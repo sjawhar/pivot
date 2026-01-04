@@ -1,4 +1,4 @@
-# Fastpipe Change Detection: Deep Analysis and Recommendations
+# Pivot Change Detection: Deep Analysis and Recommendations
 
 **Author**: Claude (AI Analysis)  
 **Date**: 2026-01-04  
@@ -9,6 +9,7 @@
 ## Executive Summary
 
 After extensive investigation including:
+
 - Review of the proposed design document
 - Analysis of existing tools (DVC, XVC, dud, joblib, Dask, Streamlit)
 - Web research on alternative approaches
@@ -16,6 +17,7 @@ After extensive investigation including:
 - Review of two prior design conversations
 
 **UPDATED CONCLUSION**: The original "lazy import" convention is **NOT NEEDED**. A superior approach exists using `inspect.getclosurevars()` that:
+
 1. Captures top-level imports automatically
 2. Works with Google-style `import module` patterns
 3. Provides transitive dependency tracking
@@ -42,21 +44,21 @@ def stage(data):
 cv = inspect.getclosurevars(stage)
 print(cv.globals.keys())
 # Output: ['helper_a', 'CONSTANT_A', 'helper_b']
-# 
+#
 # ✅ Top-level imports ARE captured!
 # ✅ No lazy imports needed!
 ```
 
 ### Verified Experimental Results
 
-| Pattern | getclosurevars captures? | Verified |
-|---------|-------------------------|----------|
-| `from mod import func` (top-level) | ✅ YES | Tested |
-| Same-module helper functions | ✅ YES | Tested |
-| `f = helper; f(x)` (aliased) | ✅ YES | Tested |
-| Top-level imported constants | ✅ YES | Tested |
-| `import module` (Google style) | Module object only | Need AST for attrs |
-| Transitive deps (func→helper→leaf) | ✅ YES (with recursion) | Tested |
+| Pattern                            | getclosurevars captures? | Verified           |
+| ---------------------------------- | ------------------------ | ------------------ |
+| `from mod import func` (top-level) | ✅ YES                   | Tested             |
+| Same-module helper functions       | ✅ YES                   | Tested             |
+| `f = helper; f(x)` (aliased)       | ✅ YES                   | Tested             |
+| Top-level imported constants       | ✅ YES                   | Tested             |
+| `import module` (Google style)     | Module object only       | Need AST for attrs |
+| Transitive deps (func→helper→leaf) | ✅ YES (with recursion)  | Tested             |
 
 ### The Complete Algorithm
 
@@ -67,22 +69,22 @@ def get_stage_fingerprint(func, visited=None):
     if id(func) in visited:
         return {}
     visited.add(id(func))
-    
+
     manifest = {}
-    
+
     # Step 1: Hash the function itself
     manifest[f"self:{func.__name__}"] = hash_function_ast(func)
-    
+
     # Step 2: Get all referenced objects via getclosurevars
     cv = inspect.getclosurevars(func)
     all_refs = {**cv.globals, **cv.nonlocals}
-    
+
     for name, val in all_refs.items():
         # Step 3: If it's a user-defined function, hash it and recurse
         if callable(val) and is_user_code(val):
             manifest[f"func:{name}"] = hash_function_ast(val)
             manifest.update(get_stage_fingerprint(val, visited))
-        
+
         # Step 4: If it's a user module, scan AST for module.attr usage
         elif isinstance(val, ModuleType) and is_user_module(val):
             for mod_name, attr_name in extract_module_attr_usage(func):
@@ -93,23 +95,23 @@ def get_stage_fingerprint(func, visited=None):
                         manifest.update(get_stage_fingerprint(attr_val, visited))
                     else:
                         manifest[f"const:{name}.{attr_name}"] = repr(attr_val)
-        
+
         # Step 5: Hash simple constants
         elif isinstance(val, (bool, int, float, str, bytes, type(None))):
             manifest[f"const:{name}"] = repr(val)
-    
+
     return manifest
 ```
 
 ### Why This Is Better Than the Original Proposal
 
-| Original Proposal | getclosurevars Approach |
-|-------------------|------------------------|
-| Requires lazy imports convention | No convention needed |
+| Original Proposal                   | getclosurevars Approach            |
+| ----------------------------------- | ---------------------------------- |
+| Requires lazy imports convention    | No convention needed               |
 | AST call-graph extraction (brittle) | Runtime name resolution (accurate) |
-| Misses `f = helper; f(x)` | Captures aliased functions |
-| Complex name resolution logic | Simple dictionary lookup |
-| Users must change coding style | Standard Python works |
+| Misses `f = helper; f(x)`           | Captures aliased functions         |
+| Complex name resolution logic       | Simple dictionary lookup           |
+| Users must change coding style      | Standard Python works              |
 
 ---
 
@@ -161,6 +163,7 @@ mult_3 = make_multiplier(3)
 ```
 
 **Solution**: Access `func.__closure__` to get cell values:
+
 ```python
 if func.__closure__:
     for cell in func.__closure__:
@@ -210,12 +213,12 @@ This is a fundamental limitation of static analysis. **The design document corre
 
 ### Alternative 1: Bytecode Hashing
 
-| Aspect | AST Hashing | Bytecode Hashing |
-|--------|-------------|------------------|
-| Speed | ~0.13ms | ~0.002ms |
-| Stability | Python-version stable | Changes across Python versions |
-| Semantic | Captures structure | Captures compiled behavior |
-| Closures | Doesn't capture values | Doesn't capture values |
+| Aspect    | AST Hashing            | Bytecode Hashing               |
+| --------- | ---------------------- | ------------------------------ |
+| Speed     | ~0.13ms                | ~0.002ms                       |
+| Stability | Python-version stable  | Changes across Python versions |
+| Semantic  | Captures structure     | Captures compiled behavior     |
+| Closures  | Doesn't capture values | Doesn't capture values         |
 
 **Verdict**: Bytecode is faster but less stable. AST is the better choice for a persistent lock file that may be used across Python version upgrades.
 
@@ -227,10 +230,12 @@ hash(cloudpickle.dumps(func))
 ```
 
 **Pros**:
+
 - Captures everything: code, closure values, globals
 - Most complete representation
 
 **Cons**:
+
 - Heavy dependency
 - Slow (~10x slower than AST)
 - Overkill for most use cases
@@ -241,36 +246,37 @@ hash(cloudpickle.dumps(func))
 ### Alternative 3: Comprehensive Hash (Recommended Enhancement)
 
 Combine multiple sources:
+
 1. AST hash (code structure)
 2. Global value hash (referenced non-callable globals)
 3. Closure value hash (cell contents)
-4. Default argument hash (__defaults__, __kwdefaults__)
+4. Default argument hash (**defaults**, **kwdefaults**)
 
 ```python
 def comprehensive_hash(func):
     parts = []
-    
+
     # AST
     source = textwrap.dedent(inspect.getsource(func))
     parts.append(ast.dump(ast.parse(source)))
-    
+
     # Globals (non-callable only to avoid hashing imported functions)
     for name in func.__code__.co_names:
         if name in func.__globals__:
             val = func.__globals__[name]
             if not callable(val):
                 parts.append(f"{name}={repr(val)}")
-    
+
     # Closures
     if func.__closure__:
         for cell in func.__closure__:
             if not callable(cell.cell_contents):
                 parts.append(repr(cell.cell_contents))
-    
+
     # Defaults
     if func.__defaults__:
         parts.append(repr(func.__defaults__))
-    
+
     return hash(str(parts))
 ```
 
@@ -289,17 +295,17 @@ Use git to track which Python files changed since last run.
 
 ## Comparison with Existing Tools
 
-| Tool | Code Change Detection | Approach |
-|------|----------------------|----------|
-| **DVC** | `cmd` string hash | Hashes the shell command string, not Python code |
-| **dud** | Stage definition JSON hash | Hashes command + inputs/outputs config |
-| **xvc** | Generic command output hash | Can hash output of arbitrary commands |
-| **Kedro** | None built-in | No incremental execution |
-| **Hamilton** | None built-in | No persistent caching |
-| **Prefect** | Task key + result hash | Caches based on inputs, not code |
-| **Dagster** | Op config hash | Focuses on config, not code changes |
+| Tool         | Code Change Detection       | Approach                                         |
+| ------------ | --------------------------- | ------------------------------------------------ |
+| **DVC**      | `cmd` string hash           | Hashes the shell command string, not Python code |
+| **dud**      | Stage definition JSON hash  | Hashes command + inputs/outputs config           |
+| **xvc**      | Generic command output hash | Can hash output of arbitrary commands            |
+| **Kedro**    | None built-in               | No incremental execution                         |
+| **Hamilton** | None built-in               | No persistent caching                            |
+| **Prefect**  | Task key + result hash      | Caches based on inputs, not code                 |
+| **Dagster**  | Op config hash              | Focuses on config, not code changes              |
 
-**Observation**: No existing tool does what fastpipe proposes. This is a genuine differentiator.
+**Observation**: No existing tool does what pivot proposes. This is a genuine differentiator.
 
 ---
 
@@ -322,6 +328,7 @@ for name, val in dependencies.items():
 ```
 
 This catches:
+
 - ✅ Top-level imports (`from utils import clean_data`)
 - ✅ Same-module helpers
 - ✅ Aliased functions (`f = helper; f(x)`)
@@ -338,12 +345,12 @@ def get_fingerprint(func, visited=None):
     if id(func) in visited:
         return {}
     visited.add(id(func))
-    
+
     manifest = {func.__name__: hash_ast(func)}
-    
+
     for dep in get_user_deps(func):
         manifest.update(get_fingerprint(dep, visited))
-    
+
     return manifest
 ```
 
@@ -369,14 +376,16 @@ This enables `--explain` to show exactly WHICH dependency changed.
 ### 4. Document What IS and ISN'T Tracked (UPDATED)
 
 **WILL trigger re-run:**
+
 - Function body changes
-- Same-module helper function changes  
+- Same-module helper function changes
 - **Top-level imported user functions** ← NEW (was "WILL NOT" before!)
 - Module.attr function changes (with AST extraction)
 - Simple constant changes
 - Transitive dependencies (recursive)
 
 **WILL NOT trigger re-run (provide escape hatches):**
+
 - Dynamic dispatch (`getattr(mod, name_variable)`)
 - Method calls (`obj.method()`)
 - `eval`/`exec`
@@ -397,20 +406,21 @@ def train(deps, outs, params):
 ```
 
 CLI:
+
 ```bash
-fastpipe run --force train      # Force specific stage
-fastpipe run --force-all        # Force everything
-fastpipe run --explain          # Show why each stage runs/skips
+pivot run --force train      # Force specific stage
+pivot run --force-all        # Force everything
+pivot run --explain          # Show why each stage runs/skips
 ```
 
 ### 6. `--explain` Mode (Critical for Trust)
 
 ```bash
-$ fastpipe run --explain
+$ pivot run --explain
 Stage: preprocess
   Status: WILL RUN
   Reason: Dependency changed
-  
+
   Changed:
     func:clean_data
       Old: abc123...
@@ -442,7 +452,8 @@ def stage(data):
 
 **Analysis**: `getclosurevars()` automatically captures referenced globals.
 
-**Recommendation**: 
+**Recommendation**:
+
 - Track simple constants (bool, int, float, str) by default
 - For complex objects, recommend users pass via `params`
 - This is handled automatically by the `getclosurevars()` approach
@@ -452,6 +463,7 @@ def stage(data):
 **Analysis**: Still useful, still orthogonal to code change detection.
 
 **Recommendation**: Add as opt-in:
+
 ```python
 @stage(package_deps=["pandas", "numpy"])
 ```
@@ -460,7 +472,8 @@ def stage(data):
 
 **Analysis**: `obj.method()` still can't be resolved statically.
 
-**Recommendation**: 
+**Recommendation**:
+
 - Document as limitation
 - `getclosurevars()` captures `obj` if it's a global, but can't know which methods are called
 - Provide `code_deps` escape hatch
@@ -470,6 +483,7 @@ def stage(data):
 **Analysis**: If a decorator is a user function, `getclosurevars()` can capture it.
 
 **Recommendation**:
+
 - Check `func.__wrapped__` and hash both wrapper and wrapped
 - Decorators imported from user code are automatically tracked
 
@@ -478,17 +492,20 @@ def stage(data):
 ## Proposed Implementation Phases
 
 ### Phase 1: Minimum Viable Detection
+
 - AST hashing of stage function body
 - Transitive hashing of same-module functions
 - Basic lazy import tracking
 
 ### Phase 2: Enhanced Detection
+
 - Global value hashing (opt-in)
 - Closure value hashing
 - Default argument hashing
 - `--explain` mode
 
 ### Phase 3: Advanced Features
+
 - Package version tracking
 - Git-based pre-check optimization
 - Decorator `__wrapped__` handling
@@ -502,21 +519,21 @@ After reviewing both design conversations and running experiments, the **optimal
 
 ### The Winning Design
 
-| Component | Mechanism | Why |
-|-----------|-----------|-----|
+| Component                | Mechanism                  | Why                                             |
+| ------------------------ | -------------------------- | ----------------------------------------------- |
 | **Dependency Discovery** | `inspect.getclosurevars()` | Captures runtime references, not just AST calls |
-| **Module.attr Handling** | AST extraction | Precise, no spurious misses |
-| **Transitive Tracking** | Recursive fingerprinting | Catches helper→helper→leaf chains |
-| **Hash Format** | Normalized AST | Ignores comments/whitespace |
-| **Storage** | Manifest (not single hash) | Enables `--explain` |
+| **Module.attr Handling** | AST extraction             | Precise, no spurious misses                     |
+| **Transitive Tracking**  | Recursive fingerprinting   | Catches helper→helper→leaf chains               |
+| **Hash Format**          | Normalized AST             | Ignores comments/whitespace                     |
+| **Storage**              | Manifest (not single hash) | Enables `--explain`                             |
 
 ### What Changed from Original Proposal
 
-| Original | Updated |
-|----------|---------|
-| Lazy imports required | ❌ **NOT NEEDED** |
-| AST call-graph extraction | Replaced by `getclosurevars()` |
-| Top-level imports not tracked | ✅ **NOW TRACKED** |
+| Original                               | Updated                        |
+| -------------------------------------- | ------------------------------ |
+| Lazy imports required                  | ❌ **NOT NEEDED**              |
+| AST call-graph extraction              | Replaced by `getclosurevars()` |
+| Top-level imports not tracked          | ✅ **NOW TRACKED**             |
 | Module-level granularity (cloudpickle) | Precise attr-level granularity |
 
 ### Key Insight from Second Conversation
@@ -524,18 +541,19 @@ After reviewing both design conversations and running experiments, the **optimal
 The second conversation discovered that `inspect.getclosurevars()` is "more accurate than AST call graph extraction because it aligns with Python's real name lookup semantics."
 
 This means:
+
 - **No user convention needed** for imports
-- **Aliasing works** (`f = helper; f(x)`)  
+- **Aliasing works** (`f = helper; f(x)`)
 - **More faithful to runtime behavior**
 
 ### Prior Art Comparison
 
-| Tool | Tracks Transitive Deps? |
-|------|------------------------|
-| joblib | ❌ No |
-| Streamlit | ❌ No |
-| Dask | ❌ No (tokenizes by import path) |
-| **Fastpipe (proposed)** | ✅ **YES** |
+| Tool                 | Tracks Transitive Deps?          |
+| -------------------- | -------------------------------- |
+| joblib               | ❌ No                            |
+| Streamlit            | ❌ No                            |
+| Dask                 | ❌ No (tokenizes by import path) |
+| **Pivot (proposed)** | ✅ **YES**                       |
 
 This is genuinely novel relative to common caching libraries.
 
@@ -552,4 +570,3 @@ Implement the `getclosurevars()` + AST approach:
 **DO store manifests in lock files** for debuggability.
 
 **DO provide escape hatches** for dynamic/reflection-heavy code.
-

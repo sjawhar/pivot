@@ -4,7 +4,7 @@ Provides the @stage decorator for marking functions as pipeline stages and
 a registry for managing all registered stages.
 
 Example:
-    >>> from fastpipe import stage
+    >>> from pivot import stage
     >>>
     >>> @stage(deps=['data.csv'], outs=['output.txt'])
     >>> def process(input_file: str = 'data.csv'):
@@ -14,11 +14,16 @@ Example:
     ...         f.write(data.upper())
 """
 
+import inspect
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, TypeVar
 
 from pydantic import BaseModel
+
+from . import fingerprint
+
+F = TypeVar("F", bound=Callable[..., Any])
 
 
 @dataclass
@@ -41,14 +46,16 @@ class stage:
     outs: list[str] = field(default_factory=list)
     params_cls: type[BaseModel] | None = None
 
-    def __call__(self, func: Callable[..., Any]) -> Callable[..., Any]:
+    def __call__(self, func: F) -> F:
         """Register function as a stage (returns original function unmodified)."""
-        # TODO: Implement stage registration
-        # 1. Get function signature with inspect.signature()
-        # 2. Generate fingerprint with get_stage_fingerprint()
-        # 3. Register in REGISTRY with stage info
-        # 4. Return original function unmodified
-        raise NotImplementedError("Week 1 implementation in progress")
+        REGISTRY.register(
+            func,
+            name=func.__name__,
+            deps=self.deps,
+            outs=self.outs,
+            params_cls=self.params_cls,
+        )
+        return func
 
 
 class StageRegistry:
@@ -66,12 +73,24 @@ class StageRegistry:
         params_cls: type[BaseModel] | None = None,
     ) -> None:
         """Register a stage function with metadata."""
-        # TODO: Implement registration logic
-        # 1. Validate inputs
-        # 2. Generate stage name
-        # 3. Create stage info dict
-        # 4. Store in _stages
-        raise NotImplementedError("Week 1 implementation in progress")
+        stage_name = name if name is not None else func.__name__
+
+        # TODO (future): Warn or error on duplicate stage names to prevent
+        # accidental overwrites. Current behavior silently replaces existing stage.
+
+        # TODO (future): Validate deps/outs paths:
+        # - Check for invalid characters (e.g., '..')
+        # - Warn on absolute paths outside project
+        # - Detect circular dependencies in stage references
+        self._stages[stage_name] = {
+            "func": func,
+            "name": stage_name,
+            "deps": deps if deps is not None else [],
+            "outs": outs if outs is not None else [],
+            "params_cls": params_cls,
+            "signature": inspect.signature(func),
+            "fingerprint": fingerprint.get_stage_fingerprint(func),
+        }
 
     def get(self, name: str) -> dict[str, Any]:
         """Get stage info by name (raises KeyError if not found)."""
@@ -86,5 +105,4 @@ class StageRegistry:
         self._stages.clear()
 
 
-# Global registry instance
 REGISTRY = StageRegistry()

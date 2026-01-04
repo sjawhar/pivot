@@ -2,26 +2,31 @@ import ast
 import hashlib
 import inspect
 import textwrap
+from collections.abc import Callable
 from types import ModuleType
+from typing import Any, override
 
-import user_utils
+import tests.user_utils as user_utils
 
 
-def stage_google_style(data):
+def stage_google_style(data: int) -> int:
     return user_utils.helper_b(data) + user_utils.CONSTANT_A
 
 
 class ModuleAttrExtractor(ast.NodeVisitor):
-    def __init__(self):
-        self.attrs = []
+    attrs: list[tuple[str, str]]
 
-    def visit_Attribute(self, node):
+    def __init__(self) -> None:
+        self.attrs = list[tuple[str, str]]()
+
+    @override
+    def visit_Attribute(self, node: ast.Attribute) -> None:
         if isinstance(node.value, ast.Name):
             self.attrs.append((node.value.id, node.attr))
         self.generic_visit(node)
 
 
-def extract_module_attrs(func):
+def extract_module_attrs(func: Callable[..., Any]) -> list[tuple[str, str]]:
     source = textwrap.dedent(inspect.getsource(func))
     tree = ast.parse(source)
     extractor = ModuleAttrExtractor()
@@ -29,7 +34,7 @@ def extract_module_attrs(func):
     return extractor.attrs
 
 
-def is_user_module(mod):
+def is_user_module(mod: ModuleType) -> bool:
     if not hasattr(mod, "__file__") or mod.__file__ is None:
         return False
     path = mod.__file__
@@ -40,15 +45,15 @@ def is_user_module(mod):
     return True
 
 
-def get_fingerprint(func, visited=None):
+def get_fingerprint(func: Callable[..., Any], visited: set[int] | None = None) -> dict[str, str]:
     if visited is None:
-        visited = set()
+        visited = set[int]()
 
     if id(func) in visited:
-        return {}
+        return dict[str, str]()
     visited.add(id(func))
 
-    manifest = {}
+    manifest = dict[str, str]()
 
     try:
         source = textwrap.dedent(inspect.getsource(func))
@@ -83,7 +88,7 @@ def get_fingerprint(func, visited=None):
     return manifest
 
 
-def get_func_hash(func):
+def get_func_hash(func: Callable[..., Any]) -> str:
     try:
         source = textwrap.dedent(inspect.getsource(func))
         tree = ast.parse(source)
@@ -92,7 +97,7 @@ def get_func_hash(func):
         return "no-source"
 
 
-def test_google_style_with_user_module():
+def test_google_style_with_user_module() -> None:
     print("=" * 60)
     print("TEST: Google-style import with user module")
     print("=" * 60)

@@ -1,5 +1,5 @@
 [project]
-name = "fastpipe"
+name = "pivot"
 version = "0.1.0-dev"
 description = "High-performance Python pipeline tool with automatic code change detection"
 readme = "README.md"
@@ -14,23 +14,71 @@ dependencies = [
     "xxhash>=3.0",
 ]
 
-[project.optional-dependencies]
-dev = [
-    "basedpyright>=1.0",
-    "pytest-cov>=4.0",
-    "pytest-watch>=4.2",
-    "pytest>=7.0",
-    "ruff>=0.8.0",
-]
-
 [project.scripts]
-fastpipe = "fastpipe.cli:cli"
+pivot = "pivot.cli:cli"
 
 [build-system]
 requires = ["uv_build>=0.9.18,<0.10.0"]
 build-backend = "uv_build"
 
-# Ruff configuration (linting and formatting)
+[dependency-groups]
+dev = [
+    "basedpyright>=1.0",
+    "pytest-cov>=4.0",
+    "pytest-mock>=3.15.1",
+    "pytest-watcher>=0.6.2",
+    "pytest>=7.0",
+    "ruff>=0.8.0",
+]
+
+
+[tool.basedpyright]
+pythonVersion = "3.13"
+exclude = ["experiments", ".pytest_cache", ".ruff_cache", ".venv"]
+reportAny = false
+reportExplicitAny = false
+reportUnusedCallResult = false
+reportImportCycles = false
+
+[tool.coverage.run]
+source = ["src/pivot"]
+branch = true
+parallel = true
+omit = ["tests/*", "*/site-packages/*"]
+
+[tool.coverage.report]
+precision = 2
+show_missing = true
+skip_covered = false
+fail_under = 90
+
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+    "class .*\\bProtocol\\):",
+    "@(abc\\.)?abstractmethod",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = [
+    "-v",
+    "--strict-markers",
+    "--tb=short",
+    "--cov=src/pivot",
+    "--cov-report=term-missing",
+    "--cov-report=html",
+]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: marks tests as integration tests",
+    "benchmark: marks tests as benchmarks",
+]
+
 [tool.ruff]
 line-length = 100
 target-version = "py313"
@@ -69,54 +117,3 @@ ignore = [
 quote-style = "double"
 indent-style = "space"
 line-ending = "auto"
-
-# Basedpyright configuration
-[tool.basedpyright]
-pythonVersion = "3.13"
-typeCheckingMode = "standard"
-reportMissingTypeStubs = false
-reportUnknownMemberType = false
-reportUnknownArgumentType = false
-reportUnknownVariableType = false
-include = ["src"]
-exclude = ["experiments", "**/__pycache__"]
-
-# Pytest configuration
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-addopts = [
-    "-v",
-    "--strict-markers",
-    "--tb=short",
-    "--cov=src/fastpipe",
-    "--cov-report=term-missing",
-    "--cov-report=html",
-]
-markers = [
-    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
-    "integration: marks tests as integration tests",
-    "benchmark: marks tests as benchmarks",
-]
-
-[tool.coverage.run]
-source = ["src/fastpipe"]
-branch = true
-parallel = true
-omit = ["tests/*", "*/site-packages/*"]
-
-[tool.coverage.report]
-precision = 2
-show_missing = true
-skip_covered = false
-fail_under = 90
-
-exclude_lines = [
-    "pragma: no cover",
-    "def __repr__",
-    "raise AssertionError",
-    "raise NotImplementedError",
-    "if __name__ == .__main__.:",
-    "if TYPE_CHECKING:",
-    "class .*\\bProtocol\\):",
-    "@(abc\\.)?abstractmethod",
-]

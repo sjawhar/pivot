@@ -2,48 +2,53 @@ import ast
 import hashlib
 import inspect
 import textwrap
+from collections.abc import Callable
 from types import ModuleType
+from typing import Any, override
 
 
-def helper_leaf(x):
+def helper_leaf(x: int) -> int:
     return x * 2
 
 
-def helper_middle(x):
+def helper_middle(x: int) -> int:
     return helper_leaf(x) + 1
 
 
-def helper_top(x):
+def helper_top(x: int) -> int:
     return helper_middle(x) + 10
 
 
 GLOBAL_CONSTANT = 42
 
 
-def stage_direct_call(data):
+def stage_direct_call(data: int) -> int:
     return helper_top(data)
 
 
-def stage_with_constant(data):
+def stage_with_constant(data: int) -> int:
     return data + GLOBAL_CONSTANT
 
 
-def stage_with_alias(data):
+def stage_with_alias(data: int) -> int:
     f = helper_top
     return f(data)
 
 
 class ModuleAttrExtractor(ast.NodeVisitor):
-    def __init__(self):
-        self.attrs = []
+    attrs: list[tuple[str, str]]
 
-    def visit_Attribute(self, node):
+    def __init__(self) -> None:
+        self.attrs = list[tuple[str, str]]()
+
+    @override
+    def visit_Attribute(self, node: ast.Attribute) -> None:
         if isinstance(node.value, ast.Name):
             self.attrs.append((node.value.id, node.attr))
         self.generic_visit(node)
 
 
-def extract_module_attrs(func):
+def extract_module_attrs(func: Callable[..., Any]) -> list[tuple[str, str]]:
     source = textwrap.dedent(inspect.getsource(func))
     tree = ast.parse(source)
     extractor = ModuleAttrExtractor()
@@ -51,7 +56,7 @@ def extract_module_attrs(func):
     return extractor.attrs
 
 
-def is_user_code(obj):
+def is_user_code(obj: Any) -> bool:
     if not hasattr(obj, "__module__"):
         return False
     mod_name = obj.__module__
@@ -64,15 +69,17 @@ def is_user_code(obj):
     return True
 
 
-def get_recursive_fingerprint(func, visited=None):
+def get_recursive_fingerprint(
+    func: Callable[..., Any], visited: set[int] | None = None
+) -> dict[str, str]:
     if visited is None:
-        visited = set()
+        visited = set[int]()
 
     if id(func) in visited:
-        return {}
+        return dict[str, str]()
     visited.add(id(func))
 
-    manifest = {}
+    manifest = dict[str, str]()
 
     try:
         source = textwrap.dedent(inspect.getsource(func))
@@ -102,7 +109,7 @@ def get_recursive_fingerprint(func, visited=None):
     return manifest
 
 
-def test_direct_call_captures_transitive():
+def test_direct_call_captures_transitive() -> None:
     print("=" * 60)
     print("TEST 1: Direct call captures transitive dependencies")
     print("=" * 60)
@@ -127,7 +134,7 @@ def test_direct_call_captures_transitive():
         print(f"MISSING: {expected - found}")
 
 
-def test_global_constant_captured():
+def test_global_constant_captured() -> None:
     print("\n" + "=" * 60)
     print("TEST 2: Global constants are captured")
     print("=" * 60)
@@ -144,7 +151,7 @@ def test_global_constant_captured():
         print("FAILED: Constant not captured")
 
 
-def test_aliasing_works():
+def test_aliasing_works() -> None:
     print("\n" + "=" * 60)
     print("TEST 3: Aliasing (f = func; f()) works")
     print("=" * 60)
@@ -161,14 +168,14 @@ def test_aliasing_works():
         print("FAILED: Aliased function not captured")
 
 
-def test_module_attr_google_style():
+def test_module_attr_google_style() -> None:
     print("\n" + "=" * 60)
     print("TEST 4: Google-style 'import module' with module.attr")
     print("=" * 60)
 
     import json
 
-    def stage_with_module(data):
+    def stage_with_module(data: Any) -> str:
         return json.dumps(data)
 
     cv = inspect.getclosurevars(stage_with_module)

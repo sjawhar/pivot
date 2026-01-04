@@ -1,6 +1,6 @@
-# Fastpipe Testing Strategy
+# Pivot Testing Strategy
 
-**Directory:** `/workspaces/treeverse/fastpipe/tests/`
+**Directory:** `/workspaces/treeverse/pivot/tests/`
 **Updated:** 2026-01-04
 **Framework:** pytest
 **Coverage Target:** >90%
@@ -10,6 +10,7 @@
 ## Testing Philosophy
 
 ### Test-Driven Development (TDD)
+
 1. **Write test first** - Define expected behavior
 2. **Run test (should fail)** - Verify test catches the problem
 3. **Implement minimal code** - Make test pass
@@ -17,6 +18,7 @@
 5. **Repeat** - For each feature/bug fix
 
 ### Test Organization
+
 ```
 tests/
 ├── CLAUDE.md                     # This file
@@ -44,6 +46,7 @@ tests/
 ## Unit Test Structure
 
 ### File Naming Convention
+
 - Test file: `test_<module>.py`
 - Test function: `test_<behavior>`
 - **NO test classes** - Use flat function structure
@@ -51,6 +54,7 @@ tests/
 ### Test Writing Standards
 
 **1. Flat Structure (No Test Classes)**
+
 ```python
 # Good
 def test_simple_function_fingerprinted():
@@ -63,15 +67,17 @@ class TestGetStageFingerprint:
 ```
 
 **2. No Skip Markers**
+
 - All tests should run (fail initially in TDD)
 - Remove `@pytest.mark.skip` markers
 - If a test isn't ready, don't write it yet
 
 **3. Global Imports Only**
+
 ```python
 # Good - imports at top of file
 import math
-from fastpipe import fingerprint
+from pivot import fingerprint
 
 # Good - module-level helper (CRITICAL for fingerprinting tests!)
 def _helper_uses_math():
@@ -88,6 +94,7 @@ def test_use_math():
 ```
 
 **4. No Module Docstrings in Test Functions**
+
 ```python
 # Good
 def test_simple_function():
@@ -102,7 +109,32 @@ def test_simple_function():
     ...
 ```
 
-**5. Use Parametrization to Avoid Repetition**
+**5. Assertion Messages Instead of Inline Comments**
+Use assertion error messages to explain what's being tested instead of inline comments:
+
+```python
+# Good - assertion messages explain the check
+def test_stage_captures_dependencies():
+    fp = fingerprint.get_stage_fingerprint(my_func)
+
+    assert "func:helper" in fp, "Should capture helper function dependency"
+    assert "mod:math.pi" in fp, "Should capture math.pi module attribute"
+
+# Bad - inline comments that should be assertion messages
+def test_stage_captures_dependencies():
+    fp = fingerprint.get_stage_fingerprint(my_func)
+
+    # Should capture helper function
+    assert "func:helper" in fp
+
+    # Should capture module attributes
+    assert "mod:math.pi" in fp
+```
+
+**Why:** Assertion messages appear in test failure output, making debugging easier. Inline comments don't help when a test fails.
+
+**6. Use Parametrization to Avoid Repetition**
+
 ```python
 # Good - parametrized
 @pytest.mark.parametrize(
@@ -161,16 +193,18 @@ def test_math_attr_detected():
 ```
 
 **Naming Convention:**
+
 - Module-level helpers: `_helper_<description>`
 - Module-level test constants: `_TEST_<NAME>`
 
 **Example Organization:**
+
 ```python
 # tests/test_fingerprint.py
 
 import math
 import os
-from fastpipe import fingerprint
+from pivot import fingerprint
 
 # --- Module-level helper functions ---
 # These capture imports properly in their closures
@@ -201,6 +235,7 @@ def test_module_attr_usage():
 ```
 
 **7. Explicit Parametrization (No Conditional Logic in Test Body)**
+
 ```python
 # Good - explicit expected result in parameters
 @pytest.mark.parametrize(
@@ -249,13 +284,14 @@ def test_different_functions_different_hash(code1, code2):
 ```
 
 ### Example Structure
+
 ```python
 # tests/test_fingerprint.py
 import math
 
 import pytest
 
-from fastpipe import fingerprint
+from pivot import fingerprint
 
 
 def test_simple_function_fingerprinted():
@@ -372,6 +408,7 @@ class TestIsUserCode:
 ## Integration Test Strategy
 
 ### test_real_pipeline.py
+
 **Purpose:** Validate end-to-end pipeline execution
 
 ```python
@@ -390,9 +427,11 @@ def test_simple_ml_pipeline_runs(tmp_path):
 ```
 
 ### test_change_detection.py
+
 **Purpose:** Validate automatic code change detection
 
 **Test Scenarios:**
+
 ```python
 def test_helper_function_change_detected()
 def test_constant_change_detected()
@@ -403,27 +442,29 @@ def test_aliased_function_change_detected()
 ```
 
 ### test_dvc_compatibility.py
-**Purpose:** Ensure Fastpipe behavior matches DVC
+
+**Purpose:** Ensure Pivot behavior matches DVC
 
 ```python
-def test_fastpipe_and_dvc_produce_identical_outputs():
+def test_pivot_and_dvc_produce_identical_outputs():
     """Export to dvc.yaml, run both, compare outputs."""
-    # 1. Define pipeline in Fastpipe
-    # 2. Run Fastpipe, collect output hashes
+    # 1. Define pipeline in Pivot
+    # 2. Run Pivot, collect output hashes
     # 3. Export to dvc.yaml
     # 4. Run DVC repro
     # 5. Compare output file hashes
-    assert fastpipe_hashes == dvc_hashes
+    assert pivot_hashes == dvc_hashes
 
-def test_fastpipe_faster_than_dvc():
+def test_pivot_faster_than_dvc():
     """Benchmark on identical pipeline."""
     # Create 50+ stage pipeline
-    # Time Fastpipe execution
+    # Time Pivot execution
     # Export and time DVC execution
-    assert fastpipe_time < dvc_time * 0.7  # At least 30% faster
+    assert pivot_time < dvc_time * 0.7  # At least 30% faster
 ```
 
 ### test_parallel_performance.py
+
 **Purpose:** Validate parallel speedup
 
 ```python
@@ -440,6 +481,7 @@ def test_parallel_faster_than_sequential():
 ## Fixtures
 
 ### conftest.py - Shared Fixtures
+
 ```python
 import pytest
 from pathlib import Path
@@ -464,7 +506,7 @@ def sample_data_file(tmp_pipeline_dir):
 @pytest.fixture
 def clean_registry():
     """Reset stage registry before each test."""
-    from fastpipe.registry import REGISTRY
+    from pivot.registry import REGISTRY
     original = REGISTRY._stages.copy()
     REGISTRY._stages.clear()
     yield REGISTRY
@@ -476,31 +518,37 @@ def clean_registry():
 ## Running Tests
 
 ### All Tests
+
 ```bash
 pytest tests/ -v
 ```
 
 ### Unit Tests Only
+
 ```bash
 pytest tests/test_*.py -v
 ```
 
 ### Integration Tests Only
+
 ```bash
 pytest tests/integration/ -v
 ```
 
 ### With Coverage
+
 ```bash
-pytest tests/ --cov=src/fastpipe --cov-report=html --cov-report=term
+pytest tests/ --cov=src/pivot --cov-report=html --cov-report=term
 ```
 
 ### Specific Test
+
 ```bash
 pytest tests/test_fingerprint.py::TestGetStageFingerprint::test_helper_function_captured -v
 ```
 
 ### Watch Mode (Re-run on Changes)
+
 ```bash
 pytest-watch tests/ -- -v
 ```
@@ -510,6 +558,7 @@ pytest-watch tests/ -- -v
 ## Test Quality Standards
 
 ### Good Test Characteristics
+
 1. **Fast** - Unit tests < 100ms, integration < 5s
 2. **Independent** - Can run in any order
 3. **Repeatable** - Same result every time
@@ -517,6 +566,7 @@ pytest-watch tests/ -- -v
 5. **Timely** - Written before/with implementation
 
 ### Test Naming
+
 ```python
 # Good: Describes behavior
 def test_helper_function_change_triggers_rerun():
@@ -528,6 +578,7 @@ def test_fingerprint():
 ```
 
 ### Assertions
+
 ```python
 # Good: Specific assertion with message
 assert stage_result.status == StageStatus.COMPLETED, \
@@ -543,6 +594,7 @@ assert fingerprint  # What are we checking?
 ```
 
 ### Test Data
+
 ```python
 # Good: Inline test data for clarity
 def test_parse_stage_info():
@@ -568,21 +620,25 @@ def test_parse_stage_info(complex_stage_fixture):
 ### Minimum Coverage: 90%
 
 **Priority Files (Must Have 100% Coverage):**
+
 - `fingerprint.py` - Critical for correctness
 - `lock.py` - Critical for correctness
 - `dag.py` - Critical for correctness
 - `scheduler.py` - Critical for correctness
 
 **Acceptable Lower Coverage (<90%):**
+
 - `cli.py` - UI code harder to test (80% acceptable)
 - `explain.py` - Output formatting (85% acceptable)
 
 ### Measuring Coverage
+
 ```bash
-pytest --cov=src/fastpipe --cov-report=term-missing
+pytest --cov=src/pivot --cov-report=term-missing
 ```
 
 ### Coverage Reports
+
 - HTML: `htmlcov/index.html` (detailed line-by-line)
 - Terminal: Shows missing lines immediately
 
@@ -591,6 +647,7 @@ pytest --cov=src/fastpipe --cov-report=term-missing
 ## Continuous Integration (Future)
 
 ### Pre-commit Hooks
+
 ```bash
 # .pre-commit-config.yaml
 - pytest tests/test_*.py  # Unit tests only (fast)
@@ -600,9 +657,10 @@ pytest --cov=src/fastpipe --cov-report=term-missing
 ```
 
 ### CI Pipeline (GitHub Actions)
+
 ```yaml
 # Run on every PR
-- pytest tests/ --cov=src/fastpipe --cov-fail-under=90
+- pytest tests/ --cov=src/pivot --cov-fail-under=90
 - ruff check src/ tests/
 - black --check src/ tests/
 - mypy src/ --strict
@@ -613,6 +671,7 @@ pytest --cov=src/fastpipe --cov-report=term-missing
 ## Debugging Failed Tests
 
 ### Useful pytest Flags
+
 ```bash
 # Stop on first failure
 pytest -x
@@ -633,14 +692,17 @@ pytest -l
 ### Common Issues
 
 **Issue:** Test fails only when run with other tests
+
 - **Cause:** Shared state (registry, filesystem)
 - **Fix:** Use fixtures to isolate state
 
 **Issue:** Test passes locally, fails in CI
+
 - **Cause:** Timing issues, different Python version, missing dependencies
 - **Fix:** Pin Python version, check CI logs, add retries for flaky tests
 
 **Issue:** Integration test too slow
+
 - **Cause:** Not using tmp_path fixture, large data files
 - **Fix:** Use tmp_path, reduce test data size
 

@@ -3,6 +3,7 @@
 Validates that the fingerprinting algorithm correctly detects code changes
 and captures all dependencies.
 """
+# pyright: reportUnusedFunction=false, reportUnusedParameter=false, reportUnknownLambdaType=false, reportUnknownParameterType=false, reportMissingParameterType=false, reportUnknownVariableType=false, reportUnknownArgumentType=false
 
 import ast
 import math
@@ -12,7 +13,7 @@ import sys
 import networkx as nx
 import pytest
 
-from fastpipe import ast_utils, fingerprint
+from pivot import ast_utils, fingerprint
 
 # --- Module-level helper functions for testing ---
 # These must be at module level to properly capture imports in their closures
@@ -334,7 +335,7 @@ def test_fingerprint_with_visited_set():
 def test_fingerprint_builtin_function_skipped():
     """Should not include builtin functions in manifest."""
 
-    def use_builtin(items: list) -> int:
+    def use_builtin(items: list[int]) -> int:
         return len(items)
 
     fp = fingerprint.get_stage_fingerprint(use_builtin)
@@ -522,7 +523,7 @@ def test_is_user_code_lambda():
 
 
 def test_is_user_code_module():
-    """Should identify fastpipe module as user code."""
+    """Should identify pivot module as user code."""
     assert fingerprint.is_user_code(fingerprint) is True
 
 

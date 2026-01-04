@@ -1,67 +1,33 @@
-"""Shared test fixtures for Fastpipe tests.
+from __future__ import annotations
 
-Provides common fixtures used across multiple test files.
-"""
-
+import pathlib
 import tempfile
-from collections.abc import Generator
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 
-from fastpipe.registry import REGISTRY
+from pivot.registry import REGISTRY
+
+if TYPE_CHECKING:
+    from collections.abc import Generator
+
+    from pytest_mock import MockerFixture
 
 
 @pytest.fixture
-def tmp_pipeline_dir() -> Generator[Path]:
-    """Create temporary directory for pipeline tests.
-
-    Yields:
-        Path to temporary directory (cleaned up after test)
-
-    Example:
-        >>> def test_something(tmp_pipeline_dir):
-        ...     data_file = tmp_pipeline_dir / "data.csv"
-        ...     data_file.write_text("id,value\\n1,10\\n")
-        ...     assert data_file.exists()
-    """
+def tmp_pipeline_dir() -> Generator[pathlib.Path]:
     with tempfile.TemporaryDirectory() as tmpdir:
-        yield Path(tmpdir)
+        yield pathlib.Path(tmpdir)
 
 
 @pytest.fixture
-def sample_data_file(tmp_pipeline_dir: Path) -> Path:
-    """Create sample CSV data file.
-
-    Args:
-        tmp_pipeline_dir: Temporary directory fixture
-
-    Returns:
-        Path to created CSV file
-
-    Example:
-        >>> def test_data_processing(sample_data_file):
-        ...     import pandas as pd
-        ...     df = pd.read_csv(sample_data_file)
-        ...     assert len(df) == 3
-    """
+def sample_data_file(tmp_pipeline_dir: pathlib.Path) -> pathlib.Path:
     data_file = tmp_pipeline_dir / "data.csv"
     data_file.write_text("id,value\n1,10\n2,20\n3,30\n")
     return data_file
 
 
 @pytest.fixture(autouse=True)
-def clean_registry() -> Generator[None]:
-    """Reset stage registry before and after each test.
-
-    Ensures test isolation by clearing the global registry.
-
-    Example:
-        >>> def test_stage_registration():
-        ...     # Registry automatically cleaned before this test
-        ...     assert len(REGISTRY.list_stages()) == 0
-    """
-    original_stages = REGISTRY._stages.copy()
-    REGISTRY.clear()
+def clean_registry(mocker: MockerFixture) -> Generator[None]:
+    mocker.patch.dict(REGISTRY._stages, clear=True)  # pyright: ignore[reportPrivateUsage]
     yield
-    REGISTRY._stages = original_stages

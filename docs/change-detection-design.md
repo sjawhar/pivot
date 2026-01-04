@@ -1,4 +1,4 @@
-# Fastpipe Change Detection: Design Document
+# Pivot Change Detection: Design Document
 
 **Status**: RFC (Request for Comments)  
 **Authors**: [Your name]  
@@ -375,9 +375,9 @@ def train(deps, outs, params: TrainParams):
 ### Escape Hatches
 
 ```bash
-fastpipe run --force train      # Force specific stage
-fastpipe run --force-all        # Force everything
-fastpipe run --explain          # Show why each stage will/won't run
+pivot run --force train      # Force specific stage
+pivot run --force-all        # Force everything
+pivot run --explain          # Show why each stage will/won't run
 ```
 
 ---
@@ -491,7 +491,7 @@ For 100 stages with ~3 helper functions each: ~120 ms total. **Negligible.**
 
 ### When Hashing Occurs
 
-Hashing happens at **pipeline load time** (when `fastpipe run` starts):
+Hashing happens at **pipeline load time** (when `pivot run` starts):
 
 1. Import pipeline module
 2. Collect all `@stage` decorated functions

@@ -15,10 +15,11 @@ Example:
 
 import ast
 import inspect
+from collections.abc import Callable
 from typing import Any
 
 
-def extract_module_attr_usage(func: Any) -> list[tuple[str, str]]:
+def extract_module_attr_usage(func: Callable[..., Any]) -> list[tuple[str, str]]:
     """Extract module.attr patterns (e.g., 'np.array') from function AST."""
     try:
         source = inspect.getsource(func)
@@ -30,29 +31,29 @@ def extract_module_attr_usage(func: Any) -> list[tuple[str, str]]:
     except SyntaxError:
         return []
 
-    attrs: list[tuple[str, str]] = []
+    attrs = list[tuple[str, str]]()
 
     for node in ast.walk(tree):
         if isinstance(node, ast.Attribute):
-            if isinstance(node.value, ast.Name):
-                module_name = node.value.id
-                attr_name = node.attr
-                attrs.append((module_name, attr_name))
-            # Chained attributes (os.path.join) handled by recursion through ast.walk()
-            elif isinstance(node.value, ast.Attribute):
-                pass
+            # Walk up the attribute chain to get full dotted path
+            chain = [node.attr]
+            current = node.value
 
-    seen = set()
-    unique_attrs = []
-    for attr in attrs:
-        if attr not in seen:
-            seen.add(attr)
-            unique_attrs.append(attr)
+            while isinstance(current, ast.Attribute):
+                chain.append(current.attr)
+                current = current.value
 
-    return unique_attrs
+            # If root is a Name (module reference), capture full chain
+            if isinstance(current, ast.Name):
+                module_name = current.id
+                # Reverse chain to get correct order (module.sub.attr)
+                attr_path = ".".join(reversed(chain))
+                attrs.append((module_name, attr_path))
+
+    return list(dict.fromkeys(attrs))
 
 
-def get_function_ast(func: Any) -> ast.FunctionDef | ast.AsyncFunctionDef:
+def get_function_ast(func: Callable[..., Any]) -> ast.FunctionDef | ast.AsyncFunctionDef:
     """Parse function to AST node."""
     try:
         source = inspect.getsource(func)

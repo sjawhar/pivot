@@ -1,9 +1,9 @@
-"""Fastpipe: High-Performance Python Pipeline Tool.
+"""Pivot: High-Performance Python Pipeline Tool.
 
 Public API for defining and running pipelines.
 
 Example:
-    >>> from fastpipe import stage
+    >>> from pivot import stage
     >>>
     >>> @stage(deps=['data.csv'], outs=['processed.parquet'])
     >>> def preprocess(input_file: str = 'data.csv'):
@@ -19,7 +19,7 @@ Example:
     ...     # Train model...
 """
 
-from fastpipe.registry import REGISTRY, stage
+from pivot.registry import REGISTRY, stage
 
 __version__ = "0.1.0-dev"
 __all__ = ["stage", "REGISTRY"]
