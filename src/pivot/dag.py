@@ -4,14 +4,12 @@ Builds a directed acyclic graph from registered stages to determine execution or
 Uses networkx for graph operations and DFS postorder traversal.
 """
 
-from pathlib import Path
+import pathlib
 from typing import Any
 
 import networkx as nx
 
 from pivot.exceptions import CyclicGraphError, DependencyNotFoundError
-
-__all__ = ["build_dag", "get_execution_order", "get_downstream_stages"]
 
 
 def build_dag(stages: dict[str, dict[str, Any]], validate: bool = True) -> nx.DiGraph:
@@ -49,7 +47,7 @@ def build_dag(stages: dict[str, dict[str, Any]], validate: bool = True) -> nx.Di
             producer = outputs_map.get(dep)
             if producer:
                 graph.add_edge(stage_name, producer)
-            elif validate and not Path(dep).exists():
+            elif validate and not pathlib.Path(dep).exists():
                 raise DependencyNotFoundError(
                     f"Stage '{stage_name}' depends on '{dep}' which is not "
                     f"produced by any stage and does not exist on disk"

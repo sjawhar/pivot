@@ -32,10 +32,10 @@ Example:
 import ast
 import hashlib
 import inspect
+import pathlib
 import sys
+import types
 from collections.abc import Callable
-from pathlib import Path
-from types import ModuleType
 from typing import Any
 
 from pivot import ast_utils
@@ -81,7 +81,7 @@ def get_stage_fingerprint(
 
         if callable(value) and is_user_code(value):
             _process_callable_dependency(name, value, manifest, visited)
-        elif isinstance(value, ModuleType):
+        elif isinstance(value, types.ModuleType):
             _process_module_dependency(name, value, func, manifest)
         elif isinstance(value, (bool, int, float, str, bytes, type(None))):
             manifest[f"const:{name}"] = repr(value)
@@ -107,7 +107,7 @@ def _process_callable_dependency(
 
 
 def _process_module_dependency(
-    name: str, module: ModuleType, func: Callable[..., Any], manifest: dict[str, str]
+    name: str, module: types.ModuleType, func: Callable[..., Any], manifest: dict[str, str]
 ) -> None:
     """Process module attribute dependencies and add to manifest."""
     attrs = ast_utils.extract_module_attr_usage(func)
@@ -205,7 +205,7 @@ def is_user_code(obj: Any) -> bool:
     if not hasattr(module, "__file__") or module.__file__ is None:
         return True
 
-    module_file = Path(module.__file__).resolve()
+    module_file = pathlib.Path(module.__file__).resolve()
 
     if _is_stdlib_path(module_file):
         return False
@@ -213,9 +213,9 @@ def is_user_code(obj: Any) -> bool:
     return not any(path in module_file.parts for path in _SITE_PACKAGE_PATHS)
 
 
-def _get_module(obj: Any) -> ModuleType | None:
+def _get_module(obj: Any) -> types.ModuleType | None:
     """Get module for an object, handling both modules and module members."""
-    if isinstance(obj, ModuleType):
+    if isinstance(obj, types.ModuleType):
         return obj
 
     if not hasattr(obj, "__module__"):
@@ -228,9 +228,9 @@ def _get_module(obj: Any) -> ModuleType | None:
     return sys.modules.get(module_name)
 
 
-def _is_stdlib_path(module_file: Path) -> bool:
+def _is_stdlib_path(module_file: pathlib.Path) -> bool:
     """Check if path is in Python stdlib (but not site-packages)."""
-    stdlib_paths = [Path(sys.prefix), Path(sys.base_prefix)]
+    stdlib_paths = [pathlib.Path(sys.prefix), pathlib.Path(sys.base_prefix)]
 
     for stdlib_path in stdlib_paths:
         try:

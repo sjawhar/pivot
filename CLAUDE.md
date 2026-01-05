@@ -34,17 +34,30 @@
 
 - Import modules, not functions: `from pivot import fingerprint` then `fingerprint.get_stage_fingerprint(...)`.
 - No relative imports; no `sys.path` modifications.
-- Exceptions: type hints in `TYPE_CHECKING` blocks, unambiguous stdlib (`Path`, `dataclass`).
+- No exceptions for stdlib—use `import pathlib` then `pathlib.Path`, not `from pathlib import Path`.
+- Exception: type hints in `TYPE_CHECKING` blocks may import types directly.
 
 ```python
 # Good
 from pivot import fingerprint
+import pathlib
+
 fp = fingerprint.get_stage_fingerprint(func)
+path = pathlib.Path("/some/path")
 
 # Bad
 from pivot.fingerprint import get_stage_fingerprint
+from pathlib import Path
+
 fp = get_stage_fingerprint(func)  # Where is this from?
+path = Path("/some/path")  # Where is Path from?
 ```
+
+## No `__all__` Declarations
+
+- Don't use `__all__` in modules—it's unnecessary maintenance overhead.
+- Use underscore prefix (`_helper`) to indicate private functions.
+- For package `__init__.py` re-exports, use explicit re-export syntax: `from module import X as X`.
 
 ## Docstrings
 
@@ -54,7 +67,7 @@ Skip Args/Returns/Examples if type hints make it obvious. Don't repeat what the 
 
 ```python
 # Bad - verbose, repeats type hints
-def resolve_path(path: str) -> Path:
+def resolve_path(path: str) -> pathlib.Path:
     """Resolve path relative to project root (or use absolute).
 
     Args:
@@ -65,11 +78,11 @@ def resolve_path(path: str) -> Path:
     """
 
 # Good - concise, says what it does
-def resolve_path(path: str) -> Path:
+def resolve_path(path: str) -> pathlib.Path:
     """Resolve relative path from project root; absolute paths unchanged."""
 
 # Bad - explains obvious behavior
-def get_project_root() -> Path:
+def get_project_root() -> pathlib.Path:
     """Get the project root directory.
 
     Returns the cached project root if available, otherwise finds it
@@ -80,7 +93,7 @@ def get_project_root() -> Path:
     """
 
 # Good - concise
-def get_project_root() -> Path:
+def get_project_root() -> pathlib.Path:
     """Get project root (cached after first call)."""
 ```
 
@@ -129,7 +142,7 @@ tree = ast.parse(source)
 
 ## Private Functions
 
-- Use `_prefix` for module-internal helpers; public = exported in `__all__` or used by other modules.
+- Use `_prefix` for module-internal helpers; public = used by other modules.
 
 ## Error Handling
 

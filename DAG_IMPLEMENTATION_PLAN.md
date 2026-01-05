@@ -1,32 +1,36 @@
 # DAG Implementation Plan - Milestone 2.1
 
-## ✅ Status Update (2026-01-05) - MILESTONE 2.1 COMPLETE
+## ✅ Status Update (2026-01-05) - MILESTONE 2.2 COMPLETE
 
 **Completed:**
-- ✅ Week 1: Fingerprinting + Registry (126 tests, 94.17% coverage)
+- ✅ Week 1: Fingerprinting + Registry
 - ✅ Milestone 2.0: Project root detection
 - ✅ Milestone 2.0.5: Input validation and path normalization
 - ✅ Trie-based output overlap detection (adapted from DVC)
 - ✅ Removed `stage:` dependency syntax
-- ✅ Code simplifications applied (extracted `_normalize_paths` helper)
-- ✅ Bug fix: `ast_utils.normalize_ast()` now handles empty body edge case
-- ✅ **Milestone 2.1: DAG Construction (COMPLETE)**
-  - ✅ `src/pivot/dag.py` implemented (49 lines, 98.59% coverage)
-  - ✅ 21 comprehensive tests in `tests/test_dag.py`
-  - ✅ Registry integration with `build_dag()` method
-  - ✅ All cycle detection, dependency validation, execution order tests passing
+- ✅ **Milestone 2.1: DAG Construction**
+  - `src/pivot/dag.py` - cycle detection, dependency validation, execution order
+  - 21 tests
+- ✅ **Milestone 2.2: Per-Stage Lock Files**
+  - `src/pivot/lock.py` - atomic writes, change detection, parallel safety
+  - Bug fixes: TOCTOU race, path traversal, corrupted file handling, concurrent write safety
+  - C YAML parser (CSafeLoader/CSafeDumper) for 5-10x faster I/O
+  - 36 tests
 
 **Ready for:**
-- 🔲 Milestone 2.2: Per-stage lock files (next task)
+- 🔲 Milestone 2.3: DVC YAML export (next task)
+
+**Stats:** 184 tests, 94.50% coverage
 
 **Files:**
 - `src/pivot/fingerprint.py` (119 lines, 92.18% coverage)
-- `src/pivot/registry.py` (74 lines, 97.78% coverage) ⬆️
-- `src/pivot/dag.py` (49 lines, 98.59% coverage) 🆕
+- `src/pivot/registry.py` (73 lines, 97.75% coverage)
+- `src/pivot/dag.py` (48 lines, 98.57% coverage)
+- `src/pivot/lock.py` (50 lines, 95.16% coverage)
 - `src/pivot/project.py` (22 lines, 100% coverage)
-- `src/pivot/trie.py` (22 lines, 90.62% coverage)
-- `src/pivot/exceptions.py` (19 lines, 100% coverage)
-- `src/pivot/ast_utils.py` (44 lines, 91.94% coverage)
+- `src/pivot/trie.py` (21 lines, 90.32% coverage)
+- `src/pivot/exceptions.py` (18 lines, 100% coverage)
+- `src/pivot/ast_utils.py` (45 lines, 88.89% coverage)
 
 ---
 

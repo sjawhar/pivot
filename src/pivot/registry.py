@@ -14,19 +14,20 @@ Example:
     ...         f.write(data.upper())
 """
 
+from __future__ import annotations
+
 import dataclasses
 import inspect
 import logging
+import pathlib
 from collections.abc import Callable
-from pathlib import Path
-from typing import Any, TypeVar
-
-from pydantic import BaseModel
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from pivot import fingerprint, project, trie
 from pivot.exceptions import ValidationError, ValidationMode
 
-__all__ = ["stage", "StageRegistry", "REGISTRY", "ValidationError", "ValidationMode"]
+if TYPE_CHECKING:
+    from pydantic import BaseModel
 
 F = TypeVar("F", bound=Callable[..., Any])
 logger = logging.getLogger(__name__)
@@ -179,7 +180,7 @@ def _validate_stage_registration(
 
 def _validate_path(path: str, stage_name: str, validation_mode: ValidationMode) -> None:
     """Validate a single path (before normalization)."""
-    if ".." in Path(path).parts:
+    if ".." in pathlib.Path(path).parts:
         _handle_validation_error(
             f"Stage '{stage_name}': Path '{path}' contains '..' (path traversal)", validation_mode
         )

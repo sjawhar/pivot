@@ -5,16 +5,16 @@ utilities for resolving paths relative to the project root.
 """
 
 import logging
-from pathlib import Path
+import pathlib
 
 logger = logging.getLogger(__name__)
 
-_project_root_cache: Path | None = None
+_project_root_cache: pathlib.Path | None = None
 
 
-def find_project_root() -> Path:
+def find_project_root() -> pathlib.Path:
     """Walk up from cwd to find .pivot or .git directory."""
-    current = Path.cwd().resolve()
+    current = pathlib.Path.cwd().resolve()
     for parent in [current, *current.parents]:
         if (parent / ".pivot").exists() or (parent / ".git").exists():
             logger.debug(f"Found project root: {parent}")
@@ -24,7 +24,7 @@ def find_project_root() -> Path:
     return current
 
 
-def get_project_root() -> Path:
+def get_project_root() -> pathlib.Path:
     """Get project root (cached after first call)."""
     global _project_root_cache
     if _project_root_cache is None:
@@ -33,9 +33,9 @@ def get_project_root() -> Path:
     return _project_root_cache
 
 
-def resolve_path(path: str) -> Path:
+def resolve_path(path: str) -> pathlib.Path:
     """Resolve relative path from project root; absolute paths unchanged."""
-    p = Path(path)
+    p = pathlib.Path(path)
     if p.is_absolute():
         return p.resolve()
     return (get_project_root() / p).resolve()

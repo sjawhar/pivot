@@ -15,6 +15,28 @@
 - Import modules not functions; use qualified names.
 - No imports inside test functions—import at module level.
 
+## Test the Library, Not Duplicates (Critical)
+
+**NEVER duplicate library code in test files.** Tests must import and use actual library functions.
+
+```python
+# WRONG - duplicate implementation that doesn't test the library!
+def get_recursive_fingerprint(func):  # Don't do this!
+    # ... reimplementation of library code ...
+    pass
+
+def test_fingerprint():
+    result = get_recursive_fingerprint(my_func)  # Testing duplicate, not library!
+
+# CORRECT - import and test the actual library
+from pivot import fingerprint
+
+def test_fingerprint():
+    result = fingerprint.get_stage_fingerprint(my_func)  # Tests real code
+```
+
+If you find yourself writing helper functions that duplicate library functionality, stop and import from the library instead.
+
 ## Module-Level Helpers (Critical for Fingerprinting)
 
 - Inline functions inside tests do NOT capture module imports in closures.

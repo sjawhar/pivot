@@ -19,7 +19,7 @@ Example:
     ...     # Train model...
 """
 
-from pivot.registry import REGISTRY, stage
+from pivot.registry import REGISTRY as REGISTRY
+from pivot.registry import stage as stage
 
 __version__ = "0.1.0-dev"
-__all__ = ["stage", "REGISTRY"]

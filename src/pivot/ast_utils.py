@@ -15,6 +15,7 @@ Example:
 
 import ast
 import inspect
+import textwrap
 from collections.abc import Callable
 from typing import Any
 
@@ -27,7 +28,7 @@ def extract_module_attr_usage(func: Callable[..., Any]) -> list[tuple[str, str]]
         return []
 
     try:
-        tree = ast.parse(source)
+        tree = ast.parse(textwrap.dedent(source))
     except SyntaxError:
         return []
 
@@ -58,7 +59,7 @@ def get_function_ast(func: Callable[..., Any]) -> ast.FunctionDef | ast.AsyncFun
     except (OSError, TypeError) as e:
         raise ValueError(f"Cannot get source for {func}") from e
 
-    tree = ast.parse(source)
+    tree = ast.parse(textwrap.dedent(source))
 
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):

@@ -4,14 +4,12 @@ Adapted from DVC's implementation to detect overlapping output paths.
 Uses pygtrie for efficient prefix matching.
 """
 
-from pathlib import Path
+import pathlib
 from typing import Any
 
 from pygtrie import Trie  # type: ignore[import-untyped]
 
 from pivot.exceptions import OutputDuplicationError, OverlappingOutputPathsError
-
-__all__ = ["build_outs_trie", "OutputDuplicationError", "OverlappingOutputPathsError"]
 
 
 def build_outs_trie(stages: dict[str, dict[str, Any]]) -> Trie:
@@ -34,16 +32,16 @@ def build_outs_trie(stages: dict[str, dict[str, Any]]) -> Trie:
         ... }
         >>> trie = build_outs_trie(stages)
         >>> # Later, check if path overlaps with existing outputs
-        >>> trie.has_subtrie(Path('/project/data/train.csv').parts)
+        >>> trie.has_subtrie(pathlib.Path('/project/data/train.csv').parts)
     """
     outs = Trie()
 
     for stage_name, stage_info in stages.items():
         for out in stage_info.get("outs", []):
-            out_key = Path(out).parts
+            out_key = pathlib.Path(out).parts
 
             if out_key in outs:
-                existing_stage, existing_path = outs[out_key]
+                existing_stage, _ = outs[out_key]
                 raise OutputDuplicationError(
                     f"Output '{out}' is produced by both '{stage_name}' and '{existing_stage}'"
                 )
