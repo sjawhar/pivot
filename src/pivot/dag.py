@@ -1,0 +1,144 @@
+"""DAG construction and traversal for pipeline stages.
+
+Builds a directed acyclic graph from registered stages to determine execution order.
+Uses networkx for graph operations and DFS postorder traversal.
+"""
+
+from pathlib import Path
+from typing import Any
+
+import networkx as nx
+
+from pivot.exceptions import CyclicGraphError, DependencyNotFoundError
+
+__all__ = ["build_dag", "get_execution_order", "get_downstream_stages"]
+
+
+def build_dag(stages: dict[str, dict[str, Any]], validate: bool = True) -> nx.DiGraph:
+    """Build DAG from registered stages.
+
+    Args:
+        stages: Dict of stage_name -> stage_info (from registry._stages)
+        validate: If True, validate that all dependencies exist
+
+    Returns:
+        DiGraph with edges from consumer to producer
+
+    Raises:
+        CyclicGraphError: If graph contains cycles
+        DependencyNotFoundError: If dependency doesn't exist (when validate=True)
+
+    Example:
+        >>> stages = {
+        ...     'preprocess': {'deps': ['/abs/data.csv'], 'outs': ['/abs/clean.csv']},
+        ...     'train': {'deps': ['/abs/clean.csv'], 'outs': ['/abs/model.pkl']}
+        ... }
+        >>> graph = build_dag(stages)
+        >>> list(nx.dfs_postorder_nodes(graph))
+        ['preprocess', 'train']
+    """
+    graph = nx.DiGraph()
+
+    for stage_name, stage_info in stages.items():
+        graph.add_node(stage_name, **stage_info)
+
+    outputs_map = _build_outputs_map(stages)
+
+    for stage_name, stage_info in stages.items():
+        for dep in stage_info.get("deps", []):
+            producer = outputs_map.get(dep)
+            if producer:
+                graph.add_edge(stage_name, producer)
+            elif validate and not Path(dep).exists():
+                raise DependencyNotFoundError(
+                    f"Stage '{stage_name}' depends on '{dep}' which is not "
+                    f"produced by any stage and does not exist on disk"
+                )
+
+    _check_acyclic(graph)
+
+    return graph
+
+
+def _build_outputs_map(stages: dict[str, dict[str, Any]]) -> dict[str, str]:
+    """Build mapping from output path to stage name.
+
+    Returns:
+        Dict of output_path -> stage_name
+
+    Note:
+        All paths are already normalized (absolute) by registry.py,
+        so simple dict lookup is sufficient.
+    """
+    outputs_map = {}
+    for stage_name, stage_info in stages.items():
+        for out in stage_info.get("outs", []):
+            outputs_map[out] = stage_name
+    return outputs_map
+
+
+def _check_acyclic(graph: nx.DiGraph) -> None:
+    """Check graph for cycles, raise if found."""
+    try:
+        cycle = nx.find_cycle(graph, orientation="original")
+    except nx.NetworkXNoCycle:
+        return
+
+    stages_in_cycle = []
+    for from_node, _to_node, _ in cycle:
+        stages_in_cycle.append(from_node)
+    if cycle:
+        stages_in_cycle.append(cycle[-1][1])
+
+    raise CyclicGraphError(f"Circular dependency detected: {' -> '.join(stages_in_cycle)}")
+
+
+def get_execution_order(graph: nx.DiGraph, stages: list[str] | None = None) -> list[str]:
+    """Get execution order using DFS postorder traversal.
+
+    Args:
+        graph: DAG of stages
+        stages: Optional list of stages to execute (default: all)
+
+    Returns:
+        List of stage names in execution order (dependencies first)
+
+    Example:
+        >>> # For a simple chain A -> B -> C
+        >>> get_execution_order(graph)
+        ['A', 'B', 'C']
+    """
+    if stages:
+        subgraph = _get_subgraph(graph, stages)
+        return list(nx.dfs_postorder_nodes(subgraph))
+
+    return list(nx.dfs_postorder_nodes(graph))
+
+
+def _get_subgraph(graph: nx.DiGraph, source_stages: list[str]) -> nx.DiGraph:
+    """Get subgraph containing sources and all their dependencies."""
+    nodes = set()
+    for stage in source_stages:
+        nodes.update(nx.dfs_postorder_nodes(graph, stage))
+    return graph.subgraph(nodes)
+
+
+def get_downstream_stages(graph: nx.DiGraph, stage: str) -> list[str]:
+    """Get all stages that depend on given stage (directly or transitively).
+
+    Uses reverse graph to traverse from stage to dependents.
+
+    Args:
+        graph: DAG of stages
+        stage: Source stage name
+
+    Returns:
+        List of stage names that depend on the source stage (includes source itself)
+
+    Example:
+        >>> # If B depends on A, and C depends on B
+        >>> get_downstream_stages(graph, 'A')
+        ['A', 'B', 'C']
+    """
+    reversed_graph = graph.reverse(copy=False)
+    return list(nx.dfs_postorder_nodes(reversed_graph, stage))

@@ -35,7 +35,6 @@ def extract_module_attr_usage(func: Callable[..., Any]) -> list[tuple[str, str]]
 
     for node in ast.walk(tree):
         if isinstance(node, ast.Attribute):
-            # Walk up the attribute chain to get full dotted path
             chain = [node.attr]
             current = node.value
 
@@ -43,7 +42,6 @@ def extract_module_attr_usage(func: Callable[..., Any]) -> list[tuple[str, str]]
                 chain.append(current.attr)
                 current = current.value
 
-            # If root is a Name (module reference), capture full chain
             if isinstance(current, ast.Name):
                 module_name = current.id
                 # Reverse chain to get correct order (module.sub.attr)
@@ -78,6 +76,9 @@ def normalize_ast(node: ast.AST) -> ast.AST:
         and isinstance(node.body[0].value.value, str)
     ):
         node.body = node.body[1:]
+        # Add Pass() if body becomes empty (functions must have non-empty body)
+        if not node.body:
+            node.body = [ast.Pass()]
 
     for child in ast.iter_child_nodes(node):
         normalize_ast(child)

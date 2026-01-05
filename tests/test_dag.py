@@ -1,0 +1,410 @@
+"""Tests for DAG construction and traversal."""
+
+from pathlib import Path
+
+import pytest
+
+from pivot import dag
+from pivot.exceptions import CyclicGraphError, DependencyNotFoundError
+
+# Test helpers for creating dummy stages
+
+
+def _create_stage(name: str, deps: list[str], outs: list[str]) -> dict:
+    """Create a stage dict for testing."""
+    return {"name": name, "deps": deps, "outs": outs}
+
+
+# --- Basic DAG construction tests ---
+
+
+def test_build_dag_simple_chain(tmp_path: Path) -> None:
+    """Build DAG for simple chain A -> B -> C."""
+    # Create files
+    (tmp_path / "a.csv").touch()
+
+    stages = {
+        "stage_a": _create_stage("stage_a", [], [str(tmp_path / "a.csv")]),
+        "stage_b": _create_stage("stage_b", [str(tmp_path / "a.csv")], [str(tmp_path / "b.csv")]),
+        "stage_c": _create_stage("stage_c", [str(tmp_path / "b.csv")], [str(tmp_path / "c.csv")]),
+    }
+
+    graph = dag.build_dag(stages)
+
+    # Check nodes exist
+    assert set(graph.nodes()) == {"stage_a", "stage_b", "stage_c"}
+
+    # Check edges (consumer -> producer)
+    assert graph.has_edge("stage_b", "stage_a")
+    assert graph.has_edge("stage_c", "stage_b")
+
+
+def test_build_dag_diamond(tmp_path: Path) -> None:
+    """Build DAG for diamond dependency pattern.
+
+         train
+        /     \\
+    preproc  features
+        \\     /
+          data
+    """
+    # Create source file
+    (tmp_path / "data.csv").touch()
+
+    stages = {
+        "data": _create_stage("data", [], [str(tmp_path / "data.csv")]),
+        "preproc": _create_stage(
+            "preproc", [str(tmp_path / "data.csv")], [str(tmp_path / "clean.csv")]
+        ),
+        "features": _create_stage(
+            "features", [str(tmp_path / "data.csv")], [str(tmp_path / "features.csv")]
+        ),
+        "train": _create_stage(
+            "train",
+            [str(tmp_path / "clean.csv"), str(tmp_path / "features.csv")],
+            [str(tmp_path / "model.pkl")],
+        ),
+    }
+
+    graph = dag.build_dag(stages)
+
+    # Check all nodes
+    assert set(graph.nodes()) == {"data", "preproc", "features", "train"}
+
+    # Check edges
+    assert graph.has_edge("preproc", "data")
+    assert graph.has_edge("features", "data")
+    assert graph.has_edge("train", "preproc")
+    assert graph.has_edge("train", "features")
+
+
+def test_build_dag_independent_stages(tmp_path: Path) -> None:
+    """Build DAG with independent stages (no dependencies between them)."""
+    (tmp_path / "a.csv").touch()
+    (tmp_path / "x.csv").touch()
+
+    stages = {
+        "stage_a": _create_stage("stage_a", [str(tmp_path / "a.csv")], [str(tmp_path / "b.csv")]),
+        "stage_x": _create_stage("stage_x", [str(tmp_path / "x.csv")], [str(tmp_path / "y.csv")]),
+    }
+
+    graph = dag.build_dag(stages)
+
+    # No edges between independent stages
+    assert not graph.has_edge("stage_a", "stage_x")
+    assert not graph.has_edge("stage_x", "stage_a")
+
+
+def test_build_dag_empty() -> None:
+    """Build DAG with no stages."""
+    graph = dag.build_dag({})
+    assert len(graph.nodes()) == 0
+
+
+# --- Dependency resolution tests ---
+
+
+def test_file_dependency_resolution(tmp_path: Path) -> None:
+    """Find producing stage by output file path."""
+    (tmp_path / "data.csv").touch()
+
+    stages = {
+        "extract": _create_stage("extract", [], [str(tmp_path / "data.csv")]),
+        "transform": _create_stage(
+            "transform", [str(tmp_path / "data.csv")], [str(tmp_path / "clean.csv")]
+        ),
+    }
+
+    graph = dag.build_dag(stages)
+
+    # transform depends on extract
+    assert graph.has_edge("transform", "extract")
+
+
+def test_dependency_on_existing_file(tmp_path: Path) -> None:
+    """Dependency exists on disk but not produced by any stage - no edge created."""
+    (tmp_path / "external.csv").touch()
+
+    stages = {
+        "process": _create_stage(
+            "process", [str(tmp_path / "external.csv")], [str(tmp_path / "output.csv")]
+        )
+    }
+
+    graph = dag.build_dag(stages)
+
+    # No edges (external file is not a stage)
+    assert len(list(graph.edges())) == 0
+
+
+def test_missing_dependency_raises_error(tmp_path: Path) -> None:
+    """Dependency not produced AND doesn't exist on disk - raise error."""
+    stages = {
+        "process": _create_stage(
+            "process", [str(tmp_path / "missing.csv")], [str(tmp_path / "output.csv")]
+        )
+    }
+
+    with pytest.raises(
+        DependencyNotFoundError,
+        match="depends on.*missing.csv.*not produced by any stage and does not exist on disk",
+    ):
+        dag.build_dag(stages)
+
+
+def test_missing_dependency_with_validate_false(tmp_path: Path) -> None:
+    """With validate=False, missing dependencies don't raise error."""
+    stages = {
+        "process": _create_stage(
+            "process", [str(tmp_path / "missing.csv")], [str(tmp_path / "output.csv")]
+        )
+    }
+
+    # Should not raise
+    graph = dag.build_dag(stages, validate=False)
+    assert "process" in graph.nodes()
+
+
+# --- Cycle detection tests ---
+
+
+def test_circular_dependency_raises_error(tmp_path: Path) -> None:
+    """Detect circular dependency A -> B -> A."""
+    stages = {
+        "stage_a": _create_stage("stage_a", [str(tmp_path / "b.csv")], [str(tmp_path / "a.csv")]),
+        "stage_b": _create_stage("stage_b", [str(tmp_path / "a.csv")], [str(tmp_path / "b.csv")]),
+    }
+
+    with pytest.raises(CyclicGraphError, match="Circular dependency detected"):
+        dag.build_dag(stages, validate=False)
+
+
+def test_self_dependency_raises_error(tmp_path: Path) -> None:
+    """Detect self-dependency A -> A."""
+    stages = {
+        "stage_a": _create_stage("stage_a", [str(tmp_path / "a.csv")], [str(tmp_path / "a.csv")])
+    }
+
+    with pytest.raises(CyclicGraphError, match="Circular dependency detected"):
+        dag.build_dag(stages, validate=False)
+
+
+def test_transitive_cycle_raises_error(tmp_path: Path) -> None:
+    """Detect transitive cycle A -> B -> C -> A."""
+    stages = {
+        "stage_a": _create_stage("stage_a", [str(tmp_path / "c.csv")], [str(tmp_path / "a.csv")]),
+        "stage_b": _create_stage("stage_b", [str(tmp_path / "a.csv")], [str(tmp_path / "b.csv")]),
+        "stage_c": _create_stage("stage_c", [str(tmp_path / "b.csv")], [str(tmp_path / "c.csv")]),
+    }
+
+    with pytest.raises(CyclicGraphError, match="Circular dependency detected"):
+        dag.build_dag(stages, validate=False)
+
+
+# --- Execution order tests ---
+
+
+def test_execution_order_simple_chain(tmp_path: Path) -> None:
+    """Verify execution order for simple chain."""
+    (tmp_path / "a.csv").touch()
+
+    stages = {
+        "stage_a": _create_stage("stage_a", [], [str(tmp_path / "a.csv")]),
+        "stage_b": _create_stage("stage_b", [str(tmp_path / "a.csv")], [str(tmp_path / "b.csv")]),
+        "stage_c": _create_stage("stage_c", [str(tmp_path / "b.csv")], [str(tmp_path / "c.csv")]),
+    }
+
+    graph = dag.build_dag(stages)
+    order = dag.get_execution_order(graph)
+
+    assert order == ["stage_a", "stage_b", "stage_c"]
+
+
+def test_execution_order_diamond(tmp_path: Path) -> None:
+    """Verify execution order for diamond dependency pattern."""
+    (tmp_path / "data.csv").touch()
+
+    stages = {
+        "data": _create_stage("data", [], [str(tmp_path / "data.csv")]),
+        "preproc": _create_stage(
+            "preproc", [str(tmp_path / "data.csv")], [str(tmp_path / "clean.csv")]
+        ),
+        "features": _create_stage(
+            "features", [str(tmp_path / "data.csv")], [str(tmp_path / "features.csv")]
+        ),
+        "train": _create_stage(
+            "train",
+            [str(tmp_path / "clean.csv"), str(tmp_path / "features.csv")],
+            [str(tmp_path / "model.pkl")],
+        ),
+    }
+
+    graph = dag.build_dag(stages)
+    order = dag.get_execution_order(graph)
+
+    # data must run first
+    assert order[0] == "data"
+
+    # preproc and features can run in any order (both after data)
+    assert set(order[1:3]) == {"preproc", "features"}
+
+    # train must run last
+    assert order[3] == "train"
+
+
+def test_execution_order_parallel_branches(tmp_path: Path) -> None:
+    """Verify execution order for independent parallel branches."""
+    (tmp_path / "a.csv").touch()
+    (tmp_path / "x.csv").touch()
+
+    stages = {
+        "stage_a": _create_stage("stage_a", [str(tmp_path / "a.csv")], [str(tmp_path / "b.csv")]),
+        "stage_b": _create_stage("stage_b", [str(tmp_path / "b.csv")], [str(tmp_path / "c.csv")]),
+        "stage_x": _create_stage("stage_x", [str(tmp_path / "x.csv")], [str(tmp_path / "y.csv")]),
+        "stage_y": _create_stage("stage_y", [str(tmp_path / "y.csv")], [str(tmp_path / "z.csv")]),
+    }
+
+    graph = dag.build_dag(stages)
+    order = dag.get_execution_order(graph)
+
+    # stage_a before stage_b
+    assert order.index("stage_a") < order.index("stage_b")
+
+    # stage_x before stage_y
+    assert order.index("stage_x") < order.index("stage_y")
+
+
+def test_execution_order_subset(tmp_path: Path) -> None:
+    """Verify execution order for subset of stages."""
+    (tmp_path / "a.csv").touch()
+
+    stages = {
+        "stage_a": _create_stage("stage_a", [], [str(tmp_path / "a.csv")]),
+        "stage_b": _create_stage("stage_b", [str(tmp_path / "a.csv")], [str(tmp_path / "b.csv")]),
+        "stage_c": _create_stage("stage_c", [str(tmp_path / "b.csv")], [str(tmp_path / "c.csv")]),
+    }
+
+    graph = dag.build_dag(stages)
+
+    # Execute only stage_b and its dependencies
+    order = dag.get_execution_order(graph, stages=["stage_b"])
+
+    # Should include stage_a (dependency) and stage_b, but not stage_c
+    assert set(order) == {"stage_a", "stage_b"}
+    assert order == ["stage_a", "stage_b"]
+
+
+# --- Subgraph extraction tests ---
+
+
+def test_get_subgraph_single_stage(tmp_path: Path) -> None:
+    """Get subgraph for single stage and its dependencies."""
+    (tmp_path / "a.csv").touch()
+
+    stages = {
+        "stage_a": _create_stage("stage_a", [], [str(tmp_path / "a.csv")]),
+        "stage_b": _create_stage("stage_b", [str(tmp_path / "a.csv")], [str(tmp_path / "b.csv")]),
+        "stage_c": _create_stage("stage_c", [str(tmp_path / "b.csv")], [str(tmp_path / "c.csv")]),
+    }
+
+    graph = dag.build_dag(stages)
+
+    # Get execution order for just stage_b
+    order = dag.get_execution_order(graph, stages=["stage_b"])
+
+    # Should include dependencies
+    assert "stage_a" in order
+    assert "stage_b" in order
+    assert "stage_c" not in order
+
+
+def test_get_subgraph_multiple_stages(tmp_path: Path) -> None:
+    """Get subgraph for multiple stages and their dependencies."""
+    (tmp_path / "data.csv").touch()
+
+    stages = {
+        "data": _create_stage("data", [], [str(tmp_path / "data.csv")]),
+        "preproc": _create_stage(
+            "preproc", [str(tmp_path / "data.csv")], [str(tmp_path / "clean.csv")]
+        ),
+        "features": _create_stage(
+            "features", [str(tmp_path / "data.csv")], [str(tmp_path / "features.csv")]
+        ),
+        "train": _create_stage(
+            "train",
+            [str(tmp_path / "clean.csv"), str(tmp_path / "features.csv")],
+            [str(tmp_path / "model.pkl")],
+        ),
+    }
+
+    graph = dag.build_dag(stages)
+
+    # Get execution order for preproc and features
+    order = dag.get_execution_order(graph, stages=["preproc", "features"])
+
+    # Should include data (shared dependency) but not train
+    assert set(order) == {"data", "preproc", "features"}
+
+
+def test_get_downstream_stages(tmp_path: Path) -> None:
+    """Get all stages that depend on given stage."""
+    (tmp_path / "a.csv").touch()
+
+    stages = {
+        "stage_a": _create_stage("stage_a", [], [str(tmp_path / "a.csv")]),
+        "stage_b": _create_stage("stage_b", [str(tmp_path / "a.csv")], [str(tmp_path / "b.csv")]),
+        "stage_c": _create_stage("stage_c", [str(tmp_path / "b.csv")], [str(tmp_path / "c.csv")]),
+    }
+
+    graph = dag.build_dag(stages)
+
+    # Get all stages downstream of stage_a
+    downstream = dag.get_downstream_stages(graph, "stage_a")
+
+    # stage_b and stage_c depend on stage_a (directly or transitively)
+    assert set(downstream) == {"stage_a", "stage_b", "stage_c"}
+
+
+# --- Edge case tests ---
+
+
+def test_stage_with_no_deps(tmp_path: Path) -> None:
+    """Stage with no dependencies (leaf node)."""
+    stages = {"stage_a": _create_stage("stage_a", [], [str(tmp_path / "a.csv")])}
+
+    graph = dag.build_dag(stages, validate=False)
+
+    assert "stage_a" in graph.nodes()
+    assert len(list(graph.edges())) == 0
+
+
+def test_stage_with_no_outs(tmp_path: Path) -> None:
+    """Stage with no outputs (terminal node)."""
+    (tmp_path / "input.csv").touch()
+
+    stages = {"stage_a": _create_stage("stage_a", [str(tmp_path / "input.csv")], [])}
+
+    graph = dag.build_dag(stages)
+
+    assert "stage_a" in graph.nodes()
+
+
+def test_multiple_stages_same_dependency(tmp_path: Path) -> None:
+    """Multiple stages depending on same output (fan-in pattern)."""
+    (tmp_path / "data.csv").touch()
+
+    stages = {
+        "extract": _create_stage("extract", [], [str(tmp_path / "data.csv")]),
+        "analyze": _create_stage(
+            "analyze", [str(tmp_path / "data.csv")], [str(tmp_path / "report.txt")]
+        ),
+        "visualize": _create_stage(
+            "visualize", [str(tmp_path / "data.csv")], [str(tmp_path / "chart.png")]
+        ),
+    }
+
+    graph = dag.build_dag(stages)
+
+    # Both analyze and visualize depend on extract
+    assert graph.has_edge("analyze", "extract")
+    assert graph.has_edge("visualize", "extract")

@@ -7,6 +7,7 @@ and captures their metadata including code fingerprints.
 
 import inspect
 import math
+from pathlib import Path
 
 import pytest
 from pydantic import BaseModel
@@ -279,3 +280,35 @@ def test_stage_captures_constants():
     info = REGISTRY.get("uses_constant")
     fp = info["fingerprint"]
     assert "const:LEARNING_RATE" in fp
+
+
+def test_registry_build_dag_integration(tmp_path: Path) -> None:
+    """Test registry build_dag integration."""
+    reg = registry.StageRegistry()
+
+    # Create test files
+    (tmp_path / "a.csv").touch()
+
+    def stage_a() -> None:
+        pass
+
+    def stage_b() -> None:
+        pass
+
+    # Register stages
+    reg.register(stage_a, name="stage_a", deps=[], outs=[str(tmp_path / "a.csv")], params_cls=None)
+    reg.register(
+        stage_b,
+        name="stage_b",
+        deps=[str(tmp_path / "a.csv")],
+        outs=[str(tmp_path / "b.csv")],
+        params_cls=None,
+    )
+
+    # Build DAG
+    graph = reg.build_dag()
+
+    # Check that DAG was built correctly
+    assert "stage_a" in graph.nodes()
+    assert "stage_b" in graph.nodes()
+    assert graph.has_edge("stage_b", "stage_a")

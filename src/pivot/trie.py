@@ -1,0 +1,74 @@
+"""Trie-based path overlap detection.
+
+Adapted from DVC's implementation to detect overlapping output paths.
+Uses pygtrie for efficient prefix matching.
+"""
+
+from pathlib import Path
+from typing import Any
+
+from pygtrie import Trie  # type: ignore[import-untyped]
+
+from pivot.exceptions import OutputDuplicationError, OverlappingOutputPathsError
+
+__all__ = ["build_outs_trie", "OutputDuplicationError", "OverlappingOutputPathsError"]
+
+
+def build_outs_trie(stages: dict[str, dict[str, Any]]) -> Trie:
+    """Build trie of output paths from stages.
+
+    Args:
+        stages: Dict of stage_name -> stage_info (from registry)
+
+    Returns:
+        Trie mapping output paths to (stage_name, output_path) tuples
+
+    Raises:
+        OutputDuplicationError: If two stages produce exact same output
+        OverlappingOutputPathsError: If output paths overlap
+
+    Example:
+        >>> stages = {
+        ...     'a': {'outs': ['/project/data/train.csv']},
+        ...     'b': {'outs': ['/project/data/test.csv']}
+        ... }
+        >>> trie = build_outs_trie(stages)
+        >>> # Later, check if path overlaps with existing outputs
+        >>> trie.has_subtrie(Path('/project/data/train.csv').parts)
+    """
+    outs = Trie()
+
+    for stage_name, stage_info in stages.items():
+        for out in stage_info.get("outs", []):
+            out_key = Path(out).parts
+
+            if out_key in outs:
+                existing_stage, existing_path = outs[out_key]
+                raise OutputDuplicationError(
+                    f"Output '{out}' is produced by both '{stage_name}' and '{existing_stage}'"
+                )
+
+            # Case 1: New output is parent of existing output(s)
+            if outs.has_subtrie(out_key):
+                child_stage, child_path = next(iter(outs.values(prefix=out_key)))
+                raise OverlappingOutputPathsError(
+                    "Output paths overlap:\n"
+                    + f"  '{out}' (stage '{stage_name}')\n"
+                    + f"  '{child_path}' (stage '{child_stage}')\n"
+                    + "One is a parent directory of the other."
+                )
+
+            # Case 2: New output is child of existing output
+            prefix_item = outs.shortest_prefix(out_key)
+            if prefix_item is not None and prefix_item.value is not None:
+                parent_stage, parent_path = prefix_item.value
+                raise OverlappingOutputPathsError(
+                    "Output paths overlap:\n"
+                    + f"  '{parent_path}' (stage '{parent_stage}')\n"
+                    + f"  '{out}' (stage '{stage_name}')\n"
+                    + "One is a parent directory of the other."
+                )
+
+            outs[out_key] = (stage_name, out)
+
+    return outs

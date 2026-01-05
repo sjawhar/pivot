@@ -107,7 +107,7 @@ def test_output_conflict_raises_error() -> None:
 
     reg.register(stage1, name="process1", deps=list[str](), outs=["output.txt"], params_cls=None)
 
-    with pytest.raises(registry.ValidationError, match="Output conflict"):
+    with pytest.raises(registry.ValidationError, match="produced by both"):
         reg.register(
             stage2, name="process2", deps=list[str](), outs=["output.txt"], params_cls=None
         )
@@ -162,7 +162,7 @@ def test_valid_inputs_pass_silently() -> None:
     reg.register(
         stage1,
         name="process",
-        deps=["data/input.csv", "stage:upstream"],
+        deps=["data/input.csv"],
         outs=["data/output.csv"],
         params_cls=None,
     )

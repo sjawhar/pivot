@@ -15,7 +15,6 @@ Example:
 """
 
 import dataclasses
-import enum
 import inspect
 import logging
 from collections.abc import Callable
@@ -24,23 +23,13 @@ from typing import Any, TypeVar
 
 from pydantic import BaseModel
 
-from pivot import fingerprint, project
+from pivot import fingerprint, project, trie
+from pivot.exceptions import ValidationError, ValidationMode
+
+__all__ = ["stage", "StageRegistry", "REGISTRY", "ValidationError", "ValidationMode"]
 
 F = TypeVar("F", bound=Callable[..., Any])
 logger = logging.getLogger(__name__)
-
-
-class ValidationError(ValueError):
-    """Raised when stage validation fails."""
-
-    pass
-
-
-class ValidationMode(enum.StrEnum):
-    """Validation strictness levels."""
-
-    ERROR = "error"  # Raise exception on validation failure
-    WARN = "warn"  # Log warning, allow registration
 
 
 @dataclasses.dataclass
@@ -48,7 +37,7 @@ class stage:
     """Decorator for marking functions as pipeline stages.
 
     Args:
-        deps: Input dependencies (files or 'stage:<name>')
+        deps: Input dependencies (file paths)
         outs: Output files produced by stage
         params_cls: Optional Pydantic model for parameters
 
@@ -95,42 +84,23 @@ class StageRegistry:
         deps_list = deps if deps is not None else []
         outs_list = outs if outs is not None else []
 
-        # Validate paths BEFORE normalizing
+        # Validate paths BEFORE normalizing (check ".." on original paths)
         _validate_stage_registration(
             self._stages, stage_name, deps_list, outs_list, self.validation_mode
         )
 
-        # Normalize all paths (resolve relative to project root)
-        # In WARN mode, if normalization fails, use the original path
-        normalized_deps = []
-        for d in deps_list:
-            try:
-                normalized_deps.append(str(project.resolve_path(d)))
-            except (ValueError, OSError):
-                if self.validation_mode == ValidationMode.WARN:
-                    normalized_deps.append(d)  # Use unnormalized path
-                else:
-                    raise
+        deps_list = _normalize_paths(deps_list, self.validation_mode)
+        outs_list = _normalize_paths(outs_list, self.validation_mode)
 
-        normalized_outs = []
-        for o in outs_list:
-            try:
-                normalized_outs.append(str(project.resolve_path(o)))
-            except (ValueError, OSError):
-                if self.validation_mode == ValidationMode.WARN:
-                    normalized_outs.append(o)  # Use unnormalized path
-                else:
-                    raise
-
-        deps_list = normalized_deps
-        outs_list = normalized_outs
-
-        # Check for output conflicts with normalized paths
-        for out in outs_list:
-            for existing_name, existing_info in self._stages.items():
-                if out in existing_info.get("outs", []):
-                    msg = f"Output conflict: '{out}' is already produced by stage '{existing_name}'"
-                    _handle_validation_error(msg, self.validation_mode)
+        try:
+            temp_stages = dict(self._stages)
+            temp_stages[stage_name] = {
+                "name": stage_name,
+                "outs": outs_list,
+            }
+            trie.build_outs_trie(temp_stages)
+        except (trie.OutputDuplicationError, trie.OverlappingOutputPathsError) as e:
+            _handle_validation_error(str(e), self.validation_mode)
 
         self._stages[stage_name] = {
             "func": func,
@@ -150,9 +120,40 @@ class StageRegistry:
         """Get list of all stage names."""
         return list(self._stages.keys())
 
+    def build_dag(self, validate: bool = True):
+        """Build DAG from registered stages.
+
+        Args:
+            validate: If True, validate that all dependencies exist
+
+        Returns:
+            NetworkX DiGraph with stages as nodes and dependencies as edges
+
+        Raises:
+            CyclicGraphError: If graph contains cycles
+            DependencyNotFoundError: If dependency doesn't exist (when validate=True)
+        """
+        from pivot import dag
+
+        return dag.build_dag(self._stages, validate=validate)
+
     def clear(self) -> None:
         """Clear all registered stages (for testing)."""
         self._stages.clear()
+
+
+def _normalize_paths(paths: list[str], validation_mode: ValidationMode) -> list[str]:
+    """Normalize paths to absolute paths, handling errors based on validation mode."""
+    normalized = []
+    for path in paths:
+        try:
+            normalized.append(str(project.resolve_path(path)))
+        except (ValueError, OSError):
+            if validation_mode == ValidationMode.WARN:
+                normalized.append(path)  # Use unnormalized path
+            else:
+                raise
+    return normalized
 
 
 def _validate_stage_registration(

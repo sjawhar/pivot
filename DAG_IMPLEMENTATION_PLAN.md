@@ -1,5 +1,35 @@
 # DAG Implementation Plan - Milestone 2.1
 
+## ✅ Status Update (2026-01-05) - MILESTONE 2.1 COMPLETE
+
+**Completed:**
+- ✅ Week 1: Fingerprinting + Registry (126 tests, 94.17% coverage)
+- ✅ Milestone 2.0: Project root detection
+- ✅ Milestone 2.0.5: Input validation and path normalization
+- ✅ Trie-based output overlap detection (adapted from DVC)
+- ✅ Removed `stage:` dependency syntax
+- ✅ Code simplifications applied (extracted `_normalize_paths` helper)
+- ✅ Bug fix: `ast_utils.normalize_ast()` now handles empty body edge case
+- ✅ **Milestone 2.1: DAG Construction (COMPLETE)**
+  - ✅ `src/pivot/dag.py` implemented (49 lines, 98.59% coverage)
+  - ✅ 21 comprehensive tests in `tests/test_dag.py`
+  - ✅ Registry integration with `build_dag()` method
+  - ✅ All cycle detection, dependency validation, execution order tests passing
+
+**Ready for:**
+- 🔲 Milestone 2.2: Per-stage lock files (next task)
+
+**Files:**
+- `src/pivot/fingerprint.py` (119 lines, 92.18% coverage)
+- `src/pivot/registry.py` (74 lines, 97.78% coverage) ⬆️
+- `src/pivot/dag.py` (49 lines, 98.59% coverage) 🆕
+- `src/pivot/project.py` (22 lines, 100% coverage)
+- `src/pivot/trie.py` (22 lines, 90.62% coverage)
+- `src/pivot/exceptions.py` (19 lines, 100% coverage)
+- `src/pivot/ast_utils.py` (44 lines, 91.94% coverage)
+
+---
+
 ## Research Summary: DVC's DAG Implementation
 
 ### Key Files Analyzed
@@ -61,23 +91,101 @@ This ensures dependencies run before dependents.
 
 ---
 
-## Pivot's Simplified Approach
+## Pivot's Approach
 
-### Key Simplifications
+### Key Design Decisions
 
-1. **No Trie needed:** We already validate output conflicts at registration (Milestone 2.0.5)
-   - Each output is produced by exactly one stage
-   - Simple dict lookup: `outputs_map[path] = stage_name`
+1. **✅ Trie used at registration time (IMPLEMENTED):**
+   - We validate output conflicts at registration using `src/pivot/trie.py`
+   - Detects both exact duplicates AND overlapping paths (parent/child relationships)
+   - Raises `OutputDuplicationError` or `OverlappingOutputPathsError`
+   - At DAG build time, simple dict lookup suffices: `outputs_map[path] = stage_name`
+   - Each output is guaranteed to be produced by exactly one stage
 
-2. **Two dependency types:**
-   - **File dependency:** `deps=['data.csv']` - find stage that produces this file
-   - **Stage dependency:** `deps=['stage:preprocess']` - direct stage reference
+2. **✅ No `stage:` references (IMPLEMENTED):** Just use file paths
+   - DAG builder will resolve which stage produces each dependency
+   - Cleaner API, less for users to remember
+   - Removed all references from docstrings and tests
 
-3. **Validation already done:** Registration time catches:
-   - Duplicate outputs
-   - Empty stage names
-   - Invalid paths
-   - DAG validation is separate (done after all stages registered)
+3. **Dependency validation (at DAG build time):**
+   - Each dependency must be EITHER:
+     - An output of another registered stage, OR
+     - A file that exists on disk
+   - This ensures pipeline integrity
+
+4. **✅ Path normalization (IMPLEMENTED):** All paths normalized at registration
+   - Uses `project.resolve_path()` to convert relative → absolute paths
+   - Eliminates path ambiguity (`./data.csv` vs `data.csv`)
+   - Output conflict detection works correctly
+   - Extracted `_normalize_paths()` helper to reduce code duplication
+
+5. **Future:** `.pvt` file tracking (deferred to later milestone)
+   - Similar to DVC's `.dvc` files
+   - Track individual files and directories
+   - Git integration using python library (not shell)
+
+---
+
+## ⚠️ Open Questions (To Resolve Before Implementation)
+
+### 1. Dependency Validation Strategy
+
+**Question:** When should we validate that dependencies exist?
+
+**Options:**
+- **A) Validate at DAG build time (RECOMMENDED)**
+  - Pro: Fail fast, clear error messages
+  - Pro: User knows immediately if pipeline has missing inputs
+  - Con: May reject valid pipelines where files are generated externally
+
+- **B) Validate at execution time**
+  - Pro: Allows external file generation before execution
+  - Con: Later error discovery, harder to debug
+
+**Decision:** Validate at DAG build time by default, with `validate=False` escape hatch for advanced use cases.
+
+### 2. Missing Dependency Behavior
+
+**Question:** What if a dependency is not produced by any stage AND doesn't exist on disk?
+
+**Options:**
+- **A) Strict: Raise DependencyNotFoundError (RECOMMENDED)**
+  - Clear error: "Stage 'train' depends on 'data.csv' which is not produced by any stage and does not exist on disk"
+  - User must either: add upstream stage, create file, or use validate=False
+
+- **B) Lenient: Log warning and continue**
+  - Pro: More flexible for iterative development
+  - Con: Silent failures, confusing behavior
+
+**Decision:** Strict by default. Users can use `validate=False` if they know what they're doing.
+
+### 3. Test Data Creation Strategy
+
+**Question:** Should DAG tests use real files on disk?
+
+**Options:**
+- **A) Use tmp_path and create real files (RECOMMENDED)**
+  - Pro: Integration tests are realistic
+  - Pro: Tests actual file existence checks
+  - Example: `(tmp_path / 'data.csv').touch()`
+
+- **B) Mock file existence**
+  - Pro: Faster tests
+  - Con: May miss real-world edge cases
+
+**Decision:** Use tmp_path for integration tests, mock for unit tests of individual functions.
+
+### 4. Execution Order for Disconnected Components
+
+**Question:** If pipeline has independent branches (no shared dependencies), what order?
+
+```python
+# Example: Two independent pipelines
+Stage A → Stage B
+Stage X → Stage Y
+```
+
+**Answer:** DFS postorder is deterministic but order between branches is undefined. This is acceptable—independent stages can run in any order. Document this behavior.
 
 ---
 
@@ -87,32 +195,29 @@ This ensures dependencies run before dependents.
 
 ```python
 import networkx as nx
+from pathlib import Path
 from typing import Any
 
-class DAGError(Exception):
-    """Base class for DAG-related errors."""
-    pass
+from pivot.exceptions import CyclicGraphError, DependencyNotFoundError
 
-class CyclicGraphError(DAGError):
-    """Raised when DAG contains cycles."""
-    pass
-
-def build_dag(stages: dict[str, dict[str, Any]]) -> nx.DiGraph:
+def build_dag(stages: dict[str, dict[str, Any]], validate: bool = True) -> nx.DiGraph:
     """Build DAG from registered stages.
 
     Args:
         stages: Dict of stage_name -> stage_info
+        validate: If True, validate that all dependencies exist
 
     Returns:
         DiGraph with edges from consumer to producer
 
     Raises:
         CyclicGraphError: If graph contains cycles
+        DependencyNotFoundError: If dependency doesn't exist (when validate=True)
 
     Example:
         >>> stages = {
         ...     'preprocess': {'deps': ['data.csv'], 'outs': ['clean.csv']},
-        ...     'train': {'deps': ['stage:preprocess'], 'outs': ['model.pkl']}
+        ...     'train': {'deps': ['clean.csv'], 'outs': ['model.pkl']}
         ... }
         >>> graph = build_dag(stages)
         >>> list(nx.dfs_postorder_nodes(graph))
@@ -127,19 +232,20 @@ def build_dag(stages: dict[str, dict[str, Any]]) -> nx.DiGraph:
     # Step 2: Build output map for file dependency resolution
     outputs_map = _build_outputs_map(stages)
 
-    # Step 3: Add edges (stage -> its dependencies)
+    # Step 3: Add edges (stage -> its dependencies) and validate
     for stage_name, stage_info in stages.items():
         for dep in stage_info.get('deps', []):
-            if dep.startswith('stage:'):
-                # Direct stage reference
-                upstream_stage = dep.replace('stage:', '')
-                if upstream_stage in stages:
-                    graph.add_edge(stage_name, upstream_stage)
-            else:
-                # File dependency - find producing stage
-                producer = outputs_map.get(dep)
-                if producer:
-                    graph.add_edge(stage_name, producer)
+            # File dependency - find producing stage
+            producer = outputs_map.get(dep)
+            if producer:
+                graph.add_edge(stage_name, producer)
+            elif validate:
+                # Dependency not produced by any stage - check if file exists
+                if not Path(dep).exists():
+                    raise DependencyNotFoundError(
+                        f"Stage '{stage_name}' depends on '{dep}' which is not "
+                        f"produced by any stage and does not exist on disk"
+                    )
 
     # Step 4: Check for cycles
     _check_acyclic(graph)
@@ -234,9 +340,9 @@ def get_downstream_stages(
 
 2. **Dependency resolution:**
    - `test_file_dependency_resolution()` - Find stage by output file
-   - `test_stage_reference_resolution()` - stage:name dependencies
-   - `test_mixed_dependencies()` - Both file and stage references
-   - `test_missing_file_dependency()` - Dep file not produced by any stage
+   - `test_dependency_on_existing_file()` - Dep exists on disk (no edge created)
+   - `test_missing_dependency_raises_error()` - Dep not produced AND doesn't exist
+   - `test_missing_dependency_with_validate_false()` - No error when validate=False
 
 3. **Cycle detection:**
    - `test_circular_dependency_raises_error()` - A → B → A
@@ -299,25 +405,14 @@ def test_execution_order_diamond():
 
 Add method to StageRegistry:
 ```python
-def build_dag(self) -> nx.DiGraph:
+def build_dag(self, validate: bool = True) -> nx.DiGraph:
     """Build DAG from registered stages."""
     from pivot import dag
-    return dag.build_dag(self._stages)
+    return dag.build_dag(self._stages, validate=validate)
 ```
 
-### `project.py` integration:
-
-Resolve paths before DAG building:
-```python
-# In dag.py, before building outputs_map
-from pivot import project
-
-def _normalize_paths(stages):
-    """Resolve all relative paths."""
-    for stage_info in stages.values():
-        stage_info['deps'] = [project.resolve_path(d) for d in stage_info['deps']]
-        stage_info['outs'] = [project.resolve_path(o) for o in stage_info['outs']]
-```
+**Note:** Path normalization already happens at registration time (Milestone 2.0.5),
+so DAG builder works with absolute paths.
 
 ---
 
@@ -383,3 +478,28 @@ With DAG complete, we'll have:
 5. ✅ **DAG construction (Week 2)** ← We are here
 
 Next: Per-stage lock files (Milestone 2.2)
+
+---
+
+## Future Milestones (Post-MVP)
+
+### Phase 4: File Tracking System (`.pvt` files)
+
+**Goal:** Track individual files and directories like DVC's `.dvc` files
+
+**Features:**
+- Track files/directories with `.pvt` metadata files
+- Enable `pvt add <file>` to track files
+- Support granular pulls and updates for directories
+- Integrate with git (using python library like `gitpython`, not shell)
+
+**Dependency validation will then check:**
+1. Output of registered stage, OR
+2. Tracked by `.pvt` file, OR
+3. Tracked by git, OR
+4. Exists on disk (with warning)
+
+**Investigation needed:**
+- Study DVC's `.dvc` file format and implementation
+- Study `dvc-data` repo for directory optimization strategies
+- Design `.pvt` file format (likely similar to DVC's approach)

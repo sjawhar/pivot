@@ -84,17 +84,43 @@ def get_project_root() -> Path:
     """Get project root (cached after first call)."""
 ```
 
-## Comments - WHY Not WHAT
+## Comments - Only When Necessary
+
+**When to add comments:**
+
+- Non-obvious WHY (e.g., "Validate BEFORE normalizing" not "Validate paths")
+- Important timing/ordering (e.g., "Reverse chain to get correct order")
+- Known limitations (e.g., "KNOWN ISSUE: lambdas use id() which is non-deterministic")
+- TODOs with context (e.g., "TODO: Use threading.Lock for parallel fingerprinting")
+- Complex algorithm explanation (e.g., "Case 1: parent contains child")
+
+**When NOT to add comments:**
+
+- Obvious WHAT the code does (e.g., "Add node to graph" before `graph.add_node()`)
+- Step-by-step descriptions (e.g., "Step 1:", "Step 2:")
+- Redundant with function/variable names (e.g., "Build output map" before `_build_outputs_map()`)
+- Information already in docstrings
 
 ```python
-# Good - explains WHY
-# Normalize names to "func" so identical logic produces same hash
-node.name = "func"
+# Good - explains non-obvious WHY
+# Validate paths BEFORE normalizing (check ".." on original paths)
+_validate_stage_registration(stages, name, deps, outs)
 
 # Bad - states obvious WHAT
-# Parse to AST
+# Add all stages as nodes
+for stage in stages:
+    graph.add_node(stage)
+
+# Good - clarifies intent
+# Reverse chain to get correct order (module.sub.attr)
+attr_path = ".".join(reversed(chain))
+
+# Bad - redundant with code
+# Parse source code to AST
 tree = ast.parse(source)
 ```
+
+**Rule of thumb:** If removing the comment makes the code unclear, try to write clearer code instead (helper functions, variable names). If that doesn't work, keep the comment.
 
 ## Early Returns (Reduce Nesting)
 
@@ -145,3 +171,6 @@ uv run basedpyright .      # Type check
 1. Test helpers must be module-level, not inline—`getclosurevars()` doesn't see module imports in inline closures.
 2. Helper functions must NOT start with underscore—fingerprinting filters `_globals` to skip `__name__`, `__file__`, etc., which also filters `_helper()`.
 3. Use assertion messages instead of inline comments—messages appear in failure output.
+4. **Circular import resolution:** When two modules have bidirectional dependencies, extract shared types/exceptions to a separate module (e.g., `exceptions.py` breaks `registry.py` ↔ `trie.py` cycle).
+5. **AST manipulation validation:** After transforming AST nodes (e.g., removing docstrings), validate structural invariants. Function/class bodies must contain at least one statement—add `ast.Pass()` if empty.
+6. **Path overlap detection requires Trie:** Simple string matching can't detect directory/file overlaps (`data/` vs `data/train.csv`). Use prefix-based data structure (pygtrie) for comprehensive validation.
