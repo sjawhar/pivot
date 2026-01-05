@@ -8,6 +8,7 @@ license = { text = "TBD" }
 authors = [{ name = "Internal Team" }]
 dependencies = [
     "click>=8.0",
+    "loky>=3.4",
     "networkx>=3.0",
     "pydantic>=2.0",
     "pygtrie>=2.5.0",
@@ -19,7 +20,7 @@ dependencies = [
 dvc = ["dvc>=3.0"]
 
 [project.scripts]
-pivot = "pivot.cli:cli"
+pivot = "pivot.cli:main"
 
 [build-system]
 requires = ["uv_build>=0.9.18,<0.10.0"]
@@ -39,7 +40,14 @@ dev = [
 
 [tool.basedpyright]
 pythonVersion = "3.13"
-exclude = ["experiments", ".pytest_cache", ".ruff_cache", ".venv"]
+exclude = [
+    "**/.pytest_cache/**",
+    "**/.ruff_cache/**",
+    "**/.venv/**",
+    "benchmarks",
+    "experiments",
+    "pipelines",
+]
 reportAny = false
 reportExplicitAny = false
 reportUnusedCallResult = false
@@ -88,7 +96,7 @@ markers = [
 line-length = 100
 target-version = "py313"
 src = ["src", "tests"]
-exclude = ["experiments"]
+exclude = ["benchmarks", "experiments"]
 
 [tool.ruff.lint]
 select = [

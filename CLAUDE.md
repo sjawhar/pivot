@@ -7,7 +7,44 @@
 ## Core Design
 
 - Pivot eliminates DVC bottlenecks via per-stage lock files (32x faster), automatic code fingerprinting, and warm worker pools.
+- Uses **ProcessPoolExecutor** for true parallel execution (not threads - GIL would serialize CPU work).
 - TDD: write tests BEFORE implementation; 90%+ code coverage required.
+
+## Stage Function Requirements (Critical)
+
+Stage functions must be **pure, serializable functions** for multiprocessing:
+
+1. **Module-level definition** - Not lambdas, closures, or defined in `__main__`
+2. **Picklable** - Function and all default arguments must serialize
+3. **Pure** - No reliance on global mutable state (each process has its own copy)
+
+```python
+# Good - module-level function in importable module
+@stage(deps=['data.csv'], outs=['output.csv'])
+def process_data():
+    import pandas as pd
+    df = pd.read_csv('data.csv')
+    df.to_csv('output.csv')
+
+# Bad - lambda (not picklable)
+process = stage(deps=['x'], outs=['y'])(lambda: ...)
+
+# Bad - closure capturing local variable
+def make_stage(threshold):
+    @stage(deps=['x'], outs=['y'])
+    def process():
+        if value > threshold:  # Captures threshold - not picklable!
+            ...
+    return process
+
+# Bad - defined in __main__ (no module path for pickle)
+if __name__ == '__main__':
+    @stage(deps=['x'], outs=['y'])
+    def my_stage():  # Can't be pickled!
+        ...
+```
+
+**Why?** Pivot uses `ProcessPoolExecutor` with `forkserver` context for true parallelism. Workers are separate processes that receive serialized (pickled) functions.
 
 ## Code Quality Standards
 
@@ -36,14 +73,17 @@
 - No relative imports; no `sys.path` modifications.
 - No exceptions for stdlib—use `import pathlib` then `pathlib.Path`, not `from pathlib import Path`.
 - Exception: type hints in `TYPE_CHECKING` blocks may import types directly.
+- Exception: types from `pivot.types` may be imported directly: `from pivot.types import StageStatus, StageResult`.
 
 ```python
 # Good
 from pivot import fingerprint
+from pivot.types import StageStatus, StageResult
 import pathlib
 
 fp = fingerprint.get_stage_fingerprint(func)
 path = pathlib.Path("/some/path")
+status = StageStatus.READY
 
 # Bad
 from pivot.fingerprint import get_stage_fingerprint
@@ -97,22 +137,26 @@ def get_project_root() -> pathlib.Path:
     """Get project root (cached after first call)."""
 ```
 
-## Comments - Only When Necessary
+## Comments - Code Clarity Over Comments (Critical)
 
-**When to add comments:**
+**Prefer improving code clarity over leaving comments. Comments are a last resort.**
 
-- Non-obvious WHY (e.g., "Validate BEFORE normalizing" not "Validate paths")
-- Important timing/ordering (e.g., "Reverse chain to get correct order")
-- Known limitations (e.g., "KNOWN ISSUE: lambdas use id() which is non-deterministic")
-- TODOs with context (e.g., "TODO: Use threading.Lock for parallel fingerprinting")
-- Complex algorithm explanation (e.g., "Case 1: parent contains child")
+Before adding a comment, ask: "Can I make this code self-explanatory instead?" Better variable names, smaller functions, and clearer structure beat comments every time.
 
-**When NOT to add comments:**
+**When to add comments (rare):**
+
+- Non-obvious WHY that can't be expressed in code
+- Important timing/ordering constraints
+- Known limitations or edge cases
+- Complex algorithm steps that can't be simplified
+
+**When NOT to add comments (common):**
 
 - Obvious WHAT the code does (e.g., "Add node to graph" before `graph.add_node()`)
-- Step-by-step descriptions (e.g., "Step 1:", "Step 2:")
+- Step-by-step descriptions (e.g., "Step 1:", "Step 2:", "Check if ready")
 - Redundant with function/variable names (e.g., "Build output map" before `_build_outputs_map()`)
 - Information already in docstrings
+- Anything the code already expresses clearly
 
 ```python
 # Good - explains non-obvious WHY

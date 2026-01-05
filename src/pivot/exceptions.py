@@ -64,6 +64,12 @@ class StageAlreadyRunningError(PivotError):
     pass
 
 
+class ExecutionError(PivotError):
+    """Raised when pipeline execution fails."""
+
+    pass
+
+
 class DVCCompatError(PivotError):
     """Base class for DVC compatibility errors."""
 

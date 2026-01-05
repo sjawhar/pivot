@@ -129,6 +129,37 @@ def _get_subgraph(graph: nx.DiGraph[str], source_stages: list[str]) -> nx.DiGrap
     return graph.subgraph(nodes)  # pyright: ignore[reportReturnType]
 
 
+def get_parallel_groups(graph: nx.DiGraph[str], stages: list[str] | None = None) -> list[list[str]]:
+    """Get stages grouped by parallel execution levels.
+
+    Uses topological generations to identify stages that can run in parallel.
+    Each group contains stages with no dependencies on each other.
+
+    Args:
+        graph: DAG of stages
+        stages: Optional list of stages to execute (default: all)
+
+    Returns:
+        List of groups, where each group is a list of stage names that can run
+        in parallel. Groups must be executed in order (group 0 before group 1, etc).
+
+    Example:
+        >>> # For pipeline: A -> B, A -> C, B -> D, C -> D
+        >>> get_parallel_groups(graph)
+        [['A'], ['B', 'C'], ['D']]  # B and C can run in parallel
+    """
+    subgraph = _get_subgraph(graph, stages) if stages else graph
+
+    # Reverse the graph because our edges go consumer->producer
+    # but topological_generations expects producer->consumer
+    reversed_graph = subgraph.reverse(copy=False)
+
+    # Get generations (each generation can run in parallel)
+    generations = list(nx.topological_generations(reversed_graph))
+
+    return [list(gen) for gen in generations]
+
+
 def get_downstream_stages(graph: nx.DiGraph[str], stage: str) -> list[str]:
     """Get all stages that depend on given stage (directly or transitively).
 

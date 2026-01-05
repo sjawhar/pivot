@@ -20,9 +20,19 @@ EVAL_PIPELINE_DIR = pathlib.Path(__file__).parent.parent / "pipelines" / "eval-p
 
 
 def is_pipeline_available() -> bool:
-    """Check if eval-pipeline is available and not git-ignored."""
+    """Check if eval-pipeline is available and DVC can see it (not git-ignored)."""
     difficulty_yaml = EVAL_PIPELINE_DIR / "eval_pipeline" / "difficulty" / "dvc.yaml"
-    return difficulty_yaml.exists()
+    if not difficulty_yaml.exists():
+        return False
+
+    # DVC needs git to track files - check if repo returns stages
+    try:
+        import dvc.repo
+
+        repo = dvc.repo.Repo(str(difficulty_yaml.parent))
+        return len(repo.index.stages) > 0
+    except Exception:
+        return False
 
 
 # Skip all tests if pipeline not available

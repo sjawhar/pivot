@@ -44,29 +44,30 @@ def test_linear_dag_three_stages(pipeline_dir: pathlib.Path) -> None:
     Each stage appends to the data, creating a chain that proves order.
     If any stage runs out of order, assertions will fail.
     """
-    execution_log = list[str]()
-
     (pipeline_dir / "input.txt").write_text("START")
+    log_file = pipeline_dir / "execution_log.txt"
+    log_file.write_text("")
 
     @stage(deps=["input.txt"], outs=["a.txt"])
     def stage_a() -> None:
-        execution_log.append("a")
+        with open("execution_log.txt", "a") as f:
+            f.write("a\n")
         data = pathlib.Path("input.txt").read_text()
         pathlib.Path("a.txt").write_text(f"{data}->A")
 
     @stage(deps=["a.txt"], outs=["b.txt"])
     def stage_b() -> None:
-        execution_log.append("b")
+        with open("execution_log.txt", "a") as f:
+            f.write("b\n")
         data = pathlib.Path("a.txt").read_text()
-        # This assertion would fail if stage_b runs before stage_a
         assert data == "START->A", f"Expected 'START->A', got '{data}'"
         pathlib.Path("b.txt").write_text(f"{data}->B")
 
     @stage(deps=["b.txt"], outs=["c.txt"])
     def stage_c() -> None:
-        execution_log.append("c")
+        with open("execution_log.txt", "a") as f:
+            f.write("c\n")
         data = pathlib.Path("b.txt").read_text()
-        # This assertion would fail if stage_c runs before stage_b
         assert data == "START->A->B", f"Expected 'START->A->B', got '{data}'"
         pathlib.Path("c.txt").write_text(f"{data}->C")
 
@@ -77,7 +78,8 @@ def test_linear_dag_three_stages(pipeline_dir: pathlib.Path) -> None:
     # Verify all stages ran
     assert all(r["status"] == "ran" for r in results.values())
 
-    # Verify execution order
+    # Verify execution order via file-based log
+    execution_log = log_file.read_text().strip().split("\n")
     assert execution_log == ["a", "b", "c"], f"Expected ['a', 'b', 'c'], got {execution_log}"
 
     # Verify final output proves correct chaining
@@ -87,40 +89,45 @@ def test_linear_dag_three_stages(pipeline_dir: pathlib.Path) -> None:
 
 def test_linear_dag_five_stages(pipeline_dir: pathlib.Path) -> None:
     """Longer linear DAG: A → B → C → D → E."""
-    execution_log = list[str]()
-
     (pipeline_dir / "input.txt").write_text("0")
+    log_file = pipeline_dir / "execution_log.txt"
+    log_file.write_text("")
 
     @stage(deps=["input.txt"], outs=["stage1.txt"])
     def stage1() -> None:
-        execution_log.append("1")
+        with open("execution_log.txt", "a") as f:
+            f.write("1\n")
         n = int(pathlib.Path("input.txt").read_text())
         pathlib.Path("stage1.txt").write_text(str(n + 1))
 
     @stage(deps=["stage1.txt"], outs=["stage2.txt"])
     def stage2() -> None:
-        execution_log.append("2")
+        with open("execution_log.txt", "a") as f:
+            f.write("2\n")
         n = int(pathlib.Path("stage1.txt").read_text())
         assert n == 1, f"stage1 must run first, got {n}"
         pathlib.Path("stage2.txt").write_text(str(n + 1))
 
     @stage(deps=["stage2.txt"], outs=["stage3.txt"])
     def stage3() -> None:
-        execution_log.append("3")
+        with open("execution_log.txt", "a") as f:
+            f.write("3\n")
         n = int(pathlib.Path("stage2.txt").read_text())
         assert n == 2, f"stage2 must run first, got {n}"
         pathlib.Path("stage3.txt").write_text(str(n + 1))
 
     @stage(deps=["stage3.txt"], outs=["stage4.txt"])
     def stage4() -> None:
-        execution_log.append("4")
+        with open("execution_log.txt", "a") as f:
+            f.write("4\n")
         n = int(pathlib.Path("stage3.txt").read_text())
         assert n == 3, f"stage3 must run first, got {n}"
         pathlib.Path("stage4.txt").write_text(str(n + 1))
 
     @stage(deps=["stage4.txt"], outs=["stage5.txt"])
     def stage5() -> None:
-        execution_log.append("5")
+        with open("execution_log.txt", "a") as f:
+            f.write("5\n")
         n = int(pathlib.Path("stage4.txt").read_text())
         assert n == 4, f"stage4 must run first, got {n}"
         pathlib.Path("stage5.txt").write_text(str(n + 1))
@@ -129,6 +136,7 @@ def test_linear_dag_five_stages(pipeline_dir: pathlib.Path) -> None:
 
     executor.run()
 
+    execution_log = log_file.read_text().strip().split("\n")
     assert execution_log == ["1", "2", "3", "4", "5"]
     assert (pipeline_dir / "stage5.txt").read_text() == "5"
 
@@ -144,35 +152,38 @@ def test_linear_dag_five_stages(pipeline_dir: pathlib.Path) -> None:
 
 def test_tree_dag_one_root_two_children(pipeline_dir: pathlib.Path) -> None:
     """Tree DAG: A → B, A → C (B and C both depend on A, but not each other)."""
-    execution_log = list[str]()
-
     (pipeline_dir / "input.txt").write_text("ROOT")
+    log_file = pipeline_dir / "execution_log.txt"
+    log_file.write_text("")
 
     @stage(deps=["input.txt"], outs=["a.txt"])
     def stage_a() -> None:
-        execution_log.append("a")
+        with open("execution_log.txt", "a") as f:
+            f.write("a\n")
         data = pathlib.Path("input.txt").read_text()
         pathlib.Path("a.txt").write_text(f"{data}->A")
 
     @stage(deps=["a.txt"], outs=["b.txt"])
     def stage_b() -> None:
-        execution_log.append("b")
+        with open("execution_log.txt", "a") as f:
+            f.write("b\n")
         data = pathlib.Path("a.txt").read_text()
-        # Would fail if A hasn't run
         assert "->A" in data, "stage_a must run before stage_b"
         pathlib.Path("b.txt").write_text(f"{data}->B")
 
     @stage(deps=["a.txt"], outs=["c.txt"])
     def stage_c() -> None:
-        execution_log.append("c")
+        with open("execution_log.txt", "a") as f:
+            f.write("c\n")
         data = pathlib.Path("a.txt").read_text()
-        # Would fail if A hasn't run
         assert "->A" in data, "stage_a must run before stage_c"
         pathlib.Path("c.txt").write_text(f"{data}->C")
 
     from pivot import executor
 
     executor.run()
+
+    execution_log = log_file.read_text().strip().split("\n")
 
     # A must run first
     assert execution_log[0] == "a", "stage_a must run first"
@@ -194,42 +205,49 @@ def test_tree_dag_deeper(pipeline_dir: pathlib.Path) -> None:
        |   |
        D   E
     """
-    execution_log = list[str]()
-
     (pipeline_dir / "input.txt").write_text("0")
+    log_file = pipeline_dir / "execution_log.txt"
+    log_file.write_text("")
 
     @stage(deps=["input.txt"], outs=["a.txt"])
     def stage_a() -> None:
-        execution_log.append("a")
+        with open("execution_log.txt", "a") as f:
+            f.write("a\n")
         pathlib.Path("a.txt").write_text("A")
 
     @stage(deps=["a.txt"], outs=["b.txt"])
     def stage_b() -> None:
-        execution_log.append("b")
+        with open("execution_log.txt", "a") as f:
+            f.write("b\n")
         assert pathlib.Path("a.txt").read_text() == "A"
         pathlib.Path("b.txt").write_text("B")
 
     @stage(deps=["a.txt"], outs=["c.txt"])
     def stage_c() -> None:
-        execution_log.append("c")
+        with open("execution_log.txt", "a") as f:
+            f.write("c\n")
         assert pathlib.Path("a.txt").read_text() == "A"
         pathlib.Path("c.txt").write_text("C")
 
     @stage(deps=["b.txt"], outs=["d.txt"])
     def stage_d() -> None:
-        execution_log.append("d")
+        with open("execution_log.txt", "a") as f:
+            f.write("d\n")
         assert pathlib.Path("b.txt").read_text() == "B"
         pathlib.Path("d.txt").write_text("D")
 
     @stage(deps=["c.txt"], outs=["e.txt"])
     def stage_e() -> None:
-        execution_log.append("e")
+        with open("execution_log.txt", "a") as f:
+            f.write("e\n")
         assert pathlib.Path("c.txt").read_text() == "C"
         pathlib.Path("e.txt").write_text("E")
 
     from pivot import executor
 
     executor.run()
+
+    execution_log = log_file.read_text().strip().split("\n")
 
     # Verify order constraints
     assert execution_log.index("a") < execution_log.index("b")
@@ -254,35 +272,38 @@ def test_diamond_dag(pipeline_dir: pathlib.Path) -> None:
 
     D depends on both B and C, which both depend on A.
     """
-    execution_log = list[str]()
-
     (pipeline_dir / "input.txt").write_text("INPUT")
+    log_file = pipeline_dir / "execution_log.txt"
+    log_file.write_text("")
 
     @stage(deps=["input.txt"], outs=["a.txt"])
     def stage_a() -> None:
-        execution_log.append("a")
+        with open("execution_log.txt", "a") as f:
+            f.write("a\n")
         pathlib.Path("a.txt").write_text("A_OUTPUT")
 
     @stage(deps=["a.txt"], outs=["b.txt"])
     def stage_b() -> None:
-        execution_log.append("b")
+        with open("execution_log.txt", "a") as f:
+            f.write("b\n")
         data = pathlib.Path("a.txt").read_text()
         assert data == "A_OUTPUT", "stage_a must run before stage_b"
         pathlib.Path("b.txt").write_text("B_OUTPUT")
 
     @stage(deps=["a.txt"], outs=["c.txt"])
     def stage_c() -> None:
-        execution_log.append("c")
+        with open("execution_log.txt", "a") as f:
+            f.write("c\n")
         data = pathlib.Path("a.txt").read_text()
         assert data == "A_OUTPUT", "stage_a must run before stage_c"
         pathlib.Path("c.txt").write_text("C_OUTPUT")
 
     @stage(deps=["b.txt", "c.txt"], outs=["d.txt"])
     def stage_d() -> None:
-        execution_log.append("d")
+        with open("execution_log.txt", "a") as f:
+            f.write("d\n")
         b_data = pathlib.Path("b.txt").read_text()
         c_data = pathlib.Path("c.txt").read_text()
-        # Would fail if B or C haven't run
         assert b_data == "B_OUTPUT", "stage_b must run before stage_d"
         assert c_data == "C_OUTPUT", "stage_c must run before stage_d"
         pathlib.Path("d.txt").write_text(f"D({b_data}+{c_data})")
@@ -290,6 +311,8 @@ def test_diamond_dag(pipeline_dir: pathlib.Path) -> None:
     from pivot import executor
 
     executor.run()
+
+    execution_log = log_file.read_text().strip().split("\n")
 
     # Verify order constraints
     assert execution_log.index("a") < execution_log.index("b")
@@ -352,32 +375,36 @@ def test_diamond_dag_with_shared_data(pipeline_dir: pathlib.Path) -> None:
 
 def test_fanout_dag(pipeline_dir: pathlib.Path) -> None:
     """Fan-out DAG: A → B, A → C, A → D (one source, three consumers)."""
-    execution_log = list[str]()
-
     (pipeline_dir / "input.txt").write_text("SOURCE")
+    log_file = pipeline_dir / "execution_log.txt"
+    log_file.write_text("")
 
     @stage(deps=["input.txt"], outs=["a.txt"])
     def stage_a() -> None:
-        execution_log.append("a")
+        with open("execution_log.txt", "a") as f:
+            f.write("a\n")
         pathlib.Path("a.txt").write_text("A_DATA")
 
     @stage(deps=["a.txt"], outs=["b.txt"])
     def stage_b() -> None:
-        execution_log.append("b")
+        with open("execution_log.txt", "a") as f:
+            f.write("b\n")
         data = pathlib.Path("a.txt").read_text()
         assert data == "A_DATA", "stage_a must run before stage_b"
         pathlib.Path("b.txt").write_text("B")
 
     @stage(deps=["a.txt"], outs=["c.txt"])
     def stage_c() -> None:
-        execution_log.append("c")
+        with open("execution_log.txt", "a") as f:
+            f.write("c\n")
         data = pathlib.Path("a.txt").read_text()
         assert data == "A_DATA", "stage_a must run before stage_c"
         pathlib.Path("c.txt").write_text("C")
 
     @stage(deps=["a.txt"], outs=["d.txt"])
     def stage_d() -> None:
-        execution_log.append("d")
+        with open("execution_log.txt", "a") as f:
+            f.write("d\n")
         data = pathlib.Path("a.txt").read_text()
         assert data == "A_DATA", "stage_a must run before stage_d"
         pathlib.Path("d.txt").write_text("D")
@@ -385,6 +412,8 @@ def test_fanout_dag(pipeline_dir: pathlib.Path) -> None:
     from pivot import executor
 
     executor.run()
+
+    execution_log = log_file.read_text().strip().split("\n")
 
     # A must run first
     assert execution_log[0] == "a"
@@ -395,43 +424,50 @@ def test_fanout_dag(pipeline_dir: pathlib.Path) -> None:
 
 def test_fanout_dag_wide(pipeline_dir: pathlib.Path) -> None:
     """Wide fan-out: A → B, C, D, E, F (five consumers)."""
-    execution_log = list[str]()
     consumer_names = ["b", "c", "d", "e", "f"]
 
     (pipeline_dir / "input.txt").write_text("1")
+    log_file = pipeline_dir / "execution_log.txt"
+    log_file.write_text("")
 
     @stage(deps=["input.txt"], outs=["a.txt"])
     def root_stage() -> None:
-        execution_log.append("a")
+        with open("execution_log.txt", "a") as f:
+            f.write("a\n")
         pathlib.Path("a.txt").write_text("ROOT")
 
     @stage(deps=["a.txt"], outs=["b.txt"])
     def consumer_b() -> None:
-        execution_log.append("b")
+        with open("execution_log.txt", "a") as f:
+            f.write("b\n")
         assert pathlib.Path("a.txt").read_text() == "ROOT"
         pathlib.Path("b.txt").write_text("B")
 
     @stage(deps=["a.txt"], outs=["c.txt"])
     def consumer_c() -> None:
-        execution_log.append("c")
+        with open("execution_log.txt", "a") as f:
+            f.write("c\n")
         assert pathlib.Path("a.txt").read_text() == "ROOT"
         pathlib.Path("c.txt").write_text("C")
 
     @stage(deps=["a.txt"], outs=["d.txt"])
     def consumer_d() -> None:
-        execution_log.append("d")
+        with open("execution_log.txt", "a") as f:
+            f.write("d\n")
         assert pathlib.Path("a.txt").read_text() == "ROOT"
         pathlib.Path("d.txt").write_text("D")
 
     @stage(deps=["a.txt"], outs=["e.txt"])
     def consumer_e() -> None:
-        execution_log.append("e")
+        with open("execution_log.txt", "a") as f:
+            f.write("e\n")
         assert pathlib.Path("a.txt").read_text() == "ROOT"
         pathlib.Path("e.txt").write_text("E")
 
     @stage(deps=["a.txt"], outs=["f.txt"])
     def consumer_f() -> None:
-        execution_log.append("f")
+        with open("execution_log.txt", "a") as f:
+            f.write("f\n")
         assert pathlib.Path("a.txt").read_text() == "ROOT"
         pathlib.Path("f.txt").write_text("F")
 
@@ -439,6 +475,7 @@ def test_fanout_dag_wide(pipeline_dir: pathlib.Path) -> None:
 
     executor.run()
 
+    execution_log = log_file.read_text().strip().split("\n")
     assert execution_log[0] == "a"
     assert set(execution_log[1:]) == set(consumer_names)
 
@@ -454,35 +491,38 @@ def test_fanout_dag_wide(pipeline_dir: pathlib.Path) -> None:
 
 def test_fanin_dag(pipeline_dir: pathlib.Path) -> None:
     """Fan-in DAG: A → D, B → D, C → D (three sources, one consumer)."""
-    execution_log = list[str]()
-
     # Create separate input files for each source
     (pipeline_dir / "input_a.txt").write_text("A_INPUT")
     (pipeline_dir / "input_b.txt").write_text("B_INPUT")
     (pipeline_dir / "input_c.txt").write_text("C_INPUT")
+    log_file = pipeline_dir / "execution_log.txt"
+    log_file.write_text("")
 
     @stage(deps=["input_a.txt"], outs=["a.txt"])
     def stage_a() -> None:
-        execution_log.append("a")
+        with open("execution_log.txt", "a") as f:
+            f.write("a\n")
         pathlib.Path("a.txt").write_text("A_OUT")
 
     @stage(deps=["input_b.txt"], outs=["b.txt"])
     def stage_b() -> None:
-        execution_log.append("b")
+        with open("execution_log.txt", "a") as f:
+            f.write("b\n")
         pathlib.Path("b.txt").write_text("B_OUT")
 
     @stage(deps=["input_c.txt"], outs=["c.txt"])
     def stage_c() -> None:
-        execution_log.append("c")
+        with open("execution_log.txt", "a") as f:
+            f.write("c\n")
         pathlib.Path("c.txt").write_text("C_OUT")
 
     @stage(deps=["a.txt", "b.txt", "c.txt"], outs=["d.txt"])
     def stage_d() -> None:
-        execution_log.append("d")
+        with open("execution_log.txt", "a") as f:
+            f.write("d\n")
         a = pathlib.Path("a.txt").read_text()
         b = pathlib.Path("b.txt").read_text()
         c = pathlib.Path("c.txt").read_text()
-        # Would fail if any of A, B, C haven't run
         assert a == "A_OUT", "stage_a must run before stage_d"
         assert b == "B_OUT", "stage_b must run before stage_d"
         assert c == "C_OUT", "stage_c must run before stage_d"
@@ -491,6 +531,8 @@ def test_fanin_dag(pipeline_dir: pathlib.Path) -> None:
     from pivot import executor
 
     executor.run()
+
+    execution_log = log_file.read_text().strip().split("\n")
 
     # A, B, C can run in any order, but D must be last
     assert execution_log[-1] == "d"
@@ -562,42 +604,48 @@ def test_complex_dag_tree_then_diamond(pipeline_dir: pathlib.Path) -> None:
         \ /
          F
     """
-    execution_log = list[str]()
-
     (pipeline_dir / "input.txt").write_text("X")
+    log_file = pipeline_dir / "execution_log.txt"
+    log_file.write_text("")
 
     @stage(deps=["input.txt"], outs=["a.txt"])
     def stage_a() -> None:
-        execution_log.append("a")
+        with open("execution_log.txt", "a") as f:
+            f.write("a\n")
         pathlib.Path("a.txt").write_text("A")
 
     @stage(deps=["a.txt"], outs=["b.txt"])
     def stage_b() -> None:
-        execution_log.append("b")
+        with open("execution_log.txt", "a") as f:
+            f.write("b\n")
         assert pathlib.Path("a.txt").read_text() == "A"
         pathlib.Path("b.txt").write_text("B")
 
     @stage(deps=["a.txt"], outs=["c.txt"])
     def stage_c() -> None:
-        execution_log.append("c")
+        with open("execution_log.txt", "a") as f:
+            f.write("c\n")
         assert pathlib.Path("a.txt").read_text() == "A"
         pathlib.Path("c.txt").write_text("C")
 
     @stage(deps=["b.txt"], outs=["d.txt"])
     def stage_d() -> None:
-        execution_log.append("d")
+        with open("execution_log.txt", "a") as f:
+            f.write("d\n")
         assert pathlib.Path("b.txt").read_text() == "B"
         pathlib.Path("d.txt").write_text("D")
 
     @stage(deps=["c.txt"], outs=["e.txt"])
     def stage_e() -> None:
-        execution_log.append("e")
+        with open("execution_log.txt", "a") as f:
+            f.write("e\n")
         assert pathlib.Path("c.txt").read_text() == "C"
         pathlib.Path("e.txt").write_text("E")
 
     @stage(deps=["d.txt", "e.txt"], outs=["f.txt"])
     def stage_f() -> None:
-        execution_log.append("f")
+        with open("execution_log.txt", "a") as f:
+            f.write("f\n")
         d = pathlib.Path("d.txt").read_text()
         e = pathlib.Path("e.txt").read_text()
         assert d == "D", "stage_d must run before stage_f"
@@ -607,6 +655,8 @@ def test_complex_dag_tree_then_diamond(pipeline_dir: pathlib.Path) -> None:
     from pivot import executor
 
     executor.run()
+
+    execution_log = log_file.read_text().strip().split("\n")
 
     # Verify order constraints
     ai = execution_log.index("a")
@@ -635,61 +685,71 @@ def test_complex_dag_multiple_diamonds(pipeline_dir: pathlib.Path) -> None:
           \|/
            H
     """
-    execution_log = list[str]()
-
     (pipeline_dir / "input.txt").write_text("0")
+    log_file = pipeline_dir / "execution_log.txt"
+    log_file.write_text("")
 
     @stage(deps=["input.txt"], outs=["a.txt"])
     def root_a() -> None:
-        execution_log.append("a")
+        with open("execution_log.txt", "a") as f:
+            f.write("a\n")
         pathlib.Path("a.txt").write_text("1")
 
     @stage(deps=["a.txt"], outs=["b.txt"])
     def mid_b() -> None:
-        execution_log.append("b")
+        with open("execution_log.txt", "a") as f:
+            f.write("b\n")
         pathlib.Path("b.txt").write_text("B")
 
     @stage(deps=["a.txt"], outs=["c.txt"])
     def mid_c() -> None:
-        execution_log.append("c")
+        with open("execution_log.txt", "a") as f:
+            f.write("c\n")
         pathlib.Path("c.txt").write_text("C")
 
     @stage(deps=["a.txt"], outs=["d.txt"])
     def mid_d() -> None:
-        execution_log.append("d")
+        with open("execution_log.txt", "a") as f:
+            f.write("d\n")
         pathlib.Path("d.txt").write_text("D")
 
     @stage(deps=["b.txt", "c.txt"], outs=["e.txt"])
     def lower_e() -> None:
-        execution_log.append("e")
+        with open("execution_log.txt", "a") as f:
+            f.write("e\n")
         b = pathlib.Path("b.txt").read_text()
         c = pathlib.Path("c.txt").read_text()
         pathlib.Path("e.txt").write_text(f"E({b}{c})")
 
     @stage(deps=["c.txt", "d.txt"], outs=["f.txt"])
     def lower_f() -> None:
-        execution_log.append("f")
+        with open("execution_log.txt", "a") as f:
+            f.write("f\n")
         c = pathlib.Path("c.txt").read_text()
         d = pathlib.Path("d.txt").read_text()
         pathlib.Path("f.txt").write_text(f"F({c}{d})")
 
     @stage(deps=["d.txt"], outs=["g.txt"])
     def lower_g() -> None:
-        execution_log.append("g")
+        with open("execution_log.txt", "a") as f:
+            f.write("g\n")
         d = pathlib.Path("d.txt").read_text()
         pathlib.Path("g.txt").write_text(f"G({d})")
 
     @stage(deps=["e.txt", "f.txt", "g.txt"], outs=["h.txt"])
     def final_h() -> None:
-        execution_log.append("h")
+        with open("execution_log.txt", "a") as f:
+            f.write("h\n")
         e = pathlib.Path("e.txt").read_text()
-        f = pathlib.Path("f.txt").read_text()
+        f_val = pathlib.Path("f.txt").read_text()
         g = pathlib.Path("g.txt").read_text()
-        pathlib.Path("h.txt").write_text(f"H[{e},{f},{g}]")
+        pathlib.Path("h.txt").write_text(f"H[{e},{f_val},{g}]")
 
     from pivot import executor
 
     executor.run()
+
+    execution_log = log_file.read_text().strip().split("\n")
 
     # A must be first, H must be last
     assert execution_log[0] == "a"
@@ -741,36 +801,42 @@ def test_disconnected_dags(pipeline_dir: pathlib.Path) -> None:
     Pipeline 1: A → B
     Pipeline 2: X → Y (completely independent)
     """
-    execution_log = list[str]()
-
     (pipeline_dir / "input_a.txt").write_text("A")
     (pipeline_dir / "input_x.txt").write_text("X")
+    log_file = pipeline_dir / "execution_log.txt"
+    log_file.write_text("")
 
     @stage(deps=["input_a.txt"], outs=["a.txt"])
     def stage_a() -> None:
-        execution_log.append("a")
+        with open("execution_log.txt", "a") as f:
+            f.write("a\n")
         pathlib.Path("a.txt").write_text("A_OUT")
 
     @stage(deps=["a.txt"], outs=["b.txt"])
     def stage_b() -> None:
-        execution_log.append("b")
+        with open("execution_log.txt", "a") as f:
+            f.write("b\n")
         assert pathlib.Path("a.txt").read_text() == "A_OUT"
         pathlib.Path("b.txt").write_text("B_OUT")
 
     @stage(deps=["input_x.txt"], outs=["x.txt"])
     def stage_x() -> None:
-        execution_log.append("x")
+        with open("execution_log.txt", "a") as f:
+            f.write("x\n")
         pathlib.Path("x.txt").write_text("X_OUT")
 
     @stage(deps=["x.txt"], outs=["y.txt"])
     def stage_y() -> None:
-        execution_log.append("y")
+        with open("execution_log.txt", "a") as f:
+            f.write("y\n")
         assert pathlib.Path("x.txt").read_text() == "X_OUT"
         pathlib.Path("y.txt").write_text("Y_OUT")
 
     from pivot import executor
 
     executor.run()
+
+    execution_log = log_file.read_text().strip().split("\n")
 
     # All stages ran
     assert set(execution_log) == {"a", "b", "x", "y"}
