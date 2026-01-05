@@ -381,11 +381,11 @@ def test_output_queue_reader_only_catches_empty(
 
     # Track if queue.Empty is properly handled (not other exceptions)
     empty_count = {"value": 0}
-    original_get = queue_module.Queue.get
+    original_get = queue_module.Queue.get  # type: ignore[type-arg]
 
-    def mock_get(self, *args, **kwargs):
+    def mock_get(self: queue_module.Queue[object], *args: object, **kwargs: object) -> object:
         try:
-            return original_get(self, *args, **kwargs)
+            return original_get(self, *args, **kwargs)  # pyright: ignore[reportArgumentType]
         except queue_module.Empty:
             empty_count["value"] += 1
             raise

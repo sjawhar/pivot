@@ -64,7 +64,7 @@ def test_manifest_preservation(tmp_path: Path) -> None:
 def test_parallel_lock_writes(tmp_path: Path) -> None:
     """Multiple stages can write locks in parallel without corruption."""
     stages = [f"stage_{i}" for i in range(10)]
-    errors = []
+    errors = list[Exception]()
 
     def write_lock(name: str) -> None:
         try:

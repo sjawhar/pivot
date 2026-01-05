@@ -29,5 +29,5 @@ def sample_data_file(tmp_pipeline_dir: pathlib.Path) -> pathlib.Path:
 
 @pytest.fixture(autouse=True)
 def clean_registry(mocker: MockerFixture) -> Generator[None]:
-    mocker.patch.dict(REGISTRY._stages, clear=True)  # pyright: ignore[reportPrivateUsage]
+    mocker.patch.dict(REGISTRY._stages, clear=True)
     yield

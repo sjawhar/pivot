@@ -23,7 +23,7 @@ import queue
 import sys
 import threading
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast, override
 
 import loky
 
@@ -169,9 +169,9 @@ def _initialize_stage_states(
     return states
 
 
-def _create_executor(max_workers: int) -> loky.ProcessPoolExecutor:
+def _create_executor(max_workers: int) -> concurrent.futures.Executor:
     """Get reusable loky executor - workers persist across calls for efficiency."""
-    return loky.get_reusable_executor(max_workers=max_workers)
+    return cast("concurrent.futures.Executor", loky.get_reusable_executor(max_workers=max_workers))
 
 
 def _execute_greedy(
@@ -307,7 +307,7 @@ def _output_queue_reader(output_q: mp.Queue[OutputMessage], con: console.Console
 
 def _start_ready_stages(
     stage_states: dict[str, StageState],
-    executor: loky.ProcessPoolExecutor,
+    executor: concurrent.futures.Executor,
     futures: dict[concurrent.futures.Future[StageResult], str],
     cache_dir: pathlib.Path,
     output_queue: mp.Queue[OutputMessage],
@@ -510,6 +510,12 @@ def _run_stage_function_with_capture(
 class _QueueStreamCapture(io.TextIOBase):
     """Capture stream output and send to queue for main process."""
 
+    _stage_name: str
+    _queue: mp.Queue[OutputMessage]
+    _is_stderr: bool
+    _output_lines: list[tuple[str, bool]]
+    _buffer: str
+
     def __init__(
         self,
         stage_name: str,
@@ -523,6 +529,7 @@ class _QueueStreamCapture(io.TextIOBase):
         self._output_lines = output_lines
         self._buffer = ""
 
+    @override
     def write(self, s: str) -> int:
         self._buffer += s
         while "\n" in self._buffer:
@@ -534,6 +541,7 @@ class _QueueStreamCapture(io.TextIOBase):
                     self._queue.put((self._stage_name, line, self._is_stderr), block=False)
         return len(s)
 
+    @override
     def flush(self) -> None:
         if self._buffer:
             self._output_lines.append((self._buffer, self._is_stderr))

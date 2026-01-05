@@ -145,8 +145,7 @@ def test_stage_captures_transitive_dependencies():
 def test_registry_get_stage():
     """Should retrieve stage info by name."""
     registry = StageRegistry()
-    registry._stages["test"] = {"name": "test", "func": lambda: 42}  # pyright: ignore[reportPrivateUsage]
-
+    registry._stages["test"] = {"name": "test", "func": lambda: 42}
     stage_info = registry.get("test")
     assert stage_info["name"] == "test"
 
@@ -162,9 +161,8 @@ def test_registry_get_nonexistent_stage_raises_keyerror():
 def test_registry_list_stages():
     """Should list all registered stage names."""
     registry = StageRegistry()
-    registry._stages["stage1"] = {"name": "stage1"}  # pyright: ignore[reportPrivateUsage]
-    registry._stages["stage2"] = {"name": "stage2"}  # pyright: ignore[reportPrivateUsage]
-
+    registry._stages["stage1"] = {"name": "stage1"}
+    registry._stages["stage2"] = {"name": "stage2"}
     stages = registry.list_stages()
     assert set(stages) == {"stage1", "stage2"}
 
@@ -180,8 +178,7 @@ def test_registry_list_stages_empty():
 def test_registry_clear():
     """Should clear all registered stages."""
     registry = StageRegistry()
-    registry._stages["test"] = {"name": "test"}  # pyright: ignore[reportPrivateUsage]
-
+    registry._stages["test"] = {"name": "test"}
     registry.clear()
     assert registry.list_stages() == []
 

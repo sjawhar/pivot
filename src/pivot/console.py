@@ -40,6 +40,9 @@ def _supports_color(stream: TextIO) -> bool:
 class Console:
     """Console output handler with colors and progress tracking."""
 
+    stream: TextIO
+    use_color: bool
+
     def __init__(self, stream: TextIO | None = None, color: bool | None = None) -> None:
         """Initialize console.
 

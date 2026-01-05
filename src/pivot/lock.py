@@ -17,7 +17,7 @@ import os
 import pathlib
 import re
 import tempfile
-from typing import Any
+from typing import Any, cast
 
 import yaml
 
@@ -34,6 +34,9 @@ _VALID_STAGE_NAME = re.compile(r"^[a-zA-Z0-9_-]+$")
 class StageLock:
     """Manages lock file for a single pipeline stage."""
 
+    stage_name: str
+    path: pathlib.Path
+
     def __init__(self, stage_name: str, cache_dir: pathlib.Path) -> None:
         if not stage_name or not _VALID_STAGE_NAME.match(stage_name):
             raise ValueError(f"Invalid stage name: {stage_name!r}")
@@ -44,12 +47,10 @@ class StageLock:
         """Read lock file, return None if missing or corrupted."""
         try:
             with open(self.path) as f:
-                data = yaml.load(f, Loader=_Loader)
-            if data is None:
-                return None
-            if not isinstance(data, dict):
+                data: object = yaml.load(f, Loader=_Loader)
+            if data is None or not isinstance(data, dict):
                 return None  # Treat corrupted file as missing
-            return data
+            return cast("dict[str, Any]", data)
         except (FileNotFoundError, UnicodeDecodeError, yaml.YAMLError):
             return None
 

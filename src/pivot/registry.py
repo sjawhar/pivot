@@ -23,8 +23,13 @@ import pathlib
 from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any, TypeVar
 
-from pivot import fingerprint, outputs, project, trie
-from pivot.exceptions import ValidationError, ValidationMode
+from pivot import exceptions, fingerprint, outputs, project, trie
+from pivot.exceptions import (
+    ValidationError as ValidationError,
+)
+from pivot.exceptions import (
+    ValidationMode as ValidationMode,
+)
 
 if TYPE_CHECKING:
     from pydantic import BaseModel
@@ -53,8 +58,8 @@ class stage:
         ...     pass
     """
 
-    deps: Sequence[str] = dataclasses.field(default_factory=list)
-    outs: Sequence[outputs.OutSpec] = dataclasses.field(default_factory=list)
+    deps: Sequence[str] = ()
+    outs: Sequence[outputs.OutSpec] = ()
     params_cls: type[BaseModel] | None = None
 
     def __call__(self, func: F) -> F:
@@ -86,8 +91,8 @@ class StageRegistry:
     ) -> None:
         """Register a stage function with metadata."""
         stage_name = name if name is not None else func.__name__
-        deps_list = deps if deps is not None else []
-        outs_list = outs if outs is not None else []
+        deps_list: Sequence[str] = deps if deps is not None else ()
+        outs_list: Sequence[outputs.OutSpec] = outs if outs is not None else ()
 
         # Normalize outputs to BaseOut objects
         outs_normalized = [outputs.normalize_out(o) for o in outs_list]
@@ -118,7 +123,7 @@ class StageRegistry:
                 "outs": outs_paths,  # Trie uses paths only
             }
             trie.build_outs_trie(temp_stages)
-        except (trie.OutputDuplicationError, trie.OverlappingOutputPathsError) as e:
+        except (exceptions.OutputDuplicationError, exceptions.OverlappingOutputPathsError) as e:
             _handle_validation_error(str(e), self.validation_mode)
 
         self._stages[stage_name] = {
@@ -164,7 +169,7 @@ class StageRegistry:
 
 def _normalize_paths(paths: Sequence[str], validation_mode: ValidationMode) -> list[str]:
     """Normalize paths to absolute paths, handling errors based on validation mode."""
-    normalized = []
+    normalized = list[str]()
     for path in paths:
         try:
             normalized.append(str(project.resolve_path(path)))

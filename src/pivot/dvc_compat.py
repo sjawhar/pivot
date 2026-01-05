@@ -16,7 +16,7 @@ import yaml
 
 from pivot import outputs, project
 from pivot.exceptions import DVCImportError, ExportError
-from pivot.registry import REGISTRY
+from pivot.registry import REGISTRY as REGISTRY
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -73,7 +73,7 @@ def _generate_cmd(func: Callable[..., Any]) -> str:
 
 def _extract_param_defaults(sig: Signature) -> dict[str, Any]:
     """Extract parameter defaults from function signature."""
-    params = {}
+    params = dict[str, Any]()
     for param_name, param in sig.parameters.items():
         if param.default is not param.empty:
             params[param_name] = param.default
@@ -103,8 +103,8 @@ def _generate_params_yaml(
                 yaml.dump(params, f, sort_keys=False, default_flow_style=False)
         except yaml.YAMLError as e:
             raise ExportError(
-                f"Failed to serialize params.yaml: {e}. "
-                "Parameter defaults must be YAML-serializable (str, int, float, bool, list, dict)."
+                f"Failed to serialize params.yaml: {e}. Parameter defaults must be "
+                + "YAML-serializable (str, int, float, bool, list, dict)."
             ) from e
         except OSError as e:
             raise ExportError(f"Failed to write params.yaml to '{params_path}': {e}") from e
@@ -351,7 +351,7 @@ def _extract_dvc_params(stage: PipelineStage) -> dict[str, Any]:  # pragma: no c
         if param_dep.hash_info:
             value = param_dep.hash_info.value
             if isinstance(value, dict):
-                params.update(value)  # pyright: ignore[reportArgumentType,reportCallIssue]
+                params.update(value)
     return params
 
 

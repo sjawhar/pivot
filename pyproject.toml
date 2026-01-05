@@ -40,6 +40,7 @@ dev = [
 
 [tool.basedpyright]
 pythonVersion = "3.13"
+stubPath = "typings"
 exclude = [
     "**/.pytest_cache/**",
     "**/.ruff_cache/**",
@@ -52,6 +53,18 @@ reportAny = false
 reportExplicitAny = false
 reportUnusedCallResult = false
 reportImportCycles = false
+
+[[tool.basedpyright.executionEnvironments]]
+root = "tests"
+extraPaths = ["."]
+reportUnusedFunction = false
+reportUnusedParameter = false
+reportUnusedVariable = false
+reportPrivateUsage = false
+reportRedeclaration = false
+reportMissingTypeStubs = false
+reportUnknownMemberType = false
+reportUnknownVariableType = false
 
 [tool.coverage.run]
 source = ["src/pivot"]

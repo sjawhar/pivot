@@ -329,10 +329,11 @@ class TestImportDvcYaml:
 
         original_import = builtins.__import__
 
-        def mock_import(name: str, *args, **kwargs):  # type: ignore[no-untyped-def]
+        def mock_import(name: str, *args: object, **kwargs: object) -> object:
             if name == "dvc.repo":
                 raise ImportError("No module named 'dvc'")
-            return original_import(name, *args, **kwargs)
+            # Forward to original import - type checker can't verify dynamic import signature
+            return original_import(name, *args, **kwargs)  # pyright: ignore[reportArgumentType]
 
         monkeypatch.setattr(builtins, "__import__", mock_import)
 
@@ -351,18 +352,19 @@ class TestImportDvcYaml:
 
         original_import = builtins.__import__
 
-        def mock_import(name: str, *args, **kwargs):  # type: ignore[no-untyped-def]
+        def mock_import(name: str, *args: object, **kwargs: object) -> object:
             if name == "dvc.repo":
 
                 class MockRepo:
-                    def __init__(self, path):  # type: ignore[no-untyped-def]
+                    def __init__(self, path: str) -> None:
                         pass
 
                 class MockModule:
-                    Repo = MockRepo
+                    Repo: type[MockRepo] = MockRepo
 
                 return MockModule()
-            return original_import(name, *args, **kwargs)
+            # Forward to original import - type checker can't verify dynamic import signature
+            return original_import(name, *args, **kwargs)  # pyright: ignore[reportArgumentType]
 
         monkeypatch.setattr(builtins, "__import__", mock_import)
 

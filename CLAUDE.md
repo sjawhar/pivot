@@ -266,3 +266,7 @@ uv run basedpyright .      # Type check
 4. **Circular import resolution:** When two modules have bidirectional dependencies, extract shared types/exceptions to a separate module (e.g., `exceptions.py` breaks `registry.py` ↔ `trie.py` cycle).
 5. **AST manipulation validation:** After transforming AST nodes (e.g., removing docstrings), validate structural invariants. Function/class bodies must contain at least one statement—add `ast.Pass()` if empty.
 6. **Path overlap detection requires Trie:** Simple string matching can't detect directory/file overlaps (`data/` vs `data/train.csv`). Use prefix-based data structure (pygtrie) for comprehensive validation.
+7. **loky/cloudpickle can't pickle `mp.Queue()`:** Must use `mp.Manager().Queue()` for cross-process queues when using loky. Plain `mp.Queue()` fails with "Could not pickle the task to send it to the workers."
+8. **Reusable executor pattern:** Use `loky.get_reusable_executor()` instead of creating new `ProcessPoolExecutor` instances—workers persist across calls, avoiding repeated import overhead.
+9. **Queue readers must catch specific exceptions:** Only catch `queue.Empty` in queue polling loops, not broad `Exception`. Broad catches mask bugs and make debugging impossible.
+10. **Cross-process tests need file-based state:** Shared mutable state (`execution_log = list[str]()`) silently fails in multiprocessing tests—each process gets its own copy. Use file-based logging (`open("log.txt", "a").write(...)`) for reliable cross-process communication in tests.

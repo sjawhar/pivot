@@ -1,0 +1,23 @@
+"""Type stubs for pygtrie - a pure Python trie implementation."""
+
+from collections.abc import Iterator, Sequence
+from typing import Any, TypeVar
+
+_KT = TypeVar("_KT")
+_VT = TypeVar("_VT")
+
+class _Step:
+    """Represents a step during trie traversal."""
+
+    value: tuple[Any, Any] | None
+
+class Trie:
+    """A trie data structure mapping sequences to values."""
+
+    def __init__(self) -> None: ...
+    def __contains__(self, key: Sequence[str]) -> bool: ...
+    def __setitem__(self, key: Sequence[str], value: tuple[str, str]) -> None: ...
+    def __getitem__(self, key: Sequence[str]) -> tuple[str, str]: ...
+    def has_subtrie(self, key: Sequence[str]) -> bool: ...
+    def values(self, prefix: Sequence[str] | None = None) -> Iterator[tuple[str, str]]: ...
+    def shortest_prefix(self, key: Sequence[str]) -> _Step | None: ...

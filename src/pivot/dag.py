@@ -7,7 +7,7 @@ Uses networkx for graph operations and DFS postorder traversal.
 from __future__ import annotations
 
 import pathlib
-from typing import Any
+from typing import Any, cast
 
 import networkx as nx
 
@@ -37,7 +37,7 @@ def build_dag(stages: dict[str, dict[str, Any]], validate: bool = True) -> nx.Di
         >>> list(nx.dfs_postorder_nodes(graph))
         ['preprocess', 'train']
     """
-    graph = nx.DiGraph()
+    graph: nx.DiGraph[str] = nx.DiGraph()
 
     for stage_name, stage_info in stages.items():
         graph.add_node(stage_name, **stage_info)
@@ -51,8 +51,8 @@ def build_dag(stages: dict[str, dict[str, Any]], validate: bool = True) -> nx.Di
                 graph.add_edge(stage_name, producer)
             elif validate and not pathlib.Path(dep).exists():
                 raise DependencyNotFoundError(
-                    f"Stage '{stage_name}' depends on '{dep}' which is not "
-                    f"produced by any stage and does not exist on disk"
+                    f"Stage '{stage_name}' depends on '{dep}' which is not produced by "
+                    + "any stage and does not exist on disk"
                 )
 
     _check_acyclic(graph)
@@ -85,11 +85,15 @@ def _build_outputs_map(stages: dict[str, dict[str, Any]]) -> dict[str, str]:
 def _check_acyclic(graph: nx.DiGraph[str]) -> None:
     """Check graph for cycles, raise if found."""
     try:
-        cycle = nx.find_cycle(graph, orientation="original")
+        # networkx stubs don't fully type find_cycle's return value
+        cycle = cast(
+            "list[tuple[str, str, str]]",
+            nx.find_cycle(graph, orientation="original"),  # pyright: ignore[reportUnknownMemberType]
+        )
     except nx.NetworkXNoCycle:
         return
 
-    stages_in_cycle = []
+    stages_in_cycle = list[str]()
     for from_node, _to_node, _ in cycle:
         stages_in_cycle.append(from_node)
     if cycle:
@@ -122,11 +126,11 @@ def get_execution_order(graph: nx.DiGraph[str], stages: list[str] | None = None)
 
 def _get_subgraph(graph: nx.DiGraph[str], source_stages: list[str]) -> nx.DiGraph[str]:
     """Get subgraph containing sources and all their dependencies."""
-    nodes = set()
+    nodes = set[str]()
     for stage in source_stages:
         nodes.update(nx.dfs_postorder_nodes(graph, stage))
     # subgraph() returns a SubGraph view that behaves like DiGraph at runtime
-    return graph.subgraph(nodes)  # pyright: ignore[reportReturnType]
+    return cast("nx.DiGraph[str]", graph.subgraph(nodes))
 
 
 def get_parallel_groups(graph: nx.DiGraph[str], stages: list[str] | None = None) -> list[list[str]]:
