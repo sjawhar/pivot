@@ -1,6 +1,6 @@
 # DAG Implementation Plan - Milestone 2.1
 
-## ✅ Status Update (2026-01-05) - MILESTONE 2.2 COMPLETE
+## ✅ Status Update (2026-01-05) - MILESTONE 2.2.5 COMPLETE
 
 **Completed:**
 - ✅ Week 1: Fingerprinting + Registry
@@ -16,21 +16,32 @@
   - Bug fixes: TOCTOU race, path traversal, corrupted file handling, concurrent write safety
   - C YAML parser (CSafeLoader/CSafeDumper) for 5-10x faster I/O
   - 36 tests
+- ✅ **Milestone 2.2.5: Pipeline Executor**
+  - `src/pivot/executor.py` - runs stages in dependency order, skips unchanged
+  - File hashing for dependency change detection
+  - Validates requested stages exist (`StageNotFoundError`)
+  - Validates dependencies exist before running (`DependencyNotFoundError`)
+  - Sentinel file locking (PID-based) to prevent concurrent stage execution
+  - Context manager for clean lock acquisition/release
+  - Bounded retry loop (replaces unbounded recursion)
+  - PermissionError handling for multi-user environments
+  - 14 executor tests + 14 DAG topology tests (linear, tree, diamond, fan-out, fan-in)
 
 **Ready for:**
-- 🔲 Milestone 2.3: DVC YAML export (next task)
+- 🔲 Milestone 2.3: DVC YAML export
 
-**Stats:** 184 tests, 94.50% coverage
+**Stats:** 215 tests, 94.64% coverage
 
 **Files:**
-- `src/pivot/fingerprint.py` (119 lines, 92.18% coverage)
+- `src/pivot/executor.py` (99 lines, 91.87% coverage)
+- `src/pivot/fingerprint.py` (119 lines, 93.85% coverage)
 - `src/pivot/registry.py` (73 lines, 97.75% coverage)
 - `src/pivot/dag.py` (48 lines, 98.57% coverage)
 - `src/pivot/lock.py` (50 lines, 95.16% coverage)
 - `src/pivot/project.py` (22 lines, 100% coverage)
 - `src/pivot/trie.py` (21 lines, 90.32% coverage)
-- `src/pivot/exceptions.py` (18 lines, 100% coverage)
-- `src/pivot/ast_utils.py` (45 lines, 88.89% coverage)
+- `src/pivot/exceptions.py` (22 lines, 100% coverage)
+- `src/pivot/ast_utils.py` (45 lines, 90.48% coverage)
 
 ---
 
@@ -450,6 +461,38 @@ so DAG builder works with absolute paths.
 - Allow stages to be registered in any order
 - Only validate DAG when user calls `validate_dag()` or `run()`
 - More flexible for incremental pipeline building
+
+### 4. Concurrent Execution Locking: Sentinel File with PID
+
+**Problem:** Two processes can race to run the same stage simultaneously, causing wasted compute and potential output corruption.
+
+**Options Considered:**
+
+1. **flock (fcntl.flock)**
+   - Pro: Simple (~5 lines), kernel auto-releases on crash
+   - Con: No Windows support, doesn't work over NFS, "invisible" (can't see who holds lock)
+
+2. **Sentinel file with PID** ✅ CHOSEN
+   - Pro: Cross-platform, visible debugging (can `ls` to see locks), crash recovery via PID check
+   - Pro: Uses `O_CREAT | O_EXCL` for atomic lock acquisition (no TOCTOU)
+   - Con: More code (~30 lines), requires stale lock cleanup
+
+3. **Hard link (flufl.lock style)**
+   - Pro: NFS-safe
+   - Con: Over-engineered for single-machine use, complex
+
+**Decision: Sentinel file with PID**
+
+Rationale:
+- Cross-platform without external dependencies
+- Clear debugging: users can see `stage_name.lock.running` files with PID inside
+- Crash recovery: check if PID is alive, break stale locks
+- Atomic acquisition via `os.open(path, O_CREAT | O_EXCL | O_WRONLY)`
+
+We chose this over `flock` because:
+- Windows support may be needed in future
+- Visible lock state aids debugging ("why is my stage not running?")
+- The added complexity (~25 extra lines) is acceptable for these benefits
 
 ---
 

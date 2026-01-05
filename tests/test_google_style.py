@@ -1,151 +1,58 @@
-import ast
-import hashlib
-import inspect
-import textwrap
-from collections.abc import Callable
-from types import ModuleType
-from typing import Any, override
+"""Tests for Google-style imports with user modules.
+
+Verifies that fingerprinting correctly captures module.attr usage patterns
+like `user_utils.helper_b()` and `user_utils.CONSTANT_A`.
+"""
 
 import tests.user_utils as user_utils
+from pivot import ast_utils, fingerprint
 
 
 def stage_google_style(data: int) -> int:
+    """Stage function using Google-style imports."""
     return user_utils.helper_b(data) + user_utils.CONSTANT_A
 
 
-class ModuleAttrExtractor(ast.NodeVisitor):
-    attrs: list[tuple[str, str]]
+def test_google_style_captures_module_attrs() -> None:
+    """get_stage_fingerprint captures module.attr usage from user modules."""
+    manifest = fingerprint.get_stage_fingerprint(stage_google_style)
 
-    def __init__(self) -> None:
-        self.attrs = list[tuple[str, str]]()
+    # Should capture the stage function itself
+    assert "self:stage_google_style" in manifest, "Should capture stage function"
 
-    @override
-    def visit_Attribute(self, node: ast.Attribute) -> None:
-        if isinstance(node.value, ast.Name):
-            self.attrs.append((node.value.id, node.attr))
-        self.generic_visit(node)
+    # Should capture module attribute usage via AST analysis
+    assert "mod:user_utils.helper_b" in manifest, "Should capture user_utils.helper_b"
+    assert "mod:user_utils.CONSTANT_A" in manifest, "Should capture user_utils.CONSTANT_A"
 
-
-def extract_module_attrs(func: Callable[..., Any]) -> list[tuple[str, str]]:
-    source = textwrap.dedent(inspect.getsource(func))
-    tree = ast.parse(source)
-    extractor = ModuleAttrExtractor()
-    extractor.visit(tree)
-    return extractor.attrs
+    # Verify helper_b is marked as callable
+    assert manifest["mod:user_utils.helper_b"] == "callable", "helper_b should be marked callable"
 
 
-def is_user_module(mod: ModuleType) -> bool:
-    if not hasattr(mod, "__file__") or mod.__file__ is None:
-        return False
-    path = mod.__file__
-    if "site-packages" in path or "dist-packages" in path:
-        return False
-    if "/usr/lib/python" in path:
-        return False
-    return True
+def test_extract_module_attr_usage_finds_patterns() -> None:
+    """extract_module_attr_usage finds module.attr patterns in function AST."""
+    attrs = ast_utils.extract_module_attr_usage(stage_google_style)
+
+    # Should find both user_utils.helper_b and user_utils.CONSTANT_A
+    assert ("user_utils", "helper_b") in attrs, "Should find user_utils.helper_b"
+    assert ("user_utils", "CONSTANT_A") in attrs, "Should find user_utils.CONSTANT_A"
 
 
-def get_fingerprint(func: Callable[..., Any], visited: set[int] | None = None) -> dict[str, str]:
-    if visited is None:
-        visited = set[int]()
+def test_is_user_code_identifies_user_modules() -> None:
+    """is_user_code correctly identifies user module functions."""
+    # user_utils functions should be identified as user code
+    assert fingerprint.is_user_code(user_utils.helper_b), "helper_b should be user code"
+    assert fingerprint.is_user_code(user_utils.helper_a), "helper_a should be user code"
 
-    if id(func) in visited:
-        return dict[str, str]()
-    visited.add(id(func))
+    # stdlib functions should NOT be user code
+    import json
 
-    manifest = dict[str, str]()
-
-    try:
-        source = textwrap.dedent(inspect.getsource(func))
-        tree = ast.parse(source)
-        func_hash = hashlib.md5(ast.dump(tree).encode()).hexdigest()[:8]
-        manifest[f"self:{func.__name__}"] = func_hash
-    except OSError:
-        manifest[f"self:{func.__name__}"] = "no-source"
-
-    cv = inspect.getclosurevars(func)
-    all_refs = {**cv.globals, **cv.nonlocals}
-
-    for name, val in all_refs.items():
-        if callable(val) and hasattr(val, "__code__"):
-            manifest[f"func:{name}"] = get_func_hash(val)
-            manifest.update(get_fingerprint(val, visited))
-
-        elif isinstance(val, (bool, int, float, str, bytes, type(None))):
-            manifest[f"const:{name}"] = repr(val)
-
-        elif isinstance(val, ModuleType) and is_user_module(val):
-            attrs = extract_module_attrs(func)
-            for mod_name, attr_name in attrs:
-                if mod_name == name:
-                    attr_val = getattr(val, attr_name, None)
-                    if callable(attr_val) and hasattr(attr_val, "__code__"):
-                        manifest[f"mod:{name}.{attr_name}"] = get_func_hash(attr_val)
-                        manifest.update(get_fingerprint(attr_val, visited))
-                    elif attr_val is not None:
-                        manifest[f"const:{name}.{attr_name}"] = repr(attr_val)
-
-    return manifest
+    assert not fingerprint.is_user_code(json.dumps), "json.dumps should not be user code"
 
 
-def get_func_hash(func: Callable[..., Any]) -> str:
-    try:
-        source = textwrap.dedent(inspect.getsource(func))
-        tree = ast.parse(source)
-        return hashlib.md5(ast.dump(tree).encode()).hexdigest()[:8]
-    except OSError:
-        return "no-source"
+def test_unused_module_attrs_not_captured() -> None:
+    """Fingerprint only captures actually used module attrs, not all exports."""
+    manifest = fingerprint.get_stage_fingerprint(stage_google_style)
 
-
-def test_google_style_with_user_module() -> None:
-    print("=" * 60)
-    print("TEST: Google-style import with user module")
-    print("=" * 60)
-
-    cv = inspect.getclosurevars(stage_google_style)
-    print(f"Globals: {list(cv.globals.keys())}")
-
-    for name, val in cv.globals.items():
-        if isinstance(val, ModuleType):
-            print(f"  {name} is a module: {val.__file__}")
-            print(f"  is_user_module: {is_user_module(val)}")
-
-    attrs = extract_module_attrs(stage_google_style)
-    print(f"\nModule.attr usage in AST: {attrs}")
-
-    manifest = get_fingerprint(stage_google_style)
-    print("\nFull manifest:")
-    for k, v in sorted(manifest.items()):
-        print(f"  {k}: {v}")
-
-    expected_functions = [
-        "self:stage_google_style",
-        "mod:user_utils.helper_b",
-        "self:helper_b",
-        "self:helper_a",
-        "self:leaf_func",
-    ]
-
-    expected_constants = ["const:user_utils.CONSTANT_A"]
-
-    print("\n--- Verification ---")
-    for exp in expected_functions:
-        if exp in manifest:
-            print(f"  FOUND: {exp}")
-        else:
-            print(f"  MISSING: {exp}")
-
-    for exp in expected_constants:
-        if exp in manifest:
-            print(f"  FOUND: {exp}")
-        else:
-            print(f"  MISSING: {exp}")
-
-    if "unused_func" not in str(manifest):
-        print("  GOOD: unused_func is NOT in manifest (precise tracking!)")
-    else:
-        print("  BAD: unused_func is in manifest (spurious dependency)")
-
-
-if __name__ == "__main__":
-    test_google_style_with_user_module()
+    # unused_func is defined in user_utils but not used by stage_google_style
+    manifest_str = str(manifest)
+    assert "unused_func" not in manifest_str, "unused_func should not be in manifest"

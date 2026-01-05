@@ -50,3 +50,15 @@ class DependencyNotFoundError(DAGError):
     """Raised when a dependency doesn't exist."""
 
     pass
+
+
+class StageNotFoundError(DAGError):
+    """Raised when a requested stage doesn't exist."""
+
+    pass
+
+
+class StageAlreadyRunningError(PivotError):
+    """Raised when a stage is already being executed by another process."""
+
+    pass

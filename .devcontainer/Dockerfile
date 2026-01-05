@@ -1,11 +1,7 @@
-ARG NODE_VERSION=22.21.1
 ARG PYTHON_VERSION=3.13.9
 ARG UV_VERSION=0.9.18
-ARG YARN_VERSION=1.22.22
 
 FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv
-FROM node:${NODE_VERSION}-bookworm AS node
-
 FROM python:${PYTHON_VERSION}-bookworm AS python
 ARG UV_PROJECT_ENVIRONMENT=/opt/python
 ENV PATH=${UV_PROJECT_ENVIRONMENT}/bin:$PATH
@@ -42,14 +38,7 @@ RUN --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
  && sed -i -e 's/# en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen \
  && locale-gen en_US.UTF-8
 
-COPY --from=node /usr/local/bin /usr/local/bin
-COPY --from=node /usr/local/lib/node_modules /usr/local/lib/node_modules
 COPY --from=uv /uv /uvx /usr/local/bin/
-
-ARG YARN_VERSION=1.22.22
-RUN --mount=type=cache,target=/root/.npm \
-    npm install --global --force yarn@${YARN_VERSION}
-
 RUN echo 'eval "$(uv generate-shell-completion bash)"' >> /etc/bash_completion.d/uv
 
 ARG APP_USER=pivot
