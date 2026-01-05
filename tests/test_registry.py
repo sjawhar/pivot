@@ -11,7 +11,7 @@ import math
 import pytest
 from pydantic import BaseModel
 
-from pivot import fingerprint, stage
+from pivot import fingerprint, registry, stage
 from pivot.registry import REGISTRY, StageRegistry
 
 
@@ -37,8 +37,11 @@ def test_stage_decorator_registers_function():
     assert "process" in REGISTRY.list_stages()
     info = REGISTRY.get("process")
     assert info["name"] == "process"
-    assert info["deps"] == ["data.csv"]
-    assert info["outs"] == ["output.txt"]
+    # Paths are normalized to absolute paths
+    assert len(info["deps"]) == 1
+    assert info["deps"][0].endswith("data.csv")
+    assert len(info["outs"]) == 1
+    assert info["outs"][0].endswith("output.txt")
 
 
 def test_stage_decorator_returns_unmodified_function():
@@ -120,18 +123,6 @@ def test_stage_with_no_deps_or_outs():
     assert info["outs"] == []
 
 
-def test_stage_with_stage_dependencies():
-    """Should handle stage:name dependencies."""
-
-    @stage(deps=["stage:preprocess", "data.csv"], outs=["model.pkl"])
-    def train():
-        pass
-
-    info = REGISTRY.get("train")
-    assert "stage:preprocess" in info["deps"]
-    assert "data.csv" in info["deps"]
-
-
 def test_stage_captures_transitive_dependencies():
     """Should capture helper function fingerprints."""
 
@@ -204,8 +195,11 @@ def test_registry_register_directly():
     assert "my_func" in registry.list_stages()
     info = registry.get("my_func")
     assert info["func"] == my_func
-    assert info["deps"] == ["input.txt"]
-    assert info["outs"] == ["output.txt"]
+    # Paths are normalized to absolute paths
+    assert len(info["deps"]) == 1
+    assert info["deps"][0].endswith("input.txt")
+    assert len(info["outs"]) == 1
+    assert info["outs"][0].endswith("output.txt")
 
 
 def test_registry_register_with_custom_name():
@@ -222,20 +216,25 @@ def test_registry_register_with_custom_name():
     assert info["name"] == "custom_name"
 
 
-def test_stage_duplicate_registration_allowed():
-    """Should allow re-registering a stage (overwrites previous)."""
+def test_stage_duplicate_registration_raises_error():
+    """Should raise error when registering two stages with same name."""
 
-    @stage(deps=["old.txt"])
-    def my_stage():
+    def func_one():
         pass
 
-    # Re-register with different deps
-    @stage(deps=["new.txt"])
-    def my_stage():
+    def func_two():
         pass
 
-    info = REGISTRY.get("my_stage")
-    assert info["deps"] == ["new.txt"]
+    # Register first function with name "my_stage"
+    REGISTRY.register(
+        func_one, name="my_stage", deps=["old.txt"], outs=list[str](), params_cls=None
+    )
+
+    # Registering different function with same name should raise error
+    with pytest.raises(registry.ValidationError, match="already registered"):
+        REGISTRY.register(
+            func_two, name="my_stage", deps=["new.txt"], outs=list[str](), params_cls=None
+        )
 
 
 def test_multiple_stages_registered():

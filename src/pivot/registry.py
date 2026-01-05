@@ -14,19 +14,36 @@ Example:
     ...         f.write(data.upper())
 """
 
+import dataclasses
+import enum
 import inspect
+import logging
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, TypeVar
 
 from pydantic import BaseModel
 
-from . import fingerprint
+from pivot import fingerprint, project
 
 F = TypeVar("F", bound=Callable[..., Any])
+logger = logging.getLogger(__name__)
 
 
-@dataclass
+class ValidationError(ValueError):
+    """Raised when stage validation fails."""
+
+    pass
+
+
+class ValidationMode(enum.StrEnum):
+    """Validation strictness levels."""
+
+    ERROR = "error"  # Raise exception on validation failure
+    WARN = "warn"  # Log warning, allow registration
+
+
+@dataclasses.dataclass
 class stage:
     """Decorator for marking functions as pipeline stages.
 
@@ -42,8 +59,8 @@ class stage:
         ...     pass
     """
 
-    deps: list[str] = field(default_factory=list)
-    outs: list[str] = field(default_factory=list)
+    deps: list[str] = dataclasses.field(default_factory=list)
+    outs: list[str] = dataclasses.field(default_factory=list)
     params_cls: type[BaseModel] | None = None
 
     def __call__(self, func: F) -> F:
@@ -61,8 +78,9 @@ class stage:
 class StageRegistry:
     """Global registry for all pipeline stages."""
 
-    def __init__(self) -> None:
+    def __init__(self, validation_mode: ValidationMode = ValidationMode.ERROR) -> None:
         self._stages: dict[str, dict[str, Any]] = {}
+        self.validation_mode: ValidationMode = validation_mode
 
     def register(
         self,
@@ -74,19 +92,51 @@ class StageRegistry:
     ) -> None:
         """Register a stage function with metadata."""
         stage_name = name if name is not None else func.__name__
+        deps_list = deps if deps is not None else []
+        outs_list = outs if outs is not None else []
 
-        # TODO (future): Warn or error on duplicate stage names to prevent
-        # accidental overwrites. Current behavior silently replaces existing stage.
+        # Validate paths BEFORE normalizing
+        _validate_stage_registration(
+            self._stages, stage_name, deps_list, outs_list, self.validation_mode
+        )
 
-        # TODO (future): Validate deps/outs paths:
-        # - Check for invalid characters (e.g., '..')
-        # - Warn on absolute paths outside project
-        # - Detect circular dependencies in stage references
+        # Normalize all paths (resolve relative to project root)
+        # In WARN mode, if normalization fails, use the original path
+        normalized_deps = []
+        for d in deps_list:
+            try:
+                normalized_deps.append(str(project.resolve_path(d)))
+            except (ValueError, OSError):
+                if self.validation_mode == ValidationMode.WARN:
+                    normalized_deps.append(d)  # Use unnormalized path
+                else:
+                    raise
+
+        normalized_outs = []
+        for o in outs_list:
+            try:
+                normalized_outs.append(str(project.resolve_path(o)))
+            except (ValueError, OSError):
+                if self.validation_mode == ValidationMode.WARN:
+                    normalized_outs.append(o)  # Use unnormalized path
+                else:
+                    raise
+
+        deps_list = normalized_deps
+        outs_list = normalized_outs
+
+        # Check for output conflicts with normalized paths
+        for out in outs_list:
+            for existing_name, existing_info in self._stages.items():
+                if out in existing_info.get("outs", []):
+                    msg = f"Output conflict: '{out}' is already produced by stage '{existing_name}'"
+                    _handle_validation_error(msg, self.validation_mode)
+
         self._stages[stage_name] = {
             "func": func,
             "name": stage_name,
-            "deps": deps if deps is not None else [],
-            "outs": outs if outs is not None else [],
+            "deps": deps_list,
+            "outs": outs_list,
             "params_cls": params_cls,
             "signature": inspect.signature(func),
             "fingerprint": fingerprint.get_stage_fingerprint(func),
@@ -103,6 +153,47 @@ class StageRegistry:
     def clear(self) -> None:
         """Clear all registered stages (for testing)."""
         self._stages.clear()
+
+
+def _validate_stage_registration(
+    stages: dict[str, dict[str, Any]],
+    stage_name: str,
+    deps: list[str],
+    outs: list[str],
+    validation_mode: ValidationMode,
+) -> None:
+    """Validate stage registration inputs (before path normalization)."""
+    if stage_name in stages:
+        _handle_validation_error(
+            f"Stage '{stage_name}' already registered. This will overwrite the existing stage.",
+            validation_mode,
+        )
+
+    if not stage_name or not stage_name.strip():
+        _handle_validation_error("Stage name cannot be empty", validation_mode)
+
+    for path in deps + outs:
+        _validate_path(path, stage_name, validation_mode)
+
+
+def _validate_path(path: str, stage_name: str, validation_mode: ValidationMode) -> None:
+    """Validate a single path (before normalization)."""
+    if ".." in Path(path).parts:
+        _handle_validation_error(
+            f"Stage '{stage_name}': Path '{path}' contains '..' (path traversal)", validation_mode
+        )
+
+    if "\x00" in path:
+        _handle_validation_error(
+            f"Stage '{stage_name}': Path '{path}' contains null byte", validation_mode
+        )
+
+
+def _handle_validation_error(msg: str, validation_mode: ValidationMode) -> None:
+    """Raise error or warn based on validation mode."""
+    if validation_mode == ValidationMode.ERROR:
+        raise ValidationError(msg)
+    logger.warning(msg)
 
 
 REGISTRY = StageRegistry()

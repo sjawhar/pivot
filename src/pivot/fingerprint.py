@@ -38,7 +38,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
-from . import ast_utils
+from pivot import ast_utils
 
 _SITE_PACKAGE_PATHS = ("site-packages", "dist-packages")
 
