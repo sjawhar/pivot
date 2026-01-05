@@ -76,8 +76,8 @@ def dry_run_cmd(stages: tuple[str, ...], cache_dir: pathlib.Path | None) -> None
             stage_lock = lock.StageLock(stage_name, cache_path)
 
             current_fingerprint = stage_info["fingerprint"]
-            current_params = _extract_params(stage_info)
-            dep_hashes, missing = _hash_dependencies(stage_info.get("deps", []))
+            current_params = executor.extract_params(stage_info)
+            dep_hashes, missing = executor.hash_dependencies(stage_info.get("deps", []))
 
             if missing:
                 click.echo(f"  {stage_name}: would run (missing deps: {', '.join(missing)})")
@@ -133,30 +133,6 @@ def _print_results(results: dict[str, dict[str, Any]]) -> None:
             click.echo(f"{name}: skipped")
 
     click.echo(f"\nTotal: {ran} ran, {skipped} skipped")
-
-
-def _extract_params(stage_info: dict[str, Any]) -> dict[str, Any]:
-    """Extract parameter values from stage signature defaults."""
-    sig = stage_info.get("signature")
-    if not sig:
-        return {}
-    return {
-        name: param.default
-        for name, param in sig.parameters.items()
-        if param.default is not param.empty
-    }
-
-
-def _hash_dependencies(deps: list[str]) -> tuple[dict[str, str], list[str]]:
-    """Hash all dependency files. Returns (hashes, missing_files)."""
-    hashes = dict[str, str]()
-    missing = list[str]()
-    for dep in deps:
-        try:
-            hashes[dep] = executor.hash_file(pathlib.Path(dep))
-        except FileNotFoundError:
-            missing.append(dep)
-    return hashes, missing
 
 
 def _setup_logging(verbose: bool) -> None:

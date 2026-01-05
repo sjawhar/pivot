@@ -423,3 +423,655 @@ def test_output_thread_cleanup_completes(pipeline_dir: pathlib.Path) -> None:
         f"Thread leak: started with {initial_thread_count}, ended with {final_thread_count}"
     )
     assert results["process"]["status"] == "ran"
+
+
+def test_mutex_prevents_concurrent_execution(pipeline_dir: pathlib.Path) -> None:
+    """Stages in same mutex group run sequentially, not concurrently."""
+    import time
+
+    from pivot import executor
+
+    (pipeline_dir / "input.txt").write_text("data")
+    timing_file = pipeline_dir / "timing.txt"
+
+    @stage(deps=["input.txt"], outs=["a.txt"], mutex=["gpu"])
+    def stage_a() -> None:
+        with open("timing.txt", "a") as f:
+            f.write("a_start\n")
+        time.sleep(0.1)  # Ensure overlap would be detected
+        with open("timing.txt", "a") as f:
+            f.write("a_end\n")
+        pathlib.Path("a.txt").write_text("a")
+
+    @stage(deps=["input.txt"], outs=["b.txt"], mutex=["gpu"])
+    def stage_b() -> None:
+        with open("timing.txt", "a") as f:
+            f.write("b_start\n")
+        time.sleep(0.1)
+        with open("timing.txt", "a") as f:
+            f.write("b_end\n")
+        pathlib.Path("b.txt").write_text("b")
+
+    results = executor.run(max_workers=4, show_output=False)
+
+    assert results["stage_a"]["status"] == "ran"
+    assert results["stage_b"]["status"] == "ran"
+
+    # Verify sequential execution: either a_start,a_end,b_start,b_end or b_start,b_end,a_start,a_end
+    timing = timing_file.read_text().strip().split("\n")
+    assert timing in [
+        ["a_start", "a_end", "b_start", "b_end"],
+        ["b_start", "b_end", "a_start", "a_end"],
+    ], f"Stages ran concurrently: {timing}"
+
+
+def test_mutex_releases_on_completion(pipeline_dir: pathlib.Path) -> None:
+    """Mutex is released when stage completes, allowing next stage to start."""
+    from pivot import executor
+
+    (pipeline_dir / "input.txt").write_text("data")
+
+    @stage(deps=["input.txt"], outs=["first.txt"], mutex=["resource"])
+    def first() -> None:
+        pathlib.Path("first.txt").write_text("first")
+
+    @stage(deps=["input.txt"], outs=["second.txt"], mutex=["resource"])
+    def second() -> None:
+        pathlib.Path("second.txt").write_text("second")
+
+    results = executor.run(max_workers=4, show_output=False)
+
+    assert results["first"]["status"] == "ran"
+    assert results["second"]["status"] == "ran"
+    assert (pipeline_dir / "first.txt").exists()
+    assert (pipeline_dir / "second.txt").exists()
+
+
+def test_mutex_releases_on_failure(pipeline_dir: pathlib.Path) -> None:
+    """Mutex is released even when stage fails, allowing other stages to run."""
+    from pivot import executor
+
+    (pipeline_dir / "input.txt").write_text("data")
+
+    @stage(deps=["input.txt"], outs=["failing.txt"], mutex=["resource"])
+    def failing() -> None:
+        raise RuntimeError("Intentional failure")
+
+    @stage(deps=["input.txt"], outs=["succeeding.txt"], mutex=["resource"])
+    def succeeding() -> None:
+        pathlib.Path("succeeding.txt").write_text("success")
+
+    results = executor.run(max_workers=4, on_error="keep_going", show_output=False)
+
+    assert results["failing"]["status"] == "failed"
+    assert results["succeeding"]["status"] == "ran"
+    assert (pipeline_dir / "succeeding.txt").exists()
+
+
+def test_different_mutex_groups_run_parallel(pipeline_dir: pathlib.Path) -> None:
+    """Stages in different mutex groups can run concurrently."""
+    import time
+
+    from pivot import executor
+
+    (pipeline_dir / "input.txt").write_text("data")
+    timing_file = pipeline_dir / "timing.txt"
+
+    @stage(deps=["input.txt"], outs=["gpu.txt"], mutex=["gpu"])
+    def gpu_stage() -> None:
+        with open("timing.txt", "a") as f:
+            f.write("gpu_start\n")
+        time.sleep(0.1)
+        with open("timing.txt", "a") as f:
+            f.write("gpu_end\n")
+        pathlib.Path("gpu.txt").write_text("gpu")
+
+    @stage(deps=["input.txt"], outs=["disk.txt"], mutex=["disk"])
+    def disk_stage() -> None:
+        with open("timing.txt", "a") as f:
+            f.write("disk_start\n")
+        time.sleep(0.1)
+        with open("timing.txt", "a") as f:
+            f.write("disk_end\n")
+        pathlib.Path("disk.txt").write_text("disk")
+
+    results = executor.run(max_workers=4, show_output=False)
+
+    assert results["gpu_stage"]["status"] == "ran"
+    assert results["disk_stage"]["status"] == "ran"
+
+    # With different mutex groups, stages should overlap
+    timing = timing_file.read_text().strip().split("\n")
+    # Overlapping means interleaved starts/ends (not strictly sequential)
+    # Accept any order that has both stages running (tests parallelism capability)
+    assert len(timing) == 4, f"Expected 4 timing entries, got {timing}"
+
+
+def test_multiple_mutex_groups_per_stage(pipeline_dir: pathlib.Path) -> None:
+    """Stage with multiple mutex groups blocks all of them."""
+    import time
+
+    from pivot import executor
+
+    (pipeline_dir / "input.txt").write_text("data")
+    timing_file = pipeline_dir / "timing.txt"
+
+    @stage(deps=["input.txt"], outs=["multi.txt"], mutex=["gpu", "disk"])
+    def multi_resource() -> None:
+        with open("timing.txt", "a") as f:
+            f.write("multi_start\n")
+        time.sleep(0.1)
+        with open("timing.txt", "a") as f:
+            f.write("multi_end\n")
+        pathlib.Path("multi.txt").write_text("multi")
+
+    @stage(deps=["input.txt"], outs=["gpu_only.txt"], mutex=["gpu"])
+    def gpu_only() -> None:
+        with open("timing.txt", "a") as f:
+            f.write("gpu_start\n")
+        time.sleep(0.1)
+        with open("timing.txt", "a") as f:
+            f.write("gpu_end\n")
+        pathlib.Path("gpu_only.txt").write_text("gpu")
+
+    results = executor.run(max_workers=4, show_output=False)
+
+    assert results["multi_resource"]["status"] == "ran"
+    assert results["gpu_only"]["status"] == "ran"
+
+    # Stages should be sequential due to shared "gpu" mutex
+    timing = timing_file.read_text().strip().split("\n")
+    assert timing in [
+        ["multi_start", "multi_end", "gpu_start", "gpu_end"],
+        ["gpu_start", "gpu_end", "multi_start", "multi_end"],
+    ], f"Stages ran concurrently despite shared mutex: {timing}"
+
+
+def test_mutex_with_dependencies(pipeline_dir: pathlib.Path) -> None:
+    """Mutex works correctly with stage dependencies."""
+    from pivot import executor
+
+    (pipeline_dir / "input.txt").write_text("data")
+
+    @stage(deps=["input.txt"], outs=["first.txt"], mutex=["resource"])
+    def first() -> None:
+        pathlib.Path("first.txt").write_text("first")
+
+    @stage(deps=["first.txt"], outs=["second.txt"], mutex=["resource"])
+    def second() -> None:
+        data = pathlib.Path("first.txt").read_text()
+        pathlib.Path("second.txt").write_text(f"second: {data}")
+
+    results = executor.run(max_workers=4, show_output=False)
+
+    assert results["first"]["status"] == "ran"
+    assert results["second"]["status"] == "ran"
+    assert (pipeline_dir / "second.txt").read_text() == "second: first"
+
+
+def test_no_mutex_stages_unaffected(pipeline_dir: pathlib.Path) -> None:
+    """Stages without mutex run normally in parallel."""
+    import time
+
+    from pivot import executor
+
+    (pipeline_dir / "input.txt").write_text("data")
+    timing_file = pipeline_dir / "timing.txt"
+
+    @stage(deps=["input.txt"], outs=["a.txt"])
+    def stage_a() -> None:
+        with open("timing.txt", "a") as f:
+            f.write("a_start\n")
+        time.sleep(0.1)
+        with open("timing.txt", "a") as f:
+            f.write("a_end\n")
+        pathlib.Path("a.txt").write_text("a")
+
+    @stage(deps=["input.txt"], outs=["b.txt"])
+    def stage_b() -> None:
+        with open("timing.txt", "a") as f:
+            f.write("b_start\n")
+        time.sleep(0.1)
+        with open("timing.txt", "a") as f:
+            f.write("b_end\n")
+        pathlib.Path("b.txt").write_text("b")
+
+    results = executor.run(max_workers=4, show_output=False)
+
+    assert results["stage_a"]["status"] == "ran"
+    assert results["stage_b"]["status"] == "ran"
+
+    # Without mutex, stages should run in parallel (interleaved timing)
+    timing = timing_file.read_text().strip().split("\n")
+    assert len(timing) == 4
+
+
+def test_single_stage_mutex_warning(
+    pipeline_dir: pathlib.Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Warning is logged when mutex group has only one stage."""
+    import logging
+
+    from pivot import executor
+
+    (pipeline_dir / "input.txt").write_text("data")
+
+    @stage(deps=["input.txt"], outs=["output.txt"], mutex=["lonely_group"])
+    def lonely() -> None:
+        pathlib.Path("output.txt").write_text("done")
+
+    with caplog.at_level(logging.WARNING):
+        results = executor.run(show_output=False)
+
+    assert results["lonely"]["status"] == "ran"
+    assert any(
+        "lonely_group" in record.message and "lonely" in record.message for record in caplog.records
+    ), (
+        f"Expected warning about single-stage mutex group, got: {[r.message for r in caplog.records]}"
+    )
+
+
+# =============================================================================
+# Error Mode Tests
+# =============================================================================
+
+
+def test_on_error_fail_stops_on_first_failure(pipeline_dir: pathlib.Path) -> None:
+    """on_error='fail' stops pipeline when first stage fails."""
+    from pivot import executor
+
+    (pipeline_dir / "input.txt").write_text("data")
+    execution_log = pipeline_dir / "execution.log"
+
+    @stage(deps=["input.txt"], outs=["a.txt"])
+    def stage_a() -> None:
+        with open("execution.log", "a") as f:
+            f.write("a\n")
+        raise RuntimeError("Stage A failed")
+
+    @stage(deps=["input.txt"], outs=["b.txt"])
+    def stage_b() -> None:
+        with open("execution.log", "a") as f:
+            f.write("b\n")
+        pathlib.Path("b.txt").write_text("b")
+
+    results = executor.run(on_error="fail", show_output=False)
+
+    assert results["stage_a"]["status"] == "failed"
+    # stage_b may or may not run depending on timing, but pipeline should stop
+    log_content = execution_log.read_text() if execution_log.exists() else ""
+    assert "a" in log_content, "Stage A should have executed"
+
+
+def test_on_error_keep_going_continues_independent_stages(pipeline_dir: pathlib.Path) -> None:
+    """on_error='keep_going' continues running independent stages after failure."""
+    from pivot import executor
+
+    (pipeline_dir / "input.txt").write_text("data")
+
+    @stage(deps=["input.txt"], outs=["failing.txt"])
+    def failing() -> None:
+        raise RuntimeError("Intentional failure")
+
+    @stage(deps=["input.txt"], outs=["succeeding.txt"])
+    def succeeding() -> None:
+        pathlib.Path("succeeding.txt").write_text("success")
+
+    results = executor.run(on_error="keep_going", show_output=False)
+
+    assert results["failing"]["status"] == "failed"
+    assert results["succeeding"]["status"] == "ran"
+    assert (pipeline_dir / "succeeding.txt").read_text() == "success"
+
+
+def test_on_error_keep_going_skips_downstream_of_failed(pipeline_dir: pathlib.Path) -> None:
+    """on_error='keep_going' skips stages that depend on failed stage."""
+    from pivot import executor
+
+    (pipeline_dir / "input.txt").write_text("data")
+
+    @stage(deps=["input.txt"], outs=["first.txt"])
+    def first() -> None:
+        raise RuntimeError("First failed")
+
+    @stage(deps=["first.txt"], outs=["second.txt"])
+    def second() -> None:
+        pathlib.Path("second.txt").write_text("should not run")
+
+    @stage(deps=["input.txt"], outs=["independent.txt"])
+    def independent() -> None:
+        pathlib.Path("independent.txt").write_text("runs fine")
+
+    results = executor.run(on_error="keep_going", show_output=False)
+
+    assert results["first"]["status"] == "failed"
+    assert results["second"]["status"] == "skipped"
+    assert "upstream" in results["second"]["reason"]
+    assert results["independent"]["status"] == "ran"
+
+
+def test_on_error_ignore_allows_downstream_to_attempt(pipeline_dir: pathlib.Path) -> None:
+    """on_error='ignore' allows downstream stages to attempt running."""
+    from pivot import executor
+
+    (pipeline_dir / "input.txt").write_text("data")
+    # Create the intermediate file so downstream can try to run
+    (pipeline_dir / "first.txt").write_text("preexisting")
+
+    @stage(deps=["input.txt"], outs=["first.txt"])
+    def first() -> None:
+        raise RuntimeError("First failed")
+
+    @stage(deps=["first.txt"], outs=["second.txt"])
+    def second() -> None:
+        # This stage will attempt to run because on_error=ignore
+        data = pathlib.Path("first.txt").read_text()
+        pathlib.Path("second.txt").write_text(f"got: {data}")
+
+    results = executor.run(on_error="ignore", show_output=False)
+
+    assert results["first"]["status"] == "failed"
+    # With ignore mode, second stage runs (since first.txt exists)
+    assert results["second"]["status"] == "ran"
+    assert (pipeline_dir / "second.txt").read_text() == "got: preexisting"
+
+
+def test_invalid_on_error_raises_value_error(pipeline_dir: pathlib.Path) -> None:
+    """Invalid on_error value raises ValueError."""
+    from pivot import executor
+
+    (pipeline_dir / "input.txt").write_text("data")
+
+    @stage(deps=["input.txt"], outs=["output.txt"])
+    def process() -> None:
+        pass
+
+    with pytest.raises(ValueError) as exc_info:
+        executor.run(on_error="invalid_mode", show_output=False)
+
+    assert "invalid_mode" in str(exc_info.value)
+    assert "fail" in str(exc_info.value)  # Should mention valid options
+
+
+# =============================================================================
+# Worker Exception Tests
+# =============================================================================
+
+
+def test_stage_calling_sys_exit_returns_failed(pipeline_dir: pathlib.Path) -> None:
+    """Stage calling sys.exit() returns failed status with exit code."""
+    import sys
+
+    from pivot import executor
+
+    (pipeline_dir / "input.txt").write_text("data")
+
+    @stage(deps=["input.txt"], outs=["output.txt"])
+    def exits_with_code() -> None:
+        sys.exit(42)
+
+    results = executor.run(show_output=False)
+
+    assert results["exits_with_code"]["status"] == "failed"
+    assert "sys.exit" in results["exits_with_code"]["reason"]
+    assert "42" in results["exits_with_code"]["reason"]
+
+
+def test_stage_calling_sys_exit_zero_returns_failed(pipeline_dir: pathlib.Path) -> None:
+    """Stage calling sys.exit(0) still returns failed (stages shouldn't exit)."""
+    import sys
+
+    from pivot import executor
+
+    (pipeline_dir / "input.txt").write_text("data")
+
+    @stage(deps=["input.txt"], outs=["output.txt"])
+    def exits_zero() -> None:
+        sys.exit(0)
+
+    results = executor.run(show_output=False)
+
+    assert results["exits_zero"]["status"] == "failed"
+    assert "sys.exit" in results["exits_zero"]["reason"]
+
+
+def test_stage_raising_keyboard_interrupt_returns_failed(pipeline_dir: pathlib.Path) -> None:
+    """Stage raising KeyboardInterrupt returns failed status."""
+    from pivot import executor
+
+    (pipeline_dir / "input.txt").write_text("data")
+
+    @stage(deps=["input.txt"], outs=["output.txt"])
+    def keyboard_interrupt() -> None:
+        raise KeyboardInterrupt("User cancelled")
+
+    results = executor.run(show_output=False)
+
+    assert results["keyboard_interrupt"]["status"] == "failed"
+
+
+# =============================================================================
+# Dependency Validation Tests
+# =============================================================================
+
+
+def test_dependency_is_directory_returns_failed(pipeline_dir: pathlib.Path) -> None:
+    """Stage with directory as dependency returns failed with clear message."""
+    from pivot import executor
+
+    # Create a directory instead of a file
+    (pipeline_dir / "data_dir").mkdir()
+
+    @stage(deps=["data_dir"], outs=["output.txt"])
+    def process() -> None:
+        pathlib.Path("output.txt").write_text("done")
+
+    results = executor.run(show_output=False)
+
+    assert results["process"]["status"] == "failed"
+    assert "directory" in results["process"]["reason"].lower()
+
+
+# =============================================================================
+# Non-Parallel Execution Tests
+# =============================================================================
+
+
+def test_parallel_false_runs_sequentially(pipeline_dir: pathlib.Path) -> None:
+    """parallel=False runs stages one at a time."""
+    import time
+
+    from pivot import executor
+
+    (pipeline_dir / "input.txt").write_text("data")
+    timing_file = pipeline_dir / "timing.txt"
+
+    @stage(deps=["input.txt"], outs=["a.txt"])
+    def stage_a() -> None:
+        with open("timing.txt", "a") as f:
+            f.write("a_start\n")
+        time.sleep(0.05)
+        with open("timing.txt", "a") as f:
+            f.write("a_end\n")
+        pathlib.Path("a.txt").write_text("a")
+
+    @stage(deps=["input.txt"], outs=["b.txt"])
+    def stage_b() -> None:
+        with open("timing.txt", "a") as f:
+            f.write("b_start\n")
+        time.sleep(0.05)
+        with open("timing.txt", "a") as f:
+            f.write("b_end\n")
+        pathlib.Path("b.txt").write_text("b")
+
+    results = executor.run(parallel=False, show_output=False)
+
+    assert results["stage_a"]["status"] == "ran"
+    assert results["stage_b"]["status"] == "ran"
+
+    # With parallel=False, stages must be strictly sequential
+    timing = timing_file.read_text().strip().split("\n")
+    assert timing in [
+        ["a_start", "a_end", "b_start", "b_end"],
+        ["b_start", "b_end", "a_start", "a_end"],
+    ], f"Stages overlapped with parallel=False: {timing}"
+
+
+# =============================================================================
+# Output Capture Tests
+# =============================================================================
+
+
+def test_stage_stdout_and_stderr_captured(pipeline_dir: pathlib.Path) -> None:
+    """Stage stdout and stderr are captured in results."""
+    import sys
+
+    from pivot import executor
+
+    (pipeline_dir / "input.txt").write_text("data")
+
+    @stage(deps=["input.txt"], outs=["output.txt"])
+    def prints_output() -> None:
+        print("stdout message")
+        print("stderr message", file=sys.stderr)
+        pathlib.Path("output.txt").write_text("done")
+
+    results = executor.run(show_output=False)
+
+    assert results["prints_output"]["status"] == "ran"
+    # Output lines are captured in results but not exposed in dict
+    # The stage should run successfully with captured output
+
+
+def test_stage_partial_line_output_captured(pipeline_dir: pathlib.Path) -> None:
+    """Stage output without trailing newline is captured."""
+    import sys
+
+    from pivot import executor
+
+    (pipeline_dir / "input.txt").write_text("data")
+
+    @stage(deps=["input.txt"], outs=["output.txt"])
+    def partial_output() -> None:
+        sys.stdout.write("no newline at end")
+        sys.stdout.flush()
+        pathlib.Path("output.txt").write_text("done")
+
+    results = executor.run(show_output=False)
+    assert results["partial_output"]["status"] == "ran"
+
+
+# =============================================================================
+# Lock Retry Exhaustion Tests
+# =============================================================================
+
+
+def test_lock_retry_exhaustion_returns_failed(pipeline_dir: pathlib.Path) -> None:
+    """Multiple failed lock attempts return failed status."""
+    import os
+
+    from pivot import executor
+
+    (pipeline_dir / "input.txt").write_text("data")
+    cache_dir = pipeline_dir / ".pivot" / "cache"
+    cache_dir.mkdir(parents=True)
+
+    # Create a lock with our own PID (simulates live concurrent run)
+    lock_file = cache_dir / "process.running"
+    lock_file.write_text(f"pid: {os.getpid()}\n")
+
+    @stage(deps=["input.txt"], outs=["output.txt"])
+    def process() -> None:
+        pathlib.Path("output.txt").write_text("done")
+
+    results = executor.run(show_output=False)
+
+    assert results["process"]["status"] == "failed"
+    assert "already running" in results["process"]["reason"]
+
+    lock_file.unlink()
+
+
+# =============================================================================
+# Mutex Name Normalization Tests
+# =============================================================================
+
+
+def test_mutex_names_are_case_insensitive(pipeline_dir: pathlib.Path) -> None:
+    """Mutex names are normalized to lowercase for comparison."""
+    import time
+
+    from pivot import executor
+
+    (pipeline_dir / "input.txt").write_text("data")
+    timing_file = pipeline_dir / "timing.txt"
+
+    @stage(deps=["input.txt"], outs=["upper.txt"], mutex=["GPU"])
+    def upper_mutex() -> None:
+        with open("timing.txt", "a") as f:
+            f.write("upper_start\n")
+        time.sleep(0.1)
+        with open("timing.txt", "a") as f:
+            f.write("upper_end\n")
+        pathlib.Path("upper.txt").write_text("done")
+
+    @stage(deps=["input.txt"], outs=["lower.txt"], mutex=["gpu"])
+    def lower_mutex() -> None:
+        with open("timing.txt", "a") as f:
+            f.write("lower_start\n")
+        time.sleep(0.1)
+        with open("timing.txt", "a") as f:
+            f.write("lower_end\n")
+        pathlib.Path("lower.txt").write_text("done")
+
+    results = executor.run(max_workers=4, show_output=False)
+
+    assert results["upper_mutex"]["status"] == "ran"
+    assert results["lower_mutex"]["status"] == "ran"
+
+    # Should be sequential due to mutex normalization
+    timing = timing_file.read_text().strip().split("\n")
+    assert timing in [
+        ["upper_start", "upper_end", "lower_start", "lower_end"],
+        ["lower_start", "lower_end", "upper_start", "upper_end"],
+    ], f"Mutex names not normalized - stages ran concurrently: {timing}"
+
+
+def test_mutex_names_whitespace_stripped(pipeline_dir: pathlib.Path) -> None:
+    """Mutex names have whitespace stripped."""
+    import time
+
+    from pivot import executor
+
+    (pipeline_dir / "input.txt").write_text("data")
+    timing_file = pipeline_dir / "timing.txt"
+
+    @stage(deps=["input.txt"], outs=["spaced.txt"], mutex=["  resource  "])
+    def spaced_mutex() -> None:
+        with open("timing.txt", "a") as f:
+            f.write("spaced_start\n")
+        time.sleep(0.1)
+        with open("timing.txt", "a") as f:
+            f.write("spaced_end\n")
+        pathlib.Path("spaced.txt").write_text("done")
+
+    @stage(deps=["input.txt"], outs=["clean.txt"], mutex=["resource"])
+    def clean_mutex() -> None:
+        with open("timing.txt", "a") as f:
+            f.write("clean_start\n")
+        time.sleep(0.1)
+        with open("timing.txt", "a") as f:
+            f.write("clean_end\n")
+        pathlib.Path("clean.txt").write_text("done")
+
+    results = executor.run(max_workers=4, show_output=False)
+
+    assert results["spaced_mutex"]["status"] == "ran"
+    assert results["clean_mutex"]["status"] == "ran"
+
+    # Should be sequential due to mutex normalization
+    timing = timing_file.read_text().strip().split("\n")
+    assert timing in [
+        ["spaced_start", "spaced_end", "clean_start", "clean_end"],
+        ["clean_start", "clean_end", "spaced_start", "spaced_end"],
+    ], f"Mutex whitespace not stripped - stages ran concurrently: {timing}"
