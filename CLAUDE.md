@@ -203,6 +203,7 @@ raise Exception("failed")
 Prioritize validating inputs at boundaries rather than defensively handling every possible error deep in the code.
 
 **Principles:**
+
 - Validate inputs early, then trust them downstream
 - Fail fast with clear errors rather than silently degrading
 - Don't try to "fix" invalid inputs—reject them
@@ -229,6 +230,7 @@ def export_stages(stages: list[str]) -> None:
 ```
 
 **When defensive code IS appropriate:**
+
 - External I/O (network, filesystem, user input)
 - Third-party library calls with unclear error modes
 - Graceful degradation in non-critical paths
@@ -246,11 +248,11 @@ print(f"Stage {name} completed")
 ## Development Commands
 
 ```bash
-uv sync                    # Install dependencies
-uv run pytest tests/       # Run tests
-uv run ruff format .       # Format
-uv run ruff check .        # Lint
-uv run basedpyright .      # Type check
+uv sync --active    # Install dependencies
+pytest tests/       # Run tests
+ruff format .       # Format
+ruff check .        # Lint
+basedpyright .      # Type check
 ```
 
 ## Before Returning to User (Critical)

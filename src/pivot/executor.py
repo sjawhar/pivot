@@ -376,20 +376,9 @@ def _start_ready_stages(
         if any(mutex_counts[m] > 0 for m in state.mutex):
             continue
 
-        state.status = StageStatus.IN_PROGRESS
-        state.start_time = time.perf_counter()
-
-        # Acquire mutex locks
+        # Acquire mutex locks before changing status
         for mutex in state.mutex:
             mutex_counts[mutex] += 1
-
-        if con:
-            con.stage_start(
-                name=stage_name,
-                index=completed_count + len(futures) + 1,
-                total=total_stages,
-                status=StageDisplayStatus.RUNNING,
-            )
 
         worker_info = _prepare_worker_info(state.info)
 
@@ -403,6 +392,18 @@ def _start_ready_stages(
             )
             futures[future] = stage_name
             started += 1
+
+            # Only mark as in-progress after successful submission
+            state.status = StageStatus.IN_PROGRESS
+            state.start_time = time.perf_counter()
+
+            if con:
+                con.stage_start(
+                    name=stage_name,
+                    index=completed_count + len(futures),
+                    total=total_stages,
+                    status=StageDisplayStatus.RUNNING,
+                )
         except Exception as e:
             # Rollback mutex acquisition on submission failure
             for mutex in state.mutex:
@@ -472,7 +473,7 @@ def _handle_stage_failure(
             }
 
 
-def execute_stage_worker(  # pragma: no cover (runs in subprocess)
+def execute_stage_worker(
     stage_name: str,
     stage_info: dict[str, Any],
     cache_dir: pathlib.Path,
@@ -525,7 +526,7 @@ def execute_stage_worker(  # pragma: no cover (runs in subprocess)
         return {"status": "failed", "reason": str(e), "output_lines": output_lines}
 
 
-def _run_stage_function_with_capture(  # pragma: no cover (runs in subprocess)
+def _run_stage_function_with_capture(
     func: Callable[..., Any],
     stage_name: str,
     output_queue: mp.Queue[OutputMessage],
@@ -556,7 +557,7 @@ def _run_stage_function_with_capture(  # pragma: no cover (runs in subprocess)
     return output_lines
 
 
-class _QueueStreamCapture(io.TextIOBase):  # pragma: no cover (runs in subprocess)
+class _QueueStreamCapture(io.TextIOBase):
     """Capture stream output and send to queue for main process."""
 
     _stage_name: str
@@ -655,9 +656,7 @@ _MAX_LOCK_ATTEMPTS = 3
 
 
 @contextlib.contextmanager
-def _execution_lock(
-    stage_name: str, cache_dir: pathlib.Path
-) -> Generator[pathlib.Path]:  # pragma: no cover
+def _execution_lock(stage_name: str, cache_dir: pathlib.Path) -> Generator[pathlib.Path]:
     """Context manager for stage execution lock."""
     sentinel = _acquire_execution_lock(stage_name, cache_dir)
     try:
@@ -666,9 +665,7 @@ def _execution_lock(
         sentinel.unlink(missing_ok=True)
 
 
-def _acquire_execution_lock(
-    stage_name: str, cache_dir: pathlib.Path
-) -> pathlib.Path:  # pragma: no cover
+def _acquire_execution_lock(stage_name: str, cache_dir: pathlib.Path) -> pathlib.Path:
     """Acquire exclusive lock for stage execution. Returns sentinel path."""
     cache_dir.mkdir(parents=True, exist_ok=True)
     sentinel = cache_dir / f"{stage_name}.running"
@@ -702,7 +699,7 @@ def _acquire_execution_lock(
     )
 
 
-def _is_process_alive(pid: int) -> bool:  # pragma: no cover
+def _is_process_alive(pid: int) -> bool:
     """Check if process is still running."""
     try:
         os.kill(pid, 0)

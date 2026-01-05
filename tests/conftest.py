@@ -38,21 +38,14 @@ def clean_registry(mocker: MockerFixture) -> Generator[None]:
 _PIVOT_LOGGERS = ("pivot", "pivot.project", "pivot.executor", "pivot.registry", "")
 
 
-def _reset_pivot_globals() -> None:
-    """Reset console singleton, project root cache, and logging handlers."""
-    console._console = None
-    project._project_root_cache = None
-    for name in _PIVOT_LOGGERS:
-        logging.getLogger(name).handlers.clear()
-
-
 @pytest.fixture(autouse=True)
-def reset_pivot_state() -> Generator[None]:
+def reset_pivot_state():
     """Reset global pivot state between tests.
 
     CliRunner can leave console singleton pointing to closed streams,
     and project root cache pointing to old directories.
     """
-    _reset_pivot_globals()
-    yield
-    _reset_pivot_globals()
+    console._console = None
+    project._project_root_cache = None
+    for name in _PIVOT_LOGGERS:
+        logging.getLogger(name).handlers.clear()

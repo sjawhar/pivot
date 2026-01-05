@@ -540,11 +540,18 @@ def test_different_mutex_groups_run_parallel(pipeline_dir: pathlib.Path) -> None
     assert results["gpu_stage"]["status"] == "ran"
     assert results["disk_stage"]["status"] == "ran"
 
-    # With different mutex groups, stages should overlap
+    # With different mutex groups, stages should run in parallel (interleaved timing)
     timing = timing_file.read_text().strip().split("\n")
-    # Overlapping means interleaved starts/ends (not strictly sequential)
-    # Accept any order that has both stages running (tests parallelism capability)
     assert len(timing) == 4, f"Expected 4 timing entries, got {timing}"
+
+    # Verify parallelism: stages should interleave, not run sequentially
+    # Sequential would be: [X_start, X_end, Y_start, Y_end]
+    # Parallel should be: [X_start, Y_start, ...] or [Y_start, X_start, ...]
+    is_sequential = timing in [
+        ["gpu_start", "gpu_end", "disk_start", "disk_end"],
+        ["disk_start", "disk_end", "gpu_start", "gpu_end"],
+    ]
+    assert not is_sequential, f"Stages ran sequentially despite different mutex groups: {timing}"
 
 
 def test_multiple_mutex_groups_per_stage(pipeline_dir: pathlib.Path) -> None:

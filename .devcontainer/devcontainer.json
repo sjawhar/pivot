@@ -1,6 +1,9 @@
 {
     "name": "Pivot dev",
-    "dockerFile": "Dockerfile",
+    "build": {
+        "dockerfile": "Dockerfile",
+        "context": ".."
+    },
     "mounts": [
         {
             "source": "pivot-home",
@@ -12,6 +15,8 @@
         "--name=pivot-dev",
         "--hostname=pivot-dev"
     ],
+    "workspaceMount": "source=${localWorkspaceFolder},target=/home/pivot/app,type=bind,consistency=cached",
+    "workspaceFolder": "/home/pivot/app",
     "features": {
         "ghcr.io/anthropics/devcontainer-features/claude-code:1": {}
     },
@@ -26,6 +31,7 @@
                 "[python]": {
                     "editor.defaultFormatter": "charliermarsh.ruff"
                 },
+                "python.defaultInterpreterPath": "/opt/python/bin/python",
                 "python.testing.pytestArgs": [],
                 "python.testing.unittestEnabled": false,
                 "python.testing.pytestEnabled": true
