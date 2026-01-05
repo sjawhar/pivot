@@ -1,0 +1,48 @@
+{
+    "name": "Pivot dev",
+    "dockerFile": "Dockerfile",
+    "mounts": [
+        {
+            "source": "pivot-home",
+            "target": "/home/pivot",
+            "type": "volume"
+        }
+    ],
+    "runArgs": [
+        "--name=pivot-dev",
+        "--hostname=pivot-dev"
+    ],
+    "features": {
+        "ghcr.io/anthropics/devcontainer-features/claude-code:1": {}
+    },
+    "customizations": {
+        "vscode": {
+            "settings": {
+                "editor.codeActionsOnSave": {
+                    "source.organizeImports": "explicit"
+                },
+                "editor.formatOnSave": true,
+                "python.analysis.typeCheckingMode": "strict",
+                "[python]": {
+                    "editor.defaultFormatter": "charliermarsh.ruff"
+                },
+                "python.testing.pytestArgs": [],
+                "python.testing.unittestEnabled": false,
+                "python.testing.pytestEnabled": true
+            },
+            "extensions": [
+                "charliermarsh.ruff",
+                "dbaeumer.vscode-eslint",
+                "editorconfig.editorconfig",
+                "esbenp.prettier-vscode",
+                "hashicorp.terraform",
+                "ms-python.debugpy",
+                "ms-python.python",
+                "ms-python.python",
+                "ms-python.vscode-pylance",
+                "redhat.vscode-yaml",
+                "tamasfe.even-better-toml"
+            ]
+        }
+    }
+}
