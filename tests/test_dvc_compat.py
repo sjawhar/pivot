@@ -1,0 +1,407 @@
+"""Tests for DVC YAML export/import functionality."""
+# pyright: reportUnusedFunction=false
+
+import pathlib
+from collections.abc import Generator
+
+import pytest
+import yaml
+
+from pivot import dvc_compat, outputs
+from pivot.exceptions import DVCImportError, ExportError
+from pivot.registry import StageRegistry
+
+
+# Module-level functions for export tests (can't export from __main__)
+def exportable_stage() -> None:
+    """A stage that can be exported."""
+    pass
+
+
+def exportable_with_params(learning_rate: float = 0.01, epochs: int = 100) -> None:
+    """A stage with parameter defaults."""
+    pass
+
+
+class TestToRelativePath:
+    """Tests for _to_relative_path helper."""
+
+    def test_relative_path_unchanged(self, tmp_path: pathlib.Path) -> None:
+        """Relative paths should pass through unchanged."""
+        result = dvc_compat._to_relative_path("data/file.csv", tmp_path)
+        assert result == "data/file.csv"
+
+    def test_absolute_inside_root_becomes_relative(self, tmp_path: pathlib.Path) -> None:
+        """Absolute paths inside root become relative."""
+        absolute = str(tmp_path / "data" / "file.csv")
+        result = dvc_compat._to_relative_path(absolute, tmp_path)
+        assert result == "data/file.csv"
+
+    def test_absolute_outside_root_stays_absolute(
+        self, tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Paths outside project root stay absolute with warning."""
+        outside_path = "/some/other/path/file.csv"
+        result = dvc_compat._to_relative_path(outside_path, tmp_path)
+        assert result == outside_path
+        assert "outside project root" in caplog.text
+
+
+class TestGenerateCmd:
+    """Tests for _generate_cmd helper."""
+
+    def test_generates_module_import_cmd(self) -> None:
+        """Should generate python -c import command."""
+        cmd = dvc_compat._generate_cmd(exportable_stage)
+        # Module name may include 'tests.' prefix when run from pytest
+        assert cmd.startswith("python -c 'from ")
+        assert "import exportable_stage; exportable_stage()'" in cmd
+
+    def test_raises_on_main_module(self) -> None:
+        """Should raise ExportError for functions in __main__."""
+
+        def local_func() -> None:
+            pass
+
+        # Simulate __main__ module
+        local_func.__module__ = "__main__"
+
+        with pytest.raises(ExportError, match="__main__"):
+            dvc_compat._generate_cmd(local_func)
+
+    def test_raises_on_lambda(self) -> None:
+        """Should raise ExportError for lambda functions."""
+        lamb = lambda: None  # noqa: E731
+        with pytest.raises(ExportError, match="lambda"):
+            dvc_compat._generate_cmd(lamb)
+
+
+class TestExtractParamDefaults:
+    """Tests for _extract_param_defaults helper."""
+
+    def test_extracts_defaults(self) -> None:
+        """Should extract parameter defaults from signature."""
+        import inspect
+
+        sig = inspect.signature(exportable_with_params)
+        defaults = dvc_compat._extract_param_defaults(sig)
+        assert defaults == {"learning_rate": 0.01, "epochs": 100}
+
+    def test_no_defaults_returns_empty(self) -> None:
+        """Should return empty dict if no defaults."""
+        import inspect
+
+        def no_defaults(x: int, y: str) -> None:
+            pass
+
+        sig = inspect.signature(no_defaults)
+        defaults = dvc_compat._extract_param_defaults(sig)
+        assert defaults == {}
+
+    def test_partial_defaults(self) -> None:
+        """Should only include parameters with defaults."""
+        import inspect
+
+        def partial(x: int, y: str = "default") -> None:
+            pass
+
+        sig = inspect.signature(partial)
+        defaults = dvc_compat._extract_param_defaults(sig)
+        assert defaults == {"y": "default"}
+
+
+class TestBuildOutEntry:
+    """Tests for _build_out_entry helper."""
+
+    def test_out_default_returns_string(self) -> None:
+        """Out with default cache=True returns just the path string."""
+        out = outputs.Out(path="model.pkl")
+        result = dvc_compat._build_out_entry(out, "model.pkl")
+        assert result == "model.pkl"
+
+    def test_out_cache_false_returns_dict(self) -> None:
+        """Out with cache=False returns dict with cache option."""
+        out = outputs.Out(path="model.pkl", cache=False)
+        result = dvc_compat._build_out_entry(out, "model.pkl")
+        assert result == {"model.pkl": {"cache": False}}
+
+    def test_metric_default_returns_string(self) -> None:
+        """Metric with default cache=False returns just the path string."""
+        metric = outputs.Metric(path="metrics.json")
+        result = dvc_compat._build_out_entry(metric, "metrics.json")
+        assert result == "metrics.json"
+
+    def test_metric_cache_true_returns_dict(self) -> None:
+        """Metric with cache=True returns dict with cache option."""
+        metric = outputs.Metric(path="metrics.json", cache=True)
+        result = dvc_compat._build_out_entry(metric, "metrics.json")
+        assert result == {"metrics.json": {"cache": True}}
+
+    def test_plot_with_options(self) -> None:
+        """Plot with x/y/template returns dict with those options."""
+        plot = outputs.Plot(path="loss.csv", x="epoch", y="loss", template="linear")
+        result = dvc_compat._build_out_entry(plot, "loss.csv")
+        assert result == {"loss.csv": {"x": "epoch", "y": "loss", "template": "linear"}}
+
+    def test_persist_option(self) -> None:
+        """Persist option should be included when True."""
+        out = outputs.Out(path="model.pkl", persist=True)
+        result = dvc_compat._build_out_entry(out, "model.pkl")
+        assert result == {"model.pkl": {"persist": True}}
+
+
+class TestExportDvcYaml:
+    """Tests for export_dvc_yaml function."""
+
+    registry: StageRegistry  # pyright: ignore[reportUninitializedInstanceVariable]
+    _original_registry: StageRegistry  # pyright: ignore[reportUninitializedInstanceVariable]
+
+    @pytest.fixture(autouse=True)
+    def _setup_registry(self) -> Generator[None]:
+        """Use clean registry for each test."""
+        self.registry = StageRegistry()
+        # Temporarily replace REGISTRY for tests
+        import pivot.dvc_compat
+
+        self._original_registry = pivot.dvc_compat.REGISTRY
+        pivot.dvc_compat.REGISTRY = self.registry
+        yield
+        pivot.dvc_compat.REGISTRY = self._original_registry
+
+    def test_export_simple_stage(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Should export basic stage to dvc.yaml."""
+        # Mock project root
+        monkeypatch.setattr("pivot.dvc_compat.project.get_project_root", lambda: tmp_path)
+
+        self.registry.register(
+            exportable_stage,
+            name="my_stage",
+            deps=[str(tmp_path / "input.txt")],
+            outs=[str(tmp_path / "output.txt")],
+        )
+
+        dvc_yaml_path = tmp_path / "dvc.yaml"
+        result = dvc_compat.export_dvc_yaml(dvc_yaml_path)
+
+        assert "stages" in result
+        assert "my_stage" in result["stages"]
+        stage = result["stages"]["my_stage"]
+        assert "cmd" in stage
+        assert "exportable_stage" in stage["cmd"]
+        assert stage["deps"] == ["input.txt"]
+        assert stage["outs"] == ["output.txt"]
+
+        # Verify file was written
+        assert dvc_yaml_path.exists()
+        with open(dvc_yaml_path) as f:
+            written = yaml.safe_load(f)
+        assert written == result
+
+    def test_export_with_rich_outputs(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Should separate Out/Metric/Plot into correct sections."""
+        monkeypatch.setattr("pivot.dvc_compat.project.get_project_root", lambda: tmp_path)
+
+        self.registry.register(
+            exportable_stage,
+            name="train",
+            deps=[],
+            outs=[
+                outputs.Out(path=str(tmp_path / "model.pkl")),
+                outputs.Metric(path=str(tmp_path / "metrics.json")),
+                outputs.Plot(path=str(tmp_path / "loss.csv"), x="epoch", y="loss"),
+            ],
+        )
+
+        result = dvc_compat.export_dvc_yaml(tmp_path / "dvc.yaml")
+        stage = result["stages"]["train"]
+
+        assert stage["outs"] == ["model.pkl"]
+        assert stage["metrics"] == ["metrics.json"]
+        assert stage["plots"] == [{"loss.csv": {"x": "epoch", "y": "loss"}}]
+
+    def test_export_generates_params_yaml(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Should generate params.yaml with function defaults."""
+        monkeypatch.setattr("pivot.dvc_compat.project.get_project_root", lambda: tmp_path)
+
+        self.registry.register(
+            exportable_with_params,
+            name="train",
+            deps=[],
+            outs=[],
+        )
+
+        dvc_compat.export_dvc_yaml(tmp_path / "dvc.yaml")
+
+        params_path = tmp_path / "params.yaml"
+        assert params_path.exists()
+
+        with open(params_path) as f:
+            params = yaml.safe_load(f)
+        assert params == {"train": {"learning_rate": 0.01, "epochs": 100}}
+
+    def test_export_references_params(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Stage should reference params from params.yaml."""
+        monkeypatch.setattr("pivot.dvc_compat.project.get_project_root", lambda: tmp_path)
+
+        self.registry.register(
+            exportable_with_params,
+            name="train",
+            deps=[],
+            outs=[],
+        )
+
+        result = dvc_compat.export_dvc_yaml(tmp_path / "dvc.yaml")
+        stage = result["stages"]["train"]
+
+        assert "params" in stage
+        assert set(stage["params"]) == {"train.learning_rate", "train.epochs"}
+
+    def test_export_empty_registry_raises_error(
+        self,
+        tmp_path: pathlib.Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Should raise error when no stages registered."""
+        monkeypatch.setattr("pivot.dvc_compat.project.get_project_root", lambda: tmp_path)
+
+        with pytest.raises(ExportError, match="No stages registered"):
+            dvc_compat.export_dvc_yaml(tmp_path / "dvc.yaml")
+
+    def test_export_missing_stages_raises_error(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Should raise error when requested stages don't exist."""
+        monkeypatch.setattr("pivot.dvc_compat.project.get_project_root", lambda: tmp_path)
+
+        self.registry.register(exportable_stage, name="stage1", deps=[], outs=[])
+
+        with pytest.raises(ExportError, match="Stages not found.*nonexistent"):
+            dvc_compat.export_dvc_yaml(tmp_path / "dvc.yaml", stages=["stage1", "nonexistent"])
+
+    def test_export_subset_of_stages(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Should export only specified stages."""
+        monkeypatch.setattr("pivot.dvc_compat.project.get_project_root", lambda: tmp_path)
+
+        self.registry.register(exportable_stage, name="stage1", deps=[], outs=[])
+        self.registry.register(exportable_with_params, name="stage2", deps=[], outs=[])
+
+        result = dvc_compat.export_dvc_yaml(tmp_path / "dvc.yaml", stages=["stage1"])
+
+        assert "stage1" in result["stages"]
+        assert "stage2" not in result["stages"]
+
+    def test_export_out_cache_false(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Out with cache=False should have cache: false in yaml."""
+        monkeypatch.setattr("pivot.dvc_compat.project.get_project_root", lambda: tmp_path)
+
+        self.registry.register(
+            exportable_stage,
+            name="stage",
+            deps=[],
+            outs=[outputs.Out(path=str(tmp_path / "file.txt"), cache=False)],
+        )
+
+        result = dvc_compat.export_dvc_yaml(tmp_path / "dvc.yaml")
+        assert result["stages"]["stage"]["outs"] == [{"file.txt": {"cache": False}}]
+
+
+class TestImportDvcYaml:
+    """Tests for import_dvc_yaml function."""
+
+    def test_raises_without_dvc(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Should raise DVCImportError if DVC not installed."""
+        # Make DVC import fail
+        import builtins
+
+        original_import = builtins.__import__
+
+        def mock_import(name: str, *args, **kwargs):  # type: ignore[no-untyped-def]
+            if name == "dvc.repo":
+                raise ImportError("No module named 'dvc'")
+            return original_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", mock_import)
+
+        dvc_yaml = tmp_path / "dvc.yaml"
+        dvc_yaml.write_text("stages: {}")
+
+        with pytest.raises(DVCImportError, match="DVC is required"):
+            dvc_compat.import_dvc_yaml(dvc_yaml)
+
+    def test_raises_file_not_found(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Should raise DVCImportError if file doesn't exist."""
+        # Need to make DVC importable first
+        import builtins
+
+        original_import = builtins.__import__
+
+        def mock_import(name: str, *args, **kwargs):  # type: ignore[no-untyped-def]
+            if name == "dvc.repo":
+
+                class MockRepo:
+                    def __init__(self, path):  # type: ignore[no-untyped-def]
+                        pass
+
+                class MockModule:
+                    Repo = MockRepo
+
+                return MockModule()
+            return original_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", mock_import)
+
+        with pytest.raises(DVCImportError, match="not found"):
+            dvc_compat.import_dvc_yaml(tmp_path / "nonexistent.yaml")
+
+
+class TestStageSpec:
+    """Tests for StageSpec dataclass."""
+
+    def test_stage_spec_creation(self) -> None:
+        """Should create StageSpec with all fields."""
+        spec = dvc_compat.StageSpec(
+            name="train",
+            cmd="python train.py",
+            deps=["data.csv"],
+            outs=[outputs.Out(path="model.pkl")],
+            params={"lr": 0.01},
+            frozen=True,
+            desc="Training stage",
+        )
+
+        assert spec.name == "train"
+        assert spec.cmd == "python train.py"
+        assert spec.deps == ["data.csv"]
+        assert len(spec.outs) == 1
+        assert spec.params == {"lr": 0.01}
+        assert spec.frozen is True
+        assert spec.desc == "Training stage"
+
+    def test_stage_spec_defaults(self) -> None:
+        """StageSpec should have sensible defaults."""
+        spec = dvc_compat.StageSpec(
+            name="stage",
+            cmd="echo hi",
+            deps=[],
+            outs=[],
+            params={},
+        )
+
+        assert spec.frozen is False
+        assert spec.desc is None

@@ -95,6 +95,23 @@ def test_invalid_path_with_null_byte() -> None:
         )
 
 
+def test_invalid_path_with_newline() -> None:
+    """Should raise error for paths with newline characters."""
+    reg = registry.StageRegistry()
+
+    def stage1() -> None:
+        pass
+
+    with pytest.raises(registry.ValidationError, match="newline"):
+        reg.register(
+            stage1,
+            name="process",
+            deps=["file\nname.csv"],
+            outs=list[str](),
+            params_cls=None,
+        )
+
+
 def test_output_conflict_raises_error() -> None:
     """Should raise error when two stages produce same output."""
     reg = registry.StageRegistry()

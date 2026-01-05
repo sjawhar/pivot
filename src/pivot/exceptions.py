@@ -62,3 +62,21 @@ class StageAlreadyRunningError(PivotError):
     """Raised when a stage is already being executed by another process."""
 
     pass
+
+
+class DVCCompatError(PivotError):
+    """Base class for DVC compatibility errors."""
+
+    pass
+
+
+class ExportError(DVCCompatError):
+    """Raised when stage export to DVC format fails."""
+
+    pass
+
+
+class DVCImportError(DVCCompatError):
+    """Raised when dvc.yaml import fails."""
+
+    pass

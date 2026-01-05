@@ -1,6 +1,7 @@
 """Tests for DAG construction and traversal."""
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -10,7 +11,7 @@ from pivot.exceptions import CyclicGraphError, DependencyNotFoundError
 # Test helpers for creating dummy stages
 
 
-def _create_stage(name: str, deps: list[str], outs: list[str]) -> dict:
+def _create_stage(name: str, deps: list[str], outs: list[str]) -> dict[str, Any]:
     """Create a stage dict for testing."""
     return {"name": name, "deps": deps, "outs": outs}
 

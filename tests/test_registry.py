@@ -41,8 +41,10 @@ def test_stage_decorator_registers_function():
     # Paths are normalized to absolute paths
     assert len(info["deps"]) == 1
     assert info["deps"][0].endswith("data.csv")
+    # outs contains BaseOut objects, outs_paths contains string paths
     assert len(info["outs"]) == 1
-    assert info["outs"][0].endswith("output.txt")
+    assert info["outs_paths"][0].endswith("output.txt")
+    assert info["outs"][0].path.endswith("output.txt")
 
 
 def test_stage_decorator_returns_unmodified_function():
@@ -200,7 +202,7 @@ def test_registry_register_directly():
     assert len(info["deps"]) == 1
     assert info["deps"][0].endswith("input.txt")
     assert len(info["outs"]) == 1
-    assert info["outs"][0].endswith("output.txt")
+    assert info["outs_paths"][0].endswith("output.txt")
 
 
 def test_registry_register_with_custom_name():

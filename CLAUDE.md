@@ -154,6 +154,41 @@ class FingerprintError(Exception): pass
 raise Exception("failed")
 ```
 
+## Input Validation Over Defensive Programming
+
+Prioritize validating inputs at boundaries rather than defensively handling every possible error deep in the code.
+
+**Principles:**
+- Validate inputs early, then trust them downstream
+- Fail fast with clear errors rather than silently degrading
+- Don't try to "fix" invalid inputs—reject them
+- Avoid excessive try/catch that masks bugs
+
+```python
+# Good - validate input, then operate confidently
+def export_stages(stages: list[str]) -> None:
+    missing = [s for s in stages if s not in REGISTRY]
+    if missing:
+        raise ExportError(f"Stages not found: {missing}")
+
+    for stage in stages:
+        _export_stage(REGISTRY[stage])  # Known to exist
+
+# Bad - defensive checks everywhere
+def export_stages(stages: list[str]) -> None:
+    for stage in stages:
+        if stage in REGISTRY:  # Silent skip
+            try:
+                _export_stage(REGISTRY.get(stage, {}))
+            except Exception:
+                pass  # Silent failure
+```
+
+**When defensive code IS appropriate:**
+- External I/O (network, filesystem, user input)
+- Third-party library calls with unclear error modes
+- Graceful degradation in non-critical paths
+
 ## Logging
 
 ```python

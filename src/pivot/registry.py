@@ -20,10 +20,10 @@ import dataclasses
 import inspect
 import logging
 import pathlib
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any, TypeVar
 
-from pivot import fingerprint, project, trie
+from pivot import fingerprint, outputs, project, trie
 from pivot.exceptions import ValidationError, ValidationMode
 
 if TYPE_CHECKING:
@@ -39,7 +39,7 @@ class stage:
 
     Args:
         deps: Input dependencies (file paths)
-        outs: Output files produced by stage
+        outs: Output files produced by stage (str, Out, Metric, or Plot)
         params_cls: Optional Pydantic model for parameters
 
     Example:
@@ -47,10 +47,14 @@ class stage:
         >>> def process(input_file: str, output_file: str):
         ...     # Process files...
         ...     pass
+
+        >>> @stage(deps=['data.csv'], outs=[Out('model.pkl'), Metric('metrics.json')])
+        >>> def train():
+        ...     pass
     """
 
-    deps: list[str] = dataclasses.field(default_factory=list)
-    outs: list[str] = dataclasses.field(default_factory=list)
+    deps: Sequence[str] = dataclasses.field(default_factory=list)
+    outs: Sequence[outputs.OutSpec] = dataclasses.field(default_factory=list)
     params_cls: type[BaseModel] | None = None
 
     def __call__(self, func: F) -> F:
@@ -76,8 +80,8 @@ class StageRegistry:
         self,
         func: Callable[..., Any],
         name: str | None = None,
-        deps: list[str] | None = None,
-        outs: list[str] | None = None,
+        deps: Sequence[str] | None = None,
+        outs: Sequence[outputs.OutSpec] | None = None,
         params_cls: type[BaseModel] | None = None,
     ) -> None:
         """Register a stage function with metadata."""
@@ -85,19 +89,33 @@ class StageRegistry:
         deps_list = deps if deps is not None else []
         outs_list = outs if outs is not None else []
 
+        # Normalize outputs to BaseOut objects
+        outs_normalized = [outputs.normalize_out(o) for o in outs_list]
+        outs_paths = [o.path for o in outs_normalized]
+
         # Validate paths BEFORE normalizing (check ".." on original paths)
         _validate_stage_registration(
-            self._stages, stage_name, deps_list, outs_list, self.validation_mode
+            self._stages, stage_name, deps_list, outs_paths, self.validation_mode
         )
 
         deps_list = _normalize_paths(deps_list, self.validation_mode)
-        outs_list = _normalize_paths(outs_list, self.validation_mode)
+        outs_paths = _normalize_paths(outs_paths, self.validation_mode)
+
+        # Update normalized outputs with absolute paths
+        outs_normalized = [
+            dataclasses.replace(out, path=path)
+            for out, path in zip(outs_normalized, outs_paths, strict=True)
+        ]
 
         try:
-            temp_stages = dict(self._stages)
+            # Build temp_stages with string paths for trie (existing stages use outs_paths)
+            temp_stages = {
+                name: {"name": name, "outs": info.get("outs_paths", [])}
+                for name, info in self._stages.items()
+            }
             temp_stages[stage_name] = {
                 "name": stage_name,
-                "outs": outs_list,
+                "outs": outs_paths,  # Trie uses paths only
             }
             trie.build_outs_trie(temp_stages)
         except (trie.OutputDuplicationError, trie.OverlappingOutputPathsError) as e:
@@ -107,7 +125,8 @@ class StageRegistry:
             "func": func,
             "name": stage_name,
             "deps": deps_list,
-            "outs": outs_list,
+            "outs": outs_normalized,  # Full BaseOut objects
+            "outs_paths": outs_paths,  # Just paths for DAG
             "params_cls": params_cls,
             "signature": inspect.signature(func),
             "fingerprint": fingerprint.get_stage_fingerprint(func),
@@ -143,7 +162,7 @@ class StageRegistry:
         self._stages.clear()
 
 
-def _normalize_paths(paths: list[str], validation_mode: ValidationMode) -> list[str]:
+def _normalize_paths(paths: Sequence[str], validation_mode: ValidationMode) -> list[str]:
     """Normalize paths to absolute paths, handling errors based on validation mode."""
     normalized = []
     for path in paths:
@@ -160,8 +179,8 @@ def _normalize_paths(paths: list[str], validation_mode: ValidationMode) -> list[
 def _validate_stage_registration(
     stages: dict[str, dict[str, Any]],
     stage_name: str,
-    deps: list[str],
-    outs: list[str],
+    deps: Sequence[str],
+    outs: Sequence[str],
     validation_mode: ValidationMode,
 ) -> None:
     """Validate stage registration inputs (before path normalization)."""
@@ -174,7 +193,7 @@ def _validate_stage_registration(
     if not stage_name or not stage_name.strip():
         _handle_validation_error("Stage name cannot be empty", validation_mode)
 
-    for path in deps + outs:
+    for path in [*deps, *outs]:
         _validate_path(path, stage_name, validation_mode)
 
 
@@ -188,6 +207,11 @@ def _validate_path(path: str, stage_name: str, validation_mode: ValidationMode) 
     if "\x00" in path:
         _handle_validation_error(
             f"Stage '{stage_name}': Path '{path}' contains null byte", validation_mode
+        )
+
+    if "\n" in path or "\r" in path:
+        _handle_validation_error(
+            f"Stage '{stage_name}': Path '{path}' contains newline character", validation_mode
         )
 
 

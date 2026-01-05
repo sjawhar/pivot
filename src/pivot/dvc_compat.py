@@ -1,0 +1,373 @@
+"""DVC YAML export/import for cross-compatibility.
+
+Provides an escape hatch: if Pivot doesn't work, users can export to dvc.yaml
+and use DVC directly without any Pivot dependency.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import logging
+import pathlib
+import subprocess
+from typing import TYPE_CHECKING, Any
+
+import yaml
+
+from pivot import outputs, project
+from pivot.exceptions import DVCImportError, ExportError
+from pivot.registry import REGISTRY
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Sequence
+    from inspect import Signature
+
+    from dvc.output import Output as DVCOutput
+    from dvc.stage import PipelineStage
+
+logger = logging.getLogger(__name__)
+
+
+@dataclasses.dataclass
+class StageSpec:
+    """Parsed DVC stage specification."""
+
+    name: str
+    cmd: str
+    deps: list[str]
+    outs: list[outputs.BaseOut]
+    params: dict[str, Any]
+    frozen: bool = False
+    desc: str | None = None
+
+
+def _to_relative_path(absolute_path: str, root: pathlib.Path) -> str:
+    """Convert absolute path to relative (from project root)."""
+    path = pathlib.Path(absolute_path)
+    if not path.is_absolute():
+        return absolute_path
+
+    try:
+        return str(path.relative_to(root))
+    except ValueError:
+        # Path outside project root - keep absolute with warning
+        logger.warning(f"Path '{absolute_path}' is outside project root, keeping absolute")
+        return absolute_path
+
+
+def _generate_cmd(func: Callable[..., Any]) -> str:
+    """Generate DVC command from function (module import approach)."""
+    module = func.__module__
+    name = func.__name__
+
+    if module == "__main__":
+        raise ExportError(
+            f"Cannot export function '{name}' from __main__ module. Move the function to an importable module (e.g., pipeline.py)."
+        )
+
+    if name == "<lambda>":
+        raise ExportError("Cannot export lambda functions - they have no importable name.")
+
+    return f"python -c 'from {module} import {name}; {name}()'"
+
+
+def _extract_param_defaults(sig: Signature) -> dict[str, Any]:
+    """Extract parameter defaults from function signature."""
+    params = {}
+    for param_name, param in sig.parameters.items():
+        if param.default is not param.empty:
+            params[param_name] = param.default
+    return params
+
+
+def _generate_params_yaml(
+    stages: dict[str, dict[str, Any]],
+    path: pathlib.Path,
+) -> dict[str, Any]:
+    """Generate params.yaml from stage function defaults."""
+    params: dict[str, Any] = {}
+
+    for name, info in stages.items():
+        sig = info.get("signature")
+        if not sig:
+            continue
+
+        stage_params = _extract_param_defaults(sig)
+        if stage_params:
+            params[name] = stage_params
+
+    if params:
+        params_path = path.parent / "params.yaml"
+        try:
+            with open(params_path, "w") as f:
+                yaml.dump(params, f, sort_keys=False, default_flow_style=False)
+        except yaml.YAMLError as e:
+            raise ExportError(
+                f"Failed to serialize params.yaml: {e}. "
+                "Parameter defaults must be YAML-serializable (str, int, float, bool, list, dict)."
+            ) from e
+        except OSError as e:
+            raise ExportError(f"Failed to write params.yaml to '{params_path}': {e}") from e
+        logger.info(f"Generated params.yaml at {params_path}")
+
+    return params
+
+
+def _build_dvc_stage(
+    stage_info: dict[str, Any],
+    root: pathlib.Path,
+    params: dict[str, Any],
+) -> dict[str, Any]:
+    """Build DVC stage dict from Pivot stage info."""
+    name = stage_info["name"]
+    func = stage_info["func"]
+    deps = stage_info.get("deps", [])
+    outs_objects: list[outputs.BaseOut] = stage_info.get("outs", [])
+
+    stage: dict[str, Any] = {
+        "cmd": _generate_cmd(func),
+    }
+
+    # Add deps (convert to relative paths)
+    if deps:
+        stage["deps"] = [_to_relative_path(d, root) for d in deps]
+
+    # Build outs/metrics/plots sections from BaseOut objects
+    outs_section: list[str | dict[str, Any]] = []
+    metrics_section: list[str | dict[str, Any]] = []
+    plots_section: list[str | dict[str, Any]] = []
+
+    for out in outs_objects:
+        rel_path = _to_relative_path(out.path, root)
+        out_entry = _build_out_entry(out, rel_path)
+
+        if isinstance(out, outputs.Plot):
+            plots_section.append(out_entry)
+        elif isinstance(out, outputs.Metric):
+            metrics_section.append(out_entry)
+        else:
+            # Out or BaseOut → outs section
+            outs_section.append(out_entry)
+
+    if outs_section:
+        stage["outs"] = outs_section
+    if metrics_section:
+        stage["metrics"] = metrics_section
+    if plots_section:
+        stage["plots"] = plots_section
+
+    # Add params reference if stage has parameter defaults
+    if name in params:
+        stage["params"] = [f"{name}.{p}" for p in params[name]]
+
+    return stage
+
+
+def _build_out_entry(out: outputs.BaseOut, rel_path: str) -> str | dict[str, Any]:
+    """Build DVC output entry from BaseOut object."""
+    options: dict[str, Any] = {}
+
+    # Check if cache differs from type default
+    if isinstance(out, outputs.Out) and out.cache is False:
+        options["cache"] = False
+    elif isinstance(out, outputs.Metric) and out.cache is True:
+        options["cache"] = True
+    elif isinstance(out, outputs.Plot) and out.cache is False:
+        options["cache"] = False
+
+    # Add persist if set
+    if out.persist:
+        options["persist"] = True
+
+    # Add plot-specific options
+    if isinstance(out, outputs.Plot):
+        if out.x is not None:
+            options["x"] = out.x
+        if out.y is not None:
+            options["y"] = out.y
+        if out.template is not None:
+            options["template"] = out.template
+
+    # Return simple string if no options, else dict
+    if not options:
+        return rel_path
+    return {rel_path: options}
+
+
+def export_dvc_yaml(
+    path: pathlib.Path | str,
+    stages: Sequence[str] | None = None,
+) -> dict[str, Any]:
+    """Export Pivot stages to dvc.yaml format.
+
+    Generated cmd uses module import: python -c 'from module import func; func()'
+    This creates a standalone dvc.yaml that works without Pivot.
+
+    Note: Also generates params.yaml with function parameter defaults. This
+    overwrites any existing params.yaml file (does not merge).
+
+    Args:
+        path: Output path for dvc.yaml
+        stages: Optional list of stage names to export (default: all)
+
+    Returns:
+        The generated dvc.yaml dict
+
+    Raises:
+        ExportError: If export fails or requested stages don't exist
+    """
+    path = pathlib.Path(path)
+    root = project.get_project_root()
+
+    all_stages = REGISTRY._stages  # pyright: ignore[reportPrivateUsage]
+
+    # Validate requested stages exist
+    if stages is not None:
+        missing = [name for name in stages if name not in all_stages]
+        if missing:
+            raise ExportError(f"Stages not found: {missing}")
+        stage_dict = {name: all_stages[name] for name in stages}
+    else:
+        stage_dict = all_stages
+
+    if not stage_dict:
+        raise ExportError("No stages registered to export")
+
+    # Generate params.yaml first (need params for stage references)
+    params = _generate_params_yaml(stage_dict, path)
+
+    # Build dvc.yaml structure
+    dvc_stages: dict[str, Any] = {}
+    for name, info in stage_dict.items():
+        dvc_stages[name] = _build_dvc_stage(info, root, params)
+
+    dvc_yaml = {"stages": dvc_stages}
+
+    try:
+        with open(path, "w") as f:
+            yaml.dump(dvc_yaml, f, sort_keys=False, default_flow_style=False)
+    except yaml.YAMLError as e:
+        raise ExportError(f"Failed to serialize dvc.yaml: {e}") from e
+    except OSError as e:
+        raise ExportError(f"Failed to write dvc.yaml to '{path}': {e}") from e
+
+    logger.info(f"Exported {len(dvc_stages)} stages to {path}")
+    return dvc_yaml
+
+
+def import_dvc_yaml(
+    path: pathlib.Path | str,
+    register: bool = True,
+) -> dict[str, StageSpec]:
+    """Parse dvc.yaml using DVC and optionally register stages with Pivot.
+
+    Uses DVC's own resolver to handle foreach, matrix, vars, interpolation.
+
+    Args:
+        path: Path to dvc.yaml
+        register: If True, auto-register stages (default). If False, just return specs.
+
+    Returns:
+        Dict of stage_name -> StageSpec
+
+    Raises:
+        DVCImportError: If DVC not installed or parsing fails
+    """
+    try:
+        import dvc.repo
+        from dvc.stage import PipelineStage as DVCPipelineStage
+    except ImportError:
+        raise DVCImportError("DVC is required for import_dvc_yaml") from None
+
+    path = pathlib.Path(path).resolve()
+    if not path.exists():
+        raise DVCImportError(f"dvc.yaml not found: {path}")
+
+    # DVC integration requires real DVC repository
+    try:  # pragma: no cover
+        repo = dvc.repo.Repo(str(path.parent))
+        dvc_stages = repo.index.stages
+    except Exception as e:  # pragma: no cover
+        raise DVCImportError(f"Failed to parse dvc.yaml: {e}") from e
+
+    specs: dict[str, StageSpec] = {}
+    for stage in dvc_stages:  # pragma: no cover
+        # Only process pipeline stages (not data stages, etc.)
+        if not isinstance(stage, DVCPipelineStage):
+            continue
+        if not stage.name or not stage.cmd:
+            continue
+        # Filter to stages from the target dvc.yaml file
+        if pathlib.Path(stage.path).resolve() != path:
+            continue
+
+        spec = StageSpec(
+            name=stage.name,
+            cmd=stage.cmd,
+            deps=[str(d.fs_path) for d in stage.deps],
+            outs=_convert_dvc_outputs(stage),
+            params=_extract_dvc_params(stage),
+            frozen=stage.frozen,
+            desc=stage.desc,
+        )
+        specs[stage.name] = spec
+
+        if register:
+            _register_imported_stage(spec)
+
+    logger.info(f"Imported {len(specs)} stages from {path}")  # pragma: no cover
+    return specs  # pragma: no cover
+
+
+def _convert_dvc_output(out: DVCOutput) -> outputs.BaseOut:  # pragma: no cover
+    """Convert a single DVC output to BaseOut object."""
+    path = str(out.fs_path)
+    cache = out.use_cache
+    persist = out.persist
+
+    if out.plot:
+        return outputs.Plot(
+            path=path,
+            cache=cache,
+            persist=persist,
+            x=out.plot.get("x") if isinstance(out.plot, dict) else None,
+            y=out.plot.get("y") if isinstance(out.plot, dict) else None,
+            template=out.plot.get("template") if isinstance(out.plot, dict) else None,
+        )
+    if out.metric:
+        return outputs.Metric(path=path, cache=cache, persist=persist)
+    return outputs.Out(path=path, cache=cache, persist=persist)
+
+
+def _convert_dvc_outputs(stage: PipelineStage) -> list[outputs.BaseOut]:  # pragma: no cover
+    """Convert DVC stage outputs to BaseOut objects."""
+    return [_convert_dvc_output(out) for out in stage.outs]
+
+
+def _extract_dvc_params(stage: PipelineStage) -> dict[str, Any]:  # pragma: no cover
+    """Extract params from DVC stage."""
+    params: dict[str, Any] = {}
+    for param_dep in stage.params:
+        if param_dep.hash_info:
+            value = param_dep.hash_info.value
+            if isinstance(value, dict):
+                params.update(value)  # pyright: ignore[reportArgumentType,reportCallIssue]
+    return params
+
+
+def _register_imported_stage(spec: StageSpec) -> None:  # pragma: no cover
+    """Register an imported DVC stage with Pivot."""
+    root = project.get_project_root()
+
+    def wrapper() -> None:
+        subprocess.run(spec.cmd, shell=True, check=True, cwd=root)  # noqa: S602
+
+    wrapper.__name__ = spec.name
+    wrapper.__module__ = "pivot.dvc_compat"
+
+    REGISTRY.register(
+        wrapper,
+        name=spec.name,
+        deps=list(spec.deps),
+        outs=spec.outs,
+    )

@@ -4,6 +4,8 @@ Builds a directed acyclic graph from registered stages to determine execution or
 Uses networkx for graph operations and DFS postorder traversal.
 """
 
+from __future__ import annotations
+
 import pathlib
 from typing import Any
 
@@ -12,7 +14,7 @@ import networkx as nx
 from pivot.exceptions import CyclicGraphError, DependencyNotFoundError
 
 
-def build_dag(stages: dict[str, dict[str, Any]], validate: bool = True) -> nx.DiGraph:
+def build_dag(stages: dict[str, dict[str, Any]], validate: bool = True) -> nx.DiGraph[str]:
     """Build DAG from registered stages.
 
     Args:
@@ -66,16 +68,21 @@ def _build_outputs_map(stages: dict[str, dict[str, Any]]) -> dict[str, str]:
 
     Note:
         All paths are already normalized (absolute) by registry.py,
-        so simple dict lookup is sufficient.
+        so simple dict lookup is sufficient. Prefers outs_paths (list of str)
+        but falls back to outs for backward compatibility with direct dict creation.
     """
-    outputs_map = {}
+    outputs_map = dict[str, str]()
     for stage_name, stage_info in stages.items():
-        for out in stage_info.get("outs", []):
-            outputs_map[out] = stage_name
+        # Prefer outs_paths (from registry), fallback to outs (direct dict)
+        outs = stage_info.get("outs_paths") or stage_info.get("outs", [])
+        for out in outs:
+            # Handle both string paths and BaseOut objects
+            path = out.path if hasattr(out, "path") else out
+            outputs_map[path] = stage_name
     return outputs_map
 
 
-def _check_acyclic(graph: nx.DiGraph) -> None:
+def _check_acyclic(graph: nx.DiGraph[str]) -> None:
     """Check graph for cycles, raise if found."""
     try:
         cycle = nx.find_cycle(graph, orientation="original")
@@ -91,7 +98,7 @@ def _check_acyclic(graph: nx.DiGraph) -> None:
     raise CyclicGraphError(f"Circular dependency detected: {' -> '.join(stages_in_cycle)}")
 
 
-def get_execution_order(graph: nx.DiGraph, stages: list[str] | None = None) -> list[str]:
+def get_execution_order(graph: nx.DiGraph[str], stages: list[str] | None = None) -> list[str]:
     """Get execution order using DFS postorder traversal.
 
     Args:
@@ -113,15 +120,16 @@ def get_execution_order(graph: nx.DiGraph, stages: list[str] | None = None) -> l
     return list(nx.dfs_postorder_nodes(graph))
 
 
-def _get_subgraph(graph: nx.DiGraph, source_stages: list[str]) -> nx.DiGraph:
+def _get_subgraph(graph: nx.DiGraph[str], source_stages: list[str]) -> nx.DiGraph[str]:
     """Get subgraph containing sources and all their dependencies."""
     nodes = set()
     for stage in source_stages:
         nodes.update(nx.dfs_postorder_nodes(graph, stage))
-    return graph.subgraph(nodes)
+    # subgraph() returns a SubGraph view that behaves like DiGraph at runtime
+    return graph.subgraph(nodes)  # pyright: ignore[reportReturnType]
 
 
-def get_downstream_stages(graph: nx.DiGraph, stage: str) -> list[str]:
+def get_downstream_stages(graph: nx.DiGraph[str], stage: str) -> list[str]:
     """Get all stages that depend on given stage (directly or transitively).
 
     Uses reverse graph to traverse from stage to dependents.

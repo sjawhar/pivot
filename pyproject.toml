@@ -15,6 +15,9 @@ dependencies = [
     "xxhash>=3.0",
 ]
 
+[project.optional-dependencies]
+dvc = ["dvc>=3.0"]
+
 [project.scripts]
 pivot = "pivot.cli:cli"
 
@@ -25,6 +28,7 @@ build-backend = "uv_build"
 [dependency-groups]
 dev = [
     "basedpyright>=1.0",
+    "pivot[dvc]",
     "pytest-cov>=4.0",
     "pytest-mock>=3.15.1",
     "pytest-watcher>=0.6.2",
