@@ -268,10 +268,12 @@ def test_run_stage_function_captures_stdout() -> None:
         print("line1")
         print("line2")
 
-    output_lines = executor._run_stage_function_with_capture(
+    output_lines: list[tuple[str, bool]] = []
+    executor._run_stage_function_with_capture(
         stage_with_output,
         "test_stage",
         mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
+        output_lines,
     )
 
     assert len(output_lines) == 2
@@ -286,10 +288,12 @@ def test_run_stage_function_captures_stderr() -> None:
         print("error1", file=sys.stderr)
         print("error2", file=sys.stderr)
 
-    output_lines = executor._run_stage_function_with_capture(
+    output_lines: list[tuple[str, bool]] = []
+    executor._run_stage_function_with_capture(
         stage_with_errors,
         "test_stage",
         mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
+        output_lines,
     )
 
     assert len(output_lines) == 2
@@ -305,10 +309,12 @@ def test_run_stage_function_captures_mixed_output() -> None:
         print("stderr1", file=sys.stderr)
         print("stdout2")
 
-    output_lines = executor._run_stage_function_with_capture(
+    output_lines: list[tuple[str, bool]] = []
+    executor._run_stage_function_with_capture(
         stage_mixed,
         "test_stage",
         mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
+        output_lines,
     )
 
     assert len(output_lines) == 3
@@ -325,7 +331,13 @@ def test_run_stage_function_restores_streams() -> None:
     def noop_stage() -> None:
         pass
 
-    executor._run_stage_function_with_capture(noop_stage, "test", mp.Manager().Queue())  # pyright: ignore[reportArgumentType]
+    output_lines: list[tuple[str, bool]] = []
+    executor._run_stage_function_with_capture(
+        noop_stage,
+        "test",
+        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
+        output_lines,
+    )
 
     assert sys.stdout is original_stdout
     assert sys.stderr is original_stderr
@@ -339,8 +351,14 @@ def test_run_stage_function_restores_streams_on_exception() -> None:
     def failing_stage() -> None:
         raise RuntimeError("fail")
 
+    output_lines: list[tuple[str, bool]] = []
     with pytest.raises(RuntimeError):
-        executor._run_stage_function_with_capture(failing_stage, "test", mp.Manager().Queue())  # pyright: ignore[reportArgumentType]
+        executor._run_stage_function_with_capture(
+            failing_stage,
+            "test",
+            mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
+            output_lines,
+        )
 
     assert sys.stdout is original_stdout
     assert sys.stderr is original_stderr
@@ -353,10 +371,12 @@ def test_run_stage_function_captures_partial_lines() -> None:
         sys.stdout.write("no newline")
         sys.stdout.flush()
 
-    output_lines = executor._run_stage_function_with_capture(
+    output_lines: list[tuple[str, bool]] = []
+    executor._run_stage_function_with_capture(
         stage_no_newline,
         "test_stage",
         mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
+        output_lines,
     )
 
     assert len(output_lines) == 1
@@ -364,143 +384,188 @@ def test_run_stage_function_captures_partial_lines() -> None:
 
 
 # =============================================================================
-# _QueueStreamCapture Tests
+# _QueueWriter Tests
 # =============================================================================
 
 
-def test_queue_stream_capture_splits_on_newlines() -> None:
-    """QueueStreamCapture splits output on newlines."""
+def test_queue_writer_splits_on_newlines() -> None:
+    """_QueueWriter splits output on newlines."""
     output_lines: list[tuple[str, bool]] = []
     queue: mp.Queue[OutputMessage] = mp.Manager().Queue()  # pyright: ignore[reportAssignmentType]
 
-    capture = executor._QueueStreamCapture(
+    writer = executor._QueueWriter(
         "test_stage",
         queue,
         is_stderr=False,
         output_lines=output_lines,
     )
 
-    bytes_written = capture.write("line1\nline2\n")
+    bytes_written = writer.write("line1\nline2\n")
 
     assert bytes_written == len("line1\nline2\n")
     assert output_lines == [("line1", False), ("line2", False)]
 
 
-def test_queue_stream_capture_buffers_partial_lines() -> None:
-    """QueueStreamCapture buffers incomplete lines."""
+def test_queue_writer_buffers_partial_lines() -> None:
+    """_QueueWriter buffers incomplete lines."""
     output_lines: list[tuple[str, bool]] = []
     queue: mp.Queue[OutputMessage] = mp.Manager().Queue()  # pyright: ignore[reportAssignmentType]
 
-    capture = executor._QueueStreamCapture(
+    writer = executor._QueueWriter(
         "test_stage",
         queue,
         is_stderr=False,
         output_lines=output_lines,
     )
 
-    capture.write("partial")
+    writer.write("partial")
     assert output_lines == []  # Not flushed yet
 
-    capture.write(" line\n")
+    writer.write(" line\n")
     assert output_lines == [("partial line", False)]
 
 
-def test_queue_stream_capture_flush_writes_buffer() -> None:
-    """QueueStreamCapture.flush() writes buffered content."""
+def test_queue_writer_flush_writes_buffer() -> None:
+    """_QueueWriter.flush() writes buffered content."""
     output_lines: list[tuple[str, bool]] = []
     queue: mp.Queue[OutputMessage] = mp.Manager().Queue()  # pyright: ignore[reportAssignmentType]
 
-    capture = executor._QueueStreamCapture(
+    writer = executor._QueueWriter(
         "test_stage",
         queue,
         is_stderr=False,
         output_lines=output_lines,
     )
 
-    capture.write("no newline")
+    writer.write("no newline")
     assert output_lines == []
 
-    capture.flush()
+    writer.flush()
     assert output_lines == [("no newline", False)]
 
 
-def test_queue_stream_capture_distinguishes_stderr() -> None:
-    """QueueStreamCapture marks stderr lines correctly."""
+def test_queue_writer_distinguishes_stderr() -> None:
+    """_QueueWriter marks stderr lines correctly."""
     output_lines: list[tuple[str, bool]] = []
     queue: mp.Queue[OutputMessage] = mp.Manager().Queue()  # pyright: ignore[reportAssignmentType]
 
-    capture = executor._QueueStreamCapture(
+    writer = executor._QueueWriter(
         "test_stage",
         queue,
         is_stderr=True,
         output_lines=output_lines,
     )
 
-    capture.write("error\n")
+    writer.write("error\n")
     assert output_lines == [("error", True)]
 
 
-def test_queue_stream_capture_handles_multiple_newlines() -> None:
-    """QueueStreamCapture handles text with multiple consecutive newlines."""
+def test_queue_writer_handles_multiple_newlines() -> None:
+    """_QueueWriter handles text with multiple consecutive newlines."""
     output_lines: list[tuple[str, bool]] = []
     queue: mp.Queue[OutputMessage] = mp.Manager().Queue()  # pyright: ignore[reportAssignmentType]
 
-    capture = executor._QueueStreamCapture(
+    writer = executor._QueueWriter(
         "test_stage",
         queue,
         is_stderr=False,
         output_lines=output_lines,
     )
 
-    capture.write("line1\n\nline2\n")
+    writer.write("line1\n\nline2\n")
     # Empty lines are skipped (code checks 'if line:')
     assert output_lines == [("line1", False), ("line2", False)]
 
 
-def test_queue_stream_capture_empty_flush_does_nothing() -> None:
-    """QueueStreamCapture.flush() with empty buffer does nothing."""
+def test_queue_writer_empty_flush_does_nothing() -> None:
+    """_QueueWriter.flush() with empty buffer does nothing."""
     output_lines: list[tuple[str, bool]] = []
     queue: mp.Queue[OutputMessage] = mp.Manager().Queue()  # pyright: ignore[reportAssignmentType]
 
-    capture = executor._QueueStreamCapture(
+    writer = executor._QueueWriter(
         "test_stage",
         queue,
         is_stderr=False,
         output_lines=output_lines,
     )
 
-    capture.flush()
+    writer.flush()
     assert output_lines == []
 
 
-def test_queue_stream_capture_textio_protocol() -> None:
-    """QueueStreamCapture implements TextIO protocol properties."""
+def test_queue_writer_isatty_returns_false() -> None:
+    """_QueueWriter.isatty() returns False."""
     output_lines: list[tuple[str, bool]] = []
     queue: mp.Queue[OutputMessage] = mp.Manager().Queue()  # pyright: ignore[reportAssignmentType]
 
-    capture = executor._QueueStreamCapture(
+    writer = executor._QueueWriter(
         "test_stage",
         queue,
         is_stderr=False,
         output_lines=output_lines,
     )
 
-    # TextIO protocol properties
-    assert capture.encoding == "utf-8"
-    assert capture.errors == "strict"
-    assert capture.newlines is None
+    assert writer.isatty() is False
 
-    # Stream capability properties
-    assert capture.readable() is False
-    assert capture.writable() is True
-    assert capture.seekable() is False
-    assert capture.isatty() is False
 
-    # fileno raises OSError (no underlying fd)
-    import pytest
+def test_queue_writer_context_manager_flushes_on_exit() -> None:
+    """_QueueWriter context manager flushes buffer on exit."""
+    output_lines: list[tuple[str, bool]] = []
+    queue: mp.Queue[OutputMessage] = mp.Manager().Queue()  # pyright: ignore[reportAssignmentType]
 
-    with pytest.raises(OSError, match="no underlying file descriptor"):
-        capture.fileno()
+    with executor._QueueWriter(
+        "test_stage",
+        queue,
+        is_stderr=False,
+        output_lines=output_lines,
+    ) as writer:
+        writer.write("no newline")
+        assert output_lines == []  # Not flushed yet
+
+    # Flushed on context exit
+    assert output_lines == [("no newline", False)]
+
+
+def test_queue_writer_context_manager_flushes_on_exception() -> None:
+    """_QueueWriter context manager flushes buffer even when exception raised."""
+    output_lines: list[tuple[str, bool]] = []
+    queue: mp.Queue[OutputMessage] = mp.Manager().Queue()  # pyright: ignore[reportAssignmentType]
+
+    with (
+        pytest.raises(RuntimeError),
+        executor._QueueWriter(
+            "test_stage",
+            queue,
+            is_stderr=False,
+            output_lines=output_lines,
+        ),
+    ):
+        print("before error")
+        raise RuntimeError("test error")
+
+    # Output captured despite exception
+    assert output_lines == [("before error", False)]
+
+
+def test_run_stage_function_preserves_output_on_exception() -> None:
+    """Output is preserved even when stage function raises exception."""
+
+    def failing_stage() -> None:
+        print("line before error")
+        raise RuntimeError("stage failed")
+
+    output_lines: list[tuple[str, bool]] = []
+    with pytest.raises(RuntimeError):
+        executor._run_stage_function_with_capture(
+            failing_stage,
+            "test_stage",
+            mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
+            output_lines,
+        )
+
+    # Output captured despite exception
+    assert len(output_lines) == 1
+    assert output_lines[0] == ("line before error", False)
 
 
 # =============================================================================
