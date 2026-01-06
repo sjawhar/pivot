@@ -4,15 +4,14 @@ import pathlib
 
 import pytest
 
-from pivot.registry import REGISTRY, stage
+import pivot
+from pivot import executor, registry
 
 
 @pytest.fixture(autouse=True)
 def clean_registry():
     """Reset registry before each test."""
-    REGISTRY.clear()
-    yield
-    REGISTRY.clear()
+    registry.REGISTRY.clear()
 
 
 @pytest.fixture
@@ -34,12 +33,12 @@ def test_simple_pipeline_runs_in_order(pipeline_dir: pathlib.Path) -> None:
     """Stages execute in dependency order and produce correct outputs."""
     (pipeline_dir / "input.txt").write_text("hello")
 
-    @stage(deps=["input.txt"], outs=["step1.txt"])
+    @pivot.stage(deps=["input.txt"], outs=["step1.txt"])
     def step1() -> None:
         data = pathlib.Path("input.txt").read_text()
         pathlib.Path("step1.txt").write_text(data.upper())
 
-    @stage(deps=["step1.txt"], outs=["step2.txt"])
+    @pivot.stage(deps=["step1.txt"], outs=["step2.txt"])
     def step2() -> None:
         data = pathlib.Path("step1.txt").read_text()
         pathlib.Path("step2.txt").write_text(f"Result: {data}")
@@ -57,7 +56,7 @@ def test_unchanged_stages_are_skipped(pipeline_dir: pathlib.Path) -> None:
     """Stages with unchanged code and deps are skipped on re-run."""
     (pipeline_dir / "input.txt").write_text("hello")
 
-    @stage(deps=["input.txt"], outs=["output.txt"])
+    @pivot.stage(deps=["input.txt"], outs=["output.txt"])
     def step1() -> None:
         data = pathlib.Path("input.txt").read_text()
         pathlib.Path("output.txt").write_text(data.upper())
@@ -79,7 +78,7 @@ def test_code_change_triggers_rerun(pipeline_dir: pathlib.Path) -> None:
     (pipeline_dir / "input.txt").write_text("hello")
 
     # First version
-    @stage(deps=["input.txt"], outs=["output.txt"])
+    @pivot.stage(deps=["input.txt"], outs=["output.txt"])
     def process() -> None:
         data = pathlib.Path("input.txt").read_text()
         pathlib.Path("output.txt").write_text(data.upper())
@@ -91,9 +90,9 @@ def test_code_change_triggers_rerun(pipeline_dir: pathlib.Path) -> None:
     assert (pipeline_dir / "output.txt").read_text() == "HELLO"
 
     # Clear and re-register with different implementation
-    REGISTRY.clear()
+    registry.REGISTRY.clear()
 
-    @stage(deps=["input.txt"], outs=["output.txt"])
+    @pivot.stage(deps=["input.txt"], outs=["output.txt"])
     def process() -> None:  # noqa: F811
         data = pathlib.Path("input.txt").read_text()
         pathlib.Path("output.txt").write_text(data.lower())  # Changed!
@@ -107,7 +106,7 @@ def test_input_change_triggers_rerun(pipeline_dir: pathlib.Path) -> None:
     """Changing input file triggers re-execution."""
     (pipeline_dir / "input.txt").write_text("hello")
 
-    @stage(deps=["input.txt"], outs=["output.txt"])
+    @pivot.stage(deps=["input.txt"], outs=["output.txt"])
     def process() -> None:
         data = pathlib.Path("input.txt").read_text()
         pathlib.Path("output.txt").write_text(data.upper())
@@ -132,12 +131,12 @@ def test_downstream_runs_when_upstream_changes(pipeline_dir: pathlib.Path) -> No
     """Downstream stages re-run when upstream output changes."""
     (pipeline_dir / "input.txt").write_text("hello")
 
-    @stage(deps=["input.txt"], outs=["intermediate.txt"])
+    @pivot.stage(deps=["input.txt"], outs=["intermediate.txt"])
     def step1() -> None:
         data = pathlib.Path("input.txt").read_text()
         pathlib.Path("intermediate.txt").write_text(data.upper())
 
-    @stage(deps=["intermediate.txt"], outs=["final.txt"])
+    @pivot.stage(deps=["intermediate.txt"], outs=["final.txt"])
     def step2() -> None:
         data = pathlib.Path("intermediate.txt").read_text()
         pathlib.Path("final.txt").write_text(f"Final: {data}")
@@ -167,15 +166,15 @@ def test_run_specific_stage(pipeline_dir: pathlib.Path) -> None:
     """Can run a specific stage and its dependencies only."""
     (pipeline_dir / "input.txt").write_text("data")
 
-    @stage(deps=["input.txt"], outs=["a.txt"])
+    @pivot.stage(deps=["input.txt"], outs=["a.txt"])
     def a() -> None:
         pathlib.Path("a.txt").write_text("a")
 
-    @stage(deps=["a.txt"], outs=["b.txt"])
+    @pivot.stage(deps=["a.txt"], outs=["b.txt"])
     def b() -> None:
         pathlib.Path("b.txt").write_text("b")
 
-    @stage(deps=["input.txt"], outs=["c.txt"])
+    @pivot.stage(deps=["input.txt"], outs=["c.txt"])
     def c() -> None:
         pathlib.Path("c.txt").write_text("c")
 
@@ -198,7 +197,7 @@ def test_missing_dependency_raises_error(pipeline_dir: pathlib.Path) -> None:
 
     # Don't create the input file - it's missing
 
-    @stage(deps=["missing_input.txt"], outs=["output.txt"])
+    @pivot.stage(deps=["missing_input.txt"], outs=["output.txt"])
     def process() -> None:
         run_count["process"] += 1
         pathlib.Path("output.txt").write_text("done")
@@ -216,7 +215,7 @@ def test_nonexistent_stage_raises_error(pipeline_dir: pathlib.Path) -> None:
 
     (pipeline_dir / "input.txt").write_text("data")
 
-    @stage(deps=["input.txt"], outs=["output.txt"])
+    @pivot.stage(deps=["input.txt"], outs=["output.txt"])
     def real_stage() -> None:
         pass
 
@@ -234,7 +233,7 @@ def test_execution_lock_created_and_removed(pipeline_dir: pathlib.Path) -> None:
     cache_dir = pipeline_dir / ".pivot" / "cache"
     lock_check_file = pipeline_dir / "lock_existed.txt"
 
-    @stage(deps=["input.txt"], outs=["output.txt"])
+    @pivot.stage(deps=["input.txt"], outs=["output.txt"])
     def check_lock() -> None:
         # Write to a file to communicate whether lock existed (multiprocessing safe)
         lock_existed = (cache_dir / "check_lock.running").exists()
@@ -254,7 +253,7 @@ def test_execution_lock_removed_on_stage_failure(pipeline_dir: pathlib.Path) -> 
     (pipeline_dir / "input.txt").write_text("hello")
     cache_dir = pipeline_dir / ".pivot" / "cache"
 
-    @stage(deps=["input.txt"], outs=["output.txt"])
+    @pivot.stage(deps=["input.txt"], outs=["output.txt"])
     def failing_stage() -> None:
         raise RuntimeError("Stage failed!")
 
@@ -279,7 +278,7 @@ def test_stale_lock_from_dead_process_is_broken(pipeline_dir: pathlib.Path) -> N
     stale_lock = cache_dir / "process.running"
     stale_lock.write_text("pid: 999999999\n")  # PID that doesn't exist
 
-    @stage(deps=["input.txt"], outs=["output.txt"])
+    @pivot.stage(deps=["input.txt"], outs=["output.txt"])
     def process() -> None:
         pathlib.Path("output.txt").write_text("done")
 
@@ -304,7 +303,7 @@ def test_concurrent_execution_returns_failed_status(pipeline_dir: pathlib.Path) 
     active_lock = cache_dir / "process.running"
     active_lock.write_text(f"pid: {os.getpid()}\n")
 
-    @stage(deps=["input.txt"], outs=["output.txt"])
+    @pivot.stage(deps=["input.txt"], outs=["output.txt"])
     def process() -> None:
         pathlib.Path("output.txt").write_text("done")
 
@@ -331,7 +330,7 @@ def test_corrupted_lock_file_is_broken(pipeline_dir: pathlib.Path) -> None:
     corrupted_lock = cache_dir / "process.running"
     corrupted_lock.write_text("garbage content without pid")
 
-    @stage(deps=["input.txt"], outs=["output.txt"])
+    @pivot.stage(deps=["input.txt"], outs=["output.txt"])
     def process() -> None:
         pathlib.Path("output.txt").write_text("done")
 
@@ -354,7 +353,7 @@ def test_negative_pid_in_lock_is_treated_as_stale(pipeline_dir: pathlib.Path) ->
     invalid_lock = cache_dir / "process.running"
     invalid_lock.write_text("pid: -1\n")
 
-    @stage(deps=["input.txt"], outs=["output.txt"])
+    @pivot.stage(deps=["input.txt"], outs=["output.txt"])
     def process() -> None:
         pathlib.Path("output.txt").write_text("done")
 
@@ -365,32 +364,15 @@ def test_negative_pid_in_lock_is_treated_as_stale(pipeline_dir: pathlib.Path) ->
     assert not invalid_lock.exists(), "Invalid PID lock should be removed"
 
 
-def test_output_queue_reader_only_catches_empty(
-    pipeline_dir: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_output_queue_reader_only_catches_empty(pipeline_dir: pathlib.Path) -> None:
     """Output queue reader should only catch queue.Empty, not other exceptions."""
-    import queue as queue_module
-
-    from pivot import executor
-
     (pipeline_dir / "input.txt").write_text("hello")
 
-    @stage(deps=["input.txt"], outs=["output.txt"])
+    @pivot.stage(deps=["input.txt"], outs=["output.txt"])
     def process() -> None:
         pathlib.Path("output.txt").write_text("done")
 
-    # Track if queue.Empty is properly handled (not other exceptions)
-    empty_count = {"value": 0}
-    original_get = queue_module.Queue.get  # type: ignore[type-arg]
-
-    def mock_get(self: queue_module.Queue[object], *args: object, **kwargs: object) -> object:
-        try:
-            return original_get(self, *args, **kwargs)  # pyright: ignore[reportArgumentType]
-        except queue_module.Empty:
-            empty_count["value"] += 1
-            raise
-
-    # This test verifies the behavior exists - actual fix ensures only Empty is caught
+    # This test verifies the output queue reader behavior exists and handles Empty properly
     results = executor.run(show_output=True)
     assert results["process"]["status"] == "ran"
 
@@ -405,7 +387,7 @@ def test_output_thread_cleanup_completes(pipeline_dir: pathlib.Path) -> None:
 
     initial_thread_count = threading.active_count()
 
-    @stage(deps=["input.txt"], outs=["output.txt"])
+    @pivot.stage(deps=["input.txt"], outs=["output.txt"])
     def process() -> None:
         print("Stage output")
         pathlib.Path("output.txt").write_text("done")
@@ -434,7 +416,7 @@ def test_mutex_prevents_concurrent_execution(pipeline_dir: pathlib.Path) -> None
     (pipeline_dir / "input.txt").write_text("data")
     timing_file = pipeline_dir / "timing.txt"
 
-    @stage(deps=["input.txt"], outs=["a.txt"], mutex=["gpu"])
+    @pivot.stage(deps=["input.txt"], outs=["a.txt"], mutex=["gpu"])
     def stage_a() -> None:
         with open("timing.txt", "a") as f:
             f.write("a_start\n")
@@ -443,7 +425,7 @@ def test_mutex_prevents_concurrent_execution(pipeline_dir: pathlib.Path) -> None
             f.write("a_end\n")
         pathlib.Path("a.txt").write_text("a")
 
-    @stage(deps=["input.txt"], outs=["b.txt"], mutex=["gpu"])
+    @pivot.stage(deps=["input.txt"], outs=["b.txt"], mutex=["gpu"])
     def stage_b() -> None:
         with open("timing.txt", "a") as f:
             f.write("b_start\n")
@@ -471,11 +453,11 @@ def test_mutex_releases_on_completion(pipeline_dir: pathlib.Path) -> None:
 
     (pipeline_dir / "input.txt").write_text("data")
 
-    @stage(deps=["input.txt"], outs=["first.txt"], mutex=["resource"])
+    @pivot.stage(deps=["input.txt"], outs=["first.txt"], mutex=["resource"])
     def first() -> None:
         pathlib.Path("first.txt").write_text("first")
 
-    @stage(deps=["input.txt"], outs=["second.txt"], mutex=["resource"])
+    @pivot.stage(deps=["input.txt"], outs=["second.txt"], mutex=["resource"])
     def second() -> None:
         pathlib.Path("second.txt").write_text("second")
 
@@ -493,11 +475,11 @@ def test_mutex_releases_on_failure(pipeline_dir: pathlib.Path) -> None:
 
     (pipeline_dir / "input.txt").write_text("data")
 
-    @stage(deps=["input.txt"], outs=["failing.txt"], mutex=["resource"])
+    @pivot.stage(deps=["input.txt"], outs=["failing.txt"], mutex=["resource"])
     def failing() -> None:
         raise RuntimeError("Intentional failure")
 
-    @stage(deps=["input.txt"], outs=["succeeding.txt"], mutex=["resource"])
+    @pivot.stage(deps=["input.txt"], outs=["succeeding.txt"], mutex=["resource"])
     def succeeding() -> None:
         pathlib.Path("succeeding.txt").write_text("success")
 
@@ -517,7 +499,7 @@ def test_different_mutex_groups_run_parallel(pipeline_dir: pathlib.Path) -> None
     (pipeline_dir / "input.txt").write_text("data")
     timing_file = pipeline_dir / "timing.txt"
 
-    @stage(deps=["input.txt"], outs=["gpu.txt"], mutex=["gpu"])
+    @pivot.stage(deps=["input.txt"], outs=["gpu.txt"], mutex=["gpu"])
     def gpu_stage() -> None:
         with open("timing.txt", "a") as f:
             f.write("gpu_start\n")
@@ -526,7 +508,7 @@ def test_different_mutex_groups_run_parallel(pipeline_dir: pathlib.Path) -> None
             f.write("gpu_end\n")
         pathlib.Path("gpu.txt").write_text("gpu")
 
-    @stage(deps=["input.txt"], outs=["disk.txt"], mutex=["disk"])
+    @pivot.stage(deps=["input.txt"], outs=["disk.txt"], mutex=["disk"])
     def disk_stage() -> None:
         with open("timing.txt", "a") as f:
             f.write("disk_start\n")
@@ -563,7 +545,7 @@ def test_multiple_mutex_groups_per_stage(pipeline_dir: pathlib.Path) -> None:
     (pipeline_dir / "input.txt").write_text("data")
     timing_file = pipeline_dir / "timing.txt"
 
-    @stage(deps=["input.txt"], outs=["multi.txt"], mutex=["gpu", "disk"])
+    @pivot.stage(deps=["input.txt"], outs=["multi.txt"], mutex=["gpu", "disk"])
     def multi_resource() -> None:
         with open("timing.txt", "a") as f:
             f.write("multi_start\n")
@@ -572,7 +554,7 @@ def test_multiple_mutex_groups_per_stage(pipeline_dir: pathlib.Path) -> None:
             f.write("multi_end\n")
         pathlib.Path("multi.txt").write_text("multi")
 
-    @stage(deps=["input.txt"], outs=["gpu_only.txt"], mutex=["gpu"])
+    @pivot.stage(deps=["input.txt"], outs=["gpu_only.txt"], mutex=["gpu"])
     def gpu_only() -> None:
         with open("timing.txt", "a") as f:
             f.write("gpu_start\n")
@@ -600,11 +582,11 @@ def test_mutex_with_dependencies(pipeline_dir: pathlib.Path) -> None:
 
     (pipeline_dir / "input.txt").write_text("data")
 
-    @stage(deps=["input.txt"], outs=["first.txt"], mutex=["resource"])
+    @pivot.stage(deps=["input.txt"], outs=["first.txt"], mutex=["resource"])
     def first() -> None:
         pathlib.Path("first.txt").write_text("first")
 
-    @stage(deps=["first.txt"], outs=["second.txt"], mutex=["resource"])
+    @pivot.stage(deps=["first.txt"], outs=["second.txt"], mutex=["resource"])
     def second() -> None:
         data = pathlib.Path("first.txt").read_text()
         pathlib.Path("second.txt").write_text(f"second: {data}")
@@ -625,7 +607,7 @@ def test_no_mutex_stages_unaffected(pipeline_dir: pathlib.Path) -> None:
     (pipeline_dir / "input.txt").write_text("data")
     timing_file = pipeline_dir / "timing.txt"
 
-    @stage(deps=["input.txt"], outs=["a.txt"])
+    @pivot.stage(deps=["input.txt"], outs=["a.txt"])
     def stage_a() -> None:
         with open("timing.txt", "a") as f:
             f.write("a_start\n")
@@ -634,7 +616,7 @@ def test_no_mutex_stages_unaffected(pipeline_dir: pathlib.Path) -> None:
             f.write("a_end\n")
         pathlib.Path("a.txt").write_text("a")
 
-    @stage(deps=["input.txt"], outs=["b.txt"])
+    @pivot.stage(deps=["input.txt"], outs=["b.txt"])
     def stage_b() -> None:
         with open("timing.txt", "a") as f:
             f.write("b_start\n")
@@ -663,7 +645,7 @@ def test_single_stage_mutex_warning(
 
     (pipeline_dir / "input.txt").write_text("data")
 
-    @stage(deps=["input.txt"], outs=["output.txt"], mutex=["lonely_group"])
+    @pivot.stage(deps=["input.txt"], outs=["output.txt"], mutex=["lonely_group"])
     def lonely() -> None:
         pathlib.Path("output.txt").write_text("done")
 
@@ -690,13 +672,13 @@ def test_on_error_fail_stops_on_first_failure(pipeline_dir: pathlib.Path) -> Non
     (pipeline_dir / "input.txt").write_text("data")
     execution_log = pipeline_dir / "execution.log"
 
-    @stage(deps=["input.txt"], outs=["a.txt"])
+    @pivot.stage(deps=["input.txt"], outs=["a.txt"])
     def stage_a() -> None:
         with open("execution.log", "a") as f:
             f.write("a\n")
         raise RuntimeError("Stage A failed")
 
-    @stage(deps=["input.txt"], outs=["b.txt"])
+    @pivot.stage(deps=["input.txt"], outs=["b.txt"])
     def stage_b() -> None:
         with open("execution.log", "a") as f:
             f.write("b\n")
@@ -716,11 +698,11 @@ def test_on_error_keep_going_continues_independent_stages(pipeline_dir: pathlib.
 
     (pipeline_dir / "input.txt").write_text("data")
 
-    @stage(deps=["input.txt"], outs=["failing.txt"])
+    @pivot.stage(deps=["input.txt"], outs=["failing.txt"])
     def failing() -> None:
         raise RuntimeError("Intentional failure")
 
-    @stage(deps=["input.txt"], outs=["succeeding.txt"])
+    @pivot.stage(deps=["input.txt"], outs=["succeeding.txt"])
     def succeeding() -> None:
         pathlib.Path("succeeding.txt").write_text("success")
 
@@ -737,15 +719,15 @@ def test_on_error_keep_going_skips_downstream_of_failed(pipeline_dir: pathlib.Pa
 
     (pipeline_dir / "input.txt").write_text("data")
 
-    @stage(deps=["input.txt"], outs=["first.txt"])
+    @pivot.stage(deps=["input.txt"], outs=["first.txt"])
     def first() -> None:
         raise RuntimeError("First failed")
 
-    @stage(deps=["first.txt"], outs=["second.txt"])
+    @pivot.stage(deps=["first.txt"], outs=["second.txt"])
     def second() -> None:
         pathlib.Path("second.txt").write_text("should not run")
 
-    @stage(deps=["input.txt"], outs=["independent.txt"])
+    @pivot.stage(deps=["input.txt"], outs=["independent.txt"])
     def independent() -> None:
         pathlib.Path("independent.txt").write_text("runs fine")
 
@@ -765,11 +747,11 @@ def test_on_error_ignore_allows_downstream_to_attempt(pipeline_dir: pathlib.Path
     # Create the intermediate file so downstream can try to run
     (pipeline_dir / "first.txt").write_text("preexisting")
 
-    @stage(deps=["input.txt"], outs=["first.txt"])
+    @pivot.stage(deps=["input.txt"], outs=["first.txt"])
     def first() -> None:
         raise RuntimeError("First failed")
 
-    @stage(deps=["first.txt"], outs=["second.txt"])
+    @pivot.stage(deps=["first.txt"], outs=["second.txt"])
     def second() -> None:
         # This stage will attempt to run because on_error=ignore
         data = pathlib.Path("first.txt").read_text()
@@ -789,7 +771,7 @@ def test_invalid_on_error_raises_value_error(pipeline_dir: pathlib.Path) -> None
 
     (pipeline_dir / "input.txt").write_text("data")
 
-    @stage(deps=["input.txt"], outs=["output.txt"])
+    @pivot.stage(deps=["input.txt"], outs=["output.txt"])
     def process() -> None:
         pass
 
@@ -813,7 +795,7 @@ def test_stage_calling_sys_exit_returns_failed(pipeline_dir: pathlib.Path) -> No
 
     (pipeline_dir / "input.txt").write_text("data")
 
-    @stage(deps=["input.txt"], outs=["output.txt"])
+    @pivot.stage(deps=["input.txt"], outs=["output.txt"])
     def exits_with_code() -> None:
         sys.exit(42)
 
@@ -832,7 +814,7 @@ def test_stage_calling_sys_exit_zero_returns_failed(pipeline_dir: pathlib.Path) 
 
     (pipeline_dir / "input.txt").write_text("data")
 
-    @stage(deps=["input.txt"], outs=["output.txt"])
+    @pivot.stage(deps=["input.txt"], outs=["output.txt"])
     def exits_zero() -> None:
         sys.exit(0)
 
@@ -848,7 +830,7 @@ def test_stage_raising_keyboard_interrupt_returns_failed(pipeline_dir: pathlib.P
 
     (pipeline_dir / "input.txt").write_text("data")
 
-    @stage(deps=["input.txt"], outs=["output.txt"])
+    @pivot.stage(deps=["input.txt"], outs=["output.txt"])
     def keyboard_interrupt() -> None:
         raise KeyboardInterrupt("User cancelled")
 
@@ -869,7 +851,7 @@ def test_dependency_is_directory_returns_failed(pipeline_dir: pathlib.Path) -> N
     # Create a directory instead of a file
     (pipeline_dir / "data_dir").mkdir()
 
-    @stage(deps=["data_dir"], outs=["output.txt"])
+    @pivot.stage(deps=["data_dir"], outs=["output.txt"])
     def process() -> None:
         pathlib.Path("output.txt").write_text("done")
 
@@ -893,7 +875,7 @@ def test_parallel_false_runs_sequentially(pipeline_dir: pathlib.Path) -> None:
     (pipeline_dir / "input.txt").write_text("data")
     timing_file = pipeline_dir / "timing.txt"
 
-    @stage(deps=["input.txt"], outs=["a.txt"])
+    @pivot.stage(deps=["input.txt"], outs=["a.txt"])
     def stage_a() -> None:
         with open("timing.txt", "a") as f:
             f.write("a_start\n")
@@ -902,7 +884,7 @@ def test_parallel_false_runs_sequentially(pipeline_dir: pathlib.Path) -> None:
             f.write("a_end\n")
         pathlib.Path("a.txt").write_text("a")
 
-    @stage(deps=["input.txt"], outs=["b.txt"])
+    @pivot.stage(deps=["input.txt"], outs=["b.txt"])
     def stage_b() -> None:
         with open("timing.txt", "a") as f:
             f.write("b_start\n")
@@ -937,7 +919,7 @@ def test_stage_stdout_and_stderr_captured(pipeline_dir: pathlib.Path) -> None:
 
     (pipeline_dir / "input.txt").write_text("data")
 
-    @stage(deps=["input.txt"], outs=["output.txt"])
+    @pivot.stage(deps=["input.txt"], outs=["output.txt"])
     def prints_output() -> None:
         print("stdout message")
         print("stderr message", file=sys.stderr)
@@ -958,7 +940,7 @@ def test_stage_partial_line_output_captured(pipeline_dir: pathlib.Path) -> None:
 
     (pipeline_dir / "input.txt").write_text("data")
 
-    @stage(deps=["input.txt"], outs=["output.txt"])
+    @pivot.stage(deps=["input.txt"], outs=["output.txt"])
     def partial_output() -> None:
         sys.stdout.write("no newline at end")
         sys.stdout.flush()
@@ -987,7 +969,7 @@ def test_lock_retry_exhaustion_returns_failed(pipeline_dir: pathlib.Path) -> Non
     lock_file = cache_dir / "process.running"
     lock_file.write_text(f"pid: {os.getpid()}\n")
 
-    @stage(deps=["input.txt"], outs=["output.txt"])
+    @pivot.stage(deps=["input.txt"], outs=["output.txt"])
     def process() -> None:
         pathlib.Path("output.txt").write_text("done")
 
@@ -1013,7 +995,7 @@ def test_mutex_names_are_case_insensitive(pipeline_dir: pathlib.Path) -> None:
     (pipeline_dir / "input.txt").write_text("data")
     timing_file = pipeline_dir / "timing.txt"
 
-    @stage(deps=["input.txt"], outs=["upper.txt"], mutex=["GPU"])
+    @pivot.stage(deps=["input.txt"], outs=["upper.txt"], mutex=["GPU"])
     def upper_mutex() -> None:
         with open("timing.txt", "a") as f:
             f.write("upper_start\n")
@@ -1022,7 +1004,7 @@ def test_mutex_names_are_case_insensitive(pipeline_dir: pathlib.Path) -> None:
             f.write("upper_end\n")
         pathlib.Path("upper.txt").write_text("done")
 
-    @stage(deps=["input.txt"], outs=["lower.txt"], mutex=["gpu"])
+    @pivot.stage(deps=["input.txt"], outs=["lower.txt"], mutex=["gpu"])
     def lower_mutex() -> None:
         with open("timing.txt", "a") as f:
             f.write("lower_start\n")
@@ -1053,7 +1035,7 @@ def test_mutex_names_whitespace_stripped(pipeline_dir: pathlib.Path) -> None:
     (pipeline_dir / "input.txt").write_text("data")
     timing_file = pipeline_dir / "timing.txt"
 
-    @stage(deps=["input.txt"], outs=["spaced.txt"], mutex=["  resource  "])
+    @pivot.stage(deps=["input.txt"], outs=["spaced.txt"], mutex=["  resource  "])
     def spaced_mutex() -> None:
         with open("timing.txt", "a") as f:
             f.write("spaced_start\n")
@@ -1062,7 +1044,7 @@ def test_mutex_names_whitespace_stripped(pipeline_dir: pathlib.Path) -> None:
             f.write("spaced_end\n")
         pathlib.Path("spaced.txt").write_text("done")
 
-    @stage(deps=["input.txt"], outs=["clean.txt"], mutex=["resource"])
+    @pivot.stage(deps=["input.txt"], outs=["clean.txt"], mutex=["resource"])
     def clean_mutex() -> None:
         with open("timing.txt", "a") as f:
             f.write("clean_start\n")

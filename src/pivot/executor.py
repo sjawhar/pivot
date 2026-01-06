@@ -23,12 +23,11 @@ import queue
 import sys
 import threading
 import time
-from typing import TYPE_CHECKING, Any, cast, override
+from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast, override
 
 import loky
 
-from pivot import console, dag, exceptions, lock, project
-from pivot.registry import REGISTRY
+from pivot import console, dag, exceptions, lock, project, registry
 from pivot.types import (
     LockData,
     OnError,
@@ -40,6 +39,7 @@ from pivot.types import (
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator
+    from inspect import Signature
 
     from networkx import DiGraph
 
@@ -48,12 +48,28 @@ logger = logging.getLogger(__name__)
 _MAX_WORKERS_DEFAULT = 8
 
 
+class ExecutionSummary(TypedDict):
+    """Summary result for a single stage after execution (returned by executor.run)."""
+
+    status: Literal["ran", "skipped", "failed", "unknown"]
+    reason: str
+
+
+class WorkerStageInfo(TypedDict):
+    """Stage info subset passed to worker processes."""
+
+    func: Callable[..., Any]
+    fingerprint: dict[str, str]
+    deps: list[str]
+    signature: Signature | None
+
+
 @dataclasses.dataclass
 class StageState:
     """Tracks execution state for a single stage."""
 
     name: str
-    info: dict[str, Any]
+    info: registry.RegistryStageInfo
     upstream: list[str]
     upstream_unfinished: set[str]
     downstream: list[str]
@@ -66,16 +82,18 @@ class StageState:
 
 def run(
     stages: list[str] | None = None,
+    single_stage: bool = False,
     cache_dir: pathlib.Path | None = None,
     parallel: bool = True,
     max_workers: int | None = None,
-    on_error: str = "fail",
+    on_error: OnError | str = OnError.FAIL,
     show_output: bool = True,
-) -> dict[str, dict[str, Any]]:
+) -> dict[str, ExecutionSummary]:
     """Execute pipeline stages with greedy parallel execution.
 
     Args:
-        stages: Specific stages to run (and their dependencies). If None, runs all.
+        stages: Target stages to run (and their dependencies). If None, runs all.
+        single_stage: If True, run only the specified stages without dependencies.
         cache_dir: Directory for lock files. Defaults to .pivot/cache.
         parallel: If True, run independent stages in parallel (default: True).
         max_workers: Max concurrent stages (default: min(cpu_count, 8)).
@@ -88,22 +106,25 @@ def run(
     if cache_dir is None:
         cache_dir = project.get_project_root() / ".pivot" / "cache"
 
-    try:
-        error_mode = OnError(on_error)
-    except ValueError:
-        raise ValueError(
-            f"Invalid on_error mode: {on_error}. Use 'fail', 'keep_going', or 'ignore'"
-        ) from None
+    if isinstance(on_error, OnError):
+        error_mode = on_error
+    else:
+        try:
+            error_mode = OnError(on_error)
+        except ValueError:
+            raise ValueError(
+                f"Invalid on_error mode: {on_error}. Use 'fail', 'keep_going', or 'ignore'"
+            ) from None
 
-    graph = REGISTRY.build_dag(validate=True)
+    graph = registry.REGISTRY.build_dag(validate=True)
 
     if stages:
         registered = set(graph.nodes())
-        unknown = set(stages) - registered
+        unknown = [s for s in stages if s not in registered]
         if unknown:
-            raise exceptions.StageNotFoundError(f"Unknown stages: {', '.join(sorted(unknown))}")
+            raise exceptions.StageNotFoundError(f"Unknown stage(s): {', '.join(unknown)}")
 
-    execution_order = dag.get_execution_order(graph, stages)
+    execution_order = dag.get_execution_order(graph, stages, single_stage=single_stage)
 
     if not execution_order:
         return {}
@@ -133,11 +154,11 @@ def run(
     results = _build_results(stage_states)
 
     if con:
-        ran = sum(1 for r in results.values() if r["status"] == "ran")
-        skipped = sum(1 for r in results.values() if r["status"] == "skipped")
-        failed = sum(1 for r in results.values() if r["status"] == "failed")
+        status_counts = collections.Counter(r["status"] for r in results.values())
         total_duration = time.perf_counter() - start_time
-        con.summary(ran, skipped, failed, total_duration)
+        con.summary(
+            status_counts["ran"], status_counts["skipped"], status_counts["failed"], total_duration
+        )
 
     return results
 
@@ -151,7 +172,7 @@ def _initialize_stage_states(
     states = dict[str, StageState]()
 
     for stage_name in execution_order:
-        stage_info = REGISTRY.get(stage_name)
+        stage_info = registry.REGISTRY.get(stage_name)
 
         upstream = list(graph.successors(stage_name))
         upstream_in_plan = [u for u in upstream if u in stages_set]
@@ -288,7 +309,7 @@ def _execute_greedy(
                             index=completed_count,
                             total=total_stages,
                             status=StageStatus(state.result["status"]),
-                            reason=state.result.get("reason", ""),
+                            reason=state.result["reason"],
                             duration=duration,
                         )
 
@@ -411,14 +432,14 @@ def _start_ready_stages(
             _mark_stage_failed(state, f"Failed to submit: {e}", stage_states, error_mode)
 
 
-def _prepare_worker_info(stage_info: dict[str, Any]) -> dict[str, Any]:
+def _prepare_worker_info(stage_info: registry.RegistryStageInfo) -> WorkerStageInfo:
     """Prepare stage info for pickling to worker process."""
-    return {
-        "func": stage_info["func"],
-        "fingerprint": stage_info["fingerprint"],
-        "deps": stage_info.get("deps", []),
-        "signature": stage_info.get("signature"),
-    }
+    return WorkerStageInfo(
+        func=stage_info["func"],
+        fingerprint=stage_info["fingerprint"],
+        deps=stage_info["deps"],
+        signature=stage_info["signature"],
+    )
 
 
 def _mark_stage_failed(
@@ -475,7 +496,7 @@ def _handle_stage_failure(
 
 def execute_stage_worker(
     stage_name: str,
-    stage_info: dict[str, Any],
+    stage_info: WorkerStageInfo,
     cache_dir: pathlib.Path,
     output_queue: mp.Queue[OutputMessage],
 ) -> StageResult:
@@ -579,36 +600,37 @@ class _QueueStreamCapture(io.TextIOBase):
         self._output_lines = output_lines
         self._buffer = ""
 
+    def _send_line(self, line: str) -> None:
+        """Save line locally and send to queue for real-time display."""
+        self._output_lines.append((line, self._is_stderr))
+        # Queue failure only affects real-time display; output is already saved locally
+        with contextlib.suppress(queue.Full, ValueError, OSError):
+            self._queue.put((self._stage_name, line, self._is_stderr), block=False)
+
     @override
     def write(self, s: str) -> int:
         self._buffer += s
         while "\n" in self._buffer:
             line, self._buffer = self._buffer.split("\n", 1)
             if line:
-                self._output_lines.append((line, self._is_stderr))
-                # Output already saved locally; queue failure only affects real-time display
-                with contextlib.suppress(queue.Full, ValueError, OSError):
-                    self._queue.put((self._stage_name, line, self._is_stderr), block=False)
+                self._send_line(line)
         return len(s)
 
     @override
     def flush(self) -> None:
         if self._buffer:
-            self._output_lines.append((self._buffer, self._is_stderr))
-            # Output already saved locally; queue failure only affects real-time display
-            with contextlib.suppress(queue.Full, ValueError, OSError):
-                self._queue.put((self._stage_name, self._buffer, self._is_stderr), block=False)
+            self._send_line(self._buffer)
             self._buffer = ""
 
 
-def _build_results(stage_states: dict[str, StageState]) -> dict[str, dict[str, Any]]:
+def _build_results(stage_states: dict[str, StageState]) -> dict[str, ExecutionSummary]:
     """Build results dict from stage states."""
-    results = dict[str, dict[str, Any]]()
+    results = dict[str, ExecutionSummary]()
     for name, state in stage_states.items():
         if state.result:
             results[name] = {
                 "status": state.result["status"],
-                "reason": state.result.get("reason", ""),
+                "reason": state.result["reason"],
             }
         elif state.status == StageStatus.SKIPPED:
             results[name] = {"status": "skipped", "reason": "upstream failed"}
@@ -617,7 +639,7 @@ def _build_results(stage_states: dict[str, StageState]) -> dict[str, dict[str, A
     return results
 
 
-def extract_params(stage_info: dict[str, Any]) -> dict[str, Any]:
+def extract_params(stage_info: WorkerStageInfo | dict[str, Any]) -> dict[str, Any]:
     """Extract parameter values from stage signature defaults."""
     sig = stage_info.get("signature")
     if not sig:

@@ -2,14 +2,12 @@
 # pyright: reportUnusedFunction=false
 
 import pathlib
-from collections.abc import Generator
 
 import pytest
 import yaml
 
-from pivot import dvc_compat, outputs
+from pivot import dvc_compat, outputs, registry
 from pivot.exceptions import DVCImportError, ExportError
-from pivot.registry import StageRegistry
 
 
 # Module-level functions for export tests (can't export from __main__)
@@ -153,29 +151,14 @@ class TestBuildOutEntry:
 class TestExportDvcYaml:
     """Tests for export_dvc_yaml function."""
 
-    registry: StageRegistry  # pyright: ignore[reportUninitializedInstanceVariable]
-    _original_registry: StageRegistry  # pyright: ignore[reportUninitializedInstanceVariable]
-
-    @pytest.fixture(autouse=True)
-    def _setup_registry(self) -> Generator[None]:
-        """Use clean registry for each test."""
-        self.registry = StageRegistry()
-        # Temporarily replace REGISTRY for tests
-        import pivot.dvc_compat
-
-        self._original_registry = pivot.dvc_compat.REGISTRY
-        pivot.dvc_compat.REGISTRY = self.registry
-        yield
-        pivot.dvc_compat.REGISTRY = self._original_registry
-
     def test_export_simple_stage(
         self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Should export basic stage to dvc.yaml."""
         # Mock project root
-        monkeypatch.setattr("pivot.dvc_compat.project.get_project_root", lambda: tmp_path)
+        monkeypatch.setattr("pivot.project.get_project_root", lambda: tmp_path)
 
-        self.registry.register(
+        registry.REGISTRY.register(
             exportable_stage,
             name="my_stage",
             deps=[str(tmp_path / "input.txt")],
@@ -205,7 +188,7 @@ class TestExportDvcYaml:
         """Should separate Out/Metric/Plot into correct sections."""
         monkeypatch.setattr("pivot.dvc_compat.project.get_project_root", lambda: tmp_path)
 
-        self.registry.register(
+        registry.REGISTRY.register(
             exportable_stage,
             name="train",
             deps=[],
@@ -229,7 +212,7 @@ class TestExportDvcYaml:
         """Should generate params.yaml with function defaults."""
         monkeypatch.setattr("pivot.dvc_compat.project.get_project_root", lambda: tmp_path)
 
-        self.registry.register(
+        registry.REGISTRY.register(
             exportable_with_params,
             name="train",
             deps=[],
@@ -251,7 +234,7 @@ class TestExportDvcYaml:
         """Stage should reference params from params.yaml."""
         monkeypatch.setattr("pivot.dvc_compat.project.get_project_root", lambda: tmp_path)
 
-        self.registry.register(
+        registry.REGISTRY.register(
             exportable_with_params,
             name="train",
             deps=[],
@@ -281,7 +264,7 @@ class TestExportDvcYaml:
         """Should raise error when requested stages don't exist."""
         monkeypatch.setattr("pivot.dvc_compat.project.get_project_root", lambda: tmp_path)
 
-        self.registry.register(exportable_stage, name="stage1", deps=[], outs=[])
+        registry.REGISTRY.register(exportable_stage, name="stage1", deps=[], outs=[])
 
         with pytest.raises(ExportError, match="Stages not found.*nonexistent"):
             dvc_compat.export_dvc_yaml(tmp_path / "dvc.yaml", stages=["stage1", "nonexistent"])
@@ -292,8 +275,8 @@ class TestExportDvcYaml:
         """Should export only specified stages."""
         monkeypatch.setattr("pivot.dvc_compat.project.get_project_root", lambda: tmp_path)
 
-        self.registry.register(exportable_stage, name="stage1", deps=[], outs=[])
-        self.registry.register(exportable_with_params, name="stage2", deps=[], outs=[])
+        registry.REGISTRY.register(exportable_stage, name="stage1", deps=[], outs=[])
+        registry.REGISTRY.register(exportable_with_params, name="stage2", deps=[], outs=[])
 
         result = dvc_compat.export_dvc_yaml(tmp_path / "dvc.yaml", stages=["stage1"])
 
@@ -306,7 +289,7 @@ class TestExportDvcYaml:
         """Out with cache=False should have cache: false in yaml."""
         monkeypatch.setattr("pivot.dvc_compat.project.get_project_root", lambda: tmp_path)
 
-        self.registry.register(
+        registry.REGISTRY.register(
             exportable_stage,
             name="stage",
             deps=[],

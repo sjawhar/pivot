@@ -41,12 +41,38 @@ class StageResult(TypedDict):
     output_lines: list[tuple[str, bool]]
 
 
+class FileHash(TypedDict):
+    """Hash info for a single file."""
+
+    hash: str
+
+
+class DirManifestEntry(TypedDict, total=False):
+    """Entry in directory manifest."""
+
+    relpath: str
+    hash: str
+    size: int
+    isexec: bool
+
+
+class DirHash(TypedDict):
+    """Hash info for a directory with full manifest."""
+
+    hash: str
+    manifest: list[DirManifestEntry]
+
+
+OutputHash = FileHash | DirHash | None
+
+
 class LockData(TypedDict, total=False):
     """Data stored in stage lock files."""
 
     code_manifest: dict[str, str]
     params: dict[str, Any]
     dep_hashes: dict[str, str]
+    output_hashes: dict[str, OutputHash]
 
 
 # Type alias for output queue messages: (stage_name, line, is_stderr) or None for shutdown

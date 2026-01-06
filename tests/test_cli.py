@@ -27,7 +27,7 @@ def test_cli_run_help(runner: click.testing.CliRunner) -> None:
     """Run subcommand should show its own help."""
     result = runner.invoke(cli.cli, ["run", "--help"])
     assert result.exit_code == 0
-    assert "--stages" in result.output
+    assert "--single-stage" in result.output
     assert "--dry-run" in result.output
 
 
@@ -165,10 +165,10 @@ def test_cli_dry_run_no_stages(runner: click.testing.CliRunner, tmp_path: pathli
         assert "No stages" in result.output
 
 
-def test_cli_dry_run_specific_stages(
+def test_cli_dry_run_specific_stage(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
-    """Dry-run with --stages only shows specified stages."""
+    """Dry-run with stage argument only shows specified stage and dependencies."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
@@ -181,7 +181,7 @@ def test_cli_dry_run_specific_stages(
         def stage_b() -> None:
             pass
 
-        result = runner.invoke(cli.cli, ["run", "--dry-run", "--stages", "stage_a"])
+        result = runner.invoke(cli.cli, ["run", "--dry-run", "stage_a"])
 
         assert result.exit_code == 0
         assert "stage_a" in result.output
@@ -218,7 +218,7 @@ def test_cli_run_exception_shows_error(
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
 
-        result = runner.invoke(cli.cli, ["run", "--stages", "nonexistent"])
+        result = runner.invoke(cli.cli, ["run", "nonexistent"])
 
         assert result.exit_code != 0
         assert "nonexistent" in result.output.lower() or "error" in result.output.lower()
@@ -231,7 +231,7 @@ def test_cli_dry_run_exception_shows_error(
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
 
-        result = runner.invoke(cli.cli, ["run", "--dry-run", "--stages", "nonexistent"])
+        result = runner.invoke(cli.cli, ["run", "--dry-run", "nonexistent"])
 
         assert result.exit_code != 0
 

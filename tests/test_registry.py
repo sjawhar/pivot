@@ -13,7 +13,8 @@ import pytest
 from pydantic import BaseModel
 
 from pivot import fingerprint, registry, stage
-from pivot.registry import REGISTRY, StageRegistry
+from pivot.exceptions import ValidationError
+from pivot.registry import REGISTRY, RegistryStageInfo, StageRegistry
 
 
 # Module-level helper for testing module.attr capture (no leading underscore!)
@@ -145,7 +146,17 @@ def test_stage_captures_transitive_dependencies():
 def test_registry_get_stage():
     """Should retrieve stage info by name."""
     registry = StageRegistry()
-    registry._stages["test"] = {"name": "test", "func": lambda: 42}
+    registry._stages["test"] = RegistryStageInfo(
+        name="test",
+        func=lambda: 42,
+        deps=[],
+        outs=[],
+        outs_paths=[],
+        params_cls=None,
+        mutex=[],
+        signature=None,
+        fingerprint={},
+    )
     stage_info = registry.get("test")
     assert stage_info["name"] == "test"
 
@@ -161,8 +172,28 @@ def test_registry_get_nonexistent_stage_raises_keyerror():
 def test_registry_list_stages():
     """Should list all registered stage names."""
     registry = StageRegistry()
-    registry._stages["stage1"] = {"name": "stage1"}
-    registry._stages["stage2"] = {"name": "stage2"}
+    registry._stages["stage1"] = RegistryStageInfo(
+        name="stage1",
+        func=lambda: None,
+        deps=[],
+        outs=[],
+        outs_paths=[],
+        params_cls=None,
+        mutex=[],
+        signature=None,
+        fingerprint={},
+    )
+    registry._stages["stage2"] = RegistryStageInfo(
+        name="stage2",
+        func=lambda: None,
+        deps=[],
+        outs=[],
+        outs_paths=[],
+        params_cls=None,
+        mutex=[],
+        signature=None,
+        fingerprint={},
+    )
     stages = registry.list_stages()
     assert set(stages) == {"stage1", "stage2"}
 
@@ -178,7 +209,17 @@ def test_registry_list_stages_empty():
 def test_registry_clear():
     """Should clear all registered stages."""
     registry = StageRegistry()
-    registry._stages["test"] = {"name": "test"}
+    registry._stages["test"] = RegistryStageInfo(
+        name="test",
+        func=lambda: None,
+        deps=[],
+        outs=[],
+        outs_paths=[],
+        params_cls=None,
+        mutex=[],
+        signature=None,
+        fingerprint={},
+    )
     registry.clear()
     assert registry.list_stages() == []
 
@@ -231,7 +272,7 @@ def test_stage_duplicate_registration_raises_error():
     )
 
     # Registering different function with same name should raise error
-    with pytest.raises(registry.ValidationError, match="already registered"):
+    with pytest.raises(ValidationError, match="already registered"):
         REGISTRY.register(
             func_two, name="my_stage", deps=["new.txt"], outs=list[str](), params_cls=None
         )

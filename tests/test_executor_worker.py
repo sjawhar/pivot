@@ -18,6 +18,7 @@ from pivot import exceptions, executor
 if TYPE_CHECKING:
     import pathlib
 
+    from pivot.executor import WorkerStageInfo
     from pivot.types import OutputMessage
 
 
@@ -37,9 +38,9 @@ def worker_env(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> pathl
 
 def test_execute_stage_worker_with_missing_deps(worker_env: pathlib.Path) -> None:
     """Worker returns failed status when dependency files are missing."""
-    stage_info = {
+    stage_info: WorkerStageInfo = {
         "func": lambda: None,
-        "fingerprint": "abc123",
+        "fingerprint": {"self:test": "abc123"},
         "deps": ["missing_file.txt"],
         "signature": None,
     }
@@ -62,9 +63,9 @@ def test_execute_stage_worker_with_directory_dep(
     """Worker returns failed when dependency is a directory."""
     (tmp_path / "data_dir").mkdir()
 
-    stage_info = {
+    stage_info: WorkerStageInfo = {
         "func": lambda: None,
-        "fingerprint": "abc123",
+        "fingerprint": {"self:test": "abc123"},
         "deps": ["data_dir"],
         "signature": None,
     }
@@ -89,9 +90,9 @@ def test_execute_stage_worker_runs_unchanged_stage(
     def stage_func() -> None:
         (tmp_path / "output.txt").write_text("result")
 
-    stage_info = {
+    stage_info: WorkerStageInfo = {
         "func": stage_func,
-        "fingerprint": "fp123",
+        "fingerprint": {"self:stage_func": "fp123"},
         "deps": ["input.txt"],
         "signature": None,
     }
@@ -128,9 +129,9 @@ def test_execute_stage_worker_reruns_when_fingerprint_changes(
         count = int(counter.read_text()) if counter.exists() else 0
         counter.write_text(str(count + 1))
 
-    stage_info_v1 = {
+    stage_info_v1: WorkerStageInfo = {
         "func": stage_func_v1,
-        "fingerprint": "fp_v1",
+        "fingerprint": {"self:stage_func_v1": "fp_v1"},
         "deps": ["input.txt"],
         "signature": None,
     }
@@ -146,7 +147,10 @@ def test_execute_stage_worker_reruns_when_fingerprint_changes(
     assert counter.read_text() == "1"
 
     # Second run with different fingerprint
-    stage_info_v2 = {**stage_info_v1, "fingerprint": "fp_v2"}
+    stage_info_v2: WorkerStageInfo = {
+        **stage_info_v1,
+        "fingerprint": {"self:stage_func_v1": "fp_v2"},
+    }
     result2 = executor.execute_stage_worker(
         "test_stage",
         stage_info_v2,
@@ -167,9 +171,9 @@ def test_execute_stage_worker_handles_stage_exception(
     def failing_stage() -> None:
         raise RuntimeError("Stage failed intentionally")
 
-    stage_info = {
+    stage_info: WorkerStageInfo = {
         "func": failing_stage,
-        "fingerprint": "fp123",
+        "fingerprint": {"self:failing_stage": "fp123"},
         "deps": ["input.txt"],
         "signature": None,
     }
@@ -194,9 +198,9 @@ def test_execute_stage_worker_handles_sys_exit(
     def exits_stage() -> None:
         sys.exit(42)
 
-    stage_info = {
+    stage_info: WorkerStageInfo = {
         "func": exits_stage,
-        "fingerprint": "fp123",
+        "fingerprint": {"self:exits_stage": "fp123"},
         "deps": ["input.txt"],
         "signature": None,
     }
@@ -222,9 +226,9 @@ def test_execute_stage_worker_handles_keyboard_interrupt(
     def interrupted_stage() -> None:
         raise KeyboardInterrupt("User cancelled")
 
-    stage_info = {
+    stage_info: WorkerStageInfo = {
         "func": interrupted_stage,
-        "fingerprint": "fp123",
+        "fingerprint": {"self:interrupted_stage": "fp123"},
         "deps": ["input.txt"],
         "signature": None,
     }

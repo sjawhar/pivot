@@ -6,11 +6,17 @@ Provides formatted output for pipeline execution with:
 - Timing information
 """
 
+import pathlib
 import sys
 import time
-from typing import TextIO
+from typing import TYPE_CHECKING, TextIO
 
 from pivot.types import StageDisplayStatus, StageStatus
+
+if TYPE_CHECKING:
+    from collections.abc import Set
+
+    from watchfiles import Change
 
 # ANSI color codes
 _COLORS = {
@@ -156,6 +162,34 @@ class Console:
         prefix = self._color(f"  [{name}]", "dim")
         line_colored = self._color(line, "red") if is_stderr else line
         print(f"{prefix} {line_colored}", file=self.stream, flush=True)
+
+    def watch_start(self, paths: list[pathlib.Path]) -> None:
+        """Print watch mode startup message."""
+        header = self._color("Watch mode started", "cyan", "bold")
+        paths_str = ", ".join(str(p) for p in paths[:3])
+        if len(paths) > 3:
+            paths_str += f" (+{len(paths) - 3} more)"
+        print(f"\n{header}", file=self.stream, flush=True)
+        print(f"Watching: {paths_str}", file=self.stream, flush=True)
+
+    def watch_waiting(self) -> None:
+        """Print waiting for changes message."""
+        msg = self._color("Waiting for file changes... (Ctrl+C to exit)", "dim")
+        print(f"\n{msg}\n", file=self.stream, flush=True)
+
+    def watch_changes_detected(self, changes: "Set[tuple[Change, str]]") -> None:
+        """Print detected changes summary."""
+        files = [pathlib.Path(path).name for _, path in changes]
+        files_str = ", ".join(files[:5])
+        if len(files) > 5:
+            files_str += f" (+{len(files) - 5} more)"
+        header = self._color("Changes detected:", "yellow", "bold")
+        print(f"\n{header} {files_str}", file=self.stream, flush=True)
+
+    def watch_stopped(self) -> None:
+        """Print watch mode stopped message."""
+        msg = self._color("\nWatch mode stopped", "cyan")
+        print(msg, file=self.stream, flush=True)
 
 
 # Global console instance for convenience

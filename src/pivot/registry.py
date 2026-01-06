@@ -17,25 +17,42 @@ Example:
 from __future__ import annotations
 
 import dataclasses
+import enum
 import inspect
 import logging
 import pathlib
 from collections.abc import Callable, Sequence
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypedDict, TypeVar
 
 from pivot import exceptions, fingerprint, outputs, project, trie
-from pivot.exceptions import (
-    ValidationError as ValidationError,
-)
-from pivot.exceptions import (
-    ValidationMode as ValidationMode,
-)
+from pivot.exceptions import ValidationError
 
 if TYPE_CHECKING:
+    from inspect import Signature
+
     from pydantic import BaseModel
 
 F = TypeVar("F", bound=Callable[..., Any])
 logger = logging.getLogger(__name__)
+
+
+class RegistryStageInfo(TypedDict):
+    func: Callable[..., Any]
+    name: str
+    deps: list[str]
+    outs: list[outputs.BaseOut]
+    outs_paths: list[str]
+    params_cls: type[BaseModel] | None
+    mutex: list[str]
+    signature: Signature | None
+    fingerprint: dict[str, str]
+
+
+class ValidationMode(enum.StrEnum):
+    """Validation strictness levels."""
+
+    ERROR = "error"  # Raise exception on validation failure
+    WARN = "warn"  # Log warning, allow registration
 
 
 @dataclasses.dataclass
@@ -86,7 +103,7 @@ class StageRegistry:
     """Global registry for all pipeline stages."""
 
     def __init__(self, validation_mode: ValidationMode = ValidationMode.ERROR) -> None:
-        self._stages: dict[str, dict[str, Any]] = {}
+        self._stages: dict[str, RegistryStageInfo] = {}
         self.validation_mode: ValidationMode = validation_mode
 
     def register(
@@ -136,19 +153,19 @@ class StageRegistry:
         except (exceptions.OutputDuplicationError, exceptions.OverlappingOutputPathsError) as e:
             _handle_validation_error(str(e), self.validation_mode)
 
-        self._stages[stage_name] = {
-            "func": func,
-            "name": stage_name,
-            "deps": deps_list,
-            "outs": outs_normalized,  # Full BaseOut objects
-            "outs_paths": outs_paths,  # Just paths for DAG
-            "params_cls": params_cls,
-            "mutex": mutex_list,
-            "signature": inspect.signature(func),
-            "fingerprint": fingerprint.get_stage_fingerprint(func),
-        }
+        self._stages[stage_name] = RegistryStageInfo(
+            func=func,
+            name=stage_name,
+            deps=deps_list,
+            outs=outs_normalized,
+            outs_paths=outs_paths,
+            params_cls=params_cls,
+            mutex=mutex_list,
+            signature=inspect.signature(func),
+            fingerprint=fingerprint.get_stage_fingerprint(func),
+        )
 
-    def get(self, name: str) -> dict[str, Any]:
+    def get(self, name: str) -> RegistryStageInfo:
         """Get stage info by name (raises KeyError if not found)."""
         return self._stages[name]
 
@@ -177,6 +194,14 @@ class StageRegistry:
         """Clear all registered stages (for testing)."""
         self._stages.clear()
 
+    def get_all_output_paths(self) -> set[str]:
+        """Get all registered output paths (for watch mode filtering)."""
+        result = set[str]()
+        for info in self._stages.values():
+            for out_path in info["outs_paths"]:
+                result.add(str(out_path))
+        return result
+
 
 def _normalize_paths(paths: Sequence[str], validation_mode: ValidationMode) -> list[str]:
     """Normalize paths to absolute paths, handling errors based on validation mode."""
@@ -193,7 +218,7 @@ def _normalize_paths(paths: Sequence[str], validation_mode: ValidationMode) -> l
 
 
 def _validate_stage_registration(
-    stages: dict[str, dict[str, Any]],
+    stages: dict[str, RegistryStageInfo],
     stage_name: str,
     deps: Sequence[str],
     outs: Sequence[str],

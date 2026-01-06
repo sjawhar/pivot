@@ -1,19 +1,34 @@
 """Tests for DAG construction and traversal."""
 
 from pathlib import Path
-from typing import Any
 
 import pytest
+from pydantic import BaseModel
 
-from pivot import dag
+from pivot import dag, outputs
 from pivot.exceptions import CyclicGraphError, DependencyNotFoundError
+from pivot.registry import RegistryStageInfo
 
 # Test helpers for creating dummy stages
 
 
-def _create_stage(name: str, deps: list[str], outs: list[str]) -> dict[str, Any]:
+class TestParams(BaseModel):
+    pass
+
+
+def _create_stage(name: str, deps: list[str], outs: list[str]) -> RegistryStageInfo:
     """Create a stage dict for testing."""
-    return {"name": name, "deps": deps, "outs": outs}
+    return RegistryStageInfo(
+        func=lambda: None,
+        name=name,
+        deps=deps,
+        outs=[outputs.Out(path=out) for out in outs],
+        outs_paths=outs,
+        params_cls=TestParams,
+        mutex=[],
+        signature=None,
+        fingerprint={},
+    )
 
 
 # --- Basic DAG construction tests ---
@@ -99,7 +114,7 @@ def test_build_dag_independent_stages(tmp_path: Path) -> None:
 def test_build_dag_empty() -> None:
     """Build DAG with no stages."""
     graph = dag.build_dag({})
-    assert len(graph.nodes()) == 0
+    assert len(list(graph.nodes())) == 0
 
 
 # --- Dependency resolution tests ---
@@ -319,8 +334,8 @@ def test_get_subgraph_single_stage(tmp_path: Path) -> None:
     assert "stage_c" not in order
 
 
-def test_get_subgraph_multiple_stages(tmp_path: Path) -> None:
-    """Get subgraph for multiple stages and their dependencies."""
+def test_get_subgraph_single_stage_with_shared_dependency(tmp_path: Path) -> None:
+    """Get subgraph for a single stage with shared dependencies."""
     (tmp_path / "data.csv").touch()
 
     stages = {
@@ -340,11 +355,11 @@ def test_get_subgraph_multiple_stages(tmp_path: Path) -> None:
 
     graph = dag.build_dag(stages)
 
-    # Get execution order for preproc and features
-    order = dag.get_execution_order(graph, stages=["preproc", "features"])
+    # Get execution order for train (depends on preproc and features)
+    order = dag.get_execution_order(graph, stages=["train"])
 
-    # Should include data (shared dependency) but not train
-    assert set(order) == {"data", "preproc", "features"}
+    # Should include data (dependency), preproc, features, and train
+    assert set(order) == {"data", "preproc", "features", "train"}
 
 
 def test_get_downstream_stages(tmp_path: Path) -> None:
