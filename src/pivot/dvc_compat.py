@@ -166,36 +166,22 @@ def _build_out_entry(out: outputs.BaseOut, rel_path: str) -> str | dict[str, Any
     """Build DVC output entry from BaseOut object."""
     options: dict[str, Any] = {}
 
-    # Check if cache differs from type default
-    if isinstance(out, outputs.Out) and out.cache is False:
-        options["cache"] = False
-    elif isinstance(out, outputs.Metric) and out.cache is True:
-        options["cache"] = True
-    elif (
-        isinstance(out, outputs.Plot)
-        and out.cache is False
-        or isinstance(out, outputs.IncrementalOut)
-        and out.cache is False
-    ):
-        options["cache"] = False
+    # Only emit cache option when it differs from type default (Metric=False, others=True)
+    default_cache = not isinstance(out, outputs.Metric)
+    if out.cache != default_cache:
+        options["cache"] = out.cache
 
     # IncrementalOut always exports with persist: true (DVC won't delete it between runs)
     if isinstance(out, outputs.IncrementalOut) or out.persist:
         options["persist"] = True
 
-    # Add plot-specific options
+    # Plot-specific options
     if isinstance(out, outputs.Plot):
-        if out.x is not None:
-            options["x"] = out.x
-        if out.y is not None:
-            options["y"] = out.y
-        if out.template is not None:
-            options["template"] = out.template
+        for attr in ("x", "y", "template"):
+            if (value := getattr(out, attr)) is not None:
+                options[attr] = value
 
-    # Return simple string if no options, else dict
-    if not options:
-        return rel_path
-    return {rel_path: options}
+    return {rel_path: options} if options else rel_path
 
 
 def export_dvc_yaml(

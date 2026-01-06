@@ -783,6 +783,46 @@ def test_invalid_on_error_raises_value_error(pipeline_dir: pathlib.Path) -> None
 
 
 # =============================================================================
+# Timeout Tests
+# =============================================================================
+
+
+def test_stage_timeout_marks_stage_as_failed(pipeline_dir: pathlib.Path) -> None:
+    """Stage exceeding timeout is marked as failed."""
+    import time
+
+    from pivot import executor
+
+    (pipeline_dir / "input.txt").write_text("data")
+
+    @pivot.stage(deps=["input.txt"], outs=["output.txt"])
+    def slow_stage() -> None:
+        time.sleep(5)  # Sleep longer than timeout
+        pathlib.Path("output.txt").write_text("done")
+
+    results = executor.run(stage_timeout=0.5, show_output=False)
+
+    assert results["slow_stage"]["status"] == "failed"
+    assert "timed out" in results["slow_stage"]["reason"]
+
+
+def test_stage_timeout_does_not_affect_fast_stages(pipeline_dir: pathlib.Path) -> None:
+    """Fast stages complete normally even with timeout set."""
+    from pivot import executor
+
+    (pipeline_dir / "input.txt").write_text("data")
+
+    @pivot.stage(deps=["input.txt"], outs=["output.txt"])
+    def fast_stage() -> None:
+        pathlib.Path("output.txt").write_text("done")
+
+    results = executor.run(stage_timeout=60.0, show_output=False)
+
+    assert results["fast_stage"]["status"] == "ran"
+    assert (pipeline_dir / "output.txt").read_text() == "done"
+
+
+# =============================================================================
 # Worker Exception Tests
 # =============================================================================
 
@@ -837,6 +877,7 @@ def test_stage_raising_keyboard_interrupt_returns_failed(pipeline_dir: pathlib.P
     results = executor.run(show_output=False)
 
     assert results["keyboard_interrupt"]["status"] == "failed"
+    assert "KeyboardInterrupt" in results["keyboard_interrupt"]["reason"]
 
 
 # =============================================================================

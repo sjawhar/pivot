@@ -13,8 +13,6 @@ import collections
 import concurrent.futures
 import contextlib
 import dataclasses
-import hashlib
-import io
 import logging
 import multiprocessing as mp
 import os
@@ -23,7 +21,7 @@ import queue
 import sys
 import threading
 import time
-from typing import TYPE_CHECKING, Any, Literal, TextIO, TypedDict, cast, override
+from typing import TYPE_CHECKING, Any, Literal, TextIO, TypedDict, cast
 
 import loky
 
@@ -731,10 +729,11 @@ def _run_stage_function_with_capture(
     return output_lines
 
 
-class _QueueStreamCapture(io.TextIOBase):
+class _QueueStreamCapture:
     """Capture stream output and send to queue for main process.
 
     Implements the TextIO protocol to allow assignment to sys.stdout/stderr.
+    Uses duck typing rather than inheritance to avoid property/attribute conflicts.
     """
 
     _stage_name: str
@@ -756,39 +755,31 @@ class _QueueStreamCapture(io.TextIOBase):
         self._output_lines = output_lines
         self._buffer = ""
 
-    # TextIO protocol attributes as properties (io.TextIOBase declares these read-only)
+    # TextIO protocol attributes as properties
     @property
-    @override
-    def encoding(self) -> str:  # pyright: ignore[reportIncompatibleVariableOverride]
+    def encoding(self) -> str:
         return "utf-8"
 
     @property
-    @override
-    def errors(self) -> str | None:  # pyright: ignore[reportIncompatibleVariableOverride]
+    def errors(self) -> str | None:
         return "strict"
 
     @property
-    @override
-    def newlines(self) -> str | tuple[str, ...] | None:  # pyright: ignore[reportIncompatibleVariableOverride]
+    def newlines(self) -> str | tuple[str, ...] | None:
         return None
 
-    @override
     def fileno(self) -> int:
         raise OSError("_QueueStreamCapture has no underlying file descriptor")
 
-    @override
     def isatty(self) -> bool:
         return False
 
-    @override
     def readable(self) -> bool:
         return False
 
-    @override
     def seekable(self) -> bool:
         return False
 
-    @override
     def writable(self) -> bool:
         return True
 
@@ -799,7 +790,6 @@ class _QueueStreamCapture(io.TextIOBase):
         with contextlib.suppress(queue.Full, ValueError, OSError):
             self._queue.put((self._stage_name, line, self._is_stderr), block=False)
 
-    @override
     def write(self, s: str) -> int:
         self._buffer += s
         while "\n" in self._buffer:
@@ -808,7 +798,6 @@ class _QueueStreamCapture(io.TextIOBase):
                 self._send_line(line)
         return len(s)
 
-    @override
     def flush(self) -> None:
         if self._buffer:
             self._send_line(self._buffer)
@@ -860,7 +849,7 @@ def _check_uncached_incremental_outputs(
     return uncached
 
 
-def extract_params(stage_info: WorkerStageInfo | dict[str, Any]) -> dict[str, Any]:
+def extract_params(stage_info: WorkerStageInfo) -> dict[str, Any]:
     """Extract parameter values from stage signature defaults."""
     sig = stage_info.get("signature")
     if not sig:
@@ -890,12 +879,8 @@ def hash_dependencies(deps: list[str]) -> tuple[dict[str, str], list[str]]:
 
 
 def hash_file(path: pathlib.Path) -> str:
-    """Hash file contents using SHA256 (first 16 hex chars)."""
-    hasher = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(65536), b""):
-            hasher.update(chunk)
-    return hasher.hexdigest()[:16]
+    """Hash file contents using xxhash64."""
+    return cache.hash_file(path)
 
 
 _MAX_LOCK_ATTEMPTS = 3

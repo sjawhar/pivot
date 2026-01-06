@@ -131,12 +131,12 @@ def dry_run_cmd(
             click.echo("No stages to run")
             return
 
-        cache_path = cache_dir or project.get_project_root() / ".pivot" / "cache"
+        cache_dir = cache_dir or project.get_project_root() / ".pivot" / "cache"
 
         click.echo("Would run:")
         for stage_name in execution_order:
             stage_info = registry.REGISTRY.get(stage_name)
-            stage_lock = lock.StageLock(stage_name, cache_path)
+            stage_lock = lock.StageLock(stage_name, cache_dir)
 
             current_fingerprint = stage_info["fingerprint"]
             current_params = executor.extract_params(stage_info)

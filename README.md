@@ -1,8 +1,9 @@
 # Pivot: High-Performance Python Pipeline Tool
 
-**Status:** 🚧 In Development (Week 1)
-**Python:** 3.13+ required (3.14+ for experimental features)
+**Status:** 🚧 In Development (MVP Phase)
+**Python:** 3.13+ required
 **License:** TBD
+**Tests:** 456 passing | **Coverage:** 91.5%+
 
 ---
 
@@ -136,6 +137,28 @@ Stage: train
       File: src/utils.py:15
 ```
 
+### 6. Incremental Outputs
+
+**New:** Outputs that preserve state between runs for append-only workloads:
+
+```python
+from pivot import stage, IncrementalOut
+
+@stage(deps=['new_data.csv'], outs=[IncrementalOut('database.db')])
+def append_to_database():
+    # database.db is restored from cache before execution
+    # Stage can append to it rather than recreating from scratch
+    import sqlite3
+    conn = sqlite3.connect('database.db')
+    # ... append new records ...
+```
+
+**How it works:**
+- Before execution, `IncrementalOut` restores the previous version from cache
+- Stage modifies the file in place (append, update, etc.)
+- New version is cached after execution
+- Uses COPY mode (not symlinks) so stages can safely modify files
+
 ---
 
 ## Installation (Coming Soon)
@@ -162,42 +185,41 @@ pip install pivot
 
 ## Development Roadmap
 
-### Phase 1: MVP (Weeks 1-6) - IN PROGRESS ✅
+### Phase 1: MVP - IN PROGRESS ✅
 
-**Week 1:** Fingerprinting + Registry
+**Core Infrastructure** ✅
 
 - [x] Design documentation
-- [ ] Code change detection (getclosurevars + AST)
-- [ ] Stage registry with decorator
-- [ ] Comprehensive test suite (>90% coverage)
+- [x] Code change detection (getclosurevars + AST)
+- [x] Stage registry with decorator
+- [x] Project root detection
+- [x] Input validation and path normalization
+- [x] Trie-based output overlap detection
 
-**Week 2:** DAG + Lock Files + YAML Export
+**DAG + Lock Files** ✅
 
-- [ ] Dependency graph construction
-- [ ] Per-stage lock files
-- [ ] DVC YAML export for code review
+- [x] Dependency graph construction (cycle detection, topological sort)
+- [x] Per-stage lock files (atomic writes, parallel safety)
+- [x] DVC YAML export for code review
 
-**Week 3:** Parameters + Hashing
+**Executor + Cache** ✅
 
-- [ ] Pydantic parameter system
-- [ ] xxhash64 content-addressed storage
+- [x] Pipeline executor (runs stages in dependency order)
+- [x] Content-addressable cache (xxhash64)
+- [x] Parallel execution with warm worker pools (loky)
+- [x] Sentinel file locking (prevents concurrent stage execution)
 
-**Week 4:** Sequential Executor + Explain Mode
+**IncrementalOut** ✅
 
-- [ ] Single-threaded pipeline execution
+- [x] Incremental outputs (restore from cache before execution)
+- [x] COPY mode for safe in-place modification
+- [x] Executable bit preservation
+
+**Remaining MVP Work**
+
 - [ ] Explain mode (show WHY stages run)
-
-**Week 5:** Parallel Scheduler + Multiple Executors
-
-- [ ] Warm worker pool (default)
-- [ ] InterpreterPoolExecutor (experimental)
-- [ ] Ready queue pattern from DVC
-
-**Week 6:** CLI + End-to-End Testing
-
-- [ ] Command-line interface
-- [ ] Integration tests
-- [ ] Benchmarks vs DVC
+- [ ] CLI improvements
+- [ ] End-to-end benchmarks vs DVC
 
 ### Phase 2: Observability (Weeks 7-9)
 
@@ -349,5 +371,5 @@ Questions? Check CLAUDE.md files or ask the team!
 
 ---
 
-**Last Updated:** 2026-01-04
-**Version:** 0.1.0-dev (Week 1)
+**Last Updated:** 2026-01-06
+**Version:** 0.1.0-dev (MVP Phase)

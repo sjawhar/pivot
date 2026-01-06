@@ -127,8 +127,8 @@ def _get_cache_path(cache_dir: pathlib.Path, file_hash: str) -> pathlib.Path:
     return cache_dir / file_hash[:2] / file_hash[2:]
 
 
-def _remove_path(path: pathlib.Path) -> None:
-    """Remove file, directory, or symlink if it exists."""
+def _clear_path(path: pathlib.Path) -> None:
+    """Remove file, symlink, or directory at path if it exists."""
     if not path.exists() and not path.is_symlink():
         return
     if path.is_dir() and not path.is_symlink():
@@ -159,9 +159,11 @@ def _link_from_cache(
     path: pathlib.Path,
     cache_path: pathlib.Path,
     link_mode: LinkMode,
+    *,
+    executable: bool = False,
 ) -> None:
     """Create link from workspace path to cache."""
-    _remove_path(path)
+    _clear_path(path)
 
     if link_mode == LinkMode.SYMLINK:
         path.symlink_to(cache_path.resolve())
@@ -177,7 +179,7 @@ def _link_from_cache(
                 raise
     else:
         shutil.copy2(cache_path, path)
-        os.chmod(path, 0o644)
+        os.chmod(path, 0o755 if executable else 0o644)
 
 
 def save_to_cache(
@@ -281,10 +283,12 @@ def _restore_directory_from_cache(
 
     if link_mode == LinkMode.SYMLINK and cache_dir_path.exists():
         path.parent.mkdir(parents=True, exist_ok=True)
-        _remove_path(path)
+        _clear_path(path)
         path.symlink_to(cache_dir_path.resolve())
         return True
 
+    # For COPY/HARDLINK modes, restore file-by-file
+    _clear_path(path)
     path.mkdir(parents=True, exist_ok=True)
     resolved_base = path.resolve()
     for entry in output_hash["manifest"]:
@@ -298,14 +302,23 @@ def _restore_directory_from_cache(
                 f"Manifest contains path traversal: {entry['relpath']!r}"
             )
         file_path.parent.mkdir(parents=True, exist_ok=True)
-        _link_from_cache(file_path, file_cache_path, link_mode)
+        _link_from_cache(
+            file_path, file_cache_path, link_mode, executable=entry.get("isexec", False)
+        )
+
+    # Ensure all directories are writable for COPY mode (including root)
+    if link_mode == LinkMode.COPY:
+        os.chmod(path, 0o755)
+        for dir_path in path.rglob("*"):
+            if dir_path.is_dir():
+                os.chmod(dir_path, 0o755)
 
     return True
 
 
 def remove_output(path: pathlib.Path) -> None:
     """Remove output file or directory before execution."""
-    _remove_path(path)
+    _clear_path(path)
 
 
 def protect(path: pathlib.Path) -> None:

@@ -6,7 +6,7 @@ from unittest import mock
 import pytest
 from watchfiles import Change
 
-from pivot import watch
+from pivot import project, watch
 from pivot.registry import REGISTRY, stage
 
 
@@ -222,23 +222,23 @@ def test_output_filter_excludes_intermediate_files(pipeline_dir: pathlib.Path) -
     assert watch_filter(Change.modified, str(intermediate_path)) is False
 
 
-# _resolve_path tests
+# project.resolve_path tests (used by watch module)
 
 
 def test_resolve_path_returns_realpath(pipeline_dir: pathlib.Path) -> None:
-    """_resolve_path should resolve symlinks."""
+    """resolve_path should resolve symlinks."""
     real_file = pipeline_dir / "real.txt"
     real_file.write_text("content")
     link_file = pipeline_dir / "link.txt"
     link_file.symlink_to(real_file)
 
-    resolved = watch._resolve_path(str(link_file))
+    resolved = project.resolve_path(str(link_file))
     assert resolved == real_file.resolve()
 
 
 def test_resolve_path_handles_nonexistent_path() -> None:
-    """_resolve_path should handle non-existent paths gracefully."""
-    result = watch._resolve_path("/nonexistent/path/file.txt")
+    """resolve_path should handle non-existent paths gracefully."""
+    result = project.resolve_path("/nonexistent/path/file.txt")
     # Should return a Path, not crash
     assert isinstance(result, pathlib.Path)
 

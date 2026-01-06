@@ -14,10 +14,9 @@ def test_state_cache_hit(tmp_path: pathlib.Path) -> None:
     test_file.write_text("content")
     file_stat = test_file.stat()
 
-    db = state.StateDB(db_path)
-    db.save(test_file, file_stat, "abc123")
-
-    result = db.get(test_file, file_stat)
+    with state.StateDB(db_path) as db:
+        db.save(test_file, file_stat, "abc123")
+        result = db.get(test_file, file_stat)
 
     assert result == "abc123"
 
@@ -29,14 +28,14 @@ def test_state_cache_miss_mtime(tmp_path: pathlib.Path) -> None:
     test_file.write_text("content")
     old_stat = test_file.stat()
 
-    db = state.StateDB(db_path)
-    db.save(test_file, old_stat, "abc123")
+    with state.StateDB(db_path) as db:
+        db.save(test_file, old_stat, "abc123")
 
-    time.sleep(0.01)
-    test_file.write_text("content")
-    new_stat = test_file.stat()
+        time.sleep(0.01)
+        test_file.write_text("content")
+        new_stat = test_file.stat()
 
-    result = db.get(test_file, new_stat)
+        result = db.get(test_file, new_stat)
 
     assert result is None
 
@@ -48,14 +47,14 @@ def test_state_cache_miss_size(tmp_path: pathlib.Path) -> None:
     test_file.write_text("short")
     old_stat = test_file.stat()
 
-    db = state.StateDB(db_path)
-    db.save(test_file, old_stat, "abc123")
+    with state.StateDB(db_path) as db:
+        db.save(test_file, old_stat, "abc123")
 
-    test_file.write_text("much longer content")
-    os.utime(test_file, (old_stat.st_mtime, old_stat.st_mtime))
-    new_stat = test_file.stat()
+        test_file.write_text("much longer content")
+        os.utime(test_file, (old_stat.st_mtime, old_stat.st_mtime))
+        new_stat = test_file.stat()
 
-    result = db.get(test_file, new_stat)
+        result = db.get(test_file, new_stat)
 
     assert result is None
 
@@ -67,14 +66,14 @@ def test_state_cache_miss_inode(tmp_path: pathlib.Path) -> None:
     test_file.write_text("content")
     old_stat = test_file.stat()
 
-    db = state.StateDB(db_path)
-    db.save(test_file, old_stat, "abc123")
+    with state.StateDB(db_path) as db:
+        db.save(test_file, old_stat, "abc123")
 
-    test_file.unlink()
-    test_file.write_text("content")
-    new_stat = test_file.stat()
+        test_file.unlink()
+        test_file.write_text("content")
+        new_stat = test_file.stat()
 
-    result = db.get(test_file, new_stat)
+        result = db.get(test_file, new_stat)
 
     assert result is None
 
@@ -92,12 +91,12 @@ def test_state_save_many(tmp_path: pathlib.Path) -> None:
         files.append((f, file_stat))
         entries.append((f, file_stat, f"hash_{i}"))
 
-    db = state.StateDB(db_path)
-    db.save_many(entries)
+    with state.StateDB(db_path) as db:
+        db.save_many(entries)
 
-    for i, (f, file_stat) in enumerate(files):
-        result = db.get(f, file_stat)
-        assert result == f"hash_{i}"
+        for i, (f, file_stat) in enumerate(files):
+            result = db.get(f, file_stat)
+            assert result == f"hash_{i}"
 
 
 def test_state_db_persistence(tmp_path: pathlib.Path) -> None:
@@ -107,12 +106,11 @@ def test_state_db_persistence(tmp_path: pathlib.Path) -> None:
     test_file.write_text("content")
     file_stat = test_file.stat()
 
-    db1 = state.StateDB(db_path)
-    db1.save(test_file, file_stat, "persistent_hash")
-    del db1
+    with state.StateDB(db_path) as db1:
+        db1.save(test_file, file_stat, "persistent_hash")
 
-    db2 = state.StateDB(db_path)
-    result = db2.get(test_file, file_stat)
+    with state.StateDB(db_path) as db2:
+        result = db2.get(test_file, file_stat)
 
     assert result == "persistent_hash"
 
@@ -124,9 +122,8 @@ def test_state_get_missing_path(tmp_path: pathlib.Path) -> None:
     test_file.write_text("content")
     file_stat = test_file.stat()
 
-    db = state.StateDB(db_path)
-
-    result = db.get(test_file, file_stat)
+    with state.StateDB(db_path) as db:
+        result = db.get(test_file, file_stat)
 
     assert result is None
 
@@ -138,11 +135,10 @@ def test_state_update_existing(tmp_path: pathlib.Path) -> None:
     test_file.write_text("content")
     file_stat = test_file.stat()
 
-    db = state.StateDB(db_path)
-    db.save(test_file, file_stat, "old_hash")
-    db.save(test_file, file_stat, "new_hash")
-
-    result = db.get(test_file, file_stat)
+    with state.StateDB(db_path) as db:
+        db.save(test_file, file_stat, "old_hash")
+        db.save(test_file, file_stat, "new_hash")
+        result = db.get(test_file, file_stat)
 
     assert result == "new_hash"
 
@@ -154,8 +150,8 @@ def test_state_db_creates_parent_dirs(tmp_path: pathlib.Path) -> None:
     test_file.write_text("content")
     file_stat = test_file.stat()
 
-    db = state.StateDB(db_path)
-    db.save(test_file, file_stat, "hash")
+    with state.StateDB(db_path) as db:
+        db.save(test_file, file_stat, "hash")
 
     assert db_path.exists()
 
@@ -200,9 +196,8 @@ def test_state_absolute_paths(tmp_path: pathlib.Path) -> None:
     test_file.write_text("content")
     file_stat = test_file.stat()
 
-    db = state.StateDB(db_path)
-    db.save(test_file.resolve(), file_stat, "hash")
-
-    result = db.get(test_file.resolve(), file_stat)
+    with state.StateDB(db_path) as db:
+        db.save(test_file.resolve(), file_stat, "hash")
+        result = db.get(test_file.resolve(), file_stat)
 
     assert result == "hash"

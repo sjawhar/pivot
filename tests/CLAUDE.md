@@ -6,7 +6,7 @@
 
 ## Test Structure
 
-- Flat test functions (`def test_...`), NO test classes.
+- **NEVER use `class Test*` test classes.** All tests must be flat `def test_*` functions at module level—use comment separators to group related tests if needed.
 - No `@pytest.mark.skip` markers; if test isn't ready, don't write it yet.
 - File naming: `test_<module>.py`; function naming: `test_<behavior>`.
 
