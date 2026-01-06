@@ -23,14 +23,15 @@ import queue
 import sys
 import threading
 import time
-from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast, override
+from typing import TYPE_CHECKING, Any, Literal, TextIO, TypedDict, cast, override
 
 import loky
 
-from pivot import console, dag, exceptions, lock, project, registry
+from pivot import cache, console, dag, exceptions, lock, outputs, project, registry
 from pivot.types import (
     LockData,
     OnError,
+    OutputHash,
     OutputMessage,
     StageDisplayStatus,
     StageResult,
@@ -38,7 +39,7 @@ from pivot.types import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Generator
+    from collections.abc import Callable, Generator, Sequence
     from inspect import Signature
 
     from networkx import DiGraph
@@ -61,6 +62,7 @@ class WorkerStageInfo(TypedDict):
     func: Callable[..., Any]
     fingerprint: dict[str, str]
     deps: list[str]
+    outs: list[outputs.BaseOut]
     signature: Signature | None
 
 
@@ -88,6 +90,8 @@ def run(
     max_workers: int | None = None,
     on_error: OnError | str = OnError.FAIL,
     show_output: bool = True,
+    force: bool = False,
+    stage_timeout: float | None = None,
 ) -> dict[str, ExecutionSummary]:
     """Execute pipeline stages with greedy parallel execution.
 
@@ -99,6 +103,8 @@ def run(
         max_workers: Max concurrent stages (default: min(cpu_count, 8)).
         on_error: Error handling mode - "fail", "keep_going", or "ignore".
         show_output: If True, print progress and stage output to console.
+        force: If True, skip safety checks for uncached IncrementalOut files.
+        stage_timeout: Max seconds for each stage to complete (default: no timeout).
 
     Returns:
         Dict of stage_name -> {status: "ran"|"skipped"|"failed", reason: str}
@@ -129,6 +135,17 @@ def run(
     if not execution_order:
         return {}
 
+    # Check for uncached IncrementalOut files that would be lost
+    if not force:
+        uncached = _check_uncached_incremental_outputs(execution_order, cache_dir)
+        if uncached:
+            files_list = "\n".join(f"  - {stage}: {path}" for stage, path in uncached)
+            raise exceptions.UncachedIncrementalOutputError(
+                f"The following IncrementalOut files exist but are not in cache:\n{files_list}\n\n"
+                + "Running the pipeline will DELETE these files and they cannot be restored.\n"
+                + "To proceed anyway, use force=True or back up these files first."
+            )
+
     con = console.get_console() if show_output else None
     total_stages = len(execution_order)
 
@@ -149,6 +166,7 @@ def run(
         error_mode=error_mode,
         con=con,
         total_stages=total_stages,
+        stage_timeout=stage_timeout,
     )
 
     results = _build_results(stage_states)
@@ -216,6 +234,7 @@ def _execute_greedy(
     error_mode: OnError,
     con: console.Console | None,
     total_stages: int,
+    stage_timeout: float | None = None,
 ) -> None:
     """Execute stages with greedy parallel scheduling using loky ProcessPoolExecutor."""
     completed_count = 0
@@ -253,10 +272,46 @@ def _execute_greedy(
             )
 
             while futures:
+                # Calculate wait timeout based on oldest running stage
+                wait_timeout: float | None = None
+                if stage_timeout is not None:
+                    now = time.perf_counter()
+                    for _future, stage_name in futures.items():
+                        state = stage_states[stage_name]
+                        if state.start_time:
+                            elapsed = now - state.start_time
+                            remaining = stage_timeout - elapsed
+                            if wait_timeout is None or remaining < wait_timeout:
+                                wait_timeout = max(0.1, remaining)  # At least 0.1s
+
                 done, _ = concurrent.futures.wait(
                     futures.keys(),
+                    timeout=wait_timeout,
                     return_when=concurrent.futures.FIRST_COMPLETED,
                 )
+
+                # Check for timed-out stages if nothing completed
+                if not done and stage_timeout is not None:
+                    now = time.perf_counter()
+                    timed_out = list[tuple[concurrent.futures.Future[StageResult], str]]()
+                    for future, stage_name in futures.items():
+                        state = stage_states[stage_name]
+                        if state.start_time and (now - state.start_time) >= stage_timeout:
+                            timed_out.append((future, stage_name))
+                    for future, stage_name in timed_out:
+                        futures.pop(future)
+                        future.cancel()
+                        state = stage_states[stage_name]
+                        _mark_stage_failed(
+                            state,
+                            f"Stage timed out after {stage_timeout}s",
+                            stage_states,
+                            error_mode,
+                        )
+                        completed_count += 1
+                        for mutex in state.mutex:
+                            mutex_counts[mutex] -= 1
+                    continue
 
                 for future in done:
                     stage_name = futures.pop(future)
@@ -438,6 +493,7 @@ def _prepare_worker_info(stage_info: registry.RegistryStageInfo) -> WorkerStageI
         func=stage_info["func"],
         fingerprint=stage_info["fingerprint"],
         deps=stage_info["deps"],
+        outs=stage_info["outs"],
         signature=stage_info["signature"],
     )
 
@@ -502,11 +558,13 @@ def execute_stage_worker(
 ) -> StageResult:
     """Worker function executed in separate process. Must be module-level for pickling."""
     output_lines: list[tuple[str, bool]] = []
+    files_cache_dir = cache_dir / "files"
 
     stage_lock = lock.StageLock(stage_name, cache_dir)
     current_fingerprint = stage_info["fingerprint"]
     current_params = extract_params(stage_info)
     dep_hashes, missing = hash_dependencies(stage_info.get("deps", []))
+    stage_outs = stage_info.get("outs", [])
 
     if missing:
         return {
@@ -517,25 +575,41 @@ def execute_stage_worker(
 
     changed, reason = stage_lock.is_changed(current_fingerprint, current_params, dep_hashes)
 
+    lock_data_prev = stage_lock.read()
+    if lock_data_prev is not None and "output_hashes" not in lock_data_prev:
+        changed, reason = True, "outputs not cached"
+
+    if not changed:
+        restored_all = _restore_outputs_from_cache(stage_outs, lock_data_prev, files_cache_dir)
+        if not restored_all:
+            changed, reason = True, "outputs missing from cache"
+
     if not changed:
         return {"status": "skipped", "reason": "unchanged", "output_lines": []}
 
     try:
         with _execution_lock(stage_name, cache_dir):
+            _prepare_outputs_for_execution(stage_outs, lock_data_prev, files_cache_dir)
+
             output_lines = _run_stage_function_with_capture(
                 stage_info["func"], stage_name, output_queue
             )
 
+            output_hashes = _save_outputs_to_cache(stage_outs, files_cache_dir)
+
             lock_data: LockData = {
                 "code_manifest": current_fingerprint,
                 "params": current_params,
-                "dep_hashes": dep_hashes,
+                "dep_hashes": dict(sorted(dep_hashes.items())),
+                "output_hashes": dict(sorted(output_hashes.items())),
             }
-            stage_lock.write(dict(lock_data))
+            stage_lock.write(lock_data)
 
         return {"status": "ran", "reason": reason, "output_lines": output_lines}
 
     except exceptions.StageAlreadyRunningError as e:
+        return {"status": "failed", "reason": str(e), "output_lines": output_lines}
+    except exceptions.OutputMissingError as e:
         return {"status": "failed", "reason": str(e), "output_lines": output_lines}
     except SystemExit as e:
         return {
@@ -543,8 +617,86 @@ def execute_stage_worker(
             "reason": f"Stage called sys.exit({e.code})",
             "output_lines": output_lines,
         }
-    except BaseException as e:
+    except KeyboardInterrupt:
+        return {"status": "failed", "reason": "KeyboardInterrupt", "output_lines": output_lines}
+    except Exception as e:
         return {"status": "failed", "reason": str(e), "output_lines": output_lines}
+
+
+def _restore_outputs_from_cache(
+    stage_outs: list[outputs.BaseOut],
+    lock_data: LockData | None,
+    files_cache_dir: pathlib.Path,
+) -> bool:
+    """Restore missing outputs from cache. Returns True if all restored successfully."""
+    if lock_data is None:
+        return False
+
+    output_hashes = lock_data.get("output_hashes", {})
+    for out in stage_outs:
+        path = pathlib.Path(out.path)
+        if path.exists():
+            continue
+
+        output_hash = output_hashes.get(out.path)
+        if output_hash is None:
+            if out.cache:
+                return False
+            continue
+
+        if not cache.restore_from_cache(path, output_hash, files_cache_dir):
+            return False
+
+    return True
+
+
+def _prepare_outputs_for_execution(
+    stage_outs: Sequence[outputs.BaseOut],
+    lock_data: LockData | None,
+    files_cache_dir: pathlib.Path,
+) -> None:
+    """Prepare outputs before stage execution - delete or restore for incremental."""
+    output_hashes = lock_data.get("output_hashes", {}) if lock_data else {}
+
+    for out in stage_outs:
+        path = pathlib.Path(out.path)
+
+        if isinstance(out, outputs.IncrementalOut):
+            # IncrementalOut: restore from cache as writable copy
+            cache.remove_output(path)  # Clear any stale state first
+            out_hash = output_hashes.get(out.path)
+            if out_hash:
+                # COPY mode makes file writable (not symlink to read-only cache)
+                restored = cache.restore_from_cache(
+                    path, out_hash, files_cache_dir, cache.LinkMode.COPY
+                )
+                if not restored:
+                    raise exceptions.CacheRestoreError(
+                        f"Failed to restore IncrementalOut '{out.path}' from cache"
+                    )
+        else:
+            # Regular output: delete before run
+            cache.remove_output(path)
+
+
+def _save_outputs_to_cache(
+    stage_outs: list[outputs.BaseOut],
+    files_cache_dir: pathlib.Path,
+) -> dict[str, OutputHash]:
+    """Save outputs to cache after successful execution."""
+    output_hashes = dict[str, OutputHash]()
+
+    for out in stage_outs:
+        path = pathlib.Path(out.path)
+        if not path.exists():
+            raise exceptions.OutputMissingError(f"Stage did not produce output: {out.path}")
+
+        if out.cache:
+            output_hashes[out.path] = cache.save_to_cache(path, files_cache_dir)
+        else:
+            output_hashes[out.path] = None
+
+    return output_hashes
 
 
 def _run_stage_function_with_capture(
@@ -566,8 +718,9 @@ def _run_stage_function_with_capture(
     )
 
     try:
-        sys.stdout = stdout_capture  # type: ignore[assignment]
-        sys.stderr = stderr_capture  # type: ignore[assignment]
+        # Cast to TextIO via object - _QueueStreamCapture implements the TextIO protocol
+        sys.stdout = cast("TextIO", cast("object", stdout_capture))
+        sys.stderr = cast("TextIO", cast("object", stderr_capture))
         func()
     finally:
         sys.stdout = old_stdout
@@ -579,7 +732,10 @@ def _run_stage_function_with_capture(
 
 
 class _QueueStreamCapture(io.TextIOBase):
-    """Capture stream output and send to queue for main process."""
+    """Capture stream output and send to queue for main process.
+
+    Implements the TextIO protocol to allow assignment to sys.stdout/stderr.
+    """
 
     _stage_name: str
     _queue: mp.Queue[OutputMessage]
@@ -599,6 +755,42 @@ class _QueueStreamCapture(io.TextIOBase):
         self._is_stderr = is_stderr
         self._output_lines = output_lines
         self._buffer = ""
+
+    # TextIO protocol attributes as properties (io.TextIOBase declares these read-only)
+    @property
+    @override
+    def encoding(self) -> str:  # pyright: ignore[reportIncompatibleVariableOverride]
+        return "utf-8"
+
+    @property
+    @override
+    def errors(self) -> str | None:  # pyright: ignore[reportIncompatibleVariableOverride]
+        return "strict"
+
+    @property
+    @override
+    def newlines(self) -> str | tuple[str, ...] | None:  # pyright: ignore[reportIncompatibleVariableOverride]
+        return None
+
+    @override
+    def fileno(self) -> int:
+        raise OSError("_QueueStreamCapture has no underlying file descriptor")
+
+    @override
+    def isatty(self) -> bool:
+        return False
+
+    @override
+    def readable(self) -> bool:
+        return False
+
+    @override
+    def seekable(self) -> bool:
+        return False
+
+    @override
+    def writable(self) -> bool:
+        return True
 
     def _send_line(self, line: str) -> None:
         """Save line locally and send to queue for real-time display."""
@@ -639,6 +831,35 @@ def _build_results(stage_states: dict[str, StageState]) -> dict[str, ExecutionSu
     return results
 
 
+def _check_uncached_incremental_outputs(
+    execution_order: list[str],
+    cache_dir: pathlib.Path,
+) -> list[tuple[str, str]]:
+    """Check for IncrementalOut files that exist but aren't cached.
+
+    Returns list of (stage_name, output_path) tuples for uncached files.
+    """
+    uncached = list[tuple[str, str]]()
+
+    for stage_name in execution_order:
+        stage_info = registry.REGISTRY.get(stage_name)
+        stage_outs = stage_info.get("outs", [])
+
+        # Read lock file to get cached output hashes
+        stage_lock = lock.StageLock(stage_name, cache_dir)
+        lock_data = stage_lock.read()
+        output_hashes = lock_data.get("output_hashes", {}) if lock_data else {}
+
+        for out in stage_outs:
+            if isinstance(out, outputs.IncrementalOut):
+                path = pathlib.Path(out.path)
+                # File exists on disk but has no cache entry
+                if path.exists() and out.path not in output_hashes:
+                    uncached.append((stage_name, out.path))
+
+    return uncached
+
+
 def extract_params(stage_info: WorkerStageInfo | dict[str, Any]) -> dict[str, Any]:
     """Extract parameter values from stage signature defaults."""
     sig = stage_info.get("signature")
@@ -652,16 +873,19 @@ def extract_params(stage_info: WorkerStageInfo | dict[str, Any]) -> dict[str, An
 
 
 def hash_dependencies(deps: list[str]) -> tuple[dict[str, str], list[str]]:
-    """Hash all dependency files. Returns (hashes, missing_files)."""
+    """Hash all dependency files and directories. Returns (hashes, missing_files)."""
     hashes = dict[str, str]()
     missing = list[str]()
     for dep in deps:
+        path = pathlib.Path(dep)
         try:
-            hashes[dep] = hash_file(pathlib.Path(dep))
+            if path.is_dir():
+                tree_hash, _ = cache.hash_directory(path)
+                hashes[dep] = tree_hash
+            else:
+                hashes[dep] = hash_file(path)
         except FileNotFoundError:
             missing.append(dep)
-        except IsADirectoryError:
-            missing.append(f"{dep} (is a directory)")
     return hashes, missing
 
 

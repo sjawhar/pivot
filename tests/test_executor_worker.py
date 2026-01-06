@@ -9,7 +9,7 @@ from __future__ import annotations
 import multiprocessing as mp
 import os
 import sys
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import pytest
 
@@ -43,6 +43,7 @@ def test_execute_stage_worker_with_missing_deps(worker_env: pathlib.Path) -> Non
         "fingerprint": {"self:test": "abc123"},
         "deps": ["missing_file.txt"],
         "signature": None,
+        "outs": [],
     }
 
     result = executor.execute_stage_worker(
@@ -60,14 +61,20 @@ def test_execute_stage_worker_with_missing_deps(worker_env: pathlib.Path) -> Non
 def test_execute_stage_worker_with_directory_dep(
     worker_env: pathlib.Path, tmp_path: pathlib.Path
 ) -> None:
-    """Worker returns failed when dependency is a directory."""
-    (tmp_path / "data_dir").mkdir()
+    """Worker hashes directory dependency and runs stage."""
+    data_dir = tmp_path / "data_dir"
+    data_dir.mkdir()
+    (data_dir / "file.txt").write_text("content")
+
+    def stage_func() -> None:
+        (tmp_path / "output.txt").write_text("done")
 
     stage_info: WorkerStageInfo = {
-        "func": lambda: None,
+        "func": stage_func,
         "fingerprint": {"self:test": "abc123"},
         "deps": ["data_dir"],
         "signature": None,
+        "outs": [],
     }
 
     result = executor.execute_stage_worker(
@@ -77,8 +84,8 @@ def test_execute_stage_worker_with_directory_dep(
         mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
     )
 
-    assert result["status"] == "failed"
-    assert "directory" in result["reason"].lower()
+    assert result["status"] == "ran", f"Expected ran, got {result}"
+    assert (tmp_path / "output.txt").read_text() == "done"
 
 
 def test_execute_stage_worker_runs_unchanged_stage(
@@ -95,6 +102,7 @@ def test_execute_stage_worker_runs_unchanged_stage(
         "fingerprint": {"self:stage_func": "fp123"},
         "deps": ["input.txt"],
         "signature": None,
+        "outs": [],
     }
 
     # First run - creates lock file
@@ -134,6 +142,7 @@ def test_execute_stage_worker_reruns_when_fingerprint_changes(
         "fingerprint": {"self:stage_func_v1": "fp_v1"},
         "deps": ["input.txt"],
         "signature": None,
+        "outs": [],
     }
 
     # First run
@@ -176,6 +185,7 @@ def test_execute_stage_worker_handles_stage_exception(
         "fingerprint": {"self:failing_stage": "fp123"},
         "deps": ["input.txt"],
         "signature": None,
+        "outs": [],
     }
 
     result = executor.execute_stage_worker(
@@ -203,6 +213,7 @@ def test_execute_stage_worker_handles_sys_exit(
         "fingerprint": {"self:exits_stage": "fp123"},
         "deps": ["input.txt"],
         "signature": None,
+        "outs": [],
     }
 
     result = executor.execute_stage_worker(
@@ -231,6 +242,7 @@ def test_execute_stage_worker_handles_keyboard_interrupt(
         "fingerprint": {"self:interrupted_stage": "fp123"},
         "deps": ["input.txt"],
         "signature": None,
+        "outs": [],
     }
 
     result = executor.execute_stage_worker(
@@ -461,6 +473,36 @@ def test_queue_stream_capture_empty_flush_does_nothing() -> None:
     assert output_lines == []
 
 
+def test_queue_stream_capture_textio_protocol() -> None:
+    """QueueStreamCapture implements TextIO protocol properties."""
+    output_lines: list[tuple[str, bool]] = []
+    queue: mp.Queue[OutputMessage] = mp.Manager().Queue()  # pyright: ignore[reportAssignmentType]
+
+    capture = executor._QueueStreamCapture(
+        "test_stage",
+        queue,
+        is_stderr=False,
+        output_lines=output_lines,
+    )
+
+    # TextIO protocol properties
+    assert capture.encoding == "utf-8"
+    assert capture.errors == "strict"
+    assert capture.newlines is None
+
+    # Stream capability properties
+    assert capture.readable() is False
+    assert capture.writable() is True
+    assert capture.seekable() is False
+    assert capture.isatty() is False
+
+    # fileno raises OSError (no underlying fd)
+    import pytest
+
+    with pytest.raises(OSError, match="no underlying file descriptor"):
+        capture.fileno()
+
+
 # =============================================================================
 # Execution Lock Tests
 # =============================================================================
@@ -587,7 +629,7 @@ def test_is_process_alive_returns_true_for_init() -> None:
 
 def test_extract_params_with_no_signature() -> None:
     """extract_params returns empty dict when no signature."""
-    stage_info = {"signature": None}
+    stage_info = cast("WorkerStageInfo", cast("object", {"signature": None}))
     params = executor.extract_params(stage_info)
     assert params == {}
 
@@ -599,7 +641,7 @@ def test_extract_params_with_no_defaults() -> None:
     def func(a: int, b: str) -> None:
         pass
 
-    stage_info = {"signature": inspect.signature(func)}
+    stage_info = cast("WorkerStageInfo", cast("object", {"signature": inspect.signature(func)}))
     params = executor.extract_params(stage_info)
     assert params == {}
 
@@ -611,7 +653,7 @@ def test_extract_params_with_defaults() -> None:
     def func(a: int, b: str = "default", c: float = 3.14) -> None:
         pass
 
-    stage_info = {"signature": inspect.signature(func)}
+    stage_info = cast("WorkerStageInfo", cast("object", {"signature": inspect.signature(func)}))
     params = executor.extract_params(stage_info)
     assert params == {"b": "default", "c": 3.14}
 
@@ -645,18 +687,19 @@ def test_hash_dependencies_with_missing_files() -> None:
 
 
 def test_hash_dependencies_with_directory(tmp_path: pathlib.Path) -> None:
-    """hash_dependencies reports directories as invalid."""
-    (tmp_path / "data_dir").mkdir()
-
-    import os
+    """hash_dependencies hashes directories using tree hash."""
+    data_dir = tmp_path / "data_dir"
+    data_dir.mkdir()
+    (data_dir / "file.txt").write_text("content")
 
     old_cwd = os.getcwd()
     os.chdir(tmp_path)
     try:
         hashes, missing = executor.hash_dependencies(["data_dir"])
 
-        assert len(hashes) == 0
-        assert "data_dir (is a directory)" in missing
+        assert len(hashes) == 1, "Directory should be hashed"
+        assert "data_dir" in hashes
+        assert len(missing) == 0, "No missing dependencies"
     finally:
         os.chdir(old_cwd)
 

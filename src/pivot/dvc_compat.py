@@ -171,11 +171,16 @@ def _build_out_entry(out: outputs.BaseOut, rel_path: str) -> str | dict[str, Any
         options["cache"] = False
     elif isinstance(out, outputs.Metric) and out.cache is True:
         options["cache"] = True
-    elif isinstance(out, outputs.Plot) and out.cache is False:
+    elif (
+        isinstance(out, outputs.Plot)
+        and out.cache is False
+        or isinstance(out, outputs.IncrementalOut)
+        and out.cache is False
+    ):
         options["cache"] = False
 
-    # Add persist if set
-    if out.persist:
+    # IncrementalOut always exports with persist: true (DVC won't delete it between runs)
+    if isinstance(out, outputs.IncrementalOut) or out.persist:
         options["persist"] = True
 
     # Add plot-specific options

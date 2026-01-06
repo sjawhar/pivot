@@ -36,6 +36,11 @@ class Plot(BaseOut):
     template: str | None = None
 
 
+@dataclasses.dataclass(frozen=True)
+class IncrementalOut(BaseOut):
+    """Incremental output - restored from cache before stage runs."""
+
+
 type OutSpec = str | BaseOut
 
 

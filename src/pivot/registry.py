@@ -85,12 +85,13 @@ class stage:
     outs: Sequence[outputs.OutSpec] = ()
     params_cls: type[BaseModel] | None = None
     mutex: Sequence[str] = ()
+    name: str | None = None  # Optional custom name (enables loop-based registration)
 
     def __call__(self, func: F) -> F:
         """Register function as a stage (returns original function unmodified)."""
         REGISTRY.register(
             func,
-            name=func.__name__,
+            name=self.name or func.__name__,
             deps=self.deps,
             outs=self.outs,
             params_cls=self.params_cls,

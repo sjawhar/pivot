@@ -19,10 +19,12 @@ Example:
     ...     # Train model...
 """
 
+from pivot import cache as cache
 from pivot import dvc_compat as dvc_compat
 from pivot import outputs as outputs
 from pivot import state as state
 from pivot.outputs import BaseOut as BaseOut
+from pivot.outputs import IncrementalOut as IncrementalOut
 from pivot.outputs import Metric as Metric
 from pivot.outputs import Out as Out
 from pivot.outputs import Plot as Plot

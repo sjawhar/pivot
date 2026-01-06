@@ -114,3 +114,38 @@ def test_out_instances_are_baseout() -> None:
     assert isinstance(out, outputs.BaseOut)
     assert isinstance(metric, outputs.BaseOut)
     assert isinstance(plot, outputs.BaseOut)
+
+
+# IncrementalOut tests
+
+
+def test_incremental_out_cache_default_true() -> None:
+    """IncrementalOut should have cache=True by default."""
+    inc = outputs.IncrementalOut(path="database.csv")
+    assert inc.cache is True
+
+
+def test_incremental_out_persist_default_false() -> None:
+    """IncrementalOut should have persist=False by default."""
+    inc = outputs.IncrementalOut(path="database.csv")
+    assert inc.persist is False
+
+
+def test_incremental_out_frozen() -> None:
+    """IncrementalOut should be immutable (frozen dataclass)."""
+    inc = outputs.IncrementalOut(path="database.csv")
+    with pytest.raises(AttributeError):
+        inc.path = "other.csv"  # type: ignore[misc]
+
+
+def test_incremental_out_is_base_out() -> None:
+    """IncrementalOut should inherit from BaseOut."""
+    assert issubclass(outputs.IncrementalOut, outputs.BaseOut)
+    inc = outputs.IncrementalOut(path="database.csv")
+    assert isinstance(inc, outputs.BaseOut)
+
+
+def test_normalize_out_incremental_passthrough() -> None:
+    """IncrementalOut should pass through normalize_out unchanged."""
+    inc = outputs.IncrementalOut(path="database.csv")
+    assert outputs.normalize_out(inc) is inc

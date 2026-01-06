@@ -88,15 +88,15 @@ def test_state_save_many(tmp_path: pathlib.Path) -> None:
     for i in range(5):
         f = tmp_path / f"file_{i}.txt"
         f.write_text(f"content {i}")
-        stat = f.stat()
-        files.append((f, stat))
-        entries.append((f, stat, f"hash_{i}"))
+        file_stat = f.stat()
+        files.append((f, file_stat))
+        entries.append((f, file_stat, f"hash_{i}"))
 
     db = state.StateDB(db_path)
     db.save_many(entries)
 
-    for i, (f, stat) in enumerate(files):
-        result = db.get(f, stat)
+    for i, (f, file_stat) in enumerate(files):
+        result = db.get(f, file_stat)
         assert result == f"hash_{i}"
 
 
