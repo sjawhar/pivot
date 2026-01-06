@@ -104,3 +104,9 @@ class UncachedIncrementalOutputError(CacheError):
     """Raised when an IncrementalOut file exists but is not in cache."""
 
     pass
+
+
+class ParamsError(PivotError):
+    """Raised when parameter validation or loading fails."""
+
+    pass

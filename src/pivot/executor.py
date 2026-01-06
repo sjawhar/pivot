@@ -23,8 +23,9 @@ import time
 from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast
 
 import loky
+import pydantic
 
-from pivot import cache, console, dag, exceptions, lock, outputs, project, registry
+from pivot import cache, console, dag, exceptions, lock, outputs, params, project, registry
 from pivot.types import (
     LockData,
     OnError,
@@ -41,6 +42,7 @@ if TYPE_CHECKING:
     from types import TracebackType
 
     from networkx import DiGraph
+    from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +64,8 @@ class WorkerStageInfo(TypedDict):
     deps: list[str]
     outs: list[outputs.BaseOut]
     signature: Signature | None
+    params_cls: type[BaseModel] | None
+    yaml_overrides: params.YamlParams
 
 
 @dataclasses.dataclass
@@ -122,6 +126,9 @@ def run(
 
     graph = registry.REGISTRY.build_dag(validate=True)
 
+    # Load params.yaml once at initialization (fail fast if invalid)
+    yaml_overrides = params.load_params_yaml()
+
     if stages:
         registered = set(graph.nodes())
         unknown = [s for s in stages if s not in registered]
@@ -165,6 +172,7 @@ def run(
         con=con,
         total_stages=total_stages,
         stage_timeout=stage_timeout,
+        yaml_overrides=yaml_overrides,
     )
 
     results = _build_results(stage_states)
@@ -202,7 +210,7 @@ def _initialize_stage_states(
             upstream=upstream_in_plan,
             upstream_unfinished=set(upstream_in_plan),
             downstream=downstream_in_plan,
-            mutex=stage_info.get("mutex", []),
+            mutex=stage_info["mutex"],
         )
 
     return states
@@ -233,6 +241,7 @@ def _execute_greedy(
     con: console.Console | None,
     total_stages: int,
     stage_timeout: float | None = None,
+    yaml_overrides: params.YamlParams | None = None,
 ) -> None:
     """Execute stages with greedy parallel scheduling using loky ProcessPoolExecutor."""
     completed_count = 0
@@ -267,6 +276,7 @@ def _execute_greedy(
                 con=con,
                 total_stages=total_stages,
                 completed_count=completed_count,
+                yaml_overrides=yaml_overrides or {},
             )
 
             while futures:
@@ -387,6 +397,7 @@ def _execute_greedy(
                         con=con,
                         total_stages=total_stages,
                         completed_count=completed_count,
+                        yaml_overrides=yaml_overrides or {},
                     )
     finally:
         # Signal output thread to stop - may fail if queue is broken
@@ -428,6 +439,7 @@ def _start_ready_stages(
     con: console.Console | None,
     total_stages: int,
     completed_count: int,
+    yaml_overrides: params.YamlParams,
 ) -> None:
     """Find and start stages that are ready to execute."""
     started = 0
@@ -454,7 +466,7 @@ def _start_ready_stages(
         for mutex in state.mutex:
             mutex_counts[mutex] += 1
 
-        worker_info = _prepare_worker_info(state.info)
+        worker_info = _prepare_worker_info(state.info, yaml_overrides)
 
         try:
             future = executor.submit(
@@ -485,7 +497,10 @@ def _start_ready_stages(
             _mark_stage_failed(state, f"Failed to submit: {e}", stage_states, error_mode)
 
 
-def _prepare_worker_info(stage_info: registry.RegistryStageInfo) -> WorkerStageInfo:
+def _prepare_worker_info(
+    stage_info: registry.RegistryStageInfo,
+    yaml_overrides: params.YamlParams,
+) -> WorkerStageInfo:
     """Prepare stage info for pickling to worker process."""
     return WorkerStageInfo(
         func=stage_info["func"],
@@ -493,6 +508,8 @@ def _prepare_worker_info(stage_info: registry.RegistryStageInfo) -> WorkerStageI
         deps=stage_info["deps"],
         outs=stage_info["outs"],
         signature=stage_info["signature"],
+        params_cls=stage_info["params_cls"],
+        yaml_overrides=yaml_overrides,
     )
 
 
@@ -558,11 +575,20 @@ def execute_stage_worker(
     output_lines: list[tuple[str, bool]] = []
     files_cache_dir = cache_dir / "files"
 
+    try:
+        current_params, params_instance = params.extract_stage_params(
+            stage_info["params_cls"],
+            stage_info["signature"],
+            stage_name,
+            stage_info["yaml_overrides"],
+        )
+    except pydantic.ValidationError as e:
+        return {"status": "failed", "reason": f"params validation: {e}", "output_lines": []}
+
     stage_lock = lock.StageLock(stage_name, cache_dir)
     current_fingerprint = stage_info["fingerprint"]
-    current_params = extract_params(stage_info)
-    dep_hashes, missing = hash_dependencies(stage_info.get("deps", []))
-    stage_outs = stage_info.get("outs", [])
+    dep_hashes, missing = hash_dependencies(stage_info["deps"])
+    stage_outs = stage_info["outs"]
 
     if missing:
         return {
@@ -590,7 +616,7 @@ def execute_stage_worker(
             _prepare_outputs_for_execution(stage_outs, lock_data_prev, files_cache_dir)
 
             _run_stage_function_with_capture(
-                stage_info["func"], stage_name, output_queue, output_lines
+                stage_info["func"], stage_name, output_queue, output_lines, params_instance
             )
 
             output_hashes = _save_outputs_to_cache(stage_outs, files_cache_dir)
@@ -702,6 +728,7 @@ def _run_stage_function_with_capture(
     stage_name: str,
     output_queue: mp.Queue[OutputMessage],
     output_lines: list[tuple[str, bool]],
+    params_instance: BaseModel | None = None,
 ) -> None:
     """Run stage function with stdout/stderr capture, streaming to queue.
 
@@ -712,7 +739,10 @@ def _run_stage_function_with_capture(
         _QueueWriter(stage_name, output_queue, is_stderr=False, output_lines=output_lines),
         _QueueWriter(stage_name, output_queue, is_stderr=True, output_lines=output_lines),
     ):
-        func()
+        if params_instance is not None:
+            func(params=params_instance)
+        else:
+            func()
 
 
 class _QueueWriter:
@@ -813,7 +843,7 @@ def _check_uncached_incremental_outputs(
 
     for stage_name in execution_order:
         stage_info = registry.REGISTRY.get(stage_name)
-        stage_outs = stage_info.get("outs", [])
+        stage_outs = stage_info["outs"]
 
         # Read lock file to get cached output hashes
         stage_lock = lock.StageLock(stage_name, cache_dir)
@@ -830,16 +860,15 @@ def _check_uncached_incremental_outputs(
     return uncached
 
 
-def extract_params(stage_info: WorkerStageInfo) -> dict[str, Any]:
-    """Extract parameter values from stage signature defaults."""
-    sig = stage_info.get("signature")
-    if not sig:
-        return {}
-    return {
-        name: param.default
-        for name, param in sig.parameters.items()
-        if param.default is not param.empty
-    }
+def extract_params(stage_info: WorkerStageInfo, stage_name: str = "") -> dict[str, Any]:
+    """Extract parameter values for change detection (dict only, no instance)."""
+    params_dict, _ = params.extract_stage_params(
+        stage_info["params_cls"],
+        stage_info["signature"],
+        stage_name,
+        stage_info["yaml_overrides"],
+    )
+    return params_dict
 
 
 def hash_dependencies(deps: list[str]) -> tuple[dict[str, str], list[str]]:

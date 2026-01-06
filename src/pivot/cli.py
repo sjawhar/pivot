@@ -5,11 +5,13 @@ Provides commands to run and manage pipelines from the command line.
 
 import logging
 import pathlib
+from typing import Any
 
 import click
 
-from pivot import executor, registry
+from pivot import executor, params, registry
 from pivot.executor import ExecutionSummary
+from pivot.registry import RegistryStageInfo
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +27,21 @@ def _validate_stages(stages_list: list[str] | None, single_stage: bool) -> None:
         unknown = [s for s in stages_list if s not in registered]
         if unknown:
             raise click.ClickException(f"Unknown stage(s): {', '.join(unknown)}")
+
+
+def _extract_params_for_dry_run(
+    stage_info: RegistryStageInfo,
+    stage_name: str,
+    yaml_overrides: params.YamlParams,
+) -> dict[str, Any]:
+    """Extract params from stage for dry-run check."""
+    params_dict, _ = params.extract_stage_params(
+        stage_info["params_cls"],
+        stage_info["signature"],
+        stage_name,
+        yaml_overrides,
+    )
+    return params_dict
 
 
 @click.group()
@@ -132,6 +149,7 @@ def dry_run_cmd(
             return
 
         cache_dir = cache_dir or project.get_project_root() / ".pivot" / "cache"
+        yaml_overrides = params.load_params_yaml()
 
         click.echo("Would run:")
         for stage_name in execution_order:
@@ -139,8 +157,8 @@ def dry_run_cmd(
             stage_lock = lock.StageLock(stage_name, cache_dir)
 
             current_fingerprint = stage_info["fingerprint"]
-            current_params = executor.extract_params(stage_info)
-            dep_hashes, missing = executor.hash_dependencies(stage_info.get("deps", []))
+            current_params = _extract_params_for_dry_run(stage_info, stage_name, yaml_overrides)
+            dep_hashes, missing = executor.hash_dependencies(stage_info["deps"])
 
             if missing:
                 click.echo(f"  {stage_name}: would run (missing deps: {', '.join(missing)})")
@@ -186,7 +204,7 @@ def _print_results(results: dict[str, ExecutionSummary]) -> None:
 
     for name, result in results.items():
         result_status = result["status"]
-        reason = result.get("reason", "")
+        reason = result["reason"]
 
         if result_status == "ran":
             ran += 1
