@@ -21,19 +21,25 @@ import enum
 import inspect
 import logging
 import pathlib
+import re
 from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any, TypedDict, TypeVar
 
-from pivot import exceptions, fingerprint, outputs, params, project, trie
+import pydantic
+
+from pivot import exceptions, fingerprint, outputs, parameters, project, trie
 from pivot.exceptions import ParamsError, ValidationError
 
 if TYPE_CHECKING:
     from inspect import Signature
 
-    from pydantic import BaseModel
+    from networkx import DiGraph
 
 F = TypeVar("F", bound=Callable[..., Any])
 logger = logging.getLogger(__name__)
+
+# Type alias for @stage decorator params argument: accepts class, instance, or None
+ParamsArg = type[pydantic.BaseModel] | pydantic.BaseModel | None
 
 
 class RegistryStageInfo(TypedDict):
@@ -42,8 +48,9 @@ class RegistryStageInfo(TypedDict):
     deps: list[str]
     outs: list[outputs.BaseOut]
     outs_paths: list[str]
-    params_cls: type[BaseModel] | None
+    params: pydantic.BaseModel | None
     mutex: list[str]
+    variant: str | None
     signature: Signature | None
     fingerprint: dict[str, str]
 
@@ -55,6 +62,46 @@ class ValidationMode(enum.StrEnum):
     WARN = "warn"  # Log warning, allow registration
 
 
+# Variant name pattern: alphanumeric, underscore, hyphen; max 64 chars
+_VARIANT_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9_-]+$")
+_VARIANT_NAME_MAX_LENGTH = 64
+
+
+class Variant(pydantic.BaseModel, frozen=True):
+    """Variant specification for matrix stages.
+
+    Args:
+        name: Unique identifier for this variant (required). Must be alphanumeric
+            with underscores/hyphens, max 64 chars.
+        deps: Input dependencies (file paths)
+        outs: Output files produced by variant
+        params: Optional Pydantic model instance for parameters
+        mutex: Mutex groups this variant belongs to
+    """
+
+    name: str
+    deps: Sequence[str] = ()
+    outs: Sequence[outputs.OutSpec] = ()
+    params: pydantic.BaseModel | None = None
+    mutex: Sequence[str] = ()
+
+    @pydantic.field_validator("name")
+    @classmethod
+    def validate_name(cls, v: str) -> str:
+        """Validate variant name format."""
+        if not v:
+            raise ValueError("variant name cannot be empty")
+        if len(v) > _VARIANT_NAME_MAX_LENGTH:
+            raise ValueError(
+                f"variant name '{v}' exceeds max length of {_VARIANT_NAME_MAX_LENGTH} chars"
+            )
+        if not _VARIANT_NAME_PATTERN.match(v):
+            raise ValueError(
+                f"variant name '{v}' must contain only alphanumeric characters, underscores, and hyphens"
+            )
+        return v
+
+
 @dataclasses.dataclass
 class stage:
     """Decorator for marking functions as pipeline stages.
@@ -62,7 +109,7 @@ class stage:
     Args:
         deps: Input dependencies (file paths)
         outs: Output files produced by stage (str, Out, Metric, or Plot)
-        params_cls: Optional Pydantic model for parameters
+        params: Optional Pydantic model class or instance for parameters
         mutex: Mutex groups this stage belongs to (prevents concurrent execution)
 
     Example:
@@ -79,13 +126,25 @@ class stage:
         >>> def train_gpu():
         ...     # Only one 'gpu' mutex stage runs at a time
         ...     pass
+
+        >>> @stage(deps=['data.csv'], params=MyParams(threshold=0.5))
+        >>> def train_with_params(params: MyParams):
+        ...     # Uses pre-configured params instance
+        ...     pass
     """
 
     deps: Sequence[str] = ()
     outs: Sequence[outputs.OutSpec] = ()
-    params_cls: type[BaseModel] | None = None
+    params: ParamsArg = None
     mutex: Sequence[str] = ()
     name: str | None = None  # Optional custom name (enables loop-based registration)
+
+    def __post_init__(self) -> None:
+        """Validate stage name doesn't contain @ (reserved for matrix variants)."""
+        if self.name is not None and "@" in self.name:
+            raise ValueError(
+                f"Stage name '{self.name}' cannot contain '@' (reserved for matrix variants)"
+            )
 
     def __call__(self, func: F) -> F:
         """Register function as a stage (returns original function unmodified)."""
@@ -94,10 +153,42 @@ class stage:
             name=self.name or func.__name__,
             deps=self.deps,
             outs=self.outs,
-            params_cls=self.params_cls,
+            params=self.params,
             mutex=self.mutex,
         )
         return func
+
+    @classmethod
+    def matrix(cls, variants: Sequence[Variant]) -> Callable[[F], F]:
+        """Register multiple variant stages from a list of Variant specs.
+
+        Each variant creates a separate stage with name `func_name@variant_name`.
+
+        Example:
+            @stage.matrix([
+                Variant(name='current', deps=['data/current.csv'], outs=['out/current.json']),
+                Variant(name='legacy', deps=['data/legacy.csv', 'extra.csv'], outs=['out/legacy.json']),
+            ])
+            def process(variant: str):
+                ...
+        """
+        _validate_matrix_variants(variants)
+
+        def decorator(func: F) -> F:
+            for variant in variants:
+                stage_name = f"{func.__name__}@{variant.name}"
+                REGISTRY.register(
+                    func,
+                    name=stage_name,
+                    deps=variant.deps,
+                    outs=variant.outs,
+                    params=variant.params,
+                    mutex=variant.mutex,
+                    variant=variant.name,
+                )
+            return func
+
+        return decorator
 
 
 class StageRegistry:
@@ -113,8 +204,9 @@ class StageRegistry:
         name: str | None = None,
         deps: Sequence[str] | None = None,
         outs: Sequence[outputs.OutSpec] | None = None,
-        params_cls: type[BaseModel] | None = None,
+        params: ParamsArg = None,
         mutex: Sequence[str] | None = None,
+        variant: str | None = None,
     ) -> None:
         """Register a stage function with metadata."""
         stage_name = name if name is not None else func.__name__
@@ -131,11 +223,8 @@ class StageRegistry:
             self._stages, stage_name, deps_list, outs_paths, self.validation_mode
         )
 
-        # Validate params_cls if provided, warn on orphaned params argument
-        if params_cls is not None:
-            _validate_params_cls(func, params_cls, stage_name)
-        else:
-            _warn_orphaned_params(func, stage_name)
+        # Convert params to instance (instantiate class if needed)
+        params_instance = _resolve_params(params, func, stage_name)
 
         deps_list = _normalize_paths(deps_list, self.validation_mode)
         outs_paths = _normalize_paths(outs_paths, self.validation_mode)
@@ -148,14 +237,11 @@ class StageRegistry:
 
         try:
             # Build temp_stages with string paths for trie (existing stages use outs_paths)
-            temp_stages = {
+            temp_stages: dict[str, trie.TrieStageInfo] = {
                 name: {"name": name, "outs": info["outs_paths"]}
                 for name, info in self._stages.items()
             }
-            temp_stages[stage_name] = {
-                "name": stage_name,
-                "outs": outs_paths,  # Trie uses paths only
-            }
+            temp_stages[stage_name] = {"name": stage_name, "outs": outs_paths}
             trie.build_outs_trie(temp_stages)
         except (exceptions.OutputDuplicationError, exceptions.OverlappingOutputPathsError) as e:
             _handle_validation_error(str(e), self.validation_mode)
@@ -166,8 +252,9 @@ class StageRegistry:
             deps=deps_list,
             outs=outs_normalized,
             outs_paths=outs_paths,
-            params_cls=params_cls,
+            params=params_instance,
             mutex=mutex_list,
+            variant=variant,
             signature=inspect.signature(func),
             fingerprint=fingerprint.get_stage_fingerprint(func),
         )
@@ -180,7 +267,7 @@ class StageRegistry:
         """Get list of all stage names."""
         return list(self._stages.keys())
 
-    def build_dag(self, validate: bool = True):
+    def build_dag(self, validate: bool = True) -> DiGraph[str]:
         """Build DAG from registered stages.
 
         Args:
@@ -241,26 +328,30 @@ def _validate_stage_registration(
     if not stage_name or not stage_name.strip():
         _handle_validation_error("Stage name cannot be empty", validation_mode)
 
+    # Extract base name (before @) for validation - matrix variants have format "base@variant"
+    base_name = stage_name.split("@")[0] if "@" in stage_name else stage_name
+    if base_name and not base_name[0].isalpha():
+        _handle_validation_error(
+            f"Stage name '{stage_name}' must start with a letter", validation_mode
+        )
+
     for path in [*deps, *outs]:
         _validate_path(path, stage_name, validation_mode)
 
 
 def _validate_path(path: str, stage_name: str, validation_mode: ValidationMode) -> None:
     """Validate a single path (before normalization)."""
-    if ".." in pathlib.Path(path).parts:
-        _handle_validation_error(
-            f"Stage '{stage_name}': Path '{path}' contains '..' (path traversal)", validation_mode
-        )
-
-    if "\x00" in path:
-        _handle_validation_error(
-            f"Stage '{stage_name}': Path '{path}' contains null byte", validation_mode
-        )
-
-    if "\n" in path or "\r" in path:
-        _handle_validation_error(
-            f"Stage '{stage_name}': Path '{path}' contains newline character", validation_mode
-        )
+    parts = pathlib.Path(path).parts
+    checks = [
+        (".." in parts, "contains '..' (path traversal)"),
+        ("\x00" in path, "contains null byte"),
+        ("\n" in path or "\r" in path, "contains newline character"),
+    ]
+    for failed, description in checks:
+        if failed:
+            _handle_validation_error(
+                f"Stage '{stage_name}': Path '{path}' {description}", validation_mode
+            )
 
 
 def _handle_validation_error(msg: str, validation_mode: ValidationMode) -> None:
@@ -270,32 +361,63 @@ def _handle_validation_error(msg: str, validation_mode: ValidationMode) -> None:
     logger.warning(msg)
 
 
-def _validate_params_cls(
+def _resolve_params(
+    params_arg: ParamsArg,
     func: Callable[..., Any],
-    params_cls: type[Any],
     stage_name: str,
-) -> None:
-    """Validate params_cls is a BaseModel and function has params parameter."""
-    if not params.validate_params_cls(params_cls):
-        got_name = getattr(params_cls, "__name__", repr(params_cls))
-        raise ParamsError(
-            f"Stage '{stage_name}': params_cls must be a Pydantic BaseModel subclass, got {got_name}"
-        )
+) -> pydantic.BaseModel | None:
+    """Resolve params argument to an instance, validating along the way.
+
+    If params is a class, instantiate it with defaults.
+    If params is an instance, use it directly.
+    If params is None, return None.
+    """
+    if params_arg is None:
+        _warn_orphaned_params(func, stage_name)
+        return None
 
     sig = inspect.signature(func)
     if "params" not in sig.parameters:
         raise ParamsError(
-            f"Stage '{stage_name}': function must have a 'params' parameter when params_cls is specified"
+            f"Stage '{stage_name}': function must have a 'params' parameter when params is specified"
         )
+
+    # Check if it's a class (type) or instance
+    if isinstance(params_arg, type):
+        # It's a class - validate and instantiate
+        if not parameters.validate_params_cls(params_arg):
+            raise ParamsError(
+                f"Stage '{stage_name}': params must be a Pydantic BaseModel subclass, got {params_arg.__name__}"
+            )
+        return params_arg()
+    else:
+        # It's an instance - validate the type
+        if not parameters.validate_params_cls(type(params_arg)):
+            raise ParamsError(
+                f"Stage '{stage_name}': params must be a Pydantic BaseModel instance, got {type(params_arg).__name__}"
+            )
+        return params_arg
 
 
 def _warn_orphaned_params(func: Callable[..., Any], stage_name: str) -> None:
-    """Warn if function has 'params' parameter but no params_cls."""
+    """Warn if function has 'params' parameter but no params provided."""
     sig = inspect.signature(func)
     if "params" in sig.parameters:
         logger.warning(
-            f"Stage '{stage_name}': function has 'params' parameter but no params_cls specified"
+            f"Stage '{stage_name}': function has 'params' parameter but no params specified"
         )
+
+
+def _validate_matrix_variants(variants: Sequence[Variant]) -> None:
+    """Validate matrix variant list for duplicates and emptiness."""
+    if not variants:
+        raise ValidationError("matrix variants cannot be empty - provide at least one Variant")
+
+    seen_names = set[str]()
+    for variant in variants:
+        if variant.name in seen_names:
+            raise ValidationError(f"Duplicate variant name '{variant.name}' in matrix")
+        seen_names.add(variant.name)
 
 
 REGISTRY = StageRegistry()

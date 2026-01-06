@@ -111,7 +111,7 @@ def test_export_generates_params_yaml(
         name="train",
         deps=[str(tmp_path / "data.csv")],
         outs=[str(tmp_path / "model.pkl")],
-        params_cls=pipeline.TrainParams,
+        params=pipeline.TrainParams,
     )
 
     with contextlib.chdir(tmp_path):
@@ -205,7 +205,7 @@ def test_export_with_metrics_and_plots(
             outputs.Metric(str(tmp_path / "metrics.json")),
             outputs.Plot(str(tmp_path / "loss.csv"), x="epoch", y="loss"),
         ],
-        params_cls=pipeline.TrainParams,
+        params=pipeline.TrainParams,
     )
 
     with contextlib.chdir(tmp_path):

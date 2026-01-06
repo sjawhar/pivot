@@ -5,14 +5,21 @@ Uses pygtrie for efficient prefix matching.
 """
 
 import pathlib
-from typing import Any
+from typing import TypedDict
 
 from pygtrie import Trie  # type: ignore[import-untyped]
 
 from pivot.exceptions import OutputDuplicationError, OverlappingOutputPathsError
 
 
-def build_outs_trie(stages: dict[str, dict[str, Any]]) -> Trie:
+class TrieStageInfo(TypedDict):
+    """Minimal stage info for trie output overlap detection."""
+
+    name: str
+    outs: list[str]
+
+
+def build_outs_trie(stages: dict[str, TrieStageInfo]) -> Trie:
     """Build trie of output paths from stages.
 
     Args:
@@ -37,7 +44,7 @@ def build_outs_trie(stages: dict[str, dict[str, Any]]) -> Trie:
     outs = Trie()
 
     for stage_name, stage_info in stages.items():
-        for out in stage_info.get("outs", []):
+        for out in stage_info["outs"]:
             out_key = pathlib.Path(out).parts
 
             if out_key in outs:

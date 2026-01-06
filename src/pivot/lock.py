@@ -20,22 +20,10 @@ from typing import Any, TypeGuard, cast
 
 import yaml
 
-from pivot import cache
+from pivot import cache, yaml_config
 from pivot.types import LockData
 
-# Use union types to avoid type: ignore on fallback assignment
-_Loader: type[yaml.SafeLoader] | type[yaml.CSafeLoader]
-_Dumper: type[yaml.SafeDumper] | type[yaml.CSafeDumper]
-
-try:
-    _Loader = yaml.CSafeLoader
-    _Dumper = yaml.CSafeDumper
-except AttributeError:
-    # CSafeLoader unavailable (no libyaml); SafeLoader is API-compatible
-    _Loader = yaml.SafeLoader
-    _Dumper = yaml.SafeDumper
-
-_VALID_STAGE_NAME = re.compile(r"^[a-zA-Z0-9_-]+$")
+_VALID_STAGE_NAME = re.compile(r"^[a-zA-Z0-9_@-]+$")
 _MAX_STAGE_NAME_LEN = 200  # Leave room for ".lock" suffix within filesystem NAME_MAX (255)
 _VALID_LOCK_KEYS = frozenset({"code_manifest", "params", "dep_hashes", "output_hashes"})
 
@@ -67,7 +55,7 @@ class StageLock:
         """Read lock file, return None if missing or corrupted."""
         try:
             with open(self.path) as f:
-                data: object = yaml.load(f, Loader=_Loader)
+                data: object = yaml.load(f, Loader=yaml_config.Loader)
             if not _is_lock_data(data):
                 return None  # Treat corrupted/invalid file as missing
             return data
@@ -79,7 +67,7 @@ class StageLock:
 
         def write_yaml(fd: int) -> None:
             with os.fdopen(fd, "w") as f:
-                yaml.dump(data, f, Dumper=_Dumper, sort_keys=False)
+                yaml.dump(data, f, Dumper=yaml_config.Dumper, sort_keys=False)
 
         cache.atomic_write_file(self.path, write_yaml)
 

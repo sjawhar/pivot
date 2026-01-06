@@ -1342,3 +1342,261 @@ def test_executor_old_lock_file_triggers_recache(pipeline_dir: pathlib.Path) -> 
     # Lock file should now have output_hashes
     lock_data = yaml.safe_load(old_lock.read_text())
     assert "output_hashes" in lock_data
+
+
+# =============================================================================
+# Matrix Stage Integration Tests
+# =============================================================================
+
+
+def test_matrix_stage_executes_all_variants(pipeline_dir: pathlib.Path) -> None:
+    """Matrix stage variants all execute and create lock files with @ in name."""
+    from pydantic import BaseModel
+
+    from pivot import Variant, executor
+
+    class VariantParams(BaseModel):
+        input_file: str
+        output_file: str
+
+    # Create input files for each variant
+    (pipeline_dir / "data_v1.txt").write_text("v1 data")
+    (pipeline_dir / "data_v2.txt").write_text("v2 data")
+
+    @pivot.stage.matrix(
+        [
+            Variant(
+                name="v1",
+                deps=["data_v1.txt"],
+                outs=["out_v1.txt"],
+                params=VariantParams(input_file="data_v1.txt", output_file="out_v1.txt"),
+            ),
+            Variant(
+                name="v2",
+                deps=["data_v2.txt"],
+                outs=["out_v2.txt"],
+                params=VariantParams(input_file="data_v2.txt", output_file="out_v2.txt"),
+            ),
+        ]
+    )
+    def process_variant(params: VariantParams) -> None:
+        data = pathlib.Path(params.input_file).read_text()
+        pathlib.Path(params.output_file).write_text(f"processed: {data}")
+
+    results = executor.run(show_output=False)
+
+    # Both variants should execute
+    assert results["process_variant@v1"]["status"] == "ran"
+    assert results["process_variant@v2"]["status"] == "ran"
+
+    # Outputs should be produced
+    assert (pipeline_dir / "out_v1.txt").read_text() == "processed: v1 data"
+    assert (pipeline_dir / "out_v2.txt").read_text() == "processed: v2 data"
+
+    # Lock files should exist with @ in name
+    cache_dir = pipeline_dir / ".pivot" / "cache" / "stages"
+    assert (cache_dir / "process_variant@v1.lock").exists()
+    assert (cache_dir / "process_variant@v2.lock").exists()
+
+
+def test_matrix_stage_skips_unchanged_variants(pipeline_dir: pathlib.Path) -> None:
+    """Matrix variants skip on re-run when unchanged."""
+    from pydantic import BaseModel
+
+    from pivot import Variant, executor
+
+    class SkipParams(BaseModel):
+        input_file: str
+        output_file: str
+
+    (pipeline_dir / "data_v1.txt").write_text("v1 data")
+    (pipeline_dir / "data_v2.txt").write_text("v2 data")
+
+    @pivot.stage.matrix(
+        [
+            Variant(
+                name="v1",
+                deps=["data_v1.txt"],
+                outs=["out_v1.txt"],
+                params=SkipParams(input_file="data_v1.txt", output_file="out_v1.txt"),
+            ),
+            Variant(
+                name="v2",
+                deps=["data_v2.txt"],
+                outs=["out_v2.txt"],
+                params=SkipParams(input_file="data_v2.txt", output_file="out_v2.txt"),
+            ),
+        ]
+    )
+    def process_skip(params: SkipParams) -> None:
+        data = pathlib.Path(params.input_file).read_text()
+        pathlib.Path(params.output_file).write_text(f"processed: {data}")
+
+    # First run
+    results = executor.run(show_output=False)
+    assert results["process_skip@v1"]["status"] == "ran"
+    assert results["process_skip@v2"]["status"] == "ran"
+
+    # Second run - should skip both
+    results = executor.run(show_output=False)
+    assert results["process_skip@v1"]["status"] == "skipped"
+    assert results["process_skip@v2"]["status"] == "skipped"
+
+
+def test_matrix_stage_reruns_changed_variant_only(pipeline_dir: pathlib.Path) -> None:
+    """Only the variant with changed deps re-runs."""
+    from pydantic import BaseModel
+
+    from pivot import Variant, executor
+
+    class PartialParams(BaseModel):
+        input_file: str
+        output_file: str
+
+    (pipeline_dir / "data_v1.txt").write_text("v1 data")
+    (pipeline_dir / "data_v2.txt").write_text("v2 data")
+
+    @pivot.stage.matrix(
+        [
+            Variant(
+                name="v1",
+                deps=["data_v1.txt"],
+                outs=["out_v1.txt"],
+                params=PartialParams(input_file="data_v1.txt", output_file="out_v1.txt"),
+            ),
+            Variant(
+                name="v2",
+                deps=["data_v2.txt"],
+                outs=["out_v2.txt"],
+                params=PartialParams(input_file="data_v2.txt", output_file="out_v2.txt"),
+            ),
+        ]
+    )
+    def process_partial(params: PartialParams) -> None:
+        data = pathlib.Path(params.input_file).read_text()
+        pathlib.Path(params.output_file).write_text(f"processed: {data}")
+
+    # First run
+    results = executor.run(show_output=False)
+    assert results["process_partial@v1"]["status"] == "ran"
+    assert results["process_partial@v2"]["status"] == "ran"
+
+    # Change only v1's input
+    (pipeline_dir / "data_v1.txt").write_text("v1 UPDATED")
+
+    # Second run - only v1 should re-run
+    results = executor.run(show_output=False)
+    assert results["process_partial@v1"]["status"] == "ran"
+    assert results["process_partial@v2"]["status"] == "skipped"
+
+    assert (pipeline_dir / "out_v1.txt").read_text() == "processed: v1 UPDATED"
+
+
+# =============================================================================
+# Params.yaml Change Detection Tests
+# =============================================================================
+
+
+def test_params_yaml_change_triggers_rerun(pipeline_dir: pathlib.Path) -> None:
+    """Changing params.yaml triggers stage re-run."""
+    from pydantic import BaseModel
+
+    from pivot import executor
+
+    (pipeline_dir / "input.txt").write_text("data")
+
+    class MyParams(BaseModel):
+        threshold: float = 0.5
+        mode: str = "default"
+
+    @pivot.stage(deps=["input.txt"], outs=["output.txt"], params=MyParams)
+    def process_with_params(params: MyParams) -> None:
+        pathlib.Path("output.txt").write_text(f"threshold={params.threshold}, mode={params.mode}")
+
+    # First run with no params.yaml
+    results = executor.run(show_output=False)
+    assert results["process_with_params"]["status"] == "ran"
+    assert (pipeline_dir / "output.txt").read_text() == "threshold=0.5, mode=default"
+
+    # Second run - should skip (nothing changed)
+    results = executor.run(show_output=False)
+    assert results["process_with_params"]["status"] == "skipped"
+
+    # Create params.yaml with override
+    params_file = pipeline_dir / "params.yaml"
+    params_file.write_text("process_with_params:\n  threshold: 0.9\n  mode: production\n")
+
+    # Third run - should re-run because params changed
+    results = executor.run(show_output=False)
+    assert results["process_with_params"]["status"] == "ran"
+    assert (pipeline_dir / "output.txt").read_text() == "threshold=0.9, mode=production"
+
+
+def test_params_yaml_second_change_triggers_rerun(pipeline_dir: pathlib.Path) -> None:
+    """Changing params.yaml again triggers another re-run."""
+    from pydantic import BaseModel
+
+    from pivot import executor
+
+    (pipeline_dir / "input.txt").write_text("data")
+
+    class MyParams(BaseModel):
+        value: int = 10
+
+    @pivot.stage(deps=["input.txt"], outs=["output.txt"], params=MyParams)
+    def process_value(params: MyParams) -> None:
+        pathlib.Path("output.txt").write_text(f"value={params.value}")
+
+    # Initial params.yaml
+    params_file = pipeline_dir / "params.yaml"
+    params_file.write_text("process_value:\n  value: 100\n")
+
+    # First run
+    results = executor.run(show_output=False)
+    assert results["process_value"]["status"] == "ran"
+    assert (pipeline_dir / "output.txt").read_text() == "value=100"
+
+    # Second run - skip
+    results = executor.run(show_output=False)
+    assert results["process_value"]["status"] == "skipped"
+
+    # Change params.yaml
+    params_file.write_text("process_value:\n  value: 200\n")
+
+    # Third run - should re-run
+    results = executor.run(show_output=False)
+    assert results["process_value"]["status"] == "ran"
+    assert (pipeline_dir / "output.txt").read_text() == "value=200"
+
+
+def test_params_yaml_removal_triggers_rerun(pipeline_dir: pathlib.Path) -> None:
+    """Removing params.yaml override triggers re-run (reverts to defaults)."""
+    from pydantic import BaseModel
+
+    from pivot import executor
+
+    (pipeline_dir / "input.txt").write_text("data")
+
+    class MyParams(BaseModel):
+        setting: str = "default"
+
+    @pivot.stage(deps=["input.txt"], outs=["output.txt"], params=MyParams)
+    def process_setting(params: MyParams) -> None:
+        pathlib.Path("output.txt").write_text(f"setting={params.setting}")
+
+    # Start with params.yaml
+    params_file = pipeline_dir / "params.yaml"
+    params_file.write_text("process_setting:\n  setting: custom\n")
+
+    # First run
+    results = executor.run(show_output=False)
+    assert results["process_setting"]["status"] == "ran"
+    assert (pipeline_dir / "output.txt").read_text() == "setting=custom"
+
+    # Remove params.yaml
+    params_file.unlink()
+
+    # Second run - should re-run with defaults
+    results = executor.run(show_output=False)
+    assert results["process_setting"]["status"] == "ran"
+    assert (pipeline_dir / "output.txt").read_text() == "setting=default"

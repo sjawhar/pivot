@@ -90,49 +90,69 @@ def test_stage_captures_signature():
     assert sig.parameters["y"].default == "default"
 
 
-def test_stage_with_pydantic_params():
-    """Should support Pydantic parameter models with params argument."""
+def test_stage_with_pydantic_params_class():
+    """Should support Pydantic parameter models with params class."""
 
     class TrainParams(BaseModel):
         learning_rate: float = 0.01
         epochs: int = 100
 
-    @stage(params_cls=TrainParams)
+    @stage(params=TrainParams)
     def train(params: TrainParams):
         pass
 
     info = REGISTRY.get("train")
-    assert info["params_cls"] == TrainParams
+    assert info["params"] is not None
+    assert isinstance(info["params"], TrainParams)
+    assert info["params"].learning_rate == 0.01
 
 
-def test_stage_params_cls_requires_params_argument():
-    """Should raise ParamsError when params_cls provided but function has no params arg."""
+def test_stage_with_pydantic_params_instance():
+    """Should support Pydantic parameter instance with custom values."""
+
+    class TrainParams(BaseModel):
+        learning_rate: float = 0.01
+        epochs: int = 100
+
+    @stage(params=TrainParams(learning_rate=0.05, epochs=50))
+    def train_custom(params: TrainParams):
+        pass
+
+    info = REGISTRY.get("train_custom")
+    assert info["params"] is not None
+    assert isinstance(info["params"], TrainParams)
+    assert info["params"].learning_rate == 0.05
+    assert info["params"].epochs == 50
+
+
+def test_stage_params_requires_params_argument():
+    """Should raise ParamsError when params provided but function has no params arg."""
 
     class MyParams(BaseModel):
         value: int = 10
 
     with pytest.raises(ParamsError, match="function must have a 'params' parameter"):
 
-        @stage(params_cls=MyParams)
+        @stage(params=MyParams)
         def process():
             pass
 
 
-def test_stage_params_cls_must_be_basemodel():
-    """Should raise ParamsError when params_cls is not a BaseModel subclass."""
+def test_stage_params_must_be_basemodel():
+    """Should raise ParamsError when params is not a BaseModel subclass."""
 
     class NotAModel:
         pass
 
     with pytest.raises(ParamsError, match="must be a Pydantic BaseModel subclass"):
 
-        @stage(params_cls=NotAModel)  # pyright: ignore[reportArgumentType]
+        @stage(params=NotAModel)  # pyright: ignore[reportArgumentType]
         def process(params: NotAModel):
             pass
 
 
 def test_stage_warns_on_orphaned_params_argument(caplog: pytest.LogCaptureFixture):
-    """Should warn when function has params arg but no params_cls."""
+    """Should warn when function has params arg but no params provided."""
     import logging
 
     caplog.set_level(logging.WARNING)
@@ -141,7 +161,7 @@ def test_stage_warns_on_orphaned_params_argument(caplog: pytest.LogCaptureFixtur
     def process(params: dict[str, str]):
         pass
 
-    assert "has 'params' parameter but no params_cls specified" in caplog.text
+    assert "has 'params' parameter but no params specified" in caplog.text
 
 
 def test_stage_defaults_to_function_name():
@@ -191,8 +211,9 @@ def test_registry_get_stage():
         deps=[],
         outs=[],
         outs_paths=[],
-        params_cls=None,
+        params=None,
         mutex=[],
+        variant=None,
         signature=None,
         fingerprint={},
     )
@@ -217,8 +238,9 @@ def test_registry_list_stages():
         deps=[],
         outs=[],
         outs_paths=[],
-        params_cls=None,
+        params=None,
         mutex=[],
+        variant=None,
         signature=None,
         fingerprint={},
     )
@@ -228,8 +250,9 @@ def test_registry_list_stages():
         deps=[],
         outs=[],
         outs_paths=[],
-        params_cls=None,
+        params=None,
         mutex=[],
+        variant=None,
         signature=None,
         fingerprint={},
     )
@@ -254,8 +277,9 @@ def test_registry_clear():
         deps=[],
         outs=[],
         outs_paths=[],
-        params_cls=None,
+        params=None,
         mutex=[],
+        variant=None,
         signature=None,
         fingerprint={},
     )
@@ -306,15 +330,11 @@ def test_stage_duplicate_registration_raises_error():
         pass
 
     # Register first function with name "my_stage"
-    REGISTRY.register(
-        func_one, name="my_stage", deps=["old.txt"], outs=list[str](), params_cls=None
-    )
+    REGISTRY.register(func_one, name="my_stage", deps=["old.txt"], outs=list[str]())
 
     # Registering different function with same name should raise error
     with pytest.raises(ValidationError, match="already registered"):
-        REGISTRY.register(
-            func_two, name="my_stage", deps=["new.txt"], outs=list[str](), params_cls=None
-        )
+        REGISTRY.register(func_two, name="my_stage", deps=["new.txt"], outs=list[str]())
 
 
 def test_multiple_stages_registered():
@@ -375,13 +395,12 @@ def test_registry_build_dag_integration(tmp_path: Path) -> None:
         pass
 
     # Register stages
-    reg.register(stage_a, name="stage_a", deps=[], outs=[str(tmp_path / "a.csv")], params_cls=None)
+    reg.register(stage_a, name="stage_a", deps=[], outs=[str(tmp_path / "a.csv")])
     reg.register(
         stage_b,
         name="stage_b",
         deps=[str(tmp_path / "a.csv")],
         outs=[str(tmp_path / "b.csv")],
-        params_cls=None,
     )
 
     # Build DAG
@@ -391,3 +410,179 @@ def test_registry_build_dag_integration(tmp_path: Path) -> None:
     assert "stage_a" in graph.nodes()
     assert "stage_b" in graph.nodes()
     assert graph.has_edge("stage_b", "stage_a")
+
+
+# =============================================================================
+# Matrix Stage Tests
+# =============================================================================
+
+
+def test_stage_matrix_registers_multiple_stages():
+    """Should register multiple stages for each variant in matrix."""
+    from pivot import Variant
+
+    @stage.matrix(
+        [
+            Variant(name="current", deps=["data/current.csv"], outs=["out/current.json"]),
+            Variant(name="legacy", deps=["data/legacy.csv"], outs=["out/legacy.json"]),
+        ]
+    )
+    def process_matrix(variant: str):
+        pass
+
+    assert "process_matrix@current" in REGISTRY.list_stages()
+    assert "process_matrix@legacy" in REGISTRY.list_stages()
+
+    current_info = REGISTRY.get("process_matrix@current")
+    assert current_info["variant"] == "current"
+    assert current_info["deps"][0].endswith("data/current.csv")
+
+    legacy_info = REGISTRY.get("process_matrix@legacy")
+    assert legacy_info["variant"] == "legacy"
+    assert legacy_info["deps"][0].endswith("data/legacy.csv")
+
+
+def test_stage_matrix_with_params():
+    """Should support params in matrix variants."""
+    from pivot import Variant
+
+    class MyParams(BaseModel):
+        mode: str = "default"
+        threshold: float = 0.5
+
+    @stage.matrix(
+        [
+            Variant(
+                name="fast",
+                deps=["data.csv"],
+                outs=["out/fast.json"],
+                params=MyParams(mode="fast", threshold=0.8),
+            ),
+            Variant(
+                name="accurate",
+                deps=["data.csv"],
+                outs=["out/accurate.json"],
+                params=MyParams(mode="accurate", threshold=0.2),
+            ),
+        ]
+    )
+    def train_matrix(variant: str, params: MyParams):
+        pass
+
+    fast_info = REGISTRY.get("train_matrix@fast")
+    fast_params = fast_info["params"]
+    assert fast_params is not None
+    assert isinstance(fast_params, MyParams)
+    assert fast_params.mode == "fast"
+    assert fast_params.threshold == 0.8
+
+    accurate_info = REGISTRY.get("train_matrix@accurate")
+    accurate_params = accurate_info["params"]
+    assert accurate_params is not None
+    assert isinstance(accurate_params, MyParams)
+    assert accurate_params.mode == "accurate"
+    assert accurate_params.threshold == 0.2
+
+
+def test_stage_matrix_invalid_variant_name_with_at():
+    """Should raise error for variant names with '@'."""
+    from pydantic import ValidationError as PydanticValidationError
+
+    from pivot import Variant
+
+    with pytest.raises(PydanticValidationError, match="alphanumeric"):
+        Variant(name="invalid@name", deps=["x"], outs=["y"])
+
+
+def test_stage_matrix_invalid_variant_name_with_slash():
+    """Should raise error for variant names with slashes."""
+    from pydantic import ValidationError as PydanticValidationError
+
+    from pivot import Variant
+
+    with pytest.raises(PydanticValidationError, match="alphanumeric"):
+        Variant(name="invalid/name", deps=["x"], outs=["y"])
+
+
+def test_stage_matrix_invalid_variant_name_empty():
+    """Should raise error for empty variant names."""
+    from pydantic import ValidationError as PydanticValidationError
+
+    from pivot import Variant
+
+    with pytest.raises(PydanticValidationError, match="cannot be empty"):
+        Variant(name="", deps=["x"], outs=["y"])
+
+
+def test_stage_matrix_invalid_variant_name_too_long():
+    """Should raise error for variant names exceeding max length."""
+    from pydantic import ValidationError as PydanticValidationError
+
+    from pivot import Variant
+
+    long_name = "a" * 65  # Max is 64
+    with pytest.raises(PydanticValidationError, match="exceeds max length"):
+        Variant(name=long_name, deps=["x"], outs=["y"])
+
+
+def test_stage_matrix_duplicate_variant_names():
+    """Should raise error for duplicate variant names in matrix."""
+    from pivot import Variant
+
+    with pytest.raises(ValidationError, match="Duplicate variant name"):
+
+        @stage.matrix(
+            [
+                Variant(name="same", deps=["x"], outs=["y"]),
+                Variant(name="same", deps=["a"], outs=["b"]),
+            ]
+        )
+        def bad_matrix(variant: str):
+            pass
+
+
+def test_stage_matrix_empty_variants():
+    """Should raise error for empty variant list."""
+    with pytest.raises(ValidationError, match="cannot be empty"):
+
+        @stage.matrix([])
+        def bad_matrix(variant: str):
+            pass
+
+
+def test_stage_matrix_different_deps_per_variant():
+    """Should support different deps/outs per variant (beyond DVC)."""
+    from pivot import Variant
+
+    @stage.matrix(
+        [
+            Variant(name="simple", deps=["a.csv"], outs=["simple.out"]),
+            Variant(name="complex", deps=["a.csv", "b.csv", "c.csv"], outs=["complex.out"]),
+        ]
+    )
+    def varied_deps(variant: str):
+        pass
+
+    simple_info = REGISTRY.get("varied_deps@simple")
+    complex_info = REGISTRY.get("varied_deps@complex")
+
+    assert len(simple_info["deps"]) == 1
+    assert len(complex_info["deps"]) == 3
+
+
+def test_stage_name_with_at_sign_rejected():
+    """Should reject stage name containing @ (reserved for matrix variants)."""
+    with pytest.raises(ValueError, match="cannot contain '@'"):
+
+        @stage(name="invalid@name", deps=["x"], outs=["y"])
+        def process():
+            pass
+
+
+def test_stage_func_name_with_at_sign_rejected():
+    """Should reject custom stage name containing @ (reserved for matrix variants)."""
+    with pytest.raises(ValueError, match="cannot contain '@'"):
+
+        @stage(name="bad@stage", deps=["x"], outs=["y"])
+        def normal_func():
+            pass

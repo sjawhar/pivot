@@ -39,13 +39,14 @@ _PIVOT_LOGGERS = ("pivot", "pivot.project", "pivot.executor", "pivot.registry", 
 
 
 @pytest.fixture(autouse=True)
-def reset_pivot_state():
+def reset_pivot_state(mocker: MockerFixture) -> Generator[None]:
     """Reset global pivot state between tests.
 
     CliRunner can leave console singleton pointing to closed streams,
     and project root cache pointing to old directories.
     """
-    console._console = None
-    project._project_root_cache = None
+    mocker.patch.object(console, "_console", None)
+    mocker.patch.object(project, "_project_root_cache", None)
     for name in _PIVOT_LOGGERS:
         logging.getLogger(name).handlers.clear()
+    yield

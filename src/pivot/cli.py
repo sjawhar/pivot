@@ -3,15 +3,18 @@
 Provides commands to run and manage pipelines from the command line.
 """
 
+from __future__ import annotations
+
 import logging
 import pathlib
-from typing import Any
+from typing import TYPE_CHECKING
 
 import click
 
-from pivot import executor, params, registry
-from pivot.executor import ExecutionSummary
-from pivot.registry import RegistryStageInfo
+from pivot import executor, registry
+
+if TYPE_CHECKING:
+    from pivot.executor import ExecutionSummary
 
 logger = logging.getLogger(__name__)
 
@@ -27,21 +30,6 @@ def _validate_stages(stages_list: list[str] | None, single_stage: bool) -> None:
         unknown = [s for s in stages_list if s not in registered]
         if unknown:
             raise click.ClickException(f"Unknown stage(s): {', '.join(unknown)}")
-
-
-def _extract_params_for_dry_run(
-    stage_info: RegistryStageInfo,
-    stage_name: str,
-    yaml_overrides: params.YamlParams,
-) -> dict[str, Any]:
-    """Extract params from stage for dry-run check."""
-    params_dict, _ = params.extract_stage_params(
-        stage_info["params_cls"],
-        stage_info["signature"],
-        stage_name,
-        yaml_overrides,
-    )
-    return params_dict
 
 
 @click.group()
@@ -135,7 +123,7 @@ def dry_run_cmd(
     stages: tuple[str, ...], single_stage: bool, cache_dir: pathlib.Path | None
 ) -> None:
     """Show what would run without executing."""
-    from pivot import dag, lock, project
+    from pivot import dag, parameters, project
 
     stages_list = list(stages) if stages else None
     _validate_stages(stages_list, single_stage)
@@ -149,25 +137,23 @@ def dry_run_cmd(
             return
 
         cache_dir = cache_dir or project.get_project_root() / ".pivot" / "cache"
-        yaml_overrides = params.load_params_yaml()
+        overrides = parameters.load_params_yaml()
 
         click.echo("Would run:")
         for stage_name in execution_order:
             stage_info = registry.REGISTRY.get(stage_name)
-            stage_lock = lock.StageLock(stage_name, cache_dir)
 
-            current_fingerprint = stage_info["fingerprint"]
-            current_params = _extract_params_for_dry_run(stage_info, stage_name, yaml_overrides)
-            dep_hashes, missing = executor.hash_dependencies(stage_info["deps"])
+            result = executor.check_stage_changed(
+                stage_name,
+                stage_info["fingerprint"],
+                stage_info["deps"],
+                stage_info["params"],
+                overrides,
+                cache_dir,
+            )
 
-            if missing:
-                click.echo(f"  {stage_name}: would run (missing deps: {', '.join(missing)})")
-                continue
-
-            changed, reason = stage_lock.is_changed(current_fingerprint, current_params, dep_hashes)
-
-            if changed:
-                click.echo(f"  {stage_name}: would run ({reason})")
+            if result["missing_deps"] or result["changed"]:
+                click.echo(f"  {stage_name}: would run ({result['reason']})")
             else:
                 click.echo(f"  {stage_name}: would skip (unchanged)")
 
