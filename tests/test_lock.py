@@ -2,7 +2,7 @@
 
 import threading
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 from unittest import mock
 
 import pytest
@@ -58,7 +58,8 @@ def test_manifest_preservation(tmp_path: Path) -> None:
         "const:THRESHOLD": "hash5",
     }
 
-    stage_lock.write(cast("LockData", cast("object", {"code_manifest": manifest})))
+    data: LockData = {"code_manifest": manifest}
+    stage_lock.write(data)
     result = stage_lock.read()
 
     assert result is not None

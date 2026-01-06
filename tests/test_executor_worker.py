@@ -9,7 +9,7 @@ from __future__ import annotations
 import multiprocessing as mp
 import os
 import sys
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 import pytest
 
@@ -231,7 +231,7 @@ def test_execute_stage_worker_handles_sys_exit(
 def test_execute_stage_worker_handles_keyboard_interrupt(
     worker_env: pathlib.Path, tmp_path: pathlib.Path
 ) -> None:
-    """Worker catches KeyboardInterrupt and returns failed status."""
+    """Worker returns failed status for KeyboardInterrupt."""
     (tmp_path / "input.txt").write_text("data")
 
     def interrupted_stage() -> None:
@@ -253,7 +253,7 @@ def test_execute_stage_worker_handles_keyboard_interrupt(
     )
 
     assert result["status"] == "failed"
-    assert "KeyboardInterrupt" in result["reason"] or "User cancelled" in result["reason"]
+    assert "KeyboardInterrupt" in result["reason"]
 
 
 # =============================================================================
@@ -629,7 +629,13 @@ def test_is_process_alive_returns_true_for_init() -> None:
 
 def test_extract_params_with_no_signature() -> None:
     """extract_params returns empty dict when no signature."""
-    stage_info = cast("WorkerStageInfo", cast("object", {"signature": None}))
+    stage_info = executor.WorkerStageInfo(
+        func=lambda: None,
+        fingerprint={},
+        deps=[],
+        outs=[],
+        signature=None,
+    )
     params = executor.extract_params(stage_info)
     assert params == {}
 
@@ -641,7 +647,13 @@ def test_extract_params_with_no_defaults() -> None:
     def func(a: int, b: str) -> None:
         pass
 
-    stage_info = cast("WorkerStageInfo", cast("object", {"signature": inspect.signature(func)}))
+    stage_info = executor.WorkerStageInfo(
+        func=func,
+        fingerprint={},
+        deps=[],
+        outs=[],
+        signature=inspect.signature(func),
+    )
     params = executor.extract_params(stage_info)
     assert params == {}
 
@@ -653,7 +665,13 @@ def test_extract_params_with_defaults() -> None:
     def func(a: int, b: str = "default", c: float = 3.14) -> None:
         pass
 
-    stage_info = cast("WorkerStageInfo", cast("object", {"signature": inspect.signature(func)}))
+    stage_info = executor.WorkerStageInfo(
+        func=func,
+        fingerprint={},
+        deps=[],
+        outs=[],
+        signature=inspect.signature(func),
+    )
     params = executor.extract_params(stage_info)
     assert params == {"b": "default", "c": 3.14}
 
@@ -662,8 +680,6 @@ def test_hash_dependencies_with_existing_files(tmp_path: pathlib.Path) -> None:
     """hash_dependencies hashes existing files."""
     (tmp_path / "file1.txt").write_text("content1")
     (tmp_path / "file2.txt").write_text("content2")
-
-    import os
 
     old_cwd = os.getcwd()
     os.chdir(tmp_path)

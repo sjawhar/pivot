@@ -89,9 +89,9 @@ class StateDB:
         with self._lock, self._conn:  # Atomic transaction - rolls back on error
             self._conn.executemany(
                 """
-                    INSERT OR REPLACE INTO state (path, mtime_ns, size, inode, hash)
-                    VALUES (?, ?, ?, ?, ?)
-                    """,
+                INSERT OR REPLACE INTO state (path, mtime_ns, size, inode, hash)
+                VALUES (?, ?, ?, ?, ?)
+                """,
                 data,
             )
 

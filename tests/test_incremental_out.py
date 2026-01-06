@@ -34,157 +34,403 @@ def _regular_stage_create() -> None:
     pathlib.Path("output.txt").write_text("created\n")
 
 
-class TestPrepareOutputsForExecution:
-    """Tests for _prepare_outputs_for_execution helper."""
-
-    def test_regular_out_is_deleted(self, tmp_path: pathlib.Path) -> None:
-        """Regular Out should be deleted before execution."""
-        output_file = tmp_path / "output.txt"
-        output_file.write_text("existing content")
-
-        stage_outs: list[outputs.BaseOut] = [outputs.Out(path=str(output_file))]
-        executor._prepare_outputs_for_execution(stage_outs, None, tmp_path / "cache")
-
-        assert not output_file.exists()
-
-    def test_incremental_out_no_cache_creates_empty(self, tmp_path: pathlib.Path) -> None:
-        """IncrementalOut with no cache should start fresh (file doesn't exist)."""
-        output_file = tmp_path / "database.txt"
-
-        stage_outs: list[outputs.BaseOut] = [outputs.IncrementalOut(path=str(output_file))]
-        executor._prepare_outputs_for_execution(stage_outs, None, tmp_path / "cache")
-
-        assert not output_file.exists()
-
-    def test_incremental_out_restores_from_cache(self, tmp_path: pathlib.Path) -> None:
-        """IncrementalOut should restore from cache before execution."""
-        output_file = tmp_path / "database.txt"
-        cache_dir = tmp_path / "cache"
-        cache_dir.mkdir()
-
-        # Create a cached version
-        output_file.write_text("cached content\n")
-        output_hash = cache.save_to_cache(output_file, cache_dir)
-
-        # Lock data simulating previous run
-        lock_data: LockData = {
-            "output_hashes": {str(output_file): output_hash},
-        }
-
-        # Prepare for execution
-        stage_outs = [outputs.IncrementalOut(path=str(output_file))]
-        executor._prepare_outputs_for_execution(stage_outs, lock_data, cache_dir)
-
-        # File should be restored
-        assert output_file.exists()
-        assert output_file.read_text() == "cached content\n"
-
-    def test_incremental_out_restored_file_is_writable(self, tmp_path: pathlib.Path) -> None:
-        """Restored IncrementalOut should be a writable copy, not symlink."""
-        output_file = tmp_path / "database.txt"
-        cache_dir = tmp_path / "cache"
-        cache_dir.mkdir()
-
-        # Create a cached version
-        output_file.write_text("cached content\n")
-        output_hash = cache.save_to_cache(output_file, cache_dir)
-
-        lock_data: LockData = {
-            "output_hashes": {str(output_file): output_hash},
-        }
-
-        # Prepare for execution
-        stage_outs = [outputs.IncrementalOut(path=str(output_file))]
-        executor._prepare_outputs_for_execution(stage_outs, lock_data, cache_dir)
-
-        # Should NOT be a symlink (should be a copy)
-        assert not output_file.is_symlink()
-
-        # Should be writable
-        output_file.write_text("modified content\n")
-        assert output_file.read_text() == "modified content\n"
+# =============================================================================
+# Prepare Outputs for Execution Tests
+# =============================================================================
 
 
-class TestIncrementalOutDvcExport:
-    """Tests for IncrementalOut DVC export."""
+def test_prepare_outputs_regular_out_is_deleted(tmp_path: pathlib.Path) -> None:
+    """Regular Out should be deleted before execution."""
+    output_file = tmp_path / "output.txt"
+    output_file.write_text("existing content")
 
-    def test_incremental_out_always_persist(self) -> None:
-        """IncrementalOut should always export with persist: true."""
-        from pivot import dvc_compat
+    stage_outs: list[outputs.BaseOut] = [outputs.Out(path=str(output_file))]
+    executor._prepare_outputs_for_execution(stage_outs, None, tmp_path / "cache")
 
-        inc = outputs.IncrementalOut(path="database.csv")
-        result = dvc_compat._build_out_entry(inc, "database.csv")
-        assert result == {"database.csv": {"persist": True}}
-
-    def test_incremental_out_with_cache_false(self) -> None:
-        """IncrementalOut with cache=False should export both options."""
-        from pivot import dvc_compat
-
-        inc = outputs.IncrementalOut(path="database.csv", cache=False)
-        result = dvc_compat._build_out_entry(inc, "database.csv")
-        assert result == {"database.csv": {"cache": False, "persist": True}}
+    assert not output_file.exists()
 
 
-class TestIncrementalOutIntegration:
-    """End-to-end integration tests for IncrementalOut."""
+def test_prepare_outputs_incremental_no_cache_creates_empty(tmp_path: pathlib.Path) -> None:
+    """IncrementalOut with no cache should start fresh (file doesn't exist)."""
+    output_file = tmp_path / "database.txt"
 
-    def test_first_run_creates_output(
-        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, clean_registry: None
-    ) -> None:
-        """First run with IncrementalOut should create the output from scratch."""
-        monkeypatch.setattr("pivot.project.get_project_root", lambda: tmp_path)
-        monkeypatch.chdir(tmp_path)
+    stage_outs: list[outputs.BaseOut] = [outputs.IncrementalOut(path=str(output_file))]
+    executor._prepare_outputs_for_execution(stage_outs, None, tmp_path / "cache")
 
-        db_path = tmp_path / "database.txt"
+    assert not output_file.exists()
 
-        registry.REGISTRY.register(
-            _incremental_stage_append,
-            name="append_stage",
-            deps=[],
-            outs=[IncrementalOut(path=str(db_path))],
-        )
 
-        results = executor.run(cache_dir=tmp_path / ".pivot" / "cache")
+def test_prepare_outputs_incremental_restores_from_cache(tmp_path: pathlib.Path) -> None:
+    """IncrementalOut should restore from cache before execution."""
+    output_file = tmp_path / "database.txt"
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
 
-        assert results["append_stage"]["status"] == "ran"
-        assert db_path.exists()
-        assert db_path.read_text() == "line 1\n"
+    # Create a cached version
+    output_file.write_text("cached content\n")
+    output_hash = cache.save_to_cache(output_file, cache_dir)
 
-    def test_second_run_appends_to_output(
-        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, clean_registry: None
-    ) -> None:
-        """Second run should restore and append to existing output."""
-        import yaml
+    # Lock data simulating previous run
+    lock_data: LockData = {
+        "output_hashes": {str(output_file): output_hash},
+    }
 
-        monkeypatch.setattr("pivot.project.get_project_root", lambda: tmp_path)
-        monkeypatch.chdir(tmp_path)
+    # Prepare for execution
+    stage_outs = [outputs.IncrementalOut(path=str(output_file))]
+    executor._prepare_outputs_for_execution(stage_outs, lock_data, cache_dir)
 
-        db_path = tmp_path / "database.txt"
-        cache_dir = tmp_path / ".pivot" / "cache"
+    # File should be restored
+    assert output_file.exists()
+    assert output_file.read_text() == "cached content\n"
 
-        registry.REGISTRY.register(
-            _incremental_stage_append,
-            name="append_stage",
-            deps=[],
-            outs=[IncrementalOut(path=str(db_path))],
-        )
 
-        # First run
-        executor.run(cache_dir=cache_dir)
-        assert db_path.read_text() == "line 1\n"
+def test_prepare_outputs_incremental_restored_file_is_writable(tmp_path: pathlib.Path) -> None:
+    """Restored IncrementalOut should be a writable copy, not symlink."""
+    output_file = tmp_path / "database.txt"
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
 
-        # Simulate code change by modifying the lock file's code_manifest
-        # Keep output_hashes so we can restore
-        lock_file = cache_dir / "stages" / "append_stage.lock"
-        lock_data = yaml.safe_load(lock_file.read_text())
-        lock_data["code_manifest"] = {"self:fake": "changed_hash"}
-        lock_file.write_text(yaml.dump(lock_data))
+    # Create a cached version
+    output_file.write_text("cached content\n")
+    output_hash = cache.save_to_cache(output_file, cache_dir)
 
-        # Delete the output file to verify restoration works
-        db_path.unlink()
+    lock_data: LockData = {
+        "output_hashes": {str(output_file): output_hash},
+    }
 
-        # Second run - should restore from cache and append
-        results = executor.run(cache_dir=cache_dir)
+    # Prepare for execution
+    stage_outs = [outputs.IncrementalOut(path=str(output_file))]
+    executor._prepare_outputs_for_execution(stage_outs, lock_data, cache_dir)
 
-        assert results["append_stage"]["status"] == "ran"
-        assert db_path.read_text() == "line 1\nline 2\n"
+    # Should NOT be a symlink (should be a copy)
+    assert not output_file.is_symlink()
+
+    # Should be writable
+    output_file.write_text("modified content\n")
+    assert output_file.read_text() == "modified content\n"
+
+
+# =============================================================================
+# IncrementalOut DVC Export Tests
+# =============================================================================
+
+
+def test_dvc_export_incremental_out_always_persist() -> None:
+    """IncrementalOut should always export with persist: true."""
+    from pivot import dvc_compat
+
+    inc = outputs.IncrementalOut(path="database.csv")
+    result = dvc_compat._build_out_entry(inc, "database.csv")
+    assert result == {"database.csv": {"persist": True}}
+
+
+def test_dvc_export_incremental_out_with_cache_false() -> None:
+    """IncrementalOut with cache=False should export both options."""
+    from pivot import dvc_compat
+
+    inc = outputs.IncrementalOut(path="database.csv", cache=False)
+    result = dvc_compat._build_out_entry(inc, "database.csv")
+    assert result == {"database.csv": {"cache": False, "persist": True}}
+
+
+# =============================================================================
+# IncrementalOut Integration Tests
+# =============================================================================
+
+
+def test_integration_first_run_creates_output(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, clean_registry: None
+) -> None:
+    """First run with IncrementalOut should create the output from scratch."""
+    monkeypatch.setattr("pivot.project.get_project_root", lambda: tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    db_path = tmp_path / "database.txt"
+
+    registry.REGISTRY.register(
+        _incremental_stage_append,
+        name="append_stage",
+        deps=[],
+        outs=[IncrementalOut(path=str(db_path))],
+    )
+
+    results = executor.run(cache_dir=tmp_path / ".pivot" / "cache")
+
+    assert results["append_stage"]["status"] == "ran"
+    assert db_path.exists()
+    assert db_path.read_text() == "line 1\n"
+
+
+def test_integration_second_run_appends_to_output(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, clean_registry: None
+) -> None:
+    """Second run should restore and append to existing output."""
+    import yaml
+
+    monkeypatch.setattr("pivot.project.get_project_root", lambda: tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    db_path = tmp_path / "database.txt"
+    cache_dir = tmp_path / ".pivot" / "cache"
+
+    registry.REGISTRY.register(
+        _incremental_stage_append,
+        name="append_stage",
+        deps=[],
+        outs=[IncrementalOut(path=str(db_path))],
+    )
+
+    # First run
+    executor.run(cache_dir=cache_dir)
+    assert db_path.read_text() == "line 1\n"
+
+    # Simulate code change by modifying the lock file's code_manifest
+    # Keep output_hashes so we can restore
+    lock_file = cache_dir / "stages" / "append_stage.lock"
+    lock_data = yaml.safe_load(lock_file.read_text())
+    lock_data["code_manifest"] = {"self:fake": "changed_hash"}
+    lock_file.write_text(yaml.dump(lock_data))
+
+    # Delete the output file to verify restoration works
+    db_path.unlink()
+
+    # Second run - should restore from cache and append
+    results = executor.run(cache_dir=cache_dir)
+
+    assert results["append_stage"]["status"] == "ran"
+    assert db_path.read_text() == "line 1\nline 2\n"
+
+
+# =============================================================================
+# IncrementalOut Directory Tests
+# =============================================================================
+
+
+def test_incremental_out_restores_directory(tmp_path: pathlib.Path) -> None:
+    """IncrementalOut should restore directory from cache with COPY mode."""
+    output_dir = tmp_path / "data_dir"
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+
+    # Create directory with nested structure
+    output_dir.mkdir()
+    (output_dir / "file1.txt").write_text("content1")
+    subdir = output_dir / "subdir"
+    subdir.mkdir()
+    (subdir / "file2.txt").write_text("content2")
+
+    # Save to cache
+    output_hash = cache.save_to_cache(output_dir, cache_dir)
+
+    # Simulate lock data from previous run
+    lock_data: LockData = {
+        "output_hashes": {str(output_dir): output_hash},
+    }
+
+    # Delete the output
+    cache.remove_output(output_dir)
+    assert not output_dir.exists()
+
+    # Prepare for execution (restore with COPY mode)
+    stage_outs = [outputs.IncrementalOut(path=str(output_dir))]
+    executor._prepare_outputs_for_execution(stage_outs, lock_data, cache_dir)
+
+    # Directory should be restored
+    assert output_dir.exists()
+    assert (output_dir / "file1.txt").read_text() == "content1"
+    assert (output_dir / "subdir" / "file2.txt").read_text() == "content2"
+
+
+def test_incremental_out_directory_is_writable(tmp_path: pathlib.Path) -> None:
+    """Restored directory should allow creating new files."""
+    output_dir = tmp_path / "data_dir"
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+
+    # Create directory
+    output_dir.mkdir()
+    (output_dir / "existing.txt").write_text("existing")
+
+    # Save to cache
+    output_hash = cache.save_to_cache(output_dir, cache_dir)
+
+    lock_data: LockData = {
+        "output_hashes": {str(output_dir): output_hash},
+    }
+
+    # Delete and restore
+    cache.remove_output(output_dir)
+    stage_outs = [outputs.IncrementalOut(path=str(output_dir))]
+    executor._prepare_outputs_for_execution(stage_outs, lock_data, cache_dir)
+
+    # Should be able to write new files
+    new_file = output_dir / "new_file.txt"
+    new_file.write_text("new content")
+    assert new_file.read_text() == "new content"
+
+    # Should be able to modify existing files
+    (output_dir / "existing.txt").write_text("modified")
+    assert (output_dir / "existing.txt").read_text() == "modified"
+
+
+def test_incremental_out_directory_subdirs_writable(tmp_path: pathlib.Path) -> None:
+    """Restored subdirectories should allow creating new files."""
+    output_dir = tmp_path / "data_dir"
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+
+    # Create directory with nested structure
+    output_dir.mkdir()
+    subdir = output_dir / "subdir"
+    subdir.mkdir()
+    (subdir / "existing.txt").write_text("existing")
+
+    # Save to cache
+    output_hash = cache.save_to_cache(output_dir, cache_dir)
+
+    lock_data: LockData = {
+        "output_hashes": {str(output_dir): output_hash},
+    }
+
+    # Delete and restore
+    cache.remove_output(output_dir)
+    stage_outs = [outputs.IncrementalOut(path=str(output_dir))]
+    executor._prepare_outputs_for_execution(stage_outs, lock_data, cache_dir)
+
+    # Should be able to create files in subdirectories
+    new_file = subdir / "new_in_subdir.txt"
+    new_file.write_text("new content in subdir")
+    assert new_file.read_text() == "new content in subdir"
+
+
+# =============================================================================
+# Executable Bit Restoration Tests
+# =============================================================================
+
+
+def test_executable_bit_saved_in_manifest(tmp_path: pathlib.Path) -> None:
+    """Executable bit should be recorded in directory manifest."""
+    test_dir = tmp_path / "mydir"
+    test_dir.mkdir()
+
+    # Create executable file
+    exec_file = test_dir / "script.sh"
+    exec_file.write_text("#!/bin/bash\necho hello")
+    exec_file.chmod(0o755)
+
+    # Create non-executable file
+    regular_file = test_dir / "data.txt"
+    regular_file.write_text("data")
+
+    _, manifest = cache.hash_directory(test_dir)
+
+    exec_entry = next(e for e in manifest if e["relpath"] == "script.sh")
+    regular_entry = next(e for e in manifest if e["relpath"] == "data.txt")
+
+    assert exec_entry.get("isexec") is True
+    assert regular_entry.get("isexec") is None or regular_entry.get("isexec") is False
+
+
+def test_executable_bit_restored_with_copy_mode(tmp_path: pathlib.Path) -> None:
+    """Executable bit should be restored when using COPY mode."""
+    test_dir = tmp_path / "mydir"
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+
+    # Create directory with executable file
+    test_dir.mkdir()
+    exec_file = test_dir / "script.sh"
+    exec_file.write_text("#!/bin/bash\necho hello")
+    exec_file.chmod(0o755)
+
+    # Save to cache
+    output_hash = cache.save_to_cache(test_dir, cache_dir)
+
+    # Delete and restore with COPY mode
+    cache.remove_output(test_dir)
+    cache.restore_from_cache(test_dir, output_hash, cache_dir, cache.LinkMode.COPY)
+
+    # Check executable bit is restored
+    restored_exec = test_dir / "script.sh"
+    assert restored_exec.exists()
+    mode = restored_exec.stat().st_mode
+    assert mode & 0o100, "Executable bit should be set"
+
+
+# =============================================================================
+# Uncached Incremental Output Error Tests
+# =============================================================================
+
+
+def test_uncached_incremental_output_raises_error(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, clean_registry: None
+) -> None:
+    """Should raise error when IncrementalOut file exists but has no cache entry."""
+    from pivot import exceptions
+
+    monkeypatch.setattr("pivot.project.get_project_root", lambda: tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    db_path = tmp_path / "database.txt"
+    db_path.write_text("uncached content\n")
+
+    registry.REGISTRY.register(
+        _incremental_stage_append,
+        name="append_stage",
+        deps=[],
+        outs=[IncrementalOut(path=str(db_path))],
+    )
+
+    with pytest.raises(exceptions.UncachedIncrementalOutputError) as exc_info:
+        executor.run(cache_dir=tmp_path / ".pivot" / "cache")
+
+    assert "database.txt" in str(exc_info.value)
+    assert "not in cache" in str(exc_info.value)
+
+
+def test_uncached_incremental_output_force_allows_run(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, clean_registry: None
+) -> None:
+    """force=True should bypass the uncached output check."""
+    monkeypatch.setattr("pivot.project.get_project_root", lambda: tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    db_path = tmp_path / "database.txt"
+    db_path.write_text("will be overwritten\n")
+
+    registry.REGISTRY.register(
+        _incremental_stage_append,
+        name="append_stage",
+        deps=[],
+        outs=[IncrementalOut(path=str(db_path))],
+    )
+
+    # force=True should allow run even with uncached file
+    results = executor.run(cache_dir=tmp_path / ".pivot" / "cache", force=True)
+    assert results["append_stage"]["status"] == "ran"
+
+
+def test_cached_incremental_output_runs_normally(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, clean_registry: None
+) -> None:
+    """IncrementalOut that is properly cached should run without error."""
+    monkeypatch.setattr("pivot.project.get_project_root", lambda: tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    db_path = tmp_path / "database.txt"
+    cache_dir = tmp_path / ".pivot" / "cache"
+
+    registry.REGISTRY.register(
+        _incremental_stage_append,
+        name="append_stage",
+        deps=[],
+        outs=[IncrementalOut(path=str(db_path))],
+    )
+
+    # First run creates and caches the output
+    results1 = executor.run(cache_dir=cache_dir)
+    assert results1["append_stage"]["status"] == "ran"
+
+    # Second run should skip without error (output is cached, nothing changed)
+    results2 = executor.run(cache_dir=cache_dir)
+    assert results2["append_stage"]["status"] == "skipped"

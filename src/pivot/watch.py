@@ -128,11 +128,6 @@ def _collect_watch_paths(stages: list[str]) -> list[pathlib.Path]:
     return list(paths)
 
 
-def _resolve_path(path: str) -> pathlib.Path:
-    """Resolve path to canonical form (resolves symlinks, normalizes case)."""
-    return pathlib.Path(path).resolve()
-
-
 def _get_output_paths_for_stages(stages: list[str]) -> set[str]:
     """Get output paths for specific stages only."""
     result = set[str]()
@@ -155,7 +150,9 @@ def _create_output_filter(
     # Only filter outputs from stages that will actually execute
     # This allows changes to outputs from NON-running stages to trigger re-runs
     # (e.g., in single-stage mode, upstream outputs should trigger re-runs)
-    outputs_to_filter = {_resolve_path(p) for p in _get_output_paths_for_stages(stages_to_run)}
+    outputs_to_filter = {
+        project.resolve_path(p) for p in _get_output_paths_for_stages(stages_to_run)
+    }
 
     def watch_filter(change: "Change", path: str) -> bool:
         _ = change
@@ -165,7 +162,7 @@ def _create_output_filter(
             return False
 
         # Resolve incoming path for consistent comparison
-        resolved_path = _resolve_path(path)
+        resolved_path = project.resolve_path(path)
 
         # Check if path is an output of a stage being run, or inside such an output directory
         for out in outputs_to_filter:
