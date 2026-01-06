@@ -48,7 +48,7 @@ def build_dag(stages: dict[str, RegistryStageInfo], validate: bool = True) -> nx
     outputs_map = _build_outputs_map(stages)
 
     for stage_name, stage_info in stages.items():
-        for dep in stage_info.get("deps", []):
+        for dep in stage_info["deps"]:
             producer = outputs_map.get(dep)
             if producer:
                 graph.add_edge(stage_name, producer)

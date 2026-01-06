@@ -13,7 +13,7 @@ import pytest
 from pydantic import BaseModel
 
 from pivot import fingerprint, registry, stage
-from pivot.exceptions import ValidationError
+from pivot.exceptions import ParamsError, ValidationError
 from pivot.registry import REGISTRY, RegistryStageInfo, StageRegistry
 
 
@@ -91,18 +91,57 @@ def test_stage_captures_signature():
 
 
 def test_stage_with_pydantic_params():
-    """Should support Pydantic parameter models."""
+    """Should support Pydantic parameter models with params argument."""
 
     class TrainParams(BaseModel):
         learning_rate: float = 0.01
         epochs: int = 100
 
     @stage(params_cls=TrainParams)
-    def train(learning_rate: float, epochs: int):
+    def train(params: TrainParams):
         pass
 
     info = REGISTRY.get("train")
     assert info["params_cls"] == TrainParams
+
+
+def test_stage_params_cls_requires_params_argument():
+    """Should raise ParamsError when params_cls provided but function has no params arg."""
+
+    class MyParams(BaseModel):
+        value: int = 10
+
+    with pytest.raises(ParamsError, match="function must have a 'params' parameter"):
+
+        @stage(params_cls=MyParams)
+        def process():
+            pass
+
+
+def test_stage_params_cls_must_be_basemodel():
+    """Should raise ParamsError when params_cls is not a BaseModel subclass."""
+
+    class NotAModel:
+        pass
+
+    with pytest.raises(ParamsError, match="must be a Pydantic BaseModel subclass"):
+
+        @stage(params_cls=NotAModel)  # pyright: ignore[reportArgumentType]
+        def process(params: NotAModel):
+            pass
+
+
+def test_stage_warns_on_orphaned_params_argument(caplog: pytest.LogCaptureFixture):
+    """Should warn when function has params arg but no params_cls."""
+    import logging
+
+    caplog.set_level(logging.WARNING)
+
+    @stage()
+    def process(params: dict[str, str]):
+        pass
+
+    assert "has 'params' parameter but no params_cls specified" in caplog.text
 
 
 def test_stage_defaults_to_function_name():

@@ -67,6 +67,12 @@ if __name__ == '__main__':
 - Use `Callable[..., Any]` for function params, not bare `Any`.
 - Document why when using `Any`.
 
+## TypedDict Access (Critical)
+
+**Never use `.get()` on TypedDicts.** TypedDicts have known keys at type-check time—use direct key access.
+TypedDicts with `total=False` or `NotRequired` fields may have optional fields, in which case you should
+use `if "key" in dict: ...` to check for the key and then use `dict["key"]` to access the value.
+
 ## Import Style (Google Python Style Guide)
 
 - Import modules, not functions: `from pivot import fingerprint` then `fingerprint.get_stage_fingerprint(...)`.

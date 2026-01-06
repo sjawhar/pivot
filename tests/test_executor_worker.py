@@ -44,6 +44,8 @@ def test_execute_stage_worker_with_missing_deps(worker_env: pathlib.Path) -> Non
         "deps": ["missing_file.txt"],
         "signature": None,
         "outs": [],
+        "params_cls": None,
+        "yaml_overrides": {},
     }
 
     result = executor.execute_stage_worker(
@@ -75,6 +77,8 @@ def test_execute_stage_worker_with_directory_dep(
         "deps": ["data_dir"],
         "signature": None,
         "outs": [],
+        "params_cls": None,
+        "yaml_overrides": {},
     }
 
     result = executor.execute_stage_worker(
@@ -103,6 +107,8 @@ def test_execute_stage_worker_runs_unchanged_stage(
         "deps": ["input.txt"],
         "signature": None,
         "outs": [],
+        "params_cls": None,
+        "yaml_overrides": {},
     }
 
     # First run - creates lock file
@@ -143,6 +149,8 @@ def test_execute_stage_worker_reruns_when_fingerprint_changes(
         "deps": ["input.txt"],
         "signature": None,
         "outs": [],
+        "params_cls": None,
+        "yaml_overrides": {},
     }
 
     # First run
@@ -186,6 +194,8 @@ def test_execute_stage_worker_handles_stage_exception(
         "deps": ["input.txt"],
         "signature": None,
         "outs": [],
+        "params_cls": None,
+        "yaml_overrides": {},
     }
 
     result = executor.execute_stage_worker(
@@ -214,6 +224,8 @@ def test_execute_stage_worker_handles_sys_exit(
         "deps": ["input.txt"],
         "signature": None,
         "outs": [],
+        "params_cls": None,
+        "yaml_overrides": {},
     }
 
     result = executor.execute_stage_worker(
@@ -243,6 +255,8 @@ def test_execute_stage_worker_handles_keyboard_interrupt(
         "deps": ["input.txt"],
         "signature": None,
         "outs": [],
+        "params_cls": None,
+        "yaml_overrides": {},
     }
 
     result = executor.execute_stage_worker(
@@ -700,9 +714,11 @@ def test_extract_params_with_no_signature() -> None:
         deps=[],
         outs=[],
         signature=None,
+        params_cls=None,
+        yaml_overrides={},
     )
-    params = executor.extract_params(stage_info)
-    assert params == {}
+    result = executor.extract_params(stage_info)
+    assert result == {}
 
 
 def test_extract_params_with_no_defaults() -> None:
@@ -718,9 +734,11 @@ def test_extract_params_with_no_defaults() -> None:
         deps=[],
         outs=[],
         signature=inspect.signature(func),
+        params_cls=None,
+        yaml_overrides={},
     )
-    params = executor.extract_params(stage_info)
-    assert params == {}
+    result = executor.extract_params(stage_info)
+    assert result == {}
 
 
 def test_extract_params_with_defaults() -> None:
@@ -736,9 +754,11 @@ def test_extract_params_with_defaults() -> None:
         deps=[],
         outs=[],
         signature=inspect.signature(func),
+        params_cls=None,
+        yaml_overrides={},
     )
-    params = executor.extract_params(stage_info)
-    assert params == {"b": "default", "c": 3.14}
+    result = executor.extract_params(stage_info)
+    assert result == {"b": "default", "c": 3.14}
 
 
 def test_hash_dependencies_with_existing_files(tmp_path: pathlib.Path) -> None:

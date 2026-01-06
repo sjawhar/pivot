@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any
 
 import yaml
 
-from pivot import outputs, project, registry
+from pivot import outputs, params, project, registry
 from pivot.exceptions import DVCImportError, ExportError
 
 if TYPE_CHECKING:
@@ -86,23 +86,30 @@ def _generate_params_yaml(
     stages: dict[str, RegistryStageInfo],
     path: pathlib.Path,
 ) -> dict[str, Any]:
-    """Generate params.yaml from stage function defaults."""
-    params: dict[str, Any] = {}
+    """Generate params.yaml from Pydantic defaults or function signature defaults."""
+    all_params: dict[str, Any] = {}
 
     for name, info in stages.items():
-        sig = info.get("signature")
-        if not sig:
-            continue
+        params_cls = info["params_cls"]
+        if params_cls is not None:
+            # Use Pydantic model defaults
+            params_instance = params.build_params_instance(params_cls, name, {})
+            stage_params = params.params_to_dict(params_instance)
+        else:
+            # Fall back to signature defaults
+            sig = info["signature"]
+            if not sig:
+                continue
+            stage_params = _extract_param_defaults(sig)
 
-        stage_params = _extract_param_defaults(sig)
         if stage_params:
-            params[name] = stage_params
+            all_params[name] = stage_params
 
-    if params:
+    if all_params:
         params_path = path.parent / "params.yaml"
         try:
             with open(params_path, "w") as f:
-                yaml.dump(params, f, sort_keys=False, default_flow_style=False)
+                yaml.dump(all_params, f, sort_keys=False, default_flow_style=False)
         except yaml.YAMLError as e:
             raise ExportError(
                 f"Failed to serialize params.yaml: {e}. Parameter defaults must be "
@@ -112,7 +119,7 @@ def _generate_params_yaml(
             raise ExportError(f"Failed to write params.yaml to '{params_path}': {e}") from e
         logger.info(f"Generated params.yaml at {params_path}")
 
-    return params
+    return all_params
 
 
 def _build_dvc_stage(

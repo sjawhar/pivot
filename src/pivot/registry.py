@@ -24,8 +24,8 @@ import pathlib
 from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any, TypedDict, TypeVar
 
-from pivot import exceptions, fingerprint, outputs, project, trie
-from pivot.exceptions import ValidationError
+from pivot import exceptions, fingerprint, outputs, params, project, trie
+from pivot.exceptions import ParamsError, ValidationError
 
 if TYPE_CHECKING:
     from inspect import Signature
@@ -131,6 +131,12 @@ class StageRegistry:
             self._stages, stage_name, deps_list, outs_paths, self.validation_mode
         )
 
+        # Validate params_cls if provided, warn on orphaned params argument
+        if params_cls is not None:
+            _validate_params_cls(func, params_cls, stage_name)
+        else:
+            _warn_orphaned_params(func, stage_name)
+
         deps_list = _normalize_paths(deps_list, self.validation_mode)
         outs_paths = _normalize_paths(outs_paths, self.validation_mode)
 
@@ -143,7 +149,7 @@ class StageRegistry:
         try:
             # Build temp_stages with string paths for trie (existing stages use outs_paths)
             temp_stages = {
-                name: {"name": name, "outs": info.get("outs_paths", [])}
+                name: {"name": name, "outs": info["outs_paths"]}
                 for name, info in self._stages.items()
             }
             temp_stages[stage_name] = {
@@ -262,6 +268,34 @@ def _handle_validation_error(msg: str, validation_mode: ValidationMode) -> None:
     if validation_mode == ValidationMode.ERROR:
         raise ValidationError(msg)
     logger.warning(msg)
+
+
+def _validate_params_cls(
+    func: Callable[..., Any],
+    params_cls: type[Any],
+    stage_name: str,
+) -> None:
+    """Validate params_cls is a BaseModel and function has params parameter."""
+    if not params.validate_params_cls(params_cls):
+        got_name = getattr(params_cls, "__name__", repr(params_cls))
+        raise ParamsError(
+            f"Stage '{stage_name}': params_cls must be a Pydantic BaseModel subclass, got {got_name}"
+        )
+
+    sig = inspect.signature(func)
+    if "params" not in sig.parameters:
+        raise ParamsError(
+            f"Stage '{stage_name}': function must have a 'params' parameter when params_cls is specified"
+        )
+
+
+def _warn_orphaned_params(func: Callable[..., Any], stage_name: str) -> None:
+    """Warn if function has 'params' parameter but no params_cls."""
+    sig = inspect.signature(func)
+    if "params" in sig.parameters:
+        logger.warning(
+            f"Stage '{stage_name}': function has 'params' parameter but no params_cls specified"
+        )
 
 
 REGISTRY = StageRegistry()
