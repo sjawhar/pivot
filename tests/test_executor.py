@@ -744,8 +744,8 @@ def test_on_error_ignore_allows_downstream_to_attempt(pipeline_dir: pathlib.Path
     from pivot import executor
 
     (pipeline_dir / "input.txt").write_text("data")
-    # Create the intermediate file so downstream can try to run
-    (pipeline_dir / "first.txt").write_text("preexisting")
+    # Note: pre-existing outputs are removed before stage execution
+    # so downstream will fail with missing dependency if upstream fails
 
     @pivot.stage(deps=["input.txt"], outs=["first.txt"])
     def first() -> None:
@@ -753,16 +753,16 @@ def test_on_error_ignore_allows_downstream_to_attempt(pipeline_dir: pathlib.Path
 
     @pivot.stage(deps=["first.txt"], outs=["second.txt"])
     def second() -> None:
-        # This stage will attempt to run because on_error=ignore
         data = pathlib.Path("first.txt").read_text()
         pathlib.Path("second.txt").write_text(f"got: {data}")
 
     results = executor.run(on_error="ignore", show_output=False)
 
     assert results["first"]["status"] == "failed"
-    # With ignore mode, second stage runs (since first.txt exists)
-    assert results["second"]["status"] == "ran"
-    assert (pipeline_dir / "second.txt").read_text() == "got: preexisting"
+    # With cache integration, outputs are removed before execution.
+    # Since first stage failed, first.txt doesn't exist, so second fails with missing dep.
+    assert results["second"]["status"] == "failed"
+    assert "missing" in results["second"]["reason"].lower()
 
 
 def test_invalid_on_error_raises_value_error(pipeline_dir: pathlib.Path) -> None:
@@ -844,12 +844,15 @@ def test_stage_raising_keyboard_interrupt_returns_failed(pipeline_dir: pathlib.P
 # =============================================================================
 
 
-def test_dependency_is_directory_returns_failed(pipeline_dir: pathlib.Path) -> None:
-    """Stage with directory as dependency returns failed with clear message."""
+def test_directory_dependency_hashed_and_runs(pipeline_dir: pathlib.Path) -> None:
+    """Stage with directory as dependency hashes it and runs successfully."""
     from pivot import executor
 
-    # Create a directory instead of a file
-    (pipeline_dir / "data_dir").mkdir()
+    # Create a directory with files
+    data_dir = pipeline_dir / "data_dir"
+    data_dir.mkdir()
+    (data_dir / "file1.txt").write_text("content1")
+    (data_dir / "file2.txt").write_text("content2")
 
     @pivot.stage(deps=["data_dir"], outs=["output.txt"])
     def process() -> None:
@@ -857,8 +860,8 @@ def test_dependency_is_directory_returns_failed(pipeline_dir: pathlib.Path) -> N
 
     results = executor.run(show_output=False)
 
-    assert results["process"]["status"] == "failed"
-    assert "directory" in results["process"]["reason"].lower()
+    assert results["process"]["status"] == "ran"
+    assert (pipeline_dir / "output.txt").read_text() == "done"
 
 
 # =============================================================================
@@ -1064,3 +1067,237 @@ def test_mutex_names_whitespace_stripped(pipeline_dir: pathlib.Path) -> None:
         ["spaced_start", "spaced_end", "clean_start", "clean_end"],
         ["clean_start", "clean_end", "spaced_start", "spaced_end"],
     ], f"Mutex whitespace not stripped - stages ran concurrently: {timing}"
+
+
+# =============================================================================
+# Output Cache Tests
+# =============================================================================
+
+
+def test_executor_removes_outputs_before_run(pipeline_dir: pathlib.Path) -> None:
+    """Outputs are removed before stage execution (clean state)."""
+    from pivot import executor
+
+    (pipeline_dir / "input.txt").write_text("data")
+    output_file = pipeline_dir / "output.txt"
+    output_file.write_text("stale data")
+
+    @pivot.stage(deps=["input.txt"], outs=["output.txt"])
+    def process() -> None:
+        # Should not see stale data - output should have been removed
+        assert not output_file.exists(), "Output should be removed before stage runs"
+        output_file.write_text("fresh data")
+
+    results = executor.run(show_output=False)
+
+    assert results["process"]["status"] == "ran"
+    assert output_file.read_text() == "fresh data"
+
+
+def test_executor_saves_outputs_to_cache(pipeline_dir: pathlib.Path) -> None:
+    """Outputs are saved to cache after successful execution."""
+    from pivot import executor
+
+    (pipeline_dir / "input.txt").write_text("data")
+    cache_dir = pipeline_dir / ".pivot" / "cache"
+
+    @pivot.stage(deps=["input.txt"], outs=["output.txt"])
+    def process() -> None:
+        pathlib.Path("output.txt").write_text("result")
+
+    results = executor.run(show_output=False)
+
+    assert results["process"]["status"] == "ran"
+
+    # Output should now be a symlink to cache
+    output_file = pipeline_dir / "output.txt"
+    assert output_file.is_symlink(), "Output should be symlink to cache"
+    assert output_file.read_text() == "result"
+
+    # Cache should contain the file
+    files_cache = cache_dir / "files"
+    assert files_cache.exists(), "Cache directory should exist"
+    cache_files = list(files_cache.rglob("*"))
+    assert len(cache_files) >= 1, "Cache should contain files"
+
+
+def test_executor_restores_missing_outputs_on_skip(pipeline_dir: pathlib.Path) -> None:
+    """Skipped stages restore missing outputs from cache."""
+    from pivot import executor
+
+    (pipeline_dir / "input.txt").write_text("data")
+
+    @pivot.stage(deps=["input.txt"], outs=["output.txt"])
+    def process() -> None:
+        pathlib.Path("output.txt").write_text("result")
+
+    # First run - executes and caches
+    results = executor.run(show_output=False)
+    assert results["process"]["status"] == "ran"
+
+    # Delete output (simulating user deleting file)
+    output_file = pipeline_dir / "output.txt"
+    if output_file.is_symlink():
+        output_file.unlink()
+    else:
+        output_file.unlink()
+
+    assert not output_file.exists()
+
+    # Second run - should skip but restore output from cache
+    results = executor.run(show_output=False)
+    assert results["process"]["status"] == "skipped"
+    assert output_file.exists(), "Output should be restored from cache"
+    assert output_file.read_text() == "result"
+
+
+def test_executor_fails_if_output_missing(pipeline_dir: pathlib.Path) -> None:
+    """Stage fails if declared output is not produced."""
+    from pivot import executor
+
+    (pipeline_dir / "input.txt").write_text("data")
+
+    @pivot.stage(deps=["input.txt"], outs=["output.txt"])
+    def process() -> None:
+        # Intentionally don't create output.txt
+        pass
+
+    results = executor.run(show_output=False)
+
+    assert results["process"]["status"] == "failed"
+    assert "output" in results["process"]["reason"].lower()
+
+
+def test_executor_handles_cache_false_outputs(pipeline_dir: pathlib.Path) -> None:
+    """Metric outputs with cache=False are not cached."""
+    from pivot import executor
+    from pivot.outputs import Metric
+
+    (pipeline_dir / "input.txt").write_text("data")
+
+    @pivot.stage(deps=["input.txt"], outs=[Metric("metrics.json")])
+    def process() -> None:
+        import json
+
+        pathlib.Path("metrics.json").write_text(json.dumps({"accuracy": 0.95}))
+
+    results = executor.run(show_output=False)
+
+    assert results["process"]["status"] == "ran"
+
+    # Metric output should NOT be a symlink (not cached)
+    metrics_file = pipeline_dir / "metrics.json"
+    assert metrics_file.exists()
+    assert not metrics_file.is_symlink(), "Metric with cache=False should not be symlink"
+
+
+def test_executor_output_hashes_in_lock_file(pipeline_dir: pathlib.Path) -> None:
+    """Output hashes are stored in lock file."""
+    import yaml
+
+    from pivot import executor
+
+    (pipeline_dir / "input.txt").write_text("data")
+
+    @pivot.stage(deps=["input.txt"], outs=["output.txt"])
+    def process() -> None:
+        pathlib.Path("output.txt").write_text("result")
+
+    executor.run(show_output=False)
+
+    lock_file = pipeline_dir / ".pivot" / "cache" / "stages" / "process.lock"
+    assert lock_file.exists()
+
+    lock_data = yaml.safe_load(lock_file.read_text())
+    assert "output_hashes" in lock_data
+    assert len(lock_data["output_hashes"]) == 1
+
+
+def test_executor_lock_file_deterministic_sort(pipeline_dir: pathlib.Path) -> None:
+    """Lock file entries are sorted for deterministic output."""
+    import yaml
+
+    from pivot import executor
+
+    (pipeline_dir / "input.txt").write_text("data")
+    (pipeline_dir / "z_input.txt").write_text("z")
+    (pipeline_dir / "a_input.txt").write_text("a")
+
+    @pivot.stage(deps=["z_input.txt", "a_input.txt"], outs=["z_out.txt", "a_out.txt"])
+    def process() -> None:
+        pathlib.Path("z_out.txt").write_text("z")
+        pathlib.Path("a_out.txt").write_text("a")
+
+    executor.run(show_output=False)
+
+    lock_file = pipeline_dir / ".pivot" / "cache" / "stages" / "process.lock"
+    lock_data = yaml.safe_load(lock_file.read_text())
+
+    # Verify dep_hashes are sorted
+    dep_keys = list(lock_data.get("dep_hashes", {}).keys())
+    assert dep_keys == sorted(dep_keys), "dep_hashes should be sorted"
+
+    # Verify output_hashes are sorted
+    output_keys = list(lock_data.get("output_hashes", {}).keys())
+    assert output_keys == sorted(output_keys), "output_hashes should be sorted"
+
+
+def test_executor_directory_output_cached(pipeline_dir: pathlib.Path) -> None:
+    """Directory outputs are cached with manifest."""
+    from pivot import executor
+
+    (pipeline_dir / "input.txt").write_text("data")
+
+    @pivot.stage(deps=["input.txt"], outs=["output_dir/"])
+    def process() -> None:
+        out_dir = pathlib.Path("output_dir")
+        out_dir.mkdir(exist_ok=True)
+        (out_dir / "file1.txt").write_text("file1")
+        (out_dir / "file2.txt").write_text("file2")
+
+    results = executor.run(show_output=False)
+
+    assert results["process"]["status"] == "ran"
+
+    output_dir = pipeline_dir / "output_dir"
+    assert output_dir.exists()
+    assert (output_dir / "file1.txt").read_text() == "file1"
+    assert (output_dir / "file2.txt").read_text() == "file2"
+
+
+def test_executor_old_lock_file_triggers_recache(pipeline_dir: pathlib.Path) -> None:
+    """Old lock file without output_hashes triggers re-execution."""
+    import yaml
+
+    from pivot import executor
+
+    (pipeline_dir / "input.txt").write_text("data")
+    cache_dir = pipeline_dir / ".pivot" / "cache"
+    stages_dir = cache_dir / "stages"
+    stages_dir.mkdir(parents=True)
+
+    # Create old-style lock file without output_hashes
+    old_lock = stages_dir / "process.lock"
+    old_lock.write_text(
+        yaml.dump(
+            {
+                "code_manifest": {},
+                "params": {},
+                "dep_hashes": {},
+                # No output_hashes - old format
+            }
+        )
+    )
+
+    @pivot.stage(deps=["input.txt"], outs=["output.txt"])
+    def process() -> None:
+        pathlib.Path("output.txt").write_text("result")
+
+    results = executor.run(show_output=False)
+
+    # Should re-run because output_hashes is missing
+    assert results["process"]["status"] == "ran"
+
+    # Lock file should now have output_hashes
+    lock_data = yaml.safe_load(old_lock.read_text())
+    assert "output_hashes" in lock_data

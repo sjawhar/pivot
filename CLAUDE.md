@@ -255,6 +255,13 @@ ruff check .        # Lint
 basedpyright .      # Type check
 ```
 
+## Pull Requests
+
+- Use the PR template at `.github/pull_request_template.md`
+- Include: Overview, Issue link, Approach/Alternatives, Testing, Checklist
+- Highlight review focus areas (complex logic, edge cases, design decisions)
+- Mark breaking changes and known limitations
+
 ## Before Returning to User (Critical)
 
 - Must run all four: `ruff format .`, `ruff check .`, `basedpyright .`, `pytest tests/`

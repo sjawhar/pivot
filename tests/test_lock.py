@@ -2,11 +2,15 @@
 
 import threading
 from pathlib import Path
+from typing import TYPE_CHECKING, cast
 from unittest import mock
 
 import pytest
 
 from pivot import lock
+
+if TYPE_CHECKING:
+    from pivot.types import LockData
 
 
 def test_lock_file_creation(tmp_path: Path) -> None:
@@ -22,7 +26,7 @@ def test_lock_file_creation(tmp_path: Path) -> None:
 def test_lock_file_read(tmp_path: Path) -> None:
     """Lock file contents can be read back."""
     stage_lock = lock.StageLock("train", tmp_path)
-    data = {
+    data: LockData = {
         "code_manifest": {"self:train": "def456", "func:helper": "ghi789"},
         "params": {"learning_rate": 0.01},
         "dep_hashes": {"data.csv": "xyz123"},
@@ -54,11 +58,11 @@ def test_manifest_preservation(tmp_path: Path) -> None:
         "const:THRESHOLD": "hash5",
     }
 
-    stage_lock.write({"code_manifest": manifest})
+    stage_lock.write(cast("LockData", cast("object", {"code_manifest": manifest})))
     result = stage_lock.read()
 
     assert result is not None
-    assert result["code_manifest"] == manifest
+    assert result.get("code_manifest") == manifest
 
 
 def test_parallel_lock_writes(tmp_path: Path) -> None:
@@ -325,7 +329,8 @@ def test_concurrent_same_stage_writes(tmp_path: Path) -> None:
     def write_value(value: int) -> None:
         try:
             stage_lock = lock.StageLock("shared", tmp_path)
-            stage_lock.write({"value": value})
+            # Use valid LockData with params key to track which thread won
+            stage_lock.write({"params": {"thread_id": value}})
             results.append(value)
         except Exception as e:
             errors.append(e)
@@ -341,7 +346,9 @@ def test_concurrent_same_stage_writes(tmp_path: Path) -> None:
     stage_lock = lock.StageLock("shared", tmp_path)
     final = stage_lock.read()
     assert final is not None
-    assert final["value"] in range(20), "Final value should be one of the written values"
+    params = final.get("params")
+    assert params is not None, "params should be present in lock data"
+    assert params["thread_id"] in range(20), "Final value should be from one of the threads"
 
     tmp_files = list(tmp_path.rglob("*.tmp"))
     assert len(tmp_files) == 0, f"Orphaned temp files: {tmp_files}"

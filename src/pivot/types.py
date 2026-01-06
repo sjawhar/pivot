@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import enum
-from typing import Any, Literal, TypedDict
+from typing import Any, Literal, NotRequired, TypedDict
 
 
 class StageStatus(enum.StrEnum):
@@ -47,13 +47,13 @@ class FileHash(TypedDict):
     hash: str
 
 
-class DirManifestEntry(TypedDict, total=False):
+class DirManifestEntry(TypedDict):
     """Entry in directory manifest."""
 
     relpath: str
     hash: str
     size: int
-    isexec: bool
+    isexec: NotRequired[bool]
 
 
 class DirHash(TypedDict):

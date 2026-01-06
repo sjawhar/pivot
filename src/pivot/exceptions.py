@@ -92,3 +92,15 @@ class CacheRestoreError(CacheError):
     """Raised when restoring outputs from cache fails."""
 
     pass
+
+
+class PathTraversalError(CacheError):
+    """Raised when a manifest contains path traversal attempt."""
+
+    pass
+
+
+class UncachedIncrementalOutputError(CacheError):
+    """Raised when an IncrementalOut file exists but is not in cache."""
+
+    pass
