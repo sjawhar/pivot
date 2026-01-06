@@ -1,8 +1,3 @@
-"""Pivot exceptions."""
-
-import enum
-
-
 class PivotError(Exception):
     """Base exception for Pivot errors."""
 
@@ -13,13 +8,6 @@ class ValidationError(PivotError):
     """Raised when stage validation fails."""
 
     pass
-
-
-class ValidationMode(enum.StrEnum):
-    """Validation strictness levels."""
-
-    ERROR = "error"  # Raise exception on validation failure
-    WARN = "warn"  # Log warning, allow registration
 
 
 class OutputDuplicationError(ValidationError):
@@ -84,5 +72,23 @@ class ExportError(DVCCompatError):
 
 class DVCImportError(DVCCompatError):
     """Raised when dvc.yaml import fails."""
+
+    pass
+
+
+class CacheError(PivotError):
+    """Base class for cache-related errors."""
+
+    pass
+
+
+class OutputMissingError(CacheError):
+    """Raised when a stage did not produce a declared output."""
+
+    pass
+
+
+class CacheRestoreError(CacheError):
+    """Raised when restoring outputs from cache fails."""
 
     pass

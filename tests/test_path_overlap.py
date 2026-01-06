@@ -9,6 +9,7 @@ These tests check if our current implementation correctly handles:
 import pytest
 
 from pivot import registry
+from pivot.exceptions import ValidationError
 
 
 def test_directory_output_vs_file_output_conflict() -> None:
@@ -32,7 +33,7 @@ def test_directory_output_vs_file_output_conflict() -> None:
     reg.register(stage_a, name="stage_a", deps=[], outs=["data/"])
 
     # Stage B outputs file inside that directory - should conflict
-    with pytest.raises(registry.ValidationError, match="conflict|overlap"):
+    with pytest.raises(ValidationError, match="conflict|overlap"):
         reg.register(stage_b, name="stage_b", deps=[], outs=["data/train.csv"])
 
 
@@ -57,7 +58,7 @@ def test_parent_directory_output_vs_child_directory_output() -> None:
     reg.register(stage_a, name="stage_a", deps=[], outs=["data/"])
 
     # Stage B outputs child directory - should conflict
-    with pytest.raises(registry.ValidationError, match="conflict|overlap"):
+    with pytest.raises(ValidationError, match="conflict|overlap"):
         reg.register(stage_b, name="stage_b", deps=[], outs=["data/raw/"])
 
 

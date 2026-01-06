@@ -7,6 +7,7 @@ and detection of conflicts like duplicate stage names or output conflicts.
 import pytest
 
 from pivot import registry
+from pivot.exceptions import ValidationError
 
 
 def test_duplicate_stage_name_raises_error() -> None:
@@ -21,7 +22,7 @@ def test_duplicate_stage_name_raises_error() -> None:
 
     reg.register(stage1, name="process", deps=list[str](), outs=list[str](), params_cls=None)
 
-    with pytest.raises(registry.ValidationError, match="already registered"):
+    with pytest.raises(ValidationError, match="already registered"):
         reg.register(stage2, name="process", deps=list[str](), outs=list[str](), params_cls=None)
 
 
@@ -51,7 +52,7 @@ def test_invalid_dep_path_with_parent_traversal() -> None:
     def stage1() -> None:
         pass
 
-    with pytest.raises(registry.ValidationError, match="path traversal"):
+    with pytest.raises(ValidationError, match="path traversal"):
         reg.register(
             stage1,
             name="process",
@@ -68,7 +69,7 @@ def test_invalid_out_path_with_parent_traversal() -> None:
     def stage1() -> None:
         pass
 
-    with pytest.raises(registry.ValidationError, match="path traversal"):
+    with pytest.raises(ValidationError, match="path traversal"):
         reg.register(
             stage1,
             name="process",
@@ -85,7 +86,7 @@ def test_invalid_path_with_null_byte() -> None:
     def stage1() -> None:
         pass
 
-    with pytest.raises(registry.ValidationError, match="null byte"):
+    with pytest.raises(ValidationError, match="null byte"):
         reg.register(
             stage1,
             name="process",
@@ -102,7 +103,7 @@ def test_invalid_path_with_newline() -> None:
     def stage1() -> None:
         pass
 
-    with pytest.raises(registry.ValidationError, match="newline"):
+    with pytest.raises(ValidationError, match="newline"):
         reg.register(
             stage1,
             name="process",
@@ -124,7 +125,7 @@ def test_output_conflict_raises_error() -> None:
 
     reg.register(stage1, name="process1", deps=list[str](), outs=["output.txt"], params_cls=None)
 
-    with pytest.raises(registry.ValidationError, match="produced by both"):
+    with pytest.raises(ValidationError, match="produced by both"):
         reg.register(
             stage2, name="process2", deps=list[str](), outs=["output.txt"], params_cls=None
         )
@@ -153,7 +154,7 @@ def test_empty_stage_name_raises_error() -> None:
     def stage1() -> None:
         pass
 
-    with pytest.raises(registry.ValidationError, match="cannot be empty"):
+    with pytest.raises(ValidationError, match="cannot be empty"):
         reg.register(stage1, name="", deps=list[str](), outs=list[str](), params_cls=None)
 
 
@@ -164,7 +165,7 @@ def test_whitespace_only_stage_name_raises_error() -> None:
     def stage1() -> None:
         pass
 
-    with pytest.raises(registry.ValidationError, match="cannot be empty"):
+    with pytest.raises(ValidationError, match="cannot be empty"):
         reg.register(stage1, name="   ", deps=list[str](), outs=list[str](), params_cls=None)
 
 

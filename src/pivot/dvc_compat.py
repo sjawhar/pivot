@@ -14,9 +14,8 @@ from typing import TYPE_CHECKING, Any
 
 import yaml
 
-from pivot import outputs, project
+from pivot import outputs, project, registry
 from pivot.exceptions import DVCImportError, ExportError
-from pivot.registry import REGISTRY as REGISTRY
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -24,6 +23,9 @@ if TYPE_CHECKING:
 
     from dvc.output import Output as DVCOutput
     from dvc.stage import PipelineStage
+
+    from pivot.registry import RegistryStageInfo
+
 
 logger = logging.getLogger(__name__)
 
@@ -81,7 +83,7 @@ def _extract_param_defaults(sig: Signature) -> dict[str, Any]:
 
 
 def _generate_params_yaml(
-    stages: dict[str, dict[str, Any]],
+    stages: dict[str, RegistryStageInfo],
     path: pathlib.Path,
 ) -> dict[str, Any]:
     """Generate params.yaml from stage function defaults."""
@@ -114,30 +116,26 @@ def _generate_params_yaml(
 
 
 def _build_dvc_stage(
-    stage_info: dict[str, Any],
+    stage_info: RegistryStageInfo,
     root: pathlib.Path,
     params: dict[str, Any],
 ) -> dict[str, Any]:
-    """Build DVC stage dict from Pivot stage info."""
-    name = stage_info["name"]
-    func = stage_info["func"]
-    deps = stage_info.get("deps", [])
-    outs_objects: list[outputs.BaseOut] = stage_info.get("outs", [])
-
+    """Build DVC stage dict from Pivot stage decorator."""
     stage: dict[str, Any] = {
-        "cmd": _generate_cmd(func),
+        "cmd": _generate_cmd(stage_info["func"]),
     }
 
-    # Add deps (convert to relative paths)
+    # Add deps section
+    deps = [_to_relative_path(dep, root) for dep in stage_info["deps"]]
     if deps:
-        stage["deps"] = [_to_relative_path(d, root) for d in deps]
+        stage["deps"] = deps
 
     # Build outs/metrics/plots sections from BaseOut objects
     outs_section: list[str | dict[str, Any]] = []
     metrics_section: list[str | dict[str, Any]] = []
     plots_section: list[str | dict[str, Any]] = []
 
-    for out in outs_objects:
+    for out in stage_info["outs"]:
         rel_path = _to_relative_path(out.path, root)
         out_entry = _build_out_entry(out, rel_path)
 
@@ -157,8 +155,9 @@ def _build_dvc_stage(
         stage["plots"] = plots_section
 
     # Add params reference if stage has parameter defaults
-    if name in params:
-        stage["params"] = [f"{name}.{p}" for p in params[name]]
+    stage_name = stage_info["name"]
+    if stage_name in params:
+        stage["params"] = [f"{stage_name}.{p}" for p in params[stage_name]]
 
     return stage
 
@@ -219,17 +218,16 @@ def export_dvc_yaml(
     path = pathlib.Path(path)
     root = project.get_project_root()
 
-    all_stages = REGISTRY._stages  # pyright: ignore[reportPrivateUsage]
-
     # Validate requested stages exist
-    if stages is not None:
+    if stages is None:
+        stages = registry.REGISTRY.list_stages()
+    else:
+        all_stages = {*registry.REGISTRY.list_stages()}
         missing = [name for name in stages if name not in all_stages]
         if missing:
             raise ExportError(f"Stages not found: {missing}")
-        stage_dict = {name: all_stages[name] for name in stages}
-    else:
-        stage_dict = all_stages
 
+    stage_dict = {name: registry.REGISTRY.get(name) for name in stages}
     if not stage_dict:
         raise ExportError("No stages registered to export")
 
@@ -365,7 +363,7 @@ def _register_imported_stage(spec: StageSpec) -> None:  # pragma: no cover
     wrapper.__name__ = spec.name
     wrapper.__module__ = "pivot.dvc_compat"
 
-    REGISTRY.register(
+    registry.REGISTRY.register(
         wrapper,
         name=spec.name,
         deps=list(spec.deps),
