@@ -18,10 +18,9 @@ import multiprocessing as mp
 import os
 import pathlib
 import queue
-import sys
 import threading
 import time
-from typing import TYPE_CHECKING, Any, Literal, TextIO, TypedDict, cast
+from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast
 
 import loky
 
@@ -39,6 +38,7 @@ from pivot.types import (
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator, Sequence
     from inspect import Signature
+    from types import TracebackType
 
     from networkx import DiGraph
 
@@ -589,8 +589,8 @@ def execute_stage_worker(
         with _execution_lock(stage_name, cache_dir):
             _prepare_outputs_for_execution(stage_outs, lock_data_prev, files_cache_dir)
 
-            output_lines = _run_stage_function_with_capture(
-                stage_info["func"], stage_name, output_queue
+            _run_stage_function_with_capture(
+                stage_info["func"], stage_name, output_queue, output_lines
             )
 
             output_hashes = _save_outputs_to_cache(stage_outs, files_cache_dir)
@@ -701,39 +701,25 @@ def _run_stage_function_with_capture(
     func: Callable[..., Any],
     stage_name: str,
     output_queue: mp.Queue[OutputMessage],
-) -> list[tuple[str, bool]]:
-    """Run stage function with stdout/stderr capture, streaming to queue."""
-    output_lines: list[tuple[str, bool]] = []
+    output_lines: list[tuple[str, bool]],
+) -> None:
+    """Run stage function with stdout/stderr capture, streaming to queue.
 
-    old_stdout = sys.stdout
-    old_stderr = sys.stderr
-
-    stdout_capture = _QueueStreamCapture(
-        stage_name, output_queue, is_stderr=False, output_lines=output_lines
-    )
-    stderr_capture = _QueueStreamCapture(
-        stage_name, output_queue, is_stderr=True, output_lines=output_lines
-    )
-
-    try:
-        # Cast to TextIO via object - _QueueStreamCapture implements the TextIO protocol
-        sys.stdout = cast("TextIO", cast("object", stdout_capture))
-        sys.stderr = cast("TextIO", cast("object", stderr_capture))
+    Output is appended to the provided output_lines list, ensuring captured
+    output is preserved even if func() raises an exception.
+    """
+    with (
+        _QueueWriter(stage_name, output_queue, is_stderr=False, output_lines=output_lines),
+        _QueueWriter(stage_name, output_queue, is_stderr=True, output_lines=output_lines),
+    ):
         func()
-    finally:
-        sys.stdout = old_stdout
-        sys.stderr = old_stderr
-        stdout_capture.flush()
-        stderr_capture.flush()
-
-    return output_lines
 
 
-class _QueueStreamCapture:
-    """Capture stream output and send to queue for main process.
+class _QueueWriter:
+    """Context manager for capturing stdout/stderr to a queue.
 
-    Implements the TextIO protocol to allow assignment to sys.stdout/stderr.
-    Uses duck typing rather than inheritance to avoid property/attribute conflicts.
+    Handles stream redirection, output capture, and automatic flushing.
+    Implements minimal file-like interface needed by print() and common libraries.
     """
 
     _stage_name: str
@@ -741,47 +727,39 @@ class _QueueStreamCapture:
     _is_stderr: bool
     _output_lines: list[tuple[str, bool]]
     _buffer: str
+    _redirect: contextlib.AbstractContextManager[Any]
 
     def __init__(
         self,
         stage_name: str,
-        output_q: mp.Queue[OutputMessage],
+        output_queue: mp.Queue[OutputMessage],
+        *,
         is_stderr: bool,
         output_lines: list[tuple[str, bool]],
     ) -> None:
         self._stage_name = stage_name
-        self._queue = output_q
+        self._queue = output_queue
         self._is_stderr = is_stderr
         self._output_lines = output_lines
         self._buffer = ""
+        # Create redirect context manager (not yet entered)
+        if is_stderr:
+            self._redirect = contextlib.redirect_stderr(self)
+        else:
+            self._redirect = contextlib.redirect_stdout(self)
 
-    # TextIO protocol attributes as properties
-    @property
-    def encoding(self) -> str:
-        return "utf-8"
+    def __enter__(self) -> _QueueWriter:
+        self._redirect.__enter__()
+        return self
 
-    @property
-    def errors(self) -> str | None:
-        return "strict"
-
-    @property
-    def newlines(self) -> str | tuple[str, ...] | None:
-        return None
-
-    def fileno(self) -> int:
-        raise OSError("_QueueStreamCapture has no underlying file descriptor")
-
-    def isatty(self) -> bool:
-        return False
-
-    def readable(self) -> bool:
-        return False
-
-    def seekable(self) -> bool:
-        return False
-
-    def writable(self) -> bool:
-        return True
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
+        self._redirect.__exit__(exc_type, exc_val, exc_tb)
+        self.flush()
 
     def _send_line(self, line: str) -> None:
         """Save line locally and send to queue for real-time display."""
@@ -802,6 +780,9 @@ class _QueueStreamCapture:
         if self._buffer:
             self._send_line(self._buffer)
             self._buffer = ""
+
+    def isatty(self) -> bool:
+        return False
 
 
 def _build_results(stage_states: dict[str, StageState]) -> dict[str, ExecutionSummary]:
