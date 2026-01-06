@@ -70,6 +70,7 @@ reportUnknownVariableType = false
 source = ["src/pivot"]
 branch = true
 parallel = true
+concurrency = ["multiprocessing"]
 omit = ["tests/*", "*/site-packages/*"]
 
 [tool.coverage.report]

@@ -46,6 +46,7 @@ class stage:
         deps: Input dependencies (file paths)
         outs: Output files produced by stage (str, Out, Metric, or Plot)
         params_cls: Optional Pydantic model for parameters
+        mutex: Mutex groups this stage belongs to (prevents concurrent execution)
 
     Example:
         >>> @stage(deps=['input.txt'], outs=['output.txt'])
@@ -56,11 +57,17 @@ class stage:
         >>> @stage(deps=['data.csv'], outs=[Out('model.pkl'), Metric('metrics.json')])
         >>> def train():
         ...     pass
+
+        >>> @stage(deps=['data.csv'], outs=['model.pkl'], mutex=['gpu'])
+        >>> def train_gpu():
+        ...     # Only one 'gpu' mutex stage runs at a time
+        ...     pass
     """
 
     deps: Sequence[str] = ()
     outs: Sequence[outputs.OutSpec] = ()
     params_cls: type[BaseModel] | None = None
+    mutex: Sequence[str] = ()
 
     def __call__(self, func: F) -> F:
         """Register function as a stage (returns original function unmodified)."""
@@ -70,6 +77,7 @@ class stage:
             deps=self.deps,
             outs=self.outs,
             params_cls=self.params_cls,
+            mutex=self.mutex,
         )
         return func
 
@@ -88,11 +96,13 @@ class StageRegistry:
         deps: Sequence[str] | None = None,
         outs: Sequence[outputs.OutSpec] | None = None,
         params_cls: type[BaseModel] | None = None,
+        mutex: Sequence[str] | None = None,
     ) -> None:
         """Register a stage function with metadata."""
         stage_name = name if name is not None else func.__name__
         deps_list: Sequence[str] = deps if deps is not None else ()
         outs_list: Sequence[outputs.OutSpec] = outs if outs is not None else ()
+        mutex_list: list[str] = [m.strip().lower() for m in mutex] if mutex else []
 
         # Normalize outputs to BaseOut objects
         outs_normalized = [outputs.normalize_out(o) for o in outs_list]
@@ -133,6 +143,7 @@ class StageRegistry:
             "outs": outs_normalized,  # Full BaseOut objects
             "outs_paths": outs_paths,  # Just paths for DAG
             "params_cls": params_cls,
+            "mutex": mutex_list,
             "signature": inspect.signature(func),
             "fingerprint": fingerprint.get_stage_fingerprint(func),
         }

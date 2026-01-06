@@ -57,6 +57,7 @@ class StageState:
     upstream: list[str]
     upstream_unfinished: set[str]
     downstream: list[str]
+    mutex: list[str]
     status: StageStatus = StageStatus.READY
     result: StageResult | None = None
     start_time: float | None = None
@@ -164,9 +165,22 @@ def _initialize_stage_states(
             upstream=upstream_in_plan,
             upstream_unfinished=set(upstream_in_plan),
             downstream=downstream_in_plan,
+            mutex=stage_info.get("mutex", []),
         )
 
     return states
+
+
+def _warn_single_stage_mutex_groups(stage_states: dict[str, StageState]) -> None:
+    """Warn if any mutex group contains only one stage (likely a typo)."""
+    groups: collections.defaultdict[str, list[str]] = collections.defaultdict(list)
+    for name, state in stage_states.items():
+        for mutex in state.mutex:
+            groups[mutex].append(name)
+
+    for group, members in groups.items():
+        if len(members) == 1:
+            logger.warning(f"Mutex group '{group}' only contains stage '{members[0]}'")
 
 
 def _create_executor(max_workers: int) -> concurrent.futures.Executor:
@@ -185,6 +199,9 @@ def _execute_greedy(
     """Execute stages with greedy parallel scheduling using loky ProcessPoolExecutor."""
     completed_count = 0
     futures: dict[concurrent.futures.Future[StageResult], str] = {}
+    mutex_counts: collections.defaultdict[str, int] = collections.defaultdict(int)
+
+    _warn_single_stage_mutex_groups(stage_states)
 
     executor = _create_executor(max_workers)
     output_queue: mp.Queue[OutputMessage] = mp.Manager().Queue()  # pyright: ignore[reportAssignmentType]
@@ -207,6 +224,8 @@ def _execute_greedy(
                 cache_dir=cache_dir,
                 output_queue=output_queue,
                 max_stages=max_workers,
+                mutex_counts=mutex_counts,
+                error_mode=error_mode,
                 con=con,
                 total_stages=total_stages,
                 completed_count=completed_count,
@@ -249,6 +268,15 @@ def _execute_greedy(
                         if downstream_state:
                             downstream_state.upstream_unfinished.discard(stage_name)
 
+                    # Release mutex locks (regardless of success/failure)
+                    for mutex in state.mutex:
+                        mutex_counts[mutex] -= 1
+                        if mutex_counts[mutex] < 0:
+                            logger.error(
+                                f"Mutex '{mutex}' released when not held (bug in mutex tracking)"
+                            )
+                            mutex_counts[mutex] = 0  # Reset to valid state
+
                     if con and state.result:
                         duration = (
                             (state.end_time - state.start_time)
@@ -280,6 +308,8 @@ def _execute_greedy(
                         cache_dir=cache_dir,
                         output_queue=output_queue,
                         max_stages=slots_available,
+                        mutex_counts=mutex_counts,
+                        error_mode=error_mode,
                         con=con,
                         total_stages=total_stages,
                         completed_count=completed_count,
@@ -305,6 +335,13 @@ def _output_queue_reader(output_q: mp.Queue[OutputMessage], con: console.Console
             continue
 
 
+def _has_failed_upstream(state: StageState, stage_states: dict[str, StageState]) -> bool:
+    """Check if any upstream stage has failed."""
+    return any(
+        stage_states[u].status == StageStatus.FAILED for u in state.upstream if u in stage_states
+    )
+
+
 def _start_ready_stages(
     stage_states: dict[str, StageState],
     executor: concurrent.futures.Executor,
@@ -312,6 +349,8 @@ def _start_ready_stages(
     cache_dir: pathlib.Path,
     output_queue: mp.Queue[OutputMessage],
     max_stages: int,
+    mutex_counts: collections.defaultdict[str, int],
+    error_mode: OnError,
     con: console.Console | None,
     total_stages: int,
     completed_count: int,
@@ -329,36 +368,47 @@ def _start_ready_stages(
         if state.upstream_unfinished:
             continue
 
-        upstream_failed = any(
-            stage_states[u].status == StageStatus.FAILED
-            for u in state.upstream
-            if u in stage_states
-        )
-        if upstream_failed:
+        # Skip stages with failed upstream (unless in ignore mode)
+        if error_mode != OnError.IGNORE and _has_failed_upstream(state, stage_states):
             continue
 
-        state.status = StageStatus.IN_PROGRESS
-        state.start_time = time.perf_counter()
+        # Check mutex availability - skip if any mutex group is held
+        if any(mutex_counts[m] > 0 for m in state.mutex):
+            continue
 
-        if con:
-            con.stage_start(
-                name=stage_name,
-                index=completed_count + len(futures) + 1,
-                total=total_stages,
-                status=StageDisplayStatus.RUNNING,
-            )
+        # Acquire mutex locks before changing status
+        for mutex in state.mutex:
+            mutex_counts[mutex] += 1
 
         worker_info = _prepare_worker_info(state.info)
 
-        future = executor.submit(
-            execute_stage_worker,
-            stage_name,
-            worker_info,
-            cache_dir,
-            output_queue,
-        )
-        futures[future] = stage_name
-        started += 1
+        try:
+            future = executor.submit(
+                execute_stage_worker,
+                stage_name,
+                worker_info,
+                cache_dir,
+                output_queue,
+            )
+            futures[future] = stage_name
+            started += 1
+
+            # Only mark as in-progress after successful submission
+            state.status = StageStatus.IN_PROGRESS
+            state.start_time = time.perf_counter()
+
+            if con:
+                con.stage_start(
+                    name=stage_name,
+                    index=completed_count + len(futures),
+                    total=total_stages,
+                    status=StageDisplayStatus.RUNNING,
+                )
+        except Exception as e:
+            # Rollback mutex acquisition on submission failure
+            for mutex in state.mutex:
+                mutex_counts[mutex] -= 1
+            _mark_stage_failed(state, f"Failed to submit: {e}", stage_states, error_mode)
 
 
 def _prepare_worker_info(stage_info: dict[str, Any]) -> dict[str, Any]:
@@ -434,8 +484,8 @@ def execute_stage_worker(
 
     stage_lock = lock.StageLock(stage_name, cache_dir)
     current_fingerprint = stage_info["fingerprint"]
-    current_params = _extract_params(stage_info)
-    dep_hashes, missing = _hash_dependencies(stage_info.get("deps", []))
+    current_params = extract_params(stage_info)
+    dep_hashes, missing = hash_dependencies(stage_info.get("deps", []))
 
     if missing:
         return {
@@ -567,7 +617,7 @@ def _build_results(stage_states: dict[str, StageState]) -> dict[str, dict[str, A
     return results
 
 
-def _extract_params(stage_info: dict[str, Any]) -> dict[str, Any]:
+def extract_params(stage_info: dict[str, Any]) -> dict[str, Any]:
     """Extract parameter values from stage signature defaults."""
     sig = stage_info.get("signature")
     if not sig:
@@ -579,7 +629,7 @@ def _extract_params(stage_info: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _hash_dependencies(deps: list[str]) -> tuple[dict[str, str], list[str]]:
+def hash_dependencies(deps: list[str]) -> tuple[dict[str, str], list[str]]:
     """Hash all dependency files. Returns (hashes, missing_files)."""
     hashes = dict[str, str]()
     missing = list[str]()

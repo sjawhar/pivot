@@ -20,13 +20,13 @@ we actually use, rather than generating comprehensive stubs for entire packages.
 
     # Generate baseline stubs for a package (requires mypy installed)
     uv add --dev mypy
-    uv run python scripts/generate_stubs.py --generate loky
+    python scripts/generate_stubs.py --generate loky
 
     # List current stub packages
-    uv run python scripts/generate_stubs.py --list
+    python scripts/generate_stubs.py --list
 
     # Validate stubs work with basedpyright
-    uv run python scripts/generate_stubs.py --validate
+    python scripts/generate_stubs.py --validate
 
 ## Stub Location
 
@@ -38,11 +38,11 @@ Stubs live in `typings/<package>/` and are configured via pyproject.toml:
 ## Adding a New Stub
 
 1. Run stubgen to get a baseline (optional):
-       uv run stubgen -p <package> -o /tmp/stubs
+       stubgen -p <package> -o /tmp/stubs
 
 2. Create `typings/<package>/__init__.pyi` with only the APIs you need
 
-3. Run `uv run basedpyright` to verify
+3. Run `basedpyright` to verify
 
 ## Example: Minimal Stub
 
@@ -129,7 +129,7 @@ def generate_baseline(package: str) -> None:
         print("This usually means stubgen couldn't import the package.")
         print()
         print("Try running manually to debug:")
-        print(f"  uv run python -c 'import {package}'")
+        print(f"  python -c 'import {package}'")
         sys.exit(1)
 
     print()
@@ -141,7 +141,7 @@ def generate_baseline(package: str) -> None:
     print(f"2. Copy relevant types to typings/{package}/__init__.pyi")
     print("3. Simplify to only the APIs you use")
     print("4. Add precise type annotations (replace Incomplete with real types)")
-    print("5. Run: uv run basedpyright")
+    print("5. Run: basedpyright")
 
 
 def validate_stubs() -> None:
