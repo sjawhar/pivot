@@ -784,7 +784,7 @@ def test_hash_file_produces_consistent_hash(tmp_path: pathlib.Path) -> None:
     hash2 = executor.hash_file(file_path)
 
     assert hash1 == hash2
-    assert len(hash1) == 16  # First 16 hex chars of SHA256
+    assert len(hash1) == 16  # xxhash64 hexdigest
 
 
 def test_hash_file_different_for_different_content(tmp_path: pathlib.Path) -> None:

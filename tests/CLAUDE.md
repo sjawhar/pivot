@@ -37,6 +37,22 @@ def test_fingerprint():
 
 If you find yourself writing helper functions that duplicate library functionality, stop and import from the library instead.
 
+## Fingerprint Tests (Critical)
+
+All fingerprint-related tests are in the `tests/fingerprint/` directory.
+
+**Before modifying fingerprinting behavior, consult `tests/fingerprint/README.md`** which contains:
+
+- Complete change detection matrix (what is/isn't detected)
+- Test coverage for each behavior
+- Known limitations and design decisions
+
+**When adding or modifying fingerprint tests, ALWAYS update `tests/fingerprint/README.md`** to keep the change detection matrix in sync. This includes:
+
+- Adding new test references when adding tests
+- Updating "NO TEST" entries when gaps are filled
+- Documenting new limitations or behaviors discovered
+
 ## Module-Level Helpers (Critical for Fingerprinting)
 
 - Inline functions inside tests do NOT capture module imports in closures.

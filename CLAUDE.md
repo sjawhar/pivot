@@ -212,6 +212,8 @@ tree = ast.parse(source)
 
 **Rule of thumb:** If removing the comment makes the code unclear, try to write clearer code instead (helper functions, variable names). If that doesn't work, keep the comment.
 
+**Write evergreen documentation:** Avoid time-relative language like "recently added", "new feature", "will be removed soon", or "as of version X". Future readers won't know when "recently" was. Instead, state facts that remain true regardless of when the documentation is read.
+
 ## Early Returns (Reduce Nesting)
 
 - Use early `return`/`continue` to keep main logic at top indentation level.
@@ -309,7 +311,7 @@ basedpyright .      # Type check
 ## Critical Discoveries
 
 1. Test helpers must be module-level, not inline—`getclosurevars()` doesn't see module imports in inline closures.
-2. Helper functions must NOT start with underscore—fingerprinting filters `_globals` to skip `__name__`, `__file__`, etc., which also filters `_helper()`.
+2. Helper functions starting with single underscore (`_helper`) ARE tracked. Only dunder names (`__name__`, `__file__`, etc.) are filtered.
 3. Use assertion messages instead of inline comments—messages appear in failure output.
 4. **Circular import resolution:** When two modules have bidirectional dependencies, extract shared types/exceptions to a separate module (e.g., `exceptions.py` breaks `registry.py` ↔ `trie.py` cycle).
 5. **AST manipulation validation:** After transforming AST nodes (e.g., removing docstrings), validate structural invariants. Function/class bodies must contain at least one statement—add `ast.Pass()` if empty.
@@ -321,3 +323,4 @@ basedpyright .      # Type check
 11. **Atomic file writes need `fd_closed` tracking:** When using `tempfile.mkstemp()` + rename pattern, track whether the fd was closed by a callback (e.g., `os.fdopen()`). Without this, the `finally` block may double-close or leak the fd.
 12. **IncrementalOut must use COPY mode:** `IncrementalOut` restores from cache before execution so stages can modify in-place. Must use `LinkMode.COPY` (not hardlinks/symlinks) to avoid corrupting the cache when the stage writes to the file.
 13. **Sentinel file locking for concurrent execution:** Use PID-based sentinel files (`stage.lock.running`) instead of `flock` for cross-platform support, visible debugging (can `ls` to see locks), and crash recovery via PID checking. Atomic acquisition via `os.open(path, O_CREAT | O_EXCL | O_WRONLY)`.
+14. **Fingerprinting: `is_user_code()` check required for both import styles:** Direct references (`from utils import func`) and module attributes (`import utils; utils.func()`) both need `is_user_code()` check before hashing. The actual hash+recurse logic is centralized in `_add_callable_to_manifest()`.
