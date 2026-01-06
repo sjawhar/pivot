@@ -29,12 +29,13 @@ class StageSpec:
     """Parsed DVC stage specification."""
 
     name: str
-    cmd: str
+    cmd: str | list[str]  # DVC supports multi-command stages as lists
     deps: list[str]
     outs: list[outputs.BaseOut]
     params: dict[str, Any]
     frozen: bool = False
     desc: str | None = None
+    cwd: pathlib.Path | None = None  # Working directory for command execution
 
 
 def _to_relative_path(absolute_path: str, root: pathlib.Path) -> str:
@@ -298,6 +299,7 @@ def import_dvc_yaml(
             params=_extract_dvc_params(stage),
             frozen=stage.frozen,
             desc=stage.desc,
+            cwd=path.parent,  # Run command from dvc.yaml directory
         )
         specs[stage.name] = spec
 
@@ -346,17 +348,28 @@ def _extract_dvc_params(stage: PipelineStage) -> dict[str, Any]:  # pragma: no c
 
 def _register_imported_stage(spec: StageSpec) -> None:  # pragma: no cover
     """Register an imported DVC stage with Pivot."""
-    root = project.get_project_root()
+    _register_imported_stage_with_name(spec, spec.name)
+
+
+def _register_imported_stage_with_name(spec: StageSpec, name: str) -> None:  # pragma: no cover
+    """Register imported DVC stage with explicit name (for collision handling)."""
+    # Use spec.cwd if set, otherwise fall back to project root
+    cwd = spec.cwd if spec.cwd else project.get_project_root()
+
+    # DVC supports multi-command stages as lists - run each with cwd reset
+    # (check=True ensures we stop on first failure, like && would)
+    commands = spec.cmd if isinstance(spec.cmd, list) else [spec.cmd]
 
     def wrapper() -> None:
-        subprocess.run(spec.cmd, shell=True, check=True, cwd=root)  # noqa: S602
+        for cmd in commands:
+            subprocess.run(cmd, shell=True, check=True, cwd=cwd)  # noqa: S602
 
-    wrapper.__name__ = spec.name
+    wrapper.__name__ = name
     wrapper.__module__ = "pivot.dvc_compat"
 
     registry.REGISTRY.register(
         wrapper,
-        name=spec.name,
+        name=name,
         deps=list(spec.deps),
         outs=spec.outs,
     )
