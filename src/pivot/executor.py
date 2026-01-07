@@ -25,8 +25,10 @@ from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast
 import loky
 import pydantic
 
-from pivot import cache, console, dag, exceptions, lock, outputs, parameters, project, registry
+from pivot import cache, console, dag, exceptions, lock, outputs, parameters, project, pvt, registry
+from pivot import state as state_mod
 from pivot.types import (
+    HashInfo,
     LockData,
     OnError,
     OutputHash,
@@ -52,7 +54,7 @@ _MAX_WORKERS_DEFAULT = 8
 class ExecutionSummary(TypedDict):
     """Summary result for a single stage after execution (returned by executor.run)."""
 
-    status: Literal["ran", "skipped", "failed", "unknown"]
+    status: Literal[StageStatus.RAN, StageStatus.SKIPPED, StageStatus.FAILED, StageStatus.UNKNOWN]
     reason: str
 
 
@@ -134,6 +136,10 @@ def run(
                 f"Invalid on_error mode: {on_error}. Use 'fail', 'keep_going', or 'ignore'"
             ) from None
 
+    # Verify tracked files before building DAG (provides better error messages)
+    project_root = project.get_project_root()
+    _verify_tracked_files(project_root)
+
     graph = registry.REGISTRY.build_dag(validate=True)
 
     if stages:
@@ -191,10 +197,48 @@ def run(
         status_counts = collections.Counter(r["status"] for r in results.values())
         total_duration = time.perf_counter() - start_time
         con.summary(
-            status_counts["ran"], status_counts["skipped"], status_counts["failed"], total_duration
+            status_counts[StageStatus.RAN],
+            status_counts[StageStatus.SKIPPED],
+            status_counts[StageStatus.FAILED],
+            total_duration,
         )
 
     return results
+
+
+def _verify_tracked_files(project_root: pathlib.Path) -> None:
+    """Verify all .pvt tracked files exist and warn on hash mismatches."""
+    tracked_files = pvt.discover_pvt_files(project_root)
+    if not tracked_files:
+        return
+
+    missing = list[str]()
+    state_db_path = project_root / ".pivot" / "state.db"
+
+    with state_mod.StateDB(state_db_path) as state_db:
+        for data_path, pvt_data in tracked_files.items():
+            path = pathlib.Path(data_path)
+            if not path.exists():
+                missing.append(data_path)
+                continue
+
+            # Check hash mismatch (file exists but content changed)
+            if path.is_file():
+                current_hash = cache.hash_file(path, state_db)
+            else:
+                current_hash, _ = cache.hash_directory(path, state_db)
+            if current_hash != pvt_data["hash"]:
+                logger.warning(
+                    f"Tracked file '{data_path}' has changed since tracking. "
+                    + f"Run 'pivot track --force {pvt_data['path']}' to update."
+                )
+
+    if missing:
+        missing_list = "\n".join(f"  - {p}" for p in missing)
+        raise exceptions.TrackedFileMissingError(
+            f"The following tracked files are missing:\n{missing_list}\n\n"
+            + "Run 'pivot checkout' to restore them from cache."
+        )
 
 
 def _initialize_stage_states(
@@ -341,10 +385,10 @@ def _execute_greedy(
                         state.result = result
                         state.end_time = time.perf_counter()
 
-                        if result["status"] == "failed":
+                        if result["status"] == StageStatus.FAILED:
                             state.status = StageStatus.FAILED
                             _handle_stage_failure(stage_name, stage_states, error_mode)
-                        elif result["status"] == "skipped":
+                        elif result["status"] == StageStatus.SKIPPED:
                             state.status = StageStatus.SKIPPED
                         else:
                             state.status = StageStatus.COMPLETED
@@ -532,7 +576,7 @@ def _mark_stage_failed(
     error_mode: OnError,
 ) -> None:
     """Mark a stage as failed and handle downstream effects."""
-    state.result = StageResult(status="failed", reason=reason, output_lines=[])
+    state.result = StageResult(status=StageStatus.FAILED, reason=reason, output_lines=[])
     state.status = StageStatus.FAILED
     state.end_time = time.perf_counter()
     _handle_stage_failure(state.name, stage_states, error_mode)
@@ -571,7 +615,7 @@ def _handle_stage_failure(
         if state and state.status == StageStatus.READY:
             state.status = StageStatus.SKIPPED
             state.result = StageResult(
-                status="skipped",
+                status=StageStatus.SKIPPED,
                 reason=f"upstream '{failed_stage}' failed",
                 output_lines=[],
             )
@@ -601,14 +645,14 @@ def execute_stage_worker(
             params_instance = parameters.apply_overrides(params_instance, stage_name, overrides)
     except pydantic.ValidationError as e:
         return StageResult(
-            status="failed",
+            status=StageStatus.FAILED,
             reason=f"Invalid params override in params.yaml: {e.error_count()} validation error(s)",
             output_lines=[],
         )
 
     if missing:
         return StageResult(
-            status="failed",
+            status=StageStatus.FAILED,
             reason=f"missing deps: {', '.join(missing)}",
             output_lines=[],
         )
@@ -625,7 +669,7 @@ def execute_stage_worker(
             changed, reason = True, "outputs missing from cache"
 
     if not changed:
-        return StageResult(status="skipped", reason="unchanged", output_lines=[])
+        return StageResult(status=StageStatus.SKIPPED, reason="unchanged", output_lines=[])
 
     try:
         with _execution_lock(stage_name, cache_dir):
@@ -649,22 +693,24 @@ def execute_stage_worker(
             }
             stage_lock.write(lock_data)
 
-        return StageResult(status="ran", reason=reason, output_lines=output_lines)
+        return StageResult(status=StageStatus.RAN, reason=reason, output_lines=output_lines)
 
     except exceptions.StageAlreadyRunningError as e:
-        return StageResult(status="failed", reason=str(e), output_lines=output_lines)
+        return StageResult(status=StageStatus.FAILED, reason=str(e), output_lines=output_lines)
     except exceptions.OutputMissingError as e:
-        return StageResult(status="failed", reason=str(e), output_lines=output_lines)
+        return StageResult(status=StageStatus.FAILED, reason=str(e), output_lines=output_lines)
     except SystemExit as e:
         return StageResult(
-            status="failed",
+            status=StageStatus.FAILED,
             reason=f"Stage called sys.exit({e.code})",
             output_lines=output_lines,
         )
     except KeyboardInterrupt:
-        return StageResult(status="failed", reason="KeyboardInterrupt", output_lines=output_lines)
+        return StageResult(
+            status=StageStatus.FAILED, reason="KeyboardInterrupt", output_lines=output_lines
+        )
     except Exception as e:
-        return StageResult(status="failed", reason=str(e), output_lines=output_lines)
+        return StageResult(status=StageStatus.FAILED, reason=str(e), output_lines=output_lines)
 
 
 def _restore_outputs_from_cache(
@@ -846,9 +892,9 @@ def _build_results(stage_states: dict[str, StageState]) -> dict[str, ExecutionSu
                 reason=state.result["reason"],
             )
         elif state.status == StageStatus.SKIPPED:
-            results[name] = ExecutionSummary(status="skipped", reason="upstream failed")
+            results[name] = ExecutionSummary(status=StageStatus.SKIPPED, reason="upstream failed")
         else:
-            results[name] = ExecutionSummary(status="unknown", reason="never executed")
+            results[name] = ExecutionSummary(status=StageStatus.UNKNOWN, reason="never executed")
     return results
 
 
@@ -881,18 +927,26 @@ def _check_uncached_incremental_outputs(
     return uncached
 
 
-def hash_dependencies(deps: list[str]) -> tuple[dict[str, str], list[str]]:
-    """Hash all dependency files and directories. Returns (hashes, missing_files)."""
-    hashes = dict[str, str]()
+def hash_dependencies(deps: list[str]) -> tuple[dict[str, HashInfo], list[str]]:
+    """Hash all dependency files and directories. Returns (hashes, missing_files).
+
+    For directories, includes full manifest with file hashes/sizes for provenance.
+    Paths are normalized (symlinks preserved) for portability in lock files.
+    """
+    hashes = dict[str, HashInfo]()
     missing = list[str]()
     for dep in deps:
+        # Use normalized path (preserve symlinks) as key for portability
+        normalized = str(project.normalize_path(dep))
+
+        # Resolve for actual file operations (hashing, existence check)
         path = pathlib.Path(dep)
         try:
             if path.is_dir():
-                tree_hash, _ = cache.hash_directory(path)
-                hashes[dep] = tree_hash
+                tree_hash, manifest = cache.hash_directory(path)
+                hashes[normalized] = {"hash": tree_hash, "manifest": manifest}
             else:
-                hashes[dep] = hash_file(path)
+                hashes[normalized] = {"hash": hash_file(path)}
         except FileNotFoundError:
             missing.append(dep)
     return hashes, missing

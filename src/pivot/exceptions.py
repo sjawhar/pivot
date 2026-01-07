@@ -22,6 +22,12 @@ class OverlappingOutputPathsError(ValidationError):
     pass
 
 
+class InvalidPathError(ValidationError):
+    """Raised when a path is invalid (e.g., resolves outside project root)."""
+
+    pass
+
+
 class DAGError(PivotError):
     """Base class for DAG-related errors."""
 
@@ -108,5 +114,11 @@ class UncachedIncrementalOutputError(CacheError):
 
 class ParamsError(PivotError):
     """Raised when parameter validation or loading fails."""
+
+    pass
+
+
+class TrackedFileMissingError(CacheError):
+    """Raised when a .pvt tracked file is missing (user should run pivot checkout)."""
 
     pass

@@ -21,7 +21,7 @@ from typing import Any, TypeGuard, cast
 import yaml
 
 from pivot import cache, yaml_config
-from pivot.types import LockData
+from pivot.types import HashInfo, LockData
 
 _VALID_STAGE_NAME = re.compile(r"^[a-zA-Z0-9_@-]+$")
 _MAX_STAGE_NAME_LEN = 200  # Leave room for ".lock" suffix within filesystem NAME_MAX (255)
@@ -75,21 +75,30 @@ class StageLock:
         self,
         current_fingerprint: dict[str, str],
         current_params: dict[str, Any],
-        dep_hashes: dict[str, str],
+        dep_hashes: dict[str, HashInfo],
     ) -> tuple[bool, str]:
         """Check if stage needs re-run."""
         lock_data = self.read()
         if not lock_data:
             return True, "No previous run"
 
-        checks = [
-            ("code_manifest", current_fingerprint, "Code changed"),
-            ("params", current_params, "Params changed"),
-            ("dep_hashes", dep_hashes, "Input dependencies changed"),
-        ]
-        for key, current, reason in checks:
-            # Use `or {}` to treat both missing keys AND explicit None as empty dict
-            if (lock_data.get(key) or {}) != current:
-                return True, reason
+        # Check code_manifest and params directly
+        if (lock_data.get("code_manifest") or {}) != current_fingerprint:
+            return True, "Code changed"
+        if (lock_data.get("params") or {}) != current_params:
+            return True, "Params changed"
+
+        # Check dep_hashes with path normalization for cached paths
+        # (backward compat: old lock files may have resolved paths)
+        from pivot import project
+
+        cached_dep_hashes = lock_data.get("dep_hashes") or {}
+        # Normalize cached paths (current dep_hashes already have normalized keys)
+        cached_normalized = {
+            str(project.normalize_path(p)): h for p, h in cached_dep_hashes.items()
+        }
+
+        if cached_normalized != dep_hashes:
+            return True, "Input dependencies changed"
 
         return False, ""

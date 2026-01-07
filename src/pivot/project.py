@@ -5,6 +5,7 @@ utilities for resolving paths relative to the project root.
 """
 
 import logging
+import os
 import pathlib
 
 logger = logging.getLogger(__name__)
@@ -39,3 +40,54 @@ def resolve_path(path: str) -> pathlib.Path:
     if p.is_absolute():
         return p.resolve()
     return (get_project_root() / p).resolve()
+
+
+def normalize_path(path: str) -> pathlib.Path:
+    """Make path absolute from project root, preserving symlinks (unlike resolve())."""
+    p = pathlib.Path(path)
+    abs_path = p.absolute() if p.is_absolute() else (get_project_root() / p).absolute()
+    # Collapse .. components without following symlinks
+    return pathlib.Path(os.path.normpath(abs_path))
+
+
+def contains_symlink_in_path(path: pathlib.Path, base: pathlib.Path) -> bool:
+    """Check if any component from base to path is a symlink.
+
+    Example: If /project/data is a symlink, and path is /project/data/file.csv,
+    returns True because 'data' component is a symlink.
+
+    Args:
+        path: Path to check for symlink components
+        base: Base path to stop checking at
+
+    Returns:
+        True if any component in the path is a symlink
+    """
+    current = path.absolute()
+    base_abs = base.absolute()
+
+    while current != base_abs:
+        if current.is_symlink():
+            return True
+        parent = current.parent
+        if parent == current:  # Reached filesystem root
+            break
+        current = parent
+
+    return False
+
+
+def resolve_path_for_comparison(path: str, context: str) -> pathlib.Path:
+    """Resolve path for overlap comparison, falling back to normalized for missing stage outputs."""
+    try:
+        return resolve_path(path)
+    except PermissionError as e:
+        raise PermissionError(f"Permission denied for {context} '{path}'") from e
+    except RuntimeError as e:
+        raise RuntimeError(f"Circular symlink in {context} '{path}'") from e
+    except FileNotFoundError:
+        if "stage output" in context.lower():
+            return normalize_path(path)
+        raise
+    except OSError as e:
+        raise OSError(f"Filesystem error for {context} '{path}': {e}") from e

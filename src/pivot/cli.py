@@ -11,7 +11,8 @@ from typing import TYPE_CHECKING
 
 import click
 
-from pivot import executor, registry
+from pivot import cache, executor, project, pvt, registry
+from pivot.types import OutputHash, StageStatus
 
 if TYPE_CHECKING:
     from pivot.executor import ExecutionSummary
@@ -205,6 +206,347 @@ def export(stages: tuple[str, ...], output: pathlib.Path) -> None:
         raise click.ClickException(str(e)) from e
 
 
+@cli.command()
+@click.argument("paths", nargs=-1, required=True)
+@click.option("--force", "-f", is_flag=True, help="Overwrite existing .pvt files")
+def track(paths: tuple[str, ...], force: bool) -> None:
+    """Track files/directories for caching.
+
+    Creates .pvt manifest files and caches content for reproducibility.
+    """
+    try:
+        project_root = project.get_project_root()
+        cache_dir = project_root / ".pivot" / "cache" / "files"
+
+        # Get all stage outputs for overlap detection
+        stage_outputs = _get_all_stage_outputs()
+
+        # Discover existing .pvt files
+        existing_tracked = pvt.discover_pvt_files(project_root)
+
+        for path_str in paths:
+            _track_single_path(path_str, cache_dir, stage_outputs, existing_tracked, force)
+    except Exception as e:
+        raise click.ClickException(str(e)) from e
+
+
+def _paths_overlap(path_a: pathlib.Path, path_b: pathlib.Path) -> bool:
+    """Check if two paths overlap (same location or parent/child relationship)."""
+    # Exact match - use samefile if both exist (handles hardlinks, case-insensitivity)
+    if path_a.exists() and path_b.exists():
+        try:
+            if path_a.samefile(path_b):
+                return True
+        except OSError:
+            pass
+
+    if path_a == path_b:
+        return True
+
+    return path_a.is_relative_to(path_b) or path_b.is_relative_to(path_a)
+
+
+def _get_all_stage_outputs() -> dict[str, pathlib.Path]:
+    """Get stage outputs with resolved paths for overlap detection.
+
+    Returns:
+        Dict mapping normalized path -> resolved path
+
+    Raises:
+        click.ClickException: If any stage output has unresolvable issues
+            (permission errors, circular symlinks, etc.)
+
+    Note:
+        Resolves all paths upfront and fails fast if any are problematic.
+        This provides clear error messages showing ALL issues at once.
+    """
+    outputs_normalized = set[str]()
+    for stage_name in registry.REGISTRY.list_stages():
+        info = registry.REGISTRY.get(stage_name)
+        outputs_normalized.update(info.get("outs_paths", []))
+
+    # Pre-resolve all stage outputs with explicit error handling
+    outputs_resolved = dict[str, pathlib.Path]()
+    resolution_errors = list[str]()
+
+    for norm_path in outputs_normalized:
+        try:
+            resolved = project.resolve_path_for_comparison(norm_path, "stage output")
+            outputs_resolved[norm_path] = resolved
+        except (PermissionError, RuntimeError, OSError) as e:
+            # Collect errors to show all problems at once
+            resolution_errors.append(f"  - {norm_path}: {e}")
+
+    if resolution_errors:
+        raise click.ClickException(
+            "Cannot resolve stage outputs (fix these before tracking):\n"
+            + "\n".join(resolution_errors)
+        )
+
+    return outputs_resolved
+
+
+def _track_single_path(
+    path_str: str,
+    cache_dir: pathlib.Path,
+    stage_outputs_resolved: dict[str, pathlib.Path],
+    existing_tracked: dict[str, pvt.PvtData],
+    force: bool,
+) -> None:
+    """Track a single file or directory.
+
+    Args:
+        path_str: Path to track (user input)
+        cache_dir: Cache directory path
+        stage_outputs_resolved: Dict mapping normalized output paths to resolved paths
+        existing_tracked: Dict of already tracked files
+        force: Whether to overwrite existing .pvt files
+    """
+    # Validate path doesn't escape project
+    if pvt.has_path_traversal(path_str):
+        raise click.ClickException(f"Path traversal not allowed: {path_str}")
+
+    # Normalize path (preserve symlinks) for consistency with registry/pvt
+    path = project.normalize_path(path_str)
+    abs_path_str = str(path)
+
+    # Check for broken symlinks (exist as symlinks but target doesn't exist)
+    if path.is_symlink() and not path.exists():
+        raise click.ClickException(f"Path '{path_str}' is a broken symlink (target does not exist)")
+
+    # Check file exists
+    if not path.exists():
+        raise click.ClickException(f"Path not found: {path_str}")
+
+    # Warn if tracking file inside symlinked directory
+    project_root = project.get_project_root()
+    if project.contains_symlink_in_path(path, project_root):
+        click.echo(
+            f"Warning: '{path_str}' is inside a symlinked directory. "
+            + "Tracked path may not be portable across environments.",
+            err=True,
+        )
+
+    # Check for overlap with stage outputs (resolve paths to detect symlink aliasing)
+    try:
+        user_resolved = project.resolve_path_for_comparison(path_str, "user path")
+    except (PermissionError, RuntimeError, OSError) as e:
+        raise click.ClickException(str(e)) from e
+
+    for out_norm, out_resolved in stage_outputs_resolved.items():
+        if _paths_overlap(user_resolved, out_resolved):
+            # Provide helpful error showing both normalized and resolved if different
+            if str(user_resolved) != abs_path_str or str(out_resolved) != out_norm:
+                # Symlink aliasing detected
+                raise click.ClickException(
+                    f"Cannot track '{path_str}' (resolves to '{user_resolved}'): "
+                    + f"overlaps with stage output '{out_norm}' (resolves to '{out_resolved}')"
+                )
+            else:
+                # Direct overlap
+                raise click.ClickException(
+                    f"Cannot track '{path_str}': overlaps with stage output '{out_norm}'"
+                )
+
+    # Check for duplicate tracking
+    pvt_path = pvt.get_pvt_path(path)
+    if abs_path_str in existing_tracked and not force:
+        raise click.ClickException(f"'{path_str}' is already tracked. Use --force to update.")
+
+    # Hash and cache
+    if path.is_dir():
+        tree_hash, manifest = cache.hash_directory(path)
+        total_size = sum(e["size"] for e in manifest)
+        num_files = len(manifest)
+
+        # Save each file to cache
+        for entry in manifest:
+            file_path = path / entry["relpath"]
+            file_cache_path = cache.get_cache_path(cache_dir, entry["hash"])
+            if not file_cache_path.exists():
+                cache.copy_to_cache(file_path, file_cache_path)
+
+        pvt_data: pvt.PvtData = {
+            "path": path.name,
+            "hash": tree_hash,
+            "size": total_size,
+            "num_files": num_files,
+            "manifest": manifest,
+        }
+    else:
+        file_hash = cache.hash_file(path)
+        file_size = path.stat().st_size
+        file_cache_path = cache.get_cache_path(cache_dir, file_hash)
+        if not file_cache_path.exists():
+            cache.copy_to_cache(path, file_cache_path)
+
+        pvt_data = {
+            "path": path.name,
+            "hash": file_hash,
+            "size": file_size,
+        }
+
+    # Write .pvt file
+    pvt.write_pvt_file(pvt_path, pvt_data)
+
+    # Update existing_tracked for subsequent paths
+    existing_tracked[abs_path_str] = pvt_data
+
+    click.echo(f"Tracked: {path_str}")
+
+
+@cli.command()
+@click.argument("targets", nargs=-1)
+@click.option(
+    "--link",
+    type=click.Choice(["symlink", "hardlink", "copy"]),
+    default=None,
+    help="Link type for restoration (default: project config or symlink)",
+)
+@click.option("--force", "-f", is_flag=True, help="Overwrite existing files")
+def checkout(targets: tuple[str, ...], link: str | None, force: bool) -> None:
+    """Restore tracked files and stage outputs from cache.
+
+    If no targets specified, restores all tracked files and stage outputs.
+    """
+    try:
+        project_root = project.get_project_root()
+        cache_dir = project_root / ".pivot" / "cache" / "files"
+
+        # Determine link mode
+        link_mode = cache.LinkMode(link) if link else cache.LinkMode.SYMLINK
+
+        # Discover tracked files
+        tracked_files = pvt.discover_pvt_files(project_root)
+
+        # Get stage output info from lock files
+        stage_outputs = _get_stage_output_info(project_root)
+
+        if not targets:
+            # Restore everything
+            _checkout_all_tracked(tracked_files, cache_dir, link_mode, force)
+            _checkout_all_outputs(stage_outputs, cache_dir, link_mode, force)
+        else:
+            # Restore specific targets
+            for target in targets:
+                _checkout_target(target, tracked_files, stage_outputs, cache_dir, link_mode, force)
+    except Exception as e:
+        raise click.ClickException(str(e)) from e
+
+
+def _get_stage_output_info(project_root: pathlib.Path) -> dict[str, OutputHash]:
+    """Get output hash info from lock files for all stages."""
+    from pivot import lock
+
+    outputs = dict[str, OutputHash]()
+    cache_dir = project_root / ".pivot" / "cache"
+
+    for stage_name in registry.REGISTRY.list_stages():
+        stage_lock = lock.StageLock(stage_name, cache_dir)
+        lock_data = stage_lock.read()
+        if lock_data and "output_hashes" in lock_data:
+            for out_path, out_hash in lock_data["output_hashes"].items():
+                # Normalize paths for backward compatibility with old lock files
+                # (old lock files may have resolved paths, new ones have normalized)
+                norm_path = str(project.normalize_path(out_path))
+                outputs[norm_path] = out_hash
+
+    return outputs
+
+
+def _checkout_all_tracked(
+    tracked_files: dict[str, pvt.PvtData],
+    cache_dir: pathlib.Path,
+    link_mode: cache.LinkMode,
+    force: bool,
+) -> None:
+    """Restore all tracked files."""
+    for abs_path_str, pvt_data in tracked_files.items():
+        path = pathlib.Path(abs_path_str)
+        output_hash = _pvt_to_output_hash(pvt_data)
+        _restore_path(path, output_hash, cache_dir, link_mode, force)
+
+
+def _checkout_all_outputs(
+    stage_outputs: dict[str, OutputHash],
+    cache_dir: pathlib.Path,
+    link_mode: cache.LinkMode,
+    force: bool,
+) -> None:
+    """Restore all stage outputs."""
+    for abs_path_str, output_hash in stage_outputs.items():
+        if output_hash is None:
+            continue
+        path = pathlib.Path(abs_path_str)
+        _restore_path(path, output_hash, cache_dir, link_mode, force)
+
+
+def _checkout_target(
+    target: str,
+    tracked_files: dict[str, pvt.PvtData],
+    stage_outputs: dict[str, OutputHash],
+    cache_dir: pathlib.Path,
+    link_mode: cache.LinkMode,
+    force: bool,
+) -> None:
+    """Restore a specific target."""
+    # Validate path doesn't escape project
+    if pvt.has_path_traversal(target):
+        raise click.ClickException(f"Path traversal not allowed: {target}")
+
+    # Use normalized path (preserve symlinks) to match keys in tracked_files/stage_outputs
+    abs_path = project.normalize_path(target)
+    abs_path_str = str(abs_path)
+
+    # Check if it's a tracked file
+    if abs_path_str in tracked_files:
+        pvt_data = tracked_files[abs_path_str]
+        output_hash = _pvt_to_output_hash(pvt_data)
+        _restore_path(abs_path, output_hash, cache_dir, link_mode, force)
+        return
+
+    # Check if it's a stage output
+    if abs_path_str in stage_outputs:
+        output_hash = stage_outputs[abs_path_str]
+        if output_hash is None:
+            raise click.ClickException(f"'{target}' has no cached version")
+        _restore_path(abs_path, output_hash, cache_dir, link_mode, force)
+        return
+
+    # Unknown target
+    raise click.ClickException(f"'{target}' is not a tracked file or stage output")
+
+
+def _pvt_to_output_hash(pvt_data: pvt.PvtData) -> OutputHash:
+    """Convert PvtData to OutputHash format."""
+    manifest = pvt_data.get("manifest")
+    if manifest is not None:
+        return {"hash": pvt_data["hash"], "manifest": manifest}
+    return {"hash": pvt_data["hash"]}
+
+
+def _restore_path(
+    path: pathlib.Path,
+    output_hash: OutputHash,
+    cache_dir: pathlib.Path,
+    link_mode: cache.LinkMode,
+    force: bool,
+) -> None:
+    """Restore a file or directory from cache."""
+    if path.exists() and not force:
+        click.echo(f"Skipped: {path.name} (already exists)")
+        return
+
+    if force and path.exists():
+        cache.remove_output(path)
+
+    success = cache.restore_from_cache(path, output_hash, cache_dir, link_mode)
+    if not success:
+        raise click.ClickException(f"Failed to restore '{path.name}': not found in cache")
+
+    click.echo(f"Restored: {path.name}")
+
+
 def _print_results(results: dict[str, ExecutionSummary]) -> None:
     """Print execution results in a readable format."""
     ran = 0
@@ -214,7 +556,7 @@ def _print_results(results: dict[str, ExecutionSummary]) -> None:
         result_status = result["status"]
         reason = result["reason"]
 
-        if result_status == "ran":
+        if result_status == StageStatus.RAN:
             ran += 1
             click.echo(f"{name}: ran ({reason})")
         else:

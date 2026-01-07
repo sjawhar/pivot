@@ -92,7 +92,13 @@ def hash_directory(
 ) -> tuple[str, list[DirManifestEntry]]:
     """Compute tree hash of directory, returning hash and manifest.
 
-    Note: Symlinks are skipped to prevent infinite loops and ensure consistent hashing.
+    Symlink handling:
+    - Symlinks INSIDE directories are skipped (prevents infinite loops)
+    - Base path may be symlinked (resolved for consistency)
+    - Content-based hashing only (symlink metadata excluded from fingerprints)
+
+    Note: For portability, paths are stored as normalized (symlinks preserved)
+    in lock files, but resolved here for consistent hashing.
     """
     manifest = list[DirManifestEntry]()
     resolved_base = path.resolve()
@@ -122,8 +128,10 @@ def hash_directory(
     return tree_hash, manifest
 
 
-def _get_cache_path(cache_dir: pathlib.Path, file_hash: str) -> pathlib.Path:
+def get_cache_path(cache_dir: pathlib.Path, file_hash: str) -> pathlib.Path:
     """Get cache path for a hash (XX/XXXX... structure)."""
+    if len(file_hash) < 3:
+        raise ValueError(f"Hash too short for cache path structure: {len(file_hash)} chars")
     return cache_dir / file_hash[:2] / file_hash[2:]
 
 
@@ -137,7 +145,7 @@ def _clear_path(path: pathlib.Path) -> None:
         path.unlink()
 
 
-def _copy_to_cache(src: pathlib.Path, cache_path: pathlib.Path) -> None:
+def copy_to_cache(src: pathlib.Path, cache_path: pathlib.Path) -> None:
     """Atomically copy file to cache with read-only permissions."""
     if cache_path.exists():
         return
@@ -202,9 +210,9 @@ def _save_file_to_cache(
 ) -> FileHash:
     """Save single file to cache."""
     file_hash = hash_file(path, state_db)
-    cache_path = _get_cache_path(cache_dir, file_hash)
+    cache_path = get_cache_path(cache_dir, file_hash)
 
-    _copy_to_cache(path, cache_path)
+    copy_to_cache(path, cache_path)
     _link_from_cache(path, cache_path, link_mode)
 
     return {"hash": file_hash}
@@ -221,11 +229,11 @@ def _save_directory_to_cache(
 
     for entry in manifest:
         file_path = path / entry["relpath"]
-        cache_path = _get_cache_path(cache_dir, entry["hash"])
-        _copy_to_cache(file_path, cache_path)
+        cache_path = get_cache_path(cache_dir, entry["hash"])
+        copy_to_cache(file_path, cache_path)
 
     if link_mode == LinkMode.SYMLINK:
-        cache_dir_path = _get_cache_path(cache_dir, tree_hash)
+        cache_dir_path = get_cache_path(cache_dir, tree_hash)
         if not cache_dir_path.exists():
             cache_dir_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copytree(path, cache_dir_path)
@@ -263,7 +271,7 @@ def _restore_file_from_cache(
     link_mode: LinkMode,
 ) -> bool:
     """Restore single file from cache."""
-    cache_path = _get_cache_path(cache_dir, output_hash["hash"])
+    cache_path = get_cache_path(cache_dir, output_hash["hash"])
     if not cache_path.exists():
         return False
 
@@ -279,7 +287,7 @@ def _restore_directory_from_cache(
     link_mode: LinkMode,
 ) -> bool:
     """Restore directory from cache."""
-    cache_dir_path = _get_cache_path(cache_dir, output_hash["hash"])
+    cache_dir_path = get_cache_path(cache_dir, output_hash["hash"])
 
     if link_mode == LinkMode.SYMLINK and cache_dir_path.exists():
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -292,7 +300,7 @@ def _restore_directory_from_cache(
     path.mkdir(parents=True, exist_ok=True)
     resolved_base = path.resolve()
     for entry in output_hash["manifest"]:
-        file_cache_path = _get_cache_path(cache_dir, entry["hash"])
+        file_cache_path = get_cache_path(cache_dir, entry["hash"])
         if not file_cache_path.exists():
             return False
         file_path = path / entry["relpath"]

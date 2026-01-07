@@ -143,3 +143,182 @@ def test_resolve_absolute_path_unchanged(tmp_path: Path, monkeypatch: pytest.Mon
         absolute_path = "/tmp/output.csv"
         resolved = project.resolve_path(absolute_path)
         assert resolved == Path(absolute_path).resolve()
+
+
+# --- Tests for normalize_path() ---
+
+
+def test_normalize_path_preserves_symlinks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Should preserve symlinks in path (not resolve to real path)."""
+    git_dir = tmp_path / ".git"
+    git_dir.mkdir()
+
+    # Create real directory and symlink to it
+    real_dir = tmp_path / "real_data"
+    real_dir.mkdir()
+    symlink_dir = tmp_path / "data"
+    symlink_dir.symlink_to(real_dir)
+
+    # Create file inside the real directory
+    data_file = real_dir / "input.csv"
+    data_file.write_text("test")
+
+    with contextlib.chdir(tmp_path):
+        monkeypatch.setattr(project, "_project_root_cache", None)
+
+        # normalize_path should preserve the symlink
+        normalized = project.normalize_path("data/input.csv")
+        assert normalized == tmp_path / "data" / "input.csv", "Should preserve symlink in path"
+
+        # resolve_path should follow the symlink
+        resolved = project.resolve_path("data/input.csv")
+        assert resolved == tmp_path / "real_data" / "input.csv", (
+            "resolve_path should follow symlink"
+        )
+
+
+def test_normalize_path_allows_outside_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Should allow paths outside project root (caller validates if needed)."""
+    git_dir = tmp_path / ".git"
+    git_dir.mkdir()
+
+    # Create symlink pointing outside project
+    outside_dir = tmp_path.parent / "outside_project"
+    outside_dir.mkdir(exist_ok=True)
+    symlink = tmp_path / "link_to_outside"
+    symlink.symlink_to(outside_dir)
+
+    with contextlib.chdir(tmp_path):
+        monkeypatch.setattr(project, "_project_root_cache", None)
+
+        # Should not raise - returns normalized path preserving symlink
+        normalized = project.normalize_path("link_to_outside/file.csv")
+        assert normalized == tmp_path / "link_to_outside" / "file.csv"
+
+
+def test_normalize_path_handles_absolute_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Should handle absolute paths correctly."""
+    git_dir = tmp_path / ".git"
+    git_dir.mkdir()
+
+    # Create symlink with absolute path
+    real_dir = tmp_path / "real_data"
+    real_dir.mkdir()
+    symlink_dir = tmp_path / "data"
+    symlink_dir.symlink_to(real_dir)
+
+    with contextlib.chdir(tmp_path):
+        monkeypatch.setattr(project, "_project_root_cache", None)
+
+        # Absolute path with symlink should be preserved
+        abs_path = str(tmp_path / "data" / "file.csv")
+        normalized = project.normalize_path(abs_path)
+        assert normalized == tmp_path / "data" / "file.csv"
+
+
+def test_normalize_path_from_subdirectory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Should resolve paths relative to project root, not cwd."""
+    git_dir = tmp_path / ".git"
+    git_dir.mkdir()
+
+    # Create symlink at project root
+    real_dir = tmp_path / "real_data"
+    real_dir.mkdir()
+    symlink_dir = tmp_path / "data"
+    symlink_dir.symlink_to(real_dir)
+
+    # Work from subdirectory
+    subdir = tmp_path / "src"
+    subdir.mkdir()
+
+    with contextlib.chdir(subdir):
+        monkeypatch.setattr(project, "_project_root_cache", None)
+
+        # Should resolve from project root (tmp_path), preserving symlink
+        normalized = project.normalize_path("data/file.csv")
+        assert normalized == tmp_path / "data" / "file.csv"
+
+
+# --- Tests for contains_symlink_in_path() ---
+
+
+def test_contains_symlink_detects_symlinked_directory(tmp_path: Path) -> None:
+    """Should detect when path goes through symlinked directory."""
+    # Create real directory and symlink to it
+    real_dir = tmp_path / "real_data"
+    real_dir.mkdir()
+    symlink_dir = tmp_path / "data"
+    symlink_dir.symlink_to(real_dir)
+
+    # Check file inside symlinked directory
+    file_path = symlink_dir / "file.csv"
+    assert project.contains_symlink_in_path(file_path, tmp_path), (
+        "Should detect symlinked directory"
+    )
+
+
+def test_contains_symlink_no_symlinks(tmp_path: Path) -> None:
+    """Should return False when path contains no symlinks."""
+    # Regular directory path
+    regular_dir = tmp_path / "data"
+    regular_dir.mkdir()
+    file_path = regular_dir / "file.csv"
+
+    assert not project.contains_symlink_in_path(file_path, tmp_path), (
+        "Should return False for regular paths"
+    )
+
+
+def test_contains_symlink_nested_symlinks(tmp_path: Path) -> None:
+    """Should detect symlinks in nested paths."""
+    # Create nested structure with symlink in middle
+    real_dir = tmp_path / "real_data"
+    real_dir.mkdir()
+    symlink_dir = tmp_path / "data"
+    symlink_dir.symlink_to(real_dir)
+
+    # Create subdirectory inside symlinked dir
+    subdir = real_dir / "subdir"
+    subdir.mkdir()
+
+    # Check file in nested structure
+    file_path = symlink_dir / "subdir" / "file.csv"
+    assert project.contains_symlink_in_path(file_path, tmp_path), (
+        "Should detect symlink in nested path"
+    )
+
+
+def test_contains_symlink_symlinked_file(tmp_path: Path) -> None:
+    """Should detect when the file itself is a symlink."""
+    # Create regular directory
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+
+    # Create real file and symlink to it
+    real_file = tmp_path / "real_file.csv"
+    real_file.write_text("test")
+    symlink_file = data_dir / "file.csv"
+    symlink_file.symlink_to(real_file)
+
+    assert project.contains_symlink_in_path(symlink_file, tmp_path), "Should detect symlinked file"
+
+
+def test_contains_symlink_stops_at_base(tmp_path: Path) -> None:
+    """Should stop checking at base directory, not check base itself."""
+    # Create symlink as base
+    real_dir = tmp_path / "real_base"
+    real_dir.mkdir()
+    symlink_base = tmp_path / "base"
+    symlink_base.symlink_to(real_dir)
+
+    # Create file inside real directory
+    file_path = real_dir / "file.csv"
+
+    # Should not check the base itself
+    assert not project.contains_symlink_in_path(file_path, symlink_base), (
+        "Should not check base directory for symlinks"
+    )
