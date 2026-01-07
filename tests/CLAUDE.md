@@ -10,10 +10,25 @@
 - No `@pytest.mark.skip` markers; if test isn't ready, don't write it yet.
 - File naming: `test_<module>.py`; function naming: `test_<behavior>`.
 
-## Imports
+## Imports (Critical)
 
 - Import modules not functions; use qualified names.
-- No imports inside test functions—import at module level.
+- **NEVER import inside test functions**—all imports must be at module level.
+
+```python
+# Bad - import inside test function
+def test_queue_writer_fileno():
+    import io  # WRONG - move to module level
+    with pytest.raises(io.UnsupportedOperation):
+        writer.fileno()
+
+# Good - import at module level
+import io  # At top of file with other imports
+
+def test_queue_writer_fileno():
+    with pytest.raises(io.UnsupportedOperation):
+        writer.fileno()
+```
 
 ## Test the Library, Not Duplicates (Critical)
 
