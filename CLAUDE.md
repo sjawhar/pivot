@@ -69,6 +69,8 @@ if __name__ == '__main__':
 
 ## TypedDict Usage (Critical)
 
+**Why TypedDict over dataclasses/namedtuples:** TypedDict has zero runtime overhead (it's just a `dict`), native JSON serialization without conversion, and no boundary translation needed when parsing config files or API responses. Dataclasses require `asdict()` for JSON; namedtuples serialize as arrays, not objects. For structured data that flows to/from JSON, TypedDict avoids conversion overhead entirely.
+
 **Never use `.get()` on TypedDicts.** TypedDicts have known keys at type-check time—use direct key access.
 TypedDicts with `total=False` or `NotRequired` fields may have optional fields, in which case you should
 use `if "key" in dict: ...` to check for the key and then use `dict["key"]` to access the value.
