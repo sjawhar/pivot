@@ -2,6 +2,8 @@ import pathlib
 import stat
 from typing import TYPE_CHECKING
 
+import pytest
+
 from pivot import cache, state
 
 if TYPE_CHECKING:
@@ -158,6 +160,53 @@ def test_hash_directory_marks_executable(tmp_path: pathlib.Path) -> None:
     manifest_dict = {e["relpath"]: e for e in manifest}
     assert "isexec" not in manifest_dict["regular.txt"]
     assert manifest_dict["script.sh"].get("isexec") is True
+
+
+def test_hash_directory_skips_unreadable_subdirs(tmp_path: pathlib.Path) -> None:
+    """Unreadable subdirectories are skipped rather than causing failure."""
+    test_dir = tmp_path / "mydir"
+    test_dir.mkdir()
+    (test_dir / "readable.txt").write_text("content")
+    unreadable = test_dir / "unreadable"
+    unreadable.mkdir()
+    (unreadable / "hidden.txt").write_text("hidden")
+    unreadable.chmod(0o000)
+
+    try:
+        _, manifest = cache.hash_directory(test_dir)
+        relpaths = [e["relpath"] for e in manifest]
+        assert "readable.txt" in relpaths
+        assert "unreadable/hidden.txt" not in relpaths
+    finally:
+        unreadable.chmod(0o755)
+
+
+def test_hash_directory_handles_deleted_file(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Files deleted between scan and hash are gracefully skipped."""
+    test_dir = tmp_path / "mydir"
+    test_dir.mkdir()
+    (test_dir / "keep.txt").write_text("keep")
+    to_delete = test_dir / "delete.txt"
+    to_delete.write_text("delete")
+
+    original_hash_file = cache.hash_file
+    call_count = 0
+
+    def hash_file_with_delete(path: pathlib.Path, state_db: state.StateDB | None = None) -> str:
+        nonlocal call_count
+        call_count += 1
+        if path.name == "delete.txt":
+            to_delete.unlink()
+            raise FileNotFoundError()
+        return original_hash_file(path, state_db)
+
+    monkeypatch.setattr(cache, "hash_file", hash_file_with_delete)
+
+    _, manifest = cache.hash_directory(test_dir)
+    assert len(manifest) == 1
+    assert manifest[0]["relpath"] == "keep.txt"
 
 
 # === Save to Cache Tests ===

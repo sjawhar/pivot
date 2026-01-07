@@ -17,7 +17,7 @@ from pivot import exceptions
 from pivot.types import DirHash, DirManifestEntry, FileHash, OutputHash
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Generator
 
     from pivot import state as state_mod
 
@@ -86,6 +86,25 @@ def hash_file(path: pathlib.Path, state_db: state_mod.StateDB | None = None) -> 
     return file_hash
 
 
+def _scandir_recursive(path: pathlib.Path) -> Generator[os.DirEntry[str]]:
+    """Yield all files recursively using os.scandir() for efficiency.
+
+    DirEntry objects cache stat results, avoiding redundant syscalls.
+    Symlinks are skipped to prevent loops.
+    """
+    try:
+        with os.scandir(path) as entries:
+            for entry in entries:
+                if entry.is_symlink():
+                    continue
+                if entry.is_file():
+                    yield entry
+                elif entry.is_dir():
+                    yield from _scandir_recursive(pathlib.Path(entry.path))
+    except PermissionError:
+        pass  # Skip unreadable directories rather than failing the entire walk
+
+
 def hash_directory(
     path: pathlib.Path, state_db: state_mod.StateDB | None = None
 ) -> tuple[str, list[DirManifestEntry]]:
@@ -102,24 +121,24 @@ def hash_directory(
     manifest = list[DirManifestEntry]()
     resolved_base = path.resolve()
 
-    for file_path in sorted(path.rglob("*")):
-        # Skip symlinks to prevent loops and ensure reproducibility
-        if file_path.is_symlink():
+    for entry in sorted(_scandir_recursive(path), key=lambda e: e.path):
+        file_path = pathlib.Path(entry.path)
+        # Verify file is still within the directory (paranoid check)
+        if not file_path.resolve().is_relative_to(resolved_base):
             continue
-        if file_path.is_file():
-            # Verify file is still within the directory (paranoid check)
-            if not file_path.resolve().is_relative_to(resolved_base):
-                continue
+        try:
             rel = file_path.relative_to(path)
-            file_stat = file_path.stat()
-            entry: DirManifestEntry = {
+            file_stat = entry.stat(follow_symlinks=True)
+            manifest_entry: DirManifestEntry = {
                 "relpath": str(rel),
                 "hash": hash_file(file_path, state_db),
                 "size": file_stat.st_size,
             }
             if file_stat.st_mode & stat.S_IXUSR:
-                entry["isexec"] = True
-            manifest.append(entry)
+                manifest_entry["isexec"] = True
+            manifest.append(manifest_entry)
+        except FileNotFoundError:
+            continue  # File deleted between scan and hash
 
     manifest_json = json.dumps(manifest, sort_keys=True, separators=(",", ":"))
     tree_hash = xxhash.xxh64(manifest_json.encode()).hexdigest()
