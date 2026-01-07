@@ -734,7 +734,7 @@ def test_hash_function_no_code_object():
 
     # Should fall back to identity hash
     assert isinstance(h, str)
-    assert len(h) == 16  # SHA256 truncated to 16 chars
+    assert len(h) == 16  # xxhash64 hexdigest
 
 
 def test_module_attr_with_attribute_error():

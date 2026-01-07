@@ -83,7 +83,7 @@ def process(file: str):
 - AST extraction for `module.attr` patterns (Google-style imports)
 - Recursive fingerprinting for transitive dependencies
 
-**Validated:** See `/experiments/test_getclosurevars_approach.py`
+**Validated:** See [docs/fingerprinting.md](docs/fingerprinting.md) and [tests/fingerprint/](tests/fingerprint/)
 
 ### 2. Per-Stage Lock Files
 
@@ -221,7 +221,7 @@ pip install pivot
 
 - **Core pipeline execution** - DAG construction, greedy parallel scheduling, per-stage lock files
 - **Automatic code change detection** - getclosurevars + AST fingerprinting, transitive dependencies
-- **Content-addressable cache** - xxhash64 hashing, hardlink/copy restoration
+- **Content-addressable cache** - xxhash64 hashing for files and code, hardlink/copy restoration
 - **Pydantic parameters** - Type-safe stage parameters with params.yaml overrides
 - **Watch mode** - File system monitoring with configurable globs and debounce
 - **Incremental outputs** - Restore-before-run for append-only workloads
@@ -328,8 +328,8 @@ Real-world DVC pipelines profiled to identify bottlenecks:
 
 ### Experimental Validation
 
-- **[getclosurevars approach](./experiments/test_getclosurevars_approach.py)** - Validates automatic code detection
-- **[Change detection tests](./experiments/test_change_detection.py)** - Edge cases and limitations
+- **[Fingerprinting research](./docs/fingerprinting.md)** - Why AST + getclosurevars was chosen
+- **[Change detection matrix](./tests/fingerprint/README.md)** - Comprehensive behavior catalog
 
 ### DVC Architecture Study
 

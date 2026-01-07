@@ -20,7 +20,7 @@ import pathlib
 import queue
 import threading
 import time
-from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast
+from typing import TYPE_CHECKING, Any, TypedDict, cast
 
 import loky
 import pydantic
@@ -54,7 +54,7 @@ _MAX_WORKERS_DEFAULT = 8
 class ExecutionSummary(TypedDict):
     """Summary result for a single stage after execution (returned by executor.run)."""
 
-    status: Literal[StageStatus.RAN, StageStatus.SKIPPED, StageStatus.FAILED, StageStatus.UNKNOWN]
+    status: StageStatus
     reason: str
 
 
@@ -306,10 +306,12 @@ def _execute_greedy(
     _warn_single_stage_mutex_groups(stage_states)
 
     executor = _create_executor(max_workers)
-    output_queue: mp.Queue[OutputMessage] = mp.Manager().Queue()  # pyright: ignore[reportAssignmentType]
 
+    # Only create output queue when display is enabled - avoids overhead and memory growth
+    output_queue: mp.Queue[OutputMessage] | None = None
     output_thread: threading.Thread | None = None
     if con:
+        output_queue = mp.Manager().Queue()  # pyright: ignore[reportAssignmentType]
         output_thread = threading.Thread(
             target=_output_queue_reader,
             args=(output_queue, con),
@@ -456,8 +458,9 @@ def _execute_greedy(
                     )
     finally:
         # Signal output thread to stop - may fail if queue is broken
-        with contextlib.suppress(OSError, ValueError):
-            output_queue.put(None)
+        if output_queue is not None:
+            with contextlib.suppress(OSError, ValueError):
+                output_queue.put(None)
         if output_thread:
             output_thread.join(timeout=1.0)
 
@@ -487,7 +490,7 @@ def _start_ready_stages(
     executor: concurrent.futures.Executor,
     futures: dict[concurrent.futures.Future[StageResult], str],
     cache_dir: pathlib.Path,
-    output_queue: mp.Queue[OutputMessage],
+    output_queue: mp.Queue[OutputMessage] | None,
     max_stages: int,
     mutex_counts: collections.defaultdict[str, int],
     error_mode: OnError,
@@ -625,7 +628,7 @@ def execute_stage_worker(
     stage_name: str,
     stage_info: WorkerStageInfo,
     cache_dir: pathlib.Path,
-    output_queue: mp.Queue[OutputMessage],
+    output_queue: mp.Queue[OutputMessage] | None,
 ) -> StageResult:
     """Worker function executed in separate process. Must be module-level for pickling."""
     output_lines: list[tuple[str, bool]] = []
@@ -792,14 +795,15 @@ def _save_outputs_to_cache(
 def _run_stage_function_with_capture(
     func: Callable[..., Any],
     stage_name: str,
-    output_queue: mp.Queue[OutputMessage],
+    output_queue: mp.Queue[OutputMessage] | None,
     output_lines: list[tuple[str, bool]],
     params_instance: BaseModel | None = None,
 ) -> None:
     """Run stage function with stdout/stderr capture, streaming to queue.
 
     Output is appended to the provided output_lines list, ensuring captured
-    output is preserved even if func() raises an exception.
+    output is preserved even if func() raises an exception. If output_queue
+    is None, output is still captured locally but not streamed.
     """
     with (
         _QueueWriter(stage_name, output_queue, is_stderr=False, output_lines=output_lines),
@@ -816,10 +820,11 @@ class _QueueWriter:
 
     Handles stream redirection, output capture, and automatic flushing.
     Implements minimal file-like interface needed by print() and common libraries.
+    If queue is None, output is still captured locally but not streamed.
     """
 
     _stage_name: str
-    _queue: mp.Queue[OutputMessage]
+    _queue: mp.Queue[OutputMessage] | None
     _is_stderr: bool
     _output_lines: list[tuple[str, bool]]
     _buffer: str
@@ -828,7 +833,7 @@ class _QueueWriter:
     def __init__(
         self,
         stage_name: str,
-        output_queue: mp.Queue[OutputMessage],
+        output_queue: mp.Queue[OutputMessage] | None,
         *,
         is_stderr: bool,
         output_lines: list[tuple[str, bool]],
@@ -862,8 +867,9 @@ class _QueueWriter:
         """Save line locally and send to queue for real-time display."""
         self._output_lines.append((line, self._is_stderr))
         # Queue failure only affects real-time display; output is already saved locally
-        with contextlib.suppress(queue.Full, ValueError, OSError):
-            self._queue.put((self._stage_name, line, self._is_stderr), block=False)
+        if self._queue is not None:
+            with contextlib.suppress(queue.Full, ValueError, OSError):
+                self._queue.put((self._stage_name, line, self._is_stderr), block=False)
 
     def write(self, s: str) -> int:
         self._buffer += s

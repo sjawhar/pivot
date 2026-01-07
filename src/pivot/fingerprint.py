@@ -12,7 +12,7 @@ Algorithm:
        - If simple constant → capture value
     4. Return manifest dictionary with all dependencies
 
-Validated: See experiments/test_getclosurevars_approach.py
+Validated: See docs/fingerprinting.md and tests/fingerprint/
 
 Example:
     >>> def helper(x):
@@ -30,13 +30,15 @@ Example:
 """
 
 import ast
-import hashlib
 import inspect
+import marshal
 import pathlib
 import sys
 import types
 from collections.abc import Callable
-from typing import Any
+from typing import Any, cast
+
+import xxhash
 
 from pivot import ast_utils
 
@@ -49,10 +51,11 @@ def get_stage_fingerprint(
     """Generate fingerprint manifest capturing all code dependencies.
 
     Returns dict with keys:
-    - 'self:<name>': Function itself
-    - 'func:<name>': Referenced helper functions (transitive)
-    - 'mod:<module>.<attr>': Module attributes ("callable" or value)
-    - 'const:<name>': Global constants
+    - 'self:<name>': Function itself (hash)
+    - 'func:<name>': Referenced helper functions (hash, transitive)
+    - 'class:<name>': Referenced class definitions (hash, transitive)
+    - 'mod:<module>.<attr>': Module attributes (hash for user code, "callable" for stdlib)
+    - 'const:<name>': Global constants (repr value)
     """
     if visited is None:
         visited = set()
@@ -76,21 +79,45 @@ def get_stage_fingerprint(
         return manifest
 
     for name, value in closure_vars.globals.items():
-        if name.startswith("_"):
+        if name.startswith("__"):
             continue
 
         if callable(value) and is_user_code(value):
             _process_callable_dependency(name, value, manifest, visited)
         elif isinstance(value, types.ModuleType):
-            _process_module_dependency(name, value, func, manifest)
+            _process_module_dependency(name, value, func, manifest, visited)
         elif isinstance(value, (bool, int, float, str, bytes, type(None))):
             manifest[f"const:{name}"] = repr(value)
+        elif isinstance(value, (dict, list, tuple, set, frozenset)):
+            _process_collection_dependency(
+                name,
+                cast(
+                    "dict[Any, Any] | list[Any] | tuple[Any, ...] | set[Any] | frozenset[Any]",
+                    value,
+                ),
+                manifest,
+                visited,
+            )
+        elif _is_user_class_instance(value):
+            _process_instance_dependency(name, value, manifest, visited)
 
     for name, value in closure_vars.nonlocals.items():
         if callable(value) and is_user_code(value):
             _process_callable_dependency(name, value, manifest, visited)
         elif isinstance(value, (bool, int, float, str, bytes, type(None))):
             manifest[f"const:{name}"] = repr(value)
+        elif isinstance(value, (dict, list, tuple, set, frozenset)):
+            _process_collection_dependency(
+                name,
+                cast(
+                    "dict[Any, Any] | list[Any] | tuple[Any, ...] | set[Any] | frozenset[Any]",
+                    value,
+                ),
+                manifest,
+                visited,
+            )
+        elif _is_user_class_instance(value):
+            _process_instance_dependency(name, value, manifest, visited)
 
     return manifest
 
@@ -99,15 +126,75 @@ def _process_callable_dependency(
     name: str, func: Callable[..., Any], manifest: dict[str, str], visited: set[int]
 ) -> None:
     """Process a callable dependency and add to manifest."""
-    manifest[f"func:{name}"] = hash_function_ast(func)
-    child_manifest = get_stage_fingerprint(func, visited)
-    for key, val in child_manifest.items():
-        if not key.startswith("self:"):
-            manifest[key] = val
+    # Use 'class:' prefix for type objects, 'func:' for functions
+    prefix = "class" if isinstance(func, type) else "func"
+    _add_callable_to_manifest(f"{prefix}:{name}", func, manifest, visited)
+
+
+def _is_user_class_instance(value: Any) -> bool:
+    """Check if value is an instance of a user-defined class."""
+    cls = cast("type[Any]", type(value))
+    # Skip built-in types and common stdlib types
+    if cls.__module__ == "builtins":
+        return False
+    return is_user_code(cls)
+
+
+def _process_instance_dependency(
+    name: str, instance: Any, manifest: dict[str, str], visited: set[int]
+) -> None:
+    """Track the class definition of a user-defined instance."""
+    cls = cast("type[Any]", type(instance))
+    _add_callable_to_manifest(f"class:{name}.__class__", cls, manifest, visited)
+
+
+def _process_collection_dependency(
+    name: str,
+    collection: dict[Any, Any] | list[Any] | tuple[Any, ...] | set[Any] | frozenset[Any],
+    manifest: dict[str, str],
+    visited: set[int],
+) -> None:
+    """Scan collection for callable user code and add to manifest."""
+    if isinstance(collection, dict):
+        # Use sorted keys for deterministic ordering
+        for key in sorted(collection.keys(), key=_sort_key):
+            value = collection[key]
+            if callable(value) and is_user_code(value):
+                _add_callable_to_manifest(f"func:{name}[{key!r}]", value, manifest, visited)
+    else:
+        # For sequences and sets, use enumerate for index-based keys
+        # Sort sets for deterministic ordering
+        items = (
+            sorted(collection, key=_sort_key)
+            if isinstance(collection, (set, frozenset))
+            else collection
+        )
+        for i, value in enumerate(items):
+            if callable(value) and is_user_code(value):
+                _add_callable_to_manifest(f"func:{name}[{i}]", value, manifest, visited)
+
+
+def _sort_key(value: Any) -> tuple[str, str]:
+    """Sort key that handles mixed types safely."""
+    return (type(value).__name__, str(value))
+
+
+def _add_callable_to_manifest(
+    key: str, func: Callable[..., Any], manifest: dict[str, str], visited: set[int]
+) -> None:
+    """Hash callable and merge its transitive dependencies into manifest."""
+    manifest[key] = hash_function_ast(func)
+    for child_key, child_val in get_stage_fingerprint(func, visited).items():
+        if not child_key.startswith("self:"):
+            manifest[child_key] = child_val
 
 
 def _process_module_dependency(
-    name: str, module: types.ModuleType, func: Callable[..., Any], manifest: dict[str, str]
+    name: str,
+    module: types.ModuleType,
+    func: Callable[..., Any],
+    manifest: dict[str, str],
+    visited: set[int],
 ) -> None:
     """Process module attribute dependencies and add to manifest."""
     attrs = ast_utils.extract_module_attr_usage(func)
@@ -122,11 +209,14 @@ def _process_module_dependency(
         try:
             attr_value = getattr(module, attr_name)
         except AttributeError:
-            manifest_value = "unknown"
+            manifest[key] = "unknown"
         else:
-            manifest_value = "callable" if callable(attr_value) else repr(attr_value)
-
-        manifest[key] = manifest_value
+            if callable(attr_value) and is_user_code(attr_value):
+                _add_callable_to_manifest(key, attr_value, manifest, visited)
+            elif callable(attr_value):
+                manifest[key] = "callable"
+            else:
+                manifest[key] = repr(attr_value)
 
 
 def hash_function_ast(func: Callable[..., Any]) -> str:
@@ -141,20 +231,21 @@ def hash_function_ast(func: Callable[..., Any]) -> str:
         source = inspect.getsource(func)
     except (OSError, TypeError):
         if hasattr(func, "__code__"):
-            return hashlib.sha256(func.__code__.co_code).hexdigest()[:16]
+            # marshal.dumps captures full code object including co_consts
+            # (co_code alone doesn't include constants - x+1 and x+999 have same co_code!)
+            return xxhash.xxh64(marshal.dumps(func.__code__)).hexdigest()
         # KNOWN ISSUE: Using id(func) is non-deterministic across runs
         # This affects lambdas without source code, causing unnecessary re-runs
-        # TODO: Consider using co_firstlineno + co_lnotab for better stability
-        return hashlib.sha256(str(id(func)).encode()).hexdigest()[:16]
+        return xxhash.xxh64(str(id(func)).encode()).hexdigest()
 
     try:
         tree = ast.parse(source)
     except SyntaxError:
-        return hashlib.sha256(source.encode()).hexdigest()[:16]
+        return xxhash.xxh64(source.encode()).hexdigest()
 
     tree = _normalize_ast(tree)
     ast_str = ast.dump(tree, annotate_fields=True, include_attributes=False)
-    return hashlib.sha256(ast_str.encode()).hexdigest()[:16]
+    return xxhash.xxh64(ast_str.encode()).hexdigest()
 
 
 def _normalize_ast(node: ast.AST) -> ast.AST:

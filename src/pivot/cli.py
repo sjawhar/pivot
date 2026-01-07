@@ -551,6 +551,7 @@ def _print_results(results: dict[str, ExecutionSummary]) -> None:
     """Print execution results in a readable format."""
     ran = 0
     skipped = 0
+    failed = 0
 
     for name, result in results.items():
         result_status = result["status"]
@@ -559,11 +560,20 @@ def _print_results(results: dict[str, ExecutionSummary]) -> None:
         if result_status == StageStatus.RAN:
             ran += 1
             click.echo(f"{name}: ran ({reason})")
+        elif result_status == StageStatus.FAILED:
+            failed += 1
+            click.echo(f"{name}: failed ({reason})")
         else:
             skipped += 1
-            click.echo(f"{name}: skipped")
+            if reason:
+                click.echo(f"{name}: skipped ({reason})")
+            else:
+                click.echo(f"{name}: skipped")
 
-    click.echo(f"\nTotal: {ran} ran, {skipped} skipped")
+    parts = [f"{ran} ran", f"{skipped} skipped"]
+    if failed > 0:
+        parts.append(f"{failed} failed")
+    click.echo(f"\nTotal: {', '.join(parts)}")
 
 
 def _setup_logging(verbose: bool) -> None:
