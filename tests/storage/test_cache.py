@@ -3,6 +3,7 @@ import stat
 from typing import TYPE_CHECKING
 
 import pytest
+import xxhash
 
 from pivot import cache, state
 
@@ -57,6 +58,28 @@ def test_hash_file_binary(tmp_path: pathlib.Path) -> None:
     file_hash = cache.hash_file(test_file)
 
     assert len(file_hash) == 16
+
+
+def test_hash_file_large_uses_mmap(tmp_path: pathlib.Path) -> None:
+    """hash_file uses mmap for files >= MMAP_THRESHOLD."""
+    large_file = tmp_path / "large.bin"
+    large_file.write_bytes(b"x" * cache.MMAP_THRESHOLD)
+
+    file_hash = cache.hash_file(large_file)
+
+    assert len(file_hash) == 16
+
+
+def test_hash_file_mmap_same_hash_as_buffered(tmp_path: pathlib.Path) -> None:
+    """mmap and buffered produce identical hashes for same content."""
+    content = b"test content for hashing"
+    test_file = tmp_path / "test.bin"
+    test_file.write_bytes(content)
+
+    file_hash = cache.hash_file(test_file)
+    expected = xxhash.xxh64(content).hexdigest()
+
+    assert file_hash == expected, "hash_file should match direct xxhash"
 
 
 # === Hash Directory Tests ===
