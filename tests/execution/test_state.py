@@ -2,6 +2,8 @@ import os
 import pathlib
 import time
 
+import pytest
+
 from pivot import state
 
 
@@ -151,7 +153,9 @@ def test_state_db_creates_parent_dirs(tmp_path: pathlib.Path) -> None:
     with state.StateDB(db_path) as db:
         db.save(test_file, file_stat, "hash")
 
-    assert db_path.exists()
+    # LMDB creates a directory (state.lmdb/) not a file (state.db)
+    lmdb_path = db_path.parent / "state.lmdb"
+    assert lmdb_path.is_dir()
 
 
 def test_state_close(tmp_path: pathlib.Path) -> None:
@@ -252,3 +256,52 @@ def test_state_get_many_empty(tmp_path: pathlib.Path) -> None:
         results = db.get_many([])
 
     assert results == {}
+
+
+def test_state_path_too_long_error(tmp_path: pathlib.Path) -> None:
+    """PathTooLongError raised for paths exceeding LMDB key limit."""
+    db_path = tmp_path / "state.db"
+    # Create a deeply nested path that exceeds 511 bytes when encoded
+    # Each segment is 50 chars, need ~10 segments to exceed limit
+    nested = tmp_path
+    for i in range(12):
+        nested = nested / ("d" * 50 + str(i))
+    nested.mkdir(parents=True)
+    long_path = nested / "file.txt"
+    long_path.write_text("content")
+    file_stat = long_path.stat()
+
+    with state.StateDB(db_path) as db, pytest.raises(state.PathTooLongError) as exc_info:
+        db.save(long_path, file_stat, "hash123")
+
+    assert "Path too long" in str(exc_info.value)
+    assert "511" in str(exc_info.value)
+
+
+def test_state_path_too_long_error_save_many(tmp_path: pathlib.Path) -> None:
+    """PathTooLongError raised in save_many for paths exceeding limit."""
+    db_path = tmp_path / "state.db"
+    nested = tmp_path
+    for i in range(12):
+        nested = nested / ("e" * 50 + str(i))
+    nested.mkdir(parents=True)
+    long_path = nested / "file.txt"
+    long_path.write_text("content")
+    file_stat = long_path.stat()
+
+    with state.StateDB(db_path) as db, pytest.raises(state.PathTooLongError):
+        db.save_many([(long_path, file_stat, "hash123")])
+
+
+def test_state_raises_after_close(tmp_path: pathlib.Path) -> None:
+    """Operations on closed StateDB raise RuntimeError."""
+    db_path = tmp_path / "state.db"
+    test_file = tmp_path / "file.txt"
+    test_file.write_text("content")
+    file_stat = test_file.stat()
+
+    db = state.StateDB(db_path)
+    db.close()
+
+    with pytest.raises(RuntimeError, match="closed StateDB"):
+        db.get(test_file, file_stat)
