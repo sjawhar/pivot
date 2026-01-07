@@ -20,31 +20,18 @@ import pathlib
 import queue
 import threading
 import time
-from typing import TYPE_CHECKING, Any, TypedDict, cast
+from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast
 
 import loky
 import pydantic
 
 from pivot import cache, console, dag, exceptions, lock, outputs, parameters, project, pvt, registry
 from pivot import state as state_mod
-from pivot.types import (
-    HashInfo,
-    LockData,
-    OnError,
-    OutputHash,
-    OutputMessage,
-    StageDisplayStatus,
-    StageResult,
-    StageStatus,
-)
+from pivot.executor import worker
+from pivot.types import OnError, OutputMessage, StageDisplayStatus, StageResult, StageStatus
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Generator, Sequence
-    from inspect import Signature
-    from types import TracebackType
-
     from networkx import DiGraph
-    from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
 
@@ -54,21 +41,8 @@ _MAX_WORKERS_DEFAULT = 8
 class ExecutionSummary(TypedDict):
     """Summary result for a single stage after execution (returned by executor.run)."""
 
-    status: StageStatus
+    status: Literal[StageStatus.RAN, StageStatus.SKIPPED, StageStatus.FAILED, StageStatus.UNKNOWN]
     reason: str
-
-
-class WorkerStageInfo(TypedDict):
-    """Stage info subset passed to worker processes."""
-
-    func: Callable[..., Any]
-    fingerprint: dict[str, str]
-    deps: list[str]
-    outs: list[outputs.BaseOut]
-    signature: Signature | None
-    params: BaseModel | None
-    variant: str | None
-    overrides: parameters.ParamsOverrides
 
 
 class ChangeCheckResult(TypedDict):
@@ -206,6 +180,35 @@ def run(
     return results
 
 
+def _initialize_stage_states(
+    execution_order: list[str],
+    graph: DiGraph[str],
+) -> dict[str, StageState]:
+    """Initialize state tracking for all stages."""
+    stages_set = set(execution_order)
+    states = dict[str, StageState]()
+
+    for stage_name in execution_order:
+        stage_info = registry.REGISTRY.get(stage_name)
+
+        upstream = list(graph.successors(stage_name))
+        upstream_in_plan = [u for u in upstream if u in stages_set]
+
+        downstream = list(graph.predecessors(stage_name))
+        downstream_in_plan = [d for d in downstream if d in stages_set]
+
+        states[stage_name] = StageState(
+            name=stage_name,
+            info=stage_info,
+            upstream=upstream_in_plan,
+            upstream_unfinished=set(upstream_in_plan),
+            downstream=downstream_in_plan,
+            mutex=stage_info["mutex"],
+        )
+
+    return states
+
+
 def _verify_tracked_files(project_root: pathlib.Path) -> None:
     """Verify all .pvt tracked files exist and warn on hash mismatches."""
     tracked_files = pvt.discover_pvt_files(project_root)
@@ -239,35 +242,6 @@ def _verify_tracked_files(project_root: pathlib.Path) -> None:
             f"The following tracked files are missing:\n{missing_list}\n\n"
             + "Run 'pivot checkout' to restore them from cache."
         )
-
-
-def _initialize_stage_states(
-    execution_order: list[str],
-    graph: DiGraph[str],
-) -> dict[str, StageState]:
-    """Initialize state tracking for all stages."""
-    stages_set = set(execution_order)
-    states = dict[str, StageState]()
-
-    for stage_name in execution_order:
-        stage_info = registry.REGISTRY.get(stage_name)
-
-        upstream = list(graph.successors(stage_name))
-        upstream_in_plan = [u for u in upstream if u in stages_set]
-
-        downstream = list(graph.predecessors(stage_name))
-        downstream_in_plan = [d for d in downstream if d in stages_set]
-
-        states[stage_name] = StageState(
-            name=stage_name,
-            info=stage_info,
-            upstream=upstream_in_plan,
-            upstream_unfinished=set(upstream_in_plan),
-            downstream=downstream_in_plan,
-            mutex=stage_info["mutex"],
-        )
-
-    return states
 
 
 def _warn_single_stage_mutex_groups(stage_states: dict[str, StageState]) -> None:
@@ -306,12 +280,11 @@ def _execute_greedy(
     _warn_single_stage_mutex_groups(stage_states)
 
     executor = _create_executor(max_workers)
+    # Manager().Queue() returns AutoProxy[Queue] which is incompatible with Queue type stubs
+    output_queue: mp.Queue[OutputMessage] = mp.Manager().Queue()  # pyright: ignore[reportAssignmentType]
 
-    # Only create output queue when display is enabled - avoids overhead and memory growth
-    output_queue: mp.Queue[OutputMessage] | None = None
     output_thread: threading.Thread | None = None
     if con:
-        output_queue = mp.Manager().Queue()  # pyright: ignore[reportAssignmentType]
         output_thread = threading.Thread(
             target=_output_queue_reader,
             args=(output_queue, con),
@@ -387,10 +360,10 @@ def _execute_greedy(
                         state.result = result
                         state.end_time = time.perf_counter()
 
-                        if result["status"] == StageStatus.FAILED:
+                        if result["status"] == "failed":
                             state.status = StageStatus.FAILED
                             _handle_stage_failure(stage_name, stage_states, error_mode)
-                        elif result["status"] == StageStatus.SKIPPED:
+                        elif result["status"] == "skipped":
                             state.status = StageStatus.SKIPPED
                         else:
                             state.status = StageStatus.COMPLETED
@@ -458,9 +431,8 @@ def _execute_greedy(
                     )
     finally:
         # Signal output thread to stop - may fail if queue is broken
-        if output_queue is not None:
-            with contextlib.suppress(OSError, ValueError):
-                output_queue.put(None)
+        with contextlib.suppress(OSError, ValueError):
+            output_queue.put(None)
         if output_thread:
             output_thread.join(timeout=1.0)
 
@@ -490,7 +462,7 @@ def _start_ready_stages(
     executor: concurrent.futures.Executor,
     futures: dict[concurrent.futures.Future[StageResult], str],
     cache_dir: pathlib.Path,
-    output_queue: mp.Queue[OutputMessage] | None,
+    output_queue: mp.Queue[OutputMessage],
     max_stages: int,
     mutex_counts: collections.defaultdict[str, int],
     error_mode: OnError,
@@ -528,7 +500,7 @@ def _start_ready_stages(
 
         try:
             future = executor.submit(
-                execute_stage_worker,
+                worker.execute_stage,
                 stage_name,
                 worker_info,
                 cache_dir,
@@ -558,9 +530,9 @@ def _start_ready_stages(
 def _prepare_worker_info(
     stage_info: registry.RegistryStageInfo,
     overrides: parameters.ParamsOverrides,
-) -> WorkerStageInfo:
+) -> worker.WorkerStageInfo:
     """Prepare stage info for pickling to worker process."""
-    return WorkerStageInfo(
+    return worker.WorkerStageInfo(
         func=stage_info["func"],
         fingerprint=stage_info["fingerprint"],
         deps=stage_info["deps"],
@@ -624,270 +596,6 @@ def _handle_stage_failure(
             )
 
 
-def execute_stage_worker(
-    stage_name: str,
-    stage_info: WorkerStageInfo,
-    cache_dir: pathlib.Path,
-    output_queue: mp.Queue[OutputMessage] | None,
-) -> StageResult:
-    """Worker function executed in separate process. Must be module-level for pickling."""
-    output_lines: list[tuple[str, bool]] = []
-    files_cache_dir = cache_dir / "files"
-
-    stage_lock = lock.StageLock(stage_name, cache_dir)
-    current_fingerprint = stage_info["fingerprint"]
-    dep_hashes, missing = hash_dependencies(stage_info["deps"])
-    stage_outs = stage_info["outs"]
-
-    # Apply YAML overrides BEFORE change detection so params.yaml changes trigger re-runs
-    params_instance = stage_info["params"]
-    overrides = stage_info["overrides"]
-    try:
-        current_params = parameters.get_effective_params(params_instance, stage_name, overrides)
-        if params_instance is not None:
-            params_instance = parameters.apply_overrides(params_instance, stage_name, overrides)
-    except pydantic.ValidationError as e:
-        return StageResult(
-            status=StageStatus.FAILED,
-            reason=f"Invalid params override in params.yaml: {e.error_count()} validation error(s)",
-            output_lines=[],
-        )
-
-    if missing:
-        return StageResult(
-            status=StageStatus.FAILED,
-            reason=f"missing deps: {', '.join(missing)}",
-            output_lines=[],
-        )
-
-    changed, reason = stage_lock.is_changed(current_fingerprint, current_params, dep_hashes)
-
-    lock_data_prev = stage_lock.read()
-    if lock_data_prev is not None and "output_hashes" not in lock_data_prev:
-        changed, reason = True, "outputs not cached"
-
-    if not changed:
-        restored_all = _restore_outputs_from_cache(stage_outs, lock_data_prev, files_cache_dir)
-        if not restored_all:
-            changed, reason = True, "outputs missing from cache"
-
-    if not changed:
-        return StageResult(status=StageStatus.SKIPPED, reason="unchanged", output_lines=[])
-
-    try:
-        with _execution_lock(stage_name, cache_dir):
-            _prepare_outputs_for_execution(stage_outs, lock_data_prev, files_cache_dir)
-
-            _run_stage_function_with_capture(
-                stage_info["func"],
-                stage_name,
-                output_queue,
-                output_lines,
-                params_instance,
-            )
-
-            output_hashes = _save_outputs_to_cache(stage_outs, files_cache_dir)
-
-            lock_data: LockData = {
-                "code_manifest": current_fingerprint,
-                "params": current_params,
-                "dep_hashes": dict(sorted(dep_hashes.items())),
-                "output_hashes": dict(sorted(output_hashes.items())),
-            }
-            stage_lock.write(lock_data)
-
-        return StageResult(status=StageStatus.RAN, reason=reason, output_lines=output_lines)
-
-    except exceptions.StageAlreadyRunningError as e:
-        return StageResult(status=StageStatus.FAILED, reason=str(e), output_lines=output_lines)
-    except exceptions.OutputMissingError as e:
-        return StageResult(status=StageStatus.FAILED, reason=str(e), output_lines=output_lines)
-    except SystemExit as e:
-        return StageResult(
-            status=StageStatus.FAILED,
-            reason=f"Stage called sys.exit({e.code})",
-            output_lines=output_lines,
-        )
-    except KeyboardInterrupt:
-        return StageResult(
-            status=StageStatus.FAILED, reason="KeyboardInterrupt", output_lines=output_lines
-        )
-    except Exception as e:
-        return StageResult(status=StageStatus.FAILED, reason=str(e), output_lines=output_lines)
-
-
-def _restore_outputs_from_cache(
-    stage_outs: list[outputs.BaseOut],
-    lock_data: LockData | None,
-    files_cache_dir: pathlib.Path,
-) -> bool:
-    """Restore missing outputs from cache. Returns True if all restored successfully."""
-    if lock_data is None:
-        return False
-
-    output_hashes = lock_data.get("output_hashes", {})
-    for out in stage_outs:
-        path = pathlib.Path(out.path)
-        if path.exists():
-            continue
-
-        output_hash = output_hashes.get(out.path)
-        if output_hash is None:
-            if out.cache:
-                return False
-            continue
-
-        if not cache.restore_from_cache(path, output_hash, files_cache_dir):
-            return False
-
-    return True
-
-
-def _prepare_outputs_for_execution(
-    stage_outs: Sequence[outputs.BaseOut],
-    lock_data: LockData | None,
-    files_cache_dir: pathlib.Path,
-) -> None:
-    """Prepare outputs before stage execution - delete or restore for incremental."""
-    output_hashes = lock_data.get("output_hashes", {}) if lock_data else {}
-
-    for out in stage_outs:
-        path = pathlib.Path(out.path)
-
-        if isinstance(out, outputs.IncrementalOut):
-            # IncrementalOut: restore from cache as writable copy
-            cache.remove_output(path)  # Clear any stale state first
-            out_hash = output_hashes.get(out.path)
-            if out_hash:
-                # COPY mode makes file writable (not symlink to read-only cache)
-                restored = cache.restore_from_cache(
-                    path, out_hash, files_cache_dir, cache.LinkMode.COPY
-                )
-                if not restored:
-                    raise exceptions.CacheRestoreError(
-                        f"Failed to restore IncrementalOut '{out.path}' from cache"
-                    )
-        else:
-            # Regular output: delete before run
-            cache.remove_output(path)
-
-
-def _save_outputs_to_cache(
-    stage_outs: list[outputs.BaseOut],
-    files_cache_dir: pathlib.Path,
-) -> dict[str, OutputHash]:
-    """Save outputs to cache after successful execution."""
-    output_hashes = dict[str, OutputHash]()
-
-    for out in stage_outs:
-        path = pathlib.Path(out.path)
-        if not path.exists():
-            raise exceptions.OutputMissingError(f"Stage did not produce output: {out.path}")
-
-        if out.cache:
-            output_hashes[out.path] = cache.save_to_cache(path, files_cache_dir)
-        else:
-            output_hashes[out.path] = None
-
-    return output_hashes
-
-
-def _run_stage_function_with_capture(
-    func: Callable[..., Any],
-    stage_name: str,
-    output_queue: mp.Queue[OutputMessage] | None,
-    output_lines: list[tuple[str, bool]],
-    params_instance: BaseModel | None = None,
-) -> None:
-    """Run stage function with stdout/stderr capture, streaming to queue.
-
-    Output is appended to the provided output_lines list, ensuring captured
-    output is preserved even if func() raises an exception. If output_queue
-    is None, output is still captured locally but not streamed.
-    """
-    with (
-        _QueueWriter(stage_name, output_queue, is_stderr=False, output_lines=output_lines),
-        _QueueWriter(stage_name, output_queue, is_stderr=True, output_lines=output_lines),
-    ):
-        kwargs = dict[str, Any]()
-        if params_instance is not None:
-            kwargs["params"] = params_instance
-        func(**kwargs)
-
-
-class _QueueWriter:
-    """Context manager for capturing stdout/stderr to a queue.
-
-    Handles stream redirection, output capture, and automatic flushing.
-    Implements minimal file-like interface needed by print() and common libraries.
-    If queue is None, output is still captured locally but not streamed.
-    """
-
-    _stage_name: str
-    _queue: mp.Queue[OutputMessage] | None
-    _is_stderr: bool
-    _output_lines: list[tuple[str, bool]]
-    _buffer: str
-    _redirect: contextlib.AbstractContextManager[None]
-
-    def __init__(
-        self,
-        stage_name: str,
-        output_queue: mp.Queue[OutputMessage] | None,
-        *,
-        is_stderr: bool,
-        output_lines: list[tuple[str, bool]],
-    ) -> None:
-        self._stage_name = stage_name
-        self._queue = output_queue
-        self._is_stderr = is_stderr
-        self._output_lines = output_lines
-        self._buffer = ""
-        # Create redirect context manager (not yet entered)
-        # _QueueWriter implements write/flush but not full IO[str] interface
-        if is_stderr:
-            self._redirect = contextlib.redirect_stderr(self)  # pyright: ignore[reportArgumentType]
-        else:
-            self._redirect = contextlib.redirect_stdout(self)  # pyright: ignore[reportArgumentType]
-
-    def __enter__(self) -> _QueueWriter:
-        self._redirect.__enter__()
-        return self
-
-    def __exit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc_val: BaseException | None,
-        exc_tb: TracebackType | None,
-    ) -> None:
-        self._redirect.__exit__(exc_type, exc_val, exc_tb)
-        self.flush()
-
-    def _send_line(self, line: str) -> None:
-        """Save line locally and send to queue for real-time display."""
-        self._output_lines.append((line, self._is_stderr))
-        # Queue failure only affects real-time display; output is already saved locally
-        if self._queue is not None:
-            with contextlib.suppress(queue.Full, ValueError, OSError):
-                self._queue.put((self._stage_name, line, self._is_stderr), block=False)
-
-    def write(self, s: str) -> int:
-        self._buffer += s
-        while "\n" in self._buffer:
-            line, self._buffer = self._buffer.split("\n", 1)
-            if line:
-                self._send_line(line)
-        return len(s)
-
-    def flush(self) -> None:
-        if self._buffer:
-            self._send_line(self._buffer)
-            self._buffer = ""
-
-    def isatty(self) -> bool:
-        return False
-
-
 def _build_results(stage_states: dict[str, StageState]) -> dict[str, ExecutionSummary]:
     """Build results dict from stage states."""
     results = dict[str, ExecutionSummary]()
@@ -933,41 +641,11 @@ def _check_uncached_incremental_outputs(
     return uncached
 
 
-def hash_dependencies(deps: list[str]) -> tuple[dict[str, HashInfo], list[str]]:
-    """Hash all dependency files and directories. Returns (hashes, missing_files).
-
-    For directories, includes full manifest with file hashes/sizes for provenance.
-    Paths are normalized (symlinks preserved) for portability in lock files.
-    """
-    hashes = dict[str, HashInfo]()
-    missing = list[str]()
-    for dep in deps:
-        # Use normalized path (preserve symlinks) as key for portability
-        normalized = str(project.normalize_path(dep))
-
-        # Resolve for actual file operations (hashing, existence check)
-        path = pathlib.Path(dep)
-        try:
-            if path.is_dir():
-                tree_hash, manifest = cache.hash_directory(path)
-                hashes[normalized] = {"hash": tree_hash, "manifest": manifest}
-            else:
-                hashes[normalized] = {"hash": hash_file(path)}
-        except FileNotFoundError:
-            missing.append(dep)
-    return hashes, missing
-
-
-def hash_file(path: pathlib.Path) -> str:
-    """Hash file contents using xxhash64."""
-    return cache.hash_file(path)
-
-
 def check_stage_changed(
     stage_name: str,
     fingerprint: dict[str, str],
     deps: list[str],
-    params_instance: BaseModel | None,
+    params_instance: pydantic.BaseModel | None,
     overrides: parameters.ParamsOverrides | None,
     cache_dir: pathlib.Path,
 ) -> ChangeCheckResult:
@@ -977,7 +655,7 @@ def check_stage_changed(
     Does NOT check output cache restoration - that's executor-specific.
     """
     stage_lock = lock.StageLock(stage_name, cache_dir)
-    dep_hashes, missing_deps = hash_dependencies(deps)
+    dep_hashes, missing_deps = worker.hash_dependencies(deps)
 
     try:
         current_params = parameters.get_effective_params(params_instance, stage_name, overrides)
@@ -1004,61 +682,3 @@ def check_stage_changed(
         missing_deps=[],
         current_params=current_params,
     )
-
-
-_MAX_LOCK_ATTEMPTS = 3
-
-
-@contextlib.contextmanager
-def _execution_lock(stage_name: str, cache_dir: pathlib.Path) -> Generator[pathlib.Path]:
-    """Context manager for stage execution lock."""
-    sentinel = _acquire_execution_lock(stage_name, cache_dir)
-    try:
-        yield sentinel
-    finally:
-        sentinel.unlink(missing_ok=True)
-
-
-def _acquire_execution_lock(stage_name: str, cache_dir: pathlib.Path) -> pathlib.Path:
-    """Acquire exclusive lock for stage execution. Returns sentinel path."""
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    sentinel = cache_dir / f"{stage_name}.running"
-
-    for _ in range(_MAX_LOCK_ATTEMPTS):
-        try:
-            fd = os.open(sentinel, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.write(fd, f"pid: {os.getpid()}\n".encode())
-            os.close(fd)
-            return sentinel
-        except FileExistsError:
-            pass
-
-        try:
-            content = sentinel.read_text()
-            pid = int(content.split(":")[1].strip())
-        except (ValueError, IndexError, OSError):
-            pid = None
-
-        if pid is not None and pid > 0 and _is_process_alive(pid):
-            raise exceptions.StageAlreadyRunningError(
-                f"Stage '{stage_name}' is already running (PID {pid})"
-            )
-
-        sentinel.unlink(missing_ok=True)
-        if pid is not None:
-            logger.warning(f"Removed stale lock file: {sentinel} (was PID {pid})")
-
-    raise exceptions.StageAlreadyRunningError(
-        f"Failed to acquire lock for '{stage_name}' after {_MAX_LOCK_ATTEMPTS} attempts"
-    )
-
-
-def _is_process_alive(pid: int) -> bool:
-    """Check if process is still running."""
-    try:
-        os.kill(pid, 0)
-        return True
-    except PermissionError:
-        return True
-    except ProcessLookupError:
-        return False

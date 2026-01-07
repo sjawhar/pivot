@@ -9,6 +9,7 @@ import pathlib
 
 import pytest
 
+from pivot import executor, project
 from pivot.registry import REGISTRY, stage
 
 
@@ -25,8 +26,6 @@ def pipeline_dir(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> pat
     """Set up a temporary pipeline directory."""
     (tmp_path / ".pivot").mkdir()
     monkeypatch.chdir(tmp_path)
-
-    from pivot import project
 
     project._project_root_cache = None
 
@@ -70,8 +69,6 @@ def test_linear_dag_three_stages(pipeline_dir: pathlib.Path) -> None:
         data = pathlib.Path("b.txt").read_text()
         assert data == "START->A->B", f"Expected 'START->A->B', got '{data}'"
         pathlib.Path("c.txt").write_text(f"{data}->C")
-
-    from pivot import executor
 
     results = executor.run()
 
@@ -132,8 +129,6 @@ def test_linear_dag_five_stages(pipeline_dir: pathlib.Path) -> None:
         assert n == 4, f"stage4 must run first, got {n}"
         pathlib.Path("stage5.txt").write_text(str(n + 1))
 
-    from pivot import executor
-
     executor.run()
 
     execution_log = log_file.read_text().strip().split("\n")
@@ -178,8 +173,6 @@ def test_tree_dag_one_root_two_children(pipeline_dir: pathlib.Path) -> None:
         data = pathlib.Path("a.txt").read_text()
         assert "->A" in data, "stage_a must run before stage_c"
         pathlib.Path("c.txt").write_text(f"{data}->C")
-
-    from pivot import executor
 
     executor.run()
 
@@ -242,8 +235,6 @@ def test_tree_dag_deeper(pipeline_dir: pathlib.Path) -> None:
             f.write("e\n")
         assert pathlib.Path("c.txt").read_text() == "C"
         pathlib.Path("e.txt").write_text("E")
-
-    from pivot import executor
 
     executor.run()
 
@@ -308,8 +299,6 @@ def test_diamond_dag(pipeline_dir: pathlib.Path) -> None:
         assert c_data == "C_OUTPUT", "stage_c must run before stage_d"
         pathlib.Path("d.txt").write_text(f"D({b_data}+{c_data})")
 
-    from pivot import executor
-
     executor.run()
 
     execution_log = log_file.read_text().strip().split("\n")
@@ -355,8 +344,6 @@ def test_diamond_dag_with_shared_data(pipeline_dir: pathlib.Path) -> None:
         b = int(pathlib.Path("b.txt").read_text())
         c = int(pathlib.Path("c.txt").read_text())
         pathlib.Path("d.txt").write_text(str(b + c))  # 50
-
-    from pivot import executor
 
     executor.run()
 
@@ -408,8 +395,6 @@ def test_fanout_dag(pipeline_dir: pathlib.Path) -> None:
         data = pathlib.Path("a.txt").read_text()
         assert data == "A_DATA", "stage_a must run before stage_d"
         pathlib.Path("d.txt").write_text("D")
-
-    from pivot import executor
 
     executor.run()
 
@@ -471,8 +456,6 @@ def test_fanout_dag_wide(pipeline_dir: pathlib.Path) -> None:
         assert pathlib.Path("a.txt").read_text() == "ROOT"
         pathlib.Path("f.txt").write_text("F")
 
-    from pivot import executor
-
     executor.run()
 
     execution_log = log_file.read_text().strip().split("\n")
@@ -528,8 +511,6 @@ def test_fanin_dag(pipeline_dir: pathlib.Path) -> None:
         assert c == "C_OUT", "stage_c must run before stage_d"
         pathlib.Path("d.txt").write_text(f"{a}+{b}+{c}")
 
-    from pivot import executor
-
     executor.run()
 
     execution_log = log_file.read_text().strip().split("\n")
@@ -572,8 +553,6 @@ def test_fanin_dag_with_computation(pipeline_dir: pathlib.Path) -> None:
         b = int(pathlib.Path("b.txt").read_text())
         c = int(pathlib.Path("c.txt").read_text())
         pathlib.Path("sum.txt").write_text(str(a + b + c))
-
-    from pivot import executor
 
     executor.run()
 
@@ -651,8 +630,6 @@ def test_complex_dag_tree_then_diamond(pipeline_dir: pathlib.Path) -> None:
         assert d == "D", "stage_d must run before stage_f"
         assert e == "E", "stage_e must run before stage_f"
         pathlib.Path("f.txt").write_text(f"F({d},{e})")
-
-    from pivot import executor
 
     executor.run()
 
@@ -745,8 +722,6 @@ def test_complex_dag_multiple_diamonds(pipeline_dir: pathlib.Path) -> None:
         g = pathlib.Path("g.txt").read_text()
         pathlib.Path("h.txt").write_text(f"H[{e},{f_val},{g}]")
 
-    from pivot import executor
-
     executor.run()
 
     execution_log = log_file.read_text().strip().split("\n")
@@ -786,8 +761,6 @@ def test_single_stage_dag(pipeline_dir: pathlib.Path) -> None:
     def only_stage() -> None:
         data = pathlib.Path("input.txt").read_text()
         pathlib.Path("output.txt").write_text(f"PROCESSED:{data}")
-
-    from pivot import executor
 
     results = executor.run()
 
@@ -831,8 +804,6 @@ def test_disconnected_dags(pipeline_dir: pathlib.Path) -> None:
             f.write("y\n")
         assert pathlib.Path("x.txt").read_text() == "X_OUT"
         pathlib.Path("y.txt").write_text("Y_OUT")
-
-    from pivot import executor
 
     executor.run()
 

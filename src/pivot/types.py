@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import enum
-from typing import Any, NotRequired, TypedDict
+from typing import Any, Literal, NotRequired, TypedDict
 
 
 class StageStatus(enum.StrEnum):
@@ -37,7 +37,7 @@ class OnError(enum.StrEnum):
 class StageResult(TypedDict):
     """Result from executing a single stage."""
 
-    status: StageStatus
+    status: Literal[StageStatus.RAN, StageStatus.SKIPPED, StageStatus.FAILED]
     reason: str
     output_lines: list[tuple[str, bool]]
 

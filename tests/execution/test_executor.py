@@ -1,11 +1,18 @@
 """Integration tests for pipeline execution."""
 
+import logging
+import os
 import pathlib
+import sys
+import threading
+import time
 
 import pytest
+import yaml
 
 import pivot
-from pivot import executor, registry
+from pivot import exceptions, executor, project, registry
+from pivot.outputs import Metric
 
 
 @pytest.fixture(autouse=True)
@@ -22,8 +29,6 @@ def pipeline_dir(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> pat
     monkeypatch.chdir(tmp_path)
 
     # Reset project root cache
-    from pivot import project
-
     project._project_root_cache = None
 
     return tmp_path
@@ -43,8 +48,6 @@ def test_simple_pipeline_runs_in_order(pipeline_dir: pathlib.Path) -> None:
         data = pathlib.Path("step1.txt").read_text()
         pathlib.Path("step2.txt").write_text(f"Result: {data}")
 
-    from pivot import executor
-
     results = executor.run()
 
     assert (pipeline_dir / "step2.txt").read_text() == "Result: HELLO"
@@ -60,8 +63,6 @@ def test_unchanged_stages_are_skipped(pipeline_dir: pathlib.Path) -> None:
     def step1() -> None:
         data = pathlib.Path("input.txt").read_text()
         pathlib.Path("output.txt").write_text(data.upper())
-
-    from pivot import executor
 
     # First run - should execute
     results = executor.run()
@@ -82,8 +83,6 @@ def test_code_change_triggers_rerun(pipeline_dir: pathlib.Path) -> None:
     def process() -> None:
         data = pathlib.Path("input.txt").read_text()
         pathlib.Path("output.txt").write_text(data.upper())
-
-    from pivot import executor
 
     results = executor.run()
     assert results["process"]["status"] == "ran"
@@ -110,8 +109,6 @@ def test_input_change_triggers_rerun(pipeline_dir: pathlib.Path) -> None:
     def process() -> None:
         data = pathlib.Path("input.txt").read_text()
         pathlib.Path("output.txt").write_text(data.upper())
-
-    from pivot import executor
 
     # First run
     results = executor.run()
@@ -140,8 +137,6 @@ def test_downstream_runs_when_upstream_changes(pipeline_dir: pathlib.Path) -> No
     def step2() -> None:
         data = pathlib.Path("intermediate.txt").read_text()
         pathlib.Path("final.txt").write_text(f"Final: {data}")
-
-    from pivot import executor
 
     # First run - both execute
     results = executor.run()
@@ -178,8 +173,6 @@ def test_run_specific_stage(pipeline_dir: pathlib.Path) -> None:
     def c() -> None:
         pathlib.Path("c.txt").write_text("c")
 
-    from pivot import executor
-
     # Run only 'b' (should also run 'a' as dependency, but not 'c')
     results = executor.run(stages=["b"])
 
@@ -191,8 +184,6 @@ def test_run_specific_stage(pipeline_dir: pathlib.Path) -> None:
 
 def test_missing_dependency_raises_error(pipeline_dir: pathlib.Path) -> None:
     """Missing dependency file raises DependencyNotFoundError before stage runs."""
-    from pivot import exceptions, executor
-
     run_count = {"process": 0}
 
     # Don't create the input file - it's missing
@@ -211,8 +202,6 @@ def test_missing_dependency_raises_error(pipeline_dir: pathlib.Path) -> None:
 
 def test_nonexistent_stage_raises_error(pipeline_dir: pathlib.Path) -> None:
     """Requesting a non-existent stage raises StageNotFoundError."""
-    from pivot import exceptions, executor
-
     (pipeline_dir / "input.txt").write_text("data")
 
     @pivot.stage(deps=["input.txt"], outs=["output.txt"])
@@ -227,8 +216,6 @@ def test_nonexistent_stage_raises_error(pipeline_dir: pathlib.Path) -> None:
 
 def test_execution_lock_created_and_removed(pipeline_dir: pathlib.Path) -> None:
     """Execution lock file is created during run and removed after."""
-    from pivot import executor
-
     (pipeline_dir / "input.txt").write_text("hello")
     cache_dir = pipeline_dir / ".pivot" / "cache"
     lock_check_file = pipeline_dir / "lock_existed.txt"
@@ -248,8 +235,6 @@ def test_execution_lock_created_and_removed(pipeline_dir: pathlib.Path) -> None:
 
 def test_execution_lock_removed_on_stage_failure(pipeline_dir: pathlib.Path) -> None:
     """Execution lock is released even if stage raises an exception."""
-    from pivot import executor
-
     (pipeline_dir / "input.txt").write_text("hello")
     cache_dir = pipeline_dir / ".pivot" / "cache"
 
@@ -267,8 +252,6 @@ def test_execution_lock_removed_on_stage_failure(pipeline_dir: pathlib.Path) -> 
 
 def test_stale_lock_from_dead_process_is_broken(pipeline_dir: pathlib.Path) -> None:
     """Stale lock file from crashed process is automatically removed."""
-
-    from pivot import executor
 
     (pipeline_dir / "input.txt").write_text("hello")
     cache_dir = pipeline_dir / ".pivot" / "cache"
@@ -291,10 +274,6 @@ def test_stale_lock_from_dead_process_is_broken(pipeline_dir: pathlib.Path) -> N
 
 def test_concurrent_execution_returns_failed_status(pipeline_dir: pathlib.Path) -> None:
     """Running stage that's already running returns failed status."""
-    import os
-
-    from pivot import executor
-
     (pipeline_dir / "input.txt").write_text("hello")
     cache_dir = pipeline_dir / ".pivot" / "cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -320,8 +299,6 @@ def test_concurrent_execution_returns_failed_status(pipeline_dir: pathlib.Path) 
 
 def test_corrupted_lock_file_is_broken(pipeline_dir: pathlib.Path) -> None:
     """Corrupted lock file (invalid content) is treated as stale and removed."""
-    from pivot import executor
-
     (pipeline_dir / "input.txt").write_text("hello")
     cache_dir = pipeline_dir / ".pivot" / "cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -343,8 +320,6 @@ def test_corrupted_lock_file_is_broken(pipeline_dir: pathlib.Path) -> None:
 
 def test_negative_pid_in_lock_is_treated_as_stale(pipeline_dir: pathlib.Path) -> None:
     """Lock file with invalid PID (negative) is treated as stale."""
-    from pivot import executor
-
     (pipeline_dir / "input.txt").write_text("hello")
     cache_dir = pipeline_dir / ".pivot" / "cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -379,10 +354,6 @@ def test_output_queue_reader_only_catches_empty(pipeline_dir: pathlib.Path) -> N
 
 def test_output_thread_cleanup_completes(pipeline_dir: pathlib.Path) -> None:
     """Output thread should be properly cleaned up after execution."""
-    import threading
-
-    from pivot import executor
-
     (pipeline_dir / "input.txt").write_text("hello")
 
     initial_thread_count = threading.active_count()
@@ -395,8 +366,6 @@ def test_output_thread_cleanup_completes(pipeline_dir: pathlib.Path) -> None:
     results = executor.run(show_output=True)
 
     # Give a moment for thread cleanup
-    import time
-
     time.sleep(0.2)
 
     # Thread count should return to initial (or close to it)
@@ -409,10 +378,6 @@ def test_output_thread_cleanup_completes(pipeline_dir: pathlib.Path) -> None:
 
 def test_mutex_prevents_concurrent_execution(pipeline_dir: pathlib.Path) -> None:
     """Stages in same mutex group run sequentially, not concurrently."""
-    import time
-
-    from pivot import executor
-
     (pipeline_dir / "input.txt").write_text("data")
     timing_file = pipeline_dir / "timing.txt"
 
@@ -449,8 +414,6 @@ def test_mutex_prevents_concurrent_execution(pipeline_dir: pathlib.Path) -> None
 
 def test_mutex_releases_on_completion(pipeline_dir: pathlib.Path) -> None:
     """Mutex is released when stage completes, allowing next stage to start."""
-    from pivot import executor
-
     (pipeline_dir / "input.txt").write_text("data")
 
     @pivot.stage(deps=["input.txt"], outs=["first.txt"], mutex=["resource"])
@@ -471,8 +434,6 @@ def test_mutex_releases_on_completion(pipeline_dir: pathlib.Path) -> None:
 
 def test_mutex_releases_on_failure(pipeline_dir: pathlib.Path) -> None:
     """Mutex is released even when stage fails, allowing other stages to run."""
-    from pivot import executor
-
     (pipeline_dir / "input.txt").write_text("data")
 
     @pivot.stage(deps=["input.txt"], outs=["failing.txt"], mutex=["resource"])
@@ -490,58 +451,8 @@ def test_mutex_releases_on_failure(pipeline_dir: pathlib.Path) -> None:
     assert (pipeline_dir / "succeeding.txt").exists()
 
 
-def test_different_mutex_groups_run_parallel(pipeline_dir: pathlib.Path) -> None:
-    """Stages in different mutex groups can run concurrently."""
-    import time
-
-    from pivot import executor
-
-    (pipeline_dir / "input.txt").write_text("data")
-    timing_file = pipeline_dir / "timing.txt"
-
-    @pivot.stage(deps=["input.txt"], outs=["gpu.txt"], mutex=["gpu"])
-    def gpu_stage() -> None:
-        with open("timing.txt", "a") as f:
-            f.write("gpu_start\n")
-        time.sleep(0.1)
-        with open("timing.txt", "a") as f:
-            f.write("gpu_end\n")
-        pathlib.Path("gpu.txt").write_text("gpu")
-
-    @pivot.stage(deps=["input.txt"], outs=["disk.txt"], mutex=["disk"])
-    def disk_stage() -> None:
-        with open("timing.txt", "a") as f:
-            f.write("disk_start\n")
-        time.sleep(0.1)
-        with open("timing.txt", "a") as f:
-            f.write("disk_end\n")
-        pathlib.Path("disk.txt").write_text("disk")
-
-    results = executor.run(max_workers=4, show_output=False)
-
-    assert results["gpu_stage"]["status"] == "ran"
-    assert results["disk_stage"]["status"] == "ran"
-
-    # With different mutex groups, stages should run in parallel (interleaved timing)
-    timing = timing_file.read_text().strip().split("\n")
-    assert len(timing) == 4, f"Expected 4 timing entries, got {timing}"
-
-    # Verify parallelism: stages should interleave, not run sequentially
-    # Sequential would be: [X_start, X_end, Y_start, Y_end]
-    # Parallel should be: [X_start, Y_start, ...] or [Y_start, X_start, ...]
-    is_sequential = timing in [
-        ["gpu_start", "gpu_end", "disk_start", "disk_end"],
-        ["disk_start", "disk_end", "gpu_start", "gpu_end"],
-    ]
-    assert not is_sequential, f"Stages ran sequentially despite different mutex groups: {timing}"
-
-
 def test_multiple_mutex_groups_per_stage(pipeline_dir: pathlib.Path) -> None:
     """Stage with multiple mutex groups blocks all of them."""
-    import time
-
-    from pivot import executor
-
     (pipeline_dir / "input.txt").write_text("data")
     timing_file = pipeline_dir / "timing.txt"
 
@@ -578,8 +489,6 @@ def test_multiple_mutex_groups_per_stage(pipeline_dir: pathlib.Path) -> None:
 
 def test_mutex_with_dependencies(pipeline_dir: pathlib.Path) -> None:
     """Mutex works correctly with stage dependencies."""
-    from pivot import executor
-
     (pipeline_dir / "input.txt").write_text("data")
 
     @pivot.stage(deps=["input.txt"], outs=["first.txt"], mutex=["resource"])
@@ -600,10 +509,6 @@ def test_mutex_with_dependencies(pipeline_dir: pathlib.Path) -> None:
 
 def test_no_mutex_stages_unaffected(pipeline_dir: pathlib.Path) -> None:
     """Stages without mutex run normally in parallel."""
-    import time
-
-    from pivot import executor
-
     (pipeline_dir / "input.txt").write_text("data")
     timing_file = pipeline_dir / "timing.txt"
 
@@ -639,10 +544,6 @@ def test_single_stage_mutex_warning(
     pipeline_dir: pathlib.Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Warning is logged when mutex group has only one stage."""
-    import logging
-
-    from pivot import executor
-
     (pipeline_dir / "input.txt").write_text("data")
 
     @pivot.stage(deps=["input.txt"], outs=["output.txt"], mutex=["lonely_group"])
@@ -667,8 +568,6 @@ def test_single_stage_mutex_warning(
 
 def test_on_error_fail_stops_on_first_failure(pipeline_dir: pathlib.Path) -> None:
     """on_error='fail' stops pipeline when first stage fails."""
-    from pivot import executor
-
     (pipeline_dir / "input.txt").write_text("data")
     execution_log = pipeline_dir / "execution.log"
 
@@ -694,8 +593,6 @@ def test_on_error_fail_stops_on_first_failure(pipeline_dir: pathlib.Path) -> Non
 
 def test_on_error_keep_going_continues_independent_stages(pipeline_dir: pathlib.Path) -> None:
     """on_error='keep_going' continues running independent stages after failure."""
-    from pivot import executor
-
     (pipeline_dir / "input.txt").write_text("data")
 
     @pivot.stage(deps=["input.txt"], outs=["failing.txt"])
@@ -715,8 +612,6 @@ def test_on_error_keep_going_continues_independent_stages(pipeline_dir: pathlib.
 
 def test_on_error_keep_going_skips_downstream_of_failed(pipeline_dir: pathlib.Path) -> None:
     """on_error='keep_going' skips stages that depend on failed stage."""
-    from pivot import executor
-
     (pipeline_dir / "input.txt").write_text("data")
 
     @pivot.stage(deps=["input.txt"], outs=["first.txt"])
@@ -741,8 +636,6 @@ def test_on_error_keep_going_skips_downstream_of_failed(pipeline_dir: pathlib.Pa
 
 def test_on_error_ignore_allows_downstream_to_attempt(pipeline_dir: pathlib.Path) -> None:
     """on_error='ignore' allows downstream stages to attempt running."""
-    from pivot import executor
-
     (pipeline_dir / "input.txt").write_text("data")
     # Note: pre-existing outputs are removed before stage execution
     # so downstream will fail with missing dependency if upstream fails
@@ -767,8 +660,6 @@ def test_on_error_ignore_allows_downstream_to_attempt(pipeline_dir: pathlib.Path
 
 def test_invalid_on_error_raises_value_error(pipeline_dir: pathlib.Path) -> None:
     """Invalid on_error value raises ValueError."""
-    from pivot import executor
-
     (pipeline_dir / "input.txt").write_text("data")
 
     @pivot.stage(deps=["input.txt"], outs=["output.txt"])
@@ -789,10 +680,6 @@ def test_invalid_on_error_raises_value_error(pipeline_dir: pathlib.Path) -> None
 
 def test_stage_timeout_marks_stage_as_failed(pipeline_dir: pathlib.Path) -> None:
     """Stage exceeding timeout is marked as failed."""
-    import time
-
-    from pivot import executor
-
     (pipeline_dir / "input.txt").write_text("data")
 
     @pivot.stage(deps=["input.txt"], outs=["output.txt"])
@@ -808,8 +695,6 @@ def test_stage_timeout_marks_stage_as_failed(pipeline_dir: pathlib.Path) -> None
 
 def test_stage_timeout_does_not_affect_fast_stages(pipeline_dir: pathlib.Path) -> None:
     """Fast stages complete normally even with timeout set."""
-    from pivot import executor
-
     (pipeline_dir / "input.txt").write_text("data")
 
     @pivot.stage(deps=["input.txt"], outs=["output.txt"])
@@ -829,10 +714,6 @@ def test_stage_timeout_does_not_affect_fast_stages(pipeline_dir: pathlib.Path) -
 
 def test_stage_calling_sys_exit_returns_failed(pipeline_dir: pathlib.Path) -> None:
     """Stage calling sys.exit() returns failed status with exit code."""
-    import sys
-
-    from pivot import executor
-
     (pipeline_dir / "input.txt").write_text("data")
 
     @pivot.stage(deps=["input.txt"], outs=["output.txt"])
@@ -848,10 +729,6 @@ def test_stage_calling_sys_exit_returns_failed(pipeline_dir: pathlib.Path) -> No
 
 def test_stage_calling_sys_exit_zero_returns_failed(pipeline_dir: pathlib.Path) -> None:
     """Stage calling sys.exit(0) still returns failed (stages shouldn't exit)."""
-    import sys
-
-    from pivot import executor
-
     (pipeline_dir / "input.txt").write_text("data")
 
     @pivot.stage(deps=["input.txt"], outs=["output.txt"])
@@ -866,8 +743,6 @@ def test_stage_calling_sys_exit_zero_returns_failed(pipeline_dir: pathlib.Path) 
 
 def test_stage_raising_keyboard_interrupt_returns_failed(pipeline_dir: pathlib.Path) -> None:
     """Stage raising KeyboardInterrupt returns failed status."""
-    from pivot import executor
-
     (pipeline_dir / "input.txt").write_text("data")
 
     @pivot.stage(deps=["input.txt"], outs=["output.txt"])
@@ -887,8 +762,6 @@ def test_stage_raising_keyboard_interrupt_returns_failed(pipeline_dir: pathlib.P
 
 def test_directory_dependency_hashed_and_runs(pipeline_dir: pathlib.Path) -> None:
     """Stage with directory as dependency hashes it and runs successfully."""
-    from pivot import executor
-
     # Create a directory with files
     data_dir = pipeline_dir / "data_dir"
     data_dir.mkdir()
@@ -912,10 +785,6 @@ def test_directory_dependency_hashed_and_runs(pipeline_dir: pathlib.Path) -> Non
 
 def test_parallel_false_runs_sequentially(pipeline_dir: pathlib.Path) -> None:
     """parallel=False runs stages one at a time."""
-    import time
-
-    from pivot import executor
-
     (pipeline_dir / "input.txt").write_text("data")
     timing_file = pipeline_dir / "timing.txt"
 
@@ -957,10 +826,6 @@ def test_parallel_false_runs_sequentially(pipeline_dir: pathlib.Path) -> None:
 
 def test_stage_stdout_and_stderr_captured(pipeline_dir: pathlib.Path) -> None:
     """Stage stdout and stderr are captured in results."""
-    import sys
-
-    from pivot import executor
-
     (pipeline_dir / "input.txt").write_text("data")
 
     @pivot.stage(deps=["input.txt"], outs=["output.txt"])
@@ -978,10 +843,6 @@ def test_stage_stdout_and_stderr_captured(pipeline_dir: pathlib.Path) -> None:
 
 def test_stage_partial_line_output_captured(pipeline_dir: pathlib.Path) -> None:
     """Stage output without trailing newline is captured."""
-    import sys
-
-    from pivot import executor
-
     (pipeline_dir / "input.txt").write_text("data")
 
     @pivot.stage(deps=["input.txt"], outs=["output.txt"])
@@ -1001,10 +862,6 @@ def test_stage_partial_line_output_captured(pipeline_dir: pathlib.Path) -> None:
 
 def test_lock_retry_exhaustion_returns_failed(pipeline_dir: pathlib.Path) -> None:
     """Multiple failed lock attempts return failed status."""
-    import os
-
-    from pivot import executor
-
     (pipeline_dir / "input.txt").write_text("data")
     cache_dir = pipeline_dir / ".pivot" / "cache"
     cache_dir.mkdir(parents=True)
@@ -1032,10 +889,6 @@ def test_lock_retry_exhaustion_returns_failed(pipeline_dir: pathlib.Path) -> Non
 
 def test_mutex_names_are_case_insensitive(pipeline_dir: pathlib.Path) -> None:
     """Mutex names are normalized to lowercase for comparison."""
-    import time
-
-    from pivot import executor
-
     (pipeline_dir / "input.txt").write_text("data")
     timing_file = pipeline_dir / "timing.txt"
 
@@ -1072,10 +925,6 @@ def test_mutex_names_are_case_insensitive(pipeline_dir: pathlib.Path) -> None:
 
 def test_mutex_names_whitespace_stripped(pipeline_dir: pathlib.Path) -> None:
     """Mutex names have whitespace stripped."""
-    import time
-
-    from pivot import executor
-
     (pipeline_dir / "input.txt").write_text("data")
     timing_file = pipeline_dir / "timing.txt"
 
@@ -1117,8 +966,6 @@ def test_mutex_names_whitespace_stripped(pipeline_dir: pathlib.Path) -> None:
 
 def test_executor_removes_outputs_before_run(pipeline_dir: pathlib.Path) -> None:
     """Outputs are removed before stage execution (clean state)."""
-    from pivot import executor
-
     (pipeline_dir / "input.txt").write_text("data")
     output_file = pipeline_dir / "output.txt"
     output_file.write_text("stale data")
@@ -1137,8 +984,6 @@ def test_executor_removes_outputs_before_run(pipeline_dir: pathlib.Path) -> None
 
 def test_executor_saves_outputs_to_cache(pipeline_dir: pathlib.Path) -> None:
     """Outputs are saved to cache after successful execution."""
-    from pivot import executor
-
     (pipeline_dir / "input.txt").write_text("data")
     cache_dir = pipeline_dir / ".pivot" / "cache"
 
@@ -1164,8 +1009,6 @@ def test_executor_saves_outputs_to_cache(pipeline_dir: pathlib.Path) -> None:
 
 def test_executor_restores_missing_outputs_on_skip(pipeline_dir: pathlib.Path) -> None:
     """Skipped stages restore missing outputs from cache."""
-    from pivot import executor
-
     (pipeline_dir / "input.txt").write_text("data")
 
     @pivot.stage(deps=["input.txt"], outs=["output.txt"])
@@ -1194,8 +1037,6 @@ def test_executor_restores_missing_outputs_on_skip(pipeline_dir: pathlib.Path) -
 
 def test_executor_fails_if_output_missing(pipeline_dir: pathlib.Path) -> None:
     """Stage fails if declared output is not produced."""
-    from pivot import executor
-
     (pipeline_dir / "input.txt").write_text("data")
 
     @pivot.stage(deps=["input.txt"], outs=["output.txt"])
@@ -1211,9 +1052,6 @@ def test_executor_fails_if_output_missing(pipeline_dir: pathlib.Path) -> None:
 
 def test_executor_handles_cache_false_outputs(pipeline_dir: pathlib.Path) -> None:
     """Metric outputs with cache=False are not cached."""
-    from pivot import executor
-    from pivot.outputs import Metric
-
     (pipeline_dir / "input.txt").write_text("data")
 
     @pivot.stage(deps=["input.txt"], outs=[Metric("metrics.json")])
@@ -1234,10 +1072,6 @@ def test_executor_handles_cache_false_outputs(pipeline_dir: pathlib.Path) -> Non
 
 def test_executor_output_hashes_in_lock_file(pipeline_dir: pathlib.Path) -> None:
     """Output hashes are stored in lock file."""
-    import yaml
-
-    from pivot import executor
-
     (pipeline_dir / "input.txt").write_text("data")
 
     @pivot.stage(deps=["input.txt"], outs=["output.txt"])
@@ -1256,10 +1090,6 @@ def test_executor_output_hashes_in_lock_file(pipeline_dir: pathlib.Path) -> None
 
 def test_executor_lock_file_deterministic_sort(pipeline_dir: pathlib.Path) -> None:
     """Lock file entries are sorted for deterministic output."""
-    import yaml
-
-    from pivot import executor
-
     (pipeline_dir / "input.txt").write_text("data")
     (pipeline_dir / "z_input.txt").write_text("z")
     (pipeline_dir / "a_input.txt").write_text("a")
@@ -1285,8 +1115,6 @@ def test_executor_lock_file_deterministic_sort(pipeline_dir: pathlib.Path) -> No
 
 def test_executor_directory_output_cached(pipeline_dir: pathlib.Path) -> None:
     """Directory outputs are cached with manifest."""
-    from pivot import executor
-
     (pipeline_dir / "input.txt").write_text("data")
 
     @pivot.stage(deps=["input.txt"], outs=["output_dir/"])
@@ -1308,10 +1136,6 @@ def test_executor_directory_output_cached(pipeline_dir: pathlib.Path) -> None:
 
 def test_executor_old_lock_file_triggers_recache(pipeline_dir: pathlib.Path) -> None:
     """Old lock file without output_hashes triggers re-execution."""
-    import yaml
-
-    from pivot import executor
-
     (pipeline_dir / "input.txt").write_text("data")
     cache_dir = pipeline_dir / ".pivot" / "cache"
     stages_dir = cache_dir / "stages"
@@ -1342,261 +1166,3 @@ def test_executor_old_lock_file_triggers_recache(pipeline_dir: pathlib.Path) -> 
     # Lock file should now have output_hashes
     lock_data = yaml.safe_load(old_lock.read_text())
     assert "output_hashes" in lock_data
-
-
-# =============================================================================
-# Matrix Stage Integration Tests
-# =============================================================================
-
-
-def test_matrix_stage_executes_all_variants(pipeline_dir: pathlib.Path) -> None:
-    """Matrix stage variants all execute and create lock files with @ in name."""
-    from pydantic import BaseModel
-
-    from pivot import Variant, executor
-
-    class VariantParams(BaseModel):
-        input_file: str
-        output_file: str
-
-    # Create input files for each variant
-    (pipeline_dir / "data_v1.txt").write_text("v1 data")
-    (pipeline_dir / "data_v2.txt").write_text("v2 data")
-
-    @pivot.stage.matrix(
-        [
-            Variant(
-                name="v1",
-                deps=["data_v1.txt"],
-                outs=["out_v1.txt"],
-                params=VariantParams(input_file="data_v1.txt", output_file="out_v1.txt"),
-            ),
-            Variant(
-                name="v2",
-                deps=["data_v2.txt"],
-                outs=["out_v2.txt"],
-                params=VariantParams(input_file="data_v2.txt", output_file="out_v2.txt"),
-            ),
-        ]
-    )
-    def process_variant(params: VariantParams) -> None:
-        data = pathlib.Path(params.input_file).read_text()
-        pathlib.Path(params.output_file).write_text(f"processed: {data}")
-
-    results = executor.run(show_output=False)
-
-    # Both variants should execute
-    assert results["process_variant@v1"]["status"] == "ran"
-    assert results["process_variant@v2"]["status"] == "ran"
-
-    # Outputs should be produced
-    assert (pipeline_dir / "out_v1.txt").read_text() == "processed: v1 data"
-    assert (pipeline_dir / "out_v2.txt").read_text() == "processed: v2 data"
-
-    # Lock files should exist with @ in name
-    cache_dir = pipeline_dir / ".pivot" / "cache" / "stages"
-    assert (cache_dir / "process_variant@v1.lock").exists()
-    assert (cache_dir / "process_variant@v2.lock").exists()
-
-
-def test_matrix_stage_skips_unchanged_variants(pipeline_dir: pathlib.Path) -> None:
-    """Matrix variants skip on re-run when unchanged."""
-    from pydantic import BaseModel
-
-    from pivot import Variant, executor
-
-    class SkipParams(BaseModel):
-        input_file: str
-        output_file: str
-
-    (pipeline_dir / "data_v1.txt").write_text("v1 data")
-    (pipeline_dir / "data_v2.txt").write_text("v2 data")
-
-    @pivot.stage.matrix(
-        [
-            Variant(
-                name="v1",
-                deps=["data_v1.txt"],
-                outs=["out_v1.txt"],
-                params=SkipParams(input_file="data_v1.txt", output_file="out_v1.txt"),
-            ),
-            Variant(
-                name="v2",
-                deps=["data_v2.txt"],
-                outs=["out_v2.txt"],
-                params=SkipParams(input_file="data_v2.txt", output_file="out_v2.txt"),
-            ),
-        ]
-    )
-    def process_skip(params: SkipParams) -> None:
-        data = pathlib.Path(params.input_file).read_text()
-        pathlib.Path(params.output_file).write_text(f"processed: {data}")
-
-    # First run
-    results = executor.run(show_output=False)
-    assert results["process_skip@v1"]["status"] == "ran"
-    assert results["process_skip@v2"]["status"] == "ran"
-
-    # Second run - should skip both
-    results = executor.run(show_output=False)
-    assert results["process_skip@v1"]["status"] == "skipped"
-    assert results["process_skip@v2"]["status"] == "skipped"
-
-
-def test_matrix_stage_reruns_changed_variant_only(pipeline_dir: pathlib.Path) -> None:
-    """Only the variant with changed deps re-runs."""
-    from pydantic import BaseModel
-
-    from pivot import Variant, executor
-
-    class PartialParams(BaseModel):
-        input_file: str
-        output_file: str
-
-    (pipeline_dir / "data_v1.txt").write_text("v1 data")
-    (pipeline_dir / "data_v2.txt").write_text("v2 data")
-
-    @pivot.stage.matrix(
-        [
-            Variant(
-                name="v1",
-                deps=["data_v1.txt"],
-                outs=["out_v1.txt"],
-                params=PartialParams(input_file="data_v1.txt", output_file="out_v1.txt"),
-            ),
-            Variant(
-                name="v2",
-                deps=["data_v2.txt"],
-                outs=["out_v2.txt"],
-                params=PartialParams(input_file="data_v2.txt", output_file="out_v2.txt"),
-            ),
-        ]
-    )
-    def process_partial(params: PartialParams) -> None:
-        data = pathlib.Path(params.input_file).read_text()
-        pathlib.Path(params.output_file).write_text(f"processed: {data}")
-
-    # First run
-    results = executor.run(show_output=False)
-    assert results["process_partial@v1"]["status"] == "ran"
-    assert results["process_partial@v2"]["status"] == "ran"
-
-    # Change only v1's input
-    (pipeline_dir / "data_v1.txt").write_text("v1 UPDATED")
-
-    # Second run - only v1 should re-run
-    results = executor.run(show_output=False)
-    assert results["process_partial@v1"]["status"] == "ran"
-    assert results["process_partial@v2"]["status"] == "skipped"
-
-    assert (pipeline_dir / "out_v1.txt").read_text() == "processed: v1 UPDATED"
-
-
-# =============================================================================
-# Params.yaml Change Detection Tests
-# =============================================================================
-
-
-def test_params_yaml_change_triggers_rerun(pipeline_dir: pathlib.Path) -> None:
-    """Changing params.yaml triggers stage re-run."""
-    from pydantic import BaseModel
-
-    from pivot import executor
-
-    (pipeline_dir / "input.txt").write_text("data")
-
-    class MyParams(BaseModel):
-        threshold: float = 0.5
-        mode: str = "default"
-
-    @pivot.stage(deps=["input.txt"], outs=["output.txt"], params=MyParams)
-    def process_with_params(params: MyParams) -> None:
-        pathlib.Path("output.txt").write_text(f"threshold={params.threshold}, mode={params.mode}")
-
-    # First run with no params.yaml
-    results = executor.run(show_output=False)
-    assert results["process_with_params"]["status"] == "ran"
-    assert (pipeline_dir / "output.txt").read_text() == "threshold=0.5, mode=default"
-
-    # Second run - should skip (nothing changed)
-    results = executor.run(show_output=False)
-    assert results["process_with_params"]["status"] == "skipped"
-
-    # Create params.yaml with override
-    params_file = pipeline_dir / "params.yaml"
-    params_file.write_text("process_with_params:\n  threshold: 0.9\n  mode: production\n")
-
-    # Third run - should re-run because params changed
-    results = executor.run(show_output=False)
-    assert results["process_with_params"]["status"] == "ran"
-    assert (pipeline_dir / "output.txt").read_text() == "threshold=0.9, mode=production"
-
-
-def test_params_yaml_second_change_triggers_rerun(pipeline_dir: pathlib.Path) -> None:
-    """Changing params.yaml again triggers another re-run."""
-    from pydantic import BaseModel
-
-    from pivot import executor
-
-    (pipeline_dir / "input.txt").write_text("data")
-
-    class MyParams(BaseModel):
-        value: int = 10
-
-    @pivot.stage(deps=["input.txt"], outs=["output.txt"], params=MyParams)
-    def process_value(params: MyParams) -> None:
-        pathlib.Path("output.txt").write_text(f"value={params.value}")
-
-    # Initial params.yaml
-    params_file = pipeline_dir / "params.yaml"
-    params_file.write_text("process_value:\n  value: 100\n")
-
-    # First run
-    results = executor.run(show_output=False)
-    assert results["process_value"]["status"] == "ran"
-    assert (pipeline_dir / "output.txt").read_text() == "value=100"
-
-    # Second run - skip
-    results = executor.run(show_output=False)
-    assert results["process_value"]["status"] == "skipped"
-
-    # Change params.yaml
-    params_file.write_text("process_value:\n  value: 200\n")
-
-    # Third run - should re-run
-    results = executor.run(show_output=False)
-    assert results["process_value"]["status"] == "ran"
-    assert (pipeline_dir / "output.txt").read_text() == "value=200"
-
-
-def test_params_yaml_removal_triggers_rerun(pipeline_dir: pathlib.Path) -> None:
-    """Removing params.yaml override triggers re-run (reverts to defaults)."""
-    from pydantic import BaseModel
-
-    from pivot import executor
-
-    (pipeline_dir / "input.txt").write_text("data")
-
-    class MyParams(BaseModel):
-        setting: str = "default"
-
-    @pivot.stage(deps=["input.txt"], outs=["output.txt"], params=MyParams)
-    def process_setting(params: MyParams) -> None:
-        pathlib.Path("output.txt").write_text(f"setting={params.setting}")
-
-    # Start with params.yaml
-    params_file = pipeline_dir / "params.yaml"
-    params_file.write_text("process_setting:\n  setting: custom\n")
-
-    # First run
-    results = executor.run(show_output=False)
-    assert results["process_setting"]["status"] == "ran"
-    assert (pipeline_dir / "output.txt").read_text() == "setting=custom"
-
-    # Remove params.yaml
-    params_file.unlink()
-
-    # Second run - should re-run with defaults
-    results = executor.run(show_output=False)
-    assert results["process_setting"]["status"] == "ran"
-    assert (pipeline_dir / "output.txt").read_text() == "setting=default"

@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from pivot import IncrementalOut, cache, executor, outputs, registry
+from pivot.executor import worker
 
 if TYPE_CHECKING:
     from pivot.types import LockData
@@ -45,7 +46,7 @@ def test_prepare_outputs_regular_out_is_deleted(tmp_path: pathlib.Path) -> None:
     output_file.write_text("existing content")
 
     stage_outs: list[outputs.BaseOut] = [outputs.Out(path=str(output_file))]
-    executor._prepare_outputs_for_execution(stage_outs, None, tmp_path / "cache")
+    worker._prepare_outputs_for_execution(stage_outs, None, tmp_path / "cache")
 
     assert not output_file.exists()
 
@@ -55,7 +56,7 @@ def test_prepare_outputs_incremental_no_cache_creates_empty(tmp_path: pathlib.Pa
     output_file = tmp_path / "database.txt"
 
     stage_outs: list[outputs.BaseOut] = [outputs.IncrementalOut(path=str(output_file))]
-    executor._prepare_outputs_for_execution(stage_outs, None, tmp_path / "cache")
+    worker._prepare_outputs_for_execution(stage_outs, None, tmp_path / "cache")
 
     assert not output_file.exists()
 
@@ -77,7 +78,7 @@ def test_prepare_outputs_incremental_restores_from_cache(tmp_path: pathlib.Path)
 
     # Prepare for execution
     stage_outs = [outputs.IncrementalOut(path=str(output_file))]
-    executor._prepare_outputs_for_execution(stage_outs, lock_data, cache_dir)
+    worker._prepare_outputs_for_execution(stage_outs, lock_data, cache_dir)
 
     # File should be restored
     assert output_file.exists()
@@ -100,7 +101,7 @@ def test_prepare_outputs_incremental_restored_file_is_writable(tmp_path: pathlib
 
     # Prepare for execution
     stage_outs = [outputs.IncrementalOut(path=str(output_file))]
-    executor._prepare_outputs_for_execution(stage_outs, lock_data, cache_dir)
+    worker._prepare_outputs_for_execution(stage_outs, lock_data, cache_dir)
 
     # Should NOT be a symlink (should be a copy)
     assert not output_file.is_symlink()
@@ -233,7 +234,7 @@ def test_incremental_out_restores_directory(tmp_path: pathlib.Path) -> None:
 
     # Prepare for execution (restore with COPY mode)
     stage_outs = [outputs.IncrementalOut(path=str(output_dir))]
-    executor._prepare_outputs_for_execution(stage_outs, lock_data, cache_dir)
+    worker._prepare_outputs_for_execution(stage_outs, lock_data, cache_dir)
 
     # Directory should be restored
     assert output_dir.exists()
@@ -261,7 +262,7 @@ def test_incremental_out_directory_is_writable(tmp_path: pathlib.Path) -> None:
     # Delete and restore
     cache.remove_output(output_dir)
     stage_outs = [outputs.IncrementalOut(path=str(output_dir))]
-    executor._prepare_outputs_for_execution(stage_outs, lock_data, cache_dir)
+    worker._prepare_outputs_for_execution(stage_outs, lock_data, cache_dir)
 
     # Should be able to write new files
     new_file = output_dir / "new_file.txt"
@@ -295,7 +296,7 @@ def test_incremental_out_directory_subdirs_writable(tmp_path: pathlib.Path) -> N
     # Delete and restore
     cache.remove_output(output_dir)
     stage_outs = [outputs.IncrementalOut(path=str(output_dir))]
-    executor._prepare_outputs_for_execution(stage_outs, lock_data, cache_dir)
+    worker._prepare_outputs_for_execution(stage_outs, lock_data, cache_dir)
 
     # Should be able to create files in subdirectories
     new_file = subdir / "new_in_subdir.txt"

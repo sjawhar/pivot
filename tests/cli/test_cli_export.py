@@ -6,9 +6,9 @@ import pathlib
 import click.testing
 import pytest
 import yaml
+from tests.fixtures.export import pipeline
 
 from pivot import cli, outputs, registry
-from tests.fixtures.export import pipeline
 
 
 @pytest.fixture

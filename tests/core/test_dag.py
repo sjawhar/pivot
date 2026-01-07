@@ -12,7 +12,9 @@ from pivot.registry import RegistryStageInfo
 # Test helpers for creating dummy stages
 
 
-class TestParams(BaseModel):
+class MockParams(BaseModel):
+    """Mock Pydantic params model for test stage fixtures."""
+
     pass
 
 
@@ -24,7 +26,7 @@ def _create_stage(name: str, deps: list[str], outs: list[str]) -> RegistryStageI
         deps=deps,
         outs=[outputs.Out(path=out) for out in outs],
         outs_paths=outs,
-        params=TestParams(),
+        params=None,
         mutex=[],
         variant=None,
         signature=None,

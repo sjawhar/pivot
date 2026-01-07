@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from pivot import exceptions, executor
+from pivot.executor import worker
 
 if TYPE_CHECKING:
     import pathlib
@@ -290,7 +291,7 @@ def test_run_stage_function_captures_stdout() -> None:
         print("line2")
 
     output_lines: list[tuple[str, bool]] = []
-    executor._run_stage_function_with_capture(
+    worker._run_stage_function_with_capture(
         stage_with_output,
         "test_stage",
         mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
@@ -310,7 +311,7 @@ def test_run_stage_function_captures_stderr() -> None:
         print("error2", file=sys.stderr)
 
     output_lines: list[tuple[str, bool]] = []
-    executor._run_stage_function_with_capture(
+    worker._run_stage_function_with_capture(
         stage_with_errors,
         "test_stage",
         mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
@@ -331,7 +332,7 @@ def test_run_stage_function_captures_mixed_output() -> None:
         print("stdout2")
 
     output_lines: list[tuple[str, bool]] = []
-    executor._run_stage_function_with_capture(
+    worker._run_stage_function_with_capture(
         stage_mixed,
         "test_stage",
         mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
@@ -353,7 +354,7 @@ def test_run_stage_function_restores_streams() -> None:
         pass
 
     output_lines: list[tuple[str, bool]] = []
-    executor._run_stage_function_with_capture(
+    worker._run_stage_function_with_capture(
         noop_stage,
         "test",
         mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
@@ -374,7 +375,7 @@ def test_run_stage_function_restores_streams_on_exception() -> None:
 
     output_lines: list[tuple[str, bool]] = []
     with pytest.raises(RuntimeError):
-        executor._run_stage_function_with_capture(
+        worker._run_stage_function_with_capture(
             failing_stage,
             "test",
             mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
@@ -393,7 +394,7 @@ def test_run_stage_function_captures_partial_lines() -> None:
         sys.stdout.flush()
 
     output_lines: list[tuple[str, bool]] = []
-    executor._run_stage_function_with_capture(
+    worker._run_stage_function_with_capture(
         stage_no_newline,
         "test_stage",
         mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
@@ -414,7 +415,7 @@ def test_queue_writer_splits_on_newlines() -> None:
     output_lines: list[tuple[str, bool]] = []
     queue: mp.Queue[OutputMessage] = mp.Manager().Queue()  # pyright: ignore[reportAssignmentType]
 
-    writer = executor._QueueWriter(
+    writer = worker._QueueWriter(
         "test_stage",
         queue,
         is_stderr=False,
@@ -432,7 +433,7 @@ def test_queue_writer_buffers_partial_lines() -> None:
     output_lines: list[tuple[str, bool]] = []
     queue: mp.Queue[OutputMessage] = mp.Manager().Queue()  # pyright: ignore[reportAssignmentType]
 
-    writer = executor._QueueWriter(
+    writer = worker._QueueWriter(
         "test_stage",
         queue,
         is_stderr=False,
@@ -451,7 +452,7 @@ def test_queue_writer_flush_writes_buffer() -> None:
     output_lines: list[tuple[str, bool]] = []
     queue: mp.Queue[OutputMessage] = mp.Manager().Queue()  # pyright: ignore[reportAssignmentType]
 
-    writer = executor._QueueWriter(
+    writer = worker._QueueWriter(
         "test_stage",
         queue,
         is_stderr=False,
@@ -470,7 +471,7 @@ def test_queue_writer_distinguishes_stderr() -> None:
     output_lines: list[tuple[str, bool]] = []
     queue: mp.Queue[OutputMessage] = mp.Manager().Queue()  # pyright: ignore[reportAssignmentType]
 
-    writer = executor._QueueWriter(
+    writer = worker._QueueWriter(
         "test_stage",
         queue,
         is_stderr=True,
@@ -486,7 +487,7 @@ def test_queue_writer_handles_multiple_newlines() -> None:
     output_lines: list[tuple[str, bool]] = []
     queue: mp.Queue[OutputMessage] = mp.Manager().Queue()  # pyright: ignore[reportAssignmentType]
 
-    writer = executor._QueueWriter(
+    writer = worker._QueueWriter(
         "test_stage",
         queue,
         is_stderr=False,
@@ -503,7 +504,7 @@ def test_queue_writer_empty_flush_does_nothing() -> None:
     output_lines: list[tuple[str, bool]] = []
     queue: mp.Queue[OutputMessage] = mp.Manager().Queue()  # pyright: ignore[reportAssignmentType]
 
-    writer = executor._QueueWriter(
+    writer = worker._QueueWriter(
         "test_stage",
         queue,
         is_stderr=False,
@@ -519,7 +520,7 @@ def test_queue_writer_isatty_returns_false() -> None:
     output_lines: list[tuple[str, bool]] = []
     queue: mp.Queue[OutputMessage] = mp.Manager().Queue()  # pyright: ignore[reportAssignmentType]
 
-    writer = executor._QueueWriter(
+    writer = worker._QueueWriter(
         "test_stage",
         queue,
         is_stderr=False,
@@ -534,7 +535,7 @@ def test_queue_writer_context_manager_flushes_on_exit() -> None:
     output_lines: list[tuple[str, bool]] = []
     queue: mp.Queue[OutputMessage] = mp.Manager().Queue()  # pyright: ignore[reportAssignmentType]
 
-    with executor._QueueWriter(
+    with worker._QueueWriter(
         "test_stage",
         queue,
         is_stderr=False,
@@ -554,7 +555,7 @@ def test_queue_writer_context_manager_flushes_on_exception() -> None:
 
     with (
         pytest.raises(RuntimeError),
-        executor._QueueWriter(
+        worker._QueueWriter(
             "test_stage",
             queue,
             is_stderr=False,
@@ -577,7 +578,7 @@ def test_run_stage_function_preserves_output_on_exception() -> None:
 
     output_lines: list[tuple[str, bool]] = []
     with pytest.raises(RuntimeError):
-        executor._run_stage_function_with_capture(
+        worker._run_stage_function_with_capture(
             failing_stage,
             "test_stage",
             mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
@@ -598,7 +599,7 @@ def test_execution_lock_creates_sentinel_file(worker_env: pathlib.Path) -> None:
     """Execution lock creates sentinel file during execution."""
     sentinel_path = worker_env / "test_stage.running"
 
-    with executor._execution_lock("test_stage", worker_env) as sentinel:
+    with worker._execution_lock("test_stage", worker_env) as sentinel:
         assert sentinel.exists()
         assert sentinel == sentinel_path
         content = sentinel.read_text()
@@ -612,7 +613,7 @@ def test_execution_lock_removes_sentinel_on_exception(worker_env: pathlib.Path) 
     """Execution lock removes sentinel even when exception occurs."""
     sentinel_path = worker_env / "test_stage.running"
 
-    with pytest.raises(RuntimeError), executor._execution_lock("test_stage", worker_env):
+    with pytest.raises(RuntimeError), worker._execution_lock("test_stage", worker_env):
         assert sentinel_path.exists()
         raise RuntimeError("intentional")
 
@@ -621,7 +622,7 @@ def test_execution_lock_removes_sentinel_on_exception(worker_env: pathlib.Path) 
 
 def test_acquire_execution_lock_succeeds_when_available(worker_env: pathlib.Path) -> None:
     """Acquire lock succeeds when no lock exists."""
-    sentinel = executor._acquire_execution_lock("test_stage", worker_env)
+    sentinel = worker._acquire_execution_lock("test_stage", worker_env)
 
     assert sentinel.exists()
     assert sentinel == worker_env / "test_stage.running"
@@ -638,7 +639,7 @@ def test_acquire_execution_lock_fails_when_held_by_live_process(
     sentinel.write_text(f"pid: {os.getpid()}\n")
 
     with pytest.raises(exceptions.StageAlreadyRunningError) as exc_info:
-        executor._acquire_execution_lock("test_stage", worker_env)
+        worker._acquire_execution_lock("test_stage", worker_env)
 
     assert "already running" in str(exc_info.value)
     assert str(os.getpid()) in str(exc_info.value)
@@ -652,7 +653,7 @@ def test_acquire_execution_lock_breaks_stale_lock(worker_env: pathlib.Path) -> N
     sentinel = worker_env / "test_stage.running"
     sentinel.write_text("pid: 999999999\n")  # Non-existent PID
 
-    result_sentinel = executor._acquire_execution_lock("test_stage", worker_env)
+    result_sentinel = worker._acquire_execution_lock("test_stage", worker_env)
 
     assert result_sentinel.exists()
     assert result_sentinel == sentinel
@@ -666,7 +667,7 @@ def test_acquire_execution_lock_breaks_corrupted_lock(worker_env: pathlib.Path) 
     sentinel = worker_env / "test_stage.running"
     sentinel.write_text("corrupted content")
 
-    result_sentinel = executor._acquire_execution_lock("test_stage", worker_env)
+    result_sentinel = worker._acquire_execution_lock("test_stage", worker_env)
 
     assert result_sentinel.exists()
 
@@ -679,7 +680,7 @@ def test_acquire_execution_lock_breaks_negative_pid_lock(worker_env: pathlib.Pat
     sentinel = worker_env / "test_stage.running"
     sentinel.write_text("pid: -1\n")
 
-    result_sentinel = executor._acquire_execution_lock("test_stage", worker_env)
+    result_sentinel = worker._acquire_execution_lock("test_stage", worker_env)
 
     assert result_sentinel.exists()
 
@@ -694,18 +695,18 @@ def test_acquire_execution_lock_breaks_negative_pid_lock(worker_env: pathlib.Pat
 
 def test_is_process_alive_returns_true_for_self() -> None:
     """is_process_alive returns True for own PID."""
-    assert executor._is_process_alive(os.getpid())
+    assert worker._is_process_alive(os.getpid())
 
 
 def test_is_process_alive_returns_false_for_nonexistent() -> None:
     """is_process_alive returns False for non-existent PID."""
-    assert not executor._is_process_alive(999999999)
+    assert not worker._is_process_alive(999999999)
 
 
 def test_is_process_alive_returns_true_for_init() -> None:
     """is_process_alive returns True for PID 1 (init/systemd)."""
     # PID 1 always exists (init/systemd)
-    assert executor._is_process_alive(1)
+    assert worker._is_process_alive(1)
 
 
 # =============================================================================
