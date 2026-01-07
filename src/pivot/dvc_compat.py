@@ -346,17 +346,22 @@ def _extract_dvc_params(stage: PipelineStage) -> dict[str, Any]:  # pragma: no c
 
 def _register_imported_stage(spec: StageSpec) -> None:  # pragma: no cover
     """Register an imported DVC stage with Pivot."""
+    _register_imported_stage_with_name(spec, spec.name)
+
+
+def _register_imported_stage_with_name(spec: StageSpec, name: str) -> None:  # pragma: no cover
+    """Register an imported DVC stage with a custom name."""
     root = project.get_project_root()
 
     def wrapper() -> None:
         subprocess.run(spec.cmd, shell=True, check=True, cwd=root)  # noqa: S602
 
-    wrapper.__name__ = spec.name
+    wrapper.__name__ = name
     wrapper.__module__ = "pivot.dvc_compat"
 
     registry.REGISTRY.register(
         wrapper,
-        name=spec.name,
+        name=name,
         deps=list(spec.deps),
         outs=spec.outs,
     )

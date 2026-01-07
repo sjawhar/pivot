@@ -294,7 +294,6 @@ def test_lock_directory_created(tmp_path: Path) -> None:
         "",
         "../etc/passwd",
         "stage/nested",
-        "stage.with.dots",
         "stage with spaces",
         "stage\nwith\nnewlines",
         "../../traversal",
@@ -315,6 +314,8 @@ def test_invalid_stage_name_rejected(tmp_path: Path, invalid_name: str) -> None:
         "Stage123",
         "a",
         "A-B_C",
+        "stage.with.dots",
+        "stage@0.5",  # DVC matrix parameter format
     ],
 )
 def test_valid_stage_names_accepted(tmp_path: Path, valid_name: str) -> None:

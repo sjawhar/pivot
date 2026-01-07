@@ -30,7 +30,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_VALID_STAGE_NAME = re.compile(r"^[a-zA-Z0-9_@-]+$")
+_VALID_STAGE_NAME = re.compile(r"^[a-zA-Z0-9_@.\-]+$")
 _MAX_STAGE_NAME_LEN = 200  # Leave room for ".lock" suffix within filesystem NAME_MAX (255)
 _VALID_LOCK_KEYS = frozenset({"code_manifest", "params", "dep_hashes", "output_hashes"})
 
