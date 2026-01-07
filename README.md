@@ -150,7 +150,7 @@ class TrainParams(BaseModel):
     epochs: int = 100
     batch_size: int = 32
 
-@stage(deps=['data.csv'], outs=['model.pkl'], params_cls=TrainParams)
+@stage(deps=['data.csv'], outs=['model.pkl'], params=TrainParams)
 def train(params: TrainParams):
     print(f"Training with lr={params.learning_rate}")
 ```

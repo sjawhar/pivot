@@ -6,6 +6,7 @@ Provides formatted output for pipeline execution with:
 - Timing information
 """
 
+import os
 import pathlib
 import sys
 import time
@@ -38,8 +39,6 @@ def _supports_color(stream: TextIO) -> bool:
     if not stream.isatty():
         return False
     # Check for NO_COLOR environment variable
-    import os
-
     return not os.environ.get("NO_COLOR")
 
 

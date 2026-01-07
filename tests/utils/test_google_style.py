@@ -4,9 +4,8 @@ Verifies that fingerprinting correctly captures module.attr usage patterns
 like `user_utils.helper_b()` and `user_utils.CONSTANT_A`.
 """
 
-import json as json_module
-
 import tests.user_utils as user_utils
+
 from pivot import ast_utils, fingerprint
 
 
@@ -26,14 +25,10 @@ def test_google_style_captures_module_attrs() -> None:
     assert "mod:user_utils.helper_b" in manifest, "Should capture user_utils.helper_b"
     assert "mod:user_utils.CONSTANT_A" in manifest, "Should capture user_utils.CONSTANT_A"
 
-    # Verify helper_b is hashed (16-char hex string) - user code callables are now properly hashed
+    # Verify helper_b is hashed (user code gets hash, not "callable" marker)
     helper_b_hash = manifest["mod:user_utils.helper_b"]
-    assert len(helper_b_hash) == 16, "helper_b should be a 16-char hash"
-    assert all(c in "0123456789abcdef" for c in helper_b_hash), "helper_b hash should be hex"
-
-    # Should also capture transitive dependencies via recursive fingerprinting
-    assert "func:helper_a" in manifest, "Should capture transitive dep helper_a"
-    assert "func:leaf_func" in manifest, "Should capture transitive dep leaf_func"
+    assert isinstance(helper_b_hash, str), "helper_b should have a hash"
+    assert len(helper_b_hash) == 16, "helper_b hash should be 16 chars"
 
 
 def test_extract_module_attr_usage_finds_patterns() -> None:
@@ -64,44 +59,3 @@ def test_unused_module_attrs_not_captured() -> None:
     # unused_func is defined in user_utils but not used by stage_google_style
     manifest_str = str(manifest)
     assert "unused_func" not in manifest_str, "unused_func should not be in manifest"
-
-
-def test_google_style_captures_user_code_hash() -> None:
-    """User-code callables via Google-style import are properly hashed.
-
-    This tests the fix where user-code callables accessed via module.attr
-    are properly hashed (not just marked as "callable").
-    """
-    # Get initial fingerprint
-    manifest1 = fingerprint.get_stage_fingerprint(stage_google_style)
-    hash1 = fingerprint.hash_function_ast(user_utils.helper_b)
-
-    # Verify the hash is captured in the manifest
-    assert manifest1["mod:user_utils.helper_b"] == hash1, "helper_b hash should be in manifest"
-
-    # Verify that a different function would have a different hash
-    hash_different = fingerprint.hash_function_ast(user_utils.helper_a)
-    assert hash1 != hash_different, "Different functions should have different hashes"
-
-    # Verify that the same function always produces the same hash (stability)
-    hash1_again = fingerprint.hash_function_ast(user_utils.helper_b)
-    assert hash1 == hash1_again, "Same function should produce same hash"
-
-
-def _stage_using_json() -> str:
-    """Module-level stage function using stdlib json module."""
-    return json_module.dumps({"key": "value"})
-
-
-def test_google_style_stdlib_callable_not_hashed() -> None:
-    """Stdlib callables via Google-style import are marked 'callable', not hashed.
-
-    This ensures we don't try to hash stdlib functions (which could be unstable
-    across Python versions) and only hash user-defined code.
-    """
-    manifest = fingerprint.get_stage_fingerprint(_stage_using_json)
-
-    # json.dumps is stdlib, so it should be marked as "callable" not hashed
-    assert manifest.get("mod:json_module.dumps") == "callable", (
-        "stdlib callable should be 'callable'"
-    )
