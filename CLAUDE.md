@@ -67,16 +67,31 @@ if __name__ == '__main__':
 - Use `Callable[..., Any]` for function params, not bare `Any`.
 - Document why when using `Any`.
 
-## TypedDict Access (Critical)
+## TypedDict Usage (Critical)
 
 **Never use `.get()` on TypedDicts.** TypedDicts have known keys at type-check time—use direct key access.
 TypedDicts with `total=False` or `NotRequired` fields may have optional fields, in which case you should
 use `if "key" in dict: ...` to check for the key and then use `dict["key"]` to access the value.
 
+**Use constructor syntax when returning TypedDicts**—not dict literals. This provides better type checking and makes the code self-documenting:
+
+```python
+class ChangeCheckResult(TypedDict):
+    changed: bool
+    reason: str
+
+# Good - constructor syntax
+return ChangeCheckResult(changed=True, reason="code changed")
+
+# Bad - dict literal (no type validation)
+return {"changed": True, "reason": "code changed"}
+```
+
 ## Import Style (Google Python Style Guide)
 
 - Import modules, not functions: `from pivot import fingerprint` then `fingerprint.get_stage_fingerprint(...)`.
 - No relative imports; no `sys.path` modifications.
+- **This applies to all packages including third-party**—use `import pydantic` then `pydantic.BaseModel`, not `from pydantic import BaseModel`.
 - No exceptions for stdlib—use `import pathlib` then `pathlib.Path`, not `from pathlib import Path`.
 - Exception: type hints in `TYPE_CHECKING` blocks may import types directly.
 - Exception: types from `pivot.types` may be imported directly: `from pivot.types import StageStatus, StageResult`.
@@ -86,17 +101,25 @@ use `if "key" in dict: ...` to check for the key and then use `dict["key"]` to a
 from pivot import fingerprint
 from pivot.types import StageStatus, StageResult
 import pathlib
+import pydantic
 
 fp = fingerprint.get_stage_fingerprint(func)
 path = pathlib.Path("/some/path")
 status = StageStatus.READY
 
+class MyParams(pydantic.BaseModel):
+    learning_rate: float = 0.01
+
 # Bad
 from pivot.fingerprint import get_stage_fingerprint
 from pathlib import Path
+from pydantic import BaseModel
 
 fp = get_stage_fingerprint(func)  # Where is this from?
 path = Path("/some/path")  # Where is Path from?
+
+class MyParams(BaseModel):  # Where is BaseModel from?
+    learning_rate: float = 0.01
 ```
 
 ## No `__all__` Declarations
@@ -104,6 +127,10 @@ path = Path("/some/path")  # Where is Path from?
 - Don't use `__all__` in modules—it's unnecessary maintenance overhead.
 - Use underscore prefix (`_helper`) to indicate private functions.
 - For package `__init__.py` re-exports, use explicit re-export syntax: `from module import X as X`.
+
+## No Tiny Wrapper Functions
+
+**Never create 1-2 line functions that just wrap a third-party library call—call the library directly.**
 
 ## Docstrings
 

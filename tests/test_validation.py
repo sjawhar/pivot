@@ -20,10 +20,10 @@ def test_duplicate_stage_name_raises_error() -> None:
     def stage2() -> None:
         pass
 
-    reg.register(stage1, name="process", deps=list[str](), outs=list[str](), params_cls=None)
+    reg.register(stage1, name="process", deps=list[str](), outs=list[str]())
 
     with pytest.raises(ValidationError, match="already registered"):
-        reg.register(stage2, name="process", deps=list[str](), outs=list[str](), params_cls=None)
+        reg.register(stage2, name="process", deps=list[str](), outs=list[str]())
 
 
 def test_duplicate_stage_name_with_warning_mode() -> None:
@@ -36,10 +36,10 @@ def test_duplicate_stage_name_with_warning_mode() -> None:
     def stage2() -> None:
         pass
 
-    reg.register(stage1, name="process", deps=list[str](), outs=list[str](), params_cls=None)
+    reg.register(stage1, name="process", deps=list[str](), outs=list[str]())
 
     # Should not raise, just warn
-    reg.register(stage2, name="process", deps=list[str](), outs=list[str](), params_cls=None)
+    reg.register(stage2, name="process", deps=list[str](), outs=list[str]())
 
     # Second registration should overwrite
     assert reg.get("process")["func"] is stage2
@@ -58,7 +58,6 @@ def test_invalid_dep_path_with_parent_traversal() -> None:
             name="process",
             deps=["../secrets/passwords.txt"],
             outs=list[str](),
-            params_cls=None,
         )
 
 
@@ -75,7 +74,6 @@ def test_invalid_out_path_with_parent_traversal() -> None:
             name="process",
             deps=list[str](),
             outs=["../system/file.txt"],
-            params_cls=None,
         )
 
 
@@ -92,7 +90,6 @@ def test_invalid_path_with_null_byte() -> None:
             name="process",
             deps=["data\x00.csv"],
             outs=list[str](),
-            params_cls=None,
         )
 
 
@@ -109,7 +106,6 @@ def test_invalid_path_with_newline() -> None:
             name="process",
             deps=["file\nname.csv"],
             outs=list[str](),
-            params_cls=None,
         )
 
 
@@ -123,12 +119,10 @@ def test_output_conflict_raises_error() -> None:
     def stage2() -> None:
         pass
 
-    reg.register(stage1, name="process1", deps=list[str](), outs=["output.txt"], params_cls=None)
+    reg.register(stage1, name="process1", deps=list[str](), outs=["output.txt"])
 
     with pytest.raises(ValidationError, match="produced by both"):
-        reg.register(
-            stage2, name="process2", deps=list[str](), outs=["output.txt"], params_cls=None
-        )
+        reg.register(stage2, name="process2", deps=list[str](), outs=["output.txt"])
 
 
 def test_output_conflict_with_warning_mode() -> None:
@@ -141,10 +135,10 @@ def test_output_conflict_with_warning_mode() -> None:
     def stage2() -> None:
         pass
 
-    reg.register(stage1, name="process1", deps=list[str](), outs=["output.txt"], params_cls=None)
+    reg.register(stage1, name="process1", deps=list[str](), outs=["output.txt"])
 
     # Should not raise, just warn
-    reg.register(stage2, name="process2", deps=list[str](), outs=["output.txt"], params_cls=None)
+    reg.register(stage2, name="process2", deps=list[str](), outs=["output.txt"])
 
 
 def test_empty_stage_name_raises_error() -> None:
@@ -155,7 +149,7 @@ def test_empty_stage_name_raises_error() -> None:
         pass
 
     with pytest.raises(ValidationError, match="cannot be empty"):
-        reg.register(stage1, name="", deps=list[str](), outs=list[str](), params_cls=None)
+        reg.register(stage1, name="", deps=list[str](), outs=list[str]())
 
 
 def test_whitespace_only_stage_name_raises_error() -> None:
@@ -166,7 +160,7 @@ def test_whitespace_only_stage_name_raises_error() -> None:
         pass
 
     with pytest.raises(ValidationError, match="cannot be empty"):
-        reg.register(stage1, name="   ", deps=list[str](), outs=list[str](), params_cls=None)
+        reg.register(stage1, name="   ", deps=list[str](), outs=list[str]())
 
 
 def test_valid_inputs_pass_silently() -> None:
@@ -182,7 +176,6 @@ def test_valid_inputs_pass_silently() -> None:
         name="process",
         deps=["data/input.csv"],
         outs=["data/output.csv"],
-        params_cls=None,
     )
 
     assert "process" in reg.list_stages()
@@ -201,7 +194,6 @@ def test_invalid_path_with_parent_traversal_warn_mode() -> None:
         name="process",
         deps=["../external/data.csv"],
         outs=list[str](),
-        params_cls=None,
     )
 
     assert "process" in reg.list_stages()
@@ -215,8 +207,6 @@ def test_invalid_path_with_null_byte_warn_mode() -> None:
         pass
 
     # Should not raise, just warn
-    reg.register(
-        stage1, name="process", deps=["bad\x00file.csv"], outs=list[str](), params_cls=None
-    )
+    reg.register(stage1, name="process", deps=["bad\x00file.csv"], outs=list[str]())
 
     assert "process" in reg.list_stages()

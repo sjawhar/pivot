@@ -159,6 +159,31 @@ def test_find_root(tmp_path, directories, work_dir, expected_root):
 - `tmp_pipeline_dir` - temporary directory for pipeline tests.
 - `sample_data_file` - create sample CSV.
 
+## Mocking (Critical)
+
+**Use `mocker` or `monkeypatch` fixtures for overriding state—never manual assignment.**
+
+```python
+# Good - mocker automatically restores after test
+@pytest.fixture(autouse=True)
+def reset_state(mocker: MockerFixture) -> Generator[None]:
+    mocker.patch.object(module, "_cache", None)
+    yield
+
+# Good - monkeypatch also auto-restores
+def test_something(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(module, "_cache", {})
+    ...
+
+# Bad - manual assignment requires cleanup and can leak between tests
+@pytest.fixture(autouse=True)
+def reset_state() -> Generator[None]:
+    old_value = module._cache
+    module._cache = None
+    yield
+    module._cache = old_value  # Error-prone, can forget to restore
+```
+
 ## Debugging
 
 ```bash

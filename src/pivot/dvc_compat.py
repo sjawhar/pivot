@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any
 
 import yaml
 
-from pivot import outputs, params, project, registry
+from pivot import outputs, project, registry
 from pivot.exceptions import DVCImportError, ExportError
 
 if TYPE_CHECKING:
@@ -90,11 +90,10 @@ def _generate_params_yaml(
     all_params: dict[str, Any] = {}
 
     for name, info in stages.items():
-        params_cls = info["params_cls"]
-        if params_cls is not None:
-            # Use Pydantic model defaults
-            params_instance = params.build_params_instance(params_cls, name, {})
-            stage_params = params.params_to_dict(params_instance)
+        params_instance = info["params"]
+        if params_instance is not None:
+            # Use stored Pydantic model instance
+            stage_params = params_instance.model_dump()
         else:
             # Fall back to signature defaults
             sig = info["signature"]

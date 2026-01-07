@@ -8,6 +8,7 @@ license = { text = "TBD" }
 authors = [{ name = "Internal Team" }]
 dependencies = [
     "click>=8.0",
+    "deepmerge>=2.0",
     "loky>=3.4",
     "networkx>=3.0",
     "pydantic>=2.0",

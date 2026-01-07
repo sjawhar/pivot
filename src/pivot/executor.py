@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast
 import loky
 import pydantic
 
-from pivot import cache, console, dag, exceptions, lock, outputs, params, project, registry
+from pivot import cache, console, dag, exceptions, lock, outputs, parameters, project, registry
 from pivot.types import (
     LockData,
     OnError,
@@ -64,8 +64,18 @@ class WorkerStageInfo(TypedDict):
     deps: list[str]
     outs: list[outputs.BaseOut]
     signature: Signature | None
-    params_cls: type[BaseModel] | None
-    yaml_overrides: params.YamlParams
+    params: BaseModel | None
+    variant: str | None
+    overrides: parameters.ParamsOverrides
+
+
+class ChangeCheckResult(TypedDict):
+    """Result of checking if a stage needs to run."""
+
+    changed: bool
+    reason: str
+    missing_deps: list[str]
+    current_params: dict[str, Any]
 
 
 @dataclasses.dataclass
@@ -126,9 +136,6 @@ def run(
 
     graph = registry.REGISTRY.build_dag(validate=True)
 
-    # Load params.yaml once at initialization (fail fast if invalid)
-    yaml_overrides = params.load_params_yaml()
-
     if stages:
         registered = set(graph.nodes())
         unknown = [s for s in stages if s not in registered]
@@ -139,6 +146,9 @@ def run(
 
     if not execution_order:
         return {}
+
+    # Load parameter overrides early to validate and prepare for workers
+    overrides = parameters.load_params_yaml()
 
     # Check for uncached IncrementalOut files that would be lost
     if not force:
@@ -172,7 +182,7 @@ def run(
         con=con,
         total_stages=total_stages,
         stage_timeout=stage_timeout,
-        yaml_overrides=yaml_overrides,
+        overrides=overrides,
     )
 
     results = _build_results(stage_states)
@@ -241,9 +251,10 @@ def _execute_greedy(
     con: console.Console | None,
     total_stages: int,
     stage_timeout: float | None = None,
-    yaml_overrides: params.YamlParams | None = None,
+    overrides: parameters.ParamsOverrides | None = None,
 ) -> None:
     """Execute stages with greedy parallel scheduling using loky ProcessPoolExecutor."""
+    overrides = overrides or {}
     completed_count = 0
     futures: dict[concurrent.futures.Future[StageResult], str] = {}
     mutex_counts: collections.defaultdict[str, int] = collections.defaultdict(int)
@@ -276,7 +287,7 @@ def _execute_greedy(
                 con=con,
                 total_stages=total_stages,
                 completed_count=completed_count,
-                yaml_overrides=yaml_overrides or {},
+                overrides=overrides,
             )
 
             while futures:
@@ -397,7 +408,7 @@ def _execute_greedy(
                         con=con,
                         total_stages=total_stages,
                         completed_count=completed_count,
-                        yaml_overrides=yaml_overrides or {},
+                        overrides=overrides,
                     )
     finally:
         # Signal output thread to stop - may fail if queue is broken
@@ -439,7 +450,7 @@ def _start_ready_stages(
     con: console.Console | None,
     total_stages: int,
     completed_count: int,
-    yaml_overrides: params.YamlParams,
+    overrides: parameters.ParamsOverrides,
 ) -> None:
     """Find and start stages that are ready to execute."""
     started = 0
@@ -466,7 +477,7 @@ def _start_ready_stages(
         for mutex in state.mutex:
             mutex_counts[mutex] += 1
 
-        worker_info = _prepare_worker_info(state.info, yaml_overrides)
+        worker_info = _prepare_worker_info(state.info, overrides)
 
         try:
             future = executor.submit(
@@ -499,7 +510,7 @@ def _start_ready_stages(
 
 def _prepare_worker_info(
     stage_info: registry.RegistryStageInfo,
-    yaml_overrides: params.YamlParams,
+    overrides: parameters.ParamsOverrides,
 ) -> WorkerStageInfo:
     """Prepare stage info for pickling to worker process."""
     return WorkerStageInfo(
@@ -508,8 +519,9 @@ def _prepare_worker_info(
         deps=stage_info["deps"],
         outs=stage_info["outs"],
         signature=stage_info["signature"],
-        params_cls=stage_info["params_cls"],
-        yaml_overrides=yaml_overrides,
+        params=stage_info["params"],
+        variant=stage_info["variant"],
+        overrides=overrides,
     )
 
 
@@ -520,7 +532,7 @@ def _mark_stage_failed(
     error_mode: OnError,
 ) -> None:
     """Mark a stage as failed and handle downstream effects."""
-    state.result = {"status": "failed", "reason": reason, "output_lines": []}
+    state.result = StageResult(status="failed", reason=reason, output_lines=[])
     state.status = StageStatus.FAILED
     state.end_time = time.perf_counter()
     _handle_stage_failure(state.name, stage_states, error_mode)
@@ -558,11 +570,11 @@ def _handle_stage_failure(
         state = stage_states.get(stage_name)
         if state and state.status == StageStatus.READY:
             state.status = StageStatus.SKIPPED
-            state.result = {
-                "status": "skipped",
-                "reason": f"upstream '{failed_stage}' failed",
-                "output_lines": [],
-            }
+            state.result = StageResult(
+                status="skipped",
+                reason=f"upstream '{failed_stage}' failed",
+                output_lines=[],
+            )
 
 
 def execute_stage_worker(
@@ -575,27 +587,31 @@ def execute_stage_worker(
     output_lines: list[tuple[str, bool]] = []
     files_cache_dir = cache_dir / "files"
 
-    try:
-        current_params, params_instance = params.extract_stage_params(
-            stage_info["params_cls"],
-            stage_info["signature"],
-            stage_name,
-            stage_info["yaml_overrides"],
-        )
-    except pydantic.ValidationError as e:
-        return {"status": "failed", "reason": f"params validation: {e}", "output_lines": []}
-
     stage_lock = lock.StageLock(stage_name, cache_dir)
     current_fingerprint = stage_info["fingerprint"]
     dep_hashes, missing = hash_dependencies(stage_info["deps"])
     stage_outs = stage_info["outs"]
 
+    # Apply YAML overrides BEFORE change detection so params.yaml changes trigger re-runs
+    params_instance = stage_info["params"]
+    overrides = stage_info["overrides"]
+    try:
+        current_params = parameters.get_effective_params(params_instance, stage_name, overrides)
+        if params_instance is not None:
+            params_instance = parameters.apply_overrides(params_instance, stage_name, overrides)
+    except pydantic.ValidationError as e:
+        return StageResult(
+            status="failed",
+            reason=f"Invalid params override in params.yaml: {e.error_count()} validation error(s)",
+            output_lines=[],
+        )
+
     if missing:
-        return {
-            "status": "failed",
-            "reason": f"missing deps: {', '.join(missing)}",
-            "output_lines": [],
-        }
+        return StageResult(
+            status="failed",
+            reason=f"missing deps: {', '.join(missing)}",
+            output_lines=[],
+        )
 
     changed, reason = stage_lock.is_changed(current_fingerprint, current_params, dep_hashes)
 
@@ -609,14 +625,18 @@ def execute_stage_worker(
             changed, reason = True, "outputs missing from cache"
 
     if not changed:
-        return {"status": "skipped", "reason": "unchanged", "output_lines": []}
+        return StageResult(status="skipped", reason="unchanged", output_lines=[])
 
     try:
         with _execution_lock(stage_name, cache_dir):
             _prepare_outputs_for_execution(stage_outs, lock_data_prev, files_cache_dir)
 
             _run_stage_function_with_capture(
-                stage_info["func"], stage_name, output_queue, output_lines, params_instance
+                stage_info["func"],
+                stage_name,
+                output_queue,
+                output_lines,
+                params_instance,
             )
 
             output_hashes = _save_outputs_to_cache(stage_outs, files_cache_dir)
@@ -629,22 +649,22 @@ def execute_stage_worker(
             }
             stage_lock.write(lock_data)
 
-        return {"status": "ran", "reason": reason, "output_lines": output_lines}
+        return StageResult(status="ran", reason=reason, output_lines=output_lines)
 
     except exceptions.StageAlreadyRunningError as e:
-        return {"status": "failed", "reason": str(e), "output_lines": output_lines}
+        return StageResult(status="failed", reason=str(e), output_lines=output_lines)
     except exceptions.OutputMissingError as e:
-        return {"status": "failed", "reason": str(e), "output_lines": output_lines}
+        return StageResult(status="failed", reason=str(e), output_lines=output_lines)
     except SystemExit as e:
-        return {
-            "status": "failed",
-            "reason": f"Stage called sys.exit({e.code})",
-            "output_lines": output_lines,
-        }
+        return StageResult(
+            status="failed",
+            reason=f"Stage called sys.exit({e.code})",
+            output_lines=output_lines,
+        )
     except KeyboardInterrupt:
-        return {"status": "failed", "reason": "KeyboardInterrupt", "output_lines": output_lines}
+        return StageResult(status="failed", reason="KeyboardInterrupt", output_lines=output_lines)
     except Exception as e:
-        return {"status": "failed", "reason": str(e), "output_lines": output_lines}
+        return StageResult(status="failed", reason=str(e), output_lines=output_lines)
 
 
 def _restore_outputs_from_cache(
@@ -739,10 +759,10 @@ def _run_stage_function_with_capture(
         _QueueWriter(stage_name, output_queue, is_stderr=False, output_lines=output_lines),
         _QueueWriter(stage_name, output_queue, is_stderr=True, output_lines=output_lines),
     ):
+        kwargs = dict[str, Any]()
         if params_instance is not None:
-            func(params=params_instance)
-        else:
-            func()
+            kwargs["params"] = params_instance
+        func(**kwargs)
 
 
 class _QueueWriter:
@@ -757,7 +777,7 @@ class _QueueWriter:
     _is_stderr: bool
     _output_lines: list[tuple[str, bool]]
     _buffer: str
-    _redirect: contextlib.AbstractContextManager[Any]
+    _redirect: contextlib.AbstractContextManager[None]
 
     def __init__(
         self,
@@ -773,10 +793,11 @@ class _QueueWriter:
         self._output_lines = output_lines
         self._buffer = ""
         # Create redirect context manager (not yet entered)
+        # _QueueWriter implements write/flush but not full IO[str] interface
         if is_stderr:
-            self._redirect = contextlib.redirect_stderr(self)
+            self._redirect = contextlib.redirect_stderr(self)  # pyright: ignore[reportArgumentType]
         else:
-            self._redirect = contextlib.redirect_stdout(self)
+            self._redirect = contextlib.redirect_stdout(self)  # pyright: ignore[reportArgumentType]
 
     def __enter__(self) -> _QueueWriter:
         self._redirect.__enter__()
@@ -820,14 +841,14 @@ def _build_results(stage_states: dict[str, StageState]) -> dict[str, ExecutionSu
     results = dict[str, ExecutionSummary]()
     for name, state in stage_states.items():
         if state.result:
-            results[name] = {
-                "status": state.result["status"],
-                "reason": state.result["reason"],
-            }
+            results[name] = ExecutionSummary(
+                status=state.result["status"],
+                reason=state.result["reason"],
+            )
         elif state.status == StageStatus.SKIPPED:
-            results[name] = {"status": "skipped", "reason": "upstream failed"}
+            results[name] = ExecutionSummary(status="skipped", reason="upstream failed")
         else:
-            results[name] = {"status": "unknown", "reason": "never executed"}
+            results[name] = ExecutionSummary(status="unknown", reason="never executed")
     return results
 
 
@@ -860,17 +881,6 @@ def _check_uncached_incremental_outputs(
     return uncached
 
 
-def extract_params(stage_info: WorkerStageInfo, stage_name: str = "") -> dict[str, Any]:
-    """Extract parameter values for change detection (dict only, no instance)."""
-    params_dict, _ = params.extract_stage_params(
-        stage_info["params_cls"],
-        stage_info["signature"],
-        stage_name,
-        stage_info["yaml_overrides"],
-    )
-    return params_dict
-
-
 def hash_dependencies(deps: list[str]) -> tuple[dict[str, str], list[str]]:
     """Hash all dependency files and directories. Returns (hashes, missing_files)."""
     hashes = dict[str, str]()
@@ -891,6 +901,49 @@ def hash_dependencies(deps: list[str]) -> tuple[dict[str, str], list[str]]:
 def hash_file(path: pathlib.Path) -> str:
     """Hash file contents using xxhash64."""
     return cache.hash_file(path)
+
+
+def check_stage_changed(
+    stage_name: str,
+    fingerprint: dict[str, str],
+    deps: list[str],
+    params_instance: BaseModel | None,
+    overrides: parameters.ParamsOverrides | None,
+    cache_dir: pathlib.Path,
+) -> ChangeCheckResult:
+    """Check if a stage needs to run based on fingerprint, deps, and params.
+
+    Single source of truth for change detection logic used by both executor and CLI.
+    Does NOT check output cache restoration - that's executor-specific.
+    """
+    stage_lock = lock.StageLock(stage_name, cache_dir)
+    dep_hashes, missing_deps = hash_dependencies(deps)
+
+    try:
+        current_params = parameters.get_effective_params(params_instance, stage_name, overrides)
+    except pydantic.ValidationError as e:
+        return ChangeCheckResult(
+            changed=True,
+            reason=f"invalid params.yaml: {e.error_count()} error(s)",
+            missing_deps=[],
+            current_params={},
+        )
+
+    if missing_deps:
+        return ChangeCheckResult(
+            changed=True,
+            reason=f"missing deps: {', '.join(missing_deps)}",
+            missing_deps=missing_deps,
+            current_params=current_params,
+        )
+
+    changed, reason = stage_lock.is_changed(fingerprint, current_params, dep_hashes)
+    return ChangeCheckResult(
+        changed=changed,
+        reason=reason,
+        missing_deps=[],
+        current_params=current_params,
+    )
 
 
 _MAX_LOCK_ATTEMPTS = 3

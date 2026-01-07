@@ -24,8 +24,9 @@ def _create_stage(name: str, deps: list[str], outs: list[str]) -> RegistryStageI
         deps=deps,
         outs=[outputs.Out(path=out) for out in outs],
         outs_paths=outs,
-        params_cls=TestParams,
+        params=TestParams(),
         mutex=[],
+        variant=None,
         signature=None,
         fingerprint={},
     )

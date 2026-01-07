@@ -44,8 +44,9 @@ def test_execute_stage_worker_with_missing_deps(worker_env: pathlib.Path) -> Non
         "deps": ["missing_file.txt"],
         "signature": None,
         "outs": [],
-        "params_cls": None,
-        "yaml_overrides": {},
+        "params": None,
+        "variant": None,
+        "overrides": {},
     }
 
     result = executor.execute_stage_worker(
@@ -77,8 +78,9 @@ def test_execute_stage_worker_with_directory_dep(
         "deps": ["data_dir"],
         "signature": None,
         "outs": [],
-        "params_cls": None,
-        "yaml_overrides": {},
+        "params": None,
+        "variant": None,
+        "overrides": {},
     }
 
     result = executor.execute_stage_worker(
@@ -107,8 +109,9 @@ def test_execute_stage_worker_runs_unchanged_stage(
         "deps": ["input.txt"],
         "signature": None,
         "outs": [],
-        "params_cls": None,
-        "yaml_overrides": {},
+        "params": None,
+        "variant": None,
+        "overrides": {},
     }
 
     # First run - creates lock file
@@ -149,8 +152,9 @@ def test_execute_stage_worker_reruns_when_fingerprint_changes(
         "deps": ["input.txt"],
         "signature": None,
         "outs": [],
-        "params_cls": None,
-        "yaml_overrides": {},
+        "params": None,
+        "variant": None,
+        "overrides": {},
     }
 
     # First run
@@ -194,8 +198,9 @@ def test_execute_stage_worker_handles_stage_exception(
         "deps": ["input.txt"],
         "signature": None,
         "outs": [],
-        "params_cls": None,
-        "yaml_overrides": {},
+        "params": None,
+        "variant": None,
+        "overrides": {},
     }
 
     result = executor.execute_stage_worker(
@@ -224,8 +229,9 @@ def test_execute_stage_worker_handles_sys_exit(
         "deps": ["input.txt"],
         "signature": None,
         "outs": [],
-        "params_cls": None,
-        "yaml_overrides": {},
+        "params": None,
+        "variant": None,
+        "overrides": {},
     }
 
     result = executor.execute_stage_worker(
@@ -255,8 +261,9 @@ def test_execute_stage_worker_handles_keyboard_interrupt(
         "deps": ["input.txt"],
         "signature": None,
         "outs": [],
-        "params_cls": None,
-        "yaml_overrides": {},
+        "params": None,
+        "variant": None,
+        "overrides": {},
     }
 
     result = executor.execute_stage_worker(
@@ -704,61 +711,6 @@ def test_is_process_alive_returns_true_for_init() -> None:
 # =============================================================================
 # Helper Function Tests
 # =============================================================================
-
-
-def test_extract_params_with_no_signature() -> None:
-    """extract_params returns empty dict when no signature."""
-    stage_info = executor.WorkerStageInfo(
-        func=lambda: None,
-        fingerprint={},
-        deps=[],
-        outs=[],
-        signature=None,
-        params_cls=None,
-        yaml_overrides={},
-    )
-    result = executor.extract_params(stage_info)
-    assert result == {}
-
-
-def test_extract_params_with_no_defaults() -> None:
-    """extract_params returns empty dict when no default parameters."""
-    import inspect
-
-    def func(a: int, b: str) -> None:
-        pass
-
-    stage_info = executor.WorkerStageInfo(
-        func=func,
-        fingerprint={},
-        deps=[],
-        outs=[],
-        signature=inspect.signature(func),
-        params_cls=None,
-        yaml_overrides={},
-    )
-    result = executor.extract_params(stage_info)
-    assert result == {}
-
-
-def test_extract_params_with_defaults() -> None:
-    """extract_params extracts parameters with default values."""
-    import inspect
-
-    def func(a: int, b: str = "default", c: float = 3.14) -> None:
-        pass
-
-    stage_info = executor.WorkerStageInfo(
-        func=func,
-        fingerprint={},
-        deps=[],
-        outs=[],
-        signature=inspect.signature(func),
-        params_cls=None,
-        yaml_overrides={},
-    )
-    result = executor.extract_params(stage_info)
-    assert result == {"b": "default", "c": 3.14}
 
 
 def test_hash_dependencies_with_existing_files(tmp_path: pathlib.Path) -> None:
