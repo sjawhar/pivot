@@ -51,7 +51,11 @@ class StateDB:
             raise RuntimeError("Cannot operate on closed StateDB")
 
     def get(self, path: pathlib.Path, fs_stat: os.stat_result) -> str | None:
-        """Return cached hash if file metadata matches, else None."""
+        """Return cached hash if file metadata matches, else None.
+
+        Note: Uses resolved paths (symlinks followed) as keys because state DB
+        is local-only. Lock files use normalized paths for portability.
+        """
         self._check_closed()
         abs_path = str(path.resolve())
         with self._lock:
@@ -63,7 +67,10 @@ class StateDB:
         return row[0] if row else None
 
     def save(self, path: pathlib.Path, fs_stat: os.stat_result, file_hash: str) -> None:
-        """Cache file metadata and hash."""
+        """Cache file metadata and hash.
+
+        Note: Uses resolved paths (symlinks followed) as keys for local-only cache.
+        """
         self._check_closed()
         abs_path = str(path.resolve())
         with self._lock:

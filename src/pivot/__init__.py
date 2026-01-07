@@ -23,6 +23,7 @@ from pivot import cache as cache
 from pivot import dvc_compat as dvc_compat
 from pivot import outputs as outputs
 from pivot import parameters as parameters
+from pivot import pvt as pvt
 from pivot import state as state
 from pivot.outputs import BaseOut as BaseOut
 from pivot.outputs import IncrementalOut as IncrementalOut

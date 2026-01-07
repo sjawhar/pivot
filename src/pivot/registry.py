@@ -298,11 +298,25 @@ class StageRegistry:
 
 
 def _normalize_paths(paths: Sequence[str], validation_mode: ValidationMode) -> list[str]:
-    """Normalize paths to absolute paths, handling errors based on validation mode."""
+    """Normalize paths to absolute paths, preserving symlinks for portability."""
     normalized = list[str]()
+
     for path in paths:
         try:
-            normalized.append(str(project.resolve_path(path)))
+            # Use normalized path (preserve symlinks) for portability
+            norm_path = project.normalize_path(path)
+
+            # Warn if relative path contains symlinks (skip for absolute paths to avoid
+            # caching project root during registration, which can cause issues in tests)
+            if not pathlib.Path(path).is_absolute():
+                project_root = project.get_project_root()
+                if project.contains_symlink_in_path(norm_path, project_root):
+                    logger.warning(
+                        f"Path '{path}' is inside a symlinked directory. "
+                        + "This may affect portability across environments."
+                    )
+
+            normalized.append(str(norm_path))
         except (ValueError, OSError):
             if validation_mode == ValidationMode.WARN:
                 normalized.append(path)  # Use unnormalized path

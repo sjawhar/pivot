@@ -19,7 +19,7 @@ if TYPE_CHECKING:
     import pathlib
 
     from pivot.executor import WorkerStageInfo
-    from pivot.types import OutputMessage
+    from pivot.types import DirManifestEntry, OutputMessage
 
 
 @pytest.fixture
@@ -714,7 +714,7 @@ def test_is_process_alive_returns_true_for_init() -> None:
 
 
 def test_hash_dependencies_with_existing_files(tmp_path: pathlib.Path) -> None:
-    """hash_dependencies hashes existing files."""
+    """hash_dependencies hashes existing files as FileHash dicts."""
     (tmp_path / "file1.txt").write_text("content1")
     (tmp_path / "file2.txt").write_text("content2")
 
@@ -724,8 +724,16 @@ def test_hash_dependencies_with_existing_files(tmp_path: pathlib.Path) -> None:
         hashes, missing = executor.hash_dependencies(["file1.txt", "file2.txt"])
 
         assert len(hashes) == 2
-        assert "file1.txt" in hashes
-        assert "file2.txt" in hashes
+        # Keys are now normalized paths (absolute)
+        file1_key = str(tmp_path / "file1.txt")
+        file2_key = str(tmp_path / "file2.txt")
+        assert file1_key in hashes
+        assert file2_key in hashes
+        # File hashes are FileHash dicts with only 'hash' key
+        file_hash = hashes[file1_key]
+        assert file_hash is not None
+        assert "hash" in file_hash
+        assert "manifest" not in file_hash, "Files should not have manifest"
         assert len(missing) == 0
     finally:
         os.chdir(old_cwd)
@@ -740,7 +748,7 @@ def test_hash_dependencies_with_missing_files() -> None:
 
 
 def test_hash_dependencies_with_directory(tmp_path: pathlib.Path) -> None:
-    """hash_dependencies hashes directories using tree hash."""
+    """hash_dependencies hashes directories with manifest."""
     data_dir = tmp_path / "data_dir"
     data_dir.mkdir()
     (data_dir / "file.txt").write_text("content")
@@ -751,7 +759,17 @@ def test_hash_dependencies_with_directory(tmp_path: pathlib.Path) -> None:
         hashes, missing = executor.hash_dependencies(["data_dir"])
 
         assert len(hashes) == 1, "Directory should be hashed"
-        assert "data_dir" in hashes
+        # Keys are now normalized paths (absolute)
+        data_dir_key = str(tmp_path / "data_dir")
+        assert data_dir_key in hashes
+        dir_hash = hashes[data_dir_key]
+        assert "hash" in dir_hash, "Should have hash key"
+        assert "manifest" in dir_hash, "Directory should include manifest"
+        # Narrow to DirHash via TypeGuard-style assertion
+        assert isinstance(dir_hash.get("manifest"), list)
+        manifest: list[DirManifestEntry] = dir_hash["manifest"]
+        assert len(manifest) == 1, "Manifest should have one file"
+        assert manifest[0]["relpath"] == "file.txt"
         assert len(missing) == 0, "No missing dependencies"
     finally:
         os.chdir(old_cwd)

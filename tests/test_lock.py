@@ -10,7 +10,7 @@ import pytest
 from pivot import lock
 
 if TYPE_CHECKING:
-    from pivot.types import LockData
+    from pivot.types import HashInfo, LockData
 
 
 def test_lock_file_creation(tmp_path: Path) -> None:
@@ -26,10 +26,11 @@ def test_lock_file_creation(tmp_path: Path) -> None:
 def test_lock_file_read(tmp_path: Path) -> None:
     """Lock file contents can be read back."""
     stage_lock = lock.StageLock("train", tmp_path)
+    dep_hashes: dict[str, HashInfo] = {"data.csv": {"hash": "xyz123"}}
     data: LockData = {
         "code_manifest": {"self:train": "def456", "func:helper": "ghi789"},
         "params": {"learning_rate": 0.01},
-        "dep_hashes": {"data.csv": "xyz123"},
+        "dep_hashes": dep_hashes,
     }
 
     stage_lock.write(data)
@@ -108,10 +109,14 @@ def test_stage_changed_no_previous_run(tmp_path: Path) -> None:
 
 def test_stage_unchanged_when_identical(tmp_path: Path) -> None:
     """Stage is not changed when fingerprint, params, and deps match."""
+    from pivot import project
+
     stage_lock = lock.StageLock("stable", tmp_path)
     fingerprint = {"self:stable": "abc", "func:helper": "def"}
     params = {"lr": 0.01}
-    dep_hashes = {"data.csv": "xyz"}
+    # In real usage, dep_hashes keys are normalized by hash_dependencies()
+    normalized_key = str(project.normalize_path("data.csv"))
+    dep_hashes: dict[str, HashInfo] = {normalized_key: {"hash": "xyz"}}
 
     stage_lock.write(
         {
@@ -193,18 +198,20 @@ def test_stage_changed_params_modified(tmp_path: Path) -> None:
 def test_stage_changed_dep_hash_modified(tmp_path: Path) -> None:
     """Stage is marked changed when input file hash differs."""
     stage_lock = lock.StageLock("consumer", tmp_path)
+    old_dep_hashes: dict[str, HashInfo] = {"input.csv": {"hash": "old_hash"}}
     stage_lock.write(
         {
             "code_manifest": {"self:consumer": "hash"},
             "params": {},
-            "dep_hashes": {"input.csv": "old_hash"},
+            "dep_hashes": old_dep_hashes,
         }
     )
 
+    new_dep_hashes: dict[str, HashInfo] = {"input.csv": {"hash": "new_hash"}}
     changed, reason = stage_lock.is_changed(
         current_fingerprint={"self:consumer": "hash"},
         current_params={},
-        dep_hashes={"input.csv": "new_hash"},
+        dep_hashes=new_dep_hashes,
     )
 
     assert changed is True
@@ -214,18 +221,23 @@ def test_stage_changed_dep_hash_modified(tmp_path: Path) -> None:
 def test_stage_changed_dep_added(tmp_path: Path) -> None:
     """Stage is marked changed when new input dependency added."""
     stage_lock = lock.StageLock("consumer", tmp_path)
+    old_dep_hashes: dict[str, HashInfo] = {"a.csv": {"hash": "hash_a"}}
     stage_lock.write(
         {
             "code_manifest": {"self:consumer": "hash"},
             "params": {},
-            "dep_hashes": {"a.csv": "hash_a"},
+            "dep_hashes": old_dep_hashes,
         }
     )
 
+    new_dep_hashes: dict[str, HashInfo] = {
+        "a.csv": {"hash": "hash_a"},
+        "b.csv": {"hash": "hash_b"},
+    }
     changed, reason = stage_lock.is_changed(
         current_fingerprint={"self:consumer": "hash"},
         current_params={},
-        dep_hashes={"a.csv": "hash_a", "b.csv": "hash_b"},
+        dep_hashes=new_dep_hashes,
     )
 
     assert changed is True
@@ -234,18 +246,23 @@ def test_stage_changed_dep_added(tmp_path: Path) -> None:
 def test_stage_changed_dep_removed(tmp_path: Path) -> None:
     """Stage is marked changed when input dependency removed."""
     stage_lock = lock.StageLock("consumer", tmp_path)
+    old_dep_hashes: dict[str, HashInfo] = {
+        "a.csv": {"hash": "hash_a"},
+        "b.csv": {"hash": "hash_b"},
+    }
     stage_lock.write(
         {
             "code_manifest": {"self:consumer": "hash"},
             "params": {},
-            "dep_hashes": {"a.csv": "hash_a", "b.csv": "hash_b"},
+            "dep_hashes": old_dep_hashes,
         }
     )
 
+    new_dep_hashes: dict[str, HashInfo] = {"a.csv": {"hash": "hash_a"}}
     changed, reason = stage_lock.is_changed(
         current_fingerprint={"self:consumer": "hash"},
         current_params={},
-        dep_hashes={"a.csv": "hash_a"},
+        dep_hashes=new_dep_hashes,
     )
 
     assert changed is True
