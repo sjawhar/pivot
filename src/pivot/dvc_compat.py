@@ -1,9 +1,3 @@
-"""DVC YAML export/import for cross-compatibility.
-
-Provides an escape hatch: if Pivot doesn't work, users can export to dvc.yaml
-and use DVC directly without any Pivot dependency.
-"""
-
 from __future__ import annotations
 
 import dataclasses

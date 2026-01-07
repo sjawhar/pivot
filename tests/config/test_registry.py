@@ -1,8 +1,3 @@
-"""Tests for stage registry and @stage decorator.
-
-Tests the stage registration system that collects pipeline stages
-and captures their metadata including code fingerprints.
-"""
 # pyright: reportUnusedFunction=false, reportUnusedParameter=false, reportRedeclaration=false
 
 import inspect

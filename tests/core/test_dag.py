@@ -1,5 +1,3 @@
-"""Tests for DAG construction and traversal."""
-
 from pathlib import Path
 
 import pytest

@@ -134,6 +134,8 @@ class MyParams(BaseModel):  # Where is BaseModel from?
 
 ## Docstrings
 
+**No module-level docstrings.** Don't add docstrings at the top of Python files unless explicitly asked.
+
 **Simple functions (<20 lines) get one-line docstrings. Period.**
 
 Skip Args/Returns/Examples if type hints make it obvious. Don't repeat what the function signature already says.

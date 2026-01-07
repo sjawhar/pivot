@@ -1,9 +1,3 @@
-"""Sample pipeline stages for export CLI tests.
-
-These are module-level functions that can be exported to DVC YAML format.
-They are registered manually in tests to avoid side effects at import time.
-"""
-
 from pydantic import BaseModel
 
 

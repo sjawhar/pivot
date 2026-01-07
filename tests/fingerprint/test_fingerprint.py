@@ -1,8 +1,3 @@
-"""Tests for automatic code fingerprinting.
-
-Validates that the fingerprinting algorithm correctly detects code changes
-and captures all dependencies.
-"""
 # pyright: reportUnusedFunction=false, reportUnusedParameter=false, reportUnknownLambdaType=false, reportUnknownParameterType=false, reportMissingParameterType=false, reportUnknownVariableType=false, reportUnknownArgumentType=false
 
 import ast

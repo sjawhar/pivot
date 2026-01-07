@@ -1,9 +1,3 @@
-"""Integration tests for DVC compat with real pipelines.
-
-Tests import functionality against real DVC pipelines in pipelines/eval-pipeline/.
-These tests require the eval-pipeline directory to be present and not git-ignored.
-"""
-
 import pathlib
 import sys
 

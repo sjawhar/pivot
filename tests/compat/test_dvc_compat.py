@@ -1,5 +1,3 @@
-"""Tests for DVC YAML export/import functionality."""
-
 # pyright: reportUnusedFunction=false
 
 import pathlib

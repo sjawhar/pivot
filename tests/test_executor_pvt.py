@@ -1,5 +1,3 @@
-"""Integration tests for executor with .pvt tracked files."""
-
 import pathlib
 
 import click.testing

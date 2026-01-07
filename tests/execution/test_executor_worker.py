@@ -1,9 +1,3 @@
-"""Unit tests for executor worker functions.
-
-These functions run in subprocesses during normal execution but are tested
-directly here to avoid subprocess coverage issues.
-"""
-
 from __future__ import annotations
 
 import multiprocessing as mp

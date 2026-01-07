@@ -1,5 +1,3 @@
-"""Watch mode for automatic pipeline re-execution on file changes."""
-
 import fnmatch
 import logging
 import pathlib

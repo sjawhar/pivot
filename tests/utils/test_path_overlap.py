@@ -1,11 +1,3 @@
-"""Tests to validate path overlap handling.
-
-These tests check if our current implementation correctly handles:
-1. Directory outputs vs file outputs (e.g., data/ vs data/train.csv)
-2. File dependencies on directory outputs
-3. Overlapping output paths
-"""
-
 import pytest
 
 from pivot import registry

@@ -1,14 +1,3 @@
-"""Tests for fingerprint change detection behavior.
-
-These tests comprehensively verify WHAT changes do and don't trigger cache misses,
-documenting both working behavior and known limitations.
-
-Test categories:
-1. Changes that SHOULD cause cache miss (and do)
-2. Changes that should NOT cause cache miss (by design)
-3. Known limitations (changes that SHOULD but DON'T cause cache miss)
-"""
-
 import importlib
 import pathlib
 import sys

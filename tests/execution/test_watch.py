@@ -1,5 +1,3 @@
-"""Tests for watch mode functionality."""
-
 import pathlib
 from unittest import mock
 

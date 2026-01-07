@@ -1,12 +1,3 @@
-"""Pipeline executor - runs stages with greedy parallel execution.
-
-Uses ProcessPoolExecutor for true parallelism (separate GIL per process):
-- Greedy scheduling: start stages as soon as dependencies complete
-- FIRST_COMPLETED waiting: don't wait for entire batches
-- forkserver context: warm imports without fork's dangers
-- Queue-based output streaming: real-time stdout/stderr from workers
-"""
-
 from __future__ import annotations
 
 import collections

@@ -1,24 +1,3 @@
-"""Pivot: High-Performance Python Pipeline Tool.
-
-Public API for defining and running pipelines.
-
-Example:
-    >>> from pivot import stage, Out, Metric, Plot
-    >>>
-    >>> @stage(deps=['data.csv'], outs=['processed.parquet'])
-    >>> def preprocess(input_file: str = 'data.csv'):
-    ...     import pandas as pd
-    ...     df = pd.read_csv(input_file)
-    ...     df = df.dropna()
-    ...     df.to_parquet('processed.parquet')
-    >>>
-    >>> @stage(deps=['processed.parquet'], outs=[Out('model.pkl'), Metric('metrics.json')])
-    >>> def train(data_file: str = 'processed.parquet', lr: float = 0.01):
-    ...     import pandas as pd
-    ...     df = pd.read_parquet(data_file)
-    ...     # Train model...
-"""
-
 from pivot import cache as cache
 from pivot import dvc_compat as dvc_compat
 from pivot import outputs as outputs

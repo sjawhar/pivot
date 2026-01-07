@@ -1,11 +1,3 @@
-"""Console output with colors and progress tracking.
-
-Provides formatted output for pipeline execution with:
-- Colored status indicators (green=ran, yellow=skipped, red=failed)
-- Progress tracking (stage N of M)
-- Timing information
-"""
-
 import os
 import pathlib
 import sys

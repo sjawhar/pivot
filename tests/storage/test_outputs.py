@@ -1,4 +1,3 @@
-"""Tests for rich output types."""
 # pyright: reportAttributeAccessIssue=false
 
 import pytest

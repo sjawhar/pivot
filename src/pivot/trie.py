@@ -1,9 +1,3 @@
-"""Trie-based path overlap detection.
-
-Adapted from DVC's implementation to detect overlapping output paths.
-Uses pygtrie for efficient prefix matching.
-"""
-
 import pathlib
 from typing import TypedDict
 

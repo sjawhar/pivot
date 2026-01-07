@@ -1,5 +1,3 @@
-"""Tests for CLI module."""
-
 import pathlib
 
 import click.testing

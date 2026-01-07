@@ -1,5 +1,3 @@
-"""SQLite-backed cache for file metadata to hash mappings."""
-
 from __future__ import annotations
 
 import sqlite3

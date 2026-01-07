@@ -1,13 +1,7 @@
-"""Tests for stage registration input validation.
-
-Tests validation of stage names, dependency paths, output paths,
-and detection of conflicts like duplicate stage names or output conflicts.
-"""
-
 import pytest
 
 from pivot import registry
-from pivot.exceptions import ValidationError
+from pivot.exceptions import SecurityValidationError, ValidationError
 from pivot.registry import ValidationMode
 
 
@@ -47,13 +41,13 @@ def test_duplicate_stage_name_with_warning_mode() -> None:
 
 
 def test_invalid_dep_path_with_parent_traversal() -> None:
-    """Should raise error for paths with '..' (path traversal)."""
+    """Should raise SecurityValidationError for paths with '..' (path traversal)."""
     reg = registry.StageRegistry()
 
     def stage1() -> None:
         pass
 
-    with pytest.raises(ValidationError, match="path traversal"):
+    with pytest.raises(SecurityValidationError, match="path traversal"):
         reg.register(
             stage1,
             name="process",
@@ -64,13 +58,13 @@ def test_invalid_dep_path_with_parent_traversal() -> None:
 
 
 def test_invalid_out_path_with_parent_traversal() -> None:
-    """Should raise error for output paths with '..' (path traversal)."""
+    """Should raise SecurityValidationError for output paths with '..' (path traversal)."""
     reg = registry.StageRegistry()
 
     def stage1() -> None:
         pass
 
-    with pytest.raises(ValidationError, match="path traversal"):
+    with pytest.raises(SecurityValidationError, match="path traversal"):
         reg.register(
             stage1,
             name="process",
@@ -81,13 +75,13 @@ def test_invalid_out_path_with_parent_traversal() -> None:
 
 
 def test_invalid_path_with_null_byte() -> None:
-    """Should raise error for paths with null bytes."""
+    """Should raise SecurityValidationError for paths with null bytes."""
     reg = registry.StageRegistry()
 
     def stage1() -> None:
         pass
 
-    with pytest.raises(ValidationError, match="null byte"):
+    with pytest.raises(SecurityValidationError, match="null byte"):
         reg.register(
             stage1,
             name="process",
@@ -98,13 +92,13 @@ def test_invalid_path_with_null_byte() -> None:
 
 
 def test_invalid_path_with_newline() -> None:
-    """Should raise error for paths with newline characters."""
+    """Should raise SecurityValidationError for paths with newline characters."""
     reg = registry.StageRegistry()
 
     def stage1() -> None:
         pass
 
-    with pytest.raises(ValidationError, match="newline"):
+    with pytest.raises(SecurityValidationError, match="newline"):
         reg.register(
             stage1,
             name="process",
@@ -188,32 +182,68 @@ def test_valid_inputs_pass_silently() -> None:
 
 
 def test_invalid_path_with_parent_traversal_warn_mode() -> None:
-    """Should warn but not raise for path with '..' in WARN mode."""
+    """Path traversal should always error, even in WARN mode (security check)."""
     reg = registry.StageRegistry(validation_mode=ValidationMode.WARN)
 
     def stage1() -> None:
         pass
 
-    # Should not raise, just warn
-    reg.register(
-        stage1,
-        name="process",
-        deps=["../external/data.csv"],
-        outs=list[str](),
-        params=None,
-    )
-
-    assert "process" in reg.list_stages()
+    with pytest.raises(SecurityValidationError, match="path traversal"):
+        reg.register(
+            stage1,
+            name="process",
+            deps=["../external/data.csv"],
+            outs=list[str](),
+            params=None,
+        )
 
 
 def test_invalid_path_with_null_byte_warn_mode() -> None:
-    """Should warn but not raise for path with null byte in WARN mode."""
+    """Null byte in path should always error, even in WARN mode (security check)."""
     reg = registry.StageRegistry(validation_mode=ValidationMode.WARN)
 
     def stage1() -> None:
         pass
 
-    # Should not raise, just warn
-    reg.register(stage1, name="process", deps=["bad\x00file.csv"], outs=list[str](), params=None)
+    with pytest.raises(SecurityValidationError, match="null byte"):
+        reg.register(
+            stage1, name="process", deps=["bad\x00file.csv"], outs=list[str](), params=None
+        )
 
-    assert "process" in reg.list_stages()
+
+def test_newline_in_path_always_errors_regardless_of_mode() -> None:
+    """Newline in path should always error, even in WARN mode (security check)."""
+    reg = registry.StageRegistry(validation_mode=ValidationMode.WARN)
+
+    def stage1() -> None:
+        pass
+
+    with pytest.raises(SecurityValidationError, match="newline"):
+        reg.register(stage1, name="process", deps=["file\nname.csv"], outs=list[str](), params=None)
+
+
+def test_carriage_return_in_path_always_errors_regardless_of_mode() -> None:
+    """Carriage return in path should always error, even in WARN mode (security check)."""
+    reg = registry.StageRegistry(validation_mode=ValidationMode.WARN)
+
+    def stage1() -> None:
+        pass
+
+    with pytest.raises(SecurityValidationError, match="newline"):
+        reg.register(stage1, name="process", deps=["file\rname.csv"], outs=list[str](), params=None)
+
+
+def test_non_security_validation_respects_warn_mode() -> None:
+    """Non-security validations (like duplicate names) should still respect WARN mode."""
+    reg = registry.StageRegistry(validation_mode=ValidationMode.WARN)
+
+    def stage1() -> None:
+        pass
+
+    def stage2() -> None:
+        pass
+
+    reg.register(stage1, name="process", deps=list[str](), outs=list[str](), params=None)
+    reg.register(stage2, name="process", deps=list[str](), outs=list[str](), params=None)
+
+    assert reg.get("process")["func"] is stage2, "Second registration should overwrite in WARN mode"

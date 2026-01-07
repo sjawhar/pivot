@@ -1,5 +1,3 @@
-"""Rich output types for DVC-compatible stage outputs."""
-
 import dataclasses
 
 

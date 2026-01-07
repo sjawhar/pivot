@@ -1,34 +1,3 @@
-"""Automatic code change detection using Python introspection.
-
-This module implements the core fingerprinting algorithm that detects when user-defined
-functions change, enabling automatic pipeline re-execution without manual declarations.
-
-Algorithm:
-    1. Hash the function itself using AST
-    2. Use inspect.getclosurevars() to find all referenced names
-    3. For each reference:
-       - If callable and user code → hash and recurse (transitive deps)
-       - If module → AST scan for module.attr usage (Google-style imports)
-       - If simple constant → capture value
-    4. Return manifest dictionary with all dependencies
-
-Validated: See docs/fingerprinting.md and tests/fingerprint/
-
-Example:
-    >>> def helper(x):
-    ...     return x * 2
-    >>>
-    >>> def stage_func(data):
-    ...     return helper(data) + 1
-    >>>
-    >>> fp = get_stage_fingerprint(stage_func)
-    >>> print(fp)
-    {
-        'self:stage_func': 'a1b2c3d4...',
-        'func:helper': '5e6f7g8h...'
-    }
-"""
-
 import ast
 import inspect
 import marshal
