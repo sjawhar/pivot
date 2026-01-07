@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     from pivot import state as state_mod
 
 CHUNK_SIZE = 1024 * 1024  # 1MB chunks for hashing
+XXHASH64_HEX_LENGTH = 16  # xxhash64 produces 64-bit hash = 16 hex characters
 
 
 def atomic_write_file(
@@ -143,6 +144,26 @@ def _clear_path(path: pathlib.Path) -> None:
         path.unlink()
 
 
+def _get_symlink_cache_hash(path: pathlib.Path, cache_dir: pathlib.Path) -> str | None:
+    """Extract hash from symlink target if it points to cache, else None."""
+    if not path.is_symlink():
+        return None
+    try:
+        target = path.resolve()
+        cache_resolved = cache_dir.resolve()
+        if not target.is_relative_to(cache_resolved):
+            return None
+        rel = target.relative_to(cache_resolved)
+        if len(rel.parts) != 2:
+            return None
+        reconstructed = rel.parts[0] + rel.parts[1]
+        if len(reconstructed) != XXHASH64_HEX_LENGTH:
+            return None
+        return reconstructed
+    except (OSError, ValueError):
+        return None  # Includes ELOOP for circular symlinks
+
+
 def copy_to_cache(src: pathlib.Path, cache_path: pathlib.Path) -> None:
     """Atomically copy file to cache with read-only permissions."""
     if cache_path.exists():
@@ -169,6 +190,16 @@ def _link_from_cache(
     executable: bool = False,
 ) -> None:
     """Create link from workspace path to cache."""
+    # Idempotency: skip if already correctly linked
+    if link_mode == LinkMode.SYMLINK and path.is_symlink():
+        with contextlib.suppress(OSError):
+            if path.resolve() == cache_path.resolve():
+                return
+    elif link_mode == LinkMode.HARDLINK and path.exists() and not path.is_symlink():
+        with contextlib.suppress(OSError):
+            if path.stat().st_ino == cache_path.stat().st_ino:
+                return
+
     _clear_path(path)
 
     if link_mode == LinkMode.SYMLINK:
@@ -207,13 +238,21 @@ def _save_file_to_cache(
     link_mode: LinkMode,
 ) -> FileHash:
     """Save single file to cache."""
+    # Idempotency: check if already a valid cache symlink (cheap check first)
+    if link_mode == LinkMode.SYMLINK:
+        existing_hash = _get_symlink_cache_hash(path, cache_dir)
+        if existing_hash is not None:
+            cache_path = get_cache_path(cache_dir, existing_hash)
+            if cache_path.exists():
+                return FileHash(hash=existing_hash)
+
     file_hash = hash_file(path, state_db)
     cache_path = get_cache_path(cache_dir, file_hash)
 
     copy_to_cache(path, cache_path)
     _link_from_cache(path, cache_path, link_mode)
 
-    return {"hash": file_hash}
+    return FileHash(hash=file_hash)
 
 
 def _save_directory_to_cache(
@@ -223,6 +262,16 @@ def _save_directory_to_cache(
     link_mode: LinkMode,
 ) -> DirHash:
     """Save directory to cache."""
+    # Idempotency check for SYMLINK mode
+    if link_mode == LinkMode.SYMLINK and path.is_symlink():
+        existing_hash = _get_symlink_cache_hash(path, cache_dir)
+        if existing_hash is not None:
+            cache_dir_path = get_cache_path(cache_dir, existing_hash)
+            if cache_dir_path.exists():
+                # Already correctly linked - compute manifest from actual content
+                _, manifest = hash_directory(path, state_db)
+                return DirHash(hash=existing_hash, manifest=manifest)
+
     tree_hash, manifest = hash_directory(path, state_db)
 
     for entry in manifest:
@@ -241,10 +290,10 @@ def _save_directory_to_cache(
                     os.chmod(f, 0o444)
             os.chmod(cache_dir_path, 0o555)
 
-        shutil.rmtree(path)
+        _clear_path(path)
         path.symlink_to(cache_dir_path.resolve())
 
-    return {"hash": tree_hash, "manifest": manifest}
+    return DirHash(hash=tree_hash, manifest=manifest)
 
 
 def restore_from_cache(

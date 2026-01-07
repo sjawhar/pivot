@@ -1,12 +1,10 @@
 from __future__ import annotations
 
+import os
+import pathlib
 import sqlite3
 import threading
-from typing import TYPE_CHECKING, Self
-
-if TYPE_CHECKING:
-    import os
-    import pathlib
+from typing import Self
 
 # Timeout for acquiring database lock (seconds)
 _DB_TIMEOUT = 5.0
@@ -63,6 +61,49 @@ class StateDB:
             )
             row = cursor.fetchone()
         return row[0] if row else None
+
+    def get_many(
+        self, items: list[tuple[pathlib.Path, os.stat_result]]
+    ) -> dict[pathlib.Path, str | None]:
+        """Batch query for multiple files. Returns path → hash mapping."""
+        self._check_closed()
+        if not items:
+            return {}
+
+        # Build path → (original_path, stat) mapping
+        path_stats = dict[str, tuple[pathlib.Path, os.stat_result]]()
+        for p, s in items:
+            path_stats[str(p.resolve())] = (p, s)
+        paths = list(path_stats.keys())
+
+        # Single SQL query for all paths
+        placeholders = ",".join("?" * len(paths))
+        query = (
+            f"SELECT path, mtime_ns, size, inode, hash FROM state WHERE path IN ({placeholders})"
+        )
+
+        results = dict[pathlib.Path, str | None]()
+        with self._lock:
+            cursor = self._conn.execute(query, paths)
+            for row in cursor:
+                path_str, mtime_ns, size, inode, cached_hash = row
+                orig_path, stat_info = path_stats[path_str]
+                # Validate metadata matches
+                if (
+                    stat_info.st_mtime_ns == mtime_ns
+                    and stat_info.st_size == size
+                    and stat_info.st_ino == inode
+                ):
+                    results[orig_path] = cached_hash
+                else:
+                    results[orig_path] = None  # Cache invalid
+
+        # Fill missing paths with None
+        for p, _ in items:
+            if p not in results:
+                results[p] = None
+
+        return results
 
     def save(self, path: pathlib.Path, fs_stat: os.stat_result, file_hash: str) -> None:
         """Cache file metadata and hash.

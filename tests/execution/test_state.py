@@ -199,3 +199,56 @@ def test_state_absolute_paths(tmp_path: pathlib.Path) -> None:
         result = db.get(test_file.resolve(), file_stat)
 
     assert result == "hash"
+
+
+def test_state_get_many(tmp_path: pathlib.Path) -> None:
+    """Batch get returns correct hashes for multiple files."""
+    db_path = tmp_path / "state.db"
+    files = list[tuple[pathlib.Path, os.stat_result]]()
+    entries = list[tuple[pathlib.Path, os.stat_result, str]]()
+
+    for i in range(5):
+        f = tmp_path / f"file_{i}.txt"
+        f.write_text(f"content {i}")
+        file_stat = f.stat()
+        files.append((f, file_stat))
+        entries.append((f, file_stat, f"hash_{i}"))
+
+    with state.StateDB(db_path) as db:
+        db.save_many(entries)
+        results = db.get_many(files)
+
+    for i, (f, _) in enumerate(files):
+        assert results[f] == f"hash_{i}"
+
+
+def test_state_get_many_mixed(tmp_path: pathlib.Path) -> None:
+    """Batch get handles mix of cached and uncached files."""
+    db_path = tmp_path / "state.db"
+
+    # Create cached file
+    cached = tmp_path / "cached.txt"
+    cached.write_text("cached content")
+    cached_stat = cached.stat()
+
+    # Create uncached file
+    uncached = tmp_path / "uncached.txt"
+    uncached.write_text("uncached content")
+    uncached_stat = uncached.stat()
+
+    with state.StateDB(db_path) as db:
+        db.save(cached, cached_stat, "cached_hash")
+        results = db.get_many([(cached, cached_stat), (uncached, uncached_stat)])
+
+    assert results[cached] == "cached_hash"
+    assert results[uncached] is None
+
+
+def test_state_get_many_empty(tmp_path: pathlib.Path) -> None:
+    """Batch get with empty list returns empty dict."""
+    db_path = tmp_path / "state.db"
+
+    with state.StateDB(db_path) as db:
+        results = db.get_many([])
+
+    assert results == {}

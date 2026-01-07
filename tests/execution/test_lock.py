@@ -5,7 +5,7 @@ from unittest import mock
 
 import pytest
 
-from pivot import lock
+from pivot import lock, project
 
 if TYPE_CHECKING:
     from pivot.types import HashInfo, LockData
@@ -107,8 +107,6 @@ def test_stage_changed_no_previous_run(tmp_path: Path) -> None:
 
 def test_stage_unchanged_when_identical(tmp_path: Path) -> None:
     """Stage is not changed when fingerprint, params, and deps match."""
-    from pivot import project
-
     stage_lock = lock.StageLock("stable", tmp_path)
     fingerprint = {"self:stable": "abc", "func:helper": "def"}
     params = {"lr": 0.01}
@@ -294,7 +292,6 @@ def test_lock_directory_created(tmp_path: Path) -> None:
         "",
         "../etc/passwd",
         "stage/nested",
-        "stage.with.dots",
         "stage with spaces",
         "stage\nwith\nnewlines",
         "../../traversal",
@@ -315,10 +312,13 @@ def test_invalid_stage_name_rejected(tmp_path: Path, invalid_name: str) -> None:
         "Stage123",
         "a",
         "A-B_C",
+        "stage.with.dots",  # Dots allowed for DVC matrix keys
+        "plot@0.5",  # DVC matrix stage names use @ and decimals
+        "wrangle@swe_bench",  # DVC foreach expansion
     ],
 )
 def test_valid_stage_names_accepted(tmp_path: Path, valid_name: str) -> None:
-    """Valid stage names with alphanumeric, underscore, dash are accepted."""
+    """Valid stage names with alphanumeric, underscore, dash, dot, @ are accepted."""
     stage_lock = lock.StageLock(valid_name, tmp_path)
     assert stage_lock.stage_name == valid_name
 

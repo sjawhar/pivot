@@ -420,3 +420,157 @@ def test_link_mode_copy(tmp_path: pathlib.Path) -> None:
     assert not test_file.is_symlink()
     assert test_file.stat().st_ino != cache_path.stat().st_ino
     assert test_file.read_text() == "content"
+
+
+# === Idempotency Tests (BUG-006) ===
+
+
+def test_save_to_cache_idempotent_file(tmp_path: pathlib.Path) -> None:
+    """Second save_to_cache on symlinked file is idempotent."""
+    test_file = tmp_path / "file.txt"
+    test_file.write_text("content")
+    cache_dir = tmp_path / "cache"
+
+    h1 = cache.save_to_cache(test_file, cache_dir)
+    assert test_file.is_symlink()
+    h2 = cache.save_to_cache(test_file, cache_dir)  # Should NOT raise ELOOP
+
+    assert h1 == h2
+    assert test_file.read_text() == "content"
+
+
+def test_save_to_cache_idempotent_directory(tmp_path: pathlib.Path) -> None:
+    """Second save_to_cache on symlinked directory is idempotent."""
+    test_dir = tmp_path / "dir"
+    test_dir.mkdir()
+    (test_dir / "a.txt").write_text("a")
+    cache_dir = tmp_path / "cache"
+
+    h1 = cache.save_to_cache(test_dir, cache_dir)
+    assert h1 is not None
+    assert test_dir.is_symlink()
+    h2 = cache.save_to_cache(test_dir, cache_dir)  # Should NOT raise ELOOP
+    assert h2 is not None
+
+    assert h1["hash"] == h2["hash"]
+    assert (test_dir / "a.txt").read_text() == "a"
+
+
+def test_link_from_cache_idempotent_symlink(tmp_path: pathlib.Path) -> None:
+    """_link_from_cache skips if already correctly symlinked."""
+    test_file = tmp_path / "file.txt"
+    test_file.write_text("content")
+    cache_dir = tmp_path / "cache"
+
+    output_hash = cache.save_to_cache(test_file, cache_dir)
+    assert output_hash is not None
+    cache_path = cache.get_cache_path(cache_dir, output_hash["hash"])
+
+    # Call _link_from_cache again - should be idempotent
+    cache._link_from_cache(test_file, cache_path, cache.LinkMode.SYMLINK)
+
+    assert test_file.is_symlink()
+    assert test_file.read_text() == "content"
+
+
+def test_link_from_cache_idempotent_hardlink(tmp_path: pathlib.Path) -> None:
+    """_link_from_cache skips if already correctly hardlinked."""
+    test_file = tmp_path / "file.txt"
+    test_file.write_text("content")
+    cache_dir = tmp_path / "cache"
+
+    output_hash = cache.save_to_cache(test_file, cache_dir, link_mode=cache.LinkMode.HARDLINK)
+    assert output_hash is not None
+    cache_path = cache.get_cache_path(cache_dir, output_hash["hash"])
+    original_inode = test_file.stat().st_ino
+
+    # Call _link_from_cache again - should be idempotent
+    cache._link_from_cache(test_file, cache_path, cache.LinkMode.HARDLINK)
+
+    assert test_file.stat().st_ino == original_inode
+
+
+def test_save_to_cache_broken_symlink(tmp_path: pathlib.Path) -> None:
+    """Broken symlink triggers re-cache (not idempotent skip)."""
+    test_file = tmp_path / "file.txt"
+    test_file.write_text("content")
+    cache_dir = tmp_path / "cache"
+
+    h1 = cache.save_to_cache(test_file, cache_dir)
+    assert h1 is not None
+    cache_path = cache.get_cache_path(cache_dir, h1["hash"])
+
+    # Break the symlink by removing cache entry
+    cache_path.unlink()
+
+    # Re-create the original file content
+    test_file.unlink()
+    test_file.write_text("content")
+
+    # Save again - should re-cache since symlink is broken
+    h2 = cache.save_to_cache(test_file, cache_dir)
+    assert h2 is not None
+    assert h2["hash"] == h1["hash"]
+    assert test_file.is_symlink()
+    assert cache_path.exists()
+
+
+def test_save_to_cache_symlink_wrong_hash(tmp_path: pathlib.Path) -> None:
+    """Symlink to wrong cache location triggers re-cache."""
+    test_file = tmp_path / "file.txt"
+    test_file.write_text("content")
+    cache_dir = tmp_path / "cache"
+
+    h1 = cache.save_to_cache(test_file, cache_dir)
+    assert h1 is not None
+
+    # Replace with symlink to wrong location (fake hash)
+    test_file.unlink()
+    wrong_cache = cache_dir / "aa" / "bbccddee11223344"
+    wrong_cache.parent.mkdir(parents=True, exist_ok=True)
+    wrong_cache.write_text("wrong content")
+    test_file.symlink_to(wrong_cache)
+
+    # Create fresh file with original content
+    test_file.unlink()
+    test_file.write_text("content")
+
+    # Save again - should use correct hash
+    h2 = cache.save_to_cache(test_file, cache_dir)
+    assert h2 is not None
+    assert h2["hash"] == h1["hash"]
+
+
+def test_get_symlink_cache_hash_extracts_hash(tmp_path: pathlib.Path) -> None:
+    """_get_symlink_cache_hash extracts hash from valid symlink."""
+    test_file = tmp_path / "file.txt"
+    test_file.write_text("content")
+    cache_dir = tmp_path / "cache"
+
+    output_hash = cache.save_to_cache(test_file, cache_dir)
+    assert output_hash is not None
+
+    extracted = cache._get_symlink_cache_hash(test_file, cache_dir)
+    assert extracted == output_hash["hash"]
+
+
+def test_get_symlink_cache_hash_returns_none_for_regular_file(tmp_path: pathlib.Path) -> None:
+    """_get_symlink_cache_hash returns None for non-symlink."""
+    test_file = tmp_path / "file.txt"
+    test_file.write_text("content")
+    cache_dir = tmp_path / "cache"
+
+    result = cache._get_symlink_cache_hash(test_file, cache_dir)
+    assert result is None
+
+
+def test_get_symlink_cache_hash_returns_none_for_outside_cache(tmp_path: pathlib.Path) -> None:
+    """_get_symlink_cache_hash returns None for symlink outside cache."""
+    target = tmp_path / "target.txt"
+    target.write_text("content")
+    link = tmp_path / "link.txt"
+    link.symlink_to(target)
+    cache_dir = tmp_path / "cache"
+
+    result = cache._get_symlink_cache_hash(link, cache_dir)
+    assert result is None
