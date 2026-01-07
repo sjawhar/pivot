@@ -197,6 +197,28 @@ def status(ctx: click.Context) -> None:
             click.echo(f"    outs: {outs}")
 
 
+@cli.command()
+@click.argument("stages", nargs=-1)
+@click.option(
+    "--output",
+    "-o",
+    type=click.Path(path_type=pathlib.Path),
+    default="dvc.yaml",
+    help="Output path for dvc.yaml (default: dvc.yaml)",
+)
+def export(stages: tuple[str, ...], output: pathlib.Path) -> None:
+    """Export pipeline to DVC YAML format."""
+    from pivot import dvc_compat
+
+    stages_list = list(stages) if stages else None
+
+    try:
+        result = dvc_compat.export_dvc_yaml(output, stages=stages_list)
+        click.echo(f"Exported {len(result['stages'])} stages to {output}")
+    except Exception as e:
+        raise click.ClickException(str(e)) from e
+
+
 def _print_results(results: dict[str, ExecutionSummary]) -> None:
     """Print execution results in a readable format."""
     ran = 0
