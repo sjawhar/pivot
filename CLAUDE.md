@@ -273,6 +273,12 @@ basedpyright .      # Type check
 - Must run all four: `ruff format .`, `ruff check .`, `basedpyright .`, `pytest tests/`
 - Never say "done" without running these first.
 
+## After Completing a Feature
+
+- Update the **Development Roadmap** in `README.md` to reflect completed work
+- Document any new **user-facing functionality** in the appropriate README section (CLI commands, API changes, new features)
+- Keep the roadmap concise—use single-line summaries, not granular checklists
+
 ## Critical Discoveries
 
 1. Test helpers must be module-level, not inline—`getclosurevars()` doesn't see module imports in inline closures.

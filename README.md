@@ -1,9 +1,9 @@
 # Pivot: High-Performance Python Pipeline Tool
 
-**Status:** 🚧 In Development (MVP Phase)
+**Status:** 🚧 In Development (MVP Nearly Complete)
 **Python:** 3.13+ required
 **License:** TBD
-**Tests:** 456 passing | **Coverage:** 91.5%+
+**Tests:** 507 passing | **Coverage:** 91.5%+
 
 ---
 
@@ -137,7 +137,40 @@ Stage: train
       File: src/utils.py:15
 ```
 
-### 6. Incremental Outputs
+### 6. Pydantic Stage Parameters
+
+**Type-safe parameters with automatic injection:**
+
+```python
+from pydantic import BaseModel
+from pivot import stage
+
+class TrainParams(BaseModel):
+    learning_rate: float = 0.01
+    epochs: int = 100
+    batch_size: int = 32
+
+@stage(deps=['data.csv'], outs=['model.pkl'], params_cls=TrainParams)
+def train(params: TrainParams):
+    print(f"Training with lr={params.learning_rate}")
+```
+
+**Override defaults via params.yaml:**
+
+```yaml
+train:
+  learning_rate: 0.001
+  epochs: 200
+```
+
+**How it works:**
+
+- Define parameters using Pydantic BaseModel with defaults
+- Pivot automatically injects the params instance into your function
+- YAML overrides take precedence over model defaults
+- Parameter changes trigger re-execution (tracked in lock files)
+
+### 7. Incremental Outputs
 
 **New:** Outputs that preserve state between runs for append-only workloads:
 
@@ -179,59 +212,30 @@ pip install pivot
 - **[Design Documentation](./CLAUDE.md)** - Architecture and design decisions
 - **[Source Code Docs](./src/CLAUDE.md)** - Module-by-module implementation guide
 - **[Testing Strategy](./tests/CLAUDE.md)** - TDD approach and test organization
-- **[Implementation Plan](/.claude/plans/happy-hatching-acorn.md)** - Detailed 12-week roadmap
 
 ---
 
 ## Development Roadmap
 
-### Phase 1: MVP - IN PROGRESS ✅
+### Completed ✅
 
-**Core Infrastructure** ✅
+- **Core pipeline execution** - DAG construction, greedy parallel scheduling, per-stage lock files
+- **Automatic code change detection** - getclosurevars + AST fingerprinting, transitive dependencies
+- **Content-addressable cache** - xxhash64 hashing, hardlink/copy restoration
+- **Pydantic parameters** - Type-safe stage parameters with params.yaml overrides
+- **Watch mode** - File system monitoring with configurable globs and debounce
+- **Incremental outputs** - Restore-before-run for append-only workloads
+- **DVC export** - `pivot export` command for YAML generation
 
-- [x] Design documentation
-- [x] Code change detection (getclosurevars + AST)
-- [x] Stage registry with decorator
-- [x] Project root detection
-- [x] Input validation and path normalization
-- [x] Trie-based output overlap detection
+### In Progress
 
-**DAG + Lock Files** ✅
+- [ ] **Explain mode** - Show detailed breakdown of WHY stages would run (changed code, params, deps)
+- [ ] **End-to-end benchmarks** - Comparative performance testing vs DVC
 
-- [x] Dependency graph construction (cycle detection, topological sort)
-- [x] Per-stage lock files (atomic writes, parallel safety)
-- [x] DVC YAML export for code review
+### Future
 
-**Executor + Cache** ✅
-
-- [x] Pipeline executor (runs stages in dependency order)
-- [x] Content-addressable cache (xxhash64)
-- [x] Parallel execution with warm worker pools (loky)
-- [x] Sentinel file locking (prevents concurrent stage execution)
-
-**IncrementalOut** ✅
-
-- [x] Incremental outputs (restore from cache before execution)
-- [x] COPY mode for safe in-place modification
-- [x] Executable bit preservation
-
-**Remaining MVP Work**
-
-- [ ] Explain mode (show WHY stages run)
-- [ ] CLI improvements
-- [ ] End-to-end benchmarks vs DVC
-
-### Phase 2: Observability (Weeks 7-9)
-
-- Metrics tracking and diff
-- Plots generation
-- Integration with existing tools
-
-### Phase 3: Version Control (Weeks 10-12)
-
-- `pivot get --rev` (materialize old versions)
-- DVC lock file import (migration helper)
-- Git hooks integration
+- **Observability** - Metrics tracking/diff, plots generation
+- **Version control** - `pivot get --rev` to materialize old versions, DVC lock import for migration
 
 ---
 
@@ -273,8 +277,8 @@ This is currently an internal development project. Guidelines:
 
 - **TDD:** Write tests before implementation
 - **Type hints:** All functions must be fully typed
-- **Formatting:** Black with line length 100
-- **Linting:** Ruff for fast linting
+- **Formatting:** ruff format with line length 100
+- **Linting:** ruff check for fast linting
 - **Coverage:** >90% for all modules
 - **Documentation:** Update CLAUDE.md files when design changes
 
@@ -288,13 +292,13 @@ pytest tests/ -v
 pytest --cov=src/pivot --cov-report=term --cov-fail-under=90
 
 # Format code
-black src/ tests/
+ruff format src/ tests/
 
 # Lint
 ruff check src/ tests/
 
 # Type check
-mypy src/ --strict
+basedpyright src/
 ```
 
 ---
@@ -354,7 +358,7 @@ Real-world DVC pipelines profiled to identify bottlenecks:
 
 ### Q: Is this production-ready?
 
-**A:** Not yet! We're in Week 1 of development. Target: 6-week MVP with comprehensive testing.
+**A:** Not yet! Core functionality is complete and well-tested (90%+ coverage), but we're still adding features like explain mode before the 1.0 release.
 
 ---
 
@@ -371,5 +375,5 @@ Questions? Check CLAUDE.md files or ask the team!
 
 ---
 
-**Last Updated:** 2026-01-06
-**Version:** 0.1.0-dev (MVP Phase)
+**Last Updated:** 2026-01-07
+**Version:** 0.1.0-dev
