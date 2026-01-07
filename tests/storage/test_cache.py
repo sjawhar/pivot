@@ -1,3 +1,4 @@
+import mmap
 import pathlib
 import stat
 from typing import TYPE_CHECKING
@@ -57,6 +58,64 @@ def test_hash_file_binary(tmp_path: pathlib.Path) -> None:
     file_hash = cache.hash_file(test_file)
 
     assert len(file_hash) == 16
+
+
+def test_hash_file_large_uses_mmap(tmp_path: pathlib.Path) -> None:
+    """Large files (>=MMAP_THRESHOLD) use mmap and produce valid hashes."""
+    pattern = b"x" * 1024  # 1KB pattern
+
+    small_file = tmp_path / "small.bin"
+    small_file.write_bytes(pattern)
+
+    # Create file just over MMAP_THRESHOLD to ensure mmap path is used
+    large_file = tmp_path / "large.bin"
+    large_file.write_bytes(b"x" * (cache.MMAP_THRESHOLD + 1))
+
+    # Both should produce valid hashes
+    small_hash = cache.hash_file(small_file)
+    large_hash = cache.hash_file(large_file)
+
+    assert len(small_hash) == 16
+    assert len(large_hash) == 16
+    # Hashes should be different (different content sizes)
+    assert small_hash != large_hash
+
+
+def test_hash_file_mmap_consistent(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Mmap and buffered read produce identical hashes for same content."""
+    content = b"test content" * 1000000  # ~12MB, above threshold
+    test_file = tmp_path / "test.bin"
+    test_file.write_bytes(content)
+
+    # Get hash via mmap path (file > threshold)
+    mmap_hash = cache.hash_file(test_file)
+
+    # Force buffered path by raising threshold above file size
+    monkeypatch.setattr(cache, "MMAP_THRESHOLD", len(content) + 1)
+    buffered_hash = cache.hash_file(test_file)
+
+    # Both methods must produce identical hash
+    assert mmap_hash == buffered_hash
+
+
+def test_hash_file_mmap_fallback(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Falls back to buffered read when mmap fails."""
+    content = b"test content" * 1000000  # ~12MB
+    large_file = tmp_path / "large.bin"
+    large_file.write_bytes(content)
+
+    # Get expected hash via normal path first
+    expected_hash = cache.hash_file(large_file)
+
+    # Now make mmap fail
+    def failing_mmap(*args: object, **kwargs: object) -> mmap.mmap:
+        raise OSError("mmap failed")
+
+    monkeypatch.setattr(mmap, "mmap", failing_mmap)
+
+    # Should fall back to buffered read and produce same hash
+    fallback_hash = cache.hash_file(large_file)
+    assert fallback_hash == expected_hash
 
 
 # === Hash Directory Tests ===

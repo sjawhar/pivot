@@ -4,6 +4,7 @@ import contextlib
 import enum
 import errno
 import json
+import mmap
 import os
 import pathlib
 import shutil
@@ -22,6 +23,7 @@ if TYPE_CHECKING:
     from pivot import state as state_mod
 
 CHUNK_SIZE = 1024 * 1024  # 1MB chunks for hashing
+MMAP_THRESHOLD = 10 * 1024 * 1024  # 10MB - use mmap for files larger than this
 XXHASH64_HEX_LENGTH = 16  # xxhash64 produces 64-bit hash = 16 hex characters
 
 
@@ -76,8 +78,17 @@ def hash_file(path: pathlib.Path, state_db: state_mod.StateDB | None = None) -> 
 
     hasher = xxhash.xxh64()
     with open(path, "rb") as f:
-        while chunk := f.read(CHUNK_SIZE):
-            hasher.update(chunk)
+        if file_stat.st_size >= MMAP_THRESHOLD:
+            try:
+                with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                    hasher.update(mm)
+            except (ValueError, OSError):
+                # Fall back to buffered read if mmap fails (empty file, network FS, etc.)
+                while chunk := f.read(CHUNK_SIZE):
+                    hasher.update(chunk)
+        else:
+            while chunk := f.read(CHUNK_SIZE):
+                hasher.update(chunk)
     file_hash = hasher.hexdigest()
 
     if state_db is not None:
