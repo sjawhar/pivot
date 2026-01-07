@@ -1,18 +1,3 @@
-"""Per-stage lock files for tracking pipeline state.
-
-Each stage gets its own lock file (~1KB) instead of one monolithic file.
-This enables parallel writes without contention and O(1) reads per stage.
-
-Atomic Write Pattern:
-    We write to a .tmp file first, then rename to the final path. This ensures:
-    1. No partial/corrupted files if process is killed mid-write
-    2. Readers never see incomplete data (rename is atomic on POSIX)
-    3. Original file preserved until new version is complete
-
-    Without this pattern, a crash during write would leave a truncated file
-    that fails to parse, breaking all subsequent runs.
-"""
-
 import os
 import pathlib
 import re

@@ -1,5 +1,3 @@
-"""Tests for console output module."""
-
 import io
 from typing import override
 

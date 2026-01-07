@@ -1,5 +1,3 @@
-"""Tests for per-stage lock files."""
-
 import threading
 from pathlib import Path
 from typing import TYPE_CHECKING

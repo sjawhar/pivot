@@ -1,5 +1,3 @@
-"""Tests for pivot checkout CLI command."""
-
 import pathlib
 
 import click.testing

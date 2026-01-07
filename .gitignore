@@ -283,5 +283,5 @@ $RECYCLE.BIN/
 
 # End of https://www.toptal.com/developers/gitignore/api/linux,windows,macos,python,git,visualstudiocode
 
-/pipelines
 /benchmarks
+*.code-workspace

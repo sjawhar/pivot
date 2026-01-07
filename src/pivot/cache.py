@@ -1,5 +1,3 @@
-"""Content-addressable cache for stage outputs."""
-
 from __future__ import annotations
 
 import contextlib
@@ -306,7 +304,7 @@ def _restore_directory_from_cache(
         file_path = path / entry["relpath"]
         # Validate no path traversal (e.g., "../../../etc/passwd")
         if not file_path.resolve().is_relative_to(resolved_base):
-            raise exceptions.PathTraversalError(
+            raise exceptions.SecurityValidationError(
                 f"Manifest contains path traversal: {entry['relpath']!r}"
             )
         file_path.parent.mkdir(parents=True, exist_ok=True)

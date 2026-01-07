@@ -1,5 +1,3 @@
-"""Tests for CLI export command."""
-
 import contextlib
 import pathlib
 

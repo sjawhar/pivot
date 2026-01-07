@@ -1,5 +1,3 @@
-"""Tests for SQLite-backed file metadata state cache."""
-
 import os
 import pathlib
 import time

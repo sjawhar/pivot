@@ -1,9 +1,3 @@
-"""Parameter loading and validation for Pydantic-based stage parameters.
-
-Supports loading parameters from YAML files with fallback to Pydantic model defaults.
-Parameters are injected into stage functions via a single `params` argument.
-"""
-
 from __future__ import annotations
 
 import copy

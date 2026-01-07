@@ -1,8 +1,3 @@
-"""Command-line interface for Pivot.
-
-Provides commands to run and manage pipelines from the command line.
-"""
-
 from __future__ import annotations
 
 import logging

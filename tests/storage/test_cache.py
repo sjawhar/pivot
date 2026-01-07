@@ -1,5 +1,3 @@
-"""Tests for content-addressable cache module."""
-
 import pathlib
 import stat
 from typing import TYPE_CHECKING

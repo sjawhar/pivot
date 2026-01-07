@@ -1,10 +1,9 @@
-"""Tests for .pvt file handling."""
-
 import pathlib
 
 import pytest
 
 from pivot import pvt
+from pivot.exceptions import SecurityValidationError
 
 # write_pvt_file / read_pvt_file
 
@@ -299,5 +298,5 @@ def test_write_pvt_file_rejects_path_traversal(tmp_path: pathlib.Path) -> None:
         "size": 666,
     }
 
-    with pytest.raises(ValueError, match=r"path traversal|\.\."):
+    with pytest.raises(SecurityValidationError, match=r"path traversal|\.\."):
         pvt.write_pvt_file(pvt_path, data)

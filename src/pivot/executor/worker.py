@@ -1,9 +1,3 @@
-"""Worker process execution for pipeline stages.
-
-Functions that execute in separate processes via ProcessPoolExecutor.
-Must be module-level and picklable.
-"""
-
 from __future__ import annotations
 
 import contextlib

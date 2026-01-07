@@ -1,10 +1,3 @@
-"""End-to-end tests for different DAG topologies.
-
-Tests that various DAG shapes (linear, tree, diamond, fan-out, fan-in) execute
-stages in correct dependency order. Each test constructs stages that would
-necessarily fail if executed in the wrong order.
-"""
-
 import pathlib
 
 import pytest

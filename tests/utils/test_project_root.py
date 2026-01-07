@@ -1,11 +1,3 @@
-"""Tests for project root detection.
-
-Tests the ability to find project root by searching for .pivot or .git directories,
-and resolve paths relative to the project root.
-
-Logic: Stop at first directory (walking up from cwd) that contains either .pivot or .git.
-"""
-
 import contextlib
 from pathlib import Path
 

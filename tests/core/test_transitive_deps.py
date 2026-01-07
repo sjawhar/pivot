@@ -1,9 +1,3 @@
-"""Tests for change detection via fingerprinting.
-
-These tests verify that the fingerprinting system correctly captures
-transitive dependencies, constants, aliased functions, and module attributes.
-"""
-
 import inspect
 import types
 from typing import Any

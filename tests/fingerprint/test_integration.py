@@ -1,10 +1,3 @@
-"""Integration tests for fingerprinting with real .py files.
-
-These tests write actual Python files to disk, import them dynamically,
-modify them, and verify that fingerprinting correctly detects changes.
-This tests the full fingerprinting pipeline end-to-end.
-"""
-
 import importlib
 import pathlib
 import sys

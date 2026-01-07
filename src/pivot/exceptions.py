@@ -10,6 +10,16 @@ class ValidationError(PivotError):
     pass
 
 
+class SecurityValidationError(PivotError):
+    """Raised for security-sensitive validation failures (path traversal, injection attacks).
+
+    Inherits from PivotError (not ValidationError) to ensure security errors
+    are never accidentally caught by broad ValidationError handlers.
+    """
+
+    pass
+
+
 class OutputDuplicationError(ValidationError):
     """Raised when two stages produce the same output."""
 
@@ -96,12 +106,6 @@ class OutputMissingError(CacheError):
 
 class CacheRestoreError(CacheError):
     """Raised when restoring outputs from cache fails."""
-
-    pass
-
-
-class PathTraversalError(CacheError):
-    """Raised when a manifest contains path traversal attempt."""
 
     pass
 

@@ -1,9 +1,3 @@
-"""Tests for Google-style imports with user modules.
-
-Verifies that fingerprinting correctly captures module.attr usage patterns
-like `user_utils.helper_b()` and `user_utils.CONSTANT_A`.
-"""
-
 import tests.user_utils as user_utils
 
 from pivot import ast_utils, fingerprint

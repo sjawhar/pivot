@@ -1,5 +1,3 @@
-"""Integration tests for IncrementalOut feature."""
-
 import pathlib
 from typing import TYPE_CHECKING
 

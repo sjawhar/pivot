@@ -1,5 +1,3 @@
-"""Integration tests for pipeline execution."""
-
 import logging
 import os
 import pathlib

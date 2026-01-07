@@ -1,26 +1,17 @@
-"""PVT file handling for tracked files.
-
-.pvt files are YAML manifests that track arbitrary data files/directories,
-similar to DVC's .dvc files. They sit alongside the tracked data for
-discoverability.
-"""
-
 from __future__ import annotations
 
 import logging
 import os
-import re
+import pathlib
 from typing import TYPE_CHECKING, NotRequired, TypedDict, TypeGuard, cast
 
 import yaml
 
-from pivot import cache
+from pivot import cache, exceptions
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    import pathlib
-
     from pivot.types import DirManifestEntry
 
 # Use union types to avoid type: ignore on fallback assignment
@@ -47,7 +38,6 @@ class PvtData(TypedDict):
 
 _REQUIRED_KEYS = frozenset({"path", "hash", "size"})
 _VALID_KEYS = frozenset({"path", "hash", "size", "num_files", "manifest"})
-_PATH_TRAVERSAL = re.compile(r"(^|/)\.\.(/|$)")
 
 
 def _is_pvt_data(data: object) -> TypeGuard[PvtData]:
@@ -62,13 +52,13 @@ def _is_pvt_data(data: object) -> TypeGuard[PvtData]:
 
 def has_path_traversal(path: str) -> bool:
     """Check if path contains traversal components (..)."""
-    return bool(_PATH_TRAVERSAL.search(path))
+    return ".." in pathlib.Path(path).parts
 
 
 def _validate_path(path: str) -> None:
     """Validate path doesn't contain traversal."""
     if has_path_traversal(path):
-        raise ValueError(f"Path contains path traversal: {path!r}")
+        raise exceptions.SecurityValidationError(f"Path contains path traversal: {path!r}")
 
 
 def write_pvt_file(pvt_path: pathlib.Path, data: PvtData) -> None:

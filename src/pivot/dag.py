@@ -1,9 +1,3 @@
-"""DAG construction and traversal for pipeline stages.
-
-Builds a directed acyclic graph from registered stages to determine execution order.
-Uses networkx for graph operations and DFS postorder traversal.
-"""
-
 from __future__ import annotations
 
 import pathlib

@@ -1,5 +1,3 @@
-"""Tests for pivot track CLI command."""
-
 import pathlib
 
 import click.testing

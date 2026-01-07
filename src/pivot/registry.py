@@ -1,19 +1,3 @@
-"""Stage registry for collecting pipeline stages.
-
-Provides the @stage decorator for marking functions as pipeline stages and
-a registry for managing all registered stages.
-
-Example:
-    >>> from pivot import stage
-    >>>
-    >>> @stage(deps=['data.csv'], outs=['output.txt'])
-    >>> def process(input_file: str = 'data.csv'):
-    ...     with open(input_file) as f:
-    ...         data = f.read()
-    ...     with open('output.txt', 'w') as f:
-    ...         f.write(data.upper())
-"""
-
 from __future__ import annotations
 
 import dataclasses
@@ -28,7 +12,7 @@ from typing import TYPE_CHECKING, Any, TypedDict, TypeVar
 import pydantic
 
 from pivot import exceptions, fingerprint, outputs, parameters, project, trie
-from pivot.exceptions import ParamsError, ValidationError
+from pivot.exceptions import ParamsError, SecurityValidationError, ValidationError
 
 if TYPE_CHECKING:
     from inspect import Signature
@@ -350,22 +334,20 @@ def _validate_stage_registration(
         )
 
     for path in [*deps, *outs]:
-        _validate_path(path, stage_name, validation_mode)
+        _validate_path(path, stage_name)
 
 
-def _validate_path(path: str, stage_name: str, validation_mode: ValidationMode) -> None:
-    """Validate a single path (before normalization)."""
+def _validate_path(path: str, stage_name: str) -> None:
+    """Validate path has no security issues (traversal, null bytes, newlines)."""
     parts = pathlib.Path(path).parts
-    checks = [
+    security_checks = [
         (".." in parts, "contains '..' (path traversal)"),
         ("\x00" in path, "contains null byte"),
         ("\n" in path or "\r" in path, "contains newline character"),
     ]
-    for failed, description in checks:
+    for failed, description in security_checks:
         if failed:
-            _handle_validation_error(
-                f"Stage '{stage_name}': Path '{path}' {description}", validation_mode
-            )
+            raise SecurityValidationError(f"Stage '{stage_name}': Path '{path}' {description}")
 
 
 def _handle_validation_error(msg: str, validation_mode: ValidationMode) -> None:

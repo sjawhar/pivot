@@ -1,9 +1,3 @@
-"""Project root detection and path resolution.
-
-Finds project root by locating .pivot or .git directories, and provides
-utilities for resolving paths relative to the project root.
-"""
-
 import logging
 import os
 import pathlib

@@ -1,18 +1,3 @@
-"""AST parsing utilities for code analysis.
-
-Provides functions to extract information from Python Abstract Syntax Trees,
-primarily for detecting module.attr usage patterns in fingerprinting.
-
-Example:
-    >>> def use_numpy():
-    ...     import numpy as np
-    ...     return np.array([1, 2, 3])
-    >>>
-    >>> attrs = extract_module_attr_usage(use_numpy)
-    >>> attrs
-    [('np', 'array')]
-"""
-
 import ast
 import inspect
 import textwrap
