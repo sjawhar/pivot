@@ -1068,6 +1068,20 @@ def test_executor_handles_cache_false_outputs(pipeline_dir: pathlib.Path) -> Non
     assert not metrics_file.is_symlink(), "Metric with cache=False should not be symlink"
 
 
+def test_executor_fails_if_cache_false_output_missing(pipeline_dir: pathlib.Path) -> None:
+    """Stage fails if cache=False output is not produced."""
+    (pipeline_dir / "input.txt").write_text("data")
+
+    @pivot.stage(deps=["input.txt"], outs=[Metric("metrics.json")])
+    def process() -> None:
+        pass  # Intentionally don't create metrics.json
+
+    results = executor.run(show_output=False)
+
+    assert results["process"]["status"] == "failed"
+    assert "metrics.json" in results["process"]["reason"]
+
+
 def test_executor_output_hashes_in_lock_file(pipeline_dir: pathlib.Path) -> None:
     """Output hashes are stored in lock file."""
     (pipeline_dir / "input.txt").write_text("data")
