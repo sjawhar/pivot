@@ -1,8 +1,14 @@
+"""Worker process execution for pipeline stages.
+
+Functions that execute in separate processes via ProcessPoolExecutor.
+Must be module-level and picklable.
+"""
+
 from __future__ import annotations
 
 import contextlib
+import io
 import logging
-import os
 import pathlib
 import queue
 from typing import TYPE_CHECKING, Any, TypedDict
@@ -13,7 +19,7 @@ from pivot import cache, exceptions, lock, outputs, parameters, project
 from pivot.types import HashInfo, LockData, OutputHash, OutputMessage, StageResult, StageStatus
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Generator, Sequence
+    from collections.abc import Callable, Sequence
     from inspect import Signature
     from multiprocessing import Queue
     from types import TracebackType
@@ -21,8 +27,6 @@ if TYPE_CHECKING:
     from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
-
-_MAX_LOCK_ATTEMPTS = 3
 
 
 class WorkerStageInfo(TypedDict):
@@ -96,7 +100,7 @@ def execute_stage(
         return StageResult(status=StageStatus.SKIPPED, reason="unchanged", output_lines=[])
 
     try:
-        with _execution_lock(stage_name, cache_dir):
+        with lock.execution_lock(stage_name, cache_dir):
             _prepare_outputs_for_execution(stage_outs, lock_data_prev, files_cache_dir)
 
             _run_stage_function_with_capture(
@@ -301,60 +305,9 @@ class _QueueWriter:
     def isatty(self) -> bool:
         return False
 
-
-@contextlib.contextmanager
-def _execution_lock(stage_name: str, cache_dir: pathlib.Path) -> Generator[pathlib.Path]:
-    """Context manager for stage execution lock."""
-    sentinel = _acquire_execution_lock(stage_name, cache_dir)
-    try:
-        yield sentinel
-    finally:
-        sentinel.unlink(missing_ok=True)
-
-
-def _acquire_execution_lock(stage_name: str, cache_dir: pathlib.Path) -> pathlib.Path:
-    """Acquire exclusive lock for stage execution. Returns sentinel path."""
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    sentinel = cache_dir / f"{stage_name}.running"
-
-    for _ in range(_MAX_LOCK_ATTEMPTS):
-        try:
-            fd = os.open(sentinel, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.write(fd, f"pid: {os.getpid()}\n".encode())
-            os.close(fd)
-            return sentinel
-        except FileExistsError:
-            pass
-
-        try:
-            content = sentinel.read_text()
-            pid = int(content.split(":")[1].strip())
-        except (ValueError, IndexError, OSError):
-            pid = None
-
-        if pid is not None and pid > 0 and _is_process_alive(pid):
-            raise exceptions.StageAlreadyRunningError(
-                f"Stage '{stage_name}' is already running (PID {pid})"
-            )
-
-        sentinel.unlink(missing_ok=True)
-        if pid is not None:
-            logger.warning(f"Removed stale lock file: {sentinel} (was PID {pid})")
-
-    raise exceptions.StageAlreadyRunningError(
-        f"Failed to acquire lock for '{stage_name}' after {_MAX_LOCK_ATTEMPTS} attempts"
-    )
-
-
-def _is_process_alive(pid: int) -> bool:
-    """Check if process is still running."""
-    try:
-        os.kill(pid, 0)
-        return True
-    except PermissionError:
-        return True
-    except ProcessLookupError:
-        return False
+    def fileno(self) -> int:
+        """Raise UnsupportedOperation - _QueueWriter has no underlying file descriptor."""
+        raise io.UnsupportedOperation("_QueueWriter does not use a file descriptor")
 
 
 def hash_dependencies(deps: list[str]) -> tuple[dict[str, HashInfo], list[str], list[str]]:
