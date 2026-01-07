@@ -2,9 +2,10 @@ import os
 import pathlib
 import sys
 import time
+from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, TextIO
 
-from pivot.types import StageDisplayStatus, StageStatus
+from pivot.types import StageDisplayStatus, StageExplanation, StageStatus
 
 if TYPE_CHECKING:
     from collections.abc import Set
@@ -181,6 +182,89 @@ class Console:
         """Print watch mode stopped message."""
         msg = self._color("\nWatch mode stopped", "cyan")
         print(msg, file=self.stream, flush=True)
+
+    def _print_changes(
+        self,
+        header: str,
+        changes: Sequence[Mapping[str, object]],
+        key_field: str,
+        old_field: str,
+        new_field: str,
+    ) -> None:
+        """Print a list of changes with consistent formatting."""
+        if not changes:
+            return
+
+        print(f"\n  {self._color(header, 'cyan')}", file=self.stream, flush=True)
+
+        for change in changes:
+            key = change[key_field]
+            change_type = change["change_type"]
+            old_val = change[old_field]
+            new_val = change[new_field]
+
+            print(f"    {key}", file=self.stream, flush=True)
+
+            if change_type == "modified":
+                print(
+                    f"      Old: {self._color(str(old_val) if old_val else 'N/A', 'red')}",
+                    file=self.stream,
+                    flush=True,
+                )
+                print(
+                    f"      New: {self._color(str(new_val) if new_val else 'N/A', 'green')}",
+                    file=self.stream,
+                    flush=True,
+                )
+            elif change_type == "added":
+                print(
+                    f"      {self._color('(added)', 'green')} {new_val}",
+                    file=self.stream,
+                    flush=True,
+                )
+            else:
+                print(
+                    f"      {self._color('(removed)', 'red')} {old_val}",
+                    file=self.stream,
+                    flush=True,
+                )
+
+    def explain_stage(self, explanation: StageExplanation) -> None:
+        """Print detailed explanation of why a stage would run."""
+        name = explanation["stage_name"]
+        will_run = explanation["will_run"]
+        reason = explanation["reason"]
+
+        print(f"\nStage: {self._color(name, 'bold')}", file=self.stream, flush=True)
+
+        status_text = (
+            self._color("WILL RUN", "green", "bold") if will_run else self._color("SKIP", "yellow")
+        )
+        print(f"  Status: {status_text}", file=self.stream, flush=True)
+
+        if reason:
+            print(f"  Reason: {reason}", file=self.stream, flush=True)
+
+        self._print_changes(
+            "Code Changes:", explanation["code_changes"], "key", "old_hash", "new_hash"
+        )
+        self._print_changes(
+            "Param Changes:", explanation["param_changes"], "key", "old_value", "new_value"
+        )
+        self._print_changes(
+            "Dependency Changes:", explanation["dep_changes"], "path", "old_hash", "new_hash"
+        )
+
+    def explain_summary(self, will_run: int, unchanged: int) -> None:
+        """Print summary after explain output."""
+        print("", file=self.stream)
+        run_text = self._color(str(will_run), "green") if will_run > 0 else str(will_run)
+        unchanged_text = self._color(str(unchanged), "yellow") if unchanged > 0 else str(unchanged)
+        print(
+            f"Summary: {run_text} will run, {unchanged_text} unchanged",
+            file=self.stream,
+            flush=True,
+        )
 
 
 # Global console instance for convenience

@@ -80,3 +80,44 @@ class LockData(TypedDict, total=False):
 
 # Type alias for output queue messages: (stage_name, line, is_stderr) or None for shutdown
 OutputMessage = tuple[str, str, bool] | None
+
+# Type alias for change detection status
+ChangeType = Literal["modified", "added", "removed"]
+
+
+class CodeChange(TypedDict):
+    """Change info for a code component in the fingerprint."""
+
+    key: str  # e.g., "func:helper_a", "mod:utils.helper"
+    old_hash: str | None
+    new_hash: str | None
+    change_type: ChangeType
+
+
+class ParamChange(TypedDict):
+    """Change info for a parameter value."""
+
+    key: str
+    old_value: Any
+    new_value: Any
+    change_type: ChangeType
+
+
+class DepChange(TypedDict):
+    """Change info for an input dependency file."""
+
+    path: str
+    old_hash: str | None
+    new_hash: str | None
+    change_type: ChangeType
+
+
+class StageExplanation(TypedDict):
+    """Detailed explanation of why a stage would run."""
+
+    stage_name: str
+    will_run: bool
+    reason: str  # High-level: "Code changed", "No previous run", etc.
+    code_changes: list[CodeChange]
+    param_changes: list[ParamChange]
+    dep_changes: list[DepChange]

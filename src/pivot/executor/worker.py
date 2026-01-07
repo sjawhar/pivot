@@ -50,7 +50,7 @@ def execute_stage(
 
     stage_lock = lock.StageLock(stage_name, cache_dir)
     current_fingerprint = stage_info["fingerprint"]
-    dep_hashes, missing = hash_dependencies(stage_info["deps"])
+    dep_hashes, missing, unreadable = hash_dependencies(stage_info["deps"])
     stage_outs = stage_info["outs"]
 
     # Apply YAML overrides BEFORE change detection so params.yaml changes trigger re-runs
@@ -71,6 +71,13 @@ def execute_stage(
         return StageResult(
             status=StageStatus.FAILED,
             reason=f"missing deps: {', '.join(missing)}",
+            output_lines=[],
+        )
+
+    if unreadable:
+        return StageResult(
+            status=StageStatus.FAILED,
+            reason=f"unreadable deps: {', '.join(unreadable)}",
             output_lines=[],
         )
 
@@ -350,14 +357,16 @@ def _is_process_alive(pid: int) -> bool:
         return False
 
 
-def hash_dependencies(deps: list[str]) -> tuple[dict[str, HashInfo], list[str]]:
-    """Hash all dependency files and directories. Returns (hashes, missing_files).
+def hash_dependencies(deps: list[str]) -> tuple[dict[str, HashInfo], list[str], list[str]]:
+    """Hash all dependency files and directories.
 
+    Returns (hashes, missing_files, unreadable_files).
     For directories, includes full manifest with file hashes/sizes for provenance.
     Paths are normalized (symlinks preserved) for portability in lock files.
     """
     hashes = dict[str, HashInfo]()
     missing = list[str]()
+    unreadable = list[str]()
     for dep in deps:
         # Use normalized path (preserve symlinks) as key for portability
         normalized = str(project.normalize_path(dep))
@@ -372,7 +381,9 @@ def hash_dependencies(deps: list[str]) -> tuple[dict[str, HashInfo], list[str]]:
                 hashes[normalized] = {"hash": hash_file(path)}
         except FileNotFoundError:
             missing.append(dep)
-    return hashes, missing
+        except OSError:
+            unreadable.append(dep)
+    return hashes, missing, unreadable
 
 
 def hash_file(path: pathlib.Path) -> str:

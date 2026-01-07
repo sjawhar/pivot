@@ -18,7 +18,7 @@ def test_cli_help_shows_commands(runner: click.testing.CliRunner) -> None:
     result = runner.invoke(cli.cli, ["--help"])
     assert result.exit_code == 0
     assert "run" in result.output
-    assert "status" in result.output
+    assert "list" in result.output
 
 
 def test_cli_run_help(runner: click.testing.CliRunner) -> None:
@@ -37,7 +37,7 @@ def test_cli_run_no_stages_registered(
         (pathlib.Path.cwd() / ".git").mkdir()
         result = runner.invoke(cli.cli, ["run"])
         assert result.exit_code == 0
-        assert "0 ran, 0 skipped" in result.output
+        assert "No stages to run" in result.output
 
 
 def test_cli_verbose_accepted(runner: click.testing.CliRunner) -> None:
@@ -46,31 +46,31 @@ def test_cli_verbose_accepted(runner: click.testing.CliRunner) -> None:
     assert result.exit_code == 0
 
 
-def test_cli_status_command_exists(runner: click.testing.CliRunner) -> None:
-    """Status subcommand should be available."""
-    result = runner.invoke(cli.cli, ["status", "--help"])
+def test_cli_list_command_exists(runner: click.testing.CliRunner) -> None:
+    """List subcommand should be available."""
+    result = runner.invoke(cli.cli, ["list", "--help"])
     assert result.exit_code == 0
 
 
-def test_cli_status_shows_registered_stages(
+def test_cli_list_shows_registered_stages(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
-    """Status should show registered stages."""
+    """List should show registered stages."""
     output_file = tmp_path / "out.txt"
 
     @stage(deps=[], outs=[str(output_file)])
     def my_stage() -> None:
         pass
 
-    result = runner.invoke(cli.cli, ["status"])
+    result = runner.invoke(cli.cli, ["list"])
     assert result.exit_code == 0
     assert "my_stage" in result.output
 
 
-def test_cli_status_verbose_shows_details(
+def test_cli_list_verbose_shows_details(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
-    """Status --verbose should show deps and outputs."""
+    """List --verbose should show deps and outputs."""
     input_file = tmp_path / "input.txt"
     output_file = tmp_path / "output.txt"
 
@@ -78,7 +78,7 @@ def test_cli_status_verbose_shows_details(
     def my_stage() -> None:
         pass
 
-    result = runner.invoke(cli.cli, ["--verbose", "status"])
+    result = runner.invoke(cli.cli, ["--verbose", "list"])
     assert result.exit_code == 0
     assert "my_stage" in result.output
     assert "deps:" in result.output
@@ -293,13 +293,13 @@ def test_cli_run_prints_skipped_stages(
 
 
 # =============================================================================
-# Status Command Tests
+# List Command Tests
 # =============================================================================
 
 
-def test_cli_status_no_stages(runner: click.testing.CliRunner) -> None:
-    """Status with no stages shows appropriate message."""
-    result = runner.invoke(cli.cli, ["status"])
+def test_cli_list_no_stages(runner: click.testing.CliRunner) -> None:
+    """List with no stages shows appropriate message."""
+    result = runner.invoke(cli.cli, ["list"])
 
     assert result.exit_code == 0
     assert "No stages registered" in result.output
