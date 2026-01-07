@@ -11,15 +11,33 @@ import pathlib
 import queue
 import threading
 import time
-from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast
+from typing import TYPE_CHECKING, Literal, TypedDict, cast
 
 import loky
-import pydantic
 
-from pivot import cache, console, dag, exceptions, lock, outputs, parameters, project, pvt, registry
+from pivot import (
+    cache,
+    console,
+    dag,
+    exceptions,
+    explain,
+    lock,
+    outputs,
+    parameters,
+    project,
+    pvt,
+    registry,
+)
 from pivot import state as state_mod
 from pivot.executor import worker
-from pivot.types import OnError, OutputMessage, StageDisplayStatus, StageResult, StageStatus
+from pivot.types import (
+    OnError,
+    OutputMessage,
+    StageDisplayStatus,
+    StageExplanation,
+    StageResult,
+    StageStatus,
+)
 
 if TYPE_CHECKING:
     from networkx import DiGraph
@@ -34,15 +52,6 @@ class ExecutionSummary(TypedDict):
 
     status: Literal[StageStatus.RAN, StageStatus.SKIPPED, StageStatus.FAILED, StageStatus.UNKNOWN]
     reason: str
-
-
-class ChangeCheckResult(TypedDict):
-    """Result of checking if a stage needs to run."""
-
-    changed: bool
-    reason: str
-    missing_deps: list[str]
-    current_params: dict[str, Any]
 
 
 @dataclasses.dataclass
@@ -71,6 +80,7 @@ def run(
     show_output: bool = True,
     force: bool = False,
     stage_timeout: float | None = None,
+    explain_mode: bool = False,
 ) -> dict[str, ExecutionSummary]:
     """Execute pipeline stages with greedy parallel execution.
 
@@ -84,6 +94,7 @@ def run(
         show_output: If True, print progress and stage output to console.
         force: If True, skip safety checks for uncached IncrementalOut files.
         stage_timeout: Max seconds for each stage to complete (default: no timeout).
+        explain_mode: If True, show detailed WHY for each stage before execution.
 
     Returns:
         Dict of stage_name -> {status: "ran"|"skipped"|"failed", reason: str}
@@ -154,6 +165,7 @@ def run(
         total_stages=total_stages,
         stage_timeout=stage_timeout,
         overrides=overrides,
+        explain_mode=explain_mode,
     )
 
     results = _build_results(stage_states)
@@ -261,6 +273,7 @@ def _execute_greedy(
     total_stages: int,
     stage_timeout: float | None = None,
     overrides: parameters.ParamsOverrides | None = None,
+    explain_mode: bool = False,
 ) -> None:
     """Execute stages with greedy parallel scheduling using loky ProcessPoolExecutor."""
     overrides = overrides or {}
@@ -298,6 +311,7 @@ def _execute_greedy(
                 total_stages=total_stages,
                 completed_count=completed_count,
                 overrides=overrides,
+                explain_mode=explain_mode,
             )
 
             while futures:
@@ -419,6 +433,7 @@ def _execute_greedy(
                         total_stages=total_stages,
                         completed_count=completed_count,
                         overrides=overrides,
+                        explain_mode=explain_mode,
                     )
     finally:
         # Signal output thread to stop - may fail if queue is broken
@@ -461,6 +476,7 @@ def _start_ready_stages(
     total_stages: int,
     completed_count: int,
     overrides: parameters.ParamsOverrides,
+    explain_mode: bool = False,
 ) -> None:
     """Find and start stages that are ready to execute."""
     started = 0
@@ -483,6 +499,11 @@ def _start_ready_stages(
         if any(mutex_counts[m] > 0 for m in state.mutex):
             continue
 
+        # Show explanation before starting if in explain mode
+        if explain_mode and con:
+            explanation = _get_stage_explanation(state.info, cache_dir, overrides)
+            con.explain_stage(explanation)
+
         # Acquire mutex locks before changing status
         for mutex in state.mutex:
             mutex_counts[mutex] += 1
@@ -504,7 +525,7 @@ def _start_ready_stages(
             state.status = StageStatus.IN_PROGRESS
             state.start_time = time.perf_counter()
 
-            if con:
+            if con and not explain_mode:
                 con.stage_start(
                     name=stage_name,
                     index=completed_count + len(futures),
@@ -603,6 +624,22 @@ def _build_results(stage_states: dict[str, StageState]) -> dict[str, ExecutionSu
     return results
 
 
+def _get_stage_explanation(
+    stage_info: registry.RegistryStageInfo,
+    cache_dir: pathlib.Path,
+    overrides: parameters.ParamsOverrides,
+) -> StageExplanation:
+    """Compute explanation for a single stage."""
+    return explain.get_stage_explanation(
+        stage_info["name"],
+        stage_info["fingerprint"],
+        stage_info["deps"],
+        stage_info["params"],
+        overrides,
+        cache_dir,
+    )
+
+
 def _check_uncached_incremental_outputs(
     execution_order: list[str],
     cache_dir: pathlib.Path,
@@ -630,46 +667,3 @@ def _check_uncached_incremental_outputs(
                     uncached.append((stage_name, out.path))
 
     return uncached
-
-
-def check_stage_changed(
-    stage_name: str,
-    fingerprint: dict[str, str],
-    deps: list[str],
-    params_instance: pydantic.BaseModel | None,
-    overrides: parameters.ParamsOverrides | None,
-    cache_dir: pathlib.Path,
-) -> ChangeCheckResult:
-    """Check if a stage needs to run based on fingerprint, deps, and params.
-
-    Single source of truth for change detection logic used by both executor and CLI.
-    Does NOT check output cache restoration - that's executor-specific.
-    """
-    stage_lock = lock.StageLock(stage_name, cache_dir)
-    dep_hashes, missing_deps = worker.hash_dependencies(deps)
-
-    try:
-        current_params = parameters.get_effective_params(params_instance, stage_name, overrides)
-    except pydantic.ValidationError as e:
-        return ChangeCheckResult(
-            changed=True,
-            reason=f"invalid params.yaml: {e.error_count()} error(s)",
-            missing_deps=[],
-            current_params={},
-        )
-
-    if missing_deps:
-        return ChangeCheckResult(
-            changed=True,
-            reason=f"missing deps: {', '.join(missing_deps)}",
-            missing_deps=missing_deps,
-            current_params=current_params,
-        )
-
-    changed, reason = stage_lock.is_changed(fingerprint, current_params, dep_hashes)
-    return ChangeCheckResult(
-        changed=changed,
-        reason=reason,
-        missing_deps=[],
-        current_params=current_params,
-    )

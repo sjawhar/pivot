@@ -716,7 +716,7 @@ def test_hash_dependencies_with_existing_files(tmp_path: pathlib.Path) -> None:
     old_cwd = os.getcwd()
     os.chdir(tmp_path)
     try:
-        hashes, missing = executor.hash_dependencies(["file1.txt", "file2.txt"])
+        hashes, missing, unreadable = executor.hash_dependencies(["file1.txt", "file2.txt"])
 
         assert len(hashes) == 2
         # Keys are now normalized paths (absolute)
@@ -730,16 +730,18 @@ def test_hash_dependencies_with_existing_files(tmp_path: pathlib.Path) -> None:
         assert "hash" in file_hash
         assert "manifest" not in file_hash, "Files should not have manifest"
         assert len(missing) == 0
+        assert len(unreadable) == 0
     finally:
         os.chdir(old_cwd)
 
 
 def test_hash_dependencies_with_missing_files() -> None:
     """hash_dependencies reports missing files."""
-    hashes, missing = executor.hash_dependencies(["missing1.txt", "missing2.txt"])
+    hashes, missing, unreadable = executor.hash_dependencies(["missing1.txt", "missing2.txt"])
 
     assert len(hashes) == 0
     assert missing == ["missing1.txt", "missing2.txt"]
+    assert len(unreadable) == 0
 
 
 def test_hash_dependencies_with_directory(tmp_path: pathlib.Path) -> None:
@@ -751,7 +753,7 @@ def test_hash_dependencies_with_directory(tmp_path: pathlib.Path) -> None:
     old_cwd = os.getcwd()
     os.chdir(tmp_path)
     try:
-        hashes, missing = executor.hash_dependencies(["data_dir"])
+        hashes, missing, unreadable = executor.hash_dependencies(["data_dir"])
 
         assert len(hashes) == 1, "Directory should be hashed"
         # Keys are now normalized paths (absolute)
@@ -766,6 +768,7 @@ def test_hash_dependencies_with_directory(tmp_path: pathlib.Path) -> None:
         assert len(manifest) == 1, "Manifest should have one file"
         assert manifest[0]["relpath"] == "file.txt"
         assert len(missing) == 0, "No missing dependencies"
+        assert len(unreadable) == 0, "No unreadable dependencies"
     finally:
         os.chdir(old_cwd)
 

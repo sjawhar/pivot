@@ -226,10 +226,10 @@ pip install pivot
 - **Watch mode** - File system monitoring with configurable globs and debounce
 - **Incremental outputs** - Restore-before-run for append-only workloads
 - **DVC export** - `pivot export` command for YAML generation
+- **Explain mode** - `pivot run --explain` shows detailed breakdown of WHY stages would run
 
 ### In Progress
 
-- [ ] **Explain mode** - Show detailed breakdown of WHY stages would run (changed code, params, deps)
 - [ ] **End-to-end benchmarks** - Comparative performance testing vs DVC
 
 ### Future
@@ -358,7 +358,7 @@ Real-world DVC pipelines profiled to identify bottlenecks:
 
 ### Q: Is this production-ready?
 
-**A:** Not yet! Core functionality is complete and well-tested (90%+ coverage), but we're still adding features like explain mode before the 1.0 release.
+**A:** Not yet! Core functionality is complete and well-tested (90%+ coverage), but we're polishing the final features before the 1.0 release.
 
 ---
 
