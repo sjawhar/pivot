@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any, TypedDict
 
 import pydantic
 
-from pivot import cache, exceptions, lock, outputs, parameters, project
+from pivot import cache, exceptions, lock, outputs, parameters, project, state
 from pivot.types import HashInfo, LockData, OutputHash, OutputMessage, StageResult, StageStatus
 
 if TYPE_CHECKING:
@@ -59,10 +59,10 @@ def execute_stage(
     """Worker function executed in separate process. Must be module-level for pickling."""
     output_lines: list[tuple[str, bool]] = []
     files_cache_dir = cache_dir / "files"
+    state_db_path = cache_dir.parent / "state.db"
 
     stage_lock = lock.StageLock(stage_name, cache_dir)
     current_fingerprint = stage_info["fingerprint"]
-    dep_hashes, missing, unreadable = hash_dependencies(stage_info["deps"])
     stage_outs = stage_info["outs"]
 
     # Apply YAML overrides BEFORE change detection so params.yaml changes trigger re-runs
@@ -78,6 +78,17 @@ def execute_stage(
             reason=f"Invalid params override in params.yaml: {e.error_count()} validation error(s)",
             output_lines=[],
         )
+
+    with state.StateDB(state_db_path) as state_db:
+        skip_result = _try_generation_skip(
+            stage_name, stage_info, stage_lock, state_db, current_params
+        )
+        if skip_result is not None:
+            lock_data_prev = stage_lock.read()
+            if _restore_outputs_from_cache(stage_outs, lock_data_prev, files_cache_dir):
+                return skip_result
+
+        dep_hashes, missing, unreadable = hash_dependencies(stage_info["deps"], state_db)
 
     if missing:
         return StageResult(
@@ -125,6 +136,10 @@ def execute_stage(
                 "output_hashes": dict(sorted(output_hashes.items())),
             }
             stage_lock.write(lock_data)
+
+            # Record generations after successful execution
+            with state.StateDB(state_db_path) as state_db:
+                _record_generations_after_run(stage_name, stage_info, state_db)
 
         return StageResult(status=StageStatus.RAN, reason=reason, output_lines=output_lines)
 
@@ -319,7 +334,9 @@ class _QueueWriter:
         raise io.UnsupportedOperation("_QueueWriter does not use a file descriptor")
 
 
-def hash_dependencies(deps: list[str]) -> tuple[dict[str, HashInfo], list[str], list[str]]:
+def hash_dependencies(
+    deps: list[str], state_db: state.StateDB | None = None
+) -> tuple[dict[str, HashInfo], list[str], list[str]]:
     """Hash all dependency files and directories.
 
     Returns (hashes, missing_files, unreadable_files).
@@ -330,17 +347,14 @@ def hash_dependencies(deps: list[str]) -> tuple[dict[str, HashInfo], list[str], 
     missing = list[str]()
     unreadable = list[str]()
     for dep in deps:
-        # Use normalized path (preserve symlinks) as key for portability
         normalized = str(project.normalize_path(dep))
-
-        # Resolve for actual file operations (hashing, existence check)
         path = pathlib.Path(dep)
         try:
             if path.is_dir():
-                tree_hash, manifest = cache.hash_directory(path)
+                tree_hash, manifest = cache.hash_directory(path, state_db)
                 hashes[normalized] = {"hash": tree_hash, "manifest": manifest}
             else:
-                hashes[normalized] = {"hash": hash_file(path)}
+                hashes[normalized] = {"hash": cache.hash_file(path, state_db)}
         except FileNotFoundError:
             missing.append(dep)
         except OSError:
@@ -348,6 +362,71 @@ def hash_dependencies(deps: list[str]) -> tuple[dict[str, HashInfo], list[str], 
     return hashes, missing, unreadable
 
 
-def hash_file(path: pathlib.Path) -> str:
-    """Hash file contents using xxhash64."""
-    return cache.hash_file(path)
+# -----------------------------------------------------------------------------
+# Generation tracking for O(1) skip detection
+# -----------------------------------------------------------------------------
+
+
+def _try_generation_skip(
+    stage_name: str,
+    stage_info: WorkerStageInfo,
+    stage_lock: lock.StageLock,
+    state_db: state.StateDB,
+    current_params: dict[str, Any],
+) -> StageResult | None:
+    """Attempt O(1) skip using generation tracking. Returns None if fallback needed."""
+    lock_data = stage_lock.read()
+    if not lock_data:
+        return None
+
+    if "code_manifest" not in lock_data or lock_data["code_manifest"] != stage_info["fingerprint"]:
+        return None
+    if "params" not in lock_data or lock_data["params"] != current_params:
+        return None
+
+    recorded_gens = state_db.get_dep_generations(stage_name)
+    if recorded_gens is None:
+        return None
+
+    dep_paths = [pathlib.Path(d) for d in stage_info["deps"]]
+    current_gens = state_db.get_many_generations(dep_paths)
+
+    for dep in stage_info["deps"]:
+        path = pathlib.Path(dep)
+        if current_gens.get(path) is None:
+            return None
+
+    for dep in stage_info["deps"]:
+        path = pathlib.Path(dep)
+        normalized = str(project.normalize_path(dep))
+        current_gen = current_gens.get(path)
+        recorded_gen = recorded_gens.get(normalized)
+        if current_gen != recorded_gen:
+            return None
+
+    return StageResult(status=StageStatus.SKIPPED, reason="unchanged (generation)", output_lines=[])
+
+
+def _record_generations_after_run(
+    stage_name: str,
+    stage_info: WorkerStageInfo,
+    state_db: state.StateDB,
+) -> None:
+    """Record dependency generations and increment output generations after successful run."""
+    dep_paths = [pathlib.Path(d) for d in stage_info["deps"]]
+    current_gens = state_db.get_many_generations(dep_paths)
+
+    gen_record = dict[str, int]()
+    for dep in stage_info["deps"]:
+        path = pathlib.Path(dep)
+        gen = current_gens.get(path)
+        if gen is not None:
+            normalized = str(project.normalize_path(dep))
+            gen_record[normalized] = gen
+
+    if gen_record:
+        state_db.record_dep_generations(stage_name, gen_record)
+
+    for out in stage_info["outs"]:
+        out_path = pathlib.Path(out.path)
+        state_db.increment_generation(out_path)
