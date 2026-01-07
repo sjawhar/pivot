@@ -1,0 +1,50 @@
+from types import TracebackType
+from typing import Self
+
+class Error(Exception):
+    """Base class for LMDB errors."""
+
+class MapFullError(Error):
+    """Raised when the database map is full."""
+
+class BadValsizeError(Error):
+    """Raised when a key or value is too large."""
+
+class Environment:
+    """LMDB environment representing a database."""
+
+    def begin(self, write: bool = False) -> Transaction: ...
+    def close(self) -> None: ...
+    def stat(self) -> dict[str, int]: ...
+
+class Transaction:
+    """LMDB transaction."""
+
+    def get(self, key: bytes) -> bytes | None: ...
+    def put(self, key: bytes, value: bytes) -> bool: ...
+    def stat(self) -> dict[str, int]: ...
+    def __enter__(self) -> Self: ...
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None: ...
+
+def open(
+    path: str,
+    map_size: int = 10485760,
+    subdir: bool = True,
+    readonly: bool = False,
+    metasync: bool = True,
+    sync: bool = True,
+    mode: int = 0o755,
+    create: bool = True,
+    readahead: bool = True,
+    writemap: bool = False,
+    meminit: bool = True,
+    max_readers: int = 126,
+    max_dbs: int = 0,
+    max_spare_txns: int = 1,
+    lock: bool = True,
+) -> Environment: ...
