@@ -164,6 +164,41 @@ class StageExplanation(TypedDict):
     dep_changes: list[DepChange]
 
 
+# Remote cache types
+
+
+class TransferResult(TypedDict):
+    """Result of a single file transfer to/from remote."""
+
+    hash: str
+    success: bool
+    error: NotRequired[str]
+
+
+class TransferSummary(TypedDict):
+    """Summary of push/pull operation."""
+
+    transferred: int
+    skipped: int
+    failed: int
+    errors: list[str]
+
+
+class RemoteStatus(TypedDict):
+    """Status comparison between local and remote cache."""
+
+    local_only: set[str]
+    remote_only: set[str]
+    common: set[str]
+
+
+class RawPivotConfig(TypedDict, total=False):
+    """Raw config file structure (.pivot/config.yaml)."""
+
+    remotes: dict[str, str]  # {remote_name: s3_url}
+    default_remote: str
+
+
 # =============================================================================
 # Data Diff Types
 # =============================================================================
