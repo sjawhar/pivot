@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 
 import click
 
-from pivot import cache, config, executor, get, project, pvt, registry
+from pivot import cache, config, discovery, executor, get, project, pvt, registry
 from pivot.types import DataDiffResult, OutputHash, StageExplanation, StageStatus
 
 if TYPE_CHECKING:
@@ -14,6 +14,17 @@ if TYPE_CHECKING:
     from pivot.types import OutputFormat
 
 logger = logging.getLogger(__name__)
+
+
+def _ensure_stages_registered() -> None:
+    """Auto-discover and register stages if none are registered."""
+    if not discovery.has_registered_stages():
+        try:
+            discovered = discovery.discover_and_register()
+            if discovered:
+                logger.info(f"Loaded pipeline from {discovered}")
+        except discovery.DiscoveryError as e:
+            raise click.ClickException(str(e)) from e
 
 
 def _validate_stages(stages_list: list[str] | None, single_stage: bool) -> None:
@@ -110,7 +121,10 @@ def run(
 
     If STAGES are provided, runs those stages and their dependencies.
     Use --single-stage to run only the specified stages without dependencies.
+
+    Auto-discovers pivot.yaml or pipeline.py if no stages are registered.
     """
+    _ensure_stages_registered()
     stages_list = list(stages) if stages else None
     _validate_stages(stages_list, single_stage)
 
@@ -168,6 +182,7 @@ def dry_run_cmd(
     stages: tuple[str, ...], single_stage: bool, cache_dir: pathlib.Path | None
 ) -> None:
     """Show what would run without executing."""
+    _ensure_stages_registered()
     stages_list = list(stages) if stages else None
     _validate_stages(stages_list, single_stage)
 
@@ -203,6 +218,7 @@ def explain_cmd(
     """Show detailed breakdown of why stages would run."""
     from pivot import console
 
+    _ensure_stages_registered()
     stages_list = list(stages) if stages else None
     _validate_stages(stages_list, single_stage)
 

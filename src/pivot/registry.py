@@ -211,10 +211,16 @@ class StageRegistry:
         outs_list: Sequence[outputs.OutSpec] = outs if outs is not None else ()
         mutex_list: list[str] = [m.strip().lower() for m in mutex] if mutex else []
 
-        # Normalize cwd to absolute path
+        # Normalize cwd to absolute path and validate within project root
         cwd_path: pathlib.Path | None = None
         if cwd is not None:
             cwd_path = project.normalize_path(str(cwd))
+            project_root = project.get_project_root()
+            if not cwd_path.is_relative_to(project_root):
+                raise exceptions.InvalidPathError(
+                    f"Stage '{stage_name}': cwd '{cwd}' resolves to '{cwd_path}' "
+                    + f"which is outside project root '{project_root}'"
+                )
 
         # Normalize outputs to BaseOut objects
         outs_normalized = [outputs.normalize_out(o) for o in outs_list]

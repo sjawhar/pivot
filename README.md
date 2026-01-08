@@ -58,6 +58,83 @@ pivot run
 pivot export --output dvc.yaml
 ```
 
+### Alternative: YAML Configuration
+
+Define pipelines in `pivot.yaml` for teams that prefer configuration files:
+
+```yaml
+# pivot.yaml
+stages:
+  preprocess:
+    python: stages.preprocess
+    deps:
+      - data.csv
+    outs:
+      - processed.parquet
+
+  train:
+    python: stages.train
+    deps:
+      - processed.parquet
+    outs:
+      - model.pkl
+    params:
+      lr: 0.01
+```
+
+```bash
+pivot run  # Auto-discovers pivot.yaml
+```
+
+### Alternative: Programmatic Pipeline
+
+Use the `Pipeline` class for dynamic pipeline construction:
+
+```python
+# pipeline.py
+from pivot import Pipeline
+
+from stages import preprocess, train
+
+pipeline = Pipeline()
+pipeline.add_stage(preprocess, deps=['data.csv'], outs=['processed.parquet'])
+pipeline.add_stage(train, deps=['processed.parquet'], outs=['model.pkl'])
+```
+
+```bash
+pivot run  # Auto-discovers pipeline.py
+```
+
+**Auto-discovery order:** `pivot.yaml` → `pivot.yml` → `pipeline.py`
+
+### Matrix Expansion (pivot.yaml)
+
+Generate multiple stage variants from a single definition:
+
+```yaml
+stages:
+  train:
+    python: stages.train
+    deps:
+      - data/clean.csv
+      - "configs/${model}.yaml"
+    outs:
+      - "models/${model}_${dataset}.pkl"
+    matrix:
+      model:
+        bert:
+          params:
+            hidden_size: 768
+        gpt:
+          params:
+            hidden_size: 1024
+          deps+:
+            - data/gpt_tokenizer.json
+      dataset: [swe, human]
+```
+
+This generates 4 stages: `train@bert_swe`, `train@bert_human`, `train@gpt_swe`, `train@gpt_human`
+
 ---
 
 ## Key Features
@@ -255,6 +332,7 @@ pip install pivot
 - **DVC export** - `pivot export` command for YAML generation
 - **Explain mode** - `pivot run --explain` shows detailed breakdown of WHY stages would run
 - **Observability** - `pivot metrics show/diff` and `pivot plots show/diff` commands
+- **Pipeline configuration** - `pivot.yaml` files with matrix expansion, `Pipeline` class, CLI auto-discovery
 - **Data diff** - `pivot data diff` command with interactive TUI for comparing data file changes
 
 ### In Progress
