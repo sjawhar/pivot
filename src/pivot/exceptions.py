@@ -122,6 +122,12 @@ class ParamsError(PivotError):
     pass
 
 
+class PlotsError(PivotError):
+    """Raised when plot processing fails."""
+
+    pass
+
+
 class TrackedFileMissingError(CacheError):
     """Raised when a .pvt tracked file is missing (user should run pivot checkout)."""
 

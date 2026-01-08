@@ -1016,12 +1016,14 @@ source = { editable = "." }
 dependencies = [
     { name = "click" },
     { name = "deepmerge" },
+    { name = "dulwich" },
     { name = "lmdb" },
     { name = "loky" },
     { name = "networkx" },
     { name = "pydantic" },
     { name = "pygtrie" },
     { name = "pyyaml" },
+    { name = "tabulate" },
     { name = "watchfiles" },
     { name = "xxhash" },
 ]
@@ -1047,6 +1049,7 @@ dev = [
 requires-dist = [
     { name = "click", specifier = ">=8.0" },
     { name = "deepmerge", specifier = ">=2.0" },
+    { name = "dulwich", specifier = ">=0.22.0" },
     { name = "dvc", marker = "extra == 'dvc'", specifier = ">=3.0" },
     { name = "lmdb", specifier = ">=1.4.0" },
     { name = "loky", specifier = ">=3.4" },
@@ -1054,6 +1057,7 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.0" },
     { name = "pygtrie", specifier = ">=2.5.0" },
     { name = "pyyaml", specifier = ">=6.0" },
+    { name = "tabulate", specifier = ">=0.8.0" },
     { name = "watchfiles", specifier = ">=1.0" },
     { name = "xxhash", specifier = ">=3.0" },
 ]
