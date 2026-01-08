@@ -364,7 +364,7 @@ def test_output_thread_cleanup_completes(pipeline_dir: pathlib.Path) -> None:
     results = executor.run(show_output=True)
 
     # Give a moment for thread cleanup
-    time.sleep(0.2)
+    time.sleep(0.05)
 
     # Thread count should return to initial (or close to it)
     final_thread_count = threading.active_count()
@@ -383,7 +383,7 @@ def test_mutex_prevents_concurrent_execution(pipeline_dir: pathlib.Path) -> None
     def stage_a() -> None:
         with open("timing.txt", "a") as f:
             f.write("a_start\n")
-        time.sleep(0.1)  # Ensure overlap would be detected
+        time.sleep(0.02)  # Ensure overlap would be detected
         with open("timing.txt", "a") as f:
             f.write("a_end\n")
         pathlib.Path("a.txt").write_text("a")
@@ -392,7 +392,7 @@ def test_mutex_prevents_concurrent_execution(pipeline_dir: pathlib.Path) -> None
     def stage_b() -> None:
         with open("timing.txt", "a") as f:
             f.write("b_start\n")
-        time.sleep(0.1)
+        time.sleep(0.02)
         with open("timing.txt", "a") as f:
             f.write("b_end\n")
         pathlib.Path("b.txt").write_text("b")
@@ -458,7 +458,7 @@ def test_multiple_mutex_groups_per_stage(pipeline_dir: pathlib.Path) -> None:
     def multi_resource() -> None:
         with open("timing.txt", "a") as f:
             f.write("multi_start\n")
-        time.sleep(0.1)
+        time.sleep(0.02)
         with open("timing.txt", "a") as f:
             f.write("multi_end\n")
         pathlib.Path("multi.txt").write_text("multi")
@@ -467,7 +467,7 @@ def test_multiple_mutex_groups_per_stage(pipeline_dir: pathlib.Path) -> None:
     def gpu_only() -> None:
         with open("timing.txt", "a") as f:
             f.write("gpu_start\n")
-        time.sleep(0.1)
+        time.sleep(0.02)
         with open("timing.txt", "a") as f:
             f.write("gpu_end\n")
         pathlib.Path("gpu_only.txt").write_text("gpu")
@@ -514,7 +514,7 @@ def test_no_mutex_stages_unaffected(pipeline_dir: pathlib.Path) -> None:
     def stage_a() -> None:
         with open("timing.txt", "a") as f:
             f.write("a_start\n")
-        time.sleep(0.1)
+        time.sleep(0.02)
         with open("timing.txt", "a") as f:
             f.write("a_end\n")
         pathlib.Path("a.txt").write_text("a")
@@ -523,7 +523,7 @@ def test_no_mutex_stages_unaffected(pipeline_dir: pathlib.Path) -> None:
     def stage_b() -> None:
         with open("timing.txt", "a") as f:
             f.write("b_start\n")
-        time.sleep(0.1)
+        time.sleep(0.02)
         with open("timing.txt", "a") as f:
             f.write("b_end\n")
         pathlib.Path("b.txt").write_text("b")
@@ -682,10 +682,10 @@ def test_stage_timeout_marks_stage_as_failed(pipeline_dir: pathlib.Path) -> None
 
     @pivot.stage(deps=["input.txt"], outs=["output.txt"])
     def slow_stage() -> None:
-        time.sleep(5)  # Sleep longer than timeout
+        time.sleep(0.2)  # Sleep longer than timeout
         pathlib.Path("output.txt").write_text("done")
 
-    results = executor.run(stage_timeout=0.5, show_output=False)
+    results = executor.run(stage_timeout=0.1, show_output=False)
 
     assert results["slow_stage"]["status"] == "failed"
     assert "timed out" in results["slow_stage"]["reason"]
@@ -790,7 +790,7 @@ def test_parallel_false_runs_sequentially(pipeline_dir: pathlib.Path) -> None:
     def stage_a() -> None:
         with open("timing.txt", "a") as f:
             f.write("a_start\n")
-        time.sleep(0.05)
+        time.sleep(0.02)
         with open("timing.txt", "a") as f:
             f.write("a_end\n")
         pathlib.Path("a.txt").write_text("a")
@@ -799,7 +799,7 @@ def test_parallel_false_runs_sequentially(pipeline_dir: pathlib.Path) -> None:
     def stage_b() -> None:
         with open("timing.txt", "a") as f:
             f.write("b_start\n")
-        time.sleep(0.05)
+        time.sleep(0.02)
         with open("timing.txt", "a") as f:
             f.write("b_end\n")
         pathlib.Path("b.txt").write_text("b")
@@ -894,7 +894,7 @@ def test_mutex_names_are_case_insensitive(pipeline_dir: pathlib.Path) -> None:
     def upper_mutex() -> None:
         with open("timing.txt", "a") as f:
             f.write("upper_start\n")
-        time.sleep(0.1)
+        time.sleep(0.02)
         with open("timing.txt", "a") as f:
             f.write("upper_end\n")
         pathlib.Path("upper.txt").write_text("done")
@@ -903,7 +903,7 @@ def test_mutex_names_are_case_insensitive(pipeline_dir: pathlib.Path) -> None:
     def lower_mutex() -> None:
         with open("timing.txt", "a") as f:
             f.write("lower_start\n")
-        time.sleep(0.1)
+        time.sleep(0.02)
         with open("timing.txt", "a") as f:
             f.write("lower_end\n")
         pathlib.Path("lower.txt").write_text("done")
@@ -930,7 +930,7 @@ def test_mutex_names_whitespace_stripped(pipeline_dir: pathlib.Path) -> None:
     def spaced_mutex() -> None:
         with open("timing.txt", "a") as f:
             f.write("spaced_start\n")
-        time.sleep(0.1)
+        time.sleep(0.02)
         with open("timing.txt", "a") as f:
             f.write("spaced_end\n")
         pathlib.Path("spaced.txt").write_text("done")
@@ -939,7 +939,7 @@ def test_mutex_names_whitespace_stripped(pipeline_dir: pathlib.Path) -> None:
     def clean_mutex() -> None:
         with open("timing.txt", "a") as f:
             f.write("clean_start\n")
-        time.sleep(0.1)
+        time.sleep(0.02)
         with open("timing.txt", "a") as f:
             f.write("clean_end\n")
         pathlib.Path("clean.txt").write_text("done")
@@ -966,7 +966,7 @@ def test_exclusive_mutex_runs_alone(pipeline_dir: pathlib.Path) -> None:
     def exclusive_stage() -> None:
         with open("timing.txt", "a") as f:
             f.write("exclusive_start\n")
-        time.sleep(0.15)
+        time.sleep(0.03)
         with open("timing.txt", "a") as f:
             f.write("exclusive_end\n")
         pathlib.Path("exclusive.txt").write_text("done")
@@ -975,7 +975,7 @@ def test_exclusive_mutex_runs_alone(pipeline_dir: pathlib.Path) -> None:
     def normal_a() -> None:
         with open("timing.txt", "a") as f:
             f.write("a_start\n")
-        time.sleep(0.1)
+        time.sleep(0.02)
         with open("timing.txt", "a") as f:
             f.write("a_end\n")
         pathlib.Path("normal_a.txt").write_text("done")
@@ -984,7 +984,7 @@ def test_exclusive_mutex_runs_alone(pipeline_dir: pathlib.Path) -> None:
     def normal_b() -> None:
         with open("timing.txt", "a") as f:
             f.write("b_start\n")
-        time.sleep(0.1)
+        time.sleep(0.02)
         with open("timing.txt", "a") as f:
             f.write("b_end\n")
         pathlib.Path("normal_b.txt").write_text("done")
