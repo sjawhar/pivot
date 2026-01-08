@@ -48,6 +48,7 @@ def test_execute_stage_worker_with_missing_deps(worker_env: pathlib.Path) -> Non
         "params": None,
         "variant": None,
         "overrides": {},
+        "cwd": None,
     }
 
     result = executor.execute_stage_worker(
@@ -82,6 +83,7 @@ def test_execute_stage_worker_with_directory_dep(
         "params": None,
         "variant": None,
         "overrides": {},
+        "cwd": None,
     }
 
     result = executor.execute_stage_worker(
@@ -113,6 +115,7 @@ def test_execute_stage_worker_runs_unchanged_stage(
         "params": None,
         "variant": None,
         "overrides": {},
+        "cwd": None,
     }
 
     # First run - creates lock file
@@ -156,6 +159,7 @@ def test_execute_stage_worker_reruns_when_fingerprint_changes(
         "params": None,
         "variant": None,
         "overrides": {},
+        "cwd": None,
     }
 
     # First run
@@ -202,6 +206,7 @@ def test_execute_stage_worker_handles_stage_exception(
         "params": None,
         "variant": None,
         "overrides": {},
+        "cwd": None,
     }
 
     result = executor.execute_stage_worker(
@@ -233,6 +238,7 @@ def test_execute_stage_worker_handles_sys_exit(
         "params": None,
         "variant": None,
         "overrides": {},
+        "cwd": None,
     }
 
     result = executor.execute_stage_worker(
@@ -265,6 +271,7 @@ def test_execute_stage_worker_handles_keyboard_interrupt(
         "params": None,
         "variant": None,
         "overrides": {},
+        "cwd": None,
     }
 
     result = executor.execute_stage_worker(

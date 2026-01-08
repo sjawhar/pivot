@@ -3,20 +3,20 @@ name = "pivot"
 version = "0.1.0-dev"
 description = "High-performance Python pipeline tool with automatic code change detection"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.13,<3.14"
 license = { text = "TBD" }
 authors = [{ name = "Internal Team" }]
 dependencies = [
-    "click>=8.0",
-    "deepmerge>=2.0",
-    "lmdb>=1.4.0",
-    "loky>=3.4",
-    "networkx>=3.0",
-    "pydantic>=2.0",
-    "pygtrie>=2.5.0",
-    "pyyaml>=6.0",
-    "watchfiles>=1.0",
-    "xxhash>=3.0",
+  "click>=8.0",
+  "deepmerge>=2.0",
+  "lmdb>=1.4.0",
+  "loky>=3.4",
+  "networkx>=3.0",
+  "pydantic>=2.0",
+  "pygtrie>=2.5.0",
+  "pyyaml>=6.0",
+  "watchfiles>=1.0",
+  "xxhash>=3.0",
 ]
 
 [project.optional-dependencies]
@@ -31,14 +31,14 @@ build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
-    "basedpyright>=1.0",
-    "pivot[dvc]",
-    "pytest-cov>=4.0",
-    "pytest-mock>=3.15.1",
-    "pytest-watcher>=0.6.2",
-    "pytest-xdist>=3.8.0",
-    "pytest>=7.0",
-    "ruff>=0.8.0",
+  "basedpyright>=1.0",
+  "pivot[dvc]",
+  "pytest-cov>=4.0",
+  "pytest-mock>=3.15.1",
+  "pytest-watcher>=0.6.2",
+  "pytest-xdist>=3.8.0",
+  "pytest>=7.0",
+  "ruff>=0.8.0",
 ]
 
 
@@ -46,12 +46,12 @@ dev = [
 pythonVersion = "3.13"
 stubPath = "typings"
 exclude = [
-    "**/.pytest_cache/**",
-    "**/.ruff_cache/**",
-    "**/.venv/**",
-    "benchmarks",
-    "experiments",
-    "pipelines",
+  "**/.pytest_cache/**",
+  "**/.ruff_cache/**",
+  "**/.venv/**",
+  "benchmarks",
+  "experiments",
+  "pipelines",
 ]
 reportAny = false
 reportExplicitAny = false
@@ -84,30 +84,30 @@ skip_covered = false
 fail_under = 90
 
 exclude_lines = [
-    "pragma: no cover",
-    "def __repr__",
-    "raise AssertionError",
-    "raise NotImplementedError",
-    "if __name__ == .__main__.:",
-    "if TYPE_CHECKING:",
-    "class .*\\bProtocol\\):",
-    "@(abc\\.)?abstractmethod",
+  "pragma: no cover",
+  "def __repr__",
+  "raise AssertionError",
+  "raise NotImplementedError",
+  "if __name__ == .__main__.:",
+  "if TYPE_CHECKING:",
+  "class .*\\bProtocol\\):",
+  "@(abc\\.)?abstractmethod",
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = [
-    "-v",
-    "--strict-markers",
-    "--tb=short",
-    "--cov=src/pivot",
-    "--cov-report=term-missing",
-    "--cov-report=html",
+  "-v",
+  "--strict-markers",
+  "--tb=short",
+  "--cov=src/pivot",
+  "--cov-report=term-missing",
+  "--cov-report=html",
 ]
 markers = [
-    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
-    "integration: marks tests as integration tests",
-    "benchmark: marks tests as benchmarks",
+  "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+  "integration: marks tests as integration tests",
+  "benchmark: marks tests as benchmarks",
 ]
 
 [tool.ruff]
@@ -118,30 +118,31 @@ exclude = ["benchmarks", "experiments"]
 
 [tool.ruff.lint]
 select = [
-    "B",   # flake8-bugbear
-    "C4",  # flake8-comprehensions
-    "E",   # pycodestyle errors
-    "F",   # pyflakes
-    "I",   # isort
-    "N",   # pep8-naming
-    "SIM", # flake8-simplify
-    "TCH", # type-checking imports
-    "UP",  # pyupgrade
-    "W",   # pycodestyle warnings
+  "B",   # flake8-bugbear
+  "C4",  # flake8-comprehensions
+  "E",   # pycodestyle errors
+  "F",   # pyflakes
+  "I",   # isort
+  "N",   # pep8-naming
+  "SIM", # flake8-simplify
+  "TCH", # type-checking imports
+  "UP",  # pyupgrade
+  "W",   # pycodestyle warnings
 ]
 ignore = [
-    "E501", # line too long (handled by formatter)
-    "N801", # class name `stage` is intentionally lowercase (decorator pattern)
+  "E501",   # line too long (handled by formatter)
+  "N801",   # class name `stage` is intentionally lowercase (decorator pattern)
+  "SIM401", # CLAUDE.md requires `if "key" in dict:` pattern for TypedDicts with optional fields
 ]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*.py" = [
-    "C401",   # generator vs comprehension (readability)
-    "F811",   # redef allowed in tests (fixtures)
-    "N806",   # variable naming (CONSTANT test fixtures)
-    "S101",   # assert allowed in tests
-    "SIM103", # simplification suggestions (readability)
-    "SIM118", # dict.keys() usage (readability)
+  "C401",   # generator vs comprehension (readability)
+  "F811",   # redef allowed in tests (fixtures)
+  "N806",   # variable naming (CONSTANT test fixtures)
+  "S101",   # assert allowed in tests
+  "SIM103", # simplification suggestions (readability)
+  "SIM118", # dict.keys() usage (readability)
 ]
 
 [tool.ruff.format]

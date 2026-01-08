@@ -211,6 +211,7 @@ def test_registry_get_stage():
         variant=None,
         signature=None,
         fingerprint={},
+        cwd=None,
     )
     stage_info = registry.get("test")
     assert stage_info["name"] == "test"
@@ -238,6 +239,7 @@ def test_registry_list_stages():
         variant=None,
         signature=None,
         fingerprint={},
+        cwd=None,
     )
     registry._stages["stage2"] = RegistryStageInfo(
         name="stage2",
@@ -250,6 +252,7 @@ def test_registry_list_stages():
         variant=None,
         signature=None,
         fingerprint={},
+        cwd=None,
     )
     stages = registry.list_stages()
     assert set(stages) == {"stage1", "stage2"}
@@ -277,6 +280,7 @@ def test_registry_clear():
         variant=None,
         signature=None,
         fingerprint={},
+        cwd=None,
     )
     registry.clear()
     assert registry.list_stages() == []
@@ -378,12 +382,12 @@ def test_stage_captures_constants():
     assert "const:LEARNING_RATE" in fp
 
 
-def test_registry_build_dag_integration(tmp_path: Path) -> None:
+def test_registry_build_dag_integration(set_project_root: Path) -> None:
     """Test registry build_dag integration."""
     reg = registry.StageRegistry()
 
     # Create test files
-    (tmp_path / "a.csv").touch()
+    (set_project_root / "a.csv").touch()
 
     def stage_a() -> None:
         pass
@@ -392,12 +396,14 @@ def test_registry_build_dag_integration(tmp_path: Path) -> None:
         pass
 
     # Register stages
-    reg.register(stage_a, name="stage_a", deps=[], outs=[str(tmp_path / "a.csv")], params=None)
+    reg.register(
+        stage_a, name="stage_a", deps=[], outs=[str(set_project_root / "a.csv")], params=None
+    )
     reg.register(
         stage_b,
         name="stage_b",
-        deps=[str(tmp_path / "a.csv")],
-        outs=[str(tmp_path / "b.csv")],
+        deps=[str(set_project_root / "a.csv")],
+        outs=[str(set_project_root / "b.csv")],
         params=None,
     )
 

@@ -6,30 +6,42 @@ from unittest import mock
 import pytest
 
 from pivot import lock, project
+from pivot.types import LockData
 
 if TYPE_CHECKING:
-    from pivot.types import HashInfo, LockData
+    from pivot.types import HashInfo
 
 
 def test_lock_file_creation(tmp_path: Path) -> None:
     """Lock file is created on first write."""
     stage_lock = lock.StageLock("preprocess", tmp_path)
 
-    stage_lock.write({"code_manifest": {"self:preprocess": "abc123"}})
+    stage_lock.write(
+        LockData(
+            code_manifest={"self:preprocess": "abc123"},
+            params={},
+            dep_hashes={},
+            output_hashes={},
+        )
+    )
 
     assert stage_lock.path.exists()
     assert stage_lock.path.name == "preprocess.lock"
 
 
-def test_lock_file_read(tmp_path: Path) -> None:
+def test_lock_file_read(set_project_root: Path) -> None:
     """Lock file contents can be read back."""
-    stage_lock = lock.StageLock("train", tmp_path)
-    dep_hashes: dict[str, HashInfo] = {"data.csv": {"hash": "xyz123"}}
-    data: LockData = {
-        "code_manifest": {"self:train": "def456", "func:helper": "ghi789"},
-        "params": {"learning_rate": 0.01},
-        "dep_hashes": dep_hashes,
-    }
+    cache_dir = set_project_root / ".cache"
+    stage_lock = lock.StageLock("train", cache_dir)
+    # Use absolute path for dep_hashes (internal format uses absolute paths)
+    abs_data_path = str(set_project_root / "data.csv")
+    dep_hashes: dict[str, HashInfo] = {abs_data_path: {"hash": "xyz123"}}
+    data = LockData(
+        code_manifest={"self:train": "def456", "func:helper": "ghi789"},
+        params={"learning_rate": 0.01},
+        dep_hashes=dep_hashes,
+        output_hashes={},
+    )
 
     stage_lock.write(data)
     result = stage_lock.read()
@@ -57,12 +69,17 @@ def test_manifest_preservation(tmp_path: Path) -> None:
         "const:THRESHOLD": "hash5",
     }
 
-    data: LockData = {"code_manifest": manifest}
+    data = LockData(
+        code_manifest=manifest,
+        params={},
+        dep_hashes={},
+        output_hashes={},
+    )
     stage_lock.write(data)
     result = stage_lock.read()
 
     assert result is not None
-    assert result.get("code_manifest") == manifest
+    assert result["code_manifest"] == manifest
 
 
 def test_parallel_lock_writes(tmp_path: Path) -> None:
@@ -73,7 +90,14 @@ def test_parallel_lock_writes(tmp_path: Path) -> None:
     def write_lock(name: str) -> None:
         try:
             stage_lock = lock.StageLock(name, tmp_path)
-            stage_lock.write({"code_manifest": {f"self:{name}": f"hash_{name}"}})
+            stage_lock.write(
+                LockData(
+                    code_manifest={f"self:{name}": f"hash_{name}"},
+                    params={},
+                    dep_hashes={},
+                    output_hashes={},
+                )
+            )
         except Exception as e:
             errors.append(e)
 
@@ -88,7 +112,12 @@ def test_parallel_lock_writes(tmp_path: Path) -> None:
     for name in stages:
         stage_lock = lock.StageLock(name, tmp_path)
         result = stage_lock.read()
-        assert result == {"code_manifest": {f"self:{name}": f"hash_{name}"}}
+        assert result == LockData(
+            code_manifest={f"self:{name}": f"hash_{name}"},
+            params={},
+            dep_hashes={},
+            output_hashes={},
+        )
 
 
 def test_stage_changed_no_previous_run(tmp_path: Path) -> None:
@@ -115,11 +144,12 @@ def test_stage_unchanged_when_identical(tmp_path: Path) -> None:
     dep_hashes: dict[str, HashInfo] = {normalized_key: {"hash": "xyz"}}
 
     stage_lock.write(
-        {
-            "code_manifest": fingerprint,
-            "params": params,
-            "dep_hashes": dep_hashes,
-        }
+        LockData(
+            code_manifest=fingerprint,
+            params=params,
+            dep_hashes=dep_hashes,
+            output_hashes={},
+        )
     )
 
     changed, reason = stage_lock.is_changed(fingerprint, params, dep_hashes)
@@ -132,11 +162,12 @@ def test_stage_changed_code_modified(tmp_path: Path) -> None:
     """Stage is marked changed when code fingerprint differs."""
     stage_lock = lock.StageLock("modified", tmp_path)
     stage_lock.write(
-        {
-            "code_manifest": {"self:modified": "old_hash"},
-            "params": {},
-            "dep_hashes": {},
-        }
+        LockData(
+            code_manifest={"self:modified": "old_hash"},
+            params={},
+            dep_hashes={},
+            output_hashes={},
+        )
     )
 
     changed, reason = stage_lock.is_changed(
@@ -153,11 +184,12 @@ def test_stage_changed_new_dependency(tmp_path: Path) -> None:
     """Stage is marked changed when new code dependency added."""
     stage_lock = lock.StageLock("extended", tmp_path)
     stage_lock.write(
-        {
-            "code_manifest": {"self:extended": "hash1"},
-            "params": {},
-            "dep_hashes": {},
-        }
+        LockData(
+            code_manifest={"self:extended": "hash1"},
+            params={},
+            dep_hashes={},
+            output_hashes={},
+        )
     )
 
     changed, reason = stage_lock.is_changed(
@@ -174,11 +206,12 @@ def test_stage_changed_params_modified(tmp_path: Path) -> None:
     """Stage is marked changed when params differ."""
     stage_lock = lock.StageLock("tuned", tmp_path)
     stage_lock.write(
-        {
-            "code_manifest": {"self:tuned": "hash"},
-            "params": {"learning_rate": 0.01},
-            "dep_hashes": {},
-        }
+        LockData(
+            code_manifest={"self:tuned": "hash"},
+            params={"learning_rate": 0.01},
+            dep_hashes={},
+            output_hashes={},
+        )
     )
 
     changed, reason = stage_lock.is_changed(
@@ -196,11 +229,12 @@ def test_stage_changed_dep_hash_modified(tmp_path: Path) -> None:
     stage_lock = lock.StageLock("consumer", tmp_path)
     old_dep_hashes: dict[str, HashInfo] = {"input.csv": {"hash": "old_hash"}}
     stage_lock.write(
-        {
-            "code_manifest": {"self:consumer": "hash"},
-            "params": {},
-            "dep_hashes": old_dep_hashes,
-        }
+        LockData(
+            code_manifest={"self:consumer": "hash"},
+            params={},
+            dep_hashes=old_dep_hashes,
+            output_hashes={},
+        )
     )
 
     new_dep_hashes: dict[str, HashInfo] = {"input.csv": {"hash": "new_hash"}}
@@ -223,6 +257,7 @@ def test_stage_changed_dep_added(tmp_path: Path) -> None:
             "code_manifest": {"self:consumer": "hash"},
             "params": {},
             "dep_hashes": old_dep_hashes,
+            "output_hashes": {},
         }
     )
 
@@ -251,6 +286,7 @@ def test_stage_changed_dep_removed(tmp_path: Path) -> None:
             "code_manifest": {"self:consumer": "hash"},
             "params": {},
             "dep_hashes": old_dep_hashes,
+            "output_hashes": {},
         }
     )
 
@@ -268,7 +304,14 @@ def test_atomic_write_no_partial_file(tmp_path: Path) -> None:
     """Write failure should not leave partial lock file."""
     stage_lock = lock.StageLock("atomic_test", tmp_path)
 
-    stage_lock.write({"code_manifest": {"self:atomic_test": "hash"}})
+    stage_lock.write(
+        {
+            "code_manifest": {"self:atomic_test": "hash"},
+            "params": {},
+            "dep_hashes": {},
+            "output_hashes": {},
+        }
+    )
 
     # Verify no .tmp file remains
     tmp_files = list(tmp_path.rglob("*.tmp"))
@@ -280,7 +323,14 @@ def test_lock_directory_created(tmp_path: Path) -> None:
     nested_cache = tmp_path / "deep" / "nested" / "cache"
     stage_lock = lock.StageLock("nested_stage", nested_cache)
 
-    stage_lock.write({"code_manifest": {}})
+    stage_lock.write(
+        {
+            "code_manifest": {},
+            "params": {},
+            "dep_hashes": {},
+            "output_hashes": {},
+        }
+    )
 
     assert stage_lock.path.exists()
     assert stage_lock.path.parent == nested_cache / "stages"
@@ -331,7 +381,14 @@ def test_write_failure_no_orphaned_tmp(tmp_path: Path) -> None:
         mock.patch("yaml.dump", side_effect=RuntimeError("dump failed")),
         pytest.raises(RuntimeError, match="dump failed"),
     ):
-        stage_lock.write({"code_manifest": {}})
+        stage_lock.write(
+            {
+                "code_manifest": {},
+                "params": {},
+                "dep_hashes": {},
+                "output_hashes": {},
+            }
+        )
 
     tmp_files = list(tmp_path.rglob("*.tmp"))
     assert len(tmp_files) == 0, f"Orphaned temp files: {tmp_files}"
@@ -345,8 +402,14 @@ def test_concurrent_same_stage_writes(tmp_path: Path) -> None:
     def write_value(value: int) -> None:
         try:
             stage_lock = lock.StageLock("shared", tmp_path)
-            # Use valid LockData with params key to track which thread won
-            stage_lock.write({"params": {"thread_id": value}})
+            stage_lock.write(
+                {
+                    "code_manifest": {},
+                    "params": {"thread_id": value},
+                    "dep_hashes": {},
+                    "output_hashes": {},
+                }
+            )
             results.append(value)
         except Exception as e:
             errors.append(e)
@@ -425,11 +488,11 @@ def test_read_empty_file_returns_none(tmp_path: Path) -> None:
     assert result is None
 
 
-def test_is_changed_handles_explicit_null_values(tmp_path: Path) -> None:
-    """Lock file with explicit null values treated as empty dict."""
+def test_is_changed_with_null_values_triggers_rerun(tmp_path: Path) -> None:
+    """Lock file with null values triggers re-run (corrupted data)."""
     stage_lock = lock.StageLock("nulls", tmp_path)
     stage_lock.path.parent.mkdir(parents=True, exist_ok=True)
-    stage_lock.path.write_text("code_manifest: null\nparams: null\ndep_hashes: null\n")
+    stage_lock.path.write_text("code_manifest: null\nparams: null\ndeps: null\nouts: null\n")
 
     changed, reason = stage_lock.is_changed(
         current_fingerprint={},
@@ -437,4 +500,5 @@ def test_is_changed_handles_explicit_null_values(tmp_path: Path) -> None:
         dep_hashes={},
     )
 
-    assert changed is False, f"Should not be changed but got: {reason}"
+    # Null values are not valid - triggers re-run
+    assert changed is True

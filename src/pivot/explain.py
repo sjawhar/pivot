@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any, TypeVar
 
 import pydantic
 
-from pivot import lock, parameters, project
+from pivot import lock, parameters
 from pivot.executor import worker
 from pivot.types import (
     ChangeType,
@@ -152,14 +152,10 @@ def get_stage_explanation(
     old_params = lock_data["params"] if "params" in lock_data else {}  # noqa: SIM401
     old_dep_hashes = lock_data["dep_hashes"] if "dep_hashes" in lock_data else {}  # noqa: SIM401
 
-    # Normalize cached paths for comparison (backward compat with old lock files)
-    old_dep_hashes_normalized = {
-        str(project.normalize_path(p)): h for p, h in old_dep_hashes.items()
-    }
-
+    # lock.StageLock.read() already converts paths to absolute
     code_changes = diff_code_manifests(old_manifest, fingerprint)
     param_changes = diff_params(old_params, current_params)
-    dep_changes = diff_dep_hashes(old_dep_hashes_normalized, dep_hashes)
+    dep_changes = diff_dep_hashes(old_dep_hashes, dep_hashes)
 
     will_run = bool(code_changes or param_changes or dep_changes)
     reason = (

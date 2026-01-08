@@ -75,18 +75,21 @@ if __name__ == '__main__':
 TypedDicts with `total=False` or `NotRequired` fields may have optional fields, in which case you should
 use `if "key" in dict: ...` to check for the key and then use `dict["key"]` to access the value.
 
-**Use constructor syntax when returning TypedDicts**—not dict literals. This provides better type checking and makes the code self-documenting:
+**Always use constructor syntax when creating TypedDicts**—not dict literals. This provides type validation at the call site and makes the code self-documenting. Applies everywhere: return statements, assignments, function arguments, and tests.
 
 ```python
 class ChangeCheckResult(TypedDict):
     changed: bool
     reason: str
 
-# Good - constructor syntax
+# Good - constructor syntax (type-checked)
 return ChangeCheckResult(changed=True, reason="code changed")
+result = ChangeCheckResult(changed=False, reason="")
+some_function(ChangeCheckResult(changed=True, reason="test"))
 
-# Bad - dict literal (no type validation)
+# Bad - dict literal (no type validation, missing fields not caught)
 return {"changed": True, "reason": "code changed"}
+result = {"changed": False}  # Missing 'reason' not caught!
 ```
 
 ## Import Style (Google Python Style Guide)
@@ -287,11 +290,11 @@ print(f"Stage {name} completed")
 ## Development Commands
 
 ```bash
-uv sync --active    # Install dependencies
-pytest tests/       # Run tests
-ruff format .       # Format
-ruff check .        # Lint
-basedpyright .      # Type check
+uv sync --active       # Install dependencies
+pytest tests/ -n auto  # Run tests (parallel)
+ruff format .          # Format
+ruff check .           # Lint
+basedpyright .         # Type check
 ```
 
 ## Pull Requests
@@ -303,7 +306,7 @@ basedpyright .      # Type check
 
 ## Before Returning to User (Critical)
 
-- Must run all four: `ruff format .`, `ruff check .`, `basedpyright .`, `pytest tests/`
+- Must run all four: `ruff format .`, `ruff check .`, `basedpyright .`, `pytest tests/ -n auto`
 - Never say "done" without running these first.
 
 ## After Completing a Feature

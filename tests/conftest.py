@@ -50,3 +50,10 @@ def reset_pivot_state(mocker: MockerFixture) -> Generator[None]:
     for name in _PIVOT_LOGGERS:
         logging.getLogger(name).handlers.clear()
     yield
+
+
+@pytest.fixture
+def set_project_root(tmp_path: pathlib.Path, mocker: MockerFixture) -> Generator[pathlib.Path]:
+    """Set project root to tmp_path for tests that register stages with temp paths."""
+    mocker.patch.object(project, "_project_root_cache", tmp_path)
+    yield tmp_path
