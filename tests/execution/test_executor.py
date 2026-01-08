@@ -957,6 +957,56 @@ def test_mutex_names_whitespace_stripped(pipeline_dir: pathlib.Path) -> None:
     ], f"Mutex whitespace not stripped - stages ran concurrently: {timing}"
 
 
+def test_exclusive_mutex_runs_alone(pipeline_dir: pathlib.Path) -> None:
+    """Stage with mutex=['*'] runs exclusively - no other stages run concurrently."""
+    (pipeline_dir / "input.txt").write_text("data")
+    timing_file = pipeline_dir / "timing.txt"
+
+    @pivot.stage(deps=["input.txt"], outs=["exclusive.txt"], mutex=["*"])
+    def exclusive_stage() -> None:
+        with open("timing.txt", "a") as f:
+            f.write("exclusive_start\n")
+        time.sleep(0.15)
+        with open("timing.txt", "a") as f:
+            f.write("exclusive_end\n")
+        pathlib.Path("exclusive.txt").write_text("done")
+
+    @pivot.stage(deps=["input.txt"], outs=["normal_a.txt"])
+    def normal_a() -> None:
+        with open("timing.txt", "a") as f:
+            f.write("a_start\n")
+        time.sleep(0.1)
+        with open("timing.txt", "a") as f:
+            f.write("a_end\n")
+        pathlib.Path("normal_a.txt").write_text("done")
+
+    @pivot.stage(deps=["input.txt"], outs=["normal_b.txt"])
+    def normal_b() -> None:
+        with open("timing.txt", "a") as f:
+            f.write("b_start\n")
+        time.sleep(0.1)
+        with open("timing.txt", "a") as f:
+            f.write("b_end\n")
+        pathlib.Path("normal_b.txt").write_text("done")
+
+    results = executor.run(max_workers=4, show_output=False)
+
+    assert results["exclusive_stage"]["status"] == "ran"
+    assert results["normal_a"]["status"] == "ran"
+    assert results["normal_b"]["status"] == "ran"
+
+    # The exclusive stage must not overlap with any other stage
+    timing = timing_file.read_text().strip().split("\n")
+
+    # Find where exclusive runs in the sequence
+    excl_start = timing.index("exclusive_start")
+    excl_end = timing.index("exclusive_end")
+
+    # Nothing else should be between exclusive_start and exclusive_end
+    between = timing[excl_start + 1 : excl_end]
+    assert between == [], f"Other stages ran during exclusive: {between}"
+
+
 # =============================================================================
 # Output Cache Tests
 # =============================================================================
