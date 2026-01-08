@@ -7,7 +7,7 @@ import pydantic
 import pytest
 
 from pivot import explain, lock
-from pivot.types import CodeChange, DepChange, ParamChange, StageExplanation
+from pivot.types import CodeChange, DepChange, LockData, ParamChange, StageExplanation
 
 if TYPE_CHECKING:
     from pivot.types import HashInfo
@@ -278,11 +278,12 @@ def test_get_stage_explanation_unchanged(tmp_path: Path) -> None:
     """Returns will_run=False when stage unchanged."""
     stage_lock = lock.StageLock("unchanged_stage", tmp_path)
     stage_lock.write(
-        {
-            "code_manifest": {"self:unchanged_stage": "abc123"},
-            "params": {},
-            "dep_hashes": {},
-        }
+        LockData(
+            code_manifest={"self:unchanged_stage": "abc123"},
+            params={},
+            dep_hashes={},
+            output_hashes={},
+        )
     )
 
     result = explain.get_stage_explanation(
@@ -305,11 +306,12 @@ def test_get_stage_explanation_code_changed(tmp_path: Path) -> None:
     """Returns detailed code changes when code differs."""
     stage_lock = lock.StageLock("code_stage", tmp_path)
     stage_lock.write(
-        {
-            "code_manifest": {"self:code_stage": "old_hash", "func:helper": "helper_old"},
-            "params": {},
-            "dep_hashes": {},
-        }
+        LockData(
+            code_manifest={"self:code_stage": "old_hash", "func:helper": "helper_old"},
+            params={},
+            dep_hashes={},
+            output_hashes={},
+        )
     )
 
     result = explain.get_stage_explanation(
@@ -336,11 +338,12 @@ def test_get_stage_explanation_params_changed(tmp_path: Path) -> None:
 
     stage_lock = lock.StageLock("param_stage", tmp_path)
     stage_lock.write(
-        {
-            "code_manifest": {"self:param_stage": "abc"},
-            "params": {"learning_rate": 0.01},
-            "dep_hashes": {},
-        }
+        LockData(
+            code_manifest={"self:param_stage": "abc"},
+            params={"learning_rate": 0.01},
+            dep_hashes={},
+            output_hashes={},
+        )
     )
 
     overrides = {"param_stage": {"learning_rate": 0.001}}
@@ -371,11 +374,12 @@ def test_get_stage_explanation_deps_changed(tmp_path: Path) -> None:
 
     stage_lock = lock.StageLock("dep_stage", tmp_path)
     stage_lock.write(
-        {
-            "code_manifest": {"self:dep_stage": "abc"},
-            "params": {},
-            "dep_hashes": {normalized_path: {"hash": "old_data_hash"}},
-        }
+        LockData(
+            code_manifest={"self:dep_stage": "abc"},
+            params={},
+            dep_hashes={normalized_path: {"hash": "old_data_hash"}},
+            output_hashes={},
+        )
     )
 
     result = explain.get_stage_explanation(
@@ -407,11 +411,12 @@ def test_get_stage_explanation_multiple_changes(tmp_path: Path) -> None:
 
     stage_lock = lock.StageLock("multi_stage", tmp_path)
     stage_lock.write(
-        {
-            "code_manifest": {"self:multi_stage": "old_code"},
-            "params": {"epochs": 5},
-            "dep_hashes": {normalized_path: {"hash": "old_hash"}},
-        }
+        LockData(
+            code_manifest={"self:multi_stage": "old_code"},
+            params={"epochs": 5},
+            dep_hashes={normalized_path: {"hash": "old_hash"}},
+            output_hashes={},
+        )
     )
 
     result = explain.get_stage_explanation(
@@ -433,11 +438,12 @@ def test_get_stage_explanation_missing_deps(tmp_path: Path) -> None:
     """Returns will_run=True with reason when deps are missing."""
     stage_lock = lock.StageLock("missing_deps_stage", tmp_path)
     stage_lock.write(
-        {
-            "code_manifest": {"self:missing_deps_stage": "abc"},
-            "params": {},
-            "dep_hashes": {},
-        }
+        LockData(
+            code_manifest={"self:missing_deps_stage": "abc"},
+            params={},
+            dep_hashes={},
+            output_hashes={},
+        )
     )
 
     result = explain.get_stage_explanation(
@@ -470,11 +476,12 @@ def test_get_stage_explanation_invalid_params(
 
     stage_lock = lock.StageLock("stage", tmp_path)
     stage_lock.write(
-        {
-            "code_manifest": {"self:stage": "abc"},
-            "params": {"learning_rate": 0.01},
-            "dep_hashes": {},
-        }
+        LockData(
+            code_manifest={"self:stage": "abc"},
+            params={"learning_rate": 0.01},
+            dep_hashes={},
+            output_hashes={},
+        )
     )
 
     result = explain.get_stage_explanation(

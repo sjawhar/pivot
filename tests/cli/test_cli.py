@@ -53,10 +53,10 @@ def test_cli_list_command_exists(runner: click.testing.CliRunner) -> None:
 
 
 def test_cli_list_shows_registered_stages(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+    runner: click.testing.CliRunner, set_project_root: pathlib.Path
 ) -> None:
     """List should show registered stages."""
-    output_file = tmp_path / "out.txt"
+    output_file = set_project_root / "out.txt"
 
     @stage(deps=[], outs=[str(output_file)])
     def my_stage() -> None:
@@ -68,11 +68,11 @@ def test_cli_list_shows_registered_stages(
 
 
 def test_cli_list_verbose_shows_details(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+    runner: click.testing.CliRunner, set_project_root: pathlib.Path
 ) -> None:
     """List --verbose should show deps and outputs."""
-    input_file = tmp_path / "input.txt"
-    output_file = tmp_path / "output.txt"
+    input_file = set_project_root / "input.txt"
+    output_file = set_project_root / "output.txt"
 
     @stage(deps=[str(input_file)], outs=[str(output_file)])
     def my_stage() -> None:

@@ -85,3 +85,37 @@ def resolve_path_for_comparison(path: str, context: str) -> pathlib.Path:
         raise
     except OSError as e:
         raise OSError(f"Filesystem error for {context} '{path}': {e}") from e
+
+
+def to_relative_path(abs_path: str | pathlib.Path, base: pathlib.Path | None = None) -> str:
+    """Convert absolute path to relative from base (default: project root).
+
+    If path is already relative or outside base, returns as-is with warning for outside paths.
+    """
+    path = pathlib.Path(abs_path)
+    if not path.is_absolute():
+        return str(abs_path)
+
+    if base is None:
+        base = get_project_root()
+
+    try:
+        return str(path.relative_to(base))
+    except ValueError:
+        logger.warning(f"Path '{abs_path}' is outside base '{base}', keeping absolute")
+        return str(abs_path)
+
+
+def to_absolute_path(rel_path: str, base: pathlib.Path | None = None) -> pathlib.Path:
+    """Convert relative path to absolute from base (default: project root).
+
+    Already-absolute paths returned unchanged.
+    """
+    path = pathlib.Path(rel_path)
+    if path.is_absolute():
+        return path
+
+    if base is None:
+        base = get_project_root()
+
+    return base / path

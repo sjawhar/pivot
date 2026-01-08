@@ -372,4 +372,5 @@ def _register_imported_stage_with_name(spec: StageSpec, name: str) -> None:  # p
         name=name,
         deps=list(spec.deps),
         outs=spec.outs,
+        cwd=spec.cwd,
     )

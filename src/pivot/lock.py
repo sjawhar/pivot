@@ -20,28 +20,101 @@ from typing import TYPE_CHECKING, Any, TypeGuard, cast
 
 import yaml
 
-from pivot import cache, exceptions, yaml_config
+from pivot import cache, exceptions, project, yaml_config
+from pivot.types import DepEntry, HashInfo, LockData, OutEntry, OutputHash, StorageLockData
 
 if TYPE_CHECKING:
     import pathlib
     from collections.abc import Generator
 
-    from pivot.types import HashInfo, LockData
-
 logger = logging.getLogger(__name__)
 
 _VALID_STAGE_NAME = re.compile(r"^[a-zA-Z0-9_@.-]+$")  # Allow . for DVC matrix keys like @0.5
 _MAX_STAGE_NAME_LEN = 200  # Leave room for ".lock" suffix within filesystem NAME_MAX (255)
-_VALID_LOCK_KEYS = frozenset({"code_manifest", "params", "dep_hashes", "output_hashes"})
+_VALID_LOCK_KEYS = frozenset({"code_manifest", "params", "deps", "outs"})
 
 
-def _is_lock_data(data: object) -> TypeGuard[LockData]:
-    """Validate that parsed YAML has valid LockData structure."""
+def _is_lock_data(data: object) -> TypeGuard[StorageLockData]:
+    """Validate that parsed YAML has valid storage format structure."""
     if not isinstance(data, dict):
         return False
-    # All keys in LockData are optional, but reject unknown keys
-    # YAML dicts have string keys; cast for type checker after isinstance
-    return all(key in _VALID_LOCK_KEYS for key in cast("dict[str, object]", data))
+    typed_data = cast("dict[str, object]", data)
+    # Reject unknown keys
+    if not all(key in _VALID_LOCK_KEYS for key in typed_data):
+        return False
+    # Reject null values (corrupted data)
+    return all(typed_data[key] is not None for key in typed_data)
+
+
+def _convert_to_storage_format(data: LockData) -> StorageLockData:
+    """Convert internal LockData to storage format (list-based, relative paths, sorted)."""
+    result = StorageLockData()
+
+    if "code_manifest" in data:
+        result["code_manifest"] = data["code_manifest"]
+    if "params" in data:
+        result["params"] = data["params"]
+
+    proj_root = project.get_project_root()
+
+    if "dep_hashes" in data:
+        deps_list = list[DepEntry]()
+        for abs_path, hash_info in data["dep_hashes"].items():
+            rel_path = project.to_relative_path(abs_path, proj_root)
+            entry = DepEntry(path=rel_path, hash=hash_info["hash"])
+            if "manifest" in hash_info:
+                entry["manifest"] = hash_info["manifest"]
+            deps_list.append(entry)
+        deps_list.sort(key=lambda e: e["path"])
+        result["deps"] = deps_list
+
+    if "output_hashes" in data:
+        outs_list = list[OutEntry]()
+        for abs_path, hash_info in data["output_hashes"].items():
+            rel_path = project.to_relative_path(abs_path, proj_root)
+            if hash_info is None:
+                entry = OutEntry(path=rel_path, hash=None)
+            else:
+                entry = OutEntry(path=rel_path, hash=hash_info["hash"])
+                if "manifest" in hash_info:
+                    entry["manifest"] = hash_info["manifest"]
+            outs_list.append(entry)
+        outs_list.sort(key=lambda e: e["path"])
+        result["outs"] = outs_list
+
+    return result
+
+
+def _convert_from_storage_format(data: StorageLockData) -> LockData:
+    """Convert storage format (list-based, relative paths) to internal LockData."""
+    proj_root = project.get_project_root()
+
+    dep_hashes = dict[str, HashInfo]()
+    if "deps" in data:
+        for entry in data["deps"]:
+            abs_path = str(project.to_absolute_path(entry["path"], proj_root))
+            if "manifest" in entry:
+                dep_hashes[abs_path] = {"hash": entry["hash"], "manifest": entry["manifest"]}
+            else:
+                dep_hashes[abs_path] = {"hash": entry["hash"]}
+
+    output_hashes = dict[str, OutputHash]()
+    if "outs" in data:
+        for entry in data["outs"]:
+            abs_path = str(project.to_absolute_path(entry["path"], proj_root))
+            if entry["hash"] is None:
+                output_hashes[abs_path] = None
+            elif "manifest" in entry:
+                output_hashes[abs_path] = {"hash": entry["hash"], "manifest": entry["manifest"]}
+            else:
+                output_hashes[abs_path] = {"hash": entry["hash"]}
+
+    return LockData(
+        code_manifest=data["code_manifest"] if "code_manifest" in data else {},
+        params=data["params"] if "params" in data else {},
+        dep_hashes=dep_hashes,
+        output_hashes=output_hashes,
+    )
 
 
 class StageLock:
@@ -59,22 +132,23 @@ class StageLock:
         self.path = cache_dir / "stages" / f"{stage_name}.lock"
 
     def read(self) -> LockData | None:
-        """Read lock file, return None if missing or corrupted."""
+        """Read lock file, converting storage format to internal format."""
         try:
             with open(self.path) as f:
                 data: object = yaml.load(f, Loader=yaml_config.Loader)
             if not _is_lock_data(data):
                 return None  # Treat corrupted/invalid file as missing
-            return data
+            return _convert_from_storage_format(data)
         except (FileNotFoundError, UnicodeDecodeError, yaml.YAMLError):
             return None
 
     def write(self, data: LockData) -> None:
-        """Write lock file atomically."""
+        """Write lock file atomically, converting to storage format."""
+        storage_data = _convert_to_storage_format(data)
 
         def write_yaml(fd: int) -> None:
             with os.fdopen(fd, "w") as f:
-                yaml.dump(data, f, Dumper=yaml_config.Dumper, sort_keys=False)
+                yaml.dump(storage_data, f, Dumper=yaml_config.Dumper, sort_keys=False)
 
         cache.atomic_write_file(self.path, write_yaml)
 
@@ -86,26 +160,14 @@ class StageLock:
     ) -> tuple[bool, str]:
         """Check if stage needs re-run."""
         lock_data = self.read()
-        if not lock_data:
+        if lock_data is None:
             return True, "No previous run"
 
-        # Check code_manifest and params directly
-        if (lock_data.get("code_manifest") or {}) != current_fingerprint:
+        if lock_data["code_manifest"] != current_fingerprint:
             return True, "Code changed"
-        if (lock_data.get("params") or {}) != current_params:
+        if lock_data["params"] != current_params:
             return True, "Params changed"
-
-        # Check dep_hashes with path normalization for cached paths
-        # (backward compat: old lock files may have resolved paths)
-        from pivot import project
-
-        cached_dep_hashes = lock_data.get("dep_hashes") or {}
-        # Normalize cached paths (current dep_hashes already have normalized keys)
-        cached_normalized = {
-            str(project.normalize_path(p)): h for p, h in cached_dep_hashes.items()
-        }
-
-        if cached_normalized != dep_hashes:
+        if lock_data["dep_hashes"] != dep_hashes:
             return True, "Input dependencies changed"
 
         return False, ""

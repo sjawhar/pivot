@@ -88,4 +88,4 @@ jobs:
           echo "$(pwd)/.venv/bin" >> $GITHUB_PATH
 
       - name: Run tests
-        run: pytest
+        run: pytest -n auto

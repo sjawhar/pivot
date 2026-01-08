@@ -37,6 +37,7 @@ class RegistryStageInfo(TypedDict):
     variant: str | None
     signature: Signature | None
     fingerprint: dict[str, str]
+    cwd: pathlib.Path | None
 
 
 class ValidationMode(enum.StrEnum):
@@ -61,6 +62,7 @@ class Variant(pydantic.BaseModel, frozen=True):
         outs: Output files produced by variant
         params: Optional Pydantic model instance for parameters
         mutex: Mutex groups this variant belongs to
+        cwd: Working directory for path resolution and stage execution
     """
 
     name: str
@@ -68,6 +70,7 @@ class Variant(pydantic.BaseModel, frozen=True):
     outs: Sequence[outputs.OutSpec] = ()
     params: pydantic.BaseModel | None = None
     mutex: Sequence[str] = ()
+    cwd: str | pathlib.Path | None = None
 
     @pydantic.field_validator("name")
     @classmethod
@@ -91,10 +94,11 @@ class stage:
     """Decorator for marking functions as pipeline stages.
 
     Args:
-        deps: Input dependencies (file paths)
+        deps: Input dependencies (file paths, relative to cwd or project root)
         outs: Output files produced by stage (str, Out, Metric, or Plot)
         params: Optional Pydantic model class or instance for parameters
         mutex: Mutex groups this stage belongs to (prevents concurrent execution)
+        cwd: Working directory for path resolution and stage execution (default: project root)
 
     Example:
         >>> @stage(deps=['input.txt'], outs=['output.txt'])
@@ -115,6 +119,11 @@ class stage:
         >>> def train_with_params(params: MyParams):
         ...     # Uses pre-configured params instance
         ...     pass
+
+        >>> @stage(deps=['data.csv'], outs=['output.csv'], cwd='subdir')
+        >>> def process_subdir():
+        ...     # Paths relative to subdir/, stage runs from subdir/
+        ...     pass
     """
 
     deps: Sequence[str] = ()
@@ -122,6 +131,7 @@ class stage:
     params: ParamsArg = None
     mutex: Sequence[str] = ()
     name: str | None = None  # Optional custom name (enables loop-based registration)
+    cwd: str | pathlib.Path | None = None  # Working directory for paths and execution
 
     def __post_init__(self) -> None:
         """Validate stage name doesn't contain @ (reserved for matrix variants)."""
@@ -139,6 +149,7 @@ class stage:
             outs=self.outs,
             params=self.params,
             mutex=self.mutex,
+            cwd=self.cwd,
         )
         return func
 
@@ -169,6 +180,7 @@ class stage:
                     params=variant.params,
                     mutex=variant.mutex,
                     variant=variant.name,
+                    cwd=variant.cwd,
                 )
             return func
 
@@ -191,12 +203,18 @@ class StageRegistry:
         params: ParamsArg = None,
         mutex: Sequence[str] | None = None,
         variant: str | None = None,
+        cwd: str | pathlib.Path | None = None,
     ) -> None:
         """Register a stage function with metadata."""
         stage_name = name if name is not None else func.__name__
         deps_list: Sequence[str] = deps if deps is not None else ()
         outs_list: Sequence[outputs.OutSpec] = outs if outs is not None else ()
         mutex_list: list[str] = [m.strip().lower() for m in mutex] if mutex else []
+
+        # Normalize cwd to absolute path
+        cwd_path: pathlib.Path | None = None
+        if cwd is not None:
+            cwd_path = project.normalize_path(str(cwd))
 
         # Normalize outputs to BaseOut objects
         outs_normalized = [outputs.normalize_out(o) for o in outs_list]
@@ -210,8 +228,8 @@ class StageRegistry:
         # Convert params to instance (instantiate class if needed)
         params_instance = _resolve_params(params, func, stage_name)
 
-        deps_list = _normalize_paths(deps_list, self.validation_mode)
-        outs_paths = _normalize_paths(outs_paths, self.validation_mode)
+        deps_list = _normalize_paths(deps_list, self.validation_mode, cwd_path)
+        outs_paths = _normalize_paths(outs_paths, self.validation_mode, cwd_path)
 
         # Update normalized outputs with absolute paths
         outs_normalized = [
@@ -241,6 +259,7 @@ class StageRegistry:
             variant=variant,
             signature=inspect.signature(func),
             fingerprint=fingerprint.get_stage_fingerprint(func),
+            cwd=cwd_path,
         )
 
     def get(self, name: str) -> RegistryStageInfo:
@@ -281,29 +300,53 @@ class StageRegistry:
         return result
 
 
-def _normalize_paths(paths: Sequence[str], validation_mode: ValidationMode) -> list[str]:
-    """Normalize paths to absolute paths, preserving symlinks for portability."""
+def _normalize_paths(
+    paths: Sequence[str],
+    validation_mode: ValidationMode,
+    cwd: pathlib.Path | None = None,
+) -> list[str]:
+    """Normalize paths to absolute paths, preserving symlinks for portability.
+
+    Args:
+        paths: Paths to normalize
+        validation_mode: How to handle validation errors
+        cwd: Base directory for relative paths (default: project root)
+
+    Raises:
+        InvalidPathError: If path is outside project root
+    """
     normalized = list[str]()
+    project_root = project.get_project_root()
 
     for path in paths:
         try:
-            # Use normalized path (preserve symlinks) for portability
-            norm_path = project.normalize_path(path)
+            # If cwd is provided and path is relative, resolve from cwd
+            path_to_normalize = path
+            if cwd is not None and not pathlib.Path(path).is_absolute():
+                path_to_normalize = str(cwd / path)
 
-            # Warn if relative path contains symlinks (skip for absolute paths to avoid
-            # caching project root during registration, which can cause issues in tests)
-            if not pathlib.Path(path).is_absolute():
-                project_root = project.get_project_root()
-                if project.contains_symlink_in_path(norm_path, project_root):
-                    logger.warning(
-                        f"Path '{path}' is inside a symlinked directory. "
-                        + "This may affect portability across environments."
-                    )
+            # Use normalized path (preserve symlinks) for portability
+            norm_path = project.normalize_path(path_to_normalize)
+
+            # Reject paths outside project root (not portable)
+            if not norm_path.is_relative_to(project_root):
+                raise exceptions.InvalidPathError(
+                    f"Path '{path}' resolves to '{norm_path}' which is outside "
+                    + f"project root '{project_root}'. All paths must be within the project."
+                )
+
+            # Warn if relative path contains symlinks
+            is_relative = not pathlib.Path(path).is_absolute()
+            if is_relative and project.contains_symlink_in_path(norm_path, project_root):
+                logger.warning(
+                    f"Path '{path}' is inside a symlinked directory. "
+                    + "This may affect portability across environments."
+                )
 
             normalized.append(str(norm_path))
-        except (ValueError, OSError):
+        except (ValueError, OSError, exceptions.InvalidPathError):
             if validation_mode == ValidationMode.WARN:
-                normalized.append(path)  # Use unnormalized path
+                normalized.append(str(project.normalize_path(path)))
             else:
                 raise
     return normalized

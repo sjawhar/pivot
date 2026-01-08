@@ -69,13 +69,40 @@ HashInfo = FileHash | DirHash
 OutputHash = FileHash | DirHash | None
 
 
-class LockData(TypedDict, total=False):
-    """Data stored in stage lock files."""
+class DepEntry(TypedDict):
+    """Entry in deps list for lock file storage."""
+
+    path: str
+    hash: str
+    size: NotRequired[int]
+    manifest: NotRequired[list[DirManifestEntry]]  # For directories
+
+
+class OutEntry(TypedDict):
+    """Entry in outs list for lock file storage."""
+
+    path: str
+    hash: str | None  # None for uncached outputs
+    size: NotRequired[int]
+    manifest: NotRequired[list[DirManifestEntry]]  # For directories
+
+
+class StorageLockData(TypedDict, total=False):
+    """Storage format for lock files (list-based, relative paths)."""
 
     code_manifest: dict[str, str]
     params: dict[str, Any]
-    dep_hashes: dict[str, HashInfo]  # FileHash or DirHash (with manifest), never None
-    output_hashes: dict[str, OutputHash]  # Can be None for uncached outputs
+    deps: list[DepEntry]
+    outs: list[OutEntry]
+
+
+class LockData(TypedDict):
+    """Internal representation of stage lock data (dict-based, absolute paths)."""
+
+    code_manifest: dict[str, str]
+    params: dict[str, Any]
+    dep_hashes: dict[str, HashInfo]
+    output_hashes: dict[str, OutputHash]
 
 
 # Type alias for output queue messages: (stage_name, line, is_stderr) or None for shutdown

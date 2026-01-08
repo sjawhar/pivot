@@ -553,6 +553,7 @@ def _prepare_worker_info(
         params=stage_info["params"],
         variant=stage_info["variant"],
         overrides=overrides,
+        cwd=stage_info["cwd"],
     )
 
 

@@ -1095,9 +1095,11 @@ def test_executor_output_hashes_in_lock_file(pipeline_dir: pathlib.Path) -> None
     lock_file = pipeline_dir / ".pivot" / "cache" / "stages" / "process.lock"
     assert lock_file.exists()
 
+    # Storage format uses 'outs' list (not 'output_hashes' dict)
     lock_data = yaml.safe_load(lock_file.read_text())
-    assert "output_hashes" in lock_data
-    assert len(lock_data["output_hashes"]) == 1
+    assert "outs" in lock_data
+    assert len(lock_data["outs"]) == 1
+    assert lock_data["outs"][0]["path"] == "output.txt"
 
 
 def test_executor_lock_file_deterministic_sort(pipeline_dir: pathlib.Path) -> None:
@@ -1116,13 +1118,12 @@ def test_executor_lock_file_deterministic_sort(pipeline_dir: pathlib.Path) -> No
     lock_file = pipeline_dir / ".pivot" / "cache" / "stages" / "process.lock"
     lock_data = yaml.safe_load(lock_file.read_text())
 
-    # Verify dep_hashes are sorted
-    dep_keys = list(lock_data.get("dep_hashes", {}).keys())
-    assert dep_keys == sorted(dep_keys), "dep_hashes should be sorted"
+    # Storage format uses 'deps' and 'outs' lists (sorted by path)
+    dep_paths = [entry["path"] for entry in lock_data.get("deps", [])]
+    assert dep_paths == sorted(dep_paths), "deps should be sorted by path"
 
-    # Verify output_hashes are sorted
-    output_keys = list(lock_data.get("output_hashes", {}).keys())
-    assert output_keys == sorted(output_keys), "output_hashes should be sorted"
+    out_paths = [entry["path"] for entry in lock_data.get("outs", [])]
+    assert out_paths == sorted(out_paths), "outs should be sorted by path"
 
 
 def test_executor_directory_output_cached(pipeline_dir: pathlib.Path) -> None:
@@ -1146,22 +1147,22 @@ def test_executor_directory_output_cached(pipeline_dir: pathlib.Path) -> None:
     assert (output_dir / "file2.txt").read_text() == "file2"
 
 
-def test_executor_old_lock_file_triggers_recache(pipeline_dir: pathlib.Path) -> None:
-    """Old lock file without output_hashes triggers re-execution."""
+def test_executor_lock_file_missing_outs_triggers_rerun(pipeline_dir: pathlib.Path) -> None:
+    """Lock file without outs section triggers re-execution."""
     (pipeline_dir / "input.txt").write_text("data")
     cache_dir = pipeline_dir / ".pivot" / "cache"
     stages_dir = cache_dir / "stages"
     stages_dir.mkdir(parents=True)
 
-    # Create old-style lock file without output_hashes
-    old_lock = stages_dir / "process.lock"
-    old_lock.write_text(
+    # Create lock file without outs (incomplete)
+    lock_file = stages_dir / "process.lock"
+    lock_file.write_text(
         yaml.dump(
             {
                 "code_manifest": {},
                 "params": {},
-                "dep_hashes": {},
-                # No output_hashes - old format
+                "deps": [],
+                # No outs - incomplete lock
             }
         )
     )
@@ -1172,9 +1173,9 @@ def test_executor_old_lock_file_triggers_recache(pipeline_dir: pathlib.Path) -> 
 
     results = executor.run(show_output=False)
 
-    # Should re-run because output_hashes is missing
+    # Should re-run because outs is missing
     assert results["process"]["status"] == "ran"
 
-    # Lock file should now have output_hashes
-    lock_data = yaml.safe_load(old_lock.read_text())
-    assert "output_hashes" in lock_data
+    # Lock file should now have outs
+    lock_data = yaml.safe_load(lock_file.read_text())
+    assert "outs" in lock_data

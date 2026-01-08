@@ -1,13 +1,10 @@
 import pathlib
-from typing import TYPE_CHECKING
 
 import pytest
 
 from pivot import IncrementalOut, cache, executor, outputs, registry
 from pivot.executor import worker
-
-if TYPE_CHECKING:
-    from pivot.types import LockData
+from pivot.types import LockData
 
 
 # Module-level stage functions for testing (must be picklable)
@@ -70,9 +67,12 @@ def test_prepare_outputs_incremental_restores_from_cache(tmp_path: pathlib.Path)
     output_hash = cache.save_to_cache(output_file, cache_dir)
 
     # Lock data simulating previous run
-    lock_data: LockData = {
-        "output_hashes": {str(output_file): output_hash},
-    }
+    lock_data = LockData(
+        code_manifest={},
+        params={},
+        dep_hashes={},
+        output_hashes={str(output_file): output_hash},
+    )
 
     # Prepare for execution
     stage_outs = [outputs.IncrementalOut(path=str(output_file))]
@@ -93,9 +93,12 @@ def test_prepare_outputs_incremental_restored_file_is_writable(tmp_path: pathlib
     output_file.write_text("cached content\n")
     output_hash = cache.save_to_cache(output_file, cache_dir)
 
-    lock_data: LockData = {
-        "output_hashes": {str(output_file): output_hash},
-    }
+    lock_data = LockData(
+        code_manifest={},
+        params={},
+        dep_hashes={},
+        output_hashes={str(output_file): output_hash},
+    )
 
     # Prepare for execution
     stage_outs = [outputs.IncrementalOut(path=str(output_file))]
@@ -222,9 +225,12 @@ def test_incremental_out_restores_directory(tmp_path: pathlib.Path) -> None:
     output_hash = cache.save_to_cache(output_dir, cache_dir)
 
     # Simulate lock data from previous run
-    lock_data: LockData = {
-        "output_hashes": {str(output_dir): output_hash},
-    }
+    lock_data = LockData(
+        code_manifest={},
+        params={},
+        dep_hashes={},
+        output_hashes={str(output_dir): output_hash},
+    )
 
     # Delete the output
     cache.remove_output(output_dir)
@@ -253,9 +259,12 @@ def test_incremental_out_directory_is_writable(tmp_path: pathlib.Path) -> None:
     # Save to cache
     output_hash = cache.save_to_cache(output_dir, cache_dir)
 
-    lock_data: LockData = {
-        "output_hashes": {str(output_dir): output_hash},
-    }
+    lock_data = LockData(
+        code_manifest={},
+        params={},
+        dep_hashes={},
+        output_hashes={str(output_dir): output_hash},
+    )
 
     # Delete and restore
     cache.remove_output(output_dir)
@@ -287,9 +296,12 @@ def test_incremental_out_directory_subdirs_writable(tmp_path: pathlib.Path) -> N
     # Save to cache
     output_hash = cache.save_to_cache(output_dir, cache_dir)
 
-    lock_data: LockData = {
-        "output_hashes": {str(output_dir): output_hash},
-    }
+    lock_data = LockData(
+        code_manifest={},
+        params={},
+        dep_hashes={},
+        output_hashes={str(output_dir): output_hash},
+    )
 
     # Delete and restore
     cache.remove_output(output_dir)

@@ -29,6 +29,13 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _working_directory(cwd: pathlib.Path | None) -> contextlib.AbstractContextManager[None]:
+    """Return context manager to temporarily change working directory."""
+    if cwd is None:
+        return contextlib.nullcontext()
+    return contextlib.chdir(cwd)
+
+
 class WorkerStageInfo(TypedDict):
     """Stage info subset passed to worker processes."""
 
@@ -40,6 +47,7 @@ class WorkerStageInfo(TypedDict):
     params: BaseModel | None
     variant: str | None
     overrides: parameters.ParamsOverrides
+    cwd: pathlib.Path | None
 
 
 def execute_stage(
@@ -103,9 +111,10 @@ def execute_stage(
         with lock.execution_lock(stage_name, cache_dir):
             _prepare_outputs_for_execution(stage_outs, lock_data_prev, files_cache_dir)
 
-            _run_stage_function_with_capture(
-                stage_info["func"], stage_name, output_queue, output_lines, params_instance
-            )
+            with _working_directory(stage_info["cwd"]):
+                _run_stage_function_with_capture(
+                    stage_info["func"], stage_name, output_queue, output_lines, params_instance
+                )
 
             output_hashes = _save_outputs_to_cache(stage_outs, files_cache_dir)
 
@@ -146,7 +155,7 @@ def _restore_outputs_from_cache(
     if lock_data is None:
         return False
 
-    output_hashes = lock_data.get("output_hashes", {})
+    output_hashes = lock_data["output_hashes"]
     for out in stage_outs:
         path = pathlib.Path(out.path)
         if path.exists():
@@ -170,7 +179,7 @@ def _prepare_outputs_for_execution(
     files_cache_dir: pathlib.Path,
 ) -> None:
     """Prepare outputs before stage execution - delete or restore for incremental."""
-    output_hashes = lock_data.get("output_hashes", {}) if lock_data else {}
+    output_hashes = lock_data["output_hashes"] if lock_data else {}
 
     for out in stage_outs:
         path = pathlib.Path(out.path)
