@@ -502,3 +502,130 @@ def test_generation_tracks_logical_path_not_symlink_target(tmp_path: pathlib.Pat
         # Symlink path still has its own generation
         gen_via_symlink = db.get_generation(symlinked_path)
         assert gen_via_symlink == 1, "Symlink path generation unchanged"
+
+
+# -----------------------------------------------------------------------------
+# Remote index tracking tests
+# -----------------------------------------------------------------------------
+
+
+def test_remote_hash_exists_false(tmp_path: pathlib.Path) -> None:
+    """Unknown hash returns False."""
+    db_path = tmp_path / "state.db"
+
+    with state.StateDB(db_path) as db:
+        result = db.remote_hash_exists("origin", "abc123def456")
+
+    assert result is False
+
+
+def test_remote_hash_exists_true(tmp_path: pathlib.Path) -> None:
+    """Added hash returns True."""
+    db_path = tmp_path / "state.db"
+
+    with state.StateDB(db_path) as db:
+        db.remote_hashes_add("origin", ["abc123def456"])
+        result = db.remote_hash_exists("origin", "abc123def456")
+
+    assert result is True
+
+
+def test_remote_hashes_add_multiple(tmp_path: pathlib.Path) -> None:
+    """Multiple hashes can be added at once."""
+    db_path = tmp_path / "state.db"
+    hashes = ["hash1", "hash2", "hash3"]
+
+    with state.StateDB(db_path) as db:
+        db.remote_hashes_add("origin", hashes)
+
+        for h in hashes:
+            assert db.remote_hash_exists("origin", h)
+
+
+def test_remote_hashes_intersection(tmp_path: pathlib.Path) -> None:
+    """Intersection returns only hashes known to exist on remote."""
+    db_path = tmp_path / "state.db"
+    known = {"hash1", "hash2", "hash3"}
+    query = {"hash1", "hash3", "hash4", "hash5"}
+
+    with state.StateDB(db_path) as db:
+        db.remote_hashes_add("origin", known)
+        result = db.remote_hashes_intersection("origin", query)
+
+    assert result == {"hash1", "hash3"}
+
+
+def test_remote_hashes_intersection_empty_query(tmp_path: pathlib.Path) -> None:
+    """Empty query returns empty set."""
+    db_path = tmp_path / "state.db"
+
+    with state.StateDB(db_path) as db:
+        db.remote_hashes_add("origin", ["hash1", "hash2"])
+        result = db.remote_hashes_intersection("origin", set())
+
+    assert result == set()
+
+
+def test_remote_hashes_intersection_no_matches(tmp_path: pathlib.Path) -> None:
+    """No matches returns empty set."""
+    db_path = tmp_path / "state.db"
+
+    with state.StateDB(db_path) as db:
+        db.remote_hashes_add("origin", ["hash1", "hash2"])
+        result = db.remote_hashes_intersection("origin", {"hash3", "hash4"})
+
+    assert result == set()
+
+
+def test_remote_hashes_remove(tmp_path: pathlib.Path) -> None:
+    """Removed hashes no longer exist."""
+    db_path = tmp_path / "state.db"
+
+    with state.StateDB(db_path) as db:
+        db.remote_hashes_add("origin", ["hash1", "hash2", "hash3"])
+        db.remote_hashes_remove("origin", ["hash2"])
+
+        assert db.remote_hash_exists("origin", "hash1")
+        assert not db.remote_hash_exists("origin", "hash2")
+        assert db.remote_hash_exists("origin", "hash3")
+
+
+def test_remote_index_clear(tmp_path: pathlib.Path) -> None:
+    """Clear removes all hashes for a remote."""
+    db_path = tmp_path / "state.db"
+
+    with state.StateDB(db_path) as db:
+        db.remote_hashes_add("origin", ["hash1", "hash2"])
+        db.remote_hashes_add("backup", ["hash3", "hash4"])
+
+        db.remote_index_clear("origin")
+
+        assert not db.remote_hash_exists("origin", "hash1")
+        assert not db.remote_hash_exists("origin", "hash2")
+        assert db.remote_hash_exists("backup", "hash3")
+        assert db.remote_hash_exists("backup", "hash4")
+
+
+def test_remote_hashes_different_remotes_independent(tmp_path: pathlib.Path) -> None:
+    """Different remotes have independent hash indexes."""
+    db_path = tmp_path / "state.db"
+
+    with state.StateDB(db_path) as db:
+        db.remote_hashes_add("origin", ["hash1"])
+        db.remote_hashes_add("backup", ["hash2"])
+
+        assert db.remote_hash_exists("origin", "hash1")
+        assert not db.remote_hash_exists("origin", "hash2")
+        assert not db.remote_hash_exists("backup", "hash1")
+        assert db.remote_hash_exists("backup", "hash2")
+
+
+def test_remote_hashes_persistence(tmp_path: pathlib.Path) -> None:
+    """Remote hashes persist across DB instances."""
+    db_path = tmp_path / "state.db"
+
+    with state.StateDB(db_path) as db:
+        db.remote_hashes_add("origin", ["persistent_hash"])
+
+    with state.StateDB(db_path) as db:
+        assert db.remote_hash_exists("origin", "persistent_hash")

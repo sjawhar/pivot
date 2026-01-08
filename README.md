@@ -278,7 +278,72 @@ def append_to_database():
 - New version is cached after execution
 - Uses COPY mode (not symlinks) so stages can safely modify files
 
-### 8. Data Diff
+### 8. S3 Remote Cache Storage
+
+**Share cached outputs across machines and CI environments:**
+
+```bash
+# Add a remote
+pivot remote add origin s3://my-bucket/pivot-cache
+
+# Push cached outputs to remote
+pivot push
+
+# Push specific stages only
+pivot push train_model evaluate_model
+
+# Pull cached outputs from remote
+pivot pull
+
+# Pull specific stages (downloads only what's needed)
+pivot pull train_model
+```
+
+**How it works:**
+- Uses async I/O (aioboto3) for high-throughput parallel transfers
+- Local index in LMDB avoids repeated HEAD requests to S3
+- Stage-level filtering enables granular push/pull operations
+- AWS credentials via standard chain (env vars, ~/.aws/credentials, IAM roles)
+
+**Remote configuration stored in `.pivot/config.yaml`:**
+```yaml
+remotes:
+  origin: s3://my-bucket/pivot-cache
+default_remote: origin
+```
+
+**Local cache structure:**
+```
+.pivot/
+├── cache/
+│   └── files/           # Content-addressable cache (pushed/pulled)
+│       ├── ab/
+│       │   └── cdef0123...  # File content keyed by xxhash64
+│       └── ...
+├── stages/              # Per-stage lock files (local only)
+│   ├── preprocess.lock
+│   └── train.lock
+├── config.yaml          # Remote configuration (local only)
+└── state.lmdb/          # Hash cache, generation tracking (local only)
+```
+
+**What gets transferred:**
+
+| Data | Pushed | Pulled | Notes |
+|------|--------|--------|-------|
+| Cache files (`.pivot/cache/files/`) | ✅ | ✅ | Actual file contents, content-addressable by hash |
+| Lock files (`.pivot/stages/*.lock`) | ❌ | ❌ | Reference hashes; must exist locally to pull specific stages |
+| Config (`.pivot/config.yaml`) | ❌ | ❌ | Contains remote URLs; each machine has its own |
+| State DB (`.pivot/state.lmdb/`) | ❌ | ❌ | Local performance cache; rebuilt automatically |
+
+**Typical workflow:**
+1. Run pipeline locally → outputs cached in `.pivot/cache/files/`
+2. `pivot push` → upload cache files to S3
+3. On another machine: clone repo (includes lock files in git)
+4. `pivot pull train_model` → download only files needed for that stage
+5. `pivot run` → stages with cached outputs skip execution
+
+### 9. Data Diff
 
 Compare data file changes between git HEAD and workspace:
 
@@ -305,7 +370,6 @@ pivot data diff output.csv --no-tui --json
 - **Multiple formats** - Plain text, markdown, or JSON output
 
 **Supported formats:** CSV, JSON, JSONL
-
 ---
 
 ## Installation (Coming Soon)
@@ -343,6 +407,7 @@ pip install pivot
 - **Explain mode** - `pivot run --explain` shows detailed breakdown of WHY stages would run
 - **Observability** - `pivot metrics show/diff`, `pivot plots show/diff`, and `pivot params show/diff` commands
 - **Pipeline configuration** - `pivot.yaml` files with matrix expansion, `Pipeline` class, CLI auto-discovery
+- **S3 remote cache** - `pivot push/pull` with async I/O, LMDB index, per-stage filtering
 - **Data diff** - `pivot data diff` command with interactive TUI for comparing data file changes
 
 ### In Progress
@@ -430,6 +495,7 @@ basedpyright src/
 | **Explain mode**          | ❌                          | ✅ Shows WHY stages run     |
 | **YAML export**           | N/A                         | ✅ For code review          |
 | **Python-first**          | Config-first (YAML)         | Code-first (decorators)     |
+| **Remote storage**        | S3/GCS/Azure via dvc-data   | S3 with async I/O           |
 
 ---
 

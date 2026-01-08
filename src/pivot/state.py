@@ -3,14 +3,18 @@ from __future__ import annotations
 import os
 import pathlib
 import struct
-from typing import Self
+from typing import TYPE_CHECKING, Self
 
 import lmdb
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
 
 # Key prefixes for different entry types
 _HASH_PREFIX = b"hash:"  # File hash entries
 _GEN_PREFIX = b"gen:"  # Output generation counters
 _DEP_PREFIX = b"dep:"  # Stage dependency generations
+_REMOTE_PREFIX = b"remote:"  # Remote index entries
 
 # Default LMDB map size (10GB virtual - grows as needed)
 _MAP_SIZE = 10 * 1024 * 1024 * 1024
@@ -247,6 +251,69 @@ class StateDB:
             raise DatabaseFullError(
                 f"State cache is full ({_MAP_SIZE // (1024**3)}GB limit). Delete .pivot/state.lmdb/ to reset."
             ) from e
+
+    # -------------------------------------------------------------------------
+    # Remote index tracking for avoiding repeated HEAD requests
+    # -------------------------------------------------------------------------
+
+    def remote_hash_exists(self, remote_name: str, hash_: str) -> bool:
+        """Check if hash is known to exist on remote."""
+        self._check_closed()
+        key = _REMOTE_PREFIX + f"{remote_name}:{hash_}".encode()
+        with self._env.begin() as txn:
+            return txn.get(key) is not None
+
+    def remote_hashes_intersection(self, remote_name: str, hashes: set[str]) -> set[str]:
+        """Return subset of hashes known to exist on remote (batch lookup)."""
+        self._check_closed()
+        if not hashes:
+            return set()
+        prefix = _REMOTE_PREFIX + remote_name.encode() + b":"
+        found = set[str]()
+        with self._env.begin() as txn:
+            for hash_ in hashes:
+                key = prefix + hash_.encode()
+                if txn.get(key) is not None:
+                    found.add(hash_)
+        return found
+
+    def remote_hashes_add(self, remote_name: str, hashes: Iterable[str]) -> None:
+        """Mark hashes as existing on remote."""
+        self._check_closed()
+        prefix = _REMOTE_PREFIX + remote_name.encode() + b":"
+        try:
+            with self._env.begin(write=True) as txn:
+                for hash_ in hashes:
+                    key = prefix + hash_.encode()
+                    txn.put(key, b"1")
+        except lmdb.MapFullError as e:
+            raise DatabaseFullError(
+                f"State cache is full ({_MAP_SIZE // (1024**3)}GB limit). Delete .pivot/state.lmdb/ to reset."
+            ) from e
+
+    def remote_hashes_remove(self, remote_name: str, hashes: Iterable[str]) -> None:
+        """Mark hashes as no longer on remote."""
+        self._check_closed()
+        prefix = _REMOTE_PREFIX + remote_name.encode() + b":"
+        with self._env.begin(write=True) as txn:
+            for hash_ in hashes:
+                key = prefix + hash_.encode()
+                txn.delete(key)
+
+    def remote_index_clear(self, remote_name: str) -> None:
+        """Clear all index entries for a remote (force re-indexing)."""
+        self._check_closed()
+        prefix = _REMOTE_PREFIX + remote_name.encode() + b":"
+        with self._env.begin(write=True) as txn:
+            cursor = txn.cursor()
+            keys_to_delete = list[bytes]()
+            if cursor.set_range(prefix):
+                for key, _ in cursor:
+                    if not key.startswith(prefix):
+                        break
+                    keys_to_delete.append(key)
+            for key in keys_to_delete:
+                txn.delete(key)
 
     def close(self) -> None:
         """Close the database."""

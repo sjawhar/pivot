@@ -159,7 +159,31 @@ class CacheMissError(GetError):
 
 
 class RemoteError(PivotError):
-    """Base class for remote operations."""
+    """Base class for remote storage errors."""
+
+    pass
+
+
+class RemoteNotFoundError(RemoteError):
+    """Raised when a named remote doesn't exist in configuration."""
+
+    pass
+
+
+class RemoteConnectionError(RemoteError):
+    """Raised when connection to remote storage fails."""
+
+    pass
+
+
+class InvalidRemoteURLError(RemoteError):
+    """Raised when remote URL is malformed or uses unsupported scheme."""
+
+    pass
+
+
+class RemoteTransferError(RemoteError):
+    """Raised when file transfer to/from remote fails."""
 
     pass
 
