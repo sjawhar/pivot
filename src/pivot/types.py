@@ -68,6 +68,15 @@ HashInfo = FileHash | DirHash
 # Nullable hash for lock file storage (may be None for uncached outputs)
 OutputHash = FileHash | DirHash | None
 
+# Metric values are JSON primitives after flattening (nested dicts become dot-separated keys)
+MetricValue = str | int | float | bool | None
+
+# Flattened metric data: {key: value} where keys are dot-separated paths
+MetricData = dict[str, MetricValue]
+
+# Output format for metrics display commands
+OutputFormat = Literal["json", "md"] | None
+
 
 class DepEntry(TypedDict):
     """Entry in deps list for lock file storage."""
@@ -110,9 +119,6 @@ OutputMessage = tuple[str, str, bool] | None
 
 # Type alias for change detection status
 ChangeType = Literal["modified", "added", "removed"]
-
-# Type alias for CLI output format
-OutputFormat = Literal["json", "md"] | None
 
 
 class CodeChange(TypedDict):

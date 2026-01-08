@@ -16,7 +16,14 @@ from typing import TYPE_CHECKING, Any, TypedDict
 import pydantic
 
 from pivot import cache, exceptions, lock, outputs, parameters, project, state
-from pivot.types import HashInfo, LockData, OutputHash, OutputMessage, StageResult, StageStatus
+from pivot.types import (
+    HashInfo,
+    LockData,
+    OutputHash,
+    OutputMessage,
+    StageResult,
+    StageStatus,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence

@@ -1,6 +1,7 @@
 from pivot import cache as cache
 from pivot import dvc_compat as dvc_compat
 from pivot import explain as explain
+from pivot import metrics as metrics
 from pivot import outputs as outputs
 from pivot import parameters as parameters
 from pivot import plots as plots
