@@ -3,6 +3,7 @@
 **Status:** 🚧 In Development (MVP Nearly Complete)
 **Python:** 3.13+ required
 **License:** TBD
+**Coverage:** 90%+
 
 ---
 
@@ -246,6 +247,15 @@ train:
 - YAML overrides take precedence over model defaults
 - Parameter changes trigger re-execution (tracked in lock files)
 
+**View and compare params:**
+
+```bash
+pivot params show                    # Show current param values
+pivot params show --format json      # JSON output
+pivot params diff                    # Compare workspace vs last commit
+pivot params diff --precision 4      # Control float precision
+```
+
 ### 7. Incremental Outputs
 
 **New:** Outputs that preserve state between runs for append-only workloads:
@@ -331,7 +341,7 @@ pip install pivot
 - **Incremental outputs** - Restore-before-run for append-only workloads
 - **DVC export** - `pivot export` command for YAML generation
 - **Explain mode** - `pivot run --explain` shows detailed breakdown of WHY stages would run
-- **Observability** - `pivot metrics show/diff` and `pivot plots show/diff` commands
+- **Observability** - `pivot metrics show/diff`, `pivot plots show/diff`, and `pivot params show/diff` commands
 - **Pipeline configuration** - `pivot.yaml` files with matrix expansion, `Pipeline` class, CLI auto-discovery
 - **Data diff** - `pivot data diff` command with interactive TUI for comparing data file changes
 
@@ -483,3 +493,4 @@ Questions? Check CLAUDE.md files or ask the team!
 
 **Last Updated:** 2026-01-08
 **Version:** 0.1.0-dev
+
