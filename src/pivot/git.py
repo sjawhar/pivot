@@ -110,6 +110,11 @@ def _get_head_context() -> _RepoContext | None:
     return _RepoContext(repo=repo, commit=commit, proj_prefix=proj_prefix)
 
 
+def is_git_repo_with_head() -> bool:
+    """Check if we're in a git repo with a valid HEAD commit."""
+    return _get_head_context() is not None
+
+
 def _get_revision_context(rev: str) -> _RepoContext | None:
     """Get repo context for a specific revision."""
     result = _open_repo()
