@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import functools
 import logging
 import pathlib
 import subprocess
@@ -245,6 +246,25 @@ def export_dvc_yaml(
     return dvc_yaml
 
 
+@functools.cache
+def _find_dvc_root(start: pathlib.Path) -> pathlib.Path:
+    """Find DVC project root by walking up from start directory."""
+    current = start.resolve()
+    while current != current.parent:
+        if (current / ".dvc").is_dir():
+            return current
+        current = current.parent
+    return start  # Fall back to start if no .dvc found
+
+
+@functools.cache
+def _get_dvc_repo(root: pathlib.Path) -> Any:
+    """Get cached DVC Repo instance for a project root."""
+    import dvc.repo
+
+    return dvc.repo.Repo(str(root))
+
+
 def import_dvc_yaml(
     path: pathlib.Path | str,
     register: bool = True,
@@ -264,7 +284,6 @@ def import_dvc_yaml(
         DVCImportError: If DVC not installed or parsing fails
     """
     try:
-        import dvc.repo
         from dvc.stage import PipelineStage as DVCPipelineStage
     except ImportError:
         raise DVCImportError("DVC is required for import_dvc_yaml") from None
@@ -273,9 +292,10 @@ def import_dvc_yaml(
     if not path.exists():
         raise DVCImportError(f"dvc.yaml not found: {path}")
 
-    # DVC integration requires real DVC repository
+    # DVC integration requires real DVC repository (cached per project root)
     try:  # pragma: no cover
-        repo = dvc.repo.Repo(str(path.parent))
+        root = _find_dvc_root(path.parent)
+        repo = _get_dvc_repo(root)
         dvc_stages = repo.index.stages
     except Exception as e:  # pragma: no cover
         raise DVCImportError(f"Failed to parse dvc.yaml: {e}") from e
@@ -351,7 +371,11 @@ def _register_imported_stage(spec: StageSpec) -> None:  # pragma: no cover
     _register_imported_stage_with_name(spec, spec.name)
 
 
-def _register_imported_stage_with_name(spec: StageSpec, name: str) -> None:  # pragma: no cover
+def _register_imported_stage_with_name(
+    spec: StageSpec,
+    name: str,
+    mutex: list[str] | None = None,
+) -> None:  # pragma: no cover
     """Register imported DVC stage with explicit name (for collision handling)."""
     # Use spec.cwd if set, otherwise fall back to project root
     cwd = spec.cwd if spec.cwd else project.get_project_root()
@@ -372,5 +396,6 @@ def _register_imported_stage_with_name(spec: StageSpec, name: str) -> None:  # p
         name=name,
         deps=list(spec.deps),
         outs=spec.outs,
+        mutex=mutex,
         cwd=spec.cwd,
     )

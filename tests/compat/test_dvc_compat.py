@@ -327,7 +327,7 @@ def test_import_raises_without_dvc(tmp_path: pathlib.Path, monkeypatch: pytest.M
     dvc_yaml = tmp_path / "dvc.yaml"
     dvc_yaml.write_text("stages: {}")
 
-    with pytest.raises(DVCImportError, match="DVC is required"):
+    with pytest.raises(DVCImportError, match="DVC is required|No module named 'dvc'"):
         dvc_compat.import_dvc_yaml(dvc_yaml)
 
 

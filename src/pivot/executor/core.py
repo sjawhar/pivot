@@ -47,6 +47,9 @@ logger = logging.getLogger(__name__)
 
 _MAX_WORKERS_DEFAULT = 8
 
+# Special mutex that means "run exclusively" - no other stages run concurrently
+EXCLUSIVE_MUTEX = "*"
+
 
 class ExecutionSummary(TypedDict):
     """Summary result for a single stage after execution (returned by executor.run)."""
@@ -260,6 +263,9 @@ def _warn_single_stage_mutex_groups(stage_states: dict[str, StageState]) -> None
             groups[mutex].append(name)
 
     for group, members in groups.items():
+        # Skip EXCLUSIVE_MUTEX - it's intentionally used for single stages
+        if group == EXCLUSIVE_MUTEX:
+            continue
         if len(members) == 1:
             logger.warning(f"Mutex group '{group}' only contains stage '{members[0]}'")
 
@@ -509,6 +515,15 @@ def _start_ready_stages(
         # Check mutex availability - skip if any mutex group is held
         if any(mutex_counts[m] > 0 for m in state.mutex):
             continue
+
+        # Exclusive mutex handling:
+        # - If this stage is exclusive, wait until no other stages are running
+        # - If any exclusive stage is running, no other stages can start
+        is_exclusive = EXCLUSIVE_MUTEX in state.mutex
+        if is_exclusive and len(futures) > 0:
+            continue  # Exclusive stage must wait for all others to finish
+        if not is_exclusive and mutex_counts[EXCLUSIVE_MUTEX] > 0:
+            continue  # Non-exclusive stage can't start while exclusive is running
 
         # Show explanation before starting if in explain mode
         if explain_mode and con:
