@@ -426,3 +426,62 @@ def test_multiple_stages_same_dependency(tmp_path: Path) -> None:
     # Both analyze and visualize depend on extract
     assert graph.has_edge("analyze", "extract")
     assert graph.has_edge("visualize", "extract")
+
+
+# --- Directory dependency tests (BUG-007) ---
+
+
+def test_directory_depends_on_file_outputs(tmp_path: Path) -> None:
+    """Directory dependency waits for stages outputting files into it."""
+    dir_path = tmp_path / "data" / "outputs"
+    dir_path.mkdir(parents=True)
+
+    stages = {
+        "produce_file": _create_stage("produce_file", [], [str(dir_path / "file.csv")]),
+        "consume_dir": _create_stage(
+            "consume_dir", [str(dir_path)], [str(tmp_path / "result.csv")]
+        ),
+    }
+
+    graph = dag.build_dag(stages, validate=False)
+
+    assert graph.has_edge("consume_dir", "produce_file"), (
+        "Should create edge for dir→file dependency"
+    )
+
+
+def test_directory_depends_on_multiple_file_outputs(tmp_path: Path) -> None:
+    """Directory dependency waits for ALL stages outputting files into it."""
+    dir_path = tmp_path / "data" / "outputs"
+    dir_path.mkdir(parents=True)
+
+    stages = {
+        "produce_a": _create_stage("produce_a", [], [str(dir_path / "a.csv")]),
+        "produce_b": _create_stage("produce_b", [], [str(dir_path / "b.csv")]),
+        "consume_dir": _create_stage(
+            "consume_dir", [str(dir_path)], [str(tmp_path / "result.csv")]
+        ),
+    }
+
+    graph = dag.build_dag(stages, validate=False)
+
+    assert graph.has_edge("consume_dir", "produce_a"), "Should depend on first producer"
+    assert graph.has_edge("consume_dir", "produce_b"), "Should depend on second producer"
+
+
+def test_nested_directory_dependency(tmp_path: Path) -> None:
+    """Directory dependency detects files in nested subdirectories."""
+    dir_path = tmp_path / "data"
+    nested = dir_path / "sub" / "nested"
+    nested.mkdir(parents=True)
+
+    stages = {
+        "produce_nested": _create_stage("produce_nested", [], [str(nested / "file.csv")]),
+        "consume_parent": _create_stage(
+            "consume_parent", [str(dir_path)], [str(tmp_path / "result.csv")]
+        ),
+    }
+
+    graph = dag.build_dag(stages, validate=False)
+
+    assert graph.has_edge("consume_parent", "produce_nested"), "Should detect nested file outputs"
