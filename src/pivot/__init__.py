@@ -3,6 +3,7 @@ from pivot import dvc_compat as dvc_compat
 from pivot import explain as explain
 from pivot import outputs as outputs
 from pivot import parameters as parameters
+from pivot import plots as plots
 from pivot import pvt as pvt
 from pivot import state as state
 from pivot.outputs import BaseOut as BaseOut

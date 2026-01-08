@@ -111,6 +111,9 @@ OutputMessage = tuple[str, str, bool] | None
 # Type alias for change detection status
 ChangeType = Literal["modified", "added", "removed"]
 
+# Type alias for CLI output format
+OutputFormat = Literal["json", "md"] | None
+
 
 class CodeChange(TypedDict):
     """Change info for a code component in the fingerprint."""
