@@ -48,6 +48,7 @@ class WorkerStageInfo(TypedDict):
     variant: str | None
     overrides: parameters.ParamsOverrides
     cwd: pathlib.Path | None
+    checkout_modes: list[str]
 
 
 def execute_stage(
@@ -60,6 +61,9 @@ def execute_stage(
     output_lines: list[tuple[str, bool]] = []
     files_cache_dir = cache_dir / "files"
     state_db_path = cache_dir.parent / "state.db"
+
+    # Convert string checkout modes to enum (strings used for pickling across processes)
+    checkout_modes = [cache.CheckoutMode(m) for m in stage_info["checkout_modes"]]
 
     stage_lock = lock.StageLock(stage_name, cache_dir)
     current_fingerprint = stage_info["fingerprint"]
@@ -85,7 +89,9 @@ def execute_stage(
         )
         if skip_result is not None:
             lock_data_prev = stage_lock.read()
-            if _restore_outputs_from_cache(stage_outs, lock_data_prev, files_cache_dir):
+            if _restore_outputs_from_cache(
+                stage_outs, lock_data_prev, files_cache_dir, checkout_modes
+            ):
                 return skip_result
 
         dep_hashes, missing, unreadable = hash_dependencies(stage_info["deps"], state_db)
@@ -111,7 +117,9 @@ def execute_stage(
         changed, reason = True, "outputs not cached"
 
     if not changed:
-        restored_all = _restore_outputs_from_cache(stage_outs, lock_data_prev, files_cache_dir)
+        restored_all = _restore_outputs_from_cache(
+            stage_outs, lock_data_prev, files_cache_dir, checkout_modes
+        )
         if not restored_all:
             changed, reason = True, "outputs missing from cache"
 
@@ -127,7 +135,7 @@ def execute_stage(
                     stage_info["func"], stage_name, output_queue, output_lines, params_instance
                 )
 
-            output_hashes = _save_outputs_to_cache(stage_outs, files_cache_dir)
+            output_hashes = _save_outputs_to_cache(stage_outs, files_cache_dir, checkout_modes)
 
             lock_data: LockData = {
                 "code_manifest": current_fingerprint,
@@ -165,6 +173,7 @@ def _restore_outputs_from_cache(
     stage_outs: list[outputs.BaseOut],
     lock_data: LockData | None,
     files_cache_dir: pathlib.Path,
+    checkout_modes: list[cache.CheckoutMode],
 ) -> bool:
     """Restore missing outputs from cache. Returns True if all restored successfully."""
     if lock_data is None:
@@ -182,7 +191,9 @@ def _restore_outputs_from_cache(
                 return False
             continue
 
-        if not cache.restore_from_cache(path, output_hash, files_cache_dir):
+        if not cache.restore_from_cache(
+            path, output_hash, files_cache_dir, checkout_modes=checkout_modes
+        ):
             return False
 
     return True
@@ -206,7 +217,7 @@ def _prepare_outputs_for_execution(
             if out_hash:
                 # COPY mode makes file writable (not symlink to read-only cache)
                 restored = cache.restore_from_cache(
-                    path, out_hash, files_cache_dir, cache.LinkMode.COPY
+                    path, out_hash, files_cache_dir, cache.CheckoutMode.COPY
                 )
                 if not restored:
                     raise exceptions.CacheRestoreError(
@@ -220,6 +231,7 @@ def _prepare_outputs_for_execution(
 def _save_outputs_to_cache(
     stage_outs: list[outputs.BaseOut],
     files_cache_dir: pathlib.Path,
+    checkout_modes: list[cache.CheckoutMode],
 ) -> dict[str, OutputHash]:
     """Save outputs to cache after successful execution."""
     output_hashes = dict[str, OutputHash]()
@@ -230,7 +242,9 @@ def _save_outputs_to_cache(
             raise exceptions.OutputMissingError(f"Stage did not produce output: {out.path}")
 
         if out.cache:
-            output_hashes[out.path] = cache.save_to_cache(path, files_cache_dir)
+            output_hashes[out.path] = cache.save_to_cache(
+                path, files_cache_dir, checkout_modes=checkout_modes
+            )
         else:
             output_hashes[out.path] = None
 

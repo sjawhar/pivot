@@ -17,6 +17,7 @@ import loky
 
 from pivot import (
     cache,
+    config,
     console,
     dag,
     exceptions,
@@ -132,6 +133,9 @@ def run(
     # Load parameter overrides early to validate and prepare for workers
     overrides = parameters.load_params_yaml()
 
+    # Load checkout mode configuration
+    checkout_modes = config.get_checkout_mode_order()
+
     # Check for uncached IncrementalOut files that would be lost
     if not force:
         uncached = _check_uncached_incremental_outputs(execution_order, cache_dir)
@@ -166,6 +170,7 @@ def run(
         stage_timeout=stage_timeout,
         overrides=overrides,
         explain_mode=explain_mode,
+        checkout_modes=checkout_modes,
     )
 
     results = _build_results(stage_states)
@@ -274,9 +279,11 @@ def _execute_greedy(
     stage_timeout: float | None = None,
     overrides: parameters.ParamsOverrides | None = None,
     explain_mode: bool = False,
+    checkout_modes: list[str] | None = None,
 ) -> None:
     """Execute stages with greedy parallel scheduling using loky ProcessPoolExecutor."""
     overrides = overrides or {}
+    checkout_modes = checkout_modes or config.DEFAULT_CHECKOUT_MODE_ORDER
     completed_count = 0
     futures: dict[concurrent.futures.Future[StageResult], str] = {}
     mutex_counts: collections.defaultdict[str, int] = collections.defaultdict(int)
@@ -312,6 +319,7 @@ def _execute_greedy(
                 completed_count=completed_count,
                 overrides=overrides,
                 explain_mode=explain_mode,
+                checkout_modes=checkout_modes,
             )
 
             while futures:
@@ -434,6 +442,7 @@ def _execute_greedy(
                         completed_count=completed_count,
                         overrides=overrides,
                         explain_mode=explain_mode,
+                        checkout_modes=checkout_modes,
                     )
     finally:
         # Signal output thread to stop - may fail if queue is broken
@@ -477,8 +486,10 @@ def _start_ready_stages(
     completed_count: int,
     overrides: parameters.ParamsOverrides,
     explain_mode: bool = False,
+    checkout_modes: list[str] | None = None,
 ) -> None:
     """Find and start stages that are ready to execute."""
+    checkout_modes = checkout_modes or config.DEFAULT_CHECKOUT_MODE_ORDER
     started = 0
 
     for stage_name, state in stage_states.items():
@@ -508,7 +519,7 @@ def _start_ready_stages(
         for mutex in state.mutex:
             mutex_counts[mutex] += 1
 
-        worker_info = _prepare_worker_info(state.info, overrides)
+        worker_info = _prepare_worker_info(state.info, overrides, checkout_modes)
 
         try:
             future = executor.submit(
@@ -542,6 +553,7 @@ def _start_ready_stages(
 def _prepare_worker_info(
     stage_info: registry.RegistryStageInfo,
     overrides: parameters.ParamsOverrides,
+    checkout_modes: list[str],
 ) -> worker.WorkerStageInfo:
     """Prepare stage info for pickling to worker process."""
     return worker.WorkerStageInfo(
@@ -554,6 +566,7 @@ def _prepare_worker_info(
         variant=stage_info["variant"],
         overrides=overrides,
         cwd=stage_info["cwd"],
+        checkout_modes=checkout_modes,
     )
 
 

@@ -309,6 +309,11 @@ basedpyright .         # Type check
 - Must run all four: `ruff format .`, `ruff check .`, `basedpyright .`, `pytest tests/ -n auto`
 - Never say "done" without running these first.
 
+## Before Pushing to Git (Critical)
+
+- ALWAYS run all quality checks before `jj git push`: `uv run ruff format . && uv run ruff check . && uv run basedpyright . && uv run pytest tests/ -n auto`
+- CI will fail if checks don't pass locally.
+
 ## After Completing a Feature
 
 - Update the **Development Roadmap** in `README.md` to reflect completed work

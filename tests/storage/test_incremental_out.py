@@ -359,7 +359,7 @@ def test_executable_bit_restored_with_copy_mode(tmp_path: pathlib.Path) -> None:
 
     # Delete and restore with COPY mode
     cache.remove_output(test_dir)
-    cache.restore_from_cache(test_dir, output_hash, cache_dir, cache.LinkMode.COPY)
+    cache.restore_from_cache(test_dir, output_hash, cache_dir, cache.CheckoutMode.COPY)
 
     # Check executable bit is restored
     restored_exec = test_dir / "script.sh"

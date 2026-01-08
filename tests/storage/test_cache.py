@@ -299,12 +299,12 @@ def test_save_to_cache_read_only(tmp_path: pathlib.Path) -> None:
 
 
 def test_save_to_cache_creates_symlink(tmp_path: pathlib.Path) -> None:
-    """Original file is replaced with symlink to cache."""
+    """Original file is replaced with symlink to cache when SYMLINK mode used."""
     test_file = tmp_path / "file.txt"
     test_file.write_text("content")
     cache_dir = tmp_path / "cache"
 
-    cache.save_to_cache(test_file, cache_dir)
+    cache.save_to_cache(test_file, cache_dir, checkout_mode=cache.CheckoutMode.SYMLINK)
 
     assert test_file.is_symlink()
 
@@ -354,15 +354,19 @@ def test_save_atomic_no_partial(tmp_path: pathlib.Path) -> None:
 
 
 def test_restore_from_cache_creates_link(tmp_path: pathlib.Path) -> None:
-    """restore_from_cache creates symlink to cached file."""
+    """restore_from_cache creates symlink to cached file when SYMLINK mode used."""
     test_file = tmp_path / "file.txt"
     test_file.write_text("content")
     cache_dir = tmp_path / "cache"
 
-    output_hash = cache.save_to_cache(test_file, cache_dir)
+    output_hash = cache.save_to_cache(
+        test_file, cache_dir, checkout_mode=cache.CheckoutMode.SYMLINK
+    )
     test_file.unlink()
 
-    restored = cache.restore_from_cache(test_file, output_hash, cache_dir)
+    restored = cache.restore_from_cache(
+        test_file, output_hash, cache_dir, checkout_mode=cache.CheckoutMode.SYMLINK
+    )
 
     assert restored is True
     assert test_file.is_symlink()
@@ -406,11 +410,13 @@ def test_restore_directory_hardlink_mode(tmp_path: pathlib.Path) -> None:
     (subdir / "nested.txt").write_text("nested")
     cache_dir = tmp_path / "cache"
 
-    output_hash = cache.save_to_cache(test_dir, cache_dir, link_mode=cache.LinkMode.HARDLINK)
+    output_hash = cache.save_to_cache(
+        test_dir, cache_dir, checkout_mode=cache.CheckoutMode.HARDLINK
+    )
     cache.remove_output(test_dir)
 
     restored = cache.restore_from_cache(
-        test_dir, output_hash, cache_dir, link_mode=cache.LinkMode.HARDLINK
+        test_dir, output_hash, cache_dir, checkout_mode=cache.CheckoutMode.HARDLINK
     )
 
     assert restored is True
@@ -488,40 +494,42 @@ def test_unprotect(tmp_path: pathlib.Path) -> None:
     assert mode & stat.S_IWUSR
 
 
-# === Link Mode Tests ===
+# === Checkout Mode Tests ===
 
 
-def test_link_mode_symlink(tmp_path: pathlib.Path) -> None:
+def test_checkout_mode_symlink(tmp_path: pathlib.Path) -> None:
     """SYMLINK mode creates symlinks."""
     test_file = tmp_path / "file.txt"
     test_file.write_text("content")
     cache_dir = tmp_path / "cache"
 
-    cache.save_to_cache(test_file, cache_dir, link_mode=cache.LinkMode.SYMLINK)
+    cache.save_to_cache(test_file, cache_dir, checkout_mode=cache.CheckoutMode.SYMLINK)
 
     assert test_file.is_symlink()
 
 
-def test_link_mode_hardlink(tmp_path: pathlib.Path) -> None:
+def test_checkout_mode_hardlink(tmp_path: pathlib.Path) -> None:
     """HARDLINK mode creates hardlinks."""
     test_file = tmp_path / "file.txt"
     test_file.write_text("content")
     cache_dir = tmp_path / "cache"
 
-    output_hash = cache.save_to_cache(test_file, cache_dir, link_mode=cache.LinkMode.HARDLINK)
+    output_hash = cache.save_to_cache(
+        test_file, cache_dir, checkout_mode=cache.CheckoutMode.HARDLINK
+    )
     assert output_hash is not None
 
     cache_path = cache_dir / output_hash["hash"][:2] / output_hash["hash"][2:]
     assert test_file.stat().st_ino == cache_path.stat().st_ino
 
 
-def test_link_mode_copy(tmp_path: pathlib.Path) -> None:
+def test_checkout_mode_copy(tmp_path: pathlib.Path) -> None:
     """COPY mode creates separate copies."""
     test_file = tmp_path / "file.txt"
     test_file.write_text("content")
     cache_dir = tmp_path / "cache"
 
-    output_hash = cache.save_to_cache(test_file, cache_dir, link_mode=cache.LinkMode.COPY)
+    output_hash = cache.save_to_cache(test_file, cache_dir, checkout_mode=cache.CheckoutMode.COPY)
     assert output_hash is not None
 
     cache_path = cache_dir / output_hash["hash"][:2] / output_hash["hash"][2:]
@@ -539,9 +547,11 @@ def test_save_to_cache_idempotent_file(tmp_path: pathlib.Path) -> None:
     test_file.write_text("content")
     cache_dir = tmp_path / "cache"
 
-    h1 = cache.save_to_cache(test_file, cache_dir)
+    h1 = cache.save_to_cache(test_file, cache_dir, checkout_mode=cache.CheckoutMode.SYMLINK)
     assert test_file.is_symlink()
-    h2 = cache.save_to_cache(test_file, cache_dir)  # Should NOT raise ELOOP
+    h2 = cache.save_to_cache(
+        test_file, cache_dir, checkout_mode=cache.CheckoutMode.SYMLINK
+    )  # Should NOT raise ELOOP
 
     assert h1 == h2
     assert test_file.read_text() == "content"
@@ -554,18 +564,20 @@ def test_save_to_cache_idempotent_directory(tmp_path: pathlib.Path) -> None:
     (test_dir / "a.txt").write_text("a")
     cache_dir = tmp_path / "cache"
 
-    h1 = cache.save_to_cache(test_dir, cache_dir)
+    h1 = cache.save_to_cache(test_dir, cache_dir, checkout_mode=cache.CheckoutMode.SYMLINK)
     assert h1 is not None
     assert test_dir.is_symlink()
-    h2 = cache.save_to_cache(test_dir, cache_dir)  # Should NOT raise ELOOP
+    h2 = cache.save_to_cache(
+        test_dir, cache_dir, checkout_mode=cache.CheckoutMode.SYMLINK
+    )  # Should NOT raise ELOOP
     assert h2 is not None
 
     assert h1["hash"] == h2["hash"]
     assert (test_dir / "a.txt").read_text() == "a"
 
 
-def test_link_from_cache_idempotent_symlink(tmp_path: pathlib.Path) -> None:
-    """_link_from_cache skips if already correctly symlinked."""
+def test_checkout_from_cache_idempotent_symlink(tmp_path: pathlib.Path) -> None:
+    """_checkout_from_cache skips if already correctly symlinked."""
     test_file = tmp_path / "file.txt"
     test_file.write_text("content")
     cache_dir = tmp_path / "cache"
@@ -574,26 +586,28 @@ def test_link_from_cache_idempotent_symlink(tmp_path: pathlib.Path) -> None:
     assert output_hash is not None
     cache_path = cache.get_cache_path(cache_dir, output_hash["hash"])
 
-    # Call _link_from_cache again - should be idempotent
-    cache._link_from_cache(test_file, cache_path, cache.LinkMode.SYMLINK)
+    # Call _checkout_from_cache again - should be idempotent
+    cache._checkout_from_cache(test_file, cache_path, cache.CheckoutMode.SYMLINK)
 
     assert test_file.is_symlink()
     assert test_file.read_text() == "content"
 
 
-def test_link_from_cache_idempotent_hardlink(tmp_path: pathlib.Path) -> None:
-    """_link_from_cache skips if already correctly hardlinked."""
+def test_checkout_from_cache_idempotent_hardlink(tmp_path: pathlib.Path) -> None:
+    """_checkout_from_cache skips if already correctly hardlinked."""
     test_file = tmp_path / "file.txt"
     test_file.write_text("content")
     cache_dir = tmp_path / "cache"
 
-    output_hash = cache.save_to_cache(test_file, cache_dir, link_mode=cache.LinkMode.HARDLINK)
+    output_hash = cache.save_to_cache(
+        test_file, cache_dir, checkout_mode=cache.CheckoutMode.HARDLINK
+    )
     assert output_hash is not None
     cache_path = cache.get_cache_path(cache_dir, output_hash["hash"])
     original_inode = test_file.stat().st_ino
 
-    # Call _link_from_cache again - should be idempotent
-    cache._link_from_cache(test_file, cache_path, cache.LinkMode.HARDLINK)
+    # Call _checkout_from_cache again - should be idempotent
+    cache._checkout_from_cache(test_file, cache_path, cache.CheckoutMode.HARDLINK)
 
     assert test_file.stat().st_ino == original_inode
 
@@ -604,7 +618,7 @@ def test_save_to_cache_broken_symlink(tmp_path: pathlib.Path) -> None:
     test_file.write_text("content")
     cache_dir = tmp_path / "cache"
 
-    h1 = cache.save_to_cache(test_file, cache_dir)
+    h1 = cache.save_to_cache(test_file, cache_dir, checkout_mode=cache.CheckoutMode.SYMLINK)
     assert h1 is not None
     cache_path = cache.get_cache_path(cache_dir, h1["hash"])
 
@@ -616,7 +630,7 @@ def test_save_to_cache_broken_symlink(tmp_path: pathlib.Path) -> None:
     test_file.write_text("content")
 
     # Save again - should re-cache since symlink is broken
-    h2 = cache.save_to_cache(test_file, cache_dir)
+    h2 = cache.save_to_cache(test_file, cache_dir, checkout_mode=cache.CheckoutMode.SYMLINK)
     assert h2 is not None
     assert h2["hash"] == h1["hash"]
     assert test_file.is_symlink()
@@ -655,7 +669,9 @@ def test_get_symlink_cache_hash_extracts_hash(tmp_path: pathlib.Path) -> None:
     test_file.write_text("content")
     cache_dir = tmp_path / "cache"
 
-    output_hash = cache.save_to_cache(test_file, cache_dir)
+    output_hash = cache.save_to_cache(
+        test_file, cache_dir, checkout_mode=cache.CheckoutMode.SYMLINK
+    )
     assert output_hash is not None
 
     extracted = cache._get_symlink_cache_hash(test_file, cache_dir)
@@ -682,3 +698,163 @@ def test_get_symlink_cache_hash_returns_none_for_outside_cache(tmp_path: pathlib
 
     result = cache._get_symlink_cache_hash(link, cache_dir)
     assert result is None
+
+
+# === Link Mode Fallback Tests ===
+
+
+def test_checkout_with_fallback_uses_first_successful_mode(tmp_path: pathlib.Path) -> None:
+    """_checkout_with_fallback uses first mode that succeeds."""
+    cache_dir = tmp_path / "cache"
+    cache_path = cache_dir / "ab" / "cdef0123456789"
+    cache_path.parent.mkdir(parents=True)
+    cache_path.write_text("content")
+
+    target = tmp_path / "target.txt"
+
+    cache._checkout_with_fallback(
+        target, cache_path, [cache.CheckoutMode.HARDLINK, cache.CheckoutMode.COPY]
+    )
+
+    assert target.exists()
+    assert not target.is_symlink()
+    # Hardlink should share inode with cache
+    assert target.stat().st_ino == cache_path.stat().st_ino
+
+
+def test_checkout_with_fallback_falls_back_on_exdev(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """_checkout_with_fallback falls back to next mode on EXDEV error."""
+    import errno
+    import os
+
+    cache_dir = tmp_path / "cache"
+    cache_path = cache_dir / "ab" / "cdef0123456789"
+    cache_path.parent.mkdir(parents=True)
+    cache_path.write_text("content")
+
+    target = tmp_path / "target.txt"
+
+    # Mock os.link to raise EXDEV
+    def mock_link(src: str, dst: str) -> None:
+        raise OSError(errno.EXDEV, "Cross-device link")
+
+    monkeypatch.setattr(os, "link", mock_link)
+
+    cache._checkout_with_fallback(
+        target, cache_path, [cache.CheckoutMode.HARDLINK, cache.CheckoutMode.COPY]
+    )
+
+    assert target.exists()
+    # Should have fallen back to COPY, so different inode
+    assert target.stat().st_ino != cache_path.stat().st_ino
+    assert target.read_text() == "content"
+
+
+def test_checkout_with_fallback_raises_on_last_mode_failure(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """_checkout_with_fallback raises error when all modes fail."""
+    import errno
+    import os
+    import shutil
+
+    cache_dir = tmp_path / "cache"
+    cache_path = cache_dir / "ab" / "cdef0123456789"
+    cache_path.parent.mkdir(parents=True)
+    cache_path.write_text("content")
+
+    target = tmp_path / "target.txt"
+
+    # Mock both os.link and shutil.copy2 to fail
+    def mock_link(src: str, dst: str) -> None:
+        raise OSError(errno.EPERM, "Permission denied")
+
+    def mock_copy2(src: str, dst: str) -> None:
+        raise OSError(errno.EACCES, "Access denied")
+
+    monkeypatch.setattr(os, "link", mock_link)
+    monkeypatch.setattr(shutil, "copy2", mock_copy2)
+
+    with pytest.raises(OSError) as exc_info:
+        cache._checkout_with_fallback(
+            target, cache_path, [cache.CheckoutMode.HARDLINK, cache.CheckoutMode.COPY]
+        )
+
+    assert exc_info.value.errno == errno.EACCES
+
+
+def test_restore_from_cache_with_checkout_modes_list(tmp_path: pathlib.Path) -> None:
+    """restore_from_cache accepts checkout_modes list."""
+    test_file = tmp_path / "file.txt"
+    test_file.write_text("content")
+    cache_dir = tmp_path / "cache"
+
+    output_hash = cache.save_to_cache(test_file, cache_dir)
+
+    # Remove original
+    test_file.unlink()
+
+    # Restore with modes list
+    result = cache.restore_from_cache(
+        test_file,
+        output_hash,
+        cache_dir,
+        checkout_modes=[
+            cache.CheckoutMode.HARDLINK,
+            cache.CheckoutMode.SYMLINK,
+            cache.CheckoutMode.COPY,
+        ],
+    )
+
+    assert result is True
+    assert test_file.exists()
+
+
+def test_restore_from_cache_single_mode_raises_on_non_recoverable_error(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """restore_from_cache raises error for non-recoverable failures."""
+    import errno
+    import os
+
+    test_file = tmp_path / "file.txt"
+    test_file.write_text("content")
+    cache_dir = tmp_path / "cache"
+
+    output_hash = cache.save_to_cache(test_file, cache_dir)
+    test_file.unlink()
+
+    # Mock os.link to fail with EPERM (not in fallback list for _checkout_from_cache)
+    def mock_link(src: str, dst: str) -> None:
+        raise OSError(errno.EPERM, "Permission denied")
+
+    monkeypatch.setattr(os, "link", mock_link)
+
+    # EPERM is not handled internally by _checkout_from_cache for HARDLINK
+    with pytest.raises(OSError) as exc_info:
+        cache.restore_from_cache(
+            test_file,
+            output_hash,
+            cache_dir,
+            checkout_mode=cache.CheckoutMode.HARDLINK,
+        )
+
+    assert exc_info.value.errno == errno.EPERM
+
+
+def test_save_to_cache_with_checkout_modes_list(tmp_path: pathlib.Path) -> None:
+    """save_to_cache accepts checkout_modes list."""
+    test_file = tmp_path / "file.txt"
+    test_file.write_text("content")
+    cache_dir = tmp_path / "cache"
+
+    output_hash = cache.save_to_cache(
+        test_file,
+        cache_dir,
+        checkout_modes=[cache.CheckoutMode.HARDLINK, cache.CheckoutMode.SYMLINK],
+    )
+
+    assert output_hash is not None
+    assert "hash" in output_hash
