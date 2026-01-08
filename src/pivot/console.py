@@ -5,6 +5,8 @@ import time
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, TextIO
 
+import click
+
 from pivot.types import StageDisplayStatus, StageExplanation, StageStatus
 
 if TYPE_CHECKING:
@@ -60,6 +62,10 @@ class Console:
         prefix = "".join(_COLORS.get(c, "") for c in codes)
         return f"{prefix}{text}{_COLORS['reset']}"
 
+    def _echo(self, message: str) -> None:
+        """Output message, preserving ANSI codes when colors are enabled."""
+        click.echo(message, file=self.stream, color=self.use_color)
+
     def stage_start(
         self,
         name: str,
@@ -81,7 +87,7 @@ class Console:
             case StageDisplayStatus.WAITING:
                 status_text = self._color("waiting", "dim")
 
-        print(f"{progress} {name}: {status_text}...", file=self.stream, flush=True)
+        self._echo(f"{progress} {name}: {status_text}...")
 
     def stage_result(
         self,
@@ -115,7 +121,7 @@ class Console:
         if duration is not None:
             parts.append(self._color(f"[{duration:.2f}s]", "dim"))
 
-        print(" ".join(parts), file=self.stream, flush=True)
+        self._echo(" ".join(parts))
         self._current_stage = None
         self._stage_start = None
 
@@ -123,7 +129,7 @@ class Console:
         """Print parallel group start message."""
         stages_str = ", ".join(stage_names)
         header = self._color(f"=== Parallel group {group_index} ===", "cyan", "bold")
-        print(f"\n{header} ({len(stage_names)} stages: {stages_str})", file=self.stream, flush=True)
+        self._echo(f"\n{header} ({len(stage_names)} stages: {stages_str})")
 
     def summary(
         self,
@@ -133,7 +139,7 @@ class Console:
         total_duration: float,
     ) -> None:
         """Print execution summary."""
-        print("", file=self.stream)  # blank line
+        self._echo("")  # blank line
 
         ran_text = self._color(str(ran), "green") if ran > 0 else str(ran)
         skipped_text = self._color(str(skipped), "yellow") if skipped > 0 else str(skipped)
@@ -142,18 +148,18 @@ class Console:
         summary = f"Summary: {ran_text} ran, {skipped_text} skipped, {failed_text} failed"
         duration = self._color(f"[{total_duration:.2f}s total]", "dim")
 
-        print(f"{summary} {duration}", file=self.stream, flush=True)
+        self._echo(f"{summary} {duration}")
 
     def error(self, message: str) -> None:
         """Print error message."""
         prefix = self._color("Error:", "red", "bold")
-        print(f"{prefix} {message}", file=self.stream, flush=True)
+        self._echo(f"{prefix} {message}")
 
     def stage_output(self, name: str, line: str, is_stderr: bool = False) -> None:
         """Print captured stage output."""
         prefix = self._color(f"  [{name}]", "dim")
         line_colored = self._color(line, "red") if is_stderr else line
-        print(f"{prefix} {line_colored}", file=self.stream, flush=True)
+        self._echo(f"{prefix} {line_colored}")
 
     def watch_start(self, paths: list[pathlib.Path]) -> None:
         """Print watch mode startup message."""
@@ -161,13 +167,13 @@ class Console:
         paths_str = ", ".join(str(p) for p in paths[:3])
         if len(paths) > 3:
             paths_str += f" (+{len(paths) - 3} more)"
-        print(f"\n{header}", file=self.stream, flush=True)
-        print(f"Watching: {paths_str}", file=self.stream, flush=True)
+        self._echo(f"\n{header}")
+        self._echo(f"Watching: {paths_str}")
 
     def watch_waiting(self) -> None:
         """Print waiting for changes message."""
         msg = self._color("Waiting for file changes... (Ctrl+C to exit)", "dim")
-        print(f"\n{msg}\n", file=self.stream, flush=True)
+        self._echo(f"\n{msg}\n")
 
     def watch_changes_detected(self, changes: "Set[tuple[Change, str]]") -> None:
         """Print detected changes summary."""
@@ -176,12 +182,12 @@ class Console:
         if len(files) > 5:
             files_str += f" (+{len(files) - 5} more)"
         header = self._color("Changes detected:", "yellow", "bold")
-        print(f"\n{header} {files_str}", file=self.stream, flush=True)
+        self._echo(f"\n{header} {files_str}")
 
     def watch_stopped(self) -> None:
         """Print watch mode stopped message."""
         msg = self._color("\nWatch mode stopped", "cyan")
-        print(msg, file=self.stream, flush=True)
+        self._echo(msg)
 
     def _print_changes(
         self,
@@ -195,7 +201,7 @@ class Console:
         if not changes:
             return
 
-        print(f"\n  {self._color(header, 'cyan')}", file=self.stream, flush=True)
+        self._echo(f"\n  {self._color(header, 'cyan')}")
 
         for change in changes:
             key = change[key_field]
@@ -203,31 +209,15 @@ class Console:
             old_val = change[old_field]
             new_val = change[new_field]
 
-            print(f"    {key}", file=self.stream, flush=True)
+            self._echo(f"    {key}")
 
             if change_type == "modified":
-                print(
-                    f"      Old: {self._color(str(old_val) if old_val else 'N/A', 'red')}",
-                    file=self.stream,
-                    flush=True,
-                )
-                print(
-                    f"      New: {self._color(str(new_val) if new_val else 'N/A', 'green')}",
-                    file=self.stream,
-                    flush=True,
-                )
+                self._echo(f"      Old: {self._color(str(old_val) if old_val else 'N/A', 'red')}")
+                self._echo(f"      New: {self._color(str(new_val) if new_val else 'N/A', 'green')}")
             elif change_type == "added":
-                print(
-                    f"      {self._color('(added)', 'green')} {new_val}",
-                    file=self.stream,
-                    flush=True,
-                )
+                self._echo(f"      {self._color('(added)', 'green')} {new_val}")
             else:
-                print(
-                    f"      {self._color('(removed)', 'red')} {old_val}",
-                    file=self.stream,
-                    flush=True,
-                )
+                self._echo(f"      {self._color('(removed)', 'red')} {old_val}")
 
     def explain_stage(self, explanation: StageExplanation) -> None:
         """Print detailed explanation of why a stage would run."""
@@ -235,15 +225,15 @@ class Console:
         will_run = explanation["will_run"]
         reason = explanation["reason"]
 
-        print(f"\nStage: {self._color(name, 'bold')}", file=self.stream, flush=True)
+        self._echo(f"\nStage: {self._color(name, 'bold')}")
 
         status_text = (
             self._color("WILL RUN", "green", "bold") if will_run else self._color("SKIP", "yellow")
         )
-        print(f"  Status: {status_text}", file=self.stream, flush=True)
+        self._echo(f"  Status: {status_text}")
 
         if reason:
-            print(f"  Reason: {reason}", file=self.stream, flush=True)
+            self._echo(f"  Reason: {reason}")
 
         self._print_changes(
             "Code Changes:", explanation["code_changes"], "key", "old_hash", "new_hash"
@@ -257,14 +247,10 @@ class Console:
 
     def explain_summary(self, will_run: int, unchanged: int) -> None:
         """Print summary after explain output."""
-        print("", file=self.stream)
+        self._echo("")
         run_text = self._color(str(will_run), "green") if will_run > 0 else str(will_run)
         unchanged_text = self._color(str(unchanged), "yellow") if unchanged > 0 else str(unchanged)
-        print(
-            f"Summary: {run_text} will run, {unchanged_text} unchanged",
-            file=self.stream,
-            flush=True,
-        )
+        self._echo(f"Summary: {run_text} will run, {unchanged_text} unchanged")
 
 
 # Global console instance for convenience
