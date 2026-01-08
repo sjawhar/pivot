@@ -69,9 +69,17 @@ def test_state_cache_miss_inode(tmp_path: pathlib.Path) -> None:
     with state.StateDB(db_path) as db:
         db.save(test_file, old_stat, "abc123")
 
+        # Force inode change by writing to temp file and renaming
+        # (unlink + write may reuse the same inode on some filesystems)
+        temp_file = tmp_path / "file.txt.tmp"
+        temp_file.write_text("content")
         test_file.unlink()
-        test_file.write_text("content")
+        temp_file.rename(test_file)
         new_stat = test_file.stat()
+
+        # Verify inode actually changed (skip if filesystem reuses inodes)
+        if new_stat.st_ino == old_stat.st_ino:
+            pytest.skip("Filesystem reused inode - cannot test inode change detection")
 
         result = db.get(test_file, new_stat)
 
@@ -305,3 +313,192 @@ def test_state_raises_after_close(tmp_path: pathlib.Path) -> None:
 
     with pytest.raises(RuntimeError, match="closed StateDB"):
         db.get(test_file, file_stat)
+
+
+# -----------------------------------------------------------------------------
+# Generation tracking tests
+# -----------------------------------------------------------------------------
+
+
+def test_generation_get_nonexistent(tmp_path: pathlib.Path) -> None:
+    """Getting generation for untracked path returns None."""
+    db_path = tmp_path / "state.db"
+    test_file = tmp_path / "output.txt"
+
+    with state.StateDB(db_path) as db:
+        result = db.get_generation(test_file)
+
+    assert result is None
+
+
+def test_generation_increment_creates_new(tmp_path: pathlib.Path) -> None:
+    """Incrementing untracked path creates it with generation 1."""
+    db_path = tmp_path / "state.db"
+    test_file = tmp_path / "output.txt"
+
+    with state.StateDB(db_path) as db:
+        gen = db.increment_generation(test_file)
+        assert gen == 1
+        assert db.get_generation(test_file) == 1
+
+
+def test_generation_increment_existing(tmp_path: pathlib.Path) -> None:
+    """Incrementing tracked path increases generation."""
+    db_path = tmp_path / "state.db"
+    test_file = tmp_path / "output.txt"
+
+    with state.StateDB(db_path) as db:
+        db.increment_generation(test_file)
+        db.increment_generation(test_file)
+        gen = db.increment_generation(test_file)
+
+    assert gen == 3
+
+
+def test_generation_persistence(tmp_path: pathlib.Path) -> None:
+    """Generations persist across DB instances."""
+    db_path = tmp_path / "state.db"
+    test_file = tmp_path / "output.txt"
+
+    with state.StateDB(db_path) as db:
+        db.increment_generation(test_file)
+        db.increment_generation(test_file)
+
+    with state.StateDB(db_path) as db:
+        assert db.get_generation(test_file) == 2
+        gen = db.increment_generation(test_file)
+        assert gen == 3
+
+
+def test_generation_get_many(tmp_path: pathlib.Path) -> None:
+    """Batch query returns generations for multiple paths."""
+    db_path = tmp_path / "state.db"
+    files = [tmp_path / f"file_{i}.txt" for i in range(3)]
+
+    with state.StateDB(db_path) as db:
+        db.increment_generation(files[0])
+        db.increment_generation(files[0])
+        db.increment_generation(files[1])
+        # files[2] not tracked
+
+        results = db.get_many_generations(files)
+
+    assert results[files[0]] == 2
+    assert results[files[1]] == 1
+    assert results[files[2]] is None
+
+
+def test_generation_get_many_empty(tmp_path: pathlib.Path) -> None:
+    """Batch query with empty list returns empty dict."""
+    db_path = tmp_path / "state.db"
+
+    with state.StateDB(db_path) as db:
+        results = db.get_many_generations([])
+
+    assert results == {}
+
+
+def test_dep_generations_get_nonexistent(tmp_path: pathlib.Path) -> None:
+    """Getting dep generations for unknown stage returns None."""
+    db_path = tmp_path / "state.db"
+
+    with state.StateDB(db_path) as db:
+        result = db.get_dep_generations("unknown_stage")
+
+    assert result is None
+
+
+def test_dep_generations_record_and_get(tmp_path: pathlib.Path) -> None:
+    """Record and retrieve dependency generations."""
+    db_path = tmp_path / "state.db"
+    deps = {"/path/to/dep1.csv": 5, "/path/to/dep2.csv": 3}
+
+    with state.StateDB(db_path) as db:
+        db.record_dep_generations("my_stage", deps)
+        result = db.get_dep_generations("my_stage")
+
+    assert result == deps
+
+
+def test_dep_generations_update_replaces(tmp_path: pathlib.Path) -> None:
+    """Recording dep generations replaces previous values."""
+    db_path = tmp_path / "state.db"
+    old_deps = {"/path/to/dep1.csv": 1, "/path/to/dep2.csv": 2}
+    new_deps = {"/path/to/dep1.csv": 5, "/path/to/dep3.csv": 1}
+
+    with state.StateDB(db_path) as db:
+        db.record_dep_generations("my_stage", old_deps)
+        db.record_dep_generations("my_stage", new_deps)
+        result = db.get_dep_generations("my_stage")
+
+    assert result == new_deps, "Old deps should be replaced, not merged"
+
+
+def test_dep_generations_multiple_stages(tmp_path: pathlib.Path) -> None:
+    """Different stages have independent dep generations."""
+    db_path = tmp_path / "state.db"
+    stage1_deps = {"/dep1.csv": 1}
+    stage2_deps = {"/dep2.csv": 2, "/dep3.csv": 3}
+
+    with state.StateDB(db_path) as db:
+        db.record_dep_generations("stage1", stage1_deps)
+        db.record_dep_generations("stage2", stage2_deps)
+
+        result1 = db.get_dep_generations("stage1")
+        result2 = db.get_dep_generations("stage2")
+
+    assert result1 == stage1_deps
+    assert result2 == stage2_deps
+
+
+def test_dep_generations_persistence(tmp_path: pathlib.Path) -> None:
+    """Dep generations persist across DB instances."""
+    db_path = tmp_path / "state.db"
+    deps = {"/path/to/dep.csv": 42}
+
+    with state.StateDB(db_path) as db:
+        db.record_dep_generations("my_stage", deps)
+
+    with state.StateDB(db_path) as db:
+        result = db.get_dep_generations("my_stage")
+
+    assert result == deps
+
+
+# -----------------------------------------------------------------------------
+# Symlink handling tests
+# -----------------------------------------------------------------------------
+
+
+def test_generation_tracks_logical_path_not_symlink_target(tmp_path: pathlib.Path) -> None:
+    """Generation tracking uses logical paths, not resolved symlink targets.
+
+    This is critical because Pivot outputs become symlinks to cache after execution.
+    If we resolved symlinks, the generation key would change every time the file's
+    hash changes (different cache path). We need to track the DECLARED path.
+    """
+    db_path = tmp_path / "state.db"
+    real_dir = tmp_path / "real_data"
+    real_dir.mkdir()
+    output_file = real_dir / "output.csv"
+
+    symlink_dir = tmp_path / "data"
+    symlink_dir.symlink_to(real_dir)
+    symlinked_path = symlink_dir / "output.csv"
+
+    with state.StateDB(db_path) as db:
+        # Increment via symlink path
+        gen1 = db.increment_generation(symlinked_path)
+        assert gen1 == 1
+
+        # Get via real path - should be INDEPENDENT (different logical path)
+        gen_via_real = db.get_generation(output_file)
+        assert gen_via_real is None, "Different logical paths should have independent generations"
+
+        # Increment via real path - starts fresh
+        gen2 = db.increment_generation(output_file)
+        assert gen2 == 1, "Real path should start at generation 1"
+
+        # Symlink path still has its own generation
+        gen_via_symlink = db.get_generation(symlinked_path)
+        assert gen_via_symlink == 1, "Symlink path generation unchanged"

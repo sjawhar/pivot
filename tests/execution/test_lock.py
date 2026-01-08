@@ -425,9 +425,9 @@ def test_concurrent_same_stage_writes(tmp_path: Path) -> None:
     stage_lock = lock.StageLock("shared", tmp_path)
     final = stage_lock.read()
     assert final is not None
-    params = final.get("params")
-    assert params is not None, "params should be present in lock data"
-    assert params["thread_id"] in range(20), "Final value should be from one of the threads"
+    assert final["params"]["thread_id"] in range(20), (
+        "Final value should be from one of the threads"
+    )
 
     tmp_files = list(tmp_path.rglob("*.tmp"))
     assert len(tmp_files) == 0, f"Orphaned temp files: {tmp_files}"
@@ -500,5 +500,6 @@ def test_is_changed_with_null_values_triggers_rerun(tmp_path: Path) -> None:
         dep_hashes={},
     )
 
-    # Null values are not valid - triggers re-run
+    # Null values are not valid - triggers re-run (read() returns None, treated as no previous run)
     assert changed is True
+    assert "no previous run" in reason.lower()

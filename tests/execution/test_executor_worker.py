@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from pivot import exceptions, executor, lock
+from pivot import cache, exceptions, executor, lock, outputs
 from pivot.executor import worker
 
 if TYPE_CHECKING:
@@ -33,11 +33,11 @@ def _helper_always_fail_takeover(sentinel: pathlib.Path, stale_pid: int | None) 
 
 
 # =============================================================================
-# execute_stage_worker Tests
+# execute_stage Tests
 # =============================================================================
 
 
-def test_execute_stage_worker_with_missing_deps(worker_env: pathlib.Path) -> None:
+def test_execute_stage_with_missing_deps(worker_env: pathlib.Path) -> None:
     """Worker returns failed status when dependency files are missing."""
     stage_info: WorkerStageInfo = {
         "func": lambda: None,
@@ -51,7 +51,7 @@ def test_execute_stage_worker_with_missing_deps(worker_env: pathlib.Path) -> Non
         "cwd": None,
     }
 
-    result = executor.execute_stage_worker(
+    result = executor.execute_stage(
         "test_stage",
         stage_info,
         worker_env,
@@ -63,9 +63,7 @@ def test_execute_stage_worker_with_missing_deps(worker_env: pathlib.Path) -> Non
     assert "missing_file.txt" in result["reason"]
 
 
-def test_execute_stage_worker_with_directory_dep(
-    worker_env: pathlib.Path, tmp_path: pathlib.Path
-) -> None:
+def test_execute_stage_with_directory_dep(worker_env: pathlib.Path, tmp_path: pathlib.Path) -> None:
     """Worker hashes directory dependency and runs stage."""
     data_dir = tmp_path / "data_dir"
     data_dir.mkdir()
@@ -86,7 +84,7 @@ def test_execute_stage_worker_with_directory_dep(
         "cwd": None,
     }
 
-    result = executor.execute_stage_worker(
+    result = executor.execute_stage(
         "test_stage",
         stage_info,
         worker_env,
@@ -97,7 +95,7 @@ def test_execute_stage_worker_with_directory_dep(
     assert (tmp_path / "output.txt").read_text() == "done"
 
 
-def test_execute_stage_worker_runs_unchanged_stage(
+def test_execute_stage_runs_unchanged_stage(
     worker_env: pathlib.Path, tmp_path: pathlib.Path
 ) -> None:
     """Worker skips stage when fingerprint matches and deps unchanged."""
@@ -119,7 +117,7 @@ def test_execute_stage_worker_runs_unchanged_stage(
     }
 
     # First run - creates lock file
-    result1 = executor.execute_stage_worker(
+    result1 = executor.execute_stage(
         "test_stage",
         stage_info,
         worker_env,
@@ -129,7 +127,7 @@ def test_execute_stage_worker_runs_unchanged_stage(
     assert (tmp_path / "output.txt").read_text() == "result"
 
     # Second run - should skip (unchanged)
-    result2 = executor.execute_stage_worker(
+    result2 = executor.execute_stage(
         "test_stage",
         stage_info,
         worker_env,
@@ -139,7 +137,7 @@ def test_execute_stage_worker_runs_unchanged_stage(
     assert result2["reason"] == "unchanged"
 
 
-def test_execute_stage_worker_reruns_when_fingerprint_changes(
+def test_execute_stage_reruns_when_fingerprint_changes(
     worker_env: pathlib.Path, tmp_path: pathlib.Path
 ) -> None:
     """Worker reruns stage when code fingerprint changes."""
@@ -163,7 +161,7 @@ def test_execute_stage_worker_reruns_when_fingerprint_changes(
     }
 
     # First run
-    result1 = executor.execute_stage_worker(
+    result1 = executor.execute_stage(
         "test_stage",
         stage_info_v1,
         worker_env,
@@ -177,7 +175,7 @@ def test_execute_stage_worker_reruns_when_fingerprint_changes(
         **stage_info_v1,
         "fingerprint": {"self:stage_func_v1": "fp_v2"},
     }
-    result2 = executor.execute_stage_worker(
+    result2 = executor.execute_stage(
         "test_stage",
         stage_info_v2,
         worker_env,
@@ -188,7 +186,7 @@ def test_execute_stage_worker_reruns_when_fingerprint_changes(
     assert counter.read_text() == "2"
 
 
-def test_execute_stage_worker_handles_stage_exception(
+def test_execute_stage_handles_stage_exception(
     worker_env: pathlib.Path, tmp_path: pathlib.Path
 ) -> None:
     """Worker returns failed status when stage raises exception."""
@@ -209,7 +207,7 @@ def test_execute_stage_worker_handles_stage_exception(
         "cwd": None,
     }
 
-    result = executor.execute_stage_worker(
+    result = executor.execute_stage(
         "test_stage",
         stage_info,
         worker_env,
@@ -220,9 +218,7 @@ def test_execute_stage_worker_handles_stage_exception(
     assert "Stage failed intentionally" in result["reason"]
 
 
-def test_execute_stage_worker_handles_sys_exit(
-    worker_env: pathlib.Path, tmp_path: pathlib.Path
-) -> None:
+def test_execute_stage_handles_sys_exit(worker_env: pathlib.Path, tmp_path: pathlib.Path) -> None:
     """Worker catches sys.exit and returns failed status."""
     (tmp_path / "input.txt").write_text("data")
 
@@ -241,7 +237,7 @@ def test_execute_stage_worker_handles_sys_exit(
         "cwd": None,
     }
 
-    result = executor.execute_stage_worker(
+    result = executor.execute_stage(
         "test_stage",
         stage_info,
         worker_env,
@@ -253,7 +249,7 @@ def test_execute_stage_worker_handles_sys_exit(
     assert "42" in result["reason"]
 
 
-def test_execute_stage_worker_handles_keyboard_interrupt(
+def test_execute_stage_handles_keyboard_interrupt(
     worker_env: pathlib.Path, tmp_path: pathlib.Path
 ) -> None:
     """Worker returns failed status for KeyboardInterrupt."""
@@ -274,7 +270,7 @@ def test_execute_stage_worker_handles_keyboard_interrupt(
         "cwd": None,
     }
 
-    result = executor.execute_stage_worker(
+    result = executor.execute_stage(
         "test_stage",
         stage_info,
         worker_env,
@@ -969,8 +965,8 @@ def test_hash_file_produces_consistent_hash(tmp_path: pathlib.Path) -> None:
     file_path = tmp_path / "test.txt"
     file_path.write_text("test content")
 
-    hash1 = executor.hash_file(file_path)
-    hash2 = executor.hash_file(file_path)
+    hash1 = cache.hash_file(file_path)
+    hash2 = cache.hash_file(file_path)
 
     assert hash1 == hash2
     assert len(hash1) == 16  # xxhash64 hexdigest
@@ -983,7 +979,341 @@ def test_hash_file_different_for_different_content(tmp_path: pathlib.Path) -> No
     file1.write_text("content1")
     file2.write_text("content2")
 
-    hash1 = executor.hash_file(file1)
-    hash2 = executor.hash_file(file2)
+    hash1 = cache.hash_file(file1)
+    hash2 = cache.hash_file(file2)
 
     assert hash1 != hash2
+
+
+# =============================================================================
+# Generation Tracking Tests
+# =============================================================================
+
+
+def test_generation_skip_on_second_run(worker_env: pathlib.Path, tmp_path: pathlib.Path) -> None:
+    """Second run uses generation-based skip detection."""
+
+    (tmp_path / "input.txt").write_text("data")
+
+    def stage_func() -> None:
+        (tmp_path / "output.txt").write_text("result")
+
+    out = outputs.Out(str(tmp_path / "output.txt"))
+    stage_info: WorkerStageInfo = {
+        "func": stage_func,
+        "fingerprint": {"self:stage_func": "fp123"},
+        "deps": ["input.txt"],
+        "signature": None,
+        "outs": [out],
+        "params": None,
+        "variant": None,
+        "overrides": {},
+        "cwd": None,
+    }
+
+    # First run - creates output and records generations
+    result1 = executor.execute_stage(
+        "test_stage",
+        stage_info,
+        worker_env,
+        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
+    )
+    assert result1["status"] == "ran"
+    assert (tmp_path / "output.txt").read_text() == "result"
+
+    # Second run - should skip via generation check
+    result2 = executor.execute_stage(
+        "test_stage",
+        stage_info,
+        worker_env,
+        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
+    )
+    assert result2["status"] == "skipped"
+    # Falls back to hash-based skip because input.txt is external (no generation tracking)
+    assert "unchanged" in result2["reason"]
+
+
+def test_generation_mismatch_triggers_rerun(
+    worker_env: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    """Stage re-runs when dependency generation changes."""
+
+    # Create input file (external dependency - no generation tracking)
+    (tmp_path / "input.txt").write_text("original")
+
+    def step1_func() -> None:
+        data = (tmp_path / "input.txt").read_text()
+        (tmp_path / "intermediate.txt").write_text(data.upper())
+
+    def step2_func() -> None:
+        data = (tmp_path / "intermediate.txt").read_text()
+        (tmp_path / "final.txt").write_text(f"Final: {data}")
+
+    step1_out = outputs.Out(str(tmp_path / "intermediate.txt"))
+    step2_out = outputs.Out(str(tmp_path / "final.txt"))
+
+    step1_info: WorkerStageInfo = {
+        "func": step1_func,
+        "fingerprint": {"self:step1": "fp1"},
+        "deps": ["input.txt"],
+        "signature": None,
+        "outs": [step1_out],
+        "params": None,
+        "variant": None,
+        "overrides": {},
+        "cwd": None,
+    }
+
+    step2_info: WorkerStageInfo = {
+        "func": step2_func,
+        "fingerprint": {"self:step2": "fp2"},
+        "deps": ["intermediate.txt"],
+        "signature": None,
+        "outs": [step2_out],
+        "params": None,
+        "variant": None,
+        "overrides": {},
+        "cwd": None,
+    }
+
+    # First run - both stages execute
+    result1_step1 = executor.execute_stage(
+        "step1",
+        step1_info,
+        worker_env,
+        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
+    )
+    assert result1_step1["status"] == "ran"
+    result1_step2 = executor.execute_stage(
+        "step2",
+        step2_info,
+        worker_env,
+        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
+    )
+    assert result1_step2["status"] == "ran"
+    assert (tmp_path / "final.txt").read_text() == "Final: ORIGINAL"
+
+    # Second run - both should skip
+    result2_step1 = executor.execute_stage(
+        "step1",
+        step1_info,
+        worker_env,
+        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
+    )
+    assert result2_step1["status"] == "skipped"
+    result2_step2 = executor.execute_stage(
+        "step2",
+        step2_info,
+        worker_env,
+        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
+    )
+    assert result2_step2["status"] == "skipped"
+
+    # Change input - step1 should re-run
+    (tmp_path / "input.txt").write_text("modified")
+    result3_step1 = executor.execute_stage(
+        "step1",
+        step1_info,
+        worker_env,
+        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
+    )
+    assert result3_step1["status"] == "ran"
+
+    # step2 should re-run because intermediate.txt generation changed
+    result3_step2 = executor.execute_stage(
+        "step2",
+        step2_info,
+        worker_env,
+        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
+    )
+    assert result3_step2["status"] == "ran"
+    assert (tmp_path / "final.txt").read_text() == "Final: MODIFIED"
+
+
+def test_external_file_fallback_to_hash_check(
+    worker_env: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    """External files (no generation) trigger fallback to hash-based check."""
+
+    # Create external input file (not a Pivot output, so no generation)
+    (tmp_path / "external_data.txt").write_text("external")
+
+    def stage_func() -> None:
+        data = (tmp_path / "external_data.txt").read_text()
+        (tmp_path / "output.txt").write_text(data.upper())
+
+    out = outputs.Out(str(tmp_path / "output.txt"))
+    stage_info: WorkerStageInfo = {
+        "func": stage_func,
+        "fingerprint": {"self:stage_func": "fp123"},
+        "deps": ["external_data.txt"],
+        "signature": None,
+        "outs": [out],
+        "params": None,
+        "variant": None,
+        "overrides": {},
+        "cwd": None,
+    }
+
+    # First run
+    result1 = executor.execute_stage(
+        "test_stage",
+        stage_info,
+        worker_env,
+        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
+    )
+    assert result1["status"] == "ran"
+    assert (tmp_path / "output.txt").read_text() == "EXTERNAL"
+
+    # Second run - should skip (external file has no generation, falls back to hash)
+    result2 = executor.execute_stage(
+        "test_stage",
+        stage_info,
+        worker_env,
+        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
+    )
+    assert result2["status"] == "skipped"
+
+    # Modify external file - should detect change via hash fallback
+    (tmp_path / "external_data.txt").write_text("changed")
+    result3 = executor.execute_stage(
+        "test_stage",
+        stage_info,
+        worker_env,
+        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
+    )
+    assert result3["status"] == "ran"
+    assert (tmp_path / "output.txt").read_text() == "CHANGED"
+
+
+def test_deps_list_change_triggers_rerun(worker_env: pathlib.Path, tmp_path: pathlib.Path) -> None:
+    """Changing deps list (even with same fingerprint) triggers re-run via hash check.
+
+    Generation tracking only checks current deps, so removing a dep from the list
+    could cause incorrect skips. This is mitigated because:
+    1. In real usage, deps come from @stage decorator which affects fingerprint
+    2. The hash-based fallback compares full dep_hashes dict which catches changes
+
+    This test verifies the hash-based fallback catches deps list changes.
+    """
+    (tmp_path / "dep_a.txt").write_text("A")
+    (tmp_path / "dep_b.txt").write_text("B")
+
+    def stage_func() -> None:
+        (tmp_path / "output.txt").write_text("done")
+
+    out = outputs.Out(str(tmp_path / "output.txt"))
+
+    # First run with deps=[A, B]
+    stage_info_v1: WorkerStageInfo = {
+        "func": stage_func,
+        "fingerprint": {"self:stage": "fp1"},
+        "deps": [str(tmp_path / "dep_a.txt"), str(tmp_path / "dep_b.txt")],
+        "signature": None,
+        "outs": [out],
+        "params": None,
+        "variant": None,
+        "overrides": {},
+        "cwd": None,
+    }
+
+    result1 = executor.execute_stage(
+        "test_stage",
+        stage_info_v1,
+        worker_env,
+        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
+    )
+    assert result1["status"] == "ran"
+
+    # Second run with same config - should skip
+    result2 = executor.execute_stage(
+        "test_stage",
+        stage_info_v1,
+        worker_env,
+        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
+    )
+    assert result2["status"] == "skipped"
+
+    # Third run with deps=[A] only (B removed), DIFFERENT fingerprint
+    # This simulates real usage where changing @stage(deps=...) changes fingerprint
+    stage_info_v2: WorkerStageInfo = {
+        "func": stage_func,
+        "fingerprint": {"self:stage": "fp2"},  # Different fingerprint
+        "deps": [str(tmp_path / "dep_a.txt")],  # B removed
+        "signature": None,
+        "outs": [out],
+        "params": None,
+        "variant": None,
+        "overrides": {},
+        "cwd": None,
+    }
+
+    result3 = executor.execute_stage(
+        "test_stage",
+        stage_info_v2,
+        worker_env,
+        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
+    )
+    assert result3["status"] == "ran", "Fingerprint change should trigger re-run"
+
+
+def test_deps_list_change_same_fingerprint_detected_by_hash(
+    worker_env: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    """Even with same fingerprint, deps list change is caught by hash comparison.
+
+    This is a safety test for the edge case where fingerprint somehow stays same
+    but deps list changes. The hash-based fallback should catch this.
+    """
+    (tmp_path / "dep_a.txt").write_text("A")
+    (tmp_path / "dep_b.txt").write_text("B")
+
+    def stage_func() -> None:
+        (tmp_path / "output.txt").write_text("done")
+
+    out = outputs.Out(str(tmp_path / "output.txt"))
+
+    # First run with deps=[A, B]
+    stage_info_v1: WorkerStageInfo = {
+        "func": stage_func,
+        "fingerprint": {"self:stage": "fp_same"},
+        "deps": [str(tmp_path / "dep_a.txt"), str(tmp_path / "dep_b.txt")],
+        "signature": None,
+        "outs": [out],
+        "params": None,
+        "variant": None,
+        "overrides": {},
+        "cwd": None,
+    }
+
+    result1 = executor.execute_stage(
+        "test_stage",
+        stage_info_v1,
+        worker_env,
+        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
+    )
+    assert result1["status"] == "ran"
+
+    # Second run with deps=[A] only (B removed), SAME fingerprint
+    # Generation tracking would miss this, but hash comparison catches it
+    stage_info_v2: WorkerStageInfo = {
+        "func": stage_func,
+        "fingerprint": {"self:stage": "fp_same"},  # Same fingerprint!
+        "deps": [str(tmp_path / "dep_a.txt")],  # B removed
+        "signature": None,
+        "outs": [out],
+        "params": None,
+        "variant": None,
+        "overrides": {},
+        "cwd": None,
+    }
+
+    result2 = executor.execute_stage(
+        "test_stage",
+        stage_info_v2,
+        worker_env,
+        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
+    )
+    assert result2["status"] == "ran", (
+        "Deps list change should trigger re-run even with same fingerprint"
+    )

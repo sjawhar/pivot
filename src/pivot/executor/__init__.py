@@ -4,7 +4,3 @@ from pivot.executor.core import run as run
 from pivot.executor.worker import WorkerStageInfo as WorkerStageInfo
 from pivot.executor.worker import execute_stage as execute_stage
 from pivot.executor.worker import hash_dependencies as hash_dependencies
-from pivot.executor.worker import hash_file as hash_file
-
-# Backwards compatibility alias
-execute_stage_worker = execute_stage
