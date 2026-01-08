@@ -1,0 +1,14 @@
+stages:
+  preprocess:
+    python: stages.preprocess
+    deps:
+      - data/raw.csv
+    outs:
+      - data/clean.csv
+
+  train:
+    python: stages.train
+    deps:
+      - data/clean.csv
+    outs:
+      - models/model.pkl
