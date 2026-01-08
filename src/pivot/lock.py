@@ -34,7 +34,7 @@ _MAX_STAGE_NAME_LEN = 200  # Leave room for ".lock" suffix within filesystem NAM
 _VALID_LOCK_KEYS = frozenset({"code_manifest", "params", "deps", "outs"})
 
 
-def _is_lock_data(data: object) -> TypeGuard[StorageLockData]:
+def is_lock_data(data: object) -> TypeGuard[StorageLockData]:
     """Validate that parsed YAML has valid storage format structure."""
     if not isinstance(data, dict):
         return False
@@ -136,7 +136,7 @@ class StageLock:
         try:
             with open(self.path) as f:
                 data: object = yaml.load(f, Loader=yaml_config.Loader)
-            if not _is_lock_data(data):
+            if not is_lock_data(data):
                 return None  # Treat corrupted/invalid file as missing
             return _convert_from_storage_format(data)
         except (FileNotFoundError, UnicodeDecodeError, yaml.YAMLError):
