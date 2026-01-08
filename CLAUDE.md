@@ -226,6 +226,37 @@ tree = ast.parse(source)
 - Use early `return`/`continue` to keep main logic at top indentation level.
 - Avoid pyramid of doom; each guard clause should be simple, independent.
 
+## Match Statements (Prefer Over if/elif Chains)
+
+Use `match` statements instead of `if`/`elif` chains when dispatching on enum values, type discrimination, or multiple conditions on the same variable.
+
+```python
+# Good - match statement
+match change["change_type"]:
+    case ChangeType.ADDED:
+        row_data.append(f"[green]{new_val}[/]")
+    case ChangeType.REMOVED:
+        row_data.append(f"[red]{old_val}[/]")
+    case _ if old_val != new_val:
+        row_data.append(f"[yellow]{old_val} -> {new_val}[/]")
+    case _:
+        row_data.append(str(new_val) if new_val is not None else "")
+
+# Bad - if/elif chain for type dispatch
+if change["change_type"] == ChangeType.ADDED:
+    row_data.append(f"[green]{new_val}[/]")
+elif change["change_type"] == ChangeType.REMOVED:
+    row_data.append(f"[red]{old_val}[/]")
+elif old_val != new_val:
+    row_data.append(f"[yellow]{old_val} -> {new_val}[/]")
+else:
+    row_data.append(str(new_val) if new_val is not None else "")
+```
+
+**When to use match:** Enum dispatch, type discrimination, structured pattern matching, multiple conditions on one variable.
+
+**When if/elif is fine:** Simple boolean conditions, early returns/guards, conditions on different variables.
+
 ## Private Functions
 
 - Use `_prefix` for module-internal helpers; public = used by other modules.

@@ -7,7 +7,14 @@ import pydantic
 import pytest
 
 from pivot import explain, lock
-from pivot.types import CodeChange, DepChange, LockData, ParamChange, StageExplanation
+from pivot.types import (
+    ChangeType,
+    CodeChange,
+    DepChange,
+    LockData,
+    ParamChange,
+    StageExplanation,
+)
 
 if TYPE_CHECKING:
     from pivot.types import HashInfo
@@ -30,7 +37,7 @@ def test_diff_code_modified() -> None:
         key="func:helper",
         old_hash="abc123",
         new_hash="def456",
-        change_type="modified",
+        change_type=ChangeType.MODIFIED,
     )
 
 
@@ -46,7 +53,7 @@ def test_diff_code_added() -> None:
         key="func:new_helper",
         old_hash=None,
         new_hash="abc123",
-        change_type="added",
+        change_type=ChangeType.ADDED,
     )
 
 
@@ -62,7 +69,7 @@ def test_diff_code_removed() -> None:
         key="func:old_helper",
         old_hash="abc123",
         new_hash=None,
-        change_type="removed",
+        change_type=ChangeType.REMOVED,
     )
 
 
@@ -106,7 +113,7 @@ def test_diff_params_modified() -> None:
         key="learning_rate",
         old_value=0.01,
         new_value=0.001,
-        change_type="modified",
+        change_type=ChangeType.MODIFIED,
     )
 
 
@@ -122,7 +129,7 @@ def test_diff_params_added() -> None:
         key="batch_size",
         old_value=None,
         new_value=32,
-        change_type="added",
+        change_type=ChangeType.ADDED,
     )
 
 
@@ -138,7 +145,7 @@ def test_diff_params_removed() -> None:
         key="epochs",
         old_value=10,
         new_value=None,
-        change_type="removed",
+        change_type=ChangeType.REMOVED,
     )
 
 
@@ -180,7 +187,7 @@ def test_diff_deps_modified() -> None:
         path="data.csv",
         old_hash="abc123",
         new_hash="def456",
-        change_type="modified",
+        change_type=ChangeType.MODIFIED,
     )
 
 
@@ -196,7 +203,7 @@ def test_diff_deps_added() -> None:
         path="new_data.csv",
         old_hash=None,
         new_hash="abc123",
-        change_type="added",
+        change_type=ChangeType.ADDED,
     )
 
 
@@ -212,7 +219,7 @@ def test_diff_deps_removed() -> None:
         path="old_data.csv",
         old_hash="abc123",
         new_hash=None,
-        change_type="removed",
+        change_type=ChangeType.REMOVED,
     )
 
 

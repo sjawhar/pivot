@@ -3,7 +3,6 @@
 **Status:** 🚧 In Development (MVP Nearly Complete)
 **Python:** 3.13+ required
 **License:** TBD
-**Tests:** 507 passing | **Coverage:** 91.5%+
 
 ---
 
@@ -192,6 +191,34 @@ def append_to_database():
 - New version is cached after execution
 - Uses COPY mode (not symlinks) so stages can safely modify files
 
+### 8. Data Diff
+
+Compare data file changes between git HEAD and workspace:
+
+```bash
+# Interactive TUI mode (default)
+pivot data diff output.csv
+
+# Non-interactive output
+pivot data diff output.csv --no-tui
+
+# Use key columns for row matching (instead of positional)
+pivot data diff output.csv --key id --key timestamp
+
+# JSON output for scripting
+pivot data diff output.csv --no-tui --json
+```
+
+**Features:**
+- **Interactive TUI** - Navigate between files, view schema changes and row-level diffs
+- **Key-based matching** - Match rows by key columns to detect modifications vs adds/removes
+- **Positional matching** - Compare rows by position when no keys specified
+- **Schema detection** - Shows added/removed/type-changed columns
+- **Large file handling** - Summary-only mode for files exceeding memory threshold
+- **Multiple formats** - Plain text, markdown, or JSON output
+
+**Supported formats:** CSV, JSON, JSONL
+
 ---
 
 ## Installation (Coming Soon)
@@ -228,6 +255,7 @@ pip install pivot
 - **DVC export** - `pivot export` command for YAML generation
 - **Explain mode** - `pivot run --explain` shows detailed breakdown of WHY stages would run
 - **Observability** - `pivot metrics show/diff` and `pivot plots show/diff` commands
+- **Data diff** - `pivot data diff` command with interactive TUI for comparing data file changes
 
 ### In Progress
 
@@ -375,5 +403,5 @@ Questions? Check CLAUDE.md files or ask the team!
 
 ---
 
-**Last Updated:** 2026-01-07
+**Last Updated:** 2026-01-08
 **Version:** 0.1.0-dev

@@ -117,8 +117,13 @@ class LockData(TypedDict):
 # Type alias for output queue messages: (stage_name, line, is_stderr) or None for shutdown
 OutputMessage = tuple[str, str, bool] | None
 
-# Type alias for change detection status
-ChangeType = Literal["modified", "added", "removed"]
+
+class ChangeType(enum.StrEnum):
+    """Status for change detection."""
+
+    MODIFIED = "modified"
+    ADDED = "added"
+    REMOVED = "removed"
 
 
 class CodeChange(TypedDict):
@@ -157,3 +162,50 @@ class StageExplanation(TypedDict):
     code_changes: list[CodeChange]
     param_changes: list[ParamChange]
     dep_changes: list[DepChange]
+
+
+# =============================================================================
+# Data Diff Types
+# =============================================================================
+
+
+class DataFileFormat(enum.StrEnum):
+    """Supported data file formats for pivot data diff."""
+
+    CSV = "csv"
+    JSON = "json"
+    JSONL = "jsonl"
+    UNKNOWN = "unknown"
+
+
+class SchemaChange(TypedDict):
+    """Change info for a column in a data file schema."""
+
+    column: str
+    old_dtype: str | None
+    new_dtype: str | None
+    change_type: ChangeType
+
+
+class RowChange(TypedDict):
+    """Change info for a row in a data file."""
+
+    key: str | int  # Key column value or row index
+    change_type: ChangeType
+    old_values: dict[str, Any] | None
+    new_values: dict[str, Any] | None
+
+
+class DataDiffResult(TypedDict):
+    """Result of comparing two data files."""
+
+    path: str
+    old_rows: int | None
+    new_rows: int | None
+    old_cols: list[str] | None
+    new_cols: list[str] | None
+    schema_changes: list[SchemaChange]
+    row_changes: list[RowChange]
+    reorder_only: bool  # True if same content, different row order
+    truncated: bool  # True if large file, showing sample
+    summary_only: bool  # True if no row-level diff available
