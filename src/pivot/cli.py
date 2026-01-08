@@ -152,7 +152,7 @@ def run(
         elif not explain:
             _print_results(results)
     except Exception as e:
-        raise click.ClickException(str(e)) from e
+        raise click.ClickException(repr(e)) from e
 
 
 @cli.command("dry-run")
@@ -185,7 +185,7 @@ def dry_run_cmd(
             click.echo(f"  {exp['stage_name']}: {status} ({reason})")
 
     except Exception as e:
-        raise click.ClickException(str(e)) from e
+        raise click.ClickException(repr(e)) from e
 
 
 @cli.command("explain")
@@ -221,7 +221,7 @@ def explain_cmd(
         con.explain_summary(will_run, len(explanations) - will_run)
 
     except Exception as e:
-        raise click.ClickException(str(e)) from e
+        raise click.ClickException(repr(e)) from e
 
 
 @cli.command("list")
@@ -265,7 +265,7 @@ def export(stages: tuple[str, ...], output: pathlib.Path) -> None:
         result = dvc_compat.export_dvc_yaml(output, stages=stages_list)
         click.echo(f"Exported {len(result['stages'])} stages to {output}")
     except Exception as e:
-        raise click.ClickException(str(e)) from e
+        raise click.ClickException(repr(e)) from e
 
 
 @cli.command()
@@ -289,7 +289,7 @@ def track(paths: tuple[str, ...], force: bool) -> None:
         for path_str in paths:
             _track_single_path(path_str, cache_dir, stage_outputs, existing_tracked, force)
     except Exception as e:
-        raise click.ClickException(str(e)) from e
+        raise click.ClickException(repr(e)) from e
 
 
 def _paths_overlap(path_a: pathlib.Path, path_b: pathlib.Path) -> bool:
@@ -393,7 +393,7 @@ def _track_single_path(
     try:
         user_resolved = project.resolve_path_for_comparison(path_str, "user path")
     except (PermissionError, RuntimeError, OSError) as e:
-        raise click.ClickException(str(e)) from e
+        raise click.ClickException(repr(e)) from e
 
     for out_norm, out_resolved in stage_outputs_resolved.items():
         if _paths_overlap(user_resolved, out_resolved):
@@ -496,7 +496,7 @@ def checkout(targets: tuple[str, ...], checkout_mode: str | None, force: bool) -
                     target, tracked_files, stage_outputs, cache_dir, checkout_modes, force
                 )
     except Exception as e:
-        raise click.ClickException(str(e)) from e
+        raise click.ClickException(repr(e)) from e
 
 
 def _get_stage_output_info(project_root: pathlib.Path) -> dict[str, OutputHash]:
@@ -696,7 +696,7 @@ def plots_show(targets: tuple[str, ...], output: pathlib.Path, open_browser: boo
 
             webbrowser.open(f"file://{output_path.resolve()}")
     except Exception as e:
-        raise click.ClickException(str(e)) from e
+        raise click.ClickException(repr(e)) from e
 
 
 @plots.command("diff")
@@ -740,7 +740,7 @@ def plots_diff(targets: tuple[str, ...], json_output: bool, md: bool, no_path: b
         result = plots_mod.format_diff_table(diffs, output_format, show_path=not no_path)
         click.echo(result)
     except Exception as e:
-        raise click.ClickException(str(e)) from e
+        raise click.ClickException(repr(e)) from e
 
 
 def main() -> None:
