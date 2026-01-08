@@ -187,14 +187,18 @@ def diff_metrics(
             new_val = new_metrics.get(key)
 
             if key not in old_metrics:
-                diffs.append(MetricDiff(path=path, key=key, old=None, new=new_val, change="added"))
+                diffs.append(
+                    MetricDiff(path=path, key=key, old=None, new=new_val, change=ChangeType.ADDED)
+                )
             elif key not in new_metrics:
                 diffs.append(
-                    MetricDiff(path=path, key=key, old=old_val, new=None, change="removed")
+                    MetricDiff(path=path, key=key, old=old_val, new=None, change=ChangeType.REMOVED)
                 )
             elif old_val != new_val:
                 diffs.append(
-                    MetricDiff(path=path, key=key, old=old_val, new=new_val, change="modified")
+                    MetricDiff(
+                        path=path, key=key, old=old_val, new=new_val, change=ChangeType.MODIFIED
+                    )
                 )
 
     return diffs

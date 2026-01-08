@@ -5,7 +5,7 @@ import subprocess
 from typing import TYPE_CHECKING
 
 from pivot import lock, outputs, plots, registry
-from pivot.types import LockData
+from pivot.types import ChangeType, LockData
 
 if TYPE_CHECKING:
     import pathlib
@@ -483,7 +483,7 @@ def test_format_diff_table_plain() -> None:
     """Plain text format uses tabulate."""
     diffs = [
         plots.PlotDiffEntry(
-            path="plot.png", old_hash="abc123", new_hash="def456", change="modified"
+            path="plot.png", old_hash="abc123", new_hash="def456", change=ChangeType.MODIFIED
         )
     ]
 
@@ -498,7 +498,7 @@ def test_format_diff_table_json() -> None:
     """JSON format returns valid JSON."""
     diffs = [
         plots.PlotDiffEntry(
-            path="plot.png", old_hash="abc123", new_hash="def456", change="modified"
+            path="plot.png", old_hash="abc123", new_hash="def456", change=ChangeType.MODIFIED
         )
     ]
 
@@ -514,7 +514,7 @@ def test_format_diff_table_markdown() -> None:
     """Markdown format uses github tablefmt."""
     diffs = [
         plots.PlotDiffEntry(
-            path="plot.png", old_hash="abc123", new_hash="def456", change="modified"
+            path="plot.png", old_hash="abc123", new_hash="def456", change=ChangeType.MODIFIED
         )
     ]
 
@@ -528,7 +528,7 @@ def test_format_diff_table_no_path() -> None:
     """show_path=False hides path column."""
     diffs = [
         plots.PlotDiffEntry(
-            path="plot.png", old_hash="abc123", new_hash="def456", change="modified"
+            path="plot.png", old_hash="abc123", new_hash="def456", change=ChangeType.MODIFIED
         )
     ]
 

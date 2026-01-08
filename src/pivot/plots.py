@@ -183,15 +183,21 @@ def diff_plots(
         if path not in old or old_hash is None:
             if new_hash is not None:
                 diffs.append(
-                    PlotDiffEntry(path=path, old_hash=None, new_hash=new_hash, change="added")
+                    PlotDiffEntry(
+                        path=path, old_hash=None, new_hash=new_hash, change=ChangeType.ADDED
+                    )
                 )
         elif path not in new or new_hash is None:
             diffs.append(
-                PlotDiffEntry(path=path, old_hash=old_hash, new_hash=None, change="removed")
+                PlotDiffEntry(
+                    path=path, old_hash=old_hash, new_hash=None, change=ChangeType.REMOVED
+                )
             )
         elif old_hash != new_hash:
             diffs.append(
-                PlotDiffEntry(path=path, old_hash=old_hash, new_hash=new_hash, change="modified")
+                PlotDiffEntry(
+                    path=path, old_hash=old_hash, new_hash=new_hash, change=ChangeType.MODIFIED
+                )
             )
 
     return diffs

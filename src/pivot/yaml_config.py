@@ -7,7 +7,7 @@ Dumper: type[yaml.SafeDumper] | type[yaml.CSafeDumper]
 try:
     Loader = yaml.CSafeLoader
     Dumper = yaml.CSafeDumper
-except AttributeError:
+except AttributeError:  # pragma: no cover
     # CSafeLoader unavailable (no libyaml); SafeLoader is API-compatible
     Loader = yaml.SafeLoader
     Dumper = yaml.SafeDumper

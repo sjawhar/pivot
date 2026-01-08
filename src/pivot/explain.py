@@ -43,11 +43,11 @@ def _diff_dicts(
         in_new = key in new
 
         if not in_old:
-            changes.append(make_change(key, None, new[key], "added"))
+            changes.append(make_change(key, None, new[key], ChangeType.ADDED))
         elif not in_new:
-            changes.append(make_change(key, old[key], None, "removed"))
+            changes.append(make_change(key, old[key], None, ChangeType.REMOVED))
         elif old[key] != new[key]:
-            changes.append(make_change(key, old[key], new[key], "modified"))
+            changes.append(make_change(key, old[key], new[key], ChangeType.MODIFIED))
 
     return changes
 

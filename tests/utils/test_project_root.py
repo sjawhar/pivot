@@ -314,3 +314,36 @@ def test_contains_symlink_stops_at_base(tmp_path: Path) -> None:
     assert not project.contains_symlink_in_path(file_path, symlink_base), (
         "Should not check base directory for symlinks"
     )
+
+
+# --- Tests for resolve_path_for_comparison() ---
+
+
+def test_resolve_path_for_comparison_existing_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Should resolve existing file normally."""
+    git_dir = tmp_path / ".git"
+    git_dir.mkdir()
+    test_file = tmp_path / "data.csv"
+    test_file.write_text("test")
+
+    with contextlib.chdir(tmp_path):
+        monkeypatch.setattr(project, "_project_root_cache", None)
+        result = project.resolve_path_for_comparison("data.csv", "dependency")
+        assert result == test_file.resolve()
+
+
+def test_resolve_path_for_comparison_missing_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Should resolve missing files without raising (Path.resolve() doesn't raise)."""
+    git_dir = tmp_path / ".git"
+    git_dir.mkdir()
+
+    with contextlib.chdir(tmp_path):
+        monkeypatch.setattr(project, "_project_root_cache", None)
+        # Missing file - still resolves (Path.resolve() doesn't raise for missing files)
+        result = project.resolve_path_for_comparison("missing.csv", "dependency")
+        # Returns resolved path even though file doesn't exist
+        assert result == tmp_path / "missing.csv"

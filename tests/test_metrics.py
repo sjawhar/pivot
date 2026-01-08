@@ -7,6 +7,7 @@ import pytest
 import yaml
 
 from pivot import metrics
+from pivot.types import ChangeType
 
 if TYPE_CHECKING:
     import pathlib
@@ -330,7 +331,9 @@ def test_format_metrics_table_empty() -> None:
 
 def test_format_diff_table_plain() -> None:
     """Plain format for diff."""
-    diffs = [metrics.MetricDiff(path="m.json", key="acc", old=0.9, new=0.95, change="modified")]
+    diffs = [
+        metrics.MetricDiff(path="m.json", key="acc", old=0.9, new=0.95, change=ChangeType.MODIFIED)
+    ]
 
     result = metrics.format_diff_table(diffs, None, precision=2, show_path=True)
 
@@ -345,7 +348,9 @@ def test_format_diff_table_plain() -> None:
 
 def test_format_diff_table_no_path() -> None:
     """Diff without path column."""
-    diffs = [metrics.MetricDiff(path="m.json", key="acc", old=0.9, new=0.95, change="modified")]
+    diffs = [
+        metrics.MetricDiff(path="m.json", key="acc", old=0.9, new=0.95, change=ChangeType.MODIFIED)
+    ]
 
     result = metrics.format_diff_table(diffs, None, precision=2, show_path=False)
 
@@ -361,7 +366,9 @@ def test_format_diff_table_empty() -> None:
 
 def test_format_diff_table_json() -> None:
     """JSON format for diff."""
-    diffs = [metrics.MetricDiff(path="m.json", key="acc", old=0.9, new=0.95, change="modified")]
+    diffs = [
+        metrics.MetricDiff(path="m.json", key="acc", old=0.9, new=0.95, change=ChangeType.MODIFIED)
+    ]
 
     result = metrics.format_diff_table(diffs, "json", precision=2)
 
