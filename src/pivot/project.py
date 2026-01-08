@@ -24,7 +24,7 @@ def get_project_root() -> pathlib.Path:
     global _project_root_cache
     if _project_root_cache is None:
         _project_root_cache = find_project_root()
-        logger.info(f"Project root: {_project_root_cache}")
+        logger.debug(f"Project root: {_project_root_cache}")
     return _project_root_cache
 
 
