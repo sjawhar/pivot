@@ -40,7 +40,7 @@ _REQUIRED_KEYS = frozenset({"path", "hash", "size"})
 _VALID_KEYS = frozenset({"path", "hash", "size", "num_files", "manifest"})
 
 
-def _is_pvt_data(data: object) -> TypeGuard[PvtData]:
+def is_pvt_data(data: object) -> TypeGuard[PvtData]:
     """Validate that parsed YAML has valid PvtData structure."""
     if not isinstance(data, dict):
         return False
@@ -77,7 +77,7 @@ def read_pvt_file(pvt_path: pathlib.Path) -> PvtData | None:
     try:
         with open(pvt_path) as f:
             data: object = yaml.load(f, Loader=_Loader)
-        if not _is_pvt_data(data):
+        if not is_pvt_data(data):
             return None
         # Validate path doesn't contain traversal (security check)
         if has_path_traversal(data["path"]):

@@ -227,6 +227,7 @@ pip install pivot
 - **Incremental outputs** - Restore-before-run for append-only workloads
 - **DVC export** - `pivot export` command for YAML generation
 - **Explain mode** - `pivot run --explain` shows detailed breakdown of WHY stages would run
+- **Observability** - `pivot metrics show/diff` and `pivot plots show/diff` commands
 
 ### In Progress
 
@@ -234,7 +235,6 @@ pip install pivot
 
 ### Future
 
-- **Observability** - Metrics tracking/diff, plots generation
 - **Version control** - `pivot get --rev` to materialize old versions, DVC lock import for migration
 
 ---

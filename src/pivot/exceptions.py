@@ -132,3 +132,45 @@ class TrackedFileMissingError(CacheError):
     """Raised when a .pvt tracked file is missing (user should run pivot checkout)."""
 
     pass
+
+
+class GetError(PivotError):
+    """Base class for get command errors."""
+
+    pass
+
+
+class RevisionNotFoundError(GetError):
+    """Raised when git revision cannot be resolved."""
+
+    pass
+
+
+class TargetNotFoundError(GetError):
+    """Raised when target is not found at specified revision."""
+
+    pass
+
+
+class CacheMissError(GetError):
+    """Raised when file cannot be retrieved from cache, git, or remote."""
+
+    pass
+
+
+class RemoteError(PivotError):
+    """Base class for remote operations."""
+
+    pass
+
+
+class RemoteFetchError(RemoteError):
+    """Raised when fetching from remote fails."""
+
+    pass
+
+
+class RemoteNotConfiguredError(RemoteError):
+    """Raised when no remote is configured."""
+
+    pass
