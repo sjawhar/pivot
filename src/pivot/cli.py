@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 
 import click
 
-from pivot import cache, executor, project, pvt, registry
+from pivot import cache, config, executor, project, pvt, registry
 from pivot.types import OutputHash, StageExplanation, StageStatus
 
 if TYPE_CHECKING:
@@ -459,13 +459,13 @@ def _track_single_path(
 @cli.command()
 @click.argument("targets", nargs=-1)
 @click.option(
-    "--link",
+    "--checkout-mode",
     type=click.Choice(["symlink", "hardlink", "copy"]),
     default=None,
-    help="Link type for restoration (default: project config or symlink)",
+    help="Checkout mode for restoration (default: project config or hardlink)",
 )
 @click.option("--force", "-f", is_flag=True, help="Overwrite existing files")
-def checkout(targets: tuple[str, ...], link: str | None, force: bool) -> None:
+def checkout(targets: tuple[str, ...], checkout_mode: str | None, force: bool) -> None:
     """Restore tracked files and stage outputs from cache.
 
     If no targets specified, restores all tracked files and stage outputs.
@@ -474,8 +474,9 @@ def checkout(targets: tuple[str, ...], link: str | None, force: bool) -> None:
         project_root = project.get_project_root()
         cache_dir = project_root / ".pivot" / "cache" / "files"
 
-        # Determine link mode
-        link_mode = cache.LinkMode(link) if link else cache.LinkMode.SYMLINK
+        # Determine checkout modes - CLI flag overrides config (single mode, no fallback)
+        mode_strings = [checkout_mode] if checkout_mode else config.get_checkout_mode_order()
+        checkout_modes = [cache.CheckoutMode(m) for m in mode_strings]
 
         # Discover tracked files
         tracked_files = pvt.discover_pvt_files(project_root)
@@ -485,12 +486,14 @@ def checkout(targets: tuple[str, ...], link: str | None, force: bool) -> None:
 
         if not targets:
             # Restore everything
-            _checkout_all_tracked(tracked_files, cache_dir, link_mode, force)
-            _checkout_all_outputs(stage_outputs, cache_dir, link_mode, force)
+            _checkout_all_tracked(tracked_files, cache_dir, checkout_modes, force)
+            _checkout_all_outputs(stage_outputs, cache_dir, checkout_modes, force)
         else:
             # Restore specific targets
             for target in targets:
-                _checkout_target(target, tracked_files, stage_outputs, cache_dir, link_mode, force)
+                _checkout_target(
+                    target, tracked_files, stage_outputs, cache_dir, checkout_modes, force
+                )
     except Exception as e:
         raise click.ClickException(str(e)) from e
 
@@ -518,20 +521,20 @@ def _get_stage_output_info(project_root: pathlib.Path) -> dict[str, OutputHash]:
 def _checkout_all_tracked(
     tracked_files: dict[str, pvt.PvtData],
     cache_dir: pathlib.Path,
-    link_mode: cache.LinkMode,
+    checkout_modes: list[cache.CheckoutMode],
     force: bool,
 ) -> None:
     """Restore all tracked files."""
     for abs_path_str, pvt_data in tracked_files.items():
         path = pathlib.Path(abs_path_str)
         output_hash = _pvt_to_output_hash(pvt_data)
-        _restore_path(path, output_hash, cache_dir, link_mode, force)
+        _restore_path(path, output_hash, cache_dir, checkout_modes, force)
 
 
 def _checkout_all_outputs(
     stage_outputs: dict[str, OutputHash],
     cache_dir: pathlib.Path,
-    link_mode: cache.LinkMode,
+    checkout_modes: list[cache.CheckoutMode],
     force: bool,
 ) -> None:
     """Restore all stage outputs."""
@@ -539,7 +542,7 @@ def _checkout_all_outputs(
         if output_hash is None:
             continue
         path = pathlib.Path(abs_path_str)
-        _restore_path(path, output_hash, cache_dir, link_mode, force)
+        _restore_path(path, output_hash, cache_dir, checkout_modes, force)
 
 
 def _checkout_target(
@@ -547,7 +550,7 @@ def _checkout_target(
     tracked_files: dict[str, pvt.PvtData],
     stage_outputs: dict[str, OutputHash],
     cache_dir: pathlib.Path,
-    link_mode: cache.LinkMode,
+    checkout_modes: list[cache.CheckoutMode],
     force: bool,
 ) -> None:
     """Restore a specific target."""
@@ -563,7 +566,7 @@ def _checkout_target(
     if abs_path_str in tracked_files:
         pvt_data = tracked_files[abs_path_str]
         output_hash = _pvt_to_output_hash(pvt_data)
-        _restore_path(abs_path, output_hash, cache_dir, link_mode, force)
+        _restore_path(abs_path, output_hash, cache_dir, checkout_modes, force)
         return
 
     # Check if it's a stage output
@@ -571,7 +574,7 @@ def _checkout_target(
         output_hash = stage_outputs[abs_path_str]
         if output_hash is None:
             raise click.ClickException(f"'{target}' has no cached version")
-        _restore_path(abs_path, output_hash, cache_dir, link_mode, force)
+        _restore_path(abs_path, output_hash, cache_dir, checkout_modes, force)
         return
 
     # Unknown target
@@ -590,7 +593,7 @@ def _restore_path(
     path: pathlib.Path,
     output_hash: OutputHash,
     cache_dir: pathlib.Path,
-    link_mode: cache.LinkMode,
+    checkout_modes: list[cache.CheckoutMode],
     force: bool,
 ) -> None:
     """Restore a file or directory from cache."""
@@ -601,7 +604,7 @@ def _restore_path(
     if force and path.exists():
         cache.remove_output(path)
 
-    success = cache.restore_from_cache(path, output_hash, cache_dir, link_mode)
+    success = cache.restore_from_cache(path, output_hash, cache_dir, checkout_modes=checkout_modes)
     if not success:
         raise click.ClickException(f"Failed to restore '{path.name}': not found in cache")
 

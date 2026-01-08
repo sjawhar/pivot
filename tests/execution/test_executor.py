@@ -993,9 +993,9 @@ def test_executor_saves_outputs_to_cache(pipeline_dir: pathlib.Path) -> None:
 
     assert results["process"]["status"] == "ran"
 
-    # Output should now be a symlink to cache
+    # Output should exist with correct content (linked to cache via hardlink/symlink/copy)
     output_file = pipeline_dir / "output.txt"
-    assert output_file.is_symlink(), "Output should be symlink to cache"
+    assert output_file.exists(), "Output should exist"
     assert output_file.read_text() == "result"
 
     # Cache should contain the file

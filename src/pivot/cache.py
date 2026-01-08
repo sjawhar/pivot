@@ -4,6 +4,7 @@ import contextlib
 import enum
 import errno
 import json
+import logging
 import mmap
 import os
 import pathlib
@@ -16,6 +17,8 @@ import xxhash
 
 from pivot import exceptions
 from pivot.types import DirHash, DirManifestEntry, FileHash, OutputHash
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator
@@ -59,8 +62,8 @@ def atomic_write_file(
                 os.close(fd)
 
 
-class LinkMode(enum.StrEnum):
-    """Strategy for linking workspace files to cache."""
+class CheckoutMode(enum.StrEnum):
+    """Strategy for checking out workspace files from cache."""
 
     SYMLINK = "symlink"
     HARDLINK = "hardlink"
@@ -212,64 +215,105 @@ def copy_to_cache(src: pathlib.Path, cache_path: pathlib.Path) -> None:
         raise
 
 
-def _link_from_cache(
+FALLBACK_ERRNO = frozenset({errno.EXDEV, errno.EPERM, errno.EACCES})
+
+
+def _checkout_from_cache(
     path: pathlib.Path,
     cache_path: pathlib.Path,
-    link_mode: LinkMode,
+    checkout_mode: CheckoutMode,
     *,
     executable: bool = False,
 ) -> None:
     """Create link from workspace path to cache."""
     # Idempotency: skip if already correctly linked
-    if link_mode == LinkMode.SYMLINK and path.is_symlink():
+    if checkout_mode == CheckoutMode.SYMLINK and path.is_symlink():
         with contextlib.suppress(OSError):
             if path.resolve() == cache_path.resolve():
                 return
-    elif link_mode == LinkMode.HARDLINK and path.exists() and not path.is_symlink():
+    elif checkout_mode == CheckoutMode.HARDLINK and path.exists() and not path.is_symlink():
         with contextlib.suppress(OSError):
             if path.stat().st_ino == cache_path.stat().st_ino:
                 return
 
     _clear_path(path)
 
-    if link_mode == LinkMode.SYMLINK:
+    if checkout_mode == CheckoutMode.SYMLINK:
         path.symlink_to(cache_path.resolve())
-    elif link_mode == LinkMode.HARDLINK:
-        try:
-            os.link(cache_path, path)
-        except OSError as e:
-            # Fall back to copy if hardlink fails (e.g., cross-device)
-            if e.errno == errno.EXDEV:
-                shutil.copy2(cache_path, path)
-                os.chmod(path, 0o644)
-            else:
-                raise
+    elif checkout_mode == CheckoutMode.HARDLINK:
+        os.link(cache_path, path)
     else:
         shutil.copy2(cache_path, path)
         os.chmod(path, 0o755 if executable else 0o644)
+
+
+def _checkout_with_fallback(
+    path: pathlib.Path,
+    cache_path: pathlib.Path,
+    checkout_modes: list[CheckoutMode],
+    *,
+    executable: bool = False,
+) -> None:
+    """Try each link mode in order until one succeeds."""
+    for i, mode in enumerate(checkout_modes):
+        try:
+            _checkout_from_cache(path, cache_path, mode, executable=executable)
+            return
+        except OSError as e:
+            if e.errno not in FALLBACK_ERRNO or i == len(checkout_modes) - 1:
+                raise
+            logger.debug(f"Checkout mode {mode.value} failed ({e}), trying next mode")
+
+
+DEFAULT_CHECKOUT_MODE_ORDER = [CheckoutMode.HARDLINK, CheckoutMode.SYMLINK, CheckoutMode.COPY]
+
+
+def _resolve_checkout_modes(
+    checkout_mode: CheckoutMode | None,
+    checkout_modes: list[CheckoutMode] | None,
+) -> list[CheckoutMode]:
+    """Resolve effective checkout modes from single mode or list."""
+    if checkout_mode is not None:
+        return [checkout_mode]
+    if checkout_modes is not None:
+        if not checkout_modes:
+            raise ValueError("checkout_modes cannot be empty")
+        return checkout_modes
+    return DEFAULT_CHECKOUT_MODE_ORDER.copy()
 
 
 def save_to_cache(
     path: pathlib.Path,
     cache_dir: pathlib.Path,
     state_db: state_mod.StateDB | None = None,
-    link_mode: LinkMode = LinkMode.SYMLINK,
+    checkout_mode: CheckoutMode | None = None,
+    checkout_modes: list[CheckoutMode] | None = None,
 ) -> OutputHash:
-    """Save file or directory to cache, replace with link, return hash info."""
+    """Save file or directory to cache, replace with link, return hash info.
+
+    Args:
+        path: File or directory to save
+        cache_dir: Cache directory
+        state_db: Optional state database for hash caching
+        checkout_mode: Single link mode (no fallback). Takes precedence over checkout_modes.
+        checkout_modes: Ordered list of link modes to try with fallback on failure.
+    """
+    effective_modes = _resolve_checkout_modes(checkout_mode, checkout_modes)
+
     if path.is_dir():
-        return _save_directory_to_cache(path, cache_dir, state_db, link_mode)
-    return _save_file_to_cache(path, cache_dir, state_db, link_mode)
+        return _save_directory_to_cache(path, cache_dir, state_db, effective_modes)
+    return _save_file_to_cache(path, cache_dir, state_db, effective_modes)
 
 
 def _save_file_to_cache(
     path: pathlib.Path,
     cache_dir: pathlib.Path,
     state_db: state_mod.StateDB | None,
-    link_mode: LinkMode,
+    checkout_modes: list[CheckoutMode],
 ) -> FileHash:
     """Save single file to cache."""
     # Idempotency: check if already a valid cache symlink (cheap check first)
-    if link_mode == LinkMode.SYMLINK:
+    if checkout_modes and checkout_modes[0] == CheckoutMode.SYMLINK:
         existing_hash = _get_symlink_cache_hash(path, cache_dir)
         if existing_hash is not None:
             cache_path = get_cache_path(cache_dir, existing_hash)
@@ -280,7 +324,7 @@ def _save_file_to_cache(
     cache_path = get_cache_path(cache_dir, file_hash)
 
     copy_to_cache(path, cache_path)
-    _link_from_cache(path, cache_path, link_mode)
+    _checkout_with_fallback(path, cache_path, checkout_modes)
 
     return FileHash(hash=file_hash)
 
@@ -289,11 +333,11 @@ def _save_directory_to_cache(
     path: pathlib.Path,
     cache_dir: pathlib.Path,
     state_db: state_mod.StateDB | None,
-    link_mode: LinkMode,
+    checkout_modes: list[CheckoutMode],
 ) -> DirHash:
     """Save directory to cache."""
     # Idempotency check for SYMLINK mode
-    if link_mode == LinkMode.SYMLINK and path.is_symlink():
+    if checkout_modes and checkout_modes[0] == CheckoutMode.SYMLINK and path.is_symlink():
         existing_hash = _get_symlink_cache_hash(path, cache_dir)
         if existing_hash is not None:
             cache_dir_path = get_cache_path(cache_dir, existing_hash)
@@ -304,12 +348,14 @@ def _save_directory_to_cache(
 
     tree_hash, manifest = hash_directory(path, state_db)
 
+    # Cache individual files first
     for entry in manifest:
         file_path = path / entry["relpath"]
         cache_path = get_cache_path(cache_dir, entry["hash"])
         copy_to_cache(file_path, cache_path)
 
-    if link_mode == LinkMode.SYMLINK:
+    if checkout_modes and checkout_modes[0] == CheckoutMode.SYMLINK:
+        # SYMLINK mode: cache entire directory, symlink to it
         cache_dir_path = get_cache_path(cache_dir, tree_hash)
         if not cache_dir_path.exists():
             cache_dir_path.parent.mkdir(parents=True, exist_ok=True)
@@ -322,6 +368,14 @@ def _save_directory_to_cache(
 
         _clear_path(path)
         path.symlink_to(cache_dir_path.resolve())
+    else:
+        # HARDLINK/COPY modes: replace each file with link/copy from cache
+        for entry in manifest:
+            file_path = path / entry["relpath"]
+            cache_path = get_cache_path(cache_dir, entry["hash"])
+            _checkout_with_fallback(
+                file_path, cache_path, checkout_modes, executable=entry.get("isexec", False)
+            )
 
     return DirHash(hash=tree_hash, manifest=manifest)
 
@@ -330,22 +384,33 @@ def restore_from_cache(
     path: pathlib.Path,
     output_hash: OutputHash,
     cache_dir: pathlib.Path,
-    link_mode: LinkMode = LinkMode.SYMLINK,
+    checkout_mode: CheckoutMode | None = None,
+    checkout_modes: list[CheckoutMode] | None = None,
 ) -> bool:
-    """Restore file or directory from cache. Returns True if successful."""
+    """Restore file or directory from cache. Returns True if successful.
+
+    Args:
+        path: Target path to restore to
+        output_hash: Hash info for the cached output
+        cache_dir: Cache directory
+        checkout_mode: Single link mode (no fallback). Takes precedence over checkout_modes.
+        checkout_modes: Ordered list of link modes to try with fallback on failure.
+    """
     if output_hash is None:
         return False
 
+    effective_modes = _resolve_checkout_modes(checkout_mode, checkout_modes)
+
     if "manifest" in output_hash:
-        return _restore_directory_from_cache(path, output_hash, cache_dir, link_mode)
-    return _restore_file_from_cache(path, output_hash, cache_dir, link_mode)
+        return _restore_directory_from_cache(path, output_hash, cache_dir, effective_modes)
+    return _restore_file_from_cache(path, output_hash, cache_dir, effective_modes)
 
 
 def _restore_file_from_cache(
     path: pathlib.Path,
     output_hash: FileHash,
     cache_dir: pathlib.Path,
-    link_mode: LinkMode,
+    checkout_modes: list[CheckoutMode],
 ) -> bool:
     """Restore single file from cache."""
     cache_path = get_cache_path(cache_dir, output_hash["hash"])
@@ -353,7 +418,7 @@ def _restore_file_from_cache(
         return False
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    _link_from_cache(path, cache_path, link_mode)
+    _checkout_with_fallback(path, cache_path, checkout_modes)
     return True
 
 
@@ -361,18 +426,19 @@ def _restore_directory_from_cache(
     path: pathlib.Path,
     output_hash: DirHash,
     cache_dir: pathlib.Path,
-    link_mode: LinkMode,
+    checkout_modes: list[CheckoutMode],
 ) -> bool:
     """Restore directory from cache."""
     cache_dir_path = get_cache_path(cache_dir, output_hash["hash"])
 
-    if link_mode == LinkMode.SYMLINK and cache_dir_path.exists():
+    # Fast path: SYMLINK mode with entire directory cached
+    if checkout_modes and checkout_modes[0] == CheckoutMode.SYMLINK and cache_dir_path.exists():
         path.parent.mkdir(parents=True, exist_ok=True)
         _clear_path(path)
         path.symlink_to(cache_dir_path.resolve())
         return True
 
-    # For COPY/HARDLINK modes, restore file-by-file
+    # File-by-file restore with fallback support
     _clear_path(path)
     path.mkdir(parents=True, exist_ok=True)
     resolved_base = path.resolve()
@@ -387,12 +453,12 @@ def _restore_directory_from_cache(
                 f"Manifest contains path traversal: {entry['relpath']!r}"
             )
         file_path.parent.mkdir(parents=True, exist_ok=True)
-        _link_from_cache(
-            file_path, file_cache_path, link_mode, executable=entry.get("isexec", False)
+        _checkout_with_fallback(
+            file_path, file_cache_path, checkout_modes, executable=entry.get("isexec", False)
         )
 
-    # Ensure all directories are writable for COPY mode (including root)
-    if link_mode == LinkMode.COPY:
+    # Ensure directories writable if COPY might have been used (could be fallback result)
+    if CheckoutMode.COPY in checkout_modes:
         os.chmod(path, 0o755)
         for dir_path in path.rglob("*"):
             if dir_path.is_dir():

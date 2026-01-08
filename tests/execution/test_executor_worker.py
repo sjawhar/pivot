@@ -49,6 +49,7 @@ def test_execute_stage_with_missing_deps(worker_env: pathlib.Path) -> None:
         "variant": None,
         "overrides": {},
         "cwd": None,
+        "checkout_modes": ["hardlink", "symlink", "copy"],
     }
 
     result = executor.execute_stage(
@@ -82,6 +83,7 @@ def test_execute_stage_with_directory_dep(worker_env: pathlib.Path, tmp_path: pa
         "variant": None,
         "overrides": {},
         "cwd": None,
+        "checkout_modes": ["hardlink", "symlink", "copy"],
     }
 
     result = executor.execute_stage(
@@ -114,6 +116,7 @@ def test_execute_stage_runs_unchanged_stage(
         "variant": None,
         "overrides": {},
         "cwd": None,
+        "checkout_modes": ["hardlink", "symlink", "copy"],
     }
 
     # First run - creates lock file
@@ -158,6 +161,7 @@ def test_execute_stage_reruns_when_fingerprint_changes(
         "variant": None,
         "overrides": {},
         "cwd": None,
+        "checkout_modes": ["hardlink", "symlink", "copy"],
     }
 
     # First run
@@ -205,6 +209,7 @@ def test_execute_stage_handles_stage_exception(
         "variant": None,
         "overrides": {},
         "cwd": None,
+        "checkout_modes": ["hardlink", "symlink", "copy"],
     }
 
     result = executor.execute_stage(
@@ -235,6 +240,7 @@ def test_execute_stage_handles_sys_exit(worker_env: pathlib.Path, tmp_path: path
         "variant": None,
         "overrides": {},
         "cwd": None,
+        "checkout_modes": ["hardlink", "symlink", "copy"],
     }
 
     result = executor.execute_stage(
@@ -268,6 +274,7 @@ def test_execute_stage_handles_keyboard_interrupt(
         "variant": None,
         "overrides": {},
         "cwd": None,
+        "checkout_modes": ["hardlink", "symlink", "copy"],
     }
 
     result = executor.execute_stage(
@@ -1009,6 +1016,7 @@ def test_generation_skip_on_second_run(worker_env: pathlib.Path, tmp_path: pathl
         "variant": None,
         "overrides": {},
         "cwd": None,
+        "checkout_modes": ["hardlink", "symlink", "copy"],
     }
 
     # First run - creates output and records generations
@@ -1062,6 +1070,7 @@ def test_generation_mismatch_triggers_rerun(
         "variant": None,
         "overrides": {},
         "cwd": None,
+        "checkout_modes": ["hardlink", "symlink", "copy"],
     }
 
     step2_info: WorkerStageInfo = {
@@ -1074,6 +1083,7 @@ def test_generation_mismatch_triggers_rerun(
         "variant": None,
         "overrides": {},
         "cwd": None,
+        "checkout_modes": ["hardlink", "symlink", "copy"],
     }
 
     # First run - both stages execute
@@ -1153,6 +1163,7 @@ def test_external_file_fallback_to_hash_check(
         "variant": None,
         "overrides": {},
         "cwd": None,
+        "checkout_modes": ["hardlink", "symlink", "copy"],
     }
 
     # First run
@@ -1215,6 +1226,7 @@ def test_deps_list_change_triggers_rerun(worker_env: pathlib.Path, tmp_path: pat
         "variant": None,
         "overrides": {},
         "cwd": None,
+        "checkout_modes": ["hardlink", "symlink", "copy"],
     }
 
     result1 = executor.execute_stage(
@@ -1246,6 +1258,7 @@ def test_deps_list_change_triggers_rerun(worker_env: pathlib.Path, tmp_path: pat
         "variant": None,
         "overrides": {},
         "cwd": None,
+        "checkout_modes": ["hardlink", "symlink", "copy"],
     }
 
     result3 = executor.execute_stage(
@@ -1284,6 +1297,7 @@ def test_deps_list_change_same_fingerprint_detected_by_hash(
         "variant": None,
         "overrides": {},
         "cwd": None,
+        "checkout_modes": ["hardlink", "symlink", "copy"],
     }
 
     result1 = executor.execute_stage(
@@ -1306,6 +1320,7 @@ def test_deps_list_change_same_fingerprint_detected_by_hash(
         "variant": None,
         "overrides": {},
         "cwd": None,
+        "checkout_modes": ["hardlink", "symlink", "copy"],
     }
 
     result2 = executor.execute_stage(

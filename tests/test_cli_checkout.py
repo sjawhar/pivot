@@ -161,8 +161,10 @@ def test_checkout_all_restores_everything(
         REGISTRY.clear()
 
 
-def test_checkout_with_link_option(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
-    """Checkout respects --link option."""
+def test_checkout_with_checkout_mode_option(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """Checkout respects --checkout-mode option."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
         project._project_root_cache = None
@@ -175,13 +177,13 @@ def test_checkout_with_link_option(runner: click.testing.CliRunner, tmp_path: pa
         pathlib.Path("data.csv").unlink()
 
         # Checkout with copy mode
-        result = runner.invoke(cli.cli, ["checkout", "--link", "copy", "data.csv"])
+        result = runner.invoke(cli.cli, ["checkout", "--checkout-mode", "copy", "data.csv"])
         assert result.exit_code == 0
 
         # File should exist and be a regular file (not symlink)
         data_file = pathlib.Path("data.csv")
         assert data_file.exists()
-        assert not data_file.is_symlink(), "With --link=copy, should not be symlink"
+        assert not data_file.is_symlink(), "With --checkout-mode=copy, should not be symlink"
 
 
 def test_checkout_with_symlink_mode(
@@ -197,13 +199,13 @@ def test_checkout_with_symlink_mode(
 
         pathlib.Path("data.csv").unlink()
 
-        result = runner.invoke(cli.cli, ["checkout", "--link", "symlink", "data.csv"])
+        result = runner.invoke(cli.cli, ["checkout", "--checkout-mode", "symlink", "data.csv"])
         assert result.exit_code == 0
 
         data_file = pathlib.Path("data.csv")
         assert data_file.exists()
         # With symlink mode, file should be a symlink
-        assert data_file.is_symlink(), "With --link=symlink, should be symlink"
+        assert data_file.is_symlink(), "With --checkout-mode=symlink, should be symlink"
 
 
 # =============================================================================
