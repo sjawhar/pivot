@@ -4,6 +4,7 @@ import pathlib
 from typing import TYPE_CHECKING, cast
 
 import networkx as nx
+import pygtrie
 
 from pivot.exceptions import CyclicGraphError, DependencyNotFoundError
 
@@ -40,17 +41,24 @@ def build_dag(stages: dict[str, RegistryStageInfo], validate: bool = True) -> nx
         graph.add_node(stage_name, **stage_info)
 
     outputs_map = _build_outputs_map(stages)
+    outputs_trie = _build_outputs_trie(stages)
 
     for stage_name, stage_info in stages.items():
         for dep in stage_info["deps"]:
             producer = outputs_map.get(dep)
             if producer:
                 graph.add_edge(stage_name, producer)
-            elif validate and not pathlib.Path(dep).exists():
-                raise DependencyNotFoundError(
-                    f"Stage '{stage_name}' depends on '{dep}' which is not produced by "
-                    + "any stage and does not exist on disk"
-                )
+            else:
+                # Check for directory dependency on file outputs (or vice versa)
+                producers = _find_producers_for_path(dep, outputs_trie)
+                for prod in producers:
+                    graph.add_edge(stage_name, prod)
+
+                if not producers and validate and not pathlib.Path(dep).exists():
+                    raise DependencyNotFoundError(
+                        f"Stage '{stage_name}' depends on '{dep}' which is not produced by "
+                        + "any stage and does not exist on disk"
+                    )
 
     _check_acyclic(graph)
 
@@ -74,6 +82,37 @@ def _build_outputs_map(stages: dict[str, RegistryStageInfo]) -> dict[str, str]:
         for out_path in stage_info["outs_paths"]
     }
     return outputs_map
+
+
+def _build_outputs_trie(stages: dict[str, RegistryStageInfo]) -> pygtrie.Trie:
+    """Build trie of output paths for directory dependency resolution."""
+    trie = pygtrie.Trie()
+    for stage_name, stage_info in stages.items():
+        for out_path in stage_info["outs_paths"]:
+            out_key = pathlib.Path(out_path).parts
+            trie[out_key] = (stage_name, out_path)
+    return trie
+
+
+def _find_producers_for_path(dep_path: str, outputs_trie: pygtrie.Trie) -> list[str]:
+    """Find stages with outputs overlapping the dependency path (parent or child)."""
+    dep_key = pathlib.Path(dep_path).parts
+    producers = list[str]()
+
+    # Case 1: Dependency is parent of outputs (dir depends on files inside)
+    if outputs_trie.has_subtrie(dep_key):
+        for stage_name, _ in outputs_trie.values(prefix=dep_key):
+            if stage_name not in producers:
+                producers.append(stage_name)
+
+    # Case 2: Dependency is child of output (file depends on parent dir)
+    prefix_item = outputs_trie.shortest_prefix(dep_key)
+    if prefix_item is not None and prefix_item.value is not None:
+        stage_name, _ = prefix_item.value
+        if stage_name not in producers:
+            producers.append(stage_name)
+
+    return producers
 
 
 def _check_acyclic(graph: nx.DiGraph[str]) -> None:
