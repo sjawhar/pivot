@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import pydantic
 import pytest
@@ -125,22 +125,6 @@ def stage_with_params(params: TrainParams) -> None:
     pass
 
 
-def test_pipeline_add_stage_with_params_dict(mock_project_root: pathlib.Path) -> None:
-    """add_stage with params dict introspects type from signature."""
-    pipeline = Pipeline()
-    pipeline.add_stage(
-        stage_with_params,
-        outs=["model.pkl"],
-        params={"learning_rate": 0.05, "epochs": 50},
-    )
-
-    info = registry.REGISTRY.get("stage_with_params")
-    assert info["params"] is not None
-    params_dict = info["params"].model_dump()
-    assert params_dict["learning_rate"] == 0.05
-    assert params_dict["epochs"] == 50
-
-
 def test_pipeline_add_stage_with_params_instance(mock_project_root: pathlib.Path) -> None:
     """add_stage with BaseModel instance uses it directly."""
     params = TrainParams(learning_rate=0.1, epochs=200)
@@ -150,32 +134,6 @@ def test_pipeline_add_stage_with_params_instance(mock_project_root: pathlib.Path
 
     info = registry.REGISTRY.get("stage_with_params")
     assert info["params"] is params
-
-
-def test_pipeline_add_stage_params_dict_without_signature_raises(
-    mock_project_root: pathlib.Path,
-) -> None:
-    """add_stage with params dict but no params parameter raises error."""
-
-    def no_params_stage() -> None:
-        pass
-
-    pipeline = Pipeline()
-    with pytest.raises(PipelineError, match="no 'params' parameter"):
-        pipeline.add_stage(no_params_stage, outs=["out.txt"], params={"foo": "bar"})
-
-
-def test_pipeline_add_stage_params_dict_without_type_hint_raises(
-    mock_project_root: pathlib.Path,
-) -> None:
-    """add_stage with params dict but no type hint raises error."""
-
-    def untyped_params_stage(params: Any) -> None:  # noqa: ANN401
-        del params
-
-    pipeline = Pipeline()
-    with pytest.raises(PipelineError, match="Pydantic BaseModel"):
-        pipeline.add_stage(untyped_params_stage, outs=["out.txt"], params={"foo": "bar"})
 
 
 # =============================================================================

@@ -98,13 +98,15 @@ result = {"changed": False}  # Missing 'reason' not caught!
 - No relative imports; no `sys.path` modifications.
 - **This applies to all packages including third-party**—use `import pydantic` then `pydantic.BaseModel`, not `from pydantic import BaseModel`.
 - No exceptions for stdlib—use `import pathlib` then `pathlib.Path`, not `from pathlib import Path`.
-- Exception: type hints in `TYPE_CHECKING` blocks may import types directly.
+- Exception: type hints in `TYPE_CHECKING` blocks import types directly (e.g., `from pydantic import BaseModel`). Never import the same thing both inside and outside TYPE_CHECKING.
 - Exception: types from `pivot.types` may be imported directly: `from pivot.types import StageStatus, StageResult`.
+- Exception: the `typing` module—always use `from typing import X`, never `import typing`. This is because `typing` exports are all type-related utilities meant to be used directly.
 
 ```python
 # Good
 from pivot import fingerprint
 from pivot.types import StageStatus, StageResult
+from typing import Any, TypeGuard  # typing is the exception - import directly
 import pathlib
 import pydantic
 
@@ -119,9 +121,11 @@ class MyParams(pydantic.BaseModel):
 from pivot.fingerprint import get_stage_fingerprint
 from pathlib import Path
 from pydantic import BaseModel
+import typing  # Don't import typing as a module
 
 fp = get_stage_fingerprint(func)  # Where is this from?
 path = Path("/some/path")  # Where is Path from?
+typing.get_type_hints(func)  # Don't use typing.X
 
 class MyParams(BaseModel):  # Where is BaseModel from?
     learning_rate: float = 0.01
