@@ -3,13 +3,11 @@ from __future__ import annotations
 import html
 import json
 import pathlib
-from typing import TYPE_CHECKING, Any, TypedDict, cast
+from typing import TYPE_CHECKING, TypedDict
 
-import tabulate
-import yaml
-
-from pivot import cache, git, lock, outputs, project, yaml_config
-from pivot.types import ChangeType, OutEntry  # noqa: TC001 - runtime import for TypedDict
+from pivot import cache, lock, outputs, project
+from pivot.show import common
+from pivot.types import ChangeType
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -114,34 +112,15 @@ def get_plot_hashes_from_head() -> dict[str, str | None]:
                 result[rel_path] = None  # Default to None
 
     # Read all lock files from HEAD in one batch
-    lock_paths = [f".pivot/cache/stages/{name}.lock" for name in stage_plot_paths]
-    lock_contents = git.read_files_from_head(lock_paths)
+    lock_data_map = common.read_lock_files_from_head(list(stage_plot_paths.keys()))
 
     # Parse lock files and extract plot hashes
     for stage_name, plot_paths in stage_plot_paths.items():
-        lock_path = f".pivot/cache/stages/{stage_name}.lock"
-        content = lock_contents.get(lock_path)
-        if content is None:
+        lock_data = lock_data_map.get(stage_name)
+        if lock_data is None:
             continue
 
-        try:
-            data = yaml.load(content, Loader=yaml_config.Loader)
-        except yaml.YAMLError:
-            continue
-
-        if not isinstance(data, dict) or "outs" not in data:
-            continue
-
-        # Build path->hash lookup from storage format (uses relative paths)
-        outs_raw = cast("dict[str, Any]", data)["outs"]
-        if not isinstance(outs_raw, list):
-            continue
-        outs_list = cast("list[OutEntry]", outs_raw)
-
-        path_to_hash = dict[str, str | None]()
-        for out in outs_list:
-            if "path" in out:
-                path_to_hash[out["path"]] = out["hash"]
+        path_to_hash = common.extract_output_hashes_from_lock(lock_data)
 
         # Match our plot paths against storage paths
         for plot_rel_path in plot_paths:
@@ -212,9 +191,6 @@ def format_diff_table(
     if output_format == "json":
         return json.dumps(diffs, indent=2)
 
-    if not diffs:
-        return "No plot changes."
-
     rows = list[list[str]]()
     for diff in diffs:
         old_str = "-" if diff["old_hash"] is None else diff["old_hash"][:8]
@@ -228,8 +204,7 @@ def format_diff_table(
     if show_path:
         headers.insert(0, "Path")
 
-    tablefmt = "github" if output_format == "md" else "plain"
-    return tabulate.tabulate(rows, headers=headers, tablefmt=tablefmt, disable_numparse=True)
+    return common.format_table(rows, headers, output_format, "No plot changes.")
 
 
 def render_plots_html(

@@ -9,14 +9,16 @@ import pathlib
 from typing import TYPE_CHECKING, Any, TypedDict, cast
 
 import flatten_dict
-import tabulate
 import yaml
 
 from pivot import git, outputs, project, yaml_config
-from pivot.types import ChangeType, MetricData, MetricValue, OutEntry, OutputFormat
+from pivot.show import common
+from pivot.types import ChangeType, MetricData, MetricValue
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
+
+    from pivot.types import OutputFormat
 
 logger = logging.getLogger(__name__)
 
@@ -174,34 +176,11 @@ def diff_metrics(
     new: Mapping[str, Mapping[str, MetricValue]],
 ) -> list[MetricDiff]:
     """Compare old vs new metrics. Returns list of diffs."""
-    diffs = list[MetricDiff]()
-    all_paths = set(old.keys()) | set(new.keys())
-
-    for path in sorted(all_paths):
-        old_metrics = old.get(path, {})
-        new_metrics = new.get(path, {})
-        all_keys = set(old_metrics.keys()) | set(new_metrics.keys())
-
-        for key in sorted(all_keys):
-            old_val = old_metrics.get(key)
-            new_val = new_metrics.get(key)
-
-            if key not in old_metrics:
-                diffs.append(
-                    MetricDiff(path=path, key=key, old=None, new=new_val, change=ChangeType.ADDED)
-                )
-            elif key not in new_metrics:
-                diffs.append(
-                    MetricDiff(path=path, key=key, old=old_val, new=None, change=ChangeType.REMOVED)
-                )
-            elif old_val != new_val:
-                diffs.append(
-                    MetricDiff(
-                        path=path, key=key, old=old_val, new=new_val, change=ChangeType.MODIFIED
-                    )
-                )
-
-    return diffs
+    raw_diffs = common.build_two_level_diff(old, new)
+    return [
+        MetricDiff(path=path, key=key, old=old_val, new=new_val, change=change)
+        for path, key, old_val, new_val, change in raw_diffs
+    ]
 
 
 def format_metrics_table(
@@ -211,19 +190,14 @@ def format_metrics_table(
 ) -> str:
     """Format metrics for display. output_format: None (plain), 'json', or 'md'."""
     if output_format == "json":
-        return json.dumps(metrics, indent=2)
+        return common.format_json(dict(metrics))
 
     rows = list[list[str]]()
     for path, values in sorted(metrics.items()):
         for key, value in sorted(values.items()):
             rows.append([path, key, _format_value(value, precision)])
 
-    if not rows:
-        return "No metrics found."
-
-    headers = ["Path", "Key", "Value"]
-    tablefmt = "github" if output_format == "md" else "plain"
-    return tabulate.tabulate(rows, headers=headers, tablefmt=tablefmt, disable_numparse=True)
+    return common.format_table(rows, ["Path", "Key", "Value"], output_format, "No metrics found.")
 
 
 def format_diff_table(
@@ -234,10 +208,7 @@ def format_diff_table(
 ) -> str:
     """Format metric diffs for display. output_format: None (plain), 'json', or 'md'."""
     if output_format == "json":
-        return json.dumps(diffs, indent=2)
-
-    if not diffs:
-        return "No metric changes."
+        return common.format_json(diffs)
 
     rows = list[list[str]]()
     for diff in diffs:
@@ -255,8 +226,7 @@ def format_diff_table(
     if show_path:
         headers.insert(0, "Path")
 
-    tablefmt = "github" if output_format == "md" else "plain"
-    return tabulate.tabulate(rows, headers=headers, tablefmt=tablefmt, disable_numparse=True)
+    return common.format_table(rows, headers, output_format, "No metric changes.")
 
 
 def _format_value(value: MetricValue, precision: int) -> str:
@@ -328,34 +298,15 @@ def get_metric_info_from_head() -> dict[str, str | None]:
                 result[rel_path] = None  # Default to None
 
     # Read all lock files from HEAD in one batch
-    lock_paths = [f".pivot/cache/stages/{name}.lock" for name in stage_metric_paths]
-    lock_contents = git.read_files_from_head(lock_paths)
+    lock_data_map = common.read_lock_files_from_head(list(stage_metric_paths.keys()))
 
     # Parse lock files and extract metric hashes
     for stage_name, metric_paths in stage_metric_paths.items():
-        lock_path = f".pivot/cache/stages/{stage_name}.lock"
-        content = lock_contents.get(lock_path)
-        if content is None:
+        lock_data = lock_data_map.get(stage_name)
+        if lock_data is None:
             continue
 
-        try:
-            data = yaml.load(content, Loader=yaml_config.Loader)
-        except yaml.YAMLError:
-            continue
-
-        if not isinstance(data, dict) or "outs" not in data:
-            continue
-
-        # Build path->hash lookup from storage format (uses relative paths)
-        outs_raw = cast("dict[str, Any]", data)["outs"]
-        if not isinstance(outs_raw, list):
-            continue
-        outs_list = cast("list[OutEntry]", outs_raw)
-
-        path_to_hash = dict[str, str | None]()
-        for out in outs_list:
-            if "path" in out:
-                path_to_hash[out["path"]] = out["hash"]
+        path_to_hash = common.extract_output_hashes_from_lock(lock_data)
 
         # Match our metric paths against storage paths
         for metric_rel_path in metric_paths:
