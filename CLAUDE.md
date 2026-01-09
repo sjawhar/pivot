@@ -6,7 +6,7 @@
 
 ## Modifying CLAUDE.md
 
-When updating CLAUDE.md files: **brevity and clarity over verbosity**. Reference existing code examples instead of writing full code blocks. Point to specific test files or functions. Strong, clear rules in few words beat lengthy explanations.
+When updating CLAUDE.md files: **brevity and clarity over verbosity**. A few clear sentences beat verbose good/bad code examples. Reference existing code in the codebase instead of writing examples. Point to specific files or functions. Keep this file small—strong, clear rules in few words.
 
 ---
 
@@ -410,6 +410,14 @@ def run_pipeline(stages: list[str]) -> dict[str, Result] | None:
     except Exception:
         return None  # Caller has no idea what went wrong
 ```
+
+### Filesystem OSError Handling
+
+Path resolution can fail (symlink loops, permissions, deleted files). Use `project.try_resolve_path()` which returns `None` on failure instead of raising. See `watch.py:collect_watch_paths()` for usage pattern.
+
+### Error Collection for Batch Operations
+
+When operating across multiple items (stages, files, etc.), collect all errors and report together rather than failing on first error. Users see all problems at once. See `executor.py` for patterns.
 
 ## Enums vs Literals
 

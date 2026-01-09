@@ -87,6 +87,14 @@ def resolve_path_for_comparison(path: str, context: str) -> pathlib.Path:
         raise OSError(f"Filesystem error for {context} '{path}': {e}") from e
 
 
+def try_resolve_path(path: str) -> pathlib.Path | None:
+    """Resolve path, returning None on OSError (symlink loops, permissions, etc.)."""
+    try:
+        return resolve_path(path)
+    except OSError:
+        return None
+
+
 def to_relative_path(abs_path: str | pathlib.Path, base: pathlib.Path | None = None) -> str:
     """Convert absolute path to relative from base (default: project root).
 

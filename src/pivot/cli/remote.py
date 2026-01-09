@@ -34,7 +34,7 @@ def remote_list() -> None:
 @click.argument("targets", nargs=-1, shell_complete=completion.complete_targets)
 @click.option("-r", "--remote", "remote_name", help="Remote name (uses default if not specified)")
 @click.option("--dry-run", "-n", is_flag=True, help="Show what would be pushed")
-@click.option("-j", "--jobs", type=int, default=20, help="Parallel upload jobs")
+@click.option("-j", "--jobs", type=click.IntRange(min=1), default=20, help="Parallel upload jobs")
 def push(targets: tuple[str, ...], remote_name: str | None, dry_run: bool, jobs: int) -> None:
     """Push cached outputs to remote storage.
 
@@ -93,7 +93,7 @@ def push(targets: tuple[str, ...], remote_name: str | None, dry_run: bool, jobs:
 @click.argument("targets", nargs=-1, shell_complete=completion.complete_targets)
 @click.option("-r", "--remote", "remote_name", help="Remote name (uses default if not specified)")
 @click.option("--dry-run", "-n", is_flag=True, help="Show what would be pulled")
-@click.option("-j", "--jobs", type=int, default=20, help="Parallel download jobs")
+@click.option("-j", "--jobs", type=click.IntRange(min=1), default=20, help="Parallel download jobs")
 def pull(targets: tuple[str, ...], remote_name: str | None, dry_run: bool, jobs: int) -> None:
     """Pull cached outputs from remote storage.
 

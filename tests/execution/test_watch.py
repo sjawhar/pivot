@@ -22,7 +22,7 @@ def pipeline_dir(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> pat
 
 def test_collect_watch_paths_includes_project_root(pipeline_dir: pathlib.Path) -> None:
     """Project root should always be in watch paths."""
-    paths = watch._collect_watch_paths([])
+    paths = watch.collect_watch_paths([])
     assert pipeline_dir in paths
 
 
@@ -38,13 +38,13 @@ def test_collect_watch_paths_includes_dependency_directories(
     def process() -> None:
         pass
 
-    paths = watch._collect_watch_paths(["process"])
+    paths = watch.collect_watch_paths(["process"])
     assert data_dir in paths
 
 
 def test_collect_watch_paths_handles_missing_stage(pipeline_dir: pathlib.Path) -> None:
     """Should handle missing stage gracefully."""
-    paths = watch._collect_watch_paths(["nonexistent_stage"])
+    paths = watch.collect_watch_paths(["nonexistent_stage"])
     assert pipeline_dir in paths
 
 
@@ -57,7 +57,7 @@ def test_collect_watch_paths_handles_nonexistent_dep_path(
     def process() -> None:
         pass
 
-    paths = watch._collect_watch_paths(["process"])
+    paths = watch.collect_watch_paths(["process"])
     assert len(paths) == 1
     assert pipeline_dir in paths
 
@@ -73,7 +73,7 @@ def test_output_filter_filters_exact_output_match(pipeline_dir: pathlib.Path) ->
     def process() -> None:
         pass
 
-    watch_filter = watch._create_output_filter(["process"])
+    watch_filter = watch.create_watch_filter(["process"])
 
     assert watch_filter(Change.modified, str(output_path)) is False
 
@@ -89,7 +89,7 @@ def test_output_filter_filters_files_under_output_directory(
     def train() -> None:
         pass
 
-    watch_filter = watch._create_output_filter(["train"])
+    watch_filter = watch.create_watch_filter(["train"])
 
     assert watch_filter(Change.modified, str(output_dir / "checkpoint.pt")) is False
 
@@ -103,7 +103,7 @@ def test_output_filter_filters_directory_itself(pipeline_dir: pathlib.Path) -> N
     def train() -> None:
         pass
 
-    watch_filter = watch._create_output_filter(["train"])
+    watch_filter = watch.create_watch_filter(["train"])
 
     # Directory reported without trailing slash should still be filtered
     assert watch_filter(Change.modified, str(output_dir)) is False
@@ -117,7 +117,7 @@ def test_output_filter_allows_source_files(pipeline_dir: pathlib.Path) -> None:
     def process() -> None:
         pass
 
-    watch_filter = watch._create_output_filter(["process"])
+    watch_filter = watch.create_watch_filter(["process"])
 
     assert watch_filter(Change.modified, str(source_path)) is True
 
@@ -132,7 +132,7 @@ def test_output_filter_allows_source_files(pipeline_dir: pathlib.Path) -> None:
 )
 def test_output_filter_filters_python_bytecode(pipeline_dir: pathlib.Path, path: str) -> None:
     """Should filter out .pyc, .pyo, and __pycache__ files."""
-    watch_filter = watch._create_output_filter([])
+    watch_filter = watch.create_watch_filter([])
     assert watch_filter(Change.modified, path) is False
 
 
@@ -150,7 +150,7 @@ def test_output_filter_resolves_symlinks(pipeline_dir: pathlib.Path) -> None:
     def process() -> None:
         pass
 
-    watch_filter = watch._create_output_filter(["process"])
+    watch_filter = watch.create_watch_filter(["process"])
 
     # Path via symlink should be filtered (resolves to same location)
     assert watch_filter(Change.modified, str(link_path / "file.txt")) is False
@@ -158,12 +158,28 @@ def test_output_filter_resolves_symlinks(pipeline_dir: pathlib.Path) -> None:
     assert watch_filter(Change.modified, str(output_dir / "file.txt")) is False
 
 
+def test_output_filter_handles_broken_symlink(pipeline_dir: pathlib.Path) -> None:
+    """Should handle broken symlinks gracefully (can't resolve, don't filter)."""
+    broken_link = pipeline_dir / "broken_link.txt"
+    broken_link.symlink_to(pipeline_dir / "nonexistent.txt")
+
+    @stage(deps=[], outs=["output.txt"])
+    def process() -> None:
+        pass
+
+    watch_filter = watch.create_watch_filter(["process"])
+
+    # Broken symlink can't be resolved, so should not crash and should allow through
+    result = watch_filter(Change.modified, str(broken_link))
+    assert result is True, "Broken symlink should not be filtered (can't resolve)"
+
+
 # Glob filter tests
 
 
 def test_output_filter_with_glob_matches_filename(pipeline_dir: pathlib.Path) -> None:
     """Glob filter should match by filename."""
-    watch_filter = watch._create_output_filter([], watch_globs=["*.py"])
+    watch_filter = watch.create_watch_filter([], watch_globs=["*.py"])
 
     assert watch_filter(Change.modified, "/some/path/script.py") is True
     assert watch_filter(Change.modified, "/some/path/data.csv") is False
@@ -171,7 +187,7 @@ def test_output_filter_with_glob_matches_filename(pipeline_dir: pathlib.Path) ->
 
 def test_output_filter_with_glob_matches_path_pattern(pipeline_dir: pathlib.Path) -> None:
     """Glob filter should match full path patterns."""
-    watch_filter = watch._create_output_filter([], watch_globs=["*/src/*"])
+    watch_filter = watch.create_watch_filter([], watch_globs=["*/src/*"])
 
     assert watch_filter(Change.modified, "/project/src/main.py") is True
     assert watch_filter(Change.modified, "/project/tests/test.py") is False
@@ -179,7 +195,7 @@ def test_output_filter_with_glob_matches_path_pattern(pipeline_dir: pathlib.Path
 
 def test_output_filter_with_multiple_globs(pipeline_dir: pathlib.Path) -> None:
     """Multiple globs should be OR'd together."""
-    watch_filter = watch._create_output_filter([], watch_globs=["*.py", "*.txt"])
+    watch_filter = watch.create_watch_filter([], watch_globs=["*.py", "*.txt"])
 
     assert watch_filter(Change.modified, "/path/script.py") is True
     assert watch_filter(Change.modified, "/path/readme.txt") is True
@@ -194,7 +210,7 @@ def test_output_filter_glob_still_filters_outputs(pipeline_dir: pathlib.Path) ->
     def process() -> None:
         pass
 
-    watch_filter = watch._create_output_filter(["process"], watch_globs=["*.py"])
+    watch_filter = watch.create_watch_filter(["process"], watch_globs=["*.py"])
 
     # Even though it matches *.py, it should be filtered as an output
     assert watch_filter(Change.modified, str(output_path)) is False
@@ -213,7 +229,7 @@ def test_output_filter_excludes_intermediate_files(pipeline_dir: pathlib.Path) -
         pass
 
     # Both stages running - intermediate.txt is filtered as output of stage_a
-    watch_filter = watch._create_output_filter(["stage_a", "stage_b"])
+    watch_filter = watch.create_watch_filter(["stage_a", "stage_b"])
 
     # intermediate.txt is an OUTPUT of stage_a, so it should be filtered
     # even though it's also a dependency of stage_b
@@ -336,7 +352,7 @@ def test_watch_loop_passes_globs_to_filter(pipeline_dir: pathlib.Path) -> None:
     with (
         mock.patch.object(watch, "executor"),
         mock.patch.object(watch, "_wait_for_changes", mock_wait),
-        mock.patch.object(watch, "_create_output_filter") as mock_create_filter,
+        mock.patch.object(watch, "create_watch_filter") as mock_create_filter,
     ):
         mock_create_filter.return_value = lambda c, p: True  # pyright: ignore[reportUnknownLambdaType]
 

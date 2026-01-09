@@ -18,12 +18,12 @@ import loky
 import watchfiles
 import yaml
 
-from pivot import dag, executor, project, registry
+from pivot import dag, executor, project, registry, watch
 from pivot.pipeline import yaml as pipeline_yaml
 
 if TYPE_CHECKING:
     import multiprocessing as mp
-    from collections.abc import Callable, Iterator
+    from collections.abc import Callable
 
     import networkx as nx
 
@@ -123,8 +123,8 @@ class ReactiveEngine:
     def _watch_loop(self, stages_to_run: list[str]) -> None:
         """Pure producer - monitors files, enqueues changes."""
         try:
-            watch_paths = _collect_watch_paths(stages_to_run)
-            watch_filter = _create_watch_filter(stages_to_run)
+            watch_paths = watch.collect_watch_paths(stages_to_run)
+            watch_filter = watch.create_watch_filter(stages_to_run)
             pending: set[pathlib.Path] = set()
 
             logger.info(f"Watching paths: {watch_paths}")
@@ -448,72 +448,6 @@ class ReactiveEngine:
             logger.error(message)
         else:
             logger.info(message)
-
-
-def _iter_stage_infos(stages: list[str]) -> Iterator[tuple[str, RegistryStageInfo]]:
-    """Yield (name, info) pairs for valid stages, logging warnings for missing."""
-    for name in stages:
-        try:
-            yield name, registry.REGISTRY.get(name)
-        except KeyError:
-            logger.warning(f"Stage '{name}' not found in registry, skipping")
-
-
-def _collect_watch_paths(stages: list[str]) -> list[pathlib.Path]:
-    """Collect paths: project root + dependency directories for specified stages."""
-    root = project.get_project_root()
-    paths: set[pathlib.Path] = {root}
-
-    for _, info in _iter_stage_infos(stages):
-        for dep in info["deps"]:
-            dep_path = project.resolve_path(dep)
-            if dep_path.exists():
-                paths.add(dep_path.parent if dep_path.is_file() else dep_path)
-
-    return list(paths)
-
-
-def _get_output_paths_for_stages(stages: list[str]) -> set[str]:
-    """Get output paths for specific stages only."""
-    result: set[str] = set()
-
-    for _, info in _iter_stage_infos(stages):
-        for out_path in info["outs_paths"]:
-            result.add(str(out_path))
-
-    return result
-
-
-def _create_watch_filter(
-    stages_to_run: list[str],
-) -> Callable[[watchfiles.Change, str], bool]:
-    """Create filter excluding outputs from stages being run (prevents infinite loops)."""
-    outputs_to_filter = {
-        project.resolve_path(p) for p in _get_output_paths_for_stages(stages_to_run)
-    }
-
-    def watch_filter(change: watchfiles.Change, path: str) -> bool:
-        del change  # Unused but required by watchfiles signature
-
-        # Always filter Python bytecode
-        if path.endswith((".pyc", ".pyo")) or "__pycache__" in path:
-            return False
-
-        # Resolve incoming path for consistent comparison (handles symlinks)
-        try:
-            resolved_path = project.resolve_path(path)
-        except OSError:
-            # Can't resolve (symlink loop, permission denied, etc.) - don't filter
-            return True
-
-        # Check if path is an output of a stage being run, or inside such an output directory
-        for out in outputs_to_filter:
-            if resolved_path == out or out in resolved_path.parents:
-                return False
-
-        return True
-
-    return watch_filter
 
 
 def _is_code_or_config_change(changes: set[pathlib.Path]) -> bool:

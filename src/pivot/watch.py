@@ -11,7 +11,7 @@ from pivot.tui import console
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Set
+    from collections.abc import Callable
 
     from watchfiles import Change
 
@@ -28,7 +28,7 @@ def run_watch_loop(
     graph = registry.REGISTRY.build_dag(validate=True)
     stages_to_run = dag.get_execution_order(graph, stages, single_stage=single_stage)
 
-    watch_paths = _collect_watch_paths(stages_to_run)
+    watch_paths = collect_watch_paths(stages_to_run)
     con = console.get_console()
     reloads = 0
 
@@ -41,7 +41,7 @@ def run_watch_loop(
 
             # Recreate filter each iteration to capture any new outputs from registry
             # Only filter outputs from stages that are actually being run
-            watch_filter = _create_output_filter(stages_to_run, watch_globs)
+            watch_filter = create_watch_filter(stages_to_run, watch_globs)
             changes = _wait_for_changes(watch_paths, watch_filter, debounce_ms)
             con.watch_changes_detected(changes)
 
@@ -73,7 +73,7 @@ def _wait_for_changes(
     watch_paths: list[pathlib.Path],
     watch_filter: "Callable[[Change, str], bool]",
     debounce_ms: int,
-) -> "Set[tuple[Change, str]]":
+) -> "set[tuple[Change, str]]":
     """Block until file changes detected, return change set."""
     for changes in watchfiles.watch(
         *watch_paths,
@@ -110,48 +110,48 @@ def _wait_for_quiet_period(
         # More changes detected, continue waiting
 
 
-def _collect_watch_paths(stages: list[str]) -> list[pathlib.Path]:
+def collect_watch_paths(stages: list[str]) -> list[pathlib.Path]:
     """Collect paths: project root + dependency directories for specified stages."""
     root = project.get_project_root()
-    paths = {root}
+    paths: set[pathlib.Path] = {root}
     for name in stages:
         try:
             info = registry.REGISTRY.get(name)
         except KeyError:
-            logger.warning(f"Stage '{name}' not found in registry, skipping watch paths")
+            logger.warning(f"Stage '{name}' not found in registry, skipping")
             continue
         for dep in info["deps"]:
-            dep_path = pathlib.Path(dep)
-            if dep_path.exists():
+            dep_path = project.try_resolve_path(dep)
+            if dep_path is not None and dep_path.exists():
                 paths.add(dep_path.parent if dep_path.is_file() else dep_path)
     return list(paths)
 
 
-def _get_output_paths_for_stages(stages: list[str]) -> set[str]:
+def get_output_paths_for_stages(stages: list[str]) -> set[str]:
     """Get output paths for specific stages only."""
-    result = set[str]()
+    result: set[str] = set()
     for name in stages:
         try:
             info = registry.REGISTRY.get(name)
         except KeyError:
-            logger.warning(f"Stage '{name}' not found in registry, skipping output filtering")
+            logger.warning(f"Stage '{name}' not found in registry, skipping")
             continue
         for out_path in info["outs_paths"]:
             result.add(str(out_path))
     return result
 
 
-def _create_output_filter(
+def create_watch_filter(
     stages_to_run: list[str],
     watch_globs: list[str] | None = None,
 ) -> "Callable[[Change, str], bool]":
     """Create filter excluding outputs from stages being run (prevents infinite loops)."""
-    # Only filter outputs from stages that will actually execute
-    # This allows changes to outputs from NON-running stages to trigger re-runs
-    # (e.g., in single-stage mode, upstream outputs should trigger re-runs)
-    outputs_to_filter = {
-        project.resolve_path(p) for p in _get_output_paths_for_stages(stages_to_run)
-    }
+    # Collect resolved output paths, skipping any that can't be resolved
+    outputs_to_filter: set[pathlib.Path] = set()
+    for p in get_output_paths_for_stages(stages_to_run):
+        resolved = project.try_resolve_path(p)
+        if resolved is not None:
+            outputs_to_filter.add(resolved)
 
     def watch_filter(change: "Change", path: str) -> bool:
         _ = change
@@ -161,7 +161,9 @@ def _create_output_filter(
             return False
 
         # Resolve incoming path for consistent comparison
-        resolved_path = project.resolve_path(path)
+        resolved_path = project.try_resolve_path(path)
+        if resolved_path is None:
+            return True  # Can't resolve, don't filter
 
         # Check if path is an output of a stage being run, or inside such an output directory
         for out in outputs_to_filter:
@@ -171,7 +173,7 @@ def _create_output_filter(
         # Apply glob filters if specified
         if watch_globs:
             filename = resolved_path.name
-            rel_path = path  # Could make this relative to project root if needed
+            rel_path = path
             return any(
                 fnmatch.fnmatch(filename, glob) or fnmatch.fnmatch(rel_path, glob)
                 for glob in watch_globs
