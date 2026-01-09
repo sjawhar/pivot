@@ -5,9 +5,10 @@ import pathlib
 import click
 
 from pivot import cache, config, get, project
+from pivot.cli import decorators as cli_decorators
 
 
-@click.command("get")
+@cli_decorators.pivot_command("get")
 @click.argument("targets", nargs=-1, required=True)
 @click.option(
     "--rev",
@@ -46,25 +47,21 @@ def get_cmd(
       pivot get --rev v1.0 model.pkl -o old.pkl   # Get file to alternate location
       pivot get --rev abc123 train                # Get all outputs from stage
     """
-    try:
-        project_root = project.get_project_root()
-        cache_dir = project_root / ".pivot" / "cache"
+    project_root = project.get_project_root()
+    cache_dir = project_root / ".pivot" / "cache"
 
-        # Determine checkout modes
-        mode_strings = [checkout_mode] if checkout_mode else config.get_checkout_mode_order()
-        checkout_modes = [cache.CheckoutMode(m) for m in mode_strings]
+    # Determine checkout modes
+    mode_strings = [checkout_mode] if checkout_mode else config.get_checkout_mode_order()
+    checkout_modes = [cache.CheckoutMode(m) for m in mode_strings]
 
-        messages = get.restore_targets_from_revision(
-            targets=list(targets),
-            rev=rev,
-            output=output,
-            cache_dir=cache_dir,
-            checkout_modes=checkout_modes,
-            force=force,
-        )
+    messages = get.restore_targets_from_revision(
+        targets=list(targets),
+        rev=rev,
+        output=output,
+        cache_dir=cache_dir,
+        checkout_modes=checkout_modes,
+        force=force,
+    )
 
-        for msg in messages:
-            click.echo(msg)
-
-    except Exception as e:
-        raise click.ClickException(repr(e)) from e
+    for msg in messages:
+        click.echo(msg)

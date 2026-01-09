@@ -4,8 +4,10 @@ import pathlib
 
 import click
 
+from pivot.cli import decorators as cli_decorators
 
-@click.command()
+
+@cli_decorators.pivot_command()
 @click.argument("stages", nargs=-1)
 @click.option(
     "--output",
@@ -20,8 +22,5 @@ def export(stages: tuple[str, ...], output: pathlib.Path) -> None:
 
     stages_list = list(stages) if stages else None
 
-    try:
-        result = dvc_compat.export_dvc_yaml(output, stages=stages_list)
-        click.echo(f"Exported {len(result['stages'])} stages to {output}")
-    except Exception as e:
-        raise click.ClickException(repr(e)) from e
+    result = dvc_compat.export_dvc_yaml(output, stages=stages_list)
+    click.echo(f"Exported {len(result['stages'])} stages to {output}")

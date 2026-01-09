@@ -186,24 +186,6 @@ def test_cli_dry_run_specific_stage(
         assert "stage_b" not in result.output
 
 
-def test_cli_dry_run_command_directly(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
-) -> None:
-    """dry-run command can be invoked directly."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        pathlib.Path("input.txt").write_text("data")
-
-        @stage(deps=["input.txt"], outs=["output.txt"])
-        def process() -> None:
-            pass
-
-        result = runner.invoke(cli.cli, ["dry-run"])
-
-        assert result.exit_code == 0
-        assert "Would run:" in result.output
-
-
 # =============================================================================
 # Error Handling Tests
 # =============================================================================
@@ -303,3 +285,73 @@ def test_cli_list_no_stages(runner: click.testing.CliRunner) -> None:
 
     assert result.exit_code == 0
     assert "No stages registered" in result.output
+
+
+# =============================================================================
+# Categorized Help Tests
+# =============================================================================
+
+
+def test_cli_help_shows_categorized_commands(runner: click.testing.CliRunner) -> None:
+    """CLI help should show commands grouped by category."""
+    result = runner.invoke(cli.cli, ["--help"])
+    assert result.exit_code == 0
+    assert "Pipeline Commands:" in result.output
+    assert "Inspection Commands:" in result.output
+    assert "Versioning Commands:" in result.output
+    assert "Remote Commands:" in result.output
+
+
+def test_cli_help_pipeline_category_contains_run(runner: click.testing.CliRunner) -> None:
+    """Pipeline category should contain run and explain commands."""
+    result = runner.invoke(cli.cli, ["--help"])
+    assert result.exit_code == 0
+    output = result.output
+
+    pipeline_idx = output.find("Pipeline Commands:")
+    inspection_idx = output.find("Inspection Commands:")
+    pipeline_section = output[pipeline_idx:inspection_idx]
+
+    assert "run" in pipeline_section
+    assert "explain" in pipeline_section
+
+
+def test_cli_help_inspection_category_contains_list(runner: click.testing.CliRunner) -> None:
+    """Inspection category should contain list, metrics, params, plots, data."""
+    result = runner.invoke(cli.cli, ["--help"])
+    assert result.exit_code == 0
+    output = result.output
+
+    inspection_idx = output.find("Inspection Commands:")
+    versioning_idx = output.find("Versioning Commands:")
+    inspection_section = output[inspection_idx:versioning_idx]
+
+    assert "list" in inspection_section
+    assert "metrics" in inspection_section
+    assert "params" in inspection_section
+    assert "plots" in inspection_section
+    assert "data" in inspection_section
+
+
+# =============================================================================
+# Error Message with Suggestion Tests
+# =============================================================================
+
+
+def test_cli_run_unknown_stage_shows_suggestion(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """Running unknown stage shows error with suggestion to run pivot list."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        pathlib.Path("input.txt").write_text("data")
+
+        @stage(deps=["input.txt"], outs=["output.txt"])
+        def my_stage() -> None:
+            pass
+
+        result = runner.invoke(cli.cli, ["run", "nonexistent_stage"])
+
+        assert result.exit_code != 0
+        assert "nonexistent_stage" in result.output
+        assert "pivot list" in result.output, "Should suggest running pivot list"

@@ -150,10 +150,13 @@ class Console:
 
         self._echo(f"{summary} {duration}")
 
-    def error(self, message: str) -> None:
-        """Print error message."""
+    def error(self, message: str, suggestion: str | None = None) -> None:
+        """Print error message with optional suggestion."""
         prefix = self._color("Error:", "red", "bold")
         self._echo(f"{prefix} {message}")
+        if suggestion:
+            hint = self._color("Tip:", "cyan")
+            self._echo(f"  {hint} {suggestion}")
 
     def stage_output(self, name: str, line: str, is_stderr: bool = False) -> None:
         """Print captured stage output."""

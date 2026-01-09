@@ -5,6 +5,7 @@ import pathlib
 import click
 
 from pivot import cache, project, pvt, registry
+from pivot.cli import decorators as cli_decorators
 
 
 def _paths_overlap(path_a: pathlib.Path, path_b: pathlib.Path) -> bool:
@@ -172,7 +173,7 @@ def _track_single_path(
     click.echo(f"Tracked: {path_str}")
 
 
-@click.command()
+@cli_decorators.pivot_command()
 @click.argument("paths", nargs=-1, required=True)
 @click.option("--force", "-f", is_flag=True, help="Overwrite existing .pvt files")
 def track(paths: tuple[str, ...], force: bool) -> None:
@@ -180,17 +181,14 @@ def track(paths: tuple[str, ...], force: bool) -> None:
 
     Creates .pvt manifest files and caches content for reproducibility.
     """
-    try:
-        project_root = project.get_project_root()
-        cache_dir = project_root / ".pivot" / "cache" / "files"
+    project_root = project.get_project_root()
+    cache_dir = project_root / ".pivot" / "cache" / "files"
 
-        # Get all stage outputs for overlap detection
-        stage_outputs = _get_all_stage_outputs()
+    # Get all stage outputs for overlap detection
+    stage_outputs = _get_all_stage_outputs()
 
-        # Discover existing .pvt files
-        existing_tracked = pvt.discover_pvt_files(project_root)
+    # Discover existing .pvt files
+    existing_tracked = pvt.discover_pvt_files(project_root)
 
-        for path_str in paths:
-            _track_single_path(path_str, cache_dir, stage_outputs, existing_tracked, force)
-    except Exception as e:
-        raise click.ClickException(repr(e)) from e
+    for path_str in paths:
+        _track_single_path(path_str, cache_dir, stage_outputs, existing_tracked, force)

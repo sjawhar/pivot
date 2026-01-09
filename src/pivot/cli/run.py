@@ -6,7 +6,8 @@ from typing import TYPE_CHECKING
 
 import click
 
-from pivot import discovery, executor, registry
+from pivot import discovery, exceptions, executor, registry
+from pivot.cli import decorators as cli_decorators
 from pivot.types import DisplayMode, StageExplanation, StageStatus
 
 if TYPE_CHECKING:
@@ -36,7 +37,7 @@ def _validate_stages(stages_list: list[str] | None, single_stage: bool) -> None:
         registered = set(graph.nodes())
         unknown = [s for s in stages_list if s not in registered]
         if unknown:
-            raise click.ClickException(f"Unknown stage(s): {', '.join(unknown)}")
+            raise exceptions.StageNotFoundError(f"Unknown stage(s): {', '.join(unknown)}")
 
 
 def _get_all_explanations(
@@ -141,7 +142,7 @@ def _print_results(results: dict[str, ExecutionSummary]) -> None:
     click.echo(f"\nTotal: {', '.join(parts)}")
 
 
-@click.command()
+@cli_decorators.pivot_command()
 @click.argument("stages", nargs=-1)
 @click.option(
     "--single-stage",
@@ -222,29 +223,26 @@ def run(
     display_mode = DisplayMode(display) if display else None
 
     # Normal execution (with optional explain mode)
-    try:
-        from pivot import run_tui
+    from pivot import run_tui
 
-        use_tui = run_tui.should_use_tui(display_mode) and not explain
-        if use_tui:
-            results = _run_with_tui(stages_list, single_stage, cache_dir)
-        else:
-            results = executor.run(
-                stages=stages_list,
-                single_stage=single_stage,
-                cache_dir=cache_dir,
-                explain_mode=explain,
-            )
+    use_tui = run_tui.should_use_tui(display_mode) and not explain
+    if use_tui:
+        results = _run_with_tui(stages_list, single_stage, cache_dir)
+    else:
+        results = executor.run(
+            stages=stages_list,
+            single_stage=single_stage,
+            cache_dir=cache_dir,
+            explain_mode=explain,
+        )
 
-        if not results:
-            click.echo("No stages to run")
-        elif not explain and not use_tui:
-            _print_results(results)
-    except Exception as e:
-        raise click.ClickException(repr(e)) from e
+    if not results:
+        click.echo("No stages to run")
+    elif not explain and not use_tui:
+        _print_results(results)
 
 
-@click.command("dry-run")
+@cli_decorators.pivot_command("dry-run")
 @click.argument("stages", nargs=-1)
 @click.option(
     "--single-stage",
@@ -261,24 +259,20 @@ def dry_run_cmd(
     stages_list = list(stages) if stages else None
     _validate_stages(stages_list, single_stage)
 
-    try:
-        explanations = _get_all_explanations(stages_list, single_stage, cache_dir)
+    explanations = _get_all_explanations(stages_list, single_stage, cache_dir)
 
-        if not explanations:
-            click.echo("No stages to run")
-            return
+    if not explanations:
+        click.echo("No stages to run")
+        return
 
-        click.echo("Would run:")
-        for exp in explanations:
-            status = "would run" if exp["will_run"] else "would skip"
-            reason = exp["reason"] or "unchanged"
-            click.echo(f"  {exp['stage_name']}: {status} ({reason})")
-
-    except Exception as e:
-        raise click.ClickException(repr(e)) from e
+    click.echo("Would run:")
+    for exp in explanations:
+        status = "would run" if exp["will_run"] else "would skip"
+        reason = exp["reason"] or "unchanged"
+        click.echo(f"  {exp['stage_name']}: {status} ({reason})")
 
 
-@click.command("explain")
+@cli_decorators.pivot_command("explain")
 @click.argument("stages", nargs=-1)
 @click.option(
     "--single-stage",
@@ -297,19 +291,15 @@ def explain_cmd(
     stages_list = list(stages) if stages else None
     _validate_stages(stages_list, single_stage)
 
-    try:
-        explanations = _get_all_explanations(stages_list, single_stage, cache_dir)
+    explanations = _get_all_explanations(stages_list, single_stage, cache_dir)
 
-        if not explanations:
-            click.echo("No stages to run")
-            return
+    if not explanations:
+        click.echo("No stages to run")
+        return
 
-        con = console.Console()
-        for exp in explanations:
-            con.explain_stage(exp)
+    con = console.Console()
+    for exp in explanations:
+        con.explain_stage(exp)
 
-        will_run = sum(1 for e in explanations if e["will_run"])
-        con.explain_summary(will_run, len(explanations) - will_run)
-
-    except Exception as e:
-        raise click.ClickException(repr(e)) from e
+    will_run = sum(1 for e in explanations if e["will_run"])
+    con.explain_summary(will_run, len(explanations) - will_run)

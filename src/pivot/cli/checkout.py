@@ -5,6 +5,7 @@ import pathlib
 import click
 
 from pivot import cache, config, lock, project, pvt, registry
+from pivot.cli import decorators as cli_decorators
 from pivot.types import OutputHash
 
 
@@ -81,12 +82,18 @@ def _checkout_target(
     if abs_path_str in stage_outputs:
         output_hash = stage_outputs[abs_path_str]
         if output_hash is None:
-            raise click.ClickException(f"'{target}' has no cached version")
+            raise click.ClickException(
+                f"'{target}' has no cached version. "
+                + "Run the stage first, or use 'pivot pull' to fetch from remote."
+            )
         _restore_path(abs_path, output_hash, cache_dir, checkout_modes, force)
         return
 
     # Unknown target
-    raise click.ClickException(f"'{target}' is not a tracked file or stage output")
+    raise click.ClickException(
+        f"'{target}' is not a tracked file or stage output. "
+        + "Use 'pivot list' to see stages or 'pivot track' to track files."
+    )
 
 
 def _pvt_to_output_hash(pvt_data: pvt.PvtData) -> OutputHash:
@@ -114,12 +121,15 @@ def _restore_path(
 
     success = cache.restore_from_cache(path, output_hash, cache_dir, checkout_modes=checkout_modes)
     if not success:
-        raise click.ClickException(f"Failed to restore '{path.name}': not found in cache")
+        raise click.ClickException(
+            f"Failed to restore '{path.name}': not found in cache. "
+            + "Try 'pivot pull' to fetch from remote storage."
+        )
 
     click.echo(f"Restored: {path.name}")
 
 
-@click.command()
+@cli_decorators.pivot_command()
 @click.argument("targets", nargs=-1)
 @click.option(
     "--checkout-mode",
@@ -133,29 +143,24 @@ def checkout(targets: tuple[str, ...], checkout_mode: str | None, force: bool) -
 
     If no targets specified, restores all tracked files and stage outputs.
     """
-    try:
-        project_root = project.get_project_root()
-        cache_dir = project_root / ".pivot" / "cache" / "files"
+    project_root = project.get_project_root()
+    cache_dir = project_root / ".pivot" / "cache" / "files"
 
-        # Determine checkout modes - CLI flag overrides config (single mode, no fallback)
-        mode_strings = [checkout_mode] if checkout_mode else config.get_checkout_mode_order()
-        checkout_modes = [cache.CheckoutMode(m) for m in mode_strings]
+    # Determine checkout modes - CLI flag overrides config (single mode, no fallback)
+    mode_strings = [checkout_mode] if checkout_mode else config.get_checkout_mode_order()
+    checkout_modes = [cache.CheckoutMode(m) for m in mode_strings]
 
-        # Discover tracked files
-        tracked_files = pvt.discover_pvt_files(project_root)
+    # Discover tracked files
+    tracked_files = pvt.discover_pvt_files(project_root)
 
-        # Get stage output info from lock files
-        stage_outputs = _get_stage_output_info(project_root)
+    # Get stage output info from lock files
+    stage_outputs = _get_stage_output_info(project_root)
 
-        if not targets:
-            # Restore everything
-            _checkout_all_tracked(tracked_files, cache_dir, checkout_modes, force)
-            _checkout_all_outputs(stage_outputs, cache_dir, checkout_modes, force)
-        else:
-            # Restore specific targets
-            for target in targets:
-                _checkout_target(
-                    target, tracked_files, stage_outputs, cache_dir, checkout_modes, force
-                )
-    except Exception as e:
-        raise click.ClickException(repr(e)) from e
+    if not targets:
+        # Restore everything
+        _checkout_all_tracked(tracked_files, cache_dir, checkout_modes, force)
+        _checkout_all_outputs(stage_outputs, cache_dir, checkout_modes, force)
+    else:
+        # Restore specific targets
+        for target in targets:
+            _checkout_target(target, tracked_files, stage_outputs, cache_dir, checkout_modes, force)
