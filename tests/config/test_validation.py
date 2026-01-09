@@ -147,7 +147,7 @@ def test_empty_stage_name_raises_error() -> None:
     def stage1() -> None:
         pass
 
-    with pytest.raises(ValidationError, match="cannot be empty"):
+    with pytest.raises(ValidationError, match="must start with a letter"):
         reg.register(stage1, name="", deps=list[str](), outs=list[str](), params=None)
 
 
@@ -158,7 +158,7 @@ def test_whitespace_only_stage_name_raises_error() -> None:
     def stage1() -> None:
         pass
 
-    with pytest.raises(ValidationError, match="cannot be empty"):
+    with pytest.raises(ValidationError, match="must start with a letter"):
         reg.register(stage1, name="   ", deps=list[str](), outs=list[str](), params=None)
 
 

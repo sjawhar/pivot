@@ -62,7 +62,7 @@ def _validate_path(path: str) -> None:
 
 
 def write_pvt_file(pvt_path: pathlib.Path, data: PvtData) -> None:
-    """Write .pvt file atomically."""
+    """Write .pvt manifest file atomically with path validation."""
     _validate_path(data["path"])
 
     def write_yaml(fd: int) -> None:
@@ -73,7 +73,7 @@ def write_pvt_file(pvt_path: pathlib.Path, data: PvtData) -> None:
 
 
 def read_pvt_file(pvt_path: pathlib.Path) -> PvtData | None:
-    """Read .pvt file, return None if missing or invalid."""
+    """Read .pvt manifest file; returns None if missing, invalid, or insecure."""
     try:
         with open(pvt_path) as f:
             data: object = yaml.load(f, Loader=_Loader)
@@ -83,18 +83,18 @@ def read_pvt_file(pvt_path: pathlib.Path) -> PvtData | None:
         if has_path_traversal(data["path"]):
             return None
         return data
-    except (FileNotFoundError, UnicodeDecodeError, yaml.YAMLError):
+    except (FileNotFoundError, PermissionError, UnicodeDecodeError, yaml.YAMLError):
         return None
 
 
 def get_pvt_path(data_path: pathlib.Path) -> pathlib.Path:
-    """Get .pvt path for a data path (file.csv -> file.csv.pvt, dir/ -> dir.pvt)."""
+    """Convert data path to its .pvt manifest path (e.g., file.csv -> file.csv.pvt)."""
     # pathlib normalizes trailing slashes, so "images/" becomes "images"
     return data_path.with_suffix(data_path.suffix + ".pvt")
 
 
 def get_data_path(pvt_path: pathlib.Path) -> pathlib.Path:
-    """Get data path from .pvt path."""
+    """Convert .pvt manifest path back to data path (e.g., file.csv.pvt -> file.csv)."""
     if not pvt_path.suffix == ".pvt":
         raise ValueError(f"Expected .pvt file, got: {pvt_path}")
     # Remove .pvt suffix
