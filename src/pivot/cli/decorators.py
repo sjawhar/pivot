@@ -34,7 +34,7 @@ def with_error_handling[**P, R](func: Callable[P, R]) -> Callable[P, R]:
         except Exception as e:
             raise click.ClickException(repr(e)) from e
 
-    return wrapper  # type: ignore[return-value]
+    return wrapper
 
 
 def pivot_command(

@@ -154,8 +154,15 @@ def collect_all_stage_metrics_flat() -> dict[str, MetricData]:
 def collect_metrics_from_files(
     targets: Sequence[str],
     recursive: bool = False,
+    tolerant: bool = False,
 ) -> dict[str, MetricData]:
-    """Parse metric files directly from filesystem. Returns {path: {key: value}}."""
+    """Parse metric files directly from filesystem. Returns {path: {key: value}}.
+
+    Args:
+        targets: File/directory paths to collect metrics from.
+        recursive: If True, search directories recursively.
+        tolerant: If True, warn and skip missing files. If False (default), raise error.
+    """
     result = dict[str, MetricData]()
     for target in targets:
         path = pathlib.Path(target)
@@ -167,6 +174,9 @@ def collect_metrics_from_files(
         elif path.is_file():
             result[str(path)] = parse_metric_file(path)
         else:
+            if tolerant:
+                logger.warning(f"Metric file not found: {target}")
+                continue
             raise MetricsError(f"Path not found: {target}")
     return result
 

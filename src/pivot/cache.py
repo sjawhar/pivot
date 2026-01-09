@@ -167,14 +167,41 @@ def get_cache_path(cache_dir: pathlib.Path, file_hash: str) -> pathlib.Path:
     return cache_dir / file_hash[:2] / file_hash[2:]
 
 
+def _make_writable_and_retry(func: Callable[[str], object], path: str, exc: BaseException) -> None:
+    """onexc handler for rmtree: make read-only items writable before retrying."""
+    # Make parent directory writable so we can modify its contents
+    parent = os.path.dirname(path)
+    if parent:
+        try:
+            parent_perm = os.lstat(parent).st_mode
+            if not (parent_perm & stat.S_IWUSR):
+                os.chmod(parent, parent_perm | stat.S_IWUSR)
+        except OSError:
+            pass  # Best effort - may not own parent
+
+    # Make the target itself writable
+    try:
+        perm = os.lstat(path).st_mode
+        os.chmod(path, perm | stat.S_IWUSR)
+    except OSError as chmod_exc:
+        if chmod_exc.errno not in (errno.ENOENT, errno.EPERM):
+            raise exc from chmod_exc
+
+    func(path)
+
+
 def _clear_path(path: pathlib.Path) -> None:
     """Remove file, symlink, or directory at path if it exists."""
     if not path.exists() and not path.is_symlink():
         return
     if path.is_dir() and not path.is_symlink():
-        shutil.rmtree(path)
+        shutil.rmtree(path, onexc=_make_writable_and_retry)
     else:
-        path.unlink()
+        try:
+            path.unlink()
+        except PermissionError:
+            os.chmod(path, path.stat().st_mode | stat.S_IWUSR)
+            path.unlink()
 
 
 def _get_symlink_cache_hash(path: pathlib.Path, cache_dir: pathlib.Path) -> str | None:

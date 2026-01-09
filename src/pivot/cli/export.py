@@ -19,7 +19,16 @@ from pivot.cli import decorators as cli_decorators
 )
 def export(stages: tuple[str, ...], output: pathlib.Path) -> None:
     """Export pipeline to DVC YAML format."""
-    from pivot import dvc_compat
+    from pivot import dvc_compat, path_policy, project
+
+    # Validate output path stays within project
+    proj_root = project.get_project_root()
+    path_policy.require_valid_path(
+        str(output),
+        path_policy.PathType.CLI_OUTPUT,
+        proj_root,
+        context="export --output",
+    )
 
     stages_list = list(stages) if stages else None
 
