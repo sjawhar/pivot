@@ -1,12 +1,10 @@
 from pivot import cache as cache
 from pivot import dvc_compat as dvc_compat
 from pivot import explain as explain
-from pivot import metrics as metrics
 from pivot import outputs as outputs
 from pivot import parameters as parameters
 from pivot import pipeline as pipeline
 from pivot import pipeline_config as pipeline_config
-from pivot import plots as plots
 from pivot import pvt as pvt
 from pivot import state as state
 from pivot.outputs import BaseOut as BaseOut
@@ -18,5 +16,8 @@ from pivot.pipeline import Pipeline as Pipeline
 from pivot.registry import REGISTRY as REGISTRY
 from pivot.registry import Variant as Variant
 from pivot.registry import stage as stage
+from pivot.show import metrics as metrics
+from pivot.show import params as params
+from pivot.show import plots as plots
 
 __version__ = "0.1.0-dev"
