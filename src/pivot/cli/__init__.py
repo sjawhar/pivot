@@ -32,6 +32,7 @@ from pivot.cli import params as params_mod  # noqa: E402
 from pivot.cli import plots as plots_mod  # noqa: E402
 from pivot.cli import remote as remote_mod  # noqa: E402
 from pivot.cli import run as run_mod  # noqa: E402
+from pivot.cli import status as status_mod  # noqa: E402
 from pivot.cli import track as track_mod  # noqa: E402
 
 cli.add_command(run_mod.run)
@@ -40,6 +41,7 @@ cli.add_command(run_mod.explain_cmd, name="explain")
 cli.add_command(list_mod.list_cmd, name="list")
 cli.add_command(export_mod.export)
 cli.add_command(track_mod.track)
+cli.add_command(status_mod.status)
 cli.add_command(checkout_mod.checkout)
 cli.add_command(get_mod.get_cmd, name="get")
 cli.add_command(metrics_mod.metrics)

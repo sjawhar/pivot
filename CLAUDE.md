@@ -318,6 +318,39 @@ logger.info(f"Stage {name} completed in {duration:.2f}s")
 print(f"Stage {name} completed")
 ```
 
+## CLI Output: Explicit Over Implicit
+
+**Always show explicit messages instead of showing nothing.** When a user requests information and there's nothing to show, tell them explicitly rather than displaying nothing.
+
+```python
+# Good - explicit empty state
+click.echo("Tracked Files")
+if not tracked_status:
+    click.echo("  No tracked files")
+    return
+
+# Bad - shows nothing for empty state
+if tracked_status:
+    click.echo("Tracked Files")
+    for file in tracked_status:
+        click.echo(f"  {file}")
+```
+
+**For JSON output:** Always include requested sections, even if empty. Use empty arrays/objects rather than omitting keys.
+
+```python
+# Good - always include requested keys
+data = StatusOutput()
+if show_stages:
+    data["stages"] = pipeline_status  # Include even if empty list
+
+# Bad - omits empty sections
+if pipeline_status:  # Truthiness check excludes empty lists
+    data["stages"] = pipeline_status
+```
+
+This applies to all user-facing output: CLI commands, status displays, list views, etc. Users should never wonder "did it work?" or "is something broken?" because the output was empty.
+
 ## Development Commands
 
 ```bash

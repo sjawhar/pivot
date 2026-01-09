@@ -200,6 +200,46 @@ class RawPivotConfig(TypedDict, total=False):
 
 
 # =============================================================================
+# Status Types
+# =============================================================================
+
+
+class PipelineStatusInfo(TypedDict):
+    """Status info for a single stage in pivot status output."""
+
+    name: str
+    status: Literal["cached", "stale"]
+    reason: str
+    upstream_stale: list[str]
+
+
+class TrackedFileInfo(TypedDict):
+    """Status of a tracked file from pivot track."""
+
+    path: str
+    status: Literal["clean", "modified", "missing"]
+    size: int
+
+
+class RemoteSyncInfo(TypedDict):
+    """Remote sync status for pivot status output."""
+
+    name: str
+    url: str
+    push_count: int
+    pull_count: int
+
+
+class StatusOutput(TypedDict, total=False):
+    """JSON output structure for pivot status command."""
+
+    stages: list[PipelineStatusInfo]
+    tracked_files: list[TrackedFileInfo]
+    remote: RemoteSyncInfo
+    suggestions: list[str]
+
+
+# =============================================================================
 # Data Diff Types
 # =============================================================================
 
