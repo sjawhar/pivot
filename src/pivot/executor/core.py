@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import atexit
 import collections
 import concurrent.futures
 import contextlib
 import dataclasses
 import datetime
+import functools
 import logging
 import multiprocessing as mp
 import os
@@ -12,7 +14,7 @@ import pathlib
 import queue
 import threading
 import time
-from typing import TYPE_CHECKING, Literal, TypedDict, cast
+from typing import TYPE_CHECKING, Literal, TypedDict
 
 import loky
 
@@ -53,6 +55,17 @@ _MAX_WORKERS_DEFAULT = 8
 
 # Special mutex that means "run exclusively" - no other stages run concurrently
 EXCLUSIVE_MUTEX = "*"
+
+
+def _cleanup_worker_pool() -> None:
+    """Kill loky worker pool on process exit to prevent orphaned workers."""
+    with contextlib.suppress(Exception):
+        loky.get_reusable_executor(max_workers=1, kill_workers=True)
+
+
+@functools.cache  # Ensures single atexit registration across threads
+def _ensure_cleanup_registered() -> None:
+    atexit.register(_cleanup_worker_pool)
 
 
 class ExecutionSummary(TypedDict):
@@ -311,7 +324,8 @@ def _warn_single_stage_mutex_groups(stage_states: dict[str, StageState]) -> None
 
 def _create_executor(max_workers: int) -> concurrent.futures.Executor:
     """Get reusable loky executor - workers persist across calls for efficiency."""
-    return cast("concurrent.futures.Executor", loky.get_reusable_executor(max_workers=max_workers))
+    _ensure_cleanup_registered()
+    return loky.get_reusable_executor(max_workers=max_workers)
 
 
 def _execute_greedy(

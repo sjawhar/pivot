@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from pivot import project
+from pivot.executor import core as executor_core
 from pivot.registry import REGISTRY
 from pivot.tui import console
 
@@ -90,3 +91,10 @@ def git_repo(tmp_path: pathlib.Path) -> GitRepo:
         return result.stdout.strip()
 
     return tmp_path, commit
+
+
+@pytest.fixture(scope="session", autouse=True)
+def cleanup_worker_pool() -> Generator[None]:
+    """Kill loky worker pool at end of test session to prevent orphaned workers."""
+    yield
+    executor_core._cleanup_worker_pool()
