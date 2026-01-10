@@ -23,6 +23,7 @@ from pivot.types import (
     TuiMessage,
     TuiMessageType,
     TuiReactiveMessage,
+    TuiReloadMessage,
     TuiStatusMessage,
 )
 
@@ -158,9 +159,11 @@ class StatusBar(textual.widgets.Static):
 class TuiUpdate(textual.message.Message):
     """Custom message for executor updates."""
 
-    msg: TuiLogMessage | TuiStatusMessage | TuiReactiveMessage
+    msg: TuiLogMessage | TuiStatusMessage | TuiReactiveMessage | TuiReloadMessage
 
-    def __init__(self, msg: TuiLogMessage | TuiStatusMessage | TuiReactiveMessage) -> None:
+    def __init__(
+        self, msg: TuiLogMessage | TuiStatusMessage | TuiReactiveMessage | TuiReloadMessage
+    ) -> None:
         self.msg = msg
         super().__init__()
 
@@ -553,6 +556,8 @@ class RunTuiApp(textual.app.App[dict[str, executor.ExecutionSummary] | None]):
                 self._handle_status(msg)
             case TuiMessageType.REACTIVE:
                 pass  # Reactive messages handled separately in reactive mode
+            case TuiMessageType.RELOAD:
+                pass  # Reload messages handled separately in watch mode
 
     def _handle_log(self, msg: TuiLogMessage) -> None:  # pragma: no cover
         stage = msg["stage"]

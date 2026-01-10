@@ -81,7 +81,7 @@ def test_diff_code_multiple_changes() -> None:
 
     changes = explain.diff_code_manifests(old, new)
 
-    keys = {c["key"]: c for c in changes}
+    keys: dict[str, CodeChange] = {c["key"]: c for c in changes}
     assert len(keys) == 3
     assert keys["func:a"]["change_type"] == "modified"
     assert keys["func:b"]["change_type"] == "removed"
@@ -265,6 +265,7 @@ def test_get_stage_explanation_no_lock(tmp_path: Path) -> None:
     assert result == StageExplanation(
         stage_name="new_stage",
         will_run=True,
+        is_forced=False,
         reason="No previous run",
         code_changes=[],
         param_changes=[],
@@ -493,3 +494,109 @@ def test_get_stage_explanation_invalid_params(
 
     assert result["will_run"] is True
     assert "invalid" in result["reason"].lower() or "error" in result["reason"].lower()
+
+
+# =============================================================================
+# get_stage_explanation force=True tests
+# =============================================================================
+
+
+@pytest.mark.parametrize(
+    ("stage_name", "create_lock"),
+    [
+        pytest.param("no_lock_stage", False, id="no_lock"),
+        pytest.param("unchanged_stage", True, id="unchanged"),
+    ],
+)
+def test_get_stage_explanation_force_without_changes(
+    tmp_path: Path, stage_name: str, create_lock: bool
+) -> None:
+    """Force=True with no actual changes shows 'forced' reason and is_forced=True."""
+    fingerprint = {f"self:{stage_name}": "abc123"}
+
+    if create_lock:
+        stage_lock = lock.StageLock(stage_name, tmp_path)
+        stage_lock.write(
+            LockData(
+                code_manifest=fingerprint,
+                params={},
+                dep_hashes={},
+                output_hashes={},
+            )
+        )
+
+    result = explain.get_stage_explanation(
+        stage_name=stage_name,
+        fingerprint=fingerprint,
+        deps=[],
+        params_instance=None,
+        overrides=None,
+        cache_dir=tmp_path,
+        force=True,
+    )
+
+    assert result == StageExplanation(
+        stage_name=stage_name,
+        will_run=True,
+        is_forced=True,
+        reason="forced",
+        code_changes=[],
+        param_changes=[],
+        dep_changes=[],
+    )
+
+
+def test_get_stage_explanation_force_with_code_changes(tmp_path: Path) -> None:
+    """Force with code changes shows code changes but is_forced=True."""
+    stage_lock = lock.StageLock("code_stage", tmp_path)
+    stage_lock.write(
+        LockData(
+            code_manifest={"self:code_stage": "old_hash"},
+            params={},
+            dep_hashes={},
+            output_hashes={},
+        )
+    )
+
+    result = explain.get_stage_explanation(
+        stage_name="code_stage",
+        fingerprint={"self:code_stage": "new_hash"},
+        deps=[],
+        params_instance=None,
+        overrides=None,
+        cache_dir=tmp_path,
+        force=True,
+    )
+
+    assert result["will_run"] is True
+    assert result["is_forced"] is True
+    assert result["reason"] == "Code changed", "Code changes take precedence over 'forced' reason"
+    assert len(result["code_changes"]) == 1
+    assert result["code_changes"][0]["key"] == "self:code_stage"
+
+
+def test_get_stage_explanation_force_with_missing_deps(tmp_path: Path) -> None:
+    """Force with missing deps shows missing deps but is_forced=True."""
+    stage_lock = lock.StageLock("dep_stage", tmp_path)
+    stage_lock.write(
+        LockData(
+            code_manifest={"self:dep_stage": "abc"},
+            params={},
+            dep_hashes={},
+            output_hashes={},
+        )
+    )
+
+    result = explain.get_stage_explanation(
+        stage_name="dep_stage",
+        fingerprint={"self:dep_stage": "abc"},
+        deps=["nonexistent.csv"],
+        params_instance=None,
+        overrides=None,
+        cache_dir=tmp_path,
+        force=True,
+    )
+
+    assert result["will_run"] is True
+    assert result["is_forced"] is True
+    assert "missing" in result["reason"].lower()

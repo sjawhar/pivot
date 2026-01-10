@@ -1,18 +1,12 @@
 import os
-import pathlib
 import sys
 import time
 from collections.abc import Mapping, Sequence
-from typing import TYPE_CHECKING, TextIO
+from typing import TextIO
 
 import click
 
 from pivot.types import StageDisplayStatus, StageExplanation, StageStatus
-
-if TYPE_CHECKING:
-    from collections.abc import Set
-
-    from watchfiles import Change
 
 # ANSI color codes
 _COLORS = {
@@ -164,34 +158,6 @@ class Console:
         line_colored = self._color(line, "red") if is_stderr else line
         self._echo(f"{prefix} {line_colored}")
 
-    def watch_start(self, paths: list[pathlib.Path]) -> None:
-        """Print watch mode startup message."""
-        header = self._color("Watch mode started", "cyan", "bold")
-        paths_str = ", ".join(str(p) for p in paths[:3])
-        if len(paths) > 3:
-            paths_str += f" (+{len(paths) - 3} more)"
-        self._echo(f"\n{header}")
-        self._echo(f"Watching: {paths_str}")
-
-    def watch_waiting(self) -> None:
-        """Print waiting for changes message."""
-        msg = self._color("Waiting for file changes... (Ctrl+C to exit)", "dim")
-        self._echo(f"\n{msg}\n")
-
-    def watch_changes_detected(self, changes: "Set[tuple[Change, str]]") -> None:
-        """Print detected changes summary."""
-        files = [pathlib.Path(path).name for _, path in changes]
-        files_str = ", ".join(files[:5])
-        if len(files) > 5:
-            files_str += f" (+{len(files) - 5} more)"
-        header = self._color("Changes detected:", "yellow", "bold")
-        self._echo(f"\n{header} {files_str}")
-
-    def watch_stopped(self) -> None:
-        """Print watch mode stopped message."""
-        msg = self._color("\nWatch mode stopped", "cyan")
-        self._echo(msg)
-
     def _print_changes(
         self,
         header: str,
@@ -226,13 +192,16 @@ class Console:
         """Print detailed explanation of why a stage would run."""
         name = explanation["stage_name"]
         will_run = explanation["will_run"]
+        is_forced = explanation["is_forced"]
         reason = explanation["reason"]
 
         self._echo(f"\nStage: {self._color(name, 'bold')}")
 
-        status_text = (
-            self._color("WILL RUN", "green", "bold") if will_run else self._color("SKIP", "yellow")
-        )
+        if will_run:
+            status_label = "WILL RUN (forced)" if is_forced else "WILL RUN"
+            status_text = self._color(status_label, "green", "bold")
+        else:
+            status_text = self._color("SKIP", "yellow")
         self._echo(f"  Status: {status_text}")
 
         if reason:

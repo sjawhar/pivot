@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Integration tests for the reactive engine.
+"""Integration tests for watch mode (ReactiveEngine).
 
 Tests:
-1. Output correctness - reactive mode produces same outputs as fresh run
+1. Output correctness - watch mode produces same outputs as fresh run
 2. Stage selection - correct stages run after specific changes
 3. Change detection latency - time from file change to execution start
 4. Debouncing - rapid changes coalesce into single execution
@@ -122,11 +122,9 @@ def test_fresh_run(tmp_dir: pathlib.Path) -> dict[str, str]:
     return hashes
 
 
-def test_reactive_produces_same_output(
-    tmp_dir: pathlib.Path, expected_hashes: dict[str, str]
-) -> None:
-    """Verify reactive mode produces identical outputs."""
-    print("\n=== Test: Reactive Output Correctness ===")
+def test_watch_produces_same_output(tmp_dir: pathlib.Path, expected_hashes: dict[str, str]) -> None:
+    """Verify watch mode produces identical outputs."""
+    print("\n=== Test: Watch Output Correctness ===")
 
     # Clean outputs
     for d in ["data/processed.txt", "results"]:
@@ -137,12 +135,12 @@ def test_reactive_produces_same_output(
             else:
                 p.unlink()
 
-    # Start reactive mode in background
+    # Start watch mode in background
     env = os.environ.copy()
     env["PYTHONPATH"] = str(tmp_dir)
 
     proc = subprocess.Popen(
-        [str(PIVOT_BIN), "run", "--reactive"],
+        [str(PIVOT_BIN), "run", "--watch"],
         cwd=tmp_dir,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -159,13 +157,13 @@ def test_reactive_produces_same_output(
             "processed": hash_file(tmp_dir / "data" / "processed.txt"),
             "output": hash_file(tmp_dir / "results" / "output.txt"),
         }
-        print(f"Reactive output hashes: {hashes}")
+        print(f"Watch output hashes: {hashes}")
 
         if hashes != expected_hashes:
             print("FAIL: Hashes don't match!")
             print(f"  Expected: {expected_hashes}")
             print(f"  Got: {hashes}")
-            raise AssertionError("Reactive mode produced different output")
+            raise AssertionError("Watch mode produced different output")
 
         print("PASS: Outputs match fresh run")
 
@@ -182,7 +180,7 @@ def test_data_change_triggers_rerun(tmp_dir: pathlib.Path) -> None:
     env["PYTHONPATH"] = str(tmp_dir)
 
     proc = subprocess.Popen(
-        [str(PIVOT_BIN), "run", "--reactive"],
+        [str(PIVOT_BIN), "run", "--watch"],
         cwd=tmp_dir,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -201,7 +199,7 @@ def test_data_change_triggers_rerun(tmp_dir: pathlib.Path) -> None:
         input_file = tmp_dir / "data" / "input.txt"
         input_file.write_text("line1\nline2\nline3\nline4\n")  # Added line4
 
-        # Wait for reactive re-run
+        # Wait for watch re-run
         time.sleep(3)
 
         # Check output changed
@@ -232,7 +230,7 @@ def test_code_change_triggers_reload(tmp_dir: pathlib.Path) -> None:
     env["PYTHONPATH"] = str(tmp_dir)
 
     proc = subprocess.Popen(
-        [str(PIVOT_BIN), "-v", "run", "--reactive"],  # -v must come before run
+        [str(PIVOT_BIN), "-v", "run", "--watch"],  # -v must come before run
         cwd=tmp_dir,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -259,7 +257,7 @@ def test_code_change_triggers_reload(tmp_dir: pathlib.Path) -> None:
         stages_file.write_text(new_code)
         print(f"Modified stages.py contains 'ANALYZED_V2:': {'ANALYZED_V2:' in new_code}")
 
-        # Wait for reactive re-run - longer wait to be safe
+        # Wait for watch re-run - longer wait to be safe
         time.sleep(8)
 
         # Check output reflects code change
@@ -314,7 +312,7 @@ def analyze() -> None:
     env["PYTHONPATH"] = str(tmp_dir)
 
     proc = subprocess.Popen(
-        [str(PIVOT_BIN), "run", "--reactive"],
+        [str(PIVOT_BIN), "run", "--watch"],
         cwd=tmp_dir,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -351,7 +349,7 @@ def analyze() -> None:
 def main() -> int:
     """Run all tests."""
     print("=" * 60)
-    print("Reactive Engine Integration Tests")
+    print("Watch Mode Integration Tests")
     print("=" * 60)
 
     if not PIVOT_BIN.exists():
@@ -367,7 +365,7 @@ def main() -> int:
 
             # Run tests
             fresh_hashes = test_fresh_run(tmp_dir)
-            test_reactive_produces_same_output(tmp_dir, fresh_hashes)
+            test_watch_produces_same_output(tmp_dir, fresh_hashes)
             test_data_change_triggers_rerun(tmp_dir)
             test_code_change_triggers_reload(tmp_dir)
             test_debouncing(tmp_dir)

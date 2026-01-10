@@ -4,7 +4,7 @@ from typing import override
 import pytest
 
 from pivot.tui import console
-from pivot.types import StageDisplayStatus, StageStatus
+from pivot.types import StageDisplayStatus, StageExplanation, StageStatus
 
 
 class _NoIsattyStream(io.StringIO):
@@ -267,13 +267,71 @@ def test_console_no_color_output() -> None:
 
 def test_get_console_returns_singleton() -> None:
     """get_console returns the same instance on repeated calls."""
-    # Reset the global
-    console._console = None
-
     con1 = console.get_console()
     con2 = console.get_console()
 
     assert con1 is con2
 
-    # Clean up
-    console._console = None
+
+# =============================================================================
+# explain_stage tests
+# =============================================================================
+
+
+@pytest.mark.parametrize(
+    ("will_run", "is_forced", "reason", "expected_in_output", "not_expected_in_output"),
+    [
+        pytest.param(
+            True,
+            False,
+            "Code changed",
+            ["my_stage", "WILL RUN", "Code changed"],
+            ["(forced)"],
+            id="will_run",
+        ),
+        pytest.param(
+            True,
+            True,
+            "forced",
+            ["my_stage", "WILL RUN (forced)", "forced"],
+            [],
+            id="forced",
+        ),
+        pytest.param(
+            False,
+            False,
+            "",
+            ["my_stage", "SKIP"],
+            [],
+            id="skip",
+        ),
+    ],
+)
+def test_console_explain_stage(
+    will_run: bool,
+    is_forced: bool,
+    reason: str,
+    expected_in_output: list[str],
+    not_expected_in_output: list[str],
+) -> None:
+    """explain_stage displays correct status for different stage states."""
+    stream = io.StringIO()
+    con = console.Console(stream=stream, color=False)
+
+    explanation = StageExplanation(
+        stage_name="my_stage",
+        will_run=will_run,
+        is_forced=is_forced,
+        reason=reason,
+        code_changes=[],
+        param_changes=[],
+        dep_changes=[],
+    )
+
+    con.explain_stage(explanation)
+
+    output = stream.getvalue()
+    for expected in expected_in_output:
+        assert expected in output, f"Expected '{expected}' in output"
+    for not_expected in not_expected_in_output:
+        assert not_expected not in output, f"Did not expect '{not_expected}' in output"

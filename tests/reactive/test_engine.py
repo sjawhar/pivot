@@ -8,7 +8,7 @@ from unittest import mock
 
 import pytest
 
-from pivot import project, types
+from pivot import executor, project, types
 from pivot.pipeline import yaml as pipeline_yaml
 from pivot.reactive import engine
 from pivot.registry import REGISTRY, stage
@@ -1425,7 +1425,9 @@ def test_coordinator_loop_skips_execution_when_invalid(pipeline_dir: pathlib.Pat
 
     messages: list[str] = []
 
-    def capture_message(msg: str, *, is_error: bool = False) -> None:
+    def capture_message(
+        msg: str, *, is_error: bool = False, status: types.ReactiveStatus | None = None
+    ) -> None:
         messages.append(msg)
 
     with (
@@ -1464,8 +1466,12 @@ def test_coordinator_loop_sends_error_on_reload_failure(pipeline_dir: pathlib.Pa
 
     messages: list[tuple[str, bool]] = []
 
-    def capture_message(msg: str, *, is_error: bool = False) -> None:
-        messages.append((msg, is_error))
+    def capture_message(
+        msg: str, *, is_error: bool = False, status: types.ReactiveStatus | None = None
+    ) -> None:
+        # Map status to is_error for backward compatibility in this test
+        is_err = is_error or (status == types.ReactiveStatus.ERROR)
+        messages.append((msg, is_err))
 
     with (
         mock.patch.object(eng, "_collect_and_debounce", side_effect=mock_collect_and_debounce),
@@ -1518,3 +1524,137 @@ def test_coordinator_loop_clears_invalid_state_on_successful_reload(
 
     # After successful reload, errors should be cleared
     assert eng._pipeline_errors is None, "Errors should be cleared on successful reload"
+
+
+# force_first_run tests
+
+
+def test_engine_init_force_first_run_defaults_to_false(pipeline_dir: pathlib.Path) -> None:
+    """force_first_run should default to False."""
+    eng = engine.ReactiveEngine()
+    assert eng._force_first_run is False
+    assert eng._first_run_done is False
+
+
+def test_engine_init_accepts_force_first_run(pipeline_dir: pathlib.Path) -> None:
+    """Engine should accept force_first_run parameter."""
+    eng = engine.ReactiveEngine(force_first_run=True)
+    assert eng._force_first_run is True
+    assert eng._first_run_done is False
+
+
+def test_execute_stages_passes_force_on_first_run(pipeline_dir: pathlib.Path) -> None:
+    """_execute_stages should pass force=True on first run when force_first_run=True."""
+    (pipeline_dir / "data.csv").write_text("a,b\n1,2")
+
+    @stage(deps=["data.csv"], outs=["output.txt"])
+    def process() -> None:
+        pass
+
+    eng = engine.ReactiveEngine(force_first_run=True)
+
+    force_values: list[bool] = []
+
+    def capture_force(**kwargs: object) -> None:
+        force_values.append(bool(kwargs.get("force", False)))
+
+    with mock.patch.object(executor, "run", side_effect=capture_force):
+        eng._execute_stages(None)
+
+    assert len(force_values) == 1
+    assert force_values[0] is True, "First execution should have force=True"
+    assert eng._first_run_done is True, "_first_run_done should be set after first execution"
+
+
+def test_execute_stages_does_not_force_subsequent_runs(pipeline_dir: pathlib.Path) -> None:
+    """_execute_stages should pass force=False on subsequent runs."""
+    (pipeline_dir / "data.csv").write_text("a,b\n1,2")
+
+    @stage(deps=["data.csv"], outs=["output.txt"])
+    def process() -> None:
+        pass
+
+    eng = engine.ReactiveEngine(force_first_run=True)
+
+    force_values: list[bool] = []
+
+    def capture_force(**kwargs: object) -> None:
+        force_values.append(bool(kwargs.get("force", False)))
+
+    with mock.patch.object(executor, "run", side_effect=capture_force):
+        eng._execute_stages(None)  # First run
+        eng._execute_stages(None)  # Second run
+        eng._execute_stages(None)  # Third run
+
+    assert len(force_values) == 3
+    assert force_values[0] is True, "First execution should have force=True"
+    assert force_values[1] is False, "Second execution should have force=False"
+    assert force_values[2] is False, "Third execution should have force=False"
+
+
+def test_execute_stages_without_force_first_run_never_forces(pipeline_dir: pathlib.Path) -> None:
+    """_execute_stages should never pass force=True when force_first_run=False."""
+    (pipeline_dir / "data.csv").write_text("a,b\n1,2")
+
+    @stage(deps=["data.csv"], outs=["output.txt"])
+    def process() -> None:
+        pass
+
+    eng = engine.ReactiveEngine(force_first_run=False)  # Default
+
+    force_values: list[bool] = []
+
+    def capture_force(**kwargs: object) -> None:
+        force_values.append(bool(kwargs.get("force", False)))
+
+    with mock.patch.object(executor, "run", side_effect=capture_force):
+        eng._execute_stages(None)
+        eng._execute_stages(None)
+
+    assert all(v is False for v in force_values), "All executions should have force=False"
+
+
+def test_first_run_done_flag_stress_test(pipeline_dir: pathlib.Path) -> None:
+    """Stress test: rapid executions should only force first run, never subsequent ones.
+
+    This test verifies _first_run_done behaves correctly even under rapid execution.
+    Since all access is from the main thread, there's no race condition, but this
+    confirms the flag logic is correct under stress.
+    """
+    (pipeline_dir / "data.csv").write_text("a,b\n1,2")
+
+    @stage(deps=["data.csv"], outs=["output.txt"])
+    def process() -> None:
+        pass
+
+    eng = engine.ReactiveEngine(force_first_run=True)
+
+    force_values: list[bool] = []
+    first_run_done_values: list[bool] = []
+
+    def capture_force(**kwargs: object) -> None:
+        force_val = kwargs.get("force", False)
+        force_values.append(bool(force_val))
+        first_run_done_values.append(eng._first_run_done)
+
+    # Run many executions rapidly
+    num_executions = 100
+
+    with mock.patch.object(executor, "run", side_effect=capture_force):
+        for _ in range(num_executions):
+            eng._execute_stages(None)
+
+    assert len(force_values) == num_executions
+    # First execution should have force=True
+    assert force_values[0] is True, "First execution should have force=True"
+    # All subsequent executions should have force=False
+    assert all(v is False for v in force_values[1:]), (
+        "All subsequent executions should have force=False"
+    )
+    # _first_run_done should be False before first execution, True after
+    assert first_run_done_values[0] is False, (
+        "_first_run_done should be False during first execution"
+    )
+    assert all(v is True for v in first_run_done_values[1:]), (
+        "_first_run_done should be True for all subsequent"
+    )

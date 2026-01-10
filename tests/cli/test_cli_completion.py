@@ -14,6 +14,10 @@ if TYPE_CHECKING:
     from pytest_mock import MockerFixture
 
 
+def _noop() -> None:
+    """Module-level no-op function for stage registration in tests."""
+
+
 # =============================================================================
 # Fixtures
 # =============================================================================
@@ -220,8 +224,8 @@ def test_get_stages_full_returns_registered_stages() -> None:
     from pivot import registry
 
     # Register real stages (autouse fixture clears registry between tests)
-    registry.REGISTRY.register(lambda: None, name="stage1", deps=[], outs=[])
-    registry.REGISTRY.register(lambda: None, name="stage2", deps=[], outs=[])
+    registry.REGISTRY.register(_noop, name="stage1", deps=[], outs=[])
+    registry.REGISTRY.register(_noop, name="stage2", deps=[], outs=[])
 
     result = completion._get_stages_full()
 
@@ -289,7 +293,7 @@ def test_complete_stages_falls_back_to_registry(
     mocker.patch.object(completion, "_find_project_root_fast", return_value=None)
 
     # Register stages directly
-    registry.REGISTRY.register(lambda: None, name="fallback_stage", deps=[], outs=[])
+    registry.REGISTRY.register(_noop, name="fallback_stage", deps=[], outs=[])
 
     result = completion.complete_stages(mock_ctx, mock_param, "")
     assert "fallback_stage" in result

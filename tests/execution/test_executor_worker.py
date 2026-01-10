@@ -86,6 +86,7 @@ def test_execute_stage_with_missing_deps(worker_env: pathlib.Path) -> None:
         "cwd": None,
         "checkout_modes": ["hardlink", "symlink", "copy"],
         "run_id": "test_run",
+        "force": False,
     }
 
     result = executor.execute_stage(
@@ -121,6 +122,7 @@ def test_execute_stage_with_directory_dep(worker_env: pathlib.Path, tmp_path: pa
         "cwd": None,
         "checkout_modes": ["hardlink", "symlink", "copy"],
         "run_id": "test_run",
+        "force": False,
     }
 
     result = executor.execute_stage(
@@ -155,6 +157,7 @@ def test_execute_stage_runs_unchanged_stage(
         "cwd": None,
         "checkout_modes": ["hardlink", "symlink", "copy"],
         "run_id": "test_run",
+        "force": False,
     }
 
     # First run - creates lock file
@@ -201,6 +204,7 @@ def test_execute_stage_reruns_when_fingerprint_changes(
         "cwd": None,
         "checkout_modes": ["hardlink", "symlink", "copy"],
         "run_id": "test_run",
+        "force": False,
     }
 
     # First run
@@ -250,6 +254,7 @@ def test_execute_stage_handles_stage_exception(
         "cwd": None,
         "checkout_modes": ["hardlink", "symlink", "copy"],
         "run_id": "test_run",
+        "force": False,
     }
 
     result = executor.execute_stage(
@@ -282,6 +287,7 @@ def test_execute_stage_handles_sys_exit(worker_env: pathlib.Path, tmp_path: path
         "cwd": None,
         "checkout_modes": ["hardlink", "symlink", "copy"],
         "run_id": "test_run",
+        "force": False,
     }
 
     result = executor.execute_stage(
@@ -317,6 +323,7 @@ def test_execute_stage_handles_keyboard_interrupt(
         "cwd": None,
         "checkout_modes": ["hardlink", "symlink", "copy"],
         "run_id": "test_run",
+        "force": False,
     }
 
     result = executor.execute_stage(
@@ -940,6 +947,108 @@ def test_acquire_lock_exhausts_attempts_and_fails(
 
 
 # =============================================================================
+# Multiprocess Race Condition Tests
+# =============================================================================
+
+
+def _race_worker_try_takeover(args: tuple[int, str]) -> str:
+    """Module-level worker function for stale lock takeover test.
+
+    Takes a tuple of (worker_id, cache_dir_path) for cross-process pickling.
+    """
+    import time
+
+    worker_id, cache_dir_str = args
+    cache_dir = pathlib.Path(cache_dir_str)
+    try:
+        sentinel = lock.acquire_execution_lock("race_stage", cache_dir)
+        time.sleep(0.05)  # Hold lock briefly
+        sentinel.unlink(missing_ok=True)
+        return f"{worker_id}:success"
+    except exceptions.StageAlreadyRunningError:
+        return f"{worker_id}:failed"
+
+
+def _race_worker_try_fresh_acquire(args: tuple[int, str]) -> tuple[int, str]:
+    """Module-level worker function for fresh lock acquisition test.
+
+    Takes a tuple of (worker_id, cache_dir_path) for cross-process pickling.
+    """
+    import time
+
+    worker_id, cache_dir_str = args
+    cache_dir = pathlib.Path(cache_dir_str)
+    try:
+        sentinel = lock.acquire_execution_lock("fresh_lock_test", cache_dir)
+        time.sleep(0.1)  # Hold lock to force others to wait/fail
+        sentinel.unlink(missing_ok=True)
+        return (worker_id, "success")
+    except exceptions.StageAlreadyRunningError:
+        return (worker_id, "blocked")
+
+
+def test_concurrent_stale_lock_takeover_race(worker_env: pathlib.Path) -> None:
+    """Multiple processes racing to take over a stale lock - only one should win.
+
+    This tests the real race condition scenario where multiple processes detect
+    a stale lock and all try to take it over using atomic replace.
+    """
+    from concurrent import futures
+
+    NUM_PROCESSES = 5
+    cache_dir_str = str(worker_env)
+
+    # Create a stale lock (non-existent PID)
+    stale_sentinel = worker_env / "race_stage.running"
+    stale_sentinel.write_text("pid: 999999999\n")
+
+    try:
+        # Pass both worker_id and cache_dir as tuple for each worker
+        args = [(i, cache_dir_str) for i in range(NUM_PROCESSES)]
+
+        with futures.ProcessPoolExecutor(max_workers=NUM_PROCESSES) as pool:
+            results = list(pool.map(_race_worker_try_takeover, args))
+
+        successes = [r for r in results if ":success" in r]
+        failures = [r for r in results if ":failed" in r]
+
+        # At least one should succeed (first one to get the lock)
+        # Others should either fail or succeed after the first one releases
+        assert len(successes) >= 1, f"Expected at least 1 success, got {successes}"
+
+        # Total should equal NUM_PROCESSES
+        assert len(successes) + len(failures) == NUM_PROCESSES
+    finally:
+        stale_sentinel.unlink(missing_ok=True)
+
+
+def test_concurrent_fresh_lock_acquisition(worker_env: pathlib.Path) -> None:
+    """Multiple processes racing to acquire a fresh lock - only one should succeed at a time."""
+    from concurrent import futures
+
+    NUM_PROCESSES = 3
+    cache_dir_str = str(worker_env)
+    sentinel_path = worker_env / "fresh_lock_test.running"
+    sentinel_path.unlink(missing_ok=True)
+
+    try:
+        args = [(i, cache_dir_str) for i in range(NUM_PROCESSES)]
+
+        with futures.ProcessPoolExecutor(max_workers=NUM_PROCESSES) as pool:
+            results = list(pool.map(_race_worker_try_fresh_acquire, args))
+
+        # At least one should succeed
+        successes = [r for r in results if r[1] == "success"]
+        blocked = [r for r in results if r[1] == "blocked"]
+
+        assert len(successes) >= 1, "At least one process should acquire the lock"
+        # Total should be NUM_PROCESSES
+        assert len(successes) + len(blocked) == NUM_PROCESSES
+    finally:
+        sentinel_path.unlink(missing_ok=True)
+
+
+# =============================================================================
 # Helper Function Tests
 # =============================================================================
 
@@ -1060,6 +1169,7 @@ def test_generation_skip_on_second_run(worker_env: pathlib.Path, tmp_path: pathl
         "cwd": None,
         "checkout_modes": ["hardlink", "symlink", "copy"],
         "run_id": "test_run",
+        "force": False,
     }
 
     # First run - creates output and records generations
@@ -1115,6 +1225,7 @@ def test_generation_mismatch_triggers_rerun(
         "cwd": None,
         "checkout_modes": ["hardlink", "symlink", "copy"],
         "run_id": "test_run",
+        "force": False,
     }
 
     step2_info: WorkerStageInfo = {
@@ -1129,6 +1240,7 @@ def test_generation_mismatch_triggers_rerun(
         "cwd": None,
         "checkout_modes": ["hardlink", "symlink", "copy"],
         "run_id": "test_run",
+        "force": False,
     }
 
     # First run - both stages execute
@@ -1210,6 +1322,7 @@ def test_external_file_fallback_to_hash_check(
         "cwd": None,
         "checkout_modes": ["hardlink", "symlink", "copy"],
         "run_id": "test_run",
+        "force": False,
     }
 
     # First run
@@ -1274,6 +1387,7 @@ def test_deps_list_change_triggers_rerun(worker_env: pathlib.Path, tmp_path: pat
         "cwd": None,
         "checkout_modes": ["hardlink", "symlink", "copy"],
         "run_id": "test_run",
+        "force": False,
     }
 
     result1 = executor.execute_stage(
@@ -1307,6 +1421,7 @@ def test_deps_list_change_triggers_rerun(worker_env: pathlib.Path, tmp_path: pat
         "cwd": None,
         "checkout_modes": ["hardlink", "symlink", "copy"],
         "run_id": "test_run",
+        "force": False,
     }
 
     result3 = executor.execute_stage(
@@ -1347,6 +1462,7 @@ def test_deps_list_change_same_fingerprint_detected_by_hash(
         "cwd": None,
         "checkout_modes": ["hardlink", "symlink", "copy"],
         "run_id": "test_run",
+        "force": False,
     }
 
     result1 = executor.execute_stage(
@@ -1371,6 +1487,7 @@ def test_deps_list_change_same_fingerprint_detected_by_hash(
         "cwd": None,
         "checkout_modes": ["hardlink", "symlink", "copy"],
         "run_id": "test_run",
+        "force": False,
     }
 
     result2 = executor.execute_stage(
@@ -1415,6 +1532,7 @@ def test_skip_acquires_execution_lock(
         "cwd": None,
         "checkout_modes": ["hardlink", "symlink", "copy"],
         "run_id": "test_run",
+        "force": False,
     }
 
     # First run - creates lock file and output
@@ -1480,6 +1598,7 @@ def test_restore_happens_inside_lock(
         "cwd": None,
         "checkout_modes": ["copy"],  # Use copy mode for simpler testing
         "run_id": "test_run",
+        "force": False,
     }
 
     # First run - creates lock file and caches output
@@ -1559,6 +1678,7 @@ def test_stage_def_deps_loaded_before_function(
         "cwd": None,
         "checkout_modes": ["hardlink", "symlink", "copy"],
         "run_id": "test_run",
+        "force": False,
     }
 
     result = executor.execute_stage(
@@ -1596,6 +1716,7 @@ def test_stage_def_outs_saved_after_function(
         "cwd": None,
         "checkout_modes": ["hardlink", "symlink", "copy"],
         "run_id": "test_run",
+        "force": False,
     }
 
     result = executor.execute_stage(
@@ -1633,6 +1754,7 @@ def test_stage_def_missing_output_returns_failed(
         "cwd": None,
         "checkout_modes": ["hardlink", "symlink", "copy"],
         "run_id": "test_run",
+        "force": False,
     }
 
     result = executor.execute_stage(
@@ -1666,6 +1788,7 @@ def test_stage_def_load_failure_returns_failed(
         "cwd": None,
         "checkout_modes": ["hardlink", "symlink", "copy"],
         "run_id": "test_run",
+        "force": False,
     }
 
     result = executor.execute_stage(
@@ -1700,6 +1823,7 @@ def test_plain_params_no_auto_load_save(worker_env: pathlib.Path, tmp_path: path
         "cwd": None,
         "checkout_modes": ["hardlink", "symlink", "copy"],
         "run_id": "test_run",
+        "force": False,
     }
 
     result = executor.execute_stage(

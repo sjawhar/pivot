@@ -94,6 +94,7 @@ def run(
     max_workers: int | None = None,
     on_error: OnError | str = OnError.FAIL,
     show_output: bool = True,
+    allow_uncached_incremental: bool = False,
     force: bool = False,
     stage_timeout: float | None = None,
     explain_mode: bool = False,
@@ -109,7 +110,8 @@ def run(
         max_workers: Max concurrent stages (default: min(cpu_count, 8)).
         on_error: Error handling mode - "fail", "keep_going", or "ignore".
         show_output: If True, print progress and stage output to console.
-        force: If True, skip safety checks for uncached IncrementalOut files.
+        allow_uncached_incremental: If True, skip safety check for uncached IncrementalOut files.
+        force: If True, bypass cache and force all stages to re-execute.
         stage_timeout: Max seconds for each stage to complete (default: no timeout).
         explain_mode: If True, show detailed WHY for each stage before execution.
         tui_queue: Queue for TUI messages (status updates and logs).
@@ -159,14 +161,14 @@ def run(
     checkout_modes = config.get_checkout_mode_order()
 
     # Check for uncached IncrementalOut files that would be lost
-    if not force:
+    if not allow_uncached_incremental:
         uncached = _check_uncached_incremental_outputs(execution_order, cache_dir)
         if uncached:
             files_list = "\n".join(f"  - {stage}: {path}" for stage, path in uncached)
             raise exceptions.UncachedIncrementalOutputError(
                 f"The following IncrementalOut files exist but are not in cache:\n{files_list}\n\n"
                 + "Running the pipeline will DELETE these files and they cannot be restored.\n"
-                + "To proceed anyway, use force=True or back up these files first."
+                + "To proceed anyway, use allow_uncached_incremental=True or back up these files first."
             )
 
     con = console.get_console() if show_output else None
@@ -195,6 +197,7 @@ def run(
         checkout_modes=checkout_modes,
         tui_queue=tui_queue,
         run_id=run_id,
+        force=force,
     )
 
     results = _build_results(stage_states)
@@ -324,6 +327,7 @@ def _execute_greedy(
     checkout_modes: list[str] | None = None,
     tui_queue: mp.Queue[TuiMessage] | None = None,
     run_id: str = "",
+    force: bool = False,
 ) -> None:
     """Execute stages with greedy parallel scheduling using loky ProcessPoolExecutor."""
     overrides = overrides or {}
@@ -366,6 +370,7 @@ def _execute_greedy(
                 checkout_modes=checkout_modes,
                 tui_queue=tui_queue,
                 run_id=run_id,
+                force=force,
             )
 
             while futures:
@@ -518,6 +523,7 @@ def _execute_greedy(
                         checkout_modes=checkout_modes,
                         tui_queue=tui_queue,
                         run_id=run_id,
+                        force=force,
                     )
     finally:
         # Signal output thread to stop - may fail if queue is broken
@@ -575,6 +581,7 @@ def _start_ready_stages(
     checkout_modes: list[str] | None = None,
     tui_queue: mp.Queue[TuiMessage] | None = None,
     run_id: str = "",
+    force: bool = False,
 ) -> None:
     """Find and start stages that are ready to execute."""
     checkout_modes = checkout_modes or config.DEFAULT_CHECKOUT_MODE_ORDER
@@ -616,7 +623,7 @@ def _start_ready_stages(
         for mutex in state.mutex:
             mutex_counts[mutex] += 1
 
-        worker_info = _prepare_worker_info(state.info, overrides, checkout_modes, run_id)
+        worker_info = _prepare_worker_info(state.info, overrides, checkout_modes, run_id, force)
 
         try:
             future = executor.submit(
@@ -667,6 +674,7 @@ def _prepare_worker_info(
     overrides: parameters.ParamsOverrides,
     checkout_modes: list[str],
     run_id: str,
+    force: bool,
 ) -> worker.WorkerStageInfo:
     """Prepare stage info for pickling to worker process."""
     return worker.WorkerStageInfo(
@@ -681,6 +689,7 @@ def _prepare_worker_info(
         cwd=stage_info["cwd"],
         checkout_modes=checkout_modes,
         run_id=run_id,
+        force=force,
     )
 
 

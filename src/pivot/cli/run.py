@@ -45,6 +45,7 @@ def _get_all_explanations(
     stages_list: list[str] | None,
     single_stage: bool,
     cache_dir: pathlib.Path | None,
+    force: bool = False,
 ) -> list[StageExplanation]:
     """Get explanations for all stages in execution order."""
     from pivot import dag, explain, parameters, project
@@ -68,6 +69,7 @@ def _get_all_explanations(
             stage_info["params"],
             overrides,
             resolved_cache_dir,
+            force=force,
         )
         explanations.append(explanation)
 
@@ -78,6 +80,7 @@ def _run_with_tui(
     stages_list: list[str] | None,
     single_stage: bool,
     cache_dir: pathlib.Path | None,
+    force: bool = False,
 ) -> dict[str, ExecutionSummary] | None:
     """Run pipeline with TUI display."""
     import multiprocessing as mp
@@ -107,10 +110,43 @@ def _run_with_tui(
             cache_dir=resolved_cache_dir,
             show_output=False,
             tui_queue=tui_queue,
+            force=force,
         )
 
     try:
         return run_tui.run_with_tui(execution_order, tui_queue, executor_func)
+    finally:
+        manager.shutdown()
+
+
+def _run_watch_with_tui(
+    stages_list: list[str] | None,
+    single_stage: bool,
+    cache_dir: pathlib.Path | None,
+    debounce: int,
+    force: bool = False,
+) -> None:
+    """Run watch mode with TUI display."""
+    import multiprocessing as mp
+
+    from pivot import reactive as reactive_module
+    from pivot.tui import run as run_tui
+    from pivot.types import TuiMessage
+
+    # Create manager and queue (Manager().Queue for loky compatibility)
+    manager = mp.Manager()
+    tui_queue: mp.Queue[TuiMessage] = manager.Queue()  # pyright: ignore[reportAssignmentType]
+
+    engine = reactive_module.ReactiveEngine(
+        stages=stages_list,
+        single_stage=single_stage,
+        cache_dir=cache_dir,
+        debounce_ms=debounce,
+        force_first_run=force,
+    )
+
+    try:
+        run_tui.run_watch_tui(engine, tui_queue)
     finally:
         manager.shutdown()
 
@@ -158,25 +194,22 @@ def _print_results(results: dict[str, ExecutionSummary]) -> None:
     "--explain", "-e", is_flag=True, help="Show detailed breakdown of why stages would run"
 )
 @click.option(
+    "--force",
+    "-f",
+    is_flag=True,
+    help="Force re-run of stages, ignoring cache (in --watch mode, first run only)",
+)
+@click.option(
     "--watch",
     "-w",
-    is_flag=False,
-    flag_value="",
-    default=None,
-    metavar="GLOBS",
-    help="Watch for file changes and re-run. Optionally specify comma-separated glob patterns.",
+    is_flag=True,
+    help="Watch for file changes and re-run affected stages",
 )
 @click.option(
     "--debounce",
     type=click.IntRange(min=0),
     default=300,
-    help="Debounce delay in milliseconds",
-)
-@click.option(
-    "--reactive",
-    "-r",
-    is_flag=True,
-    help="Reactive mode: continuously watch and re-run affected stages on changes",
+    help="Debounce delay in milliseconds (for --watch mode)",
 )
 @click.option(
     "--display",
@@ -192,9 +225,9 @@ def run(
     cache_dir: pathlib.Path | None,
     dry_run: bool,
     explain: bool,
-    watch: str | None,
+    force: bool,
+    watch: bool,
     debounce: int,
-    reactive: bool,
     display: str | None,
 ) -> None:
     """Execute pipeline stages.
@@ -212,42 +245,53 @@ def run(
     if dry_run:
         if explain:
             # --dry-run --explain: detailed explanation without execution
-            ctx.invoke(explain_cmd, stages=stages, single_stage=single_stage, cache_dir=cache_dir)
+            ctx.invoke(
+                explain_cmd,
+                stages=stages,
+                single_stage=single_stage,
+                cache_dir=cache_dir,
+                force=force,
+            )
         else:
             # --dry-run only: terse output
-            ctx.invoke(dry_run_cmd, stages=stages, single_stage=single_stage, cache_dir=cache_dir)
+            ctx.invoke(
+                dry_run_cmd,
+                stages=stages,
+                single_stage=single_stage,
+                cache_dir=cache_dir,
+                force=force,
+            )
         return
 
-    if watch is not None:
-        from pivot import watch as watch_module
+    if watch:
+        from pivot.tui import run as run_tui
 
-        # Parse comma-separated globs if provided
-        watch_globs = [g.strip() for g in watch.split(",") if g.strip()] if watch else None
+        display_mode = DisplayMode(display) if display else None
+        use_tui = run_tui.should_use_tui(display_mode)
 
-        watch_module.run_watch_loop(
-            stages=stages_list,
-            single_stage=single_stage,
-            cache_dir=cache_dir,
-            watch_globs=watch_globs,
-            debounce_ms=debounce,
-        )
-        return
+        if use_tui:
+            try:
+                _run_watch_with_tui(stages_list, single_stage, cache_dir, debounce, force)
+            except KeyboardInterrupt:
+                click.echo("\nWatch mode stopped.")
+        else:
+            from pivot import reactive as reactive_module
 
-    if reactive:
-        from pivot import reactive as reactive_module
+            engine = reactive_module.ReactiveEngine(
+                stages=stages_list,
+                single_stage=single_stage,
+                cache_dir=cache_dir,
+                debounce_ms=debounce,
+                force_first_run=force,
+            )
 
-        engine = reactive_module.ReactiveEngine(
-            stages=stages_list,
-            single_stage=single_stage,
-            cache_dir=cache_dir,
-            debounce_ms=debounce,
-        )
-
-        try:
-            engine.run(tui_queue=None)  # TUI integration will be added later
-        except KeyboardInterrupt:
-            engine.shutdown()
-            click.echo("\nReactive mode stopped.")
+            try:
+                engine.run(tui_queue=None)
+            except KeyboardInterrupt:
+                pass
+            finally:
+                engine.shutdown()
+                click.echo("\nWatch mode stopped.")
         return
 
     # Determine display mode
@@ -258,13 +302,14 @@ def run(
 
     use_tui = run_tui.should_use_tui(display_mode) and not explain
     if use_tui:
-        results = _run_with_tui(stages_list, single_stage, cache_dir)
+        results = _run_with_tui(stages_list, single_stage, cache_dir, force=force)
     else:
         results = executor.run(
             stages=stages_list,
             single_stage=single_stage,
             cache_dir=cache_dir,
             explain_mode=explain,
+            force=force,
         )
 
     if not results:
@@ -282,15 +327,21 @@ def run(
     help="Run only the specified stages (in provided order), not their dependencies",
 )
 @click.option("--cache-dir", type=click.Path(path_type=pathlib.Path), help="Cache directory")
+@click.option(
+    "--force",
+    "-f",
+    is_flag=True,
+    help="Show what would run if forced",
+)
 def dry_run_cmd(
-    stages: tuple[str, ...], single_stage: bool, cache_dir: pathlib.Path | None
+    stages: tuple[str, ...], single_stage: bool, cache_dir: pathlib.Path | None, force: bool
 ) -> None:
     """Show what would run without executing."""
     ensure_stages_registered()
     stages_list = list(stages) if stages else None
     _validate_stages(stages_list, single_stage)
 
-    explanations = _get_all_explanations(stages_list, single_stage, cache_dir)
+    explanations = _get_all_explanations(stages_list, single_stage, cache_dir, force=force)
 
     if not explanations:
         click.echo("No stages to run")
@@ -312,8 +363,14 @@ def dry_run_cmd(
     help="Run only the specified stages (in provided order), not their dependencies",
 )
 @click.option("--cache-dir", type=click.Path(path_type=pathlib.Path), help="Cache directory")
+@click.option(
+    "--force",
+    "-f",
+    is_flag=True,
+    help="Show explanation as if forced",
+)
 def explain_cmd(
-    stages: tuple[str, ...], single_stage: bool, cache_dir: pathlib.Path | None
+    stages: tuple[str, ...], single_stage: bool, cache_dir: pathlib.Path | None, force: bool
 ) -> None:
     """Show detailed breakdown of why stages would run."""
     from pivot.tui import console
@@ -322,7 +379,7 @@ def explain_cmd(
     stages_list = list(stages) if stages else None
     _validate_stages(stages_list, single_stage)
 
-    explanations = _get_all_explanations(stages_list, single_stage, cache_dir)
+    explanations = _get_all_explanations(stages_list, single_stage, cache_dir, force=force)
 
     if not explanations:
         click.echo("No stages to run")
