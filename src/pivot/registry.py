@@ -27,6 +27,22 @@ ParamsArg = type[pydantic.BaseModel] | pydantic.BaseModel | None
 
 
 class RegistryStageInfo(TypedDict):
+    """Metadata for a registered stage.
+
+    Attributes:
+        func: The stage function to execute.
+        name: Unique stage identifier (function name or custom name).
+        deps: Input file dependencies (absolute paths).
+        outs: Output specifications (Out, Metric, Plot, etc.).
+        outs_paths: Output file paths (absolute paths).
+        params: Pydantic model instance with parameter values.
+        mutex: Mutex groups for exclusive execution.
+        variant: Variant name for matrix stages (None for regular stages).
+        signature: Function signature for parameter injection.
+        fingerprint: Code fingerprint mapping (key -> hash).
+        cwd: Working directory for path resolution.
+    """
+
     func: Callable[..., Any]
     name: str
     deps: list[str]
@@ -47,6 +63,9 @@ class ValidationMode(enum.StrEnum):
     WARN = "warn"  # Log warning, allow registration
 
 
+# Stage name pattern: must start with letter, then alphanumeric/underscore/hyphen
+_STAGE_NAME_PATTERN = re.compile(r"^[a-zA-Z][a-zA-Z0-9_-]*$")
+
 # Variant name pattern: alphanumeric, underscore, hyphen; max 64 chars
 _VARIANT_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9_-]+$")
 _VARIANT_NAME_MAX_LENGTH = 64
@@ -55,14 +74,14 @@ _VARIANT_NAME_MAX_LENGTH = 64
 class Variant(pydantic.BaseModel, frozen=True):
     """Variant specification for matrix stages.
 
-    Args:
+    Attributes:
         name: Unique identifier for this variant (required). Must be alphanumeric
             with underscores/hyphens, max 64 chars.
-        deps: Input dependencies (file paths)
-        outs: Output files produced by variant
-        params: Optional Pydantic model instance for parameters
-        mutex: Mutex groups this variant belongs to
-        cwd: Working directory for path resolution and stage execution
+        deps: Input dependencies (file paths).
+        outs: Output files produced by variant.
+        params: Optional Pydantic model instance for parameters.
+        mutex: Mutex groups this variant belongs to.
+        cwd: Working directory for path resolution and stage execution.
     """
 
     name: str
@@ -188,7 +207,23 @@ class stage:
 
 
 class StageRegistry:
-    """Global registry for all pipeline stages."""
+    """Global registry for all pipeline stages.
+
+    The registry stores metadata for all stages defined via the `@stage` decorator
+    or `Pipeline.add_stage()`. It handles validation, path normalization, and
+    dependency graph construction.
+
+    The global `REGISTRY` singleton is used by default. Direct instantiation is
+    mainly useful for testing with isolated registries.
+
+    Example:
+        ```python
+        from pivot import REGISTRY
+        REGISTRY.list_stages()  # ['preprocess', 'train']
+        info = REGISTRY.get('train')
+        info['deps']  # List of dependency paths
+        ```
+    """
 
     def __init__(self, validation_mode: ValidationMode = ValidationMode.ERROR) -> None:
         self._stages: dict[str, RegistryStageInfo] = {}
@@ -205,7 +240,24 @@ class StageRegistry:
         variant: str | None = None,
         cwd: str | pathlib.Path | None = None,
     ) -> None:
-        """Register a stage function with metadata."""
+        """Register a stage function with metadata.
+
+        Args:
+            func: The function to register as a pipeline stage.
+            name: Stage name (defaults to function name).
+            deps: Input file dependencies (relative or absolute paths).
+            outs: Output specifications (strings, Out, Metric, Plot, etc.).
+            params: Pydantic model class or instance for parameters.
+            mutex: Mutex groups for exclusive execution.
+            variant: Variant name for matrix stages.
+            cwd: Working directory for path resolution.
+
+        Raises:
+            ValidationError: If stage name is invalid or already registered.
+            SecurityValidationError: If paths contain traversal components.
+            InvalidPathError: If paths resolve outside project root.
+            ParamsError: If params specified but function lacks params argument.
+        """
         stage_name = name if name is not None else func.__name__
         deps_list: Sequence[str] = deps if deps is not None else ()
         outs_list: Sequence[outputs.OutSpec] = outs if outs is not None else ()
@@ -372,14 +424,13 @@ def _validate_stage_registration(
             validation_mode,
         )
 
-    if not stage_name or not stage_name.strip():
-        _handle_validation_error("Stage name cannot be empty", validation_mode)
-
     # Extract base name (before @) for validation - matrix variants have format "base@variant"
     base_name = stage_name.split("@")[0] if "@" in stage_name else stage_name
-    if base_name and not base_name[0].isalpha():
+    if not _STAGE_NAME_PATTERN.match(base_name):
         _handle_validation_error(
-            f"Stage name '{stage_name}' must start with a letter", validation_mode
+            f"Stage name '{stage_name}' must start with a letter and contain only "
+            + "alphanumeric characters, underscores, or hyphens",
+            validation_mode,
         )
 
     for path in [*deps, *outs]:
