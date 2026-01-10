@@ -1,16 +1,22 @@
+import atexit
 import logging
 import os
 import pathlib
 import sys
 import threading
 import time
+from typing import TYPE_CHECKING
 
 import pytest
 import yaml
 
 import pivot
 from pivot import exceptions, executor, project, registry
+from pivot.executor import core as executor_core
 from pivot.outputs import Metric
+
+if TYPE_CHECKING:
+    from pytest_mock import MockerFixture
 
 
 @pytest.fixture
@@ -1351,3 +1357,24 @@ def test_force_with_single_stage(pipeline_dir: pathlib.Path) -> None:
     results = executor.run(stages=["step2"], single_stage=True, force=True, show_output=False)
     assert "step1" not in results  # Not in execution set due to single_stage
     assert results["step2"]["status"] == "ran"
+
+
+# =============================================================================
+# Worker Pool Cleanup Tests
+# =============================================================================
+
+
+def test_ensure_cleanup_registered_registers_atexit(mocker: "MockerFixture") -> None:
+    """Verify cleanup handler is registered exactly once via functools.cache."""
+    executor_core._ensure_cleanup_registered.cache_clear()
+
+    try:
+        mock_register = mocker.patch.object(atexit, "register")
+        executor_core._ensure_cleanup_registered()
+        mock_register.assert_called_once_with(executor_core._cleanup_worker_pool)
+
+        executor_core._ensure_cleanup_registered()
+        mock_register.assert_called_once()  # Still just once due to cache
+    finally:
+        executor_core._ensure_cleanup_registered.cache_clear()
+        executor_core._ensure_cleanup_registered()
