@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import builtins
+import importlib
 import logging
 from typing import override
 
@@ -9,58 +9,95 @@ import click
 # Command categories for organized help output
 COMMAND_CATEGORIES = {
     "Pipeline": ["run", "explain"],
-    "Inspection": ["list", "metrics", "params", "plots", "data"],
+    "Inspection": ["list", "metrics", "params", "plots", "data", "status"],
     "Versioning": ["get", "track", "checkout"],
     "Remote": ["remote", "push", "pull"],
     "Other": ["export", "config", "completion"],
 }
 
+# Lazy command registry: command_name -> (module_path, attr_name, help_text)
+_LAZY_COMMANDS: dict[str, tuple[str, str, str]] = {
+    "run": ("pivot.cli.run", "run", "Execute pipeline stages."),
+    "explain": ("pivot.cli.run", "explain_cmd", "Show detailed breakdown of why stages would run."),
+    "list": ("pivot.cli.list", "list_cmd", "List registered stages."),
+    "export": ("pivot.cli.export", "export", "Export pipeline to DVC YAML format."),
+    "track": ("pivot.cli.track", "track", "Track files/directories for caching."),
+    "status": ("pivot.cli.status", "status", "Show pipeline, tracked files, and remote status."),
+    "checkout": (
+        "pivot.cli.checkout",
+        "checkout",
+        "Restore tracked files and stage outputs from cache.",
+    ),
+    "get": (
+        "pivot.cli.get",
+        "get_cmd",
+        "Retrieve files or stage outputs from a specific git revision.",
+    ),
+    "metrics": ("pivot.cli.metrics", "metrics", "Display and compare metrics."),
+    "plots": ("pivot.cli.plots", "plots", "Display and compare plots."),
+    "params": ("pivot.cli.params", "params", "Display and compare parameters."),
+    "remote": ("pivot.cli.remote", "remote", "Manage remote storage for cache synchronization."),
+    "push": ("pivot.cli.remote", "push", "Push cached outputs to remote storage."),
+    "pull": ("pivot.cli.remote", "pull", "Pull cached outputs from remote storage."),
+    "data": ("pivot.cli.data", "data", "Inspect and compare data files."),
+    "completion": ("pivot.cli.completion", "completion_cmd", "Generate shell completion script."),
+    "config": ("pivot.cli.config", "config_cmd", "View and modify Pivot configuration."),
+}
+
 
 class PivotGroup(click.Group):
-    """Custom Group that formats commands by category."""
+    """Custom Group with lazy command loading and categorized help."""
+
+    @override
+    def list_commands(self, ctx: click.Context) -> list[str]:
+        """Return all available command names."""
+        return sorted(_LAZY_COMMANDS.keys())
+
+    @override
+    def get_command(self, ctx: click.Context, cmd_name: str) -> click.Command | None:
+        """Lazily load and return a command by name."""
+        if cmd_name not in _LAZY_COMMANDS:
+            return None
+
+        module_path, attr_name, _help = _LAZY_COMMANDS[cmd_name]
+        module = importlib.import_module(module_path)
+        return getattr(module, attr_name)
 
     @override
     def format_commands(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
-        """Format commands grouped by category."""
-        commands = builtins.list[tuple[str, click.Command]]()
-        for subcommand in self.list_commands(ctx):
-            cmd = self.get_command(ctx, subcommand)
-            if cmd is None or cmd.hidden:
+        """Format commands grouped by category using cached help strings."""
+        commands: list[tuple[str, str]] = []
+        for name in self.list_commands(ctx):
+            if name not in _LAZY_COMMANDS:
                 continue
-            commands.append((subcommand, cmd))
+            _module, _attr, help_text = _LAZY_COMMANDS[name]
+            commands.append((name, help_text))
 
         if not commands:
             return
 
-        categorized: dict[str, list[tuple[str, click.Command]]] = {
-            cat: [] for cat in COMMAND_CATEGORIES
-        }
-        uncategorized = builtins.list[tuple[str, click.Command]]()
+        categorized: dict[str, list[tuple[str, str]]] = {cat: [] for cat in COMMAND_CATEGORIES}
+        uncategorized: list[tuple[str, str]] = []
 
-        for name, cmd in commands:
+        for name, help_text in commands:
             found = False
             for cat, cmd_names in COMMAND_CATEGORIES.items():
                 if name in cmd_names:
-                    categorized[cat].append((name, cmd))
+                    categorized[cat].append((name, help_text))
                     found = True
                     break
             if not found:
-                uncategorized.append((name, cmd))
-
-        max_len = max(len(name) for name, _ in commands)
-        limit = formatter.width - 6 - max_len
+                uncategorized.append((name, help_text))
 
         for category, cmds in categorized.items():
             if not cmds:
                 continue
-            rows = [(name, cmd.get_short_help_str(limit)) for name, cmd in cmds]
             with formatter.section(f"{category} Commands"):
-                formatter.write_dl(rows)
+                formatter.write_dl(cmds)
 
         if uncategorized:
-            rows = [(name, cmd.get_short_help_str(limit)) for name, cmd in uncategorized]
             with formatter.section("Other Commands"):
-                formatter.write_dl(rows)
+                formatter.write_dl(uncategorized)
 
 
 def _setup_logging(verbose: bool) -> None:
@@ -81,41 +118,6 @@ def cli(ctx: click.Context, verbose: bool) -> None:
     ctx.ensure_object(dict)
     ctx.obj["verbose"] = verbose
     _setup_logging(verbose)
-
-
-# Import and register commands - must be after cli definition to avoid circular imports
-from pivot.cli import checkout as checkout_mod  # noqa: E402
-from pivot.cli import completion as completion_mod  # noqa: E402
-from pivot.cli import config as config_mod  # noqa: E402
-from pivot.cli import data as data_mod  # noqa: E402
-from pivot.cli import export as export_mod  # noqa: E402
-from pivot.cli import get as get_mod  # noqa: E402
-from pivot.cli import list as list_mod  # noqa: E402
-from pivot.cli import metrics as metrics_mod  # noqa: E402
-from pivot.cli import params as params_mod  # noqa: E402
-from pivot.cli import plots as plots_mod  # noqa: E402
-from pivot.cli import remote as remote_mod  # noqa: E402
-from pivot.cli import run as run_mod  # noqa: E402
-from pivot.cli import status as status_mod  # noqa: E402
-from pivot.cli import track as track_mod  # noqa: E402
-
-cli.add_command(run_mod.run)
-cli.add_command(run_mod.explain_cmd, name="explain")
-cli.add_command(list_mod.list_cmd, name="list")
-cli.add_command(export_mod.export)
-cli.add_command(track_mod.track)
-cli.add_command(status_mod.status)
-cli.add_command(checkout_mod.checkout)
-cli.add_command(get_mod.get_cmd, name="get")
-cli.add_command(metrics_mod.metrics)
-cli.add_command(plots_mod.plots)
-cli.add_command(params_mod.params)
-cli.add_command(remote_mod.remote)
-cli.add_command(remote_mod.push)
-cli.add_command(remote_mod.pull)
-cli.add_command(data_mod.data)
-cli.add_command(completion_mod.completion_cmd, name="completion")
-cli.add_command(config_mod.config_cmd, name="config")
 
 
 def main() -> None:

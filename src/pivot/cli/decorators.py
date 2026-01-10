@@ -6,10 +6,17 @@ from typing import TYPE_CHECKING, Any
 import click
 
 from pivot import exceptions
-from pivot.cli import errors as cli_errors
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+
+def _handle_pivot_error(e: exceptions.PivotError) -> click.ClickException:
+    """Convert PivotError to user-friendly ClickException."""
+    message = e.format_user_message()
+    if suggestion := e.get_suggestion():
+        message = f"{message}\n\nTip: {suggestion}"
+    return click.ClickException(message)
 
 
 def with_error_handling[**P, R](func: Callable[P, R]) -> Callable[P, R]:
@@ -30,7 +37,7 @@ def with_error_handling[**P, R](func: Callable[P, R]) -> Callable[P, R]:
         except click.ClickException:
             raise
         except exceptions.PivotError as e:
-            raise cli_errors.handle_pivot_error(e) from e
+            raise _handle_pivot_error(e) from e
         except Exception as e:
             raise click.ClickException(repr(e)) from e
 
