@@ -69,14 +69,13 @@ def execute_stage(
     files_cache_dir = cache_dir / "files"
     state_db_path = cache_dir.parent / "state.db"
 
-    # Convert string checkout modes to enum (strings used for pickling across processes)
+    # Convert string checkout modes to enum (strings required for pickling across processes)
     checkout_modes = [cache.CheckoutMode(m) for m in stage_info["checkout_modes"]]
 
     stage_lock = lock.StageLock(stage_name, cache_dir)
     current_fingerprint = stage_info["fingerprint"]
     stage_outs = stage_info["outs"]
 
-    # Apply YAML overrides BEFORE change detection so params.yaml changes trigger re-runs
     params_instance = stage_info["params"]
     overrides = stage_info["overrides"]
     try:
@@ -90,52 +89,49 @@ def execute_stage(
             output_lines=[],
         )
 
-    with state.StateDB(state_db_path) as state_db:
-        skip_result = _try_generation_skip(
-            stage_name, stage_info, stage_lock, state_db, current_params
-        )
-        if skip_result is not None:
-            lock_data_prev = stage_lock.read()
-            if _restore_outputs_from_cache(
-                stage_outs, lock_data_prev, files_cache_dir, checkout_modes
-            ):
-                return skip_result
-
-        dep_hashes, missing, unreadable = hash_dependencies(stage_info["deps"], state_db)
-
-    if missing:
-        return StageResult(
-            status=StageStatus.FAILED,
-            reason=f"missing deps: {', '.join(missing)}",
-            output_lines=[],
-        )
-
-    if unreadable:
-        return StageResult(
-            status=StageStatus.FAILED,
-            reason=f"unreadable deps: {', '.join(unreadable)}",
-            output_lines=[],
-        )
-
-    changed, reason = stage_lock.is_changed(current_fingerprint, current_params, dep_hashes)
-
-    lock_data_prev = stage_lock.read()
-    if lock_data_prev is not None and "output_hashes" not in lock_data_prev:
-        changed, reason = True, "outputs not cached"
-
-    if not changed:
-        restored_all = _restore_outputs_from_cache(
-            stage_outs, lock_data_prev, files_cache_dir, checkout_modes
-        )
-        if not restored_all:
-            changed, reason = True, "outputs missing from cache"
-
-    if not changed:
-        return StageResult(status=StageStatus.SKIPPED, reason="unchanged", output_lines=[])
-
     try:
         with lock.execution_lock(stage_name, cache_dir):
-            _prepare_outputs_for_execution(stage_outs, lock_data_prev, files_cache_dir)
+            lock_data = stage_lock.read()
+
+            with state.StateDB(state_db_path) as state_db:
+                dep_hashes, missing, unreadable = hash_dependencies(stage_info["deps"], state_db)
+
+                if missing:
+                    return StageResult(
+                        status=StageStatus.FAILED,
+                        reason=f"missing deps: {', '.join(missing)}",
+                        output_lines=[],
+                    )
+
+                if unreadable:
+                    return StageResult(
+                        status=StageStatus.FAILED,
+                        reason=f"unreadable deps: {', '.join(unreadable)}",
+                        output_lines=[],
+                    )
+
+                skip_reason, run_reason = _check_skip_or_run(
+                    stage_name,
+                    stage_info,
+                    stage_lock,
+                    lock_data,
+                    state_db,
+                    current_fingerprint,
+                    current_params,
+                    dep_hashes,
+                )
+
+            if skip_reason is not None and lock_data is not None:
+                restored = _restore_outputs_from_cache(
+                    stage_outs, lock_data, files_cache_dir, checkout_modes
+                )
+                if restored:
+                    return StageResult(
+                        status=StageStatus.SKIPPED, reason=skip_reason, output_lines=[]
+                    )
+                run_reason = "outputs missing from cache"
+
+            _prepare_outputs_for_execution(stage_outs, lock_data, files_cache_dir)
 
             with _working_directory(stage_info["cwd"]):
                 _run_stage_function_with_capture(
@@ -144,19 +140,18 @@ def execute_stage(
 
             output_hashes = _save_outputs_to_cache(stage_outs, files_cache_dir, checkout_modes)
 
-            lock_data: LockData = {
-                "code_manifest": current_fingerprint,
-                "params": current_params,
-                "dep_hashes": dict(sorted(dep_hashes.items())),
-                "output_hashes": dict(sorted(output_hashes.items())),
-            }
-            stage_lock.write(lock_data)
+            new_lock_data = LockData(
+                code_manifest=current_fingerprint,
+                params=current_params,
+                dep_hashes=dict(sorted(dep_hashes.items())),
+                output_hashes=dict(sorted(output_hashes.items())),
+            )
+            stage_lock.write(new_lock_data)
 
-            # Record generations after successful execution
             with state.StateDB(state_db_path) as state_db:
                 _record_generations_after_run(stage_name, stage_info, state_db)
 
-        return StageResult(status=StageStatus.RAN, reason=reason, output_lines=output_lines)
+        return StageResult(status=StageStatus.RAN, reason=run_reason, output_lines=output_lines)
 
     except exceptions.StageAlreadyRunningError as e:
         return StageResult(status=StageStatus.FAILED, reason=str(e), output_lines=output_lines)
@@ -176,16 +171,44 @@ def execute_stage(
         return StageResult(status=StageStatus.FAILED, reason=str(e), output_lines=output_lines)
 
 
+def _check_skip_or_run(
+    stage_name: str,
+    stage_info: WorkerStageInfo,
+    stage_lock: lock.StageLock,
+    lock_data: LockData | None,
+    state_db: state.StateDB,
+    current_fingerprint: dict[str, str],
+    current_params: dict[str, Any],
+    dep_hashes: dict[str, HashInfo],
+) -> tuple[str | None, str]:
+    """Determine if stage can skip or must run.
+
+    Returns (skip_reason, run_reason) where exactly one is meaningful:
+    - If skip_reason is not None: stage can skip, run_reason is empty
+    - If skip_reason is None: stage must run, run_reason explains why
+    """
+    if lock_data is None:
+        return None, "No previous run"
+
+    if _can_skip_via_generation(stage_name, stage_info, lock_data, state_db, current_params):
+        return "unchanged (generation)", ""
+
+    changed, run_reason = stage_lock.is_changed_with_lock_data(
+        lock_data, current_fingerprint, current_params, dep_hashes
+    )
+    if not changed:
+        return "unchanged", ""
+
+    return None, run_reason
+
+
 def _restore_outputs_from_cache(
     stage_outs: list[outputs.BaseOut],
-    lock_data: LockData | None,
+    lock_data: LockData,
     files_cache_dir: pathlib.Path,
     checkout_modes: list[cache.CheckoutMode],
 ) -> bool:
     """Restore missing outputs from cache. Returns True if all restored successfully."""
-    if lock_data is None:
-        return False
-
     output_hashes = lock_data["output_hashes"]
     for out in stage_outs:
         path = pathlib.Path(out.path)
@@ -388,44 +411,36 @@ def hash_dependencies(
 # -----------------------------------------------------------------------------
 
 
-def _try_generation_skip(
+def _can_skip_via_generation(
     stage_name: str,
     stage_info: WorkerStageInfo,
-    stage_lock: lock.StageLock,
+    lock_data: LockData,
     state_db: state.StateDB,
     current_params: dict[str, Any],
-) -> StageResult | None:
-    """Attempt O(1) skip using generation tracking. Returns None if fallback needed."""
-    lock_data = stage_lock.read()
-    if not lock_data:
-        return None
-
-    if "code_manifest" not in lock_data or lock_data["code_manifest"] != stage_info["fingerprint"]:
-        return None
-    if "params" not in lock_data or lock_data["params"] != current_params:
-        return None
+) -> bool:
+    """Check if stage can skip using O(1) generation tracking."""
+    if lock_data["code_manifest"] != stage_info["fingerprint"]:
+        return False
+    if lock_data["params"] != current_params:
+        return False
 
     recorded_gens = state_db.get_dep_generations(stage_name)
     if recorded_gens is None:
-        return None
+        return False
 
     dep_paths = [pathlib.Path(d) for d in stage_info["deps"]]
     current_gens = state_db.get_many_generations(dep_paths)
 
     for dep in stage_info["deps"]:
         path = pathlib.Path(dep)
-        if current_gens.get(path) is None:
-            return None
-
-    for dep in stage_info["deps"]:
-        path = pathlib.Path(dep)
         normalized = str(project.normalize_path(dep))
         current_gen = current_gens.get(path)
-        recorded_gen = recorded_gens.get(normalized)
-        if current_gen != recorded_gen:
-            return None
+        if current_gen is None:
+            return False
+        if current_gen != recorded_gens.get(normalized):
+            return False
 
-    return StageResult(status=StageStatus.SKIPPED, reason="unchanged (generation)", output_lines=[])
+    return True
 
 
 def _record_generations_after_run(

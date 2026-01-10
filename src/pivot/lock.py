@@ -158,8 +158,20 @@ class StageLock:
         current_params: dict[str, Any],
         dep_hashes: dict[str, HashInfo],
     ) -> tuple[bool, str]:
-        """Check if stage needs re-run."""
+        """Check if stage needs re-run (reads lock file)."""
         lock_data = self.read()
+        return self.is_changed_with_lock_data(
+            lock_data, current_fingerprint, current_params, dep_hashes
+        )
+
+    def is_changed_with_lock_data(
+        self,
+        lock_data: LockData | None,
+        current_fingerprint: dict[str, str],
+        current_params: dict[str, Any],
+        dep_hashes: dict[str, HashInfo],
+    ) -> tuple[bool, str]:
+        """Check if stage needs re-run (pure comparison, no I/O)."""
         if lock_data is None:
             return True, "No previous run"
 
