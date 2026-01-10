@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import atexit
 import collections
 import dataclasses
@@ -10,13 +11,18 @@ import queue
 import threading
 from typing import IO, TYPE_CHECKING, ClassVar, TypeVar, final, override
 
+import filelock
 import textual.app
 import textual.binding
 import textual.containers
 import textual.message
+import textual.screen
 import textual.widgets
 
+from pivot import project
 from pivot.executor import ExecutionSummary
+from pivot.executor import commit as commit_mod
+from pivot.storage import lock, project_lock
 from pivot.types import (
     DisplayMode,
     ReactiveStatus,
@@ -277,6 +283,8 @@ _TUI_CSS: str = """
 
 _TUI_BINDINGS: list[textual.binding.BindingType] = [
     textual.binding.Binding("q", "quit", "Quit"),
+    textual.binding.Binding("c", "commit", "Commit"),
+    textual.binding.Binding("escape", "cancel_commit", "Cancel", show=False),
     textual.binding.Binding("j", "next_stage", "Next"),
     textual.binding.Binding("k", "prev_stage", "Prev"),
     textual.binding.Binding("down", "next_stage", "Next", show=False),
@@ -442,6 +450,10 @@ class _BaseTuiApp(textual.app.App[_AppReturnT]):
             if not self._show_logs:
                 self.action_toggle_view()
 
+    def action_cancel_commit(self) -> None:  # pragma: no cover
+        """Cancel commit operation. Override in subclasses that support commit."""
+        pass
+
     @override
     async def action_quit(self) -> None:  # pragma: no cover
         self._shutdown_event.set()
@@ -561,6 +573,50 @@ def should_use_tui(display_mode: DisplayMode | None) -> bool:
     return sys.stdout.isatty()
 
 
+class ConfirmCommitScreen(textual.screen.ModalScreen[bool]):
+    """Modal screen for confirming commit on exit."""
+
+    BINDINGS: ClassVar[list[textual.binding.BindingType]] = [
+        textual.binding.Binding("y", "confirm(True)", "Yes"),
+        textual.binding.Binding("n", "confirm(False)", "No"),
+        textual.binding.Binding("escape", "confirm(False)", "Cancel"),
+    ]
+
+    DEFAULT_CSS: ClassVar[str] = """
+    ConfirmCommitScreen {
+        align: center middle;
+    }
+
+    ConfirmCommitScreen > #dialog {
+        width: 60;
+        height: auto;
+        border: thick $primary;
+        background: $surface;
+        padding: 1 2;
+    }
+
+    ConfirmCommitScreen > #dialog > #message {
+        margin-bottom: 1;
+    }
+    """
+
+    @override
+    def compose(self) -> textual.app.ComposeResult:
+        with textual.containers.Container(id="dialog"):
+            yield textual.widgets.Static(
+                "You have uncommitted changes. Commit before exit?", id="message"
+            )
+            yield textual.widgets.Static("[y] Yes  [n] No  [Esc] Cancel")
+
+    def action_confirm(self, result: bool) -> None:
+        self.dismiss(result)
+
+
+# Constants for commit lock acquisition
+_COMMIT_LOCK_POLL_INTERVAL = 5.0  # seconds between lock attempts
+_COMMIT_LOCK_TIMEOUT = 60.0  # total seconds before giving up
+
+
 @final
 class WatchTuiApp(_BaseTuiApp[None]):
     """TUI for watch mode pipeline execution."""
@@ -573,11 +629,16 @@ class WatchTuiApp(_BaseTuiApp[None]):
         message_queue: mp.Queue[TuiMessage],
         output_queue: mp.Queue[OutputMessage] | None = None,
         tui_log: Path | None = None,
+        *,
+        no_commit: bool = False,
     ) -> None:
         super().__init__(message_queue, tui_log=tui_log)
         self._engine: ReactiveEngineProtocol = engine
         self._output_queue = output_queue
         self._engine_thread: threading.Thread | None = None
+        self._no_commit: bool = no_commit
+        self._commit_in_progress: bool = False
+        self._cancel_commit: bool = False
 
     async def on_mount(self) -> None:  # pragma: no cover
         self.title = "[●] Watching for changes..."
@@ -675,10 +736,124 @@ class WatchTuiApp(_BaseTuiApp[None]):
         ordered_stages = [self._stages[name] for name in self._stage_order if name in self._stages]
         stage_list.rebuild(ordered_stages)
 
+    async def action_commit(self) -> None:  # pragma: no cover
+        """Commit pending changes from --no-commit mode."""
+        if self._commit_in_progress:
+            return
+
+        if any(s.status == StageStatus.IN_PROGRESS for s in self._stages.values()):
+            self.notify("Cannot commit while stages are running", severity="warning")
+            return
+
+        pending = await asyncio.to_thread(lock.list_pending_stages, project.get_project_root())
+        if not pending:
+            self.notify("Nothing to commit")
+            return
+
+        self._commit_in_progress = True
+        self._cancel_commit = False
+        self.notify("Acquiring commit lock... (Esc to cancel)")
+
+        # Try to acquire lock with short timeouts, allowing cancellation between attempts
+        acquired: filelock.BaseFileLock | None = None
+        elapsed = 0.0
+
+        try:
+            while not self._cancel_commit and elapsed < _COMMIT_LOCK_TIMEOUT:
+                try:
+                    acquired = await asyncio.to_thread(
+                        project_lock.acquire_pending_state_lock, _COMMIT_LOCK_POLL_INTERVAL
+                    )
+                    break
+                except filelock.Timeout:
+                    elapsed += _COMMIT_LOCK_POLL_INTERVAL
+                    if not self._cancel_commit and elapsed < _COMMIT_LOCK_TIMEOUT:
+                        self.notify(f"Still waiting for lock... ({int(elapsed)}s)")
+
+            if self._cancel_commit:
+                if acquired is not None:
+                    acquired.release()
+                self._commit_in_progress = False
+                self.notify("Commit cancelled")
+                return
+
+            if acquired is None:
+                self._commit_in_progress = False
+                self.notify(
+                    f"Timed out waiting for lock ({int(_COMMIT_LOCK_TIMEOUT)}s). Try again later.",
+                    severity="error",
+                )
+                return
+
+            await self._do_commit(acquired)
+        except Exception as e:
+            self.notify(f"Commit failed: {e}", severity="error")
+        finally:
+            if acquired is None:
+                self._commit_in_progress = False
+
+    async def _do_commit(self, acquired_lock: filelock.BaseFileLock) -> None:  # pragma: no cover
+        """Execute the commit operation with the acquired lock."""
+        try:
+            committed = await asyncio.to_thread(commit_mod.commit_pending)
+            self.notify(f"Committed {len(committed)} stage(s)")
+        except Exception as e:
+            self.notify(f"Commit failed: {e}", severity="error")
+        finally:
+            acquired_lock.release()
+            self._commit_in_progress = False
+
+    @override
+    def action_cancel_commit(self) -> None:  # pragma: no cover
+        """Cancel waiting for commit lock."""
+        if self._commit_in_progress:
+            self._cancel_commit = True
+
     @override
     async def action_quit(self) -> None:  # pragma: no cover
-        self._engine.shutdown()
-        await super().action_quit()
+        """Quit the app, prompting to commit if there are uncommitted changes."""
+        # Cancel any pending commit operation
+        if self._commit_in_progress:
+            self._cancel_commit = True
+
+        if not self._no_commit:
+            self._engine.shutdown()
+            await super().action_quit()
+            return
+
+        # Don't offer commit if stages are running (could cause data inconsistency)
+        if any(s.status == StageStatus.IN_PROGRESS for s in self._stages.values()):
+            self._engine.shutdown()
+            await super().action_quit()
+            return
+
+        pending = await asyncio.to_thread(lock.list_pending_stages, project.get_project_root())
+        if not pending:
+            self._engine.shutdown()
+            await super().action_quit()
+            return
+
+        should_commit = await self.push_screen_wait(ConfirmCommitScreen())
+        try:
+            if should_commit:
+                # Acquire lock before committing to prevent race with running stages
+                try:
+                    commit_lock = await asyncio.to_thread(
+                        project_lock.acquire_pending_state_lock, 5.0
+                    )
+                except filelock.Timeout:
+                    self.notify(
+                        "Could not acquire lock for commit. Exiting without commit.",
+                        severity="warning",
+                    )
+                else:
+                    try:
+                        await asyncio.to_thread(commit_mod.commit_pending)
+                    finally:
+                        commit_lock.release()
+        finally:
+            self._engine.shutdown()
+            self.exit()
 
 
 def run_watch_tui(
@@ -686,7 +861,11 @@ def run_watch_tui(
     message_queue: mp.Queue[TuiMessage],
     output_queue: mp.Queue[OutputMessage] | None = None,
     tui_log: Path | None = None,
+    *,
+    no_commit: bool = False,
 ) -> None:  # pragma: no cover
     """Run watch mode with TUI display."""
-    app = WatchTuiApp(engine, message_queue, output_queue=output_queue, tui_log=tui_log)
+    app = WatchTuiApp(
+        engine, message_queue, output_queue=output_queue, tui_log=tui_log, no_commit=no_commit
+    )
     app.run()

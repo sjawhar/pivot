@@ -30,7 +30,7 @@ from pivot import (
     run_history,
 )
 from pivot.executor import worker
-from pivot.storage import cache, lock, track
+from pivot.storage import cache, lock, project_lock, track
 from pivot.storage import state as state_mod
 from pivot.tui import console
 from pivot.types import (
@@ -113,6 +113,7 @@ def run(
     explain_mode: bool = False,
     tui_queue: mp.Queue[TuiMessage] | None = None,
     output_queue: mp.Queue[OutputMessage] | None = None,
+    no_commit: bool = False,
 ) -> dict[str, ExecutionSummary]:
     """Execute pipeline stages with greedy parallel execution.
 
@@ -131,6 +132,7 @@ def run(
         tui_queue: Queue for TUI messages (status updates and logs).
         output_queue: Queue for worker output streaming. If None, created internally.
             Pass this when running in TUI mode to avoid multiprocessing issues.
+        no_commit: If True, defer lock files to pending dir (faster iteration).
 
     Returns:
         Dict of stage_name -> {status: "ran"|"skipped"|"failed", reason: str}
@@ -200,38 +202,42 @@ def run(
 
     start_time = time.perf_counter()
 
-    _execute_greedy(
-        stage_states=stage_states,
-        cache_dir=cache_dir,
-        max_workers=max_workers,
-        error_mode=error_mode,
-        con=con,
-        total_stages=total_stages,
-        stage_timeout=stage_timeout,
-        overrides=overrides,
-        explain_mode=explain_mode,
-        checkout_modes=checkout_modes,
-        tui_queue=tui_queue,
-        output_queue=output_queue,
-        run_id=run_id,
-        force=force,
-    )
+    # When no_commit=True, acquire lock to prevent commits during execution
+    lock_context = project_lock.pending_state_lock() if no_commit else contextlib.nullcontext()
+    with lock_context:
+        _execute_greedy(
+            stage_states=stage_states,
+            cache_dir=cache_dir,
+            max_workers=max_workers,
+            error_mode=error_mode,
+            con=con,
+            total_stages=total_stages,
+            stage_timeout=stage_timeout,
+            overrides=overrides,
+            explain_mode=explain_mode,
+            checkout_modes=checkout_modes,
+            tui_queue=tui_queue,
+            output_queue=output_queue,
+            run_id=run_id,
+            force=force,
+            no_commit=no_commit,
+        )
 
-    results = _build_results(stage_states)
+        results = _build_results(stage_states)
 
-    # Write run history
-    ended_at = datetime.datetime.now(datetime.UTC).isoformat()
-    retention = config.get_run_history_retention()
-    _write_run_history(
-        run_id=run_id,
-        stage_states=stage_states,
-        cache_dir=cache_dir,
-        targeted_stages=targeted_stages,
-        execution_order=execution_order,
-        started_at=started_at,
-        ended_at=ended_at,
-        retention=retention,
-    )
+        # Write run history
+        ended_at = datetime.datetime.now(datetime.UTC).isoformat()
+        retention = config.get_run_history_retention()
+        _write_run_history(
+            run_id=run_id,
+            stage_states=stage_states,
+            cache_dir=cache_dir,
+            targeted_stages=targeted_stages,
+            execution_order=execution_order,
+            started_at=started_at,
+            ended_at=ended_at,
+            retention=retention,
+        )
 
     if con:
         status_counts = collections.Counter(r["status"] for r in results.values())
@@ -347,6 +353,7 @@ def _execute_greedy(
     output_queue: mp.Queue[OutputMessage] | None = None,
     run_id: str = "",
     force: bool = False,
+    no_commit: bool = False,
 ) -> None:
     """Execute stages with greedy parallel scheduling using loky ProcessPoolExecutor."""
     overrides = overrides or {}
@@ -395,6 +402,7 @@ def _execute_greedy(
                 tui_queue=tui_queue,
                 run_id=run_id,
                 force=force,
+                no_commit=no_commit,
             )
 
             while futures:
@@ -548,6 +556,7 @@ def _execute_greedy(
                         tui_queue=tui_queue,
                         run_id=run_id,
                         force=force,
+                        no_commit=no_commit,
                     )
     finally:
         # Signal output thread to stop - may fail if queue is broken
@@ -610,6 +619,7 @@ def _start_ready_stages(
     tui_queue: mp.Queue[TuiMessage] | None = None,
     run_id: str = "",
     force: bool = False,
+    no_commit: bool = False,
 ) -> None:
     """Find and start stages that are ready to execute."""
     checkout_modes = checkout_modes or config.DEFAULT_CHECKOUT_MODE_ORDER
@@ -651,7 +661,9 @@ def _start_ready_stages(
         for mutex in state.mutex:
             mutex_counts[mutex] += 1
 
-        worker_info = _prepare_worker_info(state.info, overrides, checkout_modes, run_id, force)
+        worker_info = _prepare_worker_info(
+            state.info, overrides, checkout_modes, run_id, force, no_commit
+        )
 
         try:
             future = executor.submit(
@@ -703,6 +715,7 @@ def _prepare_worker_info(
     checkout_modes: list[str],
     run_id: str,
     force: bool,
+    no_commit: bool,
 ) -> worker.WorkerStageInfo:
     """Prepare stage info for pickling to worker process."""
     return worker.WorkerStageInfo(
@@ -718,6 +731,7 @@ def _prepare_worker_info(
         checkout_modes=checkout_modes,
         run_id=run_id,
         force=force,
+        no_commit=no_commit,
     )
 
 

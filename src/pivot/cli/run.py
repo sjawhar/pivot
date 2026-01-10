@@ -97,6 +97,7 @@ def _run_with_tui(
     cache_dir: pathlib.Path | None,
     force: bool = False,
     tui_log: pathlib.Path | None = None,
+    no_commit: bool = False,
 ) -> dict[str, ExecutionSummary] | None:
     """Run pipeline with TUI display."""
     import multiprocessing as mp
@@ -134,6 +135,7 @@ def _run_with_tui(
             show_output=False,
             tui_queue=tui_queue,
             force=force,
+            no_commit=no_commit,
         )
 
     try:
@@ -149,6 +151,7 @@ def _run_watch_with_tui(
     debounce: int,
     force: bool = False,
     tui_log: pathlib.Path | None = None,
+    no_commit: bool = False,
 ) -> None:
     """Run watch mode with TUI display."""
     import multiprocessing as mp
@@ -194,10 +197,13 @@ def _run_watch_with_tui(
         cache_dir=cache_dir,
         debounce_ms=debounce,
         force_first_run=force,
+        no_commit=no_commit,
     )
 
     try:
-        run_tui.run_watch_tui(engine, tui_queue, output_queue=output_queue, tui_log=tui_log)
+        run_tui.run_watch_tui(
+            engine, tui_queue, output_queue=output_queue, tui_log=tui_log, no_commit=no_commit
+        )
     finally:
         manager.shutdown()
 
@@ -288,6 +294,11 @@ def _print_results(results: dict[str, ExecutionSummary], as_json: bool = False) 
     type=click.Path(path_type=pathlib.Path),
     help="Write TUI messages to JSONL file for monitoring",
 )
+@click.option(
+    "--no-commit",
+    is_flag=True,
+    help="Defer lock files to pending dir for faster iteration. Run 'pivot commit' to finalize.",
+)
 @click.pass_context
 def run(
     ctx: click.Context,
@@ -302,6 +313,7 @@ def run(
     display: str | None,  # Click passes string, converted to DisplayMode below
     as_json: bool,
     tui_log: pathlib.Path | None,
+    no_commit: bool,
 ) -> None:
     """Execute pipeline stages.
 
@@ -361,7 +373,13 @@ def run(
         if use_tui:
             try:
                 _run_watch_with_tui(
-                    stages_list, single_stage, cache_dir, debounce, force, tui_log=tui_log
+                    stages_list,
+                    single_stage,
+                    cache_dir,
+                    debounce,
+                    force,
+                    tui_log=tui_log,
+                    no_commit=no_commit,
                 )
             except KeyboardInterrupt:
                 click.echo("\nWatch mode stopped.")
@@ -375,6 +393,7 @@ def run(
                 debounce_ms=debounce,
                 force_first_run=force,
                 json_output=as_json,
+                no_commit=no_commit,
             )
 
             try:
@@ -396,7 +415,14 @@ def run(
     # Disable TUI when JSON output is requested
     use_tui = run_tui.should_use_tui(display_mode) and not explain and not as_json
     if use_tui:
-        results = _run_with_tui(stages_list, single_stage, cache_dir, force=force, tui_log=tui_log)
+        results = _run_with_tui(
+            stages_list,
+            single_stage,
+            cache_dir,
+            force=force,
+            tui_log=tui_log,
+            no_commit=no_commit,
+        )
     else:
         results = executor.run(
             stages=stages_list,
@@ -404,6 +430,7 @@ def run(
             cache_dir=cache_dir,
             explain_mode=explain,
             force=force,
+            no_commit=no_commit,
         )
 
     if not results:

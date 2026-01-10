@@ -441,6 +441,9 @@ class StateDB:
     def prune_run_cache(self, valid_run_ids: set[str]) -> int:
         """Remove run cache entries that reference runs not in valid_run_ids.
 
+        Entries with run_id starting with '__' are sentinel values (e.g., '__committed__')
+        and are never pruned.
+
         Returns number of entries deleted.
         """
         self._check_closed()
@@ -452,7 +455,9 @@ class StateDB:
                 while key.startswith(_RUNCACHE_PREFIX):
                     value = cursor.value()
                     entry = run_history.deserialize_run_cache_entry(value)
-                    if entry["run_id"] not in valid_run_ids:
+                    run_id = entry["run_id"]
+                    # Never prune sentinel run_ids (e.g., __committed__ from pivot commit)
+                    if not run_id.startswith("__") and run_id not in valid_run_ids:
                         to_delete.append(key)
                     if not cursor.next():
                         break

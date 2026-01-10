@@ -8,7 +8,7 @@ import click
 
 # Command categories for organized help output
 COMMAND_CATEGORIES = {
-    "Pipeline": ["run", "explain", "status"],
+    "Pipeline": ["run", "explain", "status", "commit"],
     "Inspection": ["list", "metrics", "params", "plots", "data", "history", "show"],
     "Versioning": ["track", "checkout"],
     "Remote": ["remote", "push", "pull"],
@@ -41,6 +41,7 @@ _LAZY_COMMANDS: dict[str, tuple[str, str, str]] = {
     "history": ("pivot.cli.history", "history", "List recent pipeline runs."),
     "show": ("pivot.cli.history", "show_cmd", "Show details of a specific run."),
     "schema": ("pivot.cli.schema", "schema", "Output JSON Schema for pivot.yaml configuration."),
+    "commit": ("pivot.cli.commit", "commit_command", "Commit pending locks from --no-commit runs."),
 }
 
 
