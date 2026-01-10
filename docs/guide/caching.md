@@ -64,13 +64,10 @@ Share cached outputs across machines and CI environments.
 
 ```bash
 # Add a remote
-pivot remote add origin s3://my-bucket/pivot-cache
+pivot config set remotes.origin s3://my-bucket/pivot-cache
 
 # Set as default
-pivot remote default origin
-
-# Or combine
-pivot remote add origin s3://my-bucket/pivot-cache --default
+pivot config set default_remote origin
 ```
 
 ### Push to Remote
@@ -155,14 +152,17 @@ pivot run            # Stages with cached outputs skip
 ## Managing Remotes
 
 ```bash
-# List configured remotes
-pivot remote list
+# List all config (including remotes)
+pivot config list
+
+# View a specific remote
+pivot config get remotes.origin
 
 # Remove a remote
-pivot remote remove backup
+pivot config unset remotes.backup
 
 # Change default
-pivot remote default backup
+pivot config set default_remote backup
 ```
 
 ## See Also

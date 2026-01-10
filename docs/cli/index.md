@@ -380,56 +380,7 @@ pivot data diff output.csv --json
 
 ## Remote Storage
 
-### `pivot remote add`
-
-Add a remote storage location.
-
-```bash
-pivot remote add NAME URL [OPTIONS]
-```
-
-**Arguments:**
-
-- `NAME` - Remote name (e.g., `origin`)
-- `URL` - S3 URL (e.g., `s3://bucket/prefix`)
-
-**Options:**
-
-| Option | Description |
-|--------|-------------|
-| `--default` / `-d` | Set as default remote |
-
----
-
-### `pivot remote remove`
-
-Remove a remote storage location.
-
-```bash
-pivot remote remove NAME
-```
-
----
-
-### `pivot remote list`
-
-List configured remote storage locations.
-
-```bash
-pivot remote list
-```
-
----
-
-### `pivot remote default`
-
-Set the default remote.
-
-```bash
-pivot remote default NAME
-```
-
----
+Remote storage is configured using `pivot config` commands. See the [Configuration](#configuration) section below for details.
 
 ### `pivot push`
 
@@ -472,3 +423,123 @@ pivot pull [STAGES...] [OPTIONS]
 | `--remote` / `-r NAME` | Remote name (uses default if not specified) |
 | `--dry-run` / `-n` | Show what would be pulled |
 | `--jobs` / `-j N` | Parallel download jobs (default: 20) |
+
+---
+
+## Configuration
+
+### `pivot config list`
+
+List all configuration values.
+
+```bash
+pivot config list [OPTIONS]
+```
+
+**Options:**
+
+| Option | Description |
+|--------|-------------|
+| `--global` / `-g` | Show only global config |
+| `--local` / `-l` | Show only local config |
+| `--json` | Output as JSON |
+
+---
+
+### `pivot config get`
+
+Get a configuration value.
+
+```bash
+pivot config get KEY
+```
+
+**Arguments:**
+
+- `KEY` - Config key (e.g., `cache.dir`, `remotes.origin`, `default_remote`)
+
+---
+
+### `pivot config set`
+
+Set a configuration value.
+
+```bash
+pivot config set KEY VALUE [OPTIONS]
+```
+
+**Arguments:**
+
+- `KEY` - Config key (e.g., `cache.dir`, `remotes.origin`, `default_remote`)
+- `VALUE` - Value to set
+
+**Options:**
+
+| Option | Description |
+|--------|-------------|
+| `--global` / `-g` | Set in global config (~/.config/pivot/config.yaml) |
+
+**Examples:**
+
+```bash
+# Add a remote
+pivot config set remotes.origin s3://my-bucket/pivot-cache
+
+# Set default remote
+pivot config set default_remote origin
+
+# Set global cache directory
+pivot config set cache.dir /shared/cache --global
+
+# Set max parallel workers
+pivot config set core.max_workers 8
+```
+
+---
+
+### `pivot config unset`
+
+Remove a configuration value.
+
+```bash
+pivot config unset KEY [OPTIONS]
+```
+
+**Arguments:**
+
+- `KEY` - Config key to remove
+
+**Options:**
+
+| Option | Description |
+|--------|-------------|
+| `--global` / `-g` | Remove from global config |
+
+**Examples:**
+
+```bash
+# Remove a remote
+pivot config unset remotes.backup
+
+# Clear default remote
+pivot config unset default_remote
+```
+
+---
+
+### Configuration Keys
+
+| Key | Description | Default |
+|-----|-------------|---------|
+| `cache.dir` | Cache directory | `.pivot/cache` |
+| `cache.checkout_mode` | Checkout mode order | `hardlink,symlink,copy` |
+| `core.max_workers` | Parallel workers (-1 = all CPUs) | `-2` |
+| `core.state_dir` | State directory | `.pivot` |
+| `remote.jobs` | Parallel transfer jobs | `20` |
+| `remote.retries` | Transfer retry count | `10` |
+| `remote.connect_timeout` | Connection timeout (seconds) | `30` |
+| `watch.debounce` | Watch debounce (milliseconds) | `300` |
+| `display.precision` | Float display precision | `5` |
+| `diff.max_rows` | Max rows for data diff | `10000` |
+| `default_remote` | Default remote name | (none) |
+| `remotes.<name>` | Remote URL (S3) | (none) |

@@ -86,7 +86,7 @@ def test_remote_not_configured_error_suggestion() -> None:
     """RemoteNotConfiguredError suggests adding a remote."""
     error = exceptions.RemoteNotConfiguredError("No remote")
 
-    assert "pivot remote add" in error.get_suggestion()
+    assert "pivot config set remotes." in error.get_suggestion()
 
 
 def test_remote_not_found_error_suggestion() -> None:

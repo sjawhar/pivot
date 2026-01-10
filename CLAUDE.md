@@ -1,6 +1,6 @@
 # Pivot - Project Rules
 
-**Python Version:** 3.13+ | **Coverage Target:** 90%+
+**Python Version:** 3.13+ | **Platform:** Unix only (Linux/macOS) | **Coverage Target:** 90%+
 
 ---
 
@@ -92,6 +92,29 @@ some_function(ChangeCheckResult(changed=True, reason="test"))
 return {"changed": True, "reason": "code changed"}
 result = {"changed": False}  # Missing 'reason' not caught!
 ```
+
+## Pydantic for Structured Data with Schemas
+
+**Use Pydantic models for data that needs validation with clear error messages.** Configuration files, user-provided parameters, and API request/response bodies benefit from Pydantic's automatic validation, type coercion, and structured error messages.
+
+```python
+import pydantic
+
+class RemoteTransferConfig(pydantic.BaseModel):
+    """Remote transfer configuration."""
+    jobs: Annotated[int, pydantic.Field(gt=0)] = 20
+    retries: Annotated[int, pydantic.Field(ge=0)] = 10
+
+# Pydantic validates on construction and gives clear errors
+config = RemoteTransferConfig(jobs=-1)  # ValidationError: jobs must be > 0
+```
+
+**When to use Pydantic vs TypedDict:**
+
+- **Pydantic:** Config files, user input, API boundaries—anywhere you need validation and helpful error messages
+- **TypedDict:** Internal data structures, hot paths, data that's already validated upstream
+
+**Exception:** Avoid Pydantic for hot paths where performance is critical (e.g., per-file hash lookups during pipeline execution). Use TypedDict or plain dicts there since Pydantic adds validation overhead.
 
 ## Import Style (Google Python Style Guide)
 
@@ -489,3 +512,4 @@ basedpyright .         # Type check
 14. **Fingerprinting: `is_user_code()` check required for both import styles:** Direct references (`from utils import func`) and module attributes (`import utils; utils.func()`) both need `is_user_code()` check before hashing. The actual hash+recurse logic is centralized in `_add_callable_to_manifest()`.
 15. **StateDB uses different path strategies for hash vs generation keys:** `_make_key_file_hash()` uses `path.resolve()` (follows symlinks) for physical file deduplication—multiple symlinks to the same file share one cached hash. `_make_key_output_generation()` uses `normpath(absolute())` (preserves symlinks) for logical path tracking—Pivot outputs become symlinks to cache after execution, and `resolve()` would follow those to cache paths that change per-run, breaking generation tracking.
 16. **LMDB for all persistent caching:** Pivot uses LMDB (`.pivot/state.lmdb/`) with key prefixes (`hash:`, `gen:`, `dep:`, `remote:`) for all persistent state: file hash caching, generation counters, dependency tracking, and remote index. Prefer extending StateDB with new prefixes over adding new database technologies (e.g., SQLite, diskcache).
+17. **ruamel.yaml for user-edited config, PyYAML for read-only:** Use `ruamel.yaml` (with `typ="rt"`) for config files that users edit directly—it preserves comments and formatting when modifying YAML. Use `PyYAML` for read-only YAML files like DVC pipelines where comment preservation doesn't matter. The `config/io.py` module demonstrates the pattern: `_load_config_preserving_structure()` preserves ruamel structure for comment-preserving edits, while `load_config_file()` converts to plain dict for general use.

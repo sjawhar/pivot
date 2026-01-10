@@ -85,7 +85,7 @@ def status(
         except exceptions.RemoteNotConfiguredError:
             if remote_only:
                 raise click.ClickException(
-                    "No remotes configured. Use `pivot remote add`."
+                    "No remotes configured. Use `pivot config set remotes.<name> <url>`."
                 ) from None
             click.echo("No remotes configured")
         except exceptions.RemoteError as e:

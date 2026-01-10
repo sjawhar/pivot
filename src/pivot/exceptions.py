@@ -230,4 +230,24 @@ class RemoteNotConfiguredError(RemoteError):
 
     @override
     def get_suggestion(self) -> str:
-        return "Run 'pivot remote add <name> <url>' to configure a remote"
+        return "Run 'pivot config set remotes.<name> <url>' to configure a remote"
+
+
+class ConfigError(PivotError):
+    """Base class for configuration errors."""
+
+    pass
+
+
+class ConfigValidationError(ConfigError):
+    """Raised when config value fails validation."""
+
+    pass
+
+
+class ConfigKeyError(ConfigError):
+    """Raised when config key is unknown or invalid."""
+
+    @override
+    def get_suggestion(self) -> str:
+        return "Run 'pivot config list' to see available config keys"

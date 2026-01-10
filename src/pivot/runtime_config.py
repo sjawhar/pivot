@@ -93,7 +93,7 @@ def _parse_config(data: dict[str, Any]) -> PivotConfig:
 
 def get_checkout_mode_order(config: PivotConfig | None = None) -> list[str]:
     """Get checkout mode fallback order from config or default."""
-    from pivot import cache
+    from pivot.config import CheckoutMode
 
     if config is None:
         config = load_config()
@@ -110,7 +110,7 @@ def get_checkout_mode_order(config: PivotConfig | None = None) -> list[str]:
     valid_modes = list[str]()
     for mode in checkout_modes:
         try:
-            cache.CheckoutMode(mode)
+            CheckoutMode(mode)
             valid_modes.append(mode)
         except ValueError:
             logger.warning(f"Invalid checkout mode '{mode}' in config, skipping")
