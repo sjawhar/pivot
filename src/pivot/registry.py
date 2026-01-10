@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any, TypedDict, TypeVar, get_origin, get_type_
 
 import pydantic
 
-from pivot import exceptions, fingerprint, outputs, parameters, project, trie
+from pivot import exceptions, fingerprint, outputs, parameters, path_policy, project, trie
 from pivot.exceptions import ParamsError, SecurityValidationError, ValidationError
 
 if TYPE_CHECKING:
@@ -286,8 +286,12 @@ class StageRegistry:
         # Convert params to instance (instantiate class if needed)
         params_instance = _resolve_params(params, func, stage_name)
 
-        deps_list = _normalize_paths(deps_list, self.validation_mode, cwd_path)
-        outs_paths = _normalize_paths(outs_paths, self.validation_mode, cwd_path)
+        deps_list = _normalize_paths(
+            deps_list, path_policy.PathType.DEP, self.validation_mode, cwd_path
+        )
+        outs_paths = _normalize_paths(
+            outs_paths, path_policy.PathType.OUT, self.validation_mode, cwd_path
+        )
 
         # Update normalized outputs with absolute paths
         outs_normalized = [
@@ -360,46 +364,64 @@ class StageRegistry:
 
 def _normalize_paths(
     paths: Sequence[str],
+    path_type: path_policy.PathType,
     validation_mode: ValidationMode,
     cwd: pathlib.Path | None = None,
 ) -> list[str]:
-    """Normalize paths to absolute paths, preserving symlinks for portability.
+    """Normalize paths to absolute paths, applying policy-based validation.
 
     Args:
         paths: Paths to normalize
+        path_type: Type of path (DEP or OUT) for policy lookup
         validation_mode: How to handle validation errors
         cwd: Base directory for relative paths (default: project root)
 
     Raises:
-        InvalidPathError: If path is outside project root
+        InvalidPathError: If path violates its type's policy
     """
     normalized = list[str]()
     project_root = project.get_project_root()
+    policy = path_policy.POLICIES[path_type]
 
     for path in paths:
         try:
-            # If cwd is provided and path is relative, resolve from cwd
-            path_to_normalize = path
-            if cwd is not None and not pathlib.Path(path).is_absolute():
-                path_to_normalize = str(cwd / path)
+            # Normalize path to absolute (from cwd or project root)
+            if pathlib.Path(path).is_absolute():
+                norm_path = pathlib.Path(path)
+            elif cwd is not None:
+                norm_path = project.normalize_path(str(cwd / path))
+            else:
+                norm_path = project.normalize_path(path)
 
-            # Use normalized path (preserve symlinks) for portability
-            norm_path = project.normalize_path(path_to_normalize)
+            # Check if path is within project root
+            is_within_project = norm_path.is_relative_to(project_root)
 
-            # Reject paths outside project root (not portable)
-            if not norm_path.is_relative_to(project_root):
-                raise exceptions.InvalidPathError(
-                    f"Path '{path}' resolves to '{norm_path}' which is outside "
-                    + f"project root '{project_root}'. All paths must be within the project."
-                )
-
-            # Warn if relative path contains symlinks
-            is_relative = not pathlib.Path(path).is_absolute()
-            if is_relative and project.contains_symlink_in_path(norm_path, project_root):
-                logger.warning(
-                    f"Path '{path}' is inside a symlinked directory. "
-                    + "This may affect portability across environments."
-                )
+            if not is_within_project:
+                # Path is outside project root
+                if not policy["allow_absolute"]:
+                    raise exceptions.InvalidPathError(
+                        f"{path_type.value.capitalize()} path '{path}' resolves to '{norm_path}' "
+                        + f"which is outside project root '{project_root}'"
+                    )
+                # Allowed (deps only) - warn about reproducibility
+                logger.warning(f"Absolute {path_type.value} path may break reproducibility: {path}")
+            else:
+                # Path is within project - check symlink escape (for paths that exist)
+                if norm_path.exists() and project.contains_symlink_in_path(norm_path, project_root):
+                    resolved = norm_path.resolve()
+                    if not resolved.is_relative_to(project_root.resolve()):
+                        msg = (
+                            f"{path_type.value.capitalize()} path '{path}' resolves outside "
+                            + f"project via symlink: {resolved}"
+                        )
+                        if policy["symlink_escape_action"] == "error":
+                            raise exceptions.InvalidPathError(msg)
+                        logger.warning(msg)
+                    else:
+                        logger.warning(
+                            f"Path '{path}' is inside a symlinked directory. "
+                            + "This may affect portability across environments."
+                        )
 
             normalized.append(str(norm_path))
         except (ValueError, OSError, exceptions.InvalidPathError):
@@ -433,21 +455,16 @@ def _validate_stage_registration(
             validation_mode,
         )
 
-    for path in [*deps, *outs]:
-        _validate_path(path, stage_name)
+    # Validate syntax only here (containment checked in _normalize_paths)
+    for path in deps:
+        error = path_policy.validate_path_syntax(path)
+        if error:
+            raise SecurityValidationError(f"Stage '{stage_name}': dependency path {error}: {path}")
 
-
-def _validate_path(path: str, stage_name: str) -> None:
-    """Validate path has no security issues (traversal, null bytes, newlines)."""
-    parts = pathlib.Path(path).parts
-    security_checks = [
-        (".." in parts, "contains '..' (path traversal)"),
-        ("\x00" in path, "contains null byte"),
-        ("\n" in path or "\r" in path, "contains newline character"),
-    ]
-    for failed, description in security_checks:
-        if failed:
-            raise SecurityValidationError(f"Stage '{stage_name}': Path '{path}' {description}")
+    for path in outs:
+        error = path_policy.validate_path_syntax(path)
+        if error:
+            raise SecurityValidationError(f"Stage '{stage_name}': output path {error}: {path}")
 
 
 def _handle_validation_error(msg: str, validation_mode: ValidationMode) -> None:

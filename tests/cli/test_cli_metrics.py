@@ -44,14 +44,16 @@ def test_metrics_show_file(runner: click.testing.CliRunner, tmp_path: pathlib.Pa
 
 def test_metrics_show_json_format(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
     """Metrics show --json outputs valid JSON."""
-    metric_file = tmp_path / "metrics.json"
-    metric_file.write_text(json.dumps({"accuracy": 0.95}))
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        metric_file = pathlib.Path("metrics.json")
+        metric_file.write_text(json.dumps({"accuracy": 0.95}))
 
-    result = runner.invoke(cli.cli, ["metrics", "show", "--json", str(metric_file)])
+        result = runner.invoke(cli.cli, ["metrics", "show", "--json", str(metric_file)])
 
-    assert result.exit_code == 0
-    parsed = json.loads(result.output)
-    assert str(metric_file) in parsed
+        assert result.exit_code == 0
+        parsed = json.loads(result.output)
+        assert str(metric_file) in parsed
 
 
 def test_metrics_show_markdown_format(
@@ -173,6 +175,29 @@ def test_metrics_diff_no_metrics(runner: click.testing.CliRunner, tmp_path: path
         result = runner.invoke(cli.cli, ["metrics", "diff"])
     assert result.exit_code == 0
     assert "No metrics found" in result.output
+
+
+def test_metrics_diff_explicit_file_no_stages(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """Issue #62: metrics diff TARGET should work with explicit file when no stages registered."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        # Create a metrics file
+        metrics_file = pathlib.Path("metrics.json")
+        metrics_file.write_text(json.dumps({"accuracy": 0.95}))
+
+        # Should work even with no stages registered
+        result = runner.invoke(cli.cli, ["metrics", "diff", str(metrics_file)])
+
+        # Should not fail with "stage not found" error
+        assert result.exit_code == 0
+        # Should show diff output (no prior commit, so shows as added)
+        assert (
+            "accuracy" in result.output
+            or "No changes" in result.output
+            or "No metrics found" in result.output
+        )
 
 
 # =============================================================================

@@ -17,7 +17,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _ensure_stages_registered() -> None:
+def ensure_stages_registered() -> None:
     """Auto-discover and register stages if none are registered."""
     if not discovery.has_registered_stages():
         try:
@@ -191,7 +191,7 @@ def run(
 
     Auto-discovers pivot.yaml or pipeline.py if no stages are registered.
     """
-    _ensure_stages_registered()
+    ensure_stages_registered()
     stages_list = list(stages) if stages else None
     _validate_stages(stages_list, single_stage)
 
@@ -256,7 +256,7 @@ def dry_run_cmd(
     stages: tuple[str, ...], single_stage: bool, cache_dir: pathlib.Path | None
 ) -> None:
     """Show what would run without executing."""
-    _ensure_stages_registered()
+    ensure_stages_registered()
     stages_list = list(stages) if stages else None
     _validate_stages(stages_list, single_stage)
 
@@ -288,7 +288,7 @@ def explain_cmd(
     """Show detailed breakdown of why stages would run."""
     from pivot import console
 
-    _ensure_stages_registered()
+    ensure_stages_registered()
     stages_list = list(stages) if stages else None
     _validate_stages(stages_list, single_stage)
 

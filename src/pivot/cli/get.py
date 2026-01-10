@@ -4,7 +4,7 @@ import pathlib
 
 import click
 
-from pivot import cache, config, get, project
+from pivot import cache, config, get, path_policy, project
 from pivot.cli import completion
 from pivot.cli import decorators as cli_decorators
 
@@ -50,6 +50,15 @@ def get_cmd(
     """
     project_root = project.get_project_root()
     cache_dir = project_root / ".pivot" / "cache"
+
+    # Validate output path if provided
+    if output is not None:
+        path_policy.require_valid_path(
+            str(output),
+            path_policy.PathType.CLI_OUTPUT,
+            project_root,
+            context="get --output",
+        )
 
     # Determine checkout modes
     mode_strings = [checkout_mode] if checkout_mode else config.get_checkout_mode_order()

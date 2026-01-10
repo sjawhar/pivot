@@ -4,8 +4,10 @@ from typing import TYPE_CHECKING
 
 import click
 
-from pivot import project
+from pivot import outputs, project
 from pivot.cli import decorators as cli_decorators
+from pivot.cli import targets as cli_targets
+from pivot.cli.run import ensure_stages_registered
 from pivot.show import metrics as metrics_mod
 
 if TYPE_CHECKING:
@@ -32,11 +34,17 @@ def metrics_show(
 ) -> None:
     """Display metric values in tabular format.
 
-    If TARGETS are specified, parses those files/directories directly.
-    Otherwise, shows metrics from all registered stages' Metric outputs.
+    TARGETS can be file paths or stage names. If a stage name is provided,
+    all its metric outputs are included.
+
+    If no TARGETS are specified, shows metrics from all registered stages.
     """
-    if targets:
-        all_metrics = metrics_mod.collect_metrics_from_files(list(targets), recursive)
+    proj_root = project.get_project_root()
+    ensure_stages_registered()
+
+    paths = cli_targets.resolve_and_validate(targets, proj_root, outputs.Metric)
+    if paths is not None:
+        all_metrics = metrics_mod.collect_metrics_from_files(list(paths), recursive)
     else:
         all_metrics = metrics_mod.collect_all_stage_metrics_flat()
 
@@ -61,32 +69,32 @@ def metrics_diff(
 ) -> None:
     """Compare workspace metric files against git HEAD.
 
-    If TARGETS are specified, compares those files/directories.
-    Otherwise, compares all registered stages' Metric outputs.
+    TARGETS can be file paths or stage names. If a stage name is provided,
+    all its metric outputs are included.
+
+    If no TARGETS are specified, compares all registered stages' Metric outputs.
     """
-    # Get HEAD info (hashes from lock files)
-    head_info = metrics_mod.get_metric_info_from_head()
+    proj_root = project.get_project_root()
+    ensure_stages_registered()
 
-    if not head_info:
-        click.echo("No metrics found in registered stages.")
-        return
-
-    # Filter to targets if specified
-    if targets:
-        proj_root = project.get_project_root()
-        target_set = {
-            project.to_relative_path(project.normalize_path(t), proj_root) for t in targets
-        }
-        head_info = {k: v for k, v in head_info.items() if k in target_set}
-        paths = list(target_set)
+    paths = cli_targets.resolve_and_validate(targets, proj_root, outputs.Metric)
+    if paths is not None:
+        head_info = metrics_mod.get_metric_info_from_head()
+        head_info = {k: v for k, v in head_info.items() if k in paths}
+        head_metrics = metrics_mod.collect_metrics_from_head(list(paths), head_info)
+        workspace_metrics = metrics_mod.collect_metrics_from_files(
+            list(paths), recursive, tolerant=False
+        )
     else:
-        paths = list(head_info.keys())
-
-    # Get metrics from HEAD (cache-first, git-fallback)
-    head_metrics = metrics_mod.collect_metrics_from_head(paths, head_info)
-
-    # Get current workspace metrics
-    workspace_metrics = metrics_mod.collect_metrics_from_files(paths, recursive)
+        head_info = metrics_mod.get_metric_info_from_head()
+        if not head_info:
+            click.echo("No metrics found in registered stages.")
+            return
+        all_paths = set(head_info.keys())
+        head_metrics = metrics_mod.collect_metrics_from_head(list(all_paths), head_info)
+        workspace_metrics = metrics_mod.collect_metrics_from_files(
+            list(all_paths), recursive, tolerant=True
+        )
 
     diffs = metrics_mod.diff_metrics(head_metrics, workspace_metrics)
     output = metrics_mod.format_diff_table(diffs, output_format, precision, show_path=not no_path)

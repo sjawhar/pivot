@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Annotated, Any, TypedDict
 import pydantic
 import yaml
 
-from pivot import outputs, parameters, registry, yaml_config
+from pivot import outputs, parameters, path_policy, registry, yaml_config
 
 if TYPE_CHECKING:
     import pathlib
@@ -93,9 +93,11 @@ class StageConfig(pydantic.BaseModel, extra="forbid"):
     @pydantic.field_validator("cwd")
     @classmethod
     def validate_cwd(cls, v: str | None) -> str | None:
-        """Validate cwd doesn't contain path traversal."""
-        if v is not None and ".." in v:
-            raise ValueError(f"cwd cannot contain '..' (got '{v}')")
+        """Validate cwd doesn't contain path traversal or injection characters."""
+        if v is not None:
+            error = path_policy.validate_path_syntax(v)
+            if error:
+                raise ValueError(f"cwd {error} (got '{v}')")
         return v
 
 
@@ -103,6 +105,7 @@ class PipelineConfig(pydantic.BaseModel, extra="forbid"):
     """Top-level pivot.yaml configuration."""
 
     stages: dict[str, StageConfig]
+    vars: list[str] = []  # Files to load variables from for ${var} interpolation
 
 
 def _validate_callable(v: object) -> Callable[..., Any]:
@@ -142,19 +145,58 @@ def load_pipeline_file(pipeline_file: pathlib.Path) -> PipelineConfig:
         raise PipelineConfigError(f"Invalid pipeline configuration: {e}") from e
 
 
+def _load_vars_files(vars_paths: list[str], pipeline_dir: pathlib.Path) -> dict[str, str]:
+    """Load variables from YAML files for ${var} interpolation.
+
+    Only top-level string values are included (nested dicts are skipped).
+    """
+    from pivot import exceptions
+
+    result = dict[str, str]()
+    for var_path in vars_paths:
+        try:
+            full_path = path_policy.require_valid_path(
+                var_path,
+                path_policy.PathType.VAR,
+                pipeline_dir,
+                context="vars",
+            )
+        except exceptions.SecurityValidationError as e:
+            raise PipelineConfigError(str(e)) from e
+        if not full_path.exists():
+            raise PipelineConfigError(f"Vars file not found: {full_path}")
+        with open(full_path) as f:
+            data = yaml.safe_load(f)
+        if not isinstance(data, dict):
+            raise PipelineConfigError(f"Vars file must be a dict: {full_path}")
+        data_dict = typing.cast("dict[str, Any]", data)
+        for key, value in data_dict.items():
+            if isinstance(value, (str, int, float, bool)):
+                result[key] = str(value)
+    return result
+
+
 def register_from_pipeline_file(pipeline_file: pathlib.Path) -> None:
     """Load pivot.yaml and register all stages to the global registry."""
     pipeline = load_pipeline_file(pipeline_file)
     pipeline_dir = pipeline_file.parent
 
+    # Load variables from vars files for ${var} interpolation
+    global_vars = _load_vars_files(pipeline.vars, pipeline_dir)
+
     for stage_name, stage_config in pipeline.stages.items():
-        _register_stage(stage_name, stage_config, pipeline_dir)
+        _register_stage(stage_name, stage_config, pipeline_dir, global_vars)
 
 
-def _register_stage(name: str, config: StageConfig, pipeline_dir: pathlib.Path) -> None:
+def _register_stage(
+    name: str,
+    config: StageConfig,
+    pipeline_dir: pathlib.Path,
+    global_vars: dict[str, str],
+) -> None:
     """Register a single stage from configuration."""
     if config.matrix is not None:
-        expanded = _expand_matrix(name, config, pipeline_dir)
+        expanded = _expand_matrix(name, config, pipeline_dir, global_vars)
         for stage in expanded:
             registry.REGISTRY.register(
                 func=stage.func,
@@ -178,24 +220,37 @@ def _register_stage(name: str, config: StageConfig, pipeline_dir: pathlib.Path) 
         for variant in typing.cast("list[VariantDict]", variants):
             _register_variant_from_dict(name, func, variant, pipeline_dir)
     else:
-        _register_simple_stage(name, config, pipeline_dir)
+        _register_simple_stage(name, config, pipeline_dir, global_vars)
 
 
-def _register_simple_stage(name: str, config: StageConfig, pipeline_dir: pathlib.Path) -> None:
+def _register_simple_stage(
+    name: str,
+    config: StageConfig,
+    pipeline_dir: pathlib.Path,
+    global_vars: dict[str, str],
+) -> None:
     """Register a simple (non-matrix) stage."""
     func = _import_function(config.python)
     cwd = config.cwd or str(pipeline_dir)
+
+    # Interpolate global vars in paths
+    deps = [_interpolate(d, global_vars, name) for d in config.deps]
+    outs_raw = [_interpolate_out(o, global_vars, name) for o in config.outs]
+    metrics_raw = [_interpolate_out(m, global_vars, name) for m in config.metrics]
+    plots_raw = [_interpolate_out(p, global_vars, name) for p in config.plots]
+    cwd = _interpolate(cwd, global_vars, name)
+
     outs_spec = (
-        _normalize_output_specs(config.outs, outputs.Out)
-        + _normalize_output_specs(config.metrics, outputs.Metric)
-        + _normalize_output_specs(config.plots, outputs.Plot)
+        _normalize_output_specs(outs_raw, outputs.Out)
+        + _normalize_output_specs(metrics_raw, outputs.Metric)
+        + _normalize_output_specs(plots_raw, outputs.Plot)
     )
     params_instance = _resolve_params(func, config.params, name)
 
     registry.REGISTRY.register(
         func=func,
         name=name,
-        deps=config.deps,
+        deps=deps,
         outs=outs_spec,
         params=params_instance,
         mutex=config.mutex,
@@ -236,7 +291,10 @@ def _register_variant_from_dict(
 
 
 def _expand_matrix(
-    name: str, config: StageConfig, pipeline_dir: pathlib.Path
+    name: str,
+    config: StageConfig,
+    pipeline_dir: pathlib.Path,
+    global_vars: dict[str, str],
 ) -> list[ExpandedStage]:
     """Expand matrix configuration into individual variant stages."""
     if config.matrix is None:
@@ -278,12 +336,15 @@ def _expand_matrix(
 
         cwd = cwd or str(pipeline_dir)
 
-        # Use string values for path interpolation (deps, outs, cwd)
-        deps = [_interpolate(d, string_values, full_name) for d in deps]
-        outs_raw = [_interpolate_out(o, string_values, full_name) for o in outs_raw]
-        metrics_raw = [_interpolate_out(m, string_values, full_name) for m in metrics_raw]
-        plots_raw = [_interpolate_out(p, string_values, full_name) for p in plots_raw]
-        cwd = _interpolate(cwd, string_values, full_name)
+        # Merge global vars with matrix values (matrix takes precedence)
+        all_vars = {**global_vars, **string_values}
+
+        # Use merged values for path interpolation (deps, outs, cwd)
+        deps = [_interpolate(d, all_vars, full_name) for d in deps]
+        outs_raw = [_interpolate_out(o, all_vars, full_name) for o in outs_raw]
+        metrics_raw = [_interpolate_out(m, all_vars, full_name) for m in metrics_raw]
+        plots_raw = [_interpolate_out(p, all_vars, full_name) for p in plots_raw]
+        cwd = _interpolate(cwd, all_vars, full_name)
 
         # Use typed values for params interpolation (preserves int/float/bool)
         params_dict = {k: _interpolate_value(v, typed_values) for k, v in params_dict.items()}

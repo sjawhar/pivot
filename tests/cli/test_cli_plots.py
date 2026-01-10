@@ -1,17 +1,14 @@
 from __future__ import annotations
 
 import json
+import pathlib
 import subprocess
-from typing import TYPE_CHECKING
 
 import click.testing
 import pytest
 
 from pivot import cli, lock, outputs, registry
 from pivot.types import LockData
-
-if TYPE_CHECKING:
-    import pathlib
 
 
 def _setup_git_repo(tmp_path: pathlib.Path) -> None:
@@ -78,6 +75,24 @@ def test_plots_show_no_plots(runner: click.testing.CliRunner, tmp_path: pathlib.
         assert "No plots found" in result.output
 
 
+def test_plots_show_explicit_file_no_stages(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """Issue #62: plots show TARGET should work with explicit file when no stages registered."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        # Create a plot file
+        plot_file = pathlib.Path("results.png")
+        plot_file.write_bytes(b"fake png data")
+
+        # Should work even with no stages registered
+        result = runner.invoke(cli.cli, ["plots", "show", str(plot_file)])
+
+        # Should not fail with "stage not found" error
+        assert result.exit_code == 0
+        assert "Rendered 1 plot(s)" in result.output
+
+
 def test_plots_show_creates_html(
     runner: click.testing.CliRunner, set_project_root: pathlib.Path
 ) -> None:
@@ -142,6 +157,23 @@ def test_plots_diff_no_plots(runner: click.testing.CliRunner, tmp_path: pathlib.
         result = runner.invoke(cli.cli, ["plots", "diff"])
         assert result.exit_code == 0
         assert "No plots found" in result.output
+
+
+def test_plots_diff_explicit_file_no_stages(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """Issue #62: plots diff TARGET should work with explicit file when no stages registered."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        _setup_git_repo(pathlib.Path("."))
+        # Create a plot file
+        plot_file = pathlib.Path("results.png")
+        plot_file.write_bytes(b"fake png data")
+
+        # Should work even with no stages registered
+        result = runner.invoke(cli.cli, ["plots", "diff", str(plot_file)])
+
+        # Should not fail with "stage not found" error
+        assert result.exit_code == 0
 
 
 def test_plots_diff_json_format(

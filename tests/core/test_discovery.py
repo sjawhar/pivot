@@ -138,10 +138,8 @@ pipeline.add_stage(my_stage, outs=['output.txt'])
     assert "my_stage" in registry.REGISTRY.list_stages()
 
 
-def test_discover_pivot_yaml_takes_precedence(project_root: pathlib.Path) -> None:
-    """pivot.yaml is preferred over pipeline.py."""
-    import sys
-
+def test_discover_both_files_raises_error(project_root: pathlib.Path) -> None:
+    """Having both pivot.yaml and pipeline.py raises DiscoveryError."""
     # Create stages module
     stages_py = project_root / "stages.py"
     stages_py.write_text(
@@ -176,17 +174,8 @@ pipeline.add_stage(python_stage, outs=['python_output.txt'])
 """
     )
 
-    sys.path.insert(0, str(project_root))
-    try:
-        result = discovery.discover_and_register(project_root)
-
-        assert result == str(pivot_yaml)
-        assert "yaml_stage" in registry.REGISTRY.list_stages()
-        assert "python_stage" not in registry.REGISTRY.list_stages()
-    finally:
-        sys.path.remove(str(project_root))
-        if "stages" in sys.modules:
-            del sys.modules["stages"]
+    with pytest.raises(discovery.DiscoveryError, match="Found both pivot.yaml and pipeline.py"):
+        discovery.discover_and_register(project_root)
 
 
 # =============================================================================

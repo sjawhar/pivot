@@ -33,24 +33,38 @@ def discover_and_register(project_root: pathlib.Path | None = None) -> str | Non
         Path to the discovered file, or None if nothing found
 
     Raises:
-        DiscoveryError: If discovery or registration fails
+        DiscoveryError: If discovery or registration fails, or if both config types exist
     """
     root = project_root or project.get_project_root()
 
-    # Try pivot.yaml first
+    # Check which files exist upfront
+    yaml_path = None
     for yaml_name in PIVOT_YAML_NAMES:
-        yaml_path = root / yaml_name
-        if yaml_path.exists():
-            logger.info(f"Discovered {yaml_path}")
-            try:
-                pipeline_config.register_from_pipeline_file(yaml_path)
-                return str(yaml_path)
-            except pipeline_config.PipelineConfigError as e:
-                raise DiscoveryError(f"Failed to load {yaml_path}: {e}") from e
+        candidate = root / yaml_name
+        if candidate.exists():
+            yaml_path = candidate
+            break
+
+    pipeline_path = root / PIPELINE_PY_NAME
+    pipeline_exists = pipeline_path.exists()
+
+    # Error if both exist
+    if yaml_path and pipeline_exists:
+        raise DiscoveryError(
+            f"Found both {yaml_path.name} and {PIPELINE_PY_NAME} in {root}. Remove one to resolve ambiguity."
+        )
+
+    # Register from yaml if found
+    if yaml_path:
+        logger.info(f"Discovered {yaml_path}")
+        try:
+            pipeline_config.register_from_pipeline_file(yaml_path)
+            return str(yaml_path)
+        except pipeline_config.PipelineConfigError as e:
+            raise DiscoveryError(f"Failed to load {yaml_path}: {e}") from e
 
     # Try pipeline.py
-    pipeline_path = root / PIPELINE_PY_NAME
-    if pipeline_path.exists():
+    if pipeline_exists:
         logger.info(f"Discovered {pipeline_path}")
         try:
             _import_pipeline_module(pipeline_path)
