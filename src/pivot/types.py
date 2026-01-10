@@ -162,7 +162,8 @@ class StageExplanation(TypedDict):
 
     stage_name: str
     will_run: bool
-    reason: str  # High-level: "Code changed", "No previous run", etc.
+    is_forced: bool  # True if stage is forced to run regardless of changes
+    reason: str  # High-level: "Code changed", "No previous run", "forced", etc.
     code_changes: list[CodeChange]
     param_changes: list[ParamChange]
     dep_changes: list[DepChange]
@@ -323,6 +324,7 @@ class TuiMessageType(enum.StrEnum):
     LOG = "log"
     STATUS = "status"
     REACTIVE = "reactive"
+    RELOAD = "reload"
 
 
 class ReactiveStatus(enum.StrEnum):
@@ -363,4 +365,11 @@ class TuiReactiveMessage(TypedDict):
     message: str
 
 
-TuiMessage = TuiLogMessage | TuiStatusMessage | TuiReactiveMessage | None
+class TuiReloadMessage(TypedDict):
+    """Registry reload notification for TUI display."""
+
+    type: Literal[TuiMessageType.RELOAD]
+    stages: list[str]
+
+
+TuiMessage = TuiLogMessage | TuiStatusMessage | TuiReactiveMessage | TuiReloadMessage | None

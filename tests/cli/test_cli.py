@@ -134,6 +134,30 @@ def test_cli_dry_run_shows_unchanged_as_skip(
         assert "would skip" in result.output or "unchanged" in result.output
 
 
+def test_cli_force_dry_run_shows_forced(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """Dry-run with --force shows stages as 'would run (forced)'."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        pathlib.Path("input.txt").write_text("data")
+
+        @stage(deps=["input.txt"], outs=["output.txt"])
+        def process() -> None:
+            pathlib.Path("output.txt").write_text("done")
+
+        # First, actually run to create lock file
+        executor.run(show_output=False)
+
+        # Now dry-run with --force should show as 'would run (forced)'
+        result = runner.invoke(cli.cli, ["run", "--dry-run", "--force"])
+
+        assert result.exit_code == 0
+        assert "process" in result.output
+        assert "would run" in result.output
+        assert "forced" in result.output
+
+
 def test_cli_dry_run_missing_deps_errors(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:

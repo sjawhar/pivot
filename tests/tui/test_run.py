@@ -172,13 +172,12 @@ def test_run_tui_app_init() -> None:
 
         app = run_tui.RunTuiApp(stage_names, tui_queue, executor_func)
 
-        assert app._stage_names == stage_names
         assert len(app._stages) == 3
         assert list(app._stage_order) == stage_names
         assert app._selected_idx == 0
         assert app._show_logs is False
         assert app._results is None
-        assert app._error is None
+        assert app.error is None
     finally:
         manager.shutdown()
 

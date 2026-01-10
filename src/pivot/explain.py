@@ -99,6 +99,7 @@ def get_stage_explanation(
     params_instance: pydantic.BaseModel | None,
     overrides: parameters.ParamsOverrides | None,
     cache_dir: Path,
+    force: bool = False,
 ) -> StageExplanation:
     """Compute detailed explanation of why a stage would run."""
     stage_lock = lock.StageLock(stage_name, cache_dir)
@@ -108,7 +109,8 @@ def get_stage_explanation(
         return StageExplanation(
             stage_name=stage_name,
             will_run=True,
-            reason="No previous run",
+            is_forced=force,
+            reason="forced" if force else "No previous run",
             code_changes=[],
             param_changes=[],
             dep_changes=[],
@@ -120,6 +122,7 @@ def get_stage_explanation(
         return StageExplanation(
             stage_name=stage_name,
             will_run=True,
+            is_forced=force,
             reason=f"Missing deps: {', '.join(missing_deps)}",
             code_changes=[],
             param_changes=[],
@@ -130,6 +133,7 @@ def get_stage_explanation(
         return StageExplanation(
             stage_name=stage_name,
             will_run=True,
+            is_forced=force,
             reason=f"Unreadable deps: {', '.join(unreadable_deps)}",
             code_changes=[],
             param_changes=[],
@@ -142,6 +146,7 @@ def get_stage_explanation(
         return StageExplanation(
             stage_name=stage_name,
             will_run=True,
+            is_forced=force,
             reason=f"Invalid params.yaml: {e}",
             code_changes=[],
             param_changes=[],
@@ -158,20 +163,24 @@ def get_stage_explanation(
     param_changes = diff_params(old_params, current_params)
     dep_changes = diff_dep_hashes(old_dep_hashes, dep_hashes)
 
-    will_run = bool(code_changes or param_changes or dep_changes)
-    reason = (
-        "Code changed"
-        if code_changes
-        else "Params changed"
-        if param_changes
-        else "Input dependencies changed"
-        if dep_changes
-        else ""
-    )
+    has_changes = bool(code_changes or param_changes or dep_changes)
+    will_run = has_changes or force
+
+    if force and not has_changes:
+        reason = "forced"
+    elif code_changes:
+        reason = "Code changed"
+    elif param_changes:
+        reason = "Params changed"
+    elif dep_changes:
+        reason = "Input dependencies changed"
+    else:
+        reason = ""
 
     return StageExplanation(
         stage_name=stage_name,
         will_run=will_run,
+        is_forced=force,
         reason=reason,
         code_changes=code_changes,
         param_changes=param_changes,
