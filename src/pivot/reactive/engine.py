@@ -18,8 +18,9 @@ import loky
 import watchfiles
 import yaml
 
-from pivot import dag, executor, project, registry, watch
+from pivot import dag, executor, project, registry, types
 from pivot.pipeline import yaml as pipeline_yaml
+from pivot.reactive import _watch_utils
 
 if TYPE_CHECKING:
     import multiprocessing as mp
@@ -33,10 +34,14 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+_VENV_DIRS = frozenset({".venv", "venv", ".env", "env", "node_modules", ".git", "__pycache__"})
+
+
 def _clear_project_modules(root: pathlib.Path) -> int:
     """Remove all project modules from sys.modules to force fresh imports.
 
     This ensures transitive dependencies are also reimported, not just stage modules.
+    Excludes virtual environment directories to prevent breaking package imports.
     Returns the count of cleared modules.
     """
     root_str = str(root)
@@ -51,6 +56,10 @@ def _clear_project_modules(root: pathlib.Path) -> int:
         if module_file is None:
             continue
         try:
+            # Skip venv/node_modules directories to avoid breaking package imports
+            path_parts = pathlib.Path(module_file).parts
+            if any(part in _VENV_DIRS for part in path_parts):
+                continue
             if module_file.startswith(root_str):
                 to_remove.append(name)
         except (TypeError, AttributeError):
@@ -79,6 +88,8 @@ class ReactiveEngine:
     _cache_dir: pathlib.Path | None
     _max_workers: int | None
     _debounce_ms: int
+    _force_first_run: bool
+    _first_run_done: bool
     _change_queue: queue.Queue[set[pathlib.Path]]
     _shutdown: threading.Event
     _tui_queue: mp.Queue[TuiMessage] | None
@@ -94,6 +105,7 @@ class ReactiveEngine:
         cache_dir: pathlib.Path | None = None,
         max_workers: int | None = None,
         debounce_ms: int = 300,
+        force_first_run: bool = False,
     ) -> None:
         if debounce_ms < 0:
             raise ValueError(f"debounce_ms must be non-negative, got {debounce_ms}")
@@ -102,6 +114,8 @@ class ReactiveEngine:
         self._cache_dir = cache_dir
         self._max_workers = max_workers
         self._debounce_ms = debounce_ms
+        self._force_first_run = force_first_run
+        self._first_run_done = False
 
         self._change_queue = queue.Queue(maxsize=100)
         self._shutdown = threading.Event()
@@ -130,7 +144,7 @@ class ReactiveEngine:
 
         try:
             # Run initial execution
-            self._send_message("Running initial pipeline...")
+            self._send_message("Running initial pipeline...", status=types.ReactiveStatus.DETECTING)
             try:
                 self._execute_stages(self._stages)
             except Exception as e:
@@ -146,6 +160,11 @@ class ReactiveEngine:
             if self._watcher_thread.is_alive():
                 logger.warning("Watcher thread did not exit cleanly")
 
+            # Send shutdown sentinel to TUI queue
+            if self._tui_queue is not None:
+                with contextlib.suppress(OSError, ValueError):
+                    self._tui_queue.put(None)
+
     def shutdown(self) -> None:
         """Signal graceful shutdown."""
         self._shutdown.set()
@@ -153,8 +172,8 @@ class ReactiveEngine:
     def _watch_loop(self, stages_to_run: list[str]) -> None:
         """Pure producer - monitors files, enqueues changes."""
         try:
-            watch_paths = watch.collect_watch_paths(stages_to_run)
-            watch_filter = watch.create_watch_filter(stages_to_run)
+            watch_paths = _watch_utils.collect_watch_paths(stages_to_run)
+            watch_filter = _watch_utils.create_watch_filter(stages_to_run)
             pending: set[pathlib.Path] = set()
 
             logger.info(f"Watching paths: {watch_paths}")
@@ -191,7 +210,7 @@ class ReactiveEngine:
 
             code_changed = _is_code_or_config_change(changes)
             if code_changed:
-                self._send_message("Reloading code...")
+                self._send_message("Reloading code...", status=types.ReactiveStatus.RESTARTING)
                 self._invalidate_caches()
                 reload_ok = self._reload_registry()
                 self._restart_worker_pool()
@@ -216,7 +235,10 @@ class ReactiveEngine:
                 self._send_message("Watching for changes...")
                 continue
 
-            self._send_message(f"Running {len(affected)} affected stage(s)...")
+            self._send_message(
+                f"Running {len(affected)} affected stage(s)...",
+                status=types.ReactiveStatus.DETECTING,
+            )
 
             try:
                 self._execute_stages(affected)
@@ -284,6 +306,17 @@ class ReactiveEngine:
 
         return self._reload_from_decorators(old_stages)
 
+    def _send_reload_notification(self) -> None:
+        """Send TuiReloadMessage with current stage list."""
+        if self._tui_queue is not None:
+            new_stages = list(registry.REGISTRY.list_stages())
+            msg = types.TuiReloadMessage(
+                type=types.TuiMessageType.RELOAD,
+                stages=new_stages,
+            )
+            with contextlib.suppress(queue.Full):
+                self._tui_queue.put_nowait(msg)
+
     def _reload_with_registration(
         self,
         register_fn: Callable[[], object],
@@ -300,6 +333,7 @@ class ReactiveEngine:
             self._pipeline_errors = None
             new_stages = list(registry.REGISTRY.list_stages())
             logger.info(f"Registry reloaded from {source_name} with {len(new_stages)} stages")
+            self._send_reload_notification()
             return True
         except Exception as e:
             registry.REGISTRY.restore(old_stages)
@@ -357,6 +391,7 @@ class ReactiveEngine:
         self._pipeline_errors = None
         new_stages = list(registry.REGISTRY.list_stages())
         logger.info(f"Registry reloaded with {len(new_stages)} stages: {new_stages}")
+        self._send_reload_notification()
         return True
 
     def _get_affected_stages(self, changes: set[pathlib.Path], *, code_changed: bool) -> list[str]:
@@ -446,6 +481,7 @@ class ReactiveEngine:
 
     def _execute_stages(self, stages: list[str] | None) -> None:
         """Execute stages using the executor."""
+        force = self._force_first_run and not self._first_run_done
         executor.run(
             stages=stages,
             single_stage=self._single_stage,
@@ -453,23 +489,42 @@ class ReactiveEngine:
             max_workers=self._max_workers,
             show_output=self._tui_queue is None,
             tui_queue=self._tui_queue,
+            force=force,
         )
+        self._first_run_done = True
 
-    def _send_message(self, message: str, *, is_error: bool = False) -> None:
-        """Send message to TUI or log."""
+    def _send_message(
+        self,
+        message: str,
+        *,
+        is_error: bool = False,
+        status: types.ReactiveStatus | None = None,
+    ) -> None:
+        """Send message to TUI or log.
+
+        Args:
+            message: The message to send
+            is_error: If True, sets status to ERROR (deprecated, use status param)
+            status: Explicit status to use (overrides is_error if provided)
+        """
+        if status is None:
+            status = types.ReactiveStatus.ERROR if is_error else types.ReactiveStatus.WAITING
+
         if self._tui_queue is not None:
-            from pivot.types import ReactiveStatus, TuiMessageType, TuiReactiveMessage
+            msg = types.TuiReactiveMessage(
+                type=types.TuiMessageType.REACTIVE,
+                status=status,
+                message=message,
+            )
+            if status == types.ReactiveStatus.ERROR:
+                # Block briefly for critical messages
+                with contextlib.suppress(queue.Full):
+                    self._tui_queue.put(msg, timeout=1.0)
+            else:
+                with contextlib.suppress(queue.Full):
+                    self._tui_queue.put_nowait(msg)
 
-            with contextlib.suppress(queue.Full):
-                self._tui_queue.put_nowait(
-                    TuiReactiveMessage(
-                        type=TuiMessageType.REACTIVE,
-                        status=ReactiveStatus.ERROR if is_error else ReactiveStatus.WAITING,
-                        message=message,
-                    )
-                )
-
-        if is_error:
+        if status == types.ReactiveStatus.ERROR:
             logger.error(message)
         else:
             logger.info(message)

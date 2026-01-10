@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import collections
 import dataclasses
+import logging
 import queue
 import threading
-from typing import TYPE_CHECKING, Any, ClassVar, override
+from typing import TYPE_CHECKING, Any, ClassVar, Protocol, override
 
 import textual.app
 import textual.binding
@@ -12,20 +13,29 @@ import textual.containers
 import textual.message
 import textual.widgets
 
-from pivot import executor
 from pivot.types import (
     DisplayMode,
+    ReactiveStatus,
     StageStatus,
     TuiLogMessage,
     TuiMessage,
     TuiMessageType,
     TuiReactiveMessage,
+    TuiReloadMessage,
     TuiStatusMessage,
 )
 
 if TYPE_CHECKING:
+    import multiprocessing as mp
     from collections.abc import Callable
-    from multiprocessing import Queue
+
+    from pivot import executor
+
+    class ReactiveEngineProtocol(Protocol):
+        """Protocol for ReactiveEngine to avoid circular imports."""
+
+        def run(self, tui_queue: mp.Queue[TuiMessage] | None = None) -> None: ...
+        def shutdown(self) -> None: ...
 
 
 def _format_elapsed(elapsed: float | None) -> str:
@@ -66,9 +76,11 @@ class StageInfo:
 class TuiUpdate(textual.message.Message):
     """Custom message for executor updates."""
 
-    msg: TuiLogMessage | TuiStatusMessage | TuiReactiveMessage
+    msg: TuiLogMessage | TuiStatusMessage | TuiReactiveMessage | TuiReloadMessage
 
-    def __init__(self, msg: TuiLogMessage | TuiStatusMessage | TuiReactiveMessage) -> None:
+    def __init__(
+        self, msg: TuiLogMessage | TuiStatusMessage | TuiReactiveMessage | TuiReloadMessage
+    ) -> None:
         self.msg = msg
         super().__init__()
 
@@ -199,133 +211,109 @@ class LogPanel(textual.widgets.RichLog):
                 self._write_log_line(s, line, is_stderr)
 
 
-class RunTuiApp(textual.app.App[dict[str, executor.ExecutionSummary] | None]):
-    """TUI for pipeline execution."""
+_TUI_CSS: str = """
+#stage-list {
+    height: auto;
+    max-height: 50%;
+    border: solid green;
+    padding: 1;
+}
 
-    CSS: ClassVar[str] = """
-    #stage-list {
-        height: auto;
-        max-height: 50%;
-        border: solid green;
-        padding: 1;
-    }
+#detail-panel {
+    height: auto;
+    border: solid blue;
+    padding: 1;
+    margin-top: 1;
+}
 
-    #detail-panel {
-        height: auto;
-        border: solid blue;
-        padding: 1;
-        margin-top: 1;
-    }
+#log-panel {
+    height: 1fr;
+    border: solid yellow;
+    margin-top: 1;
+}
 
-    #log-panel {
-        height: 1fr;
-        border: solid yellow;
-        margin-top: 1;
-    }
+.section-header {
+    text-style: bold;
+    margin-bottom: 1;
+}
 
-    .section-header {
-        text-style: bold;
-        margin-bottom: 1;
-    }
+#status-view {
+    height: 100%;
+}
 
-    #status-view {
-        height: 100%;
-    }
+#logs-view {
+    height: 100%;
+    display: none;
+}
 
-    #logs-view {
-        height: 100%;
-        display: none;
-    }
+.view-active {
+    display: block;
+}
 
-    .view-active {
-        display: block;
-    }
+.view-hidden {
+    display: none;
+}
+"""
 
-    .view-hidden {
-        display: none;
-    }
-    """
+_TUI_BINDINGS: list[textual.binding.BindingType] = [
+    textual.binding.Binding("q", "quit", "Quit"),
+    textual.binding.Binding("j", "next_stage", "Next"),
+    textual.binding.Binding("k", "prev_stage", "Prev"),
+    textual.binding.Binding("down", "next_stage", "Next", show=False),
+    textual.binding.Binding("up", "prev_stage", "Prev", show=False),
+    textual.binding.Binding("tab", "toggle_view", "Toggle View"),
+    textual.binding.Binding("a", "show_all_logs", "All Logs"),
+    *[
+        textual.binding.Binding(str(i), f"filter_stage({i - 1})", f"Stage {i}", show=False)
+        for i in range(1, 10)
+    ],
+]
 
-    BINDINGS: ClassVar[list[textual.binding.BindingType]] = [
-        textual.binding.Binding("q", "quit", "Quit"),
-        textual.binding.Binding("j", "next_stage", "Next"),
-        textual.binding.Binding("k", "prev_stage", "Prev"),
-        textual.binding.Binding("down", "next_stage", "Next", show=False),
-        textual.binding.Binding("up", "prev_stage", "Prev", show=False),
-        textual.binding.Binding("tab", "toggle_view", "Toggle View"),
-        textual.binding.Binding("a", "show_all_logs", "All Logs"),
-        *[
-            textual.binding.Binding(str(i), f"filter_stage({i - 1})", f"Stage {i}", show=False)
-            for i in range(1, 10)
-        ],
-    ]
 
-    _stage_names: list[str]
-    _tui_queue: Queue[TuiMessage]
-    _executor_func: Callable[[], dict[str, executor.ExecutionSummary]]
-    _stages: dict[str, StageInfo]
-    _stage_order: list[str]
-    _selected_idx: int
-    _show_logs: bool
-    _results: dict[str, executor.ExecutionSummary] | None
-    _error: Exception | None
-    _reader_thread: threading.Thread | None
-    _executor_thread: threading.Thread | None
-    _shutdown_event: threading.Event
+class _BaseTuiApp(textual.app.App[Any]):
+    """Base class for TUI applications with shared stage management."""
+
+    CSS: ClassVar[str] = _TUI_CSS
+    BINDINGS: ClassVar[list[textual.binding.BindingType]] = _TUI_BINDINGS
 
     def __init__(
         self,
-        stage_names: list[str],
-        message_queue: Queue[TuiMessage],
-        executor_func: Callable[[], dict[str, executor.ExecutionSummary]],
+        message_queue: mp.Queue[TuiMessage],
+        stage_names: list[str] | None = None,
     ) -> None:
+        """Initialize base TUI app state."""
         super().__init__()
-        self._stage_names = stage_names
-        self._tui_queue = message_queue
-        self._executor_func = executor_func
+        self._tui_queue: mp.Queue[TuiMessage] = message_queue
+        self._stages: dict[str, StageInfo] = {}
+        self._stage_order: list[str] = []
+        self._selected_idx: int = 0
+        self._show_logs: bool = False
+        self._reader_thread: threading.Thread | None = None
+        self._shutdown_event: threading.Event = threading.Event()
 
-        # Stage state
-        self._stages = {}
-        self._stage_order = []
-        for i, name in enumerate(stage_names, 1):
-            info = StageInfo(name, i, len(stage_names))
-            self._stages[name] = info
-            self._stage_order.append(name)
-
-        self._selected_idx = 0
-        self._show_logs = False
-        self._results = None
-        self._error = None
-
-        # Threading
-        self._reader_thread = None
-        self._executor_thread = None
-        self._shutdown_event = threading.Event()
+        if stage_names:
+            for i, name in enumerate(stage_names, 1):
+                info = StageInfo(name, i, len(stage_names))
+                self._stages[name] = info
+                self._stage_order.append(name)
 
     @override
     def compose(self) -> textual.app.ComposeResult:  # pragma: no cover
         yield textual.widgets.Header()
 
-        # Status view (default)
         with textual.containers.VerticalScroll(id="status-view", classes="view-active"):
             yield StageListPanel(list(self._stages.values()), id="stage-list")
             yield DetailPanel(id="detail-panel")
 
-        # Logs view (hidden by default)
         with textual.containers.Vertical(id="logs-view", classes="view-hidden"):
             yield LogPanel(id="log-panel")
 
         yield textual.widgets.Footer()
 
-    async def on_mount(self) -> None:  # pragma: no cover
-        self._update_detail_panel()
-
-        # Start background threads
+    def _start_queue_reader(self) -> None:  # pragma: no cover
+        """Start the background queue reader thread."""
         self._reader_thread = threading.Thread(target=self._read_queue, daemon=True)
         self._reader_thread.start()
-
-        self._executor_thread = threading.Thread(target=self._run_executor, daemon=True)
-        self._executor_thread.start()
 
     def _read_queue(self) -> None:  # pragma: no cover
         """Read from queue and post messages to Textual (runs in background thread)."""
@@ -338,75 +326,16 @@ class RunTuiApp(textual.app.App[dict[str, executor.ExecutionSummary] | None]):
             except queue.Empty:
                 continue
 
-    def _run_executor(self) -> None:  # pragma: no cover
-        """Run the executor (runs in background thread)."""
-        results: dict[str, executor.ExecutionSummary] = {}
-        error: Exception | None = None
-        try:
-            results = self._executor_func()
-        except Exception as e:
-            error = e
-        finally:
-            self._tui_queue.put(None)
-            self.post_message(ExecutorComplete(results, error))
-
-    def on_tui_update(self, event: TuiUpdate) -> None:  # pragma: no cover
-        """Handle executor updates in Textual's event loop."""
-        msg = event.msg
-        match msg["type"]:
-            case TuiMessageType.LOG:
-                self._handle_log(msg)
-            case TuiMessageType.STATUS:
-                self._handle_status(msg)
-            case TuiMessageType.REACTIVE:
-                pass  # Reactive messages handled separately in reactive mode
-
     def _handle_log(self, msg: TuiLogMessage) -> None:  # pragma: no cover
         stage = msg["stage"]
         line = msg["line"]
         is_stderr = msg["is_stderr"]
 
-        # Add to stage's log buffer
         if stage in self._stages:
             self._stages[stage].logs.append((line, is_stderr))
 
-        # Add to log panel
         log_panel = self.query_one("#log-panel", LogPanel)
         log_panel.add_log(stage, line, is_stderr)
-
-    def _handle_status(self, msg: TuiStatusMessage) -> None:  # pragma: no cover
-        stage = msg["stage"]
-        if stage not in self._stages:
-            return
-
-        info = self._stages[stage]
-        info.status = msg["status"]
-        info.reason = msg["reason"]
-        info.elapsed = msg["elapsed"]
-
-        # Update UI
-        stage_list = self.query_one("#stage-list", StageListPanel)
-        stage_list.update_stage(stage)
-        self._update_detail_panel()
-
-        # Update title with progress
-        completed = sum(
-            1
-            for s in self._stages.values()
-            if s.status
-            in (StageStatus.COMPLETED, StageStatus.RAN, StageStatus.SKIPPED, StageStatus.FAILED)
-        )
-        # Textual's Reactive[str] title doesn't work with strict type checking
-        self.title = f"pivot run ({completed}/{len(self._stages)})"  # pyright: ignore[reportUnannotatedClassAttribute]
-
-    def on_executor_complete(self, event: ExecutorComplete) -> None:  # pragma: no cover
-        """Handle executor completion."""
-        self._results = event.results
-        self._error = event.error
-        if event.error:
-            self.title = f"pivot run - FAILED: {event.error}"
-        else:
-            self.title = "pivot run - Complete"
 
     def _update_detail_panel(self) -> None:  # pragma: no cover
         if self._stage_order:
@@ -459,9 +388,86 @@ class RunTuiApp(textual.app.App[dict[str, executor.ExecutionSummary] | None]):
         await super().action_quit()
 
 
+class RunTuiApp(_BaseTuiApp):
+    """TUI for single pipeline execution."""
+
+    def __init__(
+        self,
+        stage_names: list[str],
+        message_queue: mp.Queue[TuiMessage],
+        executor_func: Callable[[], dict[str, executor.ExecutionSummary]],
+    ) -> None:
+        super().__init__(message_queue, stage_names)
+        self._stage_names: list[str] = stage_names
+        self._executor_func: Callable[[], dict[str, executor.ExecutionSummary]] = executor_func
+        self._results: dict[str, executor.ExecutionSummary] | None = None
+        self._error: Exception | None = None
+        self._executor_thread: threading.Thread | None = None
+
+    async def on_mount(self) -> None:  # pragma: no cover
+        self._update_detail_panel()
+        self._start_queue_reader()
+        self._executor_thread = threading.Thread(target=self._run_executor, daemon=True)
+        self._executor_thread.start()
+
+    def _run_executor(self) -> None:  # pragma: no cover
+        """Run the executor (runs in background thread)."""
+        results: dict[str, executor.ExecutionSummary] = {}
+        error: Exception | None = None
+        try:
+            results = self._executor_func()
+        except Exception as e:
+            error = e
+        finally:
+            self._tui_queue.put(None)
+            self.post_message(ExecutorComplete(results, error))
+
+    def on_tui_update(self, event: TuiUpdate) -> None:  # pragma: no cover
+        """Handle executor updates in Textual's event loop."""
+        msg = event.msg
+        match msg["type"]:
+            case TuiMessageType.LOG:
+                self._handle_log(msg)
+            case TuiMessageType.STATUS:
+                self._handle_status(msg)
+            case TuiMessageType.REACTIVE | TuiMessageType.RELOAD:
+                pass
+
+    def _handle_status(self, msg: TuiStatusMessage) -> None:  # pragma: no cover
+        stage = msg["stage"]
+        if stage not in self._stages:
+            return
+
+        info = self._stages[stage]
+        info.status = msg["status"]
+        info.reason = msg["reason"]
+        info.elapsed = msg["elapsed"]
+
+        stage_list = self.query_one("#stage-list", StageListPanel)
+        stage_list.update_stage(stage)
+        self._update_detail_panel()
+
+        completed = sum(
+            1
+            for s in self._stages.values()
+            if s.status
+            in (StageStatus.COMPLETED, StageStatus.RAN, StageStatus.SKIPPED, StageStatus.FAILED)
+        )
+        self.title = f"pivot run ({completed}/{len(self._stages)})"  # pyright: ignore[reportUnannotatedClassAttribute]
+
+    def on_executor_complete(self, event: ExecutorComplete) -> None:  # pragma: no cover
+        """Handle executor completion."""
+        self._results = event.results
+        self._error = event.error
+        if event.error:
+            self.title = f"pivot run - FAILED: {event.error}"
+        else:
+            self.title = "pivot run - Complete"
+
+
 def run_with_tui(
     stage_names: list[str],
-    message_queue: Queue[TuiMessage],
+    message_queue: mp.Queue[TuiMessage],
     executor_func: Callable[[], dict[str, executor.ExecutionSummary]],
 ) -> dict[str, executor.ExecutionSummary] | None:  # pragma: no cover
     """Run pipeline with TUI display."""
@@ -479,3 +485,123 @@ def should_use_tui(display_mode: DisplayMode | None) -> bool:
         return False
     # Auto-detect: use TUI if stdout is a TTY
     return sys.stdout.isatty()
+
+
+class WatchTuiApp(_BaseTuiApp):
+    """TUI for watch mode pipeline execution."""
+
+    def __init__(
+        self,
+        engine: ReactiveEngineProtocol,
+        message_queue: mp.Queue[TuiMessage],
+    ) -> None:
+        super().__init__(message_queue)
+        self._engine: ReactiveEngineProtocol = engine
+        self._engine_thread: threading.Thread | None = None
+
+    async def on_mount(self) -> None:  # pragma: no cover
+        self.title = "[●] Watching for changes..."  # pyright: ignore[reportUnannotatedClassAttribute]
+        self._start_queue_reader()
+        self._engine_thread = threading.Thread(target=self._run_engine, daemon=True)
+        self._engine_thread.start()
+
+    def _run_engine(self) -> None:  # pragma: no cover
+        """Run the reactive engine (runs in background thread)."""
+        try:
+            self._engine.run(tui_queue=self._tui_queue)
+        except Exception as e:
+            logging.getLogger(__name__).exception(f"Reactive engine failed: {e}")
+
+    def on_tui_update(self, event: TuiUpdate) -> None:  # pragma: no cover
+        """Handle executor updates in Textual's event loop."""
+        msg = event.msg
+        match msg["type"]:
+            case TuiMessageType.LOG:
+                self._handle_log(msg)
+            case TuiMessageType.STATUS:
+                self._handle_status(msg)
+            case TuiMessageType.REACTIVE:
+                self._handle_reactive(msg)
+            case TuiMessageType.RELOAD:
+                self._handle_reload(msg)
+
+    def _handle_status(self, msg: TuiStatusMessage) -> None:  # pragma: no cover
+        stage = msg["stage"]
+        if stage not in self._stages:
+            info = StageInfo(stage, msg["index"], msg["total"])
+            self._stages[stage] = info
+            if stage not in self._stage_order:
+                self._stage_order.append(stage)
+
+        info = self._stages[stage]
+        info.status = msg["status"]
+        info.reason = msg["reason"]
+        info.elapsed = msg["elapsed"]
+        info.index = msg["index"]
+        info.total = msg["total"]
+
+        stage_list = self.query_one("#stage-list", StageListPanel)
+        stage_list.update_stage(stage)
+        self._update_detail_panel()
+
+    def _handle_reactive(self, msg: TuiReactiveMessage) -> None:  # pragma: no cover
+        """Handle reactive status updates - update title bar."""
+        match msg["status"]:
+            case ReactiveStatus.WAITING:
+                self.title = "[●] Watching for changes..."
+            case ReactiveStatus.RESTARTING:
+                self.title = "[↻] Reloading code..."
+            case ReactiveStatus.DETECTING:
+                self.title = f"[▶] {msg['message']}"
+            case ReactiveStatus.ERROR:
+                self.title = f"[!] {msg['message']}"
+
+    def _handle_reload(self, msg: TuiReloadMessage) -> None:  # pragma: no cover
+        """Handle registry reload - update stage list."""
+        new_stages = msg["stages"]
+        old_stages = set(self._stage_order)
+        new_stage_set = set(new_stages)
+
+        removed = old_stages - new_stage_set
+        added = new_stage_set - old_stages
+
+        for name in removed:
+            if name in self._stages:
+                del self._stages[name]
+
+        for name in added:
+            info = StageInfo(name, len(self._stages) + 1, len(new_stages))
+            self._stages[name] = info
+
+        self._stage_order: list[str] = new_stages
+        for i, name in enumerate(self._stage_order, 1):
+            if name in self._stages:
+                self._stages[name].index = i
+                self._stages[name].total = len(self._stage_order)
+
+        if self._selected_idx >= len(self._stage_order):
+            self._selected_idx: int = max(0, len(self._stage_order) - 1)
+
+        self._rebuild_stage_list()
+        self._update_detail_panel()
+
+    def _rebuild_stage_list(self) -> None:  # pragma: no cover
+        """Rebuild the stage list panel after stages change."""
+        stage_list = self.query_one("#stage-list", StageListPanel)
+        stage_list._stages = list(self._stages.values())  # pyright: ignore[reportPrivateUsage]
+        stage_list._rows.clear()  # pyright: ignore[reportPrivateUsage]
+        stage_list.refresh(recompose=True)
+
+    @override
+    async def action_quit(self) -> None:  # pragma: no cover
+        self._engine.shutdown()
+        await super().action_quit()
+
+
+def run_watch_tui(
+    engine: ReactiveEngineProtocol,
+    message_queue: mp.Queue[TuiMessage],
+) -> None:  # pragma: no cover
+    """Run watch mode with TUI display."""
+    app = WatchTuiApp(engine, message_queue)
+    app.run()

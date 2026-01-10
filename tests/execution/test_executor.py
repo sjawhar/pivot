@@ -1219,3 +1219,135 @@ def test_executor_lock_file_missing_outs_triggers_rerun(pipeline_dir: pathlib.Pa
     # Lock file should now have outs
     lock_data = yaml.safe_load(lock_file.read_text())
     assert "outs" in lock_data
+
+
+# ============================================================================
+# Force flag tests
+# ============================================================================
+
+
+def test_force_runs_unchanged_stage(pipeline_dir: pathlib.Path) -> None:
+    """Force flag should run stage even when nothing changed."""
+    (pipeline_dir / "input.txt").write_text("hello")
+
+    @pivot.stage(deps=["input.txt"], outs=["output.txt"])
+    def process() -> None:
+        data = pathlib.Path("input.txt").read_text()
+        pathlib.Path("output.txt").write_text(data.upper())
+
+    # First run - should execute
+    results = executor.run(show_output=False)
+    assert results["process"]["status"] == "ran"
+
+    # Second run without force - should skip (nothing changed)
+    results = executor.run(show_output=False)
+    assert results["process"]["status"] == "skipped"
+
+    # Third run with force - should run despite no changes
+    results = executor.run(force=True, show_output=False)
+    assert results["process"]["status"] == "ran"
+
+
+def test_force_runs_all_stages_in_chain(pipeline_dir: pathlib.Path) -> None:
+    """Force flag should run all stages in dependency chain."""
+    (pipeline_dir / "input.txt").write_text("data")
+
+    @pivot.stage(deps=["input.txt"], outs=["step1.txt"])
+    def step1() -> None:
+        pathlib.Path("step1.txt").write_text("step1")
+
+    @pivot.stage(deps=["step1.txt"], outs=["step2.txt"])
+    def step2() -> None:
+        pathlib.Path("step2.txt").write_text("step2")
+
+    # First run - both execute
+    results = executor.run(show_output=False)
+    assert results["step1"]["status"] == "ran"
+    assert results["step2"]["status"] == "ran"
+
+    # Second run - both skip
+    results = executor.run(show_output=False)
+    assert results["step1"]["status"] == "skipped"
+    assert results["step2"]["status"] == "skipped"
+
+    # Force run - both should run
+    results = executor.run(force=True, show_output=False)
+    assert results["step1"]["status"] == "ran"
+    assert results["step2"]["status"] == "ran"
+
+
+def test_force_updates_lock_file(pipeline_dir: pathlib.Path) -> None:
+    """After forced run, lock file should have current fingerprints."""
+    (pipeline_dir / "input.txt").write_text("test")
+
+    @pivot.stage(deps=["input.txt"], outs=["output.txt"])
+    def process() -> None:
+        pathlib.Path("output.txt").write_text("result")
+
+    # First run with force
+    results = executor.run(force=True, show_output=False)
+    assert results["process"]["status"] == "ran"
+
+    # Second run without force - should skip (lock file should be correct)
+    results = executor.run(show_output=False)
+    assert results["process"]["status"] == "skipped", "Lock file should be valid after forced run"
+
+
+def test_force_with_specific_stage(pipeline_dir: pathlib.Path) -> None:
+    """Force flag with specific stage forces that stage and its dependencies."""
+    (pipeline_dir / "input.txt").write_text("data")
+
+    @pivot.stage(deps=["input.txt"], outs=["step1.txt"])
+    def step1() -> None:
+        pathlib.Path("step1.txt").write_text("step1")
+
+    @pivot.stage(deps=["step1.txt"], outs=["step2.txt"])
+    def step2() -> None:
+        pathlib.Path("step2.txt").write_text("step2")
+
+    @pivot.stage(deps=["input.txt"], outs=["other.txt"])
+    def other() -> None:
+        pathlib.Path("other.txt").write_text("other")
+
+    # First run - all execute
+    results = executor.run(show_output=False)
+    assert results["step1"]["status"] == "ran"
+    assert results["step2"]["status"] == "ran"
+    assert results["other"]["status"] == "ran"
+
+    # Second run - all skip
+    results = executor.run(show_output=False)
+    assert results["step1"]["status"] == "skipped"
+    assert results["step2"]["status"] == "skipped"
+    assert results["other"]["status"] == "skipped"
+
+    # Force run of step2 only - should force step1 and step2, skip other
+    results = executor.run(stages=["step2"], force=True, show_output=False)
+    assert results["step1"]["status"] == "ran"
+    assert results["step2"]["status"] == "ran"
+    assert "other" not in results  # Not in execution set
+
+
+def test_force_with_single_stage(pipeline_dir: pathlib.Path) -> None:
+    """Force with single_stage should only force specified stage."""
+    (pipeline_dir / "input.txt").write_text("data")
+    (pipeline_dir / "step1.txt").write_text("existing")
+
+    @pivot.stage(deps=["input.txt"], outs=["step1.txt"])
+    def step1() -> None:
+        pathlib.Path("step1.txt").write_text("new_step1")
+
+    @pivot.stage(deps=["step1.txt"], outs=["step2.txt"])
+    def step2() -> None:
+        data = pathlib.Path("step1.txt").read_text()
+        pathlib.Path("step2.txt").write_text(f"step2: {data}")
+
+    # First run - both execute
+    results = executor.run(show_output=False)
+    assert results["step1"]["status"] == "ran"
+    assert results["step2"]["status"] == "ran"
+
+    # Force run step2 with single_stage - step1 should skip
+    results = executor.run(stages=["step2"], single_stage=True, force=True, show_output=False)
+    assert "step1" not in results  # Not in execution set due to single_stage
+    assert results["step2"]["status"] == "ran"

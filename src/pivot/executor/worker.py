@@ -59,6 +59,7 @@ class WorkerStageInfo(TypedDict):
     cwd: pathlib.Path | None
     checkout_modes: list[str]
     run_id: str
+    force: bool
 
 
 def execute_stage(
@@ -124,6 +125,11 @@ def execute_stage(
                     dep_hashes,
                 )
 
+                # Override skip decision if force flag is set
+                if stage_info["force"] and skip_reason is not None:
+                    skip_reason = None
+                    run_reason = "forced"
+
             if skip_reason is not None and lock_data is not None:
                 restored = _restore_outputs_from_cache(
                     stage_outs, lock_data, files_cache_dir, checkout_modes
@@ -134,8 +140,8 @@ def execute_stage(
                     )
                 run_reason = "outputs missing from cache"
 
-            # Check run cache for previously executed configuration
-            if run_reason:
+            # Check run cache for previously executed configuration (skip if forcing)
+            if run_reason and not stage_info["force"]:
                 with state.StateDB(state_db_path) as state_db:
                     run_cache_result = _try_skip_via_run_cache(
                         stage_name,

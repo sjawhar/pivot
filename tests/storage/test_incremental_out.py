@@ -4,7 +4,7 @@ import pytest
 
 from pivot import IncrementalOut, executor, outputs, registry
 from pivot.executor import worker
-from pivot.storage import cache
+from pivot.storage import cache, lock
 from pivot.types import LockData
 
 
@@ -168,8 +168,6 @@ def test_integration_second_run_appends_to_output(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, clean_registry: None
 ) -> None:
     """Second run should restore and append to existing output."""
-    import yaml
-
     monkeypatch.setattr("pivot.project.get_project_root", lambda: tmp_path)
     monkeypatch.chdir(tmp_path)
 
@@ -189,10 +187,11 @@ def test_integration_second_run_appends_to_output(
 
     # Simulate code change by modifying the lock file's code_manifest
     # Keep output_hashes so we can restore
-    lock_file = cache_dir / "stages" / "append_stage.lock"
-    lock_data = yaml.safe_load(lock_file.read_text())
+    stage_lock = lock.StageLock("append_stage", cache_dir)
+    lock_data = stage_lock.read()
+    assert lock_data is not None
     lock_data["code_manifest"] = {"self:fake": "changed_hash"}
-    lock_file.write_text(yaml.dump(lock_data))
+    stage_lock.write(lock_data)
 
     # Delete the output file to verify restoration works
     db_path.unlink()
@@ -400,10 +399,10 @@ def test_uncached_incremental_output_raises_error(
     assert "not in cache" in str(exc_info.value)
 
 
-def test_uncached_incremental_output_force_allows_run(
+def test_uncached_incremental_output_allow_uncached_incremental_allows_run(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, clean_registry: None
 ) -> None:
-    """force=True should bypass the uncached output check."""
+    """allow_uncached_incremental=True should bypass the uncached output check."""
     monkeypatch.setattr("pivot.project.get_project_root", lambda: tmp_path)
     monkeypatch.chdir(tmp_path)
 
@@ -417,8 +416,8 @@ def test_uncached_incremental_output_force_allows_run(
         outs=[IncrementalOut(path=str(db_path))],
     )
 
-    # force=True should allow run even with uncached file
-    results = executor.run(cache_dir=tmp_path / ".pivot" / "cache", force=True)
+    # allow_uncached_incremental=True should allow run even with uncached file
+    results = executor.run(cache_dir=tmp_path / ".pivot" / "cache", allow_uncached_incremental=True)
     assert results["append_stage"]["status"] == "ran"
 
 
@@ -446,3 +445,67 @@ def test_cached_incremental_output_runs_normally(
     # Second run should skip without error (output is cached, nothing changed)
     results2 = executor.run(cache_dir=cache_dir)
     assert results2["append_stage"]["status"] == "skipped"
+
+
+def test_force_runs_incremental_stage_even_when_unchanged(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, clean_registry: None
+) -> None:
+    """force=True should re-run IncrementalOut stage even when nothing changed."""
+    monkeypatch.setattr("pivot.project.get_project_root", lambda: tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    db_path = tmp_path / "database.txt"
+    cache_dir = tmp_path / ".pivot" / "cache"
+
+    registry.REGISTRY.register(
+        _incremental_stage_append,
+        name="append_stage",
+        deps=[],
+        outs=[IncrementalOut(path=str(db_path))],
+    )
+
+    # First run creates the output
+    results1 = executor.run(cache_dir=cache_dir)
+    assert results1["append_stage"]["status"] == "ran"
+    assert db_path.read_text() == "line 1\n"
+
+    # Second run without force should skip
+    results2 = executor.run(cache_dir=cache_dir)
+    assert results2["append_stage"]["status"] == "skipped"
+    assert db_path.read_text() == "line 1\n"
+
+    # Third run with force=True should run and append
+    results3 = executor.run(cache_dir=cache_dir, force=True)
+    assert results3["append_stage"]["status"] == "ran"
+    assert results3["append_stage"]["reason"] == "forced"
+    assert db_path.read_text() == "line 1\nline 2\n"
+
+
+def test_force_and_allow_uncached_incremental_are_orthogonal(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, clean_registry: None
+) -> None:
+    """force and allow_uncached_incremental are independent flags."""
+    monkeypatch.setattr("pivot.project.get_project_root", lambda: tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    db_path = tmp_path / "database.txt"
+    # Create uncached file (not from a previous run)
+    db_path.write_text("uncached content\n")
+    cache_dir = tmp_path / ".pivot" / "cache"
+
+    registry.REGISTRY.register(
+        _incremental_stage_append,
+        name="append_stage",
+        deps=[],
+        outs=[IncrementalOut(path=str(db_path))],
+    )
+
+    # force=True alone should still raise error for uncached incremental
+    from pivot import exceptions
+
+    with pytest.raises(exceptions.UncachedIncrementalOutputError):
+        executor.run(cache_dir=cache_dir, force=True)
+
+    # Both flags together should work
+    results = executor.run(cache_dir=cache_dir, force=True, allow_uncached_incremental=True)
+    assert results["append_stage"]["status"] == "ran"
