@@ -1,75 +1,76 @@
 """Tests for explain module - detailed change explanations."""
 
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar
+from typing import ClassVar
 
 import pydantic
 import pytest
 
-from pivot import explain, lock
+from pivot import explain
+from pivot.storage import lock
 from pivot.types import (
     ChangeType,
     CodeChange,
     DepChange,
+    HashInfo,
     LockData,
     ParamChange,
     StageExplanation,
 )
-
-if TYPE_CHECKING:
-    from pivot.types import HashInfo
-
 
 # =============================================================================
 # diff_code_manifests tests
 # =============================================================================
 
 
-def test_diff_code_modified() -> None:
-    """Detects modified code component."""
-    old = {"func:helper": "abc123"}
-    new = {"func:helper": "def456"}
-
+@pytest.mark.parametrize(
+    ("old", "new", "expected_key", "expected_old_hash", "expected_new_hash", "expected_type"),
+    [
+        pytest.param(
+            {"func:helper": "abc123"},
+            {"func:helper": "def456"},
+            "func:helper",
+            "abc123",
+            "def456",
+            ChangeType.MODIFIED,
+            id="modified",
+        ),
+        pytest.param(
+            {},
+            {"func:new_helper": "abc123"},
+            "func:new_helper",
+            None,
+            "abc123",
+            ChangeType.ADDED,
+            id="added",
+        ),
+        pytest.param(
+            {"func:old_helper": "abc123"},
+            {},
+            "func:old_helper",
+            "abc123",
+            None,
+            ChangeType.REMOVED,
+            id="removed",
+        ),
+    ],
+)
+def test_diff_code_change(
+    old: dict[str, str],
+    new: dict[str, str],
+    expected_key: str,
+    expected_old_hash: str | None,
+    expected_new_hash: str | None,
+    expected_type: ChangeType,
+) -> None:
+    """diff_code_manifests detects added/modified/removed code components."""
     changes = explain.diff_code_manifests(old, new)
-
     assert len(changes) == 1
     assert changes[0] == CodeChange(
-        key="func:helper",
-        old_hash="abc123",
-        new_hash="def456",
-        change_type=ChangeType.MODIFIED,
-    )
-
-
-def test_diff_code_added() -> None:
-    """Detects added code component."""
-    old: dict[str, str] = {}
-    new = {"func:new_helper": "abc123"}
-
-    changes = explain.diff_code_manifests(old, new)
-
-    assert len(changes) == 1
-    assert changes[0] == CodeChange(
-        key="func:new_helper",
-        old_hash=None,
-        new_hash="abc123",
-        change_type=ChangeType.ADDED,
-    )
-
-
-def test_diff_code_removed() -> None:
-    """Detects removed code component."""
-    old = {"func:old_helper": "abc123"}
-    new: dict[str, str] = {}
-
-    changes = explain.diff_code_manifests(old, new)
-
-    assert len(changes) == 1
-    assert changes[0] == CodeChange(
-        key="func:old_helper",
-        old_hash="abc123",
-        new_hash=None,
-        change_type=ChangeType.REMOVED,
+        key=expected_key,
+        old_hash=expected_old_hash,
+        new_hash=expected_new_hash,
+        change_type=expected_type,
     )
 
 
@@ -101,51 +102,38 @@ def test_diff_code_unchanged() -> None:
 # =============================================================================
 
 
-def test_diff_params_modified() -> None:
-    """Detects modified param value."""
-    old = {"learning_rate": 0.01}
-    new = {"learning_rate": 0.001}
-
+@pytest.mark.parametrize(
+    ("old", "new", "expected_key", "expected_old_value", "expected_new_value", "expected_type"),
+    [
+        pytest.param(
+            {"learning_rate": 0.01},
+            {"learning_rate": 0.001},
+            "learning_rate",
+            0.01,
+            0.001,
+            ChangeType.MODIFIED,
+            id="modified",
+        ),
+        pytest.param({}, {"batch_size": 32}, "batch_size", None, 32, ChangeType.ADDED, id="added"),
+        pytest.param({"epochs": 10}, {}, "epochs", 10, None, ChangeType.REMOVED, id="removed"),
+    ],
+)
+def test_diff_params_change(
+    old: dict[str, object],
+    new: dict[str, object],
+    expected_key: str,
+    expected_old_value: object,
+    expected_new_value: object,
+    expected_type: ChangeType,
+) -> None:
+    """diff_params detects added/modified/removed params."""
     changes = explain.diff_params(old, new)
-
     assert len(changes) == 1
     assert changes[0] == ParamChange(
-        key="learning_rate",
-        old_value=0.01,
-        new_value=0.001,
-        change_type=ChangeType.MODIFIED,
-    )
-
-
-def test_diff_params_added() -> None:
-    """Detects added param."""
-    old: dict[str, object] = {}
-    new = {"batch_size": 32}
-
-    changes = explain.diff_params(old, new)
-
-    assert len(changes) == 1
-    assert changes[0] == ParamChange(
-        key="batch_size",
-        old_value=None,
-        new_value=32,
-        change_type=ChangeType.ADDED,
-    )
-
-
-def test_diff_params_removed() -> None:
-    """Detects removed param."""
-    old = {"epochs": 10}
-    new: dict[str, object] = {}
-
-    changes = explain.diff_params(old, new)
-
-    assert len(changes) == 1
-    assert changes[0] == ParamChange(
-        key="epochs",
-        old_value=10,
-        new_value=None,
-        change_type=ChangeType.REMOVED,
+        key=expected_key,
+        old_value=expected_old_value,
+        new_value=expected_new_value,
+        change_type=expected_type,
     )
 
 
@@ -175,51 +163,54 @@ def test_diff_params_unchanged() -> None:
 # =============================================================================
 
 
-def test_diff_deps_modified() -> None:
-    """Detects modified dependency."""
-    old: dict[str, HashInfo] = {"data.csv": {"hash": "abc123"}}
-    new: dict[str, HashInfo] = {"data.csv": {"hash": "def456"}}
-
+@pytest.mark.parametrize(
+    ("old", "new", "expected_path", "expected_old_hash", "expected_new_hash", "expected_type"),
+    [
+        pytest.param(
+            {"data.csv": {"hash": "abc123"}},
+            {"data.csv": {"hash": "def456"}},
+            "data.csv",
+            "abc123",
+            "def456",
+            ChangeType.MODIFIED,
+            id="modified",
+        ),
+        pytest.param(
+            {},
+            {"new_data.csv": {"hash": "abc123"}},
+            "new_data.csv",
+            None,
+            "abc123",
+            ChangeType.ADDED,
+            id="added",
+        ),
+        pytest.param(
+            {"old_data.csv": {"hash": "abc123"}},
+            {},
+            "old_data.csv",
+            "abc123",
+            None,
+            ChangeType.REMOVED,
+            id="removed",
+        ),
+    ],
+)
+def test_diff_deps_change(
+    old: dict[str, HashInfo],
+    new: dict[str, HashInfo],
+    expected_path: str,
+    expected_old_hash: str | None,
+    expected_new_hash: str | None,
+    expected_type: ChangeType,
+) -> None:
+    """diff_dep_hashes detects added/modified/removed dependencies."""
     changes = explain.diff_dep_hashes(old, new)
-
     assert len(changes) == 1
     assert changes[0] == DepChange(
-        path="data.csv",
-        old_hash="abc123",
-        new_hash="def456",
-        change_type=ChangeType.MODIFIED,
-    )
-
-
-def test_diff_deps_added() -> None:
-    """Detects added dependency."""
-    old: dict[str, HashInfo] = {}
-    new: dict[str, HashInfo] = {"new_data.csv": {"hash": "abc123"}}
-
-    changes = explain.diff_dep_hashes(old, new)
-
-    assert len(changes) == 1
-    assert changes[0] == DepChange(
-        path="new_data.csv",
-        old_hash=None,
-        new_hash="abc123",
-        change_type=ChangeType.ADDED,
-    )
-
-
-def test_diff_deps_removed() -> None:
-    """Detects removed dependency."""
-    old: dict[str, HashInfo] = {"old_data.csv": {"hash": "abc123"}}
-    new: dict[str, HashInfo] = {}
-
-    changes = explain.diff_dep_hashes(old, new)
-
-    assert len(changes) == 1
-    assert changes[0] == DepChange(
-        path="old_data.csv",
-        old_hash="abc123",
-        new_hash=None,
-        change_type=ChangeType.REMOVED,
+        path=expected_path,
+        old_hash=expected_old_hash,
+        new_hash=expected_new_hash,
+        change_type=expected_type,
     )
 
 

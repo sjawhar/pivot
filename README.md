@@ -1,15 +1,14 @@
 # Pivot: High-Performance Python Pipeline Tool
 
-**Status:** 🚧 In Development (MVP Nearly Complete)
-**Python:** 3.13+ required
-**License:** TBD
-**Coverage:** 90%+
+**Change your code. Pivot knows what to run.**
+
+**Python:** 3.13+ | **Coverage:** 90%+ | **License:** TBD
 
 ---
 
 ## What is Pivot?
 
-Pivot is a Python-native pipeline tool designed to eliminate DVC's performance bottlenecks while maintaining compatibility. It provides:
+Pivot is a Python pipeline tool with automatic code change detection. Define stages with decorators, and Pivot figures out what needs to re-run—no manual dependency declarations, no stale caches. It provides:
 
 - **32x faster lock file operations** through per-stage lock files
 - **Automatic code change detection** using Python introspection (no manual declarations!)
@@ -26,38 +25,39 @@ Pivot is a Python-native pipeline tool designed to eliminate DVC's performance b
 
 ---
 
-## Quick Start (Coming Soon)
+## Quick Start
 
 ```bash
-# Install
 pip install pivot
+```
 
-# Define pipeline
+```python
 # pipeline.py
 from pivot import stage
 
 @stage(deps=['data.csv'], outs=['processed.parquet'])
-def preprocess(input_file: str = 'data.csv'):
-    import pandas as pd
-    df = pd.read_csv(input_file)
+def preprocess():
+    import pandas
+    df = pandas.read_csv('data.csv')
     df = df.dropna()
     df.to_parquet('processed.parquet')
 
 @stage(deps=['processed.parquet'], outs=['model.pkl'])
-def train(data_file: str = 'processed.parquet', lr: float = 0.01):
-    import pandas as pd
+def train():
+    import pandas
     import pickle
-    df = pd.read_parquet(data_file)
-    model = {'lr': lr, 'data': df.shape}
+    df = pandas.read_parquet('processed.parquet')
+    model = {'rows': len(df), 'columns': len(df.columns)}
     with open('model.pkl', 'wb') as f:
         pickle.dump(model, f)
-
-# Run pipeline
-pivot run
-
-# Export to DVC YAML for code review
-pivot export --output dvc.yaml
 ```
+
+```bash
+pivot run  # Runs both stages
+pivot run  # Instant - nothing changed
+```
+
+Modify `preprocess`, and Pivot automatically re-runs both stages. Modify `train`, and only `train` re-runs.
 
 ### Alternative: YAML Configuration
 
@@ -160,7 +160,7 @@ def process(file: str):
 - AST extraction for `module.attr` patterns (Google-style imports)
 - Recursive fingerprinting for transitive dependencies
 
-**Validated:** See [docs/fingerprinting.md](docs/fingerprinting.md) and [tests/fingerprint/](tests/fingerprint/)
+**Validated:** See [Architecture: Fingerprinting](docs/architecture/fingerprinting.md) and [tests/fingerprint/](tests/fingerprint/)
 
 ### 2. Per-Stage Lock Files
 
@@ -373,7 +373,7 @@ pivot data diff output.csv --no-tui --json
 **Supported formats:** CSV, JSON, JSONL
 ---
 
-## Installation (Coming Soon)
+## Installation
 
 ```bash
 pip install pivot
@@ -382,15 +382,19 @@ pip install pivot
 **Requirements:**
 
 - Python 3.13+ (3.14+ for InterpreterPoolExecutor)
-- Linux/Mac (Windows support via spawn context)
+- Unix only (Linux/macOS)
 
 ---
 
 ## Documentation
 
-- **[Design Documentation](./CLAUDE.md)** - Architecture and design decisions
-- **[Source Code Docs](./src/CLAUDE.md)** - Module-by-module implementation guide
-- **[Testing Strategy](./tests/CLAUDE.md)** - TDD approach and test organization
+Full documentation available at the [Pivot Documentation Site](https://anthropics.github.io/pivot/).
+
+- **[Quick Start](docs/getting-started/quickstart.md)** - Build your first pipeline in 5 minutes
+- **[Core Concepts](docs/getting-started/concepts.md)** - Stages, dependencies, caching
+- **[CLI Reference](docs/cli/index.md)** - All available commands
+- **[Architecture](docs/architecture/overview.md)** - Design decisions and internals
+- **[Comparison](docs/comparison.md)** - How Pivot compares to DVC, Prefect, Dagster
 
 ---
 
@@ -405,19 +409,20 @@ pip install pivot
 - **Watch mode** - File system monitoring with configurable globs and debounce
 - **Incremental outputs** - Restore-before-run for append-only workloads
 - **DVC export** - `pivot export` command for YAML generation
-- **Explain mode** - `pivot run --explain` shows detailed breakdown of WHY stages would run
+- **Explain mode** - `pivot run --explain` and `pivot explain` show detailed breakdown of WHY stages would run
 - **Observability** - `pivot metrics show/diff`, `pivot plots show/diff`, and `pivot params show/diff` commands
 - **Pipeline configuration** - `pivot.yaml` files with matrix expansion, `Pipeline` class, CLI auto-discovery
 - **S3 remote cache** - `pivot push/pull` with async I/O, LMDB index, per-stage filtering
 - **Data diff** - `pivot data diff` command with interactive TUI for comparing data file changes
+- **Version retrieval** - `pivot data get --rev` to materialize files from any git revision
+- **Shell completion** - Tab completion for bash, zsh, and fish
+- **Centralized configuration** - `pivot config` command for managing project settings
 
-### In Progress
+### Planned
 
-- [ ] **End-to-end benchmarks** - Comparative performance testing vs DVC
-
-### Future
-
-- **Version control** - `pivot get --rev` to materialize old versions, DVC lock import for migration
+- **Web UI** - DAG visualization and execution monitoring
+- **Additional remotes** - GCS, Azure, SSH
+- **Cloud orchestration** - Integration with cloud schedulers
 
 ---
 
@@ -500,24 +505,21 @@ basedpyright src/
 
 ---
 
-## Research and Validation
+## Technical Details
 
-### Profiling Data
+### Fingerprinting
 
-Real-world DVC pipelines profiled to identify bottlenecks:
+Pivot automatically detects code changes using Python introspection:
 
-- **[eval-pipeline](../timing/TIMING_REPORT.md)** - 60 stages, 50s lock overhead
-- **[monitoring-horizons](../timing/MONITORING_HORIZONS_TIMING_REPORT.md)** - 176 stages, 289s lock overhead
+- **[How Fingerprinting Works](docs/architecture/fingerprinting.md)** - AST + getclosurevars approach
+- **[Change Detection Matrix](tests/fingerprint/README.md)** - Comprehensive behavior catalog
 
-### Experimental Validation
+### Performance
 
-- **[Fingerprinting research](./docs/fingerprinting.md)** - Why AST + getclosurevars was chosen
-- **[Change detection matrix](./tests/fingerprint/README.md)** - Comprehensive behavior catalog
+Pivot was designed to address DVC's lock file bottleneck (O(n²) writes). Benchmarks on real pipelines showed:
 
-### DVC Architecture Study
-
-- **[Parallel execution](../dvc/dvc/repo/reproduce.py:145-283)** - StageInfo/ready queue pattern
-- **[Lock file writing](../dvc/dvc/dvcfile.py:444-473)** - Root cause of O(n²) overhead
+- 176-stage pipeline: Lock file writes reduced from 289s to ~9s (32x improvement)
+- Per-stage lock files enable parallel writes without contention
 
 ---
 
@@ -558,6 +560,6 @@ Questions? Check CLAUDE.md files or ask the team!
 
 ---
 
-**Last Updated:** 2026-01-08
+**Last Updated:** 2026-01-10
 **Version:** 0.1.0-dev
 

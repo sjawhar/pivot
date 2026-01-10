@@ -1,16 +1,12 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 import click
 
 from pivot import exceptions
 from pivot.cli import completion
 from pivot.cli import decorators as cli_decorators
 from pivot.show import params as params_mod
-
-if TYPE_CHECKING:
-    from pivot.types import OutputFormat
+from pivot.types import OutputFormat
 
 
 @click.group()
@@ -20,15 +16,17 @@ def params() -> None:
 
 @params.command("show")
 @click.argument("stages", nargs=-1, shell_complete=completion.complete_stages)
-@click.option("--json", "output_format", flag_value="json", default=None, help="Output as JSON")
-@click.option("--md", "output_format", flag_value="md", help="Output as Markdown table")
+@click.option(
+    "--json", "output_format", flag_value=OutputFormat.JSON, default=None, help="Output as JSON"
+)
+@click.option("--md", "output_format", flag_value=OutputFormat.MD, help="Output as Markdown table")
 @click.option(
     "--precision", default=5, type=click.IntRange(0, 10), help="Decimal precision for floats"
 )
 @cli_decorators.with_error_handling
 def params_show(
     stages: tuple[str, ...],
-    output_format: OutputFormat,
+    output_format: OutputFormat | None,
     precision: int,
 ) -> None:
     """Display current parameter values.
@@ -50,15 +48,17 @@ def params_show(
 
 @params.command("diff")
 @click.argument("stages", nargs=-1, shell_complete=completion.complete_stages)
-@click.option("--json", "output_format", flag_value="json", default=None, help="Output as JSON")
-@click.option("--md", "output_format", flag_value="md", help="Output as Markdown table")
+@click.option(
+    "--json", "output_format", flag_value=OutputFormat.JSON, default=None, help="Output as JSON"
+)
+@click.option("--md", "output_format", flag_value=OutputFormat.MD, help="Output as Markdown table")
 @click.option(
     "--precision", default=5, type=click.IntRange(0, 10), help="Decimal precision for floats"
 )
 @cli_decorators.with_error_handling
 def params_diff(
     stages: tuple[str, ...],
-    output_format: OutputFormat,
+    output_format: OutputFormat | None,
     precision: int,
 ) -> None:
     """Compare workspace parameters against git HEAD.

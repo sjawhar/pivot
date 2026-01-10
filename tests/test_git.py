@@ -6,9 +6,9 @@ from typing import TYPE_CHECKING
 from pivot import git, project
 
 if TYPE_CHECKING:
-    import pathlib
+    from pathlib import Path
 
-    import pytest
+    from pytest import MonkeyPatch
 
 
 # =============================================================================
@@ -16,9 +16,7 @@ if TYPE_CHECKING:
 # =============================================================================
 
 
-def test_read_file_from_head_no_git_repo(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_read_file_from_head_no_git_repo(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     """Returns None when not in a git repo."""
     monkeypatch.setattr(project, "_project_root_cache", tmp_path)
 
@@ -27,9 +25,7 @@ def test_read_file_from_head_no_git_repo(
     assert result is None
 
 
-def test_read_file_from_head_file_not_in_head(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_read_file_from_head_file_not_in_head(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     """Returns None when file doesn't exist in HEAD."""
     # Create a git repo with initial commit
     subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
@@ -55,9 +51,7 @@ def test_read_file_from_head_file_not_in_head(
     assert result is None
 
 
-def test_read_file_from_head_returns_content(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_read_file_from_head_returns_content(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     """Returns file content from HEAD."""
     # Create a git repo with committed file
     subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
@@ -84,7 +78,7 @@ def test_read_file_from_head_returns_content(
 
 
 def test_read_file_from_head_uncommitted_changes_not_visible(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: MonkeyPatch
 ) -> None:
     """Returns committed content, not uncommitted changes."""
     # Create a git repo with committed file
@@ -114,9 +108,7 @@ def test_read_file_from_head_uncommitted_changes_not_visible(
     assert result == b"original content"
 
 
-def test_read_file_from_head_subdirectory(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_read_file_from_head_subdirectory(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     """Can read files in subdirectories."""
     # Create a git repo with file in subdirectory
     subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
@@ -145,9 +137,7 @@ def test_read_file_from_head_subdirectory(
     assert result == b"nested content"
 
 
-def test_read_file_from_head_empty_repo(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_read_file_from_head_empty_repo(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     """Returns None for empty repo (no commits)."""
     subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
     monkeypatch.setattr(project, "_project_root_cache", tmp_path)
@@ -162,9 +152,7 @@ def test_read_file_from_head_empty_repo(
 # =============================================================================
 
 
-def test_read_files_from_head_empty_list(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_read_files_from_head_empty_list(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     """Returns empty dict for empty path list."""
     subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
     monkeypatch.setattr(project, "_project_root_cache", tmp_path)
@@ -174,9 +162,7 @@ def test_read_files_from_head_empty_list(
     assert result == {}
 
 
-def test_read_files_from_head_multiple_files(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_read_files_from_head_multiple_files(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     """Returns content for multiple files."""
     # Create a git repo with multiple files
     subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
@@ -203,9 +189,7 @@ def test_read_files_from_head_multiple_files(
     assert result == {"file1.txt": b"content1", "file2.txt": b"content2"}
 
 
-def test_read_files_from_head_no_git_repo(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_read_files_from_head_no_git_repo(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     """Returns empty dict when not in a git repo."""
     monkeypatch.setattr(project, "_project_root_cache", tmp_path)
 
@@ -219,9 +203,7 @@ def test_read_files_from_head_no_git_repo(
 # =============================================================================
 
 
-def test_resolve_revision_no_git_repo(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_resolve_revision_no_git_repo(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     """Returns None when not in a git repo."""
     monkeypatch.setattr(project, "_project_root_cache", tmp_path)
 
@@ -230,9 +212,7 @@ def test_resolve_revision_no_git_repo(
     assert result is None
 
 
-def test_resolve_revision_with_branch(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_resolve_revision_with_branch(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     """Resolves branch name to commit SHA."""
     subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
     subprocess.run(
@@ -267,9 +247,7 @@ def test_resolve_revision_with_branch(
     assert sha == expected_sha
 
 
-def test_resolve_revision_with_short_sha(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_resolve_revision_with_short_sha(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     """Resolves short SHA prefix to full commit SHA."""
     subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
     subprocess.run(
@@ -302,7 +280,7 @@ def test_resolve_revision_with_short_sha(
     assert sha == full_sha
 
 
-def test_resolve_revision_invalid(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_resolve_revision_invalid(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     """Returns None for invalid revision."""
     subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
     subprocess.run(
@@ -332,9 +310,7 @@ def test_resolve_revision_invalid(tmp_path: pathlib.Path, monkeypatch: pytest.Mo
 # =============================================================================
 
 
-def test_read_file_from_revision_returns_content(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_read_file_from_revision_returns_content(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     """Returns file content from specified revision."""
     subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
     subprocess.run(
@@ -369,9 +345,7 @@ def test_read_file_from_revision_returns_content(
     assert content == b"original content"
 
 
-def test_read_file_from_revision_file_not_found(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_read_file_from_revision_file_not_found(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     """Returns None when file doesn't exist at revision."""
     subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
     subprocess.run(
@@ -402,9 +376,7 @@ def test_read_file_from_revision_file_not_found(
     assert content is None
 
 
-def test_read_file_from_revision_invalid_rev(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_read_file_from_revision_invalid_rev(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     """Returns None for invalid revision."""
     subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
     subprocess.run(
@@ -434,9 +406,7 @@ def test_read_file_from_revision_invalid_rev(
 # =============================================================================
 
 
-def test_read_files_from_revision_multiple_files(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_read_files_from_revision_multiple_files(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     """Returns content for multiple files from revision."""
     subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
     subprocess.run(
@@ -468,9 +438,7 @@ def test_read_files_from_revision_multiple_files(
     assert result_files == {"file1.txt": b"content1", "file2.txt": b"content2"}
 
 
-def test_read_files_from_revision_empty_list(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_read_files_from_revision_empty_list(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     """Returns empty dict for empty path list."""
     subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
     monkeypatch.setattr(project, "_project_root_cache", tmp_path)

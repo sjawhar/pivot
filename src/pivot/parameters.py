@@ -11,7 +11,7 @@ import yaml
 from pivot import project, yaml_config
 
 if TYPE_CHECKING:
-    import pathlib
+    from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 ParamsOverrides = dict[str, dict[str, Any]]
 
 
-def load_params_yaml(path: pathlib.Path | None = None) -> ParamsOverrides:
+def load_params_yaml(path: Path | None = None) -> ParamsOverrides:
     """Load params.yaml from project root or specified path.
 
     Returns dict of stage_name -> param_dict. Returns empty dict if file missing.

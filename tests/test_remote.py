@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from pivot import remote
+from pivot.remote import storage as remote
 
 if TYPE_CHECKING:
     from collections.abc import Sequence

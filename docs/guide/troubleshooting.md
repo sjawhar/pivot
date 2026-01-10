@@ -57,10 +57,10 @@ Common triggers:
 
 **Cause:** Lock files not committed to git.
 
-**Solution:** Commit `.pivot/*.lock.yaml` files:
+**Solution:** Commit `.pivot/stages/*.lock` files:
 
 ```bash
-git add .pivot/stages/*.lock.yaml
+git add .pivot/stages/*.lock
 git commit -m "Update lock files"
 git push
 ```
@@ -175,7 +175,7 @@ ls -la output.csv
 
 ### Watch Mode Not Detecting Changes
 
-**Symptom:** `pivot watch` doesn't re-run when files change.
+**Symptom:** `pivot run --watch` doesn't re-run when files change.
 
 **Cause:** File not in dependencies or in a non-watched directory.
 
@@ -224,7 +224,7 @@ PIVOT_LOG_LEVEL=DEBUG pivot run
 Lock files are YAML and human-readable:
 
 ```bash
-cat .pivot/stages/train.lock.yaml
+cat .pivot/stages/train.lock
 ```
 
 Contains: code fingerprint, parameter hash, dependency hashes, output hashes.

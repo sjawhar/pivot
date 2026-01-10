@@ -7,10 +7,12 @@ import click.testing
 import pytest
 
 from pivot import cli, project
+from pivot.remote import sync as transfer
+from pivot.storage import state
 from pivot.types import TransferSummary
 
 if TYPE_CHECKING:
-    import pytest_mock
+    from pytest_mock import MockerFixture
 
 
 @pytest.fixture
@@ -27,14 +29,14 @@ def runner() -> click.testing.CliRunner:
 def test_push_no_files_to_push(
     runner: click.testing.CliRunner,
     tmp_path: pathlib.Path,
-    mocker: pytest_mock.MockerFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    mocker: MockerFixture,
 ) -> None:
     """Push exits early when no files to push."""
-    from pivot import transfer
 
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
-        project._project_root_cache = None
+        monkeypatch.setattr(project, "_project_root_cache", None)
 
         # Mock transfer functions
         mocker.patch.object(
@@ -56,14 +58,14 @@ def test_push_no_files_to_push(
 def test_push_dry_run(
     runner: click.testing.CliRunner,
     tmp_path: pathlib.Path,
-    mocker: pytest_mock.MockerFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    mocker: MockerFixture,
 ) -> None:
     """Push dry run shows what would be pushed."""
-    from pivot import transfer
 
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
-        project._project_root_cache = None
+        monkeypatch.setattr(project, "_project_root_cache", None)
 
         mocker.patch.object(
             transfer, "get_default_cache_dir", return_value=tmp_path / ".pivot/cache"
@@ -86,16 +88,16 @@ def test_push_dry_run(
 def test_push_success(
     runner: click.testing.CliRunner,
     tmp_path: pathlib.Path,
-    mocker: pytest_mock.MockerFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    mocker: MockerFixture,
 ) -> None:
     """Push command transfers files and shows summary."""
-    from pivot import state, transfer
 
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
         cache_dir = tmp_path / ".pivot" / "cache"
         cache_dir.mkdir(parents=True)
-        project._project_root_cache = None
+        monkeypatch.setattr(project, "_project_root_cache", None)
 
         mocker.patch.object(transfer, "get_default_cache_dir", return_value=cache_dir)
         mocker.patch.object(
@@ -125,16 +127,16 @@ def test_push_success(
 def test_push_with_errors(
     runner: click.testing.CliRunner,
     tmp_path: pathlib.Path,
-    mocker: pytest_mock.MockerFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    mocker: MockerFixture,
 ) -> None:
     """Push command shows errors when transfers fail."""
-    from pivot import state, transfer
 
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
         cache_dir = tmp_path / ".pivot" / "cache"
         cache_dir.mkdir(parents=True)
-        project._project_root_cache = None
+        monkeypatch.setattr(project, "_project_root_cache", None)
 
         mocker.patch.object(transfer, "get_default_cache_dir", return_value=cache_dir)
         mocker.patch.object(
@@ -165,16 +167,16 @@ def test_push_with_errors(
 def test_push_with_targets(
     runner: click.testing.CliRunner,
     tmp_path: pathlib.Path,
-    mocker: pytest_mock.MockerFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    mocker: MockerFixture,
 ) -> None:
     """Push with targets filters to those targets."""
-    from pivot import state, transfer
 
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
         cache_dir = tmp_path / ".pivot" / "cache"
         cache_dir.mkdir(parents=True)
-        project._project_root_cache = None
+        monkeypatch.setattr(project, "_project_root_cache", None)
 
         mocker.patch.object(transfer, "get_default_cache_dir", return_value=cache_dir)
         mocker.patch.object(
@@ -208,14 +210,14 @@ def test_push_with_targets(
 def test_pull_dry_run_with_targets(
     runner: click.testing.CliRunner,
     tmp_path: pathlib.Path,
-    mocker: pytest_mock.MockerFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    mocker: MockerFixture,
 ) -> None:
     """Pull dry run shows what would be pulled for targets."""
-    from pivot import transfer
 
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
-        project._project_root_cache = None
+        monkeypatch.setattr(project, "_project_root_cache", None)
 
         mocker.patch.object(
             transfer, "get_default_cache_dir", return_value=tmp_path / ".pivot/cache"
@@ -237,14 +239,14 @@ def test_pull_dry_run_with_targets(
 def test_pull_dry_run_all(
     runner: click.testing.CliRunner,
     tmp_path: pathlib.Path,
-    mocker: pytest_mock.MockerFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    mocker: MockerFixture,
 ) -> None:
     """Pull dry run without stages lists all remote files."""
-    from pivot import transfer
 
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
-        project._project_root_cache = None
+        monkeypatch.setattr(project, "_project_root_cache", None)
 
         mock_remote = mocker.MagicMock()
 
@@ -272,16 +274,16 @@ def test_pull_dry_run_all(
 def test_pull_success(
     runner: click.testing.CliRunner,
     tmp_path: pathlib.Path,
-    mocker: pytest_mock.MockerFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    mocker: MockerFixture,
 ) -> None:
     """Pull command downloads files and shows summary."""
-    from pivot import state, transfer
 
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
         cache_dir = tmp_path / ".pivot" / "cache"
         cache_dir.mkdir(parents=True)
-        project._project_root_cache = None
+        monkeypatch.setattr(project, "_project_root_cache", None)
 
         mocker.patch.object(transfer, "get_default_cache_dir", return_value=cache_dir)
         mocker.patch.object(
@@ -309,16 +311,16 @@ def test_pull_success(
 def test_pull_with_errors(
     runner: click.testing.CliRunner,
     tmp_path: pathlib.Path,
-    mocker: pytest_mock.MockerFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    mocker: MockerFixture,
 ) -> None:
     """Pull command shows errors when downloads fail."""
-    from pivot import state, transfer
 
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
         cache_dir = tmp_path / ".pivot" / "cache"
         cache_dir.mkdir(parents=True)
-        project._project_root_cache = None
+        monkeypatch.setattr(project, "_project_root_cache", None)
 
         mocker.patch.object(transfer, "get_default_cache_dir", return_value=cache_dir)
         mocker.patch.object(
@@ -359,16 +361,16 @@ def test_pull_with_errors(
 def test_pull_with_stages(
     runner: click.testing.CliRunner,
     tmp_path: pathlib.Path,
-    mocker: pytest_mock.MockerFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    mocker: MockerFixture,
 ) -> None:
     """Pull with stage names downloads those stages."""
-    from pivot import state, transfer
 
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
         cache_dir = tmp_path / ".pivot" / "cache"
         cache_dir.mkdir(parents=True)
-        project._project_root_cache = None
+        monkeypatch.setattr(project, "_project_root_cache", None)
 
         mocker.patch.object(transfer, "get_default_cache_dir", return_value=cache_dir)
         mocker.patch.object(
@@ -396,14 +398,14 @@ def test_pull_with_stages(
 def test_push_exception_shows_click_error(
     runner: click.testing.CliRunner,
     tmp_path: pathlib.Path,
-    mocker: pytest_mock.MockerFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    mocker: MockerFixture,
 ) -> None:
     """Push exception is wrapped in ClickException with user-friendly message."""
-    from pivot import transfer
 
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
-        project._project_root_cache = None
+        monkeypatch.setattr(project, "_project_root_cache", None)
 
         mocker.patch.object(
             transfer,
@@ -420,14 +422,14 @@ def test_push_exception_shows_click_error(
 def test_pull_exception_shows_click_error(
     runner: click.testing.CliRunner,
     tmp_path: pathlib.Path,
-    mocker: pytest_mock.MockerFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    mocker: MockerFixture,
 ) -> None:
     """Pull exception is wrapped in ClickException with user-friendly message."""
-    from pivot import transfer
 
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
-        project._project_root_cache = None
+        monkeypatch.setattr(project, "_project_root_cache", None)
 
         mocker.patch.object(
             transfer,
@@ -439,3 +441,70 @@ def test_pull_exception_shows_click_error(
 
         assert result.exit_code != 0
         assert "Test error" in result.output
+
+
+# =============================================================================
+# Remote List Command Tests
+# =============================================================================
+
+
+def test_remote_list_empty(
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """remote list shows no remotes when none configured."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        pathlib.Path(".pivot").mkdir()
+        monkeypatch.setattr(project, "_project_root_cache", None)
+
+        result = runner.invoke(cli.cli, ["remote", "list"])
+
+        assert result.exit_code == 0
+        assert "No remotes configured" in result.output
+
+
+def test_remote_list_shows_remotes(
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """remote list shows all configured remotes."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        pathlib.Path(".pivot").mkdir()
+        monkeypatch.setattr(project, "_project_root_cache", None)
+
+        # Use config set to add remotes (new CLI approach)
+        runner.invoke(cli.cli, ["config", "set", "remotes.origin", "s3://bucket1/cache"])
+        runner.invoke(cli.cli, ["config", "set", "remotes.backup", "s3://bucket2/backup"])
+
+        result = runner.invoke(cli.cli, ["remote", "list"])
+
+        assert result.exit_code == 0
+        assert "origin" in result.output
+        assert "s3://bucket1/cache" in result.output
+        assert "backup" in result.output
+        assert "s3://bucket2/backup" in result.output
+
+
+def test_remote_list_shows_default(
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """remote list marks default remote."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        pathlib.Path(".pivot").mkdir()
+        monkeypatch.setattr(project, "_project_root_cache", None)
+
+        # Use config set to add remote and set default
+        runner.invoke(cli.cli, ["config", "set", "remotes.origin", "s3://bucket/cache"])
+        runner.invoke(cli.cli, ["config", "set", "default_remote", "origin"])
+
+        result = runner.invoke(cli.cli, ["remote", "list"])
+
+        assert result.exit_code == 0
+        assert "(default)" in result.output

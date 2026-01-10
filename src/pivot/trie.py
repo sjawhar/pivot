@@ -3,7 +3,7 @@ from typing import TypedDict
 
 from pygtrie import Trie  # type: ignore[import-untyped]
 
-from pivot.exceptions import OutputDuplicationError, OverlappingOutputPathsError
+from pivot import exceptions
 
 
 class TrieStageInfo(TypedDict):
@@ -43,14 +43,14 @@ def build_outs_trie(stages: dict[str, TrieStageInfo]) -> Trie:
 
             if out_key in outs:
                 existing_stage, _ = outs[out_key]
-                raise OutputDuplicationError(
+                raise exceptions.OutputDuplicationError(
                     f"Output '{out}' is produced by both '{stage_name}' and '{existing_stage}'"
                 )
 
             # Case 1: New output is parent of existing output(s)
             if outs.has_subtrie(out_key):
                 child_stage, child_path = next(iter(outs.values(prefix=out_key)))
-                raise OverlappingOutputPathsError(
+                raise exceptions.OverlappingOutputPathsError(
                     "Output paths overlap:\n"
                     + f"  '{out}' (stage '{stage_name}')\n"
                     + f"  '{child_path}' (stage '{child_stage}')\n"
@@ -61,7 +61,7 @@ def build_outs_trie(stages: dict[str, TrieStageInfo]) -> Trie:
             prefix_item = outs.shortest_prefix(out_key)
             if prefix_item is not None and prefix_item.value is not None:
                 parent_stage, parent_path = prefix_item.value
-                raise OverlappingOutputPathsError(
+                raise exceptions.OverlappingOutputPathsError(
                     "Output paths overlap:\n"
                     + f"  '{parent_path}' (stage '{parent_stage}')\n"
                     + f"  '{out}' (stage '{stage_name}')\n"

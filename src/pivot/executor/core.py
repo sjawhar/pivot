@@ -16,21 +16,19 @@ from typing import TYPE_CHECKING, Literal, TypedDict, cast
 import loky
 
 from pivot import (
-    cache,
     config,
-    console,
     dag,
     exceptions,
     explain,
-    lock,
     outputs,
     parameters,
     project,
-    pvt,
     registry,
 )
-from pivot import state as state_mod
 from pivot.executor import worker
+from pivot.storage import cache, lock, track
+from pivot.storage import state as state_mod
+from pivot.tui import console
 from pivot.types import (
     OnError,
     OutputMessage,
@@ -40,6 +38,7 @@ from pivot.types import (
     StageStatus,
     TuiLogMessage,
     TuiMessage,
+    TuiMessageType,
     TuiStatusMessage,
 )
 
@@ -237,7 +236,7 @@ def _initialize_stage_states(
 
 def _verify_tracked_files(project_root: pathlib.Path) -> None:
     """Verify all .pvt tracked files exist and warn on hash mismatches."""
-    tracked_files = pvt.discover_pvt_files(project_root)
+    tracked_files = track.discover_pvt_files(project_root)
     if not tracked_files:
         return
 
@@ -245,7 +244,7 @@ def _verify_tracked_files(project_root: pathlib.Path) -> None:
     state_db_path = project_root / ".pivot" / "state.db"
 
     with state_mod.StateDB(state_db_path) as state_db:
-        for data_path, pvt_data in tracked_files.items():
+        for data_path, track_data in tracked_files.items():
             path = pathlib.Path(data_path)
             if not path.exists():
                 missing.append(data_path)
@@ -256,10 +255,10 @@ def _verify_tracked_files(project_root: pathlib.Path) -> None:
                 current_hash = cache.hash_file(path, state_db)
             else:
                 current_hash, _ = cache.hash_directory(path, state_db)
-            if current_hash != pvt_data["hash"]:
+            if current_hash != track_data["hash"]:
                 logger.warning(
                     f"Tracked file '{data_path}' has changed since tracking. "
-                    + f"Run 'pivot track --force {pvt_data['path']}' to update."
+                    + f"Run 'pivot track --force {track_data['path']}' to update."
                 )
 
     if missing:
@@ -390,7 +389,7 @@ def _execute_greedy(
                         if tui_queue:
                             tui_queue.put(
                                 TuiStatusMessage(
-                                    type="status",
+                                    type=TuiMessageType.STATUS,
                                     stage=stage_name,
                                     index=state.index,
                                     total=total_stages,
@@ -459,7 +458,7 @@ def _execute_greedy(
                         if tui_queue:
                             tui_queue.put(
                                 TuiStatusMessage(
-                                    type="status",
+                                    type=TuiMessageType.STATUS,
                                     stage=stage_name,
                                     index=state.index,
                                     total=total_stages,
@@ -519,7 +518,9 @@ def _output_queue_reader(
                 con.stage_output(stage_name, line, is_stderr)
             if tui_queue:
                 tui_queue.put(
-                    TuiLogMessage(type="log", stage=stage_name, line=line, is_stderr=is_stderr)
+                    TuiLogMessage(
+                        type=TuiMessageType.LOG, stage=stage_name, line=line, is_stderr=is_stderr
+                    )
                 )
         except queue.Empty:
             continue
@@ -619,7 +620,7 @@ def _start_ready_stages(
             if tui_queue:
                 tui_queue.put(
                     TuiStatusMessage(
-                        type="status",
+                        type=TuiMessageType.STATUS,
                         stage=stage_name,
                         index=stage_index,
                         total=total_stages,

@@ -6,8 +6,9 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from pivot import cache, exceptions, executor, pvt, status
+from pivot import exceptions, executor, status
 from pivot.registry import REGISTRY
+from pivot.storage import cache, track
 from pivot.types import RemoteStatus
 
 if TYPE_CHECKING:
@@ -117,8 +118,8 @@ def test_tracked_files_clean(tmp_path: pathlib.Path, mocker: MockerFixture) -> N
     data_file.write_text("content")
     file_hash = cache.hash_file(data_file)
 
-    pvt_data = pvt.PvtData(path="data.txt", hash=file_hash, size=7)
-    pvt.write_pvt_file(tmp_path / "data.txt.pvt", pvt_data)
+    pvt_data = track.PvtData(path="data.txt", hash=file_hash, size=7)
+    track.write_pvt_file(tmp_path / "data.txt.pvt", pvt_data)
 
     results = status.get_tracked_files_status(tmp_path)
 
@@ -136,8 +137,8 @@ def test_tracked_files_modified(tmp_path: pathlib.Path, mocker: MockerFixture) -
     data_file.write_text("original")
     old_hash = cache.hash_file(data_file)
 
-    pvt_data = pvt.PvtData(path="data.txt", hash=old_hash, size=8)
-    pvt.write_pvt_file(tmp_path / "data.txt.pvt", pvt_data)
+    pvt_data = track.PvtData(path="data.txt", hash=old_hash, size=8)
+    track.write_pvt_file(tmp_path / "data.txt.pvt", pvt_data)
 
     data_file.write_text("modified content")
 
@@ -153,8 +154,8 @@ def test_tracked_files_missing(tmp_path: pathlib.Path, mocker: MockerFixture) ->
     mocker.patch("pivot.project._project_root_cache", tmp_path)
     (tmp_path / ".git").mkdir()
 
-    pvt_data = pvt.PvtData(path="data.txt", hash="abc123", size=100)
-    pvt.write_pvt_file(tmp_path / "data.txt.pvt", pvt_data)
+    pvt_data = track.PvtData(path="data.txt", hash="abc123", size=100)
+    track.write_pvt_file(tmp_path / "data.txt.pvt", pvt_data)
 
     results = status.get_tracked_files_status(tmp_path)
 
@@ -186,8 +187,8 @@ def test_tracked_directory_clean(tmp_path: pathlib.Path, mocker: MockerFixture) 
     dir_hash, manifest = cache.hash_directory(data_dir)
     total_size = sum(entry["size"] for entry in manifest)
 
-    pvt_data = pvt.PvtData(path="data", hash=dir_hash, size=total_size)
-    pvt.write_pvt_file(tmp_path / "data.pvt", pvt_data)
+    pvt_data = track.PvtData(path="data", hash=dir_hash, size=total_size)
+    track.write_pvt_file(tmp_path / "data.pvt", pvt_data)
 
     results = status.get_tracked_files_status(tmp_path)
 
@@ -208,8 +209,8 @@ def test_tracked_directory_modified(tmp_path: pathlib.Path, mocker: MockerFixtur
     dir_hash, manifest = cache.hash_directory(data_dir)
     total_size = sum(entry["size"] for entry in manifest)
 
-    pvt_data = pvt.PvtData(path="data", hash=dir_hash, size=total_size)
-    pvt.write_pvt_file(tmp_path / "data.pvt", pvt_data)
+    pvt_data = track.PvtData(path="data", hash=dir_hash, size=total_size)
+    track.write_pvt_file(tmp_path / "data.pvt", pvt_data)
 
     (data_dir / "file1.txt").write_text("modified content")
 

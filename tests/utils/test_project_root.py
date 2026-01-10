@@ -11,20 +11,16 @@ from pivot import project
 @pytest.mark.parametrize(
     ("directories", "work_dir", "expected_root"),
     [
-        # Find marker from project root
-        ([".git"], ".", None),
-        ([".pivot"], ".", None),
-        # Find marker from subdirectory
-        ([".git", "src/pivot/nested"], "src/pivot/nested", None),
-        ([".pivot", "src/pivot/nested"], "src/pivot/nested", None),
-        # Stop at closer marker
-        ([".git", "subproject/.pivot"], "subproject", "subproject"),
-        # Both marker types in same directory
-        ([".git", ".pivot"], ".", None),
-        # No markers - fallback to cwd
-        (["no_markers"], "no_markers", "no_markers"),
-        # Nested repositories - stop at inner
-        ([".git", "inner/.git"], "inner", "inner"),
+        pytest.param([".git"], ".", None, id="git_at_root"),
+        pytest.param([".pivot"], ".", None, id="pivot_at_root"),
+        pytest.param([".git", "src/pivot/nested"], "src/pivot/nested", None, id="git_from_subdir"),
+        pytest.param(
+            [".pivot", "src/pivot/nested"], "src/pivot/nested", None, id="pivot_from_subdir"
+        ),
+        pytest.param([".git", "subproject/.pivot"], "subproject", "subproject", id="closer_marker"),
+        pytest.param([".git", ".pivot"], ".", None, id="both_markers"),
+        pytest.param(["no_markers"], "no_markers", "no_markers", id="no_markers_fallback"),
+        pytest.param([".git", "inner/.git"], "inner", "inner", id="nested_repos"),
     ],
 )
 def test_find_project_root(
@@ -93,16 +89,11 @@ def test_get_project_root_respects_cached_value(
 @pytest.mark.parametrize(
     ("input_path", "expected_relative"),
     [
-        # Relative paths
-        ("data/input.csv", "data/input.csv"),
-        # Paths with parent references
-        ("data/../models/model.pkl", "models/model.pkl"),
-        # Paths with redundant slashes
-        ("data//input.csv", "data/input.csv"),
-        # Empty path
-        ("", "."),
-        # Dot path
-        (".", "."),
+        pytest.param("data/input.csv", "data/input.csv", id="relative"),
+        pytest.param("data/../models/model.pkl", "models/model.pkl", id="parent_ref"),
+        pytest.param("data//input.csv", "data/input.csv", id="redundant_slashes"),
+        pytest.param("", ".", id="empty"),
+        pytest.param(".", ".", id="dot"),
     ],
 )
 def test_resolve_relative_paths(

@@ -5,14 +5,13 @@ import json
 import pathlib
 from typing import TYPE_CHECKING, TypedDict
 
-from pivot import cache, lock, outputs, project
+from pivot import outputs, project
 from pivot.show import common
-from pivot.types import ChangeType
+from pivot.storage import cache, lock
+from pivot.types import ChangeType, OutputFormat
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
-
-    from pivot.types import OutputFormat
 
 
 class PlotInfo(TypedDict):
@@ -184,11 +183,11 @@ def diff_plots(
 
 def format_diff_table(
     diffs: list[PlotDiffEntry],
-    output_format: OutputFormat,
+    output_format: OutputFormat | None,
     show_path: bool = True,
 ) -> str:
     """Format diff output as plain text, JSON, or markdown."""
-    if output_format == "json":
+    if output_format == OutputFormat.JSON:
         return json.dumps(diffs, indent=2)
 
     rows = list[list[str]]()

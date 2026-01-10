@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from pivot import cache, state
+from pivot.storage import cache, state
 
 if TYPE_CHECKING:
     from pivot.types import FileHash

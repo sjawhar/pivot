@@ -9,8 +9,7 @@ from typing import TYPE_CHECKING, Any
 
 import yaml
 
-from pivot import outputs, project, registry
-from pivot.exceptions import DVCImportError, ExportError
+from pivot import exceptions, outputs, project, registry
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -59,12 +58,14 @@ def _generate_cmd(func: Callable[..., Any]) -> str:
     name = func.__name__
 
     if module == "__main__":
-        raise ExportError(
+        raise exceptions.ExportError(
             f"Cannot export function '{name}' from __main__ module. Move the function to an importable module (e.g., pipeline.py)."
         )
 
     if name == "<lambda>":
-        raise ExportError("Cannot export lambda functions - they have no importable name.")
+        raise exceptions.ExportError(
+            "Cannot export lambda functions - they have no importable name."
+        )
 
     return f"python -c 'from {module} import {name}; {name}()'"
 
@@ -106,12 +107,14 @@ def _generate_params_yaml(
             with open(params_path, "w") as f:
                 yaml.dump(all_params, f, sort_keys=False, default_flow_style=False)
         except yaml.YAMLError as e:
-            raise ExportError(
+            raise exceptions.ExportError(
                 f"Failed to serialize params.yaml: {e}. Parameter defaults must be "
                 + "YAML-serializable (str, int, float, bool, list, dict)."
             ) from e
         except OSError as e:
-            raise ExportError(f"Failed to write params.yaml to '{params_path}': {e}") from e
+            raise exceptions.ExportError(
+                f"Failed to write params.yaml to '{params_path}': {e}"
+            ) from e
         logger.info(f"Generated params.yaml at {params_path}")
 
     return all_params
@@ -218,11 +221,11 @@ def export_dvc_yaml(
         all_stages = {*registry.REGISTRY.list_stages()}
         missing = [name for name in stages if name not in all_stages]
         if missing:
-            raise ExportError(f"Stages not found: {missing}")
+            raise exceptions.ExportError(f"Stages not found: {missing}")
 
     stage_dict = {name: registry.REGISTRY.get(name) for name in stages}
     if not stage_dict:
-        raise ExportError("No stages registered to export")
+        raise exceptions.ExportError("No stages registered to export")
 
     # Generate params.yaml first (need params for stage references)
     params = _generate_params_yaml(stage_dict, path)
@@ -238,9 +241,9 @@ def export_dvc_yaml(
         with open(path, "w") as f:
             yaml.dump(dvc_yaml, f, sort_keys=False, default_flow_style=False)
     except yaml.YAMLError as e:
-        raise ExportError(f"Failed to serialize dvc.yaml: {e}") from e
+        raise exceptions.ExportError(f"Failed to serialize dvc.yaml: {e}") from e
     except OSError as e:
-        raise ExportError(f"Failed to write dvc.yaml to '{path}': {e}") from e
+        raise exceptions.ExportError(f"Failed to write dvc.yaml to '{path}': {e}") from e
 
     logger.info(f"Exported {len(dvc_stages)} stages to {path}")
     return dvc_yaml
@@ -286,11 +289,11 @@ def import_dvc_yaml(
     try:
         from dvc.stage import PipelineStage as DVCPipelineStage
     except ImportError:
-        raise DVCImportError("DVC is required for import_dvc_yaml") from None
+        raise exceptions.DVCImportError("DVC is required for import_dvc_yaml") from None
 
     path = pathlib.Path(path).resolve()
     if not path.exists():
-        raise DVCImportError(f"dvc.yaml not found: {path}")
+        raise exceptions.DVCImportError(f"dvc.yaml not found: {path}")
 
     # DVC integration requires real DVC repository (cached per project root)
     try:  # pragma: no cover
@@ -298,7 +301,7 @@ def import_dvc_yaml(
         repo = _get_dvc_repo(root)
         dvc_stages = repo.index.stages
     except Exception as e:  # pragma: no cover
-        raise DVCImportError(f"Failed to parse dvc.yaml: {e}") from e
+        raise exceptions.DVCImportError(f"Failed to parse dvc.yaml: {e}") from e
 
     specs: dict[str, StageSpec] = {}
     for stage in dvc_stages:  # pragma: no cover

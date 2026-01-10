@@ -2,15 +2,15 @@ from __future__ import annotations
 
 import importlib
 import logging
-from typing import override
+from typing import TypedDict, override
 
 import click
 
 # Command categories for organized help output
 COMMAND_CATEGORIES = {
-    "Pipeline": ["run", "explain"],
-    "Inspection": ["list", "metrics", "params", "plots", "data", "status"],
-    "Versioning": ["get", "track", "checkout"],
+    "Pipeline": ["run", "explain", "status"],
+    "Inspection": ["list", "metrics", "params", "plots", "data"],
+    "Versioning": ["track", "checkout"],
     "Remote": ["remote", "push", "pull"],
     "Other": ["init", "export", "config", "completion"],
 }
@@ -29,11 +29,6 @@ _LAZY_COMMANDS: dict[str, tuple[str, str, str]] = {
         "checkout",
         "Restore tracked files and stage outputs from cache.",
     ),
-    "get": (
-        "pivot.cli.get",
-        "get_cmd",
-        "Retrieve files or stage outputs from a specific git revision.",
-    ),
     "metrics": ("pivot.cli.metrics", "metrics", "Display and compare metrics."),
     "plots": ("pivot.cli.plots", "plots", "Display and compare plots."),
     "params": ("pivot.cli.params", "params", "Display and compare parameters."),
@@ -44,6 +39,12 @@ _LAZY_COMMANDS: dict[str, tuple[str, str, str]] = {
     "completion": ("pivot.cli.completion", "completion_cmd", "Generate shell completion script."),
     "config": ("pivot.cli.config", "config_cmd", "View and modify Pivot configuration."),
 }
+
+
+class CliContext(TypedDict):
+    """Context object for CLI commands."""
+
+    verbose: bool
 
 
 class PivotGroup(click.Group):
@@ -116,8 +117,7 @@ def cli(ctx: click.Context, verbose: bool) -> None:
     Pivot accelerates ML pipelines with automatic change detection,
     parallel execution, and smart caching.
     """
-    ctx.ensure_object(dict)
-    ctx.obj["verbose"] = verbose
+    ctx.obj = CliContext(verbose=verbose)
     _setup_logging(verbose)
 
 

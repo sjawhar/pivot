@@ -13,7 +13,7 @@ def pipeline_dir(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> pat
     """Set up a temporary pipeline directory."""
     monkeypatch.chdir(tmp_path)
     (tmp_path / "pivot.yaml").write_text("version: 1\n")
-    REGISTRY.clear()
+    monkeypatch.setattr(project, "_project_root_cache", None)
     return tmp_path
 
 
@@ -125,9 +125,9 @@ def test_output_filter_allows_source_files(pipeline_dir: pathlib.Path) -> None:
 @pytest.mark.parametrize(
     "path",
     [
-        "/some/path/file.pyc",
-        "/some/path/__pycache__/file.py",
-        "/some/path/file.pyo",
+        pytest.param("/some/path/file.pyc", id="pyc"),
+        pytest.param("/some/path/__pycache__/file.py", id="pycache"),
+        pytest.param("/some/path/file.pyo", id="pyo"),
     ],
 )
 def test_output_filter_filters_python_bytecode(pipeline_dir: pathlib.Path, path: str) -> None:

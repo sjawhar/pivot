@@ -18,7 +18,8 @@ import loky
 import watchfiles
 import yaml
 
-from pivot import dag, executor, pipeline_config, project, registry
+from pivot import dag, executor, project, registry
+from pivot.pipeline import yaml as pipeline_yaml
 
 if TYPE_CHECKING:
     import multiprocessing as mp
@@ -272,7 +273,7 @@ class ReactiveEngine:
                         logger.warning(f"Failed to reload module {module_name}: {e}")
 
             # Re-register stages from pipeline file
-            pipeline_config.register_from_pipeline_file(pipeline_file)
+            pipeline_yaml.register_from_pipeline_file(pipeline_file)
 
             self._pipeline_errors = None
             new_stages = list(registry.REGISTRY.list_stages())

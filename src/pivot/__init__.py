@@ -4,35 +4,28 @@ from typing import TYPE_CHECKING
 
 __version__ = "0.1.0-dev"
 
-# These are loaded eagerly for type checking but lazily at runtime
+# Public API - only exports that users need when writing pipelines
+# Internal modules like REGISTRY, BaseOut, and show.* are accessible
+# via their full paths (e.g., pivot.registry.REGISTRY) for advanced use
+
 if TYPE_CHECKING:
-    from pivot.outputs import BaseOut as BaseOut
     from pivot.outputs import IncrementalOut as IncrementalOut
     from pivot.outputs import Metric as Metric
     from pivot.outputs import Out as Out
     from pivot.outputs import Plot as Plot
     from pivot.pipeline import Pipeline as Pipeline
-    from pivot.registry import REGISTRY as REGISTRY
     from pivot.registry import Variant as Variant
     from pivot.registry import stage as stage
-    from pivot.show import metrics as metrics
-    from pivot.show import params as params
-    from pivot.show import plots as plots
 
 # Lazy import mapping for runtime
 _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
-    "BaseOut": ("pivot.outputs", "BaseOut"),
     "IncrementalOut": ("pivot.outputs", "IncrementalOut"),
     "Metric": ("pivot.outputs", "Metric"),
     "Out": ("pivot.outputs", "Out"),
     "Plot": ("pivot.outputs", "Plot"),
     "Pipeline": ("pivot.pipeline", "Pipeline"),
-    "REGISTRY": ("pivot.registry", "REGISTRY"),
     "Variant": ("pivot.registry", "Variant"),
     "stage": ("pivot.registry", "stage"),
-    "metrics": ("pivot.show", "metrics"),
-    "params": ("pivot.show", "params"),
-    "plots": ("pivot.show", "plots"),
 }
 
 

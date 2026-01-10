@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 import click
 
 from pivot import outputs, project
@@ -9,9 +7,7 @@ from pivot.cli import decorators as cli_decorators
 from pivot.cli import targets as cli_targets
 from pivot.cli.run import ensure_stages_registered
 from pivot.show import metrics as metrics_mod
-
-if TYPE_CHECKING:
-    from pivot.types import OutputFormat
+from pivot.types import OutputFormat
 
 
 @click.group()
@@ -21,14 +17,16 @@ def metrics() -> None:
 
 @metrics.command("show")
 @click.argument("targets", nargs=-1)
-@click.option("--json", "output_format", flag_value="json", default=None, help="Output as JSON")
-@click.option("--md", "output_format", flag_value="md", help="Output as Markdown table")
+@click.option(
+    "--json", "output_format", flag_value=OutputFormat.JSON, default=None, help="Output as JSON"
+)
+@click.option("--md", "output_format", flag_value=OutputFormat.MD, help="Output as Markdown table")
 @click.option("-R", "--recursive", is_flag=True, help="Search directories recursively")
 @click.option("--precision", default=5, type=int, help="Decimal precision for floats")
 @cli_decorators.with_error_handling
 def metrics_show(
     targets: tuple[str, ...],
-    output_format: OutputFormat,
+    output_format: OutputFormat | None,
     recursive: bool,
     precision: int,
 ) -> None:
@@ -54,15 +52,17 @@ def metrics_show(
 
 @metrics.command("diff")
 @click.argument("targets", nargs=-1)
-@click.option("--json", "output_format", flag_value="json", default=None, help="Output as JSON")
-@click.option("--md", "output_format", flag_value="md", help="Output as Markdown table")
+@click.option(
+    "--json", "output_format", flag_value=OutputFormat.JSON, default=None, help="Output as JSON"
+)
+@click.option("--md", "output_format", flag_value=OutputFormat.MD, help="Output as Markdown table")
 @click.option("-R", "--recursive", is_flag=True, help="Search directories recursively")
 @click.option("--no-path", is_flag=True, help="Hide path column")
 @click.option("--precision", default=5, type=int, help="Decimal precision for floats")
 @cli_decorators.with_error_handling
 def metrics_diff(
     targets: tuple[str, ...],
-    output_format: OutputFormat,
+    output_format: OutputFormat | None,
     recursive: bool,
     no_path: bool,
     precision: int,

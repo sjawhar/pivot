@@ -5,7 +5,8 @@ from typing import TYPE_CHECKING
 
 import watchfiles
 
-from pivot import console, dag, executor, project, registry
+from pivot import dag, executor, project, registry
+from pivot.tui import console
 
 logger = logging.getLogger(__name__)
 

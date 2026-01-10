@@ -8,7 +8,7 @@ import pytest
 from botocore import exceptions as botocore_exc
 
 from pivot import exceptions
-from pivot import remote as remote_mod
+from pivot.remote import storage as remote_mod
 
 if TYPE_CHECKING:
     from pytest_mock import MockerFixture

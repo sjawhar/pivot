@@ -6,22 +6,28 @@ import pathlib
 from typing import TYPE_CHECKING
 
 from pivot import (
-    cache,
     dag,
     exceptions,
     explain,
     parameters,
     project,
-    pvt,
     registry,
-    remote_config,
-    transfer,
 )
-from pivot import state as state_mod
-from pivot.types import PipelineStatusInfo, RemoteSyncInfo, StageExplanation, TrackedFileInfo
+from pivot.remote import config as remote_config
+from pivot.remote import sync as transfer
+from pivot.storage import cache, track
+from pivot.storage import state as state_mod
+from pivot.types import (
+    PipelineStatus,
+    PipelineStatusInfo,
+    RemoteSyncInfo,
+    StageExplanation,
+    TrackedFileInfo,
+    TrackedFileStatus,
+)
 
 if TYPE_CHECKING:
-    import networkx
+    from networkx import DiGraph
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +36,7 @@ def get_pipeline_status(
     stages: list[str] | None,
     single_stage: bool,
     cache_dir: pathlib.Path | None,
-) -> tuple[list[PipelineStatusInfo], networkx.DiGraph[str]]:
+) -> tuple[list[PipelineStatusInfo], DiGraph[str]]:
     """Get status for all stages, tracking upstream staleness."""
     graph = registry.REGISTRY.build_dag(validate=True)
     execution_order = dag.get_execution_order(graph, stages, single_stage=single_stage)
@@ -59,7 +65,7 @@ def get_pipeline_status(
 
 def _compute_upstream_staleness(
     explanations: list[StageExplanation],
-    graph: networkx.DiGraph[str],
+    graph: DiGraph[str],
 ) -> list[PipelineStatusInfo]:
     """Process explanations and mark stages stale due to upstream dependencies."""
     stale_stages = set[str]()
@@ -85,7 +91,7 @@ def _compute_upstream_staleness(
         results.append(
             PipelineStatusInfo(
                 name=exp["stage_name"],
-                status="stale" if is_stale else "cached",
+                status=PipelineStatus.STALE if is_stale else PipelineStatus.CACHED,
                 reason=reason,
                 upstream_stale=upstream_stale,
             )
@@ -96,10 +102,10 @@ def _compute_upstream_staleness(
 
 def get_tracked_files_status(project_root: pathlib.Path) -> list[TrackedFileInfo]:
     """Get status for all tracked files."""
-    tracked = pvt.discover_pvt_files(project_root)
+    tracked = track.discover_pvt_files(project_root)
     results = list[TrackedFileInfo]()
 
-    for abs_path_str, pvt_data in sorted(tracked.items()):
+    for abs_path_str, track_data in sorted(tracked.items()):
         path = pathlib.Path(abs_path_str)
         rel_path = str(path.relative_to(project_root))
 
@@ -109,14 +115,22 @@ def get_tracked_files_status(project_root: pathlib.Path) -> list[TrackedFileInfo
             else:
                 current_hash = cache.hash_file(path)
         except FileNotFoundError:
-            results.append(TrackedFileInfo(path=rel_path, status="missing", size=pvt_data["size"]))
+            results.append(
+                TrackedFileInfo(
+                    path=rel_path, status=TrackedFileStatus.MISSING, size=track_data["size"]
+                )
+            )
             continue
 
         results.append(
             TrackedFileInfo(
                 path=rel_path,
-                status="modified" if current_hash != pvt_data["hash"] else "clean",
-                size=pvt_data["size"],
+                status=(
+                    TrackedFileStatus.MODIFIED
+                    if current_hash != track_data["hash"]
+                    else TrackedFileStatus.CLEAN
+                ),
+                size=track_data["size"],
             )
         )
 

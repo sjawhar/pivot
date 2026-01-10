@@ -195,11 +195,47 @@ def test_find_root(tmp_path, directories, work_dir, expected_root):
 - Minimum 90%; 100% required for critical files: `fingerprint.py`, `lock.py`, `dag.py`, `scheduler.py`.
 - CLI/explain acceptable at 80-85%.
 
+## CLI Integration Tests (Critical)
+
+**Every CLI command MUST have an integration test that runs in a real pipeline.** Non-negotiable for new commands.
+
+An integration test must:
+- Create real filesystem (use `runner.isolated_filesystem()` or `tmp_path`)
+- Write actual files (Python stages, data files, `.git` directory)
+- Run actual CLI commands via `runner.invoke()`
+- Verify both CLI output AND filesystem state
+
+**Reference Examples:**
+- Pipeline execution: `tests/cli/test_cli.py::test_cli_run_prints_results`
+- Git revision testing: `tests/cli/test_cli_metrics.py::test_metrics_diff_integration`
+- Remote config: `tests/remote/test_cli_remote.py::test_remote_add_creates_config`
+- Tracked files: `tests/test_cli_track.py::test_track_file_creates_pvt_and_caches`
+
+**Required Coverage:** Every command needs tests for success paths, error paths, and output formats (`--json`, `--md`). See existing `tests/cli/test_cli_*.py` files for patterns.
+
 ## Fixtures (conftest.py)
 
-- `clean_registry` - reset registry before each test.
-- `tmp_pipeline_dir` - temporary directory for pipeline tests.
-- `sample_data_file` - create sample CSV.
+### Global State Reset (Critical)
+
+The global `conftest.py` has **autouse fixtures** that automatically reset state between tests:
+
+- `clean_registry` - clears `REGISTRY._stages` via `mocker.patch.dict`
+- `reset_pivot_state` - resets `project._project_root_cache`, `config._config_cache`, `console._console`
+
+**NEVER:**
+- Define duplicate `clean_registry` fixtures in individual test files
+- Manually call `REGISTRY.clear()` inside test functions
+- Manually assign `project._project_root_cache = None` inside test functions
+- Create your own state reset fixtures for these globals
+
+**If you add new global state to the codebase**, update `reset_pivot_state` in `conftest.py` instead of creating a new fixture.
+
+### Other Fixtures
+
+- `tmp_pipeline_dir` - temporary directory for pipeline tests
+- `sample_data_file` - create sample CSV
+- `set_project_root` - explicitly set project root to `tmp_path` (for tests that need a specific root)
+- `git_repo` - create a git repo with commit function `(path, commit_fn)`
 
 ## Mocking (Critical)
 
@@ -224,6 +260,107 @@ def reset_state() -> Generator[None]:
     module._cache = None
     yield
     module._cache = old_value  # Error-prone, can forget to restore
+```
+
+### Mock Boundaries, Not Internal Logic (Critical)
+
+**Only mock external boundaries:** filesystem I/O, network calls, time, randomness. Never mock internal functions just to control their return values.
+
+```python
+# Bad - circular mock testing (mocks function, asserts mocked return value)
+def test_get_stages(mocker):
+    mocker.patch.object(registry.REGISTRY, "list_stages", return_value=["stage1", "stage2"])
+    result = completion._get_stages_full()
+    assert set(result) == {"stage1", "stage2"}  # Just testing the mock!
+
+# Good - use real objects, test real behavior
+def test_get_stages():
+    registry.REGISTRY.register(lambda: None, name="stage1", deps=[], outs=[])
+    registry.REGISTRY.register(lambda: None, name="stage2", deps=[], outs=[])
+    result = completion._get_stages_full()
+    assert set(result) == {"stage1", "stage2"}  # Tests real registration flow
+```
+
+**Signs of circular mock testing:**
+- Mock returns X, test asserts X is returned
+- Mocking the function you're trying to test
+- Mock setup mirrors the assertion exactly
+
+**When mocking IS appropriate:**
+- External HTTP calls (`requests.get`, `httpx.Client`)
+- Filesystem operations in fast unit tests
+- Time-dependent code (`time.time`, `datetime.now`)
+- Random number generation for determinism
+
+## Test Behavior, Not Implementation (Critical)
+
+**Test what the code does, not how it's built internally.**
+
+### No Private Attribute Access
+
+Never access `_private` attributes in assertions. Use public interfaces or type checks.
+
+```python
+# Bad - tests internal implementation details
+def test_diff_panel():
+    result = DataDiffResult(...)
+    panel = DiffSummaryPanel(result)
+    assert panel._result == result  # Exposes internal attribute
+
+# Good - tests observable behavior
+def test_diff_panel():
+    result = DataDiffResult(...)
+    panel = DiffSummaryPanel(result)
+    assert isinstance(panel, DiffSummaryPanel)  # Verifies construction succeeds
+```
+
+**Why?** Private attributes can change without breaking functionality. Tests tied to implementation break during refactoring even when behavior is preserved.
+
+### Test Public Interfaces
+
+```python
+# Bad - testing internal state
+def test_app_stores_entries():
+    app = DataDiffApp(entries, key_cols=None, max_rows=1000)
+    assert app._diff_entries == entries
+    assert app._key_cols is None
+
+# Good - test through public methods or observable effects
+def test_app_initialization():
+    app = DataDiffApp(entries, key_cols=None, max_rows=1000)
+    # Test that app is usable, not its internal state
+    assert isinstance(app, DataDiffApp)
+```
+
+## CLI Output Testing (Critical)
+
+**Never parse CLI output with position-based string manipulation.**
+
+```python
+# Bad - fragile, breaks if section order or headers change
+def test_cli_help_shows_commands(runner):
+    result = runner.invoke(cli.cli, ["--help"])
+    pipeline_idx = output.find("Pipeline Commands:")
+    inspection_idx = output.find("Inspection Commands:")
+    pipeline_section = output[pipeline_idx:inspection_idx]
+    assert "run" in pipeline_section
+
+# Good - simple containment checks with clear messages
+def test_cli_help_shows_commands(runner):
+    result = runner.invoke(cli.cli, ["--help"])
+    assert result.exit_code == 0
+    assert "run" in result.output, "Should show 'run' command"
+    assert "Pipeline Commands:" in result.output
+```
+
+**For strict section testing**, use structured output (JSON) instead of parsing human-readable text:
+
+```python
+# Best - use --json flag when available
+def test_cli_list_stages(runner):
+    result = runner.invoke(cli.cli, ["list", "--json"])
+    data = json.loads(result.output)
+    assert "my_stage" in data["stages"]
 ```
 
 ## Debugging

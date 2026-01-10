@@ -10,8 +10,9 @@ from typing import TYPE_CHECKING, Any, TypeVar
 
 import pydantic
 
-from pivot import lock, parameters
+from pivot import parameters
 from pivot.executor import worker
+from pivot.storage import lock
 from pivot.types import (
     ChangeType,
     CodeChange,
@@ -22,8 +23,8 @@ from pivot.types import (
 )
 
 if TYPE_CHECKING:
-    import pathlib
     from collections.abc import Callable
+    from pathlib import Path
 
 T = TypeVar("T")
 C = TypeVar("C")
@@ -97,7 +98,7 @@ def get_stage_explanation(
     deps: list[str],
     params_instance: pydantic.BaseModel | None,
     overrides: parameters.ParamsOverrides | None,
-    cache_dir: pathlib.Path,
+    cache_dir: Path,
 ) -> StageExplanation:
     """Compute detailed explanation of why a stage would run."""
     stage_lock = lock.StageLock(stage_name, cache_dir)

@@ -12,7 +12,6 @@ from typing import TYPE_CHECKING, Any, TypedDict, TypeVar, get_origin, get_type_
 import pydantic
 
 from pivot import exceptions, fingerprint, outputs, parameters, path_policy, project, trie
-from pivot.exceptions import ParamsError, SecurityValidationError, ValidationError
 
 if TYPE_CHECKING:
     from inspect import Signature
@@ -218,7 +217,7 @@ class StageRegistry:
 
     Example:
         ```python
-        from pivot import REGISTRY
+        from pivot.registry import REGISTRY
         REGISTRY.list_stages()  # ['preprocess', 'train']
         info = REGISTRY.get('train')
         info['deps']  # List of dependency paths
@@ -487,18 +486,22 @@ def _validate_stage_registration(
     for path in deps:
         error = path_policy.validate_path_syntax(path)
         if error:
-            raise SecurityValidationError(f"Stage '{stage_name}': dependency path {error}: {path}")
+            raise exceptions.SecurityValidationError(
+                f"Stage '{stage_name}': dependency path {error}: {path}"
+            )
 
     for path in outs:
         error = path_policy.validate_path_syntax(path)
         if error:
-            raise SecurityValidationError(f"Stage '{stage_name}': output path {error}: {path}")
+            raise exceptions.SecurityValidationError(
+                f"Stage '{stage_name}': output path {error}: {path}"
+            )
 
 
 def _handle_validation_error(msg: str, validation_mode: ValidationMode) -> None:
     """Raise error or warn based on validation mode."""
     if validation_mode == ValidationMode.ERROR:
-        raise ValidationError(msg)
+        raise exceptions.ValidationError(msg)
     logger.warning(msg)
 
 
@@ -525,7 +528,7 @@ def _get_params_type_hint(
         type_hints = get_type_hints(func)
     except (NameError, TypeError, AttributeError) as e:
         if strict:
-            raise ParamsError(
+            raise exceptions.ParamsError(
                 f"Stage '{stage_name}': failed to resolve type hints for "
                 + f"'{func.__name__}': {e}"
             ) from e
@@ -533,7 +536,7 @@ def _get_params_type_hint(
 
     if "params" not in type_hints:
         if strict:
-            raise ParamsError(
+            raise exceptions.ParamsError(
                 f"Stage '{stage_name}': function '{func.__name__}' has 'params' parameter "
                 + "but no type hint. Add a type hint like 'params: MyParams'"
             )
@@ -544,14 +547,14 @@ def _get_params_type_hint(
     # Reject Union/Optional types - params must be a concrete BaseModel class
     origin = get_origin(hint)
     if origin is not None:
-        raise ParamsError(
+        raise exceptions.ParamsError(
             f"Stage '{stage_name}': params type hint must be a concrete Pydantic BaseModel "
             + f"class, not a generic or union type. Got: {hint}"
         )
 
     if not parameters.validate_params_cls(hint):
         if strict:
-            raise ParamsError(
+            raise exceptions.ParamsError(
                 f"Stage '{stage_name}': params type hint must be a Pydantic BaseModel, "
                 + f"got {hint}"
             )
@@ -581,13 +584,13 @@ def _resolve_params(
         # Case 1: params is an instance - use directly (after validation)
         case pydantic.BaseModel():
             if not has_params_param:
-                raise ParamsError(
+                raise exceptions.ParamsError(
                     f"Stage '{stage_name}': function must have a 'params' parameter "
                     + "when params is specified"
                 )
             expected_cls = _get_params_type_hint(func, stage_name, strict=False)
             if expected_cls is not None and not isinstance(params_arg, expected_cls):
-                raise ParamsError(
+                raise exceptions.ParamsError(
                     f"Stage '{stage_name}': params type {type(params_arg).__name__} "
                     + f"does not match function type hint {expected_cls.__name__}"
                 )
@@ -596,25 +599,25 @@ def _resolve_params(
         # Case 2: params is a class - instantiate with defaults
         case type() as params_cls:
             if not has_params_param:
-                raise ParamsError(
+                raise exceptions.ParamsError(
                     f"Stage '{stage_name}': function must have a 'params' parameter "
                     + "when params is specified"
                 )
             if not parameters.validate_params_cls(params_cls):
-                raise ParamsError(
+                raise exceptions.ParamsError(
                     f"Stage '{stage_name}': params must be a Pydantic BaseModel subclass, "
                     + f"got {params_cls.__name__}"
                 )
             expected_cls = _get_params_type_hint(func, stage_name, strict=False)
             if expected_cls is not None and not issubclass(params_cls, expected_cls):
-                raise ParamsError(
+                raise exceptions.ParamsError(
                     f"Stage '{stage_name}': params type {params_cls.__name__} "
                     + f"does not match function type hint {expected_cls.__name__}"
                 )
             try:
                 return params_cls()
             except pydantic.ValidationError as e:
-                raise ParamsError(
+                raise exceptions.ParamsError(
                     f"Stage '{stage_name}': cannot instantiate params with defaults: {e}"
                 ) from e
 
@@ -627,7 +630,7 @@ def _resolve_params(
             try:
                 return params_cls()
             except pydantic.ValidationError as e:
-                raise ParamsError(
+                raise exceptions.ParamsError(
                     f"Stage '{stage_name}': cannot instantiate params with defaults: {e}"
                 ) from e
 
@@ -635,12 +638,14 @@ def _resolve_params(
 def _validate_matrix_variants(variants: Sequence[Variant]) -> None:
     """Validate matrix variant list for duplicates and emptiness."""
     if not variants:
-        raise ValidationError("matrix variants cannot be empty - provide at least one Variant")
+        raise exceptions.ValidationError(
+            "matrix variants cannot be empty - provide at least one Variant"
+        )
 
     seen_names = set[str]()
     for variant in variants:
         if variant.name in seen_names:
-            raise ValidationError(f"Duplicate variant name '{variant.name}' in matrix")
+            raise exceptions.ValidationError(f"Duplicate variant name '{variant.name}' in matrix")
         seen_names.add(variant.name)
 
 

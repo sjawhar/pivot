@@ -6,8 +6,9 @@ import pathlib
 import click.testing
 import pytest
 
-from pivot import cache, cli, executor, pvt
+from pivot import cli, executor
 from pivot.registry import REGISTRY
+from pivot.storage import cache, track
 
 
 @pytest.fixture
@@ -161,8 +162,8 @@ def test_status_shows_tracked_files(
         data_file.write_text("content")
         file_hash = cache.hash_file(data_file)
 
-        pvt_data = pvt.PvtData(path="data.txt", hash=file_hash, size=7)
-        pvt.write_pvt_file(pathlib.Path("data.txt.pvt"), pvt_data)
+        pvt_data = track.PvtData(path="data.txt", hash=file_hash, size=7)
+        track.write_pvt_file(pathlib.Path("data.txt.pvt"), pvt_data)
 
         result = runner.invoke(cli.cli, ["status", "--verbose"])
 
@@ -183,8 +184,8 @@ def test_status_shows_modified_tracked_files(
         data_file.write_text("original")
         old_hash = cache.hash_file(data_file)
 
-        pvt_data = pvt.PvtData(path="data.txt", hash=old_hash, size=8)
-        pvt.write_pvt_file(pathlib.Path("data.txt.pvt"), pvt_data)
+        pvt_data = track.PvtData(path="data.txt", hash=old_hash, size=8)
+        track.write_pvt_file(pathlib.Path("data.txt.pvt"), pvt_data)
 
         data_file.write_text("modified content")
 
@@ -209,8 +210,8 @@ def test_status_stages_only(runner: click.testing.CliRunner, tmp_path: pathlib.P
         data_file.write_text("content")
         file_hash = cache.hash_file(data_file)
 
-        pvt_data = pvt.PvtData(path="data.txt", hash=file_hash, size=7)
-        pvt.write_pvt_file(pathlib.Path("data.txt.pvt"), pvt_data)
+        pvt_data = track.PvtData(path="data.txt", hash=file_hash, size=7)
+        track.write_pvt_file(pathlib.Path("data.txt.pvt"), pvt_data)
 
         REGISTRY.register(_helper_process, name="process", deps=["input.txt"], outs=["output.txt"])
 
@@ -231,8 +232,8 @@ def test_status_tracked_only(runner: click.testing.CliRunner, tmp_path: pathlib.
         data_file.write_text("content")
         file_hash = cache.hash_file(data_file)
 
-        pvt_data = pvt.PvtData(path="data.txt", hash=file_hash, size=7)
-        pvt.write_pvt_file(pathlib.Path("data.txt.pvt"), pvt_data)
+        pvt_data = track.PvtData(path="data.txt", hash=file_hash, size=7)
+        track.write_pvt_file(pathlib.Path("data.txt.pvt"), pvt_data)
 
         REGISTRY.register(_helper_process, name="process", deps=["input.txt"], outs=["output.txt"])
 

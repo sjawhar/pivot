@@ -4,6 +4,12 @@
 
 ---
 
+## Modifying CLAUDE.md
+
+When updating CLAUDE.md files: **brevity and clarity over verbosity**. Reference existing code examples instead of writing full code blocks. Point to specific test files or functions. Strong, clear rules in few words beat lengthy explanations.
+
+---
+
 ## Core Design
 
 - Pivot eliminates DVC bottlenecks via per-stage lock files (32x faster), automatic code fingerprinting, and warm worker pools.
@@ -154,7 +160,7 @@ config = RemoteTransferConfig(jobs=-1)  # ValidationError: jobs must be > 0
 - No relative imports; no `sys.path` modifications.
 - **This applies to all packages including third-party**—use `import pydantic` then `pydantic.BaseModel`, not `from pydantic import BaseModel`.
 - No exceptions for stdlib—use `import pathlib` then `pathlib.Path`, not `from pathlib import Path`.
-- Exception: type hints in `TYPE_CHECKING` blocks import types directly (e.g., `from pydantic import BaseModel`). Never import the same thing both inside and outside TYPE_CHECKING.
+- Exception: type hints in `TYPE_CHECKING` blocks import classes/types directly, never modules. Use `from pathlib import Path`, not `import pathlib`. TYPE_CHECKING blocks are for type annotations only, so import the specific types you need. Never import the same thing both inside and outside TYPE_CHECKING.
 - Exception: types from `pivot.types` may be imported directly: `from pivot.types import StageStatus, StageResult`.
 - Exception: the `typing` module—always use `from typing import X`, never `import typing`. This is because `typing` exports are all type-related utilities meant to be used directly.
 

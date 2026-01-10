@@ -6,12 +6,10 @@ from typing import TYPE_CHECKING, TypedDict, cast
 
 from pivot import git, parameters
 from pivot.show import common
-from pivot.types import ChangeType
+from pivot.types import ChangeType, OutputFormat
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
-
-    from pivot.types import OutputFormat
 
 logger = logging.getLogger(__name__)
 
@@ -165,11 +163,11 @@ def _apply_precision(value: ParamValue, precision: int) -> ParamValue:
 
 def format_params_table(
     params: Mapping[str, Mapping[str, ParamValue]],
-    output_format: OutputFormat,
+    output_format: OutputFormat | None,
     precision: int = 5,
 ) -> str:
     """Format params for display. output_format: None (plain), 'json', or 'md'."""
-    if output_format == "json":
+    if output_format == OutputFormat.JSON:
         rounded = {
             stage: {k: _apply_precision(v, precision) for k, v in stage_params.items()}
             for stage, stage_params in params.items()
@@ -188,11 +186,11 @@ def format_params_table(
 
 def format_diff_table(
     diffs: list[ParamDiff],
-    output_format: OutputFormat,
+    output_format: OutputFormat | None,
     precision: int = 5,
 ) -> str:
     """Format param diffs for display."""
-    if output_format == "json":
+    if output_format == OutputFormat.JSON:
         rounded_diffs = [
             ParamDiff(
                 stage=d["stage"],

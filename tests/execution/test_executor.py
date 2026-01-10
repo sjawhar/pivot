@@ -13,22 +13,12 @@ from pivot import exceptions, executor, project, registry
 from pivot.outputs import Metric
 
 
-@pytest.fixture(autouse=True)
-def clean_registry():
-    """Reset registry before each test."""
-    registry.REGISTRY.clear()
-
-
 @pytest.fixture
 def pipeline_dir(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> pathlib.Path:
     """Set up a temporary pipeline directory."""
-    # Create .pivot marker so project root detection works
     (tmp_path / ".pivot").mkdir()
     monkeypatch.chdir(tmp_path)
-
-    # Reset project root cache
-    project._project_root_cache = None
-
+    monkeypatch.setattr(project, "_project_root_cache", None)
     return tmp_path
 
 

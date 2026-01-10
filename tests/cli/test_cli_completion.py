@@ -9,7 +9,7 @@ import pytest
 from pivot.cli import completion
 
 if TYPE_CHECKING:
-    import pathlib
+    from pathlib import Path
 
     from pytest_mock import MockerFixture
 
@@ -36,7 +36,7 @@ def mock_param() -> click.Parameter:
 # =============================================================================
 
 
-def test_get_stages_fast_simple_yaml(tmp_path: pathlib.Path, mocker: MockerFixture) -> None:
+def test_get_stages_fast_simple_yaml(tmp_path: Path, mocker: MockerFixture) -> None:
     """Fast path extracts names from simple pivot.yaml."""
     yaml_content = """
 stages:
@@ -55,7 +55,7 @@ stages:
     assert set(result) == {"preprocess", "train"}
 
 
-def test_get_stages_fast_matrix_yaml(tmp_path: pathlib.Path, mocker: MockerFixture) -> None:
+def test_get_stages_fast_matrix_yaml(tmp_path: Path, mocker: MockerFixture) -> None:
     """Fast path expands matrix configurations."""
     yaml_content = """
 stages:
@@ -80,9 +80,7 @@ stages:
     }
 
 
-def test_get_stages_fast_mixed_simple_and_matrix(
-    tmp_path: pathlib.Path, mocker: MockerFixture
-) -> None:
+def test_get_stages_fast_mixed_simple_and_matrix(tmp_path: Path, mocker: MockerFixture) -> None:
     """Fast path handles mix of simple and matrix stages."""
     yaml_content = """
 stages:
@@ -111,9 +109,7 @@ def test_get_stages_fast_returns_none_when_no_project_root(mocker: MockerFixture
     assert result is None
 
 
-def test_get_stages_fast_returns_none_when_no_yaml(
-    tmp_path: pathlib.Path, mocker: MockerFixture
-) -> None:
+def test_get_stages_fast_returns_none_when_no_yaml(tmp_path: Path, mocker: MockerFixture) -> None:
     """Returns None when pivot.yaml doesn't exist."""
     (tmp_path / ".git").mkdir()
 
@@ -123,9 +119,7 @@ def test_get_stages_fast_returns_none_when_no_yaml(
     assert result is None
 
 
-def test_get_stages_fast_returns_none_on_variants(
-    tmp_path: pathlib.Path, mocker: MockerFixture
-) -> None:
+def test_get_stages_fast_returns_none_on_variants(tmp_path: Path, mocker: MockerFixture) -> None:
     """Returns None when config has variants (needs fallback)."""
     yaml_content = """
 stages:
@@ -142,9 +136,7 @@ stages:
     assert result is None
 
 
-def test_get_stages_fast_returns_none_on_yaml_error(
-    tmp_path: pathlib.Path, mocker: MockerFixture
-) -> None:
+def test_get_stages_fast_returns_none_on_yaml_error(tmp_path: Path, mocker: MockerFixture) -> None:
     """Returns None on YAML parse error."""
     (tmp_path / "pivot.yaml").write_text("invalid: yaml: [[[")
     (tmp_path / ".git").mkdir()
@@ -155,9 +147,7 @@ def test_get_stages_fast_returns_none_on_yaml_error(
     assert result is None
 
 
-def test_get_stages_fast_pivot_yml_alternative(
-    tmp_path: pathlib.Path, mocker: MockerFixture
-) -> None:
+def test_get_stages_fast_pivot_yml_alternative(tmp_path: Path, mocker: MockerFixture) -> None:
     """Fast path works with pivot.yml (alternative extension)."""
     yaml_content = """
 stages:
@@ -179,9 +169,7 @@ stages:
 # =============================================================================
 
 
-def test_find_project_root_fast_finds_git_marker(
-    tmp_path: pathlib.Path, mocker: MockerFixture
-) -> None:
+def test_find_project_root_fast_finds_git_marker(tmp_path: Path, mocker: MockerFixture) -> None:
     """Finds project root via .git marker."""
     (tmp_path / ".git").mkdir()
     mocker.patch("pathlib.Path.cwd", return_value=tmp_path)
@@ -190,9 +178,7 @@ def test_find_project_root_fast_finds_git_marker(
     assert result == tmp_path
 
 
-def test_find_project_root_fast_finds_pivot_marker(
-    tmp_path: pathlib.Path, mocker: MockerFixture
-) -> None:
+def test_find_project_root_fast_finds_pivot_marker(tmp_path: Path, mocker: MockerFixture) -> None:
     """Finds project root via .pivot marker."""
     (tmp_path / ".pivot").mkdir()
     mocker.patch("pathlib.Path.cwd", return_value=tmp_path)
@@ -201,7 +187,7 @@ def test_find_project_root_fast_finds_pivot_marker(
     assert result == tmp_path
 
 
-def test_find_project_root_fast_walks_up(tmp_path: pathlib.Path, mocker: MockerFixture) -> None:
+def test_find_project_root_fast_walks_up(tmp_path: Path, mocker: MockerFixture) -> None:
     """Walks up directory tree to find marker."""
     (tmp_path / ".git").mkdir()
     subdir = tmp_path / "src" / "pkg"
@@ -213,7 +199,7 @@ def test_find_project_root_fast_walks_up(tmp_path: pathlib.Path, mocker: MockerF
 
 
 def test_find_project_root_fast_returns_none_when_no_marker(
-    tmp_path: pathlib.Path, mocker: MockerFixture
+    tmp_path: Path, mocker: MockerFixture
 ) -> None:
     """Returns None when no marker found."""
     isolated = tmp_path / "isolated"
@@ -229,68 +215,84 @@ def test_find_project_root_fast_returns_none_when_no_marker(
 # =============================================================================
 
 
-def test_get_stages_full_returns_registered_stages(mocker: MockerFixture) -> None:
-    """Returns stages from registry after discovery."""
-    mock_discovery = mocker.patch("pivot.discovery")
-    mock_discovery.has_registered_stages.return_value = False
+def test_get_stages_full_returns_registered_stages() -> None:
+    """Returns stages from registry after registration."""
+    from pivot import registry
 
-    mock_registry = mocker.patch("pivot.registry")
-    mock_registry.REGISTRY.list_stages.return_value = ["stage1", "stage2"]
-
-    result = completion._get_stages_full()
-    assert result == ["stage1", "stage2"]
-    mock_discovery.discover_and_register.assert_called_once()
-
-
-def test_get_stages_full_skips_discovery_if_registered(mocker: MockerFixture) -> None:
-    """Skips discovery if stages already registered."""
-    mock_discovery = mocker.patch("pivot.discovery")
-    mock_discovery.has_registered_stages.return_value = True
-
-    mock_registry = mocker.patch("pivot.registry")
-    mock_registry.REGISTRY.list_stages.return_value = ["existing"]
+    # Register real stages (autouse fixture clears registry between tests)
+    registry.REGISTRY.register(lambda: None, name="stage1", deps=[], outs=[])
+    registry.REGISTRY.register(lambda: None, name="stage2", deps=[], outs=[])
 
     result = completion._get_stages_full()
-    assert result == ["existing"]
-    mock_discovery.discover_and_register.assert_not_called()
+
+    assert set(result) == {"stage1", "stage2"}
 
 
 # =============================================================================
-# complete_stages tests
+# complete_stages tests - use real YAML files instead of mocking
 # =============================================================================
 
 
 def test_complete_stages_filters_by_prefix(
-    mock_ctx: click.Context, mock_param: click.Parameter, mocker: MockerFixture
+    tmp_path: Path,
+    mock_ctx: click.Context,
+    mock_param: click.Parameter,
+    mocker: MockerFixture,
 ) -> None:
     """Filters stage names by incomplete prefix."""
-    mocker.patch.object(
-        completion, "_get_stages_fast", return_value=["train", "test", "preprocess"]
-    )
+    yaml_content = """
+stages:
+  train:
+    python: stages.train
+  test:
+    python: stages.test
+  preprocess:
+    python: stages.preprocess
+"""
+    (tmp_path / "pivot.yaml").write_text(yaml_content)
+    (tmp_path / ".git").mkdir()
+    mocker.patch.object(completion, "_find_project_root_fast", return_value=tmp_path)
 
     result = completion.complete_stages(mock_ctx, mock_param, "tr")
     assert result == ["train"]
 
 
 def test_complete_stages_empty_prefix_returns_all(
-    mock_ctx: click.Context, mock_param: click.Parameter, mocker: MockerFixture
+    tmp_path: Path,
+    mock_ctx: click.Context,
+    mock_param: click.Parameter,
+    mocker: MockerFixture,
 ) -> None:
     """Empty prefix returns all stages."""
-    mocker.patch.object(completion, "_get_stages_fast", return_value=["train", "test"])
+    yaml_content = """
+stages:
+  train:
+    python: stages.train
+  test:
+    python: stages.test
+"""
+    (tmp_path / "pivot.yaml").write_text(yaml_content)
+    (tmp_path / ".git").mkdir()
+    mocker.patch.object(completion, "_find_project_root_fast", return_value=tmp_path)
 
     result = completion.complete_stages(mock_ctx, mock_param, "")
     assert set(result) == {"train", "test"}
 
 
-def test_complete_stages_falls_back_when_fast_returns_none(
+def test_complete_stages_falls_back_to_registry(
     mock_ctx: click.Context, mock_param: click.Parameter, mocker: MockerFixture
 ) -> None:
-    """Falls back to full discovery when fast path returns None."""
-    mocker.patch.object(completion, "_get_stages_fast", return_value=None)
-    mocker.patch.object(completion, "_get_stages_full", return_value=["fallback_stage"])
+    """Falls back to registry when fast path returns None (no YAML)."""
+    from pivot import registry
+
+    # No YAML file, fast path returns None
+    mocker.patch.object(completion, "_find_project_root_fast", return_value=None)
+
+    # Register stages directly
+    registry.REGISTRY.register(lambda: None, name="fallback_stage", deps=[], outs=[])
 
     result = completion.complete_stages(mock_ctx, mock_param, "")
-    assert result == ["fallback_stage"]
+    assert "fallback_stage" in result
 
 
 def test_complete_stages_returns_empty_on_exception(
@@ -304,24 +306,49 @@ def test_complete_stages_returns_empty_on_exception(
 
 
 def test_complete_stages_matrix_stage_completion(
-    mock_ctx: click.Context, mock_param: click.Parameter, mocker: MockerFixture
+    tmp_path: Path,
+    mock_ctx: click.Context,
+    mock_param: click.Parameter,
+    mocker: MockerFixture,
 ) -> None:
     """Completes matrix stage names correctly."""
-    mocker.patch.object(
-        completion,
-        "_get_stages_fast",
-        return_value=["train@bert_swe", "train@gpt_swe", "preprocess"],
-    )
+    yaml_content = """
+stages:
+  train:
+    python: stages.train
+    matrix:
+      model: [bert, gpt]
+      dataset: [swe]
+  preprocess:
+    python: stages.preprocess
+"""
+    (tmp_path / "pivot.yaml").write_text(yaml_content)
+    (tmp_path / ".git").mkdir()
+    mocker.patch.object(completion, "_find_project_root_fast", return_value=tmp_path)
 
     result = completion.complete_stages(mock_ctx, mock_param, "train@b")
     assert result == ["train@bert_swe"]
 
 
 def test_complete_stages_case_sensitive(
-    mock_ctx: click.Context, mock_param: click.Parameter, mocker: MockerFixture
+    tmp_path: Path,
+    mock_ctx: click.Context,
+    mock_param: click.Parameter,
+    mocker: MockerFixture,
 ) -> None:
     """Completion is case-sensitive."""
-    mocker.patch.object(completion, "_get_stages_fast", return_value=["Train", "train", "TRAIN"])
+    yaml_content = """
+stages:
+  Train:
+    python: stages.Train
+  train:
+    python: stages.train
+  TRAIN:
+    python: stages.TRAIN
+"""
+    (tmp_path / "pivot.yaml").write_text(yaml_content)
+    (tmp_path / ".git").mkdir()
+    mocker.patch.object(completion, "_find_project_root_fast", return_value=tmp_path)
 
     result = completion.complete_stages(mock_ctx, mock_param, "tr")
     assert result == ["train"]
@@ -333,20 +360,46 @@ def test_complete_stages_case_sensitive(
 
 
 def test_complete_targets_includes_stage_names(
-    mock_ctx: click.Context, mock_param: click.Parameter, mocker: MockerFixture
+    tmp_path: Path,
+    mock_ctx: click.Context,
+    mock_param: click.Parameter,
+    mocker: MockerFixture,
 ) -> None:
     """Target completion includes stage names."""
-    mocker.patch.object(completion, "_get_stages_fast", return_value=["train", "test"])
+    yaml_content = """
+stages:
+  train:
+    python: stages.train
+  test:
+    python: stages.test
+"""
+    (tmp_path / "pivot.yaml").write_text(yaml_content)
+    (tmp_path / ".git").mkdir()
+    mocker.patch.object(completion, "_find_project_root_fast", return_value=tmp_path)
 
     result = completion.complete_targets(mock_ctx, mock_param, "tr")
     assert "train" in result
 
 
 def test_complete_targets_filters_by_prefix(
-    mock_ctx: click.Context, mock_param: click.Parameter, mocker: MockerFixture
+    tmp_path: Path,
+    mock_ctx: click.Context,
+    mock_param: click.Parameter,
+    mocker: MockerFixture,
 ) -> None:
     """Filters targets by incomplete prefix."""
-    mocker.patch.object(completion, "_get_stages_fast", return_value=["train", "test", "deploy"])
+    yaml_content = """
+stages:
+  train:
+    python: stages.train
+  test:
+    python: stages.test
+  deploy:
+    python: stages.deploy
+"""
+    (tmp_path / "pivot.yaml").write_text(yaml_content)
+    (tmp_path / ".git").mkdir()
+    mocker.patch.object(completion, "_find_project_root_fast", return_value=tmp_path)
 
     result = completion.complete_targets(mock_ctx, mock_param, "t")
     assert set(result) == {"train", "test"}

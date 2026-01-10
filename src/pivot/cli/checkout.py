@@ -4,9 +4,10 @@ import pathlib
 
 import click
 
-from pivot import cache, config, lock, project, pvt, registry
+from pivot import config, project, registry
 from pivot.cli import completion
 from pivot.cli import decorators as cli_decorators
+from pivot.storage import cache, lock, track
 from pivot.types import OutputHash
 
 
@@ -29,7 +30,7 @@ def _get_stage_output_info(project_root: pathlib.Path) -> dict[str, OutputHash]:
 
 
 def _checkout_all_tracked(
-    tracked_files: dict[str, pvt.PvtData],
+    tracked_files: dict[str, track.PvtData],
     cache_dir: pathlib.Path,
     checkout_modes: list[cache.CheckoutMode],
     force: bool,
@@ -57,7 +58,7 @@ def _checkout_all_outputs(
 
 def _checkout_target(
     target: str,
-    tracked_files: dict[str, pvt.PvtData],
+    tracked_files: dict[str, track.PvtData],
     stage_outputs: dict[str, OutputHash],
     cache_dir: pathlib.Path,
     checkout_modes: list[cache.CheckoutMode],
@@ -65,7 +66,7 @@ def _checkout_target(
 ) -> None:
     """Restore a specific target."""
     # Validate path doesn't escape project
-    if pvt.has_path_traversal(target):
+    if track.has_path_traversal(target):
         raise click.ClickException(f"Path traversal not allowed: {target}")
 
     # Use normalized path (preserve symlinks) to match keys in tracked_files/stage_outputs
@@ -97,7 +98,7 @@ def _checkout_target(
     )
 
 
-def _pvt_to_output_hash(pvt_data: pvt.PvtData) -> OutputHash:
+def _pvt_to_output_hash(pvt_data: track.PvtData) -> OutputHash:
     """Convert PvtData to OutputHash format."""
     manifest = pvt_data.get("manifest")
     if manifest is not None:
@@ -152,7 +153,7 @@ def checkout(targets: tuple[str, ...], checkout_mode: str | None, force: bool) -
     checkout_modes = [cache.CheckoutMode(m) for m in mode_strings]
 
     # Discover tracked files
-    tracked_files = pvt.discover_pvt_files(project_root)
+    tracked_files = track.discover_pvt_files(project_root)
 
     # Get stage output info from lock files
     stage_outputs = _get_stage_output_info(project_root)

@@ -12,8 +12,8 @@ import dulwich.repo
 from pivot import project
 
 if TYPE_CHECKING:
-    import pathlib
     from collections.abc import Sequence
+    from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -23,10 +23,10 @@ class _RepoContext(NamedTuple):
 
     repo: dulwich.repo.Repo
     commit: dulwich.objects.Commit
-    proj_prefix: pathlib.Path | None
+    proj_prefix: Path | None
 
 
-def _find_git_root(start: pathlib.Path) -> pathlib.Path | None:
+def _find_git_root(start: Path) -> Path | None:
     """Walk up to find .git directory."""
     for parent in [start, *start.parents]:
         if (parent / ".git").exists():
@@ -34,7 +34,7 @@ def _find_git_root(start: pathlib.Path) -> pathlib.Path | None:
     return None
 
 
-def _open_repo() -> tuple[dulwich.repo.Repo, pathlib.Path, pathlib.Path] | None:
+def _open_repo() -> tuple[dulwich.repo.Repo, Path, Path] | None:
     """Open git repo and return (repo, git_root, proj_root) or None."""
     proj_root = project.get_project_root()
     git_root = _find_git_root(proj_root)
@@ -52,7 +52,7 @@ def _open_repo() -> tuple[dulwich.repo.Repo, pathlib.Path, pathlib.Path] | None:
     return repo, git_root, proj_root
 
 
-def _get_proj_prefix(git_root: pathlib.Path, proj_root: pathlib.Path) -> pathlib.Path | None:
+def _get_proj_prefix(git_root: Path, proj_root: Path) -> Path | None:
     """Calculate project prefix relative to git root."""
     if proj_root == git_root:
         return None
@@ -62,7 +62,7 @@ def _get_proj_prefix(git_root: pathlib.Path, proj_root: pathlib.Path) -> pathlib
         return None
 
 
-def _resolve_path(proj_prefix: pathlib.Path | None, rel_path: str) -> str:
+def _resolve_path(proj_prefix: Path | None, rel_path: str) -> str:
     """Resolve relative path accounting for project prefix."""
     return str(proj_prefix / rel_path) if proj_prefix else rel_path
 
@@ -70,7 +70,7 @@ def _resolve_path(proj_prefix: pathlib.Path | None, rel_path: str) -> str:
 def _read_blob(
     repo: dulwich.repo.Repo,
     commit: dulwich.objects.Commit,
-    proj_prefix: pathlib.Path | None,
+    proj_prefix: Path | None,
     rel_path: str,
 ) -> bytes | None:
     """Read a single blob from commit."""

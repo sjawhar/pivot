@@ -3,7 +3,9 @@ import pathlib
 import click.testing
 import pytest
 
-from pivot import cli, project, pvt
+from pivot import cli, project, stage
+from pivot.registry import REGISTRY
+from pivot.storage import track
 
 
 @pytest.fixture
@@ -45,7 +47,7 @@ def test_track_file_creates_pvt_and_caches(
         assert pvt_file.exists(), ".pvt file should be created"
 
         # Read and verify .pvt content
-        pvt_data = pvt.read_pvt_file(pvt_file)
+        pvt_data = track.read_pvt_file(pvt_file)
         assert pvt_data is not None
         assert pvt_data["path"] == "data.csv"
         assert pvt_data["hash"], "Hash should be set"
@@ -111,7 +113,7 @@ def test_track_directory_with_manifest(
         assert pvt_file.exists(), ".pvt file should be created for directory"
 
         # Read and verify .pvt content
-        pvt_data = pvt.read_pvt_file(pvt_file)
+        pvt_data = track.read_pvt_file(pvt_file)
         assert pvt_data is not None
         assert pvt_data["path"] == "images"
         assert pvt_data["hash"], "Tree hash should be set"
@@ -191,8 +193,6 @@ def test_track_file_in_stage_output_dir_raises_error(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
     """Tracking file within stage output directory raises error."""
-    from pivot import stage
-    from pivot.registry import REGISTRY
 
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
@@ -223,8 +223,6 @@ def test_track_stage_output_raises_error(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
     """Tracking a path that is a stage output raises error."""
-    from pivot import stage
-    from pivot.registry import REGISTRY
 
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
@@ -266,7 +264,7 @@ def test_track_update_existing_with_force(
         # First track
         result1 = runner.invoke(cli.cli, ["track", "data.csv"])
         assert result1.exit_code == 0
-        pvt_data1 = pvt.read_pvt_file(pathlib.Path("data.csv.pvt"))
+        pvt_data1 = track.read_pvt_file(pathlib.Path("data.csv.pvt"))
         assert pvt_data1 is not None
         original_hash = pvt_data1["hash"]
 
@@ -277,7 +275,7 @@ def test_track_update_existing_with_force(
         result2 = runner.invoke(cli.cli, ["track", "--force", "data.csv"])
         assert result2.exit_code == 0
 
-        pvt_data2 = pvt.read_pvt_file(pathlib.Path("data.csv.pvt"))
+        pvt_data2 = track.read_pvt_file(pathlib.Path("data.csv.pvt"))
         assert pvt_data2 is not None
         assert pvt_data2["hash"] != original_hash, "Hash should be updated"
 
@@ -326,8 +324,6 @@ def test_track_symlink_to_stage_output_file_rejected(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
     """Tracking symlink that points to stage output file is rejected."""
-    from pivot import stage
-    from pivot.registry import REGISTRY
 
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
@@ -362,8 +358,6 @@ def test_track_symlink_to_stage_output_directory_rejected(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
     """Tracking symlink that points to stage output directory is rejected."""
-    from pivot import stage
-    from pivot.registry import REGISTRY
 
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
@@ -395,8 +389,6 @@ def test_track_file_inside_symlinked_stage_output_rejected(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
     """Tracking file inside symlinked directory that's a stage output is rejected."""
-    from pivot import stage
-    from pivot.registry import REGISTRY
 
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
@@ -449,8 +441,6 @@ def test_track_symlink_aliasing_same_file_different_paths(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
     """Tracking same file via different symlink paths detects aliasing."""
-    from pivot import stage
-    from pivot.registry import REGISTRY
 
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
@@ -481,8 +471,6 @@ def test_track_parent_directory_with_symlinked_stage_output(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
     """Tracking parent directory when child is symlinked stage output is rejected."""
-    from pivot import stage
-    from pivot.registry import REGISTRY
 
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
@@ -516,8 +504,6 @@ def test_track_with_normalized_vs_resolved_paths(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
     """Error messages show both normalized and resolved paths for debugging."""
-    from pivot import stage
-    from pivot.registry import REGISTRY
 
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()

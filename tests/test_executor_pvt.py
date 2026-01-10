@@ -4,13 +4,8 @@ import click.testing
 import pytest
 
 import pivot
-from pivot import cli, exceptions, executor, project, pvt, registry
-
-
-@pytest.fixture(autouse=True)
-def clean_registry() -> None:
-    """Reset registry before each test."""
-    registry.REGISTRY.clear()
+from pivot import cli, exceptions, executor, project
+from pivot.storage import track
 
 
 @pytest.fixture
@@ -18,7 +13,7 @@ def pipeline_dir(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> pat
     """Set up a temporary pipeline directory."""
     (tmp_path / ".pivot").mkdir()
     monkeypatch.chdir(tmp_path)
-    project._project_root_cache = None
+    monkeypatch.setattr(project, "_project_root_cache", None)
     return tmp_path
 
 
@@ -39,7 +34,7 @@ def test_run_succeeds_with_existing_tracked_file(pipeline_dir: pathlib.Path) -> 
     data_file = pipeline_dir / "data.csv"
     data_file.write_text("col1,col2\n1,2\n")
 
-    pvt.write_pvt_file(
+    track.write_pvt_file(
         pipeline_dir / "data.csv.pvt",
         {"path": "data.csv", "hash": "placeholder", "size": 100},
     )
@@ -58,7 +53,7 @@ def test_run_succeeds_with_existing_tracked_file(pipeline_dir: pathlib.Path) -> 
 def test_run_fails_when_tracked_file_missing(pipeline_dir: pathlib.Path) -> None:
     """Pipeline fails if tracked file is missing (with helpful error message)."""
     # Create .pvt file but NOT the data file
-    pvt.write_pvt_file(
+    track.write_pvt_file(
         pipeline_dir / "data.csv.pvt",
         {"path": "data.csv", "hash": "abc123", "size": 100},
     )
@@ -202,7 +197,7 @@ def test_tracked_directory_change_triggers_rerun(
 
 def test_run_fails_when_tracked_directory_missing(pipeline_dir: pathlib.Path) -> None:
     """Pipeline fails if tracked directory is missing (with helpful error message)."""
-    pvt.write_pvt_file(
+    track.write_pvt_file(
         pipeline_dir / "images.pvt",
         {
             "path": "images",

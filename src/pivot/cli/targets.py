@@ -8,7 +8,7 @@ import click
 from pivot import outputs, project, registry
 
 if TYPE_CHECKING:
-    import pathlib
+    from pathlib import Path
 
     from pivot.show import plots as plots_mod
 
@@ -47,7 +47,7 @@ def validate_targets(targets: tuple[str, ...]) -> list[str]:
 
 def _classify_targets(
     targets: list[str],
-    proj_root: pathlib.Path,
+    proj_root: Path,
 ) -> list[ResolvedTarget]:
     """Classify each target as stage, file, both, or neither."""
     registered_stages = set(registry.REGISTRY.list_stages())
@@ -78,7 +78,7 @@ def _classify_targets(
 
 def resolve_output_paths(
     targets: list[str],
-    proj_root: pathlib.Path,
+    proj_root: Path,
     output_type: type[outputs.Metric] | type[outputs.Plot],
 ) -> tuple[set[str], list[str]]:
     """Resolve targets to output file paths.
@@ -105,7 +105,7 @@ def resolve_output_paths(
 
 def resolve_plot_infos(
     targets: list[str],
-    proj_root: pathlib.Path,
+    proj_root: Path,
 ) -> tuple[list[plots_mod.PlotInfo], list[str]]:
     """Resolve targets to PlotInfo entries with full metadata.
 
@@ -158,7 +158,7 @@ def _format_unknown_targets_error(missing: list[str]) -> str:
 
 def resolve_and_validate(
     targets: tuple[str, ...],
-    proj_root: pathlib.Path,
+    proj_root: Path,
     output_type: type[outputs.Metric] | type[outputs.Plot],
 ) -> set[str] | None:
     """Validate targets and resolve to output paths.

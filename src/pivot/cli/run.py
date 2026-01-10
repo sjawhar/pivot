@@ -82,7 +82,8 @@ def _run_with_tui(
     """Run pipeline with TUI display."""
     import multiprocessing as mp
 
-    from pivot import dag, project, run_tui
+    from pivot import dag, project
+    from pivot.tui import run as run_tui
     from pivot.types import TuiMessage
 
     # Get execution order for stage names
@@ -248,7 +249,7 @@ def run(
     display_mode = DisplayMode(display) if display else None
 
     # Normal execution (with optional explain mode)
-    from pivot import run_tui
+    from pivot.tui import run as run_tui
 
     use_tui = run_tui.should_use_tui(display_mode) and not explain
     if use_tui:
@@ -310,7 +311,7 @@ def explain_cmd(
     stages: tuple[str, ...], single_stage: bool, cache_dir: pathlib.Path | None
 ) -> None:
     """Show detailed breakdown of why stages would run."""
-    from pivot import console
+    from pivot.tui import console
 
     ensure_stages_registered()
     stages_list = list(stages) if stages else None

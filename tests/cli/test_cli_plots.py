@@ -7,7 +7,8 @@ import subprocess
 import click.testing
 import pytest
 
-from pivot import cli, lock, outputs, registry
+from pivot import cli, outputs, registry
+from pivot.storage import lock
 from pivot.types import LockData
 
 

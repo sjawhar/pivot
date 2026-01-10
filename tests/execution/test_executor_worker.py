@@ -10,8 +10,9 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from pivot import cache, exceptions, executor, lock, outputs
+from pivot import exceptions, executor, outputs
 from pivot.executor import worker
+from pivot.storage import cache, lock
 
 if TYPE_CHECKING:
     from collections.abc import Generator

@@ -7,7 +7,7 @@ import click.testing
 from pivot import cli, project
 
 if TYPE_CHECKING:
-    import pytest
+    from pytest import MonkeyPatch
 
     from conftest import GitRepo
 
@@ -21,7 +21,7 @@ def test_get_help() -> None:
     """Shows help message."""
     runner = click.testing.CliRunner()
 
-    result = runner.invoke(cli.cli, ["get", "--help"])
+    result = runner.invoke(cli.cli, ["data", "get", "--help"])
 
     assert result.exit_code == 0
     assert "Retrieve files or stage outputs" in result.output
@@ -33,7 +33,7 @@ def test_get_help() -> None:
 # =============================================================================
 
 
-def test_get_requires_rev(git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_get_requires_rev(git_repo: GitRepo, monkeypatch: MonkeyPatch) -> None:
     """Requires --rev option."""
     repo_path, commit = git_repo
     (repo_path / "file.txt").write_text("content")
@@ -44,13 +44,13 @@ def test_get_requires_rev(git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch) ->
 
     runner = click.testing.CliRunner()
 
-    result = runner.invoke(cli.cli, ["get", "file.txt"])
+    result = runner.invoke(cli.cli, ["data", "get", "file.txt"])
 
     assert result.exit_code != 0
     assert "Missing option" in result.output or "--rev" in result.output
 
 
-def test_get_requires_targets(git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_get_requires_targets(git_repo: GitRepo, monkeypatch: MonkeyPatch) -> None:
     """Requires at least one target."""
     repo_path, commit = git_repo
     (repo_path / "file.txt").write_text("content")
@@ -61,7 +61,7 @@ def test_get_requires_targets(git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
 
     runner = click.testing.CliRunner()
 
-    result = runner.invoke(cli.cli, ["get", "--rev", "HEAD"])
+    result = runner.invoke(cli.cli, ["data", "get", "--rev", "HEAD"])
 
     assert result.exit_code != 0
     assert "Missing argument" in result.output or "TARGETS" in result.output
@@ -72,7 +72,7 @@ def test_get_requires_targets(git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
 # =============================================================================
 
 
-def test_get_git_tracked_file(git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_get_git_tracked_file(git_repo: GitRepo, monkeypatch: MonkeyPatch) -> None:
     """Gets a git-tracked file from revision."""
     repo_path, commit = git_repo
     (repo_path / "file.txt").write_text("original content")
@@ -90,7 +90,7 @@ def test_get_git_tracked_file(git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
 
     result = runner.invoke(
         cli.cli,
-        ["get", "--rev", sha[:7], "file.txt", "-o", str(repo_path / "restored.txt")],
+        ["data", "get", "--rev", sha[:7], "file.txt", "-o", str(repo_path / "restored.txt")],
     )
 
     assert result.exit_code == 0, result.output
@@ -98,9 +98,7 @@ def test_get_git_tracked_file(git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
     assert (repo_path / "restored.txt").read_text() == "original content"
 
 
-def test_get_git_tracked_file_with_force(
-    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_get_git_tracked_file_with_force(git_repo: GitRepo, monkeypatch: MonkeyPatch) -> None:
     """Overwrites existing file with --force."""
     repo_path, commit = git_repo
     (repo_path / "file.txt").write_text("original")
@@ -118,7 +116,7 @@ def test_get_git_tracked_file_with_force(
 
     result = runner.invoke(
         cli.cli,
-        ["get", "--rev", sha[:7], "file.txt", "-o", str(output_path), "--force"],
+        ["data", "get", "--rev", sha[:7], "file.txt", "-o", str(output_path), "--force"],
     )
 
     assert result.exit_code == 0, result.output
@@ -126,9 +124,7 @@ def test_get_git_tracked_file_with_force(
     assert output_path.read_text() == "original"
 
 
-def test_get_skip_existing_without_force(
-    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_get_skip_existing_without_force(git_repo: GitRepo, monkeypatch: MonkeyPatch) -> None:
     """Skips existing files without --force."""
     repo_path, commit = git_repo
     (repo_path / "file.txt").write_text("original")
@@ -146,7 +142,7 @@ def test_get_skip_existing_without_force(
 
     result = runner.invoke(
         cli.cli,
-        ["get", "--rev", sha[:7], "file.txt", "-o", str(output_path)],
+        ["data", "get", "--rev", sha[:7], "file.txt", "-o", str(output_path)],
     )
 
     assert result.exit_code == 0, result.output
@@ -159,7 +155,7 @@ def test_get_skip_existing_without_force(
 # =============================================================================
 
 
-def test_get_invalid_revision(git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_get_invalid_revision(git_repo: GitRepo, monkeypatch: MonkeyPatch) -> None:
     """Errors on invalid revision."""
     repo_path, commit = git_repo
     (repo_path / "file.txt").write_text("content")
@@ -172,14 +168,14 @@ def test_get_invalid_revision(git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
 
     result = runner.invoke(
         cli.cli,
-        ["get", "--rev", "invalid-revision", "file.txt"],
+        ["data", "get", "--rev", "invalid-revision", "file.txt"],
     )
 
     assert result.exit_code != 0
     assert "RevisionNotFoundError" in result.output or "Cannot resolve" in result.output
 
 
-def test_get_target_not_found(git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_get_target_not_found(git_repo: GitRepo, monkeypatch: MonkeyPatch) -> None:
     """Errors when target not found at revision."""
     repo_path, commit = git_repo
     (repo_path / "file.txt").write_text("content")
@@ -192,7 +188,7 @@ def test_get_target_not_found(git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
 
     result = runner.invoke(
         cli.cli,
-        ["get", "--rev", sha[:7], "nonexistent.txt"],
+        ["data", "get", "--rev", sha[:7], "nonexistent.txt"],
     )
 
     assert result.exit_code != 0

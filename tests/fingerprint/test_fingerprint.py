@@ -340,11 +340,11 @@ def test_fingerprint_builtin_function_skipped():
 
 
 @pytest.mark.parametrize(
-    "x,y",
+    ("x", "y"),
     [
-        (10, 20),
-        (0, 0),
-        (-5, 10),
+        pytest.param(10, 20, id="positive"),
+        pytest.param(0, 0, id="zero"),
+        pytest.param(-5, 10, id="negative"),
     ],
 )
 def test_fingerprint_with_default_args(x, y):
@@ -478,22 +478,19 @@ def test_hash_complex_ast():
 
 
 @pytest.mark.parametrize(
-    "obj,expected",
+    ("obj", "expected"),
     [
-        # Builtins
-        (len, False),
-        (print, False),
-        (sum, False),
-        (int, False),
-        (str, False),
-        (list, False),
-        (None, False),
-        # Stdlib
-        (os.path.join, False),
-        (sys, False),
-        # Third-party
-        (nx, False),
-        (pytest.fixture, False),
+        pytest.param(len, False, id="builtin_len"),
+        pytest.param(print, False, id="builtin_print"),
+        pytest.param(sum, False, id="builtin_sum"),
+        pytest.param(int, False, id="builtin_int"),
+        pytest.param(str, False, id="builtin_str"),
+        pytest.param(list, False, id="builtin_list"),
+        pytest.param(None, False, id="none"),
+        pytest.param(os.path.join, False, id="stdlib_os_path"),
+        pytest.param(sys, False, id="stdlib_sys"),
+        pytest.param(nx, False, id="thirdparty_networkx"),
+        pytest.param(pytest.fixture, False, id="thirdparty_pytest"),
     ],
 )
 def test_is_user_code_non_user(obj, expected):
@@ -713,6 +710,107 @@ def test_fingerprint_nonlocal_callable_function():
     # Should have both the inner function and the helper it references
     assert "self:inner" in fp
     assert "func:helper_func" in fp
+
+
+# --- Nonlocals with collection types containing callables ---
+# Note: Collection processing scans for callable user code, not raw contents
+
+
+def _collection_helper_a(x):
+    """Helper function for collection tests."""
+    return x * 2
+
+
+def _collection_helper_b(x):
+    """Second helper function for collection tests."""
+    return x + 1
+
+
+def test_fingerprint_nonlocal_list_with_callable():
+    """Should capture callable functions within nonlocal list."""
+
+    def outer():
+        transforms = [_collection_helper_a, _collection_helper_b]
+
+        def inner(x):
+            for t in transforms:
+                x = t(x)
+            return x
+
+        return inner
+
+    inner_func = outer()
+    fp = fingerprint.get_stage_fingerprint(inner_func)
+
+    assert "self:inner" in fp
+    # Callables in list are captured with index-based keys
+    assert "func:transforms[0]" in fp
+    assert "func:transforms[1]" in fp
+
+
+def test_fingerprint_nonlocal_dict_with_callable():
+    """Should capture callable functions within nonlocal dict."""
+
+    def outer():
+        handlers = {
+            "double": _collection_helper_a,
+            "increment": _collection_helper_b,
+        }
+
+        def inner(x, op):
+            return handlers[op](x)
+
+        return inner
+
+    inner_func = outer()
+    fp = fingerprint.get_stage_fingerprint(inner_func)
+
+    assert "self:inner" in fp
+    # Dict values are captured with key-based names
+    assert "func:handlers['double']" in fp
+    assert "func:handlers['increment']" in fp
+
+
+def test_fingerprint_nonlocal_tuple_with_callable():
+    """Should capture callable functions within nonlocal tuple."""
+
+    def outer():
+        pipeline = (_collection_helper_a, _collection_helper_b)
+
+        def inner(x):
+            for t in pipeline:
+                x = t(x)
+            return x
+
+        return inner
+
+    inner_func = outer()
+    fp = fingerprint.get_stage_fingerprint(inner_func)
+
+    assert "self:inner" in fp
+    assert "func:pipeline[0]" in fp
+    assert "func:pipeline[1]" in fp
+
+
+def test_fingerprint_nonlocal_collection_callable_change_detected():
+    """Changing callable in collection should change fingerprint."""
+
+    def make_func(transform):
+        transforms = [transform]
+
+        def inner(x):
+            return transforms[0](x)
+
+        return inner
+
+    func1 = make_func(_collection_helper_a)
+    func2 = make_func(_collection_helper_b)
+
+    fp1 = fingerprint.get_stage_fingerprint(func1)
+    fp2 = fingerprint.get_stage_fingerprint(func2)
+
+    # The hash of the callable should differ
+    assert fp1["func:transforms[0]"] != fp2["func:transforms[0]"]
 
 
 def test_hash_function_no_code_object():

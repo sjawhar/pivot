@@ -3,8 +3,9 @@ import pathlib
 import click.testing
 import pytest
 
-from pivot import cli, executor, project, pvt, stage
+from pivot import cli, executor, project, stage
 from pivot.registry import REGISTRY
+from pivot.storage import track
 
 
 @pytest.fixture
@@ -222,12 +223,12 @@ def test_checkout_missing_from_cache_errors(
         project._project_root_cache = None
 
         # Create .pvt file manually without caching the data
-        pvt_data: pvt.PvtData = {
+        pvt_data: track.PvtData = {
             "path": "data.csv",
             "hash": "nonexistent_hash",
             "size": 100,
         }
-        pvt.write_pvt_file(pathlib.Path("data.csv.pvt"), pvt_data)
+        track.write_pvt_file(pathlib.Path("data.csv.pvt"), pvt_data)
 
         result = runner.invoke(cli.cli, ["checkout", "data.csv"])
 
