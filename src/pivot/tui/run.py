@@ -5,7 +5,7 @@ import dataclasses
 import logging
 import queue
 import threading
-from typing import TYPE_CHECKING, Any, ClassVar, Protocol, override
+from typing import TYPE_CHECKING, Any, ClassVar, final, override
 
 import textual.app
 import textual.binding
@@ -28,6 +28,7 @@ from pivot.types import (
 if TYPE_CHECKING:
     import multiprocessing as mp
     from collections.abc import Callable
+    from typing import Protocol
 
     from pivot import executor
 
@@ -487,6 +488,7 @@ def should_use_tui(display_mode: DisplayMode | None) -> bool:
     return sys.stdout.isatty()
 
 
+@final
 class WatchTuiApp(_BaseTuiApp):
     """TUI for watch mode pipeline execution."""
 
@@ -500,7 +502,7 @@ class WatchTuiApp(_BaseTuiApp):
         self._engine_thread: threading.Thread | None = None
 
     async def on_mount(self) -> None:  # pragma: no cover
-        self.title = "[●] Watching for changes..."  # pyright: ignore[reportUnannotatedClassAttribute]
+        self.title = "[●] Watching for changes..."
         self._start_queue_reader()
         self._engine_thread = threading.Thread(target=self._run_engine, daemon=True)
         self._engine_thread.start()

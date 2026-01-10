@@ -12,7 +12,7 @@ COMMAND_CATEGORIES = {
     "Inspection": ["list", "metrics", "params", "plots", "data", "history", "show"],
     "Versioning": ["track", "checkout"],
     "Remote": ["remote", "push", "pull"],
-    "Other": ["init", "export", "config", "completion"],
+    "Other": ["init", "export", "config", "completion", "schema"],
 }
 
 # Lazy command registry: command_name -> (module_path, attr_name, help_text)
@@ -40,6 +40,7 @@ _LAZY_COMMANDS: dict[str, tuple[str, str, str]] = {
     "config": ("pivot.cli.config", "config_cmd", "View and modify Pivot configuration."),
     "history": ("pivot.cli.history", "history", "List recent pipeline runs."),
     "show": ("pivot.cli.history", "show_cmd", "Show details of a specific run."),
+    "schema": ("pivot.cli.schema", "schema", "Output JSON Schema for pivot.yaml configuration."),
 }
 
 
