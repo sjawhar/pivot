@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import io
 import multiprocessing as mp
 import os
@@ -13,6 +14,8 @@ from pivot import cache, exceptions, executor, lock, outputs
 from pivot.executor import worker
 
 if TYPE_CHECKING:
+    from collections.abc import Generator
+
     from pivot.executor import WorkerStageInfo
     from pivot.types import DirManifestEntry, OutputMessage
 
@@ -1331,4 +1334,148 @@ def test_deps_list_change_same_fingerprint_detected_by_hash(
     )
     assert result2["status"] == "ran", (
         "Deps list change should trigger re-run even with same fingerprint"
+    )
+
+
+# =============================================================================
+# TOCTOU Prevention Tests
+# =============================================================================
+
+
+def test_skip_acquires_execution_lock(
+    worker_env: pathlib.Path, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Skipped stages still acquire execution lock (TOCTOU prevention).
+
+    This ensures output restoration happens inside the lock, preventing race
+    conditions between parallel processes.
+    """
+    (tmp_path / "input.txt").write_text("data")
+
+    def stage_func() -> None:
+        (tmp_path / "output.txt").write_text("result")
+
+    out = outputs.Out(str(tmp_path / "output.txt"))
+    stage_info: WorkerStageInfo = {
+        "func": stage_func,
+        "fingerprint": {"self:stage_func": "fp123"},
+        "deps": ["input.txt"],
+        "signature": None,
+        "outs": [out],
+        "params": None,
+        "variant": None,
+        "overrides": {},
+        "cwd": None,
+        "checkout_modes": ["hardlink", "symlink", "copy"],
+    }
+
+    # First run - creates lock file and output
+    result1 = executor.execute_stage(
+        "test_stage",
+        stage_info,
+        worker_env,
+        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
+    )
+    assert result1["status"] == "ran"
+
+    # Track if execution lock was acquired during second (skip) run
+    lock_acquired = False
+    original_execution_lock = lock.execution_lock
+
+    @contextlib.contextmanager
+    def tracking_execution_lock(
+        stage_name: str, cache_dir: pathlib.Path
+    ) -> Generator[pathlib.Path]:
+        nonlocal lock_acquired
+        lock_acquired = True
+        with original_execution_lock(stage_name, cache_dir) as sentinel:
+            yield sentinel
+
+    monkeypatch.setattr(lock, "execution_lock", tracking_execution_lock)
+
+    # Second run - should skip but still acquire lock
+    result2 = executor.execute_stage(
+        "test_stage",
+        stage_info,
+        worker_env,
+        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
+    )
+
+    assert result2["status"] == "skipped"
+    assert lock_acquired, "Execution lock should be acquired even when skipping (TOCTOU prevention)"
+
+
+def test_restore_happens_inside_lock(
+    worker_env: pathlib.Path, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Output restoration occurs while execution lock is held.
+
+    Verifies the fix for TOCTOU race condition where output could be modified
+    between skip decision and restoration.
+    """
+    (tmp_path / "input.txt").write_text("data")
+    output_path = tmp_path / "output.txt"
+
+    def stage_func() -> None:
+        output_path.write_text("result")
+
+    out = outputs.Out(str(output_path))
+    stage_info: WorkerStageInfo = {
+        "func": stage_func,
+        "fingerprint": {"self:stage_func": "fp123"},
+        "deps": ["input.txt"],
+        "signature": None,
+        "outs": [out],
+        "params": None,
+        "variant": None,
+        "overrides": {},
+        "cwd": None,
+        "checkout_modes": ["copy"],  # Use copy mode for simpler testing
+    }
+
+    # First run - creates lock file and caches output
+    result1 = executor.execute_stage(
+        "test_stage",
+        stage_info,
+        worker_env,
+        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
+    )
+    assert result1["status"] == "ran"
+
+    # Delete output to force restoration
+    output_path.unlink()
+
+    # Track order of operations
+    operations: list[str] = []
+    original_execution_lock = lock.execution_lock
+    original_restore = worker._restore_outputs_from_cache
+
+    @contextlib.contextmanager
+    def tracking_lock(stage_name: str, cache_dir: pathlib.Path) -> Generator[pathlib.Path]:
+        operations.append("lock_acquire")
+        with original_execution_lock(stage_name, cache_dir) as sentinel:
+            yield sentinel
+        operations.append("lock_release")
+
+    def tracking_restore(*args: object, **kwargs: object) -> bool:
+        operations.append("restore")
+        return original_restore(*args, **kwargs)  # pyright: ignore[reportArgumentType]
+
+    monkeypatch.setattr(lock, "execution_lock", tracking_lock)
+    monkeypatch.setattr(worker, "_restore_outputs_from_cache", tracking_restore)
+
+    # Second run - should restore output
+    result2 = executor.execute_stage(
+        "test_stage",
+        stage_info,
+        worker_env,
+        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
+    )
+
+    assert result2["status"] == "skipped"
+    assert output_path.exists(), "Output should be restored"
+
+    # Verify restore happened between lock acquire and release
+    assert operations == ["lock_acquire", "restore", "lock_release"], (
+        f"Restore should happen inside lock. Got: {operations}"
     )
