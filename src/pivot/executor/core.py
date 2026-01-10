@@ -4,6 +4,7 @@ import collections
 import concurrent.futures
 import contextlib
 import dataclasses
+import datetime
 import logging
 import multiprocessing as mp
 import os
@@ -24,6 +25,7 @@ from pivot import (
     parameters,
     project,
     registry,
+    run_history,
 )
 from pivot.executor import worker
 from pivot.storage import cache, lock, track
@@ -145,6 +147,11 @@ def run(
     if not execution_order:
         return {}
 
+    # Record start time and generate run_id for run history
+    started_at = datetime.datetime.now(datetime.UTC).isoformat()
+    run_id = run_history.generate_run_id()
+    targeted_stages = stages if stages else list(graph.nodes())
+
     # Load parameter overrides early to validate and prepare for workers
     overrides = parameters.load_params_yaml()
 
@@ -187,9 +194,24 @@ def run(
         explain_mode=explain_mode,
         checkout_modes=checkout_modes,
         tui_queue=tui_queue,
+        run_id=run_id,
     )
 
     results = _build_results(stage_states)
+
+    # Write run history
+    ended_at = datetime.datetime.now(datetime.UTC).isoformat()
+    retention = config.get_run_history_retention()
+    _write_run_history(
+        run_id=run_id,
+        stage_states=stage_states,
+        cache_dir=cache_dir,
+        targeted_stages=targeted_stages,
+        execution_order=execution_order,
+        started_at=started_at,
+        ended_at=ended_at,
+        retention=retention,
+    )
 
     if con:
         status_counts = collections.Counter(r["status"] for r in results.values())
@@ -301,6 +323,7 @@ def _execute_greedy(
     explain_mode: bool = False,
     checkout_modes: list[str] | None = None,
     tui_queue: mp.Queue[TuiMessage] | None = None,
+    run_id: str = "",
 ) -> None:
     """Execute stages with greedy parallel scheduling using loky ProcessPoolExecutor."""
     overrides = overrides or {}
@@ -342,6 +365,7 @@ def _execute_greedy(
                 explain_mode=explain_mode,
                 checkout_modes=checkout_modes,
                 tui_queue=tui_queue,
+                run_id=run_id,
             )
 
             while futures:
@@ -493,6 +517,7 @@ def _execute_greedy(
                         explain_mode=explain_mode,
                         checkout_modes=checkout_modes,
                         tui_queue=tui_queue,
+                        run_id=run_id,
                     )
     finally:
         # Signal output thread to stop - may fail if queue is broken
@@ -549,6 +574,7 @@ def _start_ready_stages(
     explain_mode: bool = False,
     checkout_modes: list[str] | None = None,
     tui_queue: mp.Queue[TuiMessage] | None = None,
+    run_id: str = "",
 ) -> None:
     """Find and start stages that are ready to execute."""
     checkout_modes = checkout_modes or config.DEFAULT_CHECKOUT_MODE_ORDER
@@ -590,7 +616,7 @@ def _start_ready_stages(
         for mutex in state.mutex:
             mutex_counts[mutex] += 1
 
-        worker_info = _prepare_worker_info(state.info, overrides, checkout_modes)
+        worker_info = _prepare_worker_info(state.info, overrides, checkout_modes, run_id)
 
         try:
             future = executor.submit(
@@ -640,6 +666,7 @@ def _prepare_worker_info(
     stage_info: registry.RegistryStageInfo,
     overrides: parameters.ParamsOverrides,
     checkout_modes: list[str],
+    run_id: str,
 ) -> worker.WorkerStageInfo:
     """Prepare stage info for pickling to worker process."""
     return worker.WorkerStageInfo(
@@ -653,6 +680,7 @@ def _prepare_worker_info(
         overrides=overrides,
         cwd=stage_info["cwd"],
         checkout_modes=checkout_modes,
+        run_id=run_id,
     )
 
 
@@ -767,3 +795,53 @@ def _check_uncached_incremental_outputs(
                     uncached.append((stage_name, out.path))
 
     return uncached
+
+
+def _write_run_history(
+    run_id: str,
+    stage_states: dict[str, StageState],
+    cache_dir: pathlib.Path,
+    targeted_stages: list[str],
+    execution_order: list[str],
+    started_at: str,
+    ended_at: str,
+    retention: int,
+) -> None:
+    """Build and write run manifest to StateDB."""
+
+    stages_records = dict[str, run_history.StageRunRecord]()
+    for name, state in stage_states.items():
+        stage_lock = lock.StageLock(name, cache_dir)
+        lock_data = stage_lock.read()
+
+        if lock_data:
+            stage_info = registry.REGISTRY.get(name)
+            out_paths = [out.path for out in stage_info["outs"]]
+            input_hash = run_history.compute_input_hash_from_lock(lock_data, out_paths)
+        else:
+            input_hash = "<no-lock>"
+
+        duration_ms = int((state.get_duration() or 0) * 1000)
+        status = state.result["status"] if state.result else StageStatus.UNKNOWN
+        reason = state.result["reason"] if state.result else ""
+
+        stages_records[name] = run_history.StageRunRecord(
+            input_hash=input_hash,
+            status=status,
+            reason=reason,
+            duration_ms=duration_ms,
+        )
+
+    manifest = run_history.RunManifest(
+        run_id=run_id,
+        started_at=started_at,
+        ended_at=ended_at,
+        targeted_stages=targeted_stages,
+        execution_order=execution_order,
+        stages=stages_records,
+    )
+
+    state_db_path = project.get_project_root() / ".pivot" / "state.db"
+    with state_mod.StateDB(state_db_path) as state_db:
+        state_db.write_run(manifest)
+        state_db.prune_runs(retention)

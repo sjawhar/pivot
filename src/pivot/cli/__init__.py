@@ -9,7 +9,7 @@ import click
 # Command categories for organized help output
 COMMAND_CATEGORIES = {
     "Pipeline": ["run", "explain", "status"],
-    "Inspection": ["list", "metrics", "params", "plots", "data"],
+    "Inspection": ["list", "metrics", "params", "plots", "data", "history", "show"],
     "Versioning": ["track", "checkout"],
     "Remote": ["remote", "push", "pull"],
     "Other": ["init", "export", "config", "completion"],
@@ -38,6 +38,8 @@ _LAZY_COMMANDS: dict[str, tuple[str, str, str]] = {
     "data": ("pivot.cli.data", "data", "Inspect and compare data files."),
     "completion": ("pivot.cli.completion", "completion_cmd", "Generate shell completion script."),
     "config": ("pivot.cli.config", "config_cmd", "View and modify Pivot configuration."),
+    "history": ("pivot.cli.history", "history", "List recent pipeline runs."),
+    "show": ("pivot.cli.history", "show_cmd", "Show details of a specific run."),
 }
 
 

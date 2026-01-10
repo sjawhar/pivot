@@ -6,6 +6,7 @@ from pivot.config.io import get_config_value as get_config_value
 from pivot.config.io import get_global_config_path as get_global_config_path
 from pivot.config.io import get_local_config_path as get_local_config_path
 from pivot.config.io import get_merged_config as get_merged_config
+from pivot.config.io import get_run_history_retention as get_run_history_retention
 from pivot.config.io import load_config_file as load_config_file
 from pivot.config.io import set_config_value as set_config_value
 from pivot.config.io import unset_config_value as unset_config_value
