@@ -167,6 +167,12 @@ def _print_results(results: dict[str, ExecutionSummary]) -> None:
 )
 @click.option("--debounce", type=int, default=300, help="Debounce delay in milliseconds")
 @click.option(
+    "--reactive",
+    "-r",
+    is_flag=True,
+    help="Reactive mode: continuously watch and re-run affected stages on changes",
+)
+@click.option(
     "--display",
     type=click.Choice(["tui", "plain"]),
     default=None,
@@ -182,6 +188,7 @@ def run(
     explain: bool,
     watch: str | None,
     debounce: int,
+    reactive: bool,
     display: str | None,
 ) -> None:
     """Execute pipeline stages.
@@ -218,6 +225,23 @@ def run(
             watch_globs=watch_globs,
             debounce_ms=debounce,
         )
+        return
+
+    if reactive:
+        from pivot import reactive as reactive_module
+
+        engine = reactive_module.ReactiveEngine(
+            stages=stages_list,
+            single_stage=single_stage,
+            cache_dir=cache_dir,
+            debounce_ms=debounce,
+        )
+
+        try:
+            engine.run(tui_queue=None)  # TUI integration will be added later
+        except KeyboardInterrupt:
+            engine.shutdown()
+            click.echo("\nReactive mode stopped.")
         return
 
     # Determine display mode

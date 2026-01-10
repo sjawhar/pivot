@@ -353,6 +353,34 @@ class StageRegistry:
         """Clear all registered stages (for testing)."""
         self._stages.clear()
 
+    def snapshot(self) -> dict[str, RegistryStageInfo]:
+        """Create a snapshot of current registry state for backup/restore.
+
+        Returns a shallow copy of the internal stages dict. Use with `restore()`
+        to implement atomic reload patterns where you want to preserve the previous
+        valid state if the reload fails.
+
+        Example:
+            backup = REGISTRY.snapshot()
+            REGISTRY.clear()
+            try:
+                reload_stages()
+            except Exception:
+                REGISTRY.restore(backup)  # Rollback on failure
+        """
+        return dict(self._stages)
+
+    def restore(self, snapshot: dict[str, RegistryStageInfo]) -> None:
+        """Restore registry state from a previous snapshot.
+
+        Replaces all current stages with the snapshot contents. Typically used
+        to rollback after a failed reload operation.
+
+        Args:
+            snapshot: Previously captured state from `snapshot()`
+        """
+        self._stages = dict(snapshot)
+
     def get_all_output_paths(self) -> set[str]:
         """Get all registered output paths (for watch mode filtering)."""
         result = set[str]()
