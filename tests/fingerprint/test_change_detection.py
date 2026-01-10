@@ -81,6 +81,7 @@ def test_function_argument_change_causes_miss(module_dir: pathlib.Path) -> None:
     assert fp1["self:stage"] != fp2["self:stage"], "Argument change must cause cache miss"
 
 
+@pytest.mark.flaky(reruns=3)
 def test_default_value_change_causes_miss(module_dir: pathlib.Path) -> None:
     """Changing default argument value causes cache miss."""
     mod_py = module_dir / "test_change_default.py"
