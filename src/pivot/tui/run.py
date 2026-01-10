@@ -358,7 +358,7 @@ class RunTuiApp(textual.app.App[dict[str, executor.ExecutionSummary] | None]):
                 self._handle_log(msg)
             case TuiMessageType.STATUS:
                 self._handle_status(msg)
-            case "reactive":
+            case TuiMessageType.REACTIVE:
                 pass  # Reactive messages handled separately in reactive mode
 
     def _handle_log(self, msg: TuiLogMessage) -> None:  # pragma: no cover
