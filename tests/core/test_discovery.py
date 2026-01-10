@@ -204,6 +204,20 @@ raise RuntimeError("intentional error")
         discovery.discover_and_register(project_root)
 
 
+def test_discover_pipeline_py_sys_exit_raises(project_root: Path) -> None:
+    """discover_and_register raises DiscoveryError when pipeline.py calls sys.exit()."""
+    pipeline_py = project_root / "pipeline.py"
+    pipeline_py.write_text(
+        """\
+import sys
+sys.exit(1)
+"""
+    )
+
+    with pytest.raises(discovery.DiscoveryError, match="sys.exit"):
+        discovery.discover_and_register(project_root)
+
+
 # =============================================================================
 # Helper Function Tests
 # =============================================================================

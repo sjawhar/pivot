@@ -11,13 +11,13 @@ import numpy
 import pandas
 import tabulate
 
-from pivot import git, outputs, project, yaml_config
+from pivot import outputs, project
+from pivot.show import common
 from pivot.storage import cache
 from pivot.types import (
     ChangeType,
     DataDiffResult,
     DataFileFormat,
-    OutEntry,
     OutputFormat,
     RowChange,
     SchemaChange,
@@ -559,35 +559,15 @@ def get_data_hashes_from_head() -> dict[str, str | None]:
                     result[rel_path] = None
 
     # Read all lock files from HEAD in one batch
-    lock_paths = [f".pivot/cache/stages/{name}.lock" for name in stage_data_paths]
-    lock_contents = git.read_files_from_head(lock_paths)
+    lock_data_map = common.read_lock_files_from_head(list(stage_data_paths.keys()))
 
-    # Parse lock files and extract hashes
+    # Extract hashes from lock files
     for stage_name, data_paths in stage_data_paths.items():
-        lock_path = f".pivot/cache/stages/{stage_name}.lock"
-        content = lock_contents.get(lock_path)
-        if content is None:
+        lock_data = lock_data_map.get(stage_name)
+        if lock_data is None:
             continue
 
-        try:
-            import yaml
-
-            data: object = yaml.load(content, Loader=yaml_config.Loader)
-        except Exception:
-            continue
-
-        if not isinstance(data, dict) or "outs" not in data:
-            continue
-
-        outs_raw = cast("dict[str, Any]", data)["outs"]
-        if not isinstance(outs_raw, list):
-            continue
-        outs_list = cast("list[OutEntry]", outs_raw)
-
-        path_to_hash = dict[str, str | None]()
-        for out in outs_list:
-            if "path" in out:
-                path_to_hash[out["path"]] = out["hash"]
+        path_to_hash = common.extract_output_hashes_from_lock(lock_data)
 
         for data_rel_path in data_paths:
             if data_rel_path in path_to_hash:

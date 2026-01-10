@@ -166,7 +166,12 @@ def _print_results(results: dict[str, ExecutionSummary]) -> None:
     metavar="GLOBS",
     help="Watch for file changes and re-run. Optionally specify comma-separated glob patterns.",
 )
-@click.option("--debounce", type=int, default=300, help="Debounce delay in milliseconds")
+@click.option(
+    "--debounce",
+    type=click.IntRange(min=0),
+    default=300,
+    help="Debounce delay in milliseconds",
+)
 @click.option(
     "--reactive",
     "-r",

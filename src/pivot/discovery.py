@@ -70,6 +70,8 @@ def discover_and_register(project_root: Path | None = None) -> str | None:
         try:
             _import_pipeline_module(pipeline_path)
             return str(pipeline_path)
+        except SystemExit as e:
+            raise DiscoveryError(f"Pipeline {pipeline_path} called sys.exit({e.code})") from e
         except Exception as e:
             raise DiscoveryError(f"Failed to load {pipeline_path}: {e}") from e
 

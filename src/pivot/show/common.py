@@ -44,6 +44,7 @@ def read_lock_files_from_head(
             result[stage_name] = None
             continue
 
+        # YAML parse result is dict[Unknown, Unknown]; cast through object to StorageLockData
         result[stage_name] = cast("StorageLockData", cast("object", data))
 
     return result

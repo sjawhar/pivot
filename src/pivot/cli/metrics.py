@@ -22,7 +22,9 @@ def metrics() -> None:
 )
 @click.option("--md", "output_format", flag_value=OutputFormat.MD, help="Output as Markdown table")
 @click.option("-R", "--recursive", is_flag=True, help="Search directories recursively")
-@click.option("--precision", default=5, type=int, help="Decimal precision for floats")
+@click.option(
+    "--precision", default=5, type=click.IntRange(min=0), help="Decimal precision for floats"
+)
 @cli_decorators.with_error_handling
 def metrics_show(
     targets: tuple[str, ...],
@@ -58,7 +60,9 @@ def metrics_show(
 @click.option("--md", "output_format", flag_value=OutputFormat.MD, help="Output as Markdown table")
 @click.option("-R", "--recursive", is_flag=True, help="Search directories recursively")
 @click.option("--no-path", is_flag=True, help="Hide path column")
-@click.option("--precision", default=5, type=int, help="Decimal precision for floats")
+@click.option(
+    "--precision", default=5, type=click.IntRange(min=0), help="Decimal precision for floats"
+)
 @cli_decorators.with_error_handling
 def metrics_diff(
     targets: tuple[str, ...],
