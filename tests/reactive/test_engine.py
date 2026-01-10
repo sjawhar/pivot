@@ -9,7 +9,7 @@ from unittest import mock
 import pytest
 import watchfiles
 
-from pivot import project
+from pivot import project, types
 from pivot.pipeline import yaml as pipeline_yaml
 from pivot.reactive import engine
 from pivot.registry import REGISTRY, stage
@@ -1024,8 +1024,8 @@ def test_send_message_to_tui_queue(pipeline_dir: pathlib.Path) -> None:
 
     assert not tui_queue.empty(), "Message should be in queue"
     msg = tui_queue.get_nowait()
-    assert msg["type"] == "reactive"
-    assert msg["status"] == "waiting"
+    assert msg["type"] == types.TuiMessageType.REACTIVE
+    assert msg["status"] == types.ReactiveStatus.WAITING
     assert msg["message"] == "Test message"
 
 
@@ -1040,7 +1040,7 @@ def test_send_message_error_to_tui_queue(pipeline_dir: pathlib.Path) -> None:
     eng._send_message("Error occurred", is_error=True)
 
     msg = tui_queue.get_nowait()
-    assert msg["status"] == "error"
+    assert msg["status"] == types.ReactiveStatus.ERROR
     assert msg["message"] == "Error occurred"
 
 
@@ -1133,29 +1133,29 @@ def test_reload_registry_logs_when_no_modules_found(
     assert "No stage modules found to reload" in caplog.text
 
 
-def test_reload_registry_reloads_stage_modules(
+def test_reload_registry_clears_and_reimports_modules(
     pipeline_dir: pathlib.Path,
 ) -> None:
-    """_reload_registry should reload modules that define stages."""
+    """_reload_registry should clear project modules and reimport them."""
 
-    # We can't easily test actual module reload in unit tests
-    # but we can verify the method runs without error when stages exist
     @stage(deps=[], outs=["output.txt"])
     def test_stage() -> None:
         pass
 
     eng = engine.ReactiveEngine()
 
-    # Store initial stage count
     initial_stages = list(REGISTRY.list_stages())
     assert "test_stage" in initial_stages
 
-    # Mock importlib.reload to avoid actually reloading the test module
-    with mock.patch("importlib.reload") as mock_reload:
+    # Mock _clear_project_modules to verify it's called (for decorator path)
+    with (
+        mock.patch.object(engine, "_clear_project_modules", return_value=0) as mock_clear,
+        mock.patch("importlib.import_module"),
+    ):
         eng._reload_registry()
 
-    # reload should have been called
-    assert mock_reload.called
+    # clear_project_modules should have been called
+    assert mock_clear.called, "Should clear project modules before reload"
 
 
 def test_is_existing_dir_returns_false_for_nonexistent(
@@ -1194,10 +1194,10 @@ def test_is_existing_dir_handles_os_error(
         assert engine._is_existing_dir(test_path) is False
 
 
-def test_reload_registry_handles_reload_exception(
+def test_reload_registry_handles_import_exception(
     pipeline_dir: pathlib.Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """_reload_registry should return False and preserve registry when reload fails."""
+    """_reload_registry should return False and preserve registry when import fails."""
 
     @stage(deps=[], outs=["output.txt"])
     def reload_test_stage() -> None:
@@ -1205,12 +1205,12 @@ def test_reload_registry_handles_reload_exception(
 
     eng = engine.ReactiveEngine()
 
-    # Mock importlib.reload to raise an exception
-    with mock.patch("importlib.reload", side_effect=ImportError("Module not found")):
+    # Mock import_module to raise an exception (for decorator path)
+    with mock.patch("importlib.import_module", side_effect=ImportError("Module not found")):
         result = eng._reload_registry()
 
-    assert result is False, "Should return False on reload failure"
-    assert "Failed to reload module" in caplog.text
+    assert result is False, "Should return False on import failure"
+    assert "Failed to import module" in caplog.text
     # Verify registry was restored
     assert "reload_test_stage" in REGISTRY.list_stages(), "Registry should be preserved"
     # Verify errors are tracked
@@ -1379,12 +1379,14 @@ def test_reload_registry_falls_back_to_decorators(
 
     eng = engine.ReactiveEngine()
 
-    # Mock importlib.reload to verify decorator path is used
-    with mock.patch("importlib.reload") as mock_reload:
+    # Mock import_module to verify decorator path is used
+    with mock.patch("importlib.import_module") as mock_import:
         result = eng._reload_registry()
 
     assert result is True
-    assert mock_reload.called, "Should have called importlib.reload for decorator-based stages"
+    assert mock_import.called, (
+        "Should have called importlib.import_module for decorator-based stages"
+    )
 
 
 def test_reload_registry_pivot_yaml_error_preserves_old_registry(
@@ -1641,7 +1643,7 @@ def test_coordinator_loop_sends_error_on_reload_failure(pipeline_dir: pathlib.Pa
         mock.patch.object(eng, "_send_message", side_effect=capture_message),
         mock.patch.object(eng, "_invalidate_caches"),
         mock.patch.object(eng, "_restart_worker_pool"),
-        mock.patch("importlib.reload", side_effect=SyntaxError("invalid syntax")),
+        mock.patch("importlib.import_module", side_effect=SyntaxError("invalid syntax")),
     ):
         eng._coordinator_loop()
 

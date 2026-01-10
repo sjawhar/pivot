@@ -325,6 +325,15 @@ class TuiMessageType(enum.StrEnum):
     REACTIVE = "reactive"
 
 
+class ReactiveStatus(enum.StrEnum):
+    """Status of the reactive engine."""
+
+    WAITING = "waiting"
+    RESTARTING = "restarting"
+    DETECTING = "detecting"
+    ERROR = "error"
+
+
 class TuiLogMessage(TypedDict):
     """Log line from worker process for TUI display."""
 
@@ -350,7 +359,7 @@ class TuiReactiveMessage(TypedDict):
     """Reactive engine status update for TUI display."""
 
     type: Literal[TuiMessageType.REACTIVE]
-    status: Literal["waiting", "restarting", "detecting", "error"]
+    status: ReactiveStatus
     message: str
 
 
