@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import contextlib
-import enum
 import errno
 import json
 import logging
@@ -16,6 +15,7 @@ from typing import TYPE_CHECKING
 import xxhash
 
 from pivot import exceptions
+from pivot.config import CheckoutMode as CheckoutMode
 from pivot.types import DirHash, DirManifestEntry, FileHash, OutputHash
 
 logger = logging.getLogger(__name__)
@@ -60,14 +60,6 @@ def atomic_write_file(
         if not fd_closed:
             with contextlib.suppress(OSError):
                 os.close(fd)
-
-
-class CheckoutMode(enum.StrEnum):
-    """Strategy for checking out workspace files from cache."""
-
-    SYMLINK = "symlink"
-    HARDLINK = "hardlink"
-    COPY = "copy"
 
 
 def hash_file(path: pathlib.Path, state_db: state_mod.StateDB | None = None) -> str:

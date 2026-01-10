@@ -11,37 +11,6 @@ def remote() -> None:
     """Manage remote storage for cache synchronization."""
 
 
-@remote.command("add")
-@click.argument("name")
-@click.argument("url")
-@click.option("--default", "-d", is_flag=True, help="Set as default remote")
-@cli_decorators.with_error_handling
-def remote_add(name: str, url: str, default: bool) -> None:
-    """Add a remote storage location.
-
-    URL must be in format s3://bucket/prefix
-    """
-    from pivot import remote_config
-
-    remote_config.add_remote(name, url)
-    click.echo(f"Added remote '{name}': {url}")
-
-    if default:
-        remote_config.set_default_remote(name)
-        click.echo(f"Set '{name}' as default remote")
-
-
-@remote.command("remove")
-@click.argument("name")
-@cli_decorators.with_error_handling
-def remote_remove(name: str) -> None:
-    """Remove a remote storage location."""
-    from pivot import remote_config
-
-    remote_config.remove_remote(name)
-    click.echo(f"Removed remote '{name}'")
-
-
 @remote.command("list")
 @cli_decorators.with_error_handling
 def remote_list() -> None:
@@ -53,23 +22,12 @@ def remote_list() -> None:
 
     if not remotes:
         click.echo("No remotes configured.")
-        click.echo("Use 'pivot remote add <name> <url>' to add one.")
+        click.echo("Use 'pivot config set remotes.<name> <url>' to add one.")
         return
 
     for name, url in remotes.items():
         marker = " (default)" if name == default else ""
         click.echo(f"  {name}: {url}{marker}")
-
-
-@remote.command("default")
-@click.argument("name")
-@cli_decorators.with_error_handling
-def remote_default(name: str) -> None:
-    """Set the default remote."""
-    from pivot import remote_config
-
-    remote_config.set_default_remote(name)
-    click.echo(f"Set '{name}' as default remote")
 
 
 @cli_decorators.pivot_command()

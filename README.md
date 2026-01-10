@@ -284,7 +284,8 @@ def append_to_database():
 
 ```bash
 # Add a remote
-pivot remote add origin s3://my-bucket/pivot-cache
+pivot config set remotes.origin s3://my-bucket/pivot-cache
+pivot config set default_remote origin
 
 # Push cached outputs to remote
 pivot push
