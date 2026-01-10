@@ -83,6 +83,7 @@ nav:
     - Overview: architecture/overview.md
     - Code Fingerprinting: architecture/fingerprinting.md
     - Execution Model: architecture/execution.md
+    - Reactive Engine: architecture/reactive.md
   - Comparison: comparison.md
   - Contributing: contributing.md
 

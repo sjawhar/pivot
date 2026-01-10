@@ -18,6 +18,7 @@ from pivot.types import (
     StageStatus,
     TuiLogMessage,
     TuiMessage,
+    TuiReactiveMessage,
     TuiStatusMessage,
 )
 
@@ -64,9 +65,9 @@ class StageInfo:
 class TuiUpdate(textual.message.Message):
     """Custom message for executor updates."""
 
-    msg: TuiLogMessage | TuiStatusMessage
+    msg: TuiLogMessage | TuiStatusMessage | TuiReactiveMessage
 
-    def __init__(self, msg: TuiLogMessage | TuiStatusMessage) -> None:
+    def __init__(self, msg: TuiLogMessage | TuiStatusMessage | TuiReactiveMessage) -> None:
         self.msg = msg
         super().__init__()
 
@@ -351,10 +352,13 @@ class RunTuiApp(textual.app.App[dict[str, executor.ExecutionSummary] | None]):
     def on_tui_update(self, event: TuiUpdate) -> None:  # pragma: no cover
         """Handle executor updates in Textual's event loop."""
         msg = event.msg
-        if msg["type"] == "log":
-            self._handle_log(msg)
-        elif msg["type"] == "status":
-            self._handle_status(msg)
+        match msg["type"]:
+            case "log":
+                self._handle_log(msg)
+            case "status":
+                self._handle_status(msg)
+            case "reactive":
+                pass  # Reactive messages handled separately in reactive mode
 
     def _handle_log(self, msg: TuiLogMessage) -> None:  # pragma: no cover
         stage = msg["stage"]

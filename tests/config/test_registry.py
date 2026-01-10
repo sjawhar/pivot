@@ -794,3 +794,130 @@ def test_stage_func_name_with_at_sign_rejected() -> None:
         @stage(name="bad@stage", deps=["x"], outs=["y"])
         def normal_func() -> None:
             pass
+
+
+# --- Snapshot/Restore Tests ---
+
+
+def test_registry_snapshot_returns_copy() -> None:
+    """snapshot() should return a shallow copy of stages dict."""
+    reg = StageRegistry()
+    reg._stages["test"] = RegistryStageInfo(
+        name="test",
+        func=lambda: None,
+        deps=[],
+        outs=[],
+        outs_paths=[],
+        params=None,
+        mutex=[],
+        variant=None,
+        signature=None,
+        fingerprint={},
+        cwd=None,
+    )
+
+    snapshot = reg.snapshot()
+
+    assert snapshot == reg._stages
+    assert snapshot is not reg._stages, "snapshot should be a copy, not the same object"
+
+
+def test_registry_snapshot_empty() -> None:
+    """snapshot() should work on empty registry."""
+    reg = StageRegistry()
+
+    snapshot = reg.snapshot()
+
+    assert snapshot == {}
+
+
+def test_registry_restore_replaces_stages() -> None:
+    """restore() should replace all stages with snapshot contents."""
+    reg = StageRegistry()
+    reg._stages["current"] = RegistryStageInfo(
+        name="current",
+        func=lambda: None,
+        deps=[],
+        outs=[],
+        outs_paths=[],
+        params=None,
+        mutex=[],
+        variant=None,
+        signature=None,
+        fingerprint={},
+        cwd=None,
+    )
+
+    backup = RegistryStageInfo(
+        name="backup",
+        func=lambda: 42,
+        deps=["/tmp/dep"],
+        outs=[],
+        outs_paths=[],
+        params=None,
+        mutex=[],
+        variant=None,
+        signature=None,
+        fingerprint={},
+        cwd=None,
+    )
+    snapshot = {"backup": backup}
+
+    reg.restore(snapshot)
+
+    assert reg.list_stages() == ["backup"]
+    assert reg.get("backup")["deps"] == ["/tmp/dep"]
+
+
+def test_registry_restore_empty_snapshot() -> None:
+    """restore() with empty snapshot should clear registry."""
+    reg = StageRegistry()
+    reg._stages["test"] = RegistryStageInfo(
+        name="test",
+        func=lambda: None,
+        deps=[],
+        outs=[],
+        outs_paths=[],
+        params=None,
+        mutex=[],
+        variant=None,
+        signature=None,
+        fingerprint={},
+        cwd=None,
+    )
+
+    reg.restore({})
+
+    assert reg.list_stages() == []
+
+
+def test_registry_snapshot_restore_roundtrip() -> None:
+    """snapshot() followed by restore() should preserve state."""
+    reg = StageRegistry()
+    original_info = RegistryStageInfo(
+        name="original",
+        func=lambda: 42,
+        deps=["/tmp/a", "/tmp/b"],
+        outs=[],
+        outs_paths=[],
+        params=None,
+        mutex=["gpu"],
+        variant="v1",
+        signature=None,
+        fingerprint={"self:original": "abc123"},
+        cwd=None,
+    )
+    reg._stages["original"] = original_info
+
+    snapshot = reg.snapshot()
+    reg.clear()
+    assert reg.list_stages() == []
+
+    reg.restore(snapshot)
+
+    assert reg.list_stages() == ["original"]
+    restored = reg.get("original")
+    assert restored["deps"] == ["/tmp/a", "/tmp/b"]
+    assert restored["mutex"] == ["gpu"]
+    assert restored["variant"] == "v1"
+    assert restored["fingerprint"] == {"self:original": "abc123"}

@@ -10,6 +10,38 @@
 - Uses **ProcessPoolExecutor** for true parallel execution (not threads - GIL would serialize CPU work).
 - TDD: write tests BEFORE implementation; 90%+ code coverage required.
 
+## Stage Registration Patterns (Critical)
+
+**Pivot supports three ways to define pipelines. All three must be considered when working on registry/discovery code:**
+
+1. **`pivot.yaml`** - Configuration file with `stages:` section. Most common for teams.
+   ```yaml
+   stages:
+     train:
+       python: stages.train:run
+       deps: [data/train.csv]
+       outs: [models/model.pkl]
+   ```
+
+2. **`pipeline.py`** - Python script using `@stage` decorators or `Pipeline` class. Executed via `runpy.run_path()`.
+   ```python
+   # Using decorators
+   from pivot.registry import stage
+   @stage(deps=['x'], outs=['y'])
+   def process(): ...
+
+   # Or using Pipeline class
+   from pivot import Pipeline
+   pipeline = Pipeline()
+   pipeline.add_stage(process, deps=['x'], outs=['y'])
+   ```
+
+3. **`@stage` decorators in importable modules** - Registered when modules are imported.
+
+**Auto-discovery order:** `pivot.yaml` → `pivot.yml` → `pipeline.py` → decorator modules
+
+When implementing features that reload or manipulate the registry (like reactive mode), all three patterns must be handled.
+
 ## Stage Function Requirements (Critical)
 
 Stage functions must be **pure, serializable functions** for multiprocessing:

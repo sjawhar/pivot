@@ -319,4 +319,12 @@ class TuiStatusMessage(TypedDict):
     elapsed: float | None
 
 
-TuiMessage = TuiLogMessage | TuiStatusMessage | None
+class TuiReactiveMessage(TypedDict):
+    """Reactive engine status update for TUI display."""
+
+    type: Literal["reactive"]
+    status: Literal["waiting", "restarting", "detecting", "error"]
+    message: str
+
+
+TuiMessage = TuiLogMessage | TuiStatusMessage | TuiReactiveMessage | None
