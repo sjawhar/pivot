@@ -7,6 +7,7 @@ import click
 
 from pivot import discovery, exceptions, project, registry
 from pivot import status as status_mod
+from pivot.cli import completion
 from pivot.types import (
     PipelineStatusInfo,
     RemoteSyncInfo,
@@ -35,7 +36,7 @@ def _validate_stages(stages_list: list[str] | None) -> None:
 
 
 @click.command()
-@click.argument("stages", nargs=-1)
+@click.argument("stages", nargs=-1, shell_complete=completion.complete_stages)
 @click.option("--verbose", "-v", is_flag=True, help="Show all stages, not just stale")
 @click.option("--json", "output_json", is_flag=True, help="Output as JSON")
 @click.option("--stages-only", is_flag=True, help="Show only pipeline status")

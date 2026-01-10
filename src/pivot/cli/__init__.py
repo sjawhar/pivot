@@ -12,7 +12,7 @@ COMMAND_CATEGORIES = {
     "Inspection": ["list", "metrics", "params", "plots", "data"],
     "Versioning": ["get", "track", "checkout"],
     "Remote": ["remote", "push", "pull"],
-    "Other": ["export", "config"],
+    "Other": ["export", "config", "completion"],
 }
 
 
@@ -85,6 +85,7 @@ def cli(ctx: click.Context, verbose: bool) -> None:
 
 # Import and register commands - must be after cli definition to avoid circular imports
 from pivot.cli import checkout as checkout_mod  # noqa: E402
+from pivot.cli import completion as completion_mod  # noqa: E402
 from pivot.cli import data as data_mod  # noqa: E402
 from pivot.cli import export as export_mod  # noqa: E402
 from pivot.cli import get as get_mod  # noqa: E402
@@ -112,6 +113,7 @@ cli.add_command(remote_mod.remote)
 cli.add_command(remote_mod.push)
 cli.add_command(remote_mod.pull)
 cli.add_command(data_mod.data)
+cli.add_command(completion_mod.completion_cmd, name="completion")
 
 
 def main() -> None:

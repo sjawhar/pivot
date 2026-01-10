@@ -5,11 +5,12 @@ import pathlib
 import click
 
 from pivot import cache, config, get, project
+from pivot.cli import completion
 from pivot.cli import decorators as cli_decorators
 
 
 @cli_decorators.pivot_command("get")
-@click.argument("targets", nargs=-1, required=True)
+@click.argument("targets", nargs=-1, required=True, shell_complete=completion.complete_targets)
 @click.option(
     "--rev",
     "-r",

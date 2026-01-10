@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 import click
 
 from pivot import discovery, exceptions, executor, registry
+from pivot.cli import completion
 from pivot.cli import decorators as cli_decorators
 from pivot.types import DisplayMode, StageExplanation, StageStatus
 
@@ -143,7 +144,7 @@ def _print_results(results: dict[str, ExecutionSummary]) -> None:
 
 
 @cli_decorators.pivot_command()
-@click.argument("stages", nargs=-1)
+@click.argument("stages", nargs=-1, shell_complete=completion.complete_stages)
 @click.option(
     "--single-stage",
     "-s",
@@ -243,7 +244,7 @@ def run(
 
 
 @cli_decorators.pivot_command("dry-run")
-@click.argument("stages", nargs=-1)
+@click.argument("stages", nargs=-1, shell_complete=completion.complete_stages)
 @click.option(
     "--single-stage",
     "-s",
@@ -273,7 +274,7 @@ def dry_run_cmd(
 
 
 @cli_decorators.pivot_command("explain")
-@click.argument("stages", nargs=-1)
+@click.argument("stages", nargs=-1, shell_complete=completion.complete_stages)
 @click.option(
     "--single-stage",
     "-s",

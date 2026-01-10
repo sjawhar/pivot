@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 import click
 
 from pivot import exceptions
+from pivot.cli import completion
 from pivot.cli import decorators as cli_decorators
 from pivot.show import params as params_mod
 
@@ -18,7 +19,7 @@ def params() -> None:
 
 
 @params.command("show")
-@click.argument("stages", nargs=-1)
+@click.argument("stages", nargs=-1, shell_complete=completion.complete_stages)
 @click.option("--json", "output_format", flag_value="json", default=None, help="Output as JSON")
 @click.option("--md", "output_format", flag_value="md", help="Output as Markdown table")
 @click.option(
@@ -48,7 +49,7 @@ def params_show(
 
 
 @params.command("diff")
-@click.argument("stages", nargs=-1)
+@click.argument("stages", nargs=-1, shell_complete=completion.complete_stages)
 @click.option("--json", "output_format", flag_value="json", default=None, help="Output as JSON")
 @click.option("--md", "output_format", flag_value="md", help="Output as Markdown table")
 @click.option(
