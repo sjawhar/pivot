@@ -254,89 +254,70 @@ class ReactiveEngine:
 
         return self._reload_from_decorators(old_stages)
 
-    def _reload_from_pipeline_file(
-        self, pipeline_file: pathlib.Path, old_stages: dict[str, RegistryStageInfo]
+    def _reload_stage_modules(self, old_stages: dict[str, RegistryStageInfo]) -> None:
+        """Reload stage modules so functions have fresh code. Logs warnings on failure."""
+        for module_name in _collect_stage_modules(old_stages):
+            if module_name in sys.modules:
+                try:
+                    importlib.reload(sys.modules[module_name])
+                    logger.debug(f"Reloaded module: {module_name}")
+                except Exception as e:
+                    logger.warning(f"Failed to reload module {module_name}: {e}")
+
+    def _reload_with_registration(
+        self,
+        old_stages: dict[str, RegistryStageInfo],
+        register_fn: Callable[[], object],
+        source_name: str,
     ) -> bool:
-        """Reload registry from pivot.yaml file."""
-        # Clear the registry
+        """Reload registry using provided registration function."""
         registry.REGISTRY.clear()
-
         try:
-            # Reload stage modules first so functions have fresh code
-            stage_modules = _collect_stage_modules(old_stages)
-            for module_name in stage_modules:
-                if module_name in sys.modules:
-                    try:
-                        importlib.reload(sys.modules[module_name])
-                        logger.debug(f"Reloaded module: {module_name}")
-                    except Exception as e:
-                        logger.warning(f"Failed to reload module {module_name}: {e}")
-
-            # Re-register stages from pipeline file
-            pipeline_yaml.register_from_pipeline_file(pipeline_file)
-
+            self._reload_stage_modules(old_stages)
+            register_fn()
             self._pipeline_errors = None
             new_stages = list(registry.REGISTRY.list_stages())
-            logger.info(
-                f"Registry reloaded from {pipeline_file.name} with {len(new_stages)} stages"
-            )
+            logger.info(f"Registry reloaded from {source_name} with {len(new_stages)} stages")
             return True
-
         except Exception as e:
             registry.REGISTRY.restore(old_stages)
             self._pipeline_errors = [str(e)]
             logger.warning(f"Pipeline invalid: {e}")
             return False
+
+    def _reload_from_pipeline_file(
+        self, pipeline_file: pathlib.Path, old_stages: dict[str, RegistryStageInfo]
+    ) -> bool:
+        """Reload registry from pivot.yaml file."""
+        return self._reload_with_registration(
+            old_stages,
+            lambda: pipeline_yaml.register_from_pipeline_file(pipeline_file),
+            pipeline_file.name,
+        )
 
     def _reload_from_pipeline_py(
         self, pipeline_py: pathlib.Path, old_stages: dict[str, RegistryStageInfo]
     ) -> bool:
         """Reload registry from pipeline.py file."""
-        # Clear the registry
-        registry.REGISTRY.clear()
-
-        try:
-            # Reload stage modules first so functions have fresh code
-            stage_modules = _collect_stage_modules(old_stages)
-            for module_name in stage_modules:
-                if module_name in sys.modules:
-                    try:
-                        importlib.reload(sys.modules[module_name])
-                        logger.debug(f"Reloaded module: {module_name}")
-                    except Exception as e:
-                        logger.warning(f"Failed to reload module {module_name}: {e}")
-
-            # Re-run pipeline.py to re-register stages
-            runpy.run_path(str(pipeline_py), run_name="_pivot_pipeline")
-
-            self._pipeline_errors = None
-            new_stages = list(registry.REGISTRY.list_stages())
-            logger.info(f"Registry reloaded from pipeline.py with {len(new_stages)} stages")
-            return True
-
-        except Exception as e:
-            registry.REGISTRY.restore(old_stages)
-            self._pipeline_errors = [str(e)]
-            logger.warning(f"Pipeline invalid: {e}")
-            return False
+        return self._reload_with_registration(
+            old_stages,
+            lambda: runpy.run_path(str(pipeline_py), run_name="_pivot_pipeline"),
+            "pipeline.py",
+        )
 
     def _reload_from_decorators(self, old_stages: dict[str, RegistryStageInfo]) -> bool:
         """Reload registry by reimporting modules with @stage decorators."""
         stage_modules = _collect_stage_modules(old_stages)
-
         if not stage_modules:
             logger.warning("No stage modules found to reload")
             return True
 
-        # Clear the registry
         registry.REGISTRY.clear()
 
-        # Re-import each module (this re-runs @stage decorators)
-        errors: list[str] = []
+        errors = list[str]()
         for module_name in stage_modules:
             try:
-                module = sys.modules[module_name]
-                importlib.reload(module)
+                importlib.reload(sys.modules[module_name])
                 logger.debug(f"Reloaded module: {module_name}")
             except Exception as e:
                 errors.append(f"{module_name}: {e}")
@@ -348,7 +329,6 @@ class ReactiveEngine:
             logger.warning(f"Pipeline invalid, keeping previous registry ({len(errors)} error(s))")
             return False
 
-        # Success - clear any previous errors
         self._pipeline_errors = None
         new_stages = list(registry.REGISTRY.list_stages())
         logger.info(f"Registry reloaded with {len(new_stages)} stages: {new_stages}")
@@ -453,12 +433,12 @@ class ReactiveEngine:
     def _send_message(self, message: str, *, is_error: bool = False) -> None:
         """Send message to TUI or log."""
         if self._tui_queue is not None:
-            from pivot.types import TuiReactiveMessage
+            from pivot.types import TuiMessageType, TuiReactiveMessage
 
             with contextlib.suppress(queue.Full):
                 self._tui_queue.put_nowait(
                     TuiReactiveMessage(
-                        type="reactive",
+                        type=TuiMessageType.REACTIVE,
                         status="error" if is_error else "waiting",
                         message=message,
                     )
