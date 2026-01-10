@@ -1,10 +1,13 @@
 import ast
 import dataclasses
+import functools
 import inspect
+import json
 import marshal
 import pathlib
 import sys
 import types
+import typing
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, cast
 
@@ -55,7 +58,13 @@ def get_stage_fingerprint(
         if name.startswith("__"):
             continue
 
-        if callable(value) and is_user_code(value):
+        # functools.partial fails is_user_code() (module is functools/stdlib)
+        # Must check before general callable check
+        if isinstance(value, functools.partial):
+            _process_partial_dependency(
+                name, cast("functools.partial[Any]", value), manifest, visited
+            )
+        elif callable(value) and is_user_code(value):
             _process_callable_dependency(name, value, manifest, visited)
         elif isinstance(value, types.ModuleType):
             _process_module_dependency(name, value, func, manifest, visited)
@@ -75,7 +84,12 @@ def get_stage_fingerprint(
             _process_instance_dependency(name, value, manifest, visited)
 
     for name, value in closure_vars.nonlocals.items():
-        if callable(value) and is_user_code(value):
+        # functools.partial fails is_user_code() (module is functools/stdlib)
+        if isinstance(value, functools.partial):
+            _process_partial_dependency(
+                name, cast("functools.partial[Any]", value), manifest, visited
+            )
+        elif callable(value) and is_user_code(value):
             _process_callable_dependency(name, value, manifest, visited)
         elif isinstance(value, (bool, int, float, str, bytes, type(None))):
             manifest[f"const:{name}"] = repr(value)
@@ -91,6 +105,8 @@ def get_stage_fingerprint(
             )
         elif _is_user_class_instance(value):
             _process_instance_dependency(name, value, manifest, visited)
+
+    _process_type_hint_dependencies(func, manifest, visited)
 
     return manifest
 
@@ -128,6 +144,25 @@ def _process_callable_dependency(
     _add_callable_to_manifest(f"{prefix}:{name}", func, manifest, visited)
 
 
+def _process_partial_dependency(
+    name: str,
+    partial_obj: functools.partial[Any],
+    manifest: dict[str, str],
+    visited: set[int],
+) -> None:
+    """Process functools.partial: hash underlying func and bound arguments."""
+    # Hash bound args and kwargs (changes to these should invalidate cache)
+    args_str = _serialize_value_for_hash(partial_obj.args)
+    kwargs_str = _serialize_value_for_hash(partial_obj.keywords)
+    manifest[f"partial:{name}.args"] = xxhash.xxh64(args_str.encode()).hexdigest()
+    manifest[f"partial:{name}.kwargs"] = xxhash.xxh64(kwargs_str.encode()).hexdigest()
+
+    # Recursively fingerprint the underlying function if it's user code
+    underlying = partial_obj.func
+    if callable(underlying) and is_user_code(underlying):
+        _add_callable_to_manifest(f"func:{name}.func", underlying, manifest, visited)
+
+
 def _is_user_class_instance(value: Any) -> bool:
     """Check if value is an instance of a user-defined class."""
     cls = cast("type[Any]", type(value))
@@ -143,6 +178,96 @@ def _process_instance_dependency(
     """Track the class definition of a user-defined instance."""
     cls = cast("type[Any]", type(instance))
     _add_callable_to_manifest(f"class:{name}.__class__", cls, manifest, visited)
+
+
+def _process_type_hint_dependencies(
+    func: Callable[..., Any], manifest: dict[str, str], visited: set[int]
+) -> None:
+    """Process user-defined classes in type hints, including Pydantic model defaults."""
+    try:
+        hints = typing.get_type_hints(func)
+    except Exception:
+        return
+
+    for hint in hints.values():
+        _process_type_hint(hint, manifest, visited)
+
+
+def _process_type_hint(hint: Any, manifest: dict[str, str], visited: set[int]) -> None:
+    """Process a single type hint, recursively handling generics."""
+    if hint is type(None):
+        return
+
+    origin = typing.get_origin(hint)
+    if origin is not None:
+        for arg in typing.get_args(hint):
+            _process_type_hint(arg, manifest, visited)
+        return
+
+    if not isinstance(hint, type):
+        return
+
+    if not is_user_code(hint):
+        return
+
+    key = f"class:{hint.__name__}"
+    if key not in manifest:
+        _add_callable_to_manifest(key, hint, manifest, visited)
+
+    # Always hash Pydantic defaults (even if class was already added via closure vars)
+    if hasattr(hint, "model_fields"):
+        _hash_pydantic_defaults(hint, manifest)
+
+
+def _hash_pydantic_defaults(model: type, manifest: dict[str, str]) -> None:
+    """Hash Pydantic model field default values including default_factory."""
+    model_fields = getattr(model, "model_fields", {})
+    if not model_fields:
+        return
+
+    for field_name, field_info in model_fields.items():
+        default = getattr(field_info, "default", None)
+        default_factory = getattr(field_info, "default_factory", None)
+
+        # Check for PydanticUndefined (no default) - don't skip None, it's a valid default
+        if type(default).__name__ == "PydanticUndefinedType":
+            # No static default, check for default_factory
+            if default_factory is not None and callable(default_factory):
+                # Hash the factory function itself (tracks code changes)
+                key = f"pydantic:{model.__name__}.{field_name}"
+                manifest[key] = hash_function_ast(default_factory)
+            continue
+
+        value_str = _serialize_value_for_hash(default)
+        key = f"pydantic:{model.__name__}.{field_name}"
+        manifest[key] = xxhash.xxh64(value_str.encode()).hexdigest()
+
+
+def _serialize_value_for_hash(value: Any) -> str:
+    """Serialize a value to a stable string for hashing."""
+    if hasattr(value, "model_dump"):
+        return json.dumps(value.model_dump(), sort_keys=True, default=str)
+
+    if isinstance(value, (list, tuple)):
+        items: list[Any] = []
+        for item in cast("list[Any]", value):
+            if hasattr(item, "model_dump"):
+                items.append(item.model_dump())
+            else:
+                items.append(item)
+        return json.dumps(items, sort_keys=True, default=str)
+
+    if isinstance(value, (set, frozenset)):
+        # Sort for deterministic ordering
+        items_to_sort = cast("set[Any] | frozenset[Any]", value)
+        return json.dumps(
+            sorted(items_to_sort, key=lambda x: (type(x).__name__, str(x))), default=str
+        )
+
+    if isinstance(value, dict):
+        return json.dumps(value, sort_keys=True, default=str)
+
+    return repr(value)
 
 
 def _process_collection_dependency(
@@ -224,6 +349,12 @@ def hash_function_ast(func: Callable[..., Any]) -> str:
     stages using lambdas. Mitigation: Use named functions instead of lambdas in
     pipeline stages for stable fingerprinting.
     """
+    # For wrapped functions (via functools.wraps), inspect.getsource() follows
+    # __wrapped__ and returns the ORIGINAL function's source, making decorator
+    # logic invisible. Use __code__ bytecode to capture the actual wrapper.
+    if hasattr(func, "__wrapped__") and hasattr(func, "__code__"):
+        return xxhash.xxh64(marshal.dumps(func.__code__)).hexdigest()
+
     try:
         source = inspect.getsource(func)
     except (OSError, TypeError):

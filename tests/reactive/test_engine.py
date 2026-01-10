@@ -1830,3 +1830,347 @@ def test_first_run_done_flag_stress_test(pipeline_dir: pathlib.Path) -> None:
     assert all(v is True for v in first_run_done_values[1:]), (
         "_first_run_done should be True for all subsequent"
     )
+
+
+# =============================================================================
+# Transitive dependency reload tests
+# =============================================================================
+
+
+def test_transitive_dependency_reload_detects_helper_changes(
+    pipeline_dir: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Modifying a helper module imported by a stage module should be detected.
+
+    This is a critical bug test: if stages.py imports helpers.py, and helpers.py
+    is modified, the old behavior was to only reload stages.py - but reload()
+    doesn't reimport dependencies, so the old helpers.py code would still be used.
+
+    The fix clears ALL project modules from sys.modules before reimporting.
+    """
+    import sys
+
+    # Clean up any cached modules from previous tests
+    for mod_name in list(sys.modules.keys()):
+        if mod_name in ("stages", "helpers") or mod_name.startswith(("stages.", "helpers.")):
+            del sys.modules[mod_name]
+
+    # Create helper module
+    helpers_py = pipeline_dir / "helpers.py"
+    helpers_py.write_text(
+        """\
+HELPER_VALUE = "original"
+
+def get_value():
+    return HELPER_VALUE
+"""
+    )
+
+    # Create stages module that imports helper
+    stages_py = pipeline_dir / "stages.py"
+    stages_py.write_text(
+        """\
+from helpers import get_value
+from pivot.registry import stage
+
+@stage(deps=[], outs=["output.txt"])
+def my_stage():
+    return get_value()
+"""
+    )
+
+    # Add pipeline_dir to sys.path
+    monkeypatch.syspath_prepend(str(pipeline_dir))
+
+    # Import stages to register the stage
+    import importlib
+
+    importlib.import_module("stages")
+    assert "my_stage" in REGISTRY.list_stages()
+
+    # Verify original value
+    helpers_module = sys.modules["helpers"]
+    assert helpers_module.HELPER_VALUE == "original"
+
+    # Now modify the helper module
+    helpers_py.write_text(
+        """\
+HELPER_VALUE = "modified"
+
+def get_value():
+    return HELPER_VALUE
+"""
+    )
+
+    # Create engine and reload registry
+    eng = engine.ReactiveEngine()
+    result = eng._reload_registry()
+
+    assert result is True, "Reload should succeed"
+
+    # The critical assertion: helper module should have the NEW value
+    # If transitive dependencies aren't properly reloaded, this will still be "original"
+    helpers_module = sys.modules.get("helpers")
+    assert helpers_module is not None, "helpers module should still be loaded"
+    assert helpers_module.HELPER_VALUE == "modified", (
+        "Transitive dependency should be reloaded - got stale cached value"
+    )
+
+    # Clean up
+    for mod_name in list(sys.modules.keys()):
+        if mod_name in ("stages", "helpers") or mod_name.startswith("stages."):
+            del sys.modules[mod_name]
+
+
+# =============================================================================
+# Registry reload with stage changes - filter update tests
+# =============================================================================
+
+
+def test_watch_filter_stale_after_registry_adds_new_stage(
+    pipeline_dir: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Watch filter should update when registry reload adds new stages.
+
+    Bug: _create_watch_filter() captures output paths at startup. If registry
+    reload adds a new stage with new outputs, the filter doesn't know about them,
+    potentially causing infinite loops (new stage output triggers another reload).
+    """
+    import sys
+
+    # Clean up any cached modules from previous tests
+    for mod_name in list(sys.modules.keys()):
+        if mod_name == "stages" or mod_name.startswith("stages."):
+            del sys.modules[mod_name]
+
+    # Create initial stages module with one stage
+    stages_py = pipeline_dir / "stages.py"
+    stages_py.write_text(
+        """\
+from pivot.registry import stage
+
+@stage(deps=[], outs=["output_a.txt"])
+def stage_a():
+    pass
+"""
+    )
+
+    monkeypatch.syspath_prepend(str(pipeline_dir))
+
+    # Import to register
+    import importlib
+
+    importlib.import_module("stages")
+    assert "stage_a" in REGISTRY.list_stages()
+    assert "stage_b" not in REGISTRY.list_stages()
+
+    # Create initial watch filter
+    initial_filter = _watch_utils.create_watch_filter(["stage_a"])
+
+    # output_a should be filtered
+    output_a_path = pipeline_dir / "output_a.txt"
+    assert initial_filter(watchfiles.Change.modified, str(output_a_path)) is False
+
+    # output_b should NOT be filtered (stage doesn't exist yet)
+    output_b_path = pipeline_dir / "output_b.txt"
+    assert initial_filter(watchfiles.Change.modified, str(output_b_path)) is True
+
+    # Now add a new stage
+    stages_py.write_text(
+        """\
+from pivot.registry import stage
+
+@stage(deps=[], outs=["output_a.txt"])
+def stage_a():
+    pass
+
+@stage(deps=[], outs=["output_b.txt"])
+def stage_b():
+    pass
+"""
+    )
+
+    # Reload registry
+    eng = engine.ReactiveEngine()
+    eng._reload_registry()
+
+    assert "stage_b" in REGISTRY.list_stages(), "New stage should be registered"
+
+    # BUG DEMONSTRATION: The OLD filter still doesn't know about output_b
+    # This is the bug - after reload, we need to recreate the filter
+    # The test currently shows the bug exists
+    assert initial_filter(watchfiles.Change.modified, str(output_b_path)) is True, (
+        "Old filter doesn't know about new stage output (this demonstrates the bug)"
+    )
+
+    # Create NEW filter after reload - this one should filter output_b
+    new_filter = _watch_utils.create_watch_filter(["stage_a", "stage_b"])
+    assert new_filter(watchfiles.Change.modified, str(output_b_path)) is False, (
+        "New filter should filter new stage output"
+    )
+
+    # Clean up
+    for mod_name in list(sys.modules.keys()):
+        if mod_name == "stages" or mod_name.startswith("stages."):
+            del sys.modules[mod_name]
+
+
+def test_watch_filter_stale_after_registry_removes_stage(
+    pipeline_dir: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Watch filter should update when registry reload removes stages.
+
+    If a stage is removed, its outputs should no longer be filtered.
+    """
+    import sys
+
+    # Clean up any cached modules from previous tests
+    for mod_name in list(sys.modules.keys()):
+        if mod_name == "stages" or mod_name.startswith("stages."):
+            del sys.modules[mod_name]
+
+    # Create initial stages module with two stages
+    stages_py = pipeline_dir / "stages.py"
+    stages_py.write_text(
+        """\
+from pivot.registry import stage
+
+@stage(deps=[], outs=["output_a.txt"])
+def stage_a():
+    pass
+
+@stage(deps=[], outs=["output_b.txt"])
+def stage_b():
+    pass
+"""
+    )
+
+    monkeypatch.syspath_prepend(str(pipeline_dir))
+
+    import importlib
+
+    importlib.import_module("stages")
+    assert "stage_a" in REGISTRY.list_stages()
+    assert "stage_b" in REGISTRY.list_stages()
+
+    # Create initial watch filter for both stages
+    initial_filter = _watch_utils.create_watch_filter(["stage_a", "stage_b"])
+
+    # Both outputs should be filtered
+    output_a_path = pipeline_dir / "output_a.txt"
+    output_b_path = pipeline_dir / "output_b.txt"
+    assert initial_filter(watchfiles.Change.modified, str(output_a_path)) is False
+    assert initial_filter(watchfiles.Change.modified, str(output_b_path)) is False
+
+    # Remove stage_b
+    stages_py.write_text(
+        """\
+from pivot.registry import stage
+
+@stage(deps=[], outs=["output_a.txt"])
+def stage_a():
+    pass
+"""
+    )
+
+    # Reload registry
+    eng = engine.ReactiveEngine()
+    eng._reload_registry()
+
+    assert "stage_a" in REGISTRY.list_stages()
+    assert "stage_b" not in REGISTRY.list_stages(), "stage_b should be removed"
+
+    # Create NEW filter after reload - only stage_a exists now
+    new_filter = _watch_utils.create_watch_filter(["stage_a"])
+    assert new_filter(watchfiles.Change.modified, str(output_a_path)) is False, (
+        "output_a should still be filtered"
+    )
+    # output_b should no longer be filtered (stage doesn't exist)
+    assert new_filter(watchfiles.Change.modified, str(output_b_path)) is True, (
+        "output_b should NOT be filtered after stage removal"
+    )
+
+    # Clean up
+    for mod_name in list(sys.modules.keys()):
+        if mod_name == "stages" or mod_name.startswith("stages."):
+            del sys.modules[mod_name]
+
+
+def test_file_index_stale_after_registry_changes(
+    pipeline_dir: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """File index should be invalidated when registry changes.
+
+    The file-to-stages index maps dependency files to stages. If stages are
+    added/removed, the index becomes stale.
+    """
+    import sys
+
+    # Clean up any cached modules from previous tests
+    for mod_name in list(sys.modules.keys()):
+        if mod_name == "stages" or mod_name.startswith("stages."):
+            del sys.modules[mod_name]
+
+    # Create initial stages module
+    stages_py = pipeline_dir / "stages.py"
+    stages_py.write_text(
+        """\
+from pivot.registry import stage
+
+@stage(deps=["data_a.csv"], outs=["output_a.txt"])
+def stage_a():
+    pass
+"""
+    )
+    (pipeline_dir / "data_a.csv").write_text("a,b\n1,2")
+    (pipeline_dir / "data_b.csv").write_text("x,y\n3,4")
+
+    monkeypatch.syspath_prepend(str(pipeline_dir))
+
+    import importlib
+
+    importlib.import_module("stages")
+
+    eng = engine.ReactiveEngine()
+
+    # Build initial index
+    index1 = eng._get_file_index()
+    data_a_path = project.resolve_path("data_a.csv")
+    data_b_path = project.resolve_path("data_b.csv")
+
+    assert data_a_path in index1, "data_a should be in index"
+    assert data_b_path not in index1, "data_b should NOT be in index"
+
+    # Add new stage with different dependency
+    stages_py.write_text(
+        """\
+from pivot.registry import stage
+
+@stage(deps=["data_a.csv"], outs=["output_a.txt"])
+def stage_a():
+    pass
+
+@stage(deps=["data_b.csv"], outs=["output_b.txt"])
+def stage_b():
+    pass
+"""
+    )
+
+    # Simulate what _coordinator_loop does: invalidate caches and reload
+    eng._invalidate_caches()
+    eng._reload_registry()
+
+    # Get new index (should be rebuilt after invalidation)
+    index2 = eng._get_file_index()
+
+    assert data_a_path in index2, "data_a should still be in index"
+    assert data_b_path in index2, "data_b should now be in index after stage addition"
+
+    # Clean up
+    for mod_name in list(sys.modules.keys()):
+        if mod_name == "stages" or mod_name.startswith("stages."):
+            del sys.modules[mod_name]
