@@ -3,6 +3,7 @@ from __future__ import annotations
 import collections
 import contextlib
 import importlib
+import json
 import linecache
 import logging
 import os
@@ -21,6 +22,14 @@ import yaml
 from pivot import dag, executor, project, registry, types
 from pivot.pipeline import yaml as pipeline_yaml
 from pivot.reactive import _watch_utils
+from pivot.types import (
+    ReactiveAffectedStagesEvent,
+    ReactiveEventType,
+    ReactiveExecutionResultEvent,
+    ReactiveFilesChangedEvent,
+    ReactiveStageResult,
+    ReactiveStatusEvent,
+)
 
 if TYPE_CHECKING:
     import multiprocessing as mp
@@ -29,7 +38,7 @@ if TYPE_CHECKING:
     import networkx as nx
 
     from pivot.registry import RegistryStageInfo
-    from pivot.types import TuiMessage
+    from pivot.types import ReactiveJsonEvent, TuiMessage
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +99,7 @@ class ReactiveEngine:
     _debounce_ms: int
     _force_first_run: bool
     _first_run_done: bool
+    _json_output: bool
     _change_queue: queue.Queue[set[pathlib.Path]]
     _shutdown: threading.Event
     _tui_queue: mp.Queue[TuiMessage] | None
@@ -106,6 +116,7 @@ class ReactiveEngine:
         max_workers: int | None = None,
         debounce_ms: int = 300,
         force_first_run: bool = False,
+        json_output: bool = False,
     ) -> None:
         if debounce_ms < 0:
             raise ValueError(f"debounce_ms must be non-negative, got {debounce_ms}")
@@ -116,6 +127,7 @@ class ReactiveEngine:
         self._debounce_ms = debounce_ms
         self._force_first_run = force_first_run
         self._first_run_done = False
+        self._json_output = json_output
 
         self._change_queue = queue.Queue(maxsize=100)
         self._shutdown = threading.Event()
@@ -146,7 +158,19 @@ class ReactiveEngine:
             # Run initial execution
             self._send_message("Running initial pipeline...", status=types.ReactiveStatus.DETECTING)
             try:
-                self._execute_stages(self._stages)
+                results = self._execute_stages(self._stages)
+                if self._json_output and results:
+                    self._emit_json(
+                        ReactiveExecutionResultEvent(
+                            type=ReactiveEventType.EXECUTION_RESULT,
+                            stages={
+                                name: ReactiveStageResult(
+                                    status=result["status"], reason=result["reason"]
+                                )
+                                for name, result in results.items()
+                            },
+                        )
+                    )
             except Exception as e:
                 self._send_message(f"Initial execution failed: {e}", is_error=True)
             self._send_message("Watching for changes...")
@@ -209,6 +233,19 @@ class ReactiveEngine:
                 continue
 
             code_changed = _is_code_or_config_change(changes)
+
+            # Emit files_changed event for JSON output
+            if self._json_output:
+                # Filter out sentinel path and convert to strings
+                paths = [str(p) for p in changes if p != _FULL_REBUILD_SENTINEL]
+                self._emit_json(
+                    ReactiveFilesChangedEvent(
+                        type=ReactiveEventType.FILES_CHANGED,
+                        paths=paths,
+                        code_changed=code_changed,
+                    )
+                )
+
             if code_changed:
                 self._send_message("Reloading code...", status=types.ReactiveStatus.RESTARTING)
                 self._invalidate_caches()
@@ -235,13 +272,36 @@ class ReactiveEngine:
                 self._send_message("Watching for changes...")
                 continue
 
+            # Emit affected_stages event for JSON output
+            if self._json_output:
+                self._emit_json(
+                    ReactiveAffectedStagesEvent(
+                        type=ReactiveEventType.AFFECTED_STAGES,
+                        stages=affected,
+                        count=len(affected),
+                    )
+                )
+
             self._send_message(
                 f"Running {len(affected)} affected stage(s)...",
                 status=types.ReactiveStatus.DETECTING,
             )
 
             try:
-                self._execute_stages(affected)
+                results = self._execute_stages(affected)
+                # Emit execution results for JSON output
+                if self._json_output and results:
+                    self._emit_json(
+                        ReactiveExecutionResultEvent(
+                            type=ReactiveEventType.EXECUTION_RESULT,
+                            stages={
+                                name: ReactiveStageResult(
+                                    status=result["status"], reason=result["reason"]
+                                )
+                                for name, result in results.items()
+                            },
+                        )
+                    )
             except Exception as e:
                 self._send_message(f"Execution failed: {e}", is_error=True)
 
@@ -295,9 +355,9 @@ class ReactiveEngine:
         root = project.get_project_root()
 
         # Check for pivot.yaml-based registration
-        pipeline_yaml = _find_pipeline_file(root)
-        if pipeline_yaml is not None:
-            return self._reload_from_pipeline_file(pipeline_yaml, old_stages)
+        pipeline_yaml_file = _find_pipeline_file(root)
+        if pipeline_yaml_file is not None:
+            return self._reload_from_pipeline_file(pipeline_yaml_file, old_stages)
 
         # Check for pipeline.py-based registration
         pipeline_py = root / "pipeline.py"
@@ -479,19 +539,26 @@ class ReactiveEngine:
         loky.get_reusable_executor(max_workers=max_workers, kill_workers=True)
         logger.info(f"Worker pool restarted with {max_workers} workers")
 
-    def _execute_stages(self, stages: list[str] | None) -> None:
+    def _execute_stages(self, stages: list[str] | None) -> dict[str, executor.ExecutionSummary]:
         """Execute stages using the executor."""
         force = self._force_first_run and not self._first_run_done
-        executor.run(
+        # Suppress console output when JSON output is enabled
+        show_output = self._tui_queue is None and not self._json_output
+        results = executor.run(
             stages=stages,
             single_stage=self._single_stage,
             cache_dir=self._cache_dir,
             max_workers=self._max_workers,
-            show_output=self._tui_queue is None,
+            show_output=show_output,
             tui_queue=self._tui_queue,
             force=force,
         )
         self._first_run_done = True
+        return results
+
+    def _emit_json(self, event: ReactiveJsonEvent) -> None:
+        """Emit a JSONL event to stdout."""
+        print(json.dumps(event), flush=True)
 
     def _send_message(
         self,
@@ -500,7 +567,7 @@ class ReactiveEngine:
         is_error: bool = False,
         status: types.ReactiveStatus | None = None,
     ) -> None:
-        """Send message to TUI or log.
+        """Send message to TUI, JSON output, or log.
 
         Args:
             message: The message to send
@@ -509,6 +576,16 @@ class ReactiveEngine:
         """
         if status is None:
             status = types.ReactiveStatus.ERROR if is_error else types.ReactiveStatus.WAITING
+
+        if self._json_output:
+            self._emit_json(
+                ReactiveStatusEvent(
+                    type=ReactiveEventType.STATUS,
+                    message=message,
+                    is_error=is_error,
+                )
+            )
+            return
 
         if self._tui_queue is not None:
             msg = types.TuiReactiveMessage(

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import json
 import logging
 import pathlib
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal, TypedDict
 
 import click
 
@@ -13,6 +14,20 @@ from pivot.types import DisplayMode, StageExplanation, StageStatus
 
 if TYPE_CHECKING:
     from pivot.executor import ExecutionSummary
+
+
+class RunJsonStageOutput(TypedDict):
+    """JSON output for a single stage result."""
+
+    status: Literal[StageStatus.RAN, StageStatus.SKIPPED, StageStatus.FAILED, StageStatus.UNKNOWN]
+    reason: str
+
+
+class RunJsonOutput(TypedDict):
+    """JSON output for pivot run --json."""
+
+    stages: dict[str, RunJsonStageOutput]
+
 
 logger = logging.getLogger(__name__)
 
@@ -133,7 +148,6 @@ def _run_watch_with_tui(
     from pivot.tui import run as run_tui
     from pivot.types import TuiMessage
 
-    # Create manager and queue (Manager().Queue for loky compatibility)
     manager = mp.Manager()
     tui_queue: mp.Queue[TuiMessage] = manager.Queue()  # pyright: ignore[reportAssignmentType]
 
@@ -151,8 +165,22 @@ def _run_watch_with_tui(
         manager.shutdown()
 
 
-def _print_results(results: dict[str, ExecutionSummary]) -> None:
+def _results_to_json(results: dict[str, ExecutionSummary]) -> RunJsonOutput:
+    """Convert execution results to JSON-serializable format."""
+    return RunJsonOutput(
+        stages={
+            name: RunJsonStageOutput(status=result["status"], reason=result["reason"])
+            for name, result in results.items()
+        }
+    )
+
+
+def _print_results(results: dict[str, ExecutionSummary], as_json: bool = False) -> None:
     """Print execution results in a readable format."""
+    if as_json:
+        click.echo(json.dumps(_results_to_json(results), indent=2))
+        return
+
     ran = 0
     skipped = 0
     failed = 0
@@ -217,6 +245,7 @@ def _print_results(results: dict[str, ExecutionSummary]) -> None:
     default=None,
     help="Display mode: tui (interactive) or plain (streaming text). Auto-detects if not specified.",
 )
+@click.option("--json", "as_json", is_flag=True, help="Output results as JSON")
 @click.pass_context
 def run(
     ctx: click.Context,
@@ -229,6 +258,7 @@ def run(
     watch: bool,
     debounce: int,
     display: str | None,
+    as_json: bool,
 ) -> None:
     """Execute pipeline stages.
 
@@ -267,7 +297,7 @@ def run(
         from pivot.tui import run as run_tui
 
         display_mode = DisplayMode(display) if display else None
-        use_tui = run_tui.should_use_tui(display_mode)
+        use_tui = run_tui.should_use_tui(display_mode) and not as_json
 
         if use_tui:
             try:
@@ -283,15 +313,17 @@ def run(
                 cache_dir=cache_dir,
                 debounce_ms=debounce,
                 force_first_run=force,
+                json_output=as_json,
             )
 
             try:
                 engine.run(tui_queue=None)
             except KeyboardInterrupt:
-                pass
+                pass  # Normal exit via Ctrl+C
             finally:
                 engine.shutdown()
-                click.echo("\nWatch mode stopped.")
+                if not as_json:
+                    click.echo("\nWatch mode stopped.")
         return
 
     # Determine display mode
@@ -300,7 +332,8 @@ def run(
     # Normal execution (with optional explain mode)
     from pivot.tui import run as run_tui
 
-    use_tui = run_tui.should_use_tui(display_mode) and not explain
+    # Disable TUI when JSON output is requested
+    use_tui = run_tui.should_use_tui(display_mode) and not explain and not as_json
     if use_tui:
         results = _run_with_tui(stages_list, single_stage, cache_dir, force=force)
     else:
@@ -313,9 +346,12 @@ def run(
         )
 
     if not results:
-        click.echo("No stages to run")
+        if as_json:
+            click.echo(json.dumps(RunJsonOutput(stages={})))
+        else:
+            click.echo("No stages to run")
     elif not explain and not use_tui:
-        _print_results(results)
+        _print_results(results, as_json=as_json)
 
 
 @cli_decorators.pivot_command("dry-run")

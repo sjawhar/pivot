@@ -7,10 +7,11 @@ import time
 from unittest import mock
 
 import pytest
+import watchfiles
 
 from pivot import executor, project, types
 from pivot.pipeline import yaml as pipeline_yaml
-from pivot.reactive import engine
+from pivot.reactive import _watch_utils, engine
 from pivot.registry import REGISTRY, stage
 
 
@@ -21,6 +22,72 @@ def pipeline_dir(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> pat
     (tmp_path / "pivot.yaml").write_text("version: 1\n")
     REGISTRY.clear()
     return tmp_path
+
+
+# _collect_watch_paths tests
+
+
+def test_collect_watch_paths_includes_project_root(pipeline_dir: pathlib.Path) -> None:
+    """Project root should always be in watch paths."""
+    paths = _watch_utils.collect_watch_paths([])
+    assert pipeline_dir in paths
+
+
+def test_collect_watch_paths_includes_dependency_directories(
+    pipeline_dir: pathlib.Path,
+) -> None:
+    """Dependency file directories should be included."""
+    data_dir = pipeline_dir / "data"
+    data_dir.mkdir()
+    (data_dir / "input.csv").write_text("a,b\n1,2")
+
+    @stage(deps=["data/input.csv"], outs=["output.txt"])
+    def process() -> None:
+        pass
+
+    paths = _watch_utils.collect_watch_paths(["process"])
+    assert data_dir in paths
+
+
+# _create_watch_filter tests
+
+
+def test_watch_filter_filters_exact_output_match(pipeline_dir: pathlib.Path) -> None:
+    """Should filter out exact output file paths."""
+    output_path = pipeline_dir / "output.txt"
+
+    @stage(deps=[], outs=["output.txt"])
+    def process() -> None:
+        pass
+
+    watch_filter = _watch_utils.create_watch_filter(["process"])
+    assert watch_filter(watchfiles.Change.modified, str(output_path)) is False
+
+
+def test_watch_filter_allows_source_files(pipeline_dir: pathlib.Path) -> None:
+    """Should allow source files that are not outputs."""
+    source_path = pipeline_dir / "src" / "main.py"
+
+    @stage(deps=[], outs=["output.txt"])
+    def process() -> None:
+        pass
+
+    watch_filter = _watch_utils.create_watch_filter(["process"])
+    assert watch_filter(watchfiles.Change.modified, str(source_path)) is True
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/some/path/file.pyc",
+        "/some/path/__pycache__/file.py",
+        "/some/path/file.pyo",
+    ],
+)
+def test_watch_filter_filters_python_bytecode(pipeline_dir: pathlib.Path, path: str) -> None:
+    """Should filter out .pyc, .pyo, and __pycache__ files."""
+    watch_filter = _watch_utils.create_watch_filter([])
+    assert watch_filter(watchfiles.Change.modified, path) is False
 
 
 # _build_file_to_stages_index tests
@@ -652,6 +719,51 @@ def test_concurrent_shutdown_during_run(pipeline_dir: pathlib.Path) -> None:
     assert execution_count == 1, "Should have run initial execution"
 
 
+# Symlink resolution tests
+
+
+def test_watch_filter_resolves_symlinks(pipeline_dir: pathlib.Path) -> None:
+    """Watch filter should resolve symlinks for consistent comparison."""
+    # Create actual output file
+    output_dir = pipeline_dir / "outputs"
+    output_dir.mkdir()
+    actual_output = output_dir / "result.txt"
+    actual_output.write_text("output data")
+
+    # Create symlink to output
+    symlink_path = pipeline_dir / "result_link.txt"
+    symlink_path.symlink_to(actual_output)
+
+    @stage(deps=[], outs=["outputs/result.txt"])
+    def process() -> None:
+        pass
+
+    watch_filter = _watch_utils.create_watch_filter(["process"])
+
+    # The symlink should be filtered because it points to an output
+    assert watch_filter(watchfiles.Change.modified, str(symlink_path)) is False, (
+        "Symlink to output should be filtered"
+    )
+
+
+def test_watch_filter_handles_broken_symlink(pipeline_dir: pathlib.Path) -> None:
+    """Watch filter should handle broken symlinks gracefully."""
+    # Create symlink to non-existent file
+    broken_link = pipeline_dir / "broken_link.txt"
+    broken_link.symlink_to(pipeline_dir / "nonexistent.txt")
+
+    @stage(deps=[], outs=["output.txt"])
+    def process() -> None:
+        pass
+
+    watch_filter = _watch_utils.create_watch_filter(["process"])
+
+    # Broken symlink should not crash, should allow through (can't resolve)
+    result = watch_filter(watchfiles.Change.modified, str(broken_link))
+    # Either True (allowed) or False (filtered) is acceptable, just shouldn't crash
+    assert isinstance(result, bool), "Should return a boolean, not crash"
+
+
 def test_get_stages_affected_handles_deleted_file(pipeline_dir: pathlib.Path) -> None:
     """Should handle deleted files gracefully using absolute path."""
     (pipeline_dir / "data.csv").write_text("a,b\n1,2")
@@ -930,6 +1042,49 @@ def test_send_message_error_to_tui_queue(pipeline_dir: pathlib.Path) -> None:
     msg = tui_queue.get_nowait()
     assert msg["status"] == types.ReactiveStatus.ERROR
     assert msg["message"] == "Error occurred"
+
+
+def test_collect_watch_paths_handles_missing_stage(
+    pipeline_dir: pathlib.Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """collect_watch_paths should log warning and skip missing stages."""
+
+    # Register one stage with a dep
+    data_file = pipeline_dir / "data.csv"
+    data_file.write_text("a,b\n1,2")
+
+    @stage(deps=["data.csv"], outs=["output.txt"])
+    def existing() -> None:
+        pass
+
+    # Include a non-existent stage in the list
+    stages = ["existing", "nonexistent_stage"]
+    results = _watch_utils.collect_watch_paths(stages)
+
+    # Should still include project root and existing stage's dep directory
+    assert pipeline_dir in results
+    assert "Stage 'nonexistent_stage' not found in registry" in caplog.text
+
+
+def test_watch_filter_filters_nested_output_directory(
+    pipeline_dir: pathlib.Path,
+) -> None:
+    """Watch filter should filter files inside output directories."""
+    out_dir = pipeline_dir / "outputs"
+    out_dir.mkdir()
+    nested_file = out_dir / "subdir" / "result.csv"
+    nested_file.parent.mkdir()
+    nested_file.write_text("data")
+
+    @stage(deps=[], outs=["outputs"])  # Output is a directory
+    def produce() -> None:
+        pass
+
+    stages_to_run = ["produce"]
+    watch_filter = _watch_utils.create_watch_filter(stages_to_run)
+
+    # Files inside output directory should be filtered
+    assert watch_filter(watchfiles.Change.modified, str(nested_file)) is False
 
 
 def test_resolve_path_for_matching_handles_deleted_file(
@@ -1327,6 +1482,24 @@ def preserved_py_stage() -> None:
     assert eng._pipeline_errors is not None
 
 
+def test_watch_filter_handles_resolve_oserror(
+    pipeline_dir: pathlib.Path,
+) -> None:
+    """Watch filter should not filter paths that can't be resolved."""
+
+    @stage(deps=["data.csv"], outs=["output.txt"])
+    def process() -> None:
+        pass
+
+    watch_filter = _watch_utils.create_watch_filter(["process"])
+
+    # Mock project.resolve_path to raise OSError
+    with mock.patch.object(project, "resolve_path", side_effect=OSError("Permission denied")):
+        # Should return True (don't filter) when path can't be resolved
+        result = watch_filter(watchfiles.Change.modified, "/some/path")
+        assert result is True
+
+
 def test_resolve_path_for_matching_handles_oserror(
     pipeline_dir: pathlib.Path,
 ) -> None:
@@ -1469,7 +1642,6 @@ def test_coordinator_loop_sends_error_on_reload_failure(pipeline_dir: pathlib.Pa
     def capture_message(
         msg: str, *, is_error: bool = False, status: types.ReactiveStatus | None = None
     ) -> None:
-        # Map status to is_error for backward compatibility in this test
         is_err = is_error or (status == types.ReactiveStatus.ERROR)
         messages.append((msg, is_err))
 
