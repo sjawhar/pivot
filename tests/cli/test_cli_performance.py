@@ -5,16 +5,16 @@ import time
 import pytest
 from click.testing import CliRunner
 
-from pivot.cli import cli
+from pivot.cli import _LAZY_COMMANDS, cli
 
 # Maximum allowed time for --help (in seconds)
-# This is generous to account for CI variability
-MAX_HELP_TIME_SECONDS = 2.0
+# With lazy command loading, --help should complete in ~0.2s
+MAX_HELP_TIME_SECONDS = 0.25
 
 
 def _get_all_commands() -> list[str]:
     """Get all top-level CLI commands."""
-    return list(cli.commands.keys())
+    return sorted(_LAZY_COMMANDS.keys())
 
 
 # Get commands at module load time for parametrization
