@@ -33,6 +33,36 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _clear_project_modules(root: pathlib.Path) -> int:
+    """Remove all project modules from sys.modules to force fresh imports.
+
+    This ensures transitive dependencies are also reimported, not just stage modules.
+    Returns the count of cleared modules.
+    """
+    root_str = str(root)
+    to_remove = list[str]()
+
+    for name, module in sys.modules.items():
+        # sys.modules values can be None for failed imports (Python docs: "A key can map to
+        # None if the module is found to not exist") - type stubs don't reflect this
+        if module is None:  # pyright: ignore[reportUnnecessaryComparison]
+            continue
+        module_file = getattr(module, "__file__", None)
+        if module_file is None:
+            continue
+        try:
+            if module_file.startswith(root_str):
+                to_remove.append(name)
+        except (TypeError, AttributeError):
+            continue
+
+    for name in to_remove:
+        del sys.modules[name]
+        logger.debug(f"Cleared module from cache: {name}")
+
+    return len(to_remove)
+
+
 _MAX_PENDING_CHANGES = 10000  # Threshold for "full rebuild" sentinel
 _FULL_REBUILD_SENTINEL = pathlib.Path("__PIVOT_FULL_REBUILD__")
 
@@ -254,26 +284,18 @@ class ReactiveEngine:
 
         return self._reload_from_decorators(old_stages)
 
-    def _reload_stage_modules(self, old_stages: dict[str, RegistryStageInfo]) -> None:
-        """Reload stage modules so functions have fresh code. Logs warnings on failure."""
-        for module_name in _collect_stage_modules(old_stages):
-            if module_name in sys.modules:
-                try:
-                    importlib.reload(sys.modules[module_name])
-                    logger.debug(f"Reloaded module: {module_name}")
-                except Exception as e:
-                    logger.warning(f"Failed to reload module {module_name}: {e}")
-
     def _reload_with_registration(
         self,
-        old_stages: dict[str, RegistryStageInfo],
         register_fn: Callable[[], object],
         source_name: str,
+        old_stages: dict[str, RegistryStageInfo],
     ) -> bool:
         """Reload registry using provided registration function."""
         registry.REGISTRY.clear()
         try:
-            self._reload_stage_modules(old_stages)
+            root = project.get_project_root()
+            cleared = _clear_project_modules(root)
+            logger.debug(f"Cleared {cleared} project modules from cache")
             register_fn()
             self._pipeline_errors = None
             new_stages = list(registry.REGISTRY.list_stages())
@@ -290,9 +312,9 @@ class ReactiveEngine:
     ) -> bool:
         """Reload registry from pivot.yaml file."""
         return self._reload_with_registration(
-            old_stages,
             lambda: pipeline_yaml.register_from_pipeline_file(pipeline_file),
             pipeline_file.name,
+            old_stages,
         )
 
     def _reload_from_pipeline_py(
@@ -300,9 +322,9 @@ class ReactiveEngine:
     ) -> bool:
         """Reload registry from pipeline.py file."""
         return self._reload_with_registration(
-            old_stages,
             lambda: runpy.run_path(str(pipeline_py), run_name="_pivot_pipeline"),
             "pipeline.py",
+            old_stages,
         )
 
     def _reload_from_decorators(self, old_stages: dict[str, RegistryStageInfo]) -> bool:
@@ -313,15 +335,18 @@ class ReactiveEngine:
             return True
 
         registry.REGISTRY.clear()
+        root = project.get_project_root()
+        cleared = _clear_project_modules(root)
+        logger.debug(f"Cleared {cleared} project modules from cache")
 
         errors = list[str]()
         for module_name in stage_modules:
             try:
-                importlib.reload(sys.modules[module_name])
-                logger.debug(f"Reloaded module: {module_name}")
+                importlib.import_module(module_name)
+                logger.debug(f"Reimported module: {module_name}")
             except Exception as e:
                 errors.append(f"{module_name}: {e}")
-                logger.error(f"Failed to reload module {module_name}: {e}")
+                logger.error(f"Failed to import module {module_name}: {e}")
 
         if errors:
             registry.REGISTRY.restore(old_stages)
@@ -433,13 +458,13 @@ class ReactiveEngine:
     def _send_message(self, message: str, *, is_error: bool = False) -> None:
         """Send message to TUI or log."""
         if self._tui_queue is not None:
-            from pivot.types import TuiMessageType, TuiReactiveMessage
+            from pivot.types import ReactiveStatus, TuiMessageType, TuiReactiveMessage
 
             with contextlib.suppress(queue.Full):
                 self._tui_queue.put_nowait(
                     TuiReactiveMessage(
                         type=TuiMessageType.REACTIVE,
-                        status="error" if is_error else "waiting",
+                        status=ReactiveStatus.ERROR if is_error else ReactiveStatus.WAITING,
                         message=message,
                     )
                 )
