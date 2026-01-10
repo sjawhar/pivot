@@ -1,15 +1,19 @@
 import ast
+import dataclasses
 import inspect
 import marshal
 import pathlib
 import sys
 import types
 from collections.abc import Callable
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import xxhash
 
 from pivot import ast_utils
+
+if TYPE_CHECKING:
+    from pivot import loaders
 
 _SITE_PACKAGE_PATHS = ("site-packages", "dist-packages")
 
@@ -87,6 +91,30 @@ def get_stage_fingerprint(
             )
         elif _is_user_class_instance(value):
             _process_instance_dependency(name, value, manifest, visited)
+
+    return manifest
+
+
+def get_loader_fingerprint(loader: "loaders.Loader[Any]") -> dict[str, str]:
+    """Generate fingerprint manifest for a loader instance.
+
+    Returns dict with keys:
+    - 'loader:<classname>:load': Hash of load() method
+    - 'loader:<classname>:save': Hash of save() method
+    - 'loader:<classname>:config': Hash of dataclass field values
+    """
+    manifest = dict[str, str]()
+    class_name = type(loader).__name__
+
+    manifest[f"loader:{class_name}:load"] = hash_function_ast(loader.load)
+    manifest[f"loader:{class_name}:save"] = hash_function_ast(loader.save)
+
+    field_values = list[str]()
+    for field in dataclasses.fields(loader):
+        value = getattr(loader, field.name)
+        field_values.append(f"{field.name}={value!r}")
+    config_str = ",".join(field_values)
+    manifest[f"loader:{class_name}:config"] = xxhash.xxh64(config_str.encode()).hexdigest()
 
     return manifest
 

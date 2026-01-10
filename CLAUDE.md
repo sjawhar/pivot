@@ -84,6 +84,38 @@ if __name__ == '__main__':
 
 **Why?** Pivot uses `ProcessPoolExecutor` with `forkserver` context for true parallelism. Workers are separate processes that receive serialized (pickled) functions.
 
+## StageDef Conventions (Typed Deps/Outs)
+
+When using `StageDef` for typed dependencies and outputs:
+
+1. **StageDef classes must be module-level** - Not defined inside functions (required for proper type hint resolution and pickling)
+2. **Custom loaders must be module-level** - Same reason as above
+3. **Loaders are frozen dataclasses** - Immutable for consistent fingerprinting
+4. **Generic type parameter is for IDE/type-checker only** - The `T` in `CSV[pd.DataFrame]` enables autocomplete but isn't enforced at runtime
+
+```python
+from pivot import loaders
+from pivot.stage_def import StageDef
+
+# Good - module-level StageDef
+class TrainParams(StageDef):
+    class deps:
+        data: loaders.CSV[pd.DataFrame] = "data/train.csv"
+    class outs:
+        model: loaders.Pickle = "models/model.pkl"
+    learning_rate: float = 0.01
+
+# Bad - inside function (type hints won't resolve)
+def make_params():
+    class BadParams(StageDef):  # Don't do this!
+        class deps:
+            data: loaders.CSV[pd.DataFrame] = "data.csv"
+```
+
+**Loader fingerprinting:** Loader code (the `load()`/`save()` methods) is fingerprinted. If you change loader behavior, stages using that loader will re-run.
+
+**YAML overrides:** When `deps` or `outs` are specified in `pivot.yaml`, they completely replace the StageDef defaults (no merging).
+
 ## Code Quality Standards
 
 - No code duplication; type hints everywhere; `ruff format` (line length 100); `ruff check` for linting.
@@ -94,8 +126,19 @@ if __name__ == '__main__':
 ## Linting/Type Config (Critical)
 
 - NEVER modify linting/type rules in `pyproject.toml` without explicit permission.
-- No `# type: ignore` without justification; fix code, don't silence checkers.
 - **Zero tolerance for type checker warnings.** Both errors AND warnings from basedpyright must be resolved. Warnings indicate real type safety issues (missing annotations, unsafe operations, etc.) and are not acceptable.
+- **No blanket pyright suppressions.** Don't use file-level `# pyright: reportFoo=false` to silence entire categories. Use targeted inline ignores on specific lines with explanations.
+- **Always narrow type ignore comments.** Use specific error codes and explain why:
+  ```python
+  # Good - specific code with explanation
+  return json.load(f)  # type: ignore[return-value] - json returns Any, user specifies T
+  params._load_deps(root)  # pyright: ignore[reportPrivateUsage] - internal API
+
+  # Bad - blanket ignore
+  return json.load(f)  # type: ignore
+  # pyright: reportPrivateUsage=false  # at file level
+  ```
+- **Prefer better type stubs over ignores.** Before adding a type ignore, check if the library has type stubs available (e.g., `pandas-stubs`, `types-PyYAML`). Install them if available to improve type coverage.
 
 ## Python 3.13+ Type Hints (Critical)
 
@@ -551,3 +594,5 @@ basedpyright .         # Type check
 15. **StateDB uses different path strategies for hash vs generation keys:** `_make_key_file_hash()` uses `path.resolve()` (follows symlinks) for physical file deduplication—multiple symlinks to the same file share one cached hash. `_make_key_output_generation()` uses `normpath(absolute())` (preserves symlinks) for logical path tracking—Pivot outputs become symlinks to cache after execution, and `resolve()` would follow those to cache paths that change per-run, breaking generation tracking.
 16. **LMDB for all persistent caching:** Pivot uses LMDB (`.pivot/state.lmdb/`) with key prefixes (`hash:`, `gen:`, `dep:`, `remote:`) for all persistent state: file hash caching, generation counters, dependency tracking, and remote index. Prefer extending StateDB with new prefixes over adding new database technologies (e.g., SQLite, diskcache).
 17. **ruamel.yaml for user-edited config, PyYAML for read-only:** Use `ruamel.yaml` (with `typ="rt"`) for config files that users edit directly—it preserves comments and formatting when modifying YAML. Use `PyYAML` for read-only YAML files like DVC pipelines where comment preservation doesn't matter. The `config/io.py` module demonstrates the pattern: `_load_config_preserving_structure()` preserves ruamel structure for comment-preserving edits, while `load_config_file()` converts to plain dict for general use.
+18. **StageDef classes must be module-level:** When defining StageDef subclasses, always define them at module level, not inside test functions or other functions. `typing.get_type_hints()` requires the class's `__module__` to be importable for resolving forward references and generic type annotations. Classes defined inside functions have `__module__` set to the enclosing module but can't be found there, causing type hint resolution to fail with `Invalid loader annotation` errors.
+19. **Stage failure leaves partial state (by design):** When a stage function raises an exception, outputs may be in a partial or incomplete state. This is acceptable behavior—Pivot prioritizes transparency over cleanup. Users can inspect partial outputs for debugging, and re-running the stage will produce fresh outputs. Do not add complex cleanup logic to hide failures; let them be visible.

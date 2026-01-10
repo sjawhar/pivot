@@ -371,6 +371,93 @@ pivot data diff output.csv --no-tui --json
 - **Multiple formats** - Plain text, markdown, or JSON output
 
 **Supported formats:** CSV, JSON, JSONL
+
+### 10. Typed Dependencies and Outputs (StageDef)
+
+**Declare typed deps/outs that auto-load and auto-save:**
+
+```python
+import pandas as pd
+from pivot import stage
+from pivot.loaders import CSV, JSON, Pickle
+from pivot.stage_def import StageDef
+
+
+class TrainParams(StageDef):
+    class deps:
+        train_data: CSV[pd.DataFrame] = "data/train.csv"
+        config: JSON[dict] = "config.json"
+
+    class outs:
+        model: Pickle = "models/model.pkl"
+        metrics: JSON[dict] = "metrics.json"
+
+    learning_rate: float = 0.01
+    epochs: int = 100
+
+
+@stage
+def train(params: TrainParams) -> None:
+    # Deps are auto-loaded before function runs
+    df = params.deps.train_data  # Returns pd.DataFrame
+    config = params.deps.config  # Returns dict
+
+    # Train model...
+    model = {"weights": df.shape, "lr": params.learning_rate}
+    metrics = {"accuracy": 0.95}
+
+    # Assign outputs - auto-saved after function returns
+    params.outs.model = model
+    params.outs.metrics = metrics
+```
+
+**Benefits:**
+- **Type-safe** - IDE autocomplete, type checking for loaded data
+- **Auto-load/save** - No boilerplate file I/O code
+- **Automatic fingerprinting** - Loader code changes trigger re-runs
+- **Works with all pipeline methods** - `@stage` decorator, `pivot.yaml`, `Pipeline` class
+
+**Built-in loaders:**
+
+| Loader | Load returns | Save accepts | Options |
+|--------|--------------|--------------|---------|
+| `CSV[T]` | DataFrame | DataFrame | `sep`, `index_col`, `dtype` |
+| `JSON[T]` | dict/list | dict/list | `indent` |
+| `YAML[T]` | dict/list | dict/list | - |
+| `Pickle[T]` | Any | Any | - |
+| `PathOnly` | pathlib.Path | (validates exists) | - |
+
+**With pivot.yaml:**
+
+```yaml
+stages:
+  train:
+    python: stages.train
+    # No deps/outs needed - extracted from StageDef!
+    params:
+      learning_rate: 0.001
+```
+
+**Custom loaders:**
+
+```python
+import dataclasses
+from pivot.loaders import Loader
+
+
+@dataclasses.dataclass(frozen=True)
+class Parquet(Loader[pd.DataFrame]):
+    compression: str = "snappy"
+
+    def load(self, path: pathlib.Path) -> pd.DataFrame:
+        return pd.read_parquet(path)
+
+    def save(self, data: pd.DataFrame, path: pathlib.Path) -> None:
+        data.to_parquet(path, compression=self.compression)
+```
+
+**Note:** Custom loaders must be defined at module level (not inside functions) for pickling across processes.
+
 ---
 
 ## Installation
@@ -417,6 +504,7 @@ Full documentation available at the [Pivot Documentation Site](https://anthropic
 - **Version retrieval** - `pivot data get --rev` to materialize files from any git revision
 - **Shell completion** - Tab completion for bash, zsh, and fish
 - **Centralized configuration** - `pivot config` command for managing project settings
+- **Typed deps/outs (StageDef)** - Auto-loading/saving dependencies and outputs with type-safe loaders
 
 ### Planned
 

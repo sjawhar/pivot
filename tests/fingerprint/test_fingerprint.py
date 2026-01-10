@@ -1,4 +1,4 @@
-# pyright: reportUnusedFunction=false, reportUnusedParameter=false, reportUnknownLambdaType=false, reportUnknownParameterType=false, reportMissingParameterType=false, reportUnknownVariableType=false, reportUnknownArgumentType=false
+# pyright: reportUnusedFunction=false, reportUnusedParameter=false, reportUnknownLambdaType=false, reportUnknownParameterType=false, reportMissingParameterType=false, reportUnknownVariableType=false, reportUnknownArgumentType=false, reportImplicitOverride=false
 
 import ast
 import math
@@ -995,3 +995,211 @@ def test_fingerprint_recursive_helper_excludes_self():
     assert fp["mod:math.sqrt"] == "callable"
     assert fp["mod:math.sin"] == "callable"
     assert fp["mod:math.cos"] == "callable"
+
+
+# ==============================================================================
+# Loader fingerprinting tests
+# ==============================================================================
+
+
+def test_get_loader_fingerprint_returns_manifest():
+    """Should return fingerprint manifest for loader."""
+    from pivot import loaders
+
+    loader = loaders.CSV()
+    fp = fingerprint.get_loader_fingerprint(loader)
+
+    assert isinstance(fp, dict)
+    assert len(fp) > 0
+
+
+def test_loader_fingerprint_includes_load_method():
+    """Should fingerprint the load method."""
+    from pivot import loaders
+
+    loader = loaders.CSV()
+    fp = fingerprint.get_loader_fingerprint(loader)
+
+    assert "loader:CSV:load" in fp
+    assert isinstance(fp["loader:CSV:load"], str)
+    assert len(fp["loader:CSV:load"]) == 16  # xxhash64 hex
+
+
+def test_loader_fingerprint_includes_save_method():
+    """Should fingerprint the save method."""
+    from pivot import loaders
+
+    loader = loaders.CSV()
+    fp = fingerprint.get_loader_fingerprint(loader)
+
+    assert "loader:CSV:save" in fp
+    assert isinstance(fp["loader:CSV:save"], str)
+    assert len(fp["loader:CSV:save"]) == 16
+
+
+def test_loader_fingerprint_includes_config():
+    """Should fingerprint dataclass field values."""
+    from pivot import loaders
+
+    loader = loaders.CSV(index_col="id", sep=";")
+    fp = fingerprint.get_loader_fingerprint(loader)
+
+    assert "loader:CSV:config" in fp
+    assert isinstance(fp["loader:CSV:config"], str)
+
+
+def test_loader_config_change_changes_fingerprint():
+    """Different config values should produce different fingerprints."""
+    from pivot import loaders
+
+    loader1 = loaders.CSV(sep=",")
+    loader2 = loaders.CSV(sep=";")
+
+    fp1 = fingerprint.get_loader_fingerprint(loader1)
+    fp2 = fingerprint.get_loader_fingerprint(loader2)
+
+    assert fp1["loader:CSV:config"] != fp2["loader:CSV:config"]
+
+
+def test_loader_same_config_same_fingerprint():
+    """Same config values should produce same fingerprints."""
+    from pivot import loaders
+
+    loader1 = loaders.CSV(sep=",", index_col=0)
+    loader2 = loaders.CSV(sep=",", index_col=0)
+
+    fp1 = fingerprint.get_loader_fingerprint(loader1)
+    fp2 = fingerprint.get_loader_fingerprint(loader2)
+
+    assert fp1 == fp2
+
+
+def test_different_loader_types_different_fingerprint():
+    """Different loader types should produce different fingerprints."""
+    from pivot import loaders
+
+    csv_loader = loaders.CSV()
+    json_loader = loaders.JSON()
+
+    fp_csv = fingerprint.get_loader_fingerprint(csv_loader)
+    fp_json = fingerprint.get_loader_fingerprint(json_loader)
+
+    # Method hashes should differ
+    assert fp_csv["loader:CSV:load"] != fp_json["loader:JSON:load"]
+
+
+def test_json_loader_fingerprint():
+    """Should fingerprint JSON loader correctly."""
+    from pivot import loaders
+
+    loader = loaders.JSON(indent=4)
+    fp = fingerprint.get_loader_fingerprint(loader)
+
+    assert "loader:JSON:load" in fp
+    assert "loader:JSON:save" in fp
+    assert "loader:JSON:config" in fp
+
+
+def test_yaml_loader_fingerprint():
+    """Should fingerprint YAML loader correctly."""
+    from pivot import loaders
+
+    loader = loaders.YAML()
+    fp = fingerprint.get_loader_fingerprint(loader)
+
+    assert "loader:YAML:load" in fp
+    assert "loader:YAML:save" in fp
+    assert "loader:YAML:config" in fp
+
+
+def test_pickle_loader_fingerprint():
+    """Should fingerprint Pickle loader correctly."""
+    from pivot import loaders
+
+    loader = loaders.Pickle()
+    fp = fingerprint.get_loader_fingerprint(loader)
+
+    assert "loader:Pickle:load" in fp
+    assert "loader:Pickle:save" in fp
+    assert "loader:Pickle:config" in fp
+
+
+def test_pathonly_loader_fingerprint():
+    """Should fingerprint PathOnly loader correctly."""
+    from pivot import loaders
+
+    loader = loaders.PathOnly()
+    fp = fingerprint.get_loader_fingerprint(loader)
+
+    assert "loader:PathOnly:load" in fp
+    assert "loader:PathOnly:save" in fp
+    assert "loader:PathOnly:config" in fp
+
+
+def test_custom_loader_fingerprint():
+    """Should fingerprint custom loader subclasses."""
+    import dataclasses
+    import pathlib
+
+    from pivot import loaders
+
+    @dataclasses.dataclass(frozen=True)
+    class CustomTextLoader(loaders.Loader[str]):
+        """Custom loader for testing."""
+
+        prefix: str = ""
+
+        def load(self, path: pathlib.Path) -> str:
+            return self.prefix + path.read_text()
+
+        def save(self, data: str, path: pathlib.Path) -> None:
+            path.write_text(data)
+
+    loader = CustomTextLoader(prefix="TEST:")
+    fp = fingerprint.get_loader_fingerprint(loader)
+
+    assert "loader:CustomTextLoader:load" in fp
+    assert "loader:CustomTextLoader:save" in fp
+    assert "loader:CustomTextLoader:config" in fp
+
+
+def test_custom_loader_code_change_detected():
+    """Custom loader code changes should change fingerprint."""
+    import dataclasses
+    import pathlib
+
+    from pivot import loaders
+
+    @dataclasses.dataclass(frozen=True)
+    class LoaderV1(loaders.Loader[str]):
+        def load(self, path: pathlib.Path) -> str:
+            return path.read_text()
+
+        def save(self, data: str, path: pathlib.Path) -> None:
+            path.write_text(data)
+
+    @dataclasses.dataclass(frozen=True)
+    class LoaderV2(loaders.Loader[str]):
+        def load(self, path: pathlib.Path) -> str:
+            return path.read_text().strip()  # Different logic
+
+        def save(self, data: str, path: pathlib.Path) -> None:
+            path.write_text(data)
+
+    fp1 = fingerprint.get_loader_fingerprint(LoaderV1())
+    fp2 = fingerprint.get_loader_fingerprint(LoaderV2())
+
+    # Load method hash should differ
+    assert fp1["loader:LoaderV1:load"] != fp2["loader:LoaderV2:load"]
+
+
+def test_loader_fingerprint_stable():
+    """Loader fingerprint should be stable across calls."""
+    from pivot import loaders
+
+    loader = loaders.CSV(index_col="id")
+
+    fp1 = fingerprint.get_loader_fingerprint(loader)
+    fp2 = fingerprint.get_loader_fingerprint(loader)
+
+    assert fp1 == fp2
