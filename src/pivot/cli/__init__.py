@@ -12,11 +12,12 @@ COMMAND_CATEGORIES = {
     "Inspection": ["list", "metrics", "params", "plots", "data", "status"],
     "Versioning": ["get", "track", "checkout"],
     "Remote": ["remote", "push", "pull"],
-    "Other": ["export", "config", "completion"],
+    "Other": ["init", "export", "config", "completion"],
 }
 
 # Lazy command registry: command_name -> (module_path, attr_name, help_text)
 _LAZY_COMMANDS: dict[str, tuple[str, str, str]] = {
+    "init": ("pivot.cli.init", "init", "Initialize a new Pivot project."),
     "run": ("pivot.cli.run", "run", "Execute pipeline stages."),
     "explain": ("pivot.cli.run", "explain_cmd", "Show detailed breakdown of why stages would run."),
     "list": ("pivot.cli.list", "list_cmd", "List registered stages."),

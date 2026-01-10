@@ -251,3 +251,17 @@ class ConfigKeyError(ConfigError):
     @override
     def get_suggestion(self) -> str:
         return "Run 'pivot config list' to see available config keys"
+
+
+class InitError(PivotError):
+    """Base class for initialization errors."""
+
+    pass
+
+
+class AlreadyInitializedError(InitError):
+    """Raised when project is already initialized."""
+
+    @override
+    def get_suggestion(self) -> str:
+        return "Use --force to reinitialize"

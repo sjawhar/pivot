@@ -14,20 +14,31 @@
 
 - Import modules not functions; use qualified names.
 - **NEVER import inside test functions**—all imports must be at module level.
+- **NO LAZY IMPORTS.** This includes `from x import y` inside functions, even for "local" imports. Move ALL imports to the top of the file.
 
 ```python
-# Bad - import inside test function
+# Bad - import inside test function (lazy import)
 def test_queue_writer_fileno():
     import io  # WRONG - move to module level
     with pytest.raises(io.UnsupportedOperation):
         writer.fileno()
 
+# Bad - lazy import of project module
+def test_init_creates_valid_project():
+    from pivot import project  # WRONG - this is a lazy import!
+    project._project_root_cache = None
+
 # Good - import at module level
 import io  # At top of file with other imports
+
+from pivot import project  # At top of file
 
 def test_queue_writer_fileno():
     with pytest.raises(io.UnsupportedOperation):
         writer.fileno()
+
+def test_init_creates_valid_project():
+    project._project_root_cache = None  # Module already imported at top
 ```
 
 ## Test the Library, Not Duplicates (Critical)
