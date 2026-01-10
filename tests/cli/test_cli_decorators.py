@@ -1,7 +1,9 @@
+import click
 import click.testing
 import pytest
+from pytest_mock import MockerFixture
 
-from pivot import exceptions
+from pivot import discovery, exceptions
 from pivot.cli import decorators as cli_decorators
 
 
@@ -143,3 +145,87 @@ def test_with_error_handling_with_group_command(runner: click.testing.CliRunner)
     assert result.exit_code != 0
     assert "Cycle detected" in result.output
     assert "circular" in result.output
+
+
+# =============================================================================
+# auto_discover Tests
+# =============================================================================
+
+
+def test_pivot_command_auto_discover_calls_discovery_when_no_stages(
+    runner: click.testing.CliRunner, mocker: MockerFixture
+) -> None:
+    """auto_discover=True calls discover_and_register when no stages registered."""
+    mock_has_stages = mocker.patch.object(discovery, "has_registered_stages", return_value=False)
+    mock_discover = mocker.patch.object(discovery, "discover_and_register")
+
+    @cli_decorators.pivot_command()
+    def my_command() -> None:
+        click.echo("Command executed")
+
+    result = runner.invoke(my_command)
+
+    assert result.exit_code == 0
+    mock_has_stages.assert_called_once()
+    mock_discover.assert_called_once()
+    assert "Command executed" in result.output
+
+
+def test_pivot_command_auto_discover_skips_when_stages_exist(
+    runner: click.testing.CliRunner, mocker: MockerFixture
+) -> None:
+    """auto_discover=True skips discovery when stages already registered."""
+    mock_has_stages = mocker.patch.object(discovery, "has_registered_stages", return_value=True)
+    mock_discover = mocker.patch.object(discovery, "discover_and_register")
+
+    @cli_decorators.pivot_command()
+    def my_command() -> None:
+        click.echo("Command executed")
+
+    result = runner.invoke(my_command)
+
+    assert result.exit_code == 0
+    mock_has_stages.assert_called_once()
+    mock_discover.assert_not_called()
+    assert "Command executed" in result.output
+
+
+def test_pivot_command_auto_discover_false_skips_discovery(
+    runner: click.testing.CliRunner, mocker: MockerFixture
+) -> None:
+    """auto_discover=False skips discovery entirely."""
+    mock_has_stages = mocker.patch.object(discovery, "has_registered_stages")
+    mock_discover = mocker.patch.object(discovery, "discover_and_register")
+
+    @cli_decorators.pivot_command(auto_discover=False)
+    def my_command() -> None:
+        click.echo("Command executed")
+
+    result = runner.invoke(my_command)
+
+    assert result.exit_code == 0
+    mock_has_stages.assert_not_called()
+    mock_discover.assert_not_called()
+    assert "Command executed" in result.output
+
+
+def test_pivot_command_auto_discover_converts_discovery_error(
+    runner: click.testing.CliRunner, mocker: MockerFixture
+) -> None:
+    """auto_discover converts DiscoveryError to ClickException."""
+    mocker.patch.object(discovery, "has_registered_stages", return_value=False)
+    mocker.patch.object(
+        discovery,
+        "discover_and_register",
+        side_effect=discovery.DiscoveryError("No pivot.yaml found"),
+    )
+
+    @cli_decorators.pivot_command()
+    def my_command() -> None:
+        click.echo("Should not reach here")
+
+    result = runner.invoke(my_command)
+
+    assert result.exit_code != 0
+    assert "No pivot.yaml found" in result.output
+    assert "Should not reach here" not in result.output
