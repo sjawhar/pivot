@@ -145,6 +145,12 @@ class StageListPanel(textual.widgets.Static):
         if name in self._rows:
             self._rows[name].update_display()
 
+    def rebuild(self, stages: list[StageInfo]) -> None:  # pragma: no cover
+        """Rebuild panel with new stage list."""
+        self._stages = stages
+        self._rows.clear()
+        self.refresh(recompose=True)
+
 
 class DetailPanel(textual.widgets.Static):
     """Panel showing details of selected stage."""
@@ -588,9 +594,7 @@ class WatchTuiApp(_BaseTuiApp):
     def _rebuild_stage_list(self) -> None:  # pragma: no cover
         """Rebuild the stage list panel after stages change."""
         stage_list = self.query_one("#stage-list", StageListPanel)
-        stage_list._stages = list(self._stages.values())  # pyright: ignore[reportPrivateUsage]
-        stage_list._rows.clear()  # pyright: ignore[reportPrivateUsage]
-        stage_list.refresh(recompose=True)
+        stage_list.rebuild(list(self._stages.values()))
 
     @override
     async def action_quit(self) -> None:  # pragma: no cover

@@ -199,6 +199,7 @@ class ReactiveEngine:
                     pass  # Keep accumulating, will send next iteration
         except Exception as e:
             logger.critical(f"Watcher thread failed: {e}")
+            self._send_message(f"File watcher failed: {e}", is_error=True)
             self.shutdown()  # Signal coordinator to exit
 
     def _coordinator_loop(self) -> None:
