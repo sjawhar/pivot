@@ -382,6 +382,18 @@ pivot data diff output.csv --json
 
 Remote storage is configured using `pivot config` commands. See the [Configuration](#configuration) section below for details.
 
+### `pivot remote list`
+
+List configured remote storage locations.
+
+```bash
+pivot remote list
+```
+
+Shows all remotes configured in the project, with the default marked.
+
+---
+
 ### `pivot push`
 
 Push cached outputs to remote storage.

@@ -1,16 +1,13 @@
 from __future__ import annotations
 
 import pathlib
-from typing import TYPE_CHECKING
 
 import click
 
-from pivot import project
+from pivot import config, project
 from pivot.cli import decorators as cli_decorators
-from pivot.types import DataDiffResult
-
-if TYPE_CHECKING:
-    from pivot.types import OutputFormat
+from pivot.storage import cache, restore
+from pivot.types import DataDiffResult, OutputFormat
 
 
 @click.group()
@@ -25,10 +22,16 @@ def data() -> None:
 @click.option("--summary", is_flag=True, help="Show summary only (schema + counts)")
 @click.option("--no-tui", is_flag=True, help="Print to stdout instead of launching TUI")
 @click.option(
-    "--json", "output_format", flag_value="json", help="Output as JSON (implies --no-tui)"
+    "--json",
+    "output_format",
+    flag_value=OutputFormat.JSON,
+    help="Output as JSON (implies --no-tui)",
 )
 @click.option(
-    "--md", "output_format", flag_value="md", help="Output as Markdown (implies --no-tui)"
+    "--md",
+    "output_format",
+    flag_value=OutputFormat.MD,
+    help="Output as Markdown (implies --no-tui)",
 )
 @click.option("--max-rows", default=10000, help="Max rows for comparison (default: 10000)")
 @cli_decorators.with_error_handling
@@ -38,7 +41,7 @@ def data_diff(
     positional: bool,
     summary: bool,
     no_tui: bool,
-    output_format: OutputFormat,
+    output_format: OutputFormat | None,
     max_rows: int,
 ) -> None:
     """Compare data files in workspace against git HEAD.
@@ -46,7 +49,7 @@ def data_diff(
     Compares CSV, JSON, and JSONL files showing schema changes, row additions,
     deletions, and modifications. Detects reorder-only changes.
     """
-    from pivot import data as data_module
+    from pivot.show import data as data_module
 
     # --json or --md implies --no-tui
     if output_format:
@@ -120,10 +123,69 @@ def data_diff(
                 temp_file.unlink(missing_ok=True)
     else:
         # Launch TUI
-        from pivot import data_tui
+        from pivot.tui import diff as data_tui
 
         data_tui.run_diff_app(
             diff_entries=hash_diffs,
             key_cols=key_columns,
             max_rows=max_rows,
         )
+
+
+@data.command("get")
+@click.argument("targets", nargs=-1, required=True)
+@click.option(
+    "--rev",
+    "-r",
+    required=True,
+    help="Git revision (SHA, branch, tag) to retrieve files from",
+)
+@click.option(
+    "--output",
+    "-o",
+    type=click.Path(path_type=pathlib.Path),
+    default=None,
+    help="Output path for single file target (incompatible with multiple targets or stage names)",
+)
+@click.option(
+    "--checkout-mode",
+    type=click.Choice(["symlink", "hardlink", "copy"]),
+    default=None,
+    help="Checkout mode for restoration (default: project config or hardlink)",
+)
+@click.option("--force", "-f", is_flag=True, help="Overwrite existing files")
+@cli_decorators.with_error_handling
+def data_get(
+    targets: tuple[str, ...],
+    rev: str,
+    output: pathlib.Path | None,
+    checkout_mode: str | None,
+    force: bool,
+) -> None:
+    """Retrieve files or stage outputs from a specific git revision.
+
+    TARGETS can be file paths or stage names.
+
+    \b
+    Examples:
+      pivot data get --rev v1.0 model.pkl              # Get file from tag
+      pivot data get --rev v1.0 model.pkl -o old.pkl   # Get file to alternate location
+      pivot data get --rev abc123 train                # Get all outputs from stage
+    """
+    project_root = project.get_project_root()
+    cache_dir = project_root / ".pivot" / "cache"
+
+    mode_strings = [checkout_mode] if checkout_mode else config.get_checkout_mode_order()
+    checkout_modes = [cache.CheckoutMode(m) for m in mode_strings]
+
+    messages = restore.restore_targets_from_revision(
+        targets=list(targets),
+        rev=rev,
+        output=output,
+        cache_dir=cache_dir,
+        checkout_modes=checkout_modes,
+        force=force,
+    )
+
+    for msg in messages:
+        click.echo(msg)

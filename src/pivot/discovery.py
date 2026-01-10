@@ -4,10 +4,11 @@ import logging
 import runpy
 from typing import TYPE_CHECKING
 
-from pivot import pipeline_config, project, registry
+from pivot import project, registry
+from pivot.pipeline import yaml as pipeline_config
 
 if TYPE_CHECKING:
-    import pathlib
+    from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -19,7 +20,7 @@ class DiscoveryError(Exception):
     """Error during pipeline discovery."""
 
 
-def discover_and_register(project_root: pathlib.Path | None = None) -> str | None:
+def discover_and_register(project_root: Path | None = None) -> str | None:
     """Discover and register pipeline from pivot.yaml or pipeline.py.
 
     Looks in project root for:
@@ -80,6 +81,6 @@ def has_registered_stages() -> bool:
     return len(registry.REGISTRY.list_stages()) > 0
 
 
-def _import_pipeline_module(path: pathlib.Path) -> None:
+def _import_pipeline_module(path: Path) -> None:
     """Execute a pipeline.py file, registering its stages."""
     runpy.run_path(str(path), run_name="_pivot_pipeline")

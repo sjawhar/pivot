@@ -167,4 +167,4 @@ pivot config set default_remote backup
 
 ## See Also
 
-- [API Reference: cache](../reference/pivot/cache.md) - Full API documentation
+- [API Reference: Storage & Cache](../reference/pivot/storage.md) - Full API documentation

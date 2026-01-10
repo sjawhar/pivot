@@ -1,4 +1,5 @@
 import click
+import pytest
 
 from pivot import exceptions
 from pivot.cli import errors as cli_errors
@@ -44,56 +45,64 @@ def test_handle_pivot_error_without_suggestion() -> None:
 # =============================================================================
 
 
-def test_stage_not_found_error_suggestion() -> None:
-    """StageNotFoundError provides suggestion to run pivot list."""
-    error = exceptions.StageNotFoundError("Unknown stage")
-
-    assert error.get_suggestion() == "Run 'pivot list' to see available stages"
-
-
-def test_dependency_not_found_error_suggestion() -> None:
-    """DependencyNotFoundError provides appropriate suggestion."""
-    error = exceptions.DependencyNotFoundError("Missing dep")
-
-    assert "file exists" in error.get_suggestion()
-    assert "produced by another stage" in error.get_suggestion()
-
-
-def test_cyclic_graph_error_suggestion() -> None:
-    """CyclicGraphError provides suggestion about dependencies."""
-    error = exceptions.CyclicGraphError("Cycle detected")
-
-    assert "dependencies" in error.get_suggestion()
-    assert "circular" in error.get_suggestion()
-
-
-def test_cache_miss_error_suggestion() -> None:
-    """CacheMissError provides suggestions for pull or regenerate."""
-    error = exceptions.CacheMissError("Not in cache")
-
-    assert "pivot pull" in error.get_suggestion()
-    assert "re-run" in error.get_suggestion()
-
-
-def test_tracked_file_missing_error_suggestion() -> None:
-    """TrackedFileMissingError suggests running pivot checkout."""
-    error = exceptions.TrackedFileMissingError("File missing")
-
-    assert "pivot checkout" in error.get_suggestion()
-
-
-def test_remote_not_configured_error_suggestion() -> None:
-    """RemoteNotConfiguredError suggests adding a remote."""
-    error = exceptions.RemoteNotConfiguredError("No remote")
-
-    assert "pivot config set remotes." in error.get_suggestion()
-
-
-def test_remote_not_found_error_suggestion() -> None:
-    """RemoteNotFoundError suggests listing remotes."""
-    error = exceptions.RemoteNotFoundError("Unknown remote")
-
-    assert "pivot remote list" in error.get_suggestion()
+@pytest.mark.parametrize(
+    ("exception_class", "message", "expected_substrings"),
+    [
+        pytest.param(
+            exceptions.StageNotFoundError,
+            "Unknown stage",
+            ["Run 'pivot list' to see available stages"],
+            id="stage_not_found",
+        ),
+        pytest.param(
+            exceptions.DependencyNotFoundError,
+            "Missing dep",
+            ["file exists", "produced by another stage"],
+            id="dependency_not_found",
+        ),
+        pytest.param(
+            exceptions.CyclicGraphError,
+            "Cycle detected",
+            ["dependencies", "circular"],
+            id="cyclic_graph",
+        ),
+        pytest.param(
+            exceptions.CacheMissError,
+            "Not in cache",
+            ["pivot pull", "re-run"],
+            id="cache_miss",
+        ),
+        pytest.param(
+            exceptions.TrackedFileMissingError,
+            "File missing",
+            ["pivot checkout"],
+            id="tracked_file_missing",
+        ),
+        pytest.param(
+            exceptions.RemoteNotConfiguredError,
+            "No remote",
+            ["pivot config set remotes."],
+            id="remote_not_configured",
+        ),
+        pytest.param(
+            exceptions.RemoteNotFoundError,
+            "Unknown remote",
+            ["pivot remote list"],
+            id="remote_not_found",
+        ),
+    ],
+)
+def test_exception_suggestion(
+    exception_class: type[exceptions.PivotError],
+    message: str,
+    expected_substrings: list[str],
+) -> None:
+    """Exception types provide appropriate suggestions."""
+    error = exception_class(message)
+    suggestion = error.get_suggestion()
+    assert suggestion is not None
+    for expected in expected_substrings:
+        assert expected in suggestion, f"Expected '{expected}' in suggestion '{suggestion}'"
 
 
 def test_base_pivot_error_no_suggestion() -> None:

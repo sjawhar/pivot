@@ -15,7 +15,7 @@ def remote() -> None:
 @cli_decorators.with_error_handling
 def remote_list() -> None:
     """List configured remote storage locations."""
-    from pivot import remote_config
+    from pivot.remote import config as remote_config
 
     remotes = remote_config.list_remotes()
     default = remote_config.get_default_remote()
@@ -41,7 +41,8 @@ def push(targets: tuple[str, ...], remote_name: str | None, dry_run: bool, jobs:
     TARGETS can be stage names or file paths. If specified, pushes only
     those outputs. Otherwise, pushes all cached files.
     """
-    from pivot import state, transfer
+    from pivot.remote import sync as transfer
+    from pivot.storage import state
 
     cache_dir = transfer.get_default_cache_dir()
     s3_remote, resolved_name = transfer.create_remote_from_name(remote_name)
@@ -100,7 +101,8 @@ def pull(targets: tuple[str, ...], remote_name: str | None, dry_run: bool, jobs:
     outputs (and dependencies for stages). Otherwise, pulls all available
     files from remote.
     """
-    from pivot import state, transfer
+    from pivot.remote import sync as transfer
+    from pivot.storage import state
 
     cache_dir = transfer.get_default_cache_dir()
     s3_remote, resolved_name = transfer.create_remote_from_name(remote_name)

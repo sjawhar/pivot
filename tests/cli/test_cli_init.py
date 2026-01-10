@@ -35,10 +35,10 @@ def test_init_creates_gitignore(runner: click.testing.CliRunner, tmp_path: pathl
 @pytest.mark.parametrize(
     "expected_content",
     [
-        "cache/",
-        "state.db",
-        "state.lmdb/",
-        "config.yaml.lock",
+        pytest.param("cache/", id="cache_dir"),
+        pytest.param("state.db", id="state_db"),
+        pytest.param("state.lmdb/", id="state_lmdb"),
+        pytest.param("config.yaml.lock", id="config_lock"),
     ],
 )
 def test_init_gitignore_contains_expected_entries(

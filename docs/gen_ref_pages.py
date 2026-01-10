@@ -14,8 +14,7 @@ PUBLIC_MODULES = [
     ("pivot.parameters", "Parameters"),
     ("pivot.explain", "Explain Mode"),
     ("pivot.types", "Type Definitions"),
-    ("pivot.cache", "Cache Utilities"),
-    ("pivot.pvt", "File Tracking"),
+    ("pivot.storage", "Storage & Cache"),
     ("pivot.dvc_compat", "DVC Compatibility"),
 ]
 

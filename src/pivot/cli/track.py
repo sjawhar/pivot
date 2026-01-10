@@ -4,8 +4,10 @@ import pathlib
 
 import click
 
-from pivot import cache, project, pvt, registry
+from pivot import project, registry
 from pivot.cli import decorators as cli_decorators
+from pivot.storage import cache
+from pivot.storage import track as track_mod
 
 
 def _paths_overlap(path_a: pathlib.Path, path_b: pathlib.Path) -> bool:
@@ -68,7 +70,7 @@ def _track_single_path(
     path_str: str,
     cache_dir: pathlib.Path,
     stage_outputs_resolved: dict[str, pathlib.Path],
-    existing_tracked: dict[str, pvt.PvtData],
+    existing_tracked: dict[str, track_mod.PvtData],
     force: bool,
 ) -> None:
     """Track a single file or directory.
@@ -81,7 +83,7 @@ def _track_single_path(
         force: Whether to overwrite existing .pvt files
     """
     # Validate path doesn't escape project
-    if pvt.has_path_traversal(path_str):
+    if track_mod.has_path_traversal(path_str):
         raise click.ClickException(f"Path traversal not allowed: {path_str}")
 
     # Normalize path (preserve symlinks) for consistency with registry/pvt
@@ -127,7 +129,7 @@ def _track_single_path(
                 )
 
     # Check for duplicate tracking
-    pvt_path = pvt.get_pvt_path(path)
+    pvt_path = track_mod.get_pvt_path(path)
     if abs_path_str in existing_tracked and not force:
         raise click.ClickException(f"'{path_str}' is already tracked. Use --force to update.")
 
@@ -144,7 +146,7 @@ def _track_single_path(
             if not file_cache_path.exists():
                 cache.copy_to_cache(file_path, file_cache_path)
 
-        pvt_data: pvt.PvtData = {
+        pvt_data: track_mod.PvtData = {
             "path": path.name,
             "hash": tree_hash,
             "size": total_size,
@@ -165,7 +167,7 @@ def _track_single_path(
         }
 
     # Write .pvt file
-    pvt.write_pvt_file(pvt_path, pvt_data)
+    track_mod.write_pvt_file(pvt_path, pvt_data)
 
     # Update existing_tracked for subsequent paths
     existing_tracked[abs_path_str] = pvt_data
@@ -188,7 +190,7 @@ def track(paths: tuple[str, ...], force: bool) -> None:
     stage_outputs = _get_all_stage_outputs()
 
     # Discover existing .pvt files
-    existing_tracked = pvt.discover_pvt_files(project_root)
+    existing_tracked = track_mod.discover_pvt_files(project_root)
 
     for path_str in paths:
         _track_single_path(path_str, cache_dir, stage_outputs, existing_tracked, force)

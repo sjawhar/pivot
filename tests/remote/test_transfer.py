@@ -5,19 +5,24 @@ from typing import TYPE_CHECKING
 import pytest
 import yaml
 
-from pivot import transfer
+from pivot import exceptions, project
+from pivot.remote import S3Remote
+from pivot.remote import config as remote_config
+from pivot.remote import sync as transfer
+from pivot.storage import state as state_mod
+from pivot.types import RemoteStatus, TransferResult
 
 if TYPE_CHECKING:
-    import pathlib
+    from pathlib import Path
 
-    import pytest_mock
+    from pytest_mock import MockerFixture
 
 # -----------------------------------------------------------------------------
 # Local Cache Hash Scanning Tests
 # -----------------------------------------------------------------------------
 
 
-def test_get_local_cache_hashes_empty(tmp_path: pathlib.Path) -> None:
+def test_get_local_cache_hashes_empty(tmp_path: Path) -> None:
     """Empty cache returns empty set."""
     cache_dir = tmp_path / "cache"
     cache_dir.mkdir()
@@ -26,7 +31,7 @@ def test_get_local_cache_hashes_empty(tmp_path: pathlib.Path) -> None:
     assert result == set()
 
 
-def test_get_local_cache_hashes_no_files_dir(tmp_path: pathlib.Path) -> None:
+def test_get_local_cache_hashes_no_files_dir(tmp_path: Path) -> None:
     """Missing files directory returns empty set."""
     cache_dir = tmp_path / "cache"
 
@@ -34,7 +39,7 @@ def test_get_local_cache_hashes_no_files_dir(tmp_path: pathlib.Path) -> None:
     assert result == set()
 
 
-def test_get_local_cache_hashes(tmp_path: pathlib.Path) -> None:
+def test_get_local_cache_hashes(tmp_path: Path) -> None:
     """Scans cache files directory and extracts hashes."""
     cache_dir = tmp_path / "cache"
     files_dir = cache_dir / "files"
@@ -57,7 +62,7 @@ def test_get_local_cache_hashes(tmp_path: pathlib.Path) -> None:
     assert result == {hash1, hash2, hash3}
 
 
-def test_get_local_cache_hashes_ignores_invalid_structure(tmp_path: pathlib.Path) -> None:
+def test_get_local_cache_hashes_ignores_invalid_structure(tmp_path: Path) -> None:
     """Ignores files not matching expected hash structure."""
     cache_dir = tmp_path / "cache"
     files_dir = cache_dir / "files"
@@ -85,15 +90,13 @@ def test_get_local_cache_hashes_ignores_invalid_structure(tmp_path: pathlib.Path
 
 
 @pytest.fixture
-def lock_project(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> pathlib.Path:
-    from pivot import project
-
+def lock_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(project, "_project_root_cache", tmp_path)
     (tmp_path / ".pivot" / "cache" / "stages").mkdir(parents=True)
     return tmp_path
 
 
-def test_get_stage_output_hashes_no_lock(lock_project: pathlib.Path) -> None:
+def test_get_stage_output_hashes_no_lock(lock_project: Path) -> None:
     """Missing lock file returns empty set with warning."""
     cache_dir = lock_project / ".pivot" / "cache"
 
@@ -101,7 +104,7 @@ def test_get_stage_output_hashes_no_lock(lock_project: pathlib.Path) -> None:
     assert result == set()
 
 
-def test_get_stage_output_hashes_file_output(lock_project: pathlib.Path) -> None:
+def test_get_stage_output_hashes_file_output(lock_project: Path) -> None:
     """Extracts hash from file output in lock file."""
     cache_dir = lock_project / ".pivot" / "cache"
 
@@ -116,7 +119,7 @@ def test_get_stage_output_hashes_file_output(lock_project: pathlib.Path) -> None
     assert result == {"abc123def45678"}
 
 
-def test_get_stage_output_hashes_directory_output(lock_project: pathlib.Path) -> None:
+def test_get_stage_output_hashes_directory_output(lock_project: Path) -> None:
     """Extracts all hashes from directory output including manifest."""
     cache_dir = lock_project / ".pivot" / "cache"
 
@@ -140,7 +143,7 @@ def test_get_stage_output_hashes_directory_output(lock_project: pathlib.Path) ->
     assert result == {"treehash1234567", "filehash1234567", "filehash2345678"}
 
 
-def test_get_stage_output_hashes_multiple_stages(lock_project: pathlib.Path) -> None:
+def test_get_stage_output_hashes_multiple_stages(lock_project: Path) -> None:
     """Collects hashes from multiple stages."""
     cache_dir = lock_project / ".pivot" / "cache"
 
@@ -155,7 +158,7 @@ def test_get_stage_output_hashes_multiple_stages(lock_project: pathlib.Path) -> 
     assert "hash1" + "0" * 11 in result
 
 
-def test_get_stage_output_hashes_skips_uncached(lock_project: pathlib.Path) -> None:
+def test_get_stage_output_hashes_skips_uncached(lock_project: Path) -> None:
     """Skips outputs with null hash (uncached)."""
     cache_dir = lock_project / ".pivot" / "cache"
 
@@ -178,7 +181,7 @@ def test_get_stage_output_hashes_skips_uncached(lock_project: pathlib.Path) -> N
 # -----------------------------------------------------------------------------
 
 
-def test_get_stage_dep_hashes(lock_project: pathlib.Path) -> None:
+def test_get_stage_dep_hashes(lock_project: Path) -> None:
     """Extracts dependency hashes from lock file."""
     cache_dir = lock_project / ".pivot" / "cache"
 
@@ -196,7 +199,7 @@ def test_get_stage_dep_hashes(lock_project: pathlib.Path) -> None:
     assert result == {"dep1hash1234567", "dep2hash1234567"}
 
 
-def test_get_stage_dep_hashes_with_manifest(lock_project: pathlib.Path) -> None:
+def test_get_stage_dep_hashes_with_manifest(lock_project: Path) -> None:
     """Extracts all hashes from directory dependency including manifest."""
     cache_dir = lock_project / ".pivot" / "cache"
 
@@ -220,7 +223,7 @@ def test_get_stage_dep_hashes_with_manifest(lock_project: pathlib.Path) -> None:
     assert result == {"dirtreehash1234", "afilehash123456", "bfilehash123456"}
 
 
-def test_get_stage_dep_hashes_no_lock(lock_project: pathlib.Path) -> None:
+def test_get_stage_dep_hashes_no_lock(lock_project: Path) -> None:
     """Missing lock file skips silently."""
     cache_dir = lock_project / ".pivot" / "cache"
 
@@ -233,13 +236,8 @@ def test_get_stage_dep_hashes_no_lock(lock_project: pathlib.Path) -> None:
 # -----------------------------------------------------------------------------
 
 
-async def test_compare_status_empty_hashes(
-    lock_project: pathlib.Path, mocker: pytest_mock.MockerFixture
-) -> None:
+async def test_compare_status_empty_hashes(lock_project: Path, mocker: MockerFixture) -> None:
     """Empty local hashes returns empty status."""
-    from pivot import state as state_mod
-    from pivot.remote import S3Remote
-    from pivot.types import RemoteStatus
 
     mock_remote = mocker.Mock(spec=S3Remote)
     mock_state = mocker.Mock(spec=state_mod.StateDB)
@@ -250,12 +248,8 @@ async def test_compare_status_empty_hashes(
     mock_remote.bulk_exists.assert_not_called()
 
 
-async def test_compare_status_all_known_in_index(
-    lock_project: pathlib.Path, mocker: pytest_mock.MockerFixture
-) -> None:
+async def test_compare_status_all_known_in_index(lock_project: Path, mocker: MockerFixture) -> None:
     """All hashes known in index skips remote check."""
-    from pivot import state as state_mod
-    from pivot.remote import S3Remote
 
     mock_remote = mocker.Mock(spec=S3Remote)
     mock_state = mocker.Mock(spec=state_mod.StateDB)
@@ -270,12 +264,8 @@ async def test_compare_status_all_known_in_index(
     mock_remote.bulk_exists.assert_not_called()
 
 
-async def test_compare_status_queries_unknown(
-    lock_project: pathlib.Path, mocker: pytest_mock.MockerFixture
-) -> None:
+async def test_compare_status_queries_unknown(lock_project: Path, mocker: MockerFixture) -> None:
     """Unknown hashes query remote and update index."""
-    from pivot import state as state_mod
-    from pivot.remote import S3Remote
 
     mock_remote = mocker.Mock(spec=S3Remote)
     mock_state = mocker.Mock(spec=state_mod.StateDB)
@@ -298,12 +288,8 @@ async def test_compare_status_queries_unknown(
 # -----------------------------------------------------------------------------
 
 
-async def test_push_async_no_local_hashes(
-    lock_project: pathlib.Path, mocker: pytest_mock.MockerFixture
-) -> None:
+async def test_push_async_no_local_hashes(lock_project: Path, mocker: MockerFixture) -> None:
     """Push with no local hashes returns zero summary."""
-    from pivot import state as state_mod
-    from pivot.remote import S3Remote
 
     cache_dir = lock_project / ".pivot" / "cache"
     mock_remote = mocker.Mock(spec=S3Remote)
@@ -316,12 +302,8 @@ async def test_push_async_no_local_hashes(
     assert result["failed"] == 0
 
 
-async def test_push_async_all_already_on_remote(
-    lock_project: pathlib.Path, mocker: pytest_mock.MockerFixture
-) -> None:
+async def test_push_async_all_already_on_remote(lock_project: Path, mocker: MockerFixture) -> None:
     """Push when all files on remote returns skipped count."""
-    from pivot import state as state_mod
-    from pivot.remote import S3Remote
 
     cache_dir = lock_project / ".pivot" / "cache"
     files_dir = cache_dir / "files"
@@ -341,13 +323,8 @@ async def test_push_async_all_already_on_remote(
     assert result["failed"] == 0
 
 
-async def test_push_async_uploads_missing(
-    lock_project: pathlib.Path, mocker: pytest_mock.MockerFixture
-) -> None:
+async def test_push_async_uploads_missing(lock_project: Path, mocker: MockerFixture) -> None:
     """Push uploads files not on remote."""
-    from pivot import state as state_mod
-    from pivot.remote import S3Remote
-    from pivot.types import TransferResult
 
     cache_dir = lock_project / ".pivot" / "cache"
     files_dir = cache_dir / "files"
@@ -372,13 +349,8 @@ async def test_push_async_uploads_missing(
     mock_state.remote_hashes_add.assert_called()
 
 
-async def test_push_async_handles_failures(
-    lock_project: pathlib.Path, mocker: pytest_mock.MockerFixture
-) -> None:
+async def test_push_async_handles_failures(lock_project: Path, mocker: MockerFixture) -> None:
     """Push reports failures in summary."""
-    from pivot import state as state_mod
-    from pivot.remote import S3Remote
-    from pivot.types import TransferResult
 
     cache_dir = lock_project / ".pivot" / "cache"
     files_dir = cache_dir / "files"
@@ -402,13 +374,8 @@ async def test_push_async_handles_failures(
     assert "Upload failed" in result["errors"]
 
 
-async def test_push_async_with_stages(
-    lock_project: pathlib.Path, mocker: pytest_mock.MockerFixture
-) -> None:
+async def test_push_async_with_stages(lock_project: Path, mocker: MockerFixture) -> None:
     """Push with specific stages only pushes those stage outputs."""
-    from pivot import state as state_mod
-    from pivot.remote import S3Remote
-    from pivot.types import TransferResult
 
     cache_dir = lock_project / ".pivot" / "cache"
     files_dir = cache_dir / "files"
@@ -443,12 +410,8 @@ async def test_push_async_with_stages(
 # -----------------------------------------------------------------------------
 
 
-async def test_pull_async_no_needed_hashes(
-    lock_project: pathlib.Path, mocker: pytest_mock.MockerFixture
-) -> None:
+async def test_pull_async_no_needed_hashes(lock_project: Path, mocker: MockerFixture) -> None:
     """Pull with no needed hashes returns zero summary."""
-    from pivot import state as state_mod
-    from pivot.remote import S3Remote
 
     cache_dir = lock_project / ".pivot" / "cache"
     mock_remote = mocker.Mock(spec=S3Remote)
@@ -463,12 +426,8 @@ async def test_pull_async_no_needed_hashes(
     assert result["failed"] == 0
 
 
-async def test_pull_async_all_already_local(
-    lock_project: pathlib.Path, mocker: pytest_mock.MockerFixture
-) -> None:
+async def test_pull_async_all_already_local(lock_project: Path, mocker: MockerFixture) -> None:
     """Pull when all files local returns skipped count."""
-    from pivot import state as state_mod
-    from pivot.remote import S3Remote
 
     cache_dir = lock_project / ".pivot" / "cache"
     files_dir = cache_dir / "files"
@@ -495,13 +454,8 @@ async def test_pull_async_all_already_local(
     assert result["failed"] == 0
 
 
-async def test_pull_async_downloads_missing(
-    lock_project: pathlib.Path, mocker: pytest_mock.MockerFixture
-) -> None:
+async def test_pull_async_downloads_missing(lock_project: Path, mocker: MockerFixture) -> None:
     """Pull downloads files not in local cache."""
-    from pivot import state as state_mod
-    from pivot.remote import S3Remote
-    from pivot.types import TransferResult
 
     cache_dir = lock_project / ".pivot" / "cache"
 
@@ -529,12 +483,9 @@ async def test_pull_async_downloads_missing(
 
 
 async def test_pull_async_without_stages_lists_remote(
-    lock_project: pathlib.Path, mocker: pytest_mock.MockerFixture
+    lock_project: Path, mocker: MockerFixture
 ) -> None:
     """Pull without stages lists all hashes from remote."""
-    from pivot import state as state_mod
-    from pivot.remote import S3Remote
-    from pivot.types import TransferResult
 
     cache_dir = lock_project / ".pivot" / "cache"
     (cache_dir / "files").mkdir(parents=True)
@@ -553,13 +504,8 @@ async def test_pull_async_without_stages_lists_remote(
     mock_remote.list_hashes.assert_called_once()
 
 
-async def test_pull_async_handles_failures(
-    lock_project: pathlib.Path, mocker: pytest_mock.MockerFixture
-) -> None:
+async def test_pull_async_handles_failures(lock_project: Path, mocker: MockerFixture) -> None:
     """Pull reports failures in summary."""
-    from pivot import state as state_mod
-    from pivot.remote import S3Remote
-    from pivot.types import TransferResult
 
     cache_dir = lock_project / ".pivot" / "cache"
 
@@ -585,13 +531,8 @@ async def test_pull_async_handles_failures(
     assert "Download failed" in result["errors"]
 
 
-async def test_pull_async_includes_deps(
-    lock_project: pathlib.Path, mocker: pytest_mock.MockerFixture
-) -> None:
+async def test_pull_async_includes_deps(lock_project: Path, mocker: MockerFixture) -> None:
     """Pull includes dependency hashes when stages specified."""
-    from pivot import state as state_mod
-    from pivot.remote import S3Remote
-    from pivot.types import TransferResult
 
     cache_dir = lock_project / ".pivot" / "cache"
 
@@ -627,17 +568,14 @@ async def test_pull_async_includes_deps(
 # -----------------------------------------------------------------------------
 
 
-def test_get_default_cache_dir(lock_project: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_get_default_cache_dir(lock_project: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Returns cache dir relative to project root."""
     result = transfer.get_default_cache_dir()
     assert result == lock_project / ".pivot" / "cache"
 
 
-def test_create_remote_from_name(
-    lock_project: pathlib.Path, mocker: pytest_mock.MockerFixture
-) -> None:
+def test_create_remote_from_name(lock_project: Path, mocker: MockerFixture) -> None:
     """Creates S3Remote from configured remote name."""
-    from pivot import remote_config
 
     mocker.patch.object(remote_config, "get_remote_url", return_value="s3://bucket/prefix")
     mocker.patch.object(remote_config, "get_default_remote", return_value="origin")
@@ -648,11 +586,8 @@ def test_create_remote_from_name(
     assert remote.bucket == "bucket"
 
 
-def test_create_remote_from_name_default(
-    lock_project: pathlib.Path, mocker: pytest_mock.MockerFixture
-) -> None:
+def test_create_remote_from_name_default(lock_project: Path, mocker: MockerFixture) -> None:
     """Uses default remote when name is None."""
-    from pivot import remote_config
 
     mocker.patch.object(remote_config, "get_remote_url", return_value="s3://bucket/prefix")
     mocker.patch.object(remote_config, "get_default_remote", return_value="origin")
@@ -663,11 +598,8 @@ def test_create_remote_from_name_default(
     assert remote.bucket == "bucket"
 
 
-def test_create_remote_from_name_single_remote(
-    lock_project: pathlib.Path, mocker: pytest_mock.MockerFixture
-) -> None:
+def test_create_remote_from_name_single_remote(lock_project: Path, mocker: MockerFixture) -> None:
     """Uses single remote when no default set."""
-    from pivot import remote_config
 
     mocker.patch.object(remote_config, "get_remote_url", return_value="s3://bucket/prefix")
     mocker.patch.object(remote_config, "get_default_remote", return_value=None)
@@ -679,10 +611,9 @@ def test_create_remote_from_name_single_remote(
 
 
 def test_create_remote_from_name_multiple_remotes_error(
-    lock_project: pathlib.Path, mocker: pytest_mock.MockerFixture
+    lock_project: Path, mocker: MockerFixture
 ) -> None:
     """Raises error when multiple remotes and no default."""
-    from pivot import exceptions, remote_config
 
     mocker.patch.object(remote_config, "get_remote_url", return_value="s3://bucket/prefix")
     mocker.patch.object(remote_config, "get_default_remote", return_value=None)

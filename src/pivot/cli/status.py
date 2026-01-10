@@ -9,10 +9,12 @@ from pivot import discovery, exceptions, project, registry
 from pivot import status as status_mod
 from pivot.cli import completion
 from pivot.types import (
+    PipelineStatus,
     PipelineStatusInfo,
     RemoteSyncInfo,
     StatusOutput,
     TrackedFileInfo,
+    TrackedFileStatus,
 )
 
 
@@ -92,8 +94,8 @@ def status(
             raise click.ClickException(f"Remote error: {e}") from e
 
     # Compute counts once for suggestions and output
-    stale_count = sum(1 for s in pipeline_status if s["status"] == "stale")
-    modified_count = sum(1 for f in tracked_status if f["status"] == "modified")
+    stale_count = sum(1 for s in pipeline_status if s["status"] == PipelineStatus.STALE)
+    modified_count = sum(1 for f in tracked_status if f["status"] == TrackedFileStatus.MODIFIED)
     push_count = remote_status["push_count"] if remote_status else 0
     pull_count = remote_status["pull_count"] if remote_status else 0
     suggestions = status_mod.get_suggestions(stale_count, modified_count, push_count, pull_count)
@@ -190,16 +192,18 @@ def _print_pipeline_section(pipeline_status: list[PipelineStatusInfo], verbose: 
         return
 
     total = len(pipeline_status)
-    stale = sum(1 for s in pipeline_status if s["status"] == "stale")
+    stale = sum(1 for s in pipeline_status if s["status"] == PipelineStatus.STALE)
     click.echo(f"  {total} stages: {total - stale} cached, {stale} stale")
     click.echo()
 
     stages_to_show = (
-        pipeline_status if verbose else [s for s in pipeline_status if s["status"] == "stale"]
+        pipeline_status
+        if verbose
+        else [s for s in pipeline_status if s["status"] == PipelineStatus.STALE]
     )
 
     for stage in stages_to_show:
-        icon = "\u2713" if stage["status"] == "cached" else "\u26a0"
+        icon = "\u2713" if stage["status"] == PipelineStatus.CACHED else "\u26a0"
         click.echo(f"  {icon} {stage['name']:<20} {stage['reason'] or '-'}")
 
 
@@ -212,8 +216,8 @@ def _print_tracked_section(tracked_status: list[TrackedFileInfo], verbose: bool)
         return
 
     total = len(tracked_status)
-    clean = sum(1 for f in tracked_status if f["status"] == "clean")
-    modified = sum(1 for f in tracked_status if f["status"] == "modified")
+    clean = sum(1 for f in tracked_status if f["status"] == TrackedFileStatus.CLEAN)
+    modified = sum(1 for f in tracked_status if f["status"] == TrackedFileStatus.MODIFIED)
     missing = total - clean - modified
 
     parts = [f"{clean} clean", f"{modified} modified"]
@@ -223,14 +227,16 @@ def _print_tracked_section(tracked_status: list[TrackedFileInfo], verbose: bool)
     click.echo()
 
     files_to_show = (
-        tracked_status if verbose else [f for f in tracked_status if f["status"] != "clean"]
+        tracked_status
+        if verbose
+        else [f for f in tracked_status if f["status"] != TrackedFileStatus.CLEAN]
     )
 
     for file in files_to_show:
         match file["status"]:
-            case "clean":
+            case TrackedFileStatus.CLEAN:
                 icon = "\u2713"
-            case "modified":
+            case TrackedFileStatus.MODIFIED:
                 icon = "\u26a0"
             case _:
                 icon = "\u2717"

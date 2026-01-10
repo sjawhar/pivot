@@ -38,6 +38,7 @@ def test_data_group_help(runner: click.testing.CliRunner) -> None:
     result = runner.invoke(cli.cli, ["data", "--help"])
     assert result.exit_code == 0
     assert "diff" in result.output
+    assert "get" in result.output
 
 
 def test_data_in_main_help(runner: click.testing.CliRunner) -> None:

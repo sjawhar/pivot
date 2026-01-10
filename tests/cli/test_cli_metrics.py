@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import json
 import pathlib
+from typing import TYPE_CHECKING, cast
 
 import click.testing
 import pytest
 import yaml
 
-from pivot import cli
+from pivot import cli, git, outputs
+from pivot.registry import REGISTRY
+
+if TYPE_CHECKING:
+    from pytest_mock import MockerFixture
 
 
 @pytest.fixture
@@ -218,3 +223,102 @@ def test_metrics_in_main_help(runner: click.testing.CliRunner) -> None:
     result = runner.invoke(cli.cli, ["--help"])
     assert result.exit_code == 0
     assert "metrics" in result.output
+
+
+# =============================================================================
+# Metrics Diff Integration Tests
+# =============================================================================
+
+
+def _helper_metrics_stage() -> None:
+    """Helper stage for metrics diff tests."""
+    pass
+
+
+@pytest.mark.parametrize(
+    ("head_metrics", "workspace_metrics", "cli_args", "test_id"),
+    [
+        pytest.param(
+            {"accuracy": 0.85, "loss": 0.15},
+            {"accuracy": 0.92, "loss": 0.08},
+            [],
+            "shows_changes",
+            id="shows-changes",
+        ),
+        pytest.param(
+            {"accuracy": 0.80},
+            {"accuracy": 0.95},
+            ["--json"],
+            "json_output",
+            id="json-output",
+        ),
+        pytest.param(
+            {"accuracy": 0.90},
+            {"accuracy": 0.90},
+            [],
+            "no_changes",
+            id="no-changes",
+        ),
+        pytest.param(
+            {"f1": 0.75},
+            {"f1": 0.88},
+            ["--md"],
+            "markdown_format",
+            id="markdown-format",
+        ),
+    ],
+)
+def test_metrics_diff_integration(
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    mocker: MockerFixture,
+    head_metrics: dict[str, float],
+    workspace_metrics: dict[str, float],
+    cli_args: list[str],
+    test_id: str,
+) -> None:
+    """Integration test: metrics diff with various formats and scenarios."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+
+        REGISTRY.register(
+            _helper_metrics_stage,
+            name="train",
+            outs=[outputs.Metric("metrics.json")],
+        )
+
+        lock_content = yaml.dump({"outs": [{"path": "metrics.json", "hash": "abc123"}]})
+        mocker.patch.object(
+            git,
+            "read_files_from_head",
+            return_value={
+                ".pivot/cache/stages/train.lock": lock_content.encode(),
+                "metrics.json": json.dumps(head_metrics).encode(),
+            },
+        )
+
+        pathlib.Path("metrics.json").write_text(json.dumps(workspace_metrics))
+
+        result = runner.invoke(cli.cli, ["metrics", "diff", *cli_args])
+
+        assert result.exit_code == 0
+
+        match test_id:
+            case "shows_changes":
+                assert "0.85" in result.output, "Should show old HEAD value"
+                assert "0.92" in result.output, "Should show new workspace value"
+                assert "modified" in result.output.lower()
+            case "json_output":
+                parsed = cast("list[dict[str, object]]", json.loads(result.output))
+                assert len(parsed) == 1
+                assert parsed[0]["change"] == "modified"
+                assert parsed[0]["old"] == 0.80, "Should include old value"
+                assert parsed[0]["new"] == 0.95, "Should include new value"
+            case "no_changes":
+                assert "No metric changes" in result.output
+            case "markdown_format":
+                assert "f1" in result.output, "Should show metric name"
+                assert "|" in result.output
+                assert "---" in result.output
+            case _:
+                pytest.fail(f"Unknown test_id: {test_id}")

@@ -15,7 +15,8 @@ from typing import TYPE_CHECKING, Any, TypedDict
 
 import pydantic
 
-from pivot import cache, exceptions, lock, outputs, parameters, project, state
+from pivot import exceptions, outputs, parameters, project
+from pivot.storage import cache, lock, state
 from pivot.types import (
     HashInfo,
     LockData,

@@ -10,6 +10,7 @@ import pytest
 import watchfiles
 
 from pivot import project
+from pivot.pipeline import yaml as pipeline_yaml
 from pivot.reactive import engine
 from pivot.registry import REGISTRY, stage
 
@@ -1253,9 +1254,7 @@ stages:
     monkeypatch.syspath_prepend(str(pipeline_dir))
 
     # First manually register so we have backup
-    from pivot import pipeline_config
-
-    pipeline_config.register_from_pipeline_file(pipeline_dir / "pivot.yaml")
+    pipeline_yaml.register_from_pipeline_file(pipeline_dir / "pivot.yaml")
     assert "test_yaml_stage" in REGISTRY.list_stages()
 
     eng = engine.ReactiveEngine()
@@ -1350,9 +1349,7 @@ def py_stage() -> None:
     monkeypatch.syspath_prepend(str(pipeline_dir))
 
     # First register from pivot.yaml
-    from pivot import pipeline_config
-
-    pipeline_config.register_from_pipeline_file(pipeline_dir / "pivot.yaml")
+    pipeline_yaml.register_from_pipeline_file(pipeline_dir / "pivot.yaml")
     assert "yaml_stage" in REGISTRY.list_stages()
 
     eng = engine.ReactiveEngine()
@@ -1422,9 +1419,7 @@ stages:
     monkeypatch.syspath_prepend(str(pipeline_dir))
 
     # Register the stage
-    from pivot import pipeline_config
-
-    pipeline_config.register_from_pipeline_file(pipeline_dir / "pivot.yaml")
+    pipeline_yaml.register_from_pipeline_file(pipeline_dir / "pivot.yaml")
     assert "preserved_stage" in REGISTRY.list_stages()
 
     # Now break the pivot.yaml

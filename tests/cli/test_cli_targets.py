@@ -9,9 +9,7 @@ from pivot import outputs, registry
 from pivot.cli import targets
 
 if TYPE_CHECKING:
-    import pathlib
-
-    from pytest_mock import MockerFixture
+    from pathlib import Path
 
 
 # --- validate_targets tests ---
@@ -43,12 +41,10 @@ def test_validate_targets_logs_warning_for_invalid(caplog: pytest.LogCaptureFixt
 # --- _classify_targets tests ---
 
 
-def test_classify_targets_stage_only(
-    set_project_root: pathlib.Path,
-    mocker: MockerFixture,
-) -> None:
+def test_classify_targets_stage_only(set_project_root: Path) -> None:
     """Target that is only a stage name."""
-    mocker.patch.object(registry.REGISTRY, "list_stages", return_value=["my_stage"])
+    # Register a real stage (autouse fixture clears between tests)
+    registry.REGISTRY.register(lambda: None, name="my_stage", deps=[], outs=[])
 
     result = targets._classify_targets(["my_stage"], set_project_root)
 
@@ -58,9 +54,8 @@ def test_classify_targets_stage_only(
     assert result[0]["is_file"] is False
 
 
-def test_classify_targets_file_only(set_project_root: pathlib.Path, mocker: MockerFixture) -> None:
+def test_classify_targets_file_only(set_project_root: Path) -> None:
     """Target that is only a file path."""
-    mocker.patch.object(registry.REGISTRY, "list_stages", return_value=[])
     data_file = set_project_root / "data.csv"
     data_file.touch()
 
@@ -72,10 +67,8 @@ def test_classify_targets_file_only(set_project_root: pathlib.Path, mocker: Mock
     assert result[0]["is_file"] is True
 
 
-def test_classify_targets_neither(set_project_root: pathlib.Path, mocker: MockerFixture) -> None:
+def test_classify_targets_neither(set_project_root: Path) -> None:
     """Target that is neither a stage nor existing file."""
-    mocker.patch.object(registry.REGISTRY, "list_stages", return_value=[])
-
     result = targets._classify_targets(["nonexistent"], set_project_root)
 
     assert len(result) == 1
@@ -84,12 +77,12 @@ def test_classify_targets_neither(set_project_root: pathlib.Path, mocker: Mocker
 
 
 def test_classify_targets_both_warns(
-    set_project_root: pathlib.Path,
-    mocker: MockerFixture,
+    set_project_root: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Target that is both a stage name and file should warn."""
-    mocker.patch.object(registry.REGISTRY, "list_stages", return_value=["data"])
+    # Register stage with same name as file
+    registry.REGISTRY.register(lambda: None, name="data", deps=[], outs=[])
     data_file = set_project_root / "data"
     data_file.touch()
 
@@ -104,23 +97,14 @@ def test_classify_targets_both_warns(
 # --- resolve_output_paths tests ---
 
 
-def test_resolve_output_paths_stage(
-    set_project_root: pathlib.Path,
-    mocker: MockerFixture,
-) -> None:
+def test_resolve_output_paths_stage(set_project_root: Path) -> None:
     """Resolving a stage target should return its output paths."""
-    mocker.patch.object(registry.REGISTRY, "list_stages", return_value=["my_stage"])
-    mocker.patch.object(
-        registry.REGISTRY,
-        "get",
-        return_value={
-            "func": lambda: None,
-            "deps": [],
-            "outs": [outputs.Metric(path="metrics.yaml")],
-            "params": [],
-            "name": "my_stage",
-            "cwd": None,
-        },
+    # Register a real stage with metric output
+    registry.REGISTRY.register(
+        lambda: None,
+        name="my_stage",
+        deps=[],
+        outs=[outputs.Metric(path="metrics.yaml")],
     )
 
     resolved, missing = targets.resolve_output_paths(["my_stage"], set_project_root, outputs.Metric)
@@ -129,9 +113,8 @@ def test_resolve_output_paths_stage(
     assert missing == []
 
 
-def test_resolve_output_paths_file(set_project_root: pathlib.Path, mocker: MockerFixture) -> None:
+def test_resolve_output_paths_file(set_project_root: Path) -> None:
     """Resolving a file target should return the file path."""
-    mocker.patch.object(registry.REGISTRY, "list_stages", return_value=[])
     metrics_file = set_project_root / "my_metrics.yaml"
     metrics_file.touch()
 
@@ -143,12 +126,8 @@ def test_resolve_output_paths_file(set_project_root: pathlib.Path, mocker: Mocke
     assert missing == []
 
 
-def test_resolve_output_paths_unknown(
-    set_project_root: pathlib.Path, mocker: MockerFixture
-) -> None:
+def test_resolve_output_paths_unknown(set_project_root: Path) -> None:
     """Unknown targets should be returned in missing list."""
-    mocker.patch.object(registry.REGISTRY, "list_stages", return_value=[])
-
     resolved, missing = targets.resolve_output_paths(
         ["nonexistent.yaml"], set_project_root, outputs.Metric
     )
@@ -157,26 +136,17 @@ def test_resolve_output_paths_unknown(
     assert missing == ["nonexistent.yaml"]
 
 
-def test_resolve_output_paths_filters_by_type(
-    set_project_root: pathlib.Path,
-    mocker: MockerFixture,
-) -> None:
+def test_resolve_output_paths_filters_by_type(set_project_root: Path) -> None:
     """Only outputs matching the specified type should be included."""
-    mocker.patch.object(registry.REGISTRY, "list_stages", return_value=["mixed_stage"])
-    mocker.patch.object(
-        registry.REGISTRY,
-        "get",
-        return_value={
-            "func": lambda: None,
-            "deps": [],
-            "outs": [
-                outputs.Metric(path="metrics.yaml"),
-                outputs.Plot(path="plot.png"),
-            ],
-            "params": [],
-            "name": "mixed_stage",
-            "cwd": None,
-        },
+    # Register stage with mixed output types
+    registry.REGISTRY.register(
+        lambda: None,
+        name="mixed_stage",
+        deps=[],
+        outs=[
+            outputs.Metric(path="metrics.yaml"),
+            outputs.Plot(path="plot.png"),
+        ],
     )
 
     resolved, _ = targets.resolve_output_paths(["mixed_stage"], set_project_root, outputs.Metric)
@@ -188,23 +158,14 @@ def test_resolve_output_paths_filters_by_type(
 # --- resolve_plot_infos tests ---
 
 
-def test_resolve_plot_infos_stage(
-    set_project_root: pathlib.Path,
-    mocker: MockerFixture,
-) -> None:
+def test_resolve_plot_infos_stage(set_project_root: Path) -> None:
     """Resolving a stage target should return PlotInfo with metadata."""
-    mocker.patch.object(registry.REGISTRY, "list_stages", return_value=["plot_stage"])
-    mocker.patch.object(
-        registry.REGISTRY,
-        "get",
-        return_value={
-            "func": lambda: None,
-            "deps": [],
-            "outs": [outputs.Plot(path="train_loss.png", x="epoch", y="loss")],
-            "params": [],
-            "name": "plot_stage",
-            "cwd": None,
-        },
+    # Register stage with plot output including axis metadata
+    registry.REGISTRY.register(
+        lambda: None,
+        name="plot_stage",
+        deps=[],
+        outs=[outputs.Plot(path="train_loss.png", x="epoch", y="loss")],
     )
 
     resolved, missing = targets.resolve_plot_infos(["plot_stage"], set_project_root)
@@ -217,9 +178,8 @@ def test_resolve_plot_infos_stage(
     assert missing == []
 
 
-def test_resolve_plot_infos_file(set_project_root: pathlib.Path, mocker: MockerFixture) -> None:
+def test_resolve_plot_infos_file(set_project_root: Path) -> None:
     """Resolving a file target should return PlotInfo with (direct) stage."""
-    mocker.patch.object(registry.REGISTRY, "list_stages", return_value=[])
     plot_file = set_project_root / "my_plot.png"
     plot_file.touch()
 
@@ -252,31 +212,22 @@ def test_format_unknown_targets_error_multiple() -> None:
 # --- resolve_and_validate tests ---
 
 
-def test_resolve_and_validate_empty_targets(set_project_root: pathlib.Path) -> None:
+def test_resolve_and_validate_empty_targets(set_project_root: Path) -> None:
     result = targets.resolve_and_validate((), set_project_root, outputs.Metric)
 
     assert result is None
 
 
-def test_resolve_and_validate_raises_on_unknown(
-    set_project_root: pathlib.Path,
-    mocker: MockerFixture,
-) -> None:
+def test_resolve_and_validate_raises_on_unknown(set_project_root: Path) -> None:
     """Should raise ClickException with helpful message for unknown targets."""
-    mocker.patch.object(registry.REGISTRY, "list_stages", return_value=[])
-
     with pytest.raises(click.ClickException) as exc_info:
         targets.resolve_and_validate(("nonexistent.yaml",), set_project_root, outputs.Metric)
 
     assert "neither a registered stage nor an existing file" in str(exc_info.value)
 
 
-def test_resolve_and_validate_returns_paths(
-    set_project_root: pathlib.Path,
-    mocker: MockerFixture,
-) -> None:
+def test_resolve_and_validate_returns_paths(set_project_root: Path) -> None:
     """Should return resolved paths on success."""
-    mocker.patch.object(registry.REGISTRY, "list_stages", return_value=[])
     metrics_file = set_project_root / "data.yaml"
     metrics_file.touch()
 

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import pathlib
-from typing import TYPE_CHECKING
 
 import click
 
@@ -10,9 +9,7 @@ from pivot.cli import decorators as cli_decorators
 from pivot.cli import targets as cli_targets
 from pivot.cli.run import ensure_stages_registered
 from pivot.show import plots as plots_mod
-
-if TYPE_CHECKING:
-    from pivot.types import OutputFormat
+from pivot.types import OutputFormat
 
 
 @click.group()
@@ -106,6 +103,8 @@ def plots_diff(targets: tuple[str, ...], json_output: bool, md: bool, no_path: b
     new_hashes = plots_mod.get_plot_hashes_from_workspace(list(paths))
     diffs = plots_mod.diff_plots(old_hashes, new_hashes)
 
-    output_format: OutputFormat = "json" if json_output else ("md" if md else None)
+    output_format: OutputFormat | None = (
+        OutputFormat.JSON if json_output else (OutputFormat.MD if md else None)
+    )
     result = plots_mod.format_diff_table(diffs, output_format, show_path=not no_path)
     click.echo(result)

@@ -3,7 +3,7 @@
 ## Requirements
 
 - **Python 3.13+** (3.14+ for experimental InterpreterPoolExecutor)
-- **Linux/macOS** (Windows support via spawn context)
+- **Unix only** (Linux/macOS)
 
 ## Installing from PyPI
 

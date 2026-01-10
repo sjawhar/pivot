@@ -31,7 +31,7 @@ How Pivot compares to other pipeline and workflow tools.
 - You need fast local iteration with automatic code change detection
 - Your pipeline is Python-native and you want decorator-based configuration
 - You're frustrated by DVC's lock file performance or manual dependency declarations
-- You want `pivot watch` for rapid development cycles
+- You want watch mode (`pivot run --watch`) for rapid development cycles
 
 ### Use DVC When
 
@@ -74,9 +74,9 @@ dvc.lock  # 176 stages = 289s lock overhead
 
 # Pivot: Each stage writes its own file
 .pivot/stages/
-├── preprocess.lock.yaml
-├── train.lock.yaml
-└── evaluate.lock.yaml
+├── preprocess.lock
+├── train.lock
+└── evaluate.lock
 ```
 
 Result: 32x faster lock operations on large pipelines.
@@ -98,7 +98,7 @@ pivot run  # ~1s startup (warm)
 Rapid iteration during development:
 
 ```bash
-pivot watch  # Monitors files, re-runs on change
+pivot run --watch  # Monitors files, re-runs on change
 ```
 
 Edit code, save, see results immediately.

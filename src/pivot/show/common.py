@@ -7,12 +7,10 @@ import tabulate
 import yaml
 
 from pivot import git, yaml_config
-from pivot.types import ChangeType, StorageLockData
+from pivot.types import ChangeType, OutputFormat, StorageLockData
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
-
-    from pivot.types import OutputFormat
 
 
 def read_lock_files_from_head(
@@ -69,14 +67,14 @@ def extract_output_hashes_from_lock(
 def format_table(
     rows: list[list[str]],
     headers: list[str],
-    output_format: OutputFormat,
+    output_format: OutputFormat | None,
     empty_message: str,
 ) -> str:
     """Format rows as plain/markdown table."""
     if not rows:
         return empty_message
 
-    tablefmt = "github" if output_format == "md" else "plain"
+    tablefmt = "github" if output_format == OutputFormat.MD else "plain"
     return tabulate.tabulate(rows, headers=headers, tablefmt=tablefmt, disable_numparse=True)
 
 

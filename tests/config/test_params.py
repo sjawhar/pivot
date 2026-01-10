@@ -8,7 +8,7 @@ from pydantic import BaseModel, ValidationError
 from pivot import parameters
 
 if TYPE_CHECKING:
-    import pathlib
+    from pathlib import Path
 
     from pytest_mock import MockerFixture
 
@@ -44,13 +44,13 @@ class ComplexParams(BaseModel):
 # -----------------------------------------------------------------------------
 
 
-def test_load_params_yaml_missing_file(tmp_path: pathlib.Path, mocker: MockerFixture) -> None:
+def test_load_params_yaml_missing_file(tmp_path: Path, mocker: MockerFixture) -> None:
     mocker.patch("pivot.project.get_project_root", return_value=tmp_path)
     result = parameters.load_params_yaml()
     assert result == {}, "Missing params.yaml should return empty dict"
 
 
-def test_load_params_yaml_from_explicit_path(tmp_path: pathlib.Path) -> None:
+def test_load_params_yaml_from_explicit_path(tmp_path: Path) -> None:
     params_file = tmp_path / "params.yaml"
     params_file.write_text("train:\n  learning_rate: 0.001\n  epochs: 200\n")
 
@@ -58,7 +58,7 @@ def test_load_params_yaml_from_explicit_path(tmp_path: pathlib.Path) -> None:
     assert result == {"train": {"learning_rate": 0.001, "epochs": 200}}
 
 
-def test_load_params_yaml_from_project_root(tmp_path: pathlib.Path, mocker: MockerFixture) -> None:
+def test_load_params_yaml_from_project_root(tmp_path: Path, mocker: MockerFixture) -> None:
     mocker.patch("pivot.project.get_project_root", return_value=tmp_path)
     params_file = tmp_path / "params.yaml"
     params_file.write_text("stage1:\n  lr: 0.01\nstage2:\n  batch: 64\n")
@@ -67,7 +67,7 @@ def test_load_params_yaml_from_project_root(tmp_path: pathlib.Path, mocker: Mock
     assert result == {"stage1": {"lr": 0.01}, "stage2": {"batch": 64}}
 
 
-def test_load_params_yaml_non_dict_root(tmp_path: pathlib.Path) -> None:
+def test_load_params_yaml_non_dict_root(tmp_path: Path) -> None:
     params_file = tmp_path / "params.yaml"
     params_file.write_text("- item1\n- item2\n")
 
@@ -75,7 +75,7 @@ def test_load_params_yaml_non_dict_root(tmp_path: pathlib.Path) -> None:
     assert result == {}, "Non-dict root should return empty dict"
 
 
-def test_load_params_yaml_filters_non_dict_values(tmp_path: pathlib.Path) -> None:
+def test_load_params_yaml_filters_non_dict_values(tmp_path: Path) -> None:
     params_file = tmp_path / "params.yaml"
     params_file.write_text("valid:\n  key: value\ninvalid: just_a_string\n")
 
@@ -83,7 +83,7 @@ def test_load_params_yaml_filters_non_dict_values(tmp_path: pathlib.Path) -> Non
     assert result == {"valid": {"key": "value"}}, "Non-dict stage values should be filtered"
 
 
-def test_load_params_yaml_invalid_yaml(tmp_path: pathlib.Path) -> None:
+def test_load_params_yaml_invalid_yaml(tmp_path: Path) -> None:
     params_file = tmp_path / "params.yaml"
     params_file.write_text("invalid: yaml: content: ::::")
 

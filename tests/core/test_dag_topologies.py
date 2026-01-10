@@ -3,15 +3,7 @@ import pathlib
 import pytest
 
 from pivot import executor, project
-from pivot.registry import REGISTRY, stage
-
-
-@pytest.fixture(autouse=True)
-def clean_registry():
-    """Reset registry before each test."""
-    REGISTRY.clear()
-    yield
-    REGISTRY.clear()
+from pivot.registry import stage
 
 
 @pytest.fixture
@@ -19,9 +11,7 @@ def pipeline_dir(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> pat
     """Set up a temporary pipeline directory."""
     (tmp_path / ".pivot").mkdir()
     monkeypatch.chdir(tmp_path)
-
-    project._project_root_cache = None
-
+    monkeypatch.setattr(project, "_project_root_cache", None)
     return tmp_path
 
 

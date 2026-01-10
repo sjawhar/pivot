@@ -2,8 +2,9 @@ import pathlib
 
 import pytest
 
-from pivot import IncrementalOut, cache, executor, outputs, registry
+from pivot import IncrementalOut, executor, outputs, registry
 from pivot.executor import worker
+from pivot.storage import cache
 from pivot.types import LockData
 
 

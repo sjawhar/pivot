@@ -74,8 +74,12 @@ MetricValue = str | int | float | bool | None
 # Flattened metric data: {key: value} where keys are dot-separated paths
 MetricData = dict[str, MetricValue]
 
-# Output format for metrics display commands
-OutputFormat = Literal["json", "md"] | None
+
+class OutputFormat(enum.StrEnum):
+    """Output format for display commands."""
+
+    JSON = "json"
+    MD = "md"
 
 
 class DepEntry(TypedDict):
@@ -204,11 +208,26 @@ class RawPivotConfig(TypedDict, total=False):
 # =============================================================================
 
 
+class PipelineStatus(enum.StrEnum):
+    """Pipeline stage status for pivot status output."""
+
+    CACHED = "cached"
+    STALE = "stale"
+
+
+class TrackedFileStatus(enum.StrEnum):
+    """Status of a tracked file."""
+
+    CLEAN = "clean"
+    MODIFIED = "modified"
+    MISSING = "missing"
+
+
 class PipelineStatusInfo(TypedDict):
     """Status info for a single stage in pivot status output."""
 
     name: str
-    status: Literal["cached", "stale"]
+    status: PipelineStatus
     reason: str
     upstream_stale: list[str]
 
@@ -217,7 +236,7 @@ class TrackedFileInfo(TypedDict):
     """Status of a tracked file from pivot track."""
 
     path: str
-    status: Literal["clean", "modified", "missing"]
+    status: TrackedFileStatus
     size: int
 
 
@@ -298,10 +317,17 @@ class DisplayMode(enum.StrEnum):
     PLAIN = "plain"
 
 
+class TuiMessageType(enum.StrEnum):
+    """Type of TUI message."""
+
+    LOG = "log"
+    STATUS = "status"
+
+
 class TuiLogMessage(TypedDict):
     """Log line from worker process for TUI display."""
 
-    type: Literal["log"]
+    type: Literal[TuiMessageType.LOG]
     stage: str
     line: str
     is_stderr: bool
@@ -310,7 +336,7 @@ class TuiLogMessage(TypedDict):
 class TuiStatusMessage(TypedDict):
     """Stage status update for TUI display."""
 
-    type: Literal["status"]
+    type: Literal[TuiMessageType.STATUS]
     stage: str
     index: int
     total: int

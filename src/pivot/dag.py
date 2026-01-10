@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, cast
 import networkx as nx
 import pygtrie
 
-from pivot.exceptions import CyclicGraphError, DependencyNotFoundError
+from pivot import exceptions
 
 if TYPE_CHECKING:
     from pivot.registry import RegistryStageInfo
@@ -55,7 +55,7 @@ def build_dag(stages: dict[str, RegistryStageInfo], validate: bool = True) -> nx
                     graph.add_edge(stage_name, prod)
 
                 if not producers and validate and not pathlib.Path(dep).exists():
-                    raise DependencyNotFoundError(
+                    raise exceptions.DependencyNotFoundError(
                         f"Stage '{stage_name}' depends on '{dep}' which is not produced by "
                         + "any stage and does not exist on disk"
                     )
@@ -127,7 +127,9 @@ def _check_acyclic(graph: nx.DiGraph[str]) -> None:
         return
 
     stages_in_cycle = [from_node for from_node, _, _ in cycle] + [cycle[-1][1]]
-    raise CyclicGraphError(f"Circular dependency detected: {' -> '.join(stages_in_cycle)}")
+    raise exceptions.CyclicGraphError(
+        f"Circular dependency detected: {' -> '.join(stages_in_cycle)}"
+    )
 
 
 def get_execution_order(

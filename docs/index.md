@@ -1,23 +1,8 @@
-# Pivot: High-Performance Python Pipeline Tool
+# Pivot
 
-Pivot is a Python-native pipeline tool designed to eliminate DVC's performance bottlenecks while maintaining compatibility.
+**Change your code. Pivot knows what to run.**
 
-## Key Features
-
-- **32x faster lock file operations** through per-stage lock files
-- **Automatic code change detection** using Python introspection (no manual declarations!)
-- **Warm worker pools** with preloaded imports (numpy/pandas loaded once)
-- **DVC compatibility** via YAML export for code reviews
-
-## Performance
-
-| Component         | DVC          | Pivot       | Improvement     |
-| ----------------- | ------------ | ----------- | --------------- |
-| Lock file writes  | 289s (23.8%) | ~9s (0.7%)  | **32x faster**  |
-| Total overhead    | 301s (24.8%) | ~20s (1.6%) | **15x faster**  |
-| **Total runtime** | **1214s**    | **~950s**   | **1.3x faster** |
-
-*Benchmarked on monitoring-horizons pipeline with 176 stages*
+Pivot is a Python pipeline tool with automatic code change detection. Define stages with decorators, and Pivot figures out what needs to re-run—no manual dependency declarations, no stale caches.
 
 ## Quick Example
 
@@ -26,44 +11,47 @@ from pivot import stage
 
 @stage(deps=['data.csv'], outs=['processed.parquet'])
 def preprocess():
-    import pandas as pd
-    df = pd.read_csv('data.csv')
+    import pandas
+    df = pandas.read_csv('data.csv')
     df = df.dropna()
     df.to_parquet('processed.parquet')
 
 @stage(deps=['processed.parquet'], outs=['model.pkl'])
 def train():
-    import pandas as pd
+    import pandas
     import pickle
-    df = pd.read_parquet('processed.parquet')
-    model = {'data': df.shape}
+    df = pandas.read_parquet('processed.parquet')
+    model = {'rows': len(df), 'columns': len(df.columns)}
     with open('model.pkl', 'wb') as f:
         pickle.dump(model, f)
 ```
 
 ```bash
-pivot run  # Execute the pipeline
+pivot run  # Runs both stages
+pivot run  # Instant - nothing changed
 ```
 
-## Why Pivot?
+Modify `preprocess`, and Pivot automatically re-runs both stages. Modify `train`, and only `train` re-runs.
+
+## What Makes Pivot Different
 
 ### Automatic Code Change Detection
 
-No more manual dependency declarations! Pivot automatically detects when your Python functions change:
+Change a helper function, and Pivot knows to re-run stages that call it:
 
 ```python
-def helper(x):
-    return x * 2  # Change this...
+def normalize(x):
+    return x / x.max()  # Change this...
 
-@stage(deps=['data.csv'])
+@stage(deps=['data.csv'], outs=['output.csv'])
 def process():
     data = load('data.csv')
-    return helper(data)  # ...and Pivot knows to re-run!
+    return normalize(data)  # ...and Pivot re-runs process
 ```
 
-### Explain Mode
+No YAML to update. No manual declarations. Pivot parses your Python and tracks what each stage actually calls.
 
-See **why** a stage would run:
+### See Why Stages Run
 
 ```bash
 $ pivot explain train
@@ -73,30 +61,41 @@ Stage: train
   Reason: Code dependency changed
 
   Changes:
-    func:helper_a
+    func:normalize
       Old: 5995c853
       New: a1b2c3d4
+      File: src/utils.py:15
 ```
 
-### Per-Stage Lock Files
+### Watch Mode
 
-DVC's bottleneck: Every stage writes the entire `dvc.lock` file (O(n²) behavior)
+Edit code, save, see results:
 
-Pivot's solution: Each stage gets its own lock file for parallel writes without contention.
+```bash
+pivot run --watch  # Re-runs automatically on file changes
+```
 
 ## Getting Started
 
-Ready to try Pivot? Check out the [Installation Guide](getting-started/installation.md) and [Quick Start Tutorial](getting-started/quickstart.md).
+```bash
+pip install pivot
+```
+
+See the [Quick Start](getting-started/quickstart.md) to build your first pipeline in 5 minutes.
 
 ## Requirements
 
 - Python 3.13+
-- Linux/macOS (Windows support via spawn context)
+- Unix only (Linux/macOS)
+
+## Learn More
+
+- [Core Concepts](getting-started/concepts.md) - Stages, dependencies, caching
+- [Comparison](comparison.md) - How Pivot compares to DVC, Prefect, Dagster
+- [Architecture](architecture/overview.md) - Design decisions and internals
 
 ## Roadmap
 
-Planned features:
-
 - **Web UI** - DAG visualization and execution monitoring
-- **Additional remote backends** - GCS, Azure, SSH
+- **Additional remotes** - GCS, Azure, SSH
 - **Cloud orchestration** - Integration with cloud schedulers

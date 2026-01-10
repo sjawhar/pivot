@@ -9,8 +9,9 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from pivot import console, project, runtime_config
+from pivot import project
 from pivot.registry import REGISTRY
+from pivot.tui import console
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -50,7 +51,6 @@ def reset_pivot_state(mocker: MockerFixture) -> Generator[None]:
     CliRunner can leave console singleton pointing to closed streams,
     and project root cache pointing to old directories.
     """
-    mocker.patch.object(runtime_config, "_config_cache", None)
     mocker.patch.object(console, "_console", None)
     mocker.patch.object(project, "_project_root_cache", None)
     for name in _PIVOT_LOGGERS:

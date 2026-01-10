@@ -13,12 +13,10 @@ import yaml
 
 from pivot import git, outputs, project, yaml_config
 from pivot.show import common
-from pivot.types import ChangeType, MetricData, MetricValue
+from pivot.types import ChangeType, MetricData, MetricValue, OutputFormat
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
-
-    from pivot.types import OutputFormat
 
 logger = logging.getLogger(__name__)
 
@@ -195,11 +193,11 @@ def diff_metrics(
 
 def format_metrics_table(
     metrics: Mapping[str, Mapping[str, MetricValue]],
-    output_format: OutputFormat,
+    output_format: OutputFormat | None,
     precision: int,
 ) -> str:
     """Format metrics for display. output_format: None (plain), 'json', or 'md'."""
-    if output_format == "json":
+    if output_format == OutputFormat.JSON:
         return common.format_json(dict(metrics))
 
     rows = list[list[str]]()
@@ -212,12 +210,12 @@ def format_metrics_table(
 
 def format_diff_table(
     diffs: list[MetricDiff],
-    output_format: OutputFormat,
+    output_format: OutputFormat | None,
     precision: int,
     show_path: bool = True,
 ) -> str:
     """Format metric diffs for display. output_format: None (plain), 'json', or 'md'."""
-    if output_format == "json":
+    if output_format == OutputFormat.JSON:
         return common.format_json(diffs)
 
     rows = list[list[str]]()

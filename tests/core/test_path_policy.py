@@ -12,16 +12,16 @@ from pivot import exceptions, path_policy
 @pytest.mark.parametrize(
     ("path", "expected_error"),
     [
-        ("normal/path.txt", None),
-        ("path\x00with\x00null", "contains null byte"),
-        ("path\nwith\nnewline", "contains newline character"),
-        ("path\rwith\rcarriage", "contains newline character"),
-        ("../escape/path", "contains path traversal (..)"),
-        ("path/../escape", "contains path traversal (..)"),
-        ("path/to/../file", "contains path traversal (..)"),
-        ("..hidden", None),
-        ("hidden..", None),
-        ("..", "contains path traversal (..)"),
+        pytest.param("normal/path.txt", None, id="normal_path"),
+        pytest.param("path\x00with\x00null", "contains null byte", id="null_byte"),
+        pytest.param("path\nwith\nnewline", "contains newline character", id="newline"),
+        pytest.param("path\rwith\rcarriage", "contains newline character", id="carriage_return"),
+        pytest.param("../escape/path", "contains path traversal (..)", id="traversal_prefix"),
+        pytest.param("path/../escape", "contains path traversal (..)", id="traversal_middle"),
+        pytest.param("path/to/../file", "contains path traversal (..)", id="traversal_nested"),
+        pytest.param("..hidden", None, id="dotdot_prefix_ok"),
+        pytest.param("hidden..", None, id="dotdot_suffix_ok"),
+        pytest.param("..", "contains path traversal (..)", id="bare_dotdot"),
     ],
 )
 def test_validate_path_syntax(path: str, expected_error: str | None) -> None:
@@ -35,14 +35,14 @@ def test_validate_path_syntax(path: str, expected_error: str | None) -> None:
 @pytest.mark.parametrize(
     ("path", "expected"),
     [
-        ("a/b/c", False),
-        ("../a", True),
-        ("a/../b", True),
-        ("a/b/..", True),
-        ("..", True),
-        ("..hidden", False),
-        ("file..", False),
-        ("a..b", False),
+        pytest.param("a/b/c", False, id="normal_path"),
+        pytest.param("../a", True, id="prefix_traversal"),
+        pytest.param("a/../b", True, id="middle_traversal"),
+        pytest.param("a/b/..", True, id="suffix_traversal"),
+        pytest.param("..", True, id="bare_dotdot"),
+        pytest.param("..hidden", False, id="dotdot_prefix_ok"),
+        pytest.param("file..", False, id="dotdot_suffix_ok"),
+        pytest.param("a..b", False, id="embedded_dots_ok"),
     ],
 )
 def test_has_path_traversal(path: str, expected: bool) -> None:
@@ -79,10 +79,10 @@ def test_validate_path_absolute_outside_base_dep_allowed(tmp_path: pathlib.Path)
 @pytest.mark.parametrize(
     "path_type",
     [
-        path_policy.PathType.OUT,
-        path_policy.PathType.CWD,
-        path_policy.PathType.VAR,
-        path_policy.PathType.CLI_OUTPUT,
+        pytest.param(path_policy.PathType.OUT, id="out"),
+        pytest.param(path_policy.PathType.CWD, id="cwd"),
+        pytest.param(path_policy.PathType.VAR, id="var"),
+        pytest.param(path_policy.PathType.CLI_OUTPUT, id="cli_output"),
     ],
 )
 def test_validate_path_absolute_outside_base_rejected(
