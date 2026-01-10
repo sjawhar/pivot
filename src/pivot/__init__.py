@@ -1,23 +1,56 @@
-from pivot import cache as cache
-from pivot import dvc_compat as dvc_compat
-from pivot import explain as explain
-from pivot import outputs as outputs
-from pivot import parameters as parameters
-from pivot import pipeline as pipeline
-from pivot import pipeline_config as pipeline_config
-from pivot import pvt as pvt
-from pivot import state as state
-from pivot.outputs import BaseOut as BaseOut
-from pivot.outputs import IncrementalOut as IncrementalOut
-from pivot.outputs import Metric as Metric
-from pivot.outputs import Out as Out
-from pivot.outputs import Plot as Plot
-from pivot.pipeline import Pipeline as Pipeline
-from pivot.registry import REGISTRY as REGISTRY
-from pivot.registry import Variant as Variant
-from pivot.registry import stage as stage
-from pivot.show import metrics as metrics
-from pivot.show import params as params
-from pivot.show import plots as plots
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
 
 __version__ = "0.1.0-dev"
+
+# These are loaded eagerly for type checking but lazily at runtime
+if TYPE_CHECKING:
+    from pivot.outputs import BaseOut as BaseOut
+    from pivot.outputs import IncrementalOut as IncrementalOut
+    from pivot.outputs import Metric as Metric
+    from pivot.outputs import Out as Out
+    from pivot.outputs import Plot as Plot
+    from pivot.pipeline import Pipeline as Pipeline
+    from pivot.registry import REGISTRY as REGISTRY
+    from pivot.registry import Variant as Variant
+    from pivot.registry import stage as stage
+    from pivot.show import metrics as metrics
+    from pivot.show import params as params
+    from pivot.show import plots as plots
+
+# Lazy import mapping for runtime
+_LAZY_IMPORTS: dict[str, tuple[str, str]] = {
+    "BaseOut": ("pivot.outputs", "BaseOut"),
+    "IncrementalOut": ("pivot.outputs", "IncrementalOut"),
+    "Metric": ("pivot.outputs", "Metric"),
+    "Out": ("pivot.outputs", "Out"),
+    "Plot": ("pivot.outputs", "Plot"),
+    "Pipeline": ("pivot.pipeline", "Pipeline"),
+    "REGISTRY": ("pivot.registry", "REGISTRY"),
+    "Variant": ("pivot.registry", "Variant"),
+    "stage": ("pivot.registry", "stage"),
+    "metrics": ("pivot.show", "metrics"),
+    "params": ("pivot.show", "params"),
+    "plots": ("pivot.show", "plots"),
+}
+
+
+def __getattr__(name: str) -> object:
+    """Lazily import public API members on first access."""
+    if name in _LAZY_IMPORTS:
+        module_path, attr_name = _LAZY_IMPORTS[name]
+        import importlib
+
+        module = importlib.import_module(module_path)
+        value = getattr(module, attr_name)
+        # Cache in module globals for subsequent access
+        globals()[name] = value
+        return value
+    msg = f"module {__name__!r} has no attribute {name!r}"
+    raise AttributeError(msg)
+
+
+def __dir__() -> list[str]:
+    """List available attributes including lazy imports."""
+    return list(globals().keys()) + list(_LAZY_IMPORTS.keys())
