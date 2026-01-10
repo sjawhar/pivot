@@ -5,6 +5,7 @@ import pathlib
 import click
 
 from pivot import cache, config, lock, project, pvt, registry
+from pivot.cli import completion
 from pivot.cli import decorators as cli_decorators
 from pivot.types import OutputHash
 
@@ -130,7 +131,7 @@ def _restore_path(
 
 
 @cli_decorators.pivot_command()
-@click.argument("targets", nargs=-1)
+@click.argument("targets", nargs=-1, shell_complete=completion.complete_targets)
 @click.option(
     "--checkout-mode",
     type=click.Choice(["symlink", "hardlink", "copy"]),

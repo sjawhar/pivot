@@ -415,6 +415,29 @@ if pipeline_status:  # Truthiness check excludes empty lists
 
 This applies to all user-facing output: CLI commands, status displays, list views, etc. Users should never wonder "did it work?" or "is something broken?" because the output was empty.
 
+## CLI Shell Completion (Critical)
+
+**All new CLI commands MUST include shell completion for stage/target arguments.** When adding a new CLI command:
+
+1. **Stage arguments** (e.g., `run`, `status`, `explain`): Use `shell_complete=completion.complete_stages`
+2. **Target arguments** (e.g., `push`, `pull`, `checkout`, `get`): Use `shell_complete=completion.complete_targets`
+
+```python
+from pivot.cli import completion
+
+# For stage names
+@click.argument("stages", nargs=-1, shell_complete=completion.complete_stages)
+def my_command(stages: tuple[str, ...]) -> None:
+    ...
+
+# For targets (stages + file paths)
+@click.argument("targets", nargs=-1, shell_complete=completion.complete_targets)
+def my_command(targets: tuple[str, ...]) -> None:
+    ...
+```
+
+This enables fast tab completion (~10ms) by parsing pivot.yaml directly without loading the full Pivot stack (~500ms).
+
 ## Development Commands
 
 ```bash

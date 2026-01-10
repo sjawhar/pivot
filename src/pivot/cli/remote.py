@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import click
 
+from pivot.cli import completion
 from pivot.cli import decorators as cli_decorators
 
 
@@ -72,7 +73,7 @@ def remote_default(name: str) -> None:
 
 
 @cli_decorators.pivot_command()
-@click.argument("targets", nargs=-1)
+@click.argument("targets", nargs=-1, shell_complete=completion.complete_targets)
 @click.option("-r", "--remote", "remote_name", help="Remote name (uses default if not specified)")
 @click.option("--dry-run", "-n", is_flag=True, help="Show what would be pushed")
 @click.option("-j", "--jobs", type=int, default=20, help="Parallel upload jobs")
@@ -130,7 +131,7 @@ def push(targets: tuple[str, ...], remote_name: str | None, dry_run: bool, jobs:
 
 
 @cli_decorators.pivot_command()
-@click.argument("targets", nargs=-1)
+@click.argument("targets", nargs=-1, shell_complete=completion.complete_targets)
 @click.option("-r", "--remote", "remote_name", help="Remote name (uses default if not specified)")
 @click.option("--dry-run", "-n", is_flag=True, help="Show what would be pulled")
 @click.option("-j", "--jobs", type=int, default=20, help="Parallel download jobs")

@@ -4,11 +4,12 @@ import pathlib
 
 import click
 
+from pivot.cli import completion
 from pivot.cli import decorators as cli_decorators
 
 
 @cli_decorators.pivot_command()
-@click.argument("stages", nargs=-1)
+@click.argument("stages", nargs=-1, shell_complete=completion.complete_stages)
 @click.option(
     "--output",
     "-o",
