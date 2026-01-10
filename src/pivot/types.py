@@ -373,3 +373,63 @@ class TuiReloadMessage(TypedDict):
 
 
 TuiMessage = TuiLogMessage | TuiStatusMessage | TuiReactiveMessage | TuiReloadMessage | None
+
+
+# =============================================================================
+# Reactive JSONL Event Types (for --json output)
+# =============================================================================
+
+
+class ReactiveEventType(enum.StrEnum):
+    """Type of reactive JSONL event."""
+
+    STATUS = "status"
+    FILES_CHANGED = "files_changed"
+    AFFECTED_STAGES = "affected_stages"
+    EXECUTION_RESULT = "execution_result"
+
+
+class ReactiveStatusEvent(TypedDict):
+    """Status message event."""
+
+    type: Literal[ReactiveEventType.STATUS]
+    message: str
+    is_error: bool
+
+
+class ReactiveFilesChangedEvent(TypedDict):
+    """File change detection event."""
+
+    type: Literal[ReactiveEventType.FILES_CHANGED]
+    paths: list[str]
+    code_changed: bool
+
+
+class ReactiveAffectedStagesEvent(TypedDict):
+    """Affected stages event."""
+
+    type: Literal[ReactiveEventType.AFFECTED_STAGES]
+    stages: list[str]
+    count: int
+
+
+class ReactiveStageResult(TypedDict):
+    """Result for a single stage in reactive execution."""
+
+    status: str
+    reason: str
+
+
+class ReactiveExecutionResultEvent(TypedDict):
+    """Execution result event."""
+
+    type: Literal[ReactiveEventType.EXECUTION_RESULT]
+    stages: dict[str, ReactiveStageResult]
+
+
+ReactiveJsonEvent = (
+    ReactiveStatusEvent
+    | ReactiveFilesChangedEvent
+    | ReactiveAffectedStagesEvent
+    | ReactiveExecutionResultEvent
+)
