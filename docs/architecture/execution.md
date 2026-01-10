@@ -119,11 +119,93 @@ Implementation:
 
 Each stage execution:
 
-1. **Restore IncrementalOut** - If using incremental outputs
-2. **Execute Function** - Run the user's code
-3. **Hash Outputs** - Compute content hashes
-4. **Cache Outputs** - Store in content-addressable cache
-5. **Write Lock File** - Record fingerprint
+1. **Acquire Execution Lock** - Prevent concurrent execution of same stage
+2. **Read Lock Data** - Get previous fingerprint and hashes
+3. **Hash Dependencies** - Compute current dependency hashes
+4. **Check Skip Conditions** - Compare fingerprints, params, deps
+5. **Restore or Execute** - Either restore from cache or run function
+6. **Cache Outputs** - Store in content-addressable cache
+7. **Write Lock File** - Record new fingerprint and hashes
+8. **Release Lock**
+
+## Concurrency Safety
+
+Pivot uses a "check-lock-recheck" pattern to prevent TOCTOU (Time-of-Check-Time-of-Use) race conditions in parallel execution.
+
+### The Problem
+
+Without proper locking, parallel stage execution can race:
+
+```
+Process A                     Process B
+─────────                     ─────────
+Read lock file                Read lock file
+Check: unchanged              Check: unchanged
+                              Start executing...
+Start executing...            ...
+Write output                  Write output (CONFLICT!)
+```
+
+### The Solution: Execution Locks
+
+All change detection and cache operations happen inside an execution lock:
+
+```python
+with execution_lock(stage_name, cache_dir):
+    lock_data = stage_lock.read()           # Read inside lock
+    dep_hashes = hash_dependencies(deps)     # Hash inside lock
+
+    if can_skip(lock_data, fingerprint, dep_hashes):
+        restore_outputs_from_cache(...)
+        return SKIPPED
+
+    run_stage_function()
+    save_outputs_to_cache()
+    stage_lock.write(new_lock_data)
+```
+
+### Lock Implementation
+
+Execution locks use PID-based sentinel files with atomic creation:
+
+```python
+# Atomic lock acquisition
+fd = os.open(sentinel, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+with os.fdopen(fd, 'w') as f:
+    f.write(f"pid: {os.getpid()}\n")
+```
+
+Key properties:
+
+- **Atomic creation** - `O_CREAT | O_EXCL` guarantees only one process wins
+- **Crash recovery** - Stale locks detected via PID checking
+- **Cross-platform** - Works on Linux and macOS
+- **Visible state** - Lock files can be inspected for debugging
+
+### Design Decision: Simple Locks vs Reader-Writer Locks
+
+Two approaches were considered for TOCTOU prevention:
+
+| Approach | Description | Overhead |
+|----------|-------------|----------|
+| **Simple (chosen)** | Move operations inside existing execution lock | ~0ms |
+| **RWLock** | Separate reader-writer locks per path (like DVC) | Higher |
+
+**Benchmark results** (57-stage pipeline, 10 runs each, warmup excluded):
+
+| Metric | Baseline | With TOCTOU Fix |
+|--------|----------|-----------------|
+| Mean | 8.944s ± 0.333s | 8.899s ± 0.282s |
+| Overhead | - | -0.5% (not significant) |
+
+The simple approach was chosen because:
+
+1. **Zero measurable overhead** - Lock acquisition via `O_CREAT|O_EXCL` is ~μs
+2. **No new dependencies** - Uses existing OS primitives
+3. **Simpler code** - No separate lock coordination layer
+4. **DVC's RWLock has issues** - JSON-based lock file requires full rewrite on every operation; LMDB alternative has global write lock that serializes all lock operations
+
+The RWLock approach would only benefit workloads with many concurrent readers of the same paths, which is rare in practice since Pivot's DAG ensures dependencies complete before dependents run.
 
 ## Error Handling
 
