@@ -146,17 +146,223 @@ def test_stage_params_cls_must_be_basemodel():
             pass
 
 
-def test_stage_warns_on_orphaned_params_argument(caplog: pytest.LogCaptureFixture):
-    """Should warn when function has params arg but no params."""
-    import logging
+def test_stage_infers_params_from_type_hint():
+    """Should infer params class from function type hint when params not specified."""
 
-    caplog.set_level(logging.WARNING)
+    class InferredParams(BaseModel):
+        value: int = 42
+        name: str = "default"
 
     @stage()
-    def process(params: dict[str, str]):
+    def process_inferred(params: InferredParams):
         pass
 
-    assert "has 'params' parameter but no params specified" in caplog.text
+    info = REGISTRY.get("process_inferred")
+    assert info["params"] is not None
+    assert isinstance(info["params"], InferredParams)
+    assert info["params"].value == 42
+    assert info["params"].name == "default"
+
+
+def test_stage_infer_params_requires_type_hint():
+    """Should raise ParamsError when function has params arg but no type hint."""
+
+    with pytest.raises(ParamsError, match="has 'params' parameter but no type hint"):
+
+        @stage()
+        def process_no_hint(params):  # pyright: ignore[reportUnknownParameterType,reportMissingParameterType]
+            pass
+
+
+def test_stage_infer_params_requires_basemodel_hint():
+    """Should raise ParamsError when params type hint is a generic type."""
+
+    with pytest.raises(ParamsError, match="not a generic or union type"):
+
+        @stage()
+        def process_bad_hint(params: dict[str, str]):
+            pass
+
+
+def test_stage_infer_params_requires_basemodel_plain_class():
+    """Should raise ParamsError when params type hint is a plain class (not BaseModel)."""
+
+    class PlainClass:
+        pass
+
+    with pytest.raises(ParamsError, match="params type hint must be a Pydantic BaseModel"):
+
+        @stage()
+        def process_plain_class(params: PlainClass):
+            pass
+
+
+def test_stage_params_type_mismatch_raises_error():
+    """Should raise ParamsError when params instance type doesn't match function type hint."""
+
+    class ParamsA(BaseModel):
+        value_a: int = 1
+
+    class ParamsB(BaseModel):
+        value_b: str = "x"
+
+    with pytest.raises(ParamsError, match="does not match function type hint"):
+
+        @stage(params=ParamsA())
+        def process_mismatch(params: ParamsB):
+            pass
+
+
+def test_stage_params_class_mismatch_raises_error():
+    """Should raise ParamsError when params class doesn't match function type hint."""
+
+    class ParamsA(BaseModel):
+        value_a: int = 1
+
+    class ParamsB(BaseModel):
+        value_b: str = "x"
+
+    with pytest.raises(ParamsError, match="does not match function type hint"):
+
+        @stage(params=ParamsA)
+        def process_class_mismatch(params: ParamsB):
+            pass
+
+
+def test_stage_params_subclass_allowed():
+    """Should allow params that is a subclass of the type hint."""
+
+    class BaseParams(BaseModel):
+        value: int = 1
+
+    class DerivedParams(BaseParams):
+        extra: str = "derived"
+
+    # Subclass should be accepted when base class is the type hint
+    @stage(params=DerivedParams())
+    def process_subclass(params: BaseParams):
+        pass
+
+    info = REGISTRY.get("process_subclass")
+    assert info["params"] is not None
+    assert isinstance(info["params"], DerivedParams)
+    assert info["params"].extra == "derived"
+
+
+def test_stage_params_union_type_rejected():
+    """Should reject Union type hints for params - must be concrete BaseModel."""
+    from typing import Union  # pyright: ignore[reportDeprecated]
+
+    class MyParams(BaseModel):
+        value: int = 1
+
+    with pytest.raises(ParamsError, match="not a generic or union type"):
+
+        @stage()
+        def process_union(params: Union[MyParams, None]):  # noqa: UP007  # pyright: ignore[reportDeprecated]
+            pass
+
+
+def test_stage_params_optional_type_rejected():
+    """Should reject Optional type hints for params - must be concrete BaseModel."""
+    from typing import Optional  # pyright: ignore[reportDeprecated]
+
+    class MyParams(BaseModel):
+        value: int = 1
+
+    with pytest.raises(ParamsError, match="not a generic or union type"):
+
+        @stage()
+        def process_optional(params: Optional[MyParams]):  # noqa: UP045  # pyright: ignore[reportDeprecated]
+            pass
+
+
+def test_stage_params_pipe_none_type_rejected():
+    """Should reject X | None type hints for params - must be concrete BaseModel."""
+
+    class MyParams(BaseModel):
+        value: int = 1
+
+    with pytest.raises(ParamsError, match="not a generic or union type"):
+
+        @stage()
+        def process_pipe_none(params: MyParams | None):
+            pass
+
+
+def test_stage_params_generic_type_rejected():
+    """Should reject generic type hints like list[MyParams]."""
+
+    class MyParams(BaseModel):
+        value: int = 1
+
+    with pytest.raises(ParamsError, match="not a generic or union type"):
+
+        @stage()
+        def process_generic(params: list[MyParams]):
+            pass
+
+
+def test_stage_params_required_fields_raises_error():
+    """Should raise ParamsError when inferred params have required fields without defaults."""
+
+    class RequiredParams(BaseModel):
+        required_value: int  # No default - must be provided
+
+    with pytest.raises(ParamsError, match="validation error"):
+
+        @stage()
+        def process_required(params: RequiredParams):
+            pass
+
+
+def test_stage_with_additional_decorator():
+    """Should work with functions that have additional decorators."""
+    import functools
+    from collections.abc import Callable
+    from typing import Any, TypeVar
+
+    class DecoratedParams(BaseModel):
+        multiplier: int = 2
+
+    T = TypeVar("T", bound=Callable[..., Any])
+
+    def my_decorator(f: T) -> T:
+        @functools.wraps(f)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            return f(*args, **kwargs)
+
+        return wrapper  # pyright: ignore[reportReturnType]
+
+    @stage()
+    @my_decorator
+    def decorated_stage(params: DecoratedParams) -> int:
+        return params.multiplier * 10
+
+    info = REGISTRY.get("decorated_stage")
+    assert info["params"] is not None
+    assert isinstance(info["params"], DecoratedParams)
+    assert info["params"].multiplier == 2
+
+
+def test_stage_params_forward_ref_module_level():
+    """Should handle forward reference to module-level class."""
+    # ForwardRefParams is defined at module level below
+    # This test verifies forward refs work when the class is importable
+
+    @stage()
+    def process_forward_ref(params: "ForwardRefParams"):
+        pass
+
+    info = REGISTRY.get("process_forward_ref")
+    assert info["params"] is not None
+    assert isinstance(info["params"], ForwardRefParams)
+    assert info["params"].ref_value == 99
+
+
+# Module-level class for forward reference test
+class ForwardRefParams(BaseModel):
+    ref_value: int = 99
 
 
 def test_stage_defaults_to_function_name():

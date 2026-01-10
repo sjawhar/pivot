@@ -7,7 +7,7 @@ import logging
 import pathlib
 import re
 from collections.abc import Callable, Sequence
-from typing import TYPE_CHECKING, Any, TypedDict, TypeVar
+from typing import TYPE_CHECKING, Any, TypedDict, TypeVar, get_origin, get_type_hints
 
 import pydantic
 
@@ -93,36 +93,36 @@ class Variant(pydantic.BaseModel, frozen=True):
 class stage:
     """Decorator for marking functions as pipeline stages.
 
+    The params class is automatically inferred from the function's type hint,
+    so you don't need to pass `params=MyParams` - just type-hint your function.
+
     Args:
         deps: Input dependencies (file paths, relative to cwd or project root)
         outs: Output files produced by stage (str, Out, Metric, or Plot)
-        params: Optional Pydantic model class or instance for parameters
+        params: Optional params specification. Can be:
+            - None (default): params inferred from function signature, instantiated with defaults
+            - Pydantic BaseModel class: instantiated with defaults (validated against type hint)
+            - Pydantic BaseModel instance: used directly (validated against type hint)
         mutex: Mutex groups this stage belongs to (prevents concurrent execution)
         cwd: Working directory for path resolution and stage execution (default: project root)
 
     Example:
-        >>> @stage(deps=['input.txt'], outs=['output.txt'])
-        >>> def process(input_file: str, output_file: str):
-        ...     # Process files...
-        ...     pass
+        >>> class MyParams(BaseModel):
+        ...     threshold: float = 0.5
 
-        >>> @stage(deps=['data.csv'], outs=[Out('model.pkl'), Metric('metrics.json')])
-        >>> def train():
-        ...     pass
+        >>> # Params class inferred from type hint - no params= needed!
+        >>> @stage(deps=['data.csv'], outs=['output.csv'])
+        >>> def train(params: MyParams):
+        ...     print(params.threshold)  # 0.5 (default)
+
+        >>> # Explicit params instance for custom values
+        >>> @stage(deps=['data.csv'], params=MyParams(threshold=0.9))
+        >>> def train_explicit(params: MyParams):
+        ...     print(params.threshold)  # 0.9
 
         >>> @stage(deps=['data.csv'], outs=['model.pkl'], mutex=['gpu'])
         >>> def train_gpu():
         ...     # Only one 'gpu' mutex stage runs at a time
-        ...     pass
-
-        >>> @stage(deps=['data.csv'], params=MyParams(threshold=0.5))
-        >>> def train_with_params(params: MyParams):
-        ...     # Uses pre-configured params instance
-        ...     pass
-
-        >>> @stage(deps=['data.csv'], outs=['output.csv'], cwd='subdir')
-        >>> def process_subdir():
-        ...     # Paths relative to subdir/, stage runs from subdir/
         ...     pass
     """
 
@@ -406,51 +406,134 @@ def _handle_validation_error(msg: str, validation_mode: ValidationMode) -> None:
     logger.warning(msg)
 
 
+def _get_params_type_hint(
+    func: Callable[..., Any],
+    stage_name: str,
+    *,
+    strict: bool,
+) -> type[pydantic.BaseModel] | None:
+    """Get the params type hint from function signature.
+
+    Args:
+        func: The stage function to inspect
+        stage_name: Name of the stage (for error messages)
+        strict: If True, raise ParamsError on issues. If False, return None.
+
+    Returns:
+        The params class from the type hint, or None if can't resolve (when strict=False)
+
+    Raises:
+        ParamsError: When strict=True and type hints can't be resolved or are invalid
+    """
+    try:
+        type_hints = get_type_hints(func)
+    except (NameError, TypeError, AttributeError) as e:
+        if strict:
+            raise ParamsError(
+                f"Stage '{stage_name}': failed to resolve type hints for "
+                + f"'{func.__name__}': {e}"
+            ) from e
+        return None
+
+    if "params" not in type_hints:
+        if strict:
+            raise ParamsError(
+                f"Stage '{stage_name}': function '{func.__name__}' has 'params' parameter "
+                + "but no type hint. Add a type hint like 'params: MyParams'"
+            )
+        return None
+
+    hint = type_hints["params"]
+
+    # Reject Union/Optional types - params must be a concrete BaseModel class
+    origin = get_origin(hint)
+    if origin is not None:
+        raise ParamsError(
+            f"Stage '{stage_name}': params type hint must be a concrete Pydantic BaseModel "
+            + f"class, not a generic or union type. Got: {hint}"
+        )
+
+    if not parameters.validate_params_cls(hint):
+        if strict:
+            raise ParamsError(
+                f"Stage '{stage_name}': params type hint must be a Pydantic BaseModel, "
+                + f"got {hint}"
+            )
+        return None
+
+    return hint
+
+
 def _resolve_params(
     params_arg: ParamsArg,
     func: Callable[..., Any],
     stage_name: str,
 ) -> pydantic.BaseModel | None:
-    """Resolve params argument to an instance, validating along the way.
+    """Resolve params argument to an instance, inferring from function signature if needed.
 
-    If params is a class, instantiate it with defaults.
-    If params is an instance, use it directly.
-    If params is None, return None.
+    Resolution order:
+    1. If params_arg is an instance, use it directly (validated against type hint)
+    2. If params_arg is a class, instantiate with defaults (validated against type hint)
+    3. If params_arg is None, infer class from function signature and instantiate with defaults
+
+    The params class is inferred from the type hint of the function's 'params' parameter.
     """
-    if params_arg is None:
-        _warn_orphaned_params(func, stage_name)
-        return None
-
     sig = inspect.signature(func)
-    if "params" not in sig.parameters:
-        raise ParamsError(
-            f"Stage '{stage_name}': function must have a 'params' parameter when params is specified"
-        )
+    has_params_param = "params" in sig.parameters
 
-    # Check if it's a class (type) or instance
-    if isinstance(params_arg, type):
-        # It's a class - validate and instantiate
-        if not parameters.validate_params_cls(params_arg):
-            raise ParamsError(
-                f"Stage '{stage_name}': params must be a Pydantic BaseModel subclass, got {params_arg.__name__}"
-            )
-        return params_arg()
-    else:
-        # It's an instance - validate the type
-        if not parameters.validate_params_cls(type(params_arg)):
-            raise ParamsError(
-                f"Stage '{stage_name}': params must be a Pydantic BaseModel instance, got {type(params_arg).__name__}"
-            )
-        return params_arg
+    match params_arg:
+        # Case 1: params is an instance - use directly (after validation)
+        case pydantic.BaseModel():
+            if not has_params_param:
+                raise ParamsError(
+                    f"Stage '{stage_name}': function must have a 'params' parameter "
+                    + "when params is specified"
+                )
+            expected_cls = _get_params_type_hint(func, stage_name, strict=False)
+            if expected_cls is not None and not isinstance(params_arg, expected_cls):
+                raise ParamsError(
+                    f"Stage '{stage_name}': params type {type(params_arg).__name__} "
+                    + f"does not match function type hint {expected_cls.__name__}"
+                )
+            return params_arg
 
+        # Case 2: params is a class - instantiate with defaults
+        case type() as params_cls:
+            if not has_params_param:
+                raise ParamsError(
+                    f"Stage '{stage_name}': function must have a 'params' parameter "
+                    + "when params is specified"
+                )
+            if not parameters.validate_params_cls(params_cls):
+                raise ParamsError(
+                    f"Stage '{stage_name}': params must be a Pydantic BaseModel subclass, "
+                    + f"got {params_cls.__name__}"
+                )
+            expected_cls = _get_params_type_hint(func, stage_name, strict=False)
+            if expected_cls is not None and not issubclass(params_cls, expected_cls):
+                raise ParamsError(
+                    f"Stage '{stage_name}': params type {params_cls.__name__} "
+                    + f"does not match function type hint {expected_cls.__name__}"
+                )
+            try:
+                return params_cls()
+            except pydantic.ValidationError as e:
+                raise ParamsError(
+                    f"Stage '{stage_name}': cannot instantiate params with defaults: {e}"
+                ) from e
 
-def _warn_orphaned_params(func: Callable[..., Any], stage_name: str) -> None:
-    """Warn if function has 'params' parameter but no params provided."""
-    sig = inspect.signature(func)
-    if "params" in sig.parameters:
-        logger.warning(
-            f"Stage '{stage_name}': function has 'params' parameter but no params specified"
-        )
+        # Case 3: params is None - infer class if function has params parameter
+        case None:
+            if not has_params_param:
+                return None
+            params_cls = _get_params_type_hint(func, stage_name, strict=True)
+            assert params_cls is not None  # strict=True guarantees this
+            try:
+                return params_cls()
+            except pydantic.ValidationError as e:
+                raise ParamsError(
+                    f"Stage '{stage_name}': cannot instantiate params with defaults: {e}"
+                ) from e
 
 
 def _validate_matrix_variants(variants: Sequence[Variant]) -> None:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import copy
 import logging
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, TypeGuard, cast
 
 import deepmerge
 import pydantic
@@ -134,8 +134,15 @@ def apply_overrides[T: pydantic.BaseModel](
     return type(params_instance).model_validate(merged)
 
 
-def validate_params_cls(params_cls: object) -> bool:
-    """Check if params_cls is a valid Pydantic BaseModel subclass."""
+def validate_params_cls(params_cls: object) -> TypeGuard[type[pydantic.BaseModel]]:
+    """Check if params_cls is a valid Pydantic BaseModel subclass.
+
+    This TypeGuard allows the type checker to narrow the type after a check:
+
+        if validate_params_cls(cls):
+            # cls is now type[pydantic.BaseModel]
+            instance = cls()
+    """
     return isinstance(params_cls, type) and issubclass(params_cls, pydantic.BaseModel)
 
 
