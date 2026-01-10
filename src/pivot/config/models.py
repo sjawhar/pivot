@@ -57,6 +57,7 @@ class CoreConfig(pydantic.BaseModel):
 
     max_workers: int = -2
     state_dir: str = ".pivot"
+    run_history_retention: Annotated[int, pydantic.Field(gt=0)] = 100
 
     @pydantic.field_validator("max_workers")
     @classmethod
@@ -136,6 +137,7 @@ _KNOWN_KEYS = frozenset(
         "cache.checkout_mode",
         "core.max_workers",
         "core.state_dir",
+        "core.run_history_retention",
         "remote.jobs",
         "remote.retries",
         "remote.connect_timeout",
@@ -181,6 +183,11 @@ def get_config_default(key: str) -> ConfigValue:
 
 
 _INT_VALIDATION_SPECS: dict[str, tuple[type[pydantic.BaseModel], str, str]] = {
+    "core.run_history_retention": (
+        CoreConfig,
+        "run_history_retention",
+        "must be a positive integer",
+    ),
     "remote.jobs": (RemoteTransferConfig, "jobs", "must be a positive integer"),
     "remote.retries": (RemoteTransferConfig, "retries", "must be a non-negative integer"),
     "remote.connect_timeout": (

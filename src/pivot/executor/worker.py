@@ -15,9 +15,10 @@ from typing import TYPE_CHECKING, Any, TypedDict
 
 import pydantic
 
-from pivot import exceptions, outputs, parameters, project
+from pivot import exceptions, outputs, parameters, project, run_history
 from pivot.storage import cache, lock, state
 from pivot.types import (
+    DepEntry,
     HashInfo,
     LockData,
     OutputHash,
@@ -57,6 +58,7 @@ class WorkerStageInfo(TypedDict):
     overrides: parameters.ParamsOverrides
     cwd: pathlib.Path | None
     checkout_modes: list[str]
+    run_id: str
 
 
 def execute_stage(
@@ -111,7 +113,7 @@ def execute_stage(
                         output_lines=[],
                     )
 
-                skip_reason, run_reason = _check_skip_or_run(
+                skip_reason, run_reason, input_hash = _check_skip_or_run(
                     stage_name,
                     stage_info,
                     stage_lock,
@@ -132,6 +134,20 @@ def execute_stage(
                     )
                 run_reason = "outputs missing from cache"
 
+            # Check run cache for previously executed configuration
+            if run_reason:
+                with state.StateDB(state_db_path) as state_db:
+                    run_cache_result = _try_skip_via_run_cache(
+                        stage_name,
+                        input_hash,
+                        stage_outs,
+                        files_cache_dir,
+                        checkout_modes,
+                        state_db,
+                    )
+                if run_cache_result is not None:
+                    return run_cache_result
+
             _prepare_outputs_for_execution(stage_outs, lock_data, files_cache_dir)
 
             with _working_directory(stage_info["cwd"]):
@@ -151,6 +167,9 @@ def execute_stage(
 
             with state.StateDB(state_db_path) as state_db:
                 _record_generations_after_run(stage_name, stage_info, state_db)
+                _write_run_cache_entry(
+                    stage_name, input_hash, output_hashes, stage_info["run_id"], state_db
+                )
 
         return StageResult(status=StageStatus.RAN, reason=run_reason, output_lines=output_lines)
 
@@ -181,26 +200,33 @@ def _check_skip_or_run(
     current_fingerprint: dict[str, str],
     current_params: dict[str, Any],
     dep_hashes: dict[str, HashInfo],
-) -> tuple[str | None, str]:
+) -> tuple[str | None, str, str]:
     """Determine if stage can skip or must run.
 
-    Returns (skip_reason, run_reason) where exactly one is meaningful:
+    Returns (skip_reason, run_reason, input_hash) where exactly one of skip/run reason is meaningful:
     - If skip_reason is not None: stage can skip, run_reason is empty
     - If skip_reason is None: stage must run, run_reason explains why
+    - input_hash is always returned for run cache recording
     """
+    out_paths = [out.path for out in stage_info["outs"]]
+    deps_list = [DepEntry(path=path, hash=info["hash"]) for path, info in dep_hashes.items()]
+    input_hash = run_history.compute_input_hash(
+        current_fingerprint, current_params, deps_list, out_paths
+    )
+
     if lock_data is None:
-        return None, "No previous run"
+        return None, "No previous run", input_hash
 
     if _can_skip_via_generation(stage_name, stage_info, lock_data, state_db, current_params):
-        return "unchanged (generation)", ""
+        return "unchanged (generation)", "", input_hash
 
     changed, run_reason = stage_lock.is_changed_with_lock_data(
         lock_data, current_fingerprint, current_params, dep_hashes
     )
     if not changed:
-        return "unchanged", ""
+        return "unchanged", "", input_hash
 
-    return None, run_reason
+    return None, run_reason, input_hash
 
 
 def _restore_outputs_from_cache(
@@ -467,3 +493,73 @@ def _record_generations_after_run(
     for out in stage_info["outs"]:
         out_path = pathlib.Path(out.path)
         state_db.increment_generation(out_path)
+
+
+# -----------------------------------------------------------------------------
+# Run cache for skip detection (like DVC's run cache)
+# -----------------------------------------------------------------------------
+
+
+def _try_skip_via_run_cache(
+    stage_name: str,
+    input_hash: str,
+    stage_outs: list[outputs.BaseOut],
+    files_cache_dir: pathlib.Path,
+    checkout_modes: list[cache.CheckoutMode],
+    state_db: state.StateDB,
+) -> StageResult | None:
+    """Try to skip using run cache. Returns StageResult if skipped, None if must run."""
+    # IncrementalOut stages build on previous outputs - run cache doesn't apply
+    if any(isinstance(out, outputs.IncrementalOut) for out in stage_outs):
+        return None
+
+    entry = state_db.lookup_run_cache(stage_name, input_hash)
+    if entry is None:
+        return None
+
+    # Check if all cached outputs exist in file cache
+    output_hash_map = {oh["path"]: oh["hash"] for oh in entry["output_hashes"]}
+
+    for out in stage_outs:
+        path = pathlib.Path(out.path)
+        if path.exists():
+            continue
+
+        cached_hash = output_hash_map.get(out.path)
+        if cached_hash is None:
+            if out.cache:
+                return None  # Output should be cached but not in run cache
+            continue
+
+        output_hash: OutputHash = {"hash": cached_hash}
+        if not cache.restore_from_cache(
+            path, output_hash, files_cache_dir, checkout_modes=checkout_modes
+        ):
+            return None  # Output not in file cache
+
+    return StageResult(
+        status=StageStatus.SKIPPED,
+        reason="unchanged (run cache)",
+        output_lines=[],
+    )
+
+
+def _write_run_cache_entry(
+    stage_name: str,
+    input_hash: str,
+    output_hashes: dict[str, OutputHash],
+    run_id: str,
+    state_db: state.StateDB,
+) -> None:
+    """Write run cache entry after successful execution."""
+    output_entries = [
+        run_history.OutputHashEntry(path=path, hash=oh["hash"])
+        for path, oh in output_hashes.items()
+        if oh is not None
+    ]
+
+    entry = run_history.RunCacheEntry(
+        run_id=run_id,
+        output_hashes=output_entries,
+    )
+    state_db.write_run_cache(stage_name, input_hash, entry)

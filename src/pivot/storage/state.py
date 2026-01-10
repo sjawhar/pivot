@@ -7,14 +7,20 @@ from typing import TYPE_CHECKING, Self
 
 import lmdb
 
+from pivot import run_history
+
 if TYPE_CHECKING:
     from collections.abc import Iterable
+
+    from pivot.run_history import RunCacheEntry, RunManifest
 
 # Key prefixes for different entry types
 _HASH_PREFIX = b"hash:"  # File hash entries
 _GEN_PREFIX = b"gen:"  # Output generation counters
 _DEP_PREFIX = b"dep:"  # Stage dependency generations
 _REMOTE_PREFIX = b"remote:"  # Remote index entries
+_RUN_PREFIX = b"run:"  # Run history entries
+_RUNCACHE_PREFIX = b"runcache:"  # Run cache entries for skip detection
 
 # Default LMDB map size (10GB virtual - grows as needed)
 _MAP_SIZE = 10 * 1024 * 1024 * 1024
@@ -314,6 +320,151 @@ class StateDB:
                     keys_to_delete.append(key)
             for key in keys_to_delete:
                 txn.delete(key)
+
+    # -------------------------------------------------------------------------
+    # Run history for tracking pipeline executions
+    # -------------------------------------------------------------------------
+
+    def write_run(self, manifest: RunManifest) -> None:
+        """Write a run manifest to the database."""
+        self._check_closed()
+
+        key = _RUN_PREFIX + manifest["run_id"].encode()
+        value = run_history.serialize_to_bytes(manifest)
+        try:
+            with self._env.begin(write=True) as txn:
+                txn.put(key, value)
+        except lmdb.MapFullError as e:
+            raise DatabaseFullError(
+                f"State cache is full ({_MAP_SIZE // (1024**3)}GB limit). Delete .pivot/state.lmdb/ to reset."
+            ) from e
+
+    def read_run(self, run_id: str) -> RunManifest | None:
+        """Read a run manifest by ID. Returns None if not found."""
+        self._check_closed()
+
+        key = _RUN_PREFIX + run_id.encode()
+        with self._env.begin() as txn:
+            value = txn.get(key)
+        if value is None:
+            return None
+        return run_history.deserialize_run_manifest(value)
+
+    def list_runs(self, limit: int = 100) -> list[RunManifest]:
+        """List recent runs, newest first.
+
+        Uses reverse iteration since run IDs are timestamp-prefixed,
+        avoiding loading all runs into memory for sorting.
+        """
+        self._check_closed()
+
+        runs = list[run_history.RunManifest]()
+        with self._env.begin() as txn:
+            cursor = txn.cursor()
+            # Position at the end of the run: prefix range by seeking past it
+            # Use "run;\xff" as upper bound (semicolon > colon in ASCII)
+            end_key = _RUN_PREFIX[:-1] + b";\xff"
+            if not cursor.set_range(end_key):
+                # No keys >= end_key, position at last key in DB
+                if not cursor.last():
+                    return runs
+            else:
+                # Move back one to get into the run: range
+                if not cursor.prev():
+                    return runs
+
+            # Iterate backwards through run: keys
+            while True:
+                key = cursor.key()
+                if not key.startswith(_RUN_PREFIX):
+                    break
+                value = cursor.value()
+                runs.append(run_history.deserialize_run_manifest(value))
+                if len(runs) >= limit:
+                    break
+                if not cursor.prev():
+                    break
+        return runs
+
+    def prune_runs(self, retention: int) -> int:
+        """Remove oldest runs beyond retention limit and orphaned run cache entries.
+
+        Returns number of runs deleted. Run cache entries referencing deleted runs
+        are also removed automatically.
+        """
+        self._check_closed()
+        runs = self.list_runs(
+            limit=retention + 1000
+        )  # Get more than retention to find deletable ones
+        if len(runs) <= retention:
+            return 0
+        to_keep = runs[:retention]
+        to_delete = runs[retention:]
+
+        with self._env.begin(write=True) as txn:
+            for run in to_delete:
+                key = _RUN_PREFIX + run["run_id"].encode()
+                txn.delete(key)
+
+        valid_run_ids = {run["run_id"] for run in to_keep}
+        self.prune_run_cache(valid_run_ids)
+
+        return len(to_delete)
+
+    # -------------------------------------------------------------------------
+    # Run cache for skip detection (like DVC's run cache)
+    # -------------------------------------------------------------------------
+
+    def write_run_cache(self, stage_name: str, input_hash: str, entry: RunCacheEntry) -> None:
+        """Write a run cache entry for skip detection."""
+        self._check_closed()
+        key = _RUNCACHE_PREFIX + f"{stage_name}:{input_hash}".encode()
+        value = run_history.serialize_to_bytes(entry)
+        try:
+            with self._env.begin(write=True) as txn:
+                txn.put(key, value)
+        except lmdb.MapFullError as e:
+            raise DatabaseFullError(
+                f"State cache is full ({_MAP_SIZE // (1024**3)}GB limit). Delete .pivot/state.lmdb/ to reset."
+            ) from e
+
+    def lookup_run_cache(self, stage_name: str, input_hash: str) -> RunCacheEntry | None:
+        """Look up run cache entry for skip detection. Returns None if not found."""
+        self._check_closed()
+        key = _RUNCACHE_PREFIX + f"{stage_name}:{input_hash}".encode()
+        with self._env.begin() as txn:
+            value = txn.get(key)
+        if value is None:
+            return None
+        return run_history.deserialize_run_cache_entry(value)
+
+    def prune_run_cache(self, valid_run_ids: set[str]) -> int:
+        """Remove run cache entries that reference runs not in valid_run_ids.
+
+        Returns number of entries deleted.
+        """
+        self._check_closed()
+        to_delete = list[bytes]()
+        with self._env.begin() as txn:
+            cursor = txn.cursor()
+            if cursor.set_range(_RUNCACHE_PREFIX):
+                key = cursor.key()
+                while key.startswith(_RUNCACHE_PREFIX):
+                    value = cursor.value()
+                    entry = run_history.deserialize_run_cache_entry(value)
+                    if entry["run_id"] not in valid_run_ids:
+                        to_delete.append(key)
+                    if not cursor.next():
+                        break
+                    key = cursor.key()
+
+        if not to_delete:
+            return 0
+
+        with self._env.begin(write=True) as txn:
+            for key in to_delete:
+                txn.delete(key)
+        return len(to_delete)
 
     def close(self) -> None:
         """Close the database."""

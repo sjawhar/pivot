@@ -279,3 +279,14 @@ def get_checkout_mode_order() -> list[str]:
         logger.debug("Failed to load config for checkout modes, using defaults: %s", e)
 
     return DEFAULT_CHECKOUT_MODE_ORDER.copy()
+
+
+def get_run_history_retention() -> int:
+    """Get run history retention limit from merged config or default (100)."""
+    try:
+        merged = get_merged_config()
+        return merged.core.run_history_retention
+    except (exceptions.ConfigError, pydantic.ValidationError) as e:
+        logger.debug("Failed to load config for run history retention, using default: %s", e)
+
+    return models.CoreConfig().run_history_retention

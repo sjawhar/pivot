@@ -54,6 +54,7 @@ def test_execute_stage_with_missing_deps(worker_env: pathlib.Path) -> None:
         "overrides": {},
         "cwd": None,
         "checkout_modes": ["hardlink", "symlink", "copy"],
+        "run_id": "test_run",
     }
 
     result = executor.execute_stage(
@@ -88,6 +89,7 @@ def test_execute_stage_with_directory_dep(worker_env: pathlib.Path, tmp_path: pa
         "overrides": {},
         "cwd": None,
         "checkout_modes": ["hardlink", "symlink", "copy"],
+        "run_id": "test_run",
     }
 
     result = executor.execute_stage(
@@ -121,6 +123,7 @@ def test_execute_stage_runs_unchanged_stage(
         "overrides": {},
         "cwd": None,
         "checkout_modes": ["hardlink", "symlink", "copy"],
+        "run_id": "test_run",
     }
 
     # First run - creates lock file
@@ -166,6 +169,7 @@ def test_execute_stage_reruns_when_fingerprint_changes(
         "overrides": {},
         "cwd": None,
         "checkout_modes": ["hardlink", "symlink", "copy"],
+        "run_id": "test_run",
     }
 
     # First run
@@ -214,6 +218,7 @@ def test_execute_stage_handles_stage_exception(
         "overrides": {},
         "cwd": None,
         "checkout_modes": ["hardlink", "symlink", "copy"],
+        "run_id": "test_run",
     }
 
     result = executor.execute_stage(
@@ -245,6 +250,7 @@ def test_execute_stage_handles_sys_exit(worker_env: pathlib.Path, tmp_path: path
         "overrides": {},
         "cwd": None,
         "checkout_modes": ["hardlink", "symlink", "copy"],
+        "run_id": "test_run",
     }
 
     result = executor.execute_stage(
@@ -279,6 +285,7 @@ def test_execute_stage_handles_keyboard_interrupt(
         "overrides": {},
         "cwd": None,
         "checkout_modes": ["hardlink", "symlink", "copy"],
+        "run_id": "test_run",
     }
 
     result = executor.execute_stage(
@@ -1021,6 +1028,7 @@ def test_generation_skip_on_second_run(worker_env: pathlib.Path, tmp_path: pathl
         "overrides": {},
         "cwd": None,
         "checkout_modes": ["hardlink", "symlink", "copy"],
+        "run_id": "test_run",
     }
 
     # First run - creates output and records generations
@@ -1075,6 +1083,7 @@ def test_generation_mismatch_triggers_rerun(
         "overrides": {},
         "cwd": None,
         "checkout_modes": ["hardlink", "symlink", "copy"],
+        "run_id": "test_run",
     }
 
     step2_info: WorkerStageInfo = {
@@ -1088,6 +1097,7 @@ def test_generation_mismatch_triggers_rerun(
         "overrides": {},
         "cwd": None,
         "checkout_modes": ["hardlink", "symlink", "copy"],
+        "run_id": "test_run",
     }
 
     # First run - both stages execute
@@ -1168,6 +1178,7 @@ def test_external_file_fallback_to_hash_check(
         "overrides": {},
         "cwd": None,
         "checkout_modes": ["hardlink", "symlink", "copy"],
+        "run_id": "test_run",
     }
 
     # First run
@@ -1231,6 +1242,7 @@ def test_deps_list_change_triggers_rerun(worker_env: pathlib.Path, tmp_path: pat
         "overrides": {},
         "cwd": None,
         "checkout_modes": ["hardlink", "symlink", "copy"],
+        "run_id": "test_run",
     }
 
     result1 = executor.execute_stage(
@@ -1263,6 +1275,7 @@ def test_deps_list_change_triggers_rerun(worker_env: pathlib.Path, tmp_path: pat
         "overrides": {},
         "cwd": None,
         "checkout_modes": ["hardlink", "symlink", "copy"],
+        "run_id": "test_run",
     }
 
     result3 = executor.execute_stage(
@@ -1302,6 +1315,7 @@ def test_deps_list_change_same_fingerprint_detected_by_hash(
         "overrides": {},
         "cwd": None,
         "checkout_modes": ["hardlink", "symlink", "copy"],
+        "run_id": "test_run",
     }
 
     result1 = executor.execute_stage(
@@ -1325,6 +1339,7 @@ def test_deps_list_change_same_fingerprint_detected_by_hash(
         "overrides": {},
         "cwd": None,
         "checkout_modes": ["hardlink", "symlink", "copy"],
+        "run_id": "test_run",
     }
 
     result2 = executor.execute_stage(
@@ -1368,6 +1383,7 @@ def test_skip_acquires_execution_lock(
         "overrides": {},
         "cwd": None,
         "checkout_modes": ["hardlink", "symlink", "copy"],
+        "run_id": "test_run",
     }
 
     # First run - creates lock file and output
@@ -1432,6 +1448,7 @@ def test_restore_happens_inside_lock(
         "overrides": {},
         "cwd": None,
         "checkout_modes": ["copy"],  # Use copy mode for simpler testing
+        "run_id": "test_run",
     }
 
     # First run - creates lock file and caches output
