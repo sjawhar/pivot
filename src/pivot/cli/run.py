@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 import click
 
 from pivot import discovery, executor, registry
-from pivot.types import StageExplanation, StageStatus
+from pivot.types import DisplayMode, StageExplanation, StageStatus
 
 if TYPE_CHECKING:
     from pivot.executor import ExecutionSummary
@@ -72,6 +72,46 @@ def _get_all_explanations(
     return explanations
 
 
+def _run_with_tui(
+    stages_list: list[str] | None,
+    single_stage: bool,
+    cache_dir: pathlib.Path | None,
+) -> dict[str, ExecutionSummary] | None:
+    """Run pipeline with TUI display."""
+    import multiprocessing as mp
+
+    from pivot import dag, project, run_tui
+    from pivot.types import TuiMessage
+
+    # Get execution order for stage names
+    graph = registry.REGISTRY.build_dag(validate=True)
+    execution_order = dag.get_execution_order(graph, stages_list, single_stage=single_stage)
+
+    if not execution_order:
+        return {}
+
+    resolved_cache_dir = cache_dir or project.get_project_root() / ".pivot" / "cache"
+
+    # Create manager and queue (Manager().Queue for loky compatibility)
+    manager = mp.Manager()
+    tui_queue: mp.Queue[TuiMessage] = manager.Queue()  # pyright: ignore[reportAssignmentType]
+
+    # Create executor function that passes the TUI queue
+    def executor_func() -> dict[str, ExecutionSummary]:
+        return executor.run(
+            stages=stages_list,
+            single_stage=single_stage,
+            cache_dir=resolved_cache_dir,
+            show_output=False,
+            tui_queue=tui_queue,
+        )
+
+    try:
+        return run_tui.run_with_tui(execution_order, tui_queue, executor_func)
+    finally:
+        manager.shutdown()
+
+
 def _print_results(results: dict[str, ExecutionSummary]) -> None:
     """Print execution results in a readable format."""
     ran = 0
@@ -124,6 +164,12 @@ def _print_results(results: dict[str, ExecutionSummary]) -> None:
     help="Watch for file changes and re-run. Optionally specify comma-separated glob patterns.",
 )
 @click.option("--debounce", type=int, default=300, help="Debounce delay in milliseconds")
+@click.option(
+    "--display",
+    type=click.Choice(["tui", "plain"]),
+    default=None,
+    help="Display mode: tui (interactive) or plain (streaming text). Auto-detects if not specified.",
+)
 @click.pass_context
 def run(
     ctx: click.Context,
@@ -134,6 +180,7 @@ def run(
     explain: bool,
     watch: str | None,
     debounce: int,
+    display: str | None,
 ) -> None:
     """Execute pipeline stages.
 
@@ -171,17 +218,27 @@ def run(
         )
         return
 
+    # Determine display mode
+    display_mode = DisplayMode(display) if display else None
+
     # Normal execution (with optional explain mode)
     try:
-        results = executor.run(
-            stages=stages_list,
-            single_stage=single_stage,
-            cache_dir=cache_dir,
-            explain_mode=explain,
-        )
+        from pivot import run_tui
+
+        use_tui = run_tui.should_use_tui(display_mode) and not explain
+        if use_tui:
+            results = _run_with_tui(stages_list, single_stage, cache_dir)
+        else:
+            results = executor.run(
+                stages=stages_list,
+                single_stage=single_stage,
+                cache_dir=cache_dir,
+                explain_mode=explain,
+            )
+
         if not results:
             click.echo("No stages to run")
-        elif not explain:
+        elif not explain and not use_tui:
             _print_results(results)
     except Exception as e:
         raise click.ClickException(repr(e)) from e

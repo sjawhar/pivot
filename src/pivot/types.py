@@ -284,3 +284,39 @@ class DataDiffResult(TypedDict):
     reorder_only: bool  # True if same content, different row order
     truncated: bool  # True if large file, showing sample
     summary_only: bool  # True if no row-level diff available
+
+
+# =============================================================================
+# TUI Message Types
+# =============================================================================
+
+
+class DisplayMode(enum.StrEnum):
+    """Display mode for pivot run output."""
+
+    TUI = "tui"
+    PLAIN = "plain"
+
+
+class TuiLogMessage(TypedDict):
+    """Log line from worker process for TUI display."""
+
+    type: Literal["log"]
+    stage: str
+    line: str
+    is_stderr: bool
+
+
+class TuiStatusMessage(TypedDict):
+    """Stage status update for TUI display."""
+
+    type: Literal["status"]
+    stage: str
+    index: int
+    total: int
+    status: StageStatus
+    reason: str
+    elapsed: float | None
+
+
+TuiMessage = TuiLogMessage | TuiStatusMessage | None

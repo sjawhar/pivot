@@ -57,6 +57,7 @@ if __name__ == '__main__':
 
 - NEVER modify linting/type rules in `pyproject.toml` without explicit permission.
 - No `# type: ignore` without justification; fix code, don't silence checkers.
+- **Zero tolerance for type checker warnings.** Both errors AND warnings from basedpyright must be resolved. Warnings indicate real type safety issues (missing annotations, unsafe operations, etc.) and are not acceptable.
 
 ## Python 3.13+ Type Hints (Critical)
 
@@ -98,13 +99,15 @@ result = {"changed": False}  # Missing 'reason' not caught!
 - No relative imports; no `sys.path` modifications.
 - **This applies to all packages including third-party**—use `import pydantic` then `pydantic.BaseModel`, not `from pydantic import BaseModel`.
 - No exceptions for stdlib—use `import pathlib` then `pathlib.Path`, not `from pathlib import Path`.
-- Exception: type hints in `TYPE_CHECKING` blocks may import types directly.
+- Exception: type hints in `TYPE_CHECKING` blocks import types directly (e.g., `from pydantic import BaseModel`). Never import the same thing both inside and outside TYPE_CHECKING.
 - Exception: types from `pivot.types` may be imported directly: `from pivot.types import StageStatus, StageResult`.
+- Exception: the `typing` module—always use `from typing import X`, never `import typing`. This is because `typing` exports are all type-related utilities meant to be used directly.
 
 ```python
 # Good
 from pivot import fingerprint
 from pivot.types import StageStatus, StageResult
+from typing import Any, TypeGuard  # typing is the exception - import directly
 import pathlib
 import pydantic
 
@@ -119,9 +122,11 @@ class MyParams(pydantic.BaseModel):
 from pivot.fingerprint import get_stage_fingerprint
 from pathlib import Path
 from pydantic import BaseModel
+import typing  # Don't import typing as a module
 
 fp = get_stage_fingerprint(func)  # Where is this from?
 path = Path("/some/path")  # Where is Path from?
+typing.get_type_hints(func)  # Don't use typing.X
 
 class MyParams(BaseModel):  # Where is BaseModel from?
     learning_rate: float = 0.01
@@ -270,6 +275,65 @@ class FingerprintError(Exception): pass
 # Bad - generic
 raise Exception("failed")
 ```
+
+**Let errors propagate.** The goal is not to prevent code from raising exceptions. Exceptions are valuable signals—they should propagate naturally and be caught at the appropriate boundary where they can be handled meaningfully.
+
+**Principles:**
+
+- Don't catch exceptions just to swallow them
+- Catch exceptions where you can actually do something useful (retry, fallback, user message)
+- Silent failures are worse than loud failures
+- A crash with a stack trace is better than corrupted state
+
+```python
+# Good - let it propagate, catch at CLI boundary
+def run_pipeline(stages: list[str]) -> dict[str, Result]:
+    graph = build_dag(stages)  # May raise StageNotFoundError
+    return execute(graph)      # May raise ExecutionError
+
+# CLI catches and formats for user
+try:
+    results = run_pipeline(args.stages)
+except StageNotFoundError as e:
+    click.echo(f"Error: {e}", err=True)
+    sys.exit(1)
+
+# Bad - swallowing exceptions
+def run_pipeline(stages: list[str]) -> dict[str, Result] | None:
+    try:
+        graph = build_dag(stages)
+        return execute(graph)
+    except Exception:
+        return None  # Caller has no idea what went wrong
+```
+
+## Enums vs Literals
+
+**Prefer enums for fixed sets of programmatic values.** Enums provide namespacing, iteration, IDE autocomplete, and catch typos at type-check time.
+
+```python
+# Good - enum for programmatic values
+class CheckoutMode(enum.StrEnum):
+    COPY = "copy"
+    HARDLINK = "hardlink"
+    SYMLINK = "symlink"
+
+def checkout(mode: CheckoutMode) -> None:
+    match mode:
+        case CheckoutMode.COPY: ...
+        case CheckoutMode.HARDLINK: ...
+        case CheckoutMode.SYMLINK: ...
+
+# Bad - literals scattered around
+def checkout(mode: Literal["copy", "hardlink", "symlink"]) -> None:
+    if mode == "copy": ...  # Typo "coppy" not caught until runtime
+```
+
+**When Literals are appropriate:**
+
+- TypedDict discriminator fields (`type: Literal["log", "status"]`)
+- JSON/YAML config values that map directly to strings
+- Interop boundaries where you need raw strings
 
 ## Input Validation Over Defensive Programming
 
