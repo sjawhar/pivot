@@ -9,6 +9,8 @@ __version__ = "0.1.0-dev"
 # via their full paths (e.g., pivot.registry.REGISTRY) for advanced use
 
 if TYPE_CHECKING:
+    from pivot import loaders as loaders
+    from pivot import stage_def as stage_def
     from pivot.outputs import IncrementalOut as IncrementalOut
     from pivot.outputs import Metric as Metric
     from pivot.outputs import Out as Out
@@ -17,8 +19,10 @@ if TYPE_CHECKING:
     from pivot.registry import Variant as Variant
     from pivot.registry import stage as stage
 
-# Lazy import mapping for runtime
-_LAZY_IMPORTS: dict[str, tuple[str, str]] = {
+# Lazy import mapping for runtime: (module_path, attr_name or None for module import)
+_LAZY_IMPORTS: dict[str, tuple[str, str | None]] = {
+    "loaders": ("pivot.loaders", None),
+    "stage_def": ("pivot.stage_def", None),
     "IncrementalOut": ("pivot.outputs", "IncrementalOut"),
     "Metric": ("pivot.outputs", "Metric"),
     "Out": ("pivot.outputs", "Out"),
@@ -36,7 +40,7 @@ def __getattr__(name: str) -> object:
         import importlib
 
         module = importlib.import_module(module_path)
-        value = getattr(module, attr_name)
+        value = module if attr_name is None else getattr(module, attr_name)
         # Cache in module globals for subsequent access
         globals()[name] = value
         return value

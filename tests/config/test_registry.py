@@ -1,13 +1,14 @@
-# pyright: reportUnusedFunction=false, reportUnusedParameter=false, reportRedeclaration=false
+# pyright: reportUnusedFunction=false, reportUnusedParameter=false, reportRedeclaration=false, reportIncompatibleVariableOverride=false, reportAssignmentType=false
 
 import inspect
 import math
 from pathlib import Path
 
+import pandas
 import pytest
 from pydantic import BaseModel
 
-from pivot import fingerprint, registry, stage
+from pivot import fingerprint, loaders, registry, stage, stage_def
 from pivot.exceptions import ParamsError, ValidationError
 from pivot.registry import REGISTRY, RegistryStageInfo, StageRegistry
 
@@ -891,12 +892,13 @@ def test_registry_restore_empty_snapshot() -> None:
     assert reg.list_stages() == []
 
 
-def test_registry_snapshot_restore_roundtrip() -> None:
-    """snapshot() followed by restore() should preserve state."""
+def test_registry_restore_preserves_metadata() -> None:
+    """restore() should preserve all stage metadata."""
     reg = StageRegistry()
-    original_info = RegistryStageInfo(
+
+    original = RegistryStageInfo(
         name="original",
-        func=lambda: 42,
+        func=lambda: "test",
         deps=["/tmp/a", "/tmp/b"],
         outs=[],
         outs_paths=[],
@@ -907,11 +909,7 @@ def test_registry_snapshot_restore_roundtrip() -> None:
         fingerprint={"self:original": "abc123"},
         cwd=None,
     )
-    reg._stages["original"] = original_info
-
-    snapshot = reg.snapshot()
-    reg.clear()
-    assert reg.list_stages() == []
+    snapshot = {"original": original}
 
     reg.restore(snapshot)
 
@@ -921,3 +919,148 @@ def test_registry_snapshot_restore_roundtrip() -> None:
     assert restored["mutex"] == ["gpu"]
     assert restored["variant"] == "v1"
     assert restored["fingerprint"] == {"self:original": "abc123"}
+
+
+# ==============================================================================
+# StageDef integration tests
+# ==============================================================================
+
+
+class _TestStageDef(stage_def.StageDef):
+    """Module-level StageDef for testing (required for pickling)."""
+
+    class deps:
+        data: loaders.CSV[pandas.DataFrame] = "data/input.csv"
+
+    class outs:
+        result: loaders.JSON[dict[str, int]] = "output/result.json"
+
+    threshold: float = 0.5
+
+
+def test_stage_def_detected_from_type_hint() -> None:
+    """Registry should detect StageDef from function params type hint."""
+
+    @stage()
+    def process_data(params: _TestStageDef) -> None:
+        pass
+
+    info = REGISTRY.get("process_data")
+    assert isinstance(info["params"], _TestStageDef)
+
+
+def test_stage_def_deps_extracted_automatically() -> None:
+    """Registry should extract deps from StageDef when not explicitly provided."""
+
+    @stage()
+    def auto_deps(params: _TestStageDef) -> None:
+        pass
+
+    info = REGISTRY.get("auto_deps")
+    assert len(info["deps"]) == 1
+    assert info["deps"][0].endswith("data/input.csv")
+
+
+def test_stage_def_outs_extracted_automatically() -> None:
+    """Registry should extract outs from StageDef when not explicitly provided."""
+
+    @stage()
+    def auto_outs(params: _TestStageDef) -> None:
+        pass
+
+    info = REGISTRY.get("auto_outs")
+    assert len(info["outs_paths"]) == 1
+    assert info["outs_paths"][0].endswith("output/result.json")
+
+
+def test_stage_def_explicit_deps_override() -> None:
+    """Explicit deps= argument should completely replace StageDef deps."""
+
+    @stage(deps=["custom/data.csv", "extra/file.txt"])
+    def override_deps(params: _TestStageDef) -> None:
+        pass
+
+    info = REGISTRY.get("override_deps")
+    assert len(info["deps"]) == 2
+    assert any("custom/data.csv" in d for d in info["deps"])
+    assert any("extra/file.txt" in d for d in info["deps"])
+    assert not any("data/input.csv" in d for d in info["deps"])
+
+
+def test_stage_def_explicit_outs_override() -> None:
+    """Explicit outs= argument should completely replace StageDef outs."""
+
+    @stage(outs=["custom/output.json"])
+    def override_outs(params: _TestStageDef) -> None:
+        pass
+
+    info = REGISTRY.get("override_outs")
+    assert len(info["outs_paths"]) == 1
+    assert info["outs_paths"][0].endswith("custom/output.json")
+    assert not info["outs_paths"][0].endswith("output/result.json")
+
+
+def test_stage_def_fingerprint_includes_loaders() -> None:
+    """Fingerprint should include loader fingerprints for StageDef."""
+
+    @stage()
+    def with_loaders(params: _TestStageDef) -> None:
+        pass
+
+    info = REGISTRY.get("with_loaders")
+    fp = info["fingerprint"]
+
+    # Should include loader fingerprints
+    loader_keys = [k for k in fp.keys() if k.startswith("loader:")]
+    assert len(loader_keys) > 0, "Should have loader fingerprints"
+
+
+def test_plain_pydantic_params_still_work() -> None:
+    """Regular Pydantic BaseModel params should still work (backward compat)."""
+
+    class PlainParams(BaseModel):
+        learning_rate: float = 0.01
+
+    @stage(deps=["data.csv"], outs=["out.csv"])
+    def plain_stage(params: PlainParams) -> None:
+        pass
+
+    info = REGISTRY.get("plain_stage")
+    assert isinstance(info["params"], PlainParams)
+    assert info["params"].learning_rate == 0.01
+
+
+class _MultiDeps(stage_def.StageDef):
+    """StageDef with multiple deps/outs for testing."""
+
+    class deps:
+        train: loaders.CSV[pandas.DataFrame] = "data/train.csv"
+        test: loaders.CSV[pandas.DataFrame] = "data/test.csv"
+
+    class outs:
+        model: loaders.Pickle[dict[str, float]] = "models/model.pkl"
+        metrics: loaders.JSON[dict[str, float]] = "metrics.json"
+
+
+def test_stage_def_multiple_deps_outs() -> None:
+    """StageDef with multiple deps/outs should register all paths."""
+
+    @stage()
+    def multi_io(params: _MultiDeps) -> None:
+        pass
+
+    info = REGISTRY.get("multi_io")
+    assert len(info["deps"]) == 2
+    assert len(info["outs_paths"]) == 2
+
+
+def test_stage_def_params_values_preserved() -> None:
+    """StageDef parameter values should be accessible on registered params."""
+
+    @stage()
+    def with_params(params: _TestStageDef) -> None:
+        pass
+
+    info = REGISTRY.get("with_params")
+    assert info["params"] is not None
+    assert info["params"].threshold == 0.5  # pyright: ignore[reportAttributeAccessIssue]

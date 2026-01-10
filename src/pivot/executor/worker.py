@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any, TypedDict
 
 import pydantic
 
-from pivot import exceptions, outputs, parameters, project, run_history
+from pivot import exceptions, outputs, parameters, project, run_history, stage_def
 from pivot.storage import cache, lock, state
 from pivot.types import (
     DepEntry,
@@ -319,6 +319,8 @@ def _run_stage_function_with_capture(
 
     Output is appended to the provided output_lines list, ensuring captured
     output is preserved even if func() raises an exception.
+
+    For StageDef params, auto-loads deps before function and auto-saves outs after.
     """
     with (
         _QueueWriter(stage_name, output_queue, is_stderr=False, output_lines=output_lines),
@@ -327,7 +329,24 @@ def _run_stage_function_with_capture(
         kwargs = dict[str, Any]()
         if params_instance is not None:
             kwargs["params"] = params_instance
-        func(**kwargs)
+
+        # Check once and cache for StageDef handling
+        is_stage_def = isinstance(params_instance, stage_def.StageDef)
+        project_root = project.get_project_root() if is_stage_def else None
+        if is_stage_def and project_root is not None:
+            params_instance._load_deps(project_root)  # pyright: ignore[reportPrivateUsage] - internal API
+
+        try:
+            func(**kwargs)
+
+            # Auto-save outs for StageDef params (only on success)
+            if is_stage_def and project_root is not None:
+                params_instance._save_outs(project_root)  # pyright: ignore[reportPrivateUsage] - internal API
+        finally:
+            # Clean up loaded deps/outs data on any exit to prevent memory leaks
+            if is_stage_def:
+                params_instance._clear_deps()  # pyright: ignore[reportPrivateUsage] - internal API
+                params_instance._clear_outs()  # pyright: ignore[reportPrivateUsage] - internal API
 
 
 class _QueueWriter:

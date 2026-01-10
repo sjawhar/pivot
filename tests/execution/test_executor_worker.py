@@ -1,3 +1,4 @@
+# pyright: reportAssignmentType=false, reportIncompatibleVariableOverride=false, reportAttributeAccessIssue=false
 from __future__ import annotations
 
 import contextlib
@@ -6,11 +7,13 @@ import multiprocessing as mp
 import os
 import pathlib
 import sys
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
+import pandas  # noqa: TC002 - needed at runtime for StageDef type hint resolution
+import pydantic
 import pytest
 
-from pivot import exceptions, executor, outputs
+from pivot import exceptions, executor, loaders, outputs, stage_def
 from pivot.executor import worker
 from pivot.storage import cache, lock
 
@@ -19,6 +22,34 @@ if TYPE_CHECKING:
 
     from pivot.executor import WorkerStageInfo
     from pivot.types import DirManifestEntry, OutputMessage
+
+
+# Module-level StageDef classes for testing (required for type hint resolution)
+class _TestStageDef_Deps(stage_def.StageDef):
+    """StageDef with deps for testing."""
+
+    class deps:
+        data: loaders.CSV[pandas.DataFrame] = "input.csv"
+
+
+class _TestStageDef_Outs(stage_def.StageDef):
+    """StageDef with outs for testing."""
+
+    class outs:
+        result: loaders.JSON[dict[str, int]] = "output.json"
+
+
+class _TestStageDef_MissingDeps(stage_def.StageDef):
+    """StageDef with deps that will be missing."""
+
+    class deps:
+        data: loaders.CSV[pandas.DataFrame] = "missing.csv"
+
+
+class _PlainParams(pydantic.BaseModel):
+    """Plain Pydantic params for testing backward compatibility."""
+
+    threshold: float = 0.5
 
 
 @pytest.fixture
@@ -434,7 +465,7 @@ def test_run_stage_function_captures_partial_lines() -> None:
 def test_queue_writer_splits_on_newlines() -> None:
     """_QueueWriter splits output on newlines."""
     output_lines: list[tuple[str, bool]] = []
-    queue: mp.Queue[OutputMessage] = mp.Manager().Queue()  # pyright: ignore[reportAssignmentType]
+    queue: mp.Queue[OutputMessage] = mp.Manager().Queue()
 
     writer = worker._QueueWriter(
         "test_stage",
@@ -452,7 +483,7 @@ def test_queue_writer_splits_on_newlines() -> None:
 def test_queue_writer_buffers_partial_lines() -> None:
     """_QueueWriter buffers incomplete lines."""
     output_lines: list[tuple[str, bool]] = []
-    queue: mp.Queue[OutputMessage] = mp.Manager().Queue()  # pyright: ignore[reportAssignmentType]
+    queue: mp.Queue[OutputMessage] = mp.Manager().Queue()
 
     writer = worker._QueueWriter(
         "test_stage",
@@ -471,7 +502,7 @@ def test_queue_writer_buffers_partial_lines() -> None:
 def test_queue_writer_flush_writes_buffer() -> None:
     """_QueueWriter.flush() writes buffered content."""
     output_lines: list[tuple[str, bool]] = []
-    queue: mp.Queue[OutputMessage] = mp.Manager().Queue()  # pyright: ignore[reportAssignmentType]
+    queue: mp.Queue[OutputMessage] = mp.Manager().Queue()
 
     writer = worker._QueueWriter(
         "test_stage",
@@ -490,7 +521,7 @@ def test_queue_writer_flush_writes_buffer() -> None:
 def test_queue_writer_distinguishes_stderr() -> None:
     """_QueueWriter marks stderr lines correctly."""
     output_lines: list[tuple[str, bool]] = []
-    queue: mp.Queue[OutputMessage] = mp.Manager().Queue()  # pyright: ignore[reportAssignmentType]
+    queue: mp.Queue[OutputMessage] = mp.Manager().Queue()
 
     writer = worker._QueueWriter(
         "test_stage",
@@ -506,7 +537,7 @@ def test_queue_writer_distinguishes_stderr() -> None:
 def test_queue_writer_handles_multiple_newlines() -> None:
     """_QueueWriter handles text with multiple consecutive newlines."""
     output_lines: list[tuple[str, bool]] = []
-    queue: mp.Queue[OutputMessage] = mp.Manager().Queue()  # pyright: ignore[reportAssignmentType]
+    queue: mp.Queue[OutputMessage] = mp.Manager().Queue()
 
     writer = worker._QueueWriter(
         "test_stage",
@@ -523,7 +554,7 @@ def test_queue_writer_handles_multiple_newlines() -> None:
 def test_queue_writer_empty_flush_does_nothing() -> None:
     """_QueueWriter.flush() with empty buffer does nothing."""
     output_lines: list[tuple[str, bool]] = []
-    queue: mp.Queue[OutputMessage] = mp.Manager().Queue()  # pyright: ignore[reportAssignmentType]
+    queue: mp.Queue[OutputMessage] = mp.Manager().Queue()
 
     writer = worker._QueueWriter(
         "test_stage",
@@ -539,7 +570,7 @@ def test_queue_writer_empty_flush_does_nothing() -> None:
 def test_queue_writer_isatty_returns_false() -> None:
     """_QueueWriter.isatty() returns False."""
     output_lines: list[tuple[str, bool]] = []
-    queue: mp.Queue[OutputMessage] = mp.Manager().Queue()  # pyright: ignore[reportAssignmentType]
+    queue: mp.Queue[OutputMessage] = mp.Manager().Queue()
 
     writer = worker._QueueWriter(
         "test_stage",
@@ -554,7 +585,7 @@ def test_queue_writer_isatty_returns_false() -> None:
 def test_queue_writer_fileno_raises_unsupported_operation() -> None:
     """_QueueWriter.fileno() raises io.UnsupportedOperation."""
     output_lines: list[tuple[str, bool]] = []
-    queue: mp.Queue[OutputMessage] = mp.Manager().Queue()  # pyright: ignore[reportAssignmentType]
+    queue: mp.Queue[OutputMessage] = mp.Manager().Queue()
 
     writer = worker._QueueWriter(
         "test_stage",
@@ -570,7 +601,7 @@ def test_queue_writer_fileno_raises_unsupported_operation() -> None:
 def test_queue_writer_context_manager_flushes_on_exit() -> None:
     """_QueueWriter context manager flushes buffer on exit."""
     output_lines: list[tuple[str, bool]] = []
-    queue: mp.Queue[OutputMessage] = mp.Manager().Queue()  # pyright: ignore[reportAssignmentType]
+    queue: mp.Queue[OutputMessage] = mp.Manager().Queue()
 
     with worker._QueueWriter(
         "test_stage",
@@ -588,7 +619,7 @@ def test_queue_writer_context_manager_flushes_on_exit() -> None:
 def test_queue_writer_context_manager_flushes_on_exception() -> None:
     """_QueueWriter context manager flushes buffer even when exception raised."""
     output_lines: list[tuple[str, bool]] = []
-    queue: mp.Queue[OutputMessage] = mp.Manager().Queue()  # pyright: ignore[reportAssignmentType]
+    queue: mp.Queue[OutputMessage] = mp.Manager().Queue()
 
     with (
         pytest.raises(RuntimeError),
@@ -1497,3 +1528,187 @@ def test_restore_happens_inside_lock(
     assert operations == ["lock_acquire", "restore", "lock_release"], (
         f"Restore should happen inside lock. Got: {operations}"
     )
+
+
+# =============================================================================
+# StageDef auto-load/save tests
+# =============================================================================
+
+
+def test_stage_def_deps_loaded_before_function(
+    worker_env: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    """StageDef deps should be auto-loaded before the stage function runs."""
+    input_file = tmp_path / "input.csv"
+    input_file.write_text("a,b\n1,2\n3,4\n")
+
+    loaded_data: list[Any] = []
+
+    def stage_func(params: _TestStageDef_Deps) -> None:
+        loaded_data.append(params.deps.data)
+
+    stage_info: WorkerStageInfo = {
+        "func": stage_func,
+        "fingerprint": {"self:test": "abc123"},
+        "deps": [str(input_file)],
+        "signature": None,
+        "outs": [],
+        "params": _TestStageDef_Deps(),
+        "variant": None,
+        "overrides": {},
+        "cwd": None,
+        "checkout_modes": ["hardlink", "symlink", "copy"],
+        "run_id": "test_run",
+    }
+
+    result = executor.execute_stage(
+        "test_stage",
+        stage_info,
+        worker_env,
+        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
+    )
+
+    assert result["status"] == "ran"
+    assert len(loaded_data) == 1
+    assert hasattr(loaded_data[0], "columns")  # DataFrame
+
+
+def test_stage_def_outs_saved_after_function(
+    worker_env: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    """StageDef outs should be auto-saved after the stage function returns."""
+    output_file = tmp_path / "output.json"
+
+    def stage_func(params: _TestStageDef_Outs) -> None:
+        params.outs.result = {"value": 42}
+
+    out_spec = outputs.Out(str(output_file))
+
+    stage_info: WorkerStageInfo = {
+        "func": stage_func,
+        "fingerprint": {"self:test": "abc123"},
+        "deps": [],
+        "signature": None,
+        "outs": [out_spec],
+        "params": _TestStageDef_Outs(),
+        "variant": None,
+        "overrides": {},
+        "cwd": None,
+        "checkout_modes": ["hardlink", "symlink", "copy"],
+        "run_id": "test_run",
+    }
+
+    result = executor.execute_stage(
+        "test_stage",
+        stage_info,
+        worker_env,
+        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
+    )
+
+    assert result["status"] == "ran"
+    assert output_file.exists()
+    assert "42" in output_file.read_text()
+
+
+def test_stage_def_missing_output_returns_failed(
+    worker_env: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    """StageDef should fail if output was declared but never assigned."""
+    output_file = tmp_path / "output.json"
+
+    def stage_func(params: _TestStageDef_Outs) -> None:
+        pass  # Never assign params.outs.result
+
+    out_spec = outputs.Out(str(output_file))
+
+    stage_info: WorkerStageInfo = {
+        "func": stage_func,
+        "fingerprint": {"self:test": "abc123"},
+        "deps": [],
+        "signature": None,
+        "outs": [out_spec],
+        "params": _TestStageDef_Outs(),
+        "variant": None,
+        "overrides": {},
+        "cwd": None,
+        "checkout_modes": ["hardlink", "symlink", "copy"],
+        "run_id": "test_run",
+    }
+
+    result = executor.execute_stage(
+        "test_stage",
+        stage_info,
+        worker_env,
+        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
+    )
+
+    assert result["status"] == "failed"
+    assert "never assigned" in result["reason"]
+
+
+def test_stage_def_load_failure_returns_failed(
+    worker_env: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    """StageDef should fail if deps cannot be loaded."""
+
+    def stage_func(params: _TestStageDef_MissingDeps) -> None:
+        pass
+
+    stage_info: WorkerStageInfo = {
+        "func": stage_func,
+        "fingerprint": {"self:test": "abc123"},
+        "deps": [str(tmp_path / "missing.csv")],  # File doesn't exist
+        "signature": None,
+        "outs": [],
+        "params": _TestStageDef_MissingDeps(),
+        "variant": None,
+        "overrides": {},
+        "cwd": None,
+        "checkout_modes": ["hardlink", "symlink", "copy"],
+        "run_id": "test_run",
+    }
+
+    result = executor.execute_stage(
+        "test_stage",
+        stage_info,
+        worker_env,
+        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
+    )
+
+    # Should fail before function runs (missing deps check)
+    assert result["status"] == "failed"
+
+
+def test_plain_params_no_auto_load_save(worker_env: pathlib.Path, tmp_path: pathlib.Path) -> None:
+    """Plain Pydantic params should still work without auto-load/save."""
+    output_file = tmp_path / "output.txt"
+
+    def stage_func(params: _PlainParams) -> None:
+        output_file.write_text(f"threshold: {params.threshold}")
+
+    out_spec = outputs.Out(str(output_file))
+
+    stage_info: WorkerStageInfo = {
+        "func": stage_func,
+        "fingerprint": {"self:test": "abc123"},
+        "deps": [],
+        "signature": None,
+        "outs": [out_spec],
+        "params": _PlainParams(),
+        "variant": None,
+        "overrides": {},
+        "cwd": None,
+        "checkout_modes": ["hardlink", "symlink", "copy"],
+        "run_id": "test_run",
+    }
+
+    result = executor.execute_stage(
+        "test_stage",
+        stage_info,
+        worker_env,
+        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
+    )
+
+    assert result["status"] == "ran"
+    assert output_file.exists()
+    assert "threshold: 0.5" in output_file.read_text()

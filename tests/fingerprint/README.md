@@ -175,6 +175,20 @@ This document exhaustively catalogs what code changes are and are not detected b
 
 ---
 
+## 11. Loader Fingerprinting
+
+| Change Type                     | Detected? | Test Reference                                                              |
+| ------------------------------- | --------- | --------------------------------------------------------------------------- |
+| Loader load() method change     | ✅        | `test_fingerprint.py::test_loader_fingerprint_includes_load_method`         |
+| Loader save() method change     | ✅        | `test_fingerprint.py::test_loader_fingerprint_includes_save_method`         |
+| Loader config field change      | ✅        | `test_fingerprint.py::test_loader_config_change_changes_fingerprint`        |
+| Different loader types          | ✅        | `test_fingerprint.py::test_different_loader_types_different_fingerprint`    |
+| Custom loader code change       | ✅        | `test_fingerprint.py::test_custom_loader_code_change_detected`              |
+| Custom loader fingerprinting    | ✅        | `test_fingerprint.py::test_custom_loader_fingerprint`                       |
+| Fingerprint stability           | ✅        | `test_fingerprint.py::test_loader_fingerprint_stable`                       |
+
+---
+
 ## Summary: Gaps Requiring New Tests
 
 | Gap                                              | Priority | Difficulty                    |

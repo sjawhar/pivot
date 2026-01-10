@@ -11,7 +11,16 @@ from typing import TYPE_CHECKING, Any, TypedDict, TypeVar, get_origin, get_type_
 
 import pydantic
 
-from pivot import exceptions, fingerprint, outputs, parameters, path_policy, project, trie
+from pivot import (
+    exceptions,
+    fingerprint,
+    outputs,
+    parameters,
+    path_policy,
+    project,
+    stage_def,
+    trie,
+)
 
 if TYPE_CHECKING:
     from inspect import Signature
@@ -258,8 +267,6 @@ class StageRegistry:
             ParamsError: If params specified but function lacks params argument.
         """
         stage_name = name if name is not None else func.__name__
-        deps_list: Sequence[str] = deps if deps is not None else ()
-        outs_list: Sequence[outputs.OutSpec] = outs if outs is not None else ()
         mutex_list: list[str] = [m.strip().lower() for m in mutex] if mutex else []
 
         # Normalize cwd to absolute path and validate within project root
@@ -273,6 +280,19 @@ class StageRegistry:
                     + f"which is outside project root '{project_root}'"
                 )
 
+        # Convert params to instance (instantiate class if needed)
+        params_instance = _resolve_params(params, func, stage_name)
+
+        # Extract deps/outs from StageDef if not explicitly provided
+        deps_list: Sequence[str] = deps if deps is not None else ()
+        outs_list: Sequence[outputs.OutSpec] = outs if outs is not None else ()
+
+        if isinstance(params_instance, stage_def.StageDef):
+            if not deps_list:
+                deps_list = list(params_instance.get_deps_paths().values())
+            if not outs_list:
+                outs_list = list(params_instance.get_outs_paths().values())
+
         # Normalize outputs to BaseOut objects
         outs_normalized = [outputs.normalize_out(o) for o in outs_list]
         outs_paths = [o.path for o in outs_normalized]
@@ -281,9 +301,6 @@ class StageRegistry:
         _validate_stage_registration(
             self._stages, stage_name, deps_list, outs_paths, self.validation_mode
         )
-
-        # Convert params to instance (instantiate class if needed)
-        params_instance = _resolve_params(params, func, stage_name)
 
         deps_list = _normalize_paths(
             deps_list, path_policy.PathType.DEP, self.validation_mode, cwd_path
@@ -309,6 +326,11 @@ class StageRegistry:
         except (exceptions.OutputDuplicationError, exceptions.OverlappingOutputPathsError) as e:
             _handle_validation_error(str(e), self.validation_mode)
 
+        # Build stage fingerprint (includes loader fingerprints for StageDef)
+        stage_fp = fingerprint.get_stage_fingerprint(func)
+        if isinstance(params_instance, stage_def.StageDef):
+            stage_fp.update(_get_stage_def_loader_fingerprints(type(params_instance)))
+
         self._stages[stage_name] = RegistryStageInfo(
             func=func,
             name=stage_name,
@@ -319,7 +341,7 @@ class StageRegistry:
             mutex=mutex_list,
             variant=variant,
             signature=inspect.signature(func),
-            fingerprint=fingerprint.get_stage_fingerprint(func),
+            fingerprint=stage_fp,
             cwd=cwd_path,
         )
 
@@ -647,6 +669,21 @@ def _validate_matrix_variants(variants: Sequence[Variant]) -> None:
         if variant.name in seen_names:
             raise exceptions.ValidationError(f"Duplicate variant name '{variant.name}' in matrix")
         seen_names.add(variant.name)
+
+
+def _get_stage_def_loader_fingerprints(stage_def_cls: type[stage_def.StageDef]) -> dict[str, str]:
+    """Get fingerprints for all loaders in a StageDef class."""
+    import itertools
+
+    result = dict[str, str]()
+    all_specs = itertools.chain(
+        stage_def_cls._deps_specs.values(),  # pyright: ignore[reportPrivateUsage]
+        stage_def_cls._outs_specs.values(),  # pyright: ignore[reportPrivateUsage]
+    )
+    for spec in all_specs:
+        result.update(fingerprint.get_loader_fingerprint(spec.loader))
+
+    return result
 
 
 REGISTRY = StageRegistry()
