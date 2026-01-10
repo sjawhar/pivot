@@ -5,9 +5,6 @@ import pathlib
 from typing import Literal
 
 import click
-import yaml
-
-from pivot import matrix
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +48,11 @@ def _get_stages_fast() -> list[str] | None:
     )
     if yaml_path is None:
         return None
+
+    # Lazy imports to avoid loading pivot package at CLI startup
+    import yaml
+
+    from pivot import matrix
 
     try:
         config = yaml.safe_load(yaml_path.read_text())
