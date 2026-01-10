@@ -162,12 +162,12 @@ def test_push_with_errors(
         assert "Error: Upload failed: hash2" in result.output
 
 
-def test_push_with_stages(
+def test_push_with_targets(
     runner: click.testing.CliRunner,
     tmp_path: pathlib.Path,
     mocker: pytest_mock.MockerFixture,
 ) -> None:
-    """Push with stage names filters to those stages."""
+    """Push with targets filters to those targets."""
     from pivot import state, transfer
 
     with runner.isolated_filesystem(temp_dir=tmp_path):
@@ -182,8 +182,8 @@ def test_push_with_stages(
             "create_remote_from_name",
             return_value=(mocker.MagicMock(), "origin"),
         )
-        mock_stage_hashes = mocker.patch.object(
-            transfer, "get_stage_output_hashes", return_value={"stage_hash_1"}
+        mock_target_hashes = mocker.patch.object(
+            transfer, "get_target_hashes", return_value={"target_hash_1"}
         )
         mocker.patch.object(
             transfer,
@@ -197,7 +197,7 @@ def test_push_with_stages(
         result = runner.invoke(cli.cli, ["push", "train_model"])
 
         assert result.exit_code == 0
-        mock_stage_hashes.assert_called_once_with(cache_dir, ["train_model"])
+        mock_target_hashes.assert_called_once_with(["train_model"], cache_dir, include_deps=False)
 
 
 # =============================================================================
@@ -205,12 +205,12 @@ def test_push_with_stages(
 # =============================================================================
 
 
-def test_pull_dry_run_with_stages(
+def test_pull_dry_run_with_targets(
     runner: click.testing.CliRunner,
     tmp_path: pathlib.Path,
     mocker: pytest_mock.MockerFixture,
 ) -> None:
-    """Pull dry run shows what would be pulled for stages."""
+    """Pull dry run shows what would be pulled for targets."""
     from pivot import transfer
 
     with runner.isolated_filesystem(temp_dir=tmp_path):
@@ -225,8 +225,7 @@ def test_pull_dry_run_with_stages(
             "create_remote_from_name",
             return_value=(mocker.MagicMock(), "my-remote"),
         )
-        mocker.patch.object(transfer, "get_stage_output_hashes", return_value={"hash1", "hash2"})
-        mocker.patch.object(transfer, "get_stage_dep_hashes", return_value={"hash3"})
+        mocker.patch.object(transfer, "get_target_hashes", return_value={"hash1", "hash2", "hash3"})
         mocker.patch.object(transfer, "get_local_cache_hashes", return_value={"hash1"})
 
         result = runner.invoke(cli.cli, ["pull", "--dry-run", "train_model"])
@@ -399,7 +398,7 @@ def test_push_exception_shows_click_error(
     tmp_path: pathlib.Path,
     mocker: pytest_mock.MockerFixture,
 ) -> None:
-    """Push exception is wrapped in ClickException."""
+    """Push exception is wrapped in ClickException with user-friendly message."""
     from pivot import transfer
 
     with runner.isolated_filesystem(temp_dir=tmp_path):
@@ -415,7 +414,7 @@ def test_push_exception_shows_click_error(
         result = runner.invoke(cli.cli, ["push"])
 
         assert result.exit_code != 0
-        assert "RuntimeError" in result.output
+        assert "Test error" in result.output
 
 
 def test_pull_exception_shows_click_error(
@@ -423,7 +422,7 @@ def test_pull_exception_shows_click_error(
     tmp_path: pathlib.Path,
     mocker: pytest_mock.MockerFixture,
 ) -> None:
-    """Pull exception is wrapped in ClickException."""
+    """Pull exception is wrapped in ClickException with user-friendly message."""
     from pivot import transfer
 
     with runner.isolated_filesystem(temp_dir=tmp_path):
@@ -439,4 +438,4 @@ def test_pull_exception_shows_click_error(
         result = runner.invoke(cli.cli, ["pull"])
 
         assert result.exit_code != 0
-        assert "RuntimeError" in result.output
+        assert "Test error" in result.output

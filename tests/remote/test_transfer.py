@@ -432,7 +432,7 @@ async def test_push_async_with_stages(
     )
 
     result = await transfer._push_async(
-        cache_dir, mock_remote, mock_state, "origin", stages=["my_stage"]
+        cache_dir, mock_remote, mock_state, "origin", targets=["my_stage"]
     )
 
     assert result["transferred"] == 1
@@ -455,7 +455,7 @@ async def test_pull_async_no_needed_hashes(
     mock_state = mocker.Mock(spec=state_mod.StateDB)
 
     result = await transfer._pull_async(
-        cache_dir, mock_remote, mock_state, "origin", stages=["nonexistent"]
+        cache_dir, mock_remote, mock_state, "origin", targets=["nonexistent"]
     )
 
     assert result["transferred"] == 0
@@ -487,7 +487,7 @@ async def test_pull_async_all_already_local(
     mock_state = mocker.Mock(spec=state_mod.StateDB)
 
     result = await transfer._pull_async(
-        cache_dir, mock_remote, mock_state, "origin", stages=["my_stage"]
+        cache_dir, mock_remote, mock_state, "origin", targets=["my_stage"]
     )
 
     assert result["transferred"] == 0
@@ -519,7 +519,7 @@ async def test_pull_async_downloads_missing(
     )
 
     result = await transfer._pull_async(
-        cache_dir, mock_remote, mock_state, "origin", stages=["my_stage"]
+        cache_dir, mock_remote, mock_state, "origin", targets=["my_stage"]
     )
 
     assert result["transferred"] == 1
@@ -547,7 +547,7 @@ async def test_pull_async_without_stages_lists_remote(
         return_value=[TransferResult(hash=hash1, success=True)]
     )
 
-    result = await transfer._pull_async(cache_dir, mock_remote, mock_state, "origin", stages=None)
+    result = await transfer._pull_async(cache_dir, mock_remote, mock_state, "origin", targets=None)
 
     assert result["transferred"] == 1
     mock_remote.list_hashes.assert_called_once()
@@ -577,7 +577,7 @@ async def test_pull_async_handles_failures(
     )
 
     result = await transfer._pull_async(
-        cache_dir, mock_remote, mock_state, "origin", stages=["my_stage"]
+        cache_dir, mock_remote, mock_state, "origin", targets=["my_stage"]
     )
 
     assert result["transferred"] == 0
@@ -616,7 +616,7 @@ async def test_pull_async_includes_deps(
     )
 
     result = await transfer._pull_async(
-        cache_dir, mock_remote, mock_state, "origin", stages=["my_stage"]
+        cache_dir, mock_remote, mock_state, "origin", targets=["my_stage"]
     )
 
     assert result["transferred"] == 2

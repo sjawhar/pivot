@@ -5,9 +5,9 @@ import logging
 import pathlib
 from typing import TYPE_CHECKING
 
-from pivot import cache, exceptions, lock, project, remote_config
+from pivot import cache, exceptions, lock, project, pvt, remote_config
 from pivot import remote as remote_mod
-from pivot.types import RemoteStatus, TransferSummary
+from pivot.types import DirHash, FileHash, HashInfo, RemoteStatus, TransferSummary
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -82,6 +82,105 @@ def get_stage_dep_hashes(cache_dir: pathlib.Path, stage_names: list[str]) -> set
     return hashes
 
 
+def _extract_hashes_from_output(output_hash: HashInfo) -> set[str]:
+    """Extract all hashes from a HashInfo (file or directory)."""
+    hashes = set[str]()
+    hashes.add(output_hash["hash"])
+    if "manifest" in output_hash:
+        for entry in output_hash["manifest"]:
+            hashes.add(entry["hash"])
+    return hashes
+
+
+def _get_file_hash_from_stages(rel_path: str, cache_dir: pathlib.Path) -> HashInfo | None:
+    """Look up a file's hash from stage lock files."""
+    locks_dir = cache_dir / "locks"
+    if not locks_dir.exists():
+        return None
+
+    for lock_file in locks_dir.glob("*.lock"):
+        stage_name = lock_file.stem
+        stage_lock = lock.StageLock(stage_name, cache_dir)
+        lock_data = stage_lock.read()
+        if lock_data is None:
+            continue
+
+        for out_path, out_hash in lock_data["output_hashes"].items():
+            if out_hash is not None and out_path == rel_path:
+                return out_hash
+
+    return None
+
+
+def _get_file_hash_from_pvt(rel_path: str, proj_root: pathlib.Path) -> HashInfo | None:
+    """Look up a file's hash from .pvt tracking file."""
+    pvt_path = proj_root / (rel_path + ".pvt")
+    if not pvt_path.exists():
+        return None
+
+    pvt_data = pvt.read_pvt_file(pvt_path)
+    if pvt_data is None:
+        return None
+
+    if "manifest" in pvt_data:
+        return DirHash(hash=pvt_data["hash"], manifest=pvt_data["manifest"])
+    return FileHash(hash=pvt_data["hash"])
+
+
+def get_target_hashes(
+    targets: list[str], cache_dir: pathlib.Path, include_deps: bool = False
+) -> set[str]:
+    """Resolve targets (stage names or file paths) to cache hashes.
+
+    Args:
+        targets: List of stage names or file paths
+        cache_dir: Cache directory path
+        include_deps: If True, also include dependency hashes for stages
+
+    Returns:
+        Set of content hashes for all resolved targets
+    """
+    proj_root = project.get_project_root()
+    hashes = set[str]()
+    unresolved = list[str]()
+
+    for target in targets:
+        # Try as stage name first (no path separators)
+        if "/" not in target and "\\" not in target:
+            stage_lock = lock.StageLock(target, cache_dir)
+            lock_data = stage_lock.read()
+            if lock_data is not None:
+                for out_hash in lock_data["output_hashes"].values():
+                    if out_hash is not None:
+                        hashes |= _extract_hashes_from_output(out_hash)
+                if include_deps:
+                    for dep_hash in lock_data["dep_hashes"].values():
+                        hashes |= _extract_hashes_from_output(dep_hash)
+                continue
+
+        # Try as file path
+        rel_path = project.to_relative_path(project.normalize_path(target), proj_root)
+
+        # Check stage outputs
+        out_hash = _get_file_hash_from_stages(rel_path, cache_dir)
+        if out_hash is not None:
+            hashes |= _extract_hashes_from_output(out_hash)
+            continue
+
+        # Check .pvt tracked files
+        pvt_hash = _get_file_hash_from_pvt(rel_path, proj_root)
+        if pvt_hash is not None:
+            hashes |= _extract_hashes_from_output(pvt_hash)
+            continue
+
+        unresolved.append(target)
+
+    if unresolved:
+        logger.warning(f"Could not resolve targets: {', '.join(unresolved)}")
+
+    return hashes
+
+
 async def compare_status(
     local_hashes: set[str],
     remote: remote_mod.S3Remote,
@@ -113,13 +212,13 @@ async def _push_async(
     remote: remote_mod.S3Remote,
     state_db: state_mod.StateDB,
     remote_name: str,
-    stages: list[str] | None = None,
+    targets: list[str] | None = None,
     jobs: int = 20,
     callback: Callable[[int], None] | None = None,
 ) -> TransferSummary:
     """Push cache files to remote (async implementation)."""
-    if stages:
-        local_hashes = get_stage_output_hashes(cache_dir, stages)
+    if targets:
+        local_hashes = get_target_hashes(targets, cache_dir, include_deps=False)
     else:
         local_hashes = get_local_cache_hashes(cache_dir)
 
@@ -160,13 +259,13 @@ def push(
     remote: remote_mod.S3Remote,
     state_db: state_mod.StateDB,
     remote_name: str,
-    stages: list[str] | None = None,
+    targets: list[str] | None = None,
     jobs: int = 20,
     callback: Callable[[int], None] | None = None,
 ) -> TransferSummary:
     """Push cache files to remote storage."""
     return asyncio.run(
-        _push_async(cache_dir, remote, state_db, remote_name, stages, jobs, callback)
+        _push_async(cache_dir, remote, state_db, remote_name, targets, jobs, callback)
     )
 
 
@@ -175,14 +274,13 @@ async def _pull_async(
     remote: remote_mod.S3Remote,
     state_db: state_mod.StateDB,
     remote_name: str,
-    stages: list[str] | None = None,
+    targets: list[str] | None = None,
     jobs: int = 20,
     callback: Callable[[int], None] | None = None,
 ) -> TransferSummary:
     """Pull cache files from remote (async implementation)."""
-    if stages:
-        needed_hashes = get_stage_output_hashes(cache_dir, stages)
-        needed_hashes |= get_stage_dep_hashes(cache_dir, stages)
+    if targets:
+        needed_hashes = get_target_hashes(targets, cache_dir, include_deps=True)
     else:
         needed_hashes = await remote.list_hashes()
 
@@ -223,13 +321,13 @@ def pull(
     remote: remote_mod.S3Remote,
     state_db: state_mod.StateDB,
     remote_name: str,
-    stages: list[str] | None = None,
+    targets: list[str] | None = None,
     jobs: int = 20,
     callback: Callable[[int], None] | None = None,
 ) -> TransferSummary:
     """Pull cache files from remote storage."""
     return asyncio.run(
-        _pull_async(cache_dir, remote, state_db, remote_name, stages, jobs, callback)
+        _pull_async(cache_dir, remote, state_db, remote_name, targets, jobs, callback)
     )
 
 

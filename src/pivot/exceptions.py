@@ -1,7 +1,16 @@
+from typing import override
+
+
 class PivotError(Exception):
     """Base exception for Pivot errors."""
 
-    pass
+    def format_user_message(self) -> str:
+        """Format a user-friendly error message."""
+        return str(self)
+
+    def get_suggestion(self) -> str | None:
+        """Return actionable suggestion for resolving the error."""
+        return None
 
 
 class ValidationError(PivotError):
@@ -47,25 +56,33 @@ class DAGError(PivotError):
 class CyclicGraphError(DAGError):
     """Raised when DAG contains cycles."""
 
-    pass
+    @override
+    def get_suggestion(self) -> str:
+        return "Check stage dependencies for circular references"
 
 
 class DependencyNotFoundError(DAGError):
     """Raised when a dependency doesn't exist."""
 
-    pass
+    @override
+    def get_suggestion(self) -> str:
+        return "Ensure the file exists or is produced by another stage"
 
 
 class StageNotFoundError(DAGError):
     """Raised when a requested stage doesn't exist."""
 
-    pass
+    @override
+    def get_suggestion(self) -> str:
+        return "Run 'pivot list' to see available stages"
 
 
 class StageAlreadyRunningError(PivotError):
     """Raised when a stage is already being executed by another process."""
 
-    pass
+    @override
+    def get_suggestion(self) -> str:
+        return "Wait for the other process to finish or remove stale lock files"
 
 
 class ExecutionError(PivotError):
@@ -131,7 +148,9 @@ class PlotsError(PivotError):
 class TrackedFileMissingError(CacheError):
     """Raised when a .pvt tracked file is missing (user should run pivot checkout)."""
 
-    pass
+    @override
+    def get_suggestion(self) -> str:
+        return "Run 'pivot checkout' to restore from cache"
 
 
 class GetError(PivotError):
@@ -155,7 +174,9 @@ class TargetNotFoundError(GetError):
 class CacheMissError(GetError):
     """Raised when file cannot be retrieved from cache, git, or remote."""
 
-    pass
+    @override
+    def get_suggestion(self) -> str:
+        return "Run 'pivot pull' to fetch from remote, or re-run the stage to regenerate"
 
 
 class RemoteError(PivotError):
@@ -167,34 +188,46 @@ class RemoteError(PivotError):
 class RemoteNotFoundError(RemoteError):
     """Raised when a named remote doesn't exist in configuration."""
 
-    pass
+    @override
+    def get_suggestion(self) -> str:
+        return "Run 'pivot remote list' to see available remotes"
 
 
 class RemoteConnectionError(RemoteError):
     """Raised when connection to remote storage fails."""
 
-    pass
+    @override
+    def get_suggestion(self) -> str:
+        return "Check network connection and remote credentials"
 
 
 class InvalidRemoteURLError(RemoteError):
     """Raised when remote URL is malformed or uses unsupported scheme."""
 
-    pass
+    @override
+    def get_suggestion(self) -> str:
+        return "Use format: s3://bucket/path, gs://bucket/path, or /local/path"
 
 
 class RemoteTransferError(RemoteError):
     """Raised when file transfer to/from remote fails."""
 
-    pass
+    @override
+    def get_suggestion(self) -> str:
+        return "Check network connection and remote permissions"
 
 
 class RemoteFetchError(RemoteError):
     """Raised when fetching from remote fails."""
 
-    pass
+    @override
+    def get_suggestion(self) -> str:
+        return "Check network connection and verify the file exists on remote"
 
 
 class RemoteNotConfiguredError(RemoteError):
     """Raised when no remote is configured."""
 
-    pass
+    @override
+    def get_suggestion(self) -> str:
+        return "Run 'pivot remote add <name> <url>' to configure a remote"
