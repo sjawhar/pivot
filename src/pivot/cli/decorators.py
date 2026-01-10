@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, Any
 
 import click
 
-from pivot import exceptions
+from pivot import discovery, exceptions
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -45,15 +45,18 @@ def with_error_handling[**P, R](func: Callable[P, R]) -> Callable[P, R]:
 
 
 def pivot_command(
-    name: str | None = None, **attrs: Any
+    name: str | None = None, *, auto_discover: bool = True, **attrs: Any
 ) -> Callable[[Callable[..., Any]], click.Command]:
-    """Create a Click command with Pivot error handling.
+    """Create a Click command with Pivot error handling and optional auto-discovery.
 
     Combines @click.command() with automatic error handling that converts
     PivotError to user-friendly messages with suggestions.
 
     Args:
         name: Optional command name (defaults to function name)
+        auto_discover: If True (default), automatically discover and register
+            stages before running the command. Set to False for commands that
+            don't need the registry (e.g., init, schema).
         **attrs: Additional arguments passed to click.command()
 
     Returns:
@@ -61,7 +64,16 @@ def pivot_command(
     """
 
     def decorator(func: Callable[..., Any]) -> click.Command:
-        wrapped = with_error_handling(func)
+        @functools.wraps(func)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            if auto_discover and not discovery.has_registered_stages():
+                try:
+                    discovery.discover_and_register()
+                except discovery.DiscoveryError as e:
+                    raise click.ClickException(str(e)) from e
+            return func(*args, **kwargs)
+
+        wrapped = with_error_handling(wrapper)
         return click.command(name=name, **attrs)(wrapped)
 
     return decorator

@@ -8,7 +8,7 @@ from pivot.cli import decorators as cli_decorators
 from pivot.pipeline import yaml as pipeline_yaml
 
 
-@cli_decorators.pivot_command("schema")
+@cli_decorators.pivot_command("schema", auto_discover=False)
 @click.option(
     "--indent",
     type=int,

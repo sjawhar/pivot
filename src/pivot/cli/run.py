@@ -267,7 +267,6 @@ def run(
 
     Auto-discovers pivot.yaml or pipeline.py if no stages are registered.
     """
-    ensure_stages_registered()
     stages_list = list(stages) if stages else None
     _validate_stages(stages_list, single_stage)
 
@@ -373,7 +372,6 @@ def dry_run_cmd(
     stages: tuple[str, ...], single_stage: bool, cache_dir: pathlib.Path | None, force: bool
 ) -> None:
     """Show what would run without executing."""
-    ensure_stages_registered()
     stages_list = list(stages) if stages else None
     _validate_stages(stages_list, single_stage)
 
@@ -411,7 +409,6 @@ def explain_cmd(
     """Show detailed breakdown of why stages would run."""
     from pivot.tui import console
 
-    ensure_stages_registered()
     stages_list = list(stages) if stages else None
     _validate_stages(stages_list, single_stage)
 

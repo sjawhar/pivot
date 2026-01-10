@@ -162,6 +162,57 @@ def _internal_helper():
     pass
 ```
 
+## CLI Development
+
+### The `pivot_command` Decorator
+
+**All CLI commands must use `@cli_decorators.pivot_command()` instead of `@click.command()`.**
+
+This decorator provides two essential behaviors:
+
+1. **Auto-discovery** - Calls `discover_and_register()` before the command runs
+2. **Error handling** - Converts `PivotError` to user-friendly `ClickException` messages
+
+```python
+from pivot.cli import decorators as cli_decorators
+
+# Standard command - auto-discovers stages before running
+@cli_decorators.pivot_command()
+@click.argument("stages", nargs=-1)
+def list_cmd(stages: tuple[str, ...]) -> None:
+    # Registry is guaranteed to be populated here
+    ...
+
+# Command that doesn't need the registry
+@cli_decorators.pivot_command(auto_discover=False)
+def init() -> None:
+    # No discovery - creates new project
+    ...
+```
+
+### When to disable auto-discovery
+
+Use `auto_discover=False` only for commands that don't use the stage registry:
+
+- `init` - Creates new project (no pipeline exists yet)
+- `schema` - Outputs JSON schema (no registry needed)
+- `push`/`pull` - Read from lock files directly
+
+### Shell completion
+
+Add shell completion for stage/target arguments:
+
+```python
+from pivot.cli import completion
+
+@cli_decorators.pivot_command()
+@click.argument("stages", nargs=-1, shell_complete=completion.complete_stages)
+def my_command(stages: tuple[str, ...]) -> None:
+    ...
+```
+
+See `src/pivot/cli/CLAUDE.md` for detailed CLI development guidelines.
+
 ## Pull Request Guidelines
 
 Use the PR template at `.github/pull_request_template.md`:

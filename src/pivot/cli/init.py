@@ -20,7 +20,7 @@ config.yaml.lock
 """
 
 
-@cli_decorators.pivot_command()
+@cli_decorators.pivot_command(auto_discover=False)
 @click.option(
     "--force",
     "-f",
