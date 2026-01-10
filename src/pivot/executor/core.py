@@ -38,6 +38,9 @@ from pivot.types import (
     StageExplanation,
     StageResult,
     StageStatus,
+    TuiLogMessage,
+    TuiMessage,
+    TuiStatusMessage,
 )
 
 if TYPE_CHECKING:
@@ -63,6 +66,7 @@ class StageState:
     """Tracks execution state for a single stage."""
 
     name: str
+    index: int  # 1-based position in execution order
     info: registry.RegistryStageInfo
     upstream: list[str]
     upstream_unfinished: set[str]
@@ -72,6 +76,13 @@ class StageState:
     result: StageResult | None = None
     start_time: float | None = None
     end_time: float | None = None
+
+    def get_duration(self) -> float | None:
+        """Calculate elapsed duration from start to end (or current time if still running)."""
+        if self.start_time is None:
+            return None
+        end = self.end_time if self.end_time is not None else time.perf_counter()
+        return end - self.start_time
 
 
 def run(
@@ -85,6 +96,7 @@ def run(
     force: bool = False,
     stage_timeout: float | None = None,
     explain_mode: bool = False,
+    tui_queue: mp.Queue[TuiMessage] | None = None,
 ) -> dict[str, ExecutionSummary]:
     """Execute pipeline stages with greedy parallel execution.
 
@@ -99,6 +111,7 @@ def run(
         force: If True, skip safety checks for uncached IncrementalOut files.
         stage_timeout: Max seconds for each stage to complete (default: no timeout).
         explain_mode: If True, show detailed WHY for each stage before execution.
+        tui_queue: Queue for TUI messages (status updates and logs).
 
     Returns:
         Dict of stage_name -> {status: "ran"|"skipped"|"failed", reason: str}
@@ -174,6 +187,7 @@ def run(
         overrides=overrides,
         explain_mode=explain_mode,
         checkout_modes=checkout_modes,
+        tui_queue=tui_queue,
     )
 
     results = _build_results(stage_states)
@@ -199,7 +213,7 @@ def _initialize_stage_states(
     stages_set = set(execution_order)
     states = dict[str, StageState]()
 
-    for stage_name in execution_order:
+    for idx, stage_name in enumerate(execution_order, 1):
         stage_info = registry.REGISTRY.get(stage_name)
 
         upstream = list(graph.successors(stage_name))
@@ -210,6 +224,7 @@ def _initialize_stage_states(
 
         states[stage_name] = StageState(
             name=stage_name,
+            index=idx,
             info=stage_info,
             upstream=upstream_in_plan,
             upstream_unfinished=set(upstream_in_plan),
@@ -286,6 +301,7 @@ def _execute_greedy(
     overrides: parameters.ParamsOverrides | None = None,
     explain_mode: bool = False,
     checkout_modes: list[str] | None = None,
+    tui_queue: mp.Queue[TuiMessage] | None = None,
 ) -> None:
     """Execute stages with greedy parallel scheduling using loky ProcessPoolExecutor."""
     overrides = overrides or {}
@@ -301,10 +317,10 @@ def _execute_greedy(
     output_queue: mp.Queue[OutputMessage] = mp.Manager().Queue()  # pyright: ignore[reportAssignmentType]
 
     output_thread: threading.Thread | None = None
-    if con:
+    if con or tui_queue:
         output_thread = threading.Thread(
             target=_output_queue_reader,
-            args=(output_queue, con),
+            args=(output_queue, con, tui_queue),
             daemon=True,
         )
         output_thread.start()
@@ -326,6 +342,7 @@ def _execute_greedy(
                 overrides=overrides,
                 explain_mode=explain_mode,
                 checkout_modes=checkout_modes,
+                tui_queue=tui_queue,
             )
 
             while futures:
@@ -359,15 +376,29 @@ def _execute_greedy(
                         futures.pop(future)
                         future.cancel()
                         state = stage_states[stage_name]
+                        timeout_reason = f"Stage timed out after {stage_timeout}s"
                         _mark_stage_failed(
                             state,
-                            f"Stage timed out after {stage_timeout}s",
+                            timeout_reason,
                             stage_states,
                             error_mode,
                         )
                         completed_count += 1
                         for mutex in state.mutex:
                             mutex_counts[mutex] -= 1
+
+                        if tui_queue:
+                            tui_queue.put(
+                                TuiStatusMessage(
+                                    type="status",
+                                    stage=stage_name,
+                                    index=state.index,
+                                    total=total_stages,
+                                    status=StageStatus.FAILED,
+                                    reason=timeout_reason,
+                                    elapsed=state.get_duration(),
+                                )
+                            )
                     continue
 
                 for future in done:
@@ -410,20 +441,33 @@ def _execute_greedy(
                             )
                             mutex_counts[mutex] = 0  # Reset to valid state
 
-                    if con and state.result:
-                        duration = (
-                            (state.end_time - state.start_time)
-                            if (state.start_time is not None and state.end_time is not None)
-                            else None
-                        )
-                        con.stage_result(
-                            name=stage_name,
-                            index=completed_count,
-                            total=total_stages,
-                            status=StageStatus(state.result["status"]),
-                            reason=state.result["reason"],
-                            duration=duration,
-                        )
+                    if state.result:
+                        result_status = StageStatus(state.result["status"])
+                        result_reason = state.result["reason"]
+                        duration = state.get_duration()
+
+                        if con:
+                            con.stage_result(
+                                name=stage_name,
+                                index=completed_count,
+                                total=total_stages,
+                                status=result_status,
+                                reason=result_reason,
+                                duration=duration,
+                            )
+
+                        if tui_queue:
+                            tui_queue.put(
+                                TuiStatusMessage(
+                                    type="status",
+                                    stage=stage_name,
+                                    index=state.index,
+                                    total=total_stages,
+                                    status=result_status,
+                                    reason=result_reason,
+                                    elapsed=duration,
+                                )
+                            )
 
                 if error_mode == OnError.FAIL:
                     failed = any(s.status == StageStatus.FAILED for s in stage_states.values())
@@ -449,6 +493,7 @@ def _execute_greedy(
                         overrides=overrides,
                         explain_mode=explain_mode,
                         checkout_modes=checkout_modes,
+                        tui_queue=tui_queue,
                     )
     finally:
         # Signal output thread to stop - may fail if queue is broken
@@ -458,15 +503,24 @@ def _execute_greedy(
             output_thread.join(timeout=1.0)
 
 
-def _output_queue_reader(output_q: mp.Queue[OutputMessage], con: console.Console) -> None:
-    """Read output messages from worker processes and display them."""
+def _output_queue_reader(
+    output_q: mp.Queue[OutputMessage],
+    con: console.Console | None,
+    tui_queue: mp.Queue[TuiMessage] | None = None,
+) -> None:
+    """Read output messages from worker processes and display/forward them."""
     while True:
         try:
             msg = output_q.get(timeout=0.1)
             if msg is None:
                 break
             stage_name, line, is_stderr = msg
-            con.stage_output(stage_name, line, is_stderr)
+            if con:
+                con.stage_output(stage_name, line, is_stderr)
+            if tui_queue:
+                tui_queue.put(
+                    TuiLogMessage(type="log", stage=stage_name, line=line, is_stderr=is_stderr)
+                )
         except queue.Empty:
             continue
 
@@ -493,6 +547,7 @@ def _start_ready_stages(
     overrides: parameters.ParamsOverrides,
     explain_mode: bool = False,
     checkout_modes: list[str] | None = None,
+    tui_queue: mp.Queue[TuiMessage] | None = None,
 ) -> None:
     """Find and start stages that are ready to execute."""
     checkout_modes = checkout_modes or config.DEFAULT_CHECKOUT_MODE_ORDER
@@ -551,12 +606,27 @@ def _start_ready_stages(
             state.status = StageStatus.IN_PROGRESS
             state.start_time = time.perf_counter()
 
+            stage_index = state.index
+
             if con and not explain_mode:
                 con.stage_start(
                     name=stage_name,
                     index=completed_count + len(futures),
                     total=total_stages,
                     status=StageDisplayStatus.RUNNING,
+                )
+
+            if tui_queue:
+                tui_queue.put(
+                    TuiStatusMessage(
+                        type="status",
+                        stage=stage_name,
+                        index=stage_index,
+                        total=total_stages,
+                        status=StageStatus.IN_PROGRESS,
+                        reason="",
+                        elapsed=None,
+                    )
                 )
         except Exception as e:
             # Rollback mutex acquisition on submission failure
