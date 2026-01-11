@@ -1,19 +1,7 @@
 import pathlib
 
-import pytest
-
-from pivot import executor, project
+from pivot import executor
 from pivot.registry import stage
-
-
-@pytest.fixture
-def pipeline_dir(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> pathlib.Path:
-    """Set up a temporary pipeline directory."""
-    (tmp_path / ".pivot").mkdir()
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(project, "_project_root_cache", None)
-    return tmp_path
-
 
 # =============================================================================
 # Linear DAG: A → B → C

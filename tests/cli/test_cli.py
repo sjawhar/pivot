@@ -1,21 +1,18 @@
+from __future__ import annotations
+
 import json
 import pathlib
-
-import click.testing
-import pytest
+from typing import TYPE_CHECKING
 
 from pivot import cli, executor, project, stage
 from pivot.registry import REGISTRY
 from pivot.tui import console
 
-
-@pytest.fixture
-def runner() -> click.testing.CliRunner:
-    """Create a CLI runner for testing."""
-    return click.testing.CliRunner()
+if TYPE_CHECKING:
+    from click.testing import CliRunner
 
 
-def test_cli_help_shows_commands(runner: click.testing.CliRunner) -> None:
+def test_cli_help_shows_commands(runner: CliRunner) -> None:
     """CLI should show available commands in help."""
     result = runner.invoke(cli.cli, ["--help"])
     assert result.exit_code == 0
@@ -23,7 +20,7 @@ def test_cli_help_shows_commands(runner: click.testing.CliRunner) -> None:
     assert "list" in result.output
 
 
-def test_cli_run_help(runner: click.testing.CliRunner) -> None:
+def test_cli_run_help(runner: CliRunner) -> None:
     """Run subcommand should show its own help."""
     result = runner.invoke(cli.cli, ["run", "--help"])
     assert result.exit_code == 0
@@ -31,9 +28,7 @@ def test_cli_run_help(runner: click.testing.CliRunner) -> None:
     assert "--dry-run" in result.output
 
 
-def test_cli_run_no_stages_registered(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
-) -> None:
+def test_cli_run_no_stages_registered(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """Run with no stages should report empty pipeline."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         (pathlib.Path.cwd() / ".git").mkdir()
@@ -42,20 +37,20 @@ def test_cli_run_no_stages_registered(
         assert "No stages to run" in result.output
 
 
-def test_cli_verbose_accepted(runner: click.testing.CliRunner) -> None:
+def test_cli_verbose_accepted(runner: CliRunner) -> None:
     """Verbose flag should be accepted."""
     result = runner.invoke(cli.cli, ["--verbose", "run", "--help"])
     assert result.exit_code == 0
 
 
-def test_cli_list_command_exists(runner: click.testing.CliRunner) -> None:
+def test_cli_list_command_exists(runner: CliRunner) -> None:
     """List subcommand should be available."""
     result = runner.invoke(cli.cli, ["list", "--help"])
     assert result.exit_code == 0
 
 
 def test_cli_list_shows_registered_stages(
-    runner: click.testing.CliRunner, set_project_root: pathlib.Path
+    runner: CliRunner, set_project_root: pathlib.Path
 ) -> None:
     """List should show registered stages."""
     output_file = set_project_root / "out.txt"
@@ -69,9 +64,7 @@ def test_cli_list_shows_registered_stages(
     assert "my_stage" in result.output
 
 
-def test_cli_list_verbose_shows_details(
-    runner: click.testing.CliRunner, set_project_root: pathlib.Path
-) -> None:
+def test_cli_list_verbose_shows_details(runner: CliRunner, set_project_root: pathlib.Path) -> None:
     """List --verbose should show deps and outputs."""
     input_file = set_project_root / "input.txt"
     output_file = set_project_root / "output.txt"
@@ -92,9 +85,7 @@ def test_cli_list_verbose_shows_details(
 # =============================================================================
 
 
-def test_cli_dry_run_shows_what_would_run(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
-) -> None:
+def test_cli_dry_run_shows_what_would_run(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """Dry-run shows stages that would run."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
@@ -112,9 +103,7 @@ def test_cli_dry_run_shows_what_would_run(
         assert "would run" in result.output
 
 
-def test_cli_dry_run_shows_unchanged_as_skip(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
-) -> None:
+def test_cli_dry_run_shows_unchanged_as_skip(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """Dry-run shows unchanged stages as 'would skip'."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
@@ -135,9 +124,7 @@ def test_cli_dry_run_shows_unchanged_as_skip(
         assert "would skip" in result.output or "unchanged" in result.output
 
 
-def test_cli_force_dry_run_shows_forced(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
-) -> None:
+def test_cli_force_dry_run_shows_forced(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """Dry-run with --force shows stages as 'would run (forced)'."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
@@ -159,9 +146,7 @@ def test_cli_force_dry_run_shows_forced(
         assert "forced" in result.output
 
 
-def test_cli_dry_run_missing_deps_errors(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
-) -> None:
+def test_cli_dry_run_missing_deps_errors(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """Dry-run fails when dependencies don't exist and aren't produced by other stages."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
@@ -178,7 +163,7 @@ def test_cli_dry_run_missing_deps_errors(
         assert "missing_input.txt" in result.output
 
 
-def test_cli_dry_run_no_stages(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
+def test_cli_dry_run_no_stages(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """Dry-run with no stages reports empty pipeline."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
@@ -189,9 +174,7 @@ def test_cli_dry_run_no_stages(runner: click.testing.CliRunner, tmp_path: pathli
         assert "No stages" in result.output
 
 
-def test_cli_dry_run_specific_stage(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
-) -> None:
+def test_cli_dry_run_specific_stage(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """Dry-run with stage argument only shows specified stage and dependencies."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
@@ -212,7 +195,7 @@ def test_cli_dry_run_specific_stage(
         assert "stage_b" not in result.output
 
 
-def test_cli_dry_run_json_output(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
+def test_cli_dry_run_json_output(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """Dry-run with --json outputs valid JSON with stage information."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
@@ -232,9 +215,7 @@ def test_cli_dry_run_json_output(runner: click.testing.CliRunner, tmp_path: path
         assert "reason" in data["stages"]["process"]
 
 
-def test_cli_dry_run_json_empty_pipeline(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
-) -> None:
+def test_cli_dry_run_json_empty_pipeline(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """Dry-run --json with no stages outputs empty stages dict."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
@@ -246,9 +227,7 @@ def test_cli_dry_run_json_empty_pipeline(
         assert data == {"stages": {}}
 
 
-def test_cli_dry_run_json_with_force(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
-) -> None:
+def test_cli_dry_run_json_with_force(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """Dry-run --json --force shows forced status."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
@@ -277,9 +256,7 @@ def test_cli_dry_run_json_with_force(
 # =============================================================================
 
 
-def test_cli_run_exception_shows_error(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
-) -> None:
+def test_cli_run_exception_shows_error(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """Run command shows error when exception occurs."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
@@ -290,9 +267,7 @@ def test_cli_run_exception_shows_error(
         assert "nonexistent" in result.output.lower() or "error" in result.output.lower()
 
 
-def test_cli_dry_run_exception_shows_error(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
-) -> None:
+def test_cli_dry_run_exception_shows_error(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """Dry-run command shows error when exception occurs."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
@@ -307,7 +282,7 @@ def test_cli_dry_run_exception_shows_error(
 # =============================================================================
 
 
-def test_cli_run_prints_results(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
+def test_cli_run_prints_results(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """Run command prints results for each stage."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
@@ -329,9 +304,7 @@ def test_cli_run_prints_results(runner: click.testing.CliRunner, tmp_path: pathl
         assert "Total:" in result.output
 
 
-def test_cli_run_prints_skipped_stages(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
-) -> None:
+def test_cli_run_prints_skipped_stages(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """Run command correctly shows skipped stages."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
@@ -365,7 +338,7 @@ def test_cli_run_prints_skipped_stages(
 # =============================================================================
 
 
-def test_cli_list_no_stages(runner: click.testing.CliRunner) -> None:
+def test_cli_list_no_stages(runner: CliRunner) -> None:
     """List with no stages shows appropriate message."""
     result = runner.invoke(cli.cli, ["list"])
 
@@ -378,7 +351,7 @@ def test_cli_list_no_stages(runner: click.testing.CliRunner) -> None:
 # =============================================================================
 
 
-def test_cli_help_shows_categorized_commands(runner: click.testing.CliRunner) -> None:
+def test_cli_help_shows_categorized_commands(runner: CliRunner) -> None:
     """CLI help should show commands grouped by category."""
     result = runner.invoke(cli.cli, ["--help"])
     assert result.exit_code == 0
@@ -388,7 +361,7 @@ def test_cli_help_shows_categorized_commands(runner: click.testing.CliRunner) ->
     assert "Remote Commands:" in result.output
 
 
-def test_cli_help_contains_pipeline_commands(runner: click.testing.CliRunner) -> None:
+def test_cli_help_contains_pipeline_commands(runner: CliRunner) -> None:
     """Help output should contain pipeline commands (run, explain)."""
     result = runner.invoke(cli.cli, ["--help"])
     assert result.exit_code == 0
@@ -398,7 +371,7 @@ def test_cli_help_contains_pipeline_commands(runner: click.testing.CliRunner) ->
     assert "explain" in result.output, "Should show 'explain' command"
 
 
-def test_cli_help_contains_inspection_commands(runner: click.testing.CliRunner) -> None:
+def test_cli_help_contains_inspection_commands(runner: CliRunner) -> None:
     """Help output should contain inspection commands."""
     result = runner.invoke(cli.cli, ["--help"])
     assert result.exit_code == 0
@@ -416,9 +389,7 @@ def test_cli_help_contains_inspection_commands(runner: click.testing.CliRunner) 
 # =============================================================================
 
 
-def test_cli_run_unknown_stage_shows_suggestion(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
-) -> None:
+def test_cli_run_unknown_stage_shows_suggestion(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """Running unknown stage shows error with suggestion to run pivot list."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import enum
-from typing import Any, Literal, NotRequired, TypedDict
+from typing import Any, Literal, NotRequired, TypedDict, TypeGuard
 
 # =============================================================================
 # Execution Types
@@ -462,6 +462,26 @@ class TuiReloadMessage(TypedDict):
 
 
 TuiMessage = TuiLogMessage | TuiStatusMessage | TuiWatchMessage | TuiReloadMessage | None
+
+
+def is_tui_status_message(msg: TuiMessage) -> TypeGuard[TuiStatusMessage]:
+    """TypeGuard to narrow TuiMessage to TuiStatusMessage."""
+    return msg is not None and msg["type"] == TuiMessageType.STATUS
+
+
+def is_tui_log_message(msg: TuiMessage) -> TypeGuard[TuiLogMessage]:
+    """TypeGuard to narrow TuiMessage to TuiLogMessage."""
+    return msg is not None and msg["type"] == TuiMessageType.LOG
+
+
+def is_tui_watch_message(msg: TuiMessage) -> TypeGuard[TuiWatchMessage]:
+    """TypeGuard to narrow TuiMessage to TuiWatchMessage."""
+    return msg is not None and msg["type"] == TuiMessageType.WATCH
+
+
+def is_tui_reload_message(msg: TuiMessage) -> TypeGuard[TuiReloadMessage]:
+    """TypeGuard to narrow TuiMessage to TuiReloadMessage."""
+    return msg is not None and msg["type"] == TuiMessageType.RELOAD
 
 
 # =============================================================================

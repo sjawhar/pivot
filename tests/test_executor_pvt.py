@@ -4,24 +4,8 @@ import click.testing
 import pytest
 
 import pivot
-from pivot import cli, exceptions, executor, project
+from pivot import cli, exceptions, executor
 from pivot.storage import track
-
-
-@pytest.fixture
-def pipeline_dir(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> pathlib.Path:
-    """Set up a temporary pipeline directory."""
-    (tmp_path / ".pivot").mkdir()
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(project, "_project_root_cache", None)
-    return tmp_path
-
-
-@pytest.fixture
-def runner() -> click.testing.CliRunner:
-    """Create a CLI runner for testing."""
-    return click.testing.CliRunner()
-
 
 # =============================================================================
 # Tracked File Verification Tests

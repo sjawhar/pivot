@@ -453,6 +453,24 @@ class _BaseTuiApp(textual.app.App[_AppReturnT]):
                 self._stages[name] = info
                 self._stage_order.append(name)
 
+    @property
+    def selected_stage_name(self) -> str | None:
+        """Return name of currently selected stage, or None if no stages."""
+        if self._stage_order and self._selected_idx < len(self._stage_order):
+            return self._stage_order[self._selected_idx]
+        return None
+
+    @property
+    def focused_panel(self) -> Literal["stages", "detail"]:
+        """Return which panel currently has focus."""
+        return self._focused_panel
+
+    def select_stage_by_index(self, idx: int) -> None:
+        """Select a stage by index (for testing)."""
+        if 0 <= idx < len(self._stage_order):
+            self._selected_idx = idx
+            self._update_detail_panel()
+
     def _close_log_file(self) -> None:
         """Close the log file if open (thread-safe)."""
         # Swap-then-check pattern avoids race condition

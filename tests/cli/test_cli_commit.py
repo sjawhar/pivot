@@ -1,20 +1,14 @@
 from __future__ import annotations
 
 import pathlib
-
-import click.testing
-import pytest
+from typing import TYPE_CHECKING
 
 import pivot
 from pivot import cli, executor
 from pivot.storage import lock
 
-
-@pytest.fixture
-def runner() -> click.testing.CliRunner:
-    """Create a CLI runner for testing."""
-    return click.testing.CliRunner()
-
+if TYPE_CHECKING:
+    import click.testing
 
 # =============================================================================
 # commit --list tests

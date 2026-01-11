@@ -7,13 +7,6 @@ import pytest
 from pivot import exceptions, registry
 from pivot.cli import helpers as cli_helpers
 
-
-@pytest.fixture
-def runner() -> click.testing.CliRunner:
-    """Create a CLI runner for testing."""
-    return click.testing.CliRunner()
-
-
 # =============================================================================
 # validate_stages_exist Tests
 # =============================================================================

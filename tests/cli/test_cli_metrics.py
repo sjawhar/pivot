@@ -4,7 +4,6 @@ import json
 import pathlib
 from typing import TYPE_CHECKING, cast
 
-import click.testing
 import pytest
 import yaml
 
@@ -12,13 +11,8 @@ from pivot import cli, git, outputs
 from pivot.registry import REGISTRY
 
 if TYPE_CHECKING:
+    import click.testing
     from pytest_mock import MockerFixture
-
-
-@pytest.fixture
-def runner() -> click.testing.CliRunner:
-    """Create a CLI runner for testing."""
-    return click.testing.CliRunner()
 
 
 # =============================================================================

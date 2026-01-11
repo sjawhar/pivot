@@ -2,20 +2,14 @@ from __future__ import annotations
 
 import json
 import pathlib
-
-import click.testing
-import pytest
+from typing import TYPE_CHECKING
 
 from pivot import cli, executor
 from pivot.registry import REGISTRY
 from pivot.storage import cache, track
 
-
-@pytest.fixture
-def runner() -> click.testing.CliRunner:
-    """Create a CLI runner for testing."""
-    return click.testing.CliRunner()
-
+if TYPE_CHECKING:
+    import click.testing
 
 # =============================================================================
 # Help and Basic Tests

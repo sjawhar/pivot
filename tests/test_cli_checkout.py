@@ -1,18 +1,10 @@
 import pathlib
 
 import click.testing
-import pytest
 
 from pivot import cli, executor, project, stage
 from pivot.registry import REGISTRY
 from pivot.storage import track
-
-
-@pytest.fixture
-def runner() -> click.testing.CliRunner:
-    """Create a CLI runner for testing."""
-    return click.testing.CliRunner()
-
 
 # =============================================================================
 # Basic Checkout Command Tests

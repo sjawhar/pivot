@@ -21,15 +21,6 @@ def _try_acquire_nonblocking() -> filelock.BaseFileLock | None:
         return None
 
 
-@pytest.fixture
-def pipeline_dir(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> pathlib.Path:
-    """Set up a temporary pipeline directory with .pivot marker."""
-    (tmp_path / ".pivot").mkdir()
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(project, "_project_root_cache", None)
-    return tmp_path
-
-
 def test_pending_state_lock_creates_lock_file(pipeline_dir: pathlib.Path) -> None:
     """pending_state_lock creates lock file in .pivot directory."""
     with project_lock.pending_state_lock():

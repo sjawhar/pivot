@@ -1,26 +1,23 @@
 """Tests for --explain CLI flag."""
 
-import pathlib
+from __future__ import annotations
 
-import click.testing
+import pathlib
+from typing import TYPE_CHECKING
+
 import pydantic
-import pytest
 
 from pivot import cli, executor, stage
 
-
-@pytest.fixture
-def runner() -> click.testing.CliRunner:
-    """Create a CLI runner for testing."""
-    return click.testing.CliRunner()
-
+if TYPE_CHECKING:
+    from click.testing import CliRunner
 
 # =============================================================================
 # Basic --explain flag tests
 # =============================================================================
 
 
-def test_explain_flag_in_help(runner: click.testing.CliRunner) -> None:
+def test_explain_flag_in_help(runner: CliRunner) -> None:
     """--explain flag should appear in help output."""
     result = runner.invoke(cli.cli, ["run", "--help"])
 
@@ -28,7 +25,7 @@ def test_explain_flag_in_help(runner: click.testing.CliRunner) -> None:
     assert "--explain" in result.output
 
 
-def test_explain_no_stages(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
+def test_explain_no_stages(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """--explain with no stages shows appropriate message."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
@@ -39,7 +36,7 @@ def test_explain_no_stages(runner: click.testing.CliRunner, tmp_path: pathlib.Pa
         assert "No stages" in result.output
 
 
-def test_explain_flag_works(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
+def test_explain_flag_works(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """--explain produces output for stages."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
@@ -56,7 +53,7 @@ def test_explain_flag_works(runner: click.testing.CliRunner, tmp_path: pathlib.P
         assert "WILL RUN" in result.output
 
 
-def test_explain_specific_stages(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
+def test_explain_specific_stages(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """--explain can target specific stages."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
@@ -82,9 +79,7 @@ def test_explain_specific_stages(runner: click.testing.CliRunner, tmp_path: path
 # =============================================================================
 
 
-def test_explain_shows_code_changes(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
-) -> None:
+def test_explain_shows_code_changes(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """--explain shows code changes when code differs."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
@@ -112,9 +107,7 @@ def test_explain_shows_code_changes(
         assert "Code" in result.output
 
 
-def test_explain_shows_param_changes(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
-) -> None:
+def test_explain_shows_param_changes(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """--explain shows param changes when params differ."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
@@ -139,7 +132,7 @@ def test_explain_shows_param_changes(
         assert "Param" in result.output
 
 
-def test_explain_shows_dep_changes(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
+def test_explain_shows_dep_changes(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """--explain shows dependency changes when deps differ."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
@@ -161,7 +154,7 @@ def test_explain_shows_dep_changes(runner: click.testing.CliRunner, tmp_path: pa
         assert "Dep" in result.output or "input" in result.output.lower()
 
 
-def test_explain_shows_unchanged(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
+def test_explain_shows_unchanged(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """--explain shows stages as unchanged when nothing differs."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
@@ -180,9 +173,7 @@ def test_explain_shows_unchanged(runner: click.testing.CliRunner, tmp_path: path
         assert "unchanged" in result.output.lower() or "skip" in result.output.lower()
 
 
-def test_explain_shows_no_previous_run(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
-) -> None:
+def test_explain_shows_no_previous_run(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """--explain shows 'No previous run' for never-run stages."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
@@ -203,7 +194,7 @@ def test_explain_shows_no_previous_run(
 # =============================================================================
 
 
-def test_explain_short_flag(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
+def test_explain_short_flag(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """-e short flag works like --explain."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
@@ -225,9 +216,7 @@ def test_explain_short_flag(runner: click.testing.CliRunner, tmp_path: pathlib.P
 # =============================================================================
 
 
-def test_explain_unknown_stage_errors(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
-) -> None:
+def test_explain_unknown_stage_errors(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """--explain with unknown stage shows error."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()

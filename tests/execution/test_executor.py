@@ -11,21 +11,12 @@ import pytest
 import yaml
 
 import pivot
-from pivot import exceptions, executor, project, registry
+from pivot import exceptions, executor, registry
 from pivot.executor import core as executor_core
 from pivot.outputs import Metric
 
 if TYPE_CHECKING:
     from pytest_mock import MockerFixture
-
-
-@pytest.fixture
-def pipeline_dir(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> pathlib.Path:
-    """Set up a temporary pipeline directory."""
-    (tmp_path / ".pivot").mkdir()
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(project, "_project_root_cache", None)
-    return tmp_path
 
 
 def test_simple_pipeline_runs_in_order(pipeline_dir: pathlib.Path) -> None:

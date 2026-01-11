@@ -1,17 +1,15 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 import click
-import click.testing
-import pytest
-from pytest_mock import MockerFixture
 
 from pivot import discovery, exceptions
 from pivot.cli import decorators as cli_decorators
 
-
-@pytest.fixture
-def runner() -> click.testing.CliRunner:
-    """Create a CLI runner for testing."""
-    return click.testing.CliRunner()
-
+if TYPE_CHECKING:
+    from click.testing import CliRunner
+    from pytest_mock import MockerFixture
 
 # =============================================================================
 # pivot_command Tests
@@ -38,7 +36,7 @@ def test_pivot_command_with_name() -> None:
     assert my_command.name == "custom-name"
 
 
-def test_pivot_command_handles_pivot_error(runner: click.testing.CliRunner) -> None:
+def test_pivot_command_handles_pivot_error(runner: CliRunner) -> None:
     """pivot_command converts PivotError to ClickException with suggestion."""
 
     @cli_decorators.pivot_command()
@@ -52,7 +50,7 @@ def test_pivot_command_handles_pivot_error(runner: click.testing.CliRunner) -> N
     assert "pivot list" in result.output
 
 
-def test_pivot_command_handles_generic_exception(runner: click.testing.CliRunner) -> None:
+def test_pivot_command_handles_generic_exception(runner: CliRunner) -> None:
     """pivot_command converts generic exceptions using repr."""
 
     @cli_decorators.pivot_command()
@@ -66,7 +64,7 @@ def test_pivot_command_handles_generic_exception(runner: click.testing.CliRunner
     assert "something went wrong" in result.output
 
 
-def test_pivot_command_passes_through_click_exception(runner: click.testing.CliRunner) -> None:
+def test_pivot_command_passes_through_click_exception(runner: CliRunner) -> None:
     """pivot_command passes through ClickException unchanged."""
 
     @cli_decorators.pivot_command()
@@ -79,7 +77,7 @@ def test_pivot_command_passes_through_click_exception(runner: click.testing.CliR
     assert "Custom click error" in result.output
 
 
-def test_pivot_command_preserves_function_behavior(runner: click.testing.CliRunner) -> None:
+def test_pivot_command_preserves_function_behavior(runner: CliRunner) -> None:
     """pivot_command preserves normal function behavior."""
 
     @cli_decorators.pivot_command()
@@ -97,7 +95,7 @@ def test_pivot_command_preserves_function_behavior(runner: click.testing.CliRunn
 # =============================================================================
 
 
-def test_with_error_handling_handles_pivot_error(runner: click.testing.CliRunner) -> None:
+def test_with_error_handling_handles_pivot_error(runner: CliRunner) -> None:
     """with_error_handling converts PivotError to ClickException."""
 
     @click.command()
@@ -113,7 +111,7 @@ def test_with_error_handling_handles_pivot_error(runner: click.testing.CliRunner
 
 
 def test_with_error_handling_uses_repr_for_generic_exceptions(
-    runner: click.testing.CliRunner,
+    runner: CliRunner,
 ) -> None:
     """with_error_handling uses repr for generic exceptions to avoid empty messages."""
 
@@ -128,7 +126,7 @@ def test_with_error_handling_uses_repr_for_generic_exceptions(
     assert "RuntimeError" in result.output
 
 
-def test_with_error_handling_with_group_command(runner: click.testing.CliRunner) -> None:
+def test_with_error_handling_with_group_command(runner: CliRunner) -> None:
     """with_error_handling works with group subcommands."""
 
     @click.group()
@@ -153,7 +151,7 @@ def test_with_error_handling_with_group_command(runner: click.testing.CliRunner)
 
 
 def test_pivot_command_auto_discover_calls_discovery_when_no_stages(
-    runner: click.testing.CliRunner, mocker: MockerFixture
+    runner: CliRunner, mocker: MockerFixture
 ) -> None:
     """auto_discover=True calls discover_and_register when no stages registered."""
     mock_has_stages = mocker.patch.object(discovery, "has_registered_stages", return_value=False)
@@ -172,7 +170,7 @@ def test_pivot_command_auto_discover_calls_discovery_when_no_stages(
 
 
 def test_pivot_command_auto_discover_skips_when_stages_exist(
-    runner: click.testing.CliRunner, mocker: MockerFixture
+    runner: CliRunner, mocker: MockerFixture
 ) -> None:
     """auto_discover=True skips discovery when stages already registered."""
     mock_has_stages = mocker.patch.object(discovery, "has_registered_stages", return_value=True)
@@ -191,7 +189,7 @@ def test_pivot_command_auto_discover_skips_when_stages_exist(
 
 
 def test_pivot_command_auto_discover_false_skips_discovery(
-    runner: click.testing.CliRunner, mocker: MockerFixture
+    runner: CliRunner, mocker: MockerFixture
 ) -> None:
     """auto_discover=False skips discovery entirely."""
     mock_has_stages = mocker.patch.object(discovery, "has_registered_stages")
@@ -210,7 +208,7 @@ def test_pivot_command_auto_discover_false_skips_discovery(
 
 
 def test_pivot_command_auto_discover_converts_discovery_error(
-    runner: click.testing.CliRunner, mocker: MockerFixture
+    runner: CliRunner, mocker: MockerFixture
 ) -> None:
     """auto_discover converts DiscoveryError to ClickException."""
     mocker.patch.object(discovery, "has_registered_stages", return_value=False)

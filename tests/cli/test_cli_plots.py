@@ -3,13 +3,16 @@ from __future__ import annotations
 import json
 import pathlib
 import subprocess
+from typing import TYPE_CHECKING
 
-import click.testing
 import pytest
 
 from pivot import cli, outputs, registry
 from pivot.storage import lock
 from pivot.types import LockData
+
+if TYPE_CHECKING:
+    import click.testing
 
 
 def _setup_git_repo(tmp_path: pathlib.Path) -> None:
@@ -27,12 +30,6 @@ def _setup_git_repo(tmp_path: pathlib.Path) -> None:
         check=True,
         capture_output=True,
     )
-
-
-@pytest.fixture
-def runner() -> click.testing.CliRunner:
-    """Create a CLI runner for testing."""
-    return click.testing.CliRunner()
 
 
 # =============================================================================

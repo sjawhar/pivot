@@ -1,26 +1,24 @@
-import contextlib
-import pathlib
+from __future__ import annotations
 
-import click.testing
-import pytest
+import contextlib
+from typing import TYPE_CHECKING
+
 import yaml
 from tests.fixtures.export import pipeline
 
 from pivot import cli, outputs, registry
 
+if TYPE_CHECKING:
+    from pathlib import Path
 
-@pytest.fixture
-def runner() -> click.testing.CliRunner:
-    """Create a CLI runner for testing."""
-    return click.testing.CliRunner()
-
+    from click.testing import CliRunner
 
 # =============================================================================
 # Export Command Tests
 # =============================================================================
 
 
-def test_export_help_shows_options(runner: click.testing.CliRunner) -> None:
+def test_export_help_shows_options(runner: CliRunner) -> None:
     """Export command should show help with options."""
     result = runner.invoke(cli.cli, ["export", "--help"])
     assert result.exit_code == 0
@@ -28,8 +26,8 @@ def test_export_help_shows_options(runner: click.testing.CliRunner) -> None:
 
 
 def test_export_default_output_creates_dvc_yaml(
-    runner: click.testing.CliRunner,
-    set_project_root: pathlib.Path,
+    runner: CliRunner,
+    set_project_root: Path,
 ) -> None:
     """Export without args creates dvc.yaml in current directory."""
     (set_project_root / ".git").mkdir()
@@ -50,8 +48,8 @@ def test_export_default_output_creates_dvc_yaml(
 
 
 def test_export_custom_output_path(
-    runner: click.testing.CliRunner,
-    set_project_root: pathlib.Path,
+    runner: CliRunner,
+    set_project_root: Path,
 ) -> None:
     """Export with --output writes to specified path."""
     (set_project_root / ".git").mkdir()
@@ -71,8 +69,8 @@ def test_export_custom_output_path(
 
 
 def test_export_specific_stages_only(
-    runner: click.testing.CliRunner,
-    set_project_root: pathlib.Path,
+    runner: CliRunner,
+    set_project_root: Path,
 ) -> None:
     """Export with stage names exports only those stages."""
     (set_project_root / ".git").mkdir()
@@ -98,8 +96,8 @@ def test_export_specific_stages_only(
 
 
 def test_export_generates_params_yaml(
-    runner: click.testing.CliRunner,
-    set_project_root: pathlib.Path,
+    runner: CliRunner,
+    set_project_root: Path,
 ) -> None:
     """Export generates params.yaml with Pydantic model defaults."""
     (set_project_root / ".git").mkdir()
@@ -126,8 +124,8 @@ def test_export_generates_params_yaml(
 
 
 def test_export_unknown_stage_error(
-    runner: click.testing.CliRunner,
-    set_project_root: pathlib.Path,
+    runner: CliRunner,
+    set_project_root: Path,
 ) -> None:
     """Export with unknown stage name shows error."""
     (set_project_root / ".git").mkdir()
@@ -144,8 +142,8 @@ def test_export_unknown_stage_error(
 
 
 def test_export_no_stages_error(
-    runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
+    runner: CliRunner,
+    tmp_path: Path,
 ) -> None:
     """Export with no registered stages shows error."""
     (tmp_path / ".git").mkdir()
@@ -158,8 +156,8 @@ def test_export_no_stages_error(
 
 
 def test_export_dvc_yaml_structure(
-    runner: click.testing.CliRunner,
-    set_project_root: pathlib.Path,
+    runner: CliRunner,
+    set_project_root: Path,
 ) -> None:
     """Exported dvc.yaml has correct structure with cmd, deps, outs."""
     (set_project_root / ".git").mkdir()
@@ -188,8 +186,8 @@ def test_export_dvc_yaml_structure(
 
 
 def test_export_with_metrics_and_plots(
-    runner: click.testing.CliRunner,
-    set_project_root: pathlib.Path,
+    runner: CliRunner,
+    set_project_root: Path,
 ) -> None:
     """Export correctly separates outs, metrics, and plots."""
     (set_project_root / ".git").mkdir()

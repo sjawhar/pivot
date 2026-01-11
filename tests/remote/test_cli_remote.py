@@ -3,22 +3,15 @@ from __future__ import annotations
 import pathlib
 from typing import TYPE_CHECKING
 
-import click.testing
-import pytest
-
 from pivot import cli, project
 from pivot.remote import sync as transfer
 from pivot.storage import state
 from pivot.types import TransferSummary
 
 if TYPE_CHECKING:
+    import click.testing
+    import pytest
     from pytest_mock import MockerFixture
-
-
-@pytest.fixture
-def runner() -> click.testing.CliRunner:
-    """Create a CLI runner for testing."""
-    return click.testing.CliRunner()
 
 
 # =============================================================================
