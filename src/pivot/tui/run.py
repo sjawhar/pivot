@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import atexit
 import collections
 import dataclasses
+import json
 import logging
+import os
 import queue
 import threading
-from typing import TYPE_CHECKING, Any, ClassVar, final, override
+from typing import IO, TYPE_CHECKING, ClassVar, TypeVar, final, override
 
 import textual.app
 import textual.binding
@@ -13,6 +16,7 @@ import textual.containers
 import textual.message
 import textual.widgets
 
+from pivot.executor import ExecutionSummary
 from pivot.types import (
     DisplayMode,
     ReactiveStatus,
@@ -28,14 +32,19 @@ from pivot.types import (
 if TYPE_CHECKING:
     import multiprocessing as mp
     from collections.abc import Callable
+    from pathlib import Path
     from typing import Protocol
 
-    from pivot import executor
+    from pivot.types import OutputMessage
 
     class ReactiveEngineProtocol(Protocol):
         """Protocol for ReactiveEngine to avoid circular imports."""
 
-        def run(self, tui_queue: mp.Queue[TuiMessage] | None = None) -> None: ...
+        def run(
+            self,
+            tui_queue: mp.Queue[TuiMessage] | None = None,
+            output_queue: mp.Queue[OutputMessage] | None = None,
+        ) -> None: ...
         def shutdown(self) -> None: ...
 
 
@@ -89,12 +98,10 @@ class TuiUpdate(textual.message.Message):
 class ExecutorComplete(textual.message.Message):
     """Signal that executor has finished."""
 
-    results: dict[str, executor.ExecutionSummary]
+    results: dict[str, ExecutionSummary]
     error: Exception | None
 
-    def __init__(
-        self, results: dict[str, executor.ExecutionSummary], error: Exception | None
-    ) -> None:
+    def __init__(self, results: dict[str, ExecutionSummary], error: Exception | None) -> None:
         self.results = results
         self.error = error
         super().__init__()
@@ -129,8 +136,14 @@ class StageListPanel(textual.widgets.Static):
     _stages: list[StageInfo]
     _rows: dict[str, StageRow]
 
-    def __init__(self, stages: list[StageInfo], **kwargs: Any) -> None:
-        super().__init__(**kwargs)
+    def __init__(
+        self,
+        stages: list[StageInfo],
+        *,
+        id: str | None = None,
+        classes: str | None = None,
+    ) -> None:
+        super().__init__(id=id, classes=classes)
         self._stages = stages
         self._rows = {}
 
@@ -158,8 +171,8 @@ class DetailPanel(textual.widgets.Static):
 
     _stage: StageInfo | None
 
-    def __init__(self, **kwargs: Any) -> None:
-        super().__init__(**kwargs)
+    def __init__(self, *, id: str | None = None, classes: str | None = None) -> None:
+        super().__init__(id=id, classes=classes)
         self._stage = None
 
     def set_stage(self, stage: StageInfo | None) -> None:  # pragma: no cover
@@ -192,8 +205,8 @@ class LogPanel(textual.widgets.RichLog):
     _filter_stage: str | None
     _all_logs: collections.deque[tuple[str, str, bool]]
 
-    def __init__(self, **kwargs: Any) -> None:
-        super().__init__(highlight=True, markup=True, **kwargs)
+    def __init__(self, *, id: str | None = None, classes: str | None = None) -> None:
+        super().__init__(highlight=True, markup=True, id=id, classes=classes)
         self._filter_stage = None
         self._all_logs = collections.deque(maxlen=5000)
 
@@ -276,8 +289,13 @@ _TUI_BINDINGS: list[textual.binding.BindingType] = [
     ],
 ]
 
+_logger = logging.getLogger(__name__)
 
-class _BaseTuiApp(textual.app.App[Any]):
+# TypeVar for App return type - RunTuiApp returns results, WatchTuiApp returns None
+_AppReturnT = TypeVar("_AppReturnT")
+
+
+class _BaseTuiApp(textual.app.App[_AppReturnT]):
     """Base class for TUI applications with shared stage management."""
 
     CSS: ClassVar[str] = _TUI_CSS
@@ -287,6 +305,7 @@ class _BaseTuiApp(textual.app.App[Any]):
         self,
         message_queue: mp.Queue[TuiMessage],
         stage_names: list[str] | None = None,
+        tui_log: Path | None = None,
     ) -> None:
         """Initialize base TUI app state."""
         super().__init__()
@@ -297,12 +316,39 @@ class _BaseTuiApp(textual.app.App[Any]):
         self._show_logs: bool = False
         self._reader_thread: threading.Thread | None = None
         self._shutdown_event: threading.Event = threading.Event()
+        self._log_file: IO[str] | None = None
+
+        # Open log file if configured (line-buffered for real-time tailing)
+        if tui_log:
+            self._log_file = open(tui_log, "w", buffering=1)  # noqa: SIM115
+            # Prevent fd inheritance to child processes (avoids multiprocessing errors)
+            os.set_inheritable(self._log_file.fileno(), False)
+            atexit.register(self._close_log_file)
 
         if stage_names:
             for i, name in enumerate(stage_names, 1):
                 info = StageInfo(name, i, len(stage_names))
                 self._stages[name] = info
                 self._stage_order.append(name)
+
+    def _close_log_file(self) -> None:
+        """Close the log file if open (thread-safe)."""
+        # Swap-then-check pattern avoids race condition
+        log_file = self._log_file
+        self._log_file = None
+        if log_file:
+            atexit.unregister(self._close_log_file)
+            log_file.close()
+
+    def _write_to_log(self, data: str) -> None:  # pragma: no cover
+        """Write a line to the log file, logging warning on first failure."""
+        if self._log_file:
+            try:
+                self._log_file.write(data)
+            except OSError as e:
+                _logger.warning(f"TUI log write failed: {e}")
+                # Disable further writes to avoid log spam
+                self._log_file = None
 
     @override
     def compose(self) -> textual.app.ComposeResult:  # pragma: no cover
@@ -328,10 +374,17 @@ class _BaseTuiApp(textual.app.App[Any]):
             try:
                 msg = self._tui_queue.get(timeout=0.1)
                 if msg is None:
+                    self._write_to_log('{"type": "shutdown"}\n')
                     break
+                # default=str handles StrEnum serialization
+                self._write_to_log(json.dumps(msg, default=str) + "\n")
                 self.post_message(TuiUpdate(msg))
             except queue.Empty:
                 continue
+            except (EOFError, OSError, BrokenPipeError):
+                # Queue was closed or broken - exit gracefully
+                _logger.debug("TUI queue reader exiting: queue closed or broken")
+                break
 
     def _handle_log(self, msg: TuiLogMessage) -> None:  # pragma: no cover
         stage = msg["stage"]
@@ -392,21 +445,26 @@ class _BaseTuiApp(textual.app.App[Any]):
     @override
     async def action_quit(self) -> None:  # pragma: no cover
         self._shutdown_event.set()
+        # Wait for reader thread to finish before closing log file (avoids race)
+        if self._reader_thread:
+            self._reader_thread.join(timeout=2.0)
+        self._close_log_file()
         await super().action_quit()
 
 
-class RunTuiApp(_BaseTuiApp):
+class RunTuiApp(_BaseTuiApp[dict[str, ExecutionSummary] | None]):
     """TUI for single pipeline execution."""
 
     def __init__(
         self,
         stage_names: list[str],
         message_queue: mp.Queue[TuiMessage],
-        executor_func: Callable[[], dict[str, executor.ExecutionSummary]],
+        executor_func: Callable[[], dict[str, ExecutionSummary]],
+        tui_log: Path | None = None,
     ) -> None:
-        super().__init__(message_queue, stage_names)
-        self._executor_func: Callable[[], dict[str, executor.ExecutionSummary]] = executor_func
-        self._results: dict[str, executor.ExecutionSummary] | None = None
+        super().__init__(message_queue, stage_names, tui_log=tui_log)
+        self._executor_func: Callable[[], dict[str, ExecutionSummary]] = executor_func
+        self._results: dict[str, ExecutionSummary] | None = None
         self._error: Exception | None = None
         self._executor_thread: threading.Thread | None = None
 
@@ -423,7 +481,7 @@ class RunTuiApp(_BaseTuiApp):
 
     def _run_executor(self) -> None:  # pragma: no cover
         """Run the executor (runs in background thread)."""
-        results: dict[str, executor.ExecutionSummary] = {}
+        results: dict[str, ExecutionSummary] = {}
         error: Exception | None = None
         try:
             results = self._executor_func()
@@ -480,10 +538,11 @@ class RunTuiApp(_BaseTuiApp):
 def run_with_tui(
     stage_names: list[str],
     message_queue: mp.Queue[TuiMessage],
-    executor_func: Callable[[], dict[str, executor.ExecutionSummary]],
-) -> dict[str, executor.ExecutionSummary]:  # pragma: no cover
+    executor_func: Callable[[], dict[str, ExecutionSummary]],
+    tui_log: Path | None = None,
+) -> dict[str, ExecutionSummary]:  # pragma: no cover
     """Run pipeline with TUI display. Raises if executor fails."""
-    app = RunTuiApp(stage_names, message_queue, executor_func)
+    app = RunTuiApp(stage_names, message_queue, executor_func, tui_log=tui_log)
     results = app.run()
     if app.error is not None:
         raise app.error
@@ -503,16 +562,21 @@ def should_use_tui(display_mode: DisplayMode | None) -> bool:
 
 
 @final
-class WatchTuiApp(_BaseTuiApp):
+class WatchTuiApp(_BaseTuiApp[None]):
     """TUI for watch mode pipeline execution."""
+
+    _output_queue: mp.Queue[OutputMessage] | None
 
     def __init__(
         self,
         engine: ReactiveEngineProtocol,
         message_queue: mp.Queue[TuiMessage],
+        output_queue: mp.Queue[OutputMessage] | None = None,
+        tui_log: Path | None = None,
     ) -> None:
-        super().__init__(message_queue)
+        super().__init__(message_queue, tui_log=tui_log)
         self._engine: ReactiveEngineProtocol = engine
+        self._output_queue = output_queue
         self._engine_thread: threading.Thread | None = None
 
     async def on_mount(self) -> None:  # pragma: no cover
@@ -524,7 +588,7 @@ class WatchTuiApp(_BaseTuiApp):
     def _run_engine(self) -> None:  # pragma: no cover
         """Run the reactive engine (runs in background thread)."""
         try:
-            self._engine.run(tui_queue=self._tui_queue)
+            self._engine.run(tui_queue=self._tui_queue, output_queue=self._output_queue)
         except Exception as e:
             logging.getLogger(__name__).exception(f"Reactive engine failed: {e}")
 
@@ -543,11 +607,11 @@ class WatchTuiApp(_BaseTuiApp):
 
     def _handle_status(self, msg: TuiStatusMessage) -> None:  # pragma: no cover
         stage = msg["stage"]
-        if stage not in self._stages:
+        is_new_stage = stage not in self._stages
+        if is_new_stage:
             info = StageInfo(stage, msg["index"], msg["total"])
             self._stages[stage] = info
-            if stage not in self._stage_order:
-                self._stage_order.append(stage)
+            self._stage_order.append(stage)
 
         info = self._stages[stage]
         info.status = msg["status"]
@@ -556,8 +620,11 @@ class WatchTuiApp(_BaseTuiApp):
         info.index = msg["index"]
         info.total = msg["total"]
 
-        stage_list = self.query_one("#stage-list", StageListPanel)
-        stage_list.update_stage(stage)
+        if is_new_stage:
+            self._rebuild_stage_list()
+        else:
+            stage_list = self.query_one("#stage-list", StageListPanel)
+            stage_list.update_stage(stage)
         self._update_detail_panel()
 
     def _handle_reactive(self, msg: TuiReactiveMessage) -> None:  # pragma: no cover
@@ -589,14 +656,14 @@ class WatchTuiApp(_BaseTuiApp):
             info = StageInfo(name, len(self._stages) + 1, len(new_stages))
             self._stages[name] = info
 
-        self._stage_order: list[str] = new_stages
+        self._stage_order = new_stages
         for i, name in enumerate(self._stage_order, 1):
             if name in self._stages:
                 self._stages[name].index = i
                 self._stages[name].total = len(self._stage_order)
 
         if self._selected_idx >= len(self._stage_order):
-            self._selected_idx: int = max(0, len(self._stage_order) - 1)
+            self._selected_idx = max(0, len(self._stage_order) - 1)
 
         self._rebuild_stage_list()
         self._update_detail_panel()
@@ -604,7 +671,9 @@ class WatchTuiApp(_BaseTuiApp):
     def _rebuild_stage_list(self) -> None:  # pragma: no cover
         """Rebuild the stage list panel after stages change."""
         stage_list = self.query_one("#stage-list", StageListPanel)
-        stage_list.rebuild(list(self._stages.values()))
+        # Use _stage_order to maintain correct ordering
+        ordered_stages = [self._stages[name] for name in self._stage_order if name in self._stages]
+        stage_list.rebuild(ordered_stages)
 
     @override
     async def action_quit(self) -> None:  # pragma: no cover
@@ -615,7 +684,9 @@ class WatchTuiApp(_BaseTuiApp):
 def run_watch_tui(
     engine: ReactiveEngineProtocol,
     message_queue: mp.Queue[TuiMessage],
+    output_queue: mp.Queue[OutputMessage] | None = None,
+    tui_log: Path | None = None,
 ) -> None:  # pragma: no cover
     """Run watch mode with TUI display."""
-    app = WatchTuiApp(engine, message_queue)
+    app = WatchTuiApp(engine, message_queue, output_queue=output_queue, tui_log=tui_log)
     app.run()

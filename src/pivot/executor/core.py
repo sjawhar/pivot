@@ -112,6 +112,7 @@ def run(
     stage_timeout: float | None = None,
     explain_mode: bool = False,
     tui_queue: mp.Queue[TuiMessage] | None = None,
+    output_queue: mp.Queue[OutputMessage] | None = None,
 ) -> dict[str, ExecutionSummary]:
     """Execute pipeline stages with greedy parallel execution.
 
@@ -128,6 +129,8 @@ def run(
         stage_timeout: Max seconds for each stage to complete (default: no timeout).
         explain_mode: If True, show detailed WHY for each stage before execution.
         tui_queue: Queue for TUI messages (status updates and logs).
+        output_queue: Queue for worker output streaming. If None, created internally.
+            Pass this when running in TUI mode to avoid multiprocessing issues.
 
     Returns:
         Dict of stage_name -> {status: "ran"|"skipped"|"failed", reason: str}
@@ -209,6 +212,7 @@ def run(
         explain_mode=explain_mode,
         checkout_modes=checkout_modes,
         tui_queue=tui_queue,
+        output_queue=output_queue,
         run_id=run_id,
         force=force,
     )
@@ -340,6 +344,7 @@ def _execute_greedy(
     explain_mode: bool = False,
     checkout_modes: list[str] | None = None,
     tui_queue: mp.Queue[TuiMessage] | None = None,
+    output_queue: mp.Queue[OutputMessage] | None = None,
     run_id: str = "",
     force: bool = False,
 ) -> None:
@@ -353,8 +358,13 @@ def _execute_greedy(
     _warn_single_stage_mutex_groups(stage_states)
 
     executor = _create_executor(max_workers)
-    # Manager().Queue() returns AutoProxy[Queue] which is incompatible with Queue type stubs
-    output_queue: mp.Queue[OutputMessage] = mp.Manager().Queue()  # pyright: ignore[reportAssignmentType]
+    # Create output queue if not provided (for TUI mode, pass pre-created queue to avoid mp issues)
+    if output_queue is None:
+        # Manager().Queue() returns AutoProxy[Queue] which is incompatible with Queue type stubs
+        output_queue = mp.Manager().Queue()  # pyright: ignore[reportAssignmentType]
+
+    # Type narrowing: output_queue is guaranteed to be non-None after the block above
+    assert output_queue is not None
 
     output_thread: threading.Thread | None = None
     if con or tui_queue:
@@ -569,6 +579,10 @@ def _output_queue_reader(
                 )
         except queue.Empty:
             continue
+        except (EOFError, OSError, BrokenPipeError):
+            # Queue was closed or broken - exit gracefully
+            logger.debug("Output queue reader exiting: queue closed or broken")
+            break
 
 
 def _has_failed_upstream(state: StageState, stage_states: dict[str, StageState]) -> bool:

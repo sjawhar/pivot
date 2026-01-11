@@ -287,6 +287,36 @@ def test_get_affected_stages_returns_subset_on_data_change(
     assert "stage_b" not in affected
 
 
+def test_get_affected_stages_includes_downstream_when_intermediate_file_changes(
+    pipeline_dir: pathlib.Path,
+) -> None:
+    """Changing an intermediate file (output of A, dep of B) should trigger B and downstream."""
+    # Create the input file
+    (pipeline_dir / "input.csv").write_text("a,b\n1,2")
+
+    # Create intermediate file (output of stage_a, dep of stage_b)
+    (pipeline_dir / "intermediate.csv").write_text("x,y\n3,4")
+
+    @stage(deps=["input.csv"], outs=["intermediate.csv"])
+    def stage_a() -> None:
+        pass
+
+    @stage(deps=["intermediate.csv"], outs=["final.csv"])
+    def stage_b() -> None:
+        pass
+
+    eng = engine.ReactiveEngine()
+
+    # Simulate changing the intermediate file (which is stage_b's dependency)
+    intermediate_path = project.resolve_path("intermediate.csv")
+    affected = eng._get_affected_stages({intermediate_path}, code_changed=False)
+
+    # stage_b should be affected because intermediate.csv is its dependency
+    assert "stage_b" in affected, "stage_b should run when its dep (intermediate.csv) changes"
+    # stage_a should NOT be affected (its deps didn't change)
+    assert "stage_a" not in affected, "stage_a should not run (input.csv unchanged)"
+
+
 # _collect_and_debounce tests
 
 

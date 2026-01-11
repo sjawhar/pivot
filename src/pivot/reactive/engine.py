@@ -23,6 +23,7 @@ from pivot import dag, executor, project, registry, types
 from pivot.pipeline import yaml as pipeline_yaml
 from pivot.reactive import _watch_utils
 from pivot.types import (
+    OutputMessage,
     ReactiveAffectedStagesEvent,
     ReactiveEventType,
     ReactiveExecutionResultEvent,
@@ -70,7 +71,8 @@ def _clear_project_modules(root: pathlib.Path) -> int:
     to_remove = list[str]()
     pyc_files = list[pathlib.Path]()
 
-    for name, module in sys.modules.items():
+    # Copy to list to avoid RuntimeError if another thread imports during iteration
+    for name, module in list(sys.modules.items()):
         # sys.modules values can be None for failed imports (Python docs: "A key can map
         # to None if the module is found to not exist") - type stubs don't reflect this
         if module is None:  # pyright: ignore[reportUnnecessaryComparison]
@@ -138,6 +140,7 @@ class ReactiveEngine:
     _change_queue: queue.Queue[set[pathlib.Path]]
     _shutdown: threading.Event
     _tui_queue: mp.Queue[TuiMessage] | None
+    _output_queue: mp.Queue[OutputMessage] | None
     _watcher_thread: threading.Thread | None
     _cached_dag: nx.DiGraph[str] | None
     _cached_file_index: dict[pathlib.Path, set[str]] | None
@@ -167,14 +170,20 @@ class ReactiveEngine:
         self._change_queue = queue.Queue(maxsize=100)
         self._shutdown = threading.Event()
         self._tui_queue = None
+        self._output_queue = None
         self._watcher_thread = None
         self._cached_dag = None
         self._cached_file_index = None
         self._pipeline_errors = None
 
-    def run(self, tui_queue: mp.Queue[TuiMessage] | None = None) -> None:
+    def run(
+        self,
+        tui_queue: mp.Queue[TuiMessage] | None = None,
+        output_queue: mp.Queue[OutputMessage] | None = None,
+    ) -> None:
         """Start reactive engine with watcher and coordinator."""
         self._tui_queue = tui_queue
+        self._output_queue = output_queue
 
         # Build DAG and get execution order for determining watch scope
         graph = registry.REGISTRY.build_dag(validate=True)
@@ -595,6 +604,7 @@ class ReactiveEngine:
             max_workers=self._max_workers,
             show_output=show_output,
             tui_queue=self._tui_queue,
+            output_queue=self._output_queue,
             force=force,
         )
         self._first_run_done = True
@@ -644,6 +654,8 @@ class ReactiveEngine:
             else:
                 with contextlib.suppress(queue.Full):
                     self._tui_queue.put_nowait(msg)
+            # Don't log when using TUI - messages go to the queue instead
+            return
 
         if status == types.ReactiveStatus.ERROR:
             logger.error(message)
@@ -691,7 +703,8 @@ def _find_pipeline_file(root: pathlib.Path) -> pathlib.Path | None:
                     config = yaml.safe_load(f)
                 if isinstance(config, dict) and "stages" in config:
                     return path
-            except Exception:
+            except Exception as e:
+                logger.warning(f"Failed to parse {path}: {e}")
                 continue
     return None
 
