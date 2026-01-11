@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, ClassVar, override
 
+import rich.markup
 import textual.app
 import textual.binding
 import textual.containers
@@ -39,11 +40,12 @@ class DiffSummaryPanel(textual.widgets.Static):
         summary_lines = list[str]()
 
         # File path and status
+        escaped_path = rich.markup.escape(self._result["path"])
         if self._result["reorder_only"]:
-            summary_lines.append(f"[bold blue]{self._result['path']}[/] - REORDER ONLY")
+            summary_lines.append(f"[bold blue]{escaped_path}[/] - REORDER ONLY")
             summary_lines.append("[dim]Same content, different row order[/]")
         else:
-            summary_lines.append(f"[bold]{self._result['path']}[/]")
+            summary_lines.append(f"[bold]{escaped_path}[/]")
 
         # Row counts
         old_rows = self._result["old_rows"]
