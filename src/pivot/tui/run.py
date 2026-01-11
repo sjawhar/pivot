@@ -640,6 +640,11 @@ class WatchTuiApp(_BaseTuiApp[None]):
         self._commit_in_progress: bool = False
         self._cancel_commit: bool = False
 
+    @property
+    def _has_running_stages(self) -> bool:
+        """Check if any stages are currently in progress."""
+        return any(s.status == StageStatus.IN_PROGRESS for s in self._stages.values())
+
     async def on_mount(self) -> None:  # pragma: no cover
         self.title = "[●] Watching for changes..."
         self._start_queue_reader()
@@ -741,7 +746,7 @@ class WatchTuiApp(_BaseTuiApp[None]):
         if self._commit_in_progress:
             return
 
-        if any(s.status == StageStatus.IN_PROGRESS for s in self._stages.values()):
+        if self._has_running_stages:
             self.notify("Cannot commit while stages are running", severity="warning")
             return
 
@@ -822,7 +827,7 @@ class WatchTuiApp(_BaseTuiApp[None]):
             return
 
         # Don't offer commit if stages are running (could cause data inconsistency)
-        if any(s.status == StageStatus.IN_PROGRESS for s in self._stages.values()):
+        if self._has_running_stages:
             self._engine.shutdown()
             await super().action_quit()
             return

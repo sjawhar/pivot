@@ -13,6 +13,9 @@ COMMITTED_RUN_ID = "__committed__"
 def commit_pending(cache_dir: pathlib.Path | None = None) -> list[str]:
     """Promote pending locks to production and update StateDB.
 
+    IMPORTANT: Caller must hold pending_state_lock to prevent races with other
+    processes that may be executing stages or committing concurrently.
+
     Returns list of stage names that were committed.
     """
     project_root = project.get_project_root()
@@ -39,12 +42,7 @@ def commit_pending(cache_dir: pathlib.Path | None = None) -> list[str]:
             production_lock.write(pending_data)
 
             # Record dependency generations from execution time (not commit time!)
-            dep_gens = pending_data.get("dep_generations")
-            if dep_gens is None:
-                # Backwards compatibility: compute if not stored (old pending locks)
-                dep_gens = worker.compute_dep_generation_map(
-                    list(pending_data["dep_hashes"].keys()), state_db
-                )
+            dep_gens = pending_data["dep_generations"]
             if dep_gens:
                 state_db.record_dep_generations(stage_name, dep_gens)
 
@@ -68,6 +66,9 @@ def commit_pending(cache_dir: pathlib.Path | None = None) -> list[str]:
 
 def discard_pending() -> list[str]:
     """Discard all pending locks without committing.
+
+    IMPORTANT: Caller must hold pending_state_lock to prevent races with other
+    processes that may be executing stages or committing concurrently.
 
     Returns list of stage names that were discarded.
     """

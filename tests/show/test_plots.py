@@ -123,6 +123,7 @@ def test_get_plot_hashes_from_lock_with_hash(set_project_root: Path) -> None:
             params={},
             dep_hashes={},
             output_hashes={str(plot_file): {"hash": "abc123def456"}},
+            dep_generations={},
         )
     )
 
@@ -155,6 +156,7 @@ def test_get_plot_hashes_from_lock_with_none_hash(set_project_root: Path) -> Non
             params={},
             dep_hashes={},
             output_hashes={str(plot_file): None},
+            dep_generations={},
         )
     )
 
@@ -234,6 +236,7 @@ def test_get_plot_hashes_from_head_returns_committed_hash(
             params={},
             dep_hashes={},
             output_hashes={str(plot_file): {"hash": "committed_hash_123"}},
+            dep_generations={},
         )
     )
 
@@ -277,6 +280,7 @@ def test_get_plot_hashes_from_head_ignores_uncommitted_changes(
             params={},
             dep_hashes={},
             output_hashes={str(plot_file): {"hash": "original_hash"}},
+            dep_generations={},
         )
     )
 
@@ -295,6 +299,7 @@ def test_get_plot_hashes_from_head_ignores_uncommitted_changes(
             params={},
             dep_hashes={},
             output_hashes={str(plot_file): {"hash": "modified_hash"}},
+            dep_generations={},
         )
     )
 

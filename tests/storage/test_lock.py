@@ -23,6 +23,7 @@ def test_lock_file_creation(tmp_path: Path) -> None:
             params={},
             dep_hashes={},
             output_hashes={},
+            dep_generations={},
         )
     )
 
@@ -42,6 +43,7 @@ def test_lock_file_read(set_project_root: Path) -> None:
         params={"learning_rate": 0.01},
         dep_hashes=dep_hashes,
         output_hashes={},
+        dep_generations={},
     )
 
     stage_lock.write(data)
@@ -75,6 +77,7 @@ def test_manifest_preservation(tmp_path: Path) -> None:
         params={},
         dep_hashes={},
         output_hashes={},
+        dep_generations={},
     )
     stage_lock.write(data)
     result = stage_lock.read()
@@ -97,6 +100,7 @@ def test_parallel_lock_writes(tmp_path: Path) -> None:
                     params={},
                     dep_hashes={},
                     output_hashes={},
+                    dep_generations={},
                 )
             )
         except Exception as e:
@@ -118,6 +122,7 @@ def test_parallel_lock_writes(tmp_path: Path) -> None:
             params={},
             dep_hashes={},
             output_hashes={},
+            dep_generations={},
         )
 
 
@@ -150,6 +155,7 @@ def test_stage_unchanged_when_identical(tmp_path: Path) -> None:
             params=params,
             dep_hashes=dep_hashes,
             output_hashes={},
+            dep_generations={},
         )
     )
 
@@ -168,6 +174,7 @@ def test_stage_changed_code_modified(tmp_path: Path) -> None:
             params={},
             dep_hashes={},
             output_hashes={},
+            dep_generations={},
         )
     )
 
@@ -190,6 +197,7 @@ def test_stage_changed_new_dependency(tmp_path: Path) -> None:
             params={},
             dep_hashes={},
             output_hashes={},
+            dep_generations={},
         )
     )
 
@@ -212,6 +220,7 @@ def test_stage_changed_params_modified(tmp_path: Path) -> None:
             params={"learning_rate": 0.01},
             dep_hashes={},
             output_hashes={},
+            dep_generations={},
         )
     )
 
@@ -235,6 +244,7 @@ def test_stage_changed_dep_hash_modified(tmp_path: Path) -> None:
             params={},
             dep_hashes=old_dep_hashes,
             output_hashes={},
+            dep_generations={},
         )
     )
 
@@ -259,6 +269,7 @@ def test_stage_changed_dep_added(tmp_path: Path) -> None:
             "params": {},
             "dep_hashes": old_dep_hashes,
             "output_hashes": {},
+            "dep_generations": {},
         }
     )
 
@@ -288,6 +299,7 @@ def test_stage_changed_dep_removed(tmp_path: Path) -> None:
             "params": {},
             "dep_hashes": old_dep_hashes,
             "output_hashes": {},
+            "dep_generations": {},
         }
     )
 
@@ -311,6 +323,7 @@ def test_atomic_write_no_partial_file(tmp_path: Path) -> None:
             "params": {},
             "dep_hashes": {},
             "output_hashes": {},
+            "dep_generations": {},
         }
     )
 
@@ -330,6 +343,7 @@ def test_lock_directory_created(tmp_path: Path) -> None:
             "params": {},
             "dep_hashes": {},
             "output_hashes": {},
+            "dep_generations": {},
         }
     )
 
@@ -388,6 +402,7 @@ def test_write_failure_no_orphaned_tmp(tmp_path: Path) -> None:
                 "params": {},
                 "dep_hashes": {},
                 "output_hashes": {},
+                "dep_generations": {},
             }
         )
 
@@ -409,6 +424,7 @@ def test_concurrent_same_stage_writes(tmp_path: Path) -> None:
                     "params": {"thread_id": value},
                     "dep_hashes": {},
                     "output_hashes": {},
+                    "dep_generations": {},
                 }
             )
             results.append(value)

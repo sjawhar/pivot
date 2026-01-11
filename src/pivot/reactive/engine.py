@@ -222,7 +222,9 @@ class ReactiveEngine:
                         )
                     )
             except Exception as e:
-                self._send_message(f"Initial execution failed: {e}", is_error=True)
+                self._send_message(
+                    f"Initial execution failed: {e}", status=types.ReactiveStatus.ERROR
+                )
             self._send_message("Watching for changes...")
 
             # Run coordinator (blocks until shutdown)
@@ -273,7 +275,7 @@ class ReactiveEngine:
                     pass  # Keep accumulating, will send next iteration
         except Exception as e:
             logger.critical(f"Watcher thread failed: {e}")
-            self._send_message(f"File watcher failed: {e}", is_error=True)
+            self._send_message(f"File watcher failed: {e}", status=types.ReactiveStatus.ERROR)
             self.shutdown()  # Signal coordinator to exit
 
     def _coordinator_loop(self) -> None:
@@ -308,7 +310,7 @@ class ReactiveEngine:
                     error_summary = "; ".join(self._pipeline_errors or [])
                     self._send_message(
                         f"Pipeline invalid - fix errors to continue: {error_summary}",
-                        is_error=True,
+                        status=types.ReactiveStatus.ERROR,
                     )
                     self._send_message("Watching for changes...")
                     continue
@@ -354,7 +356,7 @@ class ReactiveEngine:
                         )
                     )
             except Exception as e:
-                self._send_message(f"Execution failed: {e}", is_error=True)
+                self._send_message(f"Execution failed: {e}", status=types.ReactiveStatus.ERROR)
             self._send_message("Watching for changes...")
 
     def _collect_and_debounce(self, max_wait_s: float = 5.0) -> set[pathlib.Path]:
@@ -626,25 +628,15 @@ class ReactiveEngine:
         self,
         message: str,
         *,
-        is_error: bool = False,
-        status: types.ReactiveStatus | None = None,
+        status: types.ReactiveStatus = types.ReactiveStatus.WAITING,
     ) -> None:
-        """Send message to TUI, JSON output, or log.
-
-        Args:
-            message: The message to send
-            is_error: If True, sets status to ERROR (deprecated, use status param)
-            status: Explicit status to use (overrides is_error if provided)
-        """
-        if status is None:
-            status = types.ReactiveStatus.ERROR if is_error else types.ReactiveStatus.WAITING
-
+        """Send message to TUI, JSON output, or log."""
         if self._json_output:
             self._emit_json(
                 ReactiveStatusEvent(
                     type=ReactiveEventType.STATUS,
                     message=message,
-                    is_error=is_error,
+                    is_error=status == types.ReactiveStatus.ERROR,
                 )
             )
             return

@@ -122,11 +122,8 @@ def _convert_from_storage_format(data: StorageLockData) -> LockData:
         params=data["params"] if "params" in data else {},
         dep_hashes=dep_hashes,
         output_hashes=output_hashes,
+        dep_generations=data["dep_generations"] if "dep_generations" in data else {},
     )
-
-    # Preserve dep_generations for --no-commit mode
-    if "dep_generations" in data:
-        result["dep_generations"] = data["dep_generations"]
 
     return result
 

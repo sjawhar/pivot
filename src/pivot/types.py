@@ -120,7 +120,7 @@ class LockData(TypedDict):
     dep_hashes: dict[str, HashInfo]
     output_hashes: dict[str, OutputHash]
     # Stored at execution time for --no-commit mode (used by commit to record correct generations)
-    dep_generations: NotRequired[dict[str, int]]
+    dep_generations: dict[str, int]
 
 
 # Type alias for output queue messages: (stage_name, line, is_stderr) or None for shutdown

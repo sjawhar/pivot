@@ -23,7 +23,11 @@ def _get_lock_path() -> pathlib.Path:
 
 
 def _create_lock(timeout: float = -1) -> filelock.BaseFileLock:
-    """Create a FileLock with standard setup (creates parent dir if needed)."""
+    """Create a FileLock with standard setup (creates parent dir if needed).
+
+    Args:
+        timeout: Seconds to wait for lock. -1 means wait forever (default), 0 means non-blocking.
+    """
     lock_path = _get_lock_path()
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     return filelock.FileLock(lock_path, timeout=timeout)
@@ -33,7 +37,14 @@ def _create_lock(timeout: float = -1) -> filelock.BaseFileLock:
 def pending_state_lock(timeout: float = -1) -> Generator[filelock.BaseFileLock]:
     """Context manager for coordinating --no-commit execution and commit operations.
 
-    Yields the lock object for callers that need it (e.g., to check lock state).
+    Args:
+        timeout: Seconds to wait for lock. -1 means wait forever (default), 0 means non-blocking.
+
+    Yields:
+        BaseFileLock for callers that need it (e.g., to check lock state).
+
+    Raises:
+        filelock.Timeout: If timeout >= 0 and lock not acquired in time.
     """
     lock = _create_lock(timeout=timeout)
     logger.debug(f"Acquiring pending state lock: {lock.lock_file}")

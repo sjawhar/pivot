@@ -1060,14 +1060,14 @@ def test_send_message_to_tui_queue(pipeline_dir: pathlib.Path) -> None:
 
 
 def test_send_message_error_to_tui_queue(pipeline_dir: pathlib.Path) -> None:
-    """_send_message with is_error=True should set error status."""
+    """_send_message with status=ERROR should set error status."""
     manager = multiprocessing.Manager()
     tui_queue = manager.Queue()
 
     eng = engine.ReactiveEngine()
     eng._tui_queue = tui_queue  # pyright: ignore[reportAttributeAccessIssue]
 
-    eng._send_message("Error occurred", is_error=True)
+    eng._send_message("Error occurred", status=types.ReactiveStatus.ERROR)
 
     msg = tui_queue.get_nowait()
     assert msg["status"] == types.ReactiveStatus.ERROR

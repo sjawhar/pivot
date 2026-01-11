@@ -84,7 +84,14 @@ def execute_stage(
     cache_dir: pathlib.Path,
     output_queue: Queue[OutputMessage],
 ) -> StageResult:
-    """Worker function executed in separate process. Must be module-level for pickling."""
+    """Worker function executed in separate process. Must be module-level for pickling.
+
+    Flag interactions:
+    - --force: Always run stage, even if skip detection says it's unchanged
+    - --no-cache: Skip caching entirely; lock file records null output hashes
+    - --force + --no-cache: Maximum speed mode - no cache reads/writes, no provenance
+      tracking beyond the lock file. Lock file will have null hashes for all outputs.
+    """
     # Clear metrics at start - each stage collects its own metrics
     metrics.clear()
     output_lines: list[tuple[str, bool]] = []
@@ -199,6 +206,7 @@ def execute_stage(
                     params=current_params,
                     dep_hashes=dict(sorted(dep_hashes.items())),
                     output_hashes=dict(sorted(null_hashes.items())),
+                    dep_generations={},
                 )
                 if no_commit:
                     with state.StateDB(state_db_path) as state_db:
@@ -232,6 +240,7 @@ def execute_stage(
                         params=current_params,
                         dep_hashes=dict(sorted(dep_hashes.items())),
                         output_hashes=dict(sorted(output_hashes.items())),
+                        dep_generations={},
                     )
                     production_lock.write(new_lock_data)
 
@@ -299,8 +308,19 @@ def _restore_outputs_from_cache(
     files_cache_dir: pathlib.Path,
     checkout_modes: list[cache.CheckoutMode],
 ) -> bool:
-    """Restore missing outputs from cache. Returns True if all restored successfully."""
+    """Restore missing outputs from cache for a single stage's skip detection.
+
+    Returns True if all outputs exist or were restored. On failure, cleans up
+    any partially restored outputs to leave the filesystem in a clean state,
+    allowing the stage to re-run with a clean workspace.
+    """
     output_hashes = lock_data["output_hashes"]
+    restored_paths = list[pathlib.Path]()
+
+    def _cleanup_restored() -> None:
+        for p in restored_paths:
+            cache.remove_output(p)
+
     for out in stage_outs:
         path = pathlib.Path(out.path)
         if path.exists():
@@ -308,13 +328,21 @@ def _restore_outputs_from_cache(
 
         output_hash = output_hashes.get(out.path)
         if output_hash is None:
-            if out.cache:
-                return False
-            continue
+            _cleanup_restored()
+            return False
 
-        if not cache.restore_from_cache(
-            path, output_hash, files_cache_dir, checkout_modes=checkout_modes
-        ):
+        try:
+            restored = cache.restore_from_cache(
+                path, output_hash, files_cache_dir, checkout_modes=checkout_modes
+            )
+        except OSError:
+            _cleanup_restored()
+            return False
+
+        if restored:
+            restored_paths.append(path)
+        else:
+            _cleanup_restored()
             return False
 
     return True
@@ -374,7 +402,11 @@ def _save_outputs_to_cache(
 
 
 def _verify_outputs_exist(stage_outs: list[outputs.BaseOut]) -> None:
-    """Verify all outputs exist without caching (for --no-cache mode)."""
+    """Verify all outputs exist without caching (for --no-cache mode).
+
+    Note: Only checks existence, not contents. Empty directories pass verification.
+    This is intentional - --no-cache mode trusts that the stage produced valid output.
+    """
     for out in stage_outs:
         path = pathlib.Path(out.path)
         if not path.exists():
@@ -434,7 +466,7 @@ class _QueueWriter:
     _is_stderr: bool
     _output_lines: list[tuple[str, bool]]
     _buffer: str
-    _redirect: contextlib.AbstractContextManager[Any]
+    _redirect: contextlib.AbstractContextManager[object]
 
     def __init__(
         self,
@@ -610,7 +642,11 @@ def _try_skip_via_run_cache(
     checkout_modes: list[cache.CheckoutMode],
     state_db: state.StateDB,
 ) -> StageResult | None:
-    """Try to skip using run cache. Returns StageResult if skipped, None if must run."""
+    """Try to skip using run cache. Returns StageResult if skipped, None if must run.
+
+    On failure, cleans up any partially restored outputs to leave a clean state,
+    allowing the stage to re-run with a clean workspace.
+    """
     # IncrementalOut stages build on previous outputs - run cache doesn't apply
     if any(isinstance(out, outputs.IncrementalOut) for out in stage_outs):
         return None
@@ -619,25 +655,42 @@ def _try_skip_via_run_cache(
     if entry is None:
         return None
 
-    # Check if all cached outputs exist in file cache
-    output_hash_map = {oh["path"]: oh["hash"] for oh in entry["output_hashes"]}
+    # Build output hash map preserving manifest for directories
+    output_hash_map = {
+        oh["path"]: run_history.entry_to_output_hash(oh) for oh in entry["output_hashes"]
+    }
+
+    restored_paths = list[pathlib.Path]()
+
+    def _cleanup_restored() -> None:
+        for p in restored_paths:
+            cache.remove_output(p)
 
     for out in stage_outs:
         path = pathlib.Path(out.path)
         if path.exists():
             continue
 
-        cached_hash = output_hash_map.get(out.path)
-        if cached_hash is None:
+        cached_output = output_hash_map.get(out.path)
+        if cached_output is None:
             if out.cache:
-                return None  # Output should be cached but not in run cache
+                _cleanup_restored()
+                return None
             continue
 
-        output_hash: OutputHash = {"hash": cached_hash}
-        if not cache.restore_from_cache(
-            path, output_hash, files_cache_dir, checkout_modes=checkout_modes
-        ):
-            return None  # Output not in file cache
+        try:
+            restored = cache.restore_from_cache(
+                path, cached_output, files_cache_dir, checkout_modes=checkout_modes
+            )
+        except OSError:
+            _cleanup_restored()
+            return None
+
+        if restored:
+            restored_paths.append(path)
+        else:
+            _cleanup_restored()
+            return None
 
     return _make_result(StageStatus.SKIPPED, "unchanged (run cache)", [])
 
@@ -651,13 +704,9 @@ def write_run_cache_entry(
 ) -> None:
     """Write run cache entry after successful execution."""
     output_entries = [
-        run_history.OutputHashEntry(path=path, hash=oh["hash"])
+        entry
         for path, oh in output_hashes.items()
-        if oh is not None
+        if (entry := run_history.output_hash_to_entry(path, oh)) is not None
     ]
-
-    entry = run_history.RunCacheEntry(
-        run_id=run_id,
-        output_hashes=output_entries,
-    )
-    state_db.write_run_cache(stage_name, input_hash, entry)
+    cache_entry = run_history.RunCacheEntry(run_id=run_id, output_hashes=output_entries)
+    state_db.write_run_cache(stage_name, input_hash, cache_entry)
