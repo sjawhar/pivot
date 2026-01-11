@@ -25,6 +25,7 @@ from pivot import project
 from pivot.executor import ExecutionSummary
 from pivot.executor import commit as commit_mod
 from pivot.storage import lock, project_lock
+from pivot.tui.diff_panels import InputDiffPanel, OutputDiffPanel
 from pivot.types import (
     DisplayMode,
     ReactiveStatus,
@@ -283,18 +284,29 @@ class TabbedDetailPanel(textual.containers.Vertical):
             with textual.widgets.TabPane("Logs", id="tab-logs"):
                 yield StageLogPanel(id="stage-logs")
             with textual.widgets.TabPane("Input", id="tab-input"):
-                yield textual.widgets.Static("[dim]Coming soon...[/]", id="input-placeholder")
+                yield InputDiffPanel(id="input-panel")
             with textual.widgets.TabPane("Output", id="tab-output"):
-                yield textual.widgets.Static("[dim]Coming soon...[/]", id="output-placeholder")
+                yield OutputDiffPanel(id="output-panel")
 
     def set_stage(self, stage: StageInfo | None) -> None:  # pragma: no cover
         """Update the displayed stage."""
         self._stage = stage
+        stage_name = stage.name if stage else None
         try:
             log_panel = self.query_one("#stage-logs", StageLogPanel)
             log_panel.set_stage(stage)
         except textual.css.query.NoMatches:
             _logger.debug("stage-logs panel not found during set_stage")
+        try:
+            input_panel = self.query_one("#input-panel", InputDiffPanel)
+            input_panel.set_stage(stage_name)
+        except textual.css.query.NoMatches:
+            _logger.debug("input-panel not found during set_stage")
+        try:
+            output_panel = self.query_one("#output-panel", OutputDiffPanel)
+            output_panel.set_stage(stage_name)
+        except textual.css.query.NoMatches:
+            _logger.debug("output-panel not found during set_stage")
 
 
 _TUI_CSS: str = """
@@ -331,6 +343,18 @@ _TUI_CSS: str = """
 
 #stage-logs {
     height: 100%;
+}
+
+#input-panel {
+    height: 100%;
+    padding: 1;
+    overflow-y: auto;
+}
+
+#output-panel {
+    height: 100%;
+    padding: 1;
+    overflow-y: auto;
 }
 
 #log-panel {
