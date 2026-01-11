@@ -46,31 +46,45 @@ logger = logging.getLogger(__name__)
 _VENV_DIRS = frozenset({".venv", "venv", ".env", "env", "node_modules", ".git", "__pycache__"})
 
 
+_MAX_PENDING_CHANGES = 10000  # Threshold for "full rebuild" sentinel
+_FULL_REBUILD_SENTINEL = pathlib.Path("__PIVOT_FULL_REBUILD__")
+
+# File patterns that trigger code reload (worker restart + cache invalidation)
+_CODE_FILE_SUFFIXES = (".py",)
+_CONFIG_FILE_NAMES = ("pivot.yaml", "pivot.yml", "pipeline.py", "params.yaml", "params.yml")
+
+
 def _clear_project_modules(root: pathlib.Path) -> int:
-    """Remove all project modules from sys.modules to force fresh imports.
+    """Remove all project modules from sys.modules and their bytecode caches.
 
     This ensures transitive dependencies are also reimported, not just stage modules.
-    Excludes virtual environment directories to prevent breaking package imports.
+    Without this, if stages.py imports helpers.py, reloading stages.py still uses
+    the old cached helpers.py because importlib.reload() doesn't reimport dependencies.
+
+    Also removes .pyc bytecode cache files to prevent Python from loading stale
+    compiled bytecode instead of re-parsing the modified source files.
+
     Returns the count of cleared modules.
     """
     root_str = str(root)
     to_remove = list[str]()
+    pyc_files = list[pathlib.Path]()
 
     for name, module in sys.modules.items():
-        # sys.modules values can be None for failed imports (Python docs: "A key can map to
-        # None if the module is found to not exist") - type stubs don't reflect this
+        # sys.modules values can be None for failed imports (Python docs: "A key can map
+        # to None if the module is found to not exist") - type stubs don't reflect this
         if module is None:  # pyright: ignore[reportUnnecessaryComparison]
             continue
         module_file = getattr(module, "__file__", None)
         if module_file is None:
             continue
         try:
-            # Skip venv/node_modules directories to avoid breaking package imports
-            path_parts = pathlib.Path(module_file).parts
-            if any(part in _VENV_DIRS for part in path_parts):
-                continue
             if module_file.startswith(root_str):
                 to_remove.append(name)
+                # Track corresponding .pyc file for removal
+                pyc_path = _get_pyc_path(module_file)
+                if pyc_path is not None:
+                    pyc_files.append(pyc_path)
         except (TypeError, AttributeError):
             continue
 
@@ -78,15 +92,36 @@ def _clear_project_modules(root: pathlib.Path) -> int:
         del sys.modules[name]
         logger.debug(f"Cleared module from cache: {name}")
 
+    # Remove bytecode cache files to force re-parsing of source
+    for pyc_path in pyc_files:
+        try:
+            pyc_path.unlink(missing_ok=True)
+            logger.debug(f"Removed bytecode cache: {pyc_path}")
+        except OSError:
+            pass  # Best effort - file may be locked or already removed
+
+    # Invalidate import machinery caches after removing modules and .pyc files
+    importlib.invalidate_caches()
+
     return len(to_remove)
 
 
-_MAX_PENDING_CHANGES = 10000  # Threshold for "full rebuild" sentinel
-_FULL_REBUILD_SENTINEL = pathlib.Path("__PIVOT_FULL_REBUILD__")
-
-# File patterns that trigger code reload (worker restart + cache invalidation)
-_CODE_FILE_SUFFIXES = (".py",)
-_CONFIG_FILE_NAMES = ("pivot.yaml", "pivot.yml", "pipeline.py", "params.yaml", "params.yml")
+def _get_pyc_path(source_path: str) -> pathlib.Path | None:
+    """Get the __pycache__/*.pyc path for a source file, or None if not determinable."""
+    try:
+        source = pathlib.Path(source_path)
+        if source.suffix != ".py":
+            return None
+        # Python stores bytecode in __pycache__/<name>.cpython-<version>.pyc
+        cache_dir = source.parent / "__pycache__"
+        # Match any version tag - we want to remove all cached versions
+        # The glob pattern matches e.g. "helpers.cpython-313.pyc"
+        stem = source.stem
+        for pyc in cache_dir.glob(f"{stem}.*.pyc"):
+            return pyc  # Return first match - typically only one exists
+        return None
+    except Exception:
+        return None
 
 
 class ReactiveEngine:
@@ -305,7 +340,6 @@ class ReactiveEngine:
                     )
             except Exception as e:
                 self._send_message(f"Execution failed: {e}", is_error=True)
-
             self._send_message("Watching for changes...")
 
     def _collect_and_debounce(self, max_wait_s: float = 5.0) -> set[pathlib.Path]:
@@ -384,7 +418,11 @@ class ReactiveEngine:
         source_name: str,
         old_stages: dict[str, RegistryStageInfo],
     ) -> bool:
-        """Reload registry using provided registration function."""
+        """Reload registry using provided registration function.
+
+        Clears all project modules from sys.modules before registration to ensure
+        transitive dependencies are properly reimported (not just stage modules).
+        """
         registry.REGISTRY.clear()
         try:
             root = project.get_project_root()
@@ -423,7 +461,12 @@ class ReactiveEngine:
         )
 
     def _reload_from_decorators(self, old_stages: dict[str, RegistryStageInfo]) -> bool:
-        """Reload registry by reimporting modules with @stage decorators."""
+        """Reload registry by reimporting modules with @stage decorators.
+
+        Clears ALL project modules from sys.modules and reimports stage modules.
+        Using import_module (not reload) after clearing ensures transitive
+        dependencies are also freshly imported.
+        """
         stage_modules = _collect_stage_modules(old_stages)
         if not stage_modules:
             logger.warning("No stage modules found to reload")

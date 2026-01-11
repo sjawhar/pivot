@@ -7,6 +7,9 @@ This directory contains all tests for Pivot's automatic code change detection (f
 - **`test_fingerprint.py`** - Unit tests for fingerprinting functions
 - **`test_integration.py`** - End-to-end tests with real Python files on disk
 - **`test_change_detection.py`** - Comprehensive change detection behavior tests
+- **`test_pydantic_defaults.py`** - Tests for Pydantic default data tracking
+- **`test_functools.py`** - Tests for `functools.partial` and `functools.wraps` handling
+- **`test_callback_vulnerabilities.py`** - Tests documenting callback detection edge cases
 
 ---
 
@@ -52,6 +55,9 @@ This document exhaustively catalogs what code changes are and are not detected b
 | Global constant (int, float, str, bool, bytes, None) | ✅        | `test_fingerprint.py::test_constant_captured`, `test_fingerprint.py::test_multiple_constants_captured`                              |
 | Global constant change                               | ✅        | `test_change_detection.py::test_global_constant_change_causes_miss`                                                                 |
 | Global collection (list, dict, set) with callables   | ✅        | `test_change_detection.py::test_list_callable_tracking`, `test_change_detection.py::test_dispatch_dict_function_change_causes_miss` |
+| Global collection DATA (non-callable values)          | ❌        | `test_pydantic_defaults.py::test_list_constants_not_captured_as_const`                                                               |
+| Pydantic field default data                           | ✅        | `test_pydantic_defaults.py::test_pydantic_default_data_captured`                                                                     |
+| Pydantic class in type hint                           | ✅        | `test_pydantic_defaults.py::test_pydantic_class_captured_from_type_hint`                                                             |
 | Global class instance                                | ✅        | `test_change_detection.py::test_class_instance_tracked`, `test_change_detection.py::test_class_instance_change_causes_miss`         |
 | Class definition change                              | ✅        | `test_change_detection.py::test_class_definition_change_causes_miss`                                                                |
 | Class method change                                  | ✅        | `test_change_detection.py::test_class_definition_change_causes_miss` (class AST includes methods)                                   |
@@ -189,6 +195,25 @@ This document exhaustively catalogs what code changes are and are not detected b
 
 ---
 
+## 12. Callback/Function Argument Detection
+
+Tests in `test_callback_vulnerabilities.py` document edge cases where callback changes may not be detected.
+
+| Change Type                                        | Detected? | Test Reference                                                                          |
+| -------------------------------------------------- | --------- | --------------------------------------------------------------------------------------- |
+| Module-level callback variable change              | ✅        | `test_callback_vulnerabilities.py::test_module_variable_callback_change_detected`       |
+| Dict callback in closure                           | ✅        | `test_callback_vulnerabilities.py::test_dict_callback_in_closure_detected`              |
+| Multi-layer wrapped callbacks via closure          | ✅        | `test_callback_vulnerabilities.py::test_multilayer_closure_callbacks_detected`          |
+| Async/generator callback change                    | ✅        | `test_callback_vulnerabilities.py::test_async_callback_change_detected`                 |
+| `@functools.wraps` decorator logic change          | ✅        | `test_functools.py::test_decorator_change_triggers_fingerprint_change`                  |
+| Manual `__wrapped__` attribute detection           | ✅        | `test_callback_vulnerabilities.py::test_manual_wrapped_attribute_hides_code`            |
+| `functools.partial` arguments tracked              | ✅        | `test_functools.py::test_partial_args_change_triggers_fingerprint_change`               |
+| `functools.partial` wrapped function tracked       | ✅        | `test_functools.py::test_partial_underlying_func_change_triggers_fingerprint_change`    |
+| Instance/container state callbacks not tracked     | ❌        | `test_callback_vulnerabilities.py::test_container_callback_change_detected`             |
+| Class attribute callbacks (runtime modified)       | ❌        | `test_callback_vulnerabilities.py::test_class_attribute_callback_change_detected`       |
+
+---
+
 ## Summary: Gaps Requiring New Tests
 
 | Gap                                              | Priority | Difficulty                    |
@@ -199,7 +224,6 @@ This document exhaustively catalogs what code changes are and are not detected b
 | `getattr()` dynamic lookup                       | Low      | Easy                          |
 | `eval()`/`exec()` limitation                     | Low      | Easy                          |
 | `importlib.import_module()` limitation           | Low      | Easy                          |
-| Callback/function argument not tracked           | Medium   | Medium                        |
 | Third-party package version tracking             | Medium   | Hard (would need new feature) |
 
 ---
@@ -227,3 +251,28 @@ This document exhaustively catalogs what code changes are and are not detected b
 10. **Callable instances tracked as functions**: Objects with `__call__` methods are matched by the `callable()` check before the instance check. This means changes to non-`__call__` methods on such classes may not trigger cache invalidation. Workaround: use the class directly instead of a pre-instantiated callable.
 
 11. **NamedTuple instances tracked as tuples**: `NamedTuple` instances inherit from `tuple` and are matched by the collection check. Changes to the `NamedTuple` class definition may not be detected. Workaround: use regular classes or dataclasses instead.
+
+12. **Pydantic field defaults ARE tracked**: Pydantic model classes used in type hints are automatically detected and their field default values are hashed. The fingerprint includes:
+    - `class:ModelName` - Hash of the class AST (captures structural changes)
+    - `pydantic:ModelName.field` - Hash of each field's default value (captures data changes)
+
+    This allows Pivot to detect when Pydantic configuration changes without requiring explicit `deps`.
+
+    Tests: `test_pydantic_defaults.py::test_pydantic_default_data_captured`, `test_pydantic_defaults.py::test_pydantic_class_captured_from_type_hint`, `test_pydantic_defaults.py::test_pydantic_default_change_triggers_different_hash`
+
+13. **`functools.wraps` / `__wrapped__` ARE tracked**: Functions decorated with `@functools.wraps` are properly fingerprinted using bytecode hashing. Since `inspect.getsource()` follows the `__wrapped__` chain and returns the original function's source, we detect `__wrapped__` and use `marshal.dumps(__code__)` to hash the wrapper's bytecode instead. This correctly captures decorator logic changes while closure analysis still tracks the wrapped function.
+
+    Tests: `test_functools.py::test_decorator_change_triggers_fingerprint_change`, `test_functools.py::test_wrapped_uses_bytecode_not_source`
+
+14. **`functools.partial` IS tracked**: Partial objects are specially handled before the `is_user_code()` check. The fingerprint includes:
+    - `partial:<name>.args` - Hash of bound positional arguments
+    - `partial:<name>.kwargs` - Hash of bound keyword arguments
+    - `func:<name>.func` - Hash of the underlying function (if user code)
+
+    This allows Pivot to detect changes to both the partial's bound arguments and the underlying function.
+
+    Tests: `test_functools.py::test_partial_is_detected`, `test_functools.py::test_partial_args_change_triggers_fingerprint_change`
+
+15. **Instance state not tracked**: For user-defined class instances, only the class definition is hashed, not instance state (attributes, dict contents). Runtime-assigned callbacks on instances or in containers are not detected. Workaround: use module-level variables or explicit deps for mutable configuration.
+
+16. **Class attributes modified at runtime not tracked**: Class attributes set after class definition (e.g., `Config.callback = func`) are not detected because only the original class source is hashed. Workaround: use module-level variables instead of class attributes for runtime configuration.
