@@ -1,9 +1,10 @@
-"""Tests for --no-commit mode and pivot commit command."""
+"""Tests for execution modes: --no-commit, --no-cache, and commit command."""
 
 from __future__ import annotations
 
 import datetime
 import multiprocessing as mp
+import shutil
 from multiprocessing import queues as mp_queues
 from typing import TYPE_CHECKING, Any
 
@@ -96,7 +97,7 @@ def test_no_commit_writes_to_pending_lock(
 
     result = worker.execute_stage("test_stage", stage_info, worker_env, output_queue)
 
-    assert result["status"] == "ran"
+    assert result["status"] == StageStatus.RAN
 
     # Pending lock should exist
     pending_lock = lock.get_pending_lock("test_stage", tmp_path)
@@ -128,7 +129,7 @@ def test_no_commit_still_writes_to_cache(
 
     result = worker.execute_stage("test_stage", stage_info, worker_env, output_queue)
 
-    assert result["status"] == "ran"
+    assert result["status"] == StageStatus.RAN
 
     # Check that cache files exist
     cache_files = list((worker_env / "files").rglob("*"))
@@ -156,11 +157,11 @@ def test_second_no_commit_run_uses_pending_lock_for_skip(
 
     # First run
     result1 = worker.execute_stage("test_stage", stage_info, worker_env, output_queue)
-    assert result1["status"] == "ran"
+    assert result1["status"] == StageStatus.RAN
 
     # Second run should skip (using pending lock for comparison)
     result2 = worker.execute_stage("test_stage", stage_info, worker_env, output_queue)
-    assert result2["status"] == "skipped"
+    assert result2["status"] == StageStatus.SKIPPED
 
 
 # -----------------------------------------------------------------------------
@@ -210,7 +211,7 @@ def test_commit_pending_promotes_to_production(
 
     # Run with no_commit
     result = worker.execute_stage("test_stage", stage_info, worker_env, output_queue)
-    assert result["status"] == "ran"
+    assert result["status"] == StageStatus.RAN
 
     # Pending lock exists, production doesn't
     pending_lock = lock.get_pending_lock("test_stage", tmp_path)
@@ -247,7 +248,7 @@ def test_discard_pending_removes_pending_locks(
 
     # Run with no_commit
     result = worker.execute_stage("test_stage", stage_info, worker_env, output_queue)
-    assert result["status"] == "ran"
+    assert result["status"] == StageStatus.RAN
 
     # Pending lock exists
     pending_lock = lock.get_pending_lock("test_stage", tmp_path)
@@ -312,7 +313,7 @@ def test_commit_records_generation_at_execution_time(
 
     # Run stage with --no-commit while dep is at generation 5
     result = worker.execute_stage("test_stage", stage_info, worker_env, output_queue)
-    assert result["status"] == "ran"
+    assert result["status"] == StageStatus.RAN
 
     # Simulate another stage modifying the dep (increment generation to 6)
     with state.StateDB(state_db_path) as db:
@@ -392,40 +393,28 @@ def test_committed_run_cache_entries_survive_pruning(
         assert found_after_prune["run_id"] == commit_mod.COMMITTED_RUN_ID
 
 
-def test_reactive_engine_passes_no_commit_to_executor(
+@pytest.mark.parametrize(
+    ("flag_name", "flag_value", "expected_value"),
+    [
+        ("no_commit", True, True),
+        ("no_commit", None, False),  # None means use default
+        ("no_cache", True, True),
+        ("no_cache", None, False),
+    ],
+    ids=[
+        "no_commit=True",
+        "no_commit_defaults_to_False",
+        "no_cache=True",
+        "no_cache_defaults_to_False",
+    ],
+)
+def test_reactive_engine_flag_passed_to_executor(
     monkeypatch: pytest.MonkeyPatch,
+    flag_name: str,
+    flag_value: bool | None,
+    expected_value: bool,
 ) -> None:
-    """ReactiveEngine should pass no_commit flag to executor.run."""
-    # Track what arguments executor.run was called with
-    executor_call_args = dict[str, object]()
-
-    def mock_executor_run(**kwargs: object) -> dict[str, object]:
-        executor_call_args.update(kwargs)
-        return {}
-
-    # Mock executor.run to capture the call
-    monkeypatch.setattr("pivot.executor.run", mock_executor_run)
-
-    # Create engine with no_commit=True
-    engine = reactive.ReactiveEngine(
-        stages=None,
-        single_stage=False,
-        cache_dir=None,
-        no_commit=True,
-    )
-
-    # Call _execute_stages directly (it's what calls executor.run)
-    engine._execute_stages(None)
-
-    # Verify no_commit was passed to executor.run
-    assert "no_commit" in executor_call_args, "no_commit should be passed to executor.run"
-    assert executor_call_args["no_commit"] is True, "no_commit should be True"
-
-
-def test_reactive_engine_no_commit_defaults_to_false(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """ReactiveEngine should default no_commit to False."""
+    """ReactiveEngine should pass flags correctly to executor.run."""
     executor_call_args = dict[str, object]()
 
     def mock_executor_run(**kwargs: object) -> dict[str, object]:
@@ -434,17 +423,22 @@ def test_reactive_engine_no_commit_defaults_to_false(
 
     monkeypatch.setattr("pivot.executor.run", mock_executor_run)
 
-    # Create engine without no_commit (should default to False)
-    engine = reactive.ReactiveEngine(
-        stages=None,
-        single_stage=False,
-        cache_dir=None,
-    )
+    # Build engine kwargs - only include flag if explicitly set
+    engine_kwargs: dict[str, Any] = {
+        "stages": None,
+        "single_stage": False,
+        "cache_dir": None,
+    }
+    if flag_value is not None:
+        engine_kwargs[flag_name] = flag_value
 
+    engine = reactive.ReactiveEngine(**engine_kwargs)
     engine._execute_stages(None)
 
-    assert "no_commit" in executor_call_args, "no_commit should be passed to executor.run"
-    assert executor_call_args["no_commit"] is False, "no_commit should default to False"
+    assert flag_name in executor_call_args, f"{flag_name} should be passed to executor.run"
+    assert executor_call_args[flag_name] is expected_value, (
+        f"{flag_name} should be {expected_value}"
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -471,7 +465,7 @@ def test_no_cache_skips_cache_operations(
 
     result = worker.execute_stage("test_stage", stage_info, worker_env, output_queue)
 
-    assert result["status"] == "ran"
+    assert result["status"] == StageStatus.RAN
 
     # Output file should exist
     assert (tmp_path / "output.txt").exists()
@@ -501,7 +495,7 @@ def test_no_cache_writes_lock_with_null_hashes(
 
     result = worker.execute_stage("test_stage", stage_info, worker_env, output_queue)
 
-    assert result["status"] == "ran"
+    assert result["status"] == StageStatus.RAN
 
     # Production lock should exist with null hashes
     production_lock = lock.StageLock("test_stage", worker_env)
@@ -536,12 +530,12 @@ def test_no_cache_second_run_still_skips(
 
     # First run
     result1 = worker.execute_stage("test_stage", stage_info, worker_env, output_queue)
-    assert result1["status"] == "ran"
+    assert result1["status"] == StageStatus.RAN
     assert execution_count[0] == 1
 
     # Second run should skip (lock file comparison still works)
     result2 = worker.execute_stage("test_stage", stage_info, worker_env, output_queue)
-    assert result2["status"] == "skipped"
+    assert result2["status"] == StageStatus.SKIPPED
     assert execution_count[0] == 1  # Should not have executed again
 
 
@@ -564,7 +558,7 @@ def test_no_cache_incompatible_with_incremental_out(
 
     result = worker.execute_stage("test_stage", stage_info, worker_env, output_queue)
 
-    assert result["status"] == "failed"
+    assert result["status"] == StageStatus.FAILED
     assert "IncrementalOut" in result["reason"]
 
 
@@ -588,7 +582,7 @@ def test_no_cache_with_no_commit(
 
     result = worker.execute_stage("test_stage", stage_info, worker_env, output_queue)
 
-    assert result["status"] == "ran"
+    assert result["status"] == StageStatus.RAN
 
     # Pending lock should exist (because no_commit=True)
     pending_lock = lock.get_pending_lock("test_stage", tmp_path)
@@ -604,50 +598,61 @@ def test_no_cache_with_no_commit(
     assert len(cache_files_not_dirs) == 0, "Cache should be empty"
 
 
-def test_reactive_engine_passes_no_cache_to_executor(
-    monkeypatch: pytest.MonkeyPatch,
+# -----------------------------------------------------------------------------
+# Run cache directory output tests
+# -----------------------------------------------------------------------------
+
+
+def test_run_cache_restores_directory_output(
+    worker_env: pathlib.Path, tmp_path: pathlib.Path, output_queue: mp_queues.Queue[OutputMessage]
 ) -> None:
-    """ReactiveEngine should pass no_cache flag to executor.run."""
-    executor_call_args = dict[str, object]()
+    """Run cache should restore directory outputs including manifest."""
+    (tmp_path / "input.txt").write_text("input data")
 
-    def mock_executor_run(**kwargs: object) -> dict[str, object]:
-        executor_call_args.update(kwargs)
-        return {}
+    execution_count = [0]
 
-    monkeypatch.setattr("pivot.executor.run", mock_executor_run)
+    def stage_func() -> None:
+        execution_count[0] += 1
+        out_dir = tmp_path / "output_dir"
+        out_dir.mkdir(exist_ok=True)
+        (out_dir / "file1.txt").write_text("content1")
+        (out_dir / "file2.txt").write_text("content2")
 
-    engine = reactive.ReactiveEngine(
-        stages=None,
-        single_stage=False,
-        cache_dir=None,
-        no_cache=True,
+    stage_info = _make_stage_info(
+        stage_func,
+        tmp_path,
+        deps=[str(tmp_path / "input.txt")],
+        outs=[outputs.Out("output_dir/")],
     )
 
-    engine._execute_stages(None)
+    # First run - should execute and write to run cache
+    result1 = worker.execute_stage("test_stage", stage_info, worker_env, output_queue)
+    assert result1["status"] == StageStatus.RAN
+    assert execution_count[0] == 1
 
-    assert "no_cache" in executor_call_args, "no_cache should be passed to executor.run"
-    assert executor_call_args["no_cache"] is True, "no_cache should be True"
+    # Verify directory output exists
+    output_dir = tmp_path / "output_dir"
+    assert output_dir.is_dir()
+    assert (output_dir / "file1.txt").read_text() == "content1"
+    assert (output_dir / "file2.txt").read_text() == "content2"
 
+    # Delete the lock file so run cache is used instead of lock-based skip
+    production_lock = lock.StageLock("test_stage", worker_env)
+    production_lock.path.unlink()
 
-def test_reactive_engine_no_cache_defaults_to_false(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """ReactiveEngine should default no_cache to False."""
-    executor_call_args = dict[str, object]()
+    # Delete the directory output
+    shutil.rmtree(output_dir)
+    assert not output_dir.exists()
 
-    def mock_executor_run(**kwargs: object) -> dict[str, object]:
-        executor_call_args.update(kwargs)
-        return {}
+    # Second run - should skip via run cache and restore directory
+    result2 = worker.execute_stage("test_stage", stage_info, worker_env, output_queue)
+    assert result2["status"] == StageStatus.SKIPPED
+    assert "run cache" in result2["reason"], "Should skip via run cache"
+    assert execution_count[0] == 1, "Should not have executed again"
 
-    monkeypatch.setattr("pivot.executor.run", mock_executor_run)
-
-    engine = reactive.ReactiveEngine(
-        stages=None,
-        single_stage=False,
-        cache_dir=None,
-    )
-
-    engine._execute_stages(None)
-
-    assert "no_cache" in executor_call_args, "no_cache should be passed to executor.run"
-    assert executor_call_args["no_cache"] is False, "no_cache should default to False"
+    # Verify directory was restored from cache
+    assert output_dir.is_dir(), "Directory should be restored"
+    assert (output_dir / "file1.txt").exists(), "file1.txt should be restored"
+    assert (output_dir / "file2.txt").exists(), "file2.txt should be restored"
+    assert (output_dir / "file1.txt").read_text() == "content1"
+    assert (output_dir / "file2.txt").read_text() == "content2"

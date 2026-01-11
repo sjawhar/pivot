@@ -282,6 +282,7 @@ def test_get_stage_explanation_unchanged(tmp_path: Path) -> None:
             params={},
             dep_hashes={},
             output_hashes={},
+            dep_generations={},
         )
     )
 
@@ -310,6 +311,7 @@ def test_get_stage_explanation_code_changed(tmp_path: Path) -> None:
             params={},
             dep_hashes={},
             output_hashes={},
+            dep_generations={},
         )
     )
 
@@ -342,6 +344,7 @@ def test_get_stage_explanation_params_changed(tmp_path: Path) -> None:
             params={"learning_rate": 0.01},
             dep_hashes={},
             output_hashes={},
+            dep_generations={},
         )
     )
 
@@ -378,6 +381,7 @@ def test_get_stage_explanation_deps_changed(tmp_path: Path) -> None:
             params={},
             dep_hashes={normalized_path: {"hash": "old_data_hash"}},
             output_hashes={},
+            dep_generations={},
         )
     )
 
@@ -415,6 +419,7 @@ def test_get_stage_explanation_multiple_changes(tmp_path: Path) -> None:
             params={"epochs": 5},
             dep_hashes={normalized_path: {"hash": "old_hash"}},
             output_hashes={},
+            dep_generations={},
         )
     )
 
@@ -442,6 +447,7 @@ def test_get_stage_explanation_missing_deps(tmp_path: Path) -> None:
             params={},
             dep_hashes={},
             output_hashes={},
+            dep_generations={},
         )
     )
 
@@ -480,6 +486,7 @@ def test_get_stage_explanation_invalid_params(
             params={"learning_rate": 0.01},
             dep_hashes={},
             output_hashes={},
+            dep_generations={},
         )
     )
 
@@ -522,6 +529,7 @@ def test_get_stage_explanation_force_without_changes(
                 params={},
                 dep_hashes={},
                 output_hashes={},
+                dep_generations={},
             )
         )
 
@@ -555,6 +563,7 @@ def test_get_stage_explanation_force_with_code_changes(tmp_path: Path) -> None:
             params={},
             dep_hashes={},
             output_hashes={},
+            dep_generations={},
         )
     )
 
@@ -584,6 +593,7 @@ def test_get_stage_explanation_force_with_missing_deps(tmp_path: Path) -> None:
             params={},
             dep_hashes={},
             output_hashes={},
+            dep_generations={},
         )
     )
 

@@ -481,10 +481,10 @@ def _execute_greedy(
                         if "metrics" in result:
                             metrics.add_entries(result["metrics"])
 
-                        if result["status"] == "failed":
+                        if result["status"] == StageStatus.FAILED:
                             state.status = StageStatus.FAILED
                             _handle_stage_failure(stage_name, stage_states, error_mode)
-                        elif result["status"] == "skipped":
+                        elif result["status"] == StageStatus.SKIPPED:
                             state.status = StageStatus.SKIPPED
                         else:
                             state.status = StageStatus.COMPLETED

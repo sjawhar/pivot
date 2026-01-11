@@ -73,6 +73,7 @@ def test_prepare_outputs_incremental_restores_from_cache(tmp_path: pathlib.Path)
         params={},
         dep_hashes={},
         output_hashes={str(output_file): output_hash},
+        dep_generations={},
     )
 
     # Prepare for execution
@@ -99,6 +100,7 @@ def test_prepare_outputs_incremental_restored_file_is_writable(tmp_path: pathlib
         params={},
         dep_hashes={},
         output_hashes={str(output_file): output_hash},
+        dep_generations={},
     )
 
     # Prepare for execution
@@ -230,6 +232,7 @@ def test_incremental_out_restores_directory(tmp_path: pathlib.Path) -> None:
         params={},
         dep_hashes={},
         output_hashes={str(output_dir): output_hash},
+        dep_generations={},
     )
 
     # Delete the output
@@ -264,6 +267,7 @@ def test_incremental_out_directory_is_writable(tmp_path: pathlib.Path) -> None:
         params={},
         dep_hashes={},
         output_hashes={str(output_dir): output_hash},
+        dep_generations={},
     )
 
     # Delete and restore
@@ -301,6 +305,7 @@ def test_incremental_out_directory_subdirs_writable(tmp_path: pathlib.Path) -> N
         params={},
         dep_hashes={},
         output_hashes={str(output_dir): output_hash},
+        dep_generations={},
     )
 
     # Delete and restore

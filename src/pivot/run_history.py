@@ -4,9 +4,17 @@ import datetime
 import hashlib
 import json
 import uuid
-from typing import Any, TypedDict
+from typing import Any, NotRequired, TypedDict
 
-from pivot.types import DepEntry, LockData, StageStatus
+from pivot.types import (
+    DepEntry,
+    DirHash,
+    DirManifestEntry,
+    FileHash,
+    LockData,
+    OutputHash,
+    StageStatus,
+)
 
 
 class StageRunRecord(TypedDict):
@@ -41,6 +49,25 @@ class OutputHashEntry(TypedDict):
 
     path: str
     hash: str
+    manifest: NotRequired[list[DirManifestEntry]]
+
+
+def output_hash_to_entry(path: str, oh: OutputHash) -> OutputHashEntry | None:
+    """Convert internal OutputHash to serializable OutputHashEntry. Returns None for uncached."""
+    if oh is None:
+        return None
+    entry = OutputHashEntry(path=path, hash=oh["hash"])
+    if "manifest" in oh:
+        entry["manifest"] = oh["manifest"]
+    return entry
+
+
+def entry_to_output_hash(entry: OutputHashEntry) -> FileHash | DirHash:
+    """Convert serialized OutputHashEntry back to internal OutputHash."""
+    # Null check guards against corrupted JSON where manifest could be null
+    if "manifest" in entry and entry["manifest"] is not None:  # pyright: ignore[reportUnnecessaryComparison]
+        return DirHash(hash=entry["hash"], manifest=entry["manifest"])
+    return FileHash(hash=entry["hash"])
 
 
 def generate_run_id() -> str:
@@ -133,7 +160,4 @@ def deserialize_run_cache_entry(data: bytes) -> RunCacheEntry:
     if missing:
         msg = f"Invalid RunCacheEntry: missing keys {missing}"
         raise ValueError(msg)
-    return RunCacheEntry(
-        run_id=parsed["run_id"],
-        output_hashes=parsed["output_hashes"],
-    )
+    return RunCacheEntry(run_id=parsed["run_id"], output_hashes=parsed["output_hashes"])

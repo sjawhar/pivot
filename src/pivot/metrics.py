@@ -1,20 +1,30 @@
 from __future__ import annotations
 
 import contextlib
+import math
 import os
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypedDict
 
 if TYPE_CHECKING:
     from collections.abc import Generator
 
-# Maximum entries to prevent unbounded memory growth
+# Not thread-safe by design; each worker process has its own copy (process isolation).
+
 MAX_ENTRIES = 100_000
 
 _enabled = os.environ.get("PIVOT_METRICS", "").lower() in ("1", "true", "yes")
-
-# Store durations directly by name for simplicity
 _durations: dict[str, list[float]] = {}
+
+
+class MetricSummary(TypedDict):
+    """Summary statistics for a single metric."""
+
+    count: int
+    total_ms: float
+    avg_ms: float
+    min_ms: float
+    max_ms: float
 
 
 def enable() -> None:
@@ -45,33 +55,34 @@ def add_entries(entries: list[tuple[str, float]]) -> None:
 
 def _add(name: str, duration_ms: float) -> None:
     """Internal: add a single metric entry."""
-    if name not in _durations:
-        _durations[name] = []
-    _durations[name].append(duration_ms)
+    # Skip invalid values that would poison summary statistics
+    if math.isnan(duration_ms) or math.isinf(duration_ms):
+        return
 
-    # Prevent unbounded growth - trim oldest entries if over limit
-    total = sum(len(ds) for ds in _durations.values())
-    if total > MAX_ENTRIES:
-        # Remove oldest half of entries from each metric
-        for metric_name in _durations:
-            ds = _durations[metric_name]
-            if len(ds) > 1:
-                _durations[metric_name] = ds[len(ds) // 2 :]
+    # Prevent unbounded growth - trim before adding if at limit.
+    # The sum() is O(n) but we intentionally avoid tracking a counter since metrics
+    # are rarely used, trimming is even rarer, and the added complexity isn't worth it.
+    if sum(len(ds) for ds in _durations.values()) >= MAX_ENTRIES:
+        for metric_name, ds in _durations.items():
+            _durations[metric_name] = ds[len(ds) // 2 :]
+
+    _durations.setdefault(name, []).append(duration_ms)
 
 
-def summary() -> dict[str, dict[str, float]]:
+def summary() -> dict[str, MetricSummary]:
     """Summarize metrics by name: count, total_ms, avg_ms, min_ms, max_ms."""
-    result = dict[str, dict[str, float]]()
+    result = dict[str, MetricSummary]()
     for name, durations in sorted(_durations.items()):
         if not durations:
             continue
-        result[name] = {
-            "count": float(len(durations)),
-            "total_ms": sum(durations),
-            "avg_ms": sum(durations) / len(durations),
-            "min_ms": min(durations),
-            "max_ms": max(durations),
-        }
+        total = sum(durations)
+        result[name] = MetricSummary(
+            count=len(durations),
+            total_ms=total,
+            avg_ms=total / len(durations),
+            min_ms=min(durations),
+            max_ms=max(durations),
+        )
     return result
 
 

@@ -205,6 +205,7 @@ def test_plots_diff_json_format(
                 params={},
                 dep_hashes={},
                 output_hashes={str(plot_file): {"hash": "old_hash_value"}},
+                dep_generations={},
             )
         )
 
@@ -254,6 +255,7 @@ def test_plots_diff_md_format(
                 params={},
                 dep_hashes={},
                 output_hashes={str(plot_file): {"hash": "old_hash_value"}},
+                dep_generations={},
             )
         )
 
@@ -298,6 +300,7 @@ def test_plots_diff_no_path_flag(
                 params={},
                 dep_hashes={},
                 output_hashes={str(plot_file): {"hash": "old_hash_value"}},
+                dep_generations={},
             )
         )
 

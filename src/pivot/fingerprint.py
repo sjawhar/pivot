@@ -8,7 +8,7 @@ import pathlib
 import sys
 import types
 import typing
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any, cast
 
 import xxhash
@@ -60,57 +60,22 @@ def _get_stage_fingerprint_impl(func: Callable[..., Any], visited: set[int]) -> 
     except (TypeError, AttributeError):
         return manifest
 
-    for name, value in closure_vars.globals.items():
-        if name.startswith("__"):
-            continue
-
-        # functools.partial fails is_user_code() (module is functools/stdlib)
-        # Must check before general callable check
-        if isinstance(value, functools.partial):
-            _process_partial_dependency(
-                name, cast("functools.partial[Any]", value), manifest, visited
-            )
-        elif callable(value) and is_user_code(value):
-            _process_callable_dependency(name, value, manifest, visited)
-        elif isinstance(value, types.ModuleType):
-            _process_module_dependency(name, value, func, manifest, visited)
-        elif isinstance(value, (bool, int, float, str, bytes, type(None))):
-            manifest[f"const:{name}"] = repr(value)
-        elif isinstance(value, (dict, list, tuple, set, frozenset)):
-            _process_collection_dependency(
-                name,
-                cast(
-                    "dict[Any, Any] | list[Any] | tuple[Any, ...] | set[Any] | frozenset[Any]",
-                    value,
-                ),
-                manifest,
-                visited,
-            )
-        elif _is_user_class_instance(value):
-            _process_instance_dependency(name, value, manifest, visited)
-
-    for name, value in closure_vars.nonlocals.items():
-        # functools.partial fails is_user_code() (module is functools/stdlib)
-        if isinstance(value, functools.partial):
-            _process_partial_dependency(
-                name, cast("functools.partial[Any]", value), manifest, visited
-            )
-        elif callable(value) and is_user_code(value):
-            _process_callable_dependency(name, value, manifest, visited)
-        elif isinstance(value, (bool, int, float, str, bytes, type(None))):
-            manifest[f"const:{name}"] = repr(value)
-        elif isinstance(value, (dict, list, tuple, set, frozenset)):
-            _process_collection_dependency(
-                name,
-                cast(
-                    "dict[Any, Any] | list[Any] | tuple[Any, ...] | set[Any] | frozenset[Any]",
-                    value,
-                ),
-                manifest,
-                visited,
-            )
-        elif _is_user_class_instance(value):
-            _process_instance_dependency(name, value, manifest, visited)
+    _process_closure_values(
+        closure_vars.globals,
+        func,
+        manifest,
+        visited,
+        skip_dunders=True,
+        include_modules=True,
+    )
+    _process_closure_values(
+        closure_vars.nonlocals,
+        func,
+        manifest,
+        visited,
+        skip_dunders=False,
+        include_modules=False,
+    )
 
     _process_type_hint_dependencies(func, manifest, visited)
 
@@ -139,6 +104,46 @@ def get_loader_fingerprint(loader: "loaders.Loader[Any]") -> dict[str, str]:
     manifest[f"loader:{class_name}:config"] = xxhash.xxh64(config_str.encode()).hexdigest()
 
     return manifest
+
+
+def _process_closure_values(
+    values: Mapping[str, Any],
+    func: Callable[..., Any],
+    manifest: dict[str, str],
+    visited: set[int],
+    *,
+    skip_dunders: bool,
+    include_modules: bool,
+) -> None:
+    """Process closure variable values (globals or nonlocals) and add to manifest."""
+    for name, value in values.items():
+        if skip_dunders and name.startswith("__"):
+            continue
+
+        # functools.partial fails is_user_code() (module is functools/stdlib)
+        # Must check before general callable check
+        if isinstance(value, functools.partial):
+            _process_partial_dependency(
+                name, cast("functools.partial[Any]", value), manifest, visited
+            )
+        elif callable(value) and is_user_code(value):
+            _process_callable_dependency(name, value, manifest, visited)
+        elif include_modules and isinstance(value, types.ModuleType):
+            _process_module_dependency(name, value, func, manifest, visited)
+        elif isinstance(value, (bool, int, float, str, bytes, type(None))):
+            manifest[f"const:{name}"] = repr(value)
+        elif isinstance(value, (dict, list, tuple, set, frozenset)):
+            _process_collection_dependency(
+                name,
+                cast(
+                    "dict[Any, Any] | list[Any] | tuple[Any, ...] | set[Any] | frozenset[Any]",
+                    value,
+                ),
+                manifest,
+                visited,
+            )
+        elif _is_user_class_instance(value):
+            _process_instance_dependency(name, value, manifest, visited)
 
 
 def _process_callable_dependency(
