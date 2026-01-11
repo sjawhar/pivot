@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 
 import xxhash
 
-from pivot import exceptions
+from pivot import exceptions, metrics
 from pivot.config import CheckoutMode as CheckoutMode
 from pivot.types import DirHash, DirManifestEntry, FileHash, OutputHash
 
@@ -71,20 +71,21 @@ def hash_file(path: pathlib.Path, state_db: state_mod.StateDB | None = None) -> 
         if cached is not None:
             return cached
 
-    hasher = xxhash.xxh64()
-    with open(path, "rb") as f:
-        if file_stat.st_size >= MMAP_THRESHOLD:
-            try:
-                with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-                    hasher.update(mm)
-            except (ValueError, OSError):
-                # Fall back to buffered read if mmap fails (empty file, network FS, etc.)
+    with metrics.timed("cache.hash_file"):
+        hasher = xxhash.xxh64()
+        with open(path, "rb") as f:
+            if file_stat.st_size >= MMAP_THRESHOLD:
+                try:
+                    with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                        hasher.update(mm)
+                except (ValueError, OSError):
+                    # Fall back to buffered read if mmap fails (empty file, network FS, etc.)
+                    while chunk := f.read(CHUNK_SIZE):
+                        hasher.update(chunk)
+            else:
                 while chunk := f.read(CHUNK_SIZE):
                     hasher.update(chunk)
-        else:
-            while chunk := f.read(CHUNK_SIZE):
-                hasher.update(chunk)
-    file_hash = hasher.hexdigest()
+        file_hash = hasher.hexdigest()
 
     if state_db is not None:
         state_db.save(path, file_stat, file_hash)
@@ -124,32 +125,33 @@ def hash_directory(
     Note: For portability, paths are stored as normalized (symlinks preserved)
     in lock files, but resolved here for consistent hashing.
     """
-    manifest = list[DirManifestEntry]()
-    resolved_base = path.resolve()
+    with metrics.timed("cache.hash_directory"):
+        manifest = list[DirManifestEntry]()
+        resolved_base = path.resolve()
 
-    for entry in sorted(_scandir_recursive(path), key=lambda e: e.path):
-        file_path = pathlib.Path(entry.path)
-        # Verify file is still within the directory (paranoid check)
-        if not file_path.resolve().is_relative_to(resolved_base):
-            continue
-        try:
-            rel = file_path.relative_to(path)
-            file_stat = entry.stat(follow_symlinks=True)
-            manifest_entry: DirManifestEntry = {
-                "relpath": str(rel),
-                "hash": hash_file(file_path, state_db),
-                "size": file_stat.st_size,
-            }
-            if file_stat.st_mode & stat.S_IXUSR:
-                manifest_entry["isexec"] = True
-            manifest.append(manifest_entry)
-        except FileNotFoundError:
-            continue  # File deleted between scan and hash
+        for entry in sorted(_scandir_recursive(path), key=lambda e: e.path):
+            file_path = pathlib.Path(entry.path)
+            # Verify file is still within the directory (paranoid check)
+            if not file_path.resolve().is_relative_to(resolved_base):
+                continue
+            try:
+                rel = file_path.relative_to(path)
+                file_stat = entry.stat(follow_symlinks=True)
+                manifest_entry: DirManifestEntry = {
+                    "relpath": str(rel),
+                    "hash": hash_file(file_path, state_db),
+                    "size": file_stat.st_size,
+                }
+                if file_stat.st_mode & stat.S_IXUSR:
+                    manifest_entry["isexec"] = True
+                manifest.append(manifest_entry)
+            except FileNotFoundError:
+                continue  # File deleted between scan and hash
 
-    manifest_json = json.dumps(manifest, sort_keys=True, separators=(",", ":"))
-    tree_hash = xxhash.xxh64(manifest_json.encode()).hexdigest()
+        manifest_json = json.dumps(manifest, sort_keys=True, separators=(",", ":"))
+        tree_hash = xxhash.xxh64(manifest_json.encode()).hexdigest()
 
-    return tree_hash, manifest
+        return tree_hash, manifest
 
 
 def get_cache_path(cache_dir: pathlib.Path, file_hash: str) -> pathlib.Path:

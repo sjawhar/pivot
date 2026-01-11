@@ -23,6 +23,7 @@ from pivot import (
     dag,
     exceptions,
     explain,
+    metrics,
     outputs,
     parameters,
     project,
@@ -282,33 +283,34 @@ def _verify_tracked_files(project_root: pathlib.Path) -> None:
     if not tracked_files:
         return
 
-    missing = list[str]()
-    state_db_path = project_root / ".pivot" / "state.db"
+    with metrics.timed("core.verify_tracked_files"):
+        missing = list[str]()
+        state_db_path = project_root / ".pivot" / "state.db"
 
-    with state_mod.StateDB(state_db_path) as state_db:
-        for data_path, track_data in tracked_files.items():
-            path = pathlib.Path(data_path)
-            if not path.exists():
-                missing.append(data_path)
-                continue
+        with state_mod.StateDB(state_db_path) as state_db:
+            for data_path, track_data in tracked_files.items():
+                path = pathlib.Path(data_path)
+                if not path.exists():
+                    missing.append(data_path)
+                    continue
 
-            # Check hash mismatch (file exists but content changed)
-            if path.is_file():
-                current_hash = cache.hash_file(path, state_db)
-            else:
-                current_hash, _ = cache.hash_directory(path, state_db)
-            if current_hash != track_data["hash"]:
-                logger.warning(
-                    f"Tracked file '{data_path}' has changed since tracking. "
-                    + f"Run 'pivot track --force {track_data['path']}' to update."
-                )
+                # Check hash mismatch (file exists but content changed)
+                if path.is_file():
+                    current_hash = cache.hash_file(path, state_db)
+                else:
+                    current_hash, _ = cache.hash_directory(path, state_db)
+                if current_hash != track_data["hash"]:
+                    logger.warning(
+                        f"Tracked file '{data_path}' has changed since tracking. "
+                        + f"Run 'pivot track --force {track_data['path']}' to update."
+                    )
 
-    if missing:
-        missing_list = "\n".join(f"  - {p}" for p in missing)
-        raise exceptions.TrackedFileMissingError(
-            f"The following tracked files are missing:\n{missing_list}\n\n"
-            + "Run 'pivot checkout' to restore them from cache."
-        )
+        if missing:
+            missing_list = "\n".join(f"  - {p}" for p in missing)
+            raise exceptions.TrackedFileMissingError(
+                f"The following tracked files are missing:\n{missing_list}\n\n"
+                + "Run 'pivot checkout' to restore them from cache."
+            )
 
 
 def _warn_single_stage_mutex_groups(stage_states: dict[str, StageState]) -> None:
@@ -461,6 +463,10 @@ def _execute_greedy(
                         result = future.result()
                         state.result = result
                         state.end_time = time.perf_counter()
+
+                        # Aggregate metrics from worker process
+                        if "metrics" in result:
+                            metrics.add_entries(result["metrics"])
 
                         if result["status"] == "failed":
                             state.status = StageStatus.FAILED

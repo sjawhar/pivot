@@ -11,11 +11,11 @@ import io
 import logging
 import pathlib
 import queue
-from typing import TYPE_CHECKING, Any, TypedDict
+from typing import TYPE_CHECKING, Any, Literal, TypedDict
 
 import pydantic
 
-from pivot import exceptions, outputs, parameters, project, run_history, stage_def
+from pivot import exceptions, metrics, outputs, parameters, project, run_history, stage_def
 from pivot.storage import cache, lock, state
 from pivot.types import (
     DepEntry,
@@ -62,6 +62,20 @@ class WorkerStageInfo(TypedDict):
     force: bool
 
 
+def _make_result(
+    status: Literal[StageStatus.RAN, StageStatus.SKIPPED, StageStatus.FAILED],
+    reason: str,
+    output_lines: list[tuple[str, bool]],
+) -> StageResult:
+    """Build StageResult with collected metrics for cross-process transfer."""
+    return StageResult(
+        status=status,
+        reason=reason,
+        output_lines=output_lines,
+        metrics=metrics.get_entries(),
+    )
+
+
 def execute_stage(
     stage_name: str,
     stage_info: WorkerStageInfo,
@@ -69,6 +83,8 @@ def execute_stage(
     output_queue: Queue[OutputMessage],
 ) -> StageResult:
     """Worker function executed in separate process. Must be module-level for pickling."""
+    # Clear metrics at start - each stage collects its own metrics
+    metrics.clear()
     output_lines: list[tuple[str, bool]] = []
     files_cache_dir = cache_dir / "files"
     state_db_path = cache_dir.parent / "state.db"
@@ -87,10 +103,10 @@ def execute_stage(
         if params_instance is not None:
             params_instance = parameters.apply_overrides(params_instance, stage_name, overrides)
     except pydantic.ValidationError as e:
-        return StageResult(
-            status=StageStatus.FAILED,
-            reason=f"Invalid params override in params.yaml: {e.error_count()} validation error(s)",
-            output_lines=[],
+        return _make_result(
+            StageStatus.FAILED,
+            f"Invalid params override in params.yaml: {e.error_count()} validation error(s)",
+            [],
         )
 
     try:
@@ -101,17 +117,13 @@ def execute_stage(
                 dep_hashes, missing, unreadable = hash_dependencies(stage_info["deps"], state_db)
 
                 if missing:
-                    return StageResult(
-                        status=StageStatus.FAILED,
-                        reason=f"missing deps: {', '.join(missing)}",
-                        output_lines=[],
+                    return _make_result(
+                        StageStatus.FAILED, f"missing deps: {', '.join(missing)}", []
                     )
 
                 if unreadable:
-                    return StageResult(
-                        status=StageStatus.FAILED,
-                        reason=f"unreadable deps: {', '.join(unreadable)}",
-                        output_lines=[],
+                    return _make_result(
+                        StageStatus.FAILED, f"unreadable deps: {', '.join(unreadable)}", []
                     )
 
                 skip_reason, run_reason, input_hash = _check_skip_or_run(
@@ -135,9 +147,7 @@ def execute_stage(
                     stage_outs, lock_data, files_cache_dir, checkout_modes
                 )
                 if restored:
-                    return StageResult(
-                        status=StageStatus.SKIPPED, reason=skip_reason, output_lines=[]
-                    )
+                    return _make_result(StageStatus.SKIPPED, skip_reason, [])
                 run_reason = "outputs missing from cache"
 
             # Check run cache for previously executed configuration (skip if forcing)
@@ -177,24 +187,18 @@ def execute_stage(
                     stage_name, input_hash, output_hashes, stage_info["run_id"], state_db
                 )
 
-        return StageResult(status=StageStatus.RAN, reason=run_reason, output_lines=output_lines)
+        return _make_result(StageStatus.RAN, run_reason, output_lines)
 
     except exceptions.StageAlreadyRunningError as e:
-        return StageResult(status=StageStatus.FAILED, reason=str(e), output_lines=output_lines)
+        return _make_result(StageStatus.FAILED, str(e), output_lines)
     except exceptions.OutputMissingError as e:
-        return StageResult(status=StageStatus.FAILED, reason=str(e), output_lines=output_lines)
+        return _make_result(StageStatus.FAILED, str(e), output_lines)
     except SystemExit as e:
-        return StageResult(
-            status=StageStatus.FAILED,
-            reason=f"Stage called sys.exit({e.code})",
-            output_lines=output_lines,
-        )
+        return _make_result(StageStatus.FAILED, f"Stage called sys.exit({e.code})", output_lines)
     except KeyboardInterrupt:
-        return StageResult(
-            status=StageStatus.FAILED, reason="KeyboardInterrupt", output_lines=output_lines
-        )
+        return _make_result(StageStatus.FAILED, "KeyboardInterrupt", output_lines)
     except Exception as e:
-        return StageResult(status=StageStatus.FAILED, reason=str(e), output_lines=output_lines)
+        return _make_result(StageStatus.FAILED, str(e), output_lines)
 
 
 def _check_skip_or_run(
@@ -297,21 +301,22 @@ def _save_outputs_to_cache(
     checkout_modes: list[cache.CheckoutMode],
 ) -> dict[str, OutputHash]:
     """Save outputs to cache after successful execution."""
-    output_hashes = dict[str, OutputHash]()
+    with metrics.timed("worker.save_outputs_to_cache"):
+        output_hashes = dict[str, OutputHash]()
 
-    for out in stage_outs:
-        path = pathlib.Path(out.path)
-        if not path.exists():
-            raise exceptions.OutputMissingError(f"Stage did not produce output: {out.path}")
+        for out in stage_outs:
+            path = pathlib.Path(out.path)
+            if not path.exists():
+                raise exceptions.OutputMissingError(f"Stage did not produce output: {out.path}")
 
-        if out.cache:
-            output_hashes[out.path] = cache.save_to_cache(
-                path, files_cache_dir, checkout_modes=checkout_modes
-            )
-        else:
-            output_hashes[out.path] = None
+            if out.cache:
+                output_hashes[out.path] = cache.save_to_cache(
+                    path, files_cache_dir, checkout_modes=checkout_modes
+                )
+            else:
+                output_hashes[out.path] = None
 
-    return output_hashes
+        return output_hashes
 
 
 def _run_stage_function_with_capture(
@@ -439,23 +444,24 @@ def hash_dependencies(
     For directories, includes full manifest with file hashes/sizes for provenance.
     Paths are normalized (symlinks preserved) for portability in lock files.
     """
-    hashes = dict[str, HashInfo]()
-    missing = list[str]()
-    unreadable = list[str]()
-    for dep in deps:
-        normalized = str(project.normalize_path(dep))
-        path = pathlib.Path(dep)
-        try:
-            if path.is_dir():
-                tree_hash, manifest = cache.hash_directory(path, state_db)
-                hashes[normalized] = {"hash": tree_hash, "manifest": manifest}
-            else:
-                hashes[normalized] = {"hash": cache.hash_file(path, state_db)}
-        except FileNotFoundError:
-            missing.append(dep)
-        except OSError:
-            unreadable.append(dep)
-    return hashes, missing, unreadable
+    with metrics.timed("worker.hash_dependencies"):
+        hashes = dict[str, HashInfo]()
+        missing = list[str]()
+        unreadable = list[str]()
+        for dep in deps:
+            normalized = str(project.normalize_path(dep))
+            path = pathlib.Path(dep)
+            try:
+                if path.is_dir():
+                    tree_hash, manifest = cache.hash_directory(path, state_db)
+                    hashes[normalized] = {"hash": tree_hash, "manifest": manifest}
+                else:
+                    hashes[normalized] = {"hash": cache.hash_file(path, state_db)}
+            except FileNotFoundError:
+                missing.append(dep)
+            except OSError:
+                unreadable.append(dep)
+        return hashes, missing, unreadable
 
 
 # -----------------------------------------------------------------------------
@@ -562,11 +568,7 @@ def _try_skip_via_run_cache(
         ):
             return None  # Output not in file cache
 
-    return StageResult(
-        status=StageStatus.SKIPPED,
-        reason="unchanged (run cache)",
-        output_lines=[],
-    )
+    return _make_result(StageStatus.SKIPPED, "unchanged (run cache)", [])
 
 
 def _write_run_cache_entry(
