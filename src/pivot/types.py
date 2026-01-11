@@ -162,6 +162,16 @@ class DepChange(TypedDict):
     change_type: ChangeType
 
 
+class OutputChange(TypedDict):
+    """Change info for an output file."""
+
+    path: str
+    old_hash: str | None
+    new_hash: str | None
+    change_type: ChangeType | None  # None means unchanged
+    output_type: Literal["out", "metric", "plot"]
+
+
 class StageExplanation(TypedDict):
     """Detailed explanation of why a stage would run."""
 
