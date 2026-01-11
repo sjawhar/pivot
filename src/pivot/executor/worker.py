@@ -60,6 +60,7 @@ class WorkerStageInfo(TypedDict):
     checkout_modes: list[str]
     run_id: str
     force: bool
+    no_commit: bool
 
 
 def _make_result(
@@ -88,11 +89,16 @@ def execute_stage(
     output_lines: list[tuple[str, bool]] = []
     files_cache_dir = cache_dir / "files"
     state_db_path = cache_dir.parent / "state.db"
+    # cache_dir is .pivot/cache, project_root is two levels up
+    project_root = cache_dir.parent.parent
+    no_commit = stage_info["no_commit"]
 
     # Convert string checkout modes to enum (strings required for pickling across processes)
     checkout_modes = [cache.CheckoutMode(m) for m in stage_info["checkout_modes"]]
 
-    stage_lock = lock.StageLock(stage_name, cache_dir)
+    # Production lock for skip detection, pending lock for --no-commit mode
+    production_lock = lock.StageLock(stage_name, cache_dir)
+    pending_lock = lock.get_pending_lock(stage_name, project_root)
     current_fingerprint = stage_info["fingerprint"]
     stage_outs = stage_info["outs"]
 
@@ -111,7 +117,10 @@ def execute_stage(
 
     try:
         with lock.execution_lock(stage_name, cache_dir):
-            lock_data = stage_lock.read()
+            # Check pending lock first for IncrementalOut restoration, fall back to production
+            pending_lock_data = pending_lock.read()
+            production_lock_data = production_lock.read()
+            lock_data = pending_lock_data or production_lock_data
 
             with state.StateDB(state_db_path) as state_db:
                 dep_hashes, missing, unreadable = hash_dependencies(stage_info["deps"], state_db)
@@ -129,7 +138,7 @@ def execute_stage(
                 skip_reason, run_reason, input_hash = _check_skip_or_run(
                     stage_name,
                     stage_info,
-                    stage_lock,
+                    production_lock,
                     lock_data,
                     state_db,
                     current_fingerprint,
@@ -173,19 +182,34 @@ def execute_stage(
 
             output_hashes = _save_outputs_to_cache(stage_outs, files_cache_dir, checkout_modes)
 
-            new_lock_data = LockData(
-                code_manifest=current_fingerprint,
-                params=current_params,
-                dep_hashes=dict(sorted(dep_hashes.items())),
-                output_hashes=dict(sorted(output_hashes.items())),
-            )
-            stage_lock.write(new_lock_data)
+            if no_commit:
+                # Compute dep_generations NOW (at execution time) and store in pending lock
+                with state.StateDB(state_db_path) as state_db:
+                    dep_gens = compute_dep_generation_map(stage_info["deps"], state_db)
 
-            with state.StateDB(state_db_path) as state_db:
-                _record_generations_after_run(stage_name, stage_info, state_db)
-                _write_run_cache_entry(
-                    stage_name, input_hash, output_hashes, stage_info["run_id"], state_db
+                new_lock_data = LockData(
+                    code_manifest=current_fingerprint,
+                    params=current_params,
+                    dep_hashes=dict(sorted(dep_hashes.items())),
+                    output_hashes=dict(sorted(output_hashes.items())),
+                    dep_generations=dep_gens,
                 )
+                pending_lock.write(new_lock_data)
+            else:
+                # Write to production lock and update StateDB
+                new_lock_data = LockData(
+                    code_manifest=current_fingerprint,
+                    params=current_params,
+                    dep_hashes=dict(sorted(dep_hashes.items())),
+                    output_hashes=dict(sorted(output_hashes.items())),
+                )
+                production_lock.write(new_lock_data)
+
+                with state.StateDB(state_db_path) as state_db:
+                    _record_generations_after_run(stage_name, stage_info, state_db)
+                    write_run_cache_entry(
+                        stage_name, input_hash, output_hashes, stage_info["run_id"], state_db
+                    )
 
         return _make_result(StageStatus.RAN, run_reason, output_lines)
 
@@ -501,23 +525,32 @@ def _can_skip_via_generation(
     return True
 
 
-def _record_generations_after_run(
-    stage_name: str,
-    stage_info: WorkerStageInfo,
+def compute_dep_generation_map(
+    deps: list[str],
     state_db: state.StateDB,
-) -> None:
-    """Record dependency generations and increment output generations after successful run."""
-    dep_paths = [pathlib.Path(d) for d in stage_info["deps"]]
+) -> dict[str, int]:
+    """Compute dependency path -> generation map for recording."""
+    dep_paths = [pathlib.Path(d) for d in deps]
     current_gens = state_db.get_many_generations(dep_paths)
 
     gen_record = dict[str, int]()
-    for dep in stage_info["deps"]:
+    for dep in deps:
         path = pathlib.Path(dep)
         gen = current_gens.get(path)
         if gen is not None:
             normalized = str(project.normalize_path(dep))
             gen_record[normalized] = gen
 
+    return gen_record
+
+
+def _record_generations_after_run(
+    stage_name: str,
+    stage_info: WorkerStageInfo,
+    state_db: state.StateDB,
+) -> None:
+    """Record dependency generations and increment output generations after successful run."""
+    gen_record = compute_dep_generation_map(stage_info["deps"], state_db)
     if gen_record:
         state_db.record_dep_generations(stage_name, gen_record)
 
@@ -571,7 +604,7 @@ def _try_skip_via_run_cache(
     return _make_result(StageStatus.SKIPPED, "unchanged (run cache)", [])
 
 
-def _write_run_cache_entry(
+def write_run_cache_entry(
     stage_name: str,
     input_hash: str,
     output_hashes: dict[str, OutputHash],

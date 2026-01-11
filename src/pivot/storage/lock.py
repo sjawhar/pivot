@@ -32,7 +32,10 @@ logger = logging.getLogger(__name__)
 
 _VALID_STAGE_NAME = re.compile(r"^[a-zA-Z0-9_@.-]+$")  # Allow . for DVC matrix keys like @0.5
 _MAX_STAGE_NAME_LEN = 200  # Leave room for ".lock" suffix within filesystem NAME_MAX (255)
-_VALID_LOCK_KEYS = frozenset({"code_manifest", "params", "deps", "outs"})
+_VALID_LOCK_KEYS = frozenset({"code_manifest", "params", "deps", "outs", "dep_generations"})
+
+# Pending directory for --no-commit mode (relative to .pivot/)
+_PENDING_DIR = "pending"
 
 
 def is_lock_data(data: object) -> TypeGuard[StorageLockData]:
@@ -83,6 +86,10 @@ def _convert_to_storage_format(data: LockData) -> StorageLockData:
         outs_list.sort(key=lambda e: e["path"])
         result["outs"] = outs_list
 
+    # Preserve dep_generations for --no-commit mode (uses absolute paths, no conversion needed)
+    if "dep_generations" in data:
+        result["dep_generations"] = data["dep_generations"]
+
     return result
 
 
@@ -110,12 +117,18 @@ def _convert_from_storage_format(data: StorageLockData) -> LockData:
             else:
                 output_hashes[abs_path] = {"hash": entry["hash"]}
 
-    return LockData(
+    result = LockData(
         code_manifest=data["code_manifest"] if "code_manifest" in data else {},
         params=data["params"] if "params" in data else {},
         dep_hashes=dep_hashes,
         output_hashes=output_hashes,
     )
+
+    # Preserve dep_generations for --no-commit mode
+    if "dep_generations" in data:
+        result["dep_generations"] = data["dep_generations"]
+
+    return result
 
 
 class StageLock:
@@ -184,6 +197,20 @@ class StageLock:
             return True, "Input dependencies changed"
 
         return False, ""
+
+
+def get_pending_lock(stage_name: str, project_root: Path) -> StageLock:
+    """Get StageLock pointing to pending directory for --no-commit mode."""
+    pending_dir = project_root / ".pivot" / _PENDING_DIR
+    return StageLock(stage_name, pending_dir)
+
+
+def list_pending_stages(project_root: Path) -> list[str]:
+    """List all stages with pending lock files."""
+    pending_dir = project_root / ".pivot" / _PENDING_DIR / "stages"
+    if not pending_dir.exists():
+        return []
+    return sorted(p.stem for p in pending_dir.glob("*.lock"))
 
 
 # =============================================================================

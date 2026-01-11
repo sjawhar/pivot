@@ -6,12 +6,14 @@ import pathlib
 import queue
 
 import pytest
+import textual.binding
 
 import pivot
 from pivot import executor, project
 from pivot.tui import run as run_tui
 from pivot.types import (
     DisplayMode,
+    OutputMessage,
     StageStatus,
     TuiLogMessage,
     TuiMessage,
@@ -420,3 +422,88 @@ def test_status_styles_returns_tuple() -> None:
         assert isinstance(label, str), f"Label for {status} should be string"
         assert isinstance(style, str), f"Style for {status} should be string"
         assert len(label) > 0, f"Label for {status} should not be empty"
+
+
+# =============================================================================
+# WatchTuiApp Tests
+# =============================================================================
+
+
+def test_watch_tui_app_init_no_commit_default() -> None:
+    """WatchTuiApp defaults no_commit to False."""
+    manager = mp.Manager()
+    try:
+        tui_queue: mp.Queue[TuiMessage] = manager.Queue()  # pyright: ignore[reportAssignmentType]
+
+        class MockEngine:
+            def run(
+                self,
+                tui_queue: mp.Queue[TuiMessage] | None = None,
+                output_queue: mp.Queue[OutputMessage] | None = None,
+            ) -> None:
+                pass
+
+            def shutdown(self) -> None:
+                pass
+
+        app = run_tui.WatchTuiApp(MockEngine(), tui_queue)
+        assert app._no_commit is False
+    finally:
+        manager.shutdown()
+
+
+def test_watch_tui_app_init_no_commit_true() -> None:
+    """WatchTuiApp accepts no_commit=True."""
+    manager = mp.Manager()
+    try:
+        tui_queue: mp.Queue[TuiMessage] = manager.Queue()  # pyright: ignore[reportAssignmentType]
+
+        class MockEngine:
+            def run(
+                self,
+                tui_queue: mp.Queue[TuiMessage] | None = None,
+                output_queue: mp.Queue[OutputMessage] | None = None,
+            ) -> None:
+                pass
+
+            def shutdown(self) -> None:
+                pass
+
+        app = run_tui.WatchTuiApp(MockEngine(), tui_queue, no_commit=True)
+        assert app._no_commit is True
+    finally:
+        manager.shutdown()
+
+
+# =============================================================================
+# ConfirmCommitScreen Tests
+# =============================================================================
+
+
+def test_confirm_commit_screen_has_bindings() -> None:
+    """ConfirmCommitScreen has y, n, and escape bindings."""
+    bindings = run_tui.ConfirmCommitScreen.BINDINGS
+    assert len(bindings) == 3
+    # Extract keys from Binding objects - bindings are Binding instances
+    binding_keys = set[str]()
+    for b in bindings:
+        if isinstance(b, textual.binding.Binding):
+            binding_keys.add(b.key)
+        else:
+            binding_keys.add(b[0])  # Tuple format: (key, action, description)
+    assert "y" in binding_keys
+    assert "n" in binding_keys
+    assert "escape" in binding_keys
+
+
+def test_confirm_commit_screen_has_css() -> None:
+    """ConfirmCommitScreen has default CSS defined."""
+    css = run_tui.ConfirmCommitScreen.DEFAULT_CSS
+    assert "ConfirmCommitScreen" in css
+    assert "dialog" in css
+
+
+def test_confirm_commit_screen_instantiation() -> None:
+    """ConfirmCommitScreen can be instantiated."""
+    screen = run_tui.ConfirmCommitScreen()
+    assert isinstance(screen, run_tui.ConfirmCommitScreen)
