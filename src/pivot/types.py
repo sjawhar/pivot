@@ -348,6 +348,7 @@ class TuiLogMessage(TypedDict):
     stage: str
     line: str
     is_stderr: bool
+    timestamp: float
 
 
 class TuiStatusMessage(TypedDict):

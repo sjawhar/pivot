@@ -9,12 +9,14 @@ import logging
 import os
 import queue
 import threading
-from typing import IO, TYPE_CHECKING, ClassVar, TypeVar, final, override
+import time
+from typing import IO, TYPE_CHECKING, ClassVar, Literal, TypeVar, final, override
 
 import filelock
 import textual.app
 import textual.binding
 import textual.containers
+import textual.css.query
 import textual.message
 import textual.screen
 import textual.widgets
@@ -84,7 +86,7 @@ class StageInfo:
     status: StageStatus = StageStatus.READY
     reason: str = ""
     elapsed: float | None = None
-    logs: collections.deque[tuple[str, bool]] = dataclasses.field(
+    logs: collections.deque[tuple[str, bool, float]] = dataclasses.field(
         default_factory=lambda: collections.deque(maxlen=1000)
     )
 
@@ -237,34 +239,108 @@ class LogPanel(textual.widgets.RichLog):
                 self._write_log_line(s, line, is_stderr)
 
 
+class StageLogPanel(textual.widgets.RichLog):
+    """Panel showing timestamped logs for a single stage."""
+
+    def __init__(self, *, id: str | None = None, classes: str | None = None) -> None:
+        super().__init__(highlight=True, markup=True, id=id, classes=classes)
+
+    def set_stage(self, stage: StageInfo | None) -> None:  # pragma: no cover
+        """Display all logs for the given stage."""
+        self.clear()
+        if stage is None:
+            self.write("[dim]No stage selected[/]")
+        elif stage.logs:
+            for line, is_stderr, timestamp in stage.logs:
+                self._write_line(line, is_stderr, timestamp)
+        else:
+            self.write(f"[dim]No logs yet for {stage.name}[/]")
+
+    def add_log(self, line: str, is_stderr: bool, timestamp: float) -> None:  # pragma: no cover
+        """Add a new log line."""
+        self._write_line(line, is_stderr, timestamp)
+
+    def _write_line(self, line: str, is_stderr: bool, timestamp: float) -> None:  # pragma: no cover
+        time_str = time.strftime("[%H:%M:%S]", time.localtime(timestamp))
+        if is_stderr:
+            self.write(f"[dim]{time_str}[/] [red]{line}[/]")
+        else:
+            self.write(f"[dim]{time_str}[/] {line}")
+
+
+class TabbedDetailPanel(textual.containers.Vertical):
+    """Tabbed panel showing stage details with Logs, Input, Output tabs."""
+
+    _stage: StageInfo | None
+
+    def __init__(self, *, id: str | None = None, classes: str | None = None) -> None:
+        super().__init__(id=id, classes=classes)
+        self._stage = None
+
+    @override
+    def compose(self) -> textual.app.ComposeResult:  # pragma: no cover
+        with textual.widgets.TabbedContent(id="detail-tabs"):
+            with textual.widgets.TabPane("Logs", id="tab-logs"):
+                yield StageLogPanel(id="stage-logs")
+            with textual.widgets.TabPane("Input", id="tab-input"):
+                yield textual.widgets.Static("[dim]Coming soon...[/]", id="input-placeholder")
+            with textual.widgets.TabPane("Output", id="tab-output"):
+                yield textual.widgets.Static("[dim]Coming soon...[/]", id="output-placeholder")
+
+    def set_stage(self, stage: StageInfo | None) -> None:  # pragma: no cover
+        """Update the displayed stage."""
+        self._stage = stage
+        try:
+            log_panel = self.query_one("#stage-logs", StageLogPanel)
+            log_panel.set_stage(stage)
+        except textual.css.query.NoMatches:
+            _logger.debug("stage-logs panel not found during set_stage")
+
+
 _TUI_CSS: str = """
+#main-split {
+    height: 1fr;
+}
+
 #stage-list {
-    height: auto;
-    max-height: 50%;
-    border: solid green;
+    width: 35%;
+    min-width: 30;
+    max-width: 50;
+    height: 100%;
+    border: solid $surface-lighten-1;
     padding: 1;
 }
 
+#stage-list.focused {
+    border: solid $primary;
+}
+
 #detail-panel {
-    height: auto;
-    border: solid blue;
-    padding: 1;
-    margin-top: 1;
+    width: 1fr;
+    height: 100%;
+    border: solid $surface-lighten-1;
+}
+
+#detail-panel.focused {
+    border: solid $primary;
+}
+
+#detail-tabs {
+    height: 100%;
+}
+
+#stage-logs {
+    height: 100%;
 }
 
 #log-panel {
     height: 1fr;
     border: solid yellow;
-    margin-top: 1;
 }
 
 .section-header {
     text-style: bold;
     margin-bottom: 1;
-}
-
-#status-view {
-    height: 100%;
 }
 
 #logs-view {
@@ -285,12 +361,24 @@ _TUI_BINDINGS: list[textual.binding.BindingType] = [
     textual.binding.Binding("q", "quit", "Quit"),
     textual.binding.Binding("c", "commit", "Commit"),
     textual.binding.Binding("escape", "cancel_commit", "Cancel", show=False),
-    textual.binding.Binding("j", "next_stage", "Next"),
-    textual.binding.Binding("k", "prev_stage", "Prev"),
-    textual.binding.Binding("down", "next_stage", "Next", show=False),
-    textual.binding.Binding("up", "prev_stage", "Prev", show=False),
-    textual.binding.Binding("tab", "toggle_view", "Toggle View"),
+    # Panel focus switching
+    textual.binding.Binding("tab", "switch_focus", "Switch Panel"),
+    # Navigation (context-aware: stages panel vs detail panel)
+    textual.binding.Binding("j", "nav_down", "Down"),
+    textual.binding.Binding("k", "nav_up", "Up"),
+    textual.binding.Binding("down", "nav_down", "Down", show=False),
+    textual.binding.Binding("up", "nav_up", "Up", show=False),
+    textual.binding.Binding("h", "nav_left", "Left", show=False),
+    textual.binding.Binding("l", "nav_right", "Right", show=False),
+    textual.binding.Binding("left", "nav_left", "Left", show=False),
+    textual.binding.Binding("right", "nav_right", "Right", show=False),
+    # Tab mnemonic keys (shift+letter)
+    textual.binding.Binding("L", "goto_tab_logs", "Logs Tab", show=False),
+    textual.binding.Binding("I", "goto_tab_input", "Input Tab", show=False),
+    textual.binding.Binding("O", "goto_tab_output", "Output Tab", show=False),
+    # All logs view toggle
     textual.binding.Binding("a", "show_all_logs", "All Logs"),
+    # Keep stage filtering with number keys (4-9 for stages, 1-3 could conflict with tabs)
     *[
         textual.binding.Binding(str(i), f"filter_stage({i - 1})", f"Stage {i}", show=False)
         for i in range(1, 10)
@@ -308,6 +396,7 @@ class _BaseTuiApp(textual.app.App[_AppReturnT]):
 
     CSS: ClassVar[str] = _TUI_CSS
     BINDINGS: ClassVar[list[textual.binding.BindingType]] = _TUI_BINDINGS
+    _TAB_IDS: ClassVar[tuple[str, str, str]] = ("tab-logs", "tab-input", "tab-output")
 
     def __init__(
         self,
@@ -322,6 +411,7 @@ class _BaseTuiApp(textual.app.App[_AppReturnT]):
         self._stage_order: list[str] = []
         self._selected_idx: int = 0
         self._show_logs: bool = False
+        self._focused_panel: Literal["stages", "detail"] = "stages"
         self._reader_thread: threading.Thread | None = None
         self._shutdown_event: threading.Event = threading.Event()
         self._log_file: IO[str] | None = None
@@ -362,9 +452,9 @@ class _BaseTuiApp(textual.app.App[_AppReturnT]):
     def compose(self) -> textual.app.ComposeResult:  # pragma: no cover
         yield textual.widgets.Header()
 
-        with textual.containers.VerticalScroll(id="status-view", classes="view-active"):
+        with textual.containers.Horizontal(id="main-split"):
             yield StageListPanel(list(self._stages.values()), id="stage-list")
-            yield DetailPanel(id="detail-panel")
+            yield TabbedDetailPanel(id="detail-panel")
 
         with textual.containers.Vertical(id="logs-view", classes="view-hidden"):
             yield LogPanel(id="log-panel")
@@ -398,21 +488,107 @@ class _BaseTuiApp(textual.app.App[_AppReturnT]):
         stage = msg["stage"]
         line = msg["line"]
         is_stderr = msg["is_stderr"]
+        timestamp = msg["timestamp"]
 
         if stage in self._stages:
-            self._stages[stage].logs.append((line, is_stderr))
+            self._stages[stage].logs.append((line, is_stderr, timestamp))
 
+        # Update all-logs panel
         log_panel = self.query_one("#log-panel", LogPanel)
         log_panel.add_log(stage, line, is_stderr)
 
+        # Update stage-specific log panel if this stage is selected
+        if (
+            self._stage_order
+            and self._selected_idx < len(self._stage_order)
+            and self._stage_order[self._selected_idx] == stage
+        ):
+            try:
+                stage_log_panel = self.query_one("#stage-logs", StageLogPanel)
+                stage_log_panel.add_log(line, is_stderr, timestamp)
+            except textual.css.query.NoMatches:
+                _logger.debug("stage-logs panel not found during log update")
+
     def _update_detail_panel(self) -> None:  # pragma: no cover
-        if self._stage_order:
+        if self._stage_order and self._selected_idx < len(self._stage_order):
             selected_name = self._stage_order[self._selected_idx]
             stage = self._stages.get(selected_name)
         else:
             stage = None
-        detail = self.query_one("#detail-panel", DetailPanel)
+        detail = self.query_one("#detail-panel", TabbedDetailPanel)
         detail.set_stage(stage)
+
+    def _update_focus_visual(self) -> None:  # pragma: no cover
+        """Update visual indicators for focused panel."""
+        stage_list = self.query_one("#stage-list", StageListPanel)
+        detail_panel = self.query_one("#detail-panel", TabbedDetailPanel)
+        is_stages_focused = self._focused_panel == "stages"
+        stage_list.set_class(is_stages_focused, "focused")
+        detail_panel.set_class(not is_stages_focused, "focused")
+
+    def action_switch_focus(self) -> None:  # pragma: no cover
+        """Toggle focus between stages panel and detail panel."""
+        self._focused_panel = "detail" if self._focused_panel == "stages" else "stages"
+        self._update_focus_visual()
+
+    def action_nav_down(self) -> None:  # pragma: no cover
+        """Navigate down - stage list when stages focused."""
+        if self._focused_panel == "stages":
+            self.action_next_stage()
+
+    def action_nav_up(self) -> None:  # pragma: no cover
+        """Navigate up - stage list when stages focused."""
+        if self._focused_panel == "stages":
+            self.action_prev_stage()
+
+    def action_nav_left(self) -> None:  # pragma: no cover
+        """Navigate left - previous tab or switch to stages panel."""
+        if self._focused_panel == "detail":
+            try:
+                tabs = self.query_one("#detail-tabs", textual.widgets.TabbedContent)
+                if tabs.active == self._TAB_IDS[0]:
+                    # On leftmost tab, switch to stages panel
+                    self._focused_panel = "stages"
+                    self._update_focus_visual()
+                elif tabs.active in self._TAB_IDS:
+                    current_idx = self._TAB_IDS.index(tabs.active)
+                    tabs.active = self._TAB_IDS[current_idx - 1]
+            except (textual.css.query.NoMatches, ValueError):
+                _logger.debug("detail-tabs not found during nav_left")
+
+    def action_nav_right(self) -> None:  # pragma: no cover
+        """Navigate right - next tab or switch to detail panel."""
+        if self._focused_panel == "stages":
+            self._focused_panel = "detail"
+            self._update_focus_visual()
+        else:
+            try:
+                tabs = self.query_one("#detail-tabs", textual.widgets.TabbedContent)
+                if tabs.active in self._TAB_IDS:
+                    current_idx = self._TAB_IDS.index(tabs.active)
+                    if current_idx < len(self._TAB_IDS) - 1:
+                        tabs.active = self._TAB_IDS[current_idx + 1]
+            except (textual.css.query.NoMatches, ValueError):
+                _logger.debug("detail-tabs not found during nav_right")
+
+    def _goto_tab(self, tab_id: str) -> None:  # pragma: no cover
+        """Jump to a specific tab and focus the detail panel."""
+        try:
+            tabs = self.query_one("#detail-tabs", textual.widgets.TabbedContent)
+            tabs.active = tab_id
+            self._focused_panel = "detail"
+            self._update_focus_visual()
+        except textual.css.query.NoMatches:
+            _logger.debug("detail-tabs not found during goto_tab")
+
+    def action_goto_tab_logs(self) -> None:  # pragma: no cover
+        self._goto_tab("tab-logs")
+
+    def action_goto_tab_input(self) -> None:  # pragma: no cover
+        self._goto_tab("tab-input")
+
+    def action_goto_tab_output(self) -> None:  # pragma: no cover
+        self._goto_tab("tab-output")
 
     def action_next_stage(self) -> None:  # pragma: no cover
         if self._selected_idx < len(self._stage_order) - 1:
@@ -426,14 +602,12 @@ class _BaseTuiApp(textual.app.App[_AppReturnT]):
 
     def action_toggle_view(self) -> None:  # pragma: no cover
         self._show_logs = not self._show_logs
-        status_view = self.query_one("#status-view")
+        main_split = self.query_one("#main-split")
         logs_view = self.query_one("#logs-view")
-        if self._show_logs:
-            status_view.set_classes("view-hidden")
-            logs_view.set_classes("view-active")
-        else:
-            status_view.set_classes("view-active")
-            logs_view.set_classes("view-hidden")
+        main_split.set_class(self._show_logs, "view-hidden")
+        main_split.set_class(not self._show_logs, "view-active")
+        logs_view.set_class(self._show_logs, "view-active")
+        logs_view.set_class(not self._show_logs, "view-hidden")
 
     def action_show_all_logs(self) -> None:  # pragma: no cover
         log_panel = self.query_one("#log-panel", LogPanel)
@@ -777,37 +951,25 @@ class WatchTuiApp(_BaseTuiApp[None]):
                         self.notify(f"Still waiting for lock... ({int(elapsed)}s)")
 
             if self._cancel_commit:
-                if acquired is not None:
-                    acquired.release()
-                self._commit_in_progress = False
                 self.notify("Commit cancelled")
                 return
 
             if acquired is None:
-                self._commit_in_progress = False
                 self.notify(
                     f"Timed out waiting for lock ({int(_COMMIT_LOCK_TIMEOUT)}s). Try again later.",
                     severity="error",
                 )
                 return
 
-            await self._do_commit(acquired)
-        except Exception as e:
-            self.notify(f"Commit failed: {e}", severity="error")
-        finally:
-            if acquired is None:
-                self._commit_in_progress = False
-
-    async def _do_commit(self, acquired_lock: filelock.BaseFileLock) -> None:  # pragma: no cover
-        """Execute the commit operation with the acquired lock."""
-        try:
             committed = await asyncio.to_thread(commit_mod.commit_pending)
             self.notify(f"Committed {len(committed)} stage(s)")
         except Exception as e:
             self.notify(f"Commit failed: {e}", severity="error")
         finally:
-            acquired_lock.release()
+            # Always reset flag and release lock if acquired
             self._commit_in_progress = False
+            if acquired is not None:
+                acquired.release()
 
     @override
     def action_cancel_commit(self) -> None:  # pragma: no cover

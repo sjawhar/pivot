@@ -36,26 +36,24 @@ def pipeline_dir(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> pat
 # =============================================================================
 
 
-def test_format_elapsed_none() -> None:
-    """_format_elapsed returns empty string for None."""
-    assert run_tui._format_elapsed(None) == ""
-
-
-def test_format_elapsed_seconds() -> None:
-    """_format_elapsed formats seconds correctly."""
-    assert run_tui._format_elapsed(5.0) == "(0:05)"
-    assert run_tui._format_elapsed(59.9) == "(0:59)"
-
-
-def test_format_elapsed_minutes() -> None:
-    """_format_elapsed formats minutes correctly."""
-    assert run_tui._format_elapsed(60.0) == "(1:00)"
-    assert run_tui._format_elapsed(125.5) == "(2:05)"
-
-
-def test_format_elapsed_large_values() -> None:
-    """_format_elapsed handles large values."""
-    assert run_tui._format_elapsed(3661.0) == "(61:01)"
+@pytest.mark.parametrize(
+    ("elapsed", "expected"),
+    [
+        # None returns empty string
+        (None, ""),
+        # Seconds
+        (5.0, "(0:05)"),
+        (59.9, "(0:59)"),
+        # Minutes
+        (60.0, "(1:00)"),
+        (125.5, "(2:05)"),
+        # Large values
+        (3661.0, "(61:01)"),
+    ],
+)
+def test_format_elapsed(elapsed: float | None, expected: str) -> None:
+    """_format_elapsed formats elapsed time correctly."""
+    assert run_tui._format_elapsed(elapsed) == expected
 
 
 # =============================================================================
@@ -63,14 +61,16 @@ def test_format_elapsed_large_values() -> None:
 # =============================================================================
 
 
-def test_should_use_tui_explicit_tui() -> None:
-    """should_use_tui returns True when display mode is TUI."""
-    assert run_tui.should_use_tui(DisplayMode.TUI) is True
-
-
-def test_should_use_tui_explicit_plain() -> None:
-    """should_use_tui returns False when display mode is PLAIN."""
-    assert run_tui.should_use_tui(DisplayMode.PLAIN) is False
+@pytest.mark.parametrize(
+    ("display_mode", "expected"),
+    [
+        (DisplayMode.TUI, True),
+        (DisplayMode.PLAIN, False),
+    ],
+)
+def test_should_use_tui_explicit_mode(display_mode: DisplayMode, expected: bool) -> None:
+    """should_use_tui returns correct value for explicit display modes."""
+    assert run_tui.should_use_tui(display_mode) is expected
 
 
 # =============================================================================
@@ -97,10 +97,12 @@ def test_stage_info_logs_bounded() -> None:
     info = run_tui.StageInfo("test", 1, 1)
 
     for i in range(1500):
-        info.logs.append((f"line {i}", False))
+        info.logs.append((f"line {i}", False, 1234567890.0 + i))
 
     assert len(info.logs) == 1000, "Logs should be bounded to 1000 entries"
-    assert info.logs[0] == ("line 500", False), "Oldest entries should be dropped"
+    assert info.logs[0] == ("line 500", False, 1234567890.0 + 500), (
+        "Oldest entries should be dropped"
+    )
 
 
 # =============================================================================
@@ -110,7 +112,13 @@ def test_stage_info_logs_bounded() -> None:
 
 def test_tui_update_with_log_message() -> None:
     """TuiUpdate can wrap log messages."""
-    log_msg = TuiLogMessage(type=TuiMessageType.LOG, stage="test", line="output", is_stderr=False)
+    log_msg = TuiLogMessage(
+        type=TuiMessageType.LOG,
+        stage="test",
+        line="output",
+        is_stderr=False,
+        timestamp=1234567890.0,
+    )
     update = run_tui.TuiUpdate(log_msg)
 
     assert update.msg == log_msg
@@ -429,48 +437,34 @@ def test_status_styles_returns_tuple() -> None:
 # =============================================================================
 
 
-def test_watch_tui_app_init_no_commit_default() -> None:
-    """WatchTuiApp defaults no_commit to False."""
+class _MockEngine:
+    """Mock engine for WatchTuiApp tests."""
+
+    def run(
+        self,
+        tui_queue: mp.Queue[TuiMessage] | None = None,
+        output_queue: mp.Queue[OutputMessage] | None = None,
+    ) -> None:
+        pass
+
+    def shutdown(self) -> None:
+        pass
+
+
+@pytest.mark.parametrize(
+    ("no_commit", "expected"),
+    [
+        (False, False),
+        (True, True),
+    ],
+)
+def test_watch_tui_app_init_no_commit(no_commit: bool, expected: bool) -> None:
+    """WatchTuiApp initializes no_commit correctly."""
     manager = mp.Manager()
     try:
         tui_queue: mp.Queue[TuiMessage] = manager.Queue()  # pyright: ignore[reportAssignmentType]
-
-        class MockEngine:
-            def run(
-                self,
-                tui_queue: mp.Queue[TuiMessage] | None = None,
-                output_queue: mp.Queue[OutputMessage] | None = None,
-            ) -> None:
-                pass
-
-            def shutdown(self) -> None:
-                pass
-
-        app = run_tui.WatchTuiApp(MockEngine(), tui_queue)
-        assert app._no_commit is False
-    finally:
-        manager.shutdown()
-
-
-def test_watch_tui_app_init_no_commit_true() -> None:
-    """WatchTuiApp accepts no_commit=True."""
-    manager = mp.Manager()
-    try:
-        tui_queue: mp.Queue[TuiMessage] = manager.Queue()  # pyright: ignore[reportAssignmentType]
-
-        class MockEngine:
-            def run(
-                self,
-                tui_queue: mp.Queue[TuiMessage] | None = None,
-                output_queue: mp.Queue[OutputMessage] | None = None,
-            ) -> None:
-                pass
-
-            def shutdown(self) -> None:
-                pass
-
-        app = run_tui.WatchTuiApp(MockEngine(), tui_queue, no_commit=True)
-        assert app._no_commit is True
+        app = run_tui.WatchTuiApp(_MockEngine(), tui_queue, no_commit=no_commit)
+        assert app._no_commit is expected
     finally:
         manager.shutdown()
 
