@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import pathlib
+import sys
 from typing import TYPE_CHECKING, Literal, TypedDict
 
 import click
@@ -13,7 +15,35 @@ from pivot.cli import decorators as cli_decorators
 from pivot.types import DisplayMode, OutputMessage, StageExplanation, StageStatus
 
 if TYPE_CHECKING:
+    from collections.abc import Generator
+
     from pivot.executor import ExecutionSummary
+
+
+@contextlib.contextmanager
+def _suppress_stderr_logging() -> Generator[None]:
+    """Suppress logging to stderr while TUI is active.
+
+    Textual takes over the terminal, so stderr writes appear as garbage
+    in the upper-left corner. This temporarily removes StreamHandlers
+    that write to stderr and restores them on exit.
+    """
+    root = logging.getLogger()
+    removed_handlers = list[logging.Handler]()
+
+    for handler in root.handlers[:]:
+        if isinstance(handler, logging.StreamHandler):
+            # StreamHandler is generic but handlers list is Handler[]
+            stream = getattr(handler, "stream", None)  # pyright: ignore[reportUnknownArgumentType]
+            if stream in (sys.stderr, sys.stdout):
+                root.removeHandler(handler)  # pyright: ignore[reportUnknownArgumentType]
+                removed_handlers.append(handler)  # pyright: ignore[reportUnknownArgumentType]
+
+    try:
+        yield
+    finally:
+        for handler in removed_handlers:
+            root.addHandler(handler)
 
 
 class RunJsonStageOutput(TypedDict):
@@ -141,7 +171,8 @@ def _run_with_tui(
         )
 
     try:
-        return run_tui.run_with_tui(execution_order, tui_queue, executor_func, tui_log=tui_log)
+        with _suppress_stderr_logging():
+            return run_tui.run_with_tui(execution_order, tui_queue, executor_func, tui_log=tui_log)
     finally:
         manager.shutdown()
 
@@ -205,14 +236,15 @@ def _run_watch_with_tui(
     )
 
     try:
-        run_tui.run_watch_tui(
-            engine,
-            tui_queue,
-            output_queue=output_queue,
-            tui_log=tui_log,
-            stage_names=execution_order,
-            no_commit=no_commit,
-        )
+        with _suppress_stderr_logging():
+            run_tui.run_watch_tui(
+                engine,
+                tui_queue,
+                output_queue=output_queue,
+                tui_log=tui_log,
+                stage_names=execution_order,
+                no_commit=no_commit,
+            )
     finally:
         manager.shutdown()
 

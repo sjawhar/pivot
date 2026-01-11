@@ -595,7 +595,11 @@ def _output_queue_reader(
             if tui_queue:
                 tui_queue.put(
                     TuiLogMessage(
-                        type=TuiMessageType.LOG, stage=stage_name, line=line, is_stderr=is_stderr
+                        type=TuiMessageType.LOG,
+                        stage=stage_name,
+                        line=line,
+                        is_stderr=is_stderr,
+                        timestamp=time.time(),
                     )
                 )
         except queue.Empty:
