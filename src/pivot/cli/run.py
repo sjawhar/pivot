@@ -2,15 +2,29 @@ from __future__ import annotations
 
 import json
 import logging
+import multiprocessing as mp
 import pathlib
-from typing import TYPE_CHECKING, Literal, TypedDict
+from typing import TYPE_CHECKING, Literal, TypedDict, override
 
 import click
+import click.shell_completion
 
-from pivot import discovery, exceptions, executor, registry
+from pivot import (
+    dag,
+    discovery,
+    executor,
+    explain,
+    parameters,
+    project,
+    reactive,
+    registry,
+)
 from pivot.cli import completion
 from pivot.cli import decorators as cli_decorators
-from pivot.types import DisplayMode, StageExplanation, StageStatus
+from pivot.cli import helpers as cli_helpers
+from pivot.tui import console
+from pivot.tui import run as run_tui
+from pivot.types import DisplayMode, StageExplanation, StageStatus, TuiMessage
 
 if TYPE_CHECKING:
     from pivot.executor import ExecutionSummary
@@ -43,17 +57,41 @@ def ensure_stages_registered() -> None:
             raise click.ClickException(str(e)) from e
 
 
+class DisplayModeType(click.ParamType):
+    """Click parameter type that converts string to DisplayMode enum."""
+
+    name: str = "display_mode"
+
+    @override
+    def convert(
+        self, value: str | None, param: click.Parameter | None, ctx: click.Context | None
+    ) -> DisplayMode | None:
+        if value is None:
+            return None
+        try:
+            return DisplayMode(value)
+        except ValueError:
+            self.fail(f"Invalid display mode: {value}. Choose from: tui, plain", param, ctx)
+
+    @override
+    def shell_complete(
+        self, ctx: click.Context, param: click.Parameter, incomplete: str
+    ) -> list[click.shell_completion.CompletionItem]:
+        return [
+            click.shell_completion.CompletionItem(mode.value)
+            for mode in DisplayMode
+            if mode.value.startswith(incomplete)
+        ]
+
+
+DISPLAY_MODE = DisplayModeType()
+
+
 def _validate_stages(stages_list: list[str] | None, single_stage: bool) -> None:
     """Validate stage arguments and options."""
     if single_stage and not stages_list:
         raise click.ClickException("--single-stage requires at least one stage name")
-
-    if stages_list:
-        graph = registry.REGISTRY.build_dag(validate=True)
-        registered = set(graph.nodes())
-        unknown = [s for s in stages_list if s not in registered]
-        if unknown:
-            raise exceptions.StageNotFoundError(f"Unknown stage(s): {', '.join(unknown)}")
+    cli_helpers.validate_stages_exist(stages_list)
 
 
 def _get_all_explanations(
@@ -63,8 +101,6 @@ def _get_all_explanations(
     force: bool = False,
 ) -> list[StageExplanation]:
     """Get explanations for all stages in execution order."""
-    from pivot import dag, explain, parameters, project
-
     graph = registry.REGISTRY.build_dag(validate=True)
     execution_order = dag.get_execution_order(graph, stages_list, single_stage=single_stage)
 
@@ -98,13 +134,6 @@ def _run_with_tui(
     force: bool = False,
 ) -> dict[str, ExecutionSummary] | None:
     """Run pipeline with TUI display."""
-    import multiprocessing as mp
-
-    from pivot import dag, project
-    from pivot.tui import run as run_tui
-    from pivot.types import TuiMessage
-
-    # Get execution order for stage names
     graph = registry.REGISTRY.build_dag(validate=True)
     execution_order = dag.get_execution_order(graph, stages_list, single_stage=single_stage)
 
@@ -142,16 +171,10 @@ def _run_watch_with_tui(
     force: bool = False,
 ) -> None:
     """Run watch mode with TUI display."""
-    import multiprocessing as mp
-
-    from pivot import reactive as reactive_module
-    from pivot.tui import run as run_tui
-    from pivot.types import TuiMessage
-
     manager = mp.Manager()
     tui_queue: mp.Queue[TuiMessage] = manager.Queue()  # pyright: ignore[reportAssignmentType]
 
-    engine = reactive_module.ReactiveEngine(
+    engine = reactive.ReactiveEngine(
         stages=stages_list,
         single_stage=single_stage,
         cache_dir=cache_dir,
@@ -241,7 +264,7 @@ def _print_results(results: dict[str, ExecutionSummary], as_json: bool = False) 
 )
 @click.option(
     "--display",
-    type=click.Choice(["tui", "plain"]),
+    type=DISPLAY_MODE,
     default=None,
     help="Display mode: tui (interactive) or plain (streaming text). Auto-detects if not specified.",
 )
@@ -257,7 +280,7 @@ def run(
     force: bool,
     watch: bool,
     debounce: int,
-    display: str | None,
+    display: DisplayMode | None,
     as_json: bool,
 ) -> None:
     """Execute pipeline stages.
@@ -293,9 +316,7 @@ def run(
         return
 
     if watch:
-        from pivot.tui import run as run_tui
-
-        display_mode = DisplayMode(display) if display else None
+        display_mode = display
         use_tui = run_tui.should_use_tui(display_mode) and not as_json
 
         if use_tui:
@@ -304,9 +325,7 @@ def run(
             except KeyboardInterrupt:
                 click.echo("\nWatch mode stopped.")
         else:
-            from pivot import reactive as reactive_module
-
-            engine = reactive_module.ReactiveEngine(
+            engine = reactive.ReactiveEngine(
                 stages=stages_list,
                 single_stage=single_stage,
                 cache_dir=cache_dir,
@@ -318,7 +337,7 @@ def run(
             try:
                 engine.run(tui_queue=None)
             except KeyboardInterrupt:
-                pass  # Normal exit via Ctrl+C
+                pass
             finally:
                 engine.shutdown()
                 if not as_json:
@@ -326,12 +345,8 @@ def run(
         return
 
     # Determine display mode
-    display_mode = DisplayMode(display) if display else None
+    display_mode = display
 
-    # Normal execution (with optional explain mode)
-    from pivot.tui import run as run_tui
-
-    # Disable TUI when JSON output is requested
     use_tui = run_tui.should_use_tui(display_mode) and not explain and not as_json
     if use_tui:
         results = _run_with_tui(stages_list, single_stage, cache_dir, force=force)
@@ -407,8 +422,6 @@ def explain_cmd(
     stages: tuple[str, ...], single_stage: bool, cache_dir: pathlib.Path | None, force: bool
 ) -> None:
     """Show detailed breakdown of why stages would run."""
-    from pivot.tui import console
-
     stages_list = list(stages) if stages else None
     _validate_stages(stages_list, single_stage)
 

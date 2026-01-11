@@ -5,9 +5,11 @@ import pathlib
 
 import click
 
-from pivot import discovery, exceptions, project, registry
+from pivot import exceptions, project
 from pivot import status as status_mod
 from pivot.cli import completion
+from pivot.cli import decorators as cli_decorators
+from pivot.cli import helpers as cli_helpers
 from pivot.types import (
     PipelineStatus,
     PipelineStatusInfo,
@@ -18,26 +20,7 @@ from pivot.types import (
 )
 
 
-def _ensure_stages_registered() -> None:
-    """Auto-discover and register stages if none are registered."""
-    if not discovery.has_registered_stages():
-        try:
-            discovery.discover_and_register()
-        except discovery.DiscoveryError as e:
-            raise click.ClickException(str(e)) from e
-
-
-def _validate_stages(stages_list: list[str] | None) -> None:
-    """Validate stage arguments."""
-    if stages_list:
-        graph = registry.REGISTRY.build_dag(validate=True)
-        registered = set(graph.nodes())
-        unknown = [s for s in stages_list if s not in registered]
-        if unknown:
-            raise click.ClickException(f"Unknown stage(s): {', '.join(unknown)}")
-
-
-@click.command()
+@cli_decorators.pivot_command()
 @click.argument("stages", nargs=-1, shell_complete=completion.complete_stages)
 @click.option("--verbose", "-v", is_flag=True, help="Show all stages, not just stale")
 @click.option("--json", "output_json", is_flag=True, help="Output as JSON")
@@ -57,9 +40,8 @@ def status(
     cache_dir: pathlib.Path | None,
 ) -> None:
     """Show pipeline, tracked files, and remote status."""
-    _ensure_stages_registered()
     stages_list = list(stages) if stages else None
-    _validate_stages(stages_list)
+    cli_helpers.validate_stages_exist(stages_list)
 
     project_root = project.get_project_root()
     resolved_cache_dir = cache_dir or project_root / ".pivot" / "cache"
