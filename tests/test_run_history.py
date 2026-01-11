@@ -157,6 +157,7 @@ def test_deserialize_run_manifest_invalid_status() -> None:
         "started_at": "",
         "ended_at": "",
         "targeted_stages": [],
+        "execution_order": ["my_stage"],
         "stages": {
             "my_stage": {
                 "input_hash": "abc",

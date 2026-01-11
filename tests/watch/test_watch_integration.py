@@ -26,7 +26,7 @@ import pytest
 
 import pivot
 from pivot import executor, project
-from pivot.reactive import engine
+from pivot.watch import engine
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -64,7 +64,7 @@ def run_watch_engine(
     done_event = threading.Event()
 
     def capture_execute(
-        self: engine.ReactiveEngine, stages: list[str] | None
+        self: engine.WatchEngine, stages: list[str] | None
     ) -> dict[str, ExecutionSummary]:
         executions.append(stages)
         if len(executions) >= min_executions:
@@ -72,8 +72,8 @@ def run_watch_engine(
             self.shutdown()
         return {}
 
-    with mock.patch.object(engine.ReactiveEngine, "_execute_stages", capture_execute):
-        eng = engine.ReactiveEngine(debounce_ms=debounce_ms)
+    with mock.patch.object(engine.WatchEngine, "_execute_stages", capture_execute):
+        eng = engine.WatchEngine(debounce_ms=debounce_ms)
         engine_thread = threading.Thread(target=eng.run)
         engine_thread.start()
 
@@ -98,7 +98,7 @@ def test_file_index_maps_only_dependencies(pipeline_dir: pathlib.Path) -> None:
     def process() -> None:
         pass
 
-    eng = engine.ReactiveEngine()
+    eng = engine.WatchEngine()
     index = eng._build_file_to_stages_index()
 
     input_path = project.resolve_path("input.csv")
@@ -121,7 +121,7 @@ def test_file_index_intermediate_maps_to_consumer_only(pipeline_dir: pathlib.Pat
     def stage_b() -> None:
         pass
 
-    eng = engine.ReactiveEngine()
+    eng = engine.WatchEngine()
     index = eng._build_file_to_stages_index()
 
     input_path = project.resolve_path("input.csv")
@@ -149,7 +149,7 @@ def test_change_detection_input_file_triggers_stage(pipeline_dir: pathlib.Path) 
     def process() -> None:
         pass
 
-    eng = engine.ReactiveEngine()
+    eng = engine.WatchEngine()
     changed_path = project.resolve_path("data.csv")
     affected = eng._get_stages_matching_changes({changed_path})
 
@@ -167,7 +167,7 @@ def test_change_detection_output_file_does_not_trigger_producer(
     def process() -> None:
         pass
 
-    eng = engine.ReactiveEngine()
+    eng = engine.WatchEngine()
     changed_path = project.resolve_path("output.csv")
     affected = eng._get_stages_matching_changes({changed_path})
 
@@ -189,7 +189,7 @@ def test_change_detection_intermediate_triggers_downstream_only(
     def stage_b() -> None:
         pass
 
-    eng = engine.ReactiveEngine()
+    eng = engine.WatchEngine()
     changed_path = project.resolve_path("intermediate.csv")
     directly_affected = eng._get_stages_matching_changes({changed_path})
 
@@ -218,7 +218,7 @@ def test_linear_dag_input_change_affects_all_downstream(pipeline_dir: pathlib.Pa
     def stage_c() -> None:
         pathlib.Path("c_out.txt").write_text(pathlib.Path("b_out.txt").read_text() + "?")
 
-    eng = engine.ReactiveEngine()
+    eng = engine.WatchEngine()
     changed_path = project.resolve_path("input.txt")
     directly_affected = eng._get_stages_matching_changes({changed_path})
     all_affected = eng._get_affected_stages({changed_path}, code_changed=False)
@@ -248,7 +248,7 @@ def test_linear_dag_middle_change_affects_downstream_only(pipeline_dir: pathlib.
     def stage_c() -> None:
         pass
 
-    eng = engine.ReactiveEngine()
+    eng = engine.WatchEngine()
     changed_path = project.resolve_path("b_out.txt")
     all_affected = eng._get_affected_stages({changed_path}, code_changed=False)
 
@@ -282,7 +282,7 @@ def test_fanout_dag_input_change_affects_all_branches(pipeline_dir: pathlib.Path
     def stage_d() -> None:
         pass
 
-    eng = engine.ReactiveEngine()
+    eng = engine.WatchEngine()
     changed_path = project.resolve_path("input.txt")
     all_affected = eng._get_affected_stages({changed_path}, code_changed=False)
 
@@ -308,7 +308,7 @@ def test_fanout_dag_shared_output_change_affects_all_consumers(
     def stage_c() -> None:
         pass
 
-    eng = engine.ReactiveEngine()
+    eng = engine.WatchEngine()
     changed_path = project.resolve_path("shared.txt")
     all_affected = eng._get_affected_stages({changed_path}, code_changed=False)
 
@@ -345,7 +345,7 @@ def test_fanin_dag_single_branch_change(pipeline_dir: pathlib.Path) -> None:
     def stage_d() -> None:
         pass
 
-    eng = engine.ReactiveEngine()
+    eng = engine.WatchEngine()
     changed_path = project.resolve_path("b_input.txt")
     all_affected = eng._get_affected_stages({changed_path}, code_changed=False)
 
@@ -382,7 +382,7 @@ def test_diamond_dag_root_change_affects_all(pipeline_dir: pathlib.Path) -> None
     def stage_d() -> None:
         pass
 
-    eng = engine.ReactiveEngine()
+    eng = engine.WatchEngine()
     changed_path = project.resolve_path("input.txt")
     all_affected = eng._get_affected_stages({changed_path}, code_changed=False)
 
@@ -413,7 +413,7 @@ def test_diamond_dag_branch_change_affects_branch_and_merge(
     def stage_d() -> None:
         pass
 
-    eng = engine.ReactiveEngine()
+    eng = engine.WatchEngine()
     changed_path = project.resolve_path("b_out.txt")
     all_affected = eng._get_affected_stages({changed_path}, code_changed=False)
 
@@ -625,7 +625,7 @@ def test_watch_code_change_triggers_reload_and_execution(
     done_event = threading.Event()
 
     def capture_execute(
-        self: engine.ReactiveEngine, stages: list[str] | None
+        self: engine.WatchEngine, stages: list[str] | None
     ) -> dict[str, ExecutionSummary]:
         nonlocal execution_count
         execution_count += 1
@@ -634,16 +634,16 @@ def test_watch_code_change_triggers_reload_and_execution(
             self.shutdown()
         return {}
 
-    def capture_reload(self: engine.ReactiveEngine) -> bool:
+    def capture_reload(self: engine.WatchEngine) -> bool:
         nonlocal reload_called
         reload_called = True
         return True
 
     with (
-        mock.patch.object(engine.ReactiveEngine, "_execute_stages", capture_execute),
-        mock.patch.object(engine.ReactiveEngine, "_reload_registry", capture_reload),
+        mock.patch.object(engine.WatchEngine, "_execute_stages", capture_execute),
+        mock.patch.object(engine.WatchEngine, "_reload_registry", capture_reload),
     ):
-        eng = engine.ReactiveEngine(debounce_ms=50)
+        eng = engine.WatchEngine(debounce_ms=50)
 
         engine_thread = threading.Thread(target=eng.run)
         engine_thread.start()
@@ -678,7 +678,7 @@ def test_debounce_coalesces_rapid_changes(pipeline_dir: pathlib.Path) -> None:
     done_event = threading.Event()
 
     def capture_execute(
-        self: engine.ReactiveEngine, stages: list[str] | None
+        self: engine.WatchEngine, stages: list[str] | None
     ) -> dict[str, ExecutionSummary]:
         nonlocal execution_count
         execution_count += 1
@@ -692,8 +692,8 @@ def test_debounce_coalesces_rapid_changes(pipeline_dir: pathlib.Path) -> None:
             self.shutdown()
         return {}
 
-    with mock.patch.object(engine.ReactiveEngine, "_execute_stages", capture_execute):
-        eng = engine.ReactiveEngine(debounce_ms=200)
+    with mock.patch.object(engine.WatchEngine, "_execute_stages", capture_execute):
+        eng = engine.WatchEngine(debounce_ms=200)
 
         engine_thread = threading.Thread(target=eng.run)
         engine_thread.start()
@@ -745,7 +745,7 @@ def test_specific_stages_only_runs_selected(pipeline_dir: pathlib.Path) -> None:
 
 
 def test_engine_respects_stage_filter_on_code_change(pipeline_dir: pathlib.Path) -> None:
-    """ReactiveEngine respects stage filter when code_changed=True."""
+    """WatchEngine respects stage filter when code_changed=True."""
     (pipeline_dir / "a_input.txt").write_text("a")
     (pipeline_dir / "b_input.txt").write_text("b")
 
@@ -758,7 +758,7 @@ def test_engine_respects_stage_filter_on_code_change(pipeline_dir: pathlib.Path)
         pass
 
     # Engine only watches stage_a
-    eng = engine.ReactiveEngine(stages=["stage_a"])
+    eng = engine.WatchEngine(stages=["stage_a"])
 
     # On code change, only filtered stages should be returned
     affected = eng._get_affected_stages(set(), code_changed=True)
@@ -785,7 +785,7 @@ def test_file_index_is_global_not_filtered(pipeline_dir: pathlib.Path) -> None:
         pass
 
     # Engine only watches stage_a
-    eng = engine.ReactiveEngine(stages=["stage_a"])
+    eng = engine.WatchEngine(stages=["stage_a"])
 
     # File index should still contain both stages
     index = eng._build_file_to_stages_index()
@@ -818,7 +818,7 @@ def test_stage_failure_does_not_crash_watch(pipeline_dir: pathlib.Path) -> None:
     done_event = threading.Event()
 
     def capture_execute(
-        self: engine.ReactiveEngine, stages: list[str] | None
+        self: engine.WatchEngine, stages: list[str] | None
     ) -> dict[str, ExecutionSummary]:
         nonlocal execution_count
         execution_count += 1
@@ -833,8 +833,8 @@ def test_stage_failure_does_not_crash_watch(pipeline_dir: pathlib.Path) -> None:
                 self.shutdown()
         return {}  # type: ignore[return-value] - empty dict for failure case
 
-    with mock.patch.object(engine.ReactiveEngine, "_execute_stages", capture_execute):
-        eng = engine.ReactiveEngine(debounce_ms=50)
+    with mock.patch.object(engine.WatchEngine, "_execute_stages", capture_execute):
+        eng = engine.WatchEngine(debounce_ms=50)
 
         engine_thread = threading.Thread(target=eng.run)
         engine_thread.start()

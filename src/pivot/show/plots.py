@@ -30,7 +30,7 @@ class PlotDiffEntry(TypedDict):
     path: str
     old_hash: str | None
     new_hash: str | None
-    change: ChangeType
+    change_type: ChangeType
 
 
 def collect_plots_from_stages() -> list[PlotInfo]:
@@ -162,19 +162,19 @@ def diff_plots(
             if new_hash is not None:
                 diffs.append(
                     PlotDiffEntry(
-                        path=path, old_hash=None, new_hash=new_hash, change=ChangeType.ADDED
+                        path=path, old_hash=None, new_hash=new_hash, change_type=ChangeType.ADDED
                     )
                 )
         elif path not in new or new_hash is None:
             diffs.append(
                 PlotDiffEntry(
-                    path=path, old_hash=old_hash, new_hash=None, change=ChangeType.REMOVED
+                    path=path, old_hash=old_hash, new_hash=None, change_type=ChangeType.REMOVED
                 )
             )
         elif old_hash != new_hash:
             diffs.append(
                 PlotDiffEntry(
-                    path=path, old_hash=old_hash, new_hash=new_hash, change=ChangeType.MODIFIED
+                    path=path, old_hash=old_hash, new_hash=new_hash, change_type=ChangeType.MODIFIED
                 )
             )
 
@@ -194,7 +194,7 @@ def format_diff_table(
     for diff in diffs:
         old_str = "-" if diff["old_hash"] is None else diff["old_hash"][:8]
         new_str = "-" if diff["new_hash"] is None else diff["new_hash"][:8]
-        row = [old_str, new_str, diff["change"]]
+        row = [old_str, new_str, diff["change_type"]]
         if show_path:
             row.insert(0, diff["path"])
         rows.append(row)

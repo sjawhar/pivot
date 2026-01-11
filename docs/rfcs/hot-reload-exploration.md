@@ -9,7 +9,7 @@ Explore whether `importlib.reload()` can be used to handle code changes faster t
 
 ## Context
 
-The reactive execution engine (see related issue) uses **worker restart** when Python code changes:
+The watch execution engine (see related issue) uses **worker restart** when Python code changes:
 
 ```python
 loky.get_reusable_executor(kill_workers=True)
@@ -221,7 +221,7 @@ Hot reload should only be implemented if:
 
 ## Related
 
-- #109 - Reactive Execution Engine (main issue)
+- #109 - Watch Execution Engine (main issue)
 - #102 - `--force` flag
 
 ## References

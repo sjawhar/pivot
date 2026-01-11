@@ -194,7 +194,7 @@ def _run_watch_with_tui(
     import loky
 
     from pivot import dag
-    from pivot import reactive as reactive_module
+    from pivot import watch as watch_module
     from pivot.tui import run as run_tui
     from pivot.types import TuiMessage
 
@@ -225,7 +225,7 @@ def _run_watch_with_tui(
     tui_queue: mp.Queue[TuiMessage] = manager.Queue()  # pyright: ignore[reportAssignmentType]
     output_queue: mp.Queue[OutputMessage] = manager.Queue()  # pyright: ignore[reportAssignmentType]
 
-    engine = reactive_module.ReactiveEngine(
+    engine = watch_module.WatchEngine(
         stages=stages_list,
         single_stage=single_stage,
         cache_dir=cache_dir,
@@ -432,9 +432,9 @@ def run(
             except KeyboardInterrupt:
                 click.echo("\nWatch mode stopped.")
         else:
-            from pivot import reactive as reactive_module
+            from pivot import watch as watch_module
 
-            engine = reactive_module.ReactiveEngine(
+            engine = watch_module.WatchEngine(
                 stages=stages_list,
                 single_stage=single_stage,
                 cache_dir=cache_dir,

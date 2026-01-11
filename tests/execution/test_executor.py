@@ -1208,6 +1208,7 @@ def test_executor_lock_file_missing_outs_triggers_rerun(pipeline_dir: pathlib.Pa
                 "code_manifest": {},
                 "params": {},
                 "deps": [],
+                "dep_generations": {},
                 # No outs - incomplete lock
             }
         )

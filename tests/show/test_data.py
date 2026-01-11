@@ -1268,10 +1268,14 @@ def test_get_data_hashes_from_head(tmp_path: Path, monkeypatch: pytest.MonkeyPat
 
     # Mock git.read_files_from_head to return a lock file
     lock_content = """
-fingerprint: abc123
+code_manifest:
+  func:main: abc123
+params: {}
+deps: []
 outs:
   - path: output.csv
     hash: deadbeef
+dep_generations: {}
 """
 
     def mock_read_files(paths: list[str]) -> dict[str, str | None]:

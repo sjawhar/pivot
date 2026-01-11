@@ -3,6 +3,30 @@ from __future__ import annotations
 import enum
 from typing import Any, Literal, NotRequired, TypedDict
 
+# =============================================================================
+# Execution Types
+# =============================================================================
+#
+# These types define how stages execute and report their status.
+#
+# Stage Result Types (multiple types exist for different contexts):
+#
+#   StageResult       Worker → Executor communication. Contains output_lines
+#                     for real-time streaming and optional timing metrics.
+#                     Used internally by the ProcessPoolExecutor.
+#
+#   ExecutionSummary  Public API return from executor.run(). Simplified view
+#                     with just status and reason per stage. Defined in
+#                     executor/core.py to keep executor types together.
+#
+#   StageRunRecord    Historical record in LMDB. Stores input_hash for cache
+#                     lookups and duration_ms for performance tracking.
+#                     Defined in run_history.py.
+#
+#   WatchStageResult  JSON output for watch mode (--json flag). Uses string
+#                     status for clean serialization. See Watch Types below.
+#
+
 
 class StageStatus(enum.StrEnum):
     """Status of a stage in the execution plan."""
@@ -41,6 +65,25 @@ class StageResult(TypedDict):
     metrics: NotRequired[list[tuple[str, float]]]  # (name, duration_ms) for cross-process
 
 
+# =============================================================================
+# Hash Types
+# =============================================================================
+#
+# Content-addressable hashes for files and directories. Used throughout
+# the caching system to detect changes and identify cached artifacts.
+#
+#   FileHash          Simple {hash: str} for individual files.
+#
+#   DirHash           Tree hash with manifest listing all files. The manifest
+#                     enables incremental sync (only transfer changed files).
+#
+#   HashInfo          Union type for non-null hashes (files or directories).
+#
+#   OutputHash        Nullable variant for lock files. None means the output
+#                     exists but wasn't cached (e.g., cache: false in YAML).
+#
+
+
 class FileHash(TypedDict):
     """Hash info for a single file."""
 
@@ -53,7 +96,7 @@ class DirManifestEntry(TypedDict):
     relpath: str
     hash: str
     size: int
-    isexec: NotRequired[bool]
+    isexec: bool
 
 
 class DirHash(TypedDict):
@@ -63,16 +106,10 @@ class DirHash(TypedDict):
     manifest: list[DirManifestEntry]
 
 
-# Non-null hash for computed hashes (from hash_dependencies, save_to_cache)
 HashInfo = FileHash | DirHash
-
-# Nullable hash for lock file storage (may be None for uncached outputs)
 OutputHash = FileHash | DirHash | None
 
-# Metric values are JSON primitives after flattening (nested dicts become dot-separated keys)
 MetricValue = str | int | float | bool | None
-
-# Flattened metric data: {key: value} where keys are dot-separated paths
 MetricData = dict[str, MetricValue]
 
 
@@ -83,13 +120,32 @@ class OutputFormat(enum.StrEnum):
     MD = "md"
 
 
+# =============================================================================
+# Lock File Types
+# =============================================================================
+#
+# Per-stage .lock files track what was used in the last successful run.
+# Comparing current state to lock data determines if a stage needs re-run.
+#
+# Two representations exist for different purposes:
+#
+#   StorageLockData   On-disk YAML format. Uses relative paths (portable across
+#                     machines) and list-based deps/outs (stable YAML output).
+#
+#   LockData          In-memory format. Uses absolute paths (fast comparisons)
+#                     and dict-based deps/outs (O(1) lookups by path).
+#
+# Conversion happens at read/write time in storage/lock.py.
+#
+
+
 class DepEntry(TypedDict):
     """Entry in deps list for lock file storage."""
 
     path: str
     hash: str
     size: NotRequired[int]
-    manifest: NotRequired[list[DirManifestEntry]]  # For directories
+    manifest: NotRequired[list[DirManifestEntry]]
 
 
 class OutEntry(TypedDict):
@@ -98,10 +154,10 @@ class OutEntry(TypedDict):
     path: str
     hash: str | None  # None for uncached outputs
     size: NotRequired[int]
-    manifest: NotRequired[list[DirManifestEntry]]  # For directories
+    manifest: NotRequired[list[DirManifestEntry]]
 
 
-class StorageLockData(TypedDict, total=False):
+class StorageLockData(TypedDict):
     """Storage format for lock files (list-based, relative paths)."""
 
     code_manifest: dict[str, str]
@@ -123,8 +179,16 @@ class LockData(TypedDict):
     dep_generations: dict[str, int]
 
 
-# Type alias for output queue messages: (stage_name, line, is_stderr) or None for shutdown
 OutputMessage = tuple[str, str, bool] | None
+
+
+# =============================================================================
+# Change Detection Types
+# =============================================================================
+#
+# Used by `pivot explain` to show exactly what changed since the last run.
+# Each change type tracks old/new values to help debug unexpected re-runs.
+#
 
 
 class ChangeType(enum.StrEnum):
@@ -177,14 +241,16 @@ class StageExplanation(TypedDict):
 
     stage_name: str
     will_run: bool
-    is_forced: bool  # True if stage is forced to run regardless of changes
-    reason: str  # High-level: "Code changed", "No previous run", "forced", etc.
+    is_forced: bool
+    reason: str  # "Code changed", "No previous run", "forced", etc.
     code_changes: list[CodeChange]
     param_changes: list[ParamChange]
     dep_changes: list[DepChange]
 
 
-# Remote cache types
+# =============================================================================
+# Remote Cache Types
+# =============================================================================
 
 
 class TransferResult(TypedDict):
@@ -324,6 +390,13 @@ class DataDiffResult(TypedDict):
 # =============================================================================
 # TUI Message Types
 # =============================================================================
+#
+# Messages sent from executor/watch engine to the Textual TUI for display.
+# Sent via multiprocessing.Queue for cross-process communication.
+#
+# Message flow:
+#   Worker process → Queue → TUI event loop → Rich panel update
+#
 
 
 class DisplayMode(enum.StrEnum):
@@ -338,12 +411,12 @@ class TuiMessageType(enum.StrEnum):
 
     LOG = "log"
     STATUS = "status"
-    REACTIVE = "reactive"
+    WATCH = "watch"
     RELOAD = "reload"
 
 
-class ReactiveStatus(enum.StrEnum):
-    """Status of the reactive engine."""
+class WatchStatus(enum.StrEnum):
+    """Status of the watch engine."""
 
     WAITING = "waiting"
     RESTARTING = "restarting"
@@ -373,11 +446,11 @@ class TuiStatusMessage(TypedDict):
     elapsed: float | None
 
 
-class TuiReactiveMessage(TypedDict):
-    """Reactive engine status update for TUI display."""
+class TuiWatchMessage(TypedDict):
+    """Watch engine status update for TUI display."""
 
-    type: Literal[TuiMessageType.REACTIVE]
-    status: ReactiveStatus
+    type: Literal[TuiMessageType.WATCH]
+    status: WatchStatus
     message: str
 
 
@@ -388,16 +461,27 @@ class TuiReloadMessage(TypedDict):
     stages: list[str]
 
 
-TuiMessage = TuiLogMessage | TuiStatusMessage | TuiReactiveMessage | TuiReloadMessage | None
+TuiMessage = TuiLogMessage | TuiStatusMessage | TuiWatchMessage | TuiReloadMessage | None
 
 
 # =============================================================================
-# Reactive JSONL Event Types (for --json output)
+# Watch Mode JSONL Events (--json output)
 # =============================================================================
+#
+# Structured events emitted by `pivot run --watch --json` for programmatic
+# consumption. Each line is a complete JSON object (JSONL format).
+#
+# Event sequence during watch:
+#   1. WatchStatusEvent      "Watching for changes..."
+#   2. WatchFilesChangedEvent   Files that triggered re-run
+#   3. WatchAffectedStagesEvent Stages that will execute
+#   4. WatchExecutionResultEvent   Results of each stage
+#   ... (repeat from step 1)
+#
 
 
-class ReactiveEventType(enum.StrEnum):
-    """Type of reactive JSONL event."""
+class WatchEventType(enum.StrEnum):
+    """Type of watch mode JSONL event."""
 
     STATUS = "status"
     FILES_CHANGED = "files_changed"
@@ -405,47 +489,44 @@ class ReactiveEventType(enum.StrEnum):
     EXECUTION_RESULT = "execution_result"
 
 
-class ReactiveStatusEvent(TypedDict):
+class WatchStatusEvent(TypedDict):
     """Status message event."""
 
-    type: Literal[ReactiveEventType.STATUS]
+    type: Literal[WatchEventType.STATUS]
     message: str
     is_error: bool
 
 
-class ReactiveFilesChangedEvent(TypedDict):
+class WatchFilesChangedEvent(TypedDict):
     """File change detection event."""
 
-    type: Literal[ReactiveEventType.FILES_CHANGED]
+    type: Literal[WatchEventType.FILES_CHANGED]
     paths: list[str]
     code_changed: bool
 
 
-class ReactiveAffectedStagesEvent(TypedDict):
+class WatchAffectedStagesEvent(TypedDict):
     """Affected stages event."""
 
-    type: Literal[ReactiveEventType.AFFECTED_STAGES]
+    type: Literal[WatchEventType.AFFECTED_STAGES]
     stages: list[str]
     count: int
 
 
-class ReactiveStageResult(TypedDict):
-    """Result for a single stage in reactive execution."""
+class WatchStageResult(TypedDict):
+    """Result for a single stage in watch mode execution."""
 
     status: str
     reason: str
 
 
-class ReactiveExecutionResultEvent(TypedDict):
+class WatchExecutionResultEvent(TypedDict):
     """Execution result event."""
 
-    type: Literal[ReactiveEventType.EXECUTION_RESULT]
-    stages: dict[str, ReactiveStageResult]
+    type: Literal[WatchEventType.EXECUTION_RESULT]
+    stages: dict[str, WatchStageResult]
 
 
-ReactiveJsonEvent = (
-    ReactiveStatusEvent
-    | ReactiveFilesChangedEvent
-    | ReactiveAffectedStagesEvent
-    | ReactiveExecutionResultEvent
+WatchJsonEvent = (
+    WatchStatusEvent | WatchFilesChangedEvent | WatchAffectedStagesEvent | WatchExecutionResultEvent
 )

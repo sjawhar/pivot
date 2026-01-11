@@ -505,11 +505,23 @@ def test_read_empty_file_returns_none(tmp_path: Path) -> None:
     assert result is None
 
 
-def test_is_changed_with_null_values_triggers_rerun(tmp_path: Path) -> None:
-    """Lock file with null values triggers re-run (corrupted data)."""
-    stage_lock = lock.StageLock("nulls", tmp_path)
+@pytest.mark.parametrize(
+    ("missing_key", "lock_content"),
+    [
+        ("code_manifest", "params: {}\ndeps: []\nouts: []\ndep_generations: {}\n"),
+        ("params", "code_manifest: {}\ndeps: []\nouts: []\ndep_generations: {}\n"),
+        ("deps", "code_manifest: {}\nparams: {}\nouts: []\ndep_generations: {}\n"),
+        ("outs", "code_manifest: {}\nparams: {}\ndeps: []\ndep_generations: {}\n"),
+        ("dep_generations", "code_manifest: {}\nparams: {}\ndeps: []\nouts: []\n"),
+    ],
+)
+def test_is_changed_with_missing_required_key_triggers_rerun(
+    tmp_path: Path, missing_key: str, lock_content: str
+) -> None:
+    """Lock file missing any required key triggers re-run."""
+    stage_lock = lock.StageLock("missing", tmp_path)
     stage_lock.path.parent.mkdir(parents=True, exist_ok=True)
-    stage_lock.path.write_text("code_manifest: null\nparams: null\ndeps: null\nouts: null\n")
+    stage_lock.path.write_text(lock_content)
 
     changed, reason = stage_lock.is_changed(
         current_fingerprint={},
@@ -517,6 +529,42 @@ def test_is_changed_with_null_values_triggers_rerun(tmp_path: Path) -> None:
         dep_hashes={},
     )
 
-    # Null values are not valid - triggers re-run (read() returns None, treated as no previous run)
+    # Missing required key - read() returns None, treated as no previous run
+    assert changed is True, f"Missing {missing_key} should trigger re-run"
+    assert "no previous run" in reason.lower()
+
+
+def test_is_changed_with_null_values_triggers_rerun(tmp_path: Path) -> None:
+    """Lock file with null values triggers re-run (corrupted data)."""
+    stage_lock = lock.StageLock("nulls", tmp_path)
+    stage_lock.path.parent.mkdir(parents=True, exist_ok=True)
+    # All required keys present but with null values
+    stage_lock.path.write_text(
+        "code_manifest: null\nparams: null\ndeps: null\nouts: null\ndep_generations: null\n"
+    )
+
+    changed, reason = stage_lock.is_changed(
+        current_fingerprint={},
+        current_params={},
+        dep_hashes={},
+    )
+
+    # Null values are not valid - read() returns None, treated as no previous run
     assert changed is True
     assert "no previous run" in reason.lower()
+
+
+def test_read_lock_with_extra_keys_accepted(tmp_path: Path) -> None:
+    """Lock files with extra keys (forward compatibility) are accepted."""
+    stage_lock = lock.StageLock("future", tmp_path)
+    stage_lock.path.parent.mkdir(parents=True, exist_ok=True)
+    stage_lock.path.write_text(
+        "code_manifest: {}\nparams: {}\ndeps: []\nouts: []\n"
+        + "dep_generations: {}\nfuture_key: some_value\nanother_new_field: 123\n"
+    )
+
+    result = stage_lock.read()
+
+    assert result is not None
+    assert result["code_manifest"] == {}
+    assert result["params"] == {}

@@ -1,11 +1,11 @@
-# RFC: Reactive Execution Engine
+# RFC: Watch Execution Engine
 
-> **GitHub Issue Title:** Reactive Execution Engine
+> **GitHub Issue Title:** Watch Execution Engine
 > **Labels:** `enhancement`, `architecture`
 
 ## Summary
 
-Replace the current separate watch mode with a unified reactive execution engine that continuously monitors all pipeline dependencies and automatically triggers stage re-execution when changes are detected.
+Replace the current separate watch mode with a unified watch execution engine that continuously monitors all pipeline dependencies and automatically triggers stage re-execution when changes are detected.
 
 ## Motivation
 
@@ -14,7 +14,7 @@ The current watch mode (`pivot run --watch`) works but has limitations:
 - Full pipeline re-run on any change
 - No TUI integration for live status
 
-A reactive engine provides:
+A watch engine provides:
 - Seamless development experience
 - Only affected stages re-run
 - Live TUI showing pipeline state
@@ -24,7 +24,7 @@ A reactive engine provides:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                         REACTIVE ENGINE                              │
+│                          WATCH ENGINE                                │
 ├─────────────────────────────────────────────────────────────────────┤
 │                                                                      │
 │  ┌──────────────────┐                                               │
@@ -131,31 +131,31 @@ Filter all registered stage outputs from watcher to prevent infinite loops.
 ## Implementation Plan
 
 ### Phase 1: Core Engine
-- [ ] Create `src/pivot/reactive/` module structure
-- [ ] Implement `ReactiveEngine` class with watcher thread
-- [ ] Implement bounded queue with coalescing
-- [ ] Implement coordinator loop with debouncing
-- [ ] Add worker pool restart on code changes
+- [x] Create `src/pivot/watch/` module structure
+- [x] Implement `WatchEngine` class with watcher thread
+- [x] Implement bounded queue with coalescing
+- [x] Implement coordinator loop with debouncing
+- [x] Add worker pool restart on code changes
 
 ### Phase 2: Change Detection
-- [ ] Determine affected stages from changed paths
-- [ ] Recompute fingerprints after worker restart
-- [ ] Output filtering (prevent loops)
+- [x] Determine affected stages from changed paths
+- [x] Recompute fingerprints after worker restart
+- [x] Output filtering (prevent loops)
 
 ### Phase 3: Error Handling
-- [ ] Display execution errors without stopping reactive loop
-- [ ] Handle invalid pipeline (syntax errors, circular dependencies)
-- [ ] Show error in TUI, keep last valid state, wait for fix
+- [x] Display execution errors without stopping watch loop
+- [x] Handle invalid pipeline (syntax errors, circular dependencies)
+- [x] Show error in TUI, keep last valid state, wait for fix
 
 ### Phase 4: TUI Integration
-- [ ] Live status display (stages, states)
-- [ ] Keyboard shortcuts (`f` force run, `q` quit)
-- [ ] Error overlay for pipeline errors
+- [x] Live status display (stages, states)
+- [x] Keyboard shortcuts (`f` force run, `q` quit)
+- [x] Error overlay for pipeline errors
 
 ### Phase 5: Polish
-- [ ] Graceful shutdown (stop_event for watcher)
-- [ ] Structured logging
-- [ ] Documentation
+- [x] Graceful shutdown (stop_event for watcher)
+- [x] Structured logging
+- [x] Documentation
 
 ## Edge Cases
 
@@ -170,14 +170,14 @@ Filter all registered stage outputs from watcher to prevent infinite loops.
 ## CLI Usage
 
 ```bash
-# Basic reactive mode
-pivot run --reactive
+# Basic watch mode
+pivot run --watch
 
 # With TUI (default when TTY)
-pivot run --reactive --display tui
+pivot run --watch --display tui
 
 # Plain text output
-pivot run --reactive --display plain
+pivot run --watch --display plain
 ```
 
 ## Performance Targets
@@ -191,12 +191,12 @@ pivot run --reactive --display plain
 
 ## Related Issues
 
-- #102 - `--force` flag (works with reactive mode via keyboard shortcut)
+- #102 - `--force` flag (works with watch mode via keyboard shortcut)
 - #110 - Hot Reload Exploration
 
 ## References
 
-- [Architecture doc](/docs/architecture/reactive.md)
+- [Architecture doc](/docs/architecture/watch.md)
 - [Buck2 incremental computation](https://engineering.fb.com/2023/04/06/open-source/buck2-open-source-large-scale-build-system/)
 - [watchfiles library](https://github.com/samuelcolvin/watchfiles)
 - [loky reusable executor](https://loky.readthedocs.io/)

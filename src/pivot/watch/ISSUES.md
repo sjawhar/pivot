@@ -1,6 +1,6 @@
-# Reactive Engine - Known Issues and Improvements
+# Watch Engine - Known Issues and Improvements
 
-This file tracks non-critical issues and improvement opportunities identified during development of the reactive execution engine.
+This file tracks non-critical issues and improvement opportunities identified during development of the watch execution engine.
 
 ## Low Severity
 
@@ -71,4 +71,4 @@ Currently, external modifications to intermediate files (e.g., `clean.csv` which
 2. **State-based filtering**: Use permissive filter during "waiting" state, restrictive filter during "running" state
 3. **Content-based**: Track file hashes before/after execution, only trigger on external changes
 
-**Test case:** `test_get_affected_stages_includes_downstream_when_intermediate_file_changes` in `tests/reactive/test_engine.py` verifies the core logic works correctly - the issue is at the watcher filter level.
+**Test case:** `test_get_affected_stages_includes_downstream_when_intermediate_file_changes` in `tests/watch/test_engine.py` verifies the core logic works correctly - the issue is at the watcher filter level.

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 import tabulate
 import yaml
 
 from pivot import git, yaml_config
+from pivot.storage import lock
 from pivot.types import ChangeType, OutputFormat, StorageLockData
 
 if TYPE_CHECKING:
@@ -40,12 +41,11 @@ def read_lock_files_from_head(
             result[stage_name] = None
             continue
 
-        if not isinstance(data, dict):
+        if not lock.is_lock_data(data):
             result[stage_name] = None
             continue
 
-        # YAML parse result is dict[Unknown, Unknown]; cast through object to StorageLockData
-        result[stage_name] = cast("StorageLockData", cast("object", data))
+        result[stage_name] = data
 
     return result
 
@@ -54,15 +54,7 @@ def extract_output_hashes_from_lock(
     lock_data: StorageLockData,
 ) -> dict[str, str | None]:
     """Extract path -> hash mapping from lock data 'outs' field."""
-    if "outs" not in lock_data:
-        return {}
-
-    outs_list = lock_data["outs"]
-    result = dict[str, str | None]()
-    for out in outs_list:
-        if "path" in out:
-            result[out["path"]] = out["hash"]
-    return result
+    return {out["path"]: out["hash"] for out in lock_data["outs"]}
 
 
 def format_table(

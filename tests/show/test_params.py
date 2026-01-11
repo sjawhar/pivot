@@ -15,6 +15,8 @@ if TYPE_CHECKING:
 
     from pytest_mock import MockerFixture
 
+    from tests.conftest import ValidLockContentFactory
+
 
 # =============================================================================
 # collect_params_from_stages Tests
@@ -141,6 +143,7 @@ def test_get_params_from_head_no_stages(set_project_root: Path) -> None:
 def test_get_params_from_head_with_lock_file(
     set_project_root: Path,
     mocker: MockerFixture,
+    make_valid_lock_content: ValidLockContentFactory,
 ) -> None:
     """Returns params from lock file at HEAD."""
     from pivot import git, registry
@@ -153,7 +156,7 @@ def test_get_params_from_head_with_lock_file(
 
     registry.REGISTRY.register(_stage, name="train", params=MyParams())
 
-    lock_content = yaml.dump({"params": {"lr": 0.05, "epochs": 10}})
+    lock_content = yaml.dump(make_valid_lock_content(params={"lr": 0.05, "epochs": 10}))
     mocker.patch.object(
         git,
         "read_files_from_head",
@@ -294,6 +297,7 @@ def test_get_params_from_head_empty_params(
 def test_get_params_from_head_filters_by_stage_names(
     set_project_root: Path,
     mocker: MockerFixture,
+    make_valid_lock_content: ValidLockContentFactory,
 ) -> None:
     """Filters to specific stage names."""
     from pivot import git, registry
@@ -310,8 +314,8 @@ def test_get_params_from_head_filters_by_stage_names(
     registry.REGISTRY.register(_func_a, name="stage_a", params=Params())
     registry.REGISTRY.register(_func_b, name="stage_b", params=Params())
 
-    lock_a = yaml.dump({"params": {"value": 1}})
-    lock_b = yaml.dump({"params": {"value": 2}})
+    lock_a = yaml.dump(make_valid_lock_content(params={"value": 1}))
+    lock_b = yaml.dump(make_valid_lock_content(params={"value": 2}))
     mocker.patch.object(
         git,
         "read_files_from_head",
@@ -350,7 +354,7 @@ def test_diff_params_modified() -> None:
     result = params.diff_params(old, new)
 
     assert len(result) == 1
-    assert result[0]["change"] == "modified"
+    assert result[0]["change_type"] == "modified"
     assert result[0]["stage"] == "train"
     assert result[0]["key"] == "lr"
     assert result[0]["old"] == 0.01
@@ -365,7 +369,7 @@ def test_diff_params_added() -> None:
     result = params.diff_params(old, new)
 
     assert len(result) == 1
-    assert result[0]["change"] == "added"
+    assert result[0]["change_type"] == "added"
     assert result[0]["key"] == "epochs"
     assert result[0]["old"] is None
     assert result[0]["new"] == 10
@@ -379,7 +383,7 @@ def test_diff_params_removed() -> None:
     result = params.diff_params(old, new)
 
     assert len(result) == 1
-    assert result[0]["change"] == "removed"
+    assert result[0]["change_type"] == "removed"
     assert result[0]["key"] == "epochs"
     assert result[0]["old"] == 10
     assert result[0]["new"] is None
@@ -393,7 +397,7 @@ def test_diff_params_new_stage() -> None:
     result = params.diff_params(old, new)
 
     assert len(result) == 1
-    assert result[0]["change"] == "added"
+    assert result[0]["change_type"] == "added"
     assert result[0]["stage"] == "train"
 
 
@@ -405,7 +409,7 @@ def test_diff_params_removed_stage() -> None:
     result = params.diff_params(old, new)
 
     assert len(result) == 1
-    assert result[0]["change"] == "removed"
+    assert result[0]["change_type"] == "removed"
     assert result[0]["stage"] == "train"
 
 
@@ -421,7 +425,7 @@ def test_diff_params_nested_values() -> None:
     result = params.diff_params(old, new)
 
     assert len(result) == 1
-    assert result[0]["change"] == "modified"
+    assert result[0]["change_type"] == "modified"
     assert result[0]["key"] == "optimizer"
 
 
@@ -444,7 +448,7 @@ def test_diff_params_list_values() -> None:
     result = params.diff_params(old, new)
 
     assert len(result) == 1
-    assert result[0]["change"] == "modified"
+    assert result[0]["change_type"] == "modified"
     assert result[0]["old"] == [64, 32, 16]
     assert result[0]["new"] == [128, 64, 32]
 
@@ -527,7 +531,9 @@ def test_format_params_table_empty() -> None:
 def test_format_diff_table_plain() -> None:
     """Plain format for diff."""
     diffs = [
-        params.ParamDiff(stage="train", key="lr", old=0.01, new=0.05, change=ChangeType.MODIFIED)
+        params.ParamDiff(
+            stage="train", key="lr", old=0.01, new=0.05, change_type=ChangeType.MODIFIED
+        )
     ]
 
     result = params.format_diff_table(diffs, None, precision=2)
@@ -547,20 +553,24 @@ def test_format_diff_table_empty() -> None:
 def test_format_diff_table_json() -> None:
     """JSON format for diff."""
     diffs = [
-        params.ParamDiff(stage="train", key="lr", old=0.01, new=0.05, change=ChangeType.MODIFIED)
+        params.ParamDiff(
+            stage="train", key="lr", old=0.01, new=0.05, change_type=ChangeType.MODIFIED
+        )
     ]
 
     result = params.format_diff_table(diffs, OutputFormat.JSON, precision=2)
 
     parsed = json.loads(result)
     assert len(parsed) == 1
-    assert parsed[0]["change"] == "modified"
+    assert parsed[0]["change_type"] == "modified"
 
 
 def test_format_diff_table_markdown() -> None:
     """Markdown format for diff."""
     diffs = [
-        params.ParamDiff(stage="train", key="lr", old=0.01, new=0.05, change=ChangeType.MODIFIED)
+        params.ParamDiff(
+            stage="train", key="lr", old=0.01, new=0.05, change_type=ChangeType.MODIFIED
+        )
     ]
 
     result = params.format_diff_table(diffs, OutputFormat.MD, precision=2)
@@ -638,7 +648,11 @@ def test_format_diff_table_json_with_precision() -> None:
     """JSON diff format respects precision for floats."""
     diffs = [
         params.ParamDiff(
-            stage="train", key="lr", old=0.123456789, new=0.987654321, change=ChangeType.MODIFIED
+            stage="train",
+            key="lr",
+            old=0.123456789,
+            new=0.987654321,
+            change_type=ChangeType.MODIFIED,
         )
     ]
 

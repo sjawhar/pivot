@@ -217,8 +217,8 @@ def test_hash_directory_marks_executable(tmp_path: pathlib.Path) -> None:
     _, manifest = cache.hash_directory(test_dir)
 
     manifest_dict = {e["relpath"]: e for e in manifest}
-    assert "isexec" not in manifest_dict["regular.txt"]
-    assert manifest_dict["script.sh"].get("isexec") is True
+    assert manifest_dict["regular.txt"]["isexec"] is False
+    assert manifest_dict["script.sh"]["isexec"] is True
 
 
 def test_hash_directory_skips_unreadable_subdirs(tmp_path: pathlib.Path) -> None:

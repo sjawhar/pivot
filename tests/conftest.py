@@ -98,3 +98,28 @@ def cleanup_worker_pool() -> Generator[None]:
     """Kill loky worker pool at end of test session to prevent orphaned workers."""
     yield
     executor_core._cleanup_worker_pool()
+
+
+# Type alias for make_valid_lock_content fixture
+ValidLockContentFactory = Callable[..., dict[str, object]]
+
+
+@pytest.fixture
+def make_valid_lock_content() -> ValidLockContentFactory:
+    """Factory fixture for creating valid lock file data with all required fields."""
+
+    def _factory(
+        code_manifest: dict[str, str] | None = None,
+        params: dict[str, object] | None = None,
+        deps: list[dict[str, object]] | None = None,
+        outs: list[dict[str, object]] | None = None,
+    ) -> dict[str, object]:
+        return {
+            "code_manifest": code_manifest or {},
+            "params": params or {},
+            "deps": deps or [],
+            "outs": outs or [],
+            "dep_generations": {},
+        }
+
+    return _factory

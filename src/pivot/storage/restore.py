@@ -69,14 +69,8 @@ def _parse_yaml_bytes[T](
 
 
 def _parse_lock_data_from_bytes(content: bytes) -> StorageLockData | None:
-    """Parse lock file content from bytes. Requires 'outs' key for get operations."""
-    data = _parse_yaml_bytes(content, lock.is_lock_data)
-    if data is None:
-        return None
-    # pivot get requires outs to know what to restore
-    if "outs" not in data:
-        return None
-    return data
+    """Parse lock file content from bytes."""
+    return _parse_yaml_bytes(content, lock.is_lock_data)
 
 
 def _parse_pvt_data_from_bytes(content: bytes) -> PvtData | None:

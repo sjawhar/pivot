@@ -141,9 +141,8 @@ def hash_directory(
                     "relpath": str(rel),
                     "hash": hash_file(file_path, state_db),
                     "size": file_stat.st_size,
+                    "isexec": bool(file_stat.st_mode & stat.S_IXUSR),
                 }
-                if file_stat.st_mode & stat.S_IXUSR:
-                    manifest_entry["isexec"] = True
                 manifest.append(manifest_entry)
             except FileNotFoundError:
                 continue  # File deleted between scan and hash
@@ -397,7 +396,7 @@ def _save_directory_to_cache(
             file_path = path / entry["relpath"]
             cache_path = get_cache_path(cache_dir, entry["hash"])
             _checkout_with_fallback(
-                file_path, cache_path, checkout_modes, executable=entry.get("isexec", False)
+                file_path, cache_path, checkout_modes, executable=entry["isexec"]
             )
 
     return DirHash(hash=tree_hash, manifest=manifest)
@@ -477,7 +476,7 @@ def _restore_directory_from_cache(
             )
         file_path.parent.mkdir(parents=True, exist_ok=True)
         _checkout_with_fallback(
-            file_path, file_cache_path, checkout_modes, executable=entry.get("isexec", False)
+            file_path, file_cache_path, checkout_modes, executable=entry["isexec"]
         )
 
     # Ensure directories writable if COPY might have been used (could be fallback result)

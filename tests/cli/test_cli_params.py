@@ -221,7 +221,15 @@ def test_params_diff_no_changes(
 
         from pivot import git
 
-        lock_content = yaml.dump({"params": {"x": 1}})
+        lock_content = yaml.dump(
+            {
+                "code_manifest": {},
+                "params": {"x": 1},
+                "deps": [],
+                "outs": [],
+                "dep_generations": {},
+            }
+        )
         mocker.patch.object(
             git,
             "read_files_from_head",
@@ -256,7 +264,15 @@ def test_params_diff_with_changes(
 
         from pivot import git
 
-        lock_content = yaml.dump({"params": {"x": 1}})
+        lock_content = yaml.dump(
+            {
+                "code_manifest": {},
+                "params": {"x": 1},
+                "deps": [],
+                "outs": [],
+                "dep_generations": {},
+            }
+        )
         mocker.patch.object(
             git,
             "read_files_from_head",
@@ -292,7 +308,15 @@ def test_params_diff_json_format(
 
         from pivot import git
 
-        lock_content = yaml.dump({"params": {"x": 1}})
+        lock_content = yaml.dump(
+            {
+                "code_manifest": {},
+                "params": {"x": 1},
+                "deps": [],
+                "outs": [],
+                "dep_generations": {},
+            }
+        )
         mocker.patch.object(
             git,
             "read_files_from_head",
@@ -304,7 +328,7 @@ def test_params_diff_json_format(
         assert result.exit_code == 0
         parsed = json.loads(result.output)
         assert len(parsed) == 1
-        assert parsed[0]["change"] == "modified"
+        assert parsed[0]["change_type"] == "modified"
 
         REGISTRY.clear()
 
@@ -329,7 +353,15 @@ def test_params_diff_md_format(
 
         from pivot import git
 
-        lock_content = yaml.dump({"params": {"x": 1}})
+        lock_content = yaml.dump(
+            {
+                "code_manifest": {},
+                "params": {"x": 1},
+                "deps": [],
+                "outs": [],
+                "dep_generations": {},
+            }
+        )
         mocker.patch.object(
             git,
             "read_files_from_head",

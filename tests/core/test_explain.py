@@ -219,13 +219,13 @@ def test_diff_deps_directory_with_manifest() -> None:
     old: dict[str, HashInfo] = {
         "data_dir": {
             "hash": "tree_abc",
-            "manifest": [{"relpath": "a.csv", "hash": "h1", "size": 10}],
+            "manifest": [{"relpath": "a.csv", "hash": "h1", "size": 10, "isexec": False}],
         }
     }
     new: dict[str, HashInfo] = {
         "data_dir": {
             "hash": "tree_def",
-            "manifest": [{"relpath": "a.csv", "hash": "h2", "size": 10}],
+            "manifest": [{"relpath": "a.csv", "hash": "h2", "size": 10, "isexec": False}],
         }
     }
 
