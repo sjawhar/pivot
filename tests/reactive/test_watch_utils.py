@@ -104,86 +104,8 @@ def test_collect_watch_paths_handles_nonexistent_deps(
 
 
 # =============================================================================
-# get_output_paths_for_stages tests
-# =============================================================================
-
-
-def test_get_output_paths_for_stages_returns_outputs(
-    set_project_root: pathlib.Path,
-) -> None:
-    """Should return output paths for specified stages."""
-    output_file = set_project_root / "output.txt"
-
-    registry.REGISTRY.register(
-        _noop,
-        name="my_stage",
-        deps=[],
-        outs=[str(output_file)],
-    )
-
-    result = _watch_utils.get_output_paths_for_stages(["my_stage"])
-
-    assert str(output_file) in result
-
-
-def test_get_output_paths_for_stages_skips_unknown(
-    set_project_root: pathlib.Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    """Should skip unknown stages with warning."""
-    result = _watch_utils.get_output_paths_for_stages(["nonexistent_stage"])
-
-    assert result == set()
-    assert "not found" in caplog.text
-
-
-def test_get_output_paths_for_stages_multiple_stages(
-    set_project_root: pathlib.Path,
-) -> None:
-    """Should collect outputs from multiple stages."""
-    output1 = set_project_root / "output1.txt"
-    output2 = set_project_root / "output2.txt"
-
-    registry.REGISTRY.register(_noop, name="stage1", deps=[], outs=[str(output1)])
-    registry.REGISTRY.register(_noop, name="stage2", deps=[], outs=[str(output2)])
-
-    result = _watch_utils.get_output_paths_for_stages(["stage1", "stage2"])
-
-    assert str(output1) in result
-    assert str(output2) in result
-
-
-# =============================================================================
 # create_watch_filter tests
 # =============================================================================
-
-
-def test_create_watch_filter_excludes_outputs(
-    set_project_root: pathlib.Path,
-) -> None:
-    """Should filter out output files of watched stages."""
-    output_file = set_project_root / "output.txt"
-    output_file.write_text("data")
-
-    registry.REGISTRY.register(_noop, name="my_stage", deps=[], outs=[str(output_file)])
-
-    watch_filter = _watch_utils.create_watch_filter(["my_stage"])
-
-    assert watch_filter(Change.modified, str(output_file)) is False
-
-
-def test_create_watch_filter_allows_non_outputs(
-    set_project_root: pathlib.Path,
-) -> None:
-    """Should allow files that are not stage outputs."""
-    output_file = set_project_root / "output.txt"
-    other_file = set_project_root / "other.txt"
-    other_file.write_text("data")
-
-    registry.REGISTRY.register(_noop, name="my_stage", deps=[], outs=[str(output_file)])
-
-    watch_filter = _watch_utils.create_watch_filter(["my_stage"])
-
-    assert watch_filter(Change.modified, str(other_file)) is True
 
 
 @pytest.mark.parametrize(
@@ -194,36 +116,28 @@ def test_create_watch_filter_allows_non_outputs(
         pytest.param("__pycache__/module.pyc", id="pycache_dir"),
     ],
 )
-def test_create_watch_filter_excludes_python_bytecode(
-    set_project_root: pathlib.Path, path: str
-) -> None:
+def test_create_watch_filter_excludes_python_bytecode(path: str) -> None:
     """Should filter out .pyc files and __pycache__ directories."""
-    watch_filter = _watch_utils.create_watch_filter([])
+    watch_filter = _watch_utils.create_watch_filter()
 
     assert watch_filter(Change.modified, path) is False
 
 
-def test_create_watch_filter_excludes_files_in_output_directories(
+def test_create_watch_filter_allows_regular_files(
     set_project_root: pathlib.Path,
 ) -> None:
-    """Should filter out files inside output directories."""
-    output_dir = set_project_root / "output_dir"
-    output_dir.mkdir()
-    file_in_output = output_dir / "file.txt"
-    file_in_output.write_text("data")
+    """Should allow regular files (outputs not filtered - handled by file index)."""
+    some_file = set_project_root / "some_file.txt"
+    some_file.write_text("data")
 
-    registry.REGISTRY.register(_noop, name="my_stage", deps=[], outs=[str(output_dir)])
+    watch_filter = _watch_utils.create_watch_filter()
 
-    watch_filter = _watch_utils.create_watch_filter(["my_stage"])
-
-    assert watch_filter(Change.modified, str(file_in_output)) is False
+    assert watch_filter(Change.modified, str(some_file)) is True
 
 
-def test_create_watch_filter_allows_unresolvable_paths(
-    set_project_root: pathlib.Path,
-) -> None:
+def test_create_watch_filter_allows_unresolvable_paths() -> None:
     """Should allow paths that can't be resolved."""
-    watch_filter = _watch_utils.create_watch_filter([])
+    watch_filter = _watch_utils.create_watch_filter()
 
     # Path that doesn't exist and can't be resolved
     assert watch_filter(Change.added, "/nonexistent/path/file.txt") is True
@@ -238,7 +152,7 @@ def test_create_watch_filter_with_glob_patterns(
     py_file.write_text("# code")
     txt_file.write_text("data")
 
-    watch_filter = _watch_utils.create_watch_filter([], watch_globs=["*.py"])
+    watch_filter = _watch_utils.create_watch_filter(watch_globs=["*.py"])
 
     assert watch_filter(Change.modified, str(py_file)) is True
     assert watch_filter(Change.modified, str(txt_file)) is False
@@ -253,7 +167,7 @@ def test_create_watch_filter_glob_matches_full_path_pattern(
     nested_file.write_text("# code")
 
     # Use pattern that matches full path (fnmatch doesn't support **)
-    watch_filter = _watch_utils.create_watch_filter([], watch_globs=["*/src/*.py"])
+    watch_filter = _watch_utils.create_watch_filter(watch_globs=["*/src/*.py"])
 
     assert watch_filter(Change.modified, str(nested_file)) is True
 
@@ -265,41 +179,31 @@ def test_create_watch_filter_glob_with_no_match(
     csv_file = set_project_root / "data.csv"
     csv_file.write_text("x,y\n1,2")
 
-    watch_filter = _watch_utils.create_watch_filter([], watch_globs=["*.py"])
+    watch_filter = _watch_utils.create_watch_filter(watch_globs=["*.py"])
 
     assert watch_filter(Change.modified, str(csv_file)) is False
 
 
-def test_create_watch_filter_filters_all_outputs_including_intermediate(
+# =============================================================================
+# Output filtering behavior (for documentation)
+# =============================================================================
+
+
+def test_watch_filter_does_not_filter_outputs(
     set_project_root: pathlib.Path,
 ) -> None:
-    """All outputs are filtered to prevent infinite loops, even intermediate files.
+    """Watch filter does NOT filter outputs - file index handles this naturally.
 
-    This is a known limitation: external modifications to intermediate files
-    (outputs that are also deps of downstream stages) are not detected.
-    Workaround: modify an input file to trigger a full re-run.
+    The file index only maps dependencies (inputs), not outputs. Changes to
+    output-only files don't match any stage, so they're naturally ignored.
+    This is simpler and avoids race conditions from stateful filtering.
     """
-    input_file = set_project_root / "input.csv"
-    intermediate_file = set_project_root / "intermediate.csv"
-    final_file = set_project_root / "final.csv"
+    output_file = set_project_root / "output.txt"
+    output_file.write_text("data")
 
-    input_file.write_text("a,b\n1,2")
-    intermediate_file.write_text("x,y\n3,4")
+    registry.REGISTRY.register(_noop, name="my_stage", deps=[], outs=[str(output_file)])
 
-    # stage_a produces intermediate.csv
-    registry.REGISTRY.register(
-        _noop, name="stage_a", deps=[str(input_file)], outs=[str(intermediate_file)]
-    )
-    # stage_b consumes intermediate.csv
-    registry.REGISTRY.register(
-        _noop, name="stage_b", deps=[str(intermediate_file)], outs=[str(final_file)]
-    )
+    watch_filter = _watch_utils.create_watch_filter()
 
-    watch_filter = _watch_utils.create_watch_filter(["stage_a", "stage_b"])
-
-    # Both intermediate and final outputs are filtered to prevent infinite loops
-    assert watch_filter(Change.modified, str(intermediate_file)) is False, (
-        "Intermediate outputs are filtered (known limitation)"
-    )
-    final_file.write_text("result")
-    assert watch_filter(Change.modified, str(final_file)) is False, "Terminal outputs are filtered"
+    # Filter allows output files through - they're filtered at the file index level
+    assert watch_filter(Change.modified, str(output_file)) is True

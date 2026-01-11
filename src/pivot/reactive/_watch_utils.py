@@ -32,30 +32,29 @@ def collect_watch_paths(stages: list[str]) -> list[pathlib.Path]:
     return list(paths)
 
 
-def get_output_paths_for_stages(stages: list[str]) -> set[str]:
-    """Get output paths for specific stages only."""
-    result: set[str] = set()
-    for name in stages:
-        try:
-            info = registry.REGISTRY.get(name)
-        except KeyError:
-            logger.warning(f"Stage '{name}' not found in registry, skipping")
-            continue
-        for out_path in info["outs_paths"]:
-            result.add(str(out_path))
-    return result
+def _matches_glob(resolved_path: pathlib.Path, original_path: str, watch_globs: list[str]) -> bool:
+    """Check if path matches any of the glob patterns."""
+    filename = resolved_path.name
+    return any(
+        fnmatch.fnmatch(filename, glob) or fnmatch.fnmatch(original_path, glob)
+        for glob in watch_globs
+    )
 
 
 def create_watch_filter(
-    stages_to_run: list[str],
     watch_globs: list[str] | None = None,
 ) -> Callable[[Change, str], bool]:
-    """Create filter excluding outputs from stages being run (prevents infinite loops)."""
-    outputs_to_filter: set[pathlib.Path] = set()
-    for p in get_output_paths_for_stages(stages_to_run):
-        resolved = project.try_resolve_path(p)
-        if resolved is not None:
-            outputs_to_filter.add(resolved)
+    """Create stateless filter for watch mode.
+
+    Filters:
+    - Python bytecode (.pyc, .pyo, __pycache__)
+    - Files not matching watch_globs (if specified)
+
+    Output filtering is NOT done here - it's handled naturally by the file index
+    which only maps dependencies (inputs), not outputs. Changes to output-only
+    files won't match any stage. Changes to intermediate files (output of A,
+    input of B) will correctly trigger B.
+    """
 
     def watch_filter(change: Change, path: str) -> bool:
         _ = change
@@ -64,24 +63,12 @@ def create_watch_filter(
         if path.endswith((".pyc", ".pyo")) or "__pycache__" in path:
             return False
 
-        # Resolve incoming path for consistent comparison
-        resolved_path = project.try_resolve_path(path)
-        if resolved_path is None:
-            return True  # Can't resolve, don't filter
-
-        # Check if path is an output of a stage being run, or inside such an output directory
-        for out in outputs_to_filter:
-            if resolved_path == out or out in resolved_path.parents:
-                return False
-
         # Apply glob filters if specified
         if watch_globs:
-            filename = resolved_path.name
-            original_path = path
-            return any(
-                fnmatch.fnmatch(filename, glob) or fnmatch.fnmatch(original_path, glob)
-                for glob in watch_globs
-            )
+            resolved_path = project.try_resolve_path(path)
+            if resolved_path is None:
+                return True  # Can't resolve, don't filter
+            return _matches_glob(resolved_path, path, watch_globs)
 
         return True
 
