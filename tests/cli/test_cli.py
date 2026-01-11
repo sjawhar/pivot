@@ -1,3 +1,4 @@
+import json
 import pathlib
 
 import click.testing
@@ -209,6 +210,66 @@ def test_cli_dry_run_specific_stage(
         assert result.exit_code == 0
         assert "stage_a" in result.output
         assert "stage_b" not in result.output
+
+
+def test_cli_dry_run_json_output(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
+    """Dry-run with --json outputs valid JSON with stage information."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        pathlib.Path("input.txt").write_text("data")
+
+        @stage(deps=["input.txt"], outs=["output.txt"])
+        def process() -> None:
+            pass
+
+        result = runner.invoke(cli.cli, ["run", "--dry-run", "--json"])
+
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert "stages" in data, "JSON output should have 'stages' key"
+        assert "process" in data["stages"], "Stage 'process' should be in output"
+        assert data["stages"]["process"]["would_run"] is True
+        assert "reason" in data["stages"]["process"]
+
+
+def test_cli_dry_run_json_empty_pipeline(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """Dry-run --json with no stages outputs empty stages dict."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+
+        result = runner.invoke(cli.cli, ["run", "--dry-run", "--json"])
+
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data == {"stages": {}}
+
+
+def test_cli_dry_run_json_with_force(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """Dry-run --json --force shows forced status."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        pathlib.Path("input.txt").write_text("data")
+
+        @stage(deps=["input.txt"], outs=["output.txt"])
+        def process() -> None:
+            pathlib.Path("output.txt").write_text("done")
+
+        # First, actually run to create lock file
+        executor.run(show_output=False)
+
+        # Now dry-run with --force --json
+        result = runner.invoke(cli.cli, ["run", "--dry-run", "--force", "--json"])
+
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert "stages" in data
+        assert "process" in data["stages"]
+        assert data["stages"]["process"]["would_run"] is True
+        assert "forced" in data["stages"]["process"]["reason"]
 
 
 # =============================================================================
