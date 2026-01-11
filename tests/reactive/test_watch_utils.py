@@ -268,3 +268,38 @@ def test_create_watch_filter_glob_with_no_match(
     watch_filter = _watch_utils.create_watch_filter([], watch_globs=["*.py"])
 
     assert watch_filter(Change.modified, str(csv_file)) is False
+
+
+def test_create_watch_filter_filters_all_outputs_including_intermediate(
+    set_project_root: pathlib.Path,
+) -> None:
+    """All outputs are filtered to prevent infinite loops, even intermediate files.
+
+    This is a known limitation: external modifications to intermediate files
+    (outputs that are also deps of downstream stages) are not detected.
+    Workaround: modify an input file to trigger a full re-run.
+    """
+    input_file = set_project_root / "input.csv"
+    intermediate_file = set_project_root / "intermediate.csv"
+    final_file = set_project_root / "final.csv"
+
+    input_file.write_text("a,b\n1,2")
+    intermediate_file.write_text("x,y\n3,4")
+
+    # stage_a produces intermediate.csv
+    registry.REGISTRY.register(
+        _noop, name="stage_a", deps=[str(input_file)], outs=[str(intermediate_file)]
+    )
+    # stage_b consumes intermediate.csv
+    registry.REGISTRY.register(
+        _noop, name="stage_b", deps=[str(intermediate_file)], outs=[str(final_file)]
+    )
+
+    watch_filter = _watch_utils.create_watch_filter(["stage_a", "stage_b"])
+
+    # Both intermediate and final outputs are filtered to prevent infinite loops
+    assert watch_filter(Change.modified, str(intermediate_file)) is False, (
+        "Intermediate outputs are filtered (known limitation)"
+    )
+    final_file.write_text("result")
+    assert watch_filter(Change.modified, str(final_file)) is False, "Terminal outputs are filtered"

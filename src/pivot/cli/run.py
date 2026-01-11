@@ -2,29 +2,15 @@ from __future__ import annotations
 
 import json
 import logging
-import multiprocessing as mp
 import pathlib
-from typing import TYPE_CHECKING, Literal, TypedDict, override
+from typing import TYPE_CHECKING, Literal, TypedDict
 
 import click
-import click.shell_completion
 
-from pivot import (
-    dag,
-    discovery,
-    executor,
-    explain,
-    parameters,
-    project,
-    reactive,
-    registry,
-)
+from pivot import discovery, exceptions, executor, registry
 from pivot.cli import completion
 from pivot.cli import decorators as cli_decorators
-from pivot.cli import helpers as cli_helpers
-from pivot.tui import console
-from pivot.tui import run as run_tui
-from pivot.types import DisplayMode, StageExplanation, StageStatus, TuiMessage
+from pivot.types import DisplayMode, OutputMessage, StageExplanation, StageStatus
 
 if TYPE_CHECKING:
     from pivot.executor import ExecutionSummary
@@ -57,41 +43,17 @@ def ensure_stages_registered() -> None:
             raise click.ClickException(str(e)) from e
 
 
-class DisplayModeType(click.ParamType):
-    """Click parameter type that converts string to DisplayMode enum."""
-
-    name: str = "display_mode"
-
-    @override
-    def convert(
-        self, value: str | None, param: click.Parameter | None, ctx: click.Context | None
-    ) -> DisplayMode | None:
-        if value is None:
-            return None
-        try:
-            return DisplayMode(value)
-        except ValueError:
-            self.fail(f"Invalid display mode: {value}. Choose from: tui, plain", param, ctx)
-
-    @override
-    def shell_complete(
-        self, ctx: click.Context, param: click.Parameter, incomplete: str
-    ) -> list[click.shell_completion.CompletionItem]:
-        return [
-            click.shell_completion.CompletionItem(mode.value)
-            for mode in DisplayMode
-            if mode.value.startswith(incomplete)
-        ]
-
-
-DISPLAY_MODE = DisplayModeType()
-
-
 def _validate_stages(stages_list: list[str] | None, single_stage: bool) -> None:
     """Validate stage arguments and options."""
     if single_stage and not stages_list:
         raise click.ClickException("--single-stage requires at least one stage name")
-    cli_helpers.validate_stages_exist(stages_list)
+
+    if stages_list:
+        graph = registry.REGISTRY.build_dag(validate=True)
+        registered = set(graph.nodes())
+        unknown = [s for s in stages_list if s not in registered]
+        if unknown:
+            raise exceptions.StageNotFoundError(f"Unknown stage(s): {', '.join(unknown)}")
 
 
 def _get_all_explanations(
@@ -101,6 +63,8 @@ def _get_all_explanations(
     force: bool = False,
 ) -> list[StageExplanation]:
     """Get explanations for all stages in execution order."""
+    from pivot import dag, explain, parameters, project
+
     graph = registry.REGISTRY.build_dag(validate=True)
     execution_order = dag.get_execution_order(graph, stages_list, single_stage=single_stage)
 
@@ -132,8 +96,18 @@ def _run_with_tui(
     single_stage: bool,
     cache_dir: pathlib.Path | None,
     force: bool = False,
+    tui_log: pathlib.Path | None = None,
 ) -> dict[str, ExecutionSummary] | None:
     """Run pipeline with TUI display."""
+    import multiprocessing as mp
+
+    import loky
+
+    from pivot import dag, project
+    from pivot.tui import run as run_tui
+    from pivot.types import TuiMessage
+
+    # Get execution order for stage names
     graph = registry.REGISTRY.build_dag(validate=True)
     execution_order = dag.get_execution_order(graph, stages_list, single_stage=single_stage)
 
@@ -141,6 +115,11 @@ def _run_with_tui(
         return {}
 
     resolved_cache_dir = cache_dir or project.get_project_root() / ".pivot" / "cache"
+
+    # Pre-warm loky executor before starting Textual TUI.
+    # Textual manipulates terminal file descriptors which breaks loky's
+    # resource tracker if spawned after Textual starts.
+    loky.get_reusable_executor(max_workers=1)
 
     # Create manager and queue (Manager().Queue for loky compatibility)
     manager = mp.Manager()
@@ -158,7 +137,7 @@ def _run_with_tui(
         )
 
     try:
-        return run_tui.run_with_tui(execution_order, tui_queue, executor_func)
+        return run_tui.run_with_tui(execution_order, tui_queue, executor_func, tui_log=tui_log)
     finally:
         manager.shutdown()
 
@@ -169,12 +148,47 @@ def _run_watch_with_tui(
     cache_dir: pathlib.Path | None,
     debounce: int,
     force: bool = False,
+    tui_log: pathlib.Path | None = None,
 ) -> None:
     """Run watch mode with TUI display."""
+    import multiprocessing as mp
+    import os
+
+    import loky
+
+    from pivot import dag
+    from pivot import reactive as reactive_module
+    from pivot.tui import run as run_tui
+    from pivot.types import TuiMessage
+
+    # Get execution order to calculate the correct number of workers
+    graph = registry.REGISTRY.build_dag(validate=True)
+    execution_order = dag.get_execution_order(graph, stages_list, single_stage=single_stage)
+
+    # Calculate max_workers the same way executor does
+    max_workers = min(os.cpu_count() or 1, 8, len(execution_order)) if execution_order else 1
+
+    # Pre-warm loky executor before starting Textual TUI.
+    # Textual manipulates terminal file descriptors which breaks loky's
+    # resource tracker if spawned after Textual starts.
+    # IMPORTANT: Must use the same max_workers that executor will use, otherwise
+    # loky will try to spawn additional workers after Textual has started.
+    # We also submit a no-op task to each worker to ensure all communication
+    # channels are fully established before Textual starts.
+    pool = loky.get_reusable_executor(max_workers=max_workers)
+    # Submit no-op tasks to ensure workers are warm and communication channels exist
+    futures = [pool.submit(lambda: None) for _ in range(max_workers)]
+    for f in futures:
+        f.result()  # Wait for completion to ensure channels are established
+
+    # Create Manager and queues BEFORE Textual starts to avoid multiprocessing
+    # fd inheritance issues. Textual manipulates terminal file descriptors which
+    # breaks Manager() subprocess spawning if done after Textual starts.
     manager = mp.Manager()
     tui_queue: mp.Queue[TuiMessage] = manager.Queue()  # pyright: ignore[reportAssignmentType]
+    output_queue: mp.Queue[OutputMessage] = manager.Queue()  # pyright: ignore[reportAssignmentType]
 
-    engine = reactive.ReactiveEngine(
+    engine = reactive_module.ReactiveEngine(
         stages=stages_list,
         single_stage=single_stage,
         cache_dir=cache_dir,
@@ -183,7 +197,7 @@ def _run_watch_with_tui(
     )
 
     try:
-        run_tui.run_watch_tui(engine, tui_queue)
+        run_tui.run_watch_tui(engine, tui_queue, output_queue=output_queue, tui_log=tui_log)
     finally:
         manager.shutdown()
 
@@ -264,11 +278,16 @@ def _print_results(results: dict[str, ExecutionSummary], as_json: bool = False) 
 )
 @click.option(
     "--display",
-    type=DISPLAY_MODE,
+    type=click.Choice([e.value for e in DisplayMode]),
     default=None,
     help="Display mode: tui (interactive) or plain (streaming text). Auto-detects if not specified.",
 )
 @click.option("--json", "as_json", is_flag=True, help="Output results as JSON")
+@click.option(
+    "--tui-log",
+    type=click.Path(path_type=pathlib.Path),
+    help="Write TUI messages to JSONL file for monitoring",
+)
 @click.pass_context
 def run(
     ctx: click.Context,
@@ -280,8 +299,9 @@ def run(
     force: bool,
     watch: bool,
     debounce: int,
-    display: DisplayMode | None,
+    display: str | None,  # Click passes string, converted to DisplayMode below
     as_json: bool,
+    tui_log: pathlib.Path | None,
 ) -> None:
     """Execute pipeline stages.
 
@@ -292,6 +312,22 @@ def run(
     """
     stages_list = list(stages) if stages else None
     _validate_stages(stages_list, single_stage)
+
+    # Validate tui_log requires TUI mode
+    if tui_log:
+        if as_json:
+            raise click.ClickException("--tui-log cannot be used with --json")
+        if display == DisplayMode.PLAIN.value:
+            raise click.ClickException("--tui-log cannot be used with --display=plain")
+        if dry_run:
+            raise click.ClickException("--tui-log cannot be used with --dry-run")
+        # Validate path upfront (fail fast)
+        tui_log = tui_log.expanduser().resolve()
+        try:
+            tui_log.parent.mkdir(parents=True, exist_ok=True)
+            tui_log.touch()  # Verify writable
+        except OSError as e:
+            raise click.ClickException(f"Cannot write to {tui_log}: {e}") from e
 
     # Handle dry-run modes (with or without explain)
     if dry_run:
@@ -316,16 +352,22 @@ def run(
         return
 
     if watch:
-        display_mode = display
+        from pivot.tui import run as run_tui
+
+        display_mode = DisplayMode(display) if display else None
         use_tui = run_tui.should_use_tui(display_mode) and not as_json
 
         if use_tui:
             try:
-                _run_watch_with_tui(stages_list, single_stage, cache_dir, debounce, force)
+                _run_watch_with_tui(
+                    stages_list, single_stage, cache_dir, debounce, force, tui_log=tui_log
+                )
             except KeyboardInterrupt:
                 click.echo("\nWatch mode stopped.")
         else:
-            engine = reactive.ReactiveEngine(
+            from pivot import reactive as reactive_module
+
+            engine = reactive_module.ReactiveEngine(
                 stages=stages_list,
                 single_stage=single_stage,
                 cache_dir=cache_dir,
@@ -337,7 +379,7 @@ def run(
             try:
                 engine.run(tui_queue=None)
             except KeyboardInterrupt:
-                pass
+                pass  # Normal exit via Ctrl+C
             finally:
                 engine.shutdown()
                 if not as_json:
@@ -345,11 +387,15 @@ def run(
         return
 
     # Determine display mode
-    display_mode = display
+    display_mode = DisplayMode(display) if display else None
 
+    # Normal execution (with optional explain mode)
+    from pivot.tui import run as run_tui
+
+    # Disable TUI when JSON output is requested
     use_tui = run_tui.should_use_tui(display_mode) and not explain and not as_json
     if use_tui:
-        results = _run_with_tui(stages_list, single_stage, cache_dir, force=force)
+        results = _run_with_tui(stages_list, single_stage, cache_dir, force=force, tui_log=tui_log)
     else:
         results = executor.run(
             stages=stages_list,
@@ -422,6 +468,8 @@ def explain_cmd(
     stages: tuple[str, ...], single_stage: bool, cache_dir: pathlib.Path | None, force: bool
 ) -> None:
     """Show detailed breakdown of why stages would run."""
+    from pivot.tui import console
+
     stages_list = list(stages) if stages else None
     _validate_stages(stages_list, single_stage)
 

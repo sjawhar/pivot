@@ -57,3 +57,18 @@ The following issues were addressed:
 - **Incremental outputs during worker kill**: If workers are killed (via `kill_workers=True`) while writing to an incremental output, the file may be partially written. However, the cache contains the last good version, so the next run will restore from cache before re-executing.
 - **Environment variables**: Changes to environment variables are not detected (not file-based).
 - **External packages**: Updates to pip packages are not detected.
+- **External modifications to intermediate files**: The watcher filters ALL stage outputs to prevent infinite loops (stage produces output → detected → stage runs again). This means external modifications to intermediate files (outputs that are also deps of downstream stages) are not detected. **Workaround**: Modify an input file to trigger a full re-run.
+
+## Future Enhancements
+
+### Intermediate File Detection
+**Priority:** Medium
+
+Currently, external modifications to intermediate files (e.g., `clean.csv` which is output of `clean` stage and dep of `features` stage) are not detected because all outputs are filtered to prevent infinite loops.
+
+**Potential solutions:**
+1. **Timestamp-based filtering**: Record execution start time, ignore file changes with mtime after that timestamp
+2. **State-based filtering**: Use permissive filter during "waiting" state, restrictive filter during "running" state
+3. **Content-based**: Track file hashes before/after execution, only trigger on external changes
+
+**Test case:** `test_get_affected_stages_includes_downstream_when_intermediate_file_changes` in `tests/reactive/test_engine.py` verifies the core logic works correctly - the issue is at the watcher filter level.
