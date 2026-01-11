@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import xxhash
 
-from pivot import ast_utils
+from pivot import ast_utils, metrics
 
 if TYPE_CHECKING:
     from pivot import loaders
@@ -39,6 +39,12 @@ def get_stage_fingerprint(
         # to protect visited set from race conditions. Current single-threaded
         # usage is safe.
 
+    with metrics.timed("fingerprint.get_stage_fingerprint"):
+        return _get_stage_fingerprint_impl(func, visited)
+
+
+def _get_stage_fingerprint_impl(func: Callable[..., Any], visited: set[int]) -> dict[str, str]:
+    """Internal implementation of get_stage_fingerprint."""
     manifest = dict[str, str]()
 
     func_id = id(func)

@@ -38,6 +38,7 @@ class StageResult(TypedDict):
     status: Literal[StageStatus.RAN, StageStatus.SKIPPED, StageStatus.FAILED]
     reason: str
     output_lines: list[tuple[str, bool]]
+    metrics: NotRequired[list[tuple[str, float]]]  # (name, duration_ms) for cross-process
 
 
 class FileHash(TypedDict):
