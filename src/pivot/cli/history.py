@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 import click
 
 from pivot import project
+from pivot.cli import decorators as cli_decorators
 from pivot.storage import state
 from pivot.types import StageStatus
 
@@ -13,7 +14,7 @@ if TYPE_CHECKING:
     from pivot.run_history import RunManifest
 
 
-@click.command()
+@cli_decorators.pivot_command(auto_discover=False)
 @click.option("--limit", "-n", default=10, help="Number of runs to show")
 @click.option("--json", "output_json", is_flag=True, help="Output as JSON")
 def history(limit: int, output_json: bool) -> None:
@@ -51,7 +52,7 @@ def _print_run_summary(run: RunManifest) -> None:
     click.echo(f"{run['run_id']:<26}  {ran:>3}  {skipped:>7}  {failed:>6}  {duration_str:>8}")
 
 
-@click.command("show")
+@cli_decorators.pivot_command("show", auto_discover=False)
 @click.argument("run_id", required=False)
 @click.option("--json", "output_json", is_flag=True, help="Output as JSON")
 def show_cmd(run_id: str | None, output_json: bool) -> None:

@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+import asyncio
+
 import click
 
 from pivot.cli import completion
 from pivot.cli import decorators as cli_decorators
+from pivot.cli import helpers as cli_helpers
+from pivot.remote import config as remote_config
+from pivot.remote import sync as transfer
+from pivot.storage import state
 
 
 @click.group()
@@ -15,8 +21,6 @@ def remote() -> None:
 @cli_decorators.with_error_handling
 def remote_list() -> None:
     """List configured remote storage locations."""
-    from pivot.remote import config as remote_config
-
     remotes = remote_config.list_remotes()
     default = remote_config.get_default_remote()
 
@@ -41,9 +45,6 @@ def push(targets: tuple[str, ...], remote_name: str | None, dry_run: bool, jobs:
     TARGETS can be stage names or file paths. If specified, pushes only
     those outputs. Otherwise, pushes all cached files.
     """
-    from pivot.remote import sync as transfer
-    from pivot.storage import state
-
     cache_dir = transfer.get_default_cache_dir()
     s3_remote, resolved_name = transfer.create_remote_from_name(remote_name)
 
@@ -63,11 +64,6 @@ def push(targets: tuple[str, ...], remote_name: str | None, dry_run: bool, jobs:
         return
 
     with state.StateDB(cache_dir) as state_db:
-
-        def progress_callback(completed: int) -> None:
-            click.echo(f"  Uploaded {completed} files...", nl=False)
-            click.echo("\r", nl=False)
-
         result = transfer.push(
             cache_dir,
             s3_remote,
@@ -75,18 +71,13 @@ def push(targets: tuple[str, ...], remote_name: str | None, dry_run: bool, jobs:
             resolved_name,
             targets_list,
             jobs,
-            progress_callback,
+            cli_helpers.make_progress_callback("Uploaded"),
         )
 
     click.echo(
         f"Pushed to '{resolved_name}': {result['transferred']} transferred, {result['skipped']} skipped, {result['failed']} failed"
     )
-
-    if result["errors"]:
-        for err in result["errors"][:5]:
-            click.echo(f"  Error: {err}", err=True)
-        if len(result["errors"]) > 5:
-            click.echo(f"  ... and {len(result['errors']) - 5} more errors", err=True)
+    cli_helpers.print_transfer_errors(result["errors"])
 
 
 @cli_decorators.pivot_command(auto_discover=False)
@@ -101,9 +92,6 @@ def pull(targets: tuple[str, ...], remote_name: str | None, dry_run: bool, jobs:
     outputs (and dependencies for stages). Otherwise, pulls all available
     files from remote.
     """
-    from pivot.remote import sync as transfer
-    from pivot.storage import state
-
     cache_dir = transfer.get_default_cache_dir()
     s3_remote, resolved_name = transfer.create_remote_from_name(remote_name)
 
@@ -113,8 +101,6 @@ def pull(targets: tuple[str, ...], remote_name: str | None, dry_run: bool, jobs:
         if targets_list:
             needed = transfer.get_target_hashes(targets_list, cache_dir, include_deps=True)
         else:
-            import asyncio
-
             needed = asyncio.run(s3_remote.list_hashes())
 
         local = transfer.get_local_cache_hashes(cache_dir)
@@ -123,11 +109,6 @@ def pull(targets: tuple[str, ...], remote_name: str | None, dry_run: bool, jobs:
         return
 
     with state.StateDB(cache_dir) as state_db:
-
-        def progress_callback(completed: int) -> None:
-            click.echo(f"  Downloaded {completed} files...", nl=False)
-            click.echo("\r", nl=False)
-
         result = transfer.pull(
             cache_dir,
             s3_remote,
@@ -135,15 +116,10 @@ def pull(targets: tuple[str, ...], remote_name: str | None, dry_run: bool, jobs:
             resolved_name,
             targets_list,
             jobs,
-            progress_callback,
+            cli_helpers.make_progress_callback("Downloaded"),
         )
 
     click.echo(
         f"Pulled from '{resolved_name}': {result['transferred']} transferred, {result['skipped']} skipped, {result['failed']} failed"
     )
-
-    if result["errors"]:
-        for err in result["errors"][:5]:
-            click.echo(f"  Error: {err}", err=True)
-        if len(result["errors"]) > 5:
-            click.echo(f"  ... and {len(result['errors']) - 5} more errors", err=True)
+    cli_helpers.print_transfer_errors(result["errors"])
