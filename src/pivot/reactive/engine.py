@@ -115,13 +115,9 @@ def _get_pyc_path(source_path: str) -> pathlib.Path | None:
         if source.suffix != ".py":
             return None
         # Python stores bytecode in __pycache__/<name>.cpython-<version>.pyc
+        # Match any version tag - e.g. "helpers.cpython-313.pyc"
         cache_dir = source.parent / "__pycache__"
-        # Match any version tag - we want to remove all cached versions
-        # The glob pattern matches e.g. "helpers.cpython-313.pyc"
-        stem = source.stem
-        for pyc in cache_dir.glob(f"{stem}.*.pyc"):
-            return pyc  # Return first match - typically only one exists
-        return None
+        return next(cache_dir.glob(f"{source.stem}.*.pyc"), None)
     except Exception:
         return None
 
@@ -197,6 +193,14 @@ class ReactiveEngine:
             graph, self._stages, single_stage=self._single_stage
         )
 
+        # Send initial stage list to TUI before starting execution
+        if self._tui_queue is not None:
+            msg = types.TuiReloadMessage(
+                type=types.TuiMessageType.RELOAD,
+                stages=stages_to_run,
+            )
+            self._tui_queue.put_nowait(msg)
+
         # Start watcher thread (non-daemon - we have proper cleanup via _shutdown event)
         self._watcher_thread = threading.Thread(
             target=self._watch_loop,
@@ -231,10 +235,16 @@ class ReactiveEngine:
             self._coordinator_loop()
         finally:
             # Ensure clean shutdown regardless of how we exit
+            # Note: This handles all normal exit paths including KeyboardInterrupt and SystemExit.
+            # Edge cases not covered: os._exit(), SIGKILL, segfaults - but nothing can help those.
             self._shutdown.set()
             self._watcher_thread.join(timeout=3.0)
             if self._watcher_thread.is_alive():
-                logger.warning("Watcher thread did not exit cleanly")
+                logger.warning(
+                    "Watcher thread did not exit within 3s timeout. This may indicate "
+                    + "watchfiles.watch() is blocked on I/O. The thread will be abandoned "
+                    + "(non-daemon by design for clean shutdown)."
+                )
 
             # Send shutdown sentinel to TUI queue
             if self._tui_queue is not None:
@@ -249,7 +259,7 @@ class ReactiveEngine:
         """Pure producer - monitors files, enqueues changes."""
         try:
             watch_paths = _watch_utils.collect_watch_paths(stages_to_run)
-            watch_filter = _watch_utils.create_watch_filter(stages_to_run)
+            watch_filter = _watch_utils.create_watch_filter()
             pending: set[pathlib.Path] = set()
 
             logger.info(f"Watching paths: {watch_paths}")
@@ -259,7 +269,9 @@ class ReactiveEngine:
                 watch_filter=watch_filter,
                 stop_event=self._shutdown,
             ):
-                pending.update(pathlib.Path(path) for _, path in changes)
+                # watchfiles yields set[tuple[Change, str]] - extract paths
+                for _, path_str in changes:
+                    pending.add(pathlib.Path(path_str))
 
                 # Prevent unbounded memory growth - use sentinel for "full rebuild"
                 if len(pending) > _MAX_PENDING_CHANGES:
@@ -363,7 +375,7 @@ class ReactiveEngine:
         """Collect changes with quiet period, max wait prevents infinite block."""
         if max_wait_s <= 0:
             raise ValueError(f"max_wait_s must be positive, got {max_wait_s}")
-        changes: set[pathlib.Path] = set()
+        changes = set[pathlib.Path]()
         deadline = time.monotonic() + max_wait_s
         quiet_period_s = self._debounce_ms / 1000
         last_change = time.monotonic()

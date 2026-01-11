@@ -206,7 +206,12 @@ def _run_watch_with_tui(
 
     try:
         run_tui.run_watch_tui(
-            engine, tui_queue, output_queue=output_queue, tui_log=tui_log, no_commit=no_commit
+            engine,
+            tui_queue,
+            output_queue=output_queue,
+            tui_log=tui_log,
+            stage_names=execution_order,
+            no_commit=no_commit,
         )
     finally:
         manager.shutdown()

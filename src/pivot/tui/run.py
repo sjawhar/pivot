@@ -629,10 +629,11 @@ class WatchTuiApp(_BaseTuiApp[None]):
         message_queue: mp.Queue[TuiMessage],
         output_queue: mp.Queue[OutputMessage] | None = None,
         tui_log: Path | None = None,
+        stage_names: list[str] | None = None,
         *,
         no_commit: bool = False,
     ) -> None:
-        super().__init__(message_queue, tui_log=tui_log)
+        super().__init__(message_queue, stage_names, tui_log=tui_log)
         self._engine: ReactiveEngineProtocol = engine
         self._output_queue = output_queue
         self._engine_thread: threading.Thread | None = None
@@ -866,11 +867,17 @@ def run_watch_tui(
     message_queue: mp.Queue[TuiMessage],
     output_queue: mp.Queue[OutputMessage] | None = None,
     tui_log: Path | None = None,
+    stage_names: list[str] | None = None,
     *,
     no_commit: bool = False,
 ) -> None:  # pragma: no cover
     """Run watch mode with TUI display."""
     app = WatchTuiApp(
-        engine, message_queue, output_queue=output_queue, tui_log=tui_log, no_commit=no_commit
+        engine,
+        message_queue,
+        output_queue=output_queue,
+        tui_log=tui_log,
+        stage_names=stage_names,
+        no_commit=no_commit,
     )
     app.run()
