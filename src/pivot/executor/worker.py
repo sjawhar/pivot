@@ -61,6 +61,7 @@ class WorkerStageInfo(TypedDict):
     run_id: str
     force: bool
     no_commit: bool
+    no_cache: bool
 
 
 def _make_result(
@@ -92,6 +93,15 @@ def execute_stage(
     # cache_dir is .pivot/cache, project_root is two levels up
     project_root = cache_dir.parent.parent
     no_commit = stage_info["no_commit"]
+    no_cache = stage_info["no_cache"]
+
+    # Validate --no-cache incompatibility with IncrementalOut
+    if no_cache and any(isinstance(out, outputs.IncrementalOut) for out in stage_info["outs"]):
+        return StageResult(
+            status=StageStatus.FAILED,
+            reason="--no-cache is incompatible with IncrementalOut (requires cache for incremental updates)",
+            output_lines=[],
+        )
 
     # Convert string checkout modes to enum (strings required for pickling across processes)
     checkout_modes = [cache.CheckoutMode(m) for m in stage_info["checkout_modes"]]
@@ -159,8 +169,8 @@ def execute_stage(
                     return _make_result(StageStatus.SKIPPED, skip_reason, [])
                 run_reason = "outputs missing from cache"
 
-            # Check run cache for previously executed configuration (skip if forcing)
-            if run_reason and not stage_info["force"]:
+            # Check run cache for previously executed configuration (skip if forcing or no_cache)
+            if run_reason and not stage_info["force"] and not no_cache:
                 with state.StateDB(state_db_path) as state_db:
                     run_cache_result = _try_skip_via_run_cache(
                         stage_name,
@@ -180,36 +190,56 @@ def execute_stage(
                     stage_info["func"], stage_name, output_queue, output_lines, params_instance
                 )
 
-            output_hashes = _save_outputs_to_cache(stage_outs, files_cache_dir, checkout_modes)
-
-            if no_commit:
-                # Compute dep_generations NOW (at execution time) and store in pending lock
-                with state.StateDB(state_db_path) as state_db:
-                    dep_gens = compute_dep_generation_map(stage_info["deps"], state_db)
-
+            if no_cache:
+                # Skip caching entirely - just verify outputs exist
+                _verify_outputs_exist(stage_outs)
+                null_hashes = dict[str, OutputHash]({out.path: None for out in stage_outs})
                 new_lock_data = LockData(
                     code_manifest=current_fingerprint,
                     params=current_params,
                     dep_hashes=dict(sorted(dep_hashes.items())),
-                    output_hashes=dict(sorted(output_hashes.items())),
-                    dep_generations=dep_gens,
+                    output_hashes=dict(sorted(null_hashes.items())),
                 )
-                pending_lock.write(new_lock_data)
+                if no_commit:
+                    with state.StateDB(state_db_path) as state_db:
+                        dep_gens = compute_dep_generation_map(stage_info["deps"], state_db)
+                    new_lock_data["dep_generations"] = dep_gens
+                    pending_lock.write(new_lock_data)
+                else:
+                    production_lock.write(new_lock_data)
+                    # Still track generations for downstream skip detection
+                    with state.StateDB(state_db_path) as state_db:
+                        _record_generations_after_run(stage_name, stage_info, state_db)
             else:
-                # Write to production lock and update StateDB
-                new_lock_data = LockData(
-                    code_manifest=current_fingerprint,
-                    params=current_params,
-                    dep_hashes=dict(sorted(dep_hashes.items())),
-                    output_hashes=dict(sorted(output_hashes.items())),
-                )
-                production_lock.write(new_lock_data)
+                output_hashes = _save_outputs_to_cache(stage_outs, files_cache_dir, checkout_modes)
+                if no_commit:
+                    # Compute dep_generations NOW (at execution time) and store in pending lock
+                    with state.StateDB(state_db_path) as state_db:
+                        dep_gens = compute_dep_generation_map(stage_info["deps"], state_db)
 
-                with state.StateDB(state_db_path) as state_db:
-                    _record_generations_after_run(stage_name, stage_info, state_db)
-                    write_run_cache_entry(
-                        stage_name, input_hash, output_hashes, stage_info["run_id"], state_db
+                    new_lock_data = LockData(
+                        code_manifest=current_fingerprint,
+                        params=current_params,
+                        dep_hashes=dict(sorted(dep_hashes.items())),
+                        output_hashes=dict(sorted(output_hashes.items())),
+                        dep_generations=dep_gens,
                     )
+                    pending_lock.write(new_lock_data)
+                else:
+                    # Write to production lock and update StateDB
+                    new_lock_data = LockData(
+                        code_manifest=current_fingerprint,
+                        params=current_params,
+                        dep_hashes=dict(sorted(dep_hashes.items())),
+                        output_hashes=dict(sorted(output_hashes.items())),
+                    )
+                    production_lock.write(new_lock_data)
+
+                    with state.StateDB(state_db_path) as state_db:
+                        _record_generations_after_run(stage_name, stage_info, state_db)
+                        write_run_cache_entry(
+                            stage_name, input_hash, output_hashes, stage_info["run_id"], state_db
+                        )
 
         return _make_result(StageStatus.RAN, run_reason, output_lines)
 
@@ -341,6 +371,14 @@ def _save_outputs_to_cache(
                 output_hashes[out.path] = None
 
         return output_hashes
+
+
+def _verify_outputs_exist(stage_outs: list[outputs.BaseOut]) -> None:
+    """Verify all outputs exist without caching (for --no-cache mode)."""
+    for out in stage_outs:
+        path = pathlib.Path(out.path)
+        if not path.exists():
+            raise exceptions.OutputMissingError(f"Stage did not produce output: {out.path}")
 
 
 def _run_stage_function_with_capture(

@@ -115,6 +115,7 @@ def run(
     tui_queue: mp.Queue[TuiMessage] | None = None,
     output_queue: mp.Queue[OutputMessage] | None = None,
     no_commit: bool = False,
+    no_cache: bool = False,
 ) -> dict[str, ExecutionSummary]:
     """Execute pipeline stages with greedy parallel execution.
 
@@ -134,6 +135,7 @@ def run(
         output_queue: Queue for worker output streaming. If None, created internally.
             Pass this when running in TUI mode to avoid multiprocessing issues.
         no_commit: If True, defer lock files to pending dir (faster iteration).
+        no_cache: If True, skip caching outputs entirely (maximum iteration speed).
 
     Returns:
         Dict of stage_name -> {status: "ran"|"skipped"|"failed", reason: str}
@@ -222,6 +224,7 @@ def run(
             run_id=run_id,
             force=force,
             no_commit=no_commit,
+            no_cache=no_cache,
         )
 
         results = _build_results(stage_states)
@@ -356,6 +359,7 @@ def _execute_greedy(
     run_id: str = "",
     force: bool = False,
     no_commit: bool = False,
+    no_cache: bool = False,
 ) -> None:
     """Execute stages with greedy parallel scheduling using loky ProcessPoolExecutor."""
     overrides = overrides or {}
@@ -405,6 +409,7 @@ def _execute_greedy(
                 run_id=run_id,
                 force=force,
                 no_commit=no_commit,
+                no_cache=no_cache,
             )
 
             while futures:
@@ -563,6 +568,7 @@ def _execute_greedy(
                         run_id=run_id,
                         force=force,
                         no_commit=no_commit,
+                        no_cache=no_cache,
                     )
     finally:
         # Signal output thread to stop - may fail if queue is broken
@@ -626,6 +632,7 @@ def _start_ready_stages(
     run_id: str = "",
     force: bool = False,
     no_commit: bool = False,
+    no_cache: bool = False,
 ) -> None:
     """Find and start stages that are ready to execute."""
     checkout_modes = checkout_modes or config.DEFAULT_CHECKOUT_MODE_ORDER
@@ -668,7 +675,7 @@ def _start_ready_stages(
             mutex_counts[mutex] += 1
 
         worker_info = _prepare_worker_info(
-            state.info, overrides, checkout_modes, run_id, force, no_commit
+            state.info, overrides, checkout_modes, run_id, force, no_commit, no_cache
         )
 
         try:
@@ -722,6 +729,7 @@ def _prepare_worker_info(
     run_id: str,
     force: bool,
     no_commit: bool,
+    no_cache: bool,
 ) -> worker.WorkerStageInfo:
     """Prepare stage info for pickling to worker process."""
     return worker.WorkerStageInfo(
@@ -738,6 +746,7 @@ def _prepare_worker_info(
         run_id=run_id,
         force=force,
         no_commit=no_commit,
+        no_cache=no_cache,
     )
 
 
