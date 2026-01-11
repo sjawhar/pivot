@@ -312,6 +312,7 @@ def run(
                 single_stage=single_stage,
                 cache_dir=cache_dir,
                 force=force,
+                as_json=as_json,
             )
         return
 
@@ -368,6 +369,19 @@ def run(
         _print_results(results, as_json=as_json)
 
 
+class DryRunJsonStageOutput(TypedDict):
+    """JSON output for a single stage in dry-run mode."""
+
+    would_run: bool
+    reason: str
+
+
+class DryRunJsonOutput(TypedDict):
+    """JSON output for pivot run --dry-run --json."""
+
+    stages: dict[str, DryRunJsonStageOutput]
+
+
 @cli_decorators.pivot_command("dry-run")
 @click.argument("stages", nargs=-1, shell_complete=completion.complete_stages)
 @click.option(
@@ -383,8 +397,13 @@ def run(
     is_flag=True,
     help="Show what would run if forced",
 )
+@click.option("--json", "as_json", is_flag=True, help="Output as JSON")
 def dry_run_cmd(
-    stages: tuple[str, ...], single_stage: bool, cache_dir: pathlib.Path | None, force: bool
+    stages: tuple[str, ...],
+    single_stage: bool,
+    cache_dir: pathlib.Path | None,
+    force: bool,
+    as_json: bool,
 ) -> None:
     """Show what would run without executing."""
     stages_list = list(stages) if stages else None
@@ -393,14 +412,29 @@ def dry_run_cmd(
     explanations = _get_all_explanations(stages_list, single_stage, cache_dir, force=force)
 
     if not explanations:
-        click.echo("No stages to run")
+        if as_json:
+            click.echo(json.dumps(DryRunJsonOutput(stages={})))
+        else:
+            click.echo("No stages to run")
         return
 
-    click.echo("Would run:")
-    for exp in explanations:
-        status = "would run" if exp["will_run"] else "would skip"
-        reason = exp["reason"] or "unchanged"
-        click.echo(f"  {exp['stage_name']}: {status} ({reason})")
+    if as_json:
+        output = DryRunJsonOutput(
+            stages={
+                exp["stage_name"]: DryRunJsonStageOutput(
+                    would_run=exp["will_run"],
+                    reason=exp["reason"] or "unchanged",
+                )
+                for exp in explanations
+            }
+        )
+        click.echo(json.dumps(output, indent=2))
+    else:
+        click.echo("Would run:")
+        for exp in explanations:
+            status = "would run" if exp["will_run"] else "would skip"
+            reason = exp["reason"] or "unchanged"
+            click.echo(f"  {exp['stage_name']}: {status} ({reason})")
 
 
 @cli_decorators.pivot_command("explain")
