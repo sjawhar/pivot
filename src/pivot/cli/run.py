@@ -98,6 +98,7 @@ def _run_with_tui(
     force: bool = False,
     tui_log: pathlib.Path | None = None,
     no_commit: bool = False,
+    no_cache: bool = False,
 ) -> dict[str, ExecutionSummary] | None:
     """Run pipeline with TUI display."""
     import multiprocessing as mp
@@ -136,6 +137,7 @@ def _run_with_tui(
             tui_queue=tui_queue,
             force=force,
             no_commit=no_commit,
+            no_cache=no_cache,
         )
 
     try:
@@ -152,6 +154,7 @@ def _run_watch_with_tui(
     force: bool = False,
     tui_log: pathlib.Path | None = None,
     no_commit: bool = False,
+    no_cache: bool = False,
 ) -> None:
     """Run watch mode with TUI display."""
     import multiprocessing as mp
@@ -198,6 +201,7 @@ def _run_watch_with_tui(
         debounce_ms=debounce,
         force_first_run=force,
         no_commit=no_commit,
+        no_cache=no_cache,
     )
 
     try:
@@ -299,6 +303,11 @@ def _print_results(results: dict[str, ExecutionSummary], as_json: bool = False) 
     is_flag=True,
     help="Defer lock files to pending dir for faster iteration. Run 'pivot commit' to finalize.",
 )
+@click.option(
+    "--no-cache",
+    is_flag=True,
+    help="Skip caching outputs entirely for maximum iteration speed. Outputs won't be cached.",
+)
 @click.pass_context
 def run(
     ctx: click.Context,
@@ -314,6 +323,7 @@ def run(
     as_json: bool,
     tui_log: pathlib.Path | None,
     no_commit: bool,
+    no_cache: bool,
 ) -> None:
     """Execute pipeline stages.
 
@@ -380,6 +390,7 @@ def run(
                     force,
                     tui_log=tui_log,
                     no_commit=no_commit,
+                    no_cache=no_cache,
                 )
             except KeyboardInterrupt:
                 click.echo("\nWatch mode stopped.")
@@ -394,6 +405,7 @@ def run(
                 force_first_run=force,
                 json_output=as_json,
                 no_commit=no_commit,
+                no_cache=no_cache,
             )
 
             try:
@@ -422,6 +434,7 @@ def run(
             force=force,
             tui_log=tui_log,
             no_commit=no_commit,
+            no_cache=no_cache,
         )
     else:
         results = executor.run(
@@ -431,6 +444,7 @@ def run(
             explain_mode=explain,
             force=force,
             no_commit=no_commit,
+            no_cache=no_cache,
         )
 
     if not results:

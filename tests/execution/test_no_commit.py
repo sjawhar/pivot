@@ -50,6 +50,7 @@ def _make_stage_info(
     fingerprint: dict[str, str] | None = None,
     run_id: str = "test_run",
     no_commit: bool = False,
+    no_cache: bool = False,
     force: bool = False,
 ) -> worker.WorkerStageInfo:
     """Create a WorkerStageInfo for testing."""
@@ -67,6 +68,7 @@ def _make_stage_info(
         run_id=run_id,
         force=force,
         no_commit=no_commit,
+        no_cache=no_cache,
     )
 
 
@@ -443,3 +445,209 @@ def test_reactive_engine_no_commit_defaults_to_false(
 
     assert "no_commit" in executor_call_args, "no_commit should be passed to executor.run"
     assert executor_call_args["no_commit"] is False, "no_commit should default to False"
+
+
+# -----------------------------------------------------------------------------
+# No-cache mode tests
+# -----------------------------------------------------------------------------
+
+
+def test_no_cache_skips_cache_operations(
+    worker_env: pathlib.Path, tmp_path: pathlib.Path, output_queue: mp_queues.Queue[OutputMessage]
+) -> None:
+    """When no_cache=True, outputs are not saved to cache."""
+    (tmp_path / "input.txt").write_text("input data")
+
+    def stage_func() -> None:
+        (tmp_path / "output.txt").write_text("output data")
+
+    stage_info = _make_stage_info(
+        stage_func,
+        tmp_path,
+        deps=[str(tmp_path / "input.txt")],
+        outs=[outputs.Out("output.txt")],
+        no_cache=True,
+    )
+
+    result = worker.execute_stage("test_stage", stage_info, worker_env, output_queue)
+
+    assert result["status"] == "ran"
+
+    # Output file should exist
+    assert (tmp_path / "output.txt").exists()
+
+    # Cache should NOT have the output file
+    cache_files = list((worker_env / "files").rglob("*"))
+    cache_files_not_dirs = [f for f in cache_files if f.is_file()]
+    assert len(cache_files_not_dirs) == 0, "Cache should be empty when no_cache=True"
+
+
+def test_no_cache_writes_lock_with_null_hashes(
+    worker_env: pathlib.Path, tmp_path: pathlib.Path, output_queue: mp_queues.Queue[OutputMessage]
+) -> None:
+    """When no_cache=True, lock file is written but with null output hashes."""
+    (tmp_path / "input.txt").write_text("input data")
+
+    def stage_func() -> None:
+        (tmp_path / "output.txt").write_text("output data")
+
+    stage_info = _make_stage_info(
+        stage_func,
+        tmp_path,
+        deps=[str(tmp_path / "input.txt")],
+        outs=[outputs.Out("output.txt")],
+        no_cache=True,
+    )
+
+    result = worker.execute_stage("test_stage", stage_info, worker_env, output_queue)
+
+    assert result["status"] == "ran"
+
+    # Production lock should exist with null hashes
+    production_lock = lock.StageLock("test_stage", worker_env)
+    assert production_lock.path.exists(), "Production lock should be written"
+    lock_data = production_lock.read()
+    assert lock_data is not None
+    # Output hash should be None since we didn't cache (uses normalized absolute path as key)
+    output_path = str(project.normalize_path("output.txt"))
+    assert output_path in lock_data["output_hashes"], f"Expected {output_path} in output_hashes"
+    assert lock_data["output_hashes"][output_path] is None
+
+
+def test_no_cache_second_run_still_skips(
+    worker_env: pathlib.Path, tmp_path: pathlib.Path, output_queue: mp_queues.Queue[OutputMessage]
+) -> None:
+    """Second --no-cache run should skip if inputs unchanged (lock files work)."""
+    (tmp_path / "input.txt").write_text("input data")
+
+    execution_count = [0]
+
+    def stage_func() -> None:
+        execution_count[0] += 1
+        (tmp_path / "output.txt").write_text(f"output data {execution_count[0]}")
+
+    stage_info = _make_stage_info(
+        stage_func,
+        tmp_path,
+        deps=[str(tmp_path / "input.txt")],
+        outs=[outputs.Out("output.txt")],
+        no_cache=True,
+    )
+
+    # First run
+    result1 = worker.execute_stage("test_stage", stage_info, worker_env, output_queue)
+    assert result1["status"] == "ran"
+    assert execution_count[0] == 1
+
+    # Second run should skip (lock file comparison still works)
+    result2 = worker.execute_stage("test_stage", stage_info, worker_env, output_queue)
+    assert result2["status"] == "skipped"
+    assert execution_count[0] == 1  # Should not have executed again
+
+
+def test_no_cache_incompatible_with_incremental_out(
+    worker_env: pathlib.Path, tmp_path: pathlib.Path, output_queue: mp_queues.Queue[OutputMessage]
+) -> None:
+    """When no_cache=True with IncrementalOut, stage should fail."""
+    (tmp_path / "input.txt").write_text("input data")
+
+    def stage_func() -> None:
+        (tmp_path / "output.txt").write_text("output data")
+
+    stage_info = _make_stage_info(
+        stage_func,
+        tmp_path,
+        deps=[str(tmp_path / "input.txt")],
+        outs=[outputs.IncrementalOut("output.txt")],
+        no_cache=True,
+    )
+
+    result = worker.execute_stage("test_stage", stage_info, worker_env, output_queue)
+
+    assert result["status"] == "failed"
+    assert "IncrementalOut" in result["reason"]
+
+
+def test_no_cache_with_no_commit(
+    worker_env: pathlib.Path, tmp_path: pathlib.Path, output_queue: mp_queues.Queue[OutputMessage]
+) -> None:
+    """Both --no-cache and --no-commit can be used together."""
+    (tmp_path / "input.txt").write_text("input data")
+
+    def stage_func() -> None:
+        (tmp_path / "output.txt").write_text("output data")
+
+    stage_info = _make_stage_info(
+        stage_func,
+        tmp_path,
+        deps=[str(tmp_path / "input.txt")],
+        outs=[outputs.Out("output.txt")],
+        no_cache=True,
+        no_commit=True,
+    )
+
+    result = worker.execute_stage("test_stage", stage_info, worker_env, output_queue)
+
+    assert result["status"] == "ran"
+
+    # Pending lock should exist (because no_commit=True)
+    pending_lock = lock.get_pending_lock("test_stage", tmp_path)
+    assert pending_lock.path.exists(), "Pending lock should be written"
+
+    # Production lock should NOT exist
+    production_lock = lock.StageLock("test_stage", worker_env)
+    assert not production_lock.path.exists(), "Production lock should NOT be written"
+
+    # Cache should be empty (because no_cache=True)
+    cache_files = list((worker_env / "files").rglob("*"))
+    cache_files_not_dirs = [f for f in cache_files if f.is_file()]
+    assert len(cache_files_not_dirs) == 0, "Cache should be empty"
+
+
+def test_reactive_engine_passes_no_cache_to_executor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ReactiveEngine should pass no_cache flag to executor.run."""
+    executor_call_args = dict[str, object]()
+
+    def mock_executor_run(**kwargs: object) -> dict[str, object]:
+        executor_call_args.update(kwargs)
+        return {}
+
+    monkeypatch.setattr("pivot.executor.run", mock_executor_run)
+
+    engine = reactive.ReactiveEngine(
+        stages=None,
+        single_stage=False,
+        cache_dir=None,
+        no_cache=True,
+    )
+
+    engine._execute_stages(None)
+
+    assert "no_cache" in executor_call_args, "no_cache should be passed to executor.run"
+    assert executor_call_args["no_cache"] is True, "no_cache should be True"
+
+
+def test_reactive_engine_no_cache_defaults_to_false(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ReactiveEngine should default no_cache to False."""
+    executor_call_args = dict[str, object]()
+
+    def mock_executor_run(**kwargs: object) -> dict[str, object]:
+        executor_call_args.update(kwargs)
+        return {}
+
+    monkeypatch.setattr("pivot.executor.run", mock_executor_run)
+
+    engine = reactive.ReactiveEngine(
+        stages=None,
+        single_stage=False,
+        cache_dir=None,
+    )
+
+    engine._execute_stages(None)
+
+    assert "no_cache" in executor_call_args, "no_cache should be passed to executor.run"
+    assert executor_call_args["no_cache"] is False, "no_cache should default to False"

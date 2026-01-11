@@ -138,6 +138,7 @@ class ReactiveEngine:
     _first_run_done: bool
     _json_output: bool
     _no_commit: bool
+    _no_cache: bool
     _change_queue: queue.Queue[set[pathlib.Path]]
     _shutdown: threading.Event
     _tui_queue: mp.Queue[TuiMessage] | None
@@ -157,6 +158,7 @@ class ReactiveEngine:
         force_first_run: bool = False,
         json_output: bool = False,
         no_commit: bool = False,
+        no_cache: bool = False,
     ) -> None:
         if debounce_ms < 0:
             raise ValueError(f"debounce_ms must be non-negative, got {debounce_ms}")
@@ -169,6 +171,7 @@ class ReactiveEngine:
         self._first_run_done = False
         self._json_output = json_output
         self._no_commit = no_commit
+        self._no_cache = no_cache
 
         self._change_queue = queue.Queue(maxsize=100)
         self._shutdown = threading.Event()
@@ -610,6 +613,7 @@ class ReactiveEngine:
             output_queue=self._output_queue,
             force=force,
             no_commit=self._no_commit,
+            no_cache=self._no_cache,
         )
         self._first_run_done = True
         return results

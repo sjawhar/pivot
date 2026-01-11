@@ -88,6 +88,7 @@ def test_execute_stage_with_missing_deps(worker_env: pathlib.Path) -> None:
         "run_id": "test_run",
         "force": False,
         "no_commit": False,
+        "no_cache": False,
     }
 
     result = executor.execute_stage(
@@ -125,6 +126,7 @@ def test_execute_stage_with_directory_dep(worker_env: pathlib.Path, tmp_path: pa
         "run_id": "test_run",
         "force": False,
         "no_commit": False,
+        "no_cache": False,
     }
 
     result = executor.execute_stage(
@@ -161,6 +163,7 @@ def test_execute_stage_runs_unchanged_stage(
         "run_id": "test_run",
         "force": False,
         "no_commit": False,
+        "no_cache": False,
     }
 
     # First run - creates lock file
@@ -209,6 +212,7 @@ def test_execute_stage_reruns_when_fingerprint_changes(
         "run_id": "test_run",
         "force": False,
         "no_commit": False,
+        "no_cache": False,
     }
 
     # First run
@@ -260,6 +264,7 @@ def test_execute_stage_handles_stage_exception(
         "run_id": "test_run",
         "force": False,
         "no_commit": False,
+        "no_cache": False,
     }
 
     result = executor.execute_stage(
@@ -294,6 +299,7 @@ def test_execute_stage_handles_sys_exit(worker_env: pathlib.Path, tmp_path: path
         "run_id": "test_run",
         "force": False,
         "no_commit": False,
+        "no_cache": False,
     }
 
     result = executor.execute_stage(
@@ -331,6 +337,7 @@ def test_execute_stage_handles_keyboard_interrupt(
         "run_id": "test_run",
         "force": False,
         "no_commit": False,
+        "no_cache": False,
     }
 
     result = executor.execute_stage(
@@ -1178,6 +1185,7 @@ def test_generation_skip_on_second_run(worker_env: pathlib.Path, tmp_path: pathl
         "run_id": "test_run",
         "force": False,
         "no_commit": False,
+        "no_cache": False,
     }
 
     # First run - creates output and records generations
@@ -1235,6 +1243,7 @@ def test_generation_mismatch_triggers_rerun(
         "run_id": "test_run",
         "force": False,
         "no_commit": False,
+        "no_cache": False,
     }
 
     step2_info: WorkerStageInfo = {
@@ -1251,6 +1260,7 @@ def test_generation_mismatch_triggers_rerun(
         "run_id": "test_run",
         "force": False,
         "no_commit": False,
+        "no_cache": False,
     }
 
     # First run - both stages execute
@@ -1334,6 +1344,7 @@ def test_external_file_fallback_to_hash_check(
         "run_id": "test_run",
         "force": False,
         "no_commit": False,
+        "no_cache": False,
     }
 
     # First run
@@ -1400,6 +1411,7 @@ def test_deps_list_change_triggers_rerun(worker_env: pathlib.Path, tmp_path: pat
         "run_id": "test_run",
         "force": False,
         "no_commit": False,
+        "no_cache": False,
     }
 
     result1 = executor.execute_stage(
@@ -1435,6 +1447,7 @@ def test_deps_list_change_triggers_rerun(worker_env: pathlib.Path, tmp_path: pat
         "run_id": "test_run",
         "force": False,
         "no_commit": False,
+        "no_cache": False,
     }
 
     result3 = executor.execute_stage(
@@ -1477,6 +1490,7 @@ def test_deps_list_change_same_fingerprint_detected_by_hash(
         "run_id": "test_run",
         "force": False,
         "no_commit": False,
+        "no_cache": False,
     }
 
     result1 = executor.execute_stage(
@@ -1503,6 +1517,7 @@ def test_deps_list_change_same_fingerprint_detected_by_hash(
         "run_id": "test_run",
         "force": False,
         "no_commit": False,
+        "no_cache": False,
     }
 
     result2 = executor.execute_stage(
@@ -1549,6 +1564,7 @@ def test_skip_acquires_execution_lock(
         "run_id": "test_run",
         "force": False,
         "no_commit": False,
+        "no_cache": False,
     }
 
     # First run - creates lock file and output
@@ -1616,6 +1632,7 @@ def test_restore_happens_inside_lock(
         "run_id": "test_run",
         "force": False,
         "no_commit": False,
+        "no_cache": False,
     }
 
     # First run - creates lock file and caches output
@@ -1697,6 +1714,7 @@ def test_stage_def_deps_loaded_before_function(
         "run_id": "test_run",
         "force": False,
         "no_commit": False,
+        "no_cache": False,
     }
 
     result = executor.execute_stage(
@@ -1736,6 +1754,7 @@ def test_stage_def_outs_saved_after_function(
         "run_id": "test_run",
         "force": False,
         "no_commit": False,
+        "no_cache": False,
     }
 
     result = executor.execute_stage(
@@ -1775,6 +1794,7 @@ def test_stage_def_missing_output_returns_failed(
         "run_id": "test_run",
         "force": False,
         "no_commit": False,
+        "no_cache": False,
     }
 
     result = executor.execute_stage(
@@ -1810,6 +1830,7 @@ def test_stage_def_load_failure_returns_failed(
         "run_id": "test_run",
         "force": False,
         "no_commit": False,
+        "no_cache": False,
     }
 
     result = executor.execute_stage(
@@ -1846,6 +1867,7 @@ def test_plain_params_no_auto_load_save(worker_env: pathlib.Path, tmp_path: path
         "run_id": "test_run",
         "force": False,
         "no_commit": False,
+        "no_cache": False,
     }
 
     result = executor.execute_stage(
