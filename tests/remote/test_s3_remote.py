@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import pathlib
 from typing import TYPE_CHECKING, Any
-from unittest import mock
 
 import pytest
 from botocore import exceptions as botocore_exc
@@ -11,6 +10,8 @@ from pivot import exceptions
 from pivot.remote import storage as remote_mod
 
 if TYPE_CHECKING:
+    from unittest.mock import MagicMock
+
     from pytest_mock import MockerFixture
 
 
@@ -215,19 +216,19 @@ def test_is_not_found_error_false() -> None:
 
 
 @pytest.fixture
-def mock_s3_session(mocker: MockerFixture) -> mock.MagicMock:
+def mock_s3_session(mocker: MockerFixture) -> MagicMock:
     """Mock aioboto3 session for testing."""
-    mock_session_class = mocker.patch("aioboto3.Session")
-    mock_session = mock.MagicMock()
+    mock_session_class = mocker.patch("aioboto3.Session", autospec=True)
+    mock_session = mocker.MagicMock()
     mock_session_class.return_value = mock_session
     return mock_session
 
 
 @pytest.mark.asyncio
-async def test_exists_true(mock_s3_session: mock.MagicMock) -> None:
+async def test_exists_true(mock_s3_session: MagicMock, mocker: MockerFixture) -> None:
     """exists returns True when object exists."""
-    mock_client = mock.AsyncMock()
-    mock_client.head_object = mock.AsyncMock(return_value={})
+    mock_client = mocker.AsyncMock()
+    mock_client.head_object = mocker.AsyncMock(return_value={})
     mock_s3_session.client.return_value.__aenter__.return_value = mock_client
 
     r = remote_mod.S3Remote("s3://bucket/prefix")
@@ -238,13 +239,13 @@ async def test_exists_true(mock_s3_session: mock.MagicMock) -> None:
 
 
 @pytest.mark.asyncio
-async def test_exists_false_404(mock_s3_session: mock.MagicMock) -> None:
+async def test_exists_false_404(mock_s3_session: MagicMock, mocker: MockerFixture) -> None:
     """exists returns False on 404 error."""
-    mock_client = mock.AsyncMock()
+    mock_client = mocker.AsyncMock()
     error = botocore_exc.ClientError(
         {"Error": {"Code": "404", "Message": "Not Found"}}, "HeadObject"
     )
-    mock_client.head_object = mock.AsyncMock(side_effect=error)
+    mock_client.head_object = mocker.AsyncMock(side_effect=error)
     mock_s3_session.client.return_value.__aenter__.return_value = mock_client
 
     r = remote_mod.S3Remote("s3://bucket/prefix")
@@ -254,13 +255,15 @@ async def test_exists_false_404(mock_s3_session: mock.MagicMock) -> None:
 
 
 @pytest.mark.asyncio
-async def test_exists_raises_on_other_error(mock_s3_session: mock.MagicMock) -> None:
+async def test_exists_raises_on_other_error(
+    mock_s3_session: MagicMock, mocker: MockerFixture
+) -> None:
     """exists raises RemoteConnectionError on non-404 errors."""
-    mock_client = mock.AsyncMock()
+    mock_client = mocker.AsyncMock()
     error = botocore_exc.ClientError(
         {"Error": {"Code": "403", "Message": "Forbidden"}}, "HeadObject"
     )
-    mock_client.head_object = mock.AsyncMock(side_effect=error)
+    mock_client.head_object = mocker.AsyncMock(side_effect=error)
     mock_s3_session.client.return_value.__aenter__.return_value = mock_client
 
     r = remote_mod.S3Remote("s3://bucket/prefix")
@@ -270,10 +273,12 @@ async def test_exists_raises_on_other_error(mock_s3_session: mock.MagicMock) -> 
 
 
 @pytest.mark.asyncio
-async def test_upload_file(mock_s3_session: mock.MagicMock, tmp_path: pathlib.Path) -> None:
+async def test_upload_file(
+    mock_s3_session: MagicMock, tmp_path: pathlib.Path, mocker: MockerFixture
+) -> None:
     """upload_file puts object to S3."""
-    mock_client = mock.AsyncMock()
-    mock_client.put_object = mock.AsyncMock()
+    mock_client = mocker.AsyncMock()
+    mock_client.put_object = mocker.AsyncMock()
     mock_s3_session.client.return_value.__aenter__.return_value = mock_client
 
     test_file = tmp_path / "test.txt"
@@ -289,7 +294,9 @@ async def test_upload_file(mock_s3_session: mock.MagicMock, tmp_path: pathlib.Pa
 
 
 @pytest.mark.asyncio
-async def test_download_file(mock_s3_session: mock.MagicMock, tmp_path: pathlib.Path) -> None:
+async def test_download_file(
+    mock_s3_session: MagicMock, tmp_path: pathlib.Path, mocker: MockerFixture
+) -> None:
     """download_file gets object from S3."""
 
     class MockBody:
@@ -308,8 +315,8 @@ async def test_download_file(mock_s3_session: mock.MagicMock, tmp_path: pathlib.
             self._read_called = True
             return b"downloaded content"
 
-    mock_client = mock.AsyncMock()
-    mock_client.get_object = mock.AsyncMock(return_value={"Body": MockBody()})
+    mock_client = mocker.AsyncMock()
+    mock_client.get_object = mocker.AsyncMock(return_value={"Body": MockBody()})
     mock_s3_session.client.return_value.__aenter__.return_value = mock_client
 
     dest_file = tmp_path / "dest.txt"
@@ -321,7 +328,7 @@ async def test_download_file(mock_s3_session: mock.MagicMock, tmp_path: pathlib.
 
 
 @pytest.mark.asyncio
-async def test_bulk_exists(mock_s3_session: mock.MagicMock) -> None:
+async def test_bulk_exists(mock_s3_session: MagicMock, mocker: MockerFixture) -> None:
     """bulk_exists checks multiple hashes in parallel."""
 
     def mock_head_side_effect(**kwargs: str) -> dict[str, str]:
@@ -334,8 +341,8 @@ async def test_bulk_exists(mock_s3_session: mock.MagicMock) -> None:
             )
         return {}
 
-    mock_client = mock.AsyncMock()
-    mock_client.head_object = mock.AsyncMock(side_effect=mock_head_side_effect)
+    mock_client = mocker.AsyncMock()
+    mock_client.head_object = mocker.AsyncMock(side_effect=mock_head_side_effect)
     mock_s3_session.client.return_value.__aenter__.return_value = mock_client
 
     r = remote_mod.S3Remote("s3://bucket/prefix")
@@ -348,7 +355,9 @@ async def test_bulk_exists(mock_s3_session: mock.MagicMock) -> None:
 
 
 @pytest.mark.asyncio
-async def test_bulk_exists_raises_on_non_404_error(mock_s3_session: mock.MagicMock) -> None:
+async def test_bulk_exists_raises_on_non_404_error(
+    mock_s3_session: MagicMock, mocker: MockerFixture
+) -> None:
     """bulk_exists raises RemoteConnectionError on non-404 errors."""
 
     def mock_head_side_effect(**kwargs: str) -> dict[str, str]:
@@ -360,8 +369,8 @@ async def test_bulk_exists_raises_on_non_404_error(mock_s3_session: mock.MagicMo
             )
         return {}
 
-    mock_client = mock.AsyncMock()
-    mock_client.head_object = mock.AsyncMock(side_effect=mock_head_side_effect)
+    mock_client = mocker.AsyncMock()
+    mock_client.head_object = mocker.AsyncMock(side_effect=mock_head_side_effect)
     mock_s3_session.client.return_value.__aenter__.return_value = mock_client
 
     r = remote_mod.S3Remote("s3://bucket/prefix")
@@ -371,7 +380,7 @@ async def test_bulk_exists_raises_on_non_404_error(mock_s3_session: mock.MagicMo
 
 
 @pytest.mark.asyncio
-async def test_list_hashes(mock_s3_session: mock.MagicMock) -> None:
+async def test_list_hashes(mock_s3_session: MagicMock, mocker: MockerFixture) -> None:
     """list_hashes returns all cache hashes from S3."""
     from collections.abc import AsyncIterator  # noqa: TC003
 
@@ -395,8 +404,8 @@ async def test_list_hashes(mock_s3_session: mock.MagicMock) -> None:
             for page in pages:
                 yield page
 
-    mock_client = mock.AsyncMock()
-    mock_client.get_paginator = mock.MagicMock(return_value=MockPaginator())
+    mock_client = mocker.AsyncMock()
+    mock_client.get_paginator = mocker.MagicMock(return_value=MockPaginator())
     mock_s3_session.client.return_value.__aenter__.return_value = mock_client
 
     r = remote_mod.S3Remote("s3://bucket/prefix")
@@ -406,7 +415,7 @@ async def test_list_hashes(mock_s3_session: mock.MagicMock) -> None:
 
 
 @pytest.mark.asyncio
-async def test_iter_hashes(mock_s3_session: mock.MagicMock) -> None:
+async def test_iter_hashes(mock_s3_session: MagicMock, mocker: MockerFixture) -> None:
     """iter_hashes yields hashes without collecting into memory."""
     from collections.abc import AsyncIterator  # noqa: TC003
 
@@ -421,8 +430,8 @@ async def test_iter_hashes(mock_s3_session: mock.MagicMock) -> None:
             for page in pages:
                 yield page
 
-    mock_client = mock.AsyncMock()
-    mock_client.get_paginator = mock.MagicMock(return_value=MockPaginator())
+    mock_client = mocker.AsyncMock()
+    mock_client.get_paginator = mocker.MagicMock(return_value=MockPaginator())
     mock_s3_session.client.return_value.__aenter__.return_value = mock_client
 
     r = remote_mod.S3Remote("s3://bucket/prefix")
@@ -434,10 +443,12 @@ async def test_iter_hashes(mock_s3_session: mock.MagicMock) -> None:
 
 
 @pytest.mark.asyncio
-async def test_upload_batch(mock_s3_session: mock.MagicMock, tmp_path: pathlib.Path) -> None:
+async def test_upload_batch(
+    mock_s3_session: MagicMock, tmp_path: pathlib.Path, mocker: MockerFixture
+) -> None:
     """upload_batch uploads multiple files in parallel."""
-    mock_client = mock.AsyncMock()
-    mock_client.put_object = mock.AsyncMock()
+    mock_client = mocker.AsyncMock()
+    mock_client.put_object = mocker.AsyncMock()
     mock_s3_session.client.return_value.__aenter__.return_value = mock_client
 
     files = list[tuple[pathlib.Path, str]]()
@@ -455,11 +466,11 @@ async def test_upload_batch(mock_s3_session: mock.MagicMock, tmp_path: pathlib.P
 
 @pytest.mark.asyncio
 async def test_upload_batch_with_callback(
-    mock_s3_session: mock.MagicMock, tmp_path: pathlib.Path
+    mock_s3_session: MagicMock, tmp_path: pathlib.Path, mocker: MockerFixture
 ) -> None:
     """upload_batch calls callback for each completed upload."""
-    mock_client = mock.AsyncMock()
-    mock_client.put_object = mock.AsyncMock()
+    mock_client = mocker.AsyncMock()
+    mock_client.put_object = mocker.AsyncMock()
     mock_s3_session.client.return_value.__aenter__.return_value = mock_client
 
     files = list[tuple[pathlib.Path, str]]()
@@ -490,7 +501,9 @@ async def test_upload_batch_empty() -> None:
 
 
 @pytest.mark.asyncio
-async def test_download_batch(mock_s3_session: mock.MagicMock, tmp_path: pathlib.Path) -> None:
+async def test_download_batch(
+    mock_s3_session: MagicMock, tmp_path: pathlib.Path, mocker: MockerFixture
+) -> None:
     """download_batch downloads multiple files in parallel."""
 
     class MockBody:
@@ -509,8 +522,8 @@ async def test_download_batch(mock_s3_session: mock.MagicMock, tmp_path: pathlib
             self._read_called = True
             return b"content"
 
-    mock_client = mock.AsyncMock()
-    mock_client.get_object = mock.AsyncMock(side_effect=_make_mock_body_factory(MockBody))
+    mock_client = mocker.AsyncMock()
+    mock_client.get_object = mocker.AsyncMock(side_effect=_make_mock_body_factory(MockBody))
     mock_s3_session.client.return_value.__aenter__.return_value = mock_client
 
     items = [(f"a{i}b2c3d4e5f6789a", tmp_path / f"dest{i}.txt") for i in range(3)]
@@ -540,15 +553,15 @@ async def test_download_batch_empty() -> None:
 
 @pytest.mark.asyncio
 async def test_upload_file_large_uses_multipart(
-    mock_s3_session: mock.MagicMock, tmp_path: pathlib.Path
+    mock_s3_session: MagicMock, tmp_path: pathlib.Path, mocker: MockerFixture
 ) -> None:
     """upload_file uses multipart upload for large files."""
-    mock_client = mock.AsyncMock()
-    mock_client.create_multipart_upload = mock.AsyncMock(
+    mock_client = mocker.AsyncMock()
+    mock_client.create_multipart_upload = mocker.AsyncMock(
         return_value={"UploadId": "test-upload-id"}
     )
-    mock_client.upload_part = mock.AsyncMock(return_value={"ETag": "test-etag"})
-    mock_client.complete_multipart_upload = mock.AsyncMock()
+    mock_client.upload_part = mocker.AsyncMock(return_value={"ETag": "test-etag"})
+    mock_client.complete_multipart_upload = mocker.AsyncMock()
     mock_s3_session.client.return_value.__aenter__.return_value = mock_client
 
     # Create file larger than STREAM_CHUNK_SIZE (8MB)
@@ -566,11 +579,11 @@ async def test_upload_file_large_uses_multipart(
 
 @pytest.mark.asyncio
 async def test_upload_file_small_uses_put_object(
-    mock_s3_session: mock.MagicMock, tmp_path: pathlib.Path
+    mock_s3_session: MagicMock, tmp_path: pathlib.Path, mocker: MockerFixture
 ) -> None:
     """upload_file uses simple put_object for small files."""
-    mock_client = mock.AsyncMock()
-    mock_client.put_object = mock.AsyncMock()
+    mock_client = mocker.AsyncMock()
+    mock_client.put_object = mocker.AsyncMock()
     mock_s3_session.client.return_value.__aenter__.return_value = mock_client
 
     test_file = tmp_path / "small_file.txt"
@@ -584,15 +597,15 @@ async def test_upload_file_small_uses_put_object(
 
 @pytest.mark.asyncio
 async def test_upload_file_multipart_aborts_on_error(
-    mock_s3_session: mock.MagicMock, tmp_path: pathlib.Path
+    mock_s3_session: MagicMock, tmp_path: pathlib.Path, mocker: MockerFixture
 ) -> None:
     """upload_file aborts multipart upload on error."""
-    mock_client = mock.AsyncMock()
-    mock_client.create_multipart_upload = mock.AsyncMock(
+    mock_client = mocker.AsyncMock()
+    mock_client.create_multipart_upload = mocker.AsyncMock(
         return_value={"UploadId": "test-upload-id"}
     )
-    mock_client.upload_part = mock.AsyncMock(side_effect=Exception("Upload failed"))
-    mock_client.abort_multipart_upload = mock.AsyncMock()
+    mock_client.upload_part = mocker.AsyncMock(side_effect=Exception("Upload failed"))
+    mock_client.abort_multipart_upload = mocker.AsyncMock()
     mock_s3_session.client.return_value.__aenter__.return_value = mock_client
 
     test_file = tmp_path / "large_file.bin"
@@ -612,13 +625,13 @@ async def test_upload_file_multipart_aborts_on_error(
 
 @pytest.mark.asyncio
 async def test_download_file_cleans_up_on_error(
-    mock_s3_session: mock.MagicMock, tmp_path: pathlib.Path
+    mock_s3_session: MagicMock, tmp_path: pathlib.Path, mocker: MockerFixture
 ) -> None:
     """download_file cleans up temp file on error."""
     import os
 
-    mock_client = mock.AsyncMock()
-    mock_client.get_object = mock.AsyncMock(side_effect=Exception("Download failed"))
+    mock_client = mocker.AsyncMock()
+    mock_client.get_object = mocker.AsyncMock(side_effect=Exception("Download failed"))
     mock_s3_session.client.return_value.__aenter__.return_value = mock_client
 
     dest_file = tmp_path / "dest.txt"
@@ -634,7 +647,7 @@ async def test_download_file_cleans_up_on_error(
 
 @pytest.mark.asyncio
 async def test_download_batch_with_callback(
-    mock_s3_session: mock.MagicMock, tmp_path: pathlib.Path
+    mock_s3_session: MagicMock, tmp_path: pathlib.Path, mocker: MockerFixture
 ) -> None:
     """download_batch calls callback for each completed download."""
 
@@ -654,8 +667,8 @@ async def test_download_batch_with_callback(
             self._read_called = True
             return b"content"
 
-    mock_client = mock.AsyncMock()
-    mock_client.get_object = mock.AsyncMock(side_effect=_make_mock_body_factory(MockBody))
+    mock_client = mocker.AsyncMock()
+    mock_client.get_object = mocker.AsyncMock(side_effect=_make_mock_body_factory(MockBody))
     mock_s3_session.client.return_value.__aenter__.return_value = mock_client
 
     items = [(f"a{i}b2c3d4e5f6789a", tmp_path / f"dest{i}.txt") for i in range(3)]
