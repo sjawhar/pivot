@@ -93,6 +93,36 @@ def hash_file(path: pathlib.Path, state_db: state_mod.StateDB | None = None) -> 
     return file_hash
 
 
+# Hardcoded ignore patterns for hot path - O(1) lookups only.
+# For full .pivotignore support, see pivot.ignore module.
+_IGNORE_DIRS: frozenset[str] = frozenset(
+    {
+        "__pycache__",
+        ".venv",
+        "venv",
+        ".git",
+        ".hg",
+        ".svn",
+        ".idea",
+        ".vscode",
+        "node_modules",
+        ".pivot",
+        "dist",
+        "build",
+    }
+)
+_IGNORE_SUFFIXES: tuple[str, ...] = (".pyc", ".pyo", ".swp", ".swo")
+
+
+def _should_skip_entry(entry: os.DirEntry[str]) -> bool:
+    """Fast ignore check for hot path. O(1) lookups only."""
+    name = entry.name
+    if entry.is_dir(follow_symlinks=False):
+        return name in _IGNORE_DIRS
+    # File checks: suffix and special patterns
+    return name.endswith(_IGNORE_SUFFIXES) or name.endswith("~") or name.startswith(".#")
+
+
 def _scandir_recursive(path: pathlib.Path) -> Generator[os.DirEntry[str]]:
     """Yield all files recursively using os.scandir() for efficiency.
 
@@ -103,6 +133,8 @@ def _scandir_recursive(path: pathlib.Path) -> Generator[os.DirEntry[str]]:
         with os.scandir(path) as entries:
             for entry in entries:
                 if entry.is_symlink():
+                    continue
+                if _should_skip_entry(entry):
                     continue
                 if entry.is_file():
                     yield entry

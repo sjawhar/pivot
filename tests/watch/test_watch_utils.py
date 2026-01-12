@@ -5,7 +5,7 @@ import pathlib
 import pytest
 from watchfiles import Change
 
-from pivot import project, registry
+from pivot import ignore, project, registry
 from pivot.watch import _watch_utils
 
 
@@ -303,3 +303,83 @@ def test_create_watch_filter_filters_all_outputs_including_intermediate(
     )
     final_file.write_text("result")
     assert watch_filter(Change.modified, str(final_file)) is False, "Terminal outputs are filtered"
+
+
+# =============================================================================
+# IgnoreFilter integration tests
+# =============================================================================
+
+
+def test_create_watch_filter_uses_ignore_filter(
+    set_project_root: pathlib.Path,
+) -> None:
+    """Watch filter should respect .pivotignore patterns."""
+    # Create .pivotignore with custom pattern
+    pivotignore = set_project_root / ".pivotignore"
+    pivotignore.write_text("*.log\ntemp/\n")
+
+    # Create test files
+    log_file = set_project_root / "app.log"
+    log_file.write_text("log data")
+    py_file = set_project_root / "app.py"
+    py_file.write_text("# code")
+
+    ignore_filter = ignore.IgnoreFilter(project_root=set_project_root)
+    watch_filter = _watch_utils.create_watch_filter([], ignore_filter=ignore_filter)
+
+    assert watch_filter(Change.modified, str(log_file)) is False, "Should filter .log files"
+    assert watch_filter(Change.modified, str(py_file)) is True, "Should allow .py files"
+
+
+def test_create_watch_filter_respects_negation_patterns(
+    set_project_root: pathlib.Path,
+) -> None:
+    """Watch filter should respect negation patterns (!pattern)."""
+    # Create .pivotignore with negation
+    pivotignore = set_project_root / ".pivotignore"
+    pivotignore.write_text("*.log\n!important.log\n")
+
+    # Create test files
+    debug_log = set_project_root / "debug.log"
+    debug_log.write_text("debug data")
+    important_log = set_project_root / "important.log"
+    important_log.write_text("important data")
+
+    ignore_filter = ignore.IgnoreFilter(project_root=set_project_root)
+    watch_filter = _watch_utils.create_watch_filter([], ignore_filter=ignore_filter)
+
+    assert watch_filter(Change.modified, str(debug_log)) is False, "Should filter debug.log"
+    assert watch_filter(Change.modified, str(important_log)) is True, "Should allow important.log"
+
+
+def test_create_watch_filter_ignores_temp_directories(
+    set_project_root: pathlib.Path,
+) -> None:
+    """Watch filter should ignore directories in .pivotignore."""
+    # Create .pivotignore with directory pattern
+    pivotignore = set_project_root / ".pivotignore"
+    pivotignore.write_text("temp/\n")
+
+    # Create test directory and file
+    temp_dir = set_project_root / "temp"
+    temp_dir.mkdir()
+    temp_file = temp_dir / "cache.txt"
+    temp_file.write_text("cached")
+
+    ignore_filter = ignore.IgnoreFilter(project_root=set_project_root)
+    watch_filter = _watch_utils.create_watch_filter([], ignore_filter=ignore_filter)
+
+    assert watch_filter(Change.modified, str(temp_file)) is False, "Should filter files in temp/"
+
+
+def test_create_watch_filter_without_ignore_filter_uses_hardcoded_patterns(
+    set_project_root: pathlib.Path,
+) -> None:
+    """Without ignore_filter, should still filter Python bytecode (hardcoded)."""
+    # No .pivotignore, no ignore_filter passed
+    pyc_file = set_project_root / "module.pyc"
+
+    watch_filter = _watch_utils.create_watch_filter([])
+
+    # Hardcoded bytecode filtering should still work
+    assert watch_filter(Change.modified, str(pyc_file)) is False

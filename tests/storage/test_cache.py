@@ -858,3 +858,173 @@ def test_save_to_cache_with_checkout_modes_list(tmp_path: pathlib.Path) -> None:
 
     assert output_hash is not None
     assert "hash" in output_hash
+
+
+# === Scandir Skip Tests (Hot Path Ignore) ===
+
+
+def test_scandir_recursive_skips_pycache(tmp_path: pathlib.Path) -> None:
+    """_scandir_recursive should skip __pycache__ directories."""
+    test_dir = tmp_path / "mydir"
+    test_dir.mkdir()
+    (test_dir / "real.py").write_text("# code")
+    pycache = test_dir / "__pycache__"
+    pycache.mkdir()
+    (pycache / "real.cpython-313.pyc").write_text("bytecode")
+
+    _, manifest = cache.hash_directory(test_dir)
+
+    relpaths = [e["relpath"] for e in manifest]
+    assert "real.py" in relpaths
+    assert "__pycache__/real.cpython-313.pyc" not in relpaths
+
+
+def test_scandir_recursive_skips_venv(tmp_path: pathlib.Path) -> None:
+    """_scandir_recursive should skip .venv and venv directories."""
+    test_dir = tmp_path / "mydir"
+    test_dir.mkdir()
+    (test_dir / "app.py").write_text("# code")
+
+    # Both .venv and venv should be skipped
+    for venv_name in [".venv", "venv"]:
+        venv_dir = test_dir / venv_name
+        venv_dir.mkdir()
+        (venv_dir / "pyvenv.cfg").write_text("home = /usr/bin")
+
+    _, manifest = cache.hash_directory(test_dir)
+
+    relpaths = [e["relpath"] for e in manifest]
+    assert "app.py" in relpaths
+    assert ".venv/pyvenv.cfg" not in relpaths
+    assert "venv/pyvenv.cfg" not in relpaths
+
+
+def test_scandir_recursive_skips_git(tmp_path: pathlib.Path) -> None:
+    """_scandir_recursive should skip .git directories."""
+    test_dir = tmp_path / "mydir"
+    test_dir.mkdir()
+    (test_dir / "code.py").write_text("# code")
+    git_dir = test_dir / ".git"
+    git_dir.mkdir()
+    (git_dir / "config").write_text("[core]")
+    objects_dir = git_dir / "objects"
+    objects_dir.mkdir()
+    (objects_dir / "pack").mkdir()
+
+    _, manifest = cache.hash_directory(test_dir)
+
+    relpaths = [e["relpath"] for e in manifest]
+    assert "code.py" in relpaths
+    assert ".git/config" not in relpaths
+    assert ".git/objects/pack" not in relpaths
+
+
+def test_scandir_recursive_skips_pyc_files(tmp_path: pathlib.Path) -> None:
+    """_scandir_recursive should skip .pyc and .pyo files."""
+    test_dir = tmp_path / "mydir"
+    test_dir.mkdir()
+    (test_dir / "module.py").write_text("# code")
+    (test_dir / "module.pyc").write_text("bytecode")
+    (test_dir / "module.pyo").write_text("optimized")
+
+    _, manifest = cache.hash_directory(test_dir)
+
+    relpaths = [e["relpath"] for e in manifest]
+    assert "module.py" in relpaths
+    assert "module.pyc" not in relpaths
+    assert "module.pyo" not in relpaths
+
+
+def test_scandir_recursive_skips_swap_files(tmp_path: pathlib.Path) -> None:
+    """_scandir_recursive should skip vim swap files (.swp, .swo, ~)."""
+    test_dir = tmp_path / "mydir"
+    test_dir.mkdir()
+    (test_dir / "file.txt").write_text("content")
+    (test_dir / "file.txt.swp").write_text("swap")
+    (test_dir / "file.txt.swo").write_text("swap2")
+    (test_dir / "file.txt~").write_text("backup")
+    (test_dir / ".#file.txt").write_text("emacs lock")
+
+    _, manifest = cache.hash_directory(test_dir)
+
+    relpaths = [e["relpath"] for e in manifest]
+    assert "file.txt" in relpaths
+    assert "file.txt.swp" not in relpaths
+    assert "file.txt.swo" not in relpaths
+    assert "file.txt~" not in relpaths
+    assert ".#file.txt" not in relpaths
+
+
+def test_scandir_recursive_skips_ide_dirs(tmp_path: pathlib.Path) -> None:
+    """_scandir_recursive should skip IDE directories (.idea, .vscode)."""
+    test_dir = tmp_path / "mydir"
+    test_dir.mkdir()
+    (test_dir / "main.py").write_text("# code")
+
+    for ide_dir in [".idea", ".vscode"]:
+        d = test_dir / ide_dir
+        d.mkdir()
+        (d / "settings.json").write_text("{}")
+
+    _, manifest = cache.hash_directory(test_dir)
+
+    relpaths = [e["relpath"] for e in manifest]
+    assert "main.py" in relpaths
+    assert ".idea/settings.json" not in relpaths
+    assert ".vscode/settings.json" not in relpaths
+
+
+def test_scandir_recursive_skips_build_dirs(tmp_path: pathlib.Path) -> None:
+    """_scandir_recursive should skip build output directories."""
+    test_dir = tmp_path / "mydir"
+    test_dir.mkdir()
+    (test_dir / "setup.py").write_text("# setup")
+
+    for build_dir in ["dist", "build", "node_modules"]:
+        d = test_dir / build_dir
+        d.mkdir()
+        (d / "artifact").write_text("build output")
+
+    _, manifest = cache.hash_directory(test_dir)
+
+    relpaths = [e["relpath"] for e in manifest]
+    assert "setup.py" in relpaths
+    assert "dist/artifact" not in relpaths
+    assert "build/artifact" not in relpaths
+    assert "node_modules/artifact" not in relpaths
+
+
+def test_scandir_recursive_skips_pivot_internal(tmp_path: pathlib.Path) -> None:
+    """_scandir_recursive should skip .pivot internal directory."""
+    test_dir = tmp_path / "mydir"
+    test_dir.mkdir()
+    (test_dir / "pipeline.py").write_text("# pipeline")
+    pivot_dir = test_dir / ".pivot"
+    pivot_dir.mkdir()
+    (pivot_dir / "state.lmdb").write_text("database")
+
+    _, manifest = cache.hash_directory(test_dir)
+
+    relpaths = [e["relpath"] for e in manifest]
+    assert "pipeline.py" in relpaths
+    assert ".pivot/state.lmdb" not in relpaths
+
+
+def test_scandir_recursive_does_not_skip_regular_dirs(tmp_path: pathlib.Path) -> None:
+    """_scandir_recursive should not skip regular directories."""
+    test_dir = tmp_path / "mydir"
+    test_dir.mkdir()
+    (test_dir / "main.py").write_text("# main")
+    src_dir = test_dir / "src"
+    src_dir.mkdir()
+    (src_dir / "module.py").write_text("# module")
+    data_dir = test_dir / "data"
+    data_dir.mkdir()
+    (data_dir / "input.csv").write_text("a,b,c")
+
+    _, manifest = cache.hash_directory(test_dir)
+
+    relpaths = [e["relpath"] for e in manifest]
+    assert "main.py" in relpaths
+    assert "src/module.py" in relpaths
+    assert "data/input.csv" in relpaths
