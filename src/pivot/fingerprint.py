@@ -8,6 +8,7 @@ import pathlib
 import sys
 import types
 import typing
+import weakref
 from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any, cast
 
@@ -19,6 +20,15 @@ if TYPE_CHECKING:
     from pivot import loaders
 
 _SITE_PACKAGE_PATHS = ("site-packages", "dist-packages")
+
+# Cache for hash_function_ast results using weak references.
+# This avoids repeated AST parsing for the same function during fingerprinting
+# while ensuring stale entries are automatically cleaned up when functions are GC'd.
+# Note: WeakKeyDictionary is not thread-safe. Fingerprinting runs single-threaded
+# per process (multiprocessing uses separate memory spaces), so this is safe.
+_hash_function_ast_cache: weakref.WeakKeyDictionary[Callable[..., Any], str] = (
+    weakref.WeakKeyDictionary()
+)
 
 
 def get_stage_fingerprint(
@@ -360,6 +370,20 @@ def hash_function_ast(func: Callable[..., Any]) -> str:
     stages using lambdas. Mitigation: Use named functions instead of lambdas in
     pipeline stages for stable fingerprinting.
     """
+    # WeakKeyDictionary raises TypeError for non-weakly-referenceable functions (builtins)
+    try:
+        cached = _hash_function_ast_cache.get(func)
+        if cached is not None:
+            return cached
+        result = _compute_function_hash(func)
+        _hash_function_ast_cache[func] = result
+        return result
+    except TypeError:
+        return _compute_function_hash(func)
+
+
+def _compute_function_hash(func: Callable[..., Any]) -> str:
+    """Compute hash for a function (uncached implementation)."""
     # For wrapped functions (via functools.wraps), inspect.getsource() follows
     # __wrapped__ and returns the ORIGINAL function's source, making decorator
     # logic invisible. Use __code__ bytecode to capture the actual wrapper.
