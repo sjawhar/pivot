@@ -4,7 +4,7 @@ import json
 import pathlib
 from typing import TYPE_CHECKING
 
-from pivot import cli, executor, project, stage
+from pivot import cli, executor, stage
 from pivot.registry import REGISTRY
 from pivot.tui import console
 
@@ -288,9 +288,6 @@ def test_cli_run_prints_results(runner: CliRunner, tmp_path: pathlib.Path) -> No
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
 
-        # Clear cache after entering isolated filesystem
-        project._project_root_cache = None
-
         def stage_fn() -> None:
             pathlib.Path("output.txt").write_text("done")
 
@@ -309,9 +306,6 @@ def test_cli_run_prints_skipped_stages(runner: CliRunner, tmp_path: pathlib.Path
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
-
-        # Clear cache after entering isolated filesystem
-        project._project_root_cache = None
 
         def stage_fn() -> None:
             pathlib.Path("output.txt").write_text("done")
@@ -439,8 +433,6 @@ def test_cli_run_json_emits_stage_events(runner: CliRunner, tmp_path: pathlib.Pa
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
 
-        project._project_root_cache = None
-
         def stage_fn() -> None:
             pathlib.Path("output.txt").write_text("done")
 
@@ -461,8 +453,6 @@ def test_cli_run_json_emits_execution_result(runner: CliRunner, tmp_path: pathli
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
-
-        project._project_root_cache = None
 
         def stage_fn() -> None:
             pathlib.Path("output.txt").write_text("done")
@@ -504,8 +494,6 @@ def test_cli_run_json_stage_complete_has_duration(
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
-
-        project._project_root_cache = None
 
         def stage_fn() -> None:
             pathlib.Path("output.txt").write_text("done")

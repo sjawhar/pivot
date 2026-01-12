@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import enum
 import json
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
 import click
 
@@ -13,9 +14,25 @@ if TYPE_CHECKING:
 from pivot import exceptions, registry
 
 
+def _json_default(obj: Any) -> Any:  # noqa: ANN401 - json.dumps default requires Any
+    """Handle non-standard JSON types in JSONL output."""
+    if isinstance(obj, enum.Enum):
+        return obj.value
+    if isinstance(obj, set):
+        # Convert to sorted list for JSON serialization (deterministic output)
+        # Cast needed because isinstance(obj, set) doesn't narrow the element type
+        return sorted(cast("set[Any]", obj), key=str)
+    # Let json.dumps raise TypeError for truly unserializable types
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+
 def emit_jsonl(event: object) -> None:
-    """Emit a single JSONL event to stdout with flush for streaming."""
-    print(json.dumps(event), flush=True)
+    """Emit a single JSONL event to stdout with flush for streaming.
+
+    Handles StrEnum values automatically. Sets are converted to sorted lists.
+    Other non-serializable types will raise TypeError.
+    """
+    print(json.dumps(event, default=_json_default), flush=True)
 
 
 def get_cli_context(ctx: click.Context) -> CliContext:
