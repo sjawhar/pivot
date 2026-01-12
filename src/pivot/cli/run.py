@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, TypedDict
 
 import click
 
-from pivot import discovery, exceptions, executor, registry
+from pivot import discovery, exceptions, executor, metrics, registry
 from pivot.cli import completion
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
@@ -278,6 +278,15 @@ def _print_results(results: dict[str, ExecutionSummary]) -> None:
     if failed > 0:
         parts.append(f"{failed} failed")
     click.echo(f"\nTotal: {', '.join(parts)}")
+
+    # Print metrics summary if available (when PIVOT_METRICS=1 or metrics.enable() was called)
+    metrics_summary = metrics.summary()
+    if metrics_summary:
+        click.echo("\nMetrics:")
+        for name, stats in metrics_summary.items():
+            click.echo(
+                f"  {name}: {stats['count']}x, total={stats['total_ms']:.1f}ms, avg={stats['avg_ms']:.1f}ms"
+            )
 
 
 @cli_decorators.pivot_command()
