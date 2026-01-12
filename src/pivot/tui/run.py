@@ -432,6 +432,9 @@ _TUI_BINDINGS: list[textual.binding.BindingType] = [
     textual.binding.Binding("l", "nav_right", "Right", show=False),
     textual.binding.Binding("left", "nav_left", "Left", show=False),
     textual.binding.Binding("right", "nav_right", "Right", show=False),
+    # Changed-item navigation (in detail panel only)
+    textual.binding.Binding("n", "next_changed", "Next Change", show=False),
+    textual.binding.Binding("N", "prev_changed", "Prev Change", show=False),
     # Tab mnemonic keys (shift+letter)
     textual.binding.Binding("L", "goto_tab_logs", "Logs Tab", show=False),
     textual.binding.Binding("I", "goto_tab_input", "Input Tab", show=False),
@@ -743,6 +746,18 @@ class _BaseTuiApp(textual.app.App[_AppReturnT]):
         panel = self._get_active_diff_panel()
         if self._focused_panel == "detail" and panel:
             panel.expand_details()
+
+    def action_next_changed(self) -> None:  # pragma: no cover
+        """Move selection to next changed item."""
+        panel = self._get_active_diff_panel()
+        if self._focused_panel == "detail" and panel:
+            panel.select_next_changed()
+
+    def action_prev_changed(self) -> None:  # pragma: no cover
+        """Move selection to previous changed item."""
+        panel = self._get_active_diff_panel()
+        if self._focused_panel == "detail" and panel:
+            panel.select_prev_changed()
 
     @override
     async def action_quit(self) -> None:  # pragma: no cover

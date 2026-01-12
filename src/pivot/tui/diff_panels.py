@@ -10,6 +10,7 @@ Users can navigate with j/k and expand details to full-width with Enter.
 
 from __future__ import annotations
 
+import logging
 import pathlib
 from typing import TYPE_CHECKING, Literal, assert_never, override
 
@@ -21,12 +22,15 @@ import textual.widgets
 
 from pivot import explain, outputs, parameters, project
 from pivot.registry import REGISTRY
+from pivot.show import data as data_mod
 from pivot.show import metrics as metrics_mod
 from pivot.show.metrics import MetricDiff
 from pivot.storage import cache, lock
 from pivot.types import (
     ChangeType,
     CodeChange,
+    DataDiffResult,
+    DataFileFormat,
     DepChange,
     MetricValue,
     OutputChange,
@@ -37,6 +41,8 @@ from pivot.types import (
 if TYPE_CHECKING:
     from pivot.registry import RegistryStageInfo
     from pivot.types import LockData, OutputHash
+
+logger = logging.getLogger(__name__)
 
 # Type alias for output types matching OutputChange["output_type"]
 OutputType = Literal["out", "metric", "plot"]
@@ -249,6 +255,40 @@ class _SelectableExpandablePanel(textual.containers.Horizontal):
         self._detail_expanded = False
         self.remove_class("expanded")
         self._update_display()
+
+    def select_next_changed(self) -> None:  # pragma: no cover
+        """Move selection to next changed item."""
+        if not self._item_ids:
+            return
+        for i in range(self._selected_idx + 1, len(self._item_ids)):
+            if self._is_changed(self._item_ids[i]):
+                self._selected_idx = i
+                self._update_display()
+                return
+        for i in range(self._selected_idx):
+            if self._is_changed(self._item_ids[i]):
+                self._selected_idx = i
+                self._update_display()
+                return
+
+    def select_prev_changed(self) -> None:  # pragma: no cover
+        """Move selection to previous changed item."""
+        if not self._item_ids:
+            return
+        for i in range(self._selected_idx - 1, -1, -1):
+            if self._is_changed(self._item_ids[i]):
+                self._selected_idx = i
+                self._update_display()
+                return
+        for i in range(len(self._item_ids) - 1, self._selected_idx, -1):
+            if self._is_changed(self._item_ids[i]):
+                self._selected_idx = i
+                self._update_display()
+                return
+
+    def _is_changed(self, _item_id: str) -> bool:
+        """Check if an item has changes. Subclasses should override."""
+        return True
 
     def _reset_selection_state(self) -> None:
         """Reset selection and expansion state. Called by subclasses in set_stage."""
@@ -598,6 +638,23 @@ class InputDiffPanel(_SelectableExpandablePanel):
 
         return "\n".join(lines)
 
+    @override
+    def _is_changed(self, item_id: str) -> bool:
+        """Check if an item has changes."""
+        item_type, item_key = item_id.split(":", 1)
+        match item_type:
+            case "code":
+                # CodeChange.change_type is always set (not optional)
+                return self._find_code_change(item_key) is not None
+            case "dep":
+                # DepChange only exists for changed deps; unchanged deps have no entry
+                return self._find_dep_change(item_key) is not None
+            case "param":
+                # ParamChange.change_type is always set (not optional)
+                return self._find_param_change(item_key) is not None
+            case _:
+                return False
+
     def _find_code_change(self, key: str) -> CodeChange | None:
         """Find a code change by key."""
         return self._code_by_key.get(key)
@@ -710,6 +767,14 @@ class OutputDiffPanel(_SelectableExpandablePanel):
         if not change:
             return "[dim]No changes[/]"
 
+        # When expanded, show data diff for data files with changes
+        if self._detail_expanded:
+            if self._is_data_file(item_path) and change["change_type"] is not None:
+                return self._render_data_diff(item_path, change)
+            # Non-data file or unchanged - show hash detail
+            return self._render_hash_detail(item_path, change)
+
+        # Split view (not expanded) - show summary
         rel_path = _get_relative_path(item_path)
         # item_type is always one of OutputType values from _build_items
         item_type: OutputType = change["output_type"]
@@ -742,7 +807,15 @@ class OutputDiffPanel(_SelectableExpandablePanel):
         self._append_hash_detail(
             lines, change["old_hash"], change["new_hash"], change["change_type"]
         )
+
         return "\n".join(lines)
+
+    @override
+    def _is_changed(self, item_id: str) -> bool:
+        """Check if an item has changes."""
+        _, item_path = item_id.split(":", 1)
+        change = self._find_output_change(item_path)
+        return change is not None and change["change_type"] is not None
 
     def _find_output_change(self, path: str) -> OutputChange | None:
         """Find an output change by path."""
@@ -809,6 +882,185 @@ class OutputDiffPanel(_SelectableExpandablePanel):
                 return f"[dim]({sign}{delta:.4f})[/]"
             return f"[dim]({sign}{delta})[/]"
         return ""
+
+    def _is_data_file(self, path: str) -> bool:  # pragma: no cover
+        """Check if path is a supported data file format."""
+        return data_mod.detect_format(pathlib.Path(path)) != DataFileFormat.UNKNOWN
+
+    def _render_data_diff(self, item_path: str, change: OutputChange) -> str:  # pragma: no cover
+        """Render row-level diff. Temp file scoped to this call."""
+        rel_path = _get_relative_path(item_path)
+        old_hash = change["old_hash"]
+
+        # File added - no old version to compare
+        if old_hash is None:
+            return self._render_file_added(rel_path, change)
+
+        temp_path: pathlib.Path | None = None
+        try:
+            temp_path = data_mod.restore_data_from_cache(rel_path, old_hash)
+            if temp_path is None:
+                return self._render_hash_detail(item_path, change, cache_miss=True)
+
+            new_path = pathlib.Path(item_path)
+            if not new_path.exists():
+                # File removed
+                diff_result = data_mod.diff_data_files(temp_path, None, rel_path)
+            else:
+                diff_result = data_mod.diff_data_files(temp_path, new_path, rel_path)
+
+            return self._format_diff_result(diff_result, change)
+        except Exception as e:
+            return f"[red]Error computing diff: {rich.markup.escape(str(e))}[/]"
+        finally:
+            if temp_path:
+                temp_path.unlink(missing_ok=True)
+
+    def _render_file_added(self, rel_path: str, change: OutputChange) -> str:  # pragma: no cover
+        """Render detail for a newly added file."""
+        lines = [
+            f"[bold]{rich.markup.escape(rel_path)}[/]",
+            "",
+            f"Type: {self._get_type_label(change['output_type'])}",
+            "Status: [green]Added[/]",
+            "",
+        ]
+
+        # Try to get info about the new file
+        new_path = pathlib.Path(change["path"])
+        if new_path.exists():
+            try:
+                df = data_mod.load_dataframe(new_path)
+                lines.append(f"[bold]New File:[/] {len(df)} rows, {len(df.columns)} columns")
+                lines.append(
+                    f"[bold]Columns:[/] {', '.join(rich.markup.escape(str(c)) for c in df.columns[:10])}"
+                )
+                if len(df.columns) > 10:
+                    lines.append(f"  ... and {len(df.columns) - 10} more columns")
+            except Exception:
+                logger.debug("Failed to load dataframe for %s", new_path, exc_info=True)
+
+        lines.append("")
+        lines.append(f"New hash: {rich.markup.escape(str(change['new_hash'] or '(none)'))}")
+
+        return "\n".join(lines)
+
+    def _render_hash_detail(
+        self, item_path: str, change: OutputChange, *, cache_miss: bool = False
+    ) -> str:  # pragma: no cover
+        """Render hash-only detail for non-data files or when cache is unavailable."""
+        rel_path = _get_relative_path(item_path)
+        type_label = self._get_type_label(change["output_type"])
+
+        lines = [
+            f"[bold]{rich.markup.escape(rel_path)}[/]",
+            "",
+            f"Type: {type_label}",
+            f"Status: {self._format_status(change['change_type'])}",
+            "",
+        ]
+
+        if cache_miss:
+            lines.append("[dim]Old version not in cache. Run `pivot cache rebuild` to restore.[/]")
+            lines.append("")
+
+        old_hash = change["old_hash"] or "(none)"
+        new_hash = change["new_hash"] or "(none)"
+        lines.extend(
+            [
+                f"Old hash: {rich.markup.escape(str(old_hash))}",
+                f"New hash: {rich.markup.escape(str(new_hash))}",
+            ]
+        )
+
+        return "\n".join(lines)
+
+    def _format_diff_result(
+        self, result: DataDiffResult, change: OutputChange
+    ) -> str:  # pragma: no cover
+        """Format DataDiffResult as Rich markup text."""
+        lines = list[str]()
+
+        # Header
+        lines.append(f"[bold]{rich.markup.escape(result['path'])}[/]")
+        lines.append("")
+        lines.append(f"Type: {self._get_type_label(change['output_type'])}")
+        lines.append(f"Status: {self._format_status(change['change_type'])}")
+        lines.append("")
+
+        # Summary
+        old_rows = result["old_rows"]
+        new_rows = result["new_rows"]
+        if old_rows is not None and new_rows is not None:
+            delta = new_rows - old_rows
+            sign = "+" if delta >= 0 else ""
+            lines.append(f"[bold]Rows:[/] {old_rows} → {new_rows} ({sign}{delta})")
+        elif old_rows is None and new_rows is not None:
+            lines.append(f"[bold]Rows:[/] (new) {new_rows}")
+        elif old_rows is not None and new_rows is None:
+            lines.append(f"[bold]Rows:[/] {old_rows} → (deleted)")
+
+        # Column changes
+        old_cols = result["old_cols"]
+        new_cols = result["new_cols"]
+        if old_cols is not None and new_cols is not None:
+            old_count = len(old_cols)
+            new_count = len(new_cols)
+            if old_count != new_count:
+                delta = new_count - old_count
+                sign = "+" if delta >= 0 else ""
+                lines.append(f"[bold]Columns:[/] {old_count} → {new_count} ({sign}{delta})")
+
+        # Reorder only
+        if result["reorder_only"]:
+            lines.append("")
+            lines.append("[yellow]Row order changed (content identical)[/]")
+
+        # Schema changes
+        if result["schema_changes"]:
+            lines.append("")
+            lines.append("[bold]Schema Changes:[/]")
+            for schema_change in result["schema_changes"][:20]:
+                indicator = _get_indicator(schema_change["change_type"])
+                col = rich.markup.escape(str(schema_change["column"]))
+                old_dtype = schema_change["old_dtype"] or "(none)"
+                new_dtype = schema_change["new_dtype"] or "(none)"
+                match schema_change["change_type"]:
+                    case ChangeType.ADDED:
+                        lines.append(f"  {indicator} {col} [dim](new: {new_dtype})[/]")
+                    case ChangeType.REMOVED:
+                        lines.append(f"  {indicator} {col} [dim](was: {old_dtype})[/]")
+                    case ChangeType.MODIFIED:
+                        lines.append(f"  {indicator} {col} [dim]{old_dtype} → {new_dtype}[/]")
+            if len(result["schema_changes"]) > 20:
+                lines.append(f"  [dim]... and {len(result['schema_changes']) - 20} more[/]")
+
+        # Row changes
+        if result["row_changes"]:
+            lines.append("")
+            total = len(result["row_changes"])
+            lines.append(f"[bold]Row Changes:[/] ({total} shown)")
+            for row_change in result["row_changes"][:50]:
+                indicator = _get_indicator(row_change["change_type"])
+                key = rich.markup.escape(str(row_change["key"]))
+                lines.append(f"  {indicator} {key}")
+            if total > 50:
+                lines.append(f"  [dim]... and {total - 50} more[/]")
+
+        # Truncation notice
+        if result["truncated"]:
+            lines.append("")
+            lines.append("[dim]Large file - showing sample only[/]")
+
+        if result["summary_only"]:
+            lines.append("")
+            lines.append("[dim]No row-level diff available for this file type[/]")
+
+        # Navigation hint
+        lines.append("")
+        lines.append("[dim]n/N: next/prev change │ Esc: close[/]")
+
+        return "\n".join(lines)
 
     @override
     def _render_empty_state(self) -> str:

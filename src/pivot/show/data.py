@@ -4,7 +4,9 @@ import collections
 import csv
 import json
 import logging
+import os
 import pathlib
+import re
 from typing import TYPE_CHECKING, Any, TypedDict, cast, override
 
 import numpy
@@ -43,6 +45,9 @@ _DATA_EXTENSIONS: dict[str, DataFileFormat] = {
 
 # Default threshold for in-memory comparison (100MB)
 _MAX_IN_MEMORY_SIZE = 100 * 1024 * 1024
+
+# Hash validation pattern for xxhash64 (16 hex characters)
+_HASH_PATTERN = re.compile(r"^[0-9a-f]{16}$")
 
 
 class _NumpyEncoder(json.JSONEncoder):
@@ -635,9 +640,17 @@ def restore_data_from_cache(
     """
     import tempfile
 
+    # Validate hash format to prevent path traversal attacks
+    if not _HASH_PATTERN.fullmatch(file_hash.lower()):
+        return None
+
     proj_root = project.get_project_root()
     cache_dir = proj_root / ".pivot" / "cache" / "files"
     cached_path = cache_dir / file_hash[:2] / file_hash[2:]
+
+    # Prevent symlink escape attacks
+    if cached_path.is_symlink():
+        return None
 
     if not cached_path.exists():
         return None
@@ -648,10 +661,13 @@ def restore_data_from_cache(
     temp_path = pathlib.Path(temp_path_str)
 
     try:
+        # Set restrictive permissions before writing any data
+        os.fchmod(fd, 0o600)
         with open(fd, "wb") as f:
             f.write(cached_path.read_bytes())
         return temp_path
     except OSError:  # pragma: no cover
+        os.close(fd)
         temp_path.unlink(missing_ok=True)
         return None
 

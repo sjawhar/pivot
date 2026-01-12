@@ -834,12 +834,14 @@ def test_restore_data_from_cache(
     set_project_root: Path,
 ) -> None:
     """Restore data file from cache."""
-    cache_dir = tmp_path / ".pivot" / "cache" / "files" / "ab"
+    # Use valid 16-character xxhash64 format (hash validation requires it)
+    file_hash = "abc1234567890def"
+    cache_dir = tmp_path / ".pivot" / "cache" / "files" / file_hash[:2]
     cache_dir.mkdir(parents=True)
-    cached_file = cache_dir / "c123"
+    cached_file = cache_dir / file_hash[2:]
     cached_file.write_text("id,name\n1,alice\n")
 
-    temp_path = data.restore_data_from_cache("data.csv", "abc123")
+    temp_path = data.restore_data_from_cache("data.csv", file_hash)
 
     assert temp_path is not None
     assert temp_path.exists()
@@ -852,7 +854,41 @@ def test_restore_data_from_cache_not_found(
     set_project_root: Path,
 ) -> None:
     """Return None when cache file not found."""
-    result = data.restore_data_from_cache("data.csv", "nonexistent")
+    # Use valid hash format, but file doesn't exist
+    result = data.restore_data_from_cache("data.csv", "0123456789abcdef")
+    assert result is None
+
+
+def test_restore_data_from_cache_invalid_hash(
+    tmp_path: Path,
+    set_project_root: Path,
+) -> None:
+    """Return None when hash format is invalid (security check)."""
+    # Invalid: too short
+    assert data.restore_data_from_cache("data.csv", "abc123") is None
+    # Invalid: contains path traversal attempt
+    assert data.restore_data_from_cache("data.csv", "../../../etc/pass") is None
+    # Invalid: contains non-hex characters
+    assert data.restore_data_from_cache("data.csv", "abc123ghijklmnop") is None
+
+
+def test_restore_data_from_cache_symlink_blocked(
+    tmp_path: Path,
+    set_project_root: Path,
+) -> None:
+    """Return None when cached file is a symlink (security check)."""
+    file_hash = "abc1234567890def"
+    cache_dir = tmp_path / ".pivot" / "cache" / "files" / file_hash[:2]
+    cache_dir.mkdir(parents=True)
+
+    # Create a real file and a symlink to it
+    real_file = tmp_path / "real_file.csv"
+    real_file.write_text("id,name\n1,alice\n")
+    symlink_file = cache_dir / file_hash[2:]
+    symlink_file.symlink_to(real_file)
+
+    # Should return None because it's a symlink
+    result = data.restore_data_from_cache("data.csv", file_hash)
     assert result is None
 
 
