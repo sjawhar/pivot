@@ -7,6 +7,7 @@ import click
 
 from pivot import registry
 from pivot.cli import decorators as cli_decorators
+from pivot.cli import helpers as cli_helpers
 
 
 class StageJsonOutput(TypedDict):
@@ -40,13 +41,15 @@ def _get_output_sources(stage_list: list[str]) -> dict[str, str]:
 @click.pass_context
 def list_cmd(ctx: click.Context, as_json: bool, show_deps: bool) -> None:
     """List registered stages."""
-    verbose = ctx.obj.get("verbose", False) if ctx.obj else False
+    cli_ctx = cli_helpers.get_cli_context(ctx)
+    verbose = cli_ctx["verbose"]
+    quiet = cli_ctx["quiet"]
     stage_list = registry.REGISTRY.list_stages()
 
     if not stage_list:
         if as_json:
             click.echo(json.dumps(ListJsonOutput(stages=[])))
-        else:
+        elif not quiet:
             click.echo("No stages registered.")
             click.echo("Create a pipeline.py with @stage decorators, or a pivot.yaml file.")
         return
@@ -63,6 +66,10 @@ def list_cmd(ctx: click.Context, as_json: bool, show_deps: bool) -> None:
             for name in stage_list
         ]
         click.echo(json.dumps(ListJsonOutput(stages=stages), indent=2))
+        return
+
+    # Quiet mode: no output, just exit code
+    if quiet:
         return
 
     # Build output->stage map for showing dep sources

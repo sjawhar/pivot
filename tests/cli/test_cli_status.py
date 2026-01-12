@@ -375,3 +375,67 @@ def test_status_json_stages_only_empty(
         assert "stages" in data
         assert data["stages"] == []
         assert "tracked_files" not in data, "Should not include unrequested sections"
+
+
+# =============================================================================
+# Quiet Mode Tests
+# =============================================================================
+
+
+def test_status_quiet_no_output_when_clean(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """pivot --quiet status produces no output when all stages are cached."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        pathlib.Path("input.txt").write_text("data")
+
+        REGISTRY.register(_helper_process, name="process", deps=["input.txt"], outs=["output.txt"])
+
+        # Run once to cache
+        executor.run(show_output=False)
+
+        result = runner.invoke(cli.cli, ["--quiet", "status"])
+
+        assert result.exit_code == 0
+        assert result.output.strip() == "", "Quiet mode should suppress output when clean"
+
+
+def test_status_quiet_exits_1_when_stale(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """pivot --quiet status exits 1 when stages are stale."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        pathlib.Path("input.txt").write_text("data")
+
+        REGISTRY.register(_helper_process, name="process", deps=["input.txt"], outs=["output.txt"])
+
+        # Don't run - stage is stale
+        result = runner.invoke(cli.cli, ["--quiet", "status"])
+
+        assert result.exit_code == 1, "Should exit 1 when stages are stale"
+        assert result.output.strip() == "", "Quiet mode should suppress output"
+
+
+def test_status_quiet_exits_1_when_modified(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """pivot --quiet status exits 1 when files are modified."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        pathlib.Path("input.txt").write_text("data")
+
+        REGISTRY.register(_helper_process, name="process", deps=["input.txt"], outs=["output.txt"])
+
+        # Run to cache
+        executor.run(show_output=False)
+
+        # Modify input file
+        pathlib.Path("input.txt").write_text("modified data")
+
+        result = runner.invoke(cli.cli, ["--quiet", "status"])
+
+        # Stage should now be stale due to modified input
+        assert result.exit_code == 1, "Should exit 1 when files are modified"
+        assert result.output.strip() == "", "Quiet mode should suppress output"

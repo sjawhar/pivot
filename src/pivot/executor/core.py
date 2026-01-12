@@ -37,9 +37,13 @@ from pivot.tui import console
 from pivot.types import (
     OnError,
     OutputMessage,
+    RunEventType,
+    RunJsonEvent,
+    StageCompleteEvent,
     StageDisplayStatus,
     StageExplanation,
     StageResult,
+    StageStartEvent,
     StageStatus,
     TuiLogMessage,
     TuiMessage,
@@ -48,6 +52,8 @@ from pivot.types import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from networkx import DiGraph
 
 logger = logging.getLogger(__name__)
@@ -116,6 +122,7 @@ def run(
     output_queue: mp.Queue[OutputMessage] | None = None,
     no_commit: bool = False,
     no_cache: bool = False,
+    progress_callback: Callable[[RunJsonEvent], None] | None = None,
 ) -> dict[str, ExecutionSummary]:
     """Execute pipeline stages with greedy parallel execution.
 
@@ -136,6 +143,7 @@ def run(
             Pass this when running in TUI mode to avoid multiprocessing issues.
         no_commit: If True, defer lock files to pending dir (faster iteration).
         no_cache: If True, skip caching outputs entirely (maximum iteration speed).
+        progress_callback: Callback for JSONL progress events (stage start/complete).
 
     Returns:
         Dict of stage_name -> {status: "ran"|"skipped"|"failed", reason: str}
@@ -225,6 +233,7 @@ def run(
             force=force,
             no_commit=no_commit,
             no_cache=no_cache,
+            progress_callback=progress_callback,
         )
 
         results = _build_results(stage_states)
@@ -360,6 +369,7 @@ def _execute_greedy(
     force: bool = False,
     no_commit: bool = False,
     no_cache: bool = False,
+    progress_callback: Callable[[RunJsonEvent], None] | None = None,
 ) -> None:
     """Execute stages with greedy parallel scheduling using loky ProcessPoolExecutor."""
     overrides = overrides or {}
@@ -410,6 +420,7 @@ def _execute_greedy(
                 force=force,
                 no_commit=no_commit,
                 no_cache=no_cache,
+                progress_callback=progress_callback,
             )
 
             while futures:
@@ -466,6 +477,19 @@ def _execute_greedy(
                                     elapsed=state.get_duration(),
                                 )
                             )
+
+                        if progress_callback:
+                            duration = state.get_duration()
+                            progress_callback(
+                                StageCompleteEvent(
+                                    type=RunEventType.STAGE_COMPLETE,
+                                    stage=stage_name,
+                                    status=StageStatus.FAILED,
+                                    reason=timeout_reason,
+                                    duration_ms=(duration or 0) * 1000,
+                                    timestamp=datetime.datetime.now(datetime.UTC).isoformat(),
+                                )
+                            )
                     continue
 
                 for future in done:
@@ -513,7 +537,8 @@ def _execute_greedy(
                             mutex_counts[mutex] = 0  # Reset to valid state
 
                     if state.result:
-                        result_status = StageStatus(state.result["status"])
+                        # Use result status directly - already Literal[RAN, SKIPPED, FAILED]
+                        result_status = state.result["status"]
                         result_reason = state.result["reason"]
                         duration = state.get_duration()
 
@@ -537,6 +562,18 @@ def _execute_greedy(
                                     status=result_status,
                                     reason=result_reason,
                                     elapsed=duration,
+                                )
+                            )
+
+                        if progress_callback:
+                            progress_callback(
+                                StageCompleteEvent(
+                                    type=RunEventType.STAGE_COMPLETE,
+                                    stage=stage_name,
+                                    status=result_status,
+                                    reason=result_reason,
+                                    duration_ms=(duration or 0) * 1000,
+                                    timestamp=datetime.datetime.now(datetime.UTC).isoformat(),
                                 )
                             )
 
@@ -569,6 +606,7 @@ def _execute_greedy(
                         force=force,
                         no_commit=no_commit,
                         no_cache=no_cache,
+                        progress_callback=progress_callback,
                     )
     finally:
         # Signal output thread to stop - may fail if queue is broken
@@ -637,6 +675,7 @@ def _start_ready_stages(
     force: bool = False,
     no_commit: bool = False,
     no_cache: bool = False,
+    progress_callback: Callable[[RunJsonEvent], None] | None = None,
 ) -> None:
     """Find and start stages that are ready to execute."""
     checkout_modes = checkout_modes or config.DEFAULT_CHECKOUT_MODE_ORDER
@@ -717,6 +756,17 @@ def _start_ready_stages(
                         status=StageStatus.IN_PROGRESS,
                         reason="",
                         elapsed=None,
+                    )
+                )
+
+            if progress_callback:
+                progress_callback(
+                    StageStartEvent(
+                        type=RunEventType.STAGE_START,
+                        stage=stage_name,
+                        index=stage_index,
+                        total=total_stages,
+                        timestamp=datetime.datetime.now(datetime.UTC).isoformat(),
                     )
                 )
         except Exception as e:

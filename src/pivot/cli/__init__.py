@@ -12,7 +12,7 @@ COMMAND_CATEGORIES = {
     "Inspection": ["list", "metrics", "params", "plots", "data", "history", "show"],
     "Versioning": ["track", "checkout"],
     "Remote": ["remote", "push", "pull"],
-    "Other": ["init", "export", "config", "completion", "schema", "check-ignore"],
+    "Other": ["init", "export", "config", "completion", "schema", "check-ignore", "doctor"],
 }
 
 # Lazy command registry: command_name -> (module_path, attr_name, help_text)
@@ -47,6 +47,7 @@ _LAZY_COMMANDS: dict[str, tuple[str, str, str]] = {
         "check_ignore",
         "Check if paths are ignored by .pivotignore.",
     ),
+    "doctor": ("pivot.cli.doctor", "doctor", "Check environment and configuration for issues."),
 }
 
 
@@ -54,6 +55,7 @@ class CliContext(TypedDict):
     """Context object for CLI commands."""
 
     verbose: bool
+    quiet: bool
 
 
 class PivotGroup(click.Group):
@@ -111,23 +113,31 @@ class PivotGroup(click.Group):
                 formatter.write_dl(uncategorized)
 
 
-def _setup_logging(verbose: bool) -> None:
+def _setup_logging(verbose: bool, quiet: bool) -> None:
     """Configure logging for CLI output."""
-    level = logging.DEBUG if verbose else logging.INFO
+    if quiet:
+        level = logging.WARNING
+    elif verbose:
+        level = logging.DEBUG
+    else:
+        level = logging.INFO
     logging.basicConfig(level=level, format="%(message)s", force=True)
 
 
 @click.group(cls=PivotGroup)
 @click.option("--verbose", "-v", is_flag=True, help="Show detailed output")
+@click.option("--quiet", "-q", is_flag=True, help="Suppress non-essential output")
 @click.pass_context
-def cli(ctx: click.Context, verbose: bool) -> None:
+def cli(ctx: click.Context, verbose: bool, quiet: bool) -> None:
     """Fast pipeline execution with per-stage caching.
 
     Pivot accelerates ML pipelines with automatic change detection,
     parallel execution, and smart caching.
     """
-    ctx.obj = CliContext(verbose=verbose)
-    _setup_logging(verbose)
+    if verbose and quiet:
+        raise click.UsageError("--verbose and --quiet are mutually exclusive")
+    ctx.obj = CliContext(verbose=verbose, quiet=quiet)
+    _setup_logging(verbose, quiet)
 
 
 def main() -> None:

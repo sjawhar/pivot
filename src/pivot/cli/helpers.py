@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import TYPE_CHECKING
 
 import click
@@ -7,7 +8,27 @@ import click
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from pivot.cli import CliContext
+
 from pivot import exceptions, registry
+
+
+def emit_jsonl(event: object) -> None:
+    """Emit a single JSONL event to stdout with flush for streaming."""
+    print(json.dumps(event), flush=True)
+
+
+def get_cli_context(ctx: click.Context) -> CliContext:
+    """Get CLI context with defaults if not set."""
+    if ctx.obj:
+        return ctx.obj
+    # Return dict matching CliContext structure to avoid circular import
+    return {"verbose": False, "quiet": False}
+
+
+def stages_to_list(stages: tuple[str, ...]) -> list[str] | None:
+    """Convert Click's stage tuple to list or None if empty."""
+    return list(stages) if stages else None
 
 
 def validate_stages_exist(stages: list[str] | None) -> None:

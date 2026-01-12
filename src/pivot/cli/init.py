@@ -6,6 +6,7 @@ import click
 
 from pivot import exceptions, ignore
 from pivot.cli import decorators as cli_decorators
+from pivot.cli import helpers as cli_helpers
 
 _GITIGNORE_CONTENT = """\
 # Cache directory (stage outputs, file hashes)
@@ -27,8 +28,11 @@ config.yaml.lock
     is_flag=True,
     help="Overwrite existing .pivot/.gitignore",
 )
-def init(force: bool) -> None:
+@click.pass_context
+def init(ctx: click.Context, force: bool) -> None:
     """Initialize a new Pivot project."""
+    cli_ctx = cli_helpers.get_cli_context(ctx)
+    quiet = cli_ctx["quiet"]
     pivot_dir = pathlib.Path.cwd() / ".pivot"
 
     if pivot_dir.is_symlink():
@@ -43,7 +47,15 @@ def init(force: bool) -> None:
             )
 
     pivot_dir.mkdir(exist_ok=True)
-    (pivot_dir / ".gitignore").write_text(_GITIGNORE_CONTENT)
+    gitignore_path = pivot_dir / ".gitignore"
+
+    # Warn if overwriting existing .gitignore with custom content
+    if force and gitignore_path.exists():
+        existing_content = gitignore_path.read_text()
+        if existing_content != _GITIGNORE_CONTENT and not quiet:
+            click.echo("Warning: Overwriting existing .pivot/.gitignore", err=True)
+
+    gitignore_path.write_text(_GITIGNORE_CONTENT)
 
     # Create .pivotignore with default patterns if it doesn't exist
     pivotignore_path = pathlib.Path.cwd() / ".pivotignore"
@@ -53,15 +65,16 @@ def init(force: bool) -> None:
         pivotignore_path.write_text(pivotignore_content)
         created_pivotignore = True
 
-    click.echo("Initialized Pivot project.")
-    click.echo()
-    click.echo("Created:")
-    click.echo("  .pivot/")
-    click.echo("  .pivot/.gitignore")
-    if created_pivotignore:
-        click.echo("  .pivotignore")
-    click.echo()
-    click.echo("Next steps:")
-    click.echo("  1. Create pivot.yaml to define your pipeline stages")
-    click.echo("  2. Run 'pivot run' to execute the pipeline")
-    click.echo("  3. See 'pivot --help' for more commands")
+    if not quiet:
+        click.echo("Initialized Pivot project.")
+        click.echo()
+        click.echo("Created:")
+        click.echo("  .pivot/")
+        click.echo("  .pivot/.gitignore")
+        if created_pivotignore:
+            click.echo("  .pivotignore")
+        click.echo()
+        click.echo("Next steps:")
+        click.echo("  1. Create pivot.yaml to define your pipeline stages")
+        click.echo("  2. Run 'pivot run' to execute the pipeline")
+        click.echo("  3. See 'pivot --help' for more commands")

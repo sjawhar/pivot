@@ -348,3 +348,78 @@ def test_init_creates_valid_project_structure(
     gitignore_content = (pivot_dir / ".gitignore").read_text()
     assert "cache/" in gitignore_content
     assert "state.lmdb/" in gitignore_content
+
+
+# --- quiet mode tests ---
+
+
+def test_init_quiet_produces_no_output(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """pivot --quiet init produces no output."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        result = runner.invoke(cli.cli, ["--quiet", "init"])
+
+        assert result.exit_code == 0
+        assert result.output.strip() == "", "Quiet mode should suppress output"
+        assert pathlib.Path(".pivot").is_dir(), "Should still create .pivot directory"
+
+
+def test_init_quiet_still_creates_files(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """pivot --quiet init still creates all expected files."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        result = runner.invoke(cli.cli, ["--quiet", "init"])
+
+        assert result.exit_code == 0
+        assert pathlib.Path(".pivot").is_dir()
+        assert pathlib.Path(".pivot/.gitignore").exists()
+
+
+# --- gitignore overwrite warning tests ---
+
+
+def test_init_force_warns_when_overwriting_custom_gitignore(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """pivot init --force warns when overwriting custom .gitignore."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".pivot").mkdir()
+        pathlib.Path(".pivot/.gitignore").write_text("# Custom gitignore\nmy_custom_entry/\n")
+
+        result = runner.invoke(cli.cli, ["init", "--force"])
+
+        assert result.exit_code == 0
+        assert "warning" in result.output.lower(), "Should warn about overwriting"
+
+
+def test_init_force_no_warning_for_identical_gitignore(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """pivot init --force doesn't warn when .gitignore is identical."""
+    from pivot.cli import init as init_module
+
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".pivot").mkdir()
+        # Write the exact same content that init would write
+        pathlib.Path(".pivot/.gitignore").write_text(init_module._GITIGNORE_CONTENT)
+
+        result = runner.invoke(cli.cli, ["init", "--force"])
+
+        assert result.exit_code == 0
+        assert "warning" not in result.output.lower(), "Should not warn for identical content"
+
+
+def test_init_force_quiet_suppresses_warning(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """pivot --quiet init --force suppresses overwrite warning."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".pivot").mkdir()
+        pathlib.Path(".pivot/.gitignore").write_text("# Custom content")
+
+        result = runner.invoke(cli.cli, ["--quiet", "init", "--force"])
+
+        assert result.exit_code == 0
+        assert result.output.strip() == "", "Quiet mode should suppress warning"

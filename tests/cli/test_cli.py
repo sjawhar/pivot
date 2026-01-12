@@ -404,3 +404,150 @@ def test_cli_run_unknown_stage_shows_suggestion(runner: CliRunner, tmp_path: pat
         assert result.exit_code != 0
         assert "nonexistent_stage" in result.output
         assert "pivot list" in result.output, "Should suggest running pivot list"
+
+
+# =============================================================================
+# JSONL Streaming Tests (pivot run --json)
+# =============================================================================
+
+
+def test_cli_run_json_emits_schema_version(runner: CliRunner, tmp_path: pathlib.Path) -> None:
+    """pivot run --json emits schema_version event first."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        pathlib.Path("input.txt").write_text("data")
+
+        def stage_fn() -> None:
+            pathlib.Path("output.txt").write_text("done")
+
+        REGISTRY.register(stage_fn, name="my_stage", deps=["input.txt"], outs=["output.txt"])
+
+        result = runner.invoke(cli.cli, ["run", "--json"])
+
+        assert result.exit_code == 0
+        lines = [line for line in result.output.strip().split("\n") if line]
+        assert len(lines) >= 1, "Should have at least one event"
+
+        first_event = json.loads(lines[0])
+        assert first_event["type"] == "schema_version"
+        assert first_event["version"] == 1
+
+
+def test_cli_run_json_emits_stage_events(runner: CliRunner, tmp_path: pathlib.Path) -> None:
+    """pivot run --json emits stage_start and stage_complete events."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        pathlib.Path("input.txt").write_text("data")
+
+        project._project_root_cache = None
+
+        def stage_fn() -> None:
+            pathlib.Path("output.txt").write_text("done")
+
+        REGISTRY.register(stage_fn, name="my_stage", deps=["input.txt"], outs=["output.txt"])
+
+        result = runner.invoke(cli.cli, ["run", "--json"])
+
+        assert result.exit_code == 0
+        events = [json.loads(line) for line in result.output.strip().split("\n") if line]
+
+        event_types = [e["type"] for e in events]
+        assert "stage_start" in event_types, "Should emit stage_start event"
+        assert "stage_complete" in event_types, "Should emit stage_complete event"
+
+
+def test_cli_run_json_emits_execution_result(runner: CliRunner, tmp_path: pathlib.Path) -> None:
+    """pivot run --json emits execution_result event at end."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        pathlib.Path("input.txt").write_text("data")
+
+        project._project_root_cache = None
+
+        def stage_fn() -> None:
+            pathlib.Path("output.txt").write_text("done")
+
+        REGISTRY.register(stage_fn, name="my_stage", deps=["input.txt"], outs=["output.txt"])
+
+        result = runner.invoke(cli.cli, ["run", "--json"])
+
+        assert result.exit_code == 0
+        events = [json.loads(line) for line in result.output.strip().split("\n") if line]
+
+        last_event = events[-1]
+        assert last_event["type"] == "execution_result"
+        assert "ran" in last_event
+        assert "skipped" in last_event
+        assert "failed" in last_event
+        assert "total_duration_ms" in last_event
+
+
+def test_cli_run_json_no_stages_emits_events(runner: CliRunner, tmp_path: pathlib.Path) -> None:
+    """pivot run --json emits events even with no stages."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+
+        result = runner.invoke(cli.cli, ["run", "--json"])
+
+        assert result.exit_code == 0
+        events = [json.loads(line) for line in result.output.strip().split("\n") if line]
+
+        assert events[0]["type"] == "schema_version"
+        assert events[-1]["type"] == "execution_result"
+        assert events[-1]["ran"] == 0
+
+
+def test_cli_run_json_stage_complete_has_duration(
+    runner: CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """pivot run --json stage_complete events include duration_ms."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        pathlib.Path("input.txt").write_text("data")
+
+        project._project_root_cache = None
+
+        def stage_fn() -> None:
+            pathlib.Path("output.txt").write_text("done")
+
+        REGISTRY.register(stage_fn, name="my_stage", deps=["input.txt"], outs=["output.txt"])
+
+        result = runner.invoke(cli.cli, ["run", "--json"])
+
+        assert result.exit_code == 0
+        events = [json.loads(line) for line in result.output.strip().split("\n") if line]
+
+        complete_events = [e for e in events if e["type"] == "stage_complete"]
+        assert len(complete_events) >= 1
+        assert "duration_ms" in complete_events[0]
+        assert complete_events[0]["duration_ms"] >= 0
+
+
+# =============================================================================
+# Quiet Flag Tests
+# =============================================================================
+
+
+def test_cli_quiet_flag_accepted(runner: CliRunner) -> None:
+    """--quiet flag should be accepted."""
+    result = runner.invoke(cli.cli, ["--quiet", "--help"])
+    assert result.exit_code == 0
+
+
+def test_cli_quiet_verbose_mutually_exclusive(runner: CliRunner) -> None:
+    """--quiet and --verbose are mutually exclusive."""
+    result = runner.invoke(cli.cli, ["--quiet", "--verbose", "list"])
+    assert result.exit_code != 0
+    assert "mutually exclusive" in result.output.lower()
+
+
+def test_cli_list_quiet_produces_no_output(runner: CliRunner, tmp_path: pathlib.Path) -> None:
+    """pivot --quiet list produces no output."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+
+        result = runner.invoke(cli.cli, ["--quiet", "list"])
+
+        assert result.exit_code == 0
+        # Output should be empty or minimal (just newlines)
+        assert result.output.strip() == "", "Quiet mode should suppress output"
