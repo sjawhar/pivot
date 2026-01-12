@@ -17,6 +17,9 @@ if TYPE_CHECKING:
 
     from pytest_mock import MockerFixture
 
+    from tests.conftest import ValidLockContentFactory
+
+
 # -----------------------------------------------------------------------------
 # Local Cache Hash Scanning Tests
 # -----------------------------------------------------------------------------
@@ -104,13 +107,13 @@ def test_get_stage_output_hashes_no_lock(lock_project: Path) -> None:
     assert result == set()
 
 
-def test_get_stage_output_hashes_file_output(lock_project: Path) -> None:
+def test_get_stage_output_hashes_file_output(
+    lock_project: Path, make_valid_lock_content: ValidLockContentFactory
+) -> None:
     """Extracts hash from file output in lock file."""
     cache_dir = lock_project / ".pivot" / "cache"
 
-    lock_data = {
-        "outs": [{"path": "output.csv", "hash": "abc123def45678"}],
-    }
+    lock_data = make_valid_lock_content(outs=[{"path": "output.csv", "hash": "abc123def45678"}])
     lock_path = cache_dir / "stages" / "my_stage.lock"
     with lock_path.open("w") as f:
         yaml.dump(lock_data, f)
@@ -119,22 +122,34 @@ def test_get_stage_output_hashes_file_output(lock_project: Path) -> None:
     assert result == {"abc123def45678"}
 
 
-def test_get_stage_output_hashes_directory_output(lock_project: Path) -> None:
+def test_get_stage_output_hashes_directory_output(
+    lock_project: Path, make_valid_lock_content: ValidLockContentFactory
+) -> None:
     """Extracts all hashes from directory output including manifest."""
     cache_dir = lock_project / ".pivot" / "cache"
 
-    lock_data = {
-        "outs": [
+    lock_data = make_valid_lock_content(
+        outs=[
             {
                 "path": "output_dir",
                 "hash": "treehash1234567",
                 "manifest": [
-                    {"relpath": "file1.txt", "hash": "filehash1234567", "size": 100},
-                    {"relpath": "file2.txt", "hash": "filehash2345678", "size": 200},
+                    {
+                        "relpath": "file1.txt",
+                        "hash": "filehash1234567",
+                        "size": 100,
+                        "isexec": False,
+                    },
+                    {
+                        "relpath": "file2.txt",
+                        "hash": "filehash2345678",
+                        "size": 200,
+                        "isexec": False,
+                    },
                 ],
             }
-        ],
-    }
+        ]
+    )
     lock_path = cache_dir / "stages" / "my_stage.lock"
     with lock_path.open("w") as f:
         yaml.dump(lock_data, f)
@@ -143,12 +158,16 @@ def test_get_stage_output_hashes_directory_output(lock_project: Path) -> None:
     assert result == {"treehash1234567", "filehash1234567", "filehash2345678"}
 
 
-def test_get_stage_output_hashes_multiple_stages(lock_project: Path) -> None:
+def test_get_stage_output_hashes_multiple_stages(
+    lock_project: Path, make_valid_lock_content: ValidLockContentFactory
+) -> None:
     """Collects hashes from multiple stages."""
     cache_dir = lock_project / ".pivot" / "cache"
 
     for i, stage in enumerate(["stage_a", "stage_b"]):
-        lock_data = {"outs": [{"path": f"out{i}.csv", "hash": f"hash{i}{'0' * 11}"}]}
+        lock_data = make_valid_lock_content(
+            outs=[{"path": f"out{i}.csv", "hash": f"hash{i}{'0' * 11}"}]
+        )
         lock_path = cache_dir / "stages" / f"{stage}.lock"
         with lock_path.open("w") as f:
             yaml.dump(lock_data, f)
@@ -158,16 +177,18 @@ def test_get_stage_output_hashes_multiple_stages(lock_project: Path) -> None:
     assert "hash1" + "0" * 11 in result
 
 
-def test_get_stage_output_hashes_skips_uncached(lock_project: Path) -> None:
+def test_get_stage_output_hashes_skips_uncached(
+    lock_project: Path, make_valid_lock_content: ValidLockContentFactory
+) -> None:
     """Skips outputs with null hash (uncached)."""
     cache_dir = lock_project / ".pivot" / "cache"
 
-    lock_data = {
-        "outs": [
+    lock_data = make_valid_lock_content(
+        outs=[
             {"path": "cached.csv", "hash": "abc123def45678"},
             {"path": "uncached.csv", "hash": None},
-        ],
-    }
+        ]
+    )
     lock_path = cache_dir / "stages" / "my_stage.lock"
     with lock_path.open("w") as f:
         yaml.dump(lock_data, f)
@@ -181,16 +202,18 @@ def test_get_stage_output_hashes_skips_uncached(lock_project: Path) -> None:
 # -----------------------------------------------------------------------------
 
 
-def test_get_stage_dep_hashes(lock_project: Path) -> None:
+def test_get_stage_dep_hashes(
+    lock_project: Path, make_valid_lock_content: ValidLockContentFactory
+) -> None:
     """Extracts dependency hashes from lock file."""
     cache_dir = lock_project / ".pivot" / "cache"
 
-    lock_data = {
-        "deps": [
+    lock_data = make_valid_lock_content(
+        deps=[
             {"path": "input.csv", "hash": "dep1hash1234567"},
             {"path": "config.yaml", "hash": "dep2hash1234567"},
-        ],
-    }
+        ]
+    )
     lock_path = cache_dir / "stages" / "my_stage.lock"
     with lock_path.open("w") as f:
         yaml.dump(lock_data, f)
@@ -199,22 +222,24 @@ def test_get_stage_dep_hashes(lock_project: Path) -> None:
     assert result == {"dep1hash1234567", "dep2hash1234567"}
 
 
-def test_get_stage_dep_hashes_with_manifest(lock_project: Path) -> None:
+def test_get_stage_dep_hashes_with_manifest(
+    lock_project: Path, make_valid_lock_content: ValidLockContentFactory
+) -> None:
     """Extracts all hashes from directory dependency including manifest."""
     cache_dir = lock_project / ".pivot" / "cache"
 
-    lock_data = {
-        "deps": [
+    lock_data = make_valid_lock_content(
+        deps=[
             {
                 "path": "input_dir",
                 "hash": "dirtreehash1234",
                 "manifest": [
-                    {"relpath": "a.txt", "hash": "afilehash123456", "size": 10},
-                    {"relpath": "b.txt", "hash": "bfilehash123456", "size": 20},
+                    {"relpath": "a.txt", "hash": "afilehash123456", "size": 10, "isexec": False},
+                    {"relpath": "b.txt", "hash": "bfilehash123456", "size": 20, "isexec": False},
                 ],
             }
-        ],
-    }
+        ]
+    )
     lock_path = cache_dir / "stages" / "my_stage.lock"
     with lock_path.open("w") as f:
         yaml.dump(lock_data, f)
@@ -374,7 +399,9 @@ async def test_push_async_handles_failures(lock_project: Path, mocker: MockerFix
     assert "Upload failed" in result["errors"]
 
 
-async def test_push_async_with_stages(lock_project: Path, mocker: MockerFixture) -> None:
+async def test_push_async_with_stages(
+    lock_project: Path, mocker: MockerFixture, make_valid_lock_content: ValidLockContentFactory
+) -> None:
     """Push with specific stages only pushes those stage outputs."""
 
     cache_dir = lock_project / ".pivot" / "cache"
@@ -384,7 +411,7 @@ async def test_push_async_with_stages(lock_project: Path, mocker: MockerFixture)
     (files_dir / "ab").mkdir(parents=True)
     (files_dir / "ab" / ("c" * 14)).write_text("content1")
 
-    lock_data = {"outs": [{"path": "out.csv", "hash": hash1}]}
+    lock_data = make_valid_lock_content(outs=[{"path": "out.csv", "hash": hash1}])
     lock_path = cache_dir / "stages" / "my_stage.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("w") as f:
@@ -426,7 +453,9 @@ async def test_pull_async_no_needed_hashes(lock_project: Path, mocker: MockerFix
     assert result["failed"] == 0
 
 
-async def test_pull_async_all_already_local(lock_project: Path, mocker: MockerFixture) -> None:
+async def test_pull_async_all_already_local(
+    lock_project: Path, mocker: MockerFixture, make_valid_lock_content: ValidLockContentFactory
+) -> None:
     """Pull when all files local returns skipped count."""
 
     cache_dir = lock_project / ".pivot" / "cache"
@@ -436,7 +465,7 @@ async def test_pull_async_all_already_local(lock_project: Path, mocker: MockerFi
     (files_dir / "ab").mkdir(parents=True)
     (files_dir / "ab" / ("c" * 14)).write_text("content1")
 
-    lock_data = {"outs": [{"path": "out.csv", "hash": hash1}]}
+    lock_data = make_valid_lock_content(outs=[{"path": "out.csv", "hash": hash1}])
     lock_path = cache_dir / "stages" / "my_stage.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("w") as f:
@@ -454,13 +483,15 @@ async def test_pull_async_all_already_local(lock_project: Path, mocker: MockerFi
     assert result["failed"] == 0
 
 
-async def test_pull_async_downloads_missing(lock_project: Path, mocker: MockerFixture) -> None:
+async def test_pull_async_downloads_missing(
+    lock_project: Path, mocker: MockerFixture, make_valid_lock_content: ValidLockContentFactory
+) -> None:
     """Pull downloads files not in local cache."""
 
     cache_dir = lock_project / ".pivot" / "cache"
 
     hash1 = "ab" + "c" * 14
-    lock_data = {"outs": [{"path": "out.csv", "hash": hash1}]}
+    lock_data = make_valid_lock_content(outs=[{"path": "out.csv", "hash": hash1}])
     lock_path = cache_dir / "stages" / "my_stage.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("w") as f:
@@ -504,13 +535,15 @@ async def test_pull_async_without_stages_lists_remote(
     mock_remote.list_hashes.assert_called_once()
 
 
-async def test_pull_async_handles_failures(lock_project: Path, mocker: MockerFixture) -> None:
+async def test_pull_async_handles_failures(
+    lock_project: Path, mocker: MockerFixture, make_valid_lock_content: ValidLockContentFactory
+) -> None:
     """Pull reports failures in summary."""
 
     cache_dir = lock_project / ".pivot" / "cache"
 
     hash1 = "ab" + "c" * 14
-    lock_data = {"outs": [{"path": "out.csv", "hash": hash1}]}
+    lock_data = make_valid_lock_content(outs=[{"path": "out.csv", "hash": hash1}])
     lock_path = cache_dir / "stages" / "my_stage.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("w") as f:
@@ -531,17 +564,19 @@ async def test_pull_async_handles_failures(lock_project: Path, mocker: MockerFix
     assert "Download failed" in result["errors"]
 
 
-async def test_pull_async_includes_deps(lock_project: Path, mocker: MockerFixture) -> None:
+async def test_pull_async_includes_deps(
+    lock_project: Path, mocker: MockerFixture, make_valid_lock_content: ValidLockContentFactory
+) -> None:
     """Pull includes dependency hashes when stages specified."""
 
     cache_dir = lock_project / ".pivot" / "cache"
 
     out_hash = "ab" + "c" * 14
     dep_hash = "de" + "f" * 14
-    lock_data = {
-        "outs": [{"path": "out.csv", "hash": out_hash}],
-        "deps": [{"path": "in.csv", "hash": dep_hash}],
-    }
+    lock_data = make_valid_lock_content(
+        outs=[{"path": "out.csv", "hash": out_hash}],
+        deps=[{"path": "in.csv", "hash": dep_hash}],
+    )
     lock_path = cache_dir / "stages" / "my_stage.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("w") as f:

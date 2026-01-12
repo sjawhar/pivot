@@ -30,7 +30,7 @@ class MetricDiff(TypedDict):
     key: str
     old: MetricValue
     new: MetricValue
-    change: ChangeType
+    change_type: ChangeType
 
 
 class MetricsError(Exception):
@@ -186,7 +186,7 @@ def diff_metrics(
     """Compare old vs new metrics. Returns list of diffs."""
     raw_diffs = common.build_two_level_diff(old, new)
     return [
-        MetricDiff(path=path, key=key, old=old_val, new=new_val, change=change)
+        MetricDiff(path=path, key=key, old=old_val, new=new_val, change_type=change)
         for path, key, old_val, new_val, change in raw_diffs
     ]
 
@@ -224,7 +224,7 @@ def format_diff_table(
             diff["key"],
             _format_value(diff["old"], precision),
             _format_value(diff["new"], precision),
-            diff["change"],
+            diff["change_type"],
         ]
         if show_path:
             row.insert(0, diff["path"])

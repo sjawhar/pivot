@@ -27,7 +27,7 @@ class ParamDiff(TypedDict):
     key: str
     old: ParamValue
     new: ParamValue
-    change: ChangeType
+    change_type: ChangeType
 
 
 class CollectResult(TypedDict):
@@ -127,18 +127,24 @@ def diff_params(
 
             if key not in old_params:
                 diffs.append(
-                    ParamDiff(stage=stage, key=key, old=None, new=new_val, change=ChangeType.ADDED)
+                    ParamDiff(
+                        stage=stage, key=key, old=None, new=new_val, change_type=ChangeType.ADDED
+                    )
                 )
             elif key not in new_params:
                 diffs.append(
                     ParamDiff(
-                        stage=stage, key=key, old=old_val, new=None, change=ChangeType.REMOVED
+                        stage=stage, key=key, old=old_val, new=None, change_type=ChangeType.REMOVED
                     )
                 )
             elif not _values_equal(old_val, new_val):
                 diffs.append(
                     ParamDiff(
-                        stage=stage, key=key, old=old_val, new=new_val, change=ChangeType.MODIFIED
+                        stage=stage,
+                        key=key,
+                        old=old_val,
+                        new=new_val,
+                        change_type=ChangeType.MODIFIED,
                     )
                 )
 
@@ -197,7 +203,7 @@ def format_diff_table(
                 key=d["key"],
                 old=_apply_precision(d["old"], precision),
                 new=_apply_precision(d["new"], precision),
-                change=d["change"],
+                change_type=d["change_type"],
             )
             for d in diffs
         ]
@@ -211,7 +217,7 @@ def format_diff_table(
                 diff["key"],
                 _format_value(diff["old"], precision),
                 _format_value(diff["new"], precision),
-                diff["change"],
+                diff["change_type"],
             ]
         )
 

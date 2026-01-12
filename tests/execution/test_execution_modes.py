@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
-from pivot import outputs, project, reactive, run_history
+from pivot import outputs, project, run_history, watch
 from pivot.executor import commit as commit_mod
 from pivot.executor import worker
 from pivot.storage import lock, state
@@ -408,13 +408,13 @@ def test_committed_run_cache_entries_survive_pruning(
         "no_cache_defaults_to_False",
     ],
 )
-def test_reactive_engine_flag_passed_to_executor(
+def test_watch_engine_flag_passed_to_executor(
     monkeypatch: pytest.MonkeyPatch,
     flag_name: str,
     flag_value: bool | None,
     expected_value: bool,
 ) -> None:
-    """ReactiveEngine should pass flags correctly to executor.run."""
+    """WatchEngine should pass flags correctly to executor.run."""
     executor_call_args = dict[str, object]()
 
     def mock_executor_run(**kwargs: object) -> dict[str, object]:
@@ -432,7 +432,7 @@ def test_reactive_engine_flag_passed_to_executor(
     if flag_value is not None:
         engine_kwargs[flag_name] = flag_value
 
-    engine = reactive.ReactiveEngine(**engine_kwargs)
+    engine = watch.WatchEngine(**engine_kwargs)
     engine._execute_stages(None)
 
     assert flag_name in executor_call_args, f"{flag_name} should be passed to executor.run"

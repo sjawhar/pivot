@@ -21,16 +21,16 @@ import yaml
 
 from pivot import dag, executor, project, registry, types
 from pivot.pipeline import yaml as pipeline_yaml
-from pivot.reactive import _watch_utils
 from pivot.types import (
     OutputMessage,
-    ReactiveAffectedStagesEvent,
-    ReactiveEventType,
-    ReactiveExecutionResultEvent,
-    ReactiveFilesChangedEvent,
-    ReactiveStageResult,
-    ReactiveStatusEvent,
+    WatchAffectedStagesEvent,
+    WatchEventType,
+    WatchExecutionResultEvent,
+    WatchFilesChangedEvent,
+    WatchStageResult,
+    WatchStatusEvent,
 )
+from pivot.watch import _watch_utils
 
 if TYPE_CHECKING:
     import multiprocessing as mp
@@ -39,7 +39,7 @@ if TYPE_CHECKING:
     import networkx as nx
 
     from pivot.registry import RegistryStageInfo
-    from pivot.types import ReactiveJsonEvent, TuiMessage
+    from pivot.types import TuiMessage, WatchJsonEvent
 
 logger = logging.getLogger(__name__)
 
@@ -115,15 +115,19 @@ def _get_pyc_path(source_path: str) -> pathlib.Path | None:
         if source.suffix != ".py":
             return None
         # Python stores bytecode in __pycache__/<name>.cpython-<version>.pyc
-        # Match any version tag - e.g. "helpers.cpython-313.pyc"
         cache_dir = source.parent / "__pycache__"
-        return next(cache_dir.glob(f"{source.stem}.*.pyc"), None)
+        # Match any version tag - we want to remove all cached versions
+        # The glob pattern matches e.g. "helpers.cpython-313.pyc"
+        stem = source.stem
+        for pyc in cache_dir.glob(f"{stem}.*.pyc"):
+            return pyc  # Return first match - typically only one exists
+        return None
     except Exception:
         return None
 
 
-class ReactiveEngine:
-    """Reactive execution engine with file watching and automatic re-execution."""
+class WatchEngine:
+    """Watch mode execution engine with file watching and automatic re-execution."""
 
     _stages: list[str] | None
     _single_stage: bool
@@ -183,7 +187,7 @@ class ReactiveEngine:
         tui_queue: mp.Queue[TuiMessage] | None = None,
         output_queue: mp.Queue[OutputMessage] | None = None,
     ) -> None:
-        """Start reactive engine with watcher and coordinator."""
+        """Start watch engine with watcher and coordinator."""
         self._tui_queue = tui_queue
         self._output_queue = output_queue
 
@@ -192,14 +196,6 @@ class ReactiveEngine:
         stages_to_run = dag.get_execution_order(
             graph, self._stages, single_stage=self._single_stage
         )
-
-        # Send initial stage list to TUI before starting execution
-        if self._tui_queue is not None:
-            msg = types.TuiReloadMessage(
-                type=types.TuiMessageType.RELOAD,
-                stages=stages_to_run,
-            )
-            self._tui_queue.put_nowait(msg)
 
         # Start watcher thread (non-daemon - we have proper cleanup via _shutdown event)
         self._watcher_thread = threading.Thread(
@@ -210,15 +206,15 @@ class ReactiveEngine:
 
         try:
             # Run initial execution
-            self._send_message("Running initial pipeline...", status=types.ReactiveStatus.DETECTING)
+            self._send_message("Running initial pipeline...", status=types.WatchStatus.DETECTING)
             try:
                 results = self._execute_stages(self._stages)
                 if self._json_output and results:
                     self._emit_json(
-                        ReactiveExecutionResultEvent(
-                            type=ReactiveEventType.EXECUTION_RESULT,
+                        WatchExecutionResultEvent(
+                            type=WatchEventType.EXECUTION_RESULT,
                             stages={
-                                name: ReactiveStageResult(
+                                name: WatchStageResult(
                                     status=result["status"], reason=result["reason"]
                                 )
                                 for name, result in results.items()
@@ -226,9 +222,7 @@ class ReactiveEngine:
                         )
                     )
             except Exception as e:
-                self._send_message(
-                    f"Initial execution failed: {e}", status=types.ReactiveStatus.ERROR
-                )
+                self._send_message(f"Initial execution failed: {e}", status=types.WatchStatus.ERROR)
             self._send_message("Watching for changes...")
 
             # Run coordinator (blocks until shutdown)
@@ -259,8 +253,8 @@ class ReactiveEngine:
         """Pure producer - monitors files, enqueues changes."""
         try:
             watch_paths = _watch_utils.collect_watch_paths(stages_to_run)
-            watch_filter = _watch_utils.create_watch_filter()
-            pending: set[pathlib.Path] = set()
+            watch_filter = _watch_utils.create_watch_filter(stages_to_run)
+            pending = set[pathlib.Path]()
 
             logger.info(f"Watching paths: {watch_paths}")
 
@@ -269,9 +263,7 @@ class ReactiveEngine:
                 watch_filter=watch_filter,
                 stop_event=self._shutdown,
             ):
-                # watchfiles yields set[tuple[Change, str]] - extract paths
-                for _, path_str in changes:
-                    pending.add(pathlib.Path(path_str))
+                pending.update(pathlib.Path(path) for _, path in changes)
 
                 # Prevent unbounded memory growth - use sentinel for "full rebuild"
                 if len(pending) > _MAX_PENDING_CHANGES:
@@ -282,12 +274,12 @@ class ReactiveEngine:
 
                 try:
                     self._change_queue.put_nowait(pending)
-                    pending = set()
+                    pending = set[pathlib.Path]()
                 except queue.Full:
                     pass  # Keep accumulating, will send next iteration
         except Exception as e:
             logger.critical(f"Watcher thread failed: {e}")
-            self._send_message(f"File watcher failed: {e}", status=types.ReactiveStatus.ERROR)
+            self._send_message(f"File watcher failed: {e}", status=types.WatchStatus.ERROR)
             self.shutdown()  # Signal coordinator to exit
 
     def _coordinator_loop(self) -> None:
@@ -304,15 +296,15 @@ class ReactiveEngine:
                 # Filter out sentinel path and convert to strings
                 paths = [str(p) for p in changes if p != _FULL_REBUILD_SENTINEL]
                 self._emit_json(
-                    ReactiveFilesChangedEvent(
-                        type=ReactiveEventType.FILES_CHANGED,
+                    WatchFilesChangedEvent(
+                        type=WatchEventType.FILES_CHANGED,
                         paths=paths,
                         code_changed=code_changed,
                     )
                 )
 
             if code_changed:
-                self._send_message("Reloading code...", status=types.ReactiveStatus.RESTARTING)
+                self._send_message("Reloading code...", status=types.WatchStatus.RESTARTING)
                 self._invalidate_caches()
                 reload_ok = self._reload_registry()
                 self._restart_worker_pool()
@@ -322,7 +314,7 @@ class ReactiveEngine:
                     error_summary = "; ".join(self._pipeline_errors or [])
                     self._send_message(
                         f"Pipeline invalid - fix errors to continue: {error_summary}",
-                        status=types.ReactiveStatus.ERROR,
+                        status=types.WatchStatus.ERROR,
                     )
                     self._send_message("Watching for changes...")
                     continue
@@ -340,8 +332,8 @@ class ReactiveEngine:
             # Emit affected_stages event for JSON output
             if self._json_output:
                 self._emit_json(
-                    ReactiveAffectedStagesEvent(
-                        type=ReactiveEventType.AFFECTED_STAGES,
+                    WatchAffectedStagesEvent(
+                        type=WatchEventType.AFFECTED_STAGES,
                         stages=affected,
                         count=len(affected),
                     )
@@ -349,7 +341,7 @@ class ReactiveEngine:
 
             self._send_message(
                 f"Running {len(affected)} affected stage(s)...",
-                status=types.ReactiveStatus.DETECTING,
+                status=types.WatchStatus.DETECTING,
             )
 
             try:
@@ -357,10 +349,10 @@ class ReactiveEngine:
                 # Emit execution results for JSON output
                 if self._json_output and results:
                     self._emit_json(
-                        ReactiveExecutionResultEvent(
-                            type=ReactiveEventType.EXECUTION_RESULT,
+                        WatchExecutionResultEvent(
+                            type=WatchEventType.EXECUTION_RESULT,
                             stages={
-                                name: ReactiveStageResult(
+                                name: WatchStageResult(
                                     status=result["status"], reason=result["reason"]
                                 )
                                 for name, result in results.items()
@@ -368,7 +360,7 @@ class ReactiveEngine:
                         )
                     )
             except Exception as e:
-                self._send_message(f"Execution failed: {e}", status=types.ReactiveStatus.ERROR)
+                self._send_message(f"Execution failed: {e}", status=types.WatchStatus.ERROR)
             self._send_message("Watching for changes...")
 
     def _collect_and_debounce(self, max_wait_s: float = 5.0) -> set[pathlib.Path]:
@@ -532,9 +524,7 @@ class ReactiveEngine:
         if code_changed:
             # Code/config changed - run all stages, let executor's change detection
             # skip stages that don't actually need to run
-            if self._stages is not None:
-                return list(self._stages)  # Return copy to prevent mutation
-            return list(registry.REGISTRY.list_stages())
+            return list(self._stages or registry.REGISTRY.list_stages())
 
         # Data file changed - find affected stages and their downstream
         affected = self._get_stages_matching_changes(changes)
@@ -632,7 +622,7 @@ class ReactiveEngine:
         self._first_run_done = True
         return results
 
-    def _emit_json(self, event: ReactiveJsonEvent) -> None:
+    def _emit_json(self, event: WatchJsonEvent) -> None:
         """Emit a JSONL event to stdout."""
         print(json.dumps(event), flush=True)
 
@@ -640,26 +630,26 @@ class ReactiveEngine:
         self,
         message: str,
         *,
-        status: types.ReactiveStatus = types.ReactiveStatus.WAITING,
+        status: types.WatchStatus = types.WatchStatus.WAITING,
     ) -> None:
         """Send message to TUI, JSON output, or log."""
         if self._json_output:
             self._emit_json(
-                ReactiveStatusEvent(
-                    type=ReactiveEventType.STATUS,
+                WatchStatusEvent(
+                    type=WatchEventType.STATUS,
                     message=message,
-                    is_error=status == types.ReactiveStatus.ERROR,
+                    is_error=status == types.WatchStatus.ERROR,
                 )
             )
             return
 
         if self._tui_queue is not None:
-            msg = types.TuiReactiveMessage(
-                type=types.TuiMessageType.REACTIVE,
+            msg = types.TuiWatchMessage(
+                type=types.TuiMessageType.WATCH,
                 status=status,
                 message=message,
             )
-            if status == types.ReactiveStatus.ERROR:
+            if status == types.WatchStatus.ERROR:
                 # Block briefly for critical messages
                 with contextlib.suppress(queue.Full):
                     self._tui_queue.put(msg, timeout=1.0)
@@ -669,7 +659,7 @@ class ReactiveEngine:
             # Don't log when using TUI - messages go to the queue instead
             return
 
-        if status == types.ReactiveStatus.ERROR:
+        if status == types.WatchStatus.ERROR:
             logger.error(message)
         else:
             logger.info(message)

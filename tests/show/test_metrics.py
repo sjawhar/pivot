@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from pytest_mock import MockerFixture
 
     from pivot.types import MetricValue
+    from tests.conftest import ValidLockContentFactory
 
 # =============================================================================
 # Parsing Tests
@@ -227,7 +228,7 @@ def test_diff_metrics_modified() -> None:
     result = metrics.diff_metrics(old, new)
 
     assert len(result) == 1
-    assert result[0]["change"] == "modified"
+    assert result[0]["change_type"] == "modified"
     assert result[0]["old"] == 0.90
     assert result[0]["new"] == 0.95
 
@@ -240,7 +241,7 @@ def test_diff_metrics_added() -> None:
     result = metrics.diff_metrics(old, new)
 
     assert len(result) == 1
-    assert result[0]["change"] == "added"
+    assert result[0]["change_type"] == "added"
     assert result[0]["key"] == "f1"
     assert result[0]["old"] is None
     assert result[0]["new"] == 0.88
@@ -254,7 +255,7 @@ def test_diff_metrics_removed() -> None:
     result = metrics.diff_metrics(old, new)
 
     assert len(result) == 1
-    assert result[0]["change"] == "removed"
+    assert result[0]["change_type"] == "removed"
     assert result[0]["key"] == "f1"
     assert result[0]["old"] == 0.88
     assert result[0]["new"] is None
@@ -268,7 +269,7 @@ def test_diff_metrics_new_file() -> None:
     result = metrics.diff_metrics(old, new)
 
     assert len(result) == 1
-    assert result[0]["change"] == "added"
+    assert result[0]["change_type"] == "added"
     assert result[0]["path"] == "metrics.json"
 
 
@@ -280,7 +281,7 @@ def test_diff_metrics_removed_file() -> None:
     result = metrics.diff_metrics(old, new)
 
     assert len(result) == 1
-    assert result[0]["change"] == "removed"
+    assert result[0]["change_type"] == "removed"
     assert result[0]["path"] == "metrics.json"
 
 
@@ -332,7 +333,9 @@ def test_format_metrics_table_empty() -> None:
 def test_format_diff_table_plain() -> None:
     """Plain format for diff."""
     diffs = [
-        metrics.MetricDiff(path="m.json", key="acc", old=0.9, new=0.95, change=ChangeType.MODIFIED)
+        metrics.MetricDiff(
+            path="m.json", key="acc", old=0.9, new=0.95, change_type=ChangeType.MODIFIED
+        )
     ]
 
     result = metrics.format_diff_table(diffs, None, precision=2, show_path=True)
@@ -349,7 +352,9 @@ def test_format_diff_table_plain() -> None:
 def test_format_diff_table_no_path() -> None:
     """Diff without path column."""
     diffs = [
-        metrics.MetricDiff(path="m.json", key="acc", old=0.9, new=0.95, change=ChangeType.MODIFIED)
+        metrics.MetricDiff(
+            path="m.json", key="acc", old=0.9, new=0.95, change_type=ChangeType.MODIFIED
+        )
     ]
 
     result = metrics.format_diff_table(diffs, None, precision=2, show_path=False)
@@ -367,14 +372,16 @@ def test_format_diff_table_empty() -> None:
 def test_format_diff_table_json() -> None:
     """JSON format for diff."""
     diffs = [
-        metrics.MetricDiff(path="m.json", key="acc", old=0.9, new=0.95, change=ChangeType.MODIFIED)
+        metrics.MetricDiff(
+            path="m.json", key="acc", old=0.9, new=0.95, change_type=ChangeType.MODIFIED
+        )
     ]
 
     result = metrics.format_diff_table(diffs, OutputFormat.JSON, precision=2)
 
     parsed = json.loads(result)
     assert len(parsed) == 1
-    assert parsed[0]["change"] == "modified"
+    assert parsed[0]["change_type"] == "modified"
 
 
 # =============================================================================
@@ -597,6 +604,7 @@ def test_get_metric_info_from_head_with_metric_stage(
     tmp_path: Path,
     set_project_root: Path,
     mocker: MockerFixture,
+    make_valid_lock_content: ValidLockContentFactory,
 ) -> None:
     """Collect metric hashes from lock files at HEAD."""
     from pivot import git, outputs, stage
@@ -608,9 +616,7 @@ def test_get_metric_info_from_head_with_metric_stage(
         pass
 
     lock_content = yaml.dump(
-        {
-            "outs": [{"path": "metrics.json", "hash": "abc123"}],
-        }
+        make_valid_lock_content(outs=[{"path": "metrics.json", "hash": "abc123"}])
     )
     mocker.patch.object(
         git,

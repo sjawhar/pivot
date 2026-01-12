@@ -205,8 +205,8 @@ def test_run_fails_when_tracked_directory_missing(pipeline_dir: pathlib.Path) ->
             "size": 1000,
             "num_files": 2,
             "manifest": [
-                {"relpath": "a.jpg", "hash": "h1", "size": 500},
-                {"relpath": "b.jpg", "hash": "h2", "size": 500},
+                {"relpath": "a.jpg", "hash": "h1", "size": 500, "isexec": False},
+                {"relpath": "b.jpg", "hash": "h2", "size": 500, "isexec": False},
             ],
         },
     )

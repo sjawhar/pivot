@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Integration tests for watch mode (ReactiveEngine).
+"""Integration tests for watch mode (WatchEngine).
 
 Tests:
 1. Output correctness - watch mode produces same outputs as fresh run

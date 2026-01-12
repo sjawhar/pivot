@@ -11,11 +11,82 @@ import watchfiles
 
 from pivot import executor, project, types
 from pivot.pipeline import yaml as pipeline_yaml
-from pivot.reactive import _watch_utils, engine
 from pivot.registry import REGISTRY, stage
+from pivot.watch import _watch_utils, engine
 
-# pipeline_dir fixture is in conftest.py
-# Note: collect_watch_paths and create_watch_filter tests are in test_watch_utils.py
+
+@pytest.fixture
+def pipeline_dir(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> pathlib.Path:
+    """Set up a temporary pipeline directory."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "pivot.yaml").write_text("version: 1\n")
+    return tmp_path
+
+
+# _collect_watch_paths tests
+
+
+def test_collect_watch_paths_includes_project_root(pipeline_dir: pathlib.Path) -> None:
+    """Project root should always be in watch paths."""
+    paths = _watch_utils.collect_watch_paths([])
+    assert pipeline_dir in paths
+
+
+def test_collect_watch_paths_includes_dependency_directories(
+    pipeline_dir: pathlib.Path,
+) -> None:
+    """Dependency file directories should be included."""
+    data_dir = pipeline_dir / "data"
+    data_dir.mkdir()
+    (data_dir / "input.csv").write_text("a,b\n1,2")
+
+    @stage(deps=["data/input.csv"], outs=["output.txt"])
+    def process() -> None:
+        pass
+
+    paths = _watch_utils.collect_watch_paths(["process"])
+    assert data_dir in paths
+
+
+# _create_watch_filter tests
+
+
+def test_watch_filter_filters_exact_output_match(pipeline_dir: pathlib.Path) -> None:
+    """Should filter out exact output file paths."""
+    output_path = pipeline_dir / "output.txt"
+
+    @stage(deps=[], outs=["output.txt"])
+    def process() -> None:
+        pass
+
+    watch_filter = _watch_utils.create_watch_filter(["process"])
+    assert watch_filter(watchfiles.Change.modified, str(output_path)) is False
+
+
+def test_watch_filter_allows_source_files(pipeline_dir: pathlib.Path) -> None:
+    """Should allow source files that are not outputs."""
+    source_path = pipeline_dir / "src" / "main.py"
+
+    @stage(deps=[], outs=["output.txt"])
+    def process() -> None:
+        pass
+
+    watch_filter = _watch_utils.create_watch_filter(["process"])
+    assert watch_filter(watchfiles.Change.modified, str(source_path)) is True
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/some/path/file.pyc",
+        "/some/path/__pycache__/file.py",
+        "/some/path/file.pyo",
+    ],
+)
+def test_watch_filter_filters_python_bytecode(pipeline_dir: pathlib.Path, path: str) -> None:
+    """Should filter out .pyc, .pyo, and __pycache__ files."""
+    watch_filter = _watch_utils.create_watch_filter([])
+    assert watch_filter(watchfiles.Change.modified, path) is False
 
 
 # _build_file_to_stages_index tests
@@ -34,7 +105,7 @@ def test_build_file_to_stages_index_maps_deps_to_stages(pipeline_dir: pathlib.Pa
     def stage_b() -> None:
         pass
 
-    eng = engine.ReactiveEngine()
+    eng = engine.WatchEngine()
     index = eng._build_file_to_stages_index()
 
     data_path = project.resolve_path("data.csv")
@@ -58,7 +129,7 @@ def test_build_file_to_stages_index_handles_shared_deps(pipeline_dir: pathlib.Pa
     def stage_b() -> None:
         pass
 
-    eng = engine.ReactiveEngine()
+    eng = engine.WatchEngine()
     index = eng._build_file_to_stages_index()
 
     shared_path = project.resolve_path("shared.csv")
@@ -78,7 +149,7 @@ def test_get_stages_affected_by_direct_dep_match(pipeline_dir: pathlib.Path) -> 
     def process() -> None:
         pass
 
-    eng = engine.ReactiveEngine()
+    eng = engine.WatchEngine()
     data_path = project.resolve_path("data.csv")
     affected = eng._get_stages_matching_changes({data_path})
 
@@ -95,7 +166,7 @@ def test_get_stages_affected_by_file_in_dep_directory(pipeline_dir: pathlib.Path
     def process() -> None:
         pass
 
-    eng = engine.ReactiveEngine()
+    eng = engine.WatchEngine()
     file_path = project.resolve_path("data/file.csv")
     affected = eng._get_stages_matching_changes({file_path})
 
@@ -112,7 +183,7 @@ def test_get_stages_affected_returns_empty_for_unrelated_file(
     def process() -> None:
         pass
 
-    eng = engine.ReactiveEngine()
+    eng = engine.WatchEngine()
     unrelated_path = project.resolve_path("unrelated.txt")
     affected = eng._get_stages_matching_changes({unrelated_path})
 
@@ -134,7 +205,7 @@ def test_add_downstream_stages_includes_direct_dependents(pipeline_dir: pathlib.
     def train() -> None:
         pass
 
-    eng = engine.ReactiveEngine()
+    eng = engine.WatchEngine()
     affected = eng._add_downstream_stages({"preprocess"})
 
     assert "preprocess" in affected
@@ -159,7 +230,7 @@ def test_add_downstream_stages_includes_transitive_dependents(
     def step3() -> None:
         pass
 
-    eng = engine.ReactiveEngine()
+    eng = engine.WatchEngine()
     affected = eng._add_downstream_stages({"step1"})
 
     assert "step1" in affected
@@ -184,7 +255,7 @@ def test_get_affected_stages_returns_all_stages_on_code_change(
     def stage_b() -> None:
         pass
 
-    eng = engine.ReactiveEngine()
+    eng = engine.WatchEngine()
     code_path = pathlib.Path("/some/code.py")
     affected = eng._get_affected_stages({code_path}, code_changed=True)
 
@@ -207,7 +278,7 @@ def test_get_affected_stages_returns_subset_on_data_change(
     def stage_b() -> None:
         pass
 
-    eng = engine.ReactiveEngine()
+    eng = engine.WatchEngine()
     data_path = project.resolve_path("data1.csv")
     affected = eng._get_affected_stages({data_path}, code_changed=False)
 
@@ -233,7 +304,7 @@ def test_get_affected_stages_includes_downstream_when_intermediate_file_changes(
     def stage_b() -> None:
         pass
 
-    eng = engine.ReactiveEngine()
+    eng = engine.WatchEngine()
 
     # Simulate changing the intermediate file (which is stage_b's dependency)
     intermediate_path = project.resolve_path("intermediate.csv")
@@ -248,10 +319,9 @@ def test_get_affected_stages_includes_downstream_when_intermediate_file_changes(
 # _collect_and_debounce tests
 
 
-@pytest.mark.usefixtures("pipeline_dir")
-def test_collect_and_debounce_returns_empty_on_shutdown() -> None:
+def test_collect_and_debounce_returns_empty_on_shutdown(pipeline_dir: pathlib.Path) -> None:
     """Should return empty set immediately when shutdown is set."""
-    eng = engine.ReactiveEngine(debounce_ms=100)
+    eng = engine.WatchEngine(debounce_ms=100)
     eng._shutdown.set()
 
     start = time.monotonic()
@@ -262,10 +332,9 @@ def test_collect_and_debounce_returns_empty_on_shutdown() -> None:
     assert elapsed < 1.0, "Should return quickly on shutdown"
 
 
-@pytest.mark.usefixtures("pipeline_dir")
-def test_collect_and_debounce_waits_for_quiet_period() -> None:
+def test_collect_and_debounce_waits_for_quiet_period(pipeline_dir: pathlib.Path) -> None:
     """Should wait for quiet period after last change before returning."""
-    eng = engine.ReactiveEngine(debounce_ms=200)
+    eng = engine.WatchEngine(debounce_ms=200)
 
     # Add change immediately
     path = pathlib.Path("/some/file.txt")
@@ -280,10 +349,9 @@ def test_collect_and_debounce_waits_for_quiet_period() -> None:
     assert elapsed >= 0.2, f"Should wait for quiet period, but only waited {elapsed}s"
 
 
-@pytest.mark.usefixtures("pipeline_dir")
-def test_collect_and_debounce_coalesces_rapid_changes() -> None:
+def test_collect_and_debounce_coalesces_rapid_changes(pipeline_dir: pathlib.Path) -> None:
     """Should collect multiple changes within debounce window."""
-    eng = engine.ReactiveEngine(debounce_ms=300)
+    eng = engine.WatchEngine(debounce_ms=300)
 
     # Add changes rapidly
     path1 = pathlib.Path("/file1.txt")
@@ -304,10 +372,9 @@ def test_collect_and_debounce_coalesces_rapid_changes() -> None:
     assert path2 in changes
 
 
-@pytest.mark.usefixtures("pipeline_dir")
-def test_collect_and_debounce_respects_max_wait() -> None:
+def test_collect_and_debounce_respects_max_wait(pipeline_dir: pathlib.Path) -> None:
     """Should return after max_wait even if changes keep coming."""
-    eng = engine.ReactiveEngine(debounce_ms=500)
+    eng = engine.WatchEngine(debounce_ms=500)
 
     # Continuously add changes
     stop = threading.Event()
@@ -331,13 +398,12 @@ def test_collect_and_debounce_respects_max_wait() -> None:
     assert elapsed < 1.0, f"Should respect max_wait (0.5s), but waited {elapsed}s"
 
 
-# ReactiveEngine initialization tests
+# WatchEngine initialization tests
 
 
-@pytest.mark.usefixtures("pipeline_dir")
-def test_engine_init_sets_defaults() -> None:
+def test_engine_init_sets_defaults(pipeline_dir: pathlib.Path) -> None:
     """Engine should initialize with default values."""
-    eng = engine.ReactiveEngine()
+    eng = engine.WatchEngine()
 
     assert eng._stages is None
     assert eng._single_stage is False
@@ -345,10 +411,9 @@ def test_engine_init_sets_defaults() -> None:
     assert eng._shutdown.is_set() is False
 
 
-@pytest.mark.usefixtures("pipeline_dir")
-def test_engine_init_accepts_custom_values() -> None:
+def test_engine_init_accepts_custom_values(pipeline_dir: pathlib.Path) -> None:
     """Engine should accept custom configuration."""
-    eng = engine.ReactiveEngine(
+    eng = engine.WatchEngine(
         stages=["stage_a", "stage_b"],
         single_stage=True,
         cache_dir=pathlib.Path("/custom/cache"),
@@ -363,24 +428,21 @@ def test_engine_init_accepts_custom_values() -> None:
     assert eng._debounce_ms == 500
 
 
-@pytest.mark.usefixtures("pipeline_dir")
-def test_engine_init_raises_on_negative_debounce() -> None:
+def test_engine_init_raises_on_negative_debounce(pipeline_dir: pathlib.Path) -> None:
     """Engine should reject negative debounce_ms."""
     with pytest.raises(ValueError, match="debounce_ms must be non-negative"):
-        engine.ReactiveEngine(debounce_ms=-1)
+        engine.WatchEngine(debounce_ms=-1)
 
 
-@pytest.mark.usefixtures("pipeline_dir")
-def test_engine_init_accepts_zero_debounce() -> None:
+def test_engine_init_accepts_zero_debounce(pipeline_dir: pathlib.Path) -> None:
     """Engine should accept zero debounce_ms (no quiet period)."""
-    eng = engine.ReactiveEngine(debounce_ms=0)
+    eng = engine.WatchEngine(debounce_ms=0)
     assert eng._debounce_ms == 0
 
 
-@pytest.mark.usefixtures("pipeline_dir")
-def test_engine_shutdown_sets_event() -> None:
+def test_engine_shutdown_sets_event(pipeline_dir: pathlib.Path) -> None:
     """shutdown() should set the shutdown event."""
-    eng = engine.ReactiveEngine()
+    eng = engine.WatchEngine()
     assert eng._shutdown.is_set() is False
 
     eng.shutdown()
@@ -397,7 +459,7 @@ def test_add_downstream_stages_skips_unknown_stages(
     def known_stage() -> None:
         pass
 
-    eng = engine.ReactiveEngine()
+    eng = engine.WatchEngine()
 
     # Try to add downstream for a mix of known and unknown stages
     result = eng._add_downstream_stages({"known_stage", "unknown_stage"})
@@ -420,19 +482,19 @@ def test_engine_runs_initial_execution(pipeline_dir: pathlib.Path) -> None:
 
     call_count = 0
 
-    def mock_execute(self: engine.ReactiveEngine, stages: list[str] | None) -> None:
+    def mock_execute(self: engine.WatchEngine, stages: list[str] | None) -> None:
         nonlocal call_count
         call_count += 1
         self.shutdown()  # Exit after first call
 
-    def mock_watch_loop(self: engine.ReactiveEngine, stages: list[str]) -> None:
+    def mock_watch_loop(self: engine.WatchEngine, stages: list[str]) -> None:
         pass  # Don't actually start watching
 
     with (
-        mock.patch.object(engine.ReactiveEngine, "_execute_stages", mock_execute),
-        mock.patch.object(engine.ReactiveEngine, "_watch_loop", mock_watch_loop),
+        mock.patch.object(engine.WatchEngine, "_execute_stages", mock_execute),
+        mock.patch.object(engine.WatchEngine, "_watch_loop", mock_watch_loop),
     ):
-        eng = engine.ReactiveEngine()
+        eng = engine.WatchEngine()
         eng.run()
 
     assert call_count == 1, "Should have executed initial pipeline"
@@ -449,29 +511,29 @@ def test_engine_restarts_workers_on_code_change(pipeline_dir: pathlib.Path) -> N
     restart_called = False
     iteration_count = 0
 
-    def mock_restart(self: engine.ReactiveEngine) -> None:
+    def mock_restart(self: engine.WatchEngine) -> None:
         nonlocal restart_called
         restart_called = True
 
-    def mock_execute(self: engine.ReactiveEngine, stages: list[str] | None) -> None:
+    def mock_execute(self: engine.WatchEngine, stages: list[str] | None) -> None:
         nonlocal iteration_count
         iteration_count += 1
         if iteration_count >= 2:
             self.shutdown()
 
-    def mock_watch_loop(self: engine.ReactiveEngine, stages: list[str]) -> None:
+    def mock_watch_loop(self: engine.WatchEngine, stages: list[str]) -> None:
         pass  # Don't actually start watching
 
-    def mock_reload_registry(self: engine.ReactiveEngine) -> bool:
+    def mock_reload_registry(self: engine.WatchEngine) -> bool:
         return True  # Simulate successful reload
 
     with (
-        mock.patch.object(engine.ReactiveEngine, "_execute_stages", mock_execute),
-        mock.patch.object(engine.ReactiveEngine, "_restart_worker_pool", mock_restart),
-        mock.patch.object(engine.ReactiveEngine, "_reload_registry", mock_reload_registry),
-        mock.patch.object(engine.ReactiveEngine, "_watch_loop", mock_watch_loop),
+        mock.patch.object(engine.WatchEngine, "_execute_stages", mock_execute),
+        mock.patch.object(engine.WatchEngine, "_restart_worker_pool", mock_restart),
+        mock.patch.object(engine.WatchEngine, "_reload_registry", mock_reload_registry),
+        mock.patch.object(engine.WatchEngine, "_watch_loop", mock_watch_loop),
     ):
-        eng = engine.ReactiveEngine(debounce_ms=50)
+        eng = engine.WatchEngine(debounce_ms=50)
 
         # Simulate code change
         code_path = pathlib.Path("/some/module.py")
@@ -491,9 +553,9 @@ def test_engine_handles_execution_error_gracefully(pipeline_dir: pathlib.Path) -
         pass
 
     call_count = 0
-    eng_ref: engine.ReactiveEngine | None = None
+    eng_ref: engine.WatchEngine | None = None
 
-    def mock_execute(self: engine.ReactiveEngine, stages: list[str] | None) -> None:
+    def mock_execute(self: engine.WatchEngine, stages: list[str] | None) -> None:
         nonlocal call_count, eng_ref
         eng_ref = self
         call_count += 1
@@ -502,19 +564,19 @@ def test_engine_handles_execution_error_gracefully(pipeline_dir: pathlib.Path) -
         # Second call - shutdown
         self.shutdown()
 
-    def mock_watch_loop(self: engine.ReactiveEngine, stages: list[str]) -> None:
+    def mock_watch_loop(self: engine.WatchEngine, stages: list[str]) -> None:
         pass  # Don't actually start watching
 
-    def mock_reload_registry(self: engine.ReactiveEngine) -> bool:
+    def mock_reload_registry(self: engine.WatchEngine) -> bool:
         return True  # Simulate successful reload
 
     # Patch at the class level to ensure thread captures mocked method
     with (
-        mock.patch.object(engine.ReactiveEngine, "_execute_stages", mock_execute),
-        mock.patch.object(engine.ReactiveEngine, "_reload_registry", mock_reload_registry),
-        mock.patch.object(engine.ReactiveEngine, "_watch_loop", mock_watch_loop),
+        mock.patch.object(engine.WatchEngine, "_execute_stages", mock_execute),
+        mock.patch.object(engine.WatchEngine, "_reload_registry", mock_reload_registry),
+        mock.patch.object(engine.WatchEngine, "_watch_loop", mock_watch_loop),
     ):
-        eng = engine.ReactiveEngine(debounce_ms=50)
+        eng = engine.WatchEngine(debounce_ms=50)
 
         # Queue a code change to trigger second iteration (code changes trigger all stages)
         def queue_change() -> None:
@@ -546,7 +608,7 @@ def test_watcher_thread_exception_triggers_shutdown(pipeline_dir: pathlib.Path) 
     def mock_watch_that_fails(*args: object, **kwargs: object) -> None:
         raise RuntimeError("Watcher failed!")
 
-    def patched_watch_loop(self: engine.ReactiveEngine, stages: list[str]) -> None:
+    def patched_watch_loop(self: engine.WatchEngine, stages: list[str]) -> None:
         nonlocal shutdown_triggered
         try:
             mock_watch_that_fails()
@@ -555,14 +617,14 @@ def test_watcher_thread_exception_triggers_shutdown(pipeline_dir: pathlib.Path) 
             self.shutdown()
             shutdown_triggered = True
 
-    def mock_execute(self: engine.ReactiveEngine, stages: list[str] | None) -> None:
+    def mock_execute(self: engine.WatchEngine, stages: list[str] | None) -> None:
         pass  # Initial execution succeeds
 
     with (
-        mock.patch.object(engine.ReactiveEngine, "_watch_loop", patched_watch_loop),
-        mock.patch.object(engine.ReactiveEngine, "_execute_stages", mock_execute),
+        mock.patch.object(engine.WatchEngine, "_watch_loop", patched_watch_loop),
+        mock.patch.object(engine.WatchEngine, "_execute_stages", mock_execute),
     ):
-        eng = engine.ReactiveEngine(debounce_ms=50)
+        eng = engine.WatchEngine(debounce_ms=50)
         eng.run()
 
     assert shutdown_triggered, "Watcher exception should trigger shutdown"
@@ -572,11 +634,10 @@ def test_watcher_thread_exception_triggers_shutdown(pipeline_dir: pathlib.Path) 
 # Queue overflow behavior tests
 
 
-@pytest.mark.usefixtures("pipeline_dir")
-def test_queue_overflow_triggers_full_rebuild_sentinel() -> None:
+def test_queue_overflow_triggers_full_rebuild_sentinel(pipeline_dir: pathlib.Path) -> None:
     """Exceeding MAX_PENDING_CHANGES should use sentinel for full rebuild."""
     # Simulate many pending changes exceeding threshold
-    pending = set[pathlib.Path]()
+    pending: set[pathlib.Path] = set()
     for i in range(engine._MAX_PENDING_CHANGES + 100):
         pending.add(pathlib.Path(f"/file{i}.txt"))
 
@@ -595,7 +656,7 @@ def test_watch_loop_handles_queue_overflow(pipeline_dir: pathlib.Path) -> None:
     def process() -> None:
         pass
 
-    eng = engine.ReactiveEngine()
+    eng = engine.WatchEngine()
 
     # Fill the queue completely
     for _ in range(100):  # Queue maxsize is 100
@@ -623,7 +684,7 @@ def test_concurrent_shutdown_during_debounce(pipeline_dir: pathlib.Path) -> None
     def process() -> None:
         pass
 
-    eng = engine.ReactiveEngine(debounce_ms=1000)
+    eng = engine.WatchEngine(debounce_ms=1000)
 
     # Add a change to queue
     eng._change_queue.put({pathlib.Path("/some/file.txt")})
@@ -657,20 +718,20 @@ def test_concurrent_shutdown_during_run(pipeline_dir: pathlib.Path) -> None:
 
     execution_count = 0
 
-    def mock_execute(self: engine.ReactiveEngine, stages: list[str] | None) -> None:
+    def mock_execute(self: engine.WatchEngine, stages: list[str] | None) -> None:
         nonlocal execution_count
         execution_count += 1
 
-    def mock_watch_loop(self: engine.ReactiveEngine, stages: list[str]) -> None:
+    def mock_watch_loop(self: engine.WatchEngine, stages: list[str]) -> None:
         # Simulate watch loop that respects shutdown
         while not self._shutdown.is_set():
             time.sleep(0.05)
 
     with (
-        mock.patch.object(engine.ReactiveEngine, "_execute_stages", mock_execute),
-        mock.patch.object(engine.ReactiveEngine, "_watch_loop", mock_watch_loop),
+        mock.patch.object(engine.WatchEngine, "_execute_stages", mock_execute),
+        mock.patch.object(engine.WatchEngine, "_watch_loop", mock_watch_loop),
     ):
-        eng = engine.ReactiveEngine(debounce_ms=50)
+        eng = engine.WatchEngine(debounce_ms=50)
 
         # Trigger shutdown shortly after start
         def delayed_shutdown() -> None:
@@ -687,7 +748,31 @@ def test_concurrent_shutdown_during_run(pipeline_dir: pathlib.Path) -> None:
     assert execution_count == 1, "Should have run initial execution"
 
 
-# Symlink handling tests
+# Symlink resolution tests
+
+
+def test_watch_filter_resolves_symlinks(pipeline_dir: pathlib.Path) -> None:
+    """Watch filter should resolve symlinks for consistent comparison."""
+    # Create actual output file
+    output_dir = pipeline_dir / "outputs"
+    output_dir.mkdir()
+    actual_output = output_dir / "result.txt"
+    actual_output.write_text("output data")
+
+    # Create symlink to output
+    symlink_path = pipeline_dir / "result_link.txt"
+    symlink_path.symlink_to(actual_output)
+
+    @stage(deps=[], outs=["outputs/result.txt"])
+    def process() -> None:
+        pass
+
+    watch_filter = _watch_utils.create_watch_filter(["process"])
+
+    # The symlink should be filtered because it points to an output
+    assert watch_filter(watchfiles.Change.modified, str(symlink_path)) is False, (
+        "Symlink to output should be filtered"
+    )
 
 
 def test_watch_filter_handles_broken_symlink(pipeline_dir: pathlib.Path) -> None:
@@ -696,7 +781,11 @@ def test_watch_filter_handles_broken_symlink(pipeline_dir: pathlib.Path) -> None
     broken_link = pipeline_dir / "broken_link.txt"
     broken_link.symlink_to(pipeline_dir / "nonexistent.txt")
 
-    watch_filter = _watch_utils.create_watch_filter()
+    @stage(deps=[], outs=["output.txt"])
+    def process() -> None:
+        pass
+
+    watch_filter = _watch_utils.create_watch_filter(["process"])
 
     # Broken symlink should not crash, should allow through (can't resolve)
     result = watch_filter(watchfiles.Change.modified, str(broken_link))
@@ -712,7 +801,7 @@ def test_get_stages_affected_handles_deleted_file(pipeline_dir: pathlib.Path) ->
     def process() -> None:
         pass
 
-    eng = engine.ReactiveEngine()
+    eng = engine.WatchEngine()
 
     # Create path to file that doesn't exist (simulating deletion)
     deleted_path = pipeline_dir / "deleted_file.csv"
@@ -733,7 +822,7 @@ def test_dag_cache_invalidation_on_code_change(pipeline_dir: pathlib.Path) -> No
     def process() -> None:
         pass
 
-    eng = engine.ReactiveEngine()
+    eng = engine.WatchEngine()
 
     # Build initial caches
     dag1 = eng._get_dag()
@@ -763,7 +852,7 @@ def test_file_index_caching_returns_same_instance(pipeline_dir: pathlib.Path) ->
     def process() -> None:
         pass
 
-    eng = engine.ReactiveEngine()
+    eng = engine.WatchEngine()
 
     # Multiple calls should return same cached instance
     index1 = eng._get_file_index()
@@ -821,14 +910,14 @@ def test_integration_watchfiles_detects_real_file_change(pipeline_dir: pathlib.P
     execution_stages: list[list[str] | None] = []
     execution_event = threading.Event()
 
-    def mock_execute(self: engine.ReactiveEngine, stages: list[str] | None) -> None:
+    def mock_execute(self: engine.WatchEngine, stages: list[str] | None) -> None:
         execution_stages.append(stages)
         if len(execution_stages) >= 2:  # Initial + one triggered by file change
             execution_event.set()
             self.shutdown()
 
-    with mock.patch.object(engine.ReactiveEngine, "_execute_stages", mock_execute):
-        eng = engine.ReactiveEngine(debounce_ms=50)
+    with mock.patch.object(engine.WatchEngine, "_execute_stages", mock_execute):
+        eng = engine.WatchEngine(debounce_ms=50)
 
         # Run engine in background thread (run() blocks)
         engine_thread = threading.Thread(target=eng.run)
@@ -874,26 +963,26 @@ def test_integration_watchfiles_detects_python_code_change(pipeline_dir: pathlib
     restart_called = False
     execution_event = threading.Event()
 
-    def mock_execute(self: engine.ReactiveEngine, stages: list[str] | None) -> None:
+    def mock_execute(self: engine.WatchEngine, stages: list[str] | None) -> None:
         nonlocal execution_count
         execution_count += 1
         if execution_count >= 2:
             execution_event.set()
             self.shutdown()
 
-    def mock_restart(self: engine.ReactiveEngine) -> None:
+    def mock_restart(self: engine.WatchEngine) -> None:
         nonlocal restart_called
         restart_called = True
 
-    def mock_reload_registry(self: engine.ReactiveEngine) -> bool:
+    def mock_reload_registry(self: engine.WatchEngine) -> bool:
         return True  # Simulate successful reload
 
     with (
-        mock.patch.object(engine.ReactiveEngine, "_execute_stages", mock_execute),
-        mock.patch.object(engine.ReactiveEngine, "_restart_worker_pool", mock_restart),
-        mock.patch.object(engine.ReactiveEngine, "_reload_registry", mock_reload_registry),
+        mock.patch.object(engine.WatchEngine, "_execute_stages", mock_execute),
+        mock.patch.object(engine.WatchEngine, "_restart_worker_pool", mock_restart),
+        mock.patch.object(engine.WatchEngine, "_reload_registry", mock_reload_registry),
     ):
-        eng = engine.ReactiveEngine(debounce_ms=50)
+        eng = engine.WatchEngine(debounce_ms=50)
 
         engine_thread = threading.Thread(target=eng.run)
         engine_thread.start()
@@ -917,10 +1006,11 @@ def test_integration_watchfiles_detects_python_code_change(pipeline_dir: pathlib
 # Additional coverage tests
 
 
-@pytest.mark.usefixtures("pipeline_dir")
-def test_collect_and_debounce_raises_on_invalid_max_wait() -> None:
+def test_collect_and_debounce_raises_on_invalid_max_wait(
+    pipeline_dir: pathlib.Path,
+) -> None:
     """Should raise ValueError for non-positive max_wait_s."""
-    eng = engine.ReactiveEngine()
+    eng = engine.WatchEngine()
 
     with pytest.raises(ValueError, match="max_wait_s must be positive"):
         eng._collect_and_debounce(max_wait_s=0)
@@ -943,7 +1033,7 @@ def test_get_affected_stages_returns_all_registry_stages_on_code_change(
     def stage2() -> None:
         pass
 
-    eng = engine.ReactiveEngine(stages=None)  # No specific stages
+    eng = engine.WatchEngine(stages=None)  # No specific stages
 
     changes = {pathlib.Path("code.py")}
     affected = eng._get_affected_stages(changes, code_changed=True)
@@ -951,37 +1041,35 @@ def test_get_affected_stages_returns_all_registry_stages_on_code_change(
     assert set(affected) == {"stage1", "stage2"}, "Should return all registry stages"
 
 
-@pytest.mark.usefixtures("pipeline_dir")
-def test_send_message_to_tui_queue() -> None:
+def test_send_message_to_tui_queue(pipeline_dir: pathlib.Path) -> None:
     """_send_message should put messages on TUI queue when available."""
     manager = multiprocessing.Manager()
     tui_queue = manager.Queue()
 
-    eng = engine.ReactiveEngine()
+    eng = engine.WatchEngine()
     eng._tui_queue = tui_queue  # pyright: ignore[reportAttributeAccessIssue]
 
     eng._send_message("Test message")
 
     assert not tui_queue.empty(), "Message should be in queue"
     msg = tui_queue.get_nowait()
-    assert msg["type"] == types.TuiMessageType.REACTIVE
-    assert msg["status"] == types.ReactiveStatus.WAITING
+    assert msg["type"] == types.TuiMessageType.WATCH
+    assert msg["status"] == types.WatchStatus.WAITING
     assert msg["message"] == "Test message"
 
 
-@pytest.mark.usefixtures("pipeline_dir")
-def test_send_message_error_to_tui_queue() -> None:
+def test_send_message_error_to_tui_queue(pipeline_dir: pathlib.Path) -> None:
     """_send_message with status=ERROR should set error status."""
     manager = multiprocessing.Manager()
     tui_queue = manager.Queue()
 
-    eng = engine.ReactiveEngine()
+    eng = engine.WatchEngine()
     eng._tui_queue = tui_queue  # pyright: ignore[reportAttributeAccessIssue]
 
-    eng._send_message("Error occurred", status=types.ReactiveStatus.ERROR)
+    eng._send_message("Error occurred", status=types.WatchStatus.ERROR)
 
     msg = tui_queue.get_nowait()
-    assert msg["status"] == types.ReactiveStatus.ERROR
+    assert msg["status"] == types.WatchStatus.ERROR
     assert msg["message"] == "Error occurred"
 
 
@@ -1005,6 +1093,27 @@ def test_collect_watch_paths_handles_missing_stage(
     # Should still include project root and existing stage's dep directory
     assert pipeline_dir in results
     assert "Stage 'nonexistent_stage' not found in registry" in caplog.text
+
+
+def test_watch_filter_filters_nested_output_directory(
+    pipeline_dir: pathlib.Path,
+) -> None:
+    """Watch filter should filter files inside output directories."""
+    out_dir = pipeline_dir / "outputs"
+    out_dir.mkdir()
+    nested_file = out_dir / "subdir" / "result.csv"
+    nested_file.parent.mkdir()
+    nested_file.write_text("data")
+
+    @stage(deps=[], outs=["outputs"])  # Output is a directory
+    def produce() -> None:
+        pass
+
+    stages_to_run = ["produce"]
+    watch_filter = _watch_utils.create_watch_filter(stages_to_run)
+
+    # Files inside output directory should be filtered
+    assert watch_filter(watchfiles.Change.modified, str(nested_file)) is False
 
 
 def test_resolve_path_for_matching_handles_deleted_file(
@@ -1032,7 +1141,7 @@ def test_get_stages_matching_changes_handles_incomparable_paths(
     def process() -> None:
         pass
 
-    eng = engine.ReactiveEngine()
+    eng = engine.WatchEngine()
 
     # Use a completely different path that's not relative to anything
     changes = {pathlib.Path("/completely/different/path.txt")}
@@ -1042,27 +1151,27 @@ def test_get_stages_matching_changes_handles_incomparable_paths(
     assert affected == set()
 
 
-@pytest.mark.usefixtures("pipeline_dir")
-def test_reload_registry_logs_when_no_modules_found(caplog: pytest.LogCaptureFixture) -> None:
+def test_reload_registry_logs_when_no_modules_found(
+    pipeline_dir: pathlib.Path, caplog: pytest.LogCaptureFixture
+) -> None:
     """_reload_registry should log warning when no stage modules found."""
-    # Clear registry so there are no stages
-    REGISTRY.clear()
-
-    eng = engine.ReactiveEngine()
+    # Registry is already empty from global clean_registry autouse fixture
+    eng = engine.WatchEngine()
     eng._reload_registry()
 
     assert "No stage modules found to reload" in caplog.text
 
 
-@pytest.mark.usefixtures("pipeline_dir")
-def test_reload_registry_clears_and_reimports_modules() -> None:
+def test_reload_registry_clears_and_reimports_modules(
+    pipeline_dir: pathlib.Path,
+) -> None:
     """_reload_registry should clear project modules and reimport them."""
 
     @stage(deps=[], outs=["output.txt"])
     def test_stage() -> None:
         pass
 
-    eng = engine.ReactiveEngine()
+    eng = engine.WatchEngine()
 
     initial_stages = list(REGISTRY.list_stages())
     assert "test_stage" in initial_stages
@@ -1114,15 +1223,16 @@ def test_is_existing_dir_handles_os_error(
         assert engine._is_existing_dir(test_path) is False
 
 
-@pytest.mark.usefixtures("pipeline_dir")
-def test_reload_registry_handles_import_exception(caplog: pytest.LogCaptureFixture) -> None:
+def test_reload_registry_handles_import_exception(
+    pipeline_dir: pathlib.Path, caplog: pytest.LogCaptureFixture
+) -> None:
     """_reload_registry should return False and preserve registry when import fails."""
 
     @stage(deps=[], outs=["output.txt"])
     def reload_test_stage() -> None:
         pass
 
-    eng = engine.ReactiveEngine()
+    eng = engine.WatchEngine()
 
     # Mock import_module to raise an exception (for decorator path)
     with mock.patch("importlib.import_module", side_effect=ImportError("Module not found")):
@@ -1176,7 +1286,7 @@ stages:
     pipeline_yaml.register_from_pipeline_file(pipeline_dir / "pivot.yaml")
     assert "test_yaml_stage" in REGISTRY.list_stages()
 
-    eng = engine.ReactiveEngine()
+    eng = engine.WatchEngine()
     result = eng._reload_registry()
 
     assert result is True, "Reload should succeed"
@@ -1214,7 +1324,7 @@ def pipeline_py_stage() -> None:
     runpy.run_path(str(pipeline_dir / "pipeline.py"), run_name="_pivot_pipeline")
     assert "pipeline_py_stage" in REGISTRY.list_stages()
 
-    eng = engine.ReactiveEngine()
+    eng = engine.WatchEngine()
     result = eng._reload_registry()
 
     assert result is True, "Reload should succeed"
@@ -1271,7 +1381,7 @@ def py_stage() -> None:
     pipeline_yaml.register_from_pipeline_file(pipeline_dir / "pivot.yaml")
     assert "yaml_stage" in REGISTRY.list_stages()
 
-    eng = engine.ReactiveEngine()
+    eng = engine.WatchEngine()
     result = eng._reload_registry()
 
     assert result is True
@@ -1296,7 +1406,7 @@ def test_reload_registry_falls_back_to_decorators(
     def decorator_stage() -> None:
         pass
 
-    eng = engine.ReactiveEngine()
+    eng = engine.WatchEngine()
 
     # Mock import_module to verify decorator path is used
     with mock.patch("importlib.import_module") as mock_import:
@@ -1354,7 +1464,7 @@ stages:
 """
     )
 
-    eng = engine.ReactiveEngine()
+    eng = engine.WatchEngine()
     result = eng._reload_registry()
 
     assert result is False, "Should return False on reload failure"
@@ -1391,7 +1501,7 @@ def preserved_py_stage() -> None:
     # Now break the pipeline.py
     (pipeline_dir / "pipeline.py").write_text("raise RuntimeError('broken')\n")
 
-    eng = engine.ReactiveEngine()
+    eng = engine.WatchEngine()
     result = eng._reload_registry()
 
     assert result is False, "Should return False on reload failure"
@@ -1399,12 +1509,19 @@ def preserved_py_stage() -> None:
     assert eng._pipeline_errors is not None
 
 
-def test_watch_filter_handles_resolve_oserror() -> None:
+def test_watch_filter_handles_resolve_oserror(
+    pipeline_dir: pathlib.Path,
+) -> None:
     """Watch filter should not filter paths that can't be resolved."""
-    watch_filter = _watch_utils.create_watch_filter()
 
-    # Mock project.try_resolve_path to return None (simulates can't resolve)
-    with mock.patch.object(project, "try_resolve_path", return_value=None):
+    @stage(deps=["data.csv"], outs=["output.txt"])
+    def process() -> None:
+        pass
+
+    watch_filter = _watch_utils.create_watch_filter(["process"])
+
+    # Mock project.resolve_path to raise OSError
+    with mock.patch.object(project, "resolve_path", side_effect=OSError("Permission denied")):
         # Should return True (don't filter) when path can't be resolved
         result = watch_filter(watchfiles.Change.modified, "/some/path")
         assert result is True
@@ -1437,7 +1554,7 @@ def test_get_stages_matching_changes_handles_is_relative_to_error(
     def containment_stage() -> None:
         pass
 
-    eng = engine.ReactiveEngine()
+    eng = engine.WatchEngine()
 
     changes = {pipeline_dir / "some_file.txt"}
 
@@ -1455,15 +1572,14 @@ def test_get_stages_matching_changes_handles_is_relative_to_error(
 # _reload_registry invalid pipeline tests
 
 
-@pytest.mark.usefixtures("pipeline_dir")
-def test_reload_registry_clears_errors_on_success() -> None:
+def test_reload_registry_clears_errors_on_success(pipeline_dir: pathlib.Path) -> None:
     """_reload_registry should clear previous errors on successful reload."""
 
     @stage(deps=[], outs=["output.txt"])
     def test_clear_stage() -> None:
         pass
 
-    eng = engine.ReactiveEngine()
+    eng = engine.WatchEngine()
     # Simulate previous error state
     eng._pipeline_errors = ["previous error"]
 
@@ -1473,10 +1589,9 @@ def test_reload_registry_clears_errors_on_success() -> None:
     assert eng._pipeline_errors is None, "Previous errors should be cleared"
 
 
-@pytest.mark.usefixtures("pipeline_dir")
-def test_reload_registry_returns_true_when_no_modules() -> None:
+def test_reload_registry_returns_true_when_no_modules(pipeline_dir: pathlib.Path) -> None:
     """_reload_registry should return True when no stage modules found."""
-    eng = engine.ReactiveEngine()
+    eng = engine.WatchEngine()
     # No stages registered
 
     result = eng._reload_registry()
@@ -1491,7 +1606,7 @@ def test_coordinator_loop_skips_execution_when_invalid(pipeline_dir: pathlib.Pat
     def invalid_test_stage() -> None:
         pass
 
-    eng = engine.ReactiveEngine()
+    eng = engine.WatchEngine()
 
     # Set up invalid pipeline state
     eng._pipeline_errors = ["test_module: SyntaxError"]
@@ -1511,7 +1626,7 @@ def test_coordinator_loop_skips_execution_when_invalid(pipeline_dir: pathlib.Pat
     messages: list[str] = []
 
     def capture_message(
-        msg: str, *, is_error: bool = False, status: types.ReactiveStatus | None = None
+        msg: str, *, is_error: bool = False, status: types.WatchStatus | None = None
     ) -> None:
         messages.append(msg)
 
@@ -1535,7 +1650,7 @@ def test_coordinator_loop_sends_error_on_reload_failure(pipeline_dir: pathlib.Pa
     def reload_fail_stage() -> None:
         pass
 
-    eng = engine.ReactiveEngine()
+    eng = engine.WatchEngine()
 
     # Mock the change queue to return a Python file change then empty
     py_change: set[pathlib.Path] = {pipeline_dir / "test.py"}
@@ -1552,9 +1667,9 @@ def test_coordinator_loop_sends_error_on_reload_failure(pipeline_dir: pathlib.Pa
     messages: list[tuple[str, bool]] = []
 
     def capture_message(
-        msg: str, *, is_error: bool = False, status: types.ReactiveStatus | None = None
+        msg: str, *, is_error: bool = False, status: types.WatchStatus | None = None
     ) -> None:
-        is_err = is_error or (status == types.ReactiveStatus.ERROR)
+        is_err = is_error or (status == types.WatchStatus.ERROR)
         messages.append((msg, is_err))
 
     with (
@@ -1581,7 +1696,7 @@ def test_coordinator_loop_clears_invalid_state_on_successful_reload(
     def recovery_stage() -> None:
         pass
 
-    eng = engine.ReactiveEngine()
+    eng = engine.WatchEngine()
     # Set up previous invalid state
     eng._pipeline_errors = ["previous_error"]
 
@@ -1613,18 +1728,16 @@ def test_coordinator_loop_clears_invalid_state_on_successful_reload(
 # force_first_run tests
 
 
-@pytest.mark.usefixtures("pipeline_dir")
-def test_engine_init_force_first_run_defaults_to_false() -> None:
+def test_engine_init_force_first_run_defaults_to_false(pipeline_dir: pathlib.Path) -> None:
     """force_first_run should default to False."""
-    eng = engine.ReactiveEngine()
+    eng = engine.WatchEngine()
     assert eng._force_first_run is False
     assert eng._first_run_done is False
 
 
-@pytest.mark.usefixtures("pipeline_dir")
-def test_engine_init_accepts_force_first_run() -> None:
+def test_engine_init_accepts_force_first_run(pipeline_dir: pathlib.Path) -> None:
     """Engine should accept force_first_run parameter."""
-    eng = engine.ReactiveEngine(force_first_run=True)
+    eng = engine.WatchEngine(force_first_run=True)
     assert eng._force_first_run is True
     assert eng._first_run_done is False
 
@@ -1637,7 +1750,7 @@ def test_execute_stages_passes_force_on_first_run(pipeline_dir: pathlib.Path) ->
     def process() -> None:
         pass
 
-    eng = engine.ReactiveEngine(force_first_run=True)
+    eng = engine.WatchEngine(force_first_run=True)
 
     force_values: list[bool] = []
 
@@ -1660,7 +1773,7 @@ def test_execute_stages_does_not_force_subsequent_runs(pipeline_dir: pathlib.Pat
     def process() -> None:
         pass
 
-    eng = engine.ReactiveEngine(force_first_run=True)
+    eng = engine.WatchEngine(force_first_run=True)
 
     force_values: list[bool] = []
 
@@ -1686,7 +1799,7 @@ def test_execute_stages_without_force_first_run_never_forces(pipeline_dir: pathl
     def process() -> None:
         pass
 
-    eng = engine.ReactiveEngine(force_first_run=False)  # Default
+    eng = engine.WatchEngine(force_first_run=False)  # Default
 
     force_values: list[bool] = []
 
@@ -1713,7 +1826,7 @@ def test_first_run_done_flag_stress_test(pipeline_dir: pathlib.Path) -> None:
     def process() -> None:
         pass
 
-    eng = engine.ReactiveEngine(force_first_run=True)
+    eng = engine.WatchEngine(force_first_run=True)
 
     force_values: list[bool] = []
     first_run_done_values: list[bool] = []
@@ -1818,7 +1931,7 @@ def get_value():
     )
 
     # Create engine and reload registry
-    eng = engine.ReactiveEngine()
+    eng = engine.WatchEngine()
     result = eng._reload_registry()
 
     assert result is True, "Reload should succeed"
@@ -1834,6 +1947,182 @@ def get_value():
     # Clean up
     for mod_name in list(sys.modules.keys()):
         if mod_name in ("stages", "helpers") or mod_name.startswith("stages."):
+            del sys.modules[mod_name]
+
+
+# =============================================================================
+# Registry reload with stage changes - filter update tests
+# =============================================================================
+
+
+def test_watch_filter_stale_after_registry_adds_new_stage(
+    pipeline_dir: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Watch filter should update when registry reload adds new stages.
+
+    Bug: _create_watch_filter() captures output paths at startup. If registry
+    reload adds a new stage with new outputs, the filter doesn't know about them,
+    potentially causing infinite loops (new stage output triggers another reload).
+    """
+    import sys
+
+    # Clean up any cached modules from previous tests
+    for mod_name in list(sys.modules.keys()):
+        if mod_name == "stages" or mod_name.startswith("stages."):
+            del sys.modules[mod_name]
+
+    # Create initial stages module with one stage
+    stages_py = pipeline_dir / "stages.py"
+    stages_py.write_text(
+        """\
+from pivot.registry import stage
+
+@stage(deps=[], outs=["output_a.txt"])
+def stage_a():
+    pass
+"""
+    )
+
+    monkeypatch.syspath_prepend(str(pipeline_dir))
+
+    # Import to register
+    import importlib
+
+    importlib.import_module("stages")
+    assert "stage_a" in REGISTRY.list_stages()
+    assert "stage_b" not in REGISTRY.list_stages()
+
+    # Create initial watch filter
+    initial_filter = _watch_utils.create_watch_filter(["stage_a"])
+
+    # output_a should be filtered
+    output_a_path = pipeline_dir / "output_a.txt"
+    assert initial_filter(watchfiles.Change.modified, str(output_a_path)) is False
+
+    # output_b should NOT be filtered (stage doesn't exist yet)
+    output_b_path = pipeline_dir / "output_b.txt"
+    assert initial_filter(watchfiles.Change.modified, str(output_b_path)) is True
+
+    # Now add a new stage
+    stages_py.write_text(
+        """\
+from pivot.registry import stage
+
+@stage(deps=[], outs=["output_a.txt"])
+def stage_a():
+    pass
+
+@stage(deps=[], outs=["output_b.txt"])
+def stage_b():
+    pass
+"""
+    )
+
+    # Reload registry
+    eng = engine.WatchEngine()
+    eng._reload_registry()
+
+    assert "stage_b" in REGISTRY.list_stages(), "New stage should be registered"
+
+    # BUG DEMONSTRATION: The OLD filter still doesn't know about output_b
+    # This is the bug - after reload, we need to recreate the filter
+    # The test currently shows the bug exists
+    assert initial_filter(watchfiles.Change.modified, str(output_b_path)) is True, (
+        "Old filter doesn't know about new stage output (this demonstrates the bug)"
+    )
+
+    # Create NEW filter after reload - this one should filter output_b
+    new_filter = _watch_utils.create_watch_filter(["stage_a", "stage_b"])
+    assert new_filter(watchfiles.Change.modified, str(output_b_path)) is False, (
+        "New filter should filter new stage output"
+    )
+
+    # Clean up
+    for mod_name in list(sys.modules.keys()):
+        if mod_name == "stages" or mod_name.startswith("stages."):
+            del sys.modules[mod_name]
+
+
+def test_watch_filter_stale_after_registry_removes_stage(
+    pipeline_dir: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Watch filter should update when registry reload removes stages.
+
+    If a stage is removed, its outputs should no longer be filtered.
+    """
+    import sys
+
+    # Clean up any cached modules from previous tests
+    for mod_name in list(sys.modules.keys()):
+        if mod_name == "stages" or mod_name.startswith("stages."):
+            del sys.modules[mod_name]
+
+    # Create initial stages module with two stages
+    stages_py = pipeline_dir / "stages.py"
+    stages_py.write_text(
+        """\
+from pivot.registry import stage
+
+@stage(deps=[], outs=["output_a.txt"])
+def stage_a():
+    pass
+
+@stage(deps=[], outs=["output_b.txt"])
+def stage_b():
+    pass
+"""
+    )
+
+    monkeypatch.syspath_prepend(str(pipeline_dir))
+
+    import importlib
+
+    importlib.import_module("stages")
+    assert "stage_a" in REGISTRY.list_stages()
+    assert "stage_b" in REGISTRY.list_stages()
+
+    # Create initial watch filter for both stages
+    initial_filter = _watch_utils.create_watch_filter(["stage_a", "stage_b"])
+
+    # Both outputs should be filtered
+    output_a_path = pipeline_dir / "output_a.txt"
+    output_b_path = pipeline_dir / "output_b.txt"
+    assert initial_filter(watchfiles.Change.modified, str(output_a_path)) is False
+    assert initial_filter(watchfiles.Change.modified, str(output_b_path)) is False
+
+    # Remove stage_b
+    stages_py.write_text(
+        """\
+from pivot.registry import stage
+
+@stage(deps=[], outs=["output_a.txt"])
+def stage_a():
+    pass
+"""
+    )
+
+    # Reload registry
+    eng = engine.WatchEngine()
+    eng._reload_registry()
+
+    assert "stage_a" in REGISTRY.list_stages()
+    assert "stage_b" not in REGISTRY.list_stages(), "stage_b should be removed"
+
+    # Create NEW filter after reload - only stage_a exists now
+    new_filter = _watch_utils.create_watch_filter(["stage_a"])
+    assert new_filter(watchfiles.Change.modified, str(output_a_path)) is False, (
+        "output_a should still be filtered"
+    )
+    # output_b should no longer be filtered (stage doesn't exist)
+    assert new_filter(watchfiles.Change.modified, str(output_b_path)) is True, (
+        "output_b should NOT be filtered after stage removal"
+    )
+
+    # Clean up
+    for mod_name in list(sys.modules.keys()):
+        if mod_name == "stages" or mod_name.startswith("stages."):
             del sys.modules[mod_name]
 
 
@@ -1873,7 +2162,7 @@ def stage_a():
 
     importlib.import_module("stages")
 
-    eng = engine.ReactiveEngine()
+    eng = engine.WatchEngine()
 
     # Build initial index
     index1 = eng._get_file_index()

@@ -54,7 +54,7 @@ def test_pvt_file_for_directory_with_manifest(tmp_path: pathlib.Path) -> None:
         "size": 5120,
         "num_files": 2,
         "manifest": [
-            {"relpath": "cat.jpg", "hash": "aaa111", "size": 2048},
+            {"relpath": "cat.jpg", "hash": "aaa111", "size": 2048, "isexec": False},
             {"relpath": "dog.jpg", "hash": "bbb222", "size": 3072, "isexec": False},
         ],
     }
@@ -268,9 +268,9 @@ def test_discover_pvt_files_with_directory_manifest(tmp_path: pathlib.Path) -> N
             "size": 5000,
             "num_files": 3,
             "manifest": [
-                {"relpath": "a.jpg", "hash": "h1", "size": 1000},
-                {"relpath": "b.jpg", "hash": "h2", "size": 2000},
-                {"relpath": "c.jpg", "hash": "h3", "size": 2000},
+                {"relpath": "a.jpg", "hash": "h1", "size": 1000, "isexec": False},
+                {"relpath": "b.jpg", "hash": "h2", "size": 2000, "isexec": False},
+                {"relpath": "c.jpg", "hash": "h3", "size": 2000, "isexec": False},
             ],
         },
     )

@@ -404,7 +404,7 @@ def test_diff_plots_modified() -> None:
     assert result[0]["path"] == "plot.png"
     assert result[0]["old_hash"] == "abc123"
     assert result[0]["new_hash"] == "def456"
-    assert result[0]["change"] == "modified"
+    assert result[0]["change_type"] == "modified"
 
 
 def test_diff_plots_added() -> None:
@@ -418,7 +418,7 @@ def test_diff_plots_added() -> None:
     assert result[0]["path"] == "plot.png"
     assert result[0]["old_hash"] is None
     assert result[0]["new_hash"] == "abc123"
-    assert result[0]["change"] == "added"
+    assert result[0]["change_type"] == "added"
 
 
 def test_diff_plots_added_from_none_hash() -> None:
@@ -432,7 +432,7 @@ def test_diff_plots_added_from_none_hash() -> None:
     assert result[0]["path"] == "plot.png"
     assert result[0]["old_hash"] is None
     assert result[0]["new_hash"] == "abc123"
-    assert result[0]["change"] == "added", "Should report 'added' when old hash is None"
+    assert result[0]["change_type"] == "added", "Should report 'added' when old hash is None"
 
 
 def test_diff_plots_removed() -> None:
@@ -446,7 +446,7 @@ def test_diff_plots_removed() -> None:
     assert result[0]["path"] == "plot.png"
     assert result[0]["old_hash"] == "abc123"
     assert result[0]["new_hash"] is None
-    assert result[0]["change"] == "removed"
+    assert result[0]["change_type"] == "removed"
 
 
 def test_diff_plots_multiple_changes() -> None:
@@ -459,9 +459,9 @@ def test_diff_plots_multiple_changes() -> None:
     assert len(result) == 3
     paths = {r["path"]: r for r in result}
 
-    assert paths["a.png"]["change"] == "modified"
-    assert paths["b.png"]["change"] == "removed"
-    assert paths["c.png"]["change"] == "added"
+    assert paths["a.png"]["change_type"] == "modified"
+    assert paths["b.png"]["change_type"] == "removed"
+    assert paths["c.png"]["change_type"] == "added"
 
 
 def test_diff_plots_sorted_by_path() -> None:
@@ -490,7 +490,7 @@ def test_format_diff_table_plain() -> None:
     """Plain text format uses tabulate."""
     diffs = [
         plots.PlotDiffEntry(
-            path="plot.png", old_hash="abc123", new_hash="def456", change=ChangeType.MODIFIED
+            path="plot.png", old_hash="abc123", new_hash="def456", change_type=ChangeType.MODIFIED
         )
     ]
 
@@ -505,7 +505,7 @@ def test_format_diff_table_json() -> None:
     """JSON format returns valid JSON."""
     diffs = [
         plots.PlotDiffEntry(
-            path="plot.png", old_hash="abc123", new_hash="def456", change=ChangeType.MODIFIED
+            path="plot.png", old_hash="abc123", new_hash="def456", change_type=ChangeType.MODIFIED
         )
     ]
 
@@ -514,14 +514,14 @@ def test_format_diff_table_json() -> None:
     parsed = json.loads(result)
     assert len(parsed) == 1
     assert parsed[0]["path"] == "plot.png"
-    assert parsed[0]["change"] == "modified"
+    assert parsed[0]["change_type"] == "modified"
 
 
 def test_format_diff_table_markdown() -> None:
     """Markdown format uses github tablefmt."""
     diffs = [
         plots.PlotDiffEntry(
-            path="plot.png", old_hash="abc123", new_hash="def456", change=ChangeType.MODIFIED
+            path="plot.png", old_hash="abc123", new_hash="def456", change_type=ChangeType.MODIFIED
         )
     ]
 
@@ -535,7 +535,7 @@ def test_format_diff_table_no_path() -> None:
     """show_path=False hides path column."""
     diffs = [
         plots.PlotDiffEntry(
-            path="plot.png", old_hash="abc123", new_hash="def456", change=ChangeType.MODIFIED
+            path="plot.png", old_hash="abc123", new_hash="def456", change_type=ChangeType.MODIFIED
         )
     ]
 

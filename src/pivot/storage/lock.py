@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 _VALID_STAGE_NAME = re.compile(r"^[a-zA-Z0-9_@.-]+$")  # Allow . for DVC matrix keys like @0.5
 _MAX_STAGE_NAME_LEN = 200  # Leave room for ".lock" suffix within filesystem NAME_MAX (255)
-_VALID_LOCK_KEYS = frozenset({"code_manifest", "params", "deps", "outs", "dep_generations"})
+_REQUIRED_LOCK_KEYS = frozenset({"code_manifest", "params", "deps", "outs", "dep_generations"})
 
 # Pending directory for --no-commit mode (relative to .pivot/)
 _PENDING_DIR = "pending"
@@ -43,54 +43,45 @@ def is_lock_data(data: object) -> TypeGuard[StorageLockData]:
     if not isinstance(data, dict):
         return False
     typed_data = cast("dict[str, object]", data)
-    # Reject unknown keys
-    if not all(key in _VALID_LOCK_KEYS for key in typed_data):
+    # Require all required keys (allow extra keys for forward compatibility)
+    if not _REQUIRED_LOCK_KEYS.issubset(typed_data.keys()):
         return False
-    # Reject null values (corrupted data)
-    return all(typed_data[key] is not None for key in typed_data)
+    # Reject null values for required keys (corrupted data)
+    return all(typed_data[key] is not None for key in _REQUIRED_LOCK_KEYS)
 
 
 def _convert_to_storage_format(data: LockData) -> StorageLockData:
     """Convert internal LockData to storage format (list-based, relative paths, sorted)."""
-    result = StorageLockData()
-
-    if "code_manifest" in data:
-        result["code_manifest"] = data["code_manifest"]
-    if "params" in data:
-        result["params"] = data["params"]
-
     proj_root = project.get_project_root()
 
-    if "dep_hashes" in data:
-        deps_list = list[DepEntry]()
-        for abs_path, hash_info in data["dep_hashes"].items():
-            rel_path = project.to_relative_path(abs_path, proj_root)
-            entry = DepEntry(path=rel_path, hash=hash_info["hash"])
+    deps_list = list[DepEntry]()
+    for abs_path, hash_info in data["dep_hashes"].items():
+        rel_path = project.to_relative_path(abs_path, proj_root)
+        entry = DepEntry(path=rel_path, hash=hash_info["hash"])
+        if "manifest" in hash_info:
+            entry["manifest"] = hash_info["manifest"]
+        deps_list.append(entry)
+    deps_list.sort(key=lambda e: e["path"])
+
+    outs_list = list[OutEntry]()
+    for abs_path, hash_info in data["output_hashes"].items():
+        rel_path = project.to_relative_path(abs_path, proj_root)
+        if hash_info is None:
+            entry = OutEntry(path=rel_path, hash=None)
+        else:
+            entry = OutEntry(path=rel_path, hash=hash_info["hash"])
             if "manifest" in hash_info:
                 entry["manifest"] = hash_info["manifest"]
-            deps_list.append(entry)
-        deps_list.sort(key=lambda e: e["path"])
-        result["deps"] = deps_list
+        outs_list.append(entry)
+    outs_list.sort(key=lambda e: e["path"])
 
-    if "output_hashes" in data:
-        outs_list = list[OutEntry]()
-        for abs_path, hash_info in data["output_hashes"].items():
-            rel_path = project.to_relative_path(abs_path, proj_root)
-            if hash_info is None:
-                entry = OutEntry(path=rel_path, hash=None)
-            else:
-                entry = OutEntry(path=rel_path, hash=hash_info["hash"])
-                if "manifest" in hash_info:
-                    entry["manifest"] = hash_info["manifest"]
-            outs_list.append(entry)
-        outs_list.sort(key=lambda e: e["path"])
-        result["outs"] = outs_list
-
-    # Preserve dep_generations for --no-commit mode (uses absolute paths, no conversion needed)
-    if "dep_generations" in data:
-        result["dep_generations"] = data["dep_generations"]
-
-    return result
+    return StorageLockData(
+        code_manifest=data["code_manifest"],
+        params=data["params"],
+        deps=deps_list,
+        outs=outs_list,
+        dep_generations=data["dep_generations"],
+    )
 
 
 def _convert_from_storage_format(data: StorageLockData) -> LockData:
@@ -98,31 +89,29 @@ def _convert_from_storage_format(data: StorageLockData) -> LockData:
     proj_root = project.get_project_root()
 
     dep_hashes = dict[str, HashInfo]()
-    if "deps" in data:
-        for entry in data["deps"]:
-            abs_path = str(project.to_absolute_path(entry["path"], proj_root))
-            if "manifest" in entry:
-                dep_hashes[abs_path] = {"hash": entry["hash"], "manifest": entry["manifest"]}
-            else:
-                dep_hashes[abs_path] = {"hash": entry["hash"]}
+    for entry in data["deps"]:
+        abs_path = str(project.to_absolute_path(entry["path"], proj_root))
+        if "manifest" in entry:
+            dep_hashes[abs_path] = {"hash": entry["hash"], "manifest": entry["manifest"]}
+        else:
+            dep_hashes[abs_path] = {"hash": entry["hash"]}
 
     output_hashes = dict[str, OutputHash]()
-    if "outs" in data:
-        for entry in data["outs"]:
-            abs_path = str(project.to_absolute_path(entry["path"], proj_root))
-            if entry["hash"] is None:
-                output_hashes[abs_path] = None
-            elif "manifest" in entry:
-                output_hashes[abs_path] = {"hash": entry["hash"], "manifest": entry["manifest"]}
-            else:
-                output_hashes[abs_path] = {"hash": entry["hash"]}
+    for entry in data["outs"]:
+        abs_path = str(project.to_absolute_path(entry["path"], proj_root))
+        if entry["hash"] is None:
+            output_hashes[abs_path] = None
+        elif "manifest" in entry:
+            output_hashes[abs_path] = {"hash": entry["hash"], "manifest": entry["manifest"]}
+        else:
+            output_hashes[abs_path] = {"hash": entry["hash"]}
 
     result = LockData(
-        code_manifest=data["code_manifest"] if "code_manifest" in data else {},
-        params=data["params"] if "params" in data else {},
+        code_manifest=data["code_manifest"],
+        params=data["params"],
         dep_hashes=dep_hashes,
         output_hashes=output_hashes,
-        dep_generations=data["dep_generations"] if "dep_generations" in data else {},
+        dep_generations=data["dep_generations"],
     )
 
     return result
@@ -148,6 +137,14 @@ class StageLock:
             with open(self.path) as f:
                 data: object = yaml.load(f, Loader=yaml_config.Loader)
             if not is_lock_data(data):
+                if isinstance(data, dict):
+                    actual_keys = set(cast("dict[str, object]", data).keys())
+                    logger.debug(
+                        "Lock file validation failed for %s: keys=%s, expected=%s",
+                        self.path,
+                        actual_keys,
+                        _REQUIRED_LOCK_KEYS,
+                    )
                 return None  # Treat corrupted/invalid file as missing
             return _convert_from_storage_format(data)
         except (FileNotFoundError, UnicodeDecodeError, yaml.YAMLError):

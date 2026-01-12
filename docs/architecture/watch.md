@@ -1,13 +1,13 @@
-# Reactive Execution Engine
+# Watch Execution Engine
 
-The reactive execution engine provides continuous pipeline monitoring and automatic re-execution when dependencies change.
+The watch execution engine provides continuous pipeline monitoring and automatic re-execution when dependencies change.
 
 ## Overview
 
-Unlike batch execution (`pivot run`), reactive mode keeps the pipeline running and automatically responds to file changes:
+Unlike batch execution (`pivot run`), watch mode keeps the pipeline running and automatically responds to file changes:
 
 ```bash
-pivot run --reactive
+pivot run --watch
 ```
 
 The engine monitors:
@@ -22,7 +22,7 @@ When changes are detected, only affected stages and their downstream dependencie
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                         REACTIVE ENGINE                              │
+│                          WATCH ENGINE                                │
 ├─────────────────────────────────────────────────────────────────────┤
 │                                                                      │
 │  ┌──────────────────┐                                               │
@@ -200,7 +200,7 @@ def _create_watch_filter(self) -> Callable[[str], bool]:
 
 ### Execution Errors
 
-Stage execution errors are displayed in the TUI without stopping the reactive loop:
+Stage execution errors are displayed in the TUI without stopping the watch loop:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -265,7 +265,7 @@ On `Ctrl+C`:
 - **Worker restart latency**: Code changes have ~300ms overhead for worker restart
 - **No cancellation**: Long-running stages cannot be interrupted mid-execution
 - **Single machine**: Not designed for distributed execution
-- **Memory**: Long-running reactive sessions should be restarted periodically
+- **Memory**: Long-running watch sessions should be restarted periodically
 
 ## Future Work
 

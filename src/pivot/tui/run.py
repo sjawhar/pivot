@@ -28,14 +28,14 @@ from pivot.storage import lock, project_lock
 from pivot.tui.diff_panels import InputDiffPanel, OutputDiffPanel
 from pivot.types import (
     DisplayMode,
-    ReactiveStatus,
     StageStatus,
     TuiLogMessage,
     TuiMessage,
     TuiMessageType,
-    TuiReactiveMessage,
     TuiReloadMessage,
     TuiStatusMessage,
+    TuiWatchMessage,
+    WatchStatus,
 )
 
 if TYPE_CHECKING:
@@ -46,8 +46,8 @@ if TYPE_CHECKING:
 
     from pivot.types import OutputMessage
 
-    class ReactiveEngineProtocol(Protocol):
-        """Protocol for ReactiveEngine to avoid circular imports."""
+    class WatchEngineProtocol(Protocol):
+        """Protocol for WatchEngine to avoid circular imports."""
 
         def run(
             self,
@@ -95,10 +95,10 @@ class StageInfo:
 class TuiUpdate(textual.message.Message):
     """Custom message for executor updates."""
 
-    msg: TuiLogMessage | TuiStatusMessage | TuiReactiveMessage | TuiReloadMessage
+    msg: TuiLogMessage | TuiStatusMessage | TuiWatchMessage | TuiReloadMessage
 
     def __init__(
-        self, msg: TuiLogMessage | TuiStatusMessage | TuiReactiveMessage | TuiReloadMessage
+        self, msg: TuiLogMessage | TuiStatusMessage | TuiWatchMessage | TuiReloadMessage
     ) -> None:
         self.msg = msg
         super().__init__()
@@ -709,7 +709,7 @@ class RunTuiApp(_BaseTuiApp[dict[str, ExecutionSummary] | None]):
                 self._handle_log(msg)
             case TuiMessageType.STATUS:
                 self._handle_status(msg)
-            case TuiMessageType.REACTIVE | TuiMessageType.RELOAD:
+            case TuiMessageType.WATCH | TuiMessageType.RELOAD:
                 pass
 
     def _handle_status(self, msg: TuiStatusMessage) -> None:  # pragma: no cover
@@ -823,7 +823,7 @@ class WatchTuiApp(_BaseTuiApp[None]):
 
     def __init__(
         self,
-        engine: ReactiveEngineProtocol,
+        engine: WatchEngineProtocol,
         message_queue: mp.Queue[TuiMessage],
         output_queue: mp.Queue[OutputMessage] | None = None,
         tui_log: Path | None = None,
@@ -832,7 +832,7 @@ class WatchTuiApp(_BaseTuiApp[None]):
         no_commit: bool = False,
     ) -> None:
         super().__init__(message_queue, stage_names, tui_log=tui_log)
-        self._engine: ReactiveEngineProtocol = engine
+        self._engine: WatchEngineProtocol = engine
         self._output_queue = output_queue
         self._engine_thread: threading.Thread | None = None
         self._no_commit: bool = no_commit
@@ -851,11 +851,11 @@ class WatchTuiApp(_BaseTuiApp[None]):
         self._engine_thread.start()
 
     def _run_engine(self) -> None:  # pragma: no cover
-        """Run the reactive engine (runs in background thread)."""
+        """Run the watch engine (runs in background thread)."""
         try:
             self._engine.run(tui_queue=self._tui_queue, output_queue=self._output_queue)
         except Exception as e:
-            logging.getLogger(__name__).exception(f"Reactive engine failed: {e}")
+            logging.getLogger(__name__).exception(f"Watch engine failed: {e}")
 
     def on_tui_update(self, event: TuiUpdate) -> None:  # pragma: no cover
         """Handle executor updates in Textual's event loop."""
@@ -865,8 +865,8 @@ class WatchTuiApp(_BaseTuiApp[None]):
                 self._handle_log(msg)
             case TuiMessageType.STATUS:
                 self._handle_status(msg)
-            case TuiMessageType.REACTIVE:
-                self._handle_reactive(msg)
+            case TuiMessageType.WATCH:
+                self._handle_watch(msg)
             case TuiMessageType.RELOAD:
                 self._handle_reload(msg)
 
@@ -892,16 +892,16 @@ class WatchTuiApp(_BaseTuiApp[None]):
             stage_list.update_stage(stage)
         self._update_detail_panel()
 
-    def _handle_reactive(self, msg: TuiReactiveMessage) -> None:  # pragma: no cover
+    def _handle_watch(self, msg: TuiWatchMessage) -> None:  # pragma: no cover
         """Handle reactive status updates - update title bar."""
         match msg["status"]:
-            case ReactiveStatus.WAITING:
+            case WatchStatus.WAITING:
                 self.title = "[●] Watching for changes..."
-            case ReactiveStatus.RESTARTING:
+            case WatchStatus.RESTARTING:
                 self.title = "[↻] Reloading code..."
-            case ReactiveStatus.DETECTING:
+            case WatchStatus.DETECTING:
                 self.title = f"[▶] {msg['message']}"
-            case ReactiveStatus.ERROR:
+            case WatchStatus.ERROR:
                 self.title = f"[!] {msg['message']}"
 
     def _handle_reload(self, msg: TuiReloadMessage) -> None:  # pragma: no cover
@@ -1049,7 +1049,7 @@ class WatchTuiApp(_BaseTuiApp[None]):
 
 
 def run_watch_tui(
-    engine: ReactiveEngineProtocol,
+    engine: WatchEngineProtocol,
     message_queue: mp.Queue[TuiMessage],
     output_queue: mp.Queue[OutputMessage] | None = None,
     tui_log: Path | None = None,

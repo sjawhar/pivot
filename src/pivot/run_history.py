@@ -119,7 +119,7 @@ def serialize_to_bytes(data: RunManifest | RunCacheEntry) -> bytes:
 def deserialize_run_manifest(data: bytes) -> RunManifest:
     """Deserialize bytes to RunManifest with validation."""
     parsed: dict[str, Any] = json.loads(data.decode())
-    required = {"run_id", "started_at", "ended_at", "targeted_stages", "stages"}
+    required = {"run_id", "started_at", "ended_at", "targeted_stages", "execution_order", "stages"}
     missing = required - parsed.keys()
     if missing:
         msg = f"Invalid RunManifest: missing keys {missing}"
@@ -139,8 +139,7 @@ def deserialize_run_manifest(data: bytes) -> RunManifest:
             duration_ms=record["duration_ms"],
         )
 
-    # execution_order is optional for backwards compatibility with old entries
-    execution_order = parsed.get("execution_order", sorted(stages.keys()))
+    execution_order = parsed["execution_order"]
 
     return RunManifest(
         run_id=parsed["run_id"],

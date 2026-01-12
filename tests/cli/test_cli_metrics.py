@@ -311,7 +311,7 @@ def test_metrics_diff_integration(
             case "json_output":
                 parsed = cast("list[dict[str, object]]", json.loads(result.output))
                 assert len(parsed) == 1
-                assert parsed[0]["change"] == "modified"
+                assert parsed[0]["change_type"] == "modified"
                 assert parsed[0]["old"] == 0.80, "Should include old value"
                 assert parsed[0]["new"] == 0.95, "Should include new value"
             case "no_changes":
