@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import time
+from typing import TYPE_CHECKING
 
 import pytest
-from click.testing import CliRunner
 
 from pivot.cli import _LAZY_COMMANDS, cli
+
+if TYPE_CHECKING:
+    from click.testing import CliRunner
 
 # Maximum allowed time for --help (in seconds)
 # With lazy command loading, --help should complete in ~0.2s
@@ -19,12 +22,6 @@ def _get_all_commands() -> list[str]:
 
 # Get commands at module load time for parametrization
 ALL_COMMANDS = _get_all_commands()
-
-
-@pytest.fixture
-def runner() -> CliRunner:
-    """Create a CLI runner for testing."""
-    return CliRunner()
 
 
 @pytest.mark.parametrize("command", ALL_COMMANDS)

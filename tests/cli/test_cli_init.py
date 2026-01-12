@@ -5,12 +5,6 @@ import pytest
 
 from pivot import cli, project
 
-
-@pytest.fixture
-def runner() -> click.testing.CliRunner:
-    return click.testing.CliRunner()
-
-
 # --- basic initialization tests ---
 
 

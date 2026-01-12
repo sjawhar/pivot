@@ -4,12 +4,14 @@ import collections
 import multiprocessing as mp
 import pathlib
 import queue
+from typing import TYPE_CHECKING
 
 import pytest
 import textual.binding
+import textual.widgets
 
 import pivot
-from pivot import executor, project
+from pivot import executor
 from pivot.tui import run as run_tui
 from pivot.types import (
     DisplayMode,
@@ -19,16 +21,41 @@ from pivot.types import (
     TuiMessage,
     TuiMessageType,
     TuiStatusMessage,
+    is_tui_log_message,
+    is_tui_status_message,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Generator
+    from multiprocessing.managers import SyncManager
+
+
+# =============================================================================
+# Test Fixtures and Helpers
+# =============================================================================
+
+
+def _drain_queue(tui_queue: mp.Queue[TuiMessage]) -> list[TuiMessage]:
+    """Drain all messages from a TUI queue until None sentinel or timeout."""
+    messages = list[TuiMessage]()
+    while True:
+        try:
+            msg = tui_queue.get(timeout=0.1)
+            if msg is None:
+                break
+            messages.append(msg)
+        except queue.Empty:
+            break
+    return messages
 
 
 @pytest.fixture
-def pipeline_dir(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> pathlib.Path:
-    """Set up a temporary pipeline directory."""
-    (tmp_path / ".pivot").mkdir()
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(project, "_project_root_cache", None)
-    return tmp_path
+def tui_queue_with_manager() -> Generator[tuple[mp.Queue[TuiMessage], SyncManager]]:
+    """Create a TUI queue with proper manager cleanup."""
+    manager = mp.Manager()
+    tui_queue: mp.Queue[TuiMessage] = manager.Queue()  # pyright: ignore[reportAssignmentType]
+    yield tui_queue, manager
+    manager.shutdown()
 
 
 # =============================================================================
@@ -110,36 +137,42 @@ def test_stage_info_logs_bounded() -> None:
 # =============================================================================
 
 
-def test_tui_update_with_log_message() -> None:
-    """TuiUpdate can wrap log messages."""
-    log_msg = TuiLogMessage(
-        type=TuiMessageType.LOG,
-        stage="test",
-        line="output",
-        is_stderr=False,
-        timestamp=1234567890.0,
-    )
-    update = run_tui.TuiUpdate(log_msg)
-
-    assert update.msg == log_msg
-    assert update.msg["type"] == "log"
-
-
-def test_tui_update_with_status_message() -> None:
-    """TuiUpdate can wrap status messages."""
-    status_msg = TuiStatusMessage(
-        type=TuiMessageType.STATUS,
-        stage="test",
-        index=1,
-        total=5,
-        status=StageStatus.IN_PROGRESS,
-        reason="",
-        elapsed=None,
-    )
-    update = run_tui.TuiUpdate(status_msg)
-
-    assert update.msg == status_msg
-    assert update.msg["type"] == "status"
+@pytest.mark.parametrize(
+    ("msg", "expected_type"),
+    [
+        (
+            TuiLogMessage(
+                type=TuiMessageType.LOG,
+                stage="test",
+                line="output",
+                is_stderr=False,
+                timestamp=1234567890.0,
+            ),
+            "log",
+        ),
+        (
+            TuiStatusMessage(
+                type=TuiMessageType.STATUS,
+                stage="test",
+                index=1,
+                total=5,
+                status=StageStatus.IN_PROGRESS,
+                reason="",
+                elapsed=None,
+            ),
+            "status",
+        ),
+    ],
+    ids=["log_message", "status_message"],
+)
+def test_tui_update_wraps_messages(
+    msg: TuiLogMessage | TuiStatusMessage, expected_type: str
+) -> None:
+    """TuiUpdate correctly wraps different message types."""
+    update = run_tui.TuiUpdate(msg)
+    assert update.msg == msg
+    assert update.msg is not None
+    assert update.msg["type"] == expected_type
 
 
 # =============================================================================
@@ -147,22 +180,32 @@ def test_tui_update_with_status_message() -> None:
 # =============================================================================
 
 
-def test_executor_complete_success() -> None:
-    """ExecutorComplete stores results on success."""
-    results = {"stage1": executor.ExecutionSummary(status=StageStatus.RAN, reason="code changed")}
-    complete = run_tui.ExecutorComplete(results, error=None)
-
-    assert complete.results == results
-    assert complete.error is None
-
-
-def test_executor_complete_with_error() -> None:
-    """ExecutorComplete stores error on failure."""
-    error = ValueError("something went wrong")
-    complete = run_tui.ExecutorComplete({}, error=error)
-
-    assert complete.results == {}
-    assert complete.error is error
+@pytest.mark.parametrize(
+    ("results", "error", "expected_results", "has_error"),
+    [
+        (
+            {"stage1": executor.ExecutionSummary(status=StageStatus.RAN, reason="code changed")},
+            None,
+            {"stage1": executor.ExecutionSummary(status=StageStatus.RAN, reason="code changed")},
+            False,
+        ),
+        ({}, ValueError("something went wrong"), {}, True),
+    ],
+    ids=["success", "with_error"],
+)
+def test_executor_complete(
+    results: dict[str, executor.ExecutionSummary],
+    error: Exception | None,
+    expected_results: dict[str, executor.ExecutionSummary],
+    has_error: bool,
+) -> None:
+    """ExecutorComplete stores results and error appropriately."""
+    complete = run_tui.ExecutorComplete(results, error=error)
+    assert complete.results == expected_results
+    if has_error:
+        assert complete.error is not None
+    else:
+        assert complete.error is None
 
 
 # =============================================================================
@@ -170,48 +213,44 @@ def test_executor_complete_with_error() -> None:
 # =============================================================================
 
 
-def test_run_tui_app_init() -> None:
+def test_run_tui_app_init(
+    tui_queue_with_manager: tuple[mp.Queue[TuiMessage], SyncManager],
+) -> None:
     """RunTuiApp initializes with stage names and queue."""
-    manager = mp.Manager()
-    try:
-        tui_queue: mp.Queue[TuiMessage] = manager.Queue()  # pyright: ignore[reportAssignmentType]
-        stage_names = ["stage1", "stage2", "stage3"]
+    tui_queue, _manager = tui_queue_with_manager
+    stage_names = ["stage1", "stage2", "stage3"]
 
-        def executor_func() -> dict[str, executor.ExecutionSummary]:
-            return {}
+    def executor_func() -> dict[str, executor.ExecutionSummary]:
+        return {}
 
-        app = run_tui.RunTuiApp(stage_names, tui_queue, executor_func)
+    app = run_tui.RunTuiApp(stage_names, tui_queue, executor_func)
 
-        assert len(app._stages) == 3
-        assert list(app._stage_order) == stage_names
-        assert app._selected_idx == 0
-        assert app._show_logs is False
-        assert app._results is None
-        assert app.error is None
-    finally:
-        manager.shutdown()
+    assert len(app._stages) == 3
+    assert list(app._stage_order) == stage_names
+    assert app._selected_idx == 0
+    assert app._show_logs is False
+    assert app._results is None
+    assert app.error is None
 
 
-def test_run_tui_app_stage_info_indexes() -> None:
+def test_run_tui_app_stage_info_indexes(
+    tui_queue_with_manager: tuple[mp.Queue[TuiMessage], SyncManager],
+) -> None:
     """RunTuiApp assigns correct 1-based indexes to stages."""
-    manager = mp.Manager()
-    try:
-        tui_queue: mp.Queue[TuiMessage] = manager.Queue()  # pyright: ignore[reportAssignmentType]
-        stage_names = ["first", "second", "third"]
+    tui_queue, _manager = tui_queue_with_manager
+    stage_names = ["first", "second", "third"]
 
-        def executor_func() -> dict[str, executor.ExecutionSummary]:
-            return {}
+    def executor_func() -> dict[str, executor.ExecutionSummary]:
+        return {}
 
-        app = run_tui.RunTuiApp(stage_names, tui_queue, executor_func)
+    app = run_tui.RunTuiApp(stage_names, tui_queue, executor_func)
 
-        assert app._stages["first"].index == 1
-        assert app._stages["second"].index == 2
-        assert app._stages["third"].index == 3
+    assert app._stages["first"].index == 1
+    assert app._stages["second"].index == 2
+    assert app._stages["third"].index == 3
 
-        for _name, info in app._stages.items():
-            assert info.total == 3
-    finally:
-        manager.shutdown()
+    for _name, info in app._stages.items():
+        assert info.total == 3
 
 
 # =============================================================================
@@ -219,50 +258,43 @@ def test_run_tui_app_stage_info_indexes() -> None:
 # =============================================================================
 
 
-def test_executor_emits_status_messages_to_queue(pipeline_dir: pathlib.Path) -> None:
+def test_executor_emits_status_messages_to_queue(
+    pipeline_dir: pathlib.Path,
+    tui_queue_with_manager: tuple[mp.Queue[TuiMessage], SyncManager],
+) -> None:
     """Executor emits TuiStatusMessage for stage start and completion."""
+    tui_queue, _manager = tui_queue_with_manager
     (pipeline_dir / "input.txt").write_text("hello")
 
     @pivot.stage(deps=["input.txt"], outs=["output.txt"])
     def process() -> None:
         pathlib.Path("output.txt").write_text("done")
 
-    manager = mp.Manager()
-    try:
-        tui_queue: mp.Queue[TuiMessage] = manager.Queue()  # pyright: ignore[reportAssignmentType]
+    executor.run(show_output=False, tui_queue=tui_queue)
 
-        executor.run(show_output=False, tui_queue=tui_queue)
+    messages = _drain_queue(tui_queue)
+    status_messages = [m for m in messages if is_tui_status_message(m)]
 
-        messages = list[TuiMessage]()
-        while True:
-            try:
-                msg = tui_queue.get(timeout=0.1)
-                if msg is None:
-                    break
-                messages.append(msg)
-            except queue.Empty:
-                break
+    assert len(status_messages) >= 2, "Should have at least start and complete status"
 
-        status_messages = [m for m in messages if m is not None and m["type"] == "status"]
+    start_msg = status_messages[0]
+    assert start_msg["stage"] == "process"
+    assert start_msg["status"] == StageStatus.IN_PROGRESS
+    assert start_msg["index"] == 1
+    assert start_msg["total"] == 1
 
-        assert len(status_messages) >= 2, "Should have at least start and complete status"
-
-        start_msg = status_messages[0]
-        assert start_msg["stage"] == "process"
-        assert start_msg["status"] == StageStatus.IN_PROGRESS
-        assert start_msg["index"] == 1
-        assert start_msg["total"] == 1
-
-        end_msg = status_messages[-1]
-        assert end_msg["stage"] == "process"
-        assert end_msg["status"] in (StageStatus.RAN, StageStatus.SKIPPED, StageStatus.COMPLETED)
-        assert end_msg["elapsed"] is not None or end_msg["elapsed"] is None
-    finally:
-        manager.shutdown()
+    end_msg = status_messages[-1]
+    assert end_msg["stage"] == "process"
+    assert end_msg["status"] in (StageStatus.RAN, StageStatus.SKIPPED, StageStatus.COMPLETED)
+    assert "elapsed" in end_msg
 
 
-def test_executor_emits_log_messages_to_queue(pipeline_dir: pathlib.Path) -> None:
+def test_executor_emits_log_messages_to_queue(
+    pipeline_dir: pathlib.Path,
+    tui_queue_with_manager: tuple[mp.Queue[TuiMessage], SyncManager],
+) -> None:
     """Executor emits TuiLogMessage for stage output."""
+    tui_queue, _manager = tui_queue_with_manager
     (pipeline_dir / "input.txt").write_text("hello")
 
     @pivot.stage(deps=["input.txt"], outs=["output.txt"])
@@ -270,67 +302,43 @@ def test_executor_emits_log_messages_to_queue(pipeline_dir: pathlib.Path) -> Non
         print("Processing data")
         pathlib.Path("output.txt").write_text("done")
 
-    manager = mp.Manager()
-    try:
-        tui_queue: mp.Queue[TuiMessage] = manager.Queue()  # pyright: ignore[reportAssignmentType]
+    executor.run(show_output=False, tui_queue=tui_queue)
 
-        executor.run(show_output=False, tui_queue=tui_queue)
+    messages = _drain_queue(tui_queue)
+    log_messages = [m for m in messages if is_tui_log_message(m)]
 
-        messages = list[TuiMessage]()
-        while True:
-            try:
-                msg = tui_queue.get(timeout=0.1)
-                if msg is None:
-                    break
-                messages.append(msg)
-            except queue.Empty:
-                break
-
-        log_messages = [m for m in messages if m is not None and m["type"] == "log"]
-
-        assert len(log_messages) >= 1, "Should have at least one log message"
-        assert any("Processing data" in m["line"] for m in log_messages if m is not None), (
-            "Log should contain stdout"
-        )
-    finally:
-        manager.shutdown()
+    assert len(log_messages) >= 1, "Should have at least one log message"
+    assert any("Processing data" in m["line"] for m in log_messages), "Log should contain stdout"
 
 
-def test_executor_emits_failed_status_on_stage_failure(pipeline_dir: pathlib.Path) -> None:
+def test_executor_emits_failed_status_on_stage_failure(
+    pipeline_dir: pathlib.Path,
+    tui_queue_with_manager: tuple[mp.Queue[TuiMessage], SyncManager],
+) -> None:
     """Executor emits FAILED status when stage raises an exception."""
+    tui_queue, _manager = tui_queue_with_manager
     (pipeline_dir / "input.txt").write_text("hello")
 
     @pivot.stage(deps=["input.txt"], outs=["output.txt"])
     def failing_stage() -> None:
         raise RuntimeError("Stage failed!")
 
-    manager = mp.Manager()
-    try:
-        tui_queue: mp.Queue[TuiMessage] = manager.Queue()  # pyright: ignore[reportAssignmentType]
+    executor.run(show_output=False, tui_queue=tui_queue)
 
-        executor.run(show_output=False, tui_queue=tui_queue)
+    messages = _drain_queue(tui_queue)
+    status_messages = [m for m in messages if is_tui_status_message(m)]
 
-        messages = list[TuiMessage]()
-        while True:
-            try:
-                msg = tui_queue.get(timeout=0.1)
-                if msg is None:
-                    break
-                messages.append(msg)
-            except queue.Empty:
-                break
-
-        status_messages = [m for m in messages if m is not None and m["type"] == "status"]
-
-        failed_msgs = [m for m in status_messages if m["status"] == StageStatus.FAILED]
-        assert len(failed_msgs) >= 1, "Should have at least one FAILED status message"
-        assert failed_msgs[0]["stage"] == "failing_stage"
-    finally:
-        manager.shutdown()
+    failed_msgs = [m for m in status_messages if m["status"] == StageStatus.FAILED]
+    assert len(failed_msgs) >= 1, "Should have at least one FAILED status message"
+    assert failed_msgs[0]["stage"] == "failing_stage"
 
 
-def test_executor_emits_status_for_multiple_stages(pipeline_dir: pathlib.Path) -> None:
+def test_executor_emits_status_for_multiple_stages(
+    pipeline_dir: pathlib.Path,
+    tui_queue_with_manager: tuple[mp.Queue[TuiMessage], SyncManager],
+) -> None:
     """Executor emits status messages for all stages in multi-stage pipeline."""
+    tui_queue, _manager = tui_queue_with_manager
     (pipeline_dir / "input.txt").write_text("hello")
 
     @pivot.stage(deps=["input.txt"], outs=["step1.txt"])
@@ -345,34 +353,23 @@ def test_executor_emits_status_for_multiple_stages(pipeline_dir: pathlib.Path) -
     def step3() -> None:
         pathlib.Path("step3.txt").write_text("step3")
 
-    manager = mp.Manager()
-    try:
-        tui_queue: mp.Queue[TuiMessage] = manager.Queue()  # pyright: ignore[reportAssignmentType]
+    executor.run(show_output=False, tui_queue=tui_queue)
 
-        executor.run(show_output=False, tui_queue=tui_queue)
+    messages = _drain_queue(tui_queue)
+    status_messages = [m for m in messages if is_tui_status_message(m)]
+    stages_with_status = {m["stage"] for m in status_messages}
 
-        messages = list[TuiMessage]()
-        while True:
-            try:
-                msg = tui_queue.get(timeout=0.1)
-                if msg is None:
-                    break
-                messages.append(msg)
-            except queue.Empty:
-                break
-
-        status_messages = [m for m in messages if m is not None and m["type"] == "status"]
-        stages_with_status = {m["stage"] for m in status_messages}
-
-        assert "step1" in stages_with_status
-        assert "step2" in stages_with_status
-        assert "step3" in stages_with_status
-    finally:
-        manager.shutdown()
+    assert "step1" in stages_with_status
+    assert "step2" in stages_with_status
+    assert "step3" in stages_with_status
 
 
-def test_executor_status_includes_correct_index_and_total(pipeline_dir: pathlib.Path) -> None:
+def test_executor_status_includes_correct_index_and_total(
+    pipeline_dir: pathlib.Path,
+    tui_queue_with_manager: tuple[mp.Queue[TuiMessage], SyncManager],
+) -> None:
     """Executor status messages include correct index and total counts."""
+    tui_queue, _manager = tui_queue_with_manager
     (pipeline_dir / "input.txt").write_text("hello")
 
     @pivot.stage(deps=["input.txt"], outs=["step1.txt"])
@@ -383,29 +380,14 @@ def test_executor_status_includes_correct_index_and_total(pipeline_dir: pathlib.
     def step2() -> None:
         pathlib.Path("step2.txt").write_text("step2")
 
-    manager = mp.Manager()
-    try:
-        tui_queue: mp.Queue[TuiMessage] = manager.Queue()  # pyright: ignore[reportAssignmentType]
+    executor.run(show_output=False, tui_queue=tui_queue)
 
-        executor.run(show_output=False, tui_queue=tui_queue)
+    messages = _drain_queue(tui_queue)
+    status_messages = [m for m in messages if is_tui_status_message(m)]
 
-        messages = list[TuiMessage]()
-        while True:
-            try:
-                msg = tui_queue.get(timeout=0.1)
-                if msg is None:
-                    break
-                messages.append(msg)
-            except queue.Empty:
-                break
-
-        status_messages = [m for m in messages if m is not None and m["type"] == "status"]
-
-        for msg in status_messages:
-            assert msg["total"] == 2, "Total should be 2 stages"
-            assert msg["index"] in (1, 2), "Index should be 1 or 2"
-    finally:
-        manager.shutdown()
+    for msg in status_messages:
+        assert msg["total"] == 2, "Total should be 2 stages"
+        assert msg["index"] in (1, 2), "Index should be 1 or 2"
 
 
 # =============================================================================
@@ -501,3 +483,239 @@ def test_confirm_commit_screen_instantiation() -> None:
     """ConfirmCommitScreen can be instantiated."""
     screen = run_tui.ConfirmCommitScreen()
     assert isinstance(screen, run_tui.ConfirmCommitScreen)
+
+
+# =============================================================================
+# Pilot-Based Interactive Tests
+# =============================================================================
+
+
+@pytest.fixture
+def mock_tui_queue() -> Generator[mp.Queue[TuiMessage]]:
+    """Create a mock TUI queue for testing."""
+    manager = mp.Manager()
+    tui_queue: mp.Queue[TuiMessage] = manager.Queue()  # pyright: ignore[reportAssignmentType]
+    yield tui_queue
+    manager.shutdown()
+
+
+@pytest.fixture
+def simple_run_app(mock_tui_queue: mp.Queue[TuiMessage]) -> run_tui.RunTuiApp:
+    """Create a simple RunTuiApp for testing."""
+
+    def executor_func() -> dict[str, executor.ExecutionSummary]:
+        return {}
+
+    return run_tui.RunTuiApp(["stage1", "stage2", "stage3"], mock_tui_queue, executor_func)
+
+
+@pytest.mark.asyncio
+async def test_run_app_mounts_with_correct_structure(
+    simple_run_app: run_tui.RunTuiApp,
+) -> None:
+    """RunTuiApp mounts with stage list and detail panels."""
+    async with simple_run_app.run_test():
+        # Check stage list exists
+        stage_list = simple_run_app.query_one("#stage-list", run_tui.StageListPanel)
+        assert stage_list is not None
+
+        # Check detail panel exists
+        detail_panel = simple_run_app.query_one("#detail-panel", run_tui.TabbedDetailPanel)
+        assert detail_panel is not None
+
+        # Check tabs exist
+        tabbed_content = simple_run_app.query_one("#detail-tabs", textual.widgets.TabbedContent)
+        assert tabbed_content is not None
+
+
+@pytest.mark.asyncio
+async def test_run_app_action_nav_down_changes_selection(
+    simple_run_app: run_tui.RunTuiApp,
+) -> None:
+    """action_nav_down navigates between stages."""
+    async with simple_run_app.run_test() as pilot:
+        await pilot.pause()
+
+        # Initial selection is first stage
+        assert simple_run_app.selected_stage_name == "stage1"
+
+        # Call action directly
+        simple_run_app.action_nav_down()
+        await pilot.pause()
+        assert simple_run_app.selected_stage_name == "stage2"
+
+        # Call again
+        simple_run_app.action_nav_down()
+        await pilot.pause()
+        assert simple_run_app.selected_stage_name == "stage3"
+
+
+@pytest.mark.asyncio
+async def test_run_app_action_nav_up_changes_selection(
+    simple_run_app: run_tui.RunTuiApp,
+) -> None:
+    """action_nav_up navigates between stages."""
+    async with simple_run_app.run_test() as pilot:
+        await pilot.pause()
+
+        # Start at last stage
+        simple_run_app.select_stage_by_index(2)
+
+        # Call action directly
+        simple_run_app.action_nav_up()
+        await pilot.pause()
+        assert simple_run_app.selected_stage_name == "stage2"
+
+        # Call again
+        simple_run_app.action_nav_up()
+        await pilot.pause()
+        assert simple_run_app.selected_stage_name == "stage1"
+
+
+@pytest.mark.asyncio
+async def test_run_app_navigation_stays_at_bounds(
+    simple_run_app: run_tui.RunTuiApp,
+) -> None:
+    """Navigation stays at list bounds (no wrap)."""
+    async with simple_run_app.run_test() as pilot:
+        await pilot.pause()
+
+        # At first stage, up should stay at first stage
+        simple_run_app.select_stage_by_index(0)
+        simple_run_app.action_nav_up()
+        await pilot.pause()
+        assert simple_run_app.selected_stage_name == "stage1", "Should stay at first stage"
+
+        # At last stage, down should stay at last stage
+        simple_run_app.select_stage_by_index(2)
+        simple_run_app.action_nav_down()
+        await pilot.pause()
+        assert simple_run_app.selected_stage_name == "stage3", "Should stay at last stage"
+
+
+@pytest.mark.asyncio
+async def test_run_app_action_switch_focus(simple_run_app: run_tui.RunTuiApp) -> None:
+    """action_switch_focus toggles between panels."""
+    async with simple_run_app.run_test() as pilot:
+        await pilot.pause()
+
+        # Initial focus should be on stages panel
+        assert simple_run_app.focused_panel == "stages"
+
+        # Call action to switch
+        simple_run_app.action_switch_focus()
+        await pilot.pause()
+        assert simple_run_app.focused_panel == "detail"
+
+        # Call again to switch back
+        simple_run_app.action_switch_focus()
+        await pilot.pause()
+        assert simple_run_app.focused_panel == "stages"
+
+
+@pytest.mark.asyncio
+async def test_run_app_quit_action(simple_run_app: run_tui.RunTuiApp) -> None:
+    """action_quit exits the app."""
+    async with simple_run_app.run_test() as pilot:
+        await pilot.pause()
+        # Call quit action - should not raise
+        await simple_run_app.action_quit()
+
+
+@pytest.mark.asyncio
+async def test_run_app_stages_shown(mock_tui_queue: mp.Queue[TuiMessage]) -> None:
+    """Stage names appear in the app."""
+    stage_names = ["alpha", "beta", "gamma"]
+
+    def executor_func() -> dict[str, executor.ExecutionSummary]:
+        return {}
+
+    app = run_tui.RunTuiApp(stage_names, mock_tui_queue, executor_func)
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        # Verify all stages are in the app's stage dict
+        assert "alpha" in app._stages
+        assert "beta" in app._stages
+        assert "gamma" in app._stages
+
+
+# =============================================================================
+# TabbedDetailPanel Tests
+# =============================================================================
+
+
+def test_tabbed_detail_panel_init() -> None:
+    """TabbedDetailPanel initializes with None stage."""
+    panel = run_tui.TabbedDetailPanel(id="test-detail")
+    assert panel._stage is None
+
+
+# =============================================================================
+# StageRow Tests
+# =============================================================================
+
+
+def test_stage_row_init() -> None:
+    """StageRow initializes with StageInfo."""
+    info = run_tui.StageInfo("test", 1, 3)
+    row = run_tui.StageRow(info)
+    assert row._info is info
+
+
+# =============================================================================
+# StageListPanel Tests
+# =============================================================================
+
+
+def test_stage_list_panel_init() -> None:
+    """StageListPanel initializes with stages list."""
+    stages = [
+        run_tui.StageInfo("s1", 1, 2),
+        run_tui.StageInfo("s2", 2, 2),
+    ]
+    panel = run_tui.StageListPanel(stages, id="test-list")
+    assert panel._stages == stages
+    assert panel._rows == {}  # Empty until mounted
+
+
+# =============================================================================
+# DetailPanel Tests
+# =============================================================================
+
+
+def test_detail_panel_init() -> None:
+    """DetailPanel initializes with None stage."""
+    panel = run_tui.DetailPanel(id="test-detail")
+    assert panel._stage is None
+
+
+def test_detail_panel_set_stage() -> None:
+    """DetailPanel.set_stage updates internal stage."""
+    panel = run_tui.DetailPanel()
+    info = run_tui.StageInfo("test", 1, 1)
+    panel.set_stage(info)
+    assert panel._stage is info
+
+
+# =============================================================================
+# LogPanel Tests
+# =============================================================================
+
+
+def test_log_panel_init() -> None:
+    """LogPanel initializes with empty logs and no filter."""
+    panel = run_tui.LogPanel()
+    assert panel._filter_stage is None
+    assert len(panel._all_logs) == 0
+
+
+# =============================================================================
+# StageLogPanel Tests
+# =============================================================================
+
+
+def test_stage_log_panel_init() -> None:
+    """StageLogPanel can be instantiated."""
+    panel = run_tui.StageLogPanel(id="test-logs")
+    assert isinstance(panel, run_tui.StageLogPanel)

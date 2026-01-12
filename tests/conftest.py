@@ -7,6 +7,7 @@ import tempfile
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
+import click.testing
 import pytest
 
 from pivot import project
@@ -123,3 +124,18 @@ def make_valid_lock_content() -> ValidLockContentFactory:
         }
 
     return _factory
+
+
+@pytest.fixture
+def pipeline_dir(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> pathlib.Path:
+    """Set up a temporary pipeline directory with .pivot marker."""
+    (tmp_path / ".pivot").mkdir()
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(project, "_project_root_cache", None)
+    return tmp_path
+
+
+@pytest.fixture
+def runner() -> click.testing.CliRunner:
+    """Create a CLI runner for testing."""
+    return click.testing.CliRunner()

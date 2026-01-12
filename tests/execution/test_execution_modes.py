@@ -18,7 +18,7 @@ from pivot.types import OutputMessage, StageStatus
 
 if TYPE_CHECKING:
     import pathlib
-    from collections.abc import Callable
+    from collections.abc import Callable, Generator
 
 
 @pytest.fixture
@@ -36,10 +36,12 @@ def worker_env(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> pathl
 
 
 @pytest.fixture
-def output_queue() -> mp_queues.Queue[OutputMessage]:
+def output_queue() -> Generator[mp_queues.Queue[OutputMessage]]:
     """Create a multiprocessing queue for worker output."""
+    manager = mp.Manager()
     # mp.Manager().Queue() returns a proxy that's compatible but not the exact type
-    return mp.Manager().Queue()  # pyright: ignore[reportReturnType]
+    yield manager.Queue()  # pyright: ignore[reportReturnType]
+    manager.shutdown()
 
 
 def _make_stage_info(

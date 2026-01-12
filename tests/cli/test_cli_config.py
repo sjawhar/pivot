@@ -6,12 +6,6 @@ import pytest
 
 from pivot import cli
 
-
-@pytest.fixture
-def runner() -> click.testing.CliRunner:
-    return click.testing.CliRunner()
-
-
 # --- config list tests ---
 
 

@@ -1,18 +1,12 @@
 from __future__ import annotations
 
 import pathlib
-
-import click.testing
-import pytest
+from typing import TYPE_CHECKING
 
 from pivot import cli
 
-
-@pytest.fixture
-def runner() -> click.testing.CliRunner:
-    """Create a CLI runner for testing."""
-    return click.testing.CliRunner()
-
+if TYPE_CHECKING:
+    import click.testing
 
 # =============================================================================
 # Data Diff Help Tests
