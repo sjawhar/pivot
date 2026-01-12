@@ -285,3 +285,6 @@ $RECYCLE.BIN/
 
 /benchmarks
 *.code-workspace
+
+# Pivot project state
+.pivot/

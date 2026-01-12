@@ -1,6 +1,16 @@
 # Pivot - Project Rules
 
-**Python 3.13+ | Unix only | 90%+ coverage**
+**Python 3.13+ | Unix only | 90%+ coverage | Pre-alpha (breaking changes OK)**
+
+---
+
+## Project Status
+
+This project is **pre-alpha**. No backwards compatibility is needed.
+
+- **Breaking changes are acceptable** — don't add migration code or compatibility shims
+- **No legacy format support** — only support the current version
+- **Validate design empirically** — test decisions on real workloads, not just theory
 
 ---
 
@@ -9,6 +19,19 @@
 - Per-stage lock files (32x faster than DVC), automatic code fingerprinting, warm worker pools
 - `ProcessPoolExecutor` for true parallelism (not threads—GIL would serialize)
 - TDD: write tests BEFORE implementation
+
+## Artifact-Centric Mental Model (Critical)
+
+Think **artifact-first**, not **stage-first**. The DAG emerges from artifact dependencies.
+
+- **Wrong:** "Stage A triggers Stage B"
+- **Right:** "This file changed. What needs to happen because of that?"
+
+**Implications:**
+- Invalidation is content-addressed: same inputs + same code = same outputs
+- Stage execution order is derived from the artifact graph, not explicit wiring
+- Watch mode must distinguish external changes (trigger re-run) from stage outputs (don't trigger)
+- Outputs can also be inputs to downstream stages — the full dependency graph matters
 
 ## Stage Registration (Critical)
 
@@ -77,6 +100,12 @@ Zero runtime overhead, native JSON serialization. Use over dataclasses (need `as
 
 Use for data needing validation with clear errors (config files, user input, API boundaries). Avoid in hot paths—use TypedDict there.
 
+**Config belongs in code, not YAML.** Use Pydantic classes for configuration, not `params.yaml`. This enables type checking, IDE support, and change detection through fingerprinting.
+
+## Path Handling
+
+All paths in lockfiles must be **relative** (to stage cwd), never absolute. This ensures portability and correct cache behavior.
+
 ## Import Style
 
 Import modules, not functions: `from pivot import fingerprint` then `fingerprint.func()`.
@@ -123,7 +152,9 @@ Write evergreen docs—avoid "recently added" or "as of version X".
 - **Private functions:** `_prefix` for module-internal helpers
 - **Enums over Literals:** For programmatic values (catches typos at type-check time)
 
-## Error Handling
+## Error Handling Philosophy
+
+**Validate boundaries, trust internals.** Validate aggressively at entry points (CLI, file I/O, config parsing). Once validated, trust data downstream — no redundant internal validation.
 
 Let errors propagate—catch at boundaries where you can handle meaningfully. Silent failures are worse than crashes.
 
@@ -137,9 +168,27 @@ except StageNotFoundError as e:
     click.echo(f"Error: {e}", err=True)
 ```
 
+**When to suppress vs propagate:**
+| Condition | Action |
+|-----------|--------|
+| Unknown/invalid state | Propagate — fail fast |
+| Invariant violation | Propagate — this is a bug |
+| Cache miss, optional feature | Log and continue with fallback |
+| Resource exhaustion (queue full) | Propagate — architectural issue |
+
+**Failed operations should be atomic** — return to last known good state. If a stage fails, don't update the lockfile.
+
 ## Input Validation
 
 Validate at boundaries, then trust downstream. Fail fast with clear errors—don't silently fix or skip invalid inputs.
+
+## Simplicity Over Abstraction
+
+- **Don't create thin wrapper functions** — if it just calls one library function, inline it
+- **Don't over-modularize** — a module with one public function used by one other module should be inlined
+- **Don't add options without justification** — if you can't articulate when each option would be used, you don't need options
+- **Three similar lines > premature abstraction** — wait until the pattern is clear before extracting
+- **No nested functions** — use module-level for testability and fingerprinting
 
 ## CLI
 
@@ -166,6 +215,26 @@ Run all four: `ruff format .`, `ruff check .`, `basedpyright .`, `pytest tests/ 
 ## Before Pushing (Critical)
 
 `uv run ruff format . && uv run ruff check . && uv run basedpyright . && uv run pytest tests/ -n auto`
+
+## Testing Philosophy
+
+**Real assurance over passing tests.** Tests should prove correctness, not just exercise code paths. Prefer real execution over mocks — mock external boundaries (network, filesystem in unit tests), not internal logic.
+
+See `tests/CLAUDE.md` for detailed test guidelines.
+
+## Mental Model Mistakes to Avoid
+
+These are recurring patterns that lead to corrections:
+
+1. **Over-engineering** — Adding validation modes, config options, or abstractions for hypothetical future needs. If you can't articulate when each option would be used, you don't need options.
+
+2. **Defensive over-programming** — Try/catch that returns a default on both paths; "safe" wrappers that swallow errors and hide bugs. Let errors surface.
+
+3. **Import hacks over structure** — Using lazy imports or sys.path to fix circular dependencies instead of restructuring. Extract shared types to a separate module.
+
+4. **Type safety regression** — Defaulting to `Any` when typing gets hard. Find the correct type or use TypeVar. `Any` is a last resort.
+
+5. **Stage-centric thinking** — Thinking "Stage A triggers Stage B" instead of "this artifact changed, what depends on it?" See Artifact-Centric Mental Model above.
 
 ## Critical Discoveries
 

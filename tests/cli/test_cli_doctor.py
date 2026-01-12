@@ -1,9 +1,11 @@
 import json
 import pathlib
+import subprocess
 
 import click.testing
 import pytest
 
+from pivot import project
 from pivot.cli import cli
 from pivot.cli import doctor as doctor_module
 
@@ -59,14 +61,15 @@ def test_doctor_exits_1_on_error(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """pivot doctor exits 1 when errors are found."""
-    # No .pivot or .git directory - project root will fail
+    # Create a malformed pivot.yaml to trigger a parse error
+    (tmp_path / ".pivot").mkdir()
+    (tmp_path / "pivot.yaml").write_text("stages:\n  - invalid: yaml: content\n")
     monkeypatch.chdir(tmp_path)
 
     result = runner.invoke(cli, ["doctor"])
 
-    # When no project root found, it uses cwd which should pass
-    # But we can test by creating a scenario with errors
-    assert result.exit_code in (0, 1)
+    assert result.exit_code == 1, "Should exit with code 1 when errors are found"
+    assert "[ERROR]" in result.output or "error" in result.output.lower()
 
 
 # =============================================================================
@@ -188,9 +191,6 @@ def test_check_project_root_returns_path_when_found(
     """_check_project_root returns OK with path when found."""
     (tmp_path / ".pivot").mkdir()
     monkeypatch.chdir(tmp_path)
-
-    from pivot import project
-
     monkeypatch.setattr(project, "_project_root_cache", None)
 
     event, root = doctor_module._check_project_root()
@@ -288,8 +288,6 @@ def test_check_git_repository_ok_when_in_repo(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """_check_git_repository returns OK when in git repo."""
-    import subprocess
-
     subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
     monkeypatch.chdir(tmp_path)
 

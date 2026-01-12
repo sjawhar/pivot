@@ -55,15 +55,19 @@ class DoctorSchemaVersionEvent(TypedDict):
 DoctorJsonEvent = DoctorSchemaVersionEvent | DoctorCheckEvent | DoctorSummaryEvent
 
 
+def _check_event(
+    name: str,
+    status: CheckStatus,
+    value: str,
+    details: dict[str, object] | None = None,
+) -> DoctorCheckEvent:
+    """Create a check event with standard type field."""
+    return DoctorCheckEvent(type="check", name=name, status=status, value=value, details=details)
+
+
 def _skipped_check(name: str, reason: str = "no project root") -> DoctorCheckEvent:
     """Create a skipped check event for when a prerequisite is missing."""
-    return DoctorCheckEvent(
-        type="check",
-        name=name,
-        status=CheckStatus.ERROR,
-        value="skipped",
-        details={"reason": reason},
-    )
+    return _check_event(name, CheckStatus.ERROR, "skipped", {"reason": reason})
 
 
 def _sanitize_url(url: str) -> str:
@@ -95,13 +99,7 @@ def _check_python_version() -> DoctorCheckEvent:
     """Check Python version is 3.13+."""
     version = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
     # Diagnostic check - always returns OK since we require 3.13+ to run
-    return DoctorCheckEvent(
-        type="check",
-        name="python_version",
-        status=CheckStatus.OK,
-        value=version,
-        details=None,
-    )
+    return _check_event("python_version", CheckStatus.OK, version)
 
 
 def _check_project_root() -> tuple[DoctorCheckEvent, pathlib.Path | None]:
@@ -110,25 +108,10 @@ def _check_project_root() -> tuple[DoctorCheckEvent, pathlib.Path | None]:
 
     try:
         root = project.get_project_root()
-        return (
-            DoctorCheckEvent(
-                type="check",
-                name="project_root",
-                status=CheckStatus.OK,
-                value=str(root),
-                details=None,
-            ),
-            root,
-        )
+        return (_check_event("project_root", CheckStatus.OK, str(root)), root)
     except Exception as e:
         return (
-            DoctorCheckEvent(
-                type="check",
-                name="project_root",
-                status=CheckStatus.ERROR,
-                value="not found",
-                details={"error": str(e)},
-            ),
+            _check_event("project_root", CheckStatus.ERROR, "not found", {"error": str(e)}),
             None,
         )
 
@@ -155,39 +138,22 @@ def _check_pipeline_config(project_root: pathlib.Path | None) -> DoctorCheckEven
                 stage_count = (
                     len(cast("dict[str, Any]", stages_raw)) if isinstance(stages_raw, dict) else 0
                 )
-                return DoctorCheckEvent(
-                    type="check",
-                    name="pipeline_config",
-                    status=CheckStatus.OK,
-                    value=name,
-                    details={"stages": stage_count},
+                return _check_event(
+                    "pipeline_config", CheckStatus.OK, name, {"stages": stage_count}
                 )
             except Exception as e:
-                return DoctorCheckEvent(
-                    type="check",
-                    name="pipeline_config",
-                    status=CheckStatus.ERROR,
-                    value=name,
-                    details={"error": str(e)},
-                )
+                return _check_event("pipeline_config", CheckStatus.ERROR, name, {"error": str(e)})
 
     # Check for pipeline.py
     pipeline_py = project_root / "pipeline.py"
     if pipeline_py.exists():
-        return DoctorCheckEvent(
-            type="check",
-            name="pipeline_config",
-            status=CheckStatus.OK,
-            value="pipeline.py",
-            details=None,
-        )
+        return _check_event("pipeline_config", CheckStatus.OK, "pipeline.py")
 
-    return DoctorCheckEvent(
-        type="check",
-        name="pipeline_config",
-        status=CheckStatus.WARN,
-        value="not found",
-        details={"searched": ["pivot.yaml", "pivot.yml", "pipeline.py"]},
+    return _check_event(
+        "pipeline_config",
+        CheckStatus.WARN,
+        "not found",
+        {"searched": ["pivot.yaml", "pivot.yml", "pipeline.py"]},
     )
 
 
@@ -197,31 +163,31 @@ def _check_cache_directory(project_root: pathlib.Path | None) -> DoctorCheckEven
         return _skipped_check("cache_directory")
 
     cache_dir = project_root / ".pivot" / "cache"
+    path_str = _relative_path(cache_dir, project_root)
+
     if not cache_dir.exists():
         # Cache doesn't exist yet - that's OK, it'll be created on first run
-        return DoctorCheckEvent(
-            type="check",
-            name="cache_directory",
-            status=CheckStatus.OK,
-            value=_relative_path(cache_dir, project_root),
-            details={"exists": False, "writable": True, "note": "will be created on first run"},
+        return _check_event(
+            "cache_directory",
+            CheckStatus.OK,
+            path_str,
+            {"exists": False, "writable": True, "note": "will be created on first run"},
         )
 
     # Check if writable using os.access (no file creation needed)
     writable = os.access(cache_dir, os.W_OK)
-    return DoctorCheckEvent(
-        type="check",
-        name="cache_directory",
-        status=CheckStatus.OK if writable else CheckStatus.ERROR,
-        value=_relative_path(cache_dir, project_root),
-        details={"exists": True, "writable": writable},
-    )
+    status = CheckStatus.OK if writable else CheckStatus.ERROR
+    return _check_event("cache_directory", status, path_str, {"exists": True, "writable": writable})
 
 
 def _check_git_repository(project_root: pathlib.Path | None) -> DoctorCheckEvent:
     """Check if in a git repository."""
     if project_root is None:
         return _skipped_check("git_repository")
+
+    git_optional_note: dict[str, object] = {
+        "note": "git is optional but recommended for versioning"
+    }
 
     try:
         result = subprocess.run(
@@ -232,13 +198,7 @@ def _check_git_repository(project_root: pathlib.Path | None) -> DoctorCheckEvent
             timeout=5,
         )
         if result.returncode != 0:
-            return DoctorCheckEvent(
-                type="check",
-                name="git_repository",
-                status=CheckStatus.WARN,
-                value="not found",
-                details={"note": "git is optional but recommended for versioning"},
-            )
+            return _check_event("git_repository", CheckStatus.WARN, "not found", git_optional_note)
 
         # Get branch name
         branch_result = subprocess.run(
@@ -260,28 +220,16 @@ def _check_git_repository(project_root: pathlib.Path | None) -> DoctorCheckEvent
         )
         clean = len(status_result.stdout.strip()) == 0
 
-        return DoctorCheckEvent(
-            type="check",
-            name="git_repository",
-            status=CheckStatus.OK,
-            value="found",
-            details={"branch": branch, "clean": clean},
+        return _check_event(
+            "git_repository", CheckStatus.OK, "found", {"branch": branch, "clean": clean}
         )
     except FileNotFoundError:
-        return DoctorCheckEvent(
-            type="check",
-            name="git_repository",
-            status=CheckStatus.WARN,
-            value="git not installed",
-            details={"note": "git is optional but recommended for versioning"},
+        return _check_event(
+            "git_repository", CheckStatus.WARN, "git not installed", git_optional_note
         )
     except subprocess.TimeoutExpired:
-        return DoctorCheckEvent(
-            type="check",
-            name="git_repository",
-            status=CheckStatus.WARN,
-            value="timeout",
-            details={"note": "git command timed out"},
+        return _check_event(
+            "git_repository", CheckStatus.WARN, "timeout", {"note": "git command timed out"}
         )
 
 
@@ -295,26 +243,10 @@ def _check_remote_connectivity(project_root: pathlib.Path | None) -> list[Doctor
     try:
         remotes = remote_config.list_remotes()
     except Exception as e:
-        return [
-            DoctorCheckEvent(
-                type="check",
-                name="remote",
-                status=CheckStatus.ERROR,
-                value="config error",
-                details={"error": str(e)},
-            )
-        ]
+        return [_check_event("remote", CheckStatus.ERROR, "config error", {"error": str(e)})]
 
     if not remotes:
-        return [
-            DoctorCheckEvent(
-                type="check",
-                name="remote",
-                status=CheckStatus.OK,
-                value="none configured",
-                details=None,
-            )
-        ]
+        return [_check_event("remote", CheckStatus.OK, "none configured")]
 
     results = list[DoctorCheckEvent]()
     for name, url in remotes.items():
@@ -323,22 +255,15 @@ def _check_remote_connectivity(project_root: pathlib.Path | None) -> list[Doctor
             # Validate S3 URL format
             remote_config.validate_s3_url(url)
             results.append(
-                DoctorCheckEvent(
-                    type="check",
-                    name=f"remote:{name}",
-                    status=CheckStatus.OK,
-                    value=sanitized_url,
-                    details={"valid": True},
-                )
+                _check_event(f"remote:{name}", CheckStatus.OK, sanitized_url, {"valid": True})
             )
         except Exception as e:
             results.append(
-                DoctorCheckEvent(
-                    type="check",
-                    name=f"remote:{name}",
-                    status=CheckStatus.ERROR,
-                    value=sanitized_url,
-                    details={"valid": False, "error": str(e)},
+                _check_event(
+                    f"remote:{name}",
+                    CheckStatus.ERROR,
+                    sanitized_url,
+                    {"valid": False, "error": str(e)},
                 )
             )
 
@@ -381,9 +306,8 @@ def _print_check_human(check: DoctorCheckEvent) -> None:
             display = f"{details['branch']} branch{clean_str}"
         else:
             display = value
-    elif name.startswith("remote:"):
-        display = value
     else:
+        # Default for python_version, project_root, remote:*, and any future checks
         display = value
 
     # Print with padding

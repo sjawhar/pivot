@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, TypedDict
 
 import click
 
-from pivot import discovery, exceptions, executor, metrics, registry
+from pivot import discovery, executor, metrics, registry
 from pivot.cli import completion
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
@@ -79,13 +79,7 @@ def _validate_stages(stages_list: list[str] | None, single_stage: bool) -> None:
     """Validate stage arguments and options."""
     if single_stage and not stages_list:
         raise click.ClickException("--single-stage requires at least one stage name")
-
-    if stages_list:
-        graph = registry.REGISTRY.build_dag(validate=True)
-        registered = set(graph.nodes())
-        unknown = [s for s in stages_list if s not in registered]
-        if unknown:
-            raise exceptions.StageNotFoundError(f"Unknown stage(s): {', '.join(unknown)}")
+    cli_helpers.validate_stages_exist(stages_list)
 
 
 def _get_all_explanations(
@@ -157,22 +151,22 @@ def _run_with_tui(
 
     # Create manager and queue (Manager().Queue for loky compatibility)
     manager = mp.Manager()
-    tui_queue: mp.Queue[TuiMessage] = manager.Queue()  # pyright: ignore[reportAssignmentType]
-
-    # Create executor function that passes the TUI queue
-    def executor_func() -> dict[str, ExecutionSummary]:
-        return executor.run(
-            stages=stages_list,
-            single_stage=single_stage,
-            cache_dir=resolved_cache_dir,
-            show_output=False,
-            tui_queue=tui_queue,
-            force=force,
-            no_commit=no_commit,
-            no_cache=no_cache,
-        )
-
     try:
+        tui_queue: mp.Queue[TuiMessage] = manager.Queue()  # pyright: ignore[reportAssignmentType]
+
+        # Create executor function that passes the TUI queue
+        def executor_func() -> dict[str, ExecutionSummary]:
+            return executor.run(
+                stages=stages_list,
+                single_stage=single_stage,
+                cache_dir=resolved_cache_dir,
+                show_output=False,
+                tui_queue=tui_queue,
+                force=force,
+                no_commit=no_commit,
+                no_cache=no_cache,
+            )
+
         with _suppress_stderr_logging():
             return run_tui.run_with_tui(execution_order, tui_queue, executor_func, tui_log=tui_log)
     finally:
@@ -224,20 +218,20 @@ def _run_watch_with_tui(
     # fd inheritance issues. Textual manipulates terminal file descriptors which
     # breaks Manager() subprocess spawning if done after Textual starts.
     manager = mp.Manager()
-    tui_queue: mp.Queue[TuiMessage] = manager.Queue()  # pyright: ignore[reportAssignmentType]
-    output_queue: mp.Queue[OutputMessage] = manager.Queue()  # pyright: ignore[reportAssignmentType]
-
-    engine = watch_module.WatchEngine(
-        stages=stages_list,
-        single_stage=single_stage,
-        cache_dir=cache_dir,
-        debounce_ms=debounce,
-        force_first_run=force,
-        no_commit=no_commit,
-        no_cache=no_cache,
-    )
-
     try:
+        tui_queue: mp.Queue[TuiMessage] = manager.Queue()  # pyright: ignore[reportAssignmentType]
+        output_queue: mp.Queue[OutputMessage] = manager.Queue()  # pyright: ignore[reportAssignmentType]
+
+        engine = watch_module.WatchEngine(
+            stages=stages_list,
+            single_stage=single_stage,
+            cache_dir=cache_dir,
+            debounce_ms=debounce,
+            force_first_run=force,
+            no_commit=no_commit,
+            no_cache=no_cache,
+        )
+
         with _suppress_stderr_logging():
             run_tui.run_watch_tui(
                 engine,

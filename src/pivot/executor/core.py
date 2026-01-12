@@ -382,9 +382,12 @@ def _execute_greedy(
 
     executor = _create_executor(max_workers)
     # Create output queue if not provided (for TUI mode, pass pre-created queue to avoid mp issues)
+    # Track manager so we can shut it down - only created when no queue is passed in
+    local_manager = None
     if output_queue is None:
+        local_manager = mp.Manager()
         # Manager().Queue() returns AutoProxy[Queue] which is incompatible with Queue type stubs
-        output_queue = mp.Manager().Queue()  # pyright: ignore[reportAssignmentType]
+        output_queue = local_manager.Queue()  # pyright: ignore[reportAssignmentType]
 
     # Type narrowing: output_queue is guaranteed to be non-None after the block above
     assert output_queue is not None
@@ -614,6 +617,9 @@ def _execute_greedy(
             output_queue.put(None)
         if output_thread:
             output_thread.join(timeout=1.0)
+        # Clean up manager if we created one (prevents orphaned subprocess)
+        if local_manager is not None:
+            local_manager.shutdown()
 
 
 def _output_queue_reader(
