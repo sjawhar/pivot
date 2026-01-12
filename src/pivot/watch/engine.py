@@ -19,7 +19,7 @@ import loky
 import watchfiles
 import yaml
 
-from pivot import dag, executor, project, registry, types
+from pivot import dag, executor, ignore, project, registry, types
 from pivot.pipeline import yaml as pipeline_yaml
 from pivot.types import (
     OutputMessage,
@@ -44,15 +44,19 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-_VENV_DIRS = frozenset({".venv", "venv", ".env", "env", "node_modules", ".git", "__pycache__"})
-
-
 _MAX_PENDING_CHANGES = 10000  # Threshold for "full rebuild" sentinel
 _FULL_REBUILD_SENTINEL = pathlib.Path("__PIVOT_FULL_REBUILD__")
 
 # File patterns that trigger code reload (worker restart + cache invalidation)
 _CODE_FILE_SUFFIXES = (".py",)
-_CONFIG_FILE_NAMES = ("pivot.yaml", "pivot.yml", "pipeline.py", "params.yaml", "params.yml")
+_CONFIG_FILE_NAMES = (
+    "pivot.yaml",
+    "pivot.yml",
+    "pipeline.py",
+    "params.yaml",
+    "params.yml",
+    ".pivotignore",
+)
 
 
 def _clear_project_modules(root: pathlib.Path) -> int:
@@ -147,6 +151,7 @@ class WatchEngine:
     _cached_dag: nx.DiGraph[str] | None
     _cached_file_index: dict[pathlib.Path, set[str]] | None
     _pipeline_errors: list[str] | None
+    _ignore_filter: ignore.IgnoreFilter
 
     def __init__(
         self,
@@ -181,6 +186,7 @@ class WatchEngine:
         self._cached_dag = None
         self._cached_file_index = None
         self._pipeline_errors = None
+        self._ignore_filter = ignore.IgnoreFilter(project_root=project.get_project_root())
 
     def run(
         self,
@@ -253,7 +259,9 @@ class WatchEngine:
         """Pure producer - monitors files, enqueues changes."""
         try:
             watch_paths = _watch_utils.collect_watch_paths(stages_to_run)
-            watch_filter = _watch_utils.create_watch_filter(stages_to_run)
+            watch_filter = _watch_utils.create_watch_filter(
+                stages_to_run, ignore_filter=self._ignore_filter
+            )
             pending = set[pathlib.Path]()
 
             logger.info(f"Watching paths: {watch_paths}")
@@ -391,6 +399,7 @@ class WatchEngine:
         """Invalidate all caches atomically. Call when code/config changes."""
         linecache.clearcache()
         importlib.invalidate_caches()
+        self._ignore_filter.invalidate()
         # Atomic replacement - build new caches only when needed via lazy getters
         self._cached_dag = None
         self._cached_file_index = None

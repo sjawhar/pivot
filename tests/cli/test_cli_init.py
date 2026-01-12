@@ -3,7 +3,7 @@ import pathlib
 import click.testing
 import pytest
 
-from pivot import cli, project
+from pivot import cli, ignore, project
 
 # --- basic initialization tests ---
 
@@ -44,6 +44,98 @@ def test_init_gitignore_contains_expected_entries(
         assert result.exit_code == 0
         content = pathlib.Path(".pivot/.gitignore").read_text()
         assert expected_content in content
+
+
+# --- .pivotignore tests ---
+
+
+def test_init_creates_pivotignore(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
+    """init creates .pivotignore file in project root."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        result = runner.invoke(cli.cli, ["init"])
+
+        assert result.exit_code == 0
+        assert pathlib.Path(".pivotignore").is_file()
+
+
+@pytest.mark.parametrize(
+    "expected_pattern",
+    [
+        pytest.param("*.pyc", id="pyc_bytecode"),
+        pytest.param("__pycache__/", id="pycache_dir"),
+        pytest.param(".venv/", id="venv_dir"),
+        pytest.param(".git/", id="git_dir"),
+        pytest.param("node_modules/", id="node_modules"),
+    ],
+)
+def test_init_pivotignore_contains_expected_patterns(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, expected_pattern: str
+) -> None:
+    """init creates .pivotignore with standard patterns."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        result = runner.invoke(cli.cli, ["init"])
+
+        assert result.exit_code == 0
+        content = pathlib.Path(".pivotignore").read_text()
+        assert expected_pattern in content
+
+
+def test_init_pivotignore_uses_default_patterns(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """init creates .pivotignore containing all default patterns from ignore module."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        result = runner.invoke(cli.cli, ["init"])
+
+        assert result.exit_code == 0
+        content = pathlib.Path(".pivotignore").read_text()
+
+        # Verify each non-empty, non-comment pattern from defaults is in file
+        for pattern in ignore.get_default_patterns():
+            if pattern and not pattern.startswith("#"):
+                assert pattern in content, f"Missing default pattern: {pattern}"
+
+
+def test_init_does_not_overwrite_existing_pivotignore(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """init preserves existing .pivotignore file."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".pivotignore").write_text("# Custom patterns\n*.custom\n")
+
+        result = runner.invoke(cli.cli, ["init"])
+
+        assert result.exit_code == 0
+        content = pathlib.Path(".pivotignore").read_text()
+        assert "*.custom" in content
+        assert "*.pyc" not in content  # Not overwritten with defaults
+
+
+def test_init_force_does_not_overwrite_pivotignore(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """init --force still preserves existing .pivotignore."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".pivot").mkdir()
+        pathlib.Path(".pivotignore").write_text("# My patterns\n*.log\n")
+
+        result = runner.invoke(cli.cli, ["init", "--force"])
+
+        assert result.exit_code == 0
+        content = pathlib.Path(".pivotignore").read_text()
+        assert "*.log" in content
+        assert "*.pyc" not in content
+
+
+def test_init_output_mentions_pivotignore(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """init output lists .pivotignore as created file."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        result = runner.invoke(cli.cli, ["init"])
+
+        assert result.exit_code == 0
+        assert ".pivotignore" in result.output
 
 
 # --- already initialized tests ---

@@ -4,7 +4,7 @@ import pathlib
 
 import click
 
-from pivot import exceptions
+from pivot import exceptions, ignore
 from pivot.cli import decorators as cli_decorators
 
 _GITIGNORE_CONTENT = """\
@@ -45,11 +45,21 @@ def init(force: bool) -> None:
     pivot_dir.mkdir(exist_ok=True)
     (pivot_dir / ".gitignore").write_text(_GITIGNORE_CONTENT)
 
+    # Create .pivotignore with default patterns if it doesn't exist
+    pivotignore_path = pathlib.Path.cwd() / ".pivotignore"
+    created_pivotignore = False
+    if not pivotignore_path.exists():
+        pivotignore_content = "\n".join(ignore.get_default_patterns()) + "\n"
+        pivotignore_path.write_text(pivotignore_content)
+        created_pivotignore = True
+
     click.echo("Initialized Pivot project.")
     click.echo()
     click.echo("Created:")
     click.echo("  .pivot/")
     click.echo("  .pivot/.gitignore")
+    if created_pivotignore:
+        click.echo("  .pivotignore")
     click.echo()
     click.echo("Next steps:")
     click.echo("  1. Create pivot.yaml to define your pipeline stages")

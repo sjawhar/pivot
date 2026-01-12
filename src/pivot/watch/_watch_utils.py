@@ -12,6 +12,8 @@ if TYPE_CHECKING:
 
     from watchfiles import Change
 
+    from pivot.ignore import IgnoreFilter
+
 logger = logging.getLogger(__name__)
 
 
@@ -49,6 +51,7 @@ def get_output_paths_for_stages(stages: list[str]) -> set[str]:
 def create_watch_filter(
     stages_to_run: list[str],
     watch_globs: list[str] | None = None,
+    ignore_filter: IgnoreFilter | None = None,
 ) -> Callable[[Change, str], bool]:
     """Create filter excluding outputs from stages being run (prevents infinite loops)."""
     outputs_to_filter = set[pathlib.Path]()
@@ -60,9 +63,14 @@ def create_watch_filter(
     def watch_filter(change: Change, path: str) -> bool:
         _ = change
 
-        # Always filter Python bytecode
-        if path.endswith((".pyc", ".pyo")) or "__pycache__" in path:
-            return False
+        # Check .pivotignore patterns (includes bytecode patterns by default)
+        if ignore_filter is not None:
+            if ignore_filter.is_ignored(path):
+                return False
+        else:
+            # Fallback: filter bytecode when no ignore_filter provided
+            if path.endswith((".pyc", ".pyo")) or "__pycache__" in path:
+                return False
 
         # Resolve incoming path for consistent comparison
         resolved_path = project.try_resolve_path(path)
