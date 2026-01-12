@@ -21,6 +21,7 @@ import textual.containers
 import textual.css.query
 import textual.message
 import textual.screen
+import textual.timer
 import textual.widgets
 
 from pivot import project
@@ -28,6 +29,7 @@ from pivot.executor import ExecutionSummary
 from pivot.executor import commit as commit_mod
 from pivot.storage import lock, project_lock
 from pivot.tui.diff_panels import InputDiffPanel, OutputDiffPanel
+from pivot.tui.stats import DebugStats, QueueStats, QueueStatsTracker, get_memory_mb
 from pivot.types import (
     DisplayMode,
     StageStatus,
@@ -316,6 +318,60 @@ class TabbedDetailPanel(textual.containers.Vertical):
                 _logger.debug(f"{panel_id} not found during set_stage")
 
 
+def _format_queue_stats(q: QueueStats | None, label: str) -> str:
+    """Format queue statistics for display."""
+    if q is None:
+        return f"{label}: N/A"
+    size = str(q["approximate_size"]) if q["approximate_size"] is not None else "N/A"
+    return f"{label}: {size} (peak {q['high_water_mark']})"
+
+
+class DebugPanel(textual.widgets.Static):
+    """Debug panel showing queue statistics and system info."""
+
+    _stats: DebugStats | None
+
+    def __init__(self, *, id: str | None = None, classes: str | None = None) -> None:
+        super().__init__(id=id, classes=classes)
+        self._stats = None
+
+    def update_stats(self, stats: DebugStats) -> None:  # pragma: no cover
+        """Update displayed statistics."""
+        self._stats = stats
+        self._refresh_display()
+
+    def _refresh_display(self) -> None:  # pragma: no cover
+        if self._stats is None:
+            self.update("[dim]No stats available[/]")
+            return
+
+        tui_q = self._stats["tui_queue"]
+        tui_str = _format_queue_stats(tui_q, "TUI")
+        out_str = _format_queue_stats(self._stats["output_queue"], "Output")
+
+        # Format message count with K suffix for large numbers
+        total_msgs = tui_q["messages_received"]
+        msgs_str = f"{total_msgs / 1000:.1f}k" if total_msgs >= 1000 else str(total_msgs)
+
+        # Format memory
+        mem = self._stats["memory_mb"]
+        mem_str = f"{mem:.0f}MB" if mem is not None else "N/A"
+
+        # Format uptime
+        uptime = self._stats["uptime_seconds"]
+        mins, secs = divmod(int(uptime), 60)
+        uptime_str = f"{mins}:{secs:02d}"
+
+        lines = [
+            f"[cyan]Queues:[/]  {tui_str}  {out_str}",
+            (
+                f"[cyan]Stats:[/]   {msgs_str} msgs @ {tui_q['messages_per_second']:.1f}/s   "
+                f"Workers: {self._stats['active_workers']}   Mem: {mem_str}   Up: {uptime_str}"
+            ),
+        ]
+        self.update("\n".join(lines))
+
+
 _TUI_CSS: str = """
 #main-split {
     height: 1fr;
@@ -414,6 +470,20 @@ _TUI_CSS: str = """
     width: 100%;
     border-left: none;
 }
+
+/* Debug panel - toggleable footer showing queue stats */
+#debug-panel {
+    height: auto;
+    max-height: 4;
+    background: $surface;
+    border-top: solid $primary;
+    padding: 0 1;
+    display: none;
+}
+
+#debug-panel.visible {
+    display: block;
+}
 """
 
 _TUI_BINDINGS: list[textual.binding.BindingType] = [
@@ -441,6 +511,8 @@ _TUI_BINDINGS: list[textual.binding.BindingType] = [
     textual.binding.Binding("O", "goto_tab_output", "Output Tab", show=False),
     # All logs view toggle
     textual.binding.Binding("a", "show_all_logs", "All Logs"),
+    # Debug panel toggle
+    textual.binding.Binding("~", "toggle_debug", "Debug"),
     # Keep stage filtering with number keys (4-9 for stages, 1-3 could conflict with tabs)
     *[
         textual.binding.Binding(str(i), f"filter_stage({i - 1})", f"Stage {i}", show=False)
@@ -479,6 +551,16 @@ class _BaseTuiApp(textual.app.App[_AppReturnT]):
         self._reader_thread: threading.Thread | None = None
         self._shutdown_event: threading.Event = threading.Event()
         self._log_file: IO[str] | None = None
+
+        # Debug panel stats tracking
+        self._tui_stats: QueueStatsTracker = QueueStatsTracker(
+            "tui_queue",
+            message_queue,  # pyright: ignore[reportArgumentType] - Queue is invariant
+        )
+        self._output_stats: QueueStatsTracker | None = None  # Set in WatchTuiApp
+        self._start_time: float = 0.0  # Set in on_mount for accurate uptime
+        self._debug_timer: textual.timer.Timer | None = None
+        self._stats_log_timer: textual.timer.Timer | None = None
 
         # Open log file if configured (line-buffered for real-time tailing)
         if tui_log:
@@ -558,7 +640,14 @@ class _BaseTuiApp(textual.app.App[_AppReturnT]):
         with textual.containers.Vertical(id="logs-view", classes="view-hidden"):
             yield LogPanel(id="log-panel")
 
+        yield DebugPanel(id="debug-panel")
         yield textual.widgets.Footer()
+
+    async def on_mount(self) -> None:  # pragma: no cover
+        """Base on_mount - sets start time and starts stats log timer if configured."""
+        self._start_time = time.monotonic()
+        if self._log_file is not None:
+            self._stats_log_timer = self.set_interval(1.0, self._write_stats_to_log)
 
     def _start_queue_reader(self) -> None:  # pragma: no cover
         """Start the background queue reader thread."""
@@ -569,7 +658,8 @@ class _BaseTuiApp(textual.app.App[_AppReturnT]):
         """Read from queue and post messages to Textual (runs in background thread)."""
         while not self._shutdown_event.is_set():
             try:
-                msg = self._tui_queue.get(timeout=0.1)
+                msg = self._tui_queue.get(timeout=0.02)
+                self._tui_stats.record_message()  # Track stats for debug panel
                 if msg is None:
                     self._write_to_log('{"type": "shutdown"}\n')
                     break
@@ -759,8 +849,67 @@ class _BaseTuiApp(textual.app.App[_AppReturnT]):
         if self._focused_panel == "detail" and panel:
             panel.select_prev_changed()
 
+    def action_toggle_debug(self) -> None:  # pragma: no cover
+        """Toggle debug panel visibility."""
+        debug_panel = self.query_one("#debug-panel", DebugPanel)
+        if self._debug_timer is None:
+            # Show panel and start update timer
+            debug_panel.add_class("visible")
+            self._debug_timer = self.set_interval(0.5, self._update_debug_stats)
+        else:
+            # Hide panel and stop update timer
+            debug_panel.remove_class("visible")
+            self._debug_timer.stop()
+            self._debug_timer = None
+
+    def _update_debug_stats(self) -> None:  # pragma: no cover
+        """Update debug panel with current stats."""
+        try:
+            stats = self._collect_debug_stats()
+            debug_panel = self.query_one("#debug-panel", DebugPanel)
+            debug_panel.update_stats(stats)
+        except Exception:
+            _logger.debug("Failed to update debug stats", exc_info=True)
+
+    def _collect_debug_stats(self) -> DebugStats:  # pragma: no cover
+        """Collect current debug statistics."""
+        active_workers = sum(
+            1 for s in self._stages.values() if s.status == StageStatus.IN_PROGRESS
+        )
+
+        return DebugStats(
+            tui_queue=self._tui_stats.get_stats(),
+            output_queue=self._output_stats.get_stats() if self._output_stats else None,
+            active_workers=active_workers,
+            memory_mb=get_memory_mb(),
+            uptime_seconds=time.monotonic() - self._start_time,
+        )
+
+    def _write_stats_to_log(self) -> None:  # pragma: no cover
+        """Write periodic stats snapshot to log file."""
+        if self._log_file is None:
+            return
+        try:
+            stats = self._collect_debug_stats()
+            log_entry = {
+                "type": "stats_snapshot",
+                "timestamp": time.time(),
+                **stats,
+            }
+            self._write_to_log(json.dumps(log_entry, default=str) + "\n")
+        except Exception:
+            _logger.debug("Failed to write stats to log", exc_info=True)
+
     @override
     async def action_quit(self) -> None:  # pragma: no cover
+        # Stop debug timers before shutdown
+        if self._debug_timer is not None:
+            self._debug_timer.stop()
+            self._debug_timer = None
+        if self._stats_log_timer is not None:
+            self._stats_log_timer.stop()
+            self._stats_log_timer = None
+
         self._shutdown_event.set()
         # Wait for reader thread to finish before closing log file (avoids race)
         if self._reader_thread:
@@ -794,7 +943,9 @@ class RunTuiApp(_BaseTuiApp[dict[str, ExecutionSummary] | None]):
         """Return any exception that occurred during execution."""
         return self._error
 
+    @override
     async def on_mount(self) -> None:  # pragma: no cover
+        await super().on_mount()  # Start stats log timer if configured
         self._update_detail_panel()
         self._start_queue_reader()
         self._executor_thread = threading.Thread(target=self._run_executor, daemon=True)
@@ -955,7 +1106,9 @@ class WatchTuiApp(_BaseTuiApp[None]):
         """Check if any stages are currently in progress."""
         return any(s.status == StageStatus.IN_PROGRESS for s in self._stages.values())
 
+    @override
     async def on_mount(self) -> None:  # pragma: no cover
+        await super().on_mount()
         self.title = "[●] Watching for changes..."
         self._start_queue_reader()
         self._engine_thread = threading.Thread(target=self._run_engine, daemon=True)

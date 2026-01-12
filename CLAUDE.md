@@ -81,10 +81,14 @@ Use for data needing validation with clear errors (config files, user input, API
 
 Import modules, not functions: `from pivot import fingerprint` then `fingerprint.func()`.
 
+**No lazy imports**—all imports at module level. This ensures fingerprinting captures dependencies and makes imports explicit.
+
 **Exceptions:**
 - `TYPE_CHECKING` blocks: Import types directly (`from pathlib import Path`)
 - `pivot.types`: Import directly (`from pivot.types import StageStatus`)
 - `typing` module: Always direct (`from typing import Any`)
+- Optional/platform-specific modules: Lazy import with try/except when module may not exist (e.g., `resource` on Windows)
+- CLI modules: Lazy imports acceptable in `pivot.cli` to reduce startup time
 
 ## Docstrings
 

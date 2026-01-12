@@ -241,6 +241,22 @@ The global `conftest.py` has **autouse fixtures** that automatically reset state
 
 **Use `mocker` or `monkeypatch` fixtures for overriding state—never manual assignment.**
 
+**ALWAYS use `autospec=True`** with `mocker.patch()` and `mocker.patch.object()` when mocking functions or methods. This ensures mocks have the same signature as the original, catching typos and incorrect arguments at test time.
+
+**Exception:** Don't use `autospec=True` when patching to a literal value (None, {}, etc.). autospec creates a mock with the original's signature, but literals aren't mocks.
+
+```python
+# Good - autospec for functions/methods
+mocker.patch("module.func", autospec=True, return_value=42)
+mocker.patch.object(obj, "method", autospec=True)
+
+# Good - no autospec when patching to a literal value
+mocker.patch.object(module, "_cache", None)  # Replacing with None, not a mock
+
+# Bad - autospec with literal value (will fail)
+mocker.patch.object(module, "_cache", None, autospec=True)  # Wrong!
+```
+
 ```python
 # Good - mocker automatically restores after test
 @pytest.fixture(autouse=True)

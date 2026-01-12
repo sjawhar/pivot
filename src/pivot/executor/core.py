@@ -586,7 +586,7 @@ def _output_queue_reader(
     """Read output messages from worker processes and display/forward them."""
     while True:
         try:
-            msg = output_q.get(timeout=0.1)
+            msg = output_q.get(timeout=0.02)
             if msg is None:
                 break
             stage_name, line, is_stderr = msg
