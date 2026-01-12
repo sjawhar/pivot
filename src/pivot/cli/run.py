@@ -1,18 +1,29 @@
 from __future__ import annotations
 
 import contextlib
+import datetime
 import json
 import logging
 import pathlib
 import sys
-from typing import TYPE_CHECKING, Literal, TypedDict
+import time
+from typing import TYPE_CHECKING, TypedDict
 
 import click
 
 from pivot import discovery, exceptions, executor, registry
 from pivot.cli import completion
 from pivot.cli import decorators as cli_decorators
-from pivot.types import DisplayMode, OutputMessage, StageExplanation, StageStatus
+from pivot.cli import helpers as cli_helpers
+from pivot.types import (
+    DisplayMode,
+    ExecutionResultEvent,
+    OutputMessage,
+    RunEventType,
+    SchemaVersionEvent,
+    StageExplanation,
+    StageStatus,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -46,17 +57,8 @@ def _suppress_stderr_logging() -> Generator[None]:
             root.addHandler(handler)
 
 
-class RunJsonStageOutput(TypedDict):
-    """JSON output for a single stage result."""
-
-    status: Literal[StageStatus.RAN, StageStatus.SKIPPED, StageStatus.FAILED, StageStatus.UNKNOWN]
-    reason: str
-
-
-class RunJsonOutput(TypedDict):
-    """JSON output for pivot run --json."""
-
-    stages: dict[str, RunJsonStageOutput]
+# JSONL schema version for forward compatibility
+_JSONL_SCHEMA_VERSION = 1
 
 
 logger = logging.getLogger(__name__)
@@ -249,22 +251,8 @@ def _run_watch_with_tui(
         manager.shutdown()
 
 
-def _results_to_json(results: dict[str, ExecutionSummary]) -> RunJsonOutput:
-    """Convert execution results to JSON-serializable format."""
-    return RunJsonOutput(
-        stages={
-            name: RunJsonStageOutput(status=result["status"], reason=result["reason"])
-            for name, result in results.items()
-        }
-    )
-
-
-def _print_results(results: dict[str, ExecutionSummary], as_json: bool = False) -> None:
+def _print_results(results: dict[str, ExecutionSummary]) -> None:
     """Print execution results in a readable format."""
-    if as_json:
-        click.echo(json.dumps(_results_to_json(results), indent=2))
-        return
-
     ran = 0
     skipped = 0
     failed = 0
@@ -369,7 +357,7 @@ def run(
 
     Auto-discovers pivot.yaml or pipeline.py if no stages are registered.
     """
-    stages_list = list(stages) if stages else None
+    stages_list = cli_helpers.stages_to_list(stages)
     _validate_stages(stages_list, single_stage)
 
     # Validate tui_log requires TUI mode
@@ -473,6 +461,41 @@ def run(
             no_commit=no_commit,
             no_cache=no_cache,
         )
+    elif as_json:
+        # JSONL streaming mode
+        cli_helpers.emit_jsonl(
+            SchemaVersionEvent(type=RunEventType.SCHEMA_VERSION, version=_JSONL_SCHEMA_VERSION)
+        )
+
+        start_time = time.perf_counter()
+        results = executor.run(
+            stages=stages_list,
+            single_stage=single_stage,
+            cache_dir=cache_dir,
+            explain_mode=False,
+            force=force,
+            no_commit=no_commit,
+            no_cache=no_cache,
+            show_output=False,
+            progress_callback=cli_helpers.emit_jsonl,
+        )
+        total_duration_ms = (time.perf_counter() - start_time) * 1000
+
+        # Emit final execution result
+        ran = sum(1 for r in results.values() if r["status"] == StageStatus.RAN)
+        skipped = sum(1 for r in results.values() if r["status"] == StageStatus.SKIPPED)
+        failed = sum(1 for r in results.values() if r["status"] == StageStatus.FAILED)
+
+        cli_helpers.emit_jsonl(
+            ExecutionResultEvent(
+                type=RunEventType.EXECUTION_RESULT,
+                ran=ran,
+                skipped=skipped,
+                failed=failed,
+                total_duration_ms=total_duration_ms,
+                timestamp=datetime.datetime.now(datetime.UTC).isoformat(),
+            )
+        )
     else:
         results = executor.run(
             stages=stages_list,
@@ -484,13 +507,10 @@ def run(
             no_cache=no_cache,
         )
 
-    if not results:
-        if as_json:
-            click.echo(json.dumps(RunJsonOutput(stages={})))
-        else:
-            click.echo("No stages to run")
-    elif not explain and not use_tui:
-        _print_results(results, as_json=as_json)
+    if not results and not as_json:
+        click.echo("No stages to run")
+    elif not explain and not use_tui and not as_json and results:
+        _print_results(results)
 
 
 class DryRunJsonStageOutput(TypedDict):
@@ -530,7 +550,7 @@ def dry_run_cmd(
     as_json: bool,
 ) -> None:
     """Show what would run without executing."""
-    stages_list = list(stages) if stages else None
+    stages_list = cli_helpers.stages_to_list(stages)
     _validate_stages(stages_list, single_stage)
 
     explanations = _get_all_explanations(stages_list, single_stage, cache_dir, force=force)
@@ -582,7 +602,7 @@ def explain_cmd(
     """Show detailed breakdown of why stages would run."""
     from pivot.tui import console
 
-    stages_list = list(stages) if stages else None
+    stages_list = cli_helpers.stages_to_list(stages)
     _validate_stages(stages_list, single_stage)
 
     explanations = _get_all_explanations(stages_list, single_stage, cache_dir, force=force)

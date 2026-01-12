@@ -29,7 +29,9 @@ from pivot.types import (
 @click.option("--remote-only", is_flag=True, help="Show only remote status")
 @click.option("--remote", "-r", is_flag=True, help="Include remote sync status")
 @click.option("--cache-dir", type=click.Path(path_type=pathlib.Path), help="Cache directory")
+@click.pass_context
 def status(
+    ctx: click.Context,
     stages: tuple[str, ...],
     verbose: bool,
     output_json: bool,
@@ -40,7 +42,10 @@ def status(
     cache_dir: pathlib.Path | None,
 ) -> None:
     """Show pipeline, tracked files, and remote status."""
-    stages_list = list(stages) if stages else None
+    cli_ctx = cli_helpers.get_cli_context(ctx)
+    quiet = cli_ctx["quiet"]
+
+    stages_list = cli_helpers.stages_to_list(stages)
     cli_helpers.validate_stages_exist(stages_list)
 
     project_root = project.get_project_root()
@@ -81,6 +86,12 @@ def status(
     push_count = remote_status["push_count"] if remote_status else 0
     pull_count = remote_status["pull_count"] if remote_status else 0
     suggestions = status_mod.get_suggestions(stale_count, modified_count, push_count, pull_count)
+
+    # Quiet mode: no output, exit 1 if there are issues needing attention
+    if quiet and not output_json:
+        if stale_count > 0 or modified_count > 0:
+            raise SystemExit(1)
+        return
 
     if output_json:
         _output_json(

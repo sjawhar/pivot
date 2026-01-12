@@ -550,3 +550,70 @@ class WatchExecutionResultEvent(TypedDict):
 WatchJsonEvent = (
     WatchStatusEvent | WatchFilesChangedEvent | WatchAffectedStagesEvent | WatchExecutionResultEvent
 )
+
+
+# =============================================================================
+# Run Mode JSONL Events (--json output)
+# =============================================================================
+#
+# Structured events emitted by `pivot run --json` for programmatic consumption.
+# Each line is a complete JSON object (JSONL format) with flush=True.
+#
+# Event sequence during run:
+#   1. SchemaVersionEvent      Schema version for forward compatibility
+#   2. StageStartEvent         Before each stage executes
+#   3. StageCompleteEvent      After each stage finishes
+#   ... (repeat 2-3 for each stage)
+#   4. ExecutionResultEvent    Final summary
+#
+
+
+class RunEventType(enum.StrEnum):
+    """Type of run mode JSONL event."""
+
+    SCHEMA_VERSION = "schema_version"
+    STAGE_START = "stage_start"
+    STAGE_COMPLETE = "stage_complete"
+    EXECUTION_RESULT = "execution_result"
+
+
+class SchemaVersionEvent(TypedDict):
+    """Schema version event for forward compatibility."""
+
+    type: Literal[RunEventType.SCHEMA_VERSION]
+    version: int
+
+
+class StageStartEvent(TypedDict):
+    """Event emitted before a stage begins execution."""
+
+    type: Literal[RunEventType.STAGE_START]
+    stage: str
+    index: int
+    total: int
+    timestamp: str  # ISO 8601 UTC
+
+
+class StageCompleteEvent(TypedDict):
+    """Event emitted after a stage finishes execution."""
+
+    type: Literal[RunEventType.STAGE_COMPLETE]
+    stage: str
+    status: Literal[StageStatus.RAN, StageStatus.SKIPPED, StageStatus.FAILED]
+    reason: str
+    duration_ms: float
+    timestamp: str  # ISO 8601 UTC
+
+
+class ExecutionResultEvent(TypedDict):
+    """Final summary event after pipeline completes."""
+
+    type: Literal[RunEventType.EXECUTION_RESULT]
+    ran: int
+    skipped: int
+    failed: int
+    total_duration_ms: float
+    timestamp: str  # ISO 8601 UTC
+
+
+RunJsonEvent = SchemaVersionEvent | StageStartEvent | StageCompleteEvent | ExecutionResultEvent

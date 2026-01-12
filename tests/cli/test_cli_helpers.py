@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import json
+
 import click
 import click.testing
 import pytest
 
 from pivot import exceptions, registry
+from pivot.cli import CliContext
 from pivot.cli import helpers as cli_helpers
 
 # =============================================================================
@@ -185,3 +188,134 @@ def test_print_transfer_errors_outputs_to_stderr(
     result = runner.invoke(test_cmd, catch_exceptions=False)
 
     assert result.exit_code == 0
+
+
+# =============================================================================
+# emit_jsonl Tests
+# =============================================================================
+
+
+def test_emit_jsonl_serializes_dict(
+    runner: click.testing.CliRunner, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """emit_jsonl serializes dict as JSON line."""
+
+    @click.command()
+    def test_cmd() -> None:
+        cli_helpers.emit_jsonl({"type": "test", "value": 42})
+
+    result = runner.invoke(test_cmd)
+
+    assert result.exit_code == 0
+    output = result.output.strip()
+    parsed = json.loads(output)
+    assert parsed == {"type": "test", "value": 42}
+
+
+def test_emit_jsonl_flushes_output(runner: click.testing.CliRunner) -> None:
+    """emit_jsonl flushes output for streaming."""
+
+    @click.command()
+    def test_cmd() -> None:
+        cli_helpers.emit_jsonl({"event": "start"})
+        cli_helpers.emit_jsonl({"event": "end"})
+
+    result = runner.invoke(test_cmd)
+
+    lines = result.output.strip().split("\n")
+    assert len(lines) == 2
+    assert json.loads(lines[0]) == {"event": "start"}
+    assert json.loads(lines[1]) == {"event": "end"}
+
+
+def test_emit_jsonl_handles_nested_structures(runner: click.testing.CliRunner) -> None:
+    """emit_jsonl handles nested dicts and lists."""
+
+    @click.command()
+    def test_cmd() -> None:
+        cli_helpers.emit_jsonl({"items": [1, 2, 3], "nested": {"a": "b"}})
+
+    result = runner.invoke(test_cmd)
+
+    parsed = json.loads(result.output.strip())
+    assert parsed == {"items": [1, 2, 3], "nested": {"a": "b"}}
+
+
+# =============================================================================
+# get_cli_context Tests
+# =============================================================================
+
+
+def test_get_cli_context_returns_existing_context(runner: click.testing.CliRunner) -> None:
+    """get_cli_context returns existing context when set."""
+    ctx_obj = CliContext(verbose=True, quiet=False)
+
+    @click.command()
+    @click.pass_context
+    def test_cmd(ctx: click.Context) -> None:
+        ctx.obj = ctx_obj
+        result = cli_helpers.get_cli_context(ctx)
+        assert result["verbose"] is True
+        assert result["quiet"] is False
+
+    result = runner.invoke(test_cmd)
+    assert result.exit_code == 0
+
+
+def test_get_cli_context_returns_defaults_when_none(runner: click.testing.CliRunner) -> None:
+    """get_cli_context returns defaults when ctx.obj is None."""
+
+    @click.command()
+    @click.pass_context
+    def test_cmd(ctx: click.Context) -> None:
+        ctx.obj = None
+        result = cli_helpers.get_cli_context(ctx)
+        assert result["verbose"] is False
+        assert result["quiet"] is False
+
+    result = runner.invoke(test_cmd)
+    assert result.exit_code == 0
+
+
+def test_get_cli_context_returns_defaults_when_not_set(runner: click.testing.CliRunner) -> None:
+    """get_cli_context returns defaults when ctx.obj was never set."""
+
+    @click.command()
+    @click.pass_context
+    def test_cmd(ctx: click.Context) -> None:
+        # Don't set ctx.obj at all
+        result = cli_helpers.get_cli_context(ctx)
+        assert result["verbose"] is False
+        assert result["quiet"] is False
+
+    result = runner.invoke(test_cmd)
+    assert result.exit_code == 0
+
+
+# =============================================================================
+# stages_to_list Tests
+# =============================================================================
+
+
+def test_stages_to_list_converts_tuple_to_list() -> None:
+    """stages_to_list converts non-empty tuple to list."""
+    result = cli_helpers.stages_to_list(("stage1", "stage2", "stage3"))
+    assert result == ["stage1", "stage2", "stage3"]
+
+
+def test_stages_to_list_returns_none_for_empty_tuple() -> None:
+    """stages_to_list returns None for empty tuple."""
+    result = cli_helpers.stages_to_list(())
+    assert result is None
+
+
+def test_stages_to_list_preserves_order() -> None:
+    """stages_to_list preserves stage order."""
+    result = cli_helpers.stages_to_list(("c", "a", "b"))
+    assert result == ["c", "a", "b"]
+
+
+def test_stages_to_list_single_stage() -> None:
+    """stages_to_list handles single-element tuple."""
+    result = cli_helpers.stages_to_list(("only_stage",))
+    assert result == ["only_stage"]
