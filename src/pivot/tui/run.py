@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import atexit
 import collections
+import contextlib
 import dataclasses
 import json
 import logging
@@ -13,6 +14,7 @@ import time
 from typing import IO, TYPE_CHECKING, ClassVar, Literal, TypeVar, final, override
 
 import filelock
+import rich.markup
 import textual.app
 import textual.binding
 import textual.containers
@@ -131,8 +133,9 @@ class StageRow(textual.widgets.Static):
         elapsed_str = _format_elapsed(self._info.elapsed)
         if elapsed_str:
             elapsed_str = f" {elapsed_str}"
-        reason_str = f"  ({self._info.reason})" if self._info.reason else ""
-        text = f"{index_str} {self._info.name:<20} [{style}]{label}[/]{elapsed_str}{reason_str}"
+        reason_str = f"  ({rich.markup.escape(self._info.reason)})" if self._info.reason else ""
+        name_escaped = rich.markup.escape(self._info.name)
+        text = f"{index_str} {name_escaped:<20} [{style}]{label}[/]{elapsed_str}{reason_str}"
         self.update(text)
 
     def on_mount(self) -> None:  # pragma: no cover
@@ -199,11 +202,11 @@ class DetailPanel(textual.widgets.Static):
             elapsed_str = f" {elapsed_str} elapsed"
 
         lines = [
-            f"[bold]Stage:[/] {self._stage.name}",
+            f"[bold]Stage:[/] {rich.markup.escape(self._stage.name)}",
             f"[bold]Status:[/] [{style}]{label}[/]{elapsed_str}",
         ]
         if self._stage.reason:
-            lines.append(f"[bold]Reason:[/] {self._stage.reason}")
+            lines.append(f"[bold]Reason:[/] {rich.markup.escape(self._stage.reason)}")
 
         self.update("\n".join(lines))
 
@@ -225,11 +228,12 @@ class LogPanel(textual.widgets.RichLog):
             self._write_log_line(stage, line, is_stderr)
 
     def _write_log_line(self, stage: str, line: str, is_stderr: bool) -> None:  # pragma: no cover
-        prefix = f"[cyan][{stage}][/] "
+        prefix = f"[cyan]\\[{rich.markup.escape(stage)}][/] "
+        escaped_line = rich.markup.escape(line)
         if is_stderr:
-            self.write(f"{prefix}[red]{line}[/]")
+            self.write(f"{prefix}[red]{escaped_line}[/]")
         else:
-            self.write(f"{prefix}{line}")
+            self.write(f"{prefix}{escaped_line}")
 
     def set_filter(self, stage: str | None) -> None:  # pragma: no cover
         """Filter logs to a specific stage or show all (None)."""
@@ -255,7 +259,7 @@ class StageLogPanel(textual.widgets.RichLog):
             for line, is_stderr, timestamp in stage.logs:
                 self._write_line(line, is_stderr, timestamp)
         else:
-            self.write(f"[dim]No logs yet for {stage.name}[/]")
+            self.write(f"[dim]No logs yet for {rich.markup.escape(stage.name)}[/]")
 
     def add_log(self, line: str, is_stderr: bool, timestamp: float) -> None:  # pragma: no cover
         """Add a new log line."""
@@ -263,10 +267,11 @@ class StageLogPanel(textual.widgets.RichLog):
 
     def _write_line(self, line: str, is_stderr: bool, timestamp: float) -> None:  # pragma: no cover
         time_str = time.strftime("[%H:%M:%S]", time.localtime(timestamp))
+        escaped_line = rich.markup.escape(line)
         if is_stderr:
-            self.write(f"[dim]{time_str}[/] [red]{line}[/]")
+            self.write(f"[dim]{time_str}[/] [red]{escaped_line}[/]")
         else:
-            self.write(f"[dim]{time_str}[/] {line}")
+            self.write(f"[dim]{time_str}[/] {escaped_line}")
 
 
 class TabbedDetailPanel(textual.containers.Vertical):
@@ -292,21 +297,23 @@ class TabbedDetailPanel(textual.containers.Vertical):
         """Update the displayed stage."""
         self._stage = stage
         stage_name = stage.name if stage else None
+
+        # Update log panel (takes StageInfo)
         try:
-            log_panel = self.query_one("#stage-logs", StageLogPanel)
-            log_panel.set_stage(stage)
+            self.query_one("#stage-logs", StageLogPanel).set_stage(stage)
         except textual.css.query.NoMatches:
-            _logger.debug("stage-logs panel not found during set_stage")
-        try:
-            input_panel = self.query_one("#input-panel", InputDiffPanel)
-            input_panel.set_stage(stage_name)
-        except textual.css.query.NoMatches:
-            _logger.debug("input-panel not found during set_stage")
-        try:
-            output_panel = self.query_one("#output-panel", OutputDiffPanel)
-            output_panel.set_stage(stage_name)
-        except textual.css.query.NoMatches:
-            _logger.debug("output-panel not found during set_stage")
+            _logger.debug("stage-logs not found during set_stage")
+
+        # Update diff panels (share same interface - take stage name string)
+        diff_panels: list[tuple[str, type[InputDiffPanel] | type[OutputDiffPanel]]] = [
+            ("#input-panel", InputDiffPanel),
+            ("#output-panel", OutputDiffPanel),
+        ]
+        for panel_id, panel_cls in diff_panels:
+            try:
+                self.query_one(panel_id, panel_cls).set_stage(stage_name)
+            except textual.css.query.NoMatches:
+                _logger.debug(f"{panel_id} not found during set_stage")
 
 
 _TUI_CSS: str = """
@@ -379,12 +386,41 @@ _TUI_CSS: str = """
 .view-hidden {
     display: none;
 }
+
+/* Split-view layout for diff panels */
+.diff-panel {
+    height: 100%;
+}
+
+.diff-panel #item-list {
+    width: 50%;
+    height: 100%;
+    overflow-y: auto;
+}
+
+.diff-panel #detail-pane {
+    width: 50%;
+    height: 100%;
+    border-left: solid $surface-lighten-1;
+    padding-left: 1;
+    overflow-y: auto;
+}
+
+.diff-panel.expanded #item-list {
+    display: none;
+}
+
+.diff-panel.expanded #detail-pane {
+    width: 100%;
+    border-left: none;
+}
 """
 
 _TUI_BINDINGS: list[textual.binding.BindingType] = [
     textual.binding.Binding("q", "quit", "Quit"),
     textual.binding.Binding("c", "commit", "Commit"),
-    textual.binding.Binding("escape", "cancel_commit", "Cancel", show=False),
+    textual.binding.Binding("escape", "escape_action", "Cancel/Collapse", show=False),
+    textual.binding.Binding("enter", "expand_details", "Expand", show=False),
     # Panel focus switching
     textual.binding.Binding("tab", "switch_focus", "Switch Panel"),
     # Navigation (context-aware: stages panel vs detail panel)
@@ -434,6 +470,7 @@ class _BaseTuiApp(textual.app.App[_AppReturnT]):
         self._stages: dict[str, StageInfo] = {}
         self._stage_order: list[str] = []
         self._selected_idx: int = 0
+        self._selected_stage_name: str | None = None
         self._show_logs: bool = False
         self._focused_panel: Literal["stages", "detail"] = "stages"
         self._reader_thread: threading.Thread | None = None
@@ -452,6 +489,8 @@ class _BaseTuiApp(textual.app.App[_AppReturnT]):
                 info = StageInfo(name, i, len(stage_names))
                 self._stages[name] = info
                 self._stage_order.append(name)
+            # Select first stage by default
+            self._selected_stage_name = stage_names[0]
 
     @property
     def selected_stage_name(self) -> str | None:
@@ -479,6 +518,21 @@ class _BaseTuiApp(textual.app.App[_AppReturnT]):
         if log_file:
             atexit.unregister(self._close_log_file)
             log_file.close()
+
+    def _select_stage(self, idx: int) -> None:
+        """Update selection by index, keeping both index and name in sync."""
+        if 0 <= idx < len(self._stage_order):
+            self._selected_idx = idx
+            self._selected_stage_name = self._stage_order[idx]
+
+    def _recompute_selection_idx(self) -> None:
+        """Recompute index from name after stage list changes. O(n) but infrequent."""
+        if self._selected_stage_name and self._selected_stage_name in self._stage_order:
+            self._selected_idx = self._stage_order.index(self._selected_stage_name)
+        else:
+            # Stage was removed, select first available
+            self._selected_idx = 0
+            self._selected_stage_name = self._stage_order[0] if self._stage_order else None
 
     def _write_to_log(self, data: str) -> None:  # pragma: no cover
         """Write a line to the log file, logging warning on first failure."""
@@ -540,11 +594,7 @@ class _BaseTuiApp(textual.app.App[_AppReturnT]):
         log_panel.add_log(stage, line, is_stderr)
 
         # Update stage-specific log panel if this stage is selected
-        if (
-            self._stage_order
-            and self._selected_idx < len(self._stage_order)
-            and self._stage_order[self._selected_idx] == stage
-        ):
+        if self._selected_stage_name == stage:
             try:
                 stage_log_panel = self.query_one("#stage-logs", StageLogPanel)
                 stage_log_panel.add_log(line, is_stderr, timestamp)
@@ -552,11 +602,7 @@ class _BaseTuiApp(textual.app.App[_AppReturnT]):
                 _logger.debug("stage-logs panel not found during log update")
 
     def _update_detail_panel(self) -> None:  # pragma: no cover
-        if self._stage_order and self._selected_idx < len(self._stage_order):
-            selected_name = self._stage_order[self._selected_idx]
-            stage = self._stages.get(selected_name)
-        else:
-            stage = None
+        stage = self._stages.get(self._selected_stage_name) if self._selected_stage_name else None
         detail = self.query_one("#detail-panel", TabbedDetailPanel)
         detail.set_stage(stage)
 
@@ -573,15 +619,33 @@ class _BaseTuiApp(textual.app.App[_AppReturnT]):
         self._focused_panel = "detail" if self._focused_panel == "stages" else "stages"
         self._update_focus_visual()
 
+    def _get_active_diff_panel(self) -> InputDiffPanel | OutputDiffPanel | None:  # pragma: no cover
+        """Get the diff panel for the active tab, if any."""
+        try:
+            tabs = self.query_one("#detail-tabs", textual.widgets.TabbedContent)
+            match tabs.active:
+                case "tab-input":
+                    return self.query_one("#input-panel", InputDiffPanel)
+                case "tab-output":
+                    return self.query_one("#output-panel", OutputDiffPanel)
+                case _:
+                    return None  # Logs tab has no selectable items
+        except textual.css.query.NoMatches:
+            return None
+
     def action_nav_down(self) -> None:  # pragma: no cover
-        """Navigate down - stage list when stages focused."""
+        """Navigate down - stage list or item list depending on focus."""
         if self._focused_panel == "stages":
             self.action_next_stage()
+        elif self._focused_panel == "detail" and (panel := self._get_active_diff_panel()):
+            panel.select_next()
 
     def action_nav_up(self) -> None:  # pragma: no cover
-        """Navigate up - stage list when stages focused."""
+        """Navigate up - stage list or item list depending on focus."""
         if self._focused_panel == "stages":
             self.action_prev_stage()
+        elif self._focused_panel == "detail" and (panel := self._get_active_diff_panel()):
+            panel.select_prev()
 
     def action_nav_left(self) -> None:  # pragma: no cover
         """Navigate left - previous tab or switch to stages panel."""
@@ -634,12 +698,12 @@ class _BaseTuiApp(textual.app.App[_AppReturnT]):
 
     def action_next_stage(self) -> None:  # pragma: no cover
         if self._selected_idx < len(self._stage_order) - 1:
-            self._selected_idx += 1
+            self._select_stage(self._selected_idx + 1)
             self._update_detail_panel()
 
     def action_prev_stage(self) -> None:  # pragma: no cover
         if self._selected_idx > 0:
-            self._selected_idx -= 1
+            self._select_stage(self._selected_idx - 1)
             self._update_detail_panel()
 
     def action_toggle_view(self) -> None:  # pragma: no cover
@@ -666,9 +730,19 @@ class _BaseTuiApp(textual.app.App[_AppReturnT]):
             if not self._show_logs:
                 self.action_toggle_view()
 
-    def action_cancel_commit(self) -> None:  # pragma: no cover
-        """Cancel commit operation. Override in subclasses that support commit."""
-        pass
+    def action_escape_action(self) -> None:  # pragma: no cover
+        """Context-aware Esc: cancel commit or collapse detail expansion."""
+        # Subclasses override for commit cancellation
+        # Default behavior: collapse detail panel if expanded
+        panel = self._get_active_diff_panel()
+        if self._focused_panel == "detail" and panel and panel.is_detail_expanded:
+            panel.collapse_details()
+
+    def action_expand_details(self) -> None:  # pragma: no cover
+        """Expand details pane to full width."""
+        panel = self._get_active_diff_panel()
+        if self._focused_panel == "detail" and panel:
+            panel.expand_details()
 
     @override
     async def action_quit(self) -> None:  # pragma: no cover
@@ -676,6 +750,10 @@ class _BaseTuiApp(textual.app.App[_AppReturnT]):
         # Wait for reader thread to finish before closing log file (avoids race)
         if self._reader_thread:
             self._reader_thread.join(timeout=2.0)
+            if self._reader_thread.is_alive():
+                _logger.debug("Reader thread did not finish within 2s timeout")
+            else:
+                _logger.debug("Reader thread finished cleanly")
         self._close_log_file()
         await super().action_quit()
 
@@ -874,6 +952,14 @@ class WatchTuiApp(_BaseTuiApp[None]):
             self._engine.run(tui_queue=self._tui_queue, output_queue=self._output_queue)
         except Exception as e:
             logging.getLogger(__name__).exception(f"Watch engine failed: {e}")
+            # Notify TUI about engine failure so user knows watch mode is dead
+            error_msg = TuiWatchMessage(
+                type=TuiMessageType.WATCH,
+                status=WatchStatus.ERROR,
+                message="Watch mode crashed. Please restart 'pivot watch'.",
+            )
+            with contextlib.suppress(Exception):
+                self._tui_queue.put_nowait(error_msg)
 
     def on_tui_update(self, event: TuiUpdate) -> None:  # pragma: no cover
         """Handle executor updates in Textual's event loop."""
@@ -918,9 +1004,9 @@ class WatchTuiApp(_BaseTuiApp[None]):
             case WatchStatus.RESTARTING:
                 self.title = "[↻] Reloading code..."
             case WatchStatus.DETECTING:
-                self.title = f"[▶] {msg['message']}"
+                self.title = f"[▶] {rich.markup.escape(msg['message'])}"
             case WatchStatus.ERROR:
-                self.title = f"[!] {msg['message']}"
+                self.title = f"[!] {rich.markup.escape(msg['message'])}"
 
     def _handle_reload(self, msg: TuiReloadMessage) -> None:  # pragma: no cover
         """Handle registry reload - update stage list."""
@@ -945,8 +1031,8 @@ class WatchTuiApp(_BaseTuiApp[None]):
                 self._stages[name].index = i
                 self._stages[name].total = len(self._stage_order)
 
-        if self._selected_idx >= len(self._stage_order):
-            self._selected_idx = max(0, len(self._stage_order) - 1)
+        # Recompute selection index from name (handles removed stages)
+        self._recompute_selection_idx()
 
         self._rebuild_stage_list()
         self._update_detail_panel()
@@ -1014,10 +1100,13 @@ class WatchTuiApp(_BaseTuiApp[None]):
                 acquired.release()
 
     @override
-    def action_cancel_commit(self) -> None:  # pragma: no cover
-        """Cancel waiting for commit lock."""
+    def action_escape_action(self) -> None:  # pragma: no cover
+        """Cancel commit if in progress, otherwise collapse detail expansion."""
         if self._commit_in_progress:
             self._cancel_commit = True
+            return
+        # Fall back to base behavior (collapse detail)
+        super().action_escape_action()
 
     @override
     async def action_quit(self) -> None:  # pragma: no cover
