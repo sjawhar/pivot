@@ -137,6 +137,8 @@ class StageNotFoundError(DAGError):
             ]
             if suggestions:
                 msg += f"\n  Did you mean: {', '.join(suggestions)}?"
+                if len(self._unknown) > 3:
+                    msg += f"\n  (showing first 3 of {len(self._unknown)} unknown stages)"
         return msg
 
     @override
