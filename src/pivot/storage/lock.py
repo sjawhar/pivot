@@ -140,12 +140,7 @@ class StageLock:
     path: Path
 
     def __init__(self, stage_name: str, stages_dir: Path) -> None:
-        """Initialize a stage lock.
-
-        Args:
-            stage_name: Name of the stage
-            stages_dir: Directory containing lock files (e.g., .pivot/stages/)
-        """
+        """Initialize a stage lock for the given stage in stages_dir."""
         if not stage_name or not _VALID_STAGE_NAME.match(stage_name):
             raise ValueError(f"Invalid stage name: {stage_name!r}")
         if len(stage_name) > _MAX_STAGE_NAME_LEN:
