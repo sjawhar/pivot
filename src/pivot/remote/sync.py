@@ -48,7 +48,7 @@ def get_stage_output_hashes(cache_dir: pathlib.Path, stage_names: list[str]) -> 
     hashes = set[str]()
 
     for stage_name in stage_names:
-        stage_lock = lock.StageLock(stage_name, cache_dir)
+        stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(cache_dir))
         lock_data = stage_lock.read()
         if lock_data is None:
             logger.warning(f"No lock file for stage '{stage_name}'")
@@ -70,7 +70,7 @@ def get_stage_dep_hashes(cache_dir: pathlib.Path, stage_names: list[str]) -> set
     hashes = set[str]()
 
     for stage_name in stage_names:
-        stage_lock = lock.StageLock(stage_name, cache_dir)
+        stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(cache_dir))
         lock_data = stage_lock.read()
         if lock_data is None:
             continue
@@ -96,13 +96,13 @@ def _extract_hashes_from_output(output_hash: HashInfo) -> set[str]:
 
 def _get_file_hash_from_stages(rel_path: str, cache_dir: pathlib.Path) -> HashInfo | None:
     """Look up a file's hash from stage lock files."""
-    locks_dir = cache_dir / "locks"
-    if not locks_dir.exists():
+    stages_dir = lock.get_stages_dir(cache_dir)
+    if not stages_dir.exists():
         return None
 
-    for lock_file in locks_dir.glob("*.lock"):
+    for lock_file in stages_dir.glob("*.lock"):
         stage_name = lock_file.stem
-        stage_lock = lock.StageLock(stage_name, cache_dir)
+        stage_lock = lock.StageLock(stage_name, stages_dir)
         lock_data = stage_lock.read()
         if lock_data is None:
             continue
@@ -149,7 +149,7 @@ def get_target_hashes(
     for target in targets:
         # Try as stage name first (no path separators)
         if "/" not in target and "\\" not in target:
-            stage_lock = lock.StageLock(target, cache_dir)
+            stage_lock = lock.StageLock(target, lock.get_stages_dir(cache_dir))
             lock_data = stage_lock.read()
             if lock_data is not None:
                 for out_hash in lock_data["output_hashes"].values():

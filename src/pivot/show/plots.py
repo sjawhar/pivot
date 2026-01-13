@@ -70,7 +70,7 @@ def get_plot_hashes_from_lock(
     result = dict[str, str | None]()
     for stage_name in registry.REGISTRY.list_stages():
         info = registry.REGISTRY.get(stage_name)
-        stage_lock = lock.StageLock(stage_name, cache_dir)
+        stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(cache_dir))
         lock_data = stage_lock.read()
 
         for out in info["outs"]:

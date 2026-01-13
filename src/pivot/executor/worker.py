@@ -114,7 +114,7 @@ def execute_stage(
     checkout_modes = [cache.CheckoutMode(m) for m in stage_info["checkout_modes"]]
 
     # Production lock for skip detection, pending lock for --no-commit mode
-    production_lock = lock.StageLock(stage_name, cache_dir)
+    production_lock = lock.StageLock(stage_name, lock.get_stages_dir(cache_dir))
     pending_lock = lock.get_pending_lock(stage_name, project_root)
     current_fingerprint = stage_info["fingerprint"]
     stage_outs = stage_info["outs"]

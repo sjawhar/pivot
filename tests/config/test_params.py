@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 import pytest
 from pydantic import BaseModel, ValidationError
 
-from pivot import parameters
+from pivot import exceptions, parameters
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -67,12 +67,13 @@ def test_load_params_yaml_from_project_root(tmp_path: Path, mocker: MockerFixtur
     assert result == {"stage1": {"lr": 0.01}, "stage2": {"batch": 64}}
 
 
-def test_load_params_yaml_non_dict_root(tmp_path: Path) -> None:
+def test_load_params_yaml_non_dict_root_raises(tmp_path: Path) -> None:
+    """Non-dict root should raise ParamsError."""
     params_file = tmp_path / "params.yaml"
     params_file.write_text("- item1\n- item2\n")
 
-    result = parameters.load_params_yaml(params_file)
-    assert result == {}, "Non-dict root should return empty dict"
+    with pytest.raises(exceptions.ParamsError, match="root must be a dict"):
+        parameters.load_params_yaml(params_file)
 
 
 def test_load_params_yaml_filters_non_dict_values(tmp_path: Path) -> None:
@@ -83,12 +84,13 @@ def test_load_params_yaml_filters_non_dict_values(tmp_path: Path) -> None:
     assert result == {"valid": {"key": "value"}}, "Non-dict stage values should be filtered"
 
 
-def test_load_params_yaml_invalid_yaml(tmp_path: Path) -> None:
+def test_load_params_yaml_invalid_yaml_raises(tmp_path: Path) -> None:
+    """Invalid YAML should raise ParamsError, not silently return empty dict."""
     params_file = tmp_path / "params.yaml"
     params_file.write_text("invalid: yaml: content: ::::")
 
-    result = parameters.load_params_yaml(params_file)
-    assert result == {}, "Invalid YAML should return empty dict"
+    with pytest.raises(exceptions.ParamsError, match="Failed to parse"):
+        parameters.load_params_yaml(params_file)
 
 
 # -----------------------------------------------------------------------------

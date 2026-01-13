@@ -17,7 +17,7 @@ def _get_stage_output_info(project_root: pathlib.Path) -> dict[str, OutputHash]:
     cache_dir = project_root / ".pivot" / "cache"
 
     for stage_name in registry.REGISTRY.list_stages():
-        stage_lock = lock.StageLock(stage_name, cache_dir)
+        stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(cache_dir))
         lock_data = stage_lock.read()
         if lock_data and "output_hashes" in lock_data:
             for out_path, out_hash in lock_data["output_hashes"].items():

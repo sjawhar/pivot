@@ -189,7 +189,7 @@ def test_integration_second_run_appends_to_output(
 
     # Simulate code change by modifying the lock file's code_manifest
     # Keep output_hashes so we can restore
-    stage_lock = lock.StageLock("append_stage", cache_dir)
+    stage_lock = lock.StageLock("append_stage", lock.get_stages_dir(cache_dir))
     lock_data = stage_lock.read()
     assert lock_data is not None
     lock_data["code_manifest"] = {"self:fake": "changed_hash"}

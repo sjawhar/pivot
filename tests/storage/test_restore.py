@@ -112,7 +112,7 @@ def test_resolve_targets_as_stage(git_repo: GitRepo, monkeypatch: pytest.MonkeyP
 
     # Create lock file for stage
     cache_dir = repo_path / ".pivot" / "cache"
-    (cache_dir / "stages").mkdir(parents=True)
+    (repo_path / ".pivot" / "stages").mkdir(parents=True)
     lock_content = {
         "code_manifest": {"func:main": "abc123"},
         "params": {},
@@ -120,7 +120,7 @@ def test_resolve_targets_as_stage(git_repo: GitRepo, monkeypatch: pytest.MonkeyP
         "outs": [{"path": "model.pkl", "hash": "def456"}],
         "dep_generations": {},
     }
-    (cache_dir / "stages" / "train.lock").write_text(yaml.dump(lock_content))
+    (repo_path / ".pivot" / "stages" / "train.lock").write_text(yaml.dump(lock_content))
 
     sha = commit("add lock file")[:7]
     monkeypatch.setattr(project, "_project_root_cache", repo_path)
@@ -351,7 +351,7 @@ def test_restore_targets_from_revision_output_with_stage(
 
     # Create lock file for stage
     cache_dir = repo_path / ".pivot" / "cache"
-    (cache_dir / "stages").mkdir(parents=True)
+    (repo_path / ".pivot" / "stages").mkdir(parents=True)
     lock_content = {
         "code_manifest": {"func:main": "abc123"},
         "params": {},
@@ -359,7 +359,7 @@ def test_restore_targets_from_revision_output_with_stage(
         "outs": [{"path": "model.pkl", "hash": "def456"}],
         "dep_generations": {},
     }
-    (cache_dir / "stages" / "train.lock").write_text(yaml.dump(lock_content))
+    (repo_path / ".pivot" / "stages" / "train.lock").write_text(yaml.dump(lock_content))
 
     sha = commit("add lock")
 

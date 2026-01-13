@@ -226,7 +226,7 @@ def test_params_diff_no_changes(
         mocker.patch.object(
             git,
             "read_files_from_head",
-            return_value={".pivot/cache/stages/stage.lock": lock_content.encode()},
+            return_value={".pivot/stages/stage.lock": lock_content.encode()},
         )
 
         result = runner.invoke(cli.cli, ["params", "diff"])
@@ -269,7 +269,7 @@ def test_params_diff_with_changes(
         mocker.patch.object(
             git,
             "read_files_from_head",
-            return_value={".pivot/cache/stages/stage.lock": lock_content.encode()},
+            return_value={".pivot/stages/stage.lock": lock_content.encode()},
         )
 
         result = runner.invoke(cli.cli, ["params", "diff"])
@@ -313,7 +313,7 @@ def test_params_diff_json_format(
         mocker.patch.object(
             git,
             "read_files_from_head",
-            return_value={".pivot/cache/stages/stage.lock": lock_content.encode()},
+            return_value={".pivot/stages/stage.lock": lock_content.encode()},
         )
 
         result = runner.invoke(cli.cli, ["params", "diff", "--json"])
@@ -358,7 +358,7 @@ def test_params_diff_md_format(
         mocker.patch.object(
             git,
             "read_files_from_head",
-            return_value={".pivot/cache/stages/stage.lock": lock_content.encode()},
+            return_value={".pivot/stages/stage.lock": lock_content.encode()},
         )
 
         result = runner.invoke(cli.cli, ["params", "diff", "--md"])

@@ -334,8 +334,8 @@ def test_atomic_write_no_partial_file(tmp_path: Path) -> None:
 
 def test_lock_directory_created(tmp_path: Path) -> None:
     """Lock file parent directories are created automatically."""
-    nested_cache = tmp_path / "deep" / "nested" / "cache"
-    stage_lock = lock.StageLock("nested_stage", nested_cache)
+    stages_dir = tmp_path / "deep" / "nested" / "stages"
+    stage_lock = lock.StageLock("nested_stage", stages_dir)
 
     stage_lock.write(
         {
@@ -348,7 +348,7 @@ def test_lock_directory_created(tmp_path: Path) -> None:
     )
 
     assert stage_lock.path.exists()
-    assert stage_lock.path.parent == nested_cache / "stages"
+    assert stage_lock.path.parent == stages_dir
 
 
 @pytest.mark.parametrize(

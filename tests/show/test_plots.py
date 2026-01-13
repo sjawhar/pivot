@@ -116,7 +116,9 @@ def test_get_plot_hashes_from_lock_with_hash(set_project_root: Path) -> None:
 
     # Create lock file with hash
     cache_dir = set_project_root / ".pivot" / "cache"
-    stage_lock = lock.StageLock("test_stage", cache_dir)
+    stages_dir = lock.get_stages_dir(cache_dir)
+    stages_dir.mkdir(parents=True, exist_ok=True)
+    stage_lock = lock.StageLock("test_stage", stages_dir)
     stage_lock.write(
         LockData(
             code_manifest={},
@@ -149,7 +151,9 @@ def test_get_plot_hashes_from_lock_with_none_hash(set_project_root: Path) -> Non
 
     # Create lock file with None hash (uncached output)
     cache_dir = set_project_root / ".pivot" / "cache"
-    stage_lock = lock.StageLock("test_stage", cache_dir)
+    stages_dir = lock.get_stages_dir(cache_dir)
+    stages_dir.mkdir(parents=True, exist_ok=True)
+    stage_lock = lock.StageLock("test_stage", stages_dir)
     stage_lock.write(
         LockData(
             code_manifest={},
@@ -229,7 +233,9 @@ def test_get_plot_hashes_from_head_returns_committed_hash(
 
     # Create and commit lock file with hash
     cache_dir = set_project_root / ".pivot" / "cache"
-    stage_lock = lock.StageLock("test_stage", cache_dir)
+    stages_dir = lock.get_stages_dir(cache_dir)
+    stages_dir.mkdir(parents=True, exist_ok=True)
+    stage_lock = lock.StageLock("test_stage", stages_dir)
     stage_lock.write(
         LockData(
             code_manifest={},
@@ -273,7 +279,9 @@ def test_get_plot_hashes_from_head_ignores_uncommitted_changes(
 
     # Create and commit lock file with original hash
     cache_dir = set_project_root / ".pivot" / "cache"
-    stage_lock = lock.StageLock("test_stage", cache_dir)
+    stages_dir = lock.get_stages_dir(cache_dir)
+    stages_dir.mkdir(parents=True, exist_ok=True)
+    stage_lock = lock.StageLock("test_stage", stages_dir)
     stage_lock.write(
         LockData(
             code_manifest={},

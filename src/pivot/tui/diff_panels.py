@@ -720,7 +720,7 @@ class OutputDiffPanel(_SelectableExpandablePanel):
             return
 
         cache_dir = _get_cache_dir()
-        stage_lock = lock.StageLock(stage_name, cache_dir)
+        stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(cache_dir))
         lock_data = stage_lock.read()
 
         output_changes = _compute_output_changes(lock_data, self._registry_info)

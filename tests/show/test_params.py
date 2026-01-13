@@ -160,7 +160,7 @@ def test_get_params_from_head_with_lock_file(
     mocker.patch.object(
         git,
         "read_files_from_head",
-        return_value={".pivot/cache/stages/train.lock": lock_content.encode()},
+        return_value={".pivot/stages/train.lock": lock_content.encode()},
     )
 
     result = params.get_params_from_head()
@@ -234,7 +234,7 @@ def test_get_params_from_head_invalid_yaml(
     mocker.patch.object(
         git,
         "read_files_from_head",
-        return_value={".pivot/cache/stages/train.lock": b"invalid yaml: {"},
+        return_value={".pivot/stages/train.lock": b"invalid yaml: {"},
     )
 
     result = params.get_params_from_head()
@@ -260,7 +260,7 @@ def test_get_params_from_head_missing_params_key(
     mocker.patch.object(
         git,
         "read_files_from_head",
-        return_value={".pivot/cache/stages/train.lock": lock_content.encode()},
+        return_value={".pivot/stages/train.lock": lock_content.encode()},
     )
 
     result = params.get_params_from_head()
@@ -286,7 +286,7 @@ def test_get_params_from_head_empty_params(
     mocker.patch.object(
         git,
         "read_files_from_head",
-        return_value={".pivot/cache/stages/train.lock": lock_content.encode()},
+        return_value={".pivot/stages/train.lock": lock_content.encode()},
     )
 
     result = params.get_params_from_head()
@@ -320,8 +320,8 @@ def test_get_params_from_head_filters_by_stage_names(
         git,
         "read_files_from_head",
         return_value={
-            ".pivot/cache/stages/stage_a.lock": lock_a.encode(),
-            ".pivot/cache/stages/stage_b.lock": lock_b.encode(),
+            ".pivot/stages/stage_a.lock": lock_a.encode(),
+            ".pivot/stages/stage_b.lock": lock_b.encode(),
         },
     )
 

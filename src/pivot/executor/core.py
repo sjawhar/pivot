@@ -909,7 +909,7 @@ def _check_uncached_incremental_outputs(
         stage_outs = stage_info["outs"]
 
         # Read lock file to get cached output hashes
-        stage_lock = lock.StageLock(stage_name, cache_dir)
+        stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(cache_dir))
         lock_data = stage_lock.read()
         output_hashes = lock_data.get("output_hashes", {}) if lock_data else {}
 
@@ -937,7 +937,7 @@ def _write_run_history(
 
     stages_records = dict[str, run_history.StageRunRecord]()
     for name, state in stage_states.items():
-        stage_lock = lock.StageLock(name, cache_dir)
+        stage_lock = lock.StageLock(name, lock.get_stages_dir(cache_dir))
         lock_data = stage_lock.read()
 
         if lock_data:
