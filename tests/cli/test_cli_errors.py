@@ -1,3 +1,5 @@
+import pickle
+
 import click
 import pytest
 
@@ -173,25 +175,61 @@ def test_stage_not_found_fuzzy_suggestion_multiple_unknowns() -> None:
     assert "train" in message
 
 
-def test_stage_not_found_no_suggestion_when_no_match() -> None:
-    """StageNotFoundError omits 'Did you mean' when no similar stage."""
+@pytest.mark.parametrize(
+    ("unknown_stages", "available_stages", "expected_message"),
+    [
+        pytest.param(
+            ["xyz"],
+            ["preprocess", "train", "evaluate"],
+            "Unknown stage(s): xyz",
+            id="no_similar_match",
+        ),
+        pytest.param(
+            ["preproces"],
+            None,
+            "Unknown stage(s): preproces",
+            id="no_available_stages",
+        ),
+    ],
+)
+def test_stage_not_found_no_fuzzy_suggestion(
+    unknown_stages: list[str],
+    available_stages: list[str] | None,
+    expected_message: str,
+) -> None:
+    """StageNotFoundError omits 'Did you mean' when no similar stage or no available stages."""
+    error = exceptions.StageNotFoundError(unknown_stages, available_stages=available_stages)
+
+    message = error.format_user_message()
+
+    assert "Did you mean" not in message
+    assert expected_message in message
+
+
+def test_stage_not_found_truncation_message() -> None:
+    """StageNotFoundError indicates when suggestions are truncated."""
     error = exceptions.StageNotFoundError(
-        ["xyz"], available_stages=["preprocess", "train", "evaluate"]
+        ["preproces", "trian", "evaluat", "infer"],
+        available_stages=["preprocess", "train", "evaluate", "inference"],
     )
 
     message = error.format_user_message()
 
-    assert "Did you mean" not in message
-    assert "Unknown stage(s): xyz" in message
+    assert "showing first 3" in message
+    assert "4 unknown stages" in message
 
 
-def test_stage_not_found_no_suggestion_without_available() -> None:
-    """StageNotFoundError omits 'Did you mean' when no available stages provided."""
-    error = exceptions.StageNotFoundError(["preproces"])
+def test_stage_not_found_no_truncation_message_for_three_or_fewer() -> None:
+    """StageNotFoundError omits truncation message when 3 or fewer unknown stages."""
+    error = exceptions.StageNotFoundError(
+        ["preproces", "trian", "evaluat"],
+        available_stages=["preprocess", "train", "evaluate"],
+    )
 
     message = error.format_user_message()
 
-    assert "Did you mean" not in message
+    assert "Did you mean" in message
+    assert "showing first" not in message
 
 
 def test_dependency_not_found_fuzzy_suggestion() -> None:
@@ -221,28 +259,23 @@ def test_dependency_not_found_no_suggestion_short_dep() -> None:
     assert "Did you mean" not in message
 
 
-def test_stage_not_found_pickling() -> None:
-    """StageNotFoundError can be pickled and unpickled."""
-    import pickle
-
-    original = exceptions.StageNotFoundError(
-        ["preproces"], available_stages=["preprocess", "train"]
-    )
-
-    unpickled = pickle.loads(pickle.dumps(original))
-
-    assert str(unpickled) == str(original)
-    assert "Did you mean" in unpickled.format_user_message()
-
-
-def test_dependency_not_found_pickling() -> None:
-    """DependencyNotFoundError can be pickled and unpickled."""
-    import pickle
-
-    original = exceptions.DependencyNotFoundError(
-        stage="train", dep="data/input.scv", available_outputs=["data/input.csv"]
-    )
-
+@pytest.mark.parametrize(
+    "original",
+    [
+        pytest.param(
+            exceptions.StageNotFoundError(["preproces"], available_stages=["preprocess", "train"]),
+            id="stage_not_found",
+        ),
+        pytest.param(
+            exceptions.DependencyNotFoundError(
+                stage="train", dep="data/input.scv", available_outputs=["data/input.csv"]
+            ),
+            id="dependency_not_found",
+        ),
+    ],
+)
+def test_fuzzy_error_pickling(original: exceptions.PivotError) -> None:
+    """Fuzzy matching errors can be pickled and unpickled with suggestions intact."""
     unpickled = pickle.loads(pickle.dumps(original))
 
     assert str(unpickled) == str(original)
