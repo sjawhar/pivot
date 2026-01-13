@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterable
 
     from pivot.run_history import RunCacheEntry, RunManifest
+    from pivot.types import DeferredWrites
 
 # Key prefixes for different entry types
 _HASH_PREFIX = b"hash:"  # File hash entries
@@ -27,6 +28,11 @@ _MAP_SIZE = 10 * 1024 * 1024 * 1024
 
 # LMDB default max key size
 _MAX_KEY_SIZE = 511
+
+# Common error message for MapFullError
+_DB_FULL_MSG = (
+    f"State cache is full ({_MAP_SIZE // (1024**3)}GB limit). Delete .pivot/state.lmdb/ to reset."
+)
 
 
 class StateDBError(Exception):
@@ -94,17 +100,36 @@ class StateDB:
 
     _env: lmdb.Environment
     _closed: bool
+    _readonly: bool
 
-    def __init__(self, db_path: pathlib.Path) -> None:
+    def __init__(self, db_path: pathlib.Path, readonly: bool = False) -> None:
         lmdb_path = db_path.parent / "state.lmdb"
         lmdb_path.parent.mkdir(parents=True, exist_ok=True)
-        self._env = lmdb.open(str(lmdb_path), map_size=_MAP_SIZE)
+
+        # LMDB readonly mode can't create database - create empty one first if needed
+        if readonly and not lmdb_path.exists():
+            lmdb.open(str(lmdb_path), map_size=_MAP_SIZE).close()
+
+        self._env = lmdb.open(str(lmdb_path), map_size=_MAP_SIZE, readonly=readonly)
         self._closed = False
+        self._readonly = readonly
 
     def _check_closed(self) -> None:
         """Raise if database is closed."""
         if self._closed:
             raise RuntimeError("Cannot operate on closed StateDB")
+
+    def _check_write_allowed(self) -> None:
+        """Raise if database is read-only."""
+        if self._readonly:
+            raise RuntimeError(
+                "Internal error: worker attempted write to readonly StateDB. This is a bug in Pivot. Please report it."
+            )
+
+    @property
+    def readonly(self) -> bool:
+        """Return True if database is opened in readonly mode."""
+        return self._readonly
 
     def get(self, path: pathlib.Path, fs_stat: os.stat_result) -> str | None:
         """Return cached hash if file metadata matches, else None."""
@@ -130,6 +155,7 @@ class StateDB:
     def save(self, path: pathlib.Path, fs_stat: os.stat_result, file_hash: str) -> None:
         """Cache file metadata and hash."""
         self._check_closed()
+        self._check_write_allowed()
         key = _make_key_file_hash(path)
         if len(key) > _MAX_KEY_SIZE:
             raise PathTooLongError(
@@ -140,13 +166,12 @@ class StateDB:
             with self._env.begin(write=True) as txn:
                 txn.put(key, value)
         except lmdb.MapFullError as e:
-            raise DatabaseFullError(
-                f"State cache is full ({_MAP_SIZE // (1024**3)}GB limit). Delete .pivot/state.lmdb/ to reset."
-            ) from e
+            raise DatabaseFullError(_DB_FULL_MSG) from e
 
     def save_many(self, entries: list[tuple[pathlib.Path, os.stat_result, str]]) -> None:
         """Batch save multiple entries atomically."""
         self._check_closed()
+        self._check_write_allowed()
         try:
             with self._env.begin(write=True) as txn:
                 for path, fs_stat, file_hash in entries:
@@ -160,9 +185,7 @@ class StateDB:
                     )
                     txn.put(key, value)
         except lmdb.MapFullError as e:
-            raise DatabaseFullError(
-                f"State cache is full ({_MAP_SIZE // (1024**3)}GB limit). Delete .pivot/state.lmdb/ to reset."
-            ) from e
+            raise DatabaseFullError(_DB_FULL_MSG) from e
 
     # -------------------------------------------------------------------------
     # Generation tracking for O(1) skip detection
@@ -197,6 +220,7 @@ class StateDB:
     def increment_generation(self, path: pathlib.Path) -> int:
         """Increment and return new generation (creates with gen=1 if not exists)."""
         self._check_closed()
+        self._check_write_allowed()
         key = _make_key_output_generation(path)
         if len(key) > _MAX_KEY_SIZE:
             raise PathTooLongError(
@@ -208,9 +232,7 @@ class StateDB:
                 new_gen = (struct.unpack(">Q", value)[0] + 1) if value else 1
                 txn.put(key, struct.pack(">Q", new_gen))
         except lmdb.MapFullError as e:
-            raise DatabaseFullError(
-                f"State cache is full ({_MAP_SIZE // (1024**3)}GB limit). Delete .pivot/state.lmdb/ to reset."
-            ) from e
+            raise DatabaseFullError(_DB_FULL_MSG) from e
         return new_gen
 
     def get_dep_generations(self, stage_name: str) -> dict[str, int] | None:
@@ -232,6 +254,7 @@ class StateDB:
     def record_dep_generations(self, stage_name: str, deps: dict[str, int]) -> None:
         """Record dependency generations after successful stage execution."""
         self._check_closed()
+        self._check_write_allowed()
         prefix = _DEP_PREFIX + stage_name.encode() + b":"
         for dep_path in deps:
             key = _make_key_dep_generation(stage_name, dep_path)
@@ -254,9 +277,7 @@ class StateDB:
                     key = _make_key_dep_generation(stage_name, dep_path)
                     txn.put(key, struct.pack(">Q", gen))
         except lmdb.MapFullError as e:
-            raise DatabaseFullError(
-                f"State cache is full ({_MAP_SIZE // (1024**3)}GB limit). Delete .pivot/state.lmdb/ to reset."
-            ) from e
+            raise DatabaseFullError(_DB_FULL_MSG) from e
 
     # -------------------------------------------------------------------------
     # Remote index tracking for avoiding repeated HEAD requests
@@ -286,6 +307,7 @@ class StateDB:
     def remote_hashes_add(self, remote_name: str, hashes: Iterable[str]) -> None:
         """Mark hashes as existing on remote."""
         self._check_closed()
+        self._check_write_allowed()
         prefix = _REMOTE_PREFIX + remote_name.encode() + b":"
         try:
             with self._env.begin(write=True) as txn:
@@ -293,13 +315,12 @@ class StateDB:
                     key = prefix + hash_.encode()
                     txn.put(key, b"1")
         except lmdb.MapFullError as e:
-            raise DatabaseFullError(
-                f"State cache is full ({_MAP_SIZE // (1024**3)}GB limit). Delete .pivot/state.lmdb/ to reset."
-            ) from e
+            raise DatabaseFullError(_DB_FULL_MSG) from e
 
     def remote_hashes_remove(self, remote_name: str, hashes: Iterable[str]) -> None:
         """Mark hashes as no longer on remote."""
         self._check_closed()
+        self._check_write_allowed()
         prefix = _REMOTE_PREFIX + remote_name.encode() + b":"
         with self._env.begin(write=True) as txn:
             for hash_ in hashes:
@@ -309,6 +330,7 @@ class StateDB:
     def remote_index_clear(self, remote_name: str) -> None:
         """Clear all index entries for a remote (force re-indexing)."""
         self._check_closed()
+        self._check_write_allowed()
         prefix = _REMOTE_PREFIX + remote_name.encode() + b":"
         with self._env.begin(write=True) as txn:
             cursor = txn.cursor()
@@ -328,6 +350,7 @@ class StateDB:
     def write_run(self, manifest: RunManifest) -> None:
         """Write a run manifest to the database."""
         self._check_closed()
+        self._check_write_allowed()
 
         key = _RUN_PREFIX + manifest["run_id"].encode()
         value = run_history.serialize_to_bytes(manifest)
@@ -335,9 +358,7 @@ class StateDB:
             with self._env.begin(write=True) as txn:
                 txn.put(key, value)
         except lmdb.MapFullError as e:
-            raise DatabaseFullError(
-                f"State cache is full ({_MAP_SIZE // (1024**3)}GB limit). Delete .pivot/state.lmdb/ to reset."
-            ) from e
+            raise DatabaseFullError(_DB_FULL_MSG) from e
 
     def read_run(self, run_id: str) -> RunManifest | None:
         """Read a run manifest by ID. Returns None if not found."""
@@ -393,6 +414,7 @@ class StateDB:
         are also removed automatically.
         """
         self._check_closed()
+        self._check_write_allowed()
         runs = self.list_runs(
             limit=retention + 1000
         )  # Get more than retention to find deletable ones
@@ -418,15 +440,14 @@ class StateDB:
     def write_run_cache(self, stage_name: str, input_hash: str, entry: RunCacheEntry) -> None:
         """Write a run cache entry for skip detection."""
         self._check_closed()
+        self._check_write_allowed()
         key = _RUNCACHE_PREFIX + f"{stage_name}:{input_hash}".encode()
         value = run_history.serialize_to_bytes(entry)
         try:
             with self._env.begin(write=True) as txn:
                 txn.put(key, value)
         except lmdb.MapFullError as e:
-            raise DatabaseFullError(
-                f"State cache is full ({_MAP_SIZE // (1024**3)}GB limit). Delete .pivot/state.lmdb/ to reset."
-            ) from e
+            raise DatabaseFullError(_DB_FULL_MSG) from e
 
     def lookup_run_cache(self, stage_name: str, input_hash: str) -> RunCacheEntry | None:
         """Look up run cache entry for skip detection. Returns None if not found."""
@@ -447,6 +468,7 @@ class StateDB:
         Returns number of entries deleted.
         """
         self._check_closed()
+        self._check_write_allowed()
         to_delete = list[bytes]()
         with self._env.begin() as txn:
             cursor = txn.cursor()
@@ -470,6 +492,78 @@ class StateDB:
             for key in to_delete:
                 txn.delete(key)
         return len(to_delete)
+
+    # -------------------------------------------------------------------------
+    # Deferred writes for multi-process safety
+    # -------------------------------------------------------------------------
+
+    def apply_deferred_writes(
+        self,
+        stage_name: str,
+        output_paths: list[str],
+        deferred: DeferredWrites,
+    ) -> None:
+        """Apply all deferred writes in a single atomic transaction.
+
+        Used by coordinator to apply writes collected from worker processes.
+        Workers use readonly StateDB and return deferred writes for the
+        coordinator to apply, ensuring LMDB multi-process safety.
+        """
+        self._check_closed()
+        self._check_write_allowed()
+
+        # Pre-validate key lengths before starting transaction
+        if "dep_generations" in deferred:
+            for dep_path in deferred["dep_generations"]:
+                key = _make_key_dep_generation(stage_name, dep_path)
+                if len(key) > _MAX_KEY_SIZE:
+                    raise PathTooLongError(
+                        f"Dependency path too long ({len(key)} bytes, max {_MAX_KEY_SIZE}): {dep_path}"
+                    )
+
+        for path_str in output_paths:
+            key = _make_key_output_generation(pathlib.Path(path_str))
+            if len(key) > _MAX_KEY_SIZE:
+                raise PathTooLongError(
+                    f"Output path too long ({len(key)} bytes, max {_MAX_KEY_SIZE}): {path_str}"
+                )
+
+        try:
+            with self._env.begin(write=True) as txn:
+                # Dependency generations (clear old entries first, like record_dep_generations)
+                if "dep_generations" in deferred:
+                    prefix = _DEP_PREFIX + stage_name.encode() + b":"
+                    cursor = txn.cursor()
+                    keys_to_delete = list[bytes]()
+                    if cursor.set_range(prefix):
+                        for key, _ in cursor:
+                            if not key.startswith(prefix):
+                                break
+                            keys_to_delete.append(key)
+                    for key in keys_to_delete:
+                        txn.delete(key)
+                    for dep_path, gen in deferred["dep_generations"].items():
+                        key = _make_key_dep_generation(stage_name, dep_path)
+                        txn.put(key, struct.pack(">Q", gen))
+
+                # Output generations (increment)
+                for path_str in output_paths:
+                    path = pathlib.Path(path_str)
+                    key = _make_key_output_generation(path)
+                    value = txn.get(key)
+                    current = struct.unpack(">Q", value)[0] if value else 0
+                    txn.put(key, struct.pack(">Q", current + 1))
+
+                # Run cache (only if both keys present)
+                if "run_cache_input_hash" in deferred and "run_cache_entry" in deferred:
+                    key = (
+                        _RUNCACHE_PREFIX
+                        + f"{stage_name}:{deferred['run_cache_input_hash']}".encode()
+                    )
+                    txn.put(key, run_history.serialize_to_bytes(deferred["run_cache_entry"]))
+
+        except lmdb.MapFullError as e:
+            raise DatabaseFullError(_DB_FULL_MSG) from e
 
     def close(self) -> None:
         """Close the database."""

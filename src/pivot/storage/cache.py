@@ -87,7 +87,7 @@ def hash_file(path: pathlib.Path, state_db: state_mod.StateDB | None = None) -> 
                     hasher.update(chunk)
         file_hash = hasher.hexdigest()
 
-    if state_db is not None:
+    if state_db is not None and not state_db.readonly:
         state_db.save(path, file_stat, file_hash)
 
     return file_hash

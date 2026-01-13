@@ -18,6 +18,7 @@ import pydantic
 from pivot import exceptions, metrics, outputs, parameters, project, run_history, stage_def
 from pivot.storage import cache, lock, state
 from pivot.types import (
+    DeferredWrites,
     DepEntry,
     HashInfo,
     LockData,
@@ -139,7 +140,7 @@ def execute_stage(
             production_lock_data = production_lock.read()
             lock_data = pending_lock_data or production_lock_data
 
-            with state.StateDB(state_db_path) as state_db:
+            with state.StateDB(state_db_path, readonly=True) as state_db:
                 dep_hashes, missing, unreadable = hash_dependencies(stage_info["deps"], state_db)
 
                 if missing:
@@ -168,17 +169,16 @@ def execute_stage(
                     skip_reason = None
                     run_reason = "forced"
 
-            if skip_reason is not None and lock_data is not None:
-                restored = _restore_outputs_from_cache(
-                    stage_outs, lock_data, files_cache_dir, checkout_modes
-                )
-                if restored:
-                    return _make_result(StageStatus.SKIPPED, skip_reason, [])
-                run_reason = "outputs missing from cache"
+                if skip_reason is not None and lock_data is not None:
+                    restored = _restore_outputs_from_cache(
+                        stage_outs, lock_data, files_cache_dir, checkout_modes
+                    )
+                    if restored:
+                        return _make_result(StageStatus.SKIPPED, skip_reason, [])
+                    run_reason = "outputs missing from cache"
 
-            # Check run cache for previously executed configuration (skip if forcing or no_cache)
-            if run_reason and not stage_info["force"] and not no_cache:
-                with state.StateDB(state_db_path) as state_db:
+                # Check run cache for previously executed configuration (skip if forcing or no_cache)
+                if run_reason and not stage_info["force"] and not no_cache:
                     run_cache_result = _try_skip_via_run_cache(
                         stage_name,
                         input_hash,
@@ -187,8 +187,8 @@ def execute_stage(
                         checkout_modes,
                         state_db,
                     )
-                if run_cache_result is not None:
-                    return run_cache_result
+                    if run_cache_result is not None:
+                        return run_cache_result
 
             _prepare_outputs_for_execution(stage_outs, lock_data, files_cache_dir)
 
@@ -197,58 +197,40 @@ def execute_stage(
                     stage_info["func"], stage_name, output_queue, output_lines, params_instance
                 )
 
+            # Compute output hashes (null for no_cache, actual otherwise)
             if no_cache:
-                # Skip caching entirely - just verify outputs exist
                 _verify_outputs_exist(stage_outs)
-                null_hashes = dict[str, OutputHash]({out.path: None for out in stage_outs})
-                new_lock_data = LockData(
-                    code_manifest=current_fingerprint,
-                    params=current_params,
-                    dep_hashes=dict(sorted(dep_hashes.items())),
-                    output_hashes=dict(sorted(null_hashes.items())),
-                    dep_generations={},
-                )
+                output_hashes = dict[str, OutputHash]({out.path: None for out in stage_outs})
+            else:
+                output_hashes = _save_outputs_to_cache(stage_outs, files_cache_dir, checkout_modes)
+
+            # Build lock data (dep_generations filled below if no_commit)
+            new_lock_data = LockData(
+                code_manifest=current_fingerprint,
+                params=current_params,
+                dep_hashes=dict(sorted(dep_hashes.items())),
+                output_hashes=dict(sorted(output_hashes.items())),
+                dep_generations={},
+            )
+
+            # Single StateDB open for post-execution work
+            with state.StateDB(state_db_path, readonly=True) as state_db:
                 if no_commit:
-                    with state.StateDB(state_db_path) as state_db:
-                        dep_gens = compute_dep_generation_map(stage_info["deps"], state_db)
+                    dep_gens = compute_dep_generation_map(stage_info["deps"], state_db)
                     new_lock_data["dep_generations"] = dep_gens
                     pending_lock.write(new_lock_data)
                 else:
                     production_lock.write(new_lock_data)
-                    # Still track generations for downstream skip detection
-                    with state.StateDB(state_db_path) as state_db:
-                        _record_generations_after_run(stage_name, stage_info, state_db)
-            else:
-                output_hashes = _save_outputs_to_cache(stage_outs, files_cache_dir, checkout_modes)
-                if no_commit:
-                    # Compute dep_generations NOW (at execution time) and store in pending lock
-                    with state.StateDB(state_db_path) as state_db:
-                        dep_gens = compute_dep_generation_map(stage_info["deps"], state_db)
-
-                    new_lock_data = LockData(
-                        code_manifest=current_fingerprint,
-                        params=current_params,
-                        dep_hashes=dict(sorted(dep_hashes.items())),
-                        output_hashes=dict(sorted(output_hashes.items())),
-                        dep_generations=dep_gens,
+                    deferred = _build_deferred_writes(
+                        stage_info, input_hash, output_hashes, state_db
                     )
-                    pending_lock.write(new_lock_data)
-                else:
-                    # Write to production lock and update StateDB
-                    new_lock_data = LockData(
-                        code_manifest=current_fingerprint,
-                        params=current_params,
-                        dep_hashes=dict(sorted(dep_hashes.items())),
-                        output_hashes=dict(sorted(output_hashes.items())),
-                        dep_generations={},
+                    return StageResult(
+                        status=StageStatus.RAN,
+                        reason=run_reason,
+                        output_lines=output_lines,
+                        metrics=metrics.get_entries(),
+                        deferred_writes=deferred,
                     )
-                    production_lock.write(new_lock_data)
-
-                    with state.StateDB(state_db_path) as state_db:
-                        _record_generations_after_run(stage_name, stage_info, state_db)
-                        write_run_cache_entry(
-                            stage_name, input_hash, output_hashes, stage_info["run_id"], state_db
-                        )
 
         return _make_result(StageStatus.RAN, run_reason, output_lines)
 
@@ -302,6 +284,12 @@ def _check_skip_or_run(
     return None, run_reason, input_hash
 
 
+def _cleanup_restored_paths(restored_paths: list[pathlib.Path]) -> None:
+    """Remove partially restored outputs to leave a clean state."""
+    for path in restored_paths:
+        cache.remove_output(path)
+
+
 def _restore_outputs_from_cache(
     stage_outs: list[outputs.BaseOut],
     lock_data: LockData,
@@ -317,10 +305,6 @@ def _restore_outputs_from_cache(
     output_hashes = lock_data["output_hashes"]
     restored_paths = list[pathlib.Path]()
 
-    def _cleanup_restored() -> None:
-        for p in restored_paths:
-            cache.remove_output(p)
-
     for out in stage_outs:
         path = pathlib.Path(out.path)
         if path.exists():
@@ -328,7 +312,7 @@ def _restore_outputs_from_cache(
 
         output_hash = output_hashes.get(out.path)
         if output_hash is None:
-            _cleanup_restored()
+            _cleanup_restored_paths(restored_paths)
             return False
 
         try:
@@ -336,13 +320,13 @@ def _restore_outputs_from_cache(
                 path, output_hash, files_cache_dir, checkout_modes=checkout_modes
             )
         except OSError:
-            _cleanup_restored()
+            _cleanup_restored_paths(restored_paths)
             return False
 
         if restored:
             restored_paths.append(path)
         else:
-            _cleanup_restored()
+            _cleanup_restored_paths(restored_paths)
             return False
 
     return True
@@ -614,19 +598,34 @@ def compute_dep_generation_map(
     return gen_record
 
 
-def _record_generations_after_run(
-    stage_name: str,
+def _build_deferred_writes(
     stage_info: WorkerStageInfo,
+    input_hash: str,
+    output_hashes: dict[str, OutputHash],
     state_db: state.StateDB,
-) -> None:
-    """Record dependency generations and increment output generations after successful run."""
+) -> DeferredWrites:
+    """Build deferred writes for coordinator to apply."""
+    result: DeferredWrites = {}
+
+    # Dependency generations (read current values)
     gen_record = compute_dep_generation_map(stage_info["deps"], state_db)
     if gen_record:
-        state_db.record_dep_generations(stage_name, gen_record)
+        result["dep_generations"] = gen_record
 
-    for out in stage_info["outs"]:
-        out_path = pathlib.Path(out.path)
-        state_db.increment_generation(out_path)
+    # Run cache entry (only if there are cached outputs)
+    output_entries = [
+        entry
+        for path, oh in output_hashes.items()
+        if (entry := run_history.output_hash_to_entry(path, oh)) is not None
+    ]
+    if output_entries:
+        result["run_cache_input_hash"] = input_hash
+        result["run_cache_entry"] = run_history.RunCacheEntry(
+            run_id=stage_info["run_id"],
+            output_hashes=output_entries,
+        )
+
+    return result
 
 
 # -----------------------------------------------------------------------------
@@ -662,10 +661,6 @@ def _try_skip_via_run_cache(
 
     restored_paths = list[pathlib.Path]()
 
-    def _cleanup_restored() -> None:
-        for p in restored_paths:
-            cache.remove_output(p)
-
     for out in stage_outs:
         path = pathlib.Path(out.path)
         if path.exists():
@@ -674,7 +669,7 @@ def _try_skip_via_run_cache(
         cached_output = output_hash_map.get(out.path)
         if cached_output is None:
             if out.cache:
-                _cleanup_restored()
+                _cleanup_restored_paths(restored_paths)
                 return None
             continue
 
@@ -683,13 +678,13 @@ def _try_skip_via_run_cache(
                 path, cached_output, files_cache_dir, checkout_modes=checkout_modes
             )
         except OSError:
-            _cleanup_restored()
+            _cleanup_restored_paths(restored_paths)
             return None
 
         if restored:
             restored_paths.append(path)
         else:
-            _cleanup_restored()
+            _cleanup_restored_paths(restored_paths)
             return None
 
     return _make_result(StageStatus.SKIPPED, "unchanged (run cache)", [])
