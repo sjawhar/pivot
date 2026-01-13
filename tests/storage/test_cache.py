@@ -1,6 +1,8 @@
 import mmap
+import os
 import pathlib
 import stat
+import time
 from typing import TYPE_CHECKING
 
 import pytest
@@ -8,7 +10,7 @@ import pytest
 from pivot.storage import cache, state
 
 if TYPE_CHECKING:
-    from pivot.types import FileHash
+    from pivot.types import DirHash, FileHash
 
 
 # === Hash File Tests ===
@@ -422,6 +424,229 @@ def test_restore_directory_hardlink_mode(tmp_path: pathlib.Path) -> None:
     assert restored is True
     assert (test_dir / "file.txt").read_text() == "content"
     assert (subdir / "nested.txt").read_text() == "nested"
+
+
+# === Atomic Directory Restore Tests ===
+
+
+def test_restore_directory_atomic_no_temp_dirs_on_success(tmp_path: pathlib.Path) -> None:
+    """Atomic restore leaves no temp directories on success."""
+    test_dir = tmp_path / "mydir"
+    test_dir.mkdir()
+    (test_dir / "file.txt").write_text("content")
+    cache_dir = tmp_path / "cache"
+
+    output_hash = cache.save_to_cache(
+        test_dir, cache_dir, checkout_mode=cache.CheckoutMode.HARDLINK
+    )
+    cache.remove_output(test_dir)
+
+    restored = cache.restore_from_cache(
+        test_dir, output_hash, cache_dir, checkout_mode=cache.CheckoutMode.HARDLINK
+    )
+
+    assert restored is True
+    assert (test_dir / "file.txt").read_text() == "content"
+    # No temp directories left behind (lock files are expected and cleaned up by age)
+    temp_dirs = [
+        p
+        for p in tmp_path.iterdir()
+        if (
+            p.name.startswith(cache._RESTORE_TEMP_PREFIX)
+            or p.name.startswith(cache._BACKUP_TEMP_PREFIX)
+        )
+        and not p.name.startswith(cache._RESTORE_LOCK_PREFIX)
+    ]
+    assert len(temp_dirs) == 0
+
+
+def test_restore_directory_atomic_cleans_up_on_cache_miss(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Atomic restore returns False without creating temp dirs when cache missing."""
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir(parents=True)
+    target = tmp_path / "mydir"
+
+    # Create hash with non-existent cache entry
+    missing_hash: DirHash = {
+        "hash": "missing123456789",
+        "manifest": [{"relpath": "file.txt", "hash": "0" * 16, "size": 7, "isexec": False}],
+    }
+
+    result = cache.restore_from_cache(
+        target, missing_hash, cache_dir, checkout_mode=cache.CheckoutMode.HARDLINK
+    )
+
+    assert result is False
+    assert not target.exists()
+    # No temp directories left behind (validation happens before temp creation)
+    temp_dirs = [
+        p
+        for p in tmp_path.iterdir()
+        if p.name.startswith(cache._RESTORE_TEMP_PREFIX)
+        or p.name.startswith(cache._BACKUP_TEMP_PREFIX)
+    ]
+    assert len(temp_dirs) == 0
+
+
+def test_restore_directory_atomic_cleans_up_on_exception(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Atomic restore cleans up temp directory on exception."""
+    test_dir = tmp_path / "mydir"
+    test_dir.mkdir()
+    (test_dir / "file.txt").write_text("content")
+    cache_dir = tmp_path / "cache"
+
+    output_hash = cache.save_to_cache(
+        test_dir, cache_dir, checkout_mode=cache.CheckoutMode.HARDLINK
+    )
+    cache.remove_output(test_dir)
+
+    # Make checkout fail after temp dir is created
+    def failing_checkout(*args: object, **kwargs: object) -> None:
+        raise OSError("simulated failure")
+
+    monkeypatch.setattr(cache, "_checkout_with_fallback", failing_checkout)
+
+    with pytest.raises(OSError, match="simulated failure"):
+        cache.restore_from_cache(
+            test_dir, output_hash, cache_dir, checkout_mode=cache.CheckoutMode.HARDLINK
+        )
+
+    assert not test_dir.exists()
+    # No temp directories left behind (lock files are expected and cleaned up by age)
+    temp_dirs = [
+        p
+        for p in tmp_path.iterdir()
+        if (
+            p.name.startswith(cache._RESTORE_TEMP_PREFIX)
+            or p.name.startswith(cache._BACKUP_TEMP_PREFIX)
+        )
+        and not p.name.startswith(cache._RESTORE_LOCK_PREFIX)
+    ]
+    assert len(temp_dirs) == 0
+
+
+def test_restore_directory_preserves_original_on_rename_failure(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two-phase rename preserves original if swap fails."""
+    test_dir = tmp_path / "mydir"
+    test_dir.mkdir()
+    (test_dir / "original.txt").write_text("original content")
+    cache_dir = tmp_path / "cache"
+
+    # Save a version to cache
+    output_hash = cache.save_to_cache(test_dir, cache_dir, checkout_mode=cache.CheckoutMode.COPY)
+
+    # Modify the original
+    (test_dir / "original.txt").write_text("modified content")
+
+    # Make the final replace fail
+    original_replace = pathlib.Path.replace
+
+    def failing_replace(self: pathlib.Path, target: pathlib.Path) -> pathlib.Path:
+        if self.name.startswith(cache._RESTORE_TEMP_PREFIX):
+            raise OSError("simulated replace failure")
+        return original_replace(self, target)
+
+    monkeypatch.setattr(pathlib.Path, "replace", failing_replace)
+
+    with pytest.raises(OSError, match="simulated replace failure"):
+        cache.restore_from_cache(
+            test_dir, output_hash, cache_dir, checkout_mode=cache.CheckoutMode.COPY
+        )
+
+    # Original should be restored (or still present)
+    assert test_dir.exists()
+    # The test_dir should have original.txt (though content may vary based on when failure occurred)
+
+
+def test_restore_directory_validates_all_entries_before_writing(
+    tmp_path: pathlib.Path,
+) -> None:
+    """All manifest entries validated before any files written."""
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir(parents=True)
+    target = tmp_path / "mydir"
+
+    # Create a real cached file for the first entry
+    first_file = tmp_path / "first.txt"
+    first_file.write_text("first")
+    first_hash = cache.hash_file(first_file)
+    cache_path = cache.get_cache_path(cache_dir, first_hash)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    first_file.rename(cache_path)
+
+    # Create manifest with first entry valid, second entry missing
+    partial_hash: DirHash = {
+        "hash": "test123456789012",
+        "manifest": [
+            {"relpath": "first.txt", "hash": first_hash, "size": 5, "isexec": False},
+            {"relpath": "second.txt", "hash": "missing123456789", "size": 6, "isexec": False},
+        ],
+    }
+
+    result = cache.restore_from_cache(
+        target, partial_hash, cache_dir, checkout_mode=cache.CheckoutMode.COPY
+    )
+
+    assert result is False
+    # No files should have been written (validation happens before any writes)
+    assert not target.exists()
+
+
+def test_cleanup_removes_old_temps(tmp_path: pathlib.Path) -> None:
+    """Temps older than max age are cleaned."""
+    # Create an old temp directory
+    old_temp = tmp_path / f"{cache._RESTORE_TEMP_PREFIX}old_test"
+    old_temp.mkdir()
+    (old_temp / "file.txt").write_text("old")
+
+    # Set mtime to 2 hours ago
+    old_mtime = time.time() - 7200
+    os.utime(old_temp, (old_mtime, old_mtime))
+
+    cache._cleanup_stale_restore_temps(tmp_path)
+
+    assert not old_temp.exists()
+
+
+def test_cleanup_preserves_recent_temps(tmp_path: pathlib.Path) -> None:
+    """Recent temps are preserved."""
+    # Create a recent temp directory
+    recent_temp = tmp_path / f"{cache._RESTORE_TEMP_PREFIX}recent_test"
+    recent_temp.mkdir()
+    (recent_temp / "file.txt").write_text("recent")
+    # mtime is now, which is recent
+
+    cache._cleanup_stale_restore_temps(tmp_path)
+
+    assert recent_temp.exists()
+    # Cleanup
+    cache._clear_path(recent_temp)
+
+
+def test_cleanup_skips_symlinks_via_is_dir(tmp_path: pathlib.Path) -> None:
+    """is_dir(follow_symlinks=False) skips symlinks safely."""
+    # Create a real directory to link to
+    real_dir = tmp_path / "real_dir"
+    real_dir.mkdir()
+    (real_dir / "important.txt").write_text("do not delete")
+
+    # Create a symlink with our temp prefix pointing to it
+    symlink = tmp_path / f"{cache._RESTORE_TEMP_PREFIX}symlink_attack"
+    symlink.symlink_to(real_dir)
+
+    cache._cleanup_stale_restore_temps(tmp_path)
+
+    # The real directory should still exist
+    assert real_dir.exists()
+    assert (real_dir / "important.txt").exists()
+    # Cleanup
+    symlink.unlink()
 
 
 # === Remove Output Tests ===
