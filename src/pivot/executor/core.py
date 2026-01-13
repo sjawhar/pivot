@@ -171,7 +171,7 @@ def run(
         registered = set(graph.nodes())
         unknown = [s for s in stages if s not in registered]
         if unknown:
-            raise exceptions.StageNotFoundError(f"Unknown stage(s): {', '.join(unknown)}")
+            raise exceptions.StageNotFoundError(unknown, available_stages=list(registered))
 
     execution_order = dag.get_execution_order(graph, stages, single_stage=single_stage)
 

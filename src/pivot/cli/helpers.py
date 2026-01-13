@@ -56,7 +56,7 @@ def validate_stages_exist(stages: list[str] | None) -> None:
     registered = set(graph.nodes())
     unknown = [s for s in stages if s not in registered]
     if unknown:
-        raise exceptions.StageNotFoundError(f"Unknown stage(s): {', '.join(unknown)}")
+        raise exceptions.StageNotFoundError(unknown, available_stages=list(registered))
 
 
 def make_progress_callback(action: str) -> Callable[[int], None]:

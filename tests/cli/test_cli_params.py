@@ -406,7 +406,7 @@ def test_params_show_unknown_stage_error(
         result = runner.invoke(cli.cli, ["params", "show", "nonexistent_stage"])
 
         assert result.exit_code != 0
-        assert "Unknown stages: nonexistent_stage" in result.output
+        assert "Unknown stage(s): nonexistent_stage" in result.output
 
 
 def test_params_diff_unknown_stage_error(
@@ -420,7 +420,7 @@ def test_params_diff_unknown_stage_error(
         result = runner.invoke(cli.cli, ["params", "diff", "nonexistent_stage"])
 
         assert result.exit_code != 0
-        assert "Unknown stages: nonexistent_stage" in result.output
+        assert "Unknown stage(s): nonexistent_stage" in result.output
 
 
 def test_params_diff_no_git_warning(

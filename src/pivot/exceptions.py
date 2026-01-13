@@ -1,4 +1,17 @@
+from difflib import get_close_matches
 from typing import override
+
+# Fuzzy matching constants
+_FUZZY_CUTOFF = 0.6
+_FUZZY_MIN_LENGTH = 3
+
+
+def _fuzzy_suggest(query: str, candidates: list[str]) -> str | None:
+    """Return best fuzzy match if found, else None."""
+    if not candidates or len(query) < _FUZZY_MIN_LENGTH:
+        return None
+    matches = get_close_matches(query, candidates, n=1, cutoff=_FUZZY_CUTOFF)
+    return matches[0] if matches else None
 
 
 class PivotError(Exception):
@@ -64,17 +77,75 @@ class CyclicGraphError(DAGError):
 class DependencyNotFoundError(DAGError):
     """Raised when a dependency doesn't exist."""
 
+    _stage: str
+    _dep: str
+    _available: list[str]
+
+    def __init__(
+        self,
+        stage: str,
+        dep: str,
+        available_outputs: list[str] | None = None,
+    ) -> None:
+        self._stage = stage
+        self._dep = dep
+        self._available = available_outputs or []
+        super().__init__(
+            f"Stage '{stage}' depends on '{dep}' which is not produced by any stage and does not exist on disk"
+        )
+
+    @override
+    def format_user_message(self) -> str:
+        msg = str(self)
+        if match := _fuzzy_suggest(self._dep, self._available):
+            msg += f"\n  Did you mean: '{match}'?"
+        return msg
+
     @override
     def get_suggestion(self) -> str:
         return "Ensure the file exists or is produced by another stage"
+
+    @override
+    def __reduce__(self) -> tuple[type, tuple[str, str, list[str]]]:
+        return (self.__class__, (self._stage, self._dep, self._available))
 
 
 class StageNotFoundError(DAGError):
     """Raised when a requested stage doesn't exist."""
 
+    _unknown: list[str]
+    _available: list[str]
+
+    def __init__(
+        self,
+        unknown_stages: list[str],
+        available_stages: list[str] | None = None,
+    ) -> None:
+        self._unknown = unknown_stages
+        self._available = available_stages or []
+        super().__init__(f"Unknown stage(s): {', '.join(unknown_stages)}")
+
+    @override
+    def format_user_message(self) -> str:
+        msg = str(self)
+        if self._available:
+            # Limit to 3 suggestions to avoid overwhelming output
+            suggestions = [
+                f"'{u}' -> '{m}'"
+                for u in self._unknown[:3]
+                if (m := _fuzzy_suggest(u, self._available))
+            ]
+            if suggestions:
+                msg += f"\n  Did you mean: {', '.join(suggestions)}?"
+        return msg
+
     @override
     def get_suggestion(self) -> str:
         return "Run 'pivot list' to see available stages"
+
+    @override
+    def __reduce__(self) -> tuple[type, tuple[list[str], list[str]]]:
+        return (self.__class__, (self._unknown, self._available))
 
 
 class StageAlreadyRunningError(PivotError):
