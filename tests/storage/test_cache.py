@@ -1,16 +1,50 @@
 import mmap
+import multiprocessing
 import os
 import pathlib
 import stat
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import pytest
 
 from pivot.storage import cache, state
 
+
+def _helper_assert_no_temp_dirs(
+    parent: pathlib.Path,
+    *,
+    allow_lock_files: bool = True,
+) -> None:
+    """Assert no restore/backup temp directories exist (lock files allowed by default)."""
+    unexpected = list[pathlib.Path]()
+    for p in parent.iterdir():
+        # Check lock files first (lock prefix is a superset of temp prefix)
+        if p.name.startswith(cache._RESTORE_LOCK_PREFIX):
+            if not allow_lock_files:
+                unexpected.append(p)
+            continue
+        # Check for temp/backup artifacts
+        if p.name.startswith(cache._RESTORE_TEMP_PREFIX) or p.name.startswith(
+            cache._BACKUP_TEMP_PREFIX
+        ):
+            unexpected.append(p)
+    assert len(unexpected) == 0, f"Found unexpected temp dirs: {unexpected}"
+
+
 if TYPE_CHECKING:
+    from collections.abc import Generator
+    from multiprocessing.managers import SyncManager
+
     from pivot.types import DirHash, FileHash
+
+
+@pytest.fixture
+def mp_manager() -> "Generator[SyncManager]":
+    """Provide a multiprocessing Manager with automatic cleanup."""
+    manager = multiprocessing.Manager()
+    yield manager
+    manager.shutdown()
 
 
 # === Hash File Tests ===
@@ -445,17 +479,7 @@ def test_restore_directory_atomic_no_temp_dirs_on_success(tmp_path: pathlib.Path
 
     assert restored is True
     assert (test_dir / "file.txt").read_text() == "content"
-    # No temp directories left behind (lock files are expected and cleaned up by age)
-    temp_dirs = [
-        p
-        for p in tmp_path.iterdir()
-        if (
-            p.name.startswith(cache._RESTORE_TEMP_PREFIX)
-            or p.name.startswith(cache._BACKUP_TEMP_PREFIX)
-        )
-        and not p.name.startswith(cache._RESTORE_LOCK_PREFIX)
-    ]
-    assert len(temp_dirs) == 0
+    _helper_assert_no_temp_dirs(tmp_path)
 
 
 def test_restore_directory_atomic_cleans_up_on_cache_miss(
@@ -478,14 +502,7 @@ def test_restore_directory_atomic_cleans_up_on_cache_miss(
 
     assert result is False
     assert not target.exists()
-    # No temp directories left behind (validation happens before temp creation)
-    temp_dirs = [
-        p
-        for p in tmp_path.iterdir()
-        if p.name.startswith(cache._RESTORE_TEMP_PREFIX)
-        or p.name.startswith(cache._BACKUP_TEMP_PREFIX)
-    ]
-    assert len(temp_dirs) == 0
+    _helper_assert_no_temp_dirs(tmp_path, allow_lock_files=False)
 
 
 def test_restore_directory_atomic_cleans_up_on_exception(
@@ -514,17 +531,7 @@ def test_restore_directory_atomic_cleans_up_on_exception(
         )
 
     assert not test_dir.exists()
-    # No temp directories left behind (lock files are expected and cleaned up by age)
-    temp_dirs = [
-        p
-        for p in tmp_path.iterdir()
-        if (
-            p.name.startswith(cache._RESTORE_TEMP_PREFIX)
-            or p.name.startswith(cache._BACKUP_TEMP_PREFIX)
-        )
-        and not p.name.startswith(cache._RESTORE_LOCK_PREFIX)
-    ]
-    assert len(temp_dirs) == 0
+    _helper_assert_no_temp_dirs(tmp_path)
 
 
 def test_restore_directory_preserves_original_on_rename_failure(
@@ -645,6 +652,101 @@ def test_cleanup_skips_symlinks_via_is_dir(tmp_path: pathlib.Path) -> None:
     assert (real_dir / "important.txt").exists()
     # Cleanup
     symlink.unlink()
+
+
+def test_get_lock_filename_short_name_passthrough() -> None:
+    """Short names are passed through unchanged."""
+    result = cache._get_lock_filename("mydir")
+    assert result == f"{cache._RESTORE_LOCK_PREFIX}mydir"
+
+
+def test_get_lock_filename_long_name_hashed() -> None:
+    """Long names are hashed to fit filesystem limit."""
+    long_name = "a" * 300  # Exceeds 255 - prefix length
+    result = cache._get_lock_filename(long_name)
+
+    assert result.startswith(cache._RESTORE_LOCK_PREFIX)
+    assert len(result) <= 255, "Lock filename must fit filesystem limit"
+    # Hash portion should be 32 hex chars
+    hash_portion = result[len(cache._RESTORE_LOCK_PREFIX) :]
+    assert len(hash_portion) == 32
+    assert all(c in "0123456789abcdef" for c in hash_portion)
+
+
+def test_get_lock_filename_boundary() -> None:
+    """Names exactly at the boundary are not hashed."""
+    max_name_len = 255 - len(cache._RESTORE_LOCK_PREFIX)
+    boundary_name = "x" * max_name_len
+
+    result = cache._get_lock_filename(boundary_name)
+
+    assert result == f"{cache._RESTORE_LOCK_PREFIX}{boundary_name}"
+    assert len(result) == 255
+
+
+def test_get_lock_filename_one_over_boundary() -> None:
+    """Names one char over the boundary are hashed."""
+    max_name_len = 255 - len(cache._RESTORE_LOCK_PREFIX)
+    over_boundary_name = "x" * (max_name_len + 1)
+
+    result = cache._get_lock_filename(over_boundary_name)
+
+    assert len(result) < 255, "Hashed result should be shorter than limit"
+    hash_portion = result[len(cache._RESTORE_LOCK_PREFIX) :]
+    assert len(hash_portion) == 32
+
+
+def _restore_worker(
+    test_dir: pathlib.Path,
+    output_hash: "DirHash",
+    cache_dir: pathlib.Path,
+    result_queue: "multiprocessing.Queue[tuple[str, str | bool]]",
+) -> None:
+    """Worker function for concurrent restore test (must be module-level for pickling)."""
+    try:
+        result = cache.restore_from_cache(
+            test_dir, output_hash, cache_dir, checkout_mode=cache.CheckoutMode.HARDLINK
+        )
+        result_queue.put(("success", result))
+    except Exception as e:
+        result_queue.put(("error", str(e)))
+
+
+def test_concurrent_restore_uses_locking(
+    tmp_path: pathlib.Path,
+    mp_manager: "SyncManager",
+) -> None:
+    """Concurrent restores to same path are serialized by lock."""
+    test_dir = tmp_path / "mydir"
+    test_dir.mkdir()
+    (test_dir / "file.txt").write_text("content")
+    cache_dir = tmp_path / "cache"
+
+    output_hash = cache.save_to_cache(
+        test_dir, cache_dir, checkout_mode=cache.CheckoutMode.HARDLINK
+    )
+    cache.remove_output(test_dir)
+
+    # Use Manager().Queue() for cross-process communication (cast via object for type safety)
+    result_queue = cast(
+        "multiprocessing.Queue[tuple[str, str | bool]]",
+        cast("object", mp_manager.Queue()),
+    )
+    p1 = multiprocessing.Process(
+        target=_restore_worker, args=(test_dir, output_hash, cache_dir, result_queue)
+    )
+    p2 = multiprocessing.Process(
+        target=_restore_worker, args=(test_dir, output_hash, cache_dir, result_queue)
+    )
+    p1.start()
+    p2.start()
+    p1.join()
+    p2.join()
+
+    # Both should succeed (second waits for first due to lock)
+    results = [result_queue.get(timeout=60), result_queue.get(timeout=60)]
+    assert all(r[0] == "success" for r in results), f"Got errors: {results}"
+    assert (test_dir / "file.txt").read_text() == "content"
 
 
 # === Remove Output Tests ===
