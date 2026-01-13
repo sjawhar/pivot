@@ -1,0 +1,28 @@
+stages:
+  preprocess:
+    cmd: python src/preprocess.py
+    wdir: src
+    deps:
+      - data/raw.csv
+    outs:
+      - data/clean.csv:
+          cache: false
+
+  train:
+    cmd: python train.py --epochs 100
+    deps:
+      - data/clean.csv
+    outs:
+      - models/model.pkl
+    metrics:
+      - metrics/train_metrics.json
+    plots:
+      - plots/loss_curve.csv
+
+  frozen_stage:
+    cmd: python generate_report.py
+    frozen: true
+    deps:
+      - models/model.pkl
+    outs:
+      - reports/report.html

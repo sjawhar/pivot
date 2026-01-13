@@ -1,0 +1,13 @@
+stages:
+  process:
+    foreach:
+      - train
+      - test
+      - validation
+    do:
+      cmd: python process.py data/${item}.csv
+      deps:
+        - data/${item}.csv
+        - src/process.py
+      outs:
+        - processed/${item}.csv
