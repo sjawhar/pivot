@@ -50,7 +50,7 @@ class DVCLockStage(TypedDict, total=False):
     cmd: str
     deps: list[dict[str, Any]]
     outs: list[dict[str, Any]]
-    params: dict[str, dict[str, Any]]
+    params: dict[str, dict[str, Any] | None]  # Values can be null in YAML
 
 
 class DVCLock(TypedDict, total=False):
@@ -379,7 +379,7 @@ def _convert_foreach_stage(
     stages = dict[str, PivotStageConfig]()
     params_count = 0
 
-    # foreach is guaranteed to exist by caller check (line 257: if "foreach" in dvc_stage)
+    # foreach is guaranteed to exist by caller check (line 258: if "foreach" in dvc_stage)
     foreach = dvc_stage["foreach"]  # pyright: ignore[reportTypedDictNotRequiredAccess]
     do_stage = dvc_stage["do"] if "do" in dvc_stage else None
 
@@ -597,7 +597,7 @@ def _resolve_params(
             lock_stage = dvc_lock_stages[stage_name]
             if "params" in lock_stage:
                 for file_params in lock_stage["params"].values():
-                    if isinstance(file_params, dict):  # pyright: ignore[reportUnnecessaryIsInstance] - runtime check
+                    if isinstance(file_params, dict):
                         lock_params.update(file_params)
 
     for param in dvc_params:
