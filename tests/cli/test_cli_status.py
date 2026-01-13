@@ -5,11 +5,14 @@ import pathlib
 from typing import TYPE_CHECKING
 
 from pivot import cli, executor
+from pivot import status as status_mod
 from pivot.registry import REGISTRY
 from pivot.storage import cache, track
+from pivot.types import RemoteSyncInfo
 
 if TYPE_CHECKING:
     import click.testing
+    from pytest_mock import MockerFixture
 
 # =============================================================================
 # Help and Basic Tests
@@ -439,3 +442,90 @@ def test_status_quiet_exits_1_when_modified(
         # Stage should now be stale due to modified input
         assert result.exit_code == 1, "Should exit 1 when files are modified"
         assert result.output.strip() == "", "Quiet mode should suppress output"
+
+
+# =============================================================================
+# Remote Status Tests
+# =============================================================================
+
+
+def test_status_remote_with_configured_remote(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, mocker: MockerFixture
+) -> None:
+    """--remote shows sync status when remote is configured."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+
+        # Mock the remote status function
+        mock_remote_status = RemoteSyncInfo(
+            name="default",
+            url="s3://mybucket/cache",
+            push_count=5,
+            pull_count=3,
+        )
+        mocker.patch.object(
+            status_mod, "get_remote_status", autospec=True, return_value=mock_remote_status
+        )
+
+        result = runner.invoke(cli.cli, ["status", "--remote"])
+
+        assert result.exit_code == 0
+        assert "Remote Status" in result.output
+        assert "5 to push" in result.output
+        assert "3 to pull" in result.output
+
+
+def test_status_remote_only_with_remote(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, mocker: MockerFixture
+) -> None:
+    """--remote-only shows only remote sync counts."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        pathlib.Path("input.txt").write_text("data")
+
+        REGISTRY.register(_helper_process, name="process", deps=["input.txt"], outs=["output.txt"])
+
+        mock_remote_status = RemoteSyncInfo(
+            name="myremote",
+            url="s3://bucket/path",
+            push_count=10,
+            pull_count=2,
+        )
+        mocker.patch.object(
+            status_mod, "get_remote_status", autospec=True, return_value=mock_remote_status
+        )
+
+        result = runner.invoke(cli.cli, ["status", "--remote-only"])
+
+        assert result.exit_code == 0
+        assert "Remote Status" in result.output
+        # Should NOT show pipeline or tracked files sections
+        assert "Pipeline Status" not in result.output
+        assert "Tracked Files" not in result.output
+
+
+def test_status_json_with_remote(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, mocker: MockerFixture
+) -> None:
+    """JSON output includes remote status when --remote is used."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+
+        mock_remote_status = RemoteSyncInfo(
+            name="default",
+            url="s3://bucket/cache",
+            push_count=7,
+            pull_count=4,
+        )
+        mocker.patch.object(
+            status_mod, "get_remote_status", autospec=True, return_value=mock_remote_status
+        )
+
+        result = runner.invoke(cli.cli, ["status", "--json", "--remote"])
+
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert "remote" in data
+        assert data["remote"]["name"] == "default"
+        assert data["remote"]["push_count"] == 7
+        assert data["remote"]["pull_count"] == 4
