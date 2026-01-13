@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import enum
-from typing import Any, Literal, NotRequired, TypedDict, TypeGuard
+from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypedDict, TypeGuard
+
+if TYPE_CHECKING:
+    from pivot.run_history import RunCacheEntry
 
 # =============================================================================
 # Execution Types
@@ -56,6 +59,18 @@ class OnError(enum.StrEnum):
     IGNORE = "ignore"
 
 
+class DeferredWrites(TypedDict, total=False):
+    """Deferred StateDB writes from worker for coordinator to apply.
+
+    Uses total=False so keys are only present when there's data to write.
+    Stage name and output paths are passed separately by coordinator.
+    """
+
+    dep_generations: dict[str, int]  # {dep_path: generation}
+    run_cache_input_hash: str
+    run_cache_entry: RunCacheEntry
+
+
 class StageResult(TypedDict):
     """Result from executing a single stage."""
 
@@ -63,6 +78,7 @@ class StageResult(TypedDict):
     reason: str
     output_lines: list[tuple[str, bool]]
     metrics: NotRequired[list[tuple[str, float]]]  # (name, duration_ms) for cross-process
+    deferred_writes: NotRequired[DeferredWrites]
 
 
 # =============================================================================

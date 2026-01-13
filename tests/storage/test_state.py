@@ -1,10 +1,17 @@
+from __future__ import annotations
+
 import os
 import pathlib
 import time
+from typing import TYPE_CHECKING
 
 import pytest
 
+from pivot import run_history
 from pivot.storage import state
+
+if TYPE_CHECKING:
+    from pivot.types import DeferredWrites
 
 
 def test_state_cache_hit(tmp_path: pathlib.Path) -> None:
@@ -629,3 +636,268 @@ def test_remote_hashes_persistence(tmp_path: pathlib.Path) -> None:
 
     with state.StateDB(db_path) as db:
         assert db.remote_hash_exists("origin", "persistent_hash")
+
+
+# -----------------------------------------------------------------------------
+# Readonly mode tests
+# -----------------------------------------------------------------------------
+
+
+def test_readonly_allows_reads(tmp_path: pathlib.Path) -> None:
+    """Readonly mode allows all read operations."""
+    db_path = tmp_path / "state.db"
+    test_file = tmp_path / "file.txt"
+    test_file.write_text("content")
+    file_stat = test_file.stat()
+
+    # Create data in write mode
+    with state.StateDB(db_path) as db:
+        db.save(test_file, file_stat, "hash123")
+        db.increment_generation(test_file)
+        db.record_dep_generations("stage", {"/dep.csv": 1})
+        db.remote_hashes_add("origin", ["remote_hash"])
+
+    # Verify reads work in readonly mode
+    with state.StateDB(db_path, readonly=True) as db:
+        assert db.get(test_file, file_stat) == "hash123"
+        assert db.get_generation(test_file) == 1
+        assert db.get_dep_generations("stage") == {"/dep.csv": 1}
+        assert db.remote_hash_exists("origin", "remote_hash")
+
+
+def test_readonly_blocks_save(tmp_path: pathlib.Path) -> None:
+    """Readonly mode blocks save operation."""
+    db_path = tmp_path / "state.db"
+    test_file = tmp_path / "file.txt"
+    test_file.write_text("content")
+    file_stat = test_file.stat()
+
+    with state.StateDB(db_path) as db:
+        db.save(test_file, file_stat, "initial")
+
+    with (
+        state.StateDB(db_path, readonly=True) as db,
+        pytest.raises(RuntimeError, match="readonly StateDB"),
+    ):
+        db.save(test_file, file_stat, "new_hash")
+
+
+def test_readonly_blocks_save_many(tmp_path: pathlib.Path) -> None:
+    """Readonly mode blocks save_many operation."""
+    db_path = tmp_path / "state.db"
+    test_file = tmp_path / "file.txt"
+    test_file.write_text("content")
+    file_stat = test_file.stat()
+
+    with state.StateDB(db_path) as db:
+        pass  # Just create
+
+    with (
+        state.StateDB(db_path, readonly=True) as db,
+        pytest.raises(RuntimeError, match="readonly StateDB"),
+    ):
+        db.save_many([(test_file, file_stat, "hash")])
+
+
+def test_readonly_blocks_increment_generation(tmp_path: pathlib.Path) -> None:
+    """Readonly mode blocks increment_generation operation."""
+    db_path = tmp_path / "state.db"
+    test_file = tmp_path / "output.txt"
+
+    with state.StateDB(db_path) as db:
+        pass  # Just create
+
+    with (
+        state.StateDB(db_path, readonly=True) as db,
+        pytest.raises(RuntimeError, match="readonly StateDB"),
+    ):
+        db.increment_generation(test_file)
+
+
+def test_readonly_blocks_record_dep_generations(tmp_path: pathlib.Path) -> None:
+    """Readonly mode blocks record_dep_generations operation."""
+    db_path = tmp_path / "state.db"
+
+    with state.StateDB(db_path) as db:
+        pass  # Just create
+
+    with (
+        state.StateDB(db_path, readonly=True) as db,
+        pytest.raises(RuntimeError, match="readonly StateDB"),
+    ):
+        db.record_dep_generations("stage", {"/dep.csv": 1})
+
+
+def test_readonly_blocks_remote_hashes_add(tmp_path: pathlib.Path) -> None:
+    """Readonly mode blocks remote_hashes_add operation."""
+    db_path = tmp_path / "state.db"
+
+    with state.StateDB(db_path) as db:
+        pass  # Just create
+
+    with (
+        state.StateDB(db_path, readonly=True) as db,
+        pytest.raises(RuntimeError, match="readonly StateDB"),
+    ):
+        db.remote_hashes_add("origin", ["hash1"])
+
+
+def test_readonly_blocks_remote_hashes_remove(tmp_path: pathlib.Path) -> None:
+    """Readonly mode blocks remote_hashes_remove operation."""
+    db_path = tmp_path / "state.db"
+
+    with state.StateDB(db_path) as db:
+        db.remote_hashes_add("origin", ["hash1"])
+
+    with (
+        state.StateDB(db_path, readonly=True) as db,
+        pytest.raises(RuntimeError, match="readonly StateDB"),
+    ):
+        db.remote_hashes_remove("origin", ["hash1"])
+
+
+def test_readonly_blocks_remote_index_clear(tmp_path: pathlib.Path) -> None:
+    """Readonly mode blocks remote_index_clear operation."""
+    db_path = tmp_path / "state.db"
+
+    with state.StateDB(db_path) as db:
+        db.remote_hashes_add("origin", ["hash1"])
+
+    with (
+        state.StateDB(db_path, readonly=True) as db,
+        pytest.raises(RuntimeError, match="readonly StateDB"),
+    ):
+        db.remote_index_clear("origin")
+
+
+# -----------------------------------------------------------------------------
+# apply_deferred_writes tests
+# -----------------------------------------------------------------------------
+
+
+def test_apply_deferred_writes_dep_generations(tmp_path: pathlib.Path) -> None:
+    """apply_deferred_writes records dependency generations."""
+    db_path = tmp_path / "state.db"
+    deferred: DeferredWrites = {"dep_generations": {"/path/dep1.csv": 5, "/path/dep2.csv": 3}}
+
+    with state.StateDB(db_path) as db:
+        db.apply_deferred_writes("my_stage", [], deferred)
+        result = db.get_dep_generations("my_stage")
+
+    assert result == {"/path/dep1.csv": 5, "/path/dep2.csv": 3}
+
+
+def test_apply_deferred_writes_output_generations(tmp_path: pathlib.Path) -> None:
+    """apply_deferred_writes increments output generations."""
+    db_path = tmp_path / "state.db"
+    output1 = tmp_path / "output1.csv"
+    output2 = tmp_path / "output2.csv"
+    deferred: DeferredWrites = {}
+
+    with state.StateDB(db_path) as db:
+        # First apply - outputs should be at generation 1
+        db.apply_deferred_writes("stage", [str(output1), str(output2)], deferred)
+        assert db.get_generation(output1) == 1
+        assert db.get_generation(output2) == 1
+
+        # Second apply - outputs should increment to 2
+        db.apply_deferred_writes("stage", [str(output1), str(output2)], deferred)
+        assert db.get_generation(output1) == 2
+        assert db.get_generation(output2) == 2
+
+
+def test_apply_deferred_writes_run_cache(tmp_path: pathlib.Path) -> None:
+    """apply_deferred_writes writes run cache entry."""
+    db_path = tmp_path / "state.db"
+    run_cache_entry = run_history.RunCacheEntry(
+        run_id="test_run_123",
+        output_hashes=[run_history.OutputHashEntry(path="/output.csv", hash="abc123")],
+    )
+    deferred: DeferredWrites = {
+        "run_cache_input_hash": "input_hash_xyz",
+        "run_cache_entry": run_cache_entry,
+    }
+
+    with state.StateDB(db_path) as db:
+        db.apply_deferred_writes("my_stage", [], deferred)
+        result = db.lookup_run_cache("my_stage", "input_hash_xyz")
+
+    assert result is not None
+    assert result["run_id"] == "test_run_123"
+    assert len(result["output_hashes"]) == 1
+    assert result["output_hashes"][0]["hash"] == "abc123"
+
+
+def test_apply_deferred_writes_all_fields(tmp_path: pathlib.Path) -> None:
+    """apply_deferred_writes handles all fields atomically."""
+    db_path = tmp_path / "state.db"
+    output_path = tmp_path / "output.csv"
+    run_cache_entry = run_history.RunCacheEntry(
+        run_id="run_456",
+        output_hashes=[run_history.OutputHashEntry(path=str(output_path), hash="def456")],
+    )
+    deferred: DeferredWrites = {
+        "dep_generations": {"/dep.csv": 10},
+        "run_cache_input_hash": "input_abc",
+        "run_cache_entry": run_cache_entry,
+    }
+
+    with state.StateDB(db_path) as db:
+        db.apply_deferred_writes("stage", [str(output_path)], deferred)
+
+        # Verify all writes applied
+        assert db.get_dep_generations("stage") == {"/dep.csv": 10}
+        assert db.get_generation(output_path) == 1
+        result = db.lookup_run_cache("stage", "input_abc")
+        assert result is not None
+        assert result["run_id"] == "run_456"
+
+
+def test_apply_deferred_writes_empty(tmp_path: pathlib.Path) -> None:
+    """apply_deferred_writes handles empty deferred dict."""
+    db_path = tmp_path / "state.db"
+    deferred: DeferredWrites = {}
+
+    with state.StateDB(db_path) as db:
+        # Should not raise
+        db.apply_deferred_writes("stage", [], deferred)
+
+
+def test_apply_deferred_writes_readonly_blocked(tmp_path: pathlib.Path) -> None:
+    """apply_deferred_writes blocked in readonly mode."""
+    db_path = tmp_path / "state.db"
+
+    with state.StateDB(db_path) as db:
+        pass  # Create database
+
+    deferred: DeferredWrites = {"dep_generations": {"/dep.csv": 1}}
+
+    with (
+        state.StateDB(db_path, readonly=True) as db,
+        pytest.raises(RuntimeError, match="readonly StateDB"),
+    ):
+        db.apply_deferred_writes("stage", [], deferred)
+
+
+def test_apply_deferred_writes_path_too_long_dep(tmp_path: pathlib.Path) -> None:
+    """apply_deferred_writes raises PathTooLongError for long dep paths."""
+    db_path = tmp_path / "state.db"
+    long_path = "/" + "d" * 600  # Exceeds 511 byte limit
+    deferred: DeferredWrites = {"dep_generations": {long_path: 1}}
+
+    with state.StateDB(db_path) as db, pytest.raises(state.PathTooLongError):
+        db.apply_deferred_writes("stage", [], deferred)
+
+
+def test_apply_deferred_writes_path_too_long_output(tmp_path: pathlib.Path) -> None:
+    """apply_deferred_writes raises PathTooLongError for long output paths."""
+    db_path = tmp_path / "state.db"
+    # Create a deeply nested path that exceeds 511 bytes
+    nested = tmp_path
+    for i in range(12):
+        nested = nested / ("o" * 50 + str(i))
+    long_output = str(nested / "output.csv")
+    deferred: DeferredWrites = {}
+
+    with state.StateDB(db_path) as db, pytest.raises(state.PathTooLongError):
+        db.apply_deferred_writes("stage", [long_output], deferred)

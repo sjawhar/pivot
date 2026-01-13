@@ -632,6 +632,13 @@ def test_run_cache_restores_directory_output(
     assert result1["status"] == StageStatus.RAN
     assert execution_count[0] == 1
 
+    # Apply deferred writes (simulating what coordinator does)
+    if "deferred_writes" in result1:
+        state_db_path = worker_env.parent / "state.db"
+        output_paths = [out.path for out in stage_info["outs"]]
+        with state.StateDB(state_db_path) as db:
+            db.apply_deferred_writes("test_stage", output_paths, result1["deferred_writes"])
+
     # Verify directory output exists
     output_dir = tmp_path / "output_dir"
     assert output_dir.is_dir()

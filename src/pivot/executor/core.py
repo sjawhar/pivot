@@ -392,17 +392,19 @@ def _execute_greedy(
     # Type narrowing: output_queue is guaranteed to be non-None after the block above
     assert output_queue is not None
 
+    state_db_path = cache_dir.parent / "state.db"
     output_thread: threading.Thread | None = None
-    if con or tui_queue:
-        output_thread = threading.Thread(
-            target=_output_queue_reader,
-            args=(output_queue, con, tui_queue),
-            daemon=True,
-        )
-        output_thread.start()
 
     try:
-        with executor:
+        # Start output thread inside try block to ensure Manager cleanup on failure
+        if con or tui_queue:
+            output_thread = threading.Thread(
+                target=_output_queue_reader,
+                args=(output_queue, con, tui_queue),
+                daemon=True,
+            )
+            output_thread.start()
+        with executor, state_mod.StateDB(state_db_path) as state_db:
             _start_ready_stages(
                 stage_states=stage_states,
                 executor=executor,
@@ -515,6 +517,10 @@ def _execute_greedy(
                             state.status = StageStatus.SKIPPED
                         else:
                             state.status = StageStatus.COMPLETED
+                            # Apply deferred writes from worker (only in commit mode)
+                            if not no_commit:
+                                output_paths = [out.path for out in state.info["outs"]]
+                                _apply_deferred_writes(stage_name, output_paths, result, state_db)
 
                     except concurrent.futures.BrokenExecutor as e:
                         _mark_stage_failed(state, f"Worker died: {e}", stage_states, error_mode)
@@ -808,6 +814,18 @@ def _prepare_worker_info(
         no_commit=no_commit,
         no_cache=no_cache,
     )
+
+
+def _apply_deferred_writes(
+    stage_name: str,
+    output_paths: list[str],
+    result: StageResult,
+    state_db: state_mod.StateDB,
+) -> None:
+    """Apply deferred StateDB writes from worker result."""
+    if "deferred_writes" not in result:
+        return
+    state_db.apply_deferred_writes(stage_name, output_paths, result["deferred_writes"])
 
 
 def _mark_stage_failed(
