@@ -11,7 +11,7 @@ from pivot.cli import errors as cli_errors
 
 def test_handle_pivot_error_formats_message() -> None:
     """handle_pivot_error creates ClickException with formatted message."""
-    error = exceptions.StageNotFoundError("Unknown stage(s): foo")
+    error = exceptions.StageNotFoundError(["foo"])
 
     result = cli_errors.handle_pivot_error(error)
 
@@ -21,7 +21,7 @@ def test_handle_pivot_error_formats_message() -> None:
 
 def test_handle_pivot_error_includes_suggestion() -> None:
     """handle_pivot_error includes suggestion in message."""
-    error = exceptions.StageNotFoundError("Unknown stage(s): foo")
+    error = exceptions.StageNotFoundError(["foo"])
 
     result = cli_errors.handle_pivot_error(error)
 
@@ -45,21 +45,25 @@ def test_handle_pivot_error_without_suggestion() -> None:
 # =============================================================================
 
 
+def test_stage_not_found_error_suggestion() -> None:
+    """StageNotFoundError provides suggestion."""
+    error = exceptions.StageNotFoundError(["unknown"])
+    suggestion = error.get_suggestion()
+    assert suggestion is not None
+    assert "pivot list" in suggestion
+
+
+def test_dependency_not_found_error_suggestion() -> None:
+    """DependencyNotFoundError provides suggestion."""
+    error = exceptions.DependencyNotFoundError(stage="test", dep="missing.csv")
+    suggestion = error.get_suggestion()
+    assert suggestion is not None
+    assert "file exists" in suggestion or "produced by another stage" in suggestion
+
+
 @pytest.mark.parametrize(
     ("exception_class", "message", "expected_substrings"),
     [
-        pytest.param(
-            exceptions.StageNotFoundError,
-            "Unknown stage",
-            ["Run 'pivot list' to see available stages"],
-            id="stage_not_found",
-        ),
-        pytest.param(
-            exceptions.DependencyNotFoundError,
-            "Missing dep",
-            ["file exists", "produced by another stage"],
-            id="dependency_not_found",
-        ),
         pytest.param(
             exceptions.CyclicGraphError,
             "Cycle detected",
@@ -126,9 +130,9 @@ def test_validation_error_no_suggestion() -> None:
 
 def test_format_user_message_returns_str() -> None:
     """format_user_message returns string representation of error."""
-    error = exceptions.StageNotFoundError("Unknown stage(s): foo, bar")
+    error = exceptions.StageNotFoundError(["foo", "bar"])
 
-    assert error.format_user_message() == "Unknown stage(s): foo, bar"
+    assert "Unknown stage(s): foo, bar" in error.format_user_message()
 
 
 def test_format_user_message_base_error() -> None:
@@ -136,3 +140,110 @@ def test_format_user_message_base_error() -> None:
     error = exceptions.PivotError("Test error message")
 
     assert error.format_user_message() == "Test error message"
+
+
+# =============================================================================
+# Fuzzy Matching Tests
+# =============================================================================
+
+
+def test_stage_not_found_fuzzy_suggestion_single_typo() -> None:
+    """StageNotFoundError suggests similar stage name for typo."""
+    error = exceptions.StageNotFoundError(
+        ["preproces"], available_stages=["preprocess", "train", "evaluate"]
+    )
+
+    message = error.format_user_message()
+
+    assert "Did you mean" in message
+    assert "preprocess" in message
+
+
+def test_stage_not_found_fuzzy_suggestion_multiple_unknowns() -> None:
+    """StageNotFoundError suggests for multiple unknown stages."""
+    error = exceptions.StageNotFoundError(
+        ["preproces", "trian"],
+        available_stages=["preprocess", "train", "evaluate"],
+    )
+
+    message = error.format_user_message()
+
+    assert "Did you mean" in message
+    assert "preprocess" in message
+    assert "train" in message
+
+
+def test_stage_not_found_no_suggestion_when_no_match() -> None:
+    """StageNotFoundError omits 'Did you mean' when no similar stage."""
+    error = exceptions.StageNotFoundError(
+        ["xyz"], available_stages=["preprocess", "train", "evaluate"]
+    )
+
+    message = error.format_user_message()
+
+    assert "Did you mean" not in message
+    assert "Unknown stage(s): xyz" in message
+
+
+def test_stage_not_found_no_suggestion_without_available() -> None:
+    """StageNotFoundError omits 'Did you mean' when no available stages provided."""
+    error = exceptions.StageNotFoundError(["preproces"])
+
+    message = error.format_user_message()
+
+    assert "Did you mean" not in message
+
+
+def test_dependency_not_found_fuzzy_suggestion() -> None:
+    """DependencyNotFoundError suggests similar output path."""
+    error = exceptions.DependencyNotFoundError(
+        stage="train",
+        dep="data/input.scv",
+        available_outputs=["data/input.csv", "data/output.csv"],
+    )
+
+    message = error.format_user_message()
+
+    assert "Did you mean" in message
+    assert "data/input.csv" in message
+
+
+def test_dependency_not_found_no_suggestion_short_dep() -> None:
+    """DependencyNotFoundError skips suggestion for very short paths."""
+    error = exceptions.DependencyNotFoundError(
+        stage="train",
+        dep="ab",
+        available_outputs=["abc", "def"],
+    )
+
+    message = error.format_user_message()
+
+    assert "Did you mean" not in message
+
+
+def test_stage_not_found_pickling() -> None:
+    """StageNotFoundError can be pickled and unpickled."""
+    import pickle
+
+    original = exceptions.StageNotFoundError(
+        ["preproces"], available_stages=["preprocess", "train"]
+    )
+
+    unpickled = pickle.loads(pickle.dumps(original))
+
+    assert str(unpickled) == str(original)
+    assert "Did you mean" in unpickled.format_user_message()
+
+
+def test_dependency_not_found_pickling() -> None:
+    """DependencyNotFoundError can be pickled and unpickled."""
+    import pickle
+
+    original = exceptions.DependencyNotFoundError(
+        stage="train", dep="data/input.scv", available_outputs=["data/input.csv"]
+    )
+
+    unpickled = pickle.loads(pickle.dumps(original))
+
+    assert str(unpickled) == str(original)
+    assert "Did you mean" in unpickled.format_user_message()

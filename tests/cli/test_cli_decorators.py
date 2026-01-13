@@ -41,12 +41,12 @@ def test_pivot_command_handles_pivot_error(runner: CliRunner) -> None:
 
     @cli_decorators.pivot_command()
     def failing_command() -> None:
-        raise exceptions.StageNotFoundError("Unknown stage: foo")
+        raise exceptions.StageNotFoundError(["foo"])
 
     result = runner.invoke(failing_command)
 
     assert result.exit_code != 0
-    assert "Unknown stage: foo" in result.output
+    assert "Unknown stage(s): foo" in result.output
     assert "pivot list" in result.output
 
 
