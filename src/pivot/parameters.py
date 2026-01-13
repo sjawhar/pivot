@@ -8,7 +8,7 @@ import deepmerge
 import pydantic
 import yaml
 
-from pivot import project, yaml_config
+from pivot import exceptions, project, yaml_config
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -34,13 +34,13 @@ def load_params_yaml(path: Path | None = None) -> ParamsOverrides:
     try:
         with open(path) as f:
             data: object = yaml.load(f, Loader=yaml_config.Loader)
-    except (OSError, yaml.YAMLError) as e:
-        logger.warning(f"Failed to load params.yaml: {e}")
-        return {}
+    except yaml.YAMLError as e:
+        raise exceptions.ParamsError(f"Failed to parse {path}: {e}") from e
+    except OSError as e:
+        raise exceptions.ParamsError(f"Failed to read {path}: {e}") from e
 
     if not isinstance(data, dict):
-        logger.warning(f"params.yaml root must be a dict, got {type(data).__name__}")
-        return {}
+        raise exceptions.ParamsError(f"params.yaml root must be a dict, got {type(data).__name__}")
 
     # YAML dict has unknown key/value types from parsing arbitrary user input
     typed_data = cast("dict[Any, Any]", data)

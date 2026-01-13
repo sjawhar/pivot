@@ -1129,7 +1129,7 @@ def test_executor_output_hashes_in_lock_file(pipeline_dir: pathlib.Path) -> None
 
     executor.run(show_output=False)
 
-    lock_file = pipeline_dir / ".pivot" / "cache" / "stages" / "process.lock"
+    lock_file = pipeline_dir / ".pivot" / "stages" / "process.lock"
     assert lock_file.exists()
 
     # Storage format uses 'outs' list (not 'output_hashes' dict)
@@ -1152,7 +1152,7 @@ def test_executor_lock_file_deterministic_sort(pipeline_dir: pathlib.Path) -> No
 
     executor.run(show_output=False)
 
-    lock_file = pipeline_dir / ".pivot" / "cache" / "stages" / "process.lock"
+    lock_file = pipeline_dir / ".pivot" / "stages" / "process.lock"
     lock_data = yaml.safe_load(lock_file.read_text())
 
     # Storage format uses 'deps' and 'outs' lists (sorted by path)
@@ -1187,8 +1187,7 @@ def test_executor_directory_output_cached(pipeline_dir: pathlib.Path) -> None:
 def test_executor_lock_file_missing_outs_triggers_rerun(pipeline_dir: pathlib.Path) -> None:
     """Lock file without outs section triggers re-execution."""
     (pipeline_dir / "input.txt").write_text("data")
-    cache_dir = pipeline_dir / ".pivot" / "cache"
-    stages_dir = cache_dir / "stages"
+    stages_dir = pipeline_dir / ".pivot" / "stages"
     stages_dir.mkdir(parents=True)
 
     # Create lock file without outs (incomplete)

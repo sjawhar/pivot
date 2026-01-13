@@ -38,7 +38,7 @@ def commit_pending(cache_dir: pathlib.Path | None = None) -> list[str]:
                 continue
 
             # Write to production lock (without dep_generations - that's internal to pending)
-            production_lock = lock.StageLock(stage_name, cache_dir)
+            production_lock = lock.StageLock(stage_name, lock.get_stages_dir(cache_dir))
             production_lock.write(pending_data)
 
             # Record dependency generations from execution time (not commit time!)

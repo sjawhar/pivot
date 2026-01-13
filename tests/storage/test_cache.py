@@ -223,8 +223,8 @@ def test_hash_directory_marks_executable(tmp_path: pathlib.Path) -> None:
     assert manifest_dict["script.sh"]["isexec"] is True
 
 
-def test_hash_directory_skips_unreadable_subdirs(tmp_path: pathlib.Path) -> None:
-    """Unreadable subdirectories are skipped rather than causing failure."""
+def test_hash_directory_raises_on_unreadable_subdirs(tmp_path: pathlib.Path) -> None:
+    """Unreadable subdirectories raise PermissionError (fail-fast, no partial hashes)."""
     test_dir = tmp_path / "mydir"
     test_dir.mkdir()
     (test_dir / "readable.txt").write_text("content")
@@ -234,10 +234,8 @@ def test_hash_directory_skips_unreadable_subdirs(tmp_path: pathlib.Path) -> None
     unreadable.chmod(0o000)
 
     try:
-        _, manifest = cache.hash_directory(test_dir)
-        relpaths = [e["relpath"] for e in manifest]
-        assert "readable.txt" in relpaths
-        assert "unreadable/hidden.txt" not in relpaths
+        with pytest.raises(PermissionError):
+            cache.hash_directory(test_dir)
     finally:
         unreadable.chmod(0o755)
 

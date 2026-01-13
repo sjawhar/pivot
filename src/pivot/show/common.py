@@ -24,12 +24,12 @@ def read_lock_files_from_head(
     if not stage_names:
         return {}
 
-    lock_paths = [f".pivot/cache/stages/{name}.lock" for name in stage_names]
+    lock_paths = [f"{lock.STAGES_REL_PATH}/{name}.lock" for name in stage_names]
     lock_contents = git.read_files_from_head(lock_paths)
 
     result = dict[str, StorageLockData | None]()
     for stage_name in stage_names:
-        lock_path = f".pivot/cache/stages/{stage_name}.lock"
+        lock_path = f"{lock.STAGES_REL_PATH}/{stage_name}.lock"
         content = lock_contents.get(lock_path)
         if content is None:
             result[stage_name] = None

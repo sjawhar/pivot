@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from pivot import registry
+from pivot import exceptions, registry
 from pivot.pipeline import yaml as pipeline_config
 
 if TYPE_CHECKING:
@@ -1497,8 +1497,8 @@ stages:
     assert any("output/result.json" in out for out in info["outs_paths"])
 
 
-def test_stage_def_yaml_deps_override(stage_def_pipeline: pathlib.Path) -> None:
-    """Explicit YAML deps completely replace StageDef deps."""
+def test_stage_def_yaml_deps_override_raises(stage_def_pipeline: pathlib.Path) -> None:
+    """Explicit YAML deps should raise ValidationError for StageDef stages."""
     pipeline_file = stage_def_pipeline / "pivot.yaml"
     pipeline_file.write_text(
         """\
@@ -1510,18 +1510,12 @@ stages:
 """
     )
 
-    pipeline_config.register_from_pipeline_file(pipeline_file)
-
-    info = registry.REGISTRY.get("process")
-    deps_str = " ".join(info["deps"])
-    # Should use YAML deps, not StageDef deps
-    assert "data/override.csv" in deps_str
-    # Should NOT have StageDef deps (complete replacement)
-    assert "data/input.csv" not in deps_str
+    with pytest.raises(exceptions.ValidationError, match="cannot override deps"):
+        pipeline_config.register_from_pipeline_file(pipeline_file)
 
 
-def test_stage_def_yaml_outs_override(stage_def_pipeline: pathlib.Path) -> None:
-    """Explicit YAML outs completely replace StageDef outs."""
+def test_stage_def_yaml_outs_override_raises(stage_def_pipeline: pathlib.Path) -> None:
+    """Explicit YAML outs should raise ValidationError for StageDef stages."""
     pipeline_file = stage_def_pipeline / "pivot.yaml"
     pipeline_file.write_text(
         """\
@@ -1533,14 +1527,8 @@ stages:
 """
     )
 
-    pipeline_config.register_from_pipeline_file(pipeline_file)
-
-    info = registry.REGISTRY.get("process")
-    outs_str = " ".join(info["outs_paths"])
-    # Should use YAML outs, not StageDef outs
-    assert "output/override.json" in outs_str
-    # Should NOT have StageDef outs (complete replacement)
-    assert "output/result.json" not in outs_str
+    with pytest.raises(exceptions.ValidationError, match="cannot override outs"):
+        pipeline_config.register_from_pipeline_file(pipeline_file)
 
 
 def test_stage_def_params_available(stage_def_pipeline: pathlib.Path) -> None:

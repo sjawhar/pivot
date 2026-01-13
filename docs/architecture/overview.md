@@ -75,10 +75,13 @@ code_manifest:
   func:helper: "def456"
 params:
   learning_rate: 0.01
-dep_hashes:
-  data.csv: "789..."
-output_hashes:
-  model.pkl: "012..."
+deps:
+  - path: data.csv
+    hash: "789abc..."
+outs:
+  - path: model.pkl
+    hash: "012def..."
+dep_generations: {}
 ```
 
 ## Data Flow

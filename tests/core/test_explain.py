@@ -259,7 +259,7 @@ def test_get_stage_explanation_no_lock(tmp_path: Path) -> None:
         deps=[],
         params_instance=None,
         overrides=None,
-        cache_dir=tmp_path,
+        cache_dir=tmp_path / "cache",
     )
 
     assert result == StageExplanation(
@@ -275,7 +275,7 @@ def test_get_stage_explanation_no_lock(tmp_path: Path) -> None:
 
 def test_get_stage_explanation_unchanged(tmp_path: Path) -> None:
     """Returns will_run=False when stage unchanged."""
-    stage_lock = lock.StageLock("unchanged_stage", tmp_path)
+    stage_lock = lock.StageLock("unchanged_stage", tmp_path / "stages")
     stage_lock.write(
         LockData(
             code_manifest={"self:unchanged_stage": "abc123"},
@@ -292,7 +292,7 @@ def test_get_stage_explanation_unchanged(tmp_path: Path) -> None:
         deps=[],
         params_instance=None,
         overrides=None,
-        cache_dir=tmp_path,
+        cache_dir=tmp_path / "cache",
     )
 
     assert result["will_run"] is False
@@ -304,7 +304,7 @@ def test_get_stage_explanation_unchanged(tmp_path: Path) -> None:
 
 def test_get_stage_explanation_code_changed(tmp_path: Path) -> None:
     """Returns detailed code changes when code differs."""
-    stage_lock = lock.StageLock("code_stage", tmp_path)
+    stage_lock = lock.StageLock("code_stage", tmp_path / "stages")
     stage_lock.write(
         LockData(
             code_manifest={"self:code_stage": "old_hash", "func:helper": "helper_old"},
@@ -321,7 +321,7 @@ def test_get_stage_explanation_code_changed(tmp_path: Path) -> None:
         deps=[],
         params_instance=None,
         overrides=None,
-        cache_dir=tmp_path,
+        cache_dir=tmp_path / "cache",
     )
 
     assert result["will_run"] is True
@@ -337,7 +337,7 @@ def test_get_stage_explanation_params_changed(tmp_path: Path) -> None:
     class TrainParams(pydantic.BaseModel):
         learning_rate: float = 0.01
 
-    stage_lock = lock.StageLock("param_stage", tmp_path)
+    stage_lock = lock.StageLock("param_stage", tmp_path / "stages")
     stage_lock.write(
         LockData(
             code_manifest={"self:param_stage": "abc"},
@@ -355,7 +355,7 @@ def test_get_stage_explanation_params_changed(tmp_path: Path) -> None:
         deps=[],
         params_instance=TrainParams(),
         overrides=overrides,
-        cache_dir=tmp_path,
+        cache_dir=tmp_path / "cache",
     )
 
     assert result["will_run"] is True
@@ -374,7 +374,7 @@ def test_get_stage_explanation_deps_changed(tmp_path: Path) -> None:
     data_file.write_text("id,value\n1,10\n")
     normalized_path = str(project.normalize_path(str(data_file)))
 
-    stage_lock = lock.StageLock("dep_stage", tmp_path)
+    stage_lock = lock.StageLock("dep_stage", tmp_path / "stages")
     stage_lock.write(
         LockData(
             code_manifest={"self:dep_stage": "abc"},
@@ -391,7 +391,7 @@ def test_get_stage_explanation_deps_changed(tmp_path: Path) -> None:
         deps=[str(data_file)],
         params_instance=None,
         overrides=None,
-        cache_dir=tmp_path,
+        cache_dir=tmp_path / "cache",
     )
 
     assert result["will_run"] is True
@@ -412,7 +412,7 @@ def test_get_stage_explanation_multiple_changes(tmp_path: Path) -> None:
     data_file.write_text("x,y\n1,2\n")
     normalized_path = str(project.normalize_path(str(data_file)))
 
-    stage_lock = lock.StageLock("multi_stage", tmp_path)
+    stage_lock = lock.StageLock("multi_stage", tmp_path / "stages")
     stage_lock.write(
         LockData(
             code_manifest={"self:multi_stage": "old_code"},
@@ -429,7 +429,7 @@ def test_get_stage_explanation_multiple_changes(tmp_path: Path) -> None:
         deps=[str(data_file)],
         params_instance=Params(),
         overrides=None,
-        cache_dir=tmp_path,
+        cache_dir=tmp_path / "cache",
     )
 
     assert result["will_run"] is True
@@ -440,7 +440,7 @@ def test_get_stage_explanation_multiple_changes(tmp_path: Path) -> None:
 
 def test_get_stage_explanation_missing_deps(tmp_path: Path) -> None:
     """Returns will_run=True with reason when deps are missing."""
-    stage_lock = lock.StageLock("missing_deps_stage", tmp_path)
+    stage_lock = lock.StageLock("missing_deps_stage", tmp_path / "stages")
     stage_lock.write(
         LockData(
             code_manifest={"self:missing_deps_stage": "abc"},
@@ -457,7 +457,7 @@ def test_get_stage_explanation_missing_deps(tmp_path: Path) -> None:
         deps=["nonexistent.csv"],
         params_instance=None,
         overrides=None,
-        cache_dir=tmp_path,
+        cache_dir=tmp_path / "cache",
     )
 
     assert result["will_run"] is True
@@ -479,7 +479,7 @@ def test_get_stage_explanation_invalid_params(
         model_config: ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="forbid")
         learning_rate: float = 0.01
 
-    stage_lock = lock.StageLock("stage", tmp_path)
+    stage_lock = lock.StageLock("stage", tmp_path / "stages")
     stage_lock.write(
         LockData(
             code_manifest={"self:stage": "abc"},
@@ -496,7 +496,7 @@ def test_get_stage_explanation_invalid_params(
         deps=[],
         params_instance=StrictParams(),
         overrides=invalid_params_yaml,
-        cache_dir=tmp_path,
+        cache_dir=tmp_path / "cache",
     )
 
     assert result["will_run"] is True
@@ -522,7 +522,7 @@ def test_get_stage_explanation_force_without_changes(
     fingerprint = {f"self:{stage_name}": "abc123"}
 
     if create_lock:
-        stage_lock = lock.StageLock(stage_name, tmp_path)
+        stage_lock = lock.StageLock(stage_name, tmp_path / "stages")
         stage_lock.write(
             LockData(
                 code_manifest=fingerprint,
@@ -539,7 +539,7 @@ def test_get_stage_explanation_force_without_changes(
         deps=[],
         params_instance=None,
         overrides=None,
-        cache_dir=tmp_path,
+        cache_dir=tmp_path / "cache",
         force=True,
     )
 
@@ -556,7 +556,7 @@ def test_get_stage_explanation_force_without_changes(
 
 def test_get_stage_explanation_force_with_code_changes(tmp_path: Path) -> None:
     """Force with code changes shows code changes but is_forced=True."""
-    stage_lock = lock.StageLock("code_stage", tmp_path)
+    stage_lock = lock.StageLock("code_stage", tmp_path / "stages")
     stage_lock.write(
         LockData(
             code_manifest={"self:code_stage": "old_hash"},
@@ -573,7 +573,7 @@ def test_get_stage_explanation_force_with_code_changes(tmp_path: Path) -> None:
         deps=[],
         params_instance=None,
         overrides=None,
-        cache_dir=tmp_path,
+        cache_dir=tmp_path / "cache",
         force=True,
     )
 
@@ -586,7 +586,7 @@ def test_get_stage_explanation_force_with_code_changes(tmp_path: Path) -> None:
 
 def test_get_stage_explanation_force_with_missing_deps(tmp_path: Path) -> None:
     """Force with missing deps shows missing deps but is_forced=True."""
-    stage_lock = lock.StageLock("dep_stage", tmp_path)
+    stage_lock = lock.StageLock("dep_stage", tmp_path / "stages")
     stage_lock.write(
         LockData(
             code_manifest={"self:dep_stage": "abc"},
@@ -603,7 +603,7 @@ def test_get_stage_explanation_force_with_missing_deps(tmp_path: Path) -> None:
         deps=["nonexistent.csv"],
         params_instance=None,
         overrides=None,
-        cache_dir=tmp_path,
+        cache_dir=tmp_path / "cache",
         force=True,
     )
 

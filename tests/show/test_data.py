@@ -1315,7 +1315,7 @@ dep_generations: {}
 """
 
     def mock_read_files(paths: list[str]) -> dict[str, str | None]:
-        return {".pivot/cache/stages/process_data.lock": lock_content}
+        return {".pivot/stages/process_data.lock": lock_content}
 
     monkeypatch.setattr(git, "read_files_from_head", mock_read_files)
 
@@ -1383,7 +1383,7 @@ def test_get_data_hashes_from_head_invalid_yaml(
 
     # Invalid YAML
     def mock_read_files(paths: list[str]) -> dict[str, str | None]:
-        return {".pivot/cache/stages/process_data.lock": "invalid: yaml: content: ["}
+        return {".pivot/stages/process_data.lock": "invalid: yaml: content: ["}
 
     monkeypatch.setattr(git, "read_files_from_head", mock_read_files)
 
@@ -1417,7 +1417,7 @@ def test_get_data_hashes_from_head_missing_outs_key(
 
     # Lock file without outs key
     def mock_read_files(paths: list[str]) -> dict[str, str | None]:
-        return {".pivot/cache/stages/process_data.lock": "fingerprint: abc123\n"}
+        return {".pivot/stages/process_data.lock": "fingerprint: abc123\n"}
 
     monkeypatch.setattr(git, "read_files_from_head", mock_read_files)
 
@@ -1450,7 +1450,7 @@ def test_get_data_hashes_from_head_outs_not_list(
 
     # Lock file with outs as string instead of list
     def mock_read_files(paths: list[str]) -> dict[str, str | None]:
-        return {".pivot/cache/stages/process_data.lock": "outs: not_a_list\n"}
+        return {".pivot/stages/process_data.lock": "outs: not_a_list\n"}
 
     monkeypatch.setattr(git, "read_files_from_head", mock_read_files)
 

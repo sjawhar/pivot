@@ -36,6 +36,22 @@ _REQUIRED_LOCK_KEYS = frozenset({"code_manifest", "params", "deps", "outs", "dep
 
 # Pending directory for --no-commit mode (relative to .pivot/)
 _PENDING_DIR = "pending"
+STAGES_REL_PATH = ".pivot/stages"
+
+
+def get_stages_dir(cache_dir: Path) -> Path:
+    """Return the stages directory for lock files.
+
+    Lock files are stored in .pivot/stages/ (git-tracked) rather than
+    .pivot/cache/stages/ so they can be versioned for reproducibility.
+    """
+    # cache_dir is .pivot/cache, so parent is .pivot
+    return cache_dir.parent / "stages"
+
+
+def get_pending_stages_dir(project_root: Path) -> Path:
+    """Return the pending stages directory for --no-commit mode."""
+    return project_root / ".pivot" / _PENDING_DIR / "stages"
 
 
 def is_lock_data(data: object) -> TypeGuard[StorageLockData]:
@@ -123,13 +139,19 @@ class StageLock:
     stage_name: str
     path: Path
 
-    def __init__(self, stage_name: str, cache_dir: Path) -> None:
+    def __init__(self, stage_name: str, stages_dir: Path) -> None:
+        """Initialize a stage lock.
+
+        Args:
+            stage_name: Name of the stage
+            stages_dir: Directory containing lock files (e.g., .pivot/stages/)
+        """
         if not stage_name or not _VALID_STAGE_NAME.match(stage_name):
             raise ValueError(f"Invalid stage name: {stage_name!r}")
         if len(stage_name) > _MAX_STAGE_NAME_LEN:
             raise ValueError(f"Stage name too long ({len(stage_name)} > {_MAX_STAGE_NAME_LEN})")
         self.stage_name = stage_name
-        self.path = cache_dir / "stages" / f"{stage_name}.lock"
+        self.path = stages_dir / f"{stage_name}.lock"
 
     def read(self) -> LockData | None:
         """Read lock file, converting storage format to internal format."""
@@ -147,7 +169,10 @@ class StageLock:
                     )
                 return None  # Treat corrupted/invalid file as missing
             return _convert_from_storage_format(data)
-        except (FileNotFoundError, UnicodeDecodeError, yaml.YAMLError):
+        except FileNotFoundError:
+            return None  # Normal case - lock doesn't exist yet
+        except (UnicodeDecodeError, yaml.YAMLError) as e:
+            logger.warning("Failed to parse lock file %s: %s", self.path, e)
             return None
 
     def write(self, data: LockData) -> None:
@@ -195,13 +220,12 @@ class StageLock:
 
 def get_pending_lock(stage_name: str, project_root: Path) -> StageLock:
     """Get StageLock pointing to pending directory for --no-commit mode."""
-    pending_dir = project_root / ".pivot" / _PENDING_DIR
-    return StageLock(stage_name, pending_dir)
+    return StageLock(stage_name, get_pending_stages_dir(project_root))
 
 
 def list_pending_stages(project_root: Path) -> list[str]:
     """List all stages with pending lock files."""
-    pending_dir = project_root / ".pivot" / _PENDING_DIR / "stages"
+    pending_dir = get_pending_stages_dir(project_root)
     if not pending_dir.exists():
         return []
     return sorted(p.stem for p in pending_dir.glob("*.lock"))

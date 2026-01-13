@@ -621,7 +621,7 @@ def test_get_metric_info_from_head_with_metric_stage(
     mocker.patch.object(
         git,
         "read_files_from_head",
-        return_value={".pivot/cache/stages/my_stage.lock": lock_content.encode()},
+        return_value={".pivot/stages/my_stage.lock": lock_content.encode()},
     )
 
     result = metrics.get_metric_info_from_head()
@@ -669,7 +669,7 @@ def test_get_metric_info_from_head_invalid_lock_yaml(
     mocker.patch.object(
         git,
         "read_files_from_head",
-        return_value={".pivot/cache/stages/my_stage.lock": b":\n  :\n invalid"},
+        return_value={".pivot/stages/my_stage.lock": b":\n  :\n invalid"},
     )
 
     result = metrics.get_metric_info_from_head()
@@ -696,7 +696,7 @@ def test_get_metric_info_from_head_lock_missing_outs(
     mocker.patch.object(
         git,
         "read_files_from_head",
-        return_value={".pivot/cache/stages/my_stage.lock": lock_content.encode()},
+        return_value={".pivot/stages/my_stage.lock": lock_content.encode()},
     )
 
     result = metrics.get_metric_info_from_head()
@@ -723,7 +723,7 @@ def test_get_metric_info_from_head_outs_not_list(
     mocker.patch.object(
         git,
         "read_files_from_head",
-        return_value={".pivot/cache/stages/my_stage.lock": lock_content.encode()},
+        return_value={".pivot/stages/my_stage.lock": lock_content.encode()},
     )
 
     result = metrics.get_metric_info_from_head()

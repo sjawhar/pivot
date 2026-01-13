@@ -136,20 +136,18 @@ def _scandir_recursive(path: pathlib.Path) -> Generator[os.DirEntry[str]]:
 
     DirEntry objects cache stat results, avoiding redundant syscalls.
     Symlinks are skipped to prevent loops.
+    PermissionError propagates to caller - partial hashes would be incorrect.
     """
-    try:
-        with os.scandir(path) as entries:
-            for entry in entries:
-                if entry.is_symlink():
-                    continue
-                if _should_skip_entry(entry):
-                    continue
-                if entry.is_file():
-                    yield entry
-                elif entry.is_dir():
-                    yield from _scandir_recursive(pathlib.Path(entry.path))
-    except PermissionError:
-        pass  # Skip unreadable directories rather than failing the entire walk
+    with os.scandir(path) as entries:
+        for entry in entries:
+            if entry.is_symlink():
+                continue
+            if _should_skip_entry(entry):
+                continue
+            if entry.is_file():
+                yield entry
+            elif entry.is_dir():
+                yield from _scandir_recursive(pathlib.Path(entry.path))
 
 
 def hash_directory(

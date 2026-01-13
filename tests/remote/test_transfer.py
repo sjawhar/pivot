@@ -95,7 +95,9 @@ def test_get_local_cache_hashes_ignores_invalid_structure(tmp_path: Path) -> Non
 @pytest.fixture
 def lock_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(project, "_project_root_cache", tmp_path)
-    (tmp_path / ".pivot" / "cache" / "stages").mkdir(parents=True)
+    # Lock files are at .pivot/stages/, cache at .pivot/cache/
+    (tmp_path / ".pivot" / "stages").mkdir(parents=True)
+    (tmp_path / ".pivot" / "cache").mkdir(parents=True)
     return tmp_path
 
 
@@ -114,7 +116,7 @@ def test_get_stage_output_hashes_file_output(
     cache_dir = lock_project / ".pivot" / "cache"
 
     lock_data = make_valid_lock_content(outs=[{"path": "output.csv", "hash": "abc123def45678"}])
-    lock_path = cache_dir / "stages" / "my_stage.lock"
+    lock_path = lock_project / ".pivot" / "stages" / "my_stage.lock"
     with lock_path.open("w") as f:
         yaml.dump(lock_data, f)
 
@@ -150,7 +152,7 @@ def test_get_stage_output_hashes_directory_output(
             }
         ]
     )
-    lock_path = cache_dir / "stages" / "my_stage.lock"
+    lock_path = lock_project / ".pivot" / "stages" / "my_stage.lock"
     with lock_path.open("w") as f:
         yaml.dump(lock_data, f)
 
@@ -168,7 +170,7 @@ def test_get_stage_output_hashes_multiple_stages(
         lock_data = make_valid_lock_content(
             outs=[{"path": f"out{i}.csv", "hash": f"hash{i}{'0' * 11}"}]
         )
-        lock_path = cache_dir / "stages" / f"{stage}.lock"
+        lock_path = lock_project / ".pivot" / "stages" / f"{stage}.lock"
         with lock_path.open("w") as f:
             yaml.dump(lock_data, f)
 
@@ -189,7 +191,7 @@ def test_get_stage_output_hashes_skips_uncached(
             {"path": "uncached.csv", "hash": None},
         ]
     )
-    lock_path = cache_dir / "stages" / "my_stage.lock"
+    lock_path = lock_project / ".pivot" / "stages" / "my_stage.lock"
     with lock_path.open("w") as f:
         yaml.dump(lock_data, f)
 
@@ -214,7 +216,7 @@ def test_get_stage_dep_hashes(
             {"path": "config.yaml", "hash": "dep2hash1234567"},
         ]
     )
-    lock_path = cache_dir / "stages" / "my_stage.lock"
+    lock_path = lock_project / ".pivot" / "stages" / "my_stage.lock"
     with lock_path.open("w") as f:
         yaml.dump(lock_data, f)
 
@@ -240,7 +242,7 @@ def test_get_stage_dep_hashes_with_manifest(
             }
         ]
     )
-    lock_path = cache_dir / "stages" / "my_stage.lock"
+    lock_path = lock_project / ".pivot" / "stages" / "my_stage.lock"
     with lock_path.open("w") as f:
         yaml.dump(lock_data, f)
 
@@ -412,7 +414,7 @@ async def test_push_async_with_stages(
     (files_dir / "ab" / ("c" * 14)).write_text("content1")
 
     lock_data = make_valid_lock_content(outs=[{"path": "out.csv", "hash": hash1}])
-    lock_path = cache_dir / "stages" / "my_stage.lock"
+    lock_path = lock_project / ".pivot" / "stages" / "my_stage.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("w") as f:
         yaml.dump(lock_data, f)
@@ -466,7 +468,7 @@ async def test_pull_async_all_already_local(
     (files_dir / "ab" / ("c" * 14)).write_text("content1")
 
     lock_data = make_valid_lock_content(outs=[{"path": "out.csv", "hash": hash1}])
-    lock_path = cache_dir / "stages" / "my_stage.lock"
+    lock_path = lock_project / ".pivot" / "stages" / "my_stage.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("w") as f:
         yaml.dump(lock_data, f)
@@ -492,7 +494,7 @@ async def test_pull_async_downloads_missing(
 
     hash1 = "ab" + "c" * 14
     lock_data = make_valid_lock_content(outs=[{"path": "out.csv", "hash": hash1}])
-    lock_path = cache_dir / "stages" / "my_stage.lock"
+    lock_path = lock_project / ".pivot" / "stages" / "my_stage.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("w") as f:
         yaml.dump(lock_data, f)
@@ -544,7 +546,7 @@ async def test_pull_async_handles_failures(
 
     hash1 = "ab" + "c" * 14
     lock_data = make_valid_lock_content(outs=[{"path": "out.csv", "hash": hash1}])
-    lock_path = cache_dir / "stages" / "my_stage.lock"
+    lock_path = lock_project / ".pivot" / "stages" / "my_stage.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("w") as f:
         yaml.dump(lock_data, f)
@@ -577,7 +579,7 @@ async def test_pull_async_includes_deps(
         outs=[{"path": "out.csv", "hash": out_hash}],
         deps=[{"path": "in.csv", "hash": dep_hash}],
     )
-    lock_path = cache_dir / "stages" / "my_stage.lock"
+    lock_path = lock_project / ".pivot" / "stages" / "my_stage.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("w") as f:
         yaml.dump(lock_data, f)

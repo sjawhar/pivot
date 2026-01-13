@@ -8,7 +8,7 @@ import pandas
 import pytest
 from pydantic import BaseModel
 
-from pivot import fingerprint, loaders, registry, stage, stage_def
+from pivot import exceptions, fingerprint, loaders, registry, stage, stage_def
 from pivot.exceptions import ParamsError, ValidationError
 from pivot.registry import REGISTRY, RegistryStageInfo, StageRegistry
 
@@ -973,31 +973,35 @@ def test_stage_def_outs_extracted_automatically() -> None:
     assert info["outs_paths"][0].endswith("output/result.json")
 
 
-def test_stage_def_explicit_deps_override() -> None:
-    """Explicit deps= argument should completely replace StageDef deps."""
+def test_stage_def_deps_override_raises() -> None:
+    """Explicit deps= argument should raise ValidationError for StageDef stages."""
+    with pytest.raises(exceptions.ValidationError, match="cannot override deps"):
 
-    @stage(deps=["custom/data.csv", "extra/file.txt"])
-    def override_deps(params: _TestStageDef) -> None:
+        @stage(deps=["custom/data.csv", "extra/file.txt"])
+        def override_deps(params: _TestStageDef) -> None:
+            pass
+
+
+def test_stage_def_outs_override_raises() -> None:
+    """Explicit outs= argument should raise ValidationError for StageDef stages."""
+    with pytest.raises(exceptions.ValidationError, match="cannot override outs"):
+
+        @stage(outs=["custom/output.json"])
+        def override_outs(params: _TestStageDef) -> None:
+            pass
+
+
+def test_stage_def_empty_deps_allowed() -> None:
+    """Empty deps=[] should NOT raise - it means 'no override specified'."""
+
+    @stage(deps=[])
+    def empty_deps(params: _TestStageDef) -> None:
         pass
 
-    info = REGISTRY.get("override_deps")
-    assert len(info["deps"]) == 2
-    assert any("custom/data.csv" in d for d in info["deps"])
-    assert any("extra/file.txt" in d for d in info["deps"])
-    assert not any("data/input.csv" in d for d in info["deps"])
-
-
-def test_stage_def_explicit_outs_override() -> None:
-    """Explicit outs= argument should completely replace StageDef outs."""
-
-    @stage(outs=["custom/output.json"])
-    def override_outs(params: _TestStageDef) -> None:
-        pass
-
-    info = REGISTRY.get("override_outs")
-    assert len(info["outs_paths"]) == 1
-    assert info["outs_paths"][0].endswith("custom/output.json")
-    assert not info["outs_paths"][0].endswith("output/result.json")
+    info = REGISTRY.get("empty_deps")
+    # Should use StageDef defaults
+    assert len(info["deps"]) == 1
+    assert any("data/input.csv" in d for d in info["deps"])
 
 
 def test_stage_def_fingerprint_includes_loaders() -> None:

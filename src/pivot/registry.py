@@ -283,6 +283,17 @@ class StageRegistry:
         # Convert params to instance (instantiate class if needed)
         params_instance = _resolve_params(params, func, stage_name)
 
+        # StageDef stages manage their own deps/outs - disallow overrides
+        if isinstance(params_instance, stage_def.StageDef):
+            if deps:
+                raise exceptions.ValidationError(
+                    f"Stage '{stage_name}': cannot override deps for StageDef stages"
+                )
+            if outs:
+                raise exceptions.ValidationError(
+                    f"Stage '{stage_name}': cannot override outs for StageDef stages"
+                )
+
         # Extract deps/outs from StageDef if not explicitly provided
         deps_list: Sequence[str] = deps if deps is not None else ()
         outs_list: Sequence[outputs.OutSpec] = outs if outs is not None else ()

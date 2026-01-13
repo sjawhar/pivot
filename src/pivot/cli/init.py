@@ -16,7 +16,7 @@ cache/
 state.db
 state.lmdb/
 
-# Lock files
+# Config lock (ruamel.yaml temporary file)
 config.yaml.lock
 """
 
@@ -47,6 +47,8 @@ def init(ctx: click.Context, force: bool) -> None:
             )
 
     pivot_dir.mkdir(exist_ok=True)
+    # Create stages directory for git-tracked lock files
+    (pivot_dir / "stages").mkdir(exist_ok=True)
     gitignore_path = pivot_dir / ".gitignore"
 
     # Warn if overwriting existing .gitignore with custom content
@@ -70,6 +72,7 @@ def init(ctx: click.Context, force: bool) -> None:
         click.echo()
         click.echo("Created:")
         click.echo("  .pivot/")
+        click.echo("  .pivot/stages/")
         click.echo("  .pivot/.gitignore")
         if created_pivotignore:
             click.echo("  .pivotignore")

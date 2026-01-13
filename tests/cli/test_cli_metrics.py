@@ -286,7 +286,7 @@ def test_metrics_diff_integration(
             git,
             "read_files_from_head",
             return_value={
-                ".pivot/cache/stages/train.lock": lock_content.encode(),
+                ".pivot/stages/train.lock": lock_content.encode(),
                 "metrics.json": json.dumps(head_metrics).encode(),
             },
         )
