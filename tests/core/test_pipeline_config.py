@@ -1431,19 +1431,16 @@ from pivot import loaders, stage_def
 
 
 class ProcessParams(stage_def.StageDef):
-   class deps:
-       data: loaders.CSV[pandas.DataFrame] = "data/input.csv"
+    data: stage_def.Dep[pandas.DataFrame] = stage_def.Dep("data/input.csv", loaders.CSV())
+    result: stage_def.Out[dict[str, int]] = stage_def.Out("output/result.json", loaders.JSON())
 
-   class outs:
-       result: loaders.JSON[dict[str, int]] = "output/result.json"
-
-   threshold: float = 0.5
+    threshold: float = 0.5
 
 
 def process(params: ProcessParams) -> None:
-   df = params.deps.data
-   result = {"count": len(df[df["a"] > params.threshold])}
-   params.outs.result = result
+    df = params.data
+    result = {"count": len(df[df["a"] > params.threshold])}
+    params.result = result
 """
     )
 

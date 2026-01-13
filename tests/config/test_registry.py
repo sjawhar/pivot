@@ -929,11 +929,8 @@ def test_registry_restore_preserves_metadata() -> None:
 class _TestStageDef(stage_def.StageDef):
     """Module-level StageDef for testing (required for pickling)."""
 
-    class deps:
-        data: loaders.CSV[pandas.DataFrame] = "data/input.csv"
-
-    class outs:
-        result: loaders.JSON[dict[str, int]] = "output/result.json"
+    data: stage_def.Dep[pandas.DataFrame] = stage_def.Dep("data/input.csv", loaders.CSV())
+    result: stage_def.Out[dict[str, int]] = stage_def.Out("output/result.json", loaders.JSON())
 
     threshold: float = 0.5
 
@@ -1033,13 +1030,10 @@ def test_plain_pydantic_params_still_work() -> None:
 class _MultiDeps(stage_def.StageDef):
     """StageDef with multiple deps/outs for testing."""
 
-    class deps:
-        train: loaders.CSV[pandas.DataFrame] = "data/train.csv"
-        test: loaders.CSV[pandas.DataFrame] = "data/test.csv"
-
-    class outs:
-        model: loaders.Pickle[dict[str, float]] = "models/model.pkl"
-        metrics: loaders.JSON[dict[str, float]] = "metrics.json"
+    train: stage_def.Dep[pandas.DataFrame] = stage_def.Dep("data/train.csv", loaders.CSV())
+    test: stage_def.Dep[pandas.DataFrame] = stage_def.Dep("data/test.csv", loaders.CSV())
+    model: stage_def.Out[dict[str, float]] = stage_def.Out("models/model.pkl", loaders.Pickle())
+    metrics: stage_def.Out[dict[str, float]] = stage_def.Out("metrics.json", loaders.JSON())
 
 
 def test_stage_def_multiple_deps_outs() -> None:
