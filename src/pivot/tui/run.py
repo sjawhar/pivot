@@ -11,7 +11,7 @@ import os
 import queue
 import threading
 import time
-from typing import IO, TYPE_CHECKING, ClassVar, Literal, TypeVar, final, override
+from typing import IO, TYPE_CHECKING, ClassVar, Literal, TypeVar, cast, final, override
 
 import filelock
 import rich.markup
@@ -28,6 +28,7 @@ from pivot import project
 from pivot.executor import ExecutionSummary
 from pivot.executor import commit as commit_mod
 from pivot.storage import lock, project_lock
+from pivot.tui import agent_server
 from pivot.tui.diff_panels import InputDiffPanel, OutputDiffPanel
 from pivot.tui.stats import DebugStats, QueueStats, QueueStatsTracker, get_memory_mb
 from pivot.types import (
@@ -49,6 +50,7 @@ if TYPE_CHECKING:
     from typing import Protocol
 
     from pivot.types import OutputMessage
+    from pivot.watch.engine import WatchEngine
 
     class WatchEngineProtocol(Protocol):
         """Protocol for WatchEngine to avoid circular imports."""
@@ -1103,6 +1105,7 @@ class WatchTuiApp(_BaseTuiApp[None]):
         stage_names: list[str] | None = None,
         *,
         no_commit: bool = False,
+        serve: bool = False,
     ) -> None:
         super().__init__(message_queue, stage_names, tui_log=tui_log)
         self._engine: WatchEngineProtocol = engine
@@ -1111,6 +1114,9 @@ class WatchTuiApp(_BaseTuiApp[None]):
         self._no_commit: bool = no_commit
         self._commit_in_progress: bool = False
         self._cancel_commit: bool = False
+        self._serve: bool = serve
+        self._agent_server: agent_server.AgentServer | None = None
+        self._agent_server_task: asyncio.Task[None] | None = None
 
     @property
     def _has_running_stages(self) -> bool:
@@ -1125,6 +1131,40 @@ class WatchTuiApp(_BaseTuiApp[None]):
         self._start_queue_reader()
         self._engine_thread = threading.Thread(target=self._run_engine, daemon=True)
         self._engine_thread.start()
+
+        # Start agent server if requested
+        if self._serve:
+            await self._start_agent_server()
+
+    async def _start_agent_server(self) -> None:  # pragma: no cover
+        """Start the JSON-RPC agent server."""
+        socket_path = project.get_project_root() / ".pivot" / "agent.sock"
+        # Cast to actual WatchEngine type - we know it's the real thing at runtime
+        engine = cast("WatchEngine", self._engine)
+        self._agent_server = agent_server.AgentServer(engine, socket_path)
+
+        server = None
+        try:
+            server = await self._agent_server.start()
+            _logger.info(f"Agent server listening on {socket_path}")
+            self._agent_server_task = asyncio.create_task(server.serve_forever())
+        except Exception as e:
+            _logger.warning(f"Failed to start agent server: {e}")
+            # Clean up - stop server if it was started (handles task creation failure)
+            await self._agent_server.stop()
+            self._agent_server = None
+
+    async def _stop_agent_server(self) -> None:  # pragma: no cover
+        """Stop the JSON-RPC agent server if running."""
+        if self._agent_server_task is not None:
+            self._agent_server_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._agent_server_task
+            self._agent_server_task = None
+
+        if self._agent_server is not None:
+            await self._agent_server.stop()
+            self._agent_server = None
 
     def _run_engine(self) -> None:  # pragma: no cover
         """Run the watch engine (runs in background thread)."""
@@ -1304,6 +1344,9 @@ class WatchTuiApp(_BaseTuiApp[None]):
     @override
     async def action_quit(self) -> None:  # pragma: no cover
         """Quit the app, prompting to commit if there are uncommitted changes."""
+        # Stop agent server first if running
+        await self._stop_agent_server()
+
         # Cancel any pending commit operation
         if self._commit_in_progress:
             self._cancel_commit = True
@@ -1356,6 +1399,7 @@ def run_watch_tui(
     stage_names: list[str] | None = None,
     *,
     no_commit: bool = False,
+    serve: bool = False,
 ) -> None:  # pragma: no cover
     """Run watch mode with TUI display."""
     app = WatchTuiApp(
@@ -1365,5 +1409,6 @@ def run_watch_tui(
         tui_log=tui_log,
         stage_names=stage_names,
         no_commit=no_commit,
+        serve=serve,
     )
     app.run()

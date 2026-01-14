@@ -22,6 +22,11 @@ import yaml
 from pivot import dag, executor, ignore, project, registry, types
 from pivot.pipeline import yaml as pipeline_yaml
 from pivot.types import (
+    AgentCancelResult,
+    AgentRunRejection,
+    AgentRunStartResult,
+    AgentState,
+    AgentStatusResult,
     OnError,
     OutputMessage,
     WatchAffectedStagesEvent,
@@ -156,6 +161,17 @@ class WatchEngine:
     _keep_going_event: threading.Event
     _toggle_lock: threading.Lock
 
+    # Agent RPC state
+    _agent_state: AgentState
+    _agent_run_id: str | None
+    _agent_stages_completed: list[str]
+    _agent_stages_pending: list[str]
+    _agent_last_ran: int
+    _agent_last_skipped: int
+    _agent_last_failed: int
+    _agent_request_queue: queue.Queue[tuple[str, list[str] | None, bool]]
+    _agent_lock: threading.Lock
+
     def __init__(
         self,
         stages: list[str] | None = None,
@@ -195,6 +211,17 @@ class WatchEngine:
         self._toggle_lock = threading.Lock()
         if on_error == OnError.KEEP_GOING:
             self._keep_going_event.set()
+
+        # Agent RPC state initialization
+        self._agent_state = AgentState.IDLE
+        self._agent_run_id = None
+        self._agent_stages_completed = list[str]()
+        self._agent_stages_pending = list[str]()
+        self._agent_last_ran = 0
+        self._agent_last_skipped = 0
+        self._agent_last_failed = 0
+        self._agent_request_queue = queue.Queue(maxsize=10)
+        self._agent_lock = threading.Lock()
 
     def run(
         self,
@@ -277,6 +304,206 @@ class WatchEngine:
             self._keep_going_event.set()
             return True
 
+    # =========================================================================
+    # Agent RPC Methods
+    # =========================================================================
+
+    def try_start_agent_run(
+        self, run_id: str, stages: list[str] | None, force: bool
+    ) -> AgentRunStartResult | AgentRunRejection:
+        """Atomically try to start an agent run.
+
+        Returns AgentRunStartResult if started, AgentRunRejection if rejected.
+        Thread-safe - called from asyncio thread via run_in_executor.
+
+        This method performs an atomic check-and-set to prevent race conditions:
+        - Checks if state is WATCHING (ready to accept runs)
+        - Sets state to RUNNING and queues work in a single lock acquisition
+        """
+        # Compute stages outside lock for O(1) lock hold time
+        stages_to_queue = stages if stages else list(registry.REGISTRY.list_stages())
+
+        with self._agent_lock:
+            # Only accept when actively watching (not IDLE, RUNNING, COMPLETED, FAILED)
+            if self._agent_state != AgentState.WATCHING:
+                return AgentRunRejection(
+                    reason="not_ready",
+                    current_state=self._agent_state.value,
+                    current_run_id=self._agent_run_id,
+                )
+
+            # Atomic state transition
+            self._agent_state = AgentState.RUNNING
+            self._agent_run_id = run_id
+            self._agent_stages_pending = list(stages_to_queue)
+            self._agent_stages_completed = []
+
+            try:
+                self._agent_request_queue.put_nowait((run_id, stages, force))
+            except queue.Full:
+                # Roll back state to prevent deadlock (critical fix from design review)
+                self._agent_state = AgentState.WATCHING
+                self._agent_run_id = None
+                self._agent_stages_pending = []
+                return AgentRunRejection(reason="queue_full", current_state="watching")
+
+            return AgentRunStartResult(
+                run_id=run_id,
+                status="started",
+                stages_queued=stages_to_queue,
+            )
+
+    def get_agent_status(self, run_id: str | None = None) -> AgentStatusResult:
+        """Get current agent execution status.
+
+        Called from asyncio event loop thread, must be thread-safe.
+        """
+        with self._agent_lock:
+            result = AgentStatusResult(state=self._agent_state)
+
+            if run_id is not None and run_id != self._agent_run_id:
+                # Requested specific run that's not current
+                return result
+
+            if self._agent_run_id is not None:
+                result["run_id"] = self._agent_run_id
+
+            if self._agent_stages_completed:
+                result["stages_completed"] = list(self._agent_stages_completed)
+
+            if self._agent_stages_pending:
+                result["stages_pending"] = list(self._agent_stages_pending)
+
+            # Include stats for completed/failed/watching states (watching includes last run stats)
+            # Only include if there was a previous run (at least one stat is non-zero)
+            has_stats = self._agent_last_ran or self._agent_last_skipped or self._agent_last_failed
+            if (
+                self._agent_state in (AgentState.COMPLETED, AgentState.FAILED, AgentState.WATCHING)
+                and has_stats
+            ):
+                result["ran"] = self._agent_last_ran
+                result["skipped"] = self._agent_last_skipped
+                result["failed"] = self._agent_last_failed
+
+            return result
+
+    def request_agent_cancel(self) -> AgentCancelResult:
+        """Request cancellation of current agent execution.
+
+        Called from asyncio event loop thread, must be thread-safe.
+
+        Note: The current execution engine does not support mid-execution
+        cancellation. This method returns cancelled=False to honestly report
+        that the execution will continue to completion.
+        """
+        with self._agent_lock:
+            if self._agent_state == AgentState.RUNNING:
+                logger.warning(
+                    "Agent cancellation requested while RUNNING, but cancellation is not supported"
+                )
+            return AgentCancelResult(cancelled=False)
+
+    def _check_agent_requests(self) -> tuple[str, list[str] | None, bool] | None:
+        """Check for pending agent execution requests. Returns (run_id, stages, force) or None."""
+        try:
+            return self._agent_request_queue.get_nowait()
+        except queue.Empty:
+            return None
+
+    def _update_agent_state(
+        self,
+        state: AgentState,
+        *,
+        run_id: str | None = None,
+        stages_completed: list[str] | None = None,
+        stages_pending: list[str] | None = None,
+        ran: int = 0,
+        skipped: int = 0,
+        failed: int = 0,
+    ) -> None:
+        """Update agent state (thread-safe)."""
+        with self._agent_lock:
+            self._agent_state = state
+            if run_id is not None:
+                self._agent_run_id = run_id
+            if stages_completed is not None:
+                self._agent_stages_completed = stages_completed
+            if stages_pending is not None:
+                self._agent_stages_pending = stages_pending
+            if state in (AgentState.COMPLETED, AgentState.FAILED):
+                self._agent_last_ran = ran
+                self._agent_last_skipped = skipped
+                self._agent_last_failed = failed
+            # Clear run tracking when returning to WATCHING state
+            if state == AgentState.WATCHING:
+                self._agent_run_id = None
+                self._agent_stages_pending = []
+
+    def _handle_agent_request(self, request: tuple[str, list[str] | None, bool]) -> None:
+        """Handle an execution request from the agent RPC server.
+
+        Note: State is already set to RUNNING by try_start_agent_run() before this is called.
+        """
+        _run_id, stages, force = request  # run_id already set by try_start_agent_run
+        stages_to_queue = stages or list(registry.REGISTRY.list_stages())
+
+        self._send_message(
+            f"Agent running {len(stages_to_queue)} stage(s)...",
+            status=types.WatchStatus.DETECTING,
+        )
+
+        # Track execution progress for exception handling
+        results: dict[str, executor.ExecutionSummary] = {}
+
+        try:
+            # Store original force settings and override if requested
+            original_force = self._force_first_run
+            original_first_run_done = self._first_run_done
+            if force:
+                self._force_first_run = True
+                self._first_run_done = False
+
+            try:
+                results = self._execute_stages(stages)
+            finally:
+                # Restore original force settings
+                self._force_first_run = original_force
+                self._first_run_done = original_first_run_done
+
+            # Calculate stats from results
+            ran = sum(1 for r in results.values() if r["status"] == types.StageStatus.RAN)
+            skipped = sum(1 for r in results.values() if r["status"] == types.StageStatus.SKIPPED)
+            failed = sum(1 for r in results.values() if r["status"] == types.StageStatus.FAILED)
+
+            final_state = AgentState.FAILED if failed > 0 else AgentState.COMPLETED
+            self._update_agent_state(
+                final_state,
+                ran=ran,
+                skipped=skipped,
+                failed=failed,
+                stages_completed=list(results.keys()),
+                stages_pending=list[str](),
+            )
+
+        except Exception:
+            logger.exception("Agent execution failed")
+            # Capture partial progress from results collected before the exception
+            ran = sum(1 for r in results.values() if r["status"] == types.StageStatus.RAN)
+            skipped = sum(1 for r in results.values() if r["status"] == types.StageStatus.SKIPPED)
+            failed = sum(1 for r in results.values() if r["status"] == types.StageStatus.FAILED)
+            self._update_agent_state(
+                AgentState.FAILED,
+                ran=ran,
+                skipped=skipped,
+                failed=failed + 1,  # +1 for the exception itself
+                stages_completed=list(results.keys()),
+                stages_pending=list[str](),
+            )
+
+        # Transition back to WATCHING state after execution completes
+        self._update_agent_state(AgentState.WATCHING)
+        self._send_message("Watching for changes...")
+
     def _watch_loop(self, stages_to_run: list[str]) -> None:
         """Pure producer - monitors files, enqueues changes."""
         try:
@@ -313,8 +540,17 @@ class WatchEngine:
             self.shutdown()  # Signal coordinator to exit
 
     def _coordinator_loop(self) -> None:
-        """Orchestrate execution waves based on file changes."""
+        """Orchestrate execution waves based on file changes and agent requests."""
+        # Update agent state to watching once coordinator starts
+        self._update_agent_state(AgentState.WATCHING)
+
         while not self._shutdown.is_set():
+            # Check for agent execution requests (higher priority than file changes)
+            agent_request = self._check_agent_requests()
+            if agent_request is not None:
+                self._handle_agent_request(agent_request)
+                continue
+
             changes = self._collect_and_debounce()
             if not changes:
                 continue
