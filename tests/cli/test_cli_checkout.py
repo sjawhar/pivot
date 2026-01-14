@@ -257,7 +257,7 @@ def test_checkout_cache_miss_suggests_pull(
         pathlib.Path(".pivot").mkdir()
 
         # Create pvt file pointing to non-existent cache entry
-        pvt_data = track.PvtData(path="data.txt", hash="nonexistent_hash", size=100)
+        pvt_data = track.PvtData(path="data.txt", hash="deadbeef12345678", size=100)
         track.write_pvt_file(pathlib.Path("data.txt.pvt"), pvt_data)
 
         result = runner.invoke(cli.cli, ["checkout", "data.txt"])

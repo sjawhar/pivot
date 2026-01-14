@@ -492,7 +492,7 @@ def test_restore_directory_atomic_cleans_up_on_cache_miss(
 
     # Create hash with non-existent cache entry
     missing_hash: DirHash = {
-        "hash": "missing123456789",
+        "hash": "1234567890abcdef",
         "manifest": [{"relpath": "file.txt", "hash": "0" * 16, "size": 7, "isexec": False}],
     }
 
@@ -587,10 +587,10 @@ def test_restore_directory_validates_all_entries_before_writing(
 
     # Create manifest with first entry valid, second entry missing
     partial_hash: DirHash = {
-        "hash": "test123456789012",
+        "hash": "abcd1234567890ef",
         "manifest": [
             {"relpath": "first.txt", "hash": first_hash, "size": 5, "isexec": False},
-            {"relpath": "second.txt", "hash": "missing123456789", "size": 6, "isexec": False},
+            {"relpath": "second.txt", "hash": "deadbeef12345678", "size": 6, "isexec": False},
         ],
     }
 

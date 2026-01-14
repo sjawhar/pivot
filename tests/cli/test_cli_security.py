@@ -3,7 +3,9 @@ from __future__ import annotations
 import pathlib
 from typing import TYPE_CHECKING
 
-from pivot import cli
+import pytest
+
+from pivot import cli, exceptions
 from pivot.storage import cache, track
 
 if TYPE_CHECKING:
@@ -116,6 +118,42 @@ def test_stage_name_path_injection_rejected(
 # =============================================================================
 # Hash Validation Tests
 # =============================================================================
+
+
+def test_cache_path_rejects_invalid_characters(tmp_path: pathlib.Path) -> None:
+    """get_cache_path rejects hashes with non-hex characters."""
+    cache_dir = tmp_path / "cache" / "files"
+    cache_dir.mkdir(parents=True)
+
+    # All hashes must be exactly 16 chars to test character validation (not length)
+    invalid_hashes = [
+        "abcd/efg12345678",  # forward slash
+        "abcdefgh12345GHI",  # uppercase letters
+        "abcdefgh1234567!",  # special character
+        "abcd efgh1234567",  # space character
+        "..%2fabcdef12345",  # URL encoded traversal
+    ]
+
+    for bad_hash in invalid_hashes:
+        with pytest.raises(exceptions.SecurityValidationError, match="invalid characters"):
+            cache.get_cache_path(cache_dir, bad_hash)
+
+
+def test_cache_path_rejects_invalid_length(tmp_path: pathlib.Path) -> None:
+    """get_cache_path rejects hashes with wrong length."""
+    cache_dir = tmp_path / "cache" / "files"
+    cache_dir.mkdir(parents=True)
+
+    invalid_lengths = [
+        "abc",  # too short (3 chars)
+        "abcdef12",  # too short (8 chars)
+        "abcdef1234567890abcdef",  # too long (22 chars)
+        "",  # empty string
+    ]
+
+    for bad_hash in invalid_lengths:
+        with pytest.raises(exceptions.SecurityValidationError, match="exactly 16 characters"):
+            cache.get_cache_path(cache_dir, bad_hash)
 
 
 def test_cache_path_structure(tmp_path: pathlib.Path) -> None:

@@ -202,10 +202,18 @@ def hash_directory(
         return tree_hash, manifest
 
 
+_VALID_HASH_CHARS = frozenset("0123456789abcdef")
+
+
 def get_cache_path(cache_dir: pathlib.Path, file_hash: str) -> pathlib.Path:
     """Get cache path for a hash (XX/XXXX... structure)."""
-    if len(file_hash) < 3:
-        raise ValueError(f"Hash too short for cache path structure: {len(file_hash)} chars")
+    if len(file_hash) != XXHASH64_HEX_LENGTH:
+        raise exceptions.SecurityValidationError(
+            f"Hash must be exactly {XXHASH64_HEX_LENGTH} characters, got {len(file_hash)}"
+        )
+    # Prevents path traversal via malicious hashes
+    if not all(c in _VALID_HASH_CHARS for c in file_hash):
+        raise exceptions.SecurityValidationError(f"Hash contains invalid characters: {file_hash!r}")
     return cache_dir / file_hash[:2] / file_hash[2:]
 
 
