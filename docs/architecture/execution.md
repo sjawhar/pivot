@@ -207,6 +207,37 @@ The simple approach was chosen because:
 
 The RWLock approach would only benefit workloads with many concurrent readers of the same paths, which is rare in practice since Pivot's DAG ensures dependencies complete before dependents run.
 
+## Multi-Process Safety
+
+### Concurrent `pivot run` is Safe
+
+Multiple simultaneous `pivot run` invocations on the same project are safe and supported:
+
+- Each invocation gets its own loky worker pool and StateDB instances
+- LMDB enforces at most one writer at a time (via mutex), unlimited concurrent readers
+- Read transactions use MVCC snapshots—readers never block or see partial writes
+- Writes are per-stage lock files (distinct files) plus centralized StateDB (atomic updates)
+
+### State Database Access Pattern
+
+The coordinator-worker pattern ensures multi-process safety:
+
+1. **Worker processes** (readonly): Open StateDB in readonly mode, see consistent MVCC
+   snapshots. Collect deferred writes locally instead of writing directly.
+2. **Coordinator process** (read-write): Applies all deferred writes in a single atomic
+   transaction after worker completes via `apply_deferred_writes()`.
+
+This avoids write contention between workers while maintaining consistency.
+
+### Concurrent Scenarios
+
+| Scenario | Result |
+|----------|--------|
+| Two `pivot run`, same stage | Execution lock prevents concurrent execution |
+| Two `pivot run`, different stages | Both execute independently, writes serialize |
+| `pivot run --no-commit` + `pivot commit` | `pending_state_lock` coordinates |
+| Cache writes by both processes | Idempotent (check exists before writing) |
+
 ## Error Handling
 
 Three error modes:
