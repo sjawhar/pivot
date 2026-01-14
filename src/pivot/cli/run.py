@@ -182,6 +182,7 @@ def _run_watch_with_tui(
     tui_log: pathlib.Path | None = None,
     no_commit: bool = False,
     no_cache: bool = False,
+    serve: bool = False,
 ) -> None:
     """Run watch mode with TUI display."""
     import multiprocessing as mp
@@ -240,6 +241,7 @@ def _run_watch_with_tui(
                 tui_log=tui_log,
                 stage_names=execution_order,
                 no_commit=no_commit,
+                serve=serve,
             )
     finally:
         manager.shutdown()
@@ -336,6 +338,11 @@ def _print_results(results: dict[str, ExecutionSummary]) -> None:
     is_flag=True,
     help="Skip caching outputs entirely for maximum iteration speed. Outputs won't be cached.",
 )
+@click.option(
+    "--serve",
+    is_flag=True,
+    help="Start RPC server for agent control (requires --watch). Creates Unix socket at .pivot/agent.sock",
+)
 @click.pass_context
 def run(
     ctx: click.Context,
@@ -352,6 +359,7 @@ def run(
     tui_log: pathlib.Path | None,
     no_commit: bool,
     no_cache: bool,
+    serve: bool,
 ) -> None:
     """Execute pipeline stages.
 
@@ -378,6 +386,10 @@ def run(
             tui_log.touch()  # Verify writable
         except OSError as e:
             raise click.ClickException(f"Cannot write to {tui_log}: {e}") from e
+
+    # Validate --serve requires --watch
+    if serve and not watch:
+        raise click.ClickException("--serve requires --watch mode")
 
     # Handle dry-run modes (with or without explain)
     if dry_run:
@@ -408,6 +420,12 @@ def run(
         display_mode = DisplayMode(display) if display else None
         use_tui = run_tui.should_use_tui(display_mode) and not as_json
 
+        # Validate --serve requires TUI mode
+        if serve and not use_tui:
+            raise click.ClickException(
+                "--serve requires TUI mode (not compatible with --json or --display=plain)"
+            )
+
         if use_tui:
             try:
                 _run_watch_with_tui(
@@ -419,6 +437,7 @@ def run(
                     tui_log=tui_log,
                     no_commit=no_commit,
                     no_cache=no_cache,
+                    serve=serve,
                 )
             except KeyboardInterrupt:
                 click.echo("\nWatch mode stopped.")
