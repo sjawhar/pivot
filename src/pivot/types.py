@@ -175,6 +175,8 @@ class OutEntry(TypedDict):
 class StorageLockData(TypedDict):
     """Storage format for lock files (list-based, relative paths)."""
 
+    # Schema version for forward compatibility (missing = v0, current = v1)
+    schema_version: NotRequired[int]
     code_manifest: dict[str, str]
     params: dict[str, Any]
     deps: list[DepEntry]
