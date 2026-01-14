@@ -350,11 +350,17 @@ def test_output_thread_cleanup_completes(pipeline_dir: pathlib.Path) -> None:
 
     results = executor.run(show_output=True)
 
-    # Give a moment for thread cleanup
-    time.sleep(0.05)
+    # Poll for thread cleanup with timeout (more robust than fixed sleep)
+    deadline = time.monotonic() + 1.0  # 1 second timeout
+    while time.monotonic() < deadline:
+        final_thread_count = threading.active_count()
+        if final_thread_count <= initial_thread_count + 1:
+            break
+        time.sleep(0.01)
+    else:
+        final_thread_count = threading.active_count()
 
     # Thread count should return to initial (or close to it)
-    final_thread_count = threading.active_count()
     assert final_thread_count <= initial_thread_count + 1, (
         f"Thread leak: started with {initial_thread_count}, ended with {final_thread_count}"
     )
@@ -669,7 +675,7 @@ def test_stage_timeout_marks_stage_as_failed(pipeline_dir: pathlib.Path) -> None
 
     @pivot.stage(deps=["input.txt"], outs=["output.txt"])
     def slow_stage() -> None:
-        time.sleep(0.2)  # Sleep longer than timeout
+        time.sleep(1.0)  # Sleep much longer than timeout for robustness
         pathlib.Path("output.txt").write_text("done")
 
     results = executor.run(stage_timeout=0.1, show_output=False)

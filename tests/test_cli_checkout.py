@@ -217,7 +217,7 @@ def test_checkout_missing_from_cache_errors(
         # Create .pvt file manually without caching the data
         pvt_data: track.PvtData = {
             "path": "data.csv",
-            "hash": "nonexistent_hash",
+            "hash": "abcdef1234567890",
             "size": 100,
         }
         track.write_pvt_file(pathlib.Path("data.csv.pvt"), pvt_data)

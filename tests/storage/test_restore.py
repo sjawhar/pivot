@@ -409,7 +409,7 @@ def test_restore_file_cache_miss_error(git_repo: GitRepo, monkeypatch: pytest.Mo
     repo_path, commit = git_repo
 
     # Create a .pvt file that references a hash not in cache
-    pvt_content = {"path": "data.csv", "hash": "nonexistent_hash_abc123", "size": 1024}
+    pvt_content = {"path": "data.csv", "hash": "deadbeef12345678", "size": 1024}
     (repo_path / "data.csv.pvt").write_text(yaml.dump(pvt_content))
 
     sha = commit("add pvt file")
@@ -443,7 +443,7 @@ def test_restore_file_from_cache(git_repo: GitRepo, monkeypatch: pytest.MonkeyPa
     (cache_dir / "files").mkdir(parents=True)
 
     # Create a fake cached file
-    file_hash = "abc123def456"
+    file_hash = "abc123def4567890"
     cache.get_cache_path(cache_dir / "files", file_hash).parent.mkdir(parents=True, exist_ok=True)
     cache.get_cache_path(cache_dir / "files", file_hash).write_bytes(b"cached content")
 
