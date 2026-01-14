@@ -28,6 +28,11 @@ def get_project_root() -> pathlib.Path:
     return _project_root_cache
 
 
+def get_cache_dir() -> pathlib.Path:
+    """Get the cache directory path (.pivot/cache under project root)."""
+    return get_project_root() / ".pivot" / "cache"
+
+
 def resolve_path(path: str) -> pathlib.Path:
     """Resolve relative path from project root; absolute paths unchanged."""
     p = pathlib.Path(path)
