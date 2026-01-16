@@ -92,6 +92,7 @@ def _convert_to_storage_format(data: LockData) -> StorageLockData:
     outs_list.sort(key=lambda e: e["path"])
 
     return StorageLockData(
+        schema_version=1,
         code_manifest=data["code_manifest"],
         params=data["params"],
         deps=deps_list,
