@@ -422,6 +422,9 @@ def test_status_styles_returns_tuple() -> None:
 class _MockEngine:
     """Mock engine for WatchTuiApp tests."""
 
+    def __init__(self) -> None:
+        self._keep_going: bool = False
+
     def run(
         self,
         tui_queue: mp.Queue[TuiMessage] | None = None,
@@ -431,6 +434,14 @@ class _MockEngine:
 
     def shutdown(self) -> None:
         pass
+
+    def toggle_keep_going(self) -> bool:
+        self._keep_going = not self._keep_going
+        return self._keep_going
+
+    @property
+    def keep_going(self) -> bool:
+        return self._keep_going
 
 
 @pytest.mark.parametrize(

@@ -22,6 +22,7 @@ import yaml
 from pivot import dag, executor, ignore, project, registry, types
 from pivot.pipeline import yaml as pipeline_yaml
 from pivot.types import (
+    OnError,
     OutputMessage,
     WatchAffectedStagesEvent,
     WatchEventType,
@@ -152,6 +153,8 @@ class WatchEngine:
     _cached_file_index: dict[pathlib.Path, set[str]] | None
     _pipeline_errors: list[str] | None
     _ignore_filter: ignore.IgnoreFilter
+    _keep_going_event: threading.Event
+    _toggle_lock: threading.Lock
 
     def __init__(
         self,
@@ -164,6 +167,7 @@ class WatchEngine:
         json_output: bool = False,
         no_commit: bool = False,
         no_cache: bool = False,
+        on_error: OnError = OnError.FAIL,
     ) -> None:
         if debounce_ms < 0:
             raise ValueError(f"debounce_ms must be non-negative, got {debounce_ms}")
@@ -187,6 +191,10 @@ class WatchEngine:
         self._cached_file_index = None
         self._pipeline_errors = None
         self._ignore_filter = ignore.IgnoreFilter(project_root=project.get_project_root())
+        self._keep_going_event = threading.Event()
+        self._toggle_lock = threading.Lock()
+        if on_error == OnError.KEEP_GOING:
+            self._keep_going_event.set()
 
     def run(
         self,
@@ -254,6 +262,20 @@ class WatchEngine:
     def shutdown(self) -> None:
         """Signal graceful shutdown."""
         self._shutdown.set()
+
+    @property
+    def keep_going(self) -> bool:
+        """Return whether keep-going mode is enabled."""
+        return self._keep_going_event.is_set()
+
+    def toggle_keep_going(self) -> bool:
+        """Toggle keep-going mode. Returns new state (True=enabled)."""
+        with self._toggle_lock:  # Prevent race on rapid toggling
+            if self._keep_going_event.is_set():
+                self._keep_going_event.clear()
+                return False
+            self._keep_going_event.set()
+            return True
 
     def _watch_loop(self, stages_to_run: list[str]) -> None:
         """Pure producer - monitors files, enqueues changes."""
@@ -616,6 +638,8 @@ class WatchEngine:
         force = self._force_first_run and not self._first_run_done
         # Suppress console output when JSON output is enabled
         show_output = self._tui_queue is None and not self._json_output
+        # Read keep-going state at execution start (toggle takes effect on next wave)
+        on_error = OnError.KEEP_GOING if self._keep_going_event.is_set() else OnError.FAIL
         results = executor.run(
             stages=stages,
             single_stage=self._single_stage,
@@ -627,6 +651,7 @@ class WatchEngine:
             force=force,
             no_commit=self._no_commit,
             no_cache=self._no_cache,
+            on_error=on_error,
         )
         self._first_run_done = True
         return results
