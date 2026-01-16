@@ -132,7 +132,7 @@ def run(
         cache_dir: Directory for lock files. Defaults to .pivot/cache.
         parallel: If True, run independent stages in parallel (default: True).
         max_workers: Max concurrent stages (default: min(cpu_count, 8)).
-        on_error: Error handling mode - "fail", "keep_going", or "ignore".
+        on_error: Error handling mode - "fail" or "keep_going".
         show_output: If True, print progress and stage output to console.
         allow_uncached_incremental: If True, skip safety check for uncached IncrementalOut files.
         force: If True, bypass cache and force all stages to re-execute.
@@ -158,7 +158,7 @@ def run(
             error_mode = OnError(on_error)
         except ValueError:
             raise ValueError(
-                f"Invalid on_error mode: {on_error}. Use 'fail', 'keep_going', or 'ignore'"
+                f"Invalid on_error mode: {on_error}. Use 'fail' or 'keep_going'"
             ) from None
 
     # Verify tracked files before building DAG (provides better error messages)
@@ -413,7 +413,6 @@ def _execute_greedy(
                 output_queue=output_queue,
                 max_stages=max_workers,
                 mutex_counts=mutex_counts,
-                error_mode=error_mode,
                 con=con,
                 total_stages=total_stages,
                 completed_count=completed_count,
@@ -464,7 +463,6 @@ def _execute_greedy(
                             state,
                             timeout_reason,
                             stage_states,
-                            error_mode,
                         )
                         completed_count += 1
                         for mutex in state.mutex:
@@ -512,7 +510,7 @@ def _execute_greedy(
 
                         if result["status"] == StageStatus.FAILED:
                             state.status = StageStatus.FAILED
-                            _handle_stage_failure(stage_name, stage_states, error_mode)
+                            _handle_stage_failure(stage_name, stage_states)
                         elif result["status"] == StageStatus.SKIPPED:
                             state.status = StageStatus.SKIPPED
                         else:
@@ -523,11 +521,11 @@ def _execute_greedy(
                                 _apply_deferred_writes(stage_name, output_paths, result, state_db)
 
                     except concurrent.futures.BrokenExecutor as e:
-                        _mark_stage_failed(state, f"Worker died: {e}", stage_states, error_mode)
+                        _mark_stage_failed(state, f"Worker died: {e}", stage_states)
                         logger.error(f"Worker process died while running '{stage_name}'")
 
                     except Exception as e:
-                        _mark_stage_failed(state, str(e), stage_states, error_mode)
+                        _mark_stage_failed(state, str(e), stage_states)
 
                     completed_count += 1
 
@@ -603,7 +601,6 @@ def _execute_greedy(
                         output_queue=output_queue,
                         max_stages=slots_available,
                         mutex_counts=mutex_counts,
-                        error_mode=error_mode,
                         con=con,
                         total_stages=total_stages,
                         completed_count=completed_count,
@@ -675,7 +672,6 @@ def _start_ready_stages(
     output_queue: mp.Queue[OutputMessage],
     max_stages: int,
     mutex_counts: collections.defaultdict[str, int],
-    error_mode: OnError,
     con: console.Console | None,
     total_stages: int,
     completed_count: int,
@@ -703,8 +699,8 @@ def _start_ready_stages(
         if state.upstream_unfinished:
             continue
 
-        # Skip stages with failed upstream (unless in ignore mode)
-        if error_mode != OnError.IGNORE and _has_failed_upstream(state, stage_states):
+        # Skip stages with failed upstream
+        if _has_failed_upstream(state, stage_states):
             continue
 
         # Check mutex availability - skip if any mutex group is held
@@ -785,7 +781,7 @@ def _start_ready_stages(
             # Rollback mutex acquisition on submission failure
             for mutex in state.mutex:
                 mutex_counts[mutex] -= 1
-            _mark_stage_failed(state, f"Failed to submit: {e}", stage_states, error_mode)
+            _mark_stage_failed(state, f"Failed to submit: {e}", stage_states)
 
 
 def _prepare_worker_info(
@@ -832,24 +828,19 @@ def _mark_stage_failed(
     state: StageState,
     reason: str,
     stage_states: dict[str, StageState],
-    error_mode: OnError,
 ) -> None:
     """Mark a stage as failed and handle downstream effects."""
     state.result = StageResult(status=StageStatus.FAILED, reason=reason, output_lines=[])
     state.status = StageStatus.FAILED
     state.end_time = time.perf_counter()
-    _handle_stage_failure(state.name, stage_states, error_mode)
+    _handle_stage_failure(state.name, stage_states)
 
 
 def _handle_stage_failure(
     failed_stage: str,
     stage_states: dict[str, StageState],
-    error_mode: OnError,
 ) -> None:
     """Handle stage failure by marking downstream stages as skipped."""
-    if error_mode == OnError.IGNORE:
-        return
-
     to_skip = set[str]()
     bfs_queue = collections.deque([failed_stage])
     visited = set[str]()

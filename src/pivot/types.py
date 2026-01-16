@@ -56,7 +56,6 @@ class OnError(enum.StrEnum):
 
     FAIL = "fail"
     KEEP_GOING = "keep_going"
-    IGNORE = "ignore"
 
 
 class DeferredWrites(TypedDict, total=False):

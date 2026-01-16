@@ -18,6 +18,7 @@ from pivot.cli import helpers as cli_helpers
 from pivot.types import (
     DisplayMode,
     ExecutionResultEvent,
+    OnError,
     OutputMessage,
     RunEventType,
     SchemaVersionEvent,
@@ -125,6 +126,7 @@ def _run_with_tui(
     tui_log: pathlib.Path | None = None,
     no_commit: bool = False,
     no_cache: bool = False,
+    on_error: OnError = OnError.FAIL,
 ) -> dict[str, ExecutionSummary] | None:
     """Run pipeline with TUI display."""
     import multiprocessing as mp
@@ -165,6 +167,7 @@ def _run_with_tui(
                 force=force,
                 no_commit=no_commit,
                 no_cache=no_cache,
+                on_error=on_error,
             )
 
         with _suppress_stderr_logging():
@@ -182,6 +185,7 @@ def _run_watch_with_tui(
     tui_log: pathlib.Path | None = None,
     no_commit: bool = False,
     no_cache: bool = False,
+    on_error: OnError = OnError.FAIL,
 ) -> None:
     """Run watch mode with TUI display."""
     import multiprocessing as mp
@@ -230,6 +234,7 @@ def _run_watch_with_tui(
             force_first_run=force,
             no_commit=no_commit,
             no_cache=no_cache,
+            on_error=on_error,
         )
 
         with _suppress_stderr_logging():
@@ -336,6 +341,12 @@ def _print_results(results: dict[str, ExecutionSummary]) -> None:
     is_flag=True,
     help="Skip caching outputs entirely for maximum iteration speed. Outputs won't be cached.",
 )
+@click.option(
+    "--keep-going",
+    "-k",
+    is_flag=True,
+    help="Continue running stages after failures; skip only downstream dependents.",
+)
 @click.pass_context
 def run(
     ctx: click.Context,
@@ -352,6 +363,7 @@ def run(
     tui_log: pathlib.Path | None,
     no_commit: bool,
     no_cache: bool,
+    keep_going: bool,
 ) -> None:
     """Execute pipeline stages.
 
@@ -402,6 +414,8 @@ def run(
             )
         return
 
+    on_error = OnError.KEEP_GOING if keep_going else OnError.FAIL
+
     if watch:
         from pivot.tui import run as run_tui
 
@@ -419,6 +433,7 @@ def run(
                     tui_log=tui_log,
                     no_commit=no_commit,
                     no_cache=no_cache,
+                    on_error=on_error,
                 )
             except KeyboardInterrupt:
                 click.echo("\nWatch mode stopped.")
@@ -434,6 +449,7 @@ def run(
                 json_output=as_json,
                 no_commit=no_commit,
                 no_cache=no_cache,
+                on_error=on_error,
             )
 
             try:
@@ -463,6 +479,7 @@ def run(
             tui_log=tui_log,
             no_commit=no_commit,
             no_cache=no_cache,
+            on_error=on_error,
         )
     elif as_json:
         # JSONL streaming mode
@@ -481,6 +498,7 @@ def run(
             no_cache=no_cache,
             show_output=False,
             progress_callback=cli_helpers.emit_jsonl,
+            on_error=on_error,
         )
         total_duration_ms = (time.perf_counter() - start_time) * 1000
 
@@ -508,6 +526,7 @@ def run(
             force=force,
             no_commit=no_commit,
             no_cache=no_cache,
+            on_error=on_error,
         )
 
     if not results and not as_json:

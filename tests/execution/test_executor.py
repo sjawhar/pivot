@@ -625,30 +625,6 @@ def test_on_error_keep_going_skips_downstream_of_failed(pipeline_dir: pathlib.Pa
     assert results["independent"]["status"] == "ran"
 
 
-def test_on_error_ignore_allows_downstream_to_attempt(pipeline_dir: pathlib.Path) -> None:
-    """on_error='ignore' allows downstream stages to attempt running."""
-    (pipeline_dir / "input.txt").write_text("data")
-    # Note: pre-existing outputs are removed before stage execution
-    # so downstream will fail with missing dependency if upstream fails
-
-    @pivot.stage(deps=["input.txt"], outs=["first.txt"])
-    def first() -> None:
-        raise RuntimeError("First failed")
-
-    @pivot.stage(deps=["first.txt"], outs=["second.txt"])
-    def second() -> None:
-        data = pathlib.Path("first.txt").read_text()
-        pathlib.Path("second.txt").write_text(f"got: {data}")
-
-    results = executor.run(on_error="ignore", show_output=False)
-
-    assert results["first"]["status"] == "failed"
-    # With cache integration, outputs are removed before execution.
-    # Since first stage failed, first.txt doesn't exist, so second fails with missing dep.
-    assert results["second"]["status"] == "failed"
-    assert "missing" in results["second"]["reason"].lower()
-
-
 def test_invalid_on_error_raises_value_error(pipeline_dir: pathlib.Path) -> None:
     """Invalid on_error value raises ValueError."""
     (pipeline_dir / "input.txt").write_text("data")

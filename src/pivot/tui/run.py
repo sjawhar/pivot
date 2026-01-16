@@ -59,6 +59,9 @@ if TYPE_CHECKING:
             output_queue: mp.Queue[OutputMessage] | None = None,
         ) -> None: ...
         def shutdown(self) -> None: ...
+        def toggle_keep_going(self) -> bool: ...
+        @property
+        def keep_going(self) -> bool: ...
 
 
 def _format_elapsed(elapsed: float | None) -> str:
@@ -513,6 +516,8 @@ _TUI_BINDINGS: list[textual.binding.BindingType] = [
     textual.binding.Binding("a", "show_all_logs", "All Logs"),
     # Debug panel toggle
     textual.binding.Binding("~", "toggle_debug", "Debug"),
+    # Keep-going toggle (watch mode only)
+    textual.binding.Binding("g", "toggle_keep_going", "Keep-going"),
     # Keep stage filtering with number keys (4-9 for stages, 1-3 could conflict with tabs)
     *[
         textual.binding.Binding(str(i), f"filter_stage({i - 1})", f"Stage {i}", show=False)
@@ -862,6 +867,12 @@ class _BaseTuiApp(textual.app.App[_AppReturnT]):
             self._debug_timer.stop()
             self._debug_timer = None
 
+    def action_toggle_keep_going(self) -> None:  # pragma: no cover
+        """Toggle keep-going mode (only available in watch mode)."""
+        self.notify(
+            "Keep-going toggle is only available in watch mode (use --watch)", severity="warning"
+        )
+
     def _update_debug_stats(self) -> None:  # pragma: no cover
         """Update debug panel with current stats."""
         try:
@@ -1109,7 +1120,8 @@ class WatchTuiApp(_BaseTuiApp[None]):
     @override
     async def on_mount(self) -> None:  # pragma: no cover
         await super().on_mount()
-        self.title = "[●] Watching for changes..."
+        prefix = self._get_keep_going_prefix()
+        self.title = f"{prefix}[●] Watching for changes..."
         self._start_queue_reader()
         self._engine_thread = threading.Thread(target=self._run_engine, daemon=True)
         self._engine_thread.start()
@@ -1166,15 +1178,16 @@ class WatchTuiApp(_BaseTuiApp[None]):
 
     def _handle_watch(self, msg: TuiWatchMessage) -> None:  # pragma: no cover
         """Handle reactive status updates - update title bar."""
+        prefix = self._get_keep_going_prefix()
         match msg["status"]:
             case WatchStatus.WAITING:
-                self.title = "[●] Watching for changes..."
+                self.title = f"{prefix}[●] Watching for changes..."
             case WatchStatus.RESTARTING:
-                self.title = "[↻] Reloading code..."
+                self.title = f"{prefix}[↻] Reloading code..."
             case WatchStatus.DETECTING:
-                self.title = f"[▶] {rich.markup.escape(msg['message'])}"
+                self.title = f"{prefix}[▶] {rich.markup.escape(msg['message'])}"
             case WatchStatus.ERROR:
-                self.title = f"[!] {rich.markup.escape(msg['message'])}"
+                self.title = f"{prefix}[!] {rich.markup.escape(msg['message'])}"
 
     def _handle_reload(self, msg: TuiReloadMessage) -> None:  # pragma: no cover
         """Handle registry reload - update stage list."""
@@ -1211,6 +1224,18 @@ class WatchTuiApp(_BaseTuiApp[None]):
         # Use _stage_order to maintain correct ordering
         ordered_stages = [self._stages[name] for name in self._stage_order if name in self._stages]
         stage_list.rebuild(ordered_stages)
+
+    def _get_keep_going_prefix(self) -> str:  # pragma: no cover
+        """Return title prefix for keep-going mode."""
+        return "[-k] " if self._engine.keep_going else ""
+
+    @override
+    def action_toggle_keep_going(self) -> None:  # pragma: no cover
+        """Toggle keep-going mode."""
+        enabled = self._engine.toggle_keep_going()
+        self.notify(f"Keep-going: {'ON' if enabled else 'OFF'}")
+        # Refresh title to show mode indicator
+        self.title = f"{self._get_keep_going_prefix()}[●] Watching for changes..."
 
     async def action_commit(self) -> None:  # pragma: no cover
         """Commit pending changes from --no-commit mode."""
