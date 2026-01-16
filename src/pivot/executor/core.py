@@ -657,13 +657,6 @@ def _output_queue_reader(
             break
 
 
-def _has_failed_upstream(state: StageState, stage_states: dict[str, StageState]) -> bool:
-    """Check if any upstream stage has failed."""
-    return any(
-        stage_states[u].status == StageStatus.FAILED for u in state.upstream if u in stage_states
-    )
-
-
 def _start_ready_stages(
     stage_states: dict[str, StageState],
     executor: concurrent.futures.Executor,
@@ -697,10 +690,6 @@ def _start_ready_stages(
             continue
 
         if state.upstream_unfinished:
-            continue
-
-        # Skip stages with failed upstream
-        if _has_failed_upstream(state, stage_states):
             continue
 
         # Check mutex availability - skip if any mutex group is held
@@ -840,7 +829,12 @@ def _handle_stage_failure(
     failed_stage: str,
     stage_states: dict[str, StageState],
 ) -> None:
-    """Handle stage failure by marking downstream stages as skipped."""
+    """Handle stage failure by marking downstream stages as skipped.
+
+    This handles both FAIL and KEEP_GOING modes: downstream stages are always
+    skipped when their upstream fails. The difference between modes is whether
+    independent stages continue (KEEP_GOING) or the pipeline stops (FAIL).
+    """
     to_skip = set[str]()
     bfs_queue = collections.deque([failed_stage])
     visited = set[str]()
