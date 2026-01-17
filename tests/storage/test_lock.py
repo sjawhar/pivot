@@ -237,7 +237,9 @@ def test_stage_changed_params_modified(tmp_path: Path) -> None:
 def test_stage_changed_dep_hash_modified(tmp_path: Path) -> None:
     """Stage is marked changed when input file hash differs."""
     stage_lock = lock.StageLock("consumer", tmp_path)
-    old_dep_hashes: dict[str, HashInfo] = {"input.csv": {"hash": "old_hash"}}
+    # Use absolute paths for dep_hashes to match production behavior
+    input_path = str(tmp_path / "input.csv")
+    old_dep_hashes: dict[str, HashInfo] = {input_path: {"hash": "old_hash"}}
     stage_lock.write(
         LockData(
             code_manifest={"self:consumer": "hash"},
@@ -248,7 +250,7 @@ def test_stage_changed_dep_hash_modified(tmp_path: Path) -> None:
         )
     )
 
-    new_dep_hashes: dict[str, HashInfo] = {"input.csv": {"hash": "new_hash"}}
+    new_dep_hashes: dict[str, HashInfo] = {input_path: {"hash": "new_hash"}}
     changed, reason = stage_lock.is_changed(
         current_fingerprint={"self:consumer": "hash"},
         current_params={},

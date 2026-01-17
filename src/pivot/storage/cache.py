@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import errno
 import fcntl
+import hashlib
 import json
 import logging
 import mmap
@@ -36,6 +37,16 @@ _RESTORE_TEMP_PREFIX = ".pivot_restore_"
 _BACKUP_TEMP_PREFIX = ".pivot_backup_"
 _RESTORE_LOCK_PREFIX = ".pivot_restore_lock_"
 _RESTORE_TEMP_MAX_AGE = 3600  # 1 hour
+
+
+def _get_lock_filename(path_name: str) -> str:
+    """Generate lock filename, hashing if too long for filesystem."""
+    max_name_len = 255 - len(_RESTORE_LOCK_PREFIX)
+    if len(path_name) <= max_name_len:
+        return f"{_RESTORE_LOCK_PREFIX}{path_name}"
+    # Hash long names to fit filesystem limit (first 32 hex chars of SHA-256 = 128 bits)
+    name_hash = hashlib.sha256(path_name.encode()).hexdigest()[:32]
+    return f"{_RESTORE_LOCK_PREFIX}{name_hash}"
 
 
 def atomic_write_file(
@@ -541,7 +552,7 @@ def _restore_directory_from_cache(
     _cleanup_stale_restore_temps(path.parent)
 
     # Acquire lock for this specific path to prevent concurrent restore races
-    lock_path = path.parent / f"{_RESTORE_LOCK_PREFIX}{path.name}"
+    lock_path = path.parent / _get_lock_filename(path.name)
     lock_fd: int | None = None
     try:
         lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
@@ -580,7 +591,7 @@ def _restore_directory_from_cache(
             resolved_temp = temp_path.resolve()
 
             # Restore all files to temp directory
-            for entry in output_hash["manifest"]:
+            for file_count, entry in enumerate(output_hash["manifest"], start=1):
                 file_cache_path = get_cache_path(cache_dir, entry["hash"])
                 file_path = temp_path / entry["relpath"]
 
@@ -593,6 +604,18 @@ def _restore_directory_from_cache(
                 _checkout_with_fallback(
                     file_path, file_cache_path, checkout_modes, executable=entry["isexec"]
                 )
+                # Keep mtime fresh to prevent cleanup during long restores
+                if file_count % 100 == 0:
+                    try:
+                        os.utime(temp_path, None)
+                    except OSError as e:
+                        logger.debug(f"mtime refresh failed (may be NFS with root_squash): {e}")
+
+            # Final mtime touch after restore completes
+            try:
+                os.utime(temp_path, None)
+            except OSError as e:
+                logger.debug(f"mtime refresh failed (may be NFS with root_squash): {e}")
 
             # Ensure directories writable if COPY mode was used
             # Use is_dir with follow_symlinks=False to avoid traversing symlinks
@@ -605,19 +628,19 @@ def _restore_directory_from_cache(
                 except OSError as e:
                     logger.debug(f"chmod failed (may be NFS with root_squash): {e}")
 
-            # Two-phase atomic swap (prevents data loss if rename fails)
-            # Phase 1: save original (handle TOCTOU race)
+            # Atomic swap with rollback capability:
+            # - Backup original first so we can restore on failure
+            # - Replace atomically so path always has valid content
+            # - Clean backup only after successful swap
             try:
                 if path.exists() or path.is_symlink():
                     path.rename(backup_path)
             except FileNotFoundError:
                 logger.debug("Path disappeared between check and rename, proceeding")
 
-            # Phase 2: atomic swap
             temp_path.replace(path)
             swap_completed = True
 
-            # Phase 3: cleanup backup
             try:
                 _clear_path(backup_path)
             except OSError as e:

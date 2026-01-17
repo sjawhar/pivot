@@ -69,6 +69,16 @@ def _get_indicator(change_type: ChangeType | None) -> str:
             assert_never(unreachable)
 
 
+def _escape_padded(text: str, width: int) -> str:
+    """Pad text to width, then escape for Rich markup.
+
+    Uses simple ljust() padding - works for ASCII/typical paths. For proper handling
+    of multi-cell characters (emojis, CJK), use rich.cells.cell_len() instead.
+    Kept simple since paths/identifiers rarely contain wide characters.
+    """
+    return rich.markup.escape(text.ljust(width))
+
+
 def _truncate_hash(hash_str: str | None, length: int = 8) -> str:
     """Truncate hash to specified length, or return placeholder."""
     if hash_str is None:
@@ -106,7 +116,7 @@ def _get_registry_info(stage_name: str) -> RegistryStageInfo | None:
 
 def _get_cache_dir() -> pathlib.Path:
     """Get the cache directory path."""
-    return project.get_project_root() / ".pivot" / "cache"
+    return project.get_cache_dir()
 
 
 def _get_relative_path(abs_path: str) -> str:
@@ -121,7 +131,7 @@ def _get_relative_path(abs_path: str) -> str:
     return abs_path
 
 
-def _compute_output_changes(
+def compute_output_changes(
     lock_data: LockData | None,
     registry_info: RegistryStageInfo,
 ) -> list[OutputChange]:
@@ -163,8 +173,8 @@ def _compute_output_changes(
                     new_hash, _ = cache.hash_directory(path_obj)
                 else:
                     new_hash = cache.hash_file(path_obj)
-        except OSError:
-            # File unreadable
+        except OSError as e:
+            logger.debug("Failed to read %s for hashing: %s", path, e)
             new_hash = None
 
         # Determine change type
@@ -494,8 +504,8 @@ class InputDiffPanel(_SelectableExpandablePanel):
                         change["new_hash"],
                         change["change_type"],
                     )
-                    return f"{prefix}{indicator} {rich.markup.escape(str(change['key'])):<25} {hash_display}{suffix}"
-                return f"{prefix}{_INDICATOR_UNCHANGED} {rich.markup.escape(item_key):<25} (unknown){suffix}"
+                    return f"{prefix}{indicator} {_escape_padded(str(change['key']), 25)} {hash_display}{suffix}"
+                return f"{prefix}{_INDICATOR_UNCHANGED} {_escape_padded(item_key, 25)} (unknown){suffix}"
 
             case "dep":
                 change = self._find_dep_change(item_key)
@@ -507,9 +517,11 @@ class InputDiffPanel(_SelectableExpandablePanel):
                         change["new_hash"],
                         change["change_type"],
                     )
-                    return f"{prefix}{indicator} {rich.markup.escape(rel_path):<25} {hash_display}{suffix}"
+                    return (
+                        f"{prefix}{indicator} {_escape_padded(rel_path, 25)} {hash_display}{suffix}"
+                    )
                 # Unchanged dep
-                return f"{prefix}{_INDICATOR_UNCHANGED} {rich.markup.escape(rel_path):<25} (unchanged){suffix}"
+                return f"{prefix}{_INDICATOR_UNCHANGED} {_escape_padded(rel_path, 25)} (unchanged){suffix}"
 
             case "param":
                 change = self._find_param_change(item_key)
@@ -532,8 +544,8 @@ class InputDiffPanel(_SelectableExpandablePanel):
                             )
                         case _ as unreachable:  # pyright: ignore[reportUnnecessaryComparison]
                             assert_never(unreachable)
-                    return f"{prefix}{indicator} {rich.markup.escape(str(change['key'])):<25} {val_display}{suffix}"
-                return f"{prefix}{_INDICATOR_UNCHANGED} {rich.markup.escape(item_key):<25} (unknown){suffix}"
+                    return f"{prefix}{indicator} {_escape_padded(str(change['key']), 25)} {val_display}{suffix}"
+                return f"{prefix}{_INDICATOR_UNCHANGED} {_escape_padded(item_key, 25)} (unknown){suffix}"
 
             case _:
                 return f"{prefix}{rich.markup.escape(item_id)}{suffix}"
@@ -677,6 +689,17 @@ class InputDiffPanel(_SelectableExpandablePanel):
             return "[dim]Error loading stage data[/]"
         return "[dim]No inputs[/]"
 
+    def set_from_snapshot(self, snapshot: StageExplanation) -> None:
+        """Display pre-captured snapshot instead of computing from current state."""
+        self._reset_selection_state()
+        self._explanation = snapshot
+        self._stage_name = snapshot["stage_name"]
+        self._registry_info = _get_registry_info(snapshot["stage_name"])
+        self._code_by_key = {c["key"]: c for c in snapshot["code_changes"]}
+        self._dep_by_path = {d["path"]: d for d in snapshot["dep_changes"]}
+        self._param_by_key = {p["key"]: p for p in snapshot["param_changes"]}
+        self._update_display()
+
 
 class OutputDiffPanel(_SelectableExpandablePanel):
     """Panel showing output changes for a stage (outs, metrics, plots)."""
@@ -723,7 +746,7 @@ class OutputDiffPanel(_SelectableExpandablePanel):
         stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(cache_dir))
         lock_data = stage_lock.read()
 
-        output_changes = _compute_output_changes(lock_data, self._registry_info)
+        output_changes = compute_output_changes(lock_data, self._registry_info)
         self._output_by_path = {c["path"]: c for c in output_changes}
 
     @override
@@ -748,7 +771,9 @@ class OutputDiffPanel(_SelectableExpandablePanel):
 
         if not change:
             rel_path = _get_relative_path(item_path)
-            return f"{prefix}{_INDICATOR_UNCHANGED} {rich.markup.escape(rel_path):<25} (unknown){suffix}"
+            return (
+                f"{prefix}{_INDICATOR_UNCHANGED} {_escape_padded(rel_path, 25)} (unknown){suffix}"
+            )
 
         indicator = _get_indicator(change["change_type"])
         rel_path = _get_relative_path(change["path"])
@@ -756,7 +781,7 @@ class OutputDiffPanel(_SelectableExpandablePanel):
             change["old_hash"], change["new_hash"], change["change_type"]
         )
 
-        return f"{prefix}{indicator} {rich.markup.escape(rel_path):<25} {hash_display}{suffix}"
+        return f"{prefix}{indicator} {_escape_padded(rel_path, 25)} {hash_display}{suffix}"
 
     @override
     def _render_detail_content(self, item_id: str) -> str:  # pragma: no cover
@@ -800,7 +825,7 @@ class OutputDiffPanel(_SelectableExpandablePanel):
                     new_str = self._format_metric_value(new_val)
                     delta_str = self._format_metric_delta(old_val, new_val)
                     lines.append(
-                        f"  {rich.markup.escape(diff['key']):<20} {old_str} -> {new_str}  {delta_str}"
+                        f"  {_escape_padded(diff['key'], 20)} {old_str} -> {new_str}  {delta_str}"
                     )
                 lines.append("")
 
@@ -1032,6 +1057,8 @@ class OutputDiffPanel(_SelectableExpandablePanel):
                         lines.append(f"  {indicator} {col} [dim](was: {old_dtype})[/]")
                     case ChangeType.MODIFIED:
                         lines.append(f"  {indicator} {col} [dim]{old_dtype} → {new_dtype}[/]")
+                    case _ as unreachable:  # pyright: ignore[reportUnnecessaryComparison]
+                        assert_never(unreachable)
             if len(result["schema_changes"]) > 20:
                 lines.append(f"  [dim]... and {len(result['schema_changes']) - 20} more[/]")
 
@@ -1069,3 +1096,13 @@ class OutputDiffPanel(_SelectableExpandablePanel):
         if self._registry_info is None:
             return "[dim]Stage not in registry[/]"
         return "[dim]No outputs[/]"
+
+    def set_from_snapshot(self, stage_name: str, changes: list[OutputChange]) -> None:
+        """Display pre-captured snapshot instead of computing from current state."""
+        self._reset_selection_state()
+        self._stage_name = stage_name
+        self._registry_info = _get_registry_info(stage_name)
+        self._output_by_path = {c["path"]: c for c in changes}
+        self._metric_diff_cache.clear()  # Metric diffs not available for historical
+        self._head_hashes = None
+        self._update_display()

@@ -88,7 +88,6 @@ def get_lock_data_from_revision(
     stage_name: str, rev: str, cache_dir: pathlib.Path
 ) -> StorageLockData | None:
     """Read and parse lock file for a stage from a git revision."""
-    # Lock files are at .pivot/stages/, not .pivot/cache/stages/
     stages_dir = lock.get_stages_dir(cache_dir)
     rel_path = str(stages_dir.relative_to(project.get_project_root()) / f"{stage_name}.lock")
     content = git.read_file_from_revision(rel_path, rev)

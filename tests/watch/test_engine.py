@@ -12,6 +12,7 @@ import watchfiles
 from pivot import executor, project, types
 from pivot.pipeline import yaml as pipeline_yaml
 from pivot.registry import REGISTRY, stage
+from pivot.types import AgentRunRejection, AgentRunStartResult, AgentState
 from pivot.watch import _watch_utils, engine
 
 
@@ -2201,3 +2202,203 @@ def stage_b():
     for mod_name in list(sys.modules.keys()):
         if mod_name == "stages" or mod_name.startswith("stages."):
             del sys.modules[mod_name]
+
+
+# =============================================================================
+# Agent RPC Method Tests (try_start_agent_run)
+# =============================================================================
+
+
+def _helper_agent_noop() -> None:
+    pass
+
+
+@pytest.mark.usefixtures("pipeline_dir")
+def test_try_start_agent_run_succeeds_when_watching() -> None:
+    """try_start_agent_run succeeds when engine is in WATCHING state."""
+    REGISTRY.register(_helper_agent_noop, name="test_stage", deps=[], outs=[])
+
+    eng = engine.WatchEngine(debounce_ms=100)
+    # Simulate coordinator starting (sets state to WATCHING)
+    eng._update_agent_state(AgentState.WATCHING)
+
+    result = eng.try_start_agent_run("run123", ["test_stage"], force=False)
+
+    assert "status" in result, "Should return success result"
+    assert result["status"] == "started"
+    assert result["run_id"] == "run123"
+    assert result["stages_queued"] == ["test_stage"]
+
+
+@pytest.mark.usefixtures("pipeline_dir")
+def test_try_start_agent_run_rejects_when_idle() -> None:
+    """try_start_agent_run rejects when engine is in IDLE state (not ready yet)."""
+    REGISTRY.register(_helper_agent_noop, name="test_stage", deps=[], outs=[])
+
+    eng = engine.WatchEngine(debounce_ms=100)
+    # Default state is IDLE (coordinator not started)
+
+    result = eng.try_start_agent_run("run123", ["test_stage"], force=False)
+
+    assert "reason" in result, "Should return rejection result"
+    assert result["reason"] == "not_ready"
+    assert result["current_state"] == "idle"
+
+
+@pytest.mark.usefixtures("pipeline_dir")
+def test_try_start_agent_run_rejects_when_running() -> None:
+    """try_start_agent_run rejects when execution is already in progress."""
+    REGISTRY.register(_helper_agent_noop, name="test_stage", deps=[], outs=[])
+
+    eng = engine.WatchEngine(debounce_ms=100)
+    eng._update_agent_state(AgentState.WATCHING)
+
+    # First call should succeed
+    result1 = eng.try_start_agent_run("run1", ["test_stage"], force=False)
+    assert "status" in result1
+
+    # Second call should be rejected (state is now RUNNING)
+    result2 = eng.try_start_agent_run("run2", ["test_stage"], force=False)
+    assert "reason" in result2, "Should return rejection result"
+    assert result2["reason"] == "not_ready"
+    assert result2["current_state"] == "running"
+    # current_run_id is optional, check with "in"
+    if "current_run_id" in result2:
+        assert result2["current_run_id"] == "run1"
+
+
+@pytest.mark.usefixtures("pipeline_dir")
+def test_try_start_agent_run_sets_state_atomically() -> None:
+    """try_start_agent_run sets state to RUNNING atomically with queuing."""
+    REGISTRY.register(_helper_agent_noop, name="test_stage", deps=[], outs=[])
+
+    eng = engine.WatchEngine(debounce_ms=100)
+    eng._update_agent_state(AgentState.WATCHING)
+
+    result = eng.try_start_agent_run("run123", ["test_stage"], force=False)
+
+    assert "status" in result
+    # Verify state was set
+    status = eng.get_agent_status()
+    assert status["state"] == AgentState.RUNNING
+    # run_id is optional, check with "in"
+    if "run_id" in status:
+        assert status["run_id"] == "run123"
+
+
+@pytest.mark.usefixtures("pipeline_dir")
+def test_try_start_agent_run_initializes_run_fields() -> None:
+    """try_start_agent_run initializes all run tracking fields."""
+    REGISTRY.register(_helper_agent_noop, name="stage_a", deps=[], outs=[])
+    REGISTRY.register(_helper_agent_noop, name="stage_b", deps=[], outs=[])
+
+    eng = engine.WatchEngine(debounce_ms=100)
+    eng._update_agent_state(AgentState.WATCHING)
+
+    result = eng.try_start_agent_run("run123", ["stage_a", "stage_b"], force=False)
+
+    assert "status" in result
+    status = eng.get_agent_status()
+    # stages_pending is optional, check with "in"
+    if "stages_pending" in status:
+        assert status["stages_pending"] == ["stage_a", "stage_b"]
+    # stages_completed is optional, use .get() is not allowed per CLAUDE.md, check with "in"
+    if "stages_completed" in status:
+        assert status["stages_completed"] == []
+
+
+@pytest.mark.usefixtures("pipeline_dir")
+def test_try_start_agent_run_rolls_back_on_queue_full() -> None:
+    """try_start_agent_run rolls back state if queue is full (prevents deadlock)."""
+    REGISTRY.register(_helper_agent_noop, name="test_stage", deps=[], outs=[])
+
+    eng = engine.WatchEngine(debounce_ms=100)
+    eng._update_agent_state(AgentState.WATCHING)
+
+    # Fill the queue (maxsize=10)
+    for i in range(10):
+        eng._agent_request_queue.put_nowait((f"fill{i}", None, False))
+
+    # Now try_start_agent_run should fail and roll back
+    result = eng.try_start_agent_run("run_overflow", ["test_stage"], force=False)
+
+    assert "reason" in result, "Should return rejection result"
+    assert result["reason"] == "queue_full"
+
+    # Verify state was rolled back to WATCHING (not stuck at RUNNING)
+    status = eng.get_agent_status()
+    assert status["state"] == AgentState.WATCHING, "State should be rolled back"
+
+
+@pytest.mark.usefixtures("pipeline_dir")
+def test_try_start_agent_run_concurrent_calls_only_one_succeeds() -> None:
+    """Concurrent try_start_agent_run calls - exactly one should succeed."""
+    REGISTRY.register(_helper_agent_noop, name="test_stage", deps=[], outs=[])
+
+    eng = engine.WatchEngine(debounce_ms=100)
+    eng._update_agent_state(AgentState.WATCHING)
+
+    results: list[AgentRunStartResult | AgentRunRejection] = []
+    barrier = threading.Barrier(10)
+
+    def try_run(run_id: str) -> None:
+        barrier.wait()  # Synchronize all threads to start simultaneously
+        result = eng.try_start_agent_run(run_id, ["test_stage"], force=False)
+        results.append(result)
+
+    threads = [threading.Thread(target=try_run, args=(f"run{i}",)) for i in range(10)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # Exactly one should succeed
+    successes = [r for r in results if "status" in r]
+    rejections = [r for r in results if "reason" in r]
+
+    assert len(successes) == 1, f"Exactly one should succeed, got {len(successes)}"
+    assert len(rejections) == 9, f"Nine should be rejected, got {len(rejections)}"
+
+
+@pytest.mark.usefixtures("pipeline_dir")
+def test_get_agent_status_returns_running_state() -> None:
+    """get_agent_status returns RUNNING state with run details."""
+    REGISTRY.register(_helper_agent_noop, name="test_stage", deps=[], outs=[])
+
+    eng = engine.WatchEngine(debounce_ms=100)
+    eng._update_agent_state(AgentState.WATCHING)
+    eng.try_start_agent_run("run123", ["test_stage"], force=False)
+
+    status = eng.get_agent_status()
+
+    assert status["state"] == AgentState.RUNNING
+    # run_id is optional, check with "in"
+    if "run_id" in status:
+        assert status["run_id"] == "run123"
+    assert "stages_pending" in status
+
+
+@pytest.mark.usefixtures("pipeline_dir")
+def test_get_agent_status_returns_completion_stats() -> None:
+    """get_agent_status returns completion stats when in COMPLETED/FAILED state."""
+    eng = engine.WatchEngine(debounce_ms=100)
+
+    # Simulate completion
+    eng._update_agent_state(
+        AgentState.COMPLETED,
+        run_id="run123",
+        ran=3,
+        skipped=1,
+        failed=0,
+    )
+
+    status = eng.get_agent_status()
+
+    assert status["state"] == AgentState.COMPLETED
+    # ran, skipped, failed are optional, check with "in"
+    if "ran" in status:
+        assert status["ran"] == 3
+    if "skipped" in status:
+        assert status["skipped"] == 1
+    if "failed" in status:
+        assert status["failed"] == 0

@@ -56,8 +56,9 @@ def build_dag(stages: dict[str, RegistryStageInfo], validate: bool = True) -> nx
 
                 if not producers and validate and not pathlib.Path(dep).exists():
                     raise exceptions.DependencyNotFoundError(
-                        f"Stage '{stage_name}' depends on '{dep}' which is not produced by "
-                        + "any stage and does not exist on disk"
+                        stage=stage_name,
+                        dep=dep,
+                        available_outputs=list(outputs_map.keys()),
                     )
 
     _check_acyclic(graph)

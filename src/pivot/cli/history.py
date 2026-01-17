@@ -7,6 +7,7 @@ import click
 
 from pivot import project
 from pivot.cli import decorators as cli_decorators
+from pivot.cli import helpers as cli_helpers
 from pivot.storage import state
 from pivot.types import StageStatus
 
@@ -17,8 +18,12 @@ if TYPE_CHECKING:
 @cli_decorators.pivot_command(auto_discover=False)
 @click.option("--limit", "-n", default=10, help="Number of runs to show")
 @click.option("--json", "output_json", is_flag=True, help="Output as JSON")
-def history(limit: int, output_json: bool) -> None:
+@click.pass_context
+def history(ctx: click.Context, limit: int, output_json: bool) -> None:
     """List recent pipeline runs."""
+    cli_ctx = cli_helpers.get_cli_context(ctx)
+    quiet = cli_ctx["quiet"]
+
     state_db_path = project.get_project_root() / ".pivot" / "state.db"
 
     with state.StateDB(state_db_path) as state_db:
@@ -26,6 +31,9 @@ def history(limit: int, output_json: bool) -> None:
 
     if output_json:
         click.echo(json.dumps(runs, indent=2))
+        return
+
+    if quiet:
         return
 
     if not runs:
@@ -55,11 +63,15 @@ def _print_run_summary(run: RunManifest) -> None:
 @cli_decorators.pivot_command("show", auto_discover=False)
 @click.argument("run_id", required=False)
 @click.option("--json", "output_json", is_flag=True, help="Output as JSON")
-def show_cmd(run_id: str | None, output_json: bool) -> None:
+@click.pass_context
+def show_cmd(ctx: click.Context, run_id: str | None, output_json: bool) -> None:
     """Show details of a specific run.
 
     If RUN_ID is not provided, shows the most recent run.
     """
+    cli_ctx = cli_helpers.get_cli_context(ctx)
+    quiet = cli_ctx["quiet"]
+
     state_db_path = project.get_project_root() / ".pivot" / "state.db"
 
     with state.StateDB(state_db_path) as state_db:
@@ -77,7 +89,8 @@ def show_cmd(run_id: str | None, output_json: bool) -> None:
         click.echo(json.dumps(run, indent=2))
         return
 
-    _print_run_detail(run)
+    if not quiet:
+        _print_run_detail(run)
 
 
 def _print_run_detail(run: RunManifest) -> None:

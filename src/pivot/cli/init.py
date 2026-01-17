@@ -47,7 +47,6 @@ def init(ctx: click.Context, force: bool) -> None:
             )
 
     pivot_dir.mkdir(exist_ok=True)
-    # Create stages directory for git-tracked lock files
     (pivot_dir / "stages").mkdir(exist_ok=True)
     gitignore_path = pivot_dir / ".gitignore"
 

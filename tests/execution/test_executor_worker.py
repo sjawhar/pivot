@@ -28,22 +28,19 @@ if TYPE_CHECKING:
 class _TestStageDef_Deps(stage_def.StageDef):
     """StageDef with deps for testing."""
 
-    class deps:
-        data: loaders.CSV[pandas.DataFrame] = "input.csv"
+    data: stage_def.Dep[pandas.DataFrame] = stage_def.Dep("input.csv", loaders.CSV())
 
 
 class _TestStageDef_Outs(stage_def.StageDef):
     """StageDef with outs for testing."""
 
-    class outs:
-        result: loaders.JSON[dict[str, int]] = "output.json"
+    result: stage_def.Out[dict[str, int]] = stage_def.Out("output.json", loaders.JSON())
 
 
 class _TestStageDef_MissingDeps(stage_def.StageDef):
     """StageDef with deps that will be missing."""
 
-    class deps:
-        data: loaders.CSV[pandas.DataFrame] = "missing.csv"
+    data: stage_def.Dep[pandas.DataFrame] = stage_def.Dep("missing.csv", loaders.CSV())
 
 
 class _PlainParams(pydantic.BaseModel):
@@ -61,6 +58,14 @@ def worker_env(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> pathl
     return cache_dir
 
 
+@pytest.fixture
+def output_queue() -> Generator[mp.Queue[OutputMessage]]:
+    """Shared output queue for worker tests."""
+    manager = mp.Manager()
+    yield manager.Queue()  # pyright: ignore[reportReturnType] - Manager queue is compatible
+    manager.shutdown()
+
+
 def _helper_always_fail_takeover(sentinel: pathlib.Path, stale_pid: int | None) -> bool:
     """Helper that always fails lock takeover (for testing retry exhaustion)."""
     _ = sentinel, stale_pid  # Unused
@@ -72,7 +77,9 @@ def _helper_always_fail_takeover(sentinel: pathlib.Path, stale_pid: int | None) 
 # =============================================================================
 
 
-def test_execute_stage_with_missing_deps(worker_env: pathlib.Path) -> None:
+def test_execute_stage_with_missing_deps(
+    worker_env: pathlib.Path, output_queue: mp.Queue[OutputMessage]
+) -> None:
     """Worker returns failed status when dependency files are missing."""
     stage_info: WorkerStageInfo = {
         "func": lambda: None,
@@ -91,12 +98,7 @@ def test_execute_stage_with_missing_deps(worker_env: pathlib.Path) -> None:
         "no_cache": False,
     }
 
-    result = executor.execute_stage(
-        "test_stage",
-        stage_info,
-        worker_env,
-        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
-    )
+    result = executor.execute_stage("test_stage", stage_info, worker_env, output_queue)
 
     assert result["status"] == "failed"
     assert "missing deps" in result["reason"]
@@ -1698,7 +1700,7 @@ def test_stage_def_deps_loaded_before_function(
     loaded_data: list[Any] = []
 
     def stage_func(params: _TestStageDef_Deps) -> None:
-        loaded_data.append(params.deps.data)
+        loaded_data.append(params.data)
 
     stage_info: WorkerStageInfo = {
         "func": stage_func,
@@ -1736,7 +1738,7 @@ def test_stage_def_outs_saved_after_function(
     output_file = tmp_path / "output.json"
 
     def stage_func(params: _TestStageDef_Outs) -> None:
-        params.outs.result = {"value": 42}
+        params.result = {"value": 42}
 
     out_spec = outputs.Out(str(output_file))
 
@@ -1776,7 +1778,7 @@ def test_stage_def_missing_output_returns_failed(
     output_file = tmp_path / "output.json"
 
     def stage_func(params: _TestStageDef_Outs) -> None:
-        pass  # Never assign params.outs.result
+        pass  # Never assign params.result
 
     out_spec = outputs.Out(str(output_file))
 

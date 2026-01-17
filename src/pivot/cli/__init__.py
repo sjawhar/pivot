@@ -12,7 +12,16 @@ COMMAND_CATEGORIES = {
     "Inspection": ["list", "metrics", "params", "plots", "data", "history", "show"],
     "Versioning": ["track", "checkout"],
     "Remote": ["remote", "push", "pull"],
-    "Other": ["init", "export", "config", "completion", "schema", "check-ignore", "doctor"],
+    "Other": [
+        "init",
+        "export",
+        "import-dvc",
+        "config",
+        "completion",
+        "schema",
+        "check-ignore",
+        "doctor",
+    ],
 }
 
 # Lazy command registry: command_name -> (module_path, attr_name, help_text)
@@ -22,6 +31,11 @@ _LAZY_COMMANDS: dict[str, tuple[str, str, str]] = {
     "explain": ("pivot.cli.run", "explain_cmd", "Show detailed breakdown of why stages would run."),
     "list": ("pivot.cli.list", "list_cmd", "List registered stages."),
     "export": ("pivot.cli.export", "export", "Export pipeline to DVC YAML format."),
+    "import-dvc": (
+        "pivot.cli.import_dvc",
+        "import_dvc",
+        "Import DVC pipeline and convert to Pivot format.",
+    ),
     "track": ("pivot.cli.track", "track", "Track files/directories for caching."),
     "status": ("pivot.cli.status", "status", "Show pipeline, tracked files, and remote status."),
     "checkout": (

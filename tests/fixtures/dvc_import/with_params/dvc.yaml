@@ -1,0 +1,23 @@
+stages:
+  train:
+    cmd: python train.py
+    deps:
+      - data/features.csv
+    params:
+      - train.learning_rate
+      - train.epochs
+      - model.hidden_size
+    outs:
+      - models/model.pkl
+    metrics:
+      - metrics/scores.json
+
+  evaluate:
+    cmd: python evaluate.py
+    deps:
+      - models/model.pkl
+      - data/test.csv
+    params:
+      - params.yaml:evaluate.threshold
+    outs:
+      - results/predictions.csv

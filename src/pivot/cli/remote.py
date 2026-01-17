@@ -39,12 +39,18 @@ def remote_list() -> None:
 @click.option("-r", "--remote", "remote_name", help="Remote name (uses default if not specified)")
 @click.option("--dry-run", "-n", is_flag=True, help="Show what would be pushed")
 @click.option("-j", "--jobs", type=click.IntRange(min=1), default=20, help="Parallel upload jobs")
-def push(targets: tuple[str, ...], remote_name: str | None, dry_run: bool, jobs: int) -> None:
+@click.pass_context
+def push(
+    ctx: click.Context, targets: tuple[str, ...], remote_name: str | None, dry_run: bool, jobs: int
+) -> None:
     """Push cached outputs to remote storage.
 
     TARGETS can be stage names or file paths. If specified, pushes only
     those outputs. Otherwise, pushes all cached files.
     """
+    cli_ctx = cli_helpers.get_cli_context(ctx)
+    quiet = cli_ctx["quiet"]
+
     cache_dir = transfer.get_default_cache_dir()
     s3_remote, resolved_name = transfer.create_remote_from_name(remote_name)
 
@@ -56,11 +62,13 @@ def push(targets: tuple[str, ...], remote_name: str | None, dry_run: bool, jobs:
         local_hashes = transfer.get_local_cache_hashes(cache_dir)
 
     if not local_hashes:
-        click.echo("No files to push")
+        if not quiet:
+            click.echo("No files to push")
         return
 
     if dry_run:
-        click.echo(f"Would push {len(local_hashes)} file(s) to '{resolved_name}'")
+        if not quiet:
+            click.echo(f"Would push {len(local_hashes)} file(s) to '{resolved_name}'")
         return
 
     with state.StateDB(cache_dir) as state_db:
@@ -71,13 +79,18 @@ def push(targets: tuple[str, ...], remote_name: str | None, dry_run: bool, jobs:
             resolved_name,
             targets_list,
             jobs,
-            cli_helpers.make_progress_callback("Uploaded"),
+            None if quiet else cli_helpers.make_progress_callback("Uploaded"),
         )
 
-    click.echo(
-        f"Pushed to '{resolved_name}': {result['transferred']} transferred, {result['skipped']} skipped, {result['failed']} failed"
-    )
+    if not quiet:
+        click.echo(
+            f"Pushed to '{resolved_name}': {result['transferred']} transferred, {result['skipped']} skipped, {result['failed']} failed"
+        )
+
+    # Always print errors to stderr and exit non-zero on failures
     cli_helpers.print_transfer_errors(result["errors"])
+    if result["failed"] > 0:
+        raise SystemExit(1)
 
 
 @cli_decorators.pivot_command(auto_discover=False)
@@ -85,13 +98,19 @@ def push(targets: tuple[str, ...], remote_name: str | None, dry_run: bool, jobs:
 @click.option("-r", "--remote", "remote_name", help="Remote name (uses default if not specified)")
 @click.option("--dry-run", "-n", is_flag=True, help="Show what would be pulled")
 @click.option("-j", "--jobs", type=click.IntRange(min=1), default=20, help="Parallel download jobs")
-def pull(targets: tuple[str, ...], remote_name: str | None, dry_run: bool, jobs: int) -> None:
+@click.pass_context
+def pull(
+    ctx: click.Context, targets: tuple[str, ...], remote_name: str | None, dry_run: bool, jobs: int
+) -> None:
     """Pull cached outputs from remote storage.
 
     TARGETS can be stage names or file paths. If specified, pulls those
     outputs (and dependencies for stages). Otherwise, pulls all available
     files from remote.
     """
+    cli_ctx = cli_helpers.get_cli_context(ctx)
+    quiet = cli_ctx["quiet"]
+
     cache_dir = transfer.get_default_cache_dir()
     s3_remote, resolved_name = transfer.create_remote_from_name(remote_name)
 
@@ -105,7 +124,8 @@ def pull(targets: tuple[str, ...], remote_name: str | None, dry_run: bool, jobs:
 
         local = transfer.get_local_cache_hashes(cache_dir)
         missing = needed - local
-        click.echo(f"Would pull {len(missing)} file(s) from '{resolved_name}'")
+        if not quiet:
+            click.echo(f"Would pull {len(missing)} file(s) from '{resolved_name}'")
         return
 
     with state.StateDB(cache_dir) as state_db:
@@ -116,10 +136,15 @@ def pull(targets: tuple[str, ...], remote_name: str | None, dry_run: bool, jobs:
             resolved_name,
             targets_list,
             jobs,
-            cli_helpers.make_progress_callback("Downloaded"),
+            None if quiet else cli_helpers.make_progress_callback("Downloaded"),
         )
 
-    click.echo(
-        f"Pulled from '{resolved_name}': {result['transferred']} transferred, {result['skipped']} skipped, {result['failed']} failed"
-    )
+    if not quiet:
+        click.echo(
+            f"Pulled from '{resolved_name}': {result['transferred']} transferred, {result['skipped']} skipped, {result['failed']} failed"
+        )
+
+    # Always print errors to stderr and exit non-zero on failures
     cli_helpers.print_transfer_errors(result["errors"])
+    if result["failed"] > 0:
+        raise SystemExit(1)

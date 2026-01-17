@@ -64,7 +64,7 @@ Workers receive pickled functions—lambdas, closures, and `__main__` definition
 
 ## StageDef Conventions
 
-StageDef and custom loaders must be **module-level** (required for type hint resolution and pickling). Loader code is fingerprinted—changes trigger re-runs. YAML `deps`/`outs` completely replace StageDef defaults.
+StageDef and custom loaders must be **module-level** (required for type hint resolution and pickling). Loader code is fingerprinted—changes trigger re-runs. StageDef stages manage their own deps/outs and cannot be overridden via decorator or YAML.
 
 ## Code Quality
 

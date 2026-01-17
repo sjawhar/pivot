@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import pathlib
+from typing import Literal
 
 import click
 
 from pivot import config, project, registry
 from pivot.cli import completion
 from pivot.cli import decorators as cli_decorators
+from pivot.cli import helpers as cli_helpers
 from pivot.storage import cache, lock, track
 from pivot.types import OutputHash
+
+RestoreResult = Literal["restored", "skipped"]
 
 
 def _get_stage_output_info(project_root: pathlib.Path) -> dict[str, OutputHash]:
@@ -29,75 +33,6 @@ def _get_stage_output_info(project_root: pathlib.Path) -> dict[str, OutputHash]:
     return outputs
 
 
-def _checkout_all_tracked(
-    tracked_files: dict[str, track.PvtData],
-    cache_dir: pathlib.Path,
-    checkout_modes: list[cache.CheckoutMode],
-    force: bool,
-) -> None:
-    """Restore all tracked files."""
-    for abs_path_str, pvt_data in tracked_files.items():
-        path = pathlib.Path(abs_path_str)
-        output_hash = _pvt_to_output_hash(pvt_data)
-        _restore_path(path, output_hash, cache_dir, checkout_modes, force)
-
-
-def _checkout_all_outputs(
-    stage_outputs: dict[str, OutputHash],
-    cache_dir: pathlib.Path,
-    checkout_modes: list[cache.CheckoutMode],
-    force: bool,
-) -> None:
-    """Restore all stage outputs."""
-    for abs_path_str, output_hash in stage_outputs.items():
-        if output_hash is None:
-            continue
-        path = pathlib.Path(abs_path_str)
-        _restore_path(path, output_hash, cache_dir, checkout_modes, force)
-
-
-def _checkout_target(
-    target: str,
-    tracked_files: dict[str, track.PvtData],
-    stage_outputs: dict[str, OutputHash],
-    cache_dir: pathlib.Path,
-    checkout_modes: list[cache.CheckoutMode],
-    force: bool,
-) -> None:
-    """Restore a specific target."""
-    # Validate path doesn't escape project
-    if track.has_path_traversal(target):
-        raise click.ClickException(f"Path traversal not allowed: {target}")
-
-    # Use normalized path (preserve symlinks) to match keys in tracked_files/stage_outputs
-    abs_path = project.normalize_path(target)
-    abs_path_str = str(abs_path)
-
-    # Check if it's a tracked file
-    if abs_path_str in tracked_files:
-        pvt_data = tracked_files[abs_path_str]
-        output_hash = _pvt_to_output_hash(pvt_data)
-        _restore_path(abs_path, output_hash, cache_dir, checkout_modes, force)
-        return
-
-    # Check if it's a stage output
-    if abs_path_str in stage_outputs:
-        output_hash = stage_outputs[abs_path_str]
-        if output_hash is None:
-            raise click.ClickException(
-                f"'{target}' has no cached version. "
-                + "Run the stage first, or use 'pivot pull' to fetch from remote."
-            )
-        _restore_path(abs_path, output_hash, cache_dir, checkout_modes, force)
-        return
-
-    # Unknown target
-    raise click.ClickException(
-        f"'{target}' is not a tracked file or stage output. "
-        + "Use 'pivot list' to see stages or 'pivot track' to track files."
-    )
-
-
 def _pvt_to_output_hash(pvt_data: track.PvtData) -> OutputHash:
     """Convert PvtData to OutputHash format."""
     manifest = pvt_data.get("manifest")
@@ -112,11 +47,14 @@ def _restore_path(
     cache_dir: pathlib.Path,
     checkout_modes: list[cache.CheckoutMode],
     force: bool,
-) -> None:
-    """Restore a file or directory from cache."""
+) -> tuple[RestoreResult, str]:
+    """Restore a file or directory from cache.
+
+    Returns:
+        Tuple of (result, path_name) for the caller to handle output.
+    """
     if path.exists() and not force:
-        click.echo(f"Skipped: {path.name} (already exists)")
-        return
+        return ("skipped", path.name)
 
     if force and path.exists():
         cache.remove_output(path)
@@ -128,7 +66,15 @@ def _restore_path(
             + "Try 'pivot pull' to fetch from remote storage."
         )
 
-    click.echo(f"Restored: {path.name}")
+    return ("restored", path.name)
+
+
+def _print_restore_result(result: RestoreResult, name: str) -> None:
+    """Print restore result to user."""
+    if result == "restored":
+        click.echo(f"Restored: {name}")
+    else:
+        click.echo(f"Skipped: {name} (already exists)")
 
 
 @cli_decorators.pivot_command()
@@ -140,11 +86,17 @@ def _restore_path(
     help="Checkout mode for restoration (default: project config or hardlink)",
 )
 @click.option("--force", "-f", is_flag=True, help="Overwrite existing files")
-def checkout(targets: tuple[str, ...], checkout_mode: str | None, force: bool) -> None:
+@click.pass_context
+def checkout(
+    ctx: click.Context, targets: tuple[str, ...], checkout_mode: str | None, force: bool
+) -> None:
     """Restore tracked files and stage outputs from cache.
 
     If no targets specified, restores all tracked files and stage outputs.
     """
+    cli_ctx = cli_helpers.get_cli_context(ctx)
+    quiet = cli_ctx["quiet"]
+
     project_root = project.get_project_root()
     cache_dir = project_root / ".pivot" / "cache" / "files"
 
@@ -159,10 +111,61 @@ def checkout(targets: tuple[str, ...], checkout_mode: str | None, force: bool) -
     stage_outputs = _get_stage_output_info(project_root)
 
     if not targets:
-        # Restore everything
-        _checkout_all_tracked(tracked_files, cache_dir, checkout_modes, force)
-        _checkout_all_outputs(stage_outputs, cache_dir, checkout_modes, force)
+        # Restore all tracked files
+        for abs_path_str, pvt_data in tracked_files.items():
+            path = pathlib.Path(abs_path_str)
+            output_hash = _pvt_to_output_hash(pvt_data)
+            result, name = _restore_path(path, output_hash, cache_dir, checkout_modes, force)
+            if not quiet:
+                _print_restore_result(result, name)
+
+        # Restore all stage outputs
+        for abs_path_str, output_hash in stage_outputs.items():
+            if output_hash is None:
+                continue
+            path = pathlib.Path(abs_path_str)
+            result, name = _restore_path(path, output_hash, cache_dir, checkout_modes, force)
+            if not quiet:
+                _print_restore_result(result, name)
     else:
         # Restore specific targets
         for target in targets:
-            _checkout_target(target, tracked_files, stage_outputs, cache_dir, checkout_modes, force)
+            # Validate path doesn't escape project
+            if track.has_path_traversal(target):
+                raise click.ClickException(f"Path traversal not allowed: {target}")
+
+            # Use normalized path (preserve symlinks) to match keys in tracked_files/stage_outputs
+            abs_path = project.normalize_path(target)
+            abs_path_str = str(abs_path)
+
+            # Check if it's a tracked file
+            if abs_path_str in tracked_files:
+                pvt_data = tracked_files[abs_path_str]
+                output_hash = _pvt_to_output_hash(pvt_data)
+                result, name = _restore_path(
+                    abs_path, output_hash, cache_dir, checkout_modes, force
+                )
+                if not quiet:
+                    _print_restore_result(result, name)
+                continue
+
+            # Check if it's a stage output
+            if abs_path_str in stage_outputs:
+                output_hash = stage_outputs[abs_path_str]
+                if output_hash is None:
+                    raise click.ClickException(
+                        f"'{target}' has no cached version. "
+                        + "Run the stage first, or use 'pivot pull' to fetch from remote."
+                    )
+                result, name = _restore_path(
+                    abs_path, output_hash, cache_dir, checkout_modes, force
+                )
+                if not quiet:
+                    _print_restore_result(result, name)
+                continue
+
+            # Unknown target
+            raise click.ClickException(
+                f"'{target}' is not a tracked file or stage output. "
+                + "Use 'pivot list' to see stages or 'pivot track' to track files."
+            )

@@ -4,12 +4,32 @@ import json
 import pathlib
 from typing import TYPE_CHECKING
 
-from pivot import cli, executor, stage
+import pandas  # noqa: TC002 - needed at runtime for StageDef type hint resolution
+
+from pivot import cli, executor, loaders, stage, stage_def
 from pivot.registry import REGISTRY
 from pivot.tui import console
 
 if TYPE_CHECKING:
     from click.testing import CliRunner
+
+
+# =============================================================================
+# Module-level StageDef for integration testing (required for pickling)
+# =============================================================================
+
+
+class _IntegrationTestParams(stage_def.StageDef):
+    """StageDef for CLI integration testing."""
+
+    data: stage_def.Dep[pandas.DataFrame] = stage_def.Dep("input.csv", loaders.CSV())
+    result: stage_def.Out[dict[str, int]] = stage_def.Out("output.json", loaders.JSON())
+
+
+def integration_process_data(params: _IntegrationTestParams) -> None:
+    """Module-level stage function for integration testing."""
+    df = params.data
+    params.result = {"count": len(df), "sum_a": int(df["a"].sum())}
 
 
 def test_cli_help_shows_commands(runner: CliRunner) -> None:
@@ -539,3 +559,151 @@ def test_cli_list_quiet_produces_no_output(runner: CliRunner, tmp_path: pathlib.
         assert result.exit_code == 0
         # Output should be empty or minimal (just newlines)
         assert result.output.strip() == "", "Quiet mode should suppress output"
+
+
+def test_cli_run_quiet_produces_no_output(runner: CliRunner, tmp_path: pathlib.Path) -> None:
+    """pivot --quiet run produces no output when stages run successfully."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+
+        # Create a simple pipeline using pipeline.py
+        pathlib.Path("pipeline.py").write_text(
+            """\
+from pivot.registry import stage
+import pathlib
+
+@stage(deps=[], outs=["output.txt"])
+def test_stage():
+    pathlib.Path("output.txt").write_text("hello")
+"""
+        )
+
+        result = runner.invoke(cli.cli, ["--quiet", "run"])
+
+        assert result.exit_code == 0, f"Run failed: {result.output}"
+        assert result.output.strip() == "", "Quiet mode should suppress all output"
+        # Verify stage actually ran
+        assert pathlib.Path("output.txt").exists()
+
+
+def test_cli_track_quiet_produces_no_output(runner: CliRunner, tmp_path: pathlib.Path) -> None:
+    """pivot --quiet track produces no output."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        pathlib.Path("data.txt").write_text("test data")
+
+        result = runner.invoke(cli.cli, ["--quiet", "track", "data.txt"])
+
+        assert result.exit_code == 0
+        assert result.output.strip() == "", "Quiet mode should suppress output"
+        # Verify file was tracked
+        assert pathlib.Path("data.txt.pvt").exists()
+
+
+def test_cli_checkout_quiet_produces_no_output(runner: CliRunner, tmp_path: pathlib.Path) -> None:
+    """pivot --quiet checkout produces no output."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        # Track a file first
+        pathlib.Path("data.txt").write_text("test data")
+        runner.invoke(cli.cli, ["track", "data.txt"])
+
+        # Remove original and checkout
+        pathlib.Path("data.txt").unlink()
+
+        result = runner.invoke(cli.cli, ["--quiet", "checkout"])
+
+        assert result.exit_code == 0
+        assert result.output.strip() == "", "Quiet mode should suppress output"
+        # Verify file was restored
+        assert pathlib.Path("data.txt").exists()
+
+
+def test_cli_commit_quiet_produces_no_output(runner: CliRunner, tmp_path: pathlib.Path) -> None:
+    """pivot --quiet commit produces no output."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+
+        # No pending stages, but --list should still be quiet
+        result = runner.invoke(cli.cli, ["--quiet", "commit", "--list"])
+
+        assert result.exit_code == 0
+        assert result.output.strip() == "", "Quiet mode should suppress output"
+
+
+def test_cli_export_quiet_produces_no_output(runner: CliRunner, tmp_path: pathlib.Path) -> None:
+    """pivot --quiet export produces no output."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+
+        # Create a simple pipeline using pipeline.py
+        pathlib.Path("pipeline.py").write_text(
+            """\
+from pivot.registry import stage
+
+@stage(deps=[], outs=[])
+def test_stage():
+    pass
+"""
+        )
+
+        result = runner.invoke(cli.cli, ["--quiet", "export"])
+
+        assert result.exit_code == 0, f"Export failed: {result.output}"
+        assert result.output.strip() == "", "Quiet mode should suppress output"
+        # Verify file was created
+        assert pathlib.Path("dvc.yaml").exists()
+
+
+def test_cli_doctor_quiet_produces_no_output(runner: CliRunner, tmp_path: pathlib.Path) -> None:
+    """pivot --quiet doctor produces no output."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+
+        result = runner.invoke(cli.cli, ["--quiet", "doctor"])
+
+        assert result.exit_code == 0
+        assert result.output.strip() == "", "Quiet mode should suppress output"
+
+
+def test_cli_history_quiet_produces_no_output(runner: CliRunner, tmp_path: pathlib.Path) -> None:
+    """pivot --quiet history produces no output."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        pathlib.Path(".pivot").mkdir()
+
+        result = runner.invoke(cli.cli, ["--quiet", "history"])
+
+        assert result.exit_code == 0
+        assert result.output.strip() == "", "Quiet mode should suppress output"
+
+
+# =============================================================================
+# StageDef Integration Tests
+# =============================================================================
+
+
+def test_cli_run_stage_def_loads_deps_and_saves_outs(
+    runner: CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """StageDef deps are loaded and outs are saved in end-to-end pipeline run."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+
+        # Create input data
+        pathlib.Path("input.csv").write_text("a,b\n1,2\n3,4\n")
+
+        # Register the module-level stage function
+        stage()(integration_process_data)
+
+        result = runner.invoke(cli.cli, ["run"])
+
+        assert result.exit_code == 0, f"Run failed: {result.output}"
+
+        # Verify output was created
+        output_file = pathlib.Path("output.json")
+        assert output_file.exists(), "Output file should be created"
+
+        # Verify content is correct
+        output_data = json.loads(output_file.read_text())
+        assert output_data == {"count": 2, "sum_a": 4}, f"Unexpected output: {output_data}"

@@ -378,20 +378,19 @@ pivot data diff output.csv --no-tui --json
 
 ```python
 import pandas as pd
-from pivot import stage
-from pivot.loaders import CSV, JSON, Pickle
-from pivot.stage_def import StageDef
+from pivot import loaders, stage, stage_def
 
 
-class TrainParams(StageDef):
-    class deps:
-        train_data: CSV[pd.DataFrame] = "data/train.csv"
-        config: JSON[dict] = "config.json"
+class TrainParams(stage_def.StageDef):
+    # Deps - type-safe file loading
+    train_data: stage_def.Dep[pd.DataFrame] = stage_def.Dep("data/train.csv", loaders.CSV())
+    config: stage_def.Dep[dict] = stage_def.Dep("config.json", loaders.JSON())
 
-    class outs:
-        model: Pickle = "models/model.pkl"
-        metrics: JSON[dict] = "metrics.json"
+    # Outs - type-safe file saving
+    model: stage_def.Out[dict] = stage_def.Out("models/model.pkl", loaders.Pickle())
+    metrics: stage_def.Out[dict] = stage_def.Out("metrics.json", loaders.JSON())
 
+    # Regular params
     learning_rate: float = 0.01
     epochs: int = 100
 
@@ -399,16 +398,16 @@ class TrainParams(StageDef):
 @stage
 def train(params: TrainParams) -> None:
     # Deps are auto-loaded before function runs
-    df = params.deps.train_data  # Returns pd.DataFrame
-    config = params.deps.config  # Returns dict
+    df = params.train_data  # Returns pd.DataFrame
+    config = params.config  # Returns dict
 
     # Train model...
     model = {"weights": df.shape, "lr": params.learning_rate}
     metrics = {"accuracy": 0.95}
 
     # Assign outputs - auto-saved after function returns
-    params.outs.model = model
-    params.outs.metrics = metrics
+    params.model = model
+    params.metrics = metrics
 ```
 
 **Benefits:**
@@ -421,11 +420,11 @@ def train(params: TrainParams) -> None:
 
 | Loader | Load returns | Save accepts | Options |
 |--------|--------------|--------------|---------|
-| `CSV[T]` | DataFrame | DataFrame | `sep`, `index_col`, `dtype` |
-| `JSON[T]` | dict/list | dict/list | `indent` |
-| `YAML[T]` | dict/list | dict/list | - |
-| `Pickle[T]` | Any | Any | - |
-| `PathOnly` | pathlib.Path | (validates exists) | - |
+| `loaders.CSV()` | DataFrame | DataFrame | `sep`, `index_col`, `dtype` |
+| `loaders.JSON()` | dict/list | dict/list | `indent` |
+| `loaders.YAML()` | dict/list | dict/list | - |
+| `loaders.Pickle()` | Any | Any | - |
+| `loaders.PathOnly()` | pathlib.Path | (validates exists) | - |
 
 **With pivot.yaml:**
 

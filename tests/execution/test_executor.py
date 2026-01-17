@@ -1369,3 +1369,215 @@ def test_ensure_cleanup_registered_registers_atexit(mocker: "MockerFixture") -> 
     finally:
         executor_core._ensure_cleanup_registered.cache_clear()
         executor_core._ensure_cleanup_registered()
+
+
+# =============================================================================
+# Deferred Writes Tests (Critical for multi-process safety)
+# =============================================================================
+
+
+def test_executor_deferred_writes_applied(pipeline_dir: pathlib.Path) -> None:
+    """Coordinator applies deferred_writes from worker results.
+
+    Verifies that after stage execution:
+    - Output generations are incremented in StateDB
+    - Run cache entries allow skip detection on re-run
+    """
+    from pivot.storage import state
+
+    (pipeline_dir / "input.txt").write_text("hello")
+
+    @pivot.stage(deps=["input.txt"], outs=["output.txt"])
+    def process() -> None:
+        pathlib.Path("output.txt").write_text("result")
+
+    results = executor.run(show_output=False)
+    assert results["process"]["status"] == "ran"
+
+    # Verify StateDB has output generation incremented
+    db_path = pipeline_dir / ".pivot" / "state.db"
+    with state.StateDB(db_path, readonly=True) as db:
+        output_path = pipeline_dir / "output.txt"
+        output_gen = db.get_generation(output_path)
+        assert output_gen is not None and output_gen >= 1, (
+            "Output generation should be incremented after stage runs"
+        )
+
+    # Verify deferred writes were applied by checking skip works on second run
+    results = executor.run(show_output=False)
+    assert results["process"]["status"] == "skipped", (
+        "Stage should skip on second run - deferred writes recorded run cache"
+    )
+
+
+def test_executor_multi_stage_generation_tracking(pipeline_dir: pathlib.Path) -> None:
+    """Generations increment correctly across stage chain."""
+    from pivot.storage import state
+
+    (pipeline_dir / "input.txt").write_text("data_v1")
+
+    @pivot.stage(deps=["input.txt"], outs=["step1.txt"])
+    def step1() -> None:
+        # Output content depends on input, so it changes when input changes
+        data = pathlib.Path("input.txt").read_text()
+        pathlib.Path("step1.txt").write_text(f"processed: {data}")
+
+    @pivot.stage(deps=["step1.txt"], outs=["step2.txt"])
+    def step2() -> None:
+        data = pathlib.Path("step1.txt").read_text()
+        pathlib.Path("step2.txt").write_text(f"final: {data}")
+
+    # First run
+    results = executor.run(show_output=False)
+    assert results["step1"]["status"] == "ran"
+    assert results["step2"]["status"] == "ran"
+
+    db_path = pipeline_dir / ".pivot" / "state.db"
+    with state.StateDB(db_path, readonly=True) as db:
+        step1_gen = db.get_generation(pipeline_dir / "step1.txt")
+        step2_gen = db.get_generation(pipeline_dir / "step2.txt")
+        assert step1_gen is not None and step1_gen >= 1
+        assert step2_gen is not None and step2_gen >= 1
+
+    # Modify input - both should re-run since step1 output changes
+    (pipeline_dir / "input.txt").write_text("data_v2")
+    results = executor.run(show_output=False)
+    assert results["step1"]["status"] == "ran"
+    assert results["step2"]["status"] == "ran"
+
+    with state.StateDB(db_path, readonly=True) as db:
+        new_step1_gen = db.get_generation(pipeline_dir / "step1.txt")
+        new_step2_gen = db.get_generation(pipeline_dir / "step2.txt")
+        # Generations should have incremented
+        assert new_step1_gen is not None and new_step1_gen > step1_gen  # type: ignore[operator]
+        assert new_step2_gen is not None and new_step2_gen > step2_gen  # type: ignore[operator]
+
+
+# =============================================================================
+# Concurrent Execution Tests
+# =============================================================================
+
+
+def test_concurrent_runs_different_stages_allowed(pipeline_dir: pathlib.Path) -> None:
+    """Two pivot runs targeting different stages can proceed independently."""
+    (pipeline_dir / "input.txt").write_text("data")
+
+    @pivot.stage(deps=["input.txt"], outs=["stage_a.txt"])
+    def stage_a() -> None:
+        time.sleep(0.05)
+        pathlib.Path("stage_a.txt").write_text("a")
+
+    @pivot.stage(deps=["input.txt"], outs=["stage_b.txt"])
+    def stage_b() -> None:
+        time.sleep(0.05)
+        pathlib.Path("stage_b.txt").write_text("b")
+
+    # Both stages can run in parallel since they have different execution locks
+    results = executor.run(max_workers=4, show_output=False)
+    assert results["stage_a"]["status"] == "ran"
+    assert results["stage_b"]["status"] == "ran"
+
+
+# =============================================================================
+# Scalability Tests
+# =============================================================================
+
+
+# Module-level stage helpers for chain test (avoids closure/fingerprinting issues)
+def _helper_chain_step1() -> None:
+    pathlib.Path("step1.txt").write_text(pathlib.Path("input.txt").read_text() + "_1")
+
+
+def _helper_chain_step2() -> None:
+    pathlib.Path("step2.txt").write_text(pathlib.Path("step1.txt").read_text() + "_2")
+
+
+def _helper_chain_step3() -> None:
+    pathlib.Path("step3.txt").write_text(pathlib.Path("step2.txt").read_text() + "_3")
+
+
+def _helper_chain_step4() -> None:
+    pathlib.Path("step4.txt").write_text(pathlib.Path("step3.txt").read_text() + "_4")
+
+
+def _helper_chain_step5() -> None:
+    pathlib.Path("step5.txt").write_text(pathlib.Path("step4.txt").read_text() + "_5")
+
+
+def _helper_chain_step6() -> None:
+    pathlib.Path("step6.txt").write_text(pathlib.Path("step5.txt").read_text() + "_6")
+
+
+def _helper_chain_step7() -> None:
+    pathlib.Path("step7.txt").write_text(pathlib.Path("step6.txt").read_text() + "_7")
+
+
+def _helper_chain_step8() -> None:
+    pathlib.Path("step8.txt").write_text(pathlib.Path("step7.txt").read_text() + "_8")
+
+
+def _helper_chain_step9() -> None:
+    pathlib.Path("step9.txt").write_text(pathlib.Path("step8.txt").read_text() + "_9")
+
+
+def _helper_chain_step10() -> None:
+    pathlib.Path("step10.txt").write_text(pathlib.Path("step9.txt").read_text() + "_10")
+
+
+def test_many_stage_pipeline_completes(pipeline_dir: pathlib.Path) -> None:
+    """Pipeline with many stages completes in reasonable time."""
+    (pipeline_dir / "input.txt").write_text("start")
+
+    # Register 10-stage chain using module-level helpers
+    chain_stages = [
+        (_helper_chain_step1, "step1", ["input.txt"], ["step1.txt"]),
+        (_helper_chain_step2, "step2", ["step1.txt"], ["step2.txt"]),
+        (_helper_chain_step3, "step3", ["step2.txt"], ["step3.txt"]),
+        (_helper_chain_step4, "step4", ["step3.txt"], ["step4.txt"]),
+        (_helper_chain_step5, "step5", ["step4.txt"], ["step5.txt"]),
+        (_helper_chain_step6, "step6", ["step5.txt"], ["step6.txt"]),
+        (_helper_chain_step7, "step7", ["step6.txt"], ["step7.txt"]),
+        (_helper_chain_step8, "step8", ["step7.txt"], ["step8.txt"]),
+        (_helper_chain_step9, "step9", ["step8.txt"], ["step9.txt"]),
+        (_helper_chain_step10, "step10", ["step9.txt"], ["step10.txt"]),
+    ]
+
+    for fn, name, deps, outs in chain_stages:
+        registry.REGISTRY.register(fn, name=name, deps=deps, outs=outs)
+
+    start_time = time.time()
+    results = executor.run(show_output=False)
+    elapsed = time.time() - start_time
+
+    # All stages should run
+    for i in range(1, 11):
+        assert results[f"step{i}"]["status"] == "ran", f"step{i} should have run"
+
+    # Should complete in reasonable time (< 30s even with slow CI)
+    assert elapsed < 30, f"10-stage pipeline took too long: {elapsed:.1f}s"
+
+
+def test_skip_detection_fast_with_many_deps(pipeline_dir: pathlib.Path) -> None:
+    """Second run with many deps skips quickly via generation check."""
+    # Create many input files
+    for i in range(20):
+        (pipeline_dir / f"input_{i}.txt").write_text(f"data_{i}")
+
+    deps = [f"input_{i}.txt" for i in range(20)]
+
+    @pivot.stage(deps=deps, outs=["output.txt"])
+    def process() -> None:
+        pathlib.Path("output.txt").write_text("done")
+
+    # First run
+    results = executor.run(show_output=False)
+    assert results["process"]["status"] == "ran"
+
+    # Second run - should skip quickly (generation-based check)
+    start_time = time.time()
+    results = executor.run(show_output=False)
+    elapsed = time.time() - start_time
+
+    assert results["process"]["status"] == "skipped"
+    # Skip check should be fast (< 5s even with slow CI)
+    assert elapsed < 5, f"Skip detection took too long: {elapsed:.1f}s"

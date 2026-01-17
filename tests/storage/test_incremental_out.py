@@ -57,8 +57,11 @@ def test_prepare_outputs_incremental_no_cache_creates_empty(tmp_path: pathlib.Pa
     assert not output_file.exists()
 
 
-def test_prepare_outputs_incremental_restores_from_cache(tmp_path: pathlib.Path) -> None:
+def test_prepare_outputs_incremental_restores_from_cache(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """IncrementalOut should restore from cache before execution."""
+    monkeypatch.chdir(tmp_path)
     output_file = tmp_path / "database.txt"
     cache_dir = tmp_path / "cache"
     cache_dir.mkdir()
@@ -67,17 +70,17 @@ def test_prepare_outputs_incremental_restores_from_cache(tmp_path: pathlib.Path)
     output_file.write_text("cached content\n")
     output_hash = cache.save_to_cache(output_file, cache_dir)
 
-    # Lock data simulating previous run
+    # Lock data simulating previous run (uses relative path like production)
     lock_data = LockData(
         code_manifest={},
         params={},
         dep_hashes={},
-        output_hashes={str(output_file): output_hash},
+        output_hashes={"database.txt": output_hash},
         dep_generations={},
     )
 
-    # Prepare for execution
-    stage_outs = [outputs.IncrementalOut(path=str(output_file))]
+    # Prepare for execution (uses relative path like production)
+    stage_outs = [outputs.IncrementalOut(path="database.txt")]
     worker._prepare_outputs_for_execution(stage_outs, lock_data, cache_dir)
 
     # File should be restored
@@ -85,8 +88,11 @@ def test_prepare_outputs_incremental_restores_from_cache(tmp_path: pathlib.Path)
     assert output_file.read_text() == "cached content\n"
 
 
-def test_prepare_outputs_incremental_restored_file_is_writable(tmp_path: pathlib.Path) -> None:
+def test_prepare_outputs_incremental_restored_file_is_writable(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Restored IncrementalOut should be a writable copy, not symlink."""
+    monkeypatch.chdir(tmp_path)
     output_file = tmp_path / "database.txt"
     cache_dir = tmp_path / "cache"
     cache_dir.mkdir()
@@ -99,12 +105,12 @@ def test_prepare_outputs_incremental_restored_file_is_writable(tmp_path: pathlib
         code_manifest={},
         params={},
         dep_hashes={},
-        output_hashes={str(output_file): output_hash},
+        output_hashes={"database.txt": output_hash},
         dep_generations={},
     )
 
-    # Prepare for execution
-    stage_outs = [outputs.IncrementalOut(path=str(output_file))]
+    # Prepare for execution (uses relative path like production)
+    stage_outs = [outputs.IncrementalOut(path="database.txt")]
     worker._prepare_outputs_for_execution(stage_outs, lock_data, cache_dir)
 
     # Should NOT be a symlink (should be a copy)
@@ -210,8 +216,11 @@ def test_integration_second_run_appends_to_output(
 # =============================================================================
 
 
-def test_incremental_out_restores_directory(tmp_path: pathlib.Path) -> None:
+def test_incremental_out_restores_directory(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """IncrementalOut should restore directory from cache with COPY mode."""
+    monkeypatch.chdir(tmp_path)
     output_dir = tmp_path / "data_dir"
     cache_dir = tmp_path / "cache"
     cache_dir.mkdir()
@@ -226,12 +235,12 @@ def test_incremental_out_restores_directory(tmp_path: pathlib.Path) -> None:
     # Save to cache
     output_hash = cache.save_to_cache(output_dir, cache_dir)
 
-    # Simulate lock data from previous run
+    # Simulate lock data from previous run (uses relative path like production)
     lock_data = LockData(
         code_manifest={},
         params={},
         dep_hashes={},
-        output_hashes={str(output_dir): output_hash},
+        output_hashes={"data_dir": output_hash},
         dep_generations={},
     )
 
@@ -239,8 +248,8 @@ def test_incremental_out_restores_directory(tmp_path: pathlib.Path) -> None:
     cache.remove_output(output_dir)
     assert not output_dir.exists()
 
-    # Prepare for execution (restore with COPY mode)
-    stage_outs = [outputs.IncrementalOut(path=str(output_dir))]
+    # Prepare for execution (restore with COPY mode, uses relative path)
+    stage_outs = [outputs.IncrementalOut(path="data_dir")]
     worker._prepare_outputs_for_execution(stage_outs, lock_data, cache_dir)
 
     # Directory should be restored
@@ -249,8 +258,11 @@ def test_incremental_out_restores_directory(tmp_path: pathlib.Path) -> None:
     assert (output_dir / "subdir" / "file2.txt").read_text() == "content2"
 
 
-def test_incremental_out_directory_is_writable(tmp_path: pathlib.Path) -> None:
+def test_incremental_out_directory_is_writable(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Restored directory should allow creating new files."""
+    monkeypatch.chdir(tmp_path)
     output_dir = tmp_path / "data_dir"
     cache_dir = tmp_path / "cache"
     cache_dir.mkdir()
@@ -266,13 +278,13 @@ def test_incremental_out_directory_is_writable(tmp_path: pathlib.Path) -> None:
         code_manifest={},
         params={},
         dep_hashes={},
-        output_hashes={str(output_dir): output_hash},
+        output_hashes={"data_dir": output_hash},
         dep_generations={},
     )
 
-    # Delete and restore
+    # Delete and restore (uses relative path like production)
     cache.remove_output(output_dir)
-    stage_outs = [outputs.IncrementalOut(path=str(output_dir))]
+    stage_outs = [outputs.IncrementalOut(path="data_dir")]
     worker._prepare_outputs_for_execution(stage_outs, lock_data, cache_dir)
 
     # Should be able to write new files
@@ -285,8 +297,11 @@ def test_incremental_out_directory_is_writable(tmp_path: pathlib.Path) -> None:
     assert (output_dir / "existing.txt").read_text() == "modified"
 
 
-def test_incremental_out_directory_subdirs_writable(tmp_path: pathlib.Path) -> None:
+def test_incremental_out_directory_subdirs_writable(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Restored subdirectories should allow creating new files."""
+    monkeypatch.chdir(tmp_path)
     output_dir = tmp_path / "data_dir"
     cache_dir = tmp_path / "cache"
     cache_dir.mkdir()
@@ -304,13 +319,13 @@ def test_incremental_out_directory_subdirs_writable(tmp_path: pathlib.Path) -> N
         code_manifest={},
         params={},
         dep_hashes={},
-        output_hashes={str(output_dir): output_hash},
+        output_hashes={"data_dir": output_hash},
         dep_generations={},
     )
 
-    # Delete and restore
+    # Delete and restore (uses relative path like production)
     cache.remove_output(output_dir)
-    stage_outs = [outputs.IncrementalOut(path=str(output_dir))]
+    stage_outs = [outputs.IncrementalOut(path="data_dir")]
     worker._prepare_outputs_for_execution(stage_outs, lock_data, cache_dir)
 
     # Should be able to create files in subdirectories
