@@ -45,6 +45,7 @@ def _import_fresh(name: str) -> types.ModuleType:
         del sys.modules[name]
     linecache.clearcache()  # Clear cached source (inspect.getsource uses linecache)
     importlib.invalidate_caches()
+    linecache.clearcache()  # Clear source cache used by inspect.getsource()
     return importlib.import_module(name)
 
 

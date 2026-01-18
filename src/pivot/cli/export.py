@@ -6,6 +6,7 @@ import click
 
 from pivot.cli import completion
 from pivot.cli import decorators as cli_decorators
+from pivot.cli import helpers as cli_helpers
 
 
 @cli_decorators.pivot_command()
@@ -17,9 +18,13 @@ from pivot.cli import decorators as cli_decorators
     default="dvc.yaml",
     help="Output path for dvc.yaml (default: dvc.yaml)",
 )
-def export(stages: tuple[str, ...], output: pathlib.Path) -> None:
+@click.pass_context
+def export(ctx: click.Context, stages: tuple[str, ...], output: pathlib.Path) -> None:
     """Export pipeline to DVC YAML format."""
     from pivot import dvc_compat, path_policy, project
+
+    cli_ctx = cli_helpers.get_cli_context(ctx)
+    quiet = cli_ctx["quiet"]
 
     # Validate output path stays within project
     proj_root = project.get_project_root()
@@ -33,4 +38,5 @@ def export(stages: tuple[str, ...], output: pathlib.Path) -> None:
     stages_list = list(stages) if stages else None
 
     result = dvc_compat.export_dvc_yaml(output, stages=stages_list)
-    click.echo(f"Exported {len(result['stages'])} stages to {output}")
+    if not quiet:
+        click.echo(f"Exported {len(result['stages'])} stages to {output}")

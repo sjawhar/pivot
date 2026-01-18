@@ -151,7 +151,7 @@ def test_push_with_errors(
 
         result = runner.invoke(cli.cli, ["push"])
 
-        assert result.exit_code == 0
+        assert result.exit_code == 1, "Should exit non-zero when transfers fail"
         assert "1 transferred" in result.output
         assert "1 failed" in result.output
         assert "Error: Upload failed: hash2" in result.output
@@ -344,7 +344,7 @@ def test_pull_with_errors(
 
         result = runner.invoke(cli.cli, ["pull"])
 
-        assert result.exit_code == 0
+        assert result.exit_code == 1, "Should exit non-zero when transfers fail"
         assert "2 transferred" in result.output
         assert "2 failed" in result.output
         assert "Download failed: hash1" in result.output
