@@ -461,6 +461,7 @@ class TuiStatusMessage(TypedDict):
     status: StageStatus
     reason: str
     elapsed: float | None
+    run_id: str
 
 
 class TuiWatchMessage(TypedDict):

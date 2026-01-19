@@ -159,6 +159,7 @@ def test_stage_info_logs_bounded() -> None:
                 status=StageStatus.IN_PROGRESS,
                 reason="",
                 elapsed=None,
+                run_id="20240101_120000_abcd1234",
             ),
             "status",
         ),
@@ -282,11 +283,17 @@ def test_executor_emits_status_messages_to_queue(
     assert start_msg["status"] == StageStatus.IN_PROGRESS
     assert start_msg["index"] == 1
     assert start_msg["total"] == 1
+    assert "run_id" in start_msg, "Status message must include run_id"
+    assert start_msg["run_id"], "run_id must be non-empty"
 
     end_msg = status_messages[-1]
     assert end_msg["stage"] == "process"
     assert end_msg["status"] in (StageStatus.RAN, StageStatus.SKIPPED, StageStatus.COMPLETED)
     assert "elapsed" in end_msg
+    assert "run_id" in end_msg, "Status message must include run_id"
+    assert end_msg["run_id"] == start_msg["run_id"], (
+        "run_id must be consistent across stage lifecycle"
+    )
 
 
 def test_executor_emits_log_messages_to_queue(
@@ -331,6 +338,8 @@ def test_executor_emits_failed_status_on_stage_failure(
     failed_msgs = [m for m in status_messages if m["status"] == StageStatus.FAILED]
     assert len(failed_msgs) >= 1, "Should have at least one FAILED status message"
     assert failed_msgs[0]["stage"] == "failing_stage"
+    assert "run_id" in failed_msgs[0], "Failed status must include run_id"
+    assert failed_msgs[0]["run_id"], "run_id must be non-empty"
 
 
 def test_executor_emits_status_for_multiple_stages(
@@ -362,6 +371,11 @@ def test_executor_emits_status_for_multiple_stages(
     assert "step1" in stages_with_status
     assert "step2" in stages_with_status
     assert "step3" in stages_with_status
+
+    # All status messages must include run_id
+    for msg in status_messages:
+        assert "run_id" in msg, f"Status for {msg['stage']} must include run_id"
+        assert msg["run_id"], f"run_id for {msg['stage']} must be non-empty"
 
 
 def test_executor_status_includes_correct_index_and_total(

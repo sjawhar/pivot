@@ -14,7 +14,7 @@ import pathlib
 import queue
 import threading
 import time
-from typing import TYPE_CHECKING, Literal, TypedDict
+from typing import TYPE_CHECKING, Literal, TypedDict, final
 
 import loky
 
@@ -104,6 +104,140 @@ class StageState:
             return None
         end = self.end_time if self.end_time is not None else time.perf_counter()
         return end - self.start_time
+
+
+@final
+class StageLifecycle:
+    """Centralized handler for stage lifecycle events - guarantees notifications.
+
+    All stage state transitions should go through this class to ensure
+    TUI, console, and progress callback notifications are always sent.
+    """
+
+    def __init__(
+        self,
+        tui_queue: mp.Queue[TuiMessage] | None,
+        con: console.Console | None,
+        progress_callback: Callable[[RunJsonEvent], None] | None,
+        total_stages: int,
+        run_id: str,
+        explain_mode: bool = False,
+    ) -> None:
+        self.tui_queue = tui_queue
+        self.console = con
+        self.progress_callback = progress_callback
+        self.total_stages = total_stages
+        self.run_id = run_id
+        self.explain_mode = explain_mode
+
+    def mark_started(self, state: StageState, running_count: int) -> None:
+        """Mark stage as in-progress and send all notifications."""
+        state.status = StageStatus.IN_PROGRESS
+        state.start_time = time.perf_counter()
+
+        if self.console and not self.explain_mode:
+            self.console.stage_start(
+                name=state.name,
+                index=running_count,
+                total=self.total_stages,
+                status=StageDisplayStatus.RUNNING,
+            )
+
+        if self.tui_queue:
+            self.tui_queue.put(
+                TuiStatusMessage(
+                    type=TuiMessageType.STATUS,
+                    stage=state.name,
+                    index=state.index,
+                    total=self.total_stages,
+                    status=StageStatus.IN_PROGRESS,
+                    reason="",
+                    elapsed=None,
+                    run_id=self.run_id,
+                )
+            )
+
+        if self.progress_callback:
+            self.progress_callback(
+                StageStartEvent(
+                    type=RunEventType.STAGE_START,
+                    stage=state.name,
+                    index=state.index,
+                    total=self.total_stages,
+                    timestamp=datetime.datetime.now(datetime.UTC).isoformat(),
+                )
+            )
+
+    def mark_completed(self, state: StageState, result: StageResult, completed_count: int) -> None:
+        """Mark stage completed with result and send all notifications."""
+        state.result = result
+        state.status = result["status"]
+        state.end_time = time.perf_counter()
+        self._notify_complete(state, result, completed_count)
+
+    def mark_failed(self, state: StageState, reason: str, completed_count: int) -> None:
+        """Mark stage as failed and send all notifications."""
+        result = StageResult(status=StageStatus.FAILED, reason=reason, output_lines=[])
+        state.result = result
+        state.status = StageStatus.FAILED
+        state.end_time = time.perf_counter()
+        self._notify_complete(state, result, completed_count)
+
+    def mark_skipped_upstream(self, state: StageState, failed_stage: str) -> None:
+        """Mark stage as skipped due to upstream failure and send all notifications.
+
+        Unlike mark_completed, this doesn't set end_time since the stage never started.
+        """
+        reason = f"upstream '{failed_stage}' failed"
+        result = StageResult(status=StageStatus.SKIPPED, reason=reason, output_lines=[])
+        state.result = result
+        state.status = StageStatus.SKIPPED
+        # Don't set end_time - stage never started
+        self._notify_complete(state, result, completed_count=0)
+
+    def _notify_complete(
+        self, state: StageState, result: StageResult, completed_count: int
+    ) -> None:
+        """Send completion notifications to all channels."""
+        result_status = result["status"]
+        result_reason = result["reason"]
+        duration = state.get_duration()
+
+        if self.console:
+            self.console.stage_result(
+                name=state.name,
+                index=completed_count,
+                total=self.total_stages,
+                status=result_status,
+                reason=result_reason,
+                duration=duration,
+            )
+
+        if self.tui_queue:
+            self.tui_queue.put(
+                TuiStatusMessage(
+                    type=TuiMessageType.STATUS,
+                    stage=state.name,
+                    index=state.index,
+                    total=self.total_stages,
+                    status=result_status,
+                    reason=result_reason,
+                    elapsed=duration,
+                    run_id=self.run_id,
+                )
+            )
+
+        if self.progress_callback:
+            self.progress_callback(
+                StageCompleteEvent(
+                    type=RunEventType.STAGE_COMPLETE,
+                    stage=state.name,
+                    status=result_status,
+                    reason=result_reason,
+                    duration_ms=(duration or 0) * 1000,
+                    timestamp=datetime.datetime.now(datetime.UTC).isoformat(),
+                )
+            )
 
 
 def run(
@@ -378,6 +512,16 @@ def _execute_greedy(
     futures: dict[concurrent.futures.Future[StageResult], str] = {}
     mutex_counts: collections.defaultdict[str, int] = collections.defaultdict(int)
 
+    # Centralized lifecycle handler for state transitions + notifications
+    lifecycle = StageLifecycle(
+        tui_queue=tui_queue,
+        con=con,
+        progress_callback=progress_callback,
+        total_stages=total_stages,
+        run_id=run_id,
+        explain_mode=explain_mode,
+    )
+
     _warn_single_stage_mutex_groups(stage_states)
 
     executor = _create_executor(max_workers)
@@ -413,18 +557,13 @@ def _execute_greedy(
                 output_queue=output_queue,
                 max_stages=max_workers,
                 mutex_counts=mutex_counts,
-                con=con,
-                total_stages=total_stages,
                 completed_count=completed_count,
                 overrides=overrides,
-                explain_mode=explain_mode,
+                lifecycle=lifecycle,
                 checkout_modes=checkout_modes,
-                tui_queue=tui_queue,
-                run_id=run_id,
                 force=force,
                 no_commit=no_commit,
                 no_cache=no_cache,
-                progress_callback=progress_callback,
             )
 
             while futures:
@@ -459,40 +598,16 @@ def _execute_greedy(
                         future.cancel()
                         state = stage_states[stage_name]
                         timeout_reason = f"Stage timed out after {stage_timeout}s"
+                        # _mark_stage_failed uses lifecycle.mark_failed() which sends all notifications
                         _mark_stage_failed(
                             state,
                             timeout_reason,
                             stage_states,
+                            lifecycle,
                         )
                         completed_count += 1
                         for mutex in state.mutex:
                             mutex_counts[mutex] -= 1
-
-                        if tui_queue:
-                            tui_queue.put(
-                                TuiStatusMessage(
-                                    type=TuiMessageType.STATUS,
-                                    stage=stage_name,
-                                    index=state.index,
-                                    total=total_stages,
-                                    status=StageStatus.FAILED,
-                                    reason=timeout_reason,
-                                    elapsed=state.get_duration(),
-                                )
-                            )
-
-                        if progress_callback:
-                            duration = state.get_duration()
-                            progress_callback(
-                                StageCompleteEvent(
-                                    type=RunEventType.STAGE_COMPLETE,
-                                    stage=stage_name,
-                                    status=StageStatus.FAILED,
-                                    reason=timeout_reason,
-                                    duration_ms=(duration or 0) * 1000,
-                                    timestamp=datetime.datetime.now(datetime.UTC).isoformat(),
-                                )
-                            )
                     continue
 
                 for future in done:
@@ -501,31 +616,29 @@ def _execute_greedy(
 
                     try:
                         result = future.result()
-                        state.result = result
-                        state.end_time = time.perf_counter()
 
-                        # Aggregate metrics from worker process
+                        # Aggregate metrics from worker process (before state change)
                         if "metrics" in result:
                             metrics.add_entries(result["metrics"])
 
+                        # Use lifecycle to set state AND send all notifications
+                        lifecycle.mark_completed(state, result, completed_count + 1)
+
+                        # Handle downstream cascade for failed stages
                         if result["status"] == StageStatus.FAILED:
-                            state.status = StageStatus.FAILED
-                            _handle_stage_failure(stage_name, stage_states)
-                        elif result["status"] == StageStatus.SKIPPED:
-                            state.status = StageStatus.SKIPPED
-                        else:
-                            state.status = StageStatus.COMPLETED
-                            # Apply deferred writes from worker (only in commit mode)
-                            if not no_commit:
-                                output_paths = [out.path for out in state.info["outs"]]
-                                _apply_deferred_writes(stage_name, output_paths, result, state_db)
+                            _handle_stage_failure(stage_name, stage_states, lifecycle)
+
+                        # Apply deferred writes for successful stages (only in commit mode)
+                        if result["status"] == StageStatus.RAN and not no_commit:
+                            output_paths = [out.path for out in state.info["outs"]]
+                            _apply_deferred_writes(stage_name, output_paths, result, state_db)
 
                     except concurrent.futures.BrokenExecutor as e:
-                        _mark_stage_failed(state, f"Worker died: {e}", stage_states)
+                        _mark_stage_failed(state, f"Worker died: {e}", stage_states, lifecycle)
                         logger.error(f"Worker process died while running '{stage_name}'")
 
                     except Exception as e:
-                        _mark_stage_failed(state, str(e), stage_states)
+                        _mark_stage_failed(state, str(e), stage_states, lifecycle)
 
                     completed_count += 1
 
@@ -542,47 +655,6 @@ def _execute_greedy(
                                 f"Mutex '{mutex}' released when not held (bug in mutex tracking)"
                             )
                             mutex_counts[mutex] = 0  # Reset to valid state
-
-                    if state.result:
-                        # Use result status directly - already Literal[RAN, SKIPPED, FAILED]
-                        result_status = state.result["status"]
-                        result_reason = state.result["reason"]
-                        duration = state.get_duration()
-
-                        if con:
-                            con.stage_result(
-                                name=stage_name,
-                                index=completed_count,
-                                total=total_stages,
-                                status=result_status,
-                                reason=result_reason,
-                                duration=duration,
-                            )
-
-                        if tui_queue:
-                            tui_queue.put(
-                                TuiStatusMessage(
-                                    type=TuiMessageType.STATUS,
-                                    stage=stage_name,
-                                    index=state.index,
-                                    total=total_stages,
-                                    status=result_status,
-                                    reason=result_reason,
-                                    elapsed=duration,
-                                )
-                            )
-
-                        if progress_callback:
-                            progress_callback(
-                                StageCompleteEvent(
-                                    type=RunEventType.STAGE_COMPLETE,
-                                    stage=stage_name,
-                                    status=result_status,
-                                    reason=result_reason,
-                                    duration_ms=(duration or 0) * 1000,
-                                    timestamp=datetime.datetime.now(datetime.UTC).isoformat(),
-                                )
-                            )
 
                 if error_mode == OnError.FAIL:
                     failed = any(s.status == StageStatus.FAILED for s in stage_states.values())
@@ -601,18 +673,13 @@ def _execute_greedy(
                         output_queue=output_queue,
                         max_stages=slots_available,
                         mutex_counts=mutex_counts,
-                        con=con,
-                        total_stages=total_stages,
                         completed_count=completed_count,
                         overrides=overrides,
-                        explain_mode=explain_mode,
+                        lifecycle=lifecycle,
                         checkout_modes=checkout_modes,
-                        tui_queue=tui_queue,
-                        run_id=run_id,
                         force=force,
                         no_commit=no_commit,
                         no_cache=no_cache,
-                        progress_callback=progress_callback,
                     )
     finally:
         # Signal output thread to stop - may fail if queue is broken
@@ -665,18 +732,13 @@ def _start_ready_stages(
     output_queue: mp.Queue[OutputMessage],
     max_stages: int,
     mutex_counts: collections.defaultdict[str, int],
-    con: console.Console | None,
-    total_stages: int,
     completed_count: int,
     overrides: parameters.ParamsOverrides,
-    explain_mode: bool = False,
+    lifecycle: StageLifecycle,
     checkout_modes: list[str] | None = None,
-    tui_queue: mp.Queue[TuiMessage] | None = None,
-    run_id: str = "",
     force: bool = False,
     no_commit: bool = False,
     no_cache: bool = False,
-    progress_callback: Callable[[RunJsonEvent], None] | None = None,
 ) -> None:
     """Find and start stages that are ready to execute."""
     checkout_modes = checkout_modes or config.DEFAULT_CHECKOUT_MODE_ORDER
@@ -706,16 +768,16 @@ def _start_ready_stages(
             continue  # Non-exclusive stage can't start while exclusive is running
 
         # Show explanation before starting if in explain mode
-        if explain_mode and con:
+        if lifecycle.explain_mode and lifecycle.console:
             explanation = _get_stage_explanation(state.info, cache_dir, overrides)
-            con.explain_stage(explanation)
+            lifecycle.console.explain_stage(explanation)
 
         # Acquire mutex locks before changing status
         for mutex in state.mutex:
             mutex_counts[mutex] += 1
 
         worker_info = _prepare_worker_info(
-            state.info, overrides, checkout_modes, run_id, force, no_commit, no_cache
+            state.info, overrides, checkout_modes, lifecycle.run_id, force, no_commit, no_cache
         )
 
         try:
@@ -729,48 +791,13 @@ def _start_ready_stages(
             futures[future] = stage_name
             started += 1
 
-            # Only mark as in-progress after successful submission
-            state.status = StageStatus.IN_PROGRESS
-            state.start_time = time.perf_counter()
-
-            stage_index = state.index
-
-            if con and not explain_mode:
-                con.stage_start(
-                    name=stage_name,
-                    index=completed_count + len(futures),
-                    total=total_stages,
-                    status=StageDisplayStatus.RUNNING,
-                )
-
-            if tui_queue:
-                tui_queue.put(
-                    TuiStatusMessage(
-                        type=TuiMessageType.STATUS,
-                        stage=stage_name,
-                        index=stage_index,
-                        total=total_stages,
-                        status=StageStatus.IN_PROGRESS,
-                        reason="",
-                        elapsed=None,
-                    )
-                )
-
-            if progress_callback:
-                progress_callback(
-                    StageStartEvent(
-                        type=RunEventType.STAGE_START,
-                        stage=stage_name,
-                        index=stage_index,
-                        total=total_stages,
-                        timestamp=datetime.datetime.now(datetime.UTC).isoformat(),
-                    )
-                )
+            # Mark as in-progress and send all notifications via lifecycle
+            lifecycle.mark_started(state, running_count=completed_count + len(futures))
         except Exception as e:
             # Rollback mutex acquisition on submission failure
             for mutex in state.mutex:
                 mutex_counts[mutex] -= 1
-            _mark_stage_failed(state, f"Failed to submit: {e}", stage_states)
+            _mark_stage_failed(state, f"Failed to submit: {e}", stage_states, lifecycle)
 
 
 def _prepare_worker_info(
@@ -817,17 +844,28 @@ def _mark_stage_failed(
     state: StageState,
     reason: str,
     stage_states: dict[str, StageState],
+    lifecycle: StageLifecycle | None = None,
 ) -> None:
-    """Mark a stage as failed and handle downstream effects."""
-    state.result = StageResult(status=StageStatus.FAILED, reason=reason, output_lines=[])
-    state.status = StageStatus.FAILED
-    state.end_time = time.perf_counter()
-    _handle_stage_failure(state.name, stage_states)
+    """Mark a stage as failed and handle downstream effects.
+
+    Uses lifecycle.mark_failed() when available to send notifications atomically
+    with state updates. Then handles downstream cascade via _handle_stage_failure.
+    """
+    if lifecycle:
+        # Use lifecycle to set state AND send notifications
+        lifecycle.mark_failed(state, reason, completed_count=0)
+    else:
+        # Fallback for non-TUI mode
+        state.result = StageResult(status=StageStatus.FAILED, reason=reason, output_lines=[])
+        state.status = StageStatus.FAILED
+        state.end_time = time.perf_counter()
+    _handle_stage_failure(state.name, stage_states, lifecycle)
 
 
 def _handle_stage_failure(
     failed_stage: str,
     stage_states: dict[str, StageState],
+    lifecycle: StageLifecycle | None = None,
 ) -> None:
     """Handle stage failure by marking downstream stages as skipped.
 
@@ -857,12 +895,17 @@ def _handle_stage_failure(
     for stage_name in to_skip:
         state = stage_states.get(stage_name)
         if state and state.status == StageStatus.READY:
-            state.status = StageStatus.SKIPPED
-            state.result = StageResult(
-                status=StageStatus.SKIPPED,
-                reason=f"upstream '{failed_stage}' failed",
-                output_lines=[],
-            )
+            if lifecycle:
+                # Use lifecycle to update state AND send notifications
+                lifecycle.mark_skipped_upstream(state, failed_stage)
+            else:
+                # Fallback for non-TUI mode (no notifications needed)
+                state.status = StageStatus.SKIPPED
+                state.result = StageResult(
+                    status=StageStatus.SKIPPED,
+                    reason=f"upstream '{failed_stage}' failed",
+                    output_lines=[],
+                )
 
 
 def _build_results(stage_states: dict[str, StageState]) -> dict[str, ExecutionSummary]:

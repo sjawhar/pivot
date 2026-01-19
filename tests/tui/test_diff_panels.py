@@ -178,7 +178,7 @@ def test_compute_output_changes_no_lock_shows_added(tmp_path: pathlib.Path) -> N
         "cwd": None,
     }
 
-    result = diff_panels._compute_output_changes(None, registry_info)
+    result = diff_panels.compute_output_changes(None, registry_info)
 
     assert len(result) == 1
     assert result[0]["path"] == str(output_file)
@@ -214,7 +214,7 @@ def test_compute_output_changes_missing_file_shows_removed(tmp_path: pathlib.Pat
         "dep_generations": {},
     }
 
-    result = diff_panels._compute_output_changes(lock_data, registry_info)
+    result = diff_panels.compute_output_changes(lock_data, registry_info)
 
     assert len(result) == 1
     assert result[0]["old_hash"] == "oldhash123"
@@ -251,7 +251,7 @@ def test_compute_output_changes_unchanged(tmp_path: pathlib.Path) -> None:
         "dep_generations": {},
     }
 
-    result = diff_panels._compute_output_changes(lock_data, registry_info)
+    result = diff_panels.compute_output_changes(lock_data, registry_info)
 
     assert len(result) == 1
     assert result[0]["change_type"] is None, "Unchanged files should have None change_type"
@@ -284,7 +284,7 @@ def test_compute_output_changes_detects_output_types(tmp_path: pathlib.Path) -> 
         "cwd": None,
     }
 
-    result = diff_panels._compute_output_changes(None, registry_info)
+    result = diff_panels.compute_output_changes(None, registry_info)
 
     assert len(result) == 3
     types = {r["output_type"] for r in result}

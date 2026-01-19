@@ -24,15 +24,18 @@ import textual.screen
 import textual.timer
 import textual.widgets
 
-from pivot import project
+from pivot import explain, parameters, project
 from pivot.executor import ExecutionSummary
 from pivot.executor import commit as commit_mod
+from pivot.registry import REGISTRY
 from pivot.storage import lock, project_lock
-from pivot.tui import agent_server
+from pivot.tui import agent_server, diff_panels
 from pivot.tui.diff_panels import InputDiffPanel, OutputDiffPanel
 from pivot.tui.stats import DebugStats, QueueStats, QueueStatsTracker, get_memory_mb
 from pivot.types import (
     DisplayMode,
+    OutputChange,
+    StageExplanation,
     StageStatus,
     TuiLogMessage,
     TuiMessage,
@@ -87,6 +90,34 @@ STATUS_STYLES: dict[StageStatus, tuple[str, str]] = {
 
 
 @dataclasses.dataclass
+class ExecutionHistoryEntry:
+    """Snapshot of a single stage execution for history navigation."""
+
+    run_id: str
+    stage_name: str
+    timestamp: float
+    duration: float | None
+    status: StageStatus
+    reason: str
+    logs: list[tuple[str, bool, float]]
+    input_snapshot: StageExplanation | None
+    output_snapshot: list[OutputChange] | None
+
+
+@dataclasses.dataclass
+class _PendingHistoryState:
+    """Temporary state for a stage execution in progress, before finalization."""
+
+    run_id: str
+    timestamp: float
+    # Bounded deque to prevent memory growth in watch mode with verbose stages
+    logs: collections.deque[tuple[str, bool, float]] = dataclasses.field(
+        default_factory=lambda: collections.deque(maxlen=500)
+    )
+    input_snapshot: StageExplanation | None = None
+
+
+@dataclasses.dataclass
 class StageInfo:
     """Mutable state for a single stage."""
 
@@ -98,6 +129,9 @@ class StageInfo:
     elapsed: float | None = None
     logs: collections.deque[tuple[str, bool, float]] = dataclasses.field(
         default_factory=lambda: collections.deque(maxlen=1000)
+    )
+    history: collections.deque[ExecutionHistoryEntry] = dataclasses.field(
+        default_factory=lambda: collections.deque(maxlen=50)
     )
 
 
@@ -272,6 +306,15 @@ class StageLogPanel(textual.widgets.RichLog):
         """Add a new log line."""
         self._write_line(line, is_stderr, timestamp)
 
+    def set_from_history(self, logs: list[tuple[str, bool, float]]) -> None:  # pragma: no cover
+        """Display logs from a historical execution entry."""
+        self.clear()
+        if logs:
+            for line, is_stderr, timestamp in logs:
+                self._write_line(line, is_stderr, timestamp)
+        else:
+            self.write("[dim]No logs recorded for this execution[/]")
+
     def _write_line(self, line: str, is_stderr: bool, timestamp: float) -> None:  # pragma: no cover
         time_str = time.strftime("[%H:%M:%S]", time.localtime(timestamp))
         escaped_line = rich.markup.escape(line)
@@ -285,13 +328,18 @@ class TabbedDetailPanel(textual.containers.Vertical):
     """Tabbed panel showing stage details with Logs, Input, Output tabs."""
 
     _stage: StageInfo | None
+    _history_index: int | None  # None = live view, else index into history deque
+    _history_total: int
 
     def __init__(self, *, id: str | None = None, classes: str | None = None) -> None:
         super().__init__(id=id, classes=classes)
         self._stage = None
+        self._history_index = None
+        self._history_total = 0
 
     @override
     def compose(self) -> textual.app.ComposeResult:  # pragma: no cover
+        yield textual.widgets.Static(id="detail-header")
         with textual.widgets.TabbedContent(id="detail-tabs"):
             with textual.widgets.TabPane("Logs", id="tab-logs"):
                 yield StageLogPanel(id="stage-logs")
@@ -303,7 +351,11 @@ class TabbedDetailPanel(textual.containers.Vertical):
     def set_stage(self, stage: StageInfo | None) -> None:  # pragma: no cover
         """Update the displayed stage."""
         self._stage = stage
+        self._history_index = None  # Reset to live view
+        self._history_total = len(stage.history) if stage else 0
         stage_name = stage.name if stage else None
+
+        self._update_header()
 
         # Update log panel (takes StageInfo)
         try:
@@ -321,6 +373,97 @@ class TabbedDetailPanel(textual.containers.Vertical):
                 self.query_one(panel_id, panel_cls).set_stage(stage_name)
             except textual.css.query.NoMatches:
                 _logger.debug(f"{panel_id} not found during set_stage")
+
+    def set_history_view(
+        self, index: int | None, total: int, entry: ExecutionHistoryEntry | None
+    ) -> None:  # pragma: no cover
+        """Set the history view state. index=None means live view."""
+        self._history_index = index
+        self._history_total = total
+        self._update_header()
+
+        if entry is not None:
+            # Update logs panel with historical logs
+            try:
+                log_panel = self.query_one("#stage-logs", StageLogPanel)
+                log_panel.set_from_history(entry.logs)
+            except textual.css.query.NoMatches:
+                _logger.debug("stage-logs not found during set_history_view")
+
+    def _update_header(self) -> None:  # pragma: no cover
+        """Update the header with execution indicator."""
+        try:
+            header = self.query_one("#detail-header", textual.widgets.Static)
+        except textual.css.query.NoMatches:
+            return
+
+        if self._stage is None:
+            header.update("")
+            return
+
+        # Build header components
+        parts = list[str]()
+
+        # Stage name
+        parts.append(f"[bold]{rich.markup.escape(self._stage.name)}[/]")
+
+        # Spacer
+        parts.append("  ")
+
+        # History navigation indicator
+        total = self._history_total
+        if self._history_index is None:
+            # Live view
+            current = total + 1  # Live is "after" all history entries
+            # Show left arrow if history exists
+            left_arrow = "← " if total > 0 else ""
+            mode_indicator = "[green]● LIVE[/]"
+            parts.append(f"{left_arrow}[{current}/{current}] {mode_indicator}")
+        else:
+            # Historical view
+            current = self._history_index + 1  # 1-based display
+            left_arrow = "← " if self._history_index > 0 else ""
+            right_arrow = " →"  # Always show - can navigate to live view
+
+            # Get entry for timestamp/duration
+            entry = self._get_current_history_entry()
+            if entry:
+                ts_str = time.strftime("%H:%M:%S", time.localtime(entry.timestamp))
+                dur_str = f"{entry.duration:.1f}s" if entry.duration is not None else "0.0s"
+                status_icon = self._get_status_icon(entry.status)
+                mode_indicator = f"[yellow]◷ {ts_str} ({dur_str})[/] {status_icon}"
+            else:
+                mode_indicator = "[yellow]◷ (unknown)[/]"
+
+            parts.append(f"{left_arrow}[{current}/{total + 1}] {mode_indicator}{right_arrow}")
+
+        header.update("".join(parts))
+
+    def _get_current_history_entry(self) -> ExecutionHistoryEntry | None:
+        """Get the currently viewed history entry."""
+        if self._stage is None or self._history_index is None:
+            return None
+        if 0 <= self._history_index < len(self._stage.history):
+            return self._stage.history[self._history_index]
+        return None
+
+    def _get_status_icon(self, status: StageStatus) -> str:
+        """Get status icon for history entry."""
+        match status:
+            case StageStatus.RAN | StageStatus.COMPLETED:
+                return "[green]✓[/]"
+            case StageStatus.FAILED:
+                return "[red]✗[/]"
+            case StageStatus.SKIPPED:
+                return "[yellow]⊘[/]"
+            case _:
+                return ""
+
+    def refresh_header(self) -> None:  # pragma: no cover
+        """Refresh the header display (call when history changes)."""
+        if self._stage:
+            self._history_total = len(self._stage.history)
+        self._update_header()
 
 
 def _format_queue_stats(q: QueueStats | None, label: str) -> str:
@@ -405,8 +548,14 @@ _TUI_CSS: str = """
     border: solid $primary;
 }
 
+#detail-header {
+    height: 1;
+    padding: 0 1;
+    background: $surface-lighten-1;
+}
+
 #detail-tabs {
-    height: 100%;
+    height: 1fr;
 }
 
 #stage-logs {
@@ -510,6 +659,11 @@ _TUI_BINDINGS: list[textual.binding.BindingType] = [
     # Changed-item navigation (in detail panel only)
     textual.binding.Binding("n", "next_changed", "Next Change", show=False),
     textual.binding.Binding("N", "prev_changed", "Prev Change", show=False),
+    # History navigation (works in all tabs)
+    textual.binding.Binding("[", "history_older", "Older", show=False),
+    textual.binding.Binding("]", "history_newer", "Newer", show=False),
+    textual.binding.Binding("G", "history_live", "Live View", show=False),
+    textual.binding.Binding("H", "show_history_list", "History", show=False),
     # Tab mnemonic keys (shift+letter)
     textual.binding.Binding("L", "goto_tab_logs", "Logs Tab", show=False),
     textual.binding.Binding("I", "goto_tab_input", "Input Tab", show=False),
@@ -1085,6 +1239,159 @@ class ConfirmCommitScreen(textual.screen.ModalScreen[bool]):
         self.dismiss(result)
 
 
+class HistoryListScreen(textual.screen.ModalScreen[int | None]):
+    """Modal screen for selecting a history entry. Returns index or None for live."""
+
+    BINDINGS: ClassVar[list[textual.binding.BindingType]] = [
+        textual.binding.Binding("j", "select_next", "Down"),
+        textual.binding.Binding("k", "select_prev", "Up"),
+        textual.binding.Binding("down", "select_next", "Down", show=False),
+        textual.binding.Binding("up", "select_prev", "Up", show=False),
+        textual.binding.Binding("enter", "confirm", "Select"),
+        textual.binding.Binding("escape", "cancel", "Cancel"),
+        textual.binding.Binding("G", "go_live", "Live"),
+    ]
+
+    DEFAULT_CSS: ClassVar[str] = """
+    HistoryListScreen {
+        align: center middle;
+    }
+
+    HistoryListScreen > #history-dialog {
+        width: 80;
+        height: auto;
+        max-height: 80%;
+        border: thick $primary;
+        background: $surface;
+        padding: 1 2;
+    }
+
+    HistoryListScreen > #history-dialog > #history-title {
+        text-style: bold;
+        margin-bottom: 1;
+    }
+
+    HistoryListScreen > #history-dialog > #history-table {
+        height: auto;
+        max-height: 20;
+        margin-bottom: 1;
+    }
+    """
+
+    _history: collections.deque[ExecutionHistoryEntry]
+    _selected_idx: int
+    _current_view_idx: int | None
+    _stage_name: str
+
+    def __init__(
+        self,
+        stage_name: str,
+        history: collections.deque[ExecutionHistoryEntry],
+        current_idx: int | None,
+    ) -> None:
+        super().__init__()
+        self._stage_name = stage_name
+        self._history = history
+        # Start selection at current view, or most recent if live view
+        if current_idx is not None:
+            self._selected_idx = current_idx
+        else:
+            self._selected_idx = len(history) - 1 if history else 0
+        self._current_view_idx = current_idx
+
+    @override
+    def compose(self) -> textual.app.ComposeResult:  # pragma: no cover
+        with textual.containers.Container(id="history-dialog"):
+            yield textual.widgets.Static(
+                f"[bold]History: {rich.markup.escape(self._stage_name)}[/]", id="history-title"
+            )
+            yield textual.widgets.Static(self._render_table(), id="history-table")
+            yield textual.widgets.Static("[j/k] navigate  [Enter] select  [G] live  [Esc] cancel")
+
+    def _render_table(self) -> str:  # pragma: no cover
+        """Render history entries as Rich markup table."""
+        if not self._history:
+            return "[dim]No history entries[/]"
+
+        lines = list[str]()
+        # Header
+        lines.append("[dim]  #  │ Time     │ Duration │ Status  │ Reason[/]")
+        lines.append("[dim]─────┼──────────┼──────────┼─────────┼────────────────────[/]")
+
+        for idx, entry in enumerate(self._history):
+            # Format time as HH:MM:SS
+            time_str = time.strftime("%H:%M:%S", time.localtime(entry.timestamp))
+
+            # Format duration
+            duration_str = f"{entry.duration:6.1f}s" if entry.duration is not None else "     - "
+
+            # Format status
+            if entry.status == StageStatus.RAN:
+                status_str = "[green]✓ ran[/]  "
+            elif entry.status == StageStatus.FAILED:
+                status_str = "[red]✗ fail[/] "
+            elif entry.status == StageStatus.SKIPPED:
+                status_str = "[yellow]○ skip[/] "
+            else:
+                status_str = f"{entry.status.value[:7]:<7} "
+
+            # Truncate reason
+            reason = entry.reason[:20] if len(entry.reason) > 20 else entry.reason
+            reason_escaped = rich.markup.escape(reason)
+
+            # Selection indicator
+            is_selected = idx == self._selected_idx
+            is_current = idx == self._current_view_idx
+            if is_selected:
+                prefix = "[reverse]▸"
+                suffix = "[/]"
+            elif is_current:
+                prefix = " "
+                suffix = " [dim]◂[/]"
+            else:
+                prefix = " "
+                suffix = ""
+
+            # Build row
+            num_str = f"{idx + 1:3}"
+            row = f"{prefix}{num_str} │ {time_str} │ {duration_str} │ {status_str} │ {reason_escaped}{suffix}"
+            lines.append(row)
+
+        return "\n".join(lines)
+
+    def _update_table(self) -> None:  # pragma: no cover
+        """Update the table display after selection change."""
+        try:
+            table = self.query_one("#history-table", textual.widgets.Static)
+            table.update(self._render_table())
+        except textual.css.query.NoMatches:
+            _logger.debug("History table widget not present, skipping update")
+
+    def action_select_next(self) -> None:  # pragma: no cover
+        """Move selection to next (newer) entry."""
+        if self._history and self._selected_idx < len(self._history) - 1:
+            self._selected_idx += 1
+            self._update_table()
+
+    def action_select_prev(self) -> None:  # pragma: no cover
+        """Move selection to previous (older) entry."""
+        if self._history and self._selected_idx > 0:
+            self._selected_idx -= 1
+            self._update_table()
+
+    def action_confirm(self) -> None:  # pragma: no cover
+        """Confirm selection and return the selected index."""
+        self.dismiss(self._selected_idx)
+
+    def action_cancel(self) -> None:  # pragma: no cover
+        """Cancel and return the original view index."""
+        self.dismiss(self._current_view_idx)
+
+    def action_go_live(self) -> None:  # pragma: no cover
+        """Go to live view."""
+        self.dismiss(None)
+
+
 # Constants for commit lock acquisition
 _COMMIT_LOCK_POLL_INTERVAL = 5.0  # seconds between lock attempts
 _COMMIT_LOCK_TIMEOUT = 60.0  # total seconds before giving up
@@ -1095,6 +1402,9 @@ class WatchTuiApp(_BaseTuiApp[None]):
     """TUI for watch mode pipeline execution."""
 
     _output_queue: mp.Queue[OutputMessage] | None
+    _viewing_history_index: int | None  # None = live view, else index into history deque
+    _pending_history: dict[str, _PendingHistoryState]
+    _current_run_id: str | None  # Track current run to detect new runs
 
     def __init__(
         self,
@@ -1114,6 +1424,9 @@ class WatchTuiApp(_BaseTuiApp[None]):
         self._no_commit: bool = no_commit
         self._commit_in_progress: bool = False
         self._cancel_commit: bool = False
+        self._viewing_history_index = None
+        self._pending_history = {}
+        self._current_run_id = None
         self._serve: bool = serve
         self._agent_server: agent_server.AgentServer | None = None
         self._agent_server_task: asyncio.Task[None] | None = None
@@ -1196,18 +1509,45 @@ class WatchTuiApp(_BaseTuiApp[None]):
 
     def _handle_status(self, msg: TuiStatusMessage) -> None:  # pragma: no cover
         stage = msg["stage"]
+        status = msg["status"]
+        run_id = msg["run_id"]
         is_new_stage = stage not in self._stages
+
+        # Detect new pipeline run - clear stale pending entries from previous run
+        if run_id and run_id != self._current_run_id:
+            if self._pending_history:
+                _logger.debug(
+                    "New run %s detected, clearing %d stale pending entries from %s",
+                    run_id,
+                    len(self._pending_history),
+                    self._current_run_id,
+                )
+                self._pending_history.clear()
+            self._current_run_id = run_id
+
         if is_new_stage:
             info = StageInfo(stage, msg["index"], msg["total"])
             self._stages[stage] = info
             self._stage_order.append(stage)
 
         info = self._stages[stage]
-        info.status = msg["status"]
+        info.status = status
         info.reason = msg["reason"]
         info.elapsed = msg["elapsed"]
         info.index = msg["index"]
         info.total = msg["total"]
+
+        # History capture: create entry on IN_PROGRESS, finalize on terminal status
+        if status == StageStatus.IN_PROGRESS:
+            self._create_history_entry(stage, run_id)
+        elif status in (
+            StageStatus.RAN,
+            StageStatus.COMPLETED,
+            StageStatus.SKIPPED,
+            StageStatus.FAILED,
+        ):
+            # Pass run_id for skipped stages that never went through IN_PROGRESS
+            self._finalize_history_entry(stage, status, msg["reason"], msg["elapsed"], run_id)
 
         if is_new_stage:
             self._rebuild_stage_list()
@@ -1241,6 +1581,11 @@ class WatchTuiApp(_BaseTuiApp[None]):
         for name in removed:
             if name in self._stages:
                 del self._stages[name]
+            # Clean up pending history data for removed stages
+            self._pending_history.pop(name, None)
+            # Exit history view if viewing removed stage
+            if self._viewing_history_index is not None and self._selected_stage_name == name:
+                self._viewing_history_index = None
 
         for name in added:
             info = StageInfo(name, len(self._stages) + 1, len(new_stages))
@@ -1257,6 +1602,280 @@ class WatchTuiApp(_BaseTuiApp[None]):
 
         self._rebuild_stage_list()
         self._update_detail_panel()
+
+    @override
+    def _handle_log(self, msg: TuiLogMessage) -> None:  # pragma: no cover
+        """Handle log message - also accumulate for history."""
+        super()._handle_log(msg)
+        # Accumulate logs for pending history entries
+        stage = msg["stage"]
+        if stage in self._pending_history:
+            self._pending_history[stage].logs.append(
+                (msg["line"], msg["is_stderr"], msg["timestamp"])
+            )
+
+    def _create_history_entry(self, stage_name: str, run_id: str) -> None:
+        """Create a new history entry when stage starts executing."""
+        # Capture input snapshot at stage start (why this stage is running)
+        input_snapshot: StageExplanation | None = None
+        try:
+            registry_info = REGISTRY.get(stage_name)
+            cache_dir = project.get_cache_dir()
+            input_snapshot = explain.get_stage_explanation(
+                stage_name=stage_name,
+                fingerprint=registry_info["fingerprint"],
+                deps=registry_info["deps"],
+                params_instance=registry_info["params"],
+                overrides=parameters.load_params_yaml(),
+                cache_dir=cache_dir,
+            )
+        except Exception:
+            _logger.debug("Failed to capture input snapshot for %s", stage_name)
+
+        self._pending_history[stage_name] = _PendingHistoryState(
+            run_id=run_id,
+            timestamp=time.time(),
+            input_snapshot=input_snapshot,
+        )
+
+    def _finalize_history_entry(
+        self,
+        stage_name: str,
+        status: StageStatus,
+        reason: str,
+        elapsed: float | None,
+        run_id: str | None = None,
+    ) -> None:
+        """Finalize history entry when stage completes.
+
+        For stages that went through IN_PROGRESS, uses pending state for logs/snapshots.
+        For upstream-skipped stages (never ran), creates a minimal entry with the skip reason.
+        """
+        if stage_name not in self._stages:
+            return
+
+        info = self._stages[stage_name]
+        pending = self._pending_history.pop(stage_name, None)
+
+        if pending is None:
+            # No pending state - stage was skipped without running (upstream failure)
+            # Create a minimal history entry to show when/why it was skipped
+            if status == StageStatus.SKIPPED and run_id:
+                entry = ExecutionHistoryEntry(
+                    run_id=run_id,
+                    stage_name=stage_name,
+                    timestamp=time.time(),
+                    duration=None,  # Never ran, no duration
+                    status=status,
+                    reason=reason,
+                    logs=[],  # No logs - never executed
+                    input_snapshot=None,  # Could capture why skipped, but keep simple
+                    output_snapshot=None,  # No outputs - never ran
+                )
+            else:
+                # Non-SKIPPED status without pending is unexpected, skip
+                return
+        else:
+            # Normal case: stage ran, finalize with captured data
+            # Capture output snapshot at stage end (what the stage produced)
+            output_snapshot: list[OutputChange] | None = None
+            try:
+                registry_info = REGISTRY.get(stage_name)
+                cache_dir = project.get_cache_dir()
+                stages_dir = lock.get_stages_dir(cache_dir)
+                lock_data = lock.StageLock(stage_name, stages_dir).read()
+                output_snapshot = diff_panels.compute_output_changes(lock_data, registry_info)
+            except Exception:
+                _logger.debug("Failed to capture output snapshot for %s", stage_name)
+
+            entry = ExecutionHistoryEntry(
+                run_id=pending.run_id,
+                stage_name=stage_name,
+                timestamp=pending.timestamp,
+                duration=elapsed,
+                status=status,
+                reason=reason,
+                logs=list(pending.logs),  # Convert bounded deque to list
+                input_snapshot=pending.input_snapshot,
+                output_snapshot=output_snapshot,
+            )
+
+        # Check if deque is at capacity before appending (oldest will be evicted)
+        was_at_capacity = len(info.history) == info.history.maxlen
+        info.history.append(entry)
+
+        # Adjust history index if viewing this stage and an entry was evicted
+        if (
+            was_at_capacity
+            and stage_name == self._selected_stage_name
+            and self._viewing_history_index is not None
+        ):
+            if self._viewing_history_index == 0:
+                # Was viewing oldest entry which was just evicted, go to live view
+                self._viewing_history_index = None
+            else:
+                # Decrement to keep pointing at same logical entry
+                self._viewing_history_index -= 1
+
+        # Refresh header if this is the selected stage (history count changed)
+        if stage_name == self._selected_stage_name:
+            try:
+                detail = self.query_one("#detail-panel", TabbedDetailPanel)
+                detail.refresh_header()
+            except (textual.css.query.NoMatches, textual.app.ScreenStackError):
+                _logger.debug("Detail panel not present during history finalization")
+
+    def _get_current_stage_history(self) -> collections.deque[ExecutionHistoryEntry]:
+        """Get the history deque for the currently selected stage."""
+        if self._selected_stage_name and self._selected_stage_name in self._stages:
+            return self._stages[self._selected_stage_name].history
+        return collections.deque()
+
+    def _navigate_history_prev(self) -> bool:  # pragma: no cover
+        """Navigate to previous (older) history entry. Returns True if navigation occurred."""
+        history = self._get_current_stage_history()
+        if not history:
+            return False
+
+        if self._viewing_history_index is None:
+            # Currently in live view, go to most recent history entry
+            self._viewing_history_index = len(history) - 1
+        elif self._viewing_history_index > 0:
+            # Go to older entry
+            self._viewing_history_index -= 1
+        else:
+            # Already at oldest entry
+            return False
+
+        self._update_history_view()
+        return True
+
+    def _navigate_history_next(self) -> bool:  # pragma: no cover
+        """Navigate to next (newer) history entry or live view. Returns True if navigation occurred."""
+        history = self._get_current_stage_history()
+
+        if self._viewing_history_index is None:
+            # Already in live view
+            return False
+
+        if self._viewing_history_index < len(history) - 1:
+            # Go to newer entry
+            self._viewing_history_index += 1
+        else:
+            # Go to live view
+            self._viewing_history_index = None
+
+        self._update_history_view()
+        return True
+
+    def _update_history_view(self) -> None:  # pragma: no cover
+        """Update the detail panel to show the current history view."""
+        try:
+            detail = self.query_one("#detail-panel", TabbedDetailPanel)
+        except textual.css.query.NoMatches:
+            return
+
+        history = self._get_current_stage_history()
+        total = len(history)
+
+        # Get diff panels for snapshot updates
+        try:
+            input_panel = self.query_one("#input-panel", InputDiffPanel)
+            output_panel = self.query_one("#output-panel", OutputDiffPanel)
+        except textual.css.query.NoMatches:
+            input_panel = None
+            output_panel = None
+
+        if self._viewing_history_index is None:
+            # Live view - show current stage state
+            stage = (
+                self._stages.get(self._selected_stage_name) if self._selected_stage_name else None
+            )
+            detail.set_history_view(None, total, None)
+            # Restore live logs
+            try:
+                log_panel = self.query_one("#stage-logs", StageLogPanel)
+                log_panel.set_stage(stage)
+            except textual.css.query.NoMatches:
+                _logger.debug("Stage log panel not present, skipping live log restore")
+            # Restore live diff panels
+            if input_panel:
+                input_panel.set_stage(self._selected_stage_name)
+            if output_panel:
+                output_panel.set_stage(self._selected_stage_name)
+        else:
+            # Historical view
+            if 0 <= self._viewing_history_index < total:
+                entry = history[self._viewing_history_index]
+                detail.set_history_view(self._viewing_history_index, total, entry)
+                # Update diff panels with snapshots
+                if input_panel:
+                    if entry.input_snapshot:
+                        input_panel.set_from_snapshot(entry.input_snapshot)
+                    else:
+                        input_panel.set_stage(None)  # Show "no data" state
+                if output_panel:
+                    if entry.output_snapshot:
+                        output_panel.set_from_snapshot(entry.stage_name, entry.output_snapshot)
+                    else:
+                        output_panel.set_stage(None)  # Show "no data" state
+
+    @override
+    def action_nav_up(self) -> None:  # pragma: no cover
+        """Navigate up - stage list or item list (diff tabs)."""
+        if self._focused_panel == "stages":
+            self.action_prev_stage()
+        elif self._focused_panel == "detail" and (panel := self._get_active_diff_panel()):
+            panel.select_prev()
+
+    @override
+    def action_nav_down(self) -> None:  # pragma: no cover
+        """Navigate down - stage list or item list (diff tabs)."""
+        if self._focused_panel == "stages":
+            self.action_next_stage()
+        elif self._focused_panel == "detail" and (panel := self._get_active_diff_panel()):
+            panel.select_next()
+
+    def action_history_older(self) -> None:  # pragma: no cover
+        """Navigate to older (previous) history entry."""
+        if self._focused_panel != "detail":
+            return
+        self._navigate_history_prev()
+
+    def action_history_newer(self) -> None:  # pragma: no cover
+        """Navigate to newer (next) history entry or live view."""
+        if self._focused_panel != "detail":
+            return
+        self._navigate_history_next()
+
+    def action_history_live(self) -> None:  # pragma: no cover
+        """Jump directly to live view."""
+        if self._focused_panel != "detail":
+            return
+        if self._viewing_history_index is not None:
+            self._viewing_history_index = None
+            self._update_history_view()
+
+    async def action_show_history_list(self) -> None:  # pragma: no cover
+        """Show modal with history list for current stage."""
+        if not self._selected_stage_name:
+            return
+        history = self._get_current_stage_history()
+        if not history:
+            self.notify("No history for this stage")
+            return
+        result = await self.push_screen_wait(
+            HistoryListScreen(self._selected_stage_name, history, self._viewing_history_index)
+        )
+        self._viewing_history_index = result
+        self._update_history_view()
+
+    @override
+    def _update_detail_panel(self) -> None:  # pragma: no cover
+        """Update detail panel and reset history view when stage changes."""
+        # Reset history view when changing stages
+        self._viewing_history_index = None
+        super()._update_detail_panel()
 
     def _rebuild_stage_list(self) -> None:  # pragma: no cover
         """Rebuild the stage list panel after stages change."""
