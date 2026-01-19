@@ -1,355 +1,522 @@
 from __future__ import annotations
 
-import pathlib  # noqa: TC003 - used at runtime in _load/_save methods
-import sys
-import weakref
+import dataclasses
+import logging
+import pathlib  # noqa: TC003 - used at runtime in _write_output
+from collections.abc import Callable, Mapping  # noqa: TC003 - used in function signatures
 from typing import (
     TYPE_CHECKING,
+    Annotated,
     Any,
     ClassVar,
-    NamedTuple,
-    Protocol,
     cast,
+    get_args,
     get_origin,
     get_type_hints,
-    overload,
-    override,
+    is_typeddict,
 )
 
 import pydantic
 
+from pivot import outputs
+
 if TYPE_CHECKING:
-    from collections.abc import Callable
-
     from pivot import loaders
 
-
-class DepSpec(NamedTuple):
-    """Specification for a dependency."""
-
-    path: str
-    loader: loaders.Loader[Any]
+logger = logging.getLogger(__name__)
 
 
-class OutSpec(NamedTuple):
-    """Specification for an output."""
+def _get_type_hints_safe(
+    obj: Callable[..., Any] | type,
+    name: str,
+    *,
+    include_extras: bool = False,
+) -> dict[str, Any] | None:
+    """Get type hints from a function or type, returning None on failure.
 
-    path: str
-    loader: loaders.Loader[Any]
+    Args:
+        obj: Function or type to get hints from
+        name: Name for error messages
+        include_extras: Whether to preserve Annotated metadata
 
-
-class _BaseDescriptor[T]:
-    """Base descriptor for typed file access with WeakKeyDictionary storage."""
-
-    name: str
-    path: str
-    loader: loaders.Loader[T]
-    _data: weakref.WeakKeyDictionary[object, T]
-    _error_template: str
-
-    def __init__(
-        self, name: str, path: str, loader: loaders.Loader[T], error_template: str
-    ) -> None:
-        self.name = name
-        self.path = path
-        self.loader = loader
-        self._data = weakref.WeakKeyDictionary()
-        self._error_template = error_template
-
-    @overload
-    def __get__(self, obj: None, owner: type[object]) -> _BaseDescriptor[T]: ...
-
-    @overload
-    def __get__(self, obj: object, owner: type[object]) -> T: ...
-
-    def __get__(self, obj: object | None, owner: type[object]) -> _BaseDescriptor[T] | T:
-        if obj is None:
-            return self
-        if obj not in self._data:
-            raise RuntimeError(self._error_template.format(name=self.name))
-        return self._data[obj]
-
-    def _clear(self, obj: object) -> None:
-        """Clear data for the given instance."""
-        self._data.pop(obj, None)
-
-
-class DepDescriptor[T](_BaseDescriptor[T]):
-    """Descriptor for typed dependency access."""
-
-    def __init__(self, name: str, path: str, loader: loaders.Loader[T]) -> None:
-        super().__init__(
-            name, path, loader, "Dependency '{name}' not loaded - ensure _load_deps() was called"
-        )
-
-    def _load(self, obj: object, project_root: pathlib.Path) -> None:
-        """Load data for the given instance."""
-        full_path = project_root / self.path
-        data = self.loader.load(full_path)
-        self._data[obj] = data
-
-
-class OutDescriptor[T](_BaseDescriptor[T]):
-    """Descriptor for typed output access."""
-
-    def __init__(self, name: str, path: str, loader: loaders.Loader[T]) -> None:
-        super().__init__(
-            name, path, loader, "Output '{name}' not assigned - set it before calling _save_outs()"
-        )
-
-    def __set__(self, obj: object, value: T) -> None:
-        self._data[obj] = value
-        # Track assignment on the StageDef instance
-        parent: StageDef | None = getattr(obj, "_parent_stage_def", None)
-        if parent is not None:
-            parent._assigned_outs.add(self.name)  # pyright: ignore[reportPrivateUsage] - internal tracking
-
-    def _save(self, obj: object, project_root: pathlib.Path) -> None:
-        """Save data for the given instance."""
-        if obj not in self._data:
-            raise RuntimeError(f"Output '{self.name}' was never assigned")
-        full_path = project_root / self.path
-        full_path.parent.mkdir(parents=True, exist_ok=True)
-        self.loader.save(self._data[obj], full_path)
-
-
-def _create_loader_from_annotation(
-    annotation: type[Any],
-) -> loaders.Loader[Any]:
-    """Create a loader instance from a type annotation like CSV[DataFrame]."""
-    from pivot import loaders
-
-    origin = get_origin(annotation)
-    if origin is None:
-        # Direct class reference (e.g., PathOnly without type param)
-        if issubclass(annotation, loaders.Loader):
-            return annotation()  # pyright: ignore[reportUnknownVariableType] - generic loader
-        raise TypeError(f"Invalid loader annotation: {annotation}")
-
-    # Generic type like CSV[DataFrame]
-    if isinstance(origin, type) and issubclass(origin, loaders.Loader):
-        return origin()  # pyright: ignore[reportUnknownVariableType] - generic loader
-
-    raise TypeError(f"Invalid loader annotation: {annotation}")
-
-
-def _process_nested_class(
-    nested_cls: type[object],
-    descriptor_cls: type[DepDescriptor[Any]] | type[OutDescriptor[Any]],
-    spec_cls: type[DepSpec] | type[OutSpec],
-    parent_globals: dict[str, Any],
-) -> tuple[dict[str, DepSpec | OutSpec], type[object]]:
-    """Process a nested deps/outs class and create descriptors."""
-    specs: dict[str, DepSpec | OutSpec] = {}
-
-    # Get annotations from the nested class, resolving string annotations
+    Returns:
+        Dict of type hints, or None if hints couldn't be resolved
+    """
     try:
-        annotations = get_type_hints(nested_cls, globalns=parent_globals)
-    except NameError:
-        # Forward reference couldn't be resolved - fall back to raw annotations
-        raw_annotations = getattr(nested_cls, "__annotations__", {})
-        # Check for unresolved string annotations
-        for name, ann in raw_annotations.items():
-            if isinstance(ann, str):
-                msg = f"Cannot resolve type annotation '{ann}' for '{name}'. "
-                msg += "Ensure all loader types are imported."
-                raise TypeError(msg) from None
-        annotations = raw_annotations
-
-    # Create a new namespace class with descriptors
-    namespace_dict: dict[str, DepDescriptor[Any] | OutDescriptor[Any] | Callable[..., None]] = {}
-
-    for name, annotation in annotations.items():
-        # Get default value (the path string)
-        default = getattr(nested_cls, name, None)
-        if default is None:
-            raise ValueError(f"Missing default path for '{name}'")
-
-        path = str(default)
-        loader = _create_loader_from_annotation(annotation)
-
-        specs[name] = spec_cls(path=path, loader=loader)
-        descriptor = descriptor_cls(name=name, path=path, loader=loader)
-        namespace_dict[name] = descriptor
-
-    # Add __init__ that takes parent reference
-    def namespace_init(self: _NamespaceInstance) -> None:
-        self._parent_stage_def = None  # pyright: ignore[reportPrivateUsage] - protocol attribute
-
-    namespace_dict["__init__"] = namespace_init
-
-    # Create namespace class dynamically
-    namespace_cls = type(f"{nested_cls.__name__}Namespace", (object,), namespace_dict)
-
-    return specs, namespace_cls
+        return get_type_hints(obj, include_extras=include_extras)
+    except (NameError, AttributeError) as e:
+        logger.warning("Failed to resolve type hints for %s: %s", name, e)
+        return None
+    except Exception as e:
+        logger.debug("Failed to get type hints for %s: %s", name, e)
+        return None
 
 
-class _NamespaceInstance(Protocol):
-    """Protocol for namespace instances that track their parent StageDef."""
+class StageParams(pydantic.BaseModel):
+    """Base class for stage parameters (Pydantic model).
 
-    _parent_stage_def: StageDef | None
+    Use as a simple base class for parameter-only stages:
 
+        class TrainParams(StageParams):
+            learning_rate: float = 0.01
+            batch_size: int = 32
 
-class _NamespaceDescriptor:
-    """Descriptor for accessing deps/outs namespace from class or instance."""
+        def train(
+            config: TrainParams,
+            data: Annotated[DataFrame, Dep("input.csv", CSV())],
+        ) -> TrainOutputs:
+            ...
 
-    _cls_attr: str
-    _instance_attr: str
-    _name: str
+    For testing, just pass the data directly:
 
-    def __init__(self, cls_attr: str, instance_attr: str, name: str) -> None:
-        self._cls_attr = cls_attr
-        self._instance_attr = instance_attr
-        self._name = name
+        result = train(TrainParams(learning_rate=0.5), test_df)
+    """
 
-    @overload
-    def __get__(self, obj: None, owner: type[StageDef]) -> type[object]: ...
-
-    @overload
-    def __get__(self, obj: StageDef, owner: type[StageDef]) -> _NamespaceInstance: ...
-
-    def __get__(
-        self, obj: StageDef | None, owner: type[StageDef]
-    ) -> type[object] | _NamespaceInstance:
-        if obj is None:
-            # Class access - return the namespace class with descriptors
-            namespace_cls: type[object] | None = getattr(owner, self._cls_attr)
-            if namespace_cls is None:
-                raise AttributeError(f"No {self._name} defined for this StageDef")
-            return namespace_cls
-        # Instance access - return the instance namespace
-        namespace_instance: _NamespaceInstance | None = getattr(obj, self._instance_attr)
-        if namespace_instance is None:
-            raise AttributeError(f"No {self._name} defined for this StageDef")
-        return namespace_instance
+    model_config: ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict()
 
 
-class StageDef(pydantic.BaseModel):
-    """Base class for stage definitions with typed deps/outs."""
+# ==============================================================================
+# Common validation and write helpers
+# ==============================================================================
 
-    model_config: ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(
-        arbitrary_types_allowed=True,
-        ignored_types=(_NamespaceDescriptor,),
-    )
 
-    _deps_specs: ClassVar[dict[str, DepSpec]] = {}
-    _outs_specs: ClassVar[dict[str, OutSpec]] = {}
-    _deps_namespace_cls: ClassVar[type[object] | None] = None
-    _outs_namespace_cls: ClassVar[type[object] | None] = None
+def _validate_path_overrides_common(
+    overrides: Mapping[str, outputs.PathType],
+    spec_paths: Mapping[str, outputs.PathType],
+    kind: str,
+) -> None:
+    """Validate path overrides against spec paths.
 
-    _deps_instance: _NamespaceInstance | None = pydantic.PrivateAttr(default=None)
-    _outs_instance: _NamespaceInstance | None = pydantic.PrivateAttr(default=None)
-    _assigned_outs: set[str] = pydantic.PrivateAttr(default_factory=set)
+    Args:
+        overrides: Dict of name -> path overrides
+        spec_paths: Dict of name -> spec path (from specs)
+        kind: "dependency", "output", or "return output" for error messages
 
-    # Use parameterized descriptors for deps/outs access
-    deps: ClassVar[_NamespaceDescriptor] = _NamespaceDescriptor(
-        "_deps_namespace_cls", "_deps_instance", "dependencies"
-    )
-    outs: ClassVar[_NamespaceDescriptor] = _NamespaceDescriptor(
-        "_outs_namespace_cls", "_outs_instance", "outputs"
-    )
+    Raises:
+        ValueError: If override keys unknown
+        TypeError: If override type (str vs sequence) doesn't match spec type
+        ValueError: If tuple spec overridden with different length
 
-    def __init_subclass__(cls, **kwargs: Any) -> None:
-        super().__init_subclass__(**kwargs)
+    Note:
+        - List specs allow variable-length overrides (can change count)
+        - Tuple specs require exact length match (fixed-size)
+    """
+    unknown = set(overrides.keys()) - set(spec_paths.keys())
+    if unknown:
+        raise ValueError(f"Unknown {kind} names in path_overrides: {unknown}")
 
-        module = sys.modules.get(cls.__module__)
-        parent_globals = vars(module) if module else {}
+    for name, override_path in overrides.items():
+        spec_path = spec_paths[name]
 
-        # Process nested deps class if defined
-        nested_deps = cls.__dict__.get("deps")
-        if nested_deps is not None and isinstance(nested_deps, type):
-            specs, namespace_cls = _process_nested_class(
-                nested_deps, DepDescriptor, DepSpec, parent_globals
+        # Check type compatibility: str vs sequence (list/tuple)
+        spec_is_seq = isinstance(spec_path, (list, tuple))
+        override_is_seq = isinstance(override_path, (list, tuple))
+
+        if spec_is_seq != override_is_seq:
+            spec_type = "sequence" if spec_is_seq else "str"
+            override_type = "sequence" if override_is_seq else "str"
+            raise TypeError(
+                f"Path type mismatch for {kind} '{name}': spec is {spec_type}, override is {override_type}"
             )
-            cls._deps_specs = cast("dict[str, DepSpec]", specs)
-            cls._deps_namespace_cls = namespace_cls
-            delattr(cls, "deps")
-        elif not hasattr(cls, "_deps_specs") or cls._deps_specs is StageDef._deps_specs:
-            cls._deps_specs = {}
-            cls._deps_namespace_cls = None
 
-        # Process nested outs class if defined
-        nested_outs = cls.__dict__.get("outs")
-        if nested_outs is not None and isinstance(nested_outs, type):
-            specs, namespace_cls = _process_nested_class(
-                nested_outs, OutDescriptor, OutSpec, parent_globals
+        # For tuple specs (fixed-length), validate exact length match
+        # (spec_is_seq check above guarantees override_path is also a sequence here)
+        if isinstance(spec_path, tuple) and len(override_path) != len(spec_path):
+            raise ValueError(
+                f"Path count mismatch for {kind} '{name}': tuple spec has {len(spec_path)} paths, override has {len(override_path)} (tuple indicates fixed-length, use list for variable-length)"
             )
-            cls._outs_specs = cast("dict[str, OutSpec]", specs)
-            cls._outs_namespace_cls = namespace_cls
-            delattr(cls, "outs")
-        elif not hasattr(cls, "_outs_specs") or cls._outs_specs is StageDef._outs_specs:
-            cls._outs_specs = {}
-            cls._outs_namespace_cls = None
 
-    @override
-    def model_post_init(self, context: Any) -> None:
-        """Initialize deps and outs namespace instances after pydantic init."""
-        if self._deps_namespace_cls is not None:
-            self._deps_instance = self._deps_namespace_cls()  # pyright: ignore[reportAttributeAccessIssue] - dynamic namespace class
-            self._deps_instance._parent_stage_def = self  # pyright: ignore[reportOptionalMemberAccess,reportPrivateUsage] - just assigned above, protocol attribute
 
-        if self._outs_namespace_cls is not None:
-            self._outs_instance = self._outs_namespace_cls()  # pyright: ignore[reportAttributeAccessIssue] - dynamic namespace class
-            self._outs_instance._parent_stage_def = self  # pyright: ignore[reportOptionalMemberAccess,reportPrivateUsage] - just assigned above, protocol attribute
+def _validate_path_not_escaped(path: pathlib.Path, project_root: pathlib.Path) -> None:
+    """Validate that resolved path is within project root (no path traversal)."""
+    resolved = path.resolve()
+    root_resolved = project_root.resolve()
+    if not resolved.is_relative_to(root_resolved):
+        raise ValueError(
+            f"Path escapes project root: '{path}' resolves to '{resolved}' which is outside '{root_resolved}'"
+        )
 
-    def _load_deps(self, project_root: pathlib.Path) -> None:
-        """Load all dependencies from disk."""
-        if self._deps_namespace_cls is None or self._deps_instance is None:
-            return
 
-        loaded_names: list[str] = []
-        try:
-            for name in self._deps_specs:
-                descriptor = cast("DepDescriptor[Any]", getattr(self._deps_namespace_cls, name))
-                descriptor._load(self._deps_instance, project_root)  # pyright: ignore[reportPrivateUsage] - internal API
-                loaded_names.append(name)
-        except Exception:
-            # Clear any partially loaded state
-            for loaded_name in loaded_names:
-                descriptor = cast(
-                    "DepDescriptor[Any]", getattr(self._deps_namespace_cls, loaded_name)
+# ==============================================================================
+# Return output spec extraction
+# ==============================================================================
+
+
+def get_output_specs_from_return(func: Callable[..., Any]) -> dict[str, outputs.Out[Any]]:
+    """Extract output specs from a function's return type annotation.
+
+    The return type must be a TypedDict with Annotated fields containing Out markers:
+
+        class ProcessOutputs(TypedDict):
+            result: Annotated[dict[str, int], Out("output.json", JSON())]
+
+        def process(params: ProcessParams) -> ProcessOutputs:
+            return {"result": {"count": 42}}
+
+        specs = get_output_specs_from_return(process)
+        # specs["result"].path == "output.json"
+        # specs["result"].loader == JSON()
+
+    Returns empty dict if return type is None or not a TypedDict.
+    Recognizes Out subclasses (Metric, Plot, IncrementalOut).
+
+    Raises:
+        TypeError: If TypedDict has fields without Out annotations
+    """
+    hints = _get_type_hints_safe(func, func.__name__, include_extras=True)
+    if hints is None:
+        return {}
+
+    return_type = hints.get("return")
+    if return_type is None:
+        return {}
+
+    # Must be a TypedDict
+    if not is_typeddict(return_type):
+        return {}
+
+    # Get the TypedDict's field annotations
+    field_hints = _get_type_hints_safe(return_type, str(return_type), include_extras=True)
+    if field_hints is None:
+        return {}
+
+    specs = dict[str, outputs.Out[Any]]()
+    unannotated_fields = list[str]()
+
+    for field_name, field_type in field_hints.items():
+        # Must be an Annotated type
+        if get_origin(field_type) is not Annotated:
+            unannotated_fields.append(field_name)
+            continue
+
+        args = get_args(field_type)
+        if len(args) < 2:
+            unannotated_fields.append(field_name)
+            continue
+
+        # Look for Out or its subclasses (Metric, Plot, IncrementalOut) in the metadata
+        out_spec: outputs.Out[Any] | None = None
+        for metadata in args[1:]:
+            if isinstance(metadata, outputs.Out):
+                out_spec = cast("outputs.Out[Any]", metadata)
+                break
+
+        if out_spec is None:
+            unannotated_fields.append(field_name)
+            continue
+
+        specs[field_name] = out_spec
+
+    if unannotated_fields:
+        raise TypeError(
+            f"TypedDict return type '{return_type.__name__}' has fields without Out annotations: {sorted(unannotated_fields)}. All fields must be Annotated with Out, Metric, Plot, or IncrementalOut."
+        )
+
+    return specs
+
+
+def save_return_outputs(
+    return_value: Mapping[str, Any],
+    specs: dict[str, outputs.Out[Any]],
+    project_root: pathlib.Path,
+    path_overrides: Mapping[str, outputs.PathType] | None = None,
+) -> None:
+    """Save return value outputs to disk.
+
+    Takes the return value from a stage function and saves each output
+    to its configured path using its loader.
+
+    Validates all inputs upfront before writing any files.
+
+    Args:
+        return_value: The dict returned by the stage function
+        specs: Output specs extracted from the function's return annotation
+        project_root: Root directory for relative paths
+        path_overrides: Optional dict of output name -> custom path(s) to override defaults
+
+    Raises:
+        TypeError: If path override type mismatches
+        ValueError: If path override keys are unknown, list lengths mismatch, or path escapes root
+        KeyError: If output keys are missing from return_value
+        RuntimeError: If value/path count mismatch for sequence outputs
+    """
+    # Validate path overrides
+    if path_overrides:
+        spec_paths = {name: spec.path for name, spec in specs.items()}
+        _validate_path_overrides_common(path_overrides, spec_paths, "return output")
+
+    # Validate all output keys exist
+    missing = set(specs.keys()) - set(return_value.keys())
+    if missing:
+        raise KeyError(
+            f"Missing return output keys: {sorted(missing)}. Return value keys: {sorted(return_value.keys())}"
+        )
+
+    # Warn about extra keys not declared as outputs
+    extra = set(return_value.keys()) - set(specs.keys())
+    if extra:
+        logger.warning("Extra keys in return value not declared as outputs: %s", sorted(extra))
+
+    # Collect all write operations and validate paths upfront
+    write_ops: list[tuple[pathlib.Path, Any, loaders.Loader[Any]]] = []
+    for name, spec in specs.items():
+        path = path_overrides[name] if path_overrides and name in path_overrides else spec.path
+        value = return_value[name]
+
+        if isinstance(path, (list, tuple)):
+            if not isinstance(value, (list, tuple)):
+                raise RuntimeError(
+                    f"Output '{name}' has sequence path but non-sequence value: {type(value).__name__}"
                 )
-                descriptor._clear(self._deps_instance)  # pyright: ignore[reportPrivateUsage] - internal API
-            raise
+            values = cast("list[Any] | tuple[Any, ...]", value)
+            if len(values) != len(path):
+                raise RuntimeError(
+                    f"Output '{name}' has {len(path)} paths but {len(values)} values"
+                )
+            for p, v in zip(path, values, strict=True):
+                full_path = project_root / p
+                _validate_path_not_escaped(full_path, project_root)
+                write_ops.append((full_path, v, spec.loader))
+        else:
+            full_path = project_root / path
+            _validate_path_not_escaped(full_path, project_root)
+            write_ops.append((full_path, value, spec.loader))
 
-    def _clear_deps(self) -> None:
-        """Clear all loaded dependency data."""
-        if self._deps_namespace_cls is None or self._deps_instance is None:
-            return
-        for name in self._deps_specs:
-            descriptor = cast("DepDescriptor[Any]", getattr(self._deps_namespace_cls, name))
-            descriptor._clear(self._deps_instance)  # pyright: ignore[reportPrivateUsage] - internal API
+    # All validation passed - now write
+    for full_path, value, loader in write_ops:
+        full_path.parent.mkdir(parents=True, exist_ok=True)
+        loader.save(value, full_path)
 
-    def _clear_outs(self) -> None:
-        """Clear all output data."""
-        if self._outs_namespace_cls is None or self._outs_instance is None:
-            return
-        for name in self._outs_specs:
-            descriptor = cast("OutDescriptor[Any]", getattr(self._outs_namespace_cls, name))
-            descriptor._clear(self._outs_instance)  # pyright: ignore[reportPrivateUsage] - internal API
 
-    def _save_outs(self, project_root: pathlib.Path) -> None:
-        """Save all outputs to disk."""
-        if self._outs_namespace_cls is None or self._outs_instance is None:
-            return
+# ==============================================================================
+# Annotation-based dependency injection helpers
+# ==============================================================================
 
-        # Check all outputs were assigned
-        for name in self._outs_specs:
-            if name not in self._assigned_outs:
-                msg = f"Output '{name}' was declared but never assigned. "
-                msg += f"Assign a value to params.outs.{name} before the stage function returns."
-                raise RuntimeError(msg)
 
-        for name in self._outs_specs:
-            descriptor = cast("OutDescriptor[Any]", getattr(self._outs_namespace_cls, name))
-            descriptor._save(self._outs_instance, project_root)  # pyright: ignore[reportPrivateUsage] - internal API
+@dataclasses.dataclass(frozen=True)
+class FuncDepSpec:
+    """Specification for a function argument dependency (from Annotated marker)."""
 
-    @classmethod
-    def get_deps_paths(cls) -> dict[str, str]:
-        """Get dict of dependency names to paths."""
-        return {name: spec.path for name, spec in cls._deps_specs.items()}
+    path: outputs.PathType
+    loader: loaders.Loader[Any]
 
-    @classmethod
-    def get_outs_paths(cls) -> dict[str, str]:
-        """Get dict of output names to paths."""
-        return {name: spec.path for name, spec in cls._outs_specs.items()}
+
+def get_dep_specs_from_signature(func: Callable[..., Any]) -> dict[str, FuncDepSpec]:
+    """Extract dependency specs from a function's parameter annotations.
+
+    Looks for Annotated type hints containing Dep markers:
+
+        def process(
+            data: Annotated[DataFrame, Dep("input.csv", CSV())],
+            config: Annotated[dict, Dep("config.json", JSON())],
+        ) -> OutputType:
+            ...
+
+        specs = get_dep_specs_from_signature(process)
+        # specs["data"].path == "input.csv"
+        # specs["config"].path == "config.json"
+
+    Returns empty dict if no Dep annotations found.
+    """
+    import inspect as inspect_module
+
+    hints = _get_type_hints_safe(func, func.__name__, include_extras=True)
+    if hints is None:
+        return {}
+
+    sig = inspect_module.signature(func)
+    specs = dict[str, FuncDepSpec]()
+
+    for param_name in sig.parameters:
+        if param_name not in hints:
+            continue
+
+        param_type = hints[param_name]
+
+        # Check if it's an Annotated type
+        if get_origin(param_type) is not Annotated:
+            continue
+
+        # Get the annotation args (first is the actual type, rest are metadata)
+        args = get_args(param_type)
+        if len(args) < 2:
+            continue
+
+        # Look for Dep in the metadata
+        for metadata in args[1:]:
+            if isinstance(metadata, outputs.Dep):
+                dep = cast("outputs.Dep[Any]", metadata)
+                specs[param_name] = FuncDepSpec(path=dep.path, loader=dep.loader)
+                break
+
+    return specs
+
+
+def get_single_output_spec_from_return(func: Callable[..., Any]) -> outputs.Out[Any] | None:
+    """Extract single output spec from a function's return annotation (non-TypedDict).
+
+    For functions with a single output, the return type can be directly annotated:
+
+        def transform(
+            data: Annotated[DataFrame, Dep("input.csv", CSV())],
+        ) -> Annotated[DataFrame, Out("output.csv", CSV())]:
+            return data.dropna()
+
+        spec = get_single_output_spec_from_return(transform)
+        # spec.path == "output.csv"
+
+    Returns None if return type is TypedDict (use get_output_specs_from_return instead)
+    or if no Out annotation found.
+    """
+    hints = _get_type_hints_safe(func, func.__name__, include_extras=True)
+    if hints is None:
+        return None
+
+    return_type = hints.get("return")
+    if return_type is None:
+        return None
+
+    # If it's a TypedDict, return None (use get_output_specs_from_return instead)
+    if is_typeddict(return_type):
+        return None
+
+    # Check if it's an Annotated type
+    if get_origin(return_type) is not Annotated:
+        return None
+
+    # Get the annotation args (first is the actual type, rest are metadata)
+    args = get_args(return_type)
+    if len(args) < 2:
+        return None
+
+    # Look for Out or its subclasses in the metadata
+    for metadata in args[1:]:
+        if isinstance(metadata, outputs.Out):
+            return cast("outputs.Out[Any]", metadata)
+
+    return None
+
+
+def _load_single_dep(
+    name: str,
+    path: str,
+    spec: FuncDepSpec,
+    project_root: pathlib.Path,
+) -> Any:
+    """Load a single dependency file with error context."""
+    try:
+        return spec.loader.load(project_root / path)
+    except Exception as e:
+        raise RuntimeError(f"Failed to load dependency '{name}' from '{path}': {e}") from e
+
+
+def load_deps_from_specs(
+    specs: dict[str, FuncDepSpec],
+    project_root: pathlib.Path,
+    path_overrides: Mapping[str, outputs.PathType] | None = None,
+) -> dict[str, Any]:
+    """Load dependency files based on specs.
+
+    For single-file deps (path is str), loads and returns the single value.
+    For multi-file deps (path is list/tuple), loads each file and returns as list/tuple.
+
+    Args:
+        specs: Dep specs from get_dep_specs_from_signature()
+        project_root: Root directory for relative paths
+        path_overrides: Optional dict of dep name -> custom path(s)
+
+    Returns:
+        Dict of dep name -> loaded data
+    """
+    loaded = dict[str, Any]()
+
+    for name, spec in specs.items():
+        path = path_overrides[name] if path_overrides and name in path_overrides else spec.path
+        if isinstance(path, (list, tuple)):
+            items = [_load_single_dep(name, p, spec, project_root) for p in path]
+            # Preserve tuple type for fixed-length deps
+            loaded[name] = tuple(items) if isinstance(path, tuple) else items
+        else:
+            loaded[name] = _load_single_dep(name, path, spec, project_root)
+
+    return loaded
+
+
+def apply_dep_path_overrides(
+    specs: dict[str, FuncDepSpec],
+    overrides: Mapping[str, outputs.PathType],
+) -> dict[str, FuncDepSpec]:
+    """Apply path overrides to dep specs, returning new specs.
+
+    Args:
+        specs: Original dep specs
+        overrides: Dict of dep name -> new path(s)
+
+    Returns:
+        New dict with overridden paths (original specs unchanged)
+
+    Raises:
+        ValueError: If override keys don't match spec keys or tuple lengths mismatch
+        TypeError: If override type (str vs sequence) doesn't match spec type
+    """
+    # Validate overrides (unknown keys, type compatibility, tuple lengths)
+    spec_paths = {name: spec.path for name, spec in specs.items()}
+    _validate_path_overrides_common(overrides, spec_paths, "dependency")
+
+    result = dict[str, FuncDepSpec]()
+    for name, spec in specs.items():
+        if name in overrides:
+            result[name] = FuncDepSpec(path=overrides[name], loader=spec.loader)
+        else:
+            result[name] = spec
+
+    return result
+
+
+def find_params_type_in_signature(func: Callable[..., Any]) -> type[StageParams] | None:
+    """Find StageParams subclass type in function signature.
+
+    Scans function parameters for a type hint that's a StageParams subclass.
+
+    Args:
+        func: Function to inspect
+
+    Returns:
+        The StageParams subclass type, or None if not found
+    """
+    _, params_type = find_params_in_signature(func)
+    return params_type
+
+
+def find_params_in_signature(
+    func: Callable[..., Any],
+) -> tuple[str | None, type[StageParams] | None]:
+    """Find StageParams argument name and type in function signature.
+
+    Scans function parameters for a type hint that's a StageParams subclass.
+
+    Args:
+        func: Function to inspect
+
+    Returns:
+        Tuple of (argument_name, StageParams_type), or (None, None) if not found
+    """
+    import inspect as inspect_module
+
+    hints = _get_type_hints_safe(func, func.__name__)
+    if hints is None:
+        return None, None
+
+    sig = inspect_module.signature(func)
+
+    for param_name in sig.parameters:
+        if param_name not in hints:
+            continue
+
+        param_type = hints[param_name]
+
+        # Check if it's a StageParams subclass
+        if isinstance(param_type, type) and issubclass(param_type, StageParams):
+            return param_name, param_type
+
+    return None, None

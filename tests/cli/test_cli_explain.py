@@ -3,14 +3,91 @@
 from __future__ import annotations
 
 import pathlib
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Annotated, TypedDict
 
-import pydantic
-
-from pivot import cli, executor, stage
+from helpers import register_test_stage
+from pivot import cli, executor, loaders, outputs, stage_def
+from pivot.registry import REGISTRY
 
 if TYPE_CHECKING:
     from click.testing import CliRunner
+
+
+# =============================================================================
+# Module-level TypedDicts and Stage Functions for annotation-based registration
+# =============================================================================
+
+
+class _OutputTxtOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
+
+
+class _ATxtOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("a.txt", loaders.PathOnly())]
+
+
+class _BTxtOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("b.txt", loaders.PathOnly())]
+
+
+def _helper_process(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _OutputTxtOutputs:
+    _ = input_file
+    return _OutputTxtOutputs(output=pathlib.Path("output.txt"))
+
+
+def _helper_stage_a(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _ATxtOutputs:
+    _ = input_file
+    return _ATxtOutputs(output=pathlib.Path("a.txt"))
+
+
+def _helper_stage_b(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _BTxtOutputs:
+    _ = input_file
+    return _BTxtOutputs(output=pathlib.Path("b.txt"))
+
+
+def _helper_process_v1(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _OutputTxtOutputs:
+    _ = input_file
+    pathlib.Path("output.txt").write_text("v1")
+    return _OutputTxtOutputs(output=pathlib.Path("output.txt"))
+
+
+def _helper_process_v2(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _OutputTxtOutputs:
+    _ = input_file
+    pathlib.Path("output.txt").write_text("v2 - different code")
+    return _OutputTxtOutputs(output=pathlib.Path("output.txt"))
+
+
+def _helper_process_writer(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _OutputTxtOutputs:
+    _ = input_file
+    pathlib.Path("output.txt").write_text("done")
+    return _OutputTxtOutputs(output=pathlib.Path("output.txt"))
+
+
+class TrainParams(stage_def.StageParams):
+    learning_rate: float = 0.01
+
+
+def _helper_train(
+    params: TrainParams,
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _OutputTxtOutputs:
+    _ = input_file
+    _ = params
+    pathlib.Path("output.txt").write_text("done")
+    return _OutputTxtOutputs(output=pathlib.Path("output.txt"))
+
 
 # =============================================================================
 # Basic --explain flag tests
@@ -42,9 +119,7 @@ def test_explain_flag_works(runner: CliRunner, tmp_path: pathlib.Path) -> None:
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
 
-        @stage(deps=["input.txt"], outs=["output.txt"])
-        def process() -> None:
-            pass
+        register_test_stage(_helper_process, name="process")
 
         result = runner.invoke(cli.cli, ["run", "--explain"])
 
@@ -59,13 +134,8 @@ def test_explain_specific_stages(runner: CliRunner, tmp_path: pathlib.Path) -> N
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
 
-        @stage(deps=["input.txt"], outs=["a.txt"])
-        def stage_a() -> None:
-            pass
-
-        @stage(deps=["input.txt"], outs=["b.txt"])
-        def stage_b() -> None:
-            pass
+        register_test_stage(_helper_stage_a, name="stage_a")
+        register_test_stage(_helper_stage_b, name="stage_b")
 
         result = runner.invoke(cli.cli, ["run", "--explain", "stage_a"])
 
@@ -85,20 +155,14 @@ def test_explain_shows_code_changes(runner: CliRunner, tmp_path: pathlib.Path) -
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
 
-        @stage(deps=["input.txt"], outs=["output.txt"])
-        def process() -> None:
-            pathlib.Path("output.txt").write_text("v1")
+        register_test_stage(_helper_process_v1, name="process")
 
         executor.run(show_output=False)
 
         # Re-register with different implementation (simulates code change)
-        from pivot.registry import REGISTRY
-
         REGISTRY._stages.clear()
 
-        @stage(deps=["input.txt"], outs=["output.txt"])
-        def process() -> None:
-            pathlib.Path("output.txt").write_text("v2 - different code")
+        register_test_stage(_helper_process_v2, name="process")
 
         result = runner.invoke(cli.cli, ["run", "--explain"])
 
@@ -113,12 +177,7 @@ def test_explain_shows_param_changes(runner: CliRunner, tmp_path: pathlib.Path) 
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
 
-        class TrainParams(pydantic.BaseModel):
-            learning_rate: float = 0.01
-
-        @stage(deps=["input.txt"], outs=["output.txt"], params=TrainParams)
-        def train(params: TrainParams) -> None:
-            pathlib.Path("output.txt").write_text("done")
+        register_test_stage(_helper_train, name="train", params=TrainParams)
 
         executor.run(show_output=False)
 
@@ -138,9 +197,7 @@ def test_explain_shows_dep_changes(runner: CliRunner, tmp_path: pathlib.Path) ->
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("original data")
 
-        @stage(deps=["input.txt"], outs=["output.txt"])
-        def process() -> None:
-            pathlib.Path("output.txt").write_text("done")
+        register_test_stage(_helper_process_writer, name="process")
 
         executor.run(show_output=False)
 
@@ -160,9 +217,7 @@ def test_explain_shows_unchanged(runner: CliRunner, tmp_path: pathlib.Path) -> N
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
 
-        @stage(deps=["input.txt"], outs=["output.txt"])
-        def process() -> None:
-            pathlib.Path("output.txt").write_text("done")
+        register_test_stage(_helper_process_writer, name="process")
 
         executor.run(show_output=False)
 
@@ -179,9 +234,7 @@ def test_explain_shows_no_previous_run(runner: CliRunner, tmp_path: pathlib.Path
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
 
-        @stage(deps=["input.txt"], outs=["output.txt"])
-        def process() -> None:
-            pass
+        register_test_stage(_helper_process, name="process")
 
         result = runner.invoke(cli.cli, ["run", "--explain"])
 
@@ -200,9 +253,7 @@ def test_explain_short_flag(runner: CliRunner, tmp_path: pathlib.Path) -> None:
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
 
-        @stage(deps=["input.txt"], outs=["output.txt"])
-        def process() -> None:
-            pass
+        register_test_stage(_helper_process, name="process")
 
         result = runner.invoke(cli.cli, ["run", "-e"])
 

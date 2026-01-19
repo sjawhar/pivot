@@ -51,14 +51,14 @@ def list_cmd(ctx: click.Context, as_json: bool, show_deps: bool) -> None:
             click.echo(json.dumps(ListJsonOutput(stages=[])))
         elif not quiet:
             click.echo("No stages registered.")
-            click.echo("Create a pipeline.py with @stage decorators, or a pivot.yaml file.")
+            click.echo("Create a pipeline.py with stage functions, or a pivot.yaml file.")
         return
 
     if as_json:
         stages = [
             StageJsonOutput(
                 name=name,
-                deps=(info := registry.REGISTRY.get(name))["deps"],
+                deps=(info := registry.REGISTRY.get(name))["deps_paths"],
                 outs=info["outs_paths"],
                 mutex=info["mutex"],
                 variant=info["variant"],
@@ -78,7 +78,7 @@ def list_cmd(ctx: click.Context, as_json: bool, show_deps: bool) -> None:
     click.echo(f"Registered stages ({len(stage_list)}):")
     for name in stage_list:
         info = registry.REGISTRY.get(name)
-        deps = info["deps"]
+        deps = info["deps_paths"]
         outs = info["outs_paths"]
         click.echo(f"  {name}")
 

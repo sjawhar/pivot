@@ -4,15 +4,70 @@ import json
 import pathlib
 from typing import TYPE_CHECKING
 
-import pydantic
 import yaml
 
-from pivot import cli, project
+from helpers import register_test_stage
+from pivot import cli, project, stage_def
 from pivot.registry import REGISTRY
 
 if TYPE_CHECKING:
     import click.testing
     from pytest_mock import MockerFixture
+
+
+# =============================================================================
+# Module-level StageParams classes for annotation-based registration
+# =============================================================================
+
+
+class _TrainParams(stage_def.StageParams):
+    lr: float = 0.01
+    epochs: int = 10
+
+
+class _SimpleParams(stage_def.StageParams):
+    x: int = 1
+
+
+class _PrecisionParams(stage_def.StageParams):
+    lr: float = 0.123456789
+
+
+class _ChangedParams(stage_def.StageParams):
+    x: int = 2
+
+
+# =============================================================================
+# Module-level stage functions
+# =============================================================================
+
+
+def _helper_train(params: _TrainParams) -> None:
+    pass
+
+
+def _helper_stage_simple(params: _SimpleParams) -> None:
+    pass
+
+
+def _helper_stage_a(params: _SimpleParams) -> None:
+    pass
+
+
+def _helper_stage_b(params: _SimpleParams) -> None:
+    pass
+
+
+def _helper_stage_c(params: _SimpleParams) -> None:
+    pass
+
+
+def _helper_stage_precision(params: _PrecisionParams) -> None:
+    pass
+
+
+def _helper_stage_changed(params: _ChangedParams) -> None:
+    pass
 
 
 # =============================================================================
@@ -47,14 +102,7 @@ def test_params_show_with_params(runner: click.testing.CliRunner, tmp_path: path
         pathlib.Path(".git").mkdir()
         project._project_root_cache = None
 
-        class TrainParams(pydantic.BaseModel):
-            lr: float = 0.01
-            epochs: int = 10
-
-        def train(params: TrainParams) -> None:
-            pass
-
-        REGISTRY.register(train, name="train", params=TrainParams())
+        register_test_stage(_helper_train, name="train", params=_TrainParams())
 
         result = runner.invoke(cli.cli, ["params", "show"])
 
@@ -72,13 +120,7 @@ def test_params_show_json_format(runner: click.testing.CliRunner, tmp_path: path
         pathlib.Path(".git").mkdir()
         project._project_root_cache = None
 
-        class P(pydantic.BaseModel):
-            x: int = 1
-
-        def s(params: P) -> None:
-            pass
-
-        REGISTRY.register(s, name="stage", params=P())
+        register_test_stage(_helper_stage_simple, name="stage", params=_SimpleParams())
 
         result = runner.invoke(cli.cli, ["params", "show", "--json"])
 
@@ -95,13 +137,7 @@ def test_params_show_md_format(runner: click.testing.CliRunner, tmp_path: pathli
         pathlib.Path(".git").mkdir()
         project._project_root_cache = None
 
-        class P(pydantic.BaseModel):
-            x: int = 1
-
-        def s(params: P) -> None:
-            pass
-
-        REGISTRY.register(s, name="stage", params=P())
+        register_test_stage(_helper_stage_simple, name="stage", params=_SimpleParams())
 
         result = runner.invoke(cli.cli, ["params", "show", "--md"])
 
@@ -120,21 +156,9 @@ def test_params_show_specific_stages(
         pathlib.Path(".git").mkdir()
         project._project_root_cache = None
 
-        class P(pydantic.BaseModel):
-            x: int = 1
-
-        def a(params: P) -> None:
-            pass
-
-        def b(params: P) -> None:
-            pass
-
-        def c(params: P) -> None:
-            pass
-
-        REGISTRY.register(a, name="stage_a", params=P())
-        REGISTRY.register(b, name="stage_b", params=P())
-        REGISTRY.register(c, name="stage_c", params=P())
+        register_test_stage(_helper_stage_a, name="stage_a", params=_SimpleParams())
+        register_test_stage(_helper_stage_b, name="stage_b", params=_SimpleParams())
+        register_test_stage(_helper_stage_c, name="stage_c", params=_SimpleParams())
 
         result = runner.invoke(cli.cli, ["params", "show", "stage_a", "stage_c"])
 
@@ -151,13 +175,7 @@ def test_params_show_precision(runner: click.testing.CliRunner, tmp_path: pathli
         pathlib.Path(".git").mkdir()
         project._project_root_cache = None
 
-        class P(pydantic.BaseModel):
-            lr: float = 0.123456789
-
-        def s(params: P) -> None:
-            pass
-
-        REGISTRY.register(s, name="stage", params=P())
+        register_test_stage(_helper_stage_precision, name="stage", params=_PrecisionParams())
 
         result = runner.invoke(cli.cli, ["params", "show", "--precision", "2"])
 
@@ -204,13 +222,7 @@ def test_params_diff_no_changes(
         pathlib.Path(".git").mkdir()
         project._project_root_cache = None
 
-        class P(pydantic.BaseModel):
-            x: int = 1
-
-        def s(params: P) -> None:
-            pass
-
-        REGISTRY.register(s, name="stage", params=P())
+        register_test_stage(_helper_stage_simple, name="stage", params=_SimpleParams())
 
         from pivot import git
 
@@ -247,13 +259,7 @@ def test_params_diff_with_changes(
         pathlib.Path(".git").mkdir()
         project._project_root_cache = None
 
-        class P(pydantic.BaseModel):
-            x: int = 2
-
-        def s(params: P) -> None:
-            pass
-
-        REGISTRY.register(s, name="stage", params=P())
+        register_test_stage(_helper_stage_changed, name="stage", params=_ChangedParams())
 
         from pivot import git
 
@@ -291,13 +297,7 @@ def test_params_diff_json_format(
         pathlib.Path(".git").mkdir()
         project._project_root_cache = None
 
-        class P(pydantic.BaseModel):
-            x: int = 2
-
-        def s(params: P) -> None:
-            pass
-
-        REGISTRY.register(s, name="stage", params=P())
+        register_test_stage(_helper_stage_changed, name="stage", params=_ChangedParams())
 
         from pivot import git
 
@@ -336,13 +336,7 @@ def test_params_diff_md_format(
         pathlib.Path(".git").mkdir()
         project._project_root_cache = None
 
-        class P(pydantic.BaseModel):
-            x: int = 2
-
-        def s(params: P) -> None:
-            pass
-
-        REGISTRY.register(s, name="stage", params=P())
+        register_test_stage(_helper_stage_changed, name="stage", params=_ChangedParams())
 
         from pivot import git
 
@@ -433,13 +427,7 @@ def test_params_diff_no_git_warning(
         pathlib.Path(".git").mkdir()
         project._project_root_cache = None
 
-        class P(pydantic.BaseModel):
-            x: int = 1
-
-        def s(params: P) -> None:
-            pass
-
-        REGISTRY.register(s, name="stage", params=P())
+        register_test_stage(_helper_stage_simple, name="stage", params=_SimpleParams())
 
         from pivot import git
 

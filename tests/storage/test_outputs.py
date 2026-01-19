@@ -2,12 +2,12 @@
 
 import pytest
 
-from pivot import outputs
+from pivot import loaders, outputs
 
 
 def test_out_cache_default_true() -> None:
     """Out should have cache=True by default."""
-    out = outputs.Out(path="file.txt")
+    out = outputs.Out(path="file.txt", loader=loaders.PathOnly())
     assert out.cache is True
 
 
@@ -33,7 +33,7 @@ def test_plot_options() -> None:
 
 def test_all_outputs_frozen() -> None:
     """All output types should be immutable (frozen dataclasses)."""
-    out = outputs.Out(path="file.txt")
+    out = outputs.Out(path="file.txt", loader=loaders.PathOnly())
     metric = outputs.Metric(path="metrics.json")
     plot = outputs.Plot(path="loss.csv")
 
@@ -56,8 +56,8 @@ def test_normalize_out_string() -> None:
 
 
 def test_normalize_out_passthrough() -> None:
-    """BaseOut subclasses should pass through unchanged."""
-    out = outputs.Out(path="file.txt", cache=False)
+    """Out subclasses should pass through unchanged."""
+    out = outputs.Out(path="file.txt", loader=loaders.PathOnly(), cache=False)
     metric = outputs.Metric(path="metrics.json")
     plot = outputs.Plot(path="loss.csv", x="epoch")
 
@@ -68,7 +68,7 @@ def test_normalize_out_passthrough() -> None:
 
 def test_out_persist_option() -> None:
     """All output types should support persist option."""
-    out = outputs.Out(path="file.txt", persist=True)
+    out = outputs.Out(path="file.txt", loader=loaders.PathOnly(), persist=True)
     metric = outputs.Metric(path="metrics.json", persist=True)
     plot = outputs.Plot(path="loss.csv", persist=True)
 
@@ -79,7 +79,7 @@ def test_out_persist_option() -> None:
 
 def test_out_with_explicit_cache_false() -> None:
     """Out can explicitly set cache=False."""
-    out = outputs.Out(path="file.txt", cache=False)
+    out = outputs.Out(path="file.txt", loader=loaders.PathOnly(), cache=False)
     assert out.cache is False
 
 
@@ -97,22 +97,22 @@ def test_plot_with_no_options() -> None:
     assert plot.template is None
 
 
-def test_baseout_is_base_class() -> None:
-    """Out, Metric, Plot should all inherit from BaseOut."""
-    assert issubclass(outputs.Out, outputs.BaseOut)
-    assert issubclass(outputs.Metric, outputs.BaseOut)
-    assert issubclass(outputs.Plot, outputs.BaseOut)
+def test_out_subclass_hierarchy() -> None:
+    """Metric, Plot should inherit from Out."""
+    assert issubclass(outputs.Metric, outputs.Out)
+    assert issubclass(outputs.Plot, outputs.Out)
+    assert issubclass(outputs.IncrementalOut, outputs.Out)
 
 
-def test_out_instances_are_baseout() -> None:
-    """Instances should be recognizable as BaseOut."""
-    out = outputs.Out(path="file.txt")
+def test_out_instances_are_out() -> None:
+    """Instances should be recognizable as Out."""
+    out = outputs.Out(path="file.txt", loader=loaders.PathOnly())
     metric = outputs.Metric(path="metrics.json")
     plot = outputs.Plot(path="loss.csv")
 
-    assert isinstance(out, outputs.BaseOut)
-    assert isinstance(metric, outputs.BaseOut)
-    assert isinstance(plot, outputs.BaseOut)
+    assert isinstance(out, outputs.Out)
+    assert isinstance(metric, outputs.Out)
+    assert isinstance(plot, outputs.Out)
 
 
 # IncrementalOut tests
@@ -120,31 +120,31 @@ def test_out_instances_are_baseout() -> None:
 
 def test_incremental_out_cache_default_true() -> None:
     """IncrementalOut should have cache=True by default."""
-    inc = outputs.IncrementalOut(path="database.csv")
+    inc = outputs.IncrementalOut(path="database.csv", loader=loaders.PathOnly())
     assert inc.cache is True
 
 
 def test_incremental_out_persist_default_false() -> None:
     """IncrementalOut should have persist=False by default."""
-    inc = outputs.IncrementalOut(path="database.csv")
+    inc = outputs.IncrementalOut(path="database.csv", loader=loaders.PathOnly())
     assert inc.persist is False
 
 
 def test_incremental_out_frozen() -> None:
     """IncrementalOut should be immutable (frozen dataclass)."""
-    inc = outputs.IncrementalOut(path="database.csv")
+    inc = outputs.IncrementalOut(path="database.csv", loader=loaders.PathOnly())
     with pytest.raises(AttributeError):
         inc.path = "other.csv"  # type: ignore[misc]
 
 
-def test_incremental_out_is_base_out() -> None:
-    """IncrementalOut should inherit from BaseOut."""
-    assert issubclass(outputs.IncrementalOut, outputs.BaseOut)
-    inc = outputs.IncrementalOut(path="database.csv")
-    assert isinstance(inc, outputs.BaseOut)
+def test_incremental_out_is_out_subclass() -> None:
+    """IncrementalOut should inherit from Out."""
+    assert issubclass(outputs.IncrementalOut, outputs.Out)
+    inc = outputs.IncrementalOut(path="database.csv", loader=loaders.PathOnly())
+    assert isinstance(inc, outputs.Out)
 
 
 def test_normalize_out_incremental_passthrough() -> None:
     """IncrementalOut should pass through normalize_out unchanged."""
-    inc = outputs.IncrementalOut(path="database.csv")
+    inc = outputs.IncrementalOut(path="database.csv", loader=loaders.PathOnly())
     assert outputs.normalize_out(inc) is inc

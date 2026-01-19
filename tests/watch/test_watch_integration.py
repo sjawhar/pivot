@@ -19,13 +19,13 @@ import os
 import pathlib
 import threading
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Annotated, TypedDict
 from unittest import mock
 
 import pytest
 
-import pivot
-from pivot import executor, project
+from helpers import register_test_stage
+from pivot import executor, loaders, outputs, project
 from pivot.watch import engine
 
 if TYPE_CHECKING:
@@ -35,6 +35,423 @@ if TYPE_CHECKING:
 
 
 # pipeline_dir fixture is in conftest.py
+
+
+# =============================================================================
+# Module-level stage functions for annotation-based registration
+# =============================================================================
+
+
+# --- TypedDicts for stage outputs ---
+
+
+class _OutputCsv(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("output.csv", loaders.PathOnly())]
+
+
+class _OutputTxt(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
+
+
+class _IntermediateCsv(TypedDict):
+    intermediate: Annotated[pathlib.Path, outputs.Out("intermediate.csv", loaders.PathOnly())]
+
+
+class _FinalCsv(TypedDict):
+    final: Annotated[pathlib.Path, outputs.Out("final.csv", loaders.PathOnly())]
+
+
+class _AOutTxt(TypedDict):
+    a_out: Annotated[pathlib.Path, outputs.Out("a_out.txt", loaders.PathOnly())]
+
+
+class _BOutTxt(TypedDict):
+    b_out: Annotated[pathlib.Path, outputs.Out("b_out.txt", loaders.PathOnly())]
+
+
+class _COutTxt(TypedDict):
+    c_out: Annotated[pathlib.Path, outputs.Out("c_out.txt", loaders.PathOnly())]
+
+
+class _DOutTxt(TypedDict):
+    d_out: Annotated[pathlib.Path, outputs.Out("d_out.txt", loaders.PathOnly())]
+
+
+class _SharedTxt(TypedDict):
+    shared: Annotated[pathlib.Path, outputs.Out("shared.txt", loaders.PathOnly())]
+
+
+class _Step1Txt(TypedDict):
+    step1: Annotated[pathlib.Path, outputs.Out("step1.txt", loaders.PathOnly())]
+
+
+class _Step2Txt(TypedDict):
+    step2: Annotated[pathlib.Path, outputs.Out("step2.txt", loaders.PathOnly())]
+
+
+class _FinalTxt(TypedDict):
+    final: Annotated[pathlib.Path, outputs.Out("final.txt", loaders.PathOnly())]
+
+
+class _MiddleTxt(TypedDict):
+    middle: Annotated[pathlib.Path, outputs.Out("middle.txt", loaders.PathOnly())]
+
+
+class _LeftTxt(TypedDict):
+    left: Annotated[pathlib.Path, outputs.Out("left.txt", loaders.PathOnly())]
+
+
+class _RightTxt(TypedDict):
+    right: Annotated[pathlib.Path, outputs.Out("right.txt", loaders.PathOnly())]
+
+
+class _MergedTxt(TypedDict):
+    merged: Annotated[pathlib.Path, outputs.Out("merged.txt", loaders.PathOnly())]
+
+
+class _ATxt(TypedDict):
+    a: Annotated[pathlib.Path, outputs.Out("a.txt", loaders.PathOnly())]
+
+
+class _BTxt(TypedDict):
+    b: Annotated[pathlib.Path, outputs.Out("b.txt", loaders.PathOnly())]
+
+
+# --- Stage functions for file index tests ---
+
+
+def _stage_process_csv_to_csv(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.csv", loaders.PathOnly())],
+) -> _OutputCsv:
+    _ = input_file
+    return _OutputCsv(output=pathlib.Path("output.csv"))
+
+
+def _stage_a_csv_pipeline(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.csv", loaders.PathOnly())],
+) -> _IntermediateCsv:
+    _ = input_file
+    return _IntermediateCsv(intermediate=pathlib.Path("intermediate.csv"))
+
+
+def _stage_b_csv_pipeline(
+    intermediate: Annotated[pathlib.Path, outputs.Dep("intermediate.csv", loaders.PathOnly())],
+) -> _FinalCsv:
+    _ = intermediate
+    return _FinalCsv(final=pathlib.Path("final.csv"))
+
+
+# --- Stage functions for change detection tests ---
+
+
+def _stage_process_data(
+    data: Annotated[pathlib.Path, outputs.Dep("data.csv", loaders.PathOnly())],
+) -> _OutputCsv:
+    _ = data
+    return _OutputCsv(output=pathlib.Path("output.csv"))
+
+
+# --- Stage functions for linear DAG tests ---
+
+
+def _stage_a_linear(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _AOutTxt:
+    pathlib.Path("a_out.txt").write_text(pathlib.Path("input.txt").read_text().upper())
+    return _AOutTxt(a_out=pathlib.Path("a_out.txt"))
+
+
+def _stage_b_linear(
+    a_out: Annotated[pathlib.Path, outputs.Dep("a_out.txt", loaders.PathOnly())],
+) -> _BOutTxt:
+    pathlib.Path("b_out.txt").write_text(pathlib.Path("a_out.txt").read_text() + "!")
+    return _BOutTxt(b_out=pathlib.Path("b_out.txt"))
+
+
+def _stage_c_linear(
+    b_out: Annotated[pathlib.Path, outputs.Dep("b_out.txt", loaders.PathOnly())],
+) -> _COutTxt:
+    pathlib.Path("c_out.txt").write_text(pathlib.Path("b_out.txt").read_text() + "?")
+    return _COutTxt(c_out=pathlib.Path("c_out.txt"))
+
+
+def _stage_a_passthrough(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _AOutTxt:
+    _ = input_file
+    return _AOutTxt(a_out=pathlib.Path("a_out.txt"))
+
+
+def _stage_b_passthrough(
+    a_out: Annotated[pathlib.Path, outputs.Dep("a_out.txt", loaders.PathOnly())],
+) -> _BOutTxt:
+    _ = a_out
+    return _BOutTxt(b_out=pathlib.Path("b_out.txt"))
+
+
+def _stage_c_passthrough(
+    b_out: Annotated[pathlib.Path, outputs.Dep("b_out.txt", loaders.PathOnly())],
+) -> _COutTxt:
+    _ = b_out
+    return _COutTxt(c_out=pathlib.Path("c_out.txt"))
+
+
+# --- Stage functions for fan-out DAG tests ---
+
+
+def _stage_a_fanout(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _SharedTxt:
+    _ = input_file
+    return _SharedTxt(shared=pathlib.Path("shared.txt"))
+
+
+def _stage_b_fanout(
+    shared: Annotated[pathlib.Path, outputs.Dep("shared.txt", loaders.PathOnly())],
+) -> _BOutTxt:
+    _ = shared
+    return _BOutTxt(b_out=pathlib.Path("b_out.txt"))
+
+
+def _stage_c_fanout(
+    shared: Annotated[pathlib.Path, outputs.Dep("shared.txt", loaders.PathOnly())],
+) -> _COutTxt:
+    _ = shared
+    return _COutTxt(c_out=pathlib.Path("c_out.txt"))
+
+
+def _stage_d_fanout(
+    shared: Annotated[pathlib.Path, outputs.Dep("shared.txt", loaders.PathOnly())],
+) -> _DOutTxt:
+    _ = shared
+    return _DOutTxt(d_out=pathlib.Path("d_out.txt"))
+
+
+# --- Stage functions for fan-in DAG tests ---
+
+
+def _stage_a_fanin(
+    a_input: Annotated[pathlib.Path, outputs.Dep("a_input.txt", loaders.PathOnly())],
+) -> _AOutTxt:
+    _ = a_input
+    return _AOutTxt(a_out=pathlib.Path("a_out.txt"))
+
+
+def _stage_b_fanin(
+    b_input: Annotated[pathlib.Path, outputs.Dep("b_input.txt", loaders.PathOnly())],
+) -> _BOutTxt:
+    _ = b_input
+    return _BOutTxt(b_out=pathlib.Path("b_out.txt"))
+
+
+def _stage_c_fanin(
+    c_input: Annotated[pathlib.Path, outputs.Dep("c_input.txt", loaders.PathOnly())],
+) -> _COutTxt:
+    _ = c_input
+    return _COutTxt(c_out=pathlib.Path("c_out.txt"))
+
+
+def _stage_d_fanin(
+    a_out: Annotated[pathlib.Path, outputs.Dep("a_out.txt", loaders.PathOnly())],
+    b_out: Annotated[pathlib.Path, outputs.Dep("b_out.txt", loaders.PathOnly())],
+    c_out: Annotated[pathlib.Path, outputs.Dep("c_out.txt", loaders.PathOnly())],
+) -> _FinalTxt:
+    _ = a_out, b_out, c_out
+    return _FinalTxt(final=pathlib.Path("final.txt"))
+
+
+# --- Stage functions for diamond DAG tests ---
+
+
+def _stage_a_diamond(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _AOutTxt:
+    _ = input_file
+    return _AOutTxt(a_out=pathlib.Path("a_out.txt"))
+
+
+def _stage_b_diamond(
+    a_out: Annotated[pathlib.Path, outputs.Dep("a_out.txt", loaders.PathOnly())],
+) -> _BOutTxt:
+    _ = a_out
+    return _BOutTxt(b_out=pathlib.Path("b_out.txt"))
+
+
+def _stage_c_diamond(
+    a_out: Annotated[pathlib.Path, outputs.Dep("a_out.txt", loaders.PathOnly())],
+) -> _COutTxt:
+    _ = a_out
+    return _COutTxt(c_out=pathlib.Path("c_out.txt"))
+
+
+def _stage_d_diamond(
+    b_out: Annotated[pathlib.Path, outputs.Dep("b_out.txt", loaders.PathOnly())],
+    c_out: Annotated[pathlib.Path, outputs.Dep("c_out.txt", loaders.PathOnly())],
+) -> _FinalTxt:
+    _ = b_out, c_out
+    return _FinalTxt(final=pathlib.Path("final.txt"))
+
+
+# --- Stage functions for full pipeline execution tests ---
+
+
+def _stage_step1_linear(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _Step1Txt:
+    data = pathlib.Path("input.txt").read_text()
+    pathlib.Path("step1.txt").write_text(data.upper())
+    return _Step1Txt(step1=pathlib.Path("step1.txt"))
+
+
+def _stage_step2_linear(
+    step1: Annotated[pathlib.Path, outputs.Dep("step1.txt", loaders.PathOnly())],
+) -> _Step2Txt:
+    data = pathlib.Path("step1.txt").read_text()
+    pathlib.Path("step2.txt").write_text(f"[{data}]")
+    return _Step2Txt(step2=pathlib.Path("step2.txt"))
+
+
+def _stage_step3_linear(
+    step2: Annotated[pathlib.Path, outputs.Dep("step2.txt", loaders.PathOnly())],
+) -> _FinalTxt:
+    data = pathlib.Path("step2.txt").read_text()
+    pathlib.Path("final.txt").write_text(f"Result: {data}")
+    return _FinalTxt(final=pathlib.Path("final.txt"))
+
+
+def _stage_root_diamond(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _SharedTxt:
+    data = pathlib.Path("input.txt").read_text()
+    pathlib.Path("shared.txt").write_text(data.upper())
+    return _SharedTxt(shared=pathlib.Path("shared.txt"))
+
+
+def _stage_left_diamond(
+    shared: Annotated[pathlib.Path, outputs.Dep("shared.txt", loaders.PathOnly())],
+) -> _LeftTxt:
+    data = pathlib.Path("shared.txt").read_text()
+    pathlib.Path("left.txt").write_text(f"L:{data}")
+    return _LeftTxt(left=pathlib.Path("left.txt"))
+
+
+def _stage_right_diamond(
+    shared: Annotated[pathlib.Path, outputs.Dep("shared.txt", loaders.PathOnly())],
+) -> _RightTxt:
+    data = pathlib.Path("shared.txt").read_text()
+    pathlib.Path("right.txt").write_text(f"R:{data}")
+    return _RightTxt(right=pathlib.Path("right.txt"))
+
+
+def _stage_merge_diamond(
+    left: Annotated[pathlib.Path, outputs.Dep("left.txt", loaders.PathOnly())],
+    right: Annotated[pathlib.Path, outputs.Dep("right.txt", loaders.PathOnly())],
+) -> _MergedTxt:
+    left_data = pathlib.Path("left.txt").read_text()
+    right_data = pathlib.Path("right.txt").read_text()
+    pathlib.Path("merged.txt").write_text(f"{left_data}+{right_data}")
+    return _MergedTxt(merged=pathlib.Path("merged.txt"))
+
+
+# --- Stage functions for rerun tests ---
+
+
+def _stage_process_rerun(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _OutputTxt:
+    data = pathlib.Path("input.txt").read_text()
+    pathlib.Path("output.txt").write_text(data.upper())
+    return _OutputTxt(output=pathlib.Path("output.txt"))
+
+
+def _stage_step1_rerun(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _MiddleTxt:
+    data = pathlib.Path("input.txt").read_text()
+    pathlib.Path("middle.txt").write_text(data.upper())
+    return _MiddleTxt(middle=pathlib.Path("middle.txt"))
+
+
+def _stage_step2_rerun(
+    middle: Annotated[pathlib.Path, outputs.Dep("middle.txt", loaders.PathOnly())],
+) -> _OutputTxt:
+    data = pathlib.Path("middle.txt").read_text()
+    pathlib.Path("output.txt").write_text(f"[{data}]")
+    return _OutputTxt(output=pathlib.Path("output.txt"))
+
+
+def _stage_process_output_only(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _OutputTxt:
+    data = pathlib.Path("input.txt").read_text()
+    pathlib.Path("output.txt").write_text(data.upper())
+    return _OutputTxt(output=pathlib.Path("output.txt"))
+
+
+# --- Stage functions for watch mode tests ---
+
+
+def _stage_process_watch(
+    data: Annotated[pathlib.Path, outputs.Dep("data.csv", loaders.PathOnly())],
+) -> _OutputTxt:
+    data_content = pathlib.Path("data.csv").read_text()
+    pathlib.Path("output.txt").write_text(f"Processed: {len(data_content)} chars")
+    return _OutputTxt(output=pathlib.Path("output.txt"))
+
+
+def _stage_process_code_change(
+    data: Annotated[pathlib.Path, outputs.Dep("data.csv", loaders.PathOnly())],
+) -> _OutputTxt:
+    _ = data
+    pathlib.Path("output.txt").write_text("processed")
+    return _OutputTxt(output=pathlib.Path("output.txt"))
+
+
+def _stage_process_debounce(
+    data: Annotated[pathlib.Path, outputs.Dep("data.csv", loaders.PathOnly())],
+) -> _OutputTxt:
+    _ = data
+    return _OutputTxt(output=pathlib.Path("output.txt"))
+
+
+# --- Stage functions for specific stage selection tests ---
+
+
+def _stage_a_selection(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _ATxt:
+    pathlib.Path("a.txt").write_text("A")
+    return _ATxt(a=pathlib.Path("a.txt"))
+
+
+def _stage_b_selection(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _BTxt:
+    pathlib.Path("b.txt").write_text("B")
+    return _BTxt(b=pathlib.Path("b.txt"))
+
+
+def _stage_a_filter(
+    a_input: Annotated[pathlib.Path, outputs.Dep("a_input.txt", loaders.PathOnly())],
+) -> _AOutTxt:
+    _ = a_input
+    return _AOutTxt(a_out=pathlib.Path("a_out.txt"))
+
+
+def _stage_b_filter(
+    b_input: Annotated[pathlib.Path, outputs.Dep("b_input.txt", loaders.PathOnly())],
+) -> _BOutTxt:
+    _ = b_input
+    return _BOutTxt(b_out=pathlib.Path("b_out.txt"))
+
+
+# --- Stage functions for error recovery tests ---
+
+
+def _stage_failing(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _OutputTxt:
+    raise RuntimeError("Stage failed!")
 
 
 # =============================================================================
@@ -94,9 +511,7 @@ def test_file_index_maps_only_dependencies(pipeline_dir: pathlib.Path) -> None:
     """File index contains dependencies, NOT outputs."""
     (pipeline_dir / "input.csv").write_text("a,b\n1,2")
 
-    @pivot.stage(deps=["input.csv"], outs=["output.csv"])
-    def process() -> None:
-        pass
+    register_test_stage(_stage_process_csv_to_csv, name="process")
 
     eng = engine.WatchEngine()
     index = eng._build_file_to_stages_index()
@@ -113,13 +528,8 @@ def test_file_index_intermediate_maps_to_consumer_only(pipeline_dir: pathlib.Pat
     """Intermediate files map only to consuming stage, not producing stage."""
     (pipeline_dir / "input.csv").write_text("a,b\n1,2")
 
-    @pivot.stage(deps=["input.csv"], outs=["intermediate.csv"])
-    def stage_a() -> None:
-        pass
-
-    @pivot.stage(deps=["intermediate.csv"], outs=["final.csv"])
-    def stage_b() -> None:
-        pass
+    register_test_stage(_stage_a_csv_pipeline, name="stage_a")
+    register_test_stage(_stage_b_csv_pipeline, name="stage_b")
 
     eng = engine.WatchEngine()
     index = eng._build_file_to_stages_index()
@@ -145,9 +555,7 @@ def test_change_detection_input_file_triggers_stage(pipeline_dir: pathlib.Path) 
     """Modifying an input file triggers the dependent stage."""
     (pipeline_dir / "data.csv").write_text("a,b\n1,2")
 
-    @pivot.stage(deps=["data.csv"], outs=["result.csv"])
-    def process() -> None:
-        pass
+    register_test_stage(_stage_process_data, name="process")
 
     eng = engine.WatchEngine()
     changed_path = project.resolve_path("data.csv")
@@ -163,9 +571,7 @@ def test_change_detection_output_file_does_not_trigger_producer(
     (pipeline_dir / "input.csv").write_text("a,b\n1,2")
     (pipeline_dir / "output.csv").write_text("result")
 
-    @pivot.stage(deps=["input.csv"], outs=["output.csv"])
-    def process() -> None:
-        pass
+    register_test_stage(_stage_process_csv_to_csv, name="process")
 
     eng = engine.WatchEngine()
     changed_path = project.resolve_path("output.csv")
@@ -181,13 +587,8 @@ def test_change_detection_intermediate_triggers_downstream_only(
     (pipeline_dir / "input.csv").write_text("a,b\n1,2")
     (pipeline_dir / "intermediate.csv").write_text("x,y\n3,4")
 
-    @pivot.stage(deps=["input.csv"], outs=["intermediate.csv"])
-    def stage_a() -> None:
-        pass
-
-    @pivot.stage(deps=["intermediate.csv"], outs=["final.csv"])
-    def stage_b() -> None:
-        pass
+    register_test_stage(_stage_a_csv_pipeline, name="stage_a")
+    register_test_stage(_stage_b_csv_pipeline, name="stage_b")
 
     eng = engine.WatchEngine()
     changed_path = project.resolve_path("intermediate.csv")
@@ -203,20 +604,12 @@ def test_change_detection_intermediate_triggers_downstream_only(
 
 
 def test_linear_dag_input_change_affects_all_downstream(pipeline_dir: pathlib.Path) -> None:
-    """Linear DAG: A → B → C. Changing A's input affects A, B, C."""
+    """Linear DAG: A -> B -> C. Changing A's input affects A, B, C."""
     (pipeline_dir / "input.txt").write_text("hello")
 
-    @pivot.stage(deps=["input.txt"], outs=["a_out.txt"])
-    def stage_a() -> None:
-        pathlib.Path("a_out.txt").write_text(pathlib.Path("input.txt").read_text().upper())
-
-    @pivot.stage(deps=["a_out.txt"], outs=["b_out.txt"])
-    def stage_b() -> None:
-        pathlib.Path("b_out.txt").write_text(pathlib.Path("a_out.txt").read_text() + "!")
-
-    @pivot.stage(deps=["b_out.txt"], outs=["c_out.txt"])
-    def stage_c() -> None:
-        pathlib.Path("c_out.txt").write_text(pathlib.Path("b_out.txt").read_text() + "?")
+    register_test_stage(_stage_a_linear, name="stage_a")
+    register_test_stage(_stage_b_linear, name="stage_b")
+    register_test_stage(_stage_c_linear, name="stage_c")
 
     eng = engine.WatchEngine()
     changed_path = project.resolve_path("input.txt")
@@ -231,22 +624,14 @@ def test_linear_dag_input_change_affects_all_downstream(pipeline_dir: pathlib.Pa
 
 
 def test_linear_dag_middle_change_affects_downstream_only(pipeline_dir: pathlib.Path) -> None:
-    """Linear DAG: A → B → C. Changing B's output affects only C."""
+    """Linear DAG: A -> B -> C. Changing B's output affects only C."""
     (pipeline_dir / "input.txt").write_text("hello")
     (pipeline_dir / "a_out.txt").write_text("HELLO")
     (pipeline_dir / "b_out.txt").write_text("HELLO!")
 
-    @pivot.stage(deps=["input.txt"], outs=["a_out.txt"])
-    def stage_a() -> None:
-        pass
-
-    @pivot.stage(deps=["a_out.txt"], outs=["b_out.txt"])
-    def stage_b() -> None:
-        pass
-
-    @pivot.stage(deps=["b_out.txt"], outs=["c_out.txt"])
-    def stage_c() -> None:
-        pass
+    register_test_stage(_stage_a_passthrough, name="stage_a")
+    register_test_stage(_stage_b_passthrough, name="stage_b")
+    register_test_stage(_stage_c_passthrough, name="stage_c")
 
     eng = engine.WatchEngine()
     changed_path = project.resolve_path("b_out.txt")
@@ -263,24 +648,13 @@ def test_linear_dag_middle_change_affects_downstream_only(pipeline_dir: pathlib.
 
 
 def test_fanout_dag_input_change_affects_all_branches(pipeline_dir: pathlib.Path) -> None:
-    """Fan-out DAG: A → [B, C, D]. Changing A's input affects all downstream."""
+    """Fan-out DAG: A -> [B, C, D]. Changing A's input affects all downstream."""
     (pipeline_dir / "input.txt").write_text("data")
 
-    @pivot.stage(deps=["input.txt"], outs=["shared.txt"])
-    def stage_a() -> None:
-        pass
-
-    @pivot.stage(deps=["shared.txt"], outs=["b_out.txt"])
-    def stage_b() -> None:
-        pass
-
-    @pivot.stage(deps=["shared.txt"], outs=["c_out.txt"])
-    def stage_c() -> None:
-        pass
-
-    @pivot.stage(deps=["shared.txt"], outs=["d_out.txt"])
-    def stage_d() -> None:
-        pass
+    register_test_stage(_stage_a_fanout, name="stage_a")
+    register_test_stage(_stage_b_fanout, name="stage_b")
+    register_test_stage(_stage_c_fanout, name="stage_c")
+    register_test_stage(_stage_d_fanout, name="stage_d")
 
     eng = engine.WatchEngine()
     changed_path = project.resolve_path("input.txt")
@@ -296,17 +670,9 @@ def test_fanout_dag_shared_output_change_affects_all_consumers(
     (pipeline_dir / "input.txt").write_text("data")
     (pipeline_dir / "shared.txt").write_text("SHARED")
 
-    @pivot.stage(deps=["input.txt"], outs=["shared.txt"])
-    def stage_a() -> None:
-        pass
-
-    @pivot.stage(deps=["shared.txt"], outs=["b_out.txt"])
-    def stage_b() -> None:
-        pass
-
-    @pivot.stage(deps=["shared.txt"], outs=["c_out.txt"])
-    def stage_c() -> None:
-        pass
+    register_test_stage(_stage_a_fanout, name="stage_a")
+    register_test_stage(_stage_b_fanout, name="stage_b")
+    register_test_stage(_stage_c_fanout, name="stage_c")
 
     eng = engine.WatchEngine()
     changed_path = project.resolve_path("shared.txt")
@@ -324,32 +690,21 @@ def test_fanout_dag_shared_output_change_affects_all_consumers(
 
 
 def test_fanin_dag_single_branch_change(pipeline_dir: pathlib.Path) -> None:
-    """Fan-in DAG: [A, B, C] → D. Changing only B's input affects B and D."""
+    """Fan-in DAG: [A, B, C] -> D. Changing only B's input affects B and D."""
     (pipeline_dir / "a_input.txt").write_text("a")
     (pipeline_dir / "b_input.txt").write_text("b")
     (pipeline_dir / "c_input.txt").write_text("c")
 
-    @pivot.stage(deps=["a_input.txt"], outs=["a_out.txt"])
-    def stage_a() -> None:
-        pass
-
-    @pivot.stage(deps=["b_input.txt"], outs=["b_out.txt"])
-    def stage_b() -> None:
-        pass
-
-    @pivot.stage(deps=["c_input.txt"], outs=["c_out.txt"])
-    def stage_c() -> None:
-        pass
-
-    @pivot.stage(deps=["a_out.txt", "b_out.txt", "c_out.txt"], outs=["final.txt"])
-    def stage_d() -> None:
-        pass
+    register_test_stage(_stage_a_fanin, name="stage_a")
+    register_test_stage(_stage_b_fanin, name="stage_b")
+    register_test_stage(_stage_c_fanin, name="stage_c")
+    register_test_stage(_stage_d_fanin, name="stage_d")
 
     eng = engine.WatchEngine()
     changed_path = project.resolve_path("b_input.txt")
     all_affected = eng._get_affected_stages({changed_path}, code_changed=False)
 
-    # B's input changed → B affected → D depends on B's output → D affected
+    # B's input changed -> B affected -> D depends on B's output -> D affected
     assert "stage_b" in all_affected
     assert "stage_d" in all_affected
     # A and C are independent
@@ -363,24 +718,13 @@ def test_fanin_dag_single_branch_change(pipeline_dir: pathlib.Path) -> None:
 
 
 def test_diamond_dag_root_change_affects_all(pipeline_dir: pathlib.Path) -> None:
-    """Diamond DAG: A → [B, C] → D. Changing A's input affects all stages."""
+    """Diamond DAG: A -> [B, C] -> D. Changing A's input affects all stages."""
     (pipeline_dir / "input.txt").write_text("data")
 
-    @pivot.stage(deps=["input.txt"], outs=["a_out.txt"])
-    def stage_a() -> None:
-        pass
-
-    @pivot.stage(deps=["a_out.txt"], outs=["b_out.txt"])
-    def stage_b() -> None:
-        pass
-
-    @pivot.stage(deps=["a_out.txt"], outs=["c_out.txt"])
-    def stage_c() -> None:
-        pass
-
-    @pivot.stage(deps=["b_out.txt", "c_out.txt"], outs=["final.txt"])
-    def stage_d() -> None:
-        pass
+    register_test_stage(_stage_a_diamond, name="stage_a")
+    register_test_stage(_stage_b_diamond, name="stage_b")
+    register_test_stage(_stage_c_diamond, name="stage_c")
+    register_test_stage(_stage_d_diamond, name="stage_d")
 
     eng = engine.WatchEngine()
     changed_path = project.resolve_path("input.txt")
@@ -397,27 +741,16 @@ def test_diamond_dag_branch_change_affects_branch_and_merge(
     (pipeline_dir / "a_out.txt").write_text("A")
     (pipeline_dir / "b_out.txt").write_text("B")
 
-    @pivot.stage(deps=["input.txt"], outs=["a_out.txt"])
-    def stage_a() -> None:
-        pass
-
-    @pivot.stage(deps=["a_out.txt"], outs=["b_out.txt"])
-    def stage_b() -> None:
-        pass
-
-    @pivot.stage(deps=["a_out.txt"], outs=["c_out.txt"])
-    def stage_c() -> None:
-        pass
-
-    @pivot.stage(deps=["b_out.txt", "c_out.txt"], outs=["final.txt"])
-    def stage_d() -> None:
-        pass
+    register_test_stage(_stage_a_diamond, name="stage_a")
+    register_test_stage(_stage_b_diamond, name="stage_b")
+    register_test_stage(_stage_c_diamond, name="stage_c")
+    register_test_stage(_stage_d_diamond, name="stage_d")
 
     eng = engine.WatchEngine()
     changed_path = project.resolve_path("b_out.txt")
     all_affected = eng._get_affected_stages({changed_path}, code_changed=False)
 
-    # B's output changed → D depends on it → D affected
+    # B's output changed -> D depends on it -> D affected
     # A and C not affected (b_out.txt is not their input)
     assert "stage_d" in all_affected
     assert "stage_a" not in all_affected
@@ -436,20 +769,9 @@ def test_full_pipeline_linear_execution(pipeline_dir: pathlib.Path) -> None:
     """Linear pipeline executes correctly and produces expected outputs."""
     (pipeline_dir / "input.txt").write_text("hello")
 
-    @pivot.stage(deps=["input.txt"], outs=["step1.txt"])
-    def step1() -> None:
-        data = pathlib.Path("input.txt").read_text()
-        pathlib.Path("step1.txt").write_text(data.upper())
-
-    @pivot.stage(deps=["step1.txt"], outs=["step2.txt"])
-    def step2() -> None:
-        data = pathlib.Path("step1.txt").read_text()
-        pathlib.Path("step2.txt").write_text(f"[{data}]")
-
-    @pivot.stage(deps=["step2.txt"], outs=["final.txt"])
-    def step3() -> None:
-        data = pathlib.Path("step2.txt").read_text()
-        pathlib.Path("final.txt").write_text(f"Result: {data}")
+    register_test_stage(_stage_step1_linear, name="step1")
+    register_test_stage(_stage_step2_linear, name="step2")
+    register_test_stage(_stage_step3_linear, name="step3")
 
     results = executor.run()
 
@@ -463,26 +785,10 @@ def test_full_pipeline_diamond_execution(pipeline_dir: pathlib.Path) -> None:
     """Diamond pipeline executes all branches and merges correctly."""
     (pipeline_dir / "input.txt").write_text("data")
 
-    @pivot.stage(deps=["input.txt"], outs=["shared.txt"])
-    def root() -> None:
-        data = pathlib.Path("input.txt").read_text()
-        pathlib.Path("shared.txt").write_text(data.upper())
-
-    @pivot.stage(deps=["shared.txt"], outs=["left.txt"])
-    def left_branch() -> None:
-        data = pathlib.Path("shared.txt").read_text()
-        pathlib.Path("left.txt").write_text(f"L:{data}")
-
-    @pivot.stage(deps=["shared.txt"], outs=["right.txt"])
-    def right_branch() -> None:
-        data = pathlib.Path("shared.txt").read_text()
-        pathlib.Path("right.txt").write_text(f"R:{data}")
-
-    @pivot.stage(deps=["left.txt", "right.txt"], outs=["merged.txt"])
-    def merge() -> None:
-        left = pathlib.Path("left.txt").read_text()
-        right = pathlib.Path("right.txt").read_text()
-        pathlib.Path("merged.txt").write_text(f"{left}+{right}")
+    register_test_stage(_stage_root_diamond, name="root")
+    register_test_stage(_stage_left_diamond, name="left_branch")
+    register_test_stage(_stage_right_diamond, name="right_branch")
+    register_test_stage(_stage_merge_diamond, name="merge")
 
     results = executor.run()
 
@@ -494,10 +800,7 @@ def test_rerun_after_input_change(pipeline_dir: pathlib.Path) -> None:
     """Changing input triggers re-execution of affected stages."""
     (pipeline_dir / "input.txt").write_text("hello")
 
-    @pivot.stage(deps=["input.txt"], outs=["output.txt"])
-    def process() -> None:
-        data = pathlib.Path("input.txt").read_text()
-        pathlib.Path("output.txt").write_text(data.upper())
+    register_test_stage(_stage_process_rerun, name="process")
 
     # First run
     results = executor.run()
@@ -530,15 +833,8 @@ def test_rerun_after_intermediate_change(pipeline_dir: pathlib.Path) -> None:
     """Modifying intermediate file triggers downstream re-execution."""
     (pipeline_dir / "input.txt").write_text("hello")
 
-    @pivot.stage(deps=["input.txt"], outs=["middle.txt"])
-    def step1() -> None:
-        data = pathlib.Path("input.txt").read_text()
-        pathlib.Path("middle.txt").write_text(data.upper())
-
-    @pivot.stage(deps=["middle.txt"], outs=["output.txt"])
-    def step2() -> None:
-        data = pathlib.Path("middle.txt").read_text()
-        pathlib.Path("output.txt").write_text(f"[{data}]")
+    register_test_stage(_stage_step1_rerun, name="step1")
+    register_test_stage(_stage_step2_rerun, name="step2")
 
     # First run
     results = executor.run()
@@ -563,10 +859,7 @@ def test_output_only_change_no_rerun(pipeline_dir: pathlib.Path) -> None:
     """Modifying output-only file (not input to any stage) doesn't trigger re-run."""
     (pipeline_dir / "input.txt").write_text("hello")
 
-    @pivot.stage(deps=["input.txt"], outs=["output.txt"])
-    def process() -> None:
-        data = pathlib.Path("input.txt").read_text()
-        pathlib.Path("output.txt").write_text(data.upper())
+    register_test_stage(_stage_process_output_only, name="process")
 
     # First run
     results = executor.run()
@@ -595,10 +888,7 @@ def test_watch_detects_file_change_and_triggers_execution(
     """Integration: Watch mode detects file change and triggers stage execution."""
     (pipeline_dir / "data.csv").write_text("a,b\n1,2")
 
-    @pivot.stage(deps=["data.csv"], outs=["output.txt"])
-    def process() -> None:
-        data = pathlib.Path("data.csv").read_text()
-        pathlib.Path("output.txt").write_text(f"Processed: {len(data)} chars")
+    register_test_stage(_stage_process_watch, name="process")
 
     with run_watch_engine() as executions:
         (pipeline_dir / "data.csv").write_text("a,b,c\n1,2,3\n4,5,6")
@@ -616,9 +906,7 @@ def test_watch_code_change_triggers_reload_and_execution(
     helper_file = pipeline_dir / "helper.py"
     helper_file.write_text("def helper(): pass\n")
 
-    @pivot.stage(deps=["data.csv"], outs=["output.txt"])
-    def process() -> None:
-        pathlib.Path("output.txt").write_text("processed")
+    register_test_stage(_stage_process_code_change, name="process")
 
     execution_count = 0
     reload_called = False
@@ -670,9 +958,7 @@ def test_debounce_coalesces_rapid_changes(pipeline_dir: pathlib.Path) -> None:
     """Multiple rapid file changes are coalesced into one execution."""
     (pipeline_dir / "data.csv").write_text("initial")
 
-    @pivot.stage(deps=["data.csv"], outs=["output.txt"])
-    def process() -> None:
-        pass
+    register_test_stage(_stage_process_debounce, name="process")
 
     execution_count = 0
     done_event = threading.Event()
@@ -724,13 +1010,8 @@ def test_specific_stages_only_runs_selected(pipeline_dir: pathlib.Path) -> None:
     """Running with specific stages only affects those stages."""
     (pipeline_dir / "input.txt").write_text("hello")
 
-    @pivot.stage(deps=["input.txt"], outs=["a.txt"])
-    def stage_a() -> None:
-        pathlib.Path("a.txt").write_text("A")
-
-    @pivot.stage(deps=["input.txt"], outs=["b.txt"])
-    def stage_b() -> None:
-        pathlib.Path("b.txt").write_text("B")
+    register_test_stage(_stage_a_selection, name="stage_a")
+    register_test_stage(_stage_b_selection, name="stage_b")
 
     # Run only stage_a
     results = executor.run(["stage_a"])
@@ -749,13 +1030,8 @@ def test_engine_respects_stage_filter_on_code_change(pipeline_dir: pathlib.Path)
     (pipeline_dir / "a_input.txt").write_text("a")
     (pipeline_dir / "b_input.txt").write_text("b")
 
-    @pivot.stage(deps=["a_input.txt"], outs=["a_out.txt"])
-    def stage_a() -> None:
-        pass
-
-    @pivot.stage(deps=["b_input.txt"], outs=["b_out.txt"])
-    def stage_b() -> None:
-        pass
+    register_test_stage(_stage_a_filter, name="stage_a")
+    register_test_stage(_stage_b_filter, name="stage_b")
 
     # Engine only watches stage_a
     eng = engine.WatchEngine(stages=["stage_a"])
@@ -776,13 +1052,8 @@ def test_file_index_is_global_not_filtered(pipeline_dir: pathlib.Path) -> None:
     (pipeline_dir / "a_input.txt").write_text("a")
     (pipeline_dir / "b_input.txt").write_text("b")
 
-    @pivot.stage(deps=["a_input.txt"], outs=["a_out.txt"])
-    def stage_a() -> None:
-        pass
-
-    @pivot.stage(deps=["b_input.txt"], outs=["b_out.txt"])
-    def stage_b() -> None:
-        pass
+    register_test_stage(_stage_a_filter, name="stage_a")
+    register_test_stage(_stage_b_filter, name="stage_b")
 
     # Engine only watches stage_a
     eng = engine.WatchEngine(stages=["stage_a"])
@@ -810,9 +1081,7 @@ def test_stage_failure_does_not_crash_watch(pipeline_dir: pathlib.Path) -> None:
     """A failing stage doesn't crash the watch loop."""
     (pipeline_dir / "input.txt").write_text("hello")
 
-    @pivot.stage(deps=["input.txt"], outs=["output.txt"])
-    def failing_stage() -> None:
-        raise RuntimeError("Stage failed!")
+    register_test_stage(_stage_failing, name="failing_stage")
 
     execution_count = 0
     done_event = threading.Event()

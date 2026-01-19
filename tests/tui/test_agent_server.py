@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import pathlib
+from typing import TYPE_CHECKING, Annotated, TypedDict
 from unittest.mock import MagicMock
 
 import pytest
 
+from helpers import register_test_stage
+from pivot import loaders, outputs
 from pivot.tui import agent_server
 from pivot.types import (
     AgentCancelResult,
@@ -18,6 +21,36 @@ from pivot.types import (
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+
+# =============================================================================
+# Output TypedDicts for annotation-based stages
+# =============================================================================
+
+
+class _StagesOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("output.csv", loaders.PathOnly())]
+
+
+# =============================================================================
+# Module-level helper functions
+# =============================================================================
+
+
+def _helper_stages_noop(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.csv", loaders.PathOnly())],
+) -> _StagesOutputs:
+    _ = input_file
+    return {"output": pathlib.Path("output.csv")}
+
+
+def _helper_run_noop() -> None:
+    pass
+
+
+# =============================================================================
+# Fixtures
+# =============================================================================
 
 
 @pytest.fixture
@@ -186,23 +219,16 @@ async def test_dispatch_cancel(mock_engine: MagicMock, socket_path: Path) -> Non
     mock_engine.request_agent_cancel.assert_called_once()
 
 
-def _helper_stages_noop() -> None:
-    pass
-
-
 @pytest.mark.asyncio
 async def test_dispatch_stages_returns_registered_stages(
     mock_engine: MagicMock, socket_path: Path
 ) -> None:
     """Test stages method returns all registered stages."""
-    from pivot import registry
 
     # Register a test stage (clean_registry autouse fixture handles cleanup)
-    registry.REGISTRY.register(
+    register_test_stage(
         _helper_stages_noop,
         name="test_stage",
-        deps=["input.csv"],
-        outs=["output.csv"],
     )
 
     server = agent_server.AgentServer(mock_engine, socket_path)
@@ -222,17 +248,12 @@ async def test_dispatch_stages_returns_registered_stages(
     assert test_stage["outs"][0].endswith("output.csv")
 
 
-def _helper_run_noop() -> None:
-    pass
-
-
 @pytest.mark.asyncio
 async def test_dispatch_run_queues_execution(mock_engine: MagicMock, socket_path: Path) -> None:
     """Test run() queues execution request to engine via try_start_agent_run."""
-    from pivot import registry
 
     # Register a test stage (clean_registry autouse fixture handles cleanup)
-    registry.REGISTRY.register(_helper_run_noop, name="run_test", deps=[], outs=[])
+    register_test_stage(_helper_run_noop, name="run_test")
 
     # Mock try_start_agent_run to return success
     mock_engine.try_start_agent_run.return_value = AgentRunStartResult(

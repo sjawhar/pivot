@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import os
 import pathlib
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Annotated, TypedDict
 
 import pytest
 
-from pivot import exceptions, executor, status
-from pivot.registry import REGISTRY
+from helpers import register_test_stage
+from pivot import exceptions, executor, loaders, outputs, status
 from pivot.storage import cache, track
 from pivot.types import RemoteStatus
 
@@ -16,16 +16,37 @@ if TYPE_CHECKING:
 
 
 # =============================================================================
+# Output TypedDicts for annotation-based stages
+# =============================================================================
+
+
+class _StageAOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("a.txt", loaders.PathOnly())]
+
+
+class _StageBOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("b.txt", loaders.PathOnly())]
+
+
+# =============================================================================
 # Pipeline Status Tests
 # =============================================================================
 
 
-def _helper_stage_a() -> None:
+def _helper_stage_a(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _StageAOutputs:
+    _ = input_file  # deps tracked but not loaded in this simple test
     pathlib.Path("a.txt").write_text("output a")
+    return {"output": pathlib.Path("a.txt")}
 
 
-def _helper_stage_b() -> None:
+def _helper_stage_b(
+    a_file: Annotated[pathlib.Path, outputs.Dep("a.txt", loaders.PathOnly())],
+) -> _StageBOutputs:
+    _ = a_file  # deps tracked but not loaded in this simple test
     pathlib.Path("b.txt").write_text("output b")
+    return {"output": pathlib.Path("b.txt")}
 
 
 def test_pipeline_status_all_cached(tmp_path: pathlib.Path, mocker: MockerFixture) -> None:
@@ -34,7 +55,7 @@ def test_pipeline_status_all_cached(tmp_path: pathlib.Path, mocker: MockerFixtur
     (tmp_path / ".git").mkdir()
     (tmp_path / "input.txt").write_text("data")
 
-    REGISTRY.register(_helper_stage_a, name="stage_a", deps=["input.txt"], outs=["a.txt"])
+    register_test_stage(_helper_stage_a, name="stage_a")
 
     old_cwd = os.getcwd()
     os.chdir(tmp_path)
@@ -56,7 +77,7 @@ def test_pipeline_status_some_stale(tmp_path: pathlib.Path, mocker: MockerFixtur
     (tmp_path / ".git").mkdir()
     (tmp_path / "input.txt").write_text("data")
 
-    REGISTRY.register(_helper_stage_a, name="stage_a", deps=["input.txt"], outs=["a.txt"])
+    register_test_stage(_helper_stage_a, name="stage_a")
 
     results, _ = status.get_pipeline_status(None, single_stage=False, cache_dir=None)
 
@@ -72,8 +93,8 @@ def test_pipeline_status_upstream_stale(tmp_path: pathlib.Path, mocker: MockerFi
     (tmp_path / ".git").mkdir()
     (tmp_path / "input.txt").write_text("data")
 
-    REGISTRY.register(_helper_stage_a, name="stage_a", deps=["input.txt"], outs=["a.txt"])
-    REGISTRY.register(_helper_stage_b, name="stage_b", deps=["a.txt"], outs=["b.txt"])
+    register_test_stage(_helper_stage_a, name="stage_a")
+    register_test_stage(_helper_stage_b, name="stage_b")
 
     results, _ = status.get_pipeline_status(None, single_stage=False, cache_dir=None)
 
@@ -95,8 +116,8 @@ def test_pipeline_status_specific_stages(tmp_path: pathlib.Path, mocker: MockerF
     (tmp_path / ".git").mkdir()
     (tmp_path / "input.txt").write_text("data")
 
-    REGISTRY.register(_helper_stage_a, name="stage_a", deps=["input.txt"], outs=["a.txt"])
-    REGISTRY.register(_helper_stage_b, name="stage_b", deps=["input.txt"], outs=["b.txt"])
+    register_test_stage(_helper_stage_a, name="stage_a")
+    register_test_stage(_helper_stage_b, name="stage_b")
 
     results, _ = status.get_pipeline_status(["stage_a"], single_stage=False, cache_dir=None)
 

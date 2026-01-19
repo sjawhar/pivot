@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import json
 import pathlib
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Annotated, TypedDict
 
-from pivot import cli, project
-from pivot.registry import REGISTRY
+from helpers import register_test_stage
+from pivot import cli, loaders, outputs, project
 from pivot.storage import cache
 
 if TYPE_CHECKING:
@@ -13,6 +13,16 @@ if TYPE_CHECKING:
     from pytest import MonkeyPatch
 
     from conftest import GitRepo
+
+
+# =============================================================================
+# Output TypedDicts for annotation-based stages
+# =============================================================================
+
+
+class _CsvOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("output.csv", loaders.PathOnly())]
+
 
 # =============================================================================
 # Data Diff Help Tests
@@ -103,9 +113,10 @@ def test_data_diff_requires_targets(
 # =============================================================================
 
 
-def _helper_make_csv_output() -> None:
+def _helper_make_csv_output() -> _CsvOutputs:
     """Helper stage that produces a CSV output."""
     pathlib.Path("output.csv").write_text("id,value\n1,10\n2,20\n")
+    return {"output": pathlib.Path("output.csv")}
 
 
 def test_data_diff_csv_file(
@@ -119,11 +130,9 @@ def test_data_diff_csv_file(
     monkeypatch.setattr(project, "_project_root_cache", repo_path)
 
     # Register stage with CSV output
-    REGISTRY.register(
+    register_test_stage(
         _helper_make_csv_output,
         name="make_csv",
-        deps=[],
-        outs=["output.csv"],
     )
 
     # Create initial CSV and cache it
@@ -170,7 +179,7 @@ def test_data_diff_json_output(
 
     monkeypatch.setattr(project, "_project_root_cache", repo_path)
 
-    REGISTRY.register(_helper_make_csv_output, name="make_csv", deps=[], outs=["output.csv"])
+    register_test_stage(_helper_make_csv_output, name="make_csv")
 
     # Create initial CSV and cache it
     csv_file = repo_path / "output.csv"
@@ -215,7 +224,7 @@ def test_data_diff_key_columns(
 
     monkeypatch.setattr(project, "_project_root_cache", repo_path)
 
-    REGISTRY.register(_helper_make_csv_output, name="make_csv", deps=[], outs=["output.csv"])
+    register_test_stage(_helper_make_csv_output, name="make_csv")
 
     # Create initial CSV with key column
     csv_file = repo_path / "output.csv"
@@ -256,7 +265,7 @@ def test_data_diff_positional(
 
     monkeypatch.setattr(project, "_project_root_cache", repo_path)
 
-    REGISTRY.register(_helper_make_csv_output, name="make_csv", deps=[], outs=["output.csv"])
+    register_test_stage(_helper_make_csv_output, name="make_csv")
 
     # Create initial CSV
     csv_file = repo_path / "output.csv"
@@ -297,7 +306,7 @@ def test_data_diff_no_changes_message(
 
     monkeypatch.setattr(project, "_project_root_cache", repo_path)
 
-    REGISTRY.register(_helper_make_csv_output, name="make_csv", deps=[], outs=["output.csv"])
+    register_test_stage(_helper_make_csv_output, name="make_csv")
 
     csv_file = repo_path / "output.csv"
     csv_file.write_text("id,value\n1,10\n")
@@ -336,7 +345,7 @@ def test_data_diff_json_empty_returns_valid_json(
 
     monkeypatch.setattr(project, "_project_root_cache", repo_path)
 
-    REGISTRY.register(_helper_make_csv_output, name="make_csv", deps=[], outs=["output.csv"])
+    register_test_stage(_helper_make_csv_output, name="make_csv")
 
     csv_file = repo_path / "output.csv"
     csv_file.write_text("id,value\n1,10\n")

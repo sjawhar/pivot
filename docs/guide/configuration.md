@@ -1,81 +1,130 @@
 # Pipeline Configuration
 
-Pivot supports three ways to define pipelines, discovered in this order:
+Pivot pipelines can be defined programmatically in Python or declaratively in YAML. Stage functions use annotations to declare their dependencies and outputs.
 
-1. `pivot.yaml` / `pivot.yml` - YAML configuration
-2. `pipeline.py` - Python file with decorators or Pipeline class
+**Discovery order:** `pipeline.py` → `pivot.yaml` → `pivot.yml`
 
-## Decorator-Based (Recommended)
+## Programmatic Registration (Primary Method)
 
-The simplest approach using `@stage` decorators:
-
-```python
-# pipeline.py
-from pivot import stage
-
-@stage(deps=['data.csv'], outs=['processed.parquet'])
-def preprocess():
-    import pandas as pd
-    df = pd.read_csv('data.csv')
-    df.to_parquet('processed.parquet')
-
-@stage(deps=['processed.parquet'], outs=['model.pkl'])
-def train():
-    import pandas as pd
-    import pickle
-    df = pd.read_parquet('processed.parquet')
-    with open('model.pkl', 'wb') as f:
-        pickle.dump({'rows': len(df)}, f)
-```
-
-```bash
-pivot run  # Auto-discovers pipeline.py
-```
-
-## Pipeline Class
-
-For dynamic pipeline construction:
+For all-Python pipelines, use `REGISTRY.register()` directly in a `pipeline.py` file:
 
 ```python
 # pipeline.py
-from pivot import Pipeline
+import pathlib
+from typing import Annotated, TypedDict
 
-def preprocess():
-    import pandas as pd
-    df = pd.read_csv('data.csv')
-    df.to_parquet('processed.parquet')
+import pandas
+from pivot import loaders, outputs
+from pivot.registry import REGISTRY
+from pivot.stage_def import StageParams
 
-def train():
-    import pandas as pd
-    import pickle
-    df = pd.read_parquet('processed.parquet')
-    with open('model.pkl', 'wb') as f:
-        pickle.dump({'rows': len(df)}, f)
 
-pipeline = Pipeline()
-pipeline.add_stage(preprocess, deps=['data.csv'], outs=['processed.parquet'])
-pipeline.add_stage(train, deps=['processed.parquet'], outs=['model.pkl'])
+# Define parameter classes
+class TrainParams(StageParams):
+    learning_rate: float = 0.01
+    epochs: int = 100
+    batch_size: int = 32
+
+
+# Define output types
+class PreprocessOutputs(TypedDict):
+    clean: Annotated[pathlib.Path, outputs.Out("data/clean.csv", loaders.PathOnly())]
+
+
+class TrainOutputs(TypedDict):
+    model: Annotated[pathlib.Path, outputs.Out("models/model.pkl", loaders.PathOnly())]
+    metrics: Annotated[dict, outputs.Metric("metrics/train.json")]
+
+
+# Define stage functions
+def preprocess(
+    raw: Annotated[pandas.DataFrame, outputs.Dep("data/raw.csv", loaders.CSV())],
+) -> PreprocessOutputs:
+    """Load raw data, clean it, return path to output."""
+    clean_df = raw.dropna()
+    out_path = pathlib.Path("data/clean.csv")
+    clean_df.to_csv(out_path, index=False)
+    return PreprocessOutputs(clean=out_path)
+
+
+def train(
+    params: TrainParams,
+    data: Annotated[pandas.DataFrame, outputs.Dep("data/clean.csv", loaders.CSV())],
+) -> TrainOutputs:
+    """Train model with injected data and params."""
+    model_path = pathlib.Path("models/model.pkl")
+    model_path.parent.mkdir(exist_ok=True)
+    model_path.write_text(f"model_lr={params.learning_rate}")
+
+    return TrainOutputs(
+        model=model_path,
+        metrics={"accuracy": 0.95, "loss": 0.05},
+    )
+
+
+# Register stages
+REGISTRY.register(preprocess)
+REGISTRY.register(train)
 ```
 
-### Pipeline.add_stage()
+Run with: `pivot run`
+
+### Single Output Shorthand
+
+For stages with one output, annotate the return type directly:
 
 ```python
-pipeline.add_stage(
-    func,                      # The function to run
-    name='custom_name',        # Optional custom name
-    deps=['input.csv'],        # Dependencies
-    outs=['output.csv'],       # Outputs (strings or Out/Metric/Plot)
-    metrics=['metrics.json'],  # Shorthand for Metric()
-    plots=['plot.png'],        # Shorthand for Plot()
-    params=MyParams,           # Pydantic model
-    mutex=['gpu'],             # Mutex groups
-    cwd='subdir/',             # Working directory
+def transform(
+    data: Annotated[pandas.DataFrame, outputs.Dep("input.csv", loaders.CSV())],
+) -> Annotated[pandas.DataFrame, outputs.Out("output.csv", loaders.CSV())]:
+    return data.dropna()
+
+REGISTRY.register(transform)
+```
+
+### Path Overrides
+
+Override annotation paths at registration time:
+
+```python
+REGISTRY.register(
+    train,
+    dep_path_overrides={"data": "custom/input.csv"},
+    out_path_overrides={"model": {"path": "custom/model.pkl"}},
 )
+```
+
+### Matrix Stages (Variants)
+
+Register variants manually for matrix-like behavior:
+
+```python
+for dataset in ["train", "test"]:
+    REGISTRY.register(
+        train,
+        name=f"train@{dataset}",
+        variant=dataset,
+        dep_path_overrides={"data": f"data/{dataset}.csv"},
+        out_path_overrides={"model": {"path": f"models/{dataset}_model.pkl"}},
+    )
+```
+
+### Testing Stage Functions
+
+Test functions directly without framework setup:
+
+```python
+def test_train():
+    test_df = pandas.DataFrame({"value": [1, 2, 3]})
+    params = TrainParams(learning_rate=0.5)
+    result = train(params, test_df)
+    assert "model" in result
+    assert "metrics" in result
 ```
 
 ## YAML Configuration
 
-For teams that prefer configuration files:
+Define pipelines in `pivot.yaml`:
 
 ```yaml
 # pivot.yaml
@@ -83,16 +132,18 @@ stages:
   preprocess:
     python: stages.preprocess    # Module path to function
     deps:
-      - data.csv
+      raw: data.csv              # Named dependencies (override annotation paths)
     outs:
-      - processed.parquet
+      clean: processed.parquet   # Named outputs (override annotation paths)
 
   train:
     python: stages.train
     deps:
-      - processed.parquet
+      data: processed.parquet
     outs:
-      - model.pkl
+      model: model.pkl
+    metrics:
+      metrics: metrics.json      # Metric outputs (git-tracked)
     params:
       learning_rate: 0.01
 ```
@@ -103,14 +154,14 @@ stages:
 stages:
   stage_name:
     python: module.function      # Required: function to call
-    deps:                        # Optional: input dependencies
-      - path/to/file
-    outs:                        # Optional: output files
-      - path/to/output
-    metrics:                     # Optional: metric files (git-tracked)
-      - metrics.json
-    plots:                       # Optional: plot files
-      - loss.png
+    deps:                        # Optional: path overrides for deps
+      dep_name: path/to/file
+    outs:                        # Optional: path overrides for outputs
+      out_name: path/to/output
+    metrics:                     # Optional: metric outputs (git-tracked)
+      metric_name: metrics.json
+    plots:                       # Optional: plot outputs
+      plot_name: plot.png
     params:                      # Optional: parameter overrides
       key: value
     mutex:                       # Optional: mutex groups
@@ -129,9 +180,9 @@ stages:
   train:
     python: stages.train
     deps:
-      - "data/${dataset}.csv"
+      data: "data/${dataset}.csv"
     outs:
-      - "models/${model}_${dataset}.pkl"
+      model: "models/${model}_${dataset}.pkl"
     matrix:
       model: [bert, gpt]
       dataset: [train, test]
@@ -141,40 +192,16 @@ Generates: `train@bert_train`, `train@bert_test`, `train@gpt_train`, `train@gpt_
 
 ## Discovery Order
 
-Pivot searches for pipeline definitions in this order:
+Pivot searches for pipeline definitions:
 
-1. `pivot.yaml`
-2. `pivot.yml`
-3. `pipeline.py`
+1. `pipeline.py` - Module calling `REGISTRY.register()`
+2. `pivot.yaml` - YAML configuration
+3. `pivot.yml` - YAML configuration (alternative extension)
 
-The first file found is used. You can have only one pipeline definition.
-
-## Mixing Approaches
-
-You can combine YAML with decorators, but be careful about conflicts:
-
-```yaml
-# pivot.yaml - defines some stages
-stages:
-  preprocess:
-    python: stages.preprocess
-    deps: [data.csv]
-    outs: [processed.parquet]
-```
-
-```python
-# stages.py - function referenced by YAML
-def preprocess():
-    pass
-
-# Additional stages via decorators
-from pivot import stage
-
-@stage(deps=['processed.parquet'], outs=['model.pkl'])
-def train():
-    pass
-```
+The first method found is used.
 
 ## See Also
 
-- [API Reference: Pipeline](../reference/pivot/pipeline.md) - Full API documentation
+- [Defining Stages](stages.md) - Stage definition patterns
+- [Output Types](outputs.md) - Output types and options
+- [Parameters](parameters.md) - Parameter handling

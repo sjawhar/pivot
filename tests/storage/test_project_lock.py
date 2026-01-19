@@ -3,12 +3,13 @@ from __future__ import annotations
 import pathlib
 import threading
 import time
+from typing import Annotated, TypedDict
 
 import filelock
 import pytest
 
-import pivot
-from pivot import executor, project
+from helpers import register_test_stage
+from pivot import executor, loaders, outputs, project
 from pivot.executor import commit as commit_mod
 from pivot.storage import project_lock
 
@@ -202,21 +203,37 @@ def test_pending_state_lock_releases_on_exception(pipeline_dir: pathlib.Path) ->
 # =============================================================================
 
 
+class _SlowStageOutput(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
+
+
+def _slow_stage_impl(
+    execution_log: pathlib.Path,
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _SlowStageOutput:
+    # Log when stage starts
+    with execution_log.open("a") as f:
+        f.write("stage_start\n")
+    time.sleep(0.3)
+    output_path = pathlib.Path("output.txt")
+    output_path.write_text("done")
+    with execution_log.open("a") as f:
+        f.write("stage_end\n")
+    return _SlowStageOutput(output=output_path)
+
+
 def test_commit_blocks_during_no_commit_execution(pipeline_dir: pathlib.Path) -> None:
     """acquire_pending_state_lock blocks while executor.run(no_commit=True) holds the lock."""
     # Create a stage that runs for a measurable duration
     pathlib.Path("input.txt").write_text("data")
     execution_log = pipeline_dir / "execution_log.txt"
 
-    @pivot.stage(deps=["input.txt"], outs=["output.txt"])
-    def slow_stage() -> None:
-        # Log when stage starts
-        with execution_log.open("a") as f:
-            f.write("stage_start\n")
-        time.sleep(0.3)
-        pathlib.Path("output.txt").write_text("done")
-        with execution_log.open("a") as f:
-            f.write("stage_end\n")
+    def slow_stage(
+        input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+    ) -> _SlowStageOutput:
+        return _slow_stage_impl(execution_log, input_file)
+
+    register_test_stage(slow_stage)
 
     execution_started = threading.Event()
     # Use dict to hold errors - helps type checker understand cross-thread mutation
@@ -268,19 +285,48 @@ def test_commit_blocks_during_no_commit_execution(pipeline_dir: pathlib.Path) ->
     assert "stage_end" in log_content, "Stage should have completed"
 
 
+class _Stage1Output(TypedDict):
+    output1: Annotated[pathlib.Path, outputs.Out("output1.txt", loaders.PathOnly())]
+
+
+class _Stage2Output(TypedDict):
+    output2: Annotated[pathlib.Path, outputs.Out("output2.txt", loaders.PathOnly())]
+
+
+def _stage1_impl(
+    input1: Annotated[pathlib.Path, outputs.Dep("input1.txt", loaders.PathOnly())],
+) -> _Stage1Output:
+    output_path = pathlib.Path("output1.txt")
+    output_path.write_text("done1")
+    return _Stage1Output(output1=output_path)
+
+
+def _stage2_impl(
+    input2: Annotated[pathlib.Path, outputs.Dep("input2.txt", loaders.PathOnly())],
+) -> _Stage2Output:
+    output_path = pathlib.Path("output2.txt")
+    output_path.write_text("done2")
+    return _Stage2Output(output2=output_path)
+
+
 def test_concurrent_commits_serialize(pipeline_dir: pathlib.Path) -> None:
     """Multiple concurrent commit attempts serialize correctly."""
     # Create multiple stages
     pathlib.Path("input1.txt").write_text("data1")
     pathlib.Path("input2.txt").write_text("data2")
 
-    @pivot.stage(deps=["input1.txt"], outs=["output1.txt"])
-    def stage1() -> None:
-        pathlib.Path("output1.txt").write_text("done1")
+    def stage1(
+        input1: Annotated[pathlib.Path, outputs.Dep("input1.txt", loaders.PathOnly())],
+    ) -> _Stage1Output:
+        return _stage1_impl(input1)
 
-    @pivot.stage(deps=["input2.txt"], outs=["output2.txt"])
-    def stage2() -> None:
-        pathlib.Path("output2.txt").write_text("done2")
+    def stage2(
+        input2: Annotated[pathlib.Path, outputs.Dep("input2.txt", loaders.PathOnly())],
+    ) -> _Stage2Output:
+        return _stage2_impl(input2)
+
+    register_test_stage(stage1)
+    register_test_stage(stage2)
 
     # Run with --no-commit
     executor.run(show_output=False, no_commit=True)

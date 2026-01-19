@@ -1,15 +1,781 @@
-import pathlib
+from __future__ import annotations
 
-from pivot import executor
-from pivot.registry import stage
+import pathlib
+from typing import Annotated, TypedDict
+
+from helpers import register_test_stage
+from pivot import executor, loaders, outputs
 
 # =============================================================================
-# Linear DAG: A → B → C
+# TypedDict output types for module-level stage functions
+# =============================================================================
+
+
+class _OutA(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("a.txt", loaders.PathOnly())]
+
+
+class _OutB(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("b.txt", loaders.PathOnly())]
+
+
+class _OutC(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("c.txt", loaders.PathOnly())]
+
+
+class _OutD(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("d.txt", loaders.PathOnly())]
+
+
+class _OutE(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("e.txt", loaders.PathOnly())]
+
+
+class _OutF(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("f.txt", loaders.PathOnly())]
+
+
+class _OutG(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("g.txt", loaders.PathOnly())]
+
+
+class _OutH(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("h.txt", loaders.PathOnly())]
+
+
+class _OutX(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("x.txt", loaders.PathOnly())]
+
+
+class _OutY(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("y.txt", loaders.PathOnly())]
+
+
+class _OutOutput(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
+
+
+class _OutSum(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("sum.txt", loaders.PathOnly())]
+
+
+class _OutStage1(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("stage1.txt", loaders.PathOnly())]
+
+
+class _OutStage2(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("stage2.txt", loaders.PathOnly())]
+
+
+class _OutStage3(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("stage3.txt", loaders.PathOnly())]
+
+
+class _OutStage4(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("stage4.txt", loaders.PathOnly())]
+
+
+class _OutStage5(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("stage5.txt", loaders.PathOnly())]
+
+
+# =============================================================================
+# Module-level stage functions for test_linear_dag_three_stages
+# =============================================================================
+
+
+def _linear3_stage_a(
+    _input: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _OutA:
+    with open("execution_log.txt", "a") as f:
+        f.write("a\n")
+    data = pathlib.Path("input.txt").read_text()
+    pathlib.Path("a.txt").write_text(f"{data}->A")
+    return _OutA(output=pathlib.Path("a.txt"))
+
+
+def _linear3_stage_b(
+    _a: Annotated[pathlib.Path, outputs.Dep("a.txt", loaders.PathOnly())],
+) -> _OutB:
+    with open("execution_log.txt", "a") as f:
+        f.write("b\n")
+    data = pathlib.Path("a.txt").read_text()
+    assert data == "START->A", f"Expected 'START->A', got '{data}'"
+    pathlib.Path("b.txt").write_text(f"{data}->B")
+    return _OutB(output=pathlib.Path("b.txt"))
+
+
+def _linear3_stage_c(
+    _b: Annotated[pathlib.Path, outputs.Dep("b.txt", loaders.PathOnly())],
+) -> _OutC:
+    with open("execution_log.txt", "a") as f:
+        f.write("c\n")
+    data = pathlib.Path("b.txt").read_text()
+    assert data == "START->A->B", f"Expected 'START->A->B', got '{data}'"
+    pathlib.Path("c.txt").write_text(f"{data}->C")
+    return _OutC(output=pathlib.Path("c.txt"))
+
+
+# =============================================================================
+# Module-level stage functions for test_linear_dag_five_stages
+# =============================================================================
+
+
+def _linear5_stage1(
+    _input: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _OutStage1:
+    with open("execution_log.txt", "a") as f:
+        f.write("1\n")
+    n = int(pathlib.Path("input.txt").read_text())
+    pathlib.Path("stage1.txt").write_text(str(n + 1))
+    return _OutStage1(output=pathlib.Path("stage1.txt"))
+
+
+def _linear5_stage2(
+    _s1: Annotated[pathlib.Path, outputs.Dep("stage1.txt", loaders.PathOnly())],
+) -> _OutStage2:
+    with open("execution_log.txt", "a") as f:
+        f.write("2\n")
+    n = int(pathlib.Path("stage1.txt").read_text())
+    assert n == 1, f"stage1 must run first, got {n}"
+    pathlib.Path("stage2.txt").write_text(str(n + 1))
+    return _OutStage2(output=pathlib.Path("stage2.txt"))
+
+
+def _linear5_stage3(
+    _s2: Annotated[pathlib.Path, outputs.Dep("stage2.txt", loaders.PathOnly())],
+) -> _OutStage3:
+    with open("execution_log.txt", "a") as f:
+        f.write("3\n")
+    n = int(pathlib.Path("stage2.txt").read_text())
+    assert n == 2, f"stage2 must run first, got {n}"
+    pathlib.Path("stage3.txt").write_text(str(n + 1))
+    return _OutStage3(output=pathlib.Path("stage3.txt"))
+
+
+def _linear5_stage4(
+    _s3: Annotated[pathlib.Path, outputs.Dep("stage3.txt", loaders.PathOnly())],
+) -> _OutStage4:
+    with open("execution_log.txt", "a") as f:
+        f.write("4\n")
+    n = int(pathlib.Path("stage3.txt").read_text())
+    assert n == 3, f"stage3 must run first, got {n}"
+    pathlib.Path("stage4.txt").write_text(str(n + 1))
+    return _OutStage4(output=pathlib.Path("stage4.txt"))
+
+
+def _linear5_stage5(
+    _s4: Annotated[pathlib.Path, outputs.Dep("stage4.txt", loaders.PathOnly())],
+) -> _OutStage5:
+    with open("execution_log.txt", "a") as f:
+        f.write("5\n")
+    n = int(pathlib.Path("stage4.txt").read_text())
+    assert n == 4, f"stage4 must run first, got {n}"
+    pathlib.Path("stage5.txt").write_text(str(n + 1))
+    return _OutStage5(output=pathlib.Path("stage5.txt"))
+
+
+# =============================================================================
+# Module-level stage functions for test_tree_dag_one_root_two_children
+# =============================================================================
+
+
+def _tree1_stage_a(
+    _input: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _OutA:
+    with open("execution_log.txt", "a") as f:
+        f.write("a\n")
+    data = pathlib.Path("input.txt").read_text()
+    pathlib.Path("a.txt").write_text(f"{data}->A")
+    return _OutA(output=pathlib.Path("a.txt"))
+
+
+def _tree1_stage_b(
+    _a: Annotated[pathlib.Path, outputs.Dep("a.txt", loaders.PathOnly())],
+) -> _OutB:
+    with open("execution_log.txt", "a") as f:
+        f.write("b\n")
+    data = pathlib.Path("a.txt").read_text()
+    assert "->A" in data, "stage_a must run before stage_b"
+    pathlib.Path("b.txt").write_text(f"{data}->B")
+    return _OutB(output=pathlib.Path("b.txt"))
+
+
+def _tree1_stage_c(
+    _a: Annotated[pathlib.Path, outputs.Dep("a.txt", loaders.PathOnly())],
+) -> _OutC:
+    with open("execution_log.txt", "a") as f:
+        f.write("c\n")
+    data = pathlib.Path("a.txt").read_text()
+    assert "->A" in data, "stage_a must run before stage_c"
+    pathlib.Path("c.txt").write_text(f"{data}->C")
+    return _OutC(output=pathlib.Path("c.txt"))
+
+
+# =============================================================================
+# Module-level stage functions for test_tree_dag_deeper
+# =============================================================================
+
+
+def _tree2_stage_a(
+    _input: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _OutA:
+    with open("execution_log.txt", "a") as f:
+        f.write("a\n")
+    pathlib.Path("a.txt").write_text("A")
+    return _OutA(output=pathlib.Path("a.txt"))
+
+
+def _tree2_stage_b(
+    _a: Annotated[pathlib.Path, outputs.Dep("a.txt", loaders.PathOnly())],
+) -> _OutB:
+    with open("execution_log.txt", "a") as f:
+        f.write("b\n")
+    assert pathlib.Path("a.txt").read_text() == "A"
+    pathlib.Path("b.txt").write_text("B")
+    return _OutB(output=pathlib.Path("b.txt"))
+
+
+def _tree2_stage_c(
+    _a: Annotated[pathlib.Path, outputs.Dep("a.txt", loaders.PathOnly())],
+) -> _OutC:
+    with open("execution_log.txt", "a") as f:
+        f.write("c\n")
+    assert pathlib.Path("a.txt").read_text() == "A"
+    pathlib.Path("c.txt").write_text("C")
+    return _OutC(output=pathlib.Path("c.txt"))
+
+
+def _tree2_stage_d(
+    _b: Annotated[pathlib.Path, outputs.Dep("b.txt", loaders.PathOnly())],
+) -> _OutD:
+    with open("execution_log.txt", "a") as f:
+        f.write("d\n")
+    assert pathlib.Path("b.txt").read_text() == "B"
+    pathlib.Path("d.txt").write_text("D")
+    return _OutD(output=pathlib.Path("d.txt"))
+
+
+def _tree2_stage_e(
+    _c: Annotated[pathlib.Path, outputs.Dep("c.txt", loaders.PathOnly())],
+) -> _OutE:
+    with open("execution_log.txt", "a") as f:
+        f.write("e\n")
+    assert pathlib.Path("c.txt").read_text() == "C"
+    pathlib.Path("e.txt").write_text("E")
+    return _OutE(output=pathlib.Path("e.txt"))
+
+
+# =============================================================================
+# Module-level stage functions for test_diamond_dag
+# =============================================================================
+
+
+def _diamond1_stage_a(
+    _input: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _OutA:
+    with open("execution_log.txt", "a") as f:
+        f.write("a\n")
+    pathlib.Path("a.txt").write_text("A_OUTPUT")
+    return _OutA(output=pathlib.Path("a.txt"))
+
+
+def _diamond1_stage_b(
+    _a: Annotated[pathlib.Path, outputs.Dep("a.txt", loaders.PathOnly())],
+) -> _OutB:
+    with open("execution_log.txt", "a") as f:
+        f.write("b\n")
+    data = pathlib.Path("a.txt").read_text()
+    assert data == "A_OUTPUT", "stage_a must run before stage_b"
+    pathlib.Path("b.txt").write_text("B_OUTPUT")
+    return _OutB(output=pathlib.Path("b.txt"))
+
+
+def _diamond1_stage_c(
+    _a: Annotated[pathlib.Path, outputs.Dep("a.txt", loaders.PathOnly())],
+) -> _OutC:
+    with open("execution_log.txt", "a") as f:
+        f.write("c\n")
+    data = pathlib.Path("a.txt").read_text()
+    assert data == "A_OUTPUT", "stage_a must run before stage_c"
+    pathlib.Path("c.txt").write_text("C_OUTPUT")
+    return _OutC(output=pathlib.Path("c.txt"))
+
+
+def _diamond1_stage_d(
+    _b: Annotated[pathlib.Path, outputs.Dep("b.txt", loaders.PathOnly())],
+    _c: Annotated[pathlib.Path, outputs.Dep("c.txt", loaders.PathOnly())],
+) -> _OutD:
+    with open("execution_log.txt", "a") as f:
+        f.write("d\n")
+    b_data = pathlib.Path("b.txt").read_text()
+    c_data = pathlib.Path("c.txt").read_text()
+    assert b_data == "B_OUTPUT", "stage_b must run before stage_d"
+    assert c_data == "C_OUTPUT", "stage_c must run before stage_d"
+    pathlib.Path("d.txt").write_text(f"D({b_data}+{c_data})")
+    return _OutD(output=pathlib.Path("d.txt"))
+
+
+# =============================================================================
+# Module-level stage functions for test_diamond_dag_with_shared_data
+# =============================================================================
+
+
+def _diamond2_compute_a(
+    _input: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _OutA:
+    n = int(pathlib.Path("input.txt").read_text())
+    pathlib.Path("a.txt").write_text(str(n))
+    return _OutA(output=pathlib.Path("a.txt"))
+
+
+def _diamond2_double_b(
+    _a: Annotated[pathlib.Path, outputs.Dep("a.txt", loaders.PathOnly())],
+) -> _OutB:
+    n = int(pathlib.Path("a.txt").read_text())
+    pathlib.Path("b.txt").write_text(str(n * 2))  # 20
+    return _OutB(output=pathlib.Path("b.txt"))
+
+
+def _diamond2_triple_c(
+    _a: Annotated[pathlib.Path, outputs.Dep("a.txt", loaders.PathOnly())],
+) -> _OutC:
+    n = int(pathlib.Path("a.txt").read_text())
+    pathlib.Path("c.txt").write_text(str(n * 3))  # 30
+    return _OutC(output=pathlib.Path("c.txt"))
+
+
+def _diamond2_sum_d(
+    _b: Annotated[pathlib.Path, outputs.Dep("b.txt", loaders.PathOnly())],
+    _c: Annotated[pathlib.Path, outputs.Dep("c.txt", loaders.PathOnly())],
+) -> _OutD:
+    b = int(pathlib.Path("b.txt").read_text())
+    c = int(pathlib.Path("c.txt").read_text())
+    pathlib.Path("d.txt").write_text(str(b + c))  # 50
+    return _OutD(output=pathlib.Path("d.txt"))
+
+
+# =============================================================================
+# Module-level stage functions for test_fanout_dag
+# =============================================================================
+
+
+def _fanout1_stage_a(
+    _input: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _OutA:
+    with open("execution_log.txt", "a") as f:
+        f.write("a\n")
+    pathlib.Path("a.txt").write_text("A_DATA")
+    return _OutA(output=pathlib.Path("a.txt"))
+
+
+def _fanout1_stage_b(
+    _a: Annotated[pathlib.Path, outputs.Dep("a.txt", loaders.PathOnly())],
+) -> _OutB:
+    with open("execution_log.txt", "a") as f:
+        f.write("b\n")
+    data = pathlib.Path("a.txt").read_text()
+    assert data == "A_DATA", "stage_a must run before stage_b"
+    pathlib.Path("b.txt").write_text("B")
+    return _OutB(output=pathlib.Path("b.txt"))
+
+
+def _fanout1_stage_c(
+    _a: Annotated[pathlib.Path, outputs.Dep("a.txt", loaders.PathOnly())],
+) -> _OutC:
+    with open("execution_log.txt", "a") as f:
+        f.write("c\n")
+    data = pathlib.Path("a.txt").read_text()
+    assert data == "A_DATA", "stage_a must run before stage_c"
+    pathlib.Path("c.txt").write_text("C")
+    return _OutC(output=pathlib.Path("c.txt"))
+
+
+def _fanout1_stage_d(
+    _a: Annotated[pathlib.Path, outputs.Dep("a.txt", loaders.PathOnly())],
+) -> _OutD:
+    with open("execution_log.txt", "a") as f:
+        f.write("d\n")
+    data = pathlib.Path("a.txt").read_text()
+    assert data == "A_DATA", "stage_a must run before stage_d"
+    pathlib.Path("d.txt").write_text("D")
+    return _OutD(output=pathlib.Path("d.txt"))
+
+
+# =============================================================================
+# Module-level stage functions for test_fanout_dag_wide
+# =============================================================================
+
+
+def _fanout2_root_stage(
+    _input: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _OutA:
+    with open("execution_log.txt", "a") as f:
+        f.write("a\n")
+    pathlib.Path("a.txt").write_text("ROOT")
+    return _OutA(output=pathlib.Path("a.txt"))
+
+
+def _fanout2_consumer_b(
+    _a: Annotated[pathlib.Path, outputs.Dep("a.txt", loaders.PathOnly())],
+) -> _OutB:
+    with open("execution_log.txt", "a") as f:
+        f.write("b\n")
+    assert pathlib.Path("a.txt").read_text() == "ROOT"
+    pathlib.Path("b.txt").write_text("B")
+    return _OutB(output=pathlib.Path("b.txt"))
+
+
+def _fanout2_consumer_c(
+    _a: Annotated[pathlib.Path, outputs.Dep("a.txt", loaders.PathOnly())],
+) -> _OutC:
+    with open("execution_log.txt", "a") as f:
+        f.write("c\n")
+    assert pathlib.Path("a.txt").read_text() == "ROOT"
+    pathlib.Path("c.txt").write_text("C")
+    return _OutC(output=pathlib.Path("c.txt"))
+
+
+def _fanout2_consumer_d(
+    _a: Annotated[pathlib.Path, outputs.Dep("a.txt", loaders.PathOnly())],
+) -> _OutD:
+    with open("execution_log.txt", "a") as f:
+        f.write("d\n")
+    assert pathlib.Path("a.txt").read_text() == "ROOT"
+    pathlib.Path("d.txt").write_text("D")
+    return _OutD(output=pathlib.Path("d.txt"))
+
+
+def _fanout2_consumer_e(
+    _a: Annotated[pathlib.Path, outputs.Dep("a.txt", loaders.PathOnly())],
+) -> _OutE:
+    with open("execution_log.txt", "a") as f:
+        f.write("e\n")
+    assert pathlib.Path("a.txt").read_text() == "ROOT"
+    pathlib.Path("e.txt").write_text("E")
+    return _OutE(output=pathlib.Path("e.txt"))
+
+
+def _fanout2_consumer_f(
+    _a: Annotated[pathlib.Path, outputs.Dep("a.txt", loaders.PathOnly())],
+) -> _OutF:
+    with open("execution_log.txt", "a") as f:
+        f.write("f\n")
+    assert pathlib.Path("a.txt").read_text() == "ROOT"
+    pathlib.Path("f.txt").write_text("F")
+    return _OutF(output=pathlib.Path("f.txt"))
+
+
+# =============================================================================
+# Module-level stage functions for test_fanin_dag
+# =============================================================================
+
+
+def _fanin1_stage_a(
+    _input_a: Annotated[pathlib.Path, outputs.Dep("input_a.txt", loaders.PathOnly())],
+) -> _OutA:
+    with open("execution_log.txt", "a") as f:
+        f.write("a\n")
+    pathlib.Path("a.txt").write_text("A_OUT")
+    return _OutA(output=pathlib.Path("a.txt"))
+
+
+def _fanin1_stage_b(
+    _input_b: Annotated[pathlib.Path, outputs.Dep("input_b.txt", loaders.PathOnly())],
+) -> _OutB:
+    with open("execution_log.txt", "a") as f:
+        f.write("b\n")
+    pathlib.Path("b.txt").write_text("B_OUT")
+    return _OutB(output=pathlib.Path("b.txt"))
+
+
+def _fanin1_stage_c(
+    _input_c: Annotated[pathlib.Path, outputs.Dep("input_c.txt", loaders.PathOnly())],
+) -> _OutC:
+    with open("execution_log.txt", "a") as f:
+        f.write("c\n")
+    pathlib.Path("c.txt").write_text("C_OUT")
+    return _OutC(output=pathlib.Path("c.txt"))
+
+
+def _fanin1_stage_d(
+    _a: Annotated[pathlib.Path, outputs.Dep("a.txt", loaders.PathOnly())],
+    _b: Annotated[pathlib.Path, outputs.Dep("b.txt", loaders.PathOnly())],
+    _c: Annotated[pathlib.Path, outputs.Dep("c.txt", loaders.PathOnly())],
+) -> _OutD:
+    with open("execution_log.txt", "a") as f:
+        f.write("d\n")
+    a = pathlib.Path("a.txt").read_text()
+    b = pathlib.Path("b.txt").read_text()
+    c = pathlib.Path("c.txt").read_text()
+    assert a == "A_OUT", "stage_a must run before stage_d"
+    assert b == "B_OUT", "stage_b must run before stage_d"
+    assert c == "C_OUT", "stage_c must run before stage_d"
+    pathlib.Path("d.txt").write_text(f"{a}+{b}+{c}")
+    return _OutD(output=pathlib.Path("d.txt"))
+
+
+# =============================================================================
+# Module-level stage functions for test_fanin_dag_with_computation
+# =============================================================================
+
+
+def _fanin2_compute_a(
+    _input_a: Annotated[pathlib.Path, outputs.Dep("input_a.txt", loaders.PathOnly())],
+) -> _OutA:
+    n = int(pathlib.Path("input_a.txt").read_text())
+    pathlib.Path("a.txt").write_text(str(n))
+    return _OutA(output=pathlib.Path("a.txt"))
+
+
+def _fanin2_compute_b(
+    _input_b: Annotated[pathlib.Path, outputs.Dep("input_b.txt", loaders.PathOnly())],
+) -> _OutB:
+    n = int(pathlib.Path("input_b.txt").read_text())
+    pathlib.Path("b.txt").write_text(str(n))
+    return _OutB(output=pathlib.Path("b.txt"))
+
+
+def _fanin2_compute_c(
+    _input_c: Annotated[pathlib.Path, outputs.Dep("input_c.txt", loaders.PathOnly())],
+) -> _OutC:
+    n = int(pathlib.Path("input_c.txt").read_text())
+    pathlib.Path("c.txt").write_text(str(n))
+    return _OutC(output=pathlib.Path("c.txt"))
+
+
+def _fanin2_compute_sum(
+    _a: Annotated[pathlib.Path, outputs.Dep("a.txt", loaders.PathOnly())],
+    _b: Annotated[pathlib.Path, outputs.Dep("b.txt", loaders.PathOnly())],
+    _c: Annotated[pathlib.Path, outputs.Dep("c.txt", loaders.PathOnly())],
+) -> _OutSum:
+    a = int(pathlib.Path("a.txt").read_text())
+    b = int(pathlib.Path("b.txt").read_text())
+    c = int(pathlib.Path("c.txt").read_text())
+    pathlib.Path("sum.txt").write_text(str(a + b + c))
+    return _OutSum(output=pathlib.Path("sum.txt"))
+
+
+# =============================================================================
+# Module-level stage functions for test_complex_dag_tree_then_diamond
+# =============================================================================
+
+
+def _complex1_stage_a(
+    _input: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _OutA:
+    with open("execution_log.txt", "a") as f:
+        f.write("a\n")
+    pathlib.Path("a.txt").write_text("A")
+    return _OutA(output=pathlib.Path("a.txt"))
+
+
+def _complex1_stage_b(
+    _a: Annotated[pathlib.Path, outputs.Dep("a.txt", loaders.PathOnly())],
+) -> _OutB:
+    with open("execution_log.txt", "a") as f:
+        f.write("b\n")
+    assert pathlib.Path("a.txt").read_text() == "A"
+    pathlib.Path("b.txt").write_text("B")
+    return _OutB(output=pathlib.Path("b.txt"))
+
+
+def _complex1_stage_c(
+    _a: Annotated[pathlib.Path, outputs.Dep("a.txt", loaders.PathOnly())],
+) -> _OutC:
+    with open("execution_log.txt", "a") as f:
+        f.write("c\n")
+    assert pathlib.Path("a.txt").read_text() == "A"
+    pathlib.Path("c.txt").write_text("C")
+    return _OutC(output=pathlib.Path("c.txt"))
+
+
+def _complex1_stage_d(
+    _b: Annotated[pathlib.Path, outputs.Dep("b.txt", loaders.PathOnly())],
+) -> _OutD:
+    with open("execution_log.txt", "a") as f:
+        f.write("d\n")
+    assert pathlib.Path("b.txt").read_text() == "B"
+    pathlib.Path("d.txt").write_text("D")
+    return _OutD(output=pathlib.Path("d.txt"))
+
+
+def _complex1_stage_e(
+    _c: Annotated[pathlib.Path, outputs.Dep("c.txt", loaders.PathOnly())],
+) -> _OutE:
+    with open("execution_log.txt", "a") as f:
+        f.write("e\n")
+    assert pathlib.Path("c.txt").read_text() == "C"
+    pathlib.Path("e.txt").write_text("E")
+    return _OutE(output=pathlib.Path("e.txt"))
+
+
+def _complex1_stage_f(
+    _d: Annotated[pathlib.Path, outputs.Dep("d.txt", loaders.PathOnly())],
+    _e: Annotated[pathlib.Path, outputs.Dep("e.txt", loaders.PathOnly())],
+) -> _OutF:
+    with open("execution_log.txt", "a") as f:
+        f.write("f\n")
+    d = pathlib.Path("d.txt").read_text()
+    e = pathlib.Path("e.txt").read_text()
+    assert d == "D", "stage_d must run before stage_f"
+    assert e == "E", "stage_e must run before stage_f"
+    pathlib.Path("f.txt").write_text(f"F({d},{e})")
+    return _OutF(output=pathlib.Path("f.txt"))
+
+
+# =============================================================================
+# Module-level stage functions for test_complex_dag_multiple_diamonds
+# =============================================================================
+
+
+def _complex2_root_a(
+    _input: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _OutA:
+    with open("execution_log.txt", "a") as f:
+        f.write("a\n")
+    pathlib.Path("a.txt").write_text("1")
+    return _OutA(output=pathlib.Path("a.txt"))
+
+
+def _complex2_mid_b(
+    _a: Annotated[pathlib.Path, outputs.Dep("a.txt", loaders.PathOnly())],
+) -> _OutB:
+    with open("execution_log.txt", "a") as f:
+        f.write("b\n")
+    pathlib.Path("b.txt").write_text("B")
+    return _OutB(output=pathlib.Path("b.txt"))
+
+
+def _complex2_mid_c(
+    _a: Annotated[pathlib.Path, outputs.Dep("a.txt", loaders.PathOnly())],
+) -> _OutC:
+    with open("execution_log.txt", "a") as f:
+        f.write("c\n")
+    pathlib.Path("c.txt").write_text("C")
+    return _OutC(output=pathlib.Path("c.txt"))
+
+
+def _complex2_mid_d(
+    _a: Annotated[pathlib.Path, outputs.Dep("a.txt", loaders.PathOnly())],
+) -> _OutD:
+    with open("execution_log.txt", "a") as f:
+        f.write("d\n")
+    pathlib.Path("d.txt").write_text("D")
+    return _OutD(output=pathlib.Path("d.txt"))
+
+
+def _complex2_lower_e(
+    _b: Annotated[pathlib.Path, outputs.Dep("b.txt", loaders.PathOnly())],
+    _c: Annotated[pathlib.Path, outputs.Dep("c.txt", loaders.PathOnly())],
+) -> _OutE:
+    with open("execution_log.txt", "a") as f:
+        f.write("e\n")
+    b = pathlib.Path("b.txt").read_text()
+    c = pathlib.Path("c.txt").read_text()
+    pathlib.Path("e.txt").write_text(f"E({b}{c})")
+    return _OutE(output=pathlib.Path("e.txt"))
+
+
+def _complex2_lower_f(
+    _c: Annotated[pathlib.Path, outputs.Dep("c.txt", loaders.PathOnly())],
+    _d: Annotated[pathlib.Path, outputs.Dep("d.txt", loaders.PathOnly())],
+) -> _OutF:
+    with open("execution_log.txt", "a") as f:
+        f.write("f\n")
+    c = pathlib.Path("c.txt").read_text()
+    d = pathlib.Path("d.txt").read_text()
+    pathlib.Path("f.txt").write_text(f"F({c}{d})")
+    return _OutF(output=pathlib.Path("f.txt"))
+
+
+def _complex2_lower_g(
+    _d: Annotated[pathlib.Path, outputs.Dep("d.txt", loaders.PathOnly())],
+) -> _OutG:
+    with open("execution_log.txt", "a") as f:
+        f.write("g\n")
+    d = pathlib.Path("d.txt").read_text()
+    pathlib.Path("g.txt").write_text(f"G({d})")
+    return _OutG(output=pathlib.Path("g.txt"))
+
+
+def _complex2_final_h(
+    _e: Annotated[pathlib.Path, outputs.Dep("e.txt", loaders.PathOnly())],
+    _f: Annotated[pathlib.Path, outputs.Dep("f.txt", loaders.PathOnly())],
+    _g: Annotated[pathlib.Path, outputs.Dep("g.txt", loaders.PathOnly())],
+) -> _OutH:
+    with open("execution_log.txt", "a") as f:
+        f.write("h\n")
+    e = pathlib.Path("e.txt").read_text()
+    f_val = pathlib.Path("f.txt").read_text()
+    g = pathlib.Path("g.txt").read_text()
+    pathlib.Path("h.txt").write_text(f"H[{e},{f_val},{g}]")
+    return _OutH(output=pathlib.Path("h.txt"))
+
+
+# =============================================================================
+# Module-level stage functions for test_single_stage_dag
+# =============================================================================
+
+
+def _single_only_stage(
+    _input: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _OutOutput:
+    data = pathlib.Path("input.txt").read_text()
+    pathlib.Path("output.txt").write_text(f"PROCESSED:{data}")
+    return _OutOutput(output=pathlib.Path("output.txt"))
+
+
+# =============================================================================
+# Module-level stage functions for test_disconnected_dags
+# =============================================================================
+
+
+def _disconn_stage_a(
+    _input_a: Annotated[pathlib.Path, outputs.Dep("input_a.txt", loaders.PathOnly())],
+) -> _OutA:
+    with open("execution_log.txt", "a") as f:
+        f.write("a\n")
+    pathlib.Path("a.txt").write_text("A_OUT")
+    return _OutA(output=pathlib.Path("a.txt"))
+
+
+def _disconn_stage_b(
+    _a: Annotated[pathlib.Path, outputs.Dep("a.txt", loaders.PathOnly())],
+) -> _OutB:
+    with open("execution_log.txt", "a") as f:
+        f.write("b\n")
+    assert pathlib.Path("a.txt").read_text() == "A_OUT"
+    pathlib.Path("b.txt").write_text("B_OUT")
+    return _OutB(output=pathlib.Path("b.txt"))
+
+
+def _disconn_stage_x(
+    _input_x: Annotated[pathlib.Path, outputs.Dep("input_x.txt", loaders.PathOnly())],
+) -> _OutX:
+    with open("execution_log.txt", "a") as f:
+        f.write("x\n")
+    pathlib.Path("x.txt").write_text("X_OUT")
+    return _OutX(output=pathlib.Path("x.txt"))
+
+
+def _disconn_stage_y(
+    _x: Annotated[pathlib.Path, outputs.Dep("x.txt", loaders.PathOnly())],
+) -> _OutY:
+    with open("execution_log.txt", "a") as f:
+        f.write("y\n")
+    assert pathlib.Path("x.txt").read_text() == "X_OUT"
+    pathlib.Path("y.txt").write_text("Y_OUT")
+    return _OutY(output=pathlib.Path("y.txt"))
+
+
+# =============================================================================
+# Linear DAG: A -> B -> C
 # =============================================================================
 
 
 def test_linear_dag_three_stages(pipeline_dir: pathlib.Path) -> None:
-    """Linear DAG A → B → C executes in correct order.
+    """Linear DAG A -> B -> C executes in correct order.
 
     Each stage appends to the data, creating a chain that proves order.
     If any stage runs out of order, assertions will fail.
@@ -18,28 +784,9 @@ def test_linear_dag_three_stages(pipeline_dir: pathlib.Path) -> None:
     log_file = pipeline_dir / "execution_log.txt"
     log_file.write_text("")
 
-    @stage(deps=["input.txt"], outs=["a.txt"])
-    def stage_a() -> None:
-        with open("execution_log.txt", "a") as f:
-            f.write("a\n")
-        data = pathlib.Path("input.txt").read_text()
-        pathlib.Path("a.txt").write_text(f"{data}->A")
-
-    @stage(deps=["a.txt"], outs=["b.txt"])
-    def stage_b() -> None:
-        with open("execution_log.txt", "a") as f:
-            f.write("b\n")
-        data = pathlib.Path("a.txt").read_text()
-        assert data == "START->A", f"Expected 'START->A', got '{data}'"
-        pathlib.Path("b.txt").write_text(f"{data}->B")
-
-    @stage(deps=["b.txt"], outs=["c.txt"])
-    def stage_c() -> None:
-        with open("execution_log.txt", "a") as f:
-            f.write("c\n")
-        data = pathlib.Path("b.txt").read_text()
-        assert data == "START->A->B", f"Expected 'START->A->B', got '{data}'"
-        pathlib.Path("c.txt").write_text(f"{data}->C")
+    register_test_stage(_linear3_stage_a, name="stage_a")
+    register_test_stage(_linear3_stage_b, name="stage_b")
+    register_test_stage(_linear3_stage_c, name="stage_c")
 
     results = executor.run()
 
@@ -56,49 +803,16 @@ def test_linear_dag_three_stages(pipeline_dir: pathlib.Path) -> None:
 
 
 def test_linear_dag_five_stages(pipeline_dir: pathlib.Path) -> None:
-    """Longer linear DAG: A → B → C → D → E."""
+    """Longer linear DAG: A -> B -> C -> D -> E."""
     (pipeline_dir / "input.txt").write_text("0")
     log_file = pipeline_dir / "execution_log.txt"
     log_file.write_text("")
 
-    @stage(deps=["input.txt"], outs=["stage1.txt"])
-    def stage1() -> None:
-        with open("execution_log.txt", "a") as f:
-            f.write("1\n")
-        n = int(pathlib.Path("input.txt").read_text())
-        pathlib.Path("stage1.txt").write_text(str(n + 1))
-
-    @stage(deps=["stage1.txt"], outs=["stage2.txt"])
-    def stage2() -> None:
-        with open("execution_log.txt", "a") as f:
-            f.write("2\n")
-        n = int(pathlib.Path("stage1.txt").read_text())
-        assert n == 1, f"stage1 must run first, got {n}"
-        pathlib.Path("stage2.txt").write_text(str(n + 1))
-
-    @stage(deps=["stage2.txt"], outs=["stage3.txt"])
-    def stage3() -> None:
-        with open("execution_log.txt", "a") as f:
-            f.write("3\n")
-        n = int(pathlib.Path("stage2.txt").read_text())
-        assert n == 2, f"stage2 must run first, got {n}"
-        pathlib.Path("stage3.txt").write_text(str(n + 1))
-
-    @stage(deps=["stage3.txt"], outs=["stage4.txt"])
-    def stage4() -> None:
-        with open("execution_log.txt", "a") as f:
-            f.write("4\n")
-        n = int(pathlib.Path("stage3.txt").read_text())
-        assert n == 3, f"stage3 must run first, got {n}"
-        pathlib.Path("stage4.txt").write_text(str(n + 1))
-
-    @stage(deps=["stage4.txt"], outs=["stage5.txt"])
-    def stage5() -> None:
-        with open("execution_log.txt", "a") as f:
-            f.write("5\n")
-        n = int(pathlib.Path("stage4.txt").read_text())
-        assert n == 4, f"stage4 must run first, got {n}"
-        pathlib.Path("stage5.txt").write_text(str(n + 1))
+    register_test_stage(_linear5_stage1, name="stage1")
+    register_test_stage(_linear5_stage2, name="stage2")
+    register_test_stage(_linear5_stage3, name="stage3")
+    register_test_stage(_linear5_stage4, name="stage4")
+    register_test_stage(_linear5_stage5, name="stage5")
 
     executor.run()
 
@@ -117,33 +831,14 @@ def test_linear_dag_five_stages(pipeline_dir: pathlib.Path) -> None:
 
 
 def test_tree_dag_one_root_two_children(pipeline_dir: pathlib.Path) -> None:
-    """Tree DAG: A → B, A → C (B and C both depend on A, but not each other)."""
+    """Tree DAG: A -> B, A -> C (B and C both depend on A, but not each other)."""
     (pipeline_dir / "input.txt").write_text("ROOT")
     log_file = pipeline_dir / "execution_log.txt"
     log_file.write_text("")
 
-    @stage(deps=["input.txt"], outs=["a.txt"])
-    def stage_a() -> None:
-        with open("execution_log.txt", "a") as f:
-            f.write("a\n")
-        data = pathlib.Path("input.txt").read_text()
-        pathlib.Path("a.txt").write_text(f"{data}->A")
-
-    @stage(deps=["a.txt"], outs=["b.txt"])
-    def stage_b() -> None:
-        with open("execution_log.txt", "a") as f:
-            f.write("b\n")
-        data = pathlib.Path("a.txt").read_text()
-        assert "->A" in data, "stage_a must run before stage_b"
-        pathlib.Path("b.txt").write_text(f"{data}->B")
-
-    @stage(deps=["a.txt"], outs=["c.txt"])
-    def stage_c() -> None:
-        with open("execution_log.txt", "a") as f:
-            f.write("c\n")
-        data = pathlib.Path("a.txt").read_text()
-        assert "->A" in data, "stage_a must run before stage_c"
-        pathlib.Path("c.txt").write_text(f"{data}->C")
+    register_test_stage(_tree1_stage_a, name="stage_a")
+    register_test_stage(_tree1_stage_b, name="stage_b")
+    register_test_stage(_tree1_stage_c, name="stage_c")
 
     executor.run()
 
@@ -161,7 +856,7 @@ def test_tree_dag_one_root_two_children(pipeline_dir: pathlib.Path) -> None:
 
 
 def test_tree_dag_deeper(pipeline_dir: pathlib.Path) -> None:
-    """Deeper tree: A → B → D, A → C → E.
+    """Deeper tree: A -> B -> D, A -> C -> E.
 
          A
         / \
@@ -173,39 +868,11 @@ def test_tree_dag_deeper(pipeline_dir: pathlib.Path) -> None:
     log_file = pipeline_dir / "execution_log.txt"
     log_file.write_text("")
 
-    @stage(deps=["input.txt"], outs=["a.txt"])
-    def stage_a() -> None:
-        with open("execution_log.txt", "a") as f:
-            f.write("a\n")
-        pathlib.Path("a.txt").write_text("A")
-
-    @stage(deps=["a.txt"], outs=["b.txt"])
-    def stage_b() -> None:
-        with open("execution_log.txt", "a") as f:
-            f.write("b\n")
-        assert pathlib.Path("a.txt").read_text() == "A"
-        pathlib.Path("b.txt").write_text("B")
-
-    @stage(deps=["a.txt"], outs=["c.txt"])
-    def stage_c() -> None:
-        with open("execution_log.txt", "a") as f:
-            f.write("c\n")
-        assert pathlib.Path("a.txt").read_text() == "A"
-        pathlib.Path("c.txt").write_text("C")
-
-    @stage(deps=["b.txt"], outs=["d.txt"])
-    def stage_d() -> None:
-        with open("execution_log.txt", "a") as f:
-            f.write("d\n")
-        assert pathlib.Path("b.txt").read_text() == "B"
-        pathlib.Path("d.txt").write_text("D")
-
-    @stage(deps=["c.txt"], outs=["e.txt"])
-    def stage_e() -> None:
-        with open("execution_log.txt", "a") as f:
-            f.write("e\n")
-        assert pathlib.Path("c.txt").read_text() == "C"
-        pathlib.Path("e.txt").write_text("E")
+    register_test_stage(_tree2_stage_a, name="stage_a")
+    register_test_stage(_tree2_stage_b, name="stage_b")
+    register_test_stage(_tree2_stage_c, name="stage_c")
+    register_test_stage(_tree2_stage_d, name="stage_d")
+    register_test_stage(_tree2_stage_e, name="stage_e")
 
     executor.run()
 
@@ -230,7 +897,7 @@ def test_tree_dag_deeper(pipeline_dir: pathlib.Path) -> None:
 
 
 def test_diamond_dag(pipeline_dir: pathlib.Path) -> None:
-    """Diamond DAG: A → B → D, A → C → D.
+    """Diamond DAG: A -> B -> D, A -> C -> D.
 
     D depends on both B and C, which both depend on A.
     """
@@ -238,37 +905,10 @@ def test_diamond_dag(pipeline_dir: pathlib.Path) -> None:
     log_file = pipeline_dir / "execution_log.txt"
     log_file.write_text("")
 
-    @stage(deps=["input.txt"], outs=["a.txt"])
-    def stage_a() -> None:
-        with open("execution_log.txt", "a") as f:
-            f.write("a\n")
-        pathlib.Path("a.txt").write_text("A_OUTPUT")
-
-    @stage(deps=["a.txt"], outs=["b.txt"])
-    def stage_b() -> None:
-        with open("execution_log.txt", "a") as f:
-            f.write("b\n")
-        data = pathlib.Path("a.txt").read_text()
-        assert data == "A_OUTPUT", "stage_a must run before stage_b"
-        pathlib.Path("b.txt").write_text("B_OUTPUT")
-
-    @stage(deps=["a.txt"], outs=["c.txt"])
-    def stage_c() -> None:
-        with open("execution_log.txt", "a") as f:
-            f.write("c\n")
-        data = pathlib.Path("a.txt").read_text()
-        assert data == "A_OUTPUT", "stage_a must run before stage_c"
-        pathlib.Path("c.txt").write_text("C_OUTPUT")
-
-    @stage(deps=["b.txt", "c.txt"], outs=["d.txt"])
-    def stage_d() -> None:
-        with open("execution_log.txt", "a") as f:
-            f.write("d\n")
-        b_data = pathlib.Path("b.txt").read_text()
-        c_data = pathlib.Path("c.txt").read_text()
-        assert b_data == "B_OUTPUT", "stage_b must run before stage_d"
-        assert c_data == "C_OUTPUT", "stage_c must run before stage_d"
-        pathlib.Path("d.txt").write_text(f"D({b_data}+{c_data})")
+    register_test_stage(_diamond1_stage_a, name="stage_a")
+    register_test_stage(_diamond1_stage_b, name="stage_b")
+    register_test_stage(_diamond1_stage_c, name="stage_c")
+    register_test_stage(_diamond1_stage_d, name="stage_d")
 
     executor.run()
 
@@ -295,26 +935,10 @@ def test_diamond_dag_with_shared_data(pipeline_dir: pathlib.Path) -> None:
     """
     (pipeline_dir / "input.txt").write_text("10")
 
-    @stage(deps=["input.txt"], outs=["a.txt"])
-    def compute_a() -> None:
-        n = int(pathlib.Path("input.txt").read_text())
-        pathlib.Path("a.txt").write_text(str(n))
-
-    @stage(deps=["a.txt"], outs=["b.txt"])
-    def double_b() -> None:
-        n = int(pathlib.Path("a.txt").read_text())
-        pathlib.Path("b.txt").write_text(str(n * 2))  # 20
-
-    @stage(deps=["a.txt"], outs=["c.txt"])
-    def triple_c() -> None:
-        n = int(pathlib.Path("a.txt").read_text())
-        pathlib.Path("c.txt").write_text(str(n * 3))  # 30
-
-    @stage(deps=["b.txt", "c.txt"], outs=["d.txt"])
-    def sum_d() -> None:
-        b = int(pathlib.Path("b.txt").read_text())
-        c = int(pathlib.Path("c.txt").read_text())
-        pathlib.Path("d.txt").write_text(str(b + c))  # 50
+    register_test_stage(_diamond2_compute_a, name="compute_a")
+    register_test_stage(_diamond2_double_b, name="double_b")
+    register_test_stage(_diamond2_triple_c, name="triple_c")
+    register_test_stage(_diamond2_sum_d, name="sum_d")
 
     executor.run()
 
@@ -332,40 +956,15 @@ def test_diamond_dag_with_shared_data(pipeline_dir: pathlib.Path) -> None:
 
 
 def test_fanout_dag(pipeline_dir: pathlib.Path) -> None:
-    """Fan-out DAG: A → B, A → C, A → D (one source, three consumers)."""
+    """Fan-out DAG: A -> B, A -> C, A -> D (one source, three consumers)."""
     (pipeline_dir / "input.txt").write_text("SOURCE")
     log_file = pipeline_dir / "execution_log.txt"
     log_file.write_text("")
 
-    @stage(deps=["input.txt"], outs=["a.txt"])
-    def stage_a() -> None:
-        with open("execution_log.txt", "a") as f:
-            f.write("a\n")
-        pathlib.Path("a.txt").write_text("A_DATA")
-
-    @stage(deps=["a.txt"], outs=["b.txt"])
-    def stage_b() -> None:
-        with open("execution_log.txt", "a") as f:
-            f.write("b\n")
-        data = pathlib.Path("a.txt").read_text()
-        assert data == "A_DATA", "stage_a must run before stage_b"
-        pathlib.Path("b.txt").write_text("B")
-
-    @stage(deps=["a.txt"], outs=["c.txt"])
-    def stage_c() -> None:
-        with open("execution_log.txt", "a") as f:
-            f.write("c\n")
-        data = pathlib.Path("a.txt").read_text()
-        assert data == "A_DATA", "stage_a must run before stage_c"
-        pathlib.Path("c.txt").write_text("C")
-
-    @stage(deps=["a.txt"], outs=["d.txt"])
-    def stage_d() -> None:
-        with open("execution_log.txt", "a") as f:
-            f.write("d\n")
-        data = pathlib.Path("a.txt").read_text()
-        assert data == "A_DATA", "stage_a must run before stage_d"
-        pathlib.Path("d.txt").write_text("D")
+    register_test_stage(_fanout1_stage_a, name="stage_a")
+    register_test_stage(_fanout1_stage_b, name="stage_b")
+    register_test_stage(_fanout1_stage_c, name="stage_c")
+    register_test_stage(_fanout1_stage_d, name="stage_d")
 
     executor.run()
 
@@ -379,53 +978,19 @@ def test_fanout_dag(pipeline_dir: pathlib.Path) -> None:
 
 
 def test_fanout_dag_wide(pipeline_dir: pathlib.Path) -> None:
-    """Wide fan-out: A → B, C, D, E, F (five consumers)."""
+    """Wide fan-out: A -> B, C, D, E, F (five consumers)."""
     consumer_names = ["b", "c", "d", "e", "f"]
 
     (pipeline_dir / "input.txt").write_text("1")
     log_file = pipeline_dir / "execution_log.txt"
     log_file.write_text("")
 
-    @stage(deps=["input.txt"], outs=["a.txt"])
-    def root_stage() -> None:
-        with open("execution_log.txt", "a") as f:
-            f.write("a\n")
-        pathlib.Path("a.txt").write_text("ROOT")
-
-    @stage(deps=["a.txt"], outs=["b.txt"])
-    def consumer_b() -> None:
-        with open("execution_log.txt", "a") as f:
-            f.write("b\n")
-        assert pathlib.Path("a.txt").read_text() == "ROOT"
-        pathlib.Path("b.txt").write_text("B")
-
-    @stage(deps=["a.txt"], outs=["c.txt"])
-    def consumer_c() -> None:
-        with open("execution_log.txt", "a") as f:
-            f.write("c\n")
-        assert pathlib.Path("a.txt").read_text() == "ROOT"
-        pathlib.Path("c.txt").write_text("C")
-
-    @stage(deps=["a.txt"], outs=["d.txt"])
-    def consumer_d() -> None:
-        with open("execution_log.txt", "a") as f:
-            f.write("d\n")
-        assert pathlib.Path("a.txt").read_text() == "ROOT"
-        pathlib.Path("d.txt").write_text("D")
-
-    @stage(deps=["a.txt"], outs=["e.txt"])
-    def consumer_e() -> None:
-        with open("execution_log.txt", "a") as f:
-            f.write("e\n")
-        assert pathlib.Path("a.txt").read_text() == "ROOT"
-        pathlib.Path("e.txt").write_text("E")
-
-    @stage(deps=["a.txt"], outs=["f.txt"])
-    def consumer_f() -> None:
-        with open("execution_log.txt", "a") as f:
-            f.write("f\n")
-        assert pathlib.Path("a.txt").read_text() == "ROOT"
-        pathlib.Path("f.txt").write_text("F")
+    register_test_stage(_fanout2_root_stage, name="root_stage")
+    register_test_stage(_fanout2_consumer_b, name="consumer_b")
+    register_test_stage(_fanout2_consumer_c, name="consumer_c")
+    register_test_stage(_fanout2_consumer_d, name="consumer_d")
+    register_test_stage(_fanout2_consumer_e, name="consumer_e")
+    register_test_stage(_fanout2_consumer_f, name="consumer_f")
 
     executor.run()
 
@@ -444,7 +1009,7 @@ def test_fanout_dag_wide(pipeline_dir: pathlib.Path) -> None:
 
 
 def test_fanin_dag(pipeline_dir: pathlib.Path) -> None:
-    """Fan-in DAG: A → D, B → D, C → D (three sources, one consumer)."""
+    """Fan-in DAG: A -> D, B -> D, C -> D (three sources, one consumer)."""
     # Create separate input files for each source
     (pipeline_dir / "input_a.txt").write_text("A_INPUT")
     (pipeline_dir / "input_b.txt").write_text("B_INPUT")
@@ -452,35 +1017,10 @@ def test_fanin_dag(pipeline_dir: pathlib.Path) -> None:
     log_file = pipeline_dir / "execution_log.txt"
     log_file.write_text("")
 
-    @stage(deps=["input_a.txt"], outs=["a.txt"])
-    def stage_a() -> None:
-        with open("execution_log.txt", "a") as f:
-            f.write("a\n")
-        pathlib.Path("a.txt").write_text("A_OUT")
-
-    @stage(deps=["input_b.txt"], outs=["b.txt"])
-    def stage_b() -> None:
-        with open("execution_log.txt", "a") as f:
-            f.write("b\n")
-        pathlib.Path("b.txt").write_text("B_OUT")
-
-    @stage(deps=["input_c.txt"], outs=["c.txt"])
-    def stage_c() -> None:
-        with open("execution_log.txt", "a") as f:
-            f.write("c\n")
-        pathlib.Path("c.txt").write_text("C_OUT")
-
-    @stage(deps=["a.txt", "b.txt", "c.txt"], outs=["d.txt"])
-    def stage_d() -> None:
-        with open("execution_log.txt", "a") as f:
-            f.write("d\n")
-        a = pathlib.Path("a.txt").read_text()
-        b = pathlib.Path("b.txt").read_text()
-        c = pathlib.Path("c.txt").read_text()
-        assert a == "A_OUT", "stage_a must run before stage_d"
-        assert b == "B_OUT", "stage_b must run before stage_d"
-        assert c == "C_OUT", "stage_c must run before stage_d"
-        pathlib.Path("d.txt").write_text(f"{a}+{b}+{c}")
+    register_test_stage(_fanin1_stage_a, name="stage_a")
+    register_test_stage(_fanin1_stage_b, name="stage_b")
+    register_test_stage(_fanin1_stage_c, name="stage_c")
+    register_test_stage(_fanin1_stage_d, name="stage_d")
 
     executor.run()
 
@@ -497,33 +1037,16 @@ def test_fanin_dag(pipeline_dir: pathlib.Path) -> None:
 def test_fanin_dag_with_computation(pipeline_dir: pathlib.Path) -> None:
     """Fan-in where D computes sum of all inputs.
 
-    A=10, B=20, C=30 → D=60
+    A=10, B=20, C=30 -> D=60
     """
     (pipeline_dir / "input_a.txt").write_text("10")
     (pipeline_dir / "input_b.txt").write_text("20")
     (pipeline_dir / "input_c.txt").write_text("30")
 
-    @stage(deps=["input_a.txt"], outs=["a.txt"])
-    def compute_a() -> None:
-        n = int(pathlib.Path("input_a.txt").read_text())
-        pathlib.Path("a.txt").write_text(str(n))
-
-    @stage(deps=["input_b.txt"], outs=["b.txt"])
-    def compute_b() -> None:
-        n = int(pathlib.Path("input_b.txt").read_text())
-        pathlib.Path("b.txt").write_text(str(n))
-
-    @stage(deps=["input_c.txt"], outs=["c.txt"])
-    def compute_c() -> None:
-        n = int(pathlib.Path("input_c.txt").read_text())
-        pathlib.Path("c.txt").write_text(str(n))
-
-    @stage(deps=["a.txt", "b.txt", "c.txt"], outs=["sum.txt"])
-    def compute_sum() -> None:
-        a = int(pathlib.Path("a.txt").read_text())
-        b = int(pathlib.Path("b.txt").read_text())
-        c = int(pathlib.Path("c.txt").read_text())
-        pathlib.Path("sum.txt").write_text(str(a + b + c))
+    register_test_stage(_fanin2_compute_a, name="compute_a")
+    register_test_stage(_fanin2_compute_b, name="compute_b")
+    register_test_stage(_fanin2_compute_c, name="compute_c")
+    register_test_stage(_fanin2_compute_sum, name="compute_sum")
 
     executor.run()
 
@@ -558,49 +1081,12 @@ def test_complex_dag_tree_then_diamond(pipeline_dir: pathlib.Path) -> None:
     log_file = pipeline_dir / "execution_log.txt"
     log_file.write_text("")
 
-    @stage(deps=["input.txt"], outs=["a.txt"])
-    def stage_a() -> None:
-        with open("execution_log.txt", "a") as f:
-            f.write("a\n")
-        pathlib.Path("a.txt").write_text("A")
-
-    @stage(deps=["a.txt"], outs=["b.txt"])
-    def stage_b() -> None:
-        with open("execution_log.txt", "a") as f:
-            f.write("b\n")
-        assert pathlib.Path("a.txt").read_text() == "A"
-        pathlib.Path("b.txt").write_text("B")
-
-    @stage(deps=["a.txt"], outs=["c.txt"])
-    def stage_c() -> None:
-        with open("execution_log.txt", "a") as f:
-            f.write("c\n")
-        assert pathlib.Path("a.txt").read_text() == "A"
-        pathlib.Path("c.txt").write_text("C")
-
-    @stage(deps=["b.txt"], outs=["d.txt"])
-    def stage_d() -> None:
-        with open("execution_log.txt", "a") as f:
-            f.write("d\n")
-        assert pathlib.Path("b.txt").read_text() == "B"
-        pathlib.Path("d.txt").write_text("D")
-
-    @stage(deps=["c.txt"], outs=["e.txt"])
-    def stage_e() -> None:
-        with open("execution_log.txt", "a") as f:
-            f.write("e\n")
-        assert pathlib.Path("c.txt").read_text() == "C"
-        pathlib.Path("e.txt").write_text("E")
-
-    @stage(deps=["d.txt", "e.txt"], outs=["f.txt"])
-    def stage_f() -> None:
-        with open("execution_log.txt", "a") as f:
-            f.write("f\n")
-        d = pathlib.Path("d.txt").read_text()
-        e = pathlib.Path("e.txt").read_text()
-        assert d == "D", "stage_d must run before stage_f"
-        assert e == "E", "stage_e must run before stage_f"
-        pathlib.Path("f.txt").write_text(f"F({d},{e})")
+    register_test_stage(_complex1_stage_a, name="stage_a")
+    register_test_stage(_complex1_stage_b, name="stage_b")
+    register_test_stage(_complex1_stage_c, name="stage_c")
+    register_test_stage(_complex1_stage_d, name="stage_d")
+    register_test_stage(_complex1_stage_e, name="stage_e")
+    register_test_stage(_complex1_stage_f, name="stage_f")
 
     executor.run()
 
@@ -637,61 +1123,14 @@ def test_complex_dag_multiple_diamonds(pipeline_dir: pathlib.Path) -> None:
     log_file = pipeline_dir / "execution_log.txt"
     log_file.write_text("")
 
-    @stage(deps=["input.txt"], outs=["a.txt"])
-    def root_a() -> None:
-        with open("execution_log.txt", "a") as f:
-            f.write("a\n")
-        pathlib.Path("a.txt").write_text("1")
-
-    @stage(deps=["a.txt"], outs=["b.txt"])
-    def mid_b() -> None:
-        with open("execution_log.txt", "a") as f:
-            f.write("b\n")
-        pathlib.Path("b.txt").write_text("B")
-
-    @stage(deps=["a.txt"], outs=["c.txt"])
-    def mid_c() -> None:
-        with open("execution_log.txt", "a") as f:
-            f.write("c\n")
-        pathlib.Path("c.txt").write_text("C")
-
-    @stage(deps=["a.txt"], outs=["d.txt"])
-    def mid_d() -> None:
-        with open("execution_log.txt", "a") as f:
-            f.write("d\n")
-        pathlib.Path("d.txt").write_text("D")
-
-    @stage(deps=["b.txt", "c.txt"], outs=["e.txt"])
-    def lower_e() -> None:
-        with open("execution_log.txt", "a") as f:
-            f.write("e\n")
-        b = pathlib.Path("b.txt").read_text()
-        c = pathlib.Path("c.txt").read_text()
-        pathlib.Path("e.txt").write_text(f"E({b}{c})")
-
-    @stage(deps=["c.txt", "d.txt"], outs=["f.txt"])
-    def lower_f() -> None:
-        with open("execution_log.txt", "a") as f:
-            f.write("f\n")
-        c = pathlib.Path("c.txt").read_text()
-        d = pathlib.Path("d.txt").read_text()
-        pathlib.Path("f.txt").write_text(f"F({c}{d})")
-
-    @stage(deps=["d.txt"], outs=["g.txt"])
-    def lower_g() -> None:
-        with open("execution_log.txt", "a") as f:
-            f.write("g\n")
-        d = pathlib.Path("d.txt").read_text()
-        pathlib.Path("g.txt").write_text(f"G({d})")
-
-    @stage(deps=["e.txt", "f.txt", "g.txt"], outs=["h.txt"])
-    def final_h() -> None:
-        with open("execution_log.txt", "a") as f:
-            f.write("h\n")
-        e = pathlib.Path("e.txt").read_text()
-        f_val = pathlib.Path("f.txt").read_text()
-        g = pathlib.Path("g.txt").read_text()
-        pathlib.Path("h.txt").write_text(f"H[{e},{f_val},{g}]")
+    register_test_stage(_complex2_root_a, name="root_a")
+    register_test_stage(_complex2_mid_b, name="mid_b")
+    register_test_stage(_complex2_mid_c, name="mid_c")
+    register_test_stage(_complex2_mid_d, name="mid_d")
+    register_test_stage(_complex2_lower_e, name="lower_e")
+    register_test_stage(_complex2_lower_f, name="lower_f")
+    register_test_stage(_complex2_lower_g, name="lower_g")
+    register_test_stage(_complex2_final_h, name="final_h")
 
     executor.run()
 
@@ -728,10 +1167,7 @@ def test_single_stage_dag(pipeline_dir: pathlib.Path) -> None:
     """Single stage with no dependencies on other stages."""
     (pipeline_dir / "input.txt").write_text("DATA")
 
-    @stage(deps=["input.txt"], outs=["output.txt"])
-    def only_stage() -> None:
-        data = pathlib.Path("input.txt").read_text()
-        pathlib.Path("output.txt").write_text(f"PROCESSED:{data}")
+    register_test_stage(_single_only_stage, name="only_stage")
 
     results = executor.run()
 
@@ -742,39 +1178,18 @@ def test_single_stage_dag(pipeline_dir: pathlib.Path) -> None:
 def test_disconnected_dags(pipeline_dir: pathlib.Path) -> None:
     """Two independent pipelines in same registry.
 
-    Pipeline 1: A → B
-    Pipeline 2: X → Y (completely independent)
+    Pipeline 1: A -> B
+    Pipeline 2: X -> Y (completely independent)
     """
     (pipeline_dir / "input_a.txt").write_text("A")
     (pipeline_dir / "input_x.txt").write_text("X")
     log_file = pipeline_dir / "execution_log.txt"
     log_file.write_text("")
 
-    @stage(deps=["input_a.txt"], outs=["a.txt"])
-    def stage_a() -> None:
-        with open("execution_log.txt", "a") as f:
-            f.write("a\n")
-        pathlib.Path("a.txt").write_text("A_OUT")
-
-    @stage(deps=["a.txt"], outs=["b.txt"])
-    def stage_b() -> None:
-        with open("execution_log.txt", "a") as f:
-            f.write("b\n")
-        assert pathlib.Path("a.txt").read_text() == "A_OUT"
-        pathlib.Path("b.txt").write_text("B_OUT")
-
-    @stage(deps=["input_x.txt"], outs=["x.txt"])
-    def stage_x() -> None:
-        with open("execution_log.txt", "a") as f:
-            f.write("x\n")
-        pathlib.Path("x.txt").write_text("X_OUT")
-
-    @stage(deps=["x.txt"], outs=["y.txt"])
-    def stage_y() -> None:
-        with open("execution_log.txt", "a") as f:
-            f.write("y\n")
-        assert pathlib.Path("x.txt").read_text() == "X_OUT"
-        pathlib.Path("y.txt").write_text("Y_OUT")
+    register_test_stage(_disconn_stage_a, name="stage_a")
+    register_test_stage(_disconn_stage_b, name="stage_b")
+    register_test_stage(_disconn_stage_x, name="stage_x")
+    register_test_stage(_disconn_stage_y, name="stage_y")
 
     executor.run()
 

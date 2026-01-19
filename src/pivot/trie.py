@@ -1,7 +1,7 @@
 import pathlib
 from typing import TypedDict
 
-from pygtrie import Trie  # type: ignore[import-untyped]
+from pygtrie import Trie
 
 from pivot import exceptions
 
@@ -13,7 +13,7 @@ class TrieStageInfo(TypedDict):
     outs: list[str]
 
 
-def build_outs_trie(stages: dict[str, TrieStageInfo]) -> Trie:
+def build_outs_trie(stages: dict[str, TrieStageInfo]) -> Trie[tuple[str, str]]:
     """Build trie of output paths from stages.
 
     Args:
@@ -35,7 +35,7 @@ def build_outs_trie(stages: dict[str, TrieStageInfo]) -> Trie:
         >>> # Later, check if path overlaps with existing outputs
         >>> trie.has_subtrie(pathlib.Path('/project/data/train.csv').parts)
     """
-    outs = Trie()
+    outs: Trie[tuple[str, str]] = Trie()
 
     for stage_name, stage_info in stages.items():
         for out in stage_info["outs"]:

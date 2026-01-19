@@ -43,7 +43,7 @@ def _import_fresh(name: str) -> types.ModuleType:
     """Import module fresh, clearing any cached version."""
     if name in sys.modules:
         del sys.modules[name]
-    linecache.clearcache()  # Clear cached source (inspect.getsource uses linecache)
+    linecache.clearcache()  # Clear source cache used by inspect.getsource()
     importlib.invalidate_caches()
     return importlib.import_module(name)
 

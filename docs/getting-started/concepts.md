@@ -10,11 +10,37 @@ A **stage** is a unit of work in your pipeline. Each stage:
 - Produces **outputs** (files it writes)
 - Contains a **function** that does the actual work
 
+```yaml
+# pivot.yaml
+stages:
+  process:
+    python: stages.process
+    deps:
+      raw: input.csv
+    outs:
+      clean: output.parquet
+```
+
 ```python
-@stage(deps=['input.csv'], outs=['output.parquet'])
-def process():
-    # This function is the stage's work
-    pass
+# stages.py
+import pathlib
+from typing import Annotated, TypedDict
+
+import pandas
+from pivot import loaders, outputs
+
+
+class ProcessOutputs(TypedDict):
+    clean: Annotated[pathlib.Path, outputs.Out("output.parquet", loaders.PathOnly())]
+
+
+def process(
+    raw: Annotated[pandas.DataFrame, outputs.Dep("input.csv", loaders.CSV())],
+) -> ProcessOutputs:
+    df = raw.dropna()
+    out_path = pathlib.Path("output.parquet")
+    df.to_parquet(out_path)
+    return {"clean": out_path}
 ```
 
 ## Dependency Graph (DAG)
@@ -41,9 +67,11 @@ Pivot tracks changes to your code automatically:
 def helper(x):
     return x * 2  # Change detected!
 
-@stage(deps=['data.csv'])
-def process():
-    return helper(load_data())  # Pivot knows helper is used
+def process(
+    data: Annotated[pandas.DataFrame, outputs.Dep("input.csv", loaders.CSV())],
+) -> ProcessOutputs:
+    result = helper(data)  # Pivot knows helper is used
+    ...
 ```
 
 **How it works:**
@@ -108,29 +136,44 @@ Stages A and B run simultaneously. Stage C waits for both to complete.
 
 ## Parameters
 
-Type-safe parameters using Pydantic:
+Parameters are defined as Pydantic models:
 
 ```python
-from pydantic import BaseModel
+# stages.py
+from pivot.stage_def import StageParams
 
-class TrainParams(BaseModel):
+
+class TrainParams(StageParams):
     learning_rate: float = 0.01
     epochs: int = 100
 
-@stage(deps=['data.csv'], params=TrainParams)
-def train(params: TrainParams):
+
+def train(
+    params: TrainParams,
+    data: Annotated[pandas.DataFrame, outputs.Dep("data.csv", loaders.CSV())],
+) -> TrainOutputs:
     print(f"LR: {params.learning_rate}")
+    ...
 ```
 
-Override via `params.yaml`:
+Override defaults in YAML:
 
 ```yaml
-train:
-  learning_rate: 0.001
+# pivot.yaml
+stages:
+  train:
+    python: stages.train
+    deps:
+      data: data.csv
+    outs:
+      model: model.pkl
+    params:
+      learning_rate: 0.05
+      epochs: 200
 ```
 
 ## Next Steps
 
 - [Defining Stages](../guide/stages.md) - Deep dive into stage configuration
-- [Parameters](../guide/parameters.md) - Learn about Pydantic parameters
-- [Caching & Remote Storage](../guide/caching.md) - Share cache with your team
+- [Parameters](../guide/parameters.md) - Learn about parameters
+- [Output Types](../guide/outputs.md) - Learn about output types

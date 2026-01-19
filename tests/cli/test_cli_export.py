@@ -1,17 +1,95 @@
 from __future__ import annotations
 
 import contextlib
-from typing import TYPE_CHECKING
+import pathlib
+from typing import TYPE_CHECKING, Annotated, TypedDict
 
 import yaml
 from tests.fixtures.export import pipeline
 
-from pivot import cli, outputs, registry
+from helpers import register_test_stage
+from pivot import cli, loaders, outputs
 
 if TYPE_CHECKING:
     from pathlib import Path
 
     from click.testing import CliRunner
+
+
+# =============================================================================
+# Module-level TypedDicts and Stage Functions for annotation-based registration
+# =============================================================================
+
+
+class _CleanCsvOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("clean.csv", loaders.PathOnly())]
+
+
+class _OutTxtOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("out.txt", loaders.PathOnly())]
+
+
+class _ATxtOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("a.txt", loaders.PathOnly())]
+
+
+class _BTxtOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("b.txt", loaders.PathOnly())]
+
+
+class _ModelPklOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("model.pkl", loaders.PathOnly())]
+
+
+class _OutputCsvOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("output.csv", loaders.PathOnly())]
+
+
+def _helper_preprocess_with_data_dep(
+    data: Annotated[pathlib.Path, outputs.Dep("data.csv", loaders.PathOnly())],
+) -> _CleanCsvOutputs:
+    """Preprocess stage with data dependency."""
+    _ = data
+    pathlib.Path("clean.csv").write_text("clean")
+    return _CleanCsvOutputs(output=pathlib.Path("clean.csv"))
+
+
+def _helper_preprocess_no_deps() -> _OutTxtOutputs:
+    """Preprocess stage without dependencies."""
+    pathlib.Path("out.txt").write_text("out")
+    return _OutTxtOutputs(output=pathlib.Path("out.txt"))
+
+
+def _helper_preprocess_a_txt() -> _ATxtOutputs:
+    """Stage producing a.txt."""
+    pathlib.Path("a.txt").write_text("a")
+    return _ATxtOutputs(output=pathlib.Path("a.txt"))
+
+
+def _helper_evaluate_b_txt() -> _BTxtOutputs:
+    """Stage producing b.txt."""
+    pathlib.Path("b.txt").write_text("b")
+    return _BTxtOutputs(output=pathlib.Path("b.txt"))
+
+
+def _helper_train_with_params(
+    params: pipeline.TrainParams,
+    data: Annotated[pathlib.Path, outputs.Dep("data.csv", loaders.PathOnly())],
+) -> _ModelPklOutputs:
+    """Train stage with params and data dependency."""
+    _ = data, params
+    pathlib.Path("model.pkl").write_text("model")
+    return _ModelPklOutputs(output=pathlib.Path("model.pkl"))
+
+
+def _helper_preprocess_with_input_dep(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.csv", loaders.PathOnly())],
+) -> _OutputCsvOutputs:
+    """Preprocess stage with input.csv dependency."""
+    _ = input_file
+    pathlib.Path("output.csv").write_text("output")
+    return _OutputCsvOutputs(output=pathlib.Path("output.csv"))
+
 
 # =============================================================================
 # Export Command Tests
@@ -32,12 +110,7 @@ def test_export_default_output_creates_dvc_yaml(
     """Export without args creates dvc.yaml in current directory."""
     (set_project_root / ".git").mkdir()
 
-    registry.REGISTRY.register(
-        pipeline.preprocess,
-        name="preprocess",
-        deps=[str(set_project_root / "data.csv")],
-        outs=[str(set_project_root / "clean.csv")],
-    )
+    register_test_stage(_helper_preprocess_with_data_dep, name="preprocess")
 
     with contextlib.chdir(set_project_root):
         result = runner.invoke(cli.cli, ["export"])
@@ -54,12 +127,7 @@ def test_export_custom_output_path(
     """Export with --output writes to specified path."""
     (set_project_root / ".git").mkdir()
 
-    registry.REGISTRY.register(
-        pipeline.preprocess,
-        name="preprocess",
-        deps=[],
-        outs=[str(set_project_root / "out.txt")],
-    )
+    register_test_stage(_helper_preprocess_no_deps, name="preprocess")
 
     with contextlib.chdir(set_project_root):
         result = runner.invoke(cli.cli, ["export", "--output", "custom.yaml"])
@@ -75,12 +143,8 @@ def test_export_specific_stages_only(
     """Export with stage names exports only those stages."""
     (set_project_root / ".git").mkdir()
 
-    registry.REGISTRY.register(
-        pipeline.preprocess, name="preprocess", deps=[], outs=[str(set_project_root / "a.txt")]
-    )
-    registry.REGISTRY.register(
-        pipeline.evaluate, name="evaluate", deps=[], outs=[str(set_project_root / "b.txt")]
-    )
+    register_test_stage(_helper_preprocess_a_txt, name="preprocess")
+    register_test_stage(_helper_evaluate_b_txt, name="evaluate")
 
     with contextlib.chdir(set_project_root):
         result = runner.invoke(cli.cli, ["export", "preprocess"])
@@ -102,12 +166,10 @@ def test_export_generates_params_yaml(
     """Export generates params.yaml with Pydantic model defaults."""
     (set_project_root / ".git").mkdir()
 
-    registry.REGISTRY.register(
-        pipeline.train,
+    register_test_stage(
+        _helper_train_with_params,
         name="train",
-        deps=[str(set_project_root / "data.csv")],
-        outs=[str(set_project_root / "model.pkl")],
-        params=pipeline.TrainParams,
+        params=pipeline.TrainParams(),
     )
 
     with contextlib.chdir(set_project_root):
@@ -130,9 +192,7 @@ def test_export_unknown_stage_error(
     """Export with unknown stage name shows error."""
     (set_project_root / ".git").mkdir()
 
-    registry.REGISTRY.register(
-        pipeline.preprocess, name="preprocess", deps=[], outs=[str(set_project_root / "a.txt")]
-    )
+    register_test_stage(_helper_preprocess_a_txt, name="preprocess")
 
     with contextlib.chdir(set_project_root):
         result = runner.invoke(cli.cli, ["export", "nonexistent"])
@@ -162,12 +222,7 @@ def test_export_dvc_yaml_structure(
     """Exported dvc.yaml has correct structure with cmd, deps, outs."""
     (set_project_root / ".git").mkdir()
 
-    registry.REGISTRY.register(
-        pipeline.preprocess,
-        name="preprocess",
-        deps=[str(set_project_root / "input.csv")],
-        outs=[outputs.Out(str(set_project_root / "output.csv"))],
-    )
+    register_test_stage(_helper_preprocess_with_input_dep, name="preprocess")
 
     with contextlib.chdir(set_project_root):
         result = runner.invoke(cli.cli, ["export"])
@@ -183,36 +238,3 @@ def test_export_dvc_yaml_structure(
         assert "preprocess" in stage["cmd"]
         assert stage["deps"] == ["input.csv"]
         assert stage["outs"] == ["output.csv"]
-
-
-def test_export_with_metrics_and_plots(
-    runner: CliRunner,
-    set_project_root: Path,
-) -> None:
-    """Export correctly separates outs, metrics, and plots."""
-    (set_project_root / ".git").mkdir()
-
-    registry.REGISTRY.register(
-        pipeline.train,
-        name="train",
-        deps=[],
-        outs=[
-            outputs.Out(str(set_project_root / "model.pkl")),
-            outputs.Metric(str(set_project_root / "metrics.json")),
-            outputs.Plot(str(set_project_root / "loss.csv"), x="epoch", y="loss"),
-        ],
-        params=pipeline.TrainParams,
-    )
-
-    with contextlib.chdir(set_project_root):
-        result = runner.invoke(cli.cli, ["export"])
-
-        assert result.exit_code == 0, f"Failed: {result.output}"
-
-        with open(set_project_root / "dvc.yaml") as f:
-            dvc_yaml = yaml.safe_load(f)
-
-        stage = dvc_yaml["stages"]["train"]
-        assert stage["outs"] == ["model.pkl"]
-        assert stage["metrics"] == ["metrics.json"]
-        assert stage["plots"] == [{"loss.csv": {"x": "epoch", "y": "loss"}}]

@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
-from pivot import outputs, project, run_history, watch
+from pivot import loaders, outputs, project, run_history, watch
 from pivot.executor import commit as commit_mod
 from pivot.executor import worker
 from pivot.storage import lock, state
@@ -72,6 +72,8 @@ def _make_stage_info(
         force=force,
         no_commit=no_commit,
         no_cache=no_cache,
+        dep_specs={},
+        out_path_overrides=None,
     )
 
 
@@ -93,7 +95,7 @@ def test_no_commit_writes_to_pending_lock(
         stage_func,
         tmp_path,
         deps=[str(tmp_path / "input.txt")],
-        outs=[outputs.Out("output.txt")],
+        outs=[outputs.Out("output.txt", loader=loaders.PathOnly())],
         no_commit=True,
     )
 
@@ -125,7 +127,7 @@ def test_no_commit_still_writes_to_cache(
         stage_func,
         tmp_path,
         deps=[str(tmp_path / "input.txt")],
-        outs=[outputs.Out("output.txt")],
+        outs=[outputs.Out("output.txt", loader=loaders.PathOnly())],
         no_commit=True,
     )
 
@@ -153,7 +155,7 @@ def test_second_no_commit_run_uses_pending_lock_for_skip(
         stage_func,
         tmp_path,
         deps=[str(tmp_path / "input.txt")],
-        outs=[outputs.Out("output.txt")],
+        outs=[outputs.Out("output.txt", loader=loaders.PathOnly())],
         no_commit=True,
     )
 
@@ -207,7 +209,7 @@ def test_commit_pending_promotes_to_production(
         stage_func,
         tmp_path,
         deps=[str(tmp_path / "input.txt")],
-        outs=[outputs.Out("output.txt")],
+        outs=[outputs.Out("output.txt", loader=loaders.PathOnly())],
         no_commit=True,
     )
 
@@ -244,7 +246,7 @@ def test_discard_pending_removes_pending_locks(
         stage_func,
         tmp_path,
         deps=[str(tmp_path / "input.txt")],
-        outs=[outputs.Out("output.txt")],
+        outs=[outputs.Out("output.txt", loader=loaders.PathOnly())],
         no_commit=True,
     )
 
@@ -309,7 +311,7 @@ def test_commit_records_generation_at_execution_time(
         stage_func,
         tmp_path,
         deps=[str(tmp_path / "input.txt")],
-        outs=[outputs.Out("output.txt")],
+        outs=[outputs.Out("output.txt", loader=loaders.PathOnly())],
         no_commit=True,
     )
 
@@ -461,7 +463,7 @@ def test_no_cache_skips_cache_operations(
         stage_func,
         tmp_path,
         deps=[str(tmp_path / "input.txt")],
-        outs=[outputs.Out("output.txt")],
+        outs=[outputs.Out("output.txt", loader=loaders.PathOnly())],
         no_cache=True,
     )
 
@@ -491,7 +493,7 @@ def test_no_cache_writes_lock_with_null_hashes(
         stage_func,
         tmp_path,
         deps=[str(tmp_path / "input.txt")],
-        outs=[outputs.Out("output.txt")],
+        outs=[outputs.Out("output.txt", loader=loaders.PathOnly())],
         no_cache=True,
     )
 
@@ -526,7 +528,7 @@ def test_no_cache_second_run_still_skips(
         stage_func,
         tmp_path,
         deps=[str(tmp_path / "input.txt")],
-        outs=[outputs.Out("output.txt")],
+        outs=[outputs.Out("output.txt", loader=loaders.PathOnly())],
         no_cache=True,
     )
 
@@ -554,7 +556,7 @@ def test_no_cache_incompatible_with_incremental_out(
         stage_func,
         tmp_path,
         deps=[str(tmp_path / "input.txt")],
-        outs=[outputs.IncrementalOut("output.txt")],
+        outs=[outputs.IncrementalOut("output.txt", loader=loaders.PathOnly())],
         no_cache=True,
     )
 
@@ -577,7 +579,7 @@ def test_no_cache_with_no_commit(
         stage_func,
         tmp_path,
         deps=[str(tmp_path / "input.txt")],
-        outs=[outputs.Out("output.txt")],
+        outs=[outputs.Out("output.txt", loader=loaders.PathOnly())],
         no_cache=True,
         no_commit=True,
     )
@@ -624,7 +626,7 @@ def test_run_cache_restores_directory_output(
         stage_func,
         tmp_path,
         deps=[str(tmp_path / "input.txt")],
-        outs=[outputs.Out("output_dir/")],
+        outs=[outputs.Out("output_dir/", loader=loaders.PathOnly())],
     )
 
     # First run - should execute and write to run cache
@@ -635,7 +637,7 @@ def test_run_cache_restores_directory_output(
     # Apply deferred writes (simulating what coordinator does)
     if "deferred_writes" in result1:
         state_db_path = worker_env.parent / "state.db"
-        output_paths = [out.path for out in stage_info["outs"]]
+        output_paths = [str(out.path) for out in stage_info["outs"]]
         with state.StateDB(state_db_path) as db:
             db.apply_deferred_writes("test_stage", output_paths, result1["deferred_writes"])
 

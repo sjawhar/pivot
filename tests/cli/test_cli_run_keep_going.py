@@ -2,12 +2,95 @@ from __future__ import annotations
 
 import json
 import pathlib
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Annotated, TypedDict
 
-from pivot import cli, stage
+from helpers import register_test_stage
+from pivot import cli, loaders, outputs
 
 if TYPE_CHECKING:
     from click.testing import CliRunner
+
+
+# =============================================================================
+# Module-level stage functions for testing (required for pickling)
+# =============================================================================
+
+
+class _FailingTxtOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("failing.txt", loaders.PathOnly())]
+
+
+class _SucceedingTxtOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("succeeding.txt", loaders.PathOnly())]
+
+
+class _FirstTxtOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("first.txt", loaders.PathOnly())]
+
+
+class _SecondTxtOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("second.txt", loaders.PathOnly())]
+
+
+class _IndependentTxtOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("independent.txt", loaders.PathOnly())]
+
+
+class _OutputTxtOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
+
+
+class _DownstreamTxtOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("downstream.txt", loaders.PathOnly())]
+
+
+def _stage_failing(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _FailingTxtOutputs:
+    raise RuntimeError("Intentional failure")
+
+
+def _stage_succeeding(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _SucceedingTxtOutputs:
+    pathlib.Path("succeeding.txt").write_text("success")
+    return {"output": pathlib.Path("succeeding.txt")}
+
+
+def _stage_first_failing(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _FirstTxtOutputs:
+    raise RuntimeError("First failed")
+
+
+def _stage_second(
+    first: Annotated[pathlib.Path, outputs.Dep("first.txt", loaders.PathOnly())],
+) -> _SecondTxtOutputs:
+    _ = first
+    pathlib.Path("second.txt").write_text("should not run")
+    return {"output": pathlib.Path("second.txt")}
+
+
+def _stage_independent(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _IndependentTxtOutputs:
+    pathlib.Path("independent.txt").write_text("runs fine")
+    return {"output": pathlib.Path("independent.txt")}
+
+
+def _stage_downstream(
+    failing: Annotated[pathlib.Path, outputs.Dep("failing.txt", loaders.PathOnly())],
+) -> _DownstreamTxtOutputs:
+    _ = failing
+    pathlib.Path("downstream.txt").write_text("ran")
+    return {"output": pathlib.Path("downstream.txt")}
+
+
+def _stage_process(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _OutputTxtOutputs:
+    pathlib.Path("output.txt").write_text("processed")
+    return {"output": pathlib.Path("output.txt")}
 
 
 # =============================================================================
@@ -21,13 +104,8 @@ def test_keep_going_flag_continues_after_failure(runner: CliRunner, tmp_path: pa
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
 
-        @stage(deps=["input.txt"], outs=["failing.txt"])
-        def failing() -> None:
-            raise RuntimeError("Intentional failure")
-
-        @stage(deps=["input.txt"], outs=["succeeding.txt"])
-        def succeeding() -> None:
-            pathlib.Path("succeeding.txt").write_text("success")
+        register_test_stage(_stage_failing, name="failing")
+        register_test_stage(_stage_succeeding, name="succeeding")
 
         result = runner.invoke(cli.cli, ["run", "--keep-going"])
 
@@ -43,17 +121,9 @@ def test_keep_going_flag_skips_downstream(runner: CliRunner, tmp_path: pathlib.P
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
 
-        @stage(deps=["input.txt"], outs=["first.txt"])
-        def first() -> None:
-            raise RuntimeError("First failed")
-
-        @stage(deps=["first.txt"], outs=["second.txt"])
-        def second() -> None:
-            pathlib.Path("second.txt").write_text("should not run")
-
-        @stage(deps=["input.txt"], outs=["independent.txt"])
-        def independent() -> None:
-            pathlib.Path("independent.txt").write_text("runs fine")
+        register_test_stage(_stage_first_failing, name="first")
+        register_test_stage(_stage_second, name="second")
+        register_test_stage(_stage_independent, name="independent")
 
         result = runner.invoke(cli.cli, ["run", "--keep-going"])
 
@@ -70,13 +140,8 @@ def test_keep_going_short_flag(runner: CliRunner, tmp_path: pathlib.Path) -> Non
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
 
-        @stage(deps=["input.txt"], outs=["failing.txt"])
-        def failing() -> None:
-            raise RuntimeError("Failure")
-
-        @stage(deps=["input.txt"], outs=["succeeding.txt"])
-        def succeeding() -> None:
-            pathlib.Path("succeeding.txt").write_text("ok")
+        register_test_stage(_stage_failing, name="failing")
+        register_test_stage(_stage_succeeding, name="succeeding")
 
         result = runner.invoke(cli.cli, ["run", "-k"])
 
@@ -93,13 +158,8 @@ def test_without_keep_going_stops_on_failure(runner: CliRunner, tmp_path: pathli
 
         # Use dependent stages to test deterministically:
         # failing runs first, downstream depends on its output
-        @stage(deps=["input.txt"], outs=["failing.txt"])
-        def failing() -> None:
-            raise RuntimeError("Intentional failure")
-
-        @stage(deps=["failing.txt"], outs=["downstream.txt"])
-        def downstream() -> None:
-            pathlib.Path("downstream.txt").write_text("ran")
+        register_test_stage(_stage_failing, name="failing")
+        register_test_stage(_stage_downstream, name="downstream")
 
         result = runner.invoke(cli.cli, ["run"])
 
@@ -125,13 +185,8 @@ def test_keep_going_with_json_output(runner: CliRunner, tmp_path: pathlib.Path) 
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
 
-        @stage(deps=["input.txt"], outs=["failing.txt"])
-        def failing() -> None:
-            raise RuntimeError("Failure")
-
-        @stage(deps=["input.txt"], outs=["succeeding.txt"])
-        def succeeding() -> None:
-            pathlib.Path("succeeding.txt").write_text("ok")
+        register_test_stage(_stage_failing, name="failing")
+        register_test_stage(_stage_succeeding, name="succeeding")
 
         result = runner.invoke(cli.cli, ["run", "--keep-going", "--json"])
 
@@ -155,9 +210,7 @@ def test_keep_going_with_dry_run(runner: CliRunner, tmp_path: pathlib.Path) -> N
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
 
-        @stage(deps=["input.txt"], outs=["output.txt"])
-        def process() -> None:
-            pathlib.Path("output.txt").write_text("processed")
+        register_test_stage(_stage_process, name="process")
 
         result = runner.invoke(cli.cli, ["run", "--keep-going", "--dry-run"])
 
@@ -174,9 +227,7 @@ def test_keep_going_with_dry_run_json(runner: CliRunner, tmp_path: pathlib.Path)
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
 
-        @stage(deps=["input.txt"], outs=["output.txt"])
-        def process() -> None:
-            pathlib.Path("output.txt").write_text("processed")
+        register_test_stage(_stage_process, name="process")
 
         result = runner.invoke(cli.cli, ["run", "--keep-going", "--dry-run", "--json"])
 

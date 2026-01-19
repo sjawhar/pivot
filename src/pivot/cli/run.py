@@ -107,7 +107,7 @@ def _get_all_explanations(
         explanation = explain.get_stage_explanation(
             stage_name,
             stage_info["fingerprint"],
-            stage_info["deps"],
+            stage_info["deps_paths"],
             stage_info["params"],
             overrides,
             resolved_cache_dir,
@@ -380,6 +380,10 @@ def run(
 
     Auto-discovers pivot.yaml or pipeline.py if no stages are registered.
     """
+    cli_ctx = cli_helpers.get_cli_context(ctx)
+    quiet = cli_ctx["quiet"]
+    show_human_output = not as_json and not quiet
+
     stages_list = cli_helpers.stages_to_list(stages)
     _validate_stages(stages_list, single_stage)
 
@@ -455,7 +459,8 @@ def run(
                     serve=serve,
                 )
             except KeyboardInterrupt:
-                click.echo("\nWatch mode stopped.")
+                if show_human_output:
+                    click.echo("\nWatch mode stopped.")
         else:
             from pivot import watch as watch_module
 
@@ -477,7 +482,7 @@ def run(
                 pass  # Normal exit via Ctrl+C
             finally:
                 engine.shutdown()
-                if not as_json:
+                if show_human_output:
                     click.echo("\nWatch mode stopped.")
         return
 
@@ -546,11 +551,12 @@ def run(
             no_commit=no_commit,
             no_cache=no_cache,
             on_error=on_error,
+            show_output=not quiet,
         )
 
-    if not results and not as_json:
+    if not results and show_human_output:
         click.echo("No stages to run")
-    elif not explain and not use_tui and not as_json and results:
+    elif not explain and not use_tui and show_human_output and results:
         _print_results(results)
 
 

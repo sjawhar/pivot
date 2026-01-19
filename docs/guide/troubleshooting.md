@@ -11,14 +11,14 @@ Is your output a visualization (chart, graph, image)?
 ├── Yes → Plot
 └── No → Is it computed numbers for tracking over time?
          ├── Yes → Metric (git-tracked JSON/YAML)
-         └── No → Out (cached, not git-tracked)
+         └── No → Regular output (cached, not git-tracked)
 ```
 
 | Type | Git-Tracked | Cached | Use Case |
 |------|-------------|--------|----------|
-| `Out` | No | Yes | Large files, intermediate data, models |
-| `Metric` | Yes | No | Accuracy, loss, F1 scores for comparison |
-| `Plot` | No | Yes | Visualizations with optional display |
+| Regular | No | Yes | Large files, intermediate data, models |
+| `metrics` | Yes | No | Accuracy, loss, F1 scores for comparison |
+| `plots` | No | Yes | Visualizations with optional display |
 
 See [Output Types](outputs.md) for detailed documentation.
 
@@ -69,7 +69,7 @@ Lock files record the fingerprint (code + params + deps + output hashes) that al
 
 ### "Stage function must be module-level"
 
-**Symptom:** Error when registering a stage.
+**Symptom:** Error when running a stage.
 
 **Cause:** Stage function is a lambda, closure, or defined in `__main__`.
 
@@ -77,11 +77,10 @@ Lock files record the fingerprint (code + params + deps + output hashes) that al
 
 ```python
 # Bad - lambda
-process = stage(deps=['x'], outs=['y'])(lambda: ...)
+process = lambda: ...
 
 # Bad - closure
 def make_stage(threshold):
-    @stage(deps=['x'], outs=['y'])
     def process():
         if value > threshold:  # Captures threshold!
             pass
@@ -89,12 +88,10 @@ def make_stage(threshold):
 
 # Bad - in __main__
 if __name__ == '__main__':
-    @stage(deps=['x'], outs=['y'])
     def my_stage():
         pass
 
 # Good - module-level function
-@stage(deps=['x'], outs=['y'])
 def process():
     pass
 ```
@@ -108,22 +105,26 @@ def process():
 **Solution:** Avoid closures; use parameters instead:
 
 ```python
-# Bad - closure captures local variable
-THRESHOLD = 0.5
+# stages.py
+from pivot.stage_def import StageParams
 
-@stage(deps=['data.csv'])
-def process():
-    if value > THRESHOLD:  # Global variable captured
-        pass
 
-# Good - use parameters
-class ProcessParams(pydantic.BaseModel):
+class ProcessParams(StageParams):
     threshold: float = 0.5
 
-@stage(deps=['data.csv'], params=ProcessParams)
+
 def process(params: ProcessParams):
     if value > params.threshold:
         pass
+```
+
+```yaml
+# pivot.yaml
+stages:
+  process:
+    python: stages.process
+    params:
+      threshold: 0.5
 ```
 
 **Why?** Pivot uses `ProcessPoolExecutor` with separate worker processes. Functions and their data must be serialized (pickled) to send to workers.
@@ -134,14 +135,38 @@ def process(params: ProcessParams):
 
 **Cause:** Output file not declared or declared incorrectly.
 
-**Solution:** Verify outputs are declared and paths match:
+**Solution:** Verify outputs are declared in the function's return type and paths match:
 
 ```python
-@stage(deps=['input.csv'], outs=['output.csv'])  # Must match actual path
-def process():
-    import pandas as pd
-    df = pd.read_csv('input.csv')
-    df.to_csv('output.csv')  # Must write to declared path
+# stages.py
+import pathlib
+from typing import Annotated, TypedDict
+
+import pandas
+from pivot import loaders, outputs
+
+
+class ProcessOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("output.csv", loaders.PathOnly())]
+
+
+def process(
+    input_data: Annotated[pandas.DataFrame, outputs.Dep("input.csv", loaders.CSV())],
+) -> ProcessOutputs:
+    out_path = pathlib.Path("output.csv")
+    input_data.to_csv(out_path)
+    return {"output": out_path}  # Must return the declared output
+```
+
+```yaml
+# pivot.yaml
+stages:
+  process:
+    python: stages.process
+    deps:
+      input_data: input.csv
+    outs:
+      output: output.csv
 ```
 
 Check that the file was actually created:
@@ -182,10 +207,13 @@ ls -la output.csv
 **Solution:**
 
 1. Verify the file is declared as a dependency:
-   ```python
-   @stage(deps=['config.yaml', 'data/'])  # Both file and directory
-   def process():
-       pass
+   ```yaml
+   stages:
+     process:
+       python: stages.process
+       deps:
+         config: config.yaml
+         data: data/
    ```
 
 2. Check that the file is within the project directory

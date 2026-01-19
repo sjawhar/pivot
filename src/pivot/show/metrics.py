@@ -128,7 +128,7 @@ def collect_metrics_from_stages() -> dict[str, dict[str, MetricData]]:
         stage_metrics = dict[str, MetricData]()
         for out in stage_info["outs"]:
             if isinstance(out, outputs.Metric):
-                path = pathlib.Path(out.path)
+                path = pathlib.Path(str(out.path))
                 if not path.exists():
                     logger.warning(f"Metric file not found: {out.path} (stage: {stage_name})")
                     continue
@@ -300,7 +300,8 @@ def get_metric_info_from_head() -> dict[str, str | None]:
             if isinstance(out, outputs.Metric):
                 if stage_name not in stage_metric_paths:
                     stage_metric_paths[stage_name] = []
-                abs_path = str(project.normalize_path(out.path))
+                # Registry always stores single-file outputs (multi-file are expanded)
+                abs_path = str(project.normalize_path(cast("str", out.path)))
                 rel_path = project.to_relative_path(abs_path, proj_root)
                 stage_metric_paths[stage_name].append(rel_path)
                 result[rel_path] = None  # Default to None

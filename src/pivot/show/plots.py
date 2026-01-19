@@ -3,7 +3,7 @@ from __future__ import annotations
 import html
 import json
 import pathlib
-from typing import TYPE_CHECKING, TypedDict
+from typing import TYPE_CHECKING, TypedDict, cast
 
 from pivot import outputs, project
 from pivot.show import common
@@ -42,9 +42,10 @@ def collect_plots_from_stages() -> list[PlotInfo]:
         info = registry.REGISTRY.get(stage_name)
         for out in info["outs"]:
             if isinstance(out, outputs.Plot):
+                # Registry always stores single-file outputs (multi-file are expanded)
                 result.append(
                     PlotInfo(
-                        path=out.path,
+                        path=str(out.path),
                         stage_name=stage_name,
                         x=out.x,
                         y=out.y,
@@ -76,7 +77,7 @@ def get_plot_hashes_from_lock(
         for out in info["outs"]:
             if isinstance(out, outputs.Plot):
                 # Normalize to absolute for lock data lookup, then convert to relative for result
-                abs_path = str(project.normalize_path(out.path))
+                abs_path = str(project.normalize_path(cast("str", out.path)))
                 rel_path = project.to_relative_path(abs_path, proj_root)
                 if lock_data and abs_path in lock_data["output_hashes"]:
                     hash_info = lock_data["output_hashes"][abs_path]
@@ -105,7 +106,7 @@ def get_plot_hashes_from_head() -> dict[str, str | None]:
             if isinstance(out, outputs.Plot):
                 if stage_name not in stage_plot_paths:
                     stage_plot_paths[stage_name] = []
-                abs_path = str(project.normalize_path(out.path))
+                abs_path = str(project.normalize_path(cast("str", out.path)))
                 rel_path = project.to_relative_path(abs_path, proj_root)
                 stage_plot_paths[stage_name].append(rel_path)
                 result[rel_path] = None  # Default to None

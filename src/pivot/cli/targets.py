@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, TypedDict
+from typing import TYPE_CHECKING, TypedDict, cast
 
 import click
 
@@ -93,7 +93,10 @@ def resolve_output_paths(
             info = registry.REGISTRY.get(item["target"])
             for out in info["outs"]:
                 if isinstance(out, output_type):
-                    rel_path = project.to_relative_path(project.normalize_path(out.path), proj_root)
+                    # Registry always stores single-file outputs (multi-file are expanded)
+                    rel_path = project.to_relative_path(
+                        project.normalize_path(cast("str", out.path)), proj_root
+                    )
                     resolved.add(rel_path)
         elif item["is_file"]:
             resolved.add(item["norm_path"])
@@ -121,10 +124,11 @@ def resolve_plot_infos(
             info = registry.REGISTRY.get(item["target"])
             for out in info["outs"]:
                 if isinstance(out, outputs.Plot):
+                    # Registry always stores single-file outputs (multi-file are expanded)
                     resolved.append(
                         plots.PlotInfo(
                             path=project.to_relative_path(
-                                project.normalize_path(out.path), proj_root
+                                project.normalize_path(cast("str", out.path)), proj_root
                             ),
                             stage_name=item["target"],
                             x=out.x,

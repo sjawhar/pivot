@@ -6,7 +6,8 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from pivot import discovery, registry
+from helpers import register_test_stage
+from pivot import discovery, outputs, registry
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -52,8 +53,9 @@ def preprocess():
 stages:
   preprocess:
     python: stages.preprocess
-    deps: []
-    outs: [output.txt]
+    deps: {}
+    outs:
+      output: output.txt
 """
     )
 
@@ -90,8 +92,9 @@ def analyze():
 stages:
   analyze:
     python: stages.analyze
-    deps: []
-    outs: [result.txt]
+    deps: {}
+    outs:
+      result: result.txt
 """
     )
 
@@ -109,17 +112,20 @@ stages:
 
 def test_discover_pipeline_py(project_root: Path) -> None:
     """discover_and_register finds and loads pipeline.py."""
-    # Create pipeline.py that registers a stage
+    # Create pipeline.py that registers a stage using annotation-based outputs
     pipeline_py = project_root / "pipeline.py"
     pipeline_py.write_text(
         """\
-from pivot import Pipeline
+import pathlib
+from typing import Annotated
+from pivot.registry import REGISTRY
+from pivot.outputs import Out
+from pivot.loaders import PathOnly
 
-def my_stage():
+def my_stage() -> Annotated[pathlib.Path, Out("output.txt", PathOnly())]:
     pass
 
-pipeline = Pipeline()
-pipeline.add_stage(my_stage, outs=['output.txt'])
+REGISTRY.register(my_stage)
 """
     )
 
@@ -147,21 +153,18 @@ def yaml_stage():
 stages:
   yaml_stage:
     python: stages.yaml_stage
-    deps: []
-    outs: [yaml_output.txt]
 """
     )
 
     pipeline_py = project_root / "pipeline.py"
     pipeline_py.write_text(
         """\
-from pivot import Pipeline
+from pivot import registry
 
 def python_stage():
     pass
 
-pipeline = Pipeline()
-pipeline.add_stage(python_stage, outs=['python_output.txt'])
+registry.REGISTRY.register(python_stage)
 """
     )
 
@@ -233,9 +236,15 @@ def test_has_registered_stages_true_after_registration(
     project_root: Path,
 ) -> None:
     """has_registered_stages returns True after stage registration."""
+    import pathlib as pathlib_module
+    from typing import Annotated
 
-    def test_stage() -> None:
-        pass
+    from pivot import loaders
 
-    registry.REGISTRY.register(test_stage, name="test", deps=[], outs=[])
+    def test_stage() -> Annotated[
+        pathlib_module.Path, outputs.Out("test_output.txt", loaders.PathOnly())
+    ]:
+        return pathlib_module.Path("test_output.txt")
+
+    register_test_stage(test_stage, name="test")
     assert discovery.has_registered_stages() is True

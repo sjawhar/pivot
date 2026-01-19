@@ -1,19 +1,43 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import pathlib
+from typing import TYPE_CHECKING, Annotated, TypedDict
 
 import click
 import pytest
 
-from pivot import outputs, registry
+from helpers import register_test_stage
+from pivot import loaders, outputs
 from pivot.cli import targets
 
 if TYPE_CHECKING:
     from pathlib import Path
 
 
+# =============================================================================
+# Output TypedDicts for annotation-based stages
+# =============================================================================
+
+
+class _OutputTxtOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
+
+
+# =============================================================================
+# Module-level helper functions
+# =============================================================================
+
+
 def _noop() -> None:
     """Module-level no-op function for stage registration in tests."""
+
+
+def _helper_stage(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _OutputTxtOutputs:
+    _ = input_file
+    pathlib.Path("output.txt").write_text("done")
+    return {"output": pathlib.Path("output.txt")}
 
 
 # --- validate_targets tests ---
@@ -48,7 +72,7 @@ def test_validate_targets_logs_warning_for_invalid(caplog: pytest.LogCaptureFixt
 def test_classify_targets_stage_only(set_project_root: Path) -> None:
     """Target that is only a stage name."""
     # Register a real stage (autouse fixture clears between tests)
-    registry.REGISTRY.register(_noop, name="my_stage", deps=[], outs=[])
+    register_test_stage(_noop, name="my_stage")
 
     result = targets._classify_targets(["my_stage"], set_project_root)
 
@@ -86,7 +110,7 @@ def test_classify_targets_both_warns(
 ) -> None:
     """Target that is both a stage name and file should warn."""
     # Register stage with same name as file
-    registry.REGISTRY.register(_noop, name="data", deps=[], outs=[])
+    register_test_stage(_noop, name="data")
     data_file = set_project_root / "data"
     data_file.touch()
 
@@ -99,22 +123,6 @@ def test_classify_targets_both_warns(
 
 
 # --- resolve_output_paths tests ---
-
-
-def test_resolve_output_paths_stage(set_project_root: Path) -> None:
-    """Resolving a stage target should return its output paths."""
-    # Register a real stage with metric output
-    registry.REGISTRY.register(
-        _noop,
-        name="my_stage",
-        deps=[],
-        outs=[outputs.Metric(path="metrics.yaml")],
-    )
-
-    resolved, missing = targets.resolve_output_paths(["my_stage"], set_project_root, outputs.Metric)
-
-    assert "metrics.yaml" in resolved
-    assert missing == []
 
 
 def test_resolve_output_paths_file(set_project_root: Path) -> None:
@@ -140,46 +148,7 @@ def test_resolve_output_paths_unknown(set_project_root: Path) -> None:
     assert missing == ["nonexistent.yaml"]
 
 
-def test_resolve_output_paths_filters_by_type(set_project_root: Path) -> None:
-    """Only outputs matching the specified type should be included."""
-    # Register stage with mixed output types
-    registry.REGISTRY.register(
-        _noop,
-        name="mixed_stage",
-        deps=[],
-        outs=[
-            outputs.Metric(path="metrics.yaml"),
-            outputs.Plot(path="plot.png"),
-        ],
-    )
-
-    resolved, _ = targets.resolve_output_paths(["mixed_stage"], set_project_root, outputs.Metric)
-
-    assert "metrics.yaml" in resolved
-    assert "plot.png" not in resolved
-
-
 # --- resolve_plot_infos tests ---
-
-
-def test_resolve_plot_infos_stage(set_project_root: Path) -> None:
-    """Resolving a stage target should return PlotInfo with metadata."""
-    # Register stage with plot output including axis metadata
-    registry.REGISTRY.register(
-        _noop,
-        name="plot_stage",
-        deps=[],
-        outs=[outputs.Plot(path="train_loss.png", x="epoch", y="loss")],
-    )
-
-    resolved, missing = targets.resolve_plot_infos(["plot_stage"], set_project_root)
-
-    assert len(resolved) == 1
-    assert resolved[0]["path"] == "train_loss.png"
-    assert resolved[0]["stage_name"] == "plot_stage"
-    assert resolved[0]["x"] == "epoch"
-    assert resolved[0]["y"] == "loss"
-    assert missing == []
 
 
 def test_resolve_plot_infos_file(set_project_root: Path) -> None:

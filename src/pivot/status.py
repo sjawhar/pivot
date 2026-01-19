@@ -53,7 +53,7 @@ def get_pipeline_status(
         explanation = explain.get_stage_explanation(
             stage_name,
             stage_info["fingerprint"],
-            stage_info["deps"],
+            stage_info["deps_paths"],
             stage_info["params"],
             overrides,
             resolved_cache_dir,

@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any
 
 import yaml
 
-from pivot import exceptions, outputs, project, registry
+from pivot import exceptions, loaders, outputs, project, registry
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -131,7 +131,7 @@ def _build_dvc_stage(
     }
 
     # Add deps section
-    deps = [_to_relative_path(dep, root) for dep in stage_info["deps"]]
+    deps = [_to_relative_path(dep, root) for dep in stage_info["deps_paths"]]
     if deps:
         stage["deps"] = deps
 
@@ -141,7 +141,8 @@ def _build_dvc_stage(
     plots_section: list[str | dict[str, Any]] = []
 
     for out in stage_info["outs"]:
-        rel_path = _to_relative_path(out.path, root)
+        # Registry always stores single-file outputs (multi-file are expanded)
+        rel_path = _to_relative_path(str(out.path), root)
         out_entry = _build_out_entry(out, rel_path)
 
         if isinstance(out, outputs.Plot):
@@ -350,7 +351,7 @@ def _convert_dvc_output(out: DVCOutput) -> outputs.BaseOut:  # pragma: no cover
         )
     if out.metric:
         return outputs.Metric(path=path, cache=cache, persist=persist)
-    return outputs.Out(path=path, cache=cache, persist=persist)
+    return outputs.Out(path=path, loader=loaders.PathOnly(), cache=cache, persist=persist)
 
 
 def _convert_dvc_outputs(stage: PipelineStage) -> list[outputs.BaseOut]:  # pragma: no cover
@@ -394,11 +395,16 @@ def _register_imported_stage_with_name(
     wrapper.__name__ = name
     wrapper.__module__ = "pivot.dvc_compat"
 
+    # DVC compat stages use shell commands which can't have annotation-based deps/outs.
+    # Deps/outs from DVC YAML are not registered - users should migrate to Python stages.
+    if spec.deps or spec.outs:
+        logger.warning(
+            "DVC compat stage '%s' has deps/outs defined in DVC YAML. These will NOT be tracked for DAG purposes. Migrate to Python annotation-based stages for proper dependency tracking.",
+            name,
+        )
     registry.REGISTRY.register(
         wrapper,
         name=name,
-        deps=list(spec.deps),
-        outs=spec.outs,
         mutex=mutex,
         cwd=spec.cwd,
     )

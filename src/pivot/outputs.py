@@ -1,49 +1,174 @@
+from __future__ import annotations
+
 import dataclasses
+import pathlib
+from typing import TYPE_CHECKING, Any, Generic, TypeVar
+
+if TYPE_CHECKING:
+    from pivot import loaders as loaders_module
+
+T = TypeVar("T")
+
+# Path type: single string, variable-length list, or fixed-length tuple
+PathType = str | list[str] | tuple[str, ...]
+
+# JSON-serializable type for Metric
+JsonValue = dict[str, Any] | list[Any] | str | int | float | bool | None
+
+
+# Loader factory functions for dataclass defaults (defined before classes that use them)
+
+
+def _default_json_loader() -> loaders_module.Loader[JsonValue]:
+    """Factory for default Metric loader."""
+    from pivot import loaders
+
+    return loaders.JSON()
+
+
+def _default_path_only_loader() -> loaders_module.Loader[pathlib.Path]:
+    """Factory for default Plot loader."""
+    from pivot import loaders
+
+    return loaders.PathOnly()
 
 
 @dataclasses.dataclass(frozen=True)
-class BaseOut:
-    """Base class for all output types."""
+class Dep(Generic[T]):  # noqa: UP046 - basedpyright doesn't support PEP 695 syntax yet
+    """Dependency marker for Annotated type hints.
 
-    path: str
+    Use in function parameters to declare a file dependency:
+
+        def process(
+            data: Annotated[DataFrame, Dep("input.csv", CSV())],
+        ) -> ProcessOutputs:
+            return {"result": {"count": len(data)}}
+
+    For multiple files, use a list (variable-length) or tuple (fixed-length):
+
+        def process(
+            shards: Annotated[list[DataFrame], Dep(["a.csv", "b.csv"], CSV())],
+        ) -> ProcessOutputs:
+            return {"result": {"count": sum(len(df) for df in shards)}}
+
+    Testing is natural - just pass the data directly:
+
+        result = process(test_dataframe)
+    """
+
+    path: PathType
+    loader: loaders_module.Loader[T]
+
+
+@dataclasses.dataclass(frozen=True)
+class Out(Generic[T]):  # noqa: UP046 - basedpyright doesn't support PEP 695 syntax yet
+    """Unified output marker and storage.
+
+    Used both as annotation marker AND registry storage.
+
+    Use in TypedDict return type to declare file outputs:
+
+        class ProcessOutputs(TypedDict):
+            result: Annotated[dict[str, int], Out("output.json", JSON())]
+
+        def process(
+            data: Annotated[DataFrame, Dep("input.csv", CSV())],
+        ) -> ProcessOutputs:
+            return {"result": {"count": len(data)}}
+
+    For single outputs, annotate the return type directly:
+
+        def transform(
+            data: Annotated[DataFrame, Dep("input.csv", CSV())],
+        ) -> Annotated[DataFrame, Out("output.csv", CSV())]:
+            return data.dropna()
+
+    For multiple files per output key:
+
+        class ShardOutputs(TypedDict):
+            shards: Annotated[list[dict], Out(["a.json", "b.json"], JSON())]
+
+    Loader is REQUIRED to prevent type lies (e.g., Out[DataFrame] with wrong loader).
+    """
+
+    path: PathType
+    loader: loaders_module.Loader[T]
     cache: bool = True
     persist: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
-class Out(BaseOut):
-    """Regular output file (cached by default)."""
+class Metric(Out[JsonValue]):
+    """Metric output - JSON file with cache=False by default (git-tracked).
 
-    cache: bool = True
+    Default loader: JSON(). Type: any JSON-serializable value.
 
+    Use for metrics that should be version-controlled:
 
-@dataclasses.dataclass(frozen=True)
-class Metric(BaseOut):
-    """Metrics file (git-tracked by default, NOT cached)."""
+        class TrainOutputs(TypedDict):
+            metrics: Annotated[dict, Metric("metrics/train.json")]
 
+    Metrics are not cached by default (they're small and should be git-tracked).
+    """
+
+    loader: loaders_module.Loader[JsonValue] = dataclasses.field(
+        default_factory=_default_json_loader
+    )  # type: ignore[assignment]
     cache: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
-class Plot(BaseOut):
-    """Plot file with visualization options."""
+class Plot(Out[pathlib.Path]):
+    """Plot output with visualization options.
 
-    cache: bool = True
+    Default loader: PathOnly(). User creates the plot file manually.
+
+    Use for visualization outputs:
+
+        class TrainOutputs(TypedDict):
+            loss_curve: Annotated[pathlib.Path, Plot("plots/loss.png")]
+
+    Extra attributes (x, y, template) are used for DVC-compatible plot configuration.
+    """
+
+    loader: loaders_module.Loader[pathlib.Path] = dataclasses.field(
+        default_factory=_default_path_only_loader
+    )  # type: ignore[assignment]
     x: str | None = None
     y: str | None = None
     template: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
-class IncrementalOut(BaseOut):
-    """Incremental output - restored from cache before stage runs."""
+class IncrementalOut(Out[T]):
+    """Incremental output - restored from cache before stage runs.
+
+    Use for outputs that are incrementally updated across runs:
+
+        class CacheOutputs(TypedDict):
+            cache: Annotated[dict, IncrementalOut("cache.json", JSON())]
+
+    Before stage execution, previous output is restored from cache as a writable
+    copy. Stage can read, modify, and write back. Changes are re-cached after run.
+
+    Loader is REQUIRED (inherited from Out).
+    """
 
 
-type OutSpec = str | BaseOut
+# Type alias for compatibility - Out is now the base
+BaseOut = Out[Any]
+
+# Output spec can be string (converted to Out with default loader) or any Out subclass
+OutSpec = str | Out[Any]
 
 
-def normalize_out(out: OutSpec) -> BaseOut:
-    """Convert string or BaseOut subclass to BaseOut object."""
+def normalize_out(out: OutSpec) -> Out[Any]:
+    """Convert string or Out subclass to Out object.
+
+    String paths are converted to Out with PathOnly loader.
+    """
     if isinstance(out, str):
-        return Out(path=out)
+        from pivot import loaders
+
+        return Out(path=out, loader=loaders.PathOnly())
     return out

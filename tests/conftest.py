@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import importlib
+import linecache
 import logging
 import pathlib
 import subprocess
+import sys
 import tempfile
 from collections.abc import Callable
 from typing import TYPE_CHECKING
@@ -14,6 +17,11 @@ from pivot import project
 from pivot.executor import core as executor_core
 from pivot.registry import REGISTRY
 from pivot.tui import console
+
+# Add tests directory to sys.path so helpers.py can be imported
+_tests_dir = pathlib.Path(__file__).parent
+if str(_tests_dir) not in sys.path:
+    sys.path.insert(0, str(_tests_dir))
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -92,6 +100,19 @@ def git_repo(tmp_path: pathlib.Path) -> GitRepo:
         return result.stdout.strip()
 
     return tmp_path, commit
+
+
+@pytest.fixture(scope="session", autouse=True)
+def clear_source_caches() -> Generator[None]:
+    """Clear linecache and importlib caches at session start.
+
+    This prevents stale bytecode/source cache from causing fingerprinting tests
+    to fail when source files have changed. inspect.getsource() relies on
+    linecache, which can return outdated content if not cleared.
+    """
+    linecache.clearcache()
+    importlib.invalidate_caches()
+    yield
 
 
 @pytest.fixture(scope="session", autouse=True)

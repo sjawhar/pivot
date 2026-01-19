@@ -1,7 +1,7 @@
-from pydantic import BaseModel
+from pivot import stage_def
 
 
-class TrainParams(BaseModel):
+class TrainParams(stage_def.StageParams):
     """Parameters for training stage."""
 
     learning_rate: float = 0.01

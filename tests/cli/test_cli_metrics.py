@@ -7,8 +7,7 @@ from typing import TYPE_CHECKING, cast
 import pytest
 import yaml
 
-from pivot import cli, git, outputs
-from pivot.registry import REGISTRY
+from pivot import cli, git
 
 if TYPE_CHECKING:
     import click.testing
@@ -220,13 +219,8 @@ def test_metrics_in_main_help(runner: click.testing.CliRunner) -> None:
 
 
 # =============================================================================
-# Metrics Diff Integration Tests
+# Metrics Diff Integration Tests (using explicit file targets)
 # =============================================================================
-
-
-def _helper_metrics_stage() -> None:
-    """Helper stage for metrics diff tests."""
-    pass
 
 
 @pytest.mark.parametrize(
@@ -271,29 +265,24 @@ def test_metrics_diff_integration(
     cli_args: list[str],
     test_id: str,
 ) -> None:
-    """Integration test: metrics diff with various formats and scenarios."""
+    """Integration test: metrics diff with various formats and scenarios using file targets."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
 
-        REGISTRY.register(
-            _helper_metrics_stage,
-            name="train",
-            outs=[outputs.Metric("metrics.json")],
-        )
-
-        lock_content = yaml.dump({"outs": [{"path": "metrics.json", "hash": "abc123"}]})
+        # Mock git.read_files_from_head to return HEAD version of metrics file
         mocker.patch.object(
             git,
             "read_files_from_head",
             return_value={
-                ".pivot/stages/train.lock": lock_content.encode(),
                 "metrics.json": json.dumps(head_metrics).encode(),
             },
         )
 
+        # Write workspace version of metrics file
         pathlib.Path("metrics.json").write_text(json.dumps(workspace_metrics))
 
-        result = runner.invoke(cli.cli, ["metrics", "diff", *cli_args])
+        # Use explicit file target instead of stage name
+        result = runner.invoke(cli.cli, ["metrics", "diff", *cli_args, "metrics.json"])
 
         assert result.exit_code == 0
 

@@ -2,6 +2,22 @@
 
 Complete reference for all Pivot command-line commands.
 
+## Quick Reference
+
+| Task | Command |
+|------|---------|
+| Run pipeline | `pivot run` |
+| Run specific stages | `pivot run stage1 stage2` |
+| See what would run | `pivot dry-run` |
+| Understand why stage runs | `pivot explain stage` |
+| List all stages | `pivot list` |
+| Show stage status | `pivot status` |
+| Push outputs to remote | `pivot push` |
+| Pull outputs from remote | `pivot pull` |
+| Watch for changes | `pivot run --watch` |
+
+---
+
 ## Global Options
 
 All commands support:

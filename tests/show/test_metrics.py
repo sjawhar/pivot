@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import inspect
 import json
 from typing import TYPE_CHECKING
 
 import pytest
 import yaml
 
+from pivot import outputs
+from pivot.registry import REGISTRY, RegistryStageInfo
 from pivot.show import metrics
 from pivot.types import ChangeType, OutputFormat
 
@@ -16,6 +19,38 @@ if TYPE_CHECKING:
 
     from pivot.types import MetricValue
     from tests.conftest import ValidLockContentFactory
+
+
+def _register_metric_stage(
+    name: str,
+    metric_path: str,
+) -> None:
+    """Register a test stage with a Metric output directly in the registry.
+
+    This bypasses the annotation-based registration since Metric outputs
+    can't be expressed through annotations (they require outputs.Metric).
+    """
+
+    def _stage_func() -> None:
+        pass
+
+    REGISTRY._stages[name] = RegistryStageInfo(
+        func=_stage_func,
+        name=name,
+        deps={},
+        deps_paths=[],
+        outs=[outputs.Metric(metric_path)],
+        outs_paths=[metric_path],
+        params=None,
+        mutex=[],
+        variant=None,
+        signature=inspect.signature(_stage_func),
+        fingerprint={"_code": "fake_hash"},
+        cwd=None,
+        dep_specs={},
+        out_path_overrides=None,
+    )
+
 
 # =============================================================================
 # Parsing Tests
@@ -514,14 +549,10 @@ def test_collect_metrics_from_stages_with_metric_output(
     set_project_root: Path,
 ) -> None:
     """Collect metrics from stages with Metric outputs."""
-    from pivot import outputs, stage
-
     metric_file = tmp_path / "metrics.json"
     metric_file.write_text(json.dumps({"accuracy": 0.95}))
 
-    @stage(outs=[outputs.Metric(str(metric_file))])
-    def my_stage() -> None:
-        pass
+    _register_metric_stage("my_stage", str(metric_file))
 
     result = metrics.collect_metrics_from_stages()
 
@@ -536,11 +567,7 @@ def test_collect_metrics_from_stages_missing_file(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Missing metric file logs warning and skips."""
-    from pivot import outputs, stage
-
-    @stage(outs=[outputs.Metric(str(tmp_path / "nonexistent.json"))])
-    def my_stage() -> None:
-        pass
+    _register_metric_stage("my_stage", str(tmp_path / "nonexistent.json"))
 
     result = metrics.collect_metrics_from_stages()
 
@@ -554,14 +581,10 @@ def test_collect_metrics_from_stages_parse_error(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Parse error in metric file logs warning and skips."""
-    from pivot import outputs, stage
-
     metric_file = tmp_path / "metrics.json"
     metric_file.write_text("{invalid json}")
 
-    @stage(outs=[outputs.Metric(str(metric_file))])
-    def my_stage() -> None:
-        pass
+    _register_metric_stage("my_stage", str(metric_file))
 
     result = metrics.collect_metrics_from_stages()
 
@@ -574,14 +597,10 @@ def test_collect_all_stage_metrics_flat(
     set_project_root: Path,
 ) -> None:
     """Collect and flatten metrics from all stages."""
-    from pivot import outputs, stage
-
     metric_file = tmp_path / "metrics.json"
     metric_file.write_text(json.dumps({"accuracy": 0.95}))
 
-    @stage(outs=[outputs.Metric(str(metric_file))])
-    def my_stage() -> None:
-        pass
+    _register_metric_stage("my_stage", str(metric_file))
 
     result = metrics.collect_all_stage_metrics_flat()
 
@@ -607,13 +626,11 @@ def test_get_metric_info_from_head_with_metric_stage(
     make_valid_lock_content: ValidLockContentFactory,
 ) -> None:
     """Collect metric hashes from lock files at HEAD."""
-    from pivot import git, outputs, stage
+    from pivot import git
 
     metric_file = tmp_path / "metrics.json"
 
-    @stage(outs=[outputs.Metric(str(metric_file))])
-    def my_stage() -> None:
-        pass
+    _register_metric_stage("my_stage", str(metric_file))
 
     lock_content = yaml.dump(
         make_valid_lock_content(outs=[{"path": "metrics.json", "hash": "abc123"}])
@@ -636,13 +653,11 @@ def test_get_metric_info_from_head_no_lock_file(
     mocker: MockerFixture,
 ) -> None:
     """Missing lock file returns None hash."""
-    from pivot import git, outputs, stage
+    from pivot import git
 
     metric_file = tmp_path / "metrics.json"
 
-    @stage(outs=[outputs.Metric(str(metric_file))])
-    def my_stage() -> None:
-        pass
+    _register_metric_stage("my_stage", str(metric_file))
 
     mocker.patch.object(git, "read_files_from_head", return_value={})
 
@@ -658,13 +673,11 @@ def test_get_metric_info_from_head_invalid_lock_yaml(
     mocker: MockerFixture,
 ) -> None:
     """Invalid YAML in lock file returns None hash."""
-    from pivot import git, outputs, stage
+    from pivot import git
 
     metric_file = tmp_path / "metrics.json"
 
-    @stage(outs=[outputs.Metric(str(metric_file))])
-    def my_stage() -> None:
-        pass
+    _register_metric_stage("my_stage", str(metric_file))
 
     mocker.patch.object(
         git,
@@ -684,13 +697,11 @@ def test_get_metric_info_from_head_lock_missing_outs(
     mocker: MockerFixture,
 ) -> None:
     """Lock file without 'outs' key returns None hash."""
-    from pivot import git, outputs, stage
+    from pivot import git
 
     metric_file = tmp_path / "metrics.json"
 
-    @stage(outs=[outputs.Metric(str(metric_file))])
-    def my_stage() -> None:
-        pass
+    _register_metric_stage("my_stage", str(metric_file))
 
     lock_content = yaml.dump({"deps": []})
     mocker.patch.object(
@@ -711,13 +722,11 @@ def test_get_metric_info_from_head_outs_not_list(
     mocker: MockerFixture,
 ) -> None:
     """Lock file with non-list 'outs' returns None hash."""
-    from pivot import git, outputs, stage
+    from pivot import git
 
     metric_file = tmp_path / "metrics.json"
 
-    @stage(outs=[outputs.Metric(str(metric_file))])
-    def my_stage() -> None:
-        pass
+    _register_metric_stage("my_stage", str(metric_file))
 
     lock_content = yaml.dump({"outs": "not a list"})
     mocker.patch.object(

@@ -1,16 +1,91 @@
 from __future__ import annotations
 
+import inspect
 import json
 import subprocess
 from typing import TYPE_CHECKING
 
-from pivot import outputs, registry
+from pivot import loaders, outputs
+from pivot.registry import REGISTRY, RegistryStageInfo
 from pivot.show import plots
 from pivot.storage import lock
 from pivot.types import ChangeType, LockData, OutputFormat
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+
+# =============================================================================
+# Helper to register Plot outputs
+# =============================================================================
+
+
+def _register_plot_stage(
+    name: str,
+    plot_path: str,
+    x: str | None = None,
+    y: str | None = None,
+    template: str | None = None,
+) -> None:
+    """Register a test stage with a Plot output directly in the registry.
+
+    This bypasses the annotation-based registration since Plot outputs
+    can't be expressed through annotations (they require outputs.Plot).
+    """
+
+    def _stage_func() -> None:
+        pass
+
+    REGISTRY._stages[name] = RegistryStageInfo(
+        func=_stage_func,
+        name=name,
+        deps={},
+        deps_paths=[],
+        outs=[outputs.Plot(path=plot_path, x=x, y=y, template=template)],
+        outs_paths=[plot_path],
+        params=None,
+        mutex=[],
+        variant=None,
+        signature=inspect.signature(_stage_func),
+        fingerprint={"_code": "fake_hash"},
+        cwd=None,
+        dep_specs={},
+        out_path_overrides=None,
+    )
+
+
+def _register_mixed_output_stage(
+    name: str,
+    out_path: str,
+    metric_path: str,
+    plot_path: str,
+) -> None:
+    """Register a test stage with Out, Metric, and Plot outputs."""
+
+    def _stage_func() -> None:
+        pass
+
+    REGISTRY._stages[name] = RegistryStageInfo(
+        func=_stage_func,
+        name=name,
+        deps={},
+        deps_paths=[],
+        outs=[
+            outputs.Out(path=out_path, loader=loaders.PathOnly()),
+            outputs.Metric(path=metric_path),
+            outputs.Plot(path=plot_path),
+        ],
+        outs_paths=[out_path, metric_path, plot_path],
+        params=None,
+        mutex=[],
+        variant=None,
+        signature=inspect.signature(_stage_func),
+        fingerprint={"_code": "fake_hash"},
+        cwd=None,
+        dep_specs={},
+        out_path_overrides=None,
+    )
+
 
 # =============================================================================
 # collect_plots_from_stages Tests
@@ -29,14 +104,7 @@ def test_collect_plots_from_stages_finds_plots(set_project_root: Path) -> None:
     plot_path = set_project_root / "plot.png"
     plot_path.write_bytes(b"data")
 
-    def _stage_with_plot() -> None:
-        pass
-
-    registry.REGISTRY.register(
-        _stage_with_plot,
-        name="my_stage",
-        outs=[outputs.Plot(path=str(plot_path), x="epoch", y="loss")],
-    )
+    _register_plot_stage("my_stage", str(plot_path), x="epoch", y="loss")
 
     result = plots.collect_plots_from_stages()
 
@@ -55,17 +123,11 @@ def test_collect_plots_from_stages_ignores_non_plots(set_project_root: Path) -> 
     metric_file.write_text("{}")
     plot_file.write_bytes(b"png")
 
-    def _stage_with_mixed_outputs() -> None:
-        pass
-
-    registry.REGISTRY.register(
-        _stage_with_mixed_outputs,
-        name="mixed_stage",
-        outs=[
-            outputs.Out(path=str(out_file)),
-            outputs.Metric(path=str(metric_file)),
-            outputs.Plot(path=str(plot_file)),
-        ],
+    _register_mixed_output_stage(
+        "mixed_stage",
+        str(out_file),
+        str(metric_file),
+        str(plot_file),
     )
 
     result = plots.collect_plots_from_stages()
@@ -84,14 +146,7 @@ def test_get_plot_hashes_from_lock_no_lock_file(set_project_root: Path) -> None:
     plot_file = set_project_root / "plot.png"
     plot_file.write_bytes(b"data")
 
-    def _stage_with_plot() -> None:
-        pass
-
-    registry.REGISTRY.register(
-        _stage_with_plot,
-        name="test_stage",
-        outs=[outputs.Plot(path=str(plot_file))],
-    )
+    _register_plot_stage("test_stage", str(plot_file))
 
     result = plots.get_plot_hashes_from_lock()
 
@@ -105,14 +160,7 @@ def test_get_plot_hashes_from_lock_with_hash(set_project_root: Path) -> None:
     plot_file = set_project_root / "plot.png"
     plot_file.write_bytes(b"data")
 
-    def _stage_with_plot() -> None:
-        pass
-
-    registry.REGISTRY.register(
-        _stage_with_plot,
-        name="test_stage",
-        outs=[outputs.Plot(path=str(plot_file))],
-    )
+    _register_plot_stage("test_stage", str(plot_file))
 
     # Create lock file with hash
     cache_dir = set_project_root / ".pivot" / "cache"
@@ -140,14 +188,7 @@ def test_get_plot_hashes_from_lock_with_none_hash(set_project_root: Path) -> Non
     plot_file = set_project_root / "plot.png"
     plot_file.write_bytes(b"data")
 
-    def _stage_with_plot() -> None:
-        pass
-
-    registry.REGISTRY.register(
-        _stage_with_plot,
-        name="test_stage",
-        outs=[outputs.Plot(path=str(plot_file))],
-    )
+    _register_plot_stage("test_stage", str(plot_file))
 
     # Create lock file with None hash (uncached output)
     cache_dir = set_project_root / ".pivot" / "cache"
@@ -197,14 +238,7 @@ def test_get_plot_hashes_from_head_no_git_repo(set_project_root: Path) -> None:
     plot_file = set_project_root / "plot.png"
     plot_file.write_bytes(b"data")
 
-    def _stage_with_plot() -> None:
-        pass
-
-    registry.REGISTRY.register(
-        _stage_with_plot,
-        name="test_stage",
-        outs=[outputs.Plot(path=str(plot_file))],
-    )
+    _register_plot_stage("test_stage", str(plot_file))
 
     result = plots.get_plot_hashes_from_head()
 
@@ -222,14 +256,7 @@ def test_get_plot_hashes_from_head_returns_committed_hash(
     plot_file = set_project_root / "plot.png"
     plot_file.write_bytes(b"data")
 
-    def _stage_with_plot() -> None:
-        pass
-
-    registry.REGISTRY.register(
-        _stage_with_plot,
-        name="test_stage",
-        outs=[outputs.Plot(path=str(plot_file))],
-    )
+    _register_plot_stage("test_stage", str(plot_file))
 
     # Create and commit lock file with hash
     cache_dir = set_project_root / ".pivot" / "cache"
@@ -268,14 +295,7 @@ def test_get_plot_hashes_from_head_ignores_uncommitted_changes(
     plot_file = set_project_root / "plot.png"
     plot_file.write_bytes(b"data")
 
-    def _stage_with_plot() -> None:
-        pass
-
-    registry.REGISTRY.register(
-        _stage_with_plot,
-        name="test_stage",
-        outs=[outputs.Plot(path=str(plot_file))],
-    )
+    _register_plot_stage("test_stage", str(plot_file))
 
     # Create and commit lock file with original hash
     cache_dir = set_project_root / ".pivot" / "cache"
@@ -333,14 +353,7 @@ def test_get_plot_hashes_from_head_no_lock_in_head(set_project_root: Path) -> No
         capture_output=True,
     )
 
-    def _stage_with_plot() -> None:
-        pass
-
-    registry.REGISTRY.register(
-        _stage_with_plot,
-        name="test_stage",
-        outs=[outputs.Plot(path=str(plot_file))],
-    )
+    _register_plot_stage("test_stage", str(plot_file))
 
     result = plots.get_plot_hashes_from_head()
 

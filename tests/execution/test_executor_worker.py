@@ -2,15 +2,14 @@
 from __future__ import annotations
 
 import contextlib
+import inspect
 import io
 import multiprocessing as mp
 import os
 import pathlib
 import sys
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
-import pandas  # noqa: TC002 - needed at runtime for StageDef type hint resolution
-import pydantic
 import pytest
 
 from pivot import exceptions, executor, loaders, outputs, stage_def
@@ -24,30 +23,8 @@ if TYPE_CHECKING:
     from pivot.types import DirManifestEntry, OutputMessage
 
 
-# Module-level StageDef classes for testing (required for type hint resolution)
-class _TestStageDef_Deps(stage_def.StageDef):
-    """StageDef with deps for testing."""
-
-    class deps:
-        data: loaders.CSV[pandas.DataFrame] = "input.csv"
-
-
-class _TestStageDef_Outs(stage_def.StageDef):
-    """StageDef with outs for testing."""
-
-    class outs:
-        result: loaders.JSON[dict[str, int]] = "output.json"
-
-
-class _TestStageDef_MissingDeps(stage_def.StageDef):
-    """StageDef with deps that will be missing."""
-
-    class deps:
-        data: loaders.CSV[pandas.DataFrame] = "missing.csv"
-
-
-class _PlainParams(pydantic.BaseModel):
-    """Plain Pydantic params for testing backward compatibility."""
+class _PlainParams(stage_def.StageParams):
+    """StageParams for testing parameter injection."""
 
     threshold: float = 0.5
 
@@ -61,6 +38,14 @@ def worker_env(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> pathl
     return cache_dir
 
 
+@pytest.fixture
+def output_queue() -> Generator[mp.Queue[OutputMessage]]:
+    """Shared output queue for worker tests."""
+    manager = mp.Manager()
+    yield manager.Queue()  # pyright: ignore[reportReturnType] - Manager queue is compatible
+    manager.shutdown()
+
+
 def _helper_always_fail_takeover(sentinel: pathlib.Path, stale_pid: int | None) -> bool:
     """Helper that always fails lock takeover (for testing retry exhaustion)."""
     _ = sentinel, stale_pid  # Unused
@@ -72,7 +57,9 @@ def _helper_always_fail_takeover(sentinel: pathlib.Path, stale_pid: int | None) 
 # =============================================================================
 
 
-def test_execute_stage_with_missing_deps(worker_env: pathlib.Path) -> None:
+def test_execute_stage_with_missing_deps(
+    worker_env: pathlib.Path, output_queue: mp.Queue[OutputMessage]
+) -> None:
     """Worker returns failed status when dependency files are missing."""
     stage_info: WorkerStageInfo = {
         "func": lambda: None,
@@ -89,14 +76,11 @@ def test_execute_stage_with_missing_deps(worker_env: pathlib.Path) -> None:
         "force": False,
         "no_commit": False,
         "no_cache": False,
+        "dep_specs": {},
+        "out_path_overrides": None,
     }
 
-    result = executor.execute_stage(
-        "test_stage",
-        stage_info,
-        worker_env,
-        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
-    )
+    result = executor.execute_stage("test_stage", stage_info, worker_env, output_queue)
 
     assert result["status"] == "failed"
     assert "missing deps" in result["reason"]
@@ -127,6 +111,8 @@ def test_execute_stage_with_directory_dep(worker_env: pathlib.Path, tmp_path: pa
         "force": False,
         "no_commit": False,
         "no_cache": False,
+        "dep_specs": {},
+        "out_path_overrides": None,
     }
 
     result = executor.execute_stage(
@@ -164,6 +150,8 @@ def test_execute_stage_runs_unchanged_stage(
         "force": False,
         "no_commit": False,
         "no_cache": False,
+        "dep_specs": {},
+        "out_path_overrides": None,
     }
 
     # First run - creates lock file
@@ -213,6 +201,8 @@ def test_execute_stage_reruns_when_fingerprint_changes(
         "force": False,
         "no_commit": False,
         "no_cache": False,
+        "dep_specs": {},
+        "out_path_overrides": None,
     }
 
     # First run
@@ -265,6 +255,8 @@ def test_execute_stage_handles_stage_exception(
         "force": False,
         "no_commit": False,
         "no_cache": False,
+        "dep_specs": {},
+        "out_path_overrides": None,
     }
 
     result = executor.execute_stage(
@@ -300,6 +292,8 @@ def test_execute_stage_handles_sys_exit(worker_env: pathlib.Path, tmp_path: path
         "force": False,
         "no_commit": False,
         "no_cache": False,
+        "dep_specs": {},
+        "out_path_overrides": None,
     }
 
     result = executor.execute_stage(
@@ -338,6 +332,8 @@ def test_execute_stage_handles_keyboard_interrupt(
         "force": False,
         "no_commit": False,
         "no_cache": False,
+        "dep_specs": {},
+        "out_path_overrides": None,
     }
 
     result = executor.execute_stage(
@@ -352,7 +348,7 @@ def test_execute_stage_handles_keyboard_interrupt(
 
 
 # =============================================================================
-# _run_stage_function_with_capture Tests
+# _run_stage_function_with_injection Tests
 # =============================================================================
 
 
@@ -364,7 +360,7 @@ def test_run_stage_function_captures_stdout() -> None:
         print("line2")
 
     output_lines: list[tuple[str, bool]] = []
-    worker._run_stage_function_with_capture(
+    worker._run_stage_function_with_injection(
         stage_with_output,
         "test_stage",
         mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
@@ -384,7 +380,7 @@ def test_run_stage_function_captures_stderr() -> None:
         print("error2", file=sys.stderr)
 
     output_lines: list[tuple[str, bool]] = []
-    worker._run_stage_function_with_capture(
+    worker._run_stage_function_with_injection(
         stage_with_errors,
         "test_stage",
         mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
@@ -405,7 +401,7 @@ def test_run_stage_function_captures_mixed_output() -> None:
         print("stdout2")
 
     output_lines: list[tuple[str, bool]] = []
-    worker._run_stage_function_with_capture(
+    worker._run_stage_function_with_injection(
         stage_mixed,
         "test_stage",
         mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
@@ -427,7 +423,7 @@ def test_run_stage_function_restores_streams() -> None:
         pass
 
     output_lines: list[tuple[str, bool]] = []
-    worker._run_stage_function_with_capture(
+    worker._run_stage_function_with_injection(
         noop_stage,
         "test",
         mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
@@ -448,7 +444,7 @@ def test_run_stage_function_restores_streams_on_exception() -> None:
 
     output_lines: list[tuple[str, bool]] = []
     with pytest.raises(RuntimeError):
-        worker._run_stage_function_with_capture(
+        worker._run_stage_function_with_injection(
             failing_stage,
             "test",
             mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
@@ -467,7 +463,7 @@ def test_run_stage_function_captures_partial_lines() -> None:
         sys.stdout.flush()
 
     output_lines: list[tuple[str, bool]] = []
-    worker._run_stage_function_with_capture(
+    worker._run_stage_function_with_injection(
         stage_no_newline,
         "test_stage",
         mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
@@ -667,7 +663,7 @@ def test_run_stage_function_preserves_output_on_exception() -> None:
 
     output_lines: list[tuple[str, bool]] = []
     with pytest.raises(RuntimeError):
-        worker._run_stage_function_with_capture(
+        worker._run_stage_function_with_injection(
             failing_stage,
             "test_stage",
             mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
@@ -1170,7 +1166,7 @@ def test_generation_skip_on_second_run(worker_env: pathlib.Path, tmp_path: pathl
     def stage_func() -> None:
         (tmp_path / "output.txt").write_text("result")
 
-    out = outputs.Out(str(tmp_path / "output.txt"))
+    out = outputs.Out(str(tmp_path / "output.txt"), loader=loaders.PathOnly())
     stage_info: WorkerStageInfo = {
         "func": stage_func,
         "fingerprint": {"self:stage_func": "fp123"},
@@ -1186,6 +1182,8 @@ def test_generation_skip_on_second_run(worker_env: pathlib.Path, tmp_path: pathl
         "force": False,
         "no_commit": False,
         "no_cache": False,
+        "dep_specs": {},
+        "out_path_overrides": None,
     }
 
     # First run - creates output and records generations
@@ -1226,8 +1224,8 @@ def test_generation_mismatch_triggers_rerun(
         data = (tmp_path / "intermediate.txt").read_text()
         (tmp_path / "final.txt").write_text(f"Final: {data}")
 
-    step1_out = outputs.Out(str(tmp_path / "intermediate.txt"))
-    step2_out = outputs.Out(str(tmp_path / "final.txt"))
+    step1_out = outputs.Out(str(tmp_path / "intermediate.txt"), loader=loaders.PathOnly())
+    step2_out = outputs.Out(str(tmp_path / "final.txt"), loader=loaders.PathOnly())
 
     step1_info: WorkerStageInfo = {
         "func": step1_func,
@@ -1244,6 +1242,8 @@ def test_generation_mismatch_triggers_rerun(
         "force": False,
         "no_commit": False,
         "no_cache": False,
+        "dep_specs": {},
+        "out_path_overrides": None,
     }
 
     step2_info: WorkerStageInfo = {
@@ -1261,6 +1261,8 @@ def test_generation_mismatch_triggers_rerun(
         "force": False,
         "no_commit": False,
         "no_cache": False,
+        "dep_specs": {},
+        "out_path_overrides": None,
     }
 
     # First run - both stages execute
@@ -1329,7 +1331,7 @@ def test_external_file_fallback_to_hash_check(
         data = (tmp_path / "external_data.txt").read_text()
         (tmp_path / "output.txt").write_text(data.upper())
 
-    out = outputs.Out(str(tmp_path / "output.txt"))
+    out = outputs.Out(str(tmp_path / "output.txt"), loader=loaders.PathOnly())
     stage_info: WorkerStageInfo = {
         "func": stage_func,
         "fingerprint": {"self:stage_func": "fp123"},
@@ -1345,6 +1347,8 @@ def test_external_file_fallback_to_hash_check(
         "force": False,
         "no_commit": False,
         "no_cache": False,
+        "dep_specs": {},
+        "out_path_overrides": None,
     }
 
     # First run
@@ -1383,7 +1387,7 @@ def test_deps_list_change_triggers_rerun(worker_env: pathlib.Path, tmp_path: pat
 
     Generation tracking only checks current deps, so removing a dep from the list
     could cause incorrect skips. This is mitigated because:
-    1. In real usage, deps come from @stage decorator which affects fingerprint
+    1. In real usage, deps come from pivot.yaml which affects fingerprint
     2. The hash-based fallback compares full dep_hashes dict which catches changes
 
     This test verifies the hash-based fallback catches deps list changes.
@@ -1394,7 +1398,7 @@ def test_deps_list_change_triggers_rerun(worker_env: pathlib.Path, tmp_path: pat
     def stage_func() -> None:
         (tmp_path / "output.txt").write_text("done")
 
-    out = outputs.Out(str(tmp_path / "output.txt"))
+    out = outputs.Out(str(tmp_path / "output.txt"), loader=loaders.PathOnly())
 
     # First run with deps=[A, B]
     stage_info_v1: WorkerStageInfo = {
@@ -1412,6 +1416,8 @@ def test_deps_list_change_triggers_rerun(worker_env: pathlib.Path, tmp_path: pat
         "force": False,
         "no_commit": False,
         "no_cache": False,
+        "dep_specs": {},
+        "out_path_overrides": None,
     }
 
     result1 = executor.execute_stage(
@@ -1432,7 +1438,7 @@ def test_deps_list_change_triggers_rerun(worker_env: pathlib.Path, tmp_path: pat
     assert result2["status"] == "skipped"
 
     # Third run with deps=[A] only (B removed), DIFFERENT fingerprint
-    # This simulates real usage where changing @stage(deps=...) changes fingerprint
+    # This simulates real usage where changing pivot.yaml deps changes fingerprint
     stage_info_v2: WorkerStageInfo = {
         "func": stage_func,
         "fingerprint": {"self:stage": "fp2"},  # Different fingerprint
@@ -1448,6 +1454,8 @@ def test_deps_list_change_triggers_rerun(worker_env: pathlib.Path, tmp_path: pat
         "force": False,
         "no_commit": False,
         "no_cache": False,
+        "dep_specs": {},
+        "out_path_overrides": None,
     }
 
     result3 = executor.execute_stage(
@@ -1473,7 +1481,7 @@ def test_deps_list_change_same_fingerprint_detected_by_hash(
     def stage_func() -> None:
         (tmp_path / "output.txt").write_text("done")
 
-    out = outputs.Out(str(tmp_path / "output.txt"))
+    out = outputs.Out(str(tmp_path / "output.txt"), loader=loaders.PathOnly())
 
     # First run with deps=[A, B]
     stage_info_v1: WorkerStageInfo = {
@@ -1491,6 +1499,8 @@ def test_deps_list_change_same_fingerprint_detected_by_hash(
         "force": False,
         "no_commit": False,
         "no_cache": False,
+        "dep_specs": {},
+        "out_path_overrides": None,
     }
 
     result1 = executor.execute_stage(
@@ -1518,6 +1528,8 @@ def test_deps_list_change_same_fingerprint_detected_by_hash(
         "force": False,
         "no_commit": False,
         "no_cache": False,
+        "dep_specs": {},
+        "out_path_overrides": None,
     }
 
     result2 = executor.execute_stage(
@@ -1549,7 +1561,7 @@ def test_skip_acquires_execution_lock(
     def stage_func() -> None:
         (tmp_path / "output.txt").write_text("result")
 
-    out = outputs.Out(str(tmp_path / "output.txt"))
+    out = outputs.Out(str(tmp_path / "output.txt"), loader=loaders.PathOnly())
     stage_info: WorkerStageInfo = {
         "func": stage_func,
         "fingerprint": {"self:stage_func": "fp123"},
@@ -1565,6 +1577,8 @@ def test_skip_acquires_execution_lock(
         "force": False,
         "no_commit": False,
         "no_cache": False,
+        "dep_specs": {},
+        "out_path_overrides": None,
     }
 
     # First run - creates lock file and output
@@ -1617,7 +1631,7 @@ def test_restore_happens_inside_lock(
     def stage_func() -> None:
         output_path.write_text("result")
 
-    out = outputs.Out(str(output_path))
+    out = outputs.Out(str(output_path), loader=loaders.PathOnly())
     stage_info: WorkerStageInfo = {
         "func": stage_func,
         "fingerprint": {"self:stage_func": "fp123"},
@@ -1633,6 +1647,8 @@ def test_restore_happens_inside_lock(
         "force": False,
         "no_commit": False,
         "no_cache": False,
+        "dep_specs": {},
+        "out_path_overrides": None,
     }
 
     # First run - creates lock file and caches output
@@ -1683,167 +1699,6 @@ def test_restore_happens_inside_lock(
     )
 
 
-# =============================================================================
-# StageDef auto-load/save tests
-# =============================================================================
-
-
-def test_stage_def_deps_loaded_before_function(
-    worker_env: pathlib.Path, tmp_path: pathlib.Path
-) -> None:
-    """StageDef deps should be auto-loaded before the stage function runs."""
-    input_file = tmp_path / "input.csv"
-    input_file.write_text("a,b\n1,2\n3,4\n")
-
-    loaded_data: list[Any] = []
-
-    def stage_func(params: _TestStageDef_Deps) -> None:
-        loaded_data.append(params.deps.data)
-
-    stage_info: WorkerStageInfo = {
-        "func": stage_func,
-        "fingerprint": {"self:test": "abc123"},
-        "deps": [str(input_file)],
-        "signature": None,
-        "outs": [],
-        "params": _TestStageDef_Deps(),
-        "variant": None,
-        "overrides": {},
-        "cwd": None,
-        "checkout_modes": ["hardlink", "symlink", "copy"],
-        "run_id": "test_run",
-        "force": False,
-        "no_commit": False,
-        "no_cache": False,
-    }
-
-    result = executor.execute_stage(
-        "test_stage",
-        stage_info,
-        worker_env,
-        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
-    )
-
-    assert result["status"] == "ran"
-    assert len(loaded_data) == 1
-    assert hasattr(loaded_data[0], "columns")  # DataFrame
-
-
-def test_stage_def_outs_saved_after_function(
-    worker_env: pathlib.Path, tmp_path: pathlib.Path
-) -> None:
-    """StageDef outs should be auto-saved after the stage function returns."""
-    output_file = tmp_path / "output.json"
-
-    def stage_func(params: _TestStageDef_Outs) -> None:
-        params.outs.result = {"value": 42}
-
-    out_spec = outputs.Out(str(output_file))
-
-    stage_info: WorkerStageInfo = {
-        "func": stage_func,
-        "fingerprint": {"self:test": "abc123"},
-        "deps": [],
-        "signature": None,
-        "outs": [out_spec],
-        "params": _TestStageDef_Outs(),
-        "variant": None,
-        "overrides": {},
-        "cwd": None,
-        "checkout_modes": ["hardlink", "symlink", "copy"],
-        "run_id": "test_run",
-        "force": False,
-        "no_commit": False,
-        "no_cache": False,
-    }
-
-    result = executor.execute_stage(
-        "test_stage",
-        stage_info,
-        worker_env,
-        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
-    )
-
-    assert result["status"] == "ran"
-    assert output_file.exists()
-    assert "42" in output_file.read_text()
-
-
-def test_stage_def_missing_output_returns_failed(
-    worker_env: pathlib.Path, tmp_path: pathlib.Path
-) -> None:
-    """StageDef should fail if output was declared but never assigned."""
-    output_file = tmp_path / "output.json"
-
-    def stage_func(params: _TestStageDef_Outs) -> None:
-        pass  # Never assign params.outs.result
-
-    out_spec = outputs.Out(str(output_file))
-
-    stage_info: WorkerStageInfo = {
-        "func": stage_func,
-        "fingerprint": {"self:test": "abc123"},
-        "deps": [],
-        "signature": None,
-        "outs": [out_spec],
-        "params": _TestStageDef_Outs(),
-        "variant": None,
-        "overrides": {},
-        "cwd": None,
-        "checkout_modes": ["hardlink", "symlink", "copy"],
-        "run_id": "test_run",
-        "force": False,
-        "no_commit": False,
-        "no_cache": False,
-    }
-
-    result = executor.execute_stage(
-        "test_stage",
-        stage_info,
-        worker_env,
-        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
-    )
-
-    assert result["status"] == "failed"
-    assert "never assigned" in result["reason"]
-
-
-def test_stage_def_load_failure_returns_failed(
-    worker_env: pathlib.Path, tmp_path: pathlib.Path
-) -> None:
-    """StageDef should fail if deps cannot be loaded."""
-
-    def stage_func(params: _TestStageDef_MissingDeps) -> None:
-        pass
-
-    stage_info: WorkerStageInfo = {
-        "func": stage_func,
-        "fingerprint": {"self:test": "abc123"},
-        "deps": [str(tmp_path / "missing.csv")],  # File doesn't exist
-        "signature": None,
-        "outs": [],
-        "params": _TestStageDef_MissingDeps(),
-        "variant": None,
-        "overrides": {},
-        "cwd": None,
-        "checkout_modes": ["hardlink", "symlink", "copy"],
-        "run_id": "test_run",
-        "force": False,
-        "no_commit": False,
-        "no_cache": False,
-    }
-
-    result = executor.execute_stage(
-        "test_stage",
-        stage_info,
-        worker_env,
-        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
-    )
-
-    # Should fail before function runs (missing deps check)
-    assert result["status"] == "failed"
-
-
 def test_plain_params_no_auto_load_save(worker_env: pathlib.Path, tmp_path: pathlib.Path) -> None:
     """Plain Pydantic params should still work without auto-load/save."""
     output_file = tmp_path / "output.txt"
@@ -1851,13 +1706,13 @@ def test_plain_params_no_auto_load_save(worker_env: pathlib.Path, tmp_path: path
     def stage_func(params: _PlainParams) -> None:
         output_file.write_text(f"threshold: {params.threshold}")
 
-    out_spec = outputs.Out(str(output_file))
+    out_spec = outputs.Out(str(output_file), loader=loaders.PathOnly())
 
     stage_info: WorkerStageInfo = {
         "func": stage_func,
         "fingerprint": {"self:test": "abc123"},
         "deps": [],
-        "signature": None,
+        "signature": inspect.signature(stage_func),
         "outs": [out_spec],
         "params": _PlainParams(),
         "variant": None,
@@ -1868,6 +1723,8 @@ def test_plain_params_no_auto_load_save(worker_env: pathlib.Path, tmp_path: path
         "force": False,
         "no_commit": False,
         "no_cache": False,
+        "dep_specs": {},
+        "out_path_overrides": None,
     }
 
     result = executor.execute_stage(

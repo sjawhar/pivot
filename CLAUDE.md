@@ -35,13 +35,22 @@ Think **artifact-first**, not **stage-first**. The DAG emerges from artifact dep
 
 ## Stage Registration (Critical)
 
-Three pipeline definition methods—all must be handled in registry/discovery code:
+Two pipeline definition methods:
 
-1. **`pivot.yaml`** - Config file with `stages:` section (most common)
-2. **`pipeline.py`** - Python script using `@stage` decorators, executed via `runpy.run_path()`
-3. **`@stage` decorators** in importable modules - Registered on import
+1. **`pivot.yaml`** - Config file with `stages:` section pointing to Python functions (most common)
+2. **`pipeline.py`** - Python module that calls `REGISTRY.register()` directly
 
-**Discovery order:** `pivot.yaml` → `pivot.yml` → `pipeline.py` → decorator modules
+**Discovery order:** `pivot.yaml` → `pivot.yml` → `pipeline.py`
+
+Stages are pure functions with annotation-based deps/outs:
+
+```python
+def train(
+    params: TrainParams,
+    data: Annotated[DataFrame, Dep("input.csv", CSV())],
+) -> Annotated[DataFrame, Out("output.csv", CSV())]:
+    return data.dropna()
+```
 
 ## Stage Functions (Critical)
 
@@ -49,12 +58,10 @@ Must be **pure, serializable, module-level functions** for multiprocessing:
 
 ```python
 # Good - module-level, no captured variables
-@stage(deps=['data.csv'], outs=['output.csv'])
 def process_data(): ...
 
 # Bad - closure captures variable (not picklable)
 def make_stage(threshold):
-    @stage(deps=['x'], outs=['y'])
     def process():
         if value > threshold: ...  # Captures threshold!
     return process
@@ -62,9 +69,13 @@ def make_stage(threshold):
 
 Workers receive pickled functions—lambdas, closures, and `__main__` definitions fail.
 
-## StageDef Conventions
+## Annotation Conventions
 
-StageDef and custom loaders must be **module-level** (required for type hint resolution and pickling). Loader code is fingerprinted—changes trigger re-runs. StageDef stages manage their own deps/outs and cannot be overridden via decorator or YAML.
+Stage functions, output TypedDicts, and custom loaders must be **module-level** (required for type hint resolution and pickling). Loader code is fingerprinted—changes trigger re-runs.
+
+- **Dependencies**: `param: Annotated[T, Dep(path, loader)]` on function parameters
+- **Outputs**: `field: Annotated[T, Out(path, loader)]` in TypedDict return type
+- **Parameters**: `params: MyParams` where `MyParams` extends `StageParams`
 
 ## Code Quality
 
@@ -180,7 +191,9 @@ except StageNotFoundError as e:
 
 ## Input Validation
 
-Validate at boundaries, then trust downstream. Fail fast with clear errors—don't silently fix or skip invalid inputs.
+**Validate upfront, validate early.** Check all preconditions before performing any side effects. If an operation requires multiple inputs, validate them all before writing any files or making any changes. This ensures operations are atomic—either all succeed or none do.
+
+Validate at boundaries, then trust downstream. Fail fast with clear errors—don't silently fix or skip invalid inputs. Never silently ignore validation failures (typos in field names, type mismatches, missing required data).
 
 ## Simplicity Over Abstraction
 
@@ -251,4 +264,4 @@ These are recurring patterns that lead to corrections:
 11. **StateDB path strategies:** `resolve()` for hash keys (dedup), `normpath()` for generation keys (logical paths)
 12. **LMDB for all state:** Extend StateDB with prefixes, don't add new databases
 13. **ruamel.yaml for editable config** (preserves comments), **PyYAML for read-only**
-14. **StageDef must be module-level**—`get_type_hints()` needs importable `__module__`
+14. **Stage functions and TypedDicts must be module-level**—`get_type_hints()` needs importable `__module__`

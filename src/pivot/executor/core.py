@@ -630,7 +630,8 @@ def _execute_greedy(
 
                         # Apply deferred writes for successful stages (only in commit mode)
                         if result["status"] == StageStatus.RAN and not no_commit:
-                            output_paths = [out.path for out in state.info["outs"]]
+                            # Registry always stores single-file outputs (multi-file are expanded)
+                            output_paths = [str(out.path) for out in state.info["outs"]]
                             _apply_deferred_writes(stage_name, output_paths, result, state_db)
 
                     except concurrent.futures.BrokenExecutor as e:
@@ -810,10 +811,15 @@ def _prepare_worker_info(
     no_cache: bool,
 ) -> worker.WorkerStageInfo:
     """Prepare stage info for pickling to worker process."""
+    # Extract just the paths from OutOverride (worker doesn't need cache/persist options)
+    out_path_overrides = None
+    if stage_info["out_path_overrides"]:
+        out_path_overrides = {k: v["path"] for k, v in stage_info["out_path_overrides"].items()}
+
     return worker.WorkerStageInfo(
         func=stage_info["func"],
         fingerprint=stage_info["fingerprint"],
-        deps=stage_info["deps"],
+        deps=stage_info["deps_paths"],
         outs=stage_info["outs"],
         signature=stage_info["signature"],
         params=stage_info["params"],
@@ -825,6 +831,8 @@ def _prepare_worker_info(
         force=force,
         no_commit=no_commit,
         no_cache=no_cache,
+        dep_specs=stage_info["dep_specs"],
+        out_path_overrides=out_path_overrides,
     )
 
 
@@ -933,7 +941,7 @@ def _get_stage_explanation(
     return explain.get_stage_explanation(
         stage_info["name"],
         stage_info["fingerprint"],
-        stage_info["deps"],
+        stage_info["deps_paths"],
         stage_info["params"],
         overrides,
         cache_dir,
@@ -961,10 +969,12 @@ def _check_uncached_incremental_outputs(
 
         for out in stage_outs:
             if isinstance(out, outputs.IncrementalOut):
-                path = pathlib.Path(out.path)
+                # Registry always stores single-file outputs (multi-file are expanded)
+                out_path = str(out.path)
+                path = pathlib.Path(out_path)
                 # File exists on disk but has no cache entry
-                if path.exists() and out.path not in output_hashes:
-                    uncached.append((stage_name, out.path))
+                if path.exists() and out_path not in output_hashes:
+                    uncached.append((stage_name, out_path))
 
     return uncached
 
@@ -988,7 +998,8 @@ def _write_run_history(
 
         if lock_data:
             stage_info = registry.REGISTRY.get(name)
-            out_paths = [out.path for out in stage_info["outs"]]
+            # Registry always stores single-file outputs (multi-file are expanded)
+            out_paths = [str(out.path) for out in stage_info["outs"]]
             input_hash = run_history.compute_input_hash_from_lock(lock_data, out_paths)
         else:
             input_hash = "<no-lock>"

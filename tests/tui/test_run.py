@@ -4,14 +4,14 @@ import collections
 import multiprocessing as mp
 import pathlib
 import queue
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Annotated, TypedDict
 
 import pytest
 import textual.binding
 import textual.widgets
 
-import pivot
-from pivot import executor
+from helpers import register_test_stage
+from pivot import executor, loaders, outputs
 from pivot.tui import run as run_tui
 from pivot.types import (
     DisplayMode,
@@ -28,6 +28,80 @@ from pivot.types import (
 if TYPE_CHECKING:
     from collections.abc import Generator
     from multiprocessing.managers import SyncManager
+
+
+# =============================================================================
+# Output TypedDicts for annotation-based stages
+# =============================================================================
+
+
+class _OutputTxtOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
+
+
+class _Step1Outputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("step1.txt", loaders.PathOnly())]
+
+
+class _Step2Outputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("step2.txt", loaders.PathOnly())]
+
+
+class _Step3Outputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("step3.txt", loaders.PathOnly())]
+
+
+# =============================================================================
+# Module-level helper functions for stages
+# =============================================================================
+
+
+def _helper_process(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _OutputTxtOutputs:
+    _ = input_file
+    pathlib.Path("output.txt").write_text("done")
+    return {"output": pathlib.Path("output.txt")}
+
+
+def _helper_process_print(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _OutputTxtOutputs:
+    _ = input_file
+    print("Processing data")
+    pathlib.Path("output.txt").write_text("done")
+    return {"output": pathlib.Path("output.txt")}
+
+
+def _helper_failing_stage(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _OutputTxtOutputs:
+    _ = input_file
+    raise RuntimeError("Stage failed!")
+
+
+def _helper_step1(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _Step1Outputs:
+    _ = input_file
+    pathlib.Path("step1.txt").write_text("step1")
+    return {"output": pathlib.Path("step1.txt")}
+
+
+def _helper_step2(
+    step1_file: Annotated[pathlib.Path, outputs.Dep("step1.txt", loaders.PathOnly())],
+) -> _Step2Outputs:
+    _ = step1_file
+    pathlib.Path("step2.txt").write_text("step2")
+    return {"output": pathlib.Path("step2.txt")}
+
+
+def _helper_step3(
+    step2_file: Annotated[pathlib.Path, outputs.Dep("step2.txt", loaders.PathOnly())],
+) -> _Step3Outputs:
+    _ = step2_file
+    pathlib.Path("step3.txt").write_text("step3")
+    return {"output": pathlib.Path("step3.txt")}
 
 
 # =============================================================================
@@ -267,9 +341,7 @@ def test_executor_emits_status_messages_to_queue(
     tui_queue, _manager = tui_queue_with_manager
     (pipeline_dir / "input.txt").write_text("hello")
 
-    @pivot.stage(deps=["input.txt"], outs=["output.txt"])
-    def process() -> None:
-        pathlib.Path("output.txt").write_text("done")
+    register_test_stage(_helper_process, name="process")
 
     executor.run(show_output=False, tui_queue=tui_queue)
 
@@ -304,10 +376,7 @@ def test_executor_emits_log_messages_to_queue(
     tui_queue, _manager = tui_queue_with_manager
     (pipeline_dir / "input.txt").write_text("hello")
 
-    @pivot.stage(deps=["input.txt"], outs=["output.txt"])
-    def process() -> None:
-        print("Processing data")
-        pathlib.Path("output.txt").write_text("done")
+    register_test_stage(_helper_process_print, name="process")
 
     executor.run(show_output=False, tui_queue=tui_queue)
 
@@ -326,9 +395,7 @@ def test_executor_emits_failed_status_on_stage_failure(
     tui_queue, _manager = tui_queue_with_manager
     (pipeline_dir / "input.txt").write_text("hello")
 
-    @pivot.stage(deps=["input.txt"], outs=["output.txt"])
-    def failing_stage() -> None:
-        raise RuntimeError("Stage failed!")
+    register_test_stage(_helper_failing_stage, name="failing_stage")
 
     executor.run(show_output=False, tui_queue=tui_queue)
 
@@ -350,17 +417,9 @@ def test_executor_emits_status_for_multiple_stages(
     tui_queue, _manager = tui_queue_with_manager
     (pipeline_dir / "input.txt").write_text("hello")
 
-    @pivot.stage(deps=["input.txt"], outs=["step1.txt"])
-    def step1() -> None:
-        pathlib.Path("step1.txt").write_text("step1")
-
-    @pivot.stage(deps=["step1.txt"], outs=["step2.txt"])
-    def step2() -> None:
-        pathlib.Path("step2.txt").write_text("step2")
-
-    @pivot.stage(deps=["step2.txt"], outs=["step3.txt"])
-    def step3() -> None:
-        pathlib.Path("step3.txt").write_text("step3")
+    register_test_stage(_helper_step1, name="step1")
+    register_test_stage(_helper_step2, name="step2")
+    register_test_stage(_helper_step3, name="step3")
 
     executor.run(show_output=False, tui_queue=tui_queue)
 
@@ -386,13 +445,8 @@ def test_executor_status_includes_correct_index_and_total(
     tui_queue, _manager = tui_queue_with_manager
     (pipeline_dir / "input.txt").write_text("hello")
 
-    @pivot.stage(deps=["input.txt"], outs=["step1.txt"])
-    def step1() -> None:
-        pathlib.Path("step1.txt").write_text("step1")
-
-    @pivot.stage(deps=["step1.txt"], outs=["step2.txt"])
-    def step2() -> None:
-        pathlib.Path("step2.txt").write_text("step2")
+    register_test_stage(_helper_step1, name="step1")
+    register_test_stage(_helper_step2, name="step2")
 
     executor.run(show_output=False, tui_queue=tui_queue)
 

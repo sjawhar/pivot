@@ -2,22 +2,71 @@ from __future__ import annotations
 
 import json
 import pathlib
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Annotated, TypedDict
 
-from pivot import cli
-from pivot.registry import REGISTRY
+from helpers import register_test_stage
+from pivot import cli, loaders, outputs
 
 if TYPE_CHECKING:
     import click.testing
 
 
+# =============================================================================
+# Output TypedDicts for annotation-based stages
+# =============================================================================
+
+
+class _StageAOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("a.txt", loaders.PathOnly())]
+
+
+class _StageBOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("b.txt", loaders.PathOnly())]
+
+
+class _ProducerOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("intermediate.txt", loaders.PathOnly())]
+
+
+class _ConsumerOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("final.txt", loaders.PathOnly())]
+
+
+# =============================================================================
 # Module-level helper functions for stage registration
-def _helper_stage_a() -> None:
+# =============================================================================
+
+
+def _helper_stage_a(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _StageAOutputs:
+    _ = input_file
     pathlib.Path("a.txt").write_text("output a")
+    return {"output": pathlib.Path("a.txt")}
 
 
-def _helper_stage_b() -> None:
+def _helper_stage_b(
+    a_file: Annotated[pathlib.Path, outputs.Dep("a.txt", loaders.PathOnly())],
+) -> _StageBOutputs:
+    _ = a_file
     pathlib.Path("b.txt").write_text("output b")
+    return {"output": pathlib.Path("b.txt")}
+
+
+def _helper_producer(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _ProducerOutputs:
+    _ = input_file
+    pathlib.Path("intermediate.txt").write_text("intermediate")
+    return {"output": pathlib.Path("intermediate.txt")}
+
+
+def _helper_consumer(
+    intermediate_file: Annotated[pathlib.Path, outputs.Dep("intermediate.txt", loaders.PathOnly())],
+) -> _ConsumerOutputs:
+    _ = intermediate_file
+    pathlib.Path("final.txt").write_text("final")
+    return {"output": pathlib.Path("final.txt")}
 
 
 # =============================================================================
@@ -37,7 +86,7 @@ def test_list_no_stages_explains_how_to_create(
         assert result.exit_code == 0
         assert "No stages registered" in result.output
         # Should mention how to create stages
-        assert "pivot.yaml" in result.output or "@stage" in result.output
+        assert "pivot.yaml" in result.output
 
 
 def test_list_no_stages_json(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
@@ -64,18 +113,14 @@ def test_list_with_stages_json(runner: click.testing.CliRunner, tmp_path: pathli
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
 
-        REGISTRY.register(
+        register_test_stage(
             _helper_stage_a,
             name="stage_a",
-            deps=["input.txt"],
-            outs=["a.txt"],
             mutex=["gpu"],
         )
-        REGISTRY.register(
+        register_test_stage(
             _helper_stage_b,
             name="stage_b",
-            deps=["a.txt"],
-            outs=["b.txt"],
         )
 
         result = runner.invoke(cli.cli, ["list", "--json"])
@@ -106,17 +151,13 @@ def test_list_deps_shows_source_stage(
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
 
-        REGISTRY.register(
-            _helper_stage_a,
+        register_test_stage(
+            _helper_producer,
             name="producer",
-            deps=["input.txt"],
-            outs=["intermediate.txt"],
         )
-        REGISTRY.register(
-            _helper_stage_b,
+        register_test_stage(
+            _helper_consumer,
             name="consumer",
-            deps=["intermediate.txt"],
-            outs=["final.txt"],
         )
 
         result = runner.invoke(cli.cli, ["list", "--deps"])

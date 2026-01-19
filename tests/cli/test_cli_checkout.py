@@ -1,23 +1,48 @@
 from __future__ import annotations
 
 import pathlib
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Annotated, TypedDict
 
-from pivot import cli, executor
-from pivot.registry import REGISTRY
+from helpers import register_test_stage
+from pivot import cli, executor, loaders, outputs
 from pivot.storage import cache, track
 
 if TYPE_CHECKING:
     import click.testing
 
 
-# Module-level helper for stage functions
-def _helper_process() -> None:
+# =============================================================================
+# Output TypedDicts for annotation-based stages
+# =============================================================================
+
+
+class _ProcessOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
+
+
+class _StageAOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("a.txt", loaders.PathOnly())]
+
+
+# =============================================================================
+# Module-level helper functions for stage registration
+# =============================================================================
+
+
+def _helper_process(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _ProcessOutputs:
+    _ = input_file  # deps tracked but not loaded in this simple test
     pathlib.Path("output.txt").write_text("processed output")
+    return {"output": pathlib.Path("output.txt")}
 
 
-def _helper_stage_a() -> None:
+def _helper_stage_a(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _StageAOutputs:
+    _ = input_file  # deps tracked but not loaded in this simple test
     pathlib.Path("a.txt").write_text("output a")
+    return {"output": pathlib.Path("a.txt")}
 
 
 # =============================================================================
@@ -115,7 +140,7 @@ def test_checkout_stage_output(runner: click.testing.CliRunner, tmp_path: pathli
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
 
-        REGISTRY.register(_helper_process, name="process", deps=["input.txt"], outs=["output.txt"])
+        register_test_stage(_helper_process, name="process")
 
         # Run to generate output
         executor.run(show_output=False)
@@ -290,7 +315,7 @@ def test_checkout_uncached_output_suggests_run_or_pull(
         pathlib.Path("input.txt").write_text("data")
 
         # Register stage but don't run it (so no cached output)
-        REGISTRY.register(_helper_stage_a, name="stage_a", deps=["input.txt"], outs=["a.txt"])
+        register_test_stage(_helper_stage_a, name="stage_a")
 
         # Try to checkout the output that was never produced
         result = runner.invoke(cli.cli, ["checkout", "a.txt"])

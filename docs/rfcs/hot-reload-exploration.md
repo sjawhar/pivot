@@ -79,10 +79,9 @@ If multi-module reload fails partway:
 ### 4. Module-Level Side Effects
 
 ```python
-# pipeline.py
+# stages.py
 import expensive_model  # Downloads 2GB model on import
 
-@stage(...)
 def inference():
     ...
 ```

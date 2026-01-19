@@ -1,15 +1,37 @@
 import pathlib
+from typing import TYPE_CHECKING, Annotated, Any, TypedDict, cast
 
 import pytest
 
-from pivot import IncrementalOut, executor, outputs, registry
+from helpers import register_test_stage
+from pivot import IncrementalOut, executor, loaders, outputs
 from pivot.executor import worker
+from pivot.registry import REGISTRY
 from pivot.storage import cache, lock
 from pivot.types import LockData
 
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
+# =============================================================================
+# Output TypedDicts for annotation-based stages
+# =============================================================================
+
+
+class _IncrementalStageOutputs(TypedDict):
+    database: Annotated[pathlib.Path, outputs.Out("database.txt", loaders.PathOnly())]
+
+
+class _RegularStageOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
+
+
+# =============================================================================
 # Module-level stage functions for testing (must be picklable)
-def _incremental_stage_append() -> None:
+# =============================================================================
+
+
+def _incremental_stage_append() -> _IncrementalStageOutputs:
     """Stage that appends to an incremental output."""
     import pathlib
 
@@ -25,10 +47,39 @@ def _incremental_stage_append() -> None:
         f.write(existing)
         f.write(f"line {count + 1}\n")
 
+    return {"database": db_path}
 
-def _regular_stage_create() -> None:
+
+def _regular_stage_create() -> _RegularStageOutputs:
     """Stage that creates a regular output."""
     pathlib.Path("output.txt").write_text("created\n")
+    return {"output": pathlib.Path("output.txt")}
+
+
+# =============================================================================
+# Test helper for IncrementalOut registration
+# =============================================================================
+
+
+def _register_incremental_stage(
+    func: object,
+    name: str,
+    out_path: str,
+) -> None:
+    """Register a stage and convert its Out to IncrementalOut for testing.
+
+    This is needed because the annotation system uses outputs.Out, but
+    IncrementalOut is a separate outputs.IncrementalOut type that requires
+    special handling during execution.
+    """
+    # Register normally (annotations create outputs.Out)
+    register_test_stage(cast("Callable[..., Any]", func), name=name)
+
+    # Replace the Out with IncrementalOut in the registry
+    # This is a test-only hack to test IncrementalOut behavior
+    stage_info = REGISTRY._stages[name]
+    stage_info["outs"] = [IncrementalOut(path=out_path, loader=loaders.PathOnly())]
+    stage_info["outs_paths"] = [out_path]
 
 
 # =============================================================================
@@ -41,7 +92,9 @@ def test_prepare_outputs_regular_out_is_deleted(tmp_path: pathlib.Path) -> None:
     output_file = tmp_path / "output.txt"
     output_file.write_text("existing content")
 
-    stage_outs: list[outputs.BaseOut] = [outputs.Out(path=str(output_file))]
+    stage_outs: list[outputs.Out[Any]] = [
+        outputs.Out(path=str(output_file), loader=loaders.PathOnly())
+    ]
     worker._prepare_outputs_for_execution(stage_outs, None, tmp_path / "cache")
 
     assert not output_file.exists()
@@ -51,7 +104,9 @@ def test_prepare_outputs_incremental_no_cache_creates_empty(tmp_path: pathlib.Pa
     """IncrementalOut with no cache should start fresh (file doesn't exist)."""
     output_file = tmp_path / "database.txt"
 
-    stage_outs: list[outputs.BaseOut] = [outputs.IncrementalOut(path=str(output_file))]
+    stage_outs: list[outputs.Out[Any]] = [
+        outputs.IncrementalOut(path=str(output_file), loader=loaders.PathOnly())
+    ]
     worker._prepare_outputs_for_execution(stage_outs, None, tmp_path / "cache")
 
     assert not output_file.exists()
@@ -80,7 +135,7 @@ def test_prepare_outputs_incremental_restores_from_cache(
     )
 
     # Prepare for execution (uses relative path like production)
-    stage_outs = [outputs.IncrementalOut(path="database.txt")]
+    stage_outs = [outputs.IncrementalOut(path="database.txt", loader=loaders.PathOnly())]
     worker._prepare_outputs_for_execution(stage_outs, lock_data, cache_dir)
 
     # File should be restored
@@ -110,7 +165,7 @@ def test_prepare_outputs_incremental_restored_file_is_writable(
     )
 
     # Prepare for execution (uses relative path like production)
-    stage_outs = [outputs.IncrementalOut(path="database.txt")]
+    stage_outs = [outputs.IncrementalOut(path="database.txt", loader=loaders.PathOnly())]
     worker._prepare_outputs_for_execution(stage_outs, lock_data, cache_dir)
 
     # Should NOT be a symlink (should be a copy)
@@ -130,7 +185,7 @@ def test_dvc_export_incremental_out_always_persist() -> None:
     """IncrementalOut should always export with persist: true."""
     from pivot import dvc_compat
 
-    inc = outputs.IncrementalOut(path="database.csv")
+    inc = outputs.IncrementalOut(path="database.csv", loader=loaders.PathOnly())
     result = dvc_compat._build_out_entry(inc, "database.csv")
     assert result == {"database.csv": {"persist": True}}
 
@@ -139,7 +194,7 @@ def test_dvc_export_incremental_out_with_cache_false() -> None:
     """IncrementalOut with cache=False should export both options."""
     from pivot import dvc_compat
 
-    inc = outputs.IncrementalOut(path="database.csv", cache=False)
+    inc = outputs.IncrementalOut(path="database.csv", loader=loaders.PathOnly(), cache=False)
     result = dvc_compat._build_out_entry(inc, "database.csv")
     assert result == {"database.csv": {"cache": False, "persist": True}}
 
@@ -158,11 +213,10 @@ def test_integration_first_run_creates_output(
 
     db_path = tmp_path / "database.txt"
 
-    registry.REGISTRY.register(
+    _register_incremental_stage(
         _incremental_stage_append,
         name="append_stage",
-        deps=[],
-        outs=[IncrementalOut(path=str(db_path))],
+        out_path=str(db_path),
     )
 
     results = executor.run(cache_dir=tmp_path / ".pivot" / "cache")
@@ -182,11 +236,10 @@ def test_integration_second_run_appends_to_output(
     db_path = tmp_path / "database.txt"
     cache_dir = tmp_path / ".pivot" / "cache"
 
-    registry.REGISTRY.register(
+    _register_incremental_stage(
         _incremental_stage_append,
         name="append_stage",
-        deps=[],
-        outs=[IncrementalOut(path=str(db_path))],
+        out_path=str(db_path),
     )
 
     # First run
@@ -249,7 +302,7 @@ def test_incremental_out_restores_directory(
     assert not output_dir.exists()
 
     # Prepare for execution (restore with COPY mode, uses relative path)
-    stage_outs = [outputs.IncrementalOut(path="data_dir")]
+    stage_outs = [outputs.IncrementalOut(path="data_dir", loader=loaders.PathOnly())]
     worker._prepare_outputs_for_execution(stage_outs, lock_data, cache_dir)
 
     # Directory should be restored
@@ -284,7 +337,7 @@ def test_incremental_out_directory_is_writable(
 
     # Delete and restore (uses relative path like production)
     cache.remove_output(output_dir)
-    stage_outs = [outputs.IncrementalOut(path="data_dir")]
+    stage_outs = [outputs.IncrementalOut(path="data_dir", loader=loaders.PathOnly())]
     worker._prepare_outputs_for_execution(stage_outs, lock_data, cache_dir)
 
     # Should be able to write new files
@@ -325,7 +378,7 @@ def test_incremental_out_directory_subdirs_writable(
 
     # Delete and restore (uses relative path like production)
     cache.remove_output(output_dir)
-    stage_outs = [outputs.IncrementalOut(path="data_dir")]
+    stage_outs = [outputs.IncrementalOut(path="data_dir", loader=loaders.PathOnly())]
     worker._prepare_outputs_for_execution(stage_outs, lock_data, cache_dir)
 
     # Should be able to create files in subdirectories
@@ -405,11 +458,10 @@ def test_uncached_incremental_output_raises_error(
     db_path = tmp_path / "database.txt"
     db_path.write_text("uncached content\n")
 
-    registry.REGISTRY.register(
+    _register_incremental_stage(
         _incremental_stage_append,
         name="append_stage",
-        deps=[],
-        outs=[IncrementalOut(path=str(db_path))],
+        out_path=str(db_path),
     )
 
     with pytest.raises(exceptions.UncachedIncrementalOutputError) as exc_info:
@@ -429,11 +481,10 @@ def test_uncached_incremental_output_allow_uncached_incremental_allows_run(
     db_path = tmp_path / "database.txt"
     db_path.write_text("will be overwritten\n")
 
-    registry.REGISTRY.register(
+    _register_incremental_stage(
         _incremental_stage_append,
         name="append_stage",
-        deps=[],
-        outs=[IncrementalOut(path=str(db_path))],
+        out_path=str(db_path),
     )
 
     # allow_uncached_incremental=True should allow run even with uncached file
@@ -451,11 +502,10 @@ def test_cached_incremental_output_runs_normally(
     db_path = tmp_path / "database.txt"
     cache_dir = tmp_path / ".pivot" / "cache"
 
-    registry.REGISTRY.register(
+    _register_incremental_stage(
         _incremental_stage_append,
         name="append_stage",
-        deps=[],
-        outs=[IncrementalOut(path=str(db_path))],
+        out_path=str(db_path),
     )
 
     # First run creates and caches the output
@@ -477,11 +527,10 @@ def test_force_runs_incremental_stage_even_when_unchanged(
     db_path = tmp_path / "database.txt"
     cache_dir = tmp_path / ".pivot" / "cache"
 
-    registry.REGISTRY.register(
+    _register_incremental_stage(
         _incremental_stage_append,
         name="append_stage",
-        deps=[],
-        outs=[IncrementalOut(path=str(db_path))],
+        out_path=str(db_path),
     )
 
     # First run creates the output
@@ -513,11 +562,10 @@ def test_force_and_allow_uncached_incremental_are_orthogonal(
     db_path.write_text("uncached content\n")
     cache_dir = tmp_path / ".pivot" / "cache"
 
-    registry.REGISTRY.register(
+    _register_incremental_stage(
         _incremental_stage_append,
         name="append_stage",
-        deps=[],
-        outs=[IncrementalOut(path=str(db_path))],
+        out_path=str(db_path),
     )
 
     # force=True alone should still raise error for uncached incremental

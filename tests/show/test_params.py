@@ -3,10 +3,11 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING
 
-import pydantic
 import pytest
 import yaml
 
+from helpers import register_test_stage
+from pivot import stage_def
 from pivot.show import params
 from pivot.types import ChangeType, OutputFormat
 
@@ -30,21 +31,21 @@ def test_collect_params_from_stages_empty(clean_registry: None) -> None:
     assert result["unknown_stages"] == []
 
 
+class _MyParams(stage_def.StageParams):
+    learning_rate: float = 0.01
+    epochs: int = 10
+
+
+def _helper_params_stage(params: _MyParams) -> None:
+    pass
+
+
 def test_collect_params_from_stages_with_params(set_project_root: Path) -> None:
     """Collects params from stage with Pydantic model."""
-    from pivot import registry
-
-    class MyParams(pydantic.BaseModel):
-        learning_rate: float = 0.01
-        epochs: int = 10
-
-    def _stage_func(params: MyParams) -> None:
-        pass
-
-    registry.REGISTRY.register(
-        _stage_func,
+    register_test_stage(
+        _helper_params_stage,
         name="train",
-        params=MyParams(),
+        params=_MyParams(),
     )
 
     result = params.collect_params_from_stages()
@@ -55,31 +56,30 @@ def test_collect_params_from_stages_with_params(set_project_root: Path) -> None:
     assert result["unknown_stages"] == []
 
 
+def _helper_no_params_stage() -> None:
+    pass
+
+
 def test_collect_params_from_stages_without_params(set_project_root: Path) -> None:
     """Stages without params are not included."""
-    from pivot import registry
-
-    def _stage_func() -> None:
-        pass
-
-    registry.REGISTRY.register(_stage_func, name="no_params")
+    register_test_stage(_helper_no_params_stage, name="no_params")
 
     result = params.collect_params_from_stages()
 
     assert "no_params" not in result["params"]
 
 
+class _OverrideParams(stage_def.StageParams):
+    learning_rate: float = 0.01
+
+
+def _helper_override_stage(params: _OverrideParams) -> None:
+    pass
+
+
 def test_collect_params_from_stages_with_overrides(set_project_root: Path) -> None:
     """Applies params.yaml overrides."""
-    from pivot import registry
-
-    class MyParams(pydantic.BaseModel):
-        learning_rate: float = 0.01
-
-    def _stage_func(params: MyParams) -> None:
-        pass
-
-    registry.REGISTRY.register(_stage_func, name="train", params=MyParams())
+    register_test_stage(_helper_override_stage, name="train", params=_OverrideParams())
 
     params_yaml = set_project_root / "params.yaml"
     params_yaml.write_text(yaml.dump({"train": {"learning_rate": 0.05}}))
@@ -89,27 +89,29 @@ def test_collect_params_from_stages_with_overrides(set_project_root: Path) -> No
     assert result["params"]["train"]["learning_rate"] == 0.05
 
 
+class _FilterParams(stage_def.StageParams):
+    value: int = 1
+
+
+def _helper_filter_a(params: _FilterParams) -> None:
+    pass
+
+
+def _helper_filter_b(params: _FilterParams) -> None:
+    pass
+
+
+def _helper_filter_c(params: _FilterParams) -> None:
+    pass
+
+
 def test_collect_params_from_stages_filters_by_stage_names(
     set_project_root: Path,
 ) -> None:
     """Filters to specific stage names."""
-    from pivot import registry
-
-    class Params(pydantic.BaseModel):
-        value: int = 1
-
-    def _func_a(params: Params) -> None:
-        pass
-
-    def _func_b(params: Params) -> None:
-        pass
-
-    def _func_c(params: Params) -> None:
-        pass
-
-    registry.REGISTRY.register(_func_a, name="stage_a", params=Params())
-    registry.REGISTRY.register(_func_b, name="stage_b", params=Params())
-    registry.REGISTRY.register(_func_c, name="stage_c", params=Params())
+    register_test_stage(_helper_filter_a, name="stage_a", params=_FilterParams())
+    register_test_stage(_helper_filter_b, name="stage_b", params=_FilterParams())
+    register_test_stage(_helper_filter_c, name="stage_c", params=_FilterParams())
 
     result = params.collect_params_from_stages(["stage_a", "stage_c"])
 
@@ -140,21 +142,23 @@ def test_get_params_from_head_no_stages(set_project_root: Path) -> None:
     assert result["git_available"] is True
 
 
+class _LockParams(stage_def.StageParams):
+    lr: float = 0.01
+
+
+def _helper_lock_stage(params: _LockParams) -> None:
+    pass
+
+
 def test_get_params_from_head_with_lock_file(
     set_project_root: Path,
     mocker: MockerFixture,
     make_valid_lock_content: ValidLockContentFactory,
 ) -> None:
     """Returns params from lock file at HEAD."""
-    from pivot import git, registry
+    from pivot import git
 
-    class MyParams(pydantic.BaseModel):
-        lr: float = 0.01
-
-    def _stage(params: MyParams) -> None:
-        pass
-
-    registry.REGISTRY.register(_stage, name="train", params=MyParams())
+    register_test_stage(_helper_lock_stage, name="train", params=_LockParams())
 
     lock_content = yaml.dump(make_valid_lock_content(params={"lr": 0.05, "epochs": 10}))
     mocker.patch.object(
@@ -176,15 +180,9 @@ def test_get_params_from_head_no_lock_file(
     mocker: MockerFixture,
 ) -> None:
     """Missing lock file means stage not in result."""
-    from pivot import git, registry
+    from pivot import git
 
-    class MyParams(pydantic.BaseModel):
-        lr: float = 0.01
-
-    def _stage(params: MyParams) -> None:
-        pass
-
-    registry.REGISTRY.register(_stage, name="train", params=MyParams())
+    register_test_stage(_helper_lock_stage, name="train", params=_LockParams())
     mocker.patch.object(git, "read_files_from_head", return_value={})
     mocker.patch.object(git, "is_git_repo_with_head", return_value=True)
 
@@ -199,15 +197,9 @@ def test_get_params_from_head_no_git_repo(
     mocker: MockerFixture,
 ) -> None:
     """Returns git_available=False when not in git repo."""
-    from pivot import git, registry
+    from pivot import git
 
-    class MyParams(pydantic.BaseModel):
-        lr: float = 0.01
-
-    def _stage(params: MyParams) -> None:
-        pass
-
-    registry.REGISTRY.register(_stage, name="train", params=MyParams())
+    register_test_stage(_helper_lock_stage, name="train", params=_LockParams())
     mocker.patch.object(git, "read_files_from_head", return_value={})
     mocker.patch.object(git, "is_git_repo_with_head", return_value=False)
 
@@ -222,15 +214,9 @@ def test_get_params_from_head_invalid_yaml(
     mocker: MockerFixture,
 ) -> None:
     """Invalid YAML in lock file is skipped."""
-    from pivot import git, registry
+    from pivot import git
 
-    class MyParams(pydantic.BaseModel):
-        lr: float = 0.01
-
-    def _stage(params: MyParams) -> None:
-        pass
-
-    registry.REGISTRY.register(_stage, name="train", params=MyParams())
+    register_test_stage(_helper_lock_stage, name="train", params=_LockParams())
     mocker.patch.object(
         git,
         "read_files_from_head",
@@ -247,15 +233,9 @@ def test_get_params_from_head_missing_params_key(
     mocker: MockerFixture,
 ) -> None:
     """Lock file without params key is skipped."""
-    from pivot import git, registry
+    from pivot import git
 
-    class MyParams(pydantic.BaseModel):
-        lr: float = 0.01
-
-    def _stage(params: MyParams) -> None:
-        pass
-
-    registry.REGISTRY.register(_stage, name="train", params=MyParams())
+    register_test_stage(_helper_lock_stage, name="train", params=_LockParams())
     lock_content = yaml.dump({"deps": []})
     mocker.patch.object(
         git,
@@ -273,15 +253,9 @@ def test_get_params_from_head_empty_params(
     mocker: MockerFixture,
 ) -> None:
     """Lock file with empty params dict is skipped."""
-    from pivot import git, registry
+    from pivot import git
 
-    class MyParams(pydantic.BaseModel):
-        lr: float = 0.01
-
-    def _stage(params: MyParams) -> None:
-        pass
-
-    registry.REGISTRY.register(_stage, name="train", params=MyParams())
+    register_test_stage(_helper_lock_stage, name="train", params=_LockParams())
     lock_content = yaml.dump({"params": {}})
     mocker.patch.object(
         git,
@@ -300,19 +274,10 @@ def test_get_params_from_head_filters_by_stage_names(
     make_valid_lock_content: ValidLockContentFactory,
 ) -> None:
     """Filters to specific stage names."""
-    from pivot import git, registry
+    from pivot import git
 
-    class Params(pydantic.BaseModel):
-        value: int = 1
-
-    def _func_a(params: Params) -> None:
-        pass
-
-    def _func_b(params: Params) -> None:
-        pass
-
-    registry.REGISTRY.register(_func_a, name="stage_a", params=Params())
-    registry.REGISTRY.register(_func_b, name="stage_b", params=Params())
+    register_test_stage(_helper_filter_a, name="stage_a", params=_FilterParams())
+    register_test_stage(_helper_filter_b, name="stage_b", params=_FilterParams())
 
     lock_a = yaml.dump(make_valid_lock_content(params={"value": 1}))
     lock_b = yaml.dump(make_valid_lock_content(params={"value": 2}))
