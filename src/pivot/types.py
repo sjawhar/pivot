@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import enum
-from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypedDict, TypeGuard
+from typing import TYPE_CHECKING, Any, Literal, NotRequired, Required, TypedDict, TypeGuard
 
 if TYPE_CHECKING:
     from pivot.run_history import RunCacheEntry
@@ -634,3 +634,78 @@ class ExecutionResultEvent(TypedDict):
 
 
 RunJsonEvent = SchemaVersionEvent | StageStartEvent | StageCompleteEvent | ExecutionResultEvent
+
+
+# =============================================================================
+# Agent RPC Types
+# =============================================================================
+#
+# Types for the JSON-RPC agent control plane. Enables AI agents to control
+# pipeline execution via Unix socket while researcher watches the TUI.
+#
+
+
+class AgentState(enum.StrEnum):
+    """State of the agent server."""
+
+    IDLE = "idle"
+    WATCHING = "watching"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class AgentRunParams(TypedDict, total=False):
+    """Parameters for agent run() RPC method."""
+
+    stages: list[str]
+    force: bool
+
+
+class AgentRunStartResult(TypedDict):
+    """Result returned immediately when run() is called."""
+
+    run_id: str
+    status: Literal["started"]
+    stages_queued: list[str]
+
+
+class AgentRunRejection(TypedDict, total=False):
+    """Reason an agent run request was rejected."""
+
+    reason: Required[Literal["not_ready", "queue_full"]]
+    current_state: Required[str]
+    current_run_id: str | None
+
+
+class AgentStatusResult(TypedDict, total=False):
+    """Result of status() RPC method."""
+
+    state: Required[AgentState]
+    run_id: str
+    stages_completed: list[str]
+    stages_pending: list[str]
+    ran: int
+    skipped: int
+    failed: int
+
+
+class AgentCancelResult(TypedDict, total=False):
+    """Result of cancel() RPC method."""
+
+    cancelled: bool
+    stage_interrupted: str
+
+
+class AgentStageInfo(TypedDict):
+    """Stage info returned by stages() RPC method."""
+
+    name: str
+    deps: list[str]
+    outs: list[str]
+
+
+class AgentStagesResult(TypedDict):
+    """Result of stages() RPC method."""
+
+    stages: list[AgentStageInfo]
