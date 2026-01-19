@@ -96,7 +96,16 @@ def _match_cached_hash(value: bytes | None, fs_stat: os.stat_result) -> str | No
 
 
 class StateDB:
-    """LMDB cache of (path, mtime_ns, size, inode) -> hash to skip rehashing unchanged files."""
+    """LMDB cache of file hashes and generation counters.
+
+    Multi-process safe: Each process independently instantiates StateDB and opens
+    the same LMDB environment file. LMDB handles inter-process synchronization via
+    file-system locking (MVCC). Workers open in readonly mode to avoid write contention;
+    state changes are deferred and applied atomically by the coordinator.
+
+    Concurrent `pivot run` invocations are safe—each gets its own StateDB instances
+    with automatic MVCC snapshot isolation. Readers never block writers and vice versa.
+    """
 
     _env: lmdb.Environment
     _closed: bool
