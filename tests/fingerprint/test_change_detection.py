@@ -1,4 +1,5 @@
 import importlib
+import linecache
 import pathlib
 import sys
 import types
@@ -42,6 +43,7 @@ def _import_fresh(name: str) -> types.ModuleType:
     """Import module fresh, clearing any cached version."""
     if name in sys.modules:
         del sys.modules[name]
+    linecache.clearcache()  # Clear cached source (inspect.getsource uses linecache)
     importlib.invalidate_caches()
     return importlib.import_module(name)
 
