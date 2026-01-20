@@ -780,3 +780,206 @@ class AgentStagesResult(TypedDict):
     """Result of stages() RPC method."""
 
     stages: list[AgentStageInfo]
+
+
+# =============================================================================
+# State Machine Types (Distributed Execution)
+# =============================================================================
+#
+# Types for the centralized state machine supporting distributed execution.
+# The coordinator holds execution state; workers are stateless and connect
+# to the coordinator to request tasks and report results.
+#
+# Event types follow the same polymorphic TypedDict pattern as TUI messages.
+#
+
+
+class StateEventType(enum.StrEnum):
+    """Type of state machine event."""
+
+    STAGE_STARTED = "stage_started"
+    STAGE_COMPLETED = "stage_completed"
+    STAGE_FAILED = "stage_failed"
+    STAGE_SKIPPED = "stage_skipped"
+    DAG_CHANGED = "dag_changed"
+    WORKER_REGISTERED = "worker_registered"
+    WORKER_HEARTBEAT = "worker_heartbeat"
+    WORKER_DISCONNECTED = "worker_disconnected"
+
+
+class StageStartedEvent(TypedDict):
+    """Event emitted when a stage starts execution."""
+
+    type: Literal[StateEventType.STAGE_STARTED]
+    version: int
+    timestamp: float
+    stage: str
+    worker_id: str
+
+
+class StageCompletedEvent(TypedDict):
+    """Event emitted when a stage completes successfully."""
+
+    type: Literal[StateEventType.STAGE_COMPLETED]
+    version: int
+    timestamp: float
+    stage: str
+    worker_id: str
+    status: Literal[StageStatus.RAN, StageStatus.SKIPPED]
+    reason: str
+    duration_ms: float
+
+
+class StageFailedEvent(TypedDict):
+    """Event emitted when a stage fails."""
+
+    type: Literal[StateEventType.STAGE_FAILED]
+    version: int
+    timestamp: float
+    stage: str
+    worker_id: str
+    error: str
+
+
+class StageSkippedUpstreamEvent(TypedDict):
+    """Event emitted when a stage is skipped due to upstream failure."""
+
+    type: Literal[StateEventType.STAGE_SKIPPED]
+    version: int
+    timestamp: float
+    stage: str
+    failed_upstream: str
+
+
+class DagChangedEvent(TypedDict):
+    """Event emitted when the DAG changes (registry reload)."""
+
+    type: Literal[StateEventType.DAG_CHANGED]
+    version: int
+    timestamp: float
+    stages: list[str]
+
+
+class WorkerRegisteredEvent(TypedDict):
+    """Event emitted when a worker connects."""
+
+    type: Literal[StateEventType.WORKER_REGISTERED]
+    version: int
+    timestamp: float
+    worker_id: str
+
+
+class WorkerHeartbeatEvent(TypedDict):
+    """Event emitted on worker heartbeat."""
+
+    type: Literal[StateEventType.WORKER_HEARTBEAT]
+    version: int
+    timestamp: float
+    worker_id: str
+
+
+class WorkerDisconnectedEvent(TypedDict):
+    """Event emitted when a worker disconnects."""
+
+    type: Literal[StateEventType.WORKER_DISCONNECTED]
+    version: int
+    timestamp: float
+    worker_id: str
+
+
+StateEvent = (
+    StageStartedEvent
+    | StageCompletedEvent
+    | StageFailedEvent
+    | StageSkippedUpstreamEvent
+    | DagChangedEvent
+    | WorkerRegisteredEvent
+    | WorkerHeartbeatEvent
+    | WorkerDisconnectedEvent
+)
+
+
+class StageStateSnapshot(TypedDict):
+    """Snapshot of a single stage's state."""
+
+    name: str
+    status: StageStatus
+    reason: str
+    worker_id: str | None
+    start_time: float | None
+    end_time: float | None
+
+
+class WorkerSnapshot(TypedDict):
+    """Snapshot of a worker's state."""
+
+    worker_id: str
+    connected_at: float
+    last_heartbeat: float
+    current_stage: str | None
+
+
+class ExecutionSnapshot(TypedDict):
+    """Complete snapshot of execution state for client sync."""
+
+    version: int
+    run_id: str | None
+    stages: dict[str, StageStateSnapshot]
+    workers: dict[str, WorkerSnapshot]
+    execution_order: list[str]
+    ran: int
+    skipped: int
+    failed: int
+
+
+# =============================================================================
+# Worker Protocol Types
+# =============================================================================
+#
+# Types for coordinator-worker communication over Unix socket.
+# Workers connect, request tasks, execute them, and report results.
+#
+
+
+class WorkerStageTask(TypedDict):
+    """Task assigned to a worker for execution."""
+
+    stage_name: str
+    run_id: str
+    force: bool
+    no_commit: bool
+    no_cache: bool
+
+
+class WorkerRegistration(TypedDict):
+    """Worker registration request."""
+
+    worker_id: str
+    pid: int
+
+
+class WorkerTaskRequest(TypedDict):
+    """Worker requesting next task."""
+
+    worker_id: str
+
+
+class WorkerTaskResponse(TypedDict, total=False):
+    """Response to task request (task or no work available)."""
+
+    task: WorkerStageTask | None
+    shutdown: bool  # True when coordinator is shutting down
+
+
+class WorkerResultReport(TypedDict):
+    """Worker reporting task completion."""
+
+    worker_id: str
+    stage_name: str
+    result: StageResult
+
+
+class WorkerHeartbeat(TypedDict):
+    """Worker heartbeat message."""
+
+    worker_id: str

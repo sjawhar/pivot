@@ -9,6 +9,7 @@ import click
 # Command categories for organized help output
 COMMAND_CATEGORIES = {
     "Pipeline": ["run", "status", "verify", "commit"],
+    "Distributed": ["serve", "worker"],
     "Inspection": ["list", "metrics", "params", "plots", "data", "history", "show"],
     "Versioning": ["track", "checkout"],
     "Remote": ["remote", "push", "pull"],
@@ -66,6 +67,8 @@ _LAZY_COMMANDS: dict[str, tuple[str, str, str]] = {
         "Check if paths are ignored by .pivotignore.",
     ),
     "doctor": ("pivot.cli.doctor", "doctor", "Check environment and configuration for issues."),
+    "serve": ("pivot.cli.serve", "serve", "Start coordinator server for distributed execution."),
+    "worker": ("pivot.cli.worker", "worker", "Run as a worker process for distributed execution."),
 }
 
 
