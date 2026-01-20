@@ -13,9 +13,18 @@ import textual.widgets
 from helpers import register_test_stage
 from pivot import executor, loaders, outputs
 from pivot.tui import run as run_tui
+from pivot.tui.screens import ConfirmCommitScreen
+from pivot.tui.types import LogEntry, StageInfo
+from pivot.tui.widgets import (
+    LogPanel,
+    StageListPanel,
+    StageLogPanel,
+    StageRow,
+    TabbedDetailPanel,
+)
+from pivot.tui.widgets import status as tui_status
 from pivot.types import (
     DisplayMode,
-    OutputMessage,
     StageStatus,
     TuiLogMessage,
     TuiMessage,
@@ -29,6 +38,8 @@ from pivot.types import (
 if TYPE_CHECKING:
     from collections.abc import Generator
     from multiprocessing.managers import SyncManager
+
+    from pivot.watch.engine import WatchEngine
 
 
 # =============================================================================
@@ -140,7 +151,7 @@ def tui_queue_with_manager() -> Generator[tuple[TuiQueue, SyncManager]]:
 
 
 # =============================================================================
-# _format_elapsed Tests
+# format_elapsed Tests
 # =============================================================================
 
 
@@ -160,8 +171,8 @@ def tui_queue_with_manager() -> Generator[tuple[TuiQueue, SyncManager]]:
     ],
 )
 def test_format_elapsed(elapsed: float | None, expected: str) -> None:
-    """_format_elapsed formats elapsed time correctly."""
-    assert run_tui._format_elapsed(elapsed) == expected
+    """format_elapsed formats elapsed time correctly."""
+    assert tui_status.format_elapsed(elapsed) == expected
 
 
 # =============================================================================
@@ -188,7 +199,7 @@ def test_should_use_tui_explicit_mode(display_mode: DisplayMode, expected: bool)
 
 def test_stage_info_initialization() -> None:
     """StageInfo initializes with correct defaults."""
-    info = run_tui.StageInfo("test_stage", 1, 5)
+    info = StageInfo("test_stage", 1, 5)
 
     assert info.name == "test_stage"
     assert info.index == 1
@@ -202,13 +213,13 @@ def test_stage_info_initialization() -> None:
 
 def test_stage_info_logs_bounded() -> None:
     """StageInfo logs deque has maxlen of 1000."""
-    info = run_tui.StageInfo("test", 1, 1)
+    info = StageInfo("test", 1, 1)
 
     for i in range(1500):
-        info.logs.append((f"line {i}", False, 1234567890.0 + i))
+        info.logs.append(LogEntry(f"line {i}", False, 1234567890.0 + i))
 
     assert len(info.logs) == 1000, "Logs should be bounded to 1000 entries"
-    assert info.logs[0] == ("line 500", False, 1234567890.0 + 500), (
+    assert info.logs[0] == LogEntry("line 500", False, 1234567890.0 + 500), (
         "Oldest entries should be dropped"
     )
 
@@ -291,21 +302,21 @@ def test_executor_complete(
 
 
 # =============================================================================
-# RunTuiApp Initialization Tests
+# PivotApp Initialization Tests (Run Mode)
 # =============================================================================
 
 
 def test_run_tui_app_init(
     tui_queue_with_manager: tuple[TuiQueue, SyncManager],
 ) -> None:
-    """RunTuiApp initializes with stage names and queue."""
+    """PivotApp initializes with stage names and queue."""
     tui_queue, _manager = tui_queue_with_manager
     stage_names = ["stage1", "stage2", "stage3"]
 
     def executor_func() -> dict[str, executor.ExecutionSummary]:
         return {}
 
-    app = run_tui.RunTuiApp(stage_names, tui_queue, executor_func)
+    app = run_tui.PivotApp(tui_queue, stage_names=stage_names, executor_func=executor_func)
 
     assert len(app._stages) == 3
     assert list(app._stage_order) == stage_names
@@ -318,14 +329,14 @@ def test_run_tui_app_init(
 def test_run_tui_app_stage_info_indexes(
     tui_queue_with_manager: tuple[TuiQueue, SyncManager],
 ) -> None:
-    """RunTuiApp assigns correct 1-based indexes to stages."""
+    """PivotApp assigns correct 1-based indexes to stages."""
     tui_queue, _manager = tui_queue_with_manager
     stage_names = ["first", "second", "third"]
 
     def executor_func() -> dict[str, executor.ExecutionSummary]:
         return {}
 
-    app = run_tui.RunTuiApp(stage_names, tui_queue, executor_func)
+    app = run_tui.PivotApp(tui_queue, stage_names=stage_names, executor_func=executor_func)
 
     assert app._stages["first"].index == 1
     assert app._stages["second"].index == 2
@@ -470,53 +481,31 @@ def test_executor_status_includes_correct_index_and_total(
 # =============================================================================
 
 
-def test_status_styles_covers_all_statuses() -> None:
-    """STATUS_STYLES dict has entries for all relevant StageStatus values."""
-    assert StageStatus.READY in run_tui.STATUS_STYLES
-    assert StageStatus.IN_PROGRESS in run_tui.STATUS_STYLES
-    assert StageStatus.COMPLETED in run_tui.STATUS_STYLES
-    assert StageStatus.RAN in run_tui.STATUS_STYLES
-    assert StageStatus.SKIPPED in run_tui.STATUS_STYLES
-    assert StageStatus.FAILED in run_tui.STATUS_STYLES
-    assert StageStatus.UNKNOWN in run_tui.STATUS_STYLES
-
-
-def test_status_styles_returns_tuple() -> None:
-    """STATUS_STYLES values are (label, style) tuples."""
-    for status, (label, style) in run_tui.STATUS_STYLES.items():
-        assert isinstance(label, str), f"Label for {status} should be string"
+def test_status_functions_cover_all_statuses() -> None:
+    """get_status_symbol and get_status_label handle all StageStatus values."""
+    for status in StageStatus:
+        symbol, style = tui_status.get_status_symbol(status)
+        assert isinstance(symbol, str), f"Symbol for {status} should be string"
         assert isinstance(style, str), f"Style for {status} should be string"
+
+        label, label_style = tui_status.get_status_label(status)
+        assert isinstance(label, str), f"Label for {status} should be string"
+        assert isinstance(label_style, str), f"Label style for {status} should be string"
+
+
+def test_status_functions_return_non_empty() -> None:
+    """Status functions return non-empty values."""
+    for status in StageStatus:
+        symbol, _ = tui_status.get_status_symbol(status)
+        assert len(symbol) > 0, f"Symbol for {status} should not be empty"
+
+        label, _ = tui_status.get_status_label(status)
         assert len(label) > 0, f"Label for {status} should not be empty"
 
 
 # =============================================================================
-# WatchTuiApp Tests
+# PivotApp Tests (Watch Mode)
 # =============================================================================
-
-
-class _MockEngine:
-    """Mock engine for WatchTuiApp tests."""
-
-    def __init__(self) -> None:
-        self._keep_going: bool = False
-
-    def run(
-        self,
-        tui_queue: TuiQueue | None = None,
-        output_queue: mp.Queue[OutputMessage] | None = None,
-    ) -> None:
-        pass
-
-    def shutdown(self) -> None:
-        pass
-
-    def toggle_keep_going(self) -> bool:
-        self._keep_going = not self._keep_going
-        return self._keep_going
-
-    @property
-    def keep_going(self) -> bool:
-        return self._keep_going
 
 
 @pytest.mark.parametrize(
@@ -526,11 +515,17 @@ class _MockEngine:
         (True, True),
     ],
 )
-def test_watch_tui_app_init_no_commit(no_commit: bool, expected: bool) -> None:
-    """WatchTuiApp initializes no_commit correctly."""
+def test_watch_tui_app_init_no_commit(
+    mock_watch_engine: WatchEngine, no_commit: bool, expected: bool
+) -> None:
+    """PivotApp (watch mode) initializes no_commit correctly."""
     # TUI queue uses stdlib queue.Queue (inter-thread, not cross-process)
     tui_queue: TuiQueue = thread_queue.Queue()
-    app = run_tui.WatchTuiApp(_MockEngine(), tui_queue, no_commit=no_commit)
+    app = run_tui.PivotApp(
+        tui_queue,
+        engine=mock_watch_engine,
+        no_commit=no_commit,
+    )
     assert app._no_commit is expected
 
 
@@ -541,7 +536,7 @@ def test_watch_tui_app_init_no_commit(no_commit: bool, expected: bool) -> None:
 
 def test_confirm_commit_screen_has_bindings() -> None:
     """ConfirmCommitScreen has y, n, and escape bindings."""
-    bindings = run_tui.ConfirmCommitScreen.BINDINGS
+    bindings = ConfirmCommitScreen.BINDINGS
     assert len(bindings) == 3
     # Extract keys from Binding objects - bindings are Binding instances
     binding_keys = set[str]()
@@ -556,16 +551,15 @@ def test_confirm_commit_screen_has_bindings() -> None:
 
 
 def test_confirm_commit_screen_has_css() -> None:
-    """ConfirmCommitScreen has default CSS defined."""
-    css = run_tui.ConfirmCommitScreen.DEFAULT_CSS
-    assert "ConfirmCommitScreen" in css
-    assert "dialog" in css
+    """ConfirmCommitScreen has CSS path defined."""
+    assert ConfirmCommitScreen.CSS_PATH is not None
+    assert "modal.tcss" in ConfirmCommitScreen.CSS_PATH
 
 
 def test_confirm_commit_screen_instantiation() -> None:
     """ConfirmCommitScreen can be instantiated."""
-    screen = run_tui.ConfirmCommitScreen()
-    assert isinstance(screen, run_tui.ConfirmCommitScreen)
+    screen = ConfirmCommitScreen()
+    assert isinstance(screen, ConfirmCommitScreen)
 
 
 # =============================================================================
@@ -582,27 +576,31 @@ def mock_tui_queue() -> Generator[TuiQueue]:
 
 
 @pytest.fixture
-def simple_run_app(mock_tui_queue: TuiQueue) -> run_tui.RunTuiApp:
-    """Create a simple RunTuiApp for testing."""
+def simple_run_app(mock_tui_queue: TuiQueue) -> run_tui.PivotApp:
+    """Create a simple PivotApp for testing."""
 
     def executor_func() -> dict[str, executor.ExecutionSummary]:
         return {}
 
-    return run_tui.RunTuiApp(["stage1", "stage2", "stage3"], mock_tui_queue, executor_func)
+    return run_tui.PivotApp(
+        mock_tui_queue,
+        stage_names=["stage1", "stage2", "stage3"],
+        executor_func=executor_func,
+    )
 
 
 @pytest.mark.asyncio
 async def test_run_app_mounts_with_correct_structure(
-    simple_run_app: run_tui.RunTuiApp,
+    simple_run_app: run_tui.PivotApp,
 ) -> None:
-    """RunTuiApp mounts with stage list and detail panels."""
+    """PivotApp mounts with stage list and detail panels."""
     async with simple_run_app.run_test():
         # Check stage list exists
-        stage_list = simple_run_app.query_one("#stage-list", run_tui.StageListPanel)
+        stage_list = simple_run_app.query_one("#stage-list", StageListPanel)
         assert stage_list is not None
 
         # Check detail panel exists
-        detail_panel = simple_run_app.query_one("#detail-panel", run_tui.TabbedDetailPanel)
+        detail_panel = simple_run_app.query_one("#detail-panel", TabbedDetailPanel)
         assert detail_panel is not None
 
         # Check tabs exist
@@ -612,7 +610,7 @@ async def test_run_app_mounts_with_correct_structure(
 
 @pytest.mark.asyncio
 async def test_run_app_action_nav_down_changes_selection(
-    simple_run_app: run_tui.RunTuiApp,
+    simple_run_app: run_tui.PivotApp,
 ) -> None:
     """action_nav_down navigates between stages."""
     async with simple_run_app.run_test() as pilot:
@@ -634,7 +632,7 @@ async def test_run_app_action_nav_down_changes_selection(
 
 @pytest.mark.asyncio
 async def test_run_app_action_nav_up_changes_selection(
-    simple_run_app: run_tui.RunTuiApp,
+    simple_run_app: run_tui.PivotApp,
 ) -> None:
     """action_nav_up navigates between stages."""
     async with simple_run_app.run_test() as pilot:
@@ -656,7 +654,7 @@ async def test_run_app_action_nav_up_changes_selection(
 
 @pytest.mark.asyncio
 async def test_run_app_navigation_stays_at_bounds(
-    simple_run_app: run_tui.RunTuiApp,
+    simple_run_app: run_tui.PivotApp,
 ) -> None:
     """Navigation stays at list bounds (no wrap)."""
     async with simple_run_app.run_test() as pilot:
@@ -676,7 +674,7 @@ async def test_run_app_navigation_stays_at_bounds(
 
 
 @pytest.mark.asyncio
-async def test_run_app_action_switch_focus(simple_run_app: run_tui.RunTuiApp) -> None:
+async def test_run_app_action_switch_focus(simple_run_app: run_tui.PivotApp) -> None:
     """action_switch_focus toggles between panels."""
     async with simple_run_app.run_test() as pilot:
         await pilot.pause()
@@ -696,7 +694,7 @@ async def test_run_app_action_switch_focus(simple_run_app: run_tui.RunTuiApp) ->
 
 
 @pytest.mark.asyncio
-async def test_run_app_quit_action(simple_run_app: run_tui.RunTuiApp) -> None:
+async def test_run_app_quit_action(simple_run_app: run_tui.PivotApp) -> None:
     """action_quit exits the app."""
     async with simple_run_app.run_test() as pilot:
         await pilot.pause()
@@ -712,7 +710,7 @@ async def test_run_app_stages_shown(mock_tui_queue: TuiQueue) -> None:
     def executor_func() -> dict[str, executor.ExecutionSummary]:
         return {}
 
-    app = run_tui.RunTuiApp(stage_names, mock_tui_queue, executor_func)
+    app = run_tui.PivotApp(mock_tui_queue, stage_names=stage_names, executor_func=executor_func)
 
     async with app.run_test() as pilot:
         await pilot.pause()
@@ -729,7 +727,7 @@ async def test_run_app_stages_shown(mock_tui_queue: TuiQueue) -> None:
 
 def test_tabbed_detail_panel_init() -> None:
     """TabbedDetailPanel initializes with None stage."""
-    panel = run_tui.TabbedDetailPanel(id="test-detail")
+    panel = TabbedDetailPanel(id="test-detail")
     assert panel._stage is None
 
 
@@ -740,8 +738,8 @@ def test_tabbed_detail_panel_init() -> None:
 
 def test_stage_row_init() -> None:
     """StageRow initializes with StageInfo."""
-    info = run_tui.StageInfo("test", 1, 3)
-    row = run_tui.StageRow(info)
+    info = StageInfo("test", 1, 3)
+    row = StageRow(info)
     assert row._info is info
 
 
@@ -753,31 +751,12 @@ def test_stage_row_init() -> None:
 def test_stage_list_panel_init() -> None:
     """StageListPanel initializes with stages list."""
     stages = [
-        run_tui.StageInfo("s1", 1, 2),
-        run_tui.StageInfo("s2", 2, 2),
+        StageInfo("s1", 1, 2),
+        StageInfo("s2", 2, 2),
     ]
-    panel = run_tui.StageListPanel(stages, id="test-list")
+    panel = StageListPanel(stages, id="test-list")
     assert panel._stages == stages
     assert panel._rows == {}  # Empty until mounted
-
-
-# =============================================================================
-# DetailPanel Tests
-# =============================================================================
-
-
-def test_detail_panel_init() -> None:
-    """DetailPanel initializes with None stage."""
-    panel = run_tui.DetailPanel(id="test-detail")
-    assert panel._stage is None
-
-
-def test_detail_panel_set_stage() -> None:
-    """DetailPanel.set_stage updates internal stage."""
-    panel = run_tui.DetailPanel()
-    info = run_tui.StageInfo("test", 1, 1)
-    panel.set_stage(info)
-    assert panel._stage is info
 
 
 # =============================================================================
@@ -787,7 +766,7 @@ def test_detail_panel_set_stage() -> None:
 
 def test_log_panel_init() -> None:
     """LogPanel initializes with empty logs and no filter."""
-    panel = run_tui.LogPanel()
+    panel = LogPanel()
     assert panel._filter_stage is None
     assert len(panel._all_logs) == 0
 
@@ -799,5 +778,5 @@ def test_log_panel_init() -> None:
 
 def test_stage_log_panel_init() -> None:
     """StageLogPanel can be instantiated."""
-    panel = run_tui.StageLogPanel(id="test-logs")
-    assert isinstance(panel, run_tui.StageLogPanel)
+    panel = StageLogPanel(id="test-logs")
+    assert isinstance(panel, StageLogPanel)

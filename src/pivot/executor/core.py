@@ -110,6 +110,7 @@ def prepare_workers(
     if not parallel or stage_count <= 0:
         return 1
     workers = _compute_max_workers(stage_count, max_workers)
+    _ensure_cleanup_registered()
     pool = loky.get_reusable_executor(max_workers=workers)
     _warm_workers(pool, workers)
     return workers
@@ -123,6 +124,7 @@ def restart_workers(stage_count: int, max_workers: int | None = None) -> int:
     if stage_count <= 0:
         return 1
     workers = _compute_max_workers(stage_count, max_workers)
+    _ensure_cleanup_registered()
     pool = loky.get_reusable_executor(max_workers=workers, kill_workers=True)
     _warm_workers(pool, workers)
     return workers

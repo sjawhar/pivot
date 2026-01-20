@@ -4,10 +4,7 @@ import sys
 import threading
 import time
 from collections import deque
-from typing import TYPE_CHECKING, TypedDict
-
-if TYPE_CHECKING:
-    from multiprocessing import Queue
+from typing import Protocol, TypedDict
 
 
 class QueueStats(TypedDict):
@@ -80,6 +77,14 @@ class SlidingWindowCounter:
         return total / _THROUGHPUT_WINDOW_SECS
 
 
+class SizedQueue(Protocol):
+    """Protocol for queues that support qsize()."""
+
+    def qsize(self) -> int:
+        """Return the approximate size of the queue."""
+        ...
+
+
 class QueueStatsTracker:
     """Thread-safe tracker for queue statistics.
 
@@ -88,13 +93,13 @@ class QueueStatsTracker:
     """
 
     _name: str
-    _queue: Queue[object] | None
+    _queue: SizedQueue | None
     _lock: threading.Lock
     _messages_received: int
     _high_water_mark: int
     _throughput: SlidingWindowCounter
 
-    def __init__(self, name: str, queue: Queue[object] | None = None) -> None:
+    def __init__(self, name: str, queue: SizedQueue | None = None) -> None:
         self._name = name
         self._queue = queue
         self._lock = threading.Lock()

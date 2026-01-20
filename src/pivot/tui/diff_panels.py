@@ -36,6 +36,7 @@ from pivot.types import (
     OutputChange,
     ParamChange,
     StageExplanation,
+    StageStatus,
 )
 
 if TYPE_CHECKING:
@@ -104,19 +105,6 @@ def _format_hash_change(
             return f"{_truncate_hash(old_hash)} -> {_truncate_hash(new_hash)}"
         case _ as unreachable:  # pyright: ignore[reportUnnecessaryComparison]
             assert_never(unreachable)
-
-
-def _get_registry_info(stage_name: str) -> RegistryStageInfo | None:
-    """Safely get registry info for a stage."""
-    try:
-        return REGISTRY.get(stage_name)
-    except KeyError:
-        return None
-
-
-def _get_state_dir() -> pathlib.Path:
-    """Get the state directory path."""
-    return config.get_state_dir()
 
 
 def _get_relative_path(abs_path: str) -> str:
@@ -439,11 +427,13 @@ class InputDiffPanel(_SelectableExpandablePanel):
 
     def _load_stage_data(self, stage_name: str) -> None:  # pragma: no cover
         """Load and cache stage data."""
-        self._registry_info = _get_registry_info(stage_name)
-        if self._registry_info is None:
+        try:
+            self._registry_info = REGISTRY.get(stage_name)
+        except KeyError:
+            logger.debug("Stage %s not in registry", stage_name)
             return
 
-        state_dir = _get_state_dir()
+        state_dir = config.get_state_dir()
         try:
             self._explanation = explain.get_stage_explanation(
                 stage_name=stage_name,
@@ -455,6 +445,7 @@ class InputDiffPanel(_SelectableExpandablePanel):
                 state_dir=state_dir,
             )
         except Exception:
+            logger.debug("Failed to load explanation for %s", stage_name, exc_info=True)
             self._explanation = None
             return
 
@@ -695,7 +686,10 @@ class InputDiffPanel(_SelectableExpandablePanel):
         self._reset_selection_state()
         self._explanation = snapshot
         self._stage_name = snapshot["stage_name"]
-        self._registry_info = _get_registry_info(snapshot["stage_name"])
+        try:
+            self._registry_info = REGISTRY.get(snapshot["stage_name"])
+        except KeyError:
+            self._registry_info = None
         self._code_by_key = {c["key"]: c for c in snapshot["code_changes"]}
         self._dep_by_path = {d["path"]: d for d in snapshot["dep_changes"]}
         self._param_by_key = {p["key"]: p for p in snapshot["param_changes"]}
@@ -708,6 +702,7 @@ class OutputDiffPanel(_SelectableExpandablePanel):
     # Cache for stage data
     _stage_name: str | None
     _registry_info: RegistryStageInfo | None
+    _stage_status: StageStatus | None
     # Dict-based storage for O(1) lookup by path
     _output_by_path: dict[str, OutputChange]
     _metric_diff_cache: dict[str, list[MetricDiff]]
@@ -718,15 +713,19 @@ class OutputDiffPanel(_SelectableExpandablePanel):
             id=id, classes="diff-panel" if classes is None else f"diff-panel {classes}"
         )
         self._registry_info = None
+        self._stage_status = None
         self._output_by_path = dict[str, OutputChange]()
         self._metric_diff_cache = dict[str, list[MetricDiff]]()
         self._head_hashes = None
 
     @override
-    def set_stage(self, stage_name: str | None) -> None:  # pragma: no cover
+    def set_stage(  # pragma: no cover
+        self, stage_name: str | None, *, status: StageStatus | None = None
+    ) -> None:
         """Update the displayed stage and load data."""
         self._reset_selection_state()
         self._registry_info = None
+        self._stage_status = status
         self._output_by_path.clear()
         self._metric_diff_cache.clear()
         self._head_hashes = None
@@ -739,13 +738,19 @@ class OutputDiffPanel(_SelectableExpandablePanel):
 
     def _load_stage_data(self, stage_name: str) -> None:  # pragma: no cover
         """Load and cache stage data."""
-        self._registry_info = _get_registry_info(stage_name)
-        if self._registry_info is None:
+        try:
+            self._registry_info = REGISTRY.get(stage_name)
+        except KeyError:
+            logger.debug("Stage %s not in registry", stage_name)
             return
 
-        state_dir = _get_state_dir()
+        state_dir = config.get_state_dir()
         stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(state_dir))
-        lock_data = stage_lock.read()
+        try:
+            lock_data = stage_lock.read()
+        except Exception:
+            logger.debug("Failed to read lock data for %s", stage_name, exc_info=True)
+            lock_data = None
 
         output_changes = compute_output_changes(lock_data, self._registry_info)
         self._output_by_path = {c["path"]: c for c in output_changes}
@@ -1096,13 +1101,22 @@ class OutputDiffPanel(_SelectableExpandablePanel):
             return "[dim]No stage selected[/]"
         if self._registry_info is None:
             return "[dim]Stage not in registry[/]"
+        # Show "running" message only if stage is actually in progress
+        if self._stage_status == StageStatus.IN_PROGRESS:
+            return "[dim]Stage running - output will appear when complete[/]"
         return "[dim]No outputs[/]"
 
-    def set_from_snapshot(self, stage_name: str, changes: list[OutputChange]) -> None:
+    def set_from_snapshot(
+        self, stage_name: str, changes: list[OutputChange], *, status: StageStatus | None = None
+    ) -> None:
         """Display pre-captured snapshot instead of computing from current state."""
         self._reset_selection_state()
         self._stage_name = stage_name
-        self._registry_info = _get_registry_info(stage_name)
+        self._stage_status = status
+        try:
+            self._registry_info = REGISTRY.get(stage_name)
+        except KeyError:
+            self._registry_info = None
         self._output_by_path = {c["path"]: c for c in changes}
         self._metric_diff_cache.clear()  # Metric diffs not available for historical
         self._head_hashes = None

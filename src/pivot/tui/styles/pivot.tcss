@@ -1,0 +1,136 @@
+#main-split {
+    height: 1fr;
+}
+
+#stage-list {
+    width: 40%;
+    min-width: 35;
+    max-width: 60;
+    height: 100%;
+    border: solid $surface-lighten-1;
+    padding: 0 1;
+}
+
+#stage-list.focused {
+    border: solid $primary;
+}
+
+#detail-panel {
+    width: 1fr;
+    height: 100%;
+    border: solid $surface-lighten-1;
+}
+
+#detail-panel.focused {
+    border: solid $primary;
+}
+
+#detail-header {
+    height: 1;
+    padding: 0 1;
+    background: $surface-lighten-1;
+}
+
+#detail-tabs {
+    height: 1fr;
+}
+
+/* Fix for RichLog inside TabbedContent - ensure ContentSwitcher has explicit height */
+#detail-tabs ContentSwitcher {
+    height: 1fr;
+}
+
+#detail-tabs TabPane {
+    height: 100%;
+}
+
+#stage-logs {
+    height: 100%;
+}
+
+#input-panel {
+    height: 100%;
+    padding: 1;
+    overflow-y: auto;
+}
+
+#output-panel {
+    height: 100%;
+    padding: 1;
+    overflow-y: auto;
+}
+
+#log-panel {
+    height: 1fr;
+    border: solid yellow;
+}
+
+.section-header {
+    text-style: bold;
+    margin-bottom: 1;
+}
+
+/* Stage row collapsed state (inside collapsed group) */
+.stage-row.collapsed {
+    display: none;
+}
+
+/* Group header styling */
+.stage-group-header {
+    background: $surface-lighten-1;
+}
+
+#logs-view {
+    height: 100%;
+    display: none;
+}
+
+.view-active {
+    display: block;
+}
+
+.view-hidden {
+    display: none;
+}
+
+/* Split-view layout for diff panels */
+.diff-panel {
+    height: 100%;
+}
+
+.diff-panel #item-list {
+    width: 50%;
+    height: 100%;
+    overflow-y: auto;
+}
+
+.diff-panel #detail-pane {
+    width: 50%;
+    height: 100%;
+    border-left: solid $surface-lighten-1;
+    padding-left: 1;
+    overflow-y: auto;
+}
+
+.diff-panel.expanded #item-list {
+    display: none;
+}
+
+.diff-panel.expanded #detail-pane {
+    width: 100%;
+    border-left: none;
+}
+
+/* Debug panel - toggleable footer showing queue stats */
+#debug-panel {
+    height: auto;
+    max-height: 4;
+    background: $surface;
+    border-top: solid $primary;
+    padding: 0 1;
+    display: none;
+}
+
+#debug-panel.visible {
+    display: block;
+}

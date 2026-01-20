@@ -7,13 +7,13 @@ import queue
 import time
 from typing import TYPE_CHECKING
 
-import pytest
-
 from pivot.tui import run as run_tui
-from pivot.types import OutputMessage, StageStatus, TuiQueue
+from pivot.tui.types import ExecutionHistoryEntry, LogEntry, PendingHistoryState, StageInfo
+from pivot.tui.widgets import TabbedDetailPanel
+from pivot.types import StageStatus, TuiQueue
 
 if TYPE_CHECKING:
-    import multiprocessing as mp
+    from pivot.watch.engine import WatchEngine
 
 # =============================================================================
 # ExecutionHistoryEntry Tests
@@ -22,14 +22,17 @@ if TYPE_CHECKING:
 
 def test_execution_history_entry_creation() -> None:
     """ExecutionHistoryEntry can be created with all fields."""
-    entry = run_tui.ExecutionHistoryEntry(
+    entry = ExecutionHistoryEntry(
         run_id="20240101_120000_abcd1234",
         stage_name="process_data",
         timestamp=1704067200.0,
         duration=5.5,
         status=StageStatus.RAN,
         reason="code changed",
-        logs=[("Processing...", False, 1704067200.0), ("Done", False, 1704067205.0)],
+        logs=[
+            LogEntry("Processing...", False, 1704067200.0),
+            LogEntry("Done", False, 1704067205.0),
+        ],
         input_snapshot=None,
         output_snapshot=None,
     )
@@ -44,7 +47,7 @@ def test_execution_history_entry_creation() -> None:
 
 def test_execution_history_entry_with_none_duration() -> None:
     """ExecutionHistoryEntry supports None duration for incomplete executions."""
-    entry = run_tui.ExecutionHistoryEntry(
+    entry = ExecutionHistoryEntry(
         run_id="20240101_120000_abcd1234",
         stage_name="process_data",
         timestamp=time.time(),
@@ -64,33 +67,33 @@ def test_execution_history_entry_with_none_duration() -> None:
 
 
 def test_pending_history_state_creation() -> None:
-    """_PendingHistoryState can be created with run_id and timestamp."""
-    state = run_tui._PendingHistoryState(run_id="test_run", timestamp=1234567890.0)
+    """PendingHistoryState can be created with run_id and timestamp."""
+    state = PendingHistoryState(run_id="test_run", timestamp=1234567890.0)
     assert state.run_id == "test_run"
     assert state.timestamp == 1234567890.0
     assert len(state.logs) == 0
 
 
 def test_pending_history_state_logs_default_factory() -> None:
-    """_PendingHistoryState.logs defaults to empty deque with separate instances."""
-    state1 = run_tui._PendingHistoryState(run_id="run1", timestamp=1.0)
-    state2 = run_tui._PendingHistoryState(run_id="run2", timestamp=2.0)
-    state1.logs.append(("line", False, 1.0))
+    """PendingHistoryState.logs defaults to empty deque with separate instances."""
+    state1 = PendingHistoryState(run_id="run1", timestamp=1.0)
+    state2 = PendingHistoryState(run_id="run2", timestamp=2.0)
+    state1.logs.append(LogEntry("line", False, 1.0))
     assert len(state1.logs) == 1
     assert len(state2.logs) == 0  # Separate deque instance
 
 
 def test_pending_history_state_logs_bounded_at_500() -> None:
-    """_PendingHistoryState.logs is bounded at 500 entries to prevent memory growth."""
-    state = run_tui._PendingHistoryState(run_id="test", timestamp=1.0)
+    """PendingHistoryState.logs is bounded at 500 entries to prevent memory growth."""
+    state = PendingHistoryState(run_id="test", timestamp=1.0)
     # Add more than 500 logs
     for i in range(600):
-        state.logs.append((f"line {i}", False, float(i)))
+        state.logs.append(LogEntry(f"line {i}", False, float(i)))
     # Should be capped at 500
     assert len(state.logs) == 500
     # Should have kept the most recent entries (oldest evicted)
-    assert state.logs[0] == ("line 100", False, 100.0)
-    assert state.logs[-1] == ("line 599", False, 599.0)
+    assert state.logs[0] == LogEntry("line 100", False, 100.0)
+    assert state.logs[-1] == LogEntry("line 599", False, 599.0)
 
 
 # =============================================================================
@@ -100,24 +103,24 @@ def test_pending_history_state_logs_bounded_at_500() -> None:
 
 def test_stage_info_has_history_deque() -> None:
     """StageInfo includes history deque."""
-    info = run_tui.StageInfo(name="test_stage", index=1, total=3)
+    info = StageInfo(name="test_stage", index=1, total=3)
     assert hasattr(info, "history")
     assert isinstance(info.history, collections.deque)
 
 
 def test_stage_info_history_initially_empty() -> None:
     """StageInfo history starts empty."""
-    info = run_tui.StageInfo(name="test_stage", index=1, total=3)
+    info = StageInfo(name="test_stage", index=1, total=3)
     assert len(info.history) == 0
 
 
 def test_stage_info_history_bounded_at_50() -> None:
     """StageInfo history deque is bounded at 50 entries."""
-    info = run_tui.StageInfo(name="test_stage", index=1, total=3)
+    info = StageInfo(name="test_stage", index=1, total=3)
 
     # Add more than 50 entries
     for i in range(60):
-        entry = run_tui.ExecutionHistoryEntry(
+        entry = ExecutionHistoryEntry(
             run_id=f"run_{i:03d}",
             stage_name="test_stage",
             timestamp=time.time() + i,
@@ -140,10 +143,10 @@ def test_stage_info_history_bounded_at_50() -> None:
 
 def test_stage_info_history_preserves_order() -> None:
     """History entries are maintained in insertion order."""
-    info = run_tui.StageInfo(name="test_stage", index=1, total=3)
+    info = StageInfo(name="test_stage", index=1, total=3)
 
     for i in range(5):
-        entry = run_tui.ExecutionHistoryEntry(
+        entry = ExecutionHistoryEntry(
             run_id=f"run_{i}",
             stage_name="test_stage",
             timestamp=time.time() + i,
@@ -169,64 +172,64 @@ def test_stage_info_history_preserves_order() -> None:
 
 def test_tabbed_detail_panel_has_history_state() -> None:
     """TabbedDetailPanel tracks history viewing state."""
-    panel = run_tui.TabbedDetailPanel()
+    panel = TabbedDetailPanel()
     assert panel._history_index is None
     assert panel._history_total == 0
 
 
 def test_tabbed_detail_panel_history_index_starts_none() -> None:
     """History index None means live view."""
-    panel = run_tui.TabbedDetailPanel()
+    panel = TabbedDetailPanel()
     # None = live view (not viewing history)
     assert panel._history_index is None
 
 
 # =============================================================================
-# WatchTuiApp History State Tests
+# PivotApp (watch mode) History State Tests
 # =============================================================================
 
 
 def test_watch_tui_app_has_history_tracking_state(
-    mock_engine: run_tui.WatchEngineProtocol,
+    mock_watch_engine: WatchEngine,
 ) -> None:
-    """WatchTuiApp has state for tracking history navigation."""
+    """PivotApp (watch mode) has state for tracking history navigation."""
     tui_queue: TuiQueue = queue.Queue()
-    app = run_tui.WatchTuiApp(mock_engine, tui_queue, stage_names=["test"])
+    app = run_tui.PivotApp(tui_queue, engine=mock_watch_engine, stage_names=["test"])
 
     assert app._viewing_history_index is None
 
 
 def test_watch_tui_app_pending_history_tracking(
-    mock_engine: run_tui.WatchEngineProtocol,
+    mock_watch_engine: WatchEngine,
 ) -> None:
-    """WatchTuiApp tracks pending history entries during execution."""
+    """PivotApp (watch mode) tracks pending history entries during execution."""
     tui_queue: TuiQueue = queue.Queue()
-    app = run_tui.WatchTuiApp(mock_engine, tui_queue, stage_names=["test"])
+    app = run_tui.PivotApp(tui_queue, engine=mock_watch_engine, stage_names=["test"])
 
     assert isinstance(app._pending_history, dict)
     assert len(app._pending_history) == 0
 
 
 def test_watch_tui_app_get_current_stage_history_empty(
-    mock_engine: run_tui.WatchEngineProtocol,
+    mock_watch_engine: WatchEngine,
 ) -> None:
     """_get_current_stage_history returns empty deque when no selection."""
     tui_queue: TuiQueue = queue.Queue()
-    app = run_tui.WatchTuiApp(mock_engine, tui_queue, stage_names=[])
+    app = run_tui.PivotApp(tui_queue, engine=mock_watch_engine, stage_names=[])
 
     history = app._get_current_stage_history()
     assert len(history) == 0
 
 
 def test_watch_tui_app_get_current_stage_history_with_stage(
-    mock_engine: run_tui.WatchEngineProtocol,
+    mock_watch_engine: WatchEngine,
 ) -> None:
     """_get_current_stage_history returns stage's history deque."""
     tui_queue: TuiQueue = queue.Queue()
-    app = run_tui.WatchTuiApp(mock_engine, tui_queue, stage_names=["stage_a"])
+    app = run_tui.PivotApp(tui_queue, engine=mock_watch_engine, stage_names=["stage_a"])
 
     # Add a history entry
-    entry = run_tui.ExecutionHistoryEntry(
+    entry = ExecutionHistoryEntry(
         run_id="test_run",
         stage_name="stage_a",
         timestamp=time.time(),
@@ -250,7 +253,7 @@ def test_watch_tui_app_get_current_stage_history_with_stage(
 
 
 def test_finalize_history_skipped_without_pending_creates_entry(
-    mock_engine: run_tui.WatchEngineProtocol,
+    mock_watch_engine: WatchEngine,
 ) -> None:
     """Skipped stages without pending state still get history entries.
 
@@ -258,7 +261,7 @@ def test_finalize_history_skipped_without_pending_creates_entry(
     IN_PROGRESS (so never had _pending_history entry created).
     """
     tui_queue: TuiQueue = queue.Queue()
-    app = run_tui.WatchTuiApp(mock_engine, tui_queue, stage_names=["downstream_stage"])
+    app = run_tui.PivotApp(tui_queue, engine=mock_watch_engine, stage_names=["downstream_stage"])
 
     # Verify no pending history
     assert "downstream_stage" not in app._pending_history
@@ -283,11 +286,11 @@ def test_finalize_history_skipped_without_pending_creates_entry(
 
 
 def test_finalize_history_skipped_without_run_id_does_not_create_entry(
-    mock_engine: run_tui.WatchEngineProtocol,
+    mock_watch_engine: WatchEngine,
 ) -> None:
     """Skipped stages without run_id don't get history entries (defensive)."""
     tui_queue: TuiQueue = queue.Queue()
-    app = run_tui.WatchTuiApp(mock_engine, tui_queue, stage_names=["downstream_stage"])
+    app = run_tui.PivotApp(tui_queue, engine=mock_watch_engine, stage_names=["downstream_stage"])
 
     # Call without run_id - should not create entry
     app._finalize_history_entry(
@@ -303,7 +306,7 @@ def test_finalize_history_skipped_without_run_id_does_not_create_entry(
 
 
 def test_finalize_history_failed_without_pending_does_not_create_entry(
-    mock_engine: run_tui.WatchEngineProtocol,
+    mock_watch_engine: WatchEngine,
 ) -> None:
     """Non-SKIPPED statuses without pending state don't get history entries.
 
@@ -311,7 +314,7 @@ def test_finalize_history_failed_without_pending_does_not_create_entry(
     should always have gone through IN_PROGRESS.
     """
     tui_queue: TuiQueue = queue.Queue()
-    app = run_tui.WatchTuiApp(mock_engine, tui_queue, stage_names=["some_stage"])
+    app = run_tui.PivotApp(tui_queue, engine=mock_watch_engine, stage_names=["some_stage"])
 
     # Call with FAILED status but no pending state - unusual case
     app._finalize_history_entry(
@@ -327,7 +330,7 @@ def test_finalize_history_failed_without_pending_does_not_create_entry(
 
 
 def test_watch_tui_app_new_run_clears_stale_pending_entries(
-    mock_engine: run_tui.WatchEngineProtocol,
+    mock_watch_engine: WatchEngine,
 ) -> None:
     """New run_id clears pending entries from previous run.
 
@@ -335,12 +338,12 @@ def test_watch_tui_app_new_run_clears_stale_pending_entries(
     and a new run starts, leaving orphaned pending entries.
     """
     tui_queue: TuiQueue = queue.Queue()
-    app = run_tui.WatchTuiApp(mock_engine, tui_queue, stage_names=["stage_a", "stage_b"])
+    app = run_tui.PivotApp(tui_queue, engine=mock_watch_engine, stage_names=["stage_a", "stage_b"])
 
     # Set up first run with pending entries
     app._current_run_id = "run_001"
-    app._pending_history["stage_a"] = run_tui._PendingHistoryState(run_id="run_001", timestamp=1.0)
-    app._pending_history["stage_b"] = run_tui._PendingHistoryState(run_id="run_001", timestamp=2.0)
+    app._pending_history["stage_a"] = PendingHistoryState(run_id="run_001", timestamp=1.0)
+    app._pending_history["stage_b"] = PendingHistoryState(run_id="run_001", timestamp=2.0)
     assert len(app._pending_history) == 2
 
     # Simulate detecting new run by calling _create_history_entry with new run_id
@@ -359,46 +362,10 @@ def test_watch_tui_app_new_run_clears_stale_pending_entries(
 
 
 def test_watch_tui_app_tracks_current_run_id(
-    mock_engine: run_tui.WatchEngineProtocol,
+    mock_watch_engine: WatchEngine,
 ) -> None:
-    """WatchTuiApp tracks current run_id for detecting new runs."""
+    """PivotApp (watch mode) tracks current run_id for detecting new runs."""
     tui_queue: TuiQueue = queue.Queue()
-    app = run_tui.WatchTuiApp(mock_engine, tui_queue, stage_names=[])
+    app = run_tui.PivotApp(tui_queue, engine=mock_watch_engine, stage_names=[])
 
     assert app._current_run_id is None
-
-
-# =============================================================================
-# Fixtures
-# =============================================================================
-
-
-class MockWatchEngine:
-    """Mock watch engine for testing."""
-
-    def __init__(self) -> None:
-        self._keep_going: bool = False
-
-    def run(
-        self,
-        tui_queue: TuiQueue | None = None,
-        output_queue: mp.Queue[OutputMessage] | None = None,
-    ) -> None:
-        pass
-
-    def shutdown(self) -> None:
-        pass
-
-    def toggle_keep_going(self) -> bool:
-        self._keep_going = not self._keep_going
-        return self._keep_going
-
-    @property
-    def keep_going(self) -> bool:
-        return self._keep_going
-
-
-@pytest.fixture
-def mock_engine() -> run_tui.WatchEngineProtocol:
-    """Provide a mock watch engine."""
-    return MockWatchEngine()
