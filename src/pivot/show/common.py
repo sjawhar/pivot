@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import TYPE_CHECKING, Any
 
 import tabulate
@@ -13,20 +14,14 @@ from pivot.types import ChangeType, OutputFormat, StorageLockData
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
+logger = logging.getLogger(__name__)
 
-def read_lock_files_from_head(
+
+def _parse_lock_contents(
     stage_names: Sequence[str],
+    lock_contents: dict[str, bytes],
 ) -> dict[str, StorageLockData | None]:
-    """Batch read and parse lock files from git HEAD.
-
-    Returns {stage_name: parsed_lock_data or None}.
-    """
-    if not stage_names:
-        return {}
-
-    lock_paths = [f"{lock.STAGES_REL_PATH}/{name}.lock" for name in stage_names]
-    lock_contents = git.read_files_from_head(lock_paths)
-
+    """Parse lock file contents into StorageLockData."""
     result = dict[str, StorageLockData | None]()
     for stage_name in stage_names:
         lock_path = f"{lock.STAGES_REL_PATH}/{stage_name}.lock"
@@ -37,7 +32,8 @@ def read_lock_files_from_head(
 
         try:
             data: object = yaml.load(content, Loader=yaml_config.Loader)
-        except yaml.YAMLError:
+        except yaml.YAMLError as e:
+            logger.debug(f"Failed to parse lock file for {stage_name}: {e}")
             result[stage_name] = None
             continue
 
@@ -48,6 +44,29 @@ def read_lock_files_from_head(
         result[stage_name] = data
 
     return result
+
+
+def read_lock_files_from_head(
+    stage_names: Sequence[str],
+) -> dict[str, StorageLockData | None]:
+    """Batch read and parse lock files from git HEAD."""
+    if not stage_names:
+        return {}
+    lock_paths = [f"{lock.STAGES_REL_PATH}/{name}.lock" for name in stage_names]
+    lock_contents = git.read_files_from_head(lock_paths)
+    return _parse_lock_contents(stage_names, lock_contents)
+
+
+def read_lock_files_from_revision(
+    stage_names: Sequence[str],
+    rev: str,
+) -> dict[str, StorageLockData | None]:
+    """Batch read and parse lock files from a specific git revision."""
+    if not stage_names:
+        return {}
+    lock_paths = [f"{lock.STAGES_REL_PATH}/{name}.lock" for name in stage_names]
+    lock_contents = git.read_files_from_revision(lock_paths, rev)
+    return _parse_lock_contents(stage_names, lock_contents)
 
 
 def extract_output_hashes_from_lock(

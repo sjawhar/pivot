@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fnmatch
 import logging
 from typing import TYPE_CHECKING, NamedTuple, cast
 
@@ -256,3 +257,52 @@ def read_files_from_revision(rel_paths: Sequence[str], rev: str) -> dict[str, by
         if content is not None:
             result[rel_path] = content
     return result
+
+
+def _list_tree_files(
+    repo: dulwich.repo.Repo,
+    tree_sha: bytes,
+    prefix: str,
+    pattern: str,
+) -> list[str]:
+    """Recursively list files in a tree matching a glob pattern."""
+    result = list[str]()
+    tree = repo[tree_sha]
+    if not isinstance(tree, dulwich.objects.Tree):
+        return result
+
+    for entry in tree.items():
+        try:
+            name = entry.path.decode()
+        except UnicodeDecodeError:
+            logger.debug(f"Skipping non-UTF8 filename: {entry.path!r}")
+            continue
+
+        full_path = f"{prefix}/{name}" if prefix else name
+
+        if entry.mode & 0o40000:
+            result.extend(_list_tree_files(repo, entry.sha, full_path, pattern))
+        elif fnmatch.fnmatch(name, pattern):
+            result.append(full_path)
+
+    return result
+
+
+def list_files_at_revision(directory: str, rev: str, pattern: str = "*") -> list[str]:
+    """List files matching pattern in a directory at a git revision; empty list on error."""
+    ctx = _get_revision_context(rev)
+    if ctx is None:
+        return []
+
+    full_dir = _resolve_path(ctx.proj_prefix, directory)
+
+    try:
+        _mode, dir_sha = dulwich.object_store.tree_lookup_path(
+            ctx.repo.__getitem__, ctx.commit.tree, full_dir.encode()
+        )
+    except KeyError:
+        logger.debug(f"Directory not found at revision {rev}: {directory}")
+        return []
+
+    files = _list_tree_files(ctx.repo, dir_sha, "", pattern)
+    return [f"{directory}/{f}" for f in files]

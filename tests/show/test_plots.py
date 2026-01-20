@@ -659,3 +659,156 @@ def test_render_plots_html_escapes_xss(tmp_path: Path) -> None:
     content = result.read_text()
     assert "<script>" not in content, "Script tags should be escaped"
     assert "&lt;script&gt;" in content, "HTML entities should be used"
+
+
+# =============================================================================
+# get_output_hashes_from_revision Tests
+# =============================================================================
+
+
+def test_get_output_hashes_from_revision_no_git_repo(set_project_root: Path) -> None:
+    """Returns empty dict when not in a git repo."""
+    result = plots.get_output_hashes_from_revision("HEAD")
+
+    assert result == {}
+
+
+def test_get_output_hashes_from_revision_returns_hashes(set_project_root: Path) -> None:
+    """Returns output hashes from lock files at revision."""
+    _setup_git_repo(set_project_root)
+
+    # Create and commit lock file with hash
+    state_dir = set_project_root / ".pivot"
+    stages_dir = lock.get_stages_dir(state_dir)
+    stages_dir.mkdir(parents=True, exist_ok=True)
+    stage_lock = lock.StageLock("test_stage", stages_dir)
+    stage_lock.write(
+        LockData(
+            code_manifest={},
+            params={},
+            dep_hashes={},
+            output_hashes={"output.csv": {"hash": "abc123"}},
+            dep_generations={},
+        )
+    )
+
+    subprocess.run(["git", "add", "."], cwd=set_project_root, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "initial"],
+        cwd=set_project_root,
+        check=True,
+        capture_output=True,
+    )
+
+    result = plots.get_output_hashes_from_revision("HEAD")
+
+    assert result == {"output.csv": "abc123"}
+
+
+def test_get_output_hashes_from_revision_multiple_stages(set_project_root: Path) -> None:
+    """Returns hashes from multiple stages."""
+    _setup_git_repo(set_project_root)
+
+    state_dir = set_project_root / ".pivot"
+    stages_dir = lock.get_stages_dir(state_dir)
+    stages_dir.mkdir(parents=True, exist_ok=True)
+
+    # Create lock files for two stages
+    lock.StageLock("stage1", stages_dir).write(
+        LockData(
+            code_manifest={},
+            params={},
+            dep_hashes={},
+            output_hashes={"plots/chart1.png": {"hash": "hash1"}},
+            dep_generations={},
+        )
+    )
+    lock.StageLock("stage2", stages_dir).write(
+        LockData(
+            code_manifest={},
+            params={},
+            dep_hashes={},
+            output_hashes={"plots/chart2.png": {"hash": "hash2"}},
+            dep_generations={},
+        )
+    )
+
+    subprocess.run(["git", "add", "."], cwd=set_project_root, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "initial"],
+        cwd=set_project_root,
+        check=True,
+        capture_output=True,
+    )
+
+    result = plots.get_output_hashes_from_revision("HEAD")
+
+    assert result == {"plots/chart1.png": "hash1", "plots/chart2.png": "hash2"}
+
+
+def test_get_output_hashes_from_revision_normalizes_paths(set_project_root: Path) -> None:
+    """Normalizes paths (e.g., ./foo.csv -> foo.csv)."""
+    _setup_git_repo(set_project_root)
+
+    state_dir = set_project_root / ".pivot"
+    stages_dir = lock.get_stages_dir(state_dir)
+    stages_dir.mkdir(parents=True, exist_ok=True)
+    stage_lock = lock.StageLock("test_stage", stages_dir)
+    stage_lock.write(
+        LockData(
+            code_manifest={},
+            params={},
+            dep_hashes={},
+            output_hashes={"./output.csv": {"hash": "abc123"}},
+            dep_generations={},
+        )
+    )
+
+    subprocess.run(["git", "add", "."], cwd=set_project_root, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "initial"],
+        cwd=set_project_root,
+        check=True,
+        capture_output=True,
+    )
+
+    result = plots.get_output_hashes_from_revision("HEAD")
+
+    assert "output.csv" in result, "Path should be normalized"
+    assert "./output.csv" not in result
+
+
+def test_get_output_hashes_from_revision_invalid_revision(set_project_root: Path) -> None:
+    """Returns empty dict for invalid revision."""
+    _setup_git_repo(set_project_root)
+
+    (set_project_root / "readme.txt").write_text("content")
+    subprocess.run(["git", "add", "."], cwd=set_project_root, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "initial"],
+        cwd=set_project_root,
+        check=True,
+        capture_output=True,
+    )
+
+    result = plots.get_output_hashes_from_revision("nonexistent-branch")
+
+    assert result == {}
+
+
+def test_get_output_hashes_from_revision_no_lock_files(set_project_root: Path) -> None:
+    """Returns empty dict when no lock files exist at revision."""
+    _setup_git_repo(set_project_root)
+
+    (set_project_root / "readme.txt").write_text("content")
+    subprocess.run(["git", "add", "."], cwd=set_project_root, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "initial"],
+        cwd=set_project_root,
+        check=True,
+        capture_output=True,
+    )
+
+    result = plots.get_output_hashes_from_revision("HEAD")
+
+    assert result == {}

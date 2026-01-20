@@ -446,3 +446,143 @@ def test_read_files_from_revision_empty_list(tmp_path: Path, monkeypatch: Monkey
     result = git.read_files_from_revision([], "HEAD")
 
     assert result == {}
+
+
+# =============================================================================
+# list_files_at_revision Tests
+# =============================================================================
+
+
+def test_list_files_at_revision_returns_files(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    """Returns list of files matching pattern in directory."""
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@test.com"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test"], cwd=tmp_path, check=True, capture_output=True
+    )
+
+    # Create files in a subdirectory
+    stages_dir = tmp_path / ".pivot" / "stages"
+    stages_dir.mkdir(parents=True)
+    (stages_dir / "stage1.lock").write_text("data1")
+    (stages_dir / "stage2.lock").write_text("data2")
+    (stages_dir / "other.txt").write_text("other")
+
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "initial"], cwd=tmp_path, check=True, capture_output=True
+    )
+
+    monkeypatch.setattr(project, "_project_root_cache", tmp_path)
+
+    result = git.list_files_at_revision(".pivot/stages", "HEAD", "*.lock")
+
+    assert sorted(result) == [".pivot/stages/stage1.lock", ".pivot/stages/stage2.lock"]
+
+
+def test_list_files_at_revision_no_git_repo(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    """Returns empty list when not in a git repo."""
+    monkeypatch.setattr(project, "_project_root_cache", tmp_path)
+
+    result = git.list_files_at_revision(".pivot/stages", "HEAD", "*.lock")
+
+    assert result == []
+
+
+def test_list_files_at_revision_directory_not_found(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    """Returns empty list when directory doesn't exist at revision."""
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@test.com"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test"], cwd=tmp_path, check=True, capture_output=True
+    )
+    (tmp_path / "readme.txt").write_text("content")
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "initial"], cwd=tmp_path, check=True, capture_output=True
+    )
+
+    monkeypatch.setattr(project, "_project_root_cache", tmp_path)
+
+    result = git.list_files_at_revision("nonexistent", "HEAD", "*")
+
+    assert result == []
+
+
+def test_list_files_at_revision_invalid_revision(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    """Returns empty list for invalid revision."""
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@test.com"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test"], cwd=tmp_path, check=True, capture_output=True
+    )
+    (tmp_path / "readme.txt").write_text("content")
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "initial"], cwd=tmp_path, check=True, capture_output=True
+    )
+
+    monkeypatch.setattr(project, "_project_root_cache", tmp_path)
+
+    result = git.list_files_at_revision(".pivot/stages", "invalid-rev", "*.lock")
+
+    assert result == []
+
+
+def test_list_files_at_revision_with_branch(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    """Lists files from a specific branch."""
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@test.com"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test"], cwd=tmp_path, check=True, capture_output=True
+    )
+
+    # Create initial commit with one file
+    stages_dir = tmp_path / ".pivot" / "stages"
+    stages_dir.mkdir(parents=True)
+    (stages_dir / "stage1.lock").write_text("data1")
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "first"], cwd=tmp_path, check=True, capture_output=True)
+
+    # Get first commit SHA
+    result = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=tmp_path, capture_output=True, text=True, check=True
+    )
+    first_sha = result.stdout.strip()[:7]
+
+    # Add another file in second commit
+    (stages_dir / "stage2.lock").write_text("data2")
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "second"], cwd=tmp_path, check=True, capture_output=True)
+
+    monkeypatch.setattr(project, "_project_root_cache", tmp_path)
+
+    # First commit should only have stage1.lock
+    result_first = git.list_files_at_revision(".pivot/stages", first_sha, "*.lock")
+    assert result_first == [".pivot/stages/stage1.lock"]
+
+    # HEAD should have both
+    result_head = git.list_files_at_revision(".pivot/stages", "HEAD", "*.lock")
+    assert sorted(result_head) == [".pivot/stages/stage1.lock", ".pivot/stages/stage2.lock"]
