@@ -199,10 +199,10 @@ def test_run_no_commit_second_run_skips(
         # First run via executor to set up pending lock
         executor.run(show_output=False, no_commit=True)
 
-        # Second run via CLI should skip
+        # Second run via CLI should use cache
         result = runner.invoke(cli.cli, ["run", "--no-commit"])
         assert result.exit_code == 0, f"Failed with output: {result.output}"
-        assert "skipped" in result.output.lower() or "unchanged" in result.output.lower()
+        assert "cached" in result.output.lower() or "unchanged" in result.output.lower()
 
 
 def test_run_no_commit_then_commit_workflow(
@@ -223,7 +223,7 @@ def test_run_no_commit_then_commit_workflow(
         assert result1.exit_code == 0
         assert "Committed 1 stage(s)" in result1.output
 
-        # Now a normal run via CLI should skip (uses production lock)
+        # Now a normal run via CLI should use cache (uses production lock)
         result2 = runner.invoke(cli.cli, ["run"])
         assert result2.exit_code == 0, f"Failed with output: {result2.output}"
-        assert "skipped" in result2.output.lower() or "unchanged" in result2.output.lower()
+        assert "cached" in result2.output.lower() or "unchanged" in result2.output.lower()

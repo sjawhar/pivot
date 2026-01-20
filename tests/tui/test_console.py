@@ -87,15 +87,15 @@ def test_console_stage_start_running() -> None:
     assert "running" in output
 
 
-def test_console_stage_start_checking() -> None:
-    """stage_start prints checking status."""
+def test_console_stage_start_fingerprinting() -> None:
+    """stage_start prints fingerprinting status."""
     stream = io.StringIO()
     con = console.Console(stream=stream, color=False)
 
-    con.stage_start("my_stage", index=1, total=5, status=StageDisplayStatus.CHECKING)
+    con.stage_start("my_stage", index=1, total=5, status=StageDisplayStatus.FINGERPRINTING)
 
     output = stream.getvalue()
-    assert "checking" in output
+    assert "fingerprinting" in output
 
 
 def test_console_stage_start_waiting() -> None:
@@ -123,15 +123,28 @@ def test_console_stage_result_ran() -> None:
     assert "code changed" in output
 
 
-def test_console_stage_result_skipped() -> None:
-    """stage_result prints skipped status."""
+def test_console_stage_result_cached() -> None:
+    """stage_result prints cached status for unchanged stages."""
     stream = io.StringIO()
     con = console.Console(stream=stream, color=False)
 
     con.stage_result("my_stage", index=1, total=5, status=StageStatus.SKIPPED, reason="unchanged")
 
     output = stream.getvalue()
-    assert "skipped" in output
+    assert "cached" in output
+
+
+def test_console_stage_result_blocked() -> None:
+    """stage_result prints blocked status for upstream failures."""
+    stream = io.StringIO()
+    con = console.Console(stream=stream, color=False)
+
+    con.stage_result(
+        "my_stage", index=1, total=5, status=StageStatus.SKIPPED, reason="upstream 'other' failed"
+    )
+
+    output = stream.getvalue()
+    assert "blocked" in output
 
 
 def test_console_stage_result_failed() -> None:
@@ -178,13 +191,17 @@ def test_console_summary() -> None:
     stream = io.StringIO()
     con = console.Console(stream=stream, color=False)
 
-    con.summary(ran=5, skipped=2, failed=1, total_duration=10.5)
+    con.summary(ran=5, cached=2, blocked=1, failed=1, total_duration=10.5)
 
     output = stream.getvalue()
-    assert "5" in output
-    assert "2" in output
-    assert "1" in output
+    assert "5" in output  # ran
+    assert "2" in output  # cached
+    assert "1" in output  # blocked and failed
     assert "10.50s" in output
+    assert "ran" in output
+    assert "cached" in output
+    assert "blocked" in output
+    assert "failed" in output
 
 
 def test_console_error() -> None:

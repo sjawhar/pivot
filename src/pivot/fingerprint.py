@@ -1,4 +1,5 @@
 import ast
+import contextlib
 import dataclasses
 import functools
 import inspect
@@ -30,6 +31,21 @@ _hash_function_ast_cache: weakref.WeakKeyDictionary[Callable[..., Any], str] = (
     weakref.WeakKeyDictionary()
 )
 
+# Cache for getclosurevars results. This is expensive (~0.5ms per call) and the same
+# function may be visited multiple times during recursive fingerprinting.
+_getclosurevars_cache: weakref.WeakKeyDictionary[Callable[..., Any], inspect.ClosureVars] = (
+    weakref.WeakKeyDictionary()
+)
+
+# Cache for is_user_code results. Called 10K+ times for 125 stages, mostly for the same
+# objects. Path resolution is expensive (~0.05ms per call).
+_is_user_code_cache: weakref.WeakKeyDictionary[object, bool] = weakref.WeakKeyDictionary()
+
+# Cache for get_type_hints results. Called ~10x per stage during fingerprinting.
+_get_type_hints_cache: weakref.WeakKeyDictionary[Callable[..., Any], dict[str, Any]] = (
+    weakref.WeakKeyDictionary()
+)
+
 
 def get_stage_fingerprint(
     func: Callable[..., Any], visited: set[int] | None = None
@@ -40,7 +56,7 @@ def get_stage_fingerprint(
     - 'self:<name>': Function itself (hash)
     - 'func:<name>': Referenced helper functions (hash, transitive)
     - 'class:<name>': Referenced class definitions (hash, transitive)
-    - 'mod:<module>.<attr>': Module attributes (hash for user code, "callable" for stdlib)
+    - 'mod:<module>.<attr>': User-code module attributes (hash)
     - 'const:<name>': Global constants (repr value)
     """
     if visited is None:
@@ -65,10 +81,17 @@ def _get_stage_fingerprint_impl(func: Callable[..., Any], visited: set[int]) -> 
     func_name = getattr(func, "__name__", "<lambda>")
     manifest[f"self:{func_name}"] = hash_function_ast(func)
 
-    try:
-        closure_vars = inspect.getclosurevars(func)
-    except (TypeError, AttributeError):
-        return manifest
+    with metrics.timed("fingerprint.getclosurevars"):
+        try:
+            # Use cached result if available (getclosurevars is expensive at ~0.5ms)
+            cached_closure = _getclosurevars_cache.get(func)
+            if cached_closure is not None:
+                closure_vars = cached_closure
+            else:
+                closure_vars = inspect.getclosurevars(func)
+                _getclosurevars_cache[func] = closure_vars
+        except (TypeError, AttributeError):
+            return manifest
 
     _process_closure_values(
         closure_vars.globals,
@@ -205,10 +228,24 @@ def _process_type_hint_dependencies(
     func: Callable[..., Any], manifest: dict[str, str], visited: set[int]
 ) -> None:
     """Process user-defined classes in type hints, including Pydantic model defaults."""
-    try:
-        hints = typing.get_type_hints(func)
-    except Exception:
-        return
+    with metrics.timed("fingerprint.get_type_hints"):
+        # Use cached result if available
+        try:
+            cached = _get_type_hints_cache.get(func)
+            if cached is not None:
+                hints = cached
+            else:
+                try:
+                    hints = typing.get_type_hints(func)
+                except Exception:
+                    return
+                _get_type_hints_cache[func] = hints
+        except TypeError:
+            # Not weakly referenceable
+            try:
+                hints = typing.get_type_hints(func)
+            except Exception:
+                return
 
     for hint in hints.values():
         _process_type_hint(hint, manifest, visited)
@@ -340,7 +377,16 @@ def _process_module_dependency(
     visited: set[int],
 ) -> None:
     """Process module attribute dependencies and add to manifest."""
-    attrs = ast_utils.extract_module_attr_usage(func)
+    # Only track attributes from user-code modules.
+    # Non-user-code modules (numpy, pandas, stdlib) are not tracked because:
+    # - AST already captures which functions are called
+    # - We can't detect library implementation changes anyway
+    # - repr() of objects like np.c_ contains memory addresses (non-deterministic)
+    if not is_user_code(module):
+        return
+
+    with metrics.timed("fingerprint.extract_module_attr_usage"):
+        attrs = ast_utils.extract_module_attr_usage(func)
     module_name = getattr(module, "__name__", name)
 
     for mod_name, attr_name in attrs:
@@ -353,13 +399,11 @@ def _process_module_dependency(
             attr_value = getattr(module, attr_name)
         except AttributeError:
             manifest[key] = "unknown"
+            continue
+        if callable(attr_value) and is_user_code(attr_value):
+            _add_callable_to_manifest(key, attr_value, manifest, visited)
         else:
-            if callable(attr_value) and is_user_code(attr_value):
-                _add_callable_to_manifest(key, attr_value, manifest, visited)
-            elif callable(attr_value):
-                manifest[key] = "callable"
-            else:
-                manifest[key] = repr(attr_value)
+            manifest[key] = repr(attr_value)
 
 
 def hash_function_ast(func: Callable[..., Any]) -> str:
@@ -370,45 +414,56 @@ def hash_function_ast(func: Callable[..., Any]) -> str:
     stages using lambdas. Mitigation: Use named functions instead of lambdas in
     pipeline stages for stable fingerprinting.
     """
-    # WeakKeyDictionary raises TypeError for non-weakly-referenceable functions (builtins)
-    try:
-        cached = _hash_function_ast_cache.get(func)
-        if cached is not None:
-            return cached
-        result = _compute_function_hash(func)
-        _hash_function_ast_cache[func] = result
-        return result
-    except TypeError:
-        return _compute_function_hash(func)
+    with metrics.timed("fingerprint.hash_function_ast"):
+        # WeakKeyDictionary raises TypeError for non-weakly-referenceable functions (builtins)
+        try:
+            cached = _hash_function_ast_cache.get(func)
+            if cached is not None:
+                metrics.count("fingerprint.hash_function_ast.cache_hit")
+                return cached
+            result = _compute_function_hash(func)
+            _hash_function_ast_cache[func] = result
+            return result
+        except TypeError:
+            return _compute_function_hash(func)
 
 
 def _compute_function_hash(func: Callable[..., Any]) -> str:
     """Compute hash for a function (uncached implementation)."""
-    # For wrapped functions (via functools.wraps), inspect.getsource() follows
-    # __wrapped__ and returns the ORIGINAL function's source, making decorator
-    # logic invisible. Use __code__ bytecode to capture the actual wrapper.
-    if hasattr(func, "__wrapped__") and hasattr(func, "__code__"):
-        return xxhash.xxh64(marshal.dumps(func.__code__)).hexdigest()
+    with metrics.timed("fingerprint._compute_function_hash"):
+        # Builtins (list, dict, set, etc.) have no source - use stable name-based hash.
+        # This is deterministic across Python sessions unlike id(func).
+        if isinstance(func, type) and func.__module__ == "builtins":
+            return xxhash.xxh64(f"builtin:{func.__qualname__}".encode()).hexdigest()
 
-    try:
-        source = inspect.getsource(func)
-    except (OSError, TypeError):
-        if hasattr(func, "__code__"):
-            # marshal.dumps captures full code object including co_consts
-            # (co_code alone doesn't include constants - x+1 and x+999 have same co_code!)
-            return xxhash.xxh64(marshal.dumps(func.__code__)).hexdigest()
-        # KNOWN ISSUE: Using id(func) is non-deterministic across runs
-        # This affects lambdas without source code, causing unnecessary re-runs
-        return xxhash.xxh64(str(id(func)).encode()).hexdigest()
+        # For wrapped functions (via functools.wraps), inspect.getsource() follows
+        # __wrapped__ and returns the ORIGINAL function's source, making decorator
+        # logic invisible. Use __code__ bytecode to capture the actual wrapper.
+        if hasattr(func, "__wrapped__") and hasattr(func, "__code__"):
+            return xxhash.xxh64(marshal.dumps(func.__code__)).hexdigest()  # pyright: ignore[reportUnknownMemberType,reportUnknownArgumentType] - hasattr guards access
 
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
-        return xxhash.xxh64(source.encode()).hexdigest()
+        with metrics.timed("fingerprint.inspect_getsource"):
+            try:
+                source = inspect.getsource(func)
+            except (OSError, TypeError):
+                if hasattr(func, "__code__"):
+                    # marshal.dumps captures full code object including co_consts
+                    # (co_code alone doesn't include constants - x+1 and x+999 have same co_code!)
+                    return xxhash.xxh64(marshal.dumps(func.__code__)).hexdigest()  # pyright: ignore[reportUnknownMemberType,reportUnknownArgumentType] - hasattr guards access
+                # KNOWN ISSUE: Using id(func) is non-deterministic across runs
+                # This affects lambdas without source code, causing unnecessary re-runs
+                return xxhash.xxh64(str(id(func)).encode()).hexdigest()
 
-    tree = _normalize_ast(tree)
-    ast_str = ast.dump(tree, annotate_fields=True, include_attributes=False)
-    return xxhash.xxh64(ast_str.encode()).hexdigest()
+        with metrics.timed("fingerprint.ast_parse"):
+            try:
+                tree = ast.parse(source)
+            except SyntaxError:
+                return xxhash.xxh64(source.encode()).hexdigest()
+
+        with metrics.timed("fingerprint.normalize_and_dump"):
+            tree = _normalize_ast(tree)
+            ast_str = ast.dump(tree, annotate_fields=True, include_attributes=False)
+        return xxhash.xxh64(ast_str.encode()).hexdigest()
 
 
 def _normalize_ast(node: ast.AST) -> ast.AST:
@@ -442,9 +497,29 @@ def _has_docstring(node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef) 
 
 def is_user_code(obj: Any) -> bool:
     """Check if object is user code (not stdlib/site-packages/builtins)."""
-    if obj is None:
-        return False
+    with metrics.timed("fingerprint.is_user_code"):
+        if obj is None:
+            return False
 
+        # Use cached result if available (called 10K+ times with many repeats)
+        try:
+            cached = _is_user_code_cache.get(obj)
+            if cached is not None:
+                return cached
+        except TypeError:
+            # Not weakly referenceable
+            pass
+
+        result = _is_user_code_impl(obj)
+
+        with contextlib.suppress(TypeError):
+            _is_user_code_cache[obj] = result
+
+        return result
+
+
+def _is_user_code_impl(obj: Any) -> bool:
+    """Internal implementation of is_user_code."""
     module = _get_module(obj)
     if module is None:
         return False

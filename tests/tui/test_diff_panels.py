@@ -176,9 +176,9 @@ def test_compute_output_changes_no_lock_shows_added(tmp_path: pathlib.Path) -> N
         "variant": None,
         "signature": None,
         "fingerprint": {},
-        "cwd": None,
         "dep_specs": {},
-        "out_path_overrides": None,
+        "out_specs": {},
+        "params_arg_name": None,
     }
 
     result = diff_panels.compute_output_changes(None, registry_info)
@@ -207,9 +207,9 @@ def test_compute_output_changes_missing_file_shows_removed(tmp_path: pathlib.Pat
         "variant": None,
         "signature": None,
         "fingerprint": {},
-        "cwd": None,
         "dep_specs": {},
-        "out_path_overrides": None,
+        "out_specs": {},
+        "params_arg_name": None,
     }
 
     lock_data: LockData = {
@@ -247,9 +247,9 @@ def test_compute_output_changes_unchanged(tmp_path: pathlib.Path) -> None:
         "variant": None,
         "signature": None,
         "fingerprint": {},
-        "cwd": None,
         "dep_specs": {},
-        "out_path_overrides": None,
+        "out_specs": {},
+        "params_arg_name": None,
     }
 
     lock_data: LockData = {
@@ -283,7 +283,7 @@ def test_compute_output_changes_detects_output_types(tmp_path: pathlib.Path) -> 
         "outs": [
             outputs.Out(path=str(out_file), loader=loaders.PathOnly()),
             outputs.Metric(path=str(metric_file)),
-            outputs.Plot(path=str(plot_file)),
+            outputs.Plot(path=str(plot_file), loader=loaders.PathOnly()),
         ],
         "outs_paths": [str(out_file), str(metric_file), str(plot_file)],
         "params": None,
@@ -291,9 +291,9 @@ def test_compute_output_changes_detects_output_types(tmp_path: pathlib.Path) -> 
         "variant": None,
         "signature": None,
         "fingerprint": {},
-        "cwd": None,
         "dep_specs": {},
-        "out_path_overrides": None,
+        "out_specs": {},
+        "params_arg_name": None,
     }
 
     result = diff_panels.compute_output_changes(None, registry_info)

@@ -34,3 +34,6 @@ def get_reusable_executor(
     initargs: tuple[Any, ...] = (),
     env: Mapping[str, str] | None = None,
 ) -> ProcessPoolExecutor: ...
+def cpu_count() -> int | None:
+    """Return the number of CPUs available, respecting cgroup limits."""
+    ...

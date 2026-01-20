@@ -10,6 +10,7 @@ This directory contains all tests for Pivot's automatic code change detection (f
 - **`test_pydantic_defaults.py`** - Tests for Pydantic default data tracking
 - **`test_functools.py`** - Tests for `functools.partial` and `functools.wraps` handling
 - **`test_callback_vulnerabilities.py`** - Tests documenting callback detection edge cases
+- **`test_determinism.py`** - Cross-process fingerprint stability tests (builtins, default_factory)
 
 ---
 
@@ -61,6 +62,9 @@ This document exhaustively catalogs what code changes are and are not detected b
 | Global class instance                                | ✅        | `test_change_detection.py::test_class_instance_tracked`, `test_change_detection.py::test_class_instance_change_causes_miss`         |
 | Class definition change                              | ✅        | `test_change_detection.py::test_class_definition_change_causes_miss`                                                                |
 | Class method change                                  | ✅        | `test_change_detection.py::test_class_definition_change_causes_miss` (class AST includes methods)                                   |
+| StageParams `@property` method change                | ✅        | `test_change_detection.py::test_stageparams_property_change_causes_miss`                                                            |
+| StageParams regular method change                    | ✅        | `test_change_detection.py::test_stageparams_method_change_causes_miss`                                                              |
+| StageParams `ClassVar` change                        | ✅        | `test_change_detection.py::test_stageparams_class_variable_change_causes_miss`                                                      |
 | Nested function (defined inside stage)               | 🚫        | `test_fingerprint.py::test_nested_function_not_in_globals` (part of stage body)                                                     |
 | Helper starting with `_` prefix                      | ✅        | `test_change_detection.py::test_underscore_helper_change_detected`                                                                  |
 | Helper starting with `__` dunder                     | ❌        | `test_fingerprint.py::test_fingerprint_with_underscore_globals`                                                                     |
@@ -276,3 +280,16 @@ Tests in `test_callback_vulnerabilities.py` document edge cases where callback c
 15. **Instance state not tracked**: For user-defined class instances, only the class definition is hashed, not instance state (attributes, dict contents). Runtime-assigned callbacks on instances or in containers are not detected. Workaround: use module-level variables or explicit deps for mutable configuration.
 
 16. **Class attributes modified at runtime not tracked**: Class attributes set after class definition (e.g., `Config.callback = func`) are not detected because only the original class source is hashed. Workaround: use module-level variables instead of class attributes for runtime configuration.
+
+17. **StageParams classes fully tracked**: `StageParams` subclasses used in type hints are tracked via `_process_type_hint_dependencies()`. The entire class definition is hashed using `inspect.getsource()`, which captures:
+    - `@property` methods
+    - Regular methods
+    - `ClassVar` declarations
+
+    Changes to any of these trigger a cache miss.
+
+    Tests: `test_change_detection.py::test_stageparams_property_change_causes_miss`, `test_change_detection.py::test_stageparams_method_change_causes_miss`, `test_change_detection.py::test_stageparams_class_variable_change_causes_miss`
+
+18. **Builtin types ARE deterministic**: Builtin types (`list`, `dict`, `set`, `tuple`, etc.) used as `default_factory` in Pydantic fields are hashed using their qualified name (e.g., `builtin:list`) rather than `id()`. This ensures fingerprints are stable across Python sessions. Previously, `id()` was used as a fallback for objects without source code, causing spurious "Code changed" invalidations.
+
+    Tests: `test_determinism.py::test_builtin_default_factory_deterministic_across_processes`, `test_determinism.py::test_builtin_type_deterministic`

@@ -159,8 +159,8 @@ def leaf_func(x):
     )
 
 
-def test_stdlib_marked_callable_not_hashed(module_dir: pathlib.Path) -> None:
-    """Stdlib functions are marked 'callable', not hashed."""
+def test_stdlib_module_attrs_not_tracked(module_dir: pathlib.Path) -> None:
+    """Stdlib module attributes are NOT tracked in fingerprint."""
     stage_py = module_dir / "test_mod_stage_v4.py"
     stage_py.write_text("""
 import json as json_mod
@@ -172,9 +172,9 @@ def run_stage():
     stage_mod = _import_module("test_mod_stage_v4")
     fp = fingerprint.get_stage_fingerprint(stage_mod.run_stage)
 
-    # json.dumps should be "callable" not a hash
-    assert fp.get("mod:json_mod.dumps") == "callable", (
-        f"Stdlib callable should be 'callable', got: {fp.get('mod:json_mod.dumps')}"
+    # json is stdlib - should NOT be in fingerprint
+    assert "mod:json_mod.dumps" not in fp, (
+        f"Stdlib module attrs should not be tracked, got: {list(fp.keys())}"
     )
 
 

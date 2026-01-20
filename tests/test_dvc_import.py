@@ -204,15 +204,18 @@ def test_convert_outs_cache_false(tmp_path: pathlib.Path) -> None:
     assert len(cache_false_out) == 1
 
 
-def test_convert_wdir_to_cwd(tmp_path: pathlib.Path) -> None:
-    """DVC wdir converts to Pivot cwd."""
+def test_convert_wdir_generates_info_note(tmp_path: pathlib.Path) -> None:
+    """DVC wdir generates an info note (paths are auto-prefixed for resolution)."""
     result = dvc_import.convert_pipeline(
         dvc_yaml_path=FIXTURES_DIR / "complex" / "dvc.yaml",
         project_root=tmp_path,
     )
-    stages = result["stages"]
+    notes = result["notes"]
 
-    assert stages["preprocess"].get("cwd") == "src"
+    wdir_notes = [n for n in notes if "wdir" in n["message"].lower()]
+    assert len(wdir_notes) == 1
+    assert wdir_notes[0]["stage"] == "preprocess"
+    assert wdir_notes[0]["severity"] == "info"
 
 
 def test_frozen_stage_generates_warning(tmp_path: pathlib.Path) -> None:
@@ -492,8 +495,8 @@ stages:
 # =============================================================================
 
 
-def test_absolute_wdir_rejected(tmp_path: pathlib.Path) -> None:
-    """Absolute wdir paths generate error."""
+def test_absolute_wdir_generates_info(tmp_path: pathlib.Path) -> None:
+    """Absolute wdir paths generate info note (paths auto-prefixed)."""
     dvc_yaml = tmp_path / "dvc.yaml"
     dvc_yaml.write_text("""
 stages:
@@ -506,9 +509,10 @@ stages:
         project_root=tmp_path,
     )
 
-    error_notes = [n for n in result["notes"] if n["severity"] == "error"]
-    assert len(error_notes) == 1
-    assert "Absolute wdir" in error_notes[0]["message"]
+    # wdir generates info note since paths are auto-prefixed
+    wdir_notes = [n for n in result["notes"] if "wdir" in n["message"].lower()]
+    assert len(wdir_notes) == 1
+    assert wdir_notes[0]["severity"] == "info"
 
 
 # =============================================================================

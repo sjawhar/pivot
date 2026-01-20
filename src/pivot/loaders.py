@@ -5,7 +5,12 @@ import dataclasses
 import json
 import pathlib
 import pickle
-from typing import override
+from typing import TYPE_CHECKING, Literal, override
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from matplotlib.figure import Figure
 
 import pandas
 import yaml
@@ -28,6 +33,16 @@ class Loader[T](abc.ABC):
     def save(self, data: T, path: pathlib.Path) -> None:
         """Save data to file path."""
         ...
+
+    def empty(self) -> T:
+        """Return an empty instance of the loaded type.
+
+        Used for IncrementalOut on first run when no previous output exists.
+        Override in loaders that support IncrementalOut (JSON, CSV, YAML).
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} cannot provide an empty instance. For IncrementalOut, use a loader with a known empty value (JSON, CSV, YAML)."
+        )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -58,16 +73,25 @@ class CSV[T](Loader[T]):
             raise TypeError(f"CSV loader expects DataFrame, got {type(data).__name__}")
         data.to_csv(path, index=self.index_col is not None)
 
+    @override
+    def empty(self) -> T:
+        return pandas.DataFrame()  # pyright: ignore[reportReturnType] - returns DataFrame, user specifies T
+
 
 @dataclasses.dataclass(frozen=True)
 class JSON[T](Loader[T]):
     """JSON file loader.
 
-    Generic type parameter indicates the expected dict type for type checking.
-    Always returns dict at runtime.
+    Generic type parameter indicates the expected type for type checking.
+
+    Args:
+        indent: JSON indentation (default 2, None for compact).
+        empty_factory: Callable returning empty value for IncrementalOut first run.
+            Defaults to dict. Use list for list types: JSON(empty_factory=list).
     """
 
     indent: int | None = 2
+    empty_factory: Callable[[], T] = dict  # pyright: ignore[reportAssignmentType] - dict is default
 
     @override
     def load(self, path: pathlib.Path) -> T:
@@ -79,14 +103,23 @@ class JSON[T](Loader[T]):
         with open(path, "w") as f:
             json.dump(data, f, indent=self.indent)
 
+    @override
+    def empty(self) -> T:
+        return self.empty_factory()
+
 
 @dataclasses.dataclass(frozen=True)
 class YAML[T](Loader[T]):
     """YAML file loader.
 
     Generic type parameter indicates the expected type for type checking.
-    Returns parsed YAML (typically dict) at runtime.
+
+    Args:
+        empty_factory: Callable returning empty value for IncrementalOut first run.
+            Defaults to dict. Use list for list types: YAML(empty_factory=list).
     """
+
+    empty_factory: Callable[[], T] = dict  # pyright: ignore[reportAssignmentType] - dict is default
 
     @override
     def load(self, path: pathlib.Path) -> T:
@@ -97,6 +130,10 @@ class YAML[T](Loader[T]):
     def save(self, data: T, path: pathlib.Path) -> None:
         with open(path, "w") as f:
             yaml.dump(data, f, default_flow_style=False)
+
+    @override
+    def empty(self) -> T:
+        return self.empty_factory()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -137,3 +174,40 @@ class PathOnly(Loader[pathlib.Path]):
         _ = data  # PathOnly doesn't save data; just validates file exists
         if not path.exists():
             raise FileNotFoundError(f"Output file not created: {path}")
+
+
+@dataclasses.dataclass(frozen=True)
+class MatplotlibFigure(Loader["Figure"]):
+    """Save matplotlib figures as images. Write-only.
+
+    Figures are closed after saving to prevent memory leaks.
+    Format is inferred from path extension (.png, .pdf, .svg).
+    """
+
+    dpi: int = 150
+    bbox_inches: Literal["tight"] | None = "tight"
+    transparent: bool = False
+
+    def __post_init__(self) -> None:
+        if not (1 <= self.dpi <= 2400):
+            raise ValueError(f"dpi must be between 1 and 2400, got {self.dpi}")
+
+    @override
+    def save(self, data: Figure, path: pathlib.Path) -> None:
+        import matplotlib.pyplot as plt
+
+        try:
+            data.savefig(  # pyright: ignore[reportUnknownMemberType] - stubs incomplete
+                path,
+                dpi=self.dpi,
+                bbox_inches=self.bbox_inches,
+                transparent=self.transparent,
+            )
+        finally:
+            plt.close(data)
+
+    @override
+    def load(self, path: pathlib.Path) -> Figure:
+        raise NotImplementedError(
+            "MatplotlibFigure is write-only. Use Out(), not Dep(). To load images, use PathOnly() and handle loading manually."
+        )

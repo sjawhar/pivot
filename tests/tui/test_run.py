@@ -3,7 +3,7 @@ from __future__ import annotations
 import collections
 import multiprocessing as mp
 import pathlib
-import queue
+import queue as thread_queue
 from typing import TYPE_CHECKING, Annotated, TypedDict
 
 import pytest
@@ -20,6 +20,7 @@ from pivot.types import (
     TuiLogMessage,
     TuiMessage,
     TuiMessageType,
+    TuiQueue,
     TuiStatusMessage,
     is_tui_log_message,
     is_tui_status_message,
@@ -109,7 +110,7 @@ def _helper_step3(
 # =============================================================================
 
 
-def _drain_queue(tui_queue: mp.Queue[TuiMessage]) -> list[TuiMessage]:
+def _drain_queue(tui_queue: TuiQueue) -> list[TuiMessage]:
     """Drain all messages from a TUI queue until None sentinel or timeout."""
     messages = list[TuiMessage]()
     while True:
@@ -118,16 +119,22 @@ def _drain_queue(tui_queue: mp.Queue[TuiMessage]) -> list[TuiMessage]:
             if msg is None:
                 break
             messages.append(msg)
-        except queue.Empty:
+        except thread_queue.Empty:
             break
     return messages
 
 
 @pytest.fixture
-def tui_queue_with_manager() -> Generator[tuple[mp.Queue[TuiMessage], SyncManager]]:
-    """Create a TUI queue with proper manager cleanup."""
-    manager = mp.Manager()
-    tui_queue: mp.Queue[TuiMessage] = manager.Queue()  # pyright: ignore[reportAssignmentType]
+def tui_queue_with_manager() -> Generator[tuple[TuiQueue, SyncManager]]:
+    """Create a TUI queue with proper manager cleanup.
+
+    TUI queue is stdlib queue.Queue (inter-thread), Manager is kept for
+    any tests that need output_queue (cross-process).
+    """
+    # Use spawn context to avoid fork-in-multithreaded-context issues (Python 3.13+ deprecation)
+    spawn_ctx = mp.get_context("spawn")
+    manager = spawn_ctx.Manager()
+    tui_queue: TuiQueue = thread_queue.Queue()
     yield tui_queue, manager
     manager.shutdown()
 
@@ -289,7 +296,7 @@ def test_executor_complete(
 
 
 def test_run_tui_app_init(
-    tui_queue_with_manager: tuple[mp.Queue[TuiMessage], SyncManager],
+    tui_queue_with_manager: tuple[TuiQueue, SyncManager],
 ) -> None:
     """RunTuiApp initializes with stage names and queue."""
     tui_queue, _manager = tui_queue_with_manager
@@ -309,7 +316,7 @@ def test_run_tui_app_init(
 
 
 def test_run_tui_app_stage_info_indexes(
-    tui_queue_with_manager: tuple[mp.Queue[TuiMessage], SyncManager],
+    tui_queue_with_manager: tuple[TuiQueue, SyncManager],
 ) -> None:
     """RunTuiApp assigns correct 1-based indexes to stages."""
     tui_queue, _manager = tui_queue_with_manager
@@ -335,7 +342,7 @@ def test_run_tui_app_stage_info_indexes(
 
 def test_executor_emits_status_messages_to_queue(
     pipeline_dir: pathlib.Path,
-    tui_queue_with_manager: tuple[mp.Queue[TuiMessage], SyncManager],
+    tui_queue_with_manager: tuple[TuiQueue, SyncManager],
 ) -> None:
     """Executor emits TuiStatusMessage for stage start and completion."""
     tui_queue, _manager = tui_queue_with_manager
@@ -370,7 +377,7 @@ def test_executor_emits_status_messages_to_queue(
 
 def test_executor_emits_log_messages_to_queue(
     pipeline_dir: pathlib.Path,
-    tui_queue_with_manager: tuple[mp.Queue[TuiMessage], SyncManager],
+    tui_queue_with_manager: tuple[TuiQueue, SyncManager],
 ) -> None:
     """Executor emits TuiLogMessage for stage output."""
     tui_queue, _manager = tui_queue_with_manager
@@ -389,7 +396,7 @@ def test_executor_emits_log_messages_to_queue(
 
 def test_executor_emits_failed_status_on_stage_failure(
     pipeline_dir: pathlib.Path,
-    tui_queue_with_manager: tuple[mp.Queue[TuiMessage], SyncManager],
+    tui_queue_with_manager: tuple[TuiQueue, SyncManager],
 ) -> None:
     """Executor emits FAILED status when stage raises an exception."""
     tui_queue, _manager = tui_queue_with_manager
@@ -411,7 +418,7 @@ def test_executor_emits_failed_status_on_stage_failure(
 
 def test_executor_emits_status_for_multiple_stages(
     pipeline_dir: pathlib.Path,
-    tui_queue_with_manager: tuple[mp.Queue[TuiMessage], SyncManager],
+    tui_queue_with_manager: tuple[TuiQueue, SyncManager],
 ) -> None:
     """Executor emits status messages for all stages in multi-stage pipeline."""
     tui_queue, _manager = tui_queue_with_manager
@@ -439,7 +446,7 @@ def test_executor_emits_status_for_multiple_stages(
 
 def test_executor_status_includes_correct_index_and_total(
     pipeline_dir: pathlib.Path,
-    tui_queue_with_manager: tuple[mp.Queue[TuiMessage], SyncManager],
+    tui_queue_with_manager: tuple[TuiQueue, SyncManager],
 ) -> None:
     """Executor status messages include correct index and total counts."""
     tui_queue, _manager = tui_queue_with_manager
@@ -495,7 +502,7 @@ class _MockEngine:
 
     def run(
         self,
-        tui_queue: mp.Queue[TuiMessage] | None = None,
+        tui_queue: TuiQueue | None = None,
         output_queue: mp.Queue[OutputMessage] | None = None,
     ) -> None:
         pass
@@ -521,13 +528,10 @@ class _MockEngine:
 )
 def test_watch_tui_app_init_no_commit(no_commit: bool, expected: bool) -> None:
     """WatchTuiApp initializes no_commit correctly."""
-    manager = mp.Manager()
-    try:
-        tui_queue: mp.Queue[TuiMessage] = manager.Queue()  # pyright: ignore[reportAssignmentType]
-        app = run_tui.WatchTuiApp(_MockEngine(), tui_queue, no_commit=no_commit)
-        assert app._no_commit is expected
-    finally:
-        manager.shutdown()
+    # TUI queue uses stdlib queue.Queue (inter-thread, not cross-process)
+    tui_queue: TuiQueue = thread_queue.Queue()
+    app = run_tui.WatchTuiApp(_MockEngine(), tui_queue, no_commit=no_commit)
+    assert app._no_commit is expected
 
 
 # =============================================================================
@@ -570,16 +574,15 @@ def test_confirm_commit_screen_instantiation() -> None:
 
 
 @pytest.fixture
-def mock_tui_queue() -> Generator[mp.Queue[TuiMessage]]:
+def mock_tui_queue() -> Generator[TuiQueue]:
     """Create a mock TUI queue for testing."""
-    manager = mp.Manager()
-    tui_queue: mp.Queue[TuiMessage] = manager.Queue()  # pyright: ignore[reportAssignmentType]
+    # TUI queue uses stdlib queue.Queue (inter-thread, not cross-process)
+    tui_queue: TuiQueue = thread_queue.Queue()
     yield tui_queue
-    manager.shutdown()
 
 
 @pytest.fixture
-def simple_run_app(mock_tui_queue: mp.Queue[TuiMessage]) -> run_tui.RunTuiApp:
+def simple_run_app(mock_tui_queue: TuiQueue) -> run_tui.RunTuiApp:
     """Create a simple RunTuiApp for testing."""
 
     def executor_func() -> dict[str, executor.ExecutionSummary]:
@@ -702,7 +705,7 @@ async def test_run_app_quit_action(simple_run_app: run_tui.RunTuiApp) -> None:
 
 
 @pytest.mark.asyncio
-async def test_run_app_stages_shown(mock_tui_queue: mp.Queue[TuiMessage]) -> None:
+async def test_run_app_stages_shown(mock_tui_queue: TuiQueue) -> None:
     """Stage names appear in the app."""
     stage_names = ["alpha", "beta", "gamma"]
 

@@ -402,9 +402,9 @@ def test_registry_get_stage():
         variant=None,
         signature=None,
         fingerprint={},
-        cwd=None,
         dep_specs={},
-        out_path_overrides=None,
+        out_specs={},
+        params_arg_name=None,
     )
     stage_info = reg.get("test")
     assert stage_info["name"] == "test"
@@ -433,9 +433,9 @@ def test_registry_list_stages():
         variant=None,
         signature=None,
         fingerprint={},
-        cwd=None,
         dep_specs={},
-        out_path_overrides=None,
+        out_specs={},
+        params_arg_name=None,
     )
     reg._stages["stage2"] = RegistryStageInfo(
         name="stage2",
@@ -449,9 +449,9 @@ def test_registry_list_stages():
         variant=None,
         signature=None,
         fingerprint={},
-        cwd=None,
         dep_specs={},
-        out_path_overrides=None,
+        out_specs={},
+        params_arg_name=None,
     )
     stages = reg.list_stages()
     assert set(stages) == {"stage1", "stage2"}
@@ -480,9 +480,9 @@ def test_registry_clear():
         variant=None,
         signature=None,
         fingerprint={},
-        cwd=None,
         dep_specs={},
-        out_path_overrides=None,
+        out_specs={},
+        params_arg_name=None,
     )
     reg.clear()
     assert reg.list_stages() == []
@@ -547,14 +547,14 @@ def test_multiple_stages_registered():
     assert "stage3" in stages
 
 
-def test_stage_captures_module_attrs():
-    """Should capture module.attr patterns in fingerprint."""
-    # Use fingerprinting directly on module-level function
+def test_stage_captures_user_code_helpers():
+    """Should capture user-code helper functions but not stdlib module attrs."""
     fp = fingerprint.get_stage_fingerprint(stage_uses_helper)
 
-    # Should capture the helper which uses math.pi
+    # Should capture the helper (user code)
     assert "func:helper_uses_math" in fp
-    assert "mod:math.pi" in fp
+    # math.pi is stdlib - should NOT be in fingerprint
+    assert "mod:math.pi" not in fp
 
 
 def test_register_captures_constants():
@@ -622,9 +622,9 @@ def test_registry_snapshot_returns_copy() -> None:
         variant=None,
         signature=None,
         fingerprint={},
-        cwd=None,
         dep_specs={},
-        out_path_overrides=None,
+        out_specs={},
+        params_arg_name=None,
     )
 
     snapshot = reg.snapshot()
@@ -657,9 +657,9 @@ def test_registry_restore_replaces_stages() -> None:
         variant=None,
         signature=None,
         fingerprint={},
-        cwd=None,
         dep_specs={},
-        out_path_overrides=None,
+        out_specs={},
+        params_arg_name=None,
     )
 
     backup = RegistryStageInfo(
@@ -674,9 +674,9 @@ def test_registry_restore_replaces_stages() -> None:
         variant=None,
         signature=None,
         fingerprint={},
-        cwd=None,
         dep_specs={},
-        out_path_overrides=None,
+        out_specs={},
+        params_arg_name=None,
     )
     snapshot = {"backup": backup}
 
@@ -701,9 +701,9 @@ def test_registry_restore_empty_snapshot() -> None:
         variant=None,
         signature=None,
         fingerprint={},
-        cwd=None,
         dep_specs={},
-        out_path_overrides=None,
+        out_specs={},
+        params_arg_name=None,
     )
 
     reg.restore({})
@@ -727,9 +727,9 @@ def test_registry_restore_preserves_metadata() -> None:
         variant="v1",
         signature=None,
         fingerprint={"self:original": "abc123"},
-        cwd=None,
         dep_specs={},
-        out_path_overrides=None,
+        out_specs={},
+        params_arg_name=None,
     )
     snapshot = {"original": original}
 
@@ -755,3 +755,53 @@ def test_stageparams_work() -> None:
     info = REGISTRY.get("plain_stage")
     assert isinstance(info["params"], PlainParams)
     assert info["params"].learning_rate == 0.01
+
+
+# ==============================================================================
+# out_path_overrides accepts simple strings
+# ==============================================================================
+
+
+def test_out_path_overrides_accepts_simple_string() -> None:
+    """out_path_overrides should accept simple strings, not just dicts with path key."""
+
+    def my_stage() -> _OutputTxt:
+        return {"output": pathlib.Path("output.txt")}
+
+    # Simple string should work (not {"output": {"path": "override.txt"}})
+    register_test_stage(my_stage, out_path_overrides={"output": "override.txt"})
+
+    info = REGISTRY.get("my_stage")
+    assert info["out_specs"]["output"].path == "override.txt"
+
+
+def test_out_path_overrides_accepts_dict_with_options() -> None:
+    """out_path_overrides should accept dicts with path and options."""
+
+    def my_stage2() -> _OutputTxt:
+        return {"output": pathlib.Path("output.txt")}
+
+    # Full dict with options should also work
+    register_test_stage(
+        my_stage2, out_path_overrides={"output": {"path": "override.txt", "cache": False}}
+    )
+
+    info = REGISTRY.get("my_stage2")
+    assert info["out_specs"]["output"].path == "override.txt"
+    assert info["out_specs"]["output"].cache is False
+
+
+def test_out_path_overrides_accepts_list_paths() -> None:
+    """out_path_overrides should accept list paths for multi-file outputs."""
+
+    class MultiOutput(TypedDict):
+        items: Annotated[list[str], outputs.Out(["a.txt", "b.txt"], loaders.PathOnly())]
+
+    def my_stage3() -> MultiOutput:
+        return {"items": []}
+
+    # Simple list should work
+    register_test_stage(my_stage3, out_path_overrides={"items": ["x.txt", "y.txt"]})
+
+    info = REGISTRY.get("my_stage3")
+    assert info["out_specs"]["items"].path == ["x.txt", "y.txt"]

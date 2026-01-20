@@ -248,7 +248,7 @@ def test_error_if_params_in_yaml_but_no_signature(simple_pipeline: pathlib.Path)
     )
     pipeline_file.write_text(config_text)
 
-    with pytest.raises(pipeline_config.PipelineConfigError, match="no 'params' parameter"):
+    with pytest.raises(pipeline_config.PipelineConfigError, match="has no StageParams parameter"):
         pipeline_config.register_from_pipeline_file(pipeline_file)
 
 
@@ -268,7 +268,8 @@ def test_error_if_params_parameter_has_no_type_hint(
         del sys.modules["stages"]
 
     pipeline_file = params_pipeline / "pivot.yaml"
-    with pytest.raises(pipeline_config.PipelineConfigError, match="type hint"):
+    # With type-based detection, untyped params won't be detected as StageParams
+    with pytest.raises(pipeline_config.PipelineConfigError, match="has no StageParams parameter"):
         pipeline_config.register_from_pipeline_file(pipeline_file)
 
 
@@ -412,24 +413,6 @@ def test_load_invalid_yaml_raises(tmp_path: pathlib.Path) -> None:
     pipeline_file.write_text("stages: not_a_dict")
 
     with pytest.raises(pipeline_config.PipelineConfigError, match="Invalid"):
-        pipeline_config.load_pipeline_file(pipeline_file)
-
-
-def test_cwd_with_path_traversal_raises(tmp_path: pathlib.Path) -> None:
-    """cwd with path traversal (..) raises validation error."""
-    pipeline_file = tmp_path / "pivot.yaml"
-    pipeline_file.write_text(
-        """\
-stages:
-  bad_stage:
-    python: os.getcwd
-    outs:
-      out: out.txt
-    cwd: "../escape"
-"""
-    )
-
-    with pytest.raises(pipeline_config.PipelineConfigError, match="\\.\\."):
         pipeline_config.load_pipeline_file(pipeline_file)
 
 
@@ -644,6 +627,140 @@ stages:
         pipeline_config.register_from_pipeline_file(pipeline_file)
 
 
+def test_matrix_interpolates_plots(simple_pipeline: pathlib.Path) -> None:
+    """Matrix ${var} interpolation works in plots section."""
+    stages_file = simple_pipeline / "stages.py"
+    stages_file.write_text(
+        """\
+import pathlib
+from typing import Annotated, TypedDict
+from pivot import loaders, outputs
+
+class TrainOutputs(TypedDict):
+    plot: Annotated[pathlib.Path, outputs.Plot("plots/default.png", loaders.PathOnly())]
+
+def train(
+    data: Annotated[pathlib.Path, outputs.Dep("data/raw.csv", loaders.PathOnly())],
+) -> TrainOutputs:
+    return {"plot": pathlib.Path("plots/default.png")}
+"""
+    )
+
+    pipeline_file = simple_pipeline / "pivot.yaml"
+    pipeline_file.write_text(
+        """\
+stages:
+  train:
+    python: stages.train
+    plots:
+      plot: "plots/${model}_curve.png"
+    matrix:
+      model:
+        - bert
+        - gpt
+"""
+    )
+
+    pipeline_config.register_from_pipeline_file(pipeline_file)
+
+    bert_info = registry.REGISTRY.get("train@bert")
+    gpt_info = registry.REGISTRY.get("train@gpt")
+
+    # Plot paths should be interpolated
+    assert any("plots/bert_curve.png" in p for p in bert_info["outs_paths"])
+    assert any("plots/gpt_curve.png" in p for p in gpt_info["outs_paths"])
+    # Should NOT have unresolved variables
+    assert "${model}" not in " ".join(bert_info["outs_paths"])
+
+
+def test_matrix_interpolates_metrics(simple_pipeline: pathlib.Path) -> None:
+    """Matrix ${var} interpolation works in metrics section."""
+    stages_file = simple_pipeline / "stages.py"
+    stages_file.write_text(
+        """\
+import pathlib
+from typing import Annotated, TypedDict
+from pivot import loaders, outputs
+
+class TrainOutputs(TypedDict):
+    metrics: Annotated[dict, outputs.Metric("metrics/default.json")]
+
+def train(
+    data: Annotated[pathlib.Path, outputs.Dep("data/raw.csv", loaders.PathOnly())],
+) -> TrainOutputs:
+    return {"metrics": {"loss": 0.5}}
+"""
+    )
+
+    pipeline_file = simple_pipeline / "pivot.yaml"
+    pipeline_file.write_text(
+        """\
+stages:
+  train:
+    python: stages.train
+    metrics:
+      metrics: "metrics/${model}_results.json"
+    matrix:
+      model:
+        - bert
+        - gpt
+"""
+    )
+
+    pipeline_config.register_from_pipeline_file(pipeline_file)
+
+    bert_info = registry.REGISTRY.get("train@bert")
+    gpt_info = registry.REGISTRY.get("train@gpt")
+
+    # Metric paths should be interpolated
+    assert any("metrics/bert_results.json" in p for p in bert_info["outs_paths"])
+    assert any("metrics/gpt_results.json" in p for p in gpt_info["outs_paths"])
+    # Should NOT have unresolved variables
+    assert "${model}" not in " ".join(bert_info["outs_paths"])
+
+
+def test_matrix_unresolved_variable_in_params_raises(simple_pipeline: pathlib.Path) -> None:
+    """Unresolved ${var} in params raises PipelineConfigError."""
+    stages_file = simple_pipeline / "stages.py"
+    stages_file.write_text(
+        """\
+import pathlib
+from typing import Annotated, TypedDict
+import pydantic
+from pivot import loaders, outputs, stage_def
+
+class TrainParams(stage_def.StageParams):
+    config_path: str
+
+class TrainOutputs(TypedDict):
+    model: Annotated[pathlib.Path, outputs.Out("models/out.pkl", loaders.PathOnly())]
+
+def train(
+    params: TrainParams,
+    data: Annotated[pathlib.Path, outputs.Dep("data/raw.csv", loaders.PathOnly())],
+) -> TrainOutputs:
+    return {"model": pathlib.Path("models/out.pkl")}
+"""
+    )
+
+    pipeline_file = simple_pipeline / "pivot.yaml"
+    pipeline_file.write_text(
+        """\
+stages:
+  train:
+    python: stages.train
+    params:
+      config_path: "configs/${unknown}/model.yaml"
+    matrix:
+      model:
+        - bert
+"""
+    )
+
+    with pytest.raises(pipeline_config.PipelineConfigError, match="unresolved"):
+        pipeline_config.register_from_pipeline_file(pipeline_file)
+
+
 def test_matrix_name_template_missing_dimensions_raises(
     simple_pipeline: pathlib.Path,
 ) -> None:
@@ -810,11 +927,10 @@ stages:
         pipeline_config.register_from_pipeline_file(pipeline_file)
 
 
-def test_variants_with_cwd(
+def test_variants_function_unknown_keys_raises(
     simple_pipeline: pathlib.Path,
 ) -> None:
-    """variants with cwd override is applied correctly."""
-    (simple_pipeline / "subdir").mkdir()
+    """variants function with unknown keys in dict raises PipelineConfigError."""
     stages_file = simple_pipeline / "stages.py"
     stages_file.write_text(
         """\
@@ -823,19 +939,16 @@ from typing import Annotated, TypedDict
 from pivot import loaders, outputs
 
 class TrainOutputs(TypedDict):
-    b: Annotated[pathlib.Path, outputs.Out("b.txt", loaders.PathOnly())]
-
-def preprocess():
-    pass
+    model: Annotated[pathlib.Path, outputs.Out("models/model.pkl", loaders.PathOnly())]
 
 def train(
-    a: Annotated[pathlib.Path, outputs.Dep("a.txt", loaders.PathOnly())],
+    data: Annotated[pathlib.Path, outputs.Dep("data/input.csv", loaders.PathOnly())],
 ) -> TrainOutputs:
-    return {"b": pathlib.Path("b.txt")}
+    return {"model": pathlib.Path("models/model.pkl")}
 
 def get_variants():
     return [
-        {"name": "v1", "cwd": "subdir"},
+        {"name": "v1", "parmas": {"learning_rate": 0.01}},  # typo: "parmas" not "params"
     ]
 """
     )
@@ -850,10 +963,8 @@ stages:
 """
     )
 
-    pipeline_config.register_from_pipeline_file(pipeline_file)
-
-    info = registry.REGISTRY.get("train@v1")
-    assert "subdir" in str(info["cwd"])
+    with pytest.raises(pipeline_config.PipelineConfigError, match="unknown keys.*parmas"):
+        pipeline_config.register_from_pipeline_file(pipeline_file)
 
 
 # =============================================================================
@@ -1035,56 +1146,6 @@ stages:
     assert "memory" in gpt_info["mutex"]
     assert "disk" in gpt_info["mutex"]
     assert "gpu" not in gpt_info["mutex"]  # Base was replaced, not merged
-
-
-def test_matrix_cwd_override(simple_pipeline: pathlib.Path) -> None:
-    """Matrix dimension can override cwd."""
-    (simple_pipeline / "bert_dir").mkdir()
-    (simple_pipeline / "gpt_dir").mkdir()
-    stages_file = simple_pipeline / "stages.py"
-    stages_file.write_text(
-        """\
-import pathlib
-from typing import Annotated, TypedDict
-from pivot import loaders, outputs
-
-class TrainOutputs(TypedDict):
-    model: Annotated[pathlib.Path, outputs.Out("models/model.pkl", loaders.PathOnly())]
-
-def preprocess():
-    pass
-
-def train(
-    clean: Annotated[pathlib.Path, outputs.Dep("data/clean.csv", loaders.PathOnly())],
-) -> TrainOutputs:
-    return {"model": pathlib.Path("models/model.pkl")}
-"""
-    )
-
-    pipeline_file = simple_pipeline / "pivot.yaml"
-    pipeline_file.write_text(
-        """\
-stages:
-  train:
-    python: stages.train
-    outs:
-      model: "models/${model}.pkl"
-    matrix:
-      model:
-        bert:
-          cwd: bert_dir
-        gpt:
-          cwd: gpt_dir
-"""
-    )
-
-    pipeline_config.register_from_pipeline_file(pipeline_file)
-
-    bert_info = registry.REGISTRY.get("train@bert")
-    gpt_info = registry.REGISTRY.get("train@gpt")
-
-    assert "bert_dir" in str(bert_info["cwd"])
-    assert "gpt_dir" in str(gpt_info["cwd"])
 
 
 def test_matrix_outs_override(simple_pipeline: pathlib.Path) -> None:
@@ -1497,3 +1558,97 @@ stages:
     # String with interpolation becomes string
     assert params["path"] == "models/0.001.pkl"
     assert isinstance(params["path"], str)
+
+
+# =============================================================================
+# Dict-Form Output with List Paths Tests
+# =============================================================================
+
+
+def test_output_dict_form_with_list_path(simple_pipeline: pathlib.Path) -> None:
+    """Dict-form output with list path is parsed correctly."""
+    stages_file = simple_pipeline / "stages.py"
+    stages_file.write_text(
+        """\
+import pathlib
+from typing import Annotated, TypedDict
+from pivot import loaders, outputs
+
+class ProcessOutputs(TypedDict):
+    files: Annotated[list[pathlib.Path], outputs.Out(["a.csv", "b.csv"], loaders.PathOnly())]
+
+def preprocess(
+    raw: Annotated[pathlib.Path, outputs.Dep("data/raw.csv", loaders.PathOnly())],
+) -> ProcessOutputs:
+    return {"files": [pathlib.Path("a.csv"), pathlib.Path("b.csv")]}
+"""
+    )
+
+    pipeline_file = simple_pipeline / "pivot.yaml"
+    pipeline_file.write_text(
+        """\
+stages:
+  preprocess:
+    python: stages.preprocess
+    outs:
+      files: {path: ["out/a.csv", "out/b.csv"], cache: false}
+"""
+    )
+
+    # Clear cached module
+    if "stages" in sys.modules:
+        del sys.modules["stages"]
+
+    pipeline_config.register_from_pipeline_file(pipeline_file)
+
+    info = registry.REGISTRY.get("preprocess")
+    paths = info["outs_paths"]
+    assert len(paths) == 2
+    assert any("out/a.csv" in p for p in paths)
+    assert any("out/b.csv" in p for p in paths)
+
+
+def test_output_dict_form_list_path_interpolation(simple_pipeline: pathlib.Path) -> None:
+    """Dict-form output with list path supports ${var} interpolation."""
+    stages_file = simple_pipeline / "stages.py"
+    stages_file.write_text(
+        """\
+import pathlib
+from typing import Annotated, TypedDict
+from pivot import loaders, outputs
+
+class ProcessOutputs(TypedDict):
+    files: Annotated[list[pathlib.Path], outputs.Out(["a.csv", "b.csv"], loaders.PathOnly())]
+
+def preprocess(
+    raw: Annotated[pathlib.Path, outputs.Dep("data/raw.csv", loaders.PathOnly())],
+) -> ProcessOutputs:
+    return {"files": [pathlib.Path("a.csv"), pathlib.Path("b.csv")]}
+"""
+    )
+
+    pipeline_file = simple_pipeline / "pivot.yaml"
+    pipeline_file.write_text(
+        """\
+stages:
+  preprocess:
+    python: stages.preprocess
+    outs:
+      files: {path: ["out/${model}/a.csv", "out/${model}/b.csv"], cache: false}
+    matrix:
+      model:
+        - bert
+"""
+    )
+
+    # Clear cached module
+    if "stages" in sys.modules:
+        del sys.modules["stages"]
+
+    pipeline_config.register_from_pipeline_file(pipeline_file)
+
+    info = registry.REGISTRY.get("preprocess@bert")
+    paths = info["outs_paths"]
+    assert len(paths) == 2
+    assert any("out/bert/a.csv" in p for p in paths)
+    assert any("out/bert/b.csv" in p for p in paths)

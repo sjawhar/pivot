@@ -3,7 +3,6 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
-import pathlib
 import re
 import tempfile
 from typing import TYPE_CHECKING, Any, Literal, TypedDict
@@ -69,7 +68,6 @@ class PivotStageConfig(TypedDict, total=False):
     metrics: list[str]
     plots: list[str]
     params: dict[str, Any]
-    cwd: str
     matrix: dict[str, list[str]]
 
 
@@ -295,6 +293,18 @@ def _convert_stage(
     pivot_stage = PivotStageConfig()
     params_count = 0
 
+    # Get wdir prefix (DVC's working directory for the stage)
+    wdir: str | None = dvc_stage.get("wdir")
+    if wdir:
+        notes.append(
+            MigrationNote(
+                stage=name,
+                severity="info",
+                message=f"Paths prefixed with wdir '{wdir}' for project-root-relative resolution.",
+                original_cmd=None,
+            )
+        )
+
     # cmd -> python (PLACEHOLDER)
     pivot_stage["python"] = f"PLACEHOLDER.{name}"
     if "cmd" in dvc_stage:
@@ -309,46 +319,33 @@ def _convert_stage(
             )
         )
 
-    # deps - validate and pass through
+    # deps - validate and pass through (with wdir prefix if present)
     if "deps" in dvc_stage:
-        pivot_stage["deps"] = _extract_paths(dvc_stage["deps"], name, "dep", project_root, notes)
+        deps = _prefix_paths_with_wdir(dvc_stage["deps"], wdir)
+        pivot_stage["deps"] = _extract_paths(deps, name, "dep", project_root, notes)
 
-    # outs - convert format
+    # outs - convert format (with wdir prefix if present)
     if "outs" in dvc_stage:
-        pivot_stage["outs"] = _convert_outs(dvc_stage["outs"], name, project_root, notes)
+        outs = _prefix_paths_with_wdir(dvc_stage["outs"], wdir)
+        pivot_stage["outs"] = _convert_outs(outs, name, project_root, notes)
 
-    # metrics
+    # metrics (with wdir prefix if present)
     if "metrics" in dvc_stage:
-        pivot_stage["metrics"] = _extract_paths(
-            dvc_stage["metrics"], name, "metric", project_root, notes
-        )
+        metrics = _prefix_paths_with_wdir(dvc_stage["metrics"], wdir)
+        pivot_stage["metrics"] = _extract_paths(metrics, name, "metric", project_root, notes)
 
-    # plots
+    # plots (with wdir prefix if present)
     if "plots" in dvc_stage:
-        pivot_stage["plots"] = _extract_paths(dvc_stage["plots"], name, "plot", project_root, notes)
+        plots = _prefix_paths_with_wdir(dvc_stage["plots"], wdir)
+        pivot_stage["plots"] = _extract_paths(plots, name, "plot", project_root, notes)
 
-    # params - resolve and inline
+    # params - resolve and inline (no wdir prefix - these are key references, not paths)
     if "params" in dvc_stage:
         resolve_result = _resolve_params(dvc_stage["params"], params_yaml, dvc_lock, name)
         if resolve_result["params"]:
             pivot_stage["params"] = resolve_result["params"]
         params_count = resolve_result["count"]
         notes.extend(resolve_result["notes"])
-
-    # wdir -> cwd (with explicit absolute path check)
-    if "wdir" in dvc_stage:
-        wdir = dvc_stage["wdir"]
-        if pathlib.Path(wdir).is_absolute():
-            notes.append(
-                MigrationNote(
-                    stage=name,
-                    severity="error",
-                    message=f"Absolute wdir path not allowed: '{wdir}'",
-                    original_cmd=None,
-                )
-            )
-        elif _validate_path(wdir, name, "cwd", project_root, notes):
-            pivot_stage["cwd"] = wdir
 
     # frozen - warning only
     if "frozen" in dvc_stage and dvc_stage["frozen"]:
@@ -468,6 +465,38 @@ def _convert_foreach_stage(
     return stages, notes, params_count
 
 
+def _prefix_paths_with_wdir(
+    items: list[str | dict[str, Any]],
+    wdir: str | None,
+) -> list[str | dict[str, Any]]:
+    """Prefix all paths in items with wdir if present.
+
+    Handles both string paths and dict-form paths like {path: {options}}.
+    Skips absolute paths and paths with variable interpolation that starts with /.
+    """
+    if not wdir:
+        return items
+
+    result = list[str | dict[str, Any]]()
+    for item in items:
+        if isinstance(item, str):
+            # Skip absolute paths
+            if item.startswith("/") or (item.startswith("${") and "}" in item):
+                result.append(item)
+            else:
+                result.append(f"{wdir}/{item}")
+        else:
+            # Dict form: {path: {options}} - prefix each key
+            prefixed_dict = dict[str, Any]()
+            for path, opts in item.items():
+                if not path.startswith("/"):
+                    prefixed_dict[f"{wdir}/{path}"] = opts
+                else:
+                    prefixed_dict[path] = opts
+            result.append(prefixed_dict)
+    return result
+
+
 def _extract_paths(
     items: list[str | dict[str, Any]],
     stage_name: str,
@@ -568,6 +597,34 @@ def _validate_path(
         return False
 
 
+def _add_param_with_collision_check(
+    param_key: str,
+    value: Any,
+    stage_name: str,
+    result: dict[str, Any],
+    seen_keys: dict[str, str],
+    notes: list[MigrationNote],
+) -> None:
+    """Add param value to result, checking for leaf key collisions."""
+    leaf_key = param_key.split(".")[-1]
+
+    if leaf_key in seen_keys and seen_keys[leaf_key] != param_key:
+        notes.append(
+            MigrationNote(
+                stage=stage_name,
+                severity="warning",
+                message=(
+                    f"Param key collision: '{param_key}' and '{seen_keys[leaf_key]}' "
+                    f"both map to leaf key '{leaf_key}'. Using value from '{param_key}'."
+                ),
+                original_cmd=None,
+            )
+        )
+
+    seen_keys[leaf_key] = param_key
+    result[leaf_key] = value
+
+
 def _resolve_params(
     dvc_params: list[str | dict[str, Any]],
     params_yaml: dict[str, Any],
@@ -631,25 +688,9 @@ def _resolve_params(
                 value = _get_nested_value(params_yaml, param_key)
 
             if value is not None:
-                # Use leaf key name for Pivot params
-                leaf_key = param_key.split(".")[-1]
-
-                # Check for collision
-                if leaf_key in seen_keys and seen_keys[leaf_key] != param_key:
-                    notes.append(
-                        MigrationNote(
-                            stage=stage_name,
-                            severity="warning",
-                            message=(
-                                f"Param key collision: '{param_key}' and '{seen_keys[leaf_key]}' "
-                                f"both map to leaf key '{leaf_key}'. Using value from '{param_key}'."
-                            ),
-                            original_cmd=None,
-                        )
-                    )
-
-                seen_keys[leaf_key] = param_key
-                result[leaf_key] = value
+                _add_param_with_collision_check(
+                    param_key, value, stage_name, result, seen_keys, notes
+                )
                 count += 1
 
         else:
@@ -677,24 +718,9 @@ def _resolve_params(
                     if value is None:
                         value = _get_nested_value(params_yaml, key)
                     if value is not None:
-                        leaf_key = key.split(".")[-1]
-
-                        # Check for collision
-                        if leaf_key in seen_keys and seen_keys[leaf_key] != key:
-                            notes.append(
-                                MigrationNote(
-                                    stage=stage_name,
-                                    severity="warning",
-                                    message=(
-                                        f"Param key collision: '{key}' and '{seen_keys[leaf_key]}' "
-                                        f"both map to leaf key '{leaf_key}'. Using value from '{key}'."
-                                    ),
-                                    original_cmd=None,
-                                )
-                            )
-
-                        seen_keys[leaf_key] = key
-                        result[leaf_key] = value
+                        _add_param_with_collision_check(
+                            key, value, stage_name, result, seen_keys, notes
+                        )
                         count += 1
 
     return _ResolveParamsResult(params=result, count=count, notes=notes)

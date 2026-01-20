@@ -8,7 +8,7 @@ import multiprocessing as mp
 import os
 import pathlib
 import sys
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Annotated
 
 import pytest
 
@@ -70,14 +70,14 @@ def test_execute_stage_with_missing_deps(
         "params": None,
         "variant": None,
         "overrides": {},
-        "cwd": None,
         "checkout_modes": ["hardlink", "symlink", "copy"],
         "run_id": "test_run",
         "force": False,
         "no_commit": False,
         "no_cache": False,
         "dep_specs": {},
-        "out_path_overrides": None,
+        "out_specs": {},
+        "params_arg_name": None,
     }
 
     result = executor.execute_stage("test_stage", stage_info, worker_env, output_queue)
@@ -105,14 +105,14 @@ def test_execute_stage_with_directory_dep(worker_env: pathlib.Path, tmp_path: pa
         "params": None,
         "variant": None,
         "overrides": {},
-        "cwd": None,
         "checkout_modes": ["hardlink", "symlink", "copy"],
         "run_id": "test_run",
         "force": False,
         "no_commit": False,
         "no_cache": False,
         "dep_specs": {},
-        "out_path_overrides": None,
+        "out_specs": {},
+        "params_arg_name": None,
     }
 
     result = executor.execute_stage(
@@ -144,14 +144,14 @@ def test_execute_stage_runs_unchanged_stage(
         "params": None,
         "variant": None,
         "overrides": {},
-        "cwd": None,
         "checkout_modes": ["hardlink", "symlink", "copy"],
         "run_id": "test_run",
         "force": False,
         "no_commit": False,
         "no_cache": False,
         "dep_specs": {},
-        "out_path_overrides": None,
+        "out_specs": {},
+        "params_arg_name": None,
     }
 
     # First run - creates lock file
@@ -195,14 +195,14 @@ def test_execute_stage_reruns_when_fingerprint_changes(
         "params": None,
         "variant": None,
         "overrides": {},
-        "cwd": None,
         "checkout_modes": ["hardlink", "symlink", "copy"],
         "run_id": "test_run",
         "force": False,
         "no_commit": False,
         "no_cache": False,
         "dep_specs": {},
-        "out_path_overrides": None,
+        "out_specs": {},
+        "params_arg_name": None,
     }
 
     # First run
@@ -249,14 +249,14 @@ def test_execute_stage_handles_stage_exception(
         "params": None,
         "variant": None,
         "overrides": {},
-        "cwd": None,
         "checkout_modes": ["hardlink", "symlink", "copy"],
         "run_id": "test_run",
         "force": False,
         "no_commit": False,
         "no_cache": False,
         "dep_specs": {},
-        "out_path_overrides": None,
+        "out_specs": {},
+        "params_arg_name": None,
     }
 
     result = executor.execute_stage(
@@ -286,14 +286,14 @@ def test_execute_stage_handles_sys_exit(worker_env: pathlib.Path, tmp_path: path
         "params": None,
         "variant": None,
         "overrides": {},
-        "cwd": None,
         "checkout_modes": ["hardlink", "symlink", "copy"],
         "run_id": "test_run",
         "force": False,
         "no_commit": False,
         "no_cache": False,
         "dep_specs": {},
-        "out_path_overrides": None,
+        "out_specs": {},
+        "params_arg_name": None,
     }
 
     result = executor.execute_stage(
@@ -326,14 +326,14 @@ def test_execute_stage_handles_keyboard_interrupt(
         "params": None,
         "variant": None,
         "overrides": {},
-        "cwd": None,
         "checkout_modes": ["hardlink", "symlink", "copy"],
         "run_id": "test_run",
         "force": False,
         "no_commit": False,
         "no_cache": False,
         "dep_specs": {},
-        "out_path_overrides": None,
+        "out_specs": {},
+        "params_arg_name": None,
     }
 
     result = executor.execute_stage(
@@ -688,7 +688,7 @@ def test_execution_lock_creates_sentinel_file(worker_env: pathlib.Path) -> None:
         assert sentinel.exists()
         assert sentinel == sentinel_path
         content = sentinel.read_text()
-        assert "pid:" in content
+        assert content.strip().isdigit()  # Just the PID number
 
     # Cleaned up after context
     assert not sentinel.exists()
@@ -721,7 +721,7 @@ def test_acquire_execution_lock_fails_when_held_by_live_process(
 ) -> None:
     """Acquire lock fails when held by a running process."""
     sentinel = worker_env / "test_stage.running"
-    sentinel.write_text(f"pid: {os.getpid()}\n")
+    sentinel.write_text(str(os.getpid()))
 
     with pytest.raises(exceptions.StageAlreadyRunningError) as exc_info:
         lock.acquire_execution_lock("test_stage", worker_env)
@@ -736,7 +736,7 @@ def test_acquire_execution_lock_fails_when_held_by_live_process(
 def test_acquire_execution_lock_breaks_stale_lock(worker_env: pathlib.Path) -> None:
     """Acquire lock breaks stale lock from dead process."""
     sentinel = worker_env / "test_stage.running"
-    sentinel.write_text("pid: 999999999\n")  # Non-existent PID
+    sentinel.write_text("999999999")  # Non-existent PID
 
     result_sentinel = lock.acquire_execution_lock("test_stage", worker_env)
 
@@ -763,7 +763,7 @@ def test_acquire_execution_lock_breaks_corrupted_lock(worker_env: pathlib.Path) 
 def test_acquire_execution_lock_breaks_negative_pid_lock(worker_env: pathlib.Path) -> None:
     """Acquire lock breaks lock with invalid negative PID."""
     sentinel = worker_env / "test_stage.running"
-    sentinel.write_text("pid: -1\n")
+    sentinel.write_text("-1")
 
     result_sentinel = lock.acquire_execution_lock("test_stage", worker_env)
 
@@ -802,7 +802,7 @@ def test_is_process_alive_returns_true_for_init() -> None:
 def test_read_lock_pid_returns_pid_for_valid_file(worker_env: pathlib.Path) -> None:
     """_read_lock_pid extracts PID from valid lock file."""
     sentinel = worker_env / "test.running"
-    sentinel.write_text("pid: 12345\n")
+    sentinel.write_text("12345")
 
     assert lock._read_lock_pid(sentinel) == 12345
 
@@ -825,7 +825,7 @@ def test_read_lock_pid_returns_none_for_corrupted_file(worker_env: pathlib.Path)
 def test_read_lock_pid_returns_none_for_negative_pid(worker_env: pathlib.Path) -> None:
     """_read_lock_pid returns None for invalid negative PID."""
     sentinel = worker_env / "test.running"
-    sentinel.write_text("pid: -1\n")
+    sentinel.write_text("-1")
 
     assert lock._read_lock_pid(sentinel) is None
 
@@ -833,7 +833,7 @@ def test_read_lock_pid_returns_none_for_negative_pid(worker_env: pathlib.Path) -
 def test_read_lock_pid_returns_none_for_zero_pid(worker_env: pathlib.Path) -> None:
     """_read_lock_pid returns None for invalid zero PID."""
     sentinel = worker_env / "test.running"
-    sentinel.write_text("pid: 0\n")
+    sentinel.write_text("0")
 
     assert lock._read_lock_pid(sentinel) is None
 
@@ -846,14 +846,14 @@ def test_read_lock_pid_returns_none_for_zero_pid(worker_env: pathlib.Path) -> No
 def test_atomic_lock_takeover_succeeds_on_stale_lock(worker_env: pathlib.Path) -> None:
     """Atomic takeover creates lock with current process PID."""
     sentinel = worker_env / "test_stage.running"
-    sentinel.write_text("pid: 999999999\n")  # Stale lock
+    sentinel.write_text("999999999")  # Stale lock
 
     result = lock._atomic_lock_takeover(sentinel, 999999999)
 
     assert result is True
     assert sentinel.exists()
     content = sentinel.read_text()
-    assert f"pid: {os.getpid()}" in content
+    assert content.strip() == str(os.getpid())
 
     # Cleanup
     sentinel.unlink()
@@ -871,10 +871,10 @@ def test_atomic_lock_takeover_fails_when_another_process_wins(
         """Simulate another process winning the race after our rename."""
         original_replace(src, dst)
         # Immediately overwrite with different PID to simulate race
-        pathlib.Path(dst).write_text("pid: 999888777\n")
+        pathlib.Path(dst).write_text("999888777")
 
     monkeypatch.setattr(os, "replace", sneaky_replace)
-    sentinel.write_text("pid: 999999999\n")  # Stale lock
+    sentinel.write_text("999999999")  # Stale lock
 
     result = lock._atomic_lock_takeover(sentinel, 999999999)
 
@@ -890,7 +890,7 @@ def test_atomic_takeover_cleans_temp_on_error(
 ) -> None:
     """Temp file is cleaned up when rename fails."""
     sentinel = worker_env / "test_stage.running"
-    sentinel.write_text("pid: 999999999\n")
+    sentinel.write_text("999999999")
 
     def failing_replace(src: str, dst: str) -> None:
         raise OSError("Simulated disk error")
@@ -923,11 +923,11 @@ def test_acquire_lock_retries_after_failed_takeover(
         if call_count < 2:
             return False  # Fail first attempt
         # Second attempt: actually create the lock
-        sent.write_text(f"pid: {my_pid}\n")
+        sent.write_text(str(my_pid))
         return True
 
     # Start with stale lock
-    sentinel.write_text("pid: 999999999\n")
+    sentinel.write_text("999999999")
     monkeypatch.setattr(lock, "_atomic_lock_takeover", mock_takeover)
 
     result = lock.acquire_execution_lock("test_stage", worker_env)
@@ -945,7 +945,7 @@ def test_acquire_lock_exhausts_attempts_and_fails(
 ) -> None:
     """Lock acquisition fails after exhausting all attempts."""
     sentinel = worker_env / "test_stage.running"
-    sentinel.write_text("pid: 999999999\n")
+    sentinel.write_text("999999999")
 
     monkeypatch.setattr(lock, "_atomic_lock_takeover", _helper_always_fail_takeover)
 
@@ -1010,7 +1010,7 @@ def test_concurrent_stale_lock_takeover_race(worker_env: pathlib.Path) -> None:
 
     # Create a stale lock (non-existent PID)
     stale_sentinel = worker_env / "race_stage.running"
-    stale_sentinel.write_text("pid: 999999999\n")
+    stale_sentinel.write_text("999999999")
 
     try:
         # Pass both worker_id and cache_dir as tuple for each worker
@@ -1176,14 +1176,14 @@ def test_generation_skip_on_second_run(worker_env: pathlib.Path, tmp_path: pathl
         "params": None,
         "variant": None,
         "overrides": {},
-        "cwd": None,
         "checkout_modes": ["hardlink", "symlink", "copy"],
         "run_id": "test_run",
         "force": False,
         "no_commit": False,
         "no_cache": False,
         "dep_specs": {},
-        "out_path_overrides": None,
+        "out_specs": {},
+        "params_arg_name": None,
     }
 
     # First run - creates output and records generations
@@ -1236,14 +1236,14 @@ def test_generation_mismatch_triggers_rerun(
         "params": None,
         "variant": None,
         "overrides": {},
-        "cwd": None,
         "checkout_modes": ["hardlink", "symlink", "copy"],
         "run_id": "test_run",
         "force": False,
         "no_commit": False,
         "no_cache": False,
         "dep_specs": {},
-        "out_path_overrides": None,
+        "out_specs": {},
+        "params_arg_name": None,
     }
 
     step2_info: WorkerStageInfo = {
@@ -1255,14 +1255,14 @@ def test_generation_mismatch_triggers_rerun(
         "params": None,
         "variant": None,
         "overrides": {},
-        "cwd": None,
         "checkout_modes": ["hardlink", "symlink", "copy"],
         "run_id": "test_run",
         "force": False,
         "no_commit": False,
         "no_cache": False,
         "dep_specs": {},
-        "out_path_overrides": None,
+        "out_specs": {},
+        "params_arg_name": None,
     }
 
     # First run - both stages execute
@@ -1341,14 +1341,14 @@ def test_external_file_fallback_to_hash_check(
         "params": None,
         "variant": None,
         "overrides": {},
-        "cwd": None,
         "checkout_modes": ["hardlink", "symlink", "copy"],
         "run_id": "test_run",
         "force": False,
         "no_commit": False,
         "no_cache": False,
         "dep_specs": {},
-        "out_path_overrides": None,
+        "out_specs": {},
+        "params_arg_name": None,
     }
 
     # First run
@@ -1410,14 +1410,14 @@ def test_deps_list_change_triggers_rerun(worker_env: pathlib.Path, tmp_path: pat
         "params": None,
         "variant": None,
         "overrides": {},
-        "cwd": None,
         "checkout_modes": ["hardlink", "symlink", "copy"],
         "run_id": "test_run",
         "force": False,
         "no_commit": False,
         "no_cache": False,
         "dep_specs": {},
-        "out_path_overrides": None,
+        "out_specs": {},
+        "params_arg_name": None,
     }
 
     result1 = executor.execute_stage(
@@ -1448,14 +1448,14 @@ def test_deps_list_change_triggers_rerun(worker_env: pathlib.Path, tmp_path: pat
         "params": None,
         "variant": None,
         "overrides": {},
-        "cwd": None,
         "checkout_modes": ["hardlink", "symlink", "copy"],
         "run_id": "test_run",
         "force": False,
         "no_commit": False,
         "no_cache": False,
         "dep_specs": {},
-        "out_path_overrides": None,
+        "out_specs": {},
+        "params_arg_name": None,
     }
 
     result3 = executor.execute_stage(
@@ -1493,14 +1493,14 @@ def test_deps_list_change_same_fingerprint_detected_by_hash(
         "params": None,
         "variant": None,
         "overrides": {},
-        "cwd": None,
         "checkout_modes": ["hardlink", "symlink", "copy"],
         "run_id": "test_run",
         "force": False,
         "no_commit": False,
         "no_cache": False,
         "dep_specs": {},
-        "out_path_overrides": None,
+        "out_specs": {},
+        "params_arg_name": None,
     }
 
     result1 = executor.execute_stage(
@@ -1522,14 +1522,14 @@ def test_deps_list_change_same_fingerprint_detected_by_hash(
         "params": None,
         "variant": None,
         "overrides": {},
-        "cwd": None,
         "checkout_modes": ["hardlink", "symlink", "copy"],
         "run_id": "test_run",
         "force": False,
         "no_commit": False,
         "no_cache": False,
         "dep_specs": {},
-        "out_path_overrides": None,
+        "out_specs": {},
+        "params_arg_name": None,
     }
 
     result2 = executor.execute_stage(
@@ -1571,14 +1571,14 @@ def test_skip_acquires_execution_lock(
         "params": None,
         "variant": None,
         "overrides": {},
-        "cwd": None,
         "checkout_modes": ["hardlink", "symlink", "copy"],
         "run_id": "test_run",
         "force": False,
         "no_commit": False,
         "no_cache": False,
         "dep_specs": {},
-        "out_path_overrides": None,
+        "out_specs": {},
+        "params_arg_name": None,
     }
 
     # First run - creates lock file and output
@@ -1641,14 +1641,14 @@ def test_restore_happens_inside_lock(
         "params": None,
         "variant": None,
         "overrides": {},
-        "cwd": None,
         "checkout_modes": ["copy"],  # Use copy mode for simpler testing
         "run_id": "test_run",
         "force": False,
         "no_commit": False,
         "no_cache": False,
         "dep_specs": {},
-        "out_path_overrides": None,
+        "out_specs": {},
+        "params_arg_name": None,
     }
 
     # First run - creates lock file and caches output
@@ -1717,14 +1717,14 @@ def test_plain_params_no_auto_load_save(worker_env: pathlib.Path, tmp_path: path
         "params": _PlainParams(),
         "variant": None,
         "overrides": {},
-        "cwd": None,
         "checkout_modes": ["hardlink", "symlink", "copy"],
         "run_id": "test_run",
         "force": False,
         "no_commit": False,
         "no_cache": False,
         "dep_specs": {},
-        "out_path_overrides": None,
+        "out_specs": {},  # Empty - stage writes directly to file, no return-based output
+        "params_arg_name": "params",
     }
 
     result = executor.execute_stage(
@@ -1737,3 +1737,70 @@ def test_plain_params_no_auto_load_save(worker_env: pathlib.Path, tmp_path: path
     assert result["status"] == "ran"
     assert output_file.exists()
     assert "threshold: 0.5" in output_file.read_text()
+
+
+# =============================================================================
+# Single Annotated Return Type Tests (GitHub Issue #233)
+# =============================================================================
+
+
+def _stage_with_single_annotated_return() -> Annotated[
+    dict[str, str], outputs.Out("single_output.json", loaders.JSON[dict[str, str]]())
+]:
+    """Stage function with single annotated return type (not TypedDict)."""
+    return {"status": "success", "message": "output saved"}
+
+
+def test_single_annotated_return_saves_output(
+    worker_env: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    """Single Annotated[T, Out(...)] return type saves output correctly.
+
+    This tests the worker code path at worker.py:463-470 that handles single
+    annotated returns (as opposed to TypedDict returns).
+
+    Regression test for GitHub issue #233.
+    """
+    # Get the output spec from the single annotated return type
+    single_out_spec = stage_def.get_single_output_spec_from_return(
+        _stage_with_single_annotated_return
+    )
+    assert single_out_spec is not None, "Should have single output spec"
+
+    stage_info: WorkerStageInfo = {
+        "func": _stage_with_single_annotated_return,
+        "fingerprint": {"self:_stage_with_single_annotated_return": "fp123"},
+        "deps": [],
+        "signature": None,
+        "outs": [],  # Empty - outputs come from return annotation
+        "params": None,
+        "variant": None,
+        "overrides": {},
+        "checkout_modes": ["hardlink", "symlink", "copy"],
+        "run_id": "test_run",
+        "force": False,
+        "no_commit": False,
+        "no_cache": False,
+        "dep_specs": {},
+        "out_specs": {"_single": single_out_spec},  # Single return uses "_single" key convention
+        "params_arg_name": None,
+    }
+
+    result = executor.execute_stage(
+        "test_single_return",
+        stage_info,
+        worker_env,
+        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
+    )
+
+    assert result["status"] == "ran", f"Expected ran, got {result}"
+
+    # Verify the output file was created via annotation-based save
+    output_file = tmp_path / "single_output.json"
+    assert output_file.exists(), "Output file should be created from single annotated return"
+
+    import json
+
+    with open(output_file) as f:
+        content = json.load(f)
+    assert content == {"status": "success", "message": "output saved"}

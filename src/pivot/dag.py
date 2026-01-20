@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import pathlib
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 import networkx as nx
 import pygtrie
 
-from pivot import exceptions
+from pivot import exceptions, metrics
 
 if TYPE_CHECKING:
     from pivot.registry import RegistryStageInfo
@@ -35,35 +35,36 @@ def build_dag(stages: dict[str, RegistryStageInfo], validate: bool = True) -> nx
         >>> list(nx.dfs_postorder_nodes(graph))
         ['preprocess', 'train']
     """
-    graph: nx.DiGraph[str] = nx.DiGraph()
+    with metrics.timed("dag.build_dag"):
+        graph: nx.DiGraph[str] = nx.DiGraph()
 
-    for stage_name, stage_info in stages.items():
-        graph.add_node(stage_name, **stage_info)
+        for stage_name, stage_info in stages.items():
+            graph.add_node(stage_name, **stage_info)
 
-    outputs_map = _build_outputs_map(stages)
-    outputs_trie = _build_outputs_trie(stages)
+        outputs_map = _build_outputs_map(stages)
+        outputs_trie = _build_outputs_trie(stages)
 
-    for stage_name, stage_info in stages.items():
-        for dep in stage_info["deps_paths"]:
-            producer = outputs_map.get(dep)
-            if producer:
-                graph.add_edge(stage_name, producer)
-            else:
-                # Check for directory dependency on file outputs (or vice versa)
-                producers = _find_producers_for_path(dep, outputs_trie)
-                for prod in producers:
-                    graph.add_edge(stage_name, prod)
+        for stage_name, stage_info in stages.items():
+            for dep in stage_info["deps_paths"]:
+                producer = outputs_map.get(dep)
+                if producer:
+                    graph.add_edge(stage_name, producer)
+                else:
+                    # Check for directory dependency on file outputs (or vice versa)
+                    producers = _find_producers_for_path(dep, outputs_trie)
+                    for prod in producers:
+                        graph.add_edge(stage_name, prod)
 
-                if not producers and validate and not pathlib.Path(dep).exists():
-                    raise exceptions.DependencyNotFoundError(
-                        stage=stage_name,
-                        dep=dep,
-                        available_outputs=list(outputs_map.keys()),
-                    )
+                    if not producers and validate and not pathlib.Path(dep).exists():
+                        raise exceptions.DependencyNotFoundError(
+                            stage=stage_name,
+                            dep=dep,
+                            available_outputs=list(outputs_map.keys()),
+                        )
 
-    _check_acyclic(graph)
+        _check_acyclic(graph)
 
-    return graph
+        return graph
 
 
 def _build_outputs_map(stages: dict[str, RegistryStageInfo]) -> dict[str, str]:
@@ -121,11 +122,7 @@ def _find_producers_for_path(
 def _check_acyclic(graph: nx.DiGraph[str]) -> None:
     """Check graph for cycles, raise if found."""
     try:
-        # networkx stubs don't fully type find_cycle's return value
-        cycle = cast(
-            "list[tuple[str, str, str]]",
-            nx.find_cycle(graph, orientation="original"),  # pyright: ignore[reportUnknownMemberType]
-        )
+        cycle = nx.find_cycle(graph, orientation="original")
     except nx.NetworkXNoCycle:
         return
 
@@ -177,18 +174,7 @@ def _get_subgraph(graph: nx.DiGraph[str], source_stages: list[str]) -> nx.DiGrap
     nodes = set[str]()
     for stage in source_stages:
         nodes.update(nx.dfs_postorder_nodes(graph, stage))
-    # subgraph() returns a SubGraph view that behaves like DiGraph at runtime
-    return cast("nx.DiGraph[str]", graph.subgraph(nodes))
-
-
-def get_parallel_groups(  # pragma: no cover
-    graph: nx.DiGraph[str], stages: list[str] | None = None
-) -> list[list[str]]:
-    """Get stages grouped by parallel execution levels (unused with greedy execution)."""
-    subgraph = _get_subgraph(graph, stages) if stages else graph
-    reversed_graph = subgraph.reverse(copy=False)
-    generations = list(nx.topological_generations(reversed_graph))
-    return [list(gen) for gen in generations]
+    return graph.subgraph(nodes)
 
 
 def get_downstream_stages(graph: nx.DiGraph[str], stage: str) -> list[str]:

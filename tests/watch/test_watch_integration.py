@@ -22,8 +22,6 @@ import time
 from typing import TYPE_CHECKING, Annotated, TypedDict
 from unittest import mock
 
-import pytest
-
 from helpers import register_test_stage
 from pivot import executor, loaders, outputs, project
 from pivot.watch import engine
@@ -463,7 +461,7 @@ def _stage_failing(
 def run_watch_engine(
     debounce_ms: int = 50,
     min_executions: int = 2,
-    timeout: float = 5.0,
+    timeout: float = 2.0,
 ) -> Generator[list[list[str] | None]]:
     """Context manager for running watch engine in background and capturing executions.
 
@@ -494,12 +492,12 @@ def run_watch_engine(
         engine_thread = threading.Thread(target=eng.run)
         engine_thread.start()
 
-        time.sleep(0.2)  # Let watcher initialize (tested: 0.1s works, 0.2s safe margin)
+        time.sleep(0.1)  # Let watcher initialize
         yield executions
 
         done_event.wait(timeout=timeout)
         eng.shutdown()
-        engine_thread.join(timeout=2.0)
+        engine_thread.join(timeout=1.0)
 
 
 # =============================================================================
@@ -820,15 +818,6 @@ def test_rerun_after_input_change(pipeline_dir: pathlib.Path) -> None:
     assert (pipeline_dir / "output.txt").read_text() == "WORLD"
 
 
-@pytest.mark.xfail(
-    reason=(
-        "Generation-based skip doesn't detect external intermediate modifications. "
-        "This is a known limitation: when upstream stages skip, the generation check "
-        "passes and downstream stages skip without verifying actual file content. "
-        "Watch mode handles this via file change detection, but batch runs don't."
-    ),
-    strict=True,
-)
 def test_rerun_after_intermediate_change(pipeline_dir: pathlib.Path) -> None:
     """Modifying intermediate file triggers downstream re-execution."""
     (pipeline_dir / "input.txt").write_text("hello")
@@ -936,14 +925,14 @@ def test_watch_code_change_triggers_reload_and_execution(
         engine_thread = threading.Thread(target=eng.run)
         engine_thread.start()
 
-        time.sleep(0.2)  # Tested: 0.1s works but 0.2s adds safety margin
+        time.sleep(0.1)  # Let watcher initialize
 
         # Modify Python file to trigger code change
         helper_file.write_text("def helper(): return 42\n")
 
-        done_event.wait(timeout=5.0)
+        done_event.wait(timeout=2.0)
         eng.shutdown()
-        engine_thread.join(timeout=2.0)
+        engine_thread.join(timeout=1.0)
 
     assert execution_count >= 2, "Should execute at least twice"
     assert reload_called, "Should reload registry on code change"
@@ -984,16 +973,16 @@ def test_debounce_coalesces_rapid_changes(pipeline_dir: pathlib.Path) -> None:
         engine_thread = threading.Thread(target=eng.run)
         engine_thread.start()
 
-        time.sleep(0.3)  # Let watcher initialize
+        time.sleep(0.3)  # Let watcher initialize (longer due to 200ms debounce)
 
         # Make 5 rapid changes within debounce window
         for i in range(5):
             (pipeline_dir / "data.csv").write_text(f"change {i}")
             time.sleep(0.02)  # 20ms between changes, within 200ms debounce
 
-        done_event.wait(timeout=5.0)
+        done_event.wait(timeout=2.0)
         eng.shutdown()
-        engine_thread.join(timeout=2.0)
+        engine_thread.join(timeout=1.0)
 
     # Should have: 1 initial + 1 debounced (not 1 + 5)
     assert execution_count == 2, (

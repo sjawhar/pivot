@@ -26,6 +26,7 @@ Pivot's fingerprinting system:
 | Same-module helpers | Yes | `getclosurevars()` discovers reference |
 | Module imports | Yes | AST scanning for attribute access |
 | Class definitions | Yes | Full class AST hashed |
+| StageParams subclasses | Yes | Type hint analysis + full class AST (methods, properties, ClassVars) |
 | Global constants | Yes (structure) | AST captures usage |
 | Closure variables | Yes (structure) | `getclosurevars()` captures binding |
 | Default arguments | Yes | Captured in function signature |

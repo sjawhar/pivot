@@ -1,4 +1,3 @@
-import multiprocessing
 import pathlib
 import queue
 import runpy
@@ -265,12 +264,14 @@ def test_collect_watch_paths_includes_dependency_directories(
 
 
 def test_watch_filter_filters_exact_output_match(pipeline_dir: pathlib.Path) -> None:
-    """Should filter out exact output file paths."""
+    """Should filter out exact output file paths during execution."""
     output_path = pipeline_dir / "output.txt"
 
     register_test_stage(_stage_with_data_csv_dep, name="process")
 
-    watch_filter = _watch_utils.create_watch_filter(["process"])
+    output_filter = _watch_utils.OutputFilter(["process"])
+    output_filter.start_execution()  # Filtering only happens during execution
+    watch_filter = _watch_utils.create_watch_filter(output_filter=output_filter)
     assert watch_filter(watchfiles.Change.modified, str(output_path)) is False
 
 
@@ -280,7 +281,9 @@ def test_watch_filter_allows_source_files(pipeline_dir: pathlib.Path) -> None:
 
     register_test_stage(_stage_with_data_csv_dep, name="process")
 
-    watch_filter = _watch_utils.create_watch_filter(["process"])
+    output_filter = _watch_utils.OutputFilter(["process"])
+    output_filter.start_execution()  # Filtering only happens during execution
+    watch_filter = _watch_utils.create_watch_filter(output_filter=output_filter)
     assert watch_filter(watchfiles.Change.modified, str(source_path)) is True
 
 
@@ -972,9 +975,10 @@ def test_dag_cache_invalidation_on_code_change(pipeline_dir: pathlib.Path) -> No
     assert eng._cached_dag is dag1, "DAG should be cached"
     assert eng._cached_file_index is index1, "File index should be cached"
 
-    # Simulate code change invalidation (what _coordinator_loop does)
+    # Simulate code change invalidation (what _invalidate_caches does)
     eng._cached_dag = None
     eng._cached_file_index = None
+    REGISTRY.invalidate_dag_cache()
 
     # Next access should rebuild
     dag2 = eng._get_dag()
@@ -1061,18 +1065,18 @@ def test_integration_watchfiles_detects_real_file_change(pipeline_dir: pathlib.P
         engine_thread.start()
 
         # Wait for watcher to initialize and start watching
-        time.sleep(0.5)
+        time.sleep(0.1)
 
         # Modify the data file - this should trigger re-execution
         data_file.write_text("a,b\n1,2\n3,4")
 
         # Wait for execution to be triggered (with timeout to prevent hang)
-        triggered = execution_event.wait(timeout=5.0)
+        triggered = execution_event.wait(timeout=2.0)
 
         # Clean shutdown if test times out
         if not triggered:
             eng.shutdown()
-        engine_thread.join(timeout=2.0)
+        engine_thread.join(timeout=1.0)
 
     assert len(execution_stages) >= 2, (
         f"Expected at least 2 executions (initial + triggered), got {len(execution_stages)}"
@@ -1123,16 +1127,16 @@ def test_integration_watchfiles_detects_python_code_change(pipeline_dir: pathlib
         engine_thread.start()
 
         # Wait for watcher to start
-        time.sleep(0.5)
+        time.sleep(0.1)
 
         # Modify Python file - should trigger worker restart
         code_file.write_text("def helper(): return 42\n")
 
-        triggered = execution_event.wait(timeout=5.0)
+        triggered = execution_event.wait(timeout=2.0)
 
         if not triggered:
             eng.shutdown()
-        engine_thread.join(timeout=2.0)
+        engine_thread.join(timeout=1.0)
 
     assert execution_count >= 2, f"Expected at least 2 executions, got {execution_count}"
     assert restart_called, "Worker pool should be restarted on Python file change"
@@ -1173,32 +1177,37 @@ def test_get_affected_stages_returns_all_registry_stages_on_code_change(
 
 def test_send_message_to_tui_queue(pipeline_dir: pathlib.Path) -> None:
     """_send_message should put messages on TUI queue when available."""
-    manager = multiprocessing.Manager()
-    tui_queue = manager.Queue()
+    # TUI queue uses stdlib queue.Queue (inter-thread, not cross-process)
+    tui_queue: types.TuiQueue = queue.Queue()
 
     eng = engine.WatchEngine()
-    eng._tui_queue = tui_queue  # pyright: ignore[reportAttributeAccessIssue]
+    eng._tui_queue = tui_queue
 
     eng._send_message("Test message")
 
     assert not tui_queue.empty(), "Message should be in queue"
     msg = tui_queue.get_nowait()
+    assert msg is not None
     assert msg["type"] == types.TuiMessageType.WATCH
+    # Narrow to TuiWatchMessage after checking type
+    assert types.is_tui_watch_message(msg)
     assert msg["status"] == types.WatchStatus.WAITING
     assert msg["message"] == "Test message"
 
 
 def test_send_message_error_to_tui_queue(pipeline_dir: pathlib.Path) -> None:
     """_send_message with status=ERROR should set error status."""
-    manager = multiprocessing.Manager()
-    tui_queue = manager.Queue()
+    tui_queue: types.TuiQueue = queue.Queue()
 
     eng = engine.WatchEngine()
-    eng._tui_queue = tui_queue  # pyright: ignore[reportAttributeAccessIssue]
+    eng._tui_queue = tui_queue
 
     eng._send_message("Error occurred", status=types.WatchStatus.ERROR)
 
     msg = tui_queue.get_nowait()
+    assert msg is not None
+    # Narrow to TuiWatchMessage after checking type
+    assert types.is_tui_watch_message(msg)
     assert msg["status"] == types.WatchStatus.ERROR
     assert msg["message"] == "Error occurred"
 
@@ -2136,8 +2145,10 @@ REGISTRY.register(stage_a)
     assert "stage_a" in REGISTRY.list_stages()
     assert "stage_b" not in REGISTRY.list_stages()
 
-    # Create initial watch filter
-    initial_filter = _watch_utils.create_watch_filter(["stage_a"])
+    # Create initial watch filter with OutputFilter (filtering only during execution)
+    initial_output_filter = _watch_utils.OutputFilter(["stage_a"])
+    initial_output_filter.start_execution()
+    initial_filter = _watch_utils.create_watch_filter(output_filter=initial_output_filter)
 
     # output_a should be filtered
     output_a_path = pipeline_dir / "output_a.txt"
@@ -2188,7 +2199,9 @@ REGISTRY.register(stage_b)
     )
 
     # Create NEW filter after reload - this one should filter output_b
-    new_filter = _watch_utils.create_watch_filter(["stage_a", "stage_b"])
+    new_output_filter = _watch_utils.OutputFilter(["stage_a", "stage_b"])
+    new_output_filter.start_execution()
+    new_filter = _watch_utils.create_watch_filter(output_filter=new_output_filter)
     assert new_filter(watchfiles.Change.modified, str(output_b_path)) is False, (
         "New filter should filter new stage output"
     )
@@ -2250,8 +2263,10 @@ REGISTRY.register(stage_b)
     assert "stage_a" in REGISTRY.list_stages()
     assert "stage_b" in REGISTRY.list_stages()
 
-    # Create initial watch filter for both stages
-    initial_filter = _watch_utils.create_watch_filter(["stage_a", "stage_b"])
+    # Create initial watch filter for both stages using OutputFilter
+    initial_output_filter = _watch_utils.OutputFilter(["stage_a", "stage_b"])
+    initial_output_filter.start_execution()
+    initial_filter = _watch_utils.create_watch_filter(output_filter=initial_output_filter)
 
     # Both outputs should be filtered
     output_a_path = pipeline_dir / "output_a.txt"
@@ -2286,7 +2301,9 @@ REGISTRY.register(stage_a)
     assert "stage_b" not in REGISTRY.list_stages(), "stage_b should be removed"
 
     # Create NEW filter after reload - only stage_a exists now
-    new_filter = _watch_utils.create_watch_filter(["stage_a"])
+    new_output_filter = _watch_utils.OutputFilter(["stage_a"])
+    new_output_filter.start_execution()
+    new_filter = _watch_utils.create_watch_filter(output_filter=new_output_filter)
     assert new_filter(watchfiles.Change.modified, str(output_a_path)) is False, (
         "output_a should still be filtered"
     )

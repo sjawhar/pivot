@@ -15,6 +15,7 @@ from typing import IO, TYPE_CHECKING, ClassVar, Literal, TypeVar, cast, final, o
 
 import filelock
 import rich.markup
+import textual  # for textual.work decorator
 import textual.app
 import textual.binding
 import textual.containers
@@ -38,8 +39,8 @@ from pivot.types import (
     StageExplanation,
     StageStatus,
     TuiLogMessage,
-    TuiMessage,
     TuiMessageType,
+    TuiQueue,
     TuiReloadMessage,
     TuiStatusMessage,
     TuiWatchMessage,
@@ -60,7 +61,7 @@ if TYPE_CHECKING:
 
         def run(
             self,
-            tui_queue: mp.Queue[TuiMessage] | None = None,
+            tui_queue: TuiQueue | None = None,
             output_queue: mp.Queue[OutputMessage] | None = None,
         ) -> None: ...
         def shutdown(self) -> None: ...
@@ -696,13 +697,13 @@ class _BaseTuiApp(textual.app.App[_AppReturnT]):
 
     def __init__(
         self,
-        message_queue: mp.Queue[TuiMessage],
+        message_queue: TuiQueue,
         stage_names: list[str] | None = None,
         tui_log: Path | None = None,
     ) -> None:
         """Initialize base TUI app state."""
         super().__init__()
-        self._tui_queue: mp.Queue[TuiMessage] = message_queue
+        self._tui_queue: TuiQueue = message_queue
         self._stages: dict[str, StageInfo] = {}
         self._stage_order: list[str] = []
         self._selected_idx: int = 0
@@ -826,13 +827,15 @@ class _BaseTuiApp(textual.app.App[_AppReturnT]):
                     break
                 # default=str handles StrEnum serialization
                 self._write_to_log(json.dumps(msg, default=str) + "\n")
+                _logger.debug(  # noqa: G004
+                    f"TUI recv: {msg['type']} stage={msg.get('stage', '?')}"
+                )
                 self.post_message(TuiUpdate(msg))
             except queue.Empty:
                 continue
-            except (EOFError, OSError, BrokenPipeError):
-                # Queue was closed or broken - exit gracefully
-                _logger.debug("TUI queue reader exiting: queue closed or broken")
-                break
+            except Exception:
+                _logger.exception("Error in TUI queue reader")
+                # Continue reading - don't crash the thread on a single bad message
 
     def _handle_log(self, msg: TuiLogMessage) -> None:  # pragma: no cover
         stage = msg["stage"]
@@ -1095,7 +1098,7 @@ class RunTuiApp(_BaseTuiApp[dict[str, ExecutionSummary] | None]):
     def __init__(
         self,
         stage_names: list[str],
-        message_queue: mp.Queue[TuiMessage],
+        message_queue: TuiQueue,
         executor_func: Callable[[], dict[str, ExecutionSummary]],
         tui_log: Path | None = None,
     ) -> None:
@@ -1133,13 +1136,16 @@ class RunTuiApp(_BaseTuiApp[dict[str, ExecutionSummary] | None]):
     def on_tui_update(self, event: TuiUpdate) -> None:  # pragma: no cover
         """Handle executor updates in Textual's event loop."""
         msg = event.msg
-        match msg["type"]:
-            case TuiMessageType.LOG:
-                self._handle_log(msg)
-            case TuiMessageType.STATUS:
-                self._handle_status(msg)
-            case TuiMessageType.WATCH | TuiMessageType.RELOAD:
-                pass
+        try:
+            match msg["type"]:
+                case TuiMessageType.LOG:
+                    self._handle_log(msg)
+                case TuiMessageType.STATUS:
+                    self._handle_status(msg)
+                case TuiMessageType.WATCH | TuiMessageType.RELOAD:
+                    pass
+        except Exception:
+            _logger.exception("Error handling TUI update for %s: %s", msg["type"], msg)
 
     def _handle_status(self, msg: TuiStatusMessage) -> None:  # pragma: no cover
         stage = msg["stage"]
@@ -1176,7 +1182,7 @@ class RunTuiApp(_BaseTuiApp[dict[str, ExecutionSummary] | None]):
 
 def run_with_tui(
     stage_names: list[str],
-    message_queue: mp.Queue[TuiMessage],
+    message_queue: TuiQueue,
     executor_func: Callable[[], dict[str, ExecutionSummary]],
     tui_log: Path | None = None,
 ) -> dict[str, ExecutionSummary]:  # pragma: no cover
@@ -1409,7 +1415,7 @@ class WatchTuiApp(_BaseTuiApp[None]):
     def __init__(
         self,
         engine: WatchEngineProtocol,
-        message_queue: mp.Queue[TuiMessage],
+        message_queue: TuiQueue,
         output_queue: mp.Queue[OutputMessage] | None = None,
         tui_log: Path | None = None,
         stage_names: list[str] | None = None,
@@ -1430,6 +1436,7 @@ class WatchTuiApp(_BaseTuiApp[None]):
         self._serve: bool = serve
         self._agent_server: agent_server.AgentServer | None = None
         self._agent_server_task: asyncio.Task[None] | None = None
+        self._quitting: bool = False
 
     @property
     def _has_running_stages(self) -> bool:
@@ -1471,12 +1478,13 @@ class WatchTuiApp(_BaseTuiApp[None]):
         """Stop the JSON-RPC agent server if running."""
         if self._agent_server_task is not None:
             self._agent_server_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._agent_server_task
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(self._agent_server_task, timeout=2.0)
             self._agent_server_task = None
 
         if self._agent_server is not None:
-            await self._agent_server.stop()
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(self._agent_server.stop(), timeout=2.0)
             self._agent_server = None
 
     def _run_engine(self) -> None:  # pragma: no cover
@@ -1497,15 +1505,18 @@ class WatchTuiApp(_BaseTuiApp[None]):
     def on_tui_update(self, event: TuiUpdate) -> None:  # pragma: no cover
         """Handle executor updates in Textual's event loop."""
         msg = event.msg
-        match msg["type"]:
-            case TuiMessageType.LOG:
-                self._handle_log(msg)
-            case TuiMessageType.STATUS:
-                self._handle_status(msg)
-            case TuiMessageType.WATCH:
-                self._handle_watch(msg)
-            case TuiMessageType.RELOAD:
-                self._handle_reload(msg)
+        try:
+            match msg["type"]:
+                case TuiMessageType.LOG:
+                    self._handle_log(msg)
+                case TuiMessageType.STATUS:
+                    self._handle_status(msg)
+                case TuiMessageType.WATCH:
+                    self._handle_watch(msg)
+                case TuiMessageType.RELOAD:
+                    self._handle_reload(msg)
+        except Exception:
+            _logger.exception("Error handling TUI update for %s: %s", msg["type"], msg)
 
     def _handle_status(self, msg: TuiStatusMessage) -> None:  # pragma: no cover
         stage = msg["stage"]
@@ -1856,6 +1867,7 @@ class WatchTuiApp(_BaseTuiApp[None]):
             self._viewing_history_index = None
             self._update_history_view()
 
+    @textual.work
     async def action_show_history_list(self) -> None:  # pragma: no cover
         """Show modal with history list for current stage."""
         if not self._selected_stage_name:
@@ -1963,32 +1975,34 @@ class WatchTuiApp(_BaseTuiApp[None]):
     @override
     async def action_quit(self) -> None:  # pragma: no cover
         """Quit the app, prompting to commit if there are uncommitted changes."""
-        # Stop agent server first if running
-        await self._stop_agent_server()
+        if self._quitting:
+            return  # Already quitting, don't spawn another worker
+        self._quitting = True
+        self._quit_with_commit_prompt()
 
-        # Cancel any pending commit operation
-        if self._commit_in_progress:
-            self._cancel_commit = True
-
-        if not self._no_commit:
-            self._engine.shutdown()
-            await super().action_quit()
-            return
-
-        # Don't offer commit if stages are running (could cause data inconsistency)
-        if self._has_running_stages:
-            self._engine.shutdown()
-            await super().action_quit()
-            return
-
-        pending = await asyncio.to_thread(lock.list_pending_stages, project.get_project_root())
-        if not pending:
-            self._engine.shutdown()
-            await super().action_quit()
-            return
-
-        should_commit = await self.push_screen_wait(ConfirmCommitScreen())
+    @textual.work
+    async def _quit_with_commit_prompt(self) -> None:  # pragma: no cover
+        """Worker to handle quit with commit prompt."""
         try:
+            # Stop agent server first if running
+            await self._stop_agent_server()
+
+            # Cancel any pending commit operation
+            if self._commit_in_progress:
+                self._cancel_commit = True
+
+            if not self._no_commit:
+                return
+
+            # Don't offer commit if stages are running (could cause data inconsistency)
+            if self._has_running_stages:
+                return
+
+            pending = await asyncio.to_thread(lock.list_pending_stages, project.get_project_root())
+            if not pending:
+                return
+
+            should_commit = await self.push_screen_wait(ConfirmCommitScreen())
             if should_commit:
                 # Acquire lock before committing to prevent race with running stages
                 try:
@@ -2012,7 +2026,7 @@ class WatchTuiApp(_BaseTuiApp[None]):
 
 def run_watch_tui(
     engine: WatchEngineProtocol,
-    message_queue: mp.Queue[TuiMessage],
+    message_queue: TuiQueue,
     output_queue: mp.Queue[OutputMessage] | None = None,
     tui_log: Path | None = None,
     stage_names: list[str] | None = None,

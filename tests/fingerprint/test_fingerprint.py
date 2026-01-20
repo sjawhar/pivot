@@ -226,22 +226,16 @@ def test_changed_function_different_fingerprint():
     assert fp1["self:func_v1"] != fp2["self:func_v2"]
 
 
-def test_module_attr_usage_detected():
-    """Should detect module.attr patterns (Google style imports)."""
+def test_stdlib_module_attrs_not_tracked():
+    """Stdlib module attributes (math, os, json, etc.) are NOT tracked."""
     fp = fingerprint.get_stage_fingerprint(_helper_uses_math_pi)
-
     assert "self:_helper_uses_math_pi" in fp
-    assert "mod:math.pi" in fp
-    assert isinstance(fp["mod:math.pi"], str)
+    assert "mod:math.pi" not in fp
 
-
-def test_multiple_module_attrs_detected():
-    """Should detect multiple module attributes."""
-    fp = fingerprint.get_stage_fingerprint(_helper_uses_multiple_math_attrs)
-
-    assert "mod:math.sqrt" in fp
-    assert "mod:math.sin" in fp
-    assert "mod:math.cos" in fp
+    fp2 = fingerprint.get_stage_fingerprint(_helper_uses_multiple_math_attrs)
+    assert "mod:math.sqrt" not in fp2
+    assert "mod:math.sin" not in fp2
+    assert "mod:math.cos" not in fp2
 
 
 def test_aliased_function_captured():
@@ -830,30 +824,6 @@ def test_hash_function_no_code_object():
     assert len(h) == 16  # xxhash64 hexdigest
 
 
-def test_module_attr_with_attribute_error():
-    """Should handle AttributeError when getting module attributes."""
-    # Temporarily patch to return a fake attribute
-    original_extract = ast_utils.extract_module_attr_usage
-
-    def mock_extract(func):
-        if func is _helper_with_math_pi:
-            return [("math", "pi"), ("math", "nonexistent_attr")]
-        return original_extract(func)
-
-    ast_utils.extract_module_attr_usage = mock_extract
-
-    try:
-        fp = fingerprint.get_stage_fingerprint(_helper_with_math_pi)
-
-        # Should have mod:math.pi but handle nonexistent_attr gracefully
-        assert "mod:math.pi" in fp
-        # The nonexistent attribute should be marked as "unknown"
-        assert "mod:math.nonexistent_attr" in fp
-        assert fp["mod:math.nonexistent_attr"] == "unknown"
-    finally:
-        ast_utils.extract_module_attr_usage = original_extract
-
-
 def test_is_user_code_module_not_in_sys_modules():
     """Should return False for modules not in sys.modules."""
 
@@ -979,22 +949,6 @@ def test_fingerprint_with_bool_constant():
     assert "self:_helper_uses_bool" in fp
     assert "const:TEST_BOOL" in fp
     assert fp["const:TEST_BOOL"] == "True"
-
-
-def test_fingerprint_recursive_helper_excludes_self():
-    """Should recursively fingerprint helpers but exclude their self entries."""
-    # Use _helper_uses_multiple_math_attrs which references math functions
-    # This test already exists and passes - verifying merge behavior
-    fp = fingerprint.get_stage_fingerprint(_helper_uses_multiple_math_attrs)
-
-    # Should have mod:math.sqrt, sin, cos (callables)
-    assert "mod:math.sqrt" in fp
-    assert "mod:math.sin" in fp
-    assert "mod:math.cos" in fp
-    # All should be marked as "callable"
-    assert fp["mod:math.sqrt"] == "callable"
-    assert fp["mod:math.sin"] == "callable"
-    assert fp["mod:math.cos"] == "callable"
 
 
 # ==============================================================================
@@ -1155,6 +1109,9 @@ def test_custom_loader_fingerprint():
         def save(self, data: str, path: pathlib.Path) -> None:
             path.write_text(data)
 
+        def empty(self) -> str:
+            return ""
+
     loader = CustomTextLoader(prefix="TEST:")
     fp = fingerprint.get_loader_fingerprint(loader)
 
@@ -1178,6 +1135,9 @@ def test_custom_loader_code_change_detected():
         def save(self, data: str, path: pathlib.Path) -> None:
             path.write_text(data)
 
+        def empty(self) -> str:
+            return ""
+
     @dataclasses.dataclass(frozen=True)
     class LoaderV2(loaders.Loader[str]):
         def load(self, path: pathlib.Path) -> str:
@@ -1185,6 +1145,9 @@ def test_custom_loader_code_change_detected():
 
         def save(self, data: str, path: pathlib.Path) -> None:
             path.write_text(data)
+
+        def empty(self) -> str:
+            return ""
 
     fp1 = fingerprint.get_loader_fingerprint(LoaderV1())
     fp2 = fingerprint.get_loader_fingerprint(LoaderV2())

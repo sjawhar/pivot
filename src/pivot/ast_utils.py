@@ -1,12 +1,40 @@
 import ast
+import contextlib
 import inspect
 import textwrap
+import weakref
 from collections.abc import Callable
 from typing import Any
+
+# Cache for extract_module_attr_usage results using weak references.
+# This avoids repeated AST parsing for the same function when processing module dependencies.
+# Note: WeakKeyDictionary is not thread-safe. Fingerprinting runs single-threaded
+# per process (multiprocessing uses separate memory spaces), so this is safe.
+_module_attr_cache: weakref.WeakKeyDictionary[Callable[..., Any], list[tuple[str, str]]] = (
+    weakref.WeakKeyDictionary()
+)
 
 
 def extract_module_attr_usage(func: Callable[..., Any]) -> list[tuple[str, str]]:
     """Extract module.attr patterns (e.g., 'np.array') from function AST."""
+    # WeakKeyDictionary raises TypeError for non-weakly-referenceable functions (builtins)
+    try:
+        cached = _module_attr_cache.get(func)
+        if cached is not None:
+            return cached
+    except TypeError:
+        pass
+
+    result = _extract_module_attr_usage_impl(func)
+
+    with contextlib.suppress(TypeError):
+        _module_attr_cache[func] = result
+
+    return result
+
+
+def _extract_module_attr_usage_impl(func: Callable[..., Any]) -> list[tuple[str, str]]:
+    """Internal implementation of extract_module_attr_usage."""
     try:
         source = inspect.getsource(func)
     except (OSError, TypeError):

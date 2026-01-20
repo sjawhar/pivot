@@ -9,7 +9,6 @@ import datetime
 import functools
 import logging
 import multiprocessing as mp
-import os
 import pathlib
 import queue
 import threading
@@ -46,9 +45,11 @@ from pivot.types import (
     StageStartEvent,
     StageStatus,
     TuiLogMessage,
-    TuiMessage,
     TuiMessageType,
+    TuiQueue,
     TuiStatusMessage,
+    TuiWatchMessage,
+    WatchStatus,
 )
 
 if TYPE_CHECKING:
@@ -62,6 +63,54 @@ _MAX_WORKERS_DEFAULT = 8
 
 # Special mutex that means "run exclusively" - no other stages run concurrently
 EXCLUSIVE_MUTEX = "*"
+
+
+def _noop() -> None:
+    """Module-level for pickling."""
+    pass
+
+
+def _compute_max_workers(stage_count: int, override: int | None = None) -> int:
+    """Single source of truth for max_workers calculation."""
+    if override is not None:
+        return max(1, min(override, stage_count))
+    return max(1, min(loky.cpu_count() or 1, _MAX_WORKERS_DEFAULT, stage_count))
+
+
+def _warm_workers(pool: loky.ProcessPoolExecutor, count: int) -> None:
+    """Submit no-op tasks to ensure workers are warm and channels established."""
+    futures = [pool.submit(_noop) for _ in range(count)]
+    for f in futures:
+        f.result()
+
+
+def prepare_workers(
+    stage_count: int, *, parallel: bool = True, max_workers: int | None = None
+) -> int:
+    """Pre-warm loky worker pool. Returns actual worker count.
+
+    Call before starting Textual TUI to avoid FD inheritance issues.
+    Safe to call in non-TUI mode (no downside, slightly faster first execution).
+    """
+    if not parallel or stage_count <= 0:
+        return 1
+    workers = _compute_max_workers(stage_count, max_workers)
+    pool = loky.get_reusable_executor(max_workers=workers)
+    _warm_workers(pool, workers)
+    return workers
+
+
+def restart_workers(stage_count: int, max_workers: int | None = None) -> int:
+    """Kill existing workers and spawn fresh ones. For code reload in watch mode.
+
+    Unlike prepare_workers(), this kills existing workers first, then warms the new pool.
+    """
+    if stage_count <= 0:
+        return 1
+    workers = _compute_max_workers(stage_count, max_workers)
+    pool = loky.get_reusable_executor(max_workers=workers, kill_workers=True)
+    _warm_workers(pool, workers)
+    return workers
 
 
 def _cleanup_worker_pool() -> None:
@@ -80,6 +129,33 @@ class ExecutionSummary(TypedDict):
 
     status: Literal[StageStatus.RAN, StageStatus.SKIPPED, StageStatus.FAILED, StageStatus.UNKNOWN]
     reason: str
+
+
+def count_results(results: dict[str, ExecutionSummary]) -> tuple[int, int, int, int]:
+    """Count results by category: ran, cached, blocked, failed.
+
+    Distinguishes between "cached" (skipped because unchanged) and
+    "blocked" (skipped because upstream failed).
+
+    Returns:
+        Tuple of (ran, cached, blocked, failed) counts
+    """
+    ran = cached = blocked = failed = 0
+    for result in results.values():
+        status = result["status"]
+        reason = result["reason"]
+        if status == StageStatus.RAN:
+            ran += 1
+        elif status == StageStatus.FAILED:
+            failed += 1
+        elif status == StageStatus.UNKNOWN:
+            # UNKNOWN indicates executor bug - don't count in normal categories
+            pass
+        elif reason.startswith("upstream"):
+            blocked += 1
+        else:
+            cached += 1
+    return ran, cached, blocked, failed
 
 
 @dataclasses.dataclass
@@ -116,7 +192,7 @@ class StageLifecycle:
 
     def __init__(
         self,
-        tui_queue: mp.Queue[TuiMessage] | None,
+        tui_queue: TuiQueue | None,
         con: console.Console | None,
         progress_callback: Callable[[RunJsonEvent], None] | None,
         total_stages: int,
@@ -130,17 +206,18 @@ class StageLifecycle:
         self.run_id = run_id
         self.explain_mode = explain_mode
 
-    def mark_started(self, state: StageState, running_count: int) -> None:
+    def mark_started(self, state: StageState) -> None:
         """Mark stage as in-progress and send all notifications."""
         state.status = StageStatus.IN_PROGRESS
         state.start_time = time.perf_counter()
 
         if self.console and not self.explain_mode:
+            # Use FINGERPRINTING since stage is being checked - not yet confirmed to run
             self.console.stage_start(
                 name=state.name,
-                index=running_count,
+                index=state.index,
                 total=self.total_stages,
-                status=StageDisplayStatus.RUNNING,
+                status=StageDisplayStatus.FINGERPRINTING,
             )
 
         if self.tui_queue:
@@ -168,20 +245,20 @@ class StageLifecycle:
                 )
             )
 
-    def mark_completed(self, state: StageState, result: StageResult, completed_count: int) -> None:
+    def mark_completed(self, state: StageState, result: StageResult) -> None:
         """Mark stage completed with result and send all notifications."""
         state.result = result
         state.status = result["status"]
         state.end_time = time.perf_counter()
-        self._notify_complete(state, result, completed_count)
+        self._notify_complete(state, result)
 
-    def mark_failed(self, state: StageState, reason: str, completed_count: int) -> None:
+    def mark_failed(self, state: StageState, reason: str) -> None:
         """Mark stage as failed and send all notifications."""
         result = StageResult(status=StageStatus.FAILED, reason=reason, output_lines=[])
         state.result = result
         state.status = StageStatus.FAILED
         state.end_time = time.perf_counter()
-        self._notify_complete(state, result, completed_count)
+        self._notify_complete(state, result)
 
     def mark_skipped_upstream(self, state: StageState, failed_stage: str) -> None:
         """Mark stage as skipped due to upstream failure and send all notifications.
@@ -193,20 +270,19 @@ class StageLifecycle:
         state.result = result
         state.status = StageStatus.SKIPPED
         # Don't set end_time - stage never started
-        self._notify_complete(state, result, completed_count=0)
+        self._notify_complete(state, result)
 
-    def _notify_complete(
-        self, state: StageState, result: StageResult, completed_count: int
-    ) -> None:
+    def _notify_complete(self, state: StageState, result: StageResult) -> None:
         """Send completion notifications to all channels."""
         result_status = result["status"]
         result_reason = result["reason"]
         duration = state.get_duration()
+        logger.debug(f"TUI status: {state.name} -> {result_status}")  # noqa: G004
 
         if self.console:
             self.console.stage_result(
                 name=state.name,
-                index=completed_count,
+                index=state.index,
                 total=self.total_stages,
                 status=result_status,
                 reason=result_reason,
@@ -252,11 +328,12 @@ def run(
     force: bool = False,
     stage_timeout: float | None = None,
     explain_mode: bool = False,
-    tui_queue: mp.Queue[TuiMessage] | None = None,
+    tui_queue: TuiQueue | None = None,
     output_queue: mp.Queue[OutputMessage] | None = None,
     no_commit: bool = False,
     no_cache: bool = False,
     progress_callback: Callable[[RunJsonEvent], None] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> dict[str, ExecutionSummary]:
     """Execute pipeline stages with greedy parallel execution.
 
@@ -278,6 +355,7 @@ def run(
         no_commit: If True, defer lock files to pending dir (faster iteration).
         no_cache: If True, skip caching outputs entirely (maximum iteration speed).
         progress_callback: Callback for JSONL progress events (stage start/complete).
+        cancel_event: If set, stop starting new stages and mark pending as cancelled.
 
     Returns:
         Dict of stage_name -> {status: "ran"|"skipped"|"failed", reason: str}
@@ -339,11 +417,7 @@ def run(
 
     stage_states = _initialize_stage_states(execution_order, graph)
 
-    if not parallel:
-        max_workers = 1
-    elif max_workers is None:
-        max_workers = min(os.cpu_count() or 1, _MAX_WORKERS_DEFAULT, len(execution_order))
-    max_workers = max(1, min(max_workers, len(execution_order)))
+    max_workers = 1 if not parallel else _compute_max_workers(len(execution_order), max_workers)
 
     start_time = time.perf_counter()
 
@@ -368,6 +442,7 @@ def run(
             no_commit=no_commit,
             no_cache=no_cache,
             progress_callback=progress_callback,
+            cancel_event=cancel_event,
         )
 
         results = _build_results(stage_states)
@@ -387,14 +462,9 @@ def run(
         )
 
     if con:
-        status_counts = collections.Counter(r["status"] for r in results.values())
+        ran, cached, blocked, failed = count_results(results)
         total_duration = time.perf_counter() - start_time
-        con.summary(
-            status_counts[StageStatus.RAN],
-            status_counts[StageStatus.SKIPPED],
-            status_counts[StageStatus.FAILED],
-            total_duration,
-        )
+        con.summary(ran, cached, blocked, failed, total_duration)
 
     return results
 
@@ -497,18 +567,18 @@ def _execute_greedy(
     overrides: parameters.ParamsOverrides | None = None,
     explain_mode: bool = False,
     checkout_modes: list[str] | None = None,
-    tui_queue: mp.Queue[TuiMessage] | None = None,
+    tui_queue: TuiQueue | None = None,
     output_queue: mp.Queue[OutputMessage] | None = None,
     run_id: str = "",
     force: bool = False,
     no_commit: bool = False,
     no_cache: bool = False,
     progress_callback: Callable[[RunJsonEvent], None] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> None:
     """Execute stages with greedy parallel scheduling using loky ProcessPoolExecutor."""
     overrides = overrides or {}
     checkout_modes = checkout_modes or config.DEFAULT_CHECKOUT_MODE_ORDER
-    completed_count = 0
     futures: dict[concurrent.futures.Future[StageResult], str] = {}
     mutex_counts: collections.defaultdict[str, int] = collections.defaultdict(int)
 
@@ -529,7 +599,9 @@ def _execute_greedy(
     # Track manager so we can shut it down - only created when no queue is passed in
     local_manager = None
     if output_queue is None:
-        local_manager = mp.Manager()
+        # Use spawn context to avoid fork-in-multithreaded-context issues (Python 3.13+ deprecation)
+        spawn_ctx = mp.get_context("spawn")
+        local_manager = spawn_ctx.Manager()
         # Manager().Queue() returns AutoProxy[Queue] which is incompatible with Queue type stubs
         output_queue = local_manager.Queue()  # pyright: ignore[reportAssignmentType]
 
@@ -557,13 +629,13 @@ def _execute_greedy(
                 output_queue=output_queue,
                 max_stages=max_workers,
                 mutex_counts=mutex_counts,
-                completed_count=completed_count,
                 overrides=overrides,
                 lifecycle=lifecycle,
                 checkout_modes=checkout_modes,
                 force=force,
                 no_commit=no_commit,
                 no_cache=no_cache,
+                cancel_event=cancel_event,
             )
 
             while futures:
@@ -605,7 +677,6 @@ def _execute_greedy(
                             stage_states,
                             lifecycle,
                         )
-                        completed_count += 1
                         for mutex in state.mutex:
                             mutex_counts[mutex] -= 1
                     continue
@@ -622,7 +693,7 @@ def _execute_greedy(
                             metrics.add_entries(result["metrics"])
 
                         # Use lifecycle to set state AND send all notifications
-                        lifecycle.mark_completed(state, result, completed_count + 1)
+                        lifecycle.mark_completed(state, result)
 
                         # Handle downstream cascade for failed stages
                         if result["status"] == StageStatus.FAILED:
@@ -641,8 +712,6 @@ def _execute_greedy(
                     except Exception as e:
                         _mark_stage_failed(state, str(e), stage_states, lifecycle)
 
-                    completed_count += 1
-
                     for downstream_name in state.downstream:
                         downstream_state = stage_states.get(downstream_name)
                         if downstream_state:
@@ -658,11 +727,39 @@ def _execute_greedy(
                             mutex_counts[mutex] = 0  # Reset to valid state
 
                 if error_mode == OnError.FAIL:
-                    failed = any(s.status == StageStatus.FAILED for s in stage_states.values())
-                    if failed:
+                    failed_stages = [
+                        name for name, s in stage_states.items() if s.status == StageStatus.FAILED
+                    ]
+                    if failed_stages:
+                        failed_stage_name = failed_stages[0]  # Use first failure for reason
+
+                        # Cancel all pending futures (no-op for already-running workers)
                         for f in futures:
                             f.cancel()
+
+                        # Mark all unfinished stages as skipped due to upstream failure
+                        # Explicit check for READY (waiting) and IN_PROGRESS (running) -
+                        # don't use "not in finished" as UNKNOWN indicates a bug state
+                        unfinished = {StageStatus.READY, StageStatus.IN_PROGRESS}
+                        for state in stage_states.values():
+                            if state.status in unfinished:
+                                lifecycle.mark_skipped_upstream(state, failed_stage_name)
                         return
+
+                # Check for cancellation - mark remaining READY stages as cancelled
+                if cancel_event is not None and cancel_event.is_set():
+                    for state in stage_states.values():
+                        if state.status == StageStatus.READY:
+                            result = StageResult(
+                                status=StageStatus.SKIPPED,
+                                reason="cancelled",
+                                output_lines=[],
+                            )
+                            lifecycle.mark_completed(state, result)
+                    if not futures:
+                        # No running stages - exit immediately
+                        return
+                    # Otherwise let running stages complete before exiting
 
                 slots_available = max_workers - len(futures)
                 if slots_available > 0:
@@ -674,13 +771,13 @@ def _execute_greedy(
                         output_queue=output_queue,
                         max_stages=slots_available,
                         mutex_counts=mutex_counts,
-                        completed_count=completed_count,
                         overrides=overrides,
                         lifecycle=lifecycle,
                         checkout_modes=checkout_modes,
                         force=force,
                         no_commit=no_commit,
                         no_cache=no_cache,
+                        cancel_event=cancel_event,
                     )
     finally:
         # Signal output thread to stop - may fail if queue is broken
@@ -696,7 +793,7 @@ def _execute_greedy(
 def _output_queue_reader(
     output_q: mp.Queue[OutputMessage],
     con: console.Console | None,
-    tui_queue: mp.Queue[TuiMessage] | None = None,
+    tui_queue: TuiQueue | None = None,
 ) -> None:
     """Read output messages from worker processes and display/forward them."""
     while True:
@@ -722,6 +819,15 @@ def _output_queue_reader(
         except (EOFError, OSError, BrokenPipeError):
             # Queue was closed or broken - exit gracefully
             logger.debug("Output queue reader exiting: queue closed or broken")
+            # Notify TUI that log streaming was interrupted (tui_queue is reliable since it's stdlib queue.Queue)
+            if tui_queue:
+                tui_queue.put_nowait(
+                    TuiWatchMessage(
+                        type=TuiMessageType.WATCH,
+                        status=WatchStatus.ERROR,
+                        message="Log streaming interrupted - logs may be incomplete",
+                    )
+                )
             break
 
 
@@ -733,15 +839,20 @@ def _start_ready_stages(
     output_queue: mp.Queue[OutputMessage],
     max_stages: int,
     mutex_counts: collections.defaultdict[str, int],
-    completed_count: int,
     overrides: parameters.ParamsOverrides,
     lifecycle: StageLifecycle,
     checkout_modes: list[str] | None = None,
     force: bool = False,
     no_commit: bool = False,
     no_cache: bool = False,
+    cancel_event: threading.Event | None = None,
 ) -> None:
     """Find and start stages that are ready to execute."""
+    # Check cancellation - stages can become READY after the main loop's check
+    # (e.g., when a running stage completes and unblocks downstream)
+    if cancel_event is not None and cancel_event.is_set():
+        return
+
     checkout_modes = checkout_modes or config.DEFAULT_CHECKOUT_MODE_ORDER
     started = 0
 
@@ -793,7 +904,7 @@ def _start_ready_stages(
             started += 1
 
             # Mark as in-progress and send all notifications via lifecycle
-            lifecycle.mark_started(state, running_count=completed_count + len(futures))
+            lifecycle.mark_started(state)
         except Exception as e:
             # Rollback mutex acquisition on submission failure
             for mutex in state.mutex:
@@ -811,11 +922,6 @@ def _prepare_worker_info(
     no_cache: bool,
 ) -> worker.WorkerStageInfo:
     """Prepare stage info for pickling to worker process."""
-    # Extract just the paths from OutOverride (worker doesn't need cache/persist options)
-    out_path_overrides = None
-    if stage_info["out_path_overrides"]:
-        out_path_overrides = {k: v["path"] for k, v in stage_info["out_path_overrides"].items()}
-
     return worker.WorkerStageInfo(
         func=stage_info["func"],
         fingerprint=stage_info["fingerprint"],
@@ -825,14 +931,14 @@ def _prepare_worker_info(
         params=stage_info["params"],
         variant=stage_info["variant"],
         overrides=overrides,
-        cwd=stage_info["cwd"],
         checkout_modes=checkout_modes,
         run_id=run_id,
         force=force,
         no_commit=no_commit,
         no_cache=no_cache,
         dep_specs=stage_info["dep_specs"],
-        out_path_overrides=out_path_overrides,
+        out_specs=stage_info["out_specs"],
+        params_arg_name=stage_info["params_arg_name"],
     )
 
 
@@ -861,7 +967,7 @@ def _mark_stage_failed(
     """
     if lifecycle:
         # Use lifecycle to set state AND send notifications
-        lifecycle.mark_failed(state, reason, completed_count=0)
+        lifecycle.mark_failed(state, reason)
     else:
         # Fallback for non-TUI mode
         state.result = StageResult(status=StageStatus.FAILED, reason=reason, output_lines=[])

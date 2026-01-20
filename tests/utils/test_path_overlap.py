@@ -68,9 +68,12 @@ def test_directory_output_vs_file_output_conflict() -> None:
     # Stage A outputs directory
     reg.register(_helper_stage_data_dir, name="stage_a")
 
-    # Stage B outputs file inside that directory - should conflict
+    # Stage B outputs file inside that directory (registration succeeds, validation deferred)
+    reg.register(_helper_stage_data_train, name="stage_b")
+
+    # Output validation is deferred until validate_outputs() is called
     with pytest.raises(exceptions.ValidationError, match="overlap"):
-        reg.register(_helper_stage_data_train, name="stage_b")
+        reg.validate_outputs()
 
 
 def test_parent_directory_output_vs_child_directory_output() -> None:
@@ -87,9 +90,12 @@ def test_parent_directory_output_vs_child_directory_output() -> None:
     # Stage A outputs parent directory
     reg.register(_helper_stage_data_dir, name="stage_a")
 
-    # Stage B outputs child directory - should conflict
+    # Stage B outputs child directory (registration succeeds, validation deferred)
+    reg.register(_helper_stage_data_raw, name="stage_b")
+
+    # Output validation is deferred until validate_outputs() is called
     with pytest.raises(exceptions.ValidationError, match="overlap"):
-        reg.register(_helper_stage_data_raw, name="stage_b")
+        reg.validate_outputs()
 
 
 def test_sibling_file_outputs_no_conflict() -> None:

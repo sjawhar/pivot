@@ -577,3 +577,346 @@ def test_force_and_allow_uncached_incremental_are_orthogonal(
     # Both flags together should work
     results = executor.run(cache_dir=cache_dir, force=True, allow_uncached_incremental=True)
     assert results["append_stage"]["status"] == "ran"
+
+
+# =============================================================================
+# IncrementalOut as Input Annotation Tests
+# =============================================================================
+
+# Module-level type aliases for tests (required for get_type_hints to work)
+type _TestMyCache = Annotated[
+    dict[str, str] | None, IncrementalOut("cache.json", loaders.JSON[dict[str, str]]())
+]
+
+
+class _TestCacheOutputs(TypedDict):
+    existing: Annotated[
+        dict[str, str], IncrementalOut("cache.json", loaders.JSON[dict[str, str]]())
+    ]
+
+
+def _test_stage_with_incremental_input(existing: _TestMyCache) -> _RegularStageOutputs:
+    """Module-level stage function for testing IncrementalOut as input."""
+    return {"output": pathlib.Path("output.txt")}
+
+
+def _test_cache_stage(existing: _TestMyCache) -> _TestCacheOutputs:
+    """Module-level stage function for testing IncrementalOut as both input and output."""
+    if existing is None:
+        existing = {}
+    existing["new_key"] = "value"
+    return _TestCacheOutputs(existing=existing)
+
+
+def _test_stage_with_mixed_deps(
+    data: Annotated[dict[str, Any], outputs.Dep("input.json", loaders.JSON[dict[str, Any]]())],
+    existing: _TestMyCache,
+) -> _RegularStageOutputs:
+    """Module-level stage function for testing IncrementalOut mixed with Dep."""
+    return {"output": pathlib.Path("output.txt")}
+
+
+def test_incremental_out_recognized_as_input_annotation() -> None:
+    """IncrementalOut should be recognized as a valid input annotation."""
+    from pivot import stage_def
+
+    dep_specs = stage_def.get_dep_specs_from_signature(_test_stage_with_incremental_input)
+    assert "existing" in dep_specs
+    assert dep_specs["existing"].path == "cache.json"
+    assert dep_specs["existing"].creates_dep_edge is False
+
+
+def test_incremental_input_first_run_returns_empty(tmp_path: pathlib.Path) -> None:
+    """IncrementalOut as input should return empty value if file doesn't exist."""
+    from pivot import stage_def
+
+    dep_specs = stage_def.get_dep_specs_from_signature(_test_stage_with_incremental_input)
+    loaded = stage_def.load_deps_from_specs(dep_specs, tmp_path)
+
+    # JSON loader returns empty dict for first run
+    assert loaded["existing"] == {}
+
+
+def test_incremental_input_subsequent_run_loads_value(tmp_path: pathlib.Path) -> None:
+    """IncrementalOut as input should load value if file exists."""
+    from pivot import stage_def
+
+    # Create the cache file
+    cache_file = tmp_path / "cache.json"
+    cache_file.write_text('{"key": "value"}')
+
+    dep_specs = stage_def.get_dep_specs_from_signature(_test_stage_with_incremental_input)
+    loaded = stage_def.load_deps_from_specs(dep_specs, tmp_path)
+
+    assert loaded["existing"] == {"key": "value"}
+
+
+def test_incremental_input_no_circular_dependency(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, clean_registry: None
+) -> None:
+    """IncrementalOut as input should NOT create DAG circular dependency."""
+    monkeypatch.setattr("pivot.project.get_project_root", lambda: tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    # Register the stage - should NOT raise circular dependency error
+    REGISTRY.register(_test_cache_stage, name="cache_stage")
+
+    # Build DAG - should succeed without circular dependency
+    dag = REGISTRY.build_dag(validate=False)
+    assert "cache_stage" in dag.nodes()
+
+
+def test_incremental_input_type_alias_pattern() -> None:
+    """Type alias can be shared between input parameter and return annotation."""
+    from pivot import stage_def
+
+    # Verify both input and output recognized
+    dep_specs = stage_def.get_dep_specs_from_signature(_test_cache_stage)
+    assert "existing" in dep_specs
+    assert dep_specs["existing"].creates_dep_edge is False
+
+    out_specs = stage_def.get_output_specs_from_return(_test_cache_stage, "_test_cache_stage")
+    assert "existing" in out_specs
+    assert isinstance(out_specs["existing"], IncrementalOut)
+
+
+def test_incremental_input_mixed_with_regular_deps() -> None:
+    """IncrementalOut input can coexist with regular Dep annotations."""
+    from pivot import stage_def
+
+    dep_specs = stage_def.get_dep_specs_from_signature(_test_stage_with_mixed_deps)
+
+    # Regular Dep creates edge
+    assert "data" in dep_specs
+    assert dep_specs["data"].creates_dep_edge is True
+
+    # IncrementalOut does not create edge
+    assert "existing" in dep_specs
+    assert dep_specs["existing"].creates_dep_edge is False
+
+
+# =============================================================================
+# IncrementalOut Validation Tests
+# =============================================================================
+
+
+# Module-level stage functions for validation tests (must be picklable)
+
+
+class _ValidationTestWrongNameOutputs(TypedDict):
+    # Output field name 'wrong_name' doesn't match input parameter name 'existing'
+    wrong_name: Annotated[
+        dict[str, str], IncrementalOut("cache.json", loaders.JSON[dict[str, str]]())
+    ]
+
+
+class _ValidationTestWrongPathOutputs(TypedDict):
+    existing: Annotated[
+        dict[str, str], IncrementalOut("wrong_path.json", loaders.JSON[dict[str, str]]())
+    ]
+
+
+class _ValidationTestWrongLoaderOutputs(TypedDict):
+    existing: Annotated[
+        dict[str, str], IncrementalOut("cache.json", loaders.Pickle[dict[str, str]]())
+    ]
+
+
+type _TestCacheA = Annotated[
+    dict[str, str] | None, IncrementalOut("a.json", loaders.JSON[dict[str, str]]())
+]
+type _TestCacheB = Annotated[
+    dict[str, str] | None, IncrementalOut("b.json", loaders.JSON[dict[str, str]]())
+]
+
+
+class _ValidationTestMultiOutputs(TypedDict):
+    cache_a: Annotated[dict[str, str], IncrementalOut("a.json", loaders.JSON[dict[str, str]]())]
+    cache_b: Annotated[dict[str, str], IncrementalOut("b.json", loaders.JSON[dict[str, str]]())]
+
+
+def _stage_incremental_input_no_output(existing: _TestMyCache) -> _RegularStageOutputs:
+    """Stage with IncrementalOut input but regular output."""
+    return {"output": pathlib.Path("output.txt")}
+
+
+def _stage_incremental_input_wrong_field_name(
+    existing: _TestMyCache,
+) -> _ValidationTestWrongNameOutputs:
+    """Stage with IncrementalOut input but output field name doesn't match."""
+    return _ValidationTestWrongNameOutputs(wrong_name=existing or {})
+
+
+def _stage_incremental_input_wrong_path(existing: _TestMyCache) -> _ValidationTestWrongPathOutputs:
+    """Stage with IncrementalOut input but output path doesn't match."""
+    return _ValidationTestWrongPathOutputs(existing=existing or {})
+
+
+def _stage_incremental_input_wrong_loader(
+    existing: _TestMyCache,
+) -> _ValidationTestWrongLoaderOutputs:
+    """Stage with IncrementalOut input but output loader doesn't match."""
+    return _ValidationTestWrongLoaderOutputs(existing=existing or {})
+
+
+def _stage_single_output_incremental(existing: _TestMyCache) -> _TestMyCache:
+    """Stage with single IncrementalOut input and matching single output."""
+    if existing is None:
+        existing = {}
+    existing["new"] = "value"
+    return existing
+
+
+type _TestCacheSingleOut = Annotated[
+    dict[str, str] | None, IncrementalOut("single.json", loaders.JSON[dict[str, str]]())
+]
+
+
+def _stage_single_output_wrong_path(
+    existing: _TestMyCache,
+) -> _TestCacheSingleOut:
+    """Stage with single IncrementalOut but path doesn't match."""
+    return existing
+
+
+def _stage_multiple_incremental_inputs_single_output(
+    cache_a: _TestCacheA,
+    cache_b: _TestCacheB,
+) -> _TestCacheA:
+    """Stage with multiple IncrementalOut inputs but single output."""
+    return cache_a
+
+
+def _stage_multiple_incremental_matched(
+    cache_a: _TestCacheA,
+    cache_b: _TestCacheB,
+) -> _ValidationTestMultiOutputs:
+    """Stage with multiple IncrementalOut inputs matched by name."""
+    return _ValidationTestMultiOutputs(
+        cache_a=cache_a or {},
+        cache_b=cache_b or {},
+    )
+
+
+def test_incremental_out_input_requires_matching_output(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, clean_registry: None
+) -> None:
+    """IncrementalOut input must have a matching IncrementalOut output."""
+    from pivot import exceptions
+
+    monkeypatch.setattr("pivot.project.get_project_root", lambda: tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(exceptions.ValidationError) as exc_info:
+        REGISTRY.register(_stage_incremental_input_no_output, name="test_stage")
+
+    # TypedDict return has outputs but none are IncrementalOut matching the input
+    assert "no matching IncrementalOut output field" in str(exc_info.value)
+
+
+def test_incremental_out_typeddict_name_must_match(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, clean_registry: None
+) -> None:
+    """For TypedDict returns, output field name must match parameter name."""
+    from pivot import exceptions
+
+    monkeypatch.setattr("pivot.project.get_project_root", lambda: tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(exceptions.ValidationError) as exc_info:
+        REGISTRY.register(_stage_incremental_input_wrong_field_name, name="test_stage")
+
+    assert "no matching IncrementalOut output field" in str(exc_info.value)
+    assert "existing" in str(exc_info.value)
+
+
+def test_incremental_out_input_output_path_must_match(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, clean_registry: None
+) -> None:
+    """IncrementalOut input and output paths must match."""
+    from pivot import exceptions
+
+    monkeypatch.setattr("pivot.project.get_project_root", lambda: tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(exceptions.ValidationError) as exc_info:
+        REGISTRY.register(_stage_incremental_input_wrong_path, name="test_stage")
+
+    assert "path" in str(exc_info.value).lower()
+    assert "doesn't match" in str(exc_info.value)
+
+
+def test_incremental_out_input_output_loader_must_match(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, clean_registry: None
+) -> None:
+    """IncrementalOut input and output loaders must match."""
+    from pivot import exceptions
+
+    monkeypatch.setattr("pivot.project.get_project_root", lambda: tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(exceptions.ValidationError) as exc_info:
+        REGISTRY.register(_stage_incremental_input_wrong_loader, name="test_stage")
+
+    assert "loader" in str(exc_info.value).lower()
+    assert "doesn't match" in str(exc_info.value)
+
+
+def test_incremental_out_single_output_only_one_input(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, clean_registry: None
+) -> None:
+    """Single-output stages can only have one IncrementalOut input."""
+    from pivot import exceptions
+
+    monkeypatch.setattr("pivot.project.get_project_root", lambda: tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(exceptions.ValidationError) as exc_info:
+        REGISTRY.register(_stage_multiple_incremental_inputs_single_output, name="test_stage")
+
+    assert "single-output stages can only have one" in str(exc_info.value)
+
+
+def test_incremental_out_single_output_path_must_match(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, clean_registry: None
+) -> None:
+    """Single IncrementalOut input and output paths must match."""
+    from pivot import exceptions
+
+    monkeypatch.setattr("pivot.project.get_project_root", lambda: tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(exceptions.ValidationError) as exc_info:
+        REGISTRY.register(_stage_single_output_wrong_path, name="test_stage")
+
+    assert "path" in str(exc_info.value).lower()
+    assert "doesn't match" in str(exc_info.value)
+
+
+def test_multiple_incremental_outs_matched_by_name(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, clean_registry: None
+) -> None:
+    """Multiple IncrementalOut pairs work when names match."""
+    monkeypatch.setattr("pivot.project.get_project_root", lambda: tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    # Should NOT raise - names match (cache_a -> cache_a, cache_b -> cache_b)
+    REGISTRY.register(_stage_multiple_incremental_matched, name="test_stage")
+
+    info = REGISTRY.get("test_stage")
+    assert len(info["outs"]) == 2
+
+
+def test_incremental_out_single_output_valid(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, clean_registry: None
+) -> None:
+    """Single IncrementalOut input with matching single output is valid."""
+    monkeypatch.setattr("pivot.project.get_project_root", lambda: tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    # Should NOT raise - input and output use same type alias (same path/loader)
+    REGISTRY.register(_stage_single_output_incremental, name="test_stage")
+
+    info = REGISTRY.get("test_stage")
+    assert len(info["outs"]) == 1
+    assert isinstance(info["outs"][0], IncrementalOut)

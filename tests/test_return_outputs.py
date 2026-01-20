@@ -15,12 +15,14 @@ the return value to disk automatically.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import pathlib  # noqa: TC003 - needed for tmp_path type hint
 import pickle
 from typing import Annotated, TypedDict
 
 import pytest
+from typing_extensions import TypedDict as ExtTypedDict
 
 from pivot import loaders, outputs, stage_def
 
@@ -66,6 +68,22 @@ class _MixedPathTypesResult(TypedDict):
     ]
 
 
+# TypedDict from typing_extensions for detection test
+class _ExtensionsTypedDictResult(ExtTypedDict):
+    result: Annotated[dict[str, int], outputs.Out("output.json", loaders.JSON[dict[str, int]]())]
+
+
+# Metadata class that's not an Out - for testing Annotated without Out
+class _SomeOtherMetadata:
+    pass
+
+
+# Dataclass for testing invalid return types
+@dataclasses.dataclass
+class _DataclassResult:
+    count: int
+
+
 # ==============================================================================
 # Test: Extract output specs from return annotation
 # ==============================================================================
@@ -77,7 +95,7 @@ def test_get_output_specs_from_return_single_output() -> None:
     def process() -> _SingleOutputResult:
         return {"result": {"count": 42}}
 
-    specs = stage_def.get_output_specs_from_return(process)
+    specs = stage_def.get_output_specs_from_return(process, "test_stage")
 
     assert len(specs) == 1
     assert "result" in specs
@@ -91,7 +109,7 @@ def test_get_output_specs_from_return_multiple_outputs() -> None:
     def train() -> _MultipleOutputsResult:
         return {"model": b"model_bytes", "metrics": {"accuracy": 0.95}}
 
-    specs = stage_def.get_output_specs_from_return(train)
+    specs = stage_def.get_output_specs_from_return(train, "test_stage")
 
     assert len(specs) == 2
     assert "model" in specs
@@ -108,30 +126,32 @@ def test_get_output_specs_from_return_none_returns_empty() -> None:
     def process() -> None:
         pass
 
-    specs = stage_def.get_output_specs_from_return(process)
+    specs = stage_def.get_output_specs_from_return(process, "test_stage")
 
     assert specs == {}
 
 
 def test_get_output_specs_from_return_non_typeddict_returns_empty() -> None:
-    """Should return empty dict for non-TypedDict return types."""
+    """Non-TypedDict return types should return empty specs (no tracked outputs)."""
 
     def process() -> dict[str, int]:
         return {"count": 42}
 
-    specs = stage_def.get_output_specs_from_return(process)
-
+    specs = stage_def.get_output_specs_from_return(process, "test_stage")
     assert specs == {}
 
 
 def test_get_output_specs_from_return_raises_on_unannotated_fields() -> None:
-    """Should raise TypeError for TypedDict fields without Out annotation."""
+    """Should raise StageDefinitionError for TypedDict fields without Out annotation."""
+    from pivot import exceptions
 
     def process() -> _InvalidMixedFieldsResult:
         return {"result": {"count": 42}, "extra": "ignored"}
 
-    with pytest.raises(TypeError, match="fields without Out annotations.*'extra'"):
-        stage_def.get_output_specs_from_return(process)
+    with pytest.raises(
+        exceptions.StageDefinitionError, match="fields without Out annotations.*extra"
+    ):
+        stage_def.get_output_specs_from_return(process, "test_stage")
 
 
 # ==============================================================================
@@ -145,7 +165,7 @@ def test_save_return_outputs_writes_file(tmp_path: pathlib.Path) -> None:
     def process() -> _SingleOutputResult:
         return {"result": {"count": 42}}
 
-    specs = stage_def.get_output_specs_from_return(process)
+    specs = stage_def.get_output_specs_from_return(process, "test_stage")
     return_value: _SingleOutputResult = {"result": {"count": 42}}
 
     stage_def.save_return_outputs(return_value, specs, tmp_path)
@@ -161,7 +181,7 @@ def test_save_return_outputs_multiple_files(tmp_path: pathlib.Path) -> None:
     def train() -> _MultipleOutputsResult:
         return {"model": b"model_bytes", "metrics": {"accuracy": 0.95}}
 
-    specs = stage_def.get_output_specs_from_return(train)
+    specs = stage_def.get_output_specs_from_return(train, "test_stage")
     return_value: _MultipleOutputsResult = {"model": b"model_bytes", "metrics": {"accuracy": 0.95}}
 
     stage_def.save_return_outputs(return_value, specs, tmp_path)
@@ -183,62 +203,13 @@ def test_save_return_outputs_creates_parent_dirs(tmp_path: pathlib.Path) -> None
     def process() -> _NestedPathResult:
         return {"result": {"count": 42}}
 
-    specs = stage_def.get_output_specs_from_return(process)
+    specs = stage_def.get_output_specs_from_return(process, "test_stage")
     return_value: _NestedPathResult = {"result": {"count": 42}}
 
     stage_def.save_return_outputs(return_value, specs, tmp_path)
 
     output_file = tmp_path / "nested" / "dir" / "output.json"
     assert output_file.exists()
-
-
-# ==============================================================================
-# Test: Path overrides for return outputs
-# ==============================================================================
-
-
-def test_save_return_outputs_with_path_overrides(tmp_path: pathlib.Path) -> None:
-    """save_return_outputs() should respect path overrides."""
-
-    def process() -> _SingleOutputResult:
-        return {"result": {"count": 42}}
-
-    specs = stage_def.get_output_specs_from_return(process)
-    return_value: _SingleOutputResult = {"result": {"count": 42}}
-
-    # Override the default path
-    overrides = {"result": "custom/path/output.json"}
-    stage_def.save_return_outputs(return_value, specs, tmp_path, path_overrides=overrides)
-
-    # Default path should NOT exist
-    assert not (tmp_path / "output.json").exists()
-
-    # Custom path should exist
-    output_file = tmp_path / "custom" / "path" / "output.json"
-    assert output_file.exists()
-    assert json.loads(output_file.read_text()) == {"count": 42}
-
-
-def test_save_return_outputs_partial_path_overrides(tmp_path: pathlib.Path) -> None:
-    """Path overrides can be partial - only override some outputs."""
-
-    def train() -> _MultipleOutputsResult:
-        return {"model": b"model_bytes", "metrics": {"accuracy": 0.95}}
-
-    specs = stage_def.get_output_specs_from_return(train)
-    return_value: _MultipleOutputsResult = {"model": b"model_bytes", "metrics": {"accuracy": 0.95}}
-
-    # Only override model path
-    overrides = {"model": "custom/model.pkl"}
-    stage_def.save_return_outputs(return_value, specs, tmp_path, path_overrides=overrides)
-
-    # Model should be at custom path
-    assert (tmp_path / "custom" / "model.pkl").exists()
-    assert not (tmp_path / "model.pkl").exists()
-
-    # Metrics should be at default path
-    assert (tmp_path / "metrics.json").exists()
-    assert json.loads((tmp_path / "metrics.json").read_text()) == {"accuracy": 0.95}
 
 
 # ==============================================================================
@@ -252,7 +223,7 @@ def test_get_output_specs_from_return_list_path() -> None:
     def process() -> _ListPathResult:
         return {"items": [{"a": 1}, {"b": 2}]}
 
-    specs = stage_def.get_output_specs_from_return(process)
+    specs = stage_def.get_output_specs_from_return(process, "test_stage")
 
     assert len(specs) == 1
     assert "items" in specs
@@ -266,7 +237,7 @@ def test_get_output_specs_from_return_mixed_path_types() -> None:
     def process() -> _MixedPathTypesResult:
         return {"single": {"x": 1}, "multi": [{"a": 1}, {"b": 2}]}
 
-    specs = stage_def.get_output_specs_from_return(process)
+    specs = stage_def.get_output_specs_from_return(process, "test_stage")
 
     assert len(specs) == 2
     assert specs["single"].path == "single.json"
@@ -279,7 +250,7 @@ def test_save_return_outputs_list_path(tmp_path: pathlib.Path) -> None:
     def process() -> _ListPathResult:
         return {"items": [{"a": 1}, {"b": 2}]}
 
-    specs = stage_def.get_output_specs_from_return(process)
+    specs = stage_def.get_output_specs_from_return(process, "test_stage")
     return_value: _ListPathResult = {"items": [{"a": 1}, {"b": 2}]}
 
     stage_def.save_return_outputs(return_value, specs, tmp_path)
@@ -299,7 +270,7 @@ def test_save_return_outputs_mixed_path_types(tmp_path: pathlib.Path) -> None:
     def process() -> _MixedPathTypesResult:
         return {"single": {"x": 1}, "multi": [{"a": 1}, {"b": 2}]}
 
-    specs = stage_def.get_output_specs_from_return(process)
+    specs = stage_def.get_output_specs_from_return(process, "test_stage")
     return_value: _MixedPathTypesResult = {"single": {"x": 1}, "multi": [{"a": 1}, {"b": 2}]}
 
     stage_def.save_return_outputs(return_value, specs, tmp_path)
@@ -315,107 +286,9 @@ def test_save_return_outputs_mixed_path_types(tmp_path: pathlib.Path) -> None:
     assert json.loads((tmp_path / "m2.json").read_text()) == {"b": 2}
 
 
-def test_save_return_outputs_list_path_override(tmp_path: pathlib.Path) -> None:
-    """Path overrides for list paths should replace the entire list."""
-
-    def process() -> _ListPathResult:
-        return {"items": [{"a": 1}, {"b": 2}]}
-
-    specs = stage_def.get_output_specs_from_return(process)
-    return_value: _ListPathResult = {"items": [{"a": 1}, {"b": 2}]}
-
-    # Override with different paths
-    overrides = {"items": ["custom/x.json", "custom/y.json"]}
-    stage_def.save_return_outputs(return_value, specs, tmp_path, path_overrides=overrides)
-
-    # Default paths should NOT exist
-    assert not (tmp_path / "a.json").exists()
-    assert not (tmp_path / "b.json").exists()
-
-    # Custom paths should exist
-    assert (tmp_path / "custom" / "x.json").exists()
-    assert (tmp_path / "custom" / "y.json").exists()
-
-
 # ==============================================================================
 # Test: Validation errors
 # ==============================================================================
-
-
-def test_save_return_outputs_validates_unknown_override_keys(tmp_path: pathlib.Path) -> None:
-    """save_return_outputs() should raise on unknown keys in path_overrides."""
-
-    def process() -> _SingleOutputResult:
-        return {"result": {"count": 42}}
-
-    specs = stage_def.get_output_specs_from_return(process)
-    return_value: _SingleOutputResult = {"result": {"count": 42}}
-
-    # Typo in override key
-    overrides = {"rsult": "custom.json"}  # typo: 'rsult' instead of 'result'
-
-    with pytest.raises(ValueError, match="Unknown return output names"):
-        stage_def.save_return_outputs(return_value, specs, tmp_path, path_overrides=overrides)
-
-
-def test_save_return_outputs_validates_override_type_mismatch_str_to_list(
-    tmp_path: pathlib.Path,
-) -> None:
-    """save_return_outputs() should raise when string override given for list path."""
-
-    def process() -> _ListPathResult:
-        return {"items": [{"a": 1}, {"b": 2}]}
-
-    specs = stage_def.get_output_specs_from_return(process)
-    return_value: _ListPathResult = {"items": [{"a": 1}, {"b": 2}]}
-
-    # Wrong type: string override for list path
-    overrides = {"items": "single.json"}  # should be list
-
-    with pytest.raises(TypeError, match="spec is sequence, override is str"):
-        stage_def.save_return_outputs(return_value, specs, tmp_path, path_overrides=overrides)
-
-
-def test_save_return_outputs_validates_override_type_mismatch_list_to_str(
-    tmp_path: pathlib.Path,
-) -> None:
-    """save_return_outputs() should raise when list override given for string path."""
-
-    def process() -> _SingleOutputResult:
-        return {"result": {"count": 42}}
-
-    specs = stage_def.get_output_specs_from_return(process)
-    return_value: _SingleOutputResult = {"result": {"count": 42}}
-
-    # Wrong type: list override for string path
-    overrides = {"result": ["a.json", "b.json"]}  # should be string
-
-    with pytest.raises(TypeError, match="spec is str, override is sequence"):
-        stage_def.save_return_outputs(return_value, specs, tmp_path, path_overrides=overrides)
-
-
-def test_save_return_outputs_allows_different_list_length_override(tmp_path: pathlib.Path) -> None:
-    """save_return_outputs() should allow list override with different length."""
-
-    def process() -> _ListPathResult:
-        return {"items": [{"a": 1}, {"b": 2}]}
-
-    specs = stage_def.get_output_specs_from_return(process)
-    # Return value has 3 items to match the 3-path override
-    return_value = {"items": [{"a": 1}, {"b": 2}, {"c": 3}]}
-
-    # Override with 3 paths for 2-path spec - allowed for variable-size outputs
-    overrides = {"items": ["x.json", "y.json", "z.json"]}
-
-    stage_def.save_return_outputs(return_value, specs, tmp_path, path_overrides=overrides)
-
-    # Verify all three files were written
-    assert (tmp_path / "x.json").exists()
-    assert (tmp_path / "y.json").exists()
-    assert (tmp_path / "z.json").exists()
-    assert json.loads((tmp_path / "x.json").read_text()) == {"a": 1}
-    assert json.loads((tmp_path / "y.json").read_text()) == {"b": 2}
-    assert json.loads((tmp_path / "z.json").read_text()) == {"c": 3}
 
 
 def test_save_return_outputs_validates_missing_keys(tmp_path: pathlib.Path) -> None:
@@ -424,7 +297,7 @@ def test_save_return_outputs_validates_missing_keys(tmp_path: pathlib.Path) -> N
     def process() -> _MultipleOutputsResult:
         return {"model": b"data", "metrics": {"acc": 0.9}}
 
-    specs = stage_def.get_output_specs_from_return(process)
+    specs = stage_def.get_output_specs_from_return(process, "test_stage")
     # Missing 'metrics' key
     return_value = {"model": b"data"}
 
@@ -438,67 +311,12 @@ def test_save_return_outputs_validates_list_value_length(tmp_path: pathlib.Path)
     def process() -> _ListPathResult:
         return {"items": [{"a": 1}, {"b": 2}]}
 
-    specs = stage_def.get_output_specs_from_return(process)
+    specs = stage_def.get_output_specs_from_return(process, "test_stage")
     # Return value has 3 items but spec declares 2 paths
     return_value = {"items": [{"a": 1}, {"b": 2}, {"c": 3}]}
 
     with pytest.raises(RuntimeError, match="has 2 paths but 3 values"):
         stage_def.save_return_outputs(return_value, specs, tmp_path)
-
-
-def test_save_return_outputs_validates_path_traversal(tmp_path: pathlib.Path) -> None:
-    """save_return_outputs() should reject paths that escape project root."""
-
-    def process() -> _SingleOutputResult:
-        return {"result": {"count": 42}}
-
-    specs = stage_def.get_output_specs_from_return(process)
-    return_value: _SingleOutputResult = {"result": {"count": 42}}
-
-    # Override with path that escapes project root
-    overrides = {"result": "../../../etc/passwd"}
-
-    with pytest.raises(ValueError, match="escapes project root"):
-        stage_def.save_return_outputs(return_value, specs, tmp_path, path_overrides=overrides)
-
-
-# ==============================================================================
-# Test: Atomic validation (no partial writes on failure)
-# ==============================================================================
-
-
-class _ThreeItemsResult(TypedDict):
-    items: Annotated[
-        list[dict[str, int]],
-        outputs.Out(["a.json", "b.json", "c.json"], loaders.JSON[dict[str, int]]()),
-    ]
-
-
-def test_save_return_outputs_validates_paths_upfront(tmp_path: pathlib.Path) -> None:
-    """save_return_outputs() should validate all paths before writing any files.
-
-    If the third path is invalid, no files should be written (not even the first two).
-    """
-
-    def process() -> _ThreeItemsResult:
-        return {"items": [{"a": 1}, {"b": 2}, {"c": 3}]}
-
-    specs = stage_def.get_output_specs_from_return(process)
-    return_value: _ThreeItemsResult = {"items": [{"a": 1}, {"b": 2}, {"c": 3}]}
-
-    # Third path escapes project root
-    overrides = {"items": ["ok1.json", "ok2.json", "../../../escape.json"]}
-
-    with pytest.raises(ValueError, match="Path escapes project root"):
-        stage_def.save_return_outputs(return_value, specs, tmp_path, path_overrides=overrides)
-
-    # No files should have been written (atomic failure)
-    assert not (tmp_path / "ok1.json").exists(), (
-        "First file should not be written on validation failure"
-    )
-    assert not (tmp_path / "ok2.json").exists(), (
-        "Second file should not be written on validation failure"
-    )
 
 
 # ==============================================================================
@@ -515,7 +333,7 @@ def test_save_return_outputs_warns_on_extra_keys(
     def process() -> _SingleOutputResult:
         return {"result": {"count": 42}}
 
-    specs = stage_def.get_output_specs_from_return(process)
+    specs = stage_def.get_output_specs_from_return(process, "test_stage")
     # Return value has extra keys not declared as outputs
     return_value = {"result": {"count": 42}, "undeclared": "data", "another": 123}
 
@@ -529,3 +347,79 @@ def test_save_return_outputs_warns_on_extra_keys(
     assert "Extra keys in return value not declared as outputs" in caplog.text
     assert "another" in caplog.text
     assert "undeclared" in caplog.text
+
+
+# ==============================================================================
+# Test: TypedDict detection and strict return type validation
+# ==============================================================================
+
+
+def test_typing_extensions_typeddict_detected() -> None:
+    """TypedDict from typing_extensions should be detected correctly."""
+
+    def process() -> _ExtensionsTypedDictResult:
+        return {"result": {"count": 42}}
+
+    specs = stage_def.get_output_specs_from_return(process, "test_stage")
+
+    assert len(specs) == 1
+    assert "result" in specs
+    assert specs["result"].path == "output.json"
+
+
+def test_plain_dict_return_returns_empty() -> None:
+    """Plain dict return type (not TypedDict) should return empty specs (no tracked outputs)."""
+
+    def process() -> dict[str, int]:
+        return {"count": 42}
+
+    specs = stage_def.get_output_specs_from_return(process, "test_stage")
+    assert specs == {}
+
+
+def test_annotated_without_out_returns_empty() -> None:
+    """Annotated return type without Out should return empty specs (no tracked outputs)."""
+
+    def process() -> Annotated[dict[str, int], _SomeOtherMetadata()]:
+        return {"count": 42}
+
+    specs = stage_def.get_output_specs_from_return(process, "test_stage")
+    assert specs == {}
+
+
+def test_dataclass_return_returns_empty() -> None:
+    """Dataclass return type should return empty specs (no tracked outputs)."""
+
+    def process() -> _DataclassResult:
+        return _DataclassResult(count=42)
+
+    specs = stage_def.get_output_specs_from_return(process, "test_stage")
+    assert specs == {}
+
+
+def test_partial_out_annotations_raises_error() -> None:
+    """TypedDict with only some fields having Out annotations should raise StageDefinitionError."""
+    from pivot import exceptions
+
+    # Use the module-level _InvalidMixedFieldsResult which has one Out and one plain field
+    def process() -> _InvalidMixedFieldsResult:
+        return {"result": {"count": 42}, "extra": "ignored"}
+
+    with pytest.raises(
+        exceptions.StageDefinitionError, match="fields without Out annotations.*extra"
+    ):
+        stage_def.get_output_specs_from_return(process, "test_stage")
+
+
+def test_error_message_includes_stage_name() -> None:
+    """Error messages should include the stage name for easier debugging.
+
+    This tests that validation errors in TypedDict output annotations include the stage name.
+    """
+    from pivot import exceptions
+
+    def my_custom_stage() -> _InvalidMixedFieldsResult:
+        return {"result": {"count": 42}, "extra": "ignored"}
+
+    with pytest.raises(exceptions.StageDefinitionError, match="Stage 'my_custom_stage'"):
+        stage_def.get_output_specs_from_return(my_custom_stage, "my_custom_stage")

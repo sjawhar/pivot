@@ -30,9 +30,9 @@ def _create_stage(name: str, deps: list[str], outs: list[str]) -> RegistryStageI
         variant=None,
         signature=None,
         fingerprint={},
-        cwd=None,
         dep_specs={},
-        out_path_overrides=None,
+        out_specs={},
+        params_arg_name=None,
     )
 
 

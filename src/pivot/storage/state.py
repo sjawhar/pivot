@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import pathlib
 import struct
@@ -8,6 +9,8 @@ from typing import TYPE_CHECKING, Self
 import lmdb
 
 from pivot import run_history
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -580,7 +583,23 @@ class StateDB:
             self._env.close()
             self._closed = True
 
+    def _check_capacity_warning(self) -> None:
+        """Warn if database is approaching capacity limit (80% utilization)."""
+        env_info = self._env.info()
+        stat = self._env.stat()
+        # Used bytes = page size * last page number
+        used_bytes = stat["psize"] * env_info["last_pgno"]
+        if used_bytes > _MAP_SIZE * 0.8:
+            used_gb = used_bytes / (1024**3)
+            limit_gb = _MAP_SIZE / (1024**3)
+            percent = used_bytes / _MAP_SIZE * 100
+            logger.warning(
+                f"State database at {used_gb:.1f}GB ({percent:.0f}%%), approaching "
+                + f"{limit_gb:.0f}GB limit. Run `pivot gc` or delete .pivot/state.lmdb/ to free space."
+            )
+
     def __enter__(self) -> Self:
+        self._check_capacity_warning()
         return self
 
     def __exit__(self, *_: object) -> None:

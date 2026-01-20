@@ -66,14 +66,14 @@ def _make_stage_info(
         params=None,
         variant=None,
         overrides={},
-        cwd=tmp_path,
         checkout_modes=["hardlink", "symlink", "copy"],
         run_id=run_id,
         force=force,
         no_commit=no_commit,
         no_cache=no_cache,
         dep_specs={},
-        out_path_overrides=None,
+        out_specs={},
+        params_arg_name=None,
     )
 
 

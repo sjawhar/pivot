@@ -363,7 +363,7 @@ def test_cli_run_prints_results(runner: CliRunner, tmp_path: pathlib.Path) -> No
         assert result.exit_code == 0
         assert "my_stage" in result.output
         assert "ran" in result.output.lower()
-        assert "Total:" in result.output
+        assert "Summary:" in result.output
 
 
 def test_cli_run_prints_skipped_stages(runner: CliRunner, tmp_path: pathlib.Path) -> None:
@@ -386,7 +386,7 @@ def test_cli_run_prints_skipped_stages(runner: CliRunner, tmp_path: pathlib.Path
         result2 = runner.invoke(cli.cli, ["run"])
 
         assert result2.exit_code == 0
-        assert "skipped" in result2.output.lower()
+        assert "cached" in result2.output.lower()
 
 
 # =============================================================================
@@ -712,3 +712,39 @@ def test_cli_history_quiet_produces_no_output(runner: CliRunner, tmp_path: pathl
 
         assert result.exit_code == 0
         assert result.output.strip() == "", "Quiet mode should suppress output"
+
+
+# =============================================================================
+# Metrics Output Tests
+# =============================================================================
+
+
+def test_cli_run_metrics_env_var(runner: CliRunner, tmp_path: pathlib.Path) -> None:
+    """PIVOT_METRICS=1 enables metrics display to stderr."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        pathlib.Path("input.txt").write_text("data")
+
+        register_test_stage(_stage_my_stage_with_input, name="my_stage")
+
+        result = runner.invoke(cli.cli, ["run"], env={"PIVOT_METRICS": "1"})
+
+        assert result.exit_code == 0
+        assert "Metrics:" in result.output
+        # Metrics are collected and displayed (cli.total may not be present in
+        # in-process tests since it requires the env var set at module import time)
+        assert "ms" in result.output
+
+
+def test_cli_run_no_metrics_by_default(runner: CliRunner, tmp_path: pathlib.Path) -> None:
+    """pivot run does not show metrics by default."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        pathlib.Path("input.txt").write_text("data")
+
+        register_test_stage(_stage_my_stage_with_input, name="my_stage")
+
+        result = runner.invoke(cli.cli, ["run"])
+
+        assert result.exit_code == 0
+        assert "Metrics:" not in result.output

@@ -32,6 +32,12 @@ class ValidationError(PivotError):
     pass
 
 
+class StageDefinitionError(ValidationError):
+    """Raised when a stage function has invalid annotations (return type, deps, etc)."""
+
+    pass
+
+
 class SecurityValidationError(PivotError):
     """Raised for security-sensitive validation failures (path traversal, injection attacks).
 

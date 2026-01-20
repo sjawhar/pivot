@@ -24,7 +24,7 @@ stages:
           params:
             hidden_size: 1024
           deps:
-            tokenizer+: data/gpt_tokenizer.json
+            tokenizer: data/gpt_tokenizer.json
       dataset: [swe, human]
 ```
 
@@ -39,7 +39,6 @@ This generates 4 stages:
 
 - Each dimension creates variants for all values
 - Variants are combined as cross-product
-- Keys ending with `+` append to base (e.g., `tokenizer+:` adds a dep)
 - Variable substitution uses `${variable}` syntax
 
 ## Accessing the Variant Name

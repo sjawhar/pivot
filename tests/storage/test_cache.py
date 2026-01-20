@@ -793,6 +793,137 @@ def test_remove_output_missing_ok(tmp_path: pathlib.Path) -> None:
     cache.remove_output(missing)
 
 
+def test_remove_output_readonly_file(tmp_path: pathlib.Path) -> None:
+    """remove_output deletes read-only file (as in hardlinked cache).
+
+    When outputs are hardlinked to the cache, they become read-only (0o444).
+    remove_output must be able to delete these files so stages can re-run.
+    """
+    test_file = tmp_path / "readonly.txt"
+    test_file.write_text("content")
+    os.chmod(test_file, 0o444)
+
+    cache.remove_output(test_file)
+
+    assert not test_file.exists()
+
+
+def test_remove_output_readonly_directory(tmp_path: pathlib.Path) -> None:
+    """remove_output deletes directory containing read-only files.
+
+    Directory outputs with HARDLINK mode have individual files hardlinked
+    to read-only cache. remove_output must handle this recursively.
+    """
+    test_dir = tmp_path / "readonly_dir"
+    test_dir.mkdir()
+    (test_dir / "file1.txt").write_text("content1")
+    (test_dir / "file2.txt").write_text("content2")
+
+    # Make all files read-only (simulating hardlinks to cache)
+    os.chmod(test_dir / "file1.txt", 0o444)
+    os.chmod(test_dir / "file2.txt", 0o444)
+
+    cache.remove_output(test_dir)
+
+    assert not test_dir.exists()
+
+
+def test_remove_output_readonly_nested_directory(tmp_path: pathlib.Path) -> None:
+    """remove_output handles nested directories with read-only files.
+
+    Tests the scenario from the user bug report where outputs were in
+    nested directories like plots/bar_chart_weighted_scores/headline.png.
+    """
+    test_dir = tmp_path / "plots"
+    nested_dir = test_dir / "bar_chart_weighted_scores"
+    nested_dir.mkdir(parents=True)
+    (nested_dir / "headline.png").write_bytes(b"PNG")
+    (nested_dir / "other.png").write_bytes(b"PNG")
+
+    # Make all files read-only
+    os.chmod(nested_dir / "headline.png", 0o444)
+    os.chmod(nested_dir / "other.png", 0o444)
+
+    cache.remove_output(test_dir)
+
+    assert not test_dir.exists()
+
+
+def test_remove_output_hardlinked_file_preserves_cache_permissions(tmp_path: pathlib.Path) -> None:
+    """Removing hardlinked output file does not corrupt cache permissions.
+
+    When outputs are hardlinked to the cache, they share the same inode.
+    chmod on the output would also change the cache file's permissions.
+    This test verifies that remove_output does not chmod the file.
+    """
+    # Create cache file (read-only)
+    cache_dir = tmp_path / "cache"
+    cache_file = cache_dir / "ab" / "content_hash"
+    cache_file.parent.mkdir(parents=True)
+    cache_file.write_text("cached content")
+    os.chmod(cache_file, 0o444)
+
+    # Create output as hardlink to cache
+    output_file = tmp_path / "output.txt"
+    os.link(cache_file, output_file)
+
+    # Verify setup
+    assert cache_file.stat().st_ino == output_file.stat().st_ino, "Should be hardlinked"
+    assert cache_file.stat().st_mode & 0o777 == 0o444
+
+    # Remove output
+    cache.remove_output(output_file)
+
+    # Cache should still exist and be read-only
+    assert not output_file.exists()
+    assert cache_file.exists()
+    assert cache_file.stat().st_mode & 0o777 == 0o444, "Cache should remain read-only"
+
+
+def test_remove_output_hardlinked_directory_preserves_cache_permissions(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Removing directory with hardlinked files does not corrupt cache permissions.
+
+    When directory outputs are cached with HARDLINK mode, individual files are
+    hardlinked to the cache. This test verifies that removing the directory
+    does not change permissions on the cached files.
+    """
+    # Create cache files (read-only)
+    cache_dir = tmp_path / "cache"
+    cache_file1 = cache_dir / "ab" / "hash1"
+    cache_file2 = cache_dir / "cd" / "hash2"
+    cache_file1.parent.mkdir(parents=True)
+    cache_file2.parent.mkdir(parents=True)
+    cache_file1.write_text("content1")
+    cache_file2.write_text("content2")
+    os.chmod(cache_file1, 0o444)
+    os.chmod(cache_file2, 0o444)
+
+    # Create output directory with hardlinked files
+    output_dir = tmp_path / "output_dir"
+    output_dir.mkdir()
+    os.link(cache_file1, output_dir / "file1.txt")
+    os.link(cache_file2, output_dir / "file2.txt")
+
+    # Make directory read-only to force onexc handler
+    os.chmod(output_dir, 0o555)
+
+    # Verify setup
+    assert cache_file1.stat().st_mode & 0o777 == 0o444
+    assert cache_file2.stat().st_mode & 0o777 == 0o444
+
+    # Remove output directory
+    cache.remove_output(output_dir)
+
+    # Cache files should still exist and be read-only
+    assert not output_dir.exists()
+    assert cache_file1.exists()
+    assert cache_file2.exists()
+    assert cache_file1.stat().st_mode & 0o777 == 0o444, "Cache file 1 should remain read-only"
+    assert cache_file2.stat().st_mode & 0o777 == 0o444, "Cache file 2 should remain read-only"
+
+
 # === Protection Tests ===
 
 

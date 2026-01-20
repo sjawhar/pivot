@@ -19,13 +19,15 @@ def test_metric_cache_default_false() -> None:
 
 def test_plot_cache_default_true() -> None:
     """Plot should have cache=True by default."""
-    plot = outputs.Plot(path="loss.csv")
+    plot = outputs.Plot(path="loss.csv", loader=loaders.PathOnly())
     assert plot.cache is True
 
 
 def test_plot_options() -> None:
     """Plot should store x, y, template options."""
-    plot = outputs.Plot(path="loss.csv", x="epoch", y="loss", template="linear")
+    plot = outputs.Plot(
+        path="loss.csv", loader=loaders.PathOnly(), x="epoch", y="loss", template="linear"
+    )
     assert plot.x == "epoch"
     assert plot.y == "loss"
     assert plot.template == "linear"
@@ -35,7 +37,7 @@ def test_all_outputs_frozen() -> None:
     """All output types should be immutable (frozen dataclasses)."""
     out = outputs.Out(path="file.txt", loader=loaders.PathOnly())
     metric = outputs.Metric(path="metrics.json")
-    plot = outputs.Plot(path="loss.csv")
+    plot = outputs.Plot(path="loss.csv", loader=loaders.PathOnly())
 
     with pytest.raises(AttributeError):
         out.path = "other.txt"  # type: ignore[misc]
@@ -59,22 +61,11 @@ def test_normalize_out_passthrough() -> None:
     """Out subclasses should pass through unchanged."""
     out = outputs.Out(path="file.txt", loader=loaders.PathOnly(), cache=False)
     metric = outputs.Metric(path="metrics.json")
-    plot = outputs.Plot(path="loss.csv", x="epoch")
+    plot = outputs.Plot(path="loss.csv", loader=loaders.PathOnly(), x="epoch")
 
     assert outputs.normalize_out(out) is out
     assert outputs.normalize_out(metric) is metric
     assert outputs.normalize_out(plot) is plot
-
-
-def test_out_persist_option() -> None:
-    """All output types should support persist option."""
-    out = outputs.Out(path="file.txt", loader=loaders.PathOnly(), persist=True)
-    metric = outputs.Metric(path="metrics.json", persist=True)
-    plot = outputs.Plot(path="loss.csv", persist=True)
-
-    assert out.persist is True
-    assert metric.persist is True
-    assert plot.persist is True
 
 
 def test_out_with_explicit_cache_false() -> None:
@@ -91,7 +82,7 @@ def test_metric_with_explicit_cache_true() -> None:
 
 def test_plot_with_no_options() -> None:
     """Plot without visualization options should have None defaults."""
-    plot = outputs.Plot(path="loss.csv")
+    plot = outputs.Plot(path="loss.csv", loader=loaders.PathOnly())
     assert plot.x is None
     assert plot.y is None
     assert plot.template is None
@@ -108,7 +99,7 @@ def test_out_instances_are_out() -> None:
     """Instances should be recognizable as Out."""
     out = outputs.Out(path="file.txt", loader=loaders.PathOnly())
     metric = outputs.Metric(path="metrics.json")
-    plot = outputs.Plot(path="loss.csv")
+    plot = outputs.Plot(path="loss.csv", loader=loaders.PathOnly())
 
     assert isinstance(out, outputs.Out)
     assert isinstance(metric, outputs.Out)
@@ -122,12 +113,6 @@ def test_incremental_out_cache_default_true() -> None:
     """IncrementalOut should have cache=True by default."""
     inc = outputs.IncrementalOut(path="database.csv", loader=loaders.PathOnly())
     assert inc.cache is True
-
-
-def test_incremental_out_persist_default_false() -> None:
-    """IncrementalOut should have persist=False by default."""
-    inc = outputs.IncrementalOut(path="database.csv", loader=loaders.PathOnly())
-    assert inc.persist is False
 
 
 def test_incremental_out_frozen() -> None:

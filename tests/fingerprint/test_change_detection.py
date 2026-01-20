@@ -33,6 +33,7 @@ def module_dir(tmp_path: pathlib.Path):
         "test_instance_",
         "test_instchange_",
         "test_nonlocal_",
+        "test_params_",
     )
     to_remove = [name for name in sys.modules if name.startswith(prefixes)]
     for name in to_remove:
@@ -322,8 +323,8 @@ def test_function_rename_no_miss(module_dir: pathlib.Path) -> None:
     )
 
 
-def test_stdlib_function_marked_callable(module_dir: pathlib.Path) -> None:
-    """Stdlib functions are marked 'callable', not hashed (version changes ignored)."""
+def test_stdlib_module_attrs_not_tracked(module_dir: pathlib.Path) -> None:
+    """Stdlib module attributes are NOT tracked in fingerprint."""
     mod_py = module_dir / "test_nochange_stdlib.py"
     mod_py.write_text(
         "import json as json_mod\n\ndef stage():\n    return json_mod.dumps({'key': 'value'})\n"
@@ -332,7 +333,8 @@ def test_stdlib_function_marked_callable(module_dir: pathlib.Path) -> None:
     mod = _import_fresh("test_nochange_stdlib")
     fp = fingerprint.get_stage_fingerprint(mod.stage)
 
-    assert fp["mod:json_mod.dumps"] == "callable", "Stdlib functions must be 'callable', not hashed"
+    # json is stdlib - should NOT be in fingerprint
+    assert "mod:json_mod.dumps" not in fp
 
 
 # =============================================================================
@@ -683,3 +685,111 @@ def test_nonlocal_class_instance_tracked(module_dir: pathlib.Path) -> None:
     fp = fingerprint.get_stage_fingerprint(mod.stage)
 
     assert "class:processor.__class__" in fp, "Should capture nonlocal instance's class"
+
+
+# =============================================================================
+# SECTION 6: StageParams tracking
+# =============================================================================
+
+
+def test_stageparams_property_change_causes_miss(module_dir: pathlib.Path) -> None:
+    """Changing @property method on StageParams subclass causes cache miss."""
+    params_py = module_dir / "test_params_prop.py"
+    params_py.write_text("""from pivot.stage_def import StageParams
+
+class MyParams(StageParams):
+    base_rate: float = 0.01
+    multiplier: float = 2.0
+
+    @property
+    def effective_rate(self) -> float:
+        return self.base_rate * self.multiplier
+""")
+
+    stage_py = module_dir / "test_params_stage.py"
+    stage_py.write_text("""from test_params_prop import MyParams
+
+def stage(params: MyParams) -> int:
+    return int(params.effective_rate * 100)
+""")
+
+    mod = _import_fresh("test_params_stage")
+    fp1 = fingerprint.get_stage_fingerprint(mod.stage)
+
+    # Change the property implementation (minimal modification)
+    original = params_py.read_text()
+    params_py.write_text(original.replace("self.multiplier", "self.multiplier * 1.1"))
+    _import_fresh("test_params_prop")
+    mod = _import_fresh("test_params_stage")
+    fp2 = fingerprint.get_stage_fingerprint(mod.stage)
+
+    assert fp1["class:MyParams"] != fp2["class:MyParams"], (
+        "@property change on StageParams must cause cache miss"
+    )
+
+
+def test_stageparams_method_change_causes_miss(module_dir: pathlib.Path) -> None:
+    """Changing regular method on StageParams subclass causes cache miss."""
+    params_py = module_dir / "test_params_method.py"
+    params_py.write_text("""from pivot.stage_def import StageParams
+
+class MyParams(StageParams):
+    base_rate: float = 0.01
+
+    def compute_rate(self, multiplier: float) -> float:
+        return self.base_rate * multiplier
+""")
+
+    stage_py = module_dir / "test_params_method_stage.py"
+    stage_py.write_text("""from test_params_method import MyParams
+
+def stage(params: MyParams) -> int:
+    return int(params.compute_rate(2.0) * 100)
+""")
+
+    mod = _import_fresh("test_params_method_stage")
+    fp1 = fingerprint.get_stage_fingerprint(mod.stage)
+
+    # Change the method implementation
+    original = params_py.read_text()
+    params_py.write_text(original.replace("* multiplier", "* multiplier * 1.1"))
+    _import_fresh("test_params_method")
+    mod = _import_fresh("test_params_method_stage")
+    fp2 = fingerprint.get_stage_fingerprint(mod.stage)
+
+    assert fp1["class:MyParams"] != fp2["class:MyParams"], (
+        "Method change on StageParams must cause cache miss"
+    )
+
+
+def test_stageparams_class_variable_change_causes_miss(module_dir: pathlib.Path) -> None:
+    """Changing class variable on StageParams subclass causes cache miss."""
+    params_py = module_dir / "test_params_classvar.py"
+    params_py.write_text("""from typing import ClassVar
+from pivot.stage_def import StageParams
+
+class MyParams(StageParams):
+    VERSION: ClassVar[str] = "1.0"
+    base_rate: float = 0.01
+""")
+
+    stage_py = module_dir / "test_params_classvar_stage.py"
+    stage_py.write_text("""from test_params_classvar import MyParams
+
+def stage(params: MyParams) -> str:
+    return f"{MyParams.VERSION}: {params.base_rate}"
+""")
+
+    mod = _import_fresh("test_params_classvar_stage")
+    fp1 = fingerprint.get_stage_fingerprint(mod.stage)
+
+    # Change the class variable
+    original = params_py.read_text()
+    params_py.write_text(original.replace('"1.0"', '"2.0"'))
+    _import_fresh("test_params_classvar")
+    mod = _import_fresh("test_params_classvar_stage")
+    fp2 = fingerprint.get_stage_fingerprint(mod.stage)
+
+    assert fp1["class:MyParams"] != fp2["class:MyParams"], (
+        "Class variable change on StageParams must cause cache miss"
+    )

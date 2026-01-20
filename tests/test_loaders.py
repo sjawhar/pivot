@@ -346,6 +346,9 @@ class _CustomTextLoader(loaders.Loader[str]):
     def save(self, data: str, path: pathlib.Path) -> None:
         path.write_text(data)
 
+    def empty(self) -> str:
+        return ""
+
 
 def test_custom_loader_works(tmp_path: pathlib.Path) -> None:
     """Custom loader subclass works correctly."""
@@ -370,3 +373,193 @@ def test_custom_loader_is_picklable() -> None:
 def test_custom_loader_generic_type() -> None:
     """Custom loader is subclass of Loader."""
     assert issubclass(_CustomTextLoader, loaders.Loader)
+
+
+# ==============================================================================
+# MatplotlibFigure loader tests
+# ==============================================================================
+
+
+def test_matplotlib_figure_loader_save(tmp_path: pathlib.Path) -> None:
+    """MatplotlibFigure loader saves figure to file and closes it."""
+    import matplotlib.pyplot as plt
+
+    png_file = tmp_path / "plot.png"
+    fig, ax = plt.subplots()
+    ax.plot([1, 2, 3], [1, 4, 9])
+
+    loader = loaders.MatplotlibFigure()
+    loader.save(fig, png_file)
+
+    assert png_file.exists()
+    assert png_file.stat().st_size > 0
+    # Verify figure was closed (can't plot on closed figure)
+    assert fig.number not in plt.get_fignums()  # pyright: ignore[reportAttributeAccessIssue]
+
+
+def test_matplotlib_figure_loader_save_pdf(tmp_path: pathlib.Path) -> None:
+    """MatplotlibFigure loader saves to PDF format based on extension."""
+    import matplotlib.pyplot as plt
+
+    pdf_file = tmp_path / "plot.pdf"
+    fig, ax = plt.subplots()
+    ax.bar([1, 2, 3], [3, 1, 2])
+
+    loader = loaders.MatplotlibFigure()
+    loader.save(fig, pdf_file)
+
+    assert pdf_file.exists()
+    # PDF files start with %PDF
+    content = pdf_file.read_bytes()
+    assert content.startswith(b"%PDF")
+
+
+def test_matplotlib_figure_loader_save_svg(tmp_path: pathlib.Path) -> None:
+    """MatplotlibFigure loader saves to SVG format based on extension."""
+    import matplotlib.pyplot as plt
+
+    svg_file = tmp_path / "plot.svg"
+    fig, ax = plt.subplots()
+    ax.scatter([1, 2, 3], [3, 1, 2])
+
+    loader = loaders.MatplotlibFigure()
+    loader.save(fig, svg_file)
+
+    assert svg_file.exists()
+    content = svg_file.read_text()
+    assert "<svg" in content
+
+
+def test_matplotlib_figure_loader_custom_dpi(tmp_path: pathlib.Path) -> None:
+    """MatplotlibFigure loader respects dpi option."""
+    import matplotlib.pyplot as plt
+
+    png_file_low = tmp_path / "low.png"
+    png_file_high = tmp_path / "high.png"
+
+    fig, ax = plt.subplots()
+    ax.plot([1, 2], [1, 2])
+    loaders.MatplotlibFigure(dpi=50).save(fig, png_file_low)
+
+    fig, ax = plt.subplots()
+    ax.plot([1, 2], [1, 2])
+    loaders.MatplotlibFigure(dpi=300).save(fig, png_file_high)
+
+    # Higher DPI should produce larger file
+    assert png_file_high.stat().st_size > png_file_low.stat().st_size
+
+
+def test_matplotlib_figure_loader_transparent(tmp_path: pathlib.Path) -> None:
+    """MatplotlibFigure loader respects transparent option."""
+    import matplotlib.pyplot as plt
+    from PIL import Image
+
+    png_file = tmp_path / "transparent.png"
+    fig, ax = plt.subplots()
+    ax.plot([1, 2], [1, 2])
+
+    loaders.MatplotlibFigure(transparent=True).save(fig, png_file)
+
+    # Transparent PNG has alpha channel
+    img = Image.open(png_file)
+    assert img.mode == "RGBA"
+
+
+def test_matplotlib_figure_loader_bbox_inches_none(tmp_path: pathlib.Path) -> None:
+    """MatplotlibFigure loader respects bbox_inches=None option."""
+    import matplotlib.pyplot as plt
+
+    png_file_tight = tmp_path / "tight.png"
+    png_file_none = tmp_path / "none.png"
+
+    fig, ax = plt.subplots()
+    ax.plot([1, 2], [1, 2])
+    loaders.MatplotlibFigure(bbox_inches="tight").save(fig, png_file_tight)
+
+    fig, ax = plt.subplots()
+    ax.plot([1, 2], [1, 2])
+    loaders.MatplotlibFigure(bbox_inches=None).save(fig, png_file_none)
+
+    # Both should produce valid files (just different sizes)
+    assert png_file_tight.exists()
+    assert png_file_none.exists()
+
+
+def test_matplotlib_figure_loader_dpi_validation_low() -> None:
+    """MatplotlibFigure loader validates dpi is at least 1."""
+    with pytest.raises(ValueError, match="dpi must be between 1 and 2400"):
+        loaders.MatplotlibFigure(dpi=0)
+
+
+def test_matplotlib_figure_loader_dpi_validation_high() -> None:
+    """MatplotlibFigure loader validates dpi is at most 2400."""
+    with pytest.raises(ValueError, match="dpi must be between 1 and 2400"):
+        loaders.MatplotlibFigure(dpi=2401)
+
+
+def test_matplotlib_figure_loader_load_raises() -> None:
+    """MatplotlibFigure loader raises on load (write-only)."""
+    loader = loaders.MatplotlibFigure()
+    with pytest.raises(NotImplementedError, match="write-only"):
+        loader.load(pathlib.Path("test.png"))
+
+
+def test_matplotlib_figure_loader_empty_raises() -> None:
+    """MatplotlibFigure loader raises on empty (no incremental support)."""
+    loader = loaders.MatplotlibFigure()
+    with pytest.raises(NotImplementedError, match="cannot provide an empty instance"):
+        loader.empty()
+
+
+def test_matplotlib_figure_loader_is_picklable() -> None:
+    """MatplotlibFigure loader can be pickled and unpickled."""
+    loader = loaders.MatplotlibFigure(dpi=200, bbox_inches=None, transparent=True)
+    pickled = pickle.dumps(loader)
+    restored = pickle.loads(pickled)
+
+    assert restored.dpi == 200
+    assert restored.bbox_inches is None
+    assert restored.transparent is True
+
+
+def test_matplotlib_figure_loader_closes_on_error(tmp_path: pathlib.Path) -> None:
+    """MatplotlibFigure loader closes figure even when savefig fails."""
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots()
+    ax.plot([1, 2], [1, 2])
+
+    loader = loaders.MatplotlibFigure()
+    # Try to save to a path with non-existent parent directory
+    bad_path = tmp_path / "nonexistent" / "plot.png"
+
+    with pytest.raises(FileNotFoundError):
+        loader.save(fig, bad_path)
+
+    # Figure should still be closed
+    assert fig.number not in plt.get_fignums()  # pyright: ignore[reportAttributeAccessIssue]
+
+
+def test_matplotlib_figure_loader_with_out(tmp_path: pathlib.Path) -> None:
+    """MatplotlibFigure works with Out for plot outputs."""
+    import matplotlib.pyplot as plt
+
+    from pivot import outputs
+
+    # Create an Out with MatplotlibFigure loader (like Plot but with auto-save)
+    out = outputs.Out("plot.png", loaders.MatplotlibFigure(dpi=100))
+
+    # Verify the loader is correctly stored
+    assert isinstance(out.loader, loaders.MatplotlibFigure)
+    assert out.loader.dpi == 100
+    assert isinstance(out.path, str)
+
+    # Create and save a figure using the loader
+    fig, ax = plt.subplots()
+    ax.plot([1, 2, 3], [4, 5, 6])
+
+    plot_file = tmp_path / out.path
+    out.loader.save(fig, plot_file)
+
+    assert plot_file.exists()
+    assert fig.number not in plt.get_fignums()  # pyright: ignore[reportAttributeAccessIssue]
