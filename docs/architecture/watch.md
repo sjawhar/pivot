@@ -12,11 +12,40 @@ pivot run --watch
 
 The engine monitors:
 
-- **Stage function code** - Python files defining stages
+- **Stage function code** - Python files (`.py`) defining stages
 - **Input data files** - Files declared as `deps`
-- **Configuration** - `params.yaml` and `pivot.yaml`
+- **Configuration files** - `pivot.yaml`, `pivot.yml`, `pipeline.py`, `params.yaml`, `params.yml`, `.pivotignore`
 
 When changes are detected, only affected stages and their downstream dependencies re-run.
+
+## JSON Output Mode
+
+For IDE integrations and automation, watch mode supports JSON output:
+
+```bash
+pivot run --watch --json
+```
+
+This emits newline-delimited JSON (JSONL) events to stdout:
+
+| Event Type | Description | Fields |
+|------------|-------------|--------|
+| `status` | Status messages | `message`, `is_error` |
+| `files_changed` | File change detection | `paths`, `code_changed` |
+| `affected_stages` | Stages that will run | `stages`, `count` |
+| `execution_result` | Stage execution results | `stages` (map of name → status/reason) |
+
+Example output:
+
+```json
+{"type": "status", "message": "Running initial pipeline...", "is_error": false}
+{"type": "files_changed", "paths": ["src/train.py"], "code_changed": true}
+{"type": "affected_stages", "stages": ["train", "evaluate"], "count": 2}
+{"type": "execution_result", "stages": {"train": {"status": "ran", "reason": "code changed"}}}
+{"type": "status", "message": "Watching for changes...", "is_error": false}
+```
+
+When `--json` is enabled, the TUI is disabled and all output goes to stdout as JSON events.
 
 ## Architecture
 
@@ -39,17 +68,11 @@ When changes are detected, only affected stages and their downstream dependencie
 │  ┌──────────────────┐                                               │
 │  │ Coordinator Loop │  ← Orchestrates execution                     │
 │  │                  │                                               │
-│  │  while not shutdown:                                             │
-│  │    changes = collect_and_debounce()                              │
-│  │                                                                  │
-│  │    if has_code_changes(changes):                                 │
-│  │      restart_worker_pool()                                       │
-│  │                                                                  │
-│  │    stages = get_affected_stages(changes)                         │
-│  │                                                                  │
-│  │    if stages:                                                    │
-│  │      results = executor.run(stages)  # BLOCKING                  │
-│  │      report_to_tui(results)                                      │
+│  │  1. Collect and debounce changes                                 │
+│  │  2. If code changed: reload registry, restart workers            │
+│  │  3. Determine affected stages                                    │
+│  │  4. Execute stages (BLOCKING)                                    │
+│  │  5. Report results to TUI                                        │
 │  └──────────────────┘                                               │
 │                                                                      │
 └─────────────────────────────────────────────────────────────────────┘
@@ -94,23 +117,9 @@ Coordinator:   └──── collect batch ────┘
 
 ### 2. Worker Restart on Code Changes
 
-When Python files change, workers are restarted rather than hot-reloaded:
-
-```python
-def _restart_worker_pool(self) -> None:
-    """Kill workers and spawn fresh ones that reimport all modules."""
-    self._pool = loky.get_reusable_executor(
-        max_workers=self._max_workers,
-        kill_workers=True  # Terminates existing workers
-    )
-```
+When Python files change, the worker pool is restarted rather than hot-reloaded via `_restart_worker_pool()` in `src/pivot/watch/engine.py`.
 
 **Why restart instead of hot reload?**
-
-| Approach | Reliability | Latency |
-|----------|-------------|---------|
-| `importlib.reload()` | ~80% (module staleness issues) | ~50ms |
-| Worker restart | ~99% (fresh interpreter) | ~300ms |
 
 Hot reload via `importlib.reload()` has fundamental issues:
 
@@ -118,53 +127,28 @@ Hot reload via `importlib.reload()` has fundamental issues:
 - **cloudpickle caching**: May serve cached pickles with old code
 - **Module-level side effects**: Re-execute on reload
 
-Worker restart avoids these by starting fresh Python interpreters that reimport everything.
+Instead of hot-reloading, the engine performs a **full module clear** via `_clear_project_modules()`:
+
+1. Removes all project modules from `sys.modules`
+2. Deletes `.pyc` bytecode files from `__pycache__/` directories
+3. Calls `importlib.invalidate_caches()`
+
+Worker restart then starts fresh Python interpreters that reimport everything cleanly.
 
 ### 3. Bounded Queue with Coalescing
 
-The change queue is bounded to prevent memory exhaustion during long executions:
+The change queue is bounded to prevent memory exhaustion during long executions. Changes coalesce in the watcher thread if the queue is full—they accumulate locally until the queue has room.
 
-```python
-def _watch_loop(self) -> None:
-    pending: set[Path] = set()
-
-    for changes in watchfiles.watch(
-        *self._watch_paths,
-        stop_event=self._shutdown
-    ):
-        pending.update(Path(c[1]) for c in changes)
-
-        try:
-            self._change_queue.put_nowait(pending)
-            pending = set()
-        except queue.Full:
-            pass  # Keep accumulating
-```
-
-Changes coalesce in the watcher thread if the queue is full.
+If pending changes exceed 10,000 files, a "full rebuild" sentinel replaces the change set. This prevents unbounded memory growth when many files change at once (e.g., `git checkout` switching branches). The sentinel triggers code reload and full pipeline re-evaluation, letting the executor's change detection determine which stages actually need to run.
 
 ### 4. Debouncing with Maximum Wait
 
-Debouncing prevents rapid file saves from triggering multiple runs:
+Debouncing prevents rapid file saves from triggering multiple runs. The coordinator waits for a quiet period after the last change before processing:
 
-```python
-def _collect_and_debounce(self, max_wait_s: float = 5.0) -> set[Path]:
-    """Collect changes with debounce, but don't wait forever."""
-    changes: set[Path] = set()
-    deadline = time.monotonic() + max_wait_s
+- **Quiet period:** 300ms default, configurable via `--debounce` CLI flag (in milliseconds)
+- **Maximum wait:** 5 seconds (non-configurable) prevents indefinite blocking during continuous saves (e.g., auto-save editors)
 
-    while time.monotonic() < deadline:
-        try:
-            batch = self._change_queue.get(timeout=0.1)
-            changes.update(batch)
-        except queue.Empty:
-            if changes:
-                return changes  # Quiet period, return batch
-
-    return changes  # Hit deadline
-```
-
-The maximum wait prevents indefinite blocking if files continuously change (e.g., log rotation).
+If changes keep arriving within the quiet period, the coordinator accumulates them until either the quiet period elapses with no new changes, or the 5-second maximum is reached.
 
 ## Change Detection
 
@@ -180,21 +164,9 @@ The maximum wait prevents indefinite blocking if files continuously change (e.g.
 
 ### Output Filtering
 
-Stage outputs are filtered from the watcher to prevent infinite loops:
+Stage outputs are filtered from the watcher to prevent infinite loops. The `OutputFilter` class in `src/pivot/watch/_watch_utils.py` tracks output paths and filters them during execution.
 
-```python
-def _create_watch_filter(self) -> Callable[[str], bool]:
-    """Filter that excludes all registered stage outputs."""
-    outputs = set()
-    for stage in registry.REGISTRY.list_stages():
-        info = registry.REGISTRY.get(stage)
-        outputs.update(info["outs"])
-
-    def should_watch(path: str) -> bool:
-        return path not in outputs
-
-    return should_watch
-```
+**Execution state tracking:** The filter uses execution state (running vs idle) to distinguish Pivot-written outputs from external modifications. Outputs are only filtered while Pivot is actively executing stages—during the window between `mark_execution_start()` and `mark_execution_end()`. Changes to output files while idle are treated as external modifications and trigger re-runs of downstream stages.
 
 ## Error Handling
 
@@ -204,12 +176,13 @@ Stage execution errors are displayed in the TUI without stopping the watch loop:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│  Stages:                                                             │
-│    ✓ preprocess    [completed]  0.5s                                │
-│    ✗ train         [failed]     error: CUDA out of memory           │
-│    ○ evaluate      [skipped]    upstream failed                     │
-│                                                                      │
-│  Watching for changes...                                             │
+│  Stages (3) ●1 ✗1 ⊘1                   │  train ✗                    │
+│  ─────────────────────────────────────┼──────────────────────────────│
+│    ● preprocess         0.5s           │  [12:34:56] CUDA error...   │
+│    ✗ train              1.2s           │  [12:34:57] out of memory   │
+│    ⊘ evaluate                          │                              │
+│                                        │                              │
+│  Watching for changes...               │                              │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -217,32 +190,11 @@ Fix the error and save - the pipeline automatically re-runs.
 
 ### Invalid Pipeline Errors
 
-If code changes make the pipeline invalid (syntax errors, circular dependencies), the error is displayed and the system waits for a fix:
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│  ⚠ PIPELINE ERROR                                                   │
-│                                                                      │
-│  SyntaxError in src/stages/train.py:42                              │
-│    unexpected indent                                                 │
-│                                                                      │
-│  Pipeline paused. Fix the error and save to continue.               │
-└─────────────────────────────────────────────────────────────────────┘
-```
-
-The system keeps the last valid configuration and resumes when the error is fixed.
+If code changes make the pipeline invalid (syntax errors, circular dependencies), the error is displayed in the TUI title bar and the system waits for a fix. The previous valid stage list remains visible until the error is resolved.
 
 ## Graceful Shutdown
 
-The watcher thread uses `stop_event` for clean shutdown:
-
-```python
-for changes in watchfiles.watch(
-    *self._watch_paths,
-    stop_event=self._shutdown  # Allows interruption
-):
-    ...
-```
+The watcher thread uses a `stop_event` passed to `watchfiles.watch()` for clean shutdown.
 
 On `Ctrl+C`:
 
@@ -256,7 +208,7 @@ On `Ctrl+C`:
 | Operation | Latency |
 |-----------|---------|
 | File change detection | <50ms (watchfiles Rust layer) |
-| Debounce quiet period | 100-300ms (configurable) |
+| Debounce quiet period | 300ms default (`--debounce` to configure) |
 | Worker restart | ~300ms (process spawn + imports) |
 | Total code change → execution start | ~500ms |
 
@@ -266,6 +218,23 @@ On `Ctrl+C`:
 - **No cancellation**: Long-running stages cannot be interrupted mid-execution
 - **Single machine**: Not designed for distributed execution
 - **Memory**: Long-running watch sessions should be restarted periodically
+- **Intermediate file detection gap**: See below
+
+### Intermediate File Detection Gap
+
+External changes to files that are both outputs and downstream inputs are **not detected** by watch mode.
+
+**Why this happens:** Stage outputs are filtered from the watcher to prevent infinite loops (stage runs → writes output → triggers watch → stage runs again). This filtering applies to ALL outputs, including those that are also inputs to downstream stages.
+
+**Example scenario:**
+
+```
+preprocess → data/clean.csv → train
+```
+
+If an external tool (not Pivot) modifies `data/clean.csv`, watch mode won't detect it because `data/clean.csv` is filtered as an output of `preprocess`.
+
+**Workaround:** Force a re-run with `pivot run --force` or modify an upstream input file to trigger the pipeline.
 
 ## Future Work
 
@@ -273,5 +242,6 @@ See [GitHub Issue #110: Hot Reload Exploration](https://github.com/sjawhar/pivot
 
 ## See Also
 
-- [Watch Mode](../guide/watch.md) - User guide for watch mode
+- [Watch Mode Reference](../reference/watch.md) - User guide for watch mode
+- [Watch Mode Tutorial](../tutorial/watch.md) - Getting started with watch mode
 - [Execution Model](./execution.md) - Batch execution architecture

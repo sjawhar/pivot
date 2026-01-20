@@ -21,7 +21,7 @@ This project is **pre-alpha**. No backwards compatibility is needed.
 
 ## Skip Detection
 
-Two-tier algorithm: (1) O(1) generation tracking in `worker.can_skip_via_generation()`, (2) O(n) hash comparison fallback. Run cache allows skipping via input hash match.
+Three-tier algorithm: (1) O(1) generation tracking in `worker.can_skip_via_generation()`, (2) O(n) lock file comparison (fingerprint + params + dep hashes), (3) run cache lookup via input hash match.
 
 StateDB prefixes: `hash:` (file hashes), `gen:` (output generations), `dep:` (stage dep generations), `runcache:` (run cache).
 
@@ -69,7 +69,18 @@ def train(
 - NEVER modify rules in `pyproject.toml` without permission
 - Zero tolerance for basedpyright warnings—resolve all errors AND warnings
 - No blanket `# pyright: reportFoo=false`—use targeted ignores with specific codes:
+  ```python
+  return json.load(f)  # type: ignore[return-value] - json returns Any
+  ```
 - Prefer type stubs (`pandas-stubs`, `types-PyYAML`) over ignores
+
+**For untyped third-party packages**, prefer solutions in this order:
+1. **Check `typings/` first**—we maintain stubs for loky, pygtrie, dvc, lmdb, etc.
+2. **Add to existing stubs**—if the package has stubs but missing a function, add it
+3. **Generate new stubs**—use `scripts/generate_stubs.py` (see script docstring for workflow)
+4. **Line suppressions**—last resort, with `# pyright: ignore[errorCode]` and explanation
+
+## Python 3.13+ Types
 - Empty collections: `list[int]()` not `: list[int] = []`
 - Simplified Generator: `Generator[int]` not `Generator[int, None, None]`
 - `Callable` over `Any` for functions; document why when using `Any`

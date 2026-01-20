@@ -153,7 +153,27 @@ def test_train():
     assert "model" in result
 ```
 
+## Troubleshooting
+
+### Parameters Not Taking Effect
+
+**Symptom:** Changed parameters but stage doesn't re-run.
+
+**Cause:** Possibly editing wrong file or precedence issue.
+
+**Solution:** Check active parameter values and precedence:
+
+```bash
+# Show what values are actually used
+pivot params show train
+
+# Check explain output
+pivot explain train
+```
+
+Remember: `params.yaml` > `pivot.yaml` > Python defaults
+
 ## See Also
 
-- [Defining Stages](stages.md) - Stage definition patterns
-- [Configuration](configuration.md) - Pipeline configuration
+- [Defining Pipelines](pipelines.md) - Stage definition patterns
+- [Matrix Stages](matrix.md) - Parameter variations
