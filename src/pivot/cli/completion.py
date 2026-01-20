@@ -5,8 +5,66 @@ import pathlib
 from typing import Literal
 
 import click
+from click.shell_completion import CompletionItem
+
+from pivot.config.models import CONFIG_KEY_DESCRIPTIONS, VALID_REMOTE_NAME
 
 logger = logging.getLogger(__name__)
+
+
+def complete_config_keys(
+    _ctx: click.Context,
+    _param: click.Parameter,
+    incomplete: str,
+) -> list[CompletionItem]:
+    """Provide config key completions with descriptions."""
+    try:
+        keys = _get_config_keys()
+        return [
+            CompletionItem(k, help=desc) for k, desc in keys.items() if k.startswith(incomplete)
+        ]
+    except Exception:
+        logger.debug("Config key completion failed", exc_info=True)
+        return []
+
+
+def _get_config_keys() -> dict[str, str]:
+    """Get all valid config keys with descriptions, including dynamic remotes."""
+    from typing import Any, cast
+
+    import yaml
+
+    keys = dict(CONFIG_KEY_DESCRIPTIONS)
+
+    # Add remotes from config files
+    for path in _get_config_paths():
+        try:
+            if not path.exists():
+                continue
+            data = cast("dict[str, Any] | None", yaml.safe_load(path.read_text(encoding="utf-8")))
+            if data is None:
+                continue
+            remotes = data.get("remotes")
+            if isinstance(remotes, dict):
+                for name in remotes:  # pyright: ignore[reportUnknownVariableType] - validated below
+                    if isinstance(name, str) and VALID_REMOTE_NAME.match(name):
+                        keys[f"remotes.{name}"] = f"Remote '{name}'"
+        except Exception:
+            logger.debug("Config completion: failed to load %s", path, exc_info=True)
+            continue
+
+    return keys
+
+
+def _get_config_paths() -> list[pathlib.Path]:
+    """Get config file paths without heavy imports."""
+    paths = [pathlib.Path.home() / ".config" / "pivot" / "config.yaml"]
+
+    # Use existing fast project root finder
+    if root := _find_project_root_fast():
+        paths.append(root / ".pivot" / "config.yaml")
+
+    return paths
 
 
 def complete_stages(

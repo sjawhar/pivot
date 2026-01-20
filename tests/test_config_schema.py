@@ -1,3 +1,4 @@
+import pydantic
 import pytest
 
 from pivot import config, exceptions
@@ -51,6 +52,19 @@ def test_config_defaults_has_remotes_section() -> None:
 def test_config_defaults_has_default_remote() -> None:
     defaults = config.PivotConfig.get_default()
     assert defaults.default_remote == ""
+
+
+def test_pivot_config_rejects_invalid_remote_name() -> None:
+    """PivotConfig Pydantic validator rejects invalid remote names."""
+    with pytest.raises(pydantic.ValidationError) as exc_info:
+        config.PivotConfig(remotes={"has space": "s3://bucket"})
+    assert "invalid remote name" in str(exc_info.value).lower()
+
+
+def test_pivot_config_accepts_valid_remote_names() -> None:
+    """PivotConfig Pydantic validator accepts valid remote names."""
+    cfg = config.PivotConfig(remotes={"my-remote": "s3://bucket", "my_remote": "s3://bucket2"})
+    assert cfg.remotes == {"my-remote": "s3://bucket", "my_remote": "s3://bucket2"}
 
 
 # --- validate_config_value tests ---
@@ -218,6 +232,26 @@ def test_validate_remotes_rejects_invalid_url() -> None:
 def test_validate_remotes_rejects_http_url() -> None:
     with pytest.raises(exceptions.ConfigValidationError):
         config.validate_config_value("remotes.origin", "http://example.com")
+
+
+def test_validate_remotes_rejects_invalid_remote_name_with_dot() -> None:
+    # A dot in the remote name creates a 3-part key, which is invalid
+    with pytest.raises(exceptions.ConfigValidationError):
+        config.validate_config_value("remotes.has.dot", "s3://bucket")
+
+
+def test_validate_remotes_rejects_invalid_remote_name_with_space() -> None:
+    with pytest.raises(exceptions.ConfigValidationError) as exc_info:
+        config.validate_config_value("remotes.has space", "s3://bucket")
+    assert "invalid remote name" in str(exc_info.value).lower()
+
+
+def test_validate_remotes_accepts_valid_remote_names() -> None:
+    # alphanumeric, hyphens, underscores are valid
+    assert config.validate_config_value("remotes.origin", "s3://bucket") == "s3://bucket"
+    assert config.validate_config_value("remotes.my-remote", "s3://bucket") == "s3://bucket"
+    assert config.validate_config_value("remotes.my_remote", "s3://bucket") == "s3://bucket"
+    assert config.validate_config_value("remotes.Remote123", "s3://bucket") == "s3://bucket"
 
 
 def test_validate_default_remote_accepts_string() -> None:

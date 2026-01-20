@@ -5,6 +5,7 @@ import click
 import pydantic
 
 from pivot import config, exceptions
+from pivot.cli import completion
 
 
 def _format_value(value: Any) -> str:
@@ -73,7 +74,7 @@ def config_list(use_global: bool, use_local: bool, output_json: bool) -> None:
 
 
 @config_cmd.command("get")
-@click.argument("key")
+@click.argument("key", shell_complete=completion.complete_config_keys)
 @click.option("--json", "output_json", is_flag=True, help="Output as JSON")
 def config_get(key: str, output_json: bool) -> None:
     """Get a configuration value by dotted key."""
@@ -90,7 +91,7 @@ def config_get(key: str, output_json: bool) -> None:
 
 
 @config_cmd.command("set")
-@click.argument("key")
+@click.argument("key", shell_complete=completion.complete_config_keys)
 @click.argument("value")
 @click.option("--global", "use_global", is_flag=True, help="Set in global config")
 def config_set(key: str, value: str, use_global: bool) -> None:
@@ -109,7 +110,7 @@ def config_set(key: str, value: str, use_global: bool) -> None:
 
 
 @config_cmd.command("unset")
-@click.argument("key")
+@click.argument("key", shell_complete=completion.complete_config_keys)
 @click.option("--global", "use_global", is_flag=True, help="Unset from global config")
 def config_unset(key: str, use_global: bool) -> None:
     """Remove a configuration value (reverts to default or inherited value)."""

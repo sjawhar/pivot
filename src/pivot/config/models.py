@@ -7,6 +7,9 @@ import pydantic
 _S3_URL_PATTERN = re.compile(r"^s3://[^/]+(/.*)?$")
 _REMOTES_PREFIX = "remotes."
 
+# Valid remote name pattern (alphanumeric, hyphens, underscores) - public for completion module
+VALID_REMOTE_NAME = re.compile(r"^[a-zA-Z0-9_-]+$")
+
 # Type alias for config values after validation
 ConfigValue = str | int | list[str] | dict[str, str] | None
 
@@ -45,7 +48,7 @@ class CacheConfig(pydantic.BaseModel):
 
     @pydantic.field_validator("checkout_mode", mode="before")
     @classmethod
-    def parse_checkout_mode(cls, v: Any) -> list[str]:
+    def parse_checkout_mode(cls, v: Any) -> list[str] | Any:
         """Parse comma-separated string into list."""
         if isinstance(v, str):
             return [m.strip() for m in v.split(",") if m.strip()]
@@ -116,8 +119,12 @@ class PivotConfig(pydantic.BaseModel):
     @pydantic.field_validator("remotes")
     @classmethod
     def validate_remotes(cls, v: dict[str, str]) -> dict[str, str]:
-        """Validate all remote URLs are valid S3 URLs."""
+        """Validate remote names and URLs."""
         for name, url in v.items():
+            if not VALID_REMOTE_NAME.match(name):
+                raise ValueError(
+                    f"Invalid remote name '{name}': must be alphanumeric, hyphens, or underscores"
+                )
             try:
                 _validate_s3_url(url)
             except ValueError as e:
@@ -130,30 +137,34 @@ class PivotConfig(pydantic.BaseModel):
         return cls()
 
 
+# Config keys with descriptions (used by CLI completion)
+CONFIG_KEY_DESCRIPTIONS: dict[str, str] = {
+    "cache.dir": "Local cache directory",
+    "cache.checkout_mode": "Checkout strategy (hardlink,symlink,copy)",
+    "core.max_workers": "Parallel execution workers",
+    "core.state_dir": "State directory path",
+    "core.run_history_retention": "Keep last N runs",
+    "remote.jobs": "Concurrent transfer jobs",
+    "remote.retries": "Retry attempts",
+    "remote.connect_timeout": "Connection timeout (seconds)",
+    "watch.debounce": "Debounce delay (ms)",
+    "display.precision": "Decimal precision for metrics",
+    "diff.max_rows": "Max rows for diff operations",
+    "default_remote": "Default remote name",
+}
+
 # Keys that can be set via CLI (excludes dynamic remotes.* pattern)
-_KNOWN_KEYS = frozenset(
-    {
-        "cache.dir",
-        "cache.checkout_mode",
-        "core.max_workers",
-        "core.state_dir",
-        "core.run_history_retention",
-        "remote.jobs",
-        "remote.retries",
-        "remote.connect_timeout",
-        "watch.debounce",
-        "display.precision",
-        "diff.max_rows",
-        "default_remote",
-    }
-)
+_KNOWN_KEYS = frozenset(CONFIG_KEY_DESCRIPTIONS.keys())
 
 
 def is_valid_key(key: str) -> bool:
-    """Check if a config key is valid."""
+    """Check if a config key is valid (known key or valid remotes.* pattern)."""
     if key in _KNOWN_KEYS:
         return True
-    return key.startswith(_REMOTES_PREFIX) and len(key) > len(_REMOTES_PREFIX)
+    if key.startswith(_REMOTES_PREFIX):
+        remote_name = key[len(_REMOTES_PREFIX) :]
+        return bool(VALID_REMOTE_NAME.match(remote_name))
+    return False
 
 
 def get_config_default(key: str) -> ConfigValue:
@@ -168,7 +179,7 @@ def get_config_default(key: str) -> ConfigValue:
 
     if len(parts) == 2:
         section, subkey = parts
-        if section == _REMOTES_PREFIX.rstrip("."):
+        if section == "remotes":
             return None
         if hasattr(defaults, section):
             section_obj = getattr(defaults, section)
@@ -222,6 +233,11 @@ def validate_config_value(key: str, value: Any) -> ConfigValue:
     parts = key.split(".")
 
     if key.startswith(_REMOTES_PREFIX) and len(parts) == 2:
+        remote_name = parts[1]
+        if not VALID_REMOTE_NAME.match(remote_name):
+            raise exceptions.ConfigValidationError(
+                f"Invalid remote name '{remote_name}': must be alphanumeric, hyphens, or underscores"
+            )
         if not isinstance(value, str):
             raise exceptions.ConfigValidationError(f"'{key}' must be a string")
         try:
