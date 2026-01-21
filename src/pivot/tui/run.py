@@ -1624,7 +1624,7 @@ class WatchTuiApp(_BaseTuiApp[None]):
             input_snapshot = explain.get_stage_explanation(
                 stage_name=stage_name,
                 fingerprint=registry_info["fingerprint"],
-                deps=registry_info["deps"],
+                deps=registry_info["deps_paths"],
                 params_instance=registry_info["params"],
                 overrides=parameters.load_params_yaml(),
                 cache_dir=cache_dir,

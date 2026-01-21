@@ -27,7 +27,7 @@ def collect_watch_paths(stages: list[str]) -> list[pathlib.Path]:
         except KeyError:
             logger.warning(f"Stage '{name}' not found in registry, skipping")
             continue
-        for dep in info["deps"]:
+        for dep in info["deps_paths"]:
             dep_path = project.try_resolve_path(dep)
             if dep_path is not None and dep_path.exists():
                 paths.add(dep_path.parent if dep_path.is_file() else dep_path)

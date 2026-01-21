@@ -7,9 +7,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from pivot import cli, outputs, registry
-from pivot.storage import lock
-from pivot.types import LockData
+from pivot import cli
 
 if TYPE_CHECKING:
     import click.testing
@@ -94,21 +92,12 @@ def test_plots_show_explicit_file_no_stages(
 def test_plots_show_creates_html(
     runner: click.testing.CliRunner, set_project_root: pathlib.Path
 ) -> None:
-    """plots show creates HTML output file."""
+    """plots show creates HTML output file with explicit file target."""
     plot_file = set_project_root / "plot.png"
     plot_file.write_bytes(b"fake png data")
 
-    def _stage_with_plot() -> None:
-        pass
-
-    registry.REGISTRY.register(
-        _stage_with_plot,
-        name="test_stage",
-        outs=[outputs.Plot(path=str(plot_file))],
-    )
-
     with runner.isolated_filesystem(temp_dir=set_project_root):
-        result = runner.invoke(cli.cli, ["plots", "show"])
+        result = runner.invoke(cli.cli, ["plots", "show", str(plot_file)])
         assert result.exit_code == 0
         assert "Rendered 1 plot(s)" in result.output
 
@@ -120,17 +109,10 @@ def test_plots_show_custom_output_path(
     plot_file = set_project_root / "plot.png"
     plot_file.write_bytes(b"fake png data")
 
-    def _stage_with_plot() -> None:
-        pass
-
-    registry.REGISTRY.register(
-        _stage_with_plot,
-        name="test_stage",
-        outs=[outputs.Plot(path=str(plot_file))],
-    )
-
     with runner.isolated_filesystem(temp_dir=set_project_root):
-        result = runner.invoke(cli.cli, ["plots", "show", "-o", "custom/output.html"])
+        result = runner.invoke(
+            cli.cli, ["plots", "show", str(plot_file), "-o", "custom/output.html"]
+        )
         assert result.exit_code == 0
         assert "custom/output.html" in result.output
 
@@ -177,45 +159,26 @@ def test_plots_diff_explicit_file_no_stages(
 def test_plots_diff_json_format(
     runner: click.testing.CliRunner, set_project_root: pathlib.Path
 ) -> None:
-    """plots diff --json returns valid JSON."""
+    """plots diff --json returns valid JSON with explicit file target."""
     _setup_git_repo(set_project_root)
 
     plot_file = set_project_root / "plot.png"
     plot_file.write_bytes(b"fake png data")
 
-    def _stage_with_plot() -> None:
-        pass
-
-    registry.REGISTRY.register(
-        _stage_with_plot,
-        name="test_stage",
-        outs=[outputs.Plot(path=str(plot_file))],
+    # Commit the initial plot file
+    subprocess.run(["git", "add", "."], cwd=set_project_root, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "initial"],
+        cwd=set_project_root,
+        check=True,
+        capture_output=True,
     )
 
+    # Modify the plot file
+    plot_file.write_bytes(b"modified png data")
+
     with runner.isolated_filesystem(temp_dir=set_project_root):
-        # Create lock file using proper API
-        cache_dir = set_project_root / ".pivot" / "cache"
-        stage_lock = lock.StageLock("test_stage", cache_dir)
-        stage_lock.write(
-            LockData(
-                code_manifest={},
-                params={},
-                dep_hashes={},
-                output_hashes={str(plot_file): {"hash": "old_hash_value"}},
-                dep_generations={},
-            )
-        )
-
-        # Commit lock file to git
-        subprocess.run(["git", "add", "."], cwd=set_project_root, check=True, capture_output=True)
-        subprocess.run(
-            ["git", "commit", "-m", "initial"],
-            cwd=set_project_root,
-            check=True,
-            capture_output=True,
-        )
-
-        result = runner.invoke(cli.cli, ["plots", "diff", "--json"])
+        result = runner.invoke(cli.cli, ["plots", "diff", "--json", str(plot_file)])
         assert result.exit_code == 0
         # Output should be valid JSON
         try:
@@ -228,44 +191,26 @@ def test_plots_diff_json_format(
 def test_plots_diff_md_format(
     runner: click.testing.CliRunner, set_project_root: pathlib.Path
 ) -> None:
-    """plots diff --md returns markdown table."""
+    """plots diff --md returns markdown table with explicit file target."""
     _setup_git_repo(set_project_root)
 
     plot_file = set_project_root / "plot.png"
     plot_file.write_bytes(b"fake png data")
 
-    def _stage_with_plot() -> None:
-        pass
-
-    registry.REGISTRY.register(
-        _stage_with_plot,
-        name="test_stage",
-        outs=[outputs.Plot(path=str(plot_file))],
+    # Commit the initial plot file
+    subprocess.run(["git", "add", "."], cwd=set_project_root, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "initial"],
+        cwd=set_project_root,
+        check=True,
+        capture_output=True,
     )
 
+    # Modify the plot file
+    plot_file.write_bytes(b"modified png data")
+
     with runner.isolated_filesystem(temp_dir=set_project_root):
-        cache_dir = set_project_root / ".pivot" / "cache"
-        stage_lock = lock.StageLock("test_stage", cache_dir)
-        stage_lock.write(
-            LockData(
-                code_manifest={},
-                params={},
-                dep_hashes={},
-                output_hashes={str(plot_file): {"hash": "old_hash_value"}},
-                dep_generations={},
-            )
-        )
-
-        # Commit lock file to git
-        subprocess.run(["git", "add", "."], cwd=set_project_root, check=True, capture_output=True)
-        subprocess.run(
-            ["git", "commit", "-m", "initial"],
-            cwd=set_project_root,
-            check=True,
-            capture_output=True,
-        )
-
-        result = runner.invoke(cli.cli, ["plots", "diff", "--md"])
+        result = runner.invoke(cli.cli, ["plots", "diff", "--md", str(plot_file)])
         assert result.exit_code == 0
         assert "|" in result.output  # Markdown table uses pipes
 
@@ -273,43 +218,25 @@ def test_plots_diff_md_format(
 def test_plots_diff_no_path_flag(
     runner: click.testing.CliRunner, set_project_root: pathlib.Path
 ) -> None:
-    """plots diff --no-path hides path column."""
+    """plots diff --no-path hides path column with explicit file target."""
     _setup_git_repo(set_project_root)
 
     plot_file = set_project_root / "plot.png"
     plot_file.write_bytes(b"fake png data")
 
-    def _stage_with_plot() -> None:
-        pass
-
-    registry.REGISTRY.register(
-        _stage_with_plot,
-        name="test_stage",
-        outs=[outputs.Plot(path=str(plot_file))],
+    # Commit the initial plot file
+    subprocess.run(["git", "add", "."], cwd=set_project_root, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "initial"],
+        cwd=set_project_root,
+        check=True,
+        capture_output=True,
     )
 
+    # Modify the plot file
+    plot_file.write_bytes(b"modified png data")
+
     with runner.isolated_filesystem(temp_dir=set_project_root):
-        cache_dir = set_project_root / ".pivot" / "cache"
-        stage_lock = lock.StageLock("test_stage", cache_dir)
-        stage_lock.write(
-            LockData(
-                code_manifest={},
-                params={},
-                dep_hashes={},
-                output_hashes={str(plot_file): {"hash": "old_hash_value"}},
-                dep_generations={},
-            )
-        )
-
-        # Commit lock file to git
-        subprocess.run(["git", "add", "."], cwd=set_project_root, check=True, capture_output=True)
-        subprocess.run(
-            ["git", "commit", "-m", "initial"],
-            cwd=set_project_root,
-            check=True,
-            capture_output=True,
-        )
-
-        result = runner.invoke(cli.cli, ["plots", "diff", "--no-path"])
+        result = runner.invoke(cli.cli, ["plots", "diff", "--no-path", str(plot_file)])
         assert result.exit_code == 0
         assert "Path" not in result.output

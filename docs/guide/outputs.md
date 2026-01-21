@@ -11,51 +11,76 @@ Pivot provides several output types for different use cases.
 | `Plot` | Yes | No | Visualization files |
 | `IncrementalOut` | Yes | No | Append-only files |
 
-## Out (Default)
+## Defining Outputs
+
+Outputs are declared in the function's return type using a TypedDict with annotated fields:
+
+```python
+import pathlib
+from typing import Annotated, TypedDict
+
+from pivot import loaders, outputs
+
+
+class TrainOutputs(TypedDict):
+    model: Annotated[pathlib.Path, outputs.Out("model.pkl", loaders.PathOnly())]
+    metrics: Annotated[dict, outputs.Metric("metrics.json")]
+    plot: Annotated[pathlib.Path, outputs.Plot("loss.png")]
+
+
+def train(
+    data: Annotated[pandas.DataFrame, outputs.Dep("data.csv", loaders.CSV())],
+) -> TrainOutputs:
+    # ... training code ...
+    return {
+        "model": model_path,
+        "metrics": {"accuracy": 0.95},
+        "plot": plot_path,
+    }
+```
+
+YAML provides path overrides:
+
+```yaml
+stages:
+  train:
+    python: stages.train
+    outs:
+      model: models/model.pkl
+    metrics:
+      metrics: metrics/train.json
+    plots:
+      plot: plots/loss.png
+```
+
+## Regular Outputs (`Out`)
 
 Regular cached output for large files:
 
 ```python
-from pivot import stage, Out
-
-@stage(deps=['data.csv'], outs=[Out('model.pkl')])
-def train():
-    pass
-
-# Shorthand (strings become Out automatically)
-@stage(deps=['data.csv'], outs=['model.pkl'])
-def train():
-    pass
+class ProcessOutputs(TypedDict):
+    data: Annotated[pandas.DataFrame, outputs.Out("data.parquet", loaders.CSV())]
 ```
 
-Options:
-
+Options (set on the `Out` instance):
 - `cache=True` (default) - Store in content-addressable cache
 - `persist=False` (default) - Keep in cache after workspace cleanup
 
-## Metric
+## Metrics
 
 Small files tracked in git (not cached):
 
 ```python
-from pivot import stage, Metric
+class TrainOutputs(TypedDict):
+    metrics: Annotated[dict, outputs.Metric("metrics.json")]
 
-@stage(
-    deps=['data.csv'],
-    outs=[
-        'model.pkl',
-        Metric('metrics.json'),
-    ]
-)
-def train():
-    import json
+
+def train(...) -> TrainOutputs:
     metrics = {'accuracy': 0.95, 'loss': 0.05}
-    with open('metrics.json', 'w') as f:
-        json.dump(metrics, f)
+    return {"metrics": metrics}  # Automatically saved as JSON
 ```
 
 Use metrics for:
-
 - Training metrics (accuracy, loss, F1)
 - Data statistics (row counts, distributions)
 - Any small JSON you want to track in git
@@ -67,29 +92,22 @@ pivot metrics show
 pivot metrics diff  # Compare with git HEAD
 ```
 
-## Plot
+## Plots
 
-Visualization files with optional axis configuration:
+Visualization files that you create manually:
 
 ```python
-from pivot import stage, Plot
+class TrainOutputs(TypedDict):
+    plot: Annotated[pathlib.Path, outputs.Plot("loss.png")]
 
-@stage(
-    deps=['data.csv'],
-    outs=[
-        Plot('loss_curve.png'),
-        Plot('training.csv', x='epoch', y='loss'),
-    ]
-)
-def train():
-    pass
+
+def train(...) -> TrainOutputs:
+    import matplotlib.pyplot as plt
+    plt.plot(losses)
+    plot_path = pathlib.Path("loss.png")
+    plt.savefig(plot_path)
+    return {"plot": plot_path}
 ```
-
-Options:
-
-- `x` - X-axis column name (for CSV/JSON data)
-- `y` - Y-axis column name (for CSV/JSON data)
-- `template` - Visualization template
 
 View plots:
 
@@ -99,51 +117,70 @@ pivot plots show --open   # Open in browser
 pivot plots diff          # Show which plots changed
 ```
 
-## IncrementalOut
+## Incremental Outputs
 
 Outputs that preserve state between runs:
 
 ```python
-from pivot import stage, IncrementalOut
+class AppendOutputs(TypedDict):
+    database: Annotated[dict, outputs.IncrementalOut("cache.json", loaders.JSON())]
 
-@stage(deps=['new_data.csv'], outs=[IncrementalOut('database.db')])
-def append_to_database():
-    # database.db is restored from cache BEFORE execution
-    # Stage can append to it rather than recreating
-    import sqlite3
-    conn = sqlite3.connect('database.db')
-    # ... append new records ...
+
+def append_records(...) -> AppendOutputs:
+    # database.json is restored from cache BEFORE execution
+    # Stage can modify it rather than recreating
+    existing_data = ...  # Loaded from cache
+    existing_data["new_key"] = new_value
+    return {"database": existing_data}
 ```
 
 **How it works:**
 
 1. Before execution, previous version is restored from cache
-2. Stage modifies the file in place
+2. Stage modifies the data
 3. New version is cached after execution
 4. Uses COPY mode (not symlinks) so writes are safe
 
 Use cases:
-
 - Append-only databases
 - Cumulative logs
 - Incremental data processing
 
+## Single Output Shorthand
+
+For functions with a single output, annotate the return type directly:
+
+```python
+def transform(
+    data: Annotated[pandas.DataFrame, outputs.Dep("input.csv", loaders.CSV())],
+) -> Annotated[pandas.DataFrame, outputs.Out("output.csv", loaders.CSV())]:
+    return data.dropna()
+```
+
 ## Mixing Output Types
 
 ```python
-@stage(
-    deps=['data.csv'],
-    outs=[
-        Out('model.pkl'),           # Large model file
-        Metric('metrics.json'),     # Small metrics (git-tracked)
-        Plot('loss.png'),           # Visualization
-        IncrementalOut('log.txt'),  # Append-only log
-    ]
-)
-def train():
-    pass
+class FullOutputs(TypedDict):
+    model: Annotated[pathlib.Path, outputs.Out("model.pkl", loaders.PathOnly())]
+    cache: Annotated[dict, outputs.IncrementalOut("cache.json", loaders.JSON())]
+    metrics: Annotated[dict, outputs.Metric("metrics.json")]
+    plot: Annotated[pathlib.Path, outputs.Plot("loss.png")]
+```
+
+```yaml
+stages:
+  train:
+    python: stages.train
+    outs:
+      model: models/model.pkl
+      cache: cache/train.json
+    metrics:
+      metrics: metrics/train.json
+    plots:
+      plot: plots/loss.png
 ```
 
 ## See Also
 
-- [API Reference: outputs](../reference/pivot/outputs.md) - Full API documentation
+- [Defining Stages](stages.md) - Stage definition patterns
+- [Configuration](configuration.md) - Pipeline configuration

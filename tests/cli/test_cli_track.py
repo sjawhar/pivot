@@ -1,19 +1,36 @@
 from __future__ import annotations
 
 import pathlib
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Annotated, TypedDict
 
-from pivot import cli
-from pivot.registry import REGISTRY
+from helpers import register_test_stage
+from pivot import cli, loaders, outputs
 from pivot.storage import track
 
 if TYPE_CHECKING:
     import click.testing
 
 
-# Module-level helper function
-def _helper_process() -> None:
+# =============================================================================
+# Output TypedDicts for annotation-based stages
+# =============================================================================
+
+
+class _OutputTxtOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
+
+
+# =============================================================================
+# Module-level helper functions
+# =============================================================================
+
+
+def _helper_process(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _OutputTxtOutputs:
+    _ = input_file
     pathlib.Path("output.txt").write_text("done")
+    return {"output": pathlib.Path("output.txt")}
 
 
 # =============================================================================
@@ -175,7 +192,7 @@ def test_track_overlap_with_stage_output_rejected(
         pathlib.Path("input.txt").write_text("input")
 
         # Register a stage with output
-        REGISTRY.register(_helper_process, name="process", deps=["input.txt"], outs=["output.txt"])
+        register_test_stage(_helper_process, name="process")
 
         # Create the output file
         pathlib.Path("output.txt").write_text("output")

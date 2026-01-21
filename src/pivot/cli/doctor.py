@@ -322,8 +322,12 @@ def _print_check_human(check: DoctorCheckEvent) -> None:
 @cli_decorators.pivot_command(auto_discover=False)
 @click.option("--json", "as_json", is_flag=True, help="Output as JSONL")
 @click.option("--remote", "check_remote", is_flag=True, help="Also check remote connectivity")
-def doctor(as_json: bool, check_remote: bool) -> None:
+@click.pass_context
+def doctor(ctx: click.Context, as_json: bool, check_remote: bool) -> None:
     """Check environment and configuration for issues."""
+    cli_ctx = cli_helpers.get_cli_context(ctx)
+    quiet = cli_ctx["quiet"]
+
     checks = list[DoctorCheckEvent]()
 
     # Run checks
@@ -354,7 +358,7 @@ def doctor(as_json: bool, check_remote: bool) -> None:
         cli_helpers.emit_jsonl(
             DoctorSummaryEvent(type="summary", passed=passed, warnings=warnings, errors=errors)
         )
-    else:
+    elif not quiet:
         # Human-readable output
         click.echo("Pivot Environment Check")
         click.echo()

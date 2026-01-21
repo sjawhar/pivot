@@ -4,16 +4,230 @@ import queue
 import runpy
 import threading
 import time
+from typing import Annotated, TypedDict
 from unittest import mock
 
 import pytest
 import watchfiles
 
-from pivot import executor, project, types
+from helpers import register_test_stage
+from pivot import executor, loaders, outputs, project, types
 from pivot.pipeline import yaml as pipeline_yaml
-from pivot.registry import REGISTRY, stage
+from pivot.registry import REGISTRY
 from pivot.types import AgentRunRejection, AgentRunStartResult, AgentState
 from pivot.watch import _watch_utils, engine
+
+# =============================================================================
+# Module-level stage functions for annotation-based dependency injection
+# =============================================================================
+
+
+class _OutputTxt(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
+
+
+def _stage_noop() -> None:
+    """Noop stage with no deps/outs."""
+    pass
+
+
+def _stage_with_data_csv_dep(
+    data: Annotated[pathlib.Path, outputs.Dep("data.csv", loaders.PathOnly())],
+) -> _OutputTxt:
+    _ = data
+    pathlib.Path("output.txt").write_text("")
+    return _OutputTxt(output=pathlib.Path("output.txt"))
+
+
+def _stage_with_data_input_csv_dep(
+    input_file: Annotated[pathlib.Path, outputs.Dep("data/input.csv", loaders.PathOnly())],
+) -> _OutputTxt:
+    _ = input_file
+    pathlib.Path("output.txt").write_text("")
+    return _OutputTxt(output=pathlib.Path("output.txt"))
+
+
+class _Output1Txt(TypedDict):
+    output1: Annotated[pathlib.Path, outputs.Out("output1.txt", loaders.PathOnly())]
+
+
+class _Output2Txt(TypedDict):
+    output2: Annotated[pathlib.Path, outputs.Out("output2.txt", loaders.PathOnly())]
+
+
+def _stage_a_data_csv(
+    data: Annotated[pathlib.Path, outputs.Dep("data.csv", loaders.PathOnly())],
+) -> _Output1Txt:
+    _ = data
+    pathlib.Path("output1.txt").write_text("")
+    return _Output1Txt(output1=pathlib.Path("output1.txt"))
+
+
+def _stage_b_config_yaml(
+    config: Annotated[pathlib.Path, outputs.Dep("config.yaml", loaders.PathOnly())],
+) -> _Output2Txt:
+    _ = config
+    pathlib.Path("output2.txt").write_text("")
+    return _Output2Txt(output2=pathlib.Path("output2.txt"))
+
+
+class _Out1Txt(TypedDict):
+    out1: Annotated[pathlib.Path, outputs.Out("out1.txt", loaders.PathOnly())]
+
+
+class _Out2Txt(TypedDict):
+    out2: Annotated[pathlib.Path, outputs.Out("out2.txt", loaders.PathOnly())]
+
+
+def _stage_a_shared_csv(
+    shared: Annotated[pathlib.Path, outputs.Dep("shared.csv", loaders.PathOnly())],
+) -> _Out1Txt:
+    _ = shared
+    pathlib.Path("out1.txt").write_text("")
+    return _Out1Txt(out1=pathlib.Path("out1.txt"))
+
+
+def _stage_b_shared_csv(
+    shared: Annotated[pathlib.Path, outputs.Dep("shared.csv", loaders.PathOnly())],
+) -> _Out2Txt:
+    _ = shared
+    pathlib.Path("out2.txt").write_text("")
+    return _Out2Txt(out2=pathlib.Path("out2.txt"))
+
+
+class _IntermediateTxt(TypedDict):
+    intermediate: Annotated[pathlib.Path, outputs.Out("intermediate.txt", loaders.PathOnly())]
+
+
+class _FinalTxt(TypedDict):
+    final: Annotated[pathlib.Path, outputs.Out("final.txt", loaders.PathOnly())]
+
+
+def _stage_preprocess(
+    data: Annotated[pathlib.Path, outputs.Dep("data.csv", loaders.PathOnly())],
+) -> _IntermediateTxt:
+    _ = data
+    pathlib.Path("intermediate.txt").write_text("")
+    return _IntermediateTxt(intermediate=pathlib.Path("intermediate.txt"))
+
+
+def _stage_train(
+    intermediate: Annotated[pathlib.Path, outputs.Dep("intermediate.txt", loaders.PathOnly())],
+) -> _FinalTxt:
+    _ = intermediate
+    pathlib.Path("final.txt").write_text("")
+    return _FinalTxt(final=pathlib.Path("final.txt"))
+
+
+class _Step1Txt(TypedDict):
+    step1: Annotated[pathlib.Path, outputs.Out("step1.txt", loaders.PathOnly())]
+
+
+class _Step2Txt(TypedDict):
+    step2: Annotated[pathlib.Path, outputs.Out("step2.txt", loaders.PathOnly())]
+
+
+class _Step3Txt(TypedDict):
+    step3: Annotated[pathlib.Path, outputs.Out("step3.txt", loaders.PathOnly())]
+
+
+def _stage_step1(
+    data: Annotated[pathlib.Path, outputs.Dep("data.csv", loaders.PathOnly())],
+) -> _Step1Txt:
+    _ = data
+    pathlib.Path("step1.txt").write_text("")
+    return _Step1Txt(step1=pathlib.Path("step1.txt"))
+
+
+def _stage_step2(
+    step1: Annotated[pathlib.Path, outputs.Dep("step1.txt", loaders.PathOnly())],
+) -> _Step2Txt:
+    _ = step1
+    pathlib.Path("step2.txt").write_text("")
+    return _Step2Txt(step2=pathlib.Path("step2.txt"))
+
+
+def _stage_step3(
+    step2: Annotated[pathlib.Path, outputs.Dep("step2.txt", loaders.PathOnly())],
+) -> _Step3Txt:
+    _ = step2
+    pathlib.Path("step3.txt").write_text("")
+    return _Step3Txt(step3=pathlib.Path("step3.txt"))
+
+
+def _stage_a_data1(
+    data1: Annotated[pathlib.Path, outputs.Dep("data1.csv", loaders.PathOnly())],
+) -> _Out1Txt:
+    _ = data1
+    pathlib.Path("out1.txt").write_text("")
+    return _Out1Txt(out1=pathlib.Path("out1.txt"))
+
+
+def _stage_b_data2(
+    data2: Annotated[pathlib.Path, outputs.Dep("data2.csv", loaders.PathOnly())],
+) -> _Out2Txt:
+    _ = data2
+    pathlib.Path("out2.txt").write_text("")
+    return _Out2Txt(out2=pathlib.Path("out2.txt"))
+
+
+class _IntermediateCsv(TypedDict):
+    intermediate: Annotated[pathlib.Path, outputs.Out("intermediate.csv", loaders.PathOnly())]
+
+
+class _FinalCsv(TypedDict):
+    final: Annotated[pathlib.Path, outputs.Out("final.csv", loaders.PathOnly())]
+
+
+def _stage_a_input_csv(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.csv", loaders.PathOnly())],
+) -> _IntermediateCsv:
+    _ = input_file
+    pathlib.Path("intermediate.csv").write_text("")
+    return _IntermediateCsv(intermediate=pathlib.Path("intermediate.csv"))
+
+
+def _stage_b_intermediate_csv(
+    intermediate: Annotated[pathlib.Path, outputs.Dep("intermediate.csv", loaders.PathOnly())],
+) -> _FinalCsv:
+    _ = intermediate
+    pathlib.Path("final.csv").write_text("")
+    return _FinalCsv(final=pathlib.Path("final.csv"))
+
+
+def _stage_with_dir_dep(
+    data: Annotated[pathlib.Path, outputs.Dep("data/", loaders.PathOnly())],
+) -> _OutputTxt:
+    _ = data
+    pathlib.Path("output.txt").write_text("")
+    return _OutputTxt(output=pathlib.Path("output.txt"))
+
+
+def _stage_with_dir_dep_no_slash(
+    data: Annotated[pathlib.Path, outputs.Dep("data", loaders.PathOnly())],
+) -> _OutputTxt:
+    _ = data
+    pathlib.Path("output.txt").write_text("")
+    return _OutputTxt(output=pathlib.Path("output.txt"))
+
+
+class _OutputsResult(TypedDict):
+    result: Annotated[pathlib.Path, outputs.Out("outputs/result.txt", loaders.PathOnly())]
+
+
+def _stage_with_nested_output() -> _OutputsResult:
+    pathlib.Path("outputs/result.txt").parent.mkdir(parents=True, exist_ok=True)
+    pathlib.Path("outputs/result.txt").write_text("")
+    return _OutputsResult(result=pathlib.Path("outputs/result.txt"))
+
+
+class _OutputsDir(TypedDict):
+    outputs: Annotated[pathlib.Path, outputs.Out("outputs", loaders.PathOnly())]
+
+
+def _stage_with_dir_output() -> _OutputsDir:
+    pathlib.Path("outputs").mkdir(exist_ok=True)
+    return _OutputsDir(outputs=pathlib.Path("outputs"))
 
 
 @pytest.fixture
@@ -41,9 +255,7 @@ def test_collect_watch_paths_includes_dependency_directories(
     data_dir.mkdir()
     (data_dir / "input.csv").write_text("a,b\n1,2")
 
-    @stage(deps=["data/input.csv"], outs=["output.txt"])
-    def process() -> None:
-        pass
+    register_test_stage(_stage_with_data_input_csv_dep, name="process")
 
     paths = _watch_utils.collect_watch_paths(["process"])
     assert data_dir in paths
@@ -56,9 +268,7 @@ def test_watch_filter_filters_exact_output_match(pipeline_dir: pathlib.Path) -> 
     """Should filter out exact output file paths."""
     output_path = pipeline_dir / "output.txt"
 
-    @stage(deps=[], outs=["output.txt"])
-    def process() -> None:
-        pass
+    register_test_stage(_stage_with_data_csv_dep, name="process")
 
     watch_filter = _watch_utils.create_watch_filter(["process"])
     assert watch_filter(watchfiles.Change.modified, str(output_path)) is False
@@ -68,9 +278,7 @@ def test_watch_filter_allows_source_files(pipeline_dir: pathlib.Path) -> None:
     """Should allow source files that are not outputs."""
     source_path = pipeline_dir / "src" / "main.py"
 
-    @stage(deps=[], outs=["output.txt"])
-    def process() -> None:
-        pass
+    register_test_stage(_stage_with_data_csv_dep, name="process")
 
     watch_filter = _watch_utils.create_watch_filter(["process"])
     assert watch_filter(watchfiles.Change.modified, str(source_path)) is True
@@ -98,13 +306,8 @@ def test_build_file_to_stages_index_maps_deps_to_stages(pipeline_dir: pathlib.Pa
     (pipeline_dir / "data.csv").write_text("a,b\n1,2")
     (pipeline_dir / "config.yaml").write_text("key: value")
 
-    @stage(deps=["data.csv"], outs=["output1.txt"])
-    def stage_a() -> None:
-        pass
-
-    @stage(deps=["config.yaml"], outs=["output2.txt"])
-    def stage_b() -> None:
-        pass
+    register_test_stage(_stage_a_data_csv, name="stage_a")
+    register_test_stage(_stage_b_config_yaml, name="stage_b")
 
     eng = engine.WatchEngine()
     index = eng._build_file_to_stages_index()
@@ -122,13 +325,8 @@ def test_build_file_to_stages_index_handles_shared_deps(pipeline_dir: pathlib.Pa
     """Multiple stages sharing same dep should all be in the index."""
     (pipeline_dir / "shared.csv").write_text("a,b\n1,2")
 
-    @stage(deps=["shared.csv"], outs=["out1.txt"])
-    def stage_a() -> None:
-        pass
-
-    @stage(deps=["shared.csv"], outs=["out2.txt"])
-    def stage_b() -> None:
-        pass
+    register_test_stage(_stage_a_shared_csv, name="stage_a")
+    register_test_stage(_stage_b_shared_csv, name="stage_b")
 
     eng = engine.WatchEngine()
     index = eng._build_file_to_stages_index()
@@ -146,9 +344,7 @@ def test_get_stages_affected_by_direct_dep_match(pipeline_dir: pathlib.Path) -> 
     """Should find stages with direct dependency on changed file."""
     (pipeline_dir / "data.csv").write_text("a,b\n1,2")
 
-    @stage(deps=["data.csv"], outs=["output.txt"])
-    def process() -> None:
-        pass
+    register_test_stage(_stage_with_data_csv_dep, name="process")
 
     eng = engine.WatchEngine()
     data_path = project.resolve_path("data.csv")
@@ -163,9 +359,7 @@ def test_get_stages_affected_by_file_in_dep_directory(pipeline_dir: pathlib.Path
     data_dir.mkdir()
     (data_dir / "file.csv").write_text("a,b\n1,2")
 
-    @stage(deps=["data/"], outs=["output.txt"])
-    def process() -> None:
-        pass
+    register_test_stage(_stage_with_dir_dep, name="process")
 
     eng = engine.WatchEngine()
     file_path = project.resolve_path("data/file.csv")
@@ -180,9 +374,7 @@ def test_get_stages_affected_returns_empty_for_unrelated_file(
     """Should return empty set for changes to unrelated files."""
     (pipeline_dir / "data.csv").write_text("a,b\n1,2")
 
-    @stage(deps=["data.csv"], outs=["output.txt"])
-    def process() -> None:
-        pass
+    register_test_stage(_stage_with_data_csv_dep, name="process")
 
     eng = engine.WatchEngine()
     unrelated_path = project.resolve_path("unrelated.txt")
@@ -198,13 +390,8 @@ def test_add_downstream_stages_includes_direct_dependents(pipeline_dir: pathlib.
     """Should include stages that directly depend on affected stages."""
     (pipeline_dir / "data.csv").write_text("a,b\n1,2")
 
-    @stage(deps=["data.csv"], outs=["intermediate.txt"])
-    def preprocess() -> None:
-        pass
-
-    @stage(deps=["intermediate.txt"], outs=["final.txt"])
-    def train() -> None:
-        pass
+    register_test_stage(_stage_preprocess, name="preprocess")
+    register_test_stage(_stage_train, name="train")
 
     eng = engine.WatchEngine()
     affected = eng._add_downstream_stages({"preprocess"})
@@ -219,17 +406,9 @@ def test_add_downstream_stages_includes_transitive_dependents(
     """Should include transitively dependent stages."""
     (pipeline_dir / "data.csv").write_text("a,b\n1,2")
 
-    @stage(deps=["data.csv"], outs=["step1.txt"])
-    def step1() -> None:
-        pass
-
-    @stage(deps=["step1.txt"], outs=["step2.txt"])
-    def step2() -> None:
-        pass
-
-    @stage(deps=["step2.txt"], outs=["step3.txt"])
-    def step3() -> None:
-        pass
+    register_test_stage(_stage_step1, name="step1")
+    register_test_stage(_stage_step2, name="step2")
+    register_test_stage(_stage_step3, name="step3")
 
     eng = engine.WatchEngine()
     affected = eng._add_downstream_stages({"step1"})
@@ -248,13 +427,8 @@ def test_get_affected_stages_returns_all_stages_on_code_change(
     """Code changes should trigger all stages (executor handles skip logic)."""
     (pipeline_dir / "data.csv").write_text("a,b\n1,2")
 
-    @stage(deps=["data.csv"], outs=["out1.txt"])
-    def stage_a() -> None:
-        pass
-
-    @stage(deps=["out1.txt"], outs=["out2.txt"])
-    def stage_b() -> None:
-        pass
+    register_test_stage(_stage_a_data_csv, name="stage_a")
+    register_test_stage(_stage_b_config_yaml, name="stage_b")
 
     eng = engine.WatchEngine()
     code_path = pathlib.Path("/some/code.py")
@@ -271,13 +445,8 @@ def test_get_affected_stages_returns_subset_on_data_change(
     (pipeline_dir / "data1.csv").write_text("a,b\n1,2")
     (pipeline_dir / "data2.csv").write_text("x,y\n3,4")
 
-    @stage(deps=["data1.csv"], outs=["out1.txt"])
-    def stage_a() -> None:
-        pass
-
-    @stage(deps=["data2.csv"], outs=["out2.txt"])
-    def stage_b() -> None:
-        pass
+    register_test_stage(_stage_a_data1, name="stage_a")
+    register_test_stage(_stage_b_data2, name="stage_b")
 
     eng = engine.WatchEngine()
     data_path = project.resolve_path("data1.csv")
@@ -297,13 +466,8 @@ def test_get_affected_stages_includes_downstream_when_intermediate_file_changes(
     # Create intermediate file (output of stage_a, dep of stage_b)
     (pipeline_dir / "intermediate.csv").write_text("x,y\n3,4")
 
-    @stage(deps=["input.csv"], outs=["intermediate.csv"])
-    def stage_a() -> None:
-        pass
-
-    @stage(deps=["intermediate.csv"], outs=["final.csv"])
-    def stage_b() -> None:
-        pass
+    register_test_stage(_stage_a_input_csv, name="stage_a")
+    register_test_stage(_stage_b_intermediate_csv, name="stage_b")
 
     eng = engine.WatchEngine()
 
@@ -456,9 +620,7 @@ def test_add_downstream_stages_skips_unknown_stages(
     """_add_downstream_stages should skip stages not in DAG and log warning."""
     (pipeline_dir / "data.csv").write_text("a,b\n1,2")
 
-    @stage(deps=["data.csv"], outs=["output.txt"])
-    def known_stage() -> None:
-        pass
+    register_test_stage(_stage_with_data_csv_dep, name="known_stage")
 
     eng = engine.WatchEngine()
 
@@ -477,9 +639,7 @@ def test_engine_runs_initial_execution(pipeline_dir: pathlib.Path) -> None:
     """Engine should run initial pipeline execution on start."""
     (pipeline_dir / "data.csv").write_text("a,b\n1,2")
 
-    @stage(deps=["data.csv"], outs=["output.txt"])
-    def process() -> None:
-        pass
+    register_test_stage(_stage_with_data_csv_dep, name="process")
 
     call_count = 0
 
@@ -505,9 +665,7 @@ def test_engine_restarts_workers_on_code_change(pipeline_dir: pathlib.Path) -> N
     """Engine should restart workers when Python files change."""
     (pipeline_dir / "data.csv").write_text("a,b\n1,2")
 
-    @stage(deps=["data.csv"], outs=["output.txt"])
-    def process() -> None:
-        pass
+    register_test_stage(_stage_with_data_csv_dep, name="process")
 
     restart_called = False
     iteration_count = 0
@@ -549,9 +707,7 @@ def test_engine_handles_execution_error_gracefully(pipeline_dir: pathlib.Path) -
     """Engine should continue after execution errors."""
     (pipeline_dir / "data.csv").write_text("a,b\n1,2")
 
-    @stage(deps=["data.csv"], outs=["output.txt"])
-    def process() -> None:
-        pass
+    register_test_stage(_stage_with_data_csv_dep, name="process")
 
     call_count = 0
     eng_ref: engine.WatchEngine | None = None
@@ -600,9 +756,7 @@ def test_watcher_thread_exception_triggers_shutdown(pipeline_dir: pathlib.Path) 
     """Watcher thread exceptions should trigger engine shutdown."""
     (pipeline_dir / "data.csv").write_text("a,b\n1,2")
 
-    @stage(deps=["data.csv"], outs=["output.txt"])
-    def process() -> None:
-        pass
+    register_test_stage(_stage_with_data_csv_dep, name="process")
 
     shutdown_triggered = False
 
@@ -653,9 +807,7 @@ def test_watch_loop_handles_queue_overflow(pipeline_dir: pathlib.Path) -> None:
     """Watch loop should handle full queue gracefully by accumulating."""
     (pipeline_dir / "data.csv").write_text("a,b\n1,2")
 
-    @stage(deps=["data.csv"], outs=["output.txt"])
-    def process() -> None:
-        pass
+    register_test_stage(_stage_with_data_csv_dep, name="process")
 
     eng = engine.WatchEngine()
 
@@ -681,9 +833,7 @@ def test_concurrent_shutdown_during_debounce(pipeline_dir: pathlib.Path) -> None
     """Shutdown during debounce should return empty and exit cleanly."""
     (pipeline_dir / "data.csv").write_text("a,b\n1,2")
 
-    @stage(deps=["data.csv"], outs=["output.txt"])
-    def process() -> None:
-        pass
+    register_test_stage(_stage_with_data_csv_dep, name="process")
 
     eng = engine.WatchEngine(debounce_ms=1000)
 
@@ -713,9 +863,7 @@ def test_concurrent_shutdown_during_run(pipeline_dir: pathlib.Path) -> None:
     """Shutdown during run() should clean up watcher thread."""
     (pipeline_dir / "data.csv").write_text("a,b\n1,2")
 
-    @stage(deps=["data.csv"], outs=["output.txt"])
-    def process() -> None:
-        pass
+    register_test_stage(_stage_with_data_csv_dep, name="process")
 
     execution_count = 0
 
@@ -764,9 +912,7 @@ def test_watch_filter_resolves_symlinks(pipeline_dir: pathlib.Path) -> None:
     symlink_path = pipeline_dir / "result_link.txt"
     symlink_path.symlink_to(actual_output)
 
-    @stage(deps=[], outs=["outputs/result.txt"])
-    def process() -> None:
-        pass
+    register_test_stage(_stage_with_nested_output, name="process")
 
     watch_filter = _watch_utils.create_watch_filter(["process"])
 
@@ -782,9 +928,7 @@ def test_watch_filter_handles_broken_symlink(pipeline_dir: pathlib.Path) -> None
     broken_link = pipeline_dir / "broken_link.txt"
     broken_link.symlink_to(pipeline_dir / "nonexistent.txt")
 
-    @stage(deps=[], outs=["output.txt"])
-    def process() -> None:
-        pass
+    register_test_stage(_stage_with_data_csv_dep, name="process")
 
     watch_filter = _watch_utils.create_watch_filter(["process"])
 
@@ -798,9 +942,7 @@ def test_get_stages_affected_handles_deleted_file(pipeline_dir: pathlib.Path) ->
     """Should handle deleted files gracefully using absolute path."""
     (pipeline_dir / "data.csv").write_text("a,b\n1,2")
 
-    @stage(deps=["data.csv"], outs=["output.txt"])
-    def process() -> None:
-        pass
+    register_test_stage(_stage_with_data_csv_dep, name="process")
 
     eng = engine.WatchEngine()
 
@@ -819,9 +961,7 @@ def test_dag_cache_invalidation_on_code_change(pipeline_dir: pathlib.Path) -> No
     """DAG cache should be invalidated when code changes."""
     (pipeline_dir / "data.csv").write_text("a,b\n1,2")
 
-    @stage(deps=["data.csv"], outs=["output.txt"])
-    def process() -> None:
-        pass
+    register_test_stage(_stage_with_data_csv_dep, name="process")
 
     eng = engine.WatchEngine()
 
@@ -849,9 +989,7 @@ def test_file_index_caching_returns_same_instance(pipeline_dir: pathlib.Path) ->
     """File index should be cached and return same instance."""
     (pipeline_dir / "data.csv").write_text("a,b\n1,2")
 
-    @stage(deps=["data.csv"], outs=["output.txt"])
-    def process() -> None:
-        pass
+    register_test_stage(_stage_with_data_csv_dep, name="process")
 
     eng = engine.WatchEngine()
 
@@ -904,9 +1042,7 @@ def test_integration_watchfiles_detects_real_file_change(pipeline_dir: pathlib.P
     data_file = pipeline_dir / "data.csv"
     data_file.write_text("a,b\n1,2")
 
-    @stage(deps=["data.csv"], outs=["output.txt"])
-    def process() -> None:
-        pass
+    register_test_stage(_stage_with_data_csv_dep, name="process")
 
     execution_stages: list[list[str] | None] = []
     execution_event = threading.Event()
@@ -956,9 +1092,7 @@ def test_integration_watchfiles_detects_python_code_change(pipeline_dir: pathlib
     code_file = pipeline_dir / "helper.py"
     code_file.write_text("def helper(): pass\n")
 
-    @stage(deps=["data.csv"], outs=["output.txt"])
-    def process() -> None:
-        pass
+    register_test_stage(_stage_with_data_csv_dep, name="process")
 
     execution_count = 0
     restart_called = False
@@ -1026,13 +1160,8 @@ def test_get_affected_stages_returns_all_registry_stages_on_code_change(
     """When stages is None and code changed, should return all registry stages."""
     (pipeline_dir / "data.csv").write_text("a,b\n1,2")
 
-    @stage(deps=["data.csv"], outs=["output1.txt"])
-    def stage1() -> None:
-        pass
-
-    @stage(deps=["data.csv"], outs=["output2.txt"])
-    def stage2() -> None:
-        pass
+    register_test_stage(_stage_a_data_csv, name="stage1")
+    register_test_stage(_stage_b_data2, name="stage2")
 
     eng = engine.WatchEngine(stages=None)  # No specific stages
 
@@ -1083,9 +1212,7 @@ def test_collect_watch_paths_handles_missing_stage(
     data_file = pipeline_dir / "data.csv"
     data_file.write_text("a,b\n1,2")
 
-    @stage(deps=["data.csv"], outs=["output.txt"])
-    def existing() -> None:
-        pass
+    register_test_stage(_stage_with_data_csv_dep, name="existing")
 
     # Include a non-existent stage in the list
     stages = ["existing", "nonexistent_stage"]
@@ -1106,9 +1233,7 @@ def test_watch_filter_filters_nested_output_directory(
     nested_file.parent.mkdir()
     nested_file.write_text("data")
 
-    @stage(deps=[], outs=["outputs"])  # Output is a directory
-    def produce() -> None:
-        pass
+    register_test_stage(_stage_with_dir_output, name="produce")
 
     stages_to_run = ["produce"]
     watch_filter = _watch_utils.create_watch_filter(stages_to_run)
@@ -1138,9 +1263,7 @@ def test_get_stages_matching_changes_handles_incomparable_paths(
     data_dir.mkdir()
     (data_dir / "input.csv").write_text("a,b\n1,2")
 
-    @stage(deps=["data"], outs=["output.txt"])  # Depends on directory
-    def process() -> None:
-        pass
+    register_test_stage(_stage_with_dir_dep_no_slash, name="process")
 
     eng = engine.WatchEngine()
 
@@ -1168,9 +1291,7 @@ def test_reload_registry_clears_and_reimports_modules(
 ) -> None:
     """_reload_registry should clear project modules and reimport them."""
 
-    @stage(deps=[], outs=["output.txt"])
-    def test_stage() -> None:
-        pass
+    register_test_stage(_stage_noop, name="test_stage")
 
     eng = engine.WatchEngine()
 
@@ -1229,9 +1350,7 @@ def test_reload_registry_handles_import_exception(
 ) -> None:
     """_reload_registry should return False and preserve registry when import fails."""
 
-    @stage(deps=[], outs=["output.txt"])
-    def reload_test_stage() -> None:
-        pass
+    register_test_stage(_stage_noop, name="reload_test_stage")
 
     eng = engine.WatchEngine()
 
@@ -1275,8 +1394,9 @@ def my_stage() -> None:
 stages:
   test_yaml_stage:
     python: stages.my_stage
-    deps: []
-    outs: ["output.txt"]
+    deps: {}
+    outs:
+      output: output.txt
 """
     )
 
@@ -1310,14 +1430,22 @@ def test_reload_registry_uses_pipeline_py_when_present(
     # Remove pivot.yaml stages section (just keep version)
     (pipeline_dir / "pivot.yaml").write_text("version: 1\n")
 
-    # Create pipeline.py
+    # Create pipeline.py with annotation-based output
     (pipeline_dir / "pipeline.py").write_text(
         """\
-from pivot.registry import stage
+import pathlib
+from typing import Annotated, TypedDict
+from pivot import outputs, loaders, stage_def
+from pivot.registry import REGISTRY
 
-@stage(deps=[], outs=["output.txt"])
-def pipeline_py_stage() -> None:
-    pass
+class _OutputTxt(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
+
+def pipeline_py_stage() -> _OutputTxt:
+    pathlib.Path("output.txt").write_text("")
+    return _OutputTxt(output=pathlib.Path("output.txt"))
+
+REGISTRY.register(pipeline_py_stage)
 """
     )
 
@@ -1359,19 +1487,28 @@ def yaml_stage() -> None:
 stages:
   yaml_stage:
     python: stages.yaml_stage
-    deps: []
-    outs: ["yaml_out.txt"]
+    deps: {}
+    outs:
+      yaml_out: yaml_out.txt
 """
     )
 
-    # Create pipeline.py with different stage
+    # Create pipeline.py with different stage (annotation-based)
     (pipeline_dir / "pipeline.py").write_text(
         """\
-from pivot.registry import stage
+import pathlib
+from typing import Annotated, TypedDict
+from pivot import outputs, loaders, stage_def
+from pivot.registry import REGISTRY
 
-@stage(deps=[], outs=["py_out.txt"])
-def py_stage() -> None:
-    pass
+class _PyOut(TypedDict):
+    py_out: Annotated[pathlib.Path, outputs.Out("py_out.txt", loaders.PathOnly())]
+
+def py_stage() -> _PyOut:
+    pathlib.Path("py_out.txt").write_text("")
+    return _PyOut(py_out=pathlib.Path("py_out.txt"))
+
+REGISTRY.register(py_stage)
 """
     )
 
@@ -1403,9 +1540,7 @@ def test_reload_registry_falls_back_to_decorators(
     (pipeline_dir / "pivot.yaml").write_text("version: 1\n")
     # Don't create pipeline.py
 
-    @stage(deps=[], outs=["output.txt"])
-    def decorator_stage() -> None:
-        pass
+    register_test_stage(_stage_noop, name="decorator_stage")
 
     eng = engine.WatchEngine()
 
@@ -1442,8 +1577,9 @@ def my_stage() -> None:
 stages:
   preserved_stage:
     python: stages.my_stage
-    deps: []
-    outs: ["output.txt"]
+    deps: {}
+    outs:
+      output: output.txt
 """
     )
 
@@ -1460,8 +1596,9 @@ stages:
 stages:
   broken_stage:
     python: nonexistent.module.func
-    deps: []
-    outs: ["output.txt"]
+    deps: {}
+    outs:
+      output: output.txt
 """
     )
 
@@ -1484,14 +1621,22 @@ def test_reload_registry_pipeline_py_error_preserves_old_registry(
     # Remove pivot.yaml stages section
     (pipeline_dir / "pivot.yaml").write_text("version: 1\n")
 
-    # Create valid pipeline.py first
+    # Create valid pipeline.py first (annotation-based)
     (pipeline_dir / "pipeline.py").write_text(
         """\
-from pivot.registry import stage
+import pathlib
+from typing import Annotated, TypedDict
+from pivot import outputs, loaders, stage_def
+from pivot.registry import REGISTRY
 
-@stage(deps=[], outs=["output.txt"])
-def preserved_py_stage() -> None:
-    pass
+class _OutputTxt(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
+
+def preserved_py_stage() -> _OutputTxt:
+    pathlib.Path("output.txt").write_text("")
+    return _OutputTxt(output=pathlib.Path("output.txt"))
+
+REGISTRY.register(preserved_py_stage)
 """
     )
 
@@ -1515,9 +1660,7 @@ def test_watch_filter_handles_resolve_oserror(
 ) -> None:
     """Watch filter should not filter paths that can't be resolved."""
 
-    @stage(deps=["data.csv"], outs=["output.txt"])
-    def process() -> None:
-        pass
+    register_test_stage(_stage_with_data_csv_dep, name="process")
 
     watch_filter = _watch_utils.create_watch_filter(["process"])
 
@@ -1551,9 +1694,7 @@ def test_get_stages_matching_changes_handles_is_relative_to_error(
     data_dir.mkdir()
     (data_dir / "input.csv").write_text("a,b\n1,2")
 
-    @stage(deps=["data"], outs=["output.txt"])
-    def containment_stage() -> None:
-        pass
+    register_test_stage(_stage_with_dir_dep_no_slash, name="containment_stage")
 
     eng = engine.WatchEngine()
 
@@ -1576,9 +1717,7 @@ def test_get_stages_matching_changes_handles_is_relative_to_error(
 def test_reload_registry_clears_errors_on_success(pipeline_dir: pathlib.Path) -> None:
     """_reload_registry should clear previous errors on successful reload."""
 
-    @stage(deps=[], outs=["output.txt"])
-    def test_clear_stage() -> None:
-        pass
+    register_test_stage(_stage_noop, name="test_clear_stage")
 
     eng = engine.WatchEngine()
     # Simulate previous error state
@@ -1603,9 +1742,7 @@ def test_reload_registry_returns_true_when_no_modules(pipeline_dir: pathlib.Path
 def test_coordinator_loop_skips_execution_when_invalid(pipeline_dir: pathlib.Path) -> None:
     """Coordinator should skip execution when pipeline is invalid."""
 
-    @stage(deps=[], outs=["output.txt"])
-    def invalid_test_stage() -> None:
-        pass
+    register_test_stage(_stage_noop, name="invalid_test_stage")
 
     eng = engine.WatchEngine()
 
@@ -1647,9 +1784,7 @@ def test_coordinator_loop_skips_execution_when_invalid(pipeline_dir: pathlib.Pat
 def test_coordinator_loop_sends_error_on_reload_failure(pipeline_dir: pathlib.Path) -> None:
     """Coordinator should send error message when reload fails."""
 
-    @stage(deps=[], outs=["output.txt"])
-    def reload_fail_stage() -> None:
-        pass
+    register_test_stage(_stage_noop, name="reload_fail_stage")
 
     eng = engine.WatchEngine()
 
@@ -1693,9 +1828,7 @@ def test_coordinator_loop_clears_invalid_state_on_successful_reload(
 ) -> None:
     """Coordinator should clear invalid state when reload succeeds."""
 
-    @stage(deps=[], outs=["output.txt"])
-    def recovery_stage() -> None:
-        pass
+    register_test_stage(_stage_noop, name="recovery_stage")
 
     eng = engine.WatchEngine()
     # Set up previous invalid state
@@ -1747,9 +1880,7 @@ def test_execute_stages_passes_force_on_first_run(pipeline_dir: pathlib.Path) ->
     """_execute_stages should pass force=True on first run when force_first_run=True."""
     (pipeline_dir / "data.csv").write_text("a,b\n1,2")
 
-    @stage(deps=["data.csv"], outs=["output.txt"])
-    def process() -> None:
-        pass
+    register_test_stage(_stage_with_data_csv_dep, name="process")
 
     eng = engine.WatchEngine(force_first_run=True)
 
@@ -1770,9 +1901,7 @@ def test_execute_stages_does_not_force_subsequent_runs(pipeline_dir: pathlib.Pat
     """_execute_stages should pass force=False on subsequent runs."""
     (pipeline_dir / "data.csv").write_text("a,b\n1,2")
 
-    @stage(deps=["data.csv"], outs=["output.txt"])
-    def process() -> None:
-        pass
+    register_test_stage(_stage_with_data_csv_dep, name="process")
 
     eng = engine.WatchEngine(force_first_run=True)
 
@@ -1796,9 +1925,7 @@ def test_execute_stages_without_force_first_run_never_forces(pipeline_dir: pathl
     """_execute_stages should never pass force=True when force_first_run=False."""
     (pipeline_dir / "data.csv").write_text("a,b\n1,2")
 
-    @stage(deps=["data.csv"], outs=["output.txt"])
-    def process() -> None:
-        pass
+    register_test_stage(_stage_with_data_csv_dep, name="process")
 
     eng = engine.WatchEngine(force_first_run=False)  # Default
 
@@ -1823,9 +1950,7 @@ def test_first_run_done_flag_stress_test(pipeline_dir: pathlib.Path) -> None:
     """
     (pipeline_dir / "data.csv").write_text("a,b\n1,2")
 
-    @stage(deps=["data.csv"], outs=["output.txt"])
-    def process() -> None:
-        pass
+    register_test_stage(_stage_with_data_csv_dep, name="process")
 
     eng = engine.WatchEngine(force_first_run=True)
 
@@ -1895,16 +2020,25 @@ def get_value():
 """
     )
 
-    # Create stages module that imports helper
+    # Create stages module that imports helper (annotation-based)
     stages_py = pipeline_dir / "stages.py"
     stages_py.write_text(
         """\
+import pathlib
+from typing import Annotated, TypedDict
 from helpers import get_value
-from pivot.registry import stage
+from pivot import outputs, loaders, stage_def
+from pivot.registry import REGISTRY
 
-@stage(deps=[], outs=["output.txt"])
-def my_stage():
-    return get_value()
+class _OutputTxt(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
+
+def my_stage() -> _OutputTxt:
+    _ = get_value()
+    pathlib.Path("output.txt").write_text("")
+    return _OutputTxt(output=pathlib.Path("output.txt"))
+
+REGISTRY.register(my_stage)
 """
     )
 
@@ -1973,15 +2107,23 @@ def test_watch_filter_stale_after_registry_adds_new_stage(
         if mod_name == "stages" or mod_name.startswith("stages."):
             del sys.modules[mod_name]
 
-    # Create initial stages module with one stage
+    # Create initial stages module with one stage (annotation-based)
     stages_py = pipeline_dir / "stages.py"
     stages_py.write_text(
         """\
-from pivot.registry import stage
+import pathlib
+from typing import Annotated, TypedDict
+from pivot import outputs, loaders, stage_def
+from pivot.registry import REGISTRY
 
-@stage(deps=[], outs=["output_a.txt"])
-def stage_a():
-    pass
+class _OutputA(TypedDict):
+    output_a: Annotated[pathlib.Path, outputs.Out("output_a.txt", loaders.PathOnly())]
+
+def stage_a() -> _OutputA:
+    pathlib.Path("output_a.txt").write_text("")
+    return _OutputA(output_a=pathlib.Path("output_a.txt"))
+
+REGISTRY.register(stage_a)
 """
     )
 
@@ -2005,18 +2147,30 @@ def stage_a():
     output_b_path = pipeline_dir / "output_b.txt"
     assert initial_filter(watchfiles.Change.modified, str(output_b_path)) is True
 
-    # Now add a new stage
+    # Now add a new stage (annotation-based)
     stages_py.write_text(
         """\
-from pivot.registry import stage
+import pathlib
+from typing import Annotated, TypedDict
+from pivot import outputs, loaders, stage_def
+from pivot.registry import REGISTRY
 
-@stage(deps=[], outs=["output_a.txt"])
-def stage_a():
-    pass
+class _OutputA(TypedDict):
+    output_a: Annotated[pathlib.Path, outputs.Out("output_a.txt", loaders.PathOnly())]
 
-@stage(deps=[], outs=["output_b.txt"])
-def stage_b():
-    pass
+class _OutputB(TypedDict):
+    output_b: Annotated[pathlib.Path, outputs.Out("output_b.txt", loaders.PathOnly())]
+
+def stage_a() -> _OutputA:
+    pathlib.Path("output_a.txt").write_text("")
+    return _OutputA(output_a=pathlib.Path("output_a.txt"))
+
+def stage_b() -> _OutputB:
+    pathlib.Path("output_b.txt").write_text("")
+    return _OutputB(output_b=pathlib.Path("output_b.txt"))
+
+REGISTRY.register(stage_a)
+REGISTRY.register(stage_b)
 """
     )
 
@@ -2060,19 +2214,31 @@ def test_watch_filter_stale_after_registry_removes_stage(
         if mod_name == "stages" or mod_name.startswith("stages."):
             del sys.modules[mod_name]
 
-    # Create initial stages module with two stages
+    # Create initial stages module with two stages (annotation-based)
     stages_py = pipeline_dir / "stages.py"
     stages_py.write_text(
         """\
-from pivot.registry import stage
+import pathlib
+from typing import Annotated, TypedDict
+from pivot import outputs, loaders, stage_def
+from pivot.registry import REGISTRY
 
-@stage(deps=[], outs=["output_a.txt"])
-def stage_a():
-    pass
+class _OutputA(TypedDict):
+    output_a: Annotated[pathlib.Path, outputs.Out("output_a.txt", loaders.PathOnly())]
 
-@stage(deps=[], outs=["output_b.txt"])
-def stage_b():
-    pass
+class _OutputB(TypedDict):
+    output_b: Annotated[pathlib.Path, outputs.Out("output_b.txt", loaders.PathOnly())]
+
+def stage_a() -> _OutputA:
+    pathlib.Path("output_a.txt").write_text("")
+    return _OutputA(output_a=pathlib.Path("output_a.txt"))
+
+def stage_b() -> _OutputB:
+    pathlib.Path("output_b.txt").write_text("")
+    return _OutputB(output_b=pathlib.Path("output_b.txt"))
+
+REGISTRY.register(stage_a)
+REGISTRY.register(stage_b)
 """
     )
 
@@ -2093,14 +2259,22 @@ def stage_b():
     assert initial_filter(watchfiles.Change.modified, str(output_a_path)) is False
     assert initial_filter(watchfiles.Change.modified, str(output_b_path)) is False
 
-    # Remove stage_b
+    # Remove stage_b (annotation-based)
     stages_py.write_text(
         """\
-from pivot.registry import stage
+import pathlib
+from typing import Annotated, TypedDict
+from pivot import outputs, loaders, stage_def
+from pivot.registry import REGISTRY
 
-@stage(deps=[], outs=["output_a.txt"])
-def stage_a():
-    pass
+class _OutputA(TypedDict):
+    output_a: Annotated[pathlib.Path, outputs.Out("output_a.txt", loaders.PathOnly())]
+
+def stage_a() -> _OutputA:
+    pathlib.Path("output_a.txt").write_text("")
+    return _OutputA(output_a=pathlib.Path("output_a.txt"))
+
+REGISTRY.register(stage_a)
 """
     )
 
@@ -2143,15 +2317,26 @@ def test_file_index_stale_after_registry_changes(
         if mod_name == "stages" or mod_name.startswith("stages."):
             del sys.modules[mod_name]
 
-    # Create initial stages module
+    # Create initial stages module (annotation-based)
     stages_py = pipeline_dir / "stages.py"
     stages_py.write_text(
         """\
-from pivot.registry import stage
+import pathlib
+from typing import Annotated, TypedDict
+from pivot import outputs, loaders, stage_def
+from pivot.registry import REGISTRY
 
-@stage(deps=["data_a.csv"], outs=["output_a.txt"])
-def stage_a():
-    pass
+class _OutputA(TypedDict):
+    output_a: Annotated[pathlib.Path, outputs.Out("output_a.txt", loaders.PathOnly())]
+
+def stage_a(
+    data_a: Annotated[pathlib.Path, outputs.Dep("data_a.csv", loaders.PathOnly())],
+) -> _OutputA:
+    _ = data_a
+    pathlib.Path("output_a.txt").write_text("")
+    return _OutputA(output_a=pathlib.Path("output_a.txt"))
+
+REGISTRY.register(stage_a)
 """
     )
     (pipeline_dir / "data_a.csv").write_text("a,b\n1,2")
@@ -2173,18 +2358,36 @@ def stage_a():
     assert data_a_path in index1, "data_a should be in index"
     assert data_b_path not in index1, "data_b should NOT be in index"
 
-    # Add new stage with different dependency
+    # Add new stage with different dependency (annotation-based)
     stages_py.write_text(
         """\
-from pivot.registry import stage
+import pathlib
+from typing import Annotated, TypedDict
+from pivot import outputs, loaders, stage_def
+from pivot.registry import REGISTRY
 
-@stage(deps=["data_a.csv"], outs=["output_a.txt"])
-def stage_a():
-    pass
+class _OutputA(TypedDict):
+    output_a: Annotated[pathlib.Path, outputs.Out("output_a.txt", loaders.PathOnly())]
 
-@stage(deps=["data_b.csv"], outs=["output_b.txt"])
-def stage_b():
-    pass
+class _OutputB(TypedDict):
+    output_b: Annotated[pathlib.Path, outputs.Out("output_b.txt", loaders.PathOnly())]
+
+def stage_a(
+    data_a: Annotated[pathlib.Path, outputs.Dep("data_a.csv", loaders.PathOnly())],
+) -> _OutputA:
+    _ = data_a
+    pathlib.Path("output_a.txt").write_text("")
+    return _OutputA(output_a=pathlib.Path("output_a.txt"))
+
+def stage_b(
+    data_b: Annotated[pathlib.Path, outputs.Dep("data_b.csv", loaders.PathOnly())],
+) -> _OutputB:
+    _ = data_b
+    pathlib.Path("output_b.txt").write_text("")
+    return _OutputB(output_b=pathlib.Path("output_b.txt"))
+
+REGISTRY.register(stage_a)
+REGISTRY.register(stage_b)
 """
     )
 
@@ -2216,7 +2419,7 @@ def _helper_agent_noop() -> None:
 @pytest.mark.usefixtures("pipeline_dir")
 def test_try_start_agent_run_succeeds_when_watching() -> None:
     """try_start_agent_run succeeds when engine is in WATCHING state."""
-    REGISTRY.register(_helper_agent_noop, name="test_stage", deps=[], outs=[])
+    register_test_stage(_helper_agent_noop, name="test_stage")
 
     eng = engine.WatchEngine(debounce_ms=100)
     # Simulate coordinator starting (sets state to WATCHING)
@@ -2233,7 +2436,7 @@ def test_try_start_agent_run_succeeds_when_watching() -> None:
 @pytest.mark.usefixtures("pipeline_dir")
 def test_try_start_agent_run_rejects_when_idle() -> None:
     """try_start_agent_run rejects when engine is in IDLE state (not ready yet)."""
-    REGISTRY.register(_helper_agent_noop, name="test_stage", deps=[], outs=[])
+    register_test_stage(_helper_agent_noop, name="test_stage")
 
     eng = engine.WatchEngine(debounce_ms=100)
     # Default state is IDLE (coordinator not started)
@@ -2248,7 +2451,7 @@ def test_try_start_agent_run_rejects_when_idle() -> None:
 @pytest.mark.usefixtures("pipeline_dir")
 def test_try_start_agent_run_rejects_when_running() -> None:
     """try_start_agent_run rejects when execution is already in progress."""
-    REGISTRY.register(_helper_agent_noop, name="test_stage", deps=[], outs=[])
+    register_test_stage(_helper_agent_noop, name="test_stage")
 
     eng = engine.WatchEngine(debounce_ms=100)
     eng._update_agent_state(AgentState.WATCHING)
@@ -2270,7 +2473,7 @@ def test_try_start_agent_run_rejects_when_running() -> None:
 @pytest.mark.usefixtures("pipeline_dir")
 def test_try_start_agent_run_sets_state_atomically() -> None:
     """try_start_agent_run sets state to RUNNING atomically with queuing."""
-    REGISTRY.register(_helper_agent_noop, name="test_stage", deps=[], outs=[])
+    register_test_stage(_helper_agent_noop, name="test_stage")
 
     eng = engine.WatchEngine(debounce_ms=100)
     eng._update_agent_state(AgentState.WATCHING)
@@ -2289,8 +2492,8 @@ def test_try_start_agent_run_sets_state_atomically() -> None:
 @pytest.mark.usefixtures("pipeline_dir")
 def test_try_start_agent_run_initializes_run_fields() -> None:
     """try_start_agent_run initializes all run tracking fields."""
-    REGISTRY.register(_helper_agent_noop, name="stage_a", deps=[], outs=[])
-    REGISTRY.register(_helper_agent_noop, name="stage_b", deps=[], outs=[])
+    register_test_stage(_helper_agent_noop, name="stage_a")
+    register_test_stage(_helper_agent_noop, name="stage_b")
 
     eng = engine.WatchEngine(debounce_ms=100)
     eng._update_agent_state(AgentState.WATCHING)
@@ -2310,7 +2513,7 @@ def test_try_start_agent_run_initializes_run_fields() -> None:
 @pytest.mark.usefixtures("pipeline_dir")
 def test_try_start_agent_run_rolls_back_on_queue_full() -> None:
     """try_start_agent_run rolls back state if queue is full (prevents deadlock)."""
-    REGISTRY.register(_helper_agent_noop, name="test_stage", deps=[], outs=[])
+    register_test_stage(_helper_agent_noop, name="test_stage")
 
     eng = engine.WatchEngine(debounce_ms=100)
     eng._update_agent_state(AgentState.WATCHING)
@@ -2333,7 +2536,7 @@ def test_try_start_agent_run_rolls_back_on_queue_full() -> None:
 @pytest.mark.usefixtures("pipeline_dir")
 def test_try_start_agent_run_concurrent_calls_only_one_succeeds() -> None:
     """Concurrent try_start_agent_run calls - exactly one should succeed."""
-    REGISTRY.register(_helper_agent_noop, name="test_stage", deps=[], outs=[])
+    register_test_stage(_helper_agent_noop, name="test_stage")
 
     eng = engine.WatchEngine(debounce_ms=100)
     eng._update_agent_state(AgentState.WATCHING)
@@ -2363,7 +2566,7 @@ def test_try_start_agent_run_concurrent_calls_only_one_succeeds() -> None:
 @pytest.mark.usefixtures("pipeline_dir")
 def test_get_agent_status_returns_running_state() -> None:
     """get_agent_status returns RUNNING state with run details."""
-    REGISTRY.register(_helper_agent_noop, name="test_stage", deps=[], outs=[])
+    register_test_stage(_helper_agent_noop, name="test_stage")
 
     eng = engine.WatchEngine(debounce_ms=100)
     eng._update_agent_state(AgentState.WATCHING)

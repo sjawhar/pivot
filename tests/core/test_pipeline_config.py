@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from pivot import exceptions, registry
+from pivot import registry
 from pivot.pipeline import yaml as pipeline_config
 
 if TYPE_CHECKING:
@@ -129,8 +129,8 @@ def test_load_pipeline_file_parses_stage_fields(simple_pipeline: pathlib.Path) -
 
     preprocess = config.stages["preprocess"]
     assert preprocess.python == "stages.preprocess"
-    assert preprocess.deps == ["data/raw.csv"]
-    assert preprocess.outs == ["data/clean.csv"]
+    assert preprocess.deps == {"raw": "data/raw.csv"}
+    assert preprocess.outs == {"clean": "data/clean.csv"}
 
 
 def test_load_pipeline_file_with_metrics(params_pipeline: pathlib.Path) -> None:
@@ -139,7 +139,7 @@ def test_load_pipeline_file_with_metrics(params_pipeline: pathlib.Path) -> None:
     config = pipeline_config.load_pipeline_file(pipeline_file)
 
     train = config.stages["train"]
-    assert train.metrics == ["metrics/train.json"]
+    assert train.metrics == {"train": "metrics/train.json"}
 
 
 def test_load_pipeline_file_with_params(params_pipeline: pathlib.Path) -> None:
@@ -174,7 +174,7 @@ def test_registered_stage_has_correct_deps(simple_pipeline: pathlib.Path) -> Non
 
     info = registry.REGISTRY.get("preprocess")
     # Deps should be normalized to absolute paths
-    assert any("data/raw.csv" in dep for dep in info["deps"])
+    assert any("data/raw.csv" in dep for dep in info["deps_paths"])
 
 
 def test_registered_stage_has_correct_outs(simple_pipeline: pathlib.Path) -> None:
@@ -259,7 +259,8 @@ def test_error_if_params_parameter_has_no_type_hint(
     # Create a stage with untyped params
     stages_file = params_pipeline / "stages.py"
     content = stages_file.read_text()
-    content = content.replace("def train(params: TrainParams)", "def train(params)")
+    # Remove type hint from params parameter (multi-line signature)
+    content = content.replace("params: TrainParams,", "params,")
     stages_file.write_text(content)
 
     # Need to reload the module
@@ -298,7 +299,7 @@ def test_matrix_variant_has_interpolated_deps(matrix_pipeline: pathlib.Path) -> 
     pipeline_config.register_from_pipeline_file(pipeline_file)
 
     info = registry.REGISTRY.get("train@bert_swe")
-    deps_str = " ".join(info["deps"])
+    deps_str = " ".join(info["deps_paths"])
 
     assert "configs/bert.yaml" in deps_str
     # Should NOT have ${model} or ${dataset} - should be interpolated
@@ -345,23 +346,6 @@ def test_matrix_dict_dimension_applies_overrides(matrix_pipeline: pathlib.Path) 
     # bert has hidden_size=768, gpt has hidden_size=1024
     assert bert_params.model_dump()["hidden_size"] == 768
     assert gpt_params.model_dump()["hidden_size"] == 1024
-
-
-def test_matrix_append_override_adds_deps(matrix_pipeline: pathlib.Path) -> None:
-    """deps+ override appends to deps list."""
-    pipeline_file = matrix_pipeline / "pivot.yaml"
-    pipeline_config.register_from_pipeline_file(pipeline_file)
-
-    gpt_info = registry.REGISTRY.get("train@gpt_swe")
-    deps_str = " ".join(gpt_info["deps"])
-
-    # gpt variants should have the extra dep
-    assert "data/gpt_tokenizer.json" in deps_str
-
-    # bert variants should NOT have it
-    bert_info = registry.REGISTRY.get("train@bert_swe")
-    bert_deps_str = " ".join(bert_info["deps"])
-    assert "data/gpt_tokenizer.json" not in bert_deps_str
 
 
 def test_matrix_list_dimension_uses_value_as_key(matrix_pipeline: pathlib.Path) -> None:
@@ -439,7 +423,8 @@ def test_cwd_with_path_traversal_raises(tmp_path: pathlib.Path) -> None:
 stages:
   bad_stage:
     python: os.getcwd
-    outs: [out.txt]
+    outs:
+      out: out.txt
     cwd: "../escape"
 """
     )
@@ -456,7 +441,8 @@ def test_import_function_invalid_path_raises(tmp_path: pathlib.Path) -> None:
 stages:
   bad_stage:
     python: no_module_path
-    outs: [out.txt]
+    outs:
+      out: out.txt
 """
     )
 
@@ -472,7 +458,8 @@ def test_import_nonexistent_module_raises(tmp_path: pathlib.Path) -> None:
 stages:
   bad_stage:
     python: nonexistent_module_xyz.func
-    outs: [out.txt]
+    outs:
+      out: out.txt
 """
     )
 
@@ -488,7 +475,8 @@ def test_import_nonexistent_function_raises(tmp_path: pathlib.Path) -> None:
 stages:
   bad_stage:
     python: os.nonexistent_function_xyz
-    outs: [out.txt]
+    outs:
+      out: out.txt
 """
     )
 
@@ -504,7 +492,8 @@ def test_import_non_callable_raises(tmp_path: pathlib.Path) -> None:
 stages:
   bad_stage:
     python: os.name
-    outs: [out.txt]
+    outs:
+      out: out.txt
 """
     )
 
@@ -527,9 +516,10 @@ def test_output_with_cache_false(simple_pipeline: pathlib.Path) -> None:
 stages:
   preprocess:
     python: stages.preprocess
-    deps: [data/raw.csv]
+    deps:
+      raw: data/raw.csv
     outs:
-      - data/clean.csv: {cache: false}
+      clean: {path: data/clean.csv, cache: false}
 """
     )
 
@@ -542,8 +532,25 @@ stages:
 
 
 def test_plot_with_options(simple_pipeline: pathlib.Path) -> None:
-    """Plot with x, y, template options is parsed correctly."""
-    from pivot import outputs
+    """Multiple outputs defined via annotations are registered correctly."""
+    # Create stages file with multiple outputs in annotations
+    stages_file = simple_pipeline / "stages.py"
+    stages_file.write_text(
+        """\
+import pathlib
+from typing import Annotated, TypedDict
+from pivot import loaders, outputs
+
+class PreprocessOutputs(TypedDict):
+    clean: Annotated[pathlib.Path, outputs.Out("data/clean.csv", loaders.PathOnly())]
+    curve: Annotated[pathlib.Path, outputs.Out("plots/curve.json", loaders.PathOnly())]
+
+def preprocess(
+    raw: Annotated[pathlib.Path, outputs.Dep("data/raw.csv", loaders.PathOnly())],
+) -> PreprocessOutputs:
+    return {"clean": pathlib.Path("data/clean.csv"), "curve": pathlib.Path("plots/curve.json")}
+"""
+    )
 
     pipeline_file = simple_pipeline / "pivot.yaml"
     pipeline_file.write_text(
@@ -551,22 +558,21 @@ def test_plot_with_options(simple_pipeline: pathlib.Path) -> None:
 stages:
   preprocess:
     python: stages.preprocess
-    deps: [data/raw.csv]
-    outs: [data/clean.csv]
-    plots:
-      - plots/curve.json: {x: epoch, y: loss, template: linear}
 """
     )
+
+    # Clear cached module
+    if "stages" in sys.modules:
+        del sys.modules["stages"]
 
     pipeline_config.register_from_pipeline_file(pipeline_file)
 
     info = registry.REGISTRY.get("preprocess")
-    plot_outs = [o for o in info["outs"] if isinstance(o, outputs.Plot)]
-    assert len(plot_outs) == 1
-    plot = plot_outs[0]
-    assert plot.x == "epoch"
-    assert plot.y == "loss"
-    assert plot.template == "linear"
+    # Should have 2 outputs registered
+    assert len(info["outs"]) == 2
+    paths = " ".join(info["outs_paths"])
+    assert "data/clean.csv" in paths
+    assert "plots/curve.json" in paths
 
 
 # =============================================================================
@@ -583,9 +589,9 @@ stages:
   train:
     python: stages.train
     deps:
-      - data/clean.csv
+      clean: data/clean.csv
     outs:
-      - models/out.pkl
+      out: models/out.pkl
     matrix:
       model: []
 """
@@ -604,9 +610,9 @@ stages:
   train:
     python: stages.train
     deps:
-      - data/clean.csv
+      clean: data/clean.csv
     outs:
-      - models/out.pkl
+      out: models/out.pkl
     matrix:
       model: {}
 """
@@ -625,9 +631,9 @@ stages:
   train:
     python: stages.train
     deps:
-      - "data/${unknown}.csv"
+      data: "data/${unknown}.csv"
     outs:
-      - models/out.pkl
+      out: models/out.pkl
     matrix:
       model:
         - bert
@@ -649,9 +655,9 @@ stages:
   "train@{model}":
     python: stages.train
     deps:
-      - data/clean.csv
+      clean: data/clean.csv
     outs:
-      - "models/${model}_${dataset}.pkl"
+      model: "models/${model}_${dataset}.pkl"
     matrix:
       model:
         - bert
@@ -677,9 +683,9 @@ stages:
   "train@{model}_{unknown}":
     python: stages.train
     deps:
-      - data/clean.csv
+      clean: data/clean.csv
     outs:
-      - "models/${model}.pkl"
+      model: "models/${model}.pkl"
     matrix:
       model:
         - bert
@@ -702,9 +708,9 @@ stages:
   train@variant:
     python: stages.train
     deps:
-      - data/clean.csv
+      clean: data/clean.csv
     outs:
-      - "models/${model}.pkl"
+      model: "models/${model}.pkl"
     matrix:
       model:
         - bert
@@ -723,21 +729,34 @@ stages:
 def test_variants_function_registers_stages(
     simple_pipeline: pathlib.Path,
 ) -> None:
-    """variants function returns list of dicts to register."""
-    # Create a variants generator function
+    """variants function returns list of dicts with params to register."""
+    # Create a variants generator function with annotation-based train function
     stages_file = simple_pipeline / "stages.py"
     stages_file.write_text(
         """\
+import pathlib
+from typing import Annotated, TypedDict
+from pivot import loaders, outputs, stage_def
+
+class TrainParams(stage_def.StageParams):
+    learning_rate: float = 0.01
+
+class TrainOutputs(TypedDict):
+    model: Annotated[pathlib.Path, outputs.Out("models/model.pkl", loaders.PathOnly())]
+
 def preprocess():
     pass
 
-def train():
-    pass
+def train(
+    params: TrainParams,
+    data: Annotated[pathlib.Path, outputs.Dep("data/input.csv", loaders.PathOnly())],
+) -> TrainOutputs:
+    return {"model": pathlib.Path("models/model.pkl")}
 
 def get_variants():
     return [
-        {"name": "v1", "deps": ["a.txt"], "outs": ["b.txt"]},
-        {"name": "v2", "deps": ["c.txt"], "outs": ["d.txt"]},
+        {"name": "v1", "params": {"learning_rate": 0.01}, "outs": {"model": "models/model_v1.pkl"}},
+        {"name": "v2", "params": {"learning_rate": 0.001}, "outs": {"model": "models/model_v2.pkl"}},
     ]
 """
     )
@@ -799,15 +818,24 @@ def test_variants_with_cwd(
     stages_file = simple_pipeline / "stages.py"
     stages_file.write_text(
         """\
+import pathlib
+from typing import Annotated, TypedDict
+from pivot import loaders, outputs
+
+class TrainOutputs(TypedDict):
+    b: Annotated[pathlib.Path, outputs.Out("b.txt", loaders.PathOnly())]
+
 def preprocess():
     pass
 
-def train():
-    pass
+def train(
+    a: Annotated[pathlib.Path, outputs.Dep("a.txt", loaders.PathOnly())],
+) -> TrainOutputs:
+    return {"b": pathlib.Path("b.txt")}
 
 def get_variants():
     return [
-        {"name": "v1", "deps": ["a.txt"], "outs": ["b.txt"], "cwd": "subdir"},
+        {"name": "v1", "cwd": "subdir"},
     ]
 """
     )
@@ -834,17 +862,25 @@ stages:
 
 
 def test_matrix_metrics_override(simple_pipeline: pathlib.Path) -> None:
-    """Matrix dimension can override metrics list."""
-    from pivot import outputs
-
+    """Matrix path interpolation works for multiple outputs."""
     stages_file = simple_pipeline / "stages.py"
     stages_file.write_text(
         """\
+import pathlib
+from typing import Annotated, TypedDict
+from pivot import loaders, outputs
+
+class TrainOutputs(TypedDict):
+    model: Annotated[pathlib.Path, outputs.Out("models/model.pkl", loaders.PathOnly())]
+    metrics: Annotated[pathlib.Path, outputs.Out("metrics/base.json", loaders.PathOnly())]
+
 def preprocess():
     pass
 
-def train():
-    pass
+def train(
+    clean: Annotated[pathlib.Path, outputs.Dep("data/clean.csv", loaders.PathOnly())],
+) -> TrainOutputs:
+    return {"model": pathlib.Path("models/model.pkl"), "metrics": pathlib.Path("metrics/base.json")}
 """
     )
 
@@ -854,54 +890,57 @@ def train():
 stages:
   train:
     python: stages.train
-    deps:
-      - data/clean.csv
     outs:
-      - "models/${model}.pkl"
-    metrics:
-      - metrics/base.json
+      model: "models/${model}.pkl"
+      metrics: "metrics/${model}_base.json"
     matrix:
       model:
-        bert:
-          metrics:
-            - metrics/bert.json
-        gpt:
-          metrics+:
-            - metrics/gpt_extra.json
+        - bert
+        - gpt
 """
     )
+
+    # Clear cached module
+    if "stages" in sys.modules:
+        del sys.modules["stages"]
 
     pipeline_config.register_from_pipeline_file(pipeline_file)
 
     bert_info = registry.REGISTRY.get("train@bert")
     gpt_info = registry.REGISTRY.get("train@gpt")
 
-    bert_metrics = [o for o in bert_info["outs"] if isinstance(o, outputs.Metric)]
-    gpt_metrics = [o for o in gpt_info["outs"] if isinstance(o, outputs.Metric)]
+    # Each variant has 2 outputs with interpolated paths
+    assert len(bert_info["outs"]) == 2
+    bert_paths = " ".join(bert_info["outs_paths"])
+    assert "models/bert.pkl" in bert_paths
+    assert "bert_base.json" in bert_paths
 
-    # bert has override (replaces)
-    assert len(bert_metrics) == 1
-    assert "bert.json" in bert_metrics[0].path
-
-    # gpt has append
-    assert len(gpt_metrics) == 2
-    metric_paths = " ".join(m.path for m in gpt_metrics)
-    assert "base.json" in metric_paths
-    assert "gpt_extra.json" in metric_paths
+    assert len(gpt_info["outs"]) == 2
+    gpt_paths = " ".join(gpt_info["outs_paths"])
+    assert "models/gpt.pkl" in gpt_paths
+    assert "gpt_base.json" in gpt_paths
 
 
 def test_matrix_plots_override(simple_pipeline: pathlib.Path) -> None:
-    """Matrix dimension can override plots list."""
-    from pivot import outputs
-
+    """Matrix dimension overrides can add additional outputs (plots use case)."""
     stages_file = simple_pipeline / "stages.py"
     stages_file.write_text(
         """\
+import pathlib
+from typing import Annotated, TypedDict
+from pivot import loaders, outputs
+
+class TrainOutputs(TypedDict):
+    model: Annotated[pathlib.Path, outputs.Out("models/model.pkl", loaders.PathOnly())]
+    plot: Annotated[pathlib.Path, outputs.Out("plots/base.json", loaders.PathOnly())]
+
 def preprocess():
     pass
 
-def train():
-    pass
+def train(
+    clean: Annotated[pathlib.Path, outputs.Dep("data/clean.csv", loaders.PathOnly())],
+) -> TrainOutputs:
+    return {"model": pathlib.Path("models/model.pkl"), "plot": pathlib.Path("plots/base.json")}
 """
     )
 
@@ -911,47 +950,56 @@ def train():
 stages:
   train:
     python: stages.train
-    deps:
-      - data/clean.csv
     outs:
-      - "models/${model}.pkl"
-    plots:
-      - plots/base.json
+      model: "models/${model}.pkl"
+      plot: "plots/${model}_base.json"
     matrix:
       model:
-        bert:
-          plots:
-            - plots/bert.json
-        gpt:
-          plots+:
-            - plots/gpt_extra.json
+        - bert
+        - gpt
 """
     )
+
+    # Clear cached module
+    if "stages" in sys.modules:
+        del sys.modules["stages"]
 
     pipeline_config.register_from_pipeline_file(pipeline_file)
 
     bert_info = registry.REGISTRY.get("train@bert")
     gpt_info = registry.REGISTRY.get("train@gpt")
 
-    bert_plots = [o for o in bert_info["outs"] if isinstance(o, outputs.Plot)]
-    gpt_plots = [o for o in gpt_info["outs"] if isinstance(o, outputs.Plot)]
+    # Each variant has 2 outputs with interpolated paths
+    assert len(bert_info["outs"]) == 2
+    bert_paths = " ".join(bert_info["outs_paths"])
+    assert "models/bert.pkl" in bert_paths
+    assert "bert_base.json" in bert_paths
 
-    assert len(bert_plots) == 1
-    assert "bert.json" in bert_plots[0].path
-
-    assert len(gpt_plots) == 2
+    assert len(gpt_info["outs"]) == 2
+    gpt_paths = " ".join(gpt_info["outs_paths"])
+    assert "models/gpt.pkl" in gpt_paths
+    assert "gpt_base.json" in gpt_paths
 
 
 def test_matrix_mutex_override(simple_pipeline: pathlib.Path) -> None:
-    """Matrix dimension can override mutex list."""
+    """Matrix dimension can override mutex list (replacement only)."""
     stages_file = simple_pipeline / "stages.py"
     stages_file.write_text(
         """\
+import pathlib
+from typing import Annotated, TypedDict
+from pivot import loaders, outputs
+
+class TrainOutputs(TypedDict):
+    model: Annotated[pathlib.Path, outputs.Out("models/model.pkl", loaders.PathOnly())]
+
 def preprocess():
     pass
 
-def train():
-    pass
+def train(
+    clean: Annotated[pathlib.Path, outputs.Dep("data/clean.csv", loaders.PathOnly())],
+) -> TrainOutputs:
+    return {"model": pathlib.Path("models/model.pkl")}
 """
     )
 
@@ -961,10 +1009,8 @@ def train():
 stages:
   train:
     python: stages.train
-    deps:
-      - data/clean.csv
     outs:
-      - "models/${model}.pkl"
+      model: "models/${model}.pkl"
     mutex:
       - gpu
     matrix:
@@ -973,8 +1019,9 @@ stages:
           mutex:
             - cpu
         gpt:
-          mutex+:
+          mutex:
             - memory
+            - disk
 """
     )
 
@@ -983,12 +1030,11 @@ stages:
     bert_info = registry.REGISTRY.get("train@bert")
     gpt_info = registry.REGISTRY.get("train@gpt")
 
-    # bert has override (replaces)
+    # Both variants have their mutex list replaced (not merged with base)
     assert bert_info["mutex"] == ["cpu"]
-
-    # gpt has append
-    assert "gpu" in gpt_info["mutex"]
     assert "memory" in gpt_info["mutex"]
+    assert "disk" in gpt_info["mutex"]
+    assert "gpu" not in gpt_info["mutex"]  # Base was replaced, not merged
 
 
 def test_matrix_cwd_override(simple_pipeline: pathlib.Path) -> None:
@@ -998,11 +1044,20 @@ def test_matrix_cwd_override(simple_pipeline: pathlib.Path) -> None:
     stages_file = simple_pipeline / "stages.py"
     stages_file.write_text(
         """\
+import pathlib
+from typing import Annotated, TypedDict
+from pivot import loaders, outputs
+
+class TrainOutputs(TypedDict):
+    model: Annotated[pathlib.Path, outputs.Out("models/model.pkl", loaders.PathOnly())]
+
 def preprocess():
     pass
 
-def train():
-    pass
+def train(
+    clean: Annotated[pathlib.Path, outputs.Dep("data/clean.csv", loaders.PathOnly())],
+) -> TrainOutputs:
+    return {"model": pathlib.Path("models/model.pkl")}
 """
     )
 
@@ -1012,10 +1067,8 @@ def train():
 stages:
   train:
     python: stages.train
-    deps:
-      - data/clean.csv
     outs:
-      - "models/${model}.pkl"
+      model: "models/${model}.pkl"
     matrix:
       model:
         bert:
@@ -1035,15 +1088,24 @@ stages:
 
 
 def test_matrix_outs_override(simple_pipeline: pathlib.Path) -> None:
-    """Matrix dimension can override outs list."""
+    """Matrix dimension can override out paths with interpolation."""
     stages_file = simple_pipeline / "stages.py"
     stages_file.write_text(
         """\
+import pathlib
+from typing import Annotated, TypedDict
+from pivot import loaders, outputs
+
+class TrainOutputs(TypedDict):
+    base: Annotated[pathlib.Path, outputs.Out("models/base.pkl", loaders.PathOnly())]
+
 def preprocess():
     pass
 
-def train():
-    pass
+def train(
+    clean: Annotated[pathlib.Path, outputs.Dep("data/clean.csv", loaders.PathOnly())],
+) -> TrainOutputs:
+    return {"base": pathlib.Path("models/base.pkl")}
 """
     )
 
@@ -1053,18 +1115,12 @@ def train():
 stages:
   train:
     python: stages.train
-    deps:
-      - data/clean.csv
     outs:
-      - models/base.pkl
+      base: "models/${model}_base.pkl"
     matrix:
       model:
-        bert:
-          outs:
-            - models/bert_specific.pkl
-        gpt:
-          outs+:
-            - models/gpt_extra.pkl
+        - bert
+        - gpt
 """
     )
 
@@ -1073,12 +1129,12 @@ stages:
     bert_info = registry.REGISTRY.get("train@bert")
     gpt_info = registry.REGISTRY.get("train@gpt")
 
-    # bert has override (replaces)
+    # Each variant has its out path interpolated
     assert len(bert_info["outs_paths"]) == 1
-    assert "bert_specific.pkl" in bert_info["outs_paths"][0]
+    assert "bert_base.pkl" in bert_info["outs_paths"][0]
 
-    # gpt has append
-    assert len(gpt_info["outs_paths"]) == 2
+    assert len(gpt_info["outs_paths"]) == 1
+    assert "gpt_base.pkl" in gpt_info["outs_paths"][0]
 
 
 def test_matrix_interpolates_nested_params(simple_pipeline: pathlib.Path) -> None:
@@ -1086,16 +1142,24 @@ def test_matrix_interpolates_nested_params(simple_pipeline: pathlib.Path) -> Non
     stages_file = simple_pipeline / "stages.py"
     stages_file.write_text(
         """\
-import pydantic
+import pathlib
+from typing import Annotated, Any, TypedDict
+from pivot import loaders, outputs, stage_def
 
-class TrainParams(pydantic.BaseModel):
-    config: dict
+class TrainParams(stage_def.StageParams):
+    config: dict[str, Any]
+
+class TrainOutputs(TypedDict):
+    model: Annotated[pathlib.Path, outputs.Out("models/model.pkl", loaders.PathOnly())]
 
 def preprocess():
     pass
 
-def train(params: TrainParams):
-    pass
+def train(
+    params: TrainParams,
+    clean: Annotated[pathlib.Path, outputs.Dep("data/clean.csv", loaders.PathOnly())],
+) -> TrainOutputs:
+    return {"model": pathlib.Path("models/model.pkl")}
 """
     )
 
@@ -1105,10 +1169,8 @@ def train(params: TrainParams):
 stages:
   train:
     python: stages.train
-    deps:
-      - data/clean.csv
     outs:
-      - "models/${model}.pkl"
+      model: "models/${model}.pkl"
     params:
       config:
         model_name: "${model}"
@@ -1133,15 +1195,24 @@ stages:
 
 
 def test_matrix_interpolates_output_dict_keys(simple_pipeline: pathlib.Path) -> None:
-    """Matrix interpolates ${dim} in output dict keys."""
+    """Matrix interpolates ${dim} in output dict with options."""
     stages_file = simple_pipeline / "stages.py"
     stages_file.write_text(
         """\
+import pathlib
+from typing import Annotated, TypedDict
+from pivot import loaders, outputs
+
+class TrainOutputs(TypedDict):
+    model: Annotated[pathlib.Path, outputs.Out("models/model.pkl", loaders.PathOnly())]
+
 def preprocess():
     pass
 
-def train():
-    pass
+def train(
+    clean: Annotated[pathlib.Path, outputs.Dep("data/clean.csv", loaders.PathOnly())],
+) -> TrainOutputs:
+    return {"model": pathlib.Path("models/model.pkl")}
 """
     )
 
@@ -1151,11 +1222,8 @@ def train():
 stages:
   train:
     python: stages.train
-    deps:
-      - data/clean.csv
     outs:
-      - "models/${model}.pkl":
-          cache: false
+      model: {path: "models/${model}.pkl", cache: false}
     matrix:
       model:
         - bert
@@ -1178,16 +1246,24 @@ def test_matrix_boolean_values(simple_pipeline: pathlib.Path) -> None:
     stages_file = simple_pipeline / "stages.py"
     stages_file.write_text(
         """\
-import pydantic
+import pathlib
+from typing import Annotated, TypedDict
+from pivot import loaders, outputs, stage_def
 
-class FlagParams(pydantic.BaseModel):
+class FlagParams(stage_def.StageParams):
     enabled: bool
+
+class TrainOutputs(TypedDict):
+    model: Annotated[pathlib.Path, outputs.Out("models/model.pkl", loaders.PathOnly())]
 
 def preprocess():
     pass
 
-def train(params: FlagParams):
-    pass
+def train(
+    params: FlagParams,
+    clean: Annotated[pathlib.Path, outputs.Dep("data/clean.csv", loaders.PathOnly())],
+) -> TrainOutputs:
+    return {"model": pathlib.Path("models/model.pkl")}
 """
     )
 
@@ -1197,10 +1273,8 @@ def train(params: FlagParams):
 stages:
   train:
     python: stages.train
-    deps:
-      - data/clean.csv
     outs:
-      - "models/${flag}.pkl"
+      model: "models/${flag}.pkl"
     params:
       enabled: "${flag}"
     matrix:
@@ -1237,16 +1311,24 @@ def test_matrix_integer_values(simple_pipeline: pathlib.Path) -> None:
     stages_file = simple_pipeline / "stages.py"
     stages_file.write_text(
         """\
-import pydantic
+import pathlib
+from typing import Annotated, TypedDict
+from pivot import loaders, outputs, stage_def
 
-class SizeParams(pydantic.BaseModel):
+class SizeParams(stage_def.StageParams):
     batch_size: int
+
+class TrainOutputs(TypedDict):
+    model: Annotated[pathlib.Path, outputs.Out("models/model.pkl", loaders.PathOnly())]
 
 def preprocess():
     pass
 
-def train(params: SizeParams):
-    pass
+def train(
+    params: SizeParams,
+    clean: Annotated[pathlib.Path, outputs.Dep("data/clean.csv", loaders.PathOnly())],
+) -> TrainOutputs:
+    return {"model": pathlib.Path("models/model.pkl")}
 """
     )
 
@@ -1256,10 +1338,8 @@ def train(params: SizeParams):
 stages:
   train:
     python: stages.train
-    deps:
-      - data/clean.csv
     outs:
-      - "models/batch_${size}.pkl"
+      model: "models/batch_${size}.pkl"
     params:
       batch_size: "${size}"
     matrix:
@@ -1298,16 +1378,24 @@ def test_matrix_float_values(simple_pipeline: pathlib.Path) -> None:
     stages_file = simple_pipeline / "stages.py"
     stages_file.write_text(
         """\
-import pydantic
+import pathlib
+from typing import Annotated, TypedDict
+from pivot import loaders, outputs, stage_def
 
-class LRParams(pydantic.BaseModel):
+class LRParams(stage_def.StageParams):
     learning_rate: float
+
+class TrainOutputs(TypedDict):
+    model: Annotated[pathlib.Path, outputs.Out("models/model.pkl", loaders.PathOnly())]
 
 def preprocess():
     pass
 
-def train(params: LRParams):
-    pass
+def train(
+    params: LRParams,
+    clean: Annotated[pathlib.Path, outputs.Dep("data/clean.csv", loaders.PathOnly())],
+) -> TrainOutputs:
+    return {"model": pathlib.Path("models/model.pkl")}
 """
     )
 
@@ -1317,10 +1405,8 @@ def train(params: LRParams):
 stages:
   train:
     python: stages.train
-    deps:
-      - data/clean.csv
     outs:
-      - "models/lr_${lr}.pkl"
+      model: "models/lr_${lr}.pkl"
     params:
       learning_rate: "${lr}"
     matrix:
@@ -1359,17 +1445,25 @@ def test_matrix_mixed_interpolation(simple_pipeline: pathlib.Path) -> None:
     stages_file = simple_pipeline / "stages.py"
     stages_file.write_text(
         """\
-import pydantic
+import pathlib
+from typing import Annotated, TypedDict
+from pivot import loaders, outputs, stage_def
 
-class MixedParams(pydantic.BaseModel):
+class MixedParams(stage_def.StageParams):
     rate: float
     path: str
+
+class TrainOutputs(TypedDict):
+    out: Annotated[pathlib.Path, outputs.Out("models/out.pkl", loaders.PathOnly())]
 
 def preprocess():
     pass
 
-def train(params: MixedParams):
-    pass
+def train(
+    params: MixedParams,
+    clean: Annotated[pathlib.Path, outputs.Dep("data/clean.csv", loaders.PathOnly())],
+) -> TrainOutputs:
+    return {"out": pathlib.Path("models/out.pkl")}
 """
     )
 
@@ -1379,10 +1473,6 @@ def train(params: MixedParams):
 stages:
   train:
     python: stages.train
-    deps:
-      - data/clean.csv
-    outs:
-      - models/out.pkl
     params:
       rate: "${lr}"
       path: "models/${lr}.pkl"
@@ -1407,146 +1497,3 @@ stages:
     # String with interpolation becomes string
     assert params["path"] == "models/0.001.pkl"
     assert isinstance(params["path"], str)
-
-
-# =============================================================================
-# StageDef Integration Tests
-# =============================================================================
-
-
-@pytest.fixture
-def stage_def_pipeline(tmp_path: pathlib.Path, mocker: MockerFixture) -> Generator[pathlib.Path]:
-    """Set up a pipeline with StageDef-based stages."""
-    # Create data directory structure
-    (tmp_path / "data").mkdir(exist_ok=True)
-    (tmp_path / "data" / "input.csv").write_text("a,b\n1,2\n3,4\n")
-    (tmp_path / "output").mkdir(exist_ok=True)
-
-    # Create stages.py with StageDef
-    stages_file = tmp_path / "stages.py"
-    stages_file.write_text(
-        """\
-import pandas
-from pivot import loaders, stage_def
-
-
-class ProcessParams(stage_def.StageDef):
-   class deps:
-       data: loaders.CSV[pandas.DataFrame] = "data/input.csv"
-
-   class outs:
-       result: loaders.JSON[dict[str, int]] = "output/result.json"
-
-   threshold: float = 0.5
-
-
-def process(params: ProcessParams) -> None:
-   df = params.deps.data
-   result = {"count": len(df[df["a"] > params.threshold])}
-   params.outs.result = result
-"""
-    )
-
-    # Set project root
-    mocker.patch("pivot.project._project_root_cache", tmp_path)
-
-    # Clear any cached stages module from previous tests
-    if "stages" in sys.modules:
-        del sys.modules["stages"]
-
-    sys.path.insert(0, str(tmp_path))
-    yield tmp_path
-    sys.path.remove(str(tmp_path))
-    if "stages" in sys.modules:
-        del sys.modules["stages"]
-
-
-def test_stage_def_extracts_deps_from_class(stage_def_pipeline: pathlib.Path) -> None:
-    """StageDef deps are auto-extracted when not specified in YAML."""
-    pipeline_file = stage_def_pipeline / "pivot.yaml"
-    pipeline_file.write_text(
-        """\
-stages:
- process:
-   python: stages.process
-"""
-    )
-
-    pipeline_config.register_from_pipeline_file(pipeline_file)
-
-    info = registry.REGISTRY.get("process")
-    # Deps should be extracted from StageDef
-    assert any("data/input.csv" in dep for dep in info["deps"])
-
-
-def test_stage_def_extracts_outs_from_class(stage_def_pipeline: pathlib.Path) -> None:
-    """StageDef outs are auto-extracted when not specified in YAML."""
-    pipeline_file = stage_def_pipeline / "pivot.yaml"
-    pipeline_file.write_text(
-        """\
-stages:
- process:
-   python: stages.process
-"""
-    )
-
-    pipeline_config.register_from_pipeline_file(pipeline_file)
-
-    info = registry.REGISTRY.get("process")
-    # Outs should be extracted from StageDef
-    assert any("output/result.json" in out for out in info["outs_paths"])
-
-
-def test_stage_def_yaml_deps_override_raises(stage_def_pipeline: pathlib.Path) -> None:
-    """Explicit YAML deps should raise ValidationError for StageDef stages."""
-    pipeline_file = stage_def_pipeline / "pivot.yaml"
-    pipeline_file.write_text(
-        """\
-stages:
- process:
-   python: stages.process
-   deps:
-     - data/override.csv
-"""
-    )
-
-    with pytest.raises(exceptions.ValidationError, match="cannot override deps"):
-        pipeline_config.register_from_pipeline_file(pipeline_file)
-
-
-def test_stage_def_yaml_outs_override_raises(stage_def_pipeline: pathlib.Path) -> None:
-    """Explicit YAML outs should raise ValidationError for StageDef stages."""
-    pipeline_file = stage_def_pipeline / "pivot.yaml"
-    pipeline_file.write_text(
-        """\
-stages:
- process:
-   python: stages.process
-   outs:
-     - output/override.json
-"""
-    )
-
-    with pytest.raises(exceptions.ValidationError, match="cannot override outs"):
-        pipeline_config.register_from_pipeline_file(pipeline_file)
-
-
-def test_stage_def_params_available(stage_def_pipeline: pathlib.Path) -> None:
-    """StageDef params are available in registered stage."""
-    pipeline_file = stage_def_pipeline / "pivot.yaml"
-    pipeline_file.write_text(
-        """\
-stages:
- process:
-   python: stages.process
-   params:
-     threshold: 0.8
-"""
-    )
-
-    pipeline_config.register_from_pipeline_file(pipeline_file)
-
-    info = registry.REGISTRY.get("process")
-    params = info["params"]
-    assert params is not None
-    assert params.model_dump()["threshold"] == 0.8

@@ -6,9 +6,12 @@ Pivot is designed for high-performance pipeline execution with automatic code ch
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  User Pipeline Code (Python decorators)                     │
-│  @stage(deps=['data.csv'], outs=['model.pkl'])              │
-│  def train(lr: float = 0.01): ...                          │
+│  User Pipeline Code (pivot.yaml + typed Python functions)   │
+│  stages:                                                    │
+│    train:                                                   │
+│      python: stages.train                                   │
+│      deps: {data: data.csv}                                 │
+│      outs: {model: model.pkl}                               │
 └─────────────────────────────────────────────────────────────┘
                          │
                          ▼
@@ -86,8 +89,8 @@ dep_generations: {}
 
 ## Data Flow
 
-1. **Registration** - `@stage` decorator registers function with metadata
-2. **Discovery** - CLI discovers pipeline (pivot.yaml or pipeline.py)
+1. **Discovery** - CLI discovers pipeline (pivot.yaml)
+2. **Registration** - Stages registered from YAML config
 3. **DAG Construction** - Build dependency graph from outputs/inputs
 4. **Fingerprinting** - Hash code, params, and dependency content
 5. **Comparison** - Compare fingerprints with lock files
@@ -130,7 +133,7 @@ Files are stored by their content hash:
 
 ### Automatic Code Fingerprinting
 
-**Problem:** Manual `deps: [file.py]` declarations are error-prone and tedious.
+**Problem:** Manual code dependency declarations are error-prone and tedious.
 
 **Solution:** Automatic detection using:
 

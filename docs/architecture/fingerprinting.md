@@ -8,7 +8,6 @@ Pivot automatically detects when your Python code changes using a combination of
 def helper(x):
     return x * 2  # Change this...
 
-@stage(deps=['data.csv'])
 def process():
     return helper(load_data())  # ...and Pivot knows to re-run!
 ```
@@ -63,7 +62,6 @@ def level_3(): return 1
 def level_2(): return level_3() + 1
 def level_1(): return level_2() + 1
 
-@stage(deps=['data.csv'])
 def main():
     return level_1()
 ```
@@ -92,7 +90,6 @@ Some patterns cannot be tracked automatically:
 ### Lazy Imports
 
 ```python
-@stage(deps=['data.csv'])
 def process():
     from helpers import process_data  # Inside function!
     return process_data()
@@ -105,7 +102,6 @@ def process():
 ```python
 processor = DataProcessor()
 
-@stage(deps=['data.csv'])
 def process():
     return processor.transform(data)  # Method call
 ```
@@ -127,7 +123,6 @@ result = eval("process(data)")     # String execution
 ```python
 THRESHOLD = 0.5  # Changing this value...
 
-@stage(deps=['data.csv'])
 def process():
     if value > THRESHOLD:  # ...is NOT detected
         pass
@@ -136,13 +131,26 @@ def process():
 **Workaround:** Use stage parameters instead:
 
 ```python
-class ProcessParams(BaseModel):
+# stages.py
+from pivot.stage_def import StageParams
+
+
+class ProcessParams(StageParams):
     threshold: float = 0.5
 
-@stage(deps=['data.csv'], params=ProcessParams)
+
 def process(params: ProcessParams):
     if value > params.threshold:  # Changes tracked!
         pass
+```
+
+```yaml
+# pivot.yaml
+stages:
+  process:
+    python: stages.process
+    params:
+      threshold: 0.5
 ```
 
 ## Why AST + getclosurevars?

@@ -44,7 +44,7 @@ def build_dag(stages: dict[str, RegistryStageInfo], validate: bool = True) -> nx
     outputs_trie = _build_outputs_trie(stages)
 
     for stage_name, stage_info in stages.items():
-        for dep in stage_info["deps"]:
+        for dep in stage_info["deps_paths"]:
             producer = outputs_map.get(dep)
             if producer:
                 graph.add_edge(stage_name, producer)
@@ -85,9 +85,9 @@ def _build_outputs_map(stages: dict[str, RegistryStageInfo]) -> dict[str, str]:
     return outputs_map
 
 
-def _build_outputs_trie(stages: dict[str, RegistryStageInfo]) -> pygtrie.Trie:
+def _build_outputs_trie(stages: dict[str, RegistryStageInfo]) -> pygtrie.Trie[tuple[str, str]]:
     """Build trie of output paths for directory dependency resolution."""
-    trie = pygtrie.Trie()
+    trie: pygtrie.Trie[tuple[str, str]] = pygtrie.Trie()
     for stage_name, stage_info in stages.items():
         for out_path in stage_info["outs_paths"]:
             out_key = pathlib.Path(out_path).parts
@@ -95,7 +95,9 @@ def _build_outputs_trie(stages: dict[str, RegistryStageInfo]) -> pygtrie.Trie:
     return trie
 
 
-def _find_producers_for_path(dep_path: str, outputs_trie: pygtrie.Trie) -> list[str]:
+def _find_producers_for_path(
+    dep_path: str, outputs_trie: pygtrie.Trie[tuple[str, str]]
+) -> list[str]:
     """Find stages with outputs overlapping the dependency path (parent or child)."""
     dep_key = pathlib.Path(dep_path).parts
     producers = list[str]()

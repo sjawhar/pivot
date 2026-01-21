@@ -6,6 +6,7 @@ from unittest import mock
 import click
 import pytest
 
+from helpers import register_test_stage
 from pivot.cli import completion
 
 if TYPE_CHECKING:
@@ -221,11 +222,10 @@ def test_find_project_root_fast_returns_none_when_no_marker(
 
 def test_get_stages_full_returns_registered_stages() -> None:
     """Returns stages from registry after registration."""
-    from pivot import registry
 
     # Register real stages (autouse fixture clears registry between tests)
-    registry.REGISTRY.register(_noop, name="stage1", deps=[], outs=[])
-    registry.REGISTRY.register(_noop, name="stage2", deps=[], outs=[])
+    register_test_stage(_noop, name="stage1")
+    register_test_stage(_noop, name="stage2")
 
     result = completion._get_stages_full()
 
@@ -287,13 +287,12 @@ def test_complete_stages_falls_back_to_registry(
     mock_ctx: click.Context, mock_param: click.Parameter, mocker: MockerFixture
 ) -> None:
     """Falls back to registry when fast path returns None (no YAML)."""
-    from pivot import registry
 
     # No YAML file, fast path returns None
     mocker.patch.object(completion, "_find_project_root_fast", return_value=None)
 
     # Register stages directly
-    registry.REGISTRY.register(_noop, name="fallback_stage", deps=[], outs=[])
+    register_test_stage(_noop, name="fallback_stage")
 
     result = completion.complete_stages(mock_ctx, mock_param, "")
     assert "fallback_stage" in result

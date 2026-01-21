@@ -1,14 +1,33 @@
 from __future__ import annotations
 
 import pathlib
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Annotated, TypedDict
 
-import pivot
-from pivot import cli, executor
+from helpers import register_test_stage
+from pivot import cli, executor, loaders, outputs
 from pivot.storage import lock
 
 if TYPE_CHECKING:
     import click.testing
+
+
+# =============================================================================
+# Module-level helper functions for stages
+# =============================================================================
+
+
+class _ProcessOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
+
+
+def _helper_process(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _ProcessOutputs:
+    """Helper stage that writes output.txt."""
+    _ = input_file
+    pathlib.Path("output.txt").write_text("done")
+    return {"output": pathlib.Path("output.txt")}
+
 
 # =============================================================================
 # commit --list tests
@@ -33,9 +52,7 @@ def test_commit_list_shows_pending(runner: click.testing.CliRunner, tmp_path: pa
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
 
-        @pivot.stage(deps=["input.txt"], outs=["output.txt"])
-        def process() -> None:
-            pathlib.Path("output.txt").write_text("done")
+        register_test_stage(_helper_process, name="process")
 
         # Run with --no-commit
         executor.run(show_output=False, no_commit=True)
@@ -73,9 +90,7 @@ def test_commit_promotes_pending_to_production(
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
 
-        @pivot.stage(deps=["input.txt"], outs=["output.txt"])
-        def process() -> None:
-            pathlib.Path("output.txt").write_text("done")
+        register_test_stage(_helper_process, name="process")
 
         # Run with --no-commit
         executor.run(show_output=False, no_commit=True)
@@ -121,9 +136,7 @@ def test_commit_discard_removes_pending(
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
 
-        @pivot.stage(deps=["input.txt"], outs=["output.txt"])
-        def process() -> None:
-            pathlib.Path("output.txt").write_text("done")
+        register_test_stage(_helper_process, name="process")
 
         # Run with --no-commit
         executor.run(show_output=False, no_commit=True)
@@ -156,9 +169,7 @@ def test_run_no_commit_creates_pending_lock(
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
 
-        @pivot.stage(deps=["input.txt"], outs=["output.txt"])
-        def process() -> None:
-            pathlib.Path("output.txt").write_text("done")
+        register_test_stage(_helper_process, name="process")
 
         result = runner.invoke(cli.cli, ["run", "--no-commit"])
 
@@ -183,9 +194,7 @@ def test_run_no_commit_second_run_skips(
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
 
-        @pivot.stage(deps=["input.txt"], outs=["output.txt"])
-        def process() -> None:
-            pathlib.Path("output.txt").write_text("done")
+        register_test_stage(_helper_process, name="process")
 
         # First run via executor to set up pending lock
         executor.run(show_output=False, no_commit=True)
@@ -204,9 +213,7 @@ def test_run_no_commit_then_commit_workflow(
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
 
-        @pivot.stage(deps=["input.txt"], outs=["output.txt"])
-        def process() -> None:
-            pathlib.Path("output.txt").write_text("done")
+        register_test_stage(_helper_process, name="process")
 
         # Run with --no-commit via executor
         executor.run(show_output=False, no_commit=True)

@@ -1,10 +1,46 @@
 import pathlib
+from typing import Annotated, TypedDict
 
 import click.testing
 
-from pivot import cli, executor, project, stage
+from helpers import register_test_stage
+from pivot import cli, executor, loaders, outputs, project
 from pivot.registry import REGISTRY
 from pivot.storage import track
+
+# =============================================================================
+# Output TypedDicts for annotation-based stages
+# =============================================================================
+
+
+class _OutputTxtOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
+
+
+class _ModelOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("model.pkl", loaders.PathOnly())]
+
+
+# =============================================================================
+# Module-level helper functions
+# =============================================================================
+
+
+def _helper_process(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _OutputTxtOutputs:
+    _ = input_file
+    pathlib.Path("output.txt").write_text("output data")
+    return {"output": pathlib.Path("output.txt")}
+
+
+def _helper_train(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _ModelOutputs:
+    _ = input_file
+    pathlib.Path("model.pkl").write_bytes(b"model")
+    return {"output": pathlib.Path("model.pkl")}
+
 
 # =============================================================================
 # Basic Checkout Command Tests
@@ -91,10 +127,8 @@ def test_checkout_restores_stage_output(
         # Create input file
         pathlib.Path("input.txt").write_text("input data")
 
-        # Define and run a stage
-        @stage(deps=["input.txt"], outs=["output.txt"])
-        def process() -> None:
-            pathlib.Path("output.txt").write_text("output data")
+        # Register and run a stage
+        register_test_stage(_helper_process, name="process")
 
         # Run the stage to create and cache output
         executor.run(show_output=False)
@@ -133,9 +167,7 @@ def test_checkout_all_restores_everything(
         # Create and run a stage
         pathlib.Path("input.txt").write_text("input")
 
-        @stage(deps=["input.txt"], outs=["model.pkl"])
-        def train() -> None:
-            pathlib.Path("model.pkl").write_bytes(b"model")
+        register_test_stage(_helper_train, name="train")
 
         executor.run(show_output=False)
 

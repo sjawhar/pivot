@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import pathlib
+from typing import Annotated, TypedDict
 
-import pydantic
+from pivot import loaders, outputs, stage_def
 
 
-class TrainParams(pydantic.BaseModel):
+class TrainParams(stage_def.StageParams):
     """Parameters for training."""
 
     learning_rate: float = 0.01
@@ -15,18 +17,32 @@ class TrainParams(pydantic.BaseModel):
     batch_size: int = 32
 
 
-def preprocess() -> None:
+class PreprocessOutputs(TypedDict):
+    clean: Annotated[pathlib.Path, outputs.Out("data/clean.csv", loaders.PathOnly())]
+
+
+def preprocess(
+    raw: Annotated[pathlib.Path, outputs.Dep("data/raw.csv", loaders.PathOnly())],
+) -> PreprocessOutputs:
     """Read raw data and write clean data."""
-    with open("data/raw.csv") as f:
-        content = f.read()
-    with open("data/clean.csv", "w") as f:
-        f.write(content.upper())
+    content = raw.read_text()
+    clean_path = pathlib.Path("data/clean.csv")
+    clean_path.parent.mkdir(parents=True, exist_ok=True)
+    clean_path.write_text(content.upper())
+    return {"clean": clean_path}
 
 
-def train(params: TrainParams) -> None:
+class TrainOutputs(TypedDict):
+    model: Annotated[pathlib.Path, outputs.Out("models/model.pkl", loaders.PathOnly())]
+    train: Annotated[pathlib.Path, outputs.Metric("metrics/train.json")]
+
+
+def train(
+    params: TrainParams,
+    clean: Annotated[pathlib.Path, outputs.Dep("data/clean.csv", loaders.PathOnly())],
+) -> TrainOutputs:
     """Train model with params."""
-    with open("data/clean.csv") as f:
-        content = f.read()
+    content = clean.read_text()
 
     result = {
         "model": f"trained_with_lr={params.learning_rate}",
@@ -35,8 +51,13 @@ def train(params: TrainParams) -> None:
         "data_size": len(content),
     }
 
-    with open("models/model.pkl", "w") as f:
-        f.write(json.dumps(result))
+    model_path = pathlib.Path("models/model.pkl")
+    model_path.parent.mkdir(parents=True, exist_ok=True)
+    model_path.write_text(json.dumps(result))
 
-    with open("metrics/train.json", "w") as f:
+    metrics_path = pathlib.Path("metrics/train.json")
+    metrics_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(metrics_path, "w") as f:
         json.dump({"loss": 0.1, "accuracy": 0.95}, f)
+
+    return {"model": model_path, "train": metrics_path}

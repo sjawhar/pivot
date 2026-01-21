@@ -8,7 +8,7 @@
 
 ## What is Pivot?
 
-Pivot is a Python pipeline tool with automatic code change detection. Define stages with decorators, and Pivot figures out what needs to re-run—no manual dependency declarations, no stale caches. It provides:
+Pivot is a Python pipeline tool with automatic code change detection. Define stages in YAML or with typed Python classes, and Pivot figures out what needs to re-run—no manual dependency declarations, no stale caches. It provides:
 
 - **32x faster lock file operations** through per-stage lock files
 - **Automatic code change detection** using Python introspection (no manual declarations!)
@@ -31,37 +31,9 @@ Pivot is a Python pipeline tool with automatic code change detection. Define sta
 pip install pivot
 ```
 
-```python
-# pipeline.py
-from pivot import stage
+### YAML Configuration (Recommended)
 
-@stage(deps=['data.csv'], outs=['processed.parquet'])
-def preprocess():
-    import pandas
-    df = pandas.read_csv('data.csv')
-    df = df.dropna()
-    df.to_parquet('processed.parquet')
-
-@stage(deps=['processed.parquet'], outs=['model.pkl'])
-def train():
-    import pandas
-    import pickle
-    df = pandas.read_parquet('processed.parquet')
-    model = {'rows': len(df), 'columns': len(df.columns)}
-    with open('model.pkl', 'wb') as f:
-        pickle.dump(model, f)
-```
-
-```bash
-pivot run  # Runs both stages
-pivot run  # Instant - nothing changed
-```
-
-Modify `preprocess`, and Pivot automatically re-runs both stages. Modify `train`, and only `train` re-runs.
-
-### Alternative: YAML Configuration
-
-Define pipelines in `pivot.yaml` for teams that prefer configuration files:
+Define pipelines in `pivot.yaml`:
 
 ```yaml
 # pivot.yaml
@@ -83,30 +55,31 @@ stages:
       lr: 0.01
 ```
 
-```bash
-pivot run  # Auto-discovers pivot.yaml
-```
-
-### Alternative: Programmatic Pipeline
-
-Use the `Pipeline` class for dynamic pipeline construction:
-
 ```python
-# pipeline.py
-from pivot import Pipeline
+# stages.py
+import pandas
+import pickle
 
-from stages import preprocess, train
+def preprocess():
+    df = pandas.read_csv('data.csv')
+    df = df.dropna()
+    df.to_parquet('processed.parquet')
 
-pipeline = Pipeline()
-pipeline.add_stage(preprocess, deps=['data.csv'], outs=['processed.parquet'])
-pipeline.add_stage(train, deps=['processed.parquet'], outs=['model.pkl'])
+def train():
+    df = pandas.read_parquet('processed.parquet')
+    model = {'rows': len(df), 'columns': len(df.columns)}
+    with open('model.pkl', 'wb') as f:
+        pickle.dump(model, f)
 ```
 
 ```bash
-pivot run  # Auto-discovers pipeline.py
+pivot run  # Runs both stages
+pivot run  # Instant - nothing changed
 ```
 
-**Auto-discovery order:** `pivot.yaml` → `pivot.yml` → `pipeline.py`
+Modify `preprocess`, and Pivot automatically re-runs both stages. Modify `train`, and only `train` re-runs.
+
+**Auto-discovery order:** `pivot.yaml` → `pivot.yml`
 
 ### Matrix Expansion (pivot.yaml)
 
@@ -117,10 +90,10 @@ stages:
   train:
     python: stages.train
     deps:
-      - data/clean.csv
-      - "configs/${model}.yaml"
+      data: data/clean.csv
+      config: "configs/${model}.yaml"
     outs:
-      - "models/${model}_${dataset}.pkl"
+      model: "models/${model}_${dataset}.pkl"
     matrix:
       model:
         bert:
@@ -129,8 +102,8 @@ stages:
         gpt:
           params:
             hidden_size: 1024
-          deps+:
-            - data/gpt_tokenizer.json
+          deps:
+            tokenizer+: data/gpt_tokenizer.json
       dataset: [swe, human]
 ```
 
@@ -148,9 +121,8 @@ This generates 4 stages: `train@bert_swe`, `train@bert_human`, `train@gpt_swe`, 
 def helper(x):
     return x * 2  # Change this...
 
-@stage(deps=['data.csv'])
-def process(file: str):
-    data = load(file)
+def process():
+    data = load("data.csv")
     return helper(data)  # ...and Pivot knows to re-run!
 ```
 
@@ -214,37 +186,28 @@ Stage: train
       File: src/utils.py:15
 ```
 
-### 6. Pydantic Stage Parameters
+### 6. Stage Parameters
 
-**Type-safe parameters with automatic injection:**
-
-```python
-from pydantic import BaseModel
-from pivot import stage
-
-class TrainParams(BaseModel):
-    learning_rate: float = 0.01
-    epochs: int = 100
-    batch_size: int = 32
-
-@stage(deps=['data.csv'], outs=['model.pkl'], params=TrainParams)
-def train(params: TrainParams):
-    print(f"Training with lr={params.learning_rate}")
-```
-
-**Override defaults via params.yaml:**
+**Type-safe parameters via pivot.yaml:**
 
 ```yaml
-train:
-  learning_rate: 0.001
-  epochs: 200
+# pivot.yaml
+stages:
+  train:
+    python: stages.train
+    deps:
+      - data.csv
+    outs:
+      - model.pkl
+    params:
+      learning_rate: 0.01
+      epochs: 100
+      batch_size: 32
 ```
 
 **How it works:**
 
-- Define parameters using Pydantic BaseModel with defaults
-- Pivot automatically injects the params instance into your function
-- YAML overrides take precedence over model defaults
+- Define parameters in the `params:` section of your stage
 - Parameter changes trigger re-execution (tracked in lock files)
 
 **View and compare params:**
@@ -258,22 +221,22 @@ pivot params diff --precision 4      # Control float precision
 
 ### 7. Incremental Outputs
 
-**New:** Outputs that preserve state between runs for append-only workloads:
+Outputs that preserve state between runs for append-only workloads:
 
-```python
-from pivot import stage, IncrementalOut
-
-@stage(deps=['new_data.csv'], outs=[IncrementalOut('database.db')])
-def append_to_database():
-    # database.db is restored from cache before execution
-    # Stage can append to it rather than recreating from scratch
-    import sqlite3
-    conn = sqlite3.connect('database.db')
-    # ... append new records ...
+```yaml
+# pivot.yaml
+stages:
+  append_to_database:
+    python: stages.append_to_database
+    deps:
+      - new_data.csv
+    outs:
+      - database.db:
+          incremental: true
 ```
 
 **How it works:**
-- Before execution, `IncrementalOut` restores the previous version from cache
+- Before execution, incremental outputs restore the previous version from cache
 - Stage modifies the file in place (append, update, etc.)
 - New version is cached after execution
 - Uses COPY mode (not symlinks) so stages can safely modify files
@@ -378,54 +341,53 @@ pivot data diff output.csv --no-tui --json
 
 ```python
 import pandas as pd
-from pivot import stage
-from pivot.loaders import CSV, JSON, Pickle
-from pivot.stage_def import StageDef
+from pivot import loaders
+from pivot.stage_def import StageDef, Dep, Out
 
 
 class TrainParams(StageDef):
-    class deps:
-        train_data: CSV[pd.DataFrame] = "data/train.csv"
-        config: JSON[dict] = "config.json"
+    # Deps - type-safe file loading
+    train_data: Dep[pd.DataFrame] = Dep("data/train.csv", loaders.CSV())
+    config: Dep[dict] = Dep("config.json", loaders.JSON())
 
-    class outs:
-        model: Pickle = "models/model.pkl"
-        metrics: JSON[dict] = "metrics.json"
+    # Outs - type-safe file saving
+    model: Out[dict] = Out("models/model.pkl", loaders.Pickle())
+    metrics: Out[dict] = Out("metrics.json", loaders.JSON())
 
+    # Regular params
     learning_rate: float = 0.01
     epochs: int = 100
 
 
-@stage
 def train(params: TrainParams) -> None:
     # Deps are auto-loaded before function runs
-    df = params.deps.train_data  # Returns pd.DataFrame
-    config = params.deps.config  # Returns dict
+    df = params.train_data  # Returns pd.DataFrame
+    config = params.config  # Returns dict
 
     # Train model...
     model = {"weights": df.shape, "lr": params.learning_rate}
     metrics = {"accuracy": 0.95}
 
     # Assign outputs - auto-saved after function returns
-    params.outs.model = model
-    params.outs.metrics = metrics
+    params.model = model
+    params.metrics = metrics
 ```
 
 **Benefits:**
 - **Type-safe** - IDE autocomplete, type checking for loaded data
 - **Auto-load/save** - No boilerplate file I/O code
 - **Automatic fingerprinting** - Loader code changes trigger re-runs
-- **Works with all pipeline methods** - `@stage` decorator, `pivot.yaml`, `Pipeline` class
+- **Works with pivot.yaml** - Deps/outs are extracted from StageDef
 
 **Built-in loaders:**
 
 | Loader | Load returns | Save accepts | Options |
 |--------|--------------|--------------|---------|
-| `CSV[T]` | DataFrame | DataFrame | `sep`, `index_col`, `dtype` |
-| `JSON[T]` | dict/list | dict/list | `indent` |
-| `YAML[T]` | dict/list | dict/list | - |
-| `Pickle[T]` | Any | Any | - |
-| `PathOnly` | pathlib.Path | (validates exists) | - |
+| `loaders.CSV()` | DataFrame | DataFrame | `sep`, `index_col`, `dtype` |
+| `loaders.JSON()` | dict/list | dict/list | `indent` |
+| `loaders.YAML()` | dict/list | dict/list | - |
+| `loaders.Pickle()` | Any | Any | - |
+| `loaders.PathOnly()` | pathlib.Path | (validates exists) | - |
 
 **With pivot.yaml:**
 
@@ -518,9 +480,12 @@ Full documentation available at the [Pivot Documentation Site](https://anthropic
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  User Pipeline Code (Python decorators)                     │
-│  @stage(deps=['data.csv'], outs=['model.pkl'])              │
-│  def train(lr: float = 0.01): ...                          │
+│  User Pipeline Code (pivot.yaml or StageDef classes)        │
+│  stages:                                                    │
+│    train:                                                   │
+│      python: stages.train                                   │
+│      deps: [data.csv]                                       │
+│      outs: [model.pkl]                                      │
 └─────────────────────────────────────────────────────────────┘
                          │
                          ▼
@@ -588,7 +553,7 @@ basedpyright src/
 | **Executor**              | ThreadPoolExecutor          | Warm workers + Interpreters |
 | **Explain mode**          | ❌                          | ✅ Shows WHY stages run     |
 | **YAML export**           | N/A                         | ✅ For code review          |
-| **Python-first**          | Config-first (YAML)         | Code-first (decorators)     |
+| **Python-first**          | Config-first (YAML)         | YAML + typed Python classes |
 | **Remote storage**        | S3/GCS/Azure via dvc-data   | S3 with async I/O           |
 
 ---

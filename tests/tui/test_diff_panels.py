@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from pivot import outputs, project
+from pivot import loaders, outputs, project
 from pivot.storage import cache
 from pivot.tui import diff_panels
 from pivot.types import ChangeType, LockData, OutputChange
@@ -167,8 +167,9 @@ def test_compute_output_changes_no_lock_shows_added(tmp_path: pathlib.Path) -> N
     registry_info: RegistryStageInfo = {
         "func": lambda: None,
         "name": "test_stage",
-        "deps": [],
-        "outs": [outputs.Out(path=str(output_file))],
+        "deps": {},
+        "deps_paths": [],
+        "outs": [outputs.Out(path=str(output_file), loader=loaders.PathOnly())],
         "outs_paths": [str(output_file)],
         "params": None,
         "mutex": [],
@@ -176,6 +177,8 @@ def test_compute_output_changes_no_lock_shows_added(tmp_path: pathlib.Path) -> N
         "signature": None,
         "fingerprint": {},
         "cwd": None,
+        "dep_specs": {},
+        "out_path_overrides": None,
     }
 
     result = diff_panels.compute_output_changes(None, registry_info)
@@ -195,8 +198,9 @@ def test_compute_output_changes_missing_file_shows_removed(tmp_path: pathlib.Pat
     registry_info: RegistryStageInfo = {
         "func": lambda: None,
         "name": "test_stage",
-        "deps": [],
-        "outs": [outputs.Out(path=str(output_file))],
+        "deps": {},
+        "deps_paths": [],
+        "outs": [outputs.Out(path=str(output_file), loader=loaders.PathOnly())],
         "outs_paths": [str(output_file)],
         "params": None,
         "mutex": [],
@@ -204,6 +208,8 @@ def test_compute_output_changes_missing_file_shows_removed(tmp_path: pathlib.Pat
         "signature": None,
         "fingerprint": {},
         "cwd": None,
+        "dep_specs": {},
+        "out_path_overrides": None,
     }
 
     lock_data: LockData = {
@@ -232,8 +238,9 @@ def test_compute_output_changes_unchanged(tmp_path: pathlib.Path) -> None:
     registry_info: RegistryStageInfo = {
         "func": lambda: None,
         "name": "test_stage",
-        "deps": [],
-        "outs": [outputs.Out(path=str(output_file))],
+        "deps": {},
+        "deps_paths": [],
+        "outs": [outputs.Out(path=str(output_file), loader=loaders.PathOnly())],
         "outs_paths": [str(output_file)],
         "params": None,
         "mutex": [],
@@ -241,6 +248,8 @@ def test_compute_output_changes_unchanged(tmp_path: pathlib.Path) -> None:
         "signature": None,
         "fingerprint": {},
         "cwd": None,
+        "dep_specs": {},
+        "out_path_overrides": None,
     }
 
     lock_data: LockData = {
@@ -269,9 +278,10 @@ def test_compute_output_changes_detects_output_types(tmp_path: pathlib.Path) -> 
     registry_info: RegistryStageInfo = {
         "func": lambda: None,
         "name": "test_stage",
-        "deps": [],
+        "deps": {},
+        "deps_paths": [],
         "outs": [
-            outputs.Out(path=str(out_file)),
+            outputs.Out(path=str(out_file), loader=loaders.PathOnly()),
             outputs.Metric(path=str(metric_file)),
             outputs.Plot(path=str(plot_file)),
         ],
@@ -282,6 +292,8 @@ def test_compute_output_changes_detects_output_types(tmp_path: pathlib.Path) -> 
         "signature": None,
         "fingerprint": {},
         "cwd": None,
+        "dep_specs": {},
+        "out_path_overrides": None,
     }
 
     result = diff_panels.compute_output_changes(None, registry_info)

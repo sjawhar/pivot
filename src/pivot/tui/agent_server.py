@@ -301,8 +301,9 @@ class AgentServer:
             stages.append(
                 AgentStageInfo(
                     name=name,
-                    deps=list(info["deps"]),
-                    outs=[out.path for out in info["outs"]],
+                    deps=info["deps_paths"],
+                    # Registry always stores single-file outputs (multi-file are expanded)
+                    outs=[str(out.path) for out in info["outs"]],
                 )
             )
         return AgentStagesResult(stages=stages)

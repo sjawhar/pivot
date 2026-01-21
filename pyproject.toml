@@ -51,6 +51,7 @@ build-backend = "uv_build"
 dev = [
   "basedpyright>=1.0",
   "botocore-stubs>=1.35.0",
+  "mypy>=1.19.1",
   "pandas-stubs>=2.0",
   "pivot[dvc]",
   "pivot[s3]",

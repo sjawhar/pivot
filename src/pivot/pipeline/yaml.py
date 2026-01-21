@@ -6,15 +6,14 @@ import itertools
 import re
 import typing
 from collections.abc import Callable  # noqa: TC003 Pydantic needs at runtime
-from typing import TYPE_CHECKING, Annotated, Any, TypedDict
+from typing import TYPE_CHECKING, Annotated, Any, TypedDict, TypeVar
 
 import pydantic
 import yaml
 
-from pivot import outputs, parameters, path_policy, registry, yaml_config
+from pivot import outputs, parameters, path_policy, registry, stage_def, yaml_config
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
     from pathlib import Path
 
 
@@ -22,9 +21,10 @@ class PipelineConfigError(Exception):
     """Error loading or processing pivot.yaml configuration."""
 
 
-class OutputOptions(TypedDict, total=False):
-    """Valid options for output specifications."""
+class NamedOutputOptions(TypedDict, total=False):
+    """Options for named output specifications (includes path)."""
 
+    path: str
     cache: bool
     persist: bool
     x: str  # For plots
@@ -32,41 +32,47 @@ class OutputOptions(TypedDict, total=False):
     template: str  # For plots
 
 
-# Union type: YAML can have "path.txt" or {"path.txt": {cache: false}}
-OutputSpec = str | dict[str, OutputOptions]
+# Named output value: "path", ["path1", "path2"], or {path: "path", cache: false}
+NamedOutputValue = str | list[str] | NamedOutputOptions
 
-# Output specs from Python escape hatch can also include BaseOut directly
-VariantOutputSpec = str | dict[str, OutputOptions] | outputs.BaseOut
+# Named deps value: "path" or ["path1", "path2"]
+NamedDepValue = str | list[str]
+
+# Deps/outs are always named dicts (path overrides)
+DepsSpec = dict[str, NamedDepValue]
+OutputsSpec = dict[str, NamedOutputValue]
 
 
 class VariantDict(TypedDict, total=False):
     """Variant dict structure from Python escape hatch functions."""
 
     name: str
-    deps: list[str]
-    outs: list[VariantOutputSpec]
+    deps: dict[str, str | list[str]]
+    outs: dict[str, NamedOutputValue]
     params: dict[str, Any]
     mutex: list[str]
     cwd: str
 
 
-class DimensionOverrides(pydantic.BaseModel, extra="forbid", populate_by_name=True):
-    """Overrides that can be applied per matrix dimension value."""
+class DimensionOverrides(pydantic.BaseModel):
+    """Overrides that can be applied per matrix dimension value.
 
-    deps: list[str] | None = None
-    outs: list[OutputSpec] | None = None
-    metrics: list[OutputSpec] | None = None
-    plots: list[OutputSpec] | None = None
+    Keys within deps/outs/metrics/plots dicts can end with '+' to append
+    rather than replace. For example:
+        deps:
+          tokenizer+: data/tokenizer.json  # Adds 'tokenizer' key to base deps
+          data: data/other.csv             # Replaces 'data' key in base deps
+    """
+
+    model_config = pydantic.ConfigDict(extra="forbid")  # pyright: ignore[reportUnannotatedClassAttribute]
+
+    deps: DepsSpec | None = None
+    outs: OutputsSpec | None = None
+    metrics: OutputsSpec | None = None
+    plots: OutputsSpec | None = None
     params: dict[str, Any] | None = None  # JSON-compatible values from YAML
     mutex: list[str] | None = None
     cwd: str | None = None
-
-    # Append variants (Hydra-style)
-    deps_append: list[str] | None = pydantic.Field(default=None, alias="deps+")
-    outs_append: list[OutputSpec] | None = pydantic.Field(default=None, alias="outs+")
-    metrics_append: list[OutputSpec] | None = pydantic.Field(default=None, alias="metrics+")
-    plots_append: list[OutputSpec] | None = pydantic.Field(default=None, alias="plots+")
-    mutex_append: list[str] | None = pydantic.Field(default=None, alias="mutex+")
 
 
 # Primitive types allowed in matrix dimension lists
@@ -76,15 +82,21 @@ MatrixPrimitive = str | int | float | bool
 MatrixDimension = list[MatrixPrimitive] | dict[str, DimensionOverrides | None]
 
 
-class StageConfig(pydantic.BaseModel, extra="forbid"):
-    """Configuration for a single stage in pivot.yaml."""
+class StageConfig(pydantic.BaseModel):
+    """Configuration for a single stage in pivot.yaml.
+
+    deps and outs are path overrides for annotation-defined deps/outs.
+    metrics and plots are extra outputs not declared in annotations.
+    """
+
+    model_config = pydantic.ConfigDict(extra="forbid")  # pyright: ignore[reportUnannotatedClassAttribute]
 
     python: str
-    deps: list[str] = []
-    outs: list[OutputSpec] = []
-    metrics: list[OutputSpec] = []
-    plots: list[OutputSpec] = []
-    params: dict[str, Any] = pydantic.Field(default_factory=dict)  # JSON-compatible from YAML
+    deps: DepsSpec = {}
+    outs: OutputsSpec = {}
+    metrics: OutputsSpec = {}
+    plots: OutputsSpec = {}
+    params: dict[str, Any] = {}
     mutex: list[str] = []
     cwd: str | None = None
     matrix: dict[str, MatrixDimension] | None = None
@@ -101,8 +113,10 @@ class StageConfig(pydantic.BaseModel, extra="forbid"):
         return v
 
 
-class PipelineConfig(pydantic.BaseModel, extra="forbid"):
+class PipelineConfig(pydantic.BaseModel):
     """Top-level pivot.yaml configuration."""
+
+    model_config = pydantic.ConfigDict(extra="forbid")  # pyright: ignore[reportUnannotatedClassAttribute]
 
     stages: dict[str, StageConfig]
     vars: list[str] = []  # Files to load variables from for ${var} interpolation
@@ -118,10 +132,12 @@ def _validate_callable(v: object) -> Callable[..., Any]:
 class ExpandedStage(pydantic.BaseModel):
     """A stage after matrix expansion."""
 
+    model_config = pydantic.ConfigDict(arbitrary_types_allowed=True)  # pyright: ignore[reportUnannotatedClassAttribute]
+
     name: str
     func: Annotated[Callable[..., Any], pydantic.PlainValidator(_validate_callable)]
-    deps: list[str]
-    outs: list[outputs.BaseOut]
+    dep_path_overrides: dict[str, str | list[str]]
+    out_path_overrides: dict[str, registry.OutOverride]
     params: pydantic.BaseModel | None
     mutex: list[str]
     cwd: str
@@ -201,8 +217,8 @@ def _register_stage(
             registry.REGISTRY.register(
                 func=stage.func,
                 name=stage.name,
-                deps=stage.deps,
-                outs=stage.outs,
+                dep_path_overrides=stage.dep_path_overrides or None,
+                out_path_overrides=stage.out_path_overrides or None,
                 params=stage.params,
                 mutex=stage.mutex,
                 variant=stage.variant,
@@ -223,6 +239,60 @@ def _register_stage(
         _register_simple_stage(name, config, pipeline_dir, global_vars)
 
 
+def _validate_output_type(
+    out_name: str,
+    return_out_specs: dict[str, outputs.Out[Any]],
+    expected_type: type[outputs.Out[Any]],
+    section_name: str,
+    stage_name: str,
+) -> None:
+    """Validate that a YAML output key matches the expected annotation type.
+
+    Args:
+        out_name: The output name from YAML (e.g., "metrics" in metrics: {metrics: path})
+        return_out_specs: Output specs from function return type annotation
+        expected_type: Expected Out subclass (e.g., Metric or Plot)
+        section_name: YAML section name for error messages (e.g., "metrics" or "plots")
+        stage_name: Stage name for error messages
+
+    Raises:
+        PipelineConfigError: If output name not found or wrong type
+    """
+    if out_name not in return_out_specs:
+        available = list(return_out_specs.keys()) if return_out_specs else []
+        raise PipelineConfigError(
+            f"Stage '{stage_name}': {section_name} key '{out_name}' not found in function return type annotation. Available outputs: {available}"
+        )
+
+    out_spec = return_out_specs[out_name]
+    if not isinstance(out_spec, expected_type):
+        actual_type = type(out_spec).__name__
+        raise PipelineConfigError(
+            f"Stage '{stage_name}': {section_name} key '{out_name}' must be annotated with {expected_type.__name__}, but found {actual_type}"
+        )
+
+
+def _process_typed_output_section(
+    section: OutputsSpec,
+    out_path_overrides: dict[str, registry.OutOverride],
+    return_out_specs: dict[str, outputs.Out[Any]],
+    expected_type: type[outputs.Out[Any]],
+    section_name: str,
+    stage_name: str,
+    global_vars: dict[str, str],
+) -> None:
+    """Process metrics or plots section, validating types and adding to out_path_overrides."""
+    for out_name, value in section.items():
+        _validate_output_type(out_name, return_out_specs, expected_type, section_name, stage_name)
+        if out_name in out_path_overrides:
+            raise PipelineConfigError(
+                f"Stage '{stage_name}': output '{out_name}' specified in both 'outs' and '{section_name}' sections"
+            )
+        out_path_overrides.update(
+            _normalize_out_path_overrides({out_name: value}, global_vars, stage_name)
+        )
+
+
 def _register_simple_stage(
     name: str,
     config: StageConfig,
@@ -233,25 +303,37 @@ def _register_simple_stage(
     func = _import_function(config.python)
     cwd = config.cwd or str(pipeline_dir)
 
-    # Interpolate global vars in paths
-    deps = [_interpolate(d, global_vars, name) for d in config.deps]
-    outs_raw = [_interpolate_out(o, global_vars, name) for o in config.outs]
-    metrics_raw = [_interpolate_out(m, global_vars, name) for m in config.metrics]
-    plots_raw = [_interpolate_out(p, global_vars, name) for p in config.plots]
-    cwd = _interpolate(cwd, global_vars, name)
+    # Interpolate deps path overrides
+    dep_path_overrides = _normalize_deps_spec(config.deps, global_vars, name)
 
-    outs_spec = (
-        _normalize_output_specs(outs_raw, outputs.Out)
-        + _normalize_output_specs(metrics_raw, outputs.Metric)
-        + _normalize_output_specs(plots_raw, outputs.Plot)
+    # Interpolate outs path overrides
+    out_path_overrides = _normalize_out_path_overrides(config.outs, global_vars, name)
+
+    # Get return output specs for type validation
+    return_out_specs = stage_def.get_output_specs_from_return(func)
+
+    # Process metrics and plots sections
+    _process_typed_output_section(
+        config.metrics,
+        out_path_overrides,
+        return_out_specs,
+        outputs.Metric,
+        "metrics",
+        name,
+        global_vars,
     )
+    _process_typed_output_section(
+        config.plots, out_path_overrides, return_out_specs, outputs.Plot, "plots", name, global_vars
+    )
+
+    cwd = _interpolate(cwd, global_vars, name)
     params_instance = _resolve_params(func, config.params, name)
 
     registry.REGISTRY.register(
         func=func,
         name=name,
-        deps=deps,
-        outs=outs_spec,
+        dep_path_overrides=dep_path_overrides or None,
+        out_path_overrides=out_path_overrides or None,
         params=params_instance,
         mutex=config.mutex,
         cwd=cwd,
@@ -268,21 +350,28 @@ def _register_variant_from_dict(
     variant_name = variant.get("name", "default")
     full_name = f"{base_name}@{variant_name}"
 
-    deps = variant.get("deps", [])
-    outs_raw = variant.get("outs", [])
+    deps: DepsSpec = variant.get("deps") or {}
+    outs_raw: OutputsSpec = variant.get("outs") or {}
     params_dict = variant.get("params", {})
     mutex = variant.get("mutex", [])
     cwd_raw = variant.get("cwd")
     cwd = cwd_raw if cwd_raw is not None else str(pipeline_dir)
 
-    outs_spec = _normalize_output_specs(outs_raw, outputs.Out)
+    # YAML deps are path overrides only
+    dep_path_overrides: dict[str, str | list[str]] = {}
+    for dep_name, dep_value in deps.items():
+        dep_path_overrides[dep_name] = dep_value
+
+    # YAML outs are path overrides only
+    out_path_overrides = _normalize_out_path_overrides(outs_raw, {}, full_name)
+
     params_instance = _resolve_params(func, params_dict, full_name)
 
     registry.REGISTRY.register(
         func=func,
         name=full_name,
-        deps=deps,
-        outs=outs_spec,
+        dep_path_overrides=dep_path_overrides or None,
+        out_path_overrides=out_path_overrides or None,
         params=params_instance,
         mutex=mutex,
         variant=variant_name,
@@ -320,10 +409,11 @@ def _expand_matrix(
         variant_name = _generate_variant_name(name_template, dim_names, string_values)
         full_name = f"{base_name}@{variant_name}"
 
-        deps = list(config.deps)
-        outs_raw = list(config.outs)
-        metrics_raw = list(config.metrics)
-        plots_raw = list(config.plots)
+        # Copy deps/outs dicts for this variant
+        deps: DepsSpec = dict(config.deps)
+        outs_raw: OutputsSpec = dict(config.outs)
+        metrics_raw: OutputsSpec = dict(config.metrics)
+        plots_raw: OutputsSpec = dict(config.plots)
         params_dict = dict(config.params)
         mutex = list(config.mutex)
         cwd: str | None = config.cwd
@@ -339,29 +429,44 @@ def _expand_matrix(
         # Merge global vars with matrix values (matrix takes precedence)
         all_vars = {**global_vars, **string_values}
 
-        # Use merged values for path interpolation (deps, outs, cwd)
-        deps = [_interpolate(d, all_vars, full_name) for d in deps]
-        outs_raw = [_interpolate_out(o, all_vars, full_name) for o in outs_raw]
-        metrics_raw = [_interpolate_out(m, all_vars, full_name) for m in metrics_raw]
-        plots_raw = [_interpolate_out(p, all_vars, full_name) for p in plots_raw]
+        # Interpolate path overrides
+        dep_path_overrides = _normalize_deps_spec(deps, all_vars, full_name)
+        out_path_overrides = _normalize_out_path_overrides(outs_raw, all_vars, full_name)
         cwd = _interpolate(cwd, all_vars, full_name)
+
+        # Get return output specs for type validation
+        return_out_specs = stage_def.get_output_specs_from_return(func)
+
+        # Process metrics and plots sections
+        _process_typed_output_section(
+            metrics_raw,
+            out_path_overrides,
+            return_out_specs,
+            outputs.Metric,
+            "metrics",
+            full_name,
+            all_vars,
+        )
+        _process_typed_output_section(
+            plots_raw,
+            out_path_overrides,
+            return_out_specs,
+            outputs.Plot,
+            "plots",
+            full_name,
+            all_vars,
+        )
 
         # Use typed values for params interpolation (preserves int/float/bool)
         params_dict = {k: _interpolate_value(v, typed_values) for k, v in params_dict.items()}
-
-        outs_spec = (
-            _normalize_output_specs(outs_raw, outputs.Out)
-            + _normalize_output_specs(metrics_raw, outputs.Metric)
-            + _normalize_output_specs(plots_raw, outputs.Plot)
-        )
         params_instance = _resolve_params(func, params_dict, full_name)
 
         expanded.append(
             ExpandedStage(
                 name=full_name,
                 func=func,
-                deps=deps,
-                outs=outs_spec,
+                dep_path_overrides=dep_path_overrides,
+                out_path_overrides=out_path_overrides,
                 params=params_instance,
                 mutex=mutex,
                 cwd=cwd,
@@ -439,47 +544,58 @@ def _generate_variant_name(
     return "_".join(dim_values[d] for d in dim_names)
 
 
+_V = TypeVar("_V")
+
+
+def _merge_named_dict(base: dict[str, _V], override: dict[str, _V] | None) -> dict[str, _V]:
+    """Merge named dicts with per-key override/add logic.
+
+    Keys in override dict ending with '+' are added with the '+' stripped.
+    Keys without '+' replace the corresponding key in base.
+    """
+    if override is None:
+        return base
+
+    result = dict(base)
+    for key, value in override.items():
+        if key.endswith("+"):
+            result[key[:-1]] = value
+        else:
+            result[key] = value
+    return result
+
+
 def _apply_overrides(
-    deps: list[str],
-    outs: list[OutputSpec],
-    metrics: list[OutputSpec],
-    plots: list[OutputSpec],
+    deps: DepsSpec,
+    outs: OutputsSpec,
+    metrics: OutputsSpec,
+    plots: OutputsSpec,
     params: dict[str, Any],
     mutex: list[str],
     cwd: str | None,
     overrides: DimensionOverrides,
 ) -> tuple[
-    list[str],
-    list[OutputSpec],
-    list[OutputSpec],
-    list[OutputSpec],
+    DepsSpec,
+    OutputsSpec,
+    OutputsSpec,
+    OutputsSpec,
     dict[str, Any],
     list[str],
     str | None,
 ]:
-    """Apply dimension overrides to stage config."""
-    if overrides.deps is not None:
-        deps = overrides.deps
-    if overrides.deps_append:
-        deps = deps + overrides.deps_append
-    if overrides.outs is not None:
-        outs = overrides.outs
-    if overrides.outs_append:
-        outs = outs + overrides.outs_append
-    if overrides.metrics is not None:
-        metrics = overrides.metrics
-    if overrides.metrics_append:
-        metrics = metrics + overrides.metrics_append
-    if overrides.plots is not None:
-        plots = overrides.plots
-    if overrides.plots_append:
-        plots = plots + overrides.plots_append
+    """Apply dimension overrides to stage config.
+
+    Per-key override syntax: keys ending with '+' are appended, others replace.
+    """
+    deps = _merge_named_dict(deps, overrides.deps)
+    outs = _merge_named_dict(outs, overrides.outs)
+    metrics = _merge_named_dict(metrics, overrides.metrics)
+    plots = _merge_named_dict(plots, overrides.plots)
+
     if overrides.params is not None:
         params = {**params, **overrides.params}
     if overrides.mutex is not None:
         mutex = overrides.mutex
-    if overrides.mutex_append:
-        mutex = mutex + overrides.mutex_append
     if overrides.cwd is not None:
         cwd = overrides.cwd
 
@@ -498,13 +614,6 @@ def _interpolate(s: str, values: dict[str, str], stage_name: str) -> str:
             f"Stage '{stage_name}': unresolved variable(s) in '{s}': {remaining}"
         )
     return result
-
-
-def _interpolate_out(out: OutputSpec, values: dict[str, str], stage_name: str) -> OutputSpec:
-    """Interpolate ${dim} in output spec (string or dict)."""
-    if isinstance(out, str):
-        return _interpolate(out, values, stage_name)
-    return {_interpolate(k, values, stage_name): v for k, v in out.items()}
 
 
 def _interpolate_value(value: Any, values: dict[str, MatrixPrimitive]) -> Any:
@@ -533,41 +642,45 @@ def _interpolate_value(value: Any, values: dict[str, MatrixPrimitive]) -> Any:
     return value
 
 
-def _normalize_output_specs(
-    specs: Sequence[VariantOutputSpec], out_cls: type[outputs.BaseOut]
-) -> list[outputs.BaseOut]:
-    """Convert output specs (str, dict, or BaseOut) to BaseOut objects."""
-    result = list[outputs.BaseOut]()
-    for spec in specs:
-        if isinstance(spec, str):
-            result.append(out_cls(path=spec))
-        elif isinstance(spec, dict):
-            for path, opts in spec.items():
-                result.append(_make_output_with_options(out_cls, path, opts))
+def _normalize_deps_spec(
+    deps: DepsSpec, values: dict[str, str], stage_name: str
+) -> dict[str, str | list[str]]:
+    """Interpolate deps spec values."""
+    result = dict[str, str | list[str]]()
+    for name, paths in deps.items():
+        if isinstance(paths, list):
+            result[name] = [_interpolate(p, values, stage_name) for p in paths]
         else:
-            # spec is outputs.BaseOut (from Python escape hatch variants)
-            result.append(spec)
+            result[name] = _interpolate(paths, values, stage_name)
     return result
 
 
-def _make_output_with_options(
-    out_cls: type[outputs.BaseOut], path: str, opts: OutputOptions
-) -> outputs.BaseOut:
-    """Create an output object, handling class-specific options."""
-    if out_cls is outputs.Plot:
-        return outputs.Plot(
-            path=path,
-            cache=opts.get("cache", True),
-            persist=opts.get("persist", True),
-            x=opts.get("x"),
-            y=opts.get("y"),
-            template=opts.get("template"),
-        )
-    return out_cls(
-        path=path,
-        cache=opts.get("cache", True),
-        persist=opts.get("persist", True),
-    )
+def _normalize_out_path_overrides(
+    outs: OutputsSpec, values: dict[str, str], stage_name: str
+) -> dict[str, registry.OutOverride]:
+    """Extract path and option overrides from outputs spec."""
+    result = dict[str, registry.OutOverride]()
+    for name, value in outs.items():
+        if isinstance(value, str):
+            result[name] = registry.OutOverride(path=_interpolate(value, values, stage_name))
+        elif isinstance(value, list):
+            result[name] = registry.OutOverride(
+                path=[_interpolate(p, values, stage_name) for p in value]
+            )
+        else:
+            # Dict with options - extract path and options
+            path = value.get("path")
+            if path is None:
+                raise PipelineConfigError(
+                    f"Stage '{stage_name}': named output '{name}' missing 'path' field"
+                )
+            override = registry.OutOverride(path=_interpolate(path, values, stage_name))
+            if "cache" in value:
+                override["cache"] = value["cache"]
+            if "persist" in value:
+                override["persist"] = value["persist"]
+            result[name] = override
+    return result
 
 
 def _import_function(import_path: str) -> Callable[..., Any]:

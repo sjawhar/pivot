@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 from pydantic import BaseModel
 
-from pivot import dag, outputs
+from pivot import dag, loaders, outputs
 from pivot.exceptions import CyclicGraphError, DependencyNotFoundError
 from pivot.registry import RegistryStageInfo
 
@@ -21,8 +21,9 @@ def _create_stage(name: str, deps: list[str], outs: list[str]) -> RegistryStageI
     return RegistryStageInfo(
         func=lambda: None,
         name=name,
-        deps=deps,
-        outs=[outputs.Out(path=out) for out in outs],
+        deps={f"_{i}": d for i, d in enumerate(deps)},
+        deps_paths=deps,
+        outs=[outputs.Out(path=out, loader=loaders.PathOnly()) for out in outs],
         outs_paths=outs,
         params=None,
         mutex=[],
@@ -30,6 +31,8 @@ def _create_stage(name: str, deps: list[str], outs: list[str]) -> RegistryStageI
         signature=None,
         fingerprint={},
         cwd=None,
+        dep_specs={},
+        out_path_overrides=None,
     )
 
 

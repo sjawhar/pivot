@@ -1,18 +1,43 @@
 # pyright: reportUnusedFunction=false
 
+import inspect
 import pathlib
+from typing import Annotated, TypedDict
 
 import pytest
 import yaml
 
-from pivot import dvc_compat, outputs, registry
+from helpers import register_test_stage
+from pivot import dvc_compat, loaders, outputs
 from pivot.exceptions import DVCImportError, ExportError
+from pivot.registry import REGISTRY, RegistryStageInfo
+
+# =============================================================================
+# Output TypedDicts for annotation-based stages
+# =============================================================================
 
 
+class _SimpleOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
+
+
+# =============================================================================
 # Module-level functions for export tests (can't export from __main__)
+# =============================================================================
+
+
 def exportable_stage() -> None:
     """A stage that can be exported."""
     pass
+
+
+def exportable_with_dep(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _SimpleOutputs:
+    """A stage with dep and out for simple export test."""
+    _ = input_file
+    pathlib.Path("output.txt").write_bytes(b"")
+    return {"output": pathlib.Path("output.txt")}
 
 
 def exportable_with_params(learning_rate: float = 0.01, epochs: int = 100) -> None:
@@ -118,14 +143,14 @@ def test_extract_param_defaults_partial() -> None:
 
 def test_build_out_entry_out_default_returns_string() -> None:
     """Out with default cache=True returns just the path string."""
-    out = outputs.Out(path="model.pkl")
+    out = outputs.Out(path="model.pkl", loader=loaders.PathOnly())
     result = dvc_compat._build_out_entry(out, "model.pkl")
     assert result == "model.pkl"
 
 
 def test_build_out_entry_out_cache_false_returns_dict() -> None:
     """Out with cache=False returns dict with cache option."""
-    out = outputs.Out(path="model.pkl", cache=False)
+    out = outputs.Out(path="model.pkl", loader=loaders.PathOnly(), cache=False)
     result = dvc_compat._build_out_entry(out, "model.pkl")
     assert result == {"model.pkl": {"cache": False}}
 
@@ -153,7 +178,7 @@ def test_build_out_entry_plot_with_options() -> None:
 
 def test_build_out_entry_persist_option() -> None:
     """Persist option should be included when True."""
-    out = outputs.Out(path="model.pkl", persist=True)
+    out = outputs.Out(path="model.pkl", loader=loaders.PathOnly(), persist=True)
     result = dvc_compat._build_out_entry(out, "model.pkl")
     assert result == {"model.pkl": {"persist": True}}
 
@@ -166,12 +191,7 @@ def test_export_simple_stage(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyP
     # Mock project root
     monkeypatch.setattr("pivot.project.get_project_root", lambda: tmp_path)
 
-    registry.REGISTRY.register(
-        exportable_stage,
-        name="my_stage",
-        deps=[str(tmp_path / "input.txt")],
-        outs=[str(tmp_path / "output.txt")],
-    )
+    register_test_stage(exportable_with_dep, name="my_stage")
 
     dvc_yaml_path = tmp_path / "dvc.yaml"
     result = dvc_compat.export_dvc_yaml(dvc_yaml_path)
@@ -180,7 +200,7 @@ def test_export_simple_stage(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyP
     assert "my_stage" in result["stages"]
     stage = result["stages"]["my_stage"]
     assert "cmd" in stage
-    assert "exportable_stage" in stage["cmd"]
+    assert "exportable_with_dep" in stage["cmd"]
     assert stage["deps"] == ["input.txt"]
     assert stage["outs"] == ["output.txt"]
 
@@ -195,15 +215,31 @@ def test_export_with_rich_outputs(tmp_path: pathlib.Path, monkeypatch: pytest.Mo
     """Should separate Out/Metric/Plot into correct sections."""
     monkeypatch.setattr("pivot.dvc_compat.project.get_project_root", lambda: tmp_path)
 
-    registry.REGISTRY.register(
-        exportable_stage,
+    # Directly create registry entry with rich output types (Metric, Plot)
+    # since annotation-based registration only creates Out types
+    REGISTRY._stages["train"] = RegistryStageInfo(
         name="train",
-        deps=[],
+        func=exportable_stage,
+        deps={},
+        deps_paths=[],
         outs=[
-            outputs.Out(path=str(tmp_path / "model.pkl")),
+            outputs.Out(path=str(tmp_path / "model.pkl"), loader=loaders.PathOnly()),
             outputs.Metric(path=str(tmp_path / "metrics.json")),
             outputs.Plot(path=str(tmp_path / "loss.csv"), x="epoch", y="loss"),
         ],
+        outs_paths=[
+            str(tmp_path / "model.pkl"),
+            str(tmp_path / "metrics.json"),
+            str(tmp_path / "loss.csv"),
+        ],
+        params=None,
+        mutex=[],
+        variant=None,
+        signature=inspect.signature(exportable_stage),
+        fingerprint={},
+        cwd=None,
+        dep_specs={},
+        out_path_overrides=None,
     )
 
     result = dvc_compat.export_dvc_yaml(tmp_path / "dvc.yaml")
@@ -220,12 +256,7 @@ def test_export_generates_params_yaml(
     """Should generate params.yaml with function defaults."""
     monkeypatch.setattr("pivot.dvc_compat.project.get_project_root", lambda: tmp_path)
 
-    registry.REGISTRY.register(
-        exportable_with_params,
-        name="train",
-        deps=[],
-        outs=[],
-    )
+    register_test_stage(exportable_with_params, name="train")
 
     dvc_compat.export_dvc_yaml(tmp_path / "dvc.yaml")
 
@@ -241,12 +272,7 @@ def test_export_references_params(tmp_path: pathlib.Path, monkeypatch: pytest.Mo
     """Stage should reference params from params.yaml."""
     monkeypatch.setattr("pivot.dvc_compat.project.get_project_root", lambda: tmp_path)
 
-    registry.REGISTRY.register(
-        exportable_with_params,
-        name="train",
-        deps=[],
-        outs=[],
-    )
+    register_test_stage(exportable_with_params, name="train")
 
     result = dvc_compat.export_dvc_yaml(tmp_path / "dvc.yaml")
     stage = result["stages"]["train"]
@@ -272,7 +298,7 @@ def test_export_missing_stages_raises_error(
     """Should raise error when requested stages don't exist."""
     monkeypatch.setattr("pivot.dvc_compat.project.get_project_root", lambda: tmp_path)
 
-    registry.REGISTRY.register(exportable_stage, name="stage1", deps=[], outs=[])
+    register_test_stage(exportable_stage, name="stage1")
 
     with pytest.raises(ExportError, match="Stages not found.*nonexistent"):
         dvc_compat.export_dvc_yaml(tmp_path / "dvc.yaml", stages=["stage1", "nonexistent"])
@@ -282,8 +308,8 @@ def test_export_subset_of_stages(tmp_path: pathlib.Path, monkeypatch: pytest.Mon
     """Should export only specified stages."""
     monkeypatch.setattr("pivot.dvc_compat.project.get_project_root", lambda: tmp_path)
 
-    registry.REGISTRY.register(exportable_stage, name="stage1", deps=[], outs=[])
-    registry.REGISTRY.register(exportable_with_params, name="stage2", deps=[], outs=[])
+    register_test_stage(exportable_stage, name="stage1")
+    register_test_stage(exportable_with_params, name="stage2")
 
     result = dvc_compat.export_dvc_yaml(tmp_path / "dvc.yaml", stages=["stage1"])
 
@@ -295,11 +321,23 @@ def test_export_out_cache_false(tmp_path: pathlib.Path, monkeypatch: pytest.Monk
     """Out with cache=False should have cache: false in yaml."""
     monkeypatch.setattr("pivot.dvc_compat.project.get_project_root", lambda: tmp_path)
 
-    registry.REGISTRY.register(
-        exportable_stage,
+    # Directly create registry entry with Out(cache=False)
+    # since annotation-based registration always sets cache=True
+    REGISTRY._stages["stage"] = RegistryStageInfo(
         name="stage",
-        deps=[],
-        outs=[outputs.Out(path=str(tmp_path / "file.txt"), cache=False)],
+        func=exportable_stage,
+        deps={},
+        deps_paths=[],
+        outs=[outputs.Out(path=str(tmp_path / "file.txt"), loader=loaders.PathOnly(), cache=False)],
+        outs_paths=[str(tmp_path / "file.txt")],
+        params=None,
+        mutex=[],
+        variant=None,
+        signature=inspect.signature(exportable_stage),
+        fingerprint={},
+        cwd=None,
+        dep_specs={},
+        out_path_overrides=None,
     )
 
     result = dvc_compat.export_dvc_yaml(tmp_path / "dvc.yaml")
@@ -369,7 +407,7 @@ def test_stage_spec_creation() -> None:
         name="train",
         cmd="python train.py",
         deps=["data.csv"],
-        outs=[outputs.Out(path="model.pkl")],
+        outs=[outputs.Out(path="model.pkl", loader=loaders.PathOnly())],
         params={"lr": 0.01},
         frozen=True,
         desc="Training stage",

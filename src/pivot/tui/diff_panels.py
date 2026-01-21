@@ -448,7 +448,7 @@ class InputDiffPanel(_SelectableExpandablePanel):
             self._explanation = explain.get_stage_explanation(
                 stage_name=stage_name,
                 fingerprint=self._registry_info["fingerprint"],
-                deps=self._registry_info["deps"],
+                deps=self._registry_info["deps_paths"],
                 params_instance=self._registry_info["params"],
                 overrides=parameters.load_params_yaml(),
                 cache_dir=cache_dir,
@@ -477,7 +477,7 @@ class InputDiffPanel(_SelectableExpandablePanel):
 
         # Add unchanged deps if no changes
         if not self._dep_by_path and self._registry_info:
-            for dep_path in self._registry_info["deps"]:
+            for dep_path in self._registry_info["deps_paths"]:
                 items.append(f"dep:{dep_path}")
 
         # Add param items

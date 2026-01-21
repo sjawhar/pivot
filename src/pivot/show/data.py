@@ -527,8 +527,8 @@ def get_data_outputs_from_registry() -> dict[str, str]:
         info = registry.REGISTRY.get(stage_name)
         for out in info["outs"]:
             # Only include Out types that are data files (not Metric, Plot, etc.)
-            if isinstance(out, outputs.Out) and not isinstance(out, (outputs.Metric, outputs.Plot)):
-                abs_path = str(project.normalize_path(out.path))
+            if not isinstance(out, (outputs.Metric, outputs.Plot)):
+                abs_path = str(project.normalize_path(cast("str", out.path)))
                 rel_path = project.to_relative_path(abs_path, proj_root)
                 # Check if it's a supported data format
                 fmt = detect_format(pathlib.Path(rel_path))
@@ -553,8 +553,8 @@ def get_data_hashes_from_head() -> dict[str, str | None]:
     for stage_name in registry.REGISTRY.list_stages():
         info = registry.REGISTRY.get(stage_name)
         for out in info["outs"]:
-            if isinstance(out, outputs.Out) and not isinstance(out, (outputs.Metric, outputs.Plot)):
-                abs_path = str(project.normalize_path(out.path))
+            if not isinstance(out, (outputs.Metric, outputs.Plot)):
+                abs_path = str(project.normalize_path(cast("str", out.path)))
                 rel_path = project.to_relative_path(abs_path, proj_root)
                 fmt = detect_format(pathlib.Path(rel_path))
                 if fmt != DataFileFormat.UNKNOWN:

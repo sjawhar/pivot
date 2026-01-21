@@ -1,14 +1,50 @@
 from __future__ import annotations
 
 import json
+import pathlib
+from typing import Annotated, TypedDict
 
 import click
 import click.testing
 import pytest
 
-from pivot import exceptions, registry
+from helpers import register_test_stage
+from pivot import exceptions, loaders, outputs
 from pivot.cli import CliContext
 from pivot.cli import helpers as cli_helpers
+
+
+class _StageAOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("a.txt", loaders.PathOnly())]
+
+
+class _StageBOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("b.txt", loaders.PathOnly())]
+
+
+class _KnownStageOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("out.txt", loaders.PathOnly())]
+
+
+class _ValidStageOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("out.txt", loaders.PathOnly())]
+
+
+def _stage_a_func() -> _StageAOutputs:
+    return _StageAOutputs(output=pathlib.Path("a.txt"))
+
+
+def _stage_b_func() -> _StageBOutputs:
+    return _StageBOutputs(output=pathlib.Path("b.txt"))
+
+
+def _known_stage_func() -> _KnownStageOutputs:
+    return _KnownStageOutputs(output=pathlib.Path("out.txt"))
+
+
+def _valid_stage_func() -> _ValidStageOutputs:
+    return _ValidStageOutputs(output=pathlib.Path("out.txt"))
+
 
 # =============================================================================
 # validate_stages_exist Tests
@@ -27,15 +63,15 @@ def test_validate_stages_exist_with_empty_list() -> None:
 
 def test_validate_stages_exist_with_valid_stages() -> None:
     """validate_stages_exist passes for registered stages."""
-    registry.REGISTRY.register(lambda: None, name="stage_a", deps=[], outs=["a.txt"])
-    registry.REGISTRY.register(lambda: None, name="stage_b", deps=[], outs=["b.txt"])
+    register_test_stage(_stage_a_func, name="stage_a")
+    register_test_stage(_stage_b_func, name="stage_b")
 
     cli_helpers.validate_stages_exist(["stage_a", "stage_b"])
 
 
 def test_validate_stages_exist_raises_for_unknown_stage() -> None:
     """validate_stages_exist raises StageNotFoundError for unknown stages."""
-    registry.REGISTRY.register(lambda: None, name="known_stage", deps=[], outs=["out.txt"])
+    register_test_stage(_known_stage_func, name="known_stage")
 
     with pytest.raises(exceptions.StageNotFoundError) as exc_info:
         cli_helpers.validate_stages_exist(["known_stage", "unknown_stage"])
@@ -45,7 +81,7 @@ def test_validate_stages_exist_raises_for_unknown_stage() -> None:
 
 def test_validate_stages_exist_raises_for_multiple_unknown() -> None:
     """validate_stages_exist includes all unknown stages in error."""
-    registry.REGISTRY.register(lambda: None, name="valid", deps=[], outs=["out.txt"])
+    register_test_stage(_valid_stage_func, name="valid")
 
     with pytest.raises(exceptions.StageNotFoundError) as exc_info:
         cli_helpers.validate_stages_exist(["invalid1", "invalid2"])

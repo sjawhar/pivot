@@ -1,10 +1,72 @@
 import pathlib
+from typing import Annotated, TypedDict
 
 import click.testing
 
-from pivot import cli, project, stage
+from helpers import register_test_stage
+from pivot import cli, loaders, outputs, project
 from pivot.registry import REGISTRY
 from pivot.storage import track
+
+# =============================================================================
+# Output TypedDicts for annotation-based stages
+# =============================================================================
+
+
+class _OutputsDir(TypedDict):
+    outputs: Annotated[pathlib.Path, outputs.Out("outputs/", loaders.PathOnly())]
+
+
+class _ModelPkl(TypedDict):
+    model: Annotated[pathlib.Path, outputs.Out("model.pkl", loaders.PathOnly())]
+
+
+class _OutputsLinkDir(TypedDict):
+    outputs: Annotated[pathlib.Path, outputs.Out("outputs_link/", loaders.PathOnly())]
+
+
+class _Link1Csv(TypedDict):
+    link: Annotated[pathlib.Path, outputs.Out("link1.csv", loaders.PathOnly())]
+
+
+class _ModelLinkPkl(TypedDict):
+    model: Annotated[pathlib.Path, outputs.Out("data/model_link.pkl", loaders.PathOnly())]
+
+
+class _RealDataCsv(TypedDict):
+    data: Annotated[pathlib.Path, outputs.Out("real/data.csv", loaders.PathOnly())]
+
+
+# =============================================================================
+# Stage functions with annotation-based outputs
+# =============================================================================
+
+
+def _train_outputs_dir() -> _OutputsDir:
+    pathlib.Path("outputs").mkdir(exist_ok=True)
+    return {"outputs": pathlib.Path("outputs")}
+
+
+def _train_model_pkl() -> _ModelPkl:
+    pathlib.Path("model.pkl").write_bytes(b"model")
+    return {"model": pathlib.Path("model.pkl")}
+
+
+def _process_outputs_link() -> _OutputsLinkDir:
+    return {"outputs": pathlib.Path("outputs_link")}
+
+
+def _produce_link1() -> _Link1Csv:
+    return {"link": pathlib.Path("link1.csv")}
+
+
+def _train_model_link() -> _ModelLinkPkl:
+    return {"model": pathlib.Path("data/model_link.pkl")}
+
+
+def _process_real_data() -> _RealDataCsv:
+    return {"data": pathlib.Path("real/data.csv")}
+
 
 # =============================================================================
 # Basic Track Command Tests
@@ -196,9 +258,7 @@ def test_track_file_in_stage_output_dir_raises_error(
         (output_dir / "model.pkl").write_bytes(b"model")
 
         # Register a stage with directory output
-        @stage(deps=[], outs=["outputs/"])
-        def train() -> None:
-            pass
+        register_test_stage(_train_outputs_dir, name="train")
 
         # Try to track a file within that output directory
         result = runner.invoke(cli.cli, ["track", "outputs/model.pkl"])
@@ -224,9 +284,7 @@ def test_track_stage_output_raises_error(
         pathlib.Path("model.pkl").write_bytes(b"model")
 
         # Register a stage with this file as output
-        @stage(deps=[], outs=["model.pkl"])
-        def train() -> None:
-            pass
+        register_test_stage(_train_model_pkl, name="train")
 
         # Try to track the stage output
         result = runner.invoke(cli.cli, ["track", "model.pkl"])
@@ -325,9 +383,7 @@ def test_track_symlink_to_stage_output_file_rejected(
         pathlib.Path("model.pkl").write_bytes(b"model")
 
         # Register stage with this file as output
-        @stage(deps=[], outs=["model.pkl"])
-        def train() -> None:
-            pass
+        register_test_stage(_train_model_pkl, name="train")
 
         # Create symlink pointing to the stage output
         pathlib.Path("model_link.pkl").symlink_to("model.pkl")
@@ -360,10 +416,8 @@ def test_track_symlink_to_stage_output_directory_rejected(
         output_dir.mkdir()
         (output_dir / "results.txt").write_text("data")
 
-        # Register stage with directory as output
-        @stage(deps=[], outs=["outputs/"])
-        def process() -> None:
-            pass
+        # Register stage with directory as output (outputs/)
+        register_test_stage(_train_outputs_dir, name="process")
 
         # Create symlink pointing to the output directory
         pathlib.Path("output_link").symlink_to("outputs")
@@ -395,9 +449,7 @@ def test_track_file_inside_symlinked_stage_output_rejected(
         pathlib.Path("outputs_link").symlink_to("real_outputs")
 
         # Register stage with symlinked path as output
-        @stage(deps=[], outs=["outputs_link/"])
-        def train() -> None:
-            pass
+        register_test_stage(_process_outputs_link, name="train")
 
         # Try to track file via the real path
         result = runner.invoke(cli.cli, ["track", "real_outputs/model.pkl"])
@@ -446,9 +498,7 @@ def test_track_symlink_aliasing_same_file_different_paths(
         pathlib.Path("link2.csv").symlink_to("real_data.csv")
 
         # Register stage with one symlink as output
-        @stage(deps=[], outs=["link1.csv"])
-        def produce() -> None:
-            pass
+        register_test_stage(_produce_link1, name="produce")
 
         # Try to track the other symlink (points to same file)
         result = runner.invoke(cli.cli, ["track", "link2.csv"])
@@ -479,9 +529,7 @@ def test_track_parent_directory_with_symlinked_stage_output(
         symlink.symlink_to("real_model.pkl")
 
         # Register stage with symlink as output
-        @stage(deps=[], outs=["data/model_link.pkl"])
-        def train() -> None:
-            pass
+        register_test_stage(_train_model_link, name="train")
 
         # Try to track parent directory (contains stage output)
         result = runner.invoke(cli.cli, ["track", "data"])
@@ -507,9 +555,7 @@ def test_track_with_normalized_vs_resolved_paths(
         pathlib.Path("link_to_real").symlink_to("real")
 
         # Register stage with real path
-        @stage(deps=[], outs=["real/data.csv"])
-        def process() -> None:
-            pass
+        register_test_stage(_process_real_data, name="process")
 
         # Try to track via symlinked path
         result = runner.invoke(cli.cli, ["track", "link_to_real/data.csv"])

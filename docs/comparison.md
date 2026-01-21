@@ -18,7 +18,7 @@ How Pivot compares to other pipeline and workflow tools.
 | Per-stage locks | Parallel-safe writes | Single dvc.lock | N/A | N/A |
 | Remote storage | S3 | S3, GCS, Azure, SSH | Cloud-native | Cloud-native |
 | **Configuration** | | | | |
-| Pure Python | Decorators only | YAML + scripts | Decorators | Decorators |
+| Pure Python | YAML + typed classes | YAML + scripts | Decorators | Decorators |
 | Type-safe parameters | Pydantic models | No | Pydantic | Yes |
 | **Ecosystem** | | | | |
 | Web UI | Planned | DVC Studio | Built-in | Built-in |
@@ -57,7 +57,6 @@ Most tools hash command strings or explicit inputs. Pivot parses your Python fun
 def helper(x):
     return x * 2  # Change this...
 
-@stage(deps=['data.csv'])
 def process():
     return helper(load())  # ...Pivot detects it!
 ```

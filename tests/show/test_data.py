@@ -1241,7 +1241,7 @@ def test_get_schema_unsupported(tmp_path: Path) -> None:
 
 def test_get_data_outputs_from_registry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Get data outputs from mocked registry."""
-    from pivot import outputs, project, registry
+    from pivot import loaders, outputs, project, registry
 
     # Mock project root
     monkeypatch.setattr(project, "_project_root_cache", tmp_path)
@@ -1254,14 +1254,17 @@ def test_get_data_outputs_from_registry(tmp_path: Path, monkeypatch: pytest.Monk
         def get(self, name: str) -> dict[str, object]:
             if name == "process_data":
                 return {
-                    "outs": [outputs.Out("output.csv")],
+                    "outs": [outputs.Out("output.csv", loader=loaders.PathOnly())],
                     "deps": [],
                     "func": lambda: None,
                     "params": None,
                 }
             elif name == "train_model":
                 return {
-                    "outs": [outputs.Out("model.pkl"), outputs.Metric("metrics.json")],
+                    "outs": [
+                        outputs.Out("model.pkl", loader=loaders.PathOnly()),
+                        outputs.Metric("metrics.json"),
+                    ],
                     "deps": [],
                     "func": lambda: None,
                     "params": None,
@@ -1280,7 +1283,7 @@ def test_get_data_outputs_from_registry(tmp_path: Path, monkeypatch: pytest.Monk
 
 def test_get_data_hashes_from_head(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Get data hashes from mocked registry and git HEAD."""
-    from pivot import git, outputs, project, registry
+    from pivot import git, loaders, outputs, project, registry
 
     # Mock project root
     monkeypatch.setattr(project, "_project_root_cache", tmp_path)
@@ -1293,7 +1296,7 @@ def test_get_data_hashes_from_head(tmp_path: Path, monkeypatch: pytest.MonkeyPat
         def get(self, name: str) -> dict[str, object]:
             if name == "process_data":
                 return {
-                    "outs": [outputs.Out("output.csv")],
+                    "outs": [outputs.Out("output.csv", loader=loaders.PathOnly())],
                     "deps": [],
                     "func": lambda: None,
                     "params": None,
@@ -1329,7 +1332,7 @@ def test_get_data_hashes_from_head_no_lock_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Handle missing lock file gracefully."""
-    from pivot import git, outputs, project, registry
+    from pivot import git, loaders, outputs, project, registry
 
     monkeypatch.setattr(project, "_project_root_cache", tmp_path)
 
@@ -1339,7 +1342,7 @@ def test_get_data_hashes_from_head_no_lock_file(
 
         def get(self, name: str) -> dict[str, object]:
             return {
-                "outs": [outputs.Out("output.csv")],
+                "outs": [outputs.Out("output.csv", loader=loaders.PathOnly())],
                 "deps": [],
                 "func": lambda: None,
                 "params": None,
@@ -1363,7 +1366,7 @@ def test_get_data_hashes_from_head_invalid_yaml(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Handle invalid YAML in lock file gracefully."""
-    from pivot import git, outputs, project, registry
+    from pivot import git, loaders, outputs, project, registry
 
     monkeypatch.setattr(project, "_project_root_cache", tmp_path)
 
@@ -1373,7 +1376,7 @@ def test_get_data_hashes_from_head_invalid_yaml(
 
         def get(self, name: str) -> dict[str, object]:
             return {
-                "outs": [outputs.Out("output.csv")],
+                "outs": [outputs.Out("output.csv", loader=loaders.PathOnly())],
                 "deps": [],
                 "func": lambda: None,
                 "params": None,
@@ -1397,7 +1400,7 @@ def test_get_data_hashes_from_head_missing_outs_key(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Handle lock file missing outs key."""
-    from pivot import git, outputs, project, registry
+    from pivot import git, loaders, outputs, project, registry
 
     monkeypatch.setattr(project, "_project_root_cache", tmp_path)
 
@@ -1407,7 +1410,7 @@ def test_get_data_hashes_from_head_missing_outs_key(
 
         def get(self, name: str) -> dict[str, object]:
             return {
-                "outs": [outputs.Out("output.csv")],
+                "outs": [outputs.Out("output.csv", loader=loaders.PathOnly())],
                 "deps": [],
                 "func": lambda: None,
                 "params": None,
@@ -1430,7 +1433,7 @@ def test_get_data_hashes_from_head_outs_not_list(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Handle lock file where outs is not a list."""
-    from pivot import git, outputs, project, registry
+    from pivot import git, loaders, outputs, project, registry
 
     monkeypatch.setattr(project, "_project_root_cache", tmp_path)
 
@@ -1440,7 +1443,7 @@ def test_get_data_hashes_from_head_outs_not_list(
 
         def get(self, name: str) -> dict[str, object]:
             return {
-                "outs": [outputs.Out("output.csv")],
+                "outs": [outputs.Out("output.csv", loader=loaders.PathOnly())],
                 "deps": [],
                 "func": lambda: None,
                 "params": None,

@@ -671,7 +671,7 @@ class WatchEngine:
         Supports three registration patterns:
         1. pivot.yaml-based: Re-runs register_from_pipeline_file()
         2. pipeline.py-based: Re-runs the script via runpy.run_path()
-        3. @stage decorators: Reloads the modules containing decorators
+        3. Stage modules: Reloads the modules containing stage definitions
         """
         old_stages = registry.REGISTRY.snapshot()
 
@@ -749,7 +749,7 @@ class WatchEngine:
         )
 
     def _reload_from_decorators(self, old_stages: dict[str, RegistryStageInfo]) -> bool:
-        """Reload registry by reimporting modules with @stage decorators.
+        """Reload registry by reimporting stage modules.
 
         Clears ALL project modules from sys.modules and reimports stage modules.
         Using import_module (not reload) after clearing ensures transitive
@@ -835,7 +835,7 @@ class WatchEngine:
 
         for stage_name in registry.REGISTRY.list_stages():
             info = registry.REGISTRY.get(stage_name)
-            for dep in info["deps"]:
+            for dep in info["deps_paths"]:
                 dep_path = project.resolve_path(dep)
                 index[dep_path].add(stage_name)
 
@@ -947,7 +947,7 @@ def _is_code_or_config_change(changes: set[pathlib.Path]) -> bool:
 def _resolve_path_for_matching(path: pathlib.Path) -> pathlib.Path:
     """Resolve path consistently for file index matching, handling deletions."""
     try:
-        return project.resolve_path(str(path))
+        return project.resolve_path(path)
     except OSError:
         # File was deleted or inaccessible - use normalized absolute path
         # This allows matching against index entries for deleted files

@@ -11,7 +11,7 @@ import io
 import logging
 import pathlib
 import queue
-from typing import TYPE_CHECKING, Any, Literal, TypedDict
+from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast
 
 import pydantic
 
@@ -34,8 +34,6 @@ if TYPE_CHECKING:
     from multiprocessing import Queue
     from types import TracebackType
 
-    from pydantic import BaseModel
-
 logger = logging.getLogger(__name__)
 
 
@@ -54,7 +52,7 @@ class WorkerStageInfo(TypedDict):
     deps: list[str]
     outs: list[outputs.BaseOut]
     signature: Signature | None
-    params: BaseModel | None
+    params: stage_def.StageParams | None
     variant: str | None
     overrides: parameters.ParamsOverrides
     cwd: pathlib.Path | None
@@ -63,6 +61,8 @@ class WorkerStageInfo(TypedDict):
     force: bool
     no_commit: bool
     no_cache: bool
+    dep_specs: dict[str, stage_def.FuncDepSpec]
+    out_path_overrides: dict[str, outputs.PathType] | None
 
 
 def _make_result(
@@ -193,14 +193,21 @@ def execute_stage(
             _prepare_outputs_for_execution(stage_outs, lock_data, files_cache_dir)
 
             with _working_directory(stage_info["cwd"]):
-                _run_stage_function_with_capture(
-                    stage_info["func"], stage_name, output_queue, output_lines, params_instance
+                _run_stage_function_with_injection(
+                    stage_info["func"],
+                    stage_name,
+                    output_queue,
+                    output_lines,
+                    params_instance,
+                    stage_info["dep_specs"],
+                    project_root,
+                    stage_info["out_path_overrides"],
                 )
 
             # Compute output hashes (null for no_cache, actual otherwise)
             if no_cache:
                 _verify_outputs_exist(stage_outs)
-                output_hashes = dict[str, OutputHash]({out.path: None for out in stage_outs})
+                output_hashes = dict[str, OutputHash]({str(out.path): None for out in stage_outs})
             else:
                 output_hashes = _save_outputs_to_cache(stage_outs, files_cache_dir, checkout_modes)
 
@@ -263,7 +270,8 @@ def _check_skip_or_run(
     - If skip_reason is None: stage must run, run_reason explains why
     - input_hash is always returned for run cache recording
     """
-    out_paths = [out.path for out in stage_info["outs"]]
+    # Registry always stores single-file outputs (multi-file are expanded)
+    out_paths = [str(out.path) for out in stage_info["outs"]]
     deps_list = [DepEntry(path=path, hash=info["hash"]) for path, info in dep_hashes.items()]
     input_hash = run_history.compute_input_hash(
         current_fingerprint, current_params, deps_list, out_paths
@@ -306,11 +314,11 @@ def _restore_outputs_from_cache(
     restored_paths = list[pathlib.Path]()
 
     for out in stage_outs:
-        path = pathlib.Path(out.path)
+        path = pathlib.Path(cast("str", out.path))
         if path.exists():
             continue
 
-        output_hash = output_hashes.get(out.path)
+        output_hash = output_hashes.get(str(out.path))
         if output_hash is None:
             _cleanup_restored_paths(restored_paths)
             return False
@@ -341,12 +349,12 @@ def _prepare_outputs_for_execution(
     output_hashes = lock_data["output_hashes"] if lock_data else {}
 
     for out in stage_outs:
-        path = pathlib.Path(out.path)
+        path = pathlib.Path(cast("str", out.path))
 
         if isinstance(out, outputs.IncrementalOut):
             # IncrementalOut: restore from cache as writable copy
             cache.remove_output(path)  # Clear any stale state first
-            out_hash = output_hashes.get(out.path)
+            out_hash = output_hashes.get(str(out.path))
             if out_hash:
                 # COPY mode makes file writable (not symlink to read-only cache)
                 restored = cache.restore_from_cache(
@@ -371,16 +379,16 @@ def _save_outputs_to_cache(
         output_hashes = dict[str, OutputHash]()
 
         for out in stage_outs:
-            path = pathlib.Path(out.path)
+            path = pathlib.Path(cast("str", out.path))
             if not path.exists():
                 raise exceptions.OutputMissingError(f"Stage did not produce output: {out.path}")
 
             if out.cache:
-                output_hashes[out.path] = cache.save_to_cache(
+                output_hashes[str(out.path)] = cache.save_to_cache(
                     path, files_cache_dir, checkout_modes=checkout_modes
                 )
             else:
-                output_hashes[out.path] = None
+                output_hashes[str(out.path)] = None
 
         return output_hashes
 
@@ -392,50 +400,77 @@ def _verify_outputs_exist(stage_outs: list[outputs.BaseOut]) -> None:
     This is intentional - --no-cache mode trusts that the stage produced valid output.
     """
     for out in stage_outs:
-        path = pathlib.Path(out.path)
+        path = pathlib.Path(cast("str", out.path))
         if not path.exists():
             raise exceptions.OutputMissingError(f"Stage did not produce output: {out.path}")
 
 
-def _run_stage_function_with_capture(
+def _run_stage_function_with_injection(
     func: Callable[..., Any],
     stage_name: str,
     output_queue: Queue[OutputMessage],
     output_lines: list[tuple[str, bool]],
-    params_instance: BaseModel | None = None,
+    params: stage_def.StageParams | None = None,
+    dep_specs: dict[str, stage_def.FuncDepSpec] | None = None,
+    project_root: pathlib.Path | None = None,
+    return_out_path_overrides: dict[str, outputs.PathType] | None = None,
 ) -> None:
-    """Run stage function with stdout/stderr capture, streaming to queue.
+    """Run stage function with dependency injection and output capture.
 
-    Output is appended to the provided output_lines list, ensuring captured
-    output is preserved even if func() raises an exception.
+    This is the new injection-based execution path for stages using Annotated deps:
 
-    For StageDef params, auto-loads deps before function and auto-saves outs after.
+        def train(
+            config: TrainParams,
+            data: Annotated[DataFrame, Dep("input.csv", CSV())],
+        ) -> TrainOutputs:
+            ...
+
+    The function:
+    1. Loads deps from disk based on dep_specs
+    2. Builds kwargs dict (params + loaded deps)
+    3. Calls the function with kwargs
+    4. Saves outputs based on return type annotations
     """
     with (
         _QueueWriter(stage_name, output_queue, is_stderr=False, output_lines=output_lines),
         _QueueWriter(stage_name, output_queue, is_stderr=True, output_lines=output_lines),
     ):
         kwargs = dict[str, Any]()
-        if params_instance is not None:
-            kwargs["params"] = params_instance
 
-        # Check once and cache for StageDef handling
-        is_stage_def = isinstance(params_instance, stage_def.StageDef)
-        project_root = project.get_project_root() if is_stage_def else None
-        if is_stage_def and project_root is not None:
-            params_instance._load_deps(project_root)  # pyright: ignore[reportPrivateUsage] - internal API
+        # Add params if provided (find the param arg name from signature)
+        if params is not None:
+            params_arg_name, _ = stage_def.find_params_in_signature(func)
+            if params_arg_name is not None:
+                kwargs[params_arg_name] = params
 
-        try:
-            func(**kwargs)
+        # Load and inject deps
+        root = project_root if project_root is not None else project.get_project_root()
+        if dep_specs:
+            loaded_deps = stage_def.load_deps_from_specs(dep_specs, root)
+            kwargs.update(loaded_deps)
 
-            # Auto-save outs for StageDef params (only on success)
-            if is_stage_def and project_root is not None:
-                params_instance._save_outs(project_root)  # pyright: ignore[reportPrivateUsage] - internal API
-        finally:
-            # Clean up loaded deps/outs data on any exit to prevent memory leaks
-            if is_stage_def:
-                params_instance._clear_deps()  # pyright: ignore[reportPrivateUsage] - internal API
-                params_instance._clear_outs()  # pyright: ignore[reportPrivateUsage] - internal API
+        # Execute function
+        result = func(**kwargs)
+
+        # Save outputs based on return type
+        return_out_specs = stage_def.get_output_specs_from_return(func)
+        single_out_spec = stage_def.get_single_output_spec_from_return(func)
+
+        if return_out_specs and result is not None:
+            # TypedDict return with multiple outputs
+            stage_def.save_return_outputs(result, return_out_specs, root, return_out_path_overrides)
+        elif single_out_spec is not None and result is not None:
+            # Single annotated return type
+            stage_def.save_return_outputs(
+                {"_single": result},
+                {"_single": single_out_spec},
+                root,
+                return_out_path_overrides,
+            )
+        elif result is not None:
+            logger.debug(
+                "Stage '%s' returned value but has no Out annotation - discarding", stage_name
+            )
 
 
 class _QueueWriter:
@@ -662,11 +697,11 @@ def _try_skip_via_run_cache(
     restored_paths = list[pathlib.Path]()
 
     for out in stage_outs:
-        path = pathlib.Path(out.path)
+        path = pathlib.Path(cast("str", out.path))
         if path.exists():
             continue
 
-        cached_output = output_hash_map.get(out.path)
+        cached_output = output_hash_map.get(str(out.path))
         if cached_output is None:
             if out.cache:
                 _cleanup_restored_paths(restored_paths)

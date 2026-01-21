@@ -2,13 +2,13 @@ stages:
   preprocess:
     python: stages.preprocess
     deps:
-      - data/raw.csv
+      raw: data/raw.csv
     outs:
-      - data/clean.csv
+      clean: data/clean.csv
 
   train:
     python: stages.train
     deps:
-      - data/clean.csv
+      clean: data/clean.csv
     outs:
-      - models/model.pkl
+      model: models/model.pkl

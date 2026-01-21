@@ -2,9 +2,9 @@ stages:
   preprocess:
     python: stages.preprocess
     deps:
-      - data/raw.csv
+      raw: data/raw.csv
     outs:
-      - data/clean.csv
+      clean: data/clean.csv
 
   # Matrix with auto-naming: train@bert_swe, train@bert_human, train@gpt_swe, train@gpt_human
   train:
@@ -15,20 +15,18 @@ stages:
           params:
             hidden_size: 768
         gpt:
-          deps+:
-            - data/gpt_tokenizer.json
           params:
             hidden_size: 1024
       dataset:
         - swe
         - human
     deps:
-      - data/clean.csv
-      - configs/${model}.yaml
+      clean: data/clean.csv
+      config: configs/${model}.yaml
     outs:
-      - models/${model}_${dataset}.pkl
+      model: models/${model}_${dataset}.pkl
     metrics:
-      - metrics/${model}_${dataset}.json
+      metrics: metrics/${model}_${dataset}.json
     params:
       model_type: ${model}
       learning_rate: 0.001

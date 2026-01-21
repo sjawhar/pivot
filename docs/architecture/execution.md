@@ -101,12 +101,18 @@ This avoids repeated import overhead for heavy dependencies.
 
 Mutex groups prevent concurrent execution:
 
-```python
-@stage(mutex=['gpu'])
-def train_model_a(): pass
+```yaml
+# pivot.yaml
+stages:
+  train_model_a:
+    python: stages.train_model_a
+    mutex:
+      - gpu
 
-@stage(mutex=['gpu'])
-def train_model_b(): pass  # Won't run while train_model_a is running
+  train_model_b:
+    python: stages.train_model_b
+    mutex:
+      - gpu  # Won't run while train_model_a is running
 ```
 
 Implementation:
@@ -289,4 +295,5 @@ Shows:
 
 ## See Also
 
-- [API Reference: executor](../reference/pivot/executor.md) - Full API documentation
+- [Architecture Overview](overview.md) - System architecture
+- [Fingerprinting](fingerprinting.md) - Code change detection

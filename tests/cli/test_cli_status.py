@@ -2,17 +2,35 @@ from __future__ import annotations
 
 import json
 import pathlib
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Annotated, TypedDict
 
-from pivot import cli, executor
+from helpers import register_test_stage
+from pivot import cli, executor, loaders, outputs
 from pivot import status as status_mod
-from pivot.registry import REGISTRY
 from pivot.storage import cache, track
 from pivot.types import RemoteSyncInfo
 
 if TYPE_CHECKING:
     import click.testing
     from pytest_mock import MockerFixture
+
+
+# =============================================================================
+# Module-level TypedDicts and Stage Functions for annotation-based registration
+# =============================================================================
+
+
+class _OutputTxtOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
+
+
+class _ATxtOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("a.txt", loaders.PathOnly())]
+
+
+class _BTxtOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("b.txt", loaders.PathOnly())]
+
 
 # =============================================================================
 # Help and Basic Tests
@@ -48,16 +66,28 @@ def test_status_no_stages(runner: click.testing.CliRunner, tmp_path: pathlib.Pat
 # =============================================================================
 
 
-def _helper_process() -> None:
+def _helper_process(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _OutputTxtOutputs:
+    _ = input_file
     pathlib.Path("output.txt").write_text("done")
+    return _OutputTxtOutputs(output=pathlib.Path("output.txt"))
 
 
-def _helper_stage_a() -> None:
+def _helper_stage_a(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _ATxtOutputs:
+    _ = input_file
     pathlib.Path("a.txt").write_text("output a")
+    return _ATxtOutputs(output=pathlib.Path("a.txt"))
 
 
-def _helper_stage_b() -> None:
+def _helper_stage_b(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _BTxtOutputs:
+    _ = input_file
     pathlib.Path("b.txt").write_text("output b")
+    return _BTxtOutputs(output=pathlib.Path("b.txt"))
 
 
 def test_status_shows_stale_stages(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
@@ -66,7 +96,7 @@ def test_status_shows_stale_stages(runner: click.testing.CliRunner, tmp_path: pa
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
 
-        REGISTRY.register(_helper_process, name="process", deps=["input.txt"], outs=["output.txt"])
+        register_test_stage(_helper_process, name="process")
 
         result = runner.invoke(cli.cli, ["status"])
 
@@ -84,7 +114,7 @@ def test_status_shows_cached_stages(
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
 
-        REGISTRY.register(_helper_process, name="process", deps=["input.txt"], outs=["output.txt"])
+        register_test_stage(_helper_process, name="process")
 
         executor.run(show_output=False)
 
@@ -103,8 +133,8 @@ def test_status_verbose_shows_all_stages(
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
 
-        REGISTRY.register(_helper_stage_a, name="stage_a", deps=["input.txt"], outs=["a.txt"])
-        REGISTRY.register(_helper_stage_b, name="stage_b", deps=["input.txt"], outs=["b.txt"])
+        register_test_stage(_helper_stage_a, name="stage_a")
+        register_test_stage(_helper_stage_b, name="stage_b")
 
         executor.run(show_output=False)
 
@@ -121,8 +151,8 @@ def test_status_specific_stages(runner: click.testing.CliRunner, tmp_path: pathl
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
 
-        REGISTRY.register(_helper_stage_a, name="stage_a", deps=["input.txt"], outs=["a.txt"])
-        REGISTRY.register(_helper_stage_b, name="stage_b", deps=["input.txt"], outs=["b.txt"])
+        register_test_stage(_helper_stage_a, name="stage_a")
+        register_test_stage(_helper_stage_b, name="stage_b")
 
         result = runner.invoke(cli.cli, ["status", "stage_a"])
 
@@ -210,7 +240,7 @@ def test_status_stages_only(runner: click.testing.CliRunner, tmp_path: pathlib.P
         pvt_data = track.PvtData(path="data.txt", hash=file_hash, size=7)
         track.write_pvt_file(pathlib.Path("data.txt.pvt"), pvt_data)
 
-        REGISTRY.register(_helper_process, name="process", deps=["input.txt"], outs=["output.txt"])
+        register_test_stage(_helper_process, name="process")
 
         result = runner.invoke(cli.cli, ["status", "--stages-only"])
 
@@ -232,7 +262,7 @@ def test_status_tracked_only(runner: click.testing.CliRunner, tmp_path: pathlib.
         pvt_data = track.PvtData(path="data.txt", hash=file_hash, size=7)
         track.write_pvt_file(pathlib.Path("data.txt.pvt"), pvt_data)
 
-        REGISTRY.register(_helper_process, name="process", deps=["input.txt"], outs=["output.txt"])
+        register_test_stage(_helper_process, name="process")
 
         result = runner.invoke(cli.cli, ["status", "--tracked-only"])
 
@@ -265,7 +295,7 @@ def test_status_json_output(runner: click.testing.CliRunner, tmp_path: pathlib.P
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
 
-        REGISTRY.register(_helper_process, name="process", deps=["input.txt"], outs=["output.txt"])
+        register_test_stage(_helper_process, name="process")
 
         result = runner.invoke(cli.cli, ["status", "--json"])
 
@@ -284,7 +314,7 @@ def test_status_json_includes_suggestions(
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
 
-        REGISTRY.register(_helper_process, name="process", deps=["input.txt"], outs=["output.txt"])
+        register_test_stage(_helper_process, name="process")
 
         result = runner.invoke(cli.cli, ["status", "--json"])
 
@@ -305,7 +335,7 @@ def test_status_shows_suggestions(runner: click.testing.CliRunner, tmp_path: pat
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
 
-        REGISTRY.register(_helper_process, name="process", deps=["input.txt"], outs=["output.txt"])
+        register_test_stage(_helper_process, name="process")
 
         result = runner.invoke(cli.cli, ["status"])
 
@@ -393,7 +423,7 @@ def test_status_quiet_no_output_when_clean(
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
 
-        REGISTRY.register(_helper_process, name="process", deps=["input.txt"], outs=["output.txt"])
+        register_test_stage(_helper_process, name="process")
 
         # Run once to cache
         executor.run(show_output=False)
@@ -412,7 +442,7 @@ def test_status_quiet_exits_1_when_stale(
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
 
-        REGISTRY.register(_helper_process, name="process", deps=["input.txt"], outs=["output.txt"])
+        register_test_stage(_helper_process, name="process")
 
         # Don't run - stage is stale
         result = runner.invoke(cli.cli, ["--quiet", "status"])
@@ -429,7 +459,7 @@ def test_status_quiet_exits_1_when_modified(
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
 
-        REGISTRY.register(_helper_process, name="process", deps=["input.txt"], outs=["output.txt"])
+        register_test_stage(_helper_process, name="process")
 
         # Run to cache
         executor.run(show_output=False)
@@ -483,7 +513,7 @@ def test_status_remote_only_with_remote(
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
 
-        REGISTRY.register(_helper_process, name="process", deps=["input.txt"], outs=["output.txt"])
+        register_test_stage(_helper_process, name="process")
 
         mock_remote_status = RemoteSyncInfo(
             name="myremote",

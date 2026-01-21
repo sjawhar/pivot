@@ -119,7 +119,7 @@ def discover_pvt_files(root: pathlib.Path) -> dict[str, PvtData]:
         # Compute absolute data path from pvt file location + relative path
         # Use normalized path (preserve symlinks) for portability
         data_path = pvt_path.parent / data["path"]
-        normalized = project.normalize_path(str(data_path))
+        normalized = project.normalize_path(data_path)
         result[str(normalized)] = data
 
     return result

@@ -1,13 +1,22 @@
 from __future__ import annotations
 
 import pathlib
+from typing import TypedDict
 
 import click
 
 from pivot import project, registry
 from pivot.cli import decorators as cli_decorators
+from pivot.cli import helpers as cli_helpers
 from pivot.storage import cache
 from pivot.storage import track as track_mod
+
+
+class TrackResult(TypedDict):
+    """Result of tracking a single path."""
+
+    warning: str | None
+    tracked_path: str
 
 
 def _paths_overlap(path_a: pathlib.Path, path_b: pathlib.Path) -> bool:
@@ -72,15 +81,11 @@ def _track_single_path(
     stage_outputs_resolved: dict[str, pathlib.Path],
     existing_tracked: dict[str, track_mod.PvtData],
     force: bool,
-) -> None:
+) -> TrackResult:
     """Track a single file or directory.
 
-    Args:
-        path_str: Path to track (user input)
-        cache_dir: Cache directory path
-        stage_outputs_resolved: Dict mapping normalized output paths to resolved paths
-        existing_tracked: Dict of already tracked files
-        force: Whether to overwrite existing .pvt files
+    Returns:
+        TrackResult with optional warning and the tracked path for the caller to handle output.
     """
     # Validate path doesn't escape project
     if track_mod.has_path_traversal(path_str):
@@ -98,13 +103,13 @@ def _track_single_path(
     if not path.exists():
         raise click.ClickException(f"Path not found: {path_str}")
 
-    # Warn if tracking file inside symlinked directory
+    # Check if tracking file inside symlinked directory
+    warning: str | None = None
     project_root = project.get_project_root()
     if project.contains_symlink_in_path(path, project_root):
-        click.echo(
+        warning = (
             f"Warning: '{path_str}' is inside a symlinked directory. "
-            + "Tracked path may not be portable across environments.",
-            err=True,
+            + "Tracked path may not be portable across environments."
         )
 
     # Check for overlap with stage outputs (resolve paths to detect symlink aliasing)
@@ -172,17 +177,21 @@ def _track_single_path(
     # Update existing_tracked for subsequent paths
     existing_tracked[abs_path_str] = pvt_data
 
-    click.echo(f"Tracked: {path_str}")
+    return TrackResult(warning=warning, tracked_path=path_str)
 
 
 @cli_decorators.pivot_command()
 @click.argument("paths", nargs=-1, required=True)
 @click.option("--force", "-f", is_flag=True, help="Overwrite existing .pvt files")
-def track(paths: tuple[str, ...], force: bool) -> None:
+@click.pass_context
+def track(ctx: click.Context, paths: tuple[str, ...], force: bool) -> None:
     """Track files/directories for caching.
 
     Creates .pvt manifest files and caches content for reproducibility.
     """
+    cli_ctx = cli_helpers.get_cli_context(ctx)
+    quiet = cli_ctx["quiet"]
+
     project_root = project.get_project_root()
     cache_dir = project_root / ".pivot" / "cache" / "files"
 
@@ -193,4 +202,8 @@ def track(paths: tuple[str, ...], force: bool) -> None:
     existing_tracked = track_mod.discover_pvt_files(project_root)
 
     for path_str in paths:
-        _track_single_path(path_str, cache_dir, stage_outputs, existing_tracked, force)
+        result = _track_single_path(path_str, cache_dir, stage_outputs, existing_tracked, force)
+        if not quiet:
+            if result["warning"]:
+                click.echo(result["warning"], err=True)
+            click.echo(f"Tracked: {result['tracked_path']}")

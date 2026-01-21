@@ -1,79 +1,147 @@
 # Defining Stages
 
-The `@stage` decorator is the primary way to define pipeline stages in Pivot.
+Stages are defined in `pivot.yaml` which references Python functions. The functions use annotations to declare their dependencies and outputs.
 
 ## Basic Usage
 
-```python
-from pivot import stage
-
-@stage(deps=['input.csv'], outs=['output.parquet'])
-def process():
-    import pandas as pd
-    df = pd.read_csv('input.csv')
-    df.to_parquet('output.parquet')
+```yaml
+# pivot.yaml
+stages:
+  process:
+    python: stages.process
+    deps:
+      raw: input.csv
+    outs:
+      clean: output.parquet
 ```
 
-## Decorator Parameters
+```python
+# stages.py
+import pathlib
+from typing import Annotated, TypedDict
+
+import pandas
+from pivot import loaders, outputs
+
+
+class ProcessOutputs(TypedDict):
+    clean: Annotated[pathlib.Path, outputs.Out("output.parquet", loaders.PathOnly())]
+
+
+def process(
+    raw: Annotated[pandas.DataFrame, outputs.Dep("input.csv", loaders.CSV())],
+) -> ProcessOutputs:
+    df = raw.dropna()
+    out_path = pathlib.Path("output.parquet")
+    df.to_parquet(out_path)
+    return {"clean": out_path}
+```
+
+## YAML Stage Parameters
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `deps` | `Sequence[str]` | Input file dependencies |
-| `outs` | `Sequence[str \| Out \| Metric \| Plot]` | Output files |
-| `params` | `type[BaseModel] \| BaseModel` | Pydantic parameters |
-| `mutex` | `Sequence[str]` | Mutex groups for exclusive execution |
-| `name` | `str \| None` | Custom stage name (default: function name) |
-| `cwd` | `str \| Path \| None` | Working directory for paths |
+| `python` | `str` | Module path to function (required) |
+| `deps` | `dict[str, str]` | Named dependency path overrides |
+| `outs` | `dict[str, str]` | Named output path overrides |
+| `metrics` | `dict[str, str]` | Metric outputs (git-tracked) |
+| `plots` | `dict[str, str]` | Plot outputs |
+| `params` | `dict` | Stage parameters |
+| `mutex` | `list[str]` | Mutex groups for exclusive execution |
+| `cwd` | `str` | Working directory for paths |
+| `matrix` | `dict` | Matrix expansion configuration |
 
 ## Dependencies
 
-Dependencies are files that your stage reads:
+Dependencies are declared as annotated function parameters:
 
 ```python
-@stage(deps=['data/raw.csv', 'config/settings.yaml'])
-def preprocess():
-    # Both files are tracked for changes
-    pass
+def preprocess(
+    raw: Annotated[pandas.DataFrame, outputs.Dep("data/raw.csv", loaders.CSV())],
+    config: Annotated[dict, outputs.Dep("config/settings.yaml", loaders.YAML())],
+) -> PreprocessOutputs:
+    ...
 ```
 
-!!! tip "Automatic Code Dependencies"
-    Pivot automatically tracks Python code dependencies. You don't need to list `.py` files in `deps`.
+YAML provides path overrides (must match parameter names):
+
+```yaml
+stages:
+  preprocess:
+    python: stages.preprocess
+    deps:
+      raw: data/raw.csv
+      config: config/settings.yaml
+```
+
+Pivot automatically tracks Python code dependencies. You don't need to list `.py` files in `deps`.
 
 ## Outputs
 
-Outputs are files that your stage writes:
+Outputs are declared in the return type annotation:
 
 ```python
-from pivot import stage, Out, Metric, Plot
+class TrainOutputs(TypedDict):
+    model: Annotated[pathlib.Path, outputs.Out("model.pkl", loaders.PathOnly())]
+    metrics: Annotated[dict, outputs.Metric("metrics.json")]
+    plot: Annotated[pathlib.Path, outputs.Plot("loss.png")]
 
-@stage(
-    deps=['data.csv'],
-    outs=[
-        Out('model.pkl'),           # Cached output
-        Metric('metrics.json'),     # Git-tracked metrics
-        Plot('loss.png'),           # Cached plot
-    ]
-)
-def train():
-    pass
+
+def train(
+    data: Annotated[pandas.DataFrame, outputs.Dep("data.csv", loaders.CSV())],
+) -> TrainOutputs:
+    # ... training code ...
+    return {"model": model_path, "metrics": metrics_dict, "plot": plot_path}
+```
+
+YAML provides path overrides:
+
+```yaml
+stages:
+  train:
+    python: stages.train
+    deps:
+      data: data.csv
+    outs:
+      model: model.pkl
+    metrics:
+      metrics: metrics.json
+    plots:
+      plot: loss.png
 ```
 
 See [Output Types](outputs.md) for details on each type.
 
 ## Parameters
 
-Use Pydantic models for type-safe parameters:
+Parameters are declared as a `StageParams` subclass:
 
 ```python
-from pydantic import BaseModel
+from pivot.stage_def import StageParams
 
-class TrainParams(BaseModel):
+
+class TrainParams(StageParams):
     learning_rate: float = 0.01
     batch_size: int = 32
 
-@stage(deps=['data.csv'], params=TrainParams)
-def train(params: TrainParams):
+
+def train(
+    params: TrainParams,
+    data: Annotated[pandas.DataFrame, outputs.Dep("data.csv", loaders.CSV())],
+) -> TrainOutputs:
     print(f"Learning rate: {params.learning_rate}")
+    ...
+```
+
+YAML overrides defaults:
+
+```yaml
+stages:
+  train:
+    python: stages.train
+    params:
+      learning_rate: 0.05
+      batch_size: 64
 ```
 
 See [Parameters](parameters.md) for details.
@@ -82,38 +150,40 @@ See [Parameters](parameters.md) for details.
 
 Prevent stages from running concurrently:
 
-```python
-@stage(deps=['data.csv'], outs=['gpu_model.pkl'], mutex=['gpu'])
-def train_gpu():
-    # Uses GPU
-    pass
+```yaml
+stages:
+  train_gpu:
+    python: stages.train_gpu
+    deps:
+      data: data.csv
+    outs:
+      model: gpu_model.pkl
+    mutex:
+      - gpu
 
-@stage(deps=['data.csv'], outs=['gpu_model_2.pkl'], mutex=['gpu'])
-def train_gpu_2():
-    # Also uses GPU - won't run at same time as train_gpu
-    pass
+  train_gpu_2:
+    python: stages.train_gpu_2
+    deps:
+      data: data.csv
+    outs:
+      model: gpu_model_2.pkl
+    mutex:
+      - gpu   # Won't run at same time as train_gpu
 ```
-
-## Custom Stage Names
-
-```python
-@stage(deps=['data.csv'], name='my_custom_name')
-def some_function():
-    pass
-```
-
-The stage will be registered as `my_custom_name` instead of `some_function`.
 
 ## Working Directory
 
 Set a working directory for path resolution:
 
-```python
-@stage(deps=['data.csv'], outs=['output.csv'], cwd='subproject/')
-def process():
-    # Paths are relative to subproject/
-    # Stage executes from subproject/
-    pass
+```yaml
+stages:
+  process:
+    python: stages.process
+    deps:
+      data: data.csv
+    outs:
+      output: output.csv
+    cwd: subproject/
 ```
 
 ## Function Requirements
@@ -132,11 +202,24 @@ Pivot uses `ProcessPoolExecutor` with `forkserver` context for true parallelism.
 
 ```python
 # Module-level function in importable module
-@stage(deps=['data.csv'], outs=['output.csv'])
-def process_data():
-    import pandas as pd
-    df = pd.read_csv('data.csv')
-    df.to_csv('output.csv')
+# stages.py
+import pathlib
+from typing import Annotated, TypedDict
+
+import pandas
+from pivot import loaders, outputs
+
+
+class ProcessOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("output.csv", loaders.PathOnly())]
+
+
+def process_data(
+    data: Annotated[pandas.DataFrame, outputs.Dep("data.csv", loaders.CSV())],
+) -> ProcessOutputs:
+    out_path = pathlib.Path("output.csv")
+    data.to_csv(out_path)
+    return {"output": out_path}
 ```
 
 ### Don't
@@ -144,12 +227,11 @@ def process_data():
 ```python
 # Lambda (not picklable)
 # Error: Can't pickle <lambda>
-process = stage(deps=['x'], outs=['y'])(lambda: ...)
+process = lambda: ...
 
 # Closure capturing local variable
 # Error: Could not pickle the task to send it to the workers
 def make_stage(threshold):
-    @stage(deps=['x'], outs=['y'])
     def process():
         if value > threshold:  # Captures threshold!
             pass
@@ -158,26 +240,21 @@ def make_stage(threshold):
 # Defined in __main__
 # Error: Can't get attribute 'my_stage' on <module '__main__'>
 if __name__ == '__main__':
-    @stage(deps=['x'], outs=['y'])
     def my_stage():  # Can't be pickled!
         pass
 ```
 
-!!! tip "Use Parameters Instead of Closures"
-    If you need to configure stage behavior, use Pydantic parameters:
+Use parameters instead of closures to configure stage behavior.
 
-    ```python
-    class ProcessParams(pydantic.BaseModel):
-        threshold: float = 0.5
-
-    @stage(deps=['data.csv'], params=ProcessParams)
-    def process(params: ProcessParams):
-        if value > params.threshold:
-            pass
-    ```
+> **Error you'll see:** `Could not pickle the task to send it to the workers`
+>
+> This means your function captures a variable from its enclosing scope.
+> Move the function to module level and pass values through parameters instead.
 
 See [Troubleshooting](troubleshooting.md) for more common errors and solutions.
 
 ## See Also
 
-- [API Reference: stage](../reference/pivot/registry.md) - Full API documentation
+- [Configuration](configuration.md) - Pipeline configuration
+- [Output Types](outputs.md) - Output types and options
+- [Parameters](parameters.md) - Parameter handling

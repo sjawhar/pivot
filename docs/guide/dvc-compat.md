@@ -93,4 +93,5 @@ Not exported:
 
 ## See Also
 
-- [API Reference: dvc_compat](../reference/pivot/dvc_compat.md) - Full API documentation
+- [Configuration](configuration.md) - Pipeline configuration
+- [Defining Stages](stages.md) - Stage definition patterns

@@ -1,12 +1,104 @@
 """Tests for _watch_utils module."""
 
 import pathlib
+from typing import Annotated, TypedDict
 
 import pytest
 from watchfiles import Change
 
-from pivot import ignore, project, registry
+from helpers import register_test_stage
+from pivot import ignore, loaders, outputs, project
 from pivot.watch import _watch_utils
+
+
+class _OutputTxt(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
+
+
+def _stage_with_file_dep(
+    input_file: Annotated[pathlib.Path, outputs.Dep("data/input.csv", loaders.PathOnly())],
+) -> _OutputTxt:
+    _ = input_file
+    pathlib.Path("output.txt").write_text("")
+    return _OutputTxt(output=pathlib.Path("output.txt"))
+
+
+def _stage_with_dir_dep(
+    dep_dir: Annotated[pathlib.Path, outputs.Dep("data_dir", loaders.PathOnly())],
+) -> _OutputTxt:
+    _ = dep_dir
+    pathlib.Path("output.txt").write_text("")
+    return _OutputTxt(output=pathlib.Path("output.txt"))
+
+
+def _stage_with_nonexistent_dep(
+    file: Annotated[pathlib.Path, outputs.Dep("nonexistent/file.csv", loaders.PathOnly())],
+) -> _OutputTxt:
+    _ = file
+    pathlib.Path("output.txt").write_text("")
+    return _OutputTxt(output=pathlib.Path("output.txt"))
+
+
+class _Output1(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("output1.txt", loaders.PathOnly())]
+
+
+class _Output2(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("output2.txt", loaders.PathOnly())]
+
+
+class _IntermediateOut(TypedDict):
+    intermediate: Annotated[pathlib.Path, outputs.Out("intermediate.csv", loaders.PathOnly())]
+
+
+class _FinalOut(TypedDict):
+    final: Annotated[pathlib.Path, outputs.Out("final.csv", loaders.PathOnly())]
+
+
+class _OutputDir(TypedDict):
+    output_dir: Annotated[pathlib.Path, outputs.Out("output_dir/", loaders.PathOnly())]
+
+
+def _stage_output_txt() -> _OutputTxt:
+    """Stage that just produces output.txt."""
+    pathlib.Path("output.txt").write_text("")
+    return _OutputTxt(output=pathlib.Path("output.txt"))
+
+
+def _stage_output1() -> _Output1:
+    """Stage that produces output1.txt."""
+    pathlib.Path("output1.txt").write_text("")
+    return _Output1(output=pathlib.Path("output1.txt"))
+
+
+def _stage_output2() -> _Output2:
+    """Stage that produces output2.txt."""
+    pathlib.Path("output2.txt").write_text("")
+    return _Output2(output=pathlib.Path("output2.txt"))
+
+
+def _stage_intermediate(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.csv", loaders.PathOnly())],
+) -> _IntermediateOut:
+    """Stage that consumes input.csv and produces intermediate.csv."""
+    _ = input_file
+    pathlib.Path("intermediate.csv").write_text("")
+    return _IntermediateOut(intermediate=pathlib.Path("intermediate.csv"))
+
+
+def _stage_final(
+    intermediate: Annotated[pathlib.Path, outputs.Dep("intermediate.csv", loaders.PathOnly())],
+) -> _FinalOut:
+    """Stage that consumes intermediate.csv and produces final.csv."""
+    _ = intermediate
+    pathlib.Path("final.csv").write_text("")
+    return _FinalOut(final=pathlib.Path("final.csv"))
+
+
+def _stage_output_dir() -> _OutputDir:
+    """Stage that produces an output directory."""
+    pathlib.Path("output_dir").mkdir(exist_ok=True)
+    return _OutputDir(output_dir=pathlib.Path("output_dir"))
 
 
 def _noop() -> None:
@@ -35,14 +127,8 @@ def test_collect_watch_paths_includes_dep_directories(
     dep_file = set_project_root / "data" / "input.csv"
     dep_file.parent.mkdir(parents=True, exist_ok=True)
     dep_file.write_text("x,y\n1,2\n")
-    output = set_project_root / "output.txt"
 
-    registry.REGISTRY.register(
-        _noop,
-        name="my_stage",
-        deps=[str(dep_file)],
-        outs=[str(output)],
-    )
+    register_test_stage(_stage_with_file_dep, name="my_stage")
 
     paths = _watch_utils.collect_watch_paths(["my_stage"])
 
@@ -57,14 +143,8 @@ def test_collect_watch_paths_includes_directory_deps_directly(
     dep_dir = set_project_root / "data_dir"
     dep_dir.mkdir()
     (dep_dir / "file.csv").write_text("x,y\n1,2\n")
-    output = set_project_root / "output.txt"
 
-    registry.REGISTRY.register(
-        _noop,
-        name="my_stage",
-        deps=[str(dep_dir)],
-        outs=[str(output)],
-    )
+    register_test_stage(_stage_with_dir_dep, name="my_stage")
 
     paths = _watch_utils.collect_watch_paths(["my_stage"])
 
@@ -87,14 +167,7 @@ def test_collect_watch_paths_handles_nonexistent_deps(
     tmp_path: pathlib.Path, set_project_root: pathlib.Path
 ) -> None:
     """Should skip dependencies that don't exist."""
-    output = set_project_root / "output.txt"
-
-    registry.REGISTRY.register(
-        _noop,
-        name="my_stage",
-        deps=["nonexistent/file.csv"],
-        outs=[str(output)],
-    )
+    register_test_stage(_stage_with_nonexistent_dep, name="my_stage")
 
     paths = _watch_utils.collect_watch_paths(["my_stage"])
 
@@ -112,18 +185,11 @@ def test_get_output_paths_for_stages_returns_outputs(
     set_project_root: pathlib.Path,
 ) -> None:
     """Should return output paths for specified stages."""
-    output_file = set_project_root / "output.txt"
-
-    registry.REGISTRY.register(
-        _noop,
-        name="my_stage",
-        deps=[],
-        outs=[str(output_file)],
-    )
+    register_test_stage(_stage_output_txt, name="my_stage")
 
     result = _watch_utils.get_output_paths_for_stages(["my_stage"])
 
-    assert str(output_file) in result
+    assert str(set_project_root / "output.txt") in result
 
 
 def test_get_output_paths_for_stages_skips_unknown(
@@ -140,16 +206,13 @@ def test_get_output_paths_for_stages_multiple_stages(
     set_project_root: pathlib.Path,
 ) -> None:
     """Should collect outputs from multiple stages."""
-    output1 = set_project_root / "output1.txt"
-    output2 = set_project_root / "output2.txt"
-
-    registry.REGISTRY.register(_noop, name="stage1", deps=[], outs=[str(output1)])
-    registry.REGISTRY.register(_noop, name="stage2", deps=[], outs=[str(output2)])
+    register_test_stage(_stage_output1, name="stage1")
+    register_test_stage(_stage_output2, name="stage2")
 
     result = _watch_utils.get_output_paths_for_stages(["stage1", "stage2"])
 
-    assert str(output1) in result
-    assert str(output2) in result
+    assert str(set_project_root / "output1.txt") in result
+    assert str(set_project_root / "output2.txt") in result
 
 
 # =============================================================================
@@ -164,7 +227,7 @@ def test_create_watch_filter_excludes_outputs(
     output_file = set_project_root / "output.txt"
     output_file.write_text("data")
 
-    registry.REGISTRY.register(_noop, name="my_stage", deps=[], outs=[str(output_file)])
+    register_test_stage(_stage_output_txt, name="my_stage")
 
     watch_filter = _watch_utils.create_watch_filter(["my_stage"])
 
@@ -175,11 +238,10 @@ def test_create_watch_filter_allows_non_outputs(
     set_project_root: pathlib.Path,
 ) -> None:
     """Should allow files that are not stage outputs."""
-    output_file = set_project_root / "output.txt"
     other_file = set_project_root / "other.txt"
     other_file.write_text("data")
 
-    registry.REGISTRY.register(_noop, name="my_stage", deps=[], outs=[str(output_file)])
+    register_test_stage(_stage_output_txt, name="my_stage")
 
     watch_filter = _watch_utils.create_watch_filter(["my_stage"])
 
@@ -212,7 +274,7 @@ def test_create_watch_filter_excludes_files_in_output_directories(
     file_in_output = output_dir / "file.txt"
     file_in_output.write_text("data")
 
-    registry.REGISTRY.register(_noop, name="my_stage", deps=[], outs=[str(output_dir)])
+    register_test_stage(_stage_output_dir, name="my_stage")
 
     watch_filter = _watch_utils.create_watch_filter(["my_stage"])
 
@@ -287,13 +349,9 @@ def test_create_watch_filter_filters_all_outputs_including_intermediate(
     intermediate_file.write_text("x,y\n3,4")
 
     # stage_a produces intermediate.csv
-    registry.REGISTRY.register(
-        _noop, name="stage_a", deps=[str(input_file)], outs=[str(intermediate_file)]
-    )
+    register_test_stage(_stage_intermediate, name="stage_a")
     # stage_b consumes intermediate.csv
-    registry.REGISTRY.register(
-        _noop, name="stage_b", deps=[str(intermediate_file)], outs=[str(final_file)]
-    )
+    register_test_stage(_stage_final, name="stage_b")
 
     watch_filter = _watch_utils.create_watch_filter(["stage_a", "stage_b"])
 

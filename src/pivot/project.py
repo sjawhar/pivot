@@ -33,17 +33,17 @@ def get_cache_dir() -> pathlib.Path:
     return get_project_root() / ".pivot" / "cache"
 
 
-def resolve_path(path: str) -> pathlib.Path:
+def resolve_path(path: str | pathlib.Path) -> pathlib.Path:
     """Resolve relative path from project root; absolute paths unchanged."""
-    p = pathlib.Path(path)
+    p = pathlib.Path(os.fspath(path))
     if p.is_absolute():
         return p.resolve()
     return (get_project_root() / p).resolve()
 
 
-def normalize_path(path: str) -> pathlib.Path:
+def normalize_path(path: str | pathlib.Path) -> pathlib.Path:
     """Make path absolute from project root, preserving symlinks (unlike resolve())."""
-    p = pathlib.Path(path)
+    p = pathlib.Path(os.fspath(path))
     abs_path = p.absolute() if p.is_absolute() else (get_project_root() / p).absolute()
     # Collapse .. components without following symlinks
     return pathlib.Path(os.path.normpath(abs_path))
