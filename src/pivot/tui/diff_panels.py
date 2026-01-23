@@ -449,6 +449,7 @@ class InputDiffPanel(_SelectableExpandablePanel):
                 stage_name=stage_name,
                 fingerprint=self._registry_info["fingerprint"],
                 deps=self._registry_info["deps_paths"],
+                outs_paths=self._registry_info["outs_paths"],
                 params_instance=self._registry_info["params"],
                 overrides=parameters.load_params_yaml(),
                 state_dir=state_dir,

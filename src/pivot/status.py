@@ -66,6 +66,7 @@ def get_pipeline_status(
                     stage_name,
                     stage_info["fingerprint"],
                     stage_info["deps_paths"],
+                    stage_info["outs_paths"],
                     stage_info["params"],
                     overrides,
                     state_dir,

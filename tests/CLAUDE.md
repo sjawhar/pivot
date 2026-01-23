@@ -6,7 +6,7 @@
 
 ## Philosophy
 
-**Real assurance over passing tests.** Tests prove correctness, not just exercise code paths. A test that mocks internal logic proves nothing — it just confirms mocks return what you told them to.
+**Real assurance over passing tests.** Tests should prove correctness, not just exercise code paths. Prefer real execution over mocks — mock external boundaries (network, filesystem in unit tests), not internal logic.
 
 ---
 
