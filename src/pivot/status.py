@@ -41,10 +41,7 @@ def _can_skip_via_generation(
     current_params: dict[str, Any],
     cache_dir: pathlib.Path,
 ) -> bool:
-    """Check if stage can skip using O(1) generation tracking.
-
-    This mirrors the logic in executor/worker.py to ensure status is consistent with run.
-    """
+    """Mirror executor/worker.py logic to ensure status matches run."""
     stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(cache_dir))
     lock_data = stage_lock.read()
     if lock_data is None:
@@ -94,8 +91,6 @@ def get_pipeline_status(
     for stage_name in execution_order:
         stage_info = registry.REGISTRY.get(stage_name)
 
-        # First check generation tracking (O(1)) - this is what `pivot run` uses
-        # to decide whether to skip a stage, so status should match
         can_skip = False
         try:
             current_params = parameters.get_effective_params(
@@ -109,11 +104,9 @@ def get_pipeline_status(
                 resolved_cache_dir,
             )
         except pydantic.ValidationError:
-            # Invalid params - fall through to full explanation which will report the error
             pass
 
         if can_skip:
-            # Stage would be skipped by run, so report it as cached
             explanations.append(
                 StageExplanation(
                     stage_name=stage_name,
@@ -126,7 +119,6 @@ def get_pipeline_status(
                 )
             )
         else:
-            # Fall back to full hash-based explanation
             explanation = explain.get_stage_explanation(
                 stage_name,
                 stage_info["fingerprint"],
