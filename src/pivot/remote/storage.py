@@ -149,8 +149,12 @@ async def _stream_download_to_fd(
     """Stream S3 response body to file descriptor in chunks with timeout."""
     async with response["Body"] as stream:
         while True:
+            # Use stream.content.read() instead of stream.read() because when
+            # entering the async context manager, stream is the underlying
+            # aiohttp.ClientResponse, and ClientResponse.read() doesn't accept
+            # a size argument. StreamReader.read() does.
             chunk: bytes = await asyncio.wait_for(
-                stream.read(STREAM_CHUNK_SIZE),
+                stream.content.read(STREAM_CHUNK_SIZE),
                 timeout=STREAM_READ_TIMEOUT,
             )
             if not chunk:
