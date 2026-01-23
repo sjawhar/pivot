@@ -150,7 +150,7 @@ async def _stream_download_to_fd(
     async with response["Body"] as stream:
         while True:
             chunk: bytes = await asyncio.wait_for(
-                stream.read(STREAM_CHUNK_SIZE),
+                stream.content.read(STREAM_CHUNK_SIZE),
                 timeout=STREAM_READ_TIMEOUT,
             )
             if not chunk:
