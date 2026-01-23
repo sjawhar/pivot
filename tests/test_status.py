@@ -125,6 +125,51 @@ def test_pipeline_status_specific_stages(tmp_path: pathlib.Path, mocker: MockerF
     assert results[0]["name"] == "stage_a"
 
 
+def test_pipeline_status_uses_generation_tracking(
+    tmp_path: pathlib.Path, mocker: MockerFixture
+) -> None:
+    """Status should use generation tracking to match run behavior.
+
+    After a successful run, deleting an intermediate output should still
+    show downstream stages as cached (not stale), matching pivot run behavior.
+    Generation tracking checks dependency versions, not output existence.
+    """
+    mocker.patch("pivot.project._project_root_cache", tmp_path)
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "input.txt").write_text("data")
+
+    register_test_stage(_helper_stage_a, name="stage_a")
+    register_test_stage(_helper_stage_b, name="stage_b")
+
+    old_cwd = os.getcwd()
+    os.chdir(tmp_path)
+    try:
+        executor.run(show_output=False)
+
+        results_before, _ = status.get_pipeline_status(
+            None, single_stage=False, cache_dir=None
+        )
+        assert all(r["status"] == "cached" for r in results_before)
+
+        (tmp_path / "a.txt").unlink()
+
+        results_after, _ = status.get_pipeline_status(
+            None, single_stage=False, cache_dir=None
+        )
+
+        stage_a = next(s for s in results_after if s["name"] == "stage_a")
+        stage_b = next(s for s in results_after if s["name"] == "stage_b")
+
+        assert stage_a["status"] == "cached", (
+            "stage_a should still be cached via generation tracking (deps unchanged)"
+        )
+        assert stage_b["status"] == "cached", (
+            "stage_b should still be cached via generation tracking"
+        )
+    finally:
+        os.chdir(old_cwd)
+
+
 # =============================================================================
 # Tracked Files Status Tests
 # =============================================================================

@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import pathlib
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
+
+import pydantic
 
 from pivot import (
     dag,
@@ -15,7 +17,7 @@ from pivot import (
 )
 from pivot.remote import config as remote_config
 from pivot.remote import sync as transfer
-from pivot.storage import cache, track
+from pivot.storage import cache, lock, track
 from pivot.storage import state as state_mod
 from pivot.types import (
     PipelineStatus,
@@ -30,6 +32,44 @@ if TYPE_CHECKING:
     from networkx import DiGraph
 
 logger = logging.getLogger(__name__)
+
+
+def _can_skip_via_generation(
+    stage_name: str,
+    fingerprint: dict[str, str],
+    deps: list[str],
+    current_params: dict[str, Any],
+    cache_dir: pathlib.Path,
+    state_db: state_mod.StateDB,
+) -> bool:
+    """Mirror executor/worker.py logic to ensure status matches run."""
+    stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(cache_dir))
+    lock_data = stage_lock.read()
+    if lock_data is None:
+        return False
+
+    if lock_data["code_manifest"] != fingerprint:
+        return False
+    if lock_data["params"] != current_params:
+        return False
+
+    recorded_gens = state_db.get_dep_generations(stage_name)
+    if recorded_gens is None:
+        return False
+
+    dep_paths = [pathlib.Path(d) for d in deps]
+    current_gens = state_db.get_many_generations(dep_paths)
+
+    for dep in deps:
+        path = pathlib.Path(dep)
+        normalized = str(project.normalize_path(dep))
+        current_gen = current_gens.get(path)
+        if current_gen is None:
+            return False
+        if current_gen != recorded_gens.get(normalized):
+            return False
+
+    return True
 
 
 def get_pipeline_status(
@@ -48,17 +88,52 @@ def get_pipeline_status(
     overrides = parameters.load_params_yaml()
 
     explanations = list[StageExplanation]()
-    for stage_name in execution_order:
-        stage_info = registry.REGISTRY.get(stage_name)
-        explanation = explain.get_stage_explanation(
-            stage_name,
-            stage_info["fingerprint"],
-            stage_info["deps_paths"],
-            stage_info["params"],
-            overrides,
-            resolved_cache_dir,
-        )
-        explanations.append(explanation)
+    with state_mod.StateDB(resolved_cache_dir, readonly=True) as state_db:
+        for stage_name in execution_order:
+            stage_info = registry.REGISTRY.get(stage_name)
+
+            can_skip = False
+            try:
+                current_params = parameters.get_effective_params(
+                    stage_info["params"], stage_name, overrides
+                )
+                can_skip = _can_skip_via_generation(
+                    stage_name,
+                    stage_info["fingerprint"],
+                    stage_info["deps_paths"],
+                    current_params,
+                    resolved_cache_dir,
+                    state_db,
+                )
+            except pydantic.ValidationError:
+                logger.debug(
+                    "Parameter validation failed for stage %s; treating as non-skippable",
+                    stage_name,
+                    exc_info=True,
+                )
+
+            if can_skip:
+                explanations.append(
+                    StageExplanation(
+                        stage_name=stage_name,
+                        will_run=False,
+                        is_forced=False,
+                        reason="",
+                        code_changes=[],
+                        param_changes=[],
+                        dep_changes=[],
+                    )
+                )
+            else:
+                explanation = explain.get_stage_explanation(
+                    stage_name,
+                    stage_info["fingerprint"],
+                    stage_info["deps_paths"],
+                    stage_info["params"],
+                    overrides,
+                    resolved_cache_dir,
+                )
+                explanations.append(explanation)
 
     return _compute_upstream_staleness(explanations, graph), graph
 
