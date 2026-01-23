@@ -15,11 +15,41 @@ if TYPE_CHECKING:
     from pytest_mock import MockerFixture
 
 
-def _make_mock_body_factory(mock_body_class: type[Any]) -> Any:
-    """Create a side_effect callable that returns a new mock body for each call."""
+class MockStreamContent:
+    _data: bytes
+    _read_called: bool
 
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+        self._read_called = False
+
+    async def read(self, size: int = -1) -> bytes:
+        if self._read_called:
+            return b""
+        self._read_called = True
+        return self._data
+
+
+class MockBody:
+    content: MockStreamContent
+
+    def __init__(self, data: bytes = b"content") -> None:
+        self.content = MockStreamContent(data)
+
+    async def __aenter__(self) -> MockBody:
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        pass
+
+
+def _make_mock_body(data: bytes = b"content") -> MockBody:
+    return MockBody(data)
+
+
+def _make_mock_body_factory() -> Any:
     def factory(**_: Any) -> dict[str, Any]:
-        return {"Body": mock_body_class()}
+        return {"Body": MockBody()}
 
     return factory
 
@@ -298,25 +328,10 @@ async def test_download_file(
     mock_s3_session: MagicMock, tmp_path: pathlib.Path, mocker: MockerFixture
 ) -> None:
     """download_file gets object from S3."""
-
-    class MockBody:
-        def __init__(self) -> None:
-            self._read_called: bool = False
-
-        async def __aenter__(self) -> MockBody:
-            return self
-
-        async def __aexit__(self, *args: object) -> None:
-            pass
-
-        async def read(self, size: int = -1) -> bytes:
-            if self._read_called:
-                return b""  # Signal end of stream
-            self._read_called = True
-            return b"downloaded content"
-
     mock_client = mocker.AsyncMock()
-    mock_client.get_object = mocker.AsyncMock(return_value={"Body": MockBody()})
+    mock_client.get_object = mocker.AsyncMock(
+        return_value={"Body": _make_mock_body(b"downloaded content")}
+    )
     mock_s3_session.client.return_value.__aenter__.return_value = mock_client
 
     dest_file = tmp_path / "dest.txt"
@@ -505,25 +520,8 @@ async def test_download_batch(
     mock_s3_session: MagicMock, tmp_path: pathlib.Path, mocker: MockerFixture
 ) -> None:
     """download_batch downloads multiple files in parallel."""
-
-    class MockBody:
-        def __init__(self) -> None:
-            self._read_called: bool = False
-
-        async def __aenter__(self) -> MockBody:
-            return self
-
-        async def __aexit__(self, *args: object) -> None:
-            pass
-
-        async def read(self, size: int = -1) -> bytes:
-            if self._read_called:
-                return b""  # Signal end of stream
-            self._read_called = True
-            return b"content"
-
     mock_client = mocker.AsyncMock()
-    mock_client.get_object = mocker.AsyncMock(side_effect=_make_mock_body_factory(MockBody))
+    mock_client.get_object = mocker.AsyncMock(side_effect=_make_mock_body_factory())
     mock_s3_session.client.return_value.__aenter__.return_value = mock_client
 
     items = [(f"a{i}b2c3d4e5f6789a", tmp_path / f"dest{i}.txt") for i in range(3)]
@@ -650,25 +648,8 @@ async def test_download_batch_with_callback(
     mock_s3_session: MagicMock, tmp_path: pathlib.Path, mocker: MockerFixture
 ) -> None:
     """download_batch calls callback for each completed download."""
-
-    class MockBody:
-        def __init__(self) -> None:
-            self._read_called: bool = False
-
-        async def __aenter__(self) -> MockBody:
-            return self
-
-        async def __aexit__(self, *args: object) -> None:
-            pass
-
-        async def read(self, size: int = -1) -> bytes:
-            if self._read_called:
-                return b""
-            self._read_called = True
-            return b"content"
-
     mock_client = mocker.AsyncMock()
-    mock_client.get_object = mocker.AsyncMock(side_effect=_make_mock_body_factory(MockBody))
+    mock_client.get_object = mocker.AsyncMock(side_effect=_make_mock_body_factory())
     mock_s3_session.client.return_value.__aenter__.return_value = mock_client
 
     items = [(f"a{i}b2c3d4e5f6789a", tmp_path / f"dest{i}.txt") for i in range(3)]
