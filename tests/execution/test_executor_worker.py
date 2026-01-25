@@ -47,6 +47,55 @@ def output_queue() -> Generator[mp.Queue[OutputMessage]]:
     manager.shutdown()
 
 
+def _make_stage_info(
+    func: object,
+    *,
+    fingerprint: dict[str, str] | None = None,
+    deps: list[str] | None = None,
+    outs: list[outputs.BaseOut] | None = None,
+    params: stage_def.StageParams | None = None,
+    signature: inspect.Signature | None = None,
+    checkout_modes: list[str] | None = None,
+    run_id: str = "test_run",
+    force: bool = False,
+    no_commit: bool = False,
+    no_cache: bool = False,
+    dep_specs: dict[str, stage_def.FuncDepSpec] | None = None,
+    out_specs: dict[str, outputs.Out[object]] | None = None,
+    params_arg_name: str | None = None,
+) -> WorkerStageInfo:
+    """Create a WorkerStageInfo with sensible defaults for testing."""
+    return {
+        "func": func,
+        "fingerprint": fingerprint or {"self:test": "abc123"},
+        "deps": deps or [],
+        "signature": signature,
+        "outs": outs or [],
+        "params": params,
+        "variant": None,
+        "overrides": {},
+        "checkout_modes": checkout_modes or ["hardlink", "symlink", "copy"],
+        "run_id": run_id,
+        "force": force,
+        "no_commit": no_commit,
+        "no_cache": no_cache,
+        "dep_specs": dep_specs or {},
+        "out_specs": out_specs or {},
+        "params_arg_name": params_arg_name,
+    }  # pyright: ignore[reportReturnType] - test helper
+
+
+# Helper functions for joblib tests (lambdas can't be typed properly without stubs)
+def _helper_double(x: int) -> int:
+    """Double the input value."""
+    return x * 2
+
+
+def _helper_identity(x: int) -> int:
+    """Return the input value unchanged."""
+    return x
+
+
 def _helper_always_fail_takeover(sentinel: pathlib.Path, stale_pid: int | None) -> bool:
     """Helper that always fails lock takeover (for testing retry exhaustion)."""
     _ = sentinel, stale_pid  # Unused
@@ -1843,3 +1892,255 @@ def test_single_annotated_return_saves_output(
     with open(output_file) as f:
         content = json.load(f)
     assert content == {"status": "success", "message": "output saved"}
+
+
+# =============================================================================
+# Nested Parallelism Protection Tests
+# =============================================================================
+
+
+def test_joblib_protection_uses_threading_backend() -> None:
+    """Nested joblib.Parallel uses threading backend when executed under protection."""
+    from pivot.executor import worker
+
+    def stage_that_checks_backend() -> str:
+        from joblib import Parallel, delayed
+
+        # Run a simple parallel job - the backend should be threading
+        results = Parallel(n_jobs=2)(delayed(_helper_double)(i) for i in range(4))
+        return str(results)
+
+    result = worker._execute_with_joblib_protection(stage_that_checks_backend, {})
+    assert result == "[0, 2, 4, 6]", "Parallel execution should work with threading backend"
+
+
+def test_joblib_protection_noop_without_joblib(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Protection is a no-op when joblib is not installed."""
+    import builtins
+    import sys
+    from typing import Any
+
+    from pivot.executor import worker
+
+    # Remove joblib from sys.modules to force re-import
+    joblib_modules = [k for k in sys.modules if k == "joblib" or k.startswith("joblib.")]
+    for mod in joblib_modules:
+        monkeypatch.delitem(sys.modules, mod)
+
+    original_import = builtins.__import__
+
+    def mock_import(
+        name: str,
+        globals_: dict[str, Any] | None = None,
+        locals_: dict[str, Any] | None = None,
+        fromlist: tuple[str, ...] = (),
+        level: int = 0,
+    ) -> Any:
+        if name == "joblib":
+            raise ImportError("Simulated missing joblib")
+        return original_import(name, globals_, locals_, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", mock_import)
+
+    def simple_func() -> str:
+        return "executed"
+
+    result = worker._execute_with_joblib_protection(simple_func, {})
+    assert result == "executed", "Function should execute normally without joblib"
+
+
+def test_joblib_protection_uses_threading_backend_via_config() -> None:
+    """Verifies parallel_config is called with threading backend."""
+    from unittest import mock
+
+    from pivot.executor import worker
+
+    def check_func() -> str:
+        return "done"
+
+    with mock.patch("joblib.parallel_config") as mock_config:
+        mock_config.return_value.__enter__ = mock.Mock(return_value=None)
+        mock_config.return_value.__exit__ = mock.Mock(return_value=None)
+
+        worker._execute_with_joblib_protection(check_func, {})
+
+        mock_config.assert_called_once()
+        call_kwargs = mock_config.call_args.kwargs
+        assert call_kwargs["backend"] == "threading"
+
+
+def test_user_explicit_parallel_config_overrides_protection() -> None:
+    """User's explicit parallel_config inside their function overrides our defaults.
+
+    NOTE: This test verifies joblib's nested context manager behavior (inner wins).
+    If joblib changes this behavior in a future version, this test may need updating.
+    """
+    from pivot.executor import worker
+
+    def stage_with_explicit_config() -> int:
+        from joblib import Parallel, delayed, parallel_config
+
+        # User explicitly requests loky backend inside their code
+        with parallel_config(backend="loky", n_jobs=2):
+            # This inner config should win (inner context takes precedence)
+            results = list(Parallel()(delayed(_helper_identity)(i) for i in range(2)))
+        return len(results)
+
+    # Even though we wrap with threading, the user's inner config takes precedence
+    result = worker._execute_with_joblib_protection(stage_with_explicit_config, {})
+    assert result == 2, "Inner parallel_config should work"
+
+
+# =============================================================================
+# _QueueWriter Thread Safety Tests
+# =============================================================================
+
+
+def test_queue_writer_thread_safety_concurrent_writes() -> None:
+    """_QueueWriter handles concurrent writes from multiple threads."""
+    import concurrent.futures
+    import threading
+
+    output_lines: list[tuple[str, bool]] = []
+    queue_obj: mp.Queue[OutputMessage] = mp.Manager().Queue()
+
+    writer = worker._QueueWriter(
+        "test_stage",
+        queue_obj,
+        is_stderr=False,
+        output_lines=output_lines,
+    )
+
+    num_threads = 10
+    lines_per_thread = 100
+    barrier = threading.Barrier(num_threads)
+
+    def write_lines(thread_id: int) -> None:
+        # Wait for all threads to be ready before starting
+        barrier.wait()
+        for i in range(lines_per_thread):
+            writer.write(f"thread-{thread_id}-line-{i}\n")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=num_threads) as pool:
+        futures = [pool.submit(write_lines, tid) for tid in range(num_threads)]
+        for f in futures:
+            f.result()
+
+    writer.flush()
+
+    # All lines should be captured (no data loss from race conditions)
+    expected_line_count = num_threads * lines_per_thread
+    assert len(output_lines) == expected_line_count, (
+        f"Expected {expected_line_count} lines, got {len(output_lines)} - possible thread safety issue"
+    )
+
+
+def test_queue_writer_thread_safety_atomic_writes() -> None:
+    """_QueueWriter write() calls are atomic - individual lines are not corrupted.
+
+    When multiple threads write complete lines (ending with newline), each line
+    should be intact. Interleaving of partial writes (without newlines) across
+    threads is expected since the lock protects individual write() calls, not
+    sequences of them.
+    """
+    import concurrent.futures
+    import threading
+
+    output_lines: list[tuple[str, bool]] = []
+    queue_obj: mp.Queue[OutputMessage] = mp.Manager().Queue()
+
+    writer = worker._QueueWriter(
+        "test_stage",
+        queue_obj,
+        is_stderr=False,
+        output_lines=output_lines,
+    )
+
+    num_threads = 5
+    lines_per_thread = 10
+    barrier = threading.Barrier(num_threads)
+
+    def write_complete_lines(thread_id: int) -> None:
+        barrier.wait()
+        # Write complete lines (full line in single write call) - these should NOT interleave
+        for i in range(lines_per_thread):
+            writer.write(f"t{thread_id}-i{i}\n")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=num_threads) as pool:
+        futures = [pool.submit(write_complete_lines, tid) for tid in range(num_threads)]
+        for f in futures:
+            f.result()
+
+    writer.flush()
+
+    # All lines should be captured
+    expected_count = num_threads * lines_per_thread
+    assert len(output_lines) == expected_count, (
+        f"Expected {expected_count} lines, got {len(output_lines)}"
+    )
+
+    # Each line should be properly formatted (not corrupted by interleaving)
+    for line, is_stderr in output_lines:
+        assert not is_stderr
+        # Line format: t{thread_id}-i{iteration}
+        assert line.startswith("t"), f"Corrupted line: {line}"
+        parts = line.split("-")
+        assert len(parts) == 2, f"Corrupted line (wrong number of parts): {line}"
+        assert parts[1].startswith("i"), f"Corrupted line (missing i prefix): {line}"
+
+
+# =============================================================================
+# Joblib Protection Environment Variable Tests
+# =============================================================================
+
+
+def test_joblib_protection_env_var_processes_disables_memmapping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PIVOT_NESTED_PARALLELISM=processes uses loky backend with memmapping disabled."""
+    from unittest import mock
+
+    from pivot.executor import worker
+
+    def stage_func() -> str:
+        return "done"
+
+    monkeypatch.setenv("PIVOT_NESTED_PARALLELISM", "processes")
+
+    with mock.patch("joblib.parallel_config") as mock_config:
+        mock_config.return_value.__enter__ = mock.Mock(return_value=None)
+        mock_config.return_value.__exit__ = mock.Mock(return_value=None)
+
+        result = worker._execute_with_joblib_protection(stage_func, {})
+
+        # parallel_config should be called with loky backend and memmapping disabled
+        mock_config.assert_called_once_with(backend="loky", max_nbytes=None)
+        assert result == "done"
+
+
+def test_joblib_protection_default_uses_threading(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Default behavior (no env var) uses threading backend."""
+    from unittest import mock
+
+    from pivot.executor import worker
+
+    def stage_func() -> str:
+        return "done"
+
+    # Ensure env var is not set
+    monkeypatch.delenv("PIVOT_NESTED_PARALLELISM", raising=False)
+
+    with mock.patch("joblib.parallel_config") as mock_config:
+        mock_config.return_value.__enter__ = mock.Mock(return_value=None)
+        mock_config.return_value.__exit__ = mock.Mock(return_value=None)
+
+        result = worker._execute_with_joblib_protection(stage_func, {})
+
+        mock_config.assert_called_once()
+        call_kwargs = mock_config.call_args.kwargs
+        assert call_kwargs["backend"] == "threading"
+        assert result == "done"

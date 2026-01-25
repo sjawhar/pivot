@@ -12,6 +12,7 @@ import logging
 import os
 import pathlib
 import queue
+import threading
 from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast
 
 import pydantic
@@ -459,6 +460,37 @@ def _verify_outputs_exist(stage_outs: list[outputs.BaseOut]) -> None:
             raise exceptions.OutputMissingError(f"Stage did not produce output: {out.path}")
 
 
+def _execute_with_joblib_protection(func: Callable[..., Any], kwargs: dict[str, Any]) -> Any:
+    """Execute stage with joblib threading backend to avoid nested multiprocessing issues.
+
+    By default, configures joblib to use threading backend, which works well for
+    GIL-releasing code (NumPy, pandas) and avoids resource_tracker race conditions.
+
+    Users can override via PIVOT_NESTED_PARALLELISM=processes env var, or by wrapping
+    their Parallel calls in their own parallel_config() context.
+    """
+    try:
+        from joblib import parallel_config
+    except ImportError:
+        logger.debug("joblib not installed - nested parallelism protection disabled")
+        return func(**kwargs)
+
+    # Environment variable allows users to opt into multiprocessing
+    env_override = os.environ.get("PIVOT_NESTED_PARALLELISM")
+    if env_override == "processes":
+        # Disable memmapping to prevent resource_tracker race conditions.
+        # This avoids KeyError tracebacks when Pivot's loky pool and joblib's
+        # nested loky pool have concurrent cleanup.
+        logger.debug("Nested parallelism: processes mode (memmapping disabled)")
+        with parallel_config(backend="loky", max_nbytes=None):
+            return func(**kwargs)
+
+    # Default: threading backend (safe for NumPy/pandas workloads)
+    logger.debug("Nested parallelism: threading mode")
+    with parallel_config(backend="threading"):
+        return func(**kwargs)
+
+
 def _run_stage_function_with_injection(
     func: Callable[..., Any],
     stage_name: str,
@@ -511,8 +543,8 @@ def _run_stage_function_with_injection(
             loaded_deps = stage_def.load_deps_from_specs(dep_specs, root)
             kwargs.update(loaded_deps)
 
-        # Execute function
-        result = func(**kwargs)
+        # Execute function with joblib threading protection
+        result = _execute_with_joblib_protection(func, kwargs)
 
         # Save outputs using pre-resolved specs from registration
         if out_specs:
@@ -533,6 +565,8 @@ class _QueueWriter:
 
     Handles stream redirection, output capture, and automatic flushing.
     Implements minimal file-like interface needed by print() and common libraries.
+    Thread-safe: multiple threads can write concurrently (needed when nested
+    joblib uses threading backend).
     """
 
     _stage_name: str
@@ -541,6 +575,7 @@ class _QueueWriter:
     _output_lines: list[tuple[str, bool]]
     _buffer: str
     _redirect: contextlib.AbstractContextManager[object]
+    _lock: threading.Lock
 
     def __init__(
         self,
@@ -555,6 +590,7 @@ class _QueueWriter:
         self._is_stderr = is_stderr
         self._output_lines = output_lines
         self._buffer = ""
+        self._lock = threading.Lock()
         # Create redirect context manager (not yet entered)
         # _QueueWriter implements write/flush but not full IO[str] interface
         if is_stderr:
@@ -583,17 +619,19 @@ class _QueueWriter:
             self._queue.put((self._stage_name, line, self._is_stderr), block=False)
 
     def write(self, s: str) -> int:
-        self._buffer += s
-        while "\n" in self._buffer:
-            line, self._buffer = self._buffer.split("\n", 1)
-            if line:
-                self._send_line(line)
+        with self._lock:
+            self._buffer += s
+            while "\n" in self._buffer:
+                line, self._buffer = self._buffer.split("\n", 1)
+                if line:
+                    self._send_line(line)
         return len(s)
 
     def flush(self) -> None:
-        if self._buffer:
-            self._send_line(self._buffer)
-            self._buffer = ""
+        with self._lock:
+            if self._buffer:
+                self._send_line(self._buffer)
+                self._buffer = ""
 
     def isatty(self) -> bool:
         return False
