@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime
+import json
 import multiprocessing as mp
 import shutil
 from multiprocessing import queues as mp_queues
@@ -66,7 +67,11 @@ def _make_stage_info(
         params=None,
         variant=None,
         overrides={},
-        checkout_modes=[cache.CheckoutMode.HARDLINK, cache.CheckoutMode.SYMLINK, cache.CheckoutMode.COPY],
+        checkout_modes=[
+            cache.CheckoutMode.HARDLINK,
+            cache.CheckoutMode.SYMLINK,
+            cache.CheckoutMode.COPY,
+        ],
         run_id=run_id,
         force=force,
         no_commit=no_commit,
@@ -667,3 +672,74 @@ def test_run_cache_restores_directory_output(
     assert (output_dir / "file2.txt").exists(), "file2.txt should be restored"
     assert (output_dir / "file1.txt").read_text() == "content1"
     assert (output_dir / "file2.txt").read_text() == "content2"
+
+
+def test_run_cache_reruns_when_noncached_output_missing(
+    worker_env: pathlib.Path, tmp_path: pathlib.Path, output_queue: mp_queues.Queue[OutputMessage]
+) -> None:
+    """Run cache should NOT skip when non-cached output (Metric) is missing.
+
+    Regression test for #243: when a non-cached output is deleted after
+    running once, the run cache incorrectly skipped execution instead of
+    re-running the stage to recreate the output.
+
+    This test uses BOTH a cached output (Out) and a non-cached output (Metric)
+    to ensure the run cache entry is created and the skip path is exercised.
+    """
+    (tmp_path / "input.txt").write_text("input data")
+
+    execution_count: list[int] = [0]
+
+    def stage_func() -> None:
+        execution_count[0] += 1
+        (tmp_path / "output.txt").write_text("output data")
+        (tmp_path / "metrics.json").write_text(json.dumps({"accuracy": 0.95}))
+
+    # Stage with both cached (Out) and non-cached (Metric) outputs
+    stage_info = _make_stage_info(
+        stage_func,
+        tmp_path,
+        deps=[str(tmp_path / "input.txt")],
+        outs=[
+            outputs.Out("output.txt", loader=loaders.PathOnly()),
+            outputs.Metric("metrics.json"),
+        ],
+    )
+
+    # First run - should execute and write to run cache
+    result1 = worker.execute_stage("test_stage", stage_info, worker_env, output_queue)
+    assert result1["status"] == StageStatus.RAN
+    assert execution_count[0] == 1
+
+    # Apply deferred writes (simulating what coordinator does)
+    # With a cached output, deferred_writes MUST contain a run cache entry
+    assert "deferred_writes" in result1, "Should have deferred writes with cached output"
+    state_db_path = worker_env.parent / "state.db"
+    output_paths: list[str] = [str(out.path) for out in stage_info["outs"]]
+    with state.StateDB(state_db_path) as db:
+        db.apply_deferred_writes("test_stage", output_paths, result1["deferred_writes"])
+
+    # Verify both files exist
+    output_file = tmp_path / "output.txt"
+    metric_file = tmp_path / "metrics.json"
+    assert output_file.exists()
+    assert metric_file.exists()
+
+    # Delete the lock file so run cache is used instead of lock-based skip
+    production_lock = lock.StageLock("test_stage", lock.get_stages_dir(worker_env))
+    production_lock.path.unlink()
+
+    # Delete the metric file (non-cached output)
+    # The cached output.txt remains on disk
+    metric_file.unlink()
+    assert not metric_file.exists()
+    assert output_file.exists(), "Cached output should still exist"
+
+    # Second run - should re-run because the non-cached metric file is missing
+    # Before the fix, this incorrectly skipped via run cache
+    result2 = worker.execute_stage("test_stage", stage_info, worker_env, output_queue)
+    assert result2["status"] == StageStatus.RAN, "Should re-run when non-cached output is missing"
+    assert execution_count[0] == 2, "Stage should have executed again"
+
+    # Verify the metric file was recreated
+    assert metric_file.exists(), "Metric file should be recreated"

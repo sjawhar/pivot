@@ -81,33 +81,39 @@ def compute_input_hash(
     code_manifest: dict[str, str],
     params: dict[str, object],
     deps: list[DepEntry],
-    out_paths: list[str],
+    out_specs: list[tuple[str, bool]],
 ) -> str:
     """Compute input hash for run cache key.
 
-    Hash is computed from code manifest, params, dependency hashes, and output paths.
-    Output hashes are NOT included (they're stored in the value, not the key).
+    Hash is computed from code manifest, params, dependency hashes, and output specs.
+    Output specs include both path and cache flag to ensure cache invalidation when
+    an output's cache property changes (e.g., Out -> Metric).
     """
     data = {
         "code_manifest": code_manifest,
         "params": params,
         "deps": sorted([(d["path"], d["hash"]) for d in deps]),
-        "out_paths": sorted(out_paths),
+        "out_specs": sorted(out_specs),
     }
     content = json.dumps(data, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(content.encode()).hexdigest()[:16]
 
 
-def compute_input_hash_from_lock(lock_data: LockData, out_paths: list[str]) -> str:
-    """Compute input hash from existing lock data."""
+def compute_input_hash_from_lock(lock_data: LockData) -> str:
+    """Compute input hash from existing lock data.
+
+    Derives output specs from lock data: outputs with None hash are non-cached.
+    """
     deps = [
         DepEntry(path=path, hash=info["hash"]) for path, info in lock_data["dep_hashes"].items()
     ]
+    # Derive cache flag from output hash: None means cache=False
+    out_specs = [(path, oh is not None) for path, oh in lock_data["output_hashes"].items()]
     return compute_input_hash(
         code_manifest=lock_data["code_manifest"],
         params=lock_data["params"],
         deps=deps,
-        out_paths=out_paths,
+        out_specs=out_specs,
     )
 
 

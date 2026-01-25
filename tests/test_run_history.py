@@ -39,10 +39,10 @@ def test_compute_input_hash_deterministic() -> None:
     code_manifest = {"self:func": "abc123"}
     params: dict[str, object] = {"lr": 0.01}
     deps = [DepEntry(path="data.csv", hash="def456")]
-    out_paths = ["model.pkl"]
+    out_specs = [("model.pkl", True)]
 
-    hash1 = run_history.compute_input_hash(code_manifest, params, deps, out_paths)
-    hash2 = run_history.compute_input_hash(code_manifest, params, deps, out_paths)
+    hash1 = run_history.compute_input_hash(code_manifest, params, deps, out_specs)
+    hash2 = run_history.compute_input_hash(code_manifest, params, deps, out_specs)
     assert hash1 == hash2
 
 
@@ -51,16 +51,16 @@ def test_compute_input_hash_different_for_different_inputs() -> None:
     code_manifest = {"self:func": "abc123"}
     params: dict[str, object] = {"lr": 0.01}
     deps = [DepEntry(path="data.csv", hash="def456")]
-    out_paths = ["model.pkl"]
+    out_specs = [("model.pkl", True)]
 
-    hash1 = run_history.compute_input_hash(code_manifest, params, deps, out_paths)
+    hash1 = run_history.compute_input_hash(code_manifest, params, deps, out_specs)
 
     # Change code manifest
-    hash2 = run_history.compute_input_hash({"self:func": "changed"}, params, deps, out_paths)
+    hash2 = run_history.compute_input_hash({"self:func": "changed"}, params, deps, out_specs)
     assert hash1 != hash2
 
     # Change params
-    hash3 = run_history.compute_input_hash(code_manifest, {"lr": 0.02}, deps, out_paths)
+    hash3 = run_history.compute_input_hash(code_manifest, {"lr": 0.02}, deps, out_specs)
     assert hash1 != hash3
 
     # Change deps
@@ -68,13 +68,17 @@ def test_compute_input_hash_different_for_different_inputs() -> None:
         code_manifest,
         params,
         [DepEntry(path="data.csv", hash="changed")],
-        out_paths,
+        out_specs,
     )
     assert hash1 != hash4
 
+    # Change output cache flag (Out -> Metric conversion)
+    hash5 = run_history.compute_input_hash(code_manifest, params, deps, [("model.pkl", False)])
+    assert hash1 != hash5, "Cache flag change should produce different hash"
+
 
 def test_compute_input_hash_order_independent_for_deps() -> None:
-    """Input hash should be order-independent for deps."""
+    """Input hash should be order-independent for deps and output specs."""
     deps_a = [
         DepEntry(path="a.csv", hash="aaa"),
         DepEntry(path="b.csv", hash="bbb"),
@@ -87,6 +91,13 @@ def test_compute_input_hash_order_independent_for_deps() -> None:
     hash_a = run_history.compute_input_hash({}, {}, deps_a, [])
     hash_b = run_history.compute_input_hash({}, {}, deps_b, [])
     assert hash_a == hash_b
+
+    # Output specs order should also be independent
+    out_specs_a = [("a.txt", True), ("b.txt", False)]
+    out_specs_b = [("b.txt", False), ("a.txt", True)]
+    hash_c = run_history.compute_input_hash({}, {}, [], out_specs_a)
+    hash_d = run_history.compute_input_hash({}, {}, [], out_specs_b)
+    assert hash_c == hash_d
 
 
 def test_serialize_deserialize_run_manifest() -> None:

@@ -1137,10 +1137,7 @@ def _write_run_history(
         lock_data = stage_lock.read()
 
         if lock_data:
-            stage_info = registry.REGISTRY.get(name)
-            # Registry always stores single-file outputs (multi-file are expanded)
-            out_paths = [str(out.path) for out in stage_info["outs"]]
-            input_hash = run_history.compute_input_hash_from_lock(lock_data, out_paths)
+            input_hash = run_history.compute_input_hash_from_lock(lock_data)
         else:
             input_hash = "<no-lock>"
 

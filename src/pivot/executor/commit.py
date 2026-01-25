@@ -51,8 +51,7 @@ def commit_pending(cache_dir: pathlib.Path | None = None) -> list[str]:
                 state_db.increment_generation(pathlib.Path(out_path))
 
             # Write run cache entry with sentinel run_id (never pruned)
-            out_paths = list(pending_data["output_hashes"].keys())
-            input_hash = run_history.compute_input_hash_from_lock(pending_data, out_paths)
+            input_hash = run_history.compute_input_hash_from_lock(pending_data)
             worker.write_run_cache_entry(
                 stage_name, input_hash, pending_data["output_hashes"], COMMITTED_RUN_ID, state_db
             )

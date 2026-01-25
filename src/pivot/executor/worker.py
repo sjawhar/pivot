@@ -21,6 +21,8 @@ from pivot.storage import cache, lock, state
 from pivot.types import (
     DeferredWrites,
     DepEntry,
+    DirHash,
+    FileHash,
     HashInfo,
     LockData,
     OutputHash,
@@ -263,6 +265,11 @@ def _get_normalized_out_paths(stage_info: WorkerStageInfo) -> list[str]:
     return [str(project.normalize_path(str(out.path))) for out in stage_info["outs"]]
 
 
+def _get_output_specs(stage_info: WorkerStageInfo) -> list[tuple[str, bool]]:
+    """Get normalized output specs (path, cache flag) for input hash computation."""
+    return [(str(project.normalize_path(str(out.path))), out.cache) for out in stage_info["outs"]]
+
+
 def _check_skip_or_run(
     stage_name: str,
     stage_info: WorkerStageInfo,
@@ -281,9 +288,10 @@ def _check_skip_or_run(
     - input_hash is always returned for run cache recording
     """
     out_paths = _get_normalized_out_paths(stage_info)
+    out_specs = _get_output_specs(stage_info)
     deps_list = [DepEntry(path=path, hash=info["hash"]) for path, info in dep_hashes.items()]
     input_hash = run_history.compute_input_hash(
-        current_fingerprint, current_params, deps_list, out_paths
+        current_fingerprint, current_params, deps_list, out_specs
     )
 
     if lock_data is None:
@@ -724,9 +732,16 @@ def _try_skip_via_run_cache(
         return None
 
     # Build output hash map preserving manifest for directories
-    output_hash_map = {
+    output_hash_map: dict[str, FileHash | DirHash] = {
         oh["path"]: run_history.entry_to_output_hash(oh) for oh in entry["output_hashes"]
     }
+
+    # Validate cached outputs match expected: run cache entry should only contain
+    # outputs that have cache=True. The input hash includes cache flags, so a mismatch
+    # here indicates corruption or a bug.
+    expected_cached_paths = {str(out.path) for out in stage_outs if out.cache}
+    if set(output_hash_map.keys()) != expected_cached_paths:
+        return None
 
     restored_paths = list[pathlib.Path]()
 
@@ -737,23 +752,25 @@ def _try_skip_via_run_cache(
 
         cached_output = output_hash_map.get(str(out.path))
         if cached_output is None:
-            if out.cache:
+            # Output doesn't exist on disk and isn't in cache - must re-run
+            if restored_paths:
                 _cleanup_restored_paths(restored_paths)
-                return None
-            continue
+            return None
 
         try:
             restored = cache.restore_from_cache(
                 path, cached_output, files_cache_dir, checkout_modes=checkout_modes
             )
         except OSError:
-            _cleanup_restored_paths(restored_paths)
+            if restored_paths:
+                _cleanup_restored_paths(restored_paths)
             return None
 
         if restored:
             restored_paths.append(path)
         else:
-            _cleanup_restored_paths(restored_paths)
+            if restored_paths:
+                _cleanup_restored_paths(restored_paths)
             return None
 
     return _make_result(StageStatus.SKIPPED, "unchanged (run cache)", [])
