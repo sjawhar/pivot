@@ -10,14 +10,21 @@ from pivot import exceptions, metrics
 
 if TYPE_CHECKING:
     from pivot.registry import RegistryStageInfo
+    from pivot.storage.track import PvtData
 
 
-def build_dag(stages: dict[str, RegistryStageInfo], validate: bool = True) -> nx.DiGraph[str]:
+def build_dag(
+    stages: dict[str, RegistryStageInfo],
+    validate: bool = True,
+    tracked_files: dict[str, PvtData] | None = None,
+) -> nx.DiGraph[str]:
     """Build DAG from registered stages.
 
     Args:
         stages: Dict of stage_name -> stage_info (from registry._stages)
         validate: If True, validate that all dependencies exist
+        tracked_files: Dict of tracked file paths -> PvtData (from .pvt files).
+            If provided, tracked files are recognized as valid dependency sources.
 
     Returns:
         DiGraph with edges from consumer to producer
@@ -43,6 +50,7 @@ def build_dag(stages: dict[str, RegistryStageInfo], validate: bool = True) -> nx
 
         outputs_map = _build_outputs_map(stages)
         outputs_trie = _build_outputs_trie(stages)
+        tracked_trie = _build_tracked_trie(tracked_files) if tracked_files else None
 
         for stage_name, stage_info in stages.items():
             for dep in stage_info["deps_paths"]:
@@ -55,7 +63,15 @@ def build_dag(stages: dict[str, RegistryStageInfo], validate: bool = True) -> nx
                     for prod in producers:
                         graph.add_edge(stage_name, prod)
 
-                    if not producers and validate and not pathlib.Path(dep).exists():
+                    if not producers and validate:
+                        # Check if dependency exists on disk
+                        if pathlib.Path(dep).exists():
+                            continue
+
+                        # Check if dependency is a tracked file (valid source)
+                        if tracked_trie and _is_tracked_path(dep, tracked_trie):
+                            continue
+
                         raise exceptions.DependencyNotFoundError(
                             stage=stage_name,
                             dep=dep,
@@ -117,6 +133,35 @@ def _find_producers_for_path(
             producers.append(stage_name)
 
     return producers
+
+
+def _build_tracked_trie(tracked_files: dict[str, PvtData]) -> pygtrie.Trie[str]:
+    """Build trie of tracked file paths for dependency checking.
+
+    Keys are path tuples (from Path.parts), values are the absolute path string.
+    """
+    trie: pygtrie.Trie[str] = pygtrie.Trie()
+    for abs_path in tracked_files:
+        path_key = pathlib.Path(abs_path).parts
+        trie[path_key] = abs_path
+    return trie
+
+
+def _is_tracked_path(dep: str, tracked_trie: pygtrie.Trie[str]) -> bool:
+    """Check if dependency is a tracked file (exact match or inside tracked directory)."""
+    dep_key = pathlib.Path(dep).parts
+
+    # Exact match
+    if dep_key in tracked_trie:
+        return True
+
+    # Dependency is inside a tracked directory
+    prefix_item = tracked_trie.shortest_prefix(dep_key)
+    if prefix_item is not None and prefix_item.value is not None:
+        return True
+
+    # Dependency is a directory containing tracked files
+    return tracked_trie.has_subtrie(dep_key)
 
 
 def _check_acyclic(graph: nx.DiGraph[str]) -> None:

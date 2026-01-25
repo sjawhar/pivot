@@ -49,7 +49,7 @@ class WorkerStageInfo(TypedDict):
     params: stage_def.StageParams | None
     variant: str | None
     overrides: parameters.ParamsOverrides
-    checkout_modes: list[str]
+    checkout_modes: list[cache.CheckoutMode]
     run_id: str
     force: bool
     no_commit: bool
@@ -109,8 +109,7 @@ def execute_stage(
                 output_lines=[],
             )
 
-        # Convert string checkout modes to enum (strings required for pickling across processes)
-        checkout_modes = [cache.CheckoutMode(m) for m in stage_info["checkout_modes"]]
+        checkout_modes = stage_info["checkout_modes"]
 
         # Production lock for skip detection, pending lock for --no-commit mode
         production_lock = lock.StageLock(stage_name, lock.get_stages_dir(cache_dir))

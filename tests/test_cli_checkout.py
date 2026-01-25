@@ -273,10 +273,10 @@ def test_checkout_unknown_target_errors(
         assert result.exit_code != 0
 
 
-def test_checkout_already_exists_skips(
+def test_checkout_already_exists_errors_by_default(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
-    """Checkout skips files that already exist (without --force)."""
+    """Checkout errors on files that already exist (without --force or --only-missing)."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
         project._project_root_cache = None
@@ -287,10 +287,32 @@ def test_checkout_already_exists_skips(
         # Modify file
         pathlib.Path("data.csv").write_text("modified")
 
-        # Checkout should skip (file exists)
+        # Checkout should error (file exists, no flag specified)
         result = runner.invoke(cli.cli, ["checkout", "data.csv"])
+        assert result.exit_code == 1
+        assert "already exists" in result.output
+        assert pathlib.Path("data.csv").read_text() == "modified"
+
+
+def test_checkout_only_missing_skips_existing(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """Checkout with --only-missing skips files that already exist."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        project._project_root_cache = None
+
+        pathlib.Path("data.csv").write_text("original")
+        runner.invoke(cli.cli, ["track", "data.csv"])
+
+        # Modify file
+        pathlib.Path("data.csv").write_text("modified")
+
+        # Checkout with --only-missing should skip (file exists)
+        result = runner.invoke(cli.cli, ["checkout", "--only-missing", "data.csv"])
         assert result.exit_code == 0
-        assert "skip" in result.output.lower() or pathlib.Path("data.csv").read_text() == "modified"
+        assert "skip" in result.output.lower()
+        assert pathlib.Path("data.csv").read_text() == "modified"
 
 
 def test_checkout_force_overwrites(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:

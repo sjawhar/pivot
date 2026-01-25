@@ -225,11 +225,39 @@ class PlotsError(PivotError):
 
 
 class TrackedFileMissingError(CacheError):
-    """Raised when a .pvt tracked file is missing (user should run pivot checkout)."""
+    """Raised when .pvt tracked files are missing (user should run pivot checkout)."""
+
+    _missing: list[str]
+    _checkout_attempted: bool
+
+    def __init__(self, missing_files: list[str], checkout_attempted: bool = False) -> None:
+        self._missing = missing_files
+        self._checkout_attempted = checkout_attempted
+        super().__init__(self._format_message())
+
+    def _format_message(self) -> str:
+        missing_list = "\n".join(f"  - {p}" for p in self._missing)
+        if self._checkout_attempted:
+            return (
+                f"The following tracked files are missing:\n{missing_list}\n\n"
+                + "These files are not in local cache."
+            )
+        return (
+            f"The following tracked files are missing:\n{missing_list}\n\n"
+            + "These files are tracked by Pivot but don't exist on disk."
+        )
 
     @override
     def get_suggestion(self) -> str:
-        return "Run 'pivot checkout' to restore from cache"
+        if self._checkout_attempted:
+            return "Run 'pivot pull' to fetch from remote storage"
+        if len(self._missing) == 1:
+            return f"Run 'pivot checkout {self._missing[0]}' to restore, or 'pivot checkout --only-missing' to restore all missing files"
+        return "Run 'pivot checkout --only-missing' to restore missing files, or 'pivot run --checkout-missing' to restore and run"
+
+    @override
+    def __reduce__(self) -> tuple[type, tuple[list[str], bool]]:
+        return (self.__class__, (self._missing, self._checkout_attempted))
 
 
 class GetError(PivotError):

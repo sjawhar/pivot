@@ -436,8 +436,14 @@ class StageRegistry:
             return self._cached_dag
 
         from pivot import dag
+        from pivot.storage import track
 
-        graph = dag.build_dag(self._stages, validate=validate)
+        # Discover tracked files to recognize them as valid dependency sources
+        tracked_files = None
+        if validate:
+            tracked_files = track.discover_pvt_files(project.get_project_root())
+
+        graph = dag.build_dag(self._stages, validate=validate, tracked_files=tracked_files)
 
         # Cache only when validating (safe to reuse)
         if validate:

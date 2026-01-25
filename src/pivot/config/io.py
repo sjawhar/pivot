@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 _NOT_FOUND: object = object()
 
-DEFAULT_CHECKOUT_MODE_ORDER = [str(m) for m in models.CheckoutMode]
+DEFAULT_CHECKOUT_MODE_ORDER: list[models.CheckoutMode] = list(models.CheckoutMode)
 
 
 def get_global_config_path() -> pathlib.Path:
@@ -268,11 +268,11 @@ def unset_config_value(key: str, scope: models.ConfigScope = models.ConfigScope.
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
-def get_checkout_mode_order() -> list[str]:
+def get_checkout_mode_order() -> list[models.CheckoutMode]:
     """Get checkout mode fallback order from merged config or default."""
     try:
         merged = get_merged_config()
-        checkout_modes = [str(m) for m in merged.cache.checkout_mode]
+        checkout_modes = list(merged.cache.checkout_mode)
         if checkout_modes:
             return checkout_modes
     except (exceptions.ConfigError, pydantic.ValidationError) as e:

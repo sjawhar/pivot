@@ -334,6 +334,7 @@ def run(
     no_cache: bool = False,
     progress_callback: Callable[[RunJsonEvent], None] | None = None,
     cancel_event: threading.Event | None = None,
+    checkout_missing: bool = False,
 ) -> dict[str, ExecutionSummary]:
     """Execute pipeline stages with greedy parallel execution.
 
@@ -356,6 +357,7 @@ def run(
         no_cache: If True, skip caching outputs entirely (maximum iteration speed).
         progress_callback: Callback for JSONL progress events (stage start/complete).
         cancel_event: If set, stop starting new stages and mark pending as cancelled.
+        checkout_missing: If True, restore missing tracked files from cache before running.
 
     Returns:
         Dict of stage_name -> {status: "ran"|"skipped"|"failed", reason: str}
@@ -375,7 +377,7 @@ def run(
 
     # Verify tracked files before building DAG (provides better error messages)
     project_root = project.get_project_root()
-    _verify_tracked_files(project_root)
+    _verify_tracked_files(project_root, checkout_missing=checkout_missing)
 
     graph = registry.REGISTRY.build_dag(validate=True)
 
@@ -499,8 +501,30 @@ def _initialize_stage_states(
     return states
 
 
-def _verify_tracked_files(project_root: pathlib.Path) -> None:
-    """Verify all .pvt tracked files exist and warn on hash mismatches."""
+def _restore_tracked_file(
+    path: pathlib.Path,
+    track_data: track.PvtData,
+    cache_dir: pathlib.Path,
+) -> bool:
+    """Restore a tracked file from cache.
+
+    Returns True if successfully restored, False if not in cache.
+    """
+    output_hash = track.pvt_to_hash_info(track_data)
+
+    # Use default checkout modes (hardlink with copy fallback)
+    checkout_modes = config.get_checkout_mode_order()
+    return cache.restore_from_cache(path, output_hash, cache_dir, checkout_modes=checkout_modes)
+
+
+def _verify_tracked_files(project_root: pathlib.Path, checkout_missing: bool = False) -> None:
+    """Verify all .pvt tracked files exist and warn on hash mismatches.
+
+    Args:
+        project_root: Project root directory.
+        checkout_missing: If True, restore missing tracked files from cache before validating.
+            Only restores files that don't exist - never overwrites existing files.
+    """
     tracked_files = track.discover_pvt_files(project_root)
     if not tracked_files:
         return
@@ -508,19 +532,33 @@ def _verify_tracked_files(project_root: pathlib.Path) -> None:
     with metrics.timed("core.verify_tracked_files"):
         missing = list[str]()
         state_db_path = project_root / ".pivot" / "state.db"
+        cache_dir = project_root / ".pivot" / "cache" / "files"
 
         with state_mod.StateDB(state_db_path) as state_db:
             for data_path, track_data in tracked_files.items():
                 path = pathlib.Path(data_path)
-                if not path.exists():
-                    missing.append(data_path)
+
+                # Try to hash the file - handles race conditions where file disappears
+                try:
+                    if path.is_file():
+                        current_hash = cache.hash_file(path, state_db)
+                    elif path.is_dir():
+                        current_hash, _ = cache.hash_directory(path, state_db)
+                    else:
+                        # Path doesn't exist
+                        raise FileNotFoundError(data_path)
+                except FileNotFoundError:
+                    if checkout_missing:
+                        if _restore_tracked_file(path, track_data, cache_dir):
+                            logger.info(f"Restored tracked file: {data_path}")
+                        else:
+                            logger.debug(f"Failed to restore tracked file from cache: {data_path}")
+                            missing.append(data_path)
+                    else:
+                        missing.append(data_path)
                     continue
 
                 # Check hash mismatch (file exists but content changed)
-                if path.is_file():
-                    current_hash = cache.hash_file(path, state_db)
-                else:
-                    current_hash, _ = cache.hash_directory(path, state_db)
                 if current_hash != track_data["hash"]:
                     logger.warning(
                         f"Tracked file '{data_path}' has changed since tracking. "
@@ -528,11 +566,7 @@ def _verify_tracked_files(project_root: pathlib.Path) -> None:
                     )
 
         if missing:
-            missing_list = "\n".join(f"  - {p}" for p in missing)
-            raise exceptions.TrackedFileMissingError(
-                f"The following tracked files are missing:\n{missing_list}\n\n"
-                + "Run 'pivot checkout' to restore them from cache."
-            )
+            raise exceptions.TrackedFileMissingError(missing, checkout_attempted=checkout_missing)
 
 
 def _warn_single_stage_mutex_groups(stage_states: dict[str, StageState]) -> None:
@@ -566,7 +600,7 @@ def _execute_greedy(
     stage_timeout: float | None = None,
     overrides: parameters.ParamsOverrides | None = None,
     explain_mode: bool = False,
-    checkout_modes: list[str] | None = None,
+    checkout_modes: list[cache.CheckoutMode] | None = None,
     tui_queue: TuiQueue | None = None,
     output_queue: mp.Queue[OutputMessage] | None = None,
     run_id: str = "",
@@ -578,7 +612,7 @@ def _execute_greedy(
 ) -> None:
     """Execute stages with greedy parallel scheduling using loky ProcessPoolExecutor."""
     overrides = overrides or {}
-    checkout_modes = checkout_modes or config.DEFAULT_CHECKOUT_MODE_ORDER
+    checkout_modes = checkout_modes or config.get_checkout_mode_order()
     futures: dict[concurrent.futures.Future[StageResult], str] = {}
     mutex_counts: collections.defaultdict[str, int] = collections.defaultdict(int)
 
@@ -841,7 +875,7 @@ def _start_ready_stages(
     mutex_counts: collections.defaultdict[str, int],
     overrides: parameters.ParamsOverrides,
     lifecycle: StageLifecycle,
-    checkout_modes: list[str] | None = None,
+    checkout_modes: list[cache.CheckoutMode] | None = None,
     force: bool = False,
     no_commit: bool = False,
     no_cache: bool = False,
@@ -853,7 +887,7 @@ def _start_ready_stages(
     if cancel_event is not None and cancel_event.is_set():
         return
 
-    checkout_modes = checkout_modes or config.DEFAULT_CHECKOUT_MODE_ORDER
+    checkout_modes = checkout_modes or config.get_checkout_mode_order()
     started = 0
 
     for stage_name, state in stage_states.items():
@@ -915,7 +949,7 @@ def _start_ready_stages(
 def _prepare_worker_info(
     stage_info: registry.RegistryStageInfo,
     overrides: parameters.ParamsOverrides,
-    checkout_modes: list[str],
+    checkout_modes: list[cache.CheckoutMode],
     run_id: str,
     force: bool,
     no_commit: bool,

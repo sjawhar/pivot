@@ -13,7 +13,7 @@ import pytest
 from pivot import loaders, outputs, project, run_history, watch
 from pivot.executor import commit as commit_mod
 from pivot.executor import worker
-from pivot.storage import lock, state
+from pivot.storage import cache, lock, state
 from pivot.types import OutputMessage, StageStatus
 
 if TYPE_CHECKING:
@@ -66,7 +66,7 @@ def _make_stage_info(
         params=None,
         variant=None,
         overrides={},
-        checkout_modes=["hardlink", "symlink", "copy"],
+        checkout_modes=[cache.CheckoutMode.HARDLINK, cache.CheckoutMode.SYMLINK, cache.CheckoutMode.COPY],
         run_id=run_id,
         force=force,
         no_commit=no_commit,

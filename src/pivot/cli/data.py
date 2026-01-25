@@ -175,8 +175,9 @@ def data_get(
     project_root = project.get_project_root()
     cache_dir = project_root / ".pivot" / "cache"
 
-    mode_strings = [checkout_mode] if checkout_mode else config.get_checkout_mode_order()
-    checkout_modes = [cache.CheckoutMode(m) for m in mode_strings]
+    checkout_modes = (
+        [cache.CheckoutMode(checkout_mode)] if checkout_mode else config.get_checkout_mode_order()
+    )
 
     messages = restore.restore_targets_from_revision(
         targets=list(targets),

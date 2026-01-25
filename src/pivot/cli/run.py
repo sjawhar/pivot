@@ -127,6 +127,7 @@ def _run_with_tui(
     no_cache: bool = False,
     on_error: OnError = OnError.FAIL,
     allow_uncached_incremental: bool = False,
+    checkout_missing: bool = False,
 ) -> dict[str, ExecutionSummary] | None:
     """Run pipeline with TUI display."""
     import queue as thread_queue
@@ -166,6 +167,7 @@ def _run_with_tui(
             no_cache=no_cache,
             on_error=on_error,
             allow_uncached_incremental=allow_uncached_incremental,
+            checkout_missing=checkout_missing,
         )
 
     with _suppress_stderr_logging():
@@ -308,6 +310,11 @@ def _run_watch_with_tui(
     is_flag=True,
     help="Allow running stages with IncrementalOut files that exist but aren't in cache.",
 )
+@click.option(
+    "--checkout-missing",
+    is_flag=True,
+    help="Restore tracked files that don't exist on disk from cache before running.",
+)
 @click.pass_context
 def run(
     ctx: click.Context,
@@ -327,6 +334,7 @@ def run(
     keep_going: bool,
     serve: bool,
     allow_uncached_incremental: bool,
+    checkout_missing: bool,
 ) -> None:
     """Execute pipeline stages.
 
@@ -460,6 +468,7 @@ def run(
             no_cache=no_cache,
             on_error=on_error,
             allow_uncached_incremental=allow_uncached_incremental,
+            checkout_missing=checkout_missing,
         )
     elif as_json:
         # JSONL streaming mode
@@ -480,6 +489,7 @@ def run(
             progress_callback=cli_helpers.emit_jsonl,
             on_error=on_error,
             allow_uncached_incremental=allow_uncached_incremental,
+            checkout_missing=checkout_missing,
         )
         total_duration_ms = (time.perf_counter() - start_time) * 1000
 
@@ -510,6 +520,7 @@ def run(
             on_error=on_error,
             show_output=not quiet,
             allow_uncached_incremental=allow_uncached_incremental,
+            checkout_missing=checkout_missing,
         )
 
     if not results and show_human_output:
