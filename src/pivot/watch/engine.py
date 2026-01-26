@@ -15,7 +15,6 @@ import threading
 import time
 from typing import TYPE_CHECKING
 
-import loky
 import watchfiles
 import yaml
 
@@ -45,7 +44,7 @@ if TYPE_CHECKING:
     import networkx as nx
 
     from pivot.registry import RegistryStageInfo
-    from pivot.types import TuiMessage, WatchJsonEvent
+    from pivot.types import TuiQueue, WatchJsonEvent
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +62,21 @@ _CONFIG_FILE_NAMES = (
     "params.yml",
     ".pivotignore",
 )
+
+
+class CombinedEvent:
+    """Event wrapper that is set when any component event is set.
+
+    Used to make watchfiles.watch() exit on either shutdown or restart signals.
+    """
+
+    _events: tuple[threading.Event, ...]
+
+    def __init__(self, *events: threading.Event) -> None:
+        self._events = events
+
+    def is_set(self) -> bool:
+        return any(e.is_set() for e in self._events)
 
 
 def _clear_project_modules(root: pathlib.Path) -> int:
@@ -151,7 +165,7 @@ class WatchEngine:
     _no_cache: bool
     _change_queue: queue.Queue[set[pathlib.Path]]
     _shutdown: threading.Event
-    _tui_queue: mp.Queue[TuiMessage] | None
+    _tui_queue: TuiQueue | None
     _output_queue: mp.Queue[OutputMessage] | None
     _watcher_thread: threading.Thread | None
     _cached_dag: nx.DiGraph[str] | None
@@ -160,6 +174,10 @@ class WatchEngine:
     _ignore_filter: ignore.IgnoreFilter
     _keep_going_event: threading.Event
     _toggle_lock: threading.Lock
+    _output_filter: _watch_utils.OutputFilter
+    _cancel_event: threading.Event
+    _restart_event: threading.Event
+    _current_watch_paths: list[pathlib.Path]
 
     # Agent RPC state
     _agent_state: AgentState
@@ -209,6 +227,11 @@ class WatchEngine:
         self._ignore_filter = ignore.IgnoreFilter(project_root=project.get_project_root())
         self._keep_going_event = threading.Event()
         self._toggle_lock = threading.Lock()
+        # Initialized with empty stages; updated in run() with actual stages
+        self._output_filter = _watch_utils.OutputFilter([])
+        self._cancel_event = threading.Event()
+        self._restart_event = threading.Event()
+        self._current_watch_paths = list[pathlib.Path]()
         if on_error == OnError.KEEP_GOING:
             self._keep_going_event.set()
 
@@ -225,7 +248,7 @@ class WatchEngine:
 
     def run(
         self,
-        tui_queue: mp.Queue[TuiMessage] | None = None,
+        tui_queue: TuiQueue | None = None,
         output_queue: mp.Queue[OutputMessage] | None = None,
     ) -> None:
         """Start watch engine with watcher and coordinator."""
@@ -238,10 +261,17 @@ class WatchEngine:
             graph, self._stages, single_stage=self._single_stage
         )
 
+        # Update output filter BEFORE starting watcher thread (fixes race condition)
+        # The filter combines output paths with execution state for atomic filtering
+        self._output_filter.update_outputs(stages_to_run)
+
+        # Collect watch paths and store for later comparison during restarts
+        self._current_watch_paths = _watch_utils.collect_watch_paths(stages_to_run)
+
         # Start watcher thread (non-daemon - we have proper cleanup via _shutdown event)
         self._watcher_thread = threading.Thread(
             target=self._watch_loop,
-            args=(stages_to_run,),
+            args=(list(self._current_watch_paths),),
         )
         self._watcher_thread.start()
 
@@ -282,9 +312,9 @@ class WatchEngine:
                 )
 
             # Send shutdown sentinel to TUI queue
+            # Note: tui_queue is stdlib queue.Queue, so put() doesn't raise OSError/ValueError
             if self._tui_queue is not None:
-                with contextlib.suppress(OSError, ValueError):
-                    self._tui_queue.put(None)
+                self._tui_queue.put(None)
 
     def shutdown(self) -> None:
         """Signal graceful shutdown."""
@@ -392,15 +422,14 @@ class WatchEngine:
 
         Called from asyncio event loop thread, must be thread-safe.
 
-        Note: The current execution engine does not support mid-execution
-        cancellation. This method returns cancelled=False to honestly report
-        that the execution will continue to completion.
+        Cancellation is stage-level: running stages complete normally, but no new
+        stages are started. Pending stages are marked as skipped with reason "cancelled".
         """
         with self._agent_lock:
             if self._agent_state == AgentState.RUNNING:
-                logger.warning(
-                    "Agent cancellation requested while RUNNING, but cancellation is not supported"
-                )
+                self._cancel_event.set()
+                logger.info("Agent cancellation requested - pending stages will be skipped")
+                return AgentCancelResult(cancelled=True)
             return AgentCancelResult(cancelled=False)
 
     def _check_agent_requests(self) -> tuple[str, list[str] | None, bool] | None:
@@ -453,7 +482,7 @@ class WatchEngine:
         )
 
         # Track execution progress for exception handling
-        results: dict[str, executor.ExecutionSummary] = {}
+        results = dict[str, executor.ExecutionSummary]()
 
         try:
             # Store original force settings and override if requested
@@ -504,21 +533,25 @@ class WatchEngine:
         self._update_agent_state(AgentState.WATCHING)
         self._send_message("Watching for changes...")
 
-    def _watch_loop(self, stages_to_run: list[str]) -> None:
+    def _watch_loop(self, watch_paths: list[pathlib.Path]) -> None:
         """Pure producer - monitors files, enqueues changes."""
         try:
-            watch_paths = _watch_utils.collect_watch_paths(stages_to_run)
+            # OutputFilter handles both output paths and execution state atomically
             watch_filter = _watch_utils.create_watch_filter(
-                stages_to_run, ignore_filter=self._ignore_filter
+                ignore_filter=self._ignore_filter,
+                output_filter=self._output_filter,
             )
             pending = set[pathlib.Path]()
+
+            # Combined event exits on shutdown OR restart request
+            stop_event = CombinedEvent(self._shutdown, self._restart_event)
 
             logger.info(f"Watching paths: {watch_paths}")
 
             for changes in watchfiles.watch(
                 *watch_paths,
                 watch_filter=watch_filter,
-                stop_event=self._shutdown,
+                stop_event=stop_event,
             ):
                 pending.update(pathlib.Path(path) for _, path in changes)
 
@@ -538,6 +571,51 @@ class WatchEngine:
             logger.critical(f"Watcher thread failed: {e}")
             self._send_message(f"File watcher failed: {e}", status=types.WatchStatus.ERROR)
             self.shutdown()  # Signal coordinator to exit
+
+    def _restart_watcher_if_paths_changed(self, stages: list[str]) -> None:
+        """Restart watcher thread if watch paths have changed after registry reload.
+
+        Note: There's a brief window (typically <100ms) between the old watcher stopping
+        and the new one starting where file changes could theoretically be missed. This is
+        acceptable because: (1) code changes already triggered this restart, so the user
+        just made a change, (2) the executor's lockfile-based change detection will catch
+        any missed changes on the next execution cycle.
+        """
+        new_paths = _watch_utils.collect_watch_paths(stages)
+        new_paths_set = set(new_paths)
+        current_paths_set = set(self._current_watch_paths)
+
+        if new_paths_set == current_paths_set:
+            return  # No change
+
+        added = new_paths_set - current_paths_set
+        removed = current_paths_set - new_paths_set
+        logger.info(f"Watch paths changed: +{len(added)} -{len(removed)} paths")
+        logger.debug(f"Watch paths added: {added}")
+        logger.debug(f"Watch paths removed: {removed}")
+
+        # Signal the old watcher to stop (combined event will trigger)
+        self._restart_event.set()
+
+        # Wait for watcher thread to exit
+        if self._watcher_thread is not None:
+            self._watcher_thread.join(timeout=3.0)
+            if self._watcher_thread.is_alive():
+                logger.warning("Watcher thread did not exit within timeout during restart")
+
+        # Create a fresh restart event for the new watcher thread.
+        # Don't clear the old event - if the old thread is still running, it needs
+        # to see the stop signal. The new thread gets a fresh, unset event.
+        self._restart_event = threading.Event()
+        self._current_watch_paths = list(new_paths)
+
+        # Start new watcher thread with updated paths
+        self._watcher_thread = threading.Thread(
+            target=self._watch_loop,
+            args=(list(self._current_watch_paths),),
+        )
+        self._watcher_thread.start()
+        logger.info(f"Watcher restarted with {len(new_paths)} paths")
 
     def _coordinator_loop(self) -> None:
         """Orchestrate execution waves based on file changes and agent requests."""
@@ -574,6 +652,13 @@ class WatchEngine:
                 self._invalidate_caches()
                 reload_ok = self._reload_registry()
                 self._restart_worker_pool()
+
+                if reload_ok:
+                    # Atomically update outputs in filter - safe even if watcher is iterating
+                    stages = list(self._stages or registry.REGISTRY.list_stages())
+                    self._output_filter.update_outputs(stages)
+                    # Restart watcher if new stages have dependencies outside current watch paths
+                    self._restart_watcher_if_paths_changed(stages)
 
                 if not reload_ok:
                     # Pipeline is invalid - show error banner and wait for fix
@@ -661,6 +746,8 @@ class WatchEngine:
         # Atomic replacement - build new caches only when needed via lazy getters
         self._cached_dag = None
         self._cached_file_index = None
+        # Also invalidate registry's cached DAG since code may have changed
+        registry.REGISTRY.invalidate_dag_cache()
 
     def _reload_registry(self) -> bool:
         """Reload the registry by re-importing modules that define stages.
@@ -865,9 +952,9 @@ class WatchEngine:
 
     def _restart_worker_pool(self) -> None:
         """Kill existing workers, spawn fresh ones with reimported modules."""
-        max_workers = self._max_workers or os.cpu_count() or 1
-        loky.get_reusable_executor(max_workers=max_workers, kill_workers=True)
-        logger.info(f"Worker pool restarted with {max_workers} workers")
+        stages = self._stages or list(registry.REGISTRY.list_stages())
+        workers = executor.restart_workers(len(stages) if stages else 1, self._max_workers)
+        logger.info(f"Worker pool restarted with {workers} workers")
 
     def _execute_stages(self, stages: list[str] | None) -> dict[str, executor.ExecutionSummary]:
         """Execute stages using the executor."""
@@ -876,19 +963,28 @@ class WatchEngine:
         show_output = self._tui_queue is None and not self._json_output
         # Read keep-going state at execution start (toggle takes effect on next wave)
         on_error = OnError.KEEP_GOING if self._keep_going_event.is_set() else OnError.FAIL
-        results = executor.run(
-            stages=stages,
-            single_stage=self._single_stage,
-            cache_dir=self._cache_dir,
-            max_workers=self._max_workers,
-            show_output=show_output,
-            tui_queue=self._tui_queue,
-            output_queue=self._output_queue,
-            force=force,
-            no_commit=self._no_commit,
-            no_cache=self._no_cache,
-            on_error=on_error,
-        )
+
+        # Clear cancel event before starting new execution
+        self._cancel_event.clear()
+
+        # Track execution window to distinguish Pivot outputs from external modifications
+        # Context manager ensures end_execution() is called even on exceptions
+        with self._output_filter.executing():
+            results = executor.run(
+                stages=stages,
+                single_stage=self._single_stage,
+                cache_dir=self._cache_dir,
+                max_workers=self._max_workers,
+                show_output=show_output,
+                tui_queue=self._tui_queue,
+                output_queue=self._output_queue,
+                force=force,
+                no_commit=self._no_commit,
+                no_cache=self._no_cache,
+                on_error=on_error,
+                cancel_event=self._cancel_event,
+            )
+
         self._first_run_done = True
         return results
 

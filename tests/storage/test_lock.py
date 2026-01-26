@@ -570,3 +570,166 @@ def test_read_lock_with_extra_keys_accepted(tmp_path: Path) -> None:
     assert result is not None
     assert result["code_manifest"] == {}
     assert result["params"] == {}
+
+
+# =============================================================================
+# Output Path Change Detection Tests
+# =============================================================================
+
+
+def test_stage_changed_output_path_added(tmp_path: Path) -> None:
+    """Stage is marked changed when a new output path is added."""
+    stage_lock = lock.StageLock("producer", tmp_path)
+    stage_lock.write(
+        LockData(
+            code_manifest={"self:producer": "hash"},
+            params={},
+            dep_hashes={},
+            output_hashes={"/path/to/output.csv": {"hash": "abc123"}},
+            dep_generations={},
+        )
+    )
+
+    changed, reason = stage_lock.is_changed_with_lock_data(
+        lock_data=stage_lock.read(),
+        current_fingerprint={"self:producer": "hash"},
+        current_params={},
+        dep_hashes={},
+        out_paths=["/path/to/output.csv", "/path/to/new_output.csv"],
+    )
+
+    assert changed is True
+    assert "output" in reason.lower()
+
+
+def test_stage_changed_output_path_removed(tmp_path: Path) -> None:
+    """Stage is marked changed when an output path is removed."""
+    stage_lock = lock.StageLock("producer", tmp_path)
+    stage_lock.write(
+        LockData(
+            code_manifest={"self:producer": "hash"},
+            params={},
+            dep_hashes={},
+            output_hashes={
+                "/path/to/output1.csv": {"hash": "abc123"},
+                "/path/to/output2.csv": {"hash": "def456"},
+            },
+            dep_generations={},
+        )
+    )
+
+    changed, reason = stage_lock.is_changed_with_lock_data(
+        lock_data=stage_lock.read(),
+        current_fingerprint={"self:producer": "hash"},
+        current_params={},
+        dep_hashes={},
+        out_paths=["/path/to/output1.csv"],
+    )
+
+    assert changed is True
+    assert "output" in reason.lower()
+
+
+def test_stage_changed_output_path_modified(tmp_path: Path) -> None:
+    """Stage is marked changed when output path changes (e.g., out_path_overrides)."""
+    stage_lock = lock.StageLock("producer", tmp_path)
+    stage_lock.write(
+        LockData(
+            code_manifest={"self:producer": "hash"},
+            params={},
+            dep_hashes={},
+            output_hashes={"/path/to/output.csv": {"hash": "abc123"}},
+            dep_generations={},
+        )
+    )
+
+    changed, reason = stage_lock.is_changed_with_lock_data(
+        lock_data=stage_lock.read(),
+        current_fingerprint={"self:producer": "hash"},
+        current_params={},
+        dep_hashes={},
+        out_paths=["/path/to/results/output.csv"],  # Different path
+    )
+
+    assert changed is True
+    assert "output" in reason.lower()
+
+
+def test_stage_unchanged_with_same_output_paths(tmp_path: Path) -> None:
+    """Stage is not changed when output paths match (order-independent)."""
+    stage_lock = lock.StageLock("producer", tmp_path)
+    stage_lock.write(
+        LockData(
+            code_manifest={"self:producer": "hash"},
+            params={},
+            dep_hashes={},
+            output_hashes={
+                "/path/to/output1.csv": {"hash": "abc123"},
+                "/path/to/output2.csv": {"hash": "def456"},
+            },
+            dep_generations={},
+        )
+    )
+
+    # Provide paths in different order to test order-independence
+    changed, reason = stage_lock.is_changed_with_lock_data(
+        lock_data=stage_lock.read(),
+        current_fingerprint={"self:producer": "hash"},
+        current_params={},
+        dep_hashes={},
+        out_paths=["/path/to/output2.csv", "/path/to/output1.csv"],
+    )
+
+    assert changed is False
+    assert reason == ""
+
+
+def test_stage_unchanged_when_out_paths_none(tmp_path: Path) -> None:
+    """Backward compat: when out_paths not passed, skip output path check."""
+    stage_lock = lock.StageLock("producer", tmp_path)
+    stage_lock.write(
+        LockData(
+            code_manifest={"self:producer": "hash"},
+            params={},
+            dep_hashes={},
+            output_hashes={"/path/to/output.csv": {"hash": "abc123"}},
+            dep_generations={},
+        )
+    )
+
+    # Call without out_paths parameter (backward compat)
+    changed, reason = stage_lock.is_changed_with_lock_data(
+        lock_data=stage_lock.read(),
+        current_fingerprint={"self:producer": "hash"},
+        current_params={},
+        dep_hashes={},
+    )
+
+    assert changed is False
+    assert reason == ""
+
+
+def test_dep_path_change_invalidates_cache(tmp_path: Path) -> None:
+    """Verify dep path changes correctly invalidate cache (documentation test)."""
+    stage_lock = lock.StageLock("consumer", tmp_path)
+    stage_lock.write(
+        LockData(
+            code_manifest={"self:consumer": "hash"},
+            params={},
+            dep_hashes={"/old/path/data.csv": {"hash": "abc123"}},
+            output_hashes={},
+            dep_generations={},
+        )
+    )
+
+    # Same hash, different path - should invalidate
+    new_dep_hashes: dict[str, HashInfo] = {"/new/path/data.csv": {"hash": "abc123"}}
+    changed, reason = stage_lock.is_changed_with_lock_data(
+        lock_data=stage_lock.read(),
+        current_fingerprint={"self:consumer": "hash"},
+        current_params={},
+        dep_hashes=new_dep_hashes,
+    )
+
+    assert changed is True
+    assert "input" in reason.lower() or "dep" in reason.lower()

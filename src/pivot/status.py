@@ -3,14 +3,16 @@ from __future__ import annotations
 import asyncio
 import logging
 import pathlib
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from typing import TYPE_CHECKING
 
 from pivot import (
+    config,
     dag,
     exceptions,
     explain,
+    metrics,
     parameters,
-    project,
     registry,
 )
 from pivot.remote import config as remote_config
@@ -18,6 +20,9 @@ from pivot.remote import sync as transfer
 from pivot.storage import cache, track
 from pivot.storage import state as state_mod
 from pivot.types import (
+    CodeChange,
+    DepChange,
+    ParamChange,
     PipelineStatus,
     PipelineStatusInfo,
     RemoteSyncInfo,
@@ -35,32 +40,58 @@ logger = logging.getLogger(__name__)
 def get_pipeline_status(
     stages: list[str] | None,
     single_stage: bool,
-    cache_dir: pathlib.Path | None,
 ) -> tuple[list[PipelineStatusInfo], DiGraph[str]]:
     """Get status for all stages, tracking upstream staleness."""
-    graph = registry.REGISTRY.build_dag(validate=True)
-    execution_order = dag.get_execution_order(graph, stages, single_stage=single_stage)
+    with metrics.timed("status.get_pipeline_status"):
+        graph = registry.REGISTRY.build_dag(validate=True)
+        execution_order = dag.get_execution_order(graph, stages, single_stage=single_stage)
 
-    if not execution_order:
-        return [], graph
+        if not execution_order:
+            return [], graph
 
-    resolved_cache_dir = cache_dir or project.get_project_root() / ".pivot" / "cache"
-    overrides = parameters.load_params_yaml()
+        state_dir = config.get_state_dir()
+        overrides = parameters.load_params_yaml()
 
-    explanations = list[StageExplanation]()
-    for stage_name in execution_order:
-        stage_info = registry.REGISTRY.get(stage_name)
-        explanation = explain.get_stage_explanation(
-            stage_name,
-            stage_info["fingerprint"],
-            stage_info["deps_paths"],
-            stage_info["params"],
-            overrides,
-            resolved_cache_dir,
-        )
-        explanations.append(explanation)
+        # Compute explanations in parallel (I/O-bound: lock file reads, hashing)
+        # ThreadPoolExecutor is appropriate since work is file I/O, not CPU
+        max_workers = min(8, len(execution_order))
+        explanations_by_name = dict[str, StageExplanation]()
 
-    return _compute_upstream_staleness(explanations, graph), graph
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = dict[Future[StageExplanation], str]()
+            for stage_name in execution_order:
+                stage_info = registry.REGISTRY.get(stage_name)
+                future = pool.submit(
+                    explain.get_stage_explanation,
+                    stage_name,
+                    stage_info["fingerprint"],
+                    stage_info["deps_paths"],
+                    stage_info["params"],
+                    overrides,
+                    state_dir,
+                )
+                futures[future] = stage_name
+
+            for future in as_completed(futures):
+                stage_name = futures[future]
+                try:
+                    explanations_by_name[stage_name] = future.result()
+                except Exception as e:
+                    logger.warning(f"Failed to get explanation for {stage_name}: {e}")
+                    explanations_by_name[stage_name] = StageExplanation(
+                        stage_name=stage_name,
+                        will_run=True,
+                        is_forced=False,
+                        reason=f"Error: {e}",
+                        code_changes=list[CodeChange](),
+                        param_changes=list[ParamChange](),
+                        dep_changes=list[DepChange](),
+                    )
+
+        # Preserve original order for staleness propagation
+        explanations = [explanations_by_name[name] for name in execution_order]
+
+        return _compute_upstream_staleness(explanations, graph), graph
 
 
 def _compute_upstream_staleness(
@@ -159,7 +190,7 @@ def get_remote_status(
     if not local_hashes:
         return RemoteSyncInfo(name=resolved_name, url=url, push_count=0, pull_count=0)
 
-    with state_mod.StateDB(cache_dir) as state_db:
+    with state_mod.StateDB(config.get_state_dir() / "state.db") as state_db:
         status = asyncio.run(
             transfer.compare_status(local_hashes, s3_remote, state_db, resolved_name)
         )

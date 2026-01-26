@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, TypedDict, cast
+from typing import TYPE_CHECKING, Any, TypedDict, cast
 
 import click
 
@@ -79,7 +79,7 @@ def _classify_targets(
 def resolve_output_paths(
     targets: list[str],
     proj_root: Path,
-    output_type: type[outputs.Metric] | type[outputs.Plot],
+    output_type: type[outputs.Metric] | type[outputs.Plot[Any]],
 ) -> tuple[set[str], list[str]]:
     """Resolve targets to output file paths.
 
@@ -163,7 +163,7 @@ def _format_unknown_targets_error(missing: list[str]) -> str:
 def resolve_and_validate(
     targets: tuple[str, ...],
     proj_root: Path,
-    output_type: type[outputs.Metric] | type[outputs.Plot],
+    output_type: type[outputs.Metric] | type[outputs.Plot[Any]],
 ) -> set[str] | None:
     """Validate targets and resolve to output paths.
 

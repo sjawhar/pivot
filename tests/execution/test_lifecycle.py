@@ -1,4 +1,4 @@
-import multiprocessing as mp
+import queue
 import time
 from typing import cast
 
@@ -9,8 +9,8 @@ from pivot.types import (
     StageCompleteEvent,
     StageResult,
     StageStatus,
-    TuiMessage,
     TuiMessageType,
+    TuiQueue,
     TuiStatusMessage,
 )
 
@@ -35,10 +35,10 @@ def _make_stage_state(name: str, index: int = 1) -> executor_core.StageState:
             params=None,
             variant=None,
             mutex=[],
-            cwd=None,
             signature=None,
             dep_specs={},
-            out_path_overrides=None,
+            out_specs={},
+            params_arg_name=None,
         ),
         upstream=[],
         upstream_unfinished=set(),
@@ -58,7 +58,7 @@ def test_lifecycle_mark_started_updates_state() -> None:
     )
     state = _make_stage_state("stage1")
 
-    lifecycle.mark_started(state, running_count=1)
+    lifecycle.mark_started(state)
 
     assert state.status == StageStatus.IN_PROGRESS
     assert state.start_time is not None
@@ -78,7 +78,7 @@ def test_lifecycle_mark_completed_updates_state() -> None:
     state.start_time = time.perf_counter() - 1.0  # Started 1s ago
 
     result = StageResult(status=StageStatus.RAN, reason="completed", output_lines=[])
-    lifecycle.mark_completed(state, result, completed_count=1)
+    lifecycle.mark_completed(state, result)
 
     assert state.status == StageStatus.RAN
     assert state.result == result
@@ -97,7 +97,7 @@ def test_lifecycle_mark_failed_updates_state() -> None:
     state = _make_stage_state("stage1")
     state.start_time = time.perf_counter() - 1.0
 
-    lifecycle.mark_failed(state, "some error", completed_count=1)
+    lifecycle.mark_failed(state, "some error")
 
     assert state.status == StageStatus.FAILED
     assert state.result is not None
@@ -129,9 +129,8 @@ def test_lifecycle_mark_skipped_upstream_updates_state() -> None:
 
 def test_lifecycle_mark_started_sends_tui_message() -> None:
     """mark_started sends TUI status message when queue is provided."""
-    manager = mp.Manager()
-    # Manager().Queue() returns Queue[Any] - cast is safe for TUI messages
-    tui_queue: mp.Queue[TuiMessage] = manager.Queue()  # pyright: ignore[reportAssignmentType]
+    # TUI queue uses stdlib queue.Queue (inter-thread, not cross-process)
+    tui_queue: TuiQueue = queue.Queue()
 
     lifecycle = executor_core.StageLifecycle(
         tui_queue=tui_queue,
@@ -142,7 +141,7 @@ def test_lifecycle_mark_started_sends_tui_message() -> None:
     )
     state = _make_stage_state("stage1", index=1)
 
-    lifecycle.mark_started(state, running_count=1)
+    lifecycle.mark_started(state)
 
     # Check TUI message was sent - cast to TuiStatusMessage for type safety
     msg = cast("TuiStatusMessage", tui_queue.get(timeout=1.0))
@@ -151,13 +150,10 @@ def test_lifecycle_mark_started_sends_tui_message() -> None:
     assert msg["status"] == StageStatus.IN_PROGRESS
     assert msg["run_id"] == "test_run_123"
 
-    manager.shutdown()
-
 
 def test_lifecycle_mark_skipped_upstream_sends_tui_message() -> None:
     """mark_skipped_upstream sends TUI status message (critical for history bug fix)."""
-    manager = mp.Manager()
-    tui_queue: mp.Queue[TuiMessage] = manager.Queue()  # pyright: ignore[reportAssignmentType]
+    tui_queue: TuiQueue = queue.Queue()
 
     lifecycle = executor_core.StageLifecycle(
         tui_queue=tui_queue,
@@ -178,13 +174,10 @@ def test_lifecycle_mark_skipped_upstream_sends_tui_message() -> None:
     assert "upstream 'upstream_stage' failed" in msg["reason"]
     assert msg["run_id"] == "test_run_123"
 
-    manager.shutdown()
-
 
 def test_lifecycle_mark_completed_sends_tui_message() -> None:
     """mark_completed sends TUI status message."""
-    manager = mp.Manager()
-    tui_queue: mp.Queue[TuiMessage] = manager.Queue()  # pyright: ignore[reportAssignmentType]
+    tui_queue: TuiQueue = queue.Queue()
 
     lifecycle = executor_core.StageLifecycle(
         tui_queue=tui_queue,
@@ -197,7 +190,7 @@ def test_lifecycle_mark_completed_sends_tui_message() -> None:
     state.start_time = time.perf_counter() - 1.0
 
     result = StageResult(status=StageStatus.RAN, reason="success", output_lines=[])
-    lifecycle.mark_completed(state, result, completed_count=1)
+    lifecycle.mark_completed(state, result)
 
     msg = cast("TuiStatusMessage", tui_queue.get(timeout=1.0))
     assert msg["type"] == TuiMessageType.STATUS
@@ -206,8 +199,6 @@ def test_lifecycle_mark_completed_sends_tui_message() -> None:
     assert msg["reason"] == "success"
     assert msg["run_id"] == "test_run_123"
     assert msg["elapsed"] is not None
-
-    manager.shutdown()
 
 
 def test_lifecycle_calls_progress_callback() -> None:
@@ -226,14 +217,14 @@ def test_lifecycle_calls_progress_callback() -> None:
     )
     state = _make_stage_state("stage1", index=1)
 
-    lifecycle.mark_started(state, running_count=1)
+    lifecycle.mark_started(state)
 
     assert len(events) == 1
     assert events[0]["type"] == "stage_start"
     assert events[0]["stage"] == "stage1"
 
     result = StageResult(status=StageStatus.RAN, reason="done", output_lines=[])
-    lifecycle.mark_completed(state, result, completed_count=1)
+    lifecycle.mark_completed(state, result)
 
     assert len(events) == 2
     assert events[1]["type"] == "stage_complete"
@@ -250,8 +241,7 @@ def test_lifecycle_calls_progress_callback() -> None:
 
 def test_handle_stage_failure_marks_downstream_with_notifications() -> None:
     """_handle_stage_failure marks downstream stages as SKIPPED with TUI notifications."""
-    manager = mp.Manager()
-    tui_queue: mp.Queue[TuiMessage] = manager.Queue()  # pyright: ignore[reportAssignmentType]
+    tui_queue: TuiQueue = queue.Queue()
 
     lifecycle = executor_core.StageLifecycle(
         tui_queue=tui_queue,
@@ -302,8 +292,6 @@ def test_handle_stage_failure_marks_downstream_with_notifications() -> None:
         assert msg["status"] == StageStatus.SKIPPED
         assert msg["run_id"] == "test_run_123"
 
-    manager.shutdown()
-
 
 def test_handle_stage_failure_without_lifecycle_still_works() -> None:
     """_handle_stage_failure works without lifecycle (no TUI notifications)."""
@@ -320,3 +308,31 @@ def test_handle_stage_failure_without_lifecycle_still_works() -> None:
     assert stage_b.status == StageStatus.SKIPPED
     assert stage_b.result is not None
     assert "upstream 'stage_a' failed" in stage_b.result["reason"]
+
+
+def test_lifecycle_mark_skipped_upstream_console_shows_correct_index() -> None:
+    """mark_skipped_upstream shows the stage's correct index in console output, not 0."""
+    import io
+
+    from pivot.tui import console
+
+    # Capture console output
+    output = io.StringIO()
+    con = console.Console(stream=output, color=False)
+
+    lifecycle = executor_core.StageLifecycle(
+        tui_queue=None,
+        con=con,
+        progress_callback=None,
+        total_stages=10,
+        run_id="test_run",
+    )
+    state = _make_stage_state("downstream_stage", index=5)
+
+    lifecycle.mark_skipped_upstream(state, "upstream_stage")
+
+    console_output = output.getvalue()
+    # The bug: console shows [0/10] instead of [5/10]
+    # Fixed: console should show the stage's actual index
+    assert "[5/10]" in console_output, f"Expected [5/10] in output, got: {console_output}"
+    assert "[0/10]" not in console_output, f"Bug: [0/10] found in output: {console_output}"

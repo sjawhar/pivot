@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import importlib
-import inspect
 import itertools
 import re
 import typing
@@ -24,9 +23,8 @@ class PipelineConfigError(Exception):
 class NamedOutputOptions(TypedDict, total=False):
     """Options for named output specifications (includes path)."""
 
-    path: str
+    path: str | list[str]
     cache: bool
-    persist: bool
     x: str  # For plots
     y: str  # For plots
     template: str  # For plots
@@ -51,18 +49,10 @@ class VariantDict(TypedDict, total=False):
     outs: dict[str, NamedOutputValue]
     params: dict[str, Any]
     mutex: list[str]
-    cwd: str
 
 
 class DimensionOverrides(pydantic.BaseModel):
-    """Overrides that can be applied per matrix dimension value.
-
-    Keys within deps/outs/metrics/plots dicts can end with '+' to append
-    rather than replace. For example:
-        deps:
-          tokenizer+: data/tokenizer.json  # Adds 'tokenizer' key to base deps
-          data: data/other.csv             # Replaces 'data' key in base deps
-    """
+    """Overrides that can be applied per matrix dimension value."""
 
     model_config = pydantic.ConfigDict(extra="forbid")  # pyright: ignore[reportUnannotatedClassAttribute]
 
@@ -72,7 +62,6 @@ class DimensionOverrides(pydantic.BaseModel):
     plots: OutputsSpec | None = None
     params: dict[str, Any] | None = None  # JSON-compatible values from YAML
     mutex: list[str] | None = None
-    cwd: str | None = None
 
 
 # Primitive types allowed in matrix dimension lists
@@ -98,19 +87,8 @@ class StageConfig(pydantic.BaseModel):
     plots: OutputsSpec = {}
     params: dict[str, Any] = {}
     mutex: list[str] = []
-    cwd: str | None = None
     matrix: dict[str, MatrixDimension] | None = None
     variants: str | None = None
-
-    @pydantic.field_validator("cwd")
-    @classmethod
-    def validate_cwd(cls, v: str | None) -> str | None:
-        """Validate cwd doesn't contain path traversal or injection characters."""
-        if v is not None:
-            error = path_policy.validate_path_syntax(v)
-            if error:
-                raise ValueError(f"cwd {error} (got '{v}')")
-        return v
 
 
 class PipelineConfig(pydantic.BaseModel):
@@ -140,7 +118,6 @@ class ExpandedStage(pydantic.BaseModel):
     out_path_overrides: dict[str, registry.OutOverride]
     params: pydantic.BaseModel | None
     mutex: list[str]
-    cwd: str
     variant: str | None
 
 
@@ -201,18 +178,17 @@ def register_from_pipeline_file(pipeline_file: Path) -> None:
     global_vars = _load_vars_files(pipeline.vars, pipeline_dir)
 
     for stage_name, stage_config in pipeline.stages.items():
-        _register_stage(stage_name, stage_config, pipeline_dir, global_vars)
+        _register_stage(stage_name, stage_config, global_vars)
 
 
 def _register_stage(
     name: str,
     config: StageConfig,
-    pipeline_dir: Path,
     global_vars: dict[str, str],
 ) -> None:
     """Register a single stage from configuration."""
     if config.matrix is not None:
-        expanded = _expand_matrix(name, config, pipeline_dir, global_vars)
+        expanded = _expand_matrix(name, config, global_vars)
         for stage in expanded:
             registry.REGISTRY.register(
                 func=stage.func,
@@ -222,7 +198,6 @@ def _register_stage(
                 params=stage.params,
                 mutex=stage.mutex,
                 variant=stage.variant,
-                cwd=stage.cwd,
             )
     elif config.variants is not None:
         variants_func = _import_function(config.variants)
@@ -234,9 +209,9 @@ def _register_stage(
             )
         func = _import_function(config.python)
         for variant in typing.cast("list[VariantDict]", variants):
-            _register_variant_from_dict(name, func, variant, pipeline_dir)
+            _register_variant_from_dict(name, func, variant)
     else:
-        _register_simple_stage(name, config, pipeline_dir, global_vars)
+        _register_simple_stage(name, config, global_vars)
 
 
 def _validate_output_type(
@@ -296,12 +271,10 @@ def _process_typed_output_section(
 def _register_simple_stage(
     name: str,
     config: StageConfig,
-    pipeline_dir: Path,
     global_vars: dict[str, str],
 ) -> None:
     """Register a simple (non-matrix) stage."""
     func = _import_function(config.python)
-    cwd = config.cwd or str(pipeline_dir)
 
     # Interpolate deps path overrides
     dep_path_overrides = _normalize_deps_spec(config.deps, global_vars, name)
@@ -310,7 +283,7 @@ def _register_simple_stage(
     out_path_overrides = _normalize_out_path_overrides(config.outs, global_vars, name)
 
     # Get return output specs for type validation
-    return_out_specs = stage_def.get_output_specs_from_return(func)
+    return_out_specs = stage_def.get_output_specs_from_return(func, name)
 
     # Process metrics and plots sections
     _process_typed_output_section(
@@ -326,7 +299,6 @@ def _register_simple_stage(
         config.plots, out_path_overrides, return_out_specs, outputs.Plot, "plots", name, global_vars
     )
 
-    cwd = _interpolate(cwd, global_vars, name)
     params_instance = _resolve_params(func, config.params, name)
 
     registry.REGISTRY.register(
@@ -336,17 +308,26 @@ def _register_simple_stage(
         out_path_overrides=out_path_overrides or None,
         params=params_instance,
         mutex=config.mutex,
-        cwd=cwd,
     )
+
+
+_VARIANT_DICT_KEYS = frozenset({"name", "deps", "outs", "params", "mutex"})
 
 
 def _register_variant_from_dict(
     base_name: str,
     func: Callable[..., Any],
     variant: VariantDict,
-    pipeline_dir: Path,
 ) -> None:
     """Register a variant from Python escape hatch."""
+    # Validate no unknown keys (catch typos like "parmas" instead of "params")
+    unknown_keys = set(variant.keys()) - _VARIANT_DICT_KEYS
+    if unknown_keys:
+        raise PipelineConfigError(
+            f"Stage '{base_name}': variant dict has unknown keys: {sorted(unknown_keys)}. "
+            + f"Valid keys are: {sorted(_VARIANT_DICT_KEYS)}"
+        )
+
     variant_name = variant.get("name", "default")
     full_name = f"{base_name}@{variant_name}"
 
@@ -354,8 +335,6 @@ def _register_variant_from_dict(
     outs_raw: OutputsSpec = variant.get("outs") or {}
     params_dict = variant.get("params", {})
     mutex = variant.get("mutex", [])
-    cwd_raw = variant.get("cwd")
-    cwd = cwd_raw if cwd_raw is not None else str(pipeline_dir)
 
     # YAML deps are path overrides only
     dep_path_overrides: dict[str, str | list[str]] = {}
@@ -375,14 +354,12 @@ def _register_variant_from_dict(
         params=params_instance,
         mutex=mutex,
         variant=variant_name,
-        cwd=cwd,
     )
 
 
 def _expand_matrix(
     name: str,
     config: StageConfig,
-    pipeline_dir: Path,
     global_vars: dict[str, str],
 ) -> list[ExpandedStage]:
     """Expand matrix configuration into individual variant stages."""
@@ -416,15 +393,12 @@ def _expand_matrix(
         plots_raw: OutputsSpec = dict(config.plots)
         params_dict = dict(config.params)
         mutex = list(config.mutex)
-        cwd: str | None = config.cwd
 
         for dim_name, key in string_values.items():
             overrides = normalized_dims[dim_name][key][1]
-            deps, outs_raw, metrics_raw, plots_raw, params_dict, mutex, cwd = _apply_overrides(
-                deps, outs_raw, metrics_raw, plots_raw, params_dict, mutex, cwd, overrides
+            deps, outs_raw, metrics_raw, plots_raw, params_dict, mutex = _apply_overrides(
+                deps, outs_raw, metrics_raw, plots_raw, params_dict, mutex, overrides
             )
-
-        cwd = cwd or str(pipeline_dir)
 
         # Merge global vars with matrix values (matrix takes precedence)
         all_vars = {**global_vars, **string_values}
@@ -432,10 +406,9 @@ def _expand_matrix(
         # Interpolate path overrides
         dep_path_overrides = _normalize_deps_spec(deps, all_vars, full_name)
         out_path_overrides = _normalize_out_path_overrides(outs_raw, all_vars, full_name)
-        cwd = _interpolate(cwd, all_vars, full_name)
 
         # Get return output specs for type validation
-        return_out_specs = stage_def.get_output_specs_from_return(func)
+        return_out_specs = stage_def.get_output_specs_from_return(func, full_name)
 
         # Process metrics and plots sections
         _process_typed_output_section(
@@ -458,7 +431,9 @@ def _expand_matrix(
         )
 
         # Use typed values for params interpolation (preserves int/float/bool)
-        params_dict = {k: _interpolate_value(v, typed_values) for k, v in params_dict.items()}
+        params_dict = {
+            k: _interpolate_value(v, typed_values, full_name) for k, v in params_dict.items()
+        }
         params_instance = _resolve_params(func, params_dict, full_name)
 
         expanded.append(
@@ -469,7 +444,6 @@ def _expand_matrix(
                 out_path_overrides=out_path_overrides,
                 params=params_instance,
                 mutex=mutex,
-                cwd=cwd,
                 variant=variant_name,
             )
         )
@@ -548,21 +522,10 @@ _V = TypeVar("_V")
 
 
 def _merge_named_dict(base: dict[str, _V], override: dict[str, _V] | None) -> dict[str, _V]:
-    """Merge named dicts with per-key override/add logic.
-
-    Keys in override dict ending with '+' are added with the '+' stripped.
-    Keys without '+' replace the corresponding key in base.
-    """
+    """Merge named dicts with per-key replacement."""
     if override is None:
         return base
-
-    result = dict(base)
-    for key, value in override.items():
-        if key.endswith("+"):
-            result[key[:-1]] = value
-        else:
-            result[key] = value
-    return result
+    return {**base, **override}
 
 
 def _apply_overrides(
@@ -572,7 +535,6 @@ def _apply_overrides(
     plots: OutputsSpec,
     params: dict[str, Any],
     mutex: list[str],
-    cwd: str | None,
     overrides: DimensionOverrides,
 ) -> tuple[
     DepsSpec,
@@ -581,12 +543,8 @@ def _apply_overrides(
     OutputsSpec,
     dict[str, Any],
     list[str],
-    str | None,
 ]:
-    """Apply dimension overrides to stage config.
-
-    Per-key override syntax: keys ending with '+' are appended, others replace.
-    """
+    """Apply dimension overrides to stage config."""
     deps = _merge_named_dict(deps, overrides.deps)
     outs = _merge_named_dict(outs, overrides.outs)
     metrics = _merge_named_dict(metrics, overrides.metrics)
@@ -596,10 +554,8 @@ def _apply_overrides(
         params = {**params, **overrides.params}
     if overrides.mutex is not None:
         mutex = overrides.mutex
-    if overrides.cwd is not None:
-        cwd = overrides.cwd
 
-    return deps, outs, metrics, plots, params, mutex, cwd
+    return deps, outs, metrics, plots, params, mutex
 
 
 def _interpolate(s: str, values: dict[str, str], stage_name: str) -> str:
@@ -616,11 +572,18 @@ def _interpolate(s: str, values: dict[str, str], stage_name: str) -> str:
     return result
 
 
-def _interpolate_value(value: Any, values: dict[str, MatrixPrimitive]) -> Any:
+def _interpolate_value(
+    value: Any, values: dict[str, MatrixPrimitive], stage_name: str | None = None
+) -> Any:
     """Interpolate ${dim} in any value, including nested structures.
 
     When the value is exactly "${key}", returns the typed value (preserves int/float/bool).
     When the value contains "${key}" as substring, uses string replacement.
+
+    Args:
+        value: Value to interpolate (can be string, dict, list, or primitive).
+        values: Variable name -> value mapping for substitution.
+        stage_name: Stage name for error messages (if None, unresolved vars won't raise).
     """
     if isinstance(value, str):
         # Check for exact match first (preserves original type)
@@ -631,14 +594,21 @@ def _interpolate_value(value: Any, values: dict[str, MatrixPrimitive]) -> Any:
         result = value
         for key, val in values.items():
             result = result.replace(f"${{{key}}}", str(val))
+        # Check for unresolved variables
+        if stage_name is not None:
+            remaining = re.findall(r"\$\{(\w+)\}", result)
+            if remaining:
+                raise PipelineConfigError(
+                    f"Stage '{stage_name}': unresolved variable(s) in '{value}': {remaining}"
+                )
         return result
     if isinstance(value, dict):
         return {
-            k: _interpolate_value(v, values)
+            k: _interpolate_value(v, values, stage_name)
             for k, v in typing.cast("dict[str, Any]", value).items()
         }
     if isinstance(value, list):
-        return [_interpolate_value(v, values) for v in typing.cast("list[Any]", value)]
+        return [_interpolate_value(v, values, stage_name) for v in typing.cast("list[Any]", value)]
     return value
 
 
@@ -674,11 +644,16 @@ def _normalize_out_path_overrides(
                 raise PipelineConfigError(
                     f"Stage '{stage_name}': named output '{name}' missing 'path' field"
                 )
-            override = registry.OutOverride(path=_interpolate(path, values, stage_name))
+            # Handle both string and list paths with interpolation
+            if isinstance(path, list):
+                interpolated_path: str | list[str] = [
+                    _interpolate(p, values, stage_name) for p in path
+                ]
+            else:
+                interpolated_path = _interpolate(path, values, stage_name)
+            override = registry.OutOverride(path=interpolated_path)
             if "cache" in value:
                 override["cache"] = value["cache"]
-            if "persist" in value:
-                override["persist"] = value["persist"]
             result[name] = override
     return result
 
@@ -712,39 +687,34 @@ def _resolve_params(
     overrides: dict[str, Any],
     stage_name: str,
 ) -> pydantic.BaseModel | None:
-    """Resolve params from function signature + config overrides."""
-    sig = inspect.signature(func)
+    """Resolve params from function signature + config overrides.
 
-    if "params" not in sig.parameters:
+    Uses type-based detection to find any StageParams/BaseModel parameter,
+    regardless of parameter name.
+    """
+    params_arg_name, params_type = stage_def.find_params_in_signature(func)
+
+    if params_arg_name is None:
         if overrides:
             raise PipelineConfigError(
                 f"Stage '{stage_name}': pivot.yaml has 'params' but function "
-                + f"'{func.__name__}' has no 'params' parameter"
+                + f"'{func.__name__}' has no StageParams parameter"
             )
         return None
 
-    try:
-        type_hints = typing.get_type_hints(func)
-    except NameError as e:
+    if params_type is None:
         raise PipelineConfigError(
-            f"Stage '{stage_name}': failed to resolve type hints for '{func.__name__}': {e}"
-        ) from e
-
-    if "params" not in type_hints:
-        raise PipelineConfigError(
-            f"Stage '{stage_name}': function '{func.__name__}' has 'params' parameter "
-            + "but no type hint. Add a type hint like 'params: MyParams'"
+            f"Stage '{stage_name}': function '{func.__name__}' has '{params_arg_name}' parameter "
+            + "but no type hint. Add a type hint like 'config: MyParams'"
         )
 
-    type_hint = type_hints["params"]
-
-    if not parameters.validate_params_cls(type_hint):
+    if not parameters.validate_params_cls(params_type):
         raise PipelineConfigError(
             f"Stage '{stage_name}': params type hint must be a Pydantic BaseModel, "
-            + f"got {type_hint}"
+            + f"got {params_type}"
         )
 
     try:
-        return type_hint(**overrides)
+        return params_type(**overrides)
     except pydantic.ValidationError as e:
         raise PipelineConfigError(f"Stage '{stage_name}': invalid params: {e}") from e

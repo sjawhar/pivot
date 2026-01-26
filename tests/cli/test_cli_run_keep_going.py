@@ -110,7 +110,7 @@ def test_keep_going_flag_continues_after_failure(runner: CliRunner, tmp_path: pa
         result = runner.invoke(cli.cli, ["run", "--keep-going"])
 
         assert result.exit_code == 0
-        assert "failing: failed" in result.output
+        assert "failing: FAILED" in result.output
         assert "succeeding: ran" in result.output
         assert pathlib.Path("succeeding.txt").read_text() == "success"
 
@@ -128,8 +128,8 @@ def test_keep_going_flag_skips_downstream(runner: CliRunner, tmp_path: pathlib.P
         result = runner.invoke(cli.cli, ["run", "--keep-going"])
 
         assert result.exit_code == 0
-        assert "first: failed" in result.output
-        assert "second: skipped" in result.output
+        assert "first: FAILED" in result.output
+        assert "second: blocked" in result.output
         assert "upstream" in result.output  # Reason should mention upstream failed
         assert "independent: ran" in result.output
 
@@ -146,12 +146,12 @@ def test_keep_going_short_flag(runner: CliRunner, tmp_path: pathlib.Path) -> Non
         result = runner.invoke(cli.cli, ["run", "-k"])
 
         assert result.exit_code == 0
-        assert "failing: failed" in result.output
+        assert "failing: FAILED" in result.output
         assert "succeeding: ran" in result.output
 
 
 def test_without_keep_going_stops_on_failure(runner: CliRunner, tmp_path: pathlib.Path) -> None:
-    """Default behavior stops pipeline on first failure (downstream stages skipped)."""
+    """Default behavior stops pipeline on first failure (downstream stages blocked)."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
@@ -164,9 +164,9 @@ def test_without_keep_going_stops_on_failure(runner: CliRunner, tmp_path: pathli
         result = runner.invoke(cli.cli, ["run"])
 
         assert result.exit_code == 0
-        assert "failing: failed" in result.output
-        # Without --keep-going, downstream stages are skipped due to upstream failure
-        assert "downstream: skipped" in result.output
+        assert "failing: FAILED" in result.output
+        # Without --keep-going, downstream stages are blocked due to upstream failure
+        assert "downstream: blocked" in result.output
         assert not pathlib.Path("downstream.txt").exists()
 
 

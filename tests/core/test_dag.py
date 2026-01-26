@@ -6,6 +6,7 @@ from pydantic import BaseModel
 from pivot import dag, loaders, outputs
 from pivot.exceptions import CyclicGraphError, DependencyNotFoundError
 from pivot.registry import RegistryStageInfo
+from pivot.storage.track import PvtData
 
 # Test helpers for creating dummy stages
 
@@ -30,9 +31,9 @@ def _create_stage(name: str, deps: list[str], outs: list[str]) -> RegistryStageI
         variant=None,
         signature=None,
         fingerprint={},
-        cwd=None,
         dep_specs={},
-        out_path_overrides=None,
+        out_specs={},
+        params_arg_name=None,
     )
 
 
@@ -488,3 +489,75 @@ def test_nested_directory_dependency(tmp_path: Path) -> None:
     graph = dag.build_dag(stages, validate=False)
 
     assert graph.has_edge("consume_parent", "produce_nested"), "Should detect nested file outputs"
+
+
+# --- Tracked file tests ---
+
+
+def test_tracked_file_recognized_as_valid_source(tmp_path: Path) -> None:
+    """Tracked files are valid dependency sources even if not on disk."""
+    # Dependency doesn't exist on disk, but it's in tracked_files
+    tracked_path = str(tmp_path / "tracked_input.csv")
+
+    stages = {"process": _create_stage("process", [tracked_path], [str(tmp_path / "output.csv")])}
+
+    # Without tracked_files, this would raise DependencyNotFoundError
+    tracked_files: dict[str, PvtData] = {
+        tracked_path: PvtData(path="tracked_input.csv", hash="abc123", size=100),
+    }
+
+    # Should not raise - tracked file is recognized as valid source
+    graph = dag.build_dag(stages, validate=True, tracked_files=tracked_files)
+    assert "process" in graph.nodes()
+
+
+def test_tracked_file_inside_directory_recognized(tmp_path: Path) -> None:
+    """File inside a tracked directory is recognized as valid source."""
+    tracked_dir = str(tmp_path / "tracked_data")
+    file_inside = str(tmp_path / "tracked_data" / "file.csv")
+
+    stages = {"process": _create_stage("process", [file_inside], [str(tmp_path / "output.csv")])}
+
+    # Directory is tracked
+    tracked_files: dict[str, PvtData] = {
+        tracked_dir: PvtData(
+            path="tracked_data",
+            hash="def456",
+            size=500,
+            num_files=3,
+            manifest=[{"relpath": "file.csv", "hash": "ghi789", "size": 100, "isexec": False}],
+        ),
+    }
+
+    # Should not raise - file inside tracked directory is valid
+    graph = dag.build_dag(stages, validate=True, tracked_files=tracked_files)
+    assert "process" in graph.nodes()
+
+
+def test_dependency_on_tracked_directory(tmp_path: Path) -> None:
+    """Directory dependency on tracked directory is valid."""
+    tracked_dir = str(tmp_path / "tracked_data")
+
+    stages = {"process": _create_stage("process", [tracked_dir], [str(tmp_path / "output.csv")])}
+
+    tracked_files: dict[str, PvtData] = {
+        tracked_dir: PvtData(path="tracked_data", hash="abc123", size=500, num_files=2),
+    }
+
+    graph = dag.build_dag(stages, validate=True, tracked_files=tracked_files)
+    assert "process" in graph.nodes()
+
+
+def test_untracked_missing_dependency_still_raises(tmp_path: Path) -> None:
+    """Missing dependency not in tracked_files still raises error."""
+    missing_path = str(tmp_path / "missing.csv")
+
+    stages = {"process": _create_stage("process", [missing_path], [str(tmp_path / "output.csv")])}
+
+    # Some other file is tracked, but not the one we depend on
+    tracked_files: dict[str, PvtData] = {
+        str(tmp_path / "other.csv"): PvtData(path="other.csv", hash="xyz", size=50),
+    }
+
+    with pytest.raises(DependencyNotFoundError):
+        dag.build_dag(stages, validate=True, tracked_files=tracked_files)

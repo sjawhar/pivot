@@ -79,7 +79,7 @@ def test_acquire_pending_state_lock_blocks_until_available(pipeline_dir: pathlib
     def hold_lock() -> None:
         with project_lock.pending_state_lock():
             lock_holder_started.set()
-            time.sleep(0.2)
+            time.sleep(0.1)
 
     holder_thread = threading.Thread(target=hold_lock)
     holder_thread.start()
@@ -107,7 +107,7 @@ def test_acquire_pending_state_lock_timeout(pipeline_dir: pathlib.Path) -> None:
     def hold_lock() -> None:
         with project_lock.pending_state_lock():
             lock_holder_started.set()
-            time.sleep(1.0)
+            time.sleep(0.2)
 
     holder_thread = threading.Thread(target=hold_lock)
     holder_thread.start()
@@ -214,7 +214,7 @@ def _slow_stage_impl(
     # Log when stage starts
     with execution_log.open("a") as f:
         f.write("stage_start\n")
-    time.sleep(0.3)
+    time.sleep(0.1)
     output_path = pathlib.Path("output.txt")
     output_path.write_text("done")
     with execution_log.open("a") as f:

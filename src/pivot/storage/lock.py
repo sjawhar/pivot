@@ -39,14 +39,13 @@ _PENDING_DIR = "pending"
 STAGES_REL_PATH = ".pivot/stages"
 
 
-def get_stages_dir(cache_dir: Path) -> Path:
+def get_stages_dir(state_dir: Path) -> Path:
     """Return the stages directory for lock files.
 
     Lock files are stored in .pivot/stages/ (git-tracked) rather than
     .pivot/cache/stages/ so they can be versioned for reproducibility.
     """
-    # cache_dir is .pivot/cache, so parent is .pivot
-    return cache_dir.parent / "stages"
+    return state_dir / "stages"
 
 
 def get_pending_stages_dir(project_root: Path) -> Path:
@@ -91,9 +90,12 @@ def _convert_to_storage_format(data: LockData) -> StorageLockData:
         outs_list.append(entry)
     outs_list.sort(key=lambda e: e["path"])
 
+    # Sort code_manifest keys for deterministic output across interpreter sessions
+    sorted_code_manifest = dict(sorted(data["code_manifest"].items()))
+
     return StorageLockData(
         schema_version=1,
-        code_manifest=data["code_manifest"],
+        code_manifest=sorted_code_manifest,
         params=data["params"],
         deps=deps_list,
         outs=outs_list,
@@ -186,11 +188,12 @@ class StageLock:
         current_fingerprint: dict[str, str],
         current_params: dict[str, Any],
         dep_hashes: dict[str, HashInfo],
+        out_paths: list[str] | None = None,
     ) -> tuple[bool, str]:
         """Check if stage needs re-run (reads lock file)."""
         lock_data = self.read()
         return self.is_changed_with_lock_data(
-            lock_data, current_fingerprint, current_params, dep_hashes
+            lock_data, current_fingerprint, current_params, dep_hashes, out_paths
         )
 
     def is_changed_with_lock_data(
@@ -199,6 +202,7 @@ class StageLock:
         current_fingerprint: dict[str, str],
         current_params: dict[str, Any],
         dep_hashes: dict[str, HashInfo],
+        out_paths: list[str] | None = None,
     ) -> tuple[bool, str]:
         """Check if stage needs re-run (pure comparison, no I/O)."""
         if lock_data is None:
@@ -210,6 +214,10 @@ class StageLock:
             return True, "Params changed"
         if lock_data["dep_hashes"] != dep_hashes:
             return True, "Input dependencies changed"
+        if out_paths is not None:
+            locked_out_paths = sorted(lock_data["output_hashes"].keys())
+            if sorted(out_paths) != locked_out_paths:
+                return True, "Output paths changed"
 
         return False, ""
 
@@ -328,7 +336,7 @@ def acquire_execution_lock(stage_name: str, cache_dir: Path) -> Path:
         try:
             fd = os.open(sentinel, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             with os.fdopen(fd, "w") as f:
-                f.write(f"pid: {os.getpid()}\n")
+                f.write(str(os.getpid()))
             return sentinel
         except FileExistsError:
             pass
@@ -353,10 +361,9 @@ def acquire_execution_lock(stage_name: str, cache_dir: Path) -> Path:
 def _read_lock_pid(sentinel: Path) -> int | None:
     """Read PID from lock file. Returns None if missing/corrupted/invalid."""
     try:
-        content = sentinel.read_text()
-        pid = int(content.split(":")[1].strip())
+        pid = int(sentinel.read_text().strip())
         return pid if pid > 0 else None
-    except (FileNotFoundError, ValueError, IndexError, OSError):
+    except (FileNotFoundError, ValueError, OSError):
         return None
 
 
@@ -398,7 +405,7 @@ def _atomic_lock_takeover(sentinel: Path, stale_pid: int | None) -> bool:
     fd, tmp_path = tempfile.mkstemp(dir=sentinel.parent, prefix=f".{sentinel.name}.")
     try:
         with os.fdopen(fd, "w") as f:
-            f.write(f"pid: {my_pid}\n")
+            f.write(str(my_pid))
         os.replace(tmp_path, sentinel)
 
         # Verify we still hold the lock (another process may have done the same)

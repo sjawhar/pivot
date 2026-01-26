@@ -4,7 +4,7 @@ import logging
 import runpy
 from typing import TYPE_CHECKING
 
-from pivot import project, registry
+from pivot import metrics, project, registry
 from pivot.pipeline import yaml as pipeline_config
 
 if TYPE_CHECKING:
@@ -36,46 +36,47 @@ def discover_and_register(project_root: Path | None = None) -> str | None:
     Raises:
         DiscoveryError: If discovery or registration fails, or if both config types exist
     """
-    root = project_root or project.get_project_root()
+    with metrics.timed("discovery.total"):
+        root = project_root or project.get_project_root()
 
-    # Check which files exist upfront
-    yaml_path = None
-    for yaml_name in PIVOT_YAML_NAMES:
-        candidate = root / yaml_name
-        if candidate.exists():
-            yaml_path = candidate
-            break
+        # Check which files exist upfront
+        yaml_path = None
+        for yaml_name in PIVOT_YAML_NAMES:
+            candidate = root / yaml_name
+            if candidate.exists():
+                yaml_path = candidate
+                break
 
-    pipeline_path = root / PIPELINE_PY_NAME
-    pipeline_exists = pipeline_path.exists()
+        pipeline_path = root / PIPELINE_PY_NAME
+        pipeline_exists = pipeline_path.exists()
 
-    # Error if both exist
-    if yaml_path and pipeline_exists:
-        raise DiscoveryError(
-            f"Found both {yaml_path.name} and {PIPELINE_PY_NAME} in {root}. Remove one to resolve ambiguity."
-        )
+        # Error if both exist
+        if yaml_path and pipeline_exists:
+            raise DiscoveryError(
+                f"Found both {yaml_path.name} and {PIPELINE_PY_NAME} in {root}. Remove one to resolve ambiguity."
+            )
 
-    # Register from yaml if found
-    if yaml_path:
-        logger.info(f"Discovered {yaml_path}")
-        try:
-            pipeline_config.register_from_pipeline_file(yaml_path)
-            return str(yaml_path)
-        except pipeline_config.PipelineConfigError as e:
-            raise DiscoveryError(f"Failed to load {yaml_path}: {e}") from e
+        # Register from yaml if found
+        if yaml_path:
+            logger.info(f"Discovered {yaml_path}")
+            try:
+                pipeline_config.register_from_pipeline_file(yaml_path)
+                return str(yaml_path)
+            except pipeline_config.PipelineConfigError as e:
+                raise DiscoveryError(f"Failed to load {yaml_path}: {e}") from e
 
-    # Try pipeline.py
-    if pipeline_exists:
-        logger.info(f"Discovered {pipeline_path}")
-        try:
-            _import_pipeline_module(pipeline_path)
-            return str(pipeline_path)
-        except SystemExit as e:
-            raise DiscoveryError(f"Pipeline {pipeline_path} called sys.exit({e.code})") from e
-        except Exception as e:
-            raise DiscoveryError(f"Failed to load {pipeline_path}: {e}") from e
+        # Try pipeline.py
+        if pipeline_exists:
+            logger.info(f"Discovered {pipeline_path}")
+            try:
+                _import_pipeline_module(pipeline_path)
+                return str(pipeline_path)
+            except SystemExit as e:
+                raise DiscoveryError(f"Pipeline {pipeline_path} called sys.exit({e.code})") from e
+            except Exception as e:
+                raise DiscoveryError(f"Failed to load {pipeline_path}: {e}") from e
 
-    return None
+        return None
 
 
 def has_registered_stages() -> bool:

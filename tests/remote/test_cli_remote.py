@@ -4,6 +4,7 @@ import pathlib
 from typing import TYPE_CHECKING
 
 from pivot import cli, project
+from pivot import config as config_mod
 from pivot.remote import sync as transfer
 from pivot.storage import state
 from pivot.types import TransferSummary
@@ -32,9 +33,7 @@ def test_push_no_files_to_push(
         monkeypatch.setattr(project, "_project_root_cache", None)
 
         # Mock transfer functions
-        mocker.patch.object(
-            transfer, "get_default_cache_dir", return_value=tmp_path / ".pivot/cache"
-        )
+        mocker.patch.object(config_mod, "get_cache_dir", return_value=tmp_path / ".pivot/cache")
         mocker.patch.object(
             transfer,
             "create_remote_from_name",
@@ -60,9 +59,7 @@ def test_push_dry_run(
         pathlib.Path(".git").mkdir()
         monkeypatch.setattr(project, "_project_root_cache", None)
 
-        mocker.patch.object(
-            transfer, "get_default_cache_dir", return_value=tmp_path / ".pivot/cache"
-        )
+        mocker.patch.object(config_mod, "get_cache_dir", return_value=tmp_path / ".pivot/cache")
         mocker.patch.object(
             transfer,
             "create_remote_from_name",
@@ -92,7 +89,7 @@ def test_push_success(
         cache_dir.mkdir(parents=True)
         monkeypatch.setattr(project, "_project_root_cache", None)
 
-        mocker.patch.object(transfer, "get_default_cache_dir", return_value=cache_dir)
+        mocker.patch.object(config_mod, "get_cache_dir", return_value=cache_dir)
         mocker.patch.object(
             transfer,
             "create_remote_from_name",
@@ -131,7 +128,7 @@ def test_push_with_errors(
         cache_dir.mkdir(parents=True)
         monkeypatch.setattr(project, "_project_root_cache", None)
 
-        mocker.patch.object(transfer, "get_default_cache_dir", return_value=cache_dir)
+        mocker.patch.object(config_mod, "get_cache_dir", return_value=cache_dir)
         mocker.patch.object(
             transfer,
             "create_remote_from_name",
@@ -168,10 +165,12 @@ def test_push_with_targets(
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
         cache_dir = tmp_path / ".pivot" / "cache"
+        state_dir = tmp_path / ".pivot"
         cache_dir.mkdir(parents=True)
         monkeypatch.setattr(project, "_project_root_cache", None)
 
-        mocker.patch.object(transfer, "get_default_cache_dir", return_value=cache_dir)
+        mocker.patch.object(config_mod, "get_cache_dir", return_value=cache_dir)
+        mocker.patch.object(config_mod, "get_state_dir", return_value=state_dir)
         mocker.patch.object(
             transfer,
             "create_remote_from_name",
@@ -192,7 +191,7 @@ def test_push_with_targets(
         result = runner.invoke(cli.cli, ["push", "train_model"])
 
         assert result.exit_code == 0
-        mock_target_hashes.assert_called_once_with(["train_model"], cache_dir, include_deps=False)
+        mock_target_hashes.assert_called_once_with(["train_model"], state_dir, include_deps=False)
 
 
 # =============================================================================
@@ -212,9 +211,7 @@ def test_pull_dry_run_with_targets(
         pathlib.Path(".git").mkdir()
         monkeypatch.setattr(project, "_project_root_cache", None)
 
-        mocker.patch.object(
-            transfer, "get_default_cache_dir", return_value=tmp_path / ".pivot/cache"
-        )
+        mocker.patch.object(config_mod, "get_cache_dir", return_value=tmp_path / ".pivot/cache")
         mocker.patch.object(
             transfer,
             "create_remote_from_name",
@@ -248,9 +245,7 @@ def test_pull_dry_run_all(
 
         mock_remote.list_hashes = mock_list_hashes
 
-        mocker.patch.object(
-            transfer, "get_default_cache_dir", return_value=tmp_path / ".pivot/cache"
-        )
+        mocker.patch.object(config_mod, "get_cache_dir", return_value=tmp_path / ".pivot/cache")
         mocker.patch.object(
             transfer,
             "create_remote_from_name",
@@ -278,7 +273,7 @@ def test_pull_success(
         cache_dir.mkdir(parents=True)
         monkeypatch.setattr(project, "_project_root_cache", None)
 
-        mocker.patch.object(transfer, "get_default_cache_dir", return_value=cache_dir)
+        mocker.patch.object(config_mod, "get_cache_dir", return_value=cache_dir)
         mocker.patch.object(
             transfer,
             "create_remote_from_name",
@@ -315,7 +310,7 @@ def test_pull_with_errors(
         cache_dir.mkdir(parents=True)
         monkeypatch.setattr(project, "_project_root_cache", None)
 
-        mocker.patch.object(transfer, "get_default_cache_dir", return_value=cache_dir)
+        mocker.patch.object(config_mod, "get_cache_dir", return_value=cache_dir)
         mocker.patch.object(
             transfer,
             "create_remote_from_name",
@@ -362,10 +357,12 @@ def test_pull_with_stages(
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
         cache_dir = tmp_path / ".pivot" / "cache"
+        state_dir = tmp_path / ".pivot"
         cache_dir.mkdir(parents=True)
         monkeypatch.setattr(project, "_project_root_cache", None)
 
-        mocker.patch.object(transfer, "get_default_cache_dir", return_value=cache_dir)
+        mocker.patch.object(config_mod, "get_cache_dir", return_value=cache_dir)
+        mocker.patch.object(config_mod, "get_state_dir", return_value=state_dir)
         mocker.patch.object(
             transfer,
             "create_remote_from_name",
@@ -384,8 +381,9 @@ def test_pull_with_stages(
 
         assert result.exit_code == 0
         call_args = mock_pull.call_args
-        assert call_args.args[3] == "origin"
-        assert call_args.args[4] == ["train_model", "evaluate"]
+        # Function signature: pull(cache_dir, state_dir, remote, state_db, remote_name, targets, ...)
+        assert call_args.args[4] == "origin"
+        assert call_args.args[5] == ["train_model", "evaluate"]
 
 
 def test_push_exception_shows_click_error(
@@ -401,8 +399,8 @@ def test_push_exception_shows_click_error(
         monkeypatch.setattr(project, "_project_root_cache", None)
 
         mocker.patch.object(
-            transfer,
-            "get_default_cache_dir",
+            config_mod,
+            "get_cache_dir",
             side_effect=RuntimeError("Test error"),
         )
 
@@ -425,8 +423,8 @@ def test_pull_exception_shows_click_error(
         monkeypatch.setattr(project, "_project_root_cache", None)
 
         mocker.patch.object(
-            transfer,
-            "get_default_cache_dir",
+            config_mod,
+            "get_cache_dir",
             side_effect=RuntimeError("Test error"),
         )
 

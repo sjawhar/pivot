@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import collections
-import multiprocessing as mp
+import queue
 import time
+from typing import TYPE_CHECKING
 
 import pytest
 
 from pivot.tui import run as run_tui
-from pivot.types import OutputMessage, StageStatus, TuiMessage
+from pivot.types import OutputMessage, StageStatus, TuiQueue
+
+if TYPE_CHECKING:
+    import multiprocessing as mp
 
 # =============================================================================
 # ExecutionHistoryEntry Tests
@@ -186,8 +190,8 @@ def test_watch_tui_app_has_history_tracking_state(
     mock_engine: run_tui.WatchEngineProtocol,
 ) -> None:
     """WatchTuiApp has state for tracking history navigation."""
-    queue: mp.Queue[TuiMessage] = mp.Queue()
-    app = run_tui.WatchTuiApp(mock_engine, queue, stage_names=["test"])
+    tui_queue: TuiQueue = queue.Queue()
+    app = run_tui.WatchTuiApp(mock_engine, tui_queue, stage_names=["test"])
 
     assert app._viewing_history_index is None
 
@@ -196,8 +200,8 @@ def test_watch_tui_app_pending_history_tracking(
     mock_engine: run_tui.WatchEngineProtocol,
 ) -> None:
     """WatchTuiApp tracks pending history entries during execution."""
-    queue: mp.Queue[TuiMessage] = mp.Queue()
-    app = run_tui.WatchTuiApp(mock_engine, queue, stage_names=["test"])
+    tui_queue: TuiQueue = queue.Queue()
+    app = run_tui.WatchTuiApp(mock_engine, tui_queue, stage_names=["test"])
 
     assert isinstance(app._pending_history, dict)
     assert len(app._pending_history) == 0
@@ -207,8 +211,8 @@ def test_watch_tui_app_get_current_stage_history_empty(
     mock_engine: run_tui.WatchEngineProtocol,
 ) -> None:
     """_get_current_stage_history returns empty deque when no selection."""
-    queue: mp.Queue[TuiMessage] = mp.Queue()
-    app = run_tui.WatchTuiApp(mock_engine, queue, stage_names=[])
+    tui_queue: TuiQueue = queue.Queue()
+    app = run_tui.WatchTuiApp(mock_engine, tui_queue, stage_names=[])
 
     history = app._get_current_stage_history()
     assert len(history) == 0
@@ -218,8 +222,8 @@ def test_watch_tui_app_get_current_stage_history_with_stage(
     mock_engine: run_tui.WatchEngineProtocol,
 ) -> None:
     """_get_current_stage_history returns stage's history deque."""
-    queue: mp.Queue[TuiMessage] = mp.Queue()
-    app = run_tui.WatchTuiApp(mock_engine, queue, stage_names=["stage_a"])
+    tui_queue: TuiQueue = queue.Queue()
+    app = run_tui.WatchTuiApp(mock_engine, tui_queue, stage_names=["stage_a"])
 
     # Add a history entry
     entry = run_tui.ExecutionHistoryEntry(
@@ -253,8 +257,8 @@ def test_finalize_history_skipped_without_pending_creates_entry(
     This tests the fix for upstream-skipped stages that never went through
     IN_PROGRESS (so never had _pending_history entry created).
     """
-    queue: mp.Queue[TuiMessage] = mp.Queue()
-    app = run_tui.WatchTuiApp(mock_engine, queue, stage_names=["downstream_stage"])
+    tui_queue: TuiQueue = queue.Queue()
+    app = run_tui.WatchTuiApp(mock_engine, tui_queue, stage_names=["downstream_stage"])
 
     # Verify no pending history
     assert "downstream_stage" not in app._pending_history
@@ -282,8 +286,8 @@ def test_finalize_history_skipped_without_run_id_does_not_create_entry(
     mock_engine: run_tui.WatchEngineProtocol,
 ) -> None:
     """Skipped stages without run_id don't get history entries (defensive)."""
-    queue: mp.Queue[TuiMessage] = mp.Queue()
-    app = run_tui.WatchTuiApp(mock_engine, queue, stage_names=["downstream_stage"])
+    tui_queue: TuiQueue = queue.Queue()
+    app = run_tui.WatchTuiApp(mock_engine, tui_queue, stage_names=["downstream_stage"])
 
     # Call without run_id - should not create entry
     app._finalize_history_entry(
@@ -306,8 +310,8 @@ def test_finalize_history_failed_without_pending_does_not_create_entry(
     Only SKIPPED is special-cased for upstream failures. FAILED/RAN/etc
     should always have gone through IN_PROGRESS.
     """
-    queue: mp.Queue[TuiMessage] = mp.Queue()
-    app = run_tui.WatchTuiApp(mock_engine, queue, stage_names=["some_stage"])
+    tui_queue: TuiQueue = queue.Queue()
+    app = run_tui.WatchTuiApp(mock_engine, tui_queue, stage_names=["some_stage"])
 
     # Call with FAILED status but no pending state - unusual case
     app._finalize_history_entry(
@@ -330,8 +334,8 @@ def test_watch_tui_app_new_run_clears_stale_pending_entries(
     This handles the crash condition where a run is interrupted mid-execution
     and a new run starts, leaving orphaned pending entries.
     """
-    queue: mp.Queue[TuiMessage] = mp.Queue()
-    app = run_tui.WatchTuiApp(mock_engine, queue, stage_names=["stage_a", "stage_b"])
+    tui_queue: TuiQueue = queue.Queue()
+    app = run_tui.WatchTuiApp(mock_engine, tui_queue, stage_names=["stage_a", "stage_b"])
 
     # Set up first run with pending entries
     app._current_run_id = "run_001"
@@ -358,8 +362,8 @@ def test_watch_tui_app_tracks_current_run_id(
     mock_engine: run_tui.WatchEngineProtocol,
 ) -> None:
     """WatchTuiApp tracks current run_id for detecting new runs."""
-    queue: mp.Queue[TuiMessage] = mp.Queue()
-    app = run_tui.WatchTuiApp(mock_engine, queue, stage_names=[])
+    tui_queue: TuiQueue = queue.Queue()
+    app = run_tui.WatchTuiApp(mock_engine, tui_queue, stage_names=[])
 
     assert app._current_run_id is None
 
@@ -377,7 +381,7 @@ class MockWatchEngine:
 
     def run(
         self,
-        tui_queue: mp.Queue[TuiMessage] | None = None,
+        tui_queue: TuiQueue | None = None,
         output_queue: mp.Queue[OutputMessage] | None = None,
     ) -> None:
         pass

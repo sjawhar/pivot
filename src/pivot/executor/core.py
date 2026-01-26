@@ -9,7 +9,6 @@ import datetime
 import functools
 import logging
 import multiprocessing as mp
-import os
 import pathlib
 import queue
 import threading
@@ -46,9 +45,11 @@ from pivot.types import (
     StageStartEvent,
     StageStatus,
     TuiLogMessage,
-    TuiMessage,
     TuiMessageType,
+    TuiQueue,
     TuiStatusMessage,
+    TuiWatchMessage,
+    WatchStatus,
 )
 
 if TYPE_CHECKING:
@@ -58,10 +59,73 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_MAX_WORKERS_DEFAULT = 8
-
 # Special mutex that means "run exclusively" - no other stages run concurrently
 EXCLUSIVE_MUTEX = "*"
+
+
+def _noop() -> None:
+    """Module-level for pickling."""
+    pass
+
+
+def _compute_max_workers(stage_count: int, override: int | None = None) -> int:
+    """Single source of truth for max_workers calculation.
+
+    Args:
+        stage_count: Number of stages to run
+        override: CLI override for max_workers (takes precedence over config)
+
+    The effective max_workers is determined by:
+    1. CLI override (if provided)
+    2. Config value (core.max_workers)
+
+    Negative values mean "cpu_count + value" (e.g., -2 means cpu_count - 2).
+    The result is always clamped to [1, stage_count].
+    """
+    cpu_count = loky.cpu_count() or 1
+    max_workers = override if override is not None else config.get_max_workers()
+
+    # Negative values are relative to CPU count
+    if max_workers < 0:
+        max_workers = cpu_count + max_workers
+
+    return max(1, min(max_workers, stage_count))
+
+
+def _warm_workers(pool: loky.ProcessPoolExecutor, count: int) -> None:
+    """Submit no-op tasks to ensure workers are warm and channels established."""
+    futures = [pool.submit(_noop) for _ in range(count)]
+    for f in futures:
+        f.result()
+
+
+def prepare_workers(
+    stage_count: int, *, parallel: bool = True, max_workers: int | None = None
+) -> int:
+    """Pre-warm loky worker pool. Returns actual worker count.
+
+    Call before starting Textual TUI to avoid FD inheritance issues.
+    Safe to call in non-TUI mode (no downside, slightly faster first execution).
+    """
+    if not parallel or stage_count <= 0:
+        return 1
+    workers = _compute_max_workers(stage_count, max_workers)
+    pool = loky.get_reusable_executor(max_workers=workers)
+    _warm_workers(pool, workers)
+    return workers
+
+
+def restart_workers(stage_count: int, max_workers: int | None = None) -> int:
+    """Kill existing workers and spawn fresh ones. For code reload in watch mode.
+
+    Unlike prepare_workers(), this kills existing workers first, then warms the new pool.
+    """
+    if stage_count <= 0:
+        return 1
+    workers = _compute_max_workers(stage_count, max_workers)
+    pool = loky.get_reusable_executor(max_workers=workers, kill_workers=True)
+    _warm_workers(pool, workers)
+    return workers
 
 
 def _cleanup_worker_pool() -> None:
@@ -80,6 +144,33 @@ class ExecutionSummary(TypedDict):
 
     status: Literal[StageStatus.RAN, StageStatus.SKIPPED, StageStatus.FAILED, StageStatus.UNKNOWN]
     reason: str
+
+
+def count_results(results: dict[str, ExecutionSummary]) -> tuple[int, int, int, int]:
+    """Count results by category: ran, cached, blocked, failed.
+
+    Distinguishes between "cached" (skipped because unchanged) and
+    "blocked" (skipped because upstream failed).
+
+    Returns:
+        Tuple of (ran, cached, blocked, failed) counts
+    """
+    ran = cached = blocked = failed = 0
+    for result in results.values():
+        status = result["status"]
+        reason = result["reason"]
+        if status == StageStatus.RAN:
+            ran += 1
+        elif status == StageStatus.FAILED:
+            failed += 1
+        elif status == StageStatus.UNKNOWN:
+            # UNKNOWN indicates executor bug - don't count in normal categories
+            pass
+        elif reason.startswith("upstream"):
+            blocked += 1
+        else:
+            cached += 1
+    return ran, cached, blocked, failed
 
 
 @dataclasses.dataclass
@@ -116,7 +207,7 @@ class StageLifecycle:
 
     def __init__(
         self,
-        tui_queue: mp.Queue[TuiMessage] | None,
+        tui_queue: TuiQueue | None,
         con: console.Console | None,
         progress_callback: Callable[[RunJsonEvent], None] | None,
         total_stages: int,
@@ -130,17 +221,18 @@ class StageLifecycle:
         self.run_id = run_id
         self.explain_mode = explain_mode
 
-    def mark_started(self, state: StageState, running_count: int) -> None:
+    def mark_started(self, state: StageState) -> None:
         """Mark stage as in-progress and send all notifications."""
         state.status = StageStatus.IN_PROGRESS
         state.start_time = time.perf_counter()
 
         if self.console and not self.explain_mode:
+            # Use FINGERPRINTING since stage is being checked - not yet confirmed to run
             self.console.stage_start(
                 name=state.name,
-                index=running_count,
+                index=state.index,
                 total=self.total_stages,
-                status=StageDisplayStatus.RUNNING,
+                status=StageDisplayStatus.FINGERPRINTING,
             )
 
         if self.tui_queue:
@@ -168,20 +260,20 @@ class StageLifecycle:
                 )
             )
 
-    def mark_completed(self, state: StageState, result: StageResult, completed_count: int) -> None:
+    def mark_completed(self, state: StageState, result: StageResult) -> None:
         """Mark stage completed with result and send all notifications."""
         state.result = result
         state.status = result["status"]
         state.end_time = time.perf_counter()
-        self._notify_complete(state, result, completed_count)
+        self._notify_complete(state, result)
 
-    def mark_failed(self, state: StageState, reason: str, completed_count: int) -> None:
+    def mark_failed(self, state: StageState, reason: str) -> None:
         """Mark stage as failed and send all notifications."""
         result = StageResult(status=StageStatus.FAILED, reason=reason, output_lines=[])
         state.result = result
         state.status = StageStatus.FAILED
         state.end_time = time.perf_counter()
-        self._notify_complete(state, result, completed_count)
+        self._notify_complete(state, result)
 
     def mark_skipped_upstream(self, state: StageState, failed_stage: str) -> None:
         """Mark stage as skipped due to upstream failure and send all notifications.
@@ -193,20 +285,19 @@ class StageLifecycle:
         state.result = result
         state.status = StageStatus.SKIPPED
         # Don't set end_time - stage never started
-        self._notify_complete(state, result, completed_count=0)
+        self._notify_complete(state, result)
 
-    def _notify_complete(
-        self, state: StageState, result: StageResult, completed_count: int
-    ) -> None:
+    def _notify_complete(self, state: StageState, result: StageResult) -> None:
         """Send completion notifications to all channels."""
         result_status = result["status"]
         result_reason = result["reason"]
         duration = state.get_duration()
+        logger.debug(f"TUI status: {state.name} -> {result_status}")  # noqa: G004
 
         if self.console:
             self.console.stage_result(
                 name=state.name,
-                index=completed_count,
+                index=state.index,
                 total=self.total_stages,
                 status=result_status,
                 reason=result_reason,
@@ -252,11 +343,13 @@ def run(
     force: bool = False,
     stage_timeout: float | None = None,
     explain_mode: bool = False,
-    tui_queue: mp.Queue[TuiMessage] | None = None,
+    tui_queue: TuiQueue | None = None,
     output_queue: mp.Queue[OutputMessage] | None = None,
     no_commit: bool = False,
     no_cache: bool = False,
     progress_callback: Callable[[RunJsonEvent], None] | None = None,
+    cancel_event: threading.Event | None = None,
+    checkout_missing: bool = False,
 ) -> dict[str, ExecutionSummary]:
     """Execute pipeline stages with greedy parallel execution.
 
@@ -278,12 +371,14 @@ def run(
         no_commit: If True, defer lock files to pending dir (faster iteration).
         no_cache: If True, skip caching outputs entirely (maximum iteration speed).
         progress_callback: Callback for JSONL progress events (stage start/complete).
+        cancel_event: If set, stop starting new stages and mark pending as cancelled.
+        checkout_missing: If True, restore missing tracked files from cache before running.
 
     Returns:
         Dict of stage_name -> {status: "ran"|"skipped"|"failed", reason: str}
     """
     if cache_dir is None:
-        cache_dir = project.get_project_root() / ".pivot" / "cache"
+        cache_dir = config.get_cache_dir()
 
     if isinstance(on_error, OnError):
         error_mode = on_error
@@ -297,7 +392,7 @@ def run(
 
     # Verify tracked files before building DAG (provides better error messages)
     project_root = project.get_project_root()
-    _verify_tracked_files(project_root)
+    _verify_tracked_files(project_root, checkout_missing=checkout_missing)
 
     graph = registry.REGISTRY.build_dag(validate=True)
 
@@ -325,7 +420,7 @@ def run(
 
     # Check for uncached IncrementalOut files that would be lost
     if not allow_uncached_incremental:
-        uncached = _check_uncached_incremental_outputs(execution_order, cache_dir)
+        uncached = _check_uncached_incremental_outputs(execution_order)
         if uncached:
             files_list = "\n".join(f"  - {stage}: {path}" for stage, path in uncached)
             raise exceptions.UncachedIncrementalOutputError(
@@ -339,11 +434,7 @@ def run(
 
     stage_states = _initialize_stage_states(execution_order, graph)
 
-    if not parallel:
-        max_workers = 1
-    elif max_workers is None:
-        max_workers = min(os.cpu_count() or 1, _MAX_WORKERS_DEFAULT, len(execution_order))
-    max_workers = max(1, min(max_workers, len(execution_order)))
+    max_workers = 1 if not parallel else _compute_max_workers(len(execution_order), max_workers)
 
     start_time = time.perf_counter()
 
@@ -368,6 +459,7 @@ def run(
             no_commit=no_commit,
             no_cache=no_cache,
             progress_callback=progress_callback,
+            cancel_event=cancel_event,
         )
 
         results = _build_results(stage_states)
@@ -378,7 +470,6 @@ def run(
         _write_run_history(
             run_id=run_id,
             stage_states=stage_states,
-            cache_dir=cache_dir,
             targeted_stages=targeted_stages,
             execution_order=execution_order,
             started_at=started_at,
@@ -387,14 +478,9 @@ def run(
         )
 
     if con:
-        status_counts = collections.Counter(r["status"] for r in results.values())
+        ran, cached, blocked, failed = count_results(results)
         total_duration = time.perf_counter() - start_time
-        con.summary(
-            status_counts[StageStatus.RAN],
-            status_counts[StageStatus.SKIPPED],
-            status_counts[StageStatus.FAILED],
-            total_duration,
-        )
+        con.summary(ran, cached, blocked, failed, total_duration)
 
     return results
 
@@ -429,28 +515,64 @@ def _initialize_stage_states(
     return states
 
 
-def _verify_tracked_files(project_root: pathlib.Path) -> None:
-    """Verify all .pvt tracked files exist and warn on hash mismatches."""
+def _restore_tracked_file(
+    path: pathlib.Path,
+    track_data: track.PvtData,
+    cache_dir: pathlib.Path,
+) -> bool:
+    """Restore a tracked file from cache.
+
+    Returns True if successfully restored, False if not in cache.
+    """
+    output_hash = track.pvt_to_hash_info(track_data)
+
+    # Use default checkout modes (hardlink with copy fallback)
+    checkout_modes = config.get_checkout_mode_order()
+    return cache.restore_from_cache(path, output_hash, cache_dir, checkout_modes=checkout_modes)
+
+
+def _verify_tracked_files(project_root: pathlib.Path, checkout_missing: bool = False) -> None:
+    """Verify all .pvt tracked files exist and warn on hash mismatches.
+
+    Args:
+        project_root: Project root directory.
+        checkout_missing: If True, restore missing tracked files from cache before validating.
+            Only restores files that don't exist - never overwrites existing files.
+    """
     tracked_files = track.discover_pvt_files(project_root)
     if not tracked_files:
         return
 
     with metrics.timed("core.verify_tracked_files"):
         missing = list[str]()
-        state_db_path = project_root / ".pivot" / "state.db"
+        state_db_path = config.get_state_dir() / "state.db"
+        cache_dir = config.get_cache_dir() / "files"
 
         with state_mod.StateDB(state_db_path) as state_db:
             for data_path, track_data in tracked_files.items():
                 path = pathlib.Path(data_path)
-                if not path.exists():
-                    missing.append(data_path)
+
+                # Try to hash the file - handles race conditions where file disappears
+                try:
+                    if path.is_file():
+                        current_hash = cache.hash_file(path, state_db)
+                    elif path.is_dir():
+                        current_hash, _ = cache.hash_directory(path, state_db)
+                    else:
+                        # Path doesn't exist
+                        raise FileNotFoundError(data_path)
+                except FileNotFoundError:
+                    if checkout_missing:
+                        if _restore_tracked_file(path, track_data, cache_dir):
+                            logger.info(f"Restored tracked file: {data_path}")
+                        else:
+                            logger.debug(f"Failed to restore tracked file from cache: {data_path}")
+                            missing.append(data_path)
+                    else:
+                        missing.append(data_path)
                     continue
 
                 # Check hash mismatch (file exists but content changed)
-                if path.is_file():
-                    current_hash = cache.hash_file(path, state_db)
-                else:
-                    current_hash, _ = cache.hash_directory(path, state_db)
                 if current_hash != track_data["hash"]:
                     logger.warning(
                         f"Tracked file '{data_path}' has changed since tracking. "
@@ -458,11 +580,7 @@ def _verify_tracked_files(project_root: pathlib.Path) -> None:
                     )
 
         if missing:
-            missing_list = "\n".join(f"  - {p}" for p in missing)
-            raise exceptions.TrackedFileMissingError(
-                f"The following tracked files are missing:\n{missing_list}\n\n"
-                + "Run 'pivot checkout' to restore them from cache."
-            )
+            raise exceptions.TrackedFileMissingError(missing, checkout_attempted=checkout_missing)
 
 
 def _warn_single_stage_mutex_groups(stage_states: dict[str, StageState]) -> None:
@@ -496,19 +614,19 @@ def _execute_greedy(
     stage_timeout: float | None = None,
     overrides: parameters.ParamsOverrides | None = None,
     explain_mode: bool = False,
-    checkout_modes: list[str] | None = None,
-    tui_queue: mp.Queue[TuiMessage] | None = None,
+    checkout_modes: list[cache.CheckoutMode] | None = None,
+    tui_queue: TuiQueue | None = None,
     output_queue: mp.Queue[OutputMessage] | None = None,
     run_id: str = "",
     force: bool = False,
     no_commit: bool = False,
     no_cache: bool = False,
     progress_callback: Callable[[RunJsonEvent], None] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> None:
     """Execute stages with greedy parallel scheduling using loky ProcessPoolExecutor."""
     overrides = overrides or {}
-    checkout_modes = checkout_modes or config.DEFAULT_CHECKOUT_MODE_ORDER
-    completed_count = 0
+    checkout_modes = checkout_modes or config.get_checkout_mode_order()
     futures: dict[concurrent.futures.Future[StageResult], str] = {}
     mutex_counts: collections.defaultdict[str, int] = collections.defaultdict(int)
 
@@ -529,14 +647,18 @@ def _execute_greedy(
     # Track manager so we can shut it down - only created when no queue is passed in
     local_manager = None
     if output_queue is None:
-        local_manager = mp.Manager()
+        # Use spawn context to avoid fork-in-multithreaded-context issues (Python 3.13+ deprecation)
+        spawn_ctx = mp.get_context("spawn")
+        local_manager = spawn_ctx.Manager()
         # Manager().Queue() returns AutoProxy[Queue] which is incompatible with Queue type stubs
         output_queue = local_manager.Queue()  # pyright: ignore[reportAssignmentType]
 
     # Type narrowing: output_queue is guaranteed to be non-None after the block above
     assert output_queue is not None
 
-    state_db_path = cache_dir.parent / "state.db"
+    state_dir = config.get_state_dir()
+    state_db_path = state_dir / "state.db"
+    proj_root = project.get_project_root()
     output_thread: threading.Thread | None = None
 
     try:
@@ -557,13 +679,15 @@ def _execute_greedy(
                 output_queue=output_queue,
                 max_stages=max_workers,
                 mutex_counts=mutex_counts,
-                completed_count=completed_count,
                 overrides=overrides,
                 lifecycle=lifecycle,
+                project_root=proj_root,
+                state_dir=state_dir,
                 checkout_modes=checkout_modes,
                 force=force,
                 no_commit=no_commit,
                 no_cache=no_cache,
+                cancel_event=cancel_event,
             )
 
             while futures:
@@ -605,7 +729,6 @@ def _execute_greedy(
                             stage_states,
                             lifecycle,
                         )
-                        completed_count += 1
                         for mutex in state.mutex:
                             mutex_counts[mutex] -= 1
                     continue
@@ -622,7 +745,7 @@ def _execute_greedy(
                             metrics.add_entries(result["metrics"])
 
                         # Use lifecycle to set state AND send all notifications
-                        lifecycle.mark_completed(state, result, completed_count + 1)
+                        lifecycle.mark_completed(state, result)
 
                         # Handle downstream cascade for failed stages
                         if result["status"] == StageStatus.FAILED:
@@ -641,8 +764,6 @@ def _execute_greedy(
                     except Exception as e:
                         _mark_stage_failed(state, str(e), stage_states, lifecycle)
 
-                    completed_count += 1
-
                     for downstream_name in state.downstream:
                         downstream_state = stage_states.get(downstream_name)
                         if downstream_state:
@@ -658,11 +779,39 @@ def _execute_greedy(
                             mutex_counts[mutex] = 0  # Reset to valid state
 
                 if error_mode == OnError.FAIL:
-                    failed = any(s.status == StageStatus.FAILED for s in stage_states.values())
-                    if failed:
+                    failed_stages = [
+                        name for name, s in stage_states.items() if s.status == StageStatus.FAILED
+                    ]
+                    if failed_stages:
+                        failed_stage_name = failed_stages[0]  # Use first failure for reason
+
+                        # Cancel all pending futures (no-op for already-running workers)
                         for f in futures:
                             f.cancel()
+
+                        # Mark all unfinished stages as skipped due to upstream failure
+                        # Explicit check for READY (waiting) and IN_PROGRESS (running) -
+                        # don't use "not in finished" as UNKNOWN indicates a bug state
+                        unfinished = {StageStatus.READY, StageStatus.IN_PROGRESS}
+                        for state in stage_states.values():
+                            if state.status in unfinished:
+                                lifecycle.mark_skipped_upstream(state, failed_stage_name)
                         return
+
+                # Check for cancellation - mark remaining READY stages as cancelled
+                if cancel_event is not None and cancel_event.is_set():
+                    for state in stage_states.values():
+                        if state.status == StageStatus.READY:
+                            result = StageResult(
+                                status=StageStatus.SKIPPED,
+                                reason="cancelled",
+                                output_lines=[],
+                            )
+                            lifecycle.mark_completed(state, result)
+                    if not futures:
+                        # No running stages - exit immediately
+                        return
+                    # Otherwise let running stages complete before exiting
 
                 slots_available = max_workers - len(futures)
                 if slots_available > 0:
@@ -674,13 +823,15 @@ def _execute_greedy(
                         output_queue=output_queue,
                         max_stages=slots_available,
                         mutex_counts=mutex_counts,
-                        completed_count=completed_count,
                         overrides=overrides,
                         lifecycle=lifecycle,
+                        project_root=proj_root,
+                        state_dir=state_dir,
                         checkout_modes=checkout_modes,
                         force=force,
                         no_commit=no_commit,
                         no_cache=no_cache,
+                        cancel_event=cancel_event,
                     )
     finally:
         # Signal output thread to stop - may fail if queue is broken
@@ -696,7 +847,7 @@ def _execute_greedy(
 def _output_queue_reader(
     output_q: mp.Queue[OutputMessage],
     con: console.Console | None,
-    tui_queue: mp.Queue[TuiMessage] | None = None,
+    tui_queue: TuiQueue | None = None,
 ) -> None:
     """Read output messages from worker processes and display/forward them."""
     while True:
@@ -722,6 +873,15 @@ def _output_queue_reader(
         except (EOFError, OSError, BrokenPipeError):
             # Queue was closed or broken - exit gracefully
             logger.debug("Output queue reader exiting: queue closed or broken")
+            # Notify TUI that log streaming was interrupted (tui_queue is reliable since it's stdlib queue.Queue)
+            if tui_queue:
+                tui_queue.put_nowait(
+                    TuiWatchMessage(
+                        type=TuiMessageType.WATCH,
+                        status=WatchStatus.ERROR,
+                        message="Log streaming interrupted - logs may be incomplete",
+                    )
+                )
             break
 
 
@@ -733,16 +893,23 @@ def _start_ready_stages(
     output_queue: mp.Queue[OutputMessage],
     max_stages: int,
     mutex_counts: collections.defaultdict[str, int],
-    completed_count: int,
     overrides: parameters.ParamsOverrides,
     lifecycle: StageLifecycle,
-    checkout_modes: list[str] | None = None,
+    project_root: pathlib.Path,
+    state_dir: pathlib.Path,
+    checkout_modes: list[cache.CheckoutMode] | None = None,
     force: bool = False,
     no_commit: bool = False,
     no_cache: bool = False,
+    cancel_event: threading.Event | None = None,
 ) -> None:
     """Find and start stages that are ready to execute."""
-    checkout_modes = checkout_modes or config.DEFAULT_CHECKOUT_MODE_ORDER
+    # Check cancellation - stages can become READY after the main loop's check
+    # (e.g., when a running stage completes and unblocks downstream)
+    if cancel_event is not None and cancel_event.is_set():
+        return
+
+    checkout_modes = checkout_modes or config.get_checkout_mode_order()
     started = 0
 
     for stage_name, state in stage_states.items():
@@ -770,7 +937,7 @@ def _start_ready_stages(
 
         # Show explanation before starting if in explain mode
         if lifecycle.explain_mode and lifecycle.console:
-            explanation = _get_stage_explanation(state.info, cache_dir, overrides)
+            explanation = _get_stage_explanation(state.info, state_dir, overrides)
             lifecycle.console.explain_stage(explanation)
 
         # Acquire mutex locks before changing status
@@ -778,7 +945,15 @@ def _start_ready_stages(
             mutex_counts[mutex] += 1
 
         worker_info = _prepare_worker_info(
-            state.info, overrides, checkout_modes, lifecycle.run_id, force, no_commit, no_cache
+            state.info,
+            overrides,
+            checkout_modes,
+            lifecycle.run_id,
+            force,
+            no_commit,
+            no_cache,
+            project_root,
+            state_dir,
         )
 
         try:
@@ -793,7 +968,7 @@ def _start_ready_stages(
             started += 1
 
             # Mark as in-progress and send all notifications via lifecycle
-            lifecycle.mark_started(state, running_count=completed_count + len(futures))
+            lifecycle.mark_started(state)
         except Exception as e:
             # Rollback mutex acquisition on submission failure
             for mutex in state.mutex:
@@ -804,18 +979,15 @@ def _start_ready_stages(
 def _prepare_worker_info(
     stage_info: registry.RegistryStageInfo,
     overrides: parameters.ParamsOverrides,
-    checkout_modes: list[str],
+    checkout_modes: list[cache.CheckoutMode],
     run_id: str,
     force: bool,
     no_commit: bool,
     no_cache: bool,
+    project_root: pathlib.Path,
+    state_dir: pathlib.Path,
 ) -> worker.WorkerStageInfo:
     """Prepare stage info for pickling to worker process."""
-    # Extract just the paths from OutOverride (worker doesn't need cache/persist options)
-    out_path_overrides = None
-    if stage_info["out_path_overrides"]:
-        out_path_overrides = {k: v["path"] for k, v in stage_info["out_path_overrides"].items()}
-
     return worker.WorkerStageInfo(
         func=stage_info["func"],
         fingerprint=stage_info["fingerprint"],
@@ -825,14 +997,16 @@ def _prepare_worker_info(
         params=stage_info["params"],
         variant=stage_info["variant"],
         overrides=overrides,
-        cwd=stage_info["cwd"],
         checkout_modes=checkout_modes,
         run_id=run_id,
         force=force,
         no_commit=no_commit,
         no_cache=no_cache,
         dep_specs=stage_info["dep_specs"],
-        out_path_overrides=out_path_overrides,
+        out_specs=stage_info["out_specs"],
+        params_arg_name=stage_info["params_arg_name"],
+        project_root=project_root,
+        state_dir=state_dir,
     )
 
 
@@ -861,7 +1035,7 @@ def _mark_stage_failed(
     """
     if lifecycle:
         # Use lifecycle to set state AND send notifications
-        lifecycle.mark_failed(state, reason, completed_count=0)
+        lifecycle.mark_failed(state, reason)
     else:
         # Fallback for non-TUI mode
         state.result = StageResult(status=StageStatus.FAILED, reason=reason, output_lines=[])
@@ -934,7 +1108,7 @@ def _build_results(stage_states: dict[str, StageState]) -> dict[str, ExecutionSu
 
 def _get_stage_explanation(
     stage_info: registry.RegistryStageInfo,
-    cache_dir: pathlib.Path,
+    state_dir: pathlib.Path,
     overrides: parameters.ParamsOverrides,
 ) -> StageExplanation:
     """Compute explanation for a single stage."""
@@ -944,26 +1118,26 @@ def _get_stage_explanation(
         stage_info["deps_paths"],
         stage_info["params"],
         overrides,
-        cache_dir,
+        state_dir,
     )
 
 
 def _check_uncached_incremental_outputs(
     execution_order: list[str],
-    cache_dir: pathlib.Path,
 ) -> list[tuple[str, str]]:
     """Check for IncrementalOut files that exist but aren't cached.
 
     Returns list of (stage_name, output_path) tuples for uncached files.
     """
     uncached = list[tuple[str, str]]()
+    state_dir = config.get_state_dir()
 
     for stage_name in execution_order:
         stage_info = registry.REGISTRY.get(stage_name)
         stage_outs = stage_info["outs"]
 
         # Read lock file to get cached output hashes
-        stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(cache_dir))
+        stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(state_dir))
         lock_data = stage_lock.read()
         output_hashes = lock_data.get("output_hashes", {}) if lock_data else {}
 
@@ -982,7 +1156,6 @@ def _check_uncached_incremental_outputs(
 def _write_run_history(
     run_id: str,
     stage_states: dict[str, StageState],
-    cache_dir: pathlib.Path,
     targeted_stages: list[str],
     execution_order: list[str],
     started_at: str,
@@ -990,17 +1163,15 @@ def _write_run_history(
     retention: int,
 ) -> None:
     """Build and write run manifest to StateDB."""
+    state_dir = config.get_state_dir()
 
     stages_records = dict[str, run_history.StageRunRecord]()
     for name, state in stage_states.items():
-        stage_lock = lock.StageLock(name, lock.get_stages_dir(cache_dir))
+        stage_lock = lock.StageLock(name, lock.get_stages_dir(state_dir))
         lock_data = stage_lock.read()
 
         if lock_data:
-            stage_info = registry.REGISTRY.get(name)
-            # Registry always stores single-file outputs (multi-file are expanded)
-            out_paths = [str(out.path) for out in stage_info["outs"]]
-            input_hash = run_history.compute_input_hash_from_lock(lock_data, out_paths)
+            input_hash = run_history.compute_input_hash_from_lock(lock_data)
         else:
             input_hash = "<no-lock>"
 
@@ -1024,7 +1195,7 @@ def _write_run_history(
         stages=stages_records,
     )
 
-    state_db_path = project.get_project_root() / ".pivot" / "state.db"
+    state_db_path = config.get_state_dir() / "state.db"
     with state_mod.StateDB(state_db_path) as state_db:
         state_db.write_run(manifest)
         state_db.prune_runs(retention)

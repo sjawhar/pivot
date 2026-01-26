@@ -5,7 +5,7 @@ import json
 import pathlib
 from typing import TYPE_CHECKING, TypedDict, cast
 
-from pivot import outputs, project
+from pivot import config, outputs, project
 from pivot.show import common
 from pivot.storage import cache, lock
 from pivot.types import ChangeType, OutputFormat
@@ -56,7 +56,7 @@ def collect_plots_from_stages() -> list[PlotInfo]:
 
 
 def get_plot_hashes_from_lock(
-    cache_dir: pathlib.Path | None = None,
+    state_dir: pathlib.Path | None = None,
 ) -> dict[str, str | None]:
     """Read output_hashes for plots from lock files.
 
@@ -64,14 +64,14 @@ def get_plot_hashes_from_lock(
     """
     from pivot import registry
 
-    if cache_dir is None:
-        cache_dir = project.get_project_root() / ".pivot" / "cache"
+    if state_dir is None:
+        state_dir = config.get_state_dir()
 
     proj_root = project.get_project_root()
     result = dict[str, str | None]()
     for stage_name in registry.REGISTRY.list_stages():
         info = registry.REGISTRY.get(stage_name)
-        stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(cache_dir))
+        stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(state_dir))
         lock_data = stage_lock.read()
 
         for out in info["outs"]:

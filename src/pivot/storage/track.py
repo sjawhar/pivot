@@ -13,7 +13,7 @@ from pivot.storage import cache
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from pivot.types import DirManifestEntry
+    from pivot.types import DirManifestEntry, HashInfo
 
 # Use union types to avoid type: ignore on fallback assignment
 _Loader: type[yaml.SafeLoader] | type[yaml.CSafeLoader]
@@ -123,3 +123,12 @@ def discover_pvt_files(root: pathlib.Path) -> dict[str, PvtData]:
         result[str(normalized)] = data
 
     return result
+
+
+def pvt_to_hash_info(pvt_data: PvtData) -> HashInfo:
+    """Convert PvtData to HashInfo format for cache operations."""
+    from pivot.types import DirHash, FileHash
+
+    if "manifest" in pvt_data:
+        return DirHash(hash=pvt_data["hash"], manifest=pvt_data["manifest"])
+    return FileHash(hash=pvt_data["hash"])

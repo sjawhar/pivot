@@ -35,7 +35,7 @@ class StageSpec:
     params: dict[str, Any]
     frozen: bool = False
     desc: str | None = None
-    cwd: pathlib.Path | None = None  # Working directory for command execution
+    wdir: pathlib.Path | None = None  # Working directory for subprocess execution (DVC wdir)
 
 
 def _to_relative_path(absolute_path: str, root: pathlib.Path) -> str:
@@ -178,7 +178,7 @@ def _build_out_entry(out: outputs.BaseOut, rel_path: str) -> str | dict[str, Any
         options["cache"] = out.cache
 
     # IncrementalOut always exports with persist: true (DVC won't delete it between runs)
-    if isinstance(out, outputs.IncrementalOut) or out.persist:
+    if isinstance(out, outputs.IncrementalOut):
         options["persist"] = True
 
     # Plot-specific options
@@ -323,7 +323,7 @@ def import_dvc_yaml(
             params=_extract_dvc_params(stage),
             frozen=stage.frozen,
             desc=stage.desc,
-            cwd=path.parent,  # Run command from dvc.yaml directory
+            wdir=path.parent,  # Run command from dvc.yaml directory
         )
         specs[stage.name] = spec
 
@@ -338,20 +338,22 @@ def _convert_dvc_output(out: DVCOutput) -> outputs.BaseOut:  # pragma: no cover
     """Convert a single DVC output to BaseOut object."""
     path = str(out.fs_path)
     cache = out.use_cache
-    persist = out.persist
 
     if out.plot:
         return outputs.Plot(
             path=path,
+            loader=loaders.PathOnly(),
             cache=cache,
-            persist=persist,
             x=out.plot.get("x") if isinstance(out.plot, dict) else None,
             y=out.plot.get("y") if isinstance(out.plot, dict) else None,
             template=out.plot.get("template") if isinstance(out.plot, dict) else None,
         )
     if out.metric:
-        return outputs.Metric(path=path, cache=cache, persist=persist)
-    return outputs.Out(path=path, loader=loaders.PathOnly(), cache=cache, persist=persist)
+        return outputs.Metric(path=path, cache=cache)
+    # DVC persist=True maps to IncrementalOut (restored from cache instead of deleted)
+    if out.persist:
+        return outputs.IncrementalOut(path=path, loader=loaders.PathOnly(), cache=cache)
+    return outputs.Out(path=path, loader=loaders.PathOnly(), cache=cache)
 
 
 def _convert_dvc_outputs(stage: PipelineStage) -> list[outputs.BaseOut]:  # pragma: no cover
@@ -381,16 +383,16 @@ def _register_imported_stage_with_name(
     mutex: list[str] | None = None,
 ) -> None:  # pragma: no cover
     """Register imported DVC stage with explicit name (for collision handling)."""
-    # Use spec.cwd if set, otherwise fall back to project root
-    cwd = spec.cwd if spec.cwd else project.get_project_root()
+    # Use spec.wdir if set, otherwise fall back to project root
+    wdir = spec.wdir if spec.wdir else project.get_project_root()
 
-    # DVC supports multi-command stages as lists - run each with cwd reset
+    # DVC supports multi-command stages as lists - run each in wdir
     # (check=True ensures we stop on first failure, like && would)
     commands = spec.cmd if isinstance(spec.cmd, list) else [spec.cmd]
 
     def wrapper() -> None:
         for cmd in commands:
-            subprocess.run(cmd, shell=True, check=True, cwd=cwd)  # noqa: S602
+            subprocess.run(cmd, shell=True, check=True, cwd=wdir)  # noqa: S602
 
     wrapper.__name__ = name
     wrapper.__module__ = "pivot.dvc_compat"
@@ -406,5 +408,4 @@ def _register_imported_stage_with_name(
         wrapper,
         name=name,
         mutex=mutex,
-        cwd=spec.cwd,
     )

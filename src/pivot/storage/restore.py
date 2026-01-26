@@ -85,10 +85,10 @@ def _parse_pvt_data_from_bytes(content: bytes) -> PvtData | None:
 
 
 def get_lock_data_from_revision(
-    stage_name: str, rev: str, cache_dir: pathlib.Path
+    stage_name: str, rev: str, state_dir: pathlib.Path
 ) -> StorageLockData | None:
     """Read and parse lock file for a stage from a git revision."""
-    stages_dir = lock.get_stages_dir(cache_dir)
+    stages_dir = lock.get_stages_dir(state_dir)
     rel_path = str(stages_dir.relative_to(project.get_project_root()) / f"{stage_name}.lock")
     content = git.read_file_from_revision(rel_path, rev)
     if content is None:
@@ -134,7 +134,7 @@ def _normalize_target_path(target: str, proj_root: pathlib.Path) -> str:
 def resolve_targets(
     targets: Sequence[str],
     rev: str,
-    cache_dir: pathlib.Path,
+    state_dir: pathlib.Path,
 ) -> list[TargetInfo]:
     """Resolve targets to TargetInfo, determining if each is a file or stage."""
     proj_root = project.get_project_root()
@@ -143,7 +143,7 @@ def resolve_targets(
     for target in targets:
         # Try as stage name first (stage names don't have path separators)
         if "/" not in target and "\\" not in target:
-            lock_data = get_lock_data_from_revision(target, rev, cache_dir)
+            lock_data = get_lock_data_from_revision(target, rev, state_dir)
             if lock_data is not None and "outs" in lock_data:
                 outs = lock_data["outs"]
                 paths = [entry["path"] for entry in outs]
@@ -322,6 +322,7 @@ def restore_targets_from_revision(
     rev: str,
     output: pathlib.Path | None,
     cache_dir: pathlib.Path,
+    state_dir: pathlib.Path,
     checkout_modes: list[cache.CheckoutMode],
     force: bool,
 ) -> list[str]:
@@ -334,7 +335,7 @@ def restore_targets_from_revision(
         raise exceptions.RevisionNotFoundError(f"Cannot resolve revision: '{rev}'")
 
     # Resolve targets
-    target_infos = resolve_targets(targets, rev, cache_dir)
+    target_infos = resolve_targets(targets, rev, state_dir)
 
     # Validate -o usage
     if output is not None:

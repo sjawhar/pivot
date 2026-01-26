@@ -84,7 +84,7 @@ Outputs are declared in the return type annotation:
 class TrainOutputs(TypedDict):
     model: Annotated[pathlib.Path, outputs.Out("model.pkl", loaders.PathOnly())]
     metrics: Annotated[dict, outputs.Metric("metrics.json")]
-    plot: Annotated[pathlib.Path, outputs.Plot("loss.png")]
+    plot: Annotated[pathlib.Path, outputs.Plot("loss.png", loaders.PathOnly())]
 
 
 def train(

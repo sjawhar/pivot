@@ -4,6 +4,7 @@ import asyncio
 
 import click
 
+from pivot import config
 from pivot.cli import completion
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
@@ -38,10 +39,14 @@ def remote_list() -> None:
 @click.argument("targets", nargs=-1, shell_complete=completion.complete_targets)
 @click.option("-r", "--remote", "remote_name", help="Remote name (uses default if not specified)")
 @click.option("--dry-run", "-n", is_flag=True, help="Show what would be pushed")
-@click.option("-j", "--jobs", type=click.IntRange(min=1), default=20, help="Parallel upload jobs")
+@click.option("-j", "--jobs", type=click.IntRange(min=1), default=None, help="Parallel upload jobs")
 @click.pass_context
 def push(
-    ctx: click.Context, targets: tuple[str, ...], remote_name: str | None, dry_run: bool, jobs: int
+    ctx: click.Context,
+    targets: tuple[str, ...],
+    remote_name: str | None,
+    dry_run: bool,
+    jobs: int | None,
 ) -> None:
     """Push cached outputs to remote storage.
 
@@ -50,14 +55,16 @@ def push(
     """
     cli_ctx = cli_helpers.get_cli_context(ctx)
     quiet = cli_ctx["quiet"]
+    jobs = jobs if jobs is not None else config.get_remote_jobs()
 
-    cache_dir = transfer.get_default_cache_dir()
+    cache_dir = config.get_cache_dir()
+    state_dir = config.get_state_dir()
     s3_remote, resolved_name = transfer.create_remote_from_name(remote_name)
 
     targets_list = list(targets) if targets else None
 
     if targets_list:
-        local_hashes = transfer.get_target_hashes(targets_list, cache_dir, include_deps=False)
+        local_hashes = transfer.get_target_hashes(targets_list, state_dir, include_deps=False)
     else:
         local_hashes = transfer.get_local_cache_hashes(cache_dir)
 
@@ -71,9 +78,10 @@ def push(
             click.echo(f"Would push {len(local_hashes)} file(s) to '{resolved_name}'")
         return
 
-    with state.StateDB(cache_dir) as state_db:
+    with state.StateDB(state_dir / "state.db") as state_db:
         result = transfer.push(
             cache_dir,
+            state_dir,
             s3_remote,
             state_db,
             resolved_name,
@@ -100,10 +108,16 @@ def push(
 @click.argument("targets", nargs=-1, shell_complete=completion.complete_targets)
 @click.option("-r", "--remote", "remote_name", help="Remote name (uses default if not specified)")
 @click.option("--dry-run", "-n", is_flag=True, help="Show what would be pulled")
-@click.option("-j", "--jobs", type=click.IntRange(min=1), default=20, help="Parallel download jobs")
+@click.option(
+    "-j", "--jobs", type=click.IntRange(min=1), default=None, help="Parallel download jobs"
+)
 @click.pass_context
 def pull(
-    ctx: click.Context, targets: tuple[str, ...], remote_name: str | None, dry_run: bool, jobs: int
+    ctx: click.Context,
+    targets: tuple[str, ...],
+    remote_name: str | None,
+    dry_run: bool,
+    jobs: int | None,
 ) -> None:
     """Pull cached outputs from remote storage.
 
@@ -113,15 +127,17 @@ def pull(
     """
     cli_ctx = cli_helpers.get_cli_context(ctx)
     quiet = cli_ctx["quiet"]
+    jobs = jobs if jobs is not None else config.get_remote_jobs()
 
-    cache_dir = transfer.get_default_cache_dir()
+    cache_dir = config.get_cache_dir()
+    state_dir = config.get_state_dir()
     s3_remote, resolved_name = transfer.create_remote_from_name(remote_name)
 
     targets_list = list(targets) if targets else None
 
     if dry_run:
         if targets_list:
-            needed = transfer.get_target_hashes(targets_list, cache_dir, include_deps=True)
+            needed = transfer.get_target_hashes(targets_list, state_dir, include_deps=True)
         else:
             needed = asyncio.run(s3_remote.list_hashes())
 
@@ -131,9 +147,10 @@ def pull(
             click.echo(f"Would pull {len(missing)} file(s) from '{resolved_name}'")
         return
 
-    with state.StateDB(cache_dir) as state_db:
+    with state.StateDB(state_dir / "state.db") as state_db:
         result = transfer.pull(
             cache_dir,
+            state_dir,
             s3_remote,
             state_db,
             resolved_name,

@@ -259,10 +259,15 @@ def test_check_pipeline_config_handles_scalar_yaml(
     assert result["details"]["stages"] == 0
 
 
-def test_check_cache_directory_ok_when_exists_and_writable(tmp_path: pathlib.Path) -> None:
+def test_check_cache_directory_ok_when_exists_and_writable(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """_check_cache_directory returns OK when cache exists and is writable."""
     cache_dir = tmp_path / ".pivot" / "cache"
     cache_dir.mkdir(parents=True)
+
+    # Set up project root so config.get_cache_dir() works correctly
+    monkeypatch.setattr(project, "_project_root_cache", tmp_path)
 
     result = doctor_module._check_cache_directory(tmp_path)
 
@@ -272,10 +277,15 @@ def test_check_cache_directory_ok_when_exists_and_writable(tmp_path: pathlib.Pat
     assert result["details"]["writable"] is True
 
 
-def test_check_cache_directory_ok_when_not_exists(tmp_path: pathlib.Path) -> None:
+def test_check_cache_directory_ok_when_not_exists(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """_check_cache_directory returns OK when cache doesn't exist yet."""
     (tmp_path / ".pivot").mkdir()
     # Don't create cache directory
+
+    # Set up project root so config.get_cache_dir() works correctly
+    monkeypatch.setattr(project, "_project_root_cache", tmp_path)
 
     result = doctor_module._check_cache_directory(tmp_path)
 

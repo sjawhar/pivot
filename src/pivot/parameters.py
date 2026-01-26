@@ -15,6 +15,16 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Custom merger: replace lists instead of appending (deepmerge default appends)
+_params_merger = deepmerge.Merger(  # pyright: ignore[reportPrivateImportUsage]
+    type_strategies=[
+        (list, ["override"]),  # Replace lists entirely
+        (dict, ["merge"]),  # Merge dicts recursively
+    ],
+    fallback_strategies=["override"],
+    type_conflict_strategies=["override"],
+)
+
 # Type alias for params overrides: stage_name -> param_name -> param_value
 # Inner dict values are Any because config files can contain arbitrary JSON-compatible types
 ParamsOverrides = dict[str, dict[str, Any]]
@@ -92,11 +102,11 @@ def _get_merged_overrides(stage_name: str, overrides: ParamsOverrides) -> dict[s
         base_name = stage_name.split("@")[0]
         if base_name:  # Guard against names starting with @
             base_overrides = copy.deepcopy(overrides.get(base_name, {}))
-            merged = deepmerge.always_merger.merge(merged, base_overrides)
+            merged = _params_merger.merge(merged, base_overrides)
 
     # Apply exact stage name overrides (more specific, takes precedence)
     stage_overrides = copy.deepcopy(overrides.get(stage_name, {}))
-    return deepmerge.always_merger.merge(merged, stage_overrides)
+    return _params_merger.merge(merged, stage_overrides)
 
 
 def apply_overrides[T: pydantic.BaseModel](
@@ -130,7 +140,7 @@ def apply_overrides[T: pydantic.BaseModel](
 
     # Deep merge instance values with overrides
     base_dict = params_instance.model_dump()
-    merged = deepmerge.always_merger.merge(base_dict, merged_overrides)
+    merged = _params_merger.merge(base_dict, merged_overrides)
     return type(params_instance).model_validate(merged)
 
 

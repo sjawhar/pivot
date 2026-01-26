@@ -20,7 +20,7 @@ import textual.containers
 import textual.css.query
 import textual.widgets
 
-from pivot import explain, outputs, parameters, project
+from pivot import config, explain, outputs, parameters, project
 from pivot.registry import REGISTRY
 from pivot.show import data as data_mod
 from pivot.show import metrics as metrics_mod
@@ -114,9 +114,9 @@ def _get_registry_info(stage_name: str) -> RegistryStageInfo | None:
         return None
 
 
-def _get_cache_dir() -> pathlib.Path:
-    """Get the cache directory path."""
-    return project.get_cache_dir()
+def _get_state_dir() -> pathlib.Path:
+    """Get the state directory path."""
+    return config.get_state_dir()
 
 
 def _get_relative_path(abs_path: str) -> str:
@@ -443,7 +443,7 @@ class InputDiffPanel(_SelectableExpandablePanel):
         if self._registry_info is None:
             return
 
-        cache_dir = _get_cache_dir()
+        state_dir = _get_state_dir()
         try:
             self._explanation = explain.get_stage_explanation(
                 stage_name=stage_name,
@@ -451,7 +451,7 @@ class InputDiffPanel(_SelectableExpandablePanel):
                 deps=self._registry_info["deps_paths"],
                 params_instance=self._registry_info["params"],
                 overrides=parameters.load_params_yaml(),
-                cache_dir=cache_dir,
+                state_dir=state_dir,
             )
         except Exception:
             self._explanation = None
@@ -742,8 +742,8 @@ class OutputDiffPanel(_SelectableExpandablePanel):
         if self._registry_info is None:
             return
 
-        cache_dir = _get_cache_dir()
-        stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(cache_dir))
+        state_dir = _get_state_dir()
+        stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(state_dir))
         lock_data = stage_lock.read()
 
         output_changes = compute_output_changes(lock_data, self._registry_info)

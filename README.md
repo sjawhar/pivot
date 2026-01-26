@@ -103,7 +103,7 @@ stages:
           params:
             hidden_size: 1024
           deps:
-            tokenizer+: data/gpt_tokenizer.json
+            tokenizer: data/gpt_tokenizer.json
       dataset: [swe, human]
 ```
 

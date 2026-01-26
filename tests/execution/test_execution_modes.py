@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime
+import json
 import multiprocessing as mp
 import shutil
 from multiprocessing import queues as mp_queues
@@ -13,7 +14,7 @@ import pytest
 from pivot import loaders, outputs, project, run_history, watch
 from pivot.executor import commit as commit_mod
 from pivot.executor import worker
-from pivot.storage import lock, state
+from pivot.storage import cache, lock, state
 from pivot.types import OutputMessage, StageStatus
 
 if TYPE_CHECKING:
@@ -66,14 +67,20 @@ def _make_stage_info(
         params=None,
         variant=None,
         overrides={},
-        cwd=tmp_path,
-        checkout_modes=["hardlink", "symlink", "copy"],
+        checkout_modes=[
+            cache.CheckoutMode.HARDLINK,
+            cache.CheckoutMode.SYMLINK,
+            cache.CheckoutMode.COPY,
+        ],
         run_id=run_id,
         force=force,
         no_commit=no_commit,
         no_cache=no_cache,
         dep_specs={},
-        out_path_overrides=None,
+        out_specs={},
+        params_arg_name=None,
+        project_root=tmp_path,
+        state_dir=tmp_path / ".pivot",
     )
 
 
@@ -110,7 +117,7 @@ def test_no_commit_writes_to_pending_lock(
     assert pending_data is not None
 
     # Production lock should NOT exist
-    production_lock = lock.StageLock("test_stage", lock.get_stages_dir(worker_env))
+    production_lock = lock.StageLock("test_stage", lock.get_stages_dir(tmp_path / ".pivot"))
     assert not production_lock.path.exists(), "Production lock should NOT be written"
 
 
@@ -219,12 +226,12 @@ def test_commit_pending_promotes_to_production(
 
     # Pending lock exists, production doesn't
     pending_lock = lock.get_pending_lock("test_stage", tmp_path)
-    production_lock = lock.StageLock("test_stage", lock.get_stages_dir(worker_env))
+    production_lock = lock.StageLock("test_stage", lock.get_stages_dir(tmp_path / ".pivot"))
     assert pending_lock.path.exists()
     assert not production_lock.path.exists()
 
     # Commit
-    committed = commit_mod.commit_pending(worker_env)
+    committed = commit_mod.commit_pending()
 
     assert committed == ["test_stage"]
 
@@ -265,7 +272,7 @@ def test_discard_pending_removes_pending_locks(
     assert not pending_lock.path.exists()
 
     # Production lock should NOT exist (we discarded, didn't commit)
-    production_lock = lock.StageLock("test_stage", lock.get_stages_dir(worker_env))
+    production_lock = lock.StageLock("test_stage", lock.get_stages_dir(tmp_path / ".pivot"))
     assert not production_lock.path.exists()
 
 
@@ -326,7 +333,7 @@ def test_commit_records_generation_at_execution_time(
         assert new_gen == 6, "After increment: input should be at generation 6"
 
     # Now commit
-    committed = commit_mod.commit_pending(worker_env)
+    committed = commit_mod.commit_pending()
     assert committed == ["test_stage"]
 
     # Check what generation was recorded for the dependency
@@ -502,7 +509,7 @@ def test_no_cache_writes_lock_with_null_hashes(
     assert result["status"] == StageStatus.RAN
 
     # Production lock should exist with null hashes
-    production_lock = lock.StageLock("test_stage", lock.get_stages_dir(worker_env))
+    production_lock = lock.StageLock("test_stage", lock.get_stages_dir(tmp_path / ".pivot"))
     assert production_lock.path.exists(), "Production lock should be written"
     lock_data = production_lock.read()
     assert lock_data is not None
@@ -593,7 +600,7 @@ def test_no_cache_with_no_commit(
     assert pending_lock.path.exists(), "Pending lock should be written"
 
     # Production lock should NOT exist
-    production_lock = lock.StageLock("test_stage", lock.get_stages_dir(worker_env))
+    production_lock = lock.StageLock("test_stage", lock.get_stages_dir(tmp_path / ".pivot"))
     assert not production_lock.path.exists(), "Production lock should NOT be written"
 
     # Cache should be empty (because no_cache=True)
@@ -648,7 +655,7 @@ def test_run_cache_restores_directory_output(
     assert (output_dir / "file2.txt").read_text() == "content2"
 
     # Delete the lock file so run cache is used instead of lock-based skip
-    production_lock = lock.StageLock("test_stage", lock.get_stages_dir(worker_env))
+    production_lock = lock.StageLock("test_stage", lock.get_stages_dir(tmp_path / ".pivot"))
     production_lock.path.unlink()
 
     # Delete the directory output
@@ -667,3 +674,74 @@ def test_run_cache_restores_directory_output(
     assert (output_dir / "file2.txt").exists(), "file2.txt should be restored"
     assert (output_dir / "file1.txt").read_text() == "content1"
     assert (output_dir / "file2.txt").read_text() == "content2"
+
+
+def test_run_cache_reruns_when_noncached_output_missing(
+    worker_env: pathlib.Path, tmp_path: pathlib.Path, output_queue: mp_queues.Queue[OutputMessage]
+) -> None:
+    """Run cache should NOT skip when non-cached output (Metric) is missing.
+
+    Regression test for #243: when a non-cached output is deleted after
+    running once, the run cache incorrectly skipped execution instead of
+    re-running the stage to recreate the output.
+
+    This test uses BOTH a cached output (Out) and a non-cached output (Metric)
+    to ensure the run cache entry is created and the skip path is exercised.
+    """
+    (tmp_path / "input.txt").write_text("input data")
+
+    execution_count: list[int] = [0]
+
+    def stage_func() -> None:
+        execution_count[0] += 1
+        (tmp_path / "output.txt").write_text("output data")
+        (tmp_path / "metrics.json").write_text(json.dumps({"accuracy": 0.95}))
+
+    # Stage with both cached (Out) and non-cached (Metric) outputs
+    stage_info = _make_stage_info(
+        stage_func,
+        tmp_path,
+        deps=[str(tmp_path / "input.txt")],
+        outs=[
+            outputs.Out("output.txt", loader=loaders.PathOnly()),
+            outputs.Metric("metrics.json"),
+        ],
+    )
+
+    # First run - should execute and write to run cache
+    result1 = worker.execute_stage("test_stage", stage_info, worker_env, output_queue)
+    assert result1["status"] == StageStatus.RAN
+    assert execution_count[0] == 1
+
+    # Apply deferred writes (simulating what coordinator does)
+    # With a cached output, deferred_writes MUST contain a run cache entry
+    assert "deferred_writes" in result1, "Should have deferred writes with cached output"
+    state_db_path = worker_env.parent / "state.db"
+    output_paths: list[str] = [str(out.path) for out in stage_info["outs"]]
+    with state.StateDB(state_db_path) as db:
+        db.apply_deferred_writes("test_stage", output_paths, result1["deferred_writes"])
+
+    # Verify both files exist
+    output_file = tmp_path / "output.txt"
+    metric_file = tmp_path / "metrics.json"
+    assert output_file.exists()
+    assert metric_file.exists()
+
+    # Delete the lock file so run cache is used instead of lock-based skip
+    production_lock = lock.StageLock("test_stage", lock.get_stages_dir(tmp_path / ".pivot"))
+    production_lock.path.unlink()
+
+    # Delete the metric file (non-cached output)
+    # The cached output.txt remains on disk
+    metric_file.unlink()
+    assert not metric_file.exists()
+    assert output_file.exists(), "Cached output should still exist"
+
+    # Second run - should re-run because the non-cached metric file is missing
+    # Before the fix, this incorrectly skipped via run cache
+    result2 = worker.execute_stage("test_stage", stage_info, worker_env, output_queue)
+    assert result2["status"] == StageStatus.RAN, "Should re-run when non-cached output is missing"
+    assert execution_count[0] == 2, "Stage should have executed again"
+
+    # Verify the metric file was recreated
+    assert metric_file.exists(), "Metric file should be recreated"

@@ -16,6 +16,7 @@ import pydantic
 from pivot import (
     exceptions,
     fingerprint,
+    metrics,
     outputs,
     path_policy,
     project,
@@ -37,7 +38,6 @@ class _OutOverrideOptions(TypedDict, total=False):
     """Optional options for output overrides."""
 
     cache: bool
-    persist: bool
 
 
 class OutOverride(_OutOverrideOptions):
@@ -49,6 +49,10 @@ class OutOverride(_OutOverrideOptions):
     path: outputs.PathType
 
 
+# Accept either a simple path string or a full OutOverride dict
+OutOverrideInput = outputs.PathType | OutOverride
+
+
 class RegistryStageInfo(TypedDict):
     """Metadata for a registered stage.
 
@@ -57,16 +61,17 @@ class RegistryStageInfo(TypedDict):
         name: Unique stage identifier (function name or custom name).
         deps: Named input file dependencies (name -> path(s), absolute paths).
         deps_paths: Flattened list of all dependency paths (for DAG/worker).
-        outs: Output specifications (Out, Metric, Plot, etc.).
+        outs: Output specifications (expanded for DAG/caching - one Out per file).
         outs_paths: Output file paths (absolute paths).
         params: Pydantic model instance with parameter values.
         mutex: Mutex groups for exclusive execution.
         variant: Variant name for matrix stages (None for regular stages).
         signature: Function signature for parameter injection.
         fingerprint: Code fingerprint mapping (key -> hash).
-        cwd: Working directory for path resolution.
         dep_specs: Dependency specs from function annotations.
-        out_path_overrides: Path and option overrides for outputs from YAML.
+        out_specs: Output specs from return type (return key -> resolved Out, pre-expansion).
+            For single-output stages, uses SINGLE_OUTPUT_KEY (convention for non-TypedDict returns).
+        params_arg_name: Name of the StageParams parameter in function signature (or None).
     """
 
     func: Callable[..., Any]
@@ -82,9 +87,9 @@ class RegistryStageInfo(TypedDict):
     variant: str | None
     signature: Signature | None
     fingerprint: dict[str, str]
-    cwd: pathlib.Path | None
     dep_specs: dict[str, stage_def.FuncDepSpec]
-    out_path_overrides: dict[str, OutOverride] | None
+    out_specs: dict[str, outputs.Out[Any]]
+    params_arg_name: str | None
 
 
 class ValidationMode(enum.StrEnum):
@@ -98,34 +103,85 @@ class ValidationMode(enum.StrEnum):
 _STAGE_NAME_PATTERN = re.compile(r"^[a-zA-Z][a-zA-Z0-9_-]*$")
 
 
+def _normalize_out_override(value: OutOverrideInput) -> OutOverride:
+    """Normalize output override input to OutOverride dict.
+
+    Accepts simple path strings or full OutOverride dicts.
+    """
+    if isinstance(value, (str, list, tuple)):
+        return OutOverride(path=value)
+    return value
+
+
 def _apply_out_overrides(
     out_spec: outputs.Out[Any],
     override: OutOverride | None,
-) -> list[outputs.Out[Any]]:
+) -> outputs.Out[Any]:
     """Apply path and option overrides to an Out spec, preserving subclass type and loader.
 
-    For multi-file outputs (path is list/tuple), creates individual Out objects for each path.
-    Each returned Out object has a single-string path.
+    Does NOT expand multi-file paths - returns a single Out with the resolved path (may be list/tuple).
+    Expansion for DAG/caching is handled separately.
 
-    Returns a list of Out objects (possibly multiple for multi-file outputs).
+    Returns a single Out object with overrides applied.
     """
     # Determine final path (override or annotation default)
     path = override["path"] if override else out_spec.path
 
-    # Determine final cache/persist (override takes precedence, then annotation default)
+    # Determine final cache (override takes precedence, then annotation default)
     # Note: annotation default is already set correctly for Out/Metric/Plot subclasses
     cache = override.get("cache", out_spec.cache) if override else out_spec.cache
-    persist = override.get("persist", out_spec.persist) if override else out_spec.persist
 
-    # For multi-file outputs, create individual Out objects for each path
+    return dataclasses.replace(out_spec, path=path, cache=cache)
+
+
+def _expand_out_spec(out_spec: outputs.Out[Any]) -> list[outputs.Out[Any]]:
+    """Expand multi-file output spec into individual Out objects for DAG/caching.
+
+    For multi-file outputs (path is list/tuple), creates individual Out objects for each path.
+    For single-file outputs, returns a single-item list.
+    """
+    path = out_spec.path
     if isinstance(path, (list, tuple)):
-        result = list[outputs.Out[Any]]()
-        for p in path:
-            # Use dataclasses.replace to preserve the Out subclass type and loader
-            result.append(dataclasses.replace(out_spec, path=p, cache=cache, persist=persist))
-        return result
+        return [dataclasses.replace(out_spec, path=p) for p in path]
     else:
-        return [dataclasses.replace(out_spec, path=path, cache=cache, persist=persist)]
+        return [out_spec]
+
+
+def _resolve_out_spec(
+    out_name: str,
+    out_spec: outputs.Out[Any],
+    override: OutOverride | None,
+    stage_name: str,
+) -> tuple[outputs.Out[Any], list[outputs.Out[Any]]]:
+    """Apply overrides to an output spec and expand for DAG/caching.
+
+    Validates that IncrementalOut outputs aren't overridden, applies path/cache overrides,
+    and expands multi-file specs into individual Out objects.
+
+    Args:
+        out_name: Output key name (for error messages).
+        out_spec: Original Out spec from function annotations.
+        override: Path/cache override from YAML (or None).
+        stage_name: Stage name (for error messages).
+
+    Returns:
+        Tuple of (resolved_spec, expanded_specs) where:
+        - resolved_spec: Single Out with overrides applied (may have list/tuple path)
+        - expanded_specs: List of Outs with single-string paths for DAG/caching
+
+    Raises:
+        ValidationError: If trying to override an IncrementalOut path.
+    """
+    # IncrementalOut paths must match between input and output - disallow overrides
+    if override is not None and isinstance(out_spec, outputs.IncrementalOut):
+        raise exceptions.ValidationError(
+            f"Stage '{stage_name}': cannot override IncrementalOut output path for '{out_name}'. "
+            + "IncrementalOut paths must match between input and output annotations."
+        )
+
+    resolved = _apply_out_overrides(out_spec, override)
+    expanded = _expand_out_spec(resolved)
+    return resolved, expanded
 
 
 class StageRegistry:
@@ -152,6 +208,7 @@ class StageRegistry:
 
     def __init__(self, validation_mode: ValidationMode = ValidationMode.ERROR) -> None:
         self._stages: dict[str, RegistryStageInfo] = {}
+        self._cached_dag: DiGraph[str] | None = None
         self.validation_mode: ValidationMode = validation_mode
 
     def register(
@@ -161,9 +218,8 @@ class StageRegistry:
         params: ParamsArg = None,
         mutex: Sequence[str] | None = None,
         variant: str | None = None,
-        cwd: str | pathlib.Path | None = None,
         dep_path_overrides: Mapping[str, outputs.PathType] | None = None,
-        out_path_overrides: Mapping[str, OutOverride] | None = None,
+        out_path_overrides: Mapping[str, OutOverrideInput] | None = None,
     ) -> None:
         """Register a stage function with metadata.
 
@@ -177,9 +233,10 @@ class StageRegistry:
             params: Pydantic model class or instance for parameters.
             mutex: Mutex groups for exclusive execution.
             variant: Variant name for matrix stages.
-            cwd: Working directory for path resolution.
             dep_path_overrides: Override paths for deps (must match annotation dep names).
-            out_path_overrides: Override paths and options for outputs (must match annotation names).
+            out_path_overrides: Override paths/options for outputs. Accepts simple path strings
+                or dicts with path and options: `{"result": "out.csv"}` or
+                `{"result": {"path": "out.csv", "cache": False}}`.
 
         Raises:
             ValidationError: If stage name is invalid or already registered.
@@ -187,141 +244,170 @@ class StageRegistry:
             InvalidPathError: If paths resolve outside project root.
             ParamsError: If params specified but function lacks params argument.
         """
-        stage_name = name if name is not None else func.__name__
-        mutex_list: list[str] = [m.strip().lower() for m in mutex] if mutex else []
+        with metrics.timed("registry.register"):
+            # Invalidate DAG cache on any registration
+            self._cached_dag = None
 
-        # Normalize cwd to absolute path and validate within project root
-        cwd_path: pathlib.Path | None = None
-        if cwd is not None:
-            cwd_path = project.normalize_path(cwd)
-            project_root = project.get_project_root()
-            if not cwd_path.is_relative_to(project_root):
-                raise exceptions.InvalidPathError(
-                    f"Stage '{stage_name}': cwd '{cwd}' resolves to '{cwd_path}' "
-                    + f"which is outside project root '{project_root}'"
+            stage_name = name if name is not None else func.__name__
+
+            # Warn about lambda functions - their fingerprints are non-deterministic
+            if func.__name__ == "<lambda>":
+                logger.warning(
+                    f"Stage '{stage_name}' uses a lambda function. Lambda fingerprinting is non-deterministic "
+                    + "and will cause unnecessary re-runs. Use a named function instead."
                 )
 
-        # Convert params to instance (instantiate class if needed)
-        params_instance = _resolve_params(params, func, stage_name)
+            mutex_list: list[str] = [m.strip().lower() for m in mutex] if mutex else []
 
-        # Extract deps from function annotations
-        dep_specs = stage_def.get_dep_specs_from_signature(func)
+            # Convert params to instance (instantiate class if needed)
+            params_instance = _resolve_params(params, func, stage_name)
 
-        # Validate dep_path_overrides match annotation dep names
-        if dep_path_overrides:
-            unknown = set(dep_path_overrides.keys()) - set(dep_specs.keys())
-            if unknown:
-                raise exceptions.ValidationError(
-                    f"Stage '{stage_name}': dep_path_overrides contains unknown deps: {unknown}. Available: {list(dep_specs.keys())}"
-                )
-            # Apply overrides
-            dep_specs = stage_def.apply_dep_path_overrides(dep_specs, dep_path_overrides)
+            # Extract deps from function annotations
+            dep_specs = stage_def.get_dep_specs_from_signature(func)
 
-        # Build deps dict from specs
-        deps_dict: dict[str, outputs.PathType] = {
-            dep_name: spec.path for dep_name, spec in dep_specs.items()
-        }
-
-        # Flatten deps for validation and DAG
-        deps_flat = _flatten_deps(deps_dict)
-
-        # Extract outs from return type annotations
-        return_out_specs = stage_def.get_output_specs_from_return(func)
-        single_out_spec = stage_def.get_single_output_spec_from_return(func)
-
-        # Build outs from return annotations (preserving Out subclass type and loader)
-        outs_from_annotations: list[outputs.Out[Any]] = []
-        out_overrides_dict: dict[str, OutOverride] | None = None
-
-        if return_out_specs:
-            # Validate out_path_overrides match annotation out names
-            if out_path_overrides:
-                unknown = set(out_path_overrides.keys()) - set(return_out_specs.keys())
+            # Validate dep_path_overrides match annotation dep names
+            if dep_path_overrides:
+                unknown = set(dep_path_overrides.keys()) - set(dep_specs.keys())
                 if unknown:
                     raise exceptions.ValidationError(
-                        f"Stage '{stage_name}': out_path_overrides contains unknown outs: {unknown}. Available: {list(return_out_specs.keys())}"
+                        f"Stage '{stage_name}': dep_path_overrides contains unknown deps: {unknown}. "
+                        + f"Available: {list(dep_specs.keys())}"
                     )
-                out_overrides_dict = dict(out_path_overrides)
-
-            # Apply overrides while preserving Out subclass type and loader
-            for out_name, out_spec in return_out_specs.items():
-                override = out_path_overrides.get(out_name) if out_path_overrides else None
-                outs_from_annotations.extend(_apply_out_overrides(out_spec, override))
-
-        elif single_out_spec is not None:
-            # Single annotated return type - any YAML key is valid (maps to the one output)
-            override: OutOverride | None = None
-            if out_path_overrides:
-                if len(out_path_overrides) > 1:
+                # Disallow overrides for IncrementalOut inputs - path must match output annotation
+                incremental_overrides = [
+                    name for name in dep_path_overrides if not dep_specs[name].creates_dep_edge
+                ]
+                if incremental_overrides:
                     raise exceptions.ValidationError(
-                        f"Stage '{stage_name}': single-output stage has {len(out_path_overrides)} out_path_overrides keys ({list(out_path_overrides.keys())}). Only one key is allowed for single-output stages."
+                        f"Stage '{stage_name}': cannot override IncrementalOut input paths: "
+                        + f"{incremental_overrides}. IncrementalOut paths must match between "
+                        + "input and output annotations."
                     )
-                # Get the single override (whatever key the user used)
-                override = next(iter(out_path_overrides.values()))
-                # Map to internal _single key
-                out_overrides_dict = {"_single": override}
+                # Apply overrides
+                dep_specs = stage_def.apply_dep_path_overrides(dep_specs, dep_path_overrides)
 
-            outs_from_annotations.extend(_apply_out_overrides(single_out_spec, override))
-
-        outs_list = outs_from_annotations
-        # After _apply_out_overrides, each Out has a single-string path (multi-file paths expanded)
-        outs_paths = [str(o.path) for o in outs_list]
-
-        # Validate paths BEFORE normalizing (check ".." on original paths)
-        _validate_stage_registration(
-            self._stages, stage_name, deps_flat, outs_paths, self.validation_mode
-        )
-
-        # Normalize dep paths - flatten, normalize, then rebuild dict
-        deps_flat_normalized = _normalize_paths(
-            deps_flat, path_policy.PathType.DEP, self.validation_mode, cwd_path
-        )
-        outs_paths = _normalize_paths(
-            outs_paths, path_policy.PathType.OUT, self.validation_mode, cwd_path
-        )
-
-        # Rebuild deps dict with normalized paths
-        deps_normalized = _normalize_deps_dict(deps_dict, cwd_path, self.validation_mode)
-
-        # Update normalized outputs with absolute paths
-        outs_normalized = [
-            dataclasses.replace(out, path=path)
-            for out, path in zip(outs_list, outs_paths, strict=True)
-        ]
-
-        try:
-            # Build temp_stages with string paths for trie (existing stages use outs_paths)
-            temp_stages: dict[str, trie.TrieStageInfo] = {
-                name: {"name": name, "outs": info["outs_paths"]}
-                for name, info in self._stages.items()
+            # Build deps dict from specs (all deps, for loading)
+            deps_dict: dict[str, outputs.PathType] = {
+                dep_name: spec.path for dep_name, spec in dep_specs.items()
             }
-            temp_stages[stage_name] = {"name": stage_name, "outs": outs_paths}
-            trie.build_outs_trie(temp_stages)
-        except (exceptions.OutputDuplicationError, exceptions.OverlappingOutputPathsError) as e:
-            _handle_validation_error(str(e), self.validation_mode)
 
-        # Build stage fingerprint (includes loader fingerprints from annotations)
-        stage_fp = fingerprint.get_stage_fingerprint(func)
-        stage_fp.update(
-            _get_annotation_loader_fingerprints(dep_specs, return_out_specs, single_out_spec)
-        )
+            # Flatten ALL deps for path validation (security check applies to all paths)
+            all_deps_flat = _flatten_deps(deps_dict)
 
-        self._stages[stage_name] = RegistryStageInfo(
-            func=func,
-            name=stage_name,
-            deps=deps_normalized,
-            deps_paths=deps_flat_normalized,
-            outs=outs_normalized,
-            outs_paths=outs_paths,
-            params=params_instance,
-            mutex=mutex_list,
-            variant=variant,
-            signature=inspect.signature(func),
-            fingerprint=stage_fp,
-            cwd=cwd_path,
-            dep_specs=dep_specs,
-            out_path_overrides=out_overrides_dict,
-        )
+            # Flatten deps for DAG, excluding deps that don't create edges
+            # (IncrementalOut as input is self-referential, no DAG edge to avoid circular dependency)
+            deps_dict_for_dag = {
+                dep_name: spec.path for dep_name, spec in dep_specs.items() if spec.creates_dep_edge
+            }
+            deps_flat = _flatten_deps(deps_dict_for_dag)
+
+            # Extract outs from return type annotations
+            return_out_specs = stage_def.get_output_specs_from_return(func, stage_name)
+            single_out_spec = stage_def.get_single_output_spec_from_return(func)
+
+            # Validate IncrementalOut input/output matching
+            _validate_incremental_out_matching(
+                stage_name, dep_specs, return_out_specs, single_out_spec
+            )
+
+            # Build out_specs from return annotations (return key -> resolved Out, pre-expansion)
+            # For single-output stages (non-TypedDict return), uses SINGLE_OUTPUT_KEY convention
+            out_specs: dict[str, outputs.Out[Any]] = {}
+            outs_from_annotations: list[outputs.Out[Any]] = []
+
+            if return_out_specs:
+                # Validate out_path_overrides match annotation out names
+                if out_path_overrides:
+                    unknown = set(out_path_overrides.keys()) - set(return_out_specs.keys())
+                    if unknown:
+                        raise exceptions.ValidationError(
+                            f"Stage '{stage_name}': out_path_overrides contains unknown outs: {unknown}. "
+                            + f"Available: {list(return_out_specs.keys())}"
+                        )
+
+                # Apply overrides and expand each output spec
+                for out_name, out_spec in return_out_specs.items():
+                    raw_override = out_path_overrides.get(out_name) if out_path_overrides else None
+                    override = _normalize_out_override(raw_override) if raw_override else None
+                    resolved, expanded = _resolve_out_spec(out_name, out_spec, override, stage_name)
+                    out_specs[out_name] = resolved
+                    outs_from_annotations.extend(expanded)
+
+            elif single_out_spec is not None:
+                # Single annotated return type - uses SINGLE_OUTPUT_KEY convention
+                override: OutOverride | None = None
+                if out_path_overrides:
+                    if len(out_path_overrides) > 1:
+                        raise exceptions.ValidationError(
+                            f"Stage '{stage_name}': single-output stage has "
+                            + f"{len(out_path_overrides)} out_path_overrides keys "
+                            + f"({list(out_path_overrides.keys())}). "
+                            + "Only one key is allowed for single-output stages."
+                        )
+                    # Get the single override (whatever key the user used)
+                    override = _normalize_out_override(next(iter(out_path_overrides.values())))
+
+                resolved, expanded = _resolve_out_spec(
+                    stage_def.SINGLE_OUTPUT_KEY, single_out_spec, override, stage_name
+                )
+                out_specs[stage_def.SINGLE_OUTPUT_KEY] = resolved
+                outs_from_annotations.extend(expanded)
+
+            outs_list = outs_from_annotations
+            # After _apply_out_overrides, each Out has a single-string path (multi-file paths expanded)
+            outs_paths = [str(o.path) for o in outs_list]
+
+            # Validate paths BEFORE normalizing (check ".." on original paths)
+            # Use all_deps_flat to include IncrementalOut paths in security validation
+            _validate_stage_registration(
+                self._stages, stage_name, all_deps_flat, outs_paths, self.validation_mode
+            )
+
+            # Normalize dep paths - flatten, normalize, then rebuild dict
+            deps_flat_normalized = _normalize_paths(
+                deps_flat, path_policy.PathType.DEP, self.validation_mode
+            )
+            outs_paths = _normalize_paths(
+                outs_paths, path_policy.PathType.OUT, self.validation_mode
+            )
+
+            # Rebuild deps dict with normalized paths
+            deps_normalized = _normalize_deps_dict(deps_dict, self.validation_mode)
+
+            # Update normalized outputs with absolute paths
+            outs_normalized = [
+                dataclasses.replace(out, path=path)
+                for out, path in zip(outs_list, outs_paths, strict=True)
+            ]
+
+            # Output overlap validation is deferred to validate_outputs() for performance
+            # (single O(N) pass instead of O(N²) from checking on every register)
+
+            # Build stage fingerprint (includes loader fingerprints from annotations)
+            stage_fp = fingerprint.get_stage_fingerprint(func)
+            stage_fp.update(
+                _get_annotation_loader_fingerprints(dep_specs, return_out_specs, single_out_spec)
+            )
+
+            # Get params arg name for worker (avoids re-inspecting signature at execution time)
+            params_arg_name, _ = stage_def.find_params_in_signature(func)
+
+            self._stages[stage_name] = RegistryStageInfo(
+                func=func,
+                name=stage_name,
+                deps=deps_normalized,
+                deps_paths=deps_flat_normalized,
+                outs=outs_normalized,
+                outs_paths=outs_paths,
+                params=params_instance,
+                mutex=mutex_list,
+                variant=variant,
+                signature=inspect.signature(func),
+                fingerprint=stage_fp,
+                dep_specs=dep_specs,
+                out_specs=out_specs,
+                params_arg_name=params_arg_name,
+            )
 
     def get(self, name: str) -> RegistryStageInfo:
         """Get stage info by name (raises KeyError if not found)."""
@@ -344,13 +430,39 @@ class StageRegistry:
             CyclicGraphError: If graph contains cycles
             DependencyNotFoundError: If dependency doesn't exist (when validate=True)
         """
-        from pivot import dag
+        # Return cached DAG if available and validation matches
+        # Only cache when validate=True (the common case for commands)
+        if validate and self._cached_dag is not None:
+            return self._cached_dag
 
-        return dag.build_dag(self._stages, validate=validate)
+        from pivot import dag
+        from pivot.storage import track
+
+        # Discover tracked files to recognize them as valid dependency sources
+        tracked_files = None
+        if validate:
+            tracked_files = track.discover_pvt_files(project.get_project_root())
+
+        graph = dag.build_dag(self._stages, validate=validate, tracked_files=tracked_files)
+
+        # Cache only when validating (safe to reuse)
+        if validate:
+            self._cached_dag = graph
+
+        return graph
 
     def clear(self) -> None:
         """Clear all registered stages (for testing)."""
         self._stages.clear()
+        self._cached_dag = None
+
+    def invalidate_dag_cache(self) -> None:
+        """Invalidate cached DAG without clearing stages.
+
+        Call when external state changes (code reload, config change) that
+        would affect DAG construction but stage registrations haven't changed yet.
+        """
+        self._cached_dag = None
 
     def snapshot(self) -> dict[str, RegistryStageInfo]:
         """Create a snapshot of current registry state for backup/restore.
@@ -379,6 +491,7 @@ class StageRegistry:
             snapshot: Previously captured state from `snapshot()`
         """
         self._stages = dict(snapshot)
+        self._cached_dag = None
 
     def get_all_output_paths(self) -> set[str]:
         """Get all registered output paths (for watch mode filtering)."""
@@ -388,20 +501,34 @@ class StageRegistry:
                 result.add(str(out_path))
         return result
 
+    def validate_outputs(self) -> None:
+        """Validate no output path conflicts between stages.
+
+        This is called once after all stages are registered, instead of
+        checking on every register() call. Raises OutputDuplicationError
+        or OverlappingOutputPathsError if conflicts are found.
+        """
+        if not self._stages:
+            return
+        temp_stages: dict[str, trie.TrieStageInfo] = {
+            name: {"name": name, "outs": info["outs_paths"]} for name, info in self._stages.items()
+        }
+        trie.build_outs_trie(temp_stages)
+
 
 def _normalize_paths(
     paths: Sequence[str],
     path_type: path_policy.PathType,
     validation_mode: ValidationMode,
-    cwd: pathlib.Path | None = None,
 ) -> list[str]:
     """Normalize paths to absolute paths, applying policy-based validation.
+
+    All paths are relative to project root.
 
     Args:
         paths: Paths to normalize
         path_type: Type of path (DEP or OUT) for policy lookup
         validation_mode: How to handle validation errors
-        cwd: Base directory for relative paths (default: project root)
 
     Raises:
         InvalidPathError: If path violates its type's policy
@@ -412,11 +539,9 @@ def _normalize_paths(
 
     for path in paths:
         try:
-            # Normalize path to absolute (from cwd or project root)
+            # Normalize path to absolute (from project root)
             if pathlib.Path(path).is_absolute():
                 norm_path = pathlib.Path(path)
-            elif cwd is not None:
-                norm_path = project.normalize_path(cwd / path)
             else:
                 norm_path = project.normalize_path(path)
 
@@ -503,6 +628,93 @@ def _handle_validation_error(msg: str, validation_mode: ValidationMode) -> None:
     if validation_mode == ValidationMode.ERROR:
         raise exceptions.ValidationError(msg)
     logger.warning(msg)
+
+
+def _validate_incremental_spec_match(
+    stage_name: str,
+    input_name: str | None,
+    input_spec: stage_def.FuncDepSpec,
+    output_spec: outputs.Out[Any],
+) -> None:
+    """Validate IncrementalOut input/output specs match (path and loader)."""
+    name_part = f"'{input_name}' " if input_name else ""
+
+    if input_spec.path != output_spec.path:
+        raise exceptions.ValidationError(
+            f"Stage '{stage_name}': IncrementalOut input {name_part}path "
+            + f"'{input_spec.path}' doesn't match output path '{output_spec.path}'"
+        )
+    if input_spec.loader != output_spec.loader:
+        raise exceptions.ValidationError(
+            f"Stage '{stage_name}': IncrementalOut input {name_part}loader "
+            + f"{input_spec.loader!r} doesn't match output loader {output_spec.loader!r}"
+        )
+
+
+def _validate_incremental_out_matching(
+    stage_name: str,
+    dep_specs: dict[str, stage_def.FuncDepSpec],
+    return_out_specs: dict[str, outputs.Out[Any]],
+    single_out_spec: outputs.Out[Any] | None,
+) -> None:
+    """Validate IncrementalOut inputs have matching outputs.
+
+    Matching rules:
+    - For TypedDict returns: IncrementalOut output field name must match parameter name
+    - For single output (non-TypedDict): Can only have ONE IncrementalOut input parameter
+    - Paths and loaders must match between input and output
+    """
+    # Find IncrementalOut inputs (deps with creates_dep_edge=False are IncrementalOut)
+    incremental_inputs = {
+        name: spec for name, spec in dep_specs.items() if not spec.creates_dep_edge
+    }
+
+    if not incremental_inputs:
+        return  # No IncrementalOut inputs, nothing to validate
+
+    # Case 1: TypedDict return
+    if return_out_specs:
+        incremental_outputs = {
+            name: spec
+            for name, spec in return_out_specs.items()
+            if isinstance(spec, outputs.IncrementalOut)
+        }
+
+        for input_name, input_spec in incremental_inputs.items():
+            if input_name not in incremental_outputs:
+                raise exceptions.ValidationError(
+                    f"Stage '{stage_name}': IncrementalOut input parameter '{input_name}' "
+                    + "has no matching IncrementalOut output field. "
+                    + "For TypedDict returns, the output field name must match the parameter name."
+                )
+            _validate_incremental_spec_match(
+                stage_name, input_name, input_spec, incremental_outputs[input_name]
+            )
+
+    # Case 2: Single output (non-TypedDict)
+    elif single_out_spec is not None:
+        if not isinstance(single_out_spec, outputs.IncrementalOut):
+            raise exceptions.ValidationError(
+                f"Stage '{stage_name}': has IncrementalOut input but return type "
+                + "is not IncrementalOut"
+            )
+
+        if len(incremental_inputs) > 1:
+            raise exceptions.ValidationError(
+                f"Stage '{stage_name}': single-output stages can only have one "
+                + f"IncrementalOut input parameter, found {len(incremental_inputs)}: "
+                + f"{list(incremental_inputs.keys())}"
+            )
+
+        input_spec = next(iter(incremental_inputs.values()))
+        _validate_incremental_spec_match(stage_name, None, input_spec, single_out_spec)
+
+    # Case 3: No matching output
+    else:
+        raise exceptions.ValidationError(
+            f"Stage '{stage_name}': has IncrementalOut inputs but no IncrementalOut output. "
+            + "Every IncrementalOut input must have a corresponding IncrementalOut output."
+        )
 
 
 def _resolve_params(
@@ -617,20 +829,17 @@ def _flatten_deps(deps: dict[str, outputs.PathType]) -> list[str]:
 
 def _normalize_deps_dict(
     deps: dict[str, outputs.PathType],
-    cwd: pathlib.Path | None,
     validation_mode: ValidationMode,
 ) -> dict[str, outputs.PathType]:
     """Normalize all paths in deps dict to absolute paths."""
     result = dict[str, outputs.PathType]()
     for name, value in deps.items():
         if isinstance(value, (list, tuple)):
-            normalized = _normalize_paths(
-                list(value), path_policy.PathType.DEP, validation_mode, cwd
-            )
+            normalized = _normalize_paths(list(value), path_policy.PathType.DEP, validation_mode)
             # Preserve tuple type for fixed-length deps
             result[name] = tuple(normalized) if isinstance(value, tuple) else normalized
         else:
-            normalized = _normalize_paths([value], path_policy.PathType.DEP, validation_mode, cwd)
+            normalized = _normalize_paths([value], path_policy.PathType.DEP, validation_mode)
             result[name] = normalized[0]
     return result
 

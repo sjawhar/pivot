@@ -41,16 +41,16 @@ def _register_plot_stage(
         name=name,
         deps={},
         deps_paths=[],
-        outs=[outputs.Plot(path=plot_path, x=x, y=y, template=template)],
+        outs=[outputs.Plot(path=plot_path, loader=loaders.PathOnly(), x=x, y=y, template=template)],
         outs_paths=[plot_path],
         params=None,
         mutex=[],
         variant=None,
         signature=inspect.signature(_stage_func),
         fingerprint={"_code": "fake_hash"},
-        cwd=None,
         dep_specs={},
-        out_path_overrides=None,
+        out_specs={},
+        params_arg_name=None,
     )
 
 
@@ -73,7 +73,7 @@ def _register_mixed_output_stage(
         outs=[
             outputs.Out(path=out_path, loader=loaders.PathOnly()),
             outputs.Metric(path=metric_path),
-            outputs.Plot(path=plot_path),
+            outputs.Plot(path=plot_path, loader=loaders.PathOnly()),
         ],
         outs_paths=[out_path, metric_path, plot_path],
         params=None,
@@ -81,9 +81,9 @@ def _register_mixed_output_stage(
         variant=None,
         signature=inspect.signature(_stage_func),
         fingerprint={"_code": "fake_hash"},
-        cwd=None,
         dep_specs={},
-        out_path_overrides=None,
+        out_specs={},
+        params_arg_name=None,
     )
 
 
@@ -163,8 +163,8 @@ def test_get_plot_hashes_from_lock_with_hash(set_project_root: Path) -> None:
     _register_plot_stage("test_stage", str(plot_file))
 
     # Create lock file with hash
-    cache_dir = set_project_root / ".pivot" / "cache"
-    stages_dir = lock.get_stages_dir(cache_dir)
+    state_dir = set_project_root / ".pivot"
+    stages_dir = lock.get_stages_dir(state_dir)
     stages_dir.mkdir(parents=True, exist_ok=True)
     stage_lock = lock.StageLock("test_stage", stages_dir)
     stage_lock.write(
@@ -191,8 +191,8 @@ def test_get_plot_hashes_from_lock_with_none_hash(set_project_root: Path) -> Non
     _register_plot_stage("test_stage", str(plot_file))
 
     # Create lock file with None hash (uncached output)
-    cache_dir = set_project_root / ".pivot" / "cache"
-    stages_dir = lock.get_stages_dir(cache_dir)
+    state_dir = set_project_root / ".pivot"
+    stages_dir = lock.get_stages_dir(state_dir)
     stages_dir.mkdir(parents=True, exist_ok=True)
     stage_lock = lock.StageLock("test_stage", stages_dir)
     stage_lock.write(
@@ -259,8 +259,8 @@ def test_get_plot_hashes_from_head_returns_committed_hash(
     _register_plot_stage("test_stage", str(plot_file))
 
     # Create and commit lock file with hash
-    cache_dir = set_project_root / ".pivot" / "cache"
-    stages_dir = lock.get_stages_dir(cache_dir)
+    state_dir = set_project_root / ".pivot"
+    stages_dir = lock.get_stages_dir(state_dir)
     stages_dir.mkdir(parents=True, exist_ok=True)
     stage_lock = lock.StageLock("test_stage", stages_dir)
     stage_lock.write(
@@ -298,8 +298,8 @@ def test_get_plot_hashes_from_head_ignores_uncommitted_changes(
     _register_plot_stage("test_stage", str(plot_file))
 
     # Create and commit lock file with original hash
-    cache_dir = set_project_root / ".pivot" / "cache"
-    stages_dir = lock.get_stages_dir(cache_dir)
+    state_dir = set_project_root / ".pivot"
+    stages_dir = lock.get_stages_dir(state_dir)
     stages_dir.mkdir(parents=True, exist_ok=True)
     stage_lock = lock.StageLock("test_stage", stages_dir)
     stage_lock.write(

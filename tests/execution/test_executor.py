@@ -1,5 +1,6 @@
 import atexit
 import logging
+import multiprocessing as mp
 import os
 import pathlib
 import sys
@@ -7,6 +8,7 @@ import threading
 import time
 from typing import TYPE_CHECKING, Annotated, TypedDict
 
+import loky
 import pytest
 import yaml
 
@@ -319,25 +321,29 @@ def _print_stage(
 def _mutex_a(
     input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
 ) -> _ATxt:
-    with open("timing.txt", "a") as f:
+    timing_file = input_file.parent / "timing.txt"
+    with open(timing_file, "a") as f:
         f.write("a_start\n")
     time.sleep(0.02)
-    with open("timing.txt", "a") as f:
+    with open(timing_file, "a") as f:
         f.write("a_end\n")
-    pathlib.Path("a.txt").write_text("a")
-    return {"a": pathlib.Path("a.txt")}
+    out_file = input_file.parent / "a.txt"
+    out_file.write_text("a")
+    return {"a": out_file}
 
 
 def _mutex_b(
     input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
 ) -> _BTxt:
-    with open("timing.txt", "a") as f:
+    timing_file = input_file.parent / "timing.txt"
+    with open(timing_file, "a") as f:
         f.write("b_start\n")
     time.sleep(0.02)
-    with open("timing.txt", "a") as f:
+    with open(timing_file, "a") as f:
         f.write("b_end\n")
-    pathlib.Path("b.txt").write_text("b")
-    return {"b": pathlib.Path("b.txt")}
+    out_file = input_file.parent / "b.txt"
+    out_file.write_text("b")
+    return {"b": out_file}
 
 
 def _first_basic(
@@ -370,25 +376,29 @@ def _succeeding_mutex(
 def _multi_resource(
     input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
 ) -> _MultiTxt:
-    with open("timing.txt", "a") as f:
+    timing_file = input_file.parent / "timing.txt"
+    with open(timing_file, "a") as f:
         f.write("multi_start\n")
     time.sleep(0.02)
-    with open("timing.txt", "a") as f:
+    with open(timing_file, "a") as f:
         f.write("multi_end\n")
-    pathlib.Path("multi.txt").write_text("multi")
-    return {"multi": pathlib.Path("multi.txt")}
+    out_file = input_file.parent / "multi.txt"
+    out_file.write_text("multi")
+    return {"multi": out_file}
 
 
 def _gpu_only(
     input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
 ) -> _GpuOnlyTxt:
-    with open("timing.txt", "a") as f:
+    timing_file = input_file.parent / "timing.txt"
+    with open(timing_file, "a") as f:
         f.write("gpu_start\n")
     time.sleep(0.02)
-    with open("timing.txt", "a") as f:
+    with open(timing_file, "a") as f:
         f.write("gpu_end\n")
-    pathlib.Path("gpu_only.txt").write_text("gpu")
-    return {"gpu_only": pathlib.Path("gpu_only.txt")}
+    out_file = input_file.parent / "gpu_only.txt"
+    out_file.write_text("gpu")
+    return {"gpu_only": out_file}
 
 
 def _first_dep_mutex(
@@ -734,6 +744,16 @@ def _dir_output_process(
     return {"output_dir": out_dir}
 
 
+def _dir_output_process_v2(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _OutputDir:
+    out_dir = pathlib.Path("output_dir")
+    out_dir.mkdir(exist_ok=True)
+    (out_dir / "file1.txt").write_text("file1_v2")
+    (out_dir / "file2.txt").write_text("file2_v2")
+    return {"output_dir": out_dir}
+
+
 def _lock_missing_outs(
     input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
 ) -> _OutputTxt:
@@ -977,6 +997,78 @@ def test_code_change_triggers_rerun(pipeline_dir: pathlib.Path) -> None:
     assert (pipeline_dir / "output.txt").read_text() == "hello"
 
 
+def test_code_change_rerun_with_hardlinked_readonly_output(pipeline_dir: pathlib.Path) -> None:
+    """Re-running stage after code change works even when output is hardlinked to read-only cache.
+
+    Reproduces bug where hardlinked outputs (the default checkout mode) become read-only
+    (0o444) because they share the inode with the cache file. When the stage needs to re-run
+    due to code changes, the framework must either delete the old output or make it writable
+    before the stage can write new output.
+    """
+    (pipeline_dir / "input.txt").write_text("hello")
+
+    register_test_stage(_output_upper, name="process")
+
+    # First run - creates output
+    results = executor.run()
+    assert results["process"]["status"] == "ran"
+
+    output_file = pipeline_dir / "output.txt"
+    assert output_file.exists()
+    assert output_file.read_text() == "HELLO"
+
+    # Verify output is hardlinked to read-only cache (the default behavior)
+    stat_info = output_file.stat()
+    assert stat_info.st_nlink > 1, "Output should be hardlinked to cache"
+    assert stat_info.st_mode & 0o777 == 0o444, "Output should be read-only (hardlink to cache)"
+
+    # Re-register with different implementation (simulates code change)
+    REGISTRY.clear()
+    register_test_stage(_output_lower, name="process")
+
+    # Second run - should re-run due to fingerprint change
+    # BUG: This may fail with PermissionError if framework doesn't handle read-only outputs
+    results = executor.run()
+    assert results["process"]["status"] == "ran", f"Stage should re-run, got: {results['process']}"
+    assert output_file.read_text() == "hello"
+
+
+def test_code_change_rerun_with_hardlinked_directory_output(pipeline_dir: pathlib.Path) -> None:
+    """Re-running stage with directory output works even when files are hardlinked read-only.
+
+    Tests the scenario where a stage produces a directory output with multiple files.
+    After caching, individual files are hardlinked to the read-only cache.
+    When code changes trigger a re-run, the directory must be removed (including
+    all read-only hardlinked files) before the stage can write new output.
+    """
+    (pipeline_dir / "input.txt").write_text("data")
+
+    register_test_stage(_dir_output_process, name="process")
+
+    # First run - creates directory output
+    results = executor.run()
+    assert results["process"]["status"] == "ran"
+
+    output_dir = pipeline_dir / "output_dir"
+    assert output_dir.exists()
+    assert (output_dir / "file1.txt").read_text() == "file1"
+
+    # Verify files are hardlinked to read-only cache
+    file1 = output_dir / "file1.txt"
+    stat_info = file1.stat()
+    assert stat_info.st_nlink > 1, "File should be hardlinked to cache"
+    assert stat_info.st_mode & 0o777 == 0o444, "File should be read-only"
+
+    # Re-register with different implementation (simulates code change)
+    REGISTRY.clear()
+    register_test_stage(_dir_output_process_v2, name="process")
+
+    # Second run - should re-run due to fingerprint change
+    results = executor.run()
+    assert results["process"]["status"] == "ran", f"Stage should re-run, got: {results['process']}"
+    assert (output_dir / "file1.txt").read_text() == "file1_v2"
+
+
 def test_input_change_triggers_rerun(pipeline_dir: pathlib.Path) -> None:
     """Changing input file triggers re-execution."""
     (pipeline_dir / "input.txt").write_text("hello")
@@ -1102,7 +1194,7 @@ def test_stale_lock_from_dead_process_is_broken(pipeline_dir: pathlib.Path) -> N
 
     # Create a stale lock with a non-existent PID
     stale_lock = cache_dir / "process.running"
-    stale_lock.write_text("pid: 999999999\n")  # PID that doesn't exist
+    stale_lock.write_text("999999999")  # PID that doesn't exist
 
     register_test_stage(_process_basic, name="process")
 
@@ -1121,7 +1213,7 @@ def test_concurrent_execution_returns_failed_status(pipeline_dir: pathlib.Path) 
 
     # Create a lock with our own PID (simulating concurrent run)
     active_lock = cache_dir / "process.running"
-    active_lock.write_text(f"pid: {os.getpid()}\n")
+    active_lock.write_text(str(os.getpid()))
 
     register_test_stage(_process_basic, name="process")
 
@@ -1163,7 +1255,7 @@ def test_negative_pid_in_lock_is_treated_as_stale(pipeline_dir: pathlib.Path) ->
 
     # Create a lock with invalid PID
     invalid_lock = cache_dir / "process.running"
-    invalid_lock.write_text("pid: -1\n")
+    invalid_lock.write_text("-1")
 
     register_test_stage(_process_basic, name="process")
 
@@ -1210,6 +1302,43 @@ def test_output_thread_cleanup_completes(pipeline_dir: pathlib.Path) -> None:
         f"Thread leak: started with {initial_thread_count}, ended with {final_thread_count}"
     )
     assert results["process"]["status"] == "ran"
+
+
+def _loky_worker_with_queue(queue: "mp.Queue[str]", message: str) -> str:
+    """Worker function that writes to a queue and returns a value."""
+    queue.put(message)
+    return f"processed: {message}"
+
+
+def test_spawn_context_manager_works_with_loky() -> None:
+    """Spawn-context Manager queue works correctly with loky workers.
+
+    This test verifies that switching mp.Manager() to use spawn context
+    doesn't break communication between loky workers and the orchestrator.
+    This is a prerequisite for fixing the Python 3.13 fork deprecation warning.
+    """
+    # Create Manager with spawn context (the change we want to make in production)
+    spawn_ctx = mp.get_context("spawn")
+    manager = spawn_ctx.Manager()
+    queue: mp.Queue[str] = manager.Queue()  # pyright: ignore[reportAssignmentType]
+
+    try:
+        # Use loky executor (same as production code)
+        lk_executor = loky.get_reusable_executor(max_workers=2)
+
+        # Submit work that writes to the queue
+        future = lk_executor.submit(_loky_worker_with_queue, queue, "test_message")
+
+        # Verify worker can return a value (basic loky functionality)
+        result = future.result(timeout=10)
+        assert result == "processed: test_message"
+
+        # Verify orchestrator can read from queue (the critical test)
+        message = queue.get(timeout=5)
+        assert message == "test_message"
+
+    finally:
+        manager.shutdown()
 
 
 def test_mutex_prevents_concurrent_execution(pipeline_dir: pathlib.Path) -> None:
@@ -1557,7 +1686,7 @@ def test_lock_retry_exhaustion_returns_failed(pipeline_dir: pathlib.Path) -> Non
 
     # Create a lock with our own PID (simulates live concurrent run)
     lock_file = cache_dir / "process.running"
-    lock_file.write_text(f"pid: {os.getpid()}\n")
+    lock_file.write_text(str(os.getpid()))
 
     register_test_stage(_process_basic, name="process")
 

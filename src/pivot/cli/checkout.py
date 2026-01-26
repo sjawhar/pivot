@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import enum
+import logging
 import pathlib
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import click
 
@@ -12,16 +14,28 @@ from pivot.cli import helpers as cli_helpers
 from pivot.storage import cache, lock, track
 from pivot.types import OutputHash
 
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+
+logger = logging.getLogger(__name__)
+
 RestoreResult = Literal["restored", "skipped"]
 
 
-def _get_stage_output_info(project_root: pathlib.Path) -> dict[str, OutputHash]:
+class CheckoutBehavior(enum.StrEnum):
+    """How to handle existing files during checkout."""
+
+    ERROR = "error"  # Error if file already exists (default)
+    SKIP_EXISTING = "skip_existing"  # Skip files that already exist (--only-missing)
+    FORCE = "force"  # Overwrite existing files (--force)
+
+
+def _get_stage_output_info(state_dir: pathlib.Path) -> dict[str, OutputHash]:
     """Get output hash info from lock files for all stages."""
     outputs = dict[str, OutputHash]()
-    cache_dir = project_root / ".pivot" / "cache"
 
     for stage_name in registry.REGISTRY.list_stages():
-        stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(cache_dir))
+        stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(state_dir))
         lock_data = stage_lock.read()
         if lock_data and "output_hashes" in lock_data:
             for out_path, out_hash in lock_data["output_hashes"].items():
@@ -33,31 +47,31 @@ def _get_stage_output_info(project_root: pathlib.Path) -> dict[str, OutputHash]:
     return outputs
 
 
-def _pvt_to_output_hash(pvt_data: track.PvtData) -> OutputHash:
-    """Convert PvtData to OutputHash format."""
-    manifest = pvt_data.get("manifest")
-    if manifest is not None:
-        return {"hash": pvt_data["hash"], "manifest": manifest}
-    return {"hash": pvt_data["hash"]}
-
-
 def _restore_path(
     path: pathlib.Path,
     output_hash: OutputHash,
     cache_dir: pathlib.Path,
     checkout_modes: list[cache.CheckoutMode],
-    force: bool,
+    behavior: CheckoutBehavior,
 ) -> tuple[RestoreResult, str]:
     """Restore a file or directory from cache.
 
     Returns:
         Tuple of (result, path_name) for the caller to handle output.
     """
-    if path.exists() and not force:
-        return ("skipped", path.name)
-
-    if force and path.exists():
-        cache.remove_output(path)
+    if path.exists():
+        match behavior:
+            case CheckoutBehavior.ERROR:
+                raise click.ClickException(
+                    f"'{path.name}' already exists. "
+                    + "Use --force to overwrite or --only-missing to skip existing files."
+                )
+            case CheckoutBehavior.SKIP_EXISTING:
+                return ("skipped", path.name)
+            case CheckoutBehavior.FORCE:
+                cache.remove_output(path)
+            case _:  # pyright: ignore[reportUnnecessaryComparison] - defensive for future enum values
+                raise ValueError(f"Unhandled checkout behavior: {behavior}")  # pyright: ignore[reportUnreachable]
 
     success = cache.restore_from_cache(path, output_hash, cache_dir, checkout_modes=checkout_modes)
     if not success:
@@ -77,35 +91,20 @@ def _print_restore_result(result: RestoreResult, name: str) -> None:
         click.echo(f"Skipped: {name} (already exists)")
 
 
-def _checkout_all_tracked(
-    tracked_files: dict[str, track.PvtData],
+def _checkout_files(
+    files: Mapping[str, OutputHash],
     cache_dir: pathlib.Path,
     checkout_modes: list[cache.CheckoutMode],
-    force: bool,
+    behavior: CheckoutBehavior,
     quiet: bool,
 ) -> None:
-    """Restore all tracked files from cache."""
-    for abs_path_str, pvt_data in tracked_files.items():
-        path = pathlib.Path(abs_path_str)
-        output_hash = _pvt_to_output_hash(pvt_data)
-        result, name = _restore_path(path, output_hash, cache_dir, checkout_modes, force)
-        if not quiet:
-            _print_restore_result(result, name)
-
-
-def _checkout_all_outputs(
-    stage_outputs: dict[str, OutputHash],
-    cache_dir: pathlib.Path,
-    checkout_modes: list[cache.CheckoutMode],
-    force: bool,
-    quiet: bool,
-) -> None:
-    """Restore all stage outputs from cache."""
-    for abs_path_str, output_hash in stage_outputs.items():
+    """Restore files from cache."""
+    for abs_path_str, output_hash in files.items():
         if output_hash is None:
+            logger.debug(f"Skipping output with no cached hash: {abs_path_str}")
             continue
         path = pathlib.Path(abs_path_str)
-        result, name = _restore_path(path, output_hash, cache_dir, checkout_modes, force)
+        result, name = _restore_path(path, output_hash, cache_dir, checkout_modes, behavior)
         if not quiet:
             _print_restore_result(result, name)
 
@@ -116,7 +115,7 @@ def _checkout_target(
     stage_outputs: dict[str, OutputHash],
     cache_dir: pathlib.Path,
     checkout_modes: list[cache.CheckoutMode],
-    force: bool,
+    behavior: CheckoutBehavior,
     quiet: bool,
 ) -> None:
     """Restore a specific target (tracked file or stage output) from cache."""
@@ -131,8 +130,8 @@ def _checkout_target(
     # Check if it's a tracked file
     if abs_path_str in tracked_files:
         pvt_data = tracked_files[abs_path_str]
-        output_hash = _pvt_to_output_hash(pvt_data)
-        result, name = _restore_path(abs_path, output_hash, cache_dir, checkout_modes, force)
+        output_hash = track.pvt_to_hash_info(pvt_data)
+        result, name = _restore_path(abs_path, output_hash, cache_dir, checkout_modes, behavior)
         if not quiet:
             _print_restore_result(result, name)
         return
@@ -145,7 +144,7 @@ def _checkout_target(
                 f"'{target}' has no cached version. "
                 + "Run the stage first, or use 'pivot pull' to fetch from remote."
             )
-        result, name = _restore_path(abs_path, output_hash, cache_dir, checkout_modes, force)
+        result, name = _restore_path(abs_path, output_hash, cache_dir, checkout_modes, behavior)
         if not quiet:
             _print_restore_result(result, name)
         return
@@ -166,35 +165,68 @@ def _checkout_target(
     help="Checkout mode for restoration (default: project config or hardlink)",
 )
 @click.option("--force", "-f", is_flag=True, help="Overwrite existing files")
+@click.option(
+    "--only-missing",
+    is_flag=True,
+    help="Only restore files that don't exist on disk (safe for local modifications)",
+)
 @click.pass_context
 def checkout(
-    ctx: click.Context, targets: tuple[str, ...], checkout_mode: str | None, force: bool
+    ctx: click.Context,
+    targets: tuple[str, ...],
+    checkout_mode: str | None,
+    force: bool,
+    only_missing: bool,
 ) -> None:
     """Restore tracked files and stage outputs from cache.
 
     If no targets specified, restores all tracked files and stage outputs.
+    Use --only-missing to skip files that already exist (safe for local modifications).
     """
+    if force and only_missing:
+        raise click.ClickException("--force and --only-missing are mutually exclusive")
+
+    # Convert CLI flags to behavior enum
+    if force:
+        behavior = CheckoutBehavior.FORCE
+    elif only_missing:
+        behavior = CheckoutBehavior.SKIP_EXISTING
+    else:
+        behavior = CheckoutBehavior.ERROR
+
     cli_ctx = cli_helpers.get_cli_context(ctx)
     quiet = cli_ctx["quiet"]
 
     project_root = project.get_project_root()
-    cache_dir = project_root / ".pivot" / "cache" / "files"
+    cache_dir = config.get_cache_dir() / "files"
+    state_dir = config.get_state_dir()
 
     # Determine checkout modes - CLI flag overrides config (single mode, no fallback)
-    mode_strings = [checkout_mode] if checkout_mode else config.get_checkout_mode_order()
-    checkout_modes = [cache.CheckoutMode(m) for m in mode_strings]
+    checkout_modes = (
+        [cache.CheckoutMode(checkout_mode)] if checkout_mode else config.get_checkout_mode_order()
+    )
 
     # Discover tracked files
     tracked_files = track.discover_pvt_files(project_root)
 
     # Get stage output info from lock files
-    stage_outputs = _get_stage_output_info(project_root)
+    stage_outputs = _get_stage_output_info(state_dir)
 
     if not targets:
-        _checkout_all_tracked(tracked_files, cache_dir, checkout_modes, force, quiet)
-        _checkout_all_outputs(stage_outputs, cache_dir, checkout_modes, force, quiet)
+        # Convert tracked files to OutputHash format
+        tracked_as_hashes = {
+            path: track.pvt_to_hash_info(pvt) for path, pvt in tracked_files.items()
+        }
+        _checkout_files(tracked_as_hashes, cache_dir, checkout_modes, behavior, quiet)
+        _checkout_files(stage_outputs, cache_dir, checkout_modes, behavior, quiet)
     else:
         for target in targets:
             _checkout_target(
-                target, tracked_files, stage_outputs, cache_dir, checkout_modes, force, quiet
+                target,
+                tracked_files,
+                stage_outputs,
+                cache_dir,
+                checkout_modes,
+                behavior,
+                quiet,
             )

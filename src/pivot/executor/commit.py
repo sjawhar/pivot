@@ -2,15 +2,16 @@ from __future__ import annotations
 
 import pathlib
 
-from pivot import project, run_history
+from pivot import config, project, run_history
 from pivot.executor import worker
-from pivot.storage import lock, state
+from pivot.storage import lock
+from pivot.storage import state as state_mod
 
 # Sentinel run_id for committed entries - never pruned by prune_run_cache
 COMMITTED_RUN_ID = "__committed__"
 
 
-def commit_pending(cache_dir: pathlib.Path | None = None) -> list[str]:
+def commit_pending() -> list[str]:
     """Promote pending locks to production and update StateDB.
 
     IMPORTANT: Caller must hold pending_state_lock to prevent races with other
@@ -19,17 +20,15 @@ def commit_pending(cache_dir: pathlib.Path | None = None) -> list[str]:
     Returns list of stage names that were committed.
     """
     project_root = project.get_project_root()
-    if cache_dir is None:
-        cache_dir = project_root / ".pivot" / "cache"
-
     pending_stages = lock.list_pending_stages(project_root)
     if not pending_stages:
         return []
 
-    state_db_path = project_root / ".pivot" / "state.db"
+    state_dir = config.get_state_dir()
+    state_db_path = state_dir / "state.db"
     committed = list[str]()
 
-    with state.StateDB(state_db_path) as state_db:
+    with state_mod.StateDB(state_db_path) as state_db:
         for stage_name in pending_stages:
             pending_lock = lock.get_pending_lock(stage_name, project_root)
             pending_data = pending_lock.read()
@@ -38,7 +37,7 @@ def commit_pending(cache_dir: pathlib.Path | None = None) -> list[str]:
                 continue
 
             # Write to production lock (without dep_generations - that's internal to pending)
-            production_lock = lock.StageLock(stage_name, lock.get_stages_dir(cache_dir))
+            production_lock = lock.StageLock(stage_name, lock.get_stages_dir(state_dir))
             production_lock.write(pending_data)
 
             # Record dependency generations from execution time (not commit time!)
@@ -51,8 +50,7 @@ def commit_pending(cache_dir: pathlib.Path | None = None) -> list[str]:
                 state_db.increment_generation(pathlib.Path(out_path))
 
             # Write run cache entry with sentinel run_id (never pruned)
-            out_paths = list(pending_data["output_hashes"].keys())
-            input_hash = run_history.compute_input_hash_from_lock(pending_data, out_paths)
+            input_hash = run_history.compute_input_hash_from_lock(pending_data)
             worker.write_run_cache_entry(
                 stage_name, input_hash, pending_data["output_hashes"], COMMITTED_RUN_ID, state_db
             )

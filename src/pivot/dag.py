@@ -1,23 +1,30 @@
 from __future__ import annotations
 
 import pathlib
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 import networkx as nx
 import pygtrie
 
-from pivot import exceptions
+from pivot import exceptions, metrics
 
 if TYPE_CHECKING:
     from pivot.registry import RegistryStageInfo
+    from pivot.storage.track import PvtData
 
 
-def build_dag(stages: dict[str, RegistryStageInfo], validate: bool = True) -> nx.DiGraph[str]:
+def build_dag(
+    stages: dict[str, RegistryStageInfo],
+    validate: bool = True,
+    tracked_files: dict[str, PvtData] | None = None,
+) -> nx.DiGraph[str]:
     """Build DAG from registered stages.
 
     Args:
         stages: Dict of stage_name -> stage_info (from registry._stages)
         validate: If True, validate that all dependencies exist
+        tracked_files: Dict of tracked file paths -> PvtData (from .pvt files).
+            If provided, tracked files are recognized as valid dependency sources.
 
     Returns:
         DiGraph with edges from consumer to producer
@@ -35,35 +42,45 @@ def build_dag(stages: dict[str, RegistryStageInfo], validate: bool = True) -> nx
         >>> list(nx.dfs_postorder_nodes(graph))
         ['preprocess', 'train']
     """
-    graph: nx.DiGraph[str] = nx.DiGraph()
+    with metrics.timed("dag.build_dag"):
+        graph: nx.DiGraph[str] = nx.DiGraph()
 
-    for stage_name, stage_info in stages.items():
-        graph.add_node(stage_name, **stage_info)
+        for stage_name, stage_info in stages.items():
+            graph.add_node(stage_name, **stage_info)
 
-    outputs_map = _build_outputs_map(stages)
-    outputs_trie = _build_outputs_trie(stages)
+        outputs_map = _build_outputs_map(stages)
+        outputs_trie = _build_outputs_trie(stages)
+        tracked_trie = _build_tracked_trie(tracked_files) if tracked_files else None
 
-    for stage_name, stage_info in stages.items():
-        for dep in stage_info["deps_paths"]:
-            producer = outputs_map.get(dep)
-            if producer:
-                graph.add_edge(stage_name, producer)
-            else:
-                # Check for directory dependency on file outputs (or vice versa)
-                producers = _find_producers_for_path(dep, outputs_trie)
-                for prod in producers:
-                    graph.add_edge(stage_name, prod)
+        for stage_name, stage_info in stages.items():
+            for dep in stage_info["deps_paths"]:
+                producer = outputs_map.get(dep)
+                if producer:
+                    graph.add_edge(stage_name, producer)
+                else:
+                    # Check for directory dependency on file outputs (or vice versa)
+                    producers = _find_producers_for_path(dep, outputs_trie)
+                    for prod in producers:
+                        graph.add_edge(stage_name, prod)
 
-                if not producers and validate and not pathlib.Path(dep).exists():
-                    raise exceptions.DependencyNotFoundError(
-                        stage=stage_name,
-                        dep=dep,
-                        available_outputs=list(outputs_map.keys()),
-                    )
+                    if not producers and validate:
+                        # Check if dependency exists on disk
+                        if pathlib.Path(dep).exists():
+                            continue
 
-    _check_acyclic(graph)
+                        # Check if dependency is a tracked file (valid source)
+                        if tracked_trie and _is_tracked_path(dep, tracked_trie):
+                            continue
 
-    return graph
+                        raise exceptions.DependencyNotFoundError(
+                            stage=stage_name,
+                            dep=dep,
+                            available_outputs=list(outputs_map.keys()),
+                        )
+
+        _check_acyclic(graph)
+
+        return graph
 
 
 def _build_outputs_map(stages: dict[str, RegistryStageInfo]) -> dict[str, str]:
@@ -118,14 +135,39 @@ def _find_producers_for_path(
     return producers
 
 
+def _build_tracked_trie(tracked_files: dict[str, PvtData]) -> pygtrie.Trie[str]:
+    """Build trie of tracked file paths for dependency checking.
+
+    Keys are path tuples (from Path.parts), values are the absolute path string.
+    """
+    trie: pygtrie.Trie[str] = pygtrie.Trie()
+    for abs_path in tracked_files:
+        path_key = pathlib.Path(abs_path).parts
+        trie[path_key] = abs_path
+    return trie
+
+
+def _is_tracked_path(dep: str, tracked_trie: pygtrie.Trie[str]) -> bool:
+    """Check if dependency is a tracked file (exact match or inside tracked directory)."""
+    dep_key = pathlib.Path(dep).parts
+
+    # Exact match
+    if dep_key in tracked_trie:
+        return True
+
+    # Dependency is inside a tracked directory
+    prefix_item = tracked_trie.shortest_prefix(dep_key)
+    if prefix_item is not None and prefix_item.value is not None:
+        return True
+
+    # Dependency is a directory containing tracked files
+    return tracked_trie.has_subtrie(dep_key)
+
+
 def _check_acyclic(graph: nx.DiGraph[str]) -> None:
     """Check graph for cycles, raise if found."""
     try:
-        # networkx stubs don't fully type find_cycle's return value
-        cycle = cast(
-            "list[tuple[str, str, str]]",
-            nx.find_cycle(graph, orientation="original"),  # pyright: ignore[reportUnknownMemberType]
-        )
+        cycle = nx.find_cycle(graph, orientation="original")
     except nx.NetworkXNoCycle:
         return
 
@@ -177,18 +219,7 @@ def _get_subgraph(graph: nx.DiGraph[str], source_stages: list[str]) -> nx.DiGrap
     nodes = set[str]()
     for stage in source_stages:
         nodes.update(nx.dfs_postorder_nodes(graph, stage))
-    # subgraph() returns a SubGraph view that behaves like DiGraph at runtime
-    return cast("nx.DiGraph[str]", graph.subgraph(nodes))
-
-
-def get_parallel_groups(  # pragma: no cover
-    graph: nx.DiGraph[str], stages: list[str] | None = None
-) -> list[list[str]]:
-    """Get stages grouped by parallel execution levels (unused with greedy execution)."""
-    subgraph = _get_subgraph(graph, stages) if stages else graph
-    reversed_graph = subgraph.reverse(copy=False)
-    generations = list(nx.topological_generations(reversed_graph))
-    return [list(gen) for gen in generations]
+    return graph.subgraph(nodes)
 
 
 def get_downstream_stages(graph: nx.DiGraph[str], stage: str) -> list[str]:

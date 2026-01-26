@@ -265,3 +265,4 @@ These are recurring patterns that lead to corrections:
 12. **LMDB for all state:** Extend StateDB with prefixes, don't add new databases
 13. **ruamel.yaml for editable config** (preserves comments), **PyYAML for read-only**
 14. **Stage functions and TypedDicts must be module-level**—`get_type_hints()` needs importable `__module__`
+15. **Lambda fingerprinting is non-deterministic**—lambdas without source fall back to `id(func)`, causing unnecessary re-runs across interpreter sessions. Always use named functions in stage definitions.

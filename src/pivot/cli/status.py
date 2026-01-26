@@ -5,7 +5,7 @@ import pathlib
 
 import click
 
-from pivot import exceptions, project
+from pivot import config, exceptions, project
 from pivot import status as status_mod
 from pivot.cli import completion
 from pivot.cli import decorators as cli_decorators
@@ -49,7 +49,7 @@ def status(
     cli_helpers.validate_stages_exist(stages_list)
 
     project_root = project.get_project_root()
-    resolved_cache_dir = cache_dir or project_root / ".pivot" / "cache"
+    resolved_cache_dir = cache_dir or config.get_cache_dir()
 
     show_all = not (stages_only or tracked_only or remote_only)
     show_stages = show_all or stages_only
@@ -61,9 +61,7 @@ def status(
     remote_status: RemoteSyncInfo | None = None
 
     if show_stages:
-        pipeline_status, _ = status_mod.get_pipeline_status(
-            stages_list, single_stage=False, cache_dir=resolved_cache_dir
-        )
+        pipeline_status, _ = status_mod.get_pipeline_status(stages_list, single_stage=False)
 
     if show_tracked:
         tracked_status = status_mod.get_tracked_files_status(project_root)

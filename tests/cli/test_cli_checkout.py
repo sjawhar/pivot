@@ -214,10 +214,10 @@ def test_checkout_mode_copy(runner: click.testing.CliRunner, tmp_path: pathlib.P
 # =============================================================================
 
 
-def test_checkout_skips_existing_without_force(
+def test_checkout_errors_on_existing_by_default(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
-    """Checkout skips existing files and shows 'Skipped' message."""
+    """Checkout errors on existing files by default."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
         cache_dir = pathlib.Path(".pivot") / "cache" / "files"
@@ -231,8 +231,34 @@ def test_checkout_skips_existing_without_force(
         pvt_data = track.PvtData(path="data.txt", hash=output_hash["hash"], size=15)
         track.write_pvt_file(pathlib.Path("data.txt.pvt"), pvt_data)
 
-        # File exists (as symlink after save_to_cache), checkout without force
+        # File exists (as symlink after save_to_cache), checkout without flags should error
         result = runner.invoke(cli.cli, ["checkout", "data.txt"])
+
+        assert result.exit_code == 1
+        assert "already exists" in result.output
+        assert "--force" in result.output
+        assert "--only-missing" in result.output
+
+
+def test_checkout_only_missing_skips_existing(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """--only-missing skips existing files and shows 'Skipped' message."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        cache_dir = pathlib.Path(".pivot") / "cache" / "files"
+        cache_dir.mkdir(parents=True)
+
+        data_file = pathlib.Path("data.txt")
+        data_file.write_text("tracked content")
+        output_hash = cache.save_to_cache(data_file, cache_dir)
+        assert output_hash is not None and "hash" in output_hash
+
+        pvt_data = track.PvtData(path="data.txt", hash=output_hash["hash"], size=15)
+        track.write_pvt_file(pathlib.Path("data.txt.pvt"), pvt_data)
+
+        # File exists, --only-missing should skip it
+        result = runner.invoke(cli.cli, ["checkout", "--only-missing", "data.txt"])
 
         assert result.exit_code == 0
         assert "Skipped" in result.output

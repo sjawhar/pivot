@@ -162,7 +162,9 @@ def _check_cache_directory(project_root: pathlib.Path | None) -> DoctorCheckEven
     if project_root is None:
         return _skipped_check("cache_directory")
 
-    cache_dir = project_root / ".pivot" / "cache"
+    from pivot import config
+
+    cache_dir = config.get_cache_dir()
     path_str = _relative_path(cache_dir, project_root)
 
     if not cache_dir.exists():

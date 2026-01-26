@@ -166,8 +166,12 @@ def test_output_conflict_raises_error() -> None:
         _ = input_file
         return _OutputTxt(output=pathlib.Path("output.txt"))
 
+    # Second registration succeeds (validation is deferred)
+    reg.register(_helper_output_txt_2, name="process2")
+
+    # Output validation is deferred until validate_outputs() is called
     with pytest.raises(ValidationError, match="produced by both"):
-        reg.register(_helper_output_txt_2, name="process2")
+        reg.validate_outputs()
 
 
 def test_output_conflict_with_warning_mode() -> None:

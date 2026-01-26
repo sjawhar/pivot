@@ -8,7 +8,7 @@ import shutil
 import tempfile
 from typing import TYPE_CHECKING, Any, Protocol, TypedDict
 
-from pivot import exceptions
+from pivot import config, exceptions
 from pivot.remote import config as remote_config
 from pivot.types import TransferResult
 
@@ -20,10 +20,8 @@ logger = logging.getLogger(__name__)
 
 # Constants for S3 operations
 DEFAULT_CONCURRENCY = 20
-MAX_RETRIES = 10
 STREAM_CHUNK_SIZE = 8 * 1024 * 1024  # 8MB chunks for streaming
 STREAM_READ_TIMEOUT = 60  # Seconds to wait for each chunk read
-CONNECT_TIMEOUT = 30  # Seconds to wait for connection
 MIN_HASH_LENGTH = 3  # Minimum hash length (2-char prefix + at least 1 char)
 
 _HEX_PATTERN = re.compile(r"^[a-f0-9]+$", re.IGNORECASE)
@@ -95,8 +93,8 @@ def _get_s3_config() -> Any:
     from aiobotocore.config import AioConfig
 
     return AioConfig(
-        retries={"max_attempts": MAX_RETRIES},
-        connect_timeout=CONNECT_TIMEOUT,
+        retries={"max_attempts": config.get_remote_retries()},
+        connect_timeout=config.get_remote_connect_timeout(),
         read_timeout=STREAM_READ_TIMEOUT,
     )
 

@@ -111,7 +111,6 @@ def test_resolve_targets_as_stage(git_repo: GitRepo, monkeypatch: pytest.MonkeyP
     repo_path, commit = git_repo
 
     # Create lock file for stage
-    cache_dir = repo_path / ".pivot" / "cache"
     (repo_path / ".pivot" / "stages").mkdir(parents=True)
     lock_content = {
         "code_manifest": {"func:main": "abc123"},
@@ -124,8 +123,9 @@ def test_resolve_targets_as_stage(git_repo: GitRepo, monkeypatch: pytest.MonkeyP
 
     sha = commit("add lock file")[:7]
     monkeypatch.setattr(project, "_project_root_cache", repo_path)
+    state_dir = repo_path / ".pivot"
 
-    targets = restore.resolve_targets(["train"], sha, cache_dir)
+    targets = restore.resolve_targets(["train"], sha, state_dir)
 
     assert len(targets) == 1
     assert targets[0]["target_type"] == "stage"
@@ -144,8 +144,8 @@ def test_resolve_targets_as_pvt_file(git_repo: GitRepo, monkeypatch: pytest.Monk
     sha = commit("add pvt file")[:7]
     monkeypatch.setattr(project, "_project_root_cache", repo_path)
 
-    cache_dir = repo_path / ".pivot" / "cache"
-    targets = restore.resolve_targets(["data.csv"], sha, cache_dir)
+    state_dir = repo_path / ".pivot"
+    targets = restore.resolve_targets(["data.csv"], sha, state_dir)
 
     assert len(targets) == 1
     assert targets[0]["target_type"] == "file"
@@ -163,8 +163,8 @@ def test_resolve_targets_as_git_file(git_repo: GitRepo, monkeypatch: pytest.Monk
 
     monkeypatch.setattr(project, "_project_root_cache", repo_path)
 
-    cache_dir = repo_path / ".pivot" / "cache"
-    targets = restore.resolve_targets(["readme.txt"], sha, cache_dir)
+    state_dir = repo_path / ".pivot"
+    targets = restore.resolve_targets(["readme.txt"], sha, state_dir)
 
     assert len(targets) == 1
     assert targets[0]["target_type"] == "file"
@@ -180,10 +180,10 @@ def test_resolve_targets_not_found(git_repo: GitRepo, monkeypatch: pytest.Monkey
 
     monkeypatch.setattr(project, "_project_root_cache", repo_path)
 
-    cache_dir = repo_path / ".pivot" / "cache"
+    state_dir = repo_path / ".pivot"
 
     with pytest.raises(exceptions.TargetNotFoundError, match="nonexistent"):
-        restore.resolve_targets(["nonexistent"], sha, cache_dir)
+        restore.resolve_targets(["nonexistent"], sha, state_dir)
 
 
 def test_resolve_targets_path_traversal(git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -195,10 +195,10 @@ def test_resolve_targets_path_traversal(git_repo: GitRepo, monkeypatch: pytest.M
 
     monkeypatch.setattr(project, "_project_root_cache", repo_path)
 
-    cache_dir = repo_path / ".pivot" / "cache"
+    state_dir = repo_path / ".pivot"
 
     with pytest.raises(exceptions.TargetNotFoundError, match="Path traversal"):
-        restore.resolve_targets(["../../../etc/passwd"], sha, cache_dir)
+        restore.resolve_targets(["../../../etc/passwd"], sha, state_dir)
 
 
 # =============================================================================
@@ -217,6 +217,7 @@ def test_restore_targets_from_revision_invalid_rev(
     monkeypatch.setattr(project, "_project_root_cache", repo_path)
 
     cache_dir = repo_path / ".pivot" / "cache"
+    state_dir = repo_path / ".pivot"
 
     with pytest.raises(exceptions.RevisionNotFoundError, match="invalid-rev"):
         restore.restore_targets_from_revision(
@@ -224,6 +225,7 @@ def test_restore_targets_from_revision_invalid_rev(
             rev="invalid-rev",
             output=None,
             cache_dir=cache_dir,
+            state_dir=state_dir,
             checkout_modes=[cache.CheckoutMode.COPY],
             force=False,
         )
@@ -241,6 +243,7 @@ def test_restore_targets_from_revision_output_with_multiple_targets(
     monkeypatch.setattr(project, "_project_root_cache", repo_path)
 
     cache_dir = repo_path / ".pivot" / "cache"
+    state_dir = repo_path / ".pivot"
 
     with pytest.raises(exceptions.GetError, match="single target"):
         restore.restore_targets_from_revision(
@@ -248,6 +251,7 @@ def test_restore_targets_from_revision_output_with_multiple_targets(
             rev=sha[:7],
             output=repo_path / "output.txt",
             cache_dir=cache_dir,
+            state_dir=state_dir,
             checkout_modes=[cache.CheckoutMode.COPY],
             force=False,
         )
@@ -267,6 +271,7 @@ def test_restore_targets_from_revision_git_file(
     monkeypatch.setattr(project, "_project_root_cache", repo_path)
 
     cache_dir = repo_path / ".pivot" / "cache"
+    state_dir = repo_path / ".pivot"
     output_path = repo_path / "restored.txt"
 
     messages = restore.restore_targets_from_revision(
@@ -274,6 +279,7 @@ def test_restore_targets_from_revision_git_file(
         rev=sha[:7],
         output=output_path,
         cache_dir=cache_dir,
+        state_dir=state_dir,
         checkout_modes=[cache.CheckoutMode.COPY],
         force=False,
     )
@@ -298,12 +304,14 @@ def test_restore_targets_from_revision_skip_existing(
     monkeypatch.setattr(project, "_project_root_cache", repo_path)
 
     cache_dir = repo_path / ".pivot" / "cache"
+    state_dir = repo_path / ".pivot"
 
     messages = restore.restore_targets_from_revision(
         targets=["file.txt"],
         rev=sha[:7],
         output=output_path,
         cache_dir=cache_dir,
+        state_dir=state_dir,
         checkout_modes=[cache.CheckoutMode.COPY],
         force=False,
     )
@@ -328,12 +336,14 @@ def test_restore_targets_from_revision_force_overwrite(
     monkeypatch.setattr(project, "_project_root_cache", repo_path)
 
     cache_dir = repo_path / ".pivot" / "cache"
+    state_dir = repo_path / ".pivot"
 
     messages = restore.restore_targets_from_revision(
         targets=["file.txt"],
         rev=sha[:7],
         output=output_path,
         cache_dir=cache_dir,
+        state_dir=state_dir,
         checkout_modes=[cache.CheckoutMode.COPY],
         force=True,
     )
@@ -351,6 +361,7 @@ def test_restore_targets_from_revision_output_with_stage(
 
     # Create lock file for stage
     cache_dir = repo_path / ".pivot" / "cache"
+    state_dir = repo_path / ".pivot"
     (repo_path / ".pivot" / "stages").mkdir(parents=True)
     lock_content = {
         "code_manifest": {"func:main": "abc123"},
@@ -371,6 +382,7 @@ def test_restore_targets_from_revision_output_with_stage(
             rev=sha[:7],
             output=repo_path / "output.txt",
             cache_dir=cache_dir,
+            state_dir=state_dir,
             checkout_modes=[cache.CheckoutMode.COPY],
             force=False,
         )
@@ -417,12 +429,14 @@ def test_restore_file_cache_miss_error(git_repo: GitRepo, monkeypatch: pytest.Mo
     monkeypatch.setattr(project, "_project_root_cache", repo_path)
 
     cache_dir = repo_path / ".pivot" / "cache"
+    state_dir = repo_path / ".pivot"
 
     messages = restore.restore_targets_from_revision(
         targets=["data.csv"],
         rev=sha[:7],
         output=None,
         cache_dir=cache_dir,
+        state_dir=state_dir,
         checkout_modes=[cache.CheckoutMode.COPY],
         force=False,
     )
@@ -440,6 +454,7 @@ def test_restore_file_from_cache(git_repo: GitRepo, monkeypatch: pytest.MonkeyPa
 
     # Set up cache directory
     cache_dir = repo_path / ".pivot" / "cache"
+    state_dir = repo_path / ".pivot"
     (cache_dir / "files").mkdir(parents=True)
 
     # Create a fake cached file
@@ -462,6 +477,7 @@ def test_restore_file_from_cache(git_repo: GitRepo, monkeypatch: pytest.MonkeyPa
         rev=sha[:7],
         output=output_path,
         cache_dir=cache_dir,
+        state_dir=state_dir,
         checkout_modes=[cache.CheckoutMode.COPY],
         force=False,
     )

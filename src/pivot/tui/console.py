@@ -2,9 +2,10 @@ import os
 import sys
 import time
 from collections.abc import Mapping, Sequence
-from typing import TextIO
+from typing import Any, Self, TextIO
 
 import click
+from tqdm import tqdm
 
 from pivot.types import StageDisplayStatus, StageExplanation, StageStatus
 
@@ -32,7 +33,13 @@ def _supports_color(stream: TextIO) -> bool:
 
 
 class Console:
-    """Console output handler with colors and progress tracking."""
+    """Console output handler with colors and progress tracking.
+
+    Can be used as a context manager to ensure progress bar cleanup:
+        with Console() as con:
+            con.stage_start(...)
+            con.stage_result(...)
+    """
 
     stream: TextIO
     use_color: bool
@@ -48,6 +55,23 @@ class Console:
         self.use_color = color if color is not None else _supports_color(self.stream)
         self._current_stage: str | None = None
         self._stage_start: float | None = None
+        # tqdm[T] type is invariant and tricky to annotate - use Any for internal state
+        self._progress_bar: Any = None
+        self._is_tty: bool = hasattr(self.stream, "isatty") and self.stream.isatty()
+
+    def __enter__(self) -> Self:
+        """Enter context manager."""
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        """Exit context manager, ensuring progress bar cleanup."""
+        self.close()
+
+    def close(self) -> None:
+        """Close progress bar if active."""
+        if self._progress_bar is not None:
+            self._progress_bar.close()
+            self._progress_bar = None
 
     def _color(self, text: str, *codes: str) -> str:
         """Apply color codes to text."""
@@ -57,8 +81,23 @@ class Console:
         return f"{prefix}{text}{_COLORS['reset']}"
 
     def _echo(self, message: str) -> None:
-        """Output message, preserving ANSI codes when colors are enabled."""
-        click.echo(message, file=self.stream, color=self.use_color)
+        """Output message, using tqdm.write() if progress bar is active."""
+        if self._progress_bar is not None:
+            # tqdm.write() clears bar, prints, redraws bar - use same stream as bar
+            self._progress_bar.write(message, file=self.stream)
+        else:
+            click.echo(message, file=self.stream, color=self.use_color)
+
+    def _ensure_progress_bar(self, total: int) -> None:
+        """Initialize progress bar if on TTY and not already created."""
+        if self._progress_bar is None and self._is_tty:
+            self._progress_bar = tqdm(
+                total=total,
+                desc="Pipeline",
+                file=self.stream,
+                dynamic_ncols=True,
+                leave=True,
+            )
 
     def stage_start(
         self,
@@ -68,14 +107,18 @@ class Console:
         status: StageDisplayStatus,
     ) -> None:
         """Print stage start message."""
+        # Use click.unstyle to strip any ANSI codes from stage name
+        name = click.unstyle(name)
         self._current_stage = name
         self._stage_start = time.perf_counter()
+
+        self._ensure_progress_bar(total)
 
         progress = self._color(f"[{index}/{total}]", "dim")
 
         match status:
-            case StageDisplayStatus.CHECKING:
-                status_text = self._color("checking", "dim")
+            case StageDisplayStatus.FINGERPRINTING:
+                status_text = self._color("fingerprinting", "dim")
             case StageDisplayStatus.RUNNING:
                 status_text = self._color("running", "blue", "bold")
             case StageDisplayStatus.WAITING:
@@ -93,13 +136,19 @@ class Console:
         duration: float | None = None,
     ) -> None:
         """Print stage result message."""
+        name = click.unstyle(name)
         progress = self._color(f"[{index}/{total}]", "dim")
 
+        # Determine display status and text based on status and reason
         match status:
             case StageStatus.RAN:
                 status_text = self._color("ran", "green", "bold")
             case StageStatus.SKIPPED:
-                status_text = self._color("skipped", "yellow")
+                # Distinguish between "cached" (unchanged) and "blocked" (upstream failed)
+                if reason.startswith("upstream"):
+                    status_text = self._color("blocked", "red")
+                else:
+                    status_text = self._color("cached", "yellow")
             case StageStatus.FAILED:
                 status_text = self._color("FAILED", "red", "bold")
             case _:
@@ -119,27 +168,36 @@ class Console:
         self._current_stage = None
         self._stage_start = None
 
+        # Update progress bar on completion
+        if self._progress_bar is not None:
+            self._progress_bar.update(1)
+
     def parallel_group_start(self, group_index: int, stage_names: list[str]) -> None:
         """Print parallel group start message."""
-        stages_str = ", ".join(stage_names)
+        stages_str = ", ".join(click.unstyle(n) for n in stage_names)
         header = self._color(f"=== Parallel group {group_index} ===", "cyan", "bold")
         self._echo(f"\n{header} ({len(stage_names)} stages: {stages_str})")
 
     def summary(
         self,
         ran: int,
-        skipped: int,
+        cached: int,
+        blocked: int,
         failed: int,
         total_duration: float,
     ) -> None:
         """Print execution summary."""
+        # Close progress bar before printing summary
+        self.close()
+
         self._echo("")  # blank line
 
         ran_text = self._color(str(ran), "green") if ran > 0 else str(ran)
-        skipped_text = self._color(str(skipped), "yellow") if skipped > 0 else str(skipped)
+        cached_text = self._color(str(cached), "yellow") if cached > 0 else str(cached)
+        blocked_text = self._color(str(blocked), "red") if blocked > 0 else str(blocked)
         failed_text = self._color(str(failed), "red", "bold") if failed > 0 else str(failed)
 
-        summary = f"Summary: {ran_text} ran, {skipped_text} skipped, {failed_text} failed"
+        summary = f"Summary: {ran_text} ran, {cached_text} cached, {blocked_text} blocked, {failed_text} failed"
         duration = self._color(f"[{total_duration:.2f}s total]", "dim")
 
         self._echo(f"{summary} {duration}")
@@ -154,6 +212,7 @@ class Console:
 
     def stage_output(self, name: str, line: str, is_stderr: bool = False) -> None:
         """Print captured stage output."""
+        name = click.unstyle(name)
         prefix = self._color(f"  [{name}]", "dim")
         line_colored = self._color(line, "red") if is_stderr else line
         self._echo(f"{prefix} {line_colored}")

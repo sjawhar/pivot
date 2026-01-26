@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, TypedDict
 
 import click
 
-from pivot import discovery, executor, metrics, registry
+from pivot import config, discovery, executor, registry
 from pivot.cli import completion
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
@@ -50,7 +50,6 @@ def _suppress_stderr_logging() -> Generator[None]:
             if stream in (sys.stderr, sys.stdout):
                 root.removeHandler(handler)  # pyright: ignore[reportUnknownArgumentType]
                 removed_handlers.append(handler)  # pyright: ignore[reportUnknownArgumentType]
-
     try:
         yield
     finally:
@@ -86,11 +85,10 @@ def _validate_stages(stages_list: list[str] | None, single_stage: bool) -> None:
 def _get_all_explanations(
     stages_list: list[str] | None,
     single_stage: bool,
-    cache_dir: pathlib.Path | None,
     force: bool = False,
 ) -> list[StageExplanation]:
     """Get explanations for all stages in execution order."""
-    from pivot import dag, explain, parameters, project
+    from pivot import dag, explain, parameters
 
     graph = registry.REGISTRY.build_dag(validate=True)
     execution_order = dag.get_execution_order(graph, stages_list, single_stage=single_stage)
@@ -98,7 +96,7 @@ def _get_all_explanations(
     if not execution_order:
         return []
 
-    resolved_cache_dir = cache_dir or project.get_project_root() / ".pivot" / "cache"
+    state_dir = config.get_state_dir()
     overrides = parameters.load_params_yaml()
 
     explanations = list[StageExplanation]()
@@ -110,7 +108,7 @@ def _get_all_explanations(
             stage_info["deps_paths"],
             stage_info["params"],
             overrides,
-            resolved_cache_dir,
+            state_dir,
             force=force,
         )
         explanations.append(explanation)
@@ -127,13 +125,13 @@ def _run_with_tui(
     no_commit: bool = False,
     no_cache: bool = False,
     on_error: OnError = OnError.FAIL,
+    allow_uncached_incremental: bool = False,
+    checkout_missing: bool = False,
 ) -> dict[str, ExecutionSummary] | None:
     """Run pipeline with TUI display."""
-    import multiprocessing as mp
+    import queue as thread_queue
 
-    import loky
-
-    from pivot import dag, project
+    from pivot import dag
     from pivot.tui import run as run_tui
     from pivot.types import TuiMessage
 
@@ -144,36 +142,35 @@ def _run_with_tui(
     if not execution_order:
         return {}
 
-    resolved_cache_dir = cache_dir or project.get_project_root() / ".pivot" / "cache"
+    resolved_cache_dir = cache_dir or config.get_cache_dir()
 
     # Pre-warm loky executor before starting Textual TUI.
     # Textual manipulates terminal file descriptors which breaks loky's
     # resource tracker if spawned after Textual starts.
-    loky.get_reusable_executor(max_workers=1)
+    executor.prepare_workers(len(execution_order))
 
-    # Create manager and queue (Manager().Queue for loky compatibility)
-    manager = mp.Manager()
-    try:
-        tui_queue: mp.Queue[TuiMessage] = manager.Queue()  # pyright: ignore[reportAssignmentType]
+    # tui_queue is inter-thread only (executor -> TUI reader), no cross-process IPC needed.
+    # Using stdlib queue.Queue avoids Manager subprocess dependency issues.
+    tui_queue: thread_queue.Queue[TuiMessage] = thread_queue.Queue()
 
-        # Create executor function that passes the TUI queue
-        def executor_func() -> dict[str, ExecutionSummary]:
-            return executor.run(
-                stages=stages_list,
-                single_stage=single_stage,
-                cache_dir=resolved_cache_dir,
-                show_output=False,
-                tui_queue=tui_queue,
-                force=force,
-                no_commit=no_commit,
-                no_cache=no_cache,
-                on_error=on_error,
-            )
+    # Create executor function that passes the TUI queue
+    def executor_func() -> dict[str, ExecutionSummary]:
+        return executor.run(
+            stages=stages_list,
+            single_stage=single_stage,
+            cache_dir=resolved_cache_dir,
+            show_output=False,
+            tui_queue=tui_queue,
+            force=force,
+            no_commit=no_commit,
+            no_cache=no_cache,
+            on_error=on_error,
+            allow_uncached_incremental=allow_uncached_incremental,
+            checkout_missing=checkout_missing,
+        )
 
-        with _suppress_stderr_logging():
-            return run_tui.run_with_tui(execution_order, tui_queue, executor_func, tui_log=tui_log)
-    finally:
-        manager.shutdown()
+    with _suppress_stderr_logging():
+        return run_tui.run_with_tui(execution_order, tui_queue, executor_func, tui_log=tui_log)
 
 
 def _run_watch_with_tui(
@@ -190,9 +187,7 @@ def _run_watch_with_tui(
 ) -> None:
     """Run watch mode with TUI display."""
     import multiprocessing as mp
-    import os
-
-    import loky
+    import queue as thread_queue
 
     from pivot import dag
     from pivot import watch as watch_module
@@ -203,28 +198,21 @@ def _run_watch_with_tui(
     graph = registry.REGISTRY.build_dag(validate=True)
     execution_order = dag.get_execution_order(graph, stages_list, single_stage=single_stage)
 
-    # Calculate max_workers the same way executor does
-    max_workers = min(os.cpu_count() or 1, 8, len(execution_order)) if execution_order else 1
-
     # Pre-warm loky executor before starting Textual TUI.
     # Textual manipulates terminal file descriptors which breaks loky's
     # resource tracker if spawned after Textual starts.
-    # IMPORTANT: Must use the same max_workers that executor will use, otherwise
-    # loky will try to spawn additional workers after Textual has started.
-    # We also submit a no-op task to each worker to ensure all communication
-    # channels are fully established before Textual starts.
-    pool = loky.get_reusable_executor(max_workers=max_workers)
-    # Submit no-op tasks to ensure workers are warm and communication channels exist
-    futures = [pool.submit(lambda: None) for _ in range(max_workers)]
-    for f in futures:
-        f.result()  # Wait for completion to ensure channels are established
+    executor.prepare_workers(len(execution_order) if execution_order else 1)
 
-    # Create Manager and queues BEFORE Textual starts to avoid multiprocessing
-    # fd inheritance issues. Textual manipulates terminal file descriptors which
-    # breaks Manager() subprocess spawning if done after Textual starts.
-    manager = mp.Manager()
+    # tui_queue is inter-thread only (executor -> TUI reader), no cross-process IPC needed.
+    # Using stdlib queue.Queue avoids Manager subprocess dependency issues.
+    tui_queue: thread_queue.Queue[TuiMessage] = thread_queue.Queue()
+
+    # output_queue crosses process boundaries (loky workers -> main), requires Manager.Queue.
+    # Create Manager BEFORE Textual starts to avoid multiprocessing fd inheritance issues.
+    # Use spawn context to avoid fork-in-multithreaded-context issues (Python 3.13+ deprecation)
+    spawn_ctx = mp.get_context("spawn")
+    manager = spawn_ctx.Manager()
     try:
-        tui_queue: mp.Queue[TuiMessage] = manager.Queue()  # pyright: ignore[reportAssignmentType]
         output_queue: mp.Queue[OutputMessage] = manager.Queue()  # pyright: ignore[reportAssignmentType]
 
         engine = watch_module.WatchEngine(
@@ -250,44 +238,6 @@ def _run_watch_with_tui(
             )
     finally:
         manager.shutdown()
-
-
-def _print_results(results: dict[str, ExecutionSummary]) -> None:
-    """Print execution results in a readable format."""
-    ran = 0
-    skipped = 0
-    failed = 0
-
-    for name, result in results.items():
-        result_status = result["status"]
-        reason = result["reason"]
-
-        if result_status == StageStatus.RAN:
-            ran += 1
-            click.echo(f"{name}: ran ({reason})")
-        elif result_status == StageStatus.FAILED:
-            failed += 1
-            click.echo(f"{name}: failed ({reason})")
-        else:
-            skipped += 1
-            if reason:
-                click.echo(f"{name}: skipped ({reason})")
-            else:
-                click.echo(f"{name}: skipped")
-
-    parts = [f"{ran} ran", f"{skipped} skipped"]
-    if failed > 0:
-        parts.append(f"{failed} failed")
-    click.echo(f"\nTotal: {', '.join(parts)}")
-
-    # Print metrics summary if available (when PIVOT_METRICS=1 or metrics.enable() was called)
-    metrics_summary = metrics.summary()
-    if metrics_summary:
-        click.echo("\nMetrics:")
-        for name, stats in metrics_summary.items():
-            click.echo(
-                f"  {name}: {stats['count']}x, total={stats['total_ms']:.1f}ms, avg={stats['avg_ms']:.1f}ms"
-            )
 
 
 @cli_decorators.pivot_command()
@@ -318,7 +268,7 @@ def _print_results(results: dict[str, ExecutionSummary]) -> None:
 @click.option(
     "--debounce",
     type=click.IntRange(min=0),
-    default=300,
+    default=None,
     help="Debounce delay in milliseconds (for --watch mode)",
 )
 @click.option(
@@ -354,6 +304,16 @@ def _print_results(results: dict[str, ExecutionSummary]) -> None:
     is_flag=True,
     help="Start RPC server for agent control (requires --watch). Creates Unix socket at .pivot/agent.sock",
 )
+@click.option(
+    "--allow-uncached-incremental",
+    is_flag=True,
+    help="Allow running stages with IncrementalOut files that exist but aren't in cache.",
+)
+@click.option(
+    "--checkout-missing",
+    is_flag=True,
+    help="Restore tracked files that don't exist on disk from cache before running.",
+)
 @click.pass_context
 def run(
     ctx: click.Context,
@@ -364,7 +324,7 @@ def run(
     explain: bool,
     force: bool,
     watch: bool,
-    debounce: int,
+    debounce: int | None,
     display: str | None,  # Click passes string, converted to DisplayMode below
     as_json: bool,
     tui_log: pathlib.Path | None,
@@ -372,6 +332,8 @@ def run(
     no_cache: bool,
     keep_going: bool,
     serve: bool,
+    allow_uncached_incremental: bool,
+    checkout_missing: bool,
 ) -> None:
     """Execute pipeline stages.
 
@@ -383,6 +345,7 @@ def run(
     cli_ctx = cli_helpers.get_cli_context(ctx)
     quiet = cli_ctx["quiet"]
     show_human_output = not as_json and not quiet
+    debounce = debounce if debounce is not None else config.get_watch_debounce()
 
     stages_list = cli_helpers.stages_to_list(stages)
     _validate_stages(stages_list, single_stage)
@@ -415,7 +378,6 @@ def run(
                 explain_cmd,
                 stages=stages,
                 single_stage=single_stage,
-                cache_dir=cache_dir,
                 force=force,
             )
         else:
@@ -424,7 +386,6 @@ def run(
                 dry_run_cmd,
                 stages=stages,
                 single_stage=single_stage,
-                cache_dir=cache_dir,
                 force=force,
                 as_json=as_json,
             )
@@ -504,6 +465,8 @@ def run(
             no_commit=no_commit,
             no_cache=no_cache,
             on_error=on_error,
+            allow_uncached_incremental=allow_uncached_incremental,
+            checkout_missing=checkout_missing,
         )
     elif as_json:
         # JSONL streaming mode
@@ -523,6 +486,8 @@ def run(
             show_output=False,
             progress_callback=cli_helpers.emit_jsonl,
             on_error=on_error,
+            allow_uncached_incremental=allow_uncached_incremental,
+            checkout_missing=checkout_missing,
         )
         total_duration_ms = (time.perf_counter() - start_time) * 1000
 
@@ -552,12 +517,12 @@ def run(
             no_cache=no_cache,
             on_error=on_error,
             show_output=not quiet,
+            allow_uncached_incremental=allow_uncached_incremental,
+            checkout_missing=checkout_missing,
         )
 
     if not results and show_human_output:
         click.echo("No stages to run")
-    elif not explain and not use_tui and show_human_output and results:
-        _print_results(results)
 
 
 class DryRunJsonStageOutput(TypedDict):
@@ -581,7 +546,6 @@ class DryRunJsonOutput(TypedDict):
     is_flag=True,
     help="Run only the specified stages (in provided order), not their dependencies",
 )
-@click.option("--cache-dir", type=click.Path(path_type=pathlib.Path), help="Cache directory")
 @click.option(
     "--force",
     "-f",
@@ -592,7 +556,6 @@ class DryRunJsonOutput(TypedDict):
 def dry_run_cmd(
     stages: tuple[str, ...],
     single_stage: bool,
-    cache_dir: pathlib.Path | None,
     force: bool,
     as_json: bool,
 ) -> None:
@@ -600,7 +563,7 @@ def dry_run_cmd(
     stages_list = cli_helpers.stages_to_list(stages)
     _validate_stages(stages_list, single_stage)
 
-    explanations = _get_all_explanations(stages_list, single_stage, cache_dir, force=force)
+    explanations = _get_all_explanations(stages_list, single_stage, force=force)
 
     if not explanations:
         if as_json:
@@ -636,23 +599,20 @@ def dry_run_cmd(
     is_flag=True,
     help="Run only the specified stages (in provided order), not their dependencies",
 )
-@click.option("--cache-dir", type=click.Path(path_type=pathlib.Path), help="Cache directory")
 @click.option(
     "--force",
     "-f",
     is_flag=True,
     help="Show explanation as if forced",
 )
-def explain_cmd(
-    stages: tuple[str, ...], single_stage: bool, cache_dir: pathlib.Path | None, force: bool
-) -> None:
+def explain_cmd(stages: tuple[str, ...], single_stage: bool, force: bool) -> None:
     """Show detailed breakdown of why stages would run."""
     from pivot.tui import console
 
     stages_list = cli_helpers.stages_to_list(stages)
     _validate_stages(stages_list, single_stage)
 
-    explanations = _get_all_explanations(stages_list, single_stage, cache_dir, force=force)
+    explanations = _get_all_explanations(stages_list, single_stage, force=force)
 
     if not explanations:
         click.echo("No stages to run")

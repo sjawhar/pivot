@@ -5,7 +5,7 @@ from typing import TypedDict
 
 import click
 
-from pivot import project, registry
+from pivot import config, project, registry
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
 from pivot.storage import cache
@@ -193,7 +193,7 @@ def track(ctx: click.Context, paths: tuple[str, ...], force: bool) -> None:
     quiet = cli_ctx["quiet"]
 
     project_root = project.get_project_root()
-    cache_dir = project_root / ".pivot" / "cache" / "files"
+    cache_dir = config.get_cache_dir() / "files"
 
     # Get all stage outputs for overlap detection
     stage_outputs = _get_all_stage_outputs()

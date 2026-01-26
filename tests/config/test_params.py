@@ -263,3 +263,38 @@ def test_get_effective_params_with_overrides() -> None:
 def test_get_effective_params_no_instance() -> None:
     params_dict = parameters.get_effective_params(None, "train", None)
     assert params_dict == {}
+
+
+# -----------------------------------------------------------------------------
+# List replacement tests (deepmerge should replace, not append)
+# -----------------------------------------------------------------------------
+
+
+class ListParams(BaseModel):
+    files: list[str] = ["default.csv"]
+    tags: list[str] = ["a", "b"]
+
+
+def test_params_override_replaces_lists() -> None:
+    """Override list replaces base list entirely, not append."""
+    instance = ListParams()
+    overrides = {"stage": {"files": ["override.csv"], "tags": ["x"]}}
+    result = parameters.apply_overrides(instance, "stage", overrides)
+
+    # Lists should be replaced, not appended
+    assert result.files == ["override.csv"], "List should be replaced, not appended"
+    assert result.tags == ["x"], "List should be replaced, not appended"
+
+
+def test_params_deep_merge_replaces_nested_lists() -> None:
+    """Deep merge replaces nested lists instead of appending."""
+
+    class NestedListParams(BaseModel):
+        config: dict[str, list[str]] = {"items": ["a", "b"]}
+
+    instance = NestedListParams()
+    overrides = {"stage": {"config": {"items": ["x", "y", "z"]}}}
+    result = parameters.apply_overrides(instance, "stage", overrides)
+
+    # Nested list should be replaced
+    assert result.config["items"] == ["x", "y", "z"], "Nested list should be replaced"

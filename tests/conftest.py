@@ -3,17 +3,19 @@ from __future__ import annotations
 import importlib
 import linecache
 import logging
+import multiprocessing as mp
 import pathlib
 import subprocess
 import sys
 import tempfile
 from collections.abc import Callable
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import click.testing
 import pytest
 
 from pivot import project
+from pivot.config import io as config_io
 from pivot.executor import core as executor_core
 from pivot.registry import REGISTRY
 from pivot.tui import console
@@ -27,6 +29,8 @@ if TYPE_CHECKING:
     from collections.abc import Generator
 
     from pytest_mock import MockerFixture
+
+    from pivot.types import OutputMessage
 
 # Type alias for git_repo fixture: (repo_path, commit_fn)
 GitRepo = tuple[pathlib.Path, Callable[[str], str]]
@@ -48,6 +52,7 @@ def sample_data_file(tmp_pipeline_dir: pathlib.Path) -> pathlib.Path:
 @pytest.fixture(autouse=True)
 def clean_registry(mocker: MockerFixture) -> Generator[None]:
     mocker.patch.dict(REGISTRY._stages, clear=True)
+    mocker.patch.object(REGISTRY, "_cached_dag", None)
     yield
 
 
@@ -59,10 +64,11 @@ def reset_pivot_state(mocker: MockerFixture) -> Generator[None]:
     """Reset global pivot state between tests.
 
     CliRunner can leave console singleton pointing to closed streams,
-    and project root cache pointing to old directories.
+    project root cache pointing to old directories, and merged config cached.
     """
     mocker.patch.object(console, "_console", None)
     mocker.patch.object(project, "_project_root_cache", None)
+    config_io.clear_config_cache()
     for name in _PIVOT_LOGGERS:
         logging.getLogger(name).handlers.clear()
     yield
@@ -160,3 +166,18 @@ def pipeline_dir(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> pat
 def runner() -> click.testing.CliRunner:
     """Create a CLI runner for testing."""
     return click.testing.CliRunner()
+
+
+@pytest.fixture
+def output_queue() -> Generator[mp.Queue[OutputMessage]]:
+    """Create a multiprocessing queue for worker output using spawn context.
+
+    Uses spawn context to match production behavior and avoid Python 3.13+
+    deprecation warnings about fork() in multi-threaded contexts.
+    """
+    spawn_ctx = mp.get_context("spawn")
+    manager = spawn_ctx.Manager()
+    # Manager().Queue() returns Queue[Any] - cast through object for type safety
+    queue = cast("mp.Queue[OutputMessage]", cast("object", manager.Queue()))
+    yield queue
+    manager.shutdown()

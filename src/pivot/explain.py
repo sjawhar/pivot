@@ -98,11 +98,11 @@ def get_stage_explanation(
     deps: list[str],
     params_instance: pydantic.BaseModel | None,
     overrides: parameters.ParamsOverrides | None,
-    cache_dir: Path,
+    state_dir: Path,
     force: bool = False,
 ) -> StageExplanation:
     """Compute detailed explanation of why a stage would run."""
-    stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(cache_dir))
+    stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(state_dir))
     lock_data = stage_lock.read()
 
     if not lock_data:

@@ -310,7 +310,7 @@ def test_out_annotation_extraction_from_typeddict() -> None:
     def train(config: _TrainParams) -> _OutTestOutputs:
         return {"model": {"w": 1.0}, "metrics": {"loss": 0.1}}
 
-    specs = stage_def.get_output_specs_from_return(train)
+    specs = stage_def.get_output_specs_from_return(train, "test_stage")
 
     assert len(specs) == 2
     assert "model" in specs
@@ -325,7 +325,7 @@ def test_save_outputs_with_out_annotation(tmp_path: pathlib.Path) -> None:
     def process() -> _SingleOutTestOutputs:
         return {"result": {"count": 42}}
 
-    specs = stage_def.get_output_specs_from_return(process)
+    specs = stage_def.get_output_specs_from_return(process, "test_stage")
     return_value: _SingleOutTestOutputs = {"result": {"count": 42}}
 
     stage_def.save_return_outputs(return_value, specs, tmp_path)
@@ -532,8 +532,9 @@ def test_worker_injects_deps(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyP
     output_queue: Queue[OutputMessage] = Queue()
     output_lines: list[tuple[str, bool]] = []
 
-    # Get dep specs for the worker
+    # Get dep specs and out specs for the worker
     dep_specs = stage_def.get_dep_specs_from_signature(process)
+    out_specs = stage_def.get_output_specs_from_return(process, "test_stage")
 
     worker._run_stage_function_with_injection(
         process,
@@ -543,6 +544,7 @@ def test_worker_injects_deps(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyP
         params=None,
         dep_specs=dep_specs,
         project_root=tmp_path,
+        out_specs=out_specs,
     )
 
     # Verify output was saved
@@ -582,6 +584,9 @@ def test_worker_injects_params_and_deps(
     output_lines: list[tuple[str, bool]] = []
 
     dep_specs = stage_def.get_dep_specs_from_signature(train)
+    out_specs = stage_def.get_output_specs_from_return(train, "test_stage")
+
+    params_arg_name, _ = stage_def.find_params_in_signature(train)
 
     worker._run_stage_function_with_injection(
         train,
@@ -591,6 +596,8 @@ def test_worker_injects_params_and_deps(
         params=params,
         dep_specs=dep_specs,
         project_root=tmp_path,
+        out_specs=out_specs,
+        params_arg_name=params_arg_name,
     )
 
     # Verify output was saved

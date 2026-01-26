@@ -3,6 +3,7 @@
 import ast
 import math
 import os
+import pathlib
 import sys
 
 import networkx as nx
@@ -226,22 +227,16 @@ def test_changed_function_different_fingerprint():
     assert fp1["self:func_v1"] != fp2["self:func_v2"]
 
 
-def test_module_attr_usage_detected():
-    """Should detect module.attr patterns (Google style imports)."""
+def test_stdlib_module_attrs_not_tracked():
+    """Stdlib module attributes (math, os, json, etc.) are NOT tracked."""
     fp = fingerprint.get_stage_fingerprint(_helper_uses_math_pi)
-
     assert "self:_helper_uses_math_pi" in fp
-    assert "mod:math.pi" in fp
-    assert isinstance(fp["mod:math.pi"], str)
+    assert "mod:math.pi" not in fp
 
-
-def test_multiple_module_attrs_detected():
-    """Should detect multiple module attributes."""
-    fp = fingerprint.get_stage_fingerprint(_helper_uses_multiple_math_attrs)
-
-    assert "mod:math.sqrt" in fp
-    assert "mod:math.sin" in fp
-    assert "mod:math.cos" in fp
+    fp2 = fingerprint.get_stage_fingerprint(_helper_uses_multiple_math_attrs)
+    assert "mod:math.sqrt" not in fp2
+    assert "mod:math.sin" not in fp2
+    assert "mod:math.cos" not in fp2
 
 
 def test_aliased_function_captured():
@@ -830,30 +825,6 @@ def test_hash_function_no_code_object():
     assert len(h) == 16  # xxhash64 hexdigest
 
 
-def test_module_attr_with_attribute_error():
-    """Should handle AttributeError when getting module attributes."""
-    # Temporarily patch to return a fake attribute
-    original_extract = ast_utils.extract_module_attr_usage
-
-    def mock_extract(func):
-        if func is _helper_with_math_pi:
-            return [("math", "pi"), ("math", "nonexistent_attr")]
-        return original_extract(func)
-
-    ast_utils.extract_module_attr_usage = mock_extract
-
-    try:
-        fp = fingerprint.get_stage_fingerprint(_helper_with_math_pi)
-
-        # Should have mod:math.pi but handle nonexistent_attr gracefully
-        assert "mod:math.pi" in fp
-        # The nonexistent attribute should be marked as "unknown"
-        assert "mod:math.nonexistent_attr" in fp
-        assert fp["mod:math.nonexistent_attr"] == "unknown"
-    finally:
-        ast_utils.extract_module_attr_usage = original_extract
-
-
 def test_is_user_code_module_not_in_sys_modules():
     """Should return False for modules not in sys.modules."""
 
@@ -979,22 +950,6 @@ def test_fingerprint_with_bool_constant():
     assert "self:_helper_uses_bool" in fp
     assert "const:TEST_BOOL" in fp
     assert fp["const:TEST_BOOL"] == "True"
-
-
-def test_fingerprint_recursive_helper_excludes_self():
-    """Should recursively fingerprint helpers but exclude their self entries."""
-    # Use _helper_uses_multiple_math_attrs which references math functions
-    # This test already exists and passes - verifying merge behavior
-    fp = fingerprint.get_stage_fingerprint(_helper_uses_multiple_math_attrs)
-
-    # Should have mod:math.sqrt, sin, cos (callables)
-    assert "mod:math.sqrt" in fp
-    assert "mod:math.sin" in fp
-    assert "mod:math.cos" in fp
-    # All should be marked as "callable"
-    assert fp["mod:math.sqrt"] == "callable"
-    assert fp["mod:math.sin"] == "callable"
-    assert fp["mod:math.cos"] == "callable"
 
 
 # ==============================================================================
@@ -1155,6 +1110,9 @@ def test_custom_loader_fingerprint():
         def save(self, data: str, path: pathlib.Path) -> None:
             path.write_text(data)
 
+        def empty(self) -> str:
+            return ""
+
     loader = CustomTextLoader(prefix="TEST:")
     fp = fingerprint.get_loader_fingerprint(loader)
 
@@ -1178,6 +1136,9 @@ def test_custom_loader_code_change_detected():
         def save(self, data: str, path: pathlib.Path) -> None:
             path.write_text(data)
 
+        def empty(self) -> str:
+            return ""
+
     @dataclasses.dataclass(frozen=True)
     class LoaderV2(loaders.Loader[str]):
         def load(self, path: pathlib.Path) -> str:
@@ -1185,6 +1146,9 @@ def test_custom_loader_code_change_detected():
 
         def save(self, data: str, path: pathlib.Path) -> None:
             path.write_text(data)
+
+        def empty(self) -> str:
+            return ""
 
     fp1 = fingerprint.get_loader_fingerprint(LoaderV1())
     fp2 = fingerprint.get_loader_fingerprint(LoaderV2())
@@ -1203,3 +1167,153 @@ def test_loader_fingerprint_stable():
     fp2 = fingerprint.get_loader_fingerprint(loader)
 
     assert fp1 == fp2
+
+
+# ==============================================================================
+# Namespace package detection tests (Issue #2: incorrect user code classification)
+# ==============================================================================
+
+
+@pytest.fixture
+def namespace_pkg_in_site_packages(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch):
+    """Create a synthetic namespace package in a fake site-packages directory."""
+    # Create fake site-packages with a namespace package (no __init__.py)
+    site_packages = tmp_path / "site-packages" / "fake_namespace_pkg"
+    site_packages.mkdir(parents=True)
+
+    # Add to sys.path so Python can find it
+    monkeypatch.syspath_prepend(str(tmp_path / "site-packages"))
+
+    # Clear any cached import state
+    sys.modules.pop("fake_namespace_pkg", None)
+
+    yield "fake_namespace_pkg"
+
+    # Cleanup
+    sys.modules.pop("fake_namespace_pkg", None)
+
+
+@pytest.fixture
+def namespace_pkg_user_code(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch):
+    """Create a synthetic namespace package in a user directory (not site-packages)."""
+    # Create user directory with a namespace package (no __init__.py)
+    user_pkg = tmp_path / "my_project" / "user_namespace_pkg"
+    user_pkg.mkdir(parents=True)
+
+    # Add to sys.path so Python can find it
+    monkeypatch.syspath_prepend(str(tmp_path / "my_project"))
+
+    # Clear any cached import state
+    sys.modules.pop("user_namespace_pkg", None)
+
+    yield "user_namespace_pkg"
+
+    # Cleanup
+    sys.modules.pop("user_namespace_pkg", None)
+
+
+def test_is_user_code_namespace_package_in_site_packages(
+    namespace_pkg_in_site_packages: str,
+):
+    """Namespace packages in site-packages should NOT be classified as user code.
+
+    Namespace packages (PEP 420) don't have __file__, but they have __path__.
+    """
+    import importlib
+
+    module = importlib.import_module(namespace_pkg_in_site_packages)
+
+    # Verify it's a namespace package (no __file__, but has __path__)
+    assert not hasattr(module, "__file__") or module.__file__ is None
+    assert hasattr(module, "__path__")
+
+    # Should NOT be classified as user code (it's in site-packages)
+    assert fingerprint.is_user_code(module) is False
+
+
+def test_is_user_code_namespace_package_user_code(namespace_pkg_user_code: str):
+    """Namespace packages outside site-packages SHOULD be classified as user code."""
+    import importlib
+
+    module = importlib.import_module(namespace_pkg_user_code)
+
+    # Verify it's a namespace package
+    assert not hasattr(module, "__file__") or module.__file__ is None
+    assert hasattr(module, "__path__")
+
+    # Should be classified as user code (not in site-packages)
+    assert fingerprint.is_user_code(module) is True
+
+
+def test_is_user_code_path_component_matching_not_substring(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Ensure 'site-packages' is matched as path component, not substring.
+
+    A path like '/home/user/my-site-packages-util/' should NOT be treated as
+    site-packages just because it contains the substring.
+    """
+    # Create a directory with "site-packages" as substring but not component
+    tricky_path = tmp_path / "my-site-packages-util" / "tricky_pkg"
+    tricky_path.mkdir(parents=True)
+
+    monkeypatch.syspath_prepend(str(tmp_path / "my-site-packages-util"))
+    sys.modules.pop("tricky_pkg", None)
+
+    import importlib
+
+    module = importlib.import_module("tricky_pkg")
+
+    # This is user code - "site-packages" is a substring, not a path component
+    assert fingerprint.is_user_code(module) is True
+
+    sys.modules.pop("tricky_pkg", None)
+
+
+# ==============================================================================
+# Lock file determinism tests (Issue #1: non-deterministic code_manifest ordering)
+# ==============================================================================
+
+
+def test_code_manifest_sorted_in_lock_file():
+    """code_manifest keys should be sorted alphabetically in lock files.
+
+    This ensures consecutive pipeline runs produce identical lock files.
+    """
+    import yaml
+
+    from pivot.storage import lock
+    from pivot.types import LockData
+
+    # Create a code_manifest with keys in non-alphabetical order
+    code_manifest = {
+        "func:zebra": "hash1",
+        "func:alpha": "hash2",
+        "mod:omega.attr": "hash3",
+        "class:Beta": "hash4",
+        "self:main": "hash5",
+    }
+
+    lock_data = LockData(
+        code_manifest=code_manifest,
+        params={},
+        dep_hashes={},
+        output_hashes={},
+        dep_generations={},
+    )
+
+    storage_data = lock._convert_to_storage_format(lock_data)
+
+    # Serialize to YAML and check key order
+    yaml_str = yaml.dump(storage_data, sort_keys=False)
+
+    # Find positions of keys in the YAML output
+    positions = {
+        key: yaml_str.find(key) for key in code_manifest.keys() if yaml_str.find(key) != -1
+    }
+
+    # Keys should appear in sorted order
+    sorted_keys = sorted(code_manifest.keys())
+    actual_order = sorted(positions.keys(), key=lambda k: positions[k])
+
+    assert actual_order == sorted_keys, f"Expected {sorted_keys}, got {actual_order}"

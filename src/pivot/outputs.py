@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import dataclasses
-import pathlib
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
 if TYPE_CHECKING:
@@ -24,13 +23,6 @@ def _default_json_loader() -> loaders_module.Loader[JsonValue]:
     from pivot import loaders
 
     return loaders.JSON()
-
-
-def _default_path_only_loader() -> loaders_module.Loader[pathlib.Path]:
-    """Factory for default Plot loader."""
-    from pivot import loaders
-
-    return loaders.PathOnly()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -94,7 +86,6 @@ class Out(Generic[T]):  # noqa: UP046 - basedpyright doesn't support PEP 695 syn
     path: PathType
     loader: loaders_module.Loader[T]
     cache: bool = True
-    persist: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -118,22 +109,22 @@ class Metric(Out[JsonValue]):
 
 
 @dataclasses.dataclass(frozen=True)
-class Plot(Out[pathlib.Path]):
+class Plot(Out[T]):  # noqa: UP046 - basedpyright doesn't support PEP 695 syntax yet
     """Plot output with visualization options.
 
-    Default loader: PathOnly(). User creates the plot file manually.
+    Use for visualization outputs with explicit loader:
 
-    Use for visualization outputs:
-
+        # Manual file creation (user saves the plot)
         class TrainOutputs(TypedDict):
-            loss_curve: Annotated[pathlib.Path, Plot("plots/loss.png")]
+            loss_curve: Annotated[pathlib.Path, Plot("plots/loss.png", PathOnly())]
+
+        # Automatic saving (Pivot saves the figure)
+        class TrainOutputs(TypedDict):
+            loss_curve: Annotated[Figure, Plot("plots/loss.png", MatplotlibFigure())]
 
     Extra attributes (x, y, template) are used for DVC-compatible plot configuration.
     """
 
-    loader: loaders_module.Loader[pathlib.Path] = dataclasses.field(
-        default_factory=_default_path_only_loader
-    )  # type: ignore[assignment]
     x: str | None = None
     y: str | None = None
     template: str | None = None

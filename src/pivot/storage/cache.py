@@ -218,7 +218,15 @@ def get_cache_path(cache_dir: pathlib.Path, file_hash: str) -> pathlib.Path:
 
 
 def _make_writable_and_retry(func: Callable[[str], object], path: str, exc: BaseException) -> None:
-    """onexc handler for rmtree: make read-only items writable before retrying."""
+    """onexc handler for rmtree: make parent directory writable before retrying.
+
+    IMPORTANT: We only chmod directories, never files. Files may be hardlinks to
+    the cache, and chmod would corrupt the cache's read-only permissions (hardlinks
+    share the same inode, so chmod affects both the output file and cache file).
+
+    To delete a file, you only need write permission on the parent directory.
+    To delete a directory, you need write permission on the parent directory.
+    """
     # Make parent directory writable so we can modify its contents
     parent = os.path.dirname(path)
     if parent:
@@ -229,10 +237,12 @@ def _make_writable_and_retry(func: Callable[[str], object], path: str, exc: Base
         except OSError:
             pass  # Best effort - may not own parent
 
-    # Make the target itself writable
+    # For directories only: make writable so we can delete contents
+    # Never chmod files - they may be hardlinks to read-only cache
     try:
-        perm = os.lstat(path).st_mode
-        os.chmod(path, perm | stat.S_IWUSR)
+        st = os.lstat(path)
+        if stat.S_ISDIR(st.st_mode) and not (st.st_mode & stat.S_IWUSR):
+            os.chmod(path, st.st_mode | stat.S_IWUSR)
     except OSError as chmod_exc:
         if chmod_exc.errno not in (errno.ENOENT, errno.EPERM):
             raise exc from chmod_exc
@@ -241,7 +251,11 @@ def _make_writable_and_retry(func: Callable[[str], object], path: str, exc: Base
 
 
 def _clear_path(path: pathlib.Path) -> None:
-    """Remove file, symlink, or directory at path if it exists."""
+    """Remove file, symlink, or directory at path if it exists.
+
+    IMPORTANT: Never chmod files before deletion - they may be hardlinks to the
+    cache, and chmod would corrupt the cache's read-only permissions.
+    """
     if not path.exists() and not path.is_symlink():
         return
     if path.is_dir() and not path.is_symlink():
@@ -249,8 +263,17 @@ def _clear_path(path: pathlib.Path) -> None:
     else:
         try:
             path.unlink()
-        except PermissionError:
-            os.chmod(path, path.stat().st_mode | stat.S_IWUSR)
+        except PermissionError as perm_err:
+            # Make parent directory writable, not the file itself.
+            # Files may be hardlinks to read-only cache - chmod would corrupt cache.
+            parent = path.parent
+            try:
+                parent_perm = parent.stat().st_mode
+            except FileNotFoundError:
+                # Parent was deleted concurrently - re-raise original error
+                raise perm_err from None
+            if not (parent_perm & stat.S_IWUSR):
+                os.chmod(parent, parent_perm | stat.S_IWUSR)
             path.unlink()
 
 
@@ -699,6 +722,11 @@ def protect(path: pathlib.Path) -> None:
 
 
 def unprotect(path: pathlib.Path) -> None:
-    """Restore write permission to file."""
+    """Restore write permission to file.
+
+    WARNING: Do not use on files that might be hardlinks to the cache.
+    Hardlinks share the same inode, so chmod would also change the cache
+    file's permissions, corrupting its read-only invariant.
+    """
     current = path.stat().st_mode
     os.chmod(path, current | stat.S_IWUSR)

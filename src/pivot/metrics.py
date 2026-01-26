@@ -53,6 +53,11 @@ def add_entries(entries: list[tuple[str, float]]) -> None:
         _add(name, duration_ms)
 
 
+def count(name: str) -> None:
+    """Increment a counter metric (duration=0)."""
+    _add(name, 0.0)
+
+
 def _add(name: str, duration_ms: float) -> None:
     """Internal: add a single metric entry."""
     # Skip invalid values that would poison summary statistics

@@ -25,7 +25,7 @@ from pivot import loaders, outputs
 class TrainOutputs(TypedDict):
     model: Annotated[pathlib.Path, outputs.Out("model.pkl", loaders.PathOnly())]
     metrics: Annotated[dict, outputs.Metric("metrics.json")]
-    plot: Annotated[pathlib.Path, outputs.Plot("loss.png")]
+    plot: Annotated[pathlib.Path, outputs.Plot("loss.png", loaders.PathOnly())]
 
 
 def train(
@@ -98,7 +98,7 @@ Visualization files that you create manually:
 
 ```python
 class TrainOutputs(TypedDict):
-    plot: Annotated[pathlib.Path, outputs.Plot("loss.png")]
+    plot: Annotated[pathlib.Path, outputs.Plot("loss.png", loaders.PathOnly())]
 
 
 def train(...) -> TrainOutputs:
@@ -164,7 +164,7 @@ class FullOutputs(TypedDict):
     model: Annotated[pathlib.Path, outputs.Out("model.pkl", loaders.PathOnly())]
     cache: Annotated[dict, outputs.IncrementalOut("cache.json", loaders.JSON())]
     metrics: Annotated[dict, outputs.Metric("metrics.json")]
-    plot: Annotated[pathlib.Path, outputs.Plot("loss.png")]
+    plot: Annotated[pathlib.Path, outputs.Plot("loss.png", loaders.PathOnly())]
 ```
 
 ```yaml
