@@ -25,7 +25,7 @@ import textual.screen
 import textual.timer
 import textual.widgets
 
-from pivot import explain, parameters, project
+from pivot import config, explain, parameters, project
 from pivot.executor import ExecutionSummary
 from pivot.executor import commit as commit_mod
 from pivot.registry import REGISTRY
@@ -1631,14 +1631,14 @@ class WatchTuiApp(_BaseTuiApp[None]):
         input_snapshot: StageExplanation | None = None
         try:
             registry_info = REGISTRY.get(stage_name)
-            cache_dir = project.get_cache_dir()
+            state_dir = config.get_state_dir()
             input_snapshot = explain.get_stage_explanation(
                 stage_name=stage_name,
                 fingerprint=registry_info["fingerprint"],
                 deps=registry_info["deps_paths"],
                 params_instance=registry_info["params"],
                 overrides=parameters.load_params_yaml(),
-                cache_dir=cache_dir,
+                state_dir=state_dir,
             )
         except Exception:
             _logger.debug("Failed to capture input snapshot for %s", stage_name)
@@ -1692,8 +1692,8 @@ class WatchTuiApp(_BaseTuiApp[None]):
             output_snapshot: list[OutputChange] | None = None
             try:
                 registry_info = REGISTRY.get(stage_name)
-                cache_dir = project.get_cache_dir()
-                stages_dir = lock.get_stages_dir(cache_dir)
+                state_dir = config.get_state_dir()
+                stages_dir = lock.get_stages_dir(state_dir)
                 lock_data = lock.StageLock(stage_name, stages_dir).read()
                 output_snapshot = diff_panels.compute_output_changes(lock_data, registry_info)
             except Exception:

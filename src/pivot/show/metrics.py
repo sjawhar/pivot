@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any, TypedDict, cast
 import flatten_dict
 import yaml
 
-from pivot import git, outputs, project, yaml_config
+from pivot import config, git, outputs, project, yaml_config
 from pivot.show import common
 from pivot.types import ChangeType, MetricData, MetricValue, OutputFormat
 
@@ -337,8 +337,7 @@ def collect_metrics_from_head(
 
     Returns {path: {key: value}} for files found.
     """
-    proj_root = project.get_project_root()
-    cache_dir = proj_root / ".pivot" / "cache" / "files"
+    cache_dir = config.get_cache_dir() / "files"
     result = dict[str, MetricData]()
 
     # Collect paths that need git fallback

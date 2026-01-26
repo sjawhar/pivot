@@ -7,12 +7,12 @@ from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from typing import TYPE_CHECKING
 
 from pivot import (
+    config,
     dag,
     exceptions,
     explain,
     metrics,
     parameters,
-    project,
     registry,
 )
 from pivot.remote import config as remote_config
@@ -40,7 +40,6 @@ logger = logging.getLogger(__name__)
 def get_pipeline_status(
     stages: list[str] | None,
     single_stage: bool,
-    cache_dir: pathlib.Path | None,
 ) -> tuple[list[PipelineStatusInfo], DiGraph[str]]:
     """Get status for all stages, tracking upstream staleness."""
     with metrics.timed("status.get_pipeline_status"):
@@ -50,7 +49,7 @@ def get_pipeline_status(
         if not execution_order:
             return [], graph
 
-        resolved_cache_dir = cache_dir or project.get_project_root() / ".pivot" / "cache"
+        state_dir = config.get_state_dir()
         overrides = parameters.load_params_yaml()
 
         # Compute explanations in parallel (I/O-bound: lock file reads, hashing)
@@ -69,7 +68,7 @@ def get_pipeline_status(
                     stage_info["deps_paths"],
                     stage_info["params"],
                     overrides,
-                    resolved_cache_dir,
+                    state_dir,
                 )
                 futures[future] = stage_name
 
@@ -191,7 +190,7 @@ def get_remote_status(
     if not local_hashes:
         return RemoteSyncInfo(name=resolved_name, url=url, push_count=0, pull_count=0)
 
-    with state_mod.StateDB(cache_dir) as state_db:
+    with state_mod.StateDB(config.get_state_dir() / "state.db") as state_db:
         status = asyncio.run(
             transfer.compare_status(local_hashes, s3_remote, state_db, resolved_name)
         )

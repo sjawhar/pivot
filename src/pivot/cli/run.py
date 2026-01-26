@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, TypedDict
 
 import click
 
-from pivot import discovery, executor, registry
+from pivot import config, discovery, executor, registry
 from pivot.cli import completion
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
@@ -85,11 +85,10 @@ def _validate_stages(stages_list: list[str] | None, single_stage: bool) -> None:
 def _get_all_explanations(
     stages_list: list[str] | None,
     single_stage: bool,
-    cache_dir: pathlib.Path | None,
     force: bool = False,
 ) -> list[StageExplanation]:
     """Get explanations for all stages in execution order."""
-    from pivot import dag, explain, parameters, project
+    from pivot import dag, explain, parameters
 
     graph = registry.REGISTRY.build_dag(validate=True)
     execution_order = dag.get_execution_order(graph, stages_list, single_stage=single_stage)
@@ -97,7 +96,7 @@ def _get_all_explanations(
     if not execution_order:
         return []
 
-    resolved_cache_dir = cache_dir or project.get_project_root() / ".pivot" / "cache"
+    state_dir = config.get_state_dir()
     overrides = parameters.load_params_yaml()
 
     explanations = list[StageExplanation]()
@@ -109,7 +108,7 @@ def _get_all_explanations(
             stage_info["deps_paths"],
             stage_info["params"],
             overrides,
-            resolved_cache_dir,
+            state_dir,
             force=force,
         )
         explanations.append(explanation)
@@ -132,7 +131,7 @@ def _run_with_tui(
     """Run pipeline with TUI display."""
     import queue as thread_queue
 
-    from pivot import dag, project
+    from pivot import dag
     from pivot.tui import run as run_tui
     from pivot.types import TuiMessage
 
@@ -143,7 +142,7 @@ def _run_with_tui(
     if not execution_order:
         return {}
 
-    resolved_cache_dir = cache_dir or project.get_project_root() / ".pivot" / "cache"
+    resolved_cache_dir = cache_dir or config.get_cache_dir()
 
     # Pre-warm loky executor before starting Textual TUI.
     # Textual manipulates terminal file descriptors which breaks loky's
@@ -269,7 +268,7 @@ def _run_watch_with_tui(
 @click.option(
     "--debounce",
     type=click.IntRange(min=0),
-    default=300,
+    default=None,
     help="Debounce delay in milliseconds (for --watch mode)",
 )
 @click.option(
@@ -325,7 +324,7 @@ def run(
     explain: bool,
     force: bool,
     watch: bool,
-    debounce: int,
+    debounce: int | None,
     display: str | None,  # Click passes string, converted to DisplayMode below
     as_json: bool,
     tui_log: pathlib.Path | None,
@@ -346,6 +345,7 @@ def run(
     cli_ctx = cli_helpers.get_cli_context(ctx)
     quiet = cli_ctx["quiet"]
     show_human_output = not as_json and not quiet
+    debounce = debounce if debounce is not None else config.get_watch_debounce()
 
     stages_list = cli_helpers.stages_to_list(stages)
     _validate_stages(stages_list, single_stage)
@@ -378,7 +378,6 @@ def run(
                 explain_cmd,
                 stages=stages,
                 single_stage=single_stage,
-                cache_dir=cache_dir,
                 force=force,
             )
         else:
@@ -387,7 +386,6 @@ def run(
                 dry_run_cmd,
                 stages=stages,
                 single_stage=single_stage,
-                cache_dir=cache_dir,
                 force=force,
                 as_json=as_json,
             )
@@ -548,7 +546,6 @@ class DryRunJsonOutput(TypedDict):
     is_flag=True,
     help="Run only the specified stages (in provided order), not their dependencies",
 )
-@click.option("--cache-dir", type=click.Path(path_type=pathlib.Path), help="Cache directory")
 @click.option(
     "--force",
     "-f",
@@ -559,7 +556,6 @@ class DryRunJsonOutput(TypedDict):
 def dry_run_cmd(
     stages: tuple[str, ...],
     single_stage: bool,
-    cache_dir: pathlib.Path | None,
     force: bool,
     as_json: bool,
 ) -> None:
@@ -567,7 +563,7 @@ def dry_run_cmd(
     stages_list = cli_helpers.stages_to_list(stages)
     _validate_stages(stages_list, single_stage)
 
-    explanations = _get_all_explanations(stages_list, single_stage, cache_dir, force=force)
+    explanations = _get_all_explanations(stages_list, single_stage, force=force)
 
     if not explanations:
         if as_json:
@@ -603,23 +599,20 @@ def dry_run_cmd(
     is_flag=True,
     help="Run only the specified stages (in provided order), not their dependencies",
 )
-@click.option("--cache-dir", type=click.Path(path_type=pathlib.Path), help="Cache directory")
 @click.option(
     "--force",
     "-f",
     is_flag=True,
     help="Show explanation as if forced",
 )
-def explain_cmd(
-    stages: tuple[str, ...], single_stage: bool, cache_dir: pathlib.Path | None, force: bool
-) -> None:
+def explain_cmd(stages: tuple[str, ...], single_stage: bool, force: bool) -> None:
     """Show detailed breakdown of why stages would run."""
     from pivot.tui import console
 
     stages_list = cli_helpers.stages_to_list(stages)
     _validate_stages(stages_list, single_stage)
 
-    explanations = _get_all_explanations(stages_list, single_stage, cache_dir, force=force)
+    explanations = _get_all_explanations(stages_list, single_stage, force=force)
 
     if not explanations:
         click.echo("No stages to run")

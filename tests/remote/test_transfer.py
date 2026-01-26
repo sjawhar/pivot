@@ -103,9 +103,9 @@ def lock_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 def test_get_stage_output_hashes_no_lock(lock_project: Path) -> None:
     """Missing lock file returns empty set with warning."""
-    cache_dir = lock_project / ".pivot" / "cache"
+    state_dir = lock_project / ".pivot"
 
-    result = transfer.get_stage_output_hashes(cache_dir, ["nonexistent"])
+    result = transfer.get_stage_output_hashes(state_dir, ["nonexistent"])
     assert result == set()
 
 
@@ -113,14 +113,14 @@ def test_get_stage_output_hashes_file_output(
     lock_project: Path, make_valid_lock_content: ValidLockContentFactory
 ) -> None:
     """Extracts hash from file output in lock file."""
-    cache_dir = lock_project / ".pivot" / "cache"
+    state_dir = lock_project / ".pivot"
 
     lock_data = make_valid_lock_content(outs=[{"path": "output.csv", "hash": "abc123def45678"}])
     lock_path = lock_project / ".pivot" / "stages" / "my_stage.lock"
     with lock_path.open("w") as f:
         yaml.dump(lock_data, f)
 
-    result = transfer.get_stage_output_hashes(cache_dir, ["my_stage"])
+    result = transfer.get_stage_output_hashes(state_dir, ["my_stage"])
     assert result == {"abc123def45678"}
 
 
@@ -128,7 +128,7 @@ def test_get_stage_output_hashes_directory_output(
     lock_project: Path, make_valid_lock_content: ValidLockContentFactory
 ) -> None:
     """Extracts all hashes from directory output including manifest."""
-    cache_dir = lock_project / ".pivot" / "cache"
+    state_dir = lock_project / ".pivot"
 
     lock_data = make_valid_lock_content(
         outs=[
@@ -156,7 +156,7 @@ def test_get_stage_output_hashes_directory_output(
     with lock_path.open("w") as f:
         yaml.dump(lock_data, f)
 
-    result = transfer.get_stage_output_hashes(cache_dir, ["my_stage"])
+    result = transfer.get_stage_output_hashes(state_dir, ["my_stage"])
     assert result == {"treehash1234567", "filehash1234567", "filehash2345678"}
 
 
@@ -164,7 +164,7 @@ def test_get_stage_output_hashes_multiple_stages(
     lock_project: Path, make_valid_lock_content: ValidLockContentFactory
 ) -> None:
     """Collects hashes from multiple stages."""
-    cache_dir = lock_project / ".pivot" / "cache"
+    state_dir = lock_project / ".pivot"
 
     for i, stage in enumerate(["stage_a", "stage_b"]):
         lock_data = make_valid_lock_content(
@@ -174,7 +174,7 @@ def test_get_stage_output_hashes_multiple_stages(
         with lock_path.open("w") as f:
             yaml.dump(lock_data, f)
 
-    result = transfer.get_stage_output_hashes(cache_dir, ["stage_a", "stage_b"])
+    result = transfer.get_stage_output_hashes(state_dir, ["stage_a", "stage_b"])
     assert "hash0" + "0" * 11 in result
     assert "hash1" + "0" * 11 in result
 
@@ -183,7 +183,7 @@ def test_get_stage_output_hashes_skips_uncached(
     lock_project: Path, make_valid_lock_content: ValidLockContentFactory
 ) -> None:
     """Skips outputs with null hash (uncached)."""
-    cache_dir = lock_project / ".pivot" / "cache"
+    state_dir = lock_project / ".pivot"
 
     lock_data = make_valid_lock_content(
         outs=[
@@ -195,7 +195,7 @@ def test_get_stage_output_hashes_skips_uncached(
     with lock_path.open("w") as f:
         yaml.dump(lock_data, f)
 
-    result = transfer.get_stage_output_hashes(cache_dir, ["my_stage"])
+    result = transfer.get_stage_output_hashes(state_dir, ["my_stage"])
     assert result == {"abc123def45678"}
 
 
@@ -208,7 +208,7 @@ def test_get_stage_dep_hashes(
     lock_project: Path, make_valid_lock_content: ValidLockContentFactory
 ) -> None:
     """Extracts dependency hashes from lock file."""
-    cache_dir = lock_project / ".pivot" / "cache"
+    state_dir = lock_project / ".pivot"
 
     lock_data = make_valid_lock_content(
         deps=[
@@ -220,7 +220,7 @@ def test_get_stage_dep_hashes(
     with lock_path.open("w") as f:
         yaml.dump(lock_data, f)
 
-    result = transfer.get_stage_dep_hashes(cache_dir, ["my_stage"])
+    result = transfer.get_stage_dep_hashes(state_dir, ["my_stage"])
     assert result == {"dep1hash1234567", "dep2hash1234567"}
 
 
@@ -228,7 +228,7 @@ def test_get_stage_dep_hashes_with_manifest(
     lock_project: Path, make_valid_lock_content: ValidLockContentFactory
 ) -> None:
     """Extracts all hashes from directory dependency including manifest."""
-    cache_dir = lock_project / ".pivot" / "cache"
+    state_dir = lock_project / ".pivot"
 
     lock_data = make_valid_lock_content(
         deps=[
@@ -246,15 +246,15 @@ def test_get_stage_dep_hashes_with_manifest(
     with lock_path.open("w") as f:
         yaml.dump(lock_data, f)
 
-    result = transfer.get_stage_dep_hashes(cache_dir, ["my_stage"])
+    result = transfer.get_stage_dep_hashes(state_dir, ["my_stage"])
     assert result == {"dirtreehash1234", "afilehash123456", "bfilehash123456"}
 
 
 def test_get_stage_dep_hashes_no_lock(lock_project: Path) -> None:
     """Missing lock file skips silently."""
-    cache_dir = lock_project / ".pivot" / "cache"
+    state_dir = lock_project / ".pivot"
 
-    result = transfer.get_stage_dep_hashes(cache_dir, ["nonexistent"])
+    result = transfer.get_stage_dep_hashes(state_dir, ["nonexistent"])
     assert result == set()
 
 
@@ -319,10 +319,11 @@ async def test_push_async_no_local_hashes(lock_project: Path, mocker: MockerFixt
     """Push with no local hashes returns zero summary."""
 
     cache_dir = lock_project / ".pivot" / "cache"
+    state_dir = lock_project / ".pivot"
     mock_remote = mocker.Mock(spec=S3Remote)
     mock_state = mocker.Mock(spec=state_mod.StateDB)
 
-    result = await transfer._push_async(cache_dir, mock_remote, mock_state, "origin")
+    result = await transfer._push_async(cache_dir, state_dir, mock_remote, mock_state, "origin")
 
     assert result["transferred"] == 0
     assert result["skipped"] == 0
@@ -333,6 +334,7 @@ async def test_push_async_all_already_on_remote(lock_project: Path, mocker: Mock
     """Push when all files on remote returns skipped count."""
 
     cache_dir = lock_project / ".pivot" / "cache"
+    state_dir = lock_project / ".pivot"
     files_dir = cache_dir / "files"
 
     hash1 = "ab" + "c" * 14
@@ -343,7 +345,7 @@ async def test_push_async_all_already_on_remote(lock_project: Path, mocker: Mock
     mock_state = mocker.Mock(spec=state_mod.StateDB)
     mock_state.remote_hashes_intersection.return_value = {hash1}
 
-    result = await transfer._push_async(cache_dir, mock_remote, mock_state, "origin")
+    result = await transfer._push_async(cache_dir, state_dir, mock_remote, mock_state, "origin")
 
     assert result["transferred"] == 0
     assert result["skipped"] == 1
@@ -354,6 +356,7 @@ async def test_push_async_uploads_missing(lock_project: Path, mocker: MockerFixt
     """Push uploads files not on remote."""
 
     cache_dir = lock_project / ".pivot" / "cache"
+    state_dir = lock_project / ".pivot"
     files_dir = cache_dir / "files"
 
     hash1 = "ab" + "c" * 14
@@ -368,7 +371,7 @@ async def test_push_async_uploads_missing(lock_project: Path, mocker: MockerFixt
         return_value=[TransferResult(hash=hash1, success=True)]
     )
 
-    result = await transfer._push_async(cache_dir, mock_remote, mock_state, "origin")
+    result = await transfer._push_async(cache_dir, state_dir, mock_remote, mock_state, "origin")
 
     assert result["transferred"] == 1
     assert result["skipped"] == 0
@@ -380,6 +383,7 @@ async def test_push_async_handles_failures(lock_project: Path, mocker: MockerFix
     """Push reports failures in summary."""
 
     cache_dir = lock_project / ".pivot" / "cache"
+    state_dir = lock_project / ".pivot"
     files_dir = cache_dir / "files"
 
     hash1 = "ab" + "c" * 14
@@ -394,7 +398,7 @@ async def test_push_async_handles_failures(lock_project: Path, mocker: MockerFix
         return_value=[TransferResult(hash=hash1, success=False, error="Upload failed")]
     )
 
-    result = await transfer._push_async(cache_dir, mock_remote, mock_state, "origin")
+    result = await transfer._push_async(cache_dir, state_dir, mock_remote, mock_state, "origin")
 
     assert result["transferred"] == 0
     assert result["failed"] == 1
@@ -407,6 +411,7 @@ async def test_push_async_with_stages(
     """Push with specific stages only pushes those stage outputs."""
 
     cache_dir = lock_project / ".pivot" / "cache"
+    state_dir = lock_project / ".pivot"
     files_dir = cache_dir / "files"
 
     hash1 = "ab" + "c" * 14
@@ -428,7 +433,7 @@ async def test_push_async_with_stages(
     )
 
     result = await transfer._push_async(
-        cache_dir, mock_remote, mock_state, "origin", targets=["my_stage"]
+        cache_dir, state_dir, mock_remote, mock_state, "origin", targets=["my_stage"]
     )
 
     assert result["transferred"] == 1
@@ -443,11 +448,12 @@ async def test_pull_async_no_needed_hashes(lock_project: Path, mocker: MockerFix
     """Pull with no needed hashes returns zero summary."""
 
     cache_dir = lock_project / ".pivot" / "cache"
+    state_dir = lock_project / ".pivot"
     mock_remote = mocker.Mock(spec=S3Remote)
     mock_state = mocker.Mock(spec=state_mod.StateDB)
 
     result = await transfer._pull_async(
-        cache_dir, mock_remote, mock_state, "origin", targets=["nonexistent"]
+        cache_dir, state_dir, mock_remote, mock_state, "origin", targets=["nonexistent"]
     )
 
     assert result["transferred"] == 0
@@ -461,6 +467,7 @@ async def test_pull_async_all_already_local(
     """Pull when all files local returns skipped count."""
 
     cache_dir = lock_project / ".pivot" / "cache"
+    state_dir = lock_project / ".pivot"
     files_dir = cache_dir / "files"
 
     hash1 = "ab" + "c" * 14
@@ -477,7 +484,7 @@ async def test_pull_async_all_already_local(
     mock_state = mocker.Mock(spec=state_mod.StateDB)
 
     result = await transfer._pull_async(
-        cache_dir, mock_remote, mock_state, "origin", targets=["my_stage"]
+        cache_dir, state_dir, mock_remote, mock_state, "origin", targets=["my_stage"]
     )
 
     assert result["transferred"] == 0
@@ -491,6 +498,7 @@ async def test_pull_async_downloads_missing(
     """Pull downloads files not in local cache."""
 
     cache_dir = lock_project / ".pivot" / "cache"
+    state_dir = lock_project / ".pivot"
 
     hash1 = "ab" + "c" * 14
     lock_data = make_valid_lock_content(outs=[{"path": "out.csv", "hash": hash1}])
@@ -506,7 +514,7 @@ async def test_pull_async_downloads_missing(
     )
 
     result = await transfer._pull_async(
-        cache_dir, mock_remote, mock_state, "origin", targets=["my_stage"]
+        cache_dir, state_dir, mock_remote, mock_state, "origin", targets=["my_stage"]
     )
 
     assert result["transferred"] == 1
@@ -521,6 +529,7 @@ async def test_pull_async_without_stages_lists_remote(
     """Pull without stages lists all hashes from remote."""
 
     cache_dir = lock_project / ".pivot" / "cache"
+    state_dir = lock_project / ".pivot"
     (cache_dir / "files").mkdir(parents=True)
 
     hash1 = "ab" + "c" * 14
@@ -531,7 +540,9 @@ async def test_pull_async_without_stages_lists_remote(
         return_value=[TransferResult(hash=hash1, success=True)]
     )
 
-    result = await transfer._pull_async(cache_dir, mock_remote, mock_state, "origin", targets=None)
+    result = await transfer._pull_async(
+        cache_dir, state_dir, mock_remote, mock_state, "origin", targets=None
+    )
 
     assert result["transferred"] == 1
     mock_remote.list_hashes.assert_called_once()
@@ -543,6 +554,7 @@ async def test_pull_async_handles_failures(
     """Pull reports failures in summary."""
 
     cache_dir = lock_project / ".pivot" / "cache"
+    state_dir = lock_project / ".pivot"
 
     hash1 = "ab" + "c" * 14
     lock_data = make_valid_lock_content(outs=[{"path": "out.csv", "hash": hash1}])
@@ -558,7 +570,7 @@ async def test_pull_async_handles_failures(
     )
 
     result = await transfer._pull_async(
-        cache_dir, mock_remote, mock_state, "origin", targets=["my_stage"]
+        cache_dir, state_dir, mock_remote, mock_state, "origin", targets=["my_stage"]
     )
 
     assert result["transferred"] == 0
@@ -572,6 +584,7 @@ async def test_pull_async_includes_deps(
     """Pull includes dependency hashes when stages specified."""
 
     cache_dir = lock_project / ".pivot" / "cache"
+    state_dir = lock_project / ".pivot"
 
     out_hash = "ab" + "c" * 14
     dep_hash = "de" + "f" * 14
@@ -594,7 +607,7 @@ async def test_pull_async_includes_deps(
     )
 
     result = await transfer._pull_async(
-        cache_dir, mock_remote, mock_state, "origin", targets=["my_stage"]
+        cache_dir, state_dir, mock_remote, mock_state, "origin", targets=["my_stage"]
     )
 
     assert result["transferred"] == 2
@@ -603,12 +616,6 @@ async def test_pull_async_includes_deps(
 # -----------------------------------------------------------------------------
 # Utility Function Tests
 # -----------------------------------------------------------------------------
-
-
-def test_get_default_cache_dir(lock_project: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Returns cache dir relative to project root."""
-    result = transfer.get_default_cache_dir()
-    assert result == lock_project / ".pivot" / "cache"
 
 
 def test_create_remote_from_name(lock_project: Path, mocker: MockerFixture) -> None:

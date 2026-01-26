@@ -59,6 +59,8 @@ class WorkerStageInfo(TypedDict):
     dep_specs: dict[str, stage_def.FuncDepSpec]
     out_specs: dict[str, outputs.Out[Any]]
     params_arg_name: str | None
+    project_root: pathlib.Path
+    state_dir: pathlib.Path
 
 
 def _make_result(
@@ -93,9 +95,8 @@ def execute_stage(
     metrics.clear()
     output_lines: list[tuple[str, bool]] = []
     files_cache_dir = cache_dir / "files"
-    state_db_path = cache_dir.parent / "state.db"
-    # cache_dir is .pivot/cache, project_root is two levels up
-    project_root = cache_dir.parent.parent
+    state_db_path = stage_info["state_dir"] / "state.db"
+    project_root = stage_info["project_root"]
 
     # Ensure worker has correct cwd for this stage (workers in reusable pool
     # may have stale cwd from previous execution in different project)
@@ -114,7 +115,7 @@ def execute_stage(
         checkout_modes = stage_info["checkout_modes"]
 
         # Production lock for skip detection, pending lock for --no-commit mode
-        production_lock = lock.StageLock(stage_name, lock.get_stages_dir(cache_dir))
+        production_lock = lock.StageLock(stage_name, lock.get_stages_dir(stage_info["state_dir"]))
         pending_lock = lock.get_pending_lock(stage_name, project_root)
         current_fingerprint = stage_info["fingerprint"]
         stage_outs = stage_info["outs"]

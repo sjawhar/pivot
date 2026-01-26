@@ -39,14 +39,13 @@ _PENDING_DIR = "pending"
 STAGES_REL_PATH = ".pivot/stages"
 
 
-def get_stages_dir(cache_dir: Path) -> Path:
+def get_stages_dir(state_dir: Path) -> Path:
     """Return the stages directory for lock files.
 
     Lock files are stored in .pivot/stages/ (git-tracked) rather than
     .pivot/cache/stages/ so they can be versioned for reproducibility.
     """
-    # cache_dir is .pivot/cache, so parent is .pivot
-    return cache_dir.parent / "stages"
+    return state_dir / "stages"
 
 
 def get_pending_stages_dir(project_root: Path) -> Path:

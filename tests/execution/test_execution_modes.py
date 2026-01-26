@@ -79,6 +79,8 @@ def _make_stage_info(
         dep_specs={},
         out_specs={},
         params_arg_name=None,
+        project_root=tmp_path,
+        state_dir=tmp_path / ".pivot",
     )
 
 
@@ -115,7 +117,7 @@ def test_no_commit_writes_to_pending_lock(
     assert pending_data is not None
 
     # Production lock should NOT exist
-    production_lock = lock.StageLock("test_stage", lock.get_stages_dir(worker_env))
+    production_lock = lock.StageLock("test_stage", lock.get_stages_dir(tmp_path / ".pivot"))
     assert not production_lock.path.exists(), "Production lock should NOT be written"
 
 
@@ -224,7 +226,7 @@ def test_commit_pending_promotes_to_production(
 
     # Pending lock exists, production doesn't
     pending_lock = lock.get_pending_lock("test_stage", tmp_path)
-    production_lock = lock.StageLock("test_stage", lock.get_stages_dir(worker_env))
+    production_lock = lock.StageLock("test_stage", lock.get_stages_dir(tmp_path / ".pivot"))
     assert pending_lock.path.exists()
     assert not production_lock.path.exists()
 
@@ -270,7 +272,7 @@ def test_discard_pending_removes_pending_locks(
     assert not pending_lock.path.exists()
 
     # Production lock should NOT exist (we discarded, didn't commit)
-    production_lock = lock.StageLock("test_stage", lock.get_stages_dir(worker_env))
+    production_lock = lock.StageLock("test_stage", lock.get_stages_dir(tmp_path / ".pivot"))
     assert not production_lock.path.exists()
 
 
@@ -507,7 +509,7 @@ def test_no_cache_writes_lock_with_null_hashes(
     assert result["status"] == StageStatus.RAN
 
     # Production lock should exist with null hashes
-    production_lock = lock.StageLock("test_stage", lock.get_stages_dir(worker_env))
+    production_lock = lock.StageLock("test_stage", lock.get_stages_dir(tmp_path / ".pivot"))
     assert production_lock.path.exists(), "Production lock should be written"
     lock_data = production_lock.read()
     assert lock_data is not None
@@ -598,7 +600,7 @@ def test_no_cache_with_no_commit(
     assert pending_lock.path.exists(), "Pending lock should be written"
 
     # Production lock should NOT exist
-    production_lock = lock.StageLock("test_stage", lock.get_stages_dir(worker_env))
+    production_lock = lock.StageLock("test_stage", lock.get_stages_dir(tmp_path / ".pivot"))
     assert not production_lock.path.exists(), "Production lock should NOT be written"
 
     # Cache should be empty (because no_cache=True)
@@ -653,7 +655,7 @@ def test_run_cache_restores_directory_output(
     assert (output_dir / "file2.txt").read_text() == "content2"
 
     # Delete the lock file so run cache is used instead of lock-based skip
-    production_lock = lock.StageLock("test_stage", lock.get_stages_dir(worker_env))
+    production_lock = lock.StageLock("test_stage", lock.get_stages_dir(tmp_path / ".pivot"))
     production_lock.path.unlink()
 
     # Delete the directory output
@@ -726,7 +728,7 @@ def test_run_cache_reruns_when_noncached_output_missing(
     assert metric_file.exists()
 
     # Delete the lock file so run cache is used instead of lock-based skip
-    production_lock = lock.StageLock("test_stage", lock.get_stages_dir(worker_env))
+    production_lock = lock.StageLock("test_stage", lock.get_stages_dir(tmp_path / ".pivot"))
     production_lock.path.unlink()
 
     # Delete the metric file (non-cached output)

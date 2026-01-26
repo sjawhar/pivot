@@ -15,6 +15,7 @@ import click.testing
 import pytest
 
 from pivot import project
+from pivot.config import io as config_io
 from pivot.executor import core as executor_core
 from pivot.registry import REGISTRY
 from pivot.tui import console
@@ -63,10 +64,11 @@ def reset_pivot_state(mocker: MockerFixture) -> Generator[None]:
     """Reset global pivot state between tests.
 
     CliRunner can leave console singleton pointing to closed streams,
-    and project root cache pointing to old directories.
+    project root cache pointing to old directories, and merged config cached.
     """
     mocker.patch.object(console, "_console", None)
     mocker.patch.object(project, "_project_root_cache", None)
+    config_io.clear_config_cache()
     for name in _PIVOT_LOGGERS:
         logging.getLogger(name).handlers.clear()
     yield

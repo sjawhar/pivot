@@ -163,8 +163,8 @@ def test_get_plot_hashes_from_lock_with_hash(set_project_root: Path) -> None:
     _register_plot_stage("test_stage", str(plot_file))
 
     # Create lock file with hash
-    cache_dir = set_project_root / ".pivot" / "cache"
-    stages_dir = lock.get_stages_dir(cache_dir)
+    state_dir = set_project_root / ".pivot"
+    stages_dir = lock.get_stages_dir(state_dir)
     stages_dir.mkdir(parents=True, exist_ok=True)
     stage_lock = lock.StageLock("test_stage", stages_dir)
     stage_lock.write(
@@ -191,8 +191,8 @@ def test_get_plot_hashes_from_lock_with_none_hash(set_project_root: Path) -> Non
     _register_plot_stage("test_stage", str(plot_file))
 
     # Create lock file with None hash (uncached output)
-    cache_dir = set_project_root / ".pivot" / "cache"
-    stages_dir = lock.get_stages_dir(cache_dir)
+    state_dir = set_project_root / ".pivot"
+    stages_dir = lock.get_stages_dir(state_dir)
     stages_dir.mkdir(parents=True, exist_ok=True)
     stage_lock = lock.StageLock("test_stage", stages_dir)
     stage_lock.write(
@@ -259,8 +259,8 @@ def test_get_plot_hashes_from_head_returns_committed_hash(
     _register_plot_stage("test_stage", str(plot_file))
 
     # Create and commit lock file with hash
-    cache_dir = set_project_root / ".pivot" / "cache"
-    stages_dir = lock.get_stages_dir(cache_dir)
+    state_dir = set_project_root / ".pivot"
+    stages_dir = lock.get_stages_dir(state_dir)
     stages_dir.mkdir(parents=True, exist_ok=True)
     stage_lock = lock.StageLock("test_stage", stages_dir)
     stage_lock.write(
@@ -298,8 +298,8 @@ def test_get_plot_hashes_from_head_ignores_uncommitted_changes(
     _register_plot_stage("test_stage", str(plot_file))
 
     # Create and commit lock file with original hash
-    cache_dir = set_project_root / ".pivot" / "cache"
-    stages_dir = lock.get_stages_dir(cache_dir)
+    state_dir = set_project_root / ".pivot"
+    stages_dir = lock.get_stages_dir(state_dir)
     stages_dir.mkdir(parents=True, exist_ok=True)
     stage_lock = lock.StageLock("test_stage", stages_dir)
     stage_lock.write(

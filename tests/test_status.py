@@ -61,7 +61,7 @@ def test_pipeline_status_all_cached(tmp_path: pathlib.Path, mocker: MockerFixtur
     os.chdir(tmp_path)
     try:
         executor.run(show_output=False)
-        results, _ = status.get_pipeline_status(None, single_stage=False, cache_dir=None)
+        results, _ = status.get_pipeline_status(None, single_stage=False)
     finally:
         os.chdir(old_cwd)
 
@@ -79,7 +79,7 @@ def test_pipeline_status_some_stale(tmp_path: pathlib.Path, mocker: MockerFixtur
 
     register_test_stage(_helper_stage_a, name="stage_a")
 
-    results, _ = status.get_pipeline_status(None, single_stage=False, cache_dir=None)
+    results, _ = status.get_pipeline_status(None, single_stage=False)
 
     assert len(results) == 1
     assert results[0]["name"] == "stage_a"
@@ -96,7 +96,7 @@ def test_pipeline_status_upstream_stale(tmp_path: pathlib.Path, mocker: MockerFi
     register_test_stage(_helper_stage_a, name="stage_a")
     register_test_stage(_helper_stage_b, name="stage_b")
 
-    results, _ = status.get_pipeline_status(None, single_stage=False, cache_dir=None)
+    results, _ = status.get_pipeline_status(None, single_stage=False)
 
     assert len(results) == 2
 
@@ -119,7 +119,7 @@ def test_pipeline_status_specific_stages(tmp_path: pathlib.Path, mocker: MockerF
     register_test_stage(_helper_stage_a, name="stage_a")
     register_test_stage(_helper_stage_b, name="stage_b")
 
-    results, _ = status.get_pipeline_status(["stage_a"], single_stage=False, cache_dir=None)
+    results, _ = status.get_pipeline_status(["stage_a"], single_stage=False)
 
     assert len(results) == 1
     assert results[0]["name"] == "stage_a"

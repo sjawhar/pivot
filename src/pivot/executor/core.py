@@ -59,8 +59,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_MAX_WORKERS_DEFAULT = 8
-
 # Special mutex that means "run exclusively" - no other stages run concurrently
 EXCLUSIVE_MUTEX = "*"
 
@@ -71,10 +69,27 @@ def _noop() -> None:
 
 
 def _compute_max_workers(stage_count: int, override: int | None = None) -> int:
-    """Single source of truth for max_workers calculation."""
-    if override is not None:
-        return max(1, min(override, stage_count))
-    return max(1, min(loky.cpu_count() or 1, _MAX_WORKERS_DEFAULT, stage_count))
+    """Single source of truth for max_workers calculation.
+
+    Args:
+        stage_count: Number of stages to run
+        override: CLI override for max_workers (takes precedence over config)
+
+    The effective max_workers is determined by:
+    1. CLI override (if provided)
+    2. Config value (core.max_workers)
+
+    Negative values mean "cpu_count + value" (e.g., -2 means cpu_count - 2).
+    The result is always clamped to [1, stage_count].
+    """
+    cpu_count = loky.cpu_count() or 1
+    max_workers = override if override is not None else config.get_max_workers()
+
+    # Negative values are relative to CPU count
+    if max_workers < 0:
+        max_workers = cpu_count + max_workers
+
+    return max(1, min(max_workers, stage_count))
 
 
 def _warm_workers(pool: loky.ProcessPoolExecutor, count: int) -> None:
@@ -363,7 +378,7 @@ def run(
         Dict of stage_name -> {status: "ran"|"skipped"|"failed", reason: str}
     """
     if cache_dir is None:
-        cache_dir = project.get_project_root() / ".pivot" / "cache"
+        cache_dir = config.get_cache_dir()
 
     if isinstance(on_error, OnError):
         error_mode = on_error
@@ -405,7 +420,7 @@ def run(
 
     # Check for uncached IncrementalOut files that would be lost
     if not allow_uncached_incremental:
-        uncached = _check_uncached_incremental_outputs(execution_order, cache_dir)
+        uncached = _check_uncached_incremental_outputs(execution_order)
         if uncached:
             files_list = "\n".join(f"  - {stage}: {path}" for stage, path in uncached)
             raise exceptions.UncachedIncrementalOutputError(
@@ -455,7 +470,6 @@ def run(
         _write_run_history(
             run_id=run_id,
             stage_states=stage_states,
-            cache_dir=cache_dir,
             targeted_stages=targeted_stages,
             execution_order=execution_order,
             started_at=started_at,
@@ -531,8 +545,8 @@ def _verify_tracked_files(project_root: pathlib.Path, checkout_missing: bool = F
 
     with metrics.timed("core.verify_tracked_files"):
         missing = list[str]()
-        state_db_path = project_root / ".pivot" / "state.db"
-        cache_dir = project_root / ".pivot" / "cache" / "files"
+        state_db_path = config.get_state_dir() / "state.db"
+        cache_dir = config.get_cache_dir() / "files"
 
         with state_mod.StateDB(state_db_path) as state_db:
             for data_path, track_data in tracked_files.items():
@@ -642,7 +656,9 @@ def _execute_greedy(
     # Type narrowing: output_queue is guaranteed to be non-None after the block above
     assert output_queue is not None
 
-    state_db_path = cache_dir.parent / "state.db"
+    state_dir = config.get_state_dir()
+    state_db_path = state_dir / "state.db"
+    proj_root = project.get_project_root()
     output_thread: threading.Thread | None = None
 
     try:
@@ -665,6 +681,8 @@ def _execute_greedy(
                 mutex_counts=mutex_counts,
                 overrides=overrides,
                 lifecycle=lifecycle,
+                project_root=proj_root,
+                state_dir=state_dir,
                 checkout_modes=checkout_modes,
                 force=force,
                 no_commit=no_commit,
@@ -807,6 +825,8 @@ def _execute_greedy(
                         mutex_counts=mutex_counts,
                         overrides=overrides,
                         lifecycle=lifecycle,
+                        project_root=proj_root,
+                        state_dir=state_dir,
                         checkout_modes=checkout_modes,
                         force=force,
                         no_commit=no_commit,
@@ -875,6 +895,8 @@ def _start_ready_stages(
     mutex_counts: collections.defaultdict[str, int],
     overrides: parameters.ParamsOverrides,
     lifecycle: StageLifecycle,
+    project_root: pathlib.Path,
+    state_dir: pathlib.Path,
     checkout_modes: list[cache.CheckoutMode] | None = None,
     force: bool = False,
     no_commit: bool = False,
@@ -915,7 +937,7 @@ def _start_ready_stages(
 
         # Show explanation before starting if in explain mode
         if lifecycle.explain_mode and lifecycle.console:
-            explanation = _get_stage_explanation(state.info, cache_dir, overrides)
+            explanation = _get_stage_explanation(state.info, state_dir, overrides)
             lifecycle.console.explain_stage(explanation)
 
         # Acquire mutex locks before changing status
@@ -923,7 +945,15 @@ def _start_ready_stages(
             mutex_counts[mutex] += 1
 
         worker_info = _prepare_worker_info(
-            state.info, overrides, checkout_modes, lifecycle.run_id, force, no_commit, no_cache
+            state.info,
+            overrides,
+            checkout_modes,
+            lifecycle.run_id,
+            force,
+            no_commit,
+            no_cache,
+            project_root,
+            state_dir,
         )
 
         try:
@@ -954,6 +984,8 @@ def _prepare_worker_info(
     force: bool,
     no_commit: bool,
     no_cache: bool,
+    project_root: pathlib.Path,
+    state_dir: pathlib.Path,
 ) -> worker.WorkerStageInfo:
     """Prepare stage info for pickling to worker process."""
     return worker.WorkerStageInfo(
@@ -973,6 +1005,8 @@ def _prepare_worker_info(
         dep_specs=stage_info["dep_specs"],
         out_specs=stage_info["out_specs"],
         params_arg_name=stage_info["params_arg_name"],
+        project_root=project_root,
+        state_dir=state_dir,
     )
 
 
@@ -1074,7 +1108,7 @@ def _build_results(stage_states: dict[str, StageState]) -> dict[str, ExecutionSu
 
 def _get_stage_explanation(
     stage_info: registry.RegistryStageInfo,
-    cache_dir: pathlib.Path,
+    state_dir: pathlib.Path,
     overrides: parameters.ParamsOverrides,
 ) -> StageExplanation:
     """Compute explanation for a single stage."""
@@ -1084,26 +1118,26 @@ def _get_stage_explanation(
         stage_info["deps_paths"],
         stage_info["params"],
         overrides,
-        cache_dir,
+        state_dir,
     )
 
 
 def _check_uncached_incremental_outputs(
     execution_order: list[str],
-    cache_dir: pathlib.Path,
 ) -> list[tuple[str, str]]:
     """Check for IncrementalOut files that exist but aren't cached.
 
     Returns list of (stage_name, output_path) tuples for uncached files.
     """
     uncached = list[tuple[str, str]]()
+    state_dir = config.get_state_dir()
 
     for stage_name in execution_order:
         stage_info = registry.REGISTRY.get(stage_name)
         stage_outs = stage_info["outs"]
 
         # Read lock file to get cached output hashes
-        stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(cache_dir))
+        stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(state_dir))
         lock_data = stage_lock.read()
         output_hashes = lock_data.get("output_hashes", {}) if lock_data else {}
 
@@ -1122,7 +1156,6 @@ def _check_uncached_incremental_outputs(
 def _write_run_history(
     run_id: str,
     stage_states: dict[str, StageState],
-    cache_dir: pathlib.Path,
     targeted_stages: list[str],
     execution_order: list[str],
     started_at: str,
@@ -1130,10 +1163,11 @@ def _write_run_history(
     retention: int,
 ) -> None:
     """Build and write run manifest to StateDB."""
+    state_dir = config.get_state_dir()
 
     stages_records = dict[str, run_history.StageRunRecord]()
     for name, state in stage_states.items():
-        stage_lock = lock.StageLock(name, lock.get_stages_dir(cache_dir))
+        stage_lock = lock.StageLock(name, lock.get_stages_dir(state_dir))
         lock_data = stage_lock.read()
 
         if lock_data:
@@ -1161,7 +1195,7 @@ def _write_run_history(
         stages=stages_records,
     )
 
-    state_db_path = project.get_project_root() / ".pivot" / "state.db"
+    state_db_path = config.get_state_dir() / "state.db"
     with state_mod.StateDB(state_db_path) as state_db:
         state_db.write_run(manifest)
         state_db.prune_runs(retention)

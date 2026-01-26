@@ -33,7 +33,9 @@ def data() -> None:
     flag_value=OutputFormat.MD,
     help="Output as Markdown (implies --no-tui)",
 )
-@click.option("--max-rows", default=10000, help="Max rows for comparison (default: 10000)")
+@click.option(
+    "--max-rows", default=None, type=click.IntRange(min=1), help="Max rows for comparison"
+)
 @cli_decorators.with_error_handling
 def data_diff(
     targets: tuple[str, ...],
@@ -42,7 +44,7 @@ def data_diff(
     summary: bool,
     no_tui: bool,
     output_format: OutputFormat | None,
-    max_rows: int,
+    max_rows: int | None,
 ) -> None:
     """Compare data files in workspace against git HEAD.
 
@@ -50,6 +52,8 @@ def data_diff(
     deletions, and modifications. Detects reorder-only changes.
     """
     from pivot.show import data as data_module
+
+    max_rows = max_rows if max_rows is not None else config.get_diff_max_rows()
 
     # --json or --md implies --no-tui
     if output_format:
@@ -172,8 +176,8 @@ def data_get(
       pivot data get --rev v1.0 model.pkl -o old.pkl   # Get file to alternate location
       pivot data get --rev abc123 train                # Get all outputs from stage
     """
-    project_root = project.get_project_root()
-    cache_dir = project_root / ".pivot" / "cache"
+    cache_dir = config.get_cache_dir()
+    state_dir = config.get_state_dir()
 
     checkout_modes = (
         [cache.CheckoutMode(checkout_mode)] if checkout_mode else config.get_checkout_mode_order()
@@ -184,6 +188,7 @@ def data_get(
         rev=rev,
         output=output,
         cache_dir=cache_dir,
+        state_dir=state_dir,
         checkout_modes=checkout_modes,
         force=force,
     )

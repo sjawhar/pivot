@@ -30,13 +30,12 @@ class CheckoutBehavior(enum.StrEnum):
     FORCE = "force"  # Overwrite existing files (--force)
 
 
-def _get_stage_output_info(project_root: pathlib.Path) -> dict[str, OutputHash]:
+def _get_stage_output_info(state_dir: pathlib.Path) -> dict[str, OutputHash]:
     """Get output hash info from lock files for all stages."""
     outputs = dict[str, OutputHash]()
-    cache_dir = project_root / ".pivot" / "cache"
 
     for stage_name in registry.REGISTRY.list_stages():
-        stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(cache_dir))
+        stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(state_dir))
         lock_data = stage_lock.read()
         if lock_data and "output_hashes" in lock_data:
             for out_path, out_hash in lock_data["output_hashes"].items():
@@ -199,7 +198,8 @@ def checkout(
     quiet = cli_ctx["quiet"]
 
     project_root = project.get_project_root()
-    cache_dir = project_root / ".pivot" / "cache" / "files"
+    cache_dir = config.get_cache_dir() / "files"
+    state_dir = config.get_state_dir()
 
     # Determine checkout modes - CLI flag overrides config (single mode, no fallback)
     checkout_modes = (
@@ -210,7 +210,7 @@ def checkout(
     tracked_files = track.discover_pvt_files(project_root)
 
     # Get stage output info from lock files
-    stage_outputs = _get_stage_output_info(project_root)
+    stage_outputs = _get_stage_output_info(state_dir)
 
     if not targets:
         # Convert tracked files to OutputHash format

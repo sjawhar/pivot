@@ -259,7 +259,7 @@ def test_get_stage_explanation_no_lock(tmp_path: Path) -> None:
         deps=[],
         params_instance=None,
         overrides=None,
-        cache_dir=tmp_path / "cache",
+        state_dir=tmp_path,
     )
 
     assert result == StageExplanation(
@@ -292,7 +292,7 @@ def test_get_stage_explanation_unchanged(tmp_path: Path) -> None:
         deps=[],
         params_instance=None,
         overrides=None,
-        cache_dir=tmp_path / "cache",
+        state_dir=tmp_path,
     )
 
     assert result["will_run"] is False
@@ -321,7 +321,7 @@ def test_get_stage_explanation_code_changed(tmp_path: Path) -> None:
         deps=[],
         params_instance=None,
         overrides=None,
-        cache_dir=tmp_path / "cache",
+        state_dir=tmp_path,
     )
 
     assert result["will_run"] is True
@@ -355,7 +355,7 @@ def test_get_stage_explanation_params_changed(tmp_path: Path) -> None:
         deps=[],
         params_instance=TrainParams(),
         overrides=overrides,
-        cache_dir=tmp_path / "cache",
+        state_dir=tmp_path,
     )
 
     assert result["will_run"] is True
@@ -391,7 +391,7 @@ def test_get_stage_explanation_deps_changed(tmp_path: Path) -> None:
         deps=[str(data_file)],
         params_instance=None,
         overrides=None,
-        cache_dir=tmp_path / "cache",
+        state_dir=tmp_path,
     )
 
     assert result["will_run"] is True
@@ -429,7 +429,7 @@ def test_get_stage_explanation_multiple_changes(tmp_path: Path) -> None:
         deps=[str(data_file)],
         params_instance=Params(),
         overrides=None,
-        cache_dir=tmp_path / "cache",
+        state_dir=tmp_path,
     )
 
     assert result["will_run"] is True
@@ -457,7 +457,7 @@ def test_get_stage_explanation_missing_deps(tmp_path: Path) -> None:
         deps=["nonexistent.csv"],
         params_instance=None,
         overrides=None,
-        cache_dir=tmp_path / "cache",
+        state_dir=tmp_path,
     )
 
     assert result["will_run"] is True
@@ -496,7 +496,7 @@ def test_get_stage_explanation_invalid_params(
         deps=[],
         params_instance=StrictParams(),
         overrides=invalid_params_yaml,
-        cache_dir=tmp_path / "cache",
+        state_dir=tmp_path,
     )
 
     assert result["will_run"] is True
@@ -539,7 +539,7 @@ def test_get_stage_explanation_force_without_changes(
         deps=[],
         params_instance=None,
         overrides=None,
-        cache_dir=tmp_path / "cache",
+        state_dir=tmp_path,
         force=True,
     )
 
@@ -573,7 +573,7 @@ def test_get_stage_explanation_force_with_code_changes(tmp_path: Path) -> None:
         deps=[],
         params_instance=None,
         overrides=None,
-        cache_dir=tmp_path / "cache",
+        state_dir=tmp_path,
         force=True,
     )
 
@@ -603,7 +603,7 @@ def test_get_stage_explanation_force_with_missing_deps(tmp_path: Path) -> None:
         deps=["nonexistent.csv"],
         params_instance=None,
         overrides=None,
-        cache_dir=tmp_path / "cache",
+        state_dir=tmp_path,
         force=True,
     )
 

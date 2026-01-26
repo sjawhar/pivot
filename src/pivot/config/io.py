@@ -8,7 +8,6 @@ import tempfile
 from collections.abc import Generator
 from typing import Any, cast
 
-import pydantic
 import ruamel.yaml
 
 from pivot import exceptions, project
@@ -17,6 +16,9 @@ from pivot.config import models
 logger = logging.getLogger(__name__)
 
 _NOT_FOUND: object = object()
+
+# Module-level cache for merged config to avoid repeated disk I/O
+_merged_config_cache: models.PivotConfig | None = None
 
 DEFAULT_CHECKOUT_MODE_ORDER: list[models.CheckoutMode] = list(models.CheckoutMode)
 
@@ -197,7 +199,15 @@ def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]
 
 
 def get_merged_config() -> models.PivotConfig:
-    """Load and merge configs: defaults < global < local."""
+    """Load and merge configs: defaults < global < local.
+
+    Results are cached to avoid repeated disk I/O within a single command.
+    Call clear_config_cache() to reset (e.g., in tests).
+    """
+    global _merged_config_cache
+    if _merged_config_cache is not None:
+        return _merged_config_cache
+
     defaults = models.PivotConfig.get_default().model_dump()
 
     global_data = load_config_file(get_global_config_path())
@@ -206,7 +216,14 @@ def get_merged_config() -> models.PivotConfig:
     local_data = load_config_file(get_local_config_path())
     merged = deep_merge(merged, local_data)
 
-    return models.PivotConfig.model_validate(merged)
+    _merged_config_cache = models.PivotConfig.model_validate(merged)
+    return _merged_config_cache
+
+
+def clear_config_cache() -> None:
+    """Clear the merged config cache. Call this when config files change."""
+    global _merged_config_cache
+    _merged_config_cache = None
 
 
 def get_config_value(key: str) -> tuple[Any, models.ConfigSource]:
@@ -269,24 +286,73 @@ def unset_config_value(key: str, scope: models.ConfigScope = models.ConfigScope.
 
 
 def get_checkout_mode_order() -> list[models.CheckoutMode]:
-    """Get checkout mode fallback order from merged config or default."""
-    try:
-        merged = get_merged_config()
-        checkout_modes = list(merged.cache.checkout_mode)
-        if checkout_modes:
-            return checkout_modes
-    except (exceptions.ConfigError, pydantic.ValidationError) as e:
-        logger.debug("Failed to load config for checkout modes, using defaults: %s", e)
-
-    return DEFAULT_CHECKOUT_MODE_ORDER.copy()
+    """Get checkout mode fallback order from merged config."""
+    merged = get_merged_config()
+    checkout_modes = list(merged.cache.checkout_mode)
+    return checkout_modes if checkout_modes else DEFAULT_CHECKOUT_MODE_ORDER.copy()
 
 
 def get_run_history_retention() -> int:
-    """Get run history retention limit from merged config or default (100)."""
-    try:
-        merged = get_merged_config()
-        return merged.core.run_history_retention
-    except (exceptions.ConfigError, pydantic.ValidationError) as e:
-        logger.debug("Failed to load config for run history retention, using default: %s", e)
+    """Get run history retention limit from merged config."""
+    merged = get_merged_config()
+    return merged.core.run_history_retention
 
-    return models.CoreConfig().run_history_retention
+
+def get_cache_dir() -> pathlib.Path:
+    """Get cache directory from merged config, resolved to absolute path."""
+    merged = get_merged_config()
+    cache_dir = pathlib.Path(merged.cache.dir)
+    if not cache_dir.is_absolute():
+        cache_dir = project.get_project_root() / cache_dir
+    return cache_dir
+
+
+def get_state_dir() -> pathlib.Path:
+    """Get state directory from merged config, resolved to absolute path."""
+    merged = get_merged_config()
+    state_dir = pathlib.Path(merged.core.state_dir)
+    if not state_dir.is_absolute():
+        state_dir = project.get_project_root() / state_dir
+    return state_dir
+
+
+def get_max_workers() -> int:
+    """Get max workers from merged config."""
+    merged = get_merged_config()
+    return merged.core.max_workers
+
+
+def get_remote_jobs() -> int:
+    """Get remote transfer parallel jobs from merged config."""
+    merged = get_merged_config()
+    return merged.remote.jobs
+
+
+def get_remote_retries() -> int:
+    """Get remote transfer retry count from merged config."""
+    merged = get_merged_config()
+    return merged.remote.retries
+
+
+def get_remote_connect_timeout() -> int:
+    """Get remote transfer connection timeout from merged config."""
+    merged = get_merged_config()
+    return merged.remote.connect_timeout
+
+
+def get_watch_debounce() -> int:
+    """Get watch mode debounce delay in milliseconds from merged config."""
+    merged = get_merged_config()
+    return merged.watch.debounce
+
+
+def get_display_precision() -> int:
+    """Get display precision for floating point numbers from merged config."""
+    merged = get_merged_config()
+    return merged.display.precision
+
+
+def get_diff_max_rows() -> int:
+    """Get max rows for data diff operations from merged config."""
+    merged = get_merged_config()
+    return merged.diff.max_rows

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import click
 
-from pivot import outputs, project
+from pivot import config, outputs, project
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import targets as cli_targets
 from pivot.cli.run import ensure_stages_registered
@@ -23,14 +23,14 @@ def metrics() -> None:
 @click.option("--md", "output_format", flag_value=OutputFormat.MD, help="Output as Markdown table")
 @click.option("-R", "--recursive", is_flag=True, help="Search directories recursively")
 @click.option(
-    "--precision", default=5, type=click.IntRange(min=0), help="Decimal precision for floats"
+    "--precision", default=None, type=click.IntRange(min=0), help="Decimal precision for floats"
 )
 @cli_decorators.with_error_handling
 def metrics_show(
     targets: tuple[str, ...],
     output_format: OutputFormat | None,
     recursive: bool,
-    precision: int,
+    precision: int | None,
 ) -> None:
     """Display metric values in tabular format.
 
@@ -39,6 +39,7 @@ def metrics_show(
 
     If no TARGETS are specified, shows metrics from all registered stages.
     """
+    precision = precision if precision is not None else config.get_display_precision()
     proj_root = project.get_project_root()
     ensure_stages_registered()
 
@@ -61,7 +62,7 @@ def metrics_show(
 @click.option("-R", "--recursive", is_flag=True, help="Search directories recursively")
 @click.option("--no-path", is_flag=True, help="Hide path column")
 @click.option(
-    "--precision", default=5, type=click.IntRange(min=0), help="Decimal precision for floats"
+    "--precision", default=None, type=click.IntRange(min=0), help="Decimal precision for floats"
 )
 @cli_decorators.with_error_handling
 def metrics_diff(
@@ -69,7 +70,7 @@ def metrics_diff(
     output_format: OutputFormat | None,
     recursive: bool,
     no_path: bool,
-    precision: int,
+    precision: int | None,
 ) -> None:
     """Compare workspace metric files against git HEAD.
 
@@ -78,6 +79,7 @@ def metrics_diff(
 
     If no TARGETS are specified, compares all registered stages' Metric outputs.
     """
+    precision = precision if precision is not None else config.get_display_precision()
     proj_root = project.get_project_root()
     ensure_stages_registered()
 

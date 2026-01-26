@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import pathlib
 
-from pivot import project, run_history
+from pivot import config, project, run_history
 from pivot.executor import worker
-from pivot.storage import lock, state
+from pivot.storage import lock
+from pivot.storage import state as state_mod
 
 # Sentinel run_id for committed entries - never pruned by prune_run_cache
 COMMITTED_RUN_ID = "__committed__"
@@ -20,16 +21,17 @@ def commit_pending(cache_dir: pathlib.Path | None = None) -> list[str]:
     """
     project_root = project.get_project_root()
     if cache_dir is None:
-        cache_dir = project_root / ".pivot" / "cache"
+        cache_dir = config.get_cache_dir()
 
     pending_stages = lock.list_pending_stages(project_root)
     if not pending_stages:
         return []
 
-    state_db_path = project_root / ".pivot" / "state.db"
+    state_dir = config.get_state_dir()
+    state_db_path = state_dir / "state.db"
     committed = list[str]()
 
-    with state.StateDB(state_db_path) as state_db:
+    with state_mod.StateDB(state_db_path) as state_db:
         for stage_name in pending_stages:
             pending_lock = lock.get_pending_lock(stage_name, project_root)
             pending_data = pending_lock.read()
@@ -38,7 +40,7 @@ def commit_pending(cache_dir: pathlib.Path | None = None) -> list[str]:
                 continue
 
             # Write to production lock (without dep_generations - that's internal to pending)
-            production_lock = lock.StageLock(stage_name, lock.get_stages_dir(cache_dir))
+            production_lock = lock.StageLock(stage_name, lock.get_stages_dir(state_dir))
             production_lock.write(pending_data)
 
             # Record dependency generations from execution time (not commit time!)

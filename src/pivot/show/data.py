@@ -13,7 +13,7 @@ import numpy
 import pandas
 import tabulate
 
-from pivot import outputs, project
+from pivot import config, outputs, project
 from pivot.show import common
 from pivot.storage import cache
 from pivot.types import (
@@ -644,8 +644,7 @@ def restore_data_from_cache(
     if not _HASH_PATTERN.fullmatch(file_hash.lower()):
         return None
 
-    proj_root = project.get_project_root()
-    cache_dir = proj_root / ".pivot" / "cache" / "files"
+    cache_dir = config.get_cache_dir() / "files"
     cached_path = cache_dir / file_hash[:2] / file_hash[2:]
 
     # Prevent symlink escape attacks

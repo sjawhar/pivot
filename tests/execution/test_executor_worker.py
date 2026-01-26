@@ -34,6 +34,7 @@ def worker_env(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> pathl
     """Set up worker execution environment."""
     cache_dir = tmp_path / ".pivot" / "cache"
     cache_dir.mkdir(parents=True)
+    (tmp_path / ".pivot" / "stages").mkdir(parents=True, exist_ok=True)
     monkeypatch.chdir(tmp_path)
     return cache_dir
 
@@ -58,7 +59,7 @@ def _helper_always_fail_takeover(sentinel: pathlib.Path, stale_pid: int | None) 
 
 
 def test_execute_stage_with_missing_deps(
-    worker_env: pathlib.Path, output_queue: mp.Queue[OutputMessage]
+    worker_env: pathlib.Path, output_queue: mp.Queue[OutputMessage], tmp_path: pathlib.Path
 ) -> None:
     """Worker returns failed status when dependency files are missing."""
     stage_info: WorkerStageInfo = {
@@ -78,6 +79,8 @@ def test_execute_stage_with_missing_deps(
         "dep_specs": {},
         "out_specs": {},
         "params_arg_name": None,
+        "project_root": tmp_path,
+        "state_dir": tmp_path / ".pivot",
     }
 
     result = executor.execute_stage("test_stage", stage_info, worker_env, output_queue)
@@ -113,6 +116,8 @@ def test_execute_stage_with_directory_dep(worker_env: pathlib.Path, tmp_path: pa
         "dep_specs": {},
         "out_specs": {},
         "params_arg_name": None,
+        "project_root": tmp_path,
+        "state_dir": tmp_path / ".pivot",
     }
 
     result = executor.execute_stage(
@@ -152,6 +157,8 @@ def test_execute_stage_runs_unchanged_stage(
         "dep_specs": {},
         "out_specs": {},
         "params_arg_name": None,
+        "project_root": tmp_path,
+        "state_dir": tmp_path / ".pivot",
     }
 
     # First run - creates lock file
@@ -203,6 +210,8 @@ def test_execute_stage_reruns_when_fingerprint_changes(
         "dep_specs": {},
         "out_specs": {},
         "params_arg_name": None,
+        "project_root": tmp_path,
+        "state_dir": tmp_path / ".pivot",
     }
 
     # First run
@@ -257,6 +266,8 @@ def test_execute_stage_handles_stage_exception(
         "dep_specs": {},
         "out_specs": {},
         "params_arg_name": None,
+        "project_root": tmp_path,
+        "state_dir": tmp_path / ".pivot",
     }
 
     result = executor.execute_stage(
@@ -294,6 +305,8 @@ def test_execute_stage_handles_sys_exit(worker_env: pathlib.Path, tmp_path: path
         "dep_specs": {},
         "out_specs": {},
         "params_arg_name": None,
+        "project_root": tmp_path,
+        "state_dir": tmp_path / ".pivot",
     }
 
     result = executor.execute_stage(
@@ -334,6 +347,8 @@ def test_execute_stage_handles_keyboard_interrupt(
         "dep_specs": {},
         "out_specs": {},
         "params_arg_name": None,
+        "project_root": tmp_path,
+        "state_dir": tmp_path / ".pivot",
     }
 
     result = executor.execute_stage(
@@ -1184,6 +1199,8 @@ def test_generation_skip_on_second_run(worker_env: pathlib.Path, tmp_path: pathl
         "dep_specs": {},
         "out_specs": {},
         "params_arg_name": None,
+        "project_root": tmp_path,
+        "state_dir": tmp_path / ".pivot",
     }
 
     # First run - creates output and records generations
@@ -1244,6 +1261,8 @@ def test_generation_mismatch_triggers_rerun(
         "dep_specs": {},
         "out_specs": {},
         "params_arg_name": None,
+        "project_root": tmp_path,
+        "state_dir": tmp_path / ".pivot",
     }
 
     step2_info: WorkerStageInfo = {
@@ -1263,6 +1282,8 @@ def test_generation_mismatch_triggers_rerun(
         "dep_specs": {},
         "out_specs": {},
         "params_arg_name": None,
+        "project_root": tmp_path,
+        "state_dir": tmp_path / ".pivot",
     }
 
     # First run - both stages execute
@@ -1349,6 +1370,8 @@ def test_external_file_fallback_to_hash_check(
         "dep_specs": {},
         "out_specs": {},
         "params_arg_name": None,
+        "project_root": tmp_path,
+        "state_dir": tmp_path / ".pivot",
     }
 
     # First run
@@ -1418,6 +1441,8 @@ def test_deps_list_change_triggers_rerun(worker_env: pathlib.Path, tmp_path: pat
         "dep_specs": {},
         "out_specs": {},
         "params_arg_name": None,
+        "project_root": tmp_path,
+        "state_dir": tmp_path / ".pivot",
     }
 
     result1 = executor.execute_stage(
@@ -1456,6 +1481,8 @@ def test_deps_list_change_triggers_rerun(worker_env: pathlib.Path, tmp_path: pat
         "dep_specs": {},
         "out_specs": {},
         "params_arg_name": None,
+        "project_root": tmp_path,
+        "state_dir": tmp_path / ".pivot",
     }
 
     result3 = executor.execute_stage(
@@ -1501,6 +1528,8 @@ def test_deps_list_change_same_fingerprint_detected_by_hash(
         "dep_specs": {},
         "out_specs": {},
         "params_arg_name": None,
+        "project_root": tmp_path,
+        "state_dir": tmp_path / ".pivot",
     }
 
     result1 = executor.execute_stage(
@@ -1530,6 +1559,8 @@ def test_deps_list_change_same_fingerprint_detected_by_hash(
         "dep_specs": {},
         "out_specs": {},
         "params_arg_name": None,
+        "project_root": tmp_path,
+        "state_dir": tmp_path / ".pivot",
     }
 
     result2 = executor.execute_stage(
@@ -1579,6 +1610,8 @@ def test_skip_acquires_execution_lock(
         "dep_specs": {},
         "out_specs": {},
         "params_arg_name": None,
+        "project_root": tmp_path,
+        "state_dir": tmp_path / ".pivot",
     }
 
     # First run - creates lock file and output
@@ -1649,6 +1682,8 @@ def test_restore_happens_inside_lock(
         "dep_specs": {},
         "out_specs": {},
         "params_arg_name": None,
+        "project_root": tmp_path,
+        "state_dir": tmp_path / ".pivot",
     }
 
     # First run - creates lock file and caches output
@@ -1725,6 +1760,8 @@ def test_plain_params_no_auto_load_save(worker_env: pathlib.Path, tmp_path: path
         "dep_specs": {},
         "out_specs": {},  # Empty - stage writes directly to file, no return-based output
         "params_arg_name": "params",
+        "project_root": tmp_path,
+        "state_dir": tmp_path / ".pivot",
     }
 
     result = executor.execute_stage(
@@ -1784,6 +1821,8 @@ def test_single_annotated_return_saves_output(
         "dep_specs": {},
         "out_specs": {"_single": single_out_spec},  # Single return uses "_single" key convention
         "params_arg_name": None,
+        "project_root": tmp_path,
+        "state_dir": tmp_path / ".pivot",
     }
 
     result = executor.execute_stage(
