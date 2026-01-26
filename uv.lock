@@ -1160,6 +1160,27 @@ wheels = [
 ]
 
 [[package]]
+name = "joblib"
+version = "1.5.3"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/41/f2/d34e8b3a08a9cc79a50b2208a93dce981fe615b64d5a4d4abee421d898df/joblib-1.5.3.tar.gz", hash = "sha256:8561a3269e6801106863fd0d6d84bb737be9e7631e33aaed3fb9ce5953688da3", size = 331603, upload-time = "2025-12-15T08:41:46.427Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/7b/91/984aca2ec129e2757d1e4e3c81c3fcda9d0f85b74670a094cc443d9ee949/joblib-1.5.3-py3-none-any.whl", hash = "sha256:5fc3c5039fc5ca8c0276333a188bbd59d6b7ab37fe6632daa76bc7f9ec18e713", size = 309071, upload-time = "2025-12-15T08:41:44.973Z" },
+]
+
+[[package]]
+name = "joblib-stubs"
+version = "1.5.3.1.20260117"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/5e/4e/a4801406630955fe935d9d99efef72fd7398543f51fe5a787be80c235b4f/joblib_stubs-1.5.3.1.20260117.tar.gz", hash = "sha256:d420f9e26636df01e1bda851bf5bce9a8dbd6db84f08afe1dfdb963e6651e724", size = 14147, upload-time = "2026-01-17T11:16:43.666Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/37/7c/67ada9621b3c93caa75aba1a0b651dae988b22cdea93b33e7e49261364f5/joblib_stubs-1.5.3.1.20260117-py3-none-any.whl", hash = "sha256:ef9f570617b232263c8166f5b4351a5dcc90669d8b07e7e2cd7b25c3b0f26d5f", size = 21358, upload-time = "2026-01-17T11:16:44.327Z" },
+]
+
+[[package]]
 name = "joserfc"
 version = "1.6.1"
 source = { registry = "https://pypi.org/simple" }
@@ -2065,6 +2086,8 @@ s3 = [
 dev = [
     { name = "basedpyright" },
     { name = "botocore-stubs" },
+    { name = "joblib" },
+    { name = "joblib-stubs" },
     { name = "matplotlib-stubs" },
     { name = "mypy" },
     { name = "pandas-stubs" },
@@ -2119,6 +2142,8 @@ provides-extras = ["dvc", "matplotlib", "s3", "docs"]
 dev = [
     { name = "basedpyright", specifier = ">=1.0" },
     { name = "botocore-stubs", specifier = ">=1.35.0" },
+    { name = "joblib", specifier = ">=1.4.0" },
+    { name = "joblib-stubs", specifier = ">=1.5.0" },
     { name = "matplotlib-stubs", specifier = ">=0.3" },
     { name = "mypy", specifier = ">=1.19.1" },
     { name = "pandas-stubs", specifier = ">=2.0" },
