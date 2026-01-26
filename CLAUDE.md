@@ -16,22 +16,22 @@ This project is **pre-alpha**. No backwards compatibility is needed.
 
 ## Core Design
 
-- Per-stage lock files (32x faster than DVC), automatic code fingerprinting, warm worker pools
+- Per-stage lock files, automatic code fingerprinting, warm worker pools
 - `ProcessPoolExecutor` for true parallelism (not threads—GIL would serialize)
-- TDD: write tests BEFORE implementation
+
+## Skip Detection
+
+Two-tier algorithm: (1) O(1) generation tracking in `worker.can_skip_via_generation()`, (2) O(n) hash comparison fallback. Run cache allows skipping via input hash match.
+
+StateDB prefixes: `hash:` (file hashes), `gen:` (output generations), `dep:` (stage dep generations), `runcache:` (run cache).
 
 ## Artifact-Centric Mental Model (Critical)
 
-Think **artifact-first**, not **stage-first**. The DAG emerges from artifact dependencies.
-
-- **Wrong:** "Stage A triggers Stage B"
+- Think **artifact-first**, not **stage-first**. The DAG emerges from artifact dependencies.
 - **Right:** "This file changed. What needs to happen because of that?"
-
-**Implications:**
 - Invalidation is content-addressed: same inputs + same code = same outputs
 - Stage execution order is derived from the artifact graph, not explicit wiring
 - Watch mode must distinguish external changes (trigger re-run) from stage outputs (don't trigger)
-- Outputs can also be inputs to downstream stages — the full dependency graph matters
 
 ## Stage Registration (Critical)
 
@@ -42,7 +42,9 @@ Two pipeline definition methods:
 
 **Discovery order:** `pivot.yaml` → `pivot.yml` → `pipeline.py`
 
-Stages are pure functions with annotation-based deps/outs:
+- Stages must be **pure, serializable, module-level functions** for multiprocessing:
+- Workers receive pickled functions—lambdas, closures, and `__main__` definitions fail.
+- Stage functions, output TypedDicts, and custom loaders must be **module-level
 
 ```python
 def train(
@@ -52,66 +54,43 @@ def train(
     return data.dropna()
 ```
 
-## Stage Functions (Critical)
-
-Must be **pure, serializable, module-level functions** for multiprocessing:
-
-```python
-# Good - module-level, no captured variables
-def process_data(): ...
-
-# Bad - closure captures variable (not picklable)
-def make_stage(threshold):
-    def process():
-        if value > threshold: ...  # Captures threshold!
-    return process
-```
-
-Workers receive pickled functions—lambdas, closures, and `__main__` definitions fail.
-
-## Annotation Conventions
-
-Stage functions, output TypedDicts, and custom loaders must be **module-level** (required for type hint resolution and pickling). Loader code is fingerprinted—changes trigger re-runs.
+** (required for type hint resolution and pickling). Loader code is fingerprinted—changes trigger re-runs.
 
 - **Dependencies**: `param: Annotated[T, Dep(path, loader)]` on function parameters
 - **Outputs**: `field: Annotated[T, Out(path, loader)]` in TypedDict return type
 - **Parameters**: `params: MyParams` where `MyParams` extends `StageParams`
+- config belongs in code, not YAML.** Use Pydantic classes for configuration, not `params.yaml`.
+- This enables type checking, IDE support, and change detection through fingerprinting.
 
 ## Code Quality
 
 - Type hints everywhere; `ruff format` (100 chars); `ruff check`
-- One-line docstrings; comments explain WHY not WHAT
 - `_prefix` for private functions; import modules not functions
-- No circular dependencies
-
-## Linting/Types (Critical)
-
 - NEVER modify rules in `pyproject.toml` without permission
 - Zero tolerance for basedpyright warnings—resolve all errors AND warnings
 - No blanket `# pyright: reportFoo=false`—use targeted ignores with specific codes:
-  ```python
-  return json.load(f)  # type: ignore[return-value] - json returns Any
-  ```
 - Prefer type stubs (`pandas-stubs`, `types-PyYAML`) over ignores
-
-## Python 3.13+ Types
-
 - Empty collections: `list[int]()` not `: list[int] = []`
 - Simplified Generator: `Generator[int]` not `Generator[int, None, None]`
 - `Callable` over `Any` for functions; document why when using `Any`
+- Prefer better code over comments. Add comments only for non-obvious WHY, timing constraints, or known limitations. Never comment obvious WHAT.
+- No module-level docstrings. Simple functions get one-line docstrings—skip Args/Returns if type hints make it obvious.
+- Write evergreen docs—avoid "recently added" or "as of version X".
+- **Early returns:** Keep main logic at top indentation; avoid pyramid of doom
+- **Match statements:** Prefer over if/elif for enum dispatch and type discrimination
+- **Enums over Literals:** For programmatic values (catches typos at type-check time)
 
 ## TypedDict
 
-Zero runtime overhead, native JSON serialization. Use over dataclasses (need `asdict()`) or namedtuples (serialize as arrays).
-
+- Zero runtime overhead, native JSON serialization. Use over dataclasses (need `asdict()`) or namedtuples (serialize as arrays).
 - Never use `.get()`—direct access only. For optional fields: `if "key" in d: d["key"]`
 - Always use constructor syntax: `return Result(status="ok")` not `{"status": "ok"}`
 
 ## Pydantic
 
-Use for data needing validation with clear errors (config files, user input, API boundaries). Avoid in hot paths—use TypedDict there.
-
-**Config belongs in code, not YAML.** Use Pydantic classes for configuration, not `params.yaml`. This enables type checking, IDE support, and change detection through fingerprinting.
+- Use for data needing validation with clear errors (config files, user input, API boundaries).
+- Avoid in hot paths—use TypedDict there.
+- **Config belongs in code, not YAML.** Use Pydantic classes for configuration, not `params.yaml`. This enables type checking, IDE support, and change detection through fingerprinting.
 
 ## Path Handling
 
@@ -119,9 +98,8 @@ All paths in lockfiles must be **relative** (to stage cwd), never absolute. This
 
 ## Import Style
 
-Import modules, not functions: `from pivot import fingerprint` then `fingerprint.func()`.
-
-**No lazy imports**—all imports at module level. This ensures fingerprinting captures dependencies and makes imports explicit.
+- Import modules, not functions: `from pivot import fingerprint` then `fingerprint.func()`.
+- **No lazy imports**—all imports at module level. This ensures fingerprinting captures dependencies and makes imports explicit.
 
 **Exceptions:**
 - `TYPE_CHECKING` blocks: Import types directly (`from pathlib import Path`)
@@ -130,54 +108,10 @@ Import modules, not functions: `from pivot import fingerprint` then `fingerprint
 - Optional/platform-specific modules: Lazy import with try/except when module may not exist (e.g., `resource` on Windows)
 - CLI modules: Lazy imports acceptable in `pivot.cli` to reduce startup time
 
-## Docstrings
-
-No module-level docstrings. Simple functions get one-line docstrings—skip Args/Returns if type hints make it obvious.
-
-```python
-# Good
-def resolve_path(path: str) -> pathlib.Path:
-    """Resolve relative path from project root; absolute paths unchanged."""
-
-# Bad - repeats type hints
-def resolve_path(path: str) -> pathlib.Path:
-    """Resolve path relative to project root.
-
-    Args:
-        path: File path (relative or absolute)
-    Returns:
-        Resolved absolute path
-    """
-```
-
-## Comments
-
-Prefer better code over comments. Add comments only for non-obvious WHY, timing constraints, or known limitations. Never comment obvious WHAT (`# Add node` before `graph.add_node()`).
-
-Write evergreen docs—avoid "recently added" or "as of version X".
-
-## Code Patterns
-
-- **Early returns:** Keep main logic at top indentation; avoid pyramid of doom
-- **Match statements:** Prefer over if/elif for enum dispatch and type discrimination
-- **Private functions:** `_prefix` for module-internal helpers
-- **Enums over Literals:** For programmatic values (catches typos at type-check time)
-
 ## Error Handling Philosophy
 
-**Validate boundaries, trust internals.** Validate aggressively at entry points (CLI, file I/O, config parsing). Once validated, trust data downstream — no redundant internal validation.
-
-Let errors propagate—catch at boundaries where you can handle meaningfully. Silent failures are worse than crashes.
-
-```python
-# Good - propagate, catch at CLI
-def run_pipeline(stages):
-    return execute(build_dag(stages))  # May raise
-
-# CLI catches
-except StageNotFoundError as e:
-    click.echo(f"Error: {e}", err=True)
-```
+- **Validate boundaries, trust internals.** Validate aggressively at entry points (CLI, file I/O, config parsing). Once validated, trust data downstream — no redundant internal validation.
+- Let errors propagate—catch at boundaries where you can handle meaningfully. Silent failures are worse than crashes.
 
 **When to suppress vs propagate:**
 | Condition | Action |
@@ -189,11 +123,9 @@ except StageNotFoundError as e:
 
 **Failed operations should be atomic** — return to last known good state. If a stage fails, don't update the lockfile.
 
-## Input Validation
-
-**Validate upfront, validate early.** Check all preconditions before performing any side effects. If an operation requires multiple inputs, validate them all before writing any files or making any changes. This ensures operations are atomic—either all succeed or none do.
-
-Validate at boundaries, then trust downstream. Fail fast with clear errors—don't silently fix or skip invalid inputs. Never silently ignore validation failures (typos in field names, type mismatches, missing required data).
+- **Validate upfront, validate early.** Check all preconditions before performing any side effects. This ensures operations are atomic—either all succeed or none do.
+- Fail fast with clear errors—don't silently fix or skip invalid inputs.
+- Never silently ignore validation failures (typos in field names, type mismatches, missing required data).
 
 ## Simplicity Over Abstraction
 
@@ -201,68 +133,30 @@ Validate at boundaries, then trust downstream. Fail fast with clear errors—don
 - **Don't over-modularize** — a module with one public function used by one other module should be inlined
 - **Don't add options without justification** — if you can't articulate when each option would be used, you don't need options
 - **Three similar lines > premature abstraction** — wait until the pattern is clear before extracting
-- **No nested functions** — use module-level for testability and fingerprinting
-
-## CLI
-
-**Use `@cli_decorators.pivot_command()`** instead of `@click.command()`. Provides auto-discovery and error handling. Use `auto_discover=False` for commands not using registry (`init`, `schema`, `push`, `pull`).
-
-**Shell completion required:** Use `shell_complete=completion.complete_stages` for stage args, `complete_targets` for file/stage args.
-
-**Explicit output:** Always show messages for empty states. JSON output must include all requested keys (empty arrays, not omitted).
-
-See `src/pivot/cli/CLAUDE.md` for detailed CLI guidelines.
 
 ## Development
 
 ```bash
 uv sync --active       # Install deps
-pytest tests/ -n auto  # Test
-ruff format . && ruff check . && basedpyright .  # Quality
+uv run pytest tests/ -n auto  # Test
+uv run ruff format . && uv run ruff check . && uv run basedpyright .  # Quality
 ```
 
-## Before Returning to User (Critical)
-
-Run all four: `ruff format .`, `ruff check .`, `basedpyright .`, `pytest tests/ -n auto`
-
-## Before Pushing (Critical)
-
-`uv run ruff format . && uv run ruff check . && uv run basedpyright . && uv run pytest tests/ -n auto`
-
-## Testing Philosophy
-
-**Real assurance over passing tests.** Tests should prove correctness, not just exercise code paths. Prefer real execution over mocks — mock external boundaries (network, filesystem in unit tests), not internal logic.
-
-See `tests/CLAUDE.md` for detailed test guidelines.
-
-## Mental Model Mistakes to Avoid
-
-These are recurring patterns that lead to corrections:
-
-1. **Over-engineering** — Adding validation modes, config options, or abstractions for hypothetical future needs. If you can't articulate when each option would be used, you don't need options.
-
-2. **Defensive over-programming** — Try/catch that returns a default on both paths; "safe" wrappers that swallow errors and hide bugs. Let errors surface.
-
-3. **Import hacks over structure** — Using lazy imports or sys.path to fix circular dependencies instead of restructuring. Extract shared types to a separate module.
-
-4. **Type safety regression** — Defaulting to `Any` when typing gets hard. Find the correct type or use TypeVar. `Any` is a last resort.
-
-5. **Stage-centric thinking** — Thinking "Stage A triggers Stage B" instead of "this artifact changed, what depends on it?" See Artifact-Centric Mental Model above.
+- Before Returning to User or pushing (Critical), Run all quality checks
 
 ## Critical Discoveries
 
-1. **Test helpers must be module-level**—`getclosurevars()` doesn't see imports in inline closures
-2. **Single underscore functions ARE tracked**—only dunders (`__name__`) filtered
-3. **Circular imports:** Extract shared types to separate module
-4. **AST manipulation:** Function bodies need at least one statement—add `ast.Pass()` if empty
-5. **Path overlap detection:** Use pygtrie, not string matching (`data/` vs `data/file.csv`)
-6. **loky can't pickle `mp.Queue()`**—use `mp.Manager().Queue()`
-7. **Reusable executor:** `loky.get_reusable_executor()` keeps workers warm
-8. **Cross-process tests:** Use file-based state, not shared lists (each process copies)
-9. **Atomic writes:** Track fd closure when using `mkstemp()` + rename
-10. **IncrementalOut uses COPY mode**—hardlinks/symlinks would corrupt cache
-11. **StateDB path strategies:** `resolve()` for hash keys (dedup), `normpath()` for generation keys (logical paths)
-12. **LMDB for all state:** Extend StateDB with prefixes, don't add new databases
-13. **ruamel.yaml for editable config** (preserves comments), **PyYAML for read-only**
-14. **Stage functions and TypedDicts must be module-level**—`get_type_hints()` needs importable `__module__`
-15. **Lambda fingerprinting is non-deterministic**—lambdas without source fall back to `id(func)`, causing unnecessary re-runs across interpreter sessions. Always use named functions in stage definitions.
+1. **Single underscore functions ARE tracked**—only dunders (`__name__`) filtered
+2. **Circular imports:** Extract shared types to separate module
+3. **AST manipulation:** Function bodies need at least one statement—add `ast.Pass()` if empty
+4. **Path overlap detection:** Use pygtrie, not string matching (`data/` vs `data/file.csv`)
+5. **loky can't pickle `mp.Queue()`**—use `mp.Manager().Queue()`
+6. **Reusable executor:** `loky.get_reusable_executor()` keeps workers warm
+7. **Cross-process tests:** Use file-based state, not shared lists (each process copies)
+8. **Atomic writes:** Track fd closure when using `mkstemp()` + rename
+9. **IncrementalOut uses COPY mode**—hardlinks/symlinks would corrupt cache
+10. **StateDB path strategies:** `resolve()` for hash keys (dedup), `normpath()` for generation keys (logical paths)
+11. **LMDB for all state:** Extend StateDB with prefixes, don't add new databases
+12. **ruamel.yaml for editable config** (preserves comments), **PyYAML for read-only**
+13. **Stage functions and TypedDicts must be module-level**—`get_type_hints()` needs importable `__module__`
+14. **Lambda fingerprinting is non-deterministic**—lambdas without source fall back to `id(func)`, causing unnecessary re-runs across interpreter sessions. Always use named functions in stage definitions.

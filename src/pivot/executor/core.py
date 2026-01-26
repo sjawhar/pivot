@@ -1116,6 +1116,7 @@ def _get_stage_explanation(
         stage_info["name"],
         stage_info["fingerprint"],
         stage_info["deps_paths"],
+        stage_info["outs_paths"],
         stage_info["params"],
         overrides,
         state_dir,

@@ -12,7 +12,7 @@ import pydantic
 
 from pivot import parameters
 from pivot.executor import worker
-from pivot.storage import lock
+from pivot.storage import lock, state
 from pivot.types import (
     ChangeType,
     CodeChange,
@@ -96,6 +96,7 @@ def get_stage_explanation(
     stage_name: str,
     fingerprint: dict[str, str],
     deps: list[str],
+    outs_paths: list[str],
     params_instance: pydantic.BaseModel | None,
     overrides: parameters.ParamsOverrides | None,
     state_dir: Path,
@@ -116,6 +117,44 @@ def get_stage_explanation(
             dep_changes=[],
         )
 
+    try:
+        current_params = parameters.get_effective_params(params_instance, stage_name, overrides)
+    except pydantic.ValidationError as e:
+        return StageExplanation(
+            stage_name=stage_name,
+            will_run=True,
+            is_forced=force,
+            reason=f"Invalid params.yaml:\n{e}",
+            code_changes=[],
+            param_changes=[],
+            dep_changes=[],
+        )
+
+    # Check generation tracking first (O(1) skip detection)
+    # Use verify_files=False since status predicts run behavior after restoration
+    state_db_path = state_dir / "state.db"
+    if state_db_path.exists():
+        with state.StateDB(state_db_path, readonly=True) as state_db:
+            if not force and worker.can_skip_via_generation(
+                stage_name=stage_name,
+                fingerprint=fingerprint,
+                deps=deps,
+                outs_paths=outs_paths,
+                current_params=current_params,
+                lock_data=lock_data,
+                state_db=state_db,
+                verify_files=False,
+            ):
+                return StageExplanation(
+                    stage_name=stage_name,
+                    will_run=False,
+                    is_forced=False,
+                    reason="",
+                    code_changes=[],
+                    param_changes=[],
+                    dep_changes=[],
+                )
+
     dep_hashes, missing_deps, unreadable_deps = worker.hash_dependencies(deps)
 
     if missing_deps:
@@ -135,19 +174,6 @@ def get_stage_explanation(
             will_run=True,
             is_forced=force,
             reason=f"Unreadable deps: {', '.join(unreadable_deps)}",
-            code_changes=[],
-            param_changes=[],
-            dep_changes=[],
-        )
-
-    try:
-        current_params = parameters.get_effective_params(params_instance, stage_name, overrides)
-    except pydantic.ValidationError as e:
-        return StageExplanation(
-            stage_name=stage_name,
-            will_run=True,
-            is_forced=force,
-            reason=f"Invalid params.yaml: {e}",
             code_changes=[],
             param_changes=[],
             dep_changes=[],

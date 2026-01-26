@@ -1636,6 +1636,7 @@ class WatchTuiApp(_BaseTuiApp[None]):
                 stage_name=stage_name,
                 fingerprint=registry_info["fingerprint"],
                 deps=registry_info["deps_paths"],
+                outs_paths=registry_info["outs_paths"],
                 params_instance=registry_info["params"],
                 overrides=parameters.load_params_yaml(),
                 state_dir=state_dir,
