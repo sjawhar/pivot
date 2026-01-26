@@ -218,3 +218,15 @@ class MockWatchEngine:
 def mock_watch_engine() -> WatchEngine:
     """Provide a mock watch engine for TUI testing."""
     return MockWatchEngine()  # pyright: ignore[reportReturnType]
+
+
+@pytest.fixture
+def worker_env(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> pathlib.Path:
+    """Set up worker execution environment with cache and stages directories."""
+    cache_dir = tmp_path / ".pivot" / "cache"
+    cache_dir.mkdir(parents=True)
+    (cache_dir / "files").mkdir()
+    (tmp_path / ".pivot" / "stages").mkdir(parents=True, exist_ok=True)
+    (tmp_path / ".pivot" / "pending" / "stages").mkdir(parents=True)
+    monkeypatch.chdir(tmp_path)
+    return cache_dir

@@ -149,16 +149,6 @@ def test_build_params_instance_type_mismatch_raises() -> None:
         parameters.build_params_instance(TrainParams, "train", yaml_overrides)
 
 
-def test_build_params_instance_with_overrides() -> None:
-    """Alias for test_build_params_instance_with_yaml_overrides for compatibility."""
-    overrides = {"train": {"learning_rate": 0.001, "epochs": 200}}
-    instance = parameters.build_params_instance(TrainParams, "train", overrides)
-    assert isinstance(instance, TrainParams)
-    assert instance.learning_rate == 0.001, "YAML should override default"
-    assert instance.epochs == 200, "YAML should override default"
-    assert instance.batch_size == 32, "Unspecified fields keep defaults"
-
-
 def test_build_params_instance_nested_model() -> None:
     yaml_overrides = {"complex": {"debug": True}}
     instance = parameters.build_params_instance(ComplexParams, "complex", yaml_overrides)

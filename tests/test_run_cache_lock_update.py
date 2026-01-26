@@ -1,28 +1,18 @@
 from __future__ import annotations
 
-import multiprocessing as mp
 from typing import TYPE_CHECKING
-
-import pytest
 
 from pivot import executor, loaders, outputs
 from pivot.storage import cache, lock, state
 
 if TYPE_CHECKING:
+    import multiprocessing as mp
     import pathlib
+    from collections.abc import Callable
+    from typing import Any
 
     from pivot.executor import WorkerStageInfo
-    from pivot.types import StageResult
-
-
-@pytest.fixture
-def worker_env(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> pathlib.Path:
-    """Set up worker execution environment."""
-    cache_dir = tmp_path / ".pivot" / "cache"
-    cache_dir.mkdir(parents=True)
-    (tmp_path / ".pivot" / "stages").mkdir(parents=True, exist_ok=True)
-    monkeypatch.chdir(tmp_path)
-    return cache_dir
+    from pivot.types import OutputMessage, StageResult
 
 
 def _apply_deferred_writes(
@@ -36,12 +26,50 @@ def _apply_deferred_writes(
         db.apply_deferred_writes(stage_name, output_paths, result["deferred_writes"])
 
 
+def _make_stage_info(
+    func: Callable[..., Any],
+    tmp_path: pathlib.Path,
+    *,
+    fingerprint: dict[str, str] | None = None,
+    deps: list[str] | None = None,
+    outs: list[outputs.BaseOut] | None = None,
+    run_id: str = "test_run",
+) -> WorkerStageInfo:
+    """Create a WorkerStageInfo with sensible defaults for testing."""
+    return {
+        "func": func,
+        "fingerprint": fingerprint or {"self:test": "abc123"},
+        "deps": deps or [],
+        "signature": None,
+        "outs": outs or [],
+        "params": None,
+        "variant": None,
+        "overrides": {},
+        "checkout_modes": [
+            cache.CheckoutMode.HARDLINK,
+            cache.CheckoutMode.SYMLINK,
+            cache.CheckoutMode.COPY,
+        ],
+        "run_id": run_id,
+        "force": False,
+        "no_commit": False,
+        "no_cache": False,
+        "dep_specs": {},
+        "out_specs": {},
+        "params_arg_name": None,
+        "project_root": tmp_path,
+        "state_dir": tmp_path / ".pivot",
+    }
+
+
 # =============================================================================
 # Run Cache Lock Update Tests
 # =============================================================================
 
 
-def test_run_cache_skip_updates_lock_file(worker_env: pathlib.Path, tmp_path: pathlib.Path) -> None:
+def test_run_cache_skip_updates_lock_file(
+    worker_env: pathlib.Path, output_queue: mp.Queue[OutputMessage], tmp_path: pathlib.Path
+) -> None:
     """Run cache skip should update lock file with current state.
 
     This test verifies the fix for the status/run disagreement bug where:
@@ -60,40 +88,19 @@ def test_run_cache_skip_updates_lock_file(worker_env: pathlib.Path, tmp_path: pa
         (tmp_path / "output.txt").write_text(f"processed: {content}")
 
     out = outputs.Out(str(tmp_path / "output.txt"), loader=loaders.PathOnly())
-    stage_info: WorkerStageInfo = {
-        "func": stage_func,
-        "fingerprint": {"self:stage_func": "fp123"},
-        "deps": ["input.txt"],
-        "signature": None,
-        "outs": [out],
-        "params": None,
-        "variant": None,
-        "overrides": {},
-        "checkout_modes": [
-            cache.CheckoutMode.HARDLINK,
-            cache.CheckoutMode.SYMLINK,
-            cache.CheckoutMode.COPY,
-        ],
-        "run_id": "run_1",
-        "force": False,
-        "no_commit": False,
-        "no_cache": False,
-        "dep_specs": {},
-        "out_specs": {},
-        "params_arg_name": None,
-        "project_root": tmp_path,
-        "state_dir": tmp_path / ".pivot",
-    }
+    stage_info = _make_stage_info(
+        stage_func,
+        tmp_path,
+        fingerprint={"self:stage_func": "fp123"},
+        deps=["input.txt"],
+        outs=[out],
+        run_id="run_1",
+    )
 
     state_db_path = tmp_path / ".pivot" / "state.db"
 
     # Step 1: First run - creates lock file with state A
-    result1 = executor.execute_stage(
-        "test_stage",
-        stage_info,
-        worker_env,
-        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
-    )
+    result1 = executor.execute_stage("test_stage", stage_info, worker_env, output_queue)
     assert result1["status"] == "ran"
     assert (tmp_path / "output.txt").read_text() == "processed: state_A"
     _apply_deferred_writes("test_stage", stage_info, result1, state_db_path)
@@ -108,13 +115,15 @@ def test_run_cache_skip_updates_lock_file(worker_env: pathlib.Path, tmp_path: pa
     input_file.write_text("state_B")
 
     # Step 3: Run again - creates lock with state B, run cache now has A and B
-    stage_info_run2: WorkerStageInfo = {**stage_info, "run_id": "run_2"}
-    result2 = executor.execute_stage(
-        "test_stage",
-        stage_info_run2,
-        worker_env,
-        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
+    stage_info_run2 = _make_stage_info(
+        stage_func,
+        tmp_path,
+        fingerprint={"self:stage_func": "fp123"},
+        deps=["input.txt"],
+        outs=[out],
+        run_id="run_2",
     )
+    result2 = executor.execute_stage("test_stage", stage_info_run2, worker_env, output_queue)
     assert result2["status"] == "ran"
     assert (tmp_path / "output.txt").read_text() == "processed: state_B"
     _apply_deferred_writes("test_stage", stage_info_run2, result2, state_db_path)
@@ -129,13 +138,15 @@ def test_run_cache_skip_updates_lock_file(worker_env: pathlib.Path, tmp_path: pa
     input_file.write_text("state_A")
 
     # Step 5: Run again - should skip via run cache AND update lock file
-    stage_info_run3: WorkerStageInfo = {**stage_info, "run_id": "run_3"}
-    result3 = executor.execute_stage(
-        "test_stage",
-        stage_info_run3,
-        worker_env,
-        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
+    stage_info_run3 = _make_stage_info(
+        stage_func,
+        tmp_path,
+        fingerprint={"self:stage_func": "fp123"},
+        deps=["input.txt"],
+        outs=[out],
+        run_id="run_3",
     )
+    result3 = executor.execute_stage("test_stage", stage_info_run3, worker_env, output_queue)
     assert result3["status"] == "skipped"
     assert "run cache" in result3["reason"], f"Expected run cache skip, got: {result3['reason']}"
 
@@ -149,7 +160,7 @@ def test_run_cache_skip_updates_lock_file(worker_env: pathlib.Path, tmp_path: pa
 
 
 def test_explain_shows_cached_after_run_cache_skip(
-    worker_env: pathlib.Path, tmp_path: pathlib.Path
+    worker_env: pathlib.Path, output_queue: mp.Queue[OutputMessage], tmp_path: pathlib.Path
 ) -> None:
     """Explain module should show stage as unchanged after run cache skip.
 
@@ -167,40 +178,19 @@ def test_explain_shows_cached_after_run_cache_skip(
         (tmp_path / "output.txt").write_text(f"processed: {content}")
 
     out = outputs.Out(str(tmp_path / "output.txt"), loader=loaders.PathOnly())
-    stage_info: WorkerStageInfo = {
-        "func": stage_func,
-        "fingerprint": {"self:stage_func": "fp123"},
-        "deps": ["input.txt"],
-        "signature": None,
-        "outs": [out],
-        "params": None,
-        "variant": None,
-        "overrides": {},
-        "checkout_modes": [
-            cache.CheckoutMode.HARDLINK,
-            cache.CheckoutMode.SYMLINK,
-            cache.CheckoutMode.COPY,
-        ],
-        "run_id": "run_1",
-        "force": False,
-        "no_commit": False,
-        "no_cache": False,
-        "dep_specs": {},
-        "out_specs": {},
-        "params_arg_name": None,
-        "project_root": tmp_path,
-        "state_dir": tmp_path / ".pivot",
-    }
+    stage_info = _make_stage_info(
+        stage_func,
+        tmp_path,
+        fingerprint={"self:stage_func": "fp123"},
+        deps=["input.txt"],
+        outs=[out],
+        run_id="run_1",
+    )
 
     state_db_path = tmp_path / ".pivot" / "state.db"
 
     # Step 1: First run - creates lock file with state A
-    result1 = executor.execute_stage(
-        "test_stage",
-        stage_info,
-        worker_env,
-        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
-    )
+    result1 = executor.execute_stage("test_stage", stage_info, worker_env, output_queue)
     assert result1["status"] == "ran"
     _apply_deferred_writes("test_stage", stage_info, result1, state_db_path)
 
@@ -208,13 +198,15 @@ def test_explain_shows_cached_after_run_cache_skip(
     input_file.write_text("state_B")
 
     # Step 3: Run again - creates lock with state B
-    stage_info_run2: WorkerStageInfo = {**stage_info, "run_id": "run_2"}
-    result2 = executor.execute_stage(
-        "test_stage",
-        stage_info_run2,
-        worker_env,
-        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
+    stage_info_run2 = _make_stage_info(
+        stage_func,
+        tmp_path,
+        fingerprint={"self:stage_func": "fp123"},
+        deps=["input.txt"],
+        outs=[out],
+        run_id="run_2",
     )
+    result2 = executor.execute_stage("test_stage", stage_info_run2, worker_env, output_queue)
     assert result2["status"] == "ran"
     _apply_deferred_writes("test_stage", stage_info_run2, result2, state_db_path)
 
@@ -222,13 +214,15 @@ def test_explain_shows_cached_after_run_cache_skip(
     input_file.write_text("state_A")
 
     # Step 5: Run again - should skip via run cache
-    stage_info_run3: WorkerStageInfo = {**stage_info, "run_id": "run_3"}
-    result3 = executor.execute_stage(
-        "test_stage",
-        stage_info_run3,
-        worker_env,
-        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
+    stage_info_run3 = _make_stage_info(
+        stage_func,
+        tmp_path,
+        fingerprint={"self:stage_func": "fp123"},
+        deps=["input.txt"],
+        outs=[out],
+        run_id="run_3",
     )
+    result3 = executor.execute_stage("test_stage", stage_info_run3, worker_env, output_queue)
     assert result3["status"] == "skipped"
     assert "run cache" in result3["reason"]
 
@@ -250,7 +244,9 @@ def test_explain_shows_cached_after_run_cache_skip(
     assert explanation["reason"] == "", f"Reason should be empty, got: {explanation['reason']}"
 
 
-def test_regular_execution_still_works(worker_env: pathlib.Path, tmp_path: pathlib.Path) -> None:
+def test_regular_execution_still_works(
+    worker_env: pathlib.Path, output_queue: mp.Queue[OutputMessage], tmp_path: pathlib.Path
+) -> None:
     """Regular execution should still work (lock file created with current state)."""
     input_file = tmp_path / "input.txt"
     input_file.write_text("test data")
@@ -259,38 +255,16 @@ def test_regular_execution_still_works(worker_env: pathlib.Path, tmp_path: pathl
         (tmp_path / "output.txt").write_text("result")
 
     out = outputs.Out(str(tmp_path / "output.txt"), loader=loaders.PathOnly())
-    stage_info: WorkerStageInfo = {
-        "func": stage_func,
-        "fingerprint": {"self:stage_func": "fp123"},
-        "deps": ["input.txt"],
-        "signature": None,
-        "outs": [out],
-        "params": None,
-        "variant": None,
-        "overrides": {},
-        "checkout_modes": [
-            cache.CheckoutMode.HARDLINK,
-            cache.CheckoutMode.SYMLINK,
-            cache.CheckoutMode.COPY,
-        ],
-        "run_id": "test_run",
-        "force": False,
-        "no_commit": False,
-        "no_cache": False,
-        "dep_specs": {},
-        "out_specs": {},
-        "params_arg_name": None,
-        "project_root": tmp_path,
-        "state_dir": tmp_path / ".pivot",
-    }
+    stage_info = _make_stage_info(
+        stage_func,
+        tmp_path,
+        fingerprint={"self:stage_func": "fp123"},
+        deps=["input.txt"],
+        outs=[out],
+    )
 
     # First run - should execute and create lock file
-    result = executor.execute_stage(
-        "test_stage",
-        stage_info,
-        worker_env,
-        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
-    )
+    result = executor.execute_stage("test_stage", stage_info, worker_env, output_queue)
     assert result["status"] == "ran"
     assert (tmp_path / "output.txt").read_text() == "result"
 
@@ -302,11 +276,6 @@ def test_regular_execution_still_works(worker_env: pathlib.Path, tmp_path: pathl
     assert len(lock_data["dep_hashes"]) == 1
 
     # Subsequent run should skip (via generation or hash check)
-    result2 = executor.execute_stage(
-        "test_stage",
-        stage_info,
-        worker_env,
-        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
-    )
+    result2 = executor.execute_stage("test_stage", stage_info, worker_env, output_queue)
     assert result2["status"] == "skipped"
     assert "unchanged" in result2["reason"]

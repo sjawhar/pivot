@@ -4,9 +4,7 @@ from __future__ import annotations
 
 import datetime
 import json
-import multiprocessing as mp
 import shutil
-from multiprocessing import queues as mp_queues
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -15,34 +13,14 @@ from pivot import loaders, outputs, project, run_history, watch
 from pivot.executor import commit as commit_mod
 from pivot.executor import worker
 from pivot.storage import cache, lock, state
-from pivot.types import OutputMessage, StageStatus
+from pivot.types import StageStatus
 
 if TYPE_CHECKING:
+    import multiprocessing as mp
     import pathlib
-    from collections.abc import Callable, Generator
+    from collections.abc import Callable
 
-
-@pytest.fixture
-def worker_env(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> pathlib.Path:
-    """Set up worker execution environment."""
-    cache_dir = tmp_path / ".pivot" / "cache"
-    cache_dir.mkdir(parents=True)
-    (cache_dir / "files").mkdir()
-    # Create stages directory at .pivot/stages/ (not inside cache)
-    (tmp_path / ".pivot" / "stages").mkdir(parents=True, exist_ok=True)
-    (tmp_path / ".pivot" / "pending" / "stages").mkdir(parents=True)
-    monkeypatch.setattr(project, "_project_root_cache", tmp_path)
-    monkeypatch.chdir(tmp_path)
-    return cache_dir
-
-
-@pytest.fixture
-def output_queue() -> Generator[mp_queues.Queue[OutputMessage]]:
-    """Create a multiprocessing queue for worker output."""
-    manager = mp.Manager()
-    # mp.Manager().Queue() returns a proxy that's compatible but not the exact type
-    yield manager.Queue()  # pyright: ignore[reportReturnType]
-    manager.shutdown()
+    from pivot.types import OutputMessage
 
 
 def _make_stage_info(
@@ -90,7 +68,7 @@ def _make_stage_info(
 
 
 def test_no_commit_writes_to_pending_lock(
-    worker_env: pathlib.Path, tmp_path: pathlib.Path, output_queue: mp_queues.Queue[OutputMessage]
+    worker_env: pathlib.Path, tmp_path: pathlib.Path, output_queue: mp.Queue[OutputMessage]
 ) -> None:
     """When no_commit=True, lock is written to pending directory, not production."""
     (tmp_path / "input.txt").write_text("input data")
@@ -122,7 +100,7 @@ def test_no_commit_writes_to_pending_lock(
 
 
 def test_no_commit_still_writes_to_cache(
-    worker_env: pathlib.Path, tmp_path: pathlib.Path, output_queue: mp_queues.Queue[OutputMessage]
+    worker_env: pathlib.Path, tmp_path: pathlib.Path, output_queue: mp.Queue[OutputMessage]
 ) -> None:
     """When no_commit=True, outputs are still written to cache (content-addressed)."""
     (tmp_path / "input.txt").write_text("input data")
@@ -150,7 +128,7 @@ def test_no_commit_still_writes_to_cache(
 
 
 def test_second_no_commit_run_uses_pending_lock_for_skip(
-    worker_env: pathlib.Path, tmp_path: pathlib.Path, output_queue: mp_queues.Queue[OutputMessage]
+    worker_env: pathlib.Path, tmp_path: pathlib.Path, output_queue: mp.Queue[OutputMessage]
 ) -> None:
     """Second --no-commit run should skip if inputs unchanged (uses pending lock)."""
     (tmp_path / "input.txt").write_text("input data")
@@ -204,7 +182,7 @@ def test_list_pending_stages_returns_stage_names(
 
 
 def test_commit_pending_promotes_to_production(
-    worker_env: pathlib.Path, tmp_path: pathlib.Path, output_queue: mp_queues.Queue[OutputMessage]
+    worker_env: pathlib.Path, tmp_path: pathlib.Path, output_queue: mp.Queue[OutputMessage]
 ) -> None:
     """commit_pending promotes pending locks to production."""
     (tmp_path / "input.txt").write_text("input data")
@@ -241,7 +219,7 @@ def test_commit_pending_promotes_to_production(
 
 
 def test_discard_pending_removes_pending_locks(
-    worker_env: pathlib.Path, tmp_path: pathlib.Path, output_queue: mp_queues.Queue[OutputMessage]
+    worker_env: pathlib.Path, tmp_path: pathlib.Path, output_queue: mp.Queue[OutputMessage]
 ) -> None:
     """discard_pending removes pending locks without committing."""
     (tmp_path / "input.txt").write_text("input data")
@@ -292,7 +270,7 @@ def test_commit_nothing_to_commit(tmp_path: pathlib.Path, monkeypatch: pytest.Mo
 
 
 def test_commit_records_generation_at_execution_time(
-    worker_env: pathlib.Path, tmp_path: pathlib.Path, output_queue: mp_queues.Queue[OutputMessage]
+    worker_env: pathlib.Path, tmp_path: pathlib.Path, output_queue: mp.Queue[OutputMessage]
 ) -> None:
     """commit_pending records generation from execution time, not commit time.
 
@@ -458,7 +436,7 @@ def test_watch_engine_flag_passed_to_executor(
 
 
 def test_no_cache_skips_cache_operations(
-    worker_env: pathlib.Path, tmp_path: pathlib.Path, output_queue: mp_queues.Queue[OutputMessage]
+    worker_env: pathlib.Path, tmp_path: pathlib.Path, output_queue: mp.Queue[OutputMessage]
 ) -> None:
     """When no_cache=True, outputs are not saved to cache."""
     (tmp_path / "input.txt").write_text("input data")
@@ -488,7 +466,7 @@ def test_no_cache_skips_cache_operations(
 
 
 def test_no_cache_writes_lock_with_null_hashes(
-    worker_env: pathlib.Path, tmp_path: pathlib.Path, output_queue: mp_queues.Queue[OutputMessage]
+    worker_env: pathlib.Path, tmp_path: pathlib.Path, output_queue: mp.Queue[OutputMessage]
 ) -> None:
     """When no_cache=True, lock file is written but with null output hashes."""
     (tmp_path / "input.txt").write_text("input data")
@@ -520,7 +498,7 @@ def test_no_cache_writes_lock_with_null_hashes(
 
 
 def test_no_cache_second_run_still_skips(
-    worker_env: pathlib.Path, tmp_path: pathlib.Path, output_queue: mp_queues.Queue[OutputMessage]
+    worker_env: pathlib.Path, tmp_path: pathlib.Path, output_queue: mp.Queue[OutputMessage]
 ) -> None:
     """Second --no-cache run should skip if inputs unchanged (lock files work)."""
     (tmp_path / "input.txt").write_text("input data")
@@ -551,7 +529,7 @@ def test_no_cache_second_run_still_skips(
 
 
 def test_no_cache_incompatible_with_incremental_out(
-    worker_env: pathlib.Path, tmp_path: pathlib.Path, output_queue: mp_queues.Queue[OutputMessage]
+    worker_env: pathlib.Path, tmp_path: pathlib.Path, output_queue: mp.Queue[OutputMessage]
 ) -> None:
     """When no_cache=True with IncrementalOut, stage should fail."""
     (tmp_path / "input.txt").write_text("input data")
@@ -574,7 +552,7 @@ def test_no_cache_incompatible_with_incremental_out(
 
 
 def test_no_cache_with_no_commit(
-    worker_env: pathlib.Path, tmp_path: pathlib.Path, output_queue: mp_queues.Queue[OutputMessage]
+    worker_env: pathlib.Path, tmp_path: pathlib.Path, output_queue: mp.Queue[OutputMessage]
 ) -> None:
     """Both --no-cache and --no-commit can be used together."""
     (tmp_path / "input.txt").write_text("input data")
@@ -615,7 +593,7 @@ def test_no_cache_with_no_commit(
 
 
 def test_run_cache_restores_directory_output(
-    worker_env: pathlib.Path, tmp_path: pathlib.Path, output_queue: mp_queues.Queue[OutputMessage]
+    worker_env: pathlib.Path, tmp_path: pathlib.Path, output_queue: mp.Queue[OutputMessage]
 ) -> None:
     """Run cache should restore directory outputs including manifest."""
     (tmp_path / "input.txt").write_text("input data")
@@ -642,11 +620,11 @@ def test_run_cache_restores_directory_output(
     assert execution_count[0] == 1
 
     # Apply deferred writes (simulating what coordinator does)
-    if "deferred_writes" in result1:
-        state_db_path = worker_env.parent / "state.db"
-        output_paths = [str(out.path) for out in stage_info["outs"]]
-        with state.StateDB(state_db_path) as db:
-            db.apply_deferred_writes("test_stage", output_paths, result1["deferred_writes"])
+    assert "deferred_writes" in result1, "Should have deferred writes for directory output"
+    state_db_path = worker_env.parent / "state.db"
+    output_paths = [str(out.path) for out in stage_info["outs"]]
+    with state.StateDB(state_db_path) as db:
+        db.apply_deferred_writes("test_stage", output_paths, result1["deferred_writes"])
 
     # Verify directory output exists
     output_dir = tmp_path / "output_dir"
@@ -677,7 +655,7 @@ def test_run_cache_restores_directory_output(
 
 
 def test_run_cache_reruns_when_noncached_output_missing(
-    worker_env: pathlib.Path, tmp_path: pathlib.Path, output_queue: mp_queues.Queue[OutputMessage]
+    worker_env: pathlib.Path, tmp_path: pathlib.Path, output_queue: mp.Queue[OutputMessage]
 ) -> None:
     """Run cache should NOT skip when non-cached output (Metric) is missing.
 
