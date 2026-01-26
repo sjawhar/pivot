@@ -1094,3 +1094,57 @@ stages:
 
     train_params = result["stages"]["train"].get("params", {})
     assert train_params.get("lr") == 0.01
+
+
+# =============================================================================
+# _prefix_paths_with_wdir tests
+# =============================================================================
+
+
+def test_prefix_paths_with_wdir_prefixes_relative_paths() -> None:
+    """Relative paths should be prefixed with wdir."""
+    items: list[str | dict[str, object]] = ["data.csv", "subdir/file.txt"]
+    result = dvc_import._prefix_paths_with_wdir(items, "src")
+    assert result == ["src/data.csv", "src/subdir/file.txt"]
+
+
+def test_prefix_paths_with_wdir_skips_absolute_paths() -> None:
+    """Absolute paths should not be prefixed."""
+    items: list[str | dict[str, object]] = ["/absolute/path.csv", "relative.txt"]
+    result = dvc_import._prefix_paths_with_wdir(items, "src")
+    assert result == ["/absolute/path.csv", "src/relative.txt"]
+
+
+def test_prefix_paths_with_wdir_prefixes_relative_interpolations() -> None:
+    """Relative paths with variable interpolation should be prefixed with wdir.
+
+    Bug: Previously, any path starting with ${...} was skipped, even relative ones
+    like ${subdir}/data.csv. Only truly absolute paths should be skipped.
+    """
+    items: list[str | dict[str, object]] = [
+        "${subdir}/data.csv",  # Relative interpolation - should be prefixed
+        "${PROJECT_ROOT}/data.csv",  # Looks like it might be absolute but we can't know
+    ]
+    result = dvc_import._prefix_paths_with_wdir(items, "src")
+    # Both should be prefixed since we can't determine at parse time if they're absolute
+    assert result == ["src/${subdir}/data.csv", "src/${PROJECT_ROOT}/data.csv"]
+
+
+def test_prefix_paths_with_wdir_no_wdir_returns_unchanged() -> None:
+    """When wdir is None or empty, items should be unchanged."""
+    items: list[str | dict[str, object]] = ["data.csv", "${var}/file.txt"]
+    assert dvc_import._prefix_paths_with_wdir(items, None) == items
+    assert dvc_import._prefix_paths_with_wdir(items, "") == items
+
+
+def test_prefix_paths_with_wdir_handles_dict_form() -> None:
+    """Dict-form paths {path: options} should have keys prefixed."""
+    items: list[str | dict[str, object]] = [
+        {"data.csv": {"cache": False}},
+        {"/absolute.csv": {"persist": True}},
+    ]
+    result = dvc_import._prefix_paths_with_wdir(items, "src")
+    assert result == [
+        {"src/data.csv": {"cache": False}},
+        {"/absolute.csv": {"persist": True}},
+    ]

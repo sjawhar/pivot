@@ -594,7 +594,7 @@ class WatchEngine:
         logger.debug(f"Watch paths added: {added}")
         logger.debug(f"Watch paths removed: {removed}")
 
-        # Signal the watcher to stop (combined event will trigger)
+        # Signal the old watcher to stop (combined event will trigger)
         self._restart_event.set()
 
         # Wait for watcher thread to exit
@@ -603,8 +603,10 @@ class WatchEngine:
             if self._watcher_thread.is_alive():
                 logger.warning("Watcher thread did not exit within timeout during restart")
 
-        # Clear restart event and update paths
-        self._restart_event.clear()
+        # Create a fresh restart event for the new watcher thread.
+        # Don't clear the old event - if the old thread is still running, it needs
+        # to see the stop signal. The new thread gets a fresh, unset event.
+        self._restart_event = threading.Event()
         self._current_watch_paths = list(new_paths)
 
         # Start new watcher thread with updated paths

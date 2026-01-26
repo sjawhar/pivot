@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import contextlib
 import dataclasses
-import functools
 import logging
 import pathlib  # noqa: TC003 - used at runtime in _write_output
+import weakref
 from collections.abc import Callable, Mapping  # noqa: TC003 - used in function signatures
 from typing import (
     TYPE_CHECKING,
@@ -29,6 +30,12 @@ logger = logging.getLogger(__name__)
 
 # Key used in out_specs for single-output stages (non-TypedDict Annotated[T, Out(...)] returns)
 SINGLE_OUTPUT_KEY = "_single"
+
+# Cache for find_params_in_signature results. Uses WeakKeyDictionary to avoid
+# retaining old function objects during watch mode module reloads.
+_params_signature_cache: weakref.WeakKeyDictionary[
+    Callable[..., Any], tuple[str | None, type[StageParams] | None]
+] = weakref.WeakKeyDictionary()
 
 
 def _get_type_hints_safe(
@@ -577,21 +584,33 @@ def find_params_type_in_signature(func: Callable[..., Any]) -> type[StageParams]
     return params_type
 
 
-@functools.cache
 def find_params_in_signature(
     func: Callable[..., Any],
 ) -> tuple[str | None, type[StageParams] | None]:
     """Find StageParams argument name and type in function signature.
 
     Scans function parameters for a type hint that's a StageParams subclass.
-    Results are cached since the same function may be inspected multiple times.
-
-    Args:
-        func: Function to inspect
-
-    Returns:
-        Tuple of (argument_name, StageParams_type), or (None, None) if not found
+    Results are cached using WeakKeyDictionary to avoid retaining old function
+    objects during watch mode module reloads.
     """
+    # Check cache first (WeakKeyDictionary raises TypeError for non-weakly-referenceable)
+    with contextlib.suppress(TypeError):
+        cached = _params_signature_cache.get(func)
+        if cached is not None:
+            return cached
+
+    result = _find_params_in_signature_impl(func)
+
+    with contextlib.suppress(TypeError):
+        _params_signature_cache[func] = result
+
+    return result
+
+
+def _find_params_in_signature_impl(
+    func: Callable[..., Any],
+) -> tuple[str | None, type[StageParams] | None]:
+    """Internal implementation of find_params_in_signature."""
     import inspect as inspect_module
 
     hints = _get_type_hints_safe(func, func.__name__)

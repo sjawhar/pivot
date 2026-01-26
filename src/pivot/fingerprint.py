@@ -529,10 +529,19 @@ def _is_user_code_impl(obj: Any) -> bool:
     if module_name in sys.builtin_module_names:
         return False
 
-    # If no __file__, assume user code (exec/notebook/interactive)
-    # since stdlib and site-packages always have __file__
+    # Check for namespace packages (PEP 420): they have __path__ but no __file__
+    # If __path__ points to site-packages, it's a third-party namespace package
     if not hasattr(module, "__file__") or module.__file__ is None:
-        return True
+        if not hasattr(module, "__path__"):
+            return True  # No __file__ and no __path__: user code (exec/notebook/interactive)
+
+        # Namespace package - check if any path is in site-packages
+        for path_entry in module.__path__:
+            parts = pathlib.Path(path_entry).parts
+            for sp in _SITE_PACKAGE_PATHS:
+                if sp in parts:
+                    return False
+        return True  # Namespace package not in site-packages: user code
 
     module_file = pathlib.Path(module.__file__).resolve()
 

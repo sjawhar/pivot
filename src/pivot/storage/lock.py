@@ -90,9 +90,12 @@ def _convert_to_storage_format(data: LockData) -> StorageLockData:
         outs_list.append(entry)
     outs_list.sort(key=lambda e: e["path"])
 
+    # Sort code_manifest keys for deterministic output across interpreter sessions
+    sorted_code_manifest = dict(sorted(data["code_manifest"].items()))
+
     return StorageLockData(
         schema_version=1,
-        code_manifest=data["code_manifest"],
+        code_manifest=sorted_code_manifest,
         params=data["params"],
         deps=deps_list,
         outs=outs_list,

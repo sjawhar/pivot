@@ -11,7 +11,7 @@ from pivot.storage import state as state_mod
 COMMITTED_RUN_ID = "__committed__"
 
 
-def commit_pending(cache_dir: pathlib.Path | None = None) -> list[str]:
+def commit_pending() -> list[str]:
     """Promote pending locks to production and update StateDB.
 
     IMPORTANT: Caller must hold pending_state_lock to prevent races with other
@@ -20,9 +20,6 @@ def commit_pending(cache_dir: pathlib.Path | None = None) -> list[str]:
     Returns list of stage names that were committed.
     """
     project_root = project.get_project_root()
-    if cache_dir is None:
-        cache_dir = config.get_cache_dir()
-
     pending_stages = lock.list_pending_stages(project_root)
     if not pending_stages:
         return []

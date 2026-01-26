@@ -587,8 +587,8 @@ class StateDB:
         """Warn if database is approaching capacity limit (80% utilization)."""
         env_info = self._env.info()
         stat = self._env.stat()
-        # Used bytes = page size * last page number
-        used_bytes = stat["psize"] * env_info["last_pgno"]
+        # Used bytes = page size * (last page number + 1) since pages are 0-indexed
+        used_bytes = stat["psize"] * (env_info["last_pgno"] + 1)
         if used_bytes > _MAP_SIZE * 0.8:
             used_gb = used_bytes / (1024**3)
             limit_gb = _MAP_SIZE / (1024**3)

@@ -472,7 +472,9 @@ def _prefix_paths_with_wdir(
     """Prefix all paths in items with wdir if present.
 
     Handles both string paths and dict-form paths like {path: {options}}.
-    Skips absolute paths and paths with variable interpolation that starts with /.
+    Only skips literal absolute paths (starting with /). Paths with variable
+    interpolation are prefixed since we can't determine at parse time whether
+    they resolve to absolute or relative paths.
     """
     if not wdir:
         return items
@@ -480,8 +482,8 @@ def _prefix_paths_with_wdir(
     result = list[str | dict[str, Any]]()
     for item in items:
         if isinstance(item, str):
-            # Skip absolute paths
-            if item.startswith("/") or (item.startswith("${") and "}" in item):
+            # Only skip literal absolute paths
+            if item.startswith("/"):
                 result.append(item)
             else:
                 result.append(f"{wdir}/{item}")

@@ -231,7 +231,7 @@ def test_commit_pending_promotes_to_production(
     assert not production_lock.path.exists()
 
     # Commit
-    committed = commit_mod.commit_pending(worker_env)
+    committed = commit_mod.commit_pending()
 
     assert committed == ["test_stage"]
 
@@ -333,7 +333,7 @@ def test_commit_records_generation_at_execution_time(
         assert new_gen == 6, "After increment: input should be at generation 6"
 
     # Now commit
-    committed = commit_mod.commit_pending(worker_env)
+    committed = commit_mod.commit_pending()
     assert committed == ["test_stage"]
 
     # Check what generation was recorded for the dependency

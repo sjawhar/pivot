@@ -18,12 +18,10 @@ _module_attr_cache: weakref.WeakKeyDictionary[Callable[..., Any], list[tuple[str
 def extract_module_attr_usage(func: Callable[..., Any]) -> list[tuple[str, str]]:
     """Extract module.attr patterns (e.g., 'np.array') from function AST."""
     # WeakKeyDictionary raises TypeError for non-weakly-referenceable functions (builtins)
-    try:
+    with contextlib.suppress(TypeError):
         cached = _module_attr_cache.get(func)
         if cached is not None:
             return cached
-    except TypeError:
-        pass
 
     result = _extract_module_attr_usage_impl(func)
 
