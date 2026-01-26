@@ -901,3 +901,244 @@ def test_apply_deferred_writes_path_too_long_output(tmp_path: pathlib.Path) -> N
 
     with state.StateDB(db_path) as db, pytest.raises(state.PathTooLongError):
         db.apply_deferred_writes("stage", [long_output], deferred)
+
+
+# -----------------------------------------------------------------------------
+# AST hash cache tests
+# -----------------------------------------------------------------------------
+
+
+def test_ast_hash_cache_roundtrip(tmp_path: pathlib.Path) -> None:
+    """Save and retrieve AST hash."""
+    db_path = tmp_path / "state.db"
+
+    with state.StateDB(db_path) as db:
+        db.save_ast_hash_many(
+            [("src/stages.py", 1234567890, 1000, 99999, "my_func", "abc123def456")]
+        )
+        result = db.get_ast_hash("src/stages.py", 1234567890, 1000, 99999, "my_func")
+
+    assert result == "abc123def456"
+
+
+def test_ast_hash_cache_miss_on_mtime_change(tmp_path: pathlib.Path) -> None:
+    """Different mtime returns None (automatic invalidation)."""
+    db_path = tmp_path / "state.db"
+
+    with state.StateDB(db_path) as db:
+        db.save_ast_hash_many(
+            [("src/stages.py", 1234567890, 1000, 99999, "my_func", "abc123def456")]
+        )
+        # Different mtime_ns
+        result = db.get_ast_hash("src/stages.py", 1234567891, 1000, 99999, "my_func")
+
+    assert result is None
+
+
+def test_ast_hash_cache_miss_on_size_change(tmp_path: pathlib.Path) -> None:
+    """Different size returns None (automatic invalidation)."""
+    db_path = tmp_path / "state.db"
+
+    with state.StateDB(db_path) as db:
+        db.save_ast_hash_many(
+            [("src/stages.py", 1234567890, 1000, 99999, "my_func", "abc123def456")]
+        )
+        # Different size
+        result = db.get_ast_hash("src/stages.py", 1234567890, 1001, 99999, "my_func")
+
+    assert result is None
+
+
+def test_ast_hash_cache_miss_on_inode_change(tmp_path: pathlib.Path) -> None:
+    """Different inode returns None (file replaced, even with same mtime)."""
+    db_path = tmp_path / "state.db"
+
+    with state.StateDB(db_path) as db:
+        db.save_ast_hash_many(
+            [("src/stages.py", 1234567890, 1000, 99999, "my_func", "abc123def456")]
+        )
+        # Different inode
+        result = db.get_ast_hash("src/stages.py", 1234567890, 1000, 99998, "my_func")
+
+    assert result is None
+
+
+def test_ast_hash_cache_miss_on_qualname_change(tmp_path: pathlib.Path) -> None:
+    """Different qualname returns None (different function)."""
+    db_path = tmp_path / "state.db"
+
+    with state.StateDB(db_path) as db:
+        db.save_ast_hash_many(
+            [("src/stages.py", 1234567890, 1000, 99999, "my_func", "abc123def456")]
+        )
+        # Different qualname
+        result = db.get_ast_hash("src/stages.py", 1234567890, 1000, 99999, "other_func")
+
+    assert result is None
+
+
+def test_ast_hash_cache_persistence(tmp_path: pathlib.Path) -> None:
+    """AST hashes persist across DB instances."""
+    db_path = tmp_path / "state.db"
+
+    with state.StateDB(db_path) as db:
+        db.save_ast_hash_many(
+            [("src/stages.py", 1234567890, 1000, 99999, "my_func", "persistent_hash")]
+        )
+
+    # Open new DB instance
+    with state.StateDB(db_path) as db:
+        result = db.get_ast_hash("src/stages.py", 1234567890, 1000, 99999, "my_func")
+
+    assert result == "persistent_hash"
+
+
+def test_ast_hash_cache_multiple_functions(tmp_path: pathlib.Path) -> None:
+    """Multiple functions in same file have independent hashes."""
+    db_path = tmp_path / "state.db"
+
+    with state.StateDB(db_path) as db:
+        db.save_ast_hash_many(
+            [
+                ("src/stages.py", 1234567890, 1000, 99999, "func_a", "hash_a"),
+                ("src/stages.py", 1234567890, 1000, 99999, "func_b", "hash_b"),
+                ("src/stages.py", 1234567890, 1000, 99999, "MyClass.method", "hash_c"),
+            ]
+        )
+
+        assert db.get_ast_hash("src/stages.py", 1234567890, 1000, 99999, "func_a") == "hash_a"
+        assert db.get_ast_hash("src/stages.py", 1234567890, 1000, 99999, "func_b") == "hash_b"
+        assert (
+            db.get_ast_hash("src/stages.py", 1234567890, 1000, 99999, "MyClass.method") == "hash_c"
+        )
+
+
+def test_ast_hash_cache_update_existing(tmp_path: pathlib.Path) -> None:
+    """Saving same key updates the cached hash."""
+    db_path = tmp_path / "state.db"
+
+    with state.StateDB(db_path) as db:
+        db.save_ast_hash_many([("src/stages.py", 1234567890, 1000, 99999, "my_func", "old_hash")])
+        db.save_ast_hash_many([("src/stages.py", 1234567890, 1000, 99999, "my_func", "new_hash")])
+        result = db.get_ast_hash("src/stages.py", 1234567890, 1000, 99999, "my_func")
+
+    assert result == "new_hash"
+
+
+def test_ast_hash_cache_many(tmp_path: pathlib.Path) -> None:
+    """Batch save works correctly."""
+    db_path = tmp_path / "state.db"
+    entries = [
+        ("src/a.py", 1000, 100, 1, "func_a", "hash_a"),
+        ("src/b.py", 2000, 200, 2, "func_b", "hash_b"),
+        ("src/c.py", 3000, 300, 3, "func_c", "hash_c"),
+    ]
+
+    with state.StateDB(db_path) as db:
+        db.save_ast_hash_many(entries)
+
+        assert db.get_ast_hash("src/a.py", 1000, 100, 1, "func_a") == "hash_a"
+        assert db.get_ast_hash("src/b.py", 2000, 200, 2, "func_b") == "hash_b"
+        assert db.get_ast_hash("src/c.py", 3000, 300, 3, "func_c") == "hash_c"
+
+
+def test_ast_hash_cache_many_empty(tmp_path: pathlib.Path) -> None:
+    """Batch save with empty list doesn't error."""
+    db_path = tmp_path / "state.db"
+
+    with state.StateDB(db_path) as db:
+        db.save_ast_hash_many([])  # Should not raise
+
+
+def test_ast_hash_cache_skips_long_keys(tmp_path: pathlib.Path) -> None:
+    """Long keys are silently skipped (no error)."""
+    db_path = tmp_path / "state.db"
+    # Create a path long enough to exceed 511 bytes with prefix
+    long_path = "a" * 600
+
+    with state.StateDB(db_path) as db:
+        # Should not raise - silently skips invalid entries
+        db.save_ast_hash_many([(long_path, 1000, 100, 1, "func", "hash")])
+        # Should return None for long keys
+        result = db.get_ast_hash(long_path, 1000, 100, 1, "func")
+
+    assert result is None
+
+
+def test_ast_hash_cache_skips_empty_rel_path(tmp_path: pathlib.Path) -> None:
+    """Empty rel_path is silently skipped."""
+    db_path = tmp_path / "state.db"
+
+    with state.StateDB(db_path) as db:
+        # Should not raise - silently skips invalid entries
+        db.save_ast_hash_many([("", 1000, 100, 1, "func", "hash")])
+        # Should return None for empty rel_path
+        result = db.get_ast_hash("", 1000, 100, 1, "func")
+
+    assert result is None
+
+
+def test_ast_hash_cache_skips_empty_qualname(tmp_path: pathlib.Path) -> None:
+    """Empty qualname is silently skipped."""
+    db_path = tmp_path / "state.db"
+
+    with state.StateDB(db_path) as db:
+        # Should not raise - silently skips invalid entries
+        db.save_ast_hash_many([("src/stages.py", 1000, 100, 1, "", "hash")])
+        # Should return None for empty qualname
+        result = db.get_ast_hash("src/stages.py", 1000, 100, 1, "")
+
+    assert result is None
+
+
+def test_ast_hash_cache_skips_null_byte_in_path(tmp_path: pathlib.Path) -> None:
+    """Null byte in rel_path is silently skipped."""
+    db_path = tmp_path / "state.db"
+
+    with state.StateDB(db_path) as db:
+        # Should not raise - silently skips invalid entries
+        db.save_ast_hash_many([("src/sta\x00ges.py", 1000, 100, 1, "func", "hash")])
+        # Should return None for path with null byte
+        result = db.get_ast_hash("src/sta\x00ges.py", 1000, 100, 1, "func")
+
+    assert result is None
+
+
+def test_ast_hash_cache_skips_null_byte_in_qualname(tmp_path: pathlib.Path) -> None:
+    """Null byte in qualname is silently skipped."""
+    db_path = tmp_path / "state.db"
+
+    with state.StateDB(db_path) as db:
+        # Should not raise - silently skips invalid entries
+        db.save_ast_hash_many([("src/stages.py", 1000, 100, 1, "my\x00func", "hash")])
+        # Should return None for qualname with null byte
+        result = db.get_ast_hash("src/stages.py", 1000, 100, 1, "my\x00func")
+
+    assert result is None
+
+
+def test_ast_hash_cache_readonly_blocked(tmp_path: pathlib.Path) -> None:
+    """Readonly mode blocks save operations."""
+    db_path = tmp_path / "state.db"
+
+    with state.StateDB(db_path) as db:
+        pass  # Create database
+
+    with (
+        state.StateDB(db_path, readonly=True) as db,
+        pytest.raises(RuntimeError, match="readonly StateDB"),
+    ):
+        db.save_ast_hash_many([("src/stages.py", 1234567890, 1000, 99999, "my_func", "hash")])
+
+
+def test_ast_hash_cache_readonly_allows_reads(tmp_path: pathlib.Path) -> None:
+    """Readonly mode allows reading AST hashes."""
+    db_path = tmp_path / "state.db"
+
+    with state.StateDB(db_path) as db:
+        db.save_ast_hash_many([("src/stages.py", 1234567890, 1000, 99999, "my_func", "hash123")])
+
+    with state.StateDB(db_path, readonly=True) as db:
+        result = db.get_ast_hash("src/stages.py", 1234567890, 1000, 99999, "my_func")
+
+    assert result == "hash123"

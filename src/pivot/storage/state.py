@@ -25,6 +25,7 @@ _DEP_PREFIX = b"dep:"  # Stage dependency generations
 _REMOTE_PREFIX = b"remote:"  # Remote index entries
 _RUN_PREFIX = b"run:"  # Run history entries
 _RUNCACHE_PREFIX = b"runcache:"  # Run cache entries for skip detection
+_FP_PREFIX = b"fp:"  # AST fingerprint/hash cache entries
 
 # Default LMDB map size (10GB virtual - grows as needed)
 _MAP_SIZE = 10 * 1024 * 1024 * 1024
@@ -74,6 +75,34 @@ def _make_key_output_generation(path: pathlib.Path) -> bytes:
 def _make_key_dep_generation(stage_name: str, dep_path: str) -> bytes:
     """Create LMDB key for dependency generation record (stage + dep path)."""
     return _DEP_PREFIX + f"{stage_name}:{dep_path}".encode()
+
+
+class InvalidAstHashKeyError(Exception):
+    """Raised when AST hash key components contain invalid characters."""
+
+
+def _make_key_ast_hash(rel_path: str, mtime_ns: int, size: int, inode: int, qualname: str) -> bytes:
+    """Create LMDB key for AST hash entry.
+
+    Key format: fp:{rel_path}\x00{mtime_ns}\x00{size}\x00{inode}\x00{qualname}
+    Uses null byte separator (can't appear in paths or qualnames).
+
+    Raises:
+        InvalidAstHashKeyError: If rel_path or qualname contains null bytes or is empty
+    """
+    if not rel_path:
+        raise InvalidAstHashKeyError("rel_path cannot be empty")
+    if not qualname:
+        raise InvalidAstHashKeyError("qualname cannot be empty")
+    if "\x00" in rel_path:
+        raise InvalidAstHashKeyError(f"rel_path contains null byte: {rel_path!r}")
+    if "\x00" in qualname:
+        raise InvalidAstHashKeyError(f"qualname contains null byte: {qualname!r}")
+
+    key = _FP_PREFIX + f"{rel_path}\x00{mtime_ns}\x00{size}\x00{inode}\x00{qualname}".encode()
+    if len(key) > _MAX_KEY_SIZE:
+        raise InvalidAstHashKeyError(f"key exceeds {_MAX_KEY_SIZE} bytes: {len(key)}")
+    return key
 
 
 def _pack_value(mtime_ns: int, size: int, inode: int, hash_hex: str) -> bytes:
@@ -196,6 +225,42 @@ class StateDB:
                         fs_stat.st_mtime_ns, fs_stat.st_size, fs_stat.st_ino, file_hash
                     )
                     txn.put(key, value)
+        except lmdb.MapFullError as e:
+            raise DatabaseFullError(_DB_FULL_MSG) from e
+
+    # -------------------------------------------------------------------------
+    # AST hash cache for persistent fingerprint caching
+    # -------------------------------------------------------------------------
+
+    def get_ast_hash(
+        self, rel_path: str, mtime_ns: int, size: int, inode: int, qualname: str
+    ) -> str | None:
+        """Get cached AST hash; returns None if not found or key is invalid."""
+        self._check_closed()
+        try:
+            key = _make_key_ast_hash(rel_path, mtime_ns, size, inode, qualname)
+        except InvalidAstHashKeyError:
+            return None
+        with self._env.begin() as txn:
+            value = txn.get(key)
+        if value is None:
+            return None
+        return value.decode("ascii")
+
+    def save_ast_hash_many(self, entries: list[tuple[str, int, int, int, str, str]]) -> None:
+        """Batch save AST hash entries; skips entries with invalid keys."""
+        self._check_closed()
+        self._check_write_allowed()
+        if not entries:
+            return
+        try:
+            with self._env.begin(write=True) as txn:
+                for rel_path, mtime_ns, size, inode, qualname, hash_hex in entries:
+                    try:
+                        key = _make_key_ast_hash(rel_path, mtime_ns, size, inode, qualname)
+                    except InvalidAstHashKeyError:
+                        continue  # Skip invalid entries
+                    txn.put(key, hash_hex.encode("ascii"))
         except lmdb.MapFullError as e:
             raise DatabaseFullError(_DB_FULL_MSG) from e
 

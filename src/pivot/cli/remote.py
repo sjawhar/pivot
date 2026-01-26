@@ -78,7 +78,7 @@ def push(
             click.echo(f"Would push {len(local_hashes)} file(s) to '{resolved_name}'")
         return
 
-    with state.StateDB(state_dir / "state.db") as state_db:
+    with state.StateDB(config.get_state_db_path()) as state_db:
         result = transfer.push(
             cache_dir,
             state_dir,
@@ -147,7 +147,7 @@ def pull(
             click.echo(f"Would pull {len(missing)} file(s) from '{resolved_name}'")
         return
 
-    with state.StateDB(state_dir / "state.db") as state_db:
+    with state.StateDB(config.get_state_db_path()) as state_db:
         result = transfer.pull(
             cache_dir,
             state_dir,

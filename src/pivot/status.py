@@ -191,7 +191,7 @@ def get_remote_status(
     if not local_hashes:
         return RemoteSyncInfo(name=resolved_name, url=url, push_count=0, pull_count=0)
 
-    with state_mod.StateDB(config.get_state_dir() / "state.db") as state_db:
+    with state_mod.StateDB(config.get_state_db_path()) as state_db:
         status = asyncio.run(
             transfer.compare_status(local_hashes, s3_remote, state_db, resolved_name)
         )

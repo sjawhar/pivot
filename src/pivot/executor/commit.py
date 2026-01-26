@@ -25,10 +25,9 @@ def commit_pending() -> list[str]:
         return []
 
     state_dir = config.get_state_dir()
-    state_db_path = state_dir / "state.db"
     committed = list[str]()
 
-    with state_mod.StateDB(state_db_path) as state_db:
+    with state_mod.StateDB(config.get_state_db_path()) as state_db:
         for stage_name in pending_stages:
             pending_lock = lock.get_pending_lock(stage_name, project_root)
             pending_data = pending_lock.read()

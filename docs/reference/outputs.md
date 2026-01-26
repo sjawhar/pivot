@@ -245,6 +245,27 @@ Pivot uses xxhash64 for content hashing:
 - Non-cryptographic (not for security, just deduplication)
 - 64-bit hash provides sufficient uniqueness for cache keys
 
+### File Change Detection
+
+Before hashing file contents, Pivot checks if a file has changed using three filesystem attributes:
+
+| Attribute | What It Detects |
+|-----------|-----------------|
+| **mtime** | In-place edits (content modified without replacing file) |
+| **size** | Fast filter for obvious changes |
+| **inode** | Atomic replacement (vim backup mode, some IDEs, `mv`) |
+
+This combination provides defense-in-depth:
+
+- **In-place edits** (e.g., `echo "new" > file`) change mtime and size but keep the same inode
+- **Atomic replacement** (e.g., `mv tmp file`) assigns a new inode but may preserve mtime
+- **Editors vary** - vim with backup mode does atomic replacement; nano does in-place edits
+
+Using all three attributes catches both patterns.
+
+!!! note "Why Not Just Hash?"
+    Hashing every file on every run would be expensive for large outputs. The mtime+size+inode check is O(1) per file (just a `stat()` call), letting us skip rehashing unchanged files.
+
 ## Troubleshooting
 
 ### Stage Runs But Output Not Cached

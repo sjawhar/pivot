@@ -1,9 +1,11 @@
 import ast
+import atexit
 import contextlib
 import dataclasses
 import functools
 import inspect
 import json
+import logging
 import marshal
 import pathlib
 import sys
@@ -19,6 +21,9 @@ from pivot import ast_utils, metrics
 
 if TYPE_CHECKING:
     from pivot import loaders
+    from pivot.storage.state import StateDB
+
+_logger = logging.getLogger(__name__)
 
 _SITE_PACKAGE_PATHS = ("site-packages", "dist-packages")
 
@@ -45,6 +50,94 @@ _is_user_code_cache: weakref.WeakKeyDictionary[object, bool] = weakref.WeakKeyDi
 _get_type_hints_cache: weakref.WeakKeyDictionary[Callable[..., Any], dict[str, Any]] = (
     weakref.WeakKeyDictionary()
 )
+
+# Module-level state for persistent AST hash caching.
+# Fingerprinting happens during discovery (single-threaded in coordinator process).
+# Workers (via ProcessPoolExecutor) have their own memory space and don't share this
+# state - any pending writes in workers are lost, which is fine since workers use
+# readonly StateDB and fingerprinting should complete during discovery.
+_state_db: "StateDB | None" = None
+_state_db_init_attempted: bool = False
+_pending_ast_writes: list[tuple[str, int, int, int, str, str]] = []
+
+
+def _close_state_db() -> None:
+    """Close the readonly StateDB on process exit."""
+    global _state_db
+    if _state_db is not None:
+        _state_db.close()
+        _state_db = None
+
+
+atexit.register(_close_state_db)
+
+
+def _get_state_db() -> "StateDB | None":
+    """Get readonly StateDB for fingerprint caching (graceful degradation).
+
+    Not thread-safe, but fingerprinting runs single-threaded per process
+    (see comment at line 33). Workers use separate memory spaces.
+    """
+    global _state_db, _state_db_init_attempted
+    if _state_db is not None:
+        return _state_db
+    if _state_db_init_attempted:
+        return None  # Already tried and failed
+    _state_db_init_attempted = True
+    try:
+        from pivot.config import io
+        from pivot.storage import state
+
+        _state_db = state.StateDB(io.get_state_db_path(), readonly=True)
+        return _state_db
+    except Exception:
+        # OSError (filesystem), ImportError (module), lmdb.Error, etc.
+        return None
+
+
+def _get_func_source_info(func: Callable[..., Any]) -> tuple[str, int, int, int] | None:
+    """Get (rel_path, mtime_ns, size, inode) for function source file.
+
+    Returns None if source info unavailable (builtins, exec'd code, outside project).
+    """
+    try:
+        file = inspect.getsourcefile(func)
+        if file is None:
+            return None
+        path = pathlib.Path(file).resolve()
+        stat = path.stat()
+        from pivot import project
+
+        project_root = project.get_project_root()
+        rel_path = str(path.relative_to(project_root))
+        return (rel_path, stat.st_mtime_ns, stat.st_size, stat.st_ino)
+    except (TypeError, OSError, ValueError):
+        # TypeError: builtins, exec'd
+        # OSError: file doesn't exist
+        # ValueError: path outside project root
+        return None
+
+
+def flush_ast_hash_cache() -> None:
+    """Flush pending AST hash writes to StateDB (call from coordinator)."""
+    global _pending_ast_writes
+    if not _pending_ast_writes:
+        return
+
+    pending = _pending_ast_writes
+    _pending_ast_writes = []
+
+    try:
+        from pivot.config import io
+        from pivot.storage import state
+
+        with state.StateDB(io.get_state_db_path(), readonly=False) as db:
+            db.save_ast_hash_many(pending)
+        metrics.count("fingerprint.ast_hash_cache.flush")
+    except Exception:
+        # OSError (filesystem), ImportError (module), lmdb.Error, etc.
+        # Log but don't fail - cache is a performance optimization, not critical
+        _logger.debug("Failed to flush AST hash cache (%d entries)", len(pending), exc_info=True)
 
 
 def get_stage_fingerprint(
@@ -406,8 +499,24 @@ def _process_module_dependency(
             manifest[key] = repr(attr_value)
 
 
+def _should_skip_persistent_cache(func: Callable[..., Any]) -> bool:
+    """Check if function should skip persistent cache.
+
+    Skip for:
+    - Closures: `<locals>` in qualname → qualname collision risk
+    - Wrapped functions: has `__wrapped__` → source file mismatch risk
+    """
+    qualname = getattr(func, "__qualname__", "")
+    if "<locals>" in qualname:
+        return True
+    return hasattr(func, "__wrapped__")
+
+
 def hash_function_ast(func: Callable[..., Any]) -> str:
     """Hash function AST (ignores whitespace, comments, docstrings).
+
+    Uses persistent cache in StateDB when available, keyed by
+    (file_path, mtime_ns, size, inode, qualname) for automatic invalidation.
 
     Limitation: Lambdas and functions without source code fall back to id(func),
     which is non-deterministic across runs. This causes unnecessary re-runs for
@@ -415,17 +524,58 @@ def hash_function_ast(func: Callable[..., Any]) -> str:
     pipeline stages for stable fingerprinting.
     """
     with metrics.timed("fingerprint.hash_function_ast"):
+        # 1. Check in-memory WeakKeyDictionary cache first (fastest)
         # WeakKeyDictionary raises TypeError for non-weakly-referenceable functions (builtins)
         try:
             cached = _hash_function_ast_cache.get(func)
             if cached is not None:
-                metrics.count("fingerprint.hash_function_ast.cache_hit")
+                metrics.count("fingerprint.hash_function_ast.memory_cache_hit")
                 return cached
-            result = _compute_function_hash(func)
-            _hash_function_ast_cache[func] = result
-            return result
         except TypeError:
+            # Not weakly referenceable (builtins), compute directly
             return _compute_function_hash(func)
+
+        # 2. Check persistent cache if appropriate
+        source_info: tuple[str, int, int, int] | None = None
+        qualname: str | None = None
+
+        if not _should_skip_persistent_cache(func):
+            source_info = _get_func_source_info(func)
+            if source_info is not None:
+                qualname = getattr(func, "__qualname__", None) or getattr(func, "__name__", None)
+                if qualname is None:
+                    raise RuntimeError(
+                        f"Cannot fingerprint {func!r}: missing __qualname__ and __name__. This indicates a bug in pivot's fingerprinting logic."
+                    )
+                db = _get_state_db()
+                if db is not None:
+                    rel_path, mtime_ns, size, inode = source_info
+                    try:
+                        persistent_cached = db.get_ast_hash(
+                            rel_path, mtime_ns, size, inode, qualname
+                        )
+                        if persistent_cached is not None:
+                            metrics.count("fingerprint.hash_function_ast.persistent_cache_hit")
+                            # Store in memory cache too
+                            _hash_function_ast_cache[func] = persistent_cached
+                            return persistent_cached
+                    except Exception:
+                        # LMDB errors shouldn't break fingerprinting
+                        pass
+
+        # 3. Compute hash
+        result = _compute_function_hash(func)
+
+        # 4. Store in memory cache
+        _hash_function_ast_cache[func] = result
+
+        # 5. Queue persistent write (if source info available and not skipping)
+        if source_info is not None and qualname is not None:
+            rel_path, mtime_ns, size, inode = source_info
+            _pending_ast_writes.append((rel_path, mtime_ns, size, inode, qualname, result))
+            metrics.count("fingerprint.hash_function_ast.persistent_cache_miss")
+
+        return result
 
 
 def _compute_function_hash(func: Callable[..., Any]) -> str:

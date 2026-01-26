@@ -4,7 +4,7 @@ import logging
 import runpy
 from typing import TYPE_CHECKING
 
-from pivot import metrics, project, registry
+from pivot import fingerprint, metrics, project, registry
 from pivot.pipeline import yaml as pipeline_config
 
 if TYPE_CHECKING:
@@ -75,6 +75,9 @@ def discover_and_register(project_root: Path | None = None) -> str | None:
                 raise DiscoveryError(f"Pipeline {pipeline_path} called sys.exit({e.code})") from e
             except Exception as e:
                 raise DiscoveryError(f"Failed to load {pipeline_path}: {e}") from e
+            finally:
+                # Flush pending AST hash writes even if registration failed partway
+                fingerprint.flush_ast_hash_cache()
 
         return None
 
