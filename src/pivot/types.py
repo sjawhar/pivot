@@ -293,16 +293,17 @@ class OutputChange(TypedDict):
     output_type: Literal["out", "metric", "plot"]
 
 
-class StageExplanation(TypedDict):
+class StageExplanation(TypedDict, total=False):
     """Detailed explanation of why a stage would run."""
 
-    stage_name: str
-    will_run: bool
-    is_forced: bool
-    reason: str  # "Code changed", "No previous run", "forced", etc.
-    code_changes: list[CodeChange]
-    param_changes: list[ParamChange]
-    dep_changes: list[DepChange]
+    stage_name: Required[str]
+    will_run: Required[bool]
+    is_forced: Required[bool]
+    reason: Required[str]  # "Code changed", "No previous run", "forced", etc.
+    code_changes: Required[list[CodeChange]]
+    param_changes: Required[list[ParamChange]]
+    dep_changes: Required[list[DepChange]]
+    upstream_stale: list[str]  # Populated by get_pipeline_explanations()
 
 
 # =============================================================================
@@ -392,6 +393,29 @@ class StatusOutput(TypedDict, total=False):
     """JSON output structure for pivot status command."""
 
     stages: list[PipelineStatusInfo]
+    tracked_files: list[TrackedFileInfo]
+    remote: RemoteSyncInfo
+    suggestions: list[str]
+
+
+class ExplainStageJson(TypedDict):
+    """JSON-serializable stage explanation for status --explain --json output."""
+
+    name: str
+    status: Literal["stale", "cached"]
+    reason: str
+    will_run: bool
+    is_forced: bool
+    code_changes: list[CodeChange]
+    param_changes: list[ParamChange]
+    dep_changes: list[DepChange]
+    upstream_stale: list[str]
+
+
+class ExplainOutput(TypedDict, total=False):
+    """JSON output structure for pivot status --explain command."""
+
+    stages: list[ExplainStageJson]
     tracked_files: list[TrackedFileInfo]
     remote: RemoteSyncInfo
     suggestions: list[str]

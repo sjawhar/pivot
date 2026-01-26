@@ -1,12 +1,16 @@
 """Tests for explain module - detailed change explanations."""
 
+import os
+import pathlib
 from pathlib import Path
-from typing import ClassVar
+from typing import Annotated, ClassVar, TypedDict
 
 import pydantic
 import pytest
 
-from pivot import explain
+from helpers import register_test_stage
+from pivot import executor, explain, loaders, outputs, status
+from pivot.registry import REGISTRY
 from pivot.storage import lock
 from pivot.types import (
     ChangeType,
@@ -17,6 +21,43 @@ from pivot.types import (
     ParamChange,
     StageExplanation,
 )
+
+# =============================================================================
+# Module-level TypedDicts and helpers for upstream propagation tests
+# =============================================================================
+
+
+class _AOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("a_output.txt", loaders.PathOnly())]
+
+
+class _BOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("b_output.txt", loaders.PathOnly())]
+
+
+def _helper_stage_a_v1(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _AOutputs:
+    _ = input_file
+    pathlib.Path("a_output.txt").write_text("a_v1")
+    return _AOutputs(output=pathlib.Path("a_output.txt"))
+
+
+def _helper_stage_a_v2(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _AOutputs:
+    _ = input_file
+    pathlib.Path("a_output.txt").write_text("a_v2_different")
+    return _AOutputs(output=pathlib.Path("a_output.txt"))
+
+
+def _helper_stage_b(
+    a_output: Annotated[pathlib.Path, outputs.Dep("a_output.txt", loaders.PathOnly())],
+) -> _BOutputs:
+    _ = a_output
+    pathlib.Path("b_output.txt").write_text("b")
+    return _BOutputs(output=pathlib.Path("b_output.txt"))
+
 
 # =============================================================================
 # diff_code_manifests tests
@@ -621,3 +662,40 @@ def test_get_stage_explanation_force_with_missing_deps(tmp_path: Path) -> None:
     assert result["will_run"] is True
     assert result["is_forced"] is True
     assert "missing" in result["reason"].lower()
+
+
+# =============================================================================
+# Upstream propagation tests (get_pipeline_explanations)
+# =============================================================================
+
+
+def test_get_pipeline_explanations_upstream_propagation(tmp_path: Path) -> None:
+    """get_pipeline_explanations propagates staleness to downstream stages."""
+    os.chdir(tmp_path)
+    pathlib.Path(".git").mkdir()
+    pathlib.Path("input.txt").write_text("data")
+
+    # Register and run initial pipeline
+    register_test_stage(_helper_stage_a_v1, name="stage_a")
+    register_test_stage(_helper_stage_b, name="stage_b")
+
+    executor.run(show_output=False)
+
+    # Modify stage_a's code (re-register with different implementation)
+    REGISTRY._stages.clear()
+    register_test_stage(_helper_stage_a_v2, name="stage_a")
+    register_test_stage(_helper_stage_b, name="stage_b")
+
+    # Get pipeline explanations
+    explanations = status.get_pipeline_explanations(stages=None, single_stage=False)
+
+    # Find stage_b's explanation
+    stage_b_exp = next((e for e in explanations if e["stage_name"] == "stage_b"), None)
+    assert stage_b_exp is not None, "stage_b should be in explanations"
+
+    # stage_b should show as stale due to upstream
+    assert stage_b_exp["will_run"] is True, "stage_b should run due to upstream staleness"
+    assert "upstream_stale" in stage_b_exp, "stage_b should have upstream_stale field"
+    assert "stage_a" in stage_b_exp["upstream_stale"], (
+        "stage_b should list stage_a as stale upstream"
+    )

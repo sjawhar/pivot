@@ -1,0 +1,525 @@
+from __future__ import annotations
+
+import json
+import pathlib
+from typing import TYPE_CHECKING, Annotated, TypedDict
+
+from helpers import register_test_stage
+from pivot import cli, executor, loaders, outputs
+from pivot.storage import cache, lock
+
+if TYPE_CHECKING:
+    import click.testing
+    from pytest_mock import MockerFixture
+
+
+def _setup_mock_remote(mocker: MockerFixture, *, files_exist_on_remote: bool) -> None:
+    """Set up mocks for remote configuration and S3Remote.bulk_exists."""
+    mocker.patch("pivot.remote.config.list_remotes", return_value={"default": "s3://bucket/cache"})
+    mocker.patch("pivot.remote.config.get_default_remote", return_value="default")
+    mocker.patch("pivot.remote.config.get_remote_url", return_value="s3://bucket/cache")
+
+    mock_remote_class = mocker.patch("pivot.remote.storage.S3Remote")
+    mock_remote = mock_remote_class.return_value
+
+    async def mock_bulk_exists(hashes: list[str], concurrency: int = 20) -> dict[str, bool]:
+        return dict.fromkeys(hashes, files_exist_on_remote)
+
+    mock_remote.bulk_exists = mock_bulk_exists
+
+
+# =============================================================================
+# Module-level TypedDicts and Stage Functions for annotation-based registration
+# =============================================================================
+
+
+class _OutputTxtOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
+
+
+class _ATxtOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("a.txt", loaders.PathOnly())]
+
+
+class _BTxtOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("b.txt", loaders.PathOnly())]
+
+
+def _helper_process(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _OutputTxtOutputs:
+    _ = input_file
+    pathlib.Path("output.txt").write_text("done")
+    return _OutputTxtOutputs(output=pathlib.Path("output.txt"))
+
+
+def _helper_stage_a(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _ATxtOutputs:
+    _ = input_file
+    pathlib.Path("a.txt").write_text("output a")
+    return _ATxtOutputs(output=pathlib.Path("a.txt"))
+
+
+def _helper_stage_b(
+    a_file: Annotated[pathlib.Path, outputs.Dep("a.txt", loaders.PathOnly())],
+) -> _BTxtOutputs:
+    _ = a_file
+    pathlib.Path("b.txt").write_text("output b")
+    return _BTxtOutputs(output=pathlib.Path("b.txt"))
+
+
+# =============================================================================
+# Help and Basic Tests
+# =============================================================================
+
+
+def test_verify_help(runner: click.testing.CliRunner) -> None:
+    """Verify command should show help."""
+    result = runner.invoke(cli.cli, ["verify", "--help"])
+
+    assert result.exit_code == 0
+    assert "--json" in result.output
+    assert "--allow-missing" in result.output
+
+
+def test_verify_no_stages(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
+    """Verify with no stages shows appropriate error."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+
+        result = runner.invoke(cli.cli, ["verify"])
+
+        assert result.exit_code != 0
+        assert "No stages registered" in result.output
+
+
+# =============================================================================
+# Basic Verification Tests
+# =============================================================================
+
+
+def test_verify_all_cached_exits_0(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
+    """pivot verify with all stages cached and files present exits 0."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        pathlib.Path("input.txt").write_text("data")
+
+        register_test_stage(_helper_process, name="process")
+
+        # Run to cache
+        executor.run(show_output=False)
+
+        result = runner.invoke(cli.cli, ["verify"])
+
+        assert result.exit_code == 0
+        assert "Verification passed" in result.output
+
+
+def test_verify_stale_code_exits_1(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
+    """pivot verify with stale stage (code changed) exits 1."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        pathlib.Path("input.txt").write_text("data")
+
+        register_test_stage(_helper_process, name="process")
+
+        # Run to cache
+        executor.run(show_output=False)
+
+        # Modify the lock file to simulate code change
+        state_dir = pathlib.Path(".pivot")
+        stage_lock = lock.StageLock("process", lock.get_stages_dir(state_dir))
+        lock_data = stage_lock.read()
+        assert lock_data is not None
+        lock_data["code_manifest"]["process"] = "changed_hash"
+        stage_lock.write(lock_data)
+
+        result = runner.invoke(cli.cli, ["verify"])
+
+        assert result.exit_code == 1
+        assert "Code changed" in result.output
+
+
+def test_verify_stale_params_exits_1(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """pivot verify with stale stage (params changed) exits 1."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        pathlib.Path("input.txt").write_text("data")
+
+        register_test_stage(_helper_process, name="process")
+
+        # Run to cache
+        executor.run(show_output=False)
+
+        # Modify the lock file to simulate params change
+        state_dir = pathlib.Path(".pivot")
+        stage_lock = lock.StageLock("process", lock.get_stages_dir(state_dir))
+        lock_data = stage_lock.read()
+        assert lock_data is not None
+        lock_data["params"]["new_param"] = "value"
+        stage_lock.write(lock_data)
+
+        result = runner.invoke(cli.cli, ["verify"])
+
+        assert result.exit_code == 1
+        assert "Params changed" in result.output
+
+
+def test_verify_stale_deps_exits_1(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
+    """pivot verify with stale stage (deps changed) exits 1."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        pathlib.Path("input.txt").write_text("data")
+
+        register_test_stage(_helper_process, name="process")
+
+        # Run to cache
+        executor.run(show_output=False)
+
+        # Modify input file to change deps
+        pathlib.Path("input.txt").write_text("modified data")
+
+        result = runner.invoke(cli.cli, ["verify"])
+
+        assert result.exit_code == 1
+        assert "Input dependencies changed" in result.output
+
+
+def test_verify_missing_dep_file_exits_1(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """pivot verify with missing dependency file exits 1."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        pathlib.Path("input.txt").write_text("data")
+
+        register_test_stage(_helper_process, name="process")
+
+        # Run to cache
+        executor.run(show_output=False)
+
+        # Delete the dependency file
+        pathlib.Path("input.txt").unlink()
+
+        result = runner.invoke(cli.cli, ["verify"])
+
+        assert result.exit_code == 1
+        assert "Missing deps:" in result.output
+
+
+def test_verify_never_run_exits_1(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
+    """pivot verify with stage that was never run exits 1."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        pathlib.Path("input.txt").write_text("data")
+
+        register_test_stage(_helper_process, name="process")
+
+        # Don't run - no lock file exists
+        result = runner.invoke(cli.cli, ["verify"])
+
+        assert result.exit_code == 1
+        assert "No previous run" in result.output
+
+
+# =============================================================================
+# Stage Filtering Tests
+# =============================================================================
+
+
+def test_verify_specific_stage(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
+    """pivot verify train verifies only the train stage."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        pathlib.Path("input.txt").write_text("data")
+
+        register_test_stage(_helper_stage_a, name="stage_a")
+        register_test_stage(_helper_stage_b, name="stage_b")
+
+        # Run to cache both
+        executor.run(show_output=False)
+
+        # Verify only stage_a
+        result = runner.invoke(cli.cli, ["verify", "stage_a"])
+
+        assert result.exit_code == 0
+        assert "stage_a" in result.output
+
+
+def test_verify_multiple_stages(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
+    """pivot verify stage_a stage_b verifies both stages."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        pathlib.Path("input.txt").write_text("data")
+
+        register_test_stage(_helper_stage_a, name="stage_a")
+        register_test_stage(_helper_stage_b, name="stage_b")
+
+        # Run to cache both
+        executor.run(show_output=False)
+
+        # Verify both
+        result = runner.invoke(cli.cli, ["verify", "stage_a", "stage_b"])
+
+        assert result.exit_code == 0
+        assert "stage_a" in result.output
+        assert "stage_b" in result.output
+
+
+def test_verify_nonexistent_stage_errors(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """pivot verify nonexistent exits non-zero with stage not found error."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        pathlib.Path("input.txt").write_text("data")
+
+        register_test_stage(_helper_process, name="process")
+
+        result = runner.invoke(cli.cli, ["verify", "nonexistent"])
+
+        assert result.exit_code != 0
+        assert "nonexistent" in result.output.lower()
+
+
+# =============================================================================
+# Allow-Missing Mode Tests
+# =============================================================================
+
+
+def test_verify_allow_missing_no_remote_errors(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """pivot verify --allow-missing with no remote configured exits non-zero."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        pathlib.Path("input.txt").write_text("data")
+
+        register_test_stage(_helper_process, name="process")
+
+        # Run to cache
+        executor.run(show_output=False)
+
+        result = runner.invoke(cli.cli, ["verify", "--allow-missing"])
+
+        assert result.exit_code != 0
+        assert "remote" in result.output.lower()
+
+
+def test_verify_allow_missing_file_on_remote_passes(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, mocker: MockerFixture
+) -> None:
+    """pivot verify --allow-missing with missing local file that exists on remote exits 0."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        pathlib.Path("input.txt").write_text("data")
+
+        register_test_stage(_helper_process, name="process")
+
+        # Run to cache
+        executor.run(show_output=False)
+
+        # Get the output hash before deleting
+        state_dir = pathlib.Path(".pivot")
+        cache_dir = pathlib.Path(".pivot/cache")
+        stage_lock = lock.StageLock("process", lock.get_stages_dir(state_dir))
+        lock_data = stage_lock.read()
+        assert lock_data is not None
+        output_hash = list(lock_data["output_hashes"].values())[0]
+        assert output_hash is not None
+
+        # Delete output file and its cache entry
+        pathlib.Path("output.txt").unlink()
+        cache_path = cache.get_cache_path(cache_dir / "files", output_hash["hash"])
+        if cache_path.exists():
+            cache_path.unlink()
+
+        _setup_mock_remote(mocker, files_exist_on_remote=True)
+
+        result = runner.invoke(cli.cli, ["verify", "--allow-missing"])
+
+        assert result.exit_code == 0
+
+
+def test_verify_allow_missing_file_not_on_remote_fails(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, mocker: MockerFixture
+) -> None:
+    """pivot verify --allow-missing with missing local file not on remote exits 1."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        pathlib.Path("input.txt").write_text("data")
+
+        register_test_stage(_helper_process, name="process")
+
+        # Run to cache
+        executor.run(show_output=False)
+
+        # Delete output file and its cache entry
+        pathlib.Path("output.txt").unlink()
+        state_dir = pathlib.Path(".pivot")
+        cache_dir = pathlib.Path(".pivot/cache")
+        stage_lock = lock.StageLock("process", lock.get_stages_dir(state_dir))
+        lock_data = stage_lock.read()
+        assert lock_data is not None
+        output_hash = list(lock_data["output_hashes"].values())[0]
+        assert output_hash is not None
+        cache_path = cache.get_cache_path(cache_dir / "files", output_hash["hash"])
+        if cache_path.exists():
+            cache_path.unlink()
+
+        _setup_mock_remote(mocker, files_exist_on_remote=False)
+
+        result = runner.invoke(cli.cli, ["verify", "--allow-missing"])
+
+        assert result.exit_code == 1
+        assert "Missing files:" in result.output
+
+
+def test_verify_allow_missing_code_changed_still_fails(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, mocker: MockerFixture
+) -> None:
+    """pivot verify --allow-missing with code changes still exits 1."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        pathlib.Path("input.txt").write_text("data")
+
+        register_test_stage(_helper_process, name="process")
+
+        # Run to cache
+        executor.run(show_output=False)
+
+        # Modify the lock file to simulate code change
+        state_dir = pathlib.Path(".pivot")
+        stage_lock = lock.StageLock("process", lock.get_stages_dir(state_dir))
+        lock_data = stage_lock.read()
+        assert lock_data is not None
+        lock_data["code_manifest"]["process"] = "changed_hash"
+        stage_lock.write(lock_data)
+
+        _setup_mock_remote(mocker, files_exist_on_remote=True)
+
+        result = runner.invoke(cli.cli, ["verify", "--allow-missing"])
+
+        assert result.exit_code == 1
+        assert "Code changed" in result.output
+
+
+# =============================================================================
+# JSON Output Tests
+# =============================================================================
+
+
+def test_verify_json_output_passed(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
+    """--json outputs valid JSON with passed=true when all cached."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        pathlib.Path("input.txt").write_text("data")
+
+        register_test_stage(_helper_process, name="process")
+
+        # Run to cache
+        executor.run(show_output=False)
+
+        result = runner.invoke(cli.cli, ["verify", "--json"])
+
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert "passed" in data
+        assert data["passed"] is True
+        assert "stages" in data
+        assert len(data["stages"]) == 1
+        assert data["stages"][0]["name"] == "process"
+
+
+def test_verify_json_output_failed(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
+    """--json outputs valid JSON with passed=false and reasons when stale."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        pathlib.Path("input.txt").write_text("data")
+
+        register_test_stage(_helper_process, name="process")
+
+        # Don't run - stage is stale
+        result = runner.invoke(cli.cli, ["verify", "--json"])
+
+        assert result.exit_code == 1
+        data = json.loads(result.output)
+        assert "passed" in data
+        assert data["passed"] is False
+        assert "stages" in data
+        assert len(data["stages"]) == 1
+        assert data["stages"][0]["name"] == "process"
+        assert "reason" in data["stages"][0]
+
+
+def test_verify_json_includes_all_keys(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """--json output always includes passed, stages, and failure reasons."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        pathlib.Path("input.txt").write_text("data")
+
+        register_test_stage(_helper_process, name="process")
+
+        # Run to cache
+        executor.run(show_output=False)
+
+        # Modify deps to make stale
+        pathlib.Path("input.txt").write_text("modified")
+
+        result = runner.invoke(cli.cli, ["verify", "--json"])
+
+        assert result.exit_code == 1
+        data = json.loads(result.output)
+        assert "passed" in data
+        assert "stages" in data
+        # Each stage should have name, status, and reason
+        for stage in data["stages"]:
+            assert "name" in stage
+            assert "status" in stage
+            assert "reason" in stage
+
+
+# =============================================================================
+# Quiet Mode Tests
+# =============================================================================
+
+
+def test_verify_quiet_no_output_when_passed(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """pivot --quiet verify produces no output when all stages are cached."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        pathlib.Path("input.txt").write_text("data")
+
+        register_test_stage(_helper_process, name="process")
+
+        # Run to cache
+        executor.run(show_output=False)
+
+        result = runner.invoke(cli.cli, ["--quiet", "verify"])
+
+        assert result.exit_code == 0
+        assert result.output.strip() == "", "Quiet mode should suppress output when passing"
+
+
+def test_verify_quiet_exits_1_when_failed(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """pivot --quiet verify exits 1 when verification fails."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        pathlib.Path("input.txt").write_text("data")
+
+        register_test_stage(_helper_process, name="process")
+
+        # Don't run - stage is stale
+        result = runner.invoke(cli.cli, ["--quiet", "verify"])
+
+        assert result.exit_code == 1
+        assert result.output.strip() == "", "Quiet mode should suppress output"

@@ -22,7 +22,6 @@ from pivot.types import (
     OutputMessage,
     RunEventType,
     SchemaVersionEvent,
-    StageExplanation,
     StageStatus,
 )
 
@@ -132,39 +131,13 @@ def _validate_stages(stages_list: list[str] | None, single_stage: bool) -> None:
     cli_helpers.validate_stages_exist(stages_list)
 
 
-def _get_all_explanations(
-    stages_list: list[str] | None,
-    single_stage: bool,
-    force: bool = False,
-) -> list[StageExplanation]:
-    """Get explanations for all stages in execution order."""
-    from pivot import dag, explain, parameters
+def _output_explain(stages_list: list[str] | None, single_stage: bool, force: bool = False) -> None:
+    """Output detailed stage explanations using status logic."""
+    from pivot import status as status_mod
+    from pivot.cli import status as status_cli
 
-    graph = registry.REGISTRY.build_dag(validate=True)
-    execution_order = dag.get_execution_order(graph, stages_list, single_stage=single_stage)
-
-    if not execution_order:
-        return []
-
-    state_dir = config.get_state_dir()
-    overrides = parameters.load_params_yaml()
-
-    explanations = list[StageExplanation]()
-    for stage_name in execution_order:
-        stage_info = registry.REGISTRY.get(stage_name)
-        explanation = explain.get_stage_explanation(
-            stage_name,
-            stage_info["fingerprint"],
-            stage_info["deps_paths"],
-            stage_info["outs_paths"],
-            stage_info["params"],
-            overrides,
-            state_dir,
-            force=force,
-        )
-        explanations.append(explanation)
-
-    return explanations
+    explanations = status_mod.get_pipeline_explanations(stages_list, single_stage, force)
+    status_cli.output_explain_text(explanations)
 
 
 def _run_with_tui(
@@ -438,12 +411,7 @@ def run(
     if dry_run:
         if explain:
             # --dry-run --explain: detailed explanation without execution
-            ctx.invoke(
-                explain_cmd,
-                stages=stages,
-                single_stage=single_stage,
-                force=force,
-            )
+            _output_explain(stages_list, single_stage, force)
         else:
             # --dry-run only: terse output
             ctx.invoke(
@@ -624,10 +592,12 @@ def dry_run_cmd(
     as_json: bool,
 ) -> None:
     """Show what would run without executing."""
+    from pivot import status as status_mod
+
     stages_list = cli_helpers.stages_to_list(stages)
     _validate_stages(stages_list, single_stage)
 
-    explanations = _get_all_explanations(stages_list, single_stage, force=force)
+    explanations = status_mod.get_pipeline_explanations(stages_list, single_stage, force=force)
 
     if not explanations:
         if as_json:
@@ -653,38 +623,3 @@ def dry_run_cmd(
             status = "would run" if exp["will_run"] else "would skip"
             reason = exp["reason"] or "unchanged"
             click.echo(f"  {exp['stage_name']}: {status} ({reason})")
-
-
-@cli_decorators.pivot_command("explain")
-@click.argument("stages", nargs=-1, shell_complete=completion.complete_stages)
-@click.option(
-    "--single-stage",
-    "-s",
-    is_flag=True,
-    help="Run only the specified stages (in provided order), not their dependencies",
-)
-@click.option(
-    "--force",
-    "-f",
-    is_flag=True,
-    help="Show explanation as if forced",
-)
-def explain_cmd(stages: tuple[str, ...], single_stage: bool, force: bool) -> None:
-    """Show detailed breakdown of why stages would run."""
-    from pivot.tui import console
-
-    stages_list = cli_helpers.stages_to_list(stages)
-    _validate_stages(stages_list, single_stage)
-
-    explanations = _get_all_explanations(stages_list, single_stage, force=force)
-
-    if not explanations:
-        click.echo("No stages to run")
-        return
-
-    con = console.Console()
-    for exp in explanations:
-        con.explain_stage(exp)
-
-    will_run = sum(1 for e in explanations if e["will_run"])
-    con.explain_summary(will_run, len(explanations) - will_run)
