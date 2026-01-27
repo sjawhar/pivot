@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import mmap
 import multiprocessing
 import os
@@ -9,6 +11,9 @@ from typing import TYPE_CHECKING, cast
 import pytest
 
 from pivot.storage import cache, state
+
+if TYPE_CHECKING:
+    from pytest_mock import MockerFixture
 
 
 def _helper_assert_no_temp_dirs(
@@ -40,7 +45,7 @@ if TYPE_CHECKING:
 
 
 @pytest.fixture
-def mp_manager() -> "Generator[SyncManager]":
+def mp_manager() -> Generator[SyncManager]:
     """Provide a multiprocessing Manager with automatic cleanup."""
     manager = multiprocessing.Manager()
     yield manager
@@ -96,16 +101,16 @@ def test_hash_file_binary(tmp_path: pathlib.Path) -> None:
     assert len(file_hash) == 16
 
 
-def test_hash_file_large_uses_mmap(tmp_path: pathlib.Path) -> None:
+def test_hash_file_large_uses_mmap(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Large files (>=MMAP_THRESHOLD) use mmap and produce valid hashes."""
-    pattern = b"x" * 1024  # 1KB pattern
+    # Monkeypatch threshold to 100 bytes to avoid writing large files
+    monkeypatch.setattr(cache, "MMAP_THRESHOLD", 100)
 
     small_file = tmp_path / "small.bin"
-    small_file.write_bytes(pattern)
+    small_file.write_bytes(b"x" * 50)  # Below threshold
 
-    # Create file just over MMAP_THRESHOLD to ensure mmap path is used
     large_file = tmp_path / "large.bin"
-    large_file.write_bytes(b"x" * (cache.MMAP_THRESHOLD + 1))
+    large_file.write_bytes(b"x" * 150)  # Above threshold
 
     # Both should produce valid hashes
     small_hash = cache.hash_file(small_file)
@@ -119,15 +124,17 @@ def test_hash_file_large_uses_mmap(tmp_path: pathlib.Path) -> None:
 
 def test_hash_file_mmap_consistent(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Mmap and buffered read produce identical hashes for same content."""
-    content = b"test content" * 1000000  # ~12MB, above threshold
+    # Use small content but monkeypatch threshold to test both paths
+    content = b"test content for mmap consistency check"
     test_file = tmp_path / "test.bin"
     test_file.write_bytes(content)
 
-    # Get hash via mmap path (file > threshold)
+    # Set threshold below content size to force mmap path
+    monkeypatch.setattr(cache, "MMAP_THRESHOLD", 10)
     mmap_hash = cache.hash_file(test_file)
 
-    # Force buffered path by raising threshold above file size
-    monkeypatch.setattr(cache, "MMAP_THRESHOLD", len(content) + 1)
+    # Set threshold above content size to force buffered path
+    monkeypatch.setattr(cache, "MMAP_THRESHOLD", len(content) + 100)
     buffered_hash = cache.hash_file(test_file)
 
     # Both methods must produce identical hash
@@ -136,12 +143,16 @@ def test_hash_file_mmap_consistent(tmp_path: pathlib.Path, monkeypatch: pytest.M
 
 def test_hash_file_mmap_fallback(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Falls back to buffered read when mmap fails."""
-    content = b"test content" * 1000000  # ~12MB
-    large_file = tmp_path / "large.bin"
-    large_file.write_bytes(content)
+    # Use small content with low threshold to trigger mmap path
+    content = b"test content for mmap fallback testing"
+    test_file = tmp_path / "test.bin"
+    test_file.write_bytes(content)
 
-    # Get expected hash via normal path first
-    expected_hash = cache.hash_file(large_file)
+    # Set threshold below content size to trigger mmap path
+    monkeypatch.setattr(cache, "MMAP_THRESHOLD", 10)
+
+    # Get expected hash via normal path first (mmap succeeds)
+    expected_hash = cache.hash_file(test_file)
 
     # Now make mmap fail
     def failing_mmap(*args: object, **kwargs: object) -> mmap.mmap:
@@ -150,7 +161,7 @@ def test_hash_file_mmap_fallback(tmp_path: pathlib.Path, monkeypatch: pytest.Mon
     monkeypatch.setattr(mmap, "mmap", failing_mmap)
 
     # Should fall back to buffered read and produce same hash
-    fallback_hash = cache.hash_file(large_file)
+    fallback_hash = cache.hash_file(test_file)
     assert fallback_hash == expected_hash
 
 
@@ -698,9 +709,9 @@ def test_get_lock_filename_one_over_boundary() -> None:
 
 def _restore_worker(
     test_dir: pathlib.Path,
-    output_hash: "DirHash",
+    output_hash: DirHash,
     cache_dir: pathlib.Path,
-    result_queue: "multiprocessing.Queue[tuple[str, str | bool]]",
+    result_queue: multiprocessing.Queue[tuple[str, str | bool]],
 ) -> None:
     """Worker function for concurrent restore test (must be module-level for pickling)."""
     try:
@@ -714,7 +725,7 @@ def _restore_worker(
 
 def test_concurrent_restore_uses_locking(
     tmp_path: pathlib.Path,
-    mp_manager: "SyncManager",
+    mp_manager: SyncManager,
 ) -> None:
     """Concurrent restores to same path are serialized by lock."""
     test_dir = tmp_path / "mydir"
@@ -1484,3 +1495,435 @@ def test_scandir_recursive_does_not_skip_regular_dirs(tmp_path: pathlib.Path) ->
     assert "main.py" in relpaths
     assert "src/module.py" in relpaths
     assert "data/input.csv" in relpaths
+
+
+# === _resolve_checkout_modes Tests ===
+
+
+def test_resolve_checkout_modes_single_mode() -> None:
+    """Single checkout_mode returns list with that mode."""
+    result = cache._resolve_checkout_modes(cache.CheckoutMode.COPY, None)
+    assert result == [cache.CheckoutMode.COPY]
+
+
+def test_resolve_checkout_modes_list_returned_as_is() -> None:
+    """checkout_modes list is returned unchanged."""
+    modes = [cache.CheckoutMode.HARDLINK, cache.CheckoutMode.COPY]
+    result = cache._resolve_checkout_modes(None, modes)
+    assert result == modes
+
+
+def test_resolve_checkout_modes_empty_list_raises() -> None:
+    """Empty checkout_modes list raises ValueError."""
+    with pytest.raises(ValueError, match="cannot be empty"):
+        cache._resolve_checkout_modes(None, [])
+
+
+def test_resolve_checkout_modes_both_none_uses_default() -> None:
+    """Both None uses default order."""
+    result = cache._resolve_checkout_modes(None, None)
+    assert result == cache.DEFAULT_CHECKOUT_MODE_ORDER
+
+
+# === get_cache_path Validation Tests ===
+
+
+def test_get_cache_path_wrong_length_raises(tmp_path: pathlib.Path) -> None:
+    """Hash with wrong length raises SecurityValidationError."""
+    from pivot import exceptions
+
+    # Too short
+    with pytest.raises(exceptions.SecurityValidationError, match="exactly"):
+        cache.get_cache_path(tmp_path, "abc123")
+
+    # Too long
+    with pytest.raises(exceptions.SecurityValidationError, match="exactly"):
+        cache.get_cache_path(tmp_path, "a" * 20)
+
+
+def test_get_cache_path_invalid_hex_raises(tmp_path: pathlib.Path) -> None:
+    """Hash with invalid hex chars raises SecurityValidationError."""
+    from pivot import exceptions
+
+    # 16 chars but not hex (contains 'g')
+    with pytest.raises(exceptions.SecurityValidationError, match="invalid characters"):
+        cache.get_cache_path(tmp_path, "0123456789abcdeg")
+
+
+def test_get_cache_path_valid_returns_path(tmp_path: pathlib.Path) -> None:
+    """Valid hash returns correct cache path structure."""
+    result = cache.get_cache_path(tmp_path, "0123456789abcdef")
+    assert result == tmp_path / "01" / "23456789abcdef"
+
+
+# === _should_skip_entry Tests ===
+
+
+def test_should_skip_entry_pycache_dir(tmp_path: pathlib.Path) -> None:
+    """_should_skip_entry skips __pycache__ directories."""
+    pycache = tmp_path / "__pycache__"
+    pycache.mkdir()
+
+    with os.scandir(tmp_path) as entries:
+        for entry in entries:
+            if entry.name == "__pycache__":
+                assert cache._should_skip_entry(entry) is True
+
+
+def test_should_skip_entry_pyc_files(tmp_path: pathlib.Path) -> None:
+    """_should_skip_entry skips .pyc, .pyo files."""
+    (tmp_path / "module.pyc").write_text("bytecode")
+    (tmp_path / "module.pyo").write_text("optimized")
+
+    with os.scandir(tmp_path) as entries:
+        for entry in entries:
+            if entry.name.endswith((".pyc", ".pyo")):
+                assert cache._should_skip_entry(entry) is True
+
+
+def test_should_skip_entry_swap_files(tmp_path: pathlib.Path) -> None:
+    """_should_skip_entry skips .swp and .swo vim swap files."""
+    (tmp_path / "file.swp").write_text("swap")
+    (tmp_path / "file.swo").write_text("swap2")
+
+    with os.scandir(tmp_path) as entries:
+        for entry in entries:
+            if entry.name.endswith((".swp", ".swo")):
+                assert cache._should_skip_entry(entry) is True
+
+
+def test_should_skip_entry_backup_files(tmp_path: pathlib.Path) -> None:
+    """_should_skip_entry skips ~ backup files."""
+    (tmp_path / "file.txt~").write_text("backup")
+
+    with os.scandir(tmp_path) as entries:
+        for entry in entries:
+            if entry.name.endswith("~"):
+                assert cache._should_skip_entry(entry) is True
+
+
+def test_should_skip_entry_emacs_lock_files(tmp_path: pathlib.Path) -> None:
+    """_should_skip_entry skips .# Emacs lock files."""
+    (tmp_path / ".#file.txt").write_text("emacs lock")
+
+    with os.scandir(tmp_path) as entries:
+        for entry in entries:
+            if entry.name.startswith(".#"):
+                assert cache._should_skip_entry(entry) is True
+
+
+def test_should_skip_entry_regular_file_not_skipped(tmp_path: pathlib.Path) -> None:
+    """_should_skip_entry does not skip regular files."""
+    (tmp_path / "module.py").write_text("# code")
+    (tmp_path / "data.csv").write_text("a,b")
+
+    with os.scandir(tmp_path) as entries:
+        for entry in entries:
+            if entry.name in ("module.py", "data.csv"):
+                assert cache._should_skip_entry(entry) is False
+
+
+# === atomic_write_file Tests ===
+
+
+def test_atomic_write_file_normal_write(tmp_path: pathlib.Path) -> None:
+    """atomic_write_file writes file atomically."""
+    dest = tmp_path / "output.txt"
+
+    def write_fn(fd: int) -> None:
+        with os.fdopen(fd, "w") as f:
+            f.write("test content")
+
+    cache.atomic_write_file(dest, write_fn)
+
+    assert dest.exists()
+    assert dest.read_text() == "test content"
+    _helper_assert_no_temp_dirs(tmp_path)
+
+
+def test_atomic_write_file_cleans_up_on_exception(tmp_path: pathlib.Path) -> None:
+    """atomic_write_file cleans up temp file on exception."""
+    dest = tmp_path / "output.txt"
+
+    def failing_write_fn(fd: int) -> None:
+        # Don't close fd, let exception propagate
+        raise RuntimeError("write failed")
+
+    with pytest.raises(RuntimeError, match="write failed"):
+        cache.atomic_write_file(dest, failing_write_fn)
+
+    assert not dest.exists()
+    # No temp files should remain
+    tmp_files = list(tmp_path.glob("*.tmp"))
+    assert len(tmp_files) == 0
+
+
+def test_atomic_write_file_fd_closed_on_exception(tmp_path: pathlib.Path) -> None:
+    """File descriptor is closed even on exception before fdopen."""
+    dest = tmp_path / "output.txt"
+
+    def write_fn_raises_before_fdopen(fd: int) -> None:
+        _ = fd  # Mark as intentionally unused
+        # Simulate exception before taking ownership via fdopen
+        raise RuntimeError("early failure")
+
+    # The fd should be closed in the finally block
+    with pytest.raises(RuntimeError, match="early failure"):
+        cache.atomic_write_file(dest, write_fn_raises_before_fdopen)
+
+    # No temp files should remain
+    tmp_files = list(tmp_path.glob("*.tmp"))
+    assert len(tmp_files) == 0
+
+
+# === copy_to_cache Tests ===
+
+
+def test_copy_to_cache_creates_read_only_file(tmp_path: pathlib.Path) -> None:
+    """copy_to_cache creates file with mode 0o444."""
+    src = tmp_path / "source.txt"
+    src.write_text("content")
+    cache_path = tmp_path / "cache" / "ab" / "cdef"
+    cache_path.parent.mkdir(parents=True)
+
+    cache.copy_to_cache(src, cache_path)
+
+    assert cache_path.exists()
+    mode = cache_path.stat().st_mode & 0o777
+    assert mode == 0o444
+
+
+def test_copy_to_cache_skips_if_exists(tmp_path: pathlib.Path) -> None:
+    """copy_to_cache is idempotent - skips if cache path exists."""
+    src = tmp_path / "source.txt"
+    src.write_text("content")
+    cache_path = tmp_path / "cache" / "ab" / "cdef"
+    cache_path.parent.mkdir(parents=True)
+
+    # Create existing cache entry
+    cache_path.write_text("existing content")
+
+    # Should skip, not overwrite
+    cache.copy_to_cache(src, cache_path)
+
+    assert cache_path.read_text() == "existing content"
+
+
+# === _make_writable_and_retry Tests ===
+
+
+def test_make_writable_and_retry_makes_parent_writable(tmp_path: pathlib.Path) -> None:
+    """_make_writable_and_retry makes parent directory writable before retrying."""
+    # Create a read-only directory with a file
+    ro_dir = tmp_path / "readonly"
+    ro_dir.mkdir()
+    test_file = ro_dir / "file.txt"
+    test_file.write_text("content")
+
+    # Make directory read-only (can't delete files inside)
+    os.chmod(ro_dir, 0o555)
+
+    try:
+        # Should make parent writable and allow deletion
+        def mock_unlink(path: str) -> None:
+            pathlib.Path(path).unlink()
+
+        # The retry should succeed after chmod
+        cache._make_writable_and_retry(mock_unlink, str(test_file), OSError("test"))
+        assert not test_file.exists()
+    finally:
+        # Cleanup
+        os.chmod(ro_dir, 0o755)
+
+
+def test_make_writable_and_retry_handles_directory(tmp_path: pathlib.Path) -> None:
+    """_make_writable_and_retry handles read-only directories."""
+    # Create a read-only directory
+    ro_dir = tmp_path / "readonly_dir"
+    ro_dir.mkdir()
+    os.chmod(ro_dir, 0o555)
+
+    try:
+        call_count = 0
+
+        def mock_rmdir(path: str) -> None:
+            nonlocal call_count
+            call_count += 1
+            pathlib.Path(path).rmdir()
+
+        # Should make directory writable and allow rmdir
+        cache._make_writable_and_retry(mock_rmdir, str(ro_dir), OSError("test"))
+        assert call_count == 1
+        assert not ro_dir.exists()
+    finally:
+        if ro_dir.exists():
+            os.chmod(ro_dir, 0o755)
+
+
+# === Path Traversal Security Tests ===
+
+
+# === Symlink Fast Path Tests ===
+
+
+def test_restore_directory_symlink_fast_path(tmp_path: pathlib.Path) -> None:
+    """_restore_directory_from_cache uses symlink fast path when cache dir exists."""
+
+    # Create source directory with files
+    src_dir = tmp_path / "source"
+    src_dir.mkdir()
+    (src_dir / "file1.txt").write_text("content1")
+    (src_dir / "sub").mkdir()
+    (src_dir / "sub" / "file2.txt").write_text("content2")
+
+    # Create cache directory
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+
+    # Save to cache with SYMLINK mode - this creates the cache dir entry
+    dir_hash_info = cache.save_to_cache(
+        src_dir, cache_dir, state_db=None, checkout_mode=cache.CheckoutMode.SYMLINK
+    )
+    assert isinstance(dir_hash_info, dict) and "manifest" in dir_hash_info
+
+    # Now src_dir is a symlink - remove it to test restore
+    src_dir.unlink()
+
+    # Restore to a different location using SYMLINK mode (should use fast path)
+    output_dir = tmp_path / "restored"
+    result = cache._restore_directory_from_cache(
+        output_dir, dir_hash_info, cache_dir, [cache.CheckoutMode.SYMLINK]
+    )
+
+    assert result is True
+    # Output should be a symlink to cache dir
+    assert output_dir.is_symlink()
+    # Contents should be accessible
+    assert (output_dir / "file1.txt").read_text() == "content1"
+    assert (output_dir / "sub" / "file2.txt").read_text() == "content2"
+
+
+def test_restore_directory_symlink_fallback_on_failure(
+    tmp_path: pathlib.Path, mocker: MockerFixture
+) -> None:
+    """_restore_directory_from_cache falls back to file-by-file when symlink fails."""
+    # Create source directory with a file
+    src_dir = tmp_path / "source"
+    src_dir.mkdir()
+    (src_dir / "file.txt").write_text("content")
+
+    # Create cache directory
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+
+    # Save to cache with SYMLINK mode - this creates the cache dir entry
+    output_hash = cache.save_to_cache(
+        src_dir, cache_dir, state_db=None, checkout_mode=cache.CheckoutMode.SYMLINK
+    )
+    # Narrow type - save_to_cache on directory returns DirHash
+    assert output_hash is not None and "manifest" in output_hash
+
+    # Now src_dir is a symlink - remove it to test restore
+    src_dir.unlink()
+
+    # Restore to a different location, but make symlink creation fail
+    output_dir = tmp_path / "restored"
+
+    # Mock Path.symlink_to to fail, forcing fallback to file-by-file
+    original_symlink_to = pathlib.Path.symlink_to
+
+    def failing_symlink_to(self: pathlib.Path, target: pathlib.Path) -> None:
+        if "symlink_" in str(self):  # Only fail for temp symlinks
+            raise OSError("Simulated symlink failure")
+        original_symlink_to(self, target)
+
+    mocker.patch.object(pathlib.Path, "symlink_to", failing_symlink_to)
+    result = cache._restore_directory_from_cache(
+        output_dir, output_hash, cache_dir, [cache.CheckoutMode.SYMLINK, cache.CheckoutMode.COPY]
+    )
+
+    assert result is True
+    # Output should NOT be a symlink (fell back to COPY)
+    assert not output_dir.is_symlink()
+    # Contents should still be accessible
+    assert (output_dir / "file.txt").read_text() == "content"
+
+
+def test_restore_directory_copy_mode(tmp_path: pathlib.Path) -> None:
+    """_restore_directory_from_cache works with COPY mode."""
+    import shutil
+
+    from pivot.types import DirHash
+
+    # Create source directory with a file
+    src_dir = tmp_path / "source"
+    src_dir.mkdir()
+    (src_dir / "file.txt").write_text("content")
+
+    # Create cache directory
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+
+    # Hash and cache individual files (not using SYMLINK mode)
+    dir_hash, manifest = cache.hash_directory(src_dir)
+
+    # Cache each file individually
+    for entry in manifest:
+        file_path = src_dir / entry["relpath"]
+        cache_path = cache.get_cache_path(cache_dir, entry["hash"])
+        cache.copy_to_cache(file_path, cache_path)
+
+    # Remove the source directory
+    shutil.rmtree(src_dir)
+
+    # Create the DirHash for restoration
+    output_hash = DirHash(hash=dir_hash, manifest=manifest)
+
+    # Restore using COPY mode
+    output_dir = tmp_path / "restored"
+    result = cache._restore_directory_from_cache(
+        output_dir, output_hash, cache_dir, [cache.CheckoutMode.COPY]
+    )
+
+    assert result is True
+    # Output should NOT be a symlink
+    assert not output_dir.is_symlink()
+    # Contents should be accessible
+    assert (output_dir / "file.txt").read_text() == "content"
+
+
+def test_restore_directory_rejects_path_traversal(tmp_path: pathlib.Path) -> None:
+    """_restore_directory_from_cache rejects manifests with path traversal."""
+    from pivot import exceptions
+    from pivot.types import DirHash, DirManifestEntry
+
+    # Create fake cache dir
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+
+    # Create a directory to restore to
+    output_dir = tmp_path / "output"
+
+    # Create a malicious DirHash with path traversal in manifest
+    manifest_entry = DirManifestEntry(
+        relpath="../../../etc/passwd",  # Path traversal attempt
+        hash="b" * cache.XXHASH64_HEX_LENGTH,
+        size=100,
+        isexec=False,
+    )
+    malicious_hash = DirHash(
+        hash="a" * cache.XXHASH64_HEX_LENGTH,  # Fake hash
+        manifest=[manifest_entry],
+    )
+
+    # First, create the cache files so we get past the existence check
+    cache_path = cache.get_cache_path(cache_dir, "b" * cache.XXHASH64_HEX_LENGTH)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text("fake content")
+    os.chmod(cache_path, 0o444)
+
+    # Should raise SecurityValidationError
+    with pytest.raises(exceptions.SecurityValidationError, match="path traversal"):
+        cache._restore_directory_from_cache(
+            output_dir, malicious_hash, cache_dir, [cache.CheckoutMode.COPY]
+        )

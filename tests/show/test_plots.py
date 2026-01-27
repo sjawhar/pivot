@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import inspect
 import json
+import subprocess
 from typing import TYPE_CHECKING
 
+from conftest import init_git_repo
 from pivot import loaders, outputs, project
 from pivot.registry import REGISTRY, RegistryStageInfo
 from pivot.show import plots
@@ -651,7 +653,7 @@ def test_get_output_hashes_from_revision_no_git_repo(set_project_root: Path) -> 
 
 def test_get_output_hashes_from_revision_returns_hashes(set_project_root: Path) -> None:
     """Returns output hashes from lock files at revision."""
-    _setup_git_repo(set_project_root)
+    init_git_repo(set_project_root)
 
     # Create and commit lock file with hash
     state_dir = set_project_root / ".pivot"
@@ -683,7 +685,7 @@ def test_get_output_hashes_from_revision_returns_hashes(set_project_root: Path) 
 
 def test_get_output_hashes_from_revision_multiple_stages(set_project_root: Path) -> None:
     """Returns hashes from multiple stages."""
-    _setup_git_repo(set_project_root)
+    init_git_repo(set_project_root)
 
     state_dir = set_project_root / ".pivot"
     stages_dir = lock.get_stages_dir(state_dir)
@@ -724,7 +726,7 @@ def test_get_output_hashes_from_revision_multiple_stages(set_project_root: Path)
 
 def test_get_output_hashes_from_revision_normalizes_paths(set_project_root: Path) -> None:
     """Normalizes paths (e.g., ./foo.csv -> foo.csv)."""
-    _setup_git_repo(set_project_root)
+    init_git_repo(set_project_root)
 
     state_dir = set_project_root / ".pivot"
     stages_dir = lock.get_stages_dir(state_dir)
@@ -756,7 +758,7 @@ def test_get_output_hashes_from_revision_normalizes_paths(set_project_root: Path
 
 def test_get_output_hashes_from_revision_invalid_revision(set_project_root: Path) -> None:
     """Returns empty dict for invalid revision."""
-    _setup_git_repo(set_project_root)
+    init_git_repo(set_project_root)
 
     (set_project_root / "readme.txt").write_text("content")
     subprocess.run(["git", "add", "."], cwd=set_project_root, check=True, capture_output=True)
@@ -774,7 +776,7 @@ def test_get_output_hashes_from_revision_invalid_revision(set_project_root: Path
 
 def test_get_output_hashes_from_revision_no_lock_files(set_project_root: Path) -> None:
     """Returns empty dict when no lock files exist at revision."""
-    _setup_git_repo(set_project_root)
+    init_git_repo(set_project_root)
 
     (set_project_root / "readme.txt").write_text("content")
     subprocess.run(["git", "add", "."], cwd=set_project_root, check=True, capture_output=True)

@@ -180,6 +180,16 @@ def clear_source_caches() -> Generator[None]:
 
 
 @pytest.fixture(scope="session", autouse=True)
+def prewarm_worker_pool() -> Generator[None]:
+    """Pre-warm loky worker pool before tests run.
+
+    This eliminates cold-start overhead on the first test that uses workers.
+    """
+    executor_core.prepare_workers(stage_count=2, parallel=True, max_workers=2)
+    yield
+
+
+@pytest.fixture(scope="session", autouse=True)
 def cleanup_worker_pool() -> Generator[None]:
     """Kill loky worker pool at end of test session to prevent orphaned workers."""
     yield

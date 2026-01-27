@@ -554,6 +554,9 @@ async def test_upload_file_large_uses_multipart(
     mock_s3_session: MagicMock, tmp_path: pathlib.Path, mocker: MockerFixture
 ) -> None:
     """upload_file uses multipart upload for large files."""
+    # Monkeypatch chunk size to 100 bytes to avoid writing large files
+    mocker.patch.object(remote_mod, "STREAM_CHUNK_SIZE", 100)
+
     mock_client = mocker.AsyncMock()
     mock_client.create_multipart_upload = mocker.AsyncMock(
         return_value={"UploadId": "test-upload-id"}
@@ -562,16 +565,15 @@ async def test_upload_file_large_uses_multipart(
     mock_client.complete_multipart_upload = mocker.AsyncMock()
     mock_s3_session.client.return_value.__aenter__.return_value = mock_client
 
-    # Create file larger than STREAM_CHUNK_SIZE (8MB)
+    # Create file larger than patched STREAM_CHUNK_SIZE (100 bytes)
     test_file = tmp_path / "large_file.bin"
-    # Write 9MB to trigger multipart
-    test_file.write_bytes(b"x" * (9 * 1024 * 1024))
+    test_file.write_bytes(b"x" * 250)  # 250 bytes = 3 parts (100 + 100 + 50)
 
     r = remote_mod.S3Remote("s3://bucket/prefix")
     await r.upload_file(test_file, "abc123def45678")
 
     mock_client.create_multipart_upload.assert_called_once()
-    assert mock_client.upload_part.call_count == 2  # 9MB = 2 parts (8MB + 1MB)
+    assert mock_client.upload_part.call_count == 3  # 250 bytes = 3 parts at 100 byte chunks
     mock_client.complete_multipart_upload.assert_called_once()
 
 
@@ -598,6 +600,9 @@ async def test_upload_file_multipart_aborts_on_error(
     mock_s3_session: MagicMock, tmp_path: pathlib.Path, mocker: MockerFixture
 ) -> None:
     """upload_file aborts multipart upload on error."""
+    # Monkeypatch chunk size to 100 bytes to avoid writing large files
+    mocker.patch.object(remote_mod, "STREAM_CHUNK_SIZE", 100)
+
     mock_client = mocker.AsyncMock()
     mock_client.create_multipart_upload = mocker.AsyncMock(
         return_value={"UploadId": "test-upload-id"}
@@ -607,7 +612,7 @@ async def test_upload_file_multipart_aborts_on_error(
     mock_s3_session.client.return_value.__aenter__.return_value = mock_client
 
     test_file = tmp_path / "large_file.bin"
-    test_file.write_bytes(b"x" * (9 * 1024 * 1024))
+    test_file.write_bytes(b"x" * 150)  # Above 100 byte threshold
 
     r = remote_mod.S3Remote("s3://bucket/prefix")
     with pytest.raises(Exception, match="Upload failed"):

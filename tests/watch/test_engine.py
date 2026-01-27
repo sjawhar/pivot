@@ -1,10 +1,12 @@
+from __future__ import annotations
+
 import pathlib
+import py_compile
 import queue
 import runpy
 import threading
 import time
-from typing import Annotated, TypedDict
-from unittest import mock
+from typing import TYPE_CHECKING, Annotated, TypedDict
 
 import pytest
 import watchfiles
@@ -12,9 +14,12 @@ import watchfiles
 from helpers import register_test_stage
 from pivot import executor, loaders, outputs, project, types
 from pivot.pipeline import yaml as pipeline_yaml
-from pivot.registry import REGISTRY
+from pivot.registry import REGISTRY, RegistryStageInfo
 from pivot.types import AgentRunRejection, AgentRunStartResult, AgentState
 from pivot.watch import _watch_utils, engine
+
+if TYPE_CHECKING:
+    from pytest_mock import MockerFixture
 
 # =============================================================================
 # Module-level stage functions for annotation-based dependency injection
@@ -221,12 +226,12 @@ def _stage_with_nested_output() -> _OutputsResult:
 
 
 class _OutputsDir(TypedDict):
-    outputs: Annotated[pathlib.Path, outputs.Out("outputs", loaders.PathOnly())]
+    output_dir: Annotated[pathlib.Path, outputs.Out("outputs", loaders.PathOnly())]
 
 
 def _stage_with_dir_output() -> _OutputsDir:
     pathlib.Path("outputs").mkdir(exist_ok=True)
-    return _OutputsDir(outputs=pathlib.Path("outputs"))
+    return _OutputsDir(output_dir=pathlib.Path("outputs"))
 
 
 # _collect_watch_paths tests
@@ -630,7 +635,7 @@ def test_add_downstream_stages_skips_unknown_stages(
 # Integration tests with mocked executor
 
 
-def test_engine_runs_initial_execution(pipeline_dir: pathlib.Path) -> None:
+def test_engine_runs_initial_execution(pipeline_dir: pathlib.Path, mocker: MockerFixture) -> None:
     """Engine should run initial pipeline execution on start."""
     (pipeline_dir / "data.csv").write_text("a,b\n1,2")
 
@@ -646,17 +651,17 @@ def test_engine_runs_initial_execution(pipeline_dir: pathlib.Path) -> None:
     def mock_watch_loop(self: engine.WatchEngine, stages: list[str]) -> None:
         pass  # Don't actually start watching
 
-    with (
-        mock.patch.object(engine.WatchEngine, "_execute_stages", mock_execute),
-        mock.patch.object(engine.WatchEngine, "_watch_loop", mock_watch_loop),
-    ):
-        eng = engine.WatchEngine()
-        eng.run()
+    mocker.patch.object(engine.WatchEngine, "_execute_stages", mock_execute)
+    mocker.patch.object(engine.WatchEngine, "_watch_loop", mock_watch_loop)
+    eng = engine.WatchEngine()
+    eng.run()
 
     assert call_count == 1, "Should have executed initial pipeline"
 
 
-def test_engine_restarts_workers_on_code_change(pipeline_dir: pathlib.Path) -> None:
+def test_engine_restarts_workers_on_code_change(
+    pipeline_dir: pathlib.Path, mocker: MockerFixture
+) -> None:
     """Engine should restart workers when Python files change."""
     (pipeline_dir / "data.csv").write_text("a,b\n1,2")
 
@@ -681,24 +686,24 @@ def test_engine_restarts_workers_on_code_change(pipeline_dir: pathlib.Path) -> N
     def mock_reload_registry(self: engine.WatchEngine) -> bool:
         return True  # Simulate successful reload
 
-    with (
-        mock.patch.object(engine.WatchEngine, "_execute_stages", mock_execute),
-        mock.patch.object(engine.WatchEngine, "_restart_worker_pool", mock_restart),
-        mock.patch.object(engine.WatchEngine, "_reload_registry", mock_reload_registry),
-        mock.patch.object(engine.WatchEngine, "_watch_loop", mock_watch_loop),
-    ):
-        eng = engine.WatchEngine(debounce_ms=50)
+    mocker.patch.object(engine.WatchEngine, "_execute_stages", mock_execute)
+    mocker.patch.object(engine.WatchEngine, "_restart_worker_pool", mock_restart)
+    mocker.patch.object(engine.WatchEngine, "_reload_registry", mock_reload_registry)
+    mocker.patch.object(engine.WatchEngine, "_watch_loop", mock_watch_loop)
+    eng = engine.WatchEngine(debounce_ms=50)
 
-        # Simulate code change
-        code_path = pathlib.Path("/some/module.py")
-        eng._change_queue.put({code_path})
+    # Simulate code change
+    code_path = pathlib.Path("/some/module.py")
+    eng._change_queue.put({code_path})
 
-        eng.run()
+    eng.run()
 
     assert restart_called, "Should have restarted workers on code change"
 
 
-def test_engine_handles_execution_error_gracefully(pipeline_dir: pathlib.Path) -> None:
+def test_engine_handles_execution_error_gracefully(
+    pipeline_dir: pathlib.Path, mocker: MockerFixture
+) -> None:
     """Engine should continue after execution errors."""
     (pipeline_dir / "data.csv").write_text("a,b\n1,2")
 
@@ -723,23 +728,21 @@ def test_engine_handles_execution_error_gracefully(pipeline_dir: pathlib.Path) -
         return True  # Simulate successful reload
 
     # Patch at the class level to ensure thread captures mocked method
-    with (
-        mock.patch.object(engine.WatchEngine, "_execute_stages", mock_execute),
-        mock.patch.object(engine.WatchEngine, "_reload_registry", mock_reload_registry),
-        mock.patch.object(engine.WatchEngine, "_watch_loop", mock_watch_loop),
-    ):
-        eng = engine.WatchEngine(debounce_ms=50)
+    mocker.patch.object(engine.WatchEngine, "_execute_stages", mock_execute)
+    mocker.patch.object(engine.WatchEngine, "_reload_registry", mock_reload_registry)
+    mocker.patch.object(engine.WatchEngine, "_watch_loop", mock_watch_loop)
+    eng = engine.WatchEngine(debounce_ms=50)
 
-        # Queue a code change to trigger second iteration (code changes trigger all stages)
-        def queue_change() -> None:
-            time.sleep(0.1)
-            eng._change_queue.put({pathlib.Path("/some/code.py")})
+    # Queue a code change to trigger second iteration (code changes trigger all stages)
+    def queue_change() -> None:
+        time.sleep(0.1)
+        eng._change_queue.put({pathlib.Path("/some/code.py")})
 
-        thread = threading.Thread(target=queue_change)
-        thread.start()
+    thread = threading.Thread(target=queue_change)
+    thread.start()
 
-        eng.run()
-        thread.join()
+    eng.run()
+    thread.join()
 
     assert call_count == 2, "Should have continued after error"
 
@@ -747,7 +750,9 @@ def test_engine_handles_execution_error_gracefully(pipeline_dir: pathlib.Path) -
 # Watcher thread exception handling tests
 
 
-def test_watcher_thread_exception_triggers_shutdown(pipeline_dir: pathlib.Path) -> None:
+def test_watcher_thread_exception_triggers_shutdown(
+    pipeline_dir: pathlib.Path, mocker: MockerFixture
+) -> None:
     """Watcher thread exceptions should trigger engine shutdown."""
     (pipeline_dir / "data.csv").write_text("a,b\n1,2")
 
@@ -770,12 +775,10 @@ def test_watcher_thread_exception_triggers_shutdown(pipeline_dir: pathlib.Path) 
     def mock_execute(self: engine.WatchEngine, stages: list[str] | None) -> None:
         pass  # Initial execution succeeds
 
-    with (
-        mock.patch.object(engine.WatchEngine, "_watch_loop", patched_watch_loop),
-        mock.patch.object(engine.WatchEngine, "_execute_stages", mock_execute),
-    ):
-        eng = engine.WatchEngine(debounce_ms=50)
-        eng.run()
+    mocker.patch.object(engine.WatchEngine, "_watch_loop", patched_watch_loop)
+    mocker.patch.object(engine.WatchEngine, "_execute_stages", mock_execute)
+    eng = engine.WatchEngine(debounce_ms=50)
+    eng.run()
 
     assert shutdown_triggered, "Watcher exception should trigger shutdown"
     assert eng._shutdown.is_set(), "Shutdown event should be set"
@@ -854,7 +857,7 @@ def test_concurrent_shutdown_during_debounce(pipeline_dir: pathlib.Path) -> None
     assert elapsed < 1.0, f"Should exit quickly on shutdown, took {elapsed}s"
 
 
-def test_concurrent_shutdown_during_run(pipeline_dir: pathlib.Path) -> None:
+def test_concurrent_shutdown_during_run(pipeline_dir: pathlib.Path, mocker: MockerFixture) -> None:
     """Shutdown during run() should clean up watcher thread."""
     (pipeline_dir / "data.csv").write_text("a,b\n1,2")
 
@@ -871,22 +874,20 @@ def test_concurrent_shutdown_during_run(pipeline_dir: pathlib.Path) -> None:
         while not self._shutdown.is_set():
             time.sleep(0.05)
 
-    with (
-        mock.patch.object(engine.WatchEngine, "_execute_stages", mock_execute),
-        mock.patch.object(engine.WatchEngine, "_watch_loop", mock_watch_loop),
-    ):
-        eng = engine.WatchEngine(debounce_ms=50)
+    mocker.patch.object(engine.WatchEngine, "_execute_stages", mock_execute)
+    mocker.patch.object(engine.WatchEngine, "_watch_loop", mock_watch_loop)
+    eng = engine.WatchEngine(debounce_ms=50)
 
-        # Trigger shutdown shortly after start
-        def delayed_shutdown() -> None:
-            time.sleep(0.2)
-            eng.shutdown()
+    # Trigger shutdown shortly after start
+    def delayed_shutdown() -> None:
+        time.sleep(0.2)
+        eng.shutdown()
 
-        shutdown_thread = threading.Thread(target=delayed_shutdown)
-        shutdown_thread.start()
+    shutdown_thread = threading.Thread(target=delayed_shutdown)
+    shutdown_thread.start()
 
-        eng.run()
-        shutdown_thread.join()
+    eng.run()
+    shutdown_thread.join()
 
     assert eng._shutdown.is_set(), "Shutdown should be set"
     assert execution_count == 1, "Should have run initial execution"
@@ -918,19 +919,20 @@ def test_watch_filter_resolves_symlinks(pipeline_dir: pathlib.Path) -> None:
 
 
 def test_watch_filter_handles_broken_symlink(pipeline_dir: pathlib.Path) -> None:
-    """Watch filter should handle broken symlinks gracefully."""
+    """Watch filter should handle broken symlinks gracefully without crashing."""
     # Create symlink to non-existent file
     broken_link = pipeline_dir / "broken_link.txt"
     broken_link.symlink_to(pipeline_dir / "nonexistent.txt")
 
     register_test_stage(_stage_with_data_csv_dep, name="process")
 
+    # Filter with glob pattern "process" - broken symlink won't match this pattern
     watch_filter = _watch_utils.create_watch_filter(["process"])
 
-    # Broken symlink should not crash, should allow through (can't resolve)
+    # The key test: broken symlinks should not crash the filter
+    # Returns False because "broken_link.txt" doesn't match glob "process"
     result = watch_filter(watchfiles.Change.modified, str(broken_link))
-    # Either True (allowed) or False (filtered) is acceptable, just shouldn't crash
-    assert isinstance(result, bool), "Should return a boolean, not crash"
+    assert result is False, "Should not match 'process' glob pattern"
 
 
 def test_get_stages_affected_handles_deleted_file(pipeline_dir: pathlib.Path) -> None:
@@ -1032,7 +1034,9 @@ def test_is_code_or_config_change(changes: set[pathlib.Path], expected: bool) ->
 # Integration test with real watchfiles
 
 
-def test_integration_watchfiles_detects_real_file_change(pipeline_dir: pathlib.Path) -> None:
+def test_integration_watchfiles_detects_real_file_change(
+    pipeline_dir: pathlib.Path, mocker: MockerFixture
+) -> None:
     """Integration test: actual watchfiles detects real file changes (not mocked)."""
     # Create data file that will be watched
     data_file = pipeline_dir / "data.csv"
@@ -1049,26 +1053,26 @@ def test_integration_watchfiles_detects_real_file_change(pipeline_dir: pathlib.P
             execution_event.set()
             self.shutdown()
 
-    with mock.patch.object(engine.WatchEngine, "_execute_stages", mock_execute):
-        eng = engine.WatchEngine(debounce_ms=50)
+    mocker.patch.object(engine.WatchEngine, "_execute_stages", mock_execute)
+    eng = engine.WatchEngine(debounce_ms=50)
 
-        # Run engine in background thread (run() blocks)
-        engine_thread = threading.Thread(target=eng.run)
-        engine_thread.start()
+    # Run engine in background thread (run() blocks)
+    engine_thread = threading.Thread(target=eng.run)
+    engine_thread.start()
 
-        # Wait for watcher to initialize and start watching
-        time.sleep(0.1)
+    # Wait for watcher to initialize and start watching
+    time.sleep(0.1)
 
-        # Modify the data file - this should trigger re-execution
-        data_file.write_text("a,b\n1,2\n3,4")
+    # Modify the data file - this should trigger re-execution
+    data_file.write_text("a,b\n1,2\n3,4")
 
-        # Wait for execution to be triggered (with timeout to prevent hang)
-        triggered = execution_event.wait(timeout=2.0)
+    # Wait for execution to be triggered (with timeout to prevent hang)
+    triggered = execution_event.wait(timeout=2.0)
 
-        # Clean shutdown if test times out
-        if not triggered:
-            eng.shutdown()
-        engine_thread.join(timeout=1.0)
+    # Clean shutdown if test times out
+    if not triggered:
+        eng.shutdown()
+    engine_thread.join(timeout=1.0)
 
     assert len(execution_stages) >= 2, (
         f"Expected at least 2 executions (initial + triggered), got {len(execution_stages)}"
@@ -1080,7 +1084,9 @@ def test_integration_watchfiles_detects_real_file_change(pipeline_dir: pathlib.P
     assert "process" in execution_stages[1], "Second execution should include affected stage"
 
 
-def test_integration_watchfiles_detects_python_code_change(pipeline_dir: pathlib.Path) -> None:
+def test_integration_watchfiles_detects_python_code_change(
+    pipeline_dir: pathlib.Path, mocker: MockerFixture
+) -> None:
     """Integration test: watchfiles detects Python file changes and triggers worker restart."""
     # Create data file and Python file
     data_file = pipeline_dir / "data.csv"
@@ -1108,27 +1114,25 @@ def test_integration_watchfiles_detects_python_code_change(pipeline_dir: pathlib
     def mock_reload_registry(self: engine.WatchEngine) -> bool:
         return True  # Simulate successful reload
 
-    with (
-        mock.patch.object(engine.WatchEngine, "_execute_stages", mock_execute),
-        mock.patch.object(engine.WatchEngine, "_restart_worker_pool", mock_restart),
-        mock.patch.object(engine.WatchEngine, "_reload_registry", mock_reload_registry),
-    ):
-        eng = engine.WatchEngine(debounce_ms=50)
+    mocker.patch.object(engine.WatchEngine, "_execute_stages", mock_execute)
+    mocker.patch.object(engine.WatchEngine, "_restart_worker_pool", mock_restart)
+    mocker.patch.object(engine.WatchEngine, "_reload_registry", mock_reload_registry)
+    eng = engine.WatchEngine(debounce_ms=50)
 
-        engine_thread = threading.Thread(target=eng.run)
-        engine_thread.start()
+    engine_thread = threading.Thread(target=eng.run)
+    engine_thread.start()
 
-        # Wait for watcher to start
-        time.sleep(0.1)
+    # Wait for watcher to start
+    time.sleep(0.1)
 
-        # Modify Python file - should trigger worker restart
-        code_file.write_text("def helper(): return 42\n")
+    # Modify Python file - should trigger worker restart
+    code_file.write_text("def helper(): return 42\n")
 
-        triggered = execution_event.wait(timeout=2.0)
+    triggered = execution_event.wait(timeout=2.0)
 
-        if not triggered:
-            eng.shutdown()
-        engine_thread.join(timeout=1.0)
+    if not triggered:
+        eng.shutdown()
+    engine_thread.join(timeout=1.0)
 
     assert execution_count >= 2, f"Expected at least 2 executions, got {execution_count}"
     assert restart_called, "Worker pool should be restarted on Python file change"
@@ -1295,6 +1299,7 @@ def test_reload_registry_logs_when_no_modules_found(
 
 def test_reload_registry_clears_and_reimports_modules(
     pipeline_dir: pathlib.Path,
+    mocker: MockerFixture,
 ) -> None:
     """_reload_registry should clear project modules and reimport them."""
 
@@ -1306,11 +1311,11 @@ def test_reload_registry_clears_and_reimports_modules(
     assert "test_stage" in initial_stages
 
     # Mock _clear_project_modules to verify it's called (for decorator path)
-    with (
-        mock.patch.object(engine, "_clear_project_modules", return_value=0) as mock_clear,
-        mock.patch("importlib.import_module"),
-    ):
-        eng._reload_registry()
+    mock_clear = mocker.patch.object(
+        engine, "_clear_project_modules", return_value=0, autospec=True
+    )
+    mocker.patch("importlib.import_module", autospec=True)
+    eng._reload_registry()
 
     # clear_project_modules should have been called
     assert mock_clear.called, "Should clear project modules before reload"
@@ -1344,16 +1349,21 @@ def test_is_existing_dir_returns_false_for_file(
 
 def test_is_existing_dir_handles_os_error(
     pipeline_dir: pathlib.Path,
+    mocker: MockerFixture,
 ) -> None:
     """_is_existing_dir should return False on OSError."""
     test_path = pipeline_dir / "test_path"
 
-    with mock.patch.object(pathlib.Path, "is_dir", side_effect=OSError("Permission denied")):
-        assert engine._is_existing_dir(test_path) is False
+    mocker.patch.object(
+        pathlib.Path, "is_dir", side_effect=OSError("Permission denied"), autospec=True
+    )
+    assert engine._is_existing_dir(test_path) is False
 
 
 def test_reload_registry_handles_import_exception(
-    pipeline_dir: pathlib.Path, caplog: pytest.LogCaptureFixture
+    pipeline_dir: pathlib.Path,
+    caplog: pytest.LogCaptureFixture,
+    mocker: MockerFixture,
 ) -> None:
     """_reload_registry should return False and preserve registry when import fails."""
 
@@ -1362,8 +1372,10 @@ def test_reload_registry_handles_import_exception(
     eng = engine.WatchEngine()
 
     # Mock import_module to raise an exception (for decorator path)
-    with mock.patch("importlib.import_module", side_effect=ImportError("Module not found")):
-        result = eng._reload_registry()
+    mocker.patch(
+        "importlib.import_module", side_effect=ImportError("Module not found"), autospec=True
+    )
+    result = eng._reload_registry()
 
     assert result is False, "Should return False on import failure"
     assert "Failed to import module" in caplog.text
@@ -1540,7 +1552,9 @@ REGISTRY.register(py_stage)
 
 
 def test_reload_registry_falls_back_to_decorators(
-    pipeline_dir: pathlib.Path, caplog: pytest.LogCaptureFixture
+    pipeline_dir: pathlib.Path,
+    caplog: pytest.LogCaptureFixture,
+    mocker: MockerFixture,
 ) -> None:
     """_reload_registry should fall back to decorator reload when no config files."""
     # Remove pivot.yaml stages section
@@ -1552,8 +1566,8 @@ def test_reload_registry_falls_back_to_decorators(
     eng = engine.WatchEngine()
 
     # Mock import_module to verify decorator path is used
-    with mock.patch("importlib.import_module") as mock_import:
-        result = eng._reload_registry()
+    mock_import = mocker.patch("importlib.import_module", autospec=True)
+    result = eng._reload_registry()
 
     assert result is True
     assert mock_import.called, (
@@ -1664,6 +1678,7 @@ REGISTRY.register(preserved_py_stage)
 
 def test_watch_filter_handles_resolve_oserror(
     pipeline_dir: pathlib.Path,
+    mocker: MockerFixture,
 ) -> None:
     """Watch filter should not filter paths that can't be resolved."""
 
@@ -1672,21 +1687,26 @@ def test_watch_filter_handles_resolve_oserror(
     watch_filter = _watch_utils.create_watch_filter(["process"])
 
     # Mock project.resolve_path to raise OSError
-    with mock.patch.object(project, "resolve_path", side_effect=OSError("Permission denied")):
-        # Should return True (don't filter) when path can't be resolved
-        result = watch_filter(watchfiles.Change.modified, "/some/path")
-        assert result is True
+    mocker.patch.object(
+        project, "resolve_path", side_effect=OSError("Permission denied"), autospec=True
+    )
+    # Should return True (don't filter) when path can't be resolved
+    result = watch_filter(watchfiles.Change.modified, "/some/path")
+    assert result is True
 
 
 def test_resolve_path_for_matching_handles_oserror(
     pipeline_dir: pathlib.Path,
+    mocker: MockerFixture,
 ) -> None:
     """_resolve_path_for_matching should use normalized path on OSError."""
     test_path = pipeline_dir / "test_file.txt"
 
     # Mock project.resolve_path to raise OSError
-    with mock.patch.object(project, "resolve_path", side_effect=OSError("Access denied")):
-        result = engine._resolve_path_for_matching(test_path)
+    mocker.patch.object(
+        project, "resolve_path", side_effect=OSError("Access denied"), autospec=True
+    )
+    result = engine._resolve_path_for_matching(test_path)
 
     # Should return normalized absolute path
     assert result.is_absolute()
@@ -1695,6 +1715,7 @@ def test_resolve_path_for_matching_handles_oserror(
 
 def test_get_stages_matching_changes_handles_is_relative_to_error(
     pipeline_dir: pathlib.Path,
+    mocker: MockerFixture,
 ) -> None:
     """Should handle ValueError from is_relative_to."""
     data_dir = pipeline_dir / "data"
@@ -1711,8 +1732,8 @@ def test_get_stages_matching_changes_handles_is_relative_to_error(
     def mock_is_relative_to(self: pathlib.Path, other: pathlib.Path) -> bool:
         raise ValueError("Cannot compare paths")
 
-    with mock.patch.object(pathlib.Path, "is_relative_to", mock_is_relative_to):
-        affected = eng._get_stages_matching_changes(changes)
+    mocker.patch.object(pathlib.Path, "is_relative_to", mock_is_relative_to)
+    affected = eng._get_stages_matching_changes(changes)
 
     # Should not raise, should return empty set
     assert affected == set()
@@ -1746,7 +1767,9 @@ def test_reload_registry_returns_true_when_no_modules(pipeline_dir: pathlib.Path
     assert result is True, "Should return True when no modules to reload"
 
 
-def test_coordinator_loop_skips_execution_when_invalid(pipeline_dir: pathlib.Path) -> None:
+def test_coordinator_loop_skips_execution_when_invalid(
+    pipeline_dir: pathlib.Path, mocker: MockerFixture
+) -> None:
     """Coordinator should skip execution when pipeline is invalid."""
 
     register_test_stage(_stage_noop, name="invalid_test_stage")
@@ -1775,12 +1798,12 @@ def test_coordinator_loop_skips_execution_when_invalid(pipeline_dir: pathlib.Pat
     ) -> None:
         messages.append(msg)
 
-    with (
-        mock.patch.object(eng, "_collect_and_debounce", side_effect=mock_collect_and_debounce),
-        mock.patch.object(eng, "_send_message", side_effect=capture_message),
-        mock.patch.object(eng, "_execute_stages") as mock_execute,
-    ):
-        eng._coordinator_loop()
+    mocker.patch.object(
+        eng, "_collect_and_debounce", side_effect=mock_collect_and_debounce, autospec=True
+    )
+    mocker.patch.object(eng, "_send_message", side_effect=capture_message, autospec=True)
+    mock_execute = mocker.patch.object(eng, "_execute_stages", autospec=True)
+    eng._coordinator_loop()
 
     # Should not have called execute since pipeline is invalid
     mock_execute.assert_not_called()
@@ -1788,7 +1811,9 @@ def test_coordinator_loop_skips_execution_when_invalid(pipeline_dir: pathlib.Pat
     assert "Watching for changes..." in messages
 
 
-def test_coordinator_loop_sends_error_on_reload_failure(pipeline_dir: pathlib.Path) -> None:
+def test_coordinator_loop_sends_error_on_reload_failure(
+    pipeline_dir: pathlib.Path, mocker: MockerFixture
+) -> None:
     """Coordinator should send error message when reload fails."""
 
     register_test_stage(_stage_noop, name="reload_fail_stage")
@@ -1815,14 +1840,16 @@ def test_coordinator_loop_sends_error_on_reload_failure(pipeline_dir: pathlib.Pa
         is_err = is_error or (status == types.WatchStatus.ERROR)
         messages.append((msg, is_err))
 
-    with (
-        mock.patch.object(eng, "_collect_and_debounce", side_effect=mock_collect_and_debounce),
-        mock.patch.object(eng, "_send_message", side_effect=capture_message),
-        mock.patch.object(eng, "_invalidate_caches"),
-        mock.patch.object(eng, "_restart_worker_pool"),
-        mock.patch("importlib.import_module", side_effect=SyntaxError("invalid syntax")),
-    ):
-        eng._coordinator_loop()
+    mocker.patch.object(
+        eng, "_collect_and_debounce", side_effect=mock_collect_and_debounce, autospec=True
+    )
+    mocker.patch.object(eng, "_send_message", side_effect=capture_message, autospec=True)
+    mocker.patch.object(eng, "_invalidate_caches", autospec=True)
+    mocker.patch.object(eng, "_restart_worker_pool", autospec=True)
+    mocker.patch(
+        "importlib.import_module", side_effect=SyntaxError("invalid syntax"), autospec=True
+    )
+    eng._coordinator_loop()
 
     # Should have sent error message
     error_messages = [(msg, err) for msg, err in messages if err]
@@ -1832,6 +1859,7 @@ def test_coordinator_loop_sends_error_on_reload_failure(pipeline_dir: pathlib.Pa
 
 def test_coordinator_loop_clears_invalid_state_on_successful_reload(
     pipeline_dir: pathlib.Path,
+    mocker: MockerFixture,
 ) -> None:
     """Coordinator should clear invalid state when reload succeeds."""
 
@@ -1853,14 +1881,14 @@ def test_coordinator_loop_clears_invalid_state_on_successful_reload(
         eng._shutdown.set()
         return set()
 
-    with (
-        mock.patch.object(eng, "_collect_and_debounce", side_effect=mock_collect_and_debounce),
-        mock.patch.object(eng, "_send_message"),
-        mock.patch.object(eng, "_invalidate_caches"),
-        mock.patch.object(eng, "_restart_worker_pool"),
-        mock.patch.object(eng, "_execute_stages"),
-    ):
-        eng._coordinator_loop()
+    mocker.patch.object(
+        eng, "_collect_and_debounce", side_effect=mock_collect_and_debounce, autospec=True
+    )
+    mocker.patch.object(eng, "_send_message", autospec=True)
+    mocker.patch.object(eng, "_invalidate_caches", autospec=True)
+    mocker.patch.object(eng, "_restart_worker_pool", autospec=True)
+    mocker.patch.object(eng, "_execute_stages", autospec=True)
+    eng._coordinator_loop()
 
     # After successful reload, errors should be cleared
     assert eng._pipeline_errors is None, "Errors should be cleared on successful reload"
@@ -1883,7 +1911,9 @@ def test_engine_init_accepts_force_first_run(pipeline_dir: pathlib.Path) -> None
     assert eng._first_run_done is False
 
 
-def test_execute_stages_passes_force_on_first_run(pipeline_dir: pathlib.Path) -> None:
+def test_execute_stages_passes_force_on_first_run(
+    pipeline_dir: pathlib.Path, mocker: MockerFixture
+) -> None:
     """_execute_stages should pass force=True on first run when force_first_run=True."""
     (pipeline_dir / "data.csv").write_text("a,b\n1,2")
 
@@ -1896,15 +1926,17 @@ def test_execute_stages_passes_force_on_first_run(pipeline_dir: pathlib.Path) ->
     def capture_force(**kwargs: object) -> None:
         force_values.append(bool(kwargs.get("force", False)))
 
-    with mock.patch.object(executor, "run", side_effect=capture_force):
-        eng._execute_stages(None)
+    mocker.patch.object(executor, "run", side_effect=capture_force, autospec=True)
+    eng._execute_stages(None)
 
     assert len(force_values) == 1
     assert force_values[0] is True, "First execution should have force=True"
     assert eng._first_run_done is True, "_first_run_done should be set after first execution"
 
 
-def test_execute_stages_does_not_force_subsequent_runs(pipeline_dir: pathlib.Path) -> None:
+def test_execute_stages_does_not_force_subsequent_runs(
+    pipeline_dir: pathlib.Path, mocker: MockerFixture
+) -> None:
     """_execute_stages should pass force=False on subsequent runs."""
     (pipeline_dir / "data.csv").write_text("a,b\n1,2")
 
@@ -1917,10 +1949,10 @@ def test_execute_stages_does_not_force_subsequent_runs(pipeline_dir: pathlib.Pat
     def capture_force(**kwargs: object) -> None:
         force_values.append(bool(kwargs.get("force", False)))
 
-    with mock.patch.object(executor, "run", side_effect=capture_force):
-        eng._execute_stages(None)  # First run
-        eng._execute_stages(None)  # Second run
-        eng._execute_stages(None)  # Third run
+    mocker.patch.object(executor, "run", side_effect=capture_force, autospec=True)
+    eng._execute_stages(None)  # First run
+    eng._execute_stages(None)  # Second run
+    eng._execute_stages(None)  # Third run
 
     assert len(force_values) == 3
     assert force_values[0] is True, "First execution should have force=True"
@@ -1928,7 +1960,9 @@ def test_execute_stages_does_not_force_subsequent_runs(pipeline_dir: pathlib.Pat
     assert force_values[2] is False, "Third execution should have force=False"
 
 
-def test_execute_stages_without_force_first_run_never_forces(pipeline_dir: pathlib.Path) -> None:
+def test_execute_stages_without_force_first_run_never_forces(
+    pipeline_dir: pathlib.Path, mocker: MockerFixture
+) -> None:
     """_execute_stages should never pass force=True when force_first_run=False."""
     (pipeline_dir / "data.csv").write_text("a,b\n1,2")
 
@@ -1941,14 +1975,14 @@ def test_execute_stages_without_force_first_run_never_forces(pipeline_dir: pathl
     def capture_force(**kwargs: object) -> None:
         force_values.append(bool(kwargs.get("force", False)))
 
-    with mock.patch.object(executor, "run", side_effect=capture_force):
-        eng._execute_stages(None)
-        eng._execute_stages(None)
+    mocker.patch.object(executor, "run", side_effect=capture_force, autospec=True)
+    eng._execute_stages(None)
+    eng._execute_stages(None)
 
     assert all(v is False for v in force_values), "All executions should have force=False"
 
 
-def test_first_run_done_flag_stress_test(pipeline_dir: pathlib.Path) -> None:
+def test_first_run_done_flag_stress_test(pipeline_dir: pathlib.Path, mocker: MockerFixture) -> None:
     """Stress test: rapid executions should only force first run, never subsequent ones.
 
     This test verifies _first_run_done behaves correctly even under rapid execution.
@@ -1972,9 +2006,9 @@ def test_first_run_done_flag_stress_test(pipeline_dir: pathlib.Path) -> None:
     # Run many executions rapidly
     num_executions = 100
 
-    with mock.patch.object(executor, "run", side_effect=capture_force):
-        for _ in range(num_executions):
-            eng._execute_stages(None)
+    mocker.patch.object(executor, "run", side_effect=capture_force, autospec=True)
+    for _ in range(num_executions):
+        eng._execute_stages(None)
 
     assert len(force_values) == num_executions
     # First execution should have force=True
@@ -2620,3 +2654,270 @@ def test_get_agent_status_returns_completion_stats() -> None:
         assert status["skipped"] == 1
     if "failed" in status:
         assert status["failed"] == 0
+
+
+# =============================================================================
+# _get_pyc_path Tests
+# =============================================================================
+
+
+def test_get_pyc_path_non_py_returns_none() -> None:
+    """_get_pyc_path returns None for non-.py files."""
+    result = engine._get_pyc_path("/some/path/file.txt")
+    assert result is None
+
+
+def test_get_pyc_path_no_pyc_exists(tmp_path: pathlib.Path) -> None:
+    """_get_pyc_path returns None when no .pyc exists."""
+    py_file = tmp_path / "module.py"
+    py_file.write_text("# test code")
+
+    result = engine._get_pyc_path(str(py_file))
+    assert result is None
+
+
+def test_get_pyc_path_with_existing_pyc(tmp_path: pathlib.Path) -> None:
+    """_get_pyc_path returns pyc path when it exists."""
+    # Create a Python file and compile it
+    py_file = tmp_path / "module.py"
+    py_file.write_text("x = 1")
+    py_compile.compile(str(py_file), cfile=None, doraise=True)
+
+    result = engine._get_pyc_path(str(py_file))
+    assert result is not None
+    assert result.suffix == ".pyc"
+    assert result.parent.name == "__pycache__"
+
+
+# =============================================================================
+# toggle_keep_going Tests
+# =============================================================================
+
+
+@pytest.mark.usefixtures("pipeline_dir")
+def test_toggle_keep_going_toggles_state() -> None:
+    """toggle_keep_going toggles the state and returns new value."""
+    eng = engine.WatchEngine()
+    assert eng.keep_going is False
+
+    # Toggle on
+    result = eng.toggle_keep_going()
+    assert result is True
+    assert eng.keep_going is True
+
+    # Toggle off
+    result = eng.toggle_keep_going()
+    assert result is False
+    assert eng.keep_going is False
+
+
+# =============================================================================
+# _check_agent_requests Tests
+# =============================================================================
+
+
+@pytest.mark.usefixtures("pipeline_dir")
+def test_check_agent_requests_empty_queue() -> None:
+    """_check_agent_requests returns None when queue is empty."""
+    eng = engine.WatchEngine()
+    result = eng._check_agent_requests()
+    assert result is None
+
+
+@pytest.mark.usefixtures("pipeline_dir")
+def test_check_agent_requests_returns_queued_request() -> None:
+    """_check_agent_requests returns queued request tuple."""
+    eng = engine.WatchEngine()
+
+    # Manually put a request in the queue
+    eng._agent_request_queue.put_nowait(("run123", ["stage_a"], True))
+
+    result = eng._check_agent_requests()
+    assert result == ("run123", ["stage_a"], True)
+
+
+# =============================================================================
+# _emit_json Tests
+# =============================================================================
+
+
+@pytest.mark.usefixtures("pipeline_dir")
+def test_emit_json_outputs_to_stdout(capsys: pytest.CaptureFixture[str]) -> None:
+    """_emit_json outputs JSON to stdout when json_output=True."""
+    eng = engine.WatchEngine(json_output=True)
+
+    event = types.WatchStatusEvent(
+        type=types.WatchEventType.STATUS,
+        message="Test message",
+        is_error=False,
+    )
+    eng._emit_json(event)
+
+    captured = capsys.readouterr()
+    assert '"type": "status"' in captured.out
+    assert '"message": "Test message"' in captured.out
+
+
+@pytest.mark.usefixtures("pipeline_dir")
+def test_emit_json_includes_event_type(capsys: pytest.CaptureFixture[str]) -> None:
+    """_emit_json includes correct event type in output."""
+    eng = engine.WatchEngine(json_output=True)
+
+    # Test files_changed event type
+    event = types.WatchFilesChangedEvent(
+        type=types.WatchEventType.FILES_CHANGED,
+        paths=["test.py"],
+        code_changed=True,
+    )
+    eng._emit_json(event)
+
+    captured = capsys.readouterr()
+    assert '"type": "files_changed"' in captured.out
+
+
+# =============================================================================
+# _send_reload_notification Tests
+# =============================================================================
+
+
+@pytest.mark.usefixtures("pipeline_dir")
+def test_send_reload_notification_sends_message() -> None:
+    """_send_reload_notification sends RELOAD message to TUI queue."""
+    register_test_stage(_stage_noop, name="test_stage")
+
+    eng = engine.WatchEngine()
+    tui_queue: types.TuiQueue = queue.Queue()
+    eng._tui_queue = tui_queue
+
+    eng._send_reload_notification()
+
+    assert not tui_queue.empty()
+    msg = tui_queue.get_nowait()
+    assert msg is not None
+    assert msg["type"] == types.TuiMessageType.RELOAD
+    # Narrow to TuiReloadMessage
+    assert "stages" in msg
+    assert "test_stage" in msg["stages"]
+
+
+@pytest.mark.usefixtures("pipeline_dir")
+def test_send_reload_notification_handles_full_queue() -> None:
+    """_send_reload_notification handles queue.Full gracefully."""
+    register_test_stage(_stage_noop, name="test_stage")
+
+    eng = engine.WatchEngine()
+    # Use a tiny queue that we fill up
+    tiny_queue: types.TuiQueue = queue.Queue(maxsize=1)
+    # Fill it with a proper TuiMessage
+    dummy_msg = types.TuiWatchMessage(
+        type=types.TuiMessageType.WATCH,
+        status=types.WatchStatus.WAITING,
+        message="dummy",
+    )
+    tiny_queue.put(dummy_msg)
+    eng._tui_queue = tiny_queue
+
+    # Should not raise, just suppress
+    eng._send_reload_notification()  # Does nothing, queue is full
+
+
+# =============================================================================
+# _collect_stage_modules Tests
+# =============================================================================
+
+
+def test_collect_stage_modules_extracts_modules() -> None:
+    """_collect_stage_modules extracts __module__ from stage functions."""
+
+    def fake_func() -> None:
+        pass
+
+    stages: dict[str, RegistryStageInfo] = {
+        "stage1": {
+            "func": fake_func,
+            "name": "stage1",
+            "deps": {},
+            "deps_paths": [],
+            "outs": [],
+            "outs_paths": [],
+            "params": None,
+            "mutex": [],
+            "variant": None,
+            "signature": None,
+            "fingerprint": {},
+            "dep_specs": {},
+            "out_specs": {},
+            "params_arg_name": None,
+        }
+    }
+
+    result = engine._collect_stage_modules(stages)
+
+    assert isinstance(result, set)
+    # fake_func's __module__ should be in the result
+    assert fake_func.__module__ in result
+
+
+def test_collect_stage_modules_returns_set() -> None:
+    """_collect_stage_modules returns set of module names."""
+    # Empty stages dict
+    stages: dict[str, RegistryStageInfo] = {}
+
+    result = engine._collect_stage_modules(stages)
+
+    assert isinstance(result, set)
+    assert len(result) == 0
+
+
+# =============================================================================
+# _find_pipeline_file Tests
+# =============================================================================
+
+
+def test_find_pipeline_file_invalid_yaml_returns_none(tmp_path: pathlib.Path) -> None:
+    """_find_pipeline_file returns None for invalid YAML."""
+    pivot_yaml = tmp_path / "pivot.yaml"
+    pivot_yaml.write_text("invalid: yaml: syntax: {broken")
+
+    result = engine._find_pipeline_file(tmp_path)
+
+    # Invalid YAML is skipped (returns None if no valid files)
+    assert result is None
+
+
+def test_find_pipeline_file_missing_stages_returns_none(tmp_path: pathlib.Path) -> None:
+    """_find_pipeline_file returns None if stages section missing."""
+    pivot_yaml = tmp_path / "pivot.yaml"
+    pivot_yaml.write_text("# No stages section\nother_key: value\n")
+
+    result = engine._find_pipeline_file(tmp_path)
+
+    # Only returns path if file has stages section
+    assert result is None
+
+
+def test_find_pipeline_file_prefers_pivot_yaml_over_yml(tmp_path: pathlib.Path) -> None:
+    """_find_pipeline_file prefers pivot.yaml over pivot.yml."""
+    (tmp_path / "pivot.yaml").write_text("stages: {}")
+    (tmp_path / "pivot.yml").write_text("stages: {}")
+
+    result = engine._find_pipeline_file(tmp_path)
+
+    assert result == tmp_path / "pivot.yaml"
+
+
+def test_find_pipeline_file_falls_back_to_yml(tmp_path: pathlib.Path) -> None:
+    """_find_pipeline_file falls back to pivot.yml if pivot.yaml doesn't exist."""
+    (tmp_path / "pivot.yml").write_text("stages: {}")
+
+    result = engine._find_pipeline_file(tmp_path)
+
+    assert result == tmp_path / "pivot.yml"
+
+
+def test_find_pipeline_file_returns_none_if_no_stages(tmp_path: pathlib.Path) -> None:
+    """_find_pipeline_file returns None if no pivot.yaml with stages exists."""
+    # No pivot.yaml/yml files at all
+    result = engine._find_pipeline_file(tmp_path)
+
+    assert result is None

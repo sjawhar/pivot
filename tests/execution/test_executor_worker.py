@@ -19,6 +19,8 @@ if TYPE_CHECKING:
     import multiprocessing as mp
     from collections.abc import Callable, Generator
 
+    from pytest_mock import MockerFixture
+
     from pivot.executor import WorkerStageInfo
     from pivot.types import DirManifestEntry, OutputMessage
 
@@ -1443,24 +1445,22 @@ def test_joblib_protection_noop_without_joblib(
     assert result == "executed", "Function should execute normally without joblib"
 
 
-def test_joblib_protection_uses_threading_backend_via_config() -> None:
+def test_joblib_protection_uses_threading_backend_via_config(mocker: MockerFixture) -> None:
     """Verifies parallel_config is called with threading backend."""
-    from unittest import mock
-
     from pivot.executor import worker
 
     def check_func() -> str:
         return "done"
 
-    with mock.patch("joblib.parallel_config") as mock_config:
-        mock_config.return_value.__enter__ = mock.Mock(return_value=None)
-        mock_config.return_value.__exit__ = mock.Mock(return_value=None)
+    mock_config = mocker.patch("joblib.parallel_config", autospec=True)
+    mock_config.return_value.__enter__ = mocker.Mock(return_value=None)
+    mock_config.return_value.__exit__ = mocker.Mock(return_value=None)
 
-        worker._execute_with_joblib_protection(check_func, {})
+    worker._execute_with_joblib_protection(check_func, {})
 
-        mock_config.assert_called_once()
-        call_kwargs = mock_config.call_args.kwargs
-        assert call_kwargs["backend"] == "threading"
+    mock_config.assert_called_once()
+    call_kwargs = mock_config.call_args.kwargs
+    assert call_kwargs["backend"] == "threading"
 
 
 def test_user_explicit_parallel_config_overrides_protection() -> None:
@@ -1490,6 +1490,7 @@ def test_user_explicit_parallel_config_overrides_protection() -> None:
 # =============================================================================
 
 
+@pytest.mark.slow
 def test_queue_writer_thread_safety_concurrent_writes(
     output_queue: mp.Queue[OutputMessage],
 ) -> None:
@@ -1530,6 +1531,7 @@ def test_queue_writer_thread_safety_concurrent_writes(
     )
 
 
+@pytest.mark.slow
 def test_queue_writer_thread_safety_atomic_writes(
     output_queue: mp.Queue[OutputMessage],
 ) -> None:
@@ -1592,10 +1594,9 @@ def test_queue_writer_thread_safety_atomic_writes(
 
 def test_joblib_protection_env_var_processes_disables_memmapping(
     monkeypatch: pytest.MonkeyPatch,
+    mocker: MockerFixture,
 ) -> None:
     """PIVOT_NESTED_PARALLELISM=processes uses loky backend with memmapping disabled."""
-    from unittest import mock
-
     from pivot.executor import worker
 
     def stage_func() -> str:
@@ -1603,23 +1604,22 @@ def test_joblib_protection_env_var_processes_disables_memmapping(
 
     monkeypatch.setenv("PIVOT_NESTED_PARALLELISM", "processes")
 
-    with mock.patch("joblib.parallel_config") as mock_config:
-        mock_config.return_value.__enter__ = mock.Mock(return_value=None)
-        mock_config.return_value.__exit__ = mock.Mock(return_value=None)
+    mock_config = mocker.patch("joblib.parallel_config", autospec=True)
+    mock_config.return_value.__enter__ = mocker.Mock(return_value=None)
+    mock_config.return_value.__exit__ = mocker.Mock(return_value=None)
 
-        result = worker._execute_with_joblib_protection(stage_func, {})
+    result = worker._execute_with_joblib_protection(stage_func, {})
 
-        # parallel_config should be called with loky backend and memmapping disabled
-        mock_config.assert_called_once_with(backend="loky", max_nbytes=None)
-        assert result == "done"
+    # parallel_config should be called with loky backend and memmapping disabled
+    mock_config.assert_called_once_with(backend="loky", max_nbytes=None)
+    assert result == "done"
 
 
 def test_joblib_protection_default_uses_threading(
     monkeypatch: pytest.MonkeyPatch,
+    mocker: MockerFixture,
 ) -> None:
     """Default behavior (no env var) uses threading backend."""
-    from unittest import mock
-
     from pivot.executor import worker
 
     def stage_func() -> str:
@@ -1628,13 +1628,13 @@ def test_joblib_protection_default_uses_threading(
     # Ensure env var is not set
     monkeypatch.delenv("PIVOT_NESTED_PARALLELISM", raising=False)
 
-    with mock.patch("joblib.parallel_config") as mock_config:
-        mock_config.return_value.__enter__ = mock.Mock(return_value=None)
-        mock_config.return_value.__exit__ = mock.Mock(return_value=None)
+    mock_config = mocker.patch("joblib.parallel_config", autospec=True)
+    mock_config.return_value.__enter__ = mocker.Mock(return_value=None)
+    mock_config.return_value.__exit__ = mocker.Mock(return_value=None)
 
-        result = worker._execute_with_joblib_protection(stage_func, {})
+    result = worker._execute_with_joblib_protection(stage_func, {})
 
-        mock_config.assert_called_once()
-        call_kwargs = mock_config.call_args.kwargs
-        assert call_kwargs["backend"] == "threading"
-        assert result == "done"
+    mock_config.assert_called_once()
+    call_kwargs = mock_config.call_args.kwargs
+    assert call_kwargs["backend"] == "threading"
+    assert result == "done"
