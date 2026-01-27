@@ -15,7 +15,6 @@ from typing import (
     IO,
     TYPE_CHECKING,
     ClassVar,
-    Literal,
     override,
 )
 
@@ -107,22 +106,28 @@ _TUI_BINDINGS: list[textual.binding.BindingType] = [
     textual.binding.Binding("q", "quit", "Quit"),
     textual.binding.Binding("c", "commit", "Commit"),
     textual.binding.Binding("?", "show_help", "Help"),
-    textual.binding.Binding("escape", "escape_action", "Cancel/Collapse", show=False),
-    textual.binding.Binding("enter", "expand_details", "Expand", show=False),
-    # Panel focus switching
-    textual.binding.Binding("tab", "switch_focus", "Switch Panel"),
-    # Navigation (context-aware: stages panel vs detail panel)
+    textual.binding.Binding("escape", "escape_action", "Cancel/Close", show=False),
+    textual.binding.Binding("enter", "toggle_group", "Toggle Group", show=False),
+    # Stage navigation (always navigates stage list)
     textual.binding.Binding("j", "nav_down", "Down"),
     textual.binding.Binding("k", "nav_up", "Up"),
     textual.binding.Binding("down", "nav_down", "Down", show=False),
     textual.binding.Binding("up", "nav_up", "Up", show=False),
-    textual.binding.Binding("h", "nav_left", "Left", show=False),
-    textual.binding.Binding("l", "nav_right", "Right", show=False),
-    textual.binding.Binding("left", "nav_left", "Left", show=False),
-    textual.binding.Binding("right", "nav_right", "Right", show=False),
-    # Changed-item navigation (in detail panel only)
+    # Tab navigation
+    textual.binding.Binding("tab", "next_tab", "Next Tab"),
+    textual.binding.Binding("h", "prev_tab", "Prev Tab", show=False),
+    textual.binding.Binding("l", "next_tab", "Next Tab", show=False),
+    textual.binding.Binding("left", "prev_tab", "Prev Tab", show=False),
+    textual.binding.Binding("right", "next_tab", "Next Tab", show=False),
+    # Detail content scrolling
+    textual.binding.Binding("ctrl+j", "scroll_detail_down", "Scroll Down", show=False),
+    textual.binding.Binding("ctrl+k", "scroll_detail_up", "Scroll Up", show=False),
+    # Changed-item navigation
     textual.binding.Binding("n", "next_changed", "Next Change", show=False),
     textual.binding.Binding("N", "prev_changed", "Prev Change", show=False),
+    # Group collapse/expand
+    textual.binding.Binding("-", "collapse_all_groups", "Collapse All", show=False),
+    textual.binding.Binding("=", "expand_all_groups", "Expand All", show=False),
     # History navigation (works in all tabs, watch mode only)
     textual.binding.Binding("[", "history_older", "Older", show=False),
     textual.binding.Binding("]", "history_newer", "Newer", show=False),
@@ -133,7 +138,7 @@ _TUI_BINDINGS: list[textual.binding.BindingType] = [
     textual.binding.Binding("I", "goto_tab_input", "Input Tab", show=False),
     textual.binding.Binding("O", "goto_tab_output", "Output Tab", show=False),
     # All logs view toggle
-    textual.binding.Binding("a", "show_all_logs", "All Logs"),
+    textual.binding.Binding("a", "toggle_all_logs", "All Logs"),
     # Debug panel toggle
     textual.binding.Binding("~", "toggle_debug", "Debug"),
     # Keep-going toggle (watch mode only)
@@ -204,7 +209,6 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
         self._selected_idx: int = 0
         self._selected_stage_name: str | None = None
         self._show_logs: bool = False
-        self._focused_panel: Literal["stages", "detail"] = "stages"
         self._reader_thread: threading.Thread | None = None
         self._shutdown_event: threading.Event = threading.Event()
         self._log_file: IO[str] | None = None
@@ -267,11 +271,6 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
         if self._stage_order and self._selected_idx < len(self._stage_order):
             return self._stage_order[self._selected_idx]
         return None
-
-    @property
-    def focused_panel(self) -> Literal["stages", "detail"]:
-        """Return which panel currently has focus."""
-        return self._focused_panel
 
     @property
     def error(self) -> Exception | None:
@@ -549,8 +548,11 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
         info.status = status
         info.reason = msg["reason"]
         info.elapsed = msg["elapsed"]
-        info.index = msg["index"]
-        info.total = msg["total"]
+        # Only update index/total for dynamically discovered stages (watch mode).
+        # Pre-initialized stages already have correct display indices.
+        if is_new_stage:
+            info.index = msg["index"]
+            info.total = msg["total"]
 
         # Watch mode: history capture
         if self._watch_mode:
@@ -843,16 +845,6 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
         if detail:
             detail.set_stage(stage)
 
-    def _update_focus_visual(self) -> None:  # pragma: no cover
-        """Update visual indicators for focused panel."""
-        stage_list = self._try_query_one("#stage-list", StageListPanel)
-        detail_panel = self._try_query_one("#detail-panel", TabbedDetailPanel)
-        is_stages_focused = self._focused_panel == "stages"
-        if stage_list:
-            stage_list.set_class(is_stages_focused, "focused")
-        if detail_panel:
-            detail_panel.set_class(not is_stages_focused, "focused")
-
     def _update_stage_list_selection(self) -> None:  # pragma: no cover
         """Update stage list panel to reflect current selection."""
         if self._selected_stage_name:
@@ -879,11 +871,6 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
     # Actions
     # =========================================================================
 
-    def action_switch_focus(self) -> None:  # pragma: no cover
-        """Toggle focus between stages panel and detail panel."""
-        self._focused_panel = "detail" if self._focused_panel == "stages" else "stages"
-        self._update_focus_visual()
-
     def _get_active_diff_panel(self) -> InputDiffPanel | OutputDiffPanel | None:  # pragma: no cover
         """Get the diff panel for the active tab, if any."""
         tabs = self._try_query_one("#detail-tabs", textual.widgets.TabbedContent)
@@ -898,59 +885,67 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
                 return None
 
     def action_nav_down(self) -> None:  # pragma: no cover
-        """Navigate down."""
-        if self._focused_panel == "stages":
-            self.action_next_stage()
-        elif self._focused_panel == "detail" and (panel := self._get_active_diff_panel()):
-            panel.select_next()
+        """Navigate down in stage list, skipping collapsed rows."""
+        self._navigate_stage(1)
 
     def action_nav_up(self) -> None:  # pragma: no cover
-        """Navigate up."""
-        if self._focused_panel == "stages":
-            self.action_prev_stage()
-        elif self._focused_panel == "detail" and (panel := self._get_active_diff_panel()):
-            panel.select_prev()
+        """Navigate up in stage list, skipping collapsed rows."""
+        self._navigate_stage(-1)
 
-    def action_nav_left(self) -> None:  # pragma: no cover
-        """Navigate left - previous tab or switch to stages panel."""
-        if self._focused_panel == "detail":
-            tabs = self._try_query_one("#detail-tabs", textual.widgets.TabbedContent)
-            if tabs is None:
-                return
-            try:
-                if tabs.active == self._TAB_IDS[0]:
-                    self._focused_panel = "stages"
-                    self._update_focus_visual()
-                elif tabs.active in self._TAB_IDS:
-                    current_idx = self._TAB_IDS.index(tabs.active)
-                    tabs.active = self._TAB_IDS[current_idx - 1]
-            except ValueError:
-                _logger.debug("Tab index error during nav_left")
+    def _navigate_stage(self, direction: int) -> None:  # pragma: no cover
+        """Navigate stage list by direction (+1 or -1), skipping collapsed group members."""
+        stage_list = self._try_query_one("#stage-list", StageListPanel)
+        if stage_list is None:
+            return  # Can't navigate without knowing collapse state
 
-    def action_nav_right(self) -> None:  # pragma: no cover
-        """Navigate right - next tab or switch to detail panel."""
-        if self._focused_panel == "stages":
-            self._focused_panel = "detail"
-            self._update_focus_visual()
-        else:
-            tabs = self._try_query_one("#detail-tabs", textual.widgets.TabbedContent)
-            if tabs is None:
-                return
-            try:
-                if tabs.active in self._TAB_IDS:
-                    current_idx = self._TAB_IDS.index(tabs.active)
-                    if current_idx < len(self._TAB_IDS) - 1:
-                        tabs.active = self._TAB_IDS[current_idx + 1]
-            except ValueError:
-                _logger.debug("Tab index error during nav_right")
+        new_idx = self._selected_idx + direction
+
+        while 0 <= new_idx < len(self._stage_order):
+            stage_name = self._stage_order[new_idx]
+            # Skip if this stage is hidden in a collapsed group
+            if stage_list.is_collapsed(stage_name):
+                new_idx += direction
+                continue
+            # Found a valid stage
+            self._select_stage(new_idx)
+            self._update_stage_list_selection()
+            self._update_detail_panel()
+            return
+        # No valid stage found, stay at current
+
+    def action_prev_tab(self) -> None:  # pragma: no cover
+        """Navigate to previous tab."""
+        tabs = self._try_query_one("#detail-tabs", textual.widgets.TabbedContent)
+        if tabs is None:
+            return
+        try:
+            if tabs.active in self._TAB_IDS:
+                current_idx = self._TAB_IDS.index(tabs.active)
+                # Wrap around to last tab if at first
+                new_idx = (current_idx - 1) % len(self._TAB_IDS)
+                tabs.active = self._TAB_IDS[new_idx]
+        except ValueError:
+            _logger.debug("Tab index error during prev_tab")
+
+    def action_next_tab(self) -> None:  # pragma: no cover
+        """Navigate to next tab."""
+        tabs = self._try_query_one("#detail-tabs", textual.widgets.TabbedContent)
+        if tabs is None:
+            return
+        try:
+            if tabs.active in self._TAB_IDS:
+                current_idx = self._TAB_IDS.index(tabs.active)
+                # Wrap around to first tab if at last
+                new_idx = (current_idx + 1) % len(self._TAB_IDS)
+                tabs.active = self._TAB_IDS[new_idx]
+        except ValueError:
+            _logger.debug("Tab index error during next_tab")
 
     def _goto_tab(self, tab_id: str) -> None:  # pragma: no cover
-        """Jump to a specific tab and focus the detail panel."""
+        """Jump to a specific tab."""
         tabs = self._try_query_one("#detail-tabs", textual.widgets.TabbedContent)
         if tabs:
             tabs.active = tab_id
-            self._focused_panel = "detail"
-            self._update_focus_visual()
 
     def action_goto_tab_logs(self) -> None:  # pragma: no cover
         self._goto_tab("tab-logs")
@@ -960,18 +955,6 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
 
     def action_goto_tab_output(self) -> None:  # pragma: no cover
         self._goto_tab("tab-output")
-
-    def action_next_stage(self) -> None:  # pragma: no cover
-        if self._selected_idx < len(self._stage_order) - 1:
-            self._select_stage(self._selected_idx + 1)
-            self._update_stage_list_selection()
-            self._update_detail_panel()
-
-    def action_prev_stage(self) -> None:  # pragma: no cover
-        if self._selected_idx > 0:
-            self._select_stage(self._selected_idx - 1)
-            self._update_stage_list_selection()
-            self._update_detail_panel()
 
     def action_toggle_view(self) -> None:  # pragma: no cover
         self._show_logs = not self._show_logs
@@ -984,11 +967,16 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
             logs_view.set_class(self._show_logs, "view-active")
             logs_view.set_class(not self._show_logs, "view-hidden")
 
-    def action_show_all_logs(self) -> None:  # pragma: no cover
-        log_panel = self._try_query_one("#log-panel", LogPanel)
-        if log_panel:
-            log_panel.set_filter(None)
-        if not self._show_logs:
+    def action_toggle_all_logs(self) -> None:  # pragma: no cover
+        """Toggle all-logs view on/off."""
+        if self._show_logs:
+            # If already showing logs, toggle off
+            self.action_toggle_view()
+        else:
+            # Show all logs (clear filter)
+            log_panel = self._try_query_one("#log-panel", LogPanel)
+            if log_panel:
+                log_panel.set_filter(None)
             self.action_toggle_view()
 
     def action_filter_stage(self, idx: int) -> None:  # pragma: no cover
@@ -1002,37 +990,61 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
                 self.action_toggle_view()
 
     def action_escape_action(self) -> None:  # pragma: no cover
-        """Context-aware Esc: cancel commit or collapse detail expansion."""
+        """Esc: cancel commit, close logs view, or collapse detail expansion."""
         if self._watch_mode and self._commit_in_progress:
             self._cancel_commit = True
             return
+        # Close all-logs view if open
+        if self._show_logs:
+            self.action_toggle_view()
+            return
+        # Collapse detail expansion if expanded
         panel = self._get_active_diff_panel()
-        if self._focused_panel == "detail" and panel and panel.is_detail_expanded:
+        if panel and panel.is_detail_expanded:
             panel.collapse_details()
 
-    def action_expand_details(self) -> None:  # pragma: no cover
-        """Expand details pane or toggle group collapse."""
-        if self._focused_panel == "stages":
-            stage_list = self._try_query_one("#stage-list", StageListPanel)
-            if stage_list:
-                group_base = stage_list.get_group_at_selection()
-                if group_base:
-                    stage_list.toggle_group(group_base)
-        elif self._focused_panel == "detail":
-            panel = self._get_active_diff_panel()
-            if panel:
-                panel.expand_details()
+    def action_toggle_group(self) -> None:  # pragma: no cover
+        """Toggle collapse for group containing selected stage."""
+        stage_list = self._try_query_one("#stage-list", StageListPanel)
+        if stage_list:
+            group_base = stage_list.get_group_at_selection()
+            if group_base:
+                stage_list.toggle_group(group_base)
+
+    def action_collapse_all_groups(self) -> None:  # pragma: no cover
+        """Collapse all stage groups."""
+        stage_list = self._try_query_one("#stage-list", StageListPanel)
+        if stage_list:
+            stage_list.collapse_all_groups()
+
+    def action_expand_all_groups(self) -> None:  # pragma: no cover
+        """Expand all stage groups."""
+        stage_list = self._try_query_one("#stage-list", StageListPanel)
+        if stage_list:
+            stage_list.expand_all_groups()
+
+    def action_scroll_detail_down(self) -> None:  # pragma: no cover
+        """Scroll detail panel content down."""
+        panel = self._get_active_diff_panel()
+        if panel:
+            panel.select_next()
+
+    def action_scroll_detail_up(self) -> None:  # pragma: no cover
+        """Scroll detail panel content up."""
+        panel = self._get_active_diff_panel()
+        if panel:
+            panel.select_prev()
 
     def action_next_changed(self) -> None:  # pragma: no cover
-        """Move selection to next changed item."""
+        """Move selection to next changed item in detail panel."""
         panel = self._get_active_diff_panel()
-        if self._focused_panel == "detail" and panel:
+        if panel:
             panel.select_next_changed()
 
     def action_prev_changed(self) -> None:  # pragma: no cover
-        """Move selection to previous changed item."""
+        """Move selection to previous changed item in detail panel."""
         panel = self._get_active_diff_panel()
-        if self._focused_panel == "detail" and panel:
+        if panel:
             panel.select_prev_changed()
 
     def action_toggle_debug(self) -> None:  # pragma: no cover
@@ -1066,19 +1078,19 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
 
     def action_history_older(self) -> None:  # pragma: no cover
         """Navigate to older history entry (watch mode only)."""
-        if not self._watch_mode or self._focused_panel != "detail":
+        if not self._watch_mode:
             return
         self._navigate_history_prev()
 
     def action_history_newer(self) -> None:  # pragma: no cover
         """Navigate to newer history entry (watch mode only)."""
-        if not self._watch_mode or self._focused_panel != "detail":
+        if not self._watch_mode:
             return
         self._navigate_history_next()
 
     def action_history_live(self) -> None:  # pragma: no cover
         """Jump directly to live view (watch mode only)."""
-        if not self._watch_mode or self._focused_panel != "detail":
+        if not self._watch_mode:
             return
         if self._viewing_history_index is not None:
             self._viewing_history_index = None

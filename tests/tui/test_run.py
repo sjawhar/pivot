@@ -674,26 +674,6 @@ async def test_run_app_navigation_stays_at_bounds(
 
 
 @pytest.mark.asyncio
-async def test_run_app_action_switch_focus(simple_run_app: run_tui.PivotApp) -> None:
-    """action_switch_focus toggles between panels."""
-    async with simple_run_app.run_test() as pilot:
-        await pilot.pause()
-
-        # Initial focus should be on stages panel
-        assert simple_run_app.focused_panel == "stages"
-
-        # Call action to switch
-        simple_run_app.action_switch_focus()
-        await pilot.pause()
-        assert simple_run_app.focused_panel == "detail"
-
-        # Call again to switch back
-        simple_run_app.action_switch_focus()
-        await pilot.pause()
-        assert simple_run_app.focused_panel == "stages"
-
-
-@pytest.mark.asyncio
 async def test_run_app_quit_action(simple_run_app: run_tui.PivotApp) -> None:
     """action_quit exits the app."""
     async with simple_run_app.run_test() as pilot:

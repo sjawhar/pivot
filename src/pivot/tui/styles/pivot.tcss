@@ -75,6 +75,11 @@
     display: none;
 }
 
+/* Visual indentation for rows inside groups */
+.stage-row.grouped {
+    padding-left: 2;
+}
+
 /* Group header styling */
 .stage-group-header {
     background: $surface-lighten-1;

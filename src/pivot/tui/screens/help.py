@@ -9,17 +9,17 @@ import textual.screen
 import textual.widgets
 
 _HELP_TEXT = """\
-[bold cyan]Navigation[/]
-  j/k or Up/Down    Navigate items
-  h/l or Left/Right Navigate tabs / switch panels
-  Tab               Switch panel focus
-  1-9               Quick-select stage
+[bold cyan]Stage Navigation[/]
+  j/k or Up/Down    Navigate stage list
+  Enter             Toggle group collapse
+  -/=               Collapse/expand all groups
 
 [bold cyan]Detail Panel[/]
-  Enter             Expand to full width
-  Escape            Collapse / go back
-  n/N               Next/prev changed item
+  Tab or h/l        Cycle tabs (Logs → Input → Output)
   L/I/O             Jump to Logs/Input/Output tab
+  Ctrl+j/k          Scroll detail content
+  n/N               Next/prev changed item
+  Escape            Close logs view / collapse
 
 [bold cyan]History[/]
   [ / ]             View older/newer execution
@@ -29,6 +29,7 @@ _HELP_TEXT = """\
 [bold cyan]Actions[/]
   c                 Commit changes
   a                 Toggle all-logs view
+  1-9               Filter logs to stage
   g                 Toggle keep-going mode (watch)
   ~                 Toggle debug panel
   q                 Quit"""

@@ -7,6 +7,14 @@ from typing import NamedTuple
 from pivot.types import OutputChange, StageExplanation, StageStatus
 
 
+def parse_stage_name(name: str) -> tuple[str, str]:
+    """Parse stage name into (base_name, variant). Returns (name, '') if no @."""
+    if "@" in name:
+        base, variant = name.split("@", 1)
+        return (base, variant)
+    return (name, "")
+
+
 class LogEntry(NamedTuple):
     """A single log line with metadata."""
 
@@ -67,8 +75,4 @@ class StageInfo:
 
     def __post_init__(self) -> None:
         """Compute base_name and variant from name."""
-        if "@" in self.name:
-            self.base_name, self.variant = self.name.split("@", 1)
-        else:
-            self.base_name = self.name
-            self.variant = ""
+        self.base_name, self.variant = parse_stage_name(self.name)

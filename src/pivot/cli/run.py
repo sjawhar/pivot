@@ -29,6 +29,8 @@ from pivot.types import (
 if TYPE_CHECKING:
     from collections.abc import Generator
 
+    import networkx as nx
+
     from pivot.executor import ExecutionSummary
 
 
@@ -62,6 +64,53 @@ _JSONL_SCHEMA_VERSION = 1
 
 
 logger = logging.getLogger(__name__)
+
+
+def _compute_dag_levels(graph: nx.DiGraph[str]) -> dict[str, int]:
+    """Compute DAG level for each stage.
+
+    Level 0: stages with no dependencies
+    Level N: stages whose dependencies are all at level < N
+
+    Stages at the same level can run in parallel - there's no ordering between them.
+    """
+    import networkx as nx
+
+    levels: dict[str, int] = {}
+    # Process in topological order (dependencies before dependents)
+    for stage in nx.dfs_postorder_nodes(graph):
+        # successors = what this stage depends on (edges go consumer -> producer)
+        dep_levels = [levels[dep] for dep in graph.successors(stage) if dep in levels]
+        levels[stage] = max(dep_levels, default=-1) + 1
+    return levels
+
+
+def _sort_for_display(execution_order: list[str], graph: nx.DiGraph[str]) -> list[str]:
+    """Sort stages for TUI display: group matrix variants while respecting DAG structure.
+
+    Uses DAG levels (not arbitrary execution order) so parallel-capable stages
+    are treated as equals. Matrix variants are grouped at the level of their
+    earliest member.
+    """
+    from pivot.tui.types import parse_stage_name
+
+    levels = _compute_dag_levels(graph)
+
+    # Compute minimum level for each base_name (group position)
+    group_min_level: dict[str, int] = {}
+    for name in execution_order:
+        base, _ = parse_stage_name(name)
+        level = levels.get(name, 0)
+        if base not in group_min_level or level < group_min_level[base]:
+            group_min_level[base] = level
+
+    def display_sort_key(name: str) -> tuple[int, int, str]:
+        base, variant = parse_stage_name(name)
+        individual_level = levels.get(name, 0)
+        # Sort by: group level, then individual level, then variant name
+        return (group_min_level[base], individual_level, variant)
+
+    return sorted(execution_order, key=display_sort_key)
 
 
 def ensure_stages_registered() -> None:
@@ -170,8 +219,11 @@ def _run_with_tui(
             checkout_missing=checkout_missing,
         )
 
+    # Sort for display: group matrix variants together while preserving DAG structure
+    display_order = _sort_for_display(execution_order, graph)
+
     with _suppress_stderr_logging():
-        return run_tui.run_with_tui(execution_order, tui_queue, executor_func, tui_log=tui_log)
+        return run_tui.run_with_tui(display_order, tui_queue, executor_func, tui_log=tui_log)
 
 
 def _run_watch_with_tui(
@@ -227,13 +279,16 @@ def _run_watch_with_tui(
             on_error=on_error,
         )
 
+        # Sort for display: group matrix variants together while preserving DAG structure
+        display_order = _sort_for_display(execution_order, graph) if execution_order else None
+
         with _suppress_stderr_logging():
             run_tui.run_watch_tui(
                 engine,
                 tui_queue,
                 output_queue=output_queue,
                 tui_log=tui_log,
-                stage_names=execution_order,
+                stage_names=display_order,
                 no_commit=no_commit,
                 serve=serve,
             )

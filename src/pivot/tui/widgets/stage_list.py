@@ -82,11 +82,13 @@ class StageRow(textual.widgets.Static):
 
     _info: StageInfo
     _is_selected: bool
+    _show_variant_only: bool
 
-    def __init__(self, info: StageInfo) -> None:
+    def __init__(self, info: StageInfo, *, show_variant_only: bool = False) -> None:
         super().__init__(classes="stage-row")
         self._info = info
         self._is_selected = False
+        self._show_variant_only = show_variant_only
 
     @property
     def is_selected(self) -> bool:
@@ -100,7 +102,13 @@ class StageRow(textual.widgets.Static):
 
         symbol, style = status.get_status_symbol(self._info.status)
         index_str = f"{self._info.index:3}"
-        name_escaped = rich.markup.escape(self._info.name)
+
+        # Show variant only (@current) or full name depending on grouping
+        if self._show_variant_only and self._info.variant:
+            display_name = f"@{self._info.variant}"
+        else:
+            display_name = self._info.name
+        name_escaped = rich.markup.escape(display_name)
 
         # Format elapsed time (only for running/completed/failed)
         elapsed_str = ""
@@ -116,7 +124,7 @@ class StageRow(textual.widgets.Static):
         # Selection arrow prefix
         arrow = "→ " if self._is_selected else "  "
 
-        # Format: →  3  train@small              1:23 ▶
+        # Format: →  3  @current                 1:23 ▶
         text = f"{arrow}{index_str}  {name_escaped:<24} {elapsed_str}[{style}]{symbol}[/]"
         self.update(text)
 
@@ -133,6 +141,8 @@ class StageListPanel(textual.containers.VerticalScroll):
     _group_headers: dict[str, StageGroupHeader]  # base_name -> header
     _collapsed_groups: set[str]  # base_names of collapsed groups
     _selected_idx: int
+    _selected_name: str | None  # Track selection by name to avoid index sync issues
+    _groups_cache: dict[str, list[StageInfo]] | None
 
     def __init__(
         self,
@@ -148,15 +158,19 @@ class StageListPanel(textual.containers.VerticalScroll):
         self._group_headers = {}
         self._collapsed_groups = set()
         self._selected_idx = 0
+        self._selected_name = stages[0].name if stages else None
+        self._groups_cache = None
 
     def _compute_groups(self) -> dict[str, list[StageInfo]]:
-        """Group stages by base_name, maintaining order."""
-        groups: dict[str, list[StageInfo]] = {}
-        for stage in self._stages:
-            if stage.base_name not in groups:
-                groups[stage.base_name] = []
-            groups[stage.base_name].append(stage)
-        return groups
+        """Group stages by base_name, maintaining order. Results are cached."""
+        if self._groups_cache is None:
+            groups: dict[str, list[StageInfo]] = {}
+            for stage in self._stages:
+                if stage.base_name not in groups:
+                    groups[stage.base_name] = []
+                groups[stage.base_name].append(stage)
+            self._groups_cache = groups
+        return self._groups_cache
 
     @override
     def compose(self) -> textual.app.ComposeResult:  # pragma: no cover
@@ -168,20 +182,24 @@ class StageListPanel(textual.containers.VerticalScroll):
         seen_bases = set[str]()
 
         for stage_idx, stage in enumerate(self._stages):
+            is_multi_member_group = len(groups[stage.base_name]) >= 2
+
             # If this is the first stage of a group with 2+ members, yield header
             if stage.base_name not in seen_bases:
                 seen_bases.add(stage.base_name)
-                group_stages = groups[stage.base_name]
-                if len(group_stages) >= 2:
-                    header = StageGroupHeader(stage.base_name, group_stages)
+                if is_multi_member_group:
+                    header = StageGroupHeader(stage.base_name, groups[stage.base_name])
                     header.set_collapsed(stage.base_name in self._collapsed_groups)
                     self._group_headers[stage.base_name] = header
                     yield header
 
             # Yield stage row (with collapsed class if in collapsed group)
-            row = StageRow(stage)
+            row = StageRow(stage, show_variant_only=is_multi_member_group)
             if stage.base_name in self._collapsed_groups:
                 row.add_class("collapsed")
+            # Add 'grouped' class for visual indentation in multi-member groups
+            if is_multi_member_group:
+                row.add_class("grouped")
             row.update_display(is_selected=(stage_idx == self._selected_idx))
             self._rows[stage.name] = row
             yield row
@@ -226,18 +244,26 @@ class StageListPanel(textual.containers.VerticalScroll):
 
     def set_selection(self, idx: int, selected_name: str) -> None:  # pragma: no cover
         """Update selection state and scroll to keep it visible."""
-        old_idx = self._selected_idx
+        old_name = self._selected_name
         self._selected_idx = idx
+        self._selected_name = selected_name
 
-        # Update old and new selected rows
-        if 0 <= old_idx < len(self._stages):
-            old_name = self._stages[old_idx].name
-            if old_name in self._rows:
-                self._rows[old_name].update_display(is_selected=False)
+        # Deselect old row by name (safe even if indices changed)
+        if old_name and old_name in self._rows and old_name != selected_name:
+            self._rows[old_name].update_display(is_selected=False)
+            # Update old group header if in a group
+            old_stage = self._stage_by_name.get(old_name)
+            if old_stage and old_stage.base_name in self._group_headers:
+                self._group_headers[old_stage.base_name].update_display(is_selected=False)
+
+        # Select new row
         if selected_name in self._rows:
             self._rows[selected_name].update_display(is_selected=True)
-            # Scroll to keep selected row visible
             self._rows[selected_name].scroll_visible()
+            # Update new group header if in a group
+            new_stage = self._stage_by_name.get(selected_name)
+            if new_stage and new_stage.base_name in self._group_headers:
+                self._group_headers[new_stage.base_name].update_display(is_selected=True)
 
     def toggle_group(self, base_name: str) -> bool | None:  # pragma: no cover
         """Toggle collapse state for a group. Returns new collapsed state, or None if not found."""
@@ -266,17 +292,14 @@ class StageListPanel(textual.containers.VerticalScroll):
         return is_collapsed
 
     def get_group_at_selection(self) -> str | None:  # pragma: no cover
-        """Get base_name of group header if selection is on first stage of a group."""
+        """Get base_name if selection is on any stage in a multi-member group."""
         if not self._stages or self._selected_idx >= len(self._stages):
             return None
         stage = self._stages[self._selected_idx]
-        # Check if this is the first stage of a multi-variant group
+        # Check if this stage is in a multi-member group
         groups = self._compute_groups()
         if stage.base_name in groups and len(groups[stage.base_name]) >= 2:
-            # Check if this is the first stage of the group
-            first_in_group = groups[stage.base_name][0]
-            if stage.name == first_in_group.name:
-                return stage.base_name
+            return stage.base_name
         return None
 
     def rebuild(self, stages: list[StageInfo]) -> None:  # pragma: no cover
@@ -285,4 +308,61 @@ class StageListPanel(textual.containers.VerticalScroll):
         self._stage_by_name = {s.name: s for s in stages}
         self._rows.clear()
         self._group_headers.clear()
+        self._groups_cache = None  # Invalidate cache
         self.refresh(recompose=True)
+
+    def is_collapsed(self, stage_name: str) -> bool:  # pragma: no cover
+        """Check if a stage is hidden due to collapsed group.
+
+        The first stage of a collapsed group is NOT collapsed (it's navigable
+        and represents the group header position).
+        """
+        stage = self._stage_by_name.get(stage_name)
+        if stage is None or stage.base_name not in self._collapsed_groups:
+            return False
+        # First stage of collapsed group is visible (navigable)
+        groups = self._compute_groups()
+        group_stages = groups.get(stage.base_name, [])
+        return len(group_stages) > 0 and group_stages[0].name != stage_name
+
+    def _set_all_groups_collapsed(self, collapsed: bool) -> None:  # pragma: no cover
+        """Set collapse state for all multi-member groups."""
+        groups = self._compute_groups()
+        # Determine which group currently has selection for header update
+        selected_base = None
+        if self._selected_name:
+            selected_stage = self._stage_by_name.get(self._selected_name)
+            if selected_stage:
+                selected_base = selected_stage.base_name
+
+        for base_name, stages in groups.items():
+            if len(stages) < 2:
+                continue
+            is_currently_collapsed = base_name in self._collapsed_groups
+            if is_currently_collapsed == collapsed:
+                continue  # Already in desired state
+
+            if collapsed:
+                self._collapsed_groups.add(base_name)
+            else:
+                self._collapsed_groups.discard(base_name)
+
+            if base_name in self._group_headers:
+                self._group_headers[base_name].set_collapsed(collapsed)
+                is_selected = base_name == selected_base
+                self._group_headers[base_name].update_display(is_selected=is_selected)
+
+            for stage in stages:
+                if stage.name in self._rows:
+                    if collapsed:
+                        self._rows[stage.name].add_class("collapsed")
+                    else:
+                        self._rows[stage.name].remove_class("collapsed")
+
+    def collapse_all_groups(self) -> None:  # pragma: no cover
+        """Collapse all multi-member groups."""
+        self._set_all_groups_collapsed(True)
+
+    def expand_all_groups(self) -> None:  # pragma: no cover
+        """Expand all collapsed groups."""
+        self._set_all_groups_collapsed(False)
