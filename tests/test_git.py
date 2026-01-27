@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import subprocess
 from typing import TYPE_CHECKING
 
+from conftest import init_git_repo
 from pivot import git, project
 
 if TYPE_CHECKING:
@@ -87,7 +87,7 @@ def test_read_file_from_head_subdirectory(git_repo: GitRepo, monkeypatch: Monkey
 
 def test_read_file_from_head_empty_repo(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     """Returns None for empty repo (no commits)."""
-    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    init_git_repo(tmp_path, monkeypatch)
     monkeypatch.setattr(project, "_project_root_cache", tmp_path)
 
     result = git.read_file_from_head("file.txt")
@@ -102,7 +102,7 @@ def test_read_file_from_head_empty_repo(tmp_path: Path, monkeypatch: MonkeyPatch
 
 def test_read_files_from_head_empty_list(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     """Returns empty dict for empty path list."""
-    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    init_git_repo(tmp_path, monkeypatch)
     monkeypatch.setattr(project, "_project_root_cache", tmp_path)
 
     result = git.read_files_from_head([])
@@ -268,7 +268,7 @@ def test_read_files_from_revision_multiple_files(
 
 def test_read_files_from_revision_empty_list(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     """Returns empty dict for empty path list."""
-    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    init_git_repo(tmp_path, monkeypatch)
     monkeypatch.setattr(project, "_project_root_cache", tmp_path)
 
     result = git.read_files_from_revision([], "HEAD")

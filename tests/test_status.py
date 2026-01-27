@@ -7,7 +7,10 @@ import pytest
 
 from helpers import register_test_stage
 from pivot import exceptions, executor, loaders, outputs, status
+from pivot.remote import config as remote_config
+from pivot.remote import sync as transfer
 from pivot.storage import cache, track
+from pivot.storage import state as state_mod
 from pivot.types import RemoteStatus
 
 if TYPE_CHECKING:
@@ -242,7 +245,7 @@ def test_tracked_directory_modified(set_project_root: pathlib.Path) -> None:
 
 def test_remote_status_no_remotes_configured(tmp_path: pathlib.Path, mocker: MockerFixture) -> None:
     """Should raise RemoteNotConfiguredError when no remotes exist."""
-    mocker.patch("pivot.status.remote_config.list_remotes", return_value={})
+    mocker.patch.object(remote_config, "list_remotes", return_value={})
 
     with pytest.raises(exceptions.RemoteNotConfiguredError):
         status.get_remote_status(None, tmp_path)
@@ -250,13 +253,12 @@ def test_remote_status_no_remotes_configured(tmp_path: pathlib.Path, mocker: Moc
 
 def test_remote_status_no_local_hashes(tmp_path: pathlib.Path, mocker: MockerFixture) -> None:
     """Should return zero counts when no local cache files exist."""
-    mocker.patch("pivot.status.remote_config.list_remotes", return_value={"origin": "s3://bucket"})
-    mocker.patch(
-        "pivot.status.transfer.create_remote_from_name",
-        return_value=(mocker.MagicMock(), "origin"),
+    mocker.patch.object(remote_config, "list_remotes", return_value={"origin": "s3://bucket"})
+    mocker.patch.object(
+        transfer, "create_remote_from_name", return_value=(mocker.MagicMock(), "origin")
     )
-    mocker.patch("pivot.status.remote_config.get_remote_url", return_value="s3://bucket/prefix")
-    mocker.patch("pivot.status.transfer.get_local_cache_hashes", return_value=set())
+    mocker.patch.object(remote_config, "get_remote_url", return_value="s3://bucket/prefix")
+    mocker.patch.object(transfer, "get_local_cache_hashes", return_value=set())
 
     result = status.get_remote_status(None, tmp_path)
 
@@ -268,13 +270,12 @@ def test_remote_status_no_local_hashes(tmp_path: pathlib.Path, mocker: MockerFix
 
 def test_remote_status_with_local_hashes(tmp_path: pathlib.Path, mocker: MockerFixture) -> None:
     """Should return push/pull counts from compare_status."""
-    mocker.patch("pivot.status.remote_config.list_remotes", return_value={"origin": "s3://bucket"})
-    mocker.patch(
-        "pivot.status.transfer.create_remote_from_name",
-        return_value=(mocker.MagicMock(), "origin"),
+    mocker.patch.object(remote_config, "list_remotes", return_value={"origin": "s3://bucket"})
+    mocker.patch.object(
+        transfer, "create_remote_from_name", return_value=(mocker.MagicMock(), "origin")
     )
-    mocker.patch("pivot.status.remote_config.get_remote_url", return_value="s3://bucket/prefix")
-    mocker.patch("pivot.status.transfer.get_local_cache_hashes", return_value={"hash1", "hash2"})
+    mocker.patch.object(remote_config, "get_remote_url", return_value="s3://bucket/prefix")
+    mocker.patch.object(transfer, "get_local_cache_hashes", return_value={"hash1", "hash2"})
 
     async def mock_compare_status(*args: object) -> RemoteStatus:
         return RemoteStatus(
@@ -283,11 +284,11 @@ def test_remote_status_with_local_hashes(tmp_path: pathlib.Path, mocker: MockerF
             common={"hash2"},
         )
 
-    mocker.patch("pivot.status.transfer.compare_status", side_effect=mock_compare_status)
+    mocker.patch.object(transfer, "compare_status", side_effect=mock_compare_status)
     mock_state_db = mocker.MagicMock()
     mock_state_db.__enter__ = mocker.MagicMock(return_value=mock_state_db)
     mock_state_db.__exit__ = mocker.MagicMock(return_value=False)
-    mocker.patch("pivot.status.state_mod.StateDB", return_value=mock_state_db)
+    mocker.patch.object(state_mod, "StateDB", return_value=mock_state_db)
 
     result = status.get_remote_status(None, tmp_path)
 
