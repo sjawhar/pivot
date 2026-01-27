@@ -1277,9 +1277,15 @@ def test_get_stages_matching_changes_handles_incomparable_paths(
 
 
 def test_reload_registry_logs_when_no_modules_found(
-    pipeline_dir: pathlib.Path, caplog: pytest.LogCaptureFixture
+    set_project_root: pathlib.Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """_reload_registry should log warning when no stage modules found."""
+    """_reload_registry should log warning when no stage modules found.
+
+    Uses set_project_root instead of pipeline_dir to avoid creating pivot.yaml,
+    which would trigger the pipeline file reload path instead of decorator path.
+    """
+    # Create .pivot marker for project root detection
+    (set_project_root / ".pivot").mkdir()
     # Registry is already empty from global clean_registry autouse fixture
     eng = engine.WatchEngine()
     eng._reload_registry()

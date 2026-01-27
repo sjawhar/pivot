@@ -205,7 +205,7 @@ sys.exit(1)
 
 def test_has_registered_stages_false_when_empty() -> None:
     """has_registered_stages returns False when no stages registered."""
-    registry.REGISTRY.clear()
+    # Registry is already cleared by autouse clean_registry fixture
     assert discovery.has_registered_stages() is False
 
 

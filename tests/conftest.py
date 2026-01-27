@@ -213,7 +213,13 @@ def make_valid_lock_content() -> ValidLockContentFactory:
 
 @pytest.fixture
 def pipeline_dir(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> pathlib.Path:
-    """Set up a temporary pipeline directory with .pivot marker."""
+    """Set up a temporary pipeline directory with .pivot marker.
+
+    Creates `.pivot` directory but NOT pivot.yaml, allowing tests to register
+    stages programmatically without auto-discovery. Tests that need pivot.yaml
+    (e.g., those using CLI commands that trigger auto-discovery) should define
+    a local fixture override that creates pivot.yaml.
+    """
     (tmp_path / ".pivot").mkdir()
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(project, "_project_root_cache", None)

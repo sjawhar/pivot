@@ -5,7 +5,6 @@ from typing import TYPE_CHECKING, Annotated, TypedDict
 
 from helpers import register_test_stage
 from pivot import cli, loaders, outputs, project
-from pivot.registry import REGISTRY
 from pivot.storage import track
 
 if TYPE_CHECKING:
@@ -344,8 +343,6 @@ def test_track_symlink_to_stage_output_file_rejected(
             "Error should show resolved path for debugging"
         )
 
-        REGISTRY.clear()
-
 
 def test_track_symlink_to_stage_output_directory_rejected(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
@@ -371,8 +368,6 @@ def test_track_symlink_to_stage_output_directory_rejected(
 
         assert result.exit_code != 0, "Should reject symlink to stage output directory"
         assert "overlap" in result.output.lower() or "output" in result.output.lower()
-
-        REGISTRY.clear()
 
 
 def test_track_file_inside_symlinked_stage_output_rejected(
@@ -402,8 +397,6 @@ def test_track_file_inside_symlinked_stage_output_rejected(
             "Error should mention overlap with stage output"
         )
 
-        REGISTRY.clear()
-
 
 def test_track_symlink_aliasing_same_file_different_paths(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
@@ -428,8 +421,6 @@ def test_track_symlink_aliasing_same_file_different_paths(
 
         assert result.exit_code != 0, "Should detect that link2 and link1 point to same file"
         assert "overlap" in result.output.lower() or "output" in result.output.lower()
-
-        REGISTRY.clear()
 
 
 def test_track_parent_directory_with_symlinked_stage_output(
@@ -459,8 +450,6 @@ def test_track_parent_directory_with_symlinked_stage_output(
         assert result.exit_code != 0, "Should reject tracking directory containing stage output"
         assert "overlap" in result.output.lower() or "output" in result.output.lower()
 
-        REGISTRY.clear()
-
 
 def test_track_with_normalized_vs_resolved_paths(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
@@ -485,5 +474,3 @@ def test_track_with_normalized_vs_resolved_paths(
         # Both paths should appear in error for clarity
         assert "link_to_real" in result.output, "Should show user's path"
         assert "real" in result.output, "Should show resolved path"
-
-        REGISTRY.clear()

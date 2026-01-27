@@ -22,6 +22,8 @@ import time
 from typing import TYPE_CHECKING, Annotated, TypedDict
 from unittest import mock
 
+import pytest
+
 from helpers import register_test_stage
 from pivot import executor, loaders, outputs, project
 from pivot.watch import engine
@@ -887,10 +889,14 @@ def test_watch_detects_file_change_and_triggers_execution(
     assert executions[1] is not None and "process" in executions[1]
 
 
+@pytest.mark.xdist_group("watch_timing_sensitive")
 def test_watch_code_change_triggers_reload_and_execution(
     pipeline_dir: pathlib.Path,
 ) -> None:
-    """Integration: Python file change triggers registry reload and re-execution."""
+    """Integration: Python file change triggers registry reload and re-execution.
+
+    Note: Uses xdist_group to isolate from parallel tests due to timing sensitivity.
+    """
     (pipeline_dir / "data.csv").write_text("a,b\n1,2")
     helper_file = pipeline_dir / "helper.py"
     helper_file.write_text("def helper(): pass\n")
