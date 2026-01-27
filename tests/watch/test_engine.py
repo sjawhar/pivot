@@ -229,14 +229,6 @@ def _stage_with_dir_output() -> _OutputsDir:
     return _OutputsDir(outputs=pathlib.Path("outputs"))
 
 
-@pytest.fixture
-def pipeline_dir(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> pathlib.Path:
-    """Set up a temporary pipeline directory."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / "pivot.yaml").write_text("version: 1\n")
-    return tmp_path
-
-
 # _collect_watch_paths tests
 
 

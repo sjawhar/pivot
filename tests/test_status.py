@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import pathlib
 from typing import TYPE_CHECKING, Annotated, TypedDict
 
@@ -49,7 +48,9 @@ def _helper_stage_b(
     return {"output": pathlib.Path("b.txt")}
 
 
-def test_pipeline_status_all_cached(tmp_path: pathlib.Path, mocker: MockerFixture) -> None:
+def test_pipeline_status_all_cached(
+    tmp_path: pathlib.Path, mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """All stages should show cached after successful run."""
     mocker.patch("pivot.project._project_root_cache", tmp_path)
     (tmp_path / ".git").mkdir()
@@ -57,13 +58,9 @@ def test_pipeline_status_all_cached(tmp_path: pathlib.Path, mocker: MockerFixtur
 
     register_test_stage(_helper_stage_a, name="stage_a")
 
-    old_cwd = os.getcwd()
-    os.chdir(tmp_path)
-    try:
-        executor.run(show_output=False)
-        results, _ = status.get_pipeline_status(None, single_stage=False)
-    finally:
-        os.chdir(old_cwd)
+    monkeypatch.chdir(tmp_path)
+    executor.run(show_output=False)
+    results, _ = status.get_pipeline_status(None, single_stage=False)
 
     assert len(results) == 1
     assert results[0]["name"] == "stage_a"

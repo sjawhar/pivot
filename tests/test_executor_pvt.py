@@ -122,7 +122,7 @@ def test_run_fails_when_tracked_file_missing(pipeline_dir: pathlib.Path) -> None
 
 
 def test_run_succeeds_with_hash_mismatch(
-    pipeline_dir: pathlib.Path,
+    pipeline_dir: pathlib.Path, runner: click.testing.CliRunner
 ) -> None:
     """Pipeline runs successfully when tracked file hash doesn't match .pvt."""
     # Create data file with some content
@@ -130,7 +130,7 @@ def test_run_succeeds_with_hash_mismatch(
     data_file.write_text("original content")
 
     # Track it properly via CLI to get correct hash
-    result = click.testing.CliRunner().invoke(cli.cli, ["track", "data.csv"])
+    result = runner.invoke(cli.cli, ["track", "data.csv"])
     assert result.exit_code == 0
 
     # Now modify the data file (hash mismatch)
