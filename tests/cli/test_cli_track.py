@@ -4,7 +4,8 @@ import pathlib
 from typing import TYPE_CHECKING, Annotated, TypedDict
 
 from helpers import register_test_stage
-from pivot import cli, loaders, outputs
+from pivot import cli, loaders, outputs, project
+from pivot.registry import REGISTRY
 from pivot.storage import track
 
 if TYPE_CHECKING:
@@ -20,6 +21,30 @@ class _OutputTxtOutputs(TypedDict):
     output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
 
 
+class _OutputsDir(TypedDict):
+    output_dir: Annotated[pathlib.Path, outputs.Out("outputs/", loaders.PathOnly())]
+
+
+class _ModelPkl(TypedDict):
+    model: Annotated[pathlib.Path, outputs.Out("model.pkl", loaders.PathOnly())]
+
+
+class _OutputsLinkDir(TypedDict):
+    output_dir: Annotated[pathlib.Path, outputs.Out("outputs_link/", loaders.PathOnly())]
+
+
+class _Link1Csv(TypedDict):
+    link: Annotated[pathlib.Path, outputs.Out("link1.csv", loaders.PathOnly())]
+
+
+class _ModelLinkPkl(TypedDict):
+    model: Annotated[pathlib.Path, outputs.Out("data/model_link.pkl", loaders.PathOnly())]
+
+
+class _RealDataCsv(TypedDict):
+    data: Annotated[pathlib.Path, outputs.Out("real/data.csv", loaders.PathOnly())]
+
+
 # =============================================================================
 # Module-level helper functions
 # =============================================================================
@@ -31,6 +56,32 @@ def _helper_process(
     _ = input_file
     pathlib.Path("output.txt").write_text("done")
     return {"output": pathlib.Path("output.txt")}
+
+
+def _train_outputs_dir() -> _OutputsDir:
+    pathlib.Path("outputs").mkdir(exist_ok=True)
+    return {"output_dir": pathlib.Path("outputs")}
+
+
+def _train_model_pkl() -> _ModelPkl:
+    pathlib.Path("model.pkl").write_bytes(b"model")
+    return {"model": pathlib.Path("model.pkl")}
+
+
+def _process_outputs_link() -> _OutputsLinkDir:
+    return {"output_dir": pathlib.Path("outputs_link")}
+
+
+def _produce_link1() -> _Link1Csv:
+    return {"link": pathlib.Path("link1.csv")}
+
+
+def _train_model_link() -> _ModelLinkPkl:
+    return {"model": pathlib.Path("data/model_link.pkl")}
+
+
+def _process_real_data() -> _RealDataCsv:
+    return {"data": pathlib.Path("real/data.csv")}
 
 
 # =============================================================================
@@ -258,3 +309,181 @@ def test_track_multiple_files(runner: click.testing.CliRunner, tmp_path: pathlib
         assert "Tracked: file2.txt" in result.output
         assert pathlib.Path("file1.txt.pvt").exists()
         assert pathlib.Path("file2.txt.pvt").exists()
+
+
+# =============================================================================
+# Symlink Aliasing Tests - Security Critical
+# =============================================================================
+
+
+def test_track_symlink_to_stage_output_file_rejected(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """Tracking symlink that points to stage output file is rejected."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        project._project_root_cache = None
+
+        # Create stage output file
+        pathlib.Path("model.pkl").write_bytes(b"model")
+
+        # Register stage with this file as output
+        register_test_stage(_train_model_pkl, name="train")
+
+        # Create symlink pointing to the stage output
+        pathlib.Path("model_link.pkl").symlink_to("model.pkl")
+
+        # Try to track the symlink
+        result = runner.invoke(cli.cli, ["track", "model_link.pkl"])
+
+        assert result.exit_code != 0, "Should reject symlink to stage output"
+        assert "overlap" in result.output.lower() or "output" in result.output.lower(), (
+            "Error should mention overlap with stage output"
+        )
+        assert "resolves to" in result.output.lower(), (
+            "Error should show resolved path for debugging"
+        )
+
+        REGISTRY.clear()
+
+
+def test_track_symlink_to_stage_output_directory_rejected(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """Tracking symlink that points to stage output directory is rejected."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        project._project_root_cache = None
+
+        # Create stage output directory
+        output_dir = pathlib.Path("outputs")
+        output_dir.mkdir()
+        (output_dir / "results.txt").write_text("data")
+
+        # Register stage with directory as output (outputs/)
+        register_test_stage(_train_outputs_dir, name="process")
+
+        # Create symlink pointing to the output directory
+        pathlib.Path("output_link").symlink_to("outputs")
+
+        # Try to track the symlink
+        result = runner.invoke(cli.cli, ["track", "output_link"])
+
+        assert result.exit_code != 0, "Should reject symlink to stage output directory"
+        assert "overlap" in result.output.lower() or "output" in result.output.lower()
+
+        REGISTRY.clear()
+
+
+def test_track_file_inside_symlinked_stage_output_rejected(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """Tracking file inside symlinked directory that's a stage output is rejected."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        project._project_root_cache = None
+
+        # Create actual directory with files
+        real_dir = pathlib.Path("real_outputs")
+        real_dir.mkdir()
+        (real_dir / "model.pkl").write_bytes(b"model")
+
+        # Create symlink to directory
+        pathlib.Path("outputs_link").symlink_to("real_outputs")
+
+        # Register stage with symlinked path as output
+        register_test_stage(_process_outputs_link, name="train")
+
+        # Try to track file via the real path
+        result = runner.invoke(cli.cli, ["track", "real_outputs/model.pkl"])
+
+        assert result.exit_code != 0, "Should detect overlap through symlink aliasing"
+        assert "overlap" in result.output.lower() or "output" in result.output.lower(), (
+            "Error should mention overlap with stage output"
+        )
+
+        REGISTRY.clear()
+
+
+def test_track_symlink_aliasing_same_file_different_paths(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """Tracking same file via different symlink paths detects aliasing."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        project._project_root_cache = None
+
+        # Create real file
+        pathlib.Path("real_data.csv").write_text("data")
+
+        # Create two symlinks to same file
+        pathlib.Path("link1.csv").symlink_to("real_data.csv")
+        pathlib.Path("link2.csv").symlink_to("real_data.csv")
+
+        # Register stage with one symlink as output
+        register_test_stage(_produce_link1, name="produce")
+
+        # Try to track the other symlink (points to same file)
+        result = runner.invoke(cli.cli, ["track", "link2.csv"])
+
+        assert result.exit_code != 0, "Should detect that link2 and link1 point to same file"
+        assert "overlap" in result.output.lower() or "output" in result.output.lower()
+
+        REGISTRY.clear()
+
+
+def test_track_parent_directory_with_symlinked_stage_output(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """Tracking parent directory when child is symlinked stage output is rejected."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        project._project_root_cache = None
+
+        # Create directory structure
+        parent_dir = pathlib.Path("data")
+        parent_dir.mkdir()
+        real_file = parent_dir / "real_model.pkl"
+        real_file.write_bytes(b"model")
+
+        # Create symlink inside parent directory
+        symlink = parent_dir / "model_link.pkl"
+        symlink.symlink_to("real_model.pkl")
+
+        # Register stage with symlink as output
+        register_test_stage(_train_model_link, name="train")
+
+        # Try to track parent directory (contains stage output)
+        result = runner.invoke(cli.cli, ["track", "data"])
+
+        assert result.exit_code != 0, "Should reject tracking directory containing stage output"
+        assert "overlap" in result.output.lower() or "output" in result.output.lower()
+
+        REGISTRY.clear()
+
+
+def test_track_with_normalized_vs_resolved_paths(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """Error messages show both normalized and resolved paths for debugging."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        project._project_root_cache = None
+
+        # Create nested directory structure with symlink
+        pathlib.Path("real").mkdir()
+        pathlib.Path("real/data.csv").write_text("data")
+        pathlib.Path("link_to_real").symlink_to("real")
+
+        # Register stage with real path
+        register_test_stage(_process_real_data, name="process")
+
+        # Try to track via symlinked path
+        result = runner.invoke(cli.cli, ["track", "link_to_real/data.csv"])
+
+        assert result.exit_code != 0, "Should detect overlap via symlink"
+        # Both paths should appear in error for clarity
+        assert "link_to_real" in result.output, "Should show user's path"
+        assert "real" in result.output, "Should show resolved path"
+
+        REGISTRY.clear()
