@@ -9,7 +9,8 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from pivot import registry
+from conftest import stage_module_isolation
+from pivot import project, registry
 from pivot.pipeline import yaml as pipeline_config
 
 if TYPE_CHECKING:
@@ -36,19 +37,10 @@ def simple_pipeline(tmp_path: pathlib.Path, mocker: MockerFixture) -> Generator[
     (tmp_path / "data" / "raw.csv").write_text("id,value\n1,10\n2,20\n")
     (tmp_path / "models").mkdir(exist_ok=True)
 
-    # Set project root so paths resolve correctly
-    mocker.patch("pivot.project._project_root_cache", tmp_path)
+    mocker.patch.object(project, "_project_root_cache", tmp_path)
 
-    # Clear any cached stages module from previous tests
-    if "stages" in sys.modules:
-        del sys.modules["stages"]
-
-    # Add fixture dir to sys.path so stages module can be imported
-    sys.path.insert(0, str(tmp_path))
-    yield tmp_path
-    sys.path.remove(str(tmp_path))
-    if "stages" in sys.modules:
-        del sys.modules["stages"]
+    with stage_module_isolation(tmp_path):
+        yield tmp_path
 
 
 @pytest.fixture
@@ -63,18 +55,10 @@ def params_pipeline(tmp_path: pathlib.Path, mocker: MockerFixture) -> Generator[
     (tmp_path / "models").mkdir(exist_ok=True)
     (tmp_path / "metrics").mkdir(exist_ok=True)
 
-    # Set project root
-    mocker.patch("pivot.project._project_root_cache", tmp_path)
+    mocker.patch.object(project, "_project_root_cache", tmp_path)
 
-    # Clear any cached stages module from previous tests
-    if "stages" in sys.modules:
-        del sys.modules["stages"]
-
-    sys.path.insert(0, str(tmp_path))
-    yield tmp_path
-    sys.path.remove(str(tmp_path))
-    if "stages" in sys.modules:
-        del sys.modules["stages"]
+    with stage_module_isolation(tmp_path):
+        yield tmp_path
 
 
 @pytest.fixture
@@ -93,18 +77,10 @@ def matrix_pipeline(tmp_path: pathlib.Path, mocker: MockerFixture) -> Generator[
     (tmp_path / "models").mkdir(exist_ok=True)
     (tmp_path / "metrics").mkdir(exist_ok=True)
 
-    # Set project root
-    mocker.patch("pivot.project._project_root_cache", tmp_path)
+    mocker.patch.object(project, "_project_root_cache", tmp_path)
 
-    # Clear any cached stages module from previous tests
-    if "stages" in sys.modules:
-        del sys.modules["stages"]
-
-    sys.path.insert(0, str(tmp_path))
-    yield tmp_path
-    sys.path.remove(str(tmp_path))
-    if "stages" in sys.modules:
-        del sys.modules["stages"]
+    with stage_module_isolation(tmp_path):
+        yield tmp_path
 
 
 # =============================================================================

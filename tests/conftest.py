@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import importlib
 import linecache
 import logging
@@ -8,7 +9,7 @@ import pathlib
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Generator
 from typing import TYPE_CHECKING, cast
 
 import click.testing
@@ -26,8 +27,6 @@ if str(_tests_dir) not in sys.path:
     sys.path.insert(0, str(_tests_dir))
 
 if TYPE_CHECKING:
-    from collections.abc import Generator
-
     from pytest_mock import MockerFixture
 
     from pivot.types import OutputMessage, TuiQueue
@@ -113,6 +112,36 @@ def init_git_repo(path: pathlib.Path, monkeypatch: pytest.MonkeyPatch | None = N
         subprocess.run(
             ["git", "config", "user.name", "Test"], cwd=abs_path, check=True, capture_output=True
         )
+
+
+@contextlib.contextmanager
+def stage_module_isolation(path: pathlib.Path) -> Generator[None]:
+    """Add path to sys.path and ensure 'stages' module is freshly imported.
+
+    Cleans up sys.path and removes cached 'stages' module on exit to prevent
+    test pollution. Use this in fixtures that need to import a stages.py file
+    from a test-specific directory.
+
+    Example:
+        @pytest.fixture
+        def my_pipeline(tmp_path: Path, mocker: MockerFixture) -> Generator[Path]:
+            # ... setup ...
+            mocker.patch.object(project, "_project_root_cache", tmp_path)
+            with stage_module_isolation(tmp_path):
+                yield tmp_path
+    """
+    if "stages" in sys.modules:
+        del sys.modules["stages"]
+    path_str = str(path)
+    sys.path.insert(0, path_str)
+    try:
+        yield
+    finally:
+        # Guard against ValueError if path was removed by other code
+        if path_str in sys.path:
+            sys.path.remove(path_str)
+        if "stages" in sys.modules:
+            del sys.modules["stages"]
 
 
 @pytest.fixture
