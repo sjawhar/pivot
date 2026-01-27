@@ -2,10 +2,9 @@ from __future__ import annotations
 
 import inspect
 import json
-import subprocess
 from typing import TYPE_CHECKING
 
-from pivot import loaders, outputs
+from pivot import loaders, outputs, project
 from pivot.registry import REGISTRY, RegistryStageInfo
 from pivot.show import plots
 from pivot.storage import lock
@@ -13,6 +12,10 @@ from pivot.types import ChangeType, LockData, OutputFormat
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    from pytest_mock import MockerFixture
+
+    from conftest import GitRepo
 
 
 # =============================================================================
@@ -216,23 +219,6 @@ def test_get_plot_hashes_from_lock_with_none_hash(set_project_root: Path) -> Non
 # =============================================================================
 
 
-def _setup_git_repo(tmp_path: Path) -> None:
-    """Initialize a git repo with user config."""
-    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "config", "user.email", "test@test.com"],
-        cwd=tmp_path,
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "config", "user.name", "Test"],
-        cwd=tmp_path,
-        check=True,
-        capture_output=True,
-    )
-
-
 def test_get_plot_hashes_from_head_no_git_repo(set_project_root: Path) -> None:
     """Returns empty dict when not in a git repo."""
     plot_file = set_project_root / "plot.png"
@@ -248,18 +234,20 @@ def test_get_plot_hashes_from_head_no_git_repo(set_project_root: Path) -> None:
 
 
 def test_get_plot_hashes_from_head_returns_committed_hash(
-    set_project_root: Path,
+    git_repo: GitRepo,
+    mocker: MockerFixture,
 ) -> None:
     """Returns hash from lock file committed to HEAD."""
-    _setup_git_repo(set_project_root)
+    repo_path, commit = git_repo
+    mocker.patch.object(project, "_project_root_cache", repo_path)
 
-    plot_file = set_project_root / "plot.png"
+    plot_file = repo_path / "plot.png"
     plot_file.write_bytes(b"data")
 
     _register_plot_stage("test_stage", str(plot_file))
 
     # Create and commit lock file with hash
-    state_dir = set_project_root / ".pivot"
+    state_dir = repo_path / ".pivot"
     stages_dir = lock.get_stages_dir(state_dir)
     stages_dir.mkdir(parents=True, exist_ok=True)
     stage_lock = lock.StageLock("test_stage", stages_dir)
@@ -273,13 +261,7 @@ def test_get_plot_hashes_from_head_returns_committed_hash(
         )
     )
 
-    subprocess.run(["git", "add", "."], cwd=set_project_root, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "commit", "-m", "initial"],
-        cwd=set_project_root,
-        check=True,
-        capture_output=True,
-    )
+    commit("initial")
 
     result = plots.get_plot_hashes_from_head()
 
@@ -287,18 +269,20 @@ def test_get_plot_hashes_from_head_returns_committed_hash(
 
 
 def test_get_plot_hashes_from_head_ignores_uncommitted_changes(
-    set_project_root: Path,
+    git_repo: GitRepo,
+    mocker: MockerFixture,
 ) -> None:
     """Returns committed hash, not uncommitted changes."""
-    _setup_git_repo(set_project_root)
+    repo_path, commit = git_repo
+    mocker.patch.object(project, "_project_root_cache", repo_path)
 
-    plot_file = set_project_root / "plot.png"
+    plot_file = repo_path / "plot.png"
     plot_file.write_bytes(b"data")
 
     _register_plot_stage("test_stage", str(plot_file))
 
     # Create and commit lock file with original hash
-    state_dir = set_project_root / ".pivot"
+    state_dir = repo_path / ".pivot"
     stages_dir = lock.get_stages_dir(state_dir)
     stages_dir.mkdir(parents=True, exist_ok=True)
     stage_lock = lock.StageLock("test_stage", stages_dir)
@@ -312,13 +296,7 @@ def test_get_plot_hashes_from_head_ignores_uncommitted_changes(
         )
     )
 
-    subprocess.run(["git", "add", "."], cwd=set_project_root, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "commit", "-m", "initial"],
-        cwd=set_project_root,
-        check=True,
-        capture_output=True,
-    )
+    commit("initial")
 
     # Update lock file but don't commit
     stage_lock.write(
@@ -336,22 +314,20 @@ def test_get_plot_hashes_from_head_ignores_uncommitted_changes(
     assert result["plot.png"] == "original_hash", "Should return committed hash, not modified"
 
 
-def test_get_plot_hashes_from_head_no_lock_in_head(set_project_root: Path) -> None:
+def test_get_plot_hashes_from_head_no_lock_in_head(
+    git_repo: GitRepo,
+    mocker: MockerFixture,
+) -> None:
     """Returns None for plots with no lock file in HEAD."""
-    _setup_git_repo(set_project_root)
+    repo_path, commit = git_repo
+    mocker.patch.object(project, "_project_root_cache", repo_path)
 
-    plot_file = set_project_root / "plot.png"
+    plot_file = repo_path / "plot.png"
     plot_file.write_bytes(b"data")
 
     # Create initial commit with something else
-    (set_project_root / "readme.txt").write_text("readme")
-    subprocess.run(["git", "add", "."], cwd=set_project_root, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "commit", "-m", "initial"],
-        cwd=set_project_root,
-        check=True,
-        capture_output=True,
-    )
+    (repo_path / "readme.txt").write_text("readme")
+    commit("initial")
 
     _register_plot_stage("test_stage", str(plot_file))
 

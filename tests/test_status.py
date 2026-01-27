@@ -13,6 +13,12 @@ from pivot.types import RemoteStatus
 if TYPE_CHECKING:
     from pytest_mock import MockerFixture
 
+# =============================================================================
+# Note: Tests use set_project_root fixture from conftest.py which patches
+# project._project_root_cache using patch.object for safety (fails if attr
+# doesn't exist, unlike string-based patches that silently create new attrs).
+# =============================================================================
+
 
 # =============================================================================
 # Output TypedDicts for annotation-based stages
@@ -49,16 +55,15 @@ def _helper_stage_b(
 
 
 def test_pipeline_status_all_cached(
-    tmp_path: pathlib.Path, mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch
+    set_project_root: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """All stages should show cached after successful run."""
-    mocker.patch("pivot.project._project_root_cache", tmp_path)
-    (tmp_path / ".git").mkdir()
-    (tmp_path / "input.txt").write_text("data")
+    (set_project_root / ".git").mkdir()
+    (set_project_root / "input.txt").write_text("data")
 
     register_test_stage(_helper_stage_a, name="stage_a")
 
-    monkeypatch.chdir(tmp_path)
+    monkeypatch.chdir(set_project_root)
     executor.run(show_output=False)
     results, _ = status.get_pipeline_status(None, single_stage=False)
 
@@ -68,11 +73,10 @@ def test_pipeline_status_all_cached(
     assert results[0]["reason"] == ""
 
 
-def test_pipeline_status_some_stale(tmp_path: pathlib.Path, mocker: MockerFixture) -> None:
+def test_pipeline_status_some_stale(set_project_root: pathlib.Path) -> None:
     """Stages with changed code should show stale."""
-    mocker.patch("pivot.project._project_root_cache", tmp_path)
-    (tmp_path / ".git").mkdir()
-    (tmp_path / "input.txt").write_text("data")
+    (set_project_root / ".git").mkdir()
+    (set_project_root / "input.txt").write_text("data")
 
     register_test_stage(_helper_stage_a, name="stage_a")
 
@@ -84,11 +88,10 @@ def test_pipeline_status_some_stale(tmp_path: pathlib.Path, mocker: MockerFixtur
     assert results[0]["reason"] == "No previous run"
 
 
-def test_pipeline_status_upstream_stale(tmp_path: pathlib.Path, mocker: MockerFixture) -> None:
+def test_pipeline_status_upstream_stale(set_project_root: pathlib.Path) -> None:
     """Stage should be marked stale if upstream is stale."""
-    mocker.patch("pivot.project._project_root_cache", tmp_path)
-    (tmp_path / ".git").mkdir()
-    (tmp_path / "input.txt").write_text("data")
+    (set_project_root / ".git").mkdir()
+    (set_project_root / "input.txt").write_text("data")
 
     register_test_stage(_helper_stage_a, name="stage_a")
     register_test_stage(_helper_stage_b, name="stage_b")
@@ -107,11 +110,10 @@ def test_pipeline_status_upstream_stale(tmp_path: pathlib.Path, mocker: MockerFi
     assert "stage_a" in stage_b["upstream_stale"]
 
 
-def test_pipeline_status_specific_stages(tmp_path: pathlib.Path, mocker: MockerFixture) -> None:
+def test_pipeline_status_specific_stages(set_project_root: pathlib.Path) -> None:
     """Should only return status for specified stages."""
-    mocker.patch("pivot.project._project_root_cache", tmp_path)
-    (tmp_path / ".git").mkdir()
-    (tmp_path / "input.txt").write_text("data")
+    (set_project_root / ".git").mkdir()
+    (set_project_root / "input.txt").write_text("data")
 
     register_test_stage(_helper_stage_a, name="stage_a")
     register_test_stage(_helper_stage_b, name="stage_b")
@@ -127,77 +129,72 @@ def test_pipeline_status_specific_stages(tmp_path: pathlib.Path, mocker: MockerF
 # =============================================================================
 
 
-def test_tracked_files_clean(tmp_path: pathlib.Path, mocker: MockerFixture) -> None:
+def test_tracked_files_clean(set_project_root: pathlib.Path) -> None:
     """Tracked file should show clean when unchanged."""
-    mocker.patch("pivot.project._project_root_cache", tmp_path)
-    (tmp_path / ".git").mkdir()
+    (set_project_root / ".git").mkdir()
 
-    data_file = tmp_path / "data.txt"
+    data_file = set_project_root / "data.txt"
     data_file.write_text("content")
     file_hash = cache.hash_file(data_file)
 
     pvt_data = track.PvtData(path="data.txt", hash=file_hash, size=7)
-    track.write_pvt_file(tmp_path / "data.txt.pvt", pvt_data)
+    track.write_pvt_file(set_project_root / "data.txt.pvt", pvt_data)
 
-    results = status.get_tracked_files_status(tmp_path)
+    results = status.get_tracked_files_status(set_project_root)
 
     assert len(results) == 1
     assert results[0]["path"] == "data.txt"
     assert results[0]["status"] == "clean"
 
 
-def test_tracked_files_modified(tmp_path: pathlib.Path, mocker: MockerFixture) -> None:
+def test_tracked_files_modified(set_project_root: pathlib.Path) -> None:
     """Tracked file should show modified when changed."""
-    mocker.patch("pivot.project._project_root_cache", tmp_path)
-    (tmp_path / ".git").mkdir()
+    (set_project_root / ".git").mkdir()
 
-    data_file = tmp_path / "data.txt"
+    data_file = set_project_root / "data.txt"
     data_file.write_text("original")
     old_hash = cache.hash_file(data_file)
 
     pvt_data = track.PvtData(path="data.txt", hash=old_hash, size=8)
-    track.write_pvt_file(tmp_path / "data.txt.pvt", pvt_data)
+    track.write_pvt_file(set_project_root / "data.txt.pvt", pvt_data)
 
     data_file.write_text("modified content")
 
-    results = status.get_tracked_files_status(tmp_path)
+    results = status.get_tracked_files_status(set_project_root)
 
     assert len(results) == 1
     assert results[0]["path"] == "data.txt"
     assert results[0]["status"] == "modified"
 
 
-def test_tracked_files_missing(tmp_path: pathlib.Path, mocker: MockerFixture) -> None:
+def test_tracked_files_missing(set_project_root: pathlib.Path) -> None:
     """Tracked file should show missing when deleted."""
-    mocker.patch("pivot.project._project_root_cache", tmp_path)
-    (tmp_path / ".git").mkdir()
+    (set_project_root / ".git").mkdir()
 
     pvt_data = track.PvtData(path="data.txt", hash="abc123", size=100)
-    track.write_pvt_file(tmp_path / "data.txt.pvt", pvt_data)
+    track.write_pvt_file(set_project_root / "data.txt.pvt", pvt_data)
 
-    results = status.get_tracked_files_status(tmp_path)
+    results = status.get_tracked_files_status(set_project_root)
 
     assert len(results) == 1
     assert results[0]["path"] == "data.txt"
     assert results[0]["status"] == "missing"
 
 
-def test_tracked_files_empty(tmp_path: pathlib.Path, mocker: MockerFixture) -> None:
+def test_tracked_files_empty(set_project_root: pathlib.Path) -> None:
     """Should return empty list when no tracked files."""
-    mocker.patch("pivot.project._project_root_cache", tmp_path)
-    (tmp_path / ".git").mkdir()
+    (set_project_root / ".git").mkdir()
 
-    results = status.get_tracked_files_status(tmp_path)
+    results = status.get_tracked_files_status(set_project_root)
 
     assert results == []
 
 
-def test_tracked_directory_clean(tmp_path: pathlib.Path, mocker: MockerFixture) -> None:
+def test_tracked_directory_clean(set_project_root: pathlib.Path) -> None:
     """Tracked directory should show clean when unchanged."""
-    mocker.patch("pivot.project._project_root_cache", tmp_path)
-    (tmp_path / ".git").mkdir()
+    (set_project_root / ".git").mkdir()
 
-    data_dir = tmp_path / "data"
+    data_dir = set_project_root / "data"
     data_dir.mkdir()
     (data_dir / "file1.txt").write_text("content1")
     (data_dir / "file2.txt").write_text("content2")
@@ -206,21 +203,20 @@ def test_tracked_directory_clean(tmp_path: pathlib.Path, mocker: MockerFixture) 
     total_size = sum(entry["size"] for entry in manifest)
 
     pvt_data = track.PvtData(path="data", hash=dir_hash, size=total_size)
-    track.write_pvt_file(tmp_path / "data.pvt", pvt_data)
+    track.write_pvt_file(set_project_root / "data.pvt", pvt_data)
 
-    results = status.get_tracked_files_status(tmp_path)
+    results = status.get_tracked_files_status(set_project_root)
 
     assert len(results) == 1
     assert results[0]["path"] == "data"
     assert results[0]["status"] == "clean"
 
 
-def test_tracked_directory_modified(tmp_path: pathlib.Path, mocker: MockerFixture) -> None:
+def test_tracked_directory_modified(set_project_root: pathlib.Path) -> None:
     """Tracked directory should show modified when contents change."""
-    mocker.patch("pivot.project._project_root_cache", tmp_path)
-    (tmp_path / ".git").mkdir()
+    (set_project_root / ".git").mkdir()
 
-    data_dir = tmp_path / "data"
+    data_dir = set_project_root / "data"
     data_dir.mkdir()
     (data_dir / "file1.txt").write_text("content1")
 
@@ -228,11 +224,11 @@ def test_tracked_directory_modified(tmp_path: pathlib.Path, mocker: MockerFixtur
     total_size = sum(entry["size"] for entry in manifest)
 
     pvt_data = track.PvtData(path="data", hash=dir_hash, size=total_size)
-    track.write_pvt_file(tmp_path / "data.pvt", pvt_data)
+    track.write_pvt_file(set_project_root / "data.pvt", pvt_data)
 
     (data_dir / "file1.txt").write_text("modified content")
 
-    results = status.get_tracked_files_status(tmp_path)
+    results = status.get_tracked_files_status(set_project_root)
 
     assert len(results) == 1
     assert results[0]["path"] == "data"

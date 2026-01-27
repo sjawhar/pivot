@@ -82,19 +82,47 @@ def set_project_root(tmp_path: pathlib.Path, mocker: MockerFixture) -> Generator
     yield tmp_path
 
 
+def init_git_repo(path: pathlib.Path, monkeypatch: pytest.MonkeyPatch | None = None) -> None:
+    """Initialize a git repo with user config at the given path.
+
+    This is a helper function for tests that need git in a path they control.
+    For tests that just need a standard git repo, use the `git_repo` fixture.
+
+    Args:
+        path: Directory to initialize as a git repository.
+        monkeypatch: Optional MonkeyPatch to set GIT_CONFIG_GLOBAL, avoiding 2 subprocess calls.
+    """
+    # Resolve to absolute path to avoid issues with cwd changes
+    abs_path = path.resolve()
+    if monkeypatch is not None:
+        # Use GIT_CONFIG_GLOBAL to avoid per-repo config subprocess calls
+        # Place config in parent directory to avoid it being included in git commits
+        config_file = abs_path.parent / f".gitconfig_test_{abs_path.name}"
+        config_file.write_text("[user]\n\temail = test@test.com\n\tname = Test\n")
+        monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config_file))
+        subprocess.run(["git", "init"], cwd=abs_path, check=True, capture_output=True)
+    else:
+        # Fallback: configure per-repo (3 subprocess calls)
+        subprocess.run(["git", "init"], cwd=abs_path, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "config", "user.email", "test@test.com"],
+            cwd=abs_path,
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Test"], cwd=abs_path, check=True, capture_output=True
+        )
+
+
 @pytest.fixture
-def git_repo(tmp_path: pathlib.Path) -> GitRepo:
-    """Create a git repo in tmp_path, return (path, commit_fn)."""
-    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "config", "user.email", "test@test.com"],
-        cwd=tmp_path,
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "config", "user.name", "Test"], cwd=tmp_path, check=True, capture_output=True
-    )
+def git_repo(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> GitRepo:
+    """Create a git repo in tmp_path, return (path, commit_fn).
+
+    Uses GIT_CONFIG_GLOBAL to configure user settings with a single subprocess call
+    instead of 3, improving test performance.
+    """
+    init_git_repo(tmp_path, monkeypatch)
 
     def commit(message: str) -> str:
         subprocess.run(["git", "add", "."], cwd=tmp_path, check=True, capture_output=True)

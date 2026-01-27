@@ -2,32 +2,15 @@ from __future__ import annotations
 
 import json
 import pathlib
-import subprocess
 from typing import TYPE_CHECKING
 
 import pytest
 
+from conftest import GitRepo, init_git_repo
 from pivot import cli
 
 if TYPE_CHECKING:
     import click.testing
-
-
-def _setup_git_repo(tmp_path: pathlib.Path) -> None:
-    """Initialize a git repo with user config."""
-    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "config", "user.email", "test@test.com"],
-        cwd=tmp_path,
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "config", "user.name", "Test"],
-        cwd=tmp_path,
-        check=True,
-        capture_output=True,
-    )
 
 
 # =============================================================================
@@ -140,11 +123,13 @@ def test_plots_diff_no_plots(runner: click.testing.CliRunner, tmp_path: pathlib.
 
 
 def test_plots_diff_explicit_file_no_stages(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Issue #62: plots diff TARGET should work with explicit file when no stages registered."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
-        _setup_git_repo(pathlib.Path("."))
+        init_git_repo(pathlib.Path("."), monkeypatch)
         # Create a plot file
         plot_file = pathlib.Path("results.png")
         plot_file.write_bytes(b"fake png data")
@@ -156,28 +141,20 @@ def test_plots_diff_explicit_file_no_stages(
         assert result.exit_code == 0
 
 
-def test_plots_diff_json_format(
-    runner: click.testing.CliRunner, set_project_root: pathlib.Path
-) -> None:
+def test_plots_diff_json_format(runner: click.testing.CliRunner, git_repo: GitRepo) -> None:
     """plots diff --json returns valid JSON with explicit file target."""
-    _setup_git_repo(set_project_root)
+    repo_path, commit = git_repo
 
-    plot_file = set_project_root / "plot.png"
+    plot_file = repo_path / "plot.png"
     plot_file.write_bytes(b"fake png data")
 
     # Commit the initial plot file
-    subprocess.run(["git", "add", "."], cwd=set_project_root, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "commit", "-m", "initial"],
-        cwd=set_project_root,
-        check=True,
-        capture_output=True,
-    )
+    commit("initial")
 
     # Modify the plot file
     plot_file.write_bytes(b"modified png data")
 
-    with runner.isolated_filesystem(temp_dir=set_project_root):
+    with runner.isolated_filesystem(temp_dir=repo_path):
         result = runner.invoke(cli.cli, ["plots", "diff", "--json", str(plot_file)])
         assert result.exit_code == 0
         # Output should be valid JSON
@@ -188,55 +165,39 @@ def test_plots_diff_json_format(
             pytest.fail(f"Output is not valid JSON: {result.output}")
 
 
-def test_plots_diff_md_format(
-    runner: click.testing.CliRunner, set_project_root: pathlib.Path
-) -> None:
+def test_plots_diff_md_format(runner: click.testing.CliRunner, git_repo: GitRepo) -> None:
     """plots diff --md returns markdown table with explicit file target."""
-    _setup_git_repo(set_project_root)
+    repo_path, commit = git_repo
 
-    plot_file = set_project_root / "plot.png"
+    plot_file = repo_path / "plot.png"
     plot_file.write_bytes(b"fake png data")
 
     # Commit the initial plot file
-    subprocess.run(["git", "add", "."], cwd=set_project_root, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "commit", "-m", "initial"],
-        cwd=set_project_root,
-        check=True,
-        capture_output=True,
-    )
+    commit("initial")
 
     # Modify the plot file
     plot_file.write_bytes(b"modified png data")
 
-    with runner.isolated_filesystem(temp_dir=set_project_root):
+    with runner.isolated_filesystem(temp_dir=repo_path):
         result = runner.invoke(cli.cli, ["plots", "diff", "--md", str(plot_file)])
         assert result.exit_code == 0
         assert "|" in result.output  # Markdown table uses pipes
 
 
-def test_plots_diff_no_path_flag(
-    runner: click.testing.CliRunner, set_project_root: pathlib.Path
-) -> None:
+def test_plots_diff_no_path_flag(runner: click.testing.CliRunner, git_repo: GitRepo) -> None:
     """plots diff --no-path hides path column with explicit file target."""
-    _setup_git_repo(set_project_root)
+    repo_path, commit = git_repo
 
-    plot_file = set_project_root / "plot.png"
+    plot_file = repo_path / "plot.png"
     plot_file.write_bytes(b"fake png data")
 
     # Commit the initial plot file
-    subprocess.run(["git", "add", "."], cwd=set_project_root, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "commit", "-m", "initial"],
-        cwd=set_project_root,
-        check=True,
-        capture_output=True,
-    )
+    commit("initial")
 
     # Modify the plot file
     plot_file.write_bytes(b"modified png data")
 
-    with runner.isolated_filesystem(temp_dir=set_project_root):
+    with runner.isolated_filesystem(temp_dir=repo_path):
         result = runner.invoke(cli.cli, ["plots", "diff", "--no-path", str(plot_file)])
         assert result.exit_code == 0
         assert "Path" not in result.output

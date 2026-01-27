@@ -51,14 +51,16 @@ def _valid_stage_func() -> _ValidStageOutputs:
 # =============================================================================
 
 
-def test_validate_stages_exist_with_none() -> None:
-    """validate_stages_exist returns early for None input."""
-    cli_helpers.validate_stages_exist(None)
-
-
-def test_validate_stages_exist_with_empty_list() -> None:
-    """validate_stages_exist returns early for empty list."""
-    cli_helpers.validate_stages_exist([])
+@pytest.mark.parametrize(
+    "stages",
+    [
+        pytest.param(None, id="none"),
+        pytest.param([], id="empty_list"),
+    ],
+)
+def test_validate_stages_exist_returns_early_for_empty_input(stages: list[str] | None) -> None:
+    """validate_stages_exist returns early for None or empty list without raising."""
+    cli_helpers.validate_stages_exist(stages)  # Should not raise
 
 
 def test_validate_stages_exist_with_valid_stages() -> None:
