@@ -11,6 +11,7 @@ import textual.widgets
 _HELP_TEXT = """\
 [bold cyan]Stage Navigation[/]
   j/k or Up/Down    Navigate stage list
+  /                 Filter stages by name
   Enter             Toggle group collapse
   -/=               Collapse/expand all groups
 
@@ -19,7 +20,7 @@ _HELP_TEXT = """\
   L/I/O             Jump to Logs/Input/Output tab
   Ctrl+j/k          Scroll detail content
   n/N               Next/prev changed item
-  Escape            Close logs view / collapse
+  Escape            Collapse expanded detail
 
 [bold cyan]History[/]
   [ / ]             View older/newer execution
@@ -28,8 +29,6 @@ _HELP_TEXT = """\
 
 [bold cyan]Actions[/]
   c                 Commit changes
-  a                 Toggle all-logs view
-  1-9               Filter logs to stage
   g                 Toggle keep-going mode (watch)
   ~                 Toggle debug panel
   q                 Quit"""

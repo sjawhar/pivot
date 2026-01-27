@@ -222,7 +222,8 @@ class _SelectableExpandablePanel(textual.containers.Horizontal):
     @override
     def compose(self) -> textual.app.ComposeResult:  # pragma: no cover
         yield textual.widgets.Static(id="item-list")
-        yield textual.widgets.Static(id="detail-pane")
+        with textual.containers.VerticalScroll(id="detail-scroll"):
+            yield textual.widgets.Static(id="detail-pane")
 
     @property
     def is_detail_expanded(self) -> bool:

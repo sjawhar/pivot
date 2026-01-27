@@ -104,11 +104,12 @@ def _sort_for_display(execution_order: list[str], graph: nx.DiGraph[str]) -> lis
         if base not in group_min_level or level < group_min_level[base]:
             group_min_level[base] = level
 
-    def display_sort_key(name: str) -> tuple[int, int, str]:
+    def display_sort_key(name: str) -> tuple[int, str, int, str]:
         base, variant = parse_stage_name(name)
         individual_level = levels.get(name, 0)
-        # Sort by: group level, then individual level, then variant name
-        return (group_min_level[base], individual_level, variant)
+        # Sort by: group level, then base_name (to keep groups together),
+        # then individual level, then variant name
+        return (group_min_level[base], base, individual_level, variant)
 
     return sorted(execution_order, key=display_sort_key)
 
@@ -180,6 +181,7 @@ def _run_with_tui(
 ) -> dict[str, ExecutionSummary] | None:
     """Run pipeline with TUI display."""
     import queue as thread_queue
+    import threading
 
     from pivot import dag
     from pivot.tui import run as run_tui
@@ -203,7 +205,10 @@ def _run_with_tui(
     # Using stdlib queue.Queue avoids Manager subprocess dependency issues.
     tui_queue: thread_queue.Queue[TuiMessage] = thread_queue.Queue()
 
-    # Create executor function that passes the TUI queue
+    # Cancel event allows TUI to signal executor to stop scheduling new stages
+    cancel_event = threading.Event()
+
+    # Create executor function that passes the TUI queue and cancel event
     def executor_func() -> dict[str, ExecutionSummary]:
         return executor.run(
             stages=stages_list,
@@ -217,13 +222,16 @@ def _run_with_tui(
             on_error=on_error,
             allow_uncached_incremental=allow_uncached_incremental,
             checkout_missing=checkout_missing,
+            cancel_event=cancel_event,
         )
 
     # Sort for display: group matrix variants together while preserving DAG structure
     display_order = _sort_for_display(execution_order, graph)
 
     with _suppress_stderr_logging():
-        return run_tui.run_with_tui(display_order, tui_queue, executor_func, tui_log=tui_log)
+        return run_tui.run_with_tui(
+            display_order, tui_queue, executor_func, tui_log=tui_log, cancel_event=cancel_event
+        )
 
 
 def _run_watch_with_tui(

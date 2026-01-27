@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, TypedDict
 
-from pivot.types import StageStatus
+from pivot.types import DisplayCategory, StageStatus, categorize_stage_result
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -18,51 +18,101 @@ def format_elapsed(elapsed: float | None) -> str:
     return f"({mins}:{secs:02d})"
 
 
-def get_status_symbol(status: StageStatus) -> tuple[str, str]:
+def get_status_symbol(status: StageStatus, reason: str = "") -> tuple[str, str]:
     """Get compact symbol and style for a status (for row display)."""
-    match status:
-        case StageStatus.READY:
+    category = categorize_stage_result(status, reason)
+    match category:
+        case DisplayCategory.PENDING:
             return ("○", "dim")
-        case StageStatus.IN_PROGRESS:
+        case DisplayCategory.RUNNING:
             return ("▶", "blue bold")
-        case StageStatus.COMPLETED | StageStatus.RAN:
+        case DisplayCategory.SUCCESS:
             return ("●", "green bold")
-        case StageStatus.SKIPPED:
-            return ("-", "yellow")
-        case StageStatus.FAILED:
-            return ("!", "red bold")
-        case StageStatus.UNKNOWN:
+        case DisplayCategory.CACHED:
+            return ("$", "yellow")
+        case DisplayCategory.BLOCKED:
+            return ("⊘", "red")
+        case DisplayCategory.CANCELLED:
+            return ("!", "yellow dim")
+        case DisplayCategory.FAILED:
+            return ("✗", "red bold")
+        case DisplayCategory.UNKNOWN:
             return ("?", "dim")
 
 
-def get_status_label(status: StageStatus) -> tuple[str, str]:
+def get_status_label(status: StageStatus, reason: str = "") -> tuple[str, str]:
     """Get verbose label and style for a status (for detail panel)."""
-    match status:
-        case StageStatus.READY:
+    category = categorize_stage_result(status, reason)
+    match category:
+        case DisplayCategory.PENDING:
             return ("PENDING", "dim")
-        case StageStatus.IN_PROGRESS:
+        case DisplayCategory.RUNNING:
             return ("RUNNING", "blue bold")
-        case StageStatus.COMPLETED | StageStatus.RAN:
+        case DisplayCategory.SUCCESS:
             return ("SUCCESS", "green bold")
-        case StageStatus.SKIPPED:
-            return ("SKIPPED", "yellow")
-        case StageStatus.FAILED:
+        case DisplayCategory.CACHED:
+            return ("CACHED", "yellow")
+        case DisplayCategory.BLOCKED:
+            return ("BLOCKED", "red")
+        case DisplayCategory.CANCELLED:
+            return ("CANCELLED", "yellow dim")
+        case DisplayCategory.FAILED:
             return ("FAILED", "red bold")
-        case StageStatus.UNKNOWN:
+        case DisplayCategory.UNKNOWN:
             return ("UNKNOWN", "dim")
 
 
-def get_status_icon(status: StageStatus) -> str:
+def get_status_icon(status: StageStatus, reason: str = "") -> str:
     """Get status icon with Rich markup (for inline display in headers/history)."""
-    match status:
-        case StageStatus.RAN | StageStatus.COMPLETED:
+    category = categorize_stage_result(status, reason)
+    match category:
+        case DisplayCategory.SUCCESS:
             return "[green]✓[/]"
-        case StageStatus.FAILED:
+        case DisplayCategory.FAILED:
             return "[red]✗[/]"
-        case StageStatus.SKIPPED:
-            return "[yellow]⊘[/]"
+        case DisplayCategory.CACHED:
+            return "[yellow]$[/]"
+        case DisplayCategory.BLOCKED:
+            return "[red]⊘[/]"
+        case DisplayCategory.CANCELLED:
+            return "[yellow dim]![/]"
         case _:
             return ""
+
+
+# Status icon plain text (no Rich markup) for length calculations
+_STATUS_ICON_PLAIN: dict[DisplayCategory, str] = {
+    DisplayCategory.SUCCESS: "✓",
+    DisplayCategory.FAILED: "✗",
+    DisplayCategory.CACHED: "$",
+    DisplayCategory.BLOCKED: "⊘",
+    DisplayCategory.CANCELLED: "!",
+}
+
+
+def get_status_icon_plain(status: StageStatus, reason: str = "") -> str:
+    """Get status icon without Rich markup (for length calculations)."""
+    category = categorize_stage_result(status, reason)
+    return _STATUS_ICON_PLAIN.get(category, "")
+
+
+def get_status_table_cell(status: StageStatus, reason: str) -> str:
+    """Get fixed-width status cell for table display (8 chars visible)."""
+    category = categorize_stage_result(status, reason)
+    match category:
+        case DisplayCategory.SUCCESS:
+            return "[green]✓ ran[/]  "
+        case DisplayCategory.FAILED:
+            return "[red]✗ fail[/] "
+        case DisplayCategory.CACHED:
+            return "[yellow]$ cache[/]"
+        case DisplayCategory.BLOCKED:
+            return "[red]⊘ block[/]"
+        case DisplayCategory.CANCELLED:
+            return "[yellow dim]! cncl[/] "
+        case _:
+            label, style = get_status_label(status, reason)
+            return f"[{style}]{label:<7}[/] "
 
 
 class StatusCounts(TypedDict):

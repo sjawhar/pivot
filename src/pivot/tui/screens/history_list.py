@@ -13,7 +13,6 @@ import textual.screen
 import textual.widgets
 
 from pivot.tui.widgets import status
-from pivot.types import StageStatus
 
 if TYPE_CHECKING:
     import collections
@@ -85,16 +84,8 @@ class HistoryListScreen(textual.screen.ModalScreen[int | None]):
             # Format duration
             duration_str = f"{entry.duration:6.1f}s" if entry.duration is not None else "     - "
 
-            # Format status
-            if entry.status == StageStatus.RAN:
-                status_str = "[green]✓ ran[/]  "
-            elif entry.status == StageStatus.FAILED:
-                status_str = "[red]✗ fail[/] "
-            elif entry.status == StageStatus.SKIPPED:
-                status_str = "[yellow]○ skip[/] "
-            else:
-                label, style = status.get_status_label(entry.status)
-                status_str = f"[{style}]{label:<7}[/] "
+            # Format status using centralized helper
+            status_str = status.get_status_table_cell(entry.status, entry.reason)
 
             # Truncate reason
             reason = entry.reason[:20] if len(entry.reason) > 20 else entry.reason

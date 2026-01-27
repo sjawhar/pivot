@@ -38,12 +38,16 @@ from pivot.registry import REGISTRY
 from pivot.storage import lock, project_lock
 from pivot.tui import agent_server, diff_panels
 from pivot.tui.diff_panels import InputDiffPanel, OutputDiffPanel
-from pivot.tui.screens import ConfirmCommitScreen, HelpScreen, HistoryListScreen
+from pivot.tui.screens import (
+    ConfirmCommitScreen,
+    ConfirmKillWorkersScreen,
+    HelpScreen,
+    HistoryListScreen,
+)
 from pivot.tui.stats import DebugStats, QueueStatsTracker, get_memory_mb
 from pivot.tui.types import ExecutionHistoryEntry, LogEntry, PendingHistoryState, StageInfo
 from pivot.tui.widgets import (
     DebugPanel,
-    LogPanel,
     StageListPanel,
     StageLogPanel,
     TabbedDetailPanel,
@@ -128,6 +132,8 @@ _TUI_BINDINGS: list[textual.binding.BindingType] = [
     # Group collapse/expand
     textual.binding.Binding("-", "collapse_all_groups", "Collapse All", show=False),
     textual.binding.Binding("=", "expand_all_groups", "Expand All", show=False),
+    # Stage filtering
+    textual.binding.Binding("/", "focus_filter", "Filter", show=False),
     # History navigation (works in all tabs, watch mode only)
     textual.binding.Binding("[", "history_older", "Older", show=False),
     textual.binding.Binding("]", "history_newer", "Newer", show=False),
@@ -137,17 +143,10 @@ _TUI_BINDINGS: list[textual.binding.BindingType] = [
     textual.binding.Binding("L", "goto_tab_logs", "Logs Tab", show=False),
     textual.binding.Binding("I", "goto_tab_input", "Input Tab", show=False),
     textual.binding.Binding("O", "goto_tab_output", "Output Tab", show=False),
-    # All logs view toggle
-    textual.binding.Binding("a", "toggle_all_logs", "All Logs"),
     # Debug panel toggle
     textual.binding.Binding("~", "toggle_debug", "Debug"),
     # Keep-going toggle (watch mode only)
     textual.binding.Binding("g", "toggle_keep_going", "Keep-going"),
-    # Stage filtering with number keys
-    *[
-        textual.binding.Binding(str(i), f"filter_stage({i - 1})", f"Stage {i}", show=False)
-        for i in range(1, 10)
-    ],
 ]
 
 _logger = logging.getLogger(__name__)
@@ -172,6 +171,7 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
 
     # Instance attributes (annotated for type checking since class is not @final)
     _executor_func: Callable[[], dict[str, ExecutionSummary]] | None
+    _cancel_event: threading.Event | None
     _engine: WatchEngine | None
     _output_queue: mp.Queue[OutputMessage] | None
 
@@ -183,6 +183,7 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
         *,
         # Run mode parameters
         executor_func: Callable[[], dict[str, ExecutionSummary]] | None = None,
+        cancel_event: threading.Event | None = None,
         # Watch mode parameters
         engine: WatchEngine | None = None,
         output_queue: mp.Queue[OutputMessage] | None = None,
@@ -208,7 +209,6 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
         self._stage_order: list[str] = []
         self._selected_idx: int = 0
         self._selected_stage_name: str | None = None
-        self._show_logs: bool = False
         self._reader_thread: threading.Thread | None = None
         self._shutdown_event: threading.Event = threading.Event()
         self._log_file: IO[str] | None = None
@@ -225,6 +225,7 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
 
         # Run mode state
         self._executor_func = executor_func
+        self._cancel_event = cancel_event
         self._results: dict[str, ExecutionSummary] | None = None
         self._error: Exception | None = None
         self._executor_thread: threading.Thread | None = None
@@ -282,6 +283,17 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
         """Check if any stages are currently in progress."""
         return any(s.status == StageStatus.IN_PROGRESS for s in self._stages.values())
 
+    def _shutdown_loky_pool(self) -> None:
+        """Force-kill loky worker pool to prevent hang on exit."""
+        import contextlib
+
+        import loky
+
+        # Best-effort cleanup - loky can fail with fd errors in some environments
+        with contextlib.suppress(Exception):
+            # kill_workers=True forces immediate termination of worker processes
+            loky.get_reusable_executor(max_workers=1, kill_workers=True)
+
     def select_stage_by_index(self, idx: int) -> None:
         """Select a stage by index (for testing)."""
         self._select_stage(idx)
@@ -336,9 +348,6 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
         with textual.containers.Horizontal(id="main-split"):
             yield StageListPanel(list(self._stages.values()), id="stage-list")
             yield TabbedDetailPanel(id="detail-panel")
-
-        with textual.containers.Vertical(id="logs-view", classes="view-hidden"):
-            yield LogPanel(id="log-panel")
 
         yield DebugPanel(id="debug-panel")
         yield textual.widgets.Footer()
@@ -501,11 +510,6 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
 
         self._stages[stage].logs.append(log_entry)
 
-        # Update all-logs panel
-        log_panel = self._try_query_one("#log-panel", LogPanel)
-        if log_panel:
-            log_panel.add_log(stage, line, is_stderr)
-
         # Update stage-specific log panel if this stage is selected
         if self._selected_stage_name == stage and (
             stage_log_panel := self._try_query_one("#stage-logs", StageLogPanel)
@@ -572,7 +576,8 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
         else:
             stage_list = self._try_query_one("#stage-list", StageListPanel)
             if stage_list:
-                stage_list.update_stage(stage, self._selected_stage_name)
+                # Pass info to sync row's StageInfo reference (fixes reference divergence)
+                stage_list.update_stage(stage, self._selected_stage_name, info=info)
             if stage == self._selected_stage_name or not self._watch_mode:
                 self._update_detail_panel()
 
@@ -644,6 +649,7 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
         if self._reader_thread:
             self._reader_thread.join(timeout=2.0)
         self._close_log_file()
+        self._shutdown_loky_pool()
         self.exit(self._results)
 
     # =========================================================================
@@ -893,25 +899,39 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
         self._navigate_stage(-1)
 
     def _navigate_stage(self, direction: int) -> None:  # pragma: no cover
-        """Navigate stage list by direction (+1 or -1), skipping collapsed group members."""
+        """Navigate stage list by direction (+1 or -1), skipping collapsed/filtered stages."""
         stage_list = self._try_query_one("#stage-list", StageListPanel)
         if stage_list is None:
-            return  # Can't navigate without knowing collapse state
+            return  # Can't navigate without knowing visibility state
 
-        new_idx = self._selected_idx + direction
+        # Get visible stages (not collapsed and not filtered)
+        visible_names = stage_list.get_visible_stage_names()
+        if not visible_names:
+            return  # No visible stages to navigate
 
-        while 0 <= new_idx < len(self._stage_order):
-            stage_name = self._stage_order[new_idx]
-            # Skip if this stage is hidden in a collapsed group
-            if stage_list.is_collapsed(stage_name):
-                new_idx += direction
-                continue
-            # Found a valid stage
+        # Find current position in visible list
+        current_visible_idx = -1
+        if self._selected_stage_name in visible_names:
+            current_visible_idx = visible_names.index(self._selected_stage_name)
+
+        # Calculate new visible index
+        if current_visible_idx == -1:
+            # Current selection is hidden, go to first/last visible
+            new_visible_idx = 0 if direction > 0 else len(visible_names) - 1
+        else:
+            new_visible_idx = current_visible_idx + direction
+
+        # Bounds check
+        if not (0 <= new_visible_idx < len(visible_names)):
+            return  # At boundary, stay at current
+
+        # Find the actual index in _stage_order
+        new_name = visible_names[new_visible_idx]
+        if new_name in self._stage_order:
+            new_idx = self._stage_order.index(new_name)
             self._select_stage(new_idx)
             self._update_stage_list_selection()
             self._update_detail_panel()
-            return
-        # No valid stage found, stay at current
 
     def action_prev_tab(self) -> None:  # pragma: no cover
         """Navigate to previous tab."""
@@ -956,52 +976,26 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
     def action_goto_tab_output(self) -> None:  # pragma: no cover
         self._goto_tab("tab-output")
 
-    def action_toggle_view(self) -> None:  # pragma: no cover
-        self._show_logs = not self._show_logs
-        main_split = self._try_query_one("#main-split", textual.containers.Horizontal)
-        logs_view = self._try_query_one("#logs-view", textual.containers.Vertical)
-        if main_split:
-            main_split.set_class(self._show_logs, "view-hidden")
-            main_split.set_class(not self._show_logs, "view-active")
-        if logs_view:
-            logs_view.set_class(self._show_logs, "view-active")
-            logs_view.set_class(not self._show_logs, "view-hidden")
-
-    def action_toggle_all_logs(self) -> None:  # pragma: no cover
-        """Toggle all-logs view on/off."""
-        if self._show_logs:
-            # If already showing logs, toggle off
-            self.action_toggle_view()
-        else:
-            # Show all logs (clear filter)
-            log_panel = self._try_query_one("#log-panel", LogPanel)
-            if log_panel:
-                log_panel.set_filter(None)
-            self.action_toggle_view()
-
-    def action_filter_stage(self, idx: int) -> None:  # pragma: no cover
-        """Filter logs to stage at index idx (0-based)."""
-        if idx < len(self._stage_order):
-            stage_name = self._stage_order[idx]
-            log_panel = self._try_query_one("#log-panel", LogPanel)
-            if log_panel:
-                log_panel.set_filter(stage_name)
-            if not self._show_logs:
-                self.action_toggle_view()
-
     def action_escape_action(self) -> None:  # pragma: no cover
-        """Esc: cancel commit, close logs view, or collapse detail expansion."""
+        """Esc: cancel commit, clear filter, or collapse detail expansion."""
         if self._watch_mode and self._commit_in_progress:
             self._cancel_commit = True
             return
-        # Close all-logs view if open
-        if self._show_logs:
-            self.action_toggle_view()
+        # Clear filter if active
+        stage_list = self._try_query_one("#stage-list", StageListPanel)
+        if stage_list and stage_list.has_active_filter:
+            stage_list.clear_filter()
             return
         # Collapse detail expansion if expanded
         panel = self._get_active_diff_panel()
         if panel and panel.is_detail_expanded:
             panel.collapse_details()
+
+    def action_focus_filter(self) -> None:  # pragma: no cover
+        """Focus the stage filter input."""
+        stage_list = self._try_query_one("#stage-list", StageListPanel)
+        if stage_list:
+            stage_list.focus_filter()
 
     def action_toggle_group(self) -> None:  # pragma: no cover
         """Toggle collapse for group containing selected stage."""
@@ -1219,18 +1213,36 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
             self._stats_log_timer.stop()
             self._stats_log_timer = None
 
+        # Prevent re-entry from rapid quit presses
+        with self._quit_lock:
+            if self._quitting:
+                return
+            self._quitting = True
+
         if self._watch_mode:
-            with self._quit_lock:
-                if self._quitting:
-                    return
-                self._quitting = True
             self._quit_with_commit_prompt()
         else:
-            self._shutdown_event.set()
-            if self._reader_thread:
-                self._reader_thread.join(timeout=2.0)
-            self._close_log_file()
-            await super().action_quit()
+            self._quit_run_mode()
+
+    @textual.work
+    async def _quit_run_mode(self) -> None:  # pragma: no cover
+        """Worker to handle quit in run mode (may show confirmation dialog)."""
+        if self._has_running_stages:
+            should_kill = await self.push_screen_wait(ConfirmKillWorkersScreen())
+            if not should_kill:
+                self._quitting = False  # Allow retry after cancel
+                return
+            # User confirmed kill - reset terminal and exit immediately.
+            # Uses os._exit to bypass loky's atexit handler that waits for threads.
+            if self._driver is not None:
+                self._driver.stop_application_mode()
+            os.system("reset")
+            os._exit(0)
+        # No running stages - normal exit with cleanup
+        if self._cancel_event is not None:
+            self._cancel_event.set()
+        self._shutdown_event.set()
+        self.exit()
 
     @textual.work
     async def _quit_with_commit_prompt(self) -> None:  # pragma: no cover
@@ -1278,6 +1290,7 @@ def run_with_tui(
     message_queue: TuiQueue,
     executor_func: Callable[[], dict[str, ExecutionSummary]],
     tui_log: pathlib.Path | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> dict[str, ExecutionSummary]:  # pragma: no cover
     """Run pipeline with TUI display. Raises if executor fails."""
     app = PivotApp(
@@ -1285,6 +1298,7 @@ def run_with_tui(
         stage_names=stage_names,
         tui_log=tui_log,
         executor_func=executor_func,
+        cancel_event=cancel_event,
     )
     results = app.run()
     if app.error is not None:

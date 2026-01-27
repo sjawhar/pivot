@@ -16,7 +16,6 @@ from pivot.tui import run as run_tui
 from pivot.tui.screens import ConfirmCommitScreen
 from pivot.tui.types import LogEntry, StageInfo
 from pivot.tui.widgets import (
-    LogPanel,
     StageListPanel,
     StageLogPanel,
     StageRow,
@@ -321,7 +320,6 @@ def test_run_tui_app_init(
     assert len(app._stages) == 3
     assert list(app._stage_order) == stage_names
     assert app._selected_idx == 0
-    assert app._show_logs is False
     assert app._results is None
     assert app.error is None
 
@@ -737,18 +735,6 @@ def test_stage_list_panel_init() -> None:
     panel = StageListPanel(stages, id="test-list")
     assert panel._stages == stages
     assert panel._rows == {}  # Empty until mounted
-
-
-# =============================================================================
-# LogPanel Tests
-# =============================================================================
-
-
-def test_log_panel_init() -> None:
-    """LogPanel initializes with empty logs and no filter."""
-    panel = LogPanel()
-    assert panel._filter_stage is None
-    assert len(panel._all_logs) == 0
 
 
 # =============================================================================

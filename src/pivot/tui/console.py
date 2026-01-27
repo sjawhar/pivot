@@ -7,7 +7,13 @@ from typing import Any, Self, TextIO
 import click
 from tqdm import tqdm
 
-from pivot.types import StageDisplayStatus, StageExplanation, StageStatus
+from pivot.types import (
+    DisplayCategory,
+    StageDisplayStatus,
+    StageExplanation,
+    StageStatus,
+    categorize_stage_result,
+)
 
 # ANSI color codes
 _COLORS = {
@@ -140,16 +146,17 @@ class Console:
         progress = self._color(f"[{index}/{total}]", "dim")
 
         # Determine display status and text based on status and reason
-        match status:
-            case StageStatus.RAN:
+        category = categorize_stage_result(status, reason)
+        match category:
+            case DisplayCategory.SUCCESS:
                 status_text = self._color("ran", "green", "bold")
-            case StageStatus.SKIPPED:
-                # Distinguish between "cached" (unchanged) and "blocked" (upstream failed)
-                if reason.startswith("upstream"):
-                    status_text = self._color("blocked", "red")
-                else:
-                    status_text = self._color("cached", "yellow")
-            case StageStatus.FAILED:
+            case DisplayCategory.CACHED:
+                status_text = self._color("cached", "yellow")
+            case DisplayCategory.BLOCKED:
+                status_text = self._color("blocked", "red")
+            case DisplayCategory.CANCELLED:
+                status_text = self._color("cancelled", "yellow", "dim")
+            case DisplayCategory.FAILED:
                 status_text = self._color("FAILED", "red", "bold")
             case _:
                 status_text = self._color(str(status), "dim")

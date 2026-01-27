@@ -111,26 +111,26 @@ class TabbedDetailPanel(textual.containers.Vertical):
             header.update("")
             return
 
-        # Build header components
-        parts = list[str]()
+        # Build left side: stage name + history navigation
+        left_parts = list[str]()
+        left_visible_len = 0
 
         # Stage name
-        parts.append(f"[bold]{rich.markup.escape(self._stage.name)}[/]")
-
-        # Spacer
-        parts.append("  ")
+        left_parts.append(f"[bold]{rich.markup.escape(self._stage.name)}[/]")
+        left_visible_len += len(self._stage.name)
+        left_parts.append("  ")
+        left_visible_len += 2
 
         # History navigation indicator
         total = self._history_total
         if self._history_index is None:
-            # Live view
-            current = total + 1  # Live is "after" all history entries
-            # Show left arrow if history exists
+            # Live view - show "Latest" instead of "1/1"
             left_arrow = "← " if total > 0 else ""
-            mode_indicator = "[green]● LIVE[/]"
-            parts.append(f"{left_arrow}[{current}/{current}] {mode_indicator}")
+            nav_plain = f"{left_arrow}Latest ● LIVE"
+            left_parts.append(f"{left_arrow}Latest [green]● LIVE[/]")
+            left_visible_len += len(nav_plain)
         else:
-            # Historical view
+            # Historical view - show "Run X of Y"
             current = self._history_index + 1  # 1-based display
             left_arrow = "← " if self._history_index > 0 else ""
             right_arrow = " →"  # Always show - can navigate to live view
@@ -140,14 +140,35 @@ class TabbedDetailPanel(textual.containers.Vertical):
             if entry:
                 ts_str = time.strftime("%H:%M:%S", time.localtime(entry.timestamp))
                 dur_str = f"{entry.duration:.1f}s" if entry.duration is not None else "0.0s"
-                status_icon = status.get_status_icon(entry.status)
-                mode_indicator = f"[yellow]◷ {ts_str} ({dur_str})[/] {status_icon}"
+                status_icon_hist = status.get_status_icon(entry.status, entry.reason)
+                status_icon_plain = status.get_status_icon_plain(entry.status, entry.reason)
+                mode_indicator = f"[yellow]◷ {ts_str} ({dur_str})[/] {status_icon_hist}"
+                nav_plain = f"{left_arrow}Run {current} of {total + 1} ◷ {ts_str} ({dur_str}) {status_icon_plain}{right_arrow}"
             else:
                 mode_indicator = "[yellow]◷ (unknown)[/]"
+                nav_plain = f"{left_arrow}Run {current} of {total + 1} ◷ (unknown){right_arrow}"
 
-            parts.append(f"{left_arrow}[{current}/{total + 1}] {mode_indicator}{right_arrow}")
+            left_parts.append(
+                f"{left_arrow}Run {current} of {total + 1} {mode_indicator}{right_arrow}"
+            )
+            left_visible_len += len(nav_plain)
 
-        header.update("".join(parts))
+        # Build right side: status icon + label (right-aligned)
+        status_icon = status.get_status_icon(self._stage.status, self._stage.reason)
+        status_text, status_style = status.get_status_label(self._stage.status, self._stage.reason)
+        if status_icon:
+            right_part = f"{status_icon} [{status_style}]{status_text}[/]"
+            right_visible_len = 2 + len(status_text)  # icon + space + text
+        else:
+            right_part = f"[{status_style}]{status_text}[/]"
+            right_visible_len = len(status_text)
+
+        # Get available width and calculate padding
+        left_text = "".join(left_parts)
+        available_width = header.size.width if header.size.width > 0 else 80
+        padding = max(1, available_width - left_visible_len - right_visible_len - 1)
+
+        header.update(f"{left_text}{' ' * padding}{right_part}")
 
     def _get_current_history_entry(self) -> ExecutionHistoryEntry | None:
         """Get the currently viewed history entry."""

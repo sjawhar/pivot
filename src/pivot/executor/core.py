@@ -34,6 +34,7 @@ from pivot.storage import cache, lock, project_lock, track
 from pivot.storage import state as state_mod
 from pivot.tui import console
 from pivot.types import (
+    DisplayCategory,
     OnError,
     OutputMessage,
     RunEventType,
@@ -50,6 +51,7 @@ from pivot.types import (
     TuiStatusMessage,
     TuiWatchMessage,
     WatchStatus,
+    categorize_stage_result,
 )
 
 if TYPE_CHECKING:
@@ -151,27 +153,27 @@ class ExecutionSummary(TypedDict):
 def count_results(results: dict[str, ExecutionSummary]) -> tuple[int, int, int, int]:
     """Count results by category: ran, cached, blocked, failed.
 
-    Distinguishes between "cached" (skipped because unchanged) and
-    "blocked" (skipped because upstream failed).
+    Uses shared categorization for consistent treatment across TUI and plain mode.
 
     Returns:
         Tuple of (ran, cached, blocked, failed) counts
     """
     ran = cached = blocked = failed = 0
     for result in results.values():
-        status = result["status"]
-        reason = result["reason"]
-        if status == StageStatus.RAN:
-            ran += 1
-        elif status == StageStatus.FAILED:
-            failed += 1
-        elif status == StageStatus.UNKNOWN:
-            # UNKNOWN indicates executor bug - don't count in normal categories
-            pass
-        elif reason.startswith("upstream"):
-            blocked += 1
-        else:
-            cached += 1
+        category = categorize_stage_result(result["status"], result["reason"])
+        match category:
+            case DisplayCategory.SUCCESS:
+                ran += 1
+            case DisplayCategory.FAILED:
+                failed += 1
+            case DisplayCategory.BLOCKED:
+                blocked += 1
+            case DisplayCategory.CACHED | DisplayCategory.CANCELLED:
+                # Cancelled stages are counted with cached (both are skipped, not failed)
+                cached += 1
+            case DisplayCategory.UNKNOWN | DisplayCategory.PENDING | DisplayCategory.RUNNING:
+                # UNKNOWN/PENDING/RUNNING shouldn't appear in final results
+                pass
     return ran, cached, blocked, failed
 
 
@@ -692,6 +694,7 @@ def _execute_greedy(
                 cancel_event=cancel_event,
             )
 
+            stop_starting_new = False  # Set when failure detected, prevents new stage starts
             while futures:
                 # Calculate wait timeout based on oldest running stage
                 wait_timeout: float | None = None
@@ -791,14 +794,19 @@ def _execute_greedy(
                         for f in futures:
                             f.cancel()
 
-                        # Mark all unfinished stages as skipped due to upstream failure
-                        # Explicit check for READY (waiting) and IN_PROGRESS (running) -
-                        # don't use "not in finished" as UNKNOWN indicates a bug state
-                        unfinished = {StageStatus.READY, StageStatus.IN_PROGRESS}
+                        # Mark only READY stages as skipped - IN_PROGRESS stages will complete
+                        # and their actual result will be processed by the loop
                         for state in stage_states.values():
-                            if state.status in unfinished:
+                            if state.status == StageStatus.READY:
                                 lifecycle.mark_skipped_upstream(state, failed_stage_name)
-                        return
+
+                        # Prevent starting new stages
+                        stop_starting_new = True
+
+                        if not futures:
+                            # No running stages - exit immediately
+                            return
+                        # Otherwise continue loop to process remaining IN_PROGRESS stages
 
                 # Check for cancellation - mark remaining READY stages as cancelled
                 if cancel_event is not None and cancel_event.is_set():
@@ -810,13 +818,14 @@ def _execute_greedy(
                                 output_lines=[],
                             )
                             lifecycle.mark_completed(state, result)
+                    stop_starting_new = True
                     if not futures:
                         # No running stages - exit immediately
                         return
                     # Otherwise let running stages complete before exiting
 
                 slots_available = max_workers - len(futures)
-                if slots_available > 0:
+                if slots_available > 0 and not stop_starting_new:
                     _start_ready_stages(
                         stage_states=stage_states,
                         executor=executor,

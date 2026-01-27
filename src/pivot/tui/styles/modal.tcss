@@ -1,11 +1,11 @@
 /* Modal screen styles for help, history, and confirm dialogs */
 
-/* Confirm commit modal */
-ConfirmCommitScreen {
+/* Confirm dialog modal (base class - applies to all ConfirmDialog subclasses) */
+ConfirmDialog {
     align: center middle;
 }
 
-ConfirmCommitScreen > #dialog {
+ConfirmDialog > #dialog {
     width: 60;
     height: auto;
     border: thick $primary;
@@ -13,8 +13,12 @@ ConfirmCommitScreen > #dialog {
     padding: 1 2;
 }
 
-ConfirmCommitScreen > #dialog > #message {
+ConfirmDialog > #dialog > #message {
     margin-bottom: 1;
+}
+
+ConfirmDialog > #dialog > #hints {
+    color: $text-muted;
 }
 
 /* History list modal */

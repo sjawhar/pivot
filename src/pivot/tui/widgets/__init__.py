@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pivot.tui.widgets.debug import DebugPanel
-from pivot.tui.widgets.logs import LogPanel, StageLogPanel
+from pivot.tui.widgets.logs import StageLogPanel
 from pivot.tui.widgets.panels import TabbedDetailPanel
 from pivot.tui.widgets.stage_list import StageGroupHeader, StageListPanel, StageRow
 from pivot.tui.widgets.status import (
@@ -15,7 +15,6 @@ from pivot.tui.widgets.status import (
 
 __all__ = [
     "DebugPanel",
-    "LogPanel",
     "StageGroupHeader",
     "StageListPanel",
     "StageLogPanel",

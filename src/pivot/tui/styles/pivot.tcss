@@ -60,14 +60,32 @@
     overflow-y: auto;
 }
 
-#log-panel {
-    height: 1fr;
-    border: solid yellow;
-}
-
 .section-header {
     text-style: bold;
     margin-bottom: 1;
+}
+
+/* Stage filter input */
+#stage-filter {
+    height: 1;
+    margin-bottom: 1;
+    border: none;
+    background: $surface;
+}
+
+#stage-filter:focus {
+    border: solid $primary;
+    color: $text;
+}
+
+/* Filtered-out stages and headers are hidden */
+.filtered-out {
+    display: none;
+}
+
+/* Stage row selected state */
+.stage-row.selected {
+    background: $primary-darken-2;
 }
 
 /* Stage row collapsed state (inside collapsed group) */
@@ -85,19 +103,6 @@
     background: $surface-lighten-1;
 }
 
-#logs-view {
-    height: 100%;
-    display: none;
-}
-
-.view-active {
-    display: block;
-}
-
-.view-hidden {
-    display: none;
-}
-
 /* Split-view layout for diff panels */
 .diff-panel {
     height: 100%;
@@ -109,19 +114,22 @@
     overflow-y: auto;
 }
 
-.diff-panel #detail-pane {
+.diff-panel #detail-scroll {
     width: 50%;
     height: 100%;
     border-left: solid $surface-lighten-1;
     padding-left: 1;
-    overflow-y: auto;
+}
+
+.diff-panel #detail-pane {
+    width: 100%;
 }
 
 .diff-panel.expanded #item-list {
     display: none;
 }
 
-.diff-panel.expanded #detail-pane {
+.diff-panel.expanded #detail-scroll {
     width: 100%;
     border-left: none;
 }
