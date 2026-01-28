@@ -8,7 +8,7 @@ Complete reference for all Pivot command-line commands.
 |------|---------|
 | Run pipeline | `pivot run` |
 | Run specific stages | `pivot run stage1 stage2` |
-| See what would run | `pivot dry-run` |
+| See what would run | `pivot run -n` |
 | Understand why stage runs | `pivot explain stage` |
 | List all stages | `pivot list` |
 | Show stage status | `pivot status` |
@@ -25,6 +25,7 @@ All commands support:
 | Option | Description |
 |--------|-------------|
 | `--verbose` / `-v` | Show detailed output |
+| `--quiet` / `-q` | Suppress non-essential output |
 | `--help` | Show help message |
 
 ---
@@ -51,8 +52,18 @@ pivot run [STAGES...] [OPTIONS]
 | `--cache-dir PATH` | Custom cache directory |
 | `--dry-run` / `-n` | Show what would run without executing |
 | `--explain` / `-e` | Show detailed breakdown of why stages run |
-| `--watch` / `-w [PATTERNS]` | Watch for changes and re-run (optional glob patterns) |
+| `--force` / `-f` | Force re-run of stages, ignoring cache (in --watch mode, first run only) |
+| `--watch` / `-w` | Watch for file changes and re-run affected stages |
 | `--debounce MS` | Debounce delay in milliseconds (default: 300) |
+| `--display [tui\|plain]` | Display mode: tui (interactive) or plain (streaming text) |
+| `--json` | Output results as JSON |
+| `--tui-log PATH` | Write TUI messages to JSONL file for monitoring |
+| `--no-commit` | Defer lock files to pending dir for faster iteration |
+| `--no-cache` | Skip caching outputs entirely for maximum iteration speed |
+| `--keep-going` / `-k` | Continue running stages after failures |
+| `--serve` | Start RPC server for agent control (requires --watch) |
+| `--allow-uncached-incremental` | Allow running stages with IncrementalOut files not in cache |
+| `--checkout-missing` | Restore tracked files from cache before running |
 
 **Examples:**
 
@@ -71,25 +82,7 @@ pivot run --dry-run
 
 # Watch mode
 pivot run --watch
-pivot run --watch "*.py,*.csv"
 ```
-
----
-
-### `pivot dry-run`
-
-Show what would run without executing (terse output).
-
-```bash
-pivot dry-run [STAGES...] [OPTIONS]
-```
-
-**Options:**
-
-| Option | Description |
-|--------|-------------|
-| `--single-stage` / `-s` | Check only specified stages |
-| `--cache-dir PATH` | Custom cache directory |
 
 ---
 
@@ -106,7 +99,7 @@ pivot explain [STAGES...] [OPTIONS]
 | Option | Description |
 |--------|-------------|
 | `--single-stage` / `-s` | Explain only specified stages |
-| `--cache-dir PATH` | Custom cache directory |
+| `--force` / `-f` | Show explanation as if forced |
 
 **Example Output:**
 
@@ -133,10 +126,95 @@ Stage: train
 List all registered stages.
 
 ```bash
-pivot list
+pivot list [OPTIONS]
 ```
 
-With `--verbose`, shows dependencies and outputs for each stage.
+**Options:**
+
+| Option | Description |
+|--------|-------------|
+| `--json` | Output as JSON |
+| `--deps` | Show stage dependencies |
+
+---
+
+### `pivot status`
+
+Show pipeline, tracked files, and remote status.
+
+```bash
+pivot status [STAGES...] [OPTIONS]
+```
+
+**Arguments:**
+
+- `STAGES` - Stages to check (optional, checks all if not specified)
+
+**Options:**
+
+| Option | Description |
+|--------|-------------|
+| `--verbose` / `-v` | Show all stages, not just stale |
+| `--json` | Output as JSON |
+| `--stages-only` | Show only pipeline status |
+| `--tracked-only` | Show only tracked files |
+| `--remote-only` | Show only remote status |
+| `--remote` / `-r` | Include remote sync status |
+| `--cache-dir PATH` | Cache directory |
+
+---
+
+### `pivot commit`
+
+Commit pending locks from `--no-commit` runs.
+
+```bash
+pivot commit [OPTIONS]
+```
+
+**Options:**
+
+| Option | Description |
+|--------|-------------|
+| `--list` | List pending stages without committing |
+| `--discard` | Discard pending changes without committing |
+
+---
+
+### `pivot history`
+
+List recent pipeline runs.
+
+```bash
+pivot history [OPTIONS]
+```
+
+**Options:**
+
+| Option | Description |
+|--------|-------------|
+| `--limit` / `-n N` | Number of runs to show |
+| `--json` | Output as JSON |
+
+---
+
+### `pivot show`
+
+Show details of a specific run.
+
+```bash
+pivot show [RUN_ID] [OPTIONS]
+```
+
+**Arguments:**
+
+- `RUN_ID` - Run ID to show (optional, shows most recent if not specified)
+
+**Options:**
+
+| Option | Description |
+|--------|-------------|
+| `--json` | Output as JSON |
 
 ---
 
@@ -198,15 +276,16 @@ pivot checkout [TARGETS...] [OPTIONS]
 |--------|-------------|
 | `--checkout-mode MODE` | `symlink`, `hardlink`, or `copy` |
 | `--force` / `-f` | Overwrite existing files |
+| `--only-missing` | Only restore files that don't exist on disk |
 
 ---
 
-### `pivot get`
+### `pivot data get`
 
-Retrieve files from a specific git revision.
+Retrieve files or stage outputs from a specific git revision.
 
 ```bash
-pivot get TARGETS... --rev REVISION [OPTIONS]
+pivot data get TARGETS... --rev REVISION [OPTIONS]
 ```
 
 **Arguments:**
@@ -226,13 +305,13 @@ pivot get TARGETS... --rev REVISION [OPTIONS]
 
 ```bash
 # Get file from specific commit
-pivot get model.pkl --rev abc123
+pivot data get model.pkl --rev abc123
 
 # Get stage output from branch
-pivot get train --rev feature-branch
+pivot data get train --rev feature-branch
 
 # Get with custom output path
-pivot get model.pkl --rev v1.0 --output old_model.pkl
+pivot data get model.pkl --rev v1.0 --output old_model.pkl
 ```
 
 ---
@@ -415,12 +494,12 @@ Shows all remotes configured in the project, with the default marked.
 Push cached outputs to remote storage.
 
 ```bash
-pivot push [STAGES...] [OPTIONS]
+pivot push [TARGETS...] [OPTIONS]
 ```
 
 **Arguments:**
 
-- `STAGES` - Stages to push (optional, pushes all if not specified)
+- `TARGETS` - Stage names or file paths to push (optional, pushes all if not specified)
 
 **Options:**
 
@@ -437,12 +516,12 @@ pivot push [STAGES...] [OPTIONS]
 Pull cached outputs from remote storage.
 
 ```bash
-pivot pull [STAGES...] [OPTIONS]
+pivot pull [TARGETS...] [OPTIONS]
 ```
 
 **Arguments:**
 
-- `STAGES` - Stages to pull (optional, pulls all if not specified)
+- `TARGETS` - Stage names or file paths to pull (optional, pulls all if not specified)
 
 **Options:**
 
@@ -468,8 +547,8 @@ pivot config list [OPTIONS]
 
 | Option | Description |
 |--------|-------------|
-| `--global` / `-g` | Show only global config |
-| `--local` / `-l` | Show only local config |
+| `--global` | Show only global config |
+| `--local` | Show only local config |
 | `--json` | Output as JSON |
 
 ---
@@ -479,12 +558,18 @@ pivot config list [OPTIONS]
 Get a configuration value.
 
 ```bash
-pivot config get KEY
+pivot config get KEY [OPTIONS]
 ```
 
 **Arguments:**
 
 - `KEY` - Config key (e.g., `cache.dir`, `remotes.origin`, `default_remote`)
+
+**Options:**
+
+| Option | Description |
+|--------|-------------|
+| `--json` | Output as JSON |
 
 ---
 
@@ -505,7 +590,7 @@ pivot config set KEY VALUE [OPTIONS]
 
 | Option | Description |
 |--------|-------------|
-| `--global` / `-g` | Set in global config (~/.config/pivot/config.yaml) |
+| `--global` | Set in global config (~/.config/pivot/config.yaml) |
 
 **Examples:**
 
@@ -541,7 +626,7 @@ pivot config unset KEY [OPTIONS]
 
 | Option | Description |
 |--------|-------------|
-| `--global` / `-g` | Remove from global config |
+| `--global` | Remove from global config |
 
 **Examples:**
 
@@ -571,3 +656,143 @@ pivot config unset default_remote
 | `diff.max_rows` | Max rows for data diff | `10000` |
 | `default_remote` | Default remote name | (none) |
 | `remotes.<name>` | Remote URL (S3) | (none) |
+
+---
+
+## Project Setup
+
+### `pivot init`
+
+Initialize a new Pivot project.
+
+```bash
+pivot init [OPTIONS]
+```
+
+**Options:**
+
+| Option | Description |
+|--------|-------------|
+| `--force` / `-f` | Overwrite existing .pivot/.gitignore |
+
+---
+
+### `pivot import-dvc`
+
+Import DVC pipeline and convert to Pivot format.
+
+```bash
+pivot import-dvc [OPTIONS]
+```
+
+Reads `dvc.yaml` (and optionally `dvc.lock`, `params.yaml`) and generates `pivot.yaml` with migration notes for manual review.
+
+**Options:**
+
+| Option | Description |
+|--------|-------------|
+| `--input` / `-i PATH` | Path to dvc.yaml (default: auto-detect) |
+| `--output` / `-o PATH` | Output path for pivot.yaml (default: pivot.yaml) |
+| `--params` / `-p PATH` | Path to params.yaml (default: auto-detect) |
+| `--notes` / `-n PATH` | Path for migration notes (default: .pivot/migration-notes.md) |
+| `--force` / `-f` | Overwrite existing files |
+| `--dry-run` | Show what would be generated without writing files |
+
+---
+
+## Utilities
+
+### `pivot doctor`
+
+Check environment and configuration for issues.
+
+```bash
+pivot doctor [OPTIONS]
+```
+
+**Options:**
+
+| Option | Description |
+|--------|-------------|
+| `--json` | Output as JSONL |
+| `--remote` | Also check remote connectivity |
+
+---
+
+### `pivot completion`
+
+Generate shell completion script.
+
+```bash
+pivot completion {bash|zsh|fish}
+```
+
+**Arguments:**
+
+- `SHELL` - Shell type: `bash`, `zsh`, or `fish`
+
+**Examples:**
+
+```bash
+# Bash (~/.bashrc)
+eval "$(pivot completion bash)"
+
+# Zsh (~/.zshrc)
+eval "$(pivot completion zsh)"
+
+# Fish (~/.config/fish/config.fish)
+pivot completion fish | source
+```
+
+---
+
+### `pivot schema`
+
+Output JSON Schema for pivot.yaml configuration.
+
+```bash
+pivot schema [OPTIONS]
+```
+
+**Options:**
+
+| Option | Description |
+|--------|-------------|
+| `--indent N` | JSON indentation (0 for compact) |
+
+---
+
+### `pivot check-ignore`
+
+Check if paths are ignored by .pivotignore.
+
+```bash
+pivot check-ignore [TARGETS...] [OPTIONS]
+```
+
+**Arguments:**
+
+- `TARGETS` - Paths to check
+
+**Options:**
+
+| Option | Description |
+|--------|-------------|
+| `--details` / `-d` | Show matching pattern and source |
+| `--json` | Output as JSON |
+| `--show-defaults` | Show default patterns for starter .pivotignore |
+
+Exit code 0 if any target is ignored, 1 if none are ignored.
+
+**Examples:**
+
+```bash
+# Check single file
+pivot check-ignore app.log
+
+# Show matching pattern details
+pivot check-ignore --details *.pyc
+
+# JSON output for scripting
+pivot check-ignore --json build/ temp.log
+```

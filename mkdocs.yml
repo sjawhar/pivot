@@ -66,26 +66,42 @@ nav:
   - Getting Started:
     - Installation: getting-started/installation.md
     - Quick Start: getting-started/quickstart.md
-    - Core Concepts: getting-started/concepts.md
-  - User Guide:
-    - Defining Stages: guide/stages.md
-    - Output Types: guide/outputs.md
-    - Parameters: guide/parameters.md
-    - Matrix Stages: guide/matrix.md
-    - Pipeline Configuration: guide/configuration.md
-    - Caching & Remote Storage: guide/caching.md
-    - Watch Mode: guide/watch.md
-    - DVC Compatibility: guide/dvc-compat.md
-    - Troubleshooting: guide/troubleshooting.md
+  - Tutorials:
+    - Watch Mode & Rapid Iteration: tutorial/watch.md
+    - Parameters & Experiments: tutorial/parameters.md
+    - Remote Storage & CI: tutorial/remote.md
+  - Reference:
+    - Defining Pipelines: reference/pipelines.md
+    - Dependencies & Loaders: reference/dependencies.md
+    - Outputs & Caching: reference/outputs.md
+    - Parameters: reference/parameters.md
+    - Matrix Stages: reference/matrix.md
+    - Watch Mode: reference/watch.md
+    - Configuration: reference/configuration.md
   - CLI Reference: cli/index.md
   - API Reference: reference/
+  - Troubleshooting: troubleshooting/index.md
+  - Migrating from DVC: migrating-from-dvc.md
   - Architecture:
     - Overview: architecture/overview.md
-    - Code Fingerprinting: architecture/fingerprinting.md
+    - Code Tour: architecture/code-tour.md
+    - Fingerprinting: architecture/fingerprinting.md
     - Execution Model: architecture/execution.md
     - Watch Engine: architecture/watch.md
+    - TUI: architecture/tui.md
+    - Agent Server: architecture/agent-server.md
+  - Design Decisions:
+    - design/index.md
+    - Watch Engine Design: design/watch-engine.md
+    - Hot Reload Exploration: design/hot-reload-exploration.md
+  - Contributing:
+    - Getting Started: contributing/setup.md
+    - Code Style: contributing/style.md
+    - Testing Guide: contributing/testing.md
+    - CLI Development: contributing/cli.md
+    - Adding Loaders: contributing/loaders.md
+    - Common Gotchas: contributing/gotchas.md
   - Comparison: comparison.md
-  - Contributing: contributing.md
 
 markdown_extensions:
   - pymdownx.highlight:

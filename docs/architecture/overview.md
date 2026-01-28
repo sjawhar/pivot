@@ -51,6 +51,32 @@ Constructs a directed acyclic graph from stage dependencies:
 - Validates no cycles exist
 - Enables topological ordering
 
+#### Edge Direction
+
+Edges point **consumer → producer** (the stage that USES an artifact points to the stage that PRODUCES it):
+
+```
+preprocess (produces data/clean.csv)
+    ↑
+  train (consumes data/clean.csv)
+```
+
+This convention may seem counter-intuitive, but it enables natural execution ordering: `nx.dfs_postorder_nodes()` returns `[preprocess, train]` without needing to reverse the graph.
+
+#### Path Resolution
+
+The DAG builder uses two strategies to match dependencies to outputs:
+
+1. **Exact match (O(1)):** Dictionary lookup via `_build_outputs_map()`
+   - Maps each output path to its producing stage
+   - Handles the common case of explicit path dependencies
+
+2. **Directory overlap (O(log n)):** pygtrie prefix tree for parent/child relationships
+   - `has_subtrie()`: Dependency is parent of outputs (`data/` depends on `data/file.csv`)
+   - `shortest_prefix()`: Dependency is child of output (`data/file.csv` depends on `data/`)
+
+This handles cases where a stage declares a directory output and another stage depends on a file within that directory (or vice versa).
+
 ### Scheduler
 
 Coordinates parallel execution:
@@ -63,29 +89,21 @@ Coordinates parallel execution:
 
 Runs stages in worker processes:
 
-- Uses `ProcessPoolExecutor` with `forkserver` context
+- Uses `ProcessPoolExecutor` with `spawn` context
 - Warm workers with preloaded imports
 - True parallelism (not limited by GIL)
 
 ### Lock Files
 
-Per-stage lock files enable fast, parallel writes:
+Per-stage lock files (`.pivot/stages/<name>.lock`) enable fast, parallel writes. Each lock file records:
 
-```yaml
-# .pivot/stages/train.lock
-code_manifest:
-  func:train: "abc123"
-  func:helper: "def456"
-params:
-  learning_rate: 0.01
-deps:
-  - path: data.csv
-    hash: "789abc..."
-outs:
-  - path: model.pkl
-    hash: "012def..."
-dep_generations: {}
-```
+- **Code manifest** - Hashes of the stage function and its transitive dependencies
+- **Parameters** - Current parameter values
+- **Dependency hashes** - Content hashes of input files (with manifests for directories)
+- **Output hashes** - Content hashes of output files
+- **Dependency generations** - Generation counters for O(1) skip detection
+
+Lock files use relative paths for portability across machines.
 
 ## Data Flow
 
@@ -112,7 +130,7 @@ dep_generations: {}
 │   ├── preprocess.lock
 │   └── train.lock
 ├── config.yaml          # Remote configuration
-└── state.lmdb/          # LMDB database for hash caching
+└── state.lmdb/          # LMDB database (hash cache, generations, run cache, remote index)
 ```
 
 ## Key Design Decisions
@@ -145,20 +163,7 @@ Files are stored by their content hash:
 
 **Problem:** Importing numpy/pandas takes seconds per stage.
 
-**Solution:** `loky.get_reusable_executor()` keeps workers alive across calls:
-
-```python
-# loky maintains a pool of reusable workers
-executor = loky.get_reusable_executor(max_workers=4)
-
-# First run: workers import numpy, pandas (~10s total)
-executor.submit(stage_func)
-
-# Second run: imports already loaded (~1s)
-executor.submit(stage_func)
-```
-
-Workers persist between `pivot run` calls in watch mode, eliminating repeated import overhead.
+**Solution:** `loky.get_reusable_executor()` keeps workers alive across calls. The first stage execution imports heavy dependencies; subsequent stages reuse those imports. Workers persist between execution waves in watch mode, eliminating repeated import overhead.
 
 ### Trie for Path Validation
 
@@ -170,15 +175,3 @@ Workers persist between `pivot run` calls in watch mode, eliminating repeated im
 - Prevents conflicting output declarations
 - O(k) lookup where k is path depth
 
-## Module Organization
-
-| Module | Responsibility |
-|--------|----------------|
-| `registry` | Stage registration and validation |
-| `executor` | Parallel stage execution |
-| `fingerprint` | Code change detection |
-| `cache` | Content-addressable storage |
-| `lock` | Per-stage lock file management |
-| `state` | LMDB database for hash caching |
-| `dag` | Dependency graph construction |
-| `parameters` | Pydantic parameter handling |

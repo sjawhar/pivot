@@ -65,11 +65,11 @@ DVC would require manually updating `dvc.yaml` to track this change.
 
 ### Per-Stage Lock Files
 
-DVC writes a single `dvc.lock` file for all stages (O(n²) on large pipelines):
+DVC writes a single `dvc.lock` file for all stages. With many stages, this creates contention:
 
 ```
 # DVC: Every stage writes entire file
-dvc.lock  # 176 stages = 289s lock overhead
+dvc.lock
 
 # Pivot: Each stage writes its own file
 .pivot/stages/
@@ -78,19 +78,11 @@ dvc.lock  # 176 stages = 289s lock overhead
 └── evaluate.lock
 ```
 
-Result: 32x faster lock operations on large pipelines.
+Per-stage locks enable parallel-safe writes and avoid the monolithic lock file bottleneck.
 
 ### Warm Workers
 
-Pivot uses `loky.get_reusable_executor()` to keep worker processes alive:
-
-```python
-# First run: Workers import numpy, pandas, etc.
-pivot run  # ~10s startup
-
-# Second run: Workers already have imports loaded
-pivot run  # ~1s startup (warm)
-```
+Pivot uses `loky.get_reusable_executor()` to keep worker processes alive between runs. This avoids the startup cost of reimporting large libraries like numpy and pandas on each execution.
 
 ### Watch Mode
 
@@ -114,4 +106,4 @@ pivot export > dvc.yaml
 dvc repro
 ```
 
-See [DVC Compatibility](guide/dvc-compat.md) for details.
+See [Migrating from DVC](migrating-from-dvc.md) for details.

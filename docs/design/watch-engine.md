@@ -1,7 +1,6 @@
-# RFC: Watch Execution Engine
+# Watch Engine Design
 
-> **GitHub Issue Title:** Watch Execution Engine
-> **Labels:** `enhancement`, `architecture`
+*This document captures the design decisions and trade-offs for the watch execution engine.*
 
 ## Summary
 
@@ -69,12 +68,13 @@ self._pool = loky.get_reusable_executor(
 )
 ```
 
-**Why?** Hot reload via `importlib.reload()` is ~80% reliable due to:
+**Why?** Hot reload via `importlib.reload()` has known reliability issues:
+
 - Import staleness (modules importing the reloaded module keep old references)
 - cloudpickle caching (may serve pickles with old code)
 - Module-level side effects re-executing
 
-Worker restart is ~99% reliable with ~300ms latency (acceptable for dev workflow).
+Worker restart avoids these issues by starting fresh Python interpreters.
 
 ### 2. Blocking Executor for Natural Serialization
 

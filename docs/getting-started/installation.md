@@ -64,4 +64,4 @@ pivot --help
 ## Next Steps
 
 - [Quick Start Tutorial](quickstart.md) - Build your first pipeline
-- [Core Concepts](concepts.md) - Understand how Pivot works
+- [Tutorials](../tutorial/watch.md) - Watch mode, parameters, CI integration

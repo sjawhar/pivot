@@ -2,7 +2,26 @@
 
 This guide walks you through creating and running your first Pivot pipeline.
 
-## 1. Create a Pipeline
+## Mental Model
+
+Think **artifact-first**, not **stage-first**. The DAG emerges from artifact dependencies:
+
+- **Wrong:** "Stage A triggers Stage B"
+- **Right:** "This file changed. What needs to happen because of that?"
+
+Invalidation is content-addressed: same inputs + same code = same outputs.
+
+## 1. Initialize the Project
+
+```bash
+pivot init
+```
+
+This creates:
+- `.pivot/` - Directory for cache and state
+- `.pivotignore` - Patterns for files to exclude from watching
+
+## 2. Create a Pipeline
 
 Create `pivot.yaml`:
 
@@ -36,6 +55,8 @@ import pandas
 from pivot import loaders, outputs
 
 
+# TypedDict defines output names and types for the stage.
+# Each field name (e.g., "clean") maps to the YAML "outs:" key.
 class PreprocessOutputs(TypedDict):
     clean: Annotated[pathlib.Path, outputs.Out("processed.parquet", loaders.PathOnly())]
 
@@ -66,30 +87,7 @@ def train(
     return {"model": model_path}
 ```
 
-Stage functions must be defined at module level (not inside `if __name__ == '__main__':`) because Pivot uses multiprocessing and needs to serialize functions to worker processes.
-
-> **Single vs Multiple Outputs**
->
-> For stages with **one output**, annotate the return type directly:
-> ```python
-> def preprocess(
->     raw: Annotated[pandas.DataFrame, outputs.Dep("data.csv", loaders.CSV())],
-> ) -> Annotated[pandas.DataFrame, outputs.Out("processed.csv", loaders.CSV())]:
->     return raw.dropna()
-> ```
->
-> For stages with **multiple outputs**, use a TypedDict (shown above).
-
-> **How YAML and Python Work Together**
->
-> Your Python function's annotations define *what* the stage needs (types and default paths).
-> The YAML file lets you override those paths without editing Python code.
->
-> - If YAML specifies a path, it overrides the annotation's default
-> - If YAML doesn't specify a path, the annotation's default is used
-> - YAML `deps:`/`outs:` keys must match the Python parameter/output names
-
-## 2. Create Sample Data
+## 3. Create Sample Data
 
 ```bash
 echo "name,value
@@ -98,7 +96,7 @@ Bob,200
 Charlie," > data.csv
 ```
 
-## 3. Run the Pipeline
+## 4. Run the Pipeline
 
 ```bash
 pivot run
@@ -111,7 +109,7 @@ Pivot will:
 3. Execute stages in the correct order
 4. Cache outputs for future runs
 
-## 4. Re-run (Cached)
+## 5. Re-run (Cached)
 
 ```bash
 pivot run
@@ -119,7 +117,7 @@ pivot run
 
 The second run completes instantly because nothing changed.
 
-## 5. Modify and Re-run
+## 6. Modify and Re-run
 
 Edit `stages.py` to change the `preprocess` function:
 
@@ -140,7 +138,7 @@ pivot run
 
 Pivot automatically detects the code change and re-runs both stages.
 
-## 6. See Why Stages Run
+## 7. See Why Stages Run
 
 ```bash
 pivot explain
@@ -148,16 +146,10 @@ pivot explain
 
 Shows detailed breakdown of what changed and why each stage would run.
 
-## 7. Dry Run
-
-Preview what would run without executing:
-
-```bash
-pivot dry-run
-```
-
 ## Next Steps
 
-- [Core Concepts](concepts.md) - Understand stages, dependencies, and caching
-- [Defining Stages](../guide/stages.md) - Deep dive into stage definition
-- [Output Types](../guide/outputs.md) - Learn about outputs, metrics, and plots
+- [Watch Mode & Rapid Iteration](../tutorial/watch.md) - Develop faster with auto-rerun
+- [Defining Pipelines](../reference/pipelines.md) - Deep dive into stage definition
+- [Output Types](../reference/outputs.md) - Learn about outputs, metrics, and plots
+
+> **Project Structure**: For larger projects, consider using [Cookiecutter Data Science](https://cookiecutter-data-science.drivendata.org/) as a starting template. Its `data/raw/`, `data/processed/`, and `src/` layout works well with Pivot.

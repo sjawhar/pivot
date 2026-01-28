@@ -1,7 +1,9 @@
-# RFC: Hot Reload Exploration
+# Hot Reload Exploration
 
-> **GitHub Issue Title:** Explore Hot Reload for Faster Code Change Handling
-> **Labels:** `enhancement`, `research`, `future`
+!!! warning "Work in Progress"
+    This is an exploratory design document. Hot reload is not currently implemented.
+
+*This document explores the feasibility of hot reload for faster code change handling.*
 
 ## Summary
 
@@ -15,7 +17,7 @@ The watch execution engine (see related issue) uses **worker restart** when Pyth
 loky.get_reusable_executor(kill_workers=True)
 ```
 
-This is reliable (~99%) but has ~300ms latency. Hot reload via `importlib.reload()` would be ~50ms but has known reliability issues (~80%).
+Worker restart is reliable but has higher latency than hot reload. Hot reload via `importlib.reload()` would be faster but has known reliability issues (see below).
 
 ## Known Issues with Hot Reload
 
@@ -180,8 +182,8 @@ Stages defined in the main script cannot be hot-reloaded (no module path for rei
 
 ### Phase 3: Decision Point
 Based on research:
-- If reliability >= 95% AND latency improvement is significant → Implement
-- If reliability < 95% OR latency improvement is marginal → Don't implement
+- If reliability is high AND latency improvement is significant → Implement
+- If reliability is low OR latency improvement is marginal → Don't implement
 
 ## Alternative Approaches
 
@@ -207,8 +209,8 @@ Use tools like `mypyc` or Cython to compile stages. Changes trigger recompilatio
 
 Hot reload should only be implemented if:
 
-1. **Reliability >= 95%** on realistic pipelines
-2. **Latency improvement is noticeable** (>100ms saved)
+1. **High reliability** on realistic pipelines
+2. **Latency improvement is noticeable**
 3. **Failure modes are detectable** (we know when to fall back)
 4. **User impact is minimal** (rare edge cases, clear errors)
 

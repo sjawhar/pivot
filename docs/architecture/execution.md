@@ -50,29 +50,11 @@ Pivot uses greedy scheduling for maximum parallelism:
 2. **Running Set** - Currently executing stages
 3. **Completed Set** - Finished stages
 
-```python
-while not all_completed:
-    # Find stages that can run
-    ready = [s for s in pending if all_deps_complete(s)]
-
-    # Respect mutex groups
-    ready = filter_by_mutex(ready, running)
-
-    # Submit to workers
-    for stage in ready:
-        submit(stage)
-```
+As stages complete, their dependents become ready. Mutex groups prevent conflicting stages from running concurrently.
 
 ## Worker Pool
 
-Pivot uses `loky.get_reusable_executor()` for warm workers:
-
-```python
-executor = loky.get_reusable_executor(
-    max_workers=cpu_count(),
-    context='forkserver',
-)
-```
+Pivot uses `loky.get_reusable_executor()` for warm workers with `spawn` context.
 
 ### Why ProcessPoolExecutor?
 
@@ -80,22 +62,15 @@ executor = loky.get_reusable_executor(
 - **Isolation** - Each stage runs in its own process
 - **Memory efficiency** - Workers can be recycled
 
-### Why Forkserver?
+### Why Spawn?
 
-- **Safety** - Avoids fork() issues with threads
+- **Safety** - Avoids fork() issues with threads (Python 3.13+ deprecates fork in multithreaded contexts)
 - **Compatibility** - Works on macOS and Linux
-- **Clean state** - Each worker starts from a clean fork
+- **Clean state** - Each worker starts fresh without inherited state
 
 ### Warm Workers
 
-Workers stay alive between stages:
-
-```python
-# First stage: imports numpy, pandas (slow)
-# Second stage: already imported (fast)
-```
-
-This avoids repeated import overhead for heavy dependencies.
+Workers stay alive between stages, so expensive imports (numpy, pandas) only happen once per worker, not once per stage.
 
 ## Mutex Handling
 
@@ -115,9 +90,23 @@ stages:
       - gpu  # Won't run while train_model_a is running
 ```
 
-Implementation:
+### Exclusive Mutex
 
-1. Track active mutex groups
+Use `mutex: ["*"]` to run a stage with no other stages executing concurrently:
+
+```yaml
+stages:
+  database_migration:
+    python: stages.migrate_db
+    mutex:
+      - "*"  # Runs exclusively - no other stages run at the same time
+```
+
+This is useful for stages that require exclusive access to shared resources like databases or file locks.
+
+### Implementation
+
+1. Track active mutex groups (including `*` for exclusive)
 2. Before scheduling, check for conflicts
 3. Wait for conflicting stages to complete
 
@@ -134,52 +123,136 @@ Each stage execution:
 7. **Write Lock File** - Record new fingerprint and hashes
 8. **Release Lock**
 
+## Three-Tier Skip Detection
+
+Pivot uses a three-tier skip detection system to minimize unnecessary work:
+
+```
+                Worker receives stage
+                       │
+                       ▼
+          ┌────────────────────────┐
+          │  Lookup dep hashes     │
+          │  (StateDB cache: O(1)  │
+          │   when metadata match) │
+          └────────────┬───────────┘
+                       │
+                       ▼
+          ┌────────────────────────┐
+Tier 1:   │  Check generation O(1) │──── Match? ──▶ SKIP
+          │  (StateDB lookup)      │
+          └────────────┬───────────┘
+                       │ No match
+                       ▼
+          ┌────────────────────────┐
+Tier 2:   │  Compare lock file     │──── Unchanged? ─▶ SKIP
+          │  (fingerprint+params+  │
+          │   dep_hashes)          │
+          └────────────┬───────────┘
+                       │ Changed
+                       ▼
+          ┌────────────────────────┐
+Tier 3:   │  Check run cache       │──── Hit? ─────▶ SKIP
+          │  (input_hash → outputs)│                (restore from cache)
+          └────────────┬───────────┘
+                       │ No hit
+                       ▼
+                ┌──────────────┐
+                │   EXECUTE    │
+                │  stage func  │
+                └──────────────┘
+```
+
+### Dependency Hash Lookup
+
+Before skip checks, dependency hashes are looked up via StateDB. Each cached hash entry stores file metadata:
+
+- `mtime_ns` - Modification time in nanoseconds
+- `size` - File size in bytes
+- `inode` - Filesystem inode number
+
+When all three match the current file's `stat()` result, the cached hash is returned in O(1) without re-reading the file. The inode check detects file replacement (delete + create with same name), which keeps mtime/size but changes inode. Only files with changed metadata require actual hashing.
+
+### Tier 1: Generation Check (O(1))
+
+The fastest check uses monotonic generation counters to detect changes without comparing hashes:
+
+- Each output file has a **generation counter** in StateDB, incremented every time that file is written
+- When a stage runs, it **records the generation** of each dependency at that moment
+- On next run: if `recorded_generation == current_generation` for all deps → nothing changed → skip
+
+**Example:** Stage `train` depends on `data/clean.csv` (produced by `preprocess`).
+
+1. `preprocess` runs, writes `data/clean.csv` → generation becomes 5
+2. `train` runs, records `dep_generations: {"data/clean.csv": 5}`
+3. Next run: `clean.csv` generation is still 5 → generations match → skip `train`
+4. `preprocess` runs again → `clean.csv` generation becomes 6
+5. Next run: `train` recorded 5, current is 6 → mismatch → fall through to Tier 2
+
+This provides instant O(1) skip detection when nothing has changed.
+
+**File metadata verification:** In addition to generation comparison, Tier 1 optionally verifies that cached file hashes still match the current file metadata (mtime, size, inode). This catches external modifications that generation tracking alone wouldn't detect—for example, if an external tool modified a dependency file without going through Pivot.
+
+### Tier 2: Lock File Comparison
+
+If generations don't match, perform a full comparison:
+
+- Code fingerprint (AST hash of function + dependencies)
+- Parameters (Pydantic model values)
+- Dependency hashes (content hashes of all input files)
+
+If all match the lock file → skip.
+
+### Tier 3: Run Cache Lookup
+
+If the current inputs differ from the lock file but match a previous execution:
+
+- Compute `input_hash` from fingerprint + params + dep_hashes
+- Look up in run cache: `input_hash → cached_outputs`
+- If found → restore outputs from cache, skip execution
+
+This enables skipping even when switching between branches or reverting changes.
+
+## StateDB Architecture
+
+StateDB is an LMDB-backed key-value store for all pipeline state. Keys use prefixes to namespace different data types:
+
+| Prefix | Purpose |
+|--------|---------|
+| `hash:` | File hash cache (uses resolved paths, follows symlinks for deduplication) |
+| `gen:` | Output generation counters (uses normalized paths, preserves symlinks) |
+| `dep:` | Stage dependency generations (stage name + dep path) |
+| `runcache:` | Run cache entries (stage name + input hash) |
+| `run:` | Run history manifests |
+| `remote:` | Remote index entries |
+
+**Path handling strategies:** Hash keys use `resolve()` (follows symlinks) so that symlinked files deduplicate to the same cache entry. Generation keys use `normpath()` (preserves symlinks) so that logical path identity is maintained for dependency tracking.
+
+### Multi-process safety
+
+- Workers open StateDB in `readonly=True` mode (no write contention)
+- Workers collect `DeferredWrites` and return them to the coordinator
+- Coordinator applies all writes atomically in a single LMDB transaction
+
+### Generation tracking
+
+Generation counters enable the O(1) skip check. If a stage recorded dependencies at generations `[5, 3, 7]` and current generations are still `[5, 3, 7]`, skip without further comparison. If any generation differs, fall back to full hash comparison.
+
 ## Concurrency Safety
 
 Pivot uses a "check-lock-recheck" pattern to prevent TOCTOU (Time-of-Check-Time-of-Use) race conditions in parallel execution.
 
 ### The Problem
 
-Without proper locking, parallel stage execution can race:
-
-```
-Process A                     Process B
-─────────                     ─────────
-Read lock file                Read lock file
-Check: unchanged              Check: unchanged
-                              Start executing...
-Start executing...            ...
-Write output                  Write output (CONFLICT!)
-```
+Without proper locking, parallel stage execution can race: two processes could both read the lock file, both determine the stage is unchanged, both start executing, and conflict on output writes.
 
 ### The Solution: Execution Locks
 
-All change detection and cache operations happen inside an execution lock:
-
-```python
-with execution_lock(stage_name, cache_dir):
-    lock_data = stage_lock.read()           # Read inside lock
-    dep_hashes = hash_dependencies(deps)     # Hash inside lock
-
-    if can_skip(lock_data, fingerprint, dep_hashes):
-        restore_outputs_from_cache(...)
-        return SKIPPED
-
-    run_stage_function()
-    save_outputs_to_cache()
-    stage_lock.write(new_lock_data)
-```
+All change detection and cache operations happen inside an execution lock. The lock is acquired before reading the lock file and held through execution and lock file update.
 
 ### Lock Implementation
 
-Execution locks use PID-based sentinel files with atomic creation:
-
-```python
-# Atomic lock acquisition
-fd = os.open(sentinel, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-with os.fdopen(fd, 'w') as f:
-    f.write(f"pid: {os.getpid()}\n")
-```
+Execution locks use PID-based sentinel files with atomic creation via `O_CREAT | O_EXCL`. See `src/pivot/storage/lock.py:execution_lock()`.
 
 Key properties:
 
@@ -246,45 +319,37 @@ This avoids write contention between workers while maintaining consistency.
 
 ## Error Handling
 
-Three error modes:
+Two error modes:
 
 | Mode | Behavior |
 |------|----------|
 | `fail` (default) | Stop on first error |
 | `keep_going` | Continue with independent stages |
-| `ignore` | Log errors, continue all |
 
-```python
-from pivot.executor import run
-from pivot.types import OnError
+See `pivot.types.OnError` for the enum definition.
 
-run(on_error=OnError.KEEP_GOING)
-```
+## Cancellation
+
+The executor supports graceful cancellation via a `cancel_event` (a `threading.Event`). When set:
+
+1. **Running stages complete** - The currently executing stage finishes normally
+2. **Pending stages are skipped** - No new stages are started
+3. **Results include cancellation** - Skipped stages report reason "cancelled"
+
+Cancellation is **stage-level**, not mid-stage. This ensures outputs are always in a consistent state (either fully written or not started).
+
+In watch mode, the Agent Server's `cancel` RPC method sets this event, allowing external tools to stop execution between stages. The TUI also uses this for `Ctrl+C` handling.
 
 ## Timeouts
 
-Stage-level timeouts prevent runaway execution:
-
-```python
-run(stage_timeout=3600)  # 1 hour per stage
-```
-
-## Dry Run Mode
-
-Preview execution without running:
-
-```python
-run(dry_run=True)
-```
-
-Returns what would run and why.
+Stage-level timeouts prevent runaway execution. Configure via the `stage_timeout` parameter.
 
 ## Explain Mode
 
-Detailed breakdown of why stages run:
+Preview what would run and why:
 
-```python
-run(explain_mode=True)
+```bash
+pivot explain [STAGES...]
 ```
 
 Shows:
@@ -292,6 +357,66 @@ Shows:
 - Code changes
 - Parameter changes
 - Dependency changes
+
+## Checkout Missing Mode
+
+The `--checkout-missing` flag restores tracked output files from cache before running:
+
+```bash
+# Restore missing tracked files, then run pipeline
+pivot run --checkout-missing
+```
+
+This is useful when:
+
+- Switching branches where outputs were generated on another branch
+- After `git clean` or accidental deletion of output files
+- Cloning a repo where lock files exist but outputs don't
+
+Without this flag, Pivot validates that all tracked outputs exist before running. If files are missing, it fails with an error suggesting either `pivot checkout --only-missing` (to restore without running) or `pivot run --checkout-missing` (to restore and run).
+
+**How it works:** Files are restored using the hashes recorded in existing lock files—no stages are re-executed during restoration. The cache must contain the files (push/pull from remote if needed). After restoration, the normal execution flow continues and may skip stages if nothing else changed.
+
+## Deferred Commit Mode
+
+The `--no-commit` flag defers lock file updates and caching until explicitly committed:
+
+```bash
+# Run stages but don't update locks or cache outputs
+pivot run --no-commit
+
+# Inspect results, then commit when satisfied
+pivot commit
+```
+
+### How It Works
+
+1. Stages execute normally but write to `.pivot/pending/` instead of `.pivot/stages/`
+2. Output files are written to disk but not cached
+3. `pivot commit` promotes pending locks to production and updates the cache
+4. `pivot commit --discard` removes pending locks without committing
+
+### Use Case
+
+This workflow avoids caching overhead during rapid iteration. Instead of hashing and caching outputs after every run, you can iterate quickly and commit only when you have results worth keeping.
+
+Note that for pure iteration speed, running the Python code directly (without Pivot) is often faster. The `--no-commit` mode is useful when you want Pivot's stage orchestration but want to batch the caching overhead.
+
+## No-Cache Mode
+
+The `--no-cache` flag skips caching outputs entirely for maximum iteration speed:
+
+```bash
+pivot run --no-cache
+```
+
+In this mode:
+
+- Outputs are written to disk but not stored in the content-addressable cache
+- Lock files record `null` for output hashes (no provenance tracking)
+- Combined with `--force`, this is the fastest execution mode
+
+**Limitation:** `--no-cache` is incompatible with `IncrementalOut` outputs. Incremental outputs require the cache to restore previous state before appending new data. Attempting to use both will fail with an error.
 
 ## See Also
 

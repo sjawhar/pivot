@@ -4,6 +4,12 @@
 
 Pivot is a Python pipeline tool with automatic code change detection. Define stages in YAML with typed Python functions, and Pivot figures out what needs to re-run—no manual dependency declarations, no stale caches.
 
+```bash
+pivot run        # Run your pipeline
+# edit a helper function...
+pivot run        # Pivot detects the change and re-runs affected stages
+```
+
 ## Quick Example
 
 ```yaml
@@ -132,9 +138,11 @@ See the [Quick Start](getting-started/quickstart.md) to build your first pipelin
 
 ## Learn More
 
-- [Core Concepts](getting-started/concepts.md) - Stages, dependencies, caching
-- [Comparison](comparison.md) - How Pivot compares to DVC, Prefect, Dagster
+- [Tutorials](tutorial/watch.md) - Watch mode, parameters, CI integration
+- [Reference](reference/pipelines.md) - Complete documentation by task
+- [Migrating from DVC](migrating-from-dvc.md) - Step-by-step migration guide
 - [Architecture](architecture/overview.md) - Design decisions and internals
+- [Comparison](comparison.md) - How Pivot compares to DVC, Prefect, Dagster
 
 ## Roadmap
 
