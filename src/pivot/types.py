@@ -44,6 +44,45 @@ class StageStatus(enum.StrEnum):
     UNKNOWN = "unknown"
 
 
+class DisplayCategory(enum.StrEnum):
+    """Display category for stage results in UI.
+
+    Maps (StageStatus, reason) pairs to consistent visual treatment across
+    TUI and plain console modes.
+    """
+
+    PENDING = "pending"
+    RUNNING = "running"
+    SUCCESS = "success"
+    CACHED = "cached"
+    BLOCKED = "blocked"
+    CANCELLED = "cancelled"
+    FAILED = "failed"
+    UNKNOWN = "unknown"
+
+
+def categorize_stage_result(status: StageStatus, reason: str) -> DisplayCategory:
+    """Map (status, reason) to display category for consistent UI."""
+    match status:
+        case StageStatus.READY:
+            return DisplayCategory.PENDING
+        case StageStatus.IN_PROGRESS:
+            return DisplayCategory.RUNNING
+        case StageStatus.COMPLETED | StageStatus.RAN:
+            return DisplayCategory.SUCCESS
+        case StageStatus.FAILED:
+            return DisplayCategory.FAILED
+        case StageStatus.SKIPPED:
+            if reason.startswith("upstream"):
+                return DisplayCategory.BLOCKED
+            elif reason == "cancelled":
+                return DisplayCategory.CANCELLED
+            else:
+                return DisplayCategory.CACHED
+        case StageStatus.UNKNOWN:
+            return DisplayCategory.UNKNOWN
+
+
 class StageDisplayStatus(enum.StrEnum):
     """Display status for stage progress output."""
 

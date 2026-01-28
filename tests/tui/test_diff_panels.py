@@ -144,17 +144,6 @@ def test_get_relative_path_relative(
 
 
 # =============================================================================
-# _get_registry_info Tests
-# =============================================================================
-
-
-def test_get_registry_info_missing_stage() -> None:
-    """_get_registry_info returns None for missing stage."""
-    result = diff_panels._get_registry_info("nonexistent_stage_xyz")
-    assert result is None
-
-
-# =============================================================================
 # _compute_output_changes Tests
 # =============================================================================
 

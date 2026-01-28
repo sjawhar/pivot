@@ -146,17 +146,19 @@ uv run ruff format . && uv run ruff check . && uv run basedpyright .  # Quality
 
 ## Critical Discoveries
 
-1. **Single underscore functions ARE tracked**—only dunders (`__name__`) filtered
-2. **Circular imports:** Extract shared types to separate module
-3. **AST manipulation:** Function bodies need at least one statement—add `ast.Pass()` if empty
-4. **Path overlap detection:** Use pygtrie, not string matching (`data/` vs `data/file.csv`)
-5. **loky can't pickle `mp.Queue()`**—use `mp.Manager().Queue()`
-6. **Reusable executor:** `loky.get_reusable_executor()` keeps workers warm
-7. **Cross-process tests:** Use file-based state, not shared lists (each process copies)
-8. **Atomic writes:** Track fd closure when using `mkstemp()` + rename
-9. **IncrementalOut uses COPY mode**—hardlinks/symlinks would corrupt cache
-10. **StateDB path strategies:** `resolve()` for hash keys (dedup), `normpath()` for generation keys (logical paths)
-11. **LMDB for all state:** Extend StateDB with prefixes, don't add new databases
-12. **ruamel.yaml for editable config** (preserves comments), **PyYAML for read-only**
-13. **Stage functions and TypedDicts must be module-level**—`get_type_hints()` needs importable `__module__`
-14. **Lambda fingerprinting is non-deterministic**—lambdas without source fall back to `id(func)`, causing unnecessary re-runs across interpreter sessions. Always use named functions in stage definitions.
+1. **Test helpers must be module-level**—`getclosurevars()` doesn't see imports in inline closures
+2. **Single underscore functions ARE tracked**—only dunders (`__name__`) filtered
+3. **Circular imports:** Extract shared types to separate module
+4. **AST manipulation:** Function bodies need at least one statement—add `ast.Pass()` if empty
+5. **Path overlap detection:** Use pygtrie, not string matching (`data/` vs `data/file.csv`)
+6. **loky can't pickle `mp.Queue()`**—use `mp.Manager().Queue()`
+7. **Reusable executor:** `loky.get_reusable_executor()` keeps workers warm
+8. **Cross-process tests:** Use file-based state, not shared lists (each process copies)
+9. **Atomic writes:** Track fd closure when using `mkstemp()` + rename
+10. **IncrementalOut uses COPY mode**—hardlinks/symlinks would corrupt cache
+11. **StateDB path strategies:** `resolve()` for hash keys (dedup), `normpath()` for generation keys (logical paths)
+12. **LMDB for all state:** Extend StateDB with prefixes, don't add new databases
+13. **ruamel.yaml for editable config** (preserves comments), **PyYAML for read-only**
+14. **Stage functions and TypedDicts must be module-level**—`get_type_hints()` needs importable `__module__`
+15. **Lambda fingerprinting is non-deterministic**—lambdas without source fall back to `id(func)`, causing unnecessary re-runs across interpreter sessions. Always use named functions in stage definitions.
+16. **Use `loky.cpu_count()` over `os.cpu_count()`**—loky's version respects cgroup CPU limits in containers/cgroupsv2

@@ -12,8 +12,9 @@ import logging
 import os
 import pathlib
 import queue
+import sys
 import threading
-from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast
+from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast, override
 
 import pydantic
 
@@ -33,12 +34,82 @@ from pivot.types import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import Callable, Generator, Sequence
     from inspect import Signature
     from multiprocessing import Queue
     from types import TracebackType
 
 logger = logging.getLogger(__name__)
+
+
+class _QueueLoggingHandler(logging.Handler):
+    """Logging handler that sends records to the output queue.
+
+    Installed per-task in execute_stage() to capture log messages from worker processes.
+    This ensures logging (e.g., stale lock warnings) appears in TUI Logs panel instead
+    of corrupting the display by writing to inherited stderr.
+    """
+
+    _stage_name: str
+    _queue: Queue[OutputMessage]
+
+    def __init__(
+        self, stage_name: str, output_queue: Queue[OutputMessage], level: int = logging.INFO
+    ) -> None:
+        super().__init__(level=level)
+        self._stage_name = stage_name
+        self._queue = output_queue
+        self.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+
+    @override
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = self.format(record)
+            with contextlib.suppress(queue.Full, ValueError, OSError):
+                self._queue.put((self._stage_name, msg, True), block=False)
+        except Exception:
+            pass  # Never raise from emit - could cause recursion
+
+    @override
+    def handleError(self, record: logging.LogRecord) -> None:
+        pass  # Suppress default stderr writing to prevent TUI corruption
+
+
+@contextlib.contextmanager
+def _queue_logging(stage_name: str, output_queue: Queue[OutputMessage]) -> Generator[None]:
+    """Context manager to capture logging to the output queue.
+
+    Removes stream handlers that write to stdout/stderr (which would corrupt TUI)
+    and installs a handler that sends log records to the output queue instead.
+    Original handlers are restored on exit.
+
+    Note: Handler manipulation is not fully atomic, but this is acceptable because:
+    1. Worker processes are single-threaded for stage execution
+    2. Individual addHandler/removeHandler calls are internally synchronized
+    3. Worst case is a brief window where a log goes to the wrong handler
+    """
+    handler = _QueueLoggingHandler(stage_name, output_queue)
+    root_logger = logging.getLogger()
+
+    # Remove existing stderr/stdout handlers to prevent TUI corruption
+    removed_handlers = list[logging.Handler]()
+    for h in root_logger.handlers[:]:
+        if isinstance(h, logging.StreamHandler):
+            stream_handler = cast("logging.StreamHandler[Any]", h)
+            if hasattr(stream_handler, "stream") and stream_handler.stream in (
+                sys.stderr,
+                sys.stdout,
+            ):
+                root_logger.removeHandler(stream_handler)
+                removed_handlers.append(stream_handler)
+
+    root_logger.addHandler(handler)
+    try:
+        yield
+    finally:
+        root_logger.removeHandler(handler)
+        for h in removed_handlers:
+            root_logger.addHandler(h)
 
 
 class WorkerStageInfo(TypedDict):
@@ -100,8 +171,9 @@ def execute_stage(
     project_root = stage_info["project_root"]
 
     # Ensure worker has correct cwd for this stage (workers in reusable pool
-    # may have stale cwd from previous execution in different project)
-    with contextlib.chdir(project_root):
+    # may have stale cwd from previous execution in different project).
+    # _queue_logging captures log messages to the output queue (for TUI display).
+    with contextlib.chdir(project_root), _queue_logging(stage_name, output_queue):
         no_commit = stage_info["no_commit"]
         no_cache = stage_info["no_cache"]
 

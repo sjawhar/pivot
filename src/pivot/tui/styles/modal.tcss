@@ -1,0 +1,75 @@
+/* Modal screen styles for help, history, and confirm dialogs */
+
+/* Confirm dialog modal (base class - applies to all ConfirmDialog subclasses) */
+ConfirmDialog {
+    align: center middle;
+}
+
+ConfirmDialog > #dialog {
+    width: 60;
+    height: auto;
+    border: thick $primary;
+    background: $surface;
+    padding: 1 2;
+}
+
+ConfirmDialog > #dialog > #message {
+    margin-bottom: 1;
+}
+
+ConfirmDialog > #dialog > #hints {
+    color: $text-muted;
+}
+
+/* History list modal */
+HistoryListScreen {
+    align: center middle;
+}
+
+HistoryListScreen > #history-dialog {
+    width: 80;
+    height: auto;
+    max-height: 80%;
+    border: thick $primary;
+    background: $surface;
+    padding: 1 2;
+}
+
+HistoryListScreen > #history-dialog > #history-title {
+    text-style: bold;
+    margin-bottom: 1;
+}
+
+HistoryListScreen > #history-dialog > #history-table {
+    height: auto;
+    max-height: 20;
+    margin-bottom: 1;
+}
+
+/* Help screen modal */
+HelpScreen {
+    align: center middle;
+}
+
+HelpScreen > #help-dialog {
+    width: 70;
+    height: auto;
+    max-height: 90%;
+    border: thick $primary;
+    background: $surface;
+    padding: 1 2;
+}
+
+HelpScreen > #help-dialog > #help-title {
+    text-style: bold;
+    margin-bottom: 1;
+}
+
+HelpScreen > #help-dialog > #help-content {
+    height: auto;
+    margin-bottom: 1;
+}
+
+HelpScreen > #help-dialog > #help-footer {
+    color: $text-muted;
+}

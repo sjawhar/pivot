@@ -30,7 +30,8 @@ if TYPE_CHECKING:
 
     from pytest_mock import MockerFixture
 
-    from pivot.types import OutputMessage
+    from pivot.types import OutputMessage, TuiQueue
+    from pivot.watch.engine import WatchEngine
 
 # Type alias for git_repo fixture: (repo_path, commit_fn)
 GitRepo = tuple[pathlib.Path, Callable[[str], str]]
@@ -181,3 +182,39 @@ def output_queue() -> Generator[mp.Queue[OutputMessage]]:
     queue = cast("mp.Queue[OutputMessage]", cast("object", manager.Queue()))
     yield queue
     manager.shutdown()
+
+
+# =============================================================================
+# TUI Test Mocks
+# =============================================================================
+
+
+class MockWatchEngine:
+    """Mock watch engine for TUI testing."""
+
+    def __init__(self) -> None:
+        self._keep_going: bool = False
+
+    def run(
+        self,
+        tui_queue: TuiQueue | None = None,
+        output_queue: mp.Queue[OutputMessage] | None = None,
+    ) -> None:
+        pass
+
+    def shutdown(self) -> None:
+        pass
+
+    def toggle_keep_going(self) -> bool:
+        self._keep_going = not self._keep_going
+        return self._keep_going
+
+    @property
+    def keep_going(self) -> bool:
+        return self._keep_going
+
+
+@pytest.fixture
+def mock_watch_engine() -> WatchEngine:
+    """Provide a mock watch engine for TUI testing."""
+    return MockWatchEngine()  # pyright: ignore[reportReturnType]
