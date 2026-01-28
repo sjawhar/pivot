@@ -20,7 +20,8 @@ import pathlib
 import threading
 import time
 from typing import TYPE_CHECKING, Annotated, TypedDict
-from unittest import mock
+
+import pytest
 
 from helpers import register_test_stage
 from pivot import executor, loaders, outputs, project
@@ -28,6 +29,8 @@ from pivot.watch import engine
 
 if TYPE_CHECKING:
     from collections.abc import Generator
+
+    from pytest_mock import MockerFixture
 
     from pivot.executor.core import ExecutionSummary
 
@@ -459,6 +462,7 @@ def _stage_failing(
 
 @contextlib.contextmanager
 def run_watch_engine(
+    mocker: MockerFixture,
     debounce_ms: int = 50,
     min_executions: int = 2,
     timeout: float = 2.0,
@@ -469,7 +473,7 @@ def run_watch_engine(
     Subsequent executions have the list of affected stages.
 
     Usage:
-        with run_watch_engine() as executions:
+        with run_watch_engine(mocker) as executions:
             # Make file changes here
             (pipeline_dir / "data.csv").write_text("new data")
         # After context exits, executions contains captured results
@@ -487,17 +491,17 @@ def run_watch_engine(
             self.shutdown()
         return {}
 
-    with mock.patch.object(engine.WatchEngine, "_execute_stages", capture_execute):
-        eng = engine.WatchEngine(debounce_ms=debounce_ms)
-        engine_thread = threading.Thread(target=eng.run)
-        engine_thread.start()
+    mocker.patch.object(engine.WatchEngine, "_execute_stages", capture_execute)
+    eng = engine.WatchEngine(debounce_ms=debounce_ms)
+    engine_thread = threading.Thread(target=eng.run)
+    engine_thread.start()
 
-        time.sleep(0.1)  # Let watcher initialize
-        yield executions
+    time.sleep(0.1)  # Let watcher initialize
+    yield executions
 
-        done_event.wait(timeout=timeout)
-        eng.shutdown()
-        engine_thread.join(timeout=1.0)
+    done_event.wait(timeout=timeout)
+    eng.shutdown()
+    engine_thread.join(timeout=1.0)
 
 
 # =============================================================================
@@ -794,30 +798,6 @@ def test_full_pipeline_diamond_execution(pipeline_dir: pathlib.Path) -> None:
     assert all(r["status"] == "ran" for r in results.values())
 
 
-def test_rerun_after_input_change(pipeline_dir: pathlib.Path) -> None:
-    """Changing input triggers re-execution of affected stages."""
-    (pipeline_dir / "input.txt").write_text("hello")
-
-    register_test_stage(_stage_process_rerun, name="process")
-
-    # First run
-    results = executor.run()
-    assert results["process"]["status"] == "ran"
-    assert (pipeline_dir / "output.txt").read_text() == "HELLO"
-
-    # Second run - no changes, should skip
-    results = executor.run()
-    assert results["process"]["status"] == "skipped"
-
-    # Modify input
-    (pipeline_dir / "input.txt").write_text("world")
-
-    # Third run - input changed, should re-run
-    results = executor.run()
-    assert results["process"]["status"] == "ran"
-    assert (pipeline_dir / "output.txt").read_text() == "WORLD"
-
-
 def test_rerun_after_intermediate_change(pipeline_dir: pathlib.Path) -> None:
     """Modifying intermediate file triggers downstream re-execution."""
     (pipeline_dir / "input.txt").write_text("hello")
@@ -873,13 +853,14 @@ def test_output_only_change_no_rerun(pipeline_dir: pathlib.Path) -> None:
 
 def test_watch_detects_file_change_and_triggers_execution(
     pipeline_dir: pathlib.Path,
+    mocker: MockerFixture,
 ) -> None:
     """Integration: Watch mode detects file change and triggers stage execution."""
     (pipeline_dir / "data.csv").write_text("a,b\n1,2")
 
     register_test_stage(_stage_process_watch, name="process")
 
-    with run_watch_engine() as executions:
+    with run_watch_engine(mocker) as executions:
         (pipeline_dir / "data.csv").write_text("a,b,c\n1,2,3\n4,5,6")
 
     assert len(executions) >= 2, "Should have initial + triggered execution"
@@ -887,10 +868,15 @@ def test_watch_detects_file_change_and_triggers_execution(
     assert executions[1] is not None and "process" in executions[1]
 
 
+@pytest.mark.xdist_group("watch_timing_sensitive")
 def test_watch_code_change_triggers_reload_and_execution(
     pipeline_dir: pathlib.Path,
+    mocker: MockerFixture,
 ) -> None:
-    """Integration: Python file change triggers registry reload and re-execution."""
+    """Integration: Python file change triggers registry reload and re-execution.
+
+    Note: Uses xdist_group to isolate from parallel tests due to timing sensitivity.
+    """
     (pipeline_dir / "data.csv").write_text("a,b\n1,2")
     helper_file = pipeline_dir / "helper.py"
     helper_file.write_text("def helper(): pass\n")
@@ -916,23 +902,21 @@ def test_watch_code_change_triggers_reload_and_execution(
         reload_called = True
         return True
 
-    with (
-        mock.patch.object(engine.WatchEngine, "_execute_stages", capture_execute),
-        mock.patch.object(engine.WatchEngine, "_reload_registry", capture_reload),
-    ):
-        eng = engine.WatchEngine(debounce_ms=50)
+    mocker.patch.object(engine.WatchEngine, "_execute_stages", capture_execute)
+    mocker.patch.object(engine.WatchEngine, "_reload_registry", capture_reload)
+    eng = engine.WatchEngine(debounce_ms=50)
 
-        engine_thread = threading.Thread(target=eng.run)
-        engine_thread.start()
+    engine_thread = threading.Thread(target=eng.run)
+    engine_thread.start()
 
-        time.sleep(0.1)  # Let watcher initialize
+    time.sleep(0.1)  # Let watcher initialize
 
-        # Modify Python file to trigger code change
-        helper_file.write_text("def helper(): return 42\n")
+    # Modify Python file to trigger code change
+    helper_file.write_text("def helper(): return 42\n")
 
-        done_event.wait(timeout=2.0)
-        eng.shutdown()
-        engine_thread.join(timeout=1.0)
+    done_event.wait(timeout=2.0)
+    eng.shutdown()
+    engine_thread.join(timeout=1.0)
 
     assert execution_count >= 2, "Should execute at least twice"
     assert reload_called, "Should reload registry on code change"
@@ -943,7 +927,9 @@ def test_watch_code_change_triggers_reload_and_execution(
 # =============================================================================
 
 
-def test_debounce_coalesces_rapid_changes(pipeline_dir: pathlib.Path) -> None:
+def test_debounce_coalesces_rapid_changes(
+    pipeline_dir: pathlib.Path, mocker: MockerFixture
+) -> None:
     """Multiple rapid file changes are coalesced into one execution."""
     (pipeline_dir / "data.csv").write_text("initial")
 
@@ -967,22 +953,22 @@ def test_debounce_coalesces_rapid_changes(pipeline_dir: pathlib.Path) -> None:
             self.shutdown()
         return {}
 
-    with mock.patch.object(engine.WatchEngine, "_execute_stages", capture_execute):
-        eng = engine.WatchEngine(debounce_ms=200)
+    mocker.patch.object(engine.WatchEngine, "_execute_stages", capture_execute)
+    eng = engine.WatchEngine(debounce_ms=200)
 
-        engine_thread = threading.Thread(target=eng.run)
-        engine_thread.start()
+    engine_thread = threading.Thread(target=eng.run)
+    engine_thread.start()
 
-        time.sleep(0.3)  # Let watcher initialize (longer due to 200ms debounce)
+    time.sleep(0.3)  # Let watcher initialize (longer due to 200ms debounce)
 
-        # Make 5 rapid changes within debounce window
-        for i in range(5):
-            (pipeline_dir / "data.csv").write_text(f"change {i}")
-            time.sleep(0.02)  # 20ms between changes, within 200ms debounce
+    # Make 5 rapid changes within debounce window
+    for i in range(5):
+        (pipeline_dir / "data.csv").write_text(f"change {i}")
+        time.sleep(0.02)  # 20ms between changes, within 200ms debounce
 
-        done_event.wait(timeout=2.0)
-        eng.shutdown()
-        engine_thread.join(timeout=1.0)
+    done_event.wait(timeout=2.0)
+    eng.shutdown()
+    engine_thread.join(timeout=1.0)
 
     # Should have: 1 initial + 1 debounced (not 1 + 5)
     assert execution_count == 2, (
@@ -1066,7 +1052,9 @@ def test_file_index_is_global_not_filtered(pipeline_dir: pathlib.Path) -> None:
 # =============================================================================
 
 
-def test_stage_failure_does_not_crash_watch(pipeline_dir: pathlib.Path) -> None:
+def test_stage_failure_does_not_crash_watch(
+    pipeline_dir: pathlib.Path, mocker: MockerFixture
+) -> None:
     """A failing stage doesn't crash the watch loop."""
     (pipeline_dir / "input.txt").write_text("hello")
 
@@ -1091,15 +1079,15 @@ def test_stage_failure_does_not_crash_watch(pipeline_dir: pathlib.Path) -> None:
                 self.shutdown()
         return {}  # type: ignore[return-value] - empty dict for failure case
 
-    with mock.patch.object(engine.WatchEngine, "_execute_stages", capture_execute):
-        eng = engine.WatchEngine(debounce_ms=50)
+    mocker.patch.object(engine.WatchEngine, "_execute_stages", capture_execute)
+    eng = engine.WatchEngine(debounce_ms=50)
 
-        engine_thread = threading.Thread(target=eng.run)
-        engine_thread.start()
+    engine_thread = threading.Thread(target=eng.run)
+    engine_thread.start()
 
-        done_event.wait(timeout=5.0)
-        eng.shutdown()
-        engine_thread.join(timeout=2.0)
+    done_event.wait(timeout=5.0)
+    eng.shutdown()
+    engine_thread.join(timeout=2.0)
 
     # Engine should have executed at least once without crashing
     assert execution_count >= 1

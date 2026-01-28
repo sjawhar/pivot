@@ -1,7 +1,7 @@
+from __future__ import annotations
+
 import threading
-from pathlib import Path
 from typing import TYPE_CHECKING
-from unittest import mock
 
 import pytest
 
@@ -10,6 +10,10 @@ from pivot.storage import lock
 from pivot.types import LockData
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
+    from pytest_mock import MockerFixture
+
     from pivot.types import HashInfo
 
 
@@ -390,14 +394,12 @@ def test_valid_stage_names_accepted(tmp_path: Path, valid_name: str) -> None:
     assert stage_lock.stage_name == valid_name
 
 
-def test_write_failure_no_orphaned_tmp(tmp_path: Path) -> None:
+def test_write_failure_no_orphaned_tmp(tmp_path: Path, mocker: MockerFixture) -> None:
     """Write failure cleans up temporary file."""
     stage_lock = lock.StageLock("failing", tmp_path)
 
-    with (
-        mock.patch("yaml.dump", side_effect=RuntimeError("dump failed")),
-        pytest.raises(RuntimeError, match="dump failed"),
-    ):
+    mocker.patch("yaml.dump", side_effect=RuntimeError("dump failed"), autospec=True)
+    with pytest.raises(RuntimeError, match="dump failed"):
         stage_lock.write(
             {
                 "code_manifest": {},

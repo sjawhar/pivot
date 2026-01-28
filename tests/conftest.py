@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import importlib
 import linecache
 import logging
@@ -8,7 +9,7 @@ import pathlib
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Generator
 from typing import TYPE_CHECKING, cast
 
 import click.testing
@@ -26,8 +27,6 @@ if str(_tests_dir) not in sys.path:
     sys.path.insert(0, str(_tests_dir))
 
 if TYPE_CHECKING:
-    from collections.abc import Generator
-
     from pytest_mock import MockerFixture
 
     from pivot.types import OutputMessage, TuiQueue
@@ -82,19 +81,77 @@ def set_project_root(tmp_path: pathlib.Path, mocker: MockerFixture) -> Generator
     yield tmp_path
 
 
+def init_git_repo(path: pathlib.Path, monkeypatch: pytest.MonkeyPatch | None = None) -> None:
+    """Initialize a git repo with user config at the given path.
+
+    This is a helper function for tests that need git in a path they control.
+    For tests that just need a standard git repo, use the `git_repo` fixture.
+
+    Args:
+        path: Directory to initialize as a git repository.
+        monkeypatch: Optional MonkeyPatch to set GIT_CONFIG_GLOBAL, avoiding 2 subprocess calls.
+    """
+    # Resolve to absolute path to avoid issues with cwd changes
+    abs_path = path.resolve()
+    if monkeypatch is not None:
+        # Use GIT_CONFIG_GLOBAL to avoid per-repo config subprocess calls
+        # Place config in parent directory to avoid it being included in git commits
+        config_file = abs_path.parent / f".gitconfig_test_{abs_path.name}"
+        config_file.write_text("[user]\n\temail = test@test.com\n\tname = Test\n")
+        monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config_file))
+        subprocess.run(["git", "init"], cwd=abs_path, check=True, capture_output=True)
+    else:
+        # Fallback: configure per-repo (3 subprocess calls)
+        subprocess.run(["git", "init"], cwd=abs_path, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "config", "user.email", "test@test.com"],
+            cwd=abs_path,
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Test"], cwd=abs_path, check=True, capture_output=True
+        )
+
+
+@contextlib.contextmanager
+def stage_module_isolation(path: pathlib.Path) -> Generator[None]:
+    """Add path to sys.path and ensure 'stages' module is freshly imported.
+
+    Cleans up sys.path and removes cached 'stages' module on exit to prevent
+    test pollution. Use this in fixtures that need to import a stages.py file
+    from a test-specific directory.
+
+    Example:
+        @pytest.fixture
+        def my_pipeline(tmp_path: Path, mocker: MockerFixture) -> Generator[Path]:
+            # ... setup ...
+            mocker.patch.object(project, "_project_root_cache", tmp_path)
+            with stage_module_isolation(tmp_path):
+                yield tmp_path
+    """
+    if "stages" in sys.modules:
+        del sys.modules["stages"]
+    path_str = str(path)
+    sys.path.insert(0, path_str)
+    try:
+        yield
+    finally:
+        # Guard against ValueError if path was removed by other code
+        if path_str in sys.path:
+            sys.path.remove(path_str)
+        if "stages" in sys.modules:
+            del sys.modules["stages"]
+
+
 @pytest.fixture
-def git_repo(tmp_path: pathlib.Path) -> GitRepo:
-    """Create a git repo in tmp_path, return (path, commit_fn)."""
-    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "config", "user.email", "test@test.com"],
-        cwd=tmp_path,
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "config", "user.name", "Test"], cwd=tmp_path, check=True, capture_output=True
-    )
+def git_repo(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> GitRepo:
+    """Create a git repo in tmp_path, return (path, commit_fn).
+
+    Uses GIT_CONFIG_GLOBAL to configure user settings with a single subprocess call
+    instead of 3, improving test performance.
+    """
+    init_git_repo(tmp_path, monkeypatch)
 
     def commit(message: str) -> str:
         subprocess.run(["git", "add", "."], cwd=tmp_path, check=True, capture_output=True)
@@ -119,6 +176,16 @@ def clear_source_caches() -> Generator[None]:
     """
     linecache.clearcache()
     importlib.invalidate_caches()
+    yield
+
+
+@pytest.fixture(scope="session", autouse=True)
+def prewarm_worker_pool() -> Generator[None]:
+    """Pre-warm loky worker pool before tests run.
+
+    This eliminates cold-start overhead on the first test that uses workers.
+    """
+    executor_core.prepare_workers(stage_count=2, parallel=True, max_workers=2)
     yield
 
 
@@ -156,7 +223,13 @@ def make_valid_lock_content() -> ValidLockContentFactory:
 
 @pytest.fixture
 def pipeline_dir(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> pathlib.Path:
-    """Set up a temporary pipeline directory with .pivot marker."""
+    """Set up a temporary pipeline directory with .pivot marker.
+
+    Creates `.pivot` directory but NOT pivot.yaml, allowing tests to register
+    stages programmatically without auto-discovery. Tests that need pivot.yaml
+    (e.g., those using CLI commands that trigger auto-discovery) should define
+    a local fixture override that creates pivot.yaml.
+    """
     (tmp_path / ".pivot").mkdir()
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(project, "_project_root_cache", None)
@@ -218,3 +291,15 @@ class MockWatchEngine:
 def mock_watch_engine() -> WatchEngine:
     """Provide a mock watch engine for TUI testing."""
     return MockWatchEngine()  # pyright: ignore[reportReturnType]
+
+
+@pytest.fixture
+def worker_env(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> pathlib.Path:
+    """Set up worker execution environment with cache and stages directories."""
+    cache_dir = tmp_path / ".pivot" / "cache"
+    cache_dir.mkdir(parents=True)
+    (cache_dir / "files").mkdir()
+    (tmp_path / ".pivot" / "stages").mkdir(parents=True, exist_ok=True)
+    (tmp_path / ".pivot" / "pending" / "stages").mkdir(parents=True)
+    monkeypatch.chdir(tmp_path)
+    return cache_dir

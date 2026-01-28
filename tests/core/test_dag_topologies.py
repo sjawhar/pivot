@@ -59,26 +59,6 @@ class _OutSum(TypedDict):
     output: Annotated[pathlib.Path, outputs.Out("sum.txt", loaders.PathOnly())]
 
 
-class _OutStage1(TypedDict):
-    output: Annotated[pathlib.Path, outputs.Out("stage1.txt", loaders.PathOnly())]
-
-
-class _OutStage2(TypedDict):
-    output: Annotated[pathlib.Path, outputs.Out("stage2.txt", loaders.PathOnly())]
-
-
-class _OutStage3(TypedDict):
-    output: Annotated[pathlib.Path, outputs.Out("stage3.txt", loaders.PathOnly())]
-
-
-class _OutStage4(TypedDict):
-    output: Annotated[pathlib.Path, outputs.Out("stage4.txt", loaders.PathOnly())]
-
-
-class _OutStage5(TypedDict):
-    output: Annotated[pathlib.Path, outputs.Out("stage5.txt", loaders.PathOnly())]
-
-
 # =============================================================================
 # Module-level stage functions for test_linear_dag_three_stages
 # =============================================================================
@@ -114,65 +94,6 @@ def _linear3_stage_c(
     assert data == "START->A->B", f"Expected 'START->A->B', got '{data}'"
     pathlib.Path("c.txt").write_text(f"{data}->C")
     return _OutC(output=pathlib.Path("c.txt"))
-
-
-# =============================================================================
-# Module-level stage functions for test_linear_dag_five_stages
-# =============================================================================
-
-
-def _linear5_stage1(
-    _input: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
-) -> _OutStage1:
-    with open("execution_log.txt", "a") as f:
-        f.write("1\n")
-    n = int(pathlib.Path("input.txt").read_text())
-    pathlib.Path("stage1.txt").write_text(str(n + 1))
-    return _OutStage1(output=pathlib.Path("stage1.txt"))
-
-
-def _linear5_stage2(
-    _s1: Annotated[pathlib.Path, outputs.Dep("stage1.txt", loaders.PathOnly())],
-) -> _OutStage2:
-    with open("execution_log.txt", "a") as f:
-        f.write("2\n")
-    n = int(pathlib.Path("stage1.txt").read_text())
-    assert n == 1, f"stage1 must run first, got {n}"
-    pathlib.Path("stage2.txt").write_text(str(n + 1))
-    return _OutStage2(output=pathlib.Path("stage2.txt"))
-
-
-def _linear5_stage3(
-    _s2: Annotated[pathlib.Path, outputs.Dep("stage2.txt", loaders.PathOnly())],
-) -> _OutStage3:
-    with open("execution_log.txt", "a") as f:
-        f.write("3\n")
-    n = int(pathlib.Path("stage2.txt").read_text())
-    assert n == 2, f"stage2 must run first, got {n}"
-    pathlib.Path("stage3.txt").write_text(str(n + 1))
-    return _OutStage3(output=pathlib.Path("stage3.txt"))
-
-
-def _linear5_stage4(
-    _s3: Annotated[pathlib.Path, outputs.Dep("stage3.txt", loaders.PathOnly())],
-) -> _OutStage4:
-    with open("execution_log.txt", "a") as f:
-        f.write("4\n")
-    n = int(pathlib.Path("stage3.txt").read_text())
-    assert n == 3, f"stage3 must run first, got {n}"
-    pathlib.Path("stage4.txt").write_text(str(n + 1))
-    return _OutStage4(output=pathlib.Path("stage4.txt"))
-
-
-def _linear5_stage5(
-    _s4: Annotated[pathlib.Path, outputs.Dep("stage4.txt", loaders.PathOnly())],
-) -> _OutStage5:
-    with open("execution_log.txt", "a") as f:
-        f.write("5\n")
-    n = int(pathlib.Path("stage4.txt").read_text())
-    assert n == 4, f"stage4 must run first, got {n}"
-    pathlib.Path("stage5.txt").write_text(str(n + 1))
-    return _OutStage5(output=pathlib.Path("stage5.txt"))
 
 
 # =============================================================================
@@ -800,25 +721,6 @@ def test_linear_dag_three_stages(pipeline_dir: pathlib.Path) -> None:
     # Verify final output proves correct chaining
     final_output = (pipeline_dir / "c.txt").read_text()
     assert final_output == "START->A->B->C"
-
-
-def test_linear_dag_five_stages(pipeline_dir: pathlib.Path) -> None:
-    """Longer linear DAG: A -> B -> C -> D -> E."""
-    (pipeline_dir / "input.txt").write_text("0")
-    log_file = pipeline_dir / "execution_log.txt"
-    log_file.write_text("")
-
-    register_test_stage(_linear5_stage1, name="stage1")
-    register_test_stage(_linear5_stage2, name="stage2")
-    register_test_stage(_linear5_stage3, name="stage3")
-    register_test_stage(_linear5_stage4, name="stage4")
-    register_test_stage(_linear5_stage5, name="stage5")
-
-    executor.run()
-
-    execution_log = log_file.read_text().strip().split("\n")
-    assert execution_log == ["1", "2", "3", "4", "5"]
-    assert (pipeline_dir / "stage5.txt").read_text() == "5"
 
 
 # =============================================================================

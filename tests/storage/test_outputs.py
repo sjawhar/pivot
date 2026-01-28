@@ -1,5 +1,3 @@
-# pyright: reportAttributeAccessIssue=false
-
 import pytest
 
 from pivot import loaders, outputs
@@ -40,13 +38,13 @@ def test_all_outputs_frozen() -> None:
     plot = outputs.Plot(path="loss.csv", loader=loaders.PathOnly())
 
     with pytest.raises(AttributeError):
-        out.path = "other.txt"  # type: ignore[misc]
+        out.path = "other.txt"  # pyright: ignore[reportAttributeAccessIssue]
 
     with pytest.raises(AttributeError):
-        metric.cache = True  # type: ignore[misc]
+        metric.cache = True  # pyright: ignore[reportAttributeAccessIssue]
 
     with pytest.raises(AttributeError):
-        plot.x = "step"  # type: ignore[misc]
+        plot.x = "step"  # pyright: ignore[reportAttributeAccessIssue]
 
 
 def test_normalize_out_string() -> None:
@@ -119,7 +117,7 @@ def test_incremental_out_frozen() -> None:
     """IncrementalOut should be immutable (frozen dataclass)."""
     inc = outputs.IncrementalOut(path="database.csv", loader=loaders.PathOnly())
     with pytest.raises(AttributeError):
-        inc.path = "other.csv"  # type: ignore[misc]
+        inc.path = "other.csv"  # pyright: ignore[reportAttributeAccessIssue]
 
 
 def test_incremental_out_is_out_subclass() -> None:

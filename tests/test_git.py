@@ -3,12 +3,15 @@ from __future__ import annotations
 import subprocess
 from typing import TYPE_CHECKING
 
+from conftest import init_git_repo
 from pivot import git, project
 
 if TYPE_CHECKING:
     from pathlib import Path
 
     from pytest import MonkeyPatch
+
+    from conftest import GitRepo
 
 
 # =============================================================================
@@ -25,52 +28,26 @@ def test_read_file_from_head_no_git_repo(tmp_path: Path, monkeypatch: MonkeyPatc
     assert result is None
 
 
-def test_read_file_from_head_file_not_in_head(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+def test_read_file_from_head_file_not_in_head(git_repo: GitRepo, monkeypatch: MonkeyPatch) -> None:
     """Returns None when file doesn't exist in HEAD."""
-    # Create a git repo with initial commit
-    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "config", "user.email", "test@test.com"],
-        cwd=tmp_path,
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "config", "user.name", "Test"], cwd=tmp_path, check=True, capture_output=True
-    )
-    (tmp_path / "other.txt").write_text("content")
-    subprocess.run(["git", "add", "other.txt"], cwd=tmp_path, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "commit", "-m", "initial"], cwd=tmp_path, check=True, capture_output=True
-    )
+    repo_path, commit = git_repo
+    (repo_path / "other.txt").write_text("content")
+    commit("initial")
 
-    monkeypatch.setattr(project, "_project_root_cache", tmp_path)
+    monkeypatch.setattr(project, "_project_root_cache", repo_path)
 
     result = git.read_file_from_head("nonexistent.txt")
 
     assert result is None
 
 
-def test_read_file_from_head_returns_content(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+def test_read_file_from_head_returns_content(git_repo: GitRepo, monkeypatch: MonkeyPatch) -> None:
     """Returns file content from HEAD."""
-    # Create a git repo with committed file
-    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "config", "user.email", "test@test.com"],
-        cwd=tmp_path,
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "config", "user.name", "Test"], cwd=tmp_path, check=True, capture_output=True
-    )
-    (tmp_path / "file.txt").write_text("committed content")
-    subprocess.run(["git", "add", "file.txt"], cwd=tmp_path, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "commit", "-m", "initial"], cwd=tmp_path, check=True, capture_output=True
-    )
+    repo_path, commit = git_repo
+    (repo_path / "file.txt").write_text("committed content")
+    commit("initial")
 
-    monkeypatch.setattr(project, "_project_root_cache", tmp_path)
+    monkeypatch.setattr(project, "_project_root_cache", repo_path)
 
     result = git.read_file_from_head("file.txt")
 
@@ -78,59 +55,31 @@ def test_read_file_from_head_returns_content(tmp_path: Path, monkeypatch: Monkey
 
 
 def test_read_file_from_head_uncommitted_changes_not_visible(
-    tmp_path: Path, monkeypatch: MonkeyPatch
+    git_repo: GitRepo, monkeypatch: MonkeyPatch
 ) -> None:
     """Returns committed content, not uncommitted changes."""
-    # Create a git repo with committed file
-    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "config", "user.email", "test@test.com"],
-        cwd=tmp_path,
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "config", "user.name", "Test"], cwd=tmp_path, check=True, capture_output=True
-    )
-    (tmp_path / "file.txt").write_text("original content")
-    subprocess.run(["git", "add", "file.txt"], cwd=tmp_path, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "commit", "-m", "initial"], cwd=tmp_path, check=True, capture_output=True
-    )
+    repo_path, commit = git_repo
+    (repo_path / "file.txt").write_text("original content")
+    commit("initial")
 
     # Modify file but don't commit
-    (tmp_path / "file.txt").write_text("modified content")
+    (repo_path / "file.txt").write_text("modified content")
 
-    monkeypatch.setattr(project, "_project_root_cache", tmp_path)
+    monkeypatch.setattr(project, "_project_root_cache", repo_path)
 
     result = git.read_file_from_head("file.txt")
 
     assert result == b"original content"
 
 
-def test_read_file_from_head_subdirectory(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+def test_read_file_from_head_subdirectory(git_repo: GitRepo, monkeypatch: MonkeyPatch) -> None:
     """Can read files in subdirectories."""
-    # Create a git repo with file in subdirectory
-    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "config", "user.email", "test@test.com"],
-        cwd=tmp_path,
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "config", "user.name", "Test"], cwd=tmp_path, check=True, capture_output=True
-    )
-    (tmp_path / "subdir").mkdir()
-    (tmp_path / "subdir" / "nested.txt").write_text("nested content")
-    subprocess.run(
-        ["git", "add", "subdir/nested.txt"], cwd=tmp_path, check=True, capture_output=True
-    )
-    subprocess.run(
-        ["git", "commit", "-m", "initial"], cwd=tmp_path, check=True, capture_output=True
-    )
+    repo_path, commit = git_repo
+    (repo_path / "subdir").mkdir()
+    (repo_path / "subdir" / "nested.txt").write_text("nested content")
+    commit("initial")
 
-    monkeypatch.setattr(project, "_project_root_cache", tmp_path)
+    monkeypatch.setattr(project, "_project_root_cache", repo_path)
 
     result = git.read_file_from_head("subdir/nested.txt")
 
@@ -139,7 +88,7 @@ def test_read_file_from_head_subdirectory(tmp_path: Path, monkeypatch: MonkeyPat
 
 def test_read_file_from_head_empty_repo(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     """Returns None for empty repo (no commits)."""
-    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    init_git_repo(tmp_path, monkeypatch)
     monkeypatch.setattr(project, "_project_root_cache", tmp_path)
 
     result = git.read_file_from_head("file.txt")
@@ -154,7 +103,7 @@ def test_read_file_from_head_empty_repo(tmp_path: Path, monkeypatch: MonkeyPatch
 
 def test_read_files_from_head_empty_list(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     """Returns empty dict for empty path list."""
-    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    init_git_repo(tmp_path, monkeypatch)
     monkeypatch.setattr(project, "_project_root_cache", tmp_path)
 
     result = git.read_files_from_head([])
@@ -162,27 +111,14 @@ def test_read_files_from_head_empty_list(tmp_path: Path, monkeypatch: MonkeyPatc
     assert result == {}
 
 
-def test_read_files_from_head_multiple_files(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+def test_read_files_from_head_multiple_files(git_repo: GitRepo, monkeypatch: MonkeyPatch) -> None:
     """Returns content for multiple files."""
-    # Create a git repo with multiple files
-    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "config", "user.email", "test@test.com"],
-        cwd=tmp_path,
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "config", "user.name", "Test"], cwd=tmp_path, check=True, capture_output=True
-    )
-    (tmp_path / "file1.txt").write_text("content1")
-    (tmp_path / "file2.txt").write_text("content2")
-    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "commit", "-m", "initial"], cwd=tmp_path, check=True, capture_output=True
-    )
+    repo_path, commit = git_repo
+    (repo_path / "file1.txt").write_text("content1")
+    (repo_path / "file2.txt").write_text("content2")
+    commit("initial")
 
-    monkeypatch.setattr(project, "_project_root_cache", tmp_path)
+    monkeypatch.setattr(project, "_project_root_cache", repo_path)
 
     result = git.read_files_from_head(["file1.txt", "file2.txt", "missing.txt"])
 
@@ -212,31 +148,13 @@ def test_resolve_revision_no_git_repo(tmp_path: Path, monkeypatch: MonkeyPatch) 
     assert result is None
 
 
-def test_resolve_revision_with_branch(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+def test_resolve_revision_with_branch(git_repo: GitRepo, monkeypatch: MonkeyPatch) -> None:
     """Resolves branch name to commit SHA."""
-    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "config", "user.email", "test@test.com"],
-        cwd=tmp_path,
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "config", "user.name", "Test"], cwd=tmp_path, check=True, capture_output=True
-    )
-    (tmp_path / "file.txt").write_text("content")
-    subprocess.run(["git", "add", "file.txt"], cwd=tmp_path, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "commit", "-m", "initial"], cwd=tmp_path, check=True, capture_output=True
-    )
+    repo_path, commit = git_repo
+    (repo_path / "file.txt").write_text("content")
+    expected_sha = commit("initial")
 
-    # Get actual commit SHA
-    result = subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=tmp_path, capture_output=True, text=True, check=True
-    )
-    expected_sha = result.stdout.strip()
-
-    monkeypatch.setattr(project, "_project_root_cache", tmp_path)
+    monkeypatch.setattr(project, "_project_root_cache", repo_path)
 
     sha = git.resolve_revision("master")
     # master might be main on some systems, try both
@@ -247,32 +165,14 @@ def test_resolve_revision_with_branch(tmp_path: Path, monkeypatch: MonkeyPatch) 
     assert sha == expected_sha
 
 
-def test_resolve_revision_with_short_sha(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+def test_resolve_revision_with_short_sha(git_repo: GitRepo, monkeypatch: MonkeyPatch) -> None:
     """Resolves short SHA prefix to full commit SHA."""
-    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "config", "user.email", "test@test.com"],
-        cwd=tmp_path,
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "config", "user.name", "Test"], cwd=tmp_path, check=True, capture_output=True
-    )
-    (tmp_path / "file.txt").write_text("content")
-    subprocess.run(["git", "add", "file.txt"], cwd=tmp_path, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "commit", "-m", "initial"], cwd=tmp_path, check=True, capture_output=True
-    )
-
-    # Get actual commit SHA
-    result = subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=tmp_path, capture_output=True, text=True, check=True
-    )
-    full_sha = result.stdout.strip()
+    repo_path, commit = git_repo
+    (repo_path / "file.txt").write_text("content")
+    full_sha = commit("initial")
     short_sha = full_sha[:7]
 
-    monkeypatch.setattr(project, "_project_root_cache", tmp_path)
+    monkeypatch.setattr(project, "_project_root_cache", repo_path)
 
     sha = git.resolve_revision(short_sha)
 
@@ -280,25 +180,13 @@ def test_resolve_revision_with_short_sha(tmp_path: Path, monkeypatch: MonkeyPatc
     assert sha == full_sha
 
 
-def test_resolve_revision_invalid(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+def test_resolve_revision_invalid(git_repo: GitRepo, monkeypatch: MonkeyPatch) -> None:
     """Returns None for invalid revision."""
-    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "config", "user.email", "test@test.com"],
-        cwd=tmp_path,
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "config", "user.name", "Test"], cwd=tmp_path, check=True, capture_output=True
-    )
-    (tmp_path / "file.txt").write_text("content")
-    subprocess.run(["git", "add", "file.txt"], cwd=tmp_path, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "commit", "-m", "initial"], cwd=tmp_path, check=True, capture_output=True
-    )
+    repo_path, commit = git_repo
+    (repo_path / "file.txt").write_text("content")
+    commit("initial")
 
-    monkeypatch.setattr(project, "_project_root_cache", tmp_path)
+    monkeypatch.setattr(project, "_project_root_cache", repo_path)
 
     result = git.resolve_revision("nonexistent-branch")
 
@@ -310,34 +198,19 @@ def test_resolve_revision_invalid(tmp_path: Path, monkeypatch: MonkeyPatch) -> N
 # =============================================================================
 
 
-def test_read_file_from_revision_returns_content(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+def test_read_file_from_revision_returns_content(
+    git_repo: GitRepo, monkeypatch: MonkeyPatch
+) -> None:
     """Returns file content from specified revision."""
-    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "config", "user.email", "test@test.com"],
-        cwd=tmp_path,
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "config", "user.name", "Test"], cwd=tmp_path, check=True, capture_output=True
-    )
-    (tmp_path / "file.txt").write_text("original content")
-    subprocess.run(["git", "add", "file.txt"], cwd=tmp_path, check=True, capture_output=True)
-    subprocess.run(["git", "commit", "-m", "first"], cwd=tmp_path, check=True, capture_output=True)
-
-    # Get first commit SHA
-    result = subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=tmp_path, capture_output=True, text=True, check=True
-    )
-    first_sha = result.stdout.strip()[:7]
+    repo_path, commit = git_repo
+    (repo_path / "file.txt").write_text("original content")
+    first_sha = commit("first")[:7]
 
     # Make second commit with modified content
-    (tmp_path / "file.txt").write_text("modified content")
-    subprocess.run(["git", "add", "file.txt"], cwd=tmp_path, check=True, capture_output=True)
-    subprocess.run(["git", "commit", "-m", "second"], cwd=tmp_path, check=True, capture_output=True)
+    (repo_path / "file.txt").write_text("modified content")
+    commit("second")
 
-    monkeypatch.setattr(project, "_project_root_cache", tmp_path)
+    monkeypatch.setattr(project, "_project_root_cache", repo_path)
 
     # Read from first commit
     content = git.read_file_from_revision("file.txt", first_sha)
@@ -345,56 +218,28 @@ def test_read_file_from_revision_returns_content(tmp_path: Path, monkeypatch: Mo
     assert content == b"original content"
 
 
-def test_read_file_from_revision_file_not_found(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+def test_read_file_from_revision_file_not_found(
+    git_repo: GitRepo, monkeypatch: MonkeyPatch
+) -> None:
     """Returns None when file doesn't exist at revision."""
-    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "config", "user.email", "test@test.com"],
-        cwd=tmp_path,
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "config", "user.name", "Test"], cwd=tmp_path, check=True, capture_output=True
-    )
-    (tmp_path / "file.txt").write_text("content")
-    subprocess.run(["git", "add", "file.txt"], cwd=tmp_path, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "commit", "-m", "initial"], cwd=tmp_path, check=True, capture_output=True
-    )
+    repo_path, commit = git_repo
+    (repo_path / "file.txt").write_text("content")
+    sha = commit("initial")[:7]
 
-    # Get SHA
-    result = subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=tmp_path, capture_output=True, text=True, check=True
-    )
-    sha = result.stdout.strip()[:7]
-
-    monkeypatch.setattr(project, "_project_root_cache", tmp_path)
+    monkeypatch.setattr(project, "_project_root_cache", repo_path)
 
     content = git.read_file_from_revision("nonexistent.txt", sha)
 
     assert content is None
 
 
-def test_read_file_from_revision_invalid_rev(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+def test_read_file_from_revision_invalid_rev(git_repo: GitRepo, monkeypatch: MonkeyPatch) -> None:
     """Returns None for invalid revision."""
-    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "config", "user.email", "test@test.com"],
-        cwd=tmp_path,
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "config", "user.name", "Test"], cwd=tmp_path, check=True, capture_output=True
-    )
-    (tmp_path / "file.txt").write_text("content")
-    subprocess.run(["git", "add", "file.txt"], cwd=tmp_path, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "commit", "-m", "initial"], cwd=tmp_path, check=True, capture_output=True
-    )
+    repo_path, commit = git_repo
+    (repo_path / "file.txt").write_text("content")
+    commit("initial")
 
-    monkeypatch.setattr(project, "_project_root_cache", tmp_path)
+    monkeypatch.setattr(project, "_project_root_cache", repo_path)
 
     content = git.read_file_from_revision("file.txt", "invalid-rev")
 
@@ -406,32 +251,16 @@ def test_read_file_from_revision_invalid_rev(tmp_path: Path, monkeypatch: Monkey
 # =============================================================================
 
 
-def test_read_files_from_revision_multiple_files(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+def test_read_files_from_revision_multiple_files(
+    git_repo: GitRepo, monkeypatch: MonkeyPatch
+) -> None:
     """Returns content for multiple files from revision."""
-    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "config", "user.email", "test@test.com"],
-        cwd=tmp_path,
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "config", "user.name", "Test"], cwd=tmp_path, check=True, capture_output=True
-    )
-    (tmp_path / "file1.txt").write_text("content1")
-    (tmp_path / "file2.txt").write_text("content2")
-    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "commit", "-m", "initial"], cwd=tmp_path, check=True, capture_output=True
-    )
+    repo_path, commit = git_repo
+    (repo_path / "file1.txt").write_text("content1")
+    (repo_path / "file2.txt").write_text("content2")
+    sha = commit("initial")[:7]
 
-    # Get SHA
-    result = subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=tmp_path, capture_output=True, text=True, check=True
-    )
-    sha = result.stdout.strip()[:7]
-
-    monkeypatch.setattr(project, "_project_root_cache", tmp_path)
+    monkeypatch.setattr(project, "_project_root_cache", repo_path)
 
     result_files = git.read_files_from_revision(["file1.txt", "file2.txt", "missing.txt"], sha)
 
@@ -440,7 +269,7 @@ def test_read_files_from_revision_multiple_files(tmp_path: Path, monkeypatch: Mo
 
 def test_read_files_from_revision_empty_list(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     """Returns empty dict for empty path list."""
-    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    init_git_repo(tmp_path, monkeypatch)
     monkeypatch.setattr(project, "_project_root_cache", tmp_path)
 
     result = git.read_files_from_revision([], "HEAD")

@@ -324,13 +324,12 @@ def test_init_help_shows_force_option(runner: click.testing.CliRunner) -> None:
 
 
 def test_init_creates_valid_project_structure(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Integration test: init creates a valid project that other commands can use."""
     monkeypatch.chdir(tmp_path)
     project._project_root_cache = None
 
-    runner = click.testing.CliRunner()
     result = runner.invoke(cli.cli, ["init"])
 
     assert result.exit_code == 0

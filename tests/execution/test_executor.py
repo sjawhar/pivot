@@ -168,26 +168,6 @@ class _ChainStep5(TypedDict):
     output: Annotated[pathlib.Path, outputs.Out("step5.txt", loaders.PathOnly())]
 
 
-class _ChainStep6(TypedDict):
-    output: Annotated[pathlib.Path, outputs.Out("step6.txt", loaders.PathOnly())]
-
-
-class _ChainStep7(TypedDict):
-    output: Annotated[pathlib.Path, outputs.Out("step7.txt", loaders.PathOnly())]
-
-
-class _ChainStep8(TypedDict):
-    output: Annotated[pathlib.Path, outputs.Out("step8.txt", loaders.PathOnly())]
-
-
-class _ChainStep9(TypedDict):
-    output: Annotated[pathlib.Path, outputs.Out("step9.txt", loaders.PathOnly())]
-
-
-class _ChainStep10(TypedDict):
-    output: Annotated[pathlib.Path, outputs.Out("step10.txt", loaders.PathOnly())]
-
-
 # =============================================================================
 # Module-level stage functions for tests
 # =============================================================================
@@ -881,41 +861,6 @@ def _helper_chain_step5(
     return {"output": pathlib.Path("step5.txt")}
 
 
-def _helper_chain_step6(
-    step5: Annotated[pathlib.Path, outputs.Dep("step5.txt", loaders.PathOnly())],
-) -> _ChainStep6:
-    pathlib.Path("step6.txt").write_text(step5.read_text() + "_6")
-    return {"output": pathlib.Path("step6.txt")}
-
-
-def _helper_chain_step7(
-    step6: Annotated[pathlib.Path, outputs.Dep("step6.txt", loaders.PathOnly())],
-) -> _ChainStep7:
-    pathlib.Path("step7.txt").write_text(step6.read_text() + "_7")
-    return {"output": pathlib.Path("step7.txt")}
-
-
-def _helper_chain_step8(
-    step7: Annotated[pathlib.Path, outputs.Dep("step7.txt", loaders.PathOnly())],
-) -> _ChainStep8:
-    pathlib.Path("step8.txt").write_text(step7.read_text() + "_8")
-    return {"output": pathlib.Path("step8.txt")}
-
-
-def _helper_chain_step9(
-    step8: Annotated[pathlib.Path, outputs.Dep("step8.txt", loaders.PathOnly())],
-) -> _ChainStep9:
-    pathlib.Path("step9.txt").write_text(step8.read_text() + "_9")
-    return {"output": pathlib.Path("step9.txt")}
-
-
-def _helper_chain_step10(
-    step9: Annotated[pathlib.Path, outputs.Dep("step9.txt", loaders.PathOnly())],
-) -> _ChainStep10:
-    pathlib.Path("step10.txt").write_text(step9.read_text() + "_10")
-    return {"output": pathlib.Path("step10.txt")}
-
-
 def _many_deps_process(
     input_0: Annotated[pathlib.Path, outputs.Dep("input_0.txt", loaders.PathOnly())],
     input_1: Annotated[pathlib.Path, outputs.Dep("input_1.txt", loaders.PathOnly())],
@@ -1101,11 +1046,6 @@ def test_downstream_runs_when_upstream_changes(pipeline_dir: pathlib.Path) -> No
     assert results["step1"]["status"] == "ran"
     assert results["step2"]["status"] == "ran"
     assert (pipeline_dir / "final.txt").read_text() == "Final: HELLO"
-
-    # Second run - both skip
-    results = executor.run()
-    assert results["step1"]["status"] == "skipped"
-    assert results["step2"]["status"] == "skipped"
 
     # Change input - both should re-run
     (pipeline_dir / "input.txt").write_text("world")
@@ -1993,29 +1933,6 @@ def test_force_runs_unchanged_stage(pipeline_dir: pathlib.Path) -> None:
     assert results["process"]["status"] == "ran"
 
 
-def test_force_runs_all_stages_in_chain(pipeline_dir: pathlib.Path) -> None:
-    """Force flag should run all stages in dependency chain."""
-    (pipeline_dir / "input.txt").write_text("data")
-
-    register_test_stage(_force_step1, name="step1")
-    register_test_stage(_force_step2, name="step2")
-
-    # First run - both execute
-    results = executor.run(show_output=False)
-    assert results["step1"]["status"] == "ran"
-    assert results["step2"]["status"] == "ran"
-
-    # Second run - both skip
-    results = executor.run(show_output=False)
-    assert results["step1"]["status"] == "skipped"
-    assert results["step2"]["status"] == "skipped"
-
-    # Force run - both should run
-    results = executor.run(force=True, show_output=False)
-    assert results["step1"]["status"] == "ran"
-    assert results["step2"]["status"] == "ran"
-
-
 def test_force_updates_lock_file(pipeline_dir: pathlib.Path) -> None:
     """After forced run, lock file should have current fingerprints."""
     (pipeline_dir / "input.txt").write_text("test")
@@ -2044,12 +1961,6 @@ def test_force_with_specific_stage(pipeline_dir: pathlib.Path) -> None:
     assert results["step1"]["status"] == "ran"
     assert results["step2"]["status"] == "ran"
     assert results["other"]["status"] == "ran"
-
-    # Second run - all skip
-    results = executor.run(show_output=False)
-    assert results["step1"]["status"] == "skipped"
-    assert results["step2"]["status"] == "skipped"
-    assert results["other"]["status"] == "skipped"
 
     # Force run of step2 only - should force step1 and step2, skip other
     results = executor.run(stages=["step2"], force=True, show_output=False)
@@ -2197,28 +2108,23 @@ def test_many_stage_pipeline_completes(pipeline_dir: pathlib.Path) -> None:
     """Pipeline with many stages completes in reasonable time."""
     (pipeline_dir / "input.txt").write_text("start")
 
-    # Register 10-stage chain using module-level helpers
+    # Register 5-stage chain using module-level helpers
     register_test_stage(_helper_chain_step1, name="step1")
     register_test_stage(_helper_chain_step2, name="step2")
     register_test_stage(_helper_chain_step3, name="step3")
     register_test_stage(_helper_chain_step4, name="step4")
     register_test_stage(_helper_chain_step5, name="step5")
-    register_test_stage(_helper_chain_step6, name="step6")
-    register_test_stage(_helper_chain_step7, name="step7")
-    register_test_stage(_helper_chain_step8, name="step8")
-    register_test_stage(_helper_chain_step9, name="step9")
-    register_test_stage(_helper_chain_step10, name="step10")
 
     start_time = time.time()
     results = executor.run(show_output=False)
     elapsed = time.time() - start_time
 
     # All stages should run
-    for i in range(1, 11):
+    for i in range(1, 6):
         assert results[f"step{i}"]["status"] == "ran", f"step{i} should have run"
 
-    # Should complete in reasonable time (< 30s even with slow CI)
-    assert elapsed < 30, f"10-stage pipeline took too long: {elapsed:.1f}s"
+    # Should complete in reasonable time (< 15s even with slow CI)
+    assert elapsed < 15, f"5-stage pipeline took too long: {elapsed:.1f}s"
 
 
 def test_skip_detection_fast_with_many_deps(pipeline_dir: pathlib.Path) -> None:

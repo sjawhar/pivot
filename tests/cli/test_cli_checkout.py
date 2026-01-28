@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import pathlib
+import shutil
 from typing import TYPE_CHECKING, Annotated, TypedDict
 
 from helpers import register_test_stage
-from pivot import cli, executor, loaders, outputs
+from pivot import cli, executor, loaders, outputs, project
 from pivot.storage import cache, track
 
 if TYPE_CHECKING:
@@ -127,6 +128,42 @@ def test_checkout_all_tracked_files(
         assert pathlib.Path("data2.txt").exists()
         assert pathlib.Path("data1.txt").read_text() == "content of data1.txt"
         assert pathlib.Path("data2.txt").read_text() == "content of data2.txt"
+
+
+# =============================================================================
+# Tracked Directory Tests
+# =============================================================================
+
+
+def test_checkout_tracked_directory(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """Checkout restores a tracked directory from cache."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        project._project_root_cache = None
+
+        # Create directory with files
+        data_dir = pathlib.Path("images")
+        data_dir.mkdir()
+        (data_dir / "cat.jpg").write_bytes(b"cat image")
+        (data_dir / "dog.jpg").write_bytes(b"dog image")
+
+        # Track the directory (creates .pvt and caches content)
+        result = runner.invoke(cli.cli, ["track", "images"])
+        assert result.exit_code == 0, f"Track failed: {result.output}"
+
+        # Delete the directory
+        shutil.rmtree(data_dir)
+        assert not data_dir.exists()
+
+        # Checkout should restore it
+        result = runner.invoke(cli.cli, ["checkout", "images"])
+
+        assert result.exit_code == 0, f"Checkout failed: {result.output}"
+        assert data_dir.exists(), "Directory should be restored"
+        assert (data_dir / "cat.jpg").read_bytes() == b"cat image"
+        assert (data_dir / "dog.jpg").read_bytes() == b"dog image"
 
 
 # =============================================================================

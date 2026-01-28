@@ -2,11 +2,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-import click.testing
-
 from pivot import cli, project
 
 if TYPE_CHECKING:
+    import click.testing
     from pytest import MonkeyPatch
 
     from conftest import GitRepo
@@ -17,10 +16,8 @@ if TYPE_CHECKING:
 # =============================================================================
 
 
-def test_get_help() -> None:
+def test_get_help(runner: click.testing.CliRunner) -> None:
     """Shows help message."""
-    runner = click.testing.CliRunner()
-
     result = runner.invoke(cli.cli, ["data", "get", "--help"])
 
     assert result.exit_code == 0
@@ -33,7 +30,9 @@ def test_get_help() -> None:
 # =============================================================================
 
 
-def test_get_requires_rev(git_repo: GitRepo, monkeypatch: MonkeyPatch) -> None:
+def test_get_requires_rev(
+    runner: click.testing.CliRunner, git_repo: GitRepo, monkeypatch: MonkeyPatch
+) -> None:
     """Requires --rev option."""
     repo_path, commit = git_repo
     (repo_path / "file.txt").write_text("content")
@@ -42,15 +41,15 @@ def test_get_requires_rev(git_repo: GitRepo, monkeypatch: MonkeyPatch) -> None:
 
     monkeypatch.setattr(project, "_project_root_cache", repo_path)
 
-    runner = click.testing.CliRunner()
-
     result = runner.invoke(cli.cli, ["data", "get", "file.txt"])
 
     assert result.exit_code != 0
     assert "Missing option" in result.output or "--rev" in result.output
 
 
-def test_get_requires_targets(git_repo: GitRepo, monkeypatch: MonkeyPatch) -> None:
+def test_get_requires_targets(
+    runner: click.testing.CliRunner, git_repo: GitRepo, monkeypatch: MonkeyPatch
+) -> None:
     """Requires at least one target."""
     repo_path, commit = git_repo
     (repo_path / "file.txt").write_text("content")
@@ -58,8 +57,6 @@ def test_get_requires_targets(git_repo: GitRepo, monkeypatch: MonkeyPatch) -> No
     (repo_path / ".pivot").mkdir()
 
     monkeypatch.setattr(project, "_project_root_cache", repo_path)
-
-    runner = click.testing.CliRunner()
 
     result = runner.invoke(cli.cli, ["data", "get", "--rev", "HEAD"])
 
@@ -72,7 +69,9 @@ def test_get_requires_targets(git_repo: GitRepo, monkeypatch: MonkeyPatch) -> No
 # =============================================================================
 
 
-def test_get_git_tracked_file(git_repo: GitRepo, monkeypatch: MonkeyPatch) -> None:
+def test_get_git_tracked_file(
+    runner: click.testing.CliRunner, git_repo: GitRepo, monkeypatch: MonkeyPatch
+) -> None:
     """Gets a git-tracked file from revision."""
     repo_path, commit = git_repo
     (repo_path / "file.txt").write_text("original content")
@@ -86,8 +85,6 @@ def test_get_git_tracked_file(git_repo: GitRepo, monkeypatch: MonkeyPatch) -> No
 
     monkeypatch.setattr(project, "_project_root_cache", repo_path)
 
-    runner = click.testing.CliRunner()
-
     result = runner.invoke(
         cli.cli,
         ["data", "get", "--rev", sha[:7], "file.txt", "-o", str(repo_path / "restored.txt")],
@@ -98,7 +95,9 @@ def test_get_git_tracked_file(git_repo: GitRepo, monkeypatch: MonkeyPatch) -> No
     assert (repo_path / "restored.txt").read_text() == "original content"
 
 
-def test_get_git_tracked_file_with_force(git_repo: GitRepo, monkeypatch: MonkeyPatch) -> None:
+def test_get_git_tracked_file_with_force(
+    runner: click.testing.CliRunner, git_repo: GitRepo, monkeypatch: MonkeyPatch
+) -> None:
     """Overwrites existing file with --force."""
     repo_path, commit = git_repo
     (repo_path / "file.txt").write_text("original")
@@ -112,8 +111,6 @@ def test_get_git_tracked_file_with_force(git_repo: GitRepo, monkeypatch: MonkeyP
 
     monkeypatch.setattr(project, "_project_root_cache", repo_path)
 
-    runner = click.testing.CliRunner()
-
     result = runner.invoke(
         cli.cli,
         ["data", "get", "--rev", sha[:7], "file.txt", "-o", str(output_path), "--force"],
@@ -124,7 +121,9 @@ def test_get_git_tracked_file_with_force(git_repo: GitRepo, monkeypatch: MonkeyP
     assert output_path.read_text() == "original"
 
 
-def test_get_skip_existing_without_force(git_repo: GitRepo, monkeypatch: MonkeyPatch) -> None:
+def test_get_skip_existing_without_force(
+    runner: click.testing.CliRunner, git_repo: GitRepo, monkeypatch: MonkeyPatch
+) -> None:
     """Skips existing files without --force."""
     repo_path, commit = git_repo
     (repo_path / "file.txt").write_text("original")
@@ -137,8 +136,6 @@ def test_get_skip_existing_without_force(git_repo: GitRepo, monkeypatch: MonkeyP
     (repo_path / ".pivot" / "cache").mkdir(parents=True)
 
     monkeypatch.setattr(project, "_project_root_cache", repo_path)
-
-    runner = click.testing.CliRunner()
 
     result = runner.invoke(
         cli.cli,
@@ -155,7 +152,9 @@ def test_get_skip_existing_without_force(git_repo: GitRepo, monkeypatch: MonkeyP
 # =============================================================================
 
 
-def test_get_invalid_revision(git_repo: GitRepo, monkeypatch: MonkeyPatch) -> None:
+def test_get_invalid_revision(
+    runner: click.testing.CliRunner, git_repo: GitRepo, monkeypatch: MonkeyPatch
+) -> None:
     """Errors on invalid revision."""
     repo_path, commit = git_repo
     (repo_path / "file.txt").write_text("content")
@@ -163,8 +162,6 @@ def test_get_invalid_revision(git_repo: GitRepo, monkeypatch: MonkeyPatch) -> No
     (repo_path / ".pivot" / "cache").mkdir(parents=True)
 
     monkeypatch.setattr(project, "_project_root_cache", repo_path)
-
-    runner = click.testing.CliRunner()
 
     result = runner.invoke(
         cli.cli,
@@ -175,7 +172,9 @@ def test_get_invalid_revision(git_repo: GitRepo, monkeypatch: MonkeyPatch) -> No
     assert "RevisionNotFoundError" in result.output or "Cannot resolve" in result.output
 
 
-def test_get_target_not_found(git_repo: GitRepo, monkeypatch: MonkeyPatch) -> None:
+def test_get_target_not_found(
+    runner: click.testing.CliRunner, git_repo: GitRepo, monkeypatch: MonkeyPatch
+) -> None:
     """Errors when target not found at revision."""
     repo_path, commit = git_repo
     (repo_path / "file.txt").write_text("content")
@@ -183,8 +182,6 @@ def test_get_target_not_found(git_repo: GitRepo, monkeypatch: MonkeyPatch) -> No
     (repo_path / ".pivot" / "cache").mkdir(parents=True)
 
     monkeypatch.setattr(project, "_project_root_cache", repo_path)
-
-    runner = click.testing.CliRunner()
 
     result = runner.invoke(
         cli.cli,

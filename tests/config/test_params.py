@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 import pytest
 from pydantic import BaseModel, ValidationError
 
-from pivot import exceptions, parameters
+from pivot import exceptions, parameters, project
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -45,7 +45,7 @@ class ComplexParams(BaseModel):
 
 
 def test_load_params_yaml_missing_file(tmp_path: Path, mocker: MockerFixture) -> None:
-    mocker.patch("pivot.project.get_project_root", return_value=tmp_path)
+    mocker.patch.object(project, "get_project_root", return_value=tmp_path)
     result = parameters.load_params_yaml()
     assert result == {}, "Missing params.yaml should return empty dict"
 
@@ -59,7 +59,7 @@ def test_load_params_yaml_from_explicit_path(tmp_path: Path) -> None:
 
 
 def test_load_params_yaml_from_project_root(tmp_path: Path, mocker: MockerFixture) -> None:
-    mocker.patch("pivot.project.get_project_root", return_value=tmp_path)
+    mocker.patch.object(project, "get_project_root", return_value=tmp_path)
     params_file = tmp_path / "params.yaml"
     params_file.write_text("stage1:\n  lr: 0.01\nstage2:\n  batch: 64\n")
 
@@ -147,16 +147,6 @@ def test_build_params_instance_type_mismatch_raises() -> None:
     yaml_overrides = {"train": {"epochs": "not_an_int"}}
     with pytest.raises(ValidationError):
         parameters.build_params_instance(TrainParams, "train", yaml_overrides)
-
-
-def test_build_params_instance_with_overrides() -> None:
-    """Alias for test_build_params_instance_with_yaml_overrides for compatibility."""
-    overrides = {"train": {"learning_rate": 0.001, "epochs": 200}}
-    instance = parameters.build_params_instance(TrainParams, "train", overrides)
-    assert isinstance(instance, TrainParams)
-    assert instance.learning_rate == 0.001, "YAML should override default"
-    assert instance.epochs == 200, "YAML should override default"
-    assert instance.batch_size == 32, "Unspecified fields keep defaults"
 
 
 def test_build_params_instance_nested_model() -> None:

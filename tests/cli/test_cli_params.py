@@ -8,7 +8,6 @@ import yaml
 
 from helpers import register_test_stage
 from pivot import cli, project, stage_def
-from pivot.registry import REGISTRY
 
 if TYPE_CHECKING:
     import click.testing
@@ -111,8 +110,6 @@ def test_params_show_with_params(runner: click.testing.CliRunner, tmp_path: path
         assert "lr" in result.output
         assert "0.01" in result.output
 
-        REGISTRY.clear()
-
 
 def test_params_show_json_format(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
     """params show --json outputs valid JSON."""
@@ -128,8 +125,6 @@ def test_params_show_json_format(runner: click.testing.CliRunner, tmp_path: path
         parsed = json.loads(result.output)
         assert parsed["stage"]["x"] == 1
 
-        REGISTRY.clear()
-
 
 def test_params_show_md_format(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
     """params show --md outputs markdown table."""
@@ -144,8 +139,6 @@ def test_params_show_md_format(runner: click.testing.CliRunner, tmp_path: pathli
         assert result.exit_code == 0
         assert "|" in result.output
         assert "---" in result.output
-
-        REGISTRY.clear()
 
 
 def test_params_show_specific_stages(
@@ -166,8 +159,6 @@ def test_params_show_specific_stages(
         assert "stage_a" in result.output
         assert "stage_c" in result.output
 
-        REGISTRY.clear()
-
 
 def test_params_show_precision(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
     """params show respects --precision flag."""
@@ -182,8 +173,6 @@ def test_params_show_precision(runner: click.testing.CliRunner, tmp_path: pathli
         assert result.exit_code == 0
         assert "0.12" in result.output
         assert "0.123456789" not in result.output
-
-        REGISTRY.clear()
 
 
 # =============================================================================
@@ -246,8 +235,6 @@ def test_params_diff_no_changes(
         assert result.exit_code == 0
         assert "No parameter changes" in result.output
 
-        REGISTRY.clear()
-
 
 def test_params_diff_with_changes(
     runner: click.testing.CliRunner,
@@ -283,8 +270,6 @@ def test_params_diff_with_changes(
         assert result.exit_code == 0
         assert "modified" in result.output
         assert "stage" in result.output
-
-        REGISTRY.clear()
 
 
 def test_params_diff_json_format(
@@ -323,8 +308,6 @@ def test_params_diff_json_format(
         assert len(parsed) == 1
         assert parsed[0]["change_type"] == "modified"
 
-        REGISTRY.clear()
-
 
 def test_params_diff_md_format(
     runner: click.testing.CliRunner,
@@ -360,8 +343,6 @@ def test_params_diff_md_format(
         assert result.exit_code == 0
         assert "|" in result.output
         assert "---" in result.output
-
-        REGISTRY.clear()
 
 
 # =============================================================================
@@ -438,5 +419,3 @@ def test_params_diff_no_git_warning(
 
         assert result.exit_code == 0
         assert "Warning: Not in a git repository" in result.output
-
-        REGISTRY.clear()

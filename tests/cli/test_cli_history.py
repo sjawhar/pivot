@@ -6,7 +6,6 @@ import json
 from typing import TYPE_CHECKING
 
 import pytest
-from click.testing import CliRunner
 
 from pivot import cli, run_history
 from pivot.storage import state
@@ -15,11 +14,7 @@ from pivot.types import StageStatus
 if TYPE_CHECKING:
     import pathlib
 
-
-@pytest.fixture
-def cli_runner() -> CliRunner:
-    """Create CLI runner for testing."""
-    return CliRunner()
+    import click.testing
 
 
 @pytest.fixture
@@ -66,9 +61,11 @@ def project_with_runs(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -
 # =============================================================================
 
 
-def test_history_lists_runs(cli_runner: CliRunner, project_with_runs: pathlib.Path) -> None:
+def test_history_lists_runs(
+    runner: click.testing.CliRunner, project_with_runs: pathlib.Path
+) -> None:
     """History command should list recent runs."""
-    result = cli_runner.invoke(cli.cli, ["history"])
+    result = runner.invoke(cli.cli, ["history"])
 
     assert result.exit_code == 0
     assert "Run ID" in result.output
@@ -77,10 +74,10 @@ def test_history_lists_runs(cli_runner: CliRunner, project_with_runs: pathlib.Pa
 
 
 def test_history_shows_status_summary(
-    cli_runner: CliRunner, project_with_runs: pathlib.Path
+    runner: click.testing.CliRunner, project_with_runs: pathlib.Path
 ) -> None:
     """History should show ran/skipped/failed counts."""
-    result = cli_runner.invoke(cli.cli, ["history"])
+    result = runner.invoke(cli.cli, ["history"])
 
     assert result.exit_code == 0
     # Most recent run has 1 ran, 1 skipped (train ran, eval ran in run 2)
@@ -88,9 +85,11 @@ def test_history_shows_status_summary(
     assert "ran" in result.output.lower()
 
 
-def test_history_respects_limit(cli_runner: CliRunner, project_with_runs: pathlib.Path) -> None:
+def test_history_respects_limit(
+    runner: click.testing.CliRunner, project_with_runs: pathlib.Path
+) -> None:
     """History --limit should limit number of runs shown."""
-    result = cli_runner.invoke(cli.cli, ["history", "--limit", "1"])
+    result = runner.invoke(cli.cli, ["history", "--limit", "1"])
 
     assert result.exit_code == 0
     # Should only show most recent
@@ -98,9 +97,11 @@ def test_history_respects_limit(cli_runner: CliRunner, project_with_runs: pathli
     assert "20250111_143000_abc12341" not in result.output
 
 
-def test_history_json_output(cli_runner: CliRunner, project_with_runs: pathlib.Path) -> None:
+def test_history_json_output(
+    runner: click.testing.CliRunner, project_with_runs: pathlib.Path
+) -> None:
     """History --json should output JSON."""
-    result = cli_runner.invoke(cli.cli, ["history", "--json"])
+    result = runner.invoke(cli.cli, ["history", "--json"])
 
     assert result.exit_code == 0
     data: list[dict[str, object]] = json.loads(result.output)
@@ -109,7 +110,7 @@ def test_history_json_output(cli_runner: CliRunner, project_with_runs: pathlib.P
 
 
 def test_history_empty(
-    cli_runner: CliRunner, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """History should show message when no runs exist."""
     project_dir = tmp_path / "empty_project"
@@ -117,7 +118,7 @@ def test_history_empty(
     (project_dir / ".pivot").mkdir()
     monkeypatch.chdir(project_dir)
 
-    result = cli_runner.invoke(cli.cli, ["history"])
+    result = runner.invoke(cli.cli, ["history"])
 
     assert result.exit_code == 0
     assert "No runs recorded" in result.output
@@ -128,9 +129,9 @@ def test_history_empty(
 # =============================================================================
 
 
-def test_show_latest_run(cli_runner: CliRunner, project_with_runs: pathlib.Path) -> None:
+def test_show_latest_run(runner: click.testing.CliRunner, project_with_runs: pathlib.Path) -> None:
     """Show without argument should show latest run."""
-    result = cli_runner.invoke(cli.cli, ["show"])
+    result = runner.invoke(cli.cli, ["show"])
 
     assert result.exit_code == 0
     assert "20250112_143000_abc12342" in result.output
@@ -139,25 +140,29 @@ def test_show_latest_run(cli_runner: CliRunner, project_with_runs: pathlib.Path)
     assert "eval" in result.output
 
 
-def test_show_specific_run(cli_runner: CliRunner, project_with_runs: pathlib.Path) -> None:
+def test_show_specific_run(
+    runner: click.testing.CliRunner, project_with_runs: pathlib.Path
+) -> None:
     """Show with run_id should show that specific run."""
-    result = cli_runner.invoke(cli.cli, ["show", "20250110_143000_abc12340"])
+    result = runner.invoke(cli.cli, ["show", "20250110_143000_abc12340"])
 
     assert result.exit_code == 0
     assert "20250110_143000_abc12340" in result.output
 
 
-def test_show_nonexistent_run(cli_runner: CliRunner, project_with_runs: pathlib.Path) -> None:
+def test_show_nonexistent_run(
+    runner: click.testing.CliRunner, project_with_runs: pathlib.Path
+) -> None:
     """Show with nonexistent run_id should show error."""
-    result = cli_runner.invoke(cli.cli, ["show", "nonexistent_run_id"])
+    result = runner.invoke(cli.cli, ["show", "nonexistent_run_id"])
 
     assert result.exit_code != 0
     assert "Run not found" in result.output
 
 
-def test_show_json_output(cli_runner: CliRunner, project_with_runs: pathlib.Path) -> None:
+def test_show_json_output(runner: click.testing.CliRunner, project_with_runs: pathlib.Path) -> None:
     """Show --json should output JSON."""
-    result = cli_runner.invoke(cli.cli, ["show", "--json"])
+    result = runner.invoke(cli.cli, ["show", "--json"])
 
     assert result.exit_code == 0
     data: dict[str, object] = json.loads(result.output)
@@ -169,7 +174,7 @@ def test_show_json_output(cli_runner: CliRunner, project_with_runs: pathlib.Path
 
 
 def test_show_empty_project(
-    cli_runner: CliRunner, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Show on empty project should show error."""
     project_dir = tmp_path / "empty_project"
@@ -177,7 +182,7 @@ def test_show_empty_project(
     (project_dir / ".pivot").mkdir()
     monkeypatch.chdir(project_dir)
 
-    result = cli_runner.invoke(cli.cli, ["show"])
+    result = runner.invoke(cli.cli, ["show"])
 
     assert result.exit_code != 0
     assert "No runs recorded" in result.output

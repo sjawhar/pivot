@@ -25,13 +25,13 @@ def _noop() -> None:
 
 
 @pytest.fixture
-def mock_ctx() -> click.Context:
+def mock_ctx() -> mock.MagicMock:
     """Create a mock Click context."""
     return mock.MagicMock(spec=click.Context)
 
 
 @pytest.fixture
-def mock_param() -> click.Parameter:
+def mock_param() -> mock.MagicMock:
     """Create a mock Click parameter."""
     return mock.MagicMock(spec=click.Parameter)
 
@@ -239,8 +239,8 @@ def test_get_stages_full_returns_registered_stages() -> None:
 
 def test_complete_stages_filters_by_prefix(
     tmp_path: Path,
-    mock_ctx: click.Context,
-    mock_param: click.Parameter,
+    mock_ctx: mock.MagicMock,
+    mock_param: mock.MagicMock,
     mocker: MockerFixture,
 ) -> None:
     """Filters stage names by incomplete prefix."""
@@ -263,8 +263,8 @@ stages:
 
 def test_complete_stages_empty_prefix_returns_all(
     tmp_path: Path,
-    mock_ctx: click.Context,
-    mock_param: click.Parameter,
+    mock_ctx: mock.MagicMock,
+    mock_param: mock.MagicMock,
     mocker: MockerFixture,
 ) -> None:
     """Empty prefix returns all stages."""
@@ -284,7 +284,7 @@ stages:
 
 
 def test_complete_stages_falls_back_to_registry(
-    mock_ctx: click.Context, mock_param: click.Parameter, mocker: MockerFixture
+    mock_ctx: mock.MagicMock, mock_param: mock.MagicMock, mocker: MockerFixture
 ) -> None:
     """Falls back to registry when fast path returns None (no YAML)."""
 
@@ -299,7 +299,7 @@ def test_complete_stages_falls_back_to_registry(
 
 
 def test_complete_stages_returns_empty_on_exception(
-    mock_ctx: click.Context, mock_param: click.Parameter, mocker: MockerFixture
+    mock_ctx: mock.MagicMock, mock_param: mock.MagicMock, mocker: MockerFixture
 ) -> None:
     """Returns empty list if exception occurs."""
     mocker.patch.object(completion, "_get_stages_fast", side_effect=Exception("boom"))
@@ -310,8 +310,8 @@ def test_complete_stages_returns_empty_on_exception(
 
 def test_complete_stages_matrix_stage_completion(
     tmp_path: Path,
-    mock_ctx: click.Context,
-    mock_param: click.Parameter,
+    mock_ctx: mock.MagicMock,
+    mock_param: mock.MagicMock,
     mocker: MockerFixture,
 ) -> None:
     """Completes matrix stage names correctly."""
@@ -335,8 +335,8 @@ stages:
 
 def test_complete_stages_case_sensitive(
     tmp_path: Path,
-    mock_ctx: click.Context,
-    mock_param: click.Parameter,
+    mock_ctx: mock.MagicMock,
+    mock_param: mock.MagicMock,
     mocker: MockerFixture,
 ) -> None:
     """Completion is case-sensitive."""
@@ -364,8 +364,8 @@ stages:
 
 def test_complete_targets_includes_stage_names(
     tmp_path: Path,
-    mock_ctx: click.Context,
-    mock_param: click.Parameter,
+    mock_ctx: mock.MagicMock,
+    mock_param: mock.MagicMock,
     mocker: MockerFixture,
 ) -> None:
     """Target completion includes stage names."""
@@ -386,8 +386,8 @@ stages:
 
 def test_complete_targets_filters_by_prefix(
     tmp_path: Path,
-    mock_ctx: click.Context,
-    mock_param: click.Parameter,
+    mock_ctx: mock.MagicMock,
+    mock_param: mock.MagicMock,
     mocker: MockerFixture,
 ) -> None:
     """Filters targets by incomplete prefix."""

@@ -1,14 +1,13 @@
-# pyright: reportAssignmentType=false, reportIncompatibleVariableOverride=false, reportAttributeAccessIssue=false
 from __future__ import annotations
 
 import contextlib
 import inspect
 import io
-import multiprocessing as mp
+import json
 import os
 import pathlib
 import sys
-from typing import TYPE_CHECKING, Annotated
+from typing import TYPE_CHECKING, Annotated, Any
 
 import pytest
 
@@ -17,7 +16,10 @@ from pivot.executor import worker
 from pivot.storage import cache, lock
 
 if TYPE_CHECKING:
-    from collections.abc import Generator
+    import multiprocessing as mp
+    from collections.abc import Callable, Generator
+
+    from pytest_mock import MockerFixture
 
     from pivot.executor import WorkerStageInfo
     from pivot.types import DirManifestEntry, OutputMessage
@@ -29,33 +31,16 @@ class _PlainParams(stage_def.StageParams):
     threshold: float = 0.5
 
 
-@pytest.fixture
-def worker_env(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> pathlib.Path:
-    """Set up worker execution environment."""
-    cache_dir = tmp_path / ".pivot" / "cache"
-    cache_dir.mkdir(parents=True)
-    (tmp_path / ".pivot" / "stages").mkdir(parents=True, exist_ok=True)
-    monkeypatch.chdir(tmp_path)
-    return cache_dir
-
-
-@pytest.fixture
-def output_queue() -> Generator[mp.Queue[OutputMessage]]:
-    """Shared output queue for worker tests."""
-    manager = mp.Manager()
-    yield manager.Queue()  # pyright: ignore[reportReturnType] - Manager queue is compatible
-    manager.shutdown()
-
-
 def _make_stage_info(
-    func: object,
+    func: Callable[..., Any],
+    tmp_path: pathlib.Path,
     *,
     fingerprint: dict[str, str] | None = None,
     deps: list[str] | None = None,
     outs: list[outputs.BaseOut] | None = None,
     params: stage_def.StageParams | None = None,
     signature: inspect.Signature | None = None,
-    checkout_modes: list[str] | None = None,
+    checkout_modes: list[cache.CheckoutMode] | None = None,
     run_id: str = "test_run",
     force: bool = False,
     no_commit: bool = False,
@@ -74,7 +59,8 @@ def _make_stage_info(
         "params": params,
         "variant": None,
         "overrides": {},
-        "checkout_modes": checkout_modes or ["hardlink", "symlink", "copy"],
+        "checkout_modes": checkout_modes
+        or [cache.CheckoutMode.HARDLINK, cache.CheckoutMode.SYMLINK, cache.CheckoutMode.COPY],
         "run_id": run_id,
         "force": force,
         "no_commit": no_commit,
@@ -82,7 +68,9 @@ def _make_stage_info(
         "dep_specs": dep_specs or {},
         "out_specs": out_specs or {},
         "params_arg_name": params_arg_name,
-    }  # pyright: ignore[reportReturnType] - test helper
+        "project_root": tmp_path,
+        "state_dir": tmp_path / ".pivot",
+    }
 
 
 # Helper functions for joblib tests (lambdas can't be typed properly without stubs)
@@ -111,27 +99,7 @@ def test_execute_stage_with_missing_deps(
     worker_env: pathlib.Path, output_queue: mp.Queue[OutputMessage], tmp_path: pathlib.Path
 ) -> None:
     """Worker returns failed status when dependency files are missing."""
-    stage_info: WorkerStageInfo = {
-        "func": lambda: None,
-        "fingerprint": {"self:test": "abc123"},
-        "deps": ["missing_file.txt"],
-        "signature": None,
-        "outs": [],
-        "params": None,
-        "variant": None,
-        "overrides": {},
-        "checkout_modes": ["hardlink", "symlink", "copy"],
-        "run_id": "test_run",
-        "force": False,
-        "no_commit": False,
-        "no_cache": False,
-        "dep_specs": {},
-        "out_specs": {},
-        "params_arg_name": None,
-        "project_root": tmp_path,
-        "state_dir": tmp_path / ".pivot",
-    }
-
+    stage_info = _make_stage_info(lambda: None, tmp_path, deps=["missing_file.txt"])
     result = executor.execute_stage("test_stage", stage_info, worker_env, output_queue)
 
     assert result["status"] == "failed"
@@ -139,7 +107,9 @@ def test_execute_stage_with_missing_deps(
     assert "missing_file.txt" in result["reason"]
 
 
-def test_execute_stage_with_directory_dep(worker_env: pathlib.Path, tmp_path: pathlib.Path) -> None:
+def test_execute_stage_with_directory_dep(
+    worker_env: pathlib.Path, output_queue: mp.Queue[OutputMessage], tmp_path: pathlib.Path
+) -> None:
     """Worker hashes directory dependency and runs stage."""
     data_dir = tmp_path / "data_dir"
     data_dir.mkdir()
@@ -148,40 +118,15 @@ def test_execute_stage_with_directory_dep(worker_env: pathlib.Path, tmp_path: pa
     def stage_func() -> None:
         (tmp_path / "output.txt").write_text("done")
 
-    stage_info: WorkerStageInfo = {
-        "func": stage_func,
-        "fingerprint": {"self:test": "abc123"},
-        "deps": ["data_dir"],
-        "signature": None,
-        "outs": [],
-        "params": None,
-        "variant": None,
-        "overrides": {},
-        "checkout_modes": ["hardlink", "symlink", "copy"],
-        "run_id": "test_run",
-        "force": False,
-        "no_commit": False,
-        "no_cache": False,
-        "dep_specs": {},
-        "out_specs": {},
-        "params_arg_name": None,
-        "project_root": tmp_path,
-        "state_dir": tmp_path / ".pivot",
-    }
-
-    result = executor.execute_stage(
-        "test_stage",
-        stage_info,
-        worker_env,
-        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
-    )
+    stage_info = _make_stage_info(stage_func, tmp_path, deps=["data_dir"])
+    result = executor.execute_stage("test_stage", stage_info, worker_env, output_queue)
 
     assert result["status"] == "ran", f"Expected ran, got {result}"
     assert (tmp_path / "output.txt").read_text() == "done"
 
 
 def test_execute_stage_runs_unchanged_stage(
-    worker_env: pathlib.Path, tmp_path: pathlib.Path
+    worker_env: pathlib.Path, output_queue: mp.Queue[OutputMessage], tmp_path: pathlib.Path
 ) -> None:
     """Worker skips stage when fingerprint matches and deps unchanged."""
     (tmp_path / "input.txt").write_text("data")
@@ -189,50 +134,23 @@ def test_execute_stage_runs_unchanged_stage(
     def stage_func() -> None:
         (tmp_path / "output.txt").write_text("result")
 
-    stage_info: WorkerStageInfo = {
-        "func": stage_func,
-        "fingerprint": {"self:stage_func": "fp123"},
-        "deps": ["input.txt"],
-        "signature": None,
-        "outs": [],
-        "params": None,
-        "variant": None,
-        "overrides": {},
-        "checkout_modes": ["hardlink", "symlink", "copy"],
-        "run_id": "test_run",
-        "force": False,
-        "no_commit": False,
-        "no_cache": False,
-        "dep_specs": {},
-        "out_specs": {},
-        "params_arg_name": None,
-        "project_root": tmp_path,
-        "state_dir": tmp_path / ".pivot",
-    }
+    stage_info = _make_stage_info(
+        stage_func, tmp_path, fingerprint={"self:stage_func": "fp123"}, deps=["input.txt"]
+    )
 
     # First run - creates lock file
-    result1 = executor.execute_stage(
-        "test_stage",
-        stage_info,
-        worker_env,
-        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
-    )
+    result1 = executor.execute_stage("test_stage", stage_info, worker_env, output_queue)
     assert result1["status"] == "ran"
     assert (tmp_path / "output.txt").read_text() == "result"
 
     # Second run - should skip (unchanged)
-    result2 = executor.execute_stage(
-        "test_stage",
-        stage_info,
-        worker_env,
-        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
-    )
+    result2 = executor.execute_stage("test_stage", stage_info, worker_env, output_queue)
     assert result2["status"] == "skipped"
     assert result2["reason"] == "unchanged"
 
 
 def test_execute_stage_reruns_when_fingerprint_changes(
-    worker_env: pathlib.Path, tmp_path: pathlib.Path
+    worker_env: pathlib.Path, output_queue: mp.Queue[OutputMessage], tmp_path: pathlib.Path
 ) -> None:
     """Worker reruns stage when code fingerprint changes."""
     (tmp_path / "input.txt").write_text("data")
@@ -242,55 +160,27 @@ def test_execute_stage_reruns_when_fingerprint_changes(
         count = int(counter.read_text()) if counter.exists() else 0
         counter.write_text(str(count + 1))
 
-    stage_info_v1: WorkerStageInfo = {
-        "func": stage_func_v1,
-        "fingerprint": {"self:stage_func_v1": "fp_v1"},
-        "deps": ["input.txt"],
-        "signature": None,
-        "outs": [],
-        "params": None,
-        "variant": None,
-        "overrides": {},
-        "checkout_modes": ["hardlink", "symlink", "copy"],
-        "run_id": "test_run",
-        "force": False,
-        "no_commit": False,
-        "no_cache": False,
-        "dep_specs": {},
-        "out_specs": {},
-        "params_arg_name": None,
-        "project_root": tmp_path,
-        "state_dir": tmp_path / ".pivot",
-    }
+    stage_info_v1 = _make_stage_info(
+        stage_func_v1, tmp_path, fingerprint={"self:stage_func_v1": "fp_v1"}, deps=["input.txt"]
+    )
 
     # First run
-    result1 = executor.execute_stage(
-        "test_stage",
-        stage_info_v1,
-        worker_env,
-        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
-    )
+    result1 = executor.execute_stage("test_stage", stage_info_v1, worker_env, output_queue)
     assert result1["status"] == "ran"
     assert counter.read_text() == "1"
 
     # Second run with different fingerprint
-    stage_info_v2: WorkerStageInfo = {
-        **stage_info_v1,
-        "fingerprint": {"self:stage_func_v1": "fp_v2"},
-    }
-    result2 = executor.execute_stage(
-        "test_stage",
-        stage_info_v2,
-        worker_env,
-        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
+    stage_info_v2 = _make_stage_info(
+        stage_func_v1, tmp_path, fingerprint={"self:stage_func_v1": "fp_v2"}, deps=["input.txt"]
     )
+    result2 = executor.execute_stage("test_stage", stage_info_v2, worker_env, output_queue)
     assert result2["status"] == "ran"
     assert result2["reason"] == "Code changed"
     assert counter.read_text() == "2"
 
 
 def test_execute_stage_handles_stage_exception(
-    worker_env: pathlib.Path, tmp_path: pathlib.Path
+    worker_env: pathlib.Path, output_queue: mp.Queue[OutputMessage], tmp_path: pathlib.Path
 ) -> None:
     """Worker returns failed status when stage raises exception."""
     (tmp_path / "input.txt").write_text("data")
@@ -298,72 +188,28 @@ def test_execute_stage_handles_stage_exception(
     def failing_stage() -> None:
         raise RuntimeError("Stage failed intentionally")
 
-    stage_info: WorkerStageInfo = {
-        "func": failing_stage,
-        "fingerprint": {"self:failing_stage": "fp123"},
-        "deps": ["input.txt"],
-        "signature": None,
-        "outs": [],
-        "params": None,
-        "variant": None,
-        "overrides": {},
-        "checkout_modes": ["hardlink", "symlink", "copy"],
-        "run_id": "test_run",
-        "force": False,
-        "no_commit": False,
-        "no_cache": False,
-        "dep_specs": {},
-        "out_specs": {},
-        "params_arg_name": None,
-        "project_root": tmp_path,
-        "state_dir": tmp_path / ".pivot",
-    }
-
-    result = executor.execute_stage(
-        "test_stage",
-        stage_info,
-        worker_env,
-        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
+    stage_info = _make_stage_info(
+        failing_stage, tmp_path, fingerprint={"self:failing_stage": "fp123"}, deps=["input.txt"]
     )
+    result = executor.execute_stage("test_stage", stage_info, worker_env, output_queue)
 
     assert result["status"] == "failed"
     assert "Stage failed intentionally" in result["reason"]
 
 
-def test_execute_stage_handles_sys_exit(worker_env: pathlib.Path, tmp_path: pathlib.Path) -> None:
+def test_execute_stage_handles_sys_exit(
+    worker_env: pathlib.Path, output_queue: mp.Queue[OutputMessage], tmp_path: pathlib.Path
+) -> None:
     """Worker catches sys.exit and returns failed status."""
     (tmp_path / "input.txt").write_text("data")
 
     def exits_stage() -> None:
         sys.exit(42)
 
-    stage_info: WorkerStageInfo = {
-        "func": exits_stage,
-        "fingerprint": {"self:exits_stage": "fp123"},
-        "deps": ["input.txt"],
-        "signature": None,
-        "outs": [],
-        "params": None,
-        "variant": None,
-        "overrides": {},
-        "checkout_modes": ["hardlink", "symlink", "copy"],
-        "run_id": "test_run",
-        "force": False,
-        "no_commit": False,
-        "no_cache": False,
-        "dep_specs": {},
-        "out_specs": {},
-        "params_arg_name": None,
-        "project_root": tmp_path,
-        "state_dir": tmp_path / ".pivot",
-    }
-
-    result = executor.execute_stage(
-        "test_stage",
-        stage_info,
-        worker_env,
-        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
+    stage_info = _make_stage_info(
+        exits_stage, tmp_path, fingerprint={"self:exits_stage": "fp123"}, deps=["input.txt"]
     )
+    result = executor.execute_stage("test_stage", stage_info, worker_env, output_queue)
 
     assert result["status"] == "failed"
     assert "sys.exit" in result["reason"]
@@ -371,7 +217,7 @@ def test_execute_stage_handles_sys_exit(worker_env: pathlib.Path, tmp_path: path
 
 
 def test_execute_stage_handles_keyboard_interrupt(
-    worker_env: pathlib.Path, tmp_path: pathlib.Path
+    worker_env: pathlib.Path, output_queue: mp.Queue[OutputMessage], tmp_path: pathlib.Path
 ) -> None:
     """Worker returns failed status for KeyboardInterrupt."""
     (tmp_path / "input.txt").write_text("data")
@@ -379,33 +225,13 @@ def test_execute_stage_handles_keyboard_interrupt(
     def interrupted_stage() -> None:
         raise KeyboardInterrupt("User cancelled")
 
-    stage_info: WorkerStageInfo = {
-        "func": interrupted_stage,
-        "fingerprint": {"self:interrupted_stage": "fp123"},
-        "deps": ["input.txt"],
-        "signature": None,
-        "outs": [],
-        "params": None,
-        "variant": None,
-        "overrides": {},
-        "checkout_modes": ["hardlink", "symlink", "copy"],
-        "run_id": "test_run",
-        "force": False,
-        "no_commit": False,
-        "no_cache": False,
-        "dep_specs": {},
-        "out_specs": {},
-        "params_arg_name": None,
-        "project_root": tmp_path,
-        "state_dir": tmp_path / ".pivot",
-    }
-
-    result = executor.execute_stage(
-        "test_stage",
-        stage_info,
-        worker_env,
-        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
+    stage_info = _make_stage_info(
+        interrupted_stage,
+        tmp_path,
+        fingerprint={"self:interrupted_stage": "fp123"},
+        deps=["input.txt"],
     )
+    result = executor.execute_stage("test_stage", stage_info, worker_env, output_queue)
 
     assert result["status"] == "failed"
     assert "KeyboardInterrupt" in result["reason"]
@@ -416,7 +242,7 @@ def test_execute_stage_handles_keyboard_interrupt(
 # =============================================================================
 
 
-def test_run_stage_function_captures_stdout() -> None:
+def test_run_stage_function_captures_stdout(output_queue: mp.Queue[OutputMessage]) -> None:
     """Captures stdout from stage function."""
 
     def stage_with_output() -> None:
@@ -425,10 +251,7 @@ def test_run_stage_function_captures_stdout() -> None:
 
     output_lines: list[tuple[str, bool]] = []
     worker._run_stage_function_with_injection(
-        stage_with_output,
-        "test_stage",
-        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
-        output_lines,
+        stage_with_output, "test_stage", output_queue, output_lines
     )
 
     assert len(output_lines) == 2
@@ -436,7 +259,7 @@ def test_run_stage_function_captures_stdout() -> None:
     assert output_lines[1] == ("line2", False)
 
 
-def test_run_stage_function_captures_stderr() -> None:
+def test_run_stage_function_captures_stderr(output_queue: mp.Queue[OutputMessage]) -> None:
     """Captures stderr from stage function."""
 
     def stage_with_errors() -> None:
@@ -445,10 +268,7 @@ def test_run_stage_function_captures_stderr() -> None:
 
     output_lines: list[tuple[str, bool]] = []
     worker._run_stage_function_with_injection(
-        stage_with_errors,
-        "test_stage",
-        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
-        output_lines,
+        stage_with_errors, "test_stage", output_queue, output_lines
     )
 
     assert len(output_lines) == 2
@@ -456,7 +276,7 @@ def test_run_stage_function_captures_stderr() -> None:
     assert output_lines[1] == ("error2", True)
 
 
-def test_run_stage_function_captures_mixed_output() -> None:
+def test_run_stage_function_captures_mixed_output(output_queue: mp.Queue[OutputMessage]) -> None:
     """Captures both stdout and stderr."""
 
     def stage_mixed() -> None:
@@ -465,12 +285,7 @@ def test_run_stage_function_captures_mixed_output() -> None:
         print("stdout2")
 
     output_lines: list[tuple[str, bool]] = []
-    worker._run_stage_function_with_injection(
-        stage_mixed,
-        "test_stage",
-        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
-        output_lines,
-    )
+    worker._run_stage_function_with_injection(stage_mixed, "test_stage", output_queue, output_lines)
 
     assert len(output_lines) == 3
     assert output_lines[0] == ("stdout1", False)
@@ -478,7 +293,7 @@ def test_run_stage_function_captures_mixed_output() -> None:
     assert output_lines[2] == ("stdout2", False)
 
 
-def test_run_stage_function_restores_streams() -> None:
+def test_run_stage_function_restores_streams(output_queue: mp.Queue[OutputMessage]) -> None:
     """Restores original stdout/stderr after execution."""
     original_stdout = sys.stdout
     original_stderr = sys.stderr
@@ -487,18 +302,15 @@ def test_run_stage_function_restores_streams() -> None:
         pass
 
     output_lines: list[tuple[str, bool]] = []
-    worker._run_stage_function_with_injection(
-        noop_stage,
-        "test",
-        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
-        output_lines,
-    )
+    worker._run_stage_function_with_injection(noop_stage, "test", output_queue, output_lines)
 
     assert sys.stdout is original_stdout
     assert sys.stderr is original_stderr
 
 
-def test_run_stage_function_restores_streams_on_exception() -> None:
+def test_run_stage_function_restores_streams_on_exception(
+    output_queue: mp.Queue[OutputMessage],
+) -> None:
     """Restores streams even when stage raises exception."""
     original_stdout = sys.stdout
     original_stderr = sys.stderr
@@ -508,18 +320,13 @@ def test_run_stage_function_restores_streams_on_exception() -> None:
 
     output_lines: list[tuple[str, bool]] = []
     with pytest.raises(RuntimeError):
-        worker._run_stage_function_with_injection(
-            failing_stage,
-            "test",
-            mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
-            output_lines,
-        )
+        worker._run_stage_function_with_injection(failing_stage, "test", output_queue, output_lines)
 
     assert sys.stdout is original_stdout
     assert sys.stderr is original_stderr
 
 
-def test_run_stage_function_captures_partial_lines() -> None:
+def test_run_stage_function_captures_partial_lines(output_queue: mp.Queue[OutputMessage]) -> None:
     """Captures output without trailing newline."""
 
     def stage_no_newline() -> None:
@@ -528,10 +335,7 @@ def test_run_stage_function_captures_partial_lines() -> None:
 
     output_lines: list[tuple[str, bool]] = []
     worker._run_stage_function_with_injection(
-        stage_no_newline,
-        "test_stage",
-        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
-        output_lines,
+        stage_no_newline, "test_stage", output_queue, output_lines
     )
 
     assert len(output_lines) == 1
@@ -543,16 +347,11 @@ def test_run_stage_function_captures_partial_lines() -> None:
 # =============================================================================
 
 
-def test_queue_writer_splits_on_newlines() -> None:
+def test_queue_writer_splits_on_newlines(output_queue: mp.Queue[OutputMessage]) -> None:
     """_QueueWriter splits output on newlines."""
     output_lines: list[tuple[str, bool]] = []
-    queue: mp.Queue[OutputMessage] = mp.Manager().Queue()
-
     writer = worker._QueueWriter(
-        "test_stage",
-        queue,
-        is_stderr=False,
-        output_lines=output_lines,
+        "test_stage", output_queue, is_stderr=False, output_lines=output_lines
     )
 
     bytes_written = writer.write("line1\nline2\n")
@@ -561,16 +360,11 @@ def test_queue_writer_splits_on_newlines() -> None:
     assert output_lines == [("line1", False), ("line2", False)]
 
 
-def test_queue_writer_buffers_partial_lines() -> None:
+def test_queue_writer_buffers_partial_lines(output_queue: mp.Queue[OutputMessage]) -> None:
     """_QueueWriter buffers incomplete lines."""
     output_lines: list[tuple[str, bool]] = []
-    queue: mp.Queue[OutputMessage] = mp.Manager().Queue()
-
     writer = worker._QueueWriter(
-        "test_stage",
-        queue,
-        is_stderr=False,
-        output_lines=output_lines,
+        "test_stage", output_queue, is_stderr=False, output_lines=output_lines
     )
 
     writer.write("partial")
@@ -580,16 +374,11 @@ def test_queue_writer_buffers_partial_lines() -> None:
     assert output_lines == [("partial line", False)]
 
 
-def test_queue_writer_flush_writes_buffer() -> None:
+def test_queue_writer_flush_writes_buffer(output_queue: mp.Queue[OutputMessage]) -> None:
     """_QueueWriter.flush() writes buffered content."""
     output_lines: list[tuple[str, bool]] = []
-    queue: mp.Queue[OutputMessage] = mp.Manager().Queue()
-
     writer = worker._QueueWriter(
-        "test_stage",
-        queue,
-        is_stderr=False,
-        output_lines=output_lines,
+        "test_stage", output_queue, is_stderr=False, output_lines=output_lines
     )
 
     writer.write("no newline")
@@ -599,32 +388,22 @@ def test_queue_writer_flush_writes_buffer() -> None:
     assert output_lines == [("no newline", False)]
 
 
-def test_queue_writer_distinguishes_stderr() -> None:
+def test_queue_writer_distinguishes_stderr(output_queue: mp.Queue[OutputMessage]) -> None:
     """_QueueWriter marks stderr lines correctly."""
     output_lines: list[tuple[str, bool]] = []
-    queue: mp.Queue[OutputMessage] = mp.Manager().Queue()
-
     writer = worker._QueueWriter(
-        "test_stage",
-        queue,
-        is_stderr=True,
-        output_lines=output_lines,
+        "test_stage", output_queue, is_stderr=True, output_lines=output_lines
     )
 
     writer.write("error\n")
     assert output_lines == [("error", True)]
 
 
-def test_queue_writer_handles_multiple_newlines() -> None:
+def test_queue_writer_handles_multiple_newlines(output_queue: mp.Queue[OutputMessage]) -> None:
     """_QueueWriter handles text with multiple consecutive newlines."""
     output_lines: list[tuple[str, bool]] = []
-    queue: mp.Queue[OutputMessage] = mp.Manager().Queue()
-
     writer = worker._QueueWriter(
-        "test_stage",
-        queue,
-        is_stderr=False,
-        output_lines=output_lines,
+        "test_stage", output_queue, is_stderr=False, output_lines=output_lines
     )
 
     writer.write("line1\n\nline2\n")
@@ -632,63 +411,48 @@ def test_queue_writer_handles_multiple_newlines() -> None:
     assert output_lines == [("line1", False), ("line2", False)]
 
 
-def test_queue_writer_empty_flush_does_nothing() -> None:
+def test_queue_writer_empty_flush_does_nothing(output_queue: mp.Queue[OutputMessage]) -> None:
     """_QueueWriter.flush() with empty buffer does nothing."""
     output_lines: list[tuple[str, bool]] = []
-    queue: mp.Queue[OutputMessage] = mp.Manager().Queue()
-
     writer = worker._QueueWriter(
-        "test_stage",
-        queue,
-        is_stderr=False,
-        output_lines=output_lines,
+        "test_stage", output_queue, is_stderr=False, output_lines=output_lines
     )
 
     writer.flush()
     assert output_lines == []
 
 
-def test_queue_writer_isatty_returns_false() -> None:
+def test_queue_writer_isatty_returns_false(output_queue: mp.Queue[OutputMessage]) -> None:
     """_QueueWriter.isatty() returns False."""
     output_lines: list[tuple[str, bool]] = []
-    queue: mp.Queue[OutputMessage] = mp.Manager().Queue()
-
     writer = worker._QueueWriter(
-        "test_stage",
-        queue,
-        is_stderr=False,
-        output_lines=output_lines,
+        "test_stage", output_queue, is_stderr=False, output_lines=output_lines
     )
 
     assert writer.isatty() is False
 
 
-def test_queue_writer_fileno_raises_unsupported_operation() -> None:
+def test_queue_writer_fileno_raises_unsupported_operation(
+    output_queue: mp.Queue[OutputMessage],
+) -> None:
     """_QueueWriter.fileno() raises io.UnsupportedOperation."""
     output_lines: list[tuple[str, bool]] = []
-    queue: mp.Queue[OutputMessage] = mp.Manager().Queue()
-
     writer = worker._QueueWriter(
-        "test_stage",
-        queue,
-        is_stderr=False,
-        output_lines=output_lines,
+        "test_stage", output_queue, is_stderr=False, output_lines=output_lines
     )
 
     with pytest.raises(io.UnsupportedOperation, match="file descriptor"):
         writer.fileno()
 
 
-def test_queue_writer_context_manager_flushes_on_exit() -> None:
+def test_queue_writer_context_manager_flushes_on_exit(
+    output_queue: mp.Queue[OutputMessage],
+) -> None:
     """_QueueWriter context manager flushes buffer on exit."""
     output_lines: list[tuple[str, bool]] = []
-    queue: mp.Queue[OutputMessage] = mp.Manager().Queue()
 
     with worker._QueueWriter(
-        "test_stage",
-        queue,
-        is_stderr=False,
-        output_lines=output_lines,
+        "test_stage", output_queue, is_stderr=False, output_lines=output_lines
     ) as writer:
         writer.write("no newline")
         assert output_lines == []  # Not flushed yet
@@ -697,19 +461,15 @@ def test_queue_writer_context_manager_flushes_on_exit() -> None:
     assert output_lines == [("no newline", False)]
 
 
-def test_queue_writer_context_manager_flushes_on_exception() -> None:
+def test_queue_writer_context_manager_flushes_on_exception(
+    output_queue: mp.Queue[OutputMessage],
+) -> None:
     """_QueueWriter context manager flushes buffer even when exception raised."""
     output_lines: list[tuple[str, bool]] = []
-    queue: mp.Queue[OutputMessage] = mp.Manager().Queue()
 
     with (
         pytest.raises(RuntimeError),
-        worker._QueueWriter(
-            "test_stage",
-            queue,
-            is_stderr=False,
-            output_lines=output_lines,
-        ),
+        worker._QueueWriter("test_stage", output_queue, is_stderr=False, output_lines=output_lines),
     ):
         print("before error")
         raise RuntimeError("test error")
@@ -718,7 +478,9 @@ def test_queue_writer_context_manager_flushes_on_exception() -> None:
     assert output_lines == [("before error", False)]
 
 
-def test_run_stage_function_preserves_output_on_exception() -> None:
+def test_run_stage_function_preserves_output_on_exception(
+    output_queue: mp.Queue[OutputMessage],
+) -> None:
     """Output is preserved even when stage function raises exception."""
 
     def failing_stage() -> None:
@@ -728,10 +490,7 @@ def test_run_stage_function_preserves_output_on_exception() -> None:
     output_lines: list[tuple[str, bool]] = []
     with pytest.raises(RuntimeError):
         worker._run_stage_function_with_injection(
-            failing_stage,
-            "test_stage",
-            mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
-            output_lines,
+            failing_stage, "test_stage", output_queue, output_lines
         )
 
     # Output captured despite exception
@@ -1127,31 +886,29 @@ def test_concurrent_fresh_lock_acquisition(worker_env: pathlib.Path) -> None:
 # =============================================================================
 
 
-def test_hash_dependencies_with_existing_files(tmp_path: pathlib.Path) -> None:
+def test_hash_dependencies_with_existing_files(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """hash_dependencies hashes existing files as FileHash dicts."""
     (tmp_path / "file1.txt").write_text("content1")
     (tmp_path / "file2.txt").write_text("content2")
 
-    old_cwd = os.getcwd()
-    os.chdir(tmp_path)
-    try:
-        hashes, missing, unreadable = executor.hash_dependencies(["file1.txt", "file2.txt"])
+    monkeypatch.chdir(tmp_path)
+    hashes, missing, unreadable = executor.hash_dependencies(["file1.txt", "file2.txt"])
 
-        assert len(hashes) == 2
-        # Keys are now normalized paths (absolute)
-        file1_key = str(tmp_path / "file1.txt")
-        file2_key = str(tmp_path / "file2.txt")
-        assert file1_key in hashes
-        assert file2_key in hashes
-        # File hashes are FileHash dicts with only 'hash' key
-        file_hash = hashes[file1_key]
-        assert file_hash is not None
-        assert "hash" in file_hash
-        assert "manifest" not in file_hash, "Files should not have manifest"
-        assert len(missing) == 0
-        assert len(unreadable) == 0
-    finally:
-        os.chdir(old_cwd)
+    assert len(hashes) == 2
+    # Keys are now normalized paths (absolute)
+    file1_key = str(tmp_path / "file1.txt")
+    file2_key = str(tmp_path / "file2.txt")
+    assert file1_key in hashes
+    assert file2_key in hashes
+    # File hashes are FileHash dicts with only 'hash' key
+    file_hash = hashes[file1_key]
+    assert file_hash is not None
+    assert "hash" in file_hash
+    assert "manifest" not in file_hash, "Files should not have manifest"
+    assert len(missing) == 0
+    assert len(unreadable) == 0
 
 
 def test_hash_dependencies_with_missing_files() -> None:
@@ -1163,33 +920,31 @@ def test_hash_dependencies_with_missing_files() -> None:
     assert len(unreadable) == 0
 
 
-def test_hash_dependencies_with_directory(tmp_path: pathlib.Path) -> None:
+def test_hash_dependencies_with_directory(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """hash_dependencies hashes directories with manifest."""
     data_dir = tmp_path / "data_dir"
     data_dir.mkdir()
     (data_dir / "file.txt").write_text("content")
 
-    old_cwd = os.getcwd()
-    os.chdir(tmp_path)
-    try:
-        hashes, missing, unreadable = executor.hash_dependencies(["data_dir"])
+    monkeypatch.chdir(tmp_path)
+    hashes, missing, unreadable = executor.hash_dependencies(["data_dir"])
 
-        assert len(hashes) == 1, "Directory should be hashed"
-        # Keys are now normalized paths (absolute)
-        data_dir_key = str(tmp_path / "data_dir")
-        assert data_dir_key in hashes
-        dir_hash = hashes[data_dir_key]
-        assert "hash" in dir_hash, "Should have hash key"
-        assert "manifest" in dir_hash, "Directory should include manifest"
-        # Narrow to DirHash via TypeGuard-style assertion
-        assert isinstance(dir_hash.get("manifest"), list)
-        manifest: list[DirManifestEntry] = dir_hash["manifest"]
-        assert len(manifest) == 1, "Manifest should have one file"
-        assert manifest[0]["relpath"] == "file.txt"
-        assert len(missing) == 0, "No missing dependencies"
-        assert len(unreadable) == 0, "No unreadable dependencies"
-    finally:
-        os.chdir(old_cwd)
+    assert len(hashes) == 1, "Directory should be hashed"
+    # Keys are now normalized paths (absolute)
+    data_dir_key = str(tmp_path / "data_dir")
+    assert data_dir_key in hashes
+    dir_hash = hashes[data_dir_key]
+    assert "hash" in dir_hash, "Should have hash key"
+    assert "manifest" in dir_hash, "Directory should include manifest"
+    # Narrow to DirHash via TypeGuard-style assertion
+    assert isinstance(dir_hash.get("manifest"), list)
+    manifest: list[DirManifestEntry] = dir_hash["manifest"]
+    assert len(manifest) == 1, "Manifest should have one file"
+    assert manifest[0]["relpath"] == "file.txt"
+    assert len(missing) == 0, "No missing dependencies"
+    assert len(unreadable) == 0, "No unreadable dependencies"
 
 
 def test_hash_file_produces_consistent_hash(tmp_path: pathlib.Path) -> None:
@@ -1222,63 +977,40 @@ def test_hash_file_different_for_different_content(tmp_path: pathlib.Path) -> No
 # =============================================================================
 
 
-def test_generation_skip_on_second_run(worker_env: pathlib.Path, tmp_path: pathlib.Path) -> None:
+def test_generation_skip_on_second_run(
+    worker_env: pathlib.Path, output_queue: mp.Queue[OutputMessage], tmp_path: pathlib.Path
+) -> None:
     """Second run uses generation-based skip detection."""
-
     (tmp_path / "input.txt").write_text("data")
 
     def stage_func() -> None:
         (tmp_path / "output.txt").write_text("result")
 
     out = outputs.Out(str(tmp_path / "output.txt"), loader=loaders.PathOnly())
-    stage_info: WorkerStageInfo = {
-        "func": stage_func,
-        "fingerprint": {"self:stage_func": "fp123"},
-        "deps": ["input.txt"],
-        "signature": None,
-        "outs": [out],
-        "params": None,
-        "variant": None,
-        "overrides": {},
-        "checkout_modes": ["hardlink", "symlink", "copy"],
-        "run_id": "test_run",
-        "force": False,
-        "no_commit": False,
-        "no_cache": False,
-        "dep_specs": {},
-        "out_specs": {},
-        "params_arg_name": None,
-        "project_root": tmp_path,
-        "state_dir": tmp_path / ".pivot",
-    }
+    stage_info = _make_stage_info(
+        stage_func,
+        tmp_path,
+        fingerprint={"self:stage_func": "fp123"},
+        deps=["input.txt"],
+        outs=[out],
+    )
 
     # First run - creates output and records generations
-    result1 = executor.execute_stage(
-        "test_stage",
-        stage_info,
-        worker_env,
-        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
-    )
+    result1 = executor.execute_stage("test_stage", stage_info, worker_env, output_queue)
     assert result1["status"] == "ran"
     assert (tmp_path / "output.txt").read_text() == "result"
 
     # Second run - should skip via generation check
-    result2 = executor.execute_stage(
-        "test_stage",
-        stage_info,
-        worker_env,
-        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
-    )
+    result2 = executor.execute_stage("test_stage", stage_info, worker_env, output_queue)
     assert result2["status"] == "skipped"
     # Falls back to hash-based skip because input.txt is external (no generation tracking)
     assert "unchanged" in result2["reason"]
 
 
 def test_generation_mismatch_triggers_rerun(
-    worker_env: pathlib.Path, tmp_path: pathlib.Path
+    worker_env: pathlib.Path, output_queue: mp.Queue[OutputMessage], tmp_path: pathlib.Path
 ) -> None:
     """Stage re-runs when dependency generation changes."""
-
     # Create input file (external dependency - no generation tracking)
     (tmp_path / "input.txt").write_text("original")
 
@@ -1293,107 +1025,49 @@ def test_generation_mismatch_triggers_rerun(
     step1_out = outputs.Out(str(tmp_path / "intermediate.txt"), loader=loaders.PathOnly())
     step2_out = outputs.Out(str(tmp_path / "final.txt"), loader=loaders.PathOnly())
 
-    step1_info: WorkerStageInfo = {
-        "func": step1_func,
-        "fingerprint": {"self:step1": "fp1"},
-        "deps": ["input.txt"],
-        "signature": None,
-        "outs": [step1_out],
-        "params": None,
-        "variant": None,
-        "overrides": {},
-        "checkout_modes": ["hardlink", "symlink", "copy"],
-        "run_id": "test_run",
-        "force": False,
-        "no_commit": False,
-        "no_cache": False,
-        "dep_specs": {},
-        "out_specs": {},
-        "params_arg_name": None,
-        "project_root": tmp_path,
-        "state_dir": tmp_path / ".pivot",
-    }
-
-    step2_info: WorkerStageInfo = {
-        "func": step2_func,
-        "fingerprint": {"self:step2": "fp2"},
-        "deps": ["intermediate.txt"],
-        "signature": None,
-        "outs": [step2_out],
-        "params": None,
-        "variant": None,
-        "overrides": {},
-        "checkout_modes": ["hardlink", "symlink", "copy"],
-        "run_id": "test_run",
-        "force": False,
-        "no_commit": False,
-        "no_cache": False,
-        "dep_specs": {},
-        "out_specs": {},
-        "params_arg_name": None,
-        "project_root": tmp_path,
-        "state_dir": tmp_path / ".pivot",
-    }
+    step1_info = _make_stage_info(
+        step1_func,
+        tmp_path,
+        fingerprint={"self:step1": "fp1"},
+        deps=["input.txt"],
+        outs=[step1_out],
+    )
+    step2_info = _make_stage_info(
+        step2_func,
+        tmp_path,
+        fingerprint={"self:step2": "fp2"},
+        deps=["intermediate.txt"],
+        outs=[step2_out],
+    )
 
     # First run - both stages execute
-    result1_step1 = executor.execute_stage(
-        "step1",
-        step1_info,
-        worker_env,
-        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
-    )
+    result1_step1 = executor.execute_stage("step1", step1_info, worker_env, output_queue)
     assert result1_step1["status"] == "ran"
-    result1_step2 = executor.execute_stage(
-        "step2",
-        step2_info,
-        worker_env,
-        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
-    )
+    result1_step2 = executor.execute_stage("step2", step2_info, worker_env, output_queue)
     assert result1_step2["status"] == "ran"
     assert (tmp_path / "final.txt").read_text() == "Final: ORIGINAL"
 
     # Second run - both should skip
-    result2_step1 = executor.execute_stage(
-        "step1",
-        step1_info,
-        worker_env,
-        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
-    )
+    result2_step1 = executor.execute_stage("step1", step1_info, worker_env, output_queue)
     assert result2_step1["status"] == "skipped"
-    result2_step2 = executor.execute_stage(
-        "step2",
-        step2_info,
-        worker_env,
-        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
-    )
+    result2_step2 = executor.execute_stage("step2", step2_info, worker_env, output_queue)
     assert result2_step2["status"] == "skipped"
 
     # Change input - step1 should re-run
     (tmp_path / "input.txt").write_text("modified")
-    result3_step1 = executor.execute_stage(
-        "step1",
-        step1_info,
-        worker_env,
-        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
-    )
+    result3_step1 = executor.execute_stage("step1", step1_info, worker_env, output_queue)
     assert result3_step1["status"] == "ran"
 
     # step2 should re-run because intermediate.txt generation changed
-    result3_step2 = executor.execute_stage(
-        "step2",
-        step2_info,
-        worker_env,
-        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
-    )
+    result3_step2 = executor.execute_stage("step2", step2_info, worker_env, output_queue)
     assert result3_step2["status"] == "ran"
     assert (tmp_path / "final.txt").read_text() == "Final: MODIFIED"
 
 
 def test_external_file_fallback_to_hash_check(
-    worker_env: pathlib.Path, tmp_path: pathlib.Path
+    worker_env: pathlib.Path, output_queue: mp.Queue[OutputMessage], tmp_path: pathlib.Path
 ) -> None:
     """External files (no generation) trigger fallback to hash-based check."""
-
     # Create external input file (not a Pivot output, so no generation)
     (tmp_path / "external_data.txt").write_text("external")
 
@@ -1402,59 +1076,33 @@ def test_external_file_fallback_to_hash_check(
         (tmp_path / "output.txt").write_text(data.upper())
 
     out = outputs.Out(str(tmp_path / "output.txt"), loader=loaders.PathOnly())
-    stage_info: WorkerStageInfo = {
-        "func": stage_func,
-        "fingerprint": {"self:stage_func": "fp123"},
-        "deps": ["external_data.txt"],
-        "signature": None,
-        "outs": [out],
-        "params": None,
-        "variant": None,
-        "overrides": {},
-        "checkout_modes": ["hardlink", "symlink", "copy"],
-        "run_id": "test_run",
-        "force": False,
-        "no_commit": False,
-        "no_cache": False,
-        "dep_specs": {},
-        "out_specs": {},
-        "params_arg_name": None,
-        "project_root": tmp_path,
-        "state_dir": tmp_path / ".pivot",
-    }
+    stage_info = _make_stage_info(
+        stage_func,
+        tmp_path,
+        fingerprint={"self:stage_func": "fp123"},
+        deps=["external_data.txt"],
+        outs=[out],
+    )
 
     # First run
-    result1 = executor.execute_stage(
-        "test_stage",
-        stage_info,
-        worker_env,
-        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
-    )
+    result1 = executor.execute_stage("test_stage", stage_info, worker_env, output_queue)
     assert result1["status"] == "ran"
     assert (tmp_path / "output.txt").read_text() == "EXTERNAL"
 
     # Second run - should skip (external file has no generation, falls back to hash)
-    result2 = executor.execute_stage(
-        "test_stage",
-        stage_info,
-        worker_env,
-        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
-    )
+    result2 = executor.execute_stage("test_stage", stage_info, worker_env, output_queue)
     assert result2["status"] == "skipped"
 
     # Modify external file - should detect change via hash fallback
     (tmp_path / "external_data.txt").write_text("changed")
-    result3 = executor.execute_stage(
-        "test_stage",
-        stage_info,
-        worker_env,
-        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
-    )
+    result3 = executor.execute_stage("test_stage", stage_info, worker_env, output_queue)
     assert result3["status"] == "ran"
     assert (tmp_path / "output.txt").read_text() == "CHANGED"
 
 
-def test_deps_list_change_triggers_rerun(worker_env: pathlib.Path, tmp_path: pathlib.Path) -> None:
+def test_deps_list_change_triggers_rerun(
+    worker_env: pathlib.Path, output_queue: mp.Queue[OutputMessage], tmp_path: pathlib.Path
+) -> None:
     """Changing deps list (even with same fingerprint) triggers re-run via hash check.
 
     Generation tracking only checks current deps, so removing a dep from the list
@@ -1473,78 +1121,37 @@ def test_deps_list_change_triggers_rerun(worker_env: pathlib.Path, tmp_path: pat
     out = outputs.Out(str(tmp_path / "output.txt"), loader=loaders.PathOnly())
 
     # First run with deps=[A, B]
-    stage_info_v1: WorkerStageInfo = {
-        "func": stage_func,
-        "fingerprint": {"self:stage": "fp1"},
-        "deps": [str(tmp_path / "dep_a.txt"), str(tmp_path / "dep_b.txt")],
-        "signature": None,
-        "outs": [out],
-        "params": None,
-        "variant": None,
-        "overrides": {},
-        "checkout_modes": ["hardlink", "symlink", "copy"],
-        "run_id": "test_run",
-        "force": False,
-        "no_commit": False,
-        "no_cache": False,
-        "dep_specs": {},
-        "out_specs": {},
-        "params_arg_name": None,
-        "project_root": tmp_path,
-        "state_dir": tmp_path / ".pivot",
-    }
-
-    result1 = executor.execute_stage(
-        "test_stage",
-        stage_info_v1,
-        worker_env,
-        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
+    stage_info_v1 = _make_stage_info(
+        stage_func,
+        tmp_path,
+        fingerprint={"self:stage": "fp1"},
+        deps=[str(tmp_path / "dep_a.txt"), str(tmp_path / "dep_b.txt")],
+        outs=[out],
     )
+
+    result1 = executor.execute_stage("test_stage", stage_info_v1, worker_env, output_queue)
     assert result1["status"] == "ran"
 
     # Second run with same config - should skip
-    result2 = executor.execute_stage(
-        "test_stage",
-        stage_info_v1,
-        worker_env,
-        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
-    )
+    result2 = executor.execute_stage("test_stage", stage_info_v1, worker_env, output_queue)
     assert result2["status"] == "skipped"
 
     # Third run with deps=[A] only (B removed), DIFFERENT fingerprint
     # This simulates real usage where changing pivot.yaml deps changes fingerprint
-    stage_info_v2: WorkerStageInfo = {
-        "func": stage_func,
-        "fingerprint": {"self:stage": "fp2"},  # Different fingerprint
-        "deps": [str(tmp_path / "dep_a.txt")],  # B removed
-        "signature": None,
-        "outs": [out],
-        "params": None,
-        "variant": None,
-        "overrides": {},
-        "checkout_modes": ["hardlink", "symlink", "copy"],
-        "run_id": "test_run",
-        "force": False,
-        "no_commit": False,
-        "no_cache": False,
-        "dep_specs": {},
-        "out_specs": {},
-        "params_arg_name": None,
-        "project_root": tmp_path,
-        "state_dir": tmp_path / ".pivot",
-    }
-
-    result3 = executor.execute_stage(
-        "test_stage",
-        stage_info_v2,
-        worker_env,
-        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
+    stage_info_v2 = _make_stage_info(
+        stage_func,
+        tmp_path,
+        fingerprint={"self:stage": "fp2"},  # Different fingerprint
+        deps=[str(tmp_path / "dep_a.txt")],  # B removed
+        outs=[out],
     )
+
+    result3 = executor.execute_stage("test_stage", stage_info_v2, worker_env, output_queue)
     assert result3["status"] == "ran", "Fingerprint change should trigger re-run"
 
 
 def test_deps_list_change_same_fingerprint_detected_by_hash(
-    worker_env: pathlib.Path, tmp_path: pathlib.Path
+    worker_env: pathlib.Path, output_queue: mp.Queue[OutputMessage], tmp_path: pathlib.Path
 ) -> None:
     """Even with same fingerprint, deps list change is caught by hash comparison.
 
@@ -1560,64 +1167,28 @@ def test_deps_list_change_same_fingerprint_detected_by_hash(
     out = outputs.Out(str(tmp_path / "output.txt"), loader=loaders.PathOnly())
 
     # First run with deps=[A, B]
-    stage_info_v1: WorkerStageInfo = {
-        "func": stage_func,
-        "fingerprint": {"self:stage": "fp_same"},
-        "deps": [str(tmp_path / "dep_a.txt"), str(tmp_path / "dep_b.txt")],
-        "signature": None,
-        "outs": [out],
-        "params": None,
-        "variant": None,
-        "overrides": {},
-        "checkout_modes": ["hardlink", "symlink", "copy"],
-        "run_id": "test_run",
-        "force": False,
-        "no_commit": False,
-        "no_cache": False,
-        "dep_specs": {},
-        "out_specs": {},
-        "params_arg_name": None,
-        "project_root": tmp_path,
-        "state_dir": tmp_path / ".pivot",
-    }
-
-    result1 = executor.execute_stage(
-        "test_stage",
-        stage_info_v1,
-        worker_env,
-        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
+    stage_info_v1 = _make_stage_info(
+        stage_func,
+        tmp_path,
+        fingerprint={"self:stage": "fp_same"},
+        deps=[str(tmp_path / "dep_a.txt"), str(tmp_path / "dep_b.txt")],
+        outs=[out],
     )
+
+    result1 = executor.execute_stage("test_stage", stage_info_v1, worker_env, output_queue)
     assert result1["status"] == "ran"
 
     # Second run with deps=[A] only (B removed), SAME fingerprint
     # Generation tracking would miss this, but hash comparison catches it
-    stage_info_v2: WorkerStageInfo = {
-        "func": stage_func,
-        "fingerprint": {"self:stage": "fp_same"},  # Same fingerprint!
-        "deps": [str(tmp_path / "dep_a.txt")],  # B removed
-        "signature": None,
-        "outs": [out],
-        "params": None,
-        "variant": None,
-        "overrides": {},
-        "checkout_modes": ["hardlink", "symlink", "copy"],
-        "run_id": "test_run",
-        "force": False,
-        "no_commit": False,
-        "no_cache": False,
-        "dep_specs": {},
-        "out_specs": {},
-        "params_arg_name": None,
-        "project_root": tmp_path,
-        "state_dir": tmp_path / ".pivot",
-    }
-
-    result2 = executor.execute_stage(
-        "test_stage",
-        stage_info_v2,
-        worker_env,
-        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
+    stage_info_v2 = _make_stage_info(
+        stage_func,
+        tmp_path,
+        fingerprint={"self:stage": "fp_same"},  # Same fingerprint!
+        deps=[str(tmp_path / "dep_a.txt")],  # B removed
+        outs=[out],
     )
+
+    result2 = executor.execute_stage("test_stage", stage_info_v2, worker_env, output_queue)
     assert result2["status"] == "ran", (
         "Deps list change should trigger re-run even with same fingerprint"
     )
@@ -1629,7 +1200,10 @@ def test_deps_list_change_same_fingerprint_detected_by_hash(
 
 
 def test_skip_acquires_execution_lock(
-    worker_env: pathlib.Path, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    worker_env: pathlib.Path,
+    output_queue: mp.Queue[OutputMessage],
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Skipped stages still acquire execution lock (TOCTOU prevention).
 
@@ -1642,34 +1216,16 @@ def test_skip_acquires_execution_lock(
         (tmp_path / "output.txt").write_text("result")
 
     out = outputs.Out(str(tmp_path / "output.txt"), loader=loaders.PathOnly())
-    stage_info: WorkerStageInfo = {
-        "func": stage_func,
-        "fingerprint": {"self:stage_func": "fp123"},
-        "deps": ["input.txt"],
-        "signature": None,
-        "outs": [out],
-        "params": None,
-        "variant": None,
-        "overrides": {},
-        "checkout_modes": ["hardlink", "symlink", "copy"],
-        "run_id": "test_run",
-        "force": False,
-        "no_commit": False,
-        "no_cache": False,
-        "dep_specs": {},
-        "out_specs": {},
-        "params_arg_name": None,
-        "project_root": tmp_path,
-        "state_dir": tmp_path / ".pivot",
-    }
+    stage_info = _make_stage_info(
+        stage_func,
+        tmp_path,
+        fingerprint={"self:stage_func": "fp123"},
+        deps=["input.txt"],
+        outs=[out],
+    )
 
     # First run - creates lock file and output
-    result1 = executor.execute_stage(
-        "test_stage",
-        stage_info,
-        worker_env,
-        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
-    )
+    result1 = executor.execute_stage("test_stage", stage_info, worker_env, output_queue)
     assert result1["status"] == "ran"
 
     # Track if execution lock was acquired during second (skip) run
@@ -1688,19 +1244,17 @@ def test_skip_acquires_execution_lock(
     monkeypatch.setattr(lock, "execution_lock", tracking_execution_lock)
 
     # Second run - should skip but still acquire lock
-    result2 = executor.execute_stage(
-        "test_stage",
-        stage_info,
-        worker_env,
-        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
-    )
+    result2 = executor.execute_stage("test_stage", stage_info, worker_env, output_queue)
 
     assert result2["status"] == "skipped"
     assert lock_acquired, "Execution lock should be acquired even when skipping (TOCTOU prevention)"
 
 
 def test_restore_happens_inside_lock(
-    worker_env: pathlib.Path, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    worker_env: pathlib.Path,
+    output_queue: mp.Queue[OutputMessage],
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Output restoration occurs while execution lock is held.
 
@@ -1714,34 +1268,17 @@ def test_restore_happens_inside_lock(
         output_path.write_text("result")
 
     out = outputs.Out(str(output_path), loader=loaders.PathOnly())
-    stage_info: WorkerStageInfo = {
-        "func": stage_func,
-        "fingerprint": {"self:stage_func": "fp123"},
-        "deps": ["input.txt"],
-        "signature": None,
-        "outs": [out],
-        "params": None,
-        "variant": None,
-        "overrides": {},
-        "checkout_modes": ["copy"],  # Use copy mode for simpler testing
-        "run_id": "test_run",
-        "force": False,
-        "no_commit": False,
-        "no_cache": False,
-        "dep_specs": {},
-        "out_specs": {},
-        "params_arg_name": None,
-        "project_root": tmp_path,
-        "state_dir": tmp_path / ".pivot",
-    }
+    stage_info = _make_stage_info(
+        stage_func,
+        tmp_path,
+        fingerprint={"self:stage_func": "fp123"},
+        deps=["input.txt"],
+        outs=[out],
+        checkout_modes=[cache.CheckoutMode.COPY],  # Use copy mode for simpler testing
+    )
 
     # First run - creates lock file and caches output
-    result1 = executor.execute_stage(
-        "test_stage",
-        stage_info,
-        worker_env,
-        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
-    )
+    result1 = executor.execute_stage("test_stage", stage_info, worker_env, output_queue)
     assert result1["status"] == "ran"
 
     # Delete output to force restoration
@@ -1767,12 +1304,7 @@ def test_restore_happens_inside_lock(
     monkeypatch.setattr(worker, "_restore_outputs_from_cache", tracking_restore)
 
     # Second run - should restore output
-    result2 = executor.execute_stage(
-        "test_stage",
-        stage_info,
-        worker_env,
-        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
-    )
+    result2 = executor.execute_stage("test_stage", stage_info, worker_env, output_queue)
 
     assert result2["status"] == "skipped"
     assert output_path.exists(), "Output should be restored"
@@ -1783,7 +1315,9 @@ def test_restore_happens_inside_lock(
     )
 
 
-def test_plain_params_no_auto_load_save(worker_env: pathlib.Path, tmp_path: pathlib.Path) -> None:
+def test_plain_params_no_auto_load_save(
+    worker_env: pathlib.Path, output_queue: mp.Queue[OutputMessage], tmp_path: pathlib.Path
+) -> None:
     """Plain Pydantic params should still work without auto-load/save."""
     output_file = tmp_path / "output.txt"
 
@@ -1791,34 +1325,16 @@ def test_plain_params_no_auto_load_save(worker_env: pathlib.Path, tmp_path: path
         output_file.write_text(f"threshold: {params.threshold}")
 
     out_spec = outputs.Out(str(output_file), loader=loaders.PathOnly())
-
-    stage_info: WorkerStageInfo = {
-        "func": stage_func,
-        "fingerprint": {"self:test": "abc123"},
-        "deps": [],
-        "signature": inspect.signature(stage_func),
-        "outs": [out_spec],
-        "params": _PlainParams(),
-        "variant": None,
-        "overrides": {},
-        "checkout_modes": ["hardlink", "symlink", "copy"],
-        "run_id": "test_run",
-        "force": False,
-        "no_commit": False,
-        "no_cache": False,
-        "dep_specs": {},
-        "out_specs": {},  # Empty - stage writes directly to file, no return-based output
-        "params_arg_name": "params",
-        "project_root": tmp_path,
-        "state_dir": tmp_path / ".pivot",
-    }
-
-    result = executor.execute_stage(
-        "test_stage",
-        stage_info,
-        worker_env,
-        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
+    stage_info = _make_stage_info(
+        stage_func,
+        tmp_path,
+        outs=[out_spec],
+        params=_PlainParams(),
+        signature=inspect.signature(stage_func),
+        params_arg_name="params",
     )
+
+    result = executor.execute_stage("test_stage", stage_info, worker_env, output_queue)
 
     assert result["status"] == "ran"
     assert output_file.exists()
@@ -1838,7 +1354,7 @@ def _stage_with_single_annotated_return() -> Annotated[
 
 
 def test_single_annotated_return_saves_output(
-    worker_env: pathlib.Path, tmp_path: pathlib.Path
+    worker_env: pathlib.Path, output_queue: mp.Queue[OutputMessage], tmp_path: pathlib.Path
 ) -> None:
     """Single Annotated[T, Out(...)] return type saves output correctly.
 
@@ -1853,41 +1369,20 @@ def test_single_annotated_return_saves_output(
     )
     assert single_out_spec is not None, "Should have single output spec"
 
-    stage_info: WorkerStageInfo = {
-        "func": _stage_with_single_annotated_return,
-        "fingerprint": {"self:_stage_with_single_annotated_return": "fp123"},
-        "deps": [],
-        "signature": None,
-        "outs": [],  # Empty - outputs come from return annotation
-        "params": None,
-        "variant": None,
-        "overrides": {},
-        "checkout_modes": ["hardlink", "symlink", "copy"],
-        "run_id": "test_run",
-        "force": False,
-        "no_commit": False,
-        "no_cache": False,
-        "dep_specs": {},
-        "out_specs": {"_single": single_out_spec},  # Single return uses "_single" key convention
-        "params_arg_name": None,
-        "project_root": tmp_path,
-        "state_dir": tmp_path / ".pivot",
-    }
-
-    result = executor.execute_stage(
-        "test_single_return",
-        stage_info,
-        worker_env,
-        mp.Manager().Queue(),  # pyright: ignore[reportArgumentType]
+    stage_info = _make_stage_info(
+        _stage_with_single_annotated_return,
+        tmp_path,
+        fingerprint={"self:_stage_with_single_annotated_return": "fp123"},
+        out_specs={"_single": single_out_spec},  # Single return uses "_single" key convention
     )
+
+    result = executor.execute_stage("test_single_return", stage_info, worker_env, output_queue)
 
     assert result["status"] == "ran", f"Expected ran, got {result}"
 
     # Verify the output file was created via annotation-based save
     output_file = tmp_path / "single_output.json"
     assert output_file.exists(), "Output file should be created from single annotated return"
-
-    import json
 
     with open(output_file) as f:
         content = json.load(f)
@@ -1920,7 +1415,6 @@ def test_joblib_protection_noop_without_joblib(
     """Protection is a no-op when joblib is not installed."""
     import builtins
     import sys
-    from typing import Any
 
     from pivot.executor import worker
 
@@ -1951,24 +1445,22 @@ def test_joblib_protection_noop_without_joblib(
     assert result == "executed", "Function should execute normally without joblib"
 
 
-def test_joblib_protection_uses_threading_backend_via_config() -> None:
+def test_joblib_protection_uses_threading_backend_via_config(mocker: MockerFixture) -> None:
     """Verifies parallel_config is called with threading backend."""
-    from unittest import mock
-
     from pivot.executor import worker
 
     def check_func() -> str:
         return "done"
 
-    with mock.patch("joblib.parallel_config") as mock_config:
-        mock_config.return_value.__enter__ = mock.Mock(return_value=None)
-        mock_config.return_value.__exit__ = mock.Mock(return_value=None)
+    mock_config = mocker.patch("joblib.parallel_config", autospec=True)
+    mock_config.return_value.__enter__ = mocker.Mock(return_value=None)
+    mock_config.return_value.__exit__ = mocker.Mock(return_value=None)
 
-        worker._execute_with_joblib_protection(check_func, {})
+    worker._execute_with_joblib_protection(check_func, {})
 
-        mock_config.assert_called_once()
-        call_kwargs = mock_config.call_args.kwargs
-        assert call_kwargs["backend"] == "threading"
+    mock_config.assert_called_once()
+    call_kwargs = mock_config.call_args.kwargs
+    assert call_kwargs["backend"] == "threading"
 
 
 def test_user_explicit_parallel_config_overrides_protection() -> None:
@@ -1998,17 +1490,19 @@ def test_user_explicit_parallel_config_overrides_protection() -> None:
 # =============================================================================
 
 
-def test_queue_writer_thread_safety_concurrent_writes() -> None:
+@pytest.mark.slow
+def test_queue_writer_thread_safety_concurrent_writes(
+    output_queue: mp.Queue[OutputMessage],
+) -> None:
     """_QueueWriter handles concurrent writes from multiple threads."""
     import concurrent.futures
     import threading
 
     output_lines: list[tuple[str, bool]] = []
-    queue_obj: mp.Queue[OutputMessage] = mp.Manager().Queue()
 
     writer = worker._QueueWriter(
         "test_stage",
-        queue_obj,
+        output_queue,
         is_stderr=False,
         output_lines=output_lines,
     )
@@ -2037,7 +1531,10 @@ def test_queue_writer_thread_safety_concurrent_writes() -> None:
     )
 
 
-def test_queue_writer_thread_safety_atomic_writes() -> None:
+@pytest.mark.slow
+def test_queue_writer_thread_safety_atomic_writes(
+    output_queue: mp.Queue[OutputMessage],
+) -> None:
     """_QueueWriter write() calls are atomic - individual lines are not corrupted.
 
     When multiple threads write complete lines (ending with newline), each line
@@ -2049,11 +1546,10 @@ def test_queue_writer_thread_safety_atomic_writes() -> None:
     import threading
 
     output_lines: list[tuple[str, bool]] = []
-    queue_obj: mp.Queue[OutputMessage] = mp.Manager().Queue()
 
     writer = worker._QueueWriter(
         "test_stage",
-        queue_obj,
+        output_queue,
         is_stderr=False,
         output_lines=output_lines,
     )
@@ -2098,10 +1594,9 @@ def test_queue_writer_thread_safety_atomic_writes() -> None:
 
 def test_joblib_protection_env_var_processes_disables_memmapping(
     monkeypatch: pytest.MonkeyPatch,
+    mocker: MockerFixture,
 ) -> None:
     """PIVOT_NESTED_PARALLELISM=processes uses loky backend with memmapping disabled."""
-    from unittest import mock
-
     from pivot.executor import worker
 
     def stage_func() -> str:
@@ -2109,23 +1604,22 @@ def test_joblib_protection_env_var_processes_disables_memmapping(
 
     monkeypatch.setenv("PIVOT_NESTED_PARALLELISM", "processes")
 
-    with mock.patch("joblib.parallel_config") as mock_config:
-        mock_config.return_value.__enter__ = mock.Mock(return_value=None)
-        mock_config.return_value.__exit__ = mock.Mock(return_value=None)
+    mock_config = mocker.patch("joblib.parallel_config", autospec=True)
+    mock_config.return_value.__enter__ = mocker.Mock(return_value=None)
+    mock_config.return_value.__exit__ = mocker.Mock(return_value=None)
 
-        result = worker._execute_with_joblib_protection(stage_func, {})
+    result = worker._execute_with_joblib_protection(stage_func, {})
 
-        # parallel_config should be called with loky backend and memmapping disabled
-        mock_config.assert_called_once_with(backend="loky", max_nbytes=None)
-        assert result == "done"
+    # parallel_config should be called with loky backend and memmapping disabled
+    mock_config.assert_called_once_with(backend="loky", max_nbytes=None)
+    assert result == "done"
 
 
 def test_joblib_protection_default_uses_threading(
     monkeypatch: pytest.MonkeyPatch,
+    mocker: MockerFixture,
 ) -> None:
     """Default behavior (no env var) uses threading backend."""
-    from unittest import mock
-
     from pivot.executor import worker
 
     def stage_func() -> str:
@@ -2134,13 +1628,13 @@ def test_joblib_protection_default_uses_threading(
     # Ensure env var is not set
     monkeypatch.delenv("PIVOT_NESTED_PARALLELISM", raising=False)
 
-    with mock.patch("joblib.parallel_config") as mock_config:
-        mock_config.return_value.__enter__ = mock.Mock(return_value=None)
-        mock_config.return_value.__exit__ = mock.Mock(return_value=None)
+    mock_config = mocker.patch("joblib.parallel_config", autospec=True)
+    mock_config.return_value.__enter__ = mocker.Mock(return_value=None)
+    mock_config.return_value.__exit__ = mocker.Mock(return_value=None)
 
-        result = worker._execute_with_joblib_protection(stage_func, {})
+    result = worker._execute_with_joblib_protection(stage_func, {})
 
-        mock_config.assert_called_once()
-        call_kwargs = mock_config.call_args.kwargs
-        assert call_kwargs["backend"] == "threading"
-        assert result == "done"
+    mock_config.assert_called_once()
+    call_kwargs = mock_config.call_args.kwargs
+    assert call_kwargs["backend"] == "threading"
+    assert result == "done"

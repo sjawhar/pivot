@@ -4,15 +4,27 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import pytest
+
 from pivot import loaders, outputs, project
 from pivot.storage import cache
 from pivot.tui import diff_panels
-from pivot.types import ChangeType, LockData, OutputChange
+from pivot.types import (
+    ChangeType,
+    CodeChange,
+    DepChange,
+    LockData,
+    MetricValue,
+    OutputChange,
+    ParamChange,
+    StageExplanation,
+    StageStatus,
+)
 
 if TYPE_CHECKING:
     import pathlib
 
-    import pytest
+    from pytest_mock import MockerFixture
 
     from pivot.registry import RegistryStageInfo
 
@@ -366,3 +378,410 @@ def test_output_change_with_plot_type() -> None:
         output_type="plot",
     )
     assert change["output_type"] == "plot"
+
+
+# =============================================================================
+# _escape_padded Tests
+# =============================================================================
+
+
+def test_escape_padded_escapes_markup() -> None:
+    """_escape_padded escapes Rich markup characters in padded text."""
+    # Simple text without markup
+    result = diff_panels._escape_padded("simple", 10)
+    assert result == "simple    "
+    assert len(result) == 10
+
+    # Text with brackets (opening [ gets escaped as \[)
+    result_with_brackets = diff_panels._escape_padded("[test]", 20)
+    assert "\\[" in result_with_brackets
+
+
+# =============================================================================
+# _get_type_label Tests
+# =============================================================================
+
+
+@pytest.mark.parametrize(
+    ("output_type", "expected"),
+    [
+        ("out", "Output"),
+        ("metric", "Metric"),
+        ("plot", "Plot"),
+    ],
+)
+def test_get_type_label(output_type: diff_panels.OutputType, expected: str) -> None:
+    """_get_type_label returns correct labels for output types."""
+    panel = diff_panels.OutputDiffPanel()
+    result = panel._get_type_label(output_type)
+    assert result == expected
+
+
+# =============================================================================
+# _format_metric_value Tests
+# =============================================================================
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        pytest.param(None, "(none)", id="none"),
+        pytest.param(3.14159265, "3.1416", id="float"),
+        pytest.param(42, "42", id="int"),
+        pytest.param("text", "text", id="string"),
+    ],
+)
+def test_format_metric_value(value: MetricValue, expected: str) -> None:
+    """_format_metric_value formats metric values correctly."""
+    panel = diff_panels.OutputDiffPanel()
+    result = panel._format_metric_value(value)
+    assert result == expected
+
+
+# =============================================================================
+# _format_metric_delta Tests
+# =============================================================================
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "expected_pattern"),
+    [
+        pytest.param(None, 1.0, "", id="none_old"),
+        pytest.param(1.0, None, "", id="none_new"),
+        pytest.param(1.0, 2.0, "+1.0000", id="float_increase"),
+        pytest.param(5.0, 3.0, "-2.0000", id="float_decrease"),
+        pytest.param(10, 15, "+5", id="int_increase"),
+        pytest.param(20, 10, "-10", id="int_decrease"),
+    ],
+)
+def test_format_metric_delta(old: MetricValue, new: MetricValue, expected_pattern: str) -> None:
+    """_format_metric_delta formats deltas correctly."""
+    panel = diff_panels.OutputDiffPanel()
+    result = panel._format_metric_delta(old, new)
+    if expected_pattern:
+        assert expected_pattern in result
+    else:
+        assert result == ""
+
+
+# =============================================================================
+# InputDiffPanel _render_empty_state Tests
+# =============================================================================
+
+
+def test_input_panel_empty_state_no_stage() -> None:
+    """InputDiffPanel._render_empty_state shows 'No stage selected' when stage is None."""
+    panel = diff_panels.InputDiffPanel()
+    panel._stage_name = None
+    result = panel._render_empty_state()
+    assert "No stage selected" in result
+
+
+def test_input_panel_empty_state_no_registry() -> None:
+    """InputDiffPanel._render_empty_state shows 'Stage not in registry' when registry_info is None."""
+    panel = diff_panels.InputDiffPanel()
+    panel._stage_name = "some_stage"
+    panel._registry_info = None
+    result = panel._render_empty_state()
+    assert "Stage not in registry" in result
+
+
+def test_input_panel_empty_state_no_explanation() -> None:
+    """InputDiffPanel._render_empty_state shows 'Error loading' when explanation is None."""
+    panel = diff_panels.InputDiffPanel()
+    panel._stage_name = "some_stage"
+    panel._registry_info = {
+        "func": lambda: None,
+        "name": "some_stage",
+        "deps": {},
+        "deps_paths": [],
+        "outs": [],
+        "outs_paths": [],
+        "params": None,
+        "mutex": [],
+        "variant": None,
+        "signature": None,
+        "fingerprint": {},
+        "dep_specs": {},
+        "out_specs": {},
+        "params_arg_name": None,
+    }
+    panel._explanation = None
+    result = panel._render_empty_state()
+    assert "Error loading" in result
+
+
+def test_input_panel_empty_state_no_inputs() -> None:
+    """InputDiffPanel._render_empty_state shows 'No inputs' when all fields set."""
+    panel = diff_panels.InputDiffPanel()
+    panel._stage_name = "some_stage"
+    panel._registry_info = {
+        "func": lambda: None,
+        "name": "some_stage",
+        "deps": {},
+        "deps_paths": [],
+        "outs": [],
+        "outs_paths": [],
+        "params": None,
+        "mutex": [],
+        "variant": None,
+        "signature": None,
+        "fingerprint": {},
+        "dep_specs": {},
+        "out_specs": {},
+        "params_arg_name": None,
+    }
+    panel._explanation = StageExplanation(
+        stage_name="some_stage",
+        will_run=False,
+        is_forced=False,
+        reason="",
+        code_changes=[],
+        dep_changes=[],
+        param_changes=[],
+    )
+    result = panel._render_empty_state()
+    assert "No inputs" in result
+
+
+# =============================================================================
+# OutputDiffPanel _render_empty_state Tests
+# =============================================================================
+
+
+def test_output_panel_empty_state_no_stage() -> None:
+    """OutputDiffPanel._render_empty_state shows 'No stage selected' when stage is None."""
+    panel = diff_panels.OutputDiffPanel()
+    panel._stage_name = None
+    result = panel._render_empty_state()
+    assert "No stage selected" in result
+
+
+def test_output_panel_empty_state_no_registry() -> None:
+    """OutputDiffPanel._render_empty_state shows 'Stage not in registry' when registry_info is None."""
+    panel = diff_panels.OutputDiffPanel()
+    panel._stage_name = "some_stage"
+    panel._registry_info = None
+    result = panel._render_empty_state()
+    assert "Stage not in registry" in result
+
+
+def test_output_panel_empty_state_in_progress() -> None:
+    """OutputDiffPanel._render_empty_state shows 'Running' when stage is IN_PROGRESS."""
+    panel = diff_panels.OutputDiffPanel()
+    panel._stage_name = "some_stage"
+    panel._registry_info = {
+        "func": lambda: None,
+        "name": "some_stage",
+        "deps": {},
+        "deps_paths": [],
+        "outs": [],
+        "outs_paths": [],
+        "params": None,
+        "mutex": [],
+        "variant": None,
+        "signature": None,
+        "fingerprint": {},
+        "dep_specs": {},
+        "out_specs": {},
+        "params_arg_name": None,
+    }
+    panel._stage_status = StageStatus.IN_PROGRESS
+    result = panel._render_empty_state()
+    assert "running" in result.lower()
+
+
+def test_output_panel_empty_state_no_outputs() -> None:
+    """OutputDiffPanel._render_empty_state shows 'No outputs' by default."""
+    panel = diff_panels.OutputDiffPanel()
+    panel._stage_name = "some_stage"
+    panel._registry_info = {
+        "func": lambda: None,
+        "name": "some_stage",
+        "deps": {},
+        "deps_paths": [],
+        "outs": [],
+        "outs_paths": [],
+        "params": None,
+        "mutex": [],
+        "variant": None,
+        "signature": None,
+        "fingerprint": {},
+        "dep_specs": {},
+        "out_specs": {},
+        "params_arg_name": None,
+    }
+    panel._stage_status = None
+    result = panel._render_empty_state()
+    assert "No outputs" in result
+
+
+# =============================================================================
+# InputDiffPanel _is_changed Tests
+# =============================================================================
+
+
+def test_input_panel_is_changed_code_key() -> None:
+    """InputDiffPanel._is_changed returns True for code key in _code_by_key."""
+    panel = diff_panels.InputDiffPanel()
+    panel._code_by_key = {
+        "func_name": CodeChange(
+            key="func_name",
+            change_type=ChangeType.MODIFIED,
+            old_hash="abc",
+            new_hash="def",
+        )
+    }
+    panel._dep_by_path = {}
+    panel._param_by_key = {}
+
+    assert panel._is_changed("code:func_name") is True
+    assert panel._is_changed("code:unknown") is False
+
+
+def test_input_panel_is_changed_dep_path() -> None:
+    """InputDiffPanel._is_changed returns True for dep path in _dep_by_path."""
+    panel = diff_panels.InputDiffPanel()
+    panel._code_by_key = {}
+    panel._dep_by_path = {
+        "/path/to/file.csv": DepChange(
+            path="/path/to/file.csv",
+            change_type=ChangeType.MODIFIED,
+            old_hash="abc",
+            new_hash="def",
+        )
+    }
+    panel._param_by_key = {}
+
+    assert panel._is_changed("dep:/path/to/file.csv") is True
+    assert panel._is_changed("dep:/other/file.csv") is False
+
+
+def test_input_panel_is_changed_param_key() -> None:
+    """InputDiffPanel._is_changed returns True for param key in _param_by_key."""
+    panel = diff_panels.InputDiffPanel()
+    panel._code_by_key = {}
+    panel._dep_by_path = {}
+    panel._param_by_key = {
+        "learning_rate": ParamChange(
+            key="learning_rate",
+            change_type=ChangeType.MODIFIED,
+            old_value=0.01,
+            new_value=0.001,
+        )
+    }
+
+    assert panel._is_changed("param:learning_rate") is True
+    assert panel._is_changed("param:unknown") is False
+
+
+def test_input_panel_is_changed_unknown_type() -> None:
+    """InputDiffPanel._is_changed returns False for unknown item type."""
+    panel = diff_panels.InputDiffPanel()
+    panel._code_by_key = {}
+    panel._dep_by_path = {}
+    panel._param_by_key = {}
+
+    assert panel._is_changed("unknown:something") is False
+
+
+# =============================================================================
+# OutputDiffPanel _is_changed Tests
+# =============================================================================
+
+
+def test_output_panel_is_changed_with_change() -> None:
+    """OutputDiffPanel._is_changed returns True for output with change_type."""
+    panel = diff_panels.OutputDiffPanel()
+    panel._output_by_path = {
+        "/path/to/output.csv": OutputChange(
+            path="/path/to/output.csv",
+            old_hash="abc",
+            new_hash="def",
+            change_type=ChangeType.MODIFIED,
+            output_type="out",
+        )
+    }
+
+    assert panel._is_changed("out:/path/to/output.csv") is True
+
+
+def test_output_panel_is_changed_unchanged() -> None:
+    """OutputDiffPanel._is_changed returns False for output without change_type."""
+    panel = diff_panels.OutputDiffPanel()
+    panel._output_by_path = {
+        "/path/to/output.csv": OutputChange(
+            path="/path/to/output.csv",
+            old_hash="abc",
+            new_hash="abc",
+            change_type=None,  # Unchanged
+            output_type="out",
+        )
+    }
+
+    assert panel._is_changed("out:/path/to/output.csv") is False
+
+
+def test_output_panel_is_changed_not_found() -> None:
+    """OutputDiffPanel._is_changed returns False for unknown path."""
+    panel = diff_panels.OutputDiffPanel()
+    panel._output_by_path = {}
+
+    assert panel._is_changed("out:/unknown/path.csv") is False
+
+
+# =============================================================================
+# set_from_snapshot Tests
+# =============================================================================
+
+
+def test_input_panel_set_from_snapshot(mocker: MockerFixture) -> None:
+    """InputDiffPanel.set_from_snapshot loads snapshot data correctly."""
+    panel = diff_panels.InputDiffPanel()
+
+    # Mock _update_display to verify it's called
+    mock_update = mocker.patch.object(panel, "_update_display", autospec=True)
+    snapshot = StageExplanation(
+        stage_name="test_stage",
+        will_run=True,
+        is_forced=False,
+        reason="Code changed",
+        code_changes=[
+            CodeChange(
+                key="func",
+                change_type=ChangeType.MODIFIED,
+                old_hash="old",
+                new_hash="new",
+            )
+        ],
+        dep_changes=[],
+        param_changes=[],
+    )
+    panel.set_from_snapshot(snapshot)
+
+    assert panel._stage_name == "test_stage"
+    assert panel._explanation == snapshot
+    assert "func" in panel._code_by_key
+    mock_update.assert_called_once()
+
+
+def test_output_panel_set_from_snapshot(mocker: MockerFixture) -> None:
+    """OutputDiffPanel.set_from_snapshot loads snapshot data correctly."""
+    panel = diff_panels.OutputDiffPanel()
+
+    # Mock _update_display to verify it's called
+    mock_update = mocker.patch.object(panel, "_update_display", autospec=True)
+    changes = [
+        OutputChange(
+            path="/path/output.csv",
+            old_hash="old",
+            new_hash="new",
+            change_type=ChangeType.MODIFIED,
+            output_type="out",
+        )
+    ]
+    panel.set_from_snapshot("test_stage", changes)
+
+    assert panel._stage_name == "test_stage"
+    assert "/path/output.csv" in panel._output_by_path
+    mock_update.assert_called_once()

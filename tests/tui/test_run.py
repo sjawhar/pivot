@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import collections
-import multiprocessing as mp
 import pathlib
 import queue as thread_queue
 from typing import TYPE_CHECKING, Annotated, TypedDict
@@ -35,11 +34,7 @@ from pivot.types import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Generator
-    from multiprocessing.managers import SyncManager
-
     from pivot.watch.engine import WatchEngine
-
 
 # =============================================================================
 # Output TypedDicts for annotation-based stages
@@ -121,11 +116,11 @@ def _helper_step3(
 
 
 def _drain_queue(tui_queue: TuiQueue) -> list[TuiMessage]:
-    """Drain all messages from a TUI queue until None sentinel or timeout."""
+    """Drain all messages from a TUI queue until None sentinel or empty."""
     messages = list[TuiMessage]()
     while True:
         try:
-            msg = tui_queue.get(timeout=0.1)
+            msg = tui_queue.get_nowait()
             if msg is None:
                 break
             messages.append(msg)
@@ -135,18 +130,12 @@ def _drain_queue(tui_queue: TuiQueue) -> list[TuiMessage]:
 
 
 @pytest.fixture
-def tui_queue_with_manager() -> Generator[tuple[TuiQueue, SyncManager]]:
-    """Create a TUI queue with proper manager cleanup.
+def tui_queue() -> TuiQueue:
+    """Create a TUI queue for testing.
 
-    TUI queue is stdlib queue.Queue (inter-thread), Manager is kept for
-    any tests that need output_queue (cross-process).
+    TUI queue is stdlib queue.Queue (inter-thread, not cross-process).
     """
-    # Use spawn context to avoid fork-in-multithreaded-context issues (Python 3.13+ deprecation)
-    spawn_ctx = mp.get_context("spawn")
-    manager = spawn_ctx.Manager()
-    tui_queue: TuiQueue = thread_queue.Queue()
-    yield tui_queue, manager
-    manager.shutdown()
+    return thread_queue.Queue()
 
 
 # =============================================================================
@@ -306,10 +295,9 @@ def test_executor_complete(
 
 
 def test_run_tui_app_init(
-    tui_queue_with_manager: tuple[TuiQueue, SyncManager],
+    tui_queue: TuiQueue,
 ) -> None:
     """PivotApp initializes with stage names and queue."""
-    tui_queue, _manager = tui_queue_with_manager
     stage_names = ["stage1", "stage2", "stage3"]
 
     def executor_func() -> dict[str, executor.ExecutionSummary]:
@@ -325,10 +313,9 @@ def test_run_tui_app_init(
 
 
 def test_run_tui_app_stage_info_indexes(
-    tui_queue_with_manager: tuple[TuiQueue, SyncManager],
+    tui_queue: TuiQueue,
 ) -> None:
     """PivotApp assigns correct 1-based indexes to stages."""
-    tui_queue, _manager = tui_queue_with_manager
     stage_names = ["first", "second", "third"]
 
     def executor_func() -> dict[str, executor.ExecutionSummary]:
@@ -351,10 +338,9 @@ def test_run_tui_app_stage_info_indexes(
 
 def test_executor_emits_status_messages_to_queue(
     pipeline_dir: pathlib.Path,
-    tui_queue_with_manager: tuple[TuiQueue, SyncManager],
+    tui_queue: TuiQueue,
 ) -> None:
     """Executor emits TuiStatusMessage for stage start and completion."""
-    tui_queue, _manager = tui_queue_with_manager
     (pipeline_dir / "input.txt").write_text("hello")
 
     register_test_stage(_helper_process, name="process")
@@ -386,10 +372,9 @@ def test_executor_emits_status_messages_to_queue(
 
 def test_executor_emits_log_messages_to_queue(
     pipeline_dir: pathlib.Path,
-    tui_queue_with_manager: tuple[TuiQueue, SyncManager],
+    tui_queue: TuiQueue,
 ) -> None:
     """Executor emits TuiLogMessage for stage output."""
-    tui_queue, _manager = tui_queue_with_manager
     (pipeline_dir / "input.txt").write_text("hello")
 
     register_test_stage(_helper_process_print, name="process")
@@ -405,10 +390,9 @@ def test_executor_emits_log_messages_to_queue(
 
 def test_executor_emits_failed_status_on_stage_failure(
     pipeline_dir: pathlib.Path,
-    tui_queue_with_manager: tuple[TuiQueue, SyncManager],
+    tui_queue: TuiQueue,
 ) -> None:
     """Executor emits FAILED status when stage raises an exception."""
-    tui_queue, _manager = tui_queue_with_manager
     (pipeline_dir / "input.txt").write_text("hello")
 
     register_test_stage(_helper_failing_stage, name="failing_stage")
@@ -427,10 +411,9 @@ def test_executor_emits_failed_status_on_stage_failure(
 
 def test_executor_emits_status_for_multiple_stages(
     pipeline_dir: pathlib.Path,
-    tui_queue_with_manager: tuple[TuiQueue, SyncManager],
+    tui_queue: TuiQueue,
 ) -> None:
     """Executor emits status messages for all stages in multi-stage pipeline."""
-    tui_queue, _manager = tui_queue_with_manager
     (pipeline_dir / "input.txt").write_text("hello")
 
     register_test_stage(_helper_step1, name="step1")
@@ -455,10 +438,9 @@ def test_executor_emits_status_for_multiple_stages(
 
 def test_executor_status_includes_correct_index_and_total(
     pipeline_dir: pathlib.Path,
-    tui_queue_with_manager: tuple[TuiQueue, SyncManager],
+    tui_queue: TuiQueue,
 ) -> None:
     """Executor status messages include correct index and total counts."""
-    tui_queue, _manager = tui_queue_with_manager
     (pipeline_dir / "input.txt").write_text("hello")
 
     register_test_stage(_helper_step1, name="step1")
@@ -566,22 +548,14 @@ def test_confirm_commit_screen_instantiation() -> None:
 
 
 @pytest.fixture
-def mock_tui_queue() -> Generator[TuiQueue]:
-    """Create a mock TUI queue for testing."""
-    # TUI queue uses stdlib queue.Queue (inter-thread, not cross-process)
-    tui_queue: TuiQueue = thread_queue.Queue()
-    yield tui_queue
-
-
-@pytest.fixture
-def simple_run_app(mock_tui_queue: TuiQueue) -> run_tui.PivotApp:
+def simple_run_app(tui_queue: TuiQueue) -> run_tui.PivotApp:
     """Create a simple PivotApp for testing."""
 
     def executor_func() -> dict[str, executor.ExecutionSummary]:
         return {}
 
     return run_tui.PivotApp(
-        mock_tui_queue,
+        tui_queue,
         stage_names=["stage1", "stage2", "stage3"],
         executor_func=executor_func,
     )
@@ -681,14 +655,14 @@ async def test_run_app_quit_action(simple_run_app: run_tui.PivotApp) -> None:
 
 
 @pytest.mark.asyncio
-async def test_run_app_stages_shown(mock_tui_queue: TuiQueue) -> None:
+async def test_run_app_stages_shown(tui_queue: TuiQueue) -> None:
     """Stage names appear in the app."""
     stage_names = ["alpha", "beta", "gamma"]
 
     def executor_func() -> dict[str, executor.ExecutionSummary]:
         return {}
 
-    app = run_tui.PivotApp(mock_tui_queue, stage_names=stage_names, executor_func=executor_func)
+    app = run_tui.PivotApp(tui_queue, stage_names=stage_names, executor_func=executor_func)
 
     async with app.run_test() as pilot:
         await pilot.pause()

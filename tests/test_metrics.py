@@ -8,17 +8,17 @@ import pytest
 from pivot import metrics
 
 if TYPE_CHECKING:
+    from collections.abc import Generator
+
     from pytest import MonkeyPatch
 
 
 @pytest.fixture(autouse=True)
-def reset_metrics():
+def reset_metrics() -> Generator[None]:
     """Reset metrics state before each test."""
     metrics.clear()
-    # Save original enabled state
     original_enabled = metrics._enabled
     yield
-    # Restore original state after test
     metrics.clear()
     metrics._enabled = original_enabled
 

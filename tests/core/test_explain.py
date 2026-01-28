@@ -1,6 +1,6 @@
 """Tests for explain module - detailed change explanations."""
 
-import os
+import contextlib
 import pathlib
 from pathlib import Path
 from typing import Annotated, ClassVar, TypedDict
@@ -671,31 +671,31 @@ def test_get_stage_explanation_force_with_missing_deps(tmp_path: Path) -> None:
 
 def test_get_pipeline_explanations_upstream_propagation(tmp_path: Path) -> None:
     """get_pipeline_explanations propagates staleness to downstream stages."""
-    os.chdir(tmp_path)
-    pathlib.Path(".git").mkdir()
-    pathlib.Path("input.txt").write_text("data")
+    with contextlib.chdir(tmp_path):
+        pathlib.Path(".git").mkdir()
+        pathlib.Path("input.txt").write_text("data")
 
-    # Register and run initial pipeline
-    register_test_stage(_helper_stage_a_v1, name="stage_a")
-    register_test_stage(_helper_stage_b, name="stage_b")
+        # Register and run initial pipeline
+        register_test_stage(_helper_stage_a_v1, name="stage_a")
+        register_test_stage(_helper_stage_b, name="stage_b")
 
-    executor.run(show_output=False)
+        executor.run(show_output=False)
 
-    # Modify stage_a's code (re-register with different implementation)
-    REGISTRY._stages.clear()
-    register_test_stage(_helper_stage_a_v2, name="stage_a")
-    register_test_stage(_helper_stage_b, name="stage_b")
+        # Modify stage_a's code (re-register with different implementation)
+        REGISTRY._stages.clear()
+        register_test_stage(_helper_stage_a_v2, name="stage_a")
+        register_test_stage(_helper_stage_b, name="stage_b")
 
-    # Get pipeline explanations
-    explanations = status.get_pipeline_explanations(stages=None, single_stage=False)
+        # Get pipeline explanations
+        explanations = status.get_pipeline_explanations(stages=None, single_stage=False)
 
-    # Find stage_b's explanation
-    stage_b_exp = next((e for e in explanations if e["stage_name"] == "stage_b"), None)
-    assert stage_b_exp is not None, "stage_b should be in explanations"
+        # Find stage_b's explanation
+        stage_b_exp = next((e for e in explanations if e["stage_name"] == "stage_b"), None)
+        assert stage_b_exp is not None, "stage_b should be in explanations"
 
-    # stage_b should show as stale due to upstream
-    assert stage_b_exp["will_run"] is True, "stage_b should run due to upstream staleness"
-    assert "upstream_stale" in stage_b_exp, "stage_b should have upstream_stale field"
-    assert "stage_a" in stage_b_exp["upstream_stale"], (
-        "stage_b should list stage_a as stale upstream"
-    )
+        # stage_b should show as stale due to upstream
+        assert stage_b_exp["will_run"] is True, "stage_b should run due to upstream staleness"
+        assert "upstream_stale" in stage_b_exp, "stage_b should have upstream_stale field"
+        assert "stage_a" in stage_b_exp["upstream_stale"], (
+            "stage_b should list stage_a as stale upstream"
+        )
