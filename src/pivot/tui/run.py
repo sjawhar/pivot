@@ -21,7 +21,7 @@ from typing import (
 
 import filelock
 import loky
-import loky.process_executor  # pyright: ignore[reportMissingTypeStubs]
+import loky.process_executor
 import rich.markup
 import textual  # for textual.work decorator
 import textual.app
