@@ -2,16 +2,20 @@ from __future__ import annotations
 
 import html
 import json
+import logging
+import os
 import pathlib
 from typing import TYPE_CHECKING, TypedDict, cast
 
-from pivot import config, outputs, project
+from pivot import config, git, outputs, project
 from pivot.show import common
 from pivot.storage import cache, lock
 from pivot.types import ChangeType, OutputFormat
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
+
+logger = logging.getLogger(__name__)
 
 
 class PlotInfo(TypedDict):
@@ -130,6 +134,32 @@ def get_plot_hashes_from_head() -> dict[str, str | None]:
     return result
 
 
+def get_output_hashes_from_revision(rev: str) -> dict[str, str | None]:
+    """Read output hashes from lock files at a git revision; empty dict on error."""
+    result = dict[str, str | None]()
+
+    lock_files = git.list_files_at_revision(lock.STAGES_REL_PATH, rev, "*.lock")
+    if not lock_files:
+        return result
+
+    stage_names = [pathlib.Path(f).stem for f in lock_files]
+    lock_data_map = common.read_lock_files_from_revision(stage_names, rev)
+
+    for lock_data in lock_data_map.values():
+        if lock_data is None:
+            continue
+
+        path_to_hash = common.extract_output_hashes_from_lock(lock_data)
+        for path, hash_val in path_to_hash.items():
+            normalized = os.path.normpath(path)
+            if normalized in result and result[normalized] != hash_val:
+                msg = f"Conflicting hashes for output path '{normalized}' at revision {rev}: {result[normalized]} vs {hash_val}"
+                raise ValueError(msg)
+            result[normalized] = hash_val
+
+    return result
+
+
 def get_plot_hashes_from_workspace(
     paths: Sequence[str],
 ) -> dict[str, str]:
@@ -148,9 +178,9 @@ def get_plot_hashes_from_workspace(
 
 def diff_plots(
     old: Mapping[str, str | None],
-    new: Mapping[str, str],
+    new: Mapping[str, str | None],
 ) -> list[PlotDiffEntry]:
-    """Compare lock file hashes vs workspace hashes."""
+    """Compare plot hashes between two sources (HEAD vs workspace, or rev vs rev)."""
     diffs = list[PlotDiffEntry]()
     all_paths = set(old.keys()) | set(new.keys())
 
@@ -158,7 +188,7 @@ def diff_plots(
         old_hash = old.get(path)
         new_hash = new.get(path)
 
-        # Not in old OR old_hash is None means no previous version
+        # No previous version (not in old OR old_hash is None)
         if path not in old or old_hash is None:
             if new_hash is not None:
                 diffs.append(
@@ -166,6 +196,7 @@ def diff_plots(
                         path=path, old_hash=None, new_hash=new_hash, change_type=ChangeType.ADDED
                     )
                 )
+            # Both None: silently ignore (not tracked in either source)
         elif path not in new or new_hash is None:
             diffs.append(
                 PlotDiffEntry(
