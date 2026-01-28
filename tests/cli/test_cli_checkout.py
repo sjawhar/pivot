@@ -98,6 +98,38 @@ def test_checkout_tracked_file(runner: click.testing.CliRunner, tmp_path: pathli
         assert "Restored" in result.output
 
 
+def test_checkout_accepts_pvt_file_path(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """Checkout accepts .pvt file paths and restores the corresponding data file."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        cache_dir = pathlib.Path(".pivot") / "cache" / "files"
+        cache_dir.mkdir(parents=True)
+
+        # Create a file, save to cache, then track it
+        data_file = pathlib.Path("data.txt")
+        data_file.write_text("tracked content")
+        output_hash = cache.save_to_cache(data_file, cache_dir)
+        assert output_hash is not None
+
+        # Create .pvt tracking file
+        pvt_data = track.PvtData(path="data.txt", hash=output_hash["hash"], size=15)
+        track.write_pvt_file(pathlib.Path("data.txt.pvt"), pvt_data)
+
+        # Delete original file
+        data_file.unlink()
+        assert not data_file.exists()
+
+        # Checkout using .pvt path should restore the data file
+        result = runner.invoke(cli.cli, ["checkout", "data.txt.pvt"])
+
+        assert result.exit_code == 0, f"Failed: {result.output}"
+        assert data_file.exists()
+        assert data_file.read_text() == "tracked content"
+        assert "Restored" in result.output
+
+
 def test_checkout_all_tracked_files(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:

@@ -123,6 +123,11 @@ def _checkout_target(
     if track.has_path_traversal(target):
         raise click.ClickException(f"Path traversal not allowed: {target}")
 
+    # Convert .pvt file paths to their corresponding data paths
+    target_path = pathlib.Path(target)
+    if target_path.suffix == ".pvt":
+        target = str(track.get_data_path(target_path))
+
     # Use normalized path (preserve symlinks) to match keys in tracked_files/stage_outputs
     abs_path = project.normalize_path(target)
     abs_path_str = str(abs_path)
