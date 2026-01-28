@@ -407,6 +407,32 @@ def test_verify_allow_missing_code_changed_still_fails(
         assert "Code changed" in result.output
 
 
+def test_verify_allow_missing_without_prior_run(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, mocker: MockerFixture
+) -> None:
+    """verify --allow-missing works when dep files missing (CI scenario).
+
+    This tests the fix for the bug where DAG validation raised
+    DependencyNotFoundError before --allow-missing logic could run.
+
+    Scenario: CI clone has no dep files yet, but they would exist after setup.
+    With validate=False, DAG building doesn't error on missing deps.
+    """
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+
+        register_test_stage(_helper_process, name="process")
+
+        _setup_mock_remote(mocker, files_exist_on_remote=True)
+
+        result = runner.invoke(cli.cli, ["verify", "--allow-missing"])
+
+        # Should NOT raise DependencyNotFoundError during DAG building
+        assert "does not exist on disk" not in result.output, f"Got error: {result.output}"
+        # Verification fails (exit 1) because stage is stale, but command completes
+        assert result.exit_code == 1
+
+
 # =============================================================================
 # JSON Output Tests
 # =============================================================================

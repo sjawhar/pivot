@@ -52,8 +52,7 @@ def validate_stages_exist(stages: list[str] | None) -> None:
     """Validate that specified stages exist in the registry."""
     if not stages:
         return
-    graph = registry.REGISTRY.build_dag(validate=True)
-    registered = set(graph.nodes())
+    registered = set(registry.REGISTRY.list_stages())
     unknown = [s for s in stages if s not in registered]
     if unknown:
         raise exceptions.StageNotFoundError(unknown, available_stages=list(registered))

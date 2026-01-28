@@ -242,7 +242,11 @@ def verify(
     cache_dir = config.get_cache_dir()
 
     # Get pipeline status (uses default state directory internally)
-    pipeline_status, _ = status_mod.get_pipeline_status(stages_list, single_stage=False)
+    # When allow_missing is set, skip DAG validation so missing dependency files
+    # don't cause DependencyNotFoundError before we can check the remote
+    pipeline_status, _ = status_mod.get_pipeline_status(
+        stages_list, single_stage=False, validate=not allow_missing
+    )
 
     if not pipeline_status:
         raise click.ClickException("No stages to verify.")

@@ -164,10 +164,18 @@ def _compute_explanations_with_upstream(
 def get_pipeline_status(
     stages: list[str] | None,
     single_stage: bool,
+    validate: bool = True,
 ) -> tuple[list[PipelineStatusInfo], DiGraph[str]]:
-    """Get status for all stages, tracking upstream staleness."""
+    """Get status for all stages, tracking upstream staleness.
+
+    Args:
+        stages: Stage names to check, or None for all stages.
+        single_stage: If True, check only specified stages without dependencies.
+        validate: If True, validate dependency files exist during DAG building.
+            Set to False with --allow-missing to skip validation.
+    """
     with metrics.timed("status.get_pipeline_status"):
-        graph = registry.REGISTRY.build_dag(validate=True)
+        graph = registry.REGISTRY.build_dag(validate=validate)
         execution_order = dag.get_execution_order(graph, stages, single_stage=single_stage)
 
         if not execution_order:
