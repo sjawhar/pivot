@@ -406,3 +406,175 @@ stages:
 
     result = completion.complete_targets(mock_ctx, mock_param, "t")
     assert set(result) == {"train", "test"}
+
+
+# =============================================================================
+# complete_config_keys tests
+# =============================================================================
+
+
+def test_complete_config_keys_returns_static_keys(
+    mock_ctx: click.Context,
+    mock_param: click.Parameter,
+) -> None:
+    """Returns static config keys with descriptions."""
+    result = completion.complete_config_keys(mock_ctx, mock_param, "")
+    values = [item.value for item in result]
+    assert "cache.dir" in values
+    assert "core.max_workers" in values
+    assert "display.precision" in values
+    # Verify descriptions are present
+    cache_dir = next(item for item in result if item.value == "cache.dir")
+    assert cache_dir.help is not None
+
+
+def test_complete_config_keys_filters_by_prefix(
+    mock_ctx: click.Context,
+    mock_param: click.Parameter,
+) -> None:
+    """Filters keys by incomplete prefix."""
+    result = completion.complete_config_keys(mock_ctx, mock_param, "cache")
+    values = [item.value for item in result]
+    assert "cache.dir" in values
+    assert "cache.checkout_mode" in values
+    assert "core.max_workers" not in values
+
+
+def test_complete_config_keys_includes_local_remotes(
+    tmp_path: Path,
+    mock_ctx: click.Context,
+    mock_param: click.Parameter,
+    mocker: MockerFixture,
+) -> None:
+    """Includes existing remote names from local config."""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("remotes:\n  origin: s3://bucket\n")
+    mocker.patch.object(
+        completion,
+        "_get_config_paths",
+        return_value=[tmp_path / "nonexistent.yaml", config_path],
+    )
+
+    result = completion.complete_config_keys(mock_ctx, mock_param, "remotes")
+    values = [item.value for item in result]
+    assert "remotes.origin" in values
+
+
+def test_complete_config_keys_includes_global_remotes(
+    tmp_path: Path,
+    mock_ctx: click.Context,
+    mock_param: click.Parameter,
+    mocker: MockerFixture,
+) -> None:
+    """Includes existing remote names from global config."""
+    global_config = tmp_path / "global.yaml"
+    global_config.write_text("remotes:\n  backup: s3://backup-bucket\n")
+    mocker.patch.object(
+        completion,
+        "_get_config_paths",
+        return_value=[global_config],
+    )
+
+    result = completion.complete_config_keys(mock_ctx, mock_param, "remotes")
+    values = [item.value for item in result]
+    assert "remotes.backup" in values
+
+
+def test_complete_config_keys_merges_both_configs(
+    tmp_path: Path,
+    mock_ctx: click.Context,
+    mock_param: click.Parameter,
+    mocker: MockerFixture,
+) -> None:
+    """Merges remotes from both global and local configs."""
+    global_config = tmp_path / "global.yaml"
+    global_config.write_text("remotes:\n  backup: s3://backup\n")
+    local_config = tmp_path / "local.yaml"
+    local_config.write_text("remotes:\n  origin: s3://origin\n")
+    mocker.patch.object(
+        completion,
+        "_get_config_paths",
+        return_value=[global_config, local_config],
+    )
+
+    result = completion.complete_config_keys(mock_ctx, mock_param, "remotes")
+    values = [item.value for item in result]
+    assert "remotes.backup" in values
+    assert "remotes.origin" in values
+
+
+def test_complete_config_keys_filters_invalid_remote_names(
+    tmp_path: Path,
+    mock_ctx: click.Context,
+    mock_param: click.Parameter,
+    mocker: MockerFixture,
+) -> None:
+    """Filters out remote names with invalid characters."""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "remotes:\n  valid-name: s3://a\n  'has.dot': s3://b\n  'has space': s3://c\n"
+    )
+    mocker.patch.object(
+        completion,
+        "_get_config_paths",
+        return_value=[config_path],
+    )
+
+    result = completion.complete_config_keys(mock_ctx, mock_param, "remotes")
+    values = [item.value for item in result]
+    assert "remotes.valid-name" in values
+    assert "remotes.has.dot" not in values
+    assert "remotes.has space" not in values
+
+
+def test_complete_config_keys_returns_empty_on_exception(
+    mock_ctx: click.Context,
+    mock_param: click.Parameter,
+    mocker: MockerFixture,
+) -> None:
+    """Returns empty list if exception occurs."""
+    mocker.patch.object(completion, "_get_config_keys", side_effect=Exception("boom"))
+    result = completion.complete_config_keys(mock_ctx, mock_param, "")
+    assert result == []
+
+
+def test_complete_config_keys_handles_malformed_yaml(
+    tmp_path: Path,
+    mock_ctx: click.Context,
+    mock_param: click.Parameter,
+    mocker: MockerFixture,
+) -> None:
+    """Handles malformed YAML gracefully, returns static keys."""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("invalid: yaml: [[[")
+    mocker.patch.object(
+        completion,
+        "_get_config_paths",
+        return_value=[config_path],
+    )
+
+    result = completion.complete_config_keys(mock_ctx, mock_param, "cache")
+    values = [item.value for item in result]
+    # Should still return static keys
+    assert "cache.dir" in values
+
+
+def test_complete_config_keys_handles_remotes_not_dict(
+    tmp_path: Path,
+    mock_ctx: click.Context,
+    mock_param: click.Parameter,
+    mocker: MockerFixture,
+) -> None:
+    """Handles remotes: null or remotes: 'string' gracefully."""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("remotes: null\n")
+    mocker.patch.object(
+        completion,
+        "_get_config_paths",
+        return_value=[config_path],
+    )
+
+    result = completion.complete_config_keys(mock_ctx, mock_param, "")
+    # Should not crash, returns static keys
+    values = [item.value for item in result]
+    assert "cache.dir" in values
