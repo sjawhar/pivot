@@ -549,10 +549,9 @@ def _verify_tracked_files(project_root: pathlib.Path, checkout_missing: bool = F
 
     with metrics.timed("core.verify_tracked_files"):
         missing = list[str]()
-        state_db_path = config.get_state_dir() / "state.db"
         cache_dir = config.get_cache_dir() / "files"
 
-        with state_mod.StateDB(state_db_path) as state_db:
+        with state_mod.StateDB(config.get_state_db_path()) as state_db:
             for data_path, track_data in tracked_files.items():
                 path = pathlib.Path(data_path)
 
@@ -661,7 +660,7 @@ def _execute_greedy(
     assert output_queue is not None
 
     state_dir = config.get_state_dir()
-    state_db_path = state_dir / "state.db"
+    state_db_path = config.get_state_db_path()
     proj_root = project.get_project_root()
     output_thread: threading.Thread | None = None
 
@@ -1207,7 +1206,6 @@ def _write_run_history(
         stages=stages_records,
     )
 
-    state_db_path = config.get_state_dir() / "state.db"
-    with state_mod.StateDB(state_db_path) as state_db:
+    with state_mod.StateDB(config.get_state_db_path()) as state_db:
         state_db.write_run(manifest)
         state_db.prune_runs(retention)

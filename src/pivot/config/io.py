@@ -316,6 +316,11 @@ def get_state_dir() -> pathlib.Path:
     return state_dir
 
 
+def get_state_db_path() -> pathlib.Path:
+    """Get path to the StateDB LMDB database."""
+    return get_state_dir() / "state.db"
+
+
 def get_max_workers() -> int:
     """Get max workers from merged config."""
     merged = get_merged_config()

@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 
 import click
 
-from pivot import project
+from pivot import config
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
 from pivot.storage import state
@@ -24,7 +24,7 @@ def history(ctx: click.Context, limit: int, output_json: bool) -> None:
     cli_ctx = cli_helpers.get_cli_context(ctx)
     quiet = cli_ctx["quiet"]
 
-    state_db_path = project.get_project_root() / ".pivot" / "state.db"
+    state_db_path = config.get_state_db_path()
 
     with state.StateDB(state_db_path) as state_db:
         runs = state_db.list_runs(limit=limit)
@@ -72,7 +72,7 @@ def show_cmd(ctx: click.Context, run_id: str | None, output_json: bool) -> None:
     cli_ctx = cli_helpers.get_cli_context(ctx)
     quiet = cli_ctx["quiet"]
 
-    state_db_path = project.get_project_root() / ".pivot" / "state.db"
+    state_db_path = config.get_state_db_path()
 
     with state.StateDB(state_db_path) as state_db:
         if run_id:

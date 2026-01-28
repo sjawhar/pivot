@@ -1317,3 +1317,402 @@ def test_code_manifest_sorted_in_lock_file():
     actual_order = sorted(positions.keys(), key=lambda k: positions[k])
 
     assert actual_order == sorted_keys, f"Expected {sorted_keys}, got {actual_order}"
+
+
+# ==============================================================================
+# Persistent cache tests
+# ==============================================================================
+
+
+def test_should_skip_persistent_cache_closure():
+    """Closures with <locals> in qualname should skip persistent cache."""
+
+    def outer():
+        def inner():
+            return 42
+
+        return inner
+
+    closure_func = outer()
+    # The closure has "<locals>" in its qualname
+    assert "<locals>" in closure_func.__qualname__
+    assert fingerprint._should_skip_persistent_cache(closure_func) is True
+
+
+def test_should_skip_persistent_cache_wrapped():
+    """Wrapped functions should skip persistent cache."""
+    import functools
+
+    def original():
+        return 42
+
+    @functools.wraps(original)
+    def wrapper():
+        return original()
+
+    assert hasattr(wrapper, "__wrapped__")
+    assert fingerprint._should_skip_persistent_cache(wrapper) is True
+
+
+def test_should_skip_persistent_cache_normal_function():
+    """Normal module-level functions should not skip persistent cache."""
+    # _helper_for_hash_test_1 is a module-level function
+    assert fingerprint._should_skip_persistent_cache(_helper_for_hash_test_1) is False
+
+
+def test_get_func_source_info_normal_function():
+    """Should return source info for normal functions."""
+    # _helper_for_hash_test_1 is defined in this file
+    result = fingerprint._get_func_source_info(_helper_for_hash_test_1)
+
+    assert result is not None
+    rel_path, mtime_ns, size, inode = result
+    assert "test_fingerprint.py" in rel_path
+    assert mtime_ns > 0
+    assert size > 0
+    assert inode > 0
+
+
+def test_get_func_source_info_builtin():
+    """Should return None for builtins."""
+    result = fingerprint._get_func_source_info(len)
+    assert result is None
+
+
+def test_get_func_source_info_lambda():
+    """Lambdas defined in source files should have source info."""
+    my_lambda = lambda x: x * 2  # noqa: E731
+    result = fingerprint._get_func_source_info(my_lambda)
+
+    # Lambdas in actual source files (like this test file) have source info
+    assert result is not None, "Lambda in test file should have source info"
+    rel_path, mtime_ns, size, inode = result
+    assert "test_fingerprint.py" in rel_path
+    assert mtime_ns > 0
+    assert size > 0
+    assert inode > 0
+
+
+def test_flush_ast_hash_cache_empty():
+    """Flushing empty pending writes should not error."""
+    # Clear any pending writes first
+    fingerprint._pending_ast_writes.clear()
+    # Should not raise
+    fingerprint.flush_ast_hash_cache()
+
+
+@pytest.fixture
+def reset_fingerprint_cache_state(monkeypatch):
+    """Reset fingerprint module state for testing persistent cache behavior."""
+    # Save original state
+    orig_pending = fingerprint._pending_ast_writes.copy()
+    orig_db = fingerprint._state_db
+    orig_attempted = fingerprint._state_db_init_attempted
+
+    # Reset state
+    fingerprint._pending_ast_writes.clear()
+    fingerprint._hash_function_ast_cache.clear()
+    fingerprint._state_db = None
+    fingerprint._state_db_init_attempted = False
+
+    yield
+
+    # Restore original state
+    fingerprint._pending_ast_writes.clear()
+    fingerprint._pending_ast_writes.extend(orig_pending)
+    fingerprint._hash_function_ast_cache.clear()
+    fingerprint._state_db = orig_db
+    fingerprint._state_db_init_attempted = orig_attempted
+
+
+def test_hash_function_ast_adds_to_pending_writes(
+    tmp_path, monkeypatch, reset_fingerprint_cache_state
+):
+    """Module-level functions should queue entries for persistent cache."""
+    # Set project root to tmp_path so _get_func_source_info can compute relative paths
+    monkeypatch.setattr("pivot.project._project_root_cache", tmp_path)
+
+    # Create a test module file
+    test_module = tmp_path / "test_stage.py"
+    test_module.write_text("""
+def my_stage():
+    return 42
+""")
+
+    # Import the function
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("test_stage", test_module)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["test_stage"] = module
+    try:
+        spec.loader.exec_module(module)
+
+        # Hash the function - should add to pending writes
+        func = module.my_stage
+        result = fingerprint.hash_function_ast(func)
+
+        # Verify hash was computed
+        assert isinstance(result, str)
+        assert len(result) == 16  # xxhash64 hexdigest
+
+        # Verify entry was queued for persistent cache
+        assert len(fingerprint._pending_ast_writes) == 1
+        rel_path, mtime_ns, size, inode, qualname, hash_hex = fingerprint._pending_ast_writes[0]
+        assert rel_path == "test_stage.py"
+        assert qualname == "my_stage"
+        assert hash_hex == result
+        assert mtime_ns > 0
+        assert size > 0
+        assert inode > 0
+    finally:
+        del sys.modules["test_stage"]
+
+
+def test_hash_function_ast_skips_closures_for_persistent():
+    """Closures should still hash correctly but not use persistent cache."""
+
+    def make_adder(n):
+        def add(x):
+            return x + n
+
+        return add
+
+    add_five = make_adder(5)
+
+    # Should hash without error
+    h = fingerprint.hash_function_ast(add_five)
+    assert isinstance(h, str)
+    assert len(h) == 16  # xxhash64 hexdigest
+
+
+def test_hash_function_ast_uses_memory_cache():
+    """Memory cache should be used on repeated calls."""
+
+    def test_func():
+        return 42
+
+    # Clear caches
+    fingerprint._hash_function_ast_cache.clear()
+
+    h1 = fingerprint.hash_function_ast(test_func)
+    h2 = fingerprint.hash_function_ast(test_func)
+
+    assert h1 == h2
+    # The function should be in memory cache after first call
+    assert test_func in fingerprint._hash_function_ast_cache
+
+
+# ==============================================================================
+# Persistent cache integration tests
+# ==============================================================================
+
+
+def test_persistent_cache_full_roundtrip(tmp_path, monkeypatch):
+    """Full round-trip: compute → flush → hit → modify → miss.
+
+    Verifies that:
+    1. First call computes and queues for persistent cache
+    2. flush_ast_hash_cache() writes to StateDB
+    3. Second call hits persistent cache (after clearing memory cache)
+    4. Modifying the file causes a cache miss
+    """
+    from pivot.storage import state
+
+    # Set up isolated state directory
+    state_dir = tmp_path / ".pivot"
+    state_dir.mkdir()
+    db_path = state_dir / "state.db"
+
+    # Create initial StateDB so fingerprint module can open it in readonly mode
+    with state.StateDB(db_path):
+        pass
+
+    # Patch project root and state db path
+    monkeypatch.setattr("pivot.project._project_root_cache", tmp_path)
+    monkeypatch.setattr("pivot.config.io.get_state_db_path", lambda: db_path)
+
+    # Reset fingerprint module state
+    fingerprint._pending_ast_writes.clear()
+    fingerprint._hash_function_ast_cache.clear()
+    fingerprint._state_db = None
+    fingerprint._state_db_init_attempted = False
+
+    # Create test module file
+    test_module = tmp_path / "my_stage.py"
+    test_module.write_text("""
+def my_stage():
+    return 42
+""")
+
+    # Import the function
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("my_stage", test_module)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["my_stage"] = module
+    try:
+        spec.loader.exec_module(module)
+        func = module.my_stage
+
+        # Step 1: First call - should compute and queue
+        hash1 = fingerprint.hash_function_ast(func)
+        assert len(fingerprint._pending_ast_writes) == 1
+        assert isinstance(hash1, str)
+        assert len(hash1) == 16  # xxhash64 hexdigest
+
+        # Step 2: Flush to StateDB
+        fingerprint.flush_ast_hash_cache()
+        assert len(fingerprint._pending_ast_writes) == 0
+
+        # Clear memory cache to force persistent lookup
+        fingerprint._hash_function_ast_cache.clear()
+        # Reset state_db so it reopens in readonly mode
+        if fingerprint._state_db is not None:
+            fingerprint._state_db.close()
+        fingerprint._state_db = None
+        fingerprint._state_db_init_attempted = False
+
+        # Reload module to get fresh function object (memory cache uses object identity)
+        del sys.modules["my_stage"]
+        spec2 = importlib.util.spec_from_file_location("my_stage", test_module)
+        assert spec2 is not None and spec2.loader is not None
+        module2 = importlib.util.module_from_spec(spec2)
+        sys.modules["my_stage"] = module2
+        spec2.loader.exec_module(module2)
+        func2 = module2.my_stage
+
+        # Step 3: Second call - should hit persistent cache
+        hash2 = fingerprint.hash_function_ast(func2)
+        assert hash2 == hash1
+        # No new pending writes (cache hit)
+        assert len(fingerprint._pending_ast_writes) == 0
+
+        # Step 4: Modify the file (change mtime/size)
+        import time
+
+        time.sleep(0.01)  # Ensure mtime changes
+        test_module.write_text("""
+def my_stage():
+    return 43  # Changed
+""")
+
+        # Clear memory cache and reload
+        fingerprint._hash_function_ast_cache.clear()
+        del sys.modules["my_stage"]
+        spec3 = importlib.util.spec_from_file_location("my_stage", test_module)
+        assert spec3 is not None and spec3.loader is not None
+        module3 = importlib.util.module_from_spec(spec3)
+        sys.modules["my_stage"] = module3
+        spec3.loader.exec_module(module3)
+        func3 = module3.my_stage
+
+        # Step 5: Should miss cache (mtime changed) and compute new hash
+        hash3 = fingerprint.hash_function_ast(func3)
+        assert hash3 != hash1  # Different code = different hash
+        assert len(fingerprint._pending_ast_writes) == 1  # Queued for cache
+    finally:
+        sys.modules.pop("my_stage", None)
+        # Clean up fingerprint module state
+        if fingerprint._state_db is not None:
+            fingerprint._state_db.close()
+        fingerprint._state_db = None
+        fingerprint._state_db_init_attempted = False
+
+
+def test_graceful_degradation_when_statedb_unavailable(tmp_path, monkeypatch):
+    """Fingerprinting works even when StateDB initialization fails.
+
+    The persistent cache is a performance optimization, not a correctness requirement.
+    If StateDB can't be opened (e.g., corrupted, missing dir, permissions), fingerprinting
+    should continue without the persistent cache.
+    """
+    # Patch to simulate StateDB unavailable (init throws)
+    monkeypatch.setattr("pivot.project._project_root_cache", tmp_path)
+    monkeypatch.setattr(
+        "pivot.config.io.get_state_db_path",
+        lambda: tmp_path / "nonexistent" / "deeply" / "nested" / "state.db",
+    )
+
+    # Reset fingerprint module state
+    fingerprint._pending_ast_writes.clear()
+    fingerprint._hash_function_ast_cache.clear()
+    fingerprint._state_db = None
+    fingerprint._state_db_init_attempted = False
+
+    # Create test module
+    test_module = tmp_path / "graceful_stage.py"
+    test_module.write_text("""
+def graceful_stage():
+    return 42
+""")
+
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("graceful_stage", test_module)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["graceful_stage"] = module
+    try:
+        spec.loader.exec_module(module)
+        func = module.graceful_stage
+
+        # Should not raise - fingerprinting works without persistent cache
+        hash_result = fingerprint.hash_function_ast(func)
+        assert isinstance(hash_result, str)
+        assert len(hash_result) == 16  # xxhash64 hexdigest
+
+        # Entries are still queued (flush will fail gracefully too)
+        assert len(fingerprint._pending_ast_writes) == 1
+
+        # Flush should not raise either
+        fingerprint.flush_ast_hash_cache()  # Fails silently
+    finally:
+        sys.modules.pop("graceful_stage", None)
+        fingerprint._state_db = None
+        fingerprint._state_db_init_attempted = False
+
+
+def test_flush_ast_hash_cache_writes_to_statedb(tmp_path, monkeypatch):
+    """flush_ast_hash_cache() actually persists entries to StateDB."""
+    from pivot.storage import state
+
+    # Set up isolated state directory
+    state_dir = tmp_path / ".pivot"
+    state_dir.mkdir()
+    db_path = state_dir / "state.db"
+
+    # Create initial StateDB
+    with state.StateDB(db_path) as db:
+        pass
+
+    monkeypatch.setattr("pivot.config.io.get_state_db_path", lambda: db_path)
+
+    # Reset fingerprint module state
+    fingerprint._pending_ast_writes.clear()
+    fingerprint._hash_function_ast_cache.clear()
+
+    # Manually queue some entries (simulating what hash_function_ast does)
+    test_entries = [
+        ("src/a.py", 1000000000, 100, 111, "func_a", "aaaa111122223333"),
+        ("src/b.py", 2000000000, 200, 222, "func_b", "bbbb444455556666"),
+        ("src/c.py", 3000000000, 300, 333, "MyClass.method", "cccc777788889999"),
+    ]
+    fingerprint._pending_ast_writes.extend(test_entries)
+
+    # Flush to StateDB
+    fingerprint.flush_ast_hash_cache()
+
+    # Verify entries were actually written
+    with state.StateDB(db_path, readonly=True) as db:
+        for rel_path, mtime_ns, size, inode, qualname, expected_hash in test_entries:
+            actual_hash = db.get_ast_hash(rel_path, mtime_ns, size, inode, qualname)
+            assert actual_hash == expected_hash, (
+                f"Expected {expected_hash} for {rel_path}:{qualname}, got {actual_hash}"
+            )
+
+    # Pending writes should be cleared
+    assert len(fingerprint._pending_ast_writes) == 0

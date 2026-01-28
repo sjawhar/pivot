@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Annotated, Any, TypedDict, TypeVar
 import pydantic
 import yaml
 
-from pivot import outputs, parameters, path_policy, registry, stage_def, yaml_config
+from pivot import fingerprint, outputs, parameters, path_policy, registry, stage_def, yaml_config
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -179,6 +179,9 @@ def register_from_pipeline_file(pipeline_file: Path) -> None:
 
     for stage_name, stage_config in pipeline.stages.items():
         _register_stage(stage_name, stage_config, global_vars)
+
+    # Flush pending AST hash writes to persistent cache
+    fingerprint.flush_ast_hash_cache()
 
 
 def _register_stage(

@@ -14,6 +14,7 @@ from pivot.config.io import get_remote_connect_timeout as get_remote_connect_tim
 from pivot.config.io import get_remote_jobs as get_remote_jobs
 from pivot.config.io import get_remote_retries as get_remote_retries
 from pivot.config.io import get_run_history_retention as get_run_history_retention
+from pivot.config.io import get_state_db_path as get_state_db_path
 from pivot.config.io import get_state_dir as get_state_dir
 from pivot.config.io import get_watch_debounce as get_watch_debounce
 from pivot.config.io import load_config_file as load_config_file
