@@ -585,7 +585,7 @@ def run(
             checkout_missing=checkout_missing,
         )
 
-    if not results and show_human_output:
+    if not results and show_human_output and not use_tui:
         click.echo("No stages to run")
 
 

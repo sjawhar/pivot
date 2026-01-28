@@ -45,7 +45,7 @@ class ConfirmCommitScreen(ConfirmDialog):
 
 
 class ConfirmKillWorkersScreen(ConfirmDialog):
-    """Confirmation dialog for killing worker processes on quit."""
+    """Confirmation dialog for quitting with running stages."""
 
     def __init__(self) -> None:
-        super().__init__("A stage is still running. Kill it and quit?")
+        super().__init__("Stages are still running. Kill them and quit?")

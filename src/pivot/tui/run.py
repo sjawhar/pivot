@@ -9,6 +9,7 @@ import logging
 import os
 import pathlib
 import queue
+import sys
 import threading
 import time
 from typing import (
@@ -19,6 +20,8 @@ from typing import (
 )
 
 import filelock
+import loky
+import loky.process_executor  # pyright: ignore[reportMissingTypeStubs]
 import rich.markup
 import textual  # for textual.work decorator
 import textual.app
@@ -229,6 +232,7 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
         self._results: dict[str, ExecutionSummary] | None = None
         self._error: Exception | None = None
         self._executor_thread: threading.Thread | None = None
+        self._exit_message: str | None = None
 
         # Watch mode state
         self._engine = engine
@@ -279,16 +283,17 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
         return self._error
 
     @property
+    def exit_message(self) -> str | None:
+        """Return message to display after TUI exits (e.g., running stages warning)."""
+        return self._exit_message
+
+    @property
     def _has_running_stages(self) -> bool:
         """Check if any stages are currently in progress."""
         return any(s.status == StageStatus.IN_PROGRESS for s in self._stages.values())
 
     def _shutdown_loky_pool(self) -> None:
         """Force-kill loky worker pool to prevent hang on exit."""
-        import contextlib
-
-        import loky
-
         # Best-effort cleanup - loky can fail with fd errors in some environments
         with contextlib.suppress(Exception):
             # kill_workers=True forces immediate termination of worker processes
@@ -1228,20 +1233,27 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
     async def _quit_run_mode(self) -> None:  # pragma: no cover
         """Worker to handle quit in run mode (may show confirmation dialog)."""
         if self._has_running_stages:
-            should_kill = await self.push_screen_wait(ConfirmKillWorkersScreen())
-            if not should_kill:
+            should_quit = await self.push_screen_wait(ConfirmKillWorkersScreen())
+            if not should_quit:
                 self._quitting = False  # Allow retry after cancel
                 return
-            # User confirmed kill - reset terminal and exit immediately.
-            # Uses os._exit to bypass loky's atexit handler that waits for threads.
-            if self._driver is not None:
-                self._driver.stop_application_mode()
-            os.system("reset")
-            os._exit(0)
-        # No running stages - normal exit with cleanup
-        if self._cancel_event is not None:
-            self._cancel_event.set()
+            # User confirmed quit - unregister loky's atexit handler to prevent hang
+            # The handler waits for worker threads which blocks exit
+            if self._cancel_event is not None:
+                self._cancel_event.set()
+            atexit.unregister(
+                loky.process_executor._python_exit  # pyright: ignore[reportPrivateUsage]
+            )
+            # Store message to print after TUI exits
+            running = sum(1 for s in self._stages.values() if s.status == StageStatus.IN_PROGRESS)
+            self._exit_message = (
+                f"Note: {running} stage(s) are still running. Press Ctrl+C to forcefully kill them."
+            )
+        # Exit cleanly - Textual restores terminal, loky cleanup skipped
         self._shutdown_event.set()
+        if self._reader_thread:
+            self._reader_thread.join(timeout=1.0)
+        self._close_log_file()
         self.exit()
 
     @textual.work
@@ -1301,6 +1313,9 @@ def run_with_tui(
         cancel_event=cancel_event,
     )
     results = app.run()
+    # Print exit message if user quit with running stages
+    if app.exit_message:
+        print(app.exit_message, file=sys.stderr)
     if app.error is not None:
         raise app.error
     return results or {}
@@ -1331,8 +1346,6 @@ def run_watch_tui(
 
 def should_use_tui(display_mode: DisplayMode | None) -> bool:
     """Determine if TUI should be used based on display mode and TTY."""
-    import sys
-
     if display_mode == DisplayMode.TUI:
         return True
     if display_mode == DisplayMode.PLAIN:
