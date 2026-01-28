@@ -37,6 +37,130 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _get_explanations_in_parallel(
+    execution_order: list[str],
+    state_dir: pathlib.Path,
+    overrides: parameters.ParamsOverrides | None,
+    force: bool = False,
+) -> dict[str, StageExplanation]:
+    """Compute stage explanations in parallel (I/O-bound: lock file reads, hashing)."""
+    max_workers = min(8, len(execution_order))
+    explanations_by_name = dict[str, StageExplanation]()
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = dict[Future[StageExplanation], str]()
+        for stage_name in execution_order:
+            stage_info = registry.REGISTRY.get(stage_name)
+            future = pool.submit(
+                explain.get_stage_explanation,
+                stage_name,
+                stage_info["fingerprint"],
+                stage_info["deps_paths"],
+                stage_info["outs_paths"],
+                stage_info["params"],
+                overrides,
+                state_dir,
+                force=force,
+            )
+            futures[future] = stage_name
+
+        for future in as_completed(futures):
+            stage_name = futures[future]
+            try:
+                explanations_by_name[stage_name] = future.result()
+            except Exception as e:
+                logger.warning(f"Failed to get explanation for {stage_name}: {e}")
+                explanations_by_name[stage_name] = StageExplanation(
+                    stage_name=stage_name,
+                    will_run=True,
+                    is_forced=False,
+                    reason=f"Error: {e}",
+                    code_changes=list[CodeChange](),
+                    param_changes=list[ParamChange](),
+                    dep_changes=list[DepChange](),
+                )
+
+    return explanations_by_name
+
+
+def get_pipeline_explanations(
+    stages: list[str] | None,
+    single_stage: bool,
+    force: bool = False,
+) -> list[StageExplanation]:
+    """Get detailed explanations for all stages with upstream staleness populated.
+
+    Returns StageExplanation objects with the upstream_stale field populated based
+    on the DAG structure. Stages that would run due to upstream dependencies being
+    stale will have their upstream_stale field contain the list of stale upstream stages.
+
+    Args:
+        stages: List of stage names to explain, or None for all stages.
+        single_stage: If True, only explain the specified stages without dependencies.
+        force: If True, mark all stages as would run due to force flag.
+    """
+    with metrics.timed("status.get_pipeline_explanations"):
+        graph = registry.REGISTRY.build_dag(validate=True)
+        execution_order = dag.get_execution_order(graph, stages, single_stage=single_stage)
+
+        if not execution_order:
+            return []
+
+        state_dir = config.get_state_dir()
+        overrides = parameters.load_params_yaml()
+
+        explanations_by_name = _get_explanations_in_parallel(
+            execution_order, state_dir, overrides, force=force
+        )
+
+        # Preserve original order for staleness propagation
+        explanations = [explanations_by_name[name] for name in execution_order]
+
+        return _compute_explanations_with_upstream(explanations, graph)
+
+
+def _compute_explanations_with_upstream(
+    explanations: list[StageExplanation],
+    graph: DiGraph[str],
+) -> list[StageExplanation]:
+    """Process explanations and add upstream_stale field for stages stale due to upstream."""
+    stale_stages = set[str]()
+    results = list[StageExplanation]()
+
+    for exp in explanations:
+        # DAG edges go from consumer -> producer, so successors() gives upstream (producer) stages
+        upstream_stale = [
+            succ for succ in graph.successors(exp["stage_name"]) if succ in stale_stages
+        ]
+
+        is_stale = exp["will_run"] or bool(upstream_stale)
+        if is_stale:
+            stale_stages.add(exp["stage_name"])
+
+        # Compute updated reason
+        reason = (
+            exp["reason"]
+            if exp["will_run"]
+            else (f"Upstream stale ({', '.join(upstream_stale)})" if upstream_stale else "")
+        )
+
+        # Create new explanation with upstream_stale populated
+        # Note: Explicit field copy is required for TypedDict type safety
+        new_exp = StageExplanation(
+            stage_name=exp["stage_name"],
+            will_run=is_stale,
+            is_forced=exp["is_forced"],
+            reason=reason,
+            code_changes=exp["code_changes"],
+            param_changes=exp["param_changes"],
+            dep_changes=exp["dep_changes"],
+            upstream_stale=upstream_stale,
+        )
+        results.append(new_exp)
+
+    return results
+
+
 def get_pipeline_status(
     stages: list[str] | None,
     single_stage: bool,
@@ -52,84 +176,27 @@ def get_pipeline_status(
         state_dir = config.get_state_dir()
         overrides = parameters.load_params_yaml()
 
-        # Compute explanations in parallel (I/O-bound: lock file reads, hashing)
-        # ThreadPoolExecutor is appropriate since work is file I/O, not CPU
-        max_workers = min(8, len(execution_order))
-        explanations_by_name = dict[str, StageExplanation]()
-
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = dict[Future[StageExplanation], str]()
-            for stage_name in execution_order:
-                stage_info = registry.REGISTRY.get(stage_name)
-                future = pool.submit(
-                    explain.get_stage_explanation,
-                    stage_name,
-                    stage_info["fingerprint"],
-                    stage_info["deps_paths"],
-                    stage_info["outs_paths"],
-                    stage_info["params"],
-                    overrides,
-                    state_dir,
-                )
-                futures[future] = stage_name
-
-            for future in as_completed(futures):
-                stage_name = futures[future]
-                try:
-                    explanations_by_name[stage_name] = future.result()
-                except Exception as e:
-                    logger.warning(f"Failed to get explanation for {stage_name}: {e}")
-                    explanations_by_name[stage_name] = StageExplanation(
-                        stage_name=stage_name,
-                        will_run=True,
-                        is_forced=False,
-                        reason=f"Error: {e}",
-                        code_changes=list[CodeChange](),
-                        param_changes=list[ParamChange](),
-                        dep_changes=list[DepChange](),
-                    )
+        explanations_by_name = _get_explanations_in_parallel(execution_order, state_dir, overrides)
 
         # Preserve original order for staleness propagation
         explanations = [explanations_by_name[name] for name in execution_order]
 
-        return _compute_upstream_staleness(explanations, graph), graph
+        # Reuse the shared upstream computation logic
+        enriched = _compute_explanations_with_upstream(explanations, graph)
+        return _explanations_to_status(enriched), graph
 
 
-def _compute_upstream_staleness(
-    explanations: list[StageExplanation],
-    graph: DiGraph[str],
-) -> list[PipelineStatusInfo]:
-    """Process explanations and mark stages stale due to upstream dependencies."""
-    stale_stages = set[str]()
-    results = list[PipelineStatusInfo]()
-
-    for exp in explanations:
-        # DAG edges go from consumer -> producer, so successors() gives upstream (producer) stages
-        upstream_stale = [
-            succ for succ in graph.successors(exp["stage_name"]) if succ in stale_stages
-        ]
-
-        is_stale = exp["will_run"] or bool(upstream_stale)
-        if is_stale:
-            stale_stages.add(exp["stage_name"])
-
-        if exp["will_run"]:
-            reason = exp["reason"]
-        elif upstream_stale:
-            reason = f"Upstream stale ({', '.join(upstream_stale)})"
-        else:
-            reason = ""
-
-        results.append(
-            PipelineStatusInfo(
-                name=exp["stage_name"],
-                status=PipelineStatus.STALE if is_stale else PipelineStatus.CACHED,
-                reason=reason,
-                upstream_stale=upstream_stale,
-            )
+def _explanations_to_status(explanations: list[StageExplanation]) -> list[PipelineStatusInfo]:
+    """Convert enriched explanations to PipelineStatusInfo list."""
+    return [
+        PipelineStatusInfo(
+            name=exp["stage_name"],
+            status=PipelineStatus.STALE if exp["will_run"] else PipelineStatus.CACHED,
+            reason=exp["reason"],
+            upstream_stale=exp.get("upstream_stale", []),
         )
-
-    return results
+        for exp in explanations
+    ]
 
 
 def get_tracked_files_status(project_root: pathlib.Path) -> list[TrackedFileInfo]:

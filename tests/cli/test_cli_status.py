@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Annotated, TypedDict
 from helpers import register_test_stage
 from pivot import cli, executor, loaders, outputs
 from pivot import status as status_mod
+from pivot.registry import REGISTRY
 from pivot.storage import cache, track
 from pivot.types import RemoteSyncInfo
 
@@ -88,6 +89,22 @@ def _helper_stage_b(
     _ = input_file
     pathlib.Path("b.txt").write_text("output b")
     return _BTxtOutputs(output=pathlib.Path("b.txt"))
+
+
+def _helper_process_v1(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _OutputTxtOutputs:
+    _ = input_file
+    pathlib.Path("output.txt").write_text("v1")
+    return _OutputTxtOutputs(output=pathlib.Path("output.txt"))
+
+
+def _helper_process_v2(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _OutputTxtOutputs:
+    _ = input_file
+    pathlib.Path("output.txt").write_text("v2_different")
+    return _OutputTxtOutputs(output=pathlib.Path("output.txt"))
 
 
 def test_status_shows_stale_stages(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
@@ -559,3 +576,247 @@ def test_status_json_with_remote(
         assert data["remote"]["name"] == "default"
         assert data["remote"]["push_count"] == 7
         assert data["remote"]["pull_count"] == 4
+
+
+# =============================================================================
+# --explain Flag Tests
+# =============================================================================
+
+
+def test_status_explain_flag_in_help(runner: click.testing.CliRunner) -> None:
+    """--explain flag should appear in status help output."""
+    result = runner.invoke(cli.cli, ["status", "--help"])
+
+    assert result.exit_code == 0
+    assert "--explain" in result.output
+
+
+def test_status_explain_shows_detailed_output(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """--explain shows detailed change information."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        pathlib.Path("input.txt").write_text("data")
+
+        register_test_stage(_helper_process, name="process")
+
+        result = runner.invoke(cli.cli, ["status", "--explain"])
+
+        assert result.exit_code == 0
+        assert "process" in result.output
+        # Should show detailed info like reason
+        assert "No previous run" in result.output or "WILL RUN" in result.output
+
+
+def test_status_explain_shows_code_changes(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """--explain shows code changes when code differs."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        pathlib.Path("input.txt").write_text("data")
+
+        register_test_stage(_helper_process_v1, name="process")
+        executor.run(show_output=False)
+
+        REGISTRY._stages.clear()
+        register_test_stage(_helper_process_v2, name="process")
+
+        result = runner.invoke(cli.cli, ["status", "--explain"])
+
+        assert result.exit_code == 0
+        assert "Code" in result.output
+
+
+def test_status_explain_short_flag(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
+    """-e short flag works like --explain."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        pathlib.Path("input.txt").write_text("data")
+
+        register_test_stage(_helper_process, name="process")
+
+        result = runner.invoke(cli.cli, ["status", "-e"])
+
+        assert result.exit_code == 0
+        assert "process" in result.output
+
+
+def test_status_explain_json_format(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """--explain --json returns extended format with change arrays."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        pathlib.Path("input.txt").write_text("data")
+
+        register_test_stage(_helper_process, name="process")
+
+        result = runner.invoke(cli.cli, ["status", "--explain", "--json"])
+
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert "stages" in data
+        assert len(data["stages"]) == 1
+        stage = data["stages"][0]
+        assert "code_changes" in stage, "Explain JSON should include code_changes"
+        assert "param_changes" in stage, "Explain JSON should include param_changes"
+        assert "dep_changes" in stage, "Explain JSON should include dep_changes"
+
+
+def test_status_json_without_explain_no_changes(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """--json without --explain does NOT include change arrays."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        pathlib.Path("input.txt").write_text("data")
+
+        register_test_stage(_helper_process, name="process")
+
+        result = runner.invoke(cli.cli, ["status", "--json"])
+
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert "stages" in data
+        assert len(data["stages"]) == 1
+        stage = data["stages"][0]
+        # Regular status JSON should NOT include change arrays
+        assert "code_changes" not in stage, "Regular status JSON should not include code_changes"
+
+
+# =============================================================================
+# Upstream Propagation Consistency Tests
+# =============================================================================
+
+
+class _UpstreamAOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("a_out.txt", loaders.PathOnly())]
+
+
+class _UpstreamBOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("b_out.txt", loaders.PathOnly())]
+
+
+def _upstream_stage_a_v1(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _UpstreamAOutputs:
+    pathlib.Path("a_out.txt").write_text("a_v1")
+    return _UpstreamAOutputs(output=pathlib.Path("a_out.txt"))
+
+
+def _upstream_stage_a_v2(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _UpstreamAOutputs:
+    pathlib.Path("a_out.txt").write_text("a_v2_different_code")
+    return _UpstreamAOutputs(output=pathlib.Path("a_out.txt"))
+
+
+def _upstream_stage_b(
+    a_output: Annotated[pathlib.Path, outputs.Dep("a_out.txt", loaders.PathOnly())],
+) -> _UpstreamBOutputs:
+    pathlib.Path("b_out.txt").write_text("b")
+    return _UpstreamBOutputs(output=pathlib.Path("b_out.txt"))
+
+
+def test_status_upstream_propagation(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """Status shows B as stale when upstream A is stale."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        pathlib.Path("input.txt").write_text("data")
+
+        register_test_stage(_upstream_stage_a_v1, name="stage_a")
+        register_test_stage(_upstream_stage_b, name="stage_b")
+
+        executor.run(show_output=False)
+
+        # Modify stage_a's code
+        REGISTRY._stages.clear()
+        register_test_stage(_upstream_stage_a_v2, name="stage_a")
+        register_test_stage(_upstream_stage_b, name="stage_b")
+
+        result = runner.invoke(cli.cli, ["status", "--verbose"])
+
+        assert result.exit_code == 0
+        # Both stages should show as stale
+        assert "stage_a" in result.output
+        assert "stage_b" in result.output
+        # B should show upstream stale reason
+        assert "Upstream stale" in result.output or "upstream" in result.output.lower()
+
+
+def test_status_explain_upstream_propagation(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """--explain shows B with upstream_stale when A is stale."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        pathlib.Path("input.txt").write_text("data")
+
+        register_test_stage(_upstream_stage_a_v1, name="stage_a")
+        register_test_stage(_upstream_stage_b, name="stage_b")
+
+        executor.run(show_output=False)
+
+        # Modify stage_a's code
+        REGISTRY._stages.clear()
+        register_test_stage(_upstream_stage_a_v2, name="stage_a")
+        register_test_stage(_upstream_stage_b, name="stage_b")
+
+        result = runner.invoke(cli.cli, ["status", "--explain"])
+
+        assert result.exit_code == 0
+        # B should show upstream stale reason
+        assert "Upstream stale" in result.output or "upstream" in result.output.lower()
+
+
+def test_status_explain_json_upstream_propagation(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """--explain --json shows upstream_stale in stage info."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        pathlib.Path("input.txt").write_text("data")
+
+        register_test_stage(_upstream_stage_a_v1, name="stage_a")
+        register_test_stage(_upstream_stage_b, name="stage_b")
+
+        executor.run(show_output=False)
+
+        # Modify stage_a's code
+        REGISTRY._stages.clear()
+        register_test_stage(_upstream_stage_a_v2, name="stage_a")
+        register_test_stage(_upstream_stage_b, name="stage_b")
+
+        result = runner.invoke(cli.cli, ["status", "--explain", "--json"])
+
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert "stages" in data
+
+        # Find stage_b in output
+        stage_b = next((s for s in data["stages"] if s["name"] == "stage_b"), None)
+        assert stage_b is not None, "stage_b should be in output"
+        assert "upstream_stale" in stage_b, "stage_b should have upstream_stale field"
+        assert "stage_a" in stage_b["upstream_stale"], (
+            "stage_a should be in stage_b's upstream_stale"
+        )
+
+
+# =============================================================================
+# Explain Command Removal Tests
+# =============================================================================
+
+
+def test_explain_command_removed(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
+    """pivot explain command should no longer exist."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+
+        result = runner.invoke(cli.cli, ["explain"])
+
+        assert result.exit_code != 0
+        assert "No such command" in result.output or "Error" in result.output

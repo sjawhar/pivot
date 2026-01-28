@@ -10,10 +10,14 @@ from pivot import status as status_mod
 from pivot.cli import completion
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
+from pivot.tui import console
 from pivot.types import (
+    ExplainOutput,
+    ExplainStageJson,
     PipelineStatus,
     PipelineStatusInfo,
     RemoteSyncInfo,
+    StageExplanation,
     StatusOutput,
     TrackedFileInfo,
     TrackedFileStatus,
@@ -23,6 +27,9 @@ from pivot.types import (
 @cli_decorators.pivot_command()
 @click.argument("stages", nargs=-1, shell_complete=completion.complete_stages)
 @click.option("--verbose", "-v", is_flag=True, help="Show all stages, not just stale")
+@click.option(
+    "--explain", "-e", is_flag=True, help="Show detailed breakdown of why stages would run"
+)
 @click.option("--json", "output_json", is_flag=True, help="Output as JSON")
 @click.option("--stages-only", is_flag=True, help="Show only pipeline status")
 @click.option("--tracked-only", is_flag=True, help="Show only tracked files")
@@ -34,6 +41,7 @@ def status(
     ctx: click.Context,
     stages: tuple[str, ...],
     verbose: bool,
+    explain: bool,
     output_json: bool,
     stages_only: bool,
     tracked_only: bool,
@@ -56,12 +64,19 @@ def status(
     show_tracked = show_all or tracked_only
     show_remote = remote_only or remote
 
+    # When --explain is used, fetch detailed explanations instead of basic status
     pipeline_status = list[PipelineStatusInfo]()
+    pipeline_explanations = list[StageExplanation]()
     tracked_status = list[TrackedFileInfo]()
     remote_status: RemoteSyncInfo | None = None
 
     if show_stages:
-        pipeline_status, _ = status_mod.get_pipeline_status(stages_list, single_stage=False)
+        if explain:
+            pipeline_explanations = status_mod.get_pipeline_explanations(
+                stages_list, single_stage=False
+            )
+        else:
+            pipeline_status, _ = status_mod.get_pipeline_status(stages_list, single_stage=False)
 
     if show_tracked:
         tracked_status = status_mod.get_tracked_files_status(project_root)
@@ -79,7 +94,11 @@ def status(
             raise click.ClickException(f"Remote error: {e}") from e
 
     # Compute counts once for suggestions and output
-    stale_count = sum(1 for s in pipeline_status if s["status"] == PipelineStatus.STALE)
+    # When explain mode is used, compute from explanations; otherwise from status
+    if explain and pipeline_explanations:
+        stale_count = sum(1 for e in pipeline_explanations if e["will_run"])
+    else:
+        stale_count = sum(1 for s in pipeline_status if s["status"] == PipelineStatus.STALE)
     modified_count = sum(1 for f in tracked_status if f["status"] == TrackedFileStatus.MODIFIED)
     push_count = remote_status["push_count"] if remote_status else 0
     pull_count = remote_status["pull_count"] if remote_status else 0
@@ -92,25 +111,45 @@ def status(
         return
 
     if output_json:
-        _output_json(
-            pipeline_status,
-            tracked_status,
-            remote_status,
-            suggestions,
-            show_stages,
-            show_tracked,
-            show_remote,
-        )
+        if explain:
+            _output_explain_json(
+                pipeline_explanations,
+                tracked_status,
+                remote_status,
+                suggestions,
+                show_stages,
+                show_tracked,
+                show_remote,
+            )
+        else:
+            _output_json(
+                pipeline_status,
+                tracked_status,
+                remote_status,
+                suggestions,
+                show_stages,
+                show_tracked,
+                show_remote,
+            )
     else:
-        _output_text(
-            pipeline_status,
-            tracked_status,
-            remote_status,
-            suggestions,
-            verbose,
-            show_stages,
-            show_tracked,
-        )
+        if explain:
+            output_explain_text(
+                pipeline_explanations,
+                tracked_status,
+                remote_status,
+                suggestions,
+                show_tracked,
+            )
+        else:
+            _output_text(
+                pipeline_status,
+                tracked_status,
+                remote_status,
+                suggestions,
+                verbose,
+                show_stages,
+                show_tracked,
+            )
 
 
 def _output_json(
@@ -127,6 +166,48 @@ def _output_json(
 
     if show_stages:
         data["stages"] = pipeline_status
+
+    if show_tracked:
+        data["tracked_files"] = tracked_status
+
+    if show_remote and remote_status:
+        data["remote"] = remote_status
+
+    if suggestions:
+        data["suggestions"] = suggestions
+
+    click.echo(json.dumps(data, indent=2))
+
+
+def _output_explain_json(
+    explanations: list[StageExplanation],
+    tracked_status: list[TrackedFileInfo],
+    remote_status: RemoteSyncInfo | None,
+    suggestions: list[str],
+    show_stages: bool,
+    show_tracked: bool,
+    show_remote: bool,
+) -> None:
+    """Output status with detailed explanations as JSON."""
+    data = ExplainOutput()
+
+    if show_stages:
+        # Convert explanations to JSON-serializable format with name field
+        stages = list[ExplainStageJson]()
+        for exp in explanations:
+            stage_data = ExplainStageJson(
+                name=exp["stage_name"],
+                status="stale" if exp["will_run"] else "cached",
+                reason=exp["reason"],
+                will_run=exp["will_run"],
+                is_forced=exp["is_forced"],
+                code_changes=exp["code_changes"],
+                param_changes=exp["param_changes"],
+                dep_changes=exp["dep_changes"],
+                upstream_stale=exp.get("upstream_stale", []),
+            )
+            stages.append(stage_data)
+        data["stages"] = stages
 
     if show_tracked:
         data["tracked_files"] = tracked_status
@@ -160,6 +241,46 @@ def _output_text(
         if sections_printed > 0:
             click.echo()
         _print_tracked_section(tracked_status, verbose)
+        sections_printed += 1
+
+    if remote_status:
+        if sections_printed > 0:
+            click.echo()
+        _print_remote_section(remote_status)
+        sections_printed += 1
+
+    if suggestions:
+        if sections_printed > 0:
+            click.echo()
+        _print_suggestions_section(suggestions)
+
+
+def output_explain_text(
+    explanations: list[StageExplanation],
+    tracked_status: list[TrackedFileInfo] | None = None,
+    remote_status: RemoteSyncInfo | None = None,
+    suggestions: list[str] | None = None,
+    show_tracked: bool = False,
+) -> None:
+    """Output detailed stage explanations as formatted text."""
+    sections_printed = 0
+
+    # Always show stage explanations section
+    if not explanations:
+        click.echo("No stages to run")
+    else:
+        con = console.Console()
+        for exp in explanations:
+            con.explain_stage(exp)
+
+        will_run = sum(1 for e in explanations if e["will_run"])
+        con.explain_summary(will_run, len(explanations) - will_run)
+    sections_printed += 1
+
+    if show_tracked and tracked_status is not None:
+        if sections_printed > 0:
+            click.echo()
+        _print_tracked_section(tracked_status, verbose=False)
         sections_printed += 1
 
     if remote_status:

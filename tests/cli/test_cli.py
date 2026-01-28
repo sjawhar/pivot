@@ -418,13 +418,13 @@ def test_cli_help_shows_categorized_commands(runner: CliRunner) -> None:
 
 
 def test_cli_help_contains_pipeline_commands(runner: CliRunner) -> None:
-    """Help output should contain pipeline commands (run, explain)."""
+    """Help output should contain pipeline commands (run, status)."""
     result = runner.invoke(cli.cli, ["--help"])
     assert result.exit_code == 0
 
     # Test that commands appear in output (without relying on section positions)
     assert "run" in result.output, "Should show 'run' command"
-    assert "explain" in result.output, "Should show 'explain' command"
+    assert "status" in result.output, "Should show 'status' command"
 
 
 def test_cli_help_contains_inspection_commands(runner: CliRunner) -> None:
