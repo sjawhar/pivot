@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import enum
 import logging
 import pathlib
@@ -19,7 +20,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-RestoreResult = Literal["restored", "skipped"]
+RestoreResult = Literal["restored", "skipped", "missing"]
+MAX_CONCURRENT_RESTORES = 32
 
 
 class CheckoutBehavior(enum.StrEnum):
@@ -47,17 +49,22 @@ def _get_stage_output_info(state_dir: pathlib.Path) -> dict[str, OutputHash]:
     return outputs
 
 
-def _restore_path(
+def _restore_path_sync(
     path: pathlib.Path,
     output_hash: OutputHash,
     cache_dir: pathlib.Path,
     checkout_modes: list[cache.CheckoutMode],
     behavior: CheckoutBehavior,
 ) -> tuple[RestoreResult, str]:
-    """Restore a file or directory from cache.
+    """Restore a file or directory from cache (sync version).
 
     Returns:
         Tuple of (result, path_name) for the caller to handle output.
+
+    Raises:
+        click.ClickException: For immediate failures (path traversal, unknown target,
+            "already exists" without --force). Cache misses return ("missing", name)
+            instead of raising.
     """
     if path.exists():
         match behavior:
@@ -75,90 +82,198 @@ def _restore_path(
 
     success = cache.restore_from_cache(path, output_hash, cache_dir, checkout_modes=checkout_modes)
     if not success:
-        raise click.ClickException(
-            f"Failed to restore '{path.name}': not found in cache. "
-            + "Try 'pivot pull' to fetch from remote storage."
-        )
+        return ("missing", path.name)
 
     return ("restored", path.name)
 
 
-def _print_restore_result(result: RestoreResult, name: str) -> None:
-    """Print restore result to user."""
-    if result == "restored":
-        click.echo(f"Restored: {name}")
-    else:
-        click.echo(f"Skipped: {name} (already exists)")
-
-
-def _checkout_files(
+async def _checkout_files_async(
     files: Mapping[str, OutputHash],
     cache_dir: pathlib.Path,
     checkout_modes: list[cache.CheckoutMode],
     behavior: CheckoutBehavior,
-    quiet: bool,
-) -> None:
-    """Restore files from cache."""
-    for abs_path_str, output_hash in files.items():
-        if output_hash is None:
-            logger.debug(f"Skipping output with no cached hash: {abs_path_str}")
-            continue
+) -> tuple[list[str], int, int]:
+    """Restore files in parallel.
+
+    Returns:
+        Tuple of (failures, restored_count, skipped_count) where failures is a list
+        of file names that were missing from cache.
+
+    Raises:
+        click.ClickException: For immediate failures (aggregated if multiple).
+    """
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT_RESTORES)
+    failures = list[str]()
+    restored = 0
+    skipped = 0
+    immediate_errors = list[click.ClickException]()
+
+    async def restore_one(abs_path_str: str, output_hash: OutputHash) -> None:
+        nonlocal restored, skipped
         path = pathlib.Path(abs_path_str)
-        result, name = _restore_path(path, output_hash, cache_dir, checkout_modes, behavior)
-        if not quiet:
-            _print_restore_result(result, name)
+        try:
+            async with semaphore:
+                result, name = await asyncio.to_thread(
+                    _restore_path_sync, path, output_hash, cache_dir, checkout_modes, behavior
+                )
+            match result:
+                case "missing":
+                    failures.append(name)
+                case "restored":
+                    restored += 1
+                case "skipped":
+                    skipped += 1
+        except click.ClickException as e:
+            immediate_errors.append(e)
+
+    try:
+        async with asyncio.TaskGroup() as tg:
+            for abs_path_str, output_hash in files.items():
+                if output_hash is not None:
+                    tg.create_task(restore_one(abs_path_str, output_hash))
+                else:
+                    logger.debug(f"Skipping output with no cached hash: {abs_path_str}")
+    except* Exception as eg:
+        # Convert unexpected exceptions to friendly error message
+        errors = [str(e) for e in eg.exceptions]
+        raise click.ClickException("\n".join(errors)) from None
+
+    # Re-raise immediate failures (all of them, aggregated)
+    if immediate_errors:
+        msgs = [str(e.message) for e in immediate_errors]
+        raise click.ClickException("\n".join(msgs))
+
+    return (failures, restored, skipped)
 
 
-def _checkout_target(
-    target: str,
+def _dedupe_targets(targets: tuple[str, ...]) -> list[str]:
+    """Deduplicate targets by normalized absolute path.
+
+    Handles both data paths (data.txt) and .pvt paths (data.txt.pvt) resolving
+    to the same file.
+    """
+    seen = set[str]()
+    unique = list[str]()
+    for target in targets:
+        # Convert .pvt to data path
+        target_path = pathlib.Path(target)
+        if target_path.suffix == ".pvt":
+            target = str(track.get_data_path(target_path))
+
+        abs_path = str(project.normalize_path(target))
+        if abs_path not in seen:
+            seen.add(abs_path)
+            unique.append(target)
+    return unique
+
+
+def _validate_and_build_files(
+    targets: list[str],
+    tracked_files: dict[str, track.PvtData],
+    stage_outputs: dict[str, OutputHash],
+) -> dict[str, OutputHash]:
+    """Validate targets and build files dict for checkout.
+
+    Targets should already have .pvt suffixes converted by _dedupe_targets().
+
+    Raises:
+        click.ClickException: For path traversal or unknown targets.
+    """
+    files = dict[str, OutputHash]()
+
+    for target in targets:
+        # Validate path doesn't escape project
+        if track.has_path_traversal(target):
+            raise click.ClickException(f"Path traversal not allowed: {target}")
+
+        # Use normalized path (preserve symlinks) to match keys in tracked_files/stage_outputs
+        abs_path = project.normalize_path(target)
+        abs_path_str = str(abs_path)
+
+        # Check if it's a tracked file
+        if abs_path_str in tracked_files:
+            pvt_data = tracked_files[abs_path_str]
+            files[abs_path_str] = track.pvt_to_hash_info(pvt_data)
+            continue
+
+        # Check if it's a stage output
+        if abs_path_str in stage_outputs:
+            output_hash = stage_outputs[abs_path_str]
+            if output_hash is None:
+                raise click.ClickException(
+                    f"'{target}' has no cached version. "
+                    + "Run the stage first, or use 'pivot pull' to fetch from remote."
+                )
+            files[abs_path_str] = output_hash
+            continue
+
+        # Unknown target
+        raise click.ClickException(
+            f"'{target}' is not a tracked file or stage output. "
+            + "Use 'pivot list' to see stages or 'pivot track' to track files."
+        )
+
+    return files
+
+
+async def _checkout_main_async(
+    targets: tuple[str, ...],
     tracked_files: dict[str, track.PvtData],
     stage_outputs: dict[str, OutputHash],
     cache_dir: pathlib.Path,
     checkout_modes: list[cache.CheckoutMode],
     behavior: CheckoutBehavior,
-    quiet: bool,
-) -> None:
-    """Restore a specific target (tracked file or stage output) from cache."""
-    # Validate path doesn't escape project
-    if track.has_path_traversal(target):
-        raise click.ClickException(f"Path traversal not allowed: {target}")
+) -> tuple[list[str], int, int]:
+    """Main async checkout logic.
 
-    # Convert .pvt file paths to their corresponding data paths
-    target_path = pathlib.Path(target)
-    if target_path.suffix == ".pvt":
-        target = str(track.get_data_path(target_path))
+    Returns:
+        Tuple of (failures, restored_count, skipped_count).
+    """
+    if targets:
+        unique_targets = _dedupe_targets(targets)
+        files = _validate_and_build_files(unique_targets, tracked_files, stage_outputs)
+        return await _checkout_files_async(files, cache_dir, checkout_modes, behavior)
+    else:
+        # Checkout all tracked files and stage outputs
+        tracked_as_hashes: dict[str, OutputHash] = {
+            path: track.pvt_to_hash_info(pvt) for path, pvt in tracked_files.items()
+        }
+        # Run both in parallel
+        t1 = asyncio.create_task(
+            _checkout_files_async(tracked_as_hashes, cache_dir, checkout_modes, behavior)
+        )
+        t2 = asyncio.create_task(
+            _checkout_files_async(stage_outputs, cache_dir, checkout_modes, behavior)
+        )
+        (f1, r1, s1), (f2, r2, s2) = await asyncio.gather(t1, t2)
+        return (f1 + f2, r1 + r2, s1 + s2)
 
-    # Use normalized path (preserve symlinks) to match keys in tracked_files/stage_outputs
-    abs_path = project.normalize_path(target)
-    abs_path_str = str(abs_path)
 
-    # Check if it's a tracked file
-    if abs_path_str in tracked_files:
-        pvt_data = tracked_files[abs_path_str]
-        output_hash = track.pvt_to_hash_info(pvt_data)
-        result, name = _restore_path(abs_path, output_hash, cache_dir, checkout_modes, behavior)
-        if not quiet:
-            _print_restore_result(result, name)
-        return
+def _print_summary(failures: list[str], restored: int, skipped: int, quiet: bool) -> bool:
+    """Print checkout summary.
 
-    # Check if it's a stage output
-    if abs_path_str in stage_outputs:
-        output_hash = stage_outputs[abs_path_str]
-        if output_hash is None:
-            raise click.ClickException(
-                f"'{target}' has no cached version. "
-                + "Run the stage first, or use 'pivot pull' to fetch from remote."
-            )
-        result, name = _restore_path(abs_path, output_hash, cache_dir, checkout_modes, behavior)
-        if not quiet:
-            _print_restore_result(result, name)
-        return
+    Returns:
+        True if all files were restored successfully, False if any were missing.
+    """
+    if not quiet and (restored or skipped):
+        if restored:
+            click.echo(f"Restored {restored} file(s)")
+        if skipped:
+            click.echo(f"Skipped {skipped} file(s) (already exist)")
 
-    # Unknown target
-    raise click.ClickException(
-        f"'{target}' is not a tracked file or stage output. "
-        + "Use 'pivot list' to see stages or 'pivot track' to track files."
-    )
+    if failures:
+        if restored or skipped:
+            click.echo("")  # Add blank line after success summary
+        click.echo(f"Missing {len(failures)} file(s):")
+        for name in failures[:15]:
+            click.echo(f"  {name}")
+        if len(failures) > 15:
+            click.echo(f"  ... and {len(failures) - 15} more")
+        click.echo("")
+        click.echo("Run 'pivot pull' to fetch from remote storage.")
+        return False
+
+    return True
 
 
 @cli_decorators.pivot_command()
@@ -217,21 +332,13 @@ def checkout(
     # Get stage output info from lock files
     stage_outputs = _get_stage_output_info(state_dir)
 
-    if not targets:
-        # Convert tracked files to OutputHash format
-        tracked_as_hashes = {
-            path: track.pvt_to_hash_info(pvt) for path, pvt in tracked_files.items()
-        }
-        _checkout_files(tracked_as_hashes, cache_dir, checkout_modes, behavior, quiet)
-        _checkout_files(stage_outputs, cache_dir, checkout_modes, behavior, quiet)
-    else:
-        for target in targets:
-            _checkout_target(
-                target,
-                tracked_files,
-                stage_outputs,
-                cache_dir,
-                checkout_modes,
-                behavior,
-                quiet,
-            )
+    # Run async checkout
+    failures, restored, skipped = asyncio.run(
+        _checkout_main_async(
+            targets, tracked_files, stage_outputs, cache_dir, checkout_modes, behavior
+        )
+    )
+
+    success = _print_summary(failures, restored, skipped, quiet)
+    if not success:
+        ctx.exit(1)

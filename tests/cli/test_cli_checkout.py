@@ -447,3 +447,157 @@ def test_checkout_no_targets_no_files_shows_nothing_restored(
 
         # Should complete without error (no targets is valid)
         assert result.exit_code == 0
+
+
+# =============================================================================
+# Partial Success and Parallel Checkout Tests
+# =============================================================================
+
+
+def test_checkout_partial_success_some_missing(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """Checkout continues with partial success, reports cache misses at end."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        cache_dir = pathlib.Path(".pivot") / "cache" / "files"
+        cache_dir.mkdir(parents=True)
+
+        # Create first file - will be in cache
+        data1 = pathlib.Path("data1.txt")
+        data1.write_text("content1")
+        output_hash1 = cache.save_to_cache(data1, cache_dir)
+        assert output_hash1 is not None
+        pvt_data1 = track.PvtData(path="data1.txt", hash=output_hash1["hash"], size=8)
+        track.write_pvt_file(pathlib.Path("data1.txt.pvt"), pvt_data1)
+        data1.unlink()
+
+        # Create second file - will NOT be in cache (fake hash)
+        pvt_data2 = track.PvtData(path="data2.txt", hash="deadbeef12345678", size=100)
+        track.write_pvt_file(pathlib.Path("data2.txt.pvt"), pvt_data2)
+
+        # Checkout all (no targets) should restore data1, fail on data2
+        result = runner.invoke(cli.cli, ["checkout"])
+
+        # Should exit non-zero due to partial failure
+        assert result.exit_code == 1, (
+            f"Expected exit code 1, got {result.exit_code}: {result.output}"
+        )
+        # data1 should be restored
+        assert data1.exists()
+        assert data1.read_text() == "content1"
+        # Summary should indicate both success and failure
+        assert "Restored 1 file(s)" in result.output
+        assert "Missing 1 file(s)" in result.output
+        assert "pivot pull" in result.output
+
+
+def test_checkout_duplicate_targets_deduplicated(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """data.txt and data.txt.pvt resolve to same file, only restored once."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        cache_dir = pathlib.Path(".pivot") / "cache" / "files"
+        cache_dir.mkdir(parents=True)
+
+        # Create and track a file
+        data_file = pathlib.Path("data.txt")
+        data_file.write_text("tracked content")
+        output_hash = cache.save_to_cache(data_file, cache_dir)
+        assert output_hash is not None
+        pvt_data = track.PvtData(path="data.txt", hash=output_hash["hash"], size=15)
+        track.write_pvt_file(pathlib.Path("data.txt.pvt"), pvt_data)
+        data_file.unlink()
+
+        # Checkout both data.txt and data.txt.pvt (duplicate targets)
+        result = runner.invoke(cli.cli, ["checkout", "data.txt", "data.txt.pvt"])
+
+        # Should succeed and only restore once
+        assert result.exit_code == 0, f"Failed: {result.output}"
+        assert data_file.exists()
+        assert data_file.read_text() == "tracked content"
+        # Only one "Restored" message
+        assert result.output.count("Restored") == 1
+
+
+def test_checkout_quiet_with_failures_shows_summary(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """--quiet still shows failure summary when cache misses occur."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        pathlib.Path(".pivot").mkdir()
+
+        # Create pvt file pointing to non-existent cache entry
+        pvt_data = track.PvtData(path="data.txt", hash="deadbeef12345678", size=100)
+        track.write_pvt_file(pathlib.Path("data.txt.pvt"), pvt_data)
+
+        result = runner.invoke(cli.cli, ["--quiet", "checkout"])
+
+        # Should fail
+        assert result.exit_code == 1
+        # Failure summary still shown even with --quiet
+        assert "Missing 1 file(s)" in result.output
+        assert "pivot pull" in result.output
+
+
+def test_checkout_multiple_immediate_errors_aggregated(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """Multiple 'already exists' errors are aggregated into single message."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        cache_dir = pathlib.Path(".pivot") / "cache" / "files"
+        cache_dir.mkdir(parents=True)
+
+        # Create and track two files that already exist
+        for name in ["data1.txt", "data2.txt"]:
+            path = pathlib.Path(name)
+            path.write_text(f"content of {name}")
+            output_hash = cache.save_to_cache(path, cache_dir)
+            assert output_hash is not None
+            pvt_data = track.PvtData(
+                path=name, hash=output_hash["hash"], size=len(f"content of {name}")
+            )
+            track.write_pvt_file(pathlib.Path(f"{name}.pvt"), pvt_data)
+            # Files exist as symlinks after save_to_cache
+
+        # Try checkout without --force - both should error
+        result = runner.invoke(cli.cli, ["checkout"])
+
+        assert result.exit_code == 1
+        # Both errors should be shown
+        assert "data1.txt" in result.output
+        assert "data2.txt" in result.output
+        assert "already exists" in result.output
+
+
+def test_checkout_shows_aggregate_counts(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """Checkout shows aggregate counts, not interleaved file names."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        cache_dir = pathlib.Path(".pivot") / "cache" / "files"
+        cache_dir.mkdir(parents=True)
+
+        # Create 3 tracked files
+        for i in range(1, 4):
+            name = f"data{i}.txt"
+            path = pathlib.Path(name)
+            path.write_text(f"content{i}")
+            output_hash = cache.save_to_cache(path, cache_dir)
+            assert output_hash is not None
+            pvt_data = track.PvtData(path=name, hash=output_hash["hash"], size=8)
+            track.write_pvt_file(pathlib.Path(f"{name}.pvt"), pvt_data)
+            # Remove the file so it needs restoration
+            path.unlink()
+
+        result = runner.invoke(cli.cli, ["checkout"])
+
+        assert result.exit_code == 0, f"Failed: {result.output}"
+        # Should show count, not individual file names
+        assert "Restored 3 file(s)" in result.output
+        # Individual "Restored: data1.txt" lines should NOT appear
+        assert "Restored: data" not in result.output
