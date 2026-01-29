@@ -131,12 +131,19 @@ def _validate_stages(stages_list: list[str] | None, single_stage: bool) -> None:
     cli_helpers.validate_stages_exist(stages_list)
 
 
-def _output_explain(stages_list: list[str] | None, single_stage: bool, force: bool = False) -> None:
+def _output_explain(
+    stages_list: list[str] | None,
+    single_stage: bool,
+    force: bool = False,
+    allow_missing: bool = False,
+) -> None:
     """Output detailed stage explanations using status logic."""
     from pivot import status as status_mod
     from pivot.cli import status as status_cli
 
-    explanations = status_mod.get_pipeline_explanations(stages_list, single_stage, force)
+    explanations = status_mod.get_pipeline_explanations(
+        stages_list, single_stage, force, allow_missing=allow_missing
+    )
     status_cli.output_explain_text(explanations)
 
 
@@ -351,6 +358,11 @@ def _run_watch_with_tui(
     is_flag=True,
     help="Restore tracked files that don't exist on disk from cache before running.",
 )
+@click.option(
+    "--allow-missing",
+    is_flag=True,
+    help="Allow missing dep files if tracked (.pvt exists). Only affects --dry-run.",
+)
 @click.pass_context
 def run(
     ctx: click.Context,
@@ -371,6 +383,7 @@ def run(
     serve: bool,
     allow_uncached_incremental: bool,
     checkout_missing: bool,
+    allow_missing: bool,
 ) -> None:
     """Execute pipeline stages.
 
@@ -407,11 +420,15 @@ def run(
     if serve and not watch:
         raise click.ClickException("--serve requires --watch mode")
 
+    # Validate --allow-missing requires --dry-run
+    if allow_missing and not dry_run:
+        raise click.ClickException("--allow-missing can only be used with --dry-run")
+
     # Handle dry-run modes (with or without explain)
     if dry_run:
         if explain:
             # --dry-run --explain: detailed explanation without execution
-            _output_explain(stages_list, single_stage, force)
+            _output_explain(stages_list, single_stage, force, allow_missing=allow_missing)
         else:
             # --dry-run only: terse output
             ctx.invoke(
@@ -420,6 +437,7 @@ def run(
                 single_stage=single_stage,
                 force=force,
                 as_json=as_json,
+                allow_missing=allow_missing,
             )
         return
 
@@ -585,11 +603,13 @@ class DryRunJsonOutput(TypedDict):
     help="Show what would run if forced",
 )
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON")
+@click.option("--allow-missing", is_flag=True, help="Allow missing dep files if tracked")
 def dry_run_cmd(
     stages: tuple[str, ...],
     single_stage: bool,
     force: bool,
     as_json: bool,
+    allow_missing: bool,
 ) -> None:
     """Show what would run without executing."""
     from pivot import status as status_mod
@@ -597,7 +617,9 @@ def dry_run_cmd(
     stages_list = cli_helpers.stages_to_list(stages)
     _validate_stages(stages_list, single_stage)
 
-    explanations = status_mod.get_pipeline_explanations(stages_list, single_stage, force=force)
+    explanations = status_mod.get_pipeline_explanations(
+        stages_list, single_stage, force=force, allow_missing=allow_missing
+    )
 
     if not explanations:
         if as_json:

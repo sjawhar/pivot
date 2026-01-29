@@ -699,3 +699,237 @@ def test_get_pipeline_explanations_upstream_propagation(tmp_path: Path) -> None:
         assert "stage_a" in stage_b_exp["upstream_stale"], (
             "stage_b should list stage_a as stale upstream"
         )
+
+
+# =============================================================================
+# _find_tracked_hash tests
+# =============================================================================
+
+
+def test_find_tracked_hash_exact_match() -> None:
+    """Finds hash for exact tracked file match."""
+    import pygtrie
+
+    from pivot import explain
+    from pivot.storage.track import PvtData
+
+    tracked_files: dict[str, PvtData] = {
+        "/project/data.csv": PvtData(path="data.csv", hash="abc123", size=100)
+    }
+    tracked_trie: pygtrie.Trie[str] = pygtrie.Trie()
+    tracked_trie[("/", "project", "data.csv")] = "/project/data.csv"
+
+    result = explain._find_tracked_hash(Path("/project/data.csv"), tracked_files, tracked_trie)
+
+    assert result is not None
+    assert result["hash"] == "abc123"
+
+
+def test_find_tracked_hash_inside_directory() -> None:
+    """Finds hash for file inside tracked directory via manifest."""
+    import pygtrie
+
+    from pivot import explain
+    from pivot.storage.track import PvtData
+
+    tracked_files: dict[str, PvtData] = {
+        "/project/data": PvtData(
+            path="data",
+            hash="tree_hash",
+            size=200,
+            num_files=2,
+            manifest=[
+                {"relpath": "file1.csv", "hash": "hash1", "size": 100, "isexec": False},
+                {"relpath": "subdir/file2.csv", "hash": "hash2", "size": 100, "isexec": False},
+            ],
+        )
+    }
+    tracked_trie: pygtrie.Trie[str] = pygtrie.Trie()
+    tracked_trie[("/", "project", "data")] = "/project/data"
+
+    result = explain._find_tracked_hash(
+        Path("/project/data/subdir/file2.csv"), tracked_files, tracked_trie
+    )
+
+    assert result is not None
+    assert result["hash"] == "hash2"
+
+
+def test_find_tracked_hash_not_tracked() -> None:
+    """Returns None for untracked file."""
+    import pygtrie
+
+    from pivot import explain
+    from pivot.storage.track import PvtData
+
+    tracked_files = dict[str, PvtData]()
+    tracked_trie: pygtrie.Trie[str] = pygtrie.Trie()
+
+    result = explain._find_tracked_hash(Path("/project/untracked.csv"), tracked_files, tracked_trie)
+
+    assert result is None
+
+
+def test_find_tracked_hash_not_in_manifest() -> None:
+    """Returns None for file inside tracked dir but not in manifest."""
+    import pygtrie
+
+    from pivot import explain
+    from pivot.storage.track import PvtData
+
+    tracked_files: dict[str, PvtData] = {
+        "/project/data": PvtData(
+            path="data",
+            hash="tree_hash",
+            size=100,
+            num_files=1,
+            manifest=[
+                {"relpath": "file1.csv", "hash": "hash1", "size": 100, "isexec": False},
+            ],
+        )
+    }
+    tracked_trie: pygtrie.Trie[str] = pygtrie.Trie()
+    tracked_trie[("/", "project", "data")] = "/project/data"
+
+    result = explain._find_tracked_hash(
+        Path("/project/data/not_in_manifest.csv"), tracked_files, tracked_trie
+    )
+
+    assert result is None
+
+
+# =============================================================================
+# get_stage_explanation with allow_missing tests
+# =============================================================================
+
+
+def test_get_stage_explanation_with_allow_missing_uses_pvt_hash(tmp_path: Path) -> None:
+    """Uses .pvt hash when allow_missing=True and file is missing."""
+    import pygtrie
+
+    from pivot import project
+    from pivot.storage.track import PvtData
+
+    # Create tracked file data (simulating .pvt file)
+    data_path = tmp_path / "data.csv"
+    normalized_path = str(project.normalize_path(str(data_path)))
+
+    tracked_files: dict[str, PvtData] = {
+        normalized_path: PvtData(path="data.csv", hash="pvt_hash_123", size=100)
+    }
+    tracked_trie: pygtrie.Trie[str] = pygtrie.Trie()
+    tracked_trie[pathlib.Path(normalized_path).parts] = normalized_path
+
+    # Create lock file with matching hash
+    stage_lock = lock.StageLock("pvt_stage", tmp_path / "stages")
+    stage_lock.write(
+        LockData(
+            code_manifest={"self:pvt_stage": "abc"},
+            params={},
+            dep_hashes={normalized_path: {"hash": "pvt_hash_123"}},
+            output_hashes={},
+            dep_generations={},
+        )
+    )
+
+    # File does NOT exist on disk
+    assert not data_path.exists()
+
+    result = explain.get_stage_explanation(
+        stage_name="pvt_stage",
+        fingerprint={"self:pvt_stage": "abc"},
+        deps=[str(data_path)],
+        outs_paths=[],
+        params_instance=None,
+        overrides=None,
+        state_dir=tmp_path,
+        allow_missing=True,
+        tracked_files=tracked_files,
+        tracked_trie=tracked_trie,
+    )
+
+    # Should NOT report as missing deps - should use .pvt hash
+    assert "missing" not in result["reason"].lower(), f"Got: {result['reason']}"
+    assert result["will_run"] is False, "Stage should be cached (hashes match)"
+
+
+def test_get_stage_explanation_with_allow_missing_stale_pvt(tmp_path: Path) -> None:
+    """Detects staleness when .pvt hash differs from lock file."""
+    import pygtrie
+
+    from pivot import project
+    from pivot.storage.track import PvtData
+
+    data_path = tmp_path / "data.csv"
+    normalized_path = str(project.normalize_path(str(data_path)))
+
+    # .pvt has different hash than lock file
+    tracked_files: dict[str, PvtData] = {
+        normalized_path: PvtData(path="data.csv", hash="new_pvt_hash", size=100)
+    }
+    tracked_trie: pygtrie.Trie[str] = pygtrie.Trie()
+    tracked_trie[pathlib.Path(normalized_path).parts] = normalized_path
+
+    stage_lock = lock.StageLock("pvt_stage", tmp_path / "stages")
+    stage_lock.write(
+        LockData(
+            code_manifest={"self:pvt_stage": "abc"},
+            params={},
+            dep_hashes={normalized_path: {"hash": "old_lock_hash"}},
+            output_hashes={},
+            dep_generations={},
+        )
+    )
+
+    result = explain.get_stage_explanation(
+        stage_name="pvt_stage",
+        fingerprint={"self:pvt_stage": "abc"},
+        deps=[str(data_path)],
+        outs_paths=[],
+        params_instance=None,
+        overrides=None,
+        state_dir=tmp_path,
+        allow_missing=True,
+        tracked_files=tracked_files,
+        tracked_trie=tracked_trie,
+    )
+
+    assert result["will_run"] is True
+    assert "dep" in result["reason"].lower() or "input" in result["reason"].lower()
+
+
+def test_get_stage_explanation_allow_missing_untracked_still_fails(tmp_path: Path) -> None:
+    """Still reports missing deps for untracked files even with allow_missing."""
+    import pygtrie
+
+    from pivot.storage.track import PvtData
+
+    tracked_files = dict[str, PvtData]()
+    tracked_trie: pygtrie.Trie[str] = pygtrie.Trie()
+
+    stage_lock = lock.StageLock("stage", tmp_path / "stages")
+    stage_lock.write(
+        LockData(
+            code_manifest={"self:stage": "abc"},
+            params={},
+            dep_hashes={},
+            output_hashes={},
+            dep_generations={},
+        )
+    )
+
+    result = explain.get_stage_explanation(
+        stage_name="stage",
+        fingerprint={"self:stage": "abc"},
+        deps=["/nonexistent/untracked.csv"],
+        outs_paths=[],
+        params_instance=None,
+        overrides=None,
+        state_dir=tmp_path,
+        allow_missing=True,
+        tracked_files=tracked_files,
+        tracked_trie=tracked_trie,
+    )
+
+    assert result["will_run"] is True
+    assert "missing" in result["reason"].lower()

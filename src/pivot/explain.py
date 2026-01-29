@@ -6,11 +6,12 @@ showing specific code, param, and dependency changes.
 
 from __future__ import annotations
 
+import pathlib
 from typing import TYPE_CHECKING, Any, TypeVar
 
 import pydantic
 
-from pivot import parameters
+from pivot import parameters, project
 from pivot.executor import worker
 from pivot.storage import lock, state
 from pivot.types import (
@@ -25,6 +26,10 @@ from pivot.types import (
 if TYPE_CHECKING:
     from collections.abc import Callable
     from pathlib import Path
+
+    import pygtrie
+
+    from pivot.storage.track import PvtData
 
 T = TypeVar("T")
 C = TypeVar("C")
@@ -92,6 +97,56 @@ def diff_dep_hashes(old: dict[str, HashInfo], new: dict[str, HashInfo]) -> list[
     return _diff_dicts(old, new, make_dep_change)
 
 
+def _find_tracked_ancestor(dep: Path, tracked_trie: pygtrie.Trie[str]) -> Path | None:
+    """Find the tracked path that contains dep (exact match or ancestor)."""
+    dep_key = dep.parts
+
+    # Exact match
+    if dep_key in tracked_trie:
+        return pathlib.Path(tracked_trie[dep_key])
+
+    # Dependency is inside a tracked directory
+    prefix_item = tracked_trie.shortest_prefix(dep_key)
+    if prefix_item is not None and prefix_item.value is not None:
+        return pathlib.Path(prefix_item.value)
+
+    return None
+
+
+def _find_tracked_hash(
+    dep: Path,
+    tracked_files: dict[str, PvtData],
+    tracked_trie: pygtrie.Trie[str],
+) -> HashInfo | None:
+    """Find hash for dep from tracked files data.
+
+    Returns HashInfo if dep is tracked (exact match or inside tracked directory),
+    None otherwise.
+    """
+    tracked_path = _find_tracked_ancestor(dep, tracked_trie)
+    if not tracked_path:
+        return None
+
+    pvt_data = tracked_files[str(tracked_path)]
+
+    # Exact match - use top-level hash
+    if dep == tracked_path:
+        if "manifest" in pvt_data:
+            return {"hash": pvt_data["hash"], "manifest": pvt_data["manifest"]}
+        return {"hash": pvt_data["hash"]}
+
+    # Nested path - find in manifest
+    if "manifest" not in pvt_data:
+        return None  # Single file .pvt can't contain nested paths
+
+    relpath = str(dep.relative_to(tracked_path))
+    for entry in pvt_data["manifest"]:
+        if entry["relpath"] == relpath:
+            return {"hash": entry["hash"]}
+
+    return None  # Path not found in manifest
+
+
 def get_stage_explanation(
     stage_name: str,
     fingerprint: dict[str, str],
@@ -101,8 +156,18 @@ def get_stage_explanation(
     overrides: parameters.ParamsOverrides | None,
     state_dir: Path,
     force: bool = False,
+    allow_missing: bool = False,
+    tracked_files: dict[str, PvtData] | None = None,
+    tracked_trie: pygtrie.Trie[str] | None = None,
 ) -> StageExplanation:
-    """Compute detailed explanation of why a stage would run."""
+    """Compute detailed explanation of why a stage would run.
+
+    Args:
+        allow_missing: If True and a dep file is missing, try to use hash from
+            tracked_files (.pvt data) instead of reporting as missing.
+        tracked_files: Dict of absolute path -> PvtData from .pvt files.
+        tracked_trie: Trie of tracked paths for efficient lookup.
+    """
     stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(state_dir))
     lock_data = stage_lock.read()
 
@@ -155,7 +220,29 @@ def get_stage_explanation(
                     dep_changes=[],
                 )
 
-    dep_hashes, missing_deps, unreadable_deps = worker.hash_dependencies(deps)
+    # Hash dependencies - with optional .pvt fallback for missing files
+    if allow_missing and tracked_files is not None and tracked_trie is not None:
+        deps_to_hash = list[str]()
+        pvt_hashes = dict[str, HashInfo]()
+        missing_deps = list[str]()
+
+        for dep in deps:
+            dep_path = pathlib.Path(dep)
+            if dep_path.exists():
+                deps_to_hash.append(dep)
+            else:
+                hash_info = _find_tracked_hash(dep_path, tracked_files, tracked_trie)
+                if hash_info:
+                    normalized = str(project.normalize_path(dep))
+                    pvt_hashes[normalized] = hash_info
+                else:
+                    missing_deps.append(dep)
+
+        file_hashes, more_missing, unreadable_deps = worker.hash_dependencies(deps_to_hash)
+        dep_hashes = {**file_hashes, **pvt_hashes}
+        missing_deps.extend(more_missing)
+    else:
+        dep_hashes, missing_deps, unreadable_deps = worker.hash_dependencies(deps)
 
     if missing_deps:
         return StageExplanation(

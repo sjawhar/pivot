@@ -13,6 +13,7 @@ from pivot import (
     explain,
     metrics,
     parameters,
+    project,
     registry,
 )
 from pivot.remote import config as remote_config
@@ -32,9 +33,24 @@ from pivot.types import (
 )
 
 if TYPE_CHECKING:
+    import pygtrie
     from networkx import DiGraph
 
+    from pivot.storage.track import PvtData
+
 logger = logging.getLogger(__name__)
+
+
+def _discover_tracked_files(
+    allow_missing: bool,
+) -> tuple[dict[str, PvtData] | None, pygtrie.Trie[str] | None]:
+    """Discover tracked files for .pvt hash lookup when allow_missing is set."""
+    if not allow_missing:
+        return None, None
+
+    tracked_files = track.discover_pvt_files(project.get_project_root())
+    tracked_trie = dag.build_tracked_trie(tracked_files) if tracked_files else None
+    return tracked_files, tracked_trie
 
 
 def _get_explanations_in_parallel(
@@ -42,6 +58,9 @@ def _get_explanations_in_parallel(
     state_dir: pathlib.Path,
     overrides: parameters.ParamsOverrides | None,
     force: bool = False,
+    allow_missing: bool = False,
+    tracked_files: dict[str, PvtData] | None = None,
+    tracked_trie: pygtrie.Trie[str] | None = None,
 ) -> dict[str, StageExplanation]:
     """Compute stage explanations in parallel (I/O-bound: lock file reads, hashing)."""
     max_workers = min(8, len(execution_order))
@@ -61,6 +80,9 @@ def _get_explanations_in_parallel(
                 overrides,
                 state_dir,
                 force=force,
+                allow_missing=allow_missing,
+                tracked_files=tracked_files,
+                tracked_trie=tracked_trie,
             )
             futures[future] = stage_name
 
@@ -87,6 +109,7 @@ def get_pipeline_explanations(
     stages: list[str] | None,
     single_stage: bool,
     force: bool = False,
+    allow_missing: bool = False,
 ) -> list[StageExplanation]:
     """Get detailed explanations for all stages with upstream staleness populated.
 
@@ -98,9 +121,11 @@ def get_pipeline_explanations(
         stages: List of stage names to explain, or None for all stages.
         single_stage: If True, only explain the specified stages without dependencies.
         force: If True, mark all stages as would run due to force flag.
+        allow_missing: If True, use .pvt hashes for missing dependency files.
     """
     with metrics.timed("status.get_pipeline_explanations"):
-        graph = registry.REGISTRY.build_dag(validate=True)
+        tracked_files, tracked_trie = _discover_tracked_files(allow_missing)
+        graph = registry.REGISTRY.build_dag(validate=not allow_missing)
         execution_order = dag.get_execution_order(graph, stages, single_stage=single_stage)
 
         if not execution_order:
@@ -110,7 +135,13 @@ def get_pipeline_explanations(
         overrides = parameters.load_params_yaml()
 
         explanations_by_name = _get_explanations_in_parallel(
-            execution_order, state_dir, overrides, force=force
+            execution_order,
+            state_dir,
+            overrides,
+            force=force,
+            allow_missing=allow_missing,
+            tracked_files=tracked_files,
+            tracked_trie=tracked_trie,
         )
 
         # Preserve original order for staleness propagation
@@ -165,6 +196,7 @@ def get_pipeline_status(
     stages: list[str] | None,
     single_stage: bool,
     validate: bool = True,
+    allow_missing: bool = False,
 ) -> tuple[list[PipelineStatusInfo], DiGraph[str]]:
     """Get status for all stages, tracking upstream staleness.
 
@@ -173,8 +205,10 @@ def get_pipeline_status(
         single_stage: If True, check only specified stages without dependencies.
         validate: If True, validate dependency files exist during DAG building.
             Set to False with --allow-missing to skip validation.
+        allow_missing: If True, use .pvt hashes for missing dependency files.
     """
     with metrics.timed("status.get_pipeline_status"):
+        tracked_files, tracked_trie = _discover_tracked_files(allow_missing)
         graph = registry.REGISTRY.build_dag(validate=validate)
         execution_order = dag.get_execution_order(graph, stages, single_stage=single_stage)
 
@@ -184,7 +218,14 @@ def get_pipeline_status(
         state_dir = config.get_state_dir()
         overrides = parameters.load_params_yaml()
 
-        explanations_by_name = _get_explanations_in_parallel(execution_order, state_dir, overrides)
+        explanations_by_name = _get_explanations_in_parallel(
+            execution_order,
+            state_dir,
+            overrides,
+            allow_missing=allow_missing,
+            tracked_files=tracked_files,
+            tracked_trie=tracked_trie,
+        )
 
         # Preserve original order for staleness propagation
         explanations = [explanations_by_name[name] for name in execution_order]

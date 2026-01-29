@@ -69,6 +69,18 @@ def _helper_stage_b(
     return _BTxtOutputs(output=pathlib.Path("b.txt"))
 
 
+class _DirDepOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
+
+
+def _helper_dir_dep_stage(
+    data_file: Annotated[pathlib.Path, outputs.Dep("data/file.csv", loaders.PathOnly())],
+) -> _DirDepOutputs:
+    _ = data_file
+    pathlib.Path("output.txt").write_text("done")
+    return _DirDepOutputs(output=pathlib.Path("output.txt"))
+
+
 # =============================================================================
 # Help and Basic Tests
 # =============================================================================
@@ -549,3 +561,81 @@ def test_verify_quiet_exits_1_when_failed(
 
         assert result.exit_code == 1
         assert result.output.strip() == "", "Quiet mode should suppress output"
+
+
+# =============================================================================
+# PVT Hash Fallback Tests
+# =============================================================================
+
+
+def test_verify_allow_missing_uses_pvt_hash_for_deps(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, mocker: MockerFixture
+) -> None:
+    """verify --allow-missing uses .pvt hash when dep file is missing."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+
+        # Create input.txt and run stage to cache
+        pathlib.Path("input.txt").write_text("data")
+        register_test_stage(_helper_process, name="process")
+        executor.run(show_output=False)
+
+        # Track the input file (create .pvt)
+        from pivot.storage import track
+
+        input_hash = cache.hash_file(pathlib.Path("input.txt"))
+        pvt_data = track.PvtData(path="input.txt", hash=input_hash, size=4)
+        track.write_pvt_file(pathlib.Path("input.txt.pvt"), pvt_data)
+
+        # Delete the actual input file (simulating CI without data)
+        pathlib.Path("input.txt").unlink()
+
+        _setup_mock_remote(mocker, files_exist_on_remote=True)
+
+        result = runner.invoke(cli.cli, ["verify", "--allow-missing"])
+
+        # Should NOT fail with "Missing deps" - should use .pvt hash
+        assert "Missing deps" not in result.output, f"Got: {result.output}"
+        assert result.exit_code == 0, f"Expected pass, got: {result.output}"
+
+
+def test_verify_allow_missing_uses_pvt_hash_for_nested_dep(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, mocker: MockerFixture
+) -> None:
+    """verify --allow-missing uses directory .pvt manifest for nested file dep."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+
+        # Create data directory with file
+        data_dir = pathlib.Path("data")
+        data_dir.mkdir()
+        (data_dir / "file.csv").write_text("content")
+
+        register_test_stage(_helper_dir_dep_stage, name="process")
+        executor.run(show_output=False)
+
+        # Track the directory (create .pvt with manifest)
+        from pivot.storage import track
+
+        dir_hash, manifest = cache.hash_directory(data_dir)
+        pvt_data = track.PvtData(
+            path="data",
+            hash=dir_hash,
+            size=7,
+            num_files=1,
+            manifest=manifest,
+        )
+        track.write_pvt_file(pathlib.Path("data.pvt"), pvt_data)
+
+        # Delete the actual data directory (simulating CI without data)
+        import shutil
+
+        shutil.rmtree(data_dir)
+
+        _setup_mock_remote(mocker, files_exist_on_remote=True)
+
+        result = runner.invoke(cli.cli, ["verify", "--allow-missing"])
+
+        # Should use manifest entry hash for data/file.csv
+        assert "Missing deps" not in result.output, f"Got: {result.output}"
+        assert result.exit_code == 0, f"Expected pass, got: {result.output}"
