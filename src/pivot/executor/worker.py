@@ -12,6 +12,7 @@ import logging
 import os
 import pathlib
 import queue
+import random
 import sys
 import threading
 from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast, override
@@ -532,6 +533,21 @@ def _verify_outputs_exist(stage_outs: list[outputs.BaseOut]) -> None:
             raise exceptions.OutputMissingError(f"Stage did not produce output: {out.path}")
 
 
+def _set_deterministic_seeds() -> None:
+    """Set random seeds for reproducible stage execution.
+
+    Called before each stage to ensure determinism. Users can override
+    by calling random.seed() or np.random.seed() in their stage code.
+    """
+    random.seed(0)
+    try:
+        import numpy as np
+
+        np.random.seed(0)
+    except ImportError:
+        pass  # NumPy is optional; stdlib random is still seeded
+
+
 def _execute_with_joblib_protection(func: Callable[..., Any], kwargs: dict[str, Any]) -> Any:
     """Execute stage with joblib threading backend to avoid nested multiprocessing issues.
 
@@ -614,6 +630,8 @@ def _run_stage_function_with_injection(
         if dep_specs:
             loaded_deps = stage_def.load_deps_from_specs(dep_specs, root)
             kwargs.update(loaded_deps)
+
+        _set_deterministic_seeds()
 
         # Execute function with joblib threading protection
         result = _execute_with_joblib_protection(func, kwargs)
