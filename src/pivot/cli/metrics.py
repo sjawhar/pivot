@@ -3,9 +3,9 @@ from __future__ import annotations
 import click
 
 from pivot import config, outputs, project
+from pivot.cli import _run_common
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import targets as cli_targets
-from pivot.cli.run import ensure_stages_registered
 from pivot.show import metrics as metrics_mod
 from pivot.types import OutputFormat
 
@@ -41,7 +41,7 @@ def metrics_show(
     """
     precision = precision if precision is not None else config.get_display_precision()
     proj_root = project.get_project_root()
-    ensure_stages_registered()
+    _run_common.ensure_stages_registered()
 
     paths = cli_targets.resolve_and_validate(targets, proj_root, outputs.Metric)
     if paths is not None:
@@ -81,7 +81,7 @@ def metrics_diff(
     """
     precision = precision if precision is not None else config.get_display_precision()
     proj_root = project.get_project_root()
-    ensure_stages_registered()
+    _run_common.ensure_stages_registered()
 
     paths = cli_targets.resolve_and_validate(targets, proj_root, outputs.Metric)
     if paths is not None:

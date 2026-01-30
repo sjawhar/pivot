@@ -5,9 +5,9 @@ import pathlib
 import click
 
 from pivot import outputs, path_policy, project
+from pivot.cli import _run_common
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import targets as cli_targets
-from pivot.cli.run import ensure_stages_registered
 from pivot.show import plots as plots_mod
 from pivot.types import OutputFormat
 
@@ -37,7 +37,7 @@ def plots_show(targets: tuple[str, ...], output: pathlib.Path, open_browser: boo
     If no TARGETS are specified, shows plots from all registered stages.
     """
     proj_root = project.get_project_root()
-    ensure_stages_registered()
+    _run_common.ensure_stages_registered()
 
     # Validate output path stays within project
     path_policy.require_valid_path(
@@ -86,7 +86,7 @@ def plots_diff(targets: tuple[str, ...], json_output: bool, md: bool, no_path: b
     If no TARGETS are specified, compares all registered stages' Plot outputs.
     """
     proj_root = project.get_project_root()
-    ensure_stages_registered()
+    _run_common.ensure_stages_registered()
 
     paths = cli_targets.resolve_and_validate(targets, proj_root, outputs.Plot)
     if paths is not None:

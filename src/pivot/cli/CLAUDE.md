@@ -57,7 +57,7 @@ The decorator ensures consistent behavior regardless of command order.
 Commands under a `@click.group()` (like `pivot metrics show`) can't use `pivot_command`. Use `@with_error_handling` and call `ensure_stages_registered()` explicitly:
 
 ```python
-from pivot.cli.run import ensure_stages_registered
+from pivot.cli._run_common import ensure_stages_registered
 
 @metrics.command("show")
 @cli_decorators.with_error_handling

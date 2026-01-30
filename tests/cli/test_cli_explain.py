@@ -1,4 +1,4 @@
-"""Tests for --explain CLI flag."""
+"""Tests for --explain CLI flag (repro command)."""
 
 from __future__ import annotations
 
@@ -90,38 +90,38 @@ def _helper_train(
 
 
 # =============================================================================
-# Basic --explain flag tests
+# Basic --explain flag tests (repro command)
 # =============================================================================
 
 
 def test_explain_flag_in_help(runner: CliRunner) -> None:
-    """--explain flag should appear in help output."""
-    result = runner.invoke(cli.cli, ["run", "--help"])
+    """--explain flag should appear in repro help output."""
+    result = runner.invoke(cli.cli, ["repro", "--help"])
 
     assert result.exit_code == 0
     assert "--explain" in result.output
 
 
 def test_explain_no_stages(runner: CliRunner, tmp_path: pathlib.Path) -> None:
-    """--explain with no stages shows appropriate message."""
+    """repro --explain with no stages shows appropriate message."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
 
-        result = runner.invoke(cli.cli, ["run", "--explain"])
+        result = runner.invoke(cli.cli, ["repro", "--explain"])
 
         assert result.exit_code == 0
         assert "No stages" in result.output
 
 
 def test_explain_flag_works(runner: CliRunner, tmp_path: pathlib.Path) -> None:
-    """--explain produces output for stages."""
+    """repro --explain produces output for stages."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
 
         register_test_stage(_helper_process, name="process")
 
-        result = runner.invoke(cli.cli, ["run", "--explain"])
+        result = runner.invoke(cli.cli, ["repro", "--explain"])
 
         assert result.exit_code == 0
         assert "process" in result.output
@@ -129,7 +129,7 @@ def test_explain_flag_works(runner: CliRunner, tmp_path: pathlib.Path) -> None:
 
 
 def test_explain_specific_stages(runner: CliRunner, tmp_path: pathlib.Path) -> None:
-    """--explain can target specific stages."""
+    """repro --explain can target specific stages."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
@@ -137,7 +137,7 @@ def test_explain_specific_stages(runner: CliRunner, tmp_path: pathlib.Path) -> N
         register_test_stage(_helper_stage_a, name="stage_a")
         register_test_stage(_helper_stage_b, name="stage_b")
 
-        result = runner.invoke(cli.cli, ["run", "--explain", "stage_a"])
+        result = runner.invoke(cli.cli, ["repro", "--explain", "stage_a"])
 
         assert result.exit_code == 0
         assert "stage_a" in result.output
@@ -150,7 +150,7 @@ def test_explain_specific_stages(runner: CliRunner, tmp_path: pathlib.Path) -> N
 
 
 def test_explain_shows_code_changes(runner: CliRunner, tmp_path: pathlib.Path) -> None:
-    """--explain shows code changes when code differs."""
+    """repro --explain shows code changes when code differs."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
@@ -164,7 +164,7 @@ def test_explain_shows_code_changes(runner: CliRunner, tmp_path: pathlib.Path) -
 
         register_test_stage(_helper_process_v2, name="process")
 
-        result = runner.invoke(cli.cli, ["run", "--explain"])
+        result = runner.invoke(cli.cli, ["repro", "--explain"])
 
         assert result.exit_code == 0
         assert "WILL RUN" in result.output
@@ -172,7 +172,7 @@ def test_explain_shows_code_changes(runner: CliRunner, tmp_path: pathlib.Path) -
 
 
 def test_explain_shows_param_changes(runner: CliRunner, tmp_path: pathlib.Path) -> None:
-    """--explain shows param changes when params differ."""
+    """repro --explain shows param changes when params differ."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
@@ -184,7 +184,7 @@ def test_explain_shows_param_changes(runner: CliRunner, tmp_path: pathlib.Path) 
         # Change params via params.yaml
         pathlib.Path("params.yaml").write_text("train:\n  learning_rate: 0.001\n")
 
-        result = runner.invoke(cli.cli, ["run", "--explain"])
+        result = runner.invoke(cli.cli, ["repro", "--explain"])
 
         assert result.exit_code == 0
         assert "WILL RUN" in result.output
@@ -192,7 +192,7 @@ def test_explain_shows_param_changes(runner: CliRunner, tmp_path: pathlib.Path) 
 
 
 def test_explain_shows_dep_changes(runner: CliRunner, tmp_path: pathlib.Path) -> None:
-    """--explain shows dependency changes when deps differ."""
+    """repro --explain shows dependency changes when deps differ."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("original data")
@@ -204,7 +204,7 @@ def test_explain_shows_dep_changes(runner: CliRunner, tmp_path: pathlib.Path) ->
         # Modify the input file
         pathlib.Path("input.txt").write_text("modified data")
 
-        result = runner.invoke(cli.cli, ["run", "--explain"])
+        result = runner.invoke(cli.cli, ["repro", "--explain"])
 
         assert result.exit_code == 0
         assert "WILL RUN" in result.output
@@ -212,7 +212,7 @@ def test_explain_shows_dep_changes(runner: CliRunner, tmp_path: pathlib.Path) ->
 
 
 def test_explain_shows_unchanged(runner: CliRunner, tmp_path: pathlib.Path) -> None:
-    """--explain shows stages as unchanged when nothing differs."""
+    """repro --explain shows stages as unchanged when nothing differs."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
@@ -221,7 +221,7 @@ def test_explain_shows_unchanged(runner: CliRunner, tmp_path: pathlib.Path) -> N
 
         executor.run()
 
-        result = runner.invoke(cli.cli, ["run", "--explain"])
+        result = runner.invoke(cli.cli, ["repro", "--explain"])
 
         assert result.exit_code == 0
         assert "process" in result.output
@@ -229,14 +229,14 @@ def test_explain_shows_unchanged(runner: CliRunner, tmp_path: pathlib.Path) -> N
 
 
 def test_explain_shows_no_previous_run(runner: CliRunner, tmp_path: pathlib.Path) -> None:
-    """--explain shows 'No previous run' for never-run stages."""
+    """repro --explain shows 'No previous run' for never-run stages."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
 
         register_test_stage(_helper_process, name="process")
 
-        result = runner.invoke(cli.cli, ["run", "--explain"])
+        result = runner.invoke(cli.cli, ["repro", "--explain"])
 
         assert result.exit_code == 0
         assert "No previous run" in result.output
@@ -248,14 +248,14 @@ def test_explain_shows_no_previous_run(runner: CliRunner, tmp_path: pathlib.Path
 
 
 def test_explain_short_flag(runner: CliRunner, tmp_path: pathlib.Path) -> None:
-    """-e short flag works like --explain."""
+    """repro -e short flag works like --explain."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
 
         register_test_stage(_helper_process, name="process")
 
-        result = runner.invoke(cli.cli, ["run", "-e"])
+        result = runner.invoke(cli.cli, ["repro", "-e"])
 
         assert result.exit_code == 0
         assert "process" in result.output
@@ -268,11 +268,11 @@ def test_explain_short_flag(runner: CliRunner, tmp_path: pathlib.Path) -> None:
 
 
 def test_explain_unknown_stage_errors(runner: CliRunner, tmp_path: pathlib.Path) -> None:
-    """--explain with unknown stage shows error."""
+    """repro --explain with unknown stage shows error."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
 
-        result = runner.invoke(cli.cli, ["run", "--explain", "nonexistent"])
+        result = runner.invoke(cli.cli, ["repro", "--explain", "nonexistent"])
 
         assert result.exit_code != 0
         assert "nonexistent" in result.output.lower() or "unknown" in result.output.lower()

@@ -267,7 +267,7 @@ pivot config set default_remote origin
 
 ```bash
 # Run pipeline
-pivot run
+pivot repro
 
 # Compare outputs with DVC
 diff data/processed.csv data/processed.csv.dvc_backup
@@ -290,7 +290,7 @@ During migration, you can run both tools:
 
 ```bash
 # Run with Pivot
-pivot run
+pivot repro
 
 # Validate outputs match DVC
 pivot export

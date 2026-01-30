@@ -263,7 +263,7 @@ If automatic detection fails, manually invalidate:
 
 ```bash
 # Force re-run of specific stage
-pivot run train --force
+pivot repro train --force
 ```
 
 ## Further Reading
