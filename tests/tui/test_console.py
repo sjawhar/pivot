@@ -343,6 +343,7 @@ def test_console_explain_stage(
         code_changes=[],
         param_changes=[],
         dep_changes=[],
+        upstream_stale=[],
     )
 
     con.explain_stage(explanation)

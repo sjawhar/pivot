@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import pathlib
 import sys
 
 import click
@@ -38,7 +37,6 @@ from pivot.types import (
 @click.option("--tracked-only", is_flag=True, help="Show only tracked files")
 @click.option("--remote-only", is_flag=True, help="Show only remote status")
 @click.option("--remote", "-r", is_flag=True, help="Include remote sync status")
-@click.option("--cache-dir", type=click.Path(path_type=pathlib.Path), help="Cache directory")
 @click.pass_context
 def status(
     ctx: click.Context,
@@ -50,7 +48,6 @@ def status(
     tracked_only: bool,
     remote_only: bool,
     remote: bool,
-    cache_dir: pathlib.Path | None,
 ) -> None:
     """Show pipeline, tracked files, and remote status."""
     cli_ctx = cli_helpers.get_cli_context(ctx)
@@ -60,7 +57,7 @@ def status(
     cli_helpers.validate_stages_exist(stages_list)
 
     project_root = project.get_project_root()
-    resolved_cache_dir = cache_dir or config.get_cache_dir()
+    resolved_cache_dir = config.get_cache_dir()
 
     show_all = not (stages_only or tracked_only or remote_only)
     show_stages = show_all or stages_only
@@ -235,7 +232,7 @@ def _output_explain_json(
                 code_changes=exp["code_changes"],
                 param_changes=exp["param_changes"],
                 dep_changes=exp["dep_changes"],
-                upstream_stale=exp.get("upstream_stale", []),
+                upstream_stale=exp["upstream_stale"],
             )
             stages.append(stage_data)
         data["stages"] = stages

@@ -4,6 +4,7 @@ import pydantic
 import pytest
 
 from pivot import config, project
+from pivot.config import io as config_io
 from pivot.exceptions import ConfigError
 
 
@@ -21,6 +22,7 @@ def _write_config(project_root: pathlib.Path, content: str) -> None:
     """Helper to write config file."""
     config_file = project_root / ".pivot" / "config.yaml"
     config_file.write_text(content)
+    config_io.clear_config_cache()
 
 
 # --- cache.dir tests ---
@@ -57,6 +59,73 @@ def test_cache_dir_default_when_no_config(project_root: pathlib.Path) -> None:
 
     result = config.get_cache_dir()
     assert result == project_root / ".pivot" / "cache"
+
+
+# --- PIVOT_CACHE_DIR env var tests ---
+
+
+def test_cache_dir_env_var_overrides_config(
+    project_root: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PIVOT_CACHE_DIR env var takes precedence over config file."""
+    _write_config(project_root, "cache:\n  dir: config-cache\n")
+    monkeypatch.setenv("PIVOT_CACHE_DIR", "env-cache")
+
+    result = config.get_cache_dir()
+    assert result == project_root / "env-cache"
+
+
+def test_cache_dir_env_var_absolute_path(
+    project_root: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Absolute path in PIVOT_CACHE_DIR is used as-is."""
+    absolute_cache = project_root / "absolute-env-cache"
+    monkeypatch.setenv("PIVOT_CACHE_DIR", str(absolute_cache))
+
+    result = config.get_cache_dir()
+    assert result == absolute_cache
+
+
+def test_cache_dir_env_var_relative_path(
+    project_root: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Relative path in PIVOT_CACHE_DIR resolved against project root."""
+    monkeypatch.setenv("PIVOT_CACHE_DIR", "data/env-cache")
+
+    result = config.get_cache_dir()
+    assert result == project_root / "data" / "env-cache"
+
+
+def test_cache_dir_env_var_empty_uses_config(
+    project_root: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Empty PIVOT_CACHE_DIR treated as unset, falls back to config."""
+    _write_config(project_root, "cache:\n  dir: config-cache\n")
+    monkeypatch.setenv("PIVOT_CACHE_DIR", "")
+
+    result = config.get_cache_dir()
+    assert result == project_root / "config-cache"
+
+
+def test_cache_dir_env_var_whitespace_only_uses_config(
+    project_root: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Whitespace-only PIVOT_CACHE_DIR treated as unset, falls back to config."""
+    _write_config(project_root, "cache:\n  dir: config-cache\n")
+    monkeypatch.setenv("PIVOT_CACHE_DIR", "   ")
+
+    result = config.get_cache_dir()
+    assert result == project_root / "config-cache"
+
+
+def test_cache_dir_env_var_without_config(
+    project_root: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PIVOT_CACHE_DIR works even when no config file exists."""
+    monkeypatch.setenv("PIVOT_CACHE_DIR", "env-only-cache")
+
+    result = config.get_cache_dir()
+    assert result == project_root / "env-only-cache"
 
 
 # --- core.state_dir tests ---

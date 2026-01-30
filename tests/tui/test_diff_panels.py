@@ -539,6 +539,7 @@ def test_input_panel_empty_state_no_inputs() -> None:
         code_changes=[],
         dep_changes=[],
         param_changes=[],
+        upstream_stale=[],
     )
     result = panel._render_empty_state()
     assert "No inputs" in result
@@ -756,6 +757,7 @@ def test_input_panel_set_from_snapshot(mocker: MockerFixture) -> None:
         ],
         dep_changes=[],
         param_changes=[],
+        upstream_stale=[],
     )
     panel.set_from_snapshot(snapshot)
 

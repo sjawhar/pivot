@@ -30,6 +30,16 @@ All commands support:
 
 ---
 
+## Environment Variables
+
+| Variable | Description |
+|----------|-------------|
+| `PIVOT_CACHE_DIR` | Override cache directory location |
+
+**`PIVOT_CACHE_DIR`** takes precedence over the `cache.dir` config setting. Relative paths are resolved against the project root. Empty or whitespace-only values are treated as unset, falling back to the config file (or `.pivot/cache` if no config is set).
+
+---
+
 ## Pipeline Execution
 
 ### `pivot run`
@@ -49,7 +59,6 @@ pivot run [STAGES...] [OPTIONS]
 | Option | Description |
 |--------|-------------|
 | `--single-stage` / `-s` | Run only specified stages without dependencies |
-| `--cache-dir PATH` | Custom cache directory |
 | `--dry-run` / `-n` | Show what would run without executing |
 | `--explain` / `-e` | Show detailed breakdown of why stages run |
 | `--force` / `-f` | Force re-run of stages, ignoring cache (in --watch mode, first run only) |
@@ -127,7 +136,6 @@ pivot status [STAGES...] [OPTIONS]
 | `--tracked-only` | Show only tracked files |
 | `--remote-only` | Show only remote status |
 | `--remote` / `-r` | Include remote sync status |
-| `--cache-dir PATH` | Cache directory |
 
 ---
 

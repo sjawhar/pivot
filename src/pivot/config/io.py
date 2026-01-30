@@ -299,9 +299,18 @@ def get_run_history_retention() -> int:
 
 
 def get_cache_dir() -> pathlib.Path:
-    """Get cache directory from merged config, resolved to absolute path."""
-    merged = get_merged_config()
-    cache_dir = pathlib.Path(merged.cache.dir)
+    """Get cache directory, checking env var first.
+
+    Precedence: PIVOT_CACHE_DIR env var > config file > default (.pivot/cache).
+    Relative paths are resolved against the project root.
+    """
+    env_cache = os.environ.get("PIVOT_CACHE_DIR", "").strip()
+    if env_cache:
+        cache_dir = pathlib.Path(env_cache)
+    else:
+        merged = get_merged_config()
+        cache_dir = pathlib.Path(merged.cache.dir)
+
     if not cache_dir.is_absolute():
         cache_dir = project.get_project_root() / cache_dir
     return cache_dir

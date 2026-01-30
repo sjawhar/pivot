@@ -244,6 +244,7 @@ def get_stage_explanation(
             code_changes=[],
             param_changes=[],
             dep_changes=[],
+            upstream_stale=[],
         )
 
     try:
@@ -257,6 +258,7 @@ def get_stage_explanation(
             code_changes=[],
             param_changes=[],
             dep_changes=[],
+            upstream_stale=[],
         )
 
     # Check generation tracking first (O(1) skip detection)
@@ -282,6 +284,7 @@ def get_stage_explanation(
                     code_changes=[],
                     param_changes=[],
                     dep_changes=[],
+                    upstream_stale=[],
                 )
 
     # Hash dependencies - with optional .pvt fallback for missing files
@@ -319,6 +322,7 @@ def get_stage_explanation(
             code_changes=[],
             param_changes=[],
             dep_changes=[],
+            upstream_stale=[],
         )
 
     if unreadable_deps:
@@ -332,6 +336,7 @@ def get_stage_explanation(
             code_changes=[],
             param_changes=[],
             dep_changes=[],
+            upstream_stale=[],
         )
 
     # Extract lock data fields (LockData uses total=False, so check membership)
@@ -366,4 +371,5 @@ def get_stage_explanation(
         code_changes=code_changes,
         param_changes=param_changes,
         dep_changes=dep_changes,
+        upstream_stale=[],
     )
