@@ -50,7 +50,7 @@ def build_dag(
 
         outputs_map = _build_outputs_map(stages)
         outputs_trie = _build_outputs_trie(stages)
-        tracked_trie = _build_tracked_trie(tracked_files) if tracked_files else None
+        tracked_trie = build_tracked_trie(tracked_files) if tracked_files else None
 
         for stage_name, stage_info in stages.items():
             for dep in stage_info["deps_paths"]:
@@ -135,7 +135,7 @@ def _find_producers_for_path(
     return producers
 
 
-def _build_tracked_trie(tracked_files: dict[str, PvtData]) -> pygtrie.Trie[str]:
+def build_tracked_trie(tracked_files: dict[str, PvtData]) -> pygtrie.Trie[str]:
     """Build trie of tracked file paths for dependency checking.
 
     Keys are path tuples (from Path.parts), values are the absolute path string.
