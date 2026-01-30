@@ -370,7 +370,7 @@ def execute_stage(
         except KeyboardInterrupt:
             return _make_result(StageStatus.FAILED, "KeyboardInterrupt", output_lines)
         except Exception as e:
-            return _make_result(StageStatus.FAILED, str(e), output_lines)
+            return _make_result(StageStatus.FAILED, repr(e), output_lines)
 
 
 def _get_normalized_out_paths(stage_info: WorkerStageInfo) -> list[str]:

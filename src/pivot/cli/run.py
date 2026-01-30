@@ -286,9 +286,7 @@ def _run_watch_with_tui(
         eng.set_keep_going(on_error == OnError.KEEP_GOING)
 
         # Build bipartite graph for watch paths
-        all_stages = {
-            name: registry.REGISTRY.get(name) for name in registry.REGISTRY.list_stages()
-        }
+        all_stages = {name: registry.REGISTRY.get(name) for name in registry.REGISTRY.list_stages()}
         bipartite_graph = engine_graph.build_graph(all_stages)
         watch_paths = engine_graph.get_watch_paths(bipartite_graph)
 
@@ -522,8 +520,7 @@ def run(
 
                 # Build bipartite graph for watch paths
                 all_stages = {
-                    name: registry.REGISTRY.get(name)
-                    for name in registry.REGISTRY.list_stages()
+                    name: registry.REGISTRY.get(name) for name in registry.REGISTRY.list_stages()
                 }
                 bipartite_graph = engine_graph.build_graph(all_stages)
                 watch_paths = engine_graph.get_watch_paths(bipartite_graph)

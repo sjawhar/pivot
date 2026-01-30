@@ -61,7 +61,7 @@ class ConsoleSink:
             name=event["stage"],
             index=event["index"],
             total=event["total"],
-            status=StageDisplayStatus.RUNNING,
+            status=StageDisplayStatus.FINGERPRINTING,
         )
 
     def _handle_stage_completed(self, event: StageCompleted) -> None:

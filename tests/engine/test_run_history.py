@@ -7,12 +7,13 @@ from typing import TYPE_CHECKING
 import pytest
 
 from pivot import config
-from pivot.engine import engine
 from pivot.storage import state as state_mod
 from tests import helpers
 
 if TYPE_CHECKING:
     import pathlib
+
+    from pivot.engine import engine
 
 
 def _helper_stage_func(params: None) -> dict[str, str]:

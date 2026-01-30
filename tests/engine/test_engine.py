@@ -134,7 +134,6 @@ def test_engine_graph_property_returns_bipartite_graph(tmp_path: pathlib.Path) -
     - Graph is a networkx DiGraph with bipartite structure (artifact and stage nodes)
     """
     with engine.Engine() as eng:
-
         # Verify graph attribute exists and starts as None
         assert hasattr(eng, "graph")
         assert eng.graph is None
@@ -225,139 +224,152 @@ def test_engine_close_closes_all_sinks() -> None:
 
 def test_engine_run_once_returns_execution_summary() -> None:
     """run_once() returns dict mapping stage names to ExecutionSummary."""
-    with patch.object(
-        engine.Engine,
-        "_orchestrate_execution",
-        return_value={"test_stage": {"status": "ran", "reason": ""}},
+    with (
+        patch.object(
+            engine.Engine,
+            "_orchestrate_execution",
+            return_value={"test_stage": {"status": "ran", "reason": ""}},
+        ),
+        engine.Engine() as eng,
     ):
-        with engine.Engine() as eng:
-            result = eng.run_once()
+        result = eng.run_once()
 
-            assert isinstance(result, dict)
-            assert "test_stage" in result
+        assert isinstance(result, dict)
+        assert "test_stage" in result
 
 
 def test_engine_run_once_passes_stages_parameter() -> None:
     """run_once() passes stages parameter to _orchestrate_execution."""
-    with patch.object(engine.Engine, "_orchestrate_execution", return_value={}) as mock_orchestrate:
-        with engine.Engine() as eng:
-            eng.run_once(stages=["stage_a", "stage_b"])
+    with (
+        patch.object(engine.Engine, "_orchestrate_execution", return_value={}) as mock_orchestrate,
+        engine.Engine() as eng,
+    ):
+        eng.run_once(stages=["stage_a", "stage_b"])
 
-            mock_orchestrate.assert_called_once()
-            call_kwargs = mock_orchestrate.call_args.kwargs
-            assert call_kwargs["stages"] == ["stage_a", "stage_b"]
+        mock_orchestrate.assert_called_once()
+        call_kwargs = mock_orchestrate.call_args.kwargs
+        assert call_kwargs["stages"] == ["stage_a", "stage_b"]
 
 
 def test_engine_run_once_passes_force_parameter() -> None:
     """run_once() passes force parameter to _orchestrate_execution."""
-    with patch.object(engine.Engine, "_orchestrate_execution", return_value={}) as mock_orchestrate:
-        with engine.Engine() as eng:
-            eng.run_once(force=True)
+    with (
+        patch.object(engine.Engine, "_orchestrate_execution", return_value={}) as mock_orchestrate,
+        engine.Engine() as eng,
+    ):
+        eng.run_once(force=True)
 
-            call_kwargs = mock_orchestrate.call_args.kwargs
-            assert call_kwargs["force"] is True
+        call_kwargs = mock_orchestrate.call_args.kwargs
+        assert call_kwargs["force"] is True
 
 
 def test_engine_run_once_emits_state_changed_events() -> None:
     """run_once() emits engine state changed events."""
-    with patch.object(engine.Engine, "_orchestrate_execution", return_value={}):
-        with engine.Engine() as eng:
-            sink = _MockSink()
-            eng.add_sink(sink)
-            eng.run_once()
+    with (
+        patch.object(engine.Engine, "_orchestrate_execution", return_value={}),
+        engine.Engine() as eng,
+    ):
+        sink = _MockSink()
+        eng.add_sink(sink)
+        eng.run_once()
 
-            # Should emit ACTIVE at start and IDLE at end
-            state_events = [e for e in sink.events if e["type"] == "engine_state_changed"]
-            assert len(state_events) == 2
-            assert state_events[0]["state"] == types.EngineState.ACTIVE
-            assert state_events[1]["state"] == types.EngineState.IDLE
+        # Should emit ACTIVE at start and IDLE at end
+        state_events = [e for e in sink.events if e["type"] == "engine_state_changed"]
+        assert len(state_events) == 2
+        assert state_events[0]["state"] == types.EngineState.ACTIVE
+        assert state_events[1]["state"] == types.EngineState.IDLE
 
 
 def test_engine_run_once_passes_all_orchestration_params() -> None:
     """run_once() passes through all relevant orchestration parameters."""
-    with patch.object(engine.Engine, "_orchestrate_execution", return_value={}) as mock_orchestrate:
-        with engine.Engine() as eng:
-            eng.run_once(
-                stages=["stage_a"],
-                force=True,
-                single_stage=True,
-                parallel=False,
-                max_workers=4,
-                no_commit=True,
-                no_cache=True,
-                allow_uncached_incremental=True,  # Retained for CLI but not passed to orchestration
-                checkout_missing=True,  # Retained for CLI but not passed to orchestration
-            )
+    with (
+        patch.object(engine.Engine, "_orchestrate_execution", return_value={}) as mock_orchestrate,
+        engine.Engine() as eng,
+    ):
+        eng.run_once(
+            stages=["stage_a"],
+            force=True,
+            single_stage=True,
+            parallel=False,
+            max_workers=4,
+            no_commit=True,
+            no_cache=True,
+            allow_uncached_incremental=True,  # Retained for CLI but not passed to orchestration
+            checkout_missing=True,  # Retained for CLI but not passed to orchestration
+        )
 
-            call_kwargs = mock_orchestrate.call_args.kwargs
-            assert call_kwargs["stages"] == ["stage_a"]
-            assert call_kwargs["force"] is True
-            assert call_kwargs["single_stage"] is True
-            assert call_kwargs["parallel"] is False
-            assert call_kwargs["max_workers"] == 4
-            assert call_kwargs["no_commit"] is True
-            assert call_kwargs["no_cache"] is True
-            # Note: allow_uncached_incremental and checkout_missing are retained for CLI
-            # compatibility but not passed to _orchestrate_execution (handled differently)
+        call_kwargs = mock_orchestrate.call_args.kwargs
+        assert call_kwargs["stages"] == ["stage_a"]
+        assert call_kwargs["force"] is True
+        assert call_kwargs["single_stage"] is True
+        assert call_kwargs["parallel"] is False
+        assert call_kwargs["max_workers"] == 4
+        assert call_kwargs["no_commit"] is True
+        assert call_kwargs["no_cache"] is True
+        # Note: allow_uncached_incremental and checkout_missing are retained for CLI
+        # compatibility but not passed to _orchestrate_execution (handled differently)
 
 
 def test_engine_integration_with_sinks() -> None:
     """Engine correctly routes events to multiple sinks."""
-    with patch.object(
-        engine.Engine,
-        "_orchestrate_execution",
-        return_value={"stage_a": {"status": "ran", "reason": "inputs changed"}},
+    with (
+        patch.object(
+            engine.Engine,
+            "_orchestrate_execution",
+            return_value={"stage_a": {"status": "ran", "reason": "inputs changed"}},
+        ),
+        engine.Engine() as eng,
     ):
-        with engine.Engine() as eng:
-            sink1 = _MockSink()
-            sink2 = _MockSink()
-            eng.add_sink(sink1)
-            eng.add_sink(sink2)
+        sink1 = _MockSink()
+        sink2 = _MockSink()
+        eng.add_sink(sink1)
+        eng.add_sink(sink2)
 
-            result = eng.run_once(stages=["stage_a"])
+        result = eng.run_once(stages=["stage_a"])
 
-            # Verify results returned
-            assert "stage_a" in result
+        # Verify results returned
+        assert "stage_a" in result
 
-            # Verify both sinks received events
-            assert len(sink1.events) >= 2, "At least ACTIVE and IDLE state changes"
-            assert len(sink2.events) >= 2, "At least ACTIVE and IDLE state changes"
-            assert sink1.events == sink2.events, "Same events to both sinks"
+        # Verify both sinks received events
+        assert len(sink1.events) >= 2, "At least ACTIVE and IDLE state changes"
+        assert len(sink2.events) >= 2, "At least ACTIVE and IDLE state changes"
+        assert sink1.events == sink2.events, "Same events to both sinks"
 
-            # Verify state change events
-            state_events = [e for e in sink1.events if e["type"] == "engine_state_changed"]
-            assert state_events[0]["state"] == types.EngineState.ACTIVE
-            assert state_events[1]["state"] == types.EngineState.IDLE
+        # Verify state change events
+        state_events = [e for e in sink1.events if e["type"] == "engine_state_changed"]
+        assert state_events[0]["state"] == types.EngineState.ACTIVE
+        assert state_events[1]["state"] == types.EngineState.IDLE
 
-            # Close and verify
-            eng.close()
-            assert sink1.closed
-            assert sink2.closed
+        # Close and verify
+        eng.close()
+        assert sink1.closed
+        assert sink2.closed
 
 
 def test_engine_run_once_emits_idle_on_exception() -> None:
     """run_once() emits IDLE state even when _orchestrate_execution raises."""
-    with patch.object(
-        engine.Engine, "_orchestrate_execution", side_effect=RuntimeError("execution failed")
+    with (
+        patch.object(
+            engine.Engine, "_orchestrate_execution", side_effect=RuntimeError("execution failed")
+        ),
+        engine.Engine() as eng,
     ):
-        with engine.Engine() as eng:
-            sink = _MockSink()
-            eng.add_sink(sink)
+        sink = _MockSink()
+        eng.add_sink(sink)
 
-            with contextlib.suppress(RuntimeError):
-                eng.run_once()
+        with contextlib.suppress(RuntimeError):
+            eng.run_once()
 
-            # Should still emit IDLE at end
-            state_events = [e for e in sink.events if e["type"] == "engine_state_changed"]
-            assert len(state_events) == 2
-            assert state_events[1]["state"] == types.EngineState.IDLE
-            assert eng.state == types.EngineState.IDLE
+        # Should still emit IDLE at end
+        state_events = [e for e in sink.events if e["type"] == "engine_state_changed"]
+        assert len(state_events) == 2
+        assert state_events[1]["state"] == types.EngineState.IDLE
+        assert eng.state == types.EngineState.IDLE
 
 
 def test_engine_submit_adds_to_event_queue() -> None:
     """Engine.submit() queues an input event for processing."""
     with engine.Engine() as eng:
-
         event: types.RunRequested = {
             "type": "run_requested",
             "stages": ["train"],
@@ -449,7 +461,6 @@ def test_engine_run_loop_emits_state_changes() -> None:
 def test_engine_cancel_requested_sets_cancel_event() -> None:
     """CancelRequested sets internal cancel event."""
     with engine.Engine() as eng:
-
         # Verify cancel event is initially clear
         assert not eng._cancel_event.is_set()
 
@@ -467,7 +478,6 @@ def test_engine_cancel_requested_sets_cancel_event() -> None:
 def test_engine_cancel_event_property() -> None:
     """Engine exposes cancel_event for executor integration."""
     with engine.Engine() as eng:
-
         # cancel_event should be a threading.Event
         assert hasattr(eng.cancel_event, "is_set")
         assert hasattr(eng.cancel_event, "set")
@@ -477,7 +487,6 @@ def test_engine_cancel_event_property() -> None:
 def test_engine_run_loop_clears_cancel_event() -> None:
     """run_loop() clears cancel_event before processing RunRequested."""
     with engine.Engine() as eng:
-
         # Set cancel event before run
         eng._cancel_event.set()
 
@@ -566,7 +575,9 @@ def test_engine_run_once_stores_progress_callback() -> None:
                 stored_callback[0] = eng._progress_callback
                 return {}
 
-            with patch.object(engine.Engine, "_orchestrate_execution", side_effect=mock_orchestrate):
+            with patch.object(
+                engine.Engine, "_orchestrate_execution", side_effect=mock_orchestrate
+            ):
                 eng.run_once(progress_callback=callback)
 
             # Callback should have been stored during execution
@@ -577,16 +588,18 @@ def test_engine_run_once_stores_progress_callback() -> None:
 
 def test_engine_run_once_clears_cancel_event_before_execution() -> None:
     """run_once() clears cancel_event before calling _orchestrate_execution."""
-    with patch.object(engine.Engine, "_orchestrate_execution", return_value={}):
-        with engine.Engine() as eng:
-            # Set cancel event to simulate previous cancellation
-            eng._cancel_event.set()
-            assert eng._cancel_event.is_set()
+    with (
+        patch.object(engine.Engine, "_orchestrate_execution", return_value={}),
+        engine.Engine() as eng,
+    ):
+        # Set cancel event to simulate previous cancellation
+        eng._cancel_event.set()
+        assert eng._cancel_event.is_set()
 
-            eng.run_once()
+        eng.run_once()
 
-            # Cancel event should have been cleared
-            assert not eng._cancel_event.is_set()
+        # Cancel event should have been cleared
+        assert not eng._cancel_event.is_set()
 
 
 # =============================================================================
@@ -661,23 +674,24 @@ def test_engine_run_once_progress_callback_is_stored_during_execution() -> None:
     def user_callback(event: RunJsonEvent) -> None:
         user_events.append(event)
 
-    with patch.object(engine.Engine, "_orchestrate_execution", return_value={}):
-        with engine.Engine() as eng:
+    with (
+        patch.object(engine.Engine, "_orchestrate_execution", return_value={}),
+        engine.Engine() as eng,
+    ):
+        # Verify callback is stored during run
+        callback_during_run: list[object] = [None]
 
-            # Verify callback is stored during run
-            callback_during_run: list[object] = [None]
+        def capture_callback(*args: object, **kwargs: object) -> dict[str, object]:
+            callback_during_run[0] = eng._progress_callback
+            return {}
 
-            def capture_callback(*args: object, **kwargs: object) -> dict[str, object]:
-                callback_during_run[0] = eng._progress_callback
-                return {}
+        with patch.object(engine.Engine, "_orchestrate_execution", side_effect=capture_callback):
+            eng.run_once(progress_callback=user_callback)
 
-            with patch.object(engine.Engine, "_orchestrate_execution", side_effect=capture_callback):
-                eng.run_once(progress_callback=user_callback)
-
-            # Callback should have been stored during execution
-            assert callback_during_run[0] is user_callback
-            # And cleared after
-            assert eng._progress_callback is None
+        # Callback should have been stored during execution
+        assert callback_during_run[0] is user_callback
+        # And cleared after
+        assert eng._progress_callback is None
 
 
 # =============================================================================
@@ -748,65 +762,67 @@ def test_engine_full_event_flow_integration() -> None:
             "stage_b": {"status": "skipped", "reason": "up to date"},
         }
 
-    with patch.object(engine.Engine, "_orchestrate_execution", orchestrate_side_effect):
-        with engine.Engine() as eng:
-            sink = _MockSink()
-            eng.add_sink(sink)
+    with (
+        patch.object(engine.Engine, "_orchestrate_execution", orchestrate_side_effect),
+        engine.Engine() as eng,
+    ):
+        sink = _MockSink()
+        eng.add_sink(sink)
 
-            # Run stages - orchestrate_side_effect will emit events during run
-            result = eng.run_once(stages=["stage_a", "stage_b"])
+        # Run stages - orchestrate_side_effect will emit events during run
+        result = eng.run_once(stages=["stage_a", "stage_b"])
 
-            # Verify results returned
-            assert "stage_a" in result
-            assert "stage_b" in result
+        # Verify results returned
+        assert "stage_a" in result
+        assert "stage_b" in result
 
-            # Verify event sequence
-            # State events: ACTIVE at start, IDLE at end (emitted by run_once)
-            state_events = [e for e in sink.events if e["type"] == "engine_state_changed"]
-            assert len(state_events) == 2
-            assert state_events[0]["state"] == types.EngineState.ACTIVE
-            assert state_events[1]["state"] == types.EngineState.IDLE
+        # Verify event sequence
+        # State events: ACTIVE at start, IDLE at end (emitted by run_once)
+        state_events = [e for e in sink.events if e["type"] == "engine_state_changed"]
+        assert len(state_events) == 2
+        assert state_events[0]["state"] == types.EngineState.ACTIVE
+        assert state_events[1]["state"] == types.EngineState.IDLE
 
-            # Stage started events
-            started_events = [e for e in sink.events if e["type"] == "stage_started"]
-            assert len(started_events) == 2
-            assert started_events[0]["stage"] == "stage_a"
-            assert started_events[0]["index"] == 1
-            assert started_events[0]["total"] == 2
-            assert started_events[1]["stage"] == "stage_b"
-            assert started_events[1]["index"] == 2
-            assert started_events[1]["total"] == 2
+        # Stage started events
+        started_events = [e for e in sink.events if e["type"] == "stage_started"]
+        assert len(started_events) == 2
+        assert started_events[0]["stage"] == "stage_a"
+        assert started_events[0]["index"] == 1
+        assert started_events[0]["total"] == 2
+        assert started_events[1]["stage"] == "stage_b"
+        assert started_events[1]["index"] == 2
+        assert started_events[1]["total"] == 2
 
-            # Stage completed events
-            completed_events = [e for e in sink.events if e["type"] == "stage_completed"]
-            assert len(completed_events) == 2
+        # Stage completed events
+        completed_events = [e for e in sink.events if e["type"] == "stage_completed"]
+        assert len(completed_events) == 2
 
-            # Verify stage_a completed event
-            assert completed_events[0]["stage"] == "stage_a"
-            assert completed_events[0]["status"] == StageStatus.RAN
-            assert completed_events[0]["reason"] == "inputs changed"
-            assert completed_events[0]["duration_ms"] == 100.0
-            assert completed_events[0]["index"] == 1
-            assert completed_events[0]["total"] == 2
+        # Verify stage_a completed event
+        assert completed_events[0]["stage"] == "stage_a"
+        assert completed_events[0]["status"] == StageStatus.RAN
+        assert completed_events[0]["reason"] == "inputs changed"
+        assert completed_events[0]["duration_ms"] == 100.0
+        assert completed_events[0]["index"] == 1
+        assert completed_events[0]["total"] == 2
 
-            # Verify stage_b completed event
-            assert completed_events[1]["stage"] == "stage_b"
-            assert completed_events[1]["status"] == StageStatus.SKIPPED
-            assert completed_events[1]["reason"] == "up to date"
-            assert completed_events[1]["duration_ms"] == 5.0
-            assert completed_events[1]["index"] == 2
-            assert completed_events[1]["total"] == 2
+        # Verify stage_b completed event
+        assert completed_events[1]["stage"] == "stage_b"
+        assert completed_events[1]["status"] == StageStatus.SKIPPED
+        assert completed_events[1]["reason"] == "up to date"
+        assert completed_events[1]["duration_ms"] == 5.0
+        assert completed_events[1]["index"] == 2
+        assert completed_events[1]["total"] == 2
 
-            # Verify event ordering: ACTIVE -> stage events -> IDLE
-            event_types = [e["type"] for e in sink.events]
-            active_idx = event_types.index("engine_state_changed")
-            idle_idx = len(event_types) - 1 - event_types[::-1].index("engine_state_changed")
-            stage_started_indices = [i for i, t in enumerate(event_types) if t == "stage_started"]
-            stage_completed_indices = [i for i, t in enumerate(event_types) if t == "stage_completed"]
+        # Verify event ordering: ACTIVE -> stage events -> IDLE
+        event_types = [e["type"] for e in sink.events]
+        active_idx = event_types.index("engine_state_changed")
+        idle_idx = len(event_types) - 1 - event_types[::-1].index("engine_state_changed")
+        stage_started_indices = [i for i, t in enumerate(event_types) if t == "stage_started"]
+        stage_completed_indices = [i for i, t in enumerate(event_types) if t == "stage_completed"]
 
-            # All stage events should be between ACTIVE and IDLE
-            for idx in stage_started_indices + stage_completed_indices:
-                assert active_idx < idx < idle_idx, "Stage events should be between state changes"
+        # All stage events should be between ACTIVE and IDLE
+        for idx in stage_started_indices + stage_completed_indices:
+            assert active_idx < idx < idle_idx, "Stage events should be between state changes"
 
 
 # =============================================================================
@@ -853,7 +869,6 @@ def test_engine_context_manager_closes_on_exception() -> None:
 def test_engine_run_once_rejects_concurrent_calls() -> None:
     """run_once() raises if called while engine is already active."""
     with engine.Engine() as eng:
-
         # Manually set state to ACTIVE to simulate concurrent call
         eng._state = types.EngineState.ACTIVE
 
@@ -864,7 +879,6 @@ def test_engine_run_once_rejects_concurrent_calls() -> None:
 def test_engine_emit_continues_on_sink_failure() -> None:
     """emit() continues to other sinks if one fails."""
     with engine.Engine() as eng:
-
         failing_sink = _FailingSink(fail_on_handle=True)
         working_sink = _MockSink()
 
@@ -884,7 +898,6 @@ def test_engine_emit_continues_on_sink_failure() -> None:
 def test_engine_close_continues_on_sink_failure() -> None:
     """close() continues to other sinks if one fails."""
     with engine.Engine() as eng:
-
         failing_sink = _FailingSink(fail_on_close=True)
         working_sink = _MockSink()
 
@@ -917,12 +930,14 @@ def test_engine_close_continues_on_sink_failure() -> None:
 )
 def test_engine_run_once_passes_parameter(param_name: str, param_value: object) -> None:
     """run_once() passes parameters through to _orchestrate_execution."""
-    with patch.object(engine.Engine, "_orchestrate_execution", return_value={}) as mock_orchestrate:
-        with engine.Engine() as eng:
-            eng.run_once(**{param_name: param_value})  # pyright: ignore[reportArgumentType]
+    with (
+        patch.object(engine.Engine, "_orchestrate_execution", return_value={}) as mock_orchestrate,
+        engine.Engine() as eng,
+    ):
+        eng.run_once(**{param_name: param_value})  # pyright: ignore[reportArgumentType]
 
-            call_kwargs = mock_orchestrate.call_args.kwargs
-            assert call_kwargs[param_name] == param_value
+        call_kwargs = mock_orchestrate.call_args.kwargs
+        assert call_kwargs[param_name] == param_value
 
 
 # =============================================================================
@@ -998,7 +1013,6 @@ def test_engine_set_stage_state_tracks_previous_state() -> None:
 def test_engine_get_stage_state_returns_current_state() -> None:
     """get_stage_state() returns the current state after transitions."""
     with engine.Engine() as eng:
-
         eng._set_stage_state("train", types.StageExecutionState.RUNNING)
         assert eng.get_stage_state("train") == types.StageExecutionState.RUNNING
 
@@ -1015,7 +1029,6 @@ def test_engine_get_executing_stages_empty_initially() -> None:
 def test_engine_get_executing_stages_includes_preparing_and_running() -> None:
     """get_executing_stages() includes stages in PREPARING or RUNNING state."""
     with engine.Engine() as eng:
-
         # Set up various stages in different states
         eng._set_stage_state("stage_pending", types.StageExecutionState.PENDING)
         eng._set_stage_state("stage_blocked", types.StageExecutionState.BLOCKED)
@@ -1070,7 +1083,6 @@ def test_engine_stage_state_tracking_is_thread_safe() -> None:
 def test_engine_filters_executing_stage_outputs(tmp_path: pathlib.Path) -> None:
     """Engine filters filesystem events for outputs of executing stages."""
     with engine.Engine() as eng:
-
         # Register stage with known output
         output_path = tmp_path / "output.csv"
 
@@ -1097,7 +1109,6 @@ def test_engine_filters_executing_stage_outputs(tmp_path: pathlib.Path) -> None:
 def test_engine_filters_incremental_out_during_preparing(tmp_path: pathlib.Path) -> None:
     """Engine filters IncrementalOut paths during PREPARING state (restoration phase)."""
     with engine.Engine() as eng:
-
         # IncrementalOut directory being restored
         incremental_dir = tmp_path / "incremental_output"
         incremental_dir.mkdir()
@@ -1137,7 +1148,6 @@ def test_engine_should_filter_path_returns_false_for_input_artifacts(
 ) -> None:
     """_should_filter_path() returns False for artifacts with no producer (inputs)."""
     with engine.Engine() as eng:
-
         # Create graph with an input artifact (has no producer)
         input_path = tmp_path / "input.csv"
         g: nx.DiGraph[str] = nx.DiGraph()
@@ -1158,7 +1168,6 @@ def test_engine_should_filter_path_returns_false_for_completed_stage(
 ) -> None:
     """_should_filter_path() returns False when producer stage is COMPLETED."""
     with engine.Engine() as eng:
-
         output_path = tmp_path / "output.csv"
         g: nx.DiGraph[str] = nx.DiGraph()
         stage_node = engine_graph.stage_node("process")
@@ -1176,7 +1185,6 @@ def test_engine_should_filter_path_returns_false_for_completed_stage(
 def test_engine_get_output_paths_for_stage(tmp_path: pathlib.Path) -> None:
     """_get_output_paths_for_stage() returns all output paths for a stage."""
     with engine.Engine() as eng:
-
         output1 = tmp_path / "output1.csv"
         output2 = tmp_path / "output2.csv"
         g: nx.DiGraph[str] = nx.DiGraph()
@@ -1206,7 +1214,6 @@ def test_engine_get_output_paths_for_stage_empty_without_graph() -> None:
 def test_engine_get_output_paths_for_stage_unknown_stage(tmp_path: pathlib.Path) -> None:
     """_get_output_paths_for_stage() returns empty list for unknown stage."""
     with engine.Engine() as eng:
-
         g: nx.DiGraph[str] = nx.DiGraph()
         g.add_node(engine_graph.stage_node("other_stage"), type=types.NodeType.STAGE)
         eng._graph = g
@@ -1217,7 +1224,6 @@ def test_engine_get_output_paths_for_stage_unknown_stage(tmp_path: pathlib.Path)
 def test_engine_defer_event_for_stage() -> None:
     """_defer_event_for_stage() stores events for later processing."""
     with engine.Engine() as eng:
-
         event1: types.DataArtifactChanged = {
             "type": "data_artifact_changed",
             "paths": ["/path/to/file1.csv"],
@@ -1238,7 +1244,6 @@ def test_engine_defer_event_for_stage() -> None:
 def test_engine_defer_event_for_multiple_stages() -> None:
     """_defer_event_for_stage() tracks events per stage independently."""
     with engine.Engine() as eng:
-
         event1: types.DataArtifactChanged = {
             "type": "data_artifact_changed",
             "paths": ["/path/to/file1.csv"],
@@ -1292,7 +1297,6 @@ def test_engine_process_deferred_events(tmp_path: pathlib.Path) -> None:
 def test_engine_process_deferred_events_empty_list() -> None:
     """_process_deferred_events() handles stages with no deferred events."""
     with engine.Engine() as eng:
-
         # Should not raise
         eng._process_deferred_events("nonexistent_stage")
 
@@ -1359,7 +1363,6 @@ def test_engine_get_affected_stages_for_path_uses_bipartite_graph(
 ) -> None:
     """_get_affected_stages_for_path() uses get_consumers() from bipartite graph."""
     with engine.Engine() as eng:
-
         # Build a graph with dependencies
         g: nx.DiGraph[str] = nx.DiGraph()
 
@@ -1384,7 +1387,6 @@ def test_engine_get_affected_stages_for_path_includes_downstream(
 ) -> None:
     """_get_affected_stages_for_path() includes downstream stages."""
     with engine.Engine() as eng:
-
         # Build a pipeline: input -> stage_a -> intermediate -> stage_b
         g: nx.DiGraph[str] = nx.DiGraph()
 
@@ -1431,7 +1433,6 @@ def test_engine_get_affected_stages_for_path_unknown_artifact(
 ) -> None:
     """_get_affected_stages_for_path() returns empty for unknown artifacts."""
     with engine.Engine() as eng:
-
         # Graph with one stage but no artifacts
         g: nx.DiGraph[str] = nx.DiGraph()
         g.add_node(engine_graph.stage_node("some_stage"), type=types.NodeType.STAGE)
@@ -1448,7 +1449,6 @@ def test_engine_get_affected_stages_for_paths_multiple_paths(
 ) -> None:
     """_get_affected_stages_for_paths() handles multiple path changes."""
     with engine.Engine() as eng:
-
         # Build graph: input_a -> stage_a, input_b -> stage_b
         g: nx.DiGraph[str] = nx.DiGraph()
 
@@ -1482,7 +1482,6 @@ def test_engine_get_affected_stages_for_paths_deduplicates(
 ) -> None:
     """_get_affected_stages_for_paths() deduplicates affected stages."""
     with engine.Engine() as eng:
-
         # Build graph: two inputs -> same stage
         g: nx.DiGraph[str] = nx.DiGraph()
 
@@ -1514,7 +1513,6 @@ def test_engine_get_affected_stages_for_paths_filters_executing_stage_outputs(
 ) -> None:
     """_get_affected_stages_for_paths() filters outputs of executing stages."""
     with engine.Engine() as eng:
-
         # Build graph: stage_a -> output -> stage_b
         g: nx.DiGraph[str] = nx.DiGraph()
 
@@ -1548,7 +1546,6 @@ def test_engine_get_affected_stages_for_paths_without_downstream(
 ) -> None:
     """_get_affected_stages_for_paths() can exclude downstream with flag."""
     with engine.Engine() as eng:
-
         # Build a pipeline: input -> stage_a -> intermediate -> stage_b
         g: nx.DiGraph[str] = nx.DiGraph()
 
@@ -1581,7 +1578,6 @@ def test_engine_get_affected_stages_for_paths_without_downstream(
 def test_engine_get_affected_stages_for_paths_empty_list() -> None:
     """_get_affected_stages_for_paths() handles empty path list."""
     with engine.Engine() as eng:
-
         g: nx.DiGraph[str] = nx.DiGraph()
         g.add_node(engine_graph.stage_node("some_stage"), type=types.NodeType.STAGE)
         eng._graph = g
@@ -1623,7 +1619,6 @@ def _helper_mock_get_stage(name: str) -> dict[str, object]:
 def test_engine_initialize_orchestration_sets_up_state(tmp_path: pathlib.Path) -> None:
     """_initialize_orchestration() sets up stage states based on DAG."""
     with engine.Engine() as eng:
-
         # Build a simple graph: stage_a -> output -> stage_b
         g: nx.DiGraph[str] = nx.DiGraph()
 
@@ -1661,7 +1656,6 @@ def test_engine_initialize_orchestration_sets_up_state(tmp_path: pathlib.Path) -
 def test_engine_can_start_stage_checks_upstream() -> None:
     """_can_start_stage() returns False if upstream incomplete."""
     with engine.Engine() as eng:
-
         # Set up state manually
         eng._stage_states["stage_a"] = types.StageExecutionState.READY
         eng._stage_states["stage_b"] = types.StageExecutionState.READY
@@ -1681,7 +1675,6 @@ def test_engine_can_start_stage_checks_upstream() -> None:
 def test_engine_can_start_stage_checks_mutex() -> None:
     """_can_start_stage() returns False if mutex held."""
     with engine.Engine() as eng:
-
         # Set up state manually
         eng._stage_states["stage_a"] = types.StageExecutionState.READY
         eng._stage_states["stage_b"] = types.StageExecutionState.READY
@@ -1947,7 +1940,6 @@ def test_engine_execute_affected_stages_emits_state_changes() -> None:
 def test_engine_execute_affected_stages_uses_keep_going_error_mode() -> None:
     """_execute_affected_stages() uses KEEP_GOING error mode for watch mode."""
     with engine.Engine() as eng:
-
         # Capture the on_error argument
         captured_kwargs: list[dict[str, object]] = []
 
@@ -2010,7 +2002,6 @@ def test_engine_execute_affected_stages_emits_idle_on_exception() -> None:
 def test_engine_handle_input_event_routes_data_artifact_changed() -> None:
     """_handle_input_event() correctly routes data_artifact_changed events."""
     with engine.Engine() as eng:
-
         handled_events: list[types.DataArtifactChanged] = []
 
         def mock_handler(event: types.DataArtifactChanged) -> None:
@@ -2031,7 +2022,6 @@ def test_engine_handle_input_event_routes_data_artifact_changed() -> None:
 def test_engine_handle_input_event_routes_code_or_config_changed() -> None:
     """_handle_input_event() correctly routes code_or_config_changed events."""
     with engine.Engine() as eng:
-
         handled_events: list[types.CodeOrConfigChanged] = []
 
         def mock_handler(event: types.CodeOrConfigChanged) -> None:
@@ -2057,7 +2047,6 @@ def test_engine_handle_input_event_routes_code_or_config_changed() -> None:
 def test_engine_invalidate_caches_clears_graph() -> None:
     """_invalidate_caches() clears the engine's graph cache."""
     with engine.Engine() as eng:
-
         # Set up a mock graph
         g: nx.DiGraph[str] = nx.DiGraph()
         g.add_node(engine_graph.stage_node("test"), type=types.NodeType.STAGE)
@@ -2072,11 +2061,12 @@ def test_engine_invalidate_caches_clears_graph() -> None:
 
 def test_engine_invalidate_caches_calls_registry_invalidate() -> None:
     """_invalidate_caches() calls REGISTRY.invalidate_dag_cache()."""
-    with engine.Engine() as eng:
-
-        with patch("pivot.engine.engine.registry.REGISTRY.invalidate_dag_cache") as mock_invalidate:
-            eng._invalidate_caches()
-            mock_invalidate.assert_called_once()
+    with (
+        engine.Engine() as eng,
+        patch("pivot.engine.engine.registry.REGISTRY.invalidate_dag_cache") as mock_invalidate,
+    ):
+        eng._invalidate_caches()
+        mock_invalidate.assert_called_once()
 
 
 def test_engine_emit_reload_event_emits_pipeline_reloaded(tmp_path: pathlib.Path) -> None:
@@ -2144,7 +2134,6 @@ def test_engine_clear_project_modules_removes_project_files(tmp_path: pathlib.Pa
     import types as types_mod
 
     with engine.Engine() as eng:
-
         # Create a mock module that appears to be in the project
         mock_module = types_mod.ModuleType("test_project_module")
         mock_module.__file__ = str(tmp_path / "my_module.py")
@@ -2175,7 +2164,6 @@ def test_engine_clear_project_modules_removes_project_files(tmp_path: pathlib.Pa
 def test_engine_reload_registry_returns_true_on_success(tmp_path: pathlib.Path) -> None:
     """_reload_registry() returns True when reload succeeds."""
     with engine.Engine() as eng:
-
         # Create a simple pivot.yaml
         pivot_yaml = tmp_path / "pivot.yaml"
         pivot_yaml.write_text("stages: {}")
@@ -2193,7 +2181,6 @@ def test_engine_reload_registry_returns_true_on_success(tmp_path: pathlib.Path) 
 def test_engine_reload_registry_returns_false_on_failure(tmp_path: pathlib.Path) -> None:
     """_reload_registry() returns False and restores when reload fails."""
     with engine.Engine() as eng:
-
         # Create a pivot.yaml
         pivot_yaml = tmp_path / "pivot.yaml"
         pivot_yaml.write_text("stages:\n  bad_stage:\n    python: nonexistent.module.func")
@@ -2226,7 +2213,6 @@ def test_engine_reload_from_decorators_returns_true_with_no_modules() -> None:
 def test_engine_handle_code_or_config_changed_calls_invalidate_caches() -> None:
     """_handle_code_or_config_changed() calls _invalidate_caches()."""
     with engine.Engine() as eng:
-
         invalidate_called = [False]
 
         def mock_invalidate() -> None:
@@ -2285,7 +2271,6 @@ def test_engine_handle_code_or_config_changed_aborts_on_invalid_pipeline() -> No
 def test_engine_handle_code_or_config_changed_rebuilds_graph() -> None:
     """_handle_code_or_config_changed() rebuilds the bipartite graph after reload."""
     with engine.Engine() as eng:
-
         # Verify graph is None initially
         assert eng._graph is None
 
@@ -2319,7 +2304,6 @@ def test_engine_handle_code_or_config_changed_updates_watch_paths() -> None:
     from pivot.engine import sources
 
     with engine.Engine() as eng:
-
         # Add a FilesystemSource
         fs_source = sources.FilesystemSource([])
         eng.add_source(fs_source)
@@ -2359,7 +2343,6 @@ def test_engine_handle_code_or_config_changed_updates_watch_paths() -> None:
 def test_engine_try_start_run_returns_start_result_when_idle() -> None:
     """try_start_run() returns AgentRunStartResult when engine is IDLE."""
     with engine.Engine() as eng:
-
         # Mock registry to return some stages
         with patch("pivot.engine.engine.registry.REGISTRY.list_stages", return_value=["stage_a"]):
             result = eng.try_start_run(run_id="test-run-123", stages=None, force=False)
@@ -2374,7 +2357,6 @@ def test_engine_try_start_run_returns_start_result_when_idle() -> None:
 def test_engine_try_start_run_accepts_specific_stages() -> None:
     """try_start_run() uses provided stages instead of all stages."""
     with engine.Engine() as eng:
-
         result = eng.try_start_run(run_id="test-run-456", stages=["my_stage"], force=True)
 
         # Result is AgentRunStartResult (has stages_queued)
@@ -2385,7 +2367,6 @@ def test_engine_try_start_run_accepts_specific_stages() -> None:
 def test_engine_try_start_run_rejects_when_active() -> None:
     """try_start_run() returns AgentRunRejection when engine is ACTIVE."""
     with engine.Engine() as eng:
-
         # Set engine to ACTIVE state
         eng._state = types.EngineState.ACTIVE
         eng._current_run_id = "existing-run"
@@ -2402,7 +2383,6 @@ def test_engine_try_start_run_rejects_when_active() -> None:
 def test_engine_try_start_run_sets_current_run_id() -> None:
     """try_start_run() sets _current_run_id on success."""
     with engine.Engine() as eng:
-
         assert eng._current_run_id is None
 
         with patch("pivot.engine.engine.registry.REGISTRY.list_stages", return_value=[]):
@@ -2414,7 +2394,6 @@ def test_engine_try_start_run_sets_current_run_id() -> None:
 def test_engine_try_start_run_submits_run_requested_event() -> None:
     """try_start_run() submits RunRequested event to queue."""
     with engine.Engine() as eng:
-
         with patch("pivot.engine.engine.registry.REGISTRY.list_stages", return_value=["stage_a"]):
             eng.try_start_run(run_id="test-run", stages=None, force=True)
 
@@ -2456,7 +2435,6 @@ def test_engine_try_start_run_is_thread_safe() -> None:
 def test_engine_get_execution_status_returns_state() -> None:
     """get_execution_status() returns current engine state."""
     with engine.Engine() as eng:
-
         status = eng.get_execution_status()
 
         assert status["state"] == "idle"
@@ -2516,7 +2494,6 @@ def test_engine_get_execution_status_includes_stage_lists() -> None:
 def test_engine_get_execution_status_omits_empty_lists() -> None:
     """get_execution_status() omits stages_completed/stages_pending when empty."""
     with engine.Engine() as eng:
-
         status = eng.get_execution_status()
 
         assert "stages_completed" not in status
@@ -2563,7 +2540,6 @@ def test_engine_request_cancel_returns_true_when_active() -> None:
 def test_engine_request_cancel_returns_false_when_idle() -> None:
     """request_cancel() returns cancelled=False when engine is IDLE."""
     with engine.Engine() as eng:
-
         result = eng.request_cancel()
 
         assert result.get("cancelled") is False
@@ -2612,7 +2588,6 @@ def test_engine_request_cancel_is_thread_safe() -> None:
 def test_engine_run_lock_is_initialized() -> None:
     """Engine initializes _run_lock for thread safety."""
     with engine.Engine() as eng:
-
         assert hasattr(eng, "_run_lock")
         assert isinstance(eng._run_lock, type(threading.Lock()))
 
@@ -2620,7 +2595,6 @@ def test_engine_run_lock_is_initialized() -> None:
 def test_engine_current_run_id_is_initialized_none() -> None:
     """Engine initializes _current_run_id to None."""
     with engine.Engine() as eng:
-
         assert eng._current_run_id is None
 
 
@@ -2638,7 +2612,6 @@ def test_engine_keep_going_is_false_initially() -> None:
 def test_engine_toggle_keep_going_enables() -> None:
     """toggle_keep_going() enables mode and returns True."""
     with engine.Engine() as eng:
-
         result = eng.toggle_keep_going()
 
         assert result is True
@@ -2659,7 +2632,6 @@ def test_engine_toggle_keep_going_disables() -> None:
 def test_engine_set_keep_going_true() -> None:
     """set_keep_going(True) enables mode."""
     with engine.Engine() as eng:
-
         eng.set_keep_going(True)
 
         assert eng.keep_going is True
@@ -2678,7 +2650,6 @@ def test_engine_set_keep_going_false() -> None:
 def test_engine_toggle_keep_going_is_thread_safe() -> None:
     """toggle_keep_going() is thread-safe under concurrent access."""
     with engine.Engine() as eng:
-
         results: list[bool] = []
         errors: list[str] = []
 
