@@ -174,14 +174,11 @@ Filter all registered stage outputs from watcher to prevent infinite loops.
 ## CLI Usage
 
 ```bash
-# Basic watch mode
+# Plain text output (default)
 pivot run --watch
 
-# With TUI (default when TTY)
-pivot run --watch --display tui
-
-# Plain text output
-pivot run --watch --display plain
+# With TUI
+pivot run --watch --tui
 ```
 
 ## Performance Targets

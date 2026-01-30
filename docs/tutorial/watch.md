@@ -26,11 +26,11 @@ Pivot will:
 
 ## The TUI
 
-When running in a terminal, watch mode shows an interactive TUI with a two-panel layout:
+For an interactive interface, add the `--tui` flag. This shows a two-panel layout:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│  pivot run --watch                                                   │
+│  pivot run --watch --tui                                             │
 ├─────────────────────────────────────────────────────────────────────┤
 │  Stages (2) $2                         │  train $ LIVE              │
 │  ─────────────────────────────────────┼──────────────────────────────│
@@ -123,12 +123,22 @@ Default is 300ms.
 
 > **Note:** Debounce is currently handled by the underlying file watcher (watchfiles). Custom debounce values may not take effect in all situations.
 
-## Plain Text Mode
+## Display Modes
 
-For CI logs or non-TTY environments:
+### Plain Text (Default)
+
+Watch mode outputs plain text by default:
 
 ```bash
-pivot run --watch --display plain
+pivot run --watch
+```
+
+### Interactive TUI
+
+For the interactive TUI with the two-panel layout described above, use the `--tui` flag:
+
+```bash
+pivot run --watch --tui
 ```
 
 ## Best Practices

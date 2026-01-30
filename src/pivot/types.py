@@ -480,13 +480,6 @@ class DataDiffResult(TypedDict):
 #
 
 
-class DisplayMode(enum.StrEnum):
-    """Display mode for pivot run output."""
-
-    TUI = "tui"
-    PLAIN = "plain"
-
-
 class TuiMessageType(enum.StrEnum):
     """Type of TUI message."""
 
