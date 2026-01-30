@@ -27,6 +27,26 @@ _logger = logging.getLogger(__name__)
 
 _SITE_PACKAGE_PATHS = ("site-packages", "dist-packages")
 
+
+def _init_stdlib_paths() -> tuple[pathlib.Path, ...]:
+    """Build resolved stdlib paths for symlink-safe comparison.
+
+    Resolves sys.prefix and sys.base_prefix to handle environments where Python
+    is installed via symlinks (e.g., Homebrew). Deduplicates when not in a venv.
+    """
+    paths = list[pathlib.Path]()
+    for prefix in (sys.prefix, sys.base_prefix):
+        try:
+            resolved = pathlib.Path(prefix).resolve()
+        except OSError:
+            resolved = pathlib.Path(prefix)
+        if resolved not in paths:
+            paths.append(resolved)
+    return tuple(paths)
+
+
+_STDLIB_PATHS = _init_stdlib_paths()
+
 # Cache for hash_function_ast results using weak references.
 # This avoids repeated AST parsing for the same function during fingerprinting
 # while ensuring stale entries are automatically cleaned up when functions are GC'd.
@@ -718,9 +738,7 @@ def _get_module(obj: Any) -> types.ModuleType | None:
 
 def _is_stdlib_path(module_file: pathlib.Path) -> bool:
     """Check if path is in Python stdlib (but not site-packages)."""
-    stdlib_paths = [pathlib.Path(sys.prefix), pathlib.Path(sys.base_prefix)]
-
-    for stdlib_path in stdlib_paths:
+    for stdlib_path in _STDLIB_PATHS:
         try:
             if stdlib_path in module_file.parents:
                 return not any(path in module_file.parts for path in _SITE_PACKAGE_PATHS)
