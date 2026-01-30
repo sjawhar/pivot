@@ -4,11 +4,11 @@ from typing import TYPE_CHECKING, Annotated, Any, TypedDict, cast
 import pytest
 
 from helpers import register_test_stage
-from pivot import IncrementalOut, executor, loaders, outputs
+from pivot import exceptions, executor, loaders, outputs
 from pivot.executor import worker
 from pivot.registry import REGISTRY
 from pivot.storage import cache, lock
-from pivot.types import LockData
+from pivot.types import FileHash, LockData
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -78,7 +78,7 @@ def _register_incremental_stage(
     # Replace the Out with IncrementalOut in the registry
     # This is a test-only hack to test IncrementalOut behavior
     stage_info = REGISTRY._stages[name]
-    stage_info["outs"] = [IncrementalOut(path=out_path, loader=loaders.PathOnly())]
+    stage_info["outs"] = [outputs.IncrementalOut(path=out_path, loader=loaders.PathOnly())]
     stage_info["outs_paths"] = [out_path]
 
 
@@ -174,6 +174,83 @@ def test_prepare_outputs_incremental_restored_file_is_writable(
     # Should be writable
     output_file.write_text("modified content\n")
     assert output_file.read_text() == "modified content\n"
+
+
+def test_prepare_outputs_incremental_missing_cache_error(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """IncrementalOut with lock data but missing cache should raise clear error."""
+    monkeypatch.chdir(tmp_path)
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+
+    # Lock data referencing a hash that doesn't exist in cache (16 chars)
+    fake_hash = FileHash(hash="abcd1234abcd1234")
+    lock_data = LockData(
+        code_manifest={},
+        params={},
+        dep_hashes={},
+        output_hashes={"database.txt": fake_hash},
+        dep_generations={},
+    )
+
+    stage_outs: list[outputs.Out[Any]] = [
+        outputs.IncrementalOut(path="database.txt", loader=loaders.PathOnly())
+    ]
+
+    with pytest.raises(exceptions.CacheRestoreError) as exc_info:
+        worker._prepare_outputs_for_execution(stage_outs, lock_data, cache_dir)
+
+    assert "Cache missing for IncrementalOut 'database.txt'" in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    ("no_commit", "expected_lock_dir"),
+    [
+        pytest.param(False, ".pivot/stages", id="production_lock"),
+        pytest.param(True, ".pivot/pending/stages", id="pending_lock"),
+    ],
+)
+def test_integration_missing_cache_error_includes_recovery_suggestion(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    clean_registry: None,
+    no_commit: bool,
+    expected_lock_dir: str,
+) -> None:
+    """Full error message should include correct lock path and recovery suggestions."""
+    import shutil
+
+    monkeypatch.setattr("pivot.project.get_project_root", lambda: tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    db_path = tmp_path / "database.txt"
+    cache_dir = tmp_path / ".pivot" / "cache"
+
+    _register_incremental_stage(
+        _incremental_stage_append,
+        name="append_stage",
+        out_path=str(db_path),
+    )
+
+    # First run creates and caches the output
+    results1 = executor.run(cache_dir=cache_dir, no_commit=no_commit)
+    assert results1["append_stage"]["status"] == "ran"
+
+    # Delete the cache files AND output file (but keep the lock file)
+    # This simulates: lock says "file had hash X" but cache is missing
+    shutil.rmtree(cache_dir / "files")
+    db_path.unlink()
+
+    # Second run with force should fail with helpful error message
+    results2 = executor.run(cache_dir=cache_dir, force=True, no_commit=no_commit)
+    assert results2["append_stage"]["status"] == "failed"
+
+    reason = results2["append_stage"]["reason"]
+    assert "Cache missing for IncrementalOut" in reason
+    assert "pivot pull" in reason
+    assert expected_lock_dir in reason
+    assert "append_stage.lock" in reason
 
 
 # =============================================================================
@@ -586,13 +663,13 @@ def test_force_and_allow_uncached_incremental_are_orthogonal(
 
 # Module-level type aliases for tests (required for get_type_hints to work)
 type _TestMyCache = Annotated[
-    dict[str, str] | None, IncrementalOut("cache.json", loaders.JSON[dict[str, str]]())
+    dict[str, str] | None, outputs.IncrementalOut("cache.json", loaders.JSON[dict[str, str]]())
 ]
 
 
 class _TestCacheOutputs(TypedDict):
     existing: Annotated[
-        dict[str, str], IncrementalOut("cache.json", loaders.JSON[dict[str, str]]())
+        dict[str, str], outputs.IncrementalOut("cache.json", loaders.JSON[dict[str, str]]())
     ]
 
 
@@ -678,7 +755,7 @@ def test_incremental_input_type_alias_pattern() -> None:
 
     out_specs = stage_def.get_output_specs_from_return(_test_cache_stage, "_test_cache_stage")
     assert "existing" in out_specs
-    assert isinstance(out_specs["existing"], IncrementalOut)
+    assert isinstance(out_specs["existing"], outputs.IncrementalOut)
 
 
 def test_incremental_input_mixed_with_regular_deps() -> None:
@@ -707,33 +784,37 @@ def test_incremental_input_mixed_with_regular_deps() -> None:
 class _ValidationTestWrongNameOutputs(TypedDict):
     # Output field name 'wrong_name' doesn't match input parameter name 'existing'
     wrong_name: Annotated[
-        dict[str, str], IncrementalOut("cache.json", loaders.JSON[dict[str, str]]())
+        dict[str, str], outputs.IncrementalOut("cache.json", loaders.JSON[dict[str, str]]())
     ]
 
 
 class _ValidationTestWrongPathOutputs(TypedDict):
     existing: Annotated[
-        dict[str, str], IncrementalOut("wrong_path.json", loaders.JSON[dict[str, str]]())
+        dict[str, str], outputs.IncrementalOut("wrong_path.json", loaders.JSON[dict[str, str]]())
     ]
 
 
 class _ValidationTestWrongLoaderOutputs(TypedDict):
     existing: Annotated[
-        dict[str, str], IncrementalOut("cache.json", loaders.Pickle[dict[str, str]]())
+        dict[str, str], outputs.IncrementalOut("cache.json", loaders.Pickle[dict[str, str]]())
     ]
 
 
 type _TestCacheA = Annotated[
-    dict[str, str] | None, IncrementalOut("a.json", loaders.JSON[dict[str, str]]())
+    dict[str, str] | None, outputs.IncrementalOut("a.json", loaders.JSON[dict[str, str]]())
 ]
 type _TestCacheB = Annotated[
-    dict[str, str] | None, IncrementalOut("b.json", loaders.JSON[dict[str, str]]())
+    dict[str, str] | None, outputs.IncrementalOut("b.json", loaders.JSON[dict[str, str]]())
 ]
 
 
 class _ValidationTestMultiOutputs(TypedDict):
-    cache_a: Annotated[dict[str, str], IncrementalOut("a.json", loaders.JSON[dict[str, str]]())]
-    cache_b: Annotated[dict[str, str], IncrementalOut("b.json", loaders.JSON[dict[str, str]]())]
+    cache_a: Annotated[
+        dict[str, str], outputs.IncrementalOut("a.json", loaders.JSON[dict[str, str]]())
+    ]
+    cache_b: Annotated[
+        dict[str, str], outputs.IncrementalOut("b.json", loaders.JSON[dict[str, str]]())
+    ]
 
 
 def _stage_incremental_input_no_output(existing: _TestMyCache) -> _RegularStageOutputs:
@@ -769,7 +850,7 @@ def _stage_single_output_incremental(existing: _TestMyCache) -> _TestMyCache:
 
 
 type _TestCacheSingleOut = Annotated[
-    dict[str, str] | None, IncrementalOut("single.json", loaders.JSON[dict[str, str]]())
+    dict[str, str] | None, outputs.IncrementalOut("single.json", loaders.JSON[dict[str, str]]())
 ]
 
 
@@ -920,4 +1001,4 @@ def test_incremental_out_single_output_valid(
 
     info = REGISTRY.get("test_stage")
     assert len(info["outs"]) == 1
-    assert isinstance(info["outs"][0], IncrementalOut)
+    assert isinstance(info["outs"][0], outputs.IncrementalOut)

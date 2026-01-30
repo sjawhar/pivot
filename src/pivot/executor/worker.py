@@ -291,7 +291,14 @@ def execute_stage(
                                 )
                             return run_cache_skip["result"]
 
-                _prepare_outputs_for_execution(stage_outs, lock_data, files_cache_dir)
+                try:
+                    _prepare_outputs_for_execution(stage_outs, lock_data, files_cache_dir)
+                except exceptions.CacheRestoreError as e:
+                    lock_path = pending_lock.path if pending_lock_data else production_lock.path
+                    raise exceptions.CacheRestoreError(
+                        f"{e}. Run `pivot pull` to fetch from remote, or delete "
+                        + f"`{lock_path}` to start fresh."
+                    ) from e
 
                 _run_stage_function_with_injection(
                     stage_info["func"],
@@ -490,7 +497,7 @@ def _prepare_outputs_for_execution(
                 )
                 if not restored:
                     raise exceptions.CacheRestoreError(
-                        f"Failed to restore IncrementalOut '{out.path}' from cache"
+                        f"Cache missing for IncrementalOut '{out.path}'"
                     )
         else:
             # Regular output: delete before run
