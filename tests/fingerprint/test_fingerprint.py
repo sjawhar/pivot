@@ -523,6 +523,22 @@ def test_is_user_code_non_callable():
         pass  # Acceptable to raise error
 
 
+def test_is_user_code_stdlib_via_symlink() -> None:
+    """Should identify stdlib as non-user code even when sys.prefix is a symlink.
+
+    On homebrew macOS, sys.base_prefix is a symlink:
+    - sys.base_prefix = /opt/homebrew/opt/python@3.13/... (symlink)
+    - Actual stdlib at /opt/homebrew/Cellar/python@3.13/... (resolved)
+
+    The _is_stdlib_path check must resolve symlinks to correctly identify stdlib.
+    """
+    import math
+
+    # math module should be identified as NOT user code
+    assert fingerprint.is_user_code(math) is False
+    assert fingerprint.is_user_code(math.ceil) is False
+
+
 # --- extract_module_attr_usage tests ---
 
 
