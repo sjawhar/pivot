@@ -6,7 +6,7 @@ import click
 
 from pivot import config, project
 from pivot.cli import decorators as cli_decorators
-from pivot.cli.run import ensure_stages_registered
+from pivot.cli._run_common import ensure_stages_registered
 from pivot.storage import cache, restore
 from pivot.types import DataDiffResult, OutputFormat
 

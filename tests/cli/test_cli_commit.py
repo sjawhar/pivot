@@ -65,7 +65,7 @@ def test_commit_list_shows_pending(runner: click.testing.CliRunner, tmp_path: pa
         )
 
         # Run with --no-commit
-        run_result = runner.invoke(cli.cli, ["run", "--no-commit"])
+        run_result = runner.invoke(cli.cli, ["repro", "--no-commit"])
         assert run_result.exit_code == 0, f"Run failed: {run_result.output}"
 
         result = runner.invoke(cli.cli, ["commit", "--list"])
@@ -107,7 +107,7 @@ def test_commit_promotes_pending_to_production(
         )
 
         # Run with --no-commit
-        run_result = runner.invoke(cli.cli, ["run", "--no-commit"])
+        run_result = runner.invoke(cli.cli, ["repro", "--no-commit"])
         assert run_result.exit_code == 0, f"Run failed: {run_result.output}"
 
         # Verify pending lock exists
@@ -157,7 +157,7 @@ def test_commit_discard_removes_pending(
         )
 
         # Run with --no-commit
-        run_result = runner.invoke(cli.cli, ["run", "--no-commit"])
+        run_result = runner.invoke(cli.cli, ["repro", "--no-commit"])
         assert run_result.exit_code == 0, f"Run failed: {run_result.output}"
 
         # Verify pending lock exists
@@ -193,7 +193,7 @@ def test_run_no_commit_creates_pending_lock(
             [_helper_process], names={"_helper_process": "process"}, extra_code=_EXTRA_CODE
         )
 
-        result = runner.invoke(cli.cli, ["run", "--no-commit"])
+        result = runner.invoke(cli.cli, ["run", "--no-commit", "process"])
 
         assert result.exit_code == 0, f"Run failed: {result.output}"
 
@@ -222,11 +222,11 @@ def test_run_no_commit_second_run_skips(
         )
 
         # First run via CLI to set up pending lock
-        first_result = runner.invoke(cli.cli, ["run", "--no-commit"])
+        first_result = runner.invoke(cli.cli, ["repro", "--no-commit"])
         assert first_result.exit_code == 0, f"First run failed: {first_result.output}"
 
         # Second run via CLI should use cache
-        result = runner.invoke(cli.cli, ["run", "--no-commit"])
+        result = runner.invoke(cli.cli, ["run", "--no-commit", "process"])
         assert result.exit_code == 0, f"Failed with output: {result.output}"
         assert "cached" in result.output.lower() or "unchanged" in result.output.lower()
 
@@ -245,7 +245,7 @@ def test_run_no_commit_then_commit_workflow(
         )
 
         # Run with --no-commit via CLI
-        run_result = runner.invoke(cli.cli, ["run", "--no-commit"])
+        run_result = runner.invoke(cli.cli, ["repro", "--no-commit"])
         assert run_result.exit_code == 0, f"Run failed: {run_result.output}"
 
         # Commit via CLI
@@ -254,6 +254,6 @@ def test_run_no_commit_then_commit_workflow(
         assert "Committed 1 stage(s)" in result1.output
 
         # Now a normal run via CLI should use cache (uses production lock)
-        result2 = runner.invoke(cli.cli, ["run"])
+        result2 = runner.invoke(cli.cli, ["run", "process"])
         assert result2.exit_code == 0, f"Failed with output: {result2.output}"
         assert "cached" in result2.output.lower() or "unchanged" in result2.output.lower()

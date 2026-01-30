@@ -327,7 +327,7 @@ async def test_sink_error_does_not_crash_engine(test_pipeline: Pipeline) -> None
 def test_serve_mode_cli_responds_to_status_query(
     tmp_path: pathlib.Path,
 ) -> None:
-    """E2E test: pivot run --watch --serve creates working RPC endpoint.
+    """E2E test: pivot repro --watch --serve creates working RPC endpoint.
 
     This test verifies the complete CLI integration - that _run_serve_mode
     correctly wires up AgentRpcHandler and EventSink. Without this test,
@@ -356,7 +356,7 @@ pipeline.register(noop_stage, name="noop")
     env = os.environ.copy()
     env["PIVOT_CACHE_DIR"] = str(tmp_path / "cache")
     proc = subprocess.Popen(
-        ["uv", "run", "pivot", "run", "--watch", "--serve"],
+        ["uv", "run", "pivot", "repro", "--watch", "--serve"],
         cwd=tmp_path,
         env=env,
         stdout=subprocess.PIPE,

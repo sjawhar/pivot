@@ -6,7 +6,7 @@ from pivot import config, exceptions
 from pivot.cli import completion
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
-from pivot.cli.run import ensure_stages_registered
+from pivot.cli._run_common import ensure_stages_registered
 from pivot.show import params as params_mod
 from pivot.types import OutputFormat
 

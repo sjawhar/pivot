@@ -1,21 +1,24 @@
+"""Single-stage pipeline executor.
+
+The `pivot run` command executes specified stages directly, without
+resolving dependencies. Use `pivot repro` for DAG-aware execution.
+"""
+
 from __future__ import annotations
 
 import contextlib
 import datetime
-import json
-import logging
 import pathlib
-import sys
 import threading
 import time
 import uuid
-from typing import TYPE_CHECKING, TypedDict
+from collections.abc import Callable  # noqa: TC003 - used in function signatures
+from typing import TYPE_CHECKING
 
 import anyio
 import click
 
-from pivot import config, discovery
-from pivot.cli import completion
+from pivot.cli import _run_common, completion
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
 from pivot.engine import engine, sinks
@@ -31,14 +34,13 @@ from pivot.types import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Generator
-
-    import networkx as nx
-
     from pivot.engine.types import OutputEvent, StageCompleted
     from pivot.executor import ExecutionSummary
-    from pivot.tui import console as tui_console
     from pivot.tui.run import MessagePoster
+
+
+# JSONL schema version for forward compatibility
+_JSONL_SCHEMA_VERSION = 1
 
 
 def _configure_result_collector(eng: engine.Engine) -> sinks.ResultCollectorSink:
@@ -133,51 +135,24 @@ def _configure_output_sink(
         eng.add_sink(sinks.ConsoleSink(console=rich.console.Console()))
 
 
-def _configure_watch_sources(
-    eng: engine.Engine,
-    watch_paths: list[pathlib.Path],
-    debounce: int,
-    *,
-    force: bool,
-    stages: list[str] | None,
-    no_commit: bool,
-    no_cache: bool,
-    on_error: OnError,
-) -> None:
-    """Configure sources for watch mode."""
-    eng.add_source(engine_sources.FilesystemSource(watch_paths=watch_paths, debounce_ms=debounce))
-    if force:
-        eng.add_source(
-            engine_sources.OneShotSource(
-                stages=stages,
-                force=True,
-                reason="watch:initial:forced",
-                no_commit=no_commit,
-                no_cache=no_cache,
-                on_error=on_error,
-            )
-        )
-
-
 def _configure_oneshot_source(
     eng: engine.Engine,
-    stages: list[str] | None,
+    stages: list[str],
     *,
     force: bool,
-    single_stage: bool,
     no_commit: bool,
     no_cache: bool,
     on_error: OnError,
     allow_uncached_incremental: bool,
     checkout_missing: bool,
 ) -> None:
-    """Configure OneShotSource for non-watch mode."""
+    """Configure OneShotSource for single-stage mode."""
     eng.add_source(
         engine_sources.OneShotSource(
             stages=stages,
             force=force,
             reason="cli",
-            single_stage=single_stage,
+            single_stage=True,  # Always single-stage for run command
             no_commit=no_commit,
             no_cache=no_cache,
             on_error=on_error,
@@ -187,395 +162,31 @@ def _configure_oneshot_source(
     )
 
 
-def _run_pipeline(
-    stages_list: list[str] | None,
-    *,
-    watch: bool,
-    single_stage: bool,
-    force: bool,
-    quiet: bool,
-    tui: bool,
-    as_json: bool,
-    debounce: int,
-    tui_log: pathlib.Path | None,
-    no_commit: bool,
-    no_cache: bool,
-    on_error: OnError,
-    serve: bool,
-    allow_uncached_incremental: bool,
-    checkout_missing: bool,
+def _run_with_tui(
+    stages_list: list[str],
+    force: bool = False,
+    tui_log: pathlib.Path | None = None,
+    no_commit: bool = False,
+    no_cache: bool = False,
+    on_error: OnError = OnError.KEEP_GOING,
+    allow_uncached_incremental: bool = False,
+    checkout_missing: bool = False,
 ) -> dict[str, ExecutionSummary] | None:
-    """Run pipeline with unified watch/non-watch execution.
-
-    Returns execution results for non-watch mode, None for watch mode.
-    """
-    from pivot import dag
-    from pivot.tui import console as tui_console
-
-    # Emit schema version early for JSONL mode (even if no stages to run)
-    if as_json:
-        cli_helpers.emit_jsonl(
-            SchemaVersionEvent(type=RunEventType.SCHEMA_VERSION, version=_JSONL_SCHEMA_VERSION)
-        )
-
-    # Build DAG and get execution order for TUI display and worker pre-warming
-    graph = cli_helpers.build_dag(validate=True)
-    execution_order = dag.get_execution_order(graph, stages_list, single_stage=single_stage)
-
-    if not execution_order and not watch:
-        # Emit execution result for JSONL mode
-        if as_json:
-            cli_helpers.emit_jsonl(
-                ExecutionResultEvent(
-                    type=RunEventType.EXECUTION_RESULT,
-                    ran=0,
-                    skipped=0,
-                    failed=0,
-                    total_duration_ms=0.0,
-                    timestamp=datetime.datetime.now(datetime.UTC).isoformat(),
-                )
-            )
-        return {}
-
-    # Pre-warm loky executor before starting Textual TUI
-    # Textual manipulates terminal file descriptors which breaks loky's
-    # resource tracker if spawned after Textual starts
-    num_workers = len(execution_order) if execution_order else 1
-    if tui:
-        prepare_workers(num_workers)
-
-    # Set up run_id if using TUI
-    run_id: str | None = None
-    if tui:
-        run_id = str(uuid.uuid4())[:8]
-
-    # Set up console for plain text output
-    console: tui_console.Console | None = None
-    if not quiet and not as_json and not tui:
-        console = tui_console.Console()
-
-    # Set up JSONL callback (schema version already emitted above)
-    jsonl_callback: Callable[[dict[str, object]], None] | None = None
-    if as_json:
-        jsonl_callback = cli_helpers.emit_jsonl
-
-    # Create cancel event for TUI mode
-    cancel_event = threading.Event() if tui else None
-
-    if watch:
-        return _run_watch_mode(
-            stages_list=stages_list,
-            execution_order=execution_order,
-            graph=graph,
-            quiet=quiet,
-            tui=tui,
-            as_json=as_json,
-            debounce=debounce,
-            tui_log=tui_log,
-            on_error=on_error,
-            serve=serve,
-            force=force,
-            run_id=run_id,
-            console=console,
-            jsonl_callback=jsonl_callback,
-            cancel_event=cancel_event,
-            no_commit=no_commit,
-            no_cache=no_cache,
-        )
-
-    # Acquire lock for oneshot mode when no_commit=True to prevent race conditions
-    # with concurrent commit operations. Watch mode handles this differently - the
-    # TUI allows manual commit when ready.
-    lock_context = project_lock.pending_state_lock() if no_commit else contextlib.nullcontext()
-    with lock_context:
-        return _run_oneshot_mode(
-            stages_list=stages_list,
-            execution_order=execution_order,
-            graph=graph,
-            quiet=quiet,
-            tui=tui,
-            as_json=as_json,
-            tui_log=tui_log,
-            force=force,
-            single_stage=single_stage,
-            no_commit=no_commit,
-            no_cache=no_cache,
-            on_error=on_error,
-            allow_uncached_incremental=allow_uncached_incremental,
-            checkout_missing=checkout_missing,
-            run_id=run_id,
-            console=console,
-            jsonl_callback=jsonl_callback,
-            cancel_event=cancel_event,
-        )
-
-
-def _run_watch_mode(  # noqa: PLR0913 - many params needed for different modes
-    stages_list: list[str] | None,
-    execution_order: list[str],
-    graph: nx.DiGraph[str],
-    *,
-    quiet: bool,
-    tui: bool,
-    as_json: bool,
-    debounce: int,
-    tui_log: pathlib.Path | None,
-    on_error: OnError,
-    serve: bool,
-    force: bool,
-    run_id: str | None,
-    console: tui_console.Console | None,
-    jsonl_callback: Callable[[dict[str, object]], None] | None,
-    cancel_event: threading.Event | None,  # Reserved for future use
-    no_commit: bool,
-    no_cache: bool,
-) -> None:
-    """Run watch mode with unified event-driven execution."""
-    _ = cancel_event  # Reserved for future graceful cancellation support
-
-    from pivot.engine import graph as engine_graph
-
-    # Use async serve mode for headless daemon
-    if serve and not tui:
-        return _run_serve_mode(
-            stages_list,
-            force=force,
-            quiet=quiet,
-            debounce=debounce,
-            on_error=on_error,
-            no_commit=no_commit,
-            no_cache=no_cache,
-        )
-
-    # Build bipartite graph for watch paths
-    all_stages = cli_helpers.get_all_stages()
-    bipartite_graph = engine_graph.build_graph(all_stages)
-    watch_paths = engine_graph.get_watch_paths(bipartite_graph)
-
-    # Sort for display: group matrix variants together while preserving DAG structure
-    display_order = _sort_for_display(execution_order, graph) if execution_order else []
-
-    pipeline = cli_decorators.get_pipeline_from_context()
-
-    if tui and run_id:
-        # TUI mode with async Engine
-        async def tui_watch_main() -> None:
-            from pivot.tui import run as tui_run
-
-            # Create TUI app first (needed for TuiSink)
-            app = tui_run.PivotApp(
-                stage_names=display_order,
-                tui_log=tui_log,
-                watch_mode=True,
-                engine=None,  # Engine is managed by CLI
-                no_commit=no_commit,
-                serve=serve,
-            )
-
-            async with engine.Engine(pipeline=pipeline) as eng:
-                # Configure sinks - TuiSink for direct post_message
-                _configure_result_collector(eng)
-                _configure_output_sink(
-                    eng,
-                    quiet=quiet,
-                    as_json=as_json,
-                    tui=True,
-                    app=app,
-                    run_id=run_id,
-                    use_console=False,
-                    jsonl_callback=jsonl_callback,
-                )
-
-                # Add agent RPC source if serve mode
-                if serve:
-                    from pivot import project
-                    from pivot.engine.agent_rpc import (
-                        AgentRpcHandler,
-                        AgentRpcSource,
-                        EventSink,
-                    )
-
-                    state_dir = project.get_project_root() / ".pivot"
-                    socket_path = state_dir / "agent.sock"
-                    state_dir.mkdir(parents=True, exist_ok=True)
-
-                    # Add event buffer as sink so it captures events
-                    eng.add_sink(eng._event_buffer)  # pyright: ignore[reportPrivateUsage]
-
-                    rpc_handler = AgentRpcHandler(
-                        engine=eng,
-                        event_buffer=eng._event_buffer,  # pyright: ignore[reportPrivateUsage]
-                    )
-                    eng.add_source(AgentRpcSource(socket_path=socket_path, handler=rpc_handler))
-                    eng.add_sink(EventSink())
-
-                # Configure watch sources
-                _configure_watch_sources(
-                    eng,
-                    watch_paths,
-                    debounce,
-                    force=force,
-                    stages=stages_list,
-                    no_commit=no_commit,
-                    no_cache=no_cache,
-                    on_error=on_error,
-                )
-
-                # Suppress stderr logging while TUI is active
-                with _suppress_stderr_logging():
-                    async with anyio.create_task_group() as tg:
-                        # Start Engine.run() in background
-                        async def run_engine() -> None:
-                            await eng.run(exit_on_completion=False)
-
-                        tg.start_soon(run_engine)
-                        # Run Textual in a thread (it takes over terminal)
-                        await anyio.to_thread.run_sync(app.run)  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType] - anyio stub issue
-                        # When TUI exits, cancel the engine task
-                        tg.cancel_scope.cancel()
-
-        with contextlib.suppress(KeyboardInterrupt):
-            anyio.run(tui_watch_main)
-    else:
-        # Non-TUI async mode
-        async def watch_main() -> None:
-            async with engine.Engine(pipeline=pipeline) as eng:
-                # Configure sinks
-                _configure_result_collector(eng)
-                _configure_output_sink(
-                    eng,
-                    quiet=quiet,
-                    as_json=as_json,
-                    tui=False,
-                    app=None,
-                    run_id=None,
-                    use_console=console is not None,
-                    jsonl_callback=jsonl_callback,
-                )
-
-                # Configure sources
-                _configure_watch_sources(
-                    eng,
-                    watch_paths,
-                    debounce,
-                    force=force,
-                    stages=stages_list,
-                    no_commit=no_commit,
-                    no_cache=no_cache,
-                    on_error=on_error,
-                )
-
-                await eng.run(exit_on_completion=False)
-
-        with contextlib.suppress(KeyboardInterrupt):
-            anyio.run(watch_main)
-
-
-def _run_serve_mode(
-    stages_list: list[str] | None,
-    *,
-    force: bool,
-    quiet: bool,
-    debounce: int,
-    on_error: OnError,
-    no_commit: bool,
-    no_cache: bool,
-) -> None:
-    """Run serve mode with Engine and agent RPC.
-
-    This is the headless daemon mode that accepts agent connections
-    via Unix socket while watching for file changes.
-    """
-    import rich.console
-
-    from pivot import project
-    from pivot.engine import graph as engine_graph
-    from pivot.engine.agent_rpc import AgentRpcHandler, AgentRpcSource, EventSink
-
-    # Get project paths
-    project_root = project.get_project_root()
-    state_dir = project_root / ".pivot"
-    socket_path = state_dir / "agent.sock"
-
-    # Ensure state directory exists
-    state_dir.mkdir(parents=True, exist_ok=True)
-
-    # Get pipeline for Engine
-    pipeline = cli_decorators.get_pipeline_from_context()
-
-    async def serve_main() -> None:
-        # Build watch paths
-        all_stages = cli_helpers.get_all_stages()
-        bipartite_graph = engine_graph.build_graph(all_stages)
-        watch_paths = engine_graph.get_watch_paths(bipartite_graph)
-
-        async with engine.Engine(pipeline=pipeline) as eng:
-            # Add filesystem watch source
-            eng.add_source(
-                engine_sources.FilesystemSource(
-                    watch_paths=watch_paths,
-                    debounce_ms=debounce,
-                )
-            )
-
-            # Add initial run source if force specified
-            if force:
-                eng.add_source(
-                    engine_sources.OneShotSource(
-                        stages=stages_list,
-                        force=True,
-                        reason="serve:initial",
-                        no_commit=no_commit,
-                        no_cache=no_cache,
-                        on_error=on_error,
-                    )
-                )
-
-            # Add event buffer as sink so it captures events
-            eng.add_sink(eng._event_buffer)  # pyright: ignore[reportPrivateUsage]
-
-            # Add agent RPC source with handler for status/stages queries
-            rpc_handler = AgentRpcHandler(engine=eng, event_buffer=eng._event_buffer)  # pyright: ignore[reportPrivateUsage]
-            eng.add_source(AgentRpcSource(socket_path=socket_path, handler=rpc_handler))
-
-            # Add sinks
-            if not quiet:
-                serve_console = rich.console.Console()
-                eng.add_sink(sinks.ConsoleSink(console=serve_console))
-            eng.add_sink(sinks.ResultCollectorSink())
-            eng.add_sink(EventSink())  # Broadcast events to connected agents
-
-            # Run until interrupted (watch mode never exits on its own)
-            await eng.run(exit_on_completion=False)
-
-    # Run the async event loop
-    with contextlib.suppress(KeyboardInterrupt):
-        anyio.run(serve_main)
-
-
-def _run_oneshot_mode(
-    stages_list: list[str] | None,
-    execution_order: list[str],
-    graph: nx.DiGraph[str],
-    *,
-    quiet: bool,
-    tui: bool,
-    as_json: bool,
-    tui_log: pathlib.Path | None,
-    force: bool,
-    single_stage: bool,
-    no_commit: bool,
-    no_cache: bool,
-    on_error: OnError,
-    allow_uncached_incremental: bool,
-    checkout_missing: bool,
-    run_id: str | None,
-    console: tui_console.Console | None,
-    jsonl_callback: Callable[[dict[str, object]], None] | None,
-    cancel_event: threading.Event | None,
-) -> dict[str, ExecutionSummary]:
-    """Run non-watch (one-shot) mode with unified event-driven execution."""
+    """Run pipeline with TUI display."""
     from pivot.executor import core as executor_core
+
+    # Pre-warm loky executor before starting Textual TUI.
+    # Textual manipulates terminal file descriptors which breaks loky's
+    # resource tracker if spawned after Textual starts.
+    prepare_workers(len(stages_list))
+
+    # Cancel event allows TUI to signal executor to stop scheduling new stages
+    cancel_event = threading.Event()
+
+    # Generate run_id for TUI tracking
+    run_id = str(uuid.uuid4())[:8]
+
+    pipeline = cli_decorators.get_pipeline_from_context()
 
     def _convert_results(
         stage_results: dict[str, StageCompleted],
@@ -589,105 +200,121 @@ def _run_oneshot_mode(
             for name, event in stage_results.items()
         }
 
-    # Sort for display
-    display_order = _sort_for_display(execution_order, graph) if execution_order else []
-
-    pipeline = cli_decorators.get_pipeline_from_context()
-
-    # TUI mode for oneshot
-    if tui and run_id:
+    async def tui_oneshot_main() -> dict[str, executor_core.ExecutionSummary]:
         from pivot.tui import run as tui_run
 
-        async def tui_oneshot_main() -> dict[str, executor_core.ExecutionSummary]:
-            # Create TUI app first (needed for TuiSink)
-            # Placeholder executor_func - not used since we manage engine ourselves
-            def executor_wrapper() -> dict[str, ExecutionSummary]:
-                return {}
+        # Create TUI app first (needed for TuiSink)
+        def executor_wrapper() -> dict[str, ExecutionSummary]:
+            return {}
 
-            app = tui_run.PivotApp(
-                stage_names=display_order,
-                tui_log=tui_log,
-                executor_func=executor_wrapper,
-                cancel_event=cancel_event,
-            )
+        app = tui_run.PivotApp(
+            stage_names=stages_list,
+            tui_log=tui_log,
+            executor_func=executor_wrapper,
+            cancel_event=cancel_event,
+        )
 
-            async with engine.Engine(pipeline=pipeline) as eng:
-                # Configure sinks - TuiSink for direct post_message
-                result_sink = _configure_result_collector(eng)
-                _configure_output_sink(
-                    eng,
-                    quiet=quiet,
-                    as_json=as_json,
-                    tui=True,
-                    app=app,
-                    run_id=run_id,
-                    use_console=False,
-                    jsonl_callback=jsonl_callback,
-                )
-                _configure_oneshot_source(
-                    eng,
-                    stages_list,
-                    force=force,
-                    single_stage=single_stage,
-                    no_commit=no_commit,
-                    no_cache=no_cache,
-                    on_error=on_error,
-                    allow_uncached_incremental=allow_uncached_incremental,
-                    checkout_missing=checkout_missing,
-                )
-
-                # Run engine and TUI concurrently
-                async def engine_task() -> dict[str, executor_core.ExecutionSummary]:
-                    await eng.run(exit_on_completion=True)
-                    stage_results = await result_sink.get_results()
-                    return _convert_results(stage_results)
-
-                # Suppress stderr logging while TUI is active
-                with _suppress_stderr_logging():
-                    # Initialize results outside task group to avoid "possibly unbound" error
-                    engine_results: dict[str, executor_core.ExecutionSummary] = {}
-
-                    async def run_engine_and_signal() -> None:
-                        nonlocal engine_results
-                        engine_results = await engine_task()
-                        # TuiSink.close() sends TuiShutdown when Engine closes sinks
-
-                    # Note: If engine_task raises, anyio's task group will collect the
-                    # exception and re-raise it after the TUI thread completes or is
-                    # cancelled. The cancel_scope.cancel() only cancels tasks that
-                    # haven't completed yet - any exception from a completed task
-                    # is still propagated.
-                    async with anyio.create_task_group() as tg:
-                        tg.start_soon(run_engine_and_signal)
-                        await anyio.to_thread.run_sync(app.run)  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType] - anyio stub issue
-                        # TUI exited - if engine is still running, cancel it
-                        tg.cancel_scope.cancel()
-
-                    return engine_results
-
-        return anyio.run(tui_oneshot_main)
-
-    # Non-TUI async mode
-    start_time = time.perf_counter()
-
-    async def oneshot_main() -> dict[str, executor_core.ExecutionSummary]:
         async with engine.Engine(pipeline=pipeline) as eng:
+            # Configure sinks - TuiSink for direct post_message
             result_sink = _configure_result_collector(eng)
             _configure_output_sink(
                 eng,
-                quiet=quiet,
-                as_json=as_json,
-                tui=False,
-                app=None,
-                run_id=None,
-                use_console=console is not None,
-                jsonl_callback=jsonl_callback,
+                quiet=False,
+                as_json=False,
+                tui=True,
+                app=app,
+                run_id=run_id,
+                use_console=False,
+                jsonl_callback=None,
             )
             _configure_oneshot_source(
                 eng,
                 stages_list,
                 force=force,
-                single_stage=single_stage,
+                no_commit=no_commit,
+                no_cache=no_cache,
+                on_error=on_error,
+                allow_uncached_incremental=allow_uncached_incremental,
+                checkout_missing=checkout_missing,
+            )
+
+            # Run engine and TUI concurrently
+            async def engine_task() -> dict[str, executor_core.ExecutionSummary]:
+                await eng.run(exit_on_completion=True)
+                stage_results = await result_sink.get_results()
+                return _convert_results(stage_results)
+
+            # Suppress stderr logging while TUI is active
+            with _run_common.suppress_stderr_logging():
+                # Initialize results outside task group to avoid "possibly unbound" error
+                engine_results: dict[str, executor_core.ExecutionSummary] = {}
+
+                async def run_engine_and_signal() -> None:
+                    nonlocal engine_results
+                    engine_results = await engine_task()
+                    # TuiSink.close() sends TuiShutdown when Engine closes sinks
+
+                async with anyio.create_task_group() as tg:
+                    tg.start_soon(run_engine_and_signal)
+                    await anyio.to_thread.run_sync(app.run)  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType] - anyio stub issue
+                    # TUI exited - if engine is still running, cancel it
+                    tg.cancel_scope.cancel()
+
+                return engine_results
+
+    return anyio.run(tui_oneshot_main)
+
+
+def _run_json_mode(
+    stages_list: list[str],
+    *,
+    force: bool,
+    no_commit: bool,
+    no_cache: bool,
+    on_error: OnError,
+    allow_uncached_incremental: bool,
+    checkout_missing: bool,
+) -> dict[str, ExecutionSummary]:
+    """Run pipeline in JSON streaming mode."""
+    from pivot.executor import core as executor_core
+
+    # Emit schema version first
+    cli_helpers.emit_jsonl(
+        SchemaVersionEvent(type=RunEventType.SCHEMA_VERSION, version=_JSONL_SCHEMA_VERSION)
+    )
+
+    start_time = time.perf_counter()
+    pipeline = cli_decorators.get_pipeline_from_context()
+
+    def _convert_results(
+        stage_results: dict[str, StageCompleted],
+    ) -> dict[str, executor_core.ExecutionSummary]:
+        """Convert StageCompleted events to ExecutionSummary."""
+        return {
+            name: executor_core.ExecutionSummary(
+                status=event["status"],
+                reason=event["reason"],
+            )
+            for name, event in stage_results.items()
+        }
+
+    async def json_main() -> dict[str, executor_core.ExecutionSummary]:
+        async with engine.Engine(pipeline=pipeline) as eng:
+            result_sink = _configure_result_collector(eng)
+            _configure_output_sink(
+                eng,
+                quiet=False,
+                as_json=True,
+                tui=False,
+                app=None,
+                run_id=None,
+                use_console=False,
+                jsonl_callback=cli_helpers.emit_jsonl,
+            )
+            _configure_oneshot_source(
+                eng,
+                stages_list,
+                force=force,
                 no_commit=no_commit,
                 no_cache=no_cache,
                 on_error=on_error,
@@ -698,27 +325,96 @@ def _run_oneshot_mode(
             stage_results = await result_sink.get_results()
             return _convert_results(stage_results)
 
-    results = anyio.run(oneshot_main)
+    results = anyio.run(json_main)
 
-    # Emit JSONL final result
-    if as_json:
-        total_duration_ms = (time.perf_counter() - start_time) * 1000
-        ran = sum(1 for r in results.values() if r["status"] == StageStatus.RAN)
-        skipped = sum(1 for r in results.values() if r["status"] == StageStatus.SKIPPED)
-        failed = sum(1 for r in results.values() if r["status"] == StageStatus.FAILED)
+    # Emit execution result
+    total_duration_ms = (time.perf_counter() - start_time) * 1000
+    ran = sum(1 for r in results.values() if r["status"] == StageStatus.RAN)
+    skipped = sum(1 for r in results.values() if r["status"] == StageStatus.SKIPPED)
+    failed = sum(1 for r in results.values() if r["status"] == StageStatus.FAILED)
 
-        cli_helpers.emit_jsonl(
-            ExecutionResultEvent(
-                type=RunEventType.EXECUTION_RESULT,
-                ran=ran,
-                skipped=skipped,
-                failed=failed,
-                total_duration_ms=total_duration_ms,
-                timestamp=datetime.datetime.now(datetime.UTC).isoformat(),
-            )
+    cli_helpers.emit_jsonl(
+        ExecutionResultEvent(
+            type=RunEventType.EXECUTION_RESULT,
+            ran=ran,
+            skipped=skipped,
+            failed=failed,
+            total_duration_ms=total_duration_ms,
+            timestamp=datetime.datetime.now(datetime.UTC).isoformat(),
         )
+    )
 
-    # Print summary for plain mode
+    return results
+
+
+def _run_plain_mode(
+    stages_list: list[str],
+    *,
+    force: bool,
+    no_commit: bool,
+    no_cache: bool,
+    on_error: OnError,
+    allow_uncached_incremental: bool,
+    checkout_missing: bool,
+    quiet: bool,
+) -> dict[str, ExecutionSummary]:
+    """Run pipeline in plain (non-TUI) mode with optional console output."""
+    from pivot.executor import core as executor_core
+    from pivot.tui import console as tui_console
+
+    console: tui_console.Console | None = None
+    if not quiet:
+        console = tui_console.Console()
+
+    start_time = time.perf_counter()
+    pipeline = cli_decorators.get_pipeline_from_context()
+
+    def _convert_results(
+        stage_results: dict[str, StageCompleted],
+    ) -> dict[str, executor_core.ExecutionSummary]:
+        """Convert StageCompleted events to ExecutionSummary."""
+        return {
+            name: executor_core.ExecutionSummary(
+                status=event["status"],
+                reason=event["reason"],
+            )
+            for name, event in stage_results.items()
+        }
+
+    async def plain_main() -> dict[str, executor_core.ExecutionSummary]:
+        async with engine.Engine(pipeline=pipeline) as eng:
+            result_sink = _configure_result_collector(eng)
+            _configure_output_sink(
+                eng,
+                quiet=quiet,
+                as_json=False,
+                tui=False,
+                app=None,
+                run_id=None,
+                use_console=console is not None,
+                jsonl_callback=None,
+            )
+            _configure_oneshot_source(
+                eng,
+                stages_list,
+                force=force,
+                no_commit=no_commit,
+                no_cache=no_cache,
+                on_error=on_error,
+                allow_uncached_incremental=allow_uncached_incremental,
+                checkout_missing=checkout_missing,
+            )
+            await eng.run(exit_on_completion=True)
+            stage_results = await result_sink.get_results()
+            return _convert_results(stage_results)
+
+    # Acquire lock for oneshot mode when no_commit=True to prevent race conditions
+    # with concurrent commit operations. Watch mode handles this differently - the
+    # TUI allows manual commit when ready.
+    lock_context = project_lock.pending_state_lock() if no_commit else contextlib.nullcontext()
+    with lock_context:
+        results = anyio.run(plain_main)
+
     if console and results:
         ran, cached, blocked, failed = executor_core.count_results(results)
         total_duration = time.perf_counter() - start_time
@@ -727,172 +423,20 @@ def _run_oneshot_mode(
     return results
 
 
-@contextlib.contextmanager
-def _suppress_stderr_logging() -> Generator[None]:
-    """Suppress logging to stderr while TUI is active.
-
-    Textual takes over the terminal, so stderr writes appear as garbage
-    in the upper-left corner. This temporarily removes StreamHandlers
-    that write to stderr and restores them on exit.
-    """
-    from typing import TextIO, cast
-
-    root = logging.getLogger()
-    removed_handlers = list[logging.Handler]()
-
-    for handler in root.handlers[:]:
-        if isinstance(handler, logging.StreamHandler):
-            # Cast to known type - stdlib handlers writing to stderr/stdout use TextIO
-            # Use string literal because generic type isn't narrowed by isinstance
-            stream_handler = cast("logging.StreamHandler[TextIO]", handler)
-            if stream_handler.stream in (sys.stderr, sys.stdout):
-                root.removeHandler(stream_handler)
-                removed_handlers.append(stream_handler)
-    try:
-        yield
-    finally:
-        for handler in removed_handlers:
-            root.addHandler(handler)
-
-
-# JSONL schema version for forward compatibility
-_JSONL_SCHEMA_VERSION = 1
-
-
-logger = logging.getLogger(__name__)
-
-
-def _compute_dag_levels(graph: nx.DiGraph[str]) -> dict[str, int]:
-    """Compute DAG level for each stage.
-
-    Level 0: stages with no dependencies
-    Level N: stages whose dependencies are all at level < N
-
-    Stages at the same level can run in parallel - there's no ordering between them.
-    """
-    import networkx as nx
-
-    levels = dict[str, int]()
-    # Process in topological order (dependencies before dependents)
-    for stage in nx.dfs_postorder_nodes(graph):
-        # successors = what this stage depends on (edges go consumer -> producer)
-        dep_levels = [levels[dep] for dep in graph.successors(stage) if dep in levels]
-        levels[stage] = max(dep_levels, default=-1) + 1
-    return levels
-
-
-def _sort_for_display(execution_order: list[str], graph: nx.DiGraph[str]) -> list[str]:
-    """Sort stages for TUI display: group matrix variants while respecting DAG structure.
-
-    Uses DAG levels (not arbitrary execution order) so parallel-capable stages
-    are treated as equals. Matrix variants are grouped at the level of their
-    earliest member.
-    """
-    from pivot.tui.types import parse_stage_name
-
-    levels = _compute_dag_levels(graph)
-
-    # Compute minimum level for each base_name (group position)
-    group_min_level: dict[str, int] = {}
-    for name in execution_order:
-        base, _ = parse_stage_name(name)
-        level = levels.get(name, 0)
-        if base not in group_min_level or level < group_min_level[base]:
-            group_min_level[base] = level
-
-    def display_sort_key(name: str) -> tuple[int, str, int, str]:
-        base, variant = parse_stage_name(name)
-        individual_level = levels.get(name, 0)
-        # Sort by: group level, then base_name (to keep groups together),
-        # then individual level, then variant name
-        return (group_min_level[base], base, individual_level, variant)
-
-    return sorted(execution_order, key=display_sort_key)
-
-
-def ensure_stages_registered() -> None:
-    """Ensure a Pipeline is discovered and in context.
-
-    If no Pipeline is in context, attempts discovery and stores the result.
-    """
-    if cli_decorators.get_pipeline_from_context() is not None:
-        return
-    try:
-        pipeline = discovery.discover_pipeline()
-        if pipeline is not None:
-            cli_decorators.store_pipeline_in_context(pipeline)
-            logger.info(f"Loaded pipeline: {pipeline.name}")
-    except discovery.DiscoveryError as e:
-        raise click.ClickException(str(e)) from e
-
-
-def _validate_stages(stages_list: list[str] | None, single_stage: bool) -> None:
-    """Validate stage arguments and options."""
-    if single_stage and not stages_list:
-        raise click.ClickException("--single-stage requires at least one stage name")
-    cli_helpers.validate_stages_exist(stages_list)
-
-
-def _output_explain(
-    stages_list: list[str] | None,
-    single_stage: bool,
-    force: bool = False,
-    allow_missing: bool = False,
-) -> None:
-    """Output detailed stage explanations using status logic."""
-    from pivot import status as status_mod
-    from pivot.cli import status as status_cli
-    from pivot.engine import graph as engine_graph
-
-    # Validate dependencies exist when allow_missing is False
-    # (consistent with dry_run_cmd behavior)
-    if not allow_missing:
-        cli_helpers.build_dag(validate=True)
-
-    # Build graph once for all explanations
-    all_stages = cli_helpers.get_all_stages()
-    graph = engine_graph.build_graph(all_stages)
-
-    explanations = status_mod.get_pipeline_explanations(
-        stages_list,
-        single_stage,
-        all_stages,
-        force=force,
-        allow_missing=allow_missing,
-        graph=graph,
-    )
-    status_cli.output_explain_text(explanations)
+def _validate_stages_required(stages_list: list[str] | None) -> list[str]:
+    """Validate that at least one stage was provided."""
+    if not stages_list:
+        raise click.UsageError("Missing argument 'STAGES...'.")
+    return stages_list
 
 
 @cli_decorators.pivot_command()
 @click.argument("stages", nargs=-1, shell_complete=completion.complete_stages)
 @click.option(
-    "--single-stage",
-    "-s",
-    is_flag=True,
-    help="Run only the specified stages (in provided order), not their dependencies",
-)
-@click.option("--dry-run", "-n", is_flag=True, help="Show what would run without executing")
-@click.option(
-    "--explain", "-e", is_flag=True, help="Show detailed breakdown of why stages would run"
-)
-@click.option(
     "--force",
     "-f",
     is_flag=True,
-    help="Force re-run of stages, ignoring cache (in --watch mode, first run only)",
-)
-@click.option(
-    "--watch",
-    "-w",
-    is_flag=True,
-    help="Watch for file changes and re-run affected stages",
-)
-@click.option(
-    "--debounce",
-    type=click.IntRange(min=0),
-    default=None,
-    help="Debounce delay in milliseconds (for --watch mode)",
+    help="Force re-run of stages, ignoring cache",
 )
 @click.option(
     "--tui",
@@ -917,15 +461,9 @@ def _output_explain(
     help="Skip caching outputs entirely for maximum iteration speed. Outputs won't be cached.",
 )
 @click.option(
-    "--keep-going",
-    "-k",
+    "--fail-fast",
     is_flag=True,
-    help="Continue running stages after failures; skip only downstream dependents.",
-)
-@click.option(
-    "--serve",
-    is_flag=True,
-    help="Start RPC server for agent control (requires --watch). Creates Unix socket at .pivot/agent.sock",
+    help="Stop on first failure (default: keep going)",
 )
 @click.option(
     "--allow-uncached-incremental",
@@ -937,228 +475,85 @@ def _output_explain(
     is_flag=True,
     help="Restore tracked files that don't exist on disk from cache before running.",
 )
-@click.option(
-    "--allow-missing",
-    is_flag=True,
-    help="Allow missing dep files if tracked (.pvt exists). Only affects --dry-run.",
-)
 @click.pass_context
 def run(
     ctx: click.Context,
     stages: tuple[str, ...],
-    single_stage: bool,
-    dry_run: bool,
-    explain: bool,
     force: bool,
-    watch: bool,
-    debounce: int | None,
     tui_flag: bool,
     as_json: bool,
     tui_log: pathlib.Path | None,
     no_commit: bool,
     no_cache: bool,
-    keep_going: bool,
-    serve: bool,
+    fail_fast: bool,
     allow_uncached_incremental: bool,
     checkout_missing: bool,
-    allow_missing: bool,
 ) -> None:
-    """Execute pipeline stages.
+    """Execute specified pipeline stages directly.
 
-    If STAGES are provided, runs those stages and their dependencies.
-    Use --single-stage to run only the specified stages without dependencies.
+    Runs STAGES in the order specified, without resolving dependencies.
+    At least one stage name must be provided.
 
-    Auto-discovers pivot.yaml or pipeline.py if no stages are registered.
+    Use 'pivot repro' to run stages with automatic dependency resolution.
     """
     cli_ctx = cli_helpers.get_cli_context(ctx)
     quiet = cli_ctx["quiet"]
-    debounce = debounce if debounce is not None else config.get_watch_debounce()
+    show_human_output = not as_json and not quiet
 
-    stages_list = cli_helpers.stages_to_list(stages)
-    _validate_stages(stages_list, single_stage)
+    # Convert tuple to list and validate at least one stage provided
+    stages_list = _validate_stages_required(cli_helpers.stages_to_list(stages))
+
+    # Validate stages exist in registry
+    cli_helpers.validate_stages_exist(stages_list)
 
     # Validate --tui and --json are mutually exclusive
     if tui_flag and as_json:
         raise click.ClickException("--tui and --json are mutually exclusive")
 
-    # Validate tui_log requires TUI mode
-    if tui_log:
-        if as_json:
-            raise click.ClickException("--tui-log cannot be used with --json")
-        if not tui_flag:
-            raise click.ClickException("--tui-log requires --tui")
-        if dry_run:
-            raise click.ClickException("--tui-log cannot be used with --dry-run")
-        # Validate path upfront (fail fast)
-        tui_log = tui_log.expanduser().resolve()
-        try:
-            tui_log.parent.mkdir(parents=True, exist_ok=True)
-            tui_log.touch()  # Verify writable
-        except OSError as e:
-            raise click.ClickException(f"Cannot write to {tui_log}: {e}") from e
+    # Validate tui_log
+    tui_log = _run_common.validate_tui_log(tui_log, as_json, tui_flag)
 
-    # Validate --serve requires --watch
-    if serve and not watch:
-        raise click.ClickException("--serve requires --watch mode")
+    # Default: keep going; --fail-fast stops on first failure
+    on_error = OnError.FAIL if fail_fast else OnError.KEEP_GOING
 
-    # Validate --allow-missing requires --dry-run
-    if allow_missing and not dry_run:
-        raise click.ClickException("--allow-missing can only be used with --dry-run")
+    # Determine display mode from flags
+    use_tui = tui_flag
 
-    # Check that a pipeline was discovered (either Pipeline object or registered stages)
-    # Allow dry-run and JSON modes to proceed with empty pipeline (they'll report "No stages")
-    # Explain mode requires a pipeline - it can't explain stages if there are none
-    pipeline = cli_decorators.get_pipeline_from_context()
-    # Check pipeline exists before checking stages (list_stages() would raise if called on None)
-    has_stages = pipeline is not None and bool(pipeline.list_stages())
-    if not has_stages and not dry_run and not as_json:
-        raise click.ClickException("No pipeline found (pivot.yaml or pipeline.py)")
-
-    # Handle explain mode (with or without dry-run) - show explanations without execution
-    if explain:
-        _output_explain(stages_list, single_stage, force, allow_missing=allow_missing)
-        return
-
-    # Handle dry-run mode (without explain) - terse output
-    if dry_run:
-        ctx.invoke(
-            dry_run_cmd,
-            stages=stages,
-            single_stage=single_stage,
-            force=force,
-            as_json=as_json,
-            allow_missing=allow_missing,
-        )
-        return
-
-    on_error = OnError.KEEP_GOING if keep_going else OnError.FAIL
-
-    show_human_output = not as_json and not quiet
-
-    try:
-        results = _run_pipeline(
+    if use_tui:
+        results = _run_with_tui(
             stages_list,
-            watch=watch,
-            single_stage=single_stage,
             force=force,
-            quiet=quiet,
-            tui=tui_flag,
-            as_json=as_json,
-            debounce=debounce,
             tui_log=tui_log,
             no_commit=no_commit,
             no_cache=no_cache,
             on_error=on_error,
-            serve=serve,
             allow_uncached_incremental=allow_uncached_incremental,
             checkout_missing=checkout_missing,
         )
-    except KeyboardInterrupt:
-        if show_human_output:
-            click.echo("\nWatch mode stopped." if watch else "\nCancelled.")
-        return
-
-    if results is None:
-        # Watch mode completed
-        if show_human_output:
-            click.echo("\nWatch mode stopped.")
-        return
-
-    if not results and show_human_output and not tui_flag:
-        click.echo("No stages to run")
-
-
-class DryRunJsonStageOutput(TypedDict):
-    """JSON output for a single stage in dry-run mode."""
-
-    would_run: bool
-    reason: str
-
-
-class DryRunJsonOutput(TypedDict):
-    """JSON output for pivot run --dry-run --json."""
-
-    stages: dict[str, DryRunJsonStageOutput]
-
-
-@cli_decorators.pivot_command("dry-run")
-@click.argument("stages", nargs=-1, shell_complete=completion.complete_stages)
-@click.option(
-    "--single-stage",
-    "-s",
-    is_flag=True,
-    help="Run only the specified stages (in provided order), not their dependencies",
-)
-@click.option(
-    "--force",
-    "-f",
-    is_flag=True,
-    help="Show what would run if forced",
-)
-@click.option("--json", "as_json", is_flag=True, help="Output as JSON")
-@click.option("--allow-missing", is_flag=True, help="Allow missing dep files if tracked")
-@click.pass_context
-def dry_run_cmd(
-    ctx: click.Context,
-    stages: tuple[str, ...],
-    single_stage: bool,
-    force: bool,
-    as_json: bool,
-    allow_missing: bool,
-) -> None:
-    """Show what would run without executing."""
-    cli_ctx = cli_helpers.get_cli_context(ctx)
-    quiet = cli_ctx["quiet"]
-
-    # Quiet mode suppresses output (except JSON which is always emitted)
-    if quiet and not as_json:
-        return
-
-    from pivot import status as status_mod
-    from pivot.engine import graph as engine_graph
-
-    stages_list = cli_helpers.stages_to_list(stages)
-    _validate_stages(stages_list, single_stage)
-
-    # Validate dependencies exist when allow_missing is False
-    # This validation was previously done inside get_pipeline_explanations via build_dag()
-    if not allow_missing:
-        cli_helpers.build_dag(validate=True)
-
-    # Build bipartite graph for consistent execution order with Engine
-    all_stages = cli_helpers.get_all_stages()
-    graph = engine_graph.build_graph(all_stages)
-
-    explanations = status_mod.get_pipeline_explanations(
-        stages_list,
-        single_stage,
-        force=force,
-        allow_missing=allow_missing,
-        graph=graph,
-        all_stages=all_stages,
-    )
-
-    if not explanations:
-        if as_json:
-            click.echo(json.dumps(DryRunJsonOutput(stages={})))
-        else:
-            click.echo("No stages to run")
-        return
-
-    if as_json:
-        output = DryRunJsonOutput(
-            stages={
-                exp["stage_name"]: DryRunJsonStageOutput(
-                    would_run=exp["will_run"],
-                    reason=exp["reason"] or "unchanged",
-                )
-                for exp in explanations
-            }
+        # TUI returns None if user quit early - don't show "No stages" message
+        if results is None:
+            return
+    elif as_json:
+        results = _run_json_mode(
+            stages_list,
+            force=force,
+            no_commit=no_commit,
+            no_cache=no_cache,
+            on_error=on_error,
+            allow_uncached_incremental=allow_uncached_incremental,
+            checkout_missing=checkout_missing,
         )
-        click.echo(json.dumps(output, indent=2))
     else:
-        click.echo("Would run:")
-        for exp in explanations:
-            status = "would run" if exp["will_run"] else "would skip"
-            reason = exp["reason"] or "unchanged"
-            click.echo(f"  {exp['stage_name']}: {status} ({reason})")
+        results = _run_plain_mode(
+            stages_list,
+            force=force,
+            no_commit=no_commit,
+            no_cache=no_cache,
+            on_error=on_error,
+            allow_uncached_incremental=allow_uncached_incremental,
+            checkout_missing=checkout_missing,
+            quiet=quiet,
+        )
+
+    if not results and show_human_output:
+        click.echo("No stages to run")

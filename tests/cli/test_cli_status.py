@@ -167,7 +167,7 @@ def test_status_shows_cached_stages(
             names={"_helper_process": "process"},
         )
 
-        runner.invoke(cli.cli, ["run"])
+        runner.invoke(cli.cli, ["repro"])
 
         result = runner.invoke(cli.cli, ["status"])
 
@@ -190,7 +190,7 @@ def test_status_verbose_shows_all_stages(
             names={"_helper_stage_a": "stage_a", "_helper_stage_b": "stage_b"},
         )
 
-        runner.invoke(cli.cli, ["run"])
+        runner.invoke(cli.cli, ["repro"])
 
         result = runner.invoke(cli.cli, ["status", "--verbose"])
 
@@ -522,7 +522,7 @@ def test_status_quiet_no_output_when_clean(
     register_test_stage(_helper_process, name="process")
 
     # Run once to cache via CLI
-    runner.invoke(cli.cli, ["run"])
+    runner.invoke(cli.cli, ["repro"])
 
     result = runner.invoke(cli.cli, ["--quiet", "status"])
 
@@ -558,7 +558,7 @@ def test_status_quiet_exits_1_when_modified(
         register_test_stage(_helper_process, name="process")
 
         # Run to cache via CLI
-        runner.invoke(cli.cli, ["run"])
+        runner.invoke(cli.cli, ["repro"])
 
         # Modify input file
         pathlib.Path("input.txt").write_text("modified data")
@@ -709,7 +709,7 @@ def test_status_explain_shows_code_changes(
     pathlib.Path("input.txt").write_text("data")
 
     register_test_stage(_helper_process_v1, name="process")
-    runner.invoke(cli.cli, ["run"])
+    runner.invoke(cli.cli, ["repro"])
 
     # Clear and re-register with different implementation to simulate code change
     pipeline = get_test_pipeline()
@@ -829,7 +829,7 @@ def test_status_upstream_propagation(
     register_test_stage(_upstream_stage_a_v1, name="stage_a")
     register_test_stage(_upstream_stage_b, name="stage_b")
 
-    runner.invoke(cli.cli, ["run"])
+    runner.invoke(cli.cli, ["repro"])
 
     # Modify stage_a's code - clear and re-register via test pipeline
     pipeline = get_test_pipeline()
@@ -861,7 +861,7 @@ def test_status_explain_upstream_propagation(
     register_test_stage(_upstream_stage_a_v1, name="stage_a")
     register_test_stage(_upstream_stage_b, name="stage_b")
 
-    runner.invoke(cli.cli, ["run"])
+    runner.invoke(cli.cli, ["repro"])
 
     # Modify stage_a's code - clear and re-register via test pipeline
     pipeline = get_test_pipeline()
@@ -890,7 +890,7 @@ def test_status_explain_json_upstream_propagation(
     register_test_stage(_upstream_stage_a_v1, name="stage_a")
     register_test_stage(_upstream_stage_b, name="stage_b")
 
-    runner.invoke(cli.cli, ["run"])
+    runner.invoke(cli.cli, ["repro"])
 
     # Modify stage_a's code - clear and re-register via test pipeline
     pipeline = get_test_pipeline()

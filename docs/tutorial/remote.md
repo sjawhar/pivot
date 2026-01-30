@@ -40,7 +40,7 @@ After running your pipeline locally:
 
 ```bash
 # Run the pipeline
-pivot run
+pivot repro
 
 # Push all cached outputs to S3
 pivot push
@@ -81,7 +81,7 @@ cd your-project
 pivot pull
 
 # Run - stages with cached outputs skip
-pivot run
+pivot repro
 ```
 
 Pull output:
@@ -155,7 +155,7 @@ jobs:
         run: uv run pivot pull || true  # OK if nothing cached yet
 
       - name: Run pipeline
-        run: uv run pivot run
+        run: uv run pivot repro
 
       - name: Push cache
         run: uv run pivot push
@@ -203,7 +203,7 @@ pivot config set default_remote backup
 git checkout -b feature/improve-model
 
 # Run and iterate
-pivot run
+pivot repro
 
 # Push cache before PR
 pivot push
@@ -219,7 +219,7 @@ git push origin feature/improve-model
 pivot pull
 
 # CI runs - only changed stages execute
-pivot run
+pivot repro
 
 # CI pushes updated cache
 pivot push
@@ -230,7 +230,7 @@ pivot push
 ```bash
 git pull origin main
 pivot pull  # Download cached outputs
-pivot run   # Instant - everything cached
+pivot repro   # Instant - everything cached
 ```
 
 ## Troubleshooting

@@ -66,7 +66,7 @@ pipeline.register(hello, name="hello")
     env["PIVOT_CACHE_DIR"] = str(tmp_path / "cache")
 
     proc = subprocess.Popen(
-        ["uv", "run", "pivot", "run", "--watch", "--serve", "--force"],
+        ["uv", "run", "pivot", "repro", "--watch", "--serve", "--force"],
         cwd=tmp_path,
         env=env,
         stdout=subprocess.PIPE,

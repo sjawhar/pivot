@@ -6,10 +6,11 @@ This guide maps Pivot's architectural concepts to actual file paths, helping you
 
 | Command | Entry Point | Description |
 |---------|-------------|-------------|
-| `pivot run` | `src/pivot/cli/run.py` → `Engine.run_once()` | Batch execution |
+| `pivot repro` | `src/pivot/cli/repro.py` → `Engine.run_once()` | DAG-aware batch execution |
+| `pivot run` | `src/pivot/cli/run.py` → `Engine.run_once()` | Single-stage execution |
 | `pivot list` | `src/pivot/cli/list.py` | Stage listing |
 | `pivot status --explain` | `src/pivot/cli/status.py` → `status.get_pipeline_explanations()` | Change detection explanation |
-| `pivot run --watch` | `src/pivot/cli/run.py` → `Engine.run_loop()` | Watch mode |
+| `pivot repro --watch` | `src/pivot/cli/repro.py` → `Engine.run_loop()` | Watch mode |
 
 ## Core Subsystems
 
@@ -160,7 +161,7 @@ This guide maps Pivot's architectural concepts to actual file paths, helping you
 
 **Start reading:** `src/pivot/remote/sync.py:push_outputs()`
 
-## Data Flow: `pivot run`
+## Data Flow: `pivot repro`
 
 ```
 CLI (run.py)

@@ -303,8 +303,8 @@ class _ProcessOutputs(TypedDict):
             [_helper_process], names={"_helper_process": "process"}, extra_code=extra_code
         )
 
-        # Run to generate output via CLI
-        run_result = runner.invoke(cli.cli, ["run"])
+        # Run to generate output via CLI (repro runs the full pipeline)
+        run_result = runner.invoke(cli.cli, ["repro"])
         assert run_result.exit_code == 0, f"Run failed: {run_result.output}"
         assert pathlib.Path("output.txt").exists()
 

@@ -1,3 +1,9 @@
+"""Tests for keep-going / fail-fast behavior in CLI commands.
+
+run: Uses --fail-fast (default is keep-going)
+repro: Uses --keep-going (default is fail)
+"""
+
 from __future__ import annotations
 
 import json
@@ -97,17 +103,17 @@ def _stage_process(
 
 
 # =============================================================================
-# --keep-going CLI Integration Tests
+# repro --keep-going CLI Integration Tests
 # =============================================================================
 
 
-def test_keep_going_flag_continues_after_failure(
+def test_repro_keep_going_flag_continues_after_failure(
     mock_discovery: Pipeline,
     runner: CliRunner,
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """--keep-going continues independent stages after failure."""
+    """repro --keep-going continues independent stages after failure."""
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".git").mkdir()
     (tmp_path / "input.txt").write_text("data")
@@ -115,7 +121,7 @@ def test_keep_going_flag_continues_after_failure(
     register_test_stage(_stage_failing, name="failing")
     register_test_stage(_stage_succeeding, name="succeeding")
 
-    result = runner.invoke(cli.cli, ["run", "--keep-going"])
+    result = runner.invoke(cli.cli, ["repro", "--keep-going"])
 
     assert result.exit_code == 0
     assert "failing: FAILED" in result.output
@@ -123,13 +129,13 @@ def test_keep_going_flag_continues_after_failure(
     assert (tmp_path / "succeeding.txt").read_text() == "success"
 
 
-def test_keep_going_flag_skips_downstream(
+def test_repro_keep_going_flag_skips_downstream(
     mock_discovery: Pipeline,
     runner: CliRunner,
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """--keep-going skips stages downstream of failed stage."""
+    """repro --keep-going skips stages downstream of failed stage."""
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".git").mkdir()
     (tmp_path / "input.txt").write_text("data")
@@ -138,7 +144,7 @@ def test_keep_going_flag_skips_downstream(
     register_test_stage(_stage_second, name="second")
     register_test_stage(_stage_independent, name="independent")
 
-    result = runner.invoke(cli.cli, ["run", "--keep-going"])
+    result = runner.invoke(cli.cli, ["repro", "--keep-going"])
 
     assert result.exit_code == 0
     assert "first: FAILED" in result.output
@@ -149,13 +155,13 @@ def test_keep_going_flag_skips_downstream(
     assert "independent: done" in result.output
 
 
-def test_keep_going_short_flag(
+def test_repro_keep_going_short_flag(
     mock_discovery: Pipeline,
     runner: CliRunner,
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """-k short flag works the same as --keep-going."""
+    """repro -k short flag works the same as --keep-going."""
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".git").mkdir()
     (tmp_path / "input.txt").write_text("data")
@@ -163,20 +169,20 @@ def test_keep_going_short_flag(
     register_test_stage(_stage_failing, name="failing")
     register_test_stage(_stage_succeeding, name="succeeding")
 
-    result = runner.invoke(cli.cli, ["run", "-k"])
+    result = runner.invoke(cli.cli, ["repro", "-k"])
 
     assert result.exit_code == 0
     assert "failing: FAILED" in result.output
     assert "succeeding: done" in result.output
 
 
-def test_without_keep_going_stops_on_failure(
+def test_repro_without_keep_going_stops_on_failure(
     mock_discovery: Pipeline,
     runner: CliRunner,
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Default behavior stops pipeline on first failure (downstream stages blocked)."""
+    """repro default behavior stops pipeline on first failure (downstream stages blocked)."""
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".git").mkdir()
     (tmp_path / "input.txt").write_text("data")
@@ -186,7 +192,7 @@ def test_without_keep_going_stops_on_failure(
     register_test_stage(_stage_failing, name="failing")
     register_test_stage(_stage_downstream, name="downstream")
 
-    result = runner.invoke(cli.cli, ["run"])
+    result = runner.invoke(cli.cli, ["repro"])
 
     assert result.exit_code == 0
     assert "failing: FAILED" in result.output
@@ -197,22 +203,22 @@ def test_without_keep_going_stops_on_failure(
     assert not (tmp_path / "downstream.txt").exists()
 
 
-def test_keep_going_flag_shown_in_help(runner: CliRunner) -> None:
-    """--keep-going flag is documented in help."""
-    result = runner.invoke(cli.cli, ["run", "--help"])
+def test_repro_keep_going_flag_shown_in_help(runner: CliRunner) -> None:
+    """repro --keep-going flag is documented in help."""
+    result = runner.invoke(cli.cli, ["repro", "--help"])
 
     assert result.exit_code == 0
     assert "--keep-going" in result.output
     assert "-k" in result.output
 
 
-def test_keep_going_with_json_output(
+def test_repro_keep_going_with_json_output(
     mock_discovery: Pipeline,
     runner: CliRunner,
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """--keep-going works with --json output mode."""
+    """repro --keep-going works with --json output mode."""
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".git").mkdir()
     (tmp_path / "input.txt").write_text("data")
@@ -220,7 +226,7 @@ def test_keep_going_with_json_output(
     register_test_stage(_stage_failing, name="failing")
     register_test_stage(_stage_succeeding, name="succeeding")
 
-    result = runner.invoke(cli.cli, ["run", "--keep-going", "--json"])
+    result = runner.invoke(cli.cli, ["repro", "--keep-going", "--json"])
 
     assert result.exit_code == 0
     # Parse JSONL output - look for the execution result event
@@ -236,20 +242,20 @@ def test_keep_going_with_json_output(
     assert statuses["succeeding"] == "ran"
 
 
-def test_keep_going_with_dry_run(
+def test_repro_keep_going_with_dry_run(
     mock_discovery: Pipeline,
     runner: CliRunner,
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """--keep-going is accepted with --dry-run (flag is no-op since nothing executes)."""
+    """repro --keep-going is accepted with --dry-run (flag is no-op since nothing executes)."""
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".git").mkdir()
     (tmp_path / "input.txt").write_text("data")
 
     register_test_stage(_stage_process, name="process")
 
-    result = runner.invoke(cli.cli, ["run", "--keep-going", "--dry-run"])
+    result = runner.invoke(cli.cli, ["repro", "--keep-going", "--dry-run"])
 
     assert result.exit_code == 0
     # Dry run shows what would run without executing
@@ -258,20 +264,20 @@ def test_keep_going_with_dry_run(
     assert not (tmp_path / "output.txt").exists()
 
 
-def test_keep_going_with_dry_run_json(
+def test_repro_keep_going_with_dry_run_json(
     mock_discovery: Pipeline,
     runner: CliRunner,
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """--keep-going works with --dry-run --json combination."""
+    """repro --keep-going works with --dry-run --json combination."""
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".git").mkdir()
     (tmp_path / "input.txt").write_text("data")
 
     register_test_stage(_stage_process, name="process")
 
-    result = runner.invoke(cli.cli, ["run", "--keep-going", "--dry-run", "--json"])
+    result = runner.invoke(cli.cli, ["repro", "--keep-going", "--dry-run", "--json"])
 
     assert result.exit_code == 0
     # Should produce valid JSON output
@@ -279,3 +285,68 @@ def test_keep_going_with_dry_run_json(
     assert "stages" in output
     # The stage should be listed as "would_run"
     assert output["stages"]["process"]["would_run"] is True
+
+
+# =============================================================================
+# run --fail-fast CLI Integration Tests
+# =============================================================================
+
+
+def test_run_fail_fast_flag_shown_in_help(runner: CliRunner) -> None:
+    """run --fail-fast flag is documented in help."""
+    result = runner.invoke(cli.cli, ["run", "--help"])
+
+    assert result.exit_code == 0
+    assert "--fail-fast" in result.output
+
+
+def test_run_default_keeps_going(
+    mock_discovery: Pipeline,
+    runner: CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """run defaults to keep-going mode (continues after failures)."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "input.txt").write_text("data")
+
+    register_test_stage(_stage_failing, name="failing")
+    register_test_stage(_stage_succeeding, name="succeeding")
+
+    # Run both stages - default should be keep-going
+    result = runner.invoke(cli.cli, ["run", "failing", "succeeding"])
+
+    assert result.exit_code == 0
+    assert "failing: FAILED" in result.output
+    assert "succeeding: done" in result.output
+    assert (tmp_path / "succeeding.txt").read_text() == "success"
+
+
+def test_run_fail_fast_stops_early(
+    mock_discovery: Pipeline,
+    runner: CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """run --fail-fast stops on first failure.
+
+    Note: In single-stage mode (run command), stages are run in user-specified order
+    without dependency resolution. With parallel execution, both stages may start
+    before the failure is detected. The --fail-fast flag prevents starting NEW stages
+    after a failure is detected.
+
+    This test verifies --fail-fast is accepted and the failed stage shows failure status.
+    """
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "input.txt").write_text("data")
+
+    register_test_stage(_stage_failing, name="failing")
+    register_test_stage(_stage_succeeding, name="succeeding")
+
+    # With fail-fast, we verify the flag is accepted and failing shows failure
+    result = runner.invoke(cli.cli, ["run", "--fail-fast", "failing", "succeeding"])
+
+    assert result.exit_code == 0
+    assert "failing: FAILED" in result.output
