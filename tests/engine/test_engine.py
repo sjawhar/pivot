@@ -125,6 +125,62 @@ def test_engine_graph_is_none_initially() -> None:
     assert eng.graph is None
 
 
+def test_engine_graph_property_returns_bipartite_graph(tmp_path: pathlib.Path) -> None:
+    """Engine.graph returns the bipartite artifact-stage graph after execution.
+
+    Verifies:
+    - Engine has 'graph' attribute
+    - After run_once(), graph is populated (not None)
+    - Graph is a networkx DiGraph with bipartite structure (artifact and stage nodes)
+    """
+    eng = engine.Engine()
+
+    # Verify graph attribute exists and starts as None
+    assert hasattr(eng, "graph")
+    assert eng.graph is None
+
+    # Build a test graph that _orchestrate_execution would create
+    test_graph: nx.DiGraph[str] = nx.DiGraph()
+    input_artifact = engine_graph.artifact_node(tmp_path / "input.csv")
+    output_artifact = engine_graph.artifact_node(tmp_path / "output.csv")
+    stage = engine_graph.stage_node("test_stage")
+    test_graph.add_node(input_artifact, type=types.NodeType.ARTIFACT)
+    test_graph.add_node(output_artifact, type=types.NodeType.ARTIFACT)
+    test_graph.add_node(stage, type=types.NodeType.STAGE)
+    test_graph.add_edge(input_artifact, stage)
+    test_graph.add_edge(stage, output_artifact)
+
+    # Mock _orchestrate_execution to set the graph (simulating real behavior)
+    def mock_orchestrate(self: engine.Engine, **kwargs: object) -> dict[str, object]:
+        self._graph = test_graph
+        return {"test_stage": {"status": "ran", "reason": ""}}
+
+    with patch.object(engine.Engine, "_orchestrate_execution", mock_orchestrate):
+        eng.run_once()
+
+    # After run_once(), graph should be populated via _orchestrate_execution
+    result = eng.graph
+    assert result is not None, "run_once() should populate the graph"
+
+    # Verify bipartite structure: has both artifact and stage nodes
+    stage_nodes = [
+        n
+        for n in result.nodes()  # pyright: ignore[reportGeneralTypeIssues] - typeshed stub quirk
+        if result.nodes[n]["type"] == types.NodeType.STAGE
+    ]
+    artifact_nodes = [
+        n
+        for n in result.nodes()  # pyright: ignore[reportGeneralTypeIssues] - typeshed stub quirk
+        if result.nodes[n]["type"] == types.NodeType.ARTIFACT
+    ]
+    assert len(stage_nodes) == 1  # pyright: ignore[reportUnknownArgumentType]
+    assert len(artifact_nodes) == 2  # pyright: ignore[reportUnknownArgumentType]
+
+    # Verify edges exist in correct direction (artifact -> stage -> artifact)
+    assert result.has_edge(input_artifact, stage)
+    assert result.has_edge(stage, output_artifact)
+
+
 def test_engine_add_sink() -> None:
     """Engine can register event sinks."""
     eng = engine.Engine()

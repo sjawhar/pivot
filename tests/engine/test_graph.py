@@ -3,17 +3,13 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from collections.abc import Generator
 
 import pytest
 
 from pivot import dag as legacy_dag
 from pivot import loaders, outputs
 from pivot.engine import graph, types
-from pivot.registry import REGISTRY, RegistryStageInfo
+from pivot.registry import RegistryStageInfo
 
 
 def _create_stage(name: str, deps: list[str], outs: list[str]) -> RegistryStageInfo:
@@ -70,14 +66,6 @@ def test_parse_node_handles_colons_in_path() -> None:
 
 
 # --- Graph building tests ---
-
-
-@pytest.fixture
-def clean_registry() -> Generator[None]:
-    """Ensure registry is clean before and after test."""
-    REGISTRY.clear()
-    yield
-    REGISTRY.clear()
 
 
 @pytest.mark.usefixtures("clean_registry")
@@ -381,3 +369,76 @@ def test_graph_consistent_with_legacy_dag(tmp_path: Path) -> None:
                 bipartite_deps.add(producer)
 
         assert legacy_deps == bipartite_deps, f"Mismatch for {stage_name}"
+
+
+# --- get_stage_dag tests ---
+
+
+@pytest.mark.usefixtures("clean_registry")
+def test_get_stage_dag_extracts_stage_only_graph(tmp_path: Path) -> None:
+    """get_stage_dag returns stage-only DAG from bipartite graph."""
+    input_file = tmp_path / "input.csv"
+    cleaned = tmp_path / "cleaned.csv"
+    model = tmp_path / "model.pkl"
+    input_file.touch()
+
+    stages = {
+        "preprocess": _create_stage("preprocess", [str(input_file)], [str(cleaned)]),
+        "train": _create_stage("train", [str(cleaned)], [str(model)]),
+    }
+    bipartite = graph.build_graph(stages)
+
+    # Extract stage-only DAG
+    stage_dag = graph.get_stage_dag(bipartite)
+
+    # Should have stage nodes (not artifact:... or stage:... prefixed)
+    assert "preprocess" in stage_dag
+    assert "train" in stage_dag
+
+    # Should NOT have artifact nodes or prefixed stage nodes
+    for node in stage_dag.nodes():
+        assert not node.startswith("artifact:")
+        assert not node.startswith("stage:")
+
+    # Edge direction: consumer -> producer (matches dag.build_dag() convention)
+    # train depends on preprocess, so edge goes train -> preprocess
+    assert stage_dag.has_edge("train", "preprocess")
+
+
+# --- get_artifact_consumers tests ---
+
+
+@pytest.mark.usefixtures("clean_registry")
+def test_get_artifact_consumers_returns_direct_and_downstream(tmp_path: Path) -> None:
+    """get_artifact_consumers returns stages that depend on artifact."""
+    # Build graph: input.csv -> preprocess -> cleaned.csv -> train -> model.pkl
+    input_file = tmp_path / "input.csv"
+    cleaned = tmp_path / "cleaned.csv"
+    model = tmp_path / "model.pkl"
+    input_file.touch()
+
+    stages = {
+        "preprocess": _create_stage("preprocess", [str(input_file)], [str(cleaned)]),
+        "train": _create_stage("train", [str(cleaned)], [str(model)]),
+    }
+    g = graph.build_graph(stages)
+
+    # Input change should affect both preprocess AND train
+    consumers = graph.get_artifact_consumers(g, input_file, include_downstream=True)
+
+    assert "preprocess" in consumers
+    assert "train" in consumers  # Downstream of preprocess
+
+    # Without downstream, only direct consumers
+    direct = graph.get_artifact_consumers(g, input_file, include_downstream=False)
+
+    assert "preprocess" in direct
+    assert "train" not in direct
+
+
+@pytest.mark.usefixtures("clean_registry")
+def test_get_artifact_consumers_returns_empty_for_unknown_path(tmp_path: Path) -> None:
+    """get_artifact_consumers returns empty list for unknown artifact."""
+    g = graph.build_graph({})
+    consumers = graph.get_artifact_consumers(g, tmp_path / "unknown.csv")
+    assert consumers == []

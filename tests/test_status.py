@@ -398,3 +398,167 @@ def test_suggestions_none_needed() -> None:
     )
 
     assert suggestions == []
+
+
+# =============================================================================
+# Graph Parameter Tests
+# =============================================================================
+
+
+class _TestStageOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("test_output.txt", loaders.PathOnly())]
+
+
+def _helper_test_stage(
+    input_file: Annotated[pathlib.Path, outputs.Dep("test_input.txt", loaders.PathOnly())],
+) -> _TestStageOutputs:
+    pathlib.Path("test_output.txt").write_text("output")
+    return _TestStageOutputs(output=pathlib.Path("test_output.txt"))
+
+
+def test_get_pipeline_status_uses_provided_graph(
+    set_project_root: pathlib.Path,
+) -> None:
+    """get_pipeline_status uses provided graph instead of building one."""
+    from pivot import registry
+    from pivot.engine import graph as engine_graph
+
+    (set_project_root / ".git").mkdir()
+    (set_project_root / "test_input.txt").write_text("data")
+
+    register_test_stage(_helper_test_stage, name="test_stage")
+
+    # Build graph externally (simulating Engine)
+    all_stages = {name: registry.REGISTRY.get(name) for name in registry.REGISTRY.list_stages()}
+    external_graph = engine_graph.build_graph(all_stages)
+
+    # Call status with provided graph
+    results, returned_graph = status.get_pipeline_status(
+        stages=["test_stage"],
+        single_stage=False,
+        graph=external_graph,
+    )
+
+    # Verify it found the stage
+    assert len(results) == 1
+    assert results[0]["name"] == "test_stage"
+
+    # Verify returned graph is a stage-only DAG (not the bipartite graph)
+    assert "test_stage" in returned_graph.nodes()
+    # Bipartite graph would have "stage:test_stage", not "test_stage"
+    assert "stage:test_stage" not in returned_graph.nodes()
+
+
+def test_get_pipeline_explanations_uses_provided_graph(
+    set_project_root: pathlib.Path,
+) -> None:
+    """get_pipeline_explanations uses provided graph instead of building one."""
+    from pivot import registry
+    from pivot.engine import graph as engine_graph
+
+    (set_project_root / ".git").mkdir()
+    (set_project_root / "test_input.txt").write_text("data")
+
+    register_test_stage(_helper_test_stage, name="test_stage")
+
+    # Build graph externally (simulating Engine)
+    all_stages = {name: registry.REGISTRY.get(name) for name in registry.REGISTRY.list_stages()}
+    external_graph = engine_graph.build_graph(all_stages)
+
+    # Call explanations with provided graph
+    explanations = status.get_pipeline_explanations(
+        stages=["test_stage"],
+        single_stage=False,
+        graph=external_graph,
+    )
+
+    # Verify it found the stage
+    assert len(explanations) == 1
+    assert explanations[0]["stage_name"] == "test_stage"
+
+
+# =============================================================================
+# what_if_changed Tests
+# =============================================================================
+
+
+def test_what_if_changed_single_path(set_project_root: pathlib.Path) -> None:
+    """what_if_changed returns affected stages for a single path."""
+    (set_project_root / ".git").mkdir()
+    (set_project_root / "input.txt").write_text("data")
+
+    register_test_stage(_helper_stage_a, name="stage_a")
+    register_test_stage(_helper_stage_b, name="stage_b")
+
+    # input.txt affects stage_a, which in turn affects stage_b
+    affected = status.what_if_changed([pathlib.Path("input.txt")])
+
+    assert "stage_a" in affected
+    assert "stage_b" in affected, "Should include downstream stages"
+
+
+def test_what_if_changed_intermediate_path(set_project_root: pathlib.Path) -> None:
+    """what_if_changed returns only downstream stages for intermediate artifact."""
+    (set_project_root / ".git").mkdir()
+    (set_project_root / "input.txt").write_text("data")
+
+    register_test_stage(_helper_stage_a, name="stage_a")
+    register_test_stage(_helper_stage_b, name="stage_b")
+
+    # a.txt is output of stage_a, input to stage_b
+    affected = status.what_if_changed([pathlib.Path("a.txt")])
+
+    assert "stage_a" not in affected, "stage_a produces a.txt, doesn't consume it"
+    assert "stage_b" in affected, "stage_b consumes a.txt"
+
+
+def test_what_if_changed_unknown_path(set_project_root: pathlib.Path) -> None:
+    """what_if_changed returns empty list for unknown paths."""
+    (set_project_root / ".git").mkdir()
+    (set_project_root / "input.txt").write_text("data")
+
+    register_test_stage(_helper_stage_a, name="stage_a")
+
+    affected = status.what_if_changed([pathlib.Path("unknown.txt")])
+
+    assert affected == []
+
+
+def test_what_if_changed_multiple_paths(set_project_root: pathlib.Path) -> None:
+    """what_if_changed returns union of affected stages for multiple paths."""
+    (set_project_root / ".git").mkdir()
+    (set_project_root / "input.txt").write_text("data")
+
+    register_test_stage(_helper_stage_a, name="stage_a")
+    register_test_stage(_helper_stage_b, name="stage_b")
+
+    # Both paths affect different parts of the pipeline
+    affected = status.what_if_changed(
+        [
+            pathlib.Path("input.txt"),  # affects stage_a -> stage_b
+            pathlib.Path("a.txt"),  # affects stage_b
+        ]
+    )
+
+    assert "stage_a" in affected
+    assert "stage_b" in affected
+
+
+def test_what_if_changed_with_provided_graph(set_project_root: pathlib.Path) -> None:
+    """what_if_changed uses provided graph instead of building one."""
+    from pivot import registry
+    from pivot.engine import graph as engine_graph
+
+    (set_project_root / ".git").mkdir()
+    (set_project_root / "input.txt").write_text("data")
+
+    register_test_stage(_helper_stage_a, name="stage_a")
+
+    # Build graph externally
+    all_stages = {name: registry.REGISTRY.get(name) for name in registry.REGISTRY.list_stages()}
+    external_graph = engine_graph.build_graph(all_stages)
+
+    # Call with provided graph
+    affected = status.what_if_changed([pathlib.Path("input.txt")], graph=external_graph)
+
+    assert "stage_a" in affected

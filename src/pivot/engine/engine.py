@@ -49,7 +49,9 @@ from pivot.types import (
     OnError,
     OutputMessage,
     RunEventType,
+    StageCompleteEvent,
     StageResult,
+    StageStartEvent,
     StageStatus,
 )
 
@@ -66,6 +68,10 @@ if TYPE_CHECKING:
 __all__ = ["Engine"]
 
 _logger = logging.getLogger(__name__)
+
+# Timeout for draining output queue from worker processes (seconds).
+# Short timeout allows responsive shutdown while still batching messages.
+_OUTPUT_QUEUE_DRAIN_TIMEOUT = 0.02
 
 
 class Engine:
@@ -247,12 +253,55 @@ class Engine:
 
         Exceptions from individual sinks are logged but do not prevent
         other sinks from receiving the event.
+
+        Also forwards stage events to progress_callback if set (for backwards
+        compatibility with callers that pass progress_callback to run_once).
         """
         for sink in self._sinks:
             try:
                 sink.handle(event)
             except Exception:
                 _logger.exception("Sink %s failed to handle event %s", sink, event["type"])
+
+        # Forward stage events to progress_callback for backwards compatibility
+        self._forward_to_progress_callback(event)
+
+    def _forward_to_progress_callback(self, event: OutputEvent) -> None:
+        """Forward stage events to progress_callback if set."""
+        if self._progress_callback is None:
+            return
+
+        import datetime
+
+        timestamp = datetime.datetime.now(datetime.UTC).isoformat()
+
+        match event["type"]:
+            case "stage_started":
+                self._progress_callback(
+                    StageStartEvent(
+                        type=RunEventType.STAGE_START,
+                        stage=event["stage"],
+                        index=event["index"],
+                        total=event["total"],
+                        timestamp=timestamp,
+                    )
+                )
+            case "stage_completed":
+                # StageCompleteEvent requires Literal[RAN, SKIPPED, FAILED] status
+                status = event["status"]
+                if status in (StageStatus.RAN, StageStatus.SKIPPED, StageStatus.FAILED):
+                    self._progress_callback(
+                        StageCompleteEvent(
+                            type=RunEventType.STAGE_COMPLETE,
+                            stage=event["stage"],
+                            status=status,
+                            reason=event["reason"],
+                            duration_ms=event["duration_ms"],
+                            timestamp=timestamp,
+                        )
+                    )
+            case _:
+                pass  # Other events not forwarded to progress_callback
 
     def close(self) -> None:
         """Close all sinks and clean up resources.
@@ -1033,8 +1082,12 @@ class Engine:
         stage_name: str,
         result: StageResult,
         start_time: float,
-    ) -> None:
-        """Handle a stage completing execution."""
+    ) -> float:
+        """Handle a stage completing execution.
+
+        Returns:
+            Duration in milliseconds for the stage execution.
+        """
         # Calculate duration
         duration_ms = (time.perf_counter() - start_time) * 1000
 
@@ -1081,6 +1134,8 @@ class Engine:
         # Process deferred events for this stage's outputs
         self._process_deferred_events(stage_name)
 
+        return duration_ms
+
     def _cascade_failure(self, failed_stage: str) -> None:
         """Mark downstream stages as blocked due to upstream failure."""
         for downstream_name in self._stage_downstream.get(failed_stage, []):
@@ -1094,7 +1149,7 @@ class Engine:
         self,
         run_id: str,
         results: dict[str, executor_core.ExecutionSummary],
-        stage_start_times: dict[str, float],
+        stage_durations: dict[str, float],
         targeted_stages: list[str],
         execution_order: list[str],
         started_at: str,
@@ -1118,13 +1173,8 @@ class Engine:
             else:
                 input_hash = "<no-lock>"
 
-            # Compute duration from start times if available
-            start_time = stage_start_times.get(name)
-            if start_time is not None:
-                # Use wall-clock time since we recorded perf_counter at start
-                duration_ms = int((time.perf_counter() - start_time) * 1000)
-            else:
-                duration_ms = 0
+            # Use actual duration captured at stage completion time
+            duration_ms = int(stage_durations.get(name, 0))
 
             stages_records[name] = run_history.StageRunRecord(
                 input_hash=input_hash,
@@ -1251,9 +1301,10 @@ class Engine:
         local_manager = spawn_ctx.Manager()
         output_queue: mp.Queue[OutputMessage] = local_manager.Queue()  # pyright: ignore[reportAssignmentType]
 
-        # Track results and start times
+        # Track results, start times, and actual durations
         results: dict[str, executor_core.ExecutionSummary] = {}
         stage_start_times: dict[str, float] = {}
+        stage_durations: dict[str, float] = {}
 
         # Start output reader thread for LogLine events
         output_thread: threading.Thread | None = None
@@ -1303,7 +1354,10 @@ class Engine:
 
                         try:
                             result = future.result()
-                            self._handle_stage_completion(stage_name, result, start_time)
+                            duration_ms = self._handle_stage_completion(
+                                stage_name, result, start_time
+                            )
+                            stage_durations[stage_name] = duration_ms
 
                             # Apply deferred writes for successful stages (only in commit mode)
                             if result["status"] == StageStatus.RAN and not no_commit:
@@ -1326,7 +1380,10 @@ class Engine:
                                 reason=str(e),
                                 output_lines=[],
                             )
-                            self._handle_stage_completion(stage_name, failed_result, start_time)
+                            duration_ms = self._handle_stage_completion(
+                                stage_name, failed_result, start_time
+                            )
+                            stage_durations[stage_name] = duration_ms
                             results[stage_name] = executor_core.ExecutionSummary(
                                 status=StageStatus.FAILED,
                                 reason=str(e),
@@ -1416,7 +1473,7 @@ class Engine:
         self._write_run_history(
             run_id=run_id,
             results=results,
-            stage_start_times=stage_start_times,
+            stage_durations=stage_durations,
             targeted_stages=targeted_stages,
             execution_order=execution_order,
             started_at=started_at,
@@ -1434,7 +1491,7 @@ class Engine:
         """Drain output messages from worker processes and emit LogLine events."""
         while not stop_event.is_set():
             try:
-                msg = output_queue.get(timeout=0.02)
+                msg = output_queue.get(timeout=_OUTPUT_QUEUE_DRAIN_TIMEOUT)
                 if msg is None:
                     break
 

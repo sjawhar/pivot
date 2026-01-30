@@ -110,7 +110,7 @@ class TuiSink:
             stage=event["stage"],
             index=event["index"],
             total=event["total"],
-            status=StageStatus.READY,
+            status=StageStatus.IN_PROGRESS,
             reason="",
             elapsed=None,
             run_id=self._run_id,

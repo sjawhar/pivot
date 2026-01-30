@@ -141,9 +141,23 @@ def _output_explain(
     """Output detailed stage explanations using status logic."""
     from pivot import status as status_mod
     from pivot.cli import status as status_cli
+    from pivot.engine import graph as engine_graph
+
+    # Validate dependencies exist when allow_missing is False
+    # (consistent with dry_run_cmd behavior)
+    if not allow_missing:
+        registry.REGISTRY.build_dag(validate=True)
+
+    # Build graph once for all explanations
+    all_stages = {name: registry.REGISTRY.get(name) for name in registry.REGISTRY.list_stages()}
+    graph = engine_graph.build_graph(all_stages)
 
     explanations = status_mod.get_pipeline_explanations(
-        stages_list, single_stage, force, allow_missing=allow_missing
+        stages_list,
+        single_stage,
+        force,
+        allow_missing=allow_missing,
+        graph=graph,
     )
     status_cli.output_explain_text(explanations)
 
@@ -675,12 +689,22 @@ def dry_run_cmd(
 ) -> None:
     """Show what would run without executing."""
     from pivot import status as status_mod
+    from pivot.engine import graph as engine_graph
 
     stages_list = cli_helpers.stages_to_list(stages)
     _validate_stages(stages_list, single_stage)
 
+    # Validate dependencies exist when allow_missing is False
+    # This validation was previously done inside get_pipeline_explanations via build_dag()
+    if not allow_missing:
+        registry.REGISTRY.build_dag(validate=True)
+
+    # Build bipartite graph for consistent execution order with Engine
+    all_stages = {name: registry.REGISTRY.get(name) for name in registry.REGISTRY.list_stages()}
+    graph = engine_graph.build_graph(all_stages)
+
     explanations = status_mod.get_pipeline_explanations(
-        stages_list, single_stage, force=force, allow_missing=allow_missing
+        stages_list, single_stage, force=force, allow_missing=allow_missing, graph=graph
     )
 
     if not explanations:

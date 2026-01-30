@@ -26,6 +26,7 @@ __all__ = [
     "get_upstream_stages",
     "get_stage_dag",
     "update_stage",
+    "get_artifact_consumers",
 ]
 
 
@@ -58,6 +59,11 @@ def build_graph(stages: dict[str, RegistryStageInfo]) -> nx.DiGraph[str]:
         Directed graph where:
         - Nodes are either artifacts (files) or stages (functions)
         - Edges go: artifact -> stage (consumed by) and stage -> artifact (produces)
+
+    Note:
+        Paths are stored as-is from the registry (via pathlib.Path normalization).
+        Callers querying the graph (e.g., what_if_changed) should normalize paths
+        using project.normalize_path() to ensure consistent matching.
     """
     g: nx.DiGraph[str] = nx.DiGraph()
 
@@ -253,3 +259,33 @@ def get_stage_dag(g: nx.DiGraph[str]) -> nx.DiGraph[str]:
                     stage_dag.add_edge(consumer_name, stage_name)
 
     return stage_dag
+
+
+def get_artifact_consumers(
+    g: nx.DiGraph[str],
+    path: Path,
+    include_downstream: bool = True,
+) -> list[str]:
+    """Get all stages affected by a change to this artifact.
+
+    Args:
+        g: The bipartite graph.
+        path: Path to the artifact.
+        include_downstream: If True, include transitive dependents.
+
+    Returns:
+        Sorted list of stage names that would be affected (deterministic order).
+    """
+    direct = get_consumers(g, path)
+    if not direct:
+        return []
+
+    if not include_downstream:
+        return sorted(direct)
+
+    all_affected = set(direct)
+    for stage in direct:
+        downstream = get_downstream_stages(g, stage)
+        all_affected.update(downstream)
+
+    return sorted(all_affected)
