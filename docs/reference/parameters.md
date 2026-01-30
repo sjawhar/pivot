@@ -7,7 +7,7 @@ Pivot supports parameters defined as Pydantic models for type-safe stage configu
 Define a `StageParams` subclass and use it as a function parameter:
 
 ```python
-# stages.py
+# pipeline.py
 import pathlib
 from typing import Annotated, TypedDict
 
@@ -35,56 +35,38 @@ def train(
     ...
 ```
 
-Override defaults in `pivot.yaml`:
+Override defaults at runtime using `params.yaml` at your project root:
 
 ```yaml
-# pivot.yaml
-stages:
-  train:
-    python: stages.train
-    deps:
-      data: data.csv
-    outs:
-      model: model.pkl
-    params:
-      learning_rate: 0.05
-      epochs: 200
+# params.yaml - git-ignore this file
+train:
+  learning_rate: 0.05
+  epochs: 200
 ```
 
 ## Parameter Precedence
 
 Parameters can come from multiple sources. Here's the precedence (highest to lowest):
 
-1. **`params.yaml`** file at project root
-2. **`pivot.yaml`** `params:` section
-3. **Python `StageParams` defaults**
+1. **`params.yaml`** file at project root (for runtime overrides)
+2. **Python `StageParams` defaults**
 
 Example:
 
 ```python
 class TrainParams(StageParams):
-    learning_rate: float = 0.01  # Default (lowest precedence)
-```
-
-```yaml
-# pivot.yaml
-stages:
-  train:
-    python: stages.train
-    params:
-      learning_rate: 0.05  # Overrides Python default
+    learning_rate: float = 0.01  # Default (committed)
 ```
 
 ```yaml
 # params.yaml
 train:
-  learning_rate: 0.001  # Overrides everything (highest precedence)
+  learning_rate: 0.001  # Overrides Python default (not committed)
 ```
 
 This layering lets you:
 
-- Define sensible defaults in Python
-- Configure experiments in `pivot.yaml`
+- Define sensible defaults in Python (committed, type-checked)
 - Override for local testing via `params.yaml` (git-ignored)
 
 ## Parameter Change Detection
@@ -92,8 +74,8 @@ This layering lets you:
 Pivot tracks parameter changes and re-runs stages when parameters change:
 
 ```bash
-# Change pivot.yaml params
-$ pivot explain train
+# After changing params in Python or params.yaml
+$ pivot status --explain train
 Stage: train
   Status: WILL RUN
   Reason: Parameters changed
@@ -117,10 +99,10 @@ pivot params diff
 
 ## Matrix Stage Parameters
 
-Each matrix variant can have different parameters:
+When using `pivot.yaml` for matrix expansion, each variant can have different parameters:
 
 ```yaml
-# pivot.yaml
+# pivot.yaml (for matrix expansion)
 stages:
   train:
     python: stages.train
@@ -140,6 +122,8 @@ stages:
             epochs: 1000
       dataset: [train, test]
 ```
+
+See [Matrix Stages](matrix.md) for more details on YAML matrix expansion.
 
 ## Testing with Parameters
 
@@ -168,10 +152,10 @@ def test_train():
 pivot params show train
 
 # Check explain output
-pivot explain train
+pivot status --explain train
 ```
 
-Remember: `params.yaml` > `pivot.yaml` > Python defaults
+Remember: `params.yaml` > Python defaults
 
 ## See Also
 

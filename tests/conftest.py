@@ -306,6 +306,18 @@ def mock_watch_engine() -> Engine:
 
 
 @pytest.fixture
+def test_engine() -> Generator[Engine]:
+    """Provide a context-managed Engine instance.
+
+    The engine is properly closed after each test to ensure sinks are cleaned up.
+    """
+    from pivot.engine.engine import Engine
+
+    with Engine() as eng:
+        yield eng
+
+
+@pytest.fixture
 def worker_env(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> pathlib.Path:
     """Set up worker execution environment with cache and stages directories."""
     cache_dir = tmp_path / ".pivot" / "cache"

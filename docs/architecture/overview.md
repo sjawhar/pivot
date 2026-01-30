@@ -7,30 +7,22 @@ Pivot is designed for high-performance pipeline execution with automatic code ch
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │  User Pipeline Code (pivot.yaml + typed Python functions)   │
-│  stages:                                                    │
-│    train:                                                   │
-│      python: stages.train                                   │
-│      deps: {data: data.csv}                                 │
-│      outs: {model: model.pkl}                               │
 └─────────────────────────────────────────────────────────────┘
                          │
                          ▼
 ┌─────────────────────────────────────────────────────────────┐
-│  Stage Registry → DAG Builder → Scheduler                    │
-│  Automatic fingerprinting | Topological sort | Ready queue  │
+│  Stage Registry → Bipartite Graph → Engine                   │
+│  Automatic fingerprinting | Artifact-Stage DAG | Event loop │
 └─────────────────────────────────────────────────────────────┘
                          │
-                         ▼
-┌─────────────────────────────────────────────────────────────┐
-│  Warm Workers / Interpreters                                 │
-│  Preloaded numpy/pandas | True parallelism                  │
-└─────────────────────────────────────────────────────────────┘
-                         │
-                         ▼
-┌─────────────────────────────────────────────────────────────┐
-│  Per-Stage Lock Files (.pivot/stages/<name>.lock)        │
-│  Code manifest | Params | Deps/Outs | Fast parallel writes │
-└─────────────────────────────────────────────────────────────┘
+    ┌────────────────────┼────────────────────┐
+    │                    │                    │
+    ▼                    ▼                    ▼
+┌──────────┐      ┌──────────┐      ┌──────────┐
+│  Event   │      │  Event   │      │  Warm    │
+│  Sources │      │  Sinks   │      │  Workers │
+│ (Input)  │      │ (Output) │      │ (Exec)   │
+└──────────┘      └──────────┘      └──────────┘
 ```
 
 ## Core Components
@@ -43,13 +35,24 @@ The `StageRegistry` maintains all registered stages:
 - Builds dependency graph
 - Stores stage metadata (function, deps, outs, params)
 
-### DAG Builder
+### Bipartite Graph
 
-Constructs a directed acyclic graph from stage dependencies:
+The Engine maintains a bipartite graph with two node types:
 
-- Parses output paths to find implicit dependencies
-- Validates no cycles exist
-- Enables topological ordering
+- **Artifact nodes** - Files (dependencies and outputs)
+- **Stage nodes** - Python functions
+
+```
+[data.csv] ──→ [preprocess] ──→ [cleaned.csv] ──→ [train] ──→ [model.pkl]
+ (artifact)      (stage)         (artifact)       (stage)      (artifact)
+```
+
+This graph enables:
+
+1. **Execution** - "This file changed → which stages need to run?"
+2. **Queries** - "What would run if I executed now?"
+
+The legacy stage-only DAG is derived from the bipartite graph via `get_stage_dag()`.
 
 #### Edge Direction
 
@@ -65,7 +68,7 @@ This convention may seem counter-intuitive, but it enables natural execution ord
 
 #### Path Resolution
 
-The DAG builder uses two strategies to match dependencies to outputs:
+The graph builder uses two strategies to match dependencies to outputs:
 
 1. **Exact match (O(1)):** Dictionary lookup via `_build_outputs_map()`
    - Maps each output path to its producing stage
@@ -84,6 +87,33 @@ Coordinates parallel execution:
 - Greedy scheduling - runs stages as soon as dependencies complete
 - Mutex handling - prevents concurrent execution of conflicting stages
 - Ready queue - tracks which stages can run
+
+### Engine
+
+The Engine is the central coordinator for all execution paths. It:
+
+- Processes input events (file changes, run requests, cancellation)
+- Manages stage execution state machine
+- Emits output events (stage started/completed, log lines)
+- Maintains the bipartite artifact-stage graph
+
+All code paths (CLI run, watch mode, agent RPC) route through the Engine.
+
+### Event Sources
+
+Sources produce input events:
+
+- **FilesystemSource** - Watches files via watchfiles, emits `DataArtifactChanged` and `CodeOrConfigChanged`
+- **OneShotSource** - Emits single `RunRequested` for batch mode
+
+### Event Sinks
+
+Sinks consume output events for display:
+
+- **ConsoleSink** - Rich-formatted terminal output
+- **TuiSink** - Forwards to Textual TUI
+- **JsonlSink** - Newline-delimited JSON for tooling integration
+- **WatchSink** - Handles engine state changes for watch mode
 
 ### Executor
 
@@ -175,3 +205,9 @@ Files are stored by their content hash:
 - Prevents conflicting output declarations
 - O(k) lookup where k is path depth
 
+## See Also
+
+- [Engine Architecture](engine.md) - Event-driven architecture, sources, sinks, and API
+- [Execution Model](execution.md) - Parallel execution, skip detection, caching
+- [Watch Mode](watch.md) - Continuous pipeline monitoring
+- [Code Tour](code-tour.md) - Navigate the codebase

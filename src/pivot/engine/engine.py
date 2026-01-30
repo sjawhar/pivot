@@ -358,10 +358,6 @@ class Engine:
         on_error: OnError = OnError.FAIL,
         cache_dir: pathlib.Path | None = None,
         progress_callback: Callable[[RunJsonEvent], None] | None = None,
-        explain_mode: bool = False,  # noqa: ARG002  # pyright: ignore[reportUnusedParameter] - CLI compat
-        show_output: bool = False,  # noqa: ARG002  # pyright: ignore[reportUnusedParameter] - sinks
-        tui_queue: queue.Queue[object] | None = None,  # noqa: ARG002  # pyright: ignore[reportUnusedParameter]
-        output_queue: mp.Queue[OutputMessage] | None = None,  # noqa: ARG002  # pyright: ignore[reportUnusedParameter]
     ) -> dict[str, ExecutionSummary]:
         """Execute stages once and return.
 
@@ -381,10 +377,6 @@ class Engine:
             on_error: Error handling mode ('fail' or 'keep_going').
             cache_dir: Directory for lock files (defaults to .pivot/cache).
             progress_callback: Callback for JSONL progress events.
-            explain_mode: If True, explain why stages run/skip (retained for compatibility).
-            show_output: If True, display stage output (handled via sinks).
-            tui_queue: Queue for TUI messages (sinks preferred, retained for compatibility).
-            output_queue: Queue for worker output messages (Engine manages internally now).
 
         Returns:
             Dict mapping stage name to ExecutionSummary.

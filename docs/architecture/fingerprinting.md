@@ -244,7 +244,7 @@ The fingerprint manifest uses prefixed keys to distinguish different types of tr
 Use explain mode to see what changed:
 
 ```bash
-$ pivot explain train
+$ pivot status --explain train
 
 Stage: train
   Status: WILL RUN

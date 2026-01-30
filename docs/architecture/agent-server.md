@@ -170,7 +170,7 @@ After `COMPLETED` or `FAILED`, the state returns to `WATCHING` to await further 
 
 ## Thread Safety
 
-The watch engine uses locks to protect atomic state transitions. When a `run` request arrives during execution, it returns an error (`-32001 EXECUTION_IN_PROGRESS`) rather than queuing.
+The Engine uses locks to protect atomic state transitions. When a `run` request arrives during execution, it returns an error (`-32001 EXECUTION_IN_PROGRESS`) rather than queuing.
 
 ## Error Codes
 
@@ -228,5 +228,6 @@ print(f"State: {status['result']['state']}")
 
 ## See Also
 
-- [Watch Execution Engine](watch.md) - Watch mode architecture
+- [Engine Architecture](engine.md) - Execution engine architecture
+- [Watch Mode](watch.md) - Watch mode and file monitoring
 - [TUI Architecture](tui.md) - Terminal UI communication

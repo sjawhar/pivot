@@ -109,7 +109,7 @@ Watch mode automatically filters output files. If `preprocess` writes `processed
 
 ## Debounce Control
 
-Some editors save multiple times in quick succession. Control debounce timing:
+Some editors save multiple times in quick succession. The `--debounce` flag controls how long to wait after a file change before triggering a re-run:
 
 ```bash
 # Longer debounce for slow editors/network drives
@@ -120,6 +120,8 @@ pivot run --watch --debounce 100
 ```
 
 Default is 300ms.
+
+> **Note:** Debounce is currently handled by the underlying file watcher (watchfiles). Custom debounce values may not take effect in all situations.
 
 ## Plain Text Mode
 

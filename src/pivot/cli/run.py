@@ -237,7 +237,7 @@ def _run_with_tui(
 
 def _run_watch_with_tui(
     stages_list: list[str] | None,
-    single_stage: bool,  # noqa: ARG001 - single_stage filtering happens in Engine
+    single_stage: bool,
     cache_dir: pathlib.Path | None,  # noqa: ARG001 - cache_dir not yet passed to Engine
     debounce: int,  # noqa: ARG001 - debounce not yet used by FilesystemSource
     force: bool = False,
@@ -249,11 +249,11 @@ def _run_watch_with_tui(
 ) -> None:
     """Run watch mode with TUI display.
 
-    Note: Several parameters (single_stage, cache_dir, debounce, no_commit, no_cache) are
+    Note: Several parameters (cache_dir, debounce, no_commit, no_cache) are
     retained for CLI signature compatibility but not currently used by Engine watch mode.
     """
     # Suppress unused parameter warnings - retained for CLI compatibility
-    _ = single_stage, cache_dir, debounce, no_commit, no_cache
+    _ = cache_dir, debounce, no_commit, no_cache
 
     import queue as thread_queue
     import uuid
@@ -281,45 +281,46 @@ def _run_watch_with_tui(
     run_id = str(uuid.uuid4())[:8]
 
     # Create the Engine
-    eng = engine.Engine()
+    with engine.Engine() as eng:
+        # Set keep-going mode based on on_error
+        eng.set_keep_going(on_error == OnError.KEEP_GOING)
 
-    # Set keep-going mode based on on_error
-    eng.set_keep_going(on_error == OnError.KEEP_GOING)
+        # Build bipartite graph for watch paths
+        all_stages = {
+            name: registry.REGISTRY.get(name) for name in registry.REGISTRY.list_stages()
+        }
+        bipartite_graph = engine_graph.build_graph(all_stages)
+        watch_paths = engine_graph.get_watch_paths(bipartite_graph)
 
-    # Build bipartite graph for watch paths
-    all_stages = {name: registry.REGISTRY.get(name) for name in registry.REGISTRY.list_stages()}
-    bipartite_graph = engine_graph.build_graph(all_stages)
-    watch_paths = engine_graph.get_watch_paths(bipartite_graph)
+        # Add FilesystemSource for watching file changes
+        filesystem_source = sources.FilesystemSource(watch_paths)
+        eng.add_source(filesystem_source)
 
-    # Add FilesystemSource for watching file changes
-    filesystem_source = sources.FilesystemSource(watch_paths)
-    eng.add_source(filesystem_source)
+        # Add OneShotSource for initial run if force is set
+        if force:
+            initial_source = sources.OneShotSource(
+                stages=stages_list,
+                force=True,
+                reason="watch:initial:forced",
+            )
+            eng.add_source(initial_source)
 
-    # Add OneShotSource for initial run if force is set
-    if force:
-        initial_source = sources.OneShotSource(
-            stages=stages_list,
-            force=True,
-            reason="watch:initial:forced",
-        )
-        eng.add_source(initial_source)
+        # Add sinks for TUI updates
+        eng.add_sink(sinks.TuiSink(tui_queue=tui_queue, run_id=run_id))
+        eng.add_sink(sinks.WatchSink(tui_queue=tui_queue))
 
-    # Add sinks for TUI updates
-    eng.add_sink(sinks.TuiSink(tui_queue=tui_queue, run_id=run_id))
-    eng.add_sink(sinks.WatchSink(tui_queue=tui_queue))
+        # Sort for display: group matrix variants together while preserving DAG structure
+        display_order = _sort_for_display(execution_order, graph) if execution_order else None
 
-    # Sort for display: group matrix variants together while preserving DAG structure
-    display_order = _sort_for_display(execution_order, graph) if execution_order else None
-
-    with _suppress_stderr_logging():
-        run_tui.run_watch_tui(
-            eng,
-            tui_queue,
-            tui_log=tui_log,
-            stage_names=display_order,
-            no_commit=False,  # TODO: Support no_commit in Engine watch mode
-            serve=serve,
-        )
+        with _suppress_stderr_logging():
+            run_tui.run_watch_tui(
+                eng,
+                tui_queue,
+                tui_log=tui_log,
+                stage_names=display_order,
+                no_commit=False,  # TODO: Support no_commit in Engine watch mode
+                serve=serve,
+            )
 
 
 @cli_decorators.pivot_command()
@@ -515,47 +516,46 @@ def run(
             from pivot.engine import sources
 
             # Create the Engine
-            eng = engine.Engine()
+            with engine.Engine() as eng:
+                # Set keep-going mode based on on_error
+                eng.set_keep_going(on_error == OnError.KEEP_GOING)
 
-            # Set keep-going mode based on on_error
-            eng.set_keep_going(on_error == OnError.KEEP_GOING)
+                # Build bipartite graph for watch paths
+                all_stages = {
+                    name: registry.REGISTRY.get(name)
+                    for name in registry.REGISTRY.list_stages()
+                }
+                bipartite_graph = engine_graph.build_graph(all_stages)
+                watch_paths = engine_graph.get_watch_paths(bipartite_graph)
 
-            # Build bipartite graph for watch paths
-            all_stages = {
-                name: registry.REGISTRY.get(name) for name in registry.REGISTRY.list_stages()
-            }
-            bipartite_graph = engine_graph.build_graph(all_stages)
-            watch_paths = engine_graph.get_watch_paths(bipartite_graph)
+                # Add FilesystemSource for watching file changes
+                filesystem_source = sources.FilesystemSource(watch_paths)
+                eng.add_source(filesystem_source)
 
-            # Add FilesystemSource for watching file changes
-            filesystem_source = sources.FilesystemSource(watch_paths)
-            eng.add_source(filesystem_source)
+                # Add OneShotSource for initial run if force is set
+                if force:
+                    initial_source = sources.OneShotSource(
+                        stages=stages_list,
+                        force=True,
+                        reason="watch:initial:forced",
+                    )
+                    eng.add_source(initial_source)
 
-            # Add OneShotSource for initial run if force is set
-            if force:
-                initial_source = sources.OneShotSource(
-                    stages=stages_list,
-                    force=True,
-                    reason="watch:initial:forced",
-                )
-                eng.add_source(initial_source)
+                # Add console sink for plain display (unless JSON output)
+                if not as_json:
+                    from pivot.tui import console as tui_console
 
-            # Add console sink for plain display (unless JSON output)
-            if not as_json:
-                from pivot.tui import console as tui_console
+                    console = tui_console.Console()
+                    eng.add_sink(sinks.ConsoleSink(console))
 
-                console = tui_console.Console()
-                eng.add_sink(sinks.ConsoleSink(console))
-
-            try:
-                eng.run_loop()
-            except KeyboardInterrupt:
-                pass  # Normal exit via Ctrl+C
-            finally:
-                eng.shutdown()
-                eng.close()
-                if show_human_output:
-                    click.echo("\nWatch mode stopped.")
+                try:
+                    eng.run_loop()
+                except KeyboardInterrupt:
+                    pass  # Normal exit via Ctrl+C
+                finally:
+                    eng.shutdown()
+                    if show_human_output:
+                        click.echo("\nWatch mode stopped.")
         return
 
     # Determine display mode

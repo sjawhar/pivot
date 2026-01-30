@@ -1,5 +1,9 @@
 # Watch Engine Design
 
+> **Note:** This design document describes the original WatchEngine implementation, which has been superseded by the unified Engine architecture. See [Watch Mode Architecture](../architecture/watch.md) for the current implementation.
+
+---
+
 *This document captures the design decisions and trade-offs for the watch execution engine.*
 
 ## Summary

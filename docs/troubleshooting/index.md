@@ -22,7 +22,7 @@ Quick reference for common issues. Each links to detailed solutions in the relev
 pivot list
 
 # Detailed explanation for why a stage will/won't run
-pivot explain stage_name
+pivot status --explain stage_name
 
 # Show what would run without executing
 pivot run --dry-run
@@ -56,7 +56,7 @@ See: [Function Requirements](../reference/pipelines.md#function-requirements)
 
 1. Check if you're using lambdas (non-deterministic fingerprints)
 2. Check if a helper function changed
-3. Run `pivot explain stage_name` to see what changed
+3. Run `pivot status --explain stage_name` to see what changed
 
 See: [Stage Reruns Unexpectedly](../reference/outputs.md#stage-reruns-unexpectedly)
 

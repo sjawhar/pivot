@@ -9,7 +9,7 @@ Complete reference for all Pivot command-line commands.
 | Run pipeline | `pivot run` |
 | Run specific stages | `pivot run stage1 stage2` |
 | See what would run | `pivot run -n` |
-| Understand why stage runs | `pivot explain stage` |
+| Understand why stage runs | `pivot status --explain stage` |
 | List all stages | `pivot list` |
 | Show stage status | `pivot status` |
 | Push outputs to remote | `pivot push` |
@@ -82,39 +82,6 @@ pivot run --dry-run
 
 # Watch mode
 pivot run --watch
-```
-
----
-
-### `pivot explain`
-
-Show detailed breakdown of why stages would run.
-
-```bash
-pivot explain [STAGES...] [OPTIONS]
-```
-
-**Options:**
-
-| Option | Description |
-|--------|-------------|
-| `--single-stage` / `-s` | Explain only specified stages |
-| `--force` / `-f` | Show explanation as if forced |
-
-**Example Output:**
-
-```
-Stage: train
-  Status: WILL RUN
-  Reason: Code dependency changed
-
-  Code changes:
-    func:helper_a
-      Old: 5995c853
-      New: a1b2c3d4
-
-  Param changes:
-    learning_rate: 0.01 -> 0.001
 ```
 
 ---

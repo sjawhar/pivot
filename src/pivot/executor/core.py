@@ -158,7 +158,6 @@ def run(
     on_error: OnError | str = OnError.FAIL,
     allow_uncached_incremental: bool = False,
     force: bool = False,
-    stage_timeout: float | None = None,  # noqa: ARG001  # pyright: ignore[reportUnusedParameter]
     no_commit: bool = False,
     no_cache: bool = False,
     progress_callback: Callable[[RunJsonEvent], None] | None = None,
@@ -179,7 +178,6 @@ def run(
         on_error: Error handling mode - "fail" or "keep_going".
         allow_uncached_incremental: If True, skip safety check for uncached IncrementalOut files.
         force: If True, bypass cache and force all stages to re-execute.
-        stage_timeout: Max seconds for each stage to complete (retained for API compatibility).
         no_commit: If True, defer lock files to pending dir (faster iteration).
         no_cache: If True, skip caching outputs entirely (maximum iteration speed).
         progress_callback: Callback for JSONL progress events (stage start/complete).
@@ -243,26 +241,25 @@ def _run_inner(
             ) from None
 
     # Create engine and delegate execution
-    engine = Engine()
+    with Engine() as engine:
+        # Pass cancel event to engine if provided
+        if cancel_event is not None:
+            engine.set_cancel_event(cancel_event)
 
-    # Pass cancel event to engine if provided
-    if cancel_event is not None:
-        engine.set_cancel_event(cancel_event)
-
-    return engine.run_once(
-        stages=stages,
-        force=force,
-        single_stage=single_stage,
-        parallel=parallel,
-        max_workers=max_workers,
-        no_commit=no_commit,
-        no_cache=no_cache,
-        allow_uncached_incremental=allow_uncached_incremental,
-        checkout_missing=checkout_missing,
-        on_error=on_error,
-        cache_dir=cache_dir,
-        progress_callback=progress_callback,
-    )
+        return engine.run_once(
+            stages=stages,
+            force=force,
+            single_stage=single_stage,
+            parallel=parallel,
+            max_workers=max_workers,
+            no_commit=no_commit,
+            no_cache=no_cache,
+            allow_uncached_incremental=allow_uncached_incremental,
+            checkout_missing=checkout_missing,
+            on_error=on_error,
+            cache_dir=cache_dir,
+            progress_callback=progress_callback,
+        )
 
 
 # =========================================================================

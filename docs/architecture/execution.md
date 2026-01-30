@@ -11,9 +11,14 @@ Pivot uses a parallel execution model with warm worker pools for maximum perform
        │
        ▼
 ┌──────────────────┐
-│  Build DAG       │
-│  (topological    │
-│   sort)          │
+│  Engine          │  ← Central coordinator
+│  (run_once)      │
+└──────┬───────────┘
+       │
+       ▼
+┌──────────────────┐
+│  Build Bipartite │
+│  Graph           │
 └──────┬───────────┘
        │
        ▼
@@ -25,8 +30,8 @@ Pivot uses a parallel execution model with warm worker pools for maximum perform
        │
        ▼
 ┌──────────────────┐
-│  Greedy          │
-│  Scheduler       │──────────────┐
+│  Engine          │
+│  Orchestration   │──────────────┐
 └──────┬───────────┘              │
        │                          │
        ▼                          ▼
@@ -42,15 +47,48 @@ Pivot uses a parallel execution model with warm worker pools for maximum perform
 └──────────────────────────────────────────┘
 ```
 
-## Greedy Scheduling
+## Engine Orchestration
 
-Pivot uses greedy scheduling for maximum parallelism:
+The Engine uses event-driven orchestration for maximum parallelism:
 
-1. **Ready Queue** - Stages with all dependencies satisfied
-2. **Running Set** - Currently executing stages
-3. **Completed Set** - Finished stages
+1. **Stage States** - Each stage has its own state (PENDING → READY → PREPARING → RUNNING → COMPLETED)
+2. **Ready Queue** - Stages with all dependencies satisfied
+3. **Mutex Handling** - Prevents conflicting stages from running concurrently
+4. **Event Emission** - StageStarted/StageCompleted events to sinks
 
-As stages complete, their dependents become ready. Mutex groups prevent conflicting stages from running concurrently.
+As stages complete, their downstream stages become ready. The Engine handles both batch (`run_once`) and continuous (`run_loop`) execution through the same orchestration code.
+
+## Stage Execution States
+
+Stages have individual states tracked by the Engine:
+
+```python
+class StageExecutionState(IntEnum):
+    PENDING = 0      # Not yet considered
+    BLOCKED = 1      # Upstream failed
+    READY = 2        # Can run, waiting for worker
+    PREPARING = 3    # Engine clearing outputs
+    RUNNING = 4      # Stage function executing
+    COMPLETED = 5    # Terminal
+```
+
+The IntEnum allows ordered comparisons (e.g., `state >= PREPARING` means execution has begun).
+
+### State Transitions
+
+```
+PENDING ──(deps complete)──▶ READY ──(worker available)──▶ PREPARING ──▶ RUNNING ──▶ COMPLETED
+    │                                                           │
+    └──(upstream failed)──▶ BLOCKED                             └──(failed)──▶ COMPLETED
+```
+
+### Output Filtering by State
+
+During watch mode, the Engine filters filesystem events based on stage state:
+
+- **PREPARING**: Silence events for this stage's outputs (Engine is preparing them)
+- **RUNNING**: Defer events for outputs (collect, don't act yet)
+- **COMPLETED**: Process deferred events, compare output hashes, trigger downstream
 
 ## Worker Pool
 
@@ -340,16 +378,14 @@ Cancellation is **stage-level**, not mid-stage. This ensures outputs are always 
 
 In watch mode, the Agent Server's `cancel` RPC method sets this event, allowing external tools to stop execution between stages. The TUI also uses this for `Ctrl+C` handling.
 
-## Timeouts
-
-Stage-level timeouts prevent runaway execution. Configure via the `stage_timeout` parameter.
-
 ## Explain Mode
 
 Preview what would run and why:
 
 ```bash
-pivot explain [STAGES...]
+pivot status --explain [STAGES...]
+# or
+pivot run --explain [STAGES...]
 ```
 
 Shows:

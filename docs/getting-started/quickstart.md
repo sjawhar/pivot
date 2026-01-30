@@ -23,40 +23,19 @@ This creates:
 
 ## 2. Create a Pipeline
 
-Create `pivot.yaml`:
-
-```yaml
-# pivot.yaml
-stages:
-  preprocess:
-    python: stages.preprocess
-    deps:
-      raw: data.csv
-    outs:
-      clean: processed.parquet
-
-  train:
-    python: stages.train
-    deps:
-      data: processed.parquet
-    outs:
-      model: model.pkl
-```
-
-Create `stages.py`:
+Create `pipeline.py`:
 
 ```python
-# stages.py
+# pipeline.py
 import pathlib
 import pickle
 from typing import Annotated, TypedDict
 
 import pandas
 from pivot import loaders, outputs
+from pivot.registry import REGISTRY
 
 
-# TypedDict defines output names and types for the stage.
-# Each field name (e.g., "clean") maps to the YAML "outs:" key.
 class PreprocessOutputs(TypedDict):
     clean: Annotated[pathlib.Path, outputs.Out("processed.parquet", loaders.PathOnly())]
 
@@ -68,7 +47,7 @@ def preprocess(
     df = raw.dropna()
     out_path = pathlib.Path("processed.parquet")
     df.to_parquet(out_path)
-    return {"clean": out_path}
+    return PreprocessOutputs(clean=out_path)
 
 
 class TrainOutputs(TypedDict):
@@ -84,7 +63,12 @@ def train(
     model_path = pathlib.Path("model.pkl")
     with open(model_path, 'wb') as f:
         pickle.dump(model, f)
-    return {"model": model_path}
+    return TrainOutputs(model=model_path)
+
+
+# Register stages - Pivot discovers deps/outs from annotations
+REGISTRY.register(preprocess)
+REGISTRY.register(train)
 ```
 
 ## 3. Create Sample Data
@@ -104,8 +88,8 @@ pivot run
 
 Pivot will:
 
-1. Discover `pivot.yaml` automatically
-2. Build a dependency graph
+1. Discover `pipeline.py` and import it (which registers stages)
+2. Build a dependency graph from the annotations
 3. Execute stages in the correct order
 4. Cache outputs for future runs
 
@@ -119,7 +103,7 @@ The second run completes instantly because nothing changed.
 
 ## 6. Modify and Re-run
 
-Edit `stages.py` to change the `preprocess` function:
+Edit `pipeline.py` to change the `preprocess` function:
 
 ```python
 def preprocess(
@@ -141,7 +125,7 @@ Pivot automatically detects the code change and re-runs both stages.
 ## 7. See Why Stages Run
 
 ```bash
-pivot explain
+pivot status --explain
 ```
 
 Shows detailed breakdown of what changed and why each stage would run.

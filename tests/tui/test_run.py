@@ -348,13 +348,9 @@ def test_engine_emits_status_messages_via_tui_sink(
     register_test_stage(_helper_process, name="process")
 
     run_id = "test_run_123"
-    eng = engine_mod.Engine()
-    eng.add_sink(engine_sinks.TuiSink(tui_queue=tui_queue, run_id=run_id))
-
-    try:
+    with engine_mod.Engine() as eng:
+        eng.add_sink(engine_sinks.TuiSink(tui_queue=tui_queue, run_id=run_id))
         eng.run_once()
-    finally:
-        eng.close()
 
     messages = _drain_queue(tui_queue)
     status_messages = [m for m in messages if is_tui_status_message(m)]
@@ -391,13 +387,9 @@ def test_engine_emits_failed_status_via_tui_sink(
     register_test_stage(_helper_failing_stage, name="failing_stage")
 
     run_id = "test_run_456"
-    eng = engine_mod.Engine()
-    eng.add_sink(engine_sinks.TuiSink(tui_queue=tui_queue, run_id=run_id))
-
-    try:
+    with engine_mod.Engine() as eng:
+        eng.add_sink(engine_sinks.TuiSink(tui_queue=tui_queue, run_id=run_id))
         eng.run_once()
-    finally:
-        eng.close()
 
     messages = _drain_queue(tui_queue)
     status_messages = [m for m in messages if is_tui_status_message(m)]
@@ -424,13 +416,9 @@ def test_engine_emits_status_for_multiple_stages(
     register_test_stage(_helper_step3, name="step3")
 
     run_id = "test_run_789"
-    eng = engine_mod.Engine()
-    eng.add_sink(engine_sinks.TuiSink(tui_queue=tui_queue, run_id=run_id))
-
-    try:
+    with engine_mod.Engine() as eng:
+        eng.add_sink(engine_sinks.TuiSink(tui_queue=tui_queue, run_id=run_id))
         eng.run_once()
-    finally:
-        eng.close()
 
     messages = _drain_queue(tui_queue)
     status_messages = [m for m in messages if is_tui_status_message(m)]
@@ -460,13 +448,9 @@ def test_engine_status_includes_correct_index_and_total(
     register_test_stage(_helper_step2, name="step2")
 
     run_id = "test_run_abc"
-    eng = engine_mod.Engine()
-    eng.add_sink(engine_sinks.TuiSink(tui_queue=tui_queue, run_id=run_id))
-
-    try:
+    with engine_mod.Engine() as eng:
+        eng.add_sink(engine_sinks.TuiSink(tui_queue=tui_queue, run_id=run_id))
         eng.run_once()
-    finally:
-        eng.close()
 
     messages = _drain_queue(tui_queue)
     status_messages = [m for m in messages if is_tui_status_message(m)]

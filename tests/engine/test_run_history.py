@@ -31,7 +31,10 @@ def registered_stage() -> str:
 
 
 def test_engine_writes_run_history(
-    registered_stage: str, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    registered_stage: str,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    test_engine: engine.Engine,
 ) -> None:
     """Engine writes run history after execution."""
     # Set up paths
@@ -41,10 +44,8 @@ def test_engine_writes_run_history(
     monkeypatch.setattr(config, "get_state_dir", lambda: state_dir)
     monkeypatch.setattr(config, "get_state_db_path", lambda: state_dir / "state.db")
 
-    eng = engine.Engine()
-
     # Run the stage
-    results = eng.run_once(
+    results = test_engine.run_once(
         stages=[registered_stage],
         cache_dir=cache_dir,
     )
@@ -64,7 +65,10 @@ def test_engine_writes_run_history(
 
 
 def test_engine_run_history_contains_stage_records(
-    registered_stage: str, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    registered_stage: str,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    test_engine: engine.Engine,
 ) -> None:
     """Engine run history contains records for executed stages."""
     cache_dir = tmp_path / "cache"
@@ -73,10 +77,8 @@ def test_engine_run_history_contains_stage_records(
     monkeypatch.setattr(config, "get_state_dir", lambda: state_dir)
     monkeypatch.setattr(config, "get_state_db_path", lambda: state_dir / "state.db")
 
-    eng = engine.Engine()
-
     # Run the stage
-    eng.run_once(stages=[registered_stage], cache_dir=cache_dir)
+    test_engine.run_once(stages=[registered_stage], cache_dir=cache_dir)
 
     # Verify run history contains stage record
     with state_mod.StateDB(state_dir / "state.db") as state_db:
@@ -94,7 +96,10 @@ def test_engine_run_history_contains_stage_records(
 
 
 def test_engine_writes_run_cache_entry(
-    registered_stage: str, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    registered_stage: str,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    test_engine: engine.Engine,
 ) -> None:
     """Engine writes run cache entries for successful stages."""
     cache_dir = tmp_path / "cache"
@@ -103,11 +108,9 @@ def test_engine_writes_run_cache_entry(
     monkeypatch.setattr(config, "get_state_dir", lambda: state_dir)
     monkeypatch.setattr(config, "get_state_db_path", lambda: state_dir / "state.db")
 
-    eng = engine.Engine()
-
     # Run twice - second should be cached
-    eng.run_once(stages=[registered_stage], cache_dir=cache_dir)
-    results = eng.run_once(stages=[registered_stage], cache_dir=cache_dir)
+    test_engine.run_once(stages=[registered_stage], cache_dir=cache_dir)
+    results = test_engine.run_once(stages=[registered_stage], cache_dir=cache_dir)
 
     # Should be skipped due to cache
     assert results[registered_stage]["reason"] != "", "Stage should have a skip reason"

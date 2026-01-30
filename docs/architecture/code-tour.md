@@ -6,10 +6,10 @@ This guide maps Pivot's architectural concepts to actual file paths, helping you
 
 | Command | Entry Point | Description |
 |---------|-------------|-------------|
-| `pivot run` | `src/pivot/cli/run.py` | Main execution flow |
+| `pivot run` | `src/pivot/cli/run.py` → `Engine.run_once()` | Batch execution |
 | `pivot list` | `src/pivot/cli/list.py` | Stage listing |
-| `pivot explain` | `src/pivot/cli/run.py:explain_cmd()` | Change detection explanation |
-| `pivot run --watch` | `src/pivot/watch/engine.py` | Watch mode |
+| `pivot status --explain` | `src/pivot/cli/status.py` → `status.get_pipeline_explanations()` | Change detection explanation |
+| `pivot run --watch` | `src/pivot/cli/run.py` → `Engine.run_loop()` | Watch mode |
 
 ## Core Subsystems
 
@@ -66,19 +66,24 @@ This guide maps Pivot's architectural concepts to actual file paths, helping you
 
 **Key files:**
 
-- `src/pivot/executor/core.py` - Main executor logic
+- `src/pivot/engine/engine.py` - Central coordinator (Engine class)
+- `src/pivot/engine/graph.py` - Bipartite artifact-stage graph
+- `src/pivot/engine/types.py` - Event types and stage states
+- `src/pivot/engine/sources.py` - Event sources (FilesystemSource, OneShotSource)
+- `src/pivot/engine/sinks.py` - Event sinks (ConsoleSink, TuiSink, JsonlSink)
+- `src/pivot/executor/core.py` - Worker pool management
 - `src/pivot/executor/worker.py` - Worker process code
-- `src/pivot/executor/commit.py` - Post-execution output handling
 - `src/pivot/outputs.py` - Output type definitions (`Out`, `Metric`, `Plot`, `IncrementalOut`)
 
 **How it works:**
 
-1. `run()` function is the main entry point
-2. Uses `loky.get_reusable_executor()` for warm worker pool
-3. Workers execute stages via `worker.execute_stage()`
-4. Lock files updated after each stage; `commit.commit_pending()` promotes deferred locks
+1. CLI creates Engine and registers sinks/sources
+2. `Engine.run_once()` for batch mode; `Engine.run_loop()` for watch mode
+3. Engine builds bipartite graph and orchestrates execution
+4. Workers execute stages via `worker.execute_stage()`
+5. Lock files updated after each stage
 
-**Start reading:** `src/pivot/executor/core.py:run()`
+**Start reading:** `src/pivot/engine/engine.py:Engine.run_once()`
 
 ### Caching & Storage
 
@@ -100,23 +105,23 @@ This guide maps Pivot's architectural concepts to actual file paths, helping you
 
 **Start reading:** `src/pivot/storage/cache.py:CacheStore`
 
-### Watch Engine
+### Engine Event System
 
 **Key files:**
 
-- `src/pivot/watch/engine.py` - Main watch loop
-- `src/pivot/watch/_watch_utils.py` - Helper utilities (output filtering)
-- `src/pivot/ignore.py` - `.pivotignore` file parsing
+- `src/pivot/engine/engine.py` - Event processing loop
+- `src/pivot/engine/types.py` - Input/output event definitions
+- `src/pivot/engine/sources.py` - Event producers
+- `src/pivot/engine/sinks.py` - Event consumers
 
 **How it works:**
 
-1. `WatchEngine` starts watcher thread using `watchfiles`
-2. Changes are debounced in coordinator loop
-3. Code changes trigger worker pool restart
-4. Affected stages are re-executed
-5. `IgnoreFilter` excludes paths matching `.pivotignore` patterns
+1. Sources submit events to Engine via `engine.submit()`
+2. Engine processes events in `run_loop()` or `run_once()`
+3. Engine emits output events to registered sinks
+4. Sinks handle display (TUI, console, JSON)
 
-**Start reading:** `src/pivot/watch/engine.py:WatchEngine`
+**Start reading:** `src/pivot/engine/engine.py:Engine._handle_input_event()`
 
 ### TUI
 
@@ -167,21 +172,25 @@ Discovery (discovery.py)
 Registry (registry.py) ◄── YAML Parser (pipeline/yaml.py)
     │
     ▼
-DAG Builder (dag.py)
+Engine (engine/engine.py)
     │
-    ▼
-Executor (executor/core.py)
+    ├──► Build Graph (engine/graph.py)
     │
-    ├──► Worker Pool (executor/worker.py)
+    ├──► Orchestrate Execution
+    │         │
+    │         ▼
+    │    Worker Pool (executor/core.py)
+    │         │
+    │         ▼
+    │    Workers (executor/worker.py)
     │         │
     │         ▼
     │    Stage Function
     │         │
     │         ▼
-    │    Commit Outputs (executor/commit.py)
-    │         │
-    │         ▼
     │    Cache (storage/cache.py)
+    │
+    ├──► Emit Events to Sinks
     │
     ▼
 Lock File Update (storage/lock.py)

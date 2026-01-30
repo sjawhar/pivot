@@ -97,5 +97,5 @@ Variant(name='has@at')     # @ is reserved
 
 ## See Also
 
-- [Defining Pipelines](pipelines.md) - Stage definition patterns
-- [Parameters](parameters.md) - Parameter handling
+- [Getting Started](../getting-started/quickstart.md) - Basic pipeline setup
+- [Architecture Overview](../architecture/overview.md) - How Pivot works

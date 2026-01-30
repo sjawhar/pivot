@@ -100,9 +100,10 @@ class FilesystemSource:
             self._watcher_thread.join(timeout=3.0)
             if self._watcher_thread.is_alive():
                 _logger.warning("FilesystemSource watcher thread did not terminate within timeout")
-            # Always clear references to prevent repeated join() calls on subsequent stop()
             self._watcher_thread = None
-            self._submit = None
+
+        # Always clear submit callback, even if no thread was started
+        self._submit = None
 
     def _watch_loop(self) -> None:
         """Watch for file changes and submit events."""
