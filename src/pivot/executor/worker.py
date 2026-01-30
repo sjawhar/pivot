@@ -208,7 +208,7 @@ def execute_stage(
             )
 
         try:
-            with lock.execution_lock(stage_name, cache_dir):
+            with lock.execution_lock(stage_name, lock.get_stages_dir(stage_info["state_dir"])):
                 # Check pending lock first for IncrementalOut restoration, fall back to production
                 pending_lock_data = pending_lock.read()
                 production_lock_data = production_lock.read()

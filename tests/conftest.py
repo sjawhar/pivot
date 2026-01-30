@@ -237,6 +237,14 @@ def pipeline_dir(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> pat
 
 
 @pytest.fixture
+def stages_dir(pipeline_dir: pathlib.Path) -> pathlib.Path:
+    """Return the stages directory, creating it if needed."""
+    dir_path = pipeline_dir / ".pivot" / "stages"
+    dir_path.mkdir(parents=True, exist_ok=True)
+    return dir_path
+
+
+@pytest.fixture
 def runner() -> click.testing.CliRunner:
     """Create a CLI runner for testing."""
     return click.testing.CliRunner()
@@ -297,9 +305,9 @@ def mock_watch_engine() -> WatchEngine:
 def worker_env(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> pathlib.Path:
     """Set up worker execution environment with cache and stages directories."""
     cache_dir = tmp_path / ".pivot" / "cache"
-    cache_dir.mkdir(parents=True)
-    (cache_dir / "files").mkdir()
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    (cache_dir / "files").mkdir(exist_ok=True)
     (tmp_path / ".pivot" / "stages").mkdir(parents=True, exist_ok=True)
-    (tmp_path / ".pivot" / "pending" / "stages").mkdir(parents=True)
+    (tmp_path / ".pivot" / "pending" / "stages").mkdir(parents=True, exist_ok=True)
     monkeypatch.chdir(tmp_path)
     return cache_dir

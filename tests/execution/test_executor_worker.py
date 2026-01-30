@@ -517,6 +517,27 @@ def test_execution_lock_creates_sentinel_file(worker_env: pathlib.Path) -> None:
     assert not sentinel.exists()
 
 
+@pytest.mark.parametrize(
+    "stage_name",
+    [
+        pytest.param("simple", id="simple"),
+        pytest.param("train@model=gpt4", id="matrix-with-equals"),
+        pytest.param("process@v1.2", id="matrix-with-dot"),
+        pytest.param("stage_with_underscores", id="underscores"),
+        pytest.param("stage-with-dashes", id="dashes"),
+    ],
+)
+def test_execution_lock_with_various_stage_names(worker_env: pathlib.Path, stage_name: str) -> None:
+    """Execution lock works with various stage name formats including matrix names."""
+    sentinel_path = worker_env / f"{stage_name}.running"
+
+    with lock.execution_lock(stage_name, worker_env) as sentinel:
+        assert sentinel.exists()
+        assert sentinel == sentinel_path
+
+    assert not sentinel.exists()
+
+
 def test_execution_lock_removes_sentinel_on_exception(worker_env: pathlib.Path) -> None:
     """Execution lock removes sentinel even when exception occurs."""
     sentinel_path = worker_env / "test_stage.running"
