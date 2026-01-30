@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import queue
 import threading
 from typing import TYPE_CHECKING, Self
 
@@ -11,7 +12,10 @@ from pivot.engine.types import (
     EngineState,
     EngineStateChanged,
     EventSink,
+    EventSource,
+    InputEvent,
     OutputEvent,
+    RunRequested,
     StageCompleted,
     StageStarted,
 )
@@ -42,6 +46,9 @@ class Engine:
         """Initialize the engine in IDLE state."""
         self._state: EngineState = EngineState.IDLE
         self._sinks: list[EventSink] = list[EventSink]()
+        self._sources: list[EventSource] = list[EventSource]()
+        self._event_queue: queue.Queue[InputEvent] = queue.Queue()
+        self._shutdown_event: threading.Event = threading.Event()
         self._cancel_event: threading.Event = threading.Event()
         self._graph: nx.DiGraph[str] | None = None
         self._stage_indices: dict[str, tuple[int, int]] = dict[str, tuple[int, int]]()
@@ -53,8 +60,13 @@ class Engine:
 
     @property
     def sinks(self) -> list[EventSink]:
-        """Registered event sinks."""
-        return self._sinks
+        """Registered event sinks (returns a copy)."""
+        return list(self._sinks)
+
+    @property
+    def sources(self) -> list[EventSource]:
+        """Registered event sources (returns a copy)."""
+        return list(self._sources)
 
     @property
     def cancel_event(self) -> threading.Event:
@@ -93,6 +105,20 @@ class Engine:
     def add_sink(self, sink: EventSink) -> None:
         """Register an event sink to receive output events."""
         self._sinks.append(sink)
+
+    def add_source(self, source: EventSource) -> None:
+        """Register an event source to produce input events."""
+        self._sources.append(source)
+
+    def submit(self, event: InputEvent) -> None:
+        """Submit an event for processing. Thread-safe.
+
+        Events are queued and processed by run_loop().
+
+        Args:
+            event: Input event to process.
+        """
+        self._event_queue.put(event)
 
     def emit(self, event: OutputEvent) -> None:
         """Emit an event to all registered sinks.
@@ -230,3 +256,75 @@ class Engine:
             # Emit state transition: ACTIVE -> IDLE
             self._state = EngineState.IDLE
             self.emit(EngineStateChanged(type="engine_state_changed", state=EngineState.IDLE))
+
+    def shutdown(self) -> None:
+        """Signal the engine to stop processing events."""
+        self._shutdown_event.set()
+
+    def run_loop(self) -> None:
+        """Process events until shutdown. For 'pivot run --watch'.
+
+        Blocks until shutdown() is called. Processes events from the
+        queue and from registered sources.
+        """
+        # Start all sources
+        for source in self._sources:
+            source.start(self.submit)
+
+        try:
+            while not self._shutdown_event.is_set():
+                try:
+                    # Wait for an event with timeout to check shutdown
+                    event = self._event_queue.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+
+                self._handle_input_event(event)
+        finally:
+            # Stop all sources
+            for source in self._sources:
+                source.stop()
+
+            # Ensure we're in IDLE state on exit
+            if self._state != EngineState.IDLE:
+                self._state = EngineState.IDLE
+                self.emit(EngineStateChanged(type="engine_state_changed", state=EngineState.IDLE))
+
+    def _handle_input_event(self, event: InputEvent) -> None:
+        """Process a single input event."""
+        match event["type"]:
+            case "run_requested":
+                self._handle_run_requested(event)
+            case "cancel_requested":
+                self._handle_cancel_requested()
+            case "data_artifact_changed":
+                pass  # TODO: implement in Phase 4
+            case "code_or_config_changed":
+                pass  # TODO: implement in Phase 4
+
+    def _handle_run_requested(self, event: RunRequested) -> None:
+        """Handle a RunRequested event by executing stages."""
+        # Clear cancel event before starting new execution
+        self._cancel_event.clear()
+
+        # Reset stage indices for this run
+        self._stage_indices.clear()
+
+        # Emit state transition: IDLE -> ACTIVE
+        self._state = EngineState.ACTIVE
+        self.emit(EngineStateChanged(type="engine_state_changed", state=EngineState.ACTIVE))
+
+        try:
+            executor.run(
+                stages=event["stages"],
+                force=event["force"],
+                cancel_event=self._cancel_event,
+            )
+        finally:
+            # Emit state transition: ACTIVE -> IDLE
+            self._state = EngineState.IDLE
+            self.emit(EngineStateChanged(type="engine_state_changed", state=EngineState.IDLE))
+
+    def _handle_cancel_requested(self) -> None:
+        """Handle a CancelRequested event by setting cancel flag."""
+        self._cancel_event.set()

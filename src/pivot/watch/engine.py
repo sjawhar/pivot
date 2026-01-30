@@ -959,8 +959,6 @@ class WatchEngine:
     def _execute_stages(self, stages: list[str] | None) -> dict[str, executor.ExecutionSummary]:
         """Execute stages using the executor."""
         force = self._force_first_run and not self._first_run_done
-        # Suppress console output when JSON output is enabled
-        show_output = self._tui_queue is None and not self._json_output
         # Read keep-going state at execution start (toggle takes effect on next wave)
         on_error = OnError.KEEP_GOING if self._keep_going_event.is_set() else OnError.FAIL
 
@@ -975,9 +973,6 @@ class WatchEngine:
                 single_stage=self._single_stage,
                 cache_dir=self._cache_dir,
                 max_workers=self._max_workers,
-                show_output=show_output,
-                tui_queue=self._tui_queue,
-                output_queue=self._output_queue,
                 force=force,
                 no_commit=self._no_commit,
                 no_cache=self._no_cache,

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -26,12 +26,12 @@ def _create_stage(name: str, deps: list[str], outs: list[str]) -> RegistryStageI
         outs=[outputs.Out(path=out, loader=loaders.PathOnly()) for out in outs],
         outs_paths=outs,
         params=None,
-        mutex=list[Any](),
+        mutex=list[str](),
         variant=None,
         signature=None,
-        fingerprint=dict[str, Any](),
-        dep_specs=dict[str, Any](),
-        out_specs=dict[str, Any](),
+        fingerprint=dict[str, str](),
+        dep_specs={},
+        out_specs={},
         params_arg_name=None,
     )
 

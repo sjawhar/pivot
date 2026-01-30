@@ -5,11 +5,13 @@ from __future__ import annotations
 import contextlib
 import pathlib
 import threading
+import time
+from typing import TYPE_CHECKING
 from unittest.mock import patch
 
 import pytest
 
-from pivot.engine import engine, types
+from pivot.engine import engine, sources, types
 from pivot.types import (
     OnError,
     RunEventType,
@@ -18,6 +20,10 @@ from pivot.types import (
     StageStartEvent,
     StageStatus,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
 
 # =============================================================================
 # Module-level test helpers (per tests/CLAUDE.md)
@@ -39,6 +45,19 @@ class _MockSink:
 
     def close(self) -> None:
         self.closed = True
+
+
+def _helper_run_loop_with_delayed_shutdown(eng: engine.Engine, delay: float = 0.05) -> None:
+    """Run engine loop and shut it down after a delay."""
+
+    def delayed_shutdown() -> None:
+        time.sleep(delay)
+        eng.shutdown()
+
+    stopper = threading.Thread(target=delayed_shutdown)
+    stopper.start()
+    eng.run_loop()
+    stopper.join()
 
 
 class _FailingSink:
@@ -72,6 +91,22 @@ def test_engine_initial_state_is_idle() -> None:
     """Engine starts in IDLE state."""
     eng = engine.Engine()
     assert eng.state == types.EngineState.IDLE
+
+
+def test_engine_has_empty_sources_initially() -> None:
+    """Engine has no sources until registered."""
+    eng = engine.Engine()
+    assert eng.sources == []
+
+
+def test_engine_add_source() -> None:
+    """Engine can register event sources."""
+    eng = engine.Engine()
+    source = sources.OneShotSource(stages=None, force=False, reason="test")
+    eng.add_source(source)
+
+    assert len(eng.sources) == 1
+    assert eng.sources[0] is source
 
 
 def test_engine_has_empty_sinks_initially() -> None:
@@ -266,6 +301,118 @@ def test_engine_run_once_emits_idle_on_exception() -> None:
         assert eng.state == types.EngineState.IDLE
 
 
+def test_engine_submit_adds_to_event_queue() -> None:
+    """Engine.submit() queues an input event for processing."""
+    eng = engine.Engine()
+
+    event: types.RunRequested = {
+        "type": "run_requested",
+        "stages": ["train"],
+        "force": False,
+        "reason": "test",
+    }
+    eng.submit(event)
+
+    # Event should be in the queue (we can't easily inspect, but submit should not raise)
+    assert eng.state == types.EngineState.IDLE  # Still idle until run_loop starts
+
+
+def test_engine_submit_is_thread_safe() -> None:
+    """Engine.submit() is safe to call from multiple threads."""
+    eng = engine.Engine()
+    events_submitted = list[bool]()
+
+    def submit_event() -> None:
+        event: types.RunRequested = {
+            "type": "run_requested",
+            "stages": None,
+            "force": False,
+            "reason": "thread",
+        }
+        eng.submit(event)
+        events_submitted.append(True)
+
+    threads = [threading.Thread(target=submit_event) for _ in range(10)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(events_submitted) == 10
+
+
+def test_engine_run_loop_processes_run_requested() -> None:
+    """run_loop() processes RunRequested events."""
+    with patch("pivot.engine.engine.executor") as mock_executor:
+        mock_executor.run.return_value = {"stage_a": {"status": "ran", "reason": ""}}
+
+        eng = engine.Engine()
+        sink = _MockSink()
+        eng.add_sink(sink)
+
+        # Submit a run request
+        event: types.RunRequested = {
+            "type": "run_requested",
+            "stages": ["stage_a"],
+            "force": False,
+            "reason": "test",
+        }
+        eng.submit(event)
+
+        _helper_run_loop_with_delayed_shutdown(eng, delay=0.1)
+
+        # Verify executor was called
+        mock_executor.run.assert_called_once()
+        call_kwargs = mock_executor.run.call_args.kwargs
+        assert call_kwargs["stages"] == ["stage_a"]
+
+
+def test_engine_run_loop_emits_state_changes() -> None:
+    """run_loop() emits ACTIVE/IDLE state changes around execution."""
+    with patch("pivot.engine.engine.executor") as mock_executor:
+        mock_executor.run.return_value = {}
+
+        eng = engine.Engine()
+        sink = _MockSink()
+        eng.add_sink(sink)
+
+        # Submit and immediately request shutdown
+        event: types.RunRequested = {
+            "type": "run_requested",
+            "stages": None,
+            "force": False,
+            "reason": "test",
+        }
+        eng.submit(event)
+
+        _helper_run_loop_with_delayed_shutdown(eng, delay=0.1)
+
+        # Check state changes: ACTIVE when processing, IDLE when done
+        state_events = [e for e in sink.events if e["type"] == "engine_state_changed"]
+        assert len(state_events) >= 2
+        # First should be ACTIVE (start processing), last should be IDLE (done)
+        assert state_events[0]["state"] == types.EngineState.ACTIVE
+        assert state_events[-1]["state"] == types.EngineState.IDLE
+
+
+def test_engine_cancel_requested_sets_cancel_event() -> None:
+    """CancelRequested sets internal cancel event."""
+    eng = engine.Engine()
+
+    # Verify cancel event is initially clear
+    assert not eng._cancel_event.is_set()
+
+    # Submit cancel request
+    cancel_event: types.CancelRequested = {"type": "cancel_requested"}
+    eng.submit(cancel_event)
+
+    # Process the event
+    _helper_run_loop_with_delayed_shutdown(eng)
+
+    # Cancel event should be set
+    assert eng._cancel_event.is_set()
+
+
 def test_engine_cancel_event_property() -> None:
     """Engine exposes cancel_event for executor integration."""
     eng = engine.Engine()
@@ -274,6 +421,69 @@ def test_engine_cancel_event_property() -> None:
     assert hasattr(eng.cancel_event, "is_set")
     assert hasattr(eng.cancel_event, "set")
     assert hasattr(eng.cancel_event, "clear")
+
+
+def test_engine_run_loop_passes_cancel_event_to_executor() -> None:
+    """run_loop() passes cancel_event to executor.run()."""
+    with patch("pivot.engine.engine.executor") as mock_executor:
+        mock_executor.run.return_value = {}
+
+        eng = engine.Engine()
+
+        event: types.RunRequested = {
+            "type": "run_requested",
+            "stages": None,
+            "force": False,
+            "reason": "test",
+        }
+        eng.submit(event)
+
+        _helper_run_loop_with_delayed_shutdown(eng)
+
+        # Verify cancel_event was passed
+        call_kwargs = mock_executor.run.call_args.kwargs
+        assert "cancel_event" in call_kwargs
+        assert call_kwargs["cancel_event"] is eng.cancel_event
+
+
+def test_engine_run_loop_starts_sources() -> None:
+    """run_loop() starts all registered sources."""
+    started = list[bool]()
+
+    class MockSource:
+        def start(self, submit: Callable[[types.InputEvent], None]) -> None:
+            started.append(True)
+
+        def stop(self) -> None:
+            pass
+
+    eng = engine.Engine()
+    eng.add_source(MockSource())
+    eng.add_source(MockSource())
+
+    _helper_run_loop_with_delayed_shutdown(eng)
+
+    assert len(started) == 2
+
+
+def test_engine_run_loop_stops_sources_on_shutdown() -> None:
+    """run_loop() stops all sources when shutting down."""
+    stopped = list[bool]()
+
+    class MockSource:
+        def start(self, submit: Callable[[types.InputEvent], None]) -> None:
+            pass
+
+        def stop(self) -> None:
+            stopped.append(True)
+
+    eng = engine.Engine()
+    eng.add_source(MockSource())
+    eng.add_source(MockSource())
+
+    _helper_run_loop_with_delayed_shutdown(eng)
+
+    assert len(stopped) == 2
 
 
 # =============================================================================
