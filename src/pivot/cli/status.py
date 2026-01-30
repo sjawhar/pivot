@@ -5,7 +5,7 @@ import pathlib
 import sys
 
 import click
-from tqdm import tqdm
+import tqdm
 
 from pivot import config, exceptions, project
 from pivot import status as status_mod
@@ -83,16 +83,20 @@ def status(
     if show_tracked:
         # Show progress bar only on TTY and not in quiet/JSON mode
         use_progress = sys.stderr.isatty() and not quiet and not output_json
-        pbar = None  # tqdm instance, created lazily
+        pbar = (
+            tqdm.tqdm(
+                total=None, desc="Checking tracked files", file=sys.stderr, dynamic_ncols=True
+            )
+            if use_progress
+            else None
+        )
 
         def on_progress(_completed: int, total: int) -> None:
-            nonlocal pbar
-            if not use_progress:
-                return
             if pbar is None:
-                pbar = tqdm(
-                    total=total, desc="Checking tracked files", file=sys.stderr, dynamic_ncols=True
-                )
+                return
+            if pbar.total is None:
+                pbar.total = total
+                pbar.refresh()
             pbar.update(1)
 
         try:
