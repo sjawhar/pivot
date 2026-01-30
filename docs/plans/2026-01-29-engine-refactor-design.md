@@ -105,7 +105,7 @@ The IntEnum allows ordered comparisons (e.g., `state >= PREPARING` means executi
 
 ### Output Filtering by State
 
-- **PREPARING**: Silence filesystem events for this stage's outputs (it's Pivot's cleanup)
+- **PREPARING**: Silence filesystem events for this stage's outputs (Pivot is preparing them—clearing regular `Out` or restoring `IncrementalOut` from cache)
 - **RUNNING**: Defer filesystem events for outputs (collect, don't act yet)
 - **COMPLETED**: Process deferred events, compare output hashes, trigger downstream
 
@@ -375,7 +375,7 @@ def update_stage(graph: nx.DiGraph, stage_name: str, new_info: RegistryStageInfo
 - Remove `pivot/watch/engine.py`
 - Replaced by unified Engine
 
-### Phase 4: Cleanup
+### Phase 4: Cleanup and Integration
 
 **Step 4.1: Simplify executor/core.py**
 - Executor becomes: "given a stage, run it, return result"
@@ -385,9 +385,24 @@ def update_stage(graph: nx.DiGraph, stage_name: str, new_info: RegistryStageInfo
 - `_execute_greedy()` logic now in Engine
 - `StageLifecycle` replaced by Engine events
 
-**Step 4.3: Update Tests**
+**Step 4.3: Agent RPC Integration**
+- Add `Engine.try_start_run()` for atomic agent run starts
+- Add `Engine.get_execution_status()` for agent status queries
+- Add `Engine.request_cancel()` for cancellation
+- Refactor `AgentServer` to use Engine instead of WatchEngine
+
+**Step 4.4: Verify Run History**
+- Confirm run history still written correctly through Engine path
+- Verify `RunManifest` and `RunCacheEntry` populated correctly
+
+**Step 4.5: Delete WatchEngine**
+- Remove `pivot/watch/engine.py`
+- All watch functionality now in unified Engine
+
+**Step 4.6: Update Tests**
 - Tests go through Engine
 - Watch tests use same Engine with FilesystemSource
+- Agent RPC tests use Engine
 
 ### Validation at Each Step
 
@@ -398,16 +413,207 @@ def update_stage(graph: nx.DiGraph, stage_name: str, new_info: RegistryStageInfo
 | 2.3 | Stage state transitions emit correct events. TUI works. |
 | 3.1-3.2 | `pivot run --watch` works identically. |
 | 3.3 | Watch mode tests pass with new implementation. |
-| 4.x | All tests pass. Code coverage maintained. |
+| 4.1-4.2 | Executor simplified. All tests pass. |
+| 4.3 | Agent RPC works with Engine. `tui/agent_server.py` tests pass. |
+| 4.4 | Run history populated correctly. `pivot history` works. |
+| 4.5-4.6 | WatchEngine deleted. All tests pass. Code coverage maintained. |
+
+---
+
+## Query API: Status, Verify, and Dry-Run
+
+The Engine handles **execution**. Status queries (`pivot status`, `pivot verify`, `pivot run --dry-run`) are **queries** that don't execute stages but need access to the graph and skip detection logic.
+
+### Architectural Separation
+
+| Layer | Responsibility |
+|-------|----------------|
+| **Engine** | Execution coordination, graph maintenance, event processing |
+| **Status/Explain** | Query what would run and why (uses Engine's graph + lock files) |
+| **Hash Sources** | Determine artifact hashes from disk, `.pvt` files, or lock files |
+
+### Engine Exposes Graph for Queries
+
+```python
+class Engine:
+    @property
+    def graph(self) -> nx.DiGraph | None:
+        """Return current bipartite graph for querying."""
+        return self._graph
+```
+
+**Staged implementation:**
+- **Phase 2**: Property exists but returns None (Engine delegates to executor)
+- **Phase 4**: Engine builds and maintains the graph; status/verify can query it
+- **Interim**: Status/verify continues using `registry.REGISTRY.build_dag()` directly
+
+Once fully implemented, status/explain code uses `engine.graph` to understand artifact-stage relationships, then reads lock files and computes hashes to determine what would change.
+
+### Hash Source Resolution (for --allow-missing)
+
+When determining artifact hashes, the order is:
+
+1. **Actual file on disk** (primary) - `cache.hash_file(path)`
+2. **`.pvt` file hash** (fallback when file missing + `--allow-missing`) - read from tracked file
+3. **Lock file hash** (for output verification) - read from stage lock
+
+This hash source resolution lives in the **explain** layer, not the Engine. The Engine doesn't need to know about `.pvt` fallbacks - it just executes stages.
+
+### Impact on Design
+
+The bipartite graph serves two purposes:
+
+1. **Execution** (Engine): "This artifact changed → which stages need to run?"
+2. **Queries** (Status): "Given current state, what would run if I executed?"
+
+Both use the same graph structure. The Engine owns the graph; status/explain queries it.
+
+### Verify Flow (Current vs New)
+
+**Current:**
+```
+verify.py → status.get_pipeline_status() → explain.get_stage_explanation()
+                                         → worker.hash_dependencies()
+```
+
+**With Engine:**
+```
+verify.py → Engine.graph (for artifact-stage relationships)
+          → explain.get_stage_explanation() (for skip detection)
+          → hash_artifact() (uses disk → .pvt → lock fallback)
+```
+
+The explain layer gains a `hash_artifact()` function that encapsulates the fallback logic:
+
+```python
+def hash_artifact(
+    path: Path,
+    allow_missing: bool = False,
+    tracked_trie: pygtrie.StringTrie | None = None,
+) -> HashInfo | None:
+    """Get artifact hash, with fallback to .pvt if allow_missing."""
+    if path.exists():
+        return hash_file_or_dir(path)
+    if allow_missing and tracked_trie:
+        return find_tracked_hash(path, tracked_trie)
+    return None  # Missing
+```
+
+This keeps the Engine focused on execution while giving status/verify the flexibility they need.
+
+---
+
+## Agent RPC Integration
+
+The agent RPC protocol (`tui/agent_server.py`) allows external tools to control pipeline execution via JSON-RPC over Unix socket. The Engine must support both **event submission** and **synchronous queries**.
+
+### Current Protocol
+
+| Method | Purpose | Current Implementation |
+|--------|---------|------------------------|
+| `run()` | Start execution | `WatchEngine.try_start_agent_run()` |
+| `status()` | Query progress | `WatchEngine.get_agent_status()` |
+| `stages()` | List available stages | Reads from registry |
+| `cancel()` | Stop execution | `WatchEngine.request_agent_cancel()` |
+
+### Engine Methods for Agent RPC
+
+The Engine needs query methods alongside event submission:
+
+```python
+class Engine:
+    def try_start_run(
+        self,
+        run_id: str,
+        stages: list[str] | None,
+        force: bool,
+    ) -> RunStartResult | RunRejection:
+        """Atomically try to start a run.
+
+        Returns RunRejection if execution is already in progress.
+        This is atomic: checks state and starts in one operation.
+        """
+
+    def get_execution_status(self, run_id: str | None = None) -> ExecutionStatus:
+        """Query current execution state for agent RPC.
+
+        Returns:
+            - Engine state (idle/active/shutdown)
+            - Current run_id (if any)
+            - Stage progress (running, completed, pending counts)
+            - Per-stage status for the current run
+        """
+
+    def request_cancel(self) -> CancelResult:
+        """Request cancellation of current execution.
+
+        Sets cancel flag; running stages complete but no new ones start.
+        """
+```
+
+### AgentServer Refactoring
+
+After Engine integration, `AgentServer` becomes a thin JSON-RPC adapter:
+
+```python
+class AgentServer:
+    def __init__(self, engine: Engine, socket_path: Path) -> None:
+        self._engine = engine  # Was: WatchEngine
+
+    async def _handle_run(self, params: AgentRunParams) -> AgentRunStartResult:
+        return self._engine.try_start_run(
+            run_id=generate_run_id(),
+            stages=params.get("stages"),
+            force=params.get("force", False),
+        )
+
+    async def _handle_status(self, params: dict) -> AgentStatusResult:
+        return self._engine.get_execution_status(params.get("run_id"))
+
+    async def _handle_cancel(self) -> AgentCancelResult:
+        return self._engine.request_cancel()
+```
+
+The `stages()` method continues reading from registry directly (no Engine involvement needed).
+
+### Thread Safety
+
+Agent RPC runs in an asyncio event loop while Engine runs in the main thread. All Engine query methods must be thread-safe:
+
+- `try_start_run()`: Uses lock for atomic check-and-set
+- `get_execution_status()`: Reads from thread-safe state
+- `request_cancel()`: Sets `threading.Event`
+
+---
+
+## Run History
+
+**Decision: Keep current approach.** Run history continues to be written by the executor.
+
+### Rationale
+
+1. **Data locality**: Run history needs lock file data (input hashes, output hashes) that the Engine shouldn't access directly
+2. **Complexity**: A `HistorySink` would need to aggregate all `StageCompleted` events and correlate with lock files to build `RunManifest`
+3. **Working code**: Current approach is well-tested and doesn't need to change
+
+### What Stays the Same
+
+- `executor/core.py` calls `_write_run_history()` after execution completes
+- `RunManifest` and `StageRunRecord` written to StateDB
+- `RunCacheEntry` written for skip detection
+
+### Future Consideration
+
+Engine's `StageCompleted` events could enable **real-time streaming** to external systems (e.g., a monitoring dashboard), but this is separate from the authoritative run history record.
 
 ---
 
 ## Open Questions
 
-1. **Dry-run / explain mode**: Implemented as synchronous query on Engine state, not event stream. Need to define exact API.
+1. ~~**Dry-run / explain mode**: Implemented as synchronous query on Engine state, not event stream. Need to define exact API.~~ **Resolved:** See "Query API" section above.
 
-2. **Run history**: Currently written by executor. Should move to Engine or remain separate?
+2. ~~**Run history**: Currently written by executor. Should move to Engine or remain separate?~~ **Resolved:** Keep current approach. See "Run History" section above.
 
 3. **Metrics aggregation**: Currently aggregated from worker results. No change needed, but verify it still works through Engine.
 
-4. **Agent RPC protocol**: Current protocol works, but could be simplified now that Engine handles state. Consider for future iteration.
+4. ~~**Agent RPC protocol**: Current protocol works, but could be simplified now that Engine handles state.~~ **Resolved:** See "Agent RPC Integration" section above. Phase 4.3 covers implementation.

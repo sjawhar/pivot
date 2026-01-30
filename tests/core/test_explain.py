@@ -679,7 +679,7 @@ def test_get_pipeline_explanations_upstream_propagation(tmp_path: Path) -> None:
         register_test_stage(_helper_stage_a_v1, name="stage_a")
         register_test_stage(_helper_stage_b, name="stage_b")
 
-        executor.run(show_output=False)
+        executor.run()
 
         # Modify stage_a's code (re-register with different implementation)
         REGISTRY._stages.clear()

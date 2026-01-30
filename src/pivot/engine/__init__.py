@@ -2,6 +2,6 @@
 
 from __future__ import annotations
 
-from pivot.engine import graph, types
+from pivot.engine import engine, graph, sinks, types
 
-__all__ = ["graph", "types"]
+__all__ = ["engine", "graph", "sinks", "types"]

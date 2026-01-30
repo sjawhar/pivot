@@ -43,7 +43,7 @@ def test_run_dry_run_allow_missing_uses_pvt_hash(
         # Create and run
         pathlib.Path("input.txt").write_text("data")
         register_test_stage(_helper_process, name="process")
-        executor.run(show_output=False)
+        executor.run()
 
         # Track input
         input_hash = cache.hash_file(pathlib.Path("input.txt"))
@@ -70,7 +70,7 @@ def test_run_dry_run_explain_allow_missing_uses_pvt_hash(
         # Create and run
         pathlib.Path("input.txt").write_text("data")
         register_test_stage(_helper_process, name="process")
-        executor.run(show_output=False)
+        executor.run()
 
         # Track input
         input_hash = cache.hash_file(pathlib.Path("input.txt"))

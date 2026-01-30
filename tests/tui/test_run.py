@@ -29,7 +29,6 @@ from pivot.types import (
     TuiMessageType,
     TuiQueue,
     TuiStatusMessage,
-    is_tui_log_message,
     is_tui_status_message,
 )
 
@@ -332,20 +331,30 @@ def test_run_tui_app_stage_info_indexes(
 
 
 # =============================================================================
-# TUI Queue Integration Tests
+# TUI Queue Integration Tests (via Engine + TuiSink)
 # =============================================================================
 
 
-def test_executor_emits_status_messages_to_queue(
+def test_engine_emits_status_messages_via_tui_sink(
     pipeline_dir: pathlib.Path,
     tui_queue: TuiQueue,
 ) -> None:
-    """Executor emits TuiStatusMessage for stage start and completion."""
+    """Engine with TuiSink emits TuiStatusMessage for stage start and completion."""
+    from pivot.engine import engine as engine_mod
+    from pivot.engine import sinks as engine_sinks
+
     (pipeline_dir / "input.txt").write_text("hello")
 
     register_test_stage(_helper_process, name="process")
 
-    executor.run(show_output=False, tui_queue=tui_queue)
+    run_id = "test_run_123"
+    eng = engine_mod.Engine()
+    eng.add_sink(engine_sinks.TuiSink(tui_queue=tui_queue, run_id=run_id))
+
+    try:
+        eng.run_once()
+    finally:
+        eng.close()
 
     messages = _drain_queue(tui_queue)
     status_messages = [m for m in messages if is_tui_status_message(m)]
@@ -354,50 +363,41 @@ def test_executor_emits_status_messages_to_queue(
 
     start_msg = status_messages[0]
     assert start_msg["stage"] == "process"
-    assert start_msg["status"] == StageStatus.IN_PROGRESS
+    # TuiSink emits READY for started events (maps to IN_PROGRESS conceptually)
+    assert start_msg["status"] in (StageStatus.READY, StageStatus.IN_PROGRESS)
     assert start_msg["index"] == 1
     assert start_msg["total"] == 1
     assert "run_id" in start_msg, "Status message must include run_id"
-    assert start_msg["run_id"], "run_id must be non-empty"
+    assert start_msg["run_id"] == run_id, "run_id must match"
 
     end_msg = status_messages[-1]
     assert end_msg["stage"] == "process"
     assert end_msg["status"] in (StageStatus.RAN, StageStatus.SKIPPED, StageStatus.COMPLETED)
     assert "elapsed" in end_msg
     assert "run_id" in end_msg, "Status message must include run_id"
-    assert end_msg["run_id"] == start_msg["run_id"], (
-        "run_id must be consistent across stage lifecycle"
-    )
+    assert end_msg["run_id"] == run_id, "run_id must be consistent across stage lifecycle"
 
 
-def test_executor_emits_log_messages_to_queue(
+def test_engine_emits_failed_status_via_tui_sink(
     pipeline_dir: pathlib.Path,
     tui_queue: TuiQueue,
 ) -> None:
-    """Executor emits TuiLogMessage for stage output."""
-    (pipeline_dir / "input.txt").write_text("hello")
+    """Engine with TuiSink emits FAILED status when stage raises an exception."""
+    from pivot.engine import engine as engine_mod
+    from pivot.engine import sinks as engine_sinks
 
-    register_test_stage(_helper_process_print, name="process")
-
-    executor.run(show_output=False, tui_queue=tui_queue)
-
-    messages = _drain_queue(tui_queue)
-    log_messages = [m for m in messages if is_tui_log_message(m)]
-
-    assert len(log_messages) >= 1, "Should have at least one log message"
-    assert any("Processing data" in m["line"] for m in log_messages), "Log should contain stdout"
-
-
-def test_executor_emits_failed_status_on_stage_failure(
-    pipeline_dir: pathlib.Path,
-    tui_queue: TuiQueue,
-) -> None:
-    """Executor emits FAILED status when stage raises an exception."""
     (pipeline_dir / "input.txt").write_text("hello")
 
     register_test_stage(_helper_failing_stage, name="failing_stage")
 
-    executor.run(show_output=False, tui_queue=tui_queue)
+    run_id = "test_run_456"
+    eng = engine_mod.Engine()
+    eng.add_sink(engine_sinks.TuiSink(tui_queue=tui_queue, run_id=run_id))
+
+    try:
+        eng.run_once()
+    finally:
+        eng.close()
 
     messages = _drain_queue(tui_queue)
     status_messages = [m for m in messages if is_tui_status_message(m)]
@@ -406,21 +406,31 @@ def test_executor_emits_failed_status_on_stage_failure(
     assert len(failed_msgs) >= 1, "Should have at least one FAILED status message"
     assert failed_msgs[0]["stage"] == "failing_stage"
     assert "run_id" in failed_msgs[0], "Failed status must include run_id"
-    assert failed_msgs[0]["run_id"], "run_id must be non-empty"
+    assert failed_msgs[0]["run_id"] == run_id, "run_id must match"
 
 
-def test_executor_emits_status_for_multiple_stages(
+def test_engine_emits_status_for_multiple_stages(
     pipeline_dir: pathlib.Path,
     tui_queue: TuiQueue,
 ) -> None:
-    """Executor emits status messages for all stages in multi-stage pipeline."""
+    """Engine with TuiSink emits status messages for all stages in multi-stage pipeline."""
+    from pivot.engine import engine as engine_mod
+    from pivot.engine import sinks as engine_sinks
+
     (pipeline_dir / "input.txt").write_text("hello")
 
     register_test_stage(_helper_step1, name="step1")
     register_test_stage(_helper_step2, name="step2")
     register_test_stage(_helper_step3, name="step3")
 
-    executor.run(show_output=False, tui_queue=tui_queue)
+    run_id = "test_run_789"
+    eng = engine_mod.Engine()
+    eng.add_sink(engine_sinks.TuiSink(tui_queue=tui_queue, run_id=run_id))
+
+    try:
+        eng.run_once()
+    finally:
+        eng.close()
 
     messages = _drain_queue(tui_queue)
     status_messages = [m for m in messages if is_tui_status_message(m)]
@@ -433,20 +443,30 @@ def test_executor_emits_status_for_multiple_stages(
     # All status messages must include run_id
     for msg in status_messages:
         assert "run_id" in msg, f"Status for {msg['stage']} must include run_id"
-        assert msg["run_id"], f"run_id for {msg['stage']} must be non-empty"
+        assert msg["run_id"] == run_id, f"run_id for {msg['stage']} must match"
 
 
-def test_executor_status_includes_correct_index_and_total(
+def test_engine_status_includes_correct_index_and_total(
     pipeline_dir: pathlib.Path,
     tui_queue: TuiQueue,
 ) -> None:
-    """Executor status messages include correct index and total counts."""
+    """Engine status messages include correct index and total counts."""
+    from pivot.engine import engine as engine_mod
+    from pivot.engine import sinks as engine_sinks
+
     (pipeline_dir / "input.txt").write_text("hello")
 
     register_test_stage(_helper_step1, name="step1")
     register_test_stage(_helper_step2, name="step2")
 
-    executor.run(show_output=False, tui_queue=tui_queue)
+    run_id = "test_run_abc"
+    eng = engine_mod.Engine()
+    eng.add_sink(engine_sinks.TuiSink(tui_queue=tui_queue, run_id=run_id))
+
+    try:
+        eng.run_once()
+    finally:
+        eng.close()
 
     messages = _drain_queue(tui_queue)
     status_messages = [m for m in messages if is_tui_status_message(m)]

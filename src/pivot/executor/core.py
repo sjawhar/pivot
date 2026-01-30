@@ -22,7 +22,6 @@ from pivot import (
     config,
     dag,
     exceptions,
-    explain,
     metrics,
     outputs,
     parameters,
@@ -33,7 +32,6 @@ from pivot import (
 from pivot.executor import worker
 from pivot.storage import cache, lock, project_lock, track
 from pivot.storage import state as state_mod
-from pivot.tui import console
 from pivot.types import (
     DisplayCategory,
     OnError,
@@ -41,17 +39,9 @@ from pivot.types import (
     RunEventType,
     RunJsonEvent,
     StageCompleteEvent,
-    StageDisplayStatus,
-    StageExplanation,
     StageResult,
     StageStartEvent,
     StageStatus,
-    TuiLogMessage,
-    TuiMessageType,
-    TuiQueue,
-    TuiStatusMessage,
-    TuiWatchMessage,
-    WatchStatus,
     categorize_stage_result,
 )
 
@@ -206,55 +196,32 @@ class StageState:
 
 @final
 class StageLifecycle:
-    """Centralized handler for stage lifecycle events - guarantees notifications.
+    """Manages stage execution state and notifications.
 
     All stage state transitions should go through this class to ensure
-    TUI, console, and progress callback notifications are always sent.
+    progress callback notifications are always sent. Display is handled
+    by Engine sinks (ConsoleSink, TuiSink, JsonlSink).
     """
+
+    total_stages: int
+    progress_callback: Callable[[RunJsonEvent], None] | None
+    run_id: str
 
     def __init__(
         self,
-        tui_queue: TuiQueue | None,
-        con: console.Console | None,
-        progress_callback: Callable[[RunJsonEvent], None] | None,
         total_stages: int,
-        run_id: str,
-        explain_mode: bool = False,
+        progress_callback: Callable[[RunJsonEvent], None] | None = None,
+        run_id: str = "",
     ) -> None:
-        self.tui_queue = tui_queue
-        self.console = con
-        self.progress_callback = progress_callback
         self.total_stages = total_stages
+        self.progress_callback = progress_callback
         self.run_id = run_id
-        self.explain_mode = explain_mode
 
     def mark_started(self, state: StageState) -> None:
-        """Mark stage as in-progress and send all notifications."""
+        """Mark stage as started and send progress notification."""
         state.status = StageStatus.IN_PROGRESS
         state.start_time = time.perf_counter()
-
-        if self.console and not self.explain_mode:
-            # Use FINGERPRINTING since stage is being checked - not yet confirmed to run
-            self.console.stage_start(
-                name=state.name,
-                index=state.index,
-                total=self.total_stages,
-                status=StageDisplayStatus.FINGERPRINTING,
-            )
-
-        if self.tui_queue:
-            self.tui_queue.put(
-                TuiStatusMessage(
-                    type=TuiMessageType.STATUS,
-                    stage=state.name,
-                    index=state.index,
-                    total=self.total_stages,
-                    status=StageStatus.IN_PROGRESS,
-                    reason="",
-                    elapsed=None,
-                    run_id=self.run_id,
-                )
-            )
+        logger.debug(f"Stage started: {state.name}")  # noqa: G004
 
         if self.progress_callback:
             self.progress_callback(
@@ -295,35 +262,11 @@ class StageLifecycle:
         self._notify_complete(state, result)
 
     def _notify_complete(self, state: StageState, result: StageResult) -> None:
-        """Send completion notifications to all channels."""
+        """Send completion notification."""
         result_status = result["status"]
         result_reason = result["reason"]
         duration = state.get_duration()
-        logger.debug(f"TUI status: {state.name} -> {result_status}")  # noqa: G004
-
-        if self.console:
-            self.console.stage_result(
-                name=state.name,
-                index=state.index,
-                total=self.total_stages,
-                status=result_status,
-                reason=result_reason,
-                duration=duration,
-            )
-
-        if self.tui_queue:
-            self.tui_queue.put(
-                TuiStatusMessage(
-                    type=TuiMessageType.STATUS,
-                    stage=state.name,
-                    index=state.index,
-                    total=self.total_stages,
-                    status=result_status,
-                    reason=result_reason,
-                    elapsed=duration,
-                    run_id=self.run_id,
-                )
-            )
+        logger.debug(f"Stage completed: {state.name} -> {result_status}")  # noqa: G004
 
         if self.progress_callback:
             self.progress_callback(
@@ -345,13 +288,9 @@ def run(
     parallel: bool = True,
     max_workers: int | None = None,
     on_error: OnError | str = OnError.FAIL,
-    show_output: bool = True,
     allow_uncached_incremental: bool = False,
     force: bool = False,
     stage_timeout: float | None = None,
-    explain_mode: bool = False,
-    tui_queue: TuiQueue | None = None,
-    output_queue: mp.Queue[OutputMessage] | None = None,
     no_commit: bool = False,
     no_cache: bool = False,
     progress_callback: Callable[[RunJsonEvent], None] | None = None,
@@ -367,14 +306,9 @@ def run(
         parallel: If True, run independent stages in parallel (default: True).
         max_workers: Max concurrent stages (default: min(cpu_count, 8)).
         on_error: Error handling mode - "fail" or "keep_going".
-        show_output: If True, print progress and stage output to console.
         allow_uncached_incremental: If True, skip safety check for uncached IncrementalOut files.
         force: If True, bypass cache and force all stages to re-execute.
         stage_timeout: Max seconds for each stage to complete (default: no timeout).
-        explain_mode: If True, show detailed WHY for each stage before execution.
-        tui_queue: Queue for TUI messages (status updates and logs).
-        output_queue: Queue for worker output streaming. If None, created internally.
-            Pass this when running in TUI mode to avoid multiprocessing issues.
         no_commit: If True, defer lock files to pending dir (faster iteration).
         no_cache: If True, skip caching outputs entirely (maximum iteration speed).
         progress_callback: Callback for JSONL progress events (stage start/complete).
@@ -436,14 +370,11 @@ def run(
                 + "To proceed anyway, use allow_uncached_incremental=True or back up these files first."
             )
 
-    con = console.get_console() if show_output else None
     total_stages = len(execution_order)
 
     stage_states = _initialize_stage_states(execution_order, graph)
 
     max_workers = 1 if not parallel else _compute_max_workers(len(execution_order), max_workers)
-
-    start_time = time.perf_counter()
 
     # When no_commit=True, acquire lock to prevent commits during execution
     lock_context = project_lock.pending_state_lock() if no_commit else contextlib.nullcontext()
@@ -453,14 +384,10 @@ def run(
             cache_dir=cache_dir,
             max_workers=max_workers,
             error_mode=error_mode,
-            con=con,
             total_stages=total_stages,
             stage_timeout=stage_timeout,
             overrides=overrides,
-            explain_mode=explain_mode,
             checkout_modes=checkout_modes,
-            tui_queue=tui_queue,
-            output_queue=output_queue,
             run_id=run_id,
             force=force,
             no_commit=no_commit,
@@ -483,11 +410,6 @@ def run(
             ended_at=ended_at,
             retention=retention,
         )
-
-    if con:
-        ran, cached, blocked, failed = count_results(results)
-        total_duration = time.perf_counter() - start_time
-        con.summary(ran, cached, blocked, failed, total_duration)
 
     return results
 
@@ -626,14 +548,10 @@ def _execute_greedy(
     cache_dir: pathlib.Path,
     max_workers: int,
     error_mode: OnError,
-    con: console.Console | None,
     total_stages: int,
     stage_timeout: float | None = None,
     overrides: parameters.ParamsOverrides | None = None,
-    explain_mode: bool = False,
     checkout_modes: list[cache.CheckoutMode] | None = None,
-    tui_queue: TuiQueue | None = None,
-    output_queue: mp.Queue[OutputMessage] | None = None,
     run_id: str = "",
     force: bool = False,
     no_commit: bool = False,
@@ -649,29 +567,21 @@ def _execute_greedy(
 
     # Centralized lifecycle handler for state transitions + notifications
     lifecycle = StageLifecycle(
-        tui_queue=tui_queue,
-        con=con,
-        progress_callback=progress_callback,
         total_stages=total_stages,
+        progress_callback=progress_callback,
         run_id=run_id,
-        explain_mode=explain_mode,
     )
 
     _warn_single_stage_mutex_groups(stage_states)
 
     executor = _create_executor(max_workers)
-    # Create output queue if not provided (for TUI mode, pass pre-created queue to avoid mp issues)
-    # Track manager so we can shut it down - only created when no queue is passed in
-    local_manager = None
-    if output_queue is None:
-        # Use spawn context to avoid fork-in-multithreaded-context issues (Python 3.13+ deprecation)
-        spawn_ctx = mp.get_context("spawn")
-        local_manager = spawn_ctx.Manager()
-        # Manager().Queue() returns AutoProxy[Queue] which is incompatible with Queue type stubs
-        output_queue = local_manager.Queue()  # pyright: ignore[reportAssignmentType]
 
-    # Type narrowing: output_queue is guaranteed to be non-None after the block above
-    assert output_queue is not None
+    # Create output queue for worker stdout/stderr (workers require this)
+    # Use spawn context to avoid fork-in-multithreaded-context issues (Python 3.13+ deprecation)
+    spawn_ctx = mp.get_context("spawn")
+    local_manager = spawn_ctx.Manager()
+    # Manager().Queue() returns AutoProxy[Queue] which is incompatible with Queue type stubs
+    output_queue: mp.Queue[OutputMessage] = local_manager.Queue()  # pyright: ignore[reportAssignmentType]
 
     state_dir = config.get_state_dir()
     state_db_path = config.get_state_db_path()
@@ -679,14 +589,13 @@ def _execute_greedy(
     output_thread: threading.Thread | None = None
 
     try:
-        # Start output thread inside try block to ensure Manager cleanup on failure
-        if con or tui_queue:
-            output_thread = threading.Thread(
-                target=_output_queue_reader,
-                args=(output_queue, con, tui_queue),
-                daemon=True,
-            )
-            output_thread.start()
+        # Start output drain thread to prevent queue from filling up
+        output_thread = threading.Thread(
+            target=_drain_output_queue,
+            args=(output_queue,),
+            daemon=True,
+        )
+        output_thread.start()
         with executor, state_mod.StateDB(state_db_path) as state_db:
             _start_ready_stages(
                 stage_states=stage_states,
@@ -863,49 +772,27 @@ def _execute_greedy(
             output_queue.put(None)
         if output_thread:
             output_thread.join(timeout=1.0)
-        # Clean up manager if we created one (prevents orphaned subprocess)
-        if local_manager is not None:
-            local_manager.shutdown()
+        # Clean up manager (prevents orphaned subprocess)
+        local_manager.shutdown()
 
 
-def _output_queue_reader(
-    output_q: mp.Queue[OutputMessage],
-    con: console.Console | None,
-    tui_queue: TuiQueue | None = None,
-) -> None:
-    """Read output messages from worker processes and display/forward them."""
+def _drain_output_queue(output_q: mp.Queue[OutputMessage]) -> None:
+    """Drain output messages from worker processes.
+
+    This prevents the queue from filling up and blocking workers.
+    Output is discarded since display is handled by Engine sinks.
+    """
     while True:
         try:
             msg = output_q.get(timeout=0.02)
             if msg is None:
                 break
-            stage_name, line, is_stderr = msg
-            if con:
-                con.stage_output(stage_name, line, is_stderr)
-            if tui_queue:
-                tui_queue.put(
-                    TuiLogMessage(
-                        type=TuiMessageType.LOG,
-                        stage=stage_name,
-                        line=line,
-                        is_stderr=is_stderr,
-                        timestamp=time.time(),
-                    )
-                )
+            # Discard the message - display is handled by Engine sinks
         except queue.Empty:
             continue
         except (EOFError, OSError, BrokenPipeError):
             # Queue was closed or broken - exit gracefully
-            logger.debug("Output queue reader exiting: queue closed or broken")
-            # Notify TUI that log streaming was interrupted (tui_queue is reliable since it's stdlib queue.Queue)
-            if tui_queue:
-                tui_queue.put_nowait(
-                    TuiWatchMessage(
-                        type=TuiMessageType.WATCH,
-                        status=WatchStatus.ERROR,
-                        message="Log streaming interrupted - logs may be incomplete",
-                    )
-                )
+            logger.debug("Output queue drain exiting: queue closed or broken")
             break
 
 
@@ -958,11 +845,6 @@ def _start_ready_stages(
             continue  # Exclusive stage must wait for all others to finish
         if not is_exclusive and mutex_counts[EXCLUSIVE_MUTEX] > 0:
             continue  # Non-exclusive stage can't start while exclusive is running
-
-        # Show explanation before starting if in explain mode
-        if lifecycle.explain_mode and lifecycle.console:
-            explanation = _get_stage_explanation(state.info, state_dir, overrides)
-            lifecycle.console.explain_stage(explanation)
 
         # Acquire mutex locks before changing status
         for mutex in state.mutex:
@@ -1128,23 +1010,6 @@ def _build_results(stage_states: dict[str, StageState]) -> dict[str, ExecutionSu
         else:
             results[name] = ExecutionSummary(status=StageStatus.UNKNOWN, reason="never executed")
     return results
-
-
-def _get_stage_explanation(
-    stage_info: registry.RegistryStageInfo,
-    state_dir: pathlib.Path,
-    overrides: parameters.ParamsOverrides,
-) -> StageExplanation:
-    """Compute explanation for a single stage."""
-    return explain.get_stage_explanation(
-        stage_info["name"],
-        stage_info["fingerprint"],
-        stage_info["deps_paths"],
-        stage_info["outs_paths"],
-        stage_info["params"],
-        overrides,
-        state_dir,
-    )
 
 
 def _check_uncached_incremental_outputs(

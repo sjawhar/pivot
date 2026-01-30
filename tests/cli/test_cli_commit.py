@@ -55,7 +55,7 @@ def test_commit_list_shows_pending(runner: click.testing.CliRunner, tmp_path: pa
         register_test_stage(_helper_process, name="process")
 
         # Run with --no-commit
-        executor.run(show_output=False, no_commit=True)
+        executor.run(no_commit=True)
 
         result = runner.invoke(cli.cli, ["commit", "--list"])
 
@@ -93,7 +93,7 @@ def test_commit_promotes_pending_to_production(
         register_test_stage(_helper_process, name="process")
 
         # Run with --no-commit
-        executor.run(show_output=False, no_commit=True)
+        executor.run(no_commit=True)
 
         # Verify pending lock exists
         project_root = pathlib.Path.cwd()
@@ -139,7 +139,7 @@ def test_commit_discard_removes_pending(
         register_test_stage(_helper_process, name="process")
 
         # Run with --no-commit
-        executor.run(show_output=False, no_commit=True)
+        executor.run(no_commit=True)
 
         # Verify pending lock exists
         project_root = pathlib.Path.cwd()
@@ -197,7 +197,7 @@ def test_run_no_commit_second_run_skips(
         register_test_stage(_helper_process, name="process")
 
         # First run via executor to set up pending lock
-        executor.run(show_output=False, no_commit=True)
+        executor.run(no_commit=True)
 
         # Second run via CLI should use cache
         result = runner.invoke(cli.cli, ["run", "--no-commit"])
@@ -216,7 +216,7 @@ def test_run_no_commit_then_commit_workflow(
         register_test_stage(_helper_process, name="process")
 
         # Run with --no-commit via executor
-        executor.run(show_output=False, no_commit=True)
+        executor.run(no_commit=True)
 
         # Commit via CLI
         result1 = runner.invoke(cli.cli, ["commit"])

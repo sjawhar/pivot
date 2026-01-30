@@ -120,7 +120,7 @@ def test_verify_all_cached_exits_0(runner: click.testing.CliRunner, tmp_path: pa
         register_test_stage(_helper_process, name="process")
 
         # Run to cache
-        executor.run(show_output=False)
+        executor.run()
 
         result = runner.invoke(cli.cli, ["verify"])
 
@@ -137,7 +137,7 @@ def test_verify_stale_code_exits_1(runner: click.testing.CliRunner, tmp_path: pa
         register_test_stage(_helper_process, name="process")
 
         # Run to cache
-        executor.run(show_output=False)
+        executor.run()
 
         # Modify the lock file to simulate code change
         state_dir = pathlib.Path(".pivot")
@@ -164,7 +164,7 @@ def test_verify_stale_params_exits_1(
         register_test_stage(_helper_process, name="process")
 
         # Run to cache
-        executor.run(show_output=False)
+        executor.run()
 
         # Modify the lock file to simulate params change
         state_dir = pathlib.Path(".pivot")
@@ -189,7 +189,7 @@ def test_verify_stale_deps_exits_1(runner: click.testing.CliRunner, tmp_path: pa
         register_test_stage(_helper_process, name="process")
 
         # Run to cache
-        executor.run(show_output=False)
+        executor.run()
 
         # Modify input file to change deps
         pathlib.Path("input.txt").write_text("modified data")
@@ -211,7 +211,7 @@ def test_verify_missing_dep_file_exits_1(
         register_test_stage(_helper_process, name="process")
 
         # Run to cache
-        executor.run(show_output=False)
+        executor.run()
 
         # Delete the dependency file
         pathlib.Path("input.txt").unlink()
@@ -252,7 +252,7 @@ def test_verify_specific_stage(runner: click.testing.CliRunner, tmp_path: pathli
         register_test_stage(_helper_stage_b, name="stage_b")
 
         # Run to cache both
-        executor.run(show_output=False)
+        executor.run()
 
         # Verify only stage_a
         result = runner.invoke(cli.cli, ["verify", "stage_a"])
@@ -271,7 +271,7 @@ def test_verify_multiple_stages(runner: click.testing.CliRunner, tmp_path: pathl
         register_test_stage(_helper_stage_b, name="stage_b")
 
         # Run to cache both
-        executor.run(show_output=False)
+        executor.run()
 
         # Verify both
         result = runner.invoke(cli.cli, ["verify", "stage_a", "stage_b"])
@@ -313,7 +313,7 @@ def test_verify_allow_missing_no_remote_errors(
         register_test_stage(_helper_process, name="process")
 
         # Run to cache
-        executor.run(show_output=False)
+        executor.run()
 
         result = runner.invoke(cli.cli, ["verify", "--allow-missing"])
 
@@ -332,7 +332,7 @@ def test_verify_allow_missing_file_on_remote_passes(
         register_test_stage(_helper_process, name="process")
 
         # Run to cache
-        executor.run(show_output=False)
+        executor.run()
 
         # Get the output hash before deleting
         state_dir = pathlib.Path(".pivot")
@@ -367,7 +367,7 @@ def test_verify_allow_missing_file_not_on_remote_fails(
         register_test_stage(_helper_process, name="process")
 
         # Run to cache
-        executor.run(show_output=False)
+        executor.run()
 
         # Delete output file and its cache entry
         pathlib.Path("output.txt").unlink()
@@ -401,7 +401,7 @@ def test_verify_allow_missing_code_changed_still_fails(
         register_test_stage(_helper_process, name="process")
 
         # Run to cache
-        executor.run(show_output=False)
+        executor.run()
 
         # Modify the lock file to simulate code change
         state_dir = pathlib.Path(".pivot")
@@ -459,7 +459,7 @@ def test_verify_json_output_passed(runner: click.testing.CliRunner, tmp_path: pa
         register_test_stage(_helper_process, name="process")
 
         # Run to cache
-        executor.run(show_output=False)
+        executor.run()
 
         result = runner.invoke(cli.cli, ["verify", "--json"])
 
@@ -504,7 +504,7 @@ def test_verify_json_includes_all_keys(
         register_test_stage(_helper_process, name="process")
 
         # Run to cache
-        executor.run(show_output=False)
+        executor.run()
 
         # Modify deps to make stale
         pathlib.Path("input.txt").write_text("modified")
@@ -538,7 +538,7 @@ def test_verify_quiet_no_output_when_passed(
         register_test_stage(_helper_process, name="process")
 
         # Run to cache
-        executor.run(show_output=False)
+        executor.run()
 
         result = runner.invoke(cli.cli, ["--quiet", "verify"])
 
@@ -578,7 +578,7 @@ def test_verify_allow_missing_uses_pvt_hash_for_deps(
         # Create input.txt and run stage to cache
         pathlib.Path("input.txt").write_text("data")
         register_test_stage(_helper_process, name="process")
-        executor.run(show_output=False)
+        executor.run()
 
         # Track the input file (create .pvt)
         from pivot.storage import track
@@ -612,7 +612,7 @@ def test_verify_allow_missing_uses_pvt_hash_for_nested_dep(
         (data_dir / "file.csv").write_text("content")
 
         register_test_stage(_helper_dir_dep_stage, name="process")
-        executor.run(show_output=False)
+        executor.run()
 
         # Track the directory (create .pvt with manifest)
         from pivot.storage import track

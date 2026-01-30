@@ -1,4 +1,3 @@
-import queue
 import time
 from typing import cast
 
@@ -8,10 +7,8 @@ from pivot.types import (
     RunJsonEvent,
     StageCompleteEvent,
     StageResult,
+    StageStartEvent,
     StageStatus,
-    TuiMessageType,
-    TuiQueue,
-    TuiStatusMessage,
 )
 
 # =============================================================================
@@ -50,9 +47,6 @@ def _make_stage_state(name: str, index: int = 1) -> executor_core.StageState:
 def test_lifecycle_mark_started_updates_state() -> None:
     """mark_started sets status and start_time on the state."""
     lifecycle = executor_core.StageLifecycle(
-        tui_queue=None,
-        con=None,
-        progress_callback=None,
         total_stages=3,
         run_id="test_run_123",
     )
@@ -68,9 +62,6 @@ def test_lifecycle_mark_started_updates_state() -> None:
 def test_lifecycle_mark_completed_updates_state() -> None:
     """mark_completed sets result, status, and end_time on the state."""
     lifecycle = executor_core.StageLifecycle(
-        tui_queue=None,
-        con=None,
-        progress_callback=None,
         total_stages=3,
         run_id="test_run_123",
     )
@@ -88,9 +79,6 @@ def test_lifecycle_mark_completed_updates_state() -> None:
 def test_lifecycle_mark_failed_updates_state() -> None:
     """mark_failed creates a FAILED result and updates state."""
     lifecycle = executor_core.StageLifecycle(
-        tui_queue=None,
-        con=None,
-        progress_callback=None,
         total_stages=3,
         run_id="test_run_123",
     )
@@ -109,9 +97,6 @@ def test_lifecycle_mark_failed_updates_state() -> None:
 def test_lifecycle_mark_skipped_upstream_updates_state() -> None:
     """mark_skipped_upstream marks stage as SKIPPED with upstream failure reason."""
     lifecycle = executor_core.StageLifecycle(
-        tui_queue=None,
-        con=None,
-        progress_callback=None,
         total_stages=3,
         run_id="test_run_123",
     )
@@ -127,92 +112,91 @@ def test_lifecycle_mark_skipped_upstream_updates_state() -> None:
     assert state.end_time is None
 
 
-def test_lifecycle_mark_started_sends_tui_message() -> None:
-    """mark_started sends TUI status message when queue is provided."""
-    # TUI queue uses stdlib queue.Queue (inter-thread, not cross-process)
-    tui_queue: TuiQueue = queue.Queue()
-
-    lifecycle = executor_core.StageLifecycle(
-        tui_queue=tui_queue,
-        con=None,
-        progress_callback=None,
-        total_stages=3,
-        run_id="test_run_123",
-    )
-    state = _make_stage_state("stage1", index=1)
-
-    lifecycle.mark_started(state)
-
-    # Check TUI message was sent - cast to TuiStatusMessage for type safety
-    msg = cast("TuiStatusMessage", tui_queue.get(timeout=1.0))
-    assert msg["type"] == TuiMessageType.STATUS
-    assert msg["stage"] == "stage1"
-    assert msg["status"] == StageStatus.IN_PROGRESS
-    assert msg["run_id"] == "test_run_123"
-
-
-def test_lifecycle_mark_skipped_upstream_sends_tui_message() -> None:
-    """mark_skipped_upstream sends TUI status message (critical for history bug fix)."""
-    tui_queue: TuiQueue = queue.Queue()
-
-    lifecycle = executor_core.StageLifecycle(
-        tui_queue=tui_queue,
-        con=None,
-        progress_callback=None,
-        total_stages=3,
-        run_id="test_run_123",
-    )
-    state = _make_stage_state("downstream_stage", index=2)
-
-    lifecycle.mark_skipped_upstream(state, "upstream_stage")
-
-    # Check TUI message was sent - cast to TuiStatusMessage for type safety
-    msg = cast("TuiStatusMessage", tui_queue.get(timeout=1.0))
-    assert msg["type"] == TuiMessageType.STATUS
-    assert msg["stage"] == "downstream_stage"
-    assert msg["status"] == StageStatus.SKIPPED
-    assert "upstream 'upstream_stage' failed" in msg["reason"]
-    assert msg["run_id"] == "test_run_123"
-
-
-def test_lifecycle_mark_completed_sends_tui_message() -> None:
-    """mark_completed sends TUI status message."""
-    tui_queue: TuiQueue = queue.Queue()
-
-    lifecycle = executor_core.StageLifecycle(
-        tui_queue=tui_queue,
-        con=None,
-        progress_callback=None,
-        total_stages=3,
-        run_id="test_run_123",
-    )
-    state = _make_stage_state("stage1", index=1)
-    state.start_time = time.perf_counter() - 1.0
-
-    result = StageResult(status=StageStatus.RAN, reason="success", output_lines=[])
-    lifecycle.mark_completed(state, result)
-
-    msg = cast("TuiStatusMessage", tui_queue.get(timeout=1.0))
-    assert msg["type"] == TuiMessageType.STATUS
-    assert msg["stage"] == "stage1"
-    assert msg["status"] == StageStatus.RAN
-    assert msg["reason"] == "success"
-    assert msg["run_id"] == "test_run_123"
-    assert msg["elapsed"] is not None
-
-
-def test_lifecycle_calls_progress_callback() -> None:
-    """mark_started and mark_completed call progress_callback when provided."""
+def test_lifecycle_mark_started_calls_progress_callback() -> None:
+    """mark_started calls progress_callback when provided."""
     events = list[RunJsonEvent]()
 
     def callback(event: RunJsonEvent) -> None:
         events.append(event)
 
     lifecycle = executor_core.StageLifecycle(
-        tui_queue=None,
-        con=None,
-        progress_callback=callback,
         total_stages=3,
+        progress_callback=callback,
+        run_id="test_run_123",
+    )
+    state = _make_stage_state("stage1", index=1)
+
+    lifecycle.mark_started(state)
+
+    assert len(events) == 1
+    event = cast("StageStartEvent", events[0])
+    assert event["type"] == "stage_start"
+    assert event["stage"] == "stage1"
+    assert event["index"] == 1
+    assert event["total"] == 3
+
+
+def test_lifecycle_mark_completed_calls_progress_callback() -> None:
+    """mark_completed calls progress_callback when provided."""
+    events = list[RunJsonEvent]()
+
+    def callback(event: RunJsonEvent) -> None:
+        events.append(event)
+
+    lifecycle = executor_core.StageLifecycle(
+        total_stages=3,
+        progress_callback=callback,
+        run_id="test_run_123",
+    )
+    state = _make_stage_state("stage1", index=1)
+    state.start_time = time.perf_counter() - 1.0
+
+    result = StageResult(status=StageStatus.RAN, reason="done", output_lines=[])
+    lifecycle.mark_completed(state, result)
+
+    assert len(events) == 1
+    event = cast("StageCompleteEvent", events[0])
+    assert event["type"] == "stage_complete"
+    assert event["stage"] == "stage1"
+    assert event["status"] == StageStatus.RAN
+    assert event["reason"] == "done"
+    assert event["duration_ms"] > 0
+
+
+def test_lifecycle_mark_skipped_upstream_calls_progress_callback() -> None:
+    """mark_skipped_upstream calls progress_callback when provided."""
+    events = list[RunJsonEvent]()
+
+    def callback(event: RunJsonEvent) -> None:
+        events.append(event)
+
+    lifecycle = executor_core.StageLifecycle(
+        total_stages=3,
+        progress_callback=callback,
+        run_id="test_run_123",
+    )
+    state = _make_stage_state("stage2", index=2)
+
+    lifecycle.mark_skipped_upstream(state, "stage1")
+
+    assert len(events) == 1
+    event = cast("StageCompleteEvent", events[0])
+    assert event["type"] == "stage_complete"
+    assert event["stage"] == "stage2"
+    assert event["status"] == StageStatus.SKIPPED
+    assert "upstream 'stage1' failed" in event["reason"]
+
+
+def test_lifecycle_calls_progress_callback_for_full_flow() -> None:
+    """mark_started and mark_completed call progress_callback for full stage lifecycle."""
+    events = list[RunJsonEvent]()
+
+    def callback(event: RunJsonEvent) -> None:
+        events.append(event)
+
+    lifecycle = executor_core.StageLifecycle(
+        total_stages=3,
+        progress_callback=callback,
         run_id="test_run_123",
     )
     state = _make_stage_state("stage1", index=1)
@@ -229,7 +213,6 @@ def test_lifecycle_calls_progress_callback() -> None:
     assert len(events) == 2
     assert events[1]["type"] == "stage_complete"
     assert events[1]["stage"] == "stage1"
-    # Cast to StageCompleteEvent to access status field (type narrowing on discriminant not automatic)
     complete_event = cast("StageCompleteEvent", events[1])
     assert complete_event["status"] == StageStatus.RAN
 
@@ -239,15 +222,16 @@ def test_lifecycle_calls_progress_callback() -> None:
 # =============================================================================
 
 
-def test_handle_stage_failure_marks_downstream_with_notifications() -> None:
-    """_handle_stage_failure marks downstream stages as SKIPPED with TUI notifications."""
-    tui_queue: TuiQueue = queue.Queue()
+def test_handle_stage_failure_marks_downstream_with_progress_callback() -> None:
+    """_handle_stage_failure marks downstream stages as SKIPPED and calls progress_callback."""
+    events = list[RunJsonEvent]()
+
+    def callback(event: RunJsonEvent) -> None:
+        events.append(event)
 
     lifecycle = executor_core.StageLifecycle(
-        tui_queue=tui_queue,
-        con=None,
-        progress_callback=None,
         total_stages=3,
+        progress_callback=callback,
         run_id="test_run_123",
     )
 
@@ -277,24 +261,19 @@ def test_handle_stage_failure_marks_downstream_with_notifications() -> None:
     assert stage_c.result is not None
     assert "upstream 'stage_a' failed" in stage_c.result["reason"]
 
-    # Check that TUI messages were sent for skipped stages
-    messages = list[TuiStatusMessage]()
-    while not tui_queue.empty():
-        msg = tui_queue.get_nowait()
-        messages.append(cast("TuiStatusMessage", msg))
+    # Check that progress_callback was called for skipped stages
+    assert len(events) == 2, "Should have sent 2 progress events (for B and C)"
 
-    assert len(messages) == 2, "Should have sent 2 TUI messages (for B and C)"
-
-    skipped_stages = {m["stage"] for m in messages}
+    skipped_stages = {cast("StageCompleteEvent", e)["stage"] for e in events}
     assert skipped_stages == {"stage_b", "stage_c"}
 
-    for msg in messages:
-        assert msg["status"] == StageStatus.SKIPPED
-        assert msg["run_id"] == "test_run_123"
+    for event in events:
+        complete_event = cast("StageCompleteEvent", event)
+        assert complete_event["status"] == StageStatus.SKIPPED
 
 
 def test_handle_stage_failure_without_lifecycle_still_works() -> None:
-    """_handle_stage_failure works without lifecycle (no TUI notifications)."""
+    """_handle_stage_failure works without lifecycle (no notifications)."""
     stage_a = _make_stage_state("stage_a", index=1)
     stage_b = _make_stage_state("stage_b", index=2)
     stage_a.downstream = ["stage_b"]
@@ -308,31 +287,3 @@ def test_handle_stage_failure_without_lifecycle_still_works() -> None:
     assert stage_b.status == StageStatus.SKIPPED
     assert stage_b.result is not None
     assert "upstream 'stage_a' failed" in stage_b.result["reason"]
-
-
-def test_lifecycle_mark_skipped_upstream_console_shows_correct_index() -> None:
-    """mark_skipped_upstream shows the stage's correct index in console output, not 0."""
-    import io
-
-    from pivot.tui import console
-
-    # Capture console output
-    output = io.StringIO()
-    con = console.Console(stream=output, color=False)
-
-    lifecycle = executor_core.StageLifecycle(
-        tui_queue=None,
-        con=con,
-        progress_callback=None,
-        total_stages=10,
-        run_id="test_run",
-    )
-    state = _make_stage_state("downstream_stage", index=5)
-
-    lifecycle.mark_skipped_upstream(state, "upstream_stage")
-
-    console_output = output.getvalue()
-    # The bug: console shows [0/10] instead of [5/10]
-    # Fixed: console should show the stage's actual index
-    assert "[5/10]" in console_output, f"Expected [5/10] in output, got: {console_output}"
-    assert "[0/10]" not in console_output, f"Bug: [0/10] found in output: {console_output}"

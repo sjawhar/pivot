@@ -195,7 +195,7 @@ def test_cli_dry_run_shows_unchanged_as_skip(runner: CliRunner, tmp_path: pathli
         register_test_stage(_stage_process_creates_file, name="process")
 
         # First, actually run to create lock file
-        executor.run(show_output=False)
+        executor.run()
 
         # Now dry-run should show as unchanged
         result = runner.invoke(cli.cli, ["run", "--dry-run"])
@@ -214,7 +214,7 @@ def test_cli_force_dry_run_shows_forced(runner: CliRunner, tmp_path: pathlib.Pat
         register_test_stage(_stage_process_creates_file, name="process")
 
         # First, actually run to create lock file
-        executor.run(show_output=False)
+        executor.run()
 
         # Now dry-run with --force should show as 'would run (forced)'
         result = runner.invoke(cli.cli, ["run", "--dry-run", "--force"])
@@ -306,7 +306,7 @@ def test_cli_dry_run_json_with_force(runner: CliRunner, tmp_path: pathlib.Path) 
         register_test_stage(_stage_process_creates_file, name="process")
 
         # First, actually run to create lock file
-        executor.run(show_output=False)
+        executor.run()
 
         # Now dry-run with --force --json
         result = runner.invoke(cli.cli, ["run", "--dry-run", "--force", "--json"])

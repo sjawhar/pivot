@@ -157,7 +157,7 @@ def test_explain_shows_code_changes(runner: CliRunner, tmp_path: pathlib.Path) -
 
         register_test_stage(_helper_process_v1, name="process")
 
-        executor.run(show_output=False)
+        executor.run()
 
         # Re-register with different implementation (simulates code change)
         REGISTRY._stages.clear()
@@ -179,7 +179,7 @@ def test_explain_shows_param_changes(runner: CliRunner, tmp_path: pathlib.Path) 
 
         register_test_stage(_helper_train, name="train", params=TrainParams)
 
-        executor.run(show_output=False)
+        executor.run()
 
         # Change params via params.yaml
         pathlib.Path("params.yaml").write_text("train:\n  learning_rate: 0.001\n")
@@ -199,7 +199,7 @@ def test_explain_shows_dep_changes(runner: CliRunner, tmp_path: pathlib.Path) ->
 
         register_test_stage(_helper_process_writer, name="process")
 
-        executor.run(show_output=False)
+        executor.run()
 
         # Modify the input file
         pathlib.Path("input.txt").write_text("modified data")
@@ -219,7 +219,7 @@ def test_explain_shows_unchanged(runner: CliRunner, tmp_path: pathlib.Path) -> N
 
         register_test_stage(_helper_process_writer, name="process")
 
-        executor.run(show_output=False)
+        executor.run()
 
         result = runner.invoke(cli.cli, ["run", "--explain"])
 

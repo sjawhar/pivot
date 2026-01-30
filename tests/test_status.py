@@ -67,7 +67,7 @@ def test_pipeline_status_all_cached(
     register_test_stage(_helper_stage_a, name="stage_a")
 
     monkeypatch.chdir(set_project_root)
-    executor.run(show_output=False)
+    executor.run()
     results, _ = status.get_pipeline_status(None, single_stage=False)
 
     assert len(results) == 1
