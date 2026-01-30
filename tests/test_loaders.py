@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import pathlib
 import pickle
 import typing
@@ -171,6 +172,67 @@ def test_yaml_loader_save(tmp_path: pathlib.Path) -> None:
     assert yaml_file.exists()
     content = yaml_file.read_text()
     assert "setting:" in content
+
+
+# ==============================================================================
+# Text loader tests
+# ==============================================================================
+
+
+def test_text_loader_load(tmp_path: pathlib.Path) -> None:
+    """Text loader reads string from file."""
+    txt_file = tmp_path / "data.txt"
+    txt_file.write_text("hello world\nline two")
+
+    loader = loaders.Text()
+    data = loader.load(txt_file)
+
+    assert data == "hello world\nline two"
+
+
+def test_text_loader_save(tmp_path: pathlib.Path) -> None:
+    """Text loader writes string to file."""
+    txt_file = tmp_path / "output.txt"
+    data = "some text content"
+
+    loader = loaders.Text()
+    loader.save(data, txt_file)
+
+    assert txt_file.exists()
+    assert txt_file.read_text() == "some text content"
+
+
+def test_text_loader_save_creates_parent_dirs(tmp_path: pathlib.Path) -> None:
+    """Text loader creates parent directories if needed."""
+    txt_file = tmp_path / "nested" / "dir" / "output.txt"
+
+    loader = loaders.Text()
+    loader.save("content", txt_file)
+
+    assert txt_file.exists()
+    assert txt_file.read_text() == "content"
+
+
+def test_text_loader_save_type_error() -> None:
+    """Text loader raises TypeError for non-string data."""
+    loader = loaders.Text()
+    with pytest.raises(TypeError, match="Text save expects str"):
+        loader.save(123, pathlib.Path("test.txt"))  # pyright: ignore[reportArgumentType]
+
+
+def test_text_loader_empty() -> None:
+    """Text loader returns empty string for empty()."""
+    loader = loaders.Text()
+    assert loader.empty() == ""
+
+
+def test_text_loader_is_picklable() -> None:
+    """Text loader can be pickled and unpickled."""
+    loader = loaders.Text()
+    pickled = pickle.dumps(loader)
+    restored = pickle.loads(pickled)
+
+    assert isinstance(restored, loaders.Text)
 
 
 # ==============================================================================
@@ -563,3 +625,166 @@ def test_matplotlib_figure_loader_with_out(tmp_path: pathlib.Path) -> None:
 
     assert plot_file.exists()
     assert fig.number not in plt.get_fignums()  # pyright: ignore[reportAttributeAccessIssue]
+
+
+# ==============================================================================
+# JSONL loader tests
+# ==============================================================================
+
+
+def test_jsonl_loader_load(tmp_path: pathlib.Path) -> None:
+    """JSONL loader reads list of dicts from file."""
+    jsonl_file = tmp_path / "data.jsonl"
+    jsonl_file.write_text('{"a": 1}\n{"b": 2}\n')
+
+    loader = loaders.JSONL()
+    data = loader.load(jsonl_file)
+
+    assert data == [{"a": 1}, {"b": 2}]
+
+
+def test_jsonl_loader_load_skips_blank_lines(tmp_path: pathlib.Path) -> None:
+    """JSONL loader skips blank lines."""
+    jsonl_file = tmp_path / "data.jsonl"
+    jsonl_file.write_text('{"a": 1}\n\n{"b": 2}\n   \n')
+
+    loader = loaders.JSONL()
+    data = loader.load(jsonl_file)
+
+    assert data == [{"a": 1}, {"b": 2}]
+
+
+def test_jsonl_loader_load_invalid_json(tmp_path: pathlib.Path) -> None:
+    """JSONL loader reports line number on invalid JSON."""
+    jsonl_file = tmp_path / "data.jsonl"
+    jsonl_file.write_text('{"a": 1}\n{invalid}\n')
+
+    loader = loaders.JSONL()
+    with pytest.raises(ValueError, match=r"Invalid JSON at .+:2"):
+        loader.load(jsonl_file)
+
+
+def test_jsonl_loader_save(tmp_path: pathlib.Path) -> None:
+    """JSONL loader writes list of dicts to file."""
+    jsonl_file = tmp_path / "output.jsonl"
+    data = [{"x": 1}, {"y": 2}]
+
+    loader = loaders.JSONL()
+    loader.save(data, jsonl_file)
+
+    assert jsonl_file.exists()
+    lines = jsonl_file.read_text().strip().split("\n")
+    assert len(lines) == 2
+    assert json.loads(lines[0]) == {"x": 1}
+    assert json.loads(lines[1]) == {"y": 2}
+
+
+def test_jsonl_loader_save_creates_parent_dirs(tmp_path: pathlib.Path) -> None:
+    """JSONL loader creates parent directories if needed."""
+    jsonl_file = tmp_path / "nested" / "output.jsonl"
+
+    loader = loaders.JSONL()
+    loader.save([{"a": 1}], jsonl_file)
+
+    assert jsonl_file.exists()
+
+
+def test_jsonl_loader_save_type_error() -> None:
+    """JSONL loader raises TypeError for non-list data."""
+    loader = loaders.JSONL()
+    with pytest.raises(TypeError, match="JSONL save expects list"):
+        loader.save({"a": 1}, pathlib.Path("test.jsonl"))  # pyright: ignore[reportArgumentType]
+
+
+def test_jsonl_loader_empty() -> None:
+    """JSONL loader returns empty list for empty()."""
+    loader = loaders.JSONL()
+    assert loader.empty() == []
+
+
+def test_jsonl_loader_is_picklable() -> None:
+    """JSONL loader can be pickled and unpickled."""
+    loader = loaders.JSONL()
+    pickled = pickle.dumps(loader)
+    restored = pickle.loads(pickled)
+
+    assert isinstance(restored, loaders.JSONL)
+
+
+# ==============================================================================
+# DataFrameJSONL loader tests
+# ==============================================================================
+
+
+def test_dataframe_jsonl_loader_load(tmp_path: pathlib.Path) -> None:
+    """DataFrameJSONL loader reads DataFrame from file."""
+    jsonl_file = tmp_path / "data.jsonl"
+    jsonl_file.write_text('{"a": 1, "b": 2}\n{"a": 3, "b": 4}\n')
+
+    loader = loaders.DataFrameJSONL()
+    df = loader.load(jsonl_file)
+
+    assert isinstance(df, pandas.DataFrame)
+    assert list(df.columns) == ["a", "b"]
+    assert len(df) == 2
+    assert df["a"].tolist() == [1, 3]
+
+
+def test_dataframe_jsonl_loader_save(tmp_path: pathlib.Path) -> None:
+    """DataFrameJSONL loader writes DataFrame to file."""
+    jsonl_file = tmp_path / "output.jsonl"
+    df = pandas.DataFrame({"x": [1, 2], "y": [3, 4]})
+
+    loader = loaders.DataFrameJSONL()
+    loader.save(df, jsonl_file)
+
+    assert jsonl_file.exists()
+    lines = jsonl_file.read_text().strip().split("\n")
+    assert len(lines) == 2
+
+
+def test_dataframe_jsonl_loader_roundtrip(tmp_path: pathlib.Path) -> None:
+    """DataFrameJSONL loader roundtrips data correctly."""
+    jsonl_file = tmp_path / "data.jsonl"
+    df = pandas.DataFrame({"col1": [1, 2, 3], "col2": ["a", "b", "c"]})
+
+    loader = loaders.DataFrameJSONL()
+    loader.save(df, jsonl_file)
+    loaded = loader.load(jsonl_file)
+
+    pandas.testing.assert_frame_equal(df, loaded)
+
+
+def test_dataframe_jsonl_loader_save_creates_parent_dirs(tmp_path: pathlib.Path) -> None:
+    """DataFrameJSONL loader creates parent directories if needed."""
+    jsonl_file = tmp_path / "nested" / "output.jsonl"
+    df = pandas.DataFrame({"a": [1]})
+
+    loader = loaders.DataFrameJSONL()
+    loader.save(df, jsonl_file)
+
+    assert jsonl_file.exists()
+
+
+def test_dataframe_jsonl_loader_save_type_error() -> None:
+    """DataFrameJSONL loader raises TypeError for non-DataFrame data."""
+    loader = loaders.DataFrameJSONL()
+    with pytest.raises(TypeError, match="DataFrameJSONL save expects DataFrame"):
+        loader.save([{"a": 1}], pathlib.Path("test.jsonl"))  # pyright: ignore[reportArgumentType]
+
+
+def test_dataframe_jsonl_loader_empty() -> None:
+    """DataFrameJSONL loader returns empty DataFrame for empty()."""
+    loader = loaders.DataFrameJSONL()
+    result = loader.empty()
+    assert isinstance(result, pandas.DataFrame)
+    assert len(result) == 0
+
+
+def test_dataframe_jsonl_loader_is_picklable() -> None:
+    """DataFrameJSONL loader can be pickled and unpickled."""
+    loader = loaders.DataFrameJSONL()
+    pickled = pickle.dumps(loader)
+    restored = pickle.loads(pickled)
+
+    assert isinstance(restored, loaders.DataFrameJSONL)
