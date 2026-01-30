@@ -9,6 +9,7 @@ import datetime
 import functools
 import logging
 import multiprocessing as mp
+import os
 import pathlib
 import queue
 import threading
@@ -112,6 +113,7 @@ def prepare_workers(
     if not parallel or stage_count <= 0:
         return 1
     workers = _compute_max_workers(stage_count, max_workers)
+    _ensure_deterministic_environment()
     _ensure_cleanup_registered()
     pool = loky.get_reusable_executor(max_workers=workers)
     _warm_workers(pool, workers)
@@ -126,6 +128,7 @@ def restart_workers(stage_count: int, max_workers: int | None = None) -> int:
     if stage_count <= 0:
         return 1
     workers = _compute_max_workers(stage_count, max_workers)
+    _ensure_deterministic_environment()
     _ensure_cleanup_registered()
     pool = loky.get_reusable_executor(max_workers=workers, kill_workers=True)
     _warm_workers(pool, workers)
@@ -601,8 +604,19 @@ def _warn_single_stage_mutex_groups(stage_states: dict[str, StageState]) -> None
             logger.warning(f"Mutex group '{group}' only contains stage '{members[0]}'")
 
 
+@functools.cache
+def _ensure_deterministic_environment() -> None:
+    """Set environment variables for deterministic worker execution.
+
+    Must be called before ANY loky executor creation, as workers inherit
+    parent environment at spawn time. Using setdefault respects user overrides.
+    """
+    os.environ.setdefault("PYTHONHASHSEED", "0")
+
+
 def _create_executor(max_workers: int) -> concurrent.futures.Executor:
     """Get reusable loky executor - workers persist across calls for efficiency."""
+    _ensure_deterministic_environment()
     _ensure_cleanup_registered()
     return loky.get_reusable_executor(max_workers=max_workers)
 
