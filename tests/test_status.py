@@ -238,6 +238,32 @@ def test_tracked_directory_modified(set_project_root: pathlib.Path) -> None:
     assert results[0]["status"] == "modified"
 
 
+def test_tracked_files_progress_callback(set_project_root: pathlib.Path) -> None:
+    """Progress callback should be called with (completed, total) for each file."""
+    (set_project_root / ".git").mkdir()
+
+    # Create two tracked files
+    file1 = set_project_root / "file1.txt"
+    file1.write_text("content1")
+    pvt1 = track.PvtData(path="file1.txt", hash=cache.hash_file(file1), size=8)
+    track.write_pvt_file(set_project_root / "file1.txt.pvt", pvt1)
+
+    file2 = set_project_root / "file2.txt"
+    file2.write_text("content2")
+    pvt2 = track.PvtData(path="file2.txt", hash=cache.hash_file(file2), size=8)
+    track.write_pvt_file(set_project_root / "file2.txt.pvt", pvt2)
+
+    progress_calls = list[tuple[int, int]]()
+
+    def on_progress(completed: int, total: int) -> None:
+        progress_calls.append((completed, total))
+
+    results = status.get_tracked_files_status(set_project_root, on_progress)
+
+    assert len(results) == 2
+    assert progress_calls == [(1, 2), (2, 2)]
+
+
 # =============================================================================
 # Remote Status Tests
 # =============================================================================
