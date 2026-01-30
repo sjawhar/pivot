@@ -744,7 +744,7 @@ class AgentRunStartResult(TypedDict):
 class AgentRunRejection(TypedDict, total=False):
     """Reason an agent run request was rejected."""
 
-    reason: Required[Literal["not_ready", "queue_full"]]
+    reason: Required[Literal["not_ready", "queue_full", "busy"]]
     current_state: Required[str]
     current_run_id: str | None
 
@@ -752,7 +752,7 @@ class AgentRunRejection(TypedDict, total=False):
 class AgentStatusResult(TypedDict, total=False):
     """Result of status() RPC method."""
 
-    state: Required[AgentState]
+    state: Required[str]  # EngineState.value or AgentState.value
     run_id: str
     stages_completed: list[str]
     stages_pending: list[str]

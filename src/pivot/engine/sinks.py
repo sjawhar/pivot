@@ -2,25 +2,38 @@
 
 from __future__ import annotations
 
+import contextlib
+import queue
 import time
 from typing import TYPE_CHECKING
 
+from pivot.engine.types import EngineState
 from pivot.types import (
     StageDisplayStatus,
     StageStatus,
     TuiLogMessage,
     TuiMessageType,
+    TuiReloadMessage,
     TuiStatusMessage,
+    TuiWatchMessage,
+    WatchStatus,
 )
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from pivot.engine.types import LogLine, OutputEvent, StageCompleted, StageStarted
+    from pivot.engine.types import (
+        EngineStateChanged,
+        LogLine,
+        OutputEvent,
+        PipelineReloaded,
+        StageCompleted,
+        StageStarted,
+    )
     from pivot.tui.console import Console
     from pivot.types import TuiQueue
 
-__all__ = ["ConsoleSink", "JsonlSink", "TuiSink"]
+__all__ = ["ConsoleSink", "JsonlSink", "TuiSink", "WatchSink"]
 
 
 class ConsoleSink:
@@ -182,4 +195,87 @@ class JsonlSink:
 
     def close(self) -> None:
         """No cleanup needed for callback-based sink."""
+        pass
+
+
+class WatchSink:
+    """Event sink for watch mode that sends status updates to TUI.
+
+    Translates engine state changes and pipeline reloads into TuiWatchMessage
+    and TuiReloadMessage for the TUI to display watch mode status.
+    """
+
+    _queue: TuiQueue
+
+    def __init__(self, tui_queue: TuiQueue) -> None:
+        """Initialize with a TUI message queue."""
+        self._queue = tui_queue
+
+    def handle(self, event: OutputEvent) -> None:
+        """Handle an output event by sending watch status to TUI queue."""
+        match event["type"]:
+            case "engine_state_changed":
+                self._handle_engine_state_changed(event)
+            case "pipeline_reloaded":
+                self._handle_pipeline_reloaded(event)
+            case _:
+                pass
+
+    def _handle_engine_state_changed(self, event: EngineStateChanged) -> None:
+        """Handle engine state change event."""
+        match event["state"]:
+            case EngineState.ACTIVE:
+                msg = TuiWatchMessage(
+                    type=TuiMessageType.WATCH,
+                    status=WatchStatus.DETECTING,
+                    message="Running stages...",
+                )
+                with contextlib.suppress(queue.Full):
+                    self._queue.put_nowait(msg)
+            case EngineState.IDLE:
+                msg = TuiWatchMessage(
+                    type=TuiMessageType.WATCH,
+                    status=WatchStatus.WAITING,
+                    message="Watching for changes...",
+                )
+                with contextlib.suppress(queue.Full):
+                    self._queue.put_nowait(msg)
+            case _:
+                pass
+
+    def _handle_pipeline_reloaded(self, event: PipelineReloaded) -> None:
+        """Handle pipeline reload event."""
+        if event["error"]:
+            # Send error message
+            msg = TuiWatchMessage(
+                type=TuiMessageType.WATCH,
+                status=WatchStatus.ERROR,
+                message=f"Pipeline invalid: {event['error']}",
+            )
+            with contextlib.suppress(queue.Full):
+                self._queue.put(msg, timeout=1.0)
+        else:
+            # Send restarting status message
+            restart_msg = TuiWatchMessage(
+                type=TuiMessageType.WATCH,
+                status=WatchStatus.RESTARTING,
+                message="Reloading code...",
+            )
+            with contextlib.suppress(queue.Full):
+                self._queue.put_nowait(restart_msg)
+
+            # Import registry here to avoid circular import
+            from pivot import registry
+
+            # Send reload notification with stage list from registry
+            new_stages = list(registry.REGISTRY.list_stages())
+            reload_msg = TuiReloadMessage(
+                type=TuiMessageType.RELOAD,
+                stages=new_stages,
+            )
+            with contextlib.suppress(queue.Full):
+                self._queue.put_nowait(reload_msg)
+
+    def close(self) -> None:
+        """No cleanup needed for watch sink."""
         pass

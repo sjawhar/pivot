@@ -21,7 +21,6 @@ from pivot.types import (
     DisplayMode,
     ExecutionResultEvent,
     OnError,
-    OutputMessage,
     RunEventType,
     SchemaVersionEvent,
     StageStatus,
@@ -224,22 +223,30 @@ def _run_with_tui(
 
 def _run_watch_with_tui(
     stages_list: list[str] | None,
-    single_stage: bool,
-    cache_dir: pathlib.Path | None,
-    debounce: int,
+    single_stage: bool,  # noqa: ARG001 - single_stage filtering happens in Engine
+    cache_dir: pathlib.Path | None,  # noqa: ARG001 - cache_dir not yet passed to Engine
+    debounce: int,  # noqa: ARG001 - debounce not yet used by FilesystemSource
     force: bool = False,
     tui_log: pathlib.Path | None = None,
-    no_commit: bool = False,
-    no_cache: bool = False,
+    no_commit: bool = False,  # noqa: ARG001 - not yet supported in Engine watch mode
+    no_cache: bool = False,  # noqa: ARG001 - not yet supported in Engine watch mode
     on_error: OnError = OnError.FAIL,
     serve: bool = False,
 ) -> None:
-    """Run watch mode with TUI display."""
-    import multiprocessing as mp
+    """Run watch mode with TUI display.
+
+    Note: Several parameters (single_stage, cache_dir, debounce, no_commit, no_cache) are
+    retained for CLI signature compatibility but not currently used by Engine watch mode.
+    """
+    # Suppress unused parameter warnings - retained for CLI compatibility
+    _ = single_stage, cache_dir, debounce, no_commit, no_cache
+
     import queue as thread_queue
+    import uuid
 
     from pivot import dag
-    from pivot import watch as watch_module
+    from pivot.engine import graph as engine_graph
+    from pivot.engine import sources
     from pivot.tui import run as run_tui
     from pivot.types import TuiMessage
 
@@ -256,40 +263,49 @@ def _run_watch_with_tui(
     # Using stdlib queue.Queue avoids Manager subprocess dependency issues.
     tui_queue: thread_queue.Queue[TuiMessage] = thread_queue.Queue()
 
-    # output_queue crosses process boundaries (loky workers -> main), requires Manager.Queue.
-    # Create Manager BEFORE Textual starts to avoid multiprocessing fd inheritance issues.
-    # Use spawn context to avoid fork-in-multithreaded-context issues (Python 3.13+ deprecation)
-    spawn_ctx = mp.get_context("spawn")
-    manager = spawn_ctx.Manager()
-    try:
-        output_queue: mp.Queue[OutputMessage] = manager.Queue()  # pyright: ignore[reportAssignmentType]
+    # Generate run_id for TUI tracking
+    run_id = str(uuid.uuid4())[:8]
 
-        watch_engine = watch_module.WatchEngine(
+    # Create the Engine
+    eng = engine.Engine()
+
+    # Set keep-going mode based on on_error
+    eng.set_keep_going(on_error == OnError.KEEP_GOING)
+
+    # Build bipartite graph for watch paths
+    all_stages = {name: registry.REGISTRY.get(name) for name in registry.REGISTRY.list_stages()}
+    bipartite_graph = engine_graph.build_graph(all_stages)
+    watch_paths = engine_graph.get_watch_paths(bipartite_graph)
+
+    # Add FilesystemSource for watching file changes
+    filesystem_source = sources.FilesystemSource(watch_paths)
+    eng.add_source(filesystem_source)
+
+    # Add OneShotSource for initial run if force is set
+    if force:
+        initial_source = sources.OneShotSource(
             stages=stages_list,
-            single_stage=single_stage,
-            cache_dir=cache_dir,
-            debounce_ms=debounce,
-            force_first_run=force,
-            no_commit=no_commit,
-            no_cache=no_cache,
-            on_error=on_error,
+            force=True,
+            reason="watch:initial:forced",
         )
+        eng.add_source(initial_source)
 
-        # Sort for display: group matrix variants together while preserving DAG structure
-        display_order = _sort_for_display(execution_order, graph) if execution_order else None
+    # Add sinks for TUI updates
+    eng.add_sink(sinks.TuiSink(tui_queue=tui_queue, run_id=run_id))
+    eng.add_sink(sinks.WatchSink(tui_queue=tui_queue))
 
-        with _suppress_stderr_logging():
-            run_tui.run_watch_tui(
-                watch_engine,
-                tui_queue,
-                output_queue=output_queue,
-                tui_log=tui_log,
-                stage_names=display_order,
-                no_commit=no_commit,
-                serve=serve,
-            )
-    finally:
-        manager.shutdown()
+    # Sort for display: group matrix variants together while preserving DAG structure
+    display_order = _sort_for_display(execution_order, graph) if execution_order else None
+
+    with _suppress_stderr_logging():
+        run_tui.run_watch_tui(
+            eng,
+            tui_queue,
+            tui_log=tui_log,
+            stage_names=display_order,
+            no_commit=False,  # TODO: Support no_commit in Engine watch mode
+            serve=serve,
+        )
 
 
 @cli_decorators.pivot_command()
@@ -481,26 +497,49 @@ def run(
                 if show_human_output:
                     click.echo("\nWatch mode stopped.")
         else:
-            from pivot import watch as watch_module
+            from pivot.engine import graph as engine_graph
+            from pivot.engine import sources
 
-            watch_engine = watch_module.WatchEngine(
-                stages=stages_list,
-                single_stage=single_stage,
-                cache_dir=cache_dir,
-                debounce_ms=debounce,
-                force_first_run=force,
-                json_output=as_json,
-                no_commit=no_commit,
-                no_cache=no_cache,
-                on_error=on_error,
-            )
+            # Create the Engine
+            eng = engine.Engine()
+
+            # Set keep-going mode based on on_error
+            eng.set_keep_going(on_error == OnError.KEEP_GOING)
+
+            # Build bipartite graph for watch paths
+            all_stages = {
+                name: registry.REGISTRY.get(name) for name in registry.REGISTRY.list_stages()
+            }
+            bipartite_graph = engine_graph.build_graph(all_stages)
+            watch_paths = engine_graph.get_watch_paths(bipartite_graph)
+
+            # Add FilesystemSource for watching file changes
+            filesystem_source = sources.FilesystemSource(watch_paths)
+            eng.add_source(filesystem_source)
+
+            # Add OneShotSource for initial run if force is set
+            if force:
+                initial_source = sources.OneShotSource(
+                    stages=stages_list,
+                    force=True,
+                    reason="watch:initial:forced",
+                )
+                eng.add_source(initial_source)
+
+            # Add console sink for plain display (unless JSON output)
+            if not as_json:
+                from pivot.tui import console as tui_console
+
+                console = tui_console.Console()
+                eng.add_sink(sinks.ConsoleSink(console))
 
             try:
-                watch_engine.run(tui_queue=None)
+                eng.run_loop()
             except KeyboardInterrupt:
                 pass  # Normal exit via Ctrl+C
             finally:
-                watch_engine.shutdown()
+                eng.shutdown()
+                eng.close()
                 if show_human_output:
                     click.echo("\nWatch mode stopped.")
         return

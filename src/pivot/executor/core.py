@@ -1,54 +1,33 @@
 from __future__ import annotations
 
 import atexit
-import collections
-import concurrent.futures
 import contextlib
-import dataclasses
-import datetime
 import functools
 import logging
-import multiprocessing as mp
 import os
 import pathlib
-import queue
-import threading
-import time
-from typing import TYPE_CHECKING, Literal, TypedDict, final
+from typing import TYPE_CHECKING, Literal, TypedDict
 
 import loky
 
-from pivot import (
-    config,
-    dag,
-    exceptions,
-    metrics,
-    outputs,
-    parameters,
-    project,
-    registry,
-    run_history,
-)
+from pivot import config, exceptions, outputs, parameters, registry
 from pivot.executor import worker
-from pivot.storage import cache, lock, project_lock, track
+from pivot.storage import cache, lock, track
 from pivot.storage import state as state_mod
 from pivot.types import (
     DisplayCategory,
     OnError,
-    OutputMessage,
-    RunEventType,
-    RunJsonEvent,
-    StageCompleteEvent,
     StageResult,
-    StageStartEvent,
     StageStatus,
     categorize_stage_result,
 )
 
 if TYPE_CHECKING:
+    import concurrent.futures
+    import threading
     from collections.abc import Callable
 
-    from networkx import DiGraph
+    from pivot.types import RunJsonEvent
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +40,7 @@ def _noop() -> None:
     pass
 
 
-def _compute_max_workers(stage_count: int, override: int | None = None) -> int:
+def compute_max_workers(stage_count: int, override: int | None = None) -> int:
     """Single source of truth for max_workers calculation.
 
     Args:
@@ -102,7 +81,7 @@ def prepare_workers(
     """
     if not parallel or stage_count <= 0:
         return 1
-    workers = _compute_max_workers(stage_count, max_workers)
+    workers = compute_max_workers(stage_count, max_workers)
     _ensure_deterministic_environment()
     _ensure_cleanup_registered()
     pool = loky.get_reusable_executor(max_workers=workers)
@@ -117,7 +96,7 @@ def restart_workers(stage_count: int, max_workers: int | None = None) -> int:
     """
     if stage_count <= 0:
         return 1
-    workers = _compute_max_workers(stage_count, max_workers)
+    workers = compute_max_workers(stage_count, max_workers)
     _ensure_deterministic_environment()
     _ensure_cleanup_registered()
     pool = loky.get_reusable_executor(max_workers=workers, kill_workers=True)
@@ -170,117 +149,6 @@ def count_results(results: dict[str, ExecutionSummary]) -> tuple[int, int, int, 
     return ran, cached, blocked, failed
 
 
-@dataclasses.dataclass
-class StageState:
-    """Tracks execution state for a single stage."""
-
-    name: str
-    index: int  # 1-based position in execution order
-    info: registry.RegistryStageInfo
-    upstream: list[str]
-    upstream_unfinished: set[str]
-    downstream: list[str]
-    mutex: list[str]
-    status: StageStatus = StageStatus.READY
-    result: StageResult | None = None
-    start_time: float | None = None
-    end_time: float | None = None
-
-    def get_duration(self) -> float | None:
-        """Calculate elapsed duration from start to end (or current time if still running)."""
-        if self.start_time is None:
-            return None
-        end = self.end_time if self.end_time is not None else time.perf_counter()
-        return end - self.start_time
-
-
-@final
-class StageLifecycle:
-    """Manages stage execution state and notifications.
-
-    All stage state transitions should go through this class to ensure
-    progress callback notifications are always sent. Display is handled
-    by Engine sinks (ConsoleSink, TuiSink, JsonlSink).
-    """
-
-    total_stages: int
-    progress_callback: Callable[[RunJsonEvent], None] | None
-    run_id: str
-
-    def __init__(
-        self,
-        total_stages: int,
-        progress_callback: Callable[[RunJsonEvent], None] | None = None,
-        run_id: str = "",
-    ) -> None:
-        self.total_stages = total_stages
-        self.progress_callback = progress_callback
-        self.run_id = run_id
-
-    def mark_started(self, state: StageState) -> None:
-        """Mark stage as started and send progress notification."""
-        state.status = StageStatus.IN_PROGRESS
-        state.start_time = time.perf_counter()
-        logger.debug(f"Stage started: {state.name}")  # noqa: G004
-
-        if self.progress_callback:
-            self.progress_callback(
-                StageStartEvent(
-                    type=RunEventType.STAGE_START,
-                    stage=state.name,
-                    index=state.index,
-                    total=self.total_stages,
-                    timestamp=datetime.datetime.now(datetime.UTC).isoformat(),
-                )
-            )
-
-    def mark_completed(self, state: StageState, result: StageResult) -> None:
-        """Mark stage completed with result and send all notifications."""
-        state.result = result
-        state.status = result["status"]
-        state.end_time = time.perf_counter()
-        self._notify_complete(state, result)
-
-    def mark_failed(self, state: StageState, reason: str) -> None:
-        """Mark stage as failed and send all notifications."""
-        result = StageResult(status=StageStatus.FAILED, reason=reason, output_lines=[])
-        state.result = result
-        state.status = StageStatus.FAILED
-        state.end_time = time.perf_counter()
-        self._notify_complete(state, result)
-
-    def mark_skipped_upstream(self, state: StageState, failed_stage: str) -> None:
-        """Mark stage as skipped due to upstream failure and send all notifications.
-
-        Unlike mark_completed, this doesn't set end_time since the stage never started.
-        """
-        reason = f"upstream '{failed_stage}' failed"
-        result = StageResult(status=StageStatus.SKIPPED, reason=reason, output_lines=[])
-        state.result = result
-        state.status = StageStatus.SKIPPED
-        # Don't set end_time - stage never started
-        self._notify_complete(state, result)
-
-    def _notify_complete(self, state: StageState, result: StageResult) -> None:
-        """Send completion notification."""
-        result_status = result["status"]
-        result_reason = result["reason"]
-        duration = state.get_duration()
-        logger.debug(f"Stage completed: {state.name} -> {result_status}")  # noqa: G004
-
-        if self.progress_callback:
-            self.progress_callback(
-                StageCompleteEvent(
-                    type=RunEventType.STAGE_COMPLETE,
-                    stage=state.name,
-                    status=result_status,
-                    reason=result_reason,
-                    duration_ms=(duration or 0) * 1000,
-                    timestamp=datetime.datetime.now(datetime.UTC).isoformat(),
-                )
-            )
-
-
 def run(
     stages: list[str] | None = None,
     single_stage: bool = False,
@@ -290,14 +158,17 @@ def run(
     on_error: OnError | str = OnError.FAIL,
     allow_uncached_incremental: bool = False,
     force: bool = False,
-    stage_timeout: float | None = None,
+    stage_timeout: float | None = None,  # noqa: ARG001  # pyright: ignore[reportUnusedParameter]
     no_commit: bool = False,
     no_cache: bool = False,
     progress_callback: Callable[[RunJsonEvent], None] | None = None,
     cancel_event: threading.Event | None = None,
     checkout_missing: bool = False,
 ) -> dict[str, ExecutionSummary]:
-    """Execute pipeline stages with greedy parallel execution.
+    """Execute pipeline stages via Engine.
+
+    This is a thin wrapper around Engine.run_once() for backwards compatibility.
+    All execution orchestration is now handled by Engine.
 
     Args:
         stages: Target stages to run (and their dependencies). If None, runs all.
@@ -308,7 +179,7 @@ def run(
         on_error: Error handling mode - "fail" or "keep_going".
         allow_uncached_incremental: If True, skip safety check for uncached IncrementalOut files.
         force: If True, bypass cache and force all stages to re-execute.
-        stage_timeout: Max seconds for each stage to complete (default: no timeout).
+        stage_timeout: Max seconds for each stage to complete (retained for API compatibility).
         no_commit: If True, defer lock files to pending dir (faster iteration).
         no_cache: If True, skip caching outputs entirely (maximum iteration speed).
         progress_callback: Callback for JSONL progress events (stage start/complete).
@@ -318,130 +189,154 @@ def run(
     Returns:
         Dict of stage_name -> {status: "ran"|"skipped"|"failed", reason: str}
     """
-    if cache_dir is None:
-        cache_dir = config.get_cache_dir()
+    # Import project_lock early to acquire lock BEFORE importing Engine.
+    # Engine import is slow (~500ms) and we need to hold the lock during that time
+    # to prevent race conditions with concurrent commit operations.
+    from pivot.storage import project_lock
 
-    if isinstance(on_error, OnError):
-        error_mode = on_error
-    else:
-        try:
-            error_mode = OnError(on_error)
-        except ValueError:
-            raise ValueError(
-                f"Invalid on_error mode: {on_error}. Use 'fail' or 'keep_going'"
-            ) from None
-
-    # Verify tracked files before building DAG (provides better error messages)
-    project_root = project.get_project_root()
-    _verify_tracked_files(project_root, checkout_missing=checkout_missing)
-
-    graph = registry.REGISTRY.build_dag(validate=True)
-
-    if stages:
-        registered = set(graph.nodes())
-        unknown = [s for s in stages if s not in registered]
-        if unknown:
-            raise exceptions.StageNotFoundError(unknown, available_stages=list(registered))
-
-    execution_order = dag.get_execution_order(graph, stages, single_stage=single_stage)
-
-    if not execution_order:
-        return {}
-
-    # Record start time and generate run_id for run history
-    started_at = datetime.datetime.now(datetime.UTC).isoformat()
-    run_id = run_history.generate_run_id()
-    targeted_stages = stages if stages else list(graph.nodes())
-
-    # Load parameter overrides early to validate and prepare for workers
-    overrides = parameters.load_params_yaml()
-
-    # Load checkout mode configuration
-    checkout_modes = config.get_checkout_mode_order()
-
-    # Check for uncached IncrementalOut files that would be lost
-    if not allow_uncached_incremental:
-        uncached = _check_uncached_incremental_outputs(execution_order)
-        if uncached:
-            files_list = "\n".join(f"  - {stage}: {path}" for stage, path in uncached)
-            raise exceptions.UncachedIncrementalOutputError(
-                f"The following IncrementalOut files exist but are not in cache:\n{files_list}\n\n"
-                + "Running the pipeline will DELETE these files and they cannot be restored.\n"
-                + "To proceed anyway, use allow_uncached_incremental=True or back up these files first."
-            )
-
-    total_stages = len(execution_order)
-
-    stage_states = _initialize_stage_states(execution_order, graph)
-
-    max_workers = 1 if not parallel else _compute_max_workers(len(execution_order), max_workers)
-
-    # When no_commit=True, acquire lock to prevent commits during execution
+    # Acquire lock FIRST if in no_commit mode - before any slow imports
     lock_context = project_lock.pending_state_lock() if no_commit else contextlib.nullcontext()
+
     with lock_context:
-        _execute_greedy(
-            stage_states=stage_states,
+        return _run_inner(
+            stages=stages,
+            single_stage=single_stage,
             cache_dir=cache_dir,
+            parallel=parallel,
             max_workers=max_workers,
-            error_mode=error_mode,
-            total_stages=total_stages,
-            stage_timeout=stage_timeout,
-            overrides=overrides,
-            checkout_modes=checkout_modes,
-            run_id=run_id,
+            on_error=on_error,
+            allow_uncached_incremental=allow_uncached_incremental,
             force=force,
             no_commit=no_commit,
             no_cache=no_cache,
             progress_callback=progress_callback,
             cancel_event=cancel_event,
+            checkout_missing=checkout_missing,
         )
 
-        results = _build_results(stage_states)
 
-        # Write run history
-        ended_at = datetime.datetime.now(datetime.UTC).isoformat()
-        retention = config.get_run_history_retention()
-        _write_run_history(
-            run_id=run_id,
-            stage_states=stage_states,
-            targeted_stages=targeted_stages,
-            execution_order=execution_order,
-            started_at=started_at,
-            ended_at=ended_at,
-            retention=retention,
-        )
+def _run_inner(
+    stages: list[str] | None,
+    single_stage: bool,
+    cache_dir: pathlib.Path | None,
+    parallel: bool,
+    max_workers: int | None,
+    on_error: OnError | str,
+    allow_uncached_incremental: bool,
+    force: bool,
+    no_commit: bool,
+    no_cache: bool,
+    progress_callback: Callable[[RunJsonEvent], None] | None,
+    cancel_event: threading.Event | None,
+    checkout_missing: bool,
+) -> dict[str, ExecutionSummary]:
+    """Inner implementation of run(), called with lock already held if needed."""
+    # Import here to avoid circular import (engine imports executor_core)
+    from pivot.engine.engine import Engine
 
-    return results
+    if not isinstance(on_error, OnError):
+        try:
+            on_error = OnError(on_error)
+        except ValueError:
+            raise ValueError(
+                f"Invalid on_error mode: {on_error}. Use 'fail' or 'keep_going'"
+            ) from None
+
+    # Create engine and delegate execution
+    engine = Engine()
+
+    # Pass cancel event to engine if provided
+    if cancel_event is not None:
+        engine.set_cancel_event(cancel_event)
+
+    return engine.run_once(
+        stages=stages,
+        force=force,
+        single_stage=single_stage,
+        parallel=parallel,
+        max_workers=max_workers,
+        no_commit=no_commit,
+        no_cache=no_cache,
+        allow_uncached_incremental=allow_uncached_incremental,
+        checkout_missing=checkout_missing,
+        on_error=on_error,
+        cache_dir=cache_dir,
+        progress_callback=progress_callback,
+    )
 
 
-def _initialize_stage_states(
-    execution_order: list[str],
-    graph: DiGraph[str],
-) -> dict[str, StageState]:
-    """Initialize state tracking for all stages."""
-    stages_set = set(execution_order)
-    states = dict[str, StageState]()
+# =========================================================================
+# Functions used by Engine for orchestration
+# =========================================================================
 
-    for idx, stage_name in enumerate(execution_order, 1):
-        stage_info = registry.REGISTRY.get(stage_name)
 
-        upstream = list(graph.successors(stage_name))
-        upstream_in_plan = [u for u in upstream if u in stages_set]
+@functools.cache
+def _ensure_deterministic_environment() -> None:
+    """Set environment variables for deterministic worker execution.
 
-        downstream = list(graph.predecessors(stage_name))
-        downstream_in_plan = [d for d in downstream if d in stages_set]
+    Must be called before ANY loky executor creation, as workers inherit
+    parent environment at spawn time. Using setdefault respects user overrides.
+    """
+    os.environ.setdefault("PYTHONHASHSEED", "0")
 
-        states[stage_name] = StageState(
-            name=stage_name,
-            index=idx,
-            info=stage_info,
-            upstream=upstream_in_plan,
-            upstream_unfinished=set(upstream_in_plan),
-            downstream=downstream_in_plan,
-            mutex=stage_info["mutex"],
-        )
 
-    return states
+def create_executor(max_workers: int) -> concurrent.futures.Executor:
+    """Get reusable loky executor - workers persist across calls for efficiency."""
+    _ensure_deterministic_environment()
+    _ensure_cleanup_registered()
+    return loky.get_reusable_executor(max_workers=max_workers)
+
+
+def prepare_worker_info(
+    stage_info: registry.RegistryStageInfo,
+    overrides: parameters.ParamsOverrides,
+    checkout_modes: list[cache.CheckoutMode],
+    run_id: str,
+    force: bool,
+    no_commit: bool,
+    no_cache: bool,
+    project_root: pathlib.Path,
+    state_dir: pathlib.Path,
+) -> worker.WorkerStageInfo:
+    """Prepare stage info for pickling to worker process."""
+    return worker.WorkerStageInfo(
+        func=stage_info["func"],
+        fingerprint=stage_info["fingerprint"],
+        deps=stage_info["deps_paths"],
+        outs=stage_info["outs"],
+        signature=stage_info["signature"],
+        params=stage_info["params"],
+        variant=stage_info["variant"],
+        overrides=overrides,
+        checkout_modes=checkout_modes,
+        run_id=run_id,
+        force=force,
+        no_commit=no_commit,
+        no_cache=no_cache,
+        dep_specs=stage_info["dep_specs"],
+        out_specs=stage_info["out_specs"],
+        params_arg_name=stage_info["params_arg_name"],
+        project_root=project_root,
+        state_dir=state_dir,
+    )
+
+
+def apply_deferred_writes(
+    stage_name: str,
+    output_paths: list[str],
+    result: StageResult,
+    state_db: state_mod.StateDB,
+) -> None:
+    """Apply deferred StateDB writes from worker result."""
+    if "deferred_writes" not in result:
+        return
+    # result["deferred_writes"] is DeferredWrites from worker
+    state_db.apply_deferred_writes(stage_name, output_paths, result["deferred_writes"])
+
+
+# =========================================================================
+# Safety checks used before execution
+# =========================================================================
 
 
 def _restore_tracked_file(
@@ -460,7 +355,7 @@ def _restore_tracked_file(
     return cache.restore_from_cache(path, output_hash, cache_dir, checkout_modes=checkout_modes)
 
 
-def _verify_tracked_files(project_root: pathlib.Path, checkout_missing: bool = False) -> None:
+def verify_tracked_files(project_root: pathlib.Path, checkout_missing: bool = False) -> None:
     """Verify all .pvt tracked files exist and warn on hash mismatches.
 
     Args:
@@ -468,6 +363,8 @@ def _verify_tracked_files(project_root: pathlib.Path, checkout_missing: bool = F
         checkout_missing: If True, restore missing tracked files from cache before validating.
             Only restores files that don't exist - never overwrites existing files.
     """
+    from pivot import metrics
+
     tracked_files = track.discover_pvt_files(project_root)
     if not tracked_files:
         return
@@ -511,508 +408,7 @@ def _verify_tracked_files(project_root: pathlib.Path, checkout_missing: bool = F
             raise exceptions.TrackedFileMissingError(missing, checkout_attempted=checkout_missing)
 
 
-def _warn_single_stage_mutex_groups(stage_states: dict[str, StageState]) -> None:
-    """Warn if any mutex group contains only one stage (likely a typo)."""
-    groups: collections.defaultdict[str, list[str]] = collections.defaultdict(list)
-    for name, state in stage_states.items():
-        for mutex in state.mutex:
-            groups[mutex].append(name)
-
-    for group, members in groups.items():
-        # Skip EXCLUSIVE_MUTEX - it's intentionally used for single stages
-        if group == EXCLUSIVE_MUTEX:
-            continue
-        if len(members) == 1:
-            logger.warning(f"Mutex group '{group}' only contains stage '{members[0]}'")
-
-
-@functools.cache
-def _ensure_deterministic_environment() -> None:
-    """Set environment variables for deterministic worker execution.
-
-    Must be called before ANY loky executor creation, as workers inherit
-    parent environment at spawn time. Using setdefault respects user overrides.
-    """
-    os.environ.setdefault("PYTHONHASHSEED", "0")
-
-
-def _create_executor(max_workers: int) -> concurrent.futures.Executor:
-    """Get reusable loky executor - workers persist across calls for efficiency."""
-    _ensure_deterministic_environment()
-    _ensure_cleanup_registered()
-    return loky.get_reusable_executor(max_workers=max_workers)
-
-
-def _execute_greedy(
-    stage_states: dict[str, StageState],
-    cache_dir: pathlib.Path,
-    max_workers: int,
-    error_mode: OnError,
-    total_stages: int,
-    stage_timeout: float | None = None,
-    overrides: parameters.ParamsOverrides | None = None,
-    checkout_modes: list[cache.CheckoutMode] | None = None,
-    run_id: str = "",
-    force: bool = False,
-    no_commit: bool = False,
-    no_cache: bool = False,
-    progress_callback: Callable[[RunJsonEvent], None] | None = None,
-    cancel_event: threading.Event | None = None,
-) -> None:
-    """Execute stages with greedy parallel scheduling using loky ProcessPoolExecutor."""
-    overrides = overrides or {}
-    checkout_modes = checkout_modes or config.get_checkout_mode_order()
-    futures: dict[concurrent.futures.Future[StageResult], str] = {}
-    mutex_counts: collections.defaultdict[str, int] = collections.defaultdict(int)
-
-    # Centralized lifecycle handler for state transitions + notifications
-    lifecycle = StageLifecycle(
-        total_stages=total_stages,
-        progress_callback=progress_callback,
-        run_id=run_id,
-    )
-
-    _warn_single_stage_mutex_groups(stage_states)
-
-    executor = _create_executor(max_workers)
-
-    # Create output queue for worker stdout/stderr (workers require this)
-    # Use spawn context to avoid fork-in-multithreaded-context issues (Python 3.13+ deprecation)
-    spawn_ctx = mp.get_context("spawn")
-    local_manager = spawn_ctx.Manager()
-    # Manager().Queue() returns AutoProxy[Queue] which is incompatible with Queue type stubs
-    output_queue: mp.Queue[OutputMessage] = local_manager.Queue()  # pyright: ignore[reportAssignmentType]
-
-    state_dir = config.get_state_dir()
-    state_db_path = config.get_state_db_path()
-    proj_root = project.get_project_root()
-    output_thread: threading.Thread | None = None
-
-    try:
-        # Start output drain thread to prevent queue from filling up
-        output_thread = threading.Thread(
-            target=_drain_output_queue,
-            args=(output_queue,),
-            daemon=True,
-        )
-        output_thread.start()
-        with executor, state_mod.StateDB(state_db_path) as state_db:
-            _start_ready_stages(
-                stage_states=stage_states,
-                executor=executor,
-                futures=futures,
-                cache_dir=cache_dir,
-                output_queue=output_queue,
-                max_stages=max_workers,
-                mutex_counts=mutex_counts,
-                overrides=overrides,
-                lifecycle=lifecycle,
-                project_root=proj_root,
-                state_dir=state_dir,
-                checkout_modes=checkout_modes,
-                force=force,
-                no_commit=no_commit,
-                no_cache=no_cache,
-                cancel_event=cancel_event,
-            )
-
-            stop_starting_new = False  # Set when failure detected, prevents new stage starts
-            while futures:
-                # Calculate wait timeout based on oldest running stage
-                wait_timeout: float | None = None
-                if stage_timeout is not None:
-                    now = time.perf_counter()
-                    for _future, stage_name in futures.items():
-                        state = stage_states[stage_name]
-                        if state.start_time:
-                            elapsed = now - state.start_time
-                            remaining = stage_timeout - elapsed
-                            if wait_timeout is None or remaining < wait_timeout:
-                                wait_timeout = max(0.1, remaining)  # At least 0.1s
-
-                done, _ = concurrent.futures.wait(
-                    futures.keys(),
-                    timeout=wait_timeout,
-                    return_when=concurrent.futures.FIRST_COMPLETED,
-                )
-
-                # Check for timed-out stages if nothing completed
-                if not done and stage_timeout is not None:
-                    now = time.perf_counter()
-                    timed_out = list[tuple[concurrent.futures.Future[StageResult], str]]()
-                    for future, stage_name in futures.items():
-                        state = stage_states[stage_name]
-                        if state.start_time and (now - state.start_time) >= stage_timeout:
-                            timed_out.append((future, stage_name))
-                    for future, stage_name in timed_out:
-                        futures.pop(future)
-                        future.cancel()
-                        state = stage_states[stage_name]
-                        timeout_reason = f"Stage timed out after {stage_timeout}s"
-                        # _mark_stage_failed uses lifecycle.mark_failed() which sends all notifications
-                        _mark_stage_failed(
-                            state,
-                            timeout_reason,
-                            stage_states,
-                            lifecycle,
-                        )
-                        for mutex in state.mutex:
-                            mutex_counts[mutex] -= 1
-                    continue
-
-                for future in done:
-                    stage_name = futures.pop(future)
-                    state = stage_states[stage_name]
-
-                    try:
-                        result = future.result()
-
-                        # Aggregate metrics from worker process (before state change)
-                        if "metrics" in result:
-                            metrics.add_entries(result["metrics"])
-
-                        # Use lifecycle to set state AND send all notifications
-                        lifecycle.mark_completed(state, result)
-
-                        # Handle downstream cascade for failed stages
-                        if result["status"] == StageStatus.FAILED:
-                            _handle_stage_failure(stage_name, stage_states, lifecycle)
-
-                        # Apply deferred writes for successful stages (only in commit mode)
-                        if result["status"] == StageStatus.RAN and not no_commit:
-                            # Registry always stores single-file outputs (multi-file are expanded)
-                            output_paths = [str(out.path) for out in state.info["outs"]]
-                            _apply_deferred_writes(stage_name, output_paths, result, state_db)
-
-                    except concurrent.futures.BrokenExecutor as e:
-                        _mark_stage_failed(state, f"Worker died: {e}", stage_states, lifecycle)
-                        logger.error(f"Worker process died while running '{stage_name}'")
-
-                    except Exception as e:
-                        _mark_stage_failed(state, str(e), stage_states, lifecycle)
-
-                    for downstream_name in state.downstream:
-                        downstream_state = stage_states.get(downstream_name)
-                        if downstream_state:
-                            downstream_state.upstream_unfinished.discard(stage_name)
-
-                    # Release mutex locks (regardless of success/failure)
-                    for mutex in state.mutex:
-                        mutex_counts[mutex] -= 1
-                        if mutex_counts[mutex] < 0:
-                            logger.error(
-                                f"Mutex '{mutex}' released when not held (bug in mutex tracking)"
-                            )
-                            mutex_counts[mutex] = 0  # Reset to valid state
-
-                if error_mode == OnError.FAIL:
-                    failed_stages = [
-                        name for name, s in stage_states.items() if s.status == StageStatus.FAILED
-                    ]
-                    if failed_stages:
-                        failed_stage_name = failed_stages[0]  # Use first failure for reason
-
-                        # Cancel all pending futures (no-op for already-running workers)
-                        for f in futures:
-                            f.cancel()
-
-                        # Mark only READY stages as skipped - IN_PROGRESS stages will complete
-                        # and their actual result will be processed by the loop
-                        for state in stage_states.values():
-                            if state.status == StageStatus.READY:
-                                lifecycle.mark_skipped_upstream(state, failed_stage_name)
-
-                        # Prevent starting new stages
-                        stop_starting_new = True
-
-                        if not futures:
-                            # No running stages - exit immediately
-                            return
-                        # Otherwise continue loop to process remaining IN_PROGRESS stages
-
-                # Check for cancellation - mark remaining READY stages as cancelled
-                if cancel_event is not None and cancel_event.is_set():
-                    for state in stage_states.values():
-                        if state.status == StageStatus.READY:
-                            result = StageResult(
-                                status=StageStatus.SKIPPED,
-                                reason="cancelled",
-                                output_lines=[],
-                            )
-                            lifecycle.mark_completed(state, result)
-                    stop_starting_new = True
-                    if not futures:
-                        # No running stages - exit immediately
-                        return
-                    # Otherwise let running stages complete before exiting
-
-                slots_available = max_workers - len(futures)
-                if slots_available > 0 and not stop_starting_new:
-                    _start_ready_stages(
-                        stage_states=stage_states,
-                        executor=executor,
-                        futures=futures,
-                        cache_dir=cache_dir,
-                        output_queue=output_queue,
-                        max_stages=slots_available,
-                        mutex_counts=mutex_counts,
-                        overrides=overrides,
-                        lifecycle=lifecycle,
-                        project_root=proj_root,
-                        state_dir=state_dir,
-                        checkout_modes=checkout_modes,
-                        force=force,
-                        no_commit=no_commit,
-                        no_cache=no_cache,
-                        cancel_event=cancel_event,
-                    )
-    finally:
-        # Signal output thread to stop - may fail if queue is broken
-        with contextlib.suppress(OSError, ValueError):
-            output_queue.put(None)
-        if output_thread:
-            output_thread.join(timeout=1.0)
-        # Clean up manager (prevents orphaned subprocess)
-        local_manager.shutdown()
-
-
-def _drain_output_queue(output_q: mp.Queue[OutputMessage]) -> None:
-    """Drain output messages from worker processes.
-
-    This prevents the queue from filling up and blocking workers.
-    Output is discarded since display is handled by Engine sinks.
-    """
-    while True:
-        try:
-            msg = output_q.get(timeout=0.02)
-            if msg is None:
-                break
-            # Discard the message - display is handled by Engine sinks
-        except queue.Empty:
-            continue
-        except (EOFError, OSError, BrokenPipeError):
-            # Queue was closed or broken - exit gracefully
-            logger.debug("Output queue drain exiting: queue closed or broken")
-            break
-
-
-def _start_ready_stages(
-    stage_states: dict[str, StageState],
-    executor: concurrent.futures.Executor,
-    futures: dict[concurrent.futures.Future[StageResult], str],
-    cache_dir: pathlib.Path,
-    output_queue: mp.Queue[OutputMessage],
-    max_stages: int,
-    mutex_counts: collections.defaultdict[str, int],
-    overrides: parameters.ParamsOverrides,
-    lifecycle: StageLifecycle,
-    project_root: pathlib.Path,
-    state_dir: pathlib.Path,
-    checkout_modes: list[cache.CheckoutMode] | None = None,
-    force: bool = False,
-    no_commit: bool = False,
-    no_cache: bool = False,
-    cancel_event: threading.Event | None = None,
-) -> None:
-    """Find and start stages that are ready to execute."""
-    # Check cancellation - stages can become READY after the main loop's check
-    # (e.g., when a running stage completes and unblocks downstream)
-    if cancel_event is not None and cancel_event.is_set():
-        return
-
-    checkout_modes = checkout_modes or config.get_checkout_mode_order()
-    started = 0
-
-    for stage_name, state in stage_states.items():
-        if started >= max_stages:
-            break
-
-        if state.status != StageStatus.READY:
-            continue
-
-        if state.upstream_unfinished:
-            continue
-
-        # Check mutex availability - skip if any mutex group is held
-        if any(mutex_counts[m] > 0 for m in state.mutex):
-            continue
-
-        # Exclusive mutex handling:
-        # - If this stage is exclusive, wait until no other stages are running
-        # - If any exclusive stage is running, no other stages can start
-        is_exclusive = EXCLUSIVE_MUTEX in state.mutex
-        if is_exclusive and len(futures) > 0:
-            continue  # Exclusive stage must wait for all others to finish
-        if not is_exclusive and mutex_counts[EXCLUSIVE_MUTEX] > 0:
-            continue  # Non-exclusive stage can't start while exclusive is running
-
-        # Acquire mutex locks before changing status
-        for mutex in state.mutex:
-            mutex_counts[mutex] += 1
-
-        worker_info = _prepare_worker_info(
-            state.info,
-            overrides,
-            checkout_modes,
-            lifecycle.run_id,
-            force,
-            no_commit,
-            no_cache,
-            project_root,
-            state_dir,
-        )
-
-        try:
-            future = executor.submit(
-                worker.execute_stage,
-                stage_name,
-                worker_info,
-                cache_dir,
-                output_queue,
-            )
-            futures[future] = stage_name
-            started += 1
-
-            # Mark as in-progress and send all notifications via lifecycle
-            lifecycle.mark_started(state)
-        except Exception as e:
-            # Rollback mutex acquisition on submission failure
-            for mutex in state.mutex:
-                mutex_counts[mutex] -= 1
-            _mark_stage_failed(state, f"Failed to submit: {e}", stage_states, lifecycle)
-
-
-def _prepare_worker_info(
-    stage_info: registry.RegistryStageInfo,
-    overrides: parameters.ParamsOverrides,
-    checkout_modes: list[cache.CheckoutMode],
-    run_id: str,
-    force: bool,
-    no_commit: bool,
-    no_cache: bool,
-    project_root: pathlib.Path,
-    state_dir: pathlib.Path,
-) -> worker.WorkerStageInfo:
-    """Prepare stage info for pickling to worker process."""
-    return worker.WorkerStageInfo(
-        func=stage_info["func"],
-        fingerprint=stage_info["fingerprint"],
-        deps=stage_info["deps_paths"],
-        outs=stage_info["outs"],
-        signature=stage_info["signature"],
-        params=stage_info["params"],
-        variant=stage_info["variant"],
-        overrides=overrides,
-        checkout_modes=checkout_modes,
-        run_id=run_id,
-        force=force,
-        no_commit=no_commit,
-        no_cache=no_cache,
-        dep_specs=stage_info["dep_specs"],
-        out_specs=stage_info["out_specs"],
-        params_arg_name=stage_info["params_arg_name"],
-        project_root=project_root,
-        state_dir=state_dir,
-    )
-
-
-def _apply_deferred_writes(
-    stage_name: str,
-    output_paths: list[str],
-    result: StageResult,
-    state_db: state_mod.StateDB,
-) -> None:
-    """Apply deferred StateDB writes from worker result."""
-    if "deferred_writes" not in result:
-        return
-    state_db.apply_deferred_writes(stage_name, output_paths, result["deferred_writes"])
-
-
-def _mark_stage_failed(
-    state: StageState,
-    reason: str,
-    stage_states: dict[str, StageState],
-    lifecycle: StageLifecycle | None = None,
-) -> None:
-    """Mark a stage as failed and handle downstream effects.
-
-    Uses lifecycle.mark_failed() when available to send notifications atomically
-    with state updates. Then handles downstream cascade via _handle_stage_failure.
-    """
-    if lifecycle:
-        # Use lifecycle to set state AND send notifications
-        lifecycle.mark_failed(state, reason)
-    else:
-        # Fallback for non-TUI mode
-        state.result = StageResult(status=StageStatus.FAILED, reason=reason, output_lines=[])
-        state.status = StageStatus.FAILED
-        state.end_time = time.perf_counter()
-    _handle_stage_failure(state.name, stage_states, lifecycle)
-
-
-def _handle_stage_failure(
-    failed_stage: str,
-    stage_states: dict[str, StageState],
-    lifecycle: StageLifecycle | None = None,
-) -> None:
-    """Handle stage failure by marking downstream stages as skipped.
-
-    This handles both FAIL and KEEP_GOING modes: downstream stages are always
-    skipped when their upstream fails. The difference between modes is whether
-    independent stages continue (KEEP_GOING) or the pipeline stops (FAIL).
-    """
-    to_skip = set[str]()
-    bfs_queue = collections.deque([failed_stage])
-    visited = set[str]()
-
-    while bfs_queue:
-        current = bfs_queue.popleft()
-        if current in visited:
-            continue
-        visited.add(current)
-
-        state = stage_states.get(current)
-        if not state:
-            continue
-
-        for downstream in state.downstream:
-            if downstream not in visited:
-                to_skip.add(downstream)
-                bfs_queue.append(downstream)
-
-    for stage_name in to_skip:
-        state = stage_states.get(stage_name)
-        if state and state.status == StageStatus.READY:
-            if lifecycle:
-                # Use lifecycle to update state AND send notifications
-                lifecycle.mark_skipped_upstream(state, failed_stage)
-            else:
-                # Fallback for non-TUI mode (no notifications needed)
-                state.status = StageStatus.SKIPPED
-                state.result = StageResult(
-                    status=StageStatus.SKIPPED,
-                    reason=f"upstream '{failed_stage}' failed",
-                    output_lines=[],
-                )
-
-
-def _build_results(stage_states: dict[str, StageState]) -> dict[str, ExecutionSummary]:
-    """Build results dict from stage states."""
-    results = dict[str, ExecutionSummary]()
-    for name, state in stage_states.items():
-        if state.result:
-            results[name] = ExecutionSummary(
-                status=state.result["status"],
-                reason=state.result["reason"],
-            )
-        elif state.status == StageStatus.SKIPPED:
-            results[name] = ExecutionSummary(status=StageStatus.SKIPPED, reason="upstream failed")
-        else:
-            results[name] = ExecutionSummary(status=StageStatus.UNKNOWN, reason="never executed")
-    return results
-
-
-def _check_uncached_incremental_outputs(
+def check_uncached_incremental_outputs(
     execution_order: list[str],
 ) -> list[tuple[str, str]]:
     """Check for IncrementalOut files that exist but aren't cached.
@@ -1041,50 +437,3 @@ def _check_uncached_incremental_outputs(
                     uncached.append((stage_name, out_path))
 
     return uncached
-
-
-def _write_run_history(
-    run_id: str,
-    stage_states: dict[str, StageState],
-    targeted_stages: list[str],
-    execution_order: list[str],
-    started_at: str,
-    ended_at: str,
-    retention: int,
-) -> None:
-    """Build and write run manifest to StateDB."""
-    state_dir = config.get_state_dir()
-
-    stages_records = dict[str, run_history.StageRunRecord]()
-    for name, state in stage_states.items():
-        stage_lock = lock.StageLock(name, lock.get_stages_dir(state_dir))
-        lock_data = stage_lock.read()
-
-        if lock_data:
-            input_hash = run_history.compute_input_hash_from_lock(lock_data)
-        else:
-            input_hash = "<no-lock>"
-
-        duration_ms = int((state.get_duration() or 0) * 1000)
-        status = state.result["status"] if state.result else StageStatus.UNKNOWN
-        reason = state.result["reason"] if state.result else ""
-
-        stages_records[name] = run_history.StageRunRecord(
-            input_hash=input_hash,
-            status=status,
-            reason=reason,
-            duration_ms=duration_ms,
-        )
-
-    manifest = run_history.RunManifest(
-        run_id=run_id,
-        started_at=started_at,
-        ended_at=ended_at,
-        targeted_stages=targeted_stages,
-        execution_order=execution_order,
-        stages=stages_records,
-    )
-
-    with state_mod.StateDB(config.get_state_db_path()) as state_db:
-        state_db.write_run(manifest)
-        state_db.prune_runs(retention)

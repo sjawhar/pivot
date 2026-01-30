@@ -25,6 +25,7 @@ __all__ = [
     "PipelineReloaded",
     "StageStarted",
     "StageCompleted",
+    "StageStateChanged",
     "LogLine",
     "OutputEvent",
     # Protocols
@@ -152,7 +153,23 @@ class LogLine(TypedDict):
     is_stderr: bool
 
 
-OutputEvent = EngineStateChanged | PipelineReloaded | StageStarted | StageCompleted | LogLine
+class StageStateChanged(TypedDict):
+    """Emitted when a stage's execution state changes."""
+
+    type: Literal["stage_state_changed"]
+    stage: str
+    state: StageExecutionState
+    previous_state: StageExecutionState
+
+
+OutputEvent = (
+    EngineStateChanged
+    | PipelineReloaded
+    | StageStarted
+    | StageCompleted
+    | StageStateChanged
+    | LogLine
+)
 
 
 # =============================================================================

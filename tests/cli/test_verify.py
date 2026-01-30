@@ -219,7 +219,7 @@ def test_verify_missing_dep_file_exits_1(
         result = runner.invoke(cli.cli, ["verify"])
 
         assert result.exit_code == 1
-        assert "Missing deps:" in result.output
+        assert "depends on" in result.output and "does not exist" in result.output
 
 
 def test_verify_never_run_exits_1(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:

@@ -221,3 +221,98 @@ def test_jsonl_sink_close_is_noop() -> None:
     """JsonlSink.close() does nothing."""
     sink = sinks.JsonlSink(callback=lambda _: None)
     sink.close()  # Should not raise
+
+
+# =============================================================================
+# WatchSink Tests
+# =============================================================================
+
+
+def test_watch_sink_handles_engine_state_active() -> None:
+    """WatchSink sends detecting message when engine becomes active."""
+    tui_queue: TuiQueue = queue.Queue()
+    sink = sinks.WatchSink(tui_queue=tui_queue)
+
+    event: types.EngineStateChanged = {
+        "type": "engine_state_changed",
+        "state": types.EngineState.ACTIVE,
+    }
+    sink.handle(event)
+
+    msg = tui_queue.get_nowait()
+    assert msg is not None
+    assert msg["type"] == TuiMessageType.WATCH
+    assert msg["status"].value == "detecting"
+    assert "Running" in msg["message"]
+
+
+def test_watch_sink_handles_engine_state_idle() -> None:
+    """WatchSink sends waiting message when engine becomes idle."""
+    tui_queue: TuiQueue = queue.Queue()
+    sink = sinks.WatchSink(tui_queue=tui_queue)
+
+    event: types.EngineStateChanged = {
+        "type": "engine_state_changed",
+        "state": types.EngineState.IDLE,
+    }
+    sink.handle(event)
+
+    msg = tui_queue.get_nowait()
+    assert msg is not None
+    assert msg["type"] == TuiMessageType.WATCH
+    assert msg["status"].value == "waiting"
+    assert "Watching" in msg["message"]
+
+
+def test_watch_sink_handles_pipeline_reloaded_error() -> None:
+    """WatchSink sends error message when pipeline reload fails."""
+    tui_queue: TuiQueue = queue.Queue()
+    sink = sinks.WatchSink(tui_queue=tui_queue)
+
+    event: types.PipelineReloaded = {
+        "type": "pipeline_reloaded",
+        "stages_added": [],
+        "stages_removed": [],
+        "stages_modified": [],
+        "error": "Syntax error in stages.py",
+    }
+    sink.handle(event)
+
+    msg = tui_queue.get_nowait()
+    assert msg is not None
+    assert msg["type"] == TuiMessageType.WATCH
+    assert msg["status"].value == "error"
+    assert "Syntax error" in msg["message"]
+
+
+def test_watch_sink_handles_pipeline_reloaded_success() -> None:
+    """WatchSink sends restart and reload messages when pipeline reload succeeds."""
+    tui_queue: TuiQueue = queue.Queue()
+    sink = sinks.WatchSink(tui_queue=tui_queue)
+
+    event: types.PipelineReloaded = {
+        "type": "pipeline_reloaded",
+        "stages_added": ["new_stage"],
+        "stages_removed": [],
+        "stages_modified": [],
+        "error": None,
+    }
+    sink.handle(event)
+
+    # First message should be restarting status
+    msg1 = tui_queue.get_nowait()
+    assert msg1 is not None
+    assert msg1["type"] == TuiMessageType.WATCH
+    assert msg1["status"].value == "restarting"
+
+    # Second message should be reload notification
+    msg2 = tui_queue.get_nowait()
+    assert msg2 is not None
+    assert msg2["type"] == TuiMessageType.RELOAD
+
+
+def test_watch_sink_close_is_noop() -> None:
+    """WatchSink.close() does nothing."""
+    tui_queue: TuiQueue = queue.Queue()
+    sink = sinks.WatchSink(tui_queue=tui_queue)
+    sink.close()  # Should not raise

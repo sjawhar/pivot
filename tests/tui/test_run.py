@@ -33,7 +33,7 @@ from pivot.types import (
 )
 
 if TYPE_CHECKING:
-    from pivot.watch.engine import WatchEngine
+    from pivot.engine.engine import Engine
 
 # =============================================================================
 # Output TypedDicts for annotation-based stages
@@ -516,7 +516,7 @@ def test_status_functions_return_non_empty() -> None:
     ],
 )
 def test_watch_tui_app_init_no_commit(
-    mock_watch_engine: WatchEngine, no_commit: bool, expected: bool
+    mock_watch_engine: Engine, no_commit: bool, expected: bool
 ) -> None:
     """PivotApp (watch mode) initializes no_commit correctly."""
     # TUI queue uses stdlib queue.Queue (inter-thread, not cross-process)

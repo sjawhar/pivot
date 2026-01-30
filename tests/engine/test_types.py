@@ -196,6 +196,20 @@ def test_log_line_event() -> None:
     assert event_err["is_stderr"] is True
 
 
+def test_stage_state_changed_event() -> None:
+    """StageStateChanged event has required fields."""
+    event: types.StageStateChanged = {
+        "type": "stage_state_changed",
+        "stage": "train",
+        "state": types.StageExecutionState.RUNNING,
+        "previous_state": types.StageExecutionState.PREPARING,
+    }
+    assert event["type"] == "stage_state_changed"
+    assert event["stage"] == "train"
+    assert event["state"] == types.StageExecutionState.RUNNING
+    assert event["previous_state"] == types.StageExecutionState.PREPARING
+
+
 def test_output_event_union() -> None:
     """OutputEvent is a union of all output event types."""
     events: list[types.OutputEvent] = [
@@ -217,9 +231,15 @@ def test_output_event_union() -> None:
             "index": 1,
             "total": 1,
         },
+        {
+            "type": "stage_state_changed",
+            "stage": "x",
+            "state": types.StageExecutionState.RUNNING,
+            "previous_state": types.StageExecutionState.PREPARING,
+        },
         {"type": "log_line", "stage": "x", "line": "", "is_stderr": False},
     ]
-    assert len(events) == 5
+    assert len(events) == 6
 
 
 def test_event_source_protocol() -> None:

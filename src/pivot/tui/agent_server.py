@@ -22,7 +22,7 @@ from pivot.types import (
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from pivot.watch.engine import WatchEngine
+    from pivot.engine.engine import Engine
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +49,7 @@ def _make_error(code: int, message: str, data: dict[str, Any] | None = None) -> 
 
 
 def _make_response(
-    req_id: int | str | None, result: Any = None, error: dict[str, Any] | None = None
+    req_id: int | str | None, result: object = None, error: dict[str, Any] | None = None
 ) -> dict[str, Any]:
     """Create JSON-RPC response object."""
     response: dict[str, Any] = {"jsonrpc": "2.0", "id": req_id}
@@ -63,14 +63,14 @@ def _make_response(
 class AgentServer:
     """JSON-RPC server for agent control of pipeline execution.
 
-    This is a stateless RPC facade - all execution state is managed by WatchEngine.
+    This is a stateless RPC facade - all execution state is managed by Engine.
     """
 
-    _engine: WatchEngine
+    _engine: Engine
     _socket_path: Path
     _connected_clients: int
 
-    def __init__(self, engine: WatchEngine, socket_path: Path) -> None:
+    def __init__(self, engine: Engine, socket_path: Path) -> None:
         self._engine = engine
         self._socket_path = socket_path
         self._server: asyncio.Server | None = None
@@ -258,7 +258,6 @@ class AgentServer:
 
     async def _handle_run(self, params: AgentRunParams) -> AgentRunStartResult:
         """Handle run() RPC method."""
-        # Validate stages if provided
         stages = params["stages"] if "stages" in params else None
         if stages:
             all_stages = set(registry.REGISTRY.list_stages())
@@ -267,31 +266,31 @@ class AgentServer:
                     suggestions = difflib.get_close_matches(stage, all_stages, n=3, cutoff=0.6)
                     raise _StageNotFoundError(stage, suggestions)
 
-        # Generate run_id and delegate to engine (atomic check-and-set)
-        # Use 12 chars for ~48 bits of entropy (avoids birthday paradox collisions)
         run_id = str(uuid.uuid4())[:12]
         force = params["force"] if "force" in params else False
 
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(
             None,
-            self._engine.try_start_agent_run,
+            self._engine.try_start_run,
             run_id,
             stages,
             force,
         )
 
-        # Check for rejection (typed result instead of None)
         if "reason" in result:
-            logger.debug(f"Run {run_id} rejected: {result['reason']}")
             raise _ExecutionInProgressError
 
         return result
 
     async def _handle_status(self, params: dict[str, Any]) -> AgentStatusResult:
-        """Handle status() RPC method."""
+        """Handle status() RPC method.
+
+        Uses run_in_executor to avoid blocking the event loop on lock acquisition.
+        """
         run_id = params["run_id"] if "run_id" in params else None
-        return self._engine.get_agent_status(run_id)
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._engine.get_execution_status, run_id)
 
     async def _handle_stages(self) -> AgentStagesResult:
         """Handle stages() RPC method."""
@@ -309,8 +308,12 @@ class AgentServer:
         return AgentStagesResult(stages=stages)
 
     async def _handle_cancel(self) -> AgentCancelResult:
-        """Handle cancel() RPC method."""
-        return self._engine.request_agent_cancel()
+        """Handle cancel() RPC method.
+
+        Uses run_in_executor to avoid blocking the event loop on lock acquisition.
+        """
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._engine.request_cancel)
 
 
 class _ExecutionInProgressError(Exception):

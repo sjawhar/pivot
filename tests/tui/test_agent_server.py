@@ -55,10 +55,10 @@ def _helper_run_noop() -> None:
 
 @pytest.fixture
 def mock_engine() -> MagicMock:
-    """Create a mock WatchEngine for testing."""
-    engine = MagicMock(spec=["try_start_agent_run", "get_agent_status", "request_agent_cancel"])
-    engine.get_agent_status.return_value = AgentStatusResult(state=AgentState.IDLE)
-    engine.request_agent_cancel.return_value = AgentCancelResult(cancelled=False)
+    """Create a mock Engine for testing."""
+    engine = MagicMock(spec=["try_start_run", "get_execution_status", "request_cancel"])
+    engine.get_execution_status.return_value = AgentStatusResult(state=AgentState.IDLE)
+    engine.request_cancel.return_value = AgentCancelResult(cancelled=False)
     return engine
 
 
@@ -203,7 +203,7 @@ async def test_dispatch_status(mock_engine: MagicMock, socket_path: Path) -> Non
 
     assert response is not None
     assert response["result"]["state"] == "idle"
-    mock_engine.get_agent_status.assert_called_once()
+    mock_engine.get_execution_status.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -216,7 +216,7 @@ async def test_dispatch_cancel(mock_engine: MagicMock, socket_path: Path) -> Non
 
     assert response is not None
     assert response["result"]["cancelled"] is False
-    mock_engine.request_agent_cancel.assert_called_once()
+    mock_engine.request_cancel.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -250,13 +250,13 @@ async def test_dispatch_stages_returns_registered_stages(
 
 @pytest.mark.asyncio
 async def test_dispatch_run_queues_execution(mock_engine: MagicMock, socket_path: Path) -> None:
-    """Test run() queues execution request to engine via try_start_agent_run."""
+    """Test run() queues execution request to engine via try_start_run."""
 
     # Register a test stage (clean_registry autouse fixture handles cleanup)
     register_test_stage(_helper_run_noop, name="run_test")
 
-    # Mock try_start_agent_run to return success
-    mock_engine.try_start_agent_run.return_value = AgentRunStartResult(
+    # Mock try_start_run to return success
+    mock_engine.try_start_run.return_value = AgentRunStartResult(
         run_id="test123",
         status="started",
         stages_queued=["run_test"],
@@ -272,9 +272,9 @@ async def test_dispatch_run_queues_execution(mock_engine: MagicMock, socket_path
     assert response["result"]["status"] == "started"
     assert response["result"]["run_id"] == "test123"
     assert response["result"]["stages_queued"] == ["run_test"]
-    mock_engine.try_start_agent_run.assert_called_once()
+    mock_engine.try_start_run.assert_called_once()
     # Verify the call args - run_id is generated, stages passed, force=False
-    call_args = mock_engine.try_start_agent_run.call_args
+    call_args = mock_engine.try_start_run.call_args
     assert call_args[0][1] == ["run_test"]  # stages
     assert call_args[0][2] is False  # force
 
@@ -300,8 +300,8 @@ async def test_dispatch_run_while_running_returns_error(
     mock_engine: MagicMock, socket_path: Path
 ) -> None:
     """Test run() while execution in progress returns error."""
-    # Mock try_start_agent_run to return rejection (engine is already running)
-    mock_engine.try_start_agent_run.return_value = AgentRunRejection(
+    # Mock try_start_run to return rejection (engine is already running)
+    mock_engine.try_start_run.return_value = AgentRunRejection(
         reason="not_ready",
         current_state="running",
     )

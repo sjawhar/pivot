@@ -171,6 +171,10 @@ def execute_stage(
     state_db_path = stage_info["state_dir"] / "state.db"
     project_root = stage_info["project_root"]
 
+    # Set project root cache explicitly - workers in reusable pool may have
+    # stale cache from previous execution in different project/test.
+    project._project_root_cache = project_root  # pyright: ignore[reportPrivateUsage]
+
     # Ensure worker has correct cwd for this stage (workers in reusable pool
     # may have stale cwd from previous execution in different project).
     # _queue_logging captures log messages to the output queue (for TUI display).
