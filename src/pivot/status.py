@@ -33,6 +33,8 @@ from pivot.types import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     import pygtrie
     from networkx import DiGraph
 
@@ -248,39 +250,54 @@ def _explanations_to_status(explanations: list[StageExplanation]) -> list[Pipeli
     ]
 
 
-def get_tracked_files_status(project_root: pathlib.Path) -> list[TrackedFileInfo]:
-    """Get status for all tracked files."""
+def get_tracked_files_status(
+    project_root: pathlib.Path,
+    on_progress: Callable[[int, int], None] | None = None,
+) -> list[TrackedFileInfo]:
+    """Get status for all tracked files.
+
+    Args:
+        project_root: Project root directory.
+        on_progress: Optional callback called with (completed, total) after each file.
+    """
     tracked = track.discover_pvt_files(project_root)
+    total = len(tracked)
     results = list[TrackedFileInfo]()
 
-    for abs_path_str, track_data in sorted(tracked.items()):
-        path = pathlib.Path(abs_path_str)
-        rel_path = str(path.relative_to(project_root))
+    # Use state_db for hash caching (mtime-based)
+    with state_mod.StateDB(config.get_state_db_path()) as state_db:
+        for i, (abs_path_str, track_data) in enumerate(sorted(tracked.items()), 1):
+            path = pathlib.Path(abs_path_str)
+            rel_path = str(path.relative_to(project_root))
 
-        try:
-            if path.is_dir():
-                current_hash, _ = cache.hash_directory(path)
-            else:
-                current_hash = cache.hash_file(path)
-        except FileNotFoundError:
+            try:
+                if path.is_dir():
+                    current_hash, _ = cache.hash_directory(path, state_db)
+                else:
+                    current_hash = cache.hash_file(path, state_db)
+            except FileNotFoundError:
+                results.append(
+                    TrackedFileInfo(
+                        path=rel_path, status=TrackedFileStatus.MISSING, size=track_data["size"]
+                    )
+                )
+                if on_progress is not None:
+                    on_progress(i, total)
+                continue
+
             results.append(
                 TrackedFileInfo(
-                    path=rel_path, status=TrackedFileStatus.MISSING, size=track_data["size"]
+                    path=rel_path,
+                    status=(
+                        TrackedFileStatus.MODIFIED
+                        if current_hash != track_data["hash"]
+                        else TrackedFileStatus.CLEAN
+                    ),
+                    size=track_data["size"],
                 )
             )
-            continue
-
-        results.append(
-            TrackedFileInfo(
-                path=rel_path,
-                status=(
-                    TrackedFileStatus.MODIFIED
-                    if current_hash != track_data["hash"]
-                    else TrackedFileStatus.CLEAN
-                ),
-                size=track_data["size"],
-            )
-        )
+            if on_progress is not None:
+                on_progress(i, total)
 
     return results
 

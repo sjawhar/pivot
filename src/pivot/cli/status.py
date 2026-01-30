@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import pathlib
+import sys
 
 import click
+import tqdm
 
 from pivot import config, exceptions, project
 from pivot import status as status_mod
@@ -79,7 +81,29 @@ def status(
             pipeline_status, _ = status_mod.get_pipeline_status(stages_list, single_stage=False)
 
     if show_tracked:
-        tracked_status = status_mod.get_tracked_files_status(project_root)
+        # Show progress bar only on TTY and not in quiet/JSON mode
+        use_progress = sys.stderr.isatty() and not quiet and not output_json
+        pbar: tqdm.tqdm[None] | None = (
+            tqdm.tqdm(
+                total=None, desc="Checking tracked files", file=sys.stderr, dynamic_ncols=True
+            )
+            if use_progress
+            else None
+        )
+
+        def on_progress(_completed: int, total: int) -> None:
+            if pbar is None:
+                return
+            if pbar.total is None:
+                pbar.total = total
+                pbar.refresh()
+            pbar.update(1)
+
+        try:
+            tracked_status = status_mod.get_tracked_files_status(project_root, on_progress)
+        finally:
+            if pbar is not None:
+                pbar.close()
 
     if show_remote:
         try:
