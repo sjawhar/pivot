@@ -3,9 +3,11 @@ from __future__ import annotations
 import abc
 import dataclasses
 import json
+import os
 import pathlib
 import pickle
-from typing import TYPE_CHECKING, Literal, override
+import tempfile
+from typing import TYPE_CHECKING, Any, Literal, override
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -134,6 +136,118 @@ class YAML[T](Loader[T]):
     @override
     def empty(self) -> T:
         return self.empty_factory()
+
+
+@dataclasses.dataclass(frozen=True)
+class Text(Loader[str]):
+    """Plain text file loader.
+
+    Saves atomically via temp file + rename to prevent corruption.
+    """
+
+    @override
+    def load(self, path: pathlib.Path) -> str:
+        return path.read_text()
+
+    @override
+    def save(self, data: str, path: pathlib.Path) -> None:
+        if not isinstance(data, str):  # pyright: ignore[reportUnnecessaryIsInstance] - runtime validation for misuse
+            raise TypeError(f"Text save expects str, got {type(data).__name__}")  # pyright: ignore[reportUnreachable]
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        fd, tmp_path_str = tempfile.mkstemp(dir=path.parent, suffix=".txt.tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(data)
+            os.rename(tmp_path_str, path)
+        except Exception:
+            tmp_path = pathlib.Path(tmp_path_str)
+            if tmp_path.exists():
+                tmp_path.unlink()
+            raise
+
+    @override
+    def empty(self) -> str:
+        return ""
+
+
+@dataclasses.dataclass(frozen=True)
+class JSONL(Loader[list[dict[str, Any]]]):
+    """JSONL (JSON Lines) file loader - one JSON object per line.
+
+    Saves atomically via temp file + rename. Reports line numbers on parse errors.
+    """
+
+    @override
+    def load(self, path: pathlib.Path) -> list[dict[str, Any]]:
+        results = list[dict[str, Any]]()
+        with path.open() as f:
+            for line_num, line in enumerate(f, 1):
+                if line.strip():
+                    try:
+                        results.append(json.loads(line))
+                    except json.JSONDecodeError as e:
+                        raise ValueError(f"Invalid JSON at {path}:{line_num}: {e}") from e
+        return results
+
+    @override
+    def save(self, data: list[dict[str, Any]], path: pathlib.Path) -> None:
+        if not isinstance(data, list):  # pyright: ignore[reportUnnecessaryIsInstance] - runtime validation for misuse
+            raise TypeError(f"JSONL save expects list, got {type(data).__name__}")  # pyright: ignore[reportUnreachable]
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        fd, tmp_path_str = tempfile.mkstemp(dir=path.parent, suffix=".jsonl.tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                for item in data:
+                    f.write(json.dumps(item) + "\n")
+            os.rename(tmp_path_str, path)
+        except Exception:
+            tmp_path = pathlib.Path(tmp_path_str)
+            if tmp_path.exists():
+                tmp_path.unlink()
+            raise
+
+    @override
+    def empty(self) -> list[dict[str, Any]]:
+        return []
+
+
+@dataclasses.dataclass(frozen=True)
+class DataFrameJSONL(Loader[pandas.DataFrame]):
+    """JSONL (JSON Lines) file loader that returns a pandas DataFrame.
+
+    Uses pandas.read_json with lines=True for efficient loading.
+    Saves atomically via temp file + rename.
+    """
+
+    @override
+    def load(self, path: pathlib.Path) -> pandas.DataFrame:
+        return pandas.read_json(path, lines=True, orient="records", convert_dates=False)
+
+    @override
+    def save(self, data: pandas.DataFrame, path: pathlib.Path) -> None:
+        if not isinstance(data, pandas.DataFrame):  # pyright: ignore[reportUnnecessaryIsInstance] - runtime validation for misuse
+            raise TypeError(f"DataFrameJSONL save expects DataFrame, got {type(data).__name__}")  # pyright: ignore[reportUnreachable]
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        fd, tmp_path_str = tempfile.mkstemp(dir=path.parent, suffix=".jsonl.tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                data.to_json(f, lines=True, orient="records")
+            os.rename(tmp_path_str, path)
+        except Exception:
+            tmp_path = pathlib.Path(tmp_path_str)
+            if tmp_path.exists():
+                tmp_path.unlink()
+            raise
+
+    @override
+    def empty(self) -> pandas.DataFrame:
+        return pandas.DataFrame()
 
 
 @dataclasses.dataclass(frozen=True)
