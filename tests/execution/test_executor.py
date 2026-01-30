@@ -263,8 +263,8 @@ def _real_stage(
 def _check_lock(
     input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
 ) -> _OutputTxt:
-    cache_dir = pathlib.Path(".pivot") / "cache"
-    lock_existed = (cache_dir / "check_lock.running").exists()
+    stages_dir = pathlib.Path(".pivot") / "stages"
+    lock_existed = (stages_dir / "check_lock.running").exists()
     pathlib.Path("lock_existed.txt").write_text("yes" if lock_existed else "no")
     pathlib.Path("output.txt").write_text("done")
     return {"output": pathlib.Path("output.txt")}
@@ -1096,10 +1096,11 @@ def test_nonexistent_stage_raises_error(pipeline_dir: pathlib.Path) -> None:
     assert "nonexistent_stage" in str(exc_info.value)
 
 
-def test_execution_lock_created_and_removed(pipeline_dir: pathlib.Path) -> None:
+def test_execution_lock_created_and_removed(
+    pipeline_dir: pathlib.Path, stages_dir: pathlib.Path
+) -> None:
     """Execution lock file is created during run and removed after."""
     (pipeline_dir / "input.txt").write_text("hello")
-    cache_dir = pipeline_dir / ".pivot" / "cache"
 
     register_test_stage(_check_lock, name="check_lock")
 
@@ -1107,13 +1108,14 @@ def test_execution_lock_created_and_removed(pipeline_dir: pathlib.Path) -> None:
 
     lock_check_file = pipeline_dir / "lock_existed.txt"
     assert lock_check_file.read_text() == "yes", "Lock file should exist during stage execution"
-    assert not (cache_dir / "check_lock.running").exists(), "Lock file should be removed after"
+    assert not (stages_dir / "check_lock.running").exists(), "Lock file should be removed after"
 
 
-def test_execution_lock_removed_on_stage_failure(pipeline_dir: pathlib.Path) -> None:
+def test_execution_lock_removed_on_stage_failure(
+    pipeline_dir: pathlib.Path, stages_dir: pathlib.Path
+) -> None:
     """Execution lock is released even if stage raises an exception."""
     (pipeline_dir / "input.txt").write_text("hello")
-    cache_dir = pipeline_dir / ".pivot" / "cache"
 
     register_test_stage(_failing_stage, name="failing_stage")
 
@@ -1122,18 +1124,17 @@ def test_execution_lock_removed_on_stage_failure(pipeline_dir: pathlib.Path) -> 
 
     assert results["failing_stage"]["status"] == "failed"
     assert "Stage failed!" in results["failing_stage"]["reason"]
-    assert not (cache_dir / "failing_stage.running").exists(), "Lock should be released on failure"
+    assert not (stages_dir / "failing_stage.running").exists(), "Lock should be released on failure"
 
 
-def test_stale_lock_from_dead_process_is_broken(pipeline_dir: pathlib.Path) -> None:
+def test_stale_lock_from_dead_process_is_broken(
+    pipeline_dir: pathlib.Path, stages_dir: pathlib.Path
+) -> None:
     """Stale lock file from crashed process is automatically removed."""
-
     (pipeline_dir / "input.txt").write_text("hello")
-    cache_dir = pipeline_dir / ".pivot" / "cache"
-    cache_dir.mkdir(parents=True, exist_ok=True)
 
     # Create a stale lock with a non-existent PID
-    stale_lock = cache_dir / "process.running"
+    stale_lock = stages_dir / "process.running"
     stale_lock.write_text("999999999")  # PID that doesn't exist
 
     register_test_stage(_process_basic, name="process")
@@ -1145,14 +1146,14 @@ def test_stale_lock_from_dead_process_is_broken(pipeline_dir: pathlib.Path) -> N
     assert not stale_lock.exists(), "Stale lock should be removed"
 
 
-def test_concurrent_execution_returns_failed_status(pipeline_dir: pathlib.Path) -> None:
+def test_concurrent_execution_returns_failed_status(
+    pipeline_dir: pathlib.Path, stages_dir: pathlib.Path
+) -> None:
     """Running stage that's already running returns failed status."""
     (pipeline_dir / "input.txt").write_text("hello")
-    cache_dir = pipeline_dir / ".pivot" / "cache"
-    cache_dir.mkdir(parents=True, exist_ok=True)
 
     # Create a lock with our own PID (simulating concurrent run)
-    active_lock = cache_dir / "process.running"
+    active_lock = stages_dir / "process.running"
     active_lock.write_text(str(os.getpid()))
 
     register_test_stage(_process_basic, name="process")
@@ -1168,14 +1169,14 @@ def test_concurrent_execution_returns_failed_status(pipeline_dir: pathlib.Path) 
     active_lock.unlink()
 
 
-def test_corrupted_lock_file_is_broken(pipeline_dir: pathlib.Path) -> None:
+def test_corrupted_lock_file_is_broken(
+    pipeline_dir: pathlib.Path, stages_dir: pathlib.Path
+) -> None:
     """Corrupted lock file (invalid content) is treated as stale and removed."""
     (pipeline_dir / "input.txt").write_text("hello")
-    cache_dir = pipeline_dir / ".pivot" / "cache"
-    cache_dir.mkdir(parents=True, exist_ok=True)
 
     # Create a corrupted lock file
-    corrupted_lock = cache_dir / "process.running"
+    corrupted_lock = stages_dir / "process.running"
     corrupted_lock.write_text("garbage content without pid")
 
     register_test_stage(_process_basic, name="process")
@@ -1187,14 +1188,14 @@ def test_corrupted_lock_file_is_broken(pipeline_dir: pathlib.Path) -> None:
     assert not corrupted_lock.exists(), "Corrupted lock should be removed"
 
 
-def test_negative_pid_in_lock_is_treated_as_stale(pipeline_dir: pathlib.Path) -> None:
+def test_negative_pid_in_lock_is_treated_as_stale(
+    pipeline_dir: pathlib.Path, stages_dir: pathlib.Path
+) -> None:
     """Lock file with invalid PID (negative) is treated as stale."""
     (pipeline_dir / "input.txt").write_text("hello")
-    cache_dir = pipeline_dir / ".pivot" / "cache"
-    cache_dir.mkdir(parents=True, exist_ok=True)
 
     # Create a lock with invalid PID
-    invalid_lock = cache_dir / "process.running"
+    invalid_lock = stages_dir / "process.running"
     invalid_lock.write_text("-1")
 
     register_test_stage(_process_basic, name="process")
@@ -1618,14 +1619,14 @@ def test_stage_partial_line_output_captured(pipeline_dir: pathlib.Path) -> None:
 # =============================================================================
 
 
-def test_lock_retry_exhaustion_returns_failed(pipeline_dir: pathlib.Path) -> None:
+def test_lock_retry_exhaustion_returns_failed(
+    pipeline_dir: pathlib.Path, stages_dir: pathlib.Path
+) -> None:
     """Multiple failed lock attempts return failed status."""
     (pipeline_dir / "input.txt").write_text("data")
-    cache_dir = pipeline_dir / ".pivot" / "cache"
-    cache_dir.mkdir(parents=True)
 
     # Create a lock with our own PID (simulates live concurrent run)
-    lock_file = cache_dir / "process.running"
+    lock_file = stages_dir / "process.running"
     lock_file.write_text(str(os.getpid()))
 
     register_test_stage(_process_basic, name="process")

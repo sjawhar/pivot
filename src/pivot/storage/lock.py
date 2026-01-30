@@ -260,19 +260,19 @@ _MAX_LOCK_ATTEMPTS = 3
 
 
 @contextlib.contextmanager
-def execution_lock(stage_name: str, cache_dir: Path) -> Generator[Path]:
+def execution_lock(stage_name: str, stages_dir: Path) -> Generator[Path]:
     """Context manager for stage execution lock.
 
     Acquires an exclusive lock before yielding, releases on exit.
     """
-    sentinel = acquire_execution_lock(stage_name, cache_dir)
+    sentinel = acquire_execution_lock(stage_name, stages_dir)
     try:
         yield sentinel
     finally:
         sentinel.unlink(missing_ok=True)
 
 
-def acquire_execution_lock(stage_name: str, cache_dir: Path) -> Path:
+def acquire_execution_lock(stage_name: str, stages_dir: Path) -> Path:
     """Acquire exclusive lock for stage execution. Returns sentinel path.
 
     Flow:
@@ -328,8 +328,8 @@ def acquire_execution_lock(stage_name: str, cache_dir: Path) -> Path:
                                                     │ "after 3 attempts" │
                                                     └────────────────────┘
     """
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    sentinel = cache_dir / f"{stage_name}.running"
+    stages_dir.mkdir(parents=True, exist_ok=True)
+    sentinel = stages_dir / f"{stage_name}.running"
 
     for _ in range(_MAX_LOCK_ATTEMPTS):
         # Fast path: try atomic create
