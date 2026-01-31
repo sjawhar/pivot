@@ -456,7 +456,7 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
         """Run the watch engine (watch mode, background thread)."""
         try:
             if self._engine:
-                self._engine.run_loop()
+                self._engine.run(exit_on_completion=False)
         except Exception as e:
             _logger.exception(f"Watch engine failed: {e}")
             error_msg = TuiWatchMessage(

@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import logging
 import threading
-from pathlib import Path as PathClass
 from typing import TYPE_CHECKING
 
 import watchfiles
 
 from pivot.engine.types import CodeOrConfigChanged, DataArtifactChanged, RunRequested
+from pivot.types import OnError
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -35,8 +35,13 @@ _CONFIG_FILE_NAMES = (
 
 def _is_code_or_config(path: str) -> bool:
     """Check if a path is a code or config file."""
-    p = PathClass(path)
-    return p.suffix in _CODE_FILE_SUFFIXES or p.name in _CONFIG_FILE_NAMES
+    # Use string operations to avoid Path object overhead
+    if path.endswith(_CODE_FILE_SUFFIXES):
+        return True
+    # Extract filename from path (everything after last /)
+    slash_idx = path.rfind("/")
+    name = path[slash_idx + 1 :] if slash_idx >= 0 else path
+    return name in _CONFIG_FILE_NAMES
 
 
 class FilesystemSource:
@@ -172,6 +177,15 @@ class OneShotSource:
     _stages: list[str] | None
     _force: bool
     _reason: str
+    _single_stage: bool
+    _parallel: bool
+    _max_workers: int | None
+    _no_commit: bool
+    _no_cache: bool
+    _on_error: OnError
+    _cache_dir: Path | None
+    _allow_uncached_incremental: bool
+    _checkout_missing: bool
     _emitted: bool
 
     def __init__(
@@ -179,6 +193,16 @@ class OneShotSource:
         stages: list[str] | None,
         force: bool,
         reason: str,
+        *,
+        single_stage: bool = False,
+        parallel: bool = True,
+        max_workers: int | None = None,
+        no_commit: bool = False,
+        no_cache: bool = False,
+        on_error: OnError = OnError.FAIL,
+        cache_dir: Path | None = None,
+        allow_uncached_incremental: bool = False,
+        checkout_missing: bool = False,
     ) -> None:
         """Initialize with run parameters.
 
@@ -186,10 +210,28 @@ class OneShotSource:
             stages: Stage names to run (None = all stages).
             force: If True, ignore cache and re-run.
             reason: Description of why this run was requested.
+            single_stage: If True, run only the specified stages.
+            parallel: If True, run stages in parallel.
+            max_workers: Maximum worker processes.
+            no_commit: If True, don't update lockfiles.
+            no_cache: If True, disable run cache.
+            on_error: Error handling mode.
+            cache_dir: Directory for lock files.
+            allow_uncached_incremental: Allow incremental outputs without cache.
+            checkout_missing: Checkout missing dependency files from cache.
         """
         self._stages = stages
         self._force = force
         self._reason = reason
+        self._single_stage = single_stage
+        self._parallel = parallel
+        self._max_workers = max_workers
+        self._no_commit = no_commit
+        self._no_cache = no_cache
+        self._on_error = on_error
+        self._cache_dir = cache_dir
+        self._allow_uncached_incremental = allow_uncached_incremental
+        self._checkout_missing = checkout_missing
         self._emitted = False
 
     def start(self, submit: Callable[[InputEvent], None]) -> None:
@@ -202,6 +244,15 @@ class OneShotSource:
             stages=self._stages,
             force=self._force,
             reason=self._reason,
+            single_stage=self._single_stage,
+            parallel=self._parallel,
+            max_workers=self._max_workers,
+            no_commit=self._no_commit,
+            no_cache=self._no_cache,
+            on_error=self._on_error,
+            cache_dir=self._cache_dir,
+            allow_uncached_incremental=self._allow_uncached_incremental,
+            checkout_missing=self._checkout_missing,
         )
         submit(event)
         self._emitted = True

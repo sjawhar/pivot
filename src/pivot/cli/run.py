@@ -5,8 +5,11 @@ import datetime
 import json
 import logging
 import pathlib
+import queue as thread_queue
 import sys
+import threading
 import time
+import uuid
 from typing import TYPE_CHECKING, TypedDict
 
 import click
@@ -16,6 +19,7 @@ from pivot.cli import completion
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
 from pivot.engine import engine, sinks
+from pivot.engine import sources as engine_sources
 from pivot.executor import prepare_workers
 from pivot.types import (
     ExecutionResultEvent,
@@ -23,14 +27,418 @@ from pivot.types import (
     RunEventType,
     SchemaVersionEvent,
     StageStatus,
+    TuiMessage,
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Generator
+    from collections.abc import Callable, Generator
 
     import networkx as nx
 
     from pivot.executor import ExecutionSummary
+    from pivot.tui import console as tui_console
+    from pivot.types import TuiQueue
+
+
+def _configure_result_collector(eng: engine.Engine) -> sinks.ResultCollectorSink:
+    """Add ResultCollectorSink to collect execution results."""
+    result_sink = sinks.ResultCollectorSink()
+    eng.add_sink(result_sink)
+    return result_sink
+
+
+def _configure_output_sink(
+    eng: engine.Engine,
+    *,
+    quiet: bool,
+    as_json: bool,
+    tui: bool,
+    tui_queue: TuiQueue | None,
+    run_id: str | None,
+    console: tui_console.Console | None,
+    jsonl_callback: Callable[[dict[str, object]], None] | None,
+    watch: bool,
+) -> None:
+    """Configure output sinks based on display mode."""
+    if quiet:
+        return
+
+    if as_json and jsonl_callback:
+        eng.add_sink(sinks.JsonlSink(callback=jsonl_callback))
+    elif tui and tui_queue and run_id:
+        eng.add_sink(sinks.TuiSink(tui_queue=tui_queue, run_id=run_id))
+        if watch:
+            eng.add_sink(sinks.WatchSink(tui_queue=tui_queue))
+    elif console:
+        eng.add_sink(sinks.ConsoleSink(console))
+
+
+def _configure_watch_sources(
+    eng: engine.Engine,
+    watch_paths: list[pathlib.Path],
+    debounce: int,
+    *,
+    force: bool,
+    stages: list[str] | None,
+) -> None:
+    """Configure sources for watch mode."""
+    eng.add_source(engine_sources.FilesystemSource(watch_paths, debounce=debounce))
+    if force:
+        eng.add_source(
+            engine_sources.OneShotSource(
+                stages=stages,
+                force=True,
+                reason="watch:initial:forced",
+            )
+        )
+
+
+def _configure_oneshot_source(
+    eng: engine.Engine,
+    stages: list[str] | None,
+    *,
+    force: bool,
+    single_stage: bool,
+    no_commit: bool,
+    no_cache: bool,
+    on_error: OnError,
+    allow_uncached_incremental: bool,
+    checkout_missing: bool,
+) -> None:
+    """Configure OneShotSource for non-watch mode."""
+    eng.add_source(
+        engine_sources.OneShotSource(
+            stages=stages,
+            force=force,
+            reason="cli",
+            single_stage=single_stage,
+            no_commit=no_commit,
+            no_cache=no_cache,
+            on_error=on_error,
+            allow_uncached_incremental=allow_uncached_incremental,
+            checkout_missing=checkout_missing,
+        )
+    )
+
+
+def _run_pipeline(
+    stages_list: list[str] | None,
+    *,
+    watch: bool,
+    single_stage: bool,
+    force: bool,
+    quiet: bool,
+    tui: bool,
+    as_json: bool,
+    debounce: int,
+    tui_log: pathlib.Path | None,
+    no_commit: bool,
+    no_cache: bool,
+    on_error: OnError,
+    serve: bool,
+    allow_uncached_incremental: bool,
+    checkout_missing: bool,
+) -> dict[str, ExecutionSummary] | None:
+    """Run pipeline with unified watch/non-watch execution.
+
+    Returns execution results for non-watch mode, None for watch mode.
+    """
+    from pivot import dag
+    from pivot.tui import console as tui_console
+
+    # Emit schema version early for JSONL mode (even if no stages to run)
+    if as_json:
+        cli_helpers.emit_jsonl(
+            SchemaVersionEvent(type=RunEventType.SCHEMA_VERSION, version=_JSONL_SCHEMA_VERSION)
+        )
+
+    # Build DAG and get execution order for TUI display and worker pre-warming
+    graph = registry.REGISTRY.build_dag(validate=True)
+    execution_order = dag.get_execution_order(graph, stages_list, single_stage=single_stage)
+
+    if not execution_order and not watch:
+        # Emit execution result for JSONL mode
+        if as_json:
+            cli_helpers.emit_jsonl(
+                ExecutionResultEvent(
+                    type=RunEventType.EXECUTION_RESULT,
+                    ran=0,
+                    skipped=0,
+                    failed=0,
+                    total_duration_ms=0.0,
+                    timestamp=datetime.datetime.now(datetime.UTC).isoformat(),
+                )
+            )
+        return {}
+
+    # Pre-warm loky executor before starting Textual TUI
+    # Textual manipulates terminal file descriptors which breaks loky's
+    # resource tracker if spawned after Textual starts
+    num_workers = len(execution_order) if execution_order else 1
+    if tui:
+        prepare_workers(num_workers)
+
+    # Set up TUI queue and run_id if using TUI
+    tui_queue: thread_queue.Queue[TuiMessage] | None = None
+    run_id: str | None = None
+    if tui:
+        tui_queue = thread_queue.Queue()
+        run_id = str(uuid.uuid4())[:8]
+
+    # Set up console for plain text output
+    console: tui_console.Console | None = None
+    if not quiet and not as_json and not tui:
+        console = tui_console.Console()
+
+    # Set up JSONL callback (schema version already emitted above)
+    jsonl_callback: Callable[[dict[str, object]], None] | None = None
+    if as_json:
+        jsonl_callback = cli_helpers.emit_jsonl
+
+    # Create cancel event for TUI mode
+    cancel_event = threading.Event() if tui else None
+
+    if watch:
+        return _run_watch_mode(
+            stages_list=stages_list,
+            execution_order=execution_order,
+            graph=graph,
+            quiet=quiet,
+            tui=tui,
+            as_json=as_json,
+            debounce=debounce,
+            tui_log=tui_log,
+            on_error=on_error,
+            serve=serve,
+            force=force,
+            tui_queue=tui_queue,
+            run_id=run_id,
+            console=console,
+            jsonl_callback=jsonl_callback,
+            cancel_event=cancel_event,
+            no_commit=no_commit,
+        )
+
+    return _run_oneshot_mode(
+        stages_list=stages_list,
+        execution_order=execution_order,
+        graph=graph,
+        quiet=quiet,
+        tui=tui,
+        as_json=as_json,
+        tui_log=tui_log,
+        force=force,
+        single_stage=single_stage,
+        no_commit=no_commit,
+        no_cache=no_cache,
+        on_error=on_error,
+        allow_uncached_incremental=allow_uncached_incremental,
+        checkout_missing=checkout_missing,
+        tui_queue=tui_queue,
+        run_id=run_id,
+        console=console,
+        jsonl_callback=jsonl_callback,
+        cancel_event=cancel_event,
+    )
+
+
+def _run_watch_mode(
+    stages_list: list[str] | None,
+    execution_order: list[str],
+    graph: nx.DiGraph[str],
+    *,
+    quiet: bool,
+    tui: bool,
+    as_json: bool,
+    debounce: int,
+    tui_log: pathlib.Path | None,
+    on_error: OnError,
+    serve: bool,
+    force: bool,
+    tui_queue: TuiQueue | None,
+    run_id: str | None,
+    console: tui_console.Console | None,
+    jsonl_callback: Callable[[dict[str, object]], None] | None,
+    cancel_event: threading.Event | None,
+    no_commit: bool,
+) -> None:
+    """Run watch mode with unified event-driven execution."""
+    from pivot.engine import graph as engine_graph
+    from pivot.tui import run as run_tui
+
+    # Build bipartite graph for watch paths
+    all_stages = {name: registry.REGISTRY.get(name) for name in registry.REGISTRY.list_stages()}
+    bipartite_graph = engine_graph.build_graph(all_stages)
+    watch_paths = engine_graph.get_watch_paths(bipartite_graph)
+
+    # Sort for display: group matrix variants together while preserving DAG structure
+    display_order = _sort_for_display(execution_order, graph) if execution_order else None
+
+    with engine.Engine() as eng:
+        eng.set_keep_going(on_error == OnError.KEEP_GOING)
+
+        if cancel_event:
+            eng.set_cancel_event(cancel_event)
+
+        # Configure sinks
+        _configure_result_collector(eng)
+        _configure_output_sink(
+            eng,
+            quiet=quiet,
+            as_json=as_json,
+            tui=tui,
+            tui_queue=tui_queue,
+            run_id=run_id,
+            console=console,
+            jsonl_callback=jsonl_callback,
+            watch=True,
+        )
+
+        # Configure sources
+        _configure_watch_sources(eng, watch_paths, debounce, force=force, stages=stages_list)
+
+        if tui and tui_queue:
+            with _suppress_stderr_logging():
+                run_tui.run_watch_tui(
+                    eng,
+                    tui_queue,
+                    tui_log=tui_log,
+                    stage_names=display_order,
+                    no_commit=no_commit,
+                    serve=serve,
+                )
+        else:
+            try:
+                eng.run(exit_on_completion=False)
+            except KeyboardInterrupt:
+                pass  # Normal exit via Ctrl+C
+            finally:
+                eng.shutdown()
+
+    return None
+
+
+def _run_oneshot_mode(
+    stages_list: list[str] | None,
+    execution_order: list[str],
+    graph: nx.DiGraph[str],
+    *,
+    quiet: bool,
+    tui: bool,
+    as_json: bool,
+    tui_log: pathlib.Path | None,
+    force: bool,
+    single_stage: bool,
+    no_commit: bool,
+    no_cache: bool,
+    on_error: OnError,
+    allow_uncached_incremental: bool,
+    checkout_missing: bool,
+    tui_queue: TuiQueue | None,
+    run_id: str | None,
+    console: tui_console.Console | None,
+    jsonl_callback: Callable[[dict[str, object]], None] | None,
+    cancel_event: threading.Event | None,
+) -> dict[str, ExecutionSummary]:
+    """Run non-watch (one-shot) mode with unified event-driven execution."""
+    from pivot.executor import core as executor_core
+    from pivot.tui import run as run_tui
+
+    # TUI mode uses a thread to run executor
+    if tui and tui_queue and run_id:
+        # Sort for display
+        display_order = _sort_for_display(execution_order, graph)
+
+        def executor_func() -> dict[str, ExecutionSummary]:
+            with engine.Engine() as eng:
+                if cancel_event:
+                    eng.set_cancel_event(cancel_event)
+
+                result_sink = _configure_result_collector(eng)
+                _configure_output_sink(
+                    eng,
+                    quiet=quiet,
+                    as_json=as_json,
+                    tui=tui,
+                    tui_queue=tui_queue,
+                    run_id=run_id,
+                    console=console,
+                    jsonl_callback=jsonl_callback,
+                    watch=False,
+                )
+                _configure_oneshot_source(
+                    eng,
+                    stages_list,
+                    force=force,
+                    single_stage=single_stage,
+                    no_commit=no_commit,
+                    no_cache=no_cache,
+                    on_error=on_error,
+                    allow_uncached_incremental=allow_uncached_incremental,
+                    checkout_missing=checkout_missing,
+                )
+                eng.run(exit_on_completion=True)
+                return result_sink.get_execution_summaries()
+
+        with _suppress_stderr_logging():
+            return run_tui.run_with_tui(
+                display_order, tui_queue, executor_func, tui_log=tui_log, cancel_event=cancel_event
+            )
+
+    # Non-TUI mode runs directly
+    start_time = time.perf_counter()
+    with engine.Engine() as eng:
+        result_sink = _configure_result_collector(eng)
+        _configure_output_sink(
+            eng,
+            quiet=quiet,
+            as_json=as_json,
+            tui=tui,
+            tui_queue=tui_queue,
+            run_id=run_id,
+            console=console,
+            jsonl_callback=jsonl_callback,
+            watch=False,
+        )
+        _configure_oneshot_source(
+            eng,
+            stages_list,
+            force=force,
+            single_stage=single_stage,
+            no_commit=no_commit,
+            no_cache=no_cache,
+            on_error=on_error,
+            allow_uncached_incremental=allow_uncached_incremental,
+            checkout_missing=checkout_missing,
+        )
+        eng.run(exit_on_completion=True)
+        results = result_sink.get_execution_summaries()
+
+    # Emit JSONL final result
+    if as_json:
+        total_duration_ms = (time.perf_counter() - start_time) * 1000
+        ran = sum(1 for r in results.values() if r["status"] == StageStatus.RAN)
+        skipped = sum(1 for r in results.values() if r["status"] == StageStatus.SKIPPED)
+        failed = sum(1 for r in results.values() if r["status"] == StageStatus.FAILED)
+
+        cli_helpers.emit_jsonl(
+            ExecutionResultEvent(
+                type=RunEventType.EXECUTION_RESULT,
+                ran=ran,
+                skipped=skipped,
+                failed=failed,
+                total_duration_ms=total_duration_ms,
+                timestamp=datetime.datetime.now(datetime.UTC).isoformat(),
+            )
+        )
+
+    # Print summary for plain mode
+    if console and results:
+        ran, cached, blocked, failed = executor_core.count_results(results)
+        total_duration = time.perf_counter() - start_time
+        console.summary(ran, cached, blocked, failed, total_duration)
+
+    return results
 
 
 @contextlib.contextmanager
@@ -161,160 +569,6 @@ def _output_explain(
     status_cli.output_explain_text(explanations)
 
 
-def _run_with_tui(
-    stages_list: list[str] | None,
-    single_stage: bool,
-    force: bool = False,
-    tui_log: pathlib.Path | None = None,
-    no_commit: bool = False,
-    no_cache: bool = False,
-    on_error: OnError = OnError.FAIL,
-    allow_uncached_incremental: bool = False,
-    checkout_missing: bool = False,
-) -> dict[str, ExecutionSummary] | None:
-    """Run pipeline with TUI display."""
-    import queue as thread_queue
-    import threading
-
-    from pivot import dag
-    from pivot.tui import run as run_tui
-    from pivot.types import TuiMessage
-
-    # Get execution order for stage names
-    graph = registry.REGISTRY.build_dag(validate=True)
-    execution_order = dag.get_execution_order(graph, stages_list, single_stage=single_stage)
-
-    if not execution_order:
-        return {}
-
-    # Pre-warm loky executor before starting Textual TUI.
-    # Textual manipulates terminal file descriptors which breaks loky's
-    # resource tracker if spawned after Textual starts.
-    prepare_workers(len(execution_order))
-
-    # tui_queue is inter-thread only (executor -> TUI reader), no cross-process IPC needed.
-    # Using stdlib queue.Queue avoids Manager subprocess dependency issues.
-    tui_queue: thread_queue.Queue[TuiMessage] = thread_queue.Queue()
-
-    # Cancel event allows TUI to signal executor to stop scheduling new stages
-    cancel_event = threading.Event()
-
-    import uuid
-
-    # Generate run_id for TUI tracking
-    run_id = str(uuid.uuid4())[:8]
-
-    # Create executor function using Engine with TuiSink
-    def executor_func() -> dict[str, ExecutionSummary]:
-        with engine.Engine() as eng:
-            # Share TUI's cancel_event so TUI can signal cancellation
-            eng.set_cancel_event(cancel_event)
-            eng.add_sink(sinks.TuiSink(tui_queue=tui_queue, run_id=run_id))
-            return eng.run_once(
-                stages=stages_list,
-                single_stage=single_stage,
-                force=force,
-                no_commit=no_commit,
-                no_cache=no_cache,
-                on_error=on_error,
-                allow_uncached_incremental=allow_uncached_incremental,
-                checkout_missing=checkout_missing,
-            )
-
-    # Sort for display: group matrix variants together while preserving DAG structure
-    display_order = _sort_for_display(execution_order, graph)
-
-    with _suppress_stderr_logging():
-        return run_tui.run_with_tui(
-            display_order, tui_queue, executor_func, tui_log=tui_log, cancel_event=cancel_event
-        )
-
-
-def _run_watch_with_tui(
-    stages_list: list[str] | None,
-    single_stage: bool,
-    debounce: int,
-    force: bool = False,
-    tui_log: pathlib.Path | None = None,
-    no_commit: bool = False,  # noqa: ARG001 - not yet supported in Engine watch mode
-    no_cache: bool = False,  # noqa: ARG001 - not yet supported in Engine watch mode
-    on_error: OnError = OnError.FAIL,
-    serve: bool = False,
-) -> None:
-    """Run watch mode with TUI display.
-
-    Note: Several parameters (no_commit, no_cache) are
-    retained for CLI signature compatibility but not currently used by Engine watch mode.
-    """
-    # Suppress unused parameter warnings - retained for CLI compatibility
-    _ = no_commit, no_cache
-
-    import queue as thread_queue
-    import uuid
-
-    from pivot import dag
-    from pivot.engine import graph as engine_graph
-    from pivot.engine import sources
-    from pivot.tui import run as run_tui
-    from pivot.types import TuiMessage
-
-    # Get execution order to calculate the correct number of workers
-    graph = registry.REGISTRY.build_dag(validate=True)
-    execution_order = dag.get_execution_order(graph, stages_list, single_stage=single_stage)
-
-    # Pre-warm loky executor before starting Textual TUI.
-    # Textual manipulates terminal file descriptors which breaks loky's
-    # resource tracker if spawned after Textual starts.
-    prepare_workers(len(execution_order) if execution_order else 1)
-
-    # tui_queue is inter-thread only (executor -> TUI reader), no cross-process IPC needed.
-    # Using stdlib queue.Queue avoids Manager subprocess dependency issues.
-    tui_queue: thread_queue.Queue[TuiMessage] = thread_queue.Queue()
-
-    # Generate run_id for TUI tracking
-    run_id = str(uuid.uuid4())[:8]
-
-    # Create the Engine
-    with engine.Engine() as eng:
-        # Set keep-going mode based on on_error
-        eng.set_keep_going(on_error == OnError.KEEP_GOING)
-
-        # Build bipartite graph for watch paths
-        all_stages = {name: registry.REGISTRY.get(name) for name in registry.REGISTRY.list_stages()}
-        bipartite_graph = engine_graph.build_graph(all_stages)
-        watch_paths = engine_graph.get_watch_paths(bipartite_graph)
-
-        # Add FilesystemSource for watching file changes
-        filesystem_source = sources.FilesystemSource(watch_paths, debounce=debounce)
-        eng.add_source(filesystem_source)
-
-        # Add OneShotSource for initial run if force is set
-        if force:
-            initial_source = sources.OneShotSource(
-                stages=stages_list,
-                force=True,
-                reason="watch:initial:forced",
-            )
-            eng.add_source(initial_source)
-
-        # Add sinks for TUI updates
-        eng.add_sink(sinks.TuiSink(tui_queue=tui_queue, run_id=run_id))
-        eng.add_sink(sinks.WatchSink(tui_queue=tui_queue))
-
-        # Sort for display: group matrix variants together while preserving DAG structure
-        display_order = _sort_for_display(execution_order, graph) if execution_order else None
-
-        with _suppress_stderr_logging():
-            run_tui.run_watch_tui(
-                eng,
-                tui_queue,
-                tui_log=tui_log,
-                stage_names=display_order,
-                no_commit=False,  # TODO: Support no_commit in Engine watch mode
-                serve=serve,
-            )
-
-
 @cli_decorators.pivot_command()
 @click.argument("stages", nargs=-1, shell_complete=completion.complete_stages)
 @click.option(
@@ -423,7 +677,6 @@ def run(
     """
     cli_ctx = cli_helpers.get_cli_context(ctx)
     quiet = cli_ctx["quiet"]
-    show_human_output = not as_json and not quiet
     debounce = debounce if debounce is not None else config.get_watch_debounce()
 
     stages_list = cli_helpers.stages_to_list(stages)
@@ -476,164 +729,42 @@ def run(
 
     on_error = OnError.KEEP_GOING if keep_going else OnError.FAIL
 
-    if watch:
-        use_tui = tui_flag
+    # Validate --serve requires TUI mode
+    if watch and serve and not tui_flag:
+        raise click.ClickException("--serve requires --tui")
 
-        # Validate --serve requires TUI mode
-        if serve and not use_tui:
-            raise click.ClickException("--serve requires --tui")
+    show_human_output = not as_json and not quiet
 
-        if use_tui:
-            try:
-                _run_watch_with_tui(
-                    stages_list,
-                    single_stage,
-                    debounce,
-                    force,
-                    tui_log=tui_log,
-                    no_commit=no_commit,
-                    no_cache=no_cache,
-                    on_error=on_error,
-                    serve=serve,
-                )
-            except KeyboardInterrupt:
-                if show_human_output:
-                    click.echo("\nWatch mode stopped.")
-        else:
-            from pivot.engine import graph as engine_graph
-            from pivot.engine import sources
-
-            # Create the Engine
-            with engine.Engine() as eng:
-                # Set keep-going mode based on on_error
-                eng.set_keep_going(on_error == OnError.KEEP_GOING)
-
-                # Build bipartite graph for watch paths
-                all_stages = {
-                    name: registry.REGISTRY.get(name) for name in registry.REGISTRY.list_stages()
-                }
-                bipartite_graph = engine_graph.build_graph(all_stages)
-                watch_paths = engine_graph.get_watch_paths(bipartite_graph)
-
-                # Add FilesystemSource for watching file changes
-                filesystem_source = sources.FilesystemSource(watch_paths, debounce=debounce)
-                eng.add_source(filesystem_source)
-
-                # Add OneShotSource for initial run if force is set
-                if force:
-                    initial_source = sources.OneShotSource(
-                        stages=stages_list,
-                        force=True,
-                        reason="watch:initial:forced",
-                    )
-                    eng.add_source(initial_source)
-
-                # Add appropriate sink for output mode
-                if as_json:
-                    # Emit schema version for JSONL streaming
-                    cli_helpers.emit_jsonl(
-                        SchemaVersionEvent(
-                            type=RunEventType.SCHEMA_VERSION, version=_JSONL_SCHEMA_VERSION
-                        )
-                    )
-                    eng.add_sink(sinks.JsonlSink(callback=cli_helpers.emit_jsonl))
-                else:
-                    from pivot.tui import console as tui_console
-
-                    console = tui_console.Console()
-                    eng.add_sink(sinks.ConsoleSink(console))
-
-                try:
-                    eng.run_loop()
-                except KeyboardInterrupt:
-                    pass  # Normal exit via Ctrl+C
-                finally:
-                    eng.shutdown()
-                    if show_human_output:
-                        click.echo("\nWatch mode stopped.")
-        return
-
-    # Determine display mode from flags
-    use_tui = tui_flag
-    if use_tui:
-        results = _run_with_tui(
+    try:
+        results = _run_pipeline(
             stages_list,
-            single_stage,
+            watch=watch,
+            single_stage=single_stage,
             force=force,
+            quiet=quiet,
+            tui=tui_flag,
+            as_json=as_json,
+            debounce=debounce,
             tui_log=tui_log,
             no_commit=no_commit,
             no_cache=no_cache,
             on_error=on_error,
+            serve=serve,
             allow_uncached_incremental=allow_uncached_incremental,
             checkout_missing=checkout_missing,
         )
-    elif as_json:
-        # JSONL streaming mode
-        cli_helpers.emit_jsonl(
-            SchemaVersionEvent(type=RunEventType.SCHEMA_VERSION, version=_JSONL_SCHEMA_VERSION)
-        )
+    except KeyboardInterrupt:
+        if show_human_output:
+            click.echo("\nWatch mode stopped." if watch else "\nCancelled.")
+        return
 
-        start_time = time.perf_counter()
-        with engine.Engine() as eng:
-            eng.add_sink(sinks.JsonlSink(callback=cli_helpers.emit_jsonl))
-            results = eng.run_once(
-                stages=stages_list,
-                single_stage=single_stage,
-                force=force,
-                no_commit=no_commit,
-                no_cache=no_cache,
-                on_error=on_error,
-                allow_uncached_incremental=allow_uncached_incremental,
-                checkout_missing=checkout_missing,
-            )
-        total_duration_ms = (time.perf_counter() - start_time) * 1000
+    if results is None:
+        # Watch mode completed
+        if show_human_output:
+            click.echo("\nWatch mode stopped.")
+        return
 
-        # Emit final execution result
-        ran = sum(1 for r in results.values() if r["status"] == StageStatus.RAN)
-        skipped = sum(1 for r in results.values() if r["status"] == StageStatus.SKIPPED)
-        failed = sum(1 for r in results.values() if r["status"] == StageStatus.FAILED)
-
-        cli_helpers.emit_jsonl(
-            ExecutionResultEvent(
-                type=RunEventType.EXECUTION_RESULT,
-                ran=ran,
-                skipped=skipped,
-                failed=failed,
-                total_duration_ms=total_duration_ms,
-                timestamp=datetime.datetime.now(datetime.UTC).isoformat(),
-            )
-        )
-    else:
-        from pivot.executor import core as executor_core
-        from pivot.tui import console as tui_console
-
-        # Add ConsoleSink for stage progress display (unless quiet)
-        console: tui_console.Console | None = None
-        if not quiet:
-            console = tui_console.Console()
-
-        start_time = time.perf_counter()
-        with engine.Engine() as eng:
-            if console:
-                eng.add_sink(sinks.ConsoleSink(console))
-            results = eng.run_once(
-                stages=stages_list,
-                single_stage=single_stage,
-                force=force,
-                no_commit=no_commit,
-                no_cache=no_cache,
-                on_error=on_error,
-                allow_uncached_incremental=allow_uncached_incremental,
-                checkout_missing=checkout_missing,
-            )
-
-        # Print summary for plain mode (TUI/JSON modes handle this differently)
-        if console and results:
-            ran, cached, blocked, failed = executor_core.count_results(results)
-            total_duration = time.perf_counter() - start_time
-            console.summary(ran, cached, blocked, failed, total_duration)
-
-    if not results and show_human_output and not use_tui:
+    if not results and show_human_output and not tui_flag:
         click.echo("No stages to run")
 
 

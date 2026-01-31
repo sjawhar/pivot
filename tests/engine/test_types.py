@@ -113,6 +113,7 @@ def test_pipeline_reloaded_event() -> None:
     """PipelineReloaded event has required fields."""
     event: types.PipelineReloaded = {
         "type": "pipeline_reloaded",
+        "stages": ["new_stage", "changed_stage"],
         "stages_added": ["new_stage"],
         "stages_removed": ["old_stage"],
         "stages_modified": ["changed_stage"],
@@ -125,6 +126,7 @@ def test_pipeline_reloaded_event() -> None:
     # With error
     event_err: types.PipelineReloaded = {
         "type": "pipeline_reloaded",
+        "stages": [],
         "stages_added": [],
         "stages_removed": [],
         "stages_modified": [],
@@ -216,6 +218,7 @@ def test_output_event_union() -> None:
         {"type": "engine_state_changed", "state": types.EngineState.IDLE},
         {
             "type": "pipeline_reloaded",
+            "stages": [],
             "stages_added": [],
             "stages_removed": [],
             "stages_modified": [],

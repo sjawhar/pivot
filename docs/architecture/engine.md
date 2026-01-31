@@ -71,6 +71,7 @@ Sinks consume output events via `sink.handle()`:
 | `TuiSink` | Textual app | TUI mode |
 | `JsonlSink` | Newline JSON | Tooling integration |
 | `WatchSink` | Engine state | Watch mode state handling |
+| `ResultCollectorSink` | Dict collection | Programmatic result access |
 
 ## Bipartite Graph
 
@@ -102,26 +103,35 @@ class NodeType(Enum):
 
 ## Execution Modes
 
-### Batch Mode (`run_once`)
+Both batch and watch modes use the same `run()` method with the `exit_on_completion` parameter:
+
+### Batch Mode (`exit_on_completion=True`)
 
 ```python
-engine = Engine()
-engine.add_sink(ConsoleSink())
-results = engine.run_once(stages=["train"])
+with Engine() as engine:
+    collector = ResultCollectorSink()
+    engine.add_sink(collector)
+    engine.add_sink(ConsoleSink())
+    engine.add_source(OneShotSource(stages=["train"], force=True, reason="cli"))
+
+    engine.run(exit_on_completion=True)
+
+    results = collector.get_results()
 ```
 
 1. Builds bipartite graph
 2. Computes execution order
 3. Orchestrates parallel execution
-4. Returns results dict
+4. Exits when all requested stages complete
 
-### Watch Mode (`run_loop`)
+### Watch Mode (`exit_on_completion=False`)
 
 ```python
-engine = Engine()
-engine.add_sink(TuiSink())
-engine.add_source(FilesystemSource(watch_paths))
-engine.run_loop()  # Blocks until shutdown
+with Engine() as engine:
+    engine.add_sink(TuiSink())
+    engine.add_source(FilesystemSource(watch_paths))
+
+    engine.run(exit_on_completion=False)  # Blocks until shutdown
 ```
 
 1. Starts all sources
@@ -148,7 +158,7 @@ engine.run_loop()  # Blocks until shutdown
 | `StageStarted` | Stage begins | Stage name, index |
 | `StageCompleted` | Stage finishes | Status, reason, duration |
 | `LogLine` | Stage output | Line, is_stderr |
-| `PipelineReloaded` | Registry reload | Added/removed/modified stages |
+| `PipelineReloaded` | Registry reload | Stages list, added/removed/modified |
 | `StageStateChanged` | State transition | Stage, old/new state |
 
 ## Thread Safety

@@ -166,8 +166,9 @@ def run(
 ) -> dict[str, ExecutionSummary]:
     """Execute pipeline stages via Engine.
 
-    This is a thin wrapper around Engine.run_once() for backwards compatibility.
-    All execution orchestration is now handled by Engine.
+    This function creates an Engine with OneShotSource and ResultCollectorSink,
+    runs the event loop until completion, and returns the collected results.
+    All execution orchestration is handled by Engine's event-driven architecture.
 
     Args:
         stages: Target stages to run (and their dependencies). If None, runs all.
@@ -231,6 +232,8 @@ def _run_inner(
     """Inner implementation of run(), called with lock already held if needed."""
     # Import here to avoid circular import (engine imports executor_core)
     from pivot.engine.engine import Engine
+    from pivot.engine.sinks import ResultCollectorSink
+    from pivot.engine.sources import OneShotSource
 
     if not isinstance(on_error, OnError):
         try:
@@ -240,26 +243,42 @@ def _run_inner(
                 f"Invalid on_error mode: {on_error}. Use 'fail' or 'keep_going'"
             ) from None
 
-    # Create engine and delegate execution
+    # Create engine with event-driven execution
     with Engine() as engine:
         # Pass cancel event to engine if provided
         if cancel_event is not None:
             engine.set_cancel_event(cancel_event)
 
-        return engine.run_once(
+        # Set progress callback on engine for JSONL output
+        if progress_callback is not None:
+            engine.set_progress_callback(progress_callback)
+
+        # Add ResultCollectorSink to collect results
+        result_sink = ResultCollectorSink()
+        engine.add_sink(result_sink)
+
+        # Create OneShotSource with all orchestration parameters
+        source = OneShotSource(
             stages=stages,
             force=force,
+            reason="cli",
             single_stage=single_stage,
             parallel=parallel,
             max_workers=max_workers,
             no_commit=no_commit,
             no_cache=no_cache,
-            allow_uncached_incremental=allow_uncached_incremental,
-            checkout_missing=checkout_missing,
             on_error=on_error,
             cache_dir=cache_dir,
-            progress_callback=progress_callback,
+            allow_uncached_incremental=allow_uncached_incremental,
+            checkout_missing=checkout_missing,
         )
+        engine.add_source(source)
+
+        # Run event loop until all stages complete
+        engine.run(exit_on_completion=True)
+
+        # Return collected results
+        return result_sink.get_execution_summaries()
 
 
 # =========================================================================
