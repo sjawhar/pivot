@@ -15,7 +15,6 @@ import queue
 import random
 import sys
 import threading
-import unicodedata
 from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast, override
 
 import pydantic
@@ -253,7 +252,11 @@ def execute_stage(
 
                     if skip_reason is not None and lock_data is not None:
                         restored = _restore_outputs_from_cache(
-                            stage_outs, lock_data, files_cache_dir, checkout_modes
+                            stage_outs,
+                            lock_data,
+                            files_cache_dir,
+                            checkout_modes,
+                            state_db=state_db,
                         )
                         if restored:
                             return _make_result(StageStatus.SKIPPED, skip_reason, [])
@@ -455,14 +458,15 @@ def _restore_outputs(
     checkout_modes: list[cache.CheckoutMode],
     *,
     use_normalized_paths: bool = False,
+    state_db: state.StateDB | None = None,
 ) -> bool:
     """Restore outputs from cache - shared logic for lock file and run cache paths.
 
     Returns True if all outputs exist or were restored. On failure, cleans up
     any partially restored outputs to leave the filesystem in a clean state.
 
-    For directories, also verifies content matches the cached manifest and
-    reconciles any differences (restores missing files, removes extra files).
+    For files and directories, also verifies content matches the cached hash and
+    reconciles any differences (restores missing/corrupted files, removes extra files).
 
     Args:
         output_path_strings: Path strings to restore (preserves trailing slash for DirectoryOut)
@@ -471,6 +475,7 @@ def _restore_outputs(
         checkout_modes: Checkout modes for cache restoration
         use_normalized_paths: If True, normalize paths for lookup (lock data uses
             normalized paths). If False, use raw paths (run cache uses raw paths).
+        state_db: Optional state database for hash caching during file verification.
     """
     restored_paths = list[pathlib.Path]()
 
@@ -492,11 +497,11 @@ def _restore_outputs(
             _cleanup_restored_paths(restored_paths)
             return False
 
-        needs_restore = not path.exists()
-
-        # For directories, verify contents match even if path exists
-        if not needs_restore and is_dir_hash(output_hash):
-            needs_restore = _directory_needs_restore(path, output_hash)
+        # Verify content matches cached hash (directories and files)
+        if is_dir_hash(output_hash):
+            needs_restore = _directory_needs_restore(path, output_hash, state_db)
+        else:
+            needs_restore = _file_needs_restore(path, output_hash, state_db)
 
         if not needs_restore:
             continue
@@ -523,6 +528,8 @@ def _restore_outputs_from_cache(
     lock_data: LockData,
     files_cache_dir: pathlib.Path,
     checkout_modes: list[cache.CheckoutMode],
+    *,
+    state_db: state.StateDB | None = None,
 ) -> bool:
     """Restore missing outputs from cache for lock file skip detection.
 
@@ -535,55 +542,49 @@ def _restore_outputs_from_cache(
         files_cache_dir,
         checkout_modes,
         use_normalized_paths=True,
+        state_db=state_db,
     )
 
 
-def _directory_needs_restore(path: pathlib.Path, cached_hash: DirHash) -> bool:
+def _directory_needs_restore(
+    path: pathlib.Path, cached_hash: DirHash, state_db: state.StateDB | None = None
+) -> bool:
     """Check if directory content differs from cached manifest.
 
     Returns True if restoration is needed (missing files, extra files,
     or content mismatch).
 
-    Uses NFC normalization for path comparison to handle cross-platform
-    differences (macOS HFS+ uses NFD, manifest stores NFC).
+    Uses hash_directory() internally to ensure the same filtering is applied
+    (ignoring __pycache__, .venv, etc.). This ensures consistency between
+    hashing and restore checks.
     """
-    cached_manifest = cached_hash["manifest"]
-    cached_relpaths = {entry["relpath"] for entry in cached_manifest}
-    cached_hashes = {entry["relpath"]: entry["hash"] for entry in cached_manifest}
-
-    # Collect current files with NFC normalization to match manifest format
-    current_files = set[str]()
-    current_to_actual = dict[str, pathlib.Path]()  # NFC path -> actual filesystem path
-    for file_path in path.rglob("*"):
-        if file_path.is_file() and not file_path.is_symlink():
-            try:
-                rel = str(file_path.relative_to(path))
-                # Normalize to NFC for comparison (manifest uses NFC)
-                rel_nfc = unicodedata.normalize("NFC", rel)
-                current_files.add(rel_nfc)
-                current_to_actual[rel_nfc] = file_path
-            except ValueError:
-                continue  # Path not relative to directory
-
-    # Extra files in workspace that shouldn't be there
-    if current_files - cached_relpaths:
+    if not path.exists():
         return True
 
-    # Missing files that should exist
-    if cached_relpaths - current_files:
+    try:
+        current_hash, _ = cache.hash_directory(path, state_db)
+    except OSError:
         return True
 
-    # Check content hashes for files that exist
-    for relpath in current_files:
-        file_path = current_to_actual[relpath]
-        try:
-            current_hash = cache.hash_file(file_path)
-            if current_hash != cached_hashes.get(relpath):
-                return True
-        except (OSError, FileNotFoundError):
-            return True
+    # Compare tree hashes - they include all content and structure
+    return current_hash != cached_hash["hash"]
 
-    return False
+
+def _file_needs_restore(
+    path: pathlib.Path, cached_hash: FileHash, state_db: state.StateDB | None = None
+) -> bool:
+    """Check if file content differs from cached hash.
+
+    Returns True if restoration is needed (file missing or content mismatch).
+    """
+    if not path.exists():
+        return True
+
+    try:
+        current_hash = cache.hash_file(path, state_db)
+        return current_hash != cached_hash["hash"]
+    except OSError:
+        return True
 
 
 def _prepare_outputs_for_execution(
@@ -1087,6 +1088,7 @@ def _try_skip_via_run_cache(
         files_cache_dir,
         checkout_modes,
         use_normalized_paths=False,
+        state_db=state_db,
     )
     if not restored:
         return None

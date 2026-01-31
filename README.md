@@ -128,17 +128,7 @@ def process():
 
 **Problem:** Importing numpy/pandas can take seconds per stage
 
-**Solution:** Preload imports once in worker processes
-
-```bash
-pivot run --executor=warm  # Default
-```
-
-**Experimental:** Python 3.14's `InterpreterPoolExecutor`
-
-```bash
-pivot run --executor=interpreter  # Lower memory, faster startup
-```
+**Solution:** Reusable worker processes with preloaded imports. Pivot uses `loky.get_reusable_executor()` to keep workers warm between runs, avoiding repeated import overhead.
 
 ### 4. DVC Compatibility
 

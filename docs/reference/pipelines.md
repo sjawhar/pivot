@@ -125,7 +125,7 @@ Stage functions must be **pure and serializable** for multiprocessing.
 
 ### Why Serialization Matters
 
-Pivot uses `ProcessPoolExecutor` with `forkserver` context for true parallelism. Worker processes are separate Python interpreters that receive serialized (pickled) functions. This means:
+Pivot uses loky's reusable executor pool for true parallelism. Worker processes are separate Python interpreters that receive serialized (pickled) functions. This means:
 
 1. Functions must be defined at module level (not inside other functions)
 2. Functions cannot capture local variables (closures)

@@ -8,6 +8,7 @@ import os
 import pathlib
 import shutil
 import sys
+import unicodedata
 from typing import TYPE_CHECKING, Annotated, Any, TypedDict
 
 import pytest
@@ -23,7 +24,7 @@ if TYPE_CHECKING:
     from pytest_mock import MockerFixture
 
     from pivot.executor import WorkerStageInfo
-    from pivot.types import DirHash, DirManifestEntry, OutputHash, OutputMessage
+    from pivot.types import DirHash, DirManifestEntry, FileHash, OutputHash, OutputMessage
 
 
 class _PlainParams(stage_def.StageParams):
@@ -1864,22 +1865,9 @@ def test_directory_needs_restore_returns_false_when_matching(tmp_path: pathlib.P
     (dir_path / "a.json").write_text('{"value": 1}')
     (dir_path / "b.json").write_text('{"value": 2}')
 
-    # Create manifest matching the files
-    manifest: list[DirManifestEntry] = [
-        {
-            "relpath": "a.json",
-            "hash": cache.hash_file(dir_path / "a.json"),
-            "size": 0,
-            "isexec": False,
-        },
-        {
-            "relpath": "b.json",
-            "hash": cache.hash_file(dir_path / "b.json"),
-            "size": 0,
-            "isexec": False,
-        },
-    ]
-    cached_hash: DirHash = {"hash": "tree_hash", "manifest": manifest}
+    # Use hash_directory to get the actual tree hash and manifest
+    tree_hash, manifest = cache.hash_directory(dir_path)
+    cached_hash: DirHash = {"hash": tree_hash, "manifest": manifest}
 
     assert not worker._directory_needs_restore(dir_path, cached_hash)
 
@@ -1889,18 +1877,14 @@ def test_directory_needs_restore_returns_true_for_missing_file(tmp_path: pathlib
     dir_path = tmp_path / "results"
     dir_path.mkdir()
     (dir_path / "a.json").write_text('{"value": 1}')
-    # b.json is missing
+    (dir_path / "b.json").write_text('{"value": 2}')
 
-    manifest: list[DirManifestEntry] = [
-        {
-            "relpath": "a.json",
-            "hash": cache.hash_file(dir_path / "a.json"),
-            "size": 0,
-            "isexec": False,
-        },
-        {"relpath": "b.json", "hash": "missing_file_hash", "size": 0, "isexec": False},
-    ]
-    cached_hash: DirHash = {"hash": "tree_hash", "manifest": manifest}
+    # Get hash when both files exist
+    tree_hash, manifest = cache.hash_directory(dir_path)
+    cached_hash: DirHash = {"hash": tree_hash, "manifest": manifest}
+
+    # Now delete b.json - directory no longer matches
+    (dir_path / "b.json").unlink()
 
     assert worker._directory_needs_restore(dir_path, cached_hash)
 
@@ -1910,17 +1894,13 @@ def test_directory_needs_restore_returns_true_for_extra_file(tmp_path: pathlib.P
     dir_path = tmp_path / "results"
     dir_path.mkdir()
     (dir_path / "a.json").write_text('{"value": 1}')
-    (dir_path / "extra.json").write_text('{"extra": true}')  # Extra file
 
-    manifest: list[DirManifestEntry] = [
-        {
-            "relpath": "a.json",
-            "hash": cache.hash_file(dir_path / "a.json"),
-            "size": 0,
-            "isexec": False,
-        },
-    ]
-    cached_hash: DirHash = {"hash": "tree_hash", "manifest": manifest}
+    # Get hash with only a.json
+    tree_hash, manifest = cache.hash_directory(dir_path)
+    cached_hash: DirHash = {"hash": tree_hash, "manifest": manifest}
+
+    # Now add extra file - directory no longer matches
+    (dir_path / "extra.json").write_text('{"extra": true}')
 
     assert worker._directory_needs_restore(dir_path, cached_hash)
 
@@ -1931,10 +1911,12 @@ def test_directory_needs_restore_returns_true_for_wrong_content(tmp_path: pathli
     dir_path.mkdir()
     (dir_path / "a.json").write_text('{"value": 1}')
 
-    manifest: list[DirManifestEntry] = [
-        {"relpath": "a.json", "hash": "wrong_hash", "size": 0, "isexec": False},
-    ]
-    cached_hash: DirHash = {"hash": "tree_hash", "manifest": manifest}
+    # Get hash with original content
+    tree_hash, manifest = cache.hash_directory(dir_path)
+    cached_hash: DirHash = {"hash": tree_hash, "manifest": manifest}
+
+    # Now modify the file - directory no longer matches
+    (dir_path / "a.json").write_text('{"value": 999}')
 
     assert worker._directory_needs_restore(dir_path, cached_hash)
 
@@ -1945,20 +1927,14 @@ def test_directory_needs_restore_ignores_symlinks(tmp_path: pathlib.Path) -> Non
     dir_path.mkdir()
     (dir_path / "a.json").write_text('{"value": 1}')
 
-    # Create symlink (should be ignored)
+    # Get hash before adding symlink
+    tree_hash, manifest = cache.hash_directory(dir_path)
+    cached_hash: DirHash = {"hash": tree_hash, "manifest": manifest}
+
+    # Create symlink (should be ignored by hash_directory, so hash should still match)
     symlink_target = tmp_path / "target.json"
     symlink_target.write_text('{"target": true}')
     (dir_path / "link.json").symlink_to(symlink_target)
-
-    manifest: list[DirManifestEntry] = [
-        {
-            "relpath": "a.json",
-            "hash": cache.hash_file(dir_path / "a.json"),
-            "size": 0,
-            "isexec": False,
-        },
-    ]
-    cached_hash: DirHash = {"hash": "tree_hash", "manifest": manifest}
 
     # Should not consider symlink as an extra file
     assert not worker._directory_needs_restore(dir_path, cached_hash)
@@ -1972,21 +1948,9 @@ def test_directory_needs_restore_handles_nested_files(tmp_path: pathlib.Path) ->
     (dir_path / "sub").mkdir()
     (dir_path / "sub" / "nested.json").write_text('{"level": "nested"}')
 
-    manifest: list[DirManifestEntry] = [
-        {
-            "relpath": "top.json",
-            "hash": cache.hash_file(dir_path / "top.json"),
-            "size": 0,
-            "isexec": False,
-        },
-        {
-            "relpath": "sub/nested.json",
-            "hash": cache.hash_file(dir_path / "sub" / "nested.json"),
-            "size": 0,
-            "isexec": False,
-        },
-    ]
-    cached_hash: DirHash = {"hash": "tree_hash", "manifest": manifest}
+    # Use hash_directory to get the actual tree hash
+    tree_hash, manifest = cache.hash_directory(dir_path)
+    cached_hash: DirHash = {"hash": tree_hash, "manifest": manifest}
 
     assert not worker._directory_needs_restore(dir_path, cached_hash)
 
@@ -1995,11 +1959,15 @@ def test_directory_needs_restore_empty_manifest(tmp_path: pathlib.Path) -> None:
     """_directory_needs_restore returns True when manifest is empty but files exist."""
     dir_path = tmp_path / "results"
     dir_path.mkdir()
+
+    # Get hash of empty directory
+    empty_hash, _ = cache.hash_directory(dir_path)
+    cached_hash: DirHash = {"hash": empty_hash, "manifest": []}
+
+    # Now add a file - directory no longer matches
     (dir_path / "a.json").write_text('{"value": 1}')
 
-    cached_hash: DirHash = {"hash": "tree_hash", "manifest": []}
-
-    # Directory has files but manifest is empty - needs restore
+    # Directory has files but cached hash is for empty directory - needs restore
     assert worker._directory_needs_restore(dir_path, cached_hash)
 
 
@@ -2008,7 +1976,9 @@ def test_directory_needs_restore_empty_directory_empty_manifest(tmp_path: pathli
     dir_path = tmp_path / "results"
     dir_path.mkdir()
 
-    cached_hash: DirHash = {"hash": "tree_hash", "manifest": []}
+    # Get actual hash of empty directory
+    tree_hash, manifest = cache.hash_directory(dir_path)
+    cached_hash: DirHash = {"hash": tree_hash, "manifest": manifest}
 
     # Both empty - matches
     assert not worker._directory_needs_restore(dir_path, cached_hash)
@@ -2088,21 +2058,19 @@ def test_directory_needs_restore_returns_true_on_permission_error(
     dir_path.mkdir()
     (dir_path / "a.json").write_text('{"value": 1}')
 
-    manifest: list[DirManifestEntry] = [
-        {
-            "relpath": "a.json",
-            "hash": cache.hash_file(dir_path / "a.json"),
-            "size": 0,
-            "isexec": False,
-        },
-    ]
-    cached_hash: DirHash = {"hash": "tree_hash", "manifest": manifest}
+    # Get hash before breaking things
+    tree_hash, manifest = cache.hash_directory(dir_path)
+    cached_hash: DirHash = {"hash": tree_hash, "manifest": manifest}
 
-    # Make hash_file raise OSError
-    def failing_hash(path: pathlib.Path) -> str:
+    # Make hash_directory raise OSError (accepts optional state_db and ignore_filter)
+    def failing_hash_directory(
+        path: pathlib.Path,
+        state_db: state.StateDB | None = None,
+        ignore_filter: object = None,
+    ) -> tuple[str, list[DirManifestEntry]]:
         raise OSError("Permission denied")
 
-    monkeypatch.setattr(cache, "hash_file", failing_hash)
+    monkeypatch.setattr(cache, "hash_directory", failing_hash_directory)
 
     # Should return True (needs restore) when hash fails
     assert worker._directory_needs_restore(dir_path, cached_hash)
@@ -2114,28 +2082,108 @@ def test_directory_needs_restore_handles_unicode_normalization(tmp_path: pathlib
     dir_path.mkdir()
 
     # Create file with combining character (could be stored as NFD on some filesystems)
-    import unicodedata
-
     # café with combining acute accent (NFD form)
     nfd_name = "cafe\u0301.json"
-    # café with precomposed é (NFC form)
-    nfc_name = unicodedata.normalize("NFC", nfd_name)
+    # café with precomposed é (NFC form) - unused but documents the equivalence
+    _ = unicodedata.normalize("NFC", nfd_name)
 
     (dir_path / nfd_name).write_text('{"value": 1}')
 
-    # Manifest uses NFC form (as it should per the codebase convention)
-    manifest: list[DirManifestEntry] = [
-        {
-            "relpath": nfc_name,
-            "hash": cache.hash_file(dir_path / nfd_name),
-            "size": 0,
-            "isexec": False,
-        },
-    ]
-    cached_hash: DirHash = {"hash": "tree_hash", "manifest": manifest}
+    # Use hash_directory to get proper hash (handles unicode internally)
+    tree_hash, manifest = cache.hash_directory(dir_path)
+    cached_hash: DirHash = {"hash": tree_hash, "manifest": manifest}
 
     # Should handle unicode normalization correctly
     assert not worker._directory_needs_restore(dir_path, cached_hash)
+
+
+# =============================================================================
+# _file_needs_restore Tests
+# =============================================================================
+
+
+def test_file_needs_restore_returns_false_when_matching(tmp_path: pathlib.Path) -> None:
+    """_file_needs_restore returns False when file matches cached hash."""
+    file_path = tmp_path / "output.txt"
+    file_path.write_text("content")
+
+    file_hash = cache.hash_file(file_path)
+    cached_hash: FileHash = {"hash": file_hash}
+
+    assert not worker._file_needs_restore(file_path, cached_hash)
+
+
+def test_file_needs_restore_returns_true_for_missing_file(tmp_path: pathlib.Path) -> None:
+    """_file_needs_restore returns True when file doesn't exist."""
+    file_path = tmp_path / "missing.txt"
+    cached_hash: FileHash = {"hash": "1234567890abcdef"}
+
+    assert worker._file_needs_restore(file_path, cached_hash)
+
+
+def test_file_needs_restore_returns_true_for_wrong_content(tmp_path: pathlib.Path) -> None:
+    """_file_needs_restore returns True when file content doesn't match hash."""
+    file_path = tmp_path / "output.txt"
+    file_path.write_text("original")
+
+    # Get hash of original content
+    original_hash = cache.hash_file(file_path)
+    cached_hash: FileHash = {"hash": original_hash}
+
+    # Modify content
+    file_path.write_text("modified")
+
+    assert worker._file_needs_restore(file_path, cached_hash)
+
+
+def test_file_needs_restore_returns_true_on_permission_error(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """_file_needs_restore returns True when hash computation fails."""
+    file_path = tmp_path / "output.txt"
+    file_path.write_text("content")
+
+    # Get hash before breaking things
+    file_hash = cache.hash_file(file_path)
+    cached_hash: FileHash = {"hash": file_hash}
+
+    # Make hash_file raise OSError
+    def failing_hash(path: pathlib.Path, state_db: state.StateDB | None = None) -> str:
+        raise OSError("Permission denied")
+
+    monkeypatch.setattr(cache, "hash_file", failing_hash)
+
+    assert worker._file_needs_restore(file_path, cached_hash)
+
+
+def test_file_needs_restore_handles_empty_file(tmp_path: pathlib.Path) -> None:
+    """_file_needs_restore correctly handles empty files."""
+    file_path = tmp_path / "empty.txt"
+    file_path.write_text("")
+
+    empty_hash = cache.hash_file(file_path)
+    cached_hash: FileHash = {"hash": empty_hash}
+
+    # Empty file matches
+    assert not worker._file_needs_restore(file_path, cached_hash)
+
+    # Now put content - should need restore
+    file_path.write_text("not empty anymore")
+    assert worker._file_needs_restore(file_path, cached_hash)
+
+
+def test_file_needs_restore_uses_state_db(tmp_path: pathlib.Path) -> None:
+    """_file_needs_restore accepts state_db parameter for hash caching."""
+    file_path = tmp_path / "output.txt"
+    file_path.write_text("content")
+    db_path = tmp_path / "state.db"
+
+    with state.StateDB(db_path) as db:
+        file_hash = cache.hash_file(file_path, db)
+        cached_hash: FileHash = {"hash": file_hash}
+
+        # Should work with state_db
+        assert not worker._file_needs_restore(file_path, cached_hash, state_db=db)
 
 
 # =============================================================================
