@@ -228,26 +228,49 @@ def _get_stage_fingerprint_impl(func: Callable[..., Any], visited: set[int]) -> 
     return manifest
 
 
-def get_loader_fingerprint(loader: "loaders.Loader[Any]") -> dict[str, str]:
+def get_loader_fingerprint(loader: "loaders.Writer[Any] | loaders.Reader[Any]") -> dict[str, str]:
     """Generate fingerprint manifest for a loader instance.
 
-    Returns dict with keys:
-    - 'loader:<classname>:load': Hash of load() method
-    - 'loader:<classname>:save': Hash of save() method
-    - 'loader:<classname>:config': Hash of dataclass field values
+    Handles Reader, Writer, and Loader (which inherits from both) instances.
+    Only fingerprints methods that exist on the handler type:
+    - Reader: 'loader:<classname>:load' + empty() if overridden
+    - Writer: 'loader:<classname>:save'
+    - Loader: All of the above
+    - Always: 'loader:<classname>:config' for dataclass field values
     """
     manifest = dict[str, str]()
     class_name = type(loader).__name__
 
-    manifest[f"loader:{class_name}:load"] = hash_function_ast(loader.load)
-    manifest[f"loader:{class_name}:save"] = hash_function_ast(loader.save)
+    # Import here to avoid circular import
+    from pivot import loaders as loaders_module
 
+    # Fingerprint save() if this is a Writer
+    if isinstance(loader, loaders_module.Writer):
+        manifest[f"loader:{class_name}:save"] = hash_function_ast(loader.save)
+
+    # Fingerprint load() if this is a Reader
+    if isinstance(loader, loaders_module.Reader):
+        manifest[f"loader:{class_name}:load"] = hash_function_ast(loader.load)
+
+        # Only fingerprint empty() if it's overridden in a Loader subclass
+        if isinstance(loader, loaders_module.Loader):
+            for cls in type(loader).__mro__:
+                if cls is loaders_module.Loader:
+                    # Reached Loader base class without finding override
+                    break
+                if "empty" in cls.__dict__:
+                    # Found override in a subclass
+                    manifest[f"loader:{class_name}:empty"] = hash_function_ast(loader.empty)
+                    break
+
+    # Config hash from dataclass fields
     field_values = list[str]()
     for field in dataclasses.fields(loader):
         value = getattr(loader, field.name)
         field_values.append(f"{field.name}={value!r}")
-    config_str = ",".join(field_values)
-    manifest[f"loader:{class_name}:config"] = xxhash.xxh64(config_str.encode()).hexdigest()
+    if field_values:
+        config_str = ",".join(field_values)
+        manifest[f"loader:{class_name}:config"] = xxhash.xxh64(config_str.encode()).hexdigest()
 
     return manifest
 

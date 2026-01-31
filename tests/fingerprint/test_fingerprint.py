@@ -1104,7 +1104,8 @@ def test_pathonly_loader_fingerprint():
 
     assert "loader:PathOnly:load" in fp
     assert "loader:PathOnly:save" in fp
-    assert "loader:PathOnly:config" in fp
+    # PathOnly has no dataclass fields, so no config to fingerprint
+    # Config is only included when the loader has configurable fields
 
 
 def test_custom_loader_fingerprint():

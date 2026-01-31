@@ -132,6 +132,10 @@ pivot status --explain
 
 Shows detailed breakdown of what changed and why each stage would run.
 
+## A Note on Loaders
+
+In the examples above, `Dep()` and `Out()` take a loader like `loaders.CSV()` or `loaders.PathOnly()`. These loaders implement the `Reader` and `Writer` protocols respectively. All built-in loaders implement both, so you can use them interchangeably with `Dep` and `Out`.
+
 ## Next Steps
 
 - [Watch Mode & Rapid Iteration](../tutorial/watch.md) - Develop faster with auto-rerun

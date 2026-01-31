@@ -128,6 +128,24 @@ The `PathOnly` loader:
 
 ## Custom Loaders
 
+### The Loader Type Hierarchy
+
+Pivot has three loader protocols:
+
+- **`Reader[R]`** - Read-only, requires `load()` method
+- **`Writer[W]`** - Write-only, requires `save()` method
+- **`Loader[W, R]`** - Bidirectional, inherits from both `Reader[R]` and `Writer[W]`
+
+`Dep.loader` is typed as `Reader[R]`, so it accepts any loader that can read data. This includes:
+- `Reader[R]` implementations (read-only)
+- `Loader[T]` implementations (bidirectional, since `Loader` inherits from `Reader`)
+
+Write-only loaders (`Writer[W]`) cannot be used with `Dep` since they lack a `load()` method.
+
+> **Note:** `Loader[T]` is equivalent to `Loader[T, T]` thanks to a PEP 696 default type parameter. This means the write and read types are the same unless explicitly specified otherwise.
+
+### Creating a Custom Loader
+
 Extend `Loader[T]` with `load()` and `save()` methods:
 
 ```python
@@ -149,6 +167,17 @@ class Parquet(loaders.Loader[pandas.DataFrame]):
 
     def save(self, data: pandas.DataFrame, path: pathlib.Path) -> None:
         data.to_parquet(path, compression=self.compression)
+```
+
+If you only need to read (not write), implement `Reader[R]` instead:
+
+```python
+@dataclasses.dataclass(frozen=True)
+class ParquetReader(loaders.Reader[pandas.DataFrame]):
+    """Read-only Parquet loader."""
+
+    def load(self, path: pathlib.Path) -> pandas.DataFrame:
+        return pandas.read_parquet(path)
 ```
 
 Use your custom loader:

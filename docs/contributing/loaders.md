@@ -4,40 +4,79 @@ Guide for adding new data loaders to Pivot.
 
 ## Loader Architecture
 
-Loaders define how Pivot reads and writes data. They implement the `Loader[T]` protocol:
+Pivot provides three base classes for data I/O, allowing you to implement exactly the capabilities you need:
 
 ```python
 @dataclasses.dataclass(frozen=True)
-class Loader(ABC, Generic[T]):
-    """Base class for data loaders."""
+class Reader[R](ABC):
+    """Read-only - can load data from a file.
+
+    Use for dependencies where you only need to read, not write.
+    """
 
     @abstractmethod
-    def load(self, path: pathlib.Path) -> T:
-        """Load data from path."""
+    def load(self, path: pathlib.Path) -> R:
+        """Load data from file path."""
         ...
 
+
+@dataclasses.dataclass(frozen=True)
+class Writer[W](ABC):
+    """Write-only - can save data to a file.
+
+    Use for outputs where you only need to write, not read.
+    """
+
     @abstractmethod
-    def save(self, data: T, path: pathlib.Path) -> None:
-        """Save data to path."""
+    def save(self, data: W, path: pathlib.Path) -> None:
+        """Save data to file path."""
         ...
+
+
+@dataclasses.dataclass(frozen=True)
+class Loader[W, R = W](Writer[W], Reader[R], ABC):
+    """Bidirectional - can both save and load data.
+
+    W is the write type (what save() accepts).
+    R is the read type (what load() returns).
+    For symmetric loaders where W == R, use a single type parameter: Loader[T].
+    """
+    ...
 ```
+
+### When to Use Each Base Class
+
+| Base Class | Use Case | Example |
+|------------|----------|---------|
+| `Reader[R]` | Dependencies only (read from disk) | Reading config files, external data |
+| `Writer[W]` | Outputs only (write to disk) | `MatplotlibFigure` - images can't be read back as Figures |
+| `Loader[T]` | Both directions (most common) | CSV, JSON, Pickle - symmetric read/write |
+| `Loader[W, R]` | Asymmetric bidirectional | Write one type, read back a different type |
+
+**Note:** `Loader[T]` uses PEP 696 type parameter defaults, so `Loader[T]` is equivalent to `Loader[T, T]`.
 
 ## Creating a Custom Loader
 
-### Step 1: Define the Loader Class
+### Step 1: Choose the Right Base Class
 
-Create a frozen dataclass that extends `Loader[T]`:
+- **`Reader[R]`** - Use when you only need to read data (e.g., for `Dep()` only)
+- **`Writer[W]`** - Use when you only need to write data (e.g., for `Out()` only, like plots)
+- **`Loader[T]`** - Use when you need both read and write (most common, required for `IncrementalOut`)
+
+### Step 2: Define the Loader Class
+
+Create a frozen dataclass that extends the appropriate base class:
 
 ```python
 # src/pivot/loaders.py (or your own module)
 import dataclasses
 import pathlib
-from typing import TypeVar
 
 import pandas
 from pivot.loaders import Loader
 
 
+# Bidirectional loader (most common) - Loader[T] defaults R=W via PEP 696
 @dataclasses.dataclass(frozen=True)
 class Parquet(Loader[pandas.DataFrame]):
     """Parquet file loader."""
@@ -52,7 +91,39 @@ class Parquet(Loader[pandas.DataFrame]):
         data.to_parquet(path, compression=self.compression, engine=self.engine)
 ```
 
-### Step 2: Add Type Hints
+Here are examples using each base class:
+
+```python
+from pivot.loaders import Reader, Writer, Loader
+
+# Reader-only: for dependencies you only read
+@dataclasses.dataclass(frozen=True)
+class ConfigReader(Reader[dict]):
+    """Read-only config loader."""
+
+    def load(self, path: pathlib.Path) -> dict:
+        with open(path) as f:
+            return json.load(f)
+
+
+# Writer-only: for outputs you only write (like plots)
+@dataclasses.dataclass(frozen=True)
+class PlotWriter(Writer[Figure]):
+    """Write-only plot saver."""
+    dpi: int = 150
+
+    def save(self, data: Figure, path: pathlib.Path) -> None:
+        data.savefig(path, dpi=self.dpi)
+
+
+# Bidirectional: for read/write (required for IncrementalOut)
+@dataclasses.dataclass(frozen=True)
+class Parquet(Loader[pandas.DataFrame]):
+    """Parquet file loader - Loader[T] is shorthand for Loader[T, T]."""
+    ...
+```
+
+### Step 3: Add Type Hints
 
 Ensure the loader is properly typed:
 
@@ -70,7 +141,7 @@ class Parquet(Loader[pandas.DataFrame]):
         data.to_parquet(path, compression=self.compression)
 ```
 
-### Step 3: Add Tests
+### Step 4: Add Tests
 
 ```python
 # tests/unit/test_loaders.py
@@ -195,9 +266,10 @@ To add a loader to Pivot's built-in set:
 
 - [ ] Uses `@dataclasses.dataclass(frozen=True)`
 - [ ] Defined at module level
-- [ ] Implements `load()` and `save()` methods
+- [ ] Extends the appropriate base class (`Reader`, `Writer`, or `Loader`)
+- [ ] Implements required methods (`load()` for Reader, `save()` for Writer, both for Loader)
 - [ ] Has proper type hints
-- [ ] Has unit tests for roundtrip
+- [ ] Has unit tests for roundtrip (for bidirectional loaders)
 - [ ] Has tests for all options
 - [ ] Documented in README or docs (if adding to core)
 
