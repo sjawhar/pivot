@@ -171,7 +171,7 @@ def test_run_no_commit_creates_pending_lock(
 
         register_test_stage(_helper_process, name="process")
 
-        result = runner.invoke(cli.cli, ["run", "--no-commit"])
+        result = runner.invoke(cli.cli, ["run", "process", "--no-commit"])
 
         assert result.exit_code == 0
 
@@ -200,7 +200,7 @@ def test_run_no_commit_second_run_skips(
         executor.run(no_commit=True)
 
         # Second run via CLI should use cache
-        result = runner.invoke(cli.cli, ["run", "--no-commit"])
+        result = runner.invoke(cli.cli, ["run", "process", "--no-commit"])
         assert result.exit_code == 0, f"Failed with output: {result.output}"
         assert "cached" in result.output.lower() or "unchanged" in result.output.lower()
 
@@ -224,6 +224,6 @@ def test_run_no_commit_then_commit_workflow(
         assert "Committed 1 stage(s)" in result1.output
 
         # Now a normal run via CLI should use cache (uses production lock)
-        result2 = runner.invoke(cli.cli, ["run"])
+        result2 = runner.invoke(cli.cli, ["run", "process"])
         assert result2.exit_code == 0, f"Failed with output: {result2.output}"
         assert "cached" in result2.output.lower() or "unchanged" in result2.output.lower()

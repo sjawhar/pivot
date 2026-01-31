@@ -107,7 +107,7 @@ def test_keep_going_flag_continues_after_failure(runner: CliRunner, tmp_path: pa
         register_test_stage(_stage_failing, name="failing")
         register_test_stage(_stage_succeeding, name="succeeding")
 
-        result = runner.invoke(cli.cli, ["run", "--keep-going"])
+        result = runner.invoke(cli.cli, ["repro", "--keep-going"])
 
         assert result.exit_code == 0
         assert "failing: FAILED" in result.output
@@ -125,7 +125,7 @@ def test_keep_going_flag_skips_downstream(runner: CliRunner, tmp_path: pathlib.P
         register_test_stage(_stage_second, name="second")
         register_test_stage(_stage_independent, name="independent")
 
-        result = runner.invoke(cli.cli, ["run", "--keep-going"])
+        result = runner.invoke(cli.cli, ["repro", "--keep-going"])
 
         assert result.exit_code == 0
         assert "first: FAILED" in result.output
@@ -143,7 +143,7 @@ def test_keep_going_short_flag(runner: CliRunner, tmp_path: pathlib.Path) -> Non
         register_test_stage(_stage_failing, name="failing")
         register_test_stage(_stage_succeeding, name="succeeding")
 
-        result = runner.invoke(cli.cli, ["run", "-k"])
+        result = runner.invoke(cli.cli, ["repro", "-k"])
 
         assert result.exit_code == 0
         assert "failing: FAILED" in result.output
@@ -161,7 +161,7 @@ def test_without_keep_going_stops_on_failure(runner: CliRunner, tmp_path: pathli
         register_test_stage(_stage_failing, name="failing")
         register_test_stage(_stage_downstream, name="downstream")
 
-        result = runner.invoke(cli.cli, ["run"])
+        result = runner.invoke(cli.cli, ["repro"])
 
         assert result.exit_code == 0
         assert "failing: FAILED" in result.output
@@ -171,8 +171,8 @@ def test_without_keep_going_stops_on_failure(runner: CliRunner, tmp_path: pathli
 
 
 def test_keep_going_flag_shown_in_help(runner: CliRunner) -> None:
-    """--keep-going flag is documented in help."""
-    result = runner.invoke(cli.cli, ["run", "--help"])
+    """--keep-going flag is documented in repro help."""
+    result = runner.invoke(cli.cli, ["repro", "--help"])
 
     assert result.exit_code == 0
     assert "--keep-going" in result.output
@@ -188,7 +188,7 @@ def test_keep_going_with_json_output(runner: CliRunner, tmp_path: pathlib.Path) 
         register_test_stage(_stage_failing, name="failing")
         register_test_stage(_stage_succeeding, name="succeeding")
 
-        result = runner.invoke(cli.cli, ["run", "--keep-going", "--json"])
+        result = runner.invoke(cli.cli, ["repro", "--keep-going", "--json"])
 
         assert result.exit_code == 0
         # Parse JSONL output - look for the execution result event
@@ -212,7 +212,7 @@ def test_keep_going_with_dry_run(runner: CliRunner, tmp_path: pathlib.Path) -> N
 
         register_test_stage(_stage_process, name="process")
 
-        result = runner.invoke(cli.cli, ["run", "--keep-going", "--dry-run"])
+        result = runner.invoke(cli.cli, ["repro", "--keep-going", "--dry-run"])
 
         assert result.exit_code == 0
         # Dry run shows what would run without executing
@@ -229,7 +229,7 @@ def test_keep_going_with_dry_run_json(runner: CliRunner, tmp_path: pathlib.Path)
 
         register_test_stage(_stage_process, name="process")
 
-        result = runner.invoke(cli.cli, ["run", "--keep-going", "--dry-run", "--json"])
+        result = runner.invoke(cli.cli, ["repro", "--keep-going", "--dry-run", "--json"])
 
         assert result.exit_code == 0
         # Should produce valid JSON output

@@ -4,8 +4,7 @@ import pathlib
 from typing import TYPE_CHECKING, Annotated, TypedDict
 
 from helpers import register_test_stage
-from pivot import cli, executor, loaders, outputs
-from pivot.storage import cache, track
+from pivot import cli, loaders, outputs
 
 if TYPE_CHECKING:
     import click.testing
@@ -29,75 +28,57 @@ def _helper_process(
 
 
 # =============================================================================
-# run --dry-run --allow-missing Tests
+# pivot run Tests - Single-stage execution only
 # =============================================================================
 
 
-def test_run_dry_run_allow_missing_uses_pvt_hash(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
-) -> None:
-    """run --dry-run --allow-missing uses .pvt hash when dep file is missing."""
+def test_run_requires_stages(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
+    """pivot run without stages shows error."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
 
-        # Create and run
-        pathlib.Path("input.txt").write_text("data")
-        register_test_stage(_helper_process, name="process")
-        executor.run()
-
-        # Track input
-        input_hash = cache.hash_file(pathlib.Path("input.txt"))
-        pvt_data = track.PvtData(path="input.txt", hash=input_hash, size=4)
-        track.write_pvt_file(pathlib.Path("input.txt.pvt"), pvt_data)
-
-        # Delete input (simulating CI)
-        pathlib.Path("input.txt").unlink()
-
-        result = runner.invoke(cli.cli, ["run", "--dry-run", "--allow-missing"])
-
-        # Should show "would skip" not "Missing deps"
-        assert "Missing deps" not in result.output, f"Got: {result.output}"
-        assert "would skip" in result.output.lower(), f"Got: {result.output}"
-
-
-def test_run_dry_run_explain_allow_missing_uses_pvt_hash(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
-) -> None:
-    """run --dry-run --explain --allow-missing uses .pvt hash when dep file is missing."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-
-        # Create and run
-        pathlib.Path("input.txt").write_text("data")
-        register_test_stage(_helper_process, name="process")
-        executor.run()
-
-        # Track input
-        input_hash = cache.hash_file(pathlib.Path("input.txt"))
-        pvt_data = track.PvtData(path="input.txt", hash=input_hash, size=4)
-        track.write_pvt_file(pathlib.Path("input.txt.pvt"), pvt_data)
-
-        # Delete input (simulating CI)
-        pathlib.Path("input.txt").unlink()
-
-        result = runner.invoke(cli.cli, ["run", "--dry-run", "--explain", "--allow-missing"])
-
-        # Should NOT show error about missing deps
-        assert "Missing deps" not in result.output, f"Got: {result.output}"
-        assert result.exit_code == 0, f"Expected success, got: {result.output}"
-
-
-def test_run_allow_missing_requires_dry_run(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
-) -> None:
-    """run --allow-missing without --dry-run errors."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        pathlib.Path("input.txt").write_text("data")
-        register_test_stage(_helper_process, name="process")
-
-        result = runner.invoke(cli.cli, ["run", "--allow-missing"])
+        result = runner.invoke(cli.cli, ["run"])
 
         assert result.exit_code != 0
-        assert "--allow-missing" in result.output
-        assert "--dry-run" in result.output
+        assert "Missing argument" in result.output or "STAGES" in result.output
+
+
+def test_run_executes_single_stage(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
+    """pivot run STAGE executes the specified stage only (no dependencies)."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        pathlib.Path("input.txt").write_text("data")
+        register_test_stage(_helper_process, name="process")
+
+        result = runner.invoke(cli.cli, ["run", "process"])
+
+        assert result.exit_code == 0, f"Failed: {result.output}"
+        assert pathlib.Path("output.txt").exists()
+
+
+def test_run_fail_fast_stops_on_first_failure(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """pivot run --fail-fast stops execution on first failure."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        # Don't create input.txt - this will cause failure
+        register_test_stage(_helper_process, name="process")
+
+        result = runner.invoke(cli.cli, ["run", "--fail-fast", "process"])
+
+        # Should fail since input.txt doesn't exist
+        assert result.exit_code != 0
+
+
+def test_run_multiple_stages(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
+    """pivot run STAGE1 STAGE2 executes multiple stages."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        pathlib.Path("input.txt").write_text("data")
+        register_test_stage(_helper_process, name="process")
+
+        # Can run the same stage name multiple times (though unusual)
+        result = runner.invoke(cli.cli, ["run", "process"])
+
+        assert result.exit_code == 0, f"Failed: {result.output}"

@@ -6,15 +6,16 @@ Complete reference for all Pivot command-line commands.
 
 | Task | Command |
 |------|---------|
-| Run pipeline | `pivot run` |
-| Run specific stages | `pivot run stage1 stage2` |
-| See what would run | `pivot run -n` |
+| Run pipeline | `pivot repro` |
+| Run specific stages + deps | `pivot repro stage1 stage2` |
+| Run single stage (no deps) | `pivot run stage` |
+| See what would run | `pivot repro -n` |
 | Understand why stage runs | `pivot status --explain stage` |
 | List all stages | `pivot list` |
 | Show stage status | `pivot status` |
 | Push outputs to remote | `pivot push` |
 | Pull outputs from remote | `pivot pull` |
-| Watch for changes | `pivot run --watch` |
+| Watch for changes | `pivot repro --watch` |
 
 ---
 
@@ -32,23 +33,22 @@ All commands support:
 
 ## Pipeline Execution
 
-### `pivot run`
+### `pivot repro`
 
-Execute pipeline stages.
+Reproduce pipeline stages with dependency resolution (DAG-aware execution).
 
 ```bash
-pivot run [STAGES...] [OPTIONS]
+pivot repro [STAGES...] [OPTIONS]
 ```
 
 **Arguments:**
 
-- `STAGES` - Stage names to run (optional, runs all if not specified)
+- `STAGES` - Stage names to run (optional, runs entire pipeline if not specified)
 
 **Options:**
 
 | Option | Description |
 |--------|-------------|
-| `--single-stage` / `-s` | Run only specified stages without dependencies |
 | `--cache-dir PATH` | Custom cache directory |
 | `--dry-run` / `-n` | Show what would run without executing |
 | `--explain` / `-e` | Show detailed breakdown of why stages run |
@@ -64,25 +64,74 @@ pivot run [STAGES...] [OPTIONS]
 | `--serve` | Start RPC server for agent control (requires --watch) |
 | `--allow-uncached-incremental` | Allow running stages with IncrementalOut files not in cache |
 | `--checkout-missing` | Restore tracked files from cache before running |
+| `--allow-missing` | Allow missing dep files if tracked (only affects --dry-run) |
 
 **Examples:**
 
 ```bash
-# Run all stages
-pivot run
+# Run entire pipeline
+pivot repro
 
-# Run specific stages
-pivot run preprocess train
+# Run specific stages and their dependencies
+pivot repro train evaluate
 
-# Run single stage without dependencies
-pivot run train --single-stage
-
-# Dry run
-pivot run --dry-run
+# Dry run to see what would execute
+pivot repro --dry-run
 
 # Watch mode
-pivot run --watch
+pivot repro --watch
 ```
+
+---
+
+### `pivot run`
+
+Execute specific stages directly without dependency resolution.
+
+```bash
+pivot run STAGES... [OPTIONS]
+```
+
+**Arguments:**
+
+- `STAGES` - Stage names to run (required)
+
+**Options:**
+
+| Option | Description |
+|--------|-------------|
+| `--cache-dir PATH` | Custom cache directory |
+| `--force` / `-f` | Force re-run of stages, ignoring cache |
+| `--display [tui\|plain]` | Display mode: tui (interactive) or plain (streaming text) |
+| `--json` | Output results as JSON |
+| `--tui-log PATH` | Write TUI messages to JSONL file for monitoring |
+| `--no-commit` | Defer lock files to pending dir for faster iteration |
+| `--no-cache` | Skip caching outputs entirely for maximum iteration speed |
+| `--fail-fast` | Stop on first failure (default: keep going) |
+| `--allow-uncached-incremental` | Allow running stages with IncrementalOut files not in cache |
+| `--checkout-missing` | Restore tracked files from cache before running |
+
+**Examples:**
+
+```bash
+# Run single stage (no deps)
+pivot run train
+
+# Run multiple stages in order
+pivot run preprocess train
+
+# Force re-run
+pivot run train --force
+```
+
+**When to use `run` vs `repro`:**
+
+| Use `repro` when... | Use `run` when... |
+|---------------------|-------------------|
+| Running the pipeline normally | Debugging a specific stage |
+| You want deps to run first | You know deps are already up-to-date |
+| Starting fresh | Re-running a failed stage |
+| Watching for changes | Quick iteration on one stage |
 
 ---
 

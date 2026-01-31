@@ -5,7 +5,7 @@ import click
 from pivot import config, outputs, project
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import targets as cli_targets
-from pivot.cli.run import ensure_stages_registered
+from pivot.cli._run_common import ensure_stages_registered
 from pivot.show import metrics as metrics_mod
 from pivot.types import OutputFormat
 

@@ -118,17 +118,18 @@ def test_cli_run_help(runner: CliRunner) -> None:
     """Run subcommand should show its own help."""
     result = runner.invoke(cli.cli, ["run", "--help"])
     assert result.exit_code == 0
-    assert "--single-stage" in result.output
-    assert "--dry-run" in result.output
+    # run is single-stage only, uses --fail-fast (not --single-stage, --dry-run)
+    assert "--fail-fast" in result.output
+    assert "STAGES" in result.output
 
 
-def test_cli_run_no_stages_registered(runner: CliRunner, tmp_path: pathlib.Path) -> None:
-    """Run with no stages should report empty pipeline."""
+def test_cli_run_no_stages_errors(runner: CliRunner, tmp_path: pathlib.Path) -> None:
+    """Run without stages should error (STAGES are required)."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         (pathlib.Path.cwd() / ".git").mkdir()
         result = runner.invoke(cli.cli, ["run"])
-        assert result.exit_code == 0
-        assert "No stages to run" in result.output
+        assert result.exit_code != 0
+        assert "Missing argument" in result.output or "STAGES" in result.output
 
 
 def test_cli_verbose_accepted(runner: CliRunner) -> None:
@@ -170,7 +171,7 @@ def test_cli_list_verbose_shows_details(runner: CliRunner, set_project_root: pat
 # =============================================================================
 
 
-def test_cli_dry_run_shows_what_would_run(runner: CliRunner, tmp_path: pathlib.Path) -> None:
+def test_repro_dry_run_shows_what_would_run(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """Dry-run shows stages that would run."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
@@ -178,7 +179,7 @@ def test_cli_dry_run_shows_what_would_run(runner: CliRunner, tmp_path: pathlib.P
 
         register_test_stage(_stage_process, name="process")
 
-        result = runner.invoke(cli.cli, ["run", "--dry-run"])
+        result = runner.invoke(cli.cli, ["repro", "--dry-run"])
 
         assert result.exit_code == 0
         assert "Would run:" in result.output
@@ -186,7 +187,7 @@ def test_cli_dry_run_shows_what_would_run(runner: CliRunner, tmp_path: pathlib.P
         assert "would run" in result.output
 
 
-def test_cli_dry_run_shows_unchanged_as_skip(runner: CliRunner, tmp_path: pathlib.Path) -> None:
+def test_repro_dry_run_shows_unchanged_as_skip(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """Dry-run shows unchanged stages as 'would skip'."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
@@ -198,14 +199,14 @@ def test_cli_dry_run_shows_unchanged_as_skip(runner: CliRunner, tmp_path: pathli
         executor.run()
 
         # Now dry-run should show as unchanged
-        result = runner.invoke(cli.cli, ["run", "--dry-run"])
+        result = runner.invoke(cli.cli, ["repro", "--dry-run"])
 
         assert result.exit_code == 0
         assert "process" in result.output
         assert "would skip" in result.output or "unchanged" in result.output
 
 
-def test_cli_force_dry_run_shows_forced(runner: CliRunner, tmp_path: pathlib.Path) -> None:
+def test_repro_force_dry_run_shows_forced(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """Dry-run with --force shows stages as 'would run (forced)'."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
@@ -217,7 +218,7 @@ def test_cli_force_dry_run_shows_forced(runner: CliRunner, tmp_path: pathlib.Pat
         executor.run()
 
         # Now dry-run with --force should show as 'would run (forced)'
-        result = runner.invoke(cli.cli, ["run", "--dry-run", "--force"])
+        result = runner.invoke(cli.cli, ["repro", "--dry-run", "--force"])
 
         assert result.exit_code == 0
         assert "process" in result.output
@@ -225,7 +226,7 @@ def test_cli_force_dry_run_shows_forced(runner: CliRunner, tmp_path: pathlib.Pat
         assert "forced" in result.output
 
 
-def test_cli_dry_run_missing_deps_errors(runner: CliRunner, tmp_path: pathlib.Path) -> None:
+def test_repro_dry_run_missing_deps_errors(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """Dry-run fails when dependencies don't exist and aren't produced by other stages."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
@@ -233,25 +234,25 @@ def test_cli_dry_run_missing_deps_errors(runner: CliRunner, tmp_path: pathlib.Pa
 
         register_test_stage(_stage_missing_input, name="process")
 
-        result = runner.invoke(cli.cli, ["run", "--dry-run"])
+        result = runner.invoke(cli.cli, ["repro", "--dry-run"])
 
         # This should fail because the dependency doesn't exist
         assert result.exit_code != 0
         assert "missing_input.txt" in result.output
 
 
-def test_cli_dry_run_no_stages(runner: CliRunner, tmp_path: pathlib.Path) -> None:
+def test_repro_dry_run_no_stages(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """Dry-run with no stages reports empty pipeline."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
 
-        result = runner.invoke(cli.cli, ["run", "--dry-run"])
+        result = runner.invoke(cli.cli, ["repro", "--dry-run"])
 
         assert result.exit_code == 0
         assert "No stages" in result.output
 
 
-def test_cli_dry_run_specific_stage(runner: CliRunner, tmp_path: pathlib.Path) -> None:
+def test_repro_dry_run_specific_stage(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """Dry-run with stage argument only shows specified stage and dependencies."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
@@ -260,14 +261,14 @@ def test_cli_dry_run_specific_stage(runner: CliRunner, tmp_path: pathlib.Path) -
         register_test_stage(_stage_a, name="stage_a")
         register_test_stage(_stage_b, name="stage_b")
 
-        result = runner.invoke(cli.cli, ["run", "--dry-run", "stage_a"])
+        result = runner.invoke(cli.cli, ["repro", "--dry-run", "stage_a"])
 
         assert result.exit_code == 0
         assert "stage_a" in result.output
         assert "stage_b" not in result.output
 
 
-def test_cli_dry_run_json_output(runner: CliRunner, tmp_path: pathlib.Path) -> None:
+def test_repro_dry_run_json_output(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """Dry-run with --json outputs valid JSON with stage information."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
@@ -275,7 +276,7 @@ def test_cli_dry_run_json_output(runner: CliRunner, tmp_path: pathlib.Path) -> N
 
         register_test_stage(_stage_process, name="process")
 
-        result = runner.invoke(cli.cli, ["run", "--dry-run", "--json"])
+        result = runner.invoke(cli.cli, ["repro", "--dry-run", "--json"])
 
         assert result.exit_code == 0
         data = json.loads(result.output)
@@ -285,19 +286,19 @@ def test_cli_dry_run_json_output(runner: CliRunner, tmp_path: pathlib.Path) -> N
         assert "reason" in data["stages"]["process"]
 
 
-def test_cli_dry_run_json_empty_pipeline(runner: CliRunner, tmp_path: pathlib.Path) -> None:
+def test_repro_dry_run_json_empty_pipeline(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """Dry-run --json with no stages outputs empty stages dict."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
 
-        result = runner.invoke(cli.cli, ["run", "--dry-run", "--json"])
+        result = runner.invoke(cli.cli, ["repro", "--dry-run", "--json"])
 
         assert result.exit_code == 0
         data = json.loads(result.output)
         assert data == {"stages": {}}
 
 
-def test_cli_dry_run_json_with_force(runner: CliRunner, tmp_path: pathlib.Path) -> None:
+def test_repro_dry_run_json_with_force(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """Dry-run --json --force shows forced status."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
@@ -309,7 +310,7 @@ def test_cli_dry_run_json_with_force(runner: CliRunner, tmp_path: pathlib.Path) 
         executor.run()
 
         # Now dry-run with --force --json
-        result = runner.invoke(cli.cli, ["run", "--dry-run", "--force", "--json"])
+        result = runner.invoke(cli.cli, ["repro", "--dry-run", "--force", "--json"])
 
         assert result.exit_code == 0
         data = json.loads(result.output)
@@ -335,12 +336,12 @@ def test_cli_run_exception_shows_error(runner: CliRunner, tmp_path: pathlib.Path
         assert "nonexistent" in result.output.lower() or "error" in result.output.lower()
 
 
-def test_cli_dry_run_exception_shows_error(runner: CliRunner, tmp_path: pathlib.Path) -> None:
+def test_repro_dry_run_exception_shows_error(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """Dry-run command shows error when exception occurs."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
 
-        result = runner.invoke(cli.cli, ["run", "--dry-run", "nonexistent"])
+        result = runner.invoke(cli.cli, ["repro", "--dry-run", "nonexistent"])
 
         assert result.exit_code != 0
 
@@ -358,7 +359,7 @@ def test_cli_run_prints_results(runner: CliRunner, tmp_path: pathlib.Path) -> No
 
         register_test_stage(_stage_my_stage_with_input, name="my_stage")
 
-        result = runner.invoke(cli.cli, ["run"])
+        result = runner.invoke(cli.cli, ["run", "my_stage"])
 
         assert result.exit_code == 0
         assert "my_stage" in result.output
@@ -375,7 +376,7 @@ def test_cli_run_prints_skipped_stages(runner: CliRunner, tmp_path: pathlib.Path
         register_test_stage(_stage_my_stage_with_input, name="my_stage")
 
         # First run via CLI
-        result1 = runner.invoke(cli.cli, ["run"])
+        result1 = runner.invoke(cli.cli, ["run", "my_stage"])
         assert result1.exit_code == 0
         assert "ran" in result1.output.lower()
 
@@ -383,7 +384,7 @@ def test_cli_run_prints_skipped_stages(runner: CliRunner, tmp_path: pathlib.Path
         console._console = None
 
         # Second run via CLI - should skip
-        result2 = runner.invoke(cli.cli, ["run"])
+        result2 = runner.invoke(cli.cli, ["run", "my_stage"])
 
         assert result2.exit_code == 0
         assert "cached" in result2.output.lower()
@@ -473,7 +474,7 @@ def test_cli_run_json_emits_schema_version(runner: CliRunner, tmp_path: pathlib.
 
         register_test_stage(_stage_my_stage_with_input, name="my_stage")
 
-        result = runner.invoke(cli.cli, ["run", "--json"])
+        result = runner.invoke(cli.cli, ["run", "my_stage", "--json"])
 
         assert result.exit_code == 0
         lines = [line for line in result.output.strip().split("\n") if line]
@@ -492,7 +493,7 @@ def test_cli_run_json_emits_stage_events(runner: CliRunner, tmp_path: pathlib.Pa
 
         register_test_stage(_stage_my_stage_with_input, name="my_stage")
 
-        result = runner.invoke(cli.cli, ["run", "--json"])
+        result = runner.invoke(cli.cli, ["run", "my_stage", "--json"])
 
         assert result.exit_code == 0
         events = [json.loads(line) for line in result.output.strip().split("\n") if line]
@@ -510,7 +511,7 @@ def test_cli_run_json_emits_execution_result(runner: CliRunner, tmp_path: pathli
 
         register_test_stage(_stage_my_stage_with_input, name="my_stage")
 
-        result = runner.invoke(cli.cli, ["run", "--json"])
+        result = runner.invoke(cli.cli, ["run", "my_stage", "--json"])
 
         assert result.exit_code == 0
         events = [json.loads(line) for line in result.output.strip().split("\n") if line]
@@ -523,12 +524,12 @@ def test_cli_run_json_emits_execution_result(runner: CliRunner, tmp_path: pathli
         assert "total_duration_ms" in last_event
 
 
-def test_cli_run_json_no_stages_emits_events(runner: CliRunner, tmp_path: pathlib.Path) -> None:
-    """pivot run --json emits events even with no stages."""
+def test_repro_json_no_stages_emits_events(runner: CliRunner, tmp_path: pathlib.Path) -> None:
+    """pivot repro --json emits events even with no stages."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
 
-        result = runner.invoke(cli.cli, ["run", "--json"])
+        result = runner.invoke(cli.cli, ["repro", "--json"])
 
         assert result.exit_code == 0
         events = [json.loads(line) for line in result.output.strip().split("\n") if line]
@@ -548,7 +549,7 @@ def test_cli_run_json_stage_complete_has_duration(
 
         register_test_stage(_stage_my_stage_with_input, name="my_stage")
 
-        result = runner.invoke(cli.cli, ["run", "--json"])
+        result = runner.invoke(cli.cli, ["run", "my_stage", "--json"])
 
         assert result.exit_code == 0
         events = [json.loads(line) for line in result.output.strip().split("\n") if line]
@@ -613,7 +614,7 @@ REGISTRY.register(test_stage)
 """
         )
 
-        result = runner.invoke(cli.cli, ["--quiet", "run"])
+        result = runner.invoke(cli.cli, ["--quiet", "run", "test_stage"])
 
         assert result.exit_code == 0, f"Run failed: {result.output}"
         assert result.output.strip() == "", "Quiet mode should suppress all output"
@@ -727,7 +728,7 @@ def test_cli_run_metrics_env_var(runner: CliRunner, tmp_path: pathlib.Path) -> N
 
         register_test_stage(_stage_my_stage_with_input, name="my_stage")
 
-        result = runner.invoke(cli.cli, ["run"], env={"PIVOT_METRICS": "1"})
+        result = runner.invoke(cli.cli, ["run", "my_stage"], env={"PIVOT_METRICS": "1"})
 
         assert result.exit_code == 0
         assert "Metrics:" in result.output
@@ -744,7 +745,7 @@ def test_cli_run_no_metrics_by_default(runner: CliRunner, tmp_path: pathlib.Path
 
         register_test_stage(_stage_my_stage_with_input, name="my_stage")
 
-        result = runner.invoke(cli.cli, ["run"])
+        result = runner.invoke(cli.cli, ["run", "my_stage"])
 
         assert result.exit_code == 0
         assert "Metrics:" not in result.output
