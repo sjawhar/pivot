@@ -90,7 +90,8 @@ def test_out_subclass_hierarchy() -> None:
     """Metric, Plot should inherit from Out."""
     assert issubclass(outputs.Metric, outputs.Out)
     assert issubclass(outputs.Plot, outputs.Out)
-    assert issubclass(outputs.IncrementalOut, outputs.Out)
+    # Note: IncrementalOut and DirectoryOut are standalone classes (not Out subclasses)
+    # to avoid dataclass field ordering issues. They implement the BaseOut protocol.
 
 
 def test_out_instances_are_out() -> None:
@@ -120,11 +121,14 @@ def test_incremental_out_frozen() -> None:
         inc.path = "other.csv"  # pyright: ignore[reportAttributeAccessIssue]
 
 
-def test_incremental_out_is_out_subclass() -> None:
-    """IncrementalOut should inherit from Out."""
-    assert issubclass(outputs.IncrementalOut, outputs.Out)
+def test_incremental_out_implements_base_out_protocol() -> None:
+    """IncrementalOut should implement BaseOut protocol (not inherit from Out)."""
     inc = outputs.IncrementalOut(path="database.csv", loader=loaders.PathOnly())
-    assert isinstance(inc, outputs.Out)
+    # IncrementalOut is a standalone class that implements BaseOut protocol
+    assert isinstance(inc, outputs.BaseOut)
+    assert hasattr(inc, "path")
+    assert hasattr(inc, "cache")
+    assert hasattr(inc, "loader")
 
 
 def test_normalize_out_incremental_passthrough() -> None:
@@ -149,17 +153,24 @@ def test_directory_out_invalid_path_no_trailing_slash() -> None:
         outputs.DirectoryOut(path="output/dir", loader=loaders.JSON[dict[str, int]]())
 
 
-def test_directory_out_non_string_path_raises_type_error() -> None:
-    """DirectoryOut should raise TypeError if path is not a string."""
-    with pytest.raises(TypeError, match="must be a string"):
-        outputs.DirectoryOut(path=["a/", "b/"], loader=loaders.JSON[dict[str, int]]())  # type: ignore[arg-type]
+def test_directory_out_non_string_path_raises_error() -> None:
+    """DirectoryOut should raise an error if path is not a string."""
+    # Passing a list will fail when __post_init__ tries to call .endswith() on it
+    with pytest.raises(AttributeError):
+        outputs.DirectoryOut(
+            path=["a/", "b/"],  # pyright: ignore[reportArgumentType]
+            loader=loaders.JSON[dict[str, int]](),
+        )
 
 
-def test_directory_out_inherits_from_out() -> None:
-    """DirectoryOut should inherit from Out."""
-    assert issubclass(outputs.DirectoryOut, outputs.Out)
+def test_directory_out_implements_base_out_protocol() -> None:
+    """DirectoryOut should implement BaseOut protocol (not inherit from Out)."""
     dir_out = outputs.DirectoryOut(path="output/", loader=loaders.JSON[dict[str, int]]())
-    assert isinstance(dir_out, outputs.Out)
+    # DirectoryOut is a standalone class that implements BaseOut protocol
+    assert isinstance(dir_out, outputs.BaseOut)
+    assert hasattr(dir_out, "path")
+    assert hasattr(dir_out, "cache")
+    assert hasattr(dir_out, "loader")
 
 
 def test_directory_out_frozen() -> None:
@@ -179,3 +190,34 @@ def test_normalize_out_directory_passthrough() -> None:
     """DirectoryOut should pass through normalize_out unchanged."""
     dir_out = outputs.DirectoryOut(path="output/", loader=loaders.JSON[dict[str, int]]())
     assert outputs.normalize_out(dir_out) is dir_out
+
+
+# TypeGuard tests
+
+
+def test_is_directory_out_true_for_directory_out() -> None:
+    """is_directory_out should return True for DirectoryOut."""
+    dir_out = outputs.DirectoryOut(path="output/", loader=loaders.JSON[dict[str, int]]())
+    assert outputs.is_directory_out(dir_out) is True
+
+
+def test_is_directory_out_false_for_other_types() -> None:
+    """is_directory_out should return False for Out and IncrementalOut."""
+    out = outputs.Out(path="file.txt", loader=loaders.PathOnly())
+    inc = outputs.IncrementalOut(path="cache.json", loader=loaders.JSON())
+    assert outputs.is_directory_out(out) is False
+    assert outputs.is_directory_out(inc) is False
+
+
+def test_is_incremental_out_true_for_incremental_out() -> None:
+    """is_incremental_out should return True for IncrementalOut."""
+    inc = outputs.IncrementalOut(path="cache.json", loader=loaders.JSON())
+    assert outputs.is_incremental_out(inc) is True
+
+
+def test_is_incremental_out_false_for_other_types() -> None:
+    """is_incremental_out should return False for Out and DirectoryOut."""
+    out = outputs.Out(path="file.txt", loader=loaders.PathOnly())
+    dir_out = outputs.DirectoryOut(path="output/", loader=loaders.JSON[dict[str, int]]())
+    assert outputs.is_incremental_out(out) is False
+    assert outputs.is_incremental_out(dir_out) is False

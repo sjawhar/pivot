@@ -219,7 +219,7 @@ def _register_stage(
 
 def _validate_output_type(
     out_name: str,
-    return_out_specs: dict[str, outputs.Out[Any]],
+    return_out_specs: dict[str, outputs.BaseOut],
     expected_type: type[outputs.Out[Any]],
     section_name: str,
     stage_name: str,
@@ -253,7 +253,7 @@ def _validate_output_type(
 def _process_typed_output_section(
     section: OutputsSpec,
     out_path_overrides: dict[str, registry.OutOverride],
-    return_out_specs: dict[str, outputs.Out[Any]],
+    return_out_specs: dict[str, outputs.BaseOut],
     expected_type: type[outputs.Out[Any]],
     section_name: str,
     stage_name: str,

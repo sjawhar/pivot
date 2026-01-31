@@ -559,18 +559,16 @@ def test_matplotlib_figure_loader_dpi_validation_high() -> None:
         loaders.MatplotlibFigure(dpi=2401)
 
 
-def test_matplotlib_figure_loader_load_raises() -> None:
-    """MatplotlibFigure loader raises on load (write-only)."""
+def test_matplotlib_figure_is_writer_only() -> None:
+    """MatplotlibFigure is a Writer, not a Loader - no load() or empty() methods."""
     loader = loaders.MatplotlibFigure()
-    with pytest.raises(NotImplementedError, match="write-only"):
-        loader.load(pathlib.Path("test.png"))
-
-
-def test_matplotlib_figure_loader_empty_raises() -> None:
-    """MatplotlibFigure loader raises on empty (no incremental support)."""
-    loader = loaders.MatplotlibFigure()
-    with pytest.raises(NotImplementedError, match="cannot provide an empty instance"):
-        loader.empty()
+    # MatplotlibFigure is a Writer only - it has save() but not load() or empty()
+    assert hasattr(loader, "save")
+    assert not hasattr(loader, "load")
+    assert not hasattr(loader, "empty")
+    # Verify it's a Writer but not a Loader
+    assert isinstance(loader, loaders.Writer)
+    assert not isinstance(loader, loaders.Loader)
 
 
 def test_matplotlib_figure_loader_is_picklable() -> None:
