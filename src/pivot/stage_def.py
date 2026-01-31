@@ -361,10 +361,13 @@ class FuncDepSpec:
     creates_dep_edge: bool = True
 
 
-def get_dep_specs_from_signature(func: Callable[..., Any]) -> dict[str, FuncDepSpec]:
+def get_dep_specs_from_signature(
+    func: Callable[..., Any],
+    dep_path_overrides: Mapping[str, outputs.PathType] | None = None,
+) -> dict[str, FuncDepSpec]:
     """Extract dependency specs from a function's parameter annotations.
 
-    Looks for Annotated type hints containing Dep or IncrementalOut markers:
+    Looks for Annotated type hints containing Dep, PlaceholderDep, or IncrementalOut markers:
 
         def process(
             data: Annotated[DataFrame, Dep("input.csv", CSV())],
@@ -376,6 +379,16 @@ def get_dep_specs_from_signature(func: Callable[..., Any]) -> dict[str, FuncDepS
         # specs["data"].path == "input.csv"
         # specs["config"].path == "config.json"
 
+    PlaceholderDep requires an override path:
+
+        def compare(
+            baseline: Annotated[DataFrame, PlaceholderDep(CSV())],
+        ) -> OutputType:
+            ...
+
+        specs = get_dep_specs_from_signature(compare, {"baseline": "model/out.csv"})
+        # specs["baseline"].path == "model/out.csv"
+
     IncrementalOut as input creates a FuncDepSpec with creates_dep_edge=False:
 
         MyCache = Annotated[dict | None, IncrementalOut("cache.json", JSON())]
@@ -386,10 +399,11 @@ def get_dep_specs_from_signature(func: Callable[..., Any]) -> dict[str, FuncDepS
         specs = get_dep_specs_from_signature(my_stage)
         # specs["existing"].creates_dep_edge == False
 
-    Returns empty dict if no Dep/IncrementalOut annotations found.
+    Returns empty dict if no Dep/PlaceholderDep/IncrementalOut annotations found.
     """
     import inspect as inspect_module
 
+    overrides = dep_path_overrides or {}
     hints = _get_type_hints_safe(func, func.__name__, include_extras=True)
     if hints is None:
         return {}
@@ -412,12 +426,35 @@ def get_dep_specs_from_signature(func: Callable[..., Any]) -> dict[str, FuncDepS
         if len(args) < 2:
             continue
 
-        # Look for Dep or IncrementalOut in the metadata
+        # Look for PlaceholderDep, Dep, or IncrementalOut in the metadata
         for metadata in args[1:]:
-            if isinstance(metadata, outputs.Dep):
+            if isinstance(metadata, outputs.PlaceholderDep):
+                # PlaceholderDep requires override
+                if param_name not in overrides:
+                    raise ValueError(
+                        f"PlaceholderDep '{param_name}' requires override in dep_path_overrides"
+                    )
+                override_path = overrides[param_name]
+                # Validate non-empty path
+                if isinstance(override_path, (list, tuple)):
+                    if not override_path or any(not p for p in override_path):
+                        raise ValueError(
+                            f"PlaceholderDep '{param_name}' override contains empty path"
+                        )
+                elif not override_path:
+                    raise ValueError(f"PlaceholderDep '{param_name}' override cannot be empty")
+                placeholder = cast("outputs.PlaceholderDep[Any]", metadata)
+                specs[param_name] = FuncDepSpec(
+                    path=override_path,
+                    loader=placeholder.loader,
+                )
+                break
+            elif isinstance(metadata, outputs.Dep):
                 # Cast to Dep[Any] - isinstance narrows to Dep[Unknown]
                 dep = cast("outputs.Dep[Any]", metadata)
-                specs[param_name] = FuncDepSpec(path=dep.path, loader=dep.loader)
+                # Use override if provided, otherwise annotation path
+                path = overrides.get(param_name, dep.path)
+                specs[param_name] = FuncDepSpec(path=path, loader=dep.loader)
                 break
             elif isinstance(metadata, outputs.IncrementalOut):
                 # IncrementalOut as input: loads file if exists, returns None if not
@@ -431,6 +468,45 @@ def get_dep_specs_from_signature(func: Callable[..., Any]) -> dict[str, FuncDepS
                 break
 
     return specs
+
+
+def get_placeholder_dep_names(func: Callable[..., Any]) -> set[str]:
+    """Get parameter names that use PlaceholderDep annotations.
+
+    Scans function parameters for Annotated hints containing PlaceholderDep.
+    Used to validate that all placeholders have overrides before registration.
+
+    Returns:
+        Set of parameter names that have PlaceholderDep annotations.
+    """
+    import inspect as inspect_module
+
+    hints = _get_type_hints_safe(func, func.__name__, include_extras=True)
+    if hints is None:
+        return set()
+
+    sig = inspect_module.signature(func)
+    placeholder_names = set[str]()
+
+    for param_name in sig.parameters:
+        if param_name not in hints:
+            continue
+
+        param_type = _unwrap_type_alias(hints[param_name])
+
+        if get_origin(param_type) is not Annotated:
+            continue
+
+        args = get_args(param_type)
+        if len(args) < 2:
+            continue
+
+        for metadata in args[1:]:
+            if isinstance(metadata, outputs.PlaceholderDep):
+                placeholder_names.add(param_name)
+                break
+
+    return placeholder_names
 
 
 def get_single_output_spec_from_return(func: Callable[..., Any]) -> outputs.Out[Any] | None:
