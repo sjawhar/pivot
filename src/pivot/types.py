@@ -164,6 +164,12 @@ class DirHash(TypedDict):
 HashInfo = FileHash | DirHash
 OutputHash = FileHash | DirHash | None
 
+
+def is_dir_hash(h: OutputHash) -> TypeGuard[DirHash]:
+    """Type guard to narrow OutputHash to DirHash based on manifest presence."""
+    return h is not None and "manifest" in h
+
+
 MetricValue = str | int | float | bool | None
 MetricData = dict[str, MetricValue]
 

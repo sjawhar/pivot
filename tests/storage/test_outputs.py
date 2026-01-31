@@ -131,3 +131,51 @@ def test_normalize_out_incremental_passthrough() -> None:
     """IncrementalOut should pass through normalize_out unchanged."""
     inc = outputs.IncrementalOut(path="database.csv", loader=loaders.PathOnly())
     assert outputs.normalize_out(inc) is inc
+
+
+# DirectoryOut tests
+
+
+def test_directory_out_valid_path() -> None:
+    """DirectoryOut should accept path ending with '/'."""
+    dir_out = outputs.DirectoryOut(path="output/dir/", loader=loaders.JSON[dict[str, int]]())
+    assert dir_out.path == "output/dir/"
+    assert isinstance(dir_out.loader, loaders.JSON)
+
+
+def test_directory_out_invalid_path_no_trailing_slash() -> None:
+    """DirectoryOut should raise ValueError if path doesn't end with '/'."""
+    with pytest.raises(ValueError, match="must end with '/'"):
+        outputs.DirectoryOut(path="output/dir", loader=loaders.JSON[dict[str, int]]())
+
+
+def test_directory_out_non_string_path_raises_type_error() -> None:
+    """DirectoryOut should raise TypeError if path is not a string."""
+    with pytest.raises(TypeError, match="must be a string"):
+        outputs.DirectoryOut(path=["a/", "b/"], loader=loaders.JSON[dict[str, int]]())  # type: ignore[arg-type]
+
+
+def test_directory_out_inherits_from_out() -> None:
+    """DirectoryOut should inherit from Out."""
+    assert issubclass(outputs.DirectoryOut, outputs.Out)
+    dir_out = outputs.DirectoryOut(path="output/", loader=loaders.JSON[dict[str, int]]())
+    assert isinstance(dir_out, outputs.Out)
+
+
+def test_directory_out_frozen() -> None:
+    """DirectoryOut should be immutable (frozen dataclass)."""
+    dir_out = outputs.DirectoryOut(path="output/", loader=loaders.JSON[dict[str, int]]())
+    with pytest.raises(AttributeError):
+        dir_out.path = "other/"  # pyright: ignore[reportAttributeAccessIssue]
+
+
+def test_directory_out_cache_default_true() -> None:
+    """DirectoryOut should have cache=True by default."""
+    dir_out = outputs.DirectoryOut(path="output/", loader=loaders.JSON[dict[str, int]]())
+    assert dir_out.cache is True
+
+
+def test_normalize_out_directory_passthrough() -> None:
+    """DirectoryOut should pass through normalize_out unchanged."""
+    dir_out = outputs.DirectoryOut(path="output/", loader=loaders.JSON[dict[str, int]]())
+    assert outputs.normalize_out(dir_out) is dir_out

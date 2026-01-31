@@ -7,7 +7,7 @@ import pytest
 
 from pivot import project
 from pivot.storage import lock
-from pivot.types import LockData
+from pivot.types import DirHash, LockData
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -735,3 +735,50 @@ def test_dep_path_change_invalidates_cache(tmp_path: Path) -> None:
 
     assert changed is True
     assert "input" in reason.lower() or "dep" in reason.lower()
+
+
+# ==============================================================================
+# DirectoryOut trailing slash preservation
+# ==============================================================================
+
+
+def test_directory_out_trailing_slash_preserved_through_lockfile_roundtrip(
+    set_project_root: Path,
+) -> None:
+    """DirectoryOut paths preserve trailing slash through write/read cycle.
+
+    This is critical because pathlib.Path strips trailing slashes, which would
+    break key matching between stage_outs and lockfile keys.
+    """
+    cache_dir = set_project_root / ".cache"
+    stage_lock = lock.StageLock("dir_out_stage", cache_dir)
+
+    # Simulate DirectoryOut with trailing slash
+    dir_out_path = str(set_project_root / "results") + "/"
+    dir_hash = DirHash(
+        hash="abc123",
+        manifest=[
+            {"relpath": "task_a.json", "hash": "hash_a", "size": 100, "isexec": False},
+            {"relpath": "task_b.json", "hash": "hash_b", "size": 200, "isexec": False},
+        ],
+    )
+
+    data = LockData(
+        code_manifest={"self:dir_out_stage": "fingerprint"},
+        params={},
+        dep_hashes={},
+        output_hashes={dir_out_path: dir_hash},
+        dep_generations={},
+    )
+
+    stage_lock.write(data)
+    result = stage_lock.read()
+
+    assert result is not None
+    # Verify trailing slash is preserved
+    result_paths = list(result["output_hashes"].keys())
+    assert len(result_paths) == 1
+    assert result_paths[0].endswith("/"), f"Trailing slash lost: {result_paths[0]!r}"
+    assert result_paths[0] == dir_out_path
+    # Verify manifest is preserved
+    assert result["output_hashes"][dir_out_path] == dir_hash

@@ -80,7 +80,11 @@ def _convert_to_storage_format(data: LockData) -> StorageLockData:
 
     outs_list = list[OutEntry]()
     for abs_path, hash_info in data["output_hashes"].items():
+        # Preserve trailing slash for DirectoryOut paths (pathlib strips it)
+        is_dir_path = abs_path.endswith("/")
         rel_path = project.to_relative_path(abs_path, proj_root)
+        if is_dir_path and not rel_path.endswith("/"):
+            rel_path += "/"
         if hash_info is None:
             entry = OutEntry(path=rel_path, hash=None)
         else:
@@ -117,7 +121,11 @@ def _convert_from_storage_format(data: StorageLockData) -> LockData:
 
     output_hashes = dict[str, OutputHash]()
     for entry in data["outs"]:
+        # Preserve trailing slash for DirectoryOut paths (pathlib strips it)
+        is_dir_path = entry["path"].endswith("/")
         abs_path = str(project.to_absolute_path(entry["path"], proj_root))
+        if is_dir_path and not abs_path.endswith("/"):
+            abs_path += "/"
         if entry["hash"] is None:
             output_hashes[abs_path] = None
         elif "manifest" in entry:

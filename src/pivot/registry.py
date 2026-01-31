@@ -562,6 +562,9 @@ def _normalize_paths(
     policy = path_policy.POLICIES[path_type]
 
     for path in paths:
+        # Preserve trailing slash for directory paths (DirectoryOut)
+        is_dir_path = path.endswith("/")
+
         try:
             # Normalize path to absolute (from project root)
             if pathlib.Path(path).is_absolute():
@@ -599,10 +602,15 @@ def _normalize_paths(
                             + "This may affect portability across environments."
                         )
 
-            normalized.append(str(norm_path))
+            # Restore trailing slash for directory paths (pathlib strips it)
+            result_path = str(norm_path) + "/" if is_dir_path else str(norm_path)
+            normalized.append(result_path)
         except (ValueError, OSError, exceptions.InvalidPathError):
             if validation_mode == ValidationMode.WARN:
-                normalized.append(str(project.normalize_path(path)))
+                result_path = str(project.normalize_path(path))
+                if is_dir_path:
+                    result_path += "/"
+                normalized.append(result_path)
             else:
                 raise
     return normalized
