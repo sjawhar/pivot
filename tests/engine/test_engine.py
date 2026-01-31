@@ -2112,9 +2112,16 @@ def test_engine_emit_reload_event_emits_pipeline_reloaded(tmp_path: pathlib.Path
         }
 
         # Simulate registry now has stage_a, stage_c (stage_b removed, stage_c added)
-        with patch(
-            "pivot.engine.engine.registry.REGISTRY.list_stages",
-            return_value=["stage_a", "stage_c"],
+        # stage_a exists in both, so we need to mock get() to return its info for fingerprint comparison
+        with (
+            patch(
+                "pivot.engine.engine.registry.REGISTRY.list_stages",
+                return_value=["stage_a", "stage_c"],
+            ),
+            patch(
+                "pivot.engine.engine.registry.REGISTRY.get",
+                return_value=old_stages["stage_a"],  # Same fingerprint, so not modified
+            ),
         ):
             eng._emit_reload_event(old_stages)
 
@@ -2125,6 +2132,112 @@ def test_engine_emit_reload_event_emits_pipeline_reloaded(tmp_path: pathlib.Path
         event = reload_events[0]
         assert "stage_c" in event["stages_added"]
         assert "stage_b" in event["stages_removed"]
+        assert event["stages_modified"] == [], (
+            "stage_a has same fingerprint, should not be modified"
+        )
+        assert event["error"] is None
+
+
+def test_engine_emit_reload_event_detects_modified_stages(tmp_path: pathlib.Path) -> None:
+    """_emit_reload_event() detects stages with changed fingerprints."""
+    with engine.Engine() as eng:
+        sink = _MockSink()
+        eng.add_sink(sink)
+
+        # Create old stages snapshot with specific fingerprints
+        old_stages: dict[str, registry.RegistryStageInfo] = {
+            "stage_a": registry.RegistryStageInfo(
+                func=lambda: None,
+                name="stage_a",
+                deps={},
+                deps_paths=[],
+                outs=[],
+                outs_paths=[],
+                params=None,
+                mutex=[],
+                variant=None,
+                signature=None,
+                fingerprint={"code": "abc123"},  # Old fingerprint
+                dep_specs={},
+                out_specs={},
+                params_arg_name=None,
+            ),
+            "stage_b": registry.RegistryStageInfo(
+                func=lambda: None,
+                name="stage_b",
+                deps={},
+                deps_paths=[],
+                outs=[],
+                outs_paths=[],
+                params=None,
+                mutex=[],
+                variant=None,
+                signature=None,
+                fingerprint={"code": "unchanged"},  # Same fingerprint
+                dep_specs={},
+                out_specs={},
+                params_arg_name=None,
+            ),
+        }
+
+        # Mock registry to return both stages, but stage_a has different fingerprint
+        new_stage_a = registry.RegistryStageInfo(
+            func=lambda: None,
+            name="stage_a",
+            deps={},
+            deps_paths=[],
+            outs=[],
+            outs_paths=[],
+            params=None,
+            mutex=[],
+            variant=None,
+            signature=None,
+            fingerprint={"code": "xyz789"},  # New fingerprint - modified
+            dep_specs={},
+            out_specs={},
+            params_arg_name=None,
+        )
+        new_stage_b = registry.RegistryStageInfo(
+            func=lambda: None,
+            name="stage_b",
+            deps={},
+            deps_paths=[],
+            outs=[],
+            outs_paths=[],
+            params=None,
+            mutex=[],
+            variant=None,
+            signature=None,
+            fingerprint={"code": "unchanged"},  # Same fingerprint - not modified
+            dep_specs={},
+            out_specs={},
+            params_arg_name=None,
+        )
+
+        new_stages_map = {"stage_a": new_stage_a, "stage_b": new_stage_b}
+        with (
+            patch(
+                "pivot.engine.engine.registry.REGISTRY.list_stages",
+                return_value=["stage_a", "stage_b"],
+            ),
+            patch(
+                "pivot.engine.engine.registry.REGISTRY.get",
+                side_effect=new_stages_map.__getitem__,
+            ),
+        ):
+            eng._emit_reload_event(old_stages)
+
+        # Should have emitted PipelineReloaded event with stage_a as modified
+        reload_events = [e for e in sink.events if e["type"] == "pipeline_reloaded"]
+        assert len(reload_events) == 1
+
+        event = reload_events[0]
+        assert event["stages_added"] == []
+        assert event["stages_removed"] == []
+        assert "stage_a" in event["stages_modified"], (
+            "stage_a should be modified (fingerprint changed)"
+        )
+        assert "stage_b" not in event["stages_modified"], "stage_b should not be modified"
         assert event["error"] is None
 
 

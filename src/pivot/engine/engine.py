@@ -832,8 +832,14 @@ class Engine:
 
         added = list(new_stages - old_stage_names)
         removed = list(old_stage_names - new_stages)
-        # TODO: detect modified stages by comparing fingerprints
+
+        # Detect modified stages by comparing fingerprints
         modified = list[str]()
+        for stage_name in old_stage_names & new_stages:
+            old_info = old_stages[stage_name]
+            new_info = registry.REGISTRY.get(stage_name)
+            if old_info["fingerprint"] != new_info["fingerprint"]:
+                modified.append(stage_name)
 
         self.emit(
             PipelineReloaded(

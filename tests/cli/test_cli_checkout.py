@@ -198,6 +198,84 @@ def test_checkout_tracked_directory(
         assert (data_dir / "dog.jpg").read_bytes() == b"dog image"
 
 
+def test_checkout_only_missing_restores_directory_with_missing_file(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """--only-missing restores directory when files inside are missing (issue 274).
+
+    Previously, --only-missing skipped directories entirely if they existed,
+    even when files inside were missing. The fix allows directory restoration
+    to proceed so missing files are restored.
+    """
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        project._project_root_cache = None
+
+        # Create directory with files
+        data_dir = pathlib.Path("images")
+        data_dir.mkdir()
+        (data_dir / "cat.jpg").write_bytes(b"cat image")
+        (data_dir / "dog.jpg").write_bytes(b"dog image")
+
+        # Track the directory (creates .pvt and caches content)
+        result = runner.invoke(cli.cli, ["track", "images"])
+        assert result.exit_code == 0, f"Track failed: {result.output}"
+
+        # Delete one file, leaving directory partially populated
+        (data_dir / "dog.jpg").unlink()
+        assert data_dir.exists(), "Directory should still exist"
+        assert (data_dir / "cat.jpg").exists(), "cat.jpg should still exist"
+        assert not (data_dir / "dog.jpg").exists(), "dog.jpg should be missing"
+
+        # --only-missing should restore the directory (including missing file)
+        result = runner.invoke(cli.cli, ["checkout", "--only-missing", "images"])
+
+        assert result.exit_code == 0, f"Checkout failed: {result.output}"
+        assert data_dir.exists(), "Directory should exist"
+        assert (data_dir / "cat.jpg").read_bytes() == b"cat image"
+        assert (data_dir / "dog.jpg").read_bytes() == b"dog image", (
+            "Missing file should be restored"
+        )
+        assert "Restored" in result.output, "Should show restoration message"
+
+
+def test_checkout_replaces_file_with_directory(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """Checkout replaces a file with a directory when types mismatch.
+
+    If a tracked directory is replaced by a file on disk, checkout should
+    restore the correct directory structure.
+    """
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        project._project_root_cache = None
+
+        # Create and track a directory
+        data_dir = pathlib.Path("images")
+        data_dir.mkdir()
+        (data_dir / "cat.jpg").write_bytes(b"cat image")
+        (data_dir / "dog.jpg").write_bytes(b"dog image")
+
+        result = runner.invoke(cli.cli, ["track", "images"])
+        assert result.exit_code == 0, f"Track failed: {result.output}"
+
+        # Replace directory with a file (simulates accidental overwrite)
+        import shutil
+
+        shutil.rmtree(data_dir)
+        pathlib.Path("images").write_bytes(b"oops, this is a file now")
+        assert pathlib.Path("images").is_file(), "images should be a file"
+
+        # Checkout with --force should restore the directory
+        result = runner.invoke(cli.cli, ["checkout", "--force", "images"])
+
+        assert result.exit_code == 0, f"Checkout failed: {result.output}"
+        assert data_dir.is_dir(), "images should be restored as directory"
+        assert (data_dir / "cat.jpg").read_bytes() == b"cat image"
+        assert (data_dir / "dog.jpg").read_bytes() == b"dog image"
+
+
 # =============================================================================
 # Stage Output Tests
 # =============================================================================
