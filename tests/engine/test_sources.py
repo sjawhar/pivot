@@ -5,8 +5,14 @@ from __future__ import annotations
 import threading
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from pivot.engine import sources, types
+
+if TYPE_CHECKING:
+    from collections.abc import Generator
+
+    import pytest
 
 
 def test_filesystem_source_instantiation() -> None:
@@ -206,3 +212,48 @@ def test_filesystem_source_emits_code_changed_for_config_files(tmp_path: Path) -
 
     code_events = [e for e in events_received if e["type"] == "code_or_config_changed"]
     assert len(code_events) >= 1
+
+
+def test_filesystem_source_debounce_parameter() -> None:
+    """FilesystemSource accepts and stores debounce parameter."""
+    # Default is None
+    source_default = sources.FilesystemSource(watch_paths=[])
+    assert source_default.debounce is None
+
+    # Explicit value is stored
+    source_with_debounce = sources.FilesystemSource(watch_paths=[], debounce=500)
+    assert source_with_debounce.debounce == 500
+
+    # Explicit None works
+    source_explicit_none = sources.FilesystemSource(watch_paths=[], debounce=None)
+    assert source_explicit_none.debounce is None
+
+
+def test_filesystem_source_debounce_passed_to_watchfiles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FilesystemSource passes debounce to watchfiles.watch()."""
+    import watchfiles as watchfiles_module
+
+    captured_kwargs = dict[str, object]()
+
+    def mock_watch(*args: object, **kwargs: object) -> Generator[object]:
+        captured_kwargs.update(kwargs)
+        # Empty generator - yields nothing, exits immediately
+        yield from []
+
+    monkeypatch.setattr(watchfiles_module, "watch", mock_watch)
+
+    # Test with explicit debounce value
+    source = sources.FilesystemSource(watch_paths=[tmp_path], debounce=250)
+    source._watch_loop()
+
+    assert "debounce" in captured_kwargs, "debounce should be passed to watchfiles.watch()"
+    assert captured_kwargs["debounce"] == 250
+
+    # Test with None (should use default 1600)
+    captured_kwargs.clear()
+    source_default = sources.FilesystemSource(watch_paths=[tmp_path], debounce=None)
+    source_default._watch_loop()
+
+    assert captured_kwargs["debounce"] == 1600, "None debounce should default to 1600ms"

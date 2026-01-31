@@ -25,6 +25,39 @@ Three-tier algorithm: (1) O(1) generation tracking in `worker.can_skip_via_gener
 
 StateDB prefixes: `hash:` (file hashes), `gen:` (output generations), `dep:` (stage dep generations), `runcache:` (run cache).
 
+## Worker Execution
+
+Workers execute in separate processes via `loky.get_reusable_executor()` (see Critical Discovery #7).
+
+### WorkerStageInfo Contract
+
+`WorkerStageInfo` (TypedDict at `src/pivot/executor/worker.py`) is the coordinator-to-worker contract. Key fields (non-exhaustive):
+
+| Field | Purpose |
+|-------|---------|
+| `func` | The stage function (must be picklable) |
+| `fingerprint` | Code manifest for change detection |
+| `deps` | Input dependency paths |
+| `outs` | Output specs (`BaseOut` instances) |
+| `project_root` | Absolute path to project root |
+| `state_dir` | Absolute path to `.pivot/` directory |
+
+### Path Derivation
+
+Workers derive all paths from `project_root` and `state_dir` explicitly passed in `WorkerStageInfo`:
+- `state_db_path = stage_info["state_dir"] / "state.db"`
+- Workers `chdir(project_root)` before execution
+
+Do not assume paths from `cache_dir` location—it's passed separately to `execute_stage()`.
+
+### Nested Parallelism
+
+Stages using joblib/scikit-learn with `n_jobs > 1` create nested multiprocessing, causing `resource_tracker` race conditions between Pivot's loky pool and joblib's nested pool.
+
+**Default behavior:** Threading backend (`parallel_config(backend="threading")`). Safe for NumPy/pandas workloads that release the GIL.
+
+**Override:** Set `PIVOT_NESTED_PARALLELISM=processes` to use loky with memmapping disabled.
+
 ## Artifact-Centric Mental Model (Critical)
 
 - Think **artifact-first**, not **stage-first**. The DAG emerges from artifact dependencies.

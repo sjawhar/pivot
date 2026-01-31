@@ -233,7 +233,7 @@ def _run_with_tui(
 def _run_watch_with_tui(
     stages_list: list[str] | None,
     single_stage: bool,
-    debounce: int,  # noqa: ARG001 - debounce not yet used by FilesystemSource
+    debounce: int,
     force: bool = False,
     tui_log: pathlib.Path | None = None,
     no_commit: bool = False,  # noqa: ARG001 - not yet supported in Engine watch mode
@@ -243,11 +243,11 @@ def _run_watch_with_tui(
 ) -> None:
     """Run watch mode with TUI display.
 
-    Note: Several parameters (debounce, no_commit, no_cache) are
+    Note: Several parameters (no_commit, no_cache) are
     retained for CLI signature compatibility but not currently used by Engine watch mode.
     """
     # Suppress unused parameter warnings - retained for CLI compatibility
-    _ = debounce, no_commit, no_cache
+    _ = no_commit, no_cache
 
     import queue as thread_queue
     import uuid
@@ -285,7 +285,7 @@ def _run_watch_with_tui(
         watch_paths = engine_graph.get_watch_paths(bipartite_graph)
 
         # Add FilesystemSource for watching file changes
-        filesystem_source = sources.FilesystemSource(watch_paths)
+        filesystem_source = sources.FilesystemSource(watch_paths, debounce=debounce)
         eng.add_source(filesystem_source)
 
         # Add OneShotSource for initial run if force is set
@@ -516,7 +516,7 @@ def run(
                 watch_paths = engine_graph.get_watch_paths(bipartite_graph)
 
                 # Add FilesystemSource for watching file changes
-                filesystem_source = sources.FilesystemSource(watch_paths)
+                filesystem_source = sources.FilesystemSource(watch_paths, debounce=debounce)
                 eng.add_source(filesystem_source)
 
                 # Add OneShotSource for initial run if force is set

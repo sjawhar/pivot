@@ -47,14 +47,21 @@ class FilesystemSource:
     """
 
     _watch_paths: list[Path]
+    _debounce: int | None
     _submit: Callable[[InputEvent], None] | None
     _running: bool
     _shutdown_event: threading.Event
     _watcher_thread: threading.Thread | None
 
-    def __init__(self, watch_paths: list[Path]) -> None:
-        """Initialize with paths to watch."""
+    def __init__(self, watch_paths: list[Path], debounce: int | None = None) -> None:
+        """Initialize with paths to watch.
+
+        Args:
+            watch_paths: Directories/files to watch for changes.
+            debounce: Debounce delay in milliseconds for watchfiles. None uses watchfiles default.
+        """
         self._watch_paths = list(watch_paths)
+        self._debounce = debounce
         self._submit = None
         self._running = False
         self._shutdown_event = threading.Event()
@@ -64,6 +71,11 @@ class FilesystemSource:
     def watch_paths(self) -> list[Path]:
         """Current paths being watched."""
         return list(self._watch_paths)
+
+    @property
+    def debounce(self) -> int | None:
+        """Debounce delay in milliseconds, or None for watchfiles default (1600ms)."""
+        return self._debounce
 
     def set_watch_paths(self, paths: list[Path]) -> None:
         """Update watched paths.
@@ -107,9 +119,11 @@ class FilesystemSource:
 
     def _watch_loop(self) -> None:
         """Watch for file changes and submit events."""
+        debounce = self._debounce if self._debounce is not None else 1600  # watchfiles default
         for changes in watchfiles.watch(
             *self._watch_paths,
             stop_event=self._shutdown_event,
+            debounce=debounce,
         ):
             # Capture submit callback to avoid race with stop()
             submit = self._submit
