@@ -57,7 +57,6 @@ from pivot.tui.widgets import (
 )
 from pivot.tui.widgets import status as status_utils
 from pivot.types import (
-    DisplayMode,
     StageStatus,
     TuiLogMessage,
     TuiMessageType,
@@ -74,7 +73,6 @@ __all__ = [
     "ExecutorComplete",
     "run_with_tui",
     "run_watch_tui",
-    "should_use_tui",
 ]
 
 if TYPE_CHECKING:
@@ -1342,12 +1340,3 @@ def run_watch_tui(
         serve=serve,
     )
     app.run()
-
-
-def should_use_tui(display_mode: DisplayMode | None) -> bool:
-    """Determine if TUI should be used based on display mode and TTY."""
-    if display_mode == DisplayMode.TUI:
-        return True
-    if display_mode == DisplayMode.PLAIN:
-        return False
-    return sys.stdout.isatty()

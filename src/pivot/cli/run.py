@@ -18,7 +18,6 @@ from pivot.cli import helpers as cli_helpers
 from pivot.engine import engine, sinks
 from pivot.executor import prepare_workers
 from pivot.types import (
-    DisplayMode,
     ExecutionResultEvent,
     OnError,
     RunEventType,
@@ -347,10 +346,10 @@ def _run_watch_with_tui(
     help="Debounce delay in milliseconds (for --watch mode)",
 )
 @click.option(
-    "--display",
-    type=click.Choice([e.value for e in DisplayMode]),
-    default=None,
-    help="Display mode: tui (interactive) or plain (streaming text). Auto-detects if not specified.",
+    "--tui",
+    "tui_flag",
+    is_flag=True,
+    help="Use interactive TUI display (default: plain text)",
 )
 @click.option("--json", "as_json", is_flag=True, help="Output results as JSON")
 @click.option(
@@ -404,7 +403,7 @@ def run(
     force: bool,
     watch: bool,
     debounce: int | None,
-    display: str | None,  # Click passes string, converted to DisplayMode below
+    tui_flag: bool,
     as_json: bool,
     tui_log: pathlib.Path | None,
     no_commit: bool,
@@ -430,12 +429,16 @@ def run(
     stages_list = cli_helpers.stages_to_list(stages)
     _validate_stages(stages_list, single_stage)
 
+    # Validate --tui and --json are mutually exclusive
+    if tui_flag and as_json:
+        raise click.ClickException("--tui and --json are mutually exclusive")
+
     # Validate tui_log requires TUI mode
     if tui_log:
         if as_json:
             raise click.ClickException("--tui-log cannot be used with --json")
-        if display == DisplayMode.PLAIN.value:
-            raise click.ClickException("--tui-log cannot be used with --display=plain")
+        if not tui_flag:
+            raise click.ClickException("--tui-log requires --tui")
         if dry_run:
             raise click.ClickException("--tui-log cannot be used with --dry-run")
         # Validate path upfront (fail fast)
@@ -474,16 +477,11 @@ def run(
     on_error = OnError.KEEP_GOING if keep_going else OnError.FAIL
 
     if watch:
-        from pivot.tui import run as run_tui
-
-        display_mode = DisplayMode(display) if display else None
-        use_tui = run_tui.should_use_tui(display_mode) and not as_json
+        use_tui = tui_flag
 
         # Validate --serve requires TUI mode
         if serve and not use_tui:
-            raise click.ClickException(
-                "--serve requires TUI mode (not compatible with --json or --display=plain)"
-            )
+            raise click.ClickException("--serve requires --tui")
 
         if use_tui:
             try:
@@ -530,8 +528,16 @@ def run(
                     )
                     eng.add_source(initial_source)
 
-                # Add console sink for plain display (unless JSON output)
-                if not as_json:
+                # Add appropriate sink for output mode
+                if as_json:
+                    # Emit schema version for JSONL streaming
+                    cli_helpers.emit_jsonl(
+                        SchemaVersionEvent(
+                            type=RunEventType.SCHEMA_VERSION, version=_JSONL_SCHEMA_VERSION
+                        )
+                    )
+                    eng.add_sink(sinks.JsonlSink(callback=cli_helpers.emit_jsonl))
+                else:
                     from pivot.tui import console as tui_console
 
                     console = tui_console.Console()
@@ -547,14 +553,8 @@ def run(
                         click.echo("\nWatch mode stopped.")
         return
 
-    # Determine display mode
-    display_mode = DisplayMode(display) if display else None
-
-    # Normal execution (with optional explain mode)
-    from pivot.tui import run as run_tui
-
-    # Disable TUI when JSON output is requested
-    use_tui = run_tui.should_use_tui(display_mode) and not as_json
+    # Determine display mode from flags
+    use_tui = tui_flag
     if use_tui:
         results = _run_with_tui(
             stages_list,

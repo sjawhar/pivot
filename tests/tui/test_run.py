@@ -22,7 +22,6 @@ from pivot.tui.widgets import (
 )
 from pivot.tui.widgets import status as tui_status
 from pivot.types import (
-    DisplayMode,
     StageStatus,
     TuiLogMessage,
     TuiMessage,
@@ -160,23 +159,6 @@ def tui_queue() -> TuiQueue:
 def test_format_elapsed(elapsed: float | None, expected: str) -> None:
     """format_elapsed formats elapsed time correctly."""
     assert tui_status.format_elapsed(elapsed) == expected
-
-
-# =============================================================================
-# should_use_tui Tests
-# =============================================================================
-
-
-@pytest.mark.parametrize(
-    ("display_mode", "expected"),
-    [
-        (DisplayMode.TUI, True),
-        (DisplayMode.PLAIN, False),
-    ],
-)
-def test_should_use_tui_explicit_mode(display_mode: DisplayMode, expected: bool) -> None:
-    """should_use_tui returns correct value for explicit display modes."""
-    assert run_tui.should_use_tui(display_mode) is expected
 
 
 # =============================================================================
@@ -724,3 +706,144 @@ def test_stage_log_panel_init() -> None:
     """StageLogPanel can be instantiated."""
     panel = StageLogPanel(id="test-logs")
     assert isinstance(panel, StageLogPanel)
+
+
+# =============================================================================
+# TUI Log File Tests
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_tui_app_with_tui_log_writes_to_file(
+    tui_queue: TuiQueue,
+    tmp_path: pathlib.Path,
+) -> None:
+    """PivotApp writes messages to tui_log file when configured."""
+    import json
+
+    log_path = tmp_path / "tui.jsonl"
+
+    def executor_func() -> dict[str, executor.ExecutionSummary]:
+        return {"stage1": executor.ExecutionSummary(status=StageStatus.RAN, reason="code changed")}
+
+    app = run_tui.PivotApp(
+        tui_queue,
+        stage_names=["stage1"],
+        tui_log=log_path,
+        executor_func=executor_func,
+    )
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+
+        # Send a status message through the queue
+        msg = TuiStatusMessage(
+            type=TuiMessageType.STATUS,
+            stage="stage1",
+            index=1,
+            total=1,
+            status=StageStatus.RAN,
+            reason="code changed",
+            elapsed=1.5,
+            run_id="test123",
+        )
+        tui_queue.put(msg)
+
+        # Give app time to process message
+        await pilot.pause()
+        await pilot.pause()
+
+    # Close the app to flush log file
+    app._close_log_file()
+
+    # Verify log file was written
+    assert log_path.exists()
+    content = log_path.read_text()
+
+    # Should contain JSON lines
+    if content.strip():
+        lines = content.strip().split("\n")
+        # At least one valid JSON line
+        assert len(lines) >= 1
+        for line in lines:
+            if line.strip():
+                data = json.loads(line)
+                assert "type" in data
+
+
+@pytest.mark.asyncio
+async def test_tui_app_without_tui_log_no_file_created(
+    tui_queue: TuiQueue,
+    tmp_path: pathlib.Path,
+) -> None:
+    """PivotApp does not create log file when tui_log is None."""
+    log_path = tmp_path / "tui.jsonl"
+
+    def executor_func() -> dict[str, executor.ExecutionSummary]:
+        return {}
+
+    app = run_tui.PivotApp(
+        tui_queue,
+        stage_names=["stage1"],
+        tui_log=None,  # No log file
+        executor_func=executor_func,
+    )
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+
+    # Log file should not exist
+    assert not log_path.exists()
+
+
+# =============================================================================
+# Watch Mode TUI Tests
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_watch_tui_app_with_serve_flag(
+    mock_watch_engine: Engine,
+) -> None:
+    """PivotApp (watch mode) initializes serve mode correctly."""
+    tui_queue: TuiQueue = thread_queue.Queue()
+
+    app = run_tui.PivotApp(
+        tui_queue,
+        engine=mock_watch_engine,
+        serve=True,
+    )
+
+    # App should be configured for serve mode
+    assert app._serve is True
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        # App should mount and be ready
+        assert app._engine is mock_watch_engine
+
+
+@pytest.mark.asyncio
+async def test_watch_tui_app_with_tui_log(
+    mock_watch_engine: Engine,
+    tmp_path: pathlib.Path,
+) -> None:
+    """PivotApp (watch mode) writes to tui_log when configured."""
+    tui_queue: TuiQueue = thread_queue.Queue()
+    log_path = tmp_path / "watch_tui.jsonl"
+
+    app = run_tui.PivotApp(
+        tui_queue,
+        engine=mock_watch_engine,
+        tui_log=log_path,
+    )
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+
+    # Close log file
+    app._close_log_file()
+
+    # Log file should have been created (even if empty, touch happened in CLI)
+    # The app itself creates and opens the file
+    assert log_path.exists()

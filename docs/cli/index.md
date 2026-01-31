@@ -64,7 +64,7 @@ pivot run [STAGES...] [OPTIONS]
 | `--force` / `-f` | Force re-run of stages, ignoring cache (in --watch mode, first run only) |
 | `--watch` / `-w` | Watch for file changes and re-run affected stages |
 | `--debounce MS` | Debounce delay in milliseconds (default: 300) |
-| `--display [tui\|plain]` | Display mode: tui (interactive) or plain (streaming text) |
+| `--tui` | Use interactive TUI display (default: plain text) |
 | `--json` | Output results as JSON |
 | `--tui-log PATH` | Write TUI messages to JSONL file for monitoring |
 | `--no-commit` | Defer lock files to pending dir for faster iteration |
