@@ -131,7 +131,7 @@ class WorkerStageInfo(TypedDict):
     no_commit: bool
     no_cache: bool
     dep_specs: dict[str, stage_def.FuncDepSpec]
-    out_specs: dict[str, outputs.Out[Any]]
+    out_specs: dict[str, outputs.BaseOut]
     params_arg_name: str | None
     project_root: pathlib.Path
     state_dir: pathlib.Path
@@ -706,7 +706,7 @@ def _run_stage_function_with_injection(
     params: stage_def.StageParams | None = None,
     dep_specs: dict[str, stage_def.FuncDepSpec] | None = None,
     project_root: pathlib.Path | None = None,
-    out_specs: dict[str, outputs.Out[Any]] | None = None,
+    out_specs: dict[str, outputs.BaseOut] | None = None,
     params_arg_name: str | None = None,
 ) -> None:
     """Run stage function with dependency injection and output capture.

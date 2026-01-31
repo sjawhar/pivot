@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import TYPE_CHECKING, Any, Generic, TypeGuard, TypeVar
+from typing import TYPE_CHECKING, Any, Protocol, TypeGuard, runtime_checkable
 
 if TYPE_CHECKING:
     from pivot import loaders as loaders_module
-
-T = TypeVar("T")
 
 # Path type: single string, variable-length list, or fixed-length tuple
 PathType = str | list[str] | tuple[str, ...]
@@ -18,15 +16,15 @@ JsonValue = dict[str, Any] | list[Any] | str | int | float | bool | None
 # Loader factory functions for dataclass defaults (defined before classes that use them)
 
 
-def _default_json_loader() -> loaders_module.Loader[JsonValue]:
-    """Factory for default Metric loader."""
+def _default_json_writer() -> loaders_module.Writer[JsonValue]:
+    """Factory for default Metric writer."""
     from pivot import loaders
 
     return loaders.JSON()
 
 
 @dataclasses.dataclass(frozen=True)
-class Dep(Generic[T]):  # noqa: UP046 - basedpyright doesn't support PEP 695 syntax yet
+class Dep[R]:  # noqa: UP046 - basedpyright doesn't support PEP 695 syntax yet
     """Dependency marker for Annotated type hints.
 
     Use in function parameters to declare a file dependency:
@@ -49,11 +47,11 @@ class Dep(Generic[T]):  # noqa: UP046 - basedpyright doesn't support PEP 695 syn
     """
 
     path: PathType
-    loader: loaders_module.Loader[T]
+    loader: loaders_module.Reader[R]
 
 
 @dataclasses.dataclass(frozen=True)
-class PlaceholderDep(Generic[T]):  # noqa: UP046 - basedpyright doesn't support PEP 695 syntax yet
+class PlaceholderDep[R]:  # noqa: UP046 - basedpyright doesn't support PEP 695 syntax yet
     """Dependency marker with no default path — must be overridden at registration.
 
     Use when a stage needs a dependency that has no sensible default.
@@ -74,11 +72,11 @@ class PlaceholderDep(Generic[T]):  # noqa: UP046 - basedpyright doesn't support 
         )
     """
 
-    loader: loaders_module.Loader[T]
+    loader: loaders_module.Reader[R]
 
 
 @dataclasses.dataclass(frozen=True)
-class Out(Generic[T]):  # noqa: UP046 - basedpyright doesn't support PEP 695 syntax yet
+class Out[W]:  # noqa: UP046 - basedpyright doesn't support PEP 695 syntax yet
     """Unified output marker and storage.
 
     Used both as annotation marker AND registry storage.
@@ -109,7 +107,7 @@ class Out(Generic[T]):  # noqa: UP046 - basedpyright doesn't support PEP 695 syn
     """
 
     path: PathType
-    loader: loaders_module.Loader[T]
+    loader: loaders_module.Writer[W]
     cache: bool = True
 
 
@@ -127,14 +125,14 @@ class Metric(Out[JsonValue]):
     Metrics are not cached by default (they're small and should be git-tracked).
     """
 
-    loader: loaders_module.Loader[JsonValue] = dataclasses.field(
-        default_factory=_default_json_loader
+    loader: loaders_module.Writer[JsonValue] = dataclasses.field(
+        default_factory=_default_json_writer
     )  # type: ignore[assignment]
     cache: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
-class Plot(Out[T]):  # noqa: UP046 - basedpyright doesn't support PEP 695 syntax yet
+class Plot[W](Out[W]):  # noqa: UP046 - basedpyright doesn't support PEP 695 syntax yet
     """Plot output with visualization options.
 
     Use for visualization outputs with explicit loader:
@@ -156,8 +154,11 @@ class Plot(Out[T]):  # noqa: UP046 - basedpyright doesn't support PEP 695 syntax
 
 
 @dataclasses.dataclass(frozen=True)
-class IncrementalOut(Out[T]):
+class IncrementalOut[W, R = W]:  # noqa: UP046 - basedpyright doesn't support PEP 695 syntax yet
     """Incremental output - restored from cache before stage runs.
+
+    W is the write type (what the stage returns).
+    R is the read type (what gets loaded). Defaults to W for symmetric loaders.
 
     Use for outputs that are incrementally updated across runs:
 
@@ -167,16 +168,21 @@ class IncrementalOut(Out[T]):
     Before stage execution, previous output is restored from cache as a writable
     copy. Stage can read, modify, and write back. Changes are re-cached after run.
 
-    Loader is REQUIRED (inherited from Out).
+    Requires a full Loader (not just Reader or Writer) since it needs both
+    load() for restoring and save() for persisting.
     """
+
+    path: PathType
+    loader: loaders_module.Loader[W, R]
+    cache: bool = True
 
 
 @dataclasses.dataclass(frozen=True)
-class DirectoryOut(Out[dict[str, T]]):  # noqa: UP046 - basedpyright doesn't support PEP 695 syntax yet
+class DirectoryOut[T]:  # noqa: UP046 - basedpyright doesn't support PEP 695 syntax yet
     """Directory output - dynamic set of files determined at runtime.
 
     Generic parameter T represents the value type stored in each file.
-    DirectoryOut[T] stores dict[str, T], matching Out[dict[str, T]].
+    DirectoryOut[T] stores dict[str, T] (the return type), but the loader writes T.
 
     Use for outputs where the number and paths of files are determined at runtime:
 
@@ -194,31 +200,66 @@ class DirectoryOut(Out[dict[str, T]]):  # noqa: UP046 - basedpyright doesn't sup
 
     Keys are relative paths within the directory. Values are serialized by the loader.
     Path must end with '/' to enforce directory semantics.
-
-    Loader is REQUIRED (inherited from Out).
     """
 
+    path: str  # Must be str ending with '/', not list/tuple
+    loader: loaders_module.Writer[T]
+    cache: bool = True
+
     def __post_init__(self) -> None:
-        # path must be str for DirectoryOut (not list/tuple)
-        if not isinstance(self.path, str):
-            raise TypeError(f"DirectoryOut path must be a string, got {type(self.path).__name__}")
         if not self.path.endswith("/"):
             raise ValueError(f"DirectoryOut path must end with '/': {self.path!r}")
 
 
-def is_directory_out(spec: Out[Any]) -> TypeGuard[DirectoryOut[Any]]:
-    """Type guard to narrow Out to DirectoryOut, reducing need for casts."""
+@runtime_checkable
+class BaseOut(Protocol):
+    """Protocol for common output spec attributes.
+
+    All output specs (Out, DirectoryOut, IncrementalOut) implement this protocol,
+    providing access to the common `path`, `cache`, and `loader` attributes.
+
+    This is a Protocol rather than a base class because dataclass inheritance
+    has field ordering constraints that prevent a clean hierarchy.
+    """
+
+    @property
+    def path(self) -> PathType:
+        """File path(s) for this output."""
+        ...
+
+    @property
+    def cache(self) -> bool:
+        """Whether this output should be cached."""
+        ...
+
+    @property
+    def loader(self) -> loaders_module.Writer[Any] | loaders_module.Loader[Any, Any]:
+        """Writer or Loader for this output.
+
+        Out and DirectoryOut use Writer (save only).
+        IncrementalOut uses Loader (save and load for restore).
+        """
+        ...
+
+
+def is_directory_out(spec: BaseOut) -> TypeGuard[DirectoryOut[Any]]:
+    """Type guard to narrow output spec to DirectoryOut."""
     return isinstance(spec, DirectoryOut)
 
 
-# Type alias for compatibility - Out is now the base
-BaseOut = Out[Any]
+def is_incremental_out(spec: BaseOut) -> TypeGuard[IncrementalOut[Any, Any]]:
+    """Type guard to narrow output spec to IncrementalOut."""
+    return isinstance(spec, IncrementalOut)
+
+
+# Type alias for any output spec
+AnyOut = Out[Any] | DirectoryOut[Any] | IncrementalOut[Any, Any]
 
 # Output spec can be string (converted to Out with default loader) or any Out subclass
-OutSpec = str | Out[Any]
+OutSpec = str | AnyOut
 
 
-def normalize_out(out: OutSpec) -> Out[Any]:
+def normalize_out(out: OutSpec) -> AnyOut:
     """Convert string or Out subclass to Out object.
 
     String paths are converted to Out with PathOnly loader.

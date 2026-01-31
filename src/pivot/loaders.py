@@ -19,24 +19,46 @@ import yaml
 
 
 @dataclasses.dataclass(frozen=True)
-class Loader[T](abc.ABC):
-    """Base class for file loaders providing typed dependency/output access.
+class Reader[R](abc.ABC):
+    """Read-only loader - can load data from a file.
+
+    Use for dependencies where you only need to read, not write.
+    Readers are immutable, picklable, and their code is fingerprinted.
+    """
+
+    @abc.abstractmethod
+    def load(self, path: pathlib.Path) -> R:
+        """Load data from file path."""
+        ...
+
+
+@dataclasses.dataclass(frozen=True)
+class Writer[W](abc.ABC):
+    """Write-only loader - can save data to a file.
+
+    Use for outputs where you only need to write, not read.
+    Writers are immutable, picklable, and their code is fingerprinted.
+    """
+
+    @abc.abstractmethod
+    def save(self, data: W, path: pathlib.Path) -> None:
+        """Save data to file path."""
+        ...
+
+
+@dataclasses.dataclass(frozen=True)
+class Loader[W, R = W](Writer[W], Reader[R], abc.ABC):
+    """Bidirectional loader - can both save and load data.
+
+    W is the write type (what save() accepts).
+    R is the read type (what load() returns).
+    For symmetric loaders where W == R, use a single type parameter: Loader[T].
 
     Loaders are immutable, picklable, and their code is fingerprinted.
     Changes to loader implementation trigger stage re-runs.
     """
 
-    @abc.abstractmethod
-    def load(self, path: pathlib.Path) -> T:
-        """Load data from file path."""
-        ...
-
-    @abc.abstractmethod
-    def save(self, data: T, path: pathlib.Path) -> None:
-        """Save data to file path."""
-        ...
-
-    def empty(self) -> T:
+    def empty(self) -> R:
         """Return an empty instance of the loaded type.
 
         Used for IncrementalOut on first run when no previous output exists.
@@ -48,7 +70,7 @@ class Loader[T](abc.ABC):
 
 
 @dataclasses.dataclass(frozen=True)
-class CSV[T](Loader[T]):
+class CSV[T](Loader[T, T]):
     """CSV file loader using pandas.
 
     Generic type parameter indicates the DataFrame type for type checking.
@@ -81,7 +103,7 @@ class CSV[T](Loader[T]):
 
 
 @dataclasses.dataclass(frozen=True)
-class JSON[T](Loader[T]):
+class JSON[T](Loader[T, T]):
     """JSON file loader.
 
     Generic type parameter indicates the expected type for type checking.
@@ -111,7 +133,7 @@ class JSON[T](Loader[T]):
 
 
 @dataclasses.dataclass(frozen=True)
-class YAML[T](Loader[T]):
+class YAML[T](Loader[T, T]):
     """YAML file loader.
 
     Generic type parameter indicates the expected type for type checking.
@@ -139,7 +161,7 @@ class YAML[T](Loader[T]):
 
 
 @dataclasses.dataclass(frozen=True)
-class Text(Loader[str]):
+class Text(Loader[str, str]):
     """Plain text file loader.
 
     Saves atomically via temp file + rename to prevent corruption.
@@ -173,7 +195,7 @@ class Text(Loader[str]):
 
 
 @dataclasses.dataclass(frozen=True)
-class JSONL(Loader[list[dict[str, Any]]]):
+class JSONL(Loader[list[dict[str, Any]], list[dict[str, Any]]]):
     """JSONL (JSON Lines) file loader - one JSON object per line.
 
     Saves atomically via temp file + rename. Reports line numbers on parse errors.
@@ -216,7 +238,7 @@ class JSONL(Loader[list[dict[str, Any]]]):
 
 
 @dataclasses.dataclass(frozen=True)
-class DataFrameJSONL(Loader[pandas.DataFrame]):
+class DataFrameJSONL(Loader[pandas.DataFrame, pandas.DataFrame]):
     """JSONL (JSON Lines) file loader that returns a pandas DataFrame.
 
     Uses pandas.read_json with lines=True for efficient loading.
@@ -251,7 +273,7 @@ class DataFrameJSONL(Loader[pandas.DataFrame]):
 
 
 @dataclasses.dataclass(frozen=True)
-class Pickle[T](Loader[T]):
+class Pickle[T](Loader[T, T]):
     """Pickle file loader for arbitrary Python objects.
 
     WARNING: Loading pickle files from untrusted sources is a security risk.
@@ -272,7 +294,7 @@ class Pickle[T](Loader[T]):
 
 
 @dataclasses.dataclass(frozen=True)
-class PathOnly(Loader[pathlib.Path]):
+class PathOnly(Loader[pathlib.Path, pathlib.Path]):
     """No-op loader that returns the path itself for manual loading.
 
     Use when you need custom loading logic that doesn't fit standard loaders.
@@ -291,11 +313,14 @@ class PathOnly(Loader[pathlib.Path]):
 
 
 @dataclasses.dataclass(frozen=True)
-class MatplotlibFigure(Loader["Figure"]):
+class MatplotlibFigure(Writer["Figure"]):
     """Save matplotlib figures as images. Write-only.
 
     Figures are closed after saving to prevent memory leaks.
     Format is inferred from path extension (.png, .pdf, .svg).
+
+    This is a Writer (not Loader) because images cannot be loaded back as Figures.
+    To read images, use a separate Reader like PathOnly() and load manually.
     """
 
     dpi: int = 150
@@ -319,9 +344,3 @@ class MatplotlibFigure(Loader["Figure"]):
             )
         finally:
             plt.close(data)
-
-    @override
-    def load(self, path: pathlib.Path) -> Figure:
-        raise NotImplementedError(
-            "MatplotlibFigure is write-only. Use Out(), not Dep(). To load images, use PathOnly() and handle loading manually."
-        )
