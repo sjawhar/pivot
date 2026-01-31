@@ -44,6 +44,10 @@ class StageStatus(enum.StrEnum):
     UNKNOWN = "unknown"
 
 
+CompletionType = Literal[StageStatus.RAN, StageStatus.SKIPPED, StageStatus.FAILED]
+"""Status values for stages that have finished execution."""
+
+
 class DisplayCategory(enum.StrEnum):
     """Display category for stage results in UI.
 
@@ -113,7 +117,7 @@ class DeferredWrites(TypedDict, total=False):
 class StageResult(TypedDict):
     """Result from executing a single stage."""
 
-    status: Literal[StageStatus.RAN, StageStatus.SKIPPED, StageStatus.FAILED]
+    status: CompletionType
     reason: str
     output_lines: list[tuple[str, bool]]
     metrics: NotRequired[list[tuple[str, float]]]  # (name, duration_ms) for cross-process

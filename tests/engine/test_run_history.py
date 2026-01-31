@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from pivot import config
+from pivot.engine import sinks, sources
 from pivot.storage import state as state_mod
 from tests import helpers
 
@@ -46,10 +47,18 @@ def test_engine_writes_run_history(
     monkeypatch.setattr(config, "get_state_db_path", lambda: state_dir / "state.db")
 
     # Run the stage
-    results = test_engine.run_once(
-        stages=[registered_stage],
-        cache_dir=cache_dir,
+    collector = sinks.ResultCollectorSink()
+    test_engine.add_sink(collector)
+    test_engine.add_source(
+        sources.OneShotSource(
+            stages=[registered_stage],
+            force=False,
+            reason="test",
+            cache_dir=cache_dir,
+        )
     )
+    test_engine.run(exit_on_completion=True)
+    results = collector.get_execution_summaries()
 
     assert registered_stage in results
 
@@ -79,7 +88,17 @@ def test_engine_run_history_contains_stage_records(
     monkeypatch.setattr(config, "get_state_db_path", lambda: state_dir / "state.db")
 
     # Run the stage
-    test_engine.run_once(stages=[registered_stage], cache_dir=cache_dir)
+    collector = sinks.ResultCollectorSink()
+    test_engine.add_sink(collector)
+    test_engine.add_source(
+        sources.OneShotSource(
+            stages=[registered_stage],
+            force=False,
+            reason="test",
+            cache_dir=cache_dir,
+        )
+    )
+    test_engine.run(exit_on_completion=True)
 
     # Verify run history contains stage record
     with state_mod.StateDB(state_dir / "state.db") as state_db:
@@ -110,8 +129,30 @@ def test_engine_writes_run_cache_entry(
     monkeypatch.setattr(config, "get_state_db_path", lambda: state_dir / "state.db")
 
     # Run twice - second should be cached
-    test_engine.run_once(stages=[registered_stage], cache_dir=cache_dir)
-    results = test_engine.run_once(stages=[registered_stage], cache_dir=cache_dir)
+    collector1 = sinks.ResultCollectorSink()
+    test_engine.add_sink(collector1)
+    test_engine.add_source(
+        sources.OneShotSource(
+            stages=[registered_stage],
+            force=False,
+            reason="test",
+            cache_dir=cache_dir,
+        )
+    )
+    test_engine.run(exit_on_completion=True)
+
+    collector2 = sinks.ResultCollectorSink()
+    test_engine.add_sink(collector2)
+    test_engine.add_source(
+        sources.OneShotSource(
+            stages=[registered_stage],
+            force=False,
+            reason="test",
+            cache_dir=cache_dir,
+        )
+    )
+    test_engine.run(exit_on_completion=True)
+    results = collector2.get_execution_summaries()
 
     # Should be skipped due to cache
     assert results[registered_stage]["reason"] != "", "Stage should have a skip reason"

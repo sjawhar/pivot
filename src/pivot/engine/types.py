@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 from enum import Enum, IntEnum
-from typing import TYPE_CHECKING, Literal, Protocol, TypedDict
+from typing import TYPE_CHECKING, Literal, NotRequired, Protocol, TypedDict
 
 if TYPE_CHECKING:
+    import pathlib
     from collections.abc import Callable
 
-    from pivot.types import StageStatus
+    from pivot.types import CompletionType, OnError
 
 __all__ = [
     "StageExecutionState",
@@ -84,12 +85,26 @@ class CodeOrConfigChanged(TypedDict):
 
 
 class RunRequested(TypedDict):
-    """Explicit run request from CLI, RPC, or agent."""
+    """Explicit run request from CLI, RPC, or agent.
+
+    Required fields are always present. Optional fields use NotRequired
+    and have defaults applied in _handle_run_requested().
+    """
 
     type: Literal["run_requested"]
     stages: list[str] | None  # None = all stages
     force: bool
     reason: str  # "cli", "agent:{run_id}", "watch:initial"
+    # Optional execution parameters (NotRequired = may be absent)
+    single_stage: NotRequired[bool]  # Default: False
+    parallel: NotRequired[bool]  # Default: True
+    max_workers: NotRequired[int | None]  # Default: None (auto)
+    no_commit: NotRequired[bool]  # Default: False
+    no_cache: NotRequired[bool]  # Default: False
+    on_error: NotRequired[OnError]  # Default: OnError.FAIL
+    cache_dir: NotRequired[pathlib.Path | None]  # Default: None (auto)
+    allow_uncached_incremental: NotRequired[bool]  # Default: False
+    checkout_missing: NotRequired[bool]  # Default: False
 
 
 class CancelRequested(TypedDict):
@@ -117,6 +132,7 @@ class PipelineReloaded(TypedDict):
     """Registry was reloaded, DAG structure may have changed."""
 
     type: Literal["pipeline_reloaded"]
+    stages: list[str]  # All stages in topological order
     stages_added: list[str]
     stages_removed: list[str]
     stages_modified: list[str]
@@ -137,7 +153,7 @@ class StageCompleted(TypedDict):
 
     type: Literal["stage_completed"]
     stage: str
-    status: StageStatus
+    status: CompletionType
     reason: str
     duration_ms: float
     index: int

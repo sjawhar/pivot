@@ -327,6 +327,7 @@ def test_engine_emits_status_messages_via_tui_sink(
     """Engine with TuiSink emits TuiStatusMessage for stage start and completion."""
     from pivot.engine import engine as engine_mod
     from pivot.engine import sinks as engine_sinks
+    from pivot.engine import sources as engine_sources
 
     (pipeline_dir / "input.txt").write_text("hello")
 
@@ -335,7 +336,8 @@ def test_engine_emits_status_messages_via_tui_sink(
     run_id = "test_run_123"
     with engine_mod.Engine() as eng:
         eng.add_sink(engine_sinks.TuiSink(tui_queue=tui_queue, run_id=run_id))
-        eng.run_once()
+        eng.add_source(engine_sources.OneShotSource(stages=None, force=False, reason="test"))
+        eng.run(exit_on_completion=True)
 
     messages = _drain_queue(tui_queue)
     status_messages = [m for m in messages if is_tui_status_message(m)]
@@ -366,6 +368,7 @@ def test_engine_emits_failed_status_via_tui_sink(
     """Engine with TuiSink emits FAILED status when stage raises an exception."""
     from pivot.engine import engine as engine_mod
     from pivot.engine import sinks as engine_sinks
+    from pivot.engine import sources as engine_sources
 
     (pipeline_dir / "input.txt").write_text("hello")
 
@@ -374,7 +377,8 @@ def test_engine_emits_failed_status_via_tui_sink(
     run_id = "test_run_456"
     with engine_mod.Engine() as eng:
         eng.add_sink(engine_sinks.TuiSink(tui_queue=tui_queue, run_id=run_id))
-        eng.run_once()
+        eng.add_source(engine_sources.OneShotSource(stages=None, force=False, reason="test"))
+        eng.run(exit_on_completion=True)
 
     messages = _drain_queue(tui_queue)
     status_messages = [m for m in messages if is_tui_status_message(m)]
@@ -393,6 +397,7 @@ def test_engine_emits_status_for_multiple_stages(
     """Engine with TuiSink emits status messages for all stages in multi-stage pipeline."""
     from pivot.engine import engine as engine_mod
     from pivot.engine import sinks as engine_sinks
+    from pivot.engine import sources as engine_sources
 
     (pipeline_dir / "input.txt").write_text("hello")
 
@@ -403,7 +408,8 @@ def test_engine_emits_status_for_multiple_stages(
     run_id = "test_run_789"
     with engine_mod.Engine() as eng:
         eng.add_sink(engine_sinks.TuiSink(tui_queue=tui_queue, run_id=run_id))
-        eng.run_once()
+        eng.add_source(engine_sources.OneShotSource(stages=None, force=False, reason="test"))
+        eng.run(exit_on_completion=True)
 
     messages = _drain_queue(tui_queue)
     status_messages = [m for m in messages if is_tui_status_message(m)]
@@ -426,6 +432,7 @@ def test_engine_status_includes_correct_index_and_total(
     """Engine status messages include correct index and total counts."""
     from pivot.engine import engine as engine_mod
     from pivot.engine import sinks as engine_sinks
+    from pivot.engine import sources as engine_sources
 
     (pipeline_dir / "input.txt").write_text("hello")
 
@@ -435,7 +442,8 @@ def test_engine_status_includes_correct_index_and_total(
     run_id = "test_run_abc"
     with engine_mod.Engine() as eng:
         eng.add_sink(engine_sinks.TuiSink(tui_queue=tui_queue, run_id=run_id))
-        eng.run_once()
+        eng.add_source(engine_sources.OneShotSource(stages=None, force=False, reason="test"))
+        eng.run(exit_on_completion=True)
 
     messages = _drain_queue(tui_queue)
     status_messages = [m for m in messages if is_tui_status_message(m)]

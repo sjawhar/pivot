@@ -37,7 +37,7 @@ When changes are detected, only affected stages and their downstream dependencie
 │           │ Event Queue (thread-safe)                               │
 │           ▼                                                          │
 │  ┌──────────────────┐                                               │
-│  │   run_loop()     │  ← Processes events until shutdown            │
+│  │ run(exit_on_completion=False)  ← Processes events until shutdown │
 │  │                  │                                               │
 │  │  1. Handle DataArtifactChanged → run affected stages             │
 │  │  2. Handle CodeOrConfigChanged → reload registry, run all        │
@@ -53,10 +53,10 @@ The same Engine code handles both batch and watch mode:
 
 | Mode | Entry Point | Event Source |
 |------|-------------|--------------|
-| Batch (`pivot run`) | `engine.run_once()` | OneShotSource |
-| Watch (`pivot run --watch`) | `engine.run_loop()` | FilesystemSource |
+| Batch (`pivot run`) | `engine.run(exit_on_completion=True)` | OneShotSource |
+| Watch (`pivot run --watch`) | `engine.run(exit_on_completion=False)` | FilesystemSource |
 
-This unified architecture eliminates divergent code paths between batch and watch modes.
+This unified architecture eliminates divergent code paths between batch and watch modes. Both modes use identical sink configuration, ensuring flags like `--quiet` work consistently.
 
 ## Event Flow
 

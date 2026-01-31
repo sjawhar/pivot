@@ -10,15 +10,13 @@ from typing import TYPE_CHECKING
 from unittest.mock import patch
 
 import networkx as nx
-import pytest
 
 from pivot import registry
-from pivot.engine import engine, sources, types
+from pivot.engine import engine, sinks, sources, types
 from pivot.engine import graph as engine_graph
 from pivot.types import (
     OnError,
     RunEventType,
-    RunJsonEvent,
     StageCompleteEvent,
     StageResult,
     StageStartEvent,
@@ -51,8 +49,8 @@ class _MockSink:
         self.closed = True
 
 
-def _helper_run_loop_with_delayed_shutdown(eng: engine.Engine, delay: float = 0.05) -> None:
-    """Run engine loop and shut it down after a delay."""
+def _helper_run_with_delayed_shutdown(eng: engine.Engine, delay: float = 0.05) -> None:
+    """Run engine and shut it down after a delay."""
 
     def delayed_shutdown() -> None:
         time.sleep(delay)
@@ -60,7 +58,7 @@ def _helper_run_loop_with_delayed_shutdown(eng: engine.Engine, delay: float = 0.
 
     stopper = threading.Thread(target=delayed_shutdown)
     stopper.start()
-    eng.run_loop()
+    eng.run(exit_on_completion=False)
     stopper.join()
 
 
@@ -153,7 +151,7 @@ def test_engine_graph_property_returns_bipartite_graph(tmp_path: pathlib.Path) -
 
     Verifies:
     - Engine has 'graph' attribute
-    - After run_once(), graph is populated (not None)
+    - After run(), graph is populated (not None)
     - Graph is a networkx DiGraph with bipartite structure (artifact and stage nodes)
     """
     with engine.Engine() as eng:
@@ -178,11 +176,14 @@ def test_engine_graph_property_returns_bipartite_graph(tmp_path: pathlib.Path) -
             return {"test_stage": {"status": "ran", "reason": ""}}
 
         with patch.object(engine.Engine, "_orchestrate_execution", mock_orchestrate):
-            eng.run_once()
+            collector = sinks.ResultCollectorSink()
+            eng.add_sink(collector)
+            eng.add_source(sources.OneShotSource(stages=None, force=False, reason="test"))
+            eng.run(exit_on_completion=True)
 
-        # After run_once(), graph should be populated via _orchestrate_execution
+        # After run(), graph should be populated via _orchestrate_execution
         result = eng.graph
-        assert result is not None, "run_once() should populate the graph"
+        assert result is not None, "run() should populate the graph"
 
         # Verify bipartite structure: has both artifact and stage nodes
         stage_nodes = [
@@ -245,110 +246,39 @@ def test_engine_close_closes_all_sinks() -> None:
         assert sink2.closed
 
 
-def test_engine_run_once_returns_execution_summary() -> None:
-    """run_once() returns dict mapping stage names to ExecutionSummary."""
-    with (
-        patch.object(
-            engine.Engine,
-            "_orchestrate_execution",
-            return_value={"test_stage": {"status": "ran", "reason": ""}},
-        ),
-        engine.Engine() as eng,
-    ):
-        result = eng.run_once()
-
-        assert isinstance(result, dict)
-        assert "test_stage" in result
-
-
-def test_engine_run_once_passes_stages_parameter() -> None:
-    """run_once() passes stages parameter to _orchestrate_execution."""
-    with (
-        patch.object(engine.Engine, "_orchestrate_execution", return_value={}) as mock_orchestrate,
-        engine.Engine() as eng,
-    ):
-        eng.run_once(stages=["stage_a", "stage_b"])
-
-        mock_orchestrate.assert_called_once()
-        call_kwargs = mock_orchestrate.call_args.kwargs
-        assert call_kwargs["stages"] == ["stage_a", "stage_b"]
-
-
-def test_engine_run_once_passes_force_parameter() -> None:
-    """run_once() passes force parameter to _orchestrate_execution."""
-    with (
-        patch.object(engine.Engine, "_orchestrate_execution", return_value={}) as mock_orchestrate,
-        engine.Engine() as eng,
-    ):
-        eng.run_once(force=True)
-
-        call_kwargs = mock_orchestrate.call_args.kwargs
-        assert call_kwargs["force"] is True
-
-
-def test_engine_run_once_emits_state_changed_events() -> None:
-    """run_once() emits engine state changed events."""
-    with (
-        patch.object(engine.Engine, "_orchestrate_execution", return_value={}),
-        engine.Engine() as eng,
-    ):
-        sink = _MockSink()
-        eng.add_sink(sink)
-        eng.run_once()
-
-        # Should emit ACTIVE at start and IDLE at end
-        state_events = [e for e in sink.events if e["type"] == "engine_state_changed"]
-        assert len(state_events) == 2
-        assert state_events[0]["state"] == types.EngineState.ACTIVE
-        assert state_events[1]["state"] == types.EngineState.IDLE
-
-
-def test_engine_run_once_passes_all_orchestration_params() -> None:
-    """run_once() passes through all relevant orchestration parameters."""
-    with (
-        patch.object(engine.Engine, "_orchestrate_execution", return_value={}) as mock_orchestrate,
-        engine.Engine() as eng,
-    ):
-        eng.run_once(
-            stages=["stage_a"],
-            force=True,
-            single_stage=True,
-            parallel=False,
-            max_workers=4,
-            no_commit=True,
-            no_cache=True,
-            allow_uncached_incremental=True,  # Retained for CLI but not passed to orchestration
-            checkout_missing=True,  # Retained for CLI but not passed to orchestration
-        )
-
-        call_kwargs = mock_orchestrate.call_args.kwargs
-        assert call_kwargs["stages"] == ["stage_a"]
-        assert call_kwargs["force"] is True
-        assert call_kwargs["single_stage"] is True
-        assert call_kwargs["parallel"] is False
-        assert call_kwargs["max_workers"] == 4
-        assert call_kwargs["no_commit"] is True
-        assert call_kwargs["no_cache"] is True
-        # Note: allow_uncached_incremental and checkout_missing are retained for CLI
-        # compatibility but not passed to _orchestrate_execution (handled differently)
-
-
 def test_engine_integration_with_sinks() -> None:
     """Engine correctly routes events to multiple sinks."""
+
+    def orchestrate_with_events(self: engine.Engine, **kwargs: object) -> dict[str, dict[str, str]]:
+        """Mock orchestration that emits events."""
+        self.emit(types.StageStarted(type="stage_started", stage="stage_a", index=1, total=1))
+        self.emit(
+            types.StageCompleted(
+                type="stage_completed",
+                stage="stage_a",
+                status=StageStatus.RAN,
+                reason="inputs changed",
+                duration_ms=100.0,
+                index=1,
+                total=1,
+            )
+        )
+        return {"stage_a": {"status": "ran", "reason": "inputs changed"}}
+
     with (
-        patch.object(
-            engine.Engine,
-            "_orchestrate_execution",
-            return_value={"stage_a": {"status": "ran", "reason": "inputs changed"}},
-        ),
+        patch.object(engine.Engine, "_orchestrate_execution", orchestrate_with_events),
         engine.Engine() as eng,
     ):
         sink1 = _MockSink()
         sink2 = _MockSink()
+        collector = sinks.ResultCollectorSink()
         eng.add_sink(sink1)
         eng.add_sink(sink2)
+        eng.add_sink(collector)
 
-        result = eng.run_once(stages=["stage_a"])
+        eng.add_source(sources.OneShotSource(stages=["stage_a"], force=False, reason="test"))
+        eng.run(exit_on_completion=True)
+        result = collector.get_results()
 
         # Verify results returned
         assert "stage_a" in result
@@ -369,27 +299,6 @@ def test_engine_integration_with_sinks() -> None:
         assert sink2.closed
 
 
-def test_engine_run_once_emits_idle_on_exception() -> None:
-    """run_once() emits IDLE state even when _orchestrate_execution raises."""
-    with (
-        patch.object(
-            engine.Engine, "_orchestrate_execution", side_effect=RuntimeError("execution failed")
-        ),
-        engine.Engine() as eng,
-    ):
-        sink = _MockSink()
-        eng.add_sink(sink)
-
-        with contextlib.suppress(RuntimeError):
-            eng.run_once()
-
-        # Should still emit IDLE at end
-        state_events = [e for e in sink.events if e["type"] == "engine_state_changed"]
-        assert len(state_events) == 2
-        assert state_events[1]["state"] == types.EngineState.IDLE
-        assert eng.state == types.EngineState.IDLE
-
-
 def test_engine_submit_adds_to_event_queue() -> None:
     """Engine.submit() queues an input event for processing."""
     with engine.Engine() as eng:
@@ -402,7 +311,7 @@ def test_engine_submit_adds_to_event_queue() -> None:
         eng.submit(event)
 
         # Event should be in the queue (we can't easily inspect, but submit should not raise)
-        assert eng.state == types.EngineState.IDLE  # Still idle until run_loop starts
+        assert eng.state == types.EngineState.IDLE  # Still idle until run() starts
 
 
 def test_engine_submit_is_thread_safe() -> None:
@@ -429,8 +338,8 @@ def test_engine_submit_is_thread_safe() -> None:
         assert len(events_submitted) == 10
 
 
-def test_engine_run_loop_processes_run_requested() -> None:
-    """run_loop() processes RunRequested events."""
+def test_engine_run_processes_run_requested() -> None:
+    """run(exit_on_completion=False) processes RunRequested events."""
     with engine.Engine() as eng:
         sink = _MockSink()
         eng.add_sink(sink)
@@ -446,7 +355,7 @@ def test_engine_run_loop_processes_run_requested() -> None:
             }
             eng.submit(event)
 
-            _helper_run_loop_with_delayed_shutdown(eng, delay=0.1)
+            _helper_run_with_delayed_shutdown(eng, delay=0.1)
 
             # Verify orchestration was called with correct stages
             mock_orchestrate.assert_called_once()
@@ -454,8 +363,8 @@ def test_engine_run_loop_processes_run_requested() -> None:
             assert call_kwargs["stages"] == ["stage_a"]
 
 
-def test_engine_run_loop_emits_state_changes() -> None:
-    """run_loop() emits ACTIVE/IDLE state changes around execution."""
+def test_engine_run_emits_state_changes() -> None:
+    """run(exit_on_completion=False) emits ACTIVE/IDLE state changes around execution."""
     with engine.Engine() as eng:
         sink = _MockSink()
         eng.add_sink(sink)
@@ -471,7 +380,7 @@ def test_engine_run_loop_emits_state_changes() -> None:
             }
             eng.submit(event)
 
-            _helper_run_loop_with_delayed_shutdown(eng, delay=0.1)
+            _helper_run_with_delayed_shutdown(eng, delay=0.1)
 
             # Check state changes: ACTIVE when processing, IDLE when done
             state_events = [e for e in sink.events if e["type"] == "engine_state_changed"]
@@ -492,7 +401,7 @@ def test_engine_cancel_requested_sets_cancel_event() -> None:
         eng.submit(cancel_event)
 
         # Process the event
-        _helper_run_loop_with_delayed_shutdown(eng)
+        _helper_run_with_delayed_shutdown(eng)
 
         # Cancel event should be set
         assert eng._cancel_event.is_set()
@@ -507,8 +416,8 @@ def test_engine_cancel_event_property() -> None:
         assert hasattr(eng.cancel_event, "clear")
 
 
-def test_engine_run_loop_clears_cancel_event() -> None:
-    """run_loop() clears cancel_event before processing RunRequested."""
+def test_engine_run_clears_cancel_event() -> None:
+    """run(exit_on_completion=False) clears cancel_event before processing RunRequested."""
     with engine.Engine() as eng:
         # Set cancel event before run
         eng._cancel_event.set()
@@ -529,14 +438,14 @@ def test_engine_run_loop_clears_cancel_event() -> None:
             }
             eng.submit(event)
 
-            _helper_run_loop_with_delayed_shutdown(eng)
+            _helper_run_with_delayed_shutdown(eng)
 
             # Cancel event should have been cleared before orchestration
             assert cancel_event_state_during_orchestration == [False]
 
 
-def test_engine_run_loop_starts_sources() -> None:
-    """run_loop() starts all registered sources."""
+def test_engine_run_starts_sources() -> None:
+    """run(exit_on_completion=False) starts all registered sources."""
     started = list[bool]()
 
     class MockSource:
@@ -550,13 +459,13 @@ def test_engine_run_loop_starts_sources() -> None:
         eng.add_source(MockSource())
         eng.add_source(MockSource())
 
-        _helper_run_loop_with_delayed_shutdown(eng)
+        _helper_run_with_delayed_shutdown(eng)
 
         assert len(started) == 2
 
 
-def test_engine_run_loop_stops_sources_on_shutdown() -> None:
-    """run_loop() stops all sources when shutting down."""
+def test_engine_run_stops_sources_on_shutdown() -> None:
+    """run(exit_on_completion=False) stops all sources when shutting down."""
     stopped = list[bool]()
 
     class MockSource:
@@ -570,59 +479,9 @@ def test_engine_run_loop_stops_sources_on_shutdown() -> None:
         eng.add_source(MockSource())
         eng.add_source(MockSource())
 
-        _helper_run_loop_with_delayed_shutdown(eng)
+        _helper_run_with_delayed_shutdown(eng)
 
         assert len(stopped) == 2
-
-
-# =============================================================================
-# Tests for CLI parameter passthrough (Task 11)
-# =============================================================================
-
-
-def test_engine_run_once_stores_progress_callback() -> None:
-    """run_once() stores progress_callback for event forwarding."""
-    with patch.object(engine.Engine, "_orchestrate_execution", return_value={}):
-
-        def callback(event: RunJsonEvent) -> None:
-            pass
-
-        with engine.Engine() as eng:
-            # _progress_callback should be None before run
-            assert eng._progress_callback is None
-
-            # Use a flag to verify callback was stored during execution
-            stored_callback: list[object] = [None]
-
-            def mock_orchestrate(*args: object, **kwargs: object) -> dict[str, object]:
-                stored_callback[0] = eng._progress_callback
-                return {}
-
-            with patch.object(
-                engine.Engine, "_orchestrate_execution", side_effect=mock_orchestrate
-            ):
-                eng.run_once(progress_callback=callback)
-
-            # Callback should have been stored during execution
-            assert stored_callback[0] is callback
-            # And cleared after
-            assert eng._progress_callback is None
-
-
-def test_engine_run_once_clears_cancel_event_before_execution() -> None:
-    """run_once() clears cancel_event before calling _orchestrate_execution."""
-    with (
-        patch.object(engine.Engine, "_orchestrate_execution", return_value={}),
-        engine.Engine() as eng,
-    ):
-        # Set cancel event to simulate previous cancellation
-        eng._cancel_event.set()
-        assert eng._cancel_event.is_set()
-
-        eng.run_once()
-
-        # Cancel event should have been cleared
-        assert not eng._cancel_event.is_set()
 
 
 # =============================================================================
@@ -630,8 +489,8 @@ def test_engine_run_once_clears_cancel_event_before_execution() -> None:
 # =============================================================================
 
 
-def test_engine_run_once_emits_stage_started_events() -> None:
-    """run_once() emits StageStarted events to sinks."""
+def test_engine_handle_progress_event_emits_stage_started() -> None:
+    """_handle_progress_event() emits StageStarted events to sinks."""
     with engine.Engine() as eng:
         sink = _MockSink()
         eng.add_sink(sink)
@@ -654,8 +513,8 @@ def test_engine_run_once_emits_stage_started_events() -> None:
         assert stage_events[0]["total"] == 2
 
 
-def test_engine_run_once_emits_stage_completed_events() -> None:
-    """run_once() emits StageCompleted events to sinks."""
+def test_engine_handle_progress_event_emits_stage_completed() -> None:
+    """_handle_progress_event() emits StageCompleted events to sinks."""
     with engine.Engine() as eng:
         sink = _MockSink()
         eng.add_sink(sink)
@@ -688,33 +547,6 @@ def test_engine_run_once_emits_stage_completed_events() -> None:
         assert stage_events[0]["stage"] == "train"
         assert stage_events[0]["status"] == StageStatus.RAN
         assert stage_events[0]["duration_ms"] == 1234.5
-
-
-def test_engine_run_once_progress_callback_is_stored_during_execution() -> None:
-    """run_once() stores progress_callback and clears it after execution."""
-    user_events = list[RunJsonEvent]()
-
-    def user_callback(event: RunJsonEvent) -> None:
-        user_events.append(event)
-
-    with (
-        patch.object(engine.Engine, "_orchestrate_execution", return_value={}),
-        engine.Engine() as eng,
-    ):
-        # Verify callback is stored during run
-        callback_during_run: list[object] = [None]
-
-        def capture_callback(*args: object, **kwargs: object) -> dict[str, object]:
-            callback_during_run[0] = eng._progress_callback
-            return {}
-
-        with patch.object(engine.Engine, "_orchestrate_execution", side_effect=capture_callback):
-            eng.run_once(progress_callback=user_callback)
-
-        # Callback should have been stored during execution
-        assert callback_during_run[0] is user_callback
-        # And cleared after
-        assert eng._progress_callback is None
 
 
 # =============================================================================
@@ -790,17 +622,23 @@ def test_engine_full_event_flow_integration() -> None:
         engine.Engine() as eng,
     ):
         sink = _MockSink()
+        collector = sinks.ResultCollectorSink()
         eng.add_sink(sink)
+        eng.add_sink(collector)
 
         # Run stages - orchestrate_side_effect will emit events during run
-        result = eng.run_once(stages=["stage_a", "stage_b"])
+        eng.add_source(
+            sources.OneShotSource(stages=["stage_a", "stage_b"], force=False, reason="test")
+        )
+        eng.run(exit_on_completion=True)
+        result = collector.get_results()
 
         # Verify results returned
         assert "stage_a" in result
         assert "stage_b" in result
 
         # Verify event sequence
-        # State events: ACTIVE at start, IDLE at end (emitted by run_once)
+        # State events: ACTIVE at start, IDLE at end (emitted by run())
         state_events = [e for e in sink.events if e["type"] == "engine_state_changed"]
         assert len(state_events) == 2
         assert state_events[0]["state"] == types.EngineState.ACTIVE
@@ -889,16 +727,6 @@ def test_engine_context_manager_closes_on_exception() -> None:
     assert sink.closed
 
 
-def test_engine_run_once_rejects_concurrent_calls() -> None:
-    """run_once() raises if called while engine is already active."""
-    with engine.Engine() as eng:
-        # Manually set state to ACTIVE to simulate concurrent call
-        eng._state = types.EngineState.ACTIVE
-
-        with pytest.raises(RuntimeError, match="already active"):
-            eng.run_once()
-
-
 def test_engine_emit_continues_on_sink_failure() -> None:
     """emit() continues to other sinks if one fails."""
     with engine.Engine() as eng:
@@ -931,36 +759,6 @@ def test_engine_close_continues_on_sink_failure() -> None:
 
         # Working sink should still be closed
         assert working_sink.closed
-
-
-# =============================================================================
-# Parameterized Tests for run_once() Parameter Passthrough
-# =============================================================================
-
-
-@pytest.mark.parametrize(
-    ("param_name", "param_value"),
-    [
-        pytest.param("on_error", OnError.KEEP_GOING, id="on_error"),
-        pytest.param("cache_dir", pathlib.Path("/tmp/test-cache"), id="cache_dir"),
-        pytest.param("single_stage", True, id="single_stage"),
-        pytest.param("parallel", False, id="parallel"),
-        pytest.param("max_workers", 4, id="max_workers"),
-        pytest.param("no_commit", True, id="no_commit"),
-        pytest.param("no_cache", True, id="no_cache"),
-        pytest.param("checkout_missing", True, id="checkout_missing"),
-    ],
-)
-def test_engine_run_once_passes_parameter(param_name: str, param_value: object) -> None:
-    """run_once() passes parameters through to _orchestrate_execution."""
-    with (
-        patch.object(engine.Engine, "_orchestrate_execution", return_value={}) as mock_orchestrate,
-        engine.Engine() as eng,
-    ):
-        eng.run_once(**{param_name: param_value})  # pyright: ignore[reportArgumentType]
-
-        call_kwargs = mock_orchestrate.call_args.kwargs
-        assert call_kwargs[param_name] == param_value
 
 
 # =============================================================================
@@ -1096,6 +894,42 @@ def test_engine_stage_state_tracking_is_thread_safe() -> None:
             t.join()
 
         assert errors == [], f"Thread-safety errors: {errors}"
+
+
+def test_engine_sink_can_call_get_stage_state_from_handle() -> None:
+    """Sinks can call get_stage_state() from handle() without deadlocking.
+
+    This tests that _stage_states_lock is an RLock, not a regular Lock.
+    A regular Lock would deadlock because _set_stage_state() holds the lock
+    while calling emit(), and the sink's handle() would try to acquire it again.
+    """
+    state_during_handle: types.StageExecutionState | None = None
+
+    class StateQueryingSink:
+        """Test sink that queries stage state during handle()."""
+
+        def __init__(self, eng: engine.Engine) -> None:
+            self._engine: engine.Engine = eng
+
+        def handle(self, event: types.OutputEvent) -> None:
+            nonlocal state_during_handle
+            if event["type"] == "stage_state_changed":
+                # Query state while the lock is held by _set_stage_state
+                state_during_handle = self._engine.get_stage_state(event["stage"])
+
+        def close(self) -> None:
+            pass
+
+    with engine.Engine() as eng:
+        # Add our test sink BEFORE setting state
+        sink = StateQueryingSink(eng)
+        eng.add_sink(sink)
+
+        # This should NOT deadlock - the RLock allows re-entrant acquisition
+        eng._set_stage_state("test_stage", types.StageExecutionState.RUNNING)
+
+        # Verify the sink was able to query state during handle()
+        assert state_during_handle == types.StageExecutionState.RUNNING
 
 
 # =============================================================================
@@ -1325,6 +1159,58 @@ def test_engine_process_deferred_events_empty_list() -> None:
 
         # Should remain empty
         assert "nonexistent_stage" not in eng._deferred_events
+
+
+def test_engine_process_deferred_events_continues_after_error() -> None:
+    """_process_deferred_events() continues processing after an error in one event.
+
+    This ensures that a failing event doesn't block processing of remaining events.
+    """
+    with engine.Engine() as eng:
+        # Defer multiple events
+        event1: types.RunRequested = {
+            "type": "run_requested",
+            "stages": ["stage1"],
+            "force": False,
+            "reason": "first",
+        }
+        event2: types.RunRequested = {
+            "type": "run_requested",
+            "stages": ["stage2"],
+            "force": False,
+            "reason": "second",
+        }
+        event3: types.RunRequested = {
+            "type": "run_requested",
+            "stages": ["stage3"],
+            "force": False,
+            "reason": "third",
+        }
+
+        eng._defer_event_for_stage("process", event1)
+        eng._defer_event_for_stage("process", event2)
+        eng._defer_event_for_stage("process", event3)
+
+        # Mock _handle_input_event to fail on second event
+        processed_events = list[types.InputEvent]()
+
+        def failing_handler(evt: types.InputEvent) -> None:
+            processed_events.append(evt)
+            if evt.get("reason") == "second":
+                raise ValueError("Simulated failure")
+
+        with patch.object(eng, "_handle_input_event", side_effect=failing_handler):
+            # Should not raise, should continue after error
+            eng._process_deferred_events("process")
+
+        # All three events should have been attempted (even after error)
+        assert len(processed_events) == 3
+        assert processed_events[0] == event1
+        assert processed_events[1] == event2
+        assert processed_events[2] == event3
+
+        # Deferred events should be cleared
+        assert "process" not in eng._deferred_events
 
 
 def test_engine_handle_stage_completion_processes_deferred_events() -> None:

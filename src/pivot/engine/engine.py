@@ -60,7 +60,6 @@ if TYPE_CHECKING:
 
     import networkx as nx
 
-    from pivot.executor.core import ExecutionSummary
     from pivot.registry import RegistryStageInfo
     from pivot.storage.cache import CheckoutMode
     from pivot.types import RunJsonEvent
@@ -93,7 +92,8 @@ class Engine:
         self._stage_indices: dict[str, tuple[int, int]] = dict[str, tuple[int, int]]()
         # Per-stage execution state tracking
         self._stage_states: dict[str, StageExecutionState] = dict[str, StageExecutionState]()
-        self._stage_states_lock: threading.Lock = threading.Lock()
+        # RLock allows sinks to call get_stage_state() from handle() without deadlocking
+        self._stage_states_lock: threading.RLock = threading.RLock()
         # Deferred events for filtered paths (stage -> list of events)
         self._deferred_events: dict[str, list[InputEvent]] = dict[str, list[InputEvent]]()
         # Execution orchestration state
@@ -171,6 +171,14 @@ class Engine:
         """
         self._cancel_event = event
 
+    def set_progress_callback(self, callback: Callable[[RunJsonEvent], None]) -> None:
+        """Set callback for JSONL progress events.
+
+        Used for backwards compatibility with callers that need
+        progress events in the old JSONL format.
+        """
+        self._progress_callback = callback
+
     def __enter__(self) -> Self:
         """Enter context manager."""
         return self
@@ -239,13 +247,7 @@ class Engine:
         self._sources.append(source)
 
     def submit(self, event: InputEvent) -> None:
-        """Submit an event for processing. Thread-safe.
-
-        Events are queued and processed by run_loop().
-
-        Args:
-            event: Input event to process.
-        """
+        """Submit an event for processing. Thread-safe."""
         self._event_queue.put(event)
 
     def emit(self, event: OutputEvent) -> None:
@@ -254,8 +256,7 @@ class Engine:
         Exceptions from individual sinks are logged but do not prevent
         other sinks from receiving the event.
 
-        Also forwards stage events to progress_callback if set (for backwards
-        compatibility with callers that pass progress_callback to run_once).
+        Also forwards stage events to progress_callback if set.
         """
         for sink in self._sinks:
             try:
@@ -344,102 +345,20 @@ class Engine:
             case _:
                 pass
 
-    def run_once(
-        self,
-        stages: list[str] | None = None,
-        force: bool = False,
-        single_stage: bool = False,
-        parallel: bool = True,
-        max_workers: int | None = None,
-        no_commit: bool = False,
-        no_cache: bool = False,
-        allow_uncached_incremental: bool = False,
-        checkout_missing: bool = False,
-        on_error: OnError = OnError.FAIL,
-        cache_dir: pathlib.Path | None = None,
-        progress_callback: Callable[[RunJsonEvent], None] | None = None,
-    ) -> dict[str, ExecutionSummary]:
-        """Execute stages once and return.
-
-        This is the primary entry point for 'pivot run' without --watch.
-        Uses Engine orchestration for parallel execution.
-
-        Args:
-            stages: Stage names to run (None = all stages).
-            force: If True, ignore cache and re-run all stages.
-            single_stage: If True, run only the specified stages (no downstream).
-            parallel: If True, run stages in parallel.
-            max_workers: Maximum worker processes.
-            no_commit: If True, don't update lockfiles.
-            no_cache: If True, disable run cache.
-            allow_uncached_incremental: Allow incremental outputs without cache (retained for compatibility).
-            checkout_missing: Checkout missing dependency files from cache (retained for compatibility).
-            on_error: Error handling mode ('fail' or 'keep_going').
-            cache_dir: Directory for lock files (defaults to .pivot/cache).
-            progress_callback: Callback for JSONL progress events.
-
-        Returns:
-            Dict mapping stage name to ExecutionSummary.
-
-        Raises:
-            RuntimeError: If the engine is already active (concurrent calls not allowed).
-        """
-        # Note: If called via executor.run() with no_commit=True, the pending_state_lock
-        # is already held by the caller. Direct callers of run_once() should acquire
-        # the lock themselves if needed.
-
-        # Prevent concurrent execution
-        if self._state == EngineState.ACTIVE:
-            msg = "Engine is already active - concurrent run_once() calls are not allowed"
-            raise RuntimeError(msg)
-
-        # Clear cancel event from any previous run
-        self._cancel_event.clear()
-
-        # Emit state transition: IDLE -> ACTIVE
-        self._state = EngineState.ACTIVE
-        self.emit(EngineStateChanged(type="engine_state_changed", state=EngineState.ACTIVE))
-
-        # Reset stage indices for this run
-        self._stage_indices.clear()
-
-        # Store progress callback for event forwarding
-        # The Engine emits StageStarted/StageCompleted events directly,
-        # but we wrap for backwards compatibility with progress_callback users
-        self._progress_callback = progress_callback
-
-        try:
-            # Use Engine orchestration
-            result = self._orchestrate_execution(
-                stages=stages,
-                force=force,
-                single_stage=single_stage,
-                parallel=parallel,
-                max_workers=max_workers,
-                no_commit=no_commit,
-                no_cache=no_cache,
-                on_error=on_error,
-                cache_dir=cache_dir,
-                allow_uncached_incremental=allow_uncached_incremental,
-                checkout_missing=checkout_missing,
-            )
-            return result
-        finally:
-            # Emit state transition: ACTIVE -> IDLE and clear run state
-            self._state = EngineState.IDLE
-            self._progress_callback = None
-            self._current_run_id = None
-            self.emit(EngineStateChanged(type="engine_state_changed", state=EngineState.IDLE))
-
     def shutdown(self) -> None:
         """Signal the engine to stop processing events."""
         self._shutdown_event.set()
 
-    def run_loop(self) -> None:
-        """Process events until shutdown. For 'pivot run --watch'.
+    def run(self, *, exit_on_completion: bool = True) -> None:
+        """Run the engine with registered sources and sinks.
 
-        Blocks until shutdown() is called. Processes events from the
-        queue and from registered sources.
+        This is the primary entry point for event-driven execution.
+        Sources emit events, the engine processes them, and sinks receive output.
+
+        Args:
+            exit_on_completion: If True, exit after all sources have emitted
+                and no more stages are running (one-shot mode). If False,
+                continue running until shutdown() is called (watch mode).
         """
         # Start all sources
         for source in self._sources:
@@ -451,9 +370,23 @@ class Engine:
                     # Wait for an event with timeout to check shutdown
                     event = self._event_queue.get(timeout=0.1)
                 except queue.Empty:
+                    # In exit_on_completion mode, check if we should exit
+                    if exit_on_completion and self._state == EngineState.IDLE:
+                        # No pending events and engine is idle - done
+                        break
                     continue
 
                 self._handle_input_event(event)
+
+                # In exit_on_completion mode, check if we should exit after processing
+                if exit_on_completion and self._state == EngineState.IDLE:
+                    # Drain any remaining events before exiting
+                    try:
+                        while True:
+                            event = self._event_queue.get_nowait()
+                            self._handle_input_event(event)
+                    except queue.Empty:
+                        break
         finally:
             # Stop all sources
             for source in self._sources:
@@ -490,17 +423,30 @@ class Engine:
             self._state = EngineState.ACTIVE
         self.emit(EngineStateChanged(type="engine_state_changed", state=EngineState.ACTIVE))
 
+        # Extract optional fields with defaults
+        single_stage = event.get("single_stage", False)
+        parallel = event.get("parallel", True)
+        max_workers = event.get("max_workers")
+        no_commit = event.get("no_commit", False)
+        no_cache = event.get("no_cache", False)
+        on_error = event.get("on_error", OnError.KEEP_GOING)
+        cache_dir = event.get("cache_dir")
+        allow_uncached_incremental = event.get("allow_uncached_incremental", False)
+        checkout_missing = event.get("checkout_missing", False)
+
         try:
             self._orchestrate_execution(
                 stages=event["stages"],
                 force=event["force"],
-                single_stage=False,
-                parallel=True,
-                max_workers=None,
-                no_commit=False,
-                no_cache=False,
-                on_error=OnError.KEEP_GOING,  # Watch mode: continue on error
-                cache_dir=None,
+                single_stage=single_stage,
+                parallel=parallel,
+                max_workers=max_workers,
+                no_commit=no_commit,
+                no_cache=no_cache,
+                on_error=on_error,
+                cache_dir=cache_dir,
+                allow_uncached_incremental=allow_uncached_incremental,
+                checkout_missing=checkout_missing,
             )
         finally:
             # Emit state transition: ACTIVE -> IDLE
@@ -648,12 +594,16 @@ class Engine:
         """Process any deferred events for a completed stage.
 
         Uses iterative approach to avoid recursion if processing defers more events.
+        Errors in individual events are logged but don't block remaining events.
         """
         # Iteratively process - if handling an event defers more, they'll be processed
         # in subsequent iterations (when their stage completes), not recursively
         events = self._deferred_events.pop(stage, [])
         for event in events:
-            self._handle_input_event(event)
+            try:
+                self._handle_input_event(event)
+            except Exception:
+                _logger.exception(f"Error processing deferred event for stage {stage}: {event}")
 
     def _get_affected_stages_for_path(self, path: pathlib.Path) -> list[str]:
         """Get stages affected by a path change using bipartite graph."""
@@ -827,15 +777,16 @@ class Engine:
 
     def _emit_reload_event(self, old_stages: dict[str, RegistryStageInfo]) -> None:
         """Emit PipelineReloaded event with diff information."""
-        new_stages = set(registry.REGISTRY.list_stages())
+        new_stage_names = list(registry.REGISTRY.list_stages())
+        new_stages_set = set(new_stage_names)
         old_stage_names = set(old_stages.keys())
 
-        added = sorted(new_stages - old_stage_names)
-        removed = sorted(old_stage_names - new_stages)
+        added = sorted(new_stages_set - old_stage_names)
+        removed = sorted(old_stage_names - new_stages_set)
 
         # Detect modified stages by comparing fingerprints
         modified = list[str]()
-        for stage_name in sorted(old_stage_names & new_stages):
+        for stage_name in sorted(old_stage_names & new_stages_set):
             old_info = old_stages[stage_name]
             new_info = registry.REGISTRY.get(stage_name)
             if old_info["fingerprint"] != new_info["fingerprint"]:
@@ -844,6 +795,7 @@ class Engine:
         self.emit(
             PipelineReloaded(
                 type="pipeline_reloaded",
+                stages=new_stage_names,
                 stages_added=added,
                 stages_removed=removed,
                 stages_modified=modified,
@@ -1211,7 +1163,7 @@ class Engine:
         """Orchestrate parallel stage execution with the Engine's event loop.
 
         Note: If no_commit=True, the pending state lock should be held by the caller
-        (run_once acquires it before calling this method).
+        (executor.run() acquires it before calling this method via OneShotSource).
         """
         import datetime
 

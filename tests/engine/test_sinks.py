@@ -278,6 +278,7 @@ def test_watch_sink_handles_pipeline_reloaded_error() -> None:
 
     event: types.PipelineReloaded = {
         "type": "pipeline_reloaded",
+        "stages": [],
         "stages_added": [],
         "stages_removed": [],
         "stages_modified": [],
@@ -299,6 +300,7 @@ def test_watch_sink_handles_pipeline_reloaded_success() -> None:
 
     event: types.PipelineReloaded = {
         "type": "pipeline_reloaded",
+        "stages": ["new_stage"],
         "stages_added": ["new_stage"],
         "stages_removed": [],
         "stages_modified": [],
@@ -332,6 +334,7 @@ def test_watch_sink_delivers_both_messages_on_reload() -> None:
 
     event: types.PipelineReloaded = {
         "type": "pipeline_reloaded",
+        "stages": ["new_stage", "changed_stage"],
         "stages_added": ["new_stage"],
         "stages_removed": ["old_stage"],
         "stages_modified": ["changed_stage"],
@@ -365,6 +368,7 @@ def test_watch_sink_suppresses_queue_full_for_restart_message() -> None:
 
     event: types.PipelineReloaded = {
         "type": "pipeline_reloaded",
+        "stages": [],
         "stages_added": [],
         "stages_removed": [],
         "stages_modified": [],
@@ -405,6 +409,7 @@ def test_watch_sink_suppresses_queue_full_for_reload_message_after_timeout() -> 
 
     event: types.PipelineReloaded = {
         "type": "pipeline_reloaded",
+        "stages": ["critical_stage"],
         "stages_added": ["critical_stage"],
         "stages_removed": [],
         "stages_modified": [],

@@ -276,8 +276,8 @@ class MockEngine:
     def __init__(self) -> None:
         self._keep_going: bool = False
 
-    def run_loop(self) -> None:
-        """Mock run loop - does nothing."""
+    def run(self, *, exit_on_completion: bool = True) -> None:
+        """Mock run - does nothing."""
         pass
 
     def shutdown(self) -> None:

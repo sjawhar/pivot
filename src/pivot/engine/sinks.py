@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import queue
+import threading
 import time
 from typing import TYPE_CHECKING
 
@@ -30,10 +31,11 @@ if TYPE_CHECKING:
         StageCompleted,
         StageStarted,
     )
+    from pivot.executor.core import ExecutionSummary
     from pivot.tui.console import Console
     from pivot.types import TuiQueue
 
-__all__ = ["ConsoleSink", "JsonlSink", "TuiSink", "WatchSink"]
+__all__ = ["ConsoleSink", "JsonlSink", "ResultCollectorSink", "TuiSink", "WatchSink"]
 
 
 class ConsoleSink:
@@ -283,4 +285,48 @@ class WatchSink:
 
     def close(self) -> None:
         """No cleanup needed for watch sink."""
+        pass
+
+
+class ResultCollectorSink:
+    """Collects StageCompleted events for programmatic access to results."""
+
+    _results: dict[str, StageCompleted]
+    _lock: threading.Lock
+
+    def __init__(self) -> None:
+        self._results = {}
+        self._lock = threading.Lock()
+
+    def handle(self, event: OutputEvent) -> None:
+        """Collect StageCompleted events, ignore others."""
+        if event["type"] != "stage_completed":
+            return
+        with self._lock:
+            self._results[event["stage"]] = event
+
+    def get_results(self) -> dict[str, StageCompleted]:
+        """Return collected results. Call after run() completes."""
+        with self._lock:
+            return dict(self._results)
+
+    def get_execution_summaries(self) -> dict[str, ExecutionSummary]:
+        """Return results as ExecutionSummary for backwards compatibility.
+
+        Converts StageCompleted events to ExecutionSummary format (drops
+        duration_ms, index, total fields).
+        """
+        from pivot.executor import core as executor_core
+
+        with self._lock:
+            return {
+                name: executor_core.ExecutionSummary(
+                    status=result["status"],
+                    reason=result["reason"],
+                )
+                for name, result in self._results.items()
+            }
+
+    def close(self) -> None:
+        """No-op for interface compatibility."""
         pass
