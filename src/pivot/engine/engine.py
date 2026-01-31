@@ -830,12 +830,12 @@ class Engine:
         new_stages = set(registry.REGISTRY.list_stages())
         old_stage_names = set(old_stages.keys())
 
-        added = list(new_stages - old_stage_names)
-        removed = list(old_stage_names - new_stages)
+        added = sorted(new_stages - old_stage_names)
+        removed = sorted(old_stage_names - new_stages)
 
         # Detect modified stages by comparing fingerprints
         modified = list[str]()
-        for stage_name in old_stage_names & new_stages:
+        for stage_name in sorted(old_stage_names & new_stages):
             old_info = old_stages[stage_name]
             new_info = registry.REGISTRY.get(stage_name)
             if old_info["fingerprint"] != new_info["fingerprint"]:

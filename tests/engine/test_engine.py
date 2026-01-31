@@ -86,6 +86,29 @@ class _FailingSink:
         self.closed = True
 
 
+def _make_stage_info(
+    name: str,
+    fingerprint: dict[str, str] | None = None,
+) -> registry.RegistryStageInfo:
+    """Create a minimal RegistryStageInfo for testing."""
+    return registry.RegistryStageInfo(
+        func=lambda: None,
+        name=name,
+        deps={},
+        deps_paths=[],
+        outs=[],
+        outs_paths=[],
+        params=None,
+        mutex=[],
+        variant=None,
+        signature=None,
+        fingerprint=fingerprint or {f"self:{name}": "default_hash"},
+        dep_specs={},
+        out_specs={},
+        params_arg_name=None,
+    )
+
+
 # =============================================================================
 # Basic Engine Tests
 # =============================================================================
@@ -2783,3 +2806,240 @@ def test_engine_toggle_keep_going_is_thread_safe() -> None:
         assert len(results) == 20
         # With 20 toggles, we should end up back where we started (False)
         assert eng.keep_going is False
+
+
+# =============================================================================
+# End-to-end test for modified stage detection (Issue #289)
+# =============================================================================
+
+
+def test_engine_code_change_emits_stages_modified_to_sink() -> None:
+    """Full flow: code change triggers reload that detects modified stages and emits to sink.
+
+    This verifies issue #289: modified stages (fingerprint changes) are detected
+    and included in PipelineReloaded events that sinks receive.
+    """
+    with engine.Engine() as eng:
+        sink = _MockSink()
+        eng.add_sink(sink)
+
+        # Set up initial stage with old fingerprint
+        old_stages: dict[str, registry.RegistryStageInfo] = {
+            "train_stage": _make_stage_info("train_stage", {"self:train_stage": "old_hash_abc123"}),
+        }
+
+        # New stage info with changed fingerprint (simulating code modification)
+        new_stage_info = _make_stage_info("train_stage", {"self:train_stage": "new_hash_xyz789"})
+
+        # Mock the reload to succeed and return the modified stage
+        def mock_reload() -> bool:
+            # Emit reload event with old_stages to compute diff
+            eng._emit_reload_event(old_stages)
+            return True
+
+        # Mock registry to return the stage with new fingerprint
+        with (
+            patch.object(eng, "_invalidate_caches"),
+            patch.object(eng, "_reload_registry", side_effect=mock_reload),
+            patch.object(eng, "_execute_affected_stages"),
+            patch(
+                "pivot.engine.engine.registry.REGISTRY.list_stages",
+                return_value=["train_stage"],
+            ),
+            patch(
+                "pivot.engine.engine.registry.REGISTRY.get",
+                return_value=new_stage_info,
+            ),
+            patch("pivot.engine.engine.engine_graph.build_graph", return_value=nx.DiGraph()),
+            patch("pivot.engine.engine.engine_graph.get_watch_paths", return_value=[]),
+        ):
+            # Trigger code change event
+            event: types.CodeOrConfigChanged = {
+                "type": "code_or_config_changed",
+                "paths": ["train.py"],
+            }
+            eng._handle_code_or_config_changed(event)
+
+        # Find the PipelineReloaded event
+        reload_events = [e for e in sink.events if e["type"] == "pipeline_reloaded"]
+        assert len(reload_events) == 1, (
+            f"Expected 1 PipelineReloaded event, got {len(reload_events)}"
+        )
+
+        reload_event = reload_events[0]
+
+        # Verify stages_modified includes the stage with changed fingerprint
+        assert "train_stage" in reload_event["stages_modified"], (
+            f"train_stage should be in stages_modified (fingerprint changed). "
+            f"Got stages_modified={reload_event['stages_modified']}"
+        )
+
+        # Verify no stages were added or removed (same stage, just modified)
+        assert reload_event["stages_added"] == [], "No stages should be added"
+        assert reload_event["stages_removed"] == [], "No stages should be removed"
+        assert reload_event["error"] is None, "No error expected"
+
+
+def test_engine_reload_detects_added_stages() -> None:
+    """Engine detects and reports newly added stages during reload."""
+    with engine.Engine() as eng:
+        sink = _MockSink()
+        eng.add_sink(sink)
+
+        # Start with empty registry (no stages)
+        old_stages: dict[str, registry.RegistryStageInfo] = {}
+
+        # New stage added
+        new_stage_info = _make_stage_info("new_stage", {"self:new_stage": "hash123"})
+
+        def mock_reload() -> bool:
+            eng._emit_reload_event(old_stages)
+            return True
+
+        with (
+            patch.object(eng, "_invalidate_caches"),
+            patch.object(eng, "_reload_registry", side_effect=mock_reload),
+            patch.object(eng, "_execute_affected_stages"),
+            patch(
+                "pivot.engine.engine.registry.REGISTRY.list_stages",
+                return_value=["new_stage"],
+            ),
+            patch(
+                "pivot.engine.engine.registry.REGISTRY.get",
+                return_value=new_stage_info,
+            ),
+            patch("pivot.engine.engine.engine_graph.build_graph", return_value=nx.DiGraph()),
+            patch("pivot.engine.engine.engine_graph.get_watch_paths", return_value=[]),
+        ):
+            event: types.CodeOrConfigChanged = {
+                "type": "code_or_config_changed",
+                "paths": ["pipeline.py"],
+            }
+            eng._handle_code_or_config_changed(event)
+
+        reload_events = [e for e in sink.events if e["type"] == "pipeline_reloaded"]
+        assert len(reload_events) == 1
+        reload_event = reload_events[0]
+
+        assert reload_event["stages_added"] == ["new_stage"]
+        assert reload_event["stages_removed"] == []
+        assert reload_event["stages_modified"] == []
+
+
+def test_engine_reload_detects_removed_stages() -> None:
+    """Engine detects and reports removed stages during reload."""
+    with engine.Engine() as eng:
+        sink = _MockSink()
+        eng.add_sink(sink)
+
+        # Start with one stage
+        old_stages: dict[str, registry.RegistryStageInfo] = {
+            "old_stage": _make_stage_info("old_stage", {"self:old_stage": "hash456"}),
+        }
+
+        def mock_reload() -> bool:
+            eng._emit_reload_event(old_stages)
+            return True
+
+        with (
+            patch.object(eng, "_invalidate_caches"),
+            patch.object(eng, "_reload_registry", side_effect=mock_reload),
+            patch.object(eng, "_execute_affected_stages"),
+            patch(
+                "pivot.engine.engine.registry.REGISTRY.list_stages",
+                return_value=[],  # Stage was removed
+            ),
+            patch("pivot.engine.engine.engine_graph.build_graph", return_value=nx.DiGraph()),
+            patch("pivot.engine.engine.engine_graph.get_watch_paths", return_value=[]),
+        ):
+            event: types.CodeOrConfigChanged = {
+                "type": "code_or_config_changed",
+                "paths": ["pipeline.py"],
+            }
+            eng._handle_code_or_config_changed(event)
+
+        reload_events = [e for e in sink.events if e["type"] == "pipeline_reloaded"]
+        assert len(reload_events) == 1
+        reload_event = reload_events[0]
+
+        assert reload_event["stages_added"] == []
+        assert reload_event["stages_removed"] == ["old_stage"]
+        assert reload_event["stages_modified"] == []
+
+
+def test_engine_code_change_detects_multiple_modified_stages() -> None:
+    """Engine detects and reports multiple modified stages in a single reload."""
+    with engine.Engine() as eng:
+        sink = _MockSink()
+        eng.add_sink(sink)
+
+        # Set up multiple stages with old fingerprints
+        old_stages = {
+            "stage_a": _make_stage_info("stage_a", {"self:stage_a": "old_a"}),
+            "stage_b": _make_stage_info("stage_b", {"self:stage_b": "old_b"}),
+            "stage_c": _make_stage_info("stage_c", {"self:stage_c": "unchanged"}),
+        }
+
+        # New stages: a and b modified, c unchanged
+        new_stages_map = {
+            "stage_a": _make_stage_info("stage_a", {"self:stage_a": "new_a"}),
+            "stage_b": _make_stage_info("stage_b", {"self:stage_b": "new_b"}),
+            "stage_c": _make_stage_info("stage_c", {"self:stage_c": "unchanged"}),
+        }
+
+        def mock_reload() -> bool:
+            eng._emit_reload_event(old_stages)
+            return True
+
+        with (
+            patch.object(eng, "_invalidate_caches"),
+            patch.object(eng, "_reload_registry", side_effect=mock_reload),
+            patch.object(eng, "_execute_affected_stages"),
+            patch(
+                "pivot.engine.engine.registry.REGISTRY.list_stages",
+                return_value=["stage_a", "stage_b", "stage_c"],
+            ),
+            patch(
+                "pivot.engine.engine.registry.REGISTRY.get",
+                side_effect=new_stages_map.__getitem__,
+            ),
+            patch("pivot.engine.engine.engine_graph.build_graph", return_value=nx.DiGraph()),
+            patch("pivot.engine.engine.engine_graph.get_watch_paths", return_value=[]),
+        ):
+            event: types.CodeOrConfigChanged = {
+                "type": "code_or_config_changed",
+                "paths": ["stages.py"],
+            }
+            eng._handle_code_or_config_changed(event)
+
+        reload_events = [e for e in sink.events if e["type"] == "pipeline_reloaded"]
+        assert len(reload_events) == 1
+        reload_event = reload_events[0]
+
+        # Verify exactly stage_a and stage_b are modified, not stage_c
+        assert set(reload_event["stages_modified"]) == {"stage_a", "stage_b"}
+        assert len(reload_event["stages_modified"]) == 2, "No duplicates expected"
+        assert "stage_c" not in reload_event["stages_modified"]
+        assert reload_event["stages_added"] == []
+        assert reload_event["stages_removed"] == []
+
+
+def test_engine_reload_failure_does_not_emit_pipeline_reloaded() -> None:
+    """When reload fails, engine does not emit PipelineReloaded event with stage diffs."""
+    with engine.Engine() as eng:
+        sink = _MockSink()
+        eng.add_sink(sink)
+
+        with (
+            patch.object(eng, "_invalidate_caches"),
+            patch.object(eng, "_reload_registry", return_value=False),
+        ):
+            event: types.CodeOrConfigChanged = {
+                "type": "code_or_config_changed",
+                "paths": ["broken.py"],
+            }
+            eng._handle_code_or_config_changed(event)
+
+        # No PipelineReloaded event should be emitted when reload fails
+        reload_events = [e for e in sink.events if e["type"] == "pipeline_reloaded"]
+        assert reload_events == [], "No PipelineReloaded events when reload fails"

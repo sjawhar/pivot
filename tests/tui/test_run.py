@@ -27,11 +27,14 @@ from pivot.types import (
     TuiMessage,
     TuiMessageType,
     TuiQueue,
+    TuiReloadMessage,
     TuiStatusMessage,
     is_tui_status_message,
 )
 
 if TYPE_CHECKING:
+    from pytest_mock import MockerFixture
+
     from pivot.engine.engine import Engine
 
 # =============================================================================
@@ -847,3 +850,116 @@ async def test_watch_tui_app_with_tui_log(
     # Log file should have been created (even if empty, touch happened in CLI)
     # The app itself creates and opens the file
     assert log_path.exists()
+
+
+# =============================================================================
+# Reload Summary Message Formatting (Issue #289)
+# =============================================================================
+
+
+@pytest.mark.parametrize(
+    ("added", "removed", "modified", "expected"),
+    [
+        pytest.param(
+            ["new"],
+            ["old"],
+            ["changed"],
+            "Reloaded: 1 added, 1 removed, 1 modified",
+            id="all_change_types",
+        ),
+        pytest.param([], [], ["a", "b"], "Reloaded: 2 modified", id="only_modified"),
+        pytest.param(["a", "b", "c"], [], [], "Reloaded: 3 added", id="only_added"),
+        pytest.param([], ["old_stage"], [], "Reloaded: 1 removed", id="only_removed"),
+        pytest.param(
+            ["new_a", "new_b"],
+            ["old_x"],
+            [],
+            "Reloaded: 2 added, 1 removed",
+            id="added_and_removed",
+        ),
+        pytest.param([], [], [], None, id="no_changes"),
+    ],
+)
+def test_format_reload_summary(
+    added: list[str],
+    removed: list[str],
+    modified: list[str],
+    expected: str | None,
+) -> None:
+    """format_reload_summary builds summary from non-empty change lists."""
+    summary = run_tui.format_reload_summary(
+        stages_added=added,
+        stages_removed=removed,
+        stages_modified=modified,
+    )
+    assert summary == expected
+
+
+def test_handle_reload_calls_notify_with_summary(mocker: MockerFixture) -> None:
+    """_handle_reload calls notify with formatted summary when stages change."""
+    from unittest.mock import MagicMock
+
+    # Create a mock engine to enable watch mode
+    mock_engine = MagicMock()
+    tui_queue: TuiQueue = thread_queue.Queue()
+
+    app = run_tui.PivotApp(
+        message_queue=tui_queue,
+        stage_names=["stage_a", "stage_b"],
+        engine=mock_engine,
+    )
+
+    # Mock internal methods that require mounted app
+    mocker.patch.object(app, "_recompute_selection_idx")
+    mocker.patch.object(app, "_rebuild_stage_list")
+    mocker.patch.object(app, "_update_detail_panel")
+    mock_notify = mocker.patch.object(app, "notify")
+
+    # Create reload message with changes
+    reload_msg = TuiReloadMessage(
+        type=TuiMessageType.RELOAD,
+        stages=["stage_a", "stage_c"],
+        stages_added=["stage_c"],
+        stages_removed=["stage_b"],
+        stages_modified=["stage_a"],
+    )
+
+    # Call _handle_reload directly
+    app._handle_reload(reload_msg)
+
+    # Verify notify was called with the expected summary
+    mock_notify.assert_called_once_with("Reloaded: 1 added, 1 removed, 1 modified")
+
+
+def test_handle_reload_no_notify_when_no_changes(mocker: MockerFixture) -> None:
+    """_handle_reload does not call notify when no stages changed."""
+    from unittest.mock import MagicMock
+
+    mock_engine = MagicMock()
+    tui_queue: TuiQueue = thread_queue.Queue()
+
+    app = run_tui.PivotApp(
+        message_queue=tui_queue,
+        stage_names=["stage_a"],
+        engine=mock_engine,
+    )
+
+    # Mock internal methods that require mounted app
+    mocker.patch.object(app, "_recompute_selection_idx")
+    mocker.patch.object(app, "_rebuild_stage_list")
+    mocker.patch.object(app, "_update_detail_panel")
+    mock_notify = mocker.patch.object(app, "notify")
+
+    # Reload message with no changes
+    reload_msg = TuiReloadMessage(
+        type=TuiMessageType.RELOAD,
+        stages=["stage_a"],
+        stages_added=[],
+        stages_removed=[],
+        stages_modified=[],
+    )
+
+    app._handle_reload(reload_msg)
+
+    # notify should not be called when there are no changes
+    mock_notify.assert_not_called()

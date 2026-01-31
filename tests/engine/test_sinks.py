@@ -3,10 +3,17 @@
 from __future__ import annotations
 
 import queue
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from pivot.engine import sinks, types
-from pivot.types import StageStatus, TuiMessageType, TuiQueue
+from pivot.types import (
+    StageStatus,
+    TuiMessage,
+    TuiMessageType,
+    TuiQueue,
+    TuiWatchMessage,
+    WatchStatus,
+)
 
 
 def test_console_sink_handles_stage_started() -> None:
@@ -316,3 +323,114 @@ def test_watch_sink_close_is_noop() -> None:
     tui_queue: TuiQueue = queue.Queue()
     sink = sinks.WatchSink(tui_queue=tui_queue)
     sink.close()  # Should not raise
+
+
+def test_watch_sink_delivers_both_messages_on_reload() -> None:
+    """WatchSink delivers both restart and reload messages on successful reload."""
+    tui_queue: TuiQueue = queue.Queue()
+    sink = sinks.WatchSink(tui_queue=tui_queue)
+
+    event: types.PipelineReloaded = {
+        "type": "pipeline_reloaded",
+        "stages_added": ["new_stage"],
+        "stages_removed": ["old_stage"],
+        "stages_modified": ["changed_stage"],
+        "error": None,
+    }
+    sink.handle(event)
+
+    # First message: restarting status (can be dropped if queue full)
+    msg1 = tui_queue.get_nowait()
+    assert msg1 is not None
+    assert msg1["type"] == TuiMessageType.WATCH
+    assert msg1["status"] == WatchStatus.RESTARTING
+
+    # Second message: reload with stage data (uses blocking put to ensure delivery)
+    msg2 = tui_queue.get_nowait()
+    assert msg2 is not None
+    assert msg2["type"] == TuiMessageType.RELOAD
+    assert msg2["stages_added"] == ["new_stage"]
+    assert msg2["stages_removed"] == ["old_stage"]
+    assert msg2["stages_modified"] == ["changed_stage"]
+
+
+def test_watch_sink_suppresses_queue_full_for_restart_message() -> None:
+    """WatchSink silently drops restart message if queue is full."""
+    # Create a queue with maxsize=1, pre-fill it
+    tui_queue: TuiQueue = queue.Queue(maxsize=1)
+    tui_queue.put(
+        {"type": TuiMessageType.WATCH, "status": WatchStatus.WAITING, "message": "filler"}
+    )
+    sink = sinks.WatchSink(tui_queue=tui_queue)
+
+    event: types.PipelineReloaded = {
+        "type": "pipeline_reloaded",
+        "stages_added": [],
+        "stages_removed": [],
+        "stages_modified": [],
+        "error": None,
+    }
+
+    # Drain queue in background so reload_msg can be delivered after timeout
+    import threading
+
+    def drain_after_delay() -> None:
+        import time
+
+        time.sleep(0.1)
+        tui_queue.get()
+
+    drainer = threading.Thread(target=drain_after_delay)
+    drainer.start()
+
+    # This should not raise - restart_msg dropped, reload_msg waits then succeeds
+    sink.handle(event)
+    drainer.join()
+
+    # Should have the reload message (restart was dropped due to full queue)
+    msg = tui_queue.get_nowait()
+    assert msg is not None
+    assert msg["type"] == TuiMessageType.RELOAD
+
+
+def test_watch_sink_suppresses_queue_full_for_reload_message_after_timeout() -> None:
+    """WatchSink silently drops reload message if queue stays full after timeout."""
+    tui_queue: TuiQueue = queue.Queue(maxsize=1)
+    # Fill queue and never drain it
+    filler_msg = TuiWatchMessage(
+        type=TuiMessageType.WATCH, status=WatchStatus.WAITING, message="filler"
+    )
+    tui_queue.put(filler_msg)
+    sink = sinks.WatchSink(tui_queue=tui_queue)
+
+    event: types.PipelineReloaded = {
+        "type": "pipeline_reloaded",
+        "stages_added": ["critical_stage"],
+        "stages_removed": [],
+        "stages_modified": [],
+        "error": None,
+    }
+
+    # Mock put to immediately raise queue.Full (simulating timeout expiration)
+    original_put = tui_queue.put
+
+    def mock_put(msg: TuiMessage, block: bool = True, timeout: float | None = None) -> None:
+        if timeout is not None:
+            # Blocking put with timeout - simulate timeout expiration
+            raise queue.Full
+        # Non-blocking put (from put_nowait) - use original which will suppress queue.Full
+        original_put(msg, block=block, timeout=timeout)
+
+    with patch.object(tui_queue, "put", side_effect=mock_put):
+        # Should not raise - reload_msg is dropped after timeout
+        sink.handle(event)
+
+    # Queue should still only have the original filler message
+    msg = tui_queue.get_nowait()
+    assert msg is not None
+    assert msg["type"] == TuiMessageType.WATCH
+    # Type narrowing: msg is TuiWatchMessage since type == WATCH
+    assert msg["status"] == WatchStatus.WAITING, "Original message should still be there"
+
+    # Queue should be empty - reload message was dropped
+    assert tui_queue.empty(), "Reload message should have been dropped"
