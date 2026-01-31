@@ -1,5 +1,5 @@
 ---
-name: pivot-stages
+name: writing-pivot-stages
 description: Use when writing Pivot pipeline stages, seeing annotation errors (Dep, Out, Annotated), loader mismatches, "cannot pickle" errors, DirectoryOut validation failures, or IncrementalOut path mismatches
 ---
 
@@ -17,6 +17,7 @@ Pivot stages are pure Python functions declaring file I/O via type annotations. 
 from typing import Annotated, TypedDict
 from pivot.outputs import Dep, Out, Metric, Plot, PlaceholderDep, IncrementalOut, DirectoryOut
 from pivot.loaders import CSV, JSON, JSONL, YAML, Text, Pickle, PathOnly, MatplotlibFigure
+from pivot.loaders import Reader, Writer, Loader  # Base classes for custom loaders
 from pivot.stage_def import StageParams
 from pivot.pipeline import Pipeline
 ```
@@ -51,20 +52,38 @@ def transform(
     return data.dropna()
 ```
 
-## Loaders
+## Loader Hierarchy
 
-| Loader | Type | Options | `empty()` |
-|--------|------|---------|-----------|
-| `CSV()` | DataFrame | `index_col`, `sep`, `dtype` | Yes |
-| `JSON()` | dict/list | `indent=2`, `empty_factory=dict` | Yes |
-| `JSONL()` | list[dict] | — | Yes |
-| `YAML()` | dict/list | `empty_factory=dict` | Yes |
-| `Text()` | str | — | Yes |
-| `Pickle()` | Any | `protocol` | No |
-| `PathOnly()` | Path | — | No |
-| `MatplotlibFigure()` | Figure | `dpi=150`, `bbox_inches`, `transparent` | No |
+The loader system has three base classes:
 
-**Loaders with `empty()` support** are required for `IncrementalOut`.
+| Base Class | Methods | Use Case |
+|------------|---------|----------|
+| `Reader[R]` | `load() -> R` | Read-only (dependencies) |
+| `Writer[W]` | `save(data: W, ...)` | Write-only (outputs) |
+| `Loader[W, R]` | Both `load()` and `save()` | Bidirectional (incremental outputs) |
+
+**Type constraints:**
+- `Dep.loader` accepts `Reader[R]` (or `Loader`, which extends `Reader`)
+- `Out.loader` accepts `Writer[W]` (or `Loader`, which extends `Writer`)
+- `IncrementalOut.loader` requires `Loader[W, R]` (needs both read and write)
+- `DirectoryOut.loader` accepts `Writer[T]`
+
+## Built-in Loaders
+
+| Loader | Base | Data Type | Options | `empty()` |
+|--------|------|-----------|---------|-----------|
+| `CSV()` | `Loader` | DataFrame | `index_col`, `sep`, `dtype` | Yes |
+| `JSON()` | `Loader` | dict/list | `indent=2`, `empty_factory=dict` | Yes |
+| `JSONL()` | `Loader` | list[dict] | — | Yes |
+| `YAML()` | `Loader` | dict/list | `empty_factory=dict` | Yes |
+| `Text()` | `Loader` | str | — | Yes |
+| `Pickle()` | `Loader` | Any | `protocol` | No |
+| `PathOnly()` | `Loader` | Path | — | No |
+| `MatplotlibFigure()` | `Writer` | Figure | `dpi=150`, `bbox_inches`, `transparent` | N/A |
+
+**Notes:**
+- Loaders with `empty()` support are required for `IncrementalOut`.
+- `MatplotlibFigure` is `Writer[Figure]` (write-only) because images cannot be loaded back as Figure objects.
 
 ## Output Types
 
@@ -148,6 +167,8 @@ Annotated[
 ]
 ```
 
+**Note:** `MatplotlibFigure` is a `Writer[Figure]` (not a full `Loader`) because saved images cannot be loaded back as matplotlib Figure objects. It only has a `save()` method.
+
 **Full example:**
 
 ```python
@@ -170,6 +191,53 @@ def make_plot(
 ```python
 pipeline.register(my_stage, name="my_stage@v2", out_path_overrides={"result": "v2/output.csv"})
 ```
+
+## Custom Loaders
+
+Create custom loaders by extending the appropriate base class:
+
+**Reader (read-only)** - for dependencies that only need loading:
+
+```python
+import dataclasses
+import pathlib
+from pivot.loaders import Reader
+
+@dataclasses.dataclass(frozen=True)
+class ImageReader(Reader[np.ndarray]):
+    def load(self, path: pathlib.Path) -> np.ndarray:
+        from PIL import Image
+        return np.array(Image.open(path))
+```
+
+**Writer (write-only)** - for outputs that cannot be loaded back:
+
+```python
+@dataclasses.dataclass(frozen=True)
+class HTMLWriter(Writer[str]):
+    def save(self, data: str, path: pathlib.Path) -> None:
+        path.write_text(data)
+```
+
+**Loader (bidirectional)** - for `IncrementalOut` or symmetric I/O:
+
+```python
+@dataclasses.dataclass(frozen=True)
+class NPY(Loader[np.ndarray, np.ndarray]):
+    def load(self, path: pathlib.Path) -> np.ndarray:
+        return np.load(path)
+
+    def save(self, data: np.ndarray, path: pathlib.Path) -> None:
+        np.save(path, data)
+
+    def empty(self) -> np.ndarray:  # Required for IncrementalOut
+        return np.array([])
+```
+
+**Rules:**
+- Use `@dataclasses.dataclass(frozen=True)` for immutability and pickling
+- Loaders must be module-level classes (not closures)
+- Implement `empty()` only if the loader will be used with `IncrementalOut`
 
 ## Critical Rules
 

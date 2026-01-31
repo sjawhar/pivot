@@ -63,6 +63,8 @@ class ProcessOutputs(TypedDict):
     data: Annotated[pandas.DataFrame, outputs.Out("data.parquet", loaders.CSV())]
 ```
 
+`Out[W]` takes a `Writer[W]` - it only needs `save()`, not `load()`. Most loaders implement both (they are `Loader[W, R]` which extends `Writer[W]`), so you can use `CSV()`, `JSON()`, etc. directly.
+
 Options:
 
 - `cache=True` (default) - Store in content-addressable cache
@@ -80,6 +82,8 @@ def train(...) -> TrainOutputs:
     metrics = {'accuracy': 0.95, 'loss': 0.05}
     return {"metrics": metrics}  # Automatically saved as JSON
 ```
+
+`Metric` extends `Out[JsonValue]` and takes a `Writer[JsonValue]`. The default loader is `JSON()`, so you typically omit it.
 
 Use metrics for:
 
@@ -111,6 +115,24 @@ def train(...) -> TrainOutputs:
     return {"plot": plot_path}
 ```
 
+Or let Pivot save the figure automatically using `MatplotlibFigure`:
+
+```python
+from matplotlib.figure import Figure
+
+class TrainOutputs(TypedDict):
+    plot: Annotated[Figure, outputs.Plot("loss.png", loaders.MatplotlibFigure())]
+
+
+def train(...) -> TrainOutputs:
+    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots()
+    ax.plot(losses)
+    return {"plot": fig}  # Pivot calls MatplotlibFigure.save() automatically
+```
+
+`Plot[W]` extends `Out[W]` and takes a `Writer[W]`. `MatplotlibFigure` is a `Writer[Figure]` (write-only - it has `save()` but no `load()`, since images cannot be loaded back as Figure objects).
+
 View plots:
 
 ```bash
@@ -135,11 +157,15 @@ def append_records(...) -> AppendOutputs:
     return {"database": existing_data}
 ```
 
+`IncrementalOut[W, R]` takes a `Loader[W, R]` - a **bidirectional** loader that can both `save()` and `load()`. This is because Pivot needs to restore the previous output before execution (`load()`) and persist the updated output after execution (`save()`).
+
+Unlike `Out`, which only needs `Writer[W]`, `IncrementalOut` requires a full `Loader`. Write-only loaders like `MatplotlibFigure` cannot be used with `IncrementalOut`.
+
 **How it works:**
 
-1. Before execution, previous version is restored from cache
+1. Before execution, previous version is restored from cache (via `loader.load()`)
 2. Stage modifies the data
-3. New version is cached after execution
+3. New version is cached after execution (via `loader.save()`)
 4. Uses COPY mode (not symlinks) so writes are safe
 
 Use cases:

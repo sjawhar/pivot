@@ -128,7 +128,7 @@ def test_prepare_outputs_regular_out_is_deleted(tmp_path: pathlib.Path) -> None:
     output_file = tmp_path / "output.txt"
     output_file.write_text("existing content")
 
-    stage_outs: list[outputs.Out[Any]] = [
+    stage_outs: list[outputs.BaseOut] = [
         outputs.Out(path=str(output_file), loader=loaders.PathOnly())
     ]
     worker._prepare_outputs_for_execution(stage_outs, None, tmp_path / "cache")
@@ -140,7 +140,7 @@ def test_prepare_outputs_incremental_no_cache_creates_empty(tmp_path: pathlib.Pa
     """IncrementalOut with no cache should start fresh (file doesn't exist)."""
     output_file = tmp_path / "database.txt"
 
-    stage_outs: list[outputs.Out[Any]] = [
+    stage_outs: list[outputs.BaseOut] = [
         outputs.IncrementalOut(path=str(output_file), loader=loaders.PathOnly())
     ]
     worker._prepare_outputs_for_execution(stage_outs, None, tmp_path / "cache")
@@ -230,7 +230,7 @@ def test_prepare_outputs_incremental_missing_cache_error(
         dep_generations={},
     )
 
-    stage_outs: list[outputs.Out[Any]] = [
+    stage_outs: list[outputs.BaseOut] = [
         outputs.IncrementalOut(path="database.txt", loader=loaders.PathOnly())
     ]
 

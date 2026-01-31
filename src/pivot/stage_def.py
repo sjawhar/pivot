@@ -209,7 +209,7 @@ def _collect_directory_out_ops(
     spec: outputs.DirectoryOut[Any],
     value: Any,
     project_root: pathlib.Path,
-    write_ops: list[tuple[pathlib.Path, Any, loaders.Loader[Any]]],
+    write_ops: list[tuple[pathlib.Path, Any, loaders.Writer[Any]]],
 ) -> None:
     """Collect write operations for a DirectoryOut.
 
@@ -226,7 +226,7 @@ def _collect_directory_out_ops(
         raise ValueError(f"DirectoryOut '{name}': dict must be non-empty")
 
     # spec.path is guaranteed to be str ending with "/" by DirectoryOut.__post_init__
-    dir_path = cast("str", spec.path)
+    dir_path = spec.path
 
     # Track normalized keys to detect duplicates after normalization
     seen_normalized: dict[str, str] = {}  # normalized -> original
@@ -285,15 +285,15 @@ def _collect_directory_out_ops(
 def _extract_typeddict_outputs(
     return_type: type,
     stage_name: str,
-) -> dict[str, outputs.Out[Any]]:
-    """Extract Out specs from TypedDict, erroring if any field lacks Out."""
+) -> dict[str, outputs.BaseOut]:
+    """Extract output specs from TypedDict, erroring if any field lacks Out/DirectoryOut/IncrementalOut."""
     field_hints = _get_type_hints_safe(return_type, str(return_type), include_extras=True)
     if field_hints is None:
         raise exceptions.StageDefinitionError(
             f"Stage '{stage_name}': Failed to resolve type hints for TypedDict '{return_type.__name__}'"
         )
 
-    specs = dict[str, outputs.Out[Any]]()
+    specs = dict[str, outputs.BaseOut]()
     fields_without_out = list[str]()
 
     for field_name, field_type in field_hints.items():
@@ -310,9 +310,9 @@ def _extract_typeddict_outputs(
 
         out_found = False
         for metadata in args[1:]:
-            if isinstance(metadata, outputs.Out):
-                # Cast to Out[Any] - isinstance narrows to Out[Unknown]
-                specs[field_name] = cast("outputs.Out[Any]", metadata)
+            # Check for any output spec type (Out, DirectoryOut, IncrementalOut, and subclasses)
+            if isinstance(metadata, (outputs.Out, outputs.DirectoryOut, outputs.IncrementalOut)):
+                specs[field_name] = metadata
                 out_found = True
                 break
 
@@ -337,7 +337,7 @@ def _extract_typeddict_outputs(
 def get_output_specs_from_return(
     func: Callable[..., Any],
     stage_name: str,
-) -> dict[str, outputs.Out[Any]]:
+) -> dict[str, outputs.BaseOut]:
     """Extract output specs from a function's return type annotation (TypedDict only).
 
     For TypedDict returns, extracts Out specs from field annotations.
@@ -388,7 +388,7 @@ def get_output_specs_from_return(
 
 def save_return_outputs(
     return_value: Mapping[str, Any],
-    specs: dict[str, outputs.Out[Any]],
+    specs: dict[str, outputs.BaseOut],
     project_root: pathlib.Path,
 ) -> None:
     """Save return value outputs to disk.
@@ -422,7 +422,7 @@ def save_return_outputs(
         logger.warning("Extra keys in return value not declared as outputs: %s", sorted(extra))
 
     # Collect all write operations and validate paths upfront
-    write_ops: list[tuple[pathlib.Path, Any, loaders.Loader[Any]]] = []
+    write_ops: list[tuple[pathlib.Path, Any, loaders.Writer[Any]]] = []
     for name, spec in specs.items():
         path = spec.path
         value = return_value[name]
@@ -476,7 +476,7 @@ class FuncDepSpec:
     """
 
     path: outputs.PathType
-    loader: loaders.Loader[Any]
+    loader: loaders.Reader[Any]
     creates_dep_edge: bool = True
 
 
@@ -628,7 +628,7 @@ def get_placeholder_dep_names(func: Callable[..., Any]) -> set[str]:
     return placeholder_names
 
 
-def get_single_output_spec_from_return(func: Callable[..., Any]) -> outputs.Out[Any] | None:
+def get_single_output_spec_from_return(func: Callable[..., Any]) -> outputs.BaseOut | None:
     """Extract single output spec from a function's return annotation (non-TypedDict).
 
     For functions with a single output, the return type can be directly annotated:
@@ -642,7 +642,7 @@ def get_single_output_spec_from_return(func: Callable[..., Any]) -> outputs.Out[
         # spec.path == "output.csv"
 
     Returns None if return type is TypedDict (use get_output_specs_from_return instead)
-    or if no Out annotation found.
+    or if no output annotation found (Out, IncrementalOut, or DirectoryOut).
     """
     hints = _get_type_hints_safe(func, func.__name__, include_extras=True)
     if hints is None:
@@ -667,11 +667,11 @@ def get_single_output_spec_from_return(func: Callable[..., Any]) -> outputs.Out[
     if len(args) < 2:
         return None
 
-    # Look for Out or its subclasses in the metadata
+    # Look for any output spec type in the metadata
     for metadata in args[1:]:
-        if isinstance(metadata, outputs.Out):
-            # Cast to Out[Any] - isinstance narrows to Out[Unknown]
-            return cast("outputs.Out[Any]", metadata)
+        if isinstance(metadata, (outputs.Out, outputs.IncrementalOut, outputs.DirectoryOut)):
+            # Cast to BaseOut to satisfy type checker - isinstance narrows to Unknown generic params
+            return cast("outputs.BaseOut", metadata)
 
     return None
 
@@ -687,10 +687,19 @@ def _load_single_dep(
     For deps with creates_dep_edge=False (IncrementalOut as input), returns an
     empty instance from the loader if the file doesn't exist (first run).
     """
+    from pivot import loaders as loaders_module
+
     full_path = project_root / path
     if not spec.creates_dep_edge and not full_path.exists():
         # IncrementalOut as input: file doesn't exist yet (first run)
-        return spec.loader.empty()
+        # IncrementalOut.loader is always a Loader (has empty()), narrow the type
+        if not isinstance(spec.loader, loaders_module.Loader):
+            raise RuntimeError(
+                f"Dependency '{name}' has creates_dep_edge=False but loader is not a Loader"
+            )
+        # Cast to Loader[Any, Any] - isinstance narrows but basedpyright keeps Unknown params
+        loader = cast("loaders_module.Loader[Any, Any]", spec.loader)
+        return loader.empty()
     try:
         return spec.loader.load(full_path)
     except Exception as e:
