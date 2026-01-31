@@ -6,14 +6,15 @@ import io
 import json
 import os
 import pathlib
+import shutil
 import sys
-from typing import TYPE_CHECKING, Annotated, Any
+from typing import TYPE_CHECKING, Annotated, Any, TypedDict
 
 import pytest
 
 from pivot import exceptions, executor, loaders, outputs, stage_def
 from pivot.executor import worker
-from pivot.storage import cache, lock
+from pivot.storage import cache, lock, state
 
 if TYPE_CHECKING:
     import multiprocessing as mp
@@ -22,7 +23,7 @@ if TYPE_CHECKING:
     from pytest_mock import MockerFixture
 
     from pivot.executor import WorkerStageInfo
-    from pivot.types import DirManifestEntry, OutputMessage
+    from pivot.types import DirHash, DirManifestEntry, OutputHash, OutputMessage
 
 
 class _PlainParams(stage_def.StageParams):
@@ -1659,3 +1660,783 @@ def test_joblib_protection_default_uses_threading(
     call_kwargs = mock_config.call_args.kwargs
     assert call_kwargs["backend"] == "threading"
     assert result == "done"
+
+
+# =============================================================================
+# DirectoryOut Tests
+# =============================================================================
+
+
+class _DirectoryOutResult(TypedDict):
+    """TypedDict for DirectoryOut test stage."""
+
+    task_results: Annotated[
+        dict[str, dict[str, int]], outputs.DirectoryOut("results/", loaders.JSON[dict[str, int]]())
+    ]
+
+
+def _directory_out_stage() -> _DirectoryOutResult:
+    """Stage that returns DirectoryOut with multiple files."""
+    return _DirectoryOutResult(
+        task_results={
+            "task_a.json": {"accuracy": 95},
+            "task_b.json": {"accuracy": 87},
+            "subdir/task_c.json": {"accuracy": 92},
+        }
+    )
+
+
+def test_directory_out_first_run_writes_files(
+    worker_env: pathlib.Path, output_queue: mp.Queue[OutputMessage], tmp_path: pathlib.Path
+) -> None:
+    """DirectoryOut stage writes all files on first run."""
+    out_specs = stage_def.get_output_specs_from_return(_directory_out_stage, "test_stage")
+    # Create outs list with absolute path (preserving trailing slash)
+    dir_out: outputs.BaseOut = outputs.DirectoryOut(
+        str(tmp_path / "results") + "/", loaders.JSON[dict[str, int]]()
+    )
+
+    stage_info = _make_stage_info(
+        _directory_out_stage,
+        tmp_path,
+        fingerprint={"self:_directory_out_stage": "fp123"},
+        out_specs=out_specs,
+        outs=[dir_out],
+    )
+
+    result = executor.execute_stage("test_dir_out", stage_info, worker_env, output_queue)
+
+    assert result["status"] == "ran", f"Expected ran, got {result}"
+
+    # Verify all files were created
+    results_dir = tmp_path / "results"
+    assert results_dir.is_dir(), "Results directory should exist"
+    assert (results_dir / "task_a.json").exists()
+    assert (results_dir / "task_b.json").exists()
+    assert (results_dir / "subdir" / "task_c.json").exists()
+
+    # Verify content
+    assert json.loads((results_dir / "task_a.json").read_text()) == {"accuracy": 95}
+    assert json.loads((results_dir / "task_b.json").read_text()) == {"accuracy": 87}
+
+
+def test_directory_out_skipped_on_second_run(
+    worker_env: pathlib.Path, output_queue: mp.Queue[OutputMessage], tmp_path: pathlib.Path
+) -> None:
+    """DirectoryOut stage is skipped on second run when unchanged."""
+    out_specs = stage_def.get_output_specs_from_return(_directory_out_stage, "test_stage")
+    dir_out: outputs.BaseOut = outputs.DirectoryOut(
+        str(tmp_path / "results") + "/", loaders.JSON[dict[str, int]]()
+    )
+
+    stage_info = _make_stage_info(
+        _directory_out_stage,
+        tmp_path,
+        fingerprint={"self:_directory_out_stage": "fp123"},
+        out_specs=out_specs,
+        outs=[dir_out],
+    )
+
+    # First run
+    result1 = executor.execute_stage("test_dir_out", stage_info, worker_env, output_queue)
+    assert result1["status"] == "ran"
+
+    # Second run - should skip
+    result2 = executor.execute_stage("test_dir_out", stage_info, worker_env, output_queue)
+    assert result2["status"] == "skipped", f"Expected skipped, got {result2}"
+    assert "unchanged" in result2["reason"]
+
+
+def test_directory_out_reruns_on_fingerprint_change(
+    worker_env: pathlib.Path, output_queue: mp.Queue[OutputMessage], tmp_path: pathlib.Path
+) -> None:
+    """DirectoryOut stage re-runs when code fingerprint changes."""
+    out_specs = stage_def.get_output_specs_from_return(_directory_out_stage, "test_stage")
+    dir_out: outputs.BaseOut = outputs.DirectoryOut(
+        str(tmp_path / "results") + "/", loaders.JSON[dict[str, int]]()
+    )
+
+    stage_info1 = _make_stage_info(
+        _directory_out_stage,
+        tmp_path,
+        fingerprint={"self:_directory_out_stage": "fp123"},
+        out_specs=out_specs,
+        outs=[dir_out],
+    )
+
+    # First run
+    result1 = executor.execute_stage("test_dir_out", stage_info1, worker_env, output_queue)
+    assert result1["status"] == "ran"
+
+    # Change fingerprint
+    stage_info2 = _make_stage_info(
+        _directory_out_stage,
+        tmp_path,
+        fingerprint={"self:_directory_out_stage": "fp456_changed"},
+        out_specs=out_specs,
+        outs=[dir_out],
+    )
+
+    # Second run - should re-run due to fingerprint change
+    result2 = executor.execute_stage("test_dir_out", stage_info2, worker_env, output_queue)
+    assert result2["status"] == "ran", f"Expected ran, got {result2}"
+    assert "Code changed" in result2["reason"]
+
+
+def test_directory_out_restored_from_cache(
+    worker_env: pathlib.Path, output_queue: mp.Queue[OutputMessage], tmp_path: pathlib.Path
+) -> None:
+    """DirectoryOut files are restored from cache when missing."""
+    out_specs = stage_def.get_output_specs_from_return(_directory_out_stage, "test_stage")
+    dir_out: outputs.BaseOut = outputs.DirectoryOut(
+        str(tmp_path / "results") + "/", loaders.JSON[dict[str, int]]()
+    )
+
+    stage_info = _make_stage_info(
+        _directory_out_stage,
+        tmp_path,
+        fingerprint={"self:_directory_out_stage": "fp123"},
+        out_specs=out_specs,
+        outs=[dir_out],
+    )
+
+    # First run - creates files and caches them
+    result1 = executor.execute_stage("test_dir_out", stage_info, worker_env, output_queue)
+    assert result1["status"] == "ran"
+
+    # Verify files exist
+    results_dir = tmp_path / "results"
+    assert (results_dir / "task_a.json").exists()
+
+    # Delete the output directory
+    shutil.rmtree(results_dir)
+    assert not results_dir.exists()
+
+    # Second run - should skip and restore from cache
+    result2 = executor.execute_stage("test_dir_out", stage_info, worker_env, output_queue)
+    assert result2["status"] == "skipped", f"Expected skipped, got {result2}"
+
+    # Verify files were restored
+    assert results_dir.exists()
+    assert (results_dir / "task_a.json").exists()
+    assert (results_dir / "task_b.json").exists()
+    assert (results_dir / "subdir" / "task_c.json").exists()
+
+    # Verify content
+    assert json.loads((results_dir / "task_a.json").read_text()) == {"accuracy": 95}
+
+
+# =============================================================================
+# Unit Tests for Internal Functions
+# =============================================================================
+
+
+def test_normalize_out_path_preserves_trailing_slash() -> None:
+    """_normalize_out_path preserves trailing slash for DirectoryOut paths."""
+    result = worker._normalize_out_path("results/")
+    assert result.endswith("/"), "Should preserve trailing slash for DirectoryOut"
+    assert "results" in result
+
+    result2 = worker._normalize_out_path("a/b/c/")
+    assert result2.endswith("/"), "Should preserve trailing slash for nested DirectoryOut"
+
+
+def test_normalize_out_path_no_slash_for_files() -> None:
+    """_normalize_out_path doesn't add trailing slash for regular Out paths."""
+    result = worker._normalize_out_path("output.csv")
+    assert not result.endswith("/"), "Should not add trailing slash for files"
+    assert result.endswith("output.csv")
+
+
+def test_normalize_out_path_normalizes_relative_paths() -> None:
+    """_normalize_out_path normalizes relative path components."""
+    # Note: This depends on project.normalize_path behavior
+    result = worker._normalize_out_path("./results/")
+    assert result.endswith("/"), "Should preserve trailing slash"
+    assert "//" not in result, "Should not have double slashes"
+
+
+def test_directory_needs_restore_returns_false_when_matching(tmp_path: pathlib.Path) -> None:
+    """_directory_needs_restore returns False when directory matches manifest."""
+    # Create directory with files
+    dir_path = tmp_path / "results"
+    dir_path.mkdir()
+    (dir_path / "a.json").write_text('{"value": 1}')
+    (dir_path / "b.json").write_text('{"value": 2}')
+
+    # Create manifest matching the files
+    manifest: list[DirManifestEntry] = [
+        {
+            "relpath": "a.json",
+            "hash": cache.hash_file(dir_path / "a.json"),
+            "size": 0,
+            "isexec": False,
+        },
+        {
+            "relpath": "b.json",
+            "hash": cache.hash_file(dir_path / "b.json"),
+            "size": 0,
+            "isexec": False,
+        },
+    ]
+    cached_hash: DirHash = {"hash": "tree_hash", "manifest": manifest}
+
+    assert not worker._directory_needs_restore(dir_path, cached_hash)
+
+
+def test_directory_needs_restore_returns_true_for_missing_file(tmp_path: pathlib.Path) -> None:
+    """_directory_needs_restore returns True when a file is missing."""
+    dir_path = tmp_path / "results"
+    dir_path.mkdir()
+    (dir_path / "a.json").write_text('{"value": 1}')
+    # b.json is missing
+
+    manifest: list[DirManifestEntry] = [
+        {
+            "relpath": "a.json",
+            "hash": cache.hash_file(dir_path / "a.json"),
+            "size": 0,
+            "isexec": False,
+        },
+        {"relpath": "b.json", "hash": "missing_file_hash", "size": 0, "isexec": False},
+    ]
+    cached_hash: DirHash = {"hash": "tree_hash", "manifest": manifest}
+
+    assert worker._directory_needs_restore(dir_path, cached_hash)
+
+
+def test_directory_needs_restore_returns_true_for_extra_file(tmp_path: pathlib.Path) -> None:
+    """_directory_needs_restore returns True when there are extra files."""
+    dir_path = tmp_path / "results"
+    dir_path.mkdir()
+    (dir_path / "a.json").write_text('{"value": 1}')
+    (dir_path / "extra.json").write_text('{"extra": true}')  # Extra file
+
+    manifest: list[DirManifestEntry] = [
+        {
+            "relpath": "a.json",
+            "hash": cache.hash_file(dir_path / "a.json"),
+            "size": 0,
+            "isexec": False,
+        },
+    ]
+    cached_hash: DirHash = {"hash": "tree_hash", "manifest": manifest}
+
+    assert worker._directory_needs_restore(dir_path, cached_hash)
+
+
+def test_directory_needs_restore_returns_true_for_wrong_content(tmp_path: pathlib.Path) -> None:
+    """_directory_needs_restore returns True when file content doesn't match."""
+    dir_path = tmp_path / "results"
+    dir_path.mkdir()
+    (dir_path / "a.json").write_text('{"value": 1}')
+
+    manifest: list[DirManifestEntry] = [
+        {"relpath": "a.json", "hash": "wrong_hash", "size": 0, "isexec": False},
+    ]
+    cached_hash: DirHash = {"hash": "tree_hash", "manifest": manifest}
+
+    assert worker._directory_needs_restore(dir_path, cached_hash)
+
+
+def test_directory_needs_restore_ignores_symlinks(tmp_path: pathlib.Path) -> None:
+    """_directory_needs_restore ignores symlinks in directory."""
+    dir_path = tmp_path / "results"
+    dir_path.mkdir()
+    (dir_path / "a.json").write_text('{"value": 1}')
+
+    # Create symlink (should be ignored)
+    symlink_target = tmp_path / "target.json"
+    symlink_target.write_text('{"target": true}')
+    (dir_path / "link.json").symlink_to(symlink_target)
+
+    manifest: list[DirManifestEntry] = [
+        {
+            "relpath": "a.json",
+            "hash": cache.hash_file(dir_path / "a.json"),
+            "size": 0,
+            "isexec": False,
+        },
+    ]
+    cached_hash: DirHash = {"hash": "tree_hash", "manifest": manifest}
+
+    # Should not consider symlink as an extra file
+    assert not worker._directory_needs_restore(dir_path, cached_hash)
+
+
+def test_directory_needs_restore_handles_nested_files(tmp_path: pathlib.Path) -> None:
+    """_directory_needs_restore correctly handles nested subdirectories."""
+    dir_path = tmp_path / "results"
+    dir_path.mkdir()
+    (dir_path / "top.json").write_text('{"level": "top"}')
+    (dir_path / "sub").mkdir()
+    (dir_path / "sub" / "nested.json").write_text('{"level": "nested"}')
+
+    manifest: list[DirManifestEntry] = [
+        {
+            "relpath": "top.json",
+            "hash": cache.hash_file(dir_path / "top.json"),
+            "size": 0,
+            "isexec": False,
+        },
+        {
+            "relpath": "sub/nested.json",
+            "hash": cache.hash_file(dir_path / "sub" / "nested.json"),
+            "size": 0,
+            "isexec": False,
+        },
+    ]
+    cached_hash: DirHash = {"hash": "tree_hash", "manifest": manifest}
+
+    assert not worker._directory_needs_restore(dir_path, cached_hash)
+
+
+def test_directory_needs_restore_empty_manifest(tmp_path: pathlib.Path) -> None:
+    """_directory_needs_restore returns True when manifest is empty but files exist."""
+    dir_path = tmp_path / "results"
+    dir_path.mkdir()
+    (dir_path / "a.json").write_text('{"value": 1}')
+
+    cached_hash: DirHash = {"hash": "tree_hash", "manifest": []}
+
+    # Directory has files but manifest is empty - needs restore
+    assert worker._directory_needs_restore(dir_path, cached_hash)
+
+
+def test_directory_needs_restore_empty_directory_empty_manifest(tmp_path: pathlib.Path) -> None:
+    """_directory_needs_restore returns False when both directory and manifest are empty."""
+    dir_path = tmp_path / "results"
+    dir_path.mkdir()
+
+    cached_hash: DirHash = {"hash": "tree_hash", "manifest": []}
+
+    # Both empty - matches
+    assert not worker._directory_needs_restore(dir_path, cached_hash)
+
+
+# =============================================================================
+# _cleanup_restored_paths Tests
+# =============================================================================
+
+
+def test_cleanup_restored_paths_removes_files(tmp_path: pathlib.Path) -> None:
+    """_cleanup_restored_paths removes files that were partially restored."""
+    # Create some files that represent partially restored outputs
+    file1 = tmp_path / "output1.txt"
+    file2 = tmp_path / "output2.txt"
+    file1.write_text("content1")
+    file2.write_text("content2")
+
+    restored_paths = [file1, file2]
+    worker._cleanup_restored_paths(restored_paths)
+
+    assert not file1.exists(), "File1 should be removed"
+    assert not file2.exists(), "File2 should be removed"
+
+
+def test_cleanup_restored_paths_removes_directories(tmp_path: pathlib.Path) -> None:
+    """_cleanup_restored_paths removes directories and their contents."""
+    # Create a directory with files
+    dir_path = tmp_path / "results"
+    dir_path.mkdir()
+    (dir_path / "a.json").write_text('{"value": 1}')
+    (dir_path / "b.json").write_text('{"value": 2}')
+
+    worker._cleanup_restored_paths([dir_path])
+
+    assert not dir_path.exists(), "Directory should be removed"
+
+
+def test_cleanup_restored_paths_handles_nonexistent(tmp_path: pathlib.Path) -> None:
+    """_cleanup_restored_paths gracefully handles paths that don't exist."""
+    # This should not raise an exception
+    nonexistent = tmp_path / "does_not_exist.txt"
+    worker._cleanup_restored_paths([nonexistent])
+
+
+def test_cleanup_restored_paths_handles_mixed(tmp_path: pathlib.Path) -> None:
+    """_cleanup_restored_paths handles mix of files, dirs, and nonexistent."""
+    file1 = tmp_path / "file.txt"
+    file1.write_text("content")
+    dir1 = tmp_path / "dir"
+    dir1.mkdir()
+    (dir1 / "nested.txt").write_text("nested")
+    nonexistent = tmp_path / "missing"
+
+    worker._cleanup_restored_paths([file1, dir1, nonexistent])
+
+    assert not file1.exists()
+    assert not dir1.exists()
+
+
+def test_cleanup_restored_paths_empty_list() -> None:
+    """_cleanup_restored_paths handles empty list."""
+    # Should not raise
+    worker._cleanup_restored_paths([])
+
+
+# =============================================================================
+# _directory_needs_restore Error Handling Tests
+# =============================================================================
+
+
+def test_directory_needs_restore_returns_true_on_permission_error(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """_directory_needs_restore returns True when hash computation fails."""
+    dir_path = tmp_path / "results"
+    dir_path.mkdir()
+    (dir_path / "a.json").write_text('{"value": 1}')
+
+    manifest: list[DirManifestEntry] = [
+        {
+            "relpath": "a.json",
+            "hash": cache.hash_file(dir_path / "a.json"),
+            "size": 0,
+            "isexec": False,
+        },
+    ]
+    cached_hash: DirHash = {"hash": "tree_hash", "manifest": manifest}
+
+    # Make hash_file raise OSError
+    def failing_hash(path: pathlib.Path) -> str:
+        raise OSError("Permission denied")
+
+    monkeypatch.setattr(cache, "hash_file", failing_hash)
+
+    # Should return True (needs restore) when hash fails
+    assert worker._directory_needs_restore(dir_path, cached_hash)
+
+
+def test_directory_needs_restore_handles_unicode_normalization(tmp_path: pathlib.Path) -> None:
+    """_directory_needs_restore handles unicode normalization (NFC vs NFD)."""
+    dir_path = tmp_path / "results"
+    dir_path.mkdir()
+
+    # Create file with combining character (could be stored as NFD on some filesystems)
+    import unicodedata
+
+    # café with combining acute accent (NFD form)
+    nfd_name = "cafe\u0301.json"
+    # café with precomposed é (NFC form)
+    nfc_name = unicodedata.normalize("NFC", nfd_name)
+
+    (dir_path / nfd_name).write_text('{"value": 1}')
+
+    # Manifest uses NFC form (as it should per the codebase convention)
+    manifest: list[DirManifestEntry] = [
+        {
+            "relpath": nfc_name,
+            "hash": cache.hash_file(dir_path / nfd_name),
+            "size": 0,
+            "isexec": False,
+        },
+    ]
+    cached_hash: DirHash = {"hash": "tree_hash", "manifest": manifest}
+
+    # Should handle unicode normalization correctly
+    assert not worker._directory_needs_restore(dir_path, cached_hash)
+
+
+# =============================================================================
+# _normalize_out_path Additional Tests
+# =============================================================================
+
+
+def test_normalize_out_path_handles_absolute_path() -> None:
+    """_normalize_out_path handles absolute paths."""
+    result = worker._normalize_out_path("/absolute/path/output.csv")
+    assert not result.endswith("/"), "Files should not have trailing slash"
+    assert "output.csv" in result
+
+
+def test_normalize_out_path_handles_absolute_dir_path() -> None:
+    """_normalize_out_path preserves trailing slash for absolute directory paths."""
+    result = worker._normalize_out_path("/absolute/path/results/")
+    assert result.endswith("/"), "Directory paths should preserve trailing slash"
+
+
+def test_normalize_out_path_handles_empty_trailing_component() -> None:
+    """_normalize_out_path handles paths with multiple trailing slashes."""
+    # Single trailing slash
+    result = worker._normalize_out_path("results/")
+    assert result.endswith("/")
+    assert "//" not in result
+
+
+# =============================================================================
+# Run Cache with DirectoryOut Tests
+# =============================================================================
+
+
+class _RunCacheDirectoryOutResult(TypedDict):
+    """TypedDict for run cache DirectoryOut test stage."""
+
+    results: Annotated[
+        dict[str, dict[str, int]], outputs.DirectoryOut("results/", loaders.JSON[dict[str, int]]())
+    ]
+
+
+def _run_cache_directory_stage() -> _RunCacheDirectoryOutResult:
+    """Stage that returns DirectoryOut for run cache testing."""
+    return _RunCacheDirectoryOutResult(
+        results={
+            "a.json": {"value": 1},
+            "b.json": {"value": 2},
+        }
+    )
+
+
+def test_run_cache_skip_with_directory_out(
+    worker_env: pathlib.Path, output_queue: mp.Queue[OutputMessage], tmp_path: pathlib.Path
+) -> None:
+    """Run cache correctly handles DirectoryOut restoration."""
+    out_specs = stage_def.get_output_specs_from_return(_run_cache_directory_stage, "test_stage")
+    dir_out: outputs.BaseOut = outputs.DirectoryOut(
+        str(tmp_path / "results") + "/", loaders.JSON[dict[str, int]]()
+    )
+
+    stage_info = _make_stage_info(
+        _run_cache_directory_stage,
+        tmp_path,
+        fingerprint={"self:_run_cache_directory_stage": "fp123"},
+        out_specs=out_specs,
+        outs=[dir_out],
+    )
+
+    # First run - creates files and records in run cache
+    result1 = executor.execute_stage("test_run_cache_dir", stage_info, worker_env, output_queue)
+    assert result1["status"] == "ran"
+
+    results_dir = tmp_path / "results"
+    assert (results_dir / "a.json").exists()
+    assert (results_dir / "b.json").exists()
+
+    # Manually write the run cache entry (normally done by coordinator)
+    deferred = result1.get("deferred_writes", {})
+    if "run_cache_input_hash" in deferred and "run_cache_entry" in deferred:
+        state_db = state.StateDB(tmp_path / ".pivot" / "state.db")
+        state_db.write_run_cache(
+            "test_run_cache_dir", deferred["run_cache_input_hash"], deferred["run_cache_entry"]
+        )
+        state_db.close()
+
+    # Delete results and lock file to force run cache path
+    # Lock file is in stages/ subdirectory
+    shutil.rmtree(results_dir)
+    lock_file = tmp_path / ".pivot" / "stages" / "test_run_cache_dir.lock"
+    if lock_file.exists():
+        lock_file.unlink()
+
+    # Second run - should skip via run cache and restore directory
+    result2 = executor.execute_stage("test_run_cache_dir", stage_info, worker_env, output_queue)
+    assert result2["status"] == "skipped", f"Expected skipped, got {result2}"
+    assert "run cache" in result2["reason"]
+
+    # Verify files were restored
+    assert results_dir.exists()
+    assert (results_dir / "a.json").exists()
+    assert (results_dir / "b.json").exists()
+
+    # Verify content
+    assert json.loads((results_dir / "a.json").read_text()) == {"value": 1}
+
+
+def test_run_cache_skip_restores_corrupted_directory(
+    worker_env: pathlib.Path, output_queue: mp.Queue[OutputMessage], tmp_path: pathlib.Path
+) -> None:
+    """Run cache restores DirectoryOut when files are corrupted."""
+    out_specs = stage_def.get_output_specs_from_return(_run_cache_directory_stage, "test_stage")
+    dir_out: outputs.BaseOut = outputs.DirectoryOut(
+        str(tmp_path / "results") + "/", loaders.JSON[dict[str, int]]()
+    )
+
+    stage_info = _make_stage_info(
+        _run_cache_directory_stage,
+        tmp_path,
+        fingerprint={"self:_run_cache_directory_stage": "fp123"},
+        out_specs=out_specs,
+        outs=[dir_out],
+    )
+
+    # First run
+    result1 = executor.execute_stage("test_run_cache_corrupt", stage_info, worker_env, output_queue)
+    assert result1["status"] == "ran"
+
+    results_dir = tmp_path / "results"
+
+    # Manually write the run cache entry (normally done by coordinator)
+    deferred = result1.get("deferred_writes", {})
+    if "run_cache_input_hash" in deferred and "run_cache_entry" in deferred:
+        state_db = state.StateDB(tmp_path / ".pivot" / "state.db")
+        state_db.write_run_cache(
+            "test_run_cache_corrupt", deferred["run_cache_input_hash"], deferred["run_cache_entry"]
+        )
+        state_db.close()
+
+    # Delete lock file to force run cache path, but corrupt directory
+    # Lock file is in stages/ subdirectory
+    lock_file = tmp_path / ".pivot" / "stages" / "test_run_cache_corrupt.lock"
+    if lock_file.exists():
+        lock_file.unlink()
+
+    # Corrupt a.json
+    (results_dir / "a.json").unlink()
+    (results_dir / "a.json").write_text('{"corrupted": true}')
+
+    # Second run - should skip via run cache and fix corrupted file
+    result2 = executor.execute_stage("test_run_cache_corrupt", stage_info, worker_env, output_queue)
+    assert result2["status"] == "skipped"
+    assert "run cache" in result2["reason"]
+
+    # Verify corrupted file was restored
+    assert json.loads((results_dir / "a.json").read_text()) == {"value": 1}
+
+
+# =============================================================================
+# Error Path Tests
+# =============================================================================
+
+
+def test_restore_outputs_fails_when_cache_missing(
+    worker_env: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    """_restore_outputs returns False when cached file is missing."""
+    files_cache_dir = tmp_path / ".pivot" / "cache" / "files"
+    files_cache_dir.mkdir(parents=True, exist_ok=True)
+
+    output_path = str(tmp_path / "output.txt")
+    # Hash must be exactly 16 characters (xxhash64 hexdigest)
+    output_hash_map: dict[str, OutputHash] = {output_path: {"hash": "1234567890abcdef"}}
+
+    result = worker._restore_outputs(
+        [output_path],
+        output_hash_map,
+        files_cache_dir,
+        [cache.CheckoutMode.COPY],
+    )
+
+    assert result is False, "Should fail when cache is missing"
+
+
+def test_restore_outputs_returns_false_for_unrecorded_output(
+    tmp_path: pathlib.Path,
+) -> None:
+    """_restore_outputs returns False when output is not in hash map."""
+    files_cache_dir = tmp_path / ".pivot" / "cache" / "files"
+    files_cache_dir.mkdir(parents=True, exist_ok=True)
+
+    output_path = str(tmp_path / "output.txt")
+    output_hash_map: dict[str, OutputHash] = {}  # Empty map
+
+    result = worker._restore_outputs(
+        [output_path],
+        output_hash_map,
+        files_cache_dir,
+        [cache.CheckoutMode.COPY],
+    )
+
+    assert result is False, "Should fail when output not recorded"
+
+
+def test_restore_outputs_cleans_up_on_partial_failure(
+    tmp_path: pathlib.Path,
+) -> None:
+    """_restore_outputs cleans up partially restored files on failure."""
+    files_cache_dir = tmp_path / ".pivot" / "cache" / "files"
+    files_cache_dir.mkdir(parents=True, exist_ok=True)
+
+    # Create a temp file and hash it to get a valid hash
+    temp_file = tmp_path / "temp_for_hash.txt"
+    temp_file.write_text("output1 content")
+    output1_hash = cache.hash_file(temp_file)
+
+    # Create cached file in the expected location
+    cached_file = files_cache_dir / output1_hash[:2] / output1_hash[2:]
+    cached_file.parent.mkdir(parents=True, exist_ok=True)
+    cached_file.write_text("output1 content")
+
+    output1_path = str(tmp_path / "output1.txt")
+    output2_path = str(tmp_path / "output2.txt")  # This won't have cache
+
+    output_hash_map: dict[str, OutputHash] = {
+        output1_path: {"hash": output1_hash},
+        output2_path: {"hash": "fedcba0987654321"},  # Valid format but cache doesn't exist
+    }
+
+    result = worker._restore_outputs(
+        [output1_path, output2_path],
+        output_hash_map,
+        files_cache_dir,
+        [cache.CheckoutMode.COPY],
+    )
+
+    assert result is False, "Should fail when second output can't be restored"
+    # First output should be cleaned up
+    assert not pathlib.Path(output1_path).exists(), "Partially restored file should be cleaned up"
+
+
+def test_try_skip_via_run_cache_returns_none_for_incremental_out(
+    tmp_path: pathlib.Path,
+) -> None:
+    """_try_skip_via_run_cache returns None for IncrementalOut stages."""
+    from pivot.storage import state
+
+    state_dir = tmp_path / ".pivot"
+    state_dir.mkdir()
+    state_db = state.StateDB(state_dir / "state.db")
+
+    incremental_out = outputs.IncrementalOut("output.txt", loaders.PathOnly())
+
+    result = worker._try_skip_via_run_cache(
+        "test_stage",
+        "input_hash_123",
+        [incremental_out],
+        tmp_path / ".pivot" / "cache" / "files",
+        [cache.CheckoutMode.COPY],
+        state_db,
+    )
+
+    assert result is None, "IncrementalOut stages should not use run cache"
+    state_db.close()
+
+
+def test_try_skip_via_run_cache_returns_none_when_no_entry(
+    tmp_path: pathlib.Path,
+) -> None:
+    """_try_skip_via_run_cache returns None when no run cache entry exists."""
+    from pivot.storage import state
+
+    state_dir = tmp_path / ".pivot"
+    state_dir.mkdir()
+    state_db = state.StateDB(state_dir / "state.db")
+
+    out = outputs.Out(str(tmp_path / "output.txt"), loaders.PathOnly())
+
+    result = worker._try_skip_via_run_cache(
+        "nonexistent_stage",
+        "input_hash_never_seen",
+        [out],
+        tmp_path / ".pivot" / "cache" / "files",
+        [cache.CheckoutMode.COPY],
+        state_db,
+    )
+
+    assert result is None, "Should return None when no run cache entry"
+    state_db.close()
+
+
+def test_execute_stage_returns_failed_for_missing_directory_dep(
+    worker_env: pathlib.Path, output_queue: mp.Queue[OutputMessage], tmp_path: pathlib.Path
+) -> None:
+    """Worker returns failed status when directory dependency is missing."""
+
+    def stage_func() -> None:
+        pass
+
+    stage_info = _make_stage_info(stage_func, tmp_path, deps=["missing_dir/"])
+    result = executor.execute_stage("test_stage", stage_info, worker_env, output_queue)
+
+    assert result["status"] == "failed"
+    assert "missing deps" in result["reason"]
+    assert "missing_dir" in result["reason"]

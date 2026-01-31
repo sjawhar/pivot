@@ -15,6 +15,7 @@ import queue
 import random
 import sys
 import threading
+import unicodedata
 from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast, override
 
 import pydantic
@@ -32,6 +33,7 @@ from pivot.types import (
     OutputMessage,
     StageResult,
     StageStatus,
+    is_dir_hash,
 )
 
 if TYPE_CHECKING:
@@ -373,14 +375,23 @@ def execute_stage(
             return _make_result(StageStatus.FAILED, repr(e), output_lines)
 
 
+def _normalize_out_path(path: str) -> str:
+    """Normalize output path, preserving trailing slash for DirectoryOut."""
+    normalized = str(project.normalize_path(path))
+    # Preserve trailing slash for DirectoryOut paths
+    if path.endswith("/") and not normalized.endswith("/"):
+        return normalized + "/"
+    return normalized
+
+
 def _get_normalized_out_paths(stage_info: WorkerStageInfo) -> list[str]:
     """Get normalized output paths from stage info, matching lock_data format."""
-    return [str(project.normalize_path(str(out.path))) for out in stage_info["outs"]]
+    return [_normalize_out_path(str(out.path)) for out in stage_info["outs"]]
 
 
 def _get_output_specs(stage_info: WorkerStageInfo) -> list[tuple[str, bool]]:
     """Get normalized output specs (path, cache flag) for input hash computation."""
-    return [(str(project.normalize_path(str(out.path))), out.cache) for out in stage_info["outs"]]
+    return [(_normalize_out_path(str(out.path)), out.cache) for out in stage_info["outs"]]
 
 
 def _check_skip_or_run(
@@ -437,30 +448,58 @@ def _cleanup_restored_paths(restored_paths: list[pathlib.Path]) -> None:
         cache.remove_output(path)
 
 
-def _restore_outputs_from_cache(
-    stage_outs: list[outputs.BaseOut],
-    lock_data: LockData,
+def _restore_outputs(
+    output_path_strings: list[str],
+    output_hash_map: dict[str, OutputHash],
     files_cache_dir: pathlib.Path,
     checkout_modes: list[cache.CheckoutMode],
+    *,
+    use_normalized_paths: bool = False,
 ) -> bool:
-    """Restore missing outputs from cache for a single stage's skip detection.
+    """Restore outputs from cache - shared logic for lock file and run cache paths.
 
     Returns True if all outputs exist or were restored. On failure, cleans up
-    any partially restored outputs to leave the filesystem in a clean state,
-    allowing the stage to re-run with a clean workspace.
+    any partially restored outputs to leave the filesystem in a clean state.
+
+    For directories, also verifies content matches the cached manifest and
+    reconciles any differences (restores missing files, removes extra files).
+
+    Args:
+        output_path_strings: Path strings to restore (preserves trailing slash for DirectoryOut)
+        output_hash_map: Map of path string -> hash (from lock data or run cache)
+        files_cache_dir: Cache directory for file restoration
+        checkout_modes: Checkout modes for cache restoration
+        use_normalized_paths: If True, normalize paths for lookup (lock data uses
+            normalized paths). If False, use raw paths (run cache uses raw paths).
     """
-    output_hashes = lock_data["output_hashes"]
     restored_paths = list[pathlib.Path]()
 
-    for out in stage_outs:
-        path = pathlib.Path(cast("str", out.path))
-        if path.exists():
-            continue
+    for path_str in output_path_strings:
+        path = pathlib.Path(path_str)
+        lookup_key = _normalize_out_path(path_str) if use_normalized_paths else path_str
 
-        output_hash = output_hashes.get(str(out.path))
-        if output_hash is None:
+        # Check if output is recorded
+        if lookup_key not in output_hash_map:
             _cleanup_restored_paths(restored_paths)
             return False
+
+        output_hash = output_hash_map[lookup_key]
+
+        # None hash means --no-cache mode: just verify file exists
+        if output_hash is None:
+            if path.exists():
+                continue
+            _cleanup_restored_paths(restored_paths)
+            return False
+
+        needs_restore = not path.exists()
+
+        # For directories, verify contents match even if path exists
+        if not needs_restore and is_dir_hash(output_hash):
+            needs_restore = _directory_needs_restore(path, output_hash)
+
+        if not needs_restore:
+            continue
 
         try:
             restored = cache.restore_from_cache(
@@ -477,6 +516,74 @@ def _restore_outputs_from_cache(
             return False
 
     return True
+
+
+def _restore_outputs_from_cache(
+    stage_outs: list[outputs.BaseOut],
+    lock_data: LockData,
+    files_cache_dir: pathlib.Path,
+    checkout_modes: list[cache.CheckoutMode],
+) -> bool:
+    """Restore missing outputs from cache for lock file skip detection.
+
+    Returns True if all outputs exist or were restored.
+    """
+    output_path_strings = [cast("str", out.path) for out in stage_outs]
+    return _restore_outputs(
+        output_path_strings,
+        lock_data["output_hashes"],
+        files_cache_dir,
+        checkout_modes,
+        use_normalized_paths=True,
+    )
+
+
+def _directory_needs_restore(path: pathlib.Path, cached_hash: DirHash) -> bool:
+    """Check if directory content differs from cached manifest.
+
+    Returns True if restoration is needed (missing files, extra files,
+    or content mismatch).
+
+    Uses NFC normalization for path comparison to handle cross-platform
+    differences (macOS HFS+ uses NFD, manifest stores NFC).
+    """
+    cached_manifest = cached_hash["manifest"]
+    cached_relpaths = {entry["relpath"] for entry in cached_manifest}
+    cached_hashes = {entry["relpath"]: entry["hash"] for entry in cached_manifest}
+
+    # Collect current files with NFC normalization to match manifest format
+    current_files = set[str]()
+    current_to_actual = dict[str, pathlib.Path]()  # NFC path -> actual filesystem path
+    for file_path in path.rglob("*"):
+        if file_path.is_file() and not file_path.is_symlink():
+            try:
+                rel = str(file_path.relative_to(path))
+                # Normalize to NFC for comparison (manifest uses NFC)
+                rel_nfc = unicodedata.normalize("NFC", rel)
+                current_files.add(rel_nfc)
+                current_to_actual[rel_nfc] = file_path
+            except ValueError:
+                continue  # Path not relative to directory
+
+    # Extra files in workspace that shouldn't be there
+    if current_files - cached_relpaths:
+        return True
+
+    # Missing files that should exist
+    if cached_relpaths - current_files:
+        return True
+
+    # Check content hashes for files that exist
+    for relpath in current_files:
+        file_path = current_to_actual[relpath]
+        try:
+            current_hash = cache.hash_file(file_path)
+            if current_hash != cached_hashes.get(relpath):
+                return True
+        except (OSError, FileNotFoundError):
+            return True
+
+    return False
 
 
 def _prepare_outputs_for_execution(
@@ -796,8 +903,8 @@ def can_skip_via_generation(
     if lock_data["params"] != current_params:
         return False
 
-    # Normalize output paths to match lock_data format
-    normalized_outs = sorted(str(project.normalize_path(p)) for p in outs_paths)
+    # Normalize output paths to match lock_data format (preserve trailing slash for DirectoryOut)
+    normalized_outs = sorted(_normalize_out_path(p) for p in outs_paths)
     locked_out_paths = sorted(lock_data["output_hashes"].keys())
     if normalized_outs != locked_out_paths:
         return False
@@ -941,11 +1048,7 @@ def _try_skip_via_run_cache(
     checkout_modes: list[cache.CheckoutMode],
     state_db: state.StateDB,
 ) -> RunCacheSkipResult | None:
-    """Try to skip using run cache. Returns result and output hashes if skipped, None if must run.
-
-    On failure, cleans up any partially restored outputs to leave a clean state,
-    allowing the stage to re-run with a clean workspace.
-    """
+    """Try to skip using run cache. Returns result and output hashes if skipped, None if must run."""
     # IncrementalOut stages build on previous outputs - run cache doesn't apply
     if any(isinstance(out, outputs.IncrementalOut) for out in stage_outs):
         return None
@@ -966,35 +1069,27 @@ def _try_skip_via_run_cache(
     if set(output_hash_map.keys()) != expected_cached_paths:
         return None
 
-    restored_paths = list[pathlib.Path]()
-
+    # Non-cached outputs (like Metrics) must exist on disk - we can't restore them from cache
     for out in stage_outs:
-        path = pathlib.Path(cast("str", out.path))
-        if path.exists():
-            continue
+        if not out.cache:
+            path = pathlib.Path(cast("str", out.path))
+            if not path.exists():
+                return None  # Must re-run to recreate non-cached output
 
-        cached_output = output_hash_map.get(str(out.path))
-        if cached_output is None:
-            # Output doesn't exist on disk and isn't in cache - must re-run
-            if restored_paths:
-                _cleanup_restored_paths(restored_paths)
-            return None
+    # Only restore cached outputs (run cache doesn't store non-cached outputs)
+    cached_output_path_strings = [cast("str", out.path) for out in stage_outs if out.cache]
 
-        try:
-            restored = cache.restore_from_cache(
-                path, cached_output, files_cache_dir, checkout_modes=checkout_modes
-            )
-        except OSError:
-            if restored_paths:
-                _cleanup_restored_paths(restored_paths)
-            return None
-
-        if restored:
-            restored_paths.append(path)
-        else:
-            if restored_paths:
-                _cleanup_restored_paths(restored_paths)
-            return None
+    restored = _restore_outputs(
+        cached_output_path_strings,
+        cast(
+            "dict[str, OutputHash]", output_hash_map
+        ),  # FileHash | DirHash is subset of OutputHash
+        files_cache_dir,
+        checkout_modes,
+        use_normalized_paths=False,
+    )
+    if not restored:
+        return None
 
     # Build output_hashes for lock file update, including non-cached outputs
     output_hashes: dict[str, OutputHash] = {}

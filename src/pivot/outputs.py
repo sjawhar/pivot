@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import TYPE_CHECKING, Any, Generic, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, TypeGuard, TypeVar
 
 if TYPE_CHECKING:
     from pivot import loaders as loaders_module
@@ -169,6 +169,46 @@ class IncrementalOut(Out[T]):
 
     Loader is REQUIRED (inherited from Out).
     """
+
+
+@dataclasses.dataclass(frozen=True)
+class DirectoryOut(Out[dict[str, T]]):  # noqa: UP046 - basedpyright doesn't support PEP 695 syntax yet
+    """Directory output - dynamic set of files determined at runtime.
+
+    Generic parameter T represents the value type stored in each file.
+    DirectoryOut[T] stores dict[str, T], matching Out[dict[str, T]].
+
+    Use for outputs where the number and paths of files are determined at runtime:
+
+        class TaskOutputs(TypedDict):
+            task_results: Annotated[
+                dict[str, TaskMetrics],
+                DirectoryOut("metrics/task_results/", YAML())
+            ]
+
+        def process_tasks(...) -> TaskOutputs:
+            return {"task_results": {
+                "task_a.yaml": TaskMetrics(accuracy=0.95),
+                "task_b.yaml": TaskMetrics(accuracy=0.87),
+            }}
+
+    Keys are relative paths within the directory. Values are serialized by the loader.
+    Path must end with '/' to enforce directory semantics.
+
+    Loader is REQUIRED (inherited from Out).
+    """
+
+    def __post_init__(self) -> None:
+        # path must be str for DirectoryOut (not list/tuple)
+        if not isinstance(self.path, str):
+            raise TypeError(f"DirectoryOut path must be a string, got {type(self.path).__name__}")
+        if not self.path.endswith("/"):
+            raise ValueError(f"DirectoryOut path must end with '/': {self.path!r}")
+
+
+def is_directory_out(spec: Out[Any]) -> TypeGuard[DirectoryOut[Any]]:
+    """Type guard to narrow Out to DirectoryOut, reducing need for casts."""
+    return isinstance(spec, DirectoryOut)
 
 
 # Type alias for compatibility - Out is now the base

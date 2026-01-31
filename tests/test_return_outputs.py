@@ -19,7 +19,7 @@ import dataclasses
 import json
 import pathlib  # noqa: TC003 - needed for tmp_path type hint
 import pickle
-from typing import Annotated, TypedDict
+from typing import Annotated, Any, TypedDict
 
 import pytest
 from typing_extensions import TypedDict as ExtTypedDict
@@ -423,3 +423,280 @@ def test_error_message_includes_stage_name() -> None:
 
     with pytest.raises(exceptions.StageDefinitionError, match="Stage 'my_custom_stage'"):
         stage_def.get_output_specs_from_return(my_custom_stage, "my_custom_stage")
+
+
+# ==============================================================================
+# Test: DirectoryOut in save_return_outputs
+# ==============================================================================
+
+
+def test_save_return_outputs_directory_out_writes_files(tmp_path: pathlib.Path) -> None:
+    """save_return_outputs() should write DirectoryOut files using the loader."""
+    specs: dict[str, outputs.Out[Any]] = {
+        "task_results": outputs.DirectoryOut("results/", loaders.JSON[dict[str, int]]())
+    }
+    return_value = {
+        "task_results": {
+            "task_a.json": {"accuracy": 95},
+            "task_b.json": {"accuracy": 87},
+        }
+    }
+
+    stage_def.save_return_outputs(return_value, specs, tmp_path)
+
+    # Check both files were created
+    task_a = tmp_path / "results" / "task_a.json"
+    task_b = tmp_path / "results" / "task_b.json"
+    assert task_a.exists(), "task_a.json should exist"
+    assert task_b.exists(), "task_b.json should exist"
+    assert json.loads(task_a.read_text()) == {"accuracy": 95}
+    assert json.loads(task_b.read_text()) == {"accuracy": 87}
+
+
+def test_save_return_outputs_directory_out_creates_subdirs(tmp_path: pathlib.Path) -> None:
+    """save_return_outputs() should create subdirectories for nested keys."""
+    specs: dict[str, outputs.Out[Any]] = {
+        "task_results": outputs.DirectoryOut("results/", loaders.JSON[dict[str, int]]())
+    }
+    return_value = {
+        "task_results": {
+            "subdir/nested.json": {"value": 42},
+        }
+    }
+
+    stage_def.save_return_outputs(return_value, specs, tmp_path)
+
+    nested = tmp_path / "results" / "subdir" / "nested.json"
+    assert nested.exists(), "Nested file should be created"
+    assert json.loads(nested.read_text()) == {"value": 42}
+
+
+def test_save_return_outputs_directory_out_empty_dict_raises() -> None:
+    """save_return_outputs() should raise ValueError for empty DirectoryOut dict."""
+    specs: dict[str, outputs.Out[Any]] = {
+        "task_results": outputs.DirectoryOut("results/", loaders.JSON[dict[str, int]]())
+    }
+    return_value: dict[str, dict[str, dict[str, int]]] = {"task_results": {}}
+
+    with pytest.raises(ValueError, match="dict must be non-empty"):
+        stage_def.save_return_outputs(return_value, specs, pathlib.Path("/tmp"))
+
+
+def test_save_return_outputs_directory_out_path_traversal_raises() -> None:
+    """save_return_outputs() should raise ValueError for keys with path traversal."""
+    specs: dict[str, outputs.Out[Any]] = {
+        "task_results": outputs.DirectoryOut("results/", loaders.JSON[dict[str, int]]())
+    }
+    return_value = {"task_results": {"../escape.json": {"malicious": 1}}}
+
+    with pytest.raises(ValueError, match="path traversal not allowed"):
+        stage_def.save_return_outputs(return_value, specs, pathlib.Path("/tmp"))
+
+
+def test_save_return_outputs_directory_out_absolute_path_raises() -> None:
+    """save_return_outputs() should raise ValueError for absolute path keys."""
+    specs: dict[str, outputs.Out[Any]] = {
+        "task_results": outputs.DirectoryOut("results/", loaders.JSON[dict[str, int]]())
+    }
+    return_value = {"task_results": {"/etc/passwd.json": {"bad": 1}}}
+
+    with pytest.raises(ValueError, match="absolute path not allowed"):
+        stage_def.save_return_outputs(return_value, specs, pathlib.Path("/tmp"))
+
+
+def test_save_return_outputs_directory_out_no_extension_raises() -> None:
+    """save_return_outputs() should raise ValueError for keys without file extension."""
+    specs: dict[str, outputs.Out[Any]] = {
+        "task_results": outputs.DirectoryOut("results/", loaders.JSON[dict[str, int]]())
+    }
+    return_value = {"task_results": {"no_extension": {"value": 1}}}
+
+    with pytest.raises(ValueError, match="must include file extension"):
+        stage_def.save_return_outputs(return_value, specs, pathlib.Path("/tmp"))
+
+
+def test_save_return_outputs_directory_out_empty_key_raises() -> None:
+    """save_return_outputs() should raise ValueError for empty string key."""
+    specs: dict[str, outputs.Out[Any]] = {
+        "task_results": outputs.DirectoryOut("results/", loaders.JSON[dict[str, int]]())
+    }
+    return_value = {"task_results": {"": {"value": 1}}}
+
+    with pytest.raises(ValueError, match="empty or whitespace-only"):
+        stage_def.save_return_outputs(return_value, specs, pathlib.Path("/tmp"))
+
+
+def test_save_return_outputs_directory_out_duplicate_after_normalization_raises() -> None:
+    """save_return_outputs() should raise ValueError for keys that normalize to duplicates."""
+    specs: dict[str, outputs.Out[Any]] = {
+        "task_results": outputs.DirectoryOut("results/", loaders.JSON[dict[str, int]]())
+    }
+    # Both keys normalize to "foo/bar.json"
+    return_value = {"task_results": {"foo/bar.json": {"a": 1}, "foo//bar.json": {"b": 2}}}
+
+    with pytest.raises(ValueError, match="duplicate key after normalization"):
+        stage_def.save_return_outputs(return_value, specs, pathlib.Path("/tmp"))
+
+
+def test_save_return_outputs_directory_out_non_dict_raises() -> None:
+    """save_return_outputs() should raise RuntimeError for non-dict DirectoryOut value."""
+    specs: dict[str, outputs.Out[Any]] = {
+        "task_results": outputs.DirectoryOut("results/", loaders.JSON[dict[str, int]]())
+    }
+    return_value = {"task_results": [{"a": 1}]}  # List instead of dict
+
+    with pytest.raises(RuntimeError, match="expects dict"):
+        stage_def.save_return_outputs(return_value, specs, pathlib.Path("/tmp"))
+
+
+def test_save_return_outputs_directory_out_non_string_key_raises() -> None:
+    """save_return_outputs() should raise ValueError for non-string keys."""
+    specs: dict[str, outputs.Out[Any]] = {
+        "task_results": outputs.DirectoryOut("results/", loaders.JSON[dict[str, int]]())
+    }
+    return_value = {"task_results": {123: {"a": 1}}}  # type: ignore[dict-item] # Int key instead of string
+
+    with pytest.raises(ValueError, match="keys must be strings"):
+        stage_def.save_return_outputs(return_value, specs, pathlib.Path("/tmp"))
+
+
+def test_save_return_outputs_directory_out_whitespace_only_key_raises() -> None:
+    """save_return_outputs() should raise ValueError for whitespace-only filename."""
+    specs: dict[str, outputs.Out[Any]] = {
+        "task_results": outputs.DirectoryOut("results/", loaders.JSON[dict[str, int]]())
+    }
+    return_value = {"task_results": {"   .json": {"a": 1}}}  # Whitespace-only filename
+
+    with pytest.raises(ValueError, match="filename cannot be empty or whitespace-only"):
+        stage_def.save_return_outputs(return_value, specs, pathlib.Path("/tmp"))
+
+
+def test_save_return_outputs_directory_out_unicode_keys(tmp_path: pathlib.Path) -> None:
+    """save_return_outputs() should handle Unicode keys correctly (NFC normalized)."""
+    specs: dict[str, outputs.Out[Any]] = {
+        "task_results": outputs.DirectoryOut("results/", loaders.JSON[dict[str, int]]())
+    }
+    # Use Unicode characters in keys
+    return_value = {
+        "task_results": {
+            "données.json": {"count": 1},  # French accented chars
+            "数据.json": {"count": 2},  # Chinese chars
+            "café.json": {"count": 3},  # More accents
+        }
+    }
+
+    stage_def.save_return_outputs(return_value, specs, tmp_path)
+
+    # Verify all files were created with correct Unicode names
+    results_dir = tmp_path / "results"
+    assert (results_dir / "données.json").exists()
+    assert (results_dir / "数据.json").exists()
+    assert (results_dir / "café.json").exists()
+
+    # Verify contents
+    with open(results_dir / "données.json") as f:
+        assert json.load(f) == {"count": 1}
+
+
+def test_save_return_outputs_directory_out_hidden_file_without_extension_raises() -> None:
+    """save_return_outputs() should reject hidden files without real extensions."""
+    specs: dict[str, outputs.Out[Any]] = {
+        "task_results": outputs.DirectoryOut("results/", loaders.JSON[dict[str, int]]())
+    }
+    # .hiddenfile has a leading dot but no extension (suffix is empty)
+    return_value = {"task_results": {".hiddenfile": {"a": 1}}}
+
+    with pytest.raises(ValueError, match="must include file extension"):
+        stage_def.save_return_outputs(return_value, specs, pathlib.Path("/tmp"))
+
+
+def test_save_return_outputs_directory_out_hidden_file_with_extension_allowed(
+    tmp_path: pathlib.Path,
+) -> None:
+    """save_return_outputs() should allow hidden files that have real extensions."""
+    specs: dict[str, outputs.Out[Any]] = {
+        "task_results": outputs.DirectoryOut("results/", loaders.JSON[dict[str, int]]())
+    }
+    # .metadata.json has a leading dot AND a .json extension
+    return_value = {"task_results": {".metadata.json": {"version": 1}}}
+
+    stage_def.save_return_outputs(return_value, specs, tmp_path)
+
+    # Verify hidden file was created
+    assert (tmp_path / "results" / ".metadata.json").exists()
+
+
+def test_save_return_outputs_directory_out_path_normalization_edge_cases(
+    tmp_path: pathlib.Path,
+) -> None:
+    """save_return_outputs() normalizes paths correctly (redundant separators, etc)."""
+    specs: dict[str, outputs.Out[Any]] = {
+        "task_results": outputs.DirectoryOut("results/", loaders.JSON[dict[str, int]]())
+    }
+    # Keys with redundant separators and leading ./ should be normalized
+    return_value = {
+        "task_results": {
+            "foo//bar.json": {"a": 1},  # Double slash -> foo/bar.json
+            "./baz.json": {"b": 2},  # Leading ./ -> baz.json
+            "nested/./file.json": {"c": 3},  # Embedded ./ -> nested/file.json
+        }
+    }
+
+    stage_def.save_return_outputs(return_value, specs, tmp_path)
+
+    # Verify files are created at normalized paths
+    results_dir = tmp_path / "results"
+    assert (results_dir / "foo" / "bar.json").exists()
+    assert (results_dir / "baz.json").exists()
+    assert (results_dir / "nested" / "file.json").exists()
+
+
+def test_save_return_outputs_directory_out_path_normalization_duplicate_detection() -> None:
+    """save_return_outputs() detects duplicates after path normalization."""
+    specs: dict[str, outputs.Out[Any]] = {
+        "task_results": outputs.DirectoryOut("results/", loaders.JSON[dict[str, int]]())
+    }
+    # These keys normalize to the same path
+    return_value = {
+        "task_results": {
+            "foo/bar.json": {"a": 1},
+            "foo//bar.json": {"b": 2},  # Same as foo/bar.json after normalization
+        }
+    }
+
+    with pytest.raises(ValueError, match="duplicate key after normalization"):
+        stage_def.save_return_outputs(return_value, specs, pathlib.Path("/tmp"))
+
+
+def test_save_return_outputs_directory_out_case_collision_raises() -> None:
+    """save_return_outputs() should raise ValueError for keys that differ only by case."""
+    specs: dict[str, outputs.Out[Any]] = {
+        "task_results": outputs.DirectoryOut("results/", loaders.JSON[dict[str, int]]())
+    }
+    # These keys would collide on case-insensitive filesystems (macOS, Windows)
+    return_value = {
+        "task_results": {
+            "File.json": {"a": 1},
+            "file.json": {"b": 2},
+        }
+    }
+
+    with pytest.raises(ValueError, match="case-insensitive filesystems"):
+        stage_def.save_return_outputs(return_value, specs, pathlib.Path("/tmp"))
+
+
+def test_save_return_outputs_directory_out_case_collision_nested_raises() -> None:
+    """save_return_outputs() should raise ValueError for nested paths that differ only by case."""
+    specs: dict[str, outputs.Out[Any]] = {
+        "task_results": outputs.DirectoryOut("results/", loaders.JSON[dict[str, int]]())
+    }
+    # Nested paths that would collide on case-insensitive filesystems
+    return_value = {
+        "task_results": {
+            "Foo/bar.json": {"a": 1},
+            "foo/bar.json": {"b": 2},
+        }
+    }
+
+    with pytest.raises(ValueError, match="case-insensitive filesystems"):
+        stage_def.save_return_outputs(return_value, specs, pathlib.Path("/tmp"))
