@@ -52,3 +52,7 @@ def descendants[Node](
     G: DiGraph[Node],  # noqa: N803 - matches networkx API
     source: Node,
 ) -> set[Node]: ...
+def ancestors[Node](
+    G: DiGraph[Node],  # noqa: N803 - matches networkx API
+    source: Node,
+) -> set[Node]: ...

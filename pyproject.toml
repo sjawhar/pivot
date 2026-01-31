@@ -12,6 +12,7 @@ dependencies = [
   "dulwich>=0.22.0",
   "filelock>=3.12.0",
   "flatten-dict>=0.4.0",
+  "grandalf>=0.8",
   "lmdb>=1.4.0",
   "loky>=3.4",
   "networkx>=3.0",
