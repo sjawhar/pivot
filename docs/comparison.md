@@ -31,7 +31,7 @@ How Pivot compares to other pipeline and workflow tools.
 - You need fast local iteration with automatic code change detection
 - Your pipeline is Python-native and you want decorator-based configuration
 - You're frustrated by DVC's lock file performance or manual dependency declarations
-- You want watch mode (`pivot run --watch`) for rapid development cycles
+- You want watch mode (`pivot repro --watch`) for rapid development cycles
 
 ### Use DVC When
 
@@ -89,7 +89,7 @@ Pivot uses `loky.get_reusable_executor()` to keep worker processes alive between
 Rapid iteration during development:
 
 ```bash
-pivot run --watch  # Monitors files, re-runs on change
+pivot repro --watch  # Monitors files, re-runs on change
 ```
 
 Edit code, save, see results immediately.

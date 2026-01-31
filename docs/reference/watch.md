@@ -5,7 +5,7 @@ Watch mode automatically re-runs your pipeline when files change.
 ## Basic Usage
 
 ```bash
-pivot run --watch
+pivot repro --watch
 ```
 
 Pivot will:
@@ -32,13 +32,13 @@ Control how long to wait after changes before re-running:
 
 ```bash
 # Default: 300ms
-pivot run --watch
+pivot repro --watch
 
 # Longer debounce for slow file systems
-pivot run --watch --debounce 1000
+pivot repro --watch --debounce 1000
 
 # Immediate (no debounce)
-pivot run --watch --debounce 0
+pivot repro --watch --debounce 0
 ```
 
 ## How It Works
@@ -52,7 +52,7 @@ pivot run --watch --debounce 0
 
 ```bash
 # Terminal 1: Watch mode
-pivot run --watch
+pivot repro --watch
 
 # Terminal 2: Edit files
 vim pipeline.py  # Save -> pipeline re-runs
@@ -62,11 +62,8 @@ vim data.csv     # Save -> affected stages re-run
 ## Combining with Other Options
 
 ```bash
-# Watch with single-stage mode
-pivot run --watch --single-stage train
-
 # Watch with custom debounce
-pivot run --watch --debounce 500
+pivot repro --watch --debounce 500
 ```
 
 ## Limitations
@@ -79,7 +76,7 @@ pivot run --watch --debounce 500
 
 ### Watch Mode Not Detecting Changes
 
-**Symptom:** `pivot run --watch` doesn't re-run when files change.
+**Symptom:** `pivot repro --watch` doesn't re-run when files change.
 
 **Causes and solutions:**
 
@@ -97,7 +94,7 @@ pivot run --watch --debounce 500
 
 3. **Atomic saves** - Some editors use atomic saves (write to temp, then rename) which may need a brief delay. Try increasing debounce:
    ```bash
-   pivot run --watch --debounce 500
+   pivot repro --watch --debounce 500
    ```
 
 ### Lambda Causes Unnecessary Re-runs

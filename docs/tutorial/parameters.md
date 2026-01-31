@@ -83,7 +83,7 @@ Note the changes:
 ## Run and See Parameter Change Detection
 
 ```bash
-pivot run
+pivot repro
 ```
 
 Now change a parameter default in `pipeline.py`:

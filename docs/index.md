@@ -5,9 +5,9 @@
 Pivot is a Python pipeline tool with automatic code change detection. Define stages with typed Python functions and annotations, and Pivot figures out what needs to re-run—no manual dependency declarations, no stale caches.
 
 ```bash
-pivot run        # Run your pipeline
+pivot repro      # Run your pipeline
 # edit a helper function...
-pivot run        # Pivot detects the change and re-runs affected stages
+pivot repro      # Pivot detects the change and re-runs affected stages
 ```
 
 ## Quick Example
@@ -54,8 +54,8 @@ REGISTRY.register(train)
 ```
 
 ```bash
-pivot run  # Runs both stages
-pivot run  # Instant - nothing changed
+pivot repro  # Runs both stages
+pivot repro  # Instant - nothing changed
 ```
 
 Modify `preprocess`, and Pivot automatically re-runs both stages. Modify `train`, and only `train` re-runs.
@@ -99,7 +99,7 @@ Stage: train
 Edit code, save, see results:
 
 ```bash
-pivot run --watch  # Re-runs automatically on file changes
+pivot repro --watch  # Re-runs automatically on file changes
 ```
 
 ## Getting Started

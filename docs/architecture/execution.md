@@ -6,7 +6,7 @@ Pivot uses a parallel execution model with warm worker pools for maximum perform
 
 ```
 ┌──────────────┐
-│  pivot run   │
+│ pivot repro  │
 └──────┬───────┘
        │
        ▼
@@ -326,9 +326,9 @@ The RWLock approach would only benefit workloads with many concurrent readers of
 
 ## Multi-Process Safety
 
-### Concurrent `pivot run` is Safe
+### Concurrent `pivot repro` is Safe
 
-Multiple simultaneous `pivot run` invocations on the same project are safe and supported:
+Multiple simultaneous `pivot repro` invocations on the same project are safe and supported:
 
 - Each invocation gets its own loky worker pool and StateDB instances
 - LMDB enforces at most one writer at a time (via mutex), unlimited concurrent readers
@@ -350,9 +350,9 @@ This avoids write contention between workers while maintaining consistency.
 
 | Scenario | Result |
 |----------|--------|
-| Two `pivot run`, same stage | Execution lock prevents concurrent execution |
-| Two `pivot run`, different stages | Both execute independently, writes serialize |
-| `pivot run --no-commit` + `pivot commit` | `pending_state_lock` coordinates |
+| Two `pivot repro`, same stage | Execution lock prevents concurrent execution |
+| Two `pivot repro`, different stages | Both execute independently, writes serialize |
+| `pivot repro --no-commit` + `pivot commit` | `pending_state_lock` coordinates |
 | Cache writes by both processes | Idempotent (check exists before writing) |
 
 ## Error Handling
@@ -385,7 +385,7 @@ Preview what would run and why:
 ```bash
 pivot status --explain [STAGES...]
 # or
-pivot run --explain [STAGES...]
+pivot repro --explain [STAGES...]
 ```
 
 Shows:
@@ -400,7 +400,7 @@ The `--checkout-missing` flag restores tracked output files from cache before ru
 
 ```bash
 # Restore missing tracked files, then run pipeline
-pivot run --checkout-missing
+pivot repro --checkout-missing
 ```
 
 This is useful when:
@@ -409,7 +409,7 @@ This is useful when:
 - After `git clean` or accidental deletion of output files
 - Cloning a repo where lock files exist but outputs don't
 
-Without this flag, Pivot validates that all tracked outputs exist before running. If files are missing, it fails with an error suggesting either `pivot checkout --only-missing` (to restore without running) or `pivot run --checkout-missing` (to restore and run).
+Without this flag, Pivot validates that all tracked outputs exist before running. If files are missing, it fails with an error suggesting either `pivot checkout --only-missing` (to restore without running) or `pivot repro --checkout-missing` (to restore and run).
 
 **How it works:** Files are restored using the hashes recorded in existing lock files—no stages are re-executed during restoration. The cache must contain the files (push/pull from remote if needed). After restoration, the normal execution flow continues and may skip stages if nothing else changed.
 
@@ -419,7 +419,7 @@ The `--no-commit` flag defers lock file updates and caching until explicitly com
 
 ```bash
 # Run stages but don't update locks or cache outputs
-pivot run --no-commit
+pivot repro --no-commit
 
 # Inspect results, then commit when satisfied
 pivot commit
@@ -443,7 +443,7 @@ Note that for pure iteration speed, running the Python code directly (without Pi
 The `--no-cache` flag skips caching outputs entirely for maximum iteration speed:
 
 ```bash
-pivot run --no-cache
+pivot repro --no-cache
 ```
 
 In this mode:

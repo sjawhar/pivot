@@ -1,196 +1,49 @@
+"""Single-stage pipeline executor.
+
+The `pivot run` command executes specified stages directly, without
+resolving dependencies. Use `pivot repro` for DAG-aware execution.
+"""
+
 from __future__ import annotations
 
-import contextlib
-import datetime
-import json
-import logging
 import pathlib
-import sys
-import time
-from typing import TYPE_CHECKING, TypedDict
+from typing import TYPE_CHECKING
 
 import click
 
-from pivot import config, discovery, registry
-from pivot.cli import completion
+from pivot.cli import _run_common, completion
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
 from pivot.engine import engine, sinks
 from pivot.executor import prepare_workers
-from pivot.types import (
-    ExecutionResultEvent,
-    OnError,
-    RunEventType,
-    SchemaVersionEvent,
-    StageStatus,
-)
+from pivot.types import OnError
 
 if TYPE_CHECKING:
-    from collections.abc import Generator
-
-    import networkx as nx
-
     from pivot.executor import ExecutionSummary
 
 
-@contextlib.contextmanager
-def _suppress_stderr_logging() -> Generator[None]:
-    """Suppress logging to stderr while TUI is active.
-
-    Textual takes over the terminal, so stderr writes appear as garbage
-    in the upper-left corner. This temporarily removes StreamHandlers
-    that write to stderr and restores them on exit.
-    """
-    root = logging.getLogger()
-    removed_handlers = list[logging.Handler]()
-
-    for handler in root.handlers[:]:
-        if isinstance(handler, logging.StreamHandler):
-            # StreamHandler is generic but handlers list is Handler[]
-            stream = getattr(handler, "stream", None)  # pyright: ignore[reportUnknownArgumentType]
-            if stream in (sys.stderr, sys.stdout):
-                root.removeHandler(handler)  # pyright: ignore[reportUnknownArgumentType]
-                removed_handlers.append(handler)  # pyright: ignore[reportUnknownArgumentType]
-    try:
-        yield
-    finally:
-        for handler in removed_handlers:
-            root.addHandler(handler)
-
-
-# JSONL schema version for forward compatibility
-_JSONL_SCHEMA_VERSION = 1
-
-
-logger = logging.getLogger(__name__)
-
-
-def _compute_dag_levels(graph: nx.DiGraph[str]) -> dict[str, int]:
-    """Compute DAG level for each stage.
-
-    Level 0: stages with no dependencies
-    Level N: stages whose dependencies are all at level < N
-
-    Stages at the same level can run in parallel - there's no ordering between them.
-    """
-    import networkx as nx
-
-    levels: dict[str, int] = {}
-    # Process in topological order (dependencies before dependents)
-    for stage in nx.dfs_postorder_nodes(graph):
-        # successors = what this stage depends on (edges go consumer -> producer)
-        dep_levels = [levels[dep] for dep in graph.successors(stage) if dep in levels]
-        levels[stage] = max(dep_levels, default=-1) + 1
-    return levels
-
-
-def _sort_for_display(execution_order: list[str], graph: nx.DiGraph[str]) -> list[str]:
-    """Sort stages for TUI display: group matrix variants while respecting DAG structure.
-
-    Uses DAG levels (not arbitrary execution order) so parallel-capable stages
-    are treated as equals. Matrix variants are grouped at the level of their
-    earliest member.
-    """
-    from pivot.tui.types import parse_stage_name
-
-    levels = _compute_dag_levels(graph)
-
-    # Compute minimum level for each base_name (group position)
-    group_min_level: dict[str, int] = {}
-    for name in execution_order:
-        base, _ = parse_stage_name(name)
-        level = levels.get(name, 0)
-        if base not in group_min_level or level < group_min_level[base]:
-            group_min_level[base] = level
-
-    def display_sort_key(name: str) -> tuple[int, str, int, str]:
-        base, variant = parse_stage_name(name)
-        individual_level = levels.get(name, 0)
-        # Sort by: group level, then base_name (to keep groups together),
-        # then individual level, then variant name
-        return (group_min_level[base], base, individual_level, variant)
-
-    return sorted(execution_order, key=display_sort_key)
-
-
-def ensure_stages_registered() -> None:
-    """Auto-discover and register stages if none are registered."""
-    if not discovery.has_registered_stages():
-        try:
-            discovered = discovery.discover_and_register()
-            if discovered:
-                logger.info(f"Loaded pipeline from {discovered}")
-        except discovery.DiscoveryError as e:
-            raise click.ClickException(str(e)) from e
-
-
-def _validate_stages(stages_list: list[str] | None, single_stage: bool) -> None:
-    """Validate stage arguments and options."""
-    if single_stage and not stages_list:
-        raise click.ClickException("--single-stage requires at least one stage name")
-    cli_helpers.validate_stages_exist(stages_list)
-
-
-def _output_explain(
-    stages_list: list[str] | None,
-    single_stage: bool,
-    force: bool = False,
-    allow_missing: bool = False,
-) -> None:
-    """Output detailed stage explanations using status logic."""
-    from pivot import status as status_mod
-    from pivot.cli import status as status_cli
-    from pivot.engine import graph as engine_graph
-
-    # Validate dependencies exist when allow_missing is False
-    # (consistent with dry_run_cmd behavior)
-    if not allow_missing:
-        registry.REGISTRY.build_dag(validate=True)
-
-    # Build graph once for all explanations
-    all_stages = {name: registry.REGISTRY.get(name) for name in registry.REGISTRY.list_stages()}
-    graph = engine_graph.build_graph(all_stages)
-
-    explanations = status_mod.get_pipeline_explanations(
-        stages_list,
-        single_stage,
-        force,
-        allow_missing=allow_missing,
-        graph=graph,
-    )
-    status_cli.output_explain_text(explanations)
-
-
 def _run_with_tui(
-    stages_list: list[str] | None,
-    single_stage: bool,
+    stages_list: list[str],
     force: bool = False,
     tui_log: pathlib.Path | None = None,
     no_commit: bool = False,
     no_cache: bool = False,
-    on_error: OnError = OnError.FAIL,
+    on_error: OnError = OnError.KEEP_GOING,
     allow_uncached_incremental: bool = False,
     checkout_missing: bool = False,
 ) -> dict[str, ExecutionSummary] | None:
     """Run pipeline with TUI display."""
     import queue as thread_queue
     import threading
+    import uuid
 
-    from pivot import dag
     from pivot.tui import run as run_tui
     from pivot.types import TuiMessage
-
-    # Get execution order for stage names
-    graph = registry.REGISTRY.build_dag(validate=True)
-    execution_order = dag.get_execution_order(graph, stages_list, single_stage=single_stage)
-
-    if not execution_order:
-        return {}
 
     # Pre-warm loky executor before starting Textual TUI.
     # Textual manipulates terminal file descriptors which breaks loky's
     # resource tracker if spawned after Textual starts.
-    prepare_workers(len(execution_order))
+    prepare_workers(len(stages_list))
 
     # tui_queue is inter-thread only (executor -> TUI reader), no cross-process IPC needed.
     # Using stdlib queue.Queue avoids Manager subprocess dependency issues.
@@ -198,8 +51,6 @@ def _run_with_tui(
 
     # Cancel event allows TUI to signal executor to stop scheduling new stages
     cancel_event = threading.Event()
-
-    import uuid
 
     # Generate run_id for TUI tracking
     run_id = str(uuid.uuid4())[:8]
@@ -212,7 +63,7 @@ def _run_with_tui(
             eng.add_sink(sinks.TuiSink(tui_queue=tui_queue, run_id=run_id))
             return eng.run_once(
                 stages=stages_list,
-                single_stage=single_stage,
+                single_stage=True,
                 force=force,
                 no_commit=no_commit,
                 no_cache=no_cache,
@@ -221,129 +72,26 @@ def _run_with_tui(
                 checkout_missing=checkout_missing,
             )
 
-    # Sort for display: group matrix variants together while preserving DAG structure
-    display_order = _sort_for_display(execution_order, graph)
-
-    with _suppress_stderr_logging():
+    with _run_common.suppress_stderr_logging():
         return run_tui.run_with_tui(
-            display_order, tui_queue, executor_func, tui_log=tui_log, cancel_event=cancel_event
+            stages_list, tui_queue, executor_func, tui_log=tui_log, cancel_event=cancel_event
         )
 
 
-def _run_watch_with_tui(
-    stages_list: list[str] | None,
-    single_stage: bool,
-    debounce: int,
-    force: bool = False,
-    tui_log: pathlib.Path | None = None,
-    no_commit: bool = False,  # noqa: ARG001 - not yet supported in Engine watch mode
-    no_cache: bool = False,  # noqa: ARG001 - not yet supported in Engine watch mode
-    on_error: OnError = OnError.FAIL,
-    serve: bool = False,
-) -> None:
-    """Run watch mode with TUI display.
-
-    Note: Several parameters (no_commit, no_cache) are
-    retained for CLI signature compatibility but not currently used by Engine watch mode.
-    """
-    # Suppress unused parameter warnings - retained for CLI compatibility
-    _ = no_commit, no_cache
-
-    import queue as thread_queue
-    import uuid
-
-    from pivot import dag
-    from pivot.engine import graph as engine_graph
-    from pivot.engine import sources
-    from pivot.tui import run as run_tui
-    from pivot.types import TuiMessage
-
-    # Get execution order to calculate the correct number of workers
-    graph = registry.REGISTRY.build_dag(validate=True)
-    execution_order = dag.get_execution_order(graph, stages_list, single_stage=single_stage)
-
-    # Pre-warm loky executor before starting Textual TUI.
-    # Textual manipulates terminal file descriptors which breaks loky's
-    # resource tracker if spawned after Textual starts.
-    prepare_workers(len(execution_order) if execution_order else 1)
-
-    # tui_queue is inter-thread only (executor -> TUI reader), no cross-process IPC needed.
-    # Using stdlib queue.Queue avoids Manager subprocess dependency issues.
-    tui_queue: thread_queue.Queue[TuiMessage] = thread_queue.Queue()
-
-    # Generate run_id for TUI tracking
-    run_id = str(uuid.uuid4())[:8]
-
-    # Create the Engine
-    with engine.Engine() as eng:
-        # Set keep-going mode based on on_error
-        eng.set_keep_going(on_error == OnError.KEEP_GOING)
-
-        # Build bipartite graph for watch paths
-        all_stages = {name: registry.REGISTRY.get(name) for name in registry.REGISTRY.list_stages()}
-        bipartite_graph = engine_graph.build_graph(all_stages)
-        watch_paths = engine_graph.get_watch_paths(bipartite_graph)
-
-        # Add FilesystemSource for watching file changes
-        filesystem_source = sources.FilesystemSource(watch_paths, debounce=debounce)
-        eng.add_source(filesystem_source)
-
-        # Add OneShotSource for initial run if force is set
-        if force:
-            initial_source = sources.OneShotSource(
-                stages=stages_list,
-                force=True,
-                reason="watch:initial:forced",
-            )
-            eng.add_source(initial_source)
-
-        # Add sinks for TUI updates
-        eng.add_sink(sinks.TuiSink(tui_queue=tui_queue, run_id=run_id))
-        eng.add_sink(sinks.WatchSink(tui_queue=tui_queue))
-
-        # Sort for display: group matrix variants together while preserving DAG structure
-        display_order = _sort_for_display(execution_order, graph) if execution_order else None
-
-        with _suppress_stderr_logging():
-            run_tui.run_watch_tui(
-                eng,
-                tui_queue,
-                tui_log=tui_log,
-                stage_names=display_order,
-                no_commit=False,  # TODO: Support no_commit in Engine watch mode
-                serve=serve,
-            )
+def _validate_stages_required(stages_list: list[str] | None) -> list[str]:
+    """Validate that at least one stage was provided."""
+    if not stages_list:
+        raise click.UsageError("Missing argument 'STAGES...'.")
+    return stages_list
 
 
 @cli_decorators.pivot_command()
 @click.argument("stages", nargs=-1, shell_complete=completion.complete_stages)
 @click.option(
-    "--single-stage",
-    "-s",
-    is_flag=True,
-    help="Run only the specified stages (in provided order), not their dependencies",
-)
-@click.option("--dry-run", "-n", is_flag=True, help="Show what would run without executing")
-@click.option(
-    "--explain", "-e", is_flag=True, help="Show detailed breakdown of why stages would run"
-)
-@click.option(
     "--force",
     "-f",
     is_flag=True,
-    help="Force re-run of stages, ignoring cache (in --watch mode, first run only)",
-)
-@click.option(
-    "--watch",
-    "-w",
-    is_flag=True,
-    help="Watch for file changes and re-run affected stages",
-)
-@click.option(
-    "--debounce",
-    type=click.IntRange(min=0),
-    default=None,
-    help="Debounce delay in milliseconds (for --watch mode)",
+    help="Force re-run of stages, ignoring cache",
 )
 @click.option(
     "--tui",
@@ -368,15 +116,9 @@ def _run_watch_with_tui(
     help="Skip caching outputs entirely for maximum iteration speed. Outputs won't be cached.",
 )
 @click.option(
-    "--keep-going",
-    "-k",
+    "--fail-fast",
     is_flag=True,
-    help="Continue running stages after failures; skip only downstream dependents.",
-)
-@click.option(
-    "--serve",
-    is_flag=True,
-    help="Start RPC server for agent control (requires --watch). Creates Unix socket at .pivot/agent.sock",
+    help="Stop on first failure (default: keep going)",
 )
 @click.option(
     "--allow-uncached-incremental",
@@ -388,177 +130,53 @@ def _run_watch_with_tui(
     is_flag=True,
     help="Restore tracked files that don't exist on disk from cache before running.",
 )
-@click.option(
-    "--allow-missing",
-    is_flag=True,
-    help="Allow missing dep files if tracked (.pvt exists). Only affects --dry-run.",
-)
 @click.pass_context
 def run(
     ctx: click.Context,
     stages: tuple[str, ...],
-    single_stage: bool,
-    dry_run: bool,
-    explain: bool,
     force: bool,
-    watch: bool,
-    debounce: int | None,
     tui_flag: bool,
     as_json: bool,
     tui_log: pathlib.Path | None,
     no_commit: bool,
     no_cache: bool,
-    keep_going: bool,
-    serve: bool,
+    fail_fast: bool,
     allow_uncached_incremental: bool,
     checkout_missing: bool,
-    allow_missing: bool,
 ) -> None:
-    """Execute pipeline stages.
+    """Execute specified pipeline stages directly.
 
-    If STAGES are provided, runs those stages and their dependencies.
-    Use --single-stage to run only the specified stages without dependencies.
+    Runs STAGES in the order specified, without resolving dependencies.
+    At least one stage name must be provided.
 
-    Auto-discovers pivot.yaml or pipeline.py if no stages are registered.
+    Use 'pivot repro' to run stages with automatic dependency resolution.
     """
     cli_ctx = cli_helpers.get_cli_context(ctx)
     quiet = cli_ctx["quiet"]
     show_human_output = not as_json and not quiet
-    debounce = debounce if debounce is not None else config.get_watch_debounce()
 
-    stages_list = cli_helpers.stages_to_list(stages)
-    _validate_stages(stages_list, single_stage)
+    # Convert tuple to list and validate at least one stage provided
+    stages_list = _validate_stages_required(cli_helpers.stages_to_list(stages))
+
+    # Validate stages exist in registry
+    cli_helpers.validate_stages_exist(stages_list)
 
     # Validate --tui and --json are mutually exclusive
     if tui_flag and as_json:
         raise click.ClickException("--tui and --json are mutually exclusive")
 
-    # Validate tui_log requires TUI mode
-    if tui_log:
-        if as_json:
-            raise click.ClickException("--tui-log cannot be used with --json")
-        if not tui_flag:
-            raise click.ClickException("--tui-log requires --tui")
-        if dry_run:
-            raise click.ClickException("--tui-log cannot be used with --dry-run")
-        # Validate path upfront (fail fast)
-        tui_log = tui_log.expanduser().resolve()
-        try:
-            tui_log.parent.mkdir(parents=True, exist_ok=True)
-            tui_log.touch()  # Verify writable
-        except OSError as e:
-            raise click.ClickException(f"Cannot write to {tui_log}: {e}") from e
+    # Validate tui_log
+    tui_log = _run_common.validate_tui_log(tui_log, as_json, tui_flag)
 
-    # Validate --serve requires --watch
-    if serve and not watch:
-        raise click.ClickException("--serve requires --watch mode")
-
-    # Validate --allow-missing requires --dry-run
-    if allow_missing and not dry_run:
-        raise click.ClickException("--allow-missing can only be used with --dry-run")
-
-    # Handle explain mode (with or without dry-run) - show explanations without execution
-    if explain:
-        _output_explain(stages_list, single_stage, force, allow_missing=allow_missing)
-        return
-
-    # Handle dry-run mode (without explain) - terse output
-    if dry_run:
-        ctx.invoke(
-            dry_run_cmd,
-            stages=stages,
-            single_stage=single_stage,
-            force=force,
-            as_json=as_json,
-            allow_missing=allow_missing,
-        )
-        return
-
-    on_error = OnError.KEEP_GOING if keep_going else OnError.FAIL
-
-    if watch:
-        use_tui = tui_flag
-
-        # Validate --serve requires TUI mode
-        if serve and not use_tui:
-            raise click.ClickException("--serve requires --tui")
-
-        if use_tui:
-            try:
-                _run_watch_with_tui(
-                    stages_list,
-                    single_stage,
-                    debounce,
-                    force,
-                    tui_log=tui_log,
-                    no_commit=no_commit,
-                    no_cache=no_cache,
-                    on_error=on_error,
-                    serve=serve,
-                )
-            except KeyboardInterrupt:
-                if show_human_output:
-                    click.echo("\nWatch mode stopped.")
-        else:
-            from pivot.engine import graph as engine_graph
-            from pivot.engine import sources
-
-            # Create the Engine
-            with engine.Engine() as eng:
-                # Set keep-going mode based on on_error
-                eng.set_keep_going(on_error == OnError.KEEP_GOING)
-
-                # Build bipartite graph for watch paths
-                all_stages = {
-                    name: registry.REGISTRY.get(name) for name in registry.REGISTRY.list_stages()
-                }
-                bipartite_graph = engine_graph.build_graph(all_stages)
-                watch_paths = engine_graph.get_watch_paths(bipartite_graph)
-
-                # Add FilesystemSource for watching file changes
-                filesystem_source = sources.FilesystemSource(watch_paths, debounce=debounce)
-                eng.add_source(filesystem_source)
-
-                # Add OneShotSource for initial run if force is set
-                if force:
-                    initial_source = sources.OneShotSource(
-                        stages=stages_list,
-                        force=True,
-                        reason="watch:initial:forced",
-                    )
-                    eng.add_source(initial_source)
-
-                # Add appropriate sink for output mode
-                if as_json:
-                    # Emit schema version for JSONL streaming
-                    cli_helpers.emit_jsonl(
-                        SchemaVersionEvent(
-                            type=RunEventType.SCHEMA_VERSION, version=_JSONL_SCHEMA_VERSION
-                        )
-                    )
-                    eng.add_sink(sinks.JsonlSink(callback=cli_helpers.emit_jsonl))
-                else:
-                    from pivot.tui import console as tui_console
-
-                    console = tui_console.Console()
-                    eng.add_sink(sinks.ConsoleSink(console))
-
-                try:
-                    eng.run_loop()
-                except KeyboardInterrupt:
-                    pass  # Normal exit via Ctrl+C
-                finally:
-                    eng.shutdown()
-                    if show_human_output:
-                        click.echo("\nWatch mode stopped.")
-        return
+    # Default: keep going; --fail-fast stops on first failure
+    on_error = OnError.FAIL if fail_fast else OnError.KEEP_GOING
 
     # Determine display mode from flags
     use_tui = tui_flag
+
     if use_tui:
         results = _run_with_tui(
             stages_list,
-            single_stage,
             force=force,
             tui_log=tui_log,
             no_commit=no_commit,
@@ -567,153 +185,32 @@ def run(
             allow_uncached_incremental=allow_uncached_incremental,
             checkout_missing=checkout_missing,
         )
+        # TUI returns None if user quit early - don't show "No stages" message
+        if results is None:
+            return
     elif as_json:
-        # JSONL streaming mode
-        cli_helpers.emit_jsonl(
-            SchemaVersionEvent(type=RunEventType.SCHEMA_VERSION, version=_JSONL_SCHEMA_VERSION)
-        )
-
-        start_time = time.perf_counter()
-        with engine.Engine() as eng:
-            eng.add_sink(sinks.JsonlSink(callback=cli_helpers.emit_jsonl))
-            results = eng.run_once(
-                stages=stages_list,
-                single_stage=single_stage,
-                force=force,
-                no_commit=no_commit,
-                no_cache=no_cache,
-                on_error=on_error,
-                allow_uncached_incremental=allow_uncached_incremental,
-                checkout_missing=checkout_missing,
-            )
-        total_duration_ms = (time.perf_counter() - start_time) * 1000
-
-        # Emit final execution result
-        ran = sum(1 for r in results.values() if r["status"] == StageStatus.RAN)
-        skipped = sum(1 for r in results.values() if r["status"] == StageStatus.SKIPPED)
-        failed = sum(1 for r in results.values() if r["status"] == StageStatus.FAILED)
-
-        cli_helpers.emit_jsonl(
-            ExecutionResultEvent(
-                type=RunEventType.EXECUTION_RESULT,
-                ran=ran,
-                skipped=skipped,
-                failed=failed,
-                total_duration_ms=total_duration_ms,
-                timestamp=datetime.datetime.now(datetime.UTC).isoformat(),
-            )
+        results = _run_common.run_json_mode(
+            stages_list,
+            single_stage=True,
+            force=force,
+            no_commit=no_commit,
+            no_cache=no_cache,
+            on_error=on_error,
+            allow_uncached_incremental=allow_uncached_incremental,
+            checkout_missing=checkout_missing,
         )
     else:
-        from pivot.executor import core as executor_core
-        from pivot.tui import console as tui_console
+        results = _run_common.run_plain_mode(
+            stages_list,
+            single_stage=True,
+            force=force,
+            no_commit=no_commit,
+            no_cache=no_cache,
+            on_error=on_error,
+            allow_uncached_incremental=allow_uncached_incremental,
+            checkout_missing=checkout_missing,
+            quiet=quiet,
+        )
 
-        # Add ConsoleSink for stage progress display (unless quiet)
-        console: tui_console.Console | None = None
-        if not quiet:
-            console = tui_console.Console()
-
-        start_time = time.perf_counter()
-        with engine.Engine() as eng:
-            if console:
-                eng.add_sink(sinks.ConsoleSink(console))
-            results = eng.run_once(
-                stages=stages_list,
-                single_stage=single_stage,
-                force=force,
-                no_commit=no_commit,
-                no_cache=no_cache,
-                on_error=on_error,
-                allow_uncached_incremental=allow_uncached_incremental,
-                checkout_missing=checkout_missing,
-            )
-
-        # Print summary for plain mode (TUI/JSON modes handle this differently)
-        if console and results:
-            ran, cached, blocked, failed = executor_core.count_results(results)
-            total_duration = time.perf_counter() - start_time
-            console.summary(ran, cached, blocked, failed, total_duration)
-
-    if not results and show_human_output and not use_tui:
+    if not results and show_human_output:
         click.echo("No stages to run")
-
-
-class DryRunJsonStageOutput(TypedDict):
-    """JSON output for a single stage in dry-run mode."""
-
-    would_run: bool
-    reason: str
-
-
-class DryRunJsonOutput(TypedDict):
-    """JSON output for pivot run --dry-run --json."""
-
-    stages: dict[str, DryRunJsonStageOutput]
-
-
-@cli_decorators.pivot_command("dry-run")
-@click.argument("stages", nargs=-1, shell_complete=completion.complete_stages)
-@click.option(
-    "--single-stage",
-    "-s",
-    is_flag=True,
-    help="Run only the specified stages (in provided order), not their dependencies",
-)
-@click.option(
-    "--force",
-    "-f",
-    is_flag=True,
-    help="Show what would run if forced",
-)
-@click.option("--json", "as_json", is_flag=True, help="Output as JSON")
-@click.option("--allow-missing", is_flag=True, help="Allow missing dep files if tracked")
-def dry_run_cmd(
-    stages: tuple[str, ...],
-    single_stage: bool,
-    force: bool,
-    as_json: bool,
-    allow_missing: bool,
-) -> None:
-    """Show what would run without executing."""
-    from pivot import status as status_mod
-    from pivot.engine import graph as engine_graph
-
-    stages_list = cli_helpers.stages_to_list(stages)
-    _validate_stages(stages_list, single_stage)
-
-    # Validate dependencies exist when allow_missing is False
-    # This validation was previously done inside get_pipeline_explanations via build_dag()
-    if not allow_missing:
-        registry.REGISTRY.build_dag(validate=True)
-
-    # Build bipartite graph for consistent execution order with Engine
-    all_stages = {name: registry.REGISTRY.get(name) for name in registry.REGISTRY.list_stages()}
-    graph = engine_graph.build_graph(all_stages)
-
-    explanations = status_mod.get_pipeline_explanations(
-        stages_list, single_stage, force=force, allow_missing=allow_missing, graph=graph
-    )
-
-    if not explanations:
-        if as_json:
-            click.echo(json.dumps(DryRunJsonOutput(stages={})))
-        else:
-            click.echo("No stages to run")
-        return
-
-    if as_json:
-        output = DryRunJsonOutput(
-            stages={
-                exp["stage_name"]: DryRunJsonStageOutput(
-                    would_run=exp["will_run"],
-                    reason=exp["reason"] or "unchanged",
-                )
-                for exp in explanations
-            }
-        )
-        click.echo(json.dumps(output, indent=2))
-    else:
-        click.echo("Would run:")
-        for exp in explanations:
-            status = "would run" if exp["will_run"] else "would skip"
-            reason = exp["reason"] or "unchanged"
-            click.echo(f"  {exp['stage_name']}: {status} ({reason})")

@@ -83,7 +83,7 @@ Charlie," > data.csv
 ## 4. Run the Pipeline
 
 ```bash
-pivot run
+pivot repro
 ```
 
 Pivot will:
@@ -96,7 +96,7 @@ Pivot will:
 ## 5. Re-run (Cached)
 
 ```bash
-pivot run
+pivot repro
 ```
 
 The second run completes instantly because nothing changed.
@@ -117,7 +117,7 @@ def preprocess(
 ```
 
 ```bash
-pivot run
+pivot repro
 ```
 
 Pivot automatically detects the code change and re-runs both stages.
