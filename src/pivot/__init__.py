@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from pivot.outputs import IncrementalOut as IncrementalOut
     from pivot.outputs import Metric as Metric
     from pivot.outputs import Out as Out
+    from pivot.outputs import PlaceholderDep as PlaceholderDep
     from pivot.outputs import Plot as Plot
 
 # Lazy import mapping for runtime: (module_path, attr_name or None for module import)
@@ -25,6 +26,7 @@ _LAZY_IMPORTS: dict[str, tuple[str, str | None]] = {
     "IncrementalOut": ("pivot.outputs", "IncrementalOut"),
     "Metric": ("pivot.outputs", "Metric"),
     "Out": ("pivot.outputs", "Out"),
+    "PlaceholderDep": ("pivot.outputs", "PlaceholderDep"),
     "Plot": ("pivot.outputs", "Plot"),
 }
 

@@ -604,3 +604,216 @@ def test_worker_injects_params_and_deps(
     output_file = tmp_path / "model.json"
     assert output_file.exists()
     assert json.loads(output_file.read_text()) == {"weights": 50.0}
+
+
+# ==============================================================================
+# Test: PlaceholderDep (dependencies that must be overridden)
+# ==============================================================================
+
+
+def test_placeholder_dep_has_no_path() -> None:
+    """PlaceholderDep should have loader but no path attribute."""
+    placeholder = outputs.PlaceholderDep(loaders.CSV[pandas.DataFrame]())
+
+    assert hasattr(placeholder, "loader")
+    assert isinstance(placeholder.loader, loaders.CSV)
+    assert not hasattr(placeholder, "path")
+
+
+def test_get_placeholder_dep_names_identifies_placeholders() -> None:
+    """Should identify which parameters use PlaceholderDep."""
+
+    def compare(
+        baseline: Annotated[
+            pandas.DataFrame, outputs.PlaceholderDep(loaders.CSV[pandas.DataFrame]())
+        ],
+        experiment: Annotated[
+            pandas.DataFrame, outputs.PlaceholderDep(loaders.CSV[pandas.DataFrame]())
+        ],
+        config: Annotated[
+            dict[str, int], outputs.Dep("config.json", loaders.JSON[dict[str, int]]())
+        ],
+    ) -> _MultiDepOutputs:
+        return {"combined": {"count": len(baseline) + len(experiment)}}
+
+    placeholder_names = stage_def.get_placeholder_dep_names(compare)
+
+    assert placeholder_names == {"baseline", "experiment"}
+
+
+def test_get_placeholder_dep_names_returns_empty_for_no_placeholders() -> None:
+    """Should return empty set when no PlaceholderDep annotations."""
+
+    def process(
+        data: Annotated[
+            pandas.DataFrame, outputs.Dep("input.csv", loaders.CSV[pandas.DataFrame]())
+        ],
+    ) -> _ProcessOutputs:
+        return {"result": {"count": len(data)}}
+
+    placeholder_names = stage_def.get_placeholder_dep_names(process)
+
+    assert placeholder_names == set()
+
+
+def test_get_dep_specs_with_placeholder_and_overrides() -> None:
+    """Should resolve PlaceholderDep using provided overrides."""
+
+    def compare(
+        baseline: Annotated[
+            pandas.DataFrame, outputs.PlaceholderDep(loaders.CSV[pandas.DataFrame]())
+        ],
+        experiment: Annotated[
+            pandas.DataFrame, outputs.PlaceholderDep(loaders.CSV[pandas.DataFrame]())
+        ],
+    ) -> _MultiDepOutputs:
+        return {"combined": {"count": 0}}
+
+    overrides = {
+        "baseline": "model_a/results.csv",
+        "experiment": "model_b/results.csv",
+    }
+    specs = stage_def.get_dep_specs_from_signature(compare, overrides)
+
+    assert specs["baseline"].path == "model_a/results.csv"
+    assert specs["experiment"].path == "model_b/results.csv"
+    assert isinstance(specs["baseline"].loader, loaders.CSV)
+
+
+def test_get_dep_specs_mixed_placeholder_and_regular() -> None:
+    """Should handle mix of PlaceholderDep and regular Dep."""
+
+    def compare(
+        baseline: Annotated[
+            pandas.DataFrame, outputs.PlaceholderDep(loaders.CSV[pandas.DataFrame]())
+        ],
+        config: Annotated[
+            dict[str, int], outputs.Dep("config.json", loaders.JSON[dict[str, int]]())
+        ],
+    ) -> _MultiDepOutputs:
+        return {"combined": {"count": 0}}
+
+    overrides = {"baseline": "model_a/results.csv"}
+    specs = stage_def.get_dep_specs_from_signature(compare, overrides)
+
+    assert specs["baseline"].path == "model_a/results.csv"
+    assert specs["config"].path == "config.json"
+
+
+def test_get_dep_specs_placeholder_without_override_raises() -> None:
+    """Should raise when PlaceholderDep has no override."""
+
+    def compare(
+        baseline: Annotated[
+            pandas.DataFrame, outputs.PlaceholderDep(loaders.CSV[pandas.DataFrame]())
+        ],
+    ) -> _MultiDepOutputs:
+        return {"combined": {"count": 0}}
+
+    with pytest.raises(ValueError, match="PlaceholderDep .* requires override"):
+        stage_def.get_dep_specs_from_signature(compare, {})
+
+
+def test_get_dep_specs_placeholder_none_overrides_raises() -> None:
+    """Should raise when PlaceholderDep exists but overrides is None."""
+
+    def compare(
+        baseline: Annotated[
+            pandas.DataFrame, outputs.PlaceholderDep(loaders.CSV[pandas.DataFrame]())
+        ],
+    ) -> _MultiDepOutputs:
+        return {"combined": {"count": 0}}
+
+    with pytest.raises(ValueError, match="PlaceholderDep .* requires override"):
+        stage_def.get_dep_specs_from_signature(compare, None)
+
+
+def test_placeholder_dep_list_path_override() -> None:
+    """PlaceholderDep should work with list path overrides."""
+
+    def process_shards(
+        shards: Annotated[
+            list[pandas.DataFrame], outputs.PlaceholderDep(loaders.CSV[pandas.DataFrame]())
+        ],
+    ) -> _ProcessOutputs:
+        return {"result": {"count": len(shards)}}
+
+    overrides = {"shards": ["shard1.csv", "shard2.csv", "shard3.csv"]}
+    specs = stage_def.get_dep_specs_from_signature(process_shards, overrides)
+
+    assert specs["shards"].path == ["shard1.csv", "shard2.csv", "shard3.csv"]
+
+
+def test_placeholder_dep_tuple_path_override() -> None:
+    """PlaceholderDep should work with tuple path overrides."""
+
+    def compare_pair(
+        pair: Annotated[
+            tuple[pandas.DataFrame, pandas.DataFrame],
+            outputs.PlaceholderDep(loaders.CSV[pandas.DataFrame]()),
+        ],
+    ) -> _ProcessOutputs:
+        return {"result": {"count": 2}}
+
+    overrides = {"pair": ("left.csv", "right.csv")}
+    specs = stage_def.get_dep_specs_from_signature(compare_pair, overrides)
+
+    assert specs["pair"].path == ("left.csv", "right.csv")
+
+
+def test_get_dep_specs_regular_dep_with_override() -> None:
+    """Should apply override to regular Dep when provided."""
+
+    def process(
+        data: Annotated[
+            pandas.DataFrame, outputs.Dep("default.csv", loaders.CSV[pandas.DataFrame]())
+        ],
+    ) -> _ProcessOutputs:
+        return {"result": {"count": len(data)}}
+
+    overrides = {"data": "custom/override.csv"}
+    specs = stage_def.get_dep_specs_from_signature(process, overrides)
+
+    assert specs["data"].path == "custom/override.csv"
+
+
+def test_placeholder_dep_empty_string_override_raises() -> None:
+    """PlaceholderDep should reject empty string override."""
+
+    def process(
+        baseline: Annotated[
+            pandas.DataFrame, outputs.PlaceholderDep(loaders.CSV[pandas.DataFrame]())
+        ],
+    ) -> _ProcessOutputs:
+        return {"result": {"count": 0}}
+
+    with pytest.raises(ValueError, match="override cannot be empty"):
+        stage_def.get_dep_specs_from_signature(process, {"baseline": ""})
+
+
+def test_placeholder_dep_empty_list_override_raises() -> None:
+    """PlaceholderDep should reject empty list override."""
+
+    def process(
+        shards: Annotated[
+            list[pandas.DataFrame], outputs.PlaceholderDep(loaders.CSV[pandas.DataFrame]())
+        ],
+    ) -> _ProcessOutputs:
+        return {"result": {"count": 0}}
+
+    with pytest.raises(ValueError, match="override contains empty path"):
+        stage_def.get_dep_specs_from_signature(process, {"shards": []})
+
+
+def test_placeholder_dep_list_with_empty_element_raises() -> None:
+    """PlaceholderDep should reject list with empty string element."""
+
+    def process(
+        shards: Annotated[
+            list[pandas.DataFrame], outputs.PlaceholderDep(loaders.CSV[pandas.DataFrame]())
+        ],
+    ) -> _ProcessOutputs:
+        return {"result": {"count": 0}}
+
+    with pytest.raises(ValueError, match="override contains empty path"):
+        stage_def.get_dep_specs_from_signature(process, {"shards": ["a.csv", "", "c.csv"]})

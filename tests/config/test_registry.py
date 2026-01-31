@@ -5,11 +5,12 @@ import math
 import pathlib
 from typing import Annotated, TypedDict
 
+import pandas
 import pytest
 from pydantic import BaseModel
 
 from helpers import register_test_stage
-from pivot import fingerprint, loaders, outputs, registry, stage_def
+from pivot import exceptions, fingerprint, loaders, outputs, registry, stage_def
 from pivot.exceptions import ParamsError, ValidationError
 from pivot.registry import REGISTRY, RegistryStageInfo, StageRegistry
 
@@ -805,3 +806,129 @@ def test_out_path_overrides_accepts_list_paths() -> None:
 
     info = REGISTRY.get("my_stage3")
     assert info["out_specs"]["items"].path == ["x.txt", "y.txt"]
+
+
+# ==============================================================================
+# PlaceholderDep validation tests
+# ==============================================================================
+
+
+class _PlaceholderCompareOutputs(TypedDict):
+    result: Annotated[dict[str, int], outputs.Out("result.json", loaders.JSON[dict[str, int]]())]
+
+
+def test_register_placeholder_dep_without_override_raises() -> None:
+    """Registration should fail when PlaceholderDep has no override."""
+
+    def _compare_no_override(
+        baseline: Annotated[
+            pandas.DataFrame, outputs.PlaceholderDep(loaders.CSV[pandas.DataFrame]())
+        ],
+        experiment: Annotated[
+            pandas.DataFrame, outputs.PlaceholderDep(loaders.CSV[pandas.DataFrame]())
+        ],
+    ) -> _PlaceholderCompareOutputs:
+        return {"result": {"diff": 0}}
+
+    with pytest.raises(
+        exceptions.ValidationError, match="Placeholder dependencies missing overrides"
+    ):
+        REGISTRY.register(_compare_no_override, name="compare_test_no_override")
+
+
+def test_register_placeholder_dep_partial_override_raises() -> None:
+    """Registration should fail when only some PlaceholderDeps have overrides."""
+
+    def _compare_partial(
+        baseline: Annotated[
+            pandas.DataFrame, outputs.PlaceholderDep(loaders.CSV[pandas.DataFrame]())
+        ],
+        experiment: Annotated[
+            pandas.DataFrame, outputs.PlaceholderDep(loaders.CSV[pandas.DataFrame]())
+        ],
+    ) -> _PlaceholderCompareOutputs:
+        return {"result": {"diff": 0}}
+
+    with pytest.raises(exceptions.ValidationError, match="experiment"):
+        REGISTRY.register(
+            _compare_partial,
+            name="compare_partial_override",
+            dep_path_overrides={"baseline": "model_a/results.csv"},
+        )
+
+
+def test_register_placeholder_dep_with_all_overrides_succeeds() -> None:
+    """Registration should succeed when all PlaceholderDeps have overrides."""
+
+    def _compare_success(
+        baseline: Annotated[
+            pandas.DataFrame, outputs.PlaceholderDep(loaders.CSV[pandas.DataFrame]())
+        ],
+        experiment: Annotated[
+            pandas.DataFrame, outputs.PlaceholderDep(loaders.CSV[pandas.DataFrame]())
+        ],
+    ) -> _PlaceholderCompareOutputs:
+        return {"result": {"diff": 0}}
+
+    REGISTRY.register(
+        _compare_success,
+        name="compare_success_test",
+        dep_path_overrides={
+            "baseline": "model_a/results.csv",
+            "experiment": "model_b/results.csv",
+        },
+    )
+
+    info = REGISTRY.get("compare_success_test")
+    assert info is not None
+    assert "baseline" in info["deps"]
+    assert "experiment" in info["deps"]
+
+
+def test_register_placeholder_dep_error_lists_all_missing() -> None:
+    """Error message should list all missing placeholder overrides."""
+
+    def _compare_many(
+        a: Annotated[pandas.DataFrame, outputs.PlaceholderDep(loaders.CSV[pandas.DataFrame]())],
+        b: Annotated[pandas.DataFrame, outputs.PlaceholderDep(loaders.CSV[pandas.DataFrame]())],
+        c: Annotated[pandas.DataFrame, outputs.PlaceholderDep(loaders.CSV[pandas.DataFrame]())],
+    ) -> _PlaceholderCompareOutputs:
+        return {"result": {"count": 0}}
+
+    with pytest.raises(exceptions.ValidationError) as exc_info:
+        REGISTRY.register(_compare_many, name="compare_many_test")
+
+    # All three should be mentioned in the error
+    error_msg = str(exc_info.value)
+    assert "a" in error_msg
+    assert "b" in error_msg
+    assert "c" in error_msg
+
+
+def test_register_placeholder_dep_typo_suggests_correction() -> None:
+    """Error message should suggest correction for typos in override keys."""
+
+    def _compare_typo(
+        baseline: Annotated[
+            pandas.DataFrame, outputs.PlaceholderDep(loaders.CSV[pandas.DataFrame]())
+        ],
+        experiment: Annotated[
+            pandas.DataFrame, outputs.PlaceholderDep(loaders.CSV[pandas.DataFrame]())
+        ],
+    ) -> _PlaceholderCompareOutputs:
+        return {"result": {"count": 0}}
+
+    with pytest.raises(exceptions.ValidationError) as exc_info:
+        REGISTRY.register(
+            _compare_typo,
+            name="compare_typo_test",
+            dep_path_overrides={
+                "basline": "model_a/results.csv",  # typo: basline -> baseline
+                "experiment": "model_b/results.csv",
+            },
+        )
+
+    error_msg = str(exc_info.value)
+    assert "baseline" in error_msg  # missing param
+    assert "Did you mean" in error_msg  # fuzzy suggestion
+    assert "'basline' -> 'baseline'" in error_msg  # specific suggestion

@@ -53,6 +53,31 @@ class Dep(Generic[T]):  # noqa: UP046 - basedpyright doesn't support PEP 695 syn
 
 
 @dataclasses.dataclass(frozen=True)
+class PlaceholderDep(Generic[T]):  # noqa: UP046 - basedpyright doesn't support PEP 695 syntax yet
+    """Dependency marker with no default path — must be overridden at registration.
+
+    Use when a stage needs a dependency that has no sensible default.
+    Registration fails if dep_path_overrides doesn't include this dependency.
+
+        def compare(
+            baseline: Annotated[DataFrame, PlaceholderDep(CSV())],
+            experiment: Annotated[DataFrame, PlaceholderDep(CSV())],
+        ) -> CompareOutputs:
+            ...
+
+        REGISTRY.register(
+            compare,
+            dep_path_overrides={
+                "baseline": "model_a/results.csv",
+                "experiment": "model_b/results.csv",
+            },
+        )
+    """
+
+    loader: loaders_module.Loader[T]
+
+
+@dataclasses.dataclass(frozen=True)
 class Out(Generic[T]):  # noqa: UP046 - basedpyright doesn't support PEP 695 syntax yet
     """Unified output marker and storage.
 

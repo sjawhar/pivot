@@ -6,6 +6,7 @@ import inspect
 import logging
 import pathlib
 import re
+from difflib import get_close_matches
 from typing import TYPE_CHECKING, Any, TypedDict
 
 if TYPE_CHECKING:
@@ -262,8 +263,33 @@ class StageRegistry:
             # Convert params to instance (instantiate class if needed)
             params_instance = _resolve_params(params, func, stage_name)
 
-            # Extract deps from function annotations
-            dep_specs = stage_def.get_dep_specs_from_signature(func)
+            # Identify placeholder deps BEFORE extraction
+            placeholder_names = stage_def.get_placeholder_dep_names(func)
+
+            # Validate all placeholders have overrides
+            if placeholder_names:
+                provided_overrides = (
+                    set(dep_path_overrides.keys()) if dep_path_overrides else set[str]()
+                )
+                missing = placeholder_names - provided_overrides
+                if missing:
+                    # Check for typos in provided overrides
+                    unknown_overrides = list(provided_overrides - placeholder_names)
+                    suggestions = list[str]()
+                    for m in sorted(missing):
+                        matches = get_close_matches(m, unknown_overrides, n=1, cutoff=0.6)
+                        if matches:
+                            suggestions.append(f"'{matches[0]}' -> '{m}'")
+                    msg = (
+                        f"Stage '{stage_name}' has invalid dependencies:\n"
+                        + f"  - Placeholder dependencies missing overrides: {', '.join(sorted(missing))}"
+                    )
+                    if suggestions:
+                        msg += f"\n  - Did you mean: {', '.join(suggestions)}?"
+                    raise exceptions.ValidationError(msg)
+
+            # Extract deps from function annotations (PlaceholderDep resolved via overrides)
+            dep_specs = stage_def.get_dep_specs_from_signature(func, dep_path_overrides)
 
             # Validate dep_path_overrides match annotation dep names
             if dep_path_overrides:
@@ -283,8 +309,6 @@ class StageRegistry:
                         + f"{incremental_overrides}. IncrementalOut paths must match between "
                         + "input and output annotations."
                     )
-                # Apply overrides
-                dep_specs = stage_def.apply_dep_path_overrides(dep_specs, dep_path_overrides)
 
             # Build deps dict from specs (all deps, for loading)
             deps_dict: dict[str, outputs.PathType] = {
