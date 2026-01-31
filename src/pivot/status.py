@@ -140,6 +140,7 @@ def _get_explanations_in_parallel(
                     code_changes=list[CodeChange](),
                     param_changes=list[ParamChange](),
                     dep_changes=list[DepChange](),
+                    upstream_stale=[],
                 )
 
     return explanations_by_name

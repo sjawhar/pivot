@@ -303,7 +303,7 @@ class StageExplanation(TypedDict, total=False):
     code_changes: Required[list[CodeChange]]
     param_changes: Required[list[ParamChange]]
     dep_changes: Required[list[DepChange]]
-    upstream_stale: list[str]  # Populated by get_pipeline_explanations()
+    upstream_stale: Required[list[str]]
 
 
 # =============================================================================

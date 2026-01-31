@@ -165,7 +165,6 @@ def _output_explain(
 def _run_with_tui(
     stages_list: list[str] | None,
     single_stage: bool,
-    cache_dir: pathlib.Path | None,
     force: bool = False,
     tui_log: pathlib.Path | None = None,
     no_commit: bool = False,
@@ -188,8 +187,6 @@ def _run_with_tui(
 
     if not execution_order:
         return {}
-
-    resolved_cache_dir = cache_dir or config.get_cache_dir()
 
     # Pre-warm loky executor before starting Textual TUI.
     # Textual manipulates terminal file descriptors which breaks loky's
@@ -217,7 +214,6 @@ def _run_with_tui(
             return eng.run_once(
                 stages=stages_list,
                 single_stage=single_stage,
-                cache_dir=resolved_cache_dir,
                 force=force,
                 no_commit=no_commit,
                 no_cache=no_cache,
@@ -238,7 +234,6 @@ def _run_with_tui(
 def _run_watch_with_tui(
     stages_list: list[str] | None,
     single_stage: bool,
-    cache_dir: pathlib.Path | None,  # noqa: ARG001 - cache_dir not yet passed to Engine
     debounce: int,  # noqa: ARG001 - debounce not yet used by FilesystemSource
     force: bool = False,
     tui_log: pathlib.Path | None = None,
@@ -249,11 +244,11 @@ def _run_watch_with_tui(
 ) -> None:
     """Run watch mode with TUI display.
 
-    Note: Several parameters (cache_dir, debounce, no_commit, no_cache) are
+    Note: Several parameters (debounce, no_commit, no_cache) are
     retained for CLI signature compatibility but not currently used by Engine watch mode.
     """
     # Suppress unused parameter warnings - retained for CLI compatibility
-    _ = cache_dir, debounce, no_commit, no_cache
+    _ = debounce, no_commit, no_cache
 
     import queue as thread_queue
     import uuid
@@ -329,7 +324,6 @@ def _run_watch_with_tui(
     is_flag=True,
     help="Run only the specified stages (in provided order), not their dependencies",
 )
-@click.option("--cache-dir", type=click.Path(path_type=pathlib.Path), help="Cache directory")
 @click.option("--dry-run", "-n", is_flag=True, help="Show what would run without executing")
 @click.option(
     "--explain", "-e", is_flag=True, help="Show detailed breakdown of why stages would run"
@@ -405,7 +399,6 @@ def run(
     ctx: click.Context,
     stages: tuple[str, ...],
     single_stage: bool,
-    cache_dir: pathlib.Path | None,
     dry_run: bool,
     explain: bool,
     force: bool,
@@ -497,7 +490,6 @@ def run(
                 _run_watch_with_tui(
                     stages_list,
                     single_stage,
-                    cache_dir,
                     debounce,
                     force,
                     tui_log=tui_log,
@@ -567,7 +559,6 @@ def run(
         results = _run_with_tui(
             stages_list,
             single_stage,
-            cache_dir,
             force=force,
             tui_log=tui_log,
             no_commit=no_commit,
@@ -588,7 +579,6 @@ def run(
             results = eng.run_once(
                 stages=stages_list,
                 single_stage=single_stage,
-                cache_dir=cache_dir,
                 force=force,
                 no_commit=no_commit,
                 no_cache=no_cache,
@@ -629,7 +619,6 @@ def run(
             results = eng.run_once(
                 stages=stages_list,
                 single_stage=single_stage,
-                cache_dir=cache_dir,
                 force=force,
                 no_commit=no_commit,
                 no_cache=no_cache,

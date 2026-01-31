@@ -312,6 +312,7 @@ def test_get_stage_explanation_no_lock(tmp_path: Path) -> None:
         code_changes=[],
         param_changes=[],
         dep_changes=[],
+        upstream_stale=[],
     )
 
 
@@ -601,6 +602,7 @@ def test_get_stage_explanation_force_without_changes(
         code_changes=[],
         param_changes=[],
         dep_changes=[],
+        upstream_stale=[],
     )
 
 
