@@ -540,6 +540,9 @@ class TuiReloadMessage(TypedDict):
 
     type: Literal[TuiMessageType.RELOAD]
     stages: list[str]
+    stages_added: list[str]
+    stages_removed: list[str]
+    stages_modified: list[str]
 
 
 TuiMessage = TuiLogMessage | TuiStatusMessage | TuiWatchMessage | TuiReloadMessage | None

@@ -73,7 +73,33 @@ __all__ = [
     "ExecutorComplete",
     "run_with_tui",
     "run_watch_tui",
+    "format_reload_summary",
 ]
+
+
+def format_reload_summary(
+    stages_added: list[str],
+    stages_removed: list[str],
+    stages_modified: list[str],
+) -> str | None:
+    """Format a summary message for pipeline reload changes.
+
+    Returns None if there are no changes to report.
+    """
+    parts = list[str]()
+
+    if stages_added:
+        parts.append(f"{len(stages_added)} added")
+    if stages_removed:
+        parts.append(f"{len(stages_removed)} removed")
+    if stages_modified:
+        parts.append(f"{len(stages_modified)} modified")
+
+    if not parts:
+        return None
+
+    return f"Reloaded: {', '.join(parts)}"
+
 
 if TYPE_CHECKING:
     import multiprocessing as mp
@@ -638,6 +664,15 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
         self._recompute_selection_idx()
         self._rebuild_stage_list()
         self._update_detail_panel()
+
+        # Show notification with reload summary
+        summary = format_reload_summary(
+            stages_added=msg["stages_added"],
+            stages_removed=msg["stages_removed"],
+            stages_modified=msg["stages_modified"],
+        )
+        if summary:
+            self.notify(summary)
 
     def on_executor_complete(self, event: ExecutorComplete) -> None:  # pragma: no cover
         """Handle executor completion (run mode only)."""
