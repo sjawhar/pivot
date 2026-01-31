@@ -18,7 +18,8 @@ import pytest
 from pivot import project
 from pivot.config import io as config_io
 from pivot.executor import core as executor_core
-from pivot.registry import REGISTRY
+from pivot.pipeline import pipeline as pipeline_mod
+from pivot.registry import StageRegistry
 from pivot.tui import console
 
 # Add tests directory to sys.path so helpers.py can be imported
@@ -49,11 +50,63 @@ def sample_data_file(tmp_pipeline_dir: pathlib.Path) -> pathlib.Path:
     return data_file
 
 
-@pytest.fixture(autouse=True)
-def clean_registry(mocker: MockerFixture) -> Generator[None]:
-    mocker.patch.dict(REGISTRY._stages, clear=True)
-    mocker.patch.object(REGISTRY, "_cached_dag", None)
-    yield
+@pytest.fixture
+def test_pipeline(tmp_path: pathlib.Path) -> Generator[pipeline_mod.Pipeline]:
+    """Provide a fresh Pipeline for tests.
+
+    Also sets up the module-level test pipeline in helpers.py so that
+    register_test_stage() works without explicit pipeline parameter.
+    """
+    import helpers
+
+    pipeline = pipeline_mod.Pipeline("test", root=tmp_path)
+    helpers.set_test_pipeline(pipeline)
+    yield pipeline
+    helpers.set_test_pipeline(None)
+
+
+@pytest.fixture
+def mock_discovery(
+    test_pipeline: pipeline_mod.Pipeline, mocker: MockerFixture
+) -> pipeline_mod.Pipeline:
+    """Mock discover_pipeline to return the test_pipeline.
+
+    Use this fixture for CLI tests that need stages to be discovered
+    without creating actual pivot.yaml or pipeline.py files.
+
+    Also sets project._project_root_cache to the pipeline's root directory
+    so that project.get_project_root() works correctly.
+
+    Additionally mocks get_pipeline_from_context() so that cli_helpers
+    functions work even when not running inside a Click command context.
+
+    Note: The test_pipeline fixture is automatically used, so stages
+    can be registered via register_test_stage().
+    """
+    from pivot import discovery
+    from pivot.cli import decorators as cli_decorators
+
+    mocker.patch.object(discovery, "discover_pipeline", return_value=test_pipeline)
+    mocker.patch.object(project, "_project_root_cache", test_pipeline.root)
+    mocker.patch.object(cli_decorators, "get_pipeline_from_context", return_value=test_pipeline)
+    return test_pipeline
+
+
+@pytest.fixture
+def test_registry() -> StageRegistry:
+    """Provide a fresh StageRegistry for tests that need direct registry access."""
+    return StageRegistry()
+
+
+@pytest.fixture
+def clean_registry() -> None:
+    """No-op fixture for backwards compatibility.
+
+    Previously cleared the global REGISTRY between tests.
+    Now that REGISTRY is removed, this is kept for tests that still use
+    @pytest.mark.usefixtures("clean_registry") - they can be gradually updated.
+    """
+    pass
 
 
 _PIVOT_LOGGERS = ("pivot", "pivot.project", "pivot.executor", "pivot.registry", "")
@@ -306,14 +359,14 @@ def mock_watch_engine() -> Engine:
 
 
 @pytest.fixture
-def test_engine() -> Generator[Engine]:
+def test_engine(test_pipeline: pipeline_mod.Pipeline) -> Generator[Engine]:
     """Provide a context-managed Engine instance.
 
     The engine is properly closed after each test to ensure sinks are cleaned up.
     """
     from pivot.engine.engine import Engine
 
-    with Engine() as eng:
+    with Engine(pipeline=test_pipeline) as eng:
         yield eng
 
 

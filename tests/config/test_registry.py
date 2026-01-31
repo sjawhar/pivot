@@ -12,7 +12,8 @@ from pydantic import BaseModel
 from helpers import register_test_stage
 from pivot import exceptions, fingerprint, loaders, outputs, registry, stage_def
 from pivot.exceptions import ParamsError, ValidationError
-from pivot.registry import REGISTRY, RegistryStageInfo, StageRegistry
+from pivot.pipeline.pipeline import Pipeline
+from pivot.registry import RegistryStageInfo, StageRegistry
 
 # =============================================================================
 # Output TypedDicts for annotation-based stages
@@ -100,12 +101,12 @@ def _plain_stage(
 # =============================================================================
 
 
-def test_register_registers_function():
+def test_register_registers_function(test_pipeline: "Pipeline") -> None:
     """Should register function when calling register_test_stage()."""
     register_test_stage(_process_with_dep, name="process")
 
-    assert "process" in REGISTRY.list_stages()
-    info = REGISTRY.get("process")
+    assert "process" in test_pipeline.list_stages()
+    info = test_pipeline.get("process")
     assert info["name"] == "process"
     # Paths are normalized to absolute paths
     assert len(info["deps_paths"]) == 1
@@ -116,7 +117,7 @@ def test_register_registers_function():
     assert str(info["outs"][0].path).endswith("output.txt")
 
 
-def test_register_captures_fingerprint():
+def test_register_captures_fingerprint(test_pipeline: "Pipeline") -> None:
     """Should capture code fingerprint on registration."""
 
     def my_stage():
@@ -124,13 +125,13 @@ def test_register_captures_fingerprint():
 
     register_test_stage(my_stage)
 
-    info = REGISTRY.get("my_stage")
+    info = test_pipeline.get("my_stage")
     assert "fingerprint" in info
     assert isinstance(info["fingerprint"], dict)
     assert "self:my_stage" in info["fingerprint"]
 
 
-def test_register_captures_signature():
+def test_register_captures_signature(test_pipeline: "Pipeline") -> None:
     """Should capture function signature."""
 
     def my_stage(x: int, y: str = "default"):
@@ -138,7 +139,7 @@ def test_register_captures_signature():
 
     register_test_stage(my_stage)
 
-    info = REGISTRY.get("my_stage")
+    info = test_pipeline.get("my_stage")
     assert "signature" in info
     sig = info["signature"]
     assert isinstance(sig, inspect.Signature)
@@ -147,7 +148,7 @@ def test_register_captures_signature():
     assert sig.parameters["y"].default == "default"
 
 
-def test_register_with_pydantic_params():
+def test_register_with_pydantic_params(test_pipeline: "Pipeline") -> None:
     """Should support Pydantic parameter models with params argument."""
 
     class TrainParams(stage_def.StageParams):
@@ -159,13 +160,13 @@ def test_register_with_pydantic_params():
 
     register_test_stage(train, params=TrainParams)
 
-    info = REGISTRY.get("train")
+    info = test_pipeline.get("train")
     assert isinstance(info["params"], TrainParams), "Should store params as an instance"
     assert info["params"].learning_rate == 0.01
     assert info["params"].epochs == 100
 
 
-def test_register_with_pydantic_params_instance():
+def test_register_with_pydantic_params_instance(test_pipeline: "Pipeline") -> None:
     """Should support Pydantic parameter instance with custom values."""
 
     class TrainParams(stage_def.StageParams):
@@ -177,14 +178,14 @@ def test_register_with_pydantic_params_instance():
 
     register_test_stage(train_custom, params=TrainParams(learning_rate=0.05, epochs=50))
 
-    info = REGISTRY.get("train_custom")
+    info = test_pipeline.get("train_custom")
     assert info["params"] is not None
     assert isinstance(info["params"], TrainParams)
     assert info["params"].learning_rate == 0.05
     assert info["params"].epochs == 50
 
 
-def test_register_params_cls_requires_params_argument():
+def test_register_params_cls_requires_params_argument(test_pipeline: "Pipeline") -> None:
     """Should raise ParamsError when params_cls provided but function has no params arg."""
 
     class MyParams(stage_def.StageParams):
@@ -197,7 +198,7 @@ def test_register_params_cls_requires_params_argument():
         register_test_stage(process, params=MyParams)
 
 
-def test_register_params_cls_must_be_stageparams():
+def test_register_params_cls_must_be_stageparams(test_pipeline: "Pipeline") -> None:
     """Should raise ParamsError when params_cls is not a StageParams subclass."""
 
     class NotAStageParams(BaseModel):
@@ -210,7 +211,7 @@ def test_register_params_cls_must_be_stageparams():
         register_test_stage(process, params=NotAStageParams)  # pyright: ignore[reportArgumentType]
 
 
-def test_register_infers_params_from_type_hint():
+def test_register_infers_params_from_type_hint(test_pipeline: "Pipeline") -> None:
     """Should infer params class from function type hint when params not specified."""
 
     class InferredParams(stage_def.StageParams):
@@ -222,14 +223,14 @@ def test_register_infers_params_from_type_hint():
 
     register_test_stage(process_inferred)
 
-    info = REGISTRY.get("process_inferred")
+    info = test_pipeline.get("process_inferred")
     assert info["params"] is not None
     assert isinstance(info["params"], InferredParams)
     assert info["params"].value == 42
     assert info["params"].name == "default"
 
 
-def test_register_params_type_mismatch_raises_error():
+def test_register_params_type_mismatch_raises_error(test_pipeline: "Pipeline") -> None:
     """Should raise ParamsError when params instance type doesn't match function type hint."""
 
     class ParamsA(stage_def.StageParams):
@@ -245,7 +246,7 @@ def test_register_params_type_mismatch_raises_error():
         register_test_stage(process_mismatch, params=ParamsA())
 
 
-def test_register_params_class_mismatch_raises_error():
+def test_register_params_class_mismatch_raises_error(test_pipeline: "Pipeline") -> None:
     """Should raise ParamsError when params class doesn't match function type hint."""
 
     class ParamsA(stage_def.StageParams):
@@ -261,7 +262,7 @@ def test_register_params_class_mismatch_raises_error():
         register_test_stage(process_class_mismatch, params=ParamsA)
 
 
-def test_register_params_subclass_allowed():
+def test_register_params_subclass_allowed(test_pipeline: "Pipeline") -> None:
     """Should allow params that is a subclass of the type hint."""
 
     class BaseParams(stage_def.StageParams):
@@ -276,13 +277,13 @@ def test_register_params_subclass_allowed():
     # Subclass should be accepted when base class is the type hint
     register_test_stage(process_subclass, params=DerivedParams())
 
-    info = REGISTRY.get("process_subclass")
+    info = test_pipeline.get("process_subclass")
     assert info["params"] is not None
     assert isinstance(info["params"], DerivedParams)
     assert info["params"].extra == "derived"
 
 
-def test_register_params_required_fields_raises_error():
+def test_register_params_required_fields_raises_error(test_pipeline: "Pipeline") -> None:
     """Should raise ParamsError when inferred params have required fields without defaults."""
 
     class RequiredParams(stage_def.StageParams):
@@ -295,7 +296,7 @@ def test_register_params_required_fields_raises_error():
         register_test_stage(process_required)
 
 
-def test_register_with_additional_decorator():
+def test_register_with_additional_decorator(test_pipeline: "Pipeline") -> None:
     """Should work with functions that have additional decorators."""
     import functools
     from collections.abc import Callable
@@ -319,13 +320,13 @@ def test_register_with_additional_decorator():
 
     register_test_stage(decorated_stage)
 
-    info = REGISTRY.get("decorated_stage")
+    info = test_pipeline.get("decorated_stage")
     assert info["params"] is not None
     assert isinstance(info["params"], DecoratedParams)
     assert info["params"].multiplier == 2
 
 
-def test_register_params_forward_ref_module_level():
+def test_register_params_forward_ref_module_level(test_pipeline: "Pipeline") -> None:
     """Should handle forward reference to module-level class."""
     # ForwardRefParams is defined at module level below
     # This test verifies forward refs work when the class is importable
@@ -335,7 +336,7 @@ def test_register_params_forward_ref_module_level():
 
     register_test_stage(process_forward_ref)
 
-    info = REGISTRY.get("process_forward_ref")
+    info = test_pipeline.get("process_forward_ref")
     assert info["params"] is not None
     assert isinstance(info["params"], ForwardRefParams)
     assert info["params"].ref_value == 99
@@ -346,7 +347,7 @@ class ForwardRefParams(stage_def.StageParams):
     ref_value: int = 99
 
 
-def test_register_defaults_to_function_name():
+def test_register_defaults_to_function_name(test_pipeline: "Pipeline") -> None:
     """Should use function name as stage name by default."""
 
     def my_custom_stage():
@@ -354,10 +355,10 @@ def test_register_defaults_to_function_name():
 
     register_test_stage(my_custom_stage)
 
-    assert "my_custom_stage" in REGISTRY.list_stages()
+    assert "my_custom_stage" in test_pipeline.list_stages()
 
 
-def test_register_with_no_deps_or_outs():
+def test_register_with_no_deps_or_outs(test_pipeline: "Pipeline") -> None:
     """Should handle stages with no dependencies or outputs."""
 
     def simple():
@@ -365,13 +366,13 @@ def test_register_with_no_deps_or_outs():
 
     register_test_stage(simple)
 
-    info = REGISTRY.get("simple")
+    info = test_pipeline.get("simple")
     assert info["deps"] == {}
     assert info["deps_paths"] == []
     assert info["outs"] == []
 
 
-def test_register_captures_transitive_dependencies():
+def test_register_captures_transitive_dependencies(test_pipeline: "Pipeline") -> None:
     """Should capture helper function fingerprints."""
 
     def helper(x: int) -> int:
@@ -382,7 +383,7 @@ def test_register_captures_transitive_dependencies():
 
     register_test_stage(my_stage)
 
-    info = REGISTRY.get("my_stage")
+    info = test_pipeline.get("my_stage")
     fp = info["fingerprint"]
     assert "self:my_stage" in fp
     assert "func:helper" in fp
@@ -406,6 +407,7 @@ def test_registry_get_stage():
         dep_specs={},
         out_specs={},
         params_arg_name=None,
+        state_dir=None,
     )
     stage_info = reg.get("test")
     assert stage_info["name"] == "test"
@@ -437,6 +439,7 @@ def test_registry_list_stages():
         dep_specs={},
         out_specs={},
         params_arg_name=None,
+        state_dir=None,
     )
     reg._stages["stage2"] = RegistryStageInfo(
         name="stage2",
@@ -453,6 +456,7 @@ def test_registry_list_stages():
         dep_specs={},
         out_specs={},
         params_arg_name=None,
+        state_dir=None,
     )
     stages = reg.list_stages()
     assert set(stages) == {"stage1", "stage2"}
@@ -484,6 +488,7 @@ def test_registry_clear():
         dep_specs={},
         out_specs={},
         params_arg_name=None,
+        state_dir=None,
     )
     reg.clear()
     assert reg.list_stages() == []
@@ -519,7 +524,7 @@ def test_registry_register_with_custom_name():
     assert info["name"] == "custom_name"
 
 
-def test_stage_duplicate_registration_raises_error():
+def test_stage_duplicate_registration_raises_error(test_pipeline: "Pipeline") -> None:
     """Should raise error when registering two stages with same name."""
 
     def func_one() -> None:
@@ -536,13 +541,13 @@ def test_stage_duplicate_registration_raises_error():
         register_test_stage(func_two, name="my_stage")
 
 
-def test_multiple_stages_registered():
+def test_multiple_stages_registered(test_pipeline: "Pipeline") -> None:
     """Should register multiple stages independently."""
     register_test_stage(_stage1_with_dep, name="stage1")
     register_test_stage(_stage2_with_out, name="stage2")
     register_test_stage(_stage3_no_deps, name="stage3")
 
-    stages = REGISTRY.list_stages()
+    stages = test_pipeline.list_stages()
     assert "stage1" in stages
     assert "stage2" in stages
     assert "stage3" in stages
@@ -558,7 +563,7 @@ def test_stage_captures_user_code_helpers():
     assert "mod:math.pi" not in fp
 
 
-def test_register_captures_constants():
+def test_register_captures_constants(test_pipeline: "Pipeline") -> None:
     """Should capture constant values in fingerprint."""
     LEARNING_RATE = 0.01
 
@@ -567,7 +572,7 @@ def test_register_captures_constants():
 
     register_test_stage(uses_constant)
 
-    info = REGISTRY.get("uses_constant")
+    info = test_pipeline.get("uses_constant")
     fp = info["fingerprint"]
     assert "const:LEARNING_RATE" in fp
 
@@ -626,6 +631,7 @@ def test_registry_snapshot_returns_copy() -> None:
         dep_specs={},
         out_specs={},
         params_arg_name=None,
+        state_dir=None,
     )
 
     snapshot = reg.snapshot()
@@ -661,6 +667,7 @@ def test_registry_restore_replaces_stages() -> None:
         dep_specs={},
         out_specs={},
         params_arg_name=None,
+        state_dir=None,
     )
 
     backup = RegistryStageInfo(
@@ -678,6 +685,7 @@ def test_registry_restore_replaces_stages() -> None:
         dep_specs={},
         out_specs={},
         params_arg_name=None,
+        state_dir=None,
     )
     snapshot = {"backup": backup}
 
@@ -705,6 +713,7 @@ def test_registry_restore_empty_snapshot() -> None:
         dep_specs={},
         out_specs={},
         params_arg_name=None,
+        state_dir=None,
     )
 
     reg.restore({})
@@ -731,6 +740,7 @@ def test_registry_restore_preserves_metadata() -> None:
         dep_specs={},
         out_specs={},
         params_arg_name=None,
+        state_dir=None,
     )
     snapshot = {"original": original}
 
@@ -749,11 +759,11 @@ def test_registry_restore_preserves_metadata() -> None:
 # ==============================================================================
 
 
-def test_stageparams_work() -> None:
+def test_stageparams_work(test_pipeline: "Pipeline") -> None:
     """StageParams should work for stage parameters."""
     register_test_stage(_plain_stage, name="plain_stage", params=PlainParams())
 
-    info = REGISTRY.get("plain_stage")
+    info = test_pipeline.get("plain_stage")
     assert isinstance(info["params"], PlainParams)
     assert info["params"].learning_rate == 0.01
 
@@ -763,7 +773,7 @@ def test_stageparams_work() -> None:
 # ==============================================================================
 
 
-def test_out_path_overrides_accepts_simple_string() -> None:
+def test_out_path_overrides_accepts_simple_string(test_pipeline: "Pipeline") -> None:
     """out_path_overrides should accept simple strings, not just dicts with path key."""
 
     def my_stage() -> _OutputTxt:
@@ -772,11 +782,11 @@ def test_out_path_overrides_accepts_simple_string() -> None:
     # Simple string should work (not {"output": {"path": "override.txt"}})
     register_test_stage(my_stage, out_path_overrides={"output": "override.txt"})
 
-    info = REGISTRY.get("my_stage")
+    info = test_pipeline.get("my_stage")
     assert info["out_specs"]["output"].path == "override.txt"
 
 
-def test_out_path_overrides_accepts_dict_with_options() -> None:
+def test_out_path_overrides_accepts_dict_with_options(test_pipeline: "Pipeline") -> None:
     """out_path_overrides should accept dicts with path and options."""
 
     def my_stage2() -> _OutputTxt:
@@ -787,12 +797,12 @@ def test_out_path_overrides_accepts_dict_with_options() -> None:
         my_stage2, out_path_overrides={"output": {"path": "override.txt", "cache": False}}
     )
 
-    info = REGISTRY.get("my_stage2")
+    info = test_pipeline.get("my_stage2")
     assert info["out_specs"]["output"].path == "override.txt"
     assert info["out_specs"]["output"].cache is False
 
 
-def test_out_path_overrides_accepts_list_paths() -> None:
+def test_out_path_overrides_accepts_list_paths(test_pipeline: Pipeline) -> None:
     """out_path_overrides should accept list paths for multi-file outputs."""
 
     class MultiOutput(TypedDict):
@@ -804,7 +814,7 @@ def test_out_path_overrides_accepts_list_paths() -> None:
     # Simple list should work
     register_test_stage(my_stage3, out_path_overrides={"items": ["x.txt", "y.txt"]})
 
-    info = REGISTRY.get("my_stage3")
+    info = test_pipeline.get("my_stage3")
     assert info["out_specs"]["items"].path == ["x.txt", "y.txt"]
 
 
@@ -817,7 +827,9 @@ class _PlaceholderCompareOutputs(TypedDict):
     result: Annotated[dict[str, int], outputs.Out("result.json", loaders.JSON[dict[str, int]]())]
 
 
-def test_register_placeholder_dep_without_override_raises() -> None:
+def test_register_placeholder_dep_without_override_raises(
+    test_registry: StageRegistry,
+) -> None:
     """Registration should fail when PlaceholderDep has no override."""
 
     def _compare_no_override(
@@ -833,10 +845,12 @@ def test_register_placeholder_dep_without_override_raises() -> None:
     with pytest.raises(
         exceptions.ValidationError, match="Placeholder dependencies missing overrides"
     ):
-        REGISTRY.register(_compare_no_override, name="compare_test_no_override")
+        test_registry.register(_compare_no_override, name="compare_test_no_override")
 
 
-def test_register_placeholder_dep_partial_override_raises() -> None:
+def test_register_placeholder_dep_partial_override_raises(
+    test_registry: StageRegistry,
+) -> None:
     """Registration should fail when only some PlaceholderDeps have overrides."""
 
     def _compare_partial(
@@ -850,14 +864,16 @@ def test_register_placeholder_dep_partial_override_raises() -> None:
         return {"result": {"diff": 0}}
 
     with pytest.raises(exceptions.ValidationError, match="experiment"):
-        REGISTRY.register(
+        test_registry.register(
             _compare_partial,
             name="compare_partial_override",
             dep_path_overrides={"baseline": "model_a/results.csv"},
         )
 
 
-def test_register_placeholder_dep_with_all_overrides_succeeds() -> None:
+def test_register_placeholder_dep_with_all_overrides_succeeds(
+    test_registry: StageRegistry,
+) -> None:
     """Registration should succeed when all PlaceholderDeps have overrides."""
 
     def _compare_success(
@@ -870,7 +886,7 @@ def test_register_placeholder_dep_with_all_overrides_succeeds() -> None:
     ) -> _PlaceholderCompareOutputs:
         return {"result": {"diff": 0}}
 
-    REGISTRY.register(
+    test_registry.register(
         _compare_success,
         name="compare_success_test",
         dep_path_overrides={
@@ -879,13 +895,15 @@ def test_register_placeholder_dep_with_all_overrides_succeeds() -> None:
         },
     )
 
-    info = REGISTRY.get("compare_success_test")
+    info = test_registry.get("compare_success_test")
     assert info is not None
     assert "baseline" in info["deps"]
     assert "experiment" in info["deps"]
 
 
-def test_register_placeholder_dep_error_lists_all_missing() -> None:
+def test_register_placeholder_dep_error_lists_all_missing(
+    test_registry: StageRegistry,
+) -> None:
     """Error message should list all missing placeholder overrides."""
 
     def _compare_many(
@@ -896,7 +914,7 @@ def test_register_placeholder_dep_error_lists_all_missing() -> None:
         return {"result": {"count": 0}}
 
     with pytest.raises(exceptions.ValidationError) as exc_info:
-        REGISTRY.register(_compare_many, name="compare_many_test")
+        test_registry.register(_compare_many, name="compare_many_test")
 
     # All three should be mentioned in the error
     error_msg = str(exc_info.value)
@@ -905,7 +923,9 @@ def test_register_placeholder_dep_error_lists_all_missing() -> None:
     assert "c" in error_msg
 
 
-def test_register_placeholder_dep_typo_suggests_correction() -> None:
+def test_register_placeholder_dep_typo_suggests_correction(
+    test_registry: StageRegistry,
+) -> None:
     """Error message should suggest correction for typos in override keys."""
 
     def _compare_typo(
@@ -919,7 +939,7 @@ def test_register_placeholder_dep_typo_suggests_correction() -> None:
         return {"result": {"count": 0}}
 
     with pytest.raises(exceptions.ValidationError) as exc_info:
-        REGISTRY.register(
+        test_registry.register(
             _compare_typo,
             name="compare_typo_test",
             dep_path_overrides={
@@ -932,3 +952,35 @@ def test_register_placeholder_dep_typo_suggests_correction() -> None:
     assert "baseline" in error_msg  # missing param
     assert "Did you mean" in error_msg  # fuzzy suggestion
     assert "'basline' -> 'baseline'" in error_msg  # specific suggestion
+
+
+# ==============================================================================
+# state_dir field tests (multi-pipeline support)
+# ==============================================================================
+
+
+def test_registry_stage_info_has_state_dir() -> None:
+    """RegistryStageInfo should include state_dir field."""
+    reg = StageRegistry()
+
+    def my_stage() -> None:
+        pass
+
+    state_dir = pathlib.Path("/tmp/test_pipeline/.pivot")
+    reg.register(my_stage, name="my_stage", state_dir=state_dir)
+
+    info = reg.get("my_stage")
+    assert info["state_dir"] == state_dir
+
+
+def test_registry_stage_info_state_dir_defaults_to_none() -> None:
+    """state_dir should default to None when not specified."""
+    reg = StageRegistry()
+
+    def my_stage() -> None:
+        pass
+
+    reg.register(my_stage, name="my_stage")
+
+    info = reg.get("my_stage")
+    assert info["state_dir"] is None

@@ -16,8 +16,8 @@ from pivot.cli import decorators as cli_decorators
 @cli_decorators.pivot_command()
 def list_cmd() -> None:
     """List registered stages."""
-    # Registry is guaranteed to be populated here
-    stages = registry.REGISTRY.list_stages()
+    # Pipeline is guaranteed to be in context here
+    stages = cli_helpers.list_stages()
     ...
 
 # Command that doesn't need the registry

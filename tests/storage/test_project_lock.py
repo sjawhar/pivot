@@ -3,12 +3,16 @@ from __future__ import annotations
 import pathlib
 import threading
 import time
-from typing import Annotated, TypedDict
+from typing import TYPE_CHECKING, Annotated, TypedDict
 
 import filelock
 import pytest
 
 from helpers import register_test_stage
+
+if TYPE_CHECKING:
+    from pivot.pipeline.pipeline import Pipeline
+
 from pivot import executor, loaders, outputs, project
 from pivot.executor import commit as commit_mod
 from pivot.storage import project_lock
@@ -222,7 +226,9 @@ def _slow_stage_impl(
     return _SlowStageOutput(output=output_path)
 
 
-def test_commit_blocks_during_no_commit_execution(pipeline_dir: pathlib.Path) -> None:
+def test_commit_blocks_during_no_commit_execution(
+    pipeline_dir: pathlib.Path, test_pipeline: Pipeline
+) -> None:
     """acquire_pending_state_lock blocks while executor.run(no_commit=True) holds the lock."""
     # Create a stage that runs for a measurable duration
     pathlib.Path("input.txt").write_text("data")
@@ -243,7 +249,7 @@ def test_commit_blocks_during_no_commit_execution(pipeline_dir: pathlib.Path) ->
     def run_execution() -> None:
         try:
             execution_started.set()
-            executor.run(no_commit=True)
+            executor.run(no_commit=True, pipeline=test_pipeline)
         except Exception as e:
             errors["exec"] = e
 
@@ -309,7 +315,7 @@ def _stage2_impl(
     return _Stage2Output(output2=output_path)
 
 
-def test_concurrent_commits_serialize(pipeline_dir: pathlib.Path) -> None:
+def test_concurrent_commits_serialize(pipeline_dir: pathlib.Path, test_pipeline: Pipeline) -> None:
     """Multiple concurrent commit attempts serialize correctly."""
     # Create multiple stages
     pathlib.Path("input1.txt").write_text("data1")
@@ -329,7 +335,7 @@ def test_concurrent_commits_serialize(pipeline_dir: pathlib.Path) -> None:
     register_test_stage(stage2)
 
     # Run with --no-commit
-    executor.run(no_commit=True)
+    executor.run(no_commit=True, pipeline=test_pipeline)
 
     # Now try two concurrent commits
     results = list[tuple[str, list[str]]]()

@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import click
 
-from pivot import config, exceptions, registry
+from pivot import config, exceptions
 from pivot.cli import completion
 from pivot.cli import decorators as cli_decorators
+from pivot.cli import helpers as cli_helpers
 from pivot.show import params as params_mod
 from pivot.types import OutputFormat
 
@@ -39,7 +40,7 @@ def params_show(
     result = params_mod.collect_params_from_stages(stages_list)
 
     if result["unknown_stages"]:
-        available = registry.REGISTRY.list_stages()
+        available = cli_helpers.list_stages()
         raise exceptions.StageNotFoundError(result["unknown_stages"], available_stages=available)
 
     output = params_mod.format_params_table(result["params"], output_format, precision)
@@ -73,7 +74,7 @@ def params_diff(
     workspace_result = params_mod.collect_params_from_stages(stages_list)
 
     if workspace_result["unknown_stages"]:
-        available = registry.REGISTRY.list_stages()
+        available = cli_helpers.list_stages()
         raise exceptions.StageNotFoundError(
             workspace_result["unknown_stages"], available_stages=available
         )

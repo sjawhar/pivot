@@ -4,12 +4,11 @@ import dataclasses
 import functools
 import logging
 import pathlib
-import subprocess
 from typing import TYPE_CHECKING, Any
 
 import yaml
 
-from pivot import exceptions, loaders, outputs, project, registry
+from pivot import exceptions, loaders, outputs, project
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -212,19 +211,22 @@ def export_dvc_yaml(
     Raises:
         ExportError: If export fails or requested stages don't exist
     """
+    from pivot.cli import helpers as cli_helpers
+
     path = pathlib.Path(path)
     root = project.get_project_root()
 
     # Validate requested stages exist
+    available_stages = cli_helpers.list_stages()
     if stages is None:
-        stages = registry.REGISTRY.list_stages()
+        stages = available_stages
     else:
-        all_stages = {*registry.REGISTRY.list_stages()}
-        missing = [name for name in stages if name not in all_stages]
+        all_stages_set = set(available_stages)
+        missing = [name for name in stages if name not in all_stages_set]
         if missing:
             raise exceptions.ExportError(f"Stages not found: {missing}")
 
-    stage_dict = {name: registry.REGISTRY.get(name) for name in stages}
+    stage_dict = {name: cli_helpers.get_stage(name) for name in stages}
     if not stage_dict:
         raise exceptions.ExportError("No stages registered to export")
 
@@ -271,7 +273,7 @@ def _get_dvc_repo(root: pathlib.Path) -> Any:
 
 def import_dvc_yaml(
     path: pathlib.Path | str,
-    register: bool = True,
+    register: bool = False,
 ) -> dict[str, StageSpec]:
     """Parse dvc.yaml using DVC and optionally register stages with Pivot.
 
@@ -279,7 +281,7 @@ def import_dvc_yaml(
 
     Args:
         path: Path to dvc.yaml
-        register: If True, auto-register stages (default). If False, just return specs.
+        register: If True, auto-register stages. If False, just return specs (default).
 
     Returns:
         Dict of stage_name -> StageSpec
@@ -372,40 +374,14 @@ def _extract_dvc_params(stage: PipelineStage) -> dict[str, Any]:  # pragma: no c
     return params
 
 
-def _register_imported_stage(spec: StageSpec) -> None:  # pragma: no cover
-    """Register an imported DVC stage with Pivot."""
-    _register_imported_stage_with_name(spec, spec.name)
+def _register_imported_stage(_spec: StageSpec) -> None:  # pragma: no cover
+    """Register an imported DVC stage with Pivot.
 
-
-def _register_imported_stage_with_name(
-    spec: StageSpec,
-    name: str,
-    mutex: list[str] | None = None,
-) -> None:  # pragma: no cover
-    """Register imported DVC stage with explicit name (for collision handling)."""
-    # Use spec.wdir if set, otherwise fall back to project root
-    wdir = spec.wdir if spec.wdir else project.get_project_root()
-
-    # DVC supports multi-command stages as lists - run each in wdir
-    # (check=True ensures we stop on first failure, like && would)
-    commands = spec.cmd if isinstance(spec.cmd, list) else [spec.cmd]
-
-    def wrapper() -> None:
-        for cmd in commands:
-            subprocess.run(cmd, shell=True, check=True, cwd=wdir)  # noqa: S602
-
-    wrapper.__name__ = name
-    wrapper.__module__ = "pivot.dvc_compat"
-
-    # DVC compat stages use shell commands which can't have annotation-based deps/outs.
-    # Deps/outs from DVC YAML are not registered - users should migrate to Python stages.
-    if spec.deps or spec.outs:
-        logger.warning(
-            "DVC compat stage '%s' has deps/outs defined in DVC YAML. These will NOT be tracked for DAG purposes. Migrate to Python annotation-based stages for proper dependency tracking.",
-            name,
-        )
-    registry.REGISTRY.register(
-        wrapper,
-        name=name,
-        mutex=mutex,
+    Note: This functionality is deprecated. The global REGISTRY has been removed.
+    Use Pipeline.register() directly instead.
+    """
+    raise NotImplementedError(
+        "DVC stage import with automatic registration is no longer supported. "
+        + "Use import_dvc_yaml(path, register=False) and register stages manually "
+        + "with Pipeline.register()."
     )

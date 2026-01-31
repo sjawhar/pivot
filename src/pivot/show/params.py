@@ -44,19 +44,19 @@ def collect_params_from_stages(
 
     Returns CollectResult with params dict and list of unknown stage names.
     """
-    from pivot import registry
+    from pivot.cli import helpers as cli_helpers
 
     result = dict[str, StageParams]()
     unknown_stages = list[str]()
     overrides = parameters.load_params_yaml()
 
-    available_stages = set(registry.REGISTRY.list_stages())
+    available_stages = set(cli_helpers.list_stages())
     stage_list = list(stages) if stages else list(available_stages)
     for stage_name in stage_list:
         if stage_name not in available_stages:
             unknown_stages.append(stage_name)
             continue
-        stage_info = registry.REGISTRY.get(stage_name)
+        stage_info = cli_helpers.get_stage(stage_name)
         effective = parameters.get_effective_params(stage_info["params"], stage_name, overrides)
         if effective:
             result[stage_name] = cast("StageParams", effective)
@@ -78,11 +78,11 @@ def get_params_from_head(
 
     Returns HeadResult with params dict and git availability flag.
     """
-    from pivot import registry
+    from pivot.cli import helpers as cli_helpers
 
     result = dict[str, StageParams]()
 
-    stage_list = list(stages) if stages else registry.REGISTRY.list_stages()
+    stage_list = list(stages) if stages else cli_helpers.list_stages()
     if not stage_list:
         return HeadResult(params=result, git_available=True)
 

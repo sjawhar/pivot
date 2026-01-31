@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from conftest import stage_module_isolation
-from pivot import project, registry
+from pivot import project
 from pivot.pipeline import yaml as pipeline_config
 
 if TYPE_CHECKING:
@@ -136,9 +136,9 @@ def test_load_pipeline_file_with_params(params_pipeline: pathlib.Path) -> None:
 def test_register_simple_stages(simple_pipeline: pathlib.Path) -> None:
     """Register stages from simple pivot.yaml into registry."""
     pipeline_file = simple_pipeline / "pivot.yaml"
-    pipeline_config.register_from_pipeline_file(pipeline_file)
+    pipeline = pipeline_config.load_pipeline_from_yaml(pipeline_file)
 
-    stages = registry.REGISTRY.list_stages()
+    stages = pipeline.list_stages()
     assert "preprocess" in stages
     assert "train" in stages
 
@@ -146,9 +146,9 @@ def test_register_simple_stages(simple_pipeline: pathlib.Path) -> None:
 def test_registered_stage_has_correct_deps(simple_pipeline: pathlib.Path) -> None:
     """Registered stage has correct dependencies."""
     pipeline_file = simple_pipeline / "pivot.yaml"
-    pipeline_config.register_from_pipeline_file(pipeline_file)
+    pipeline = pipeline_config.load_pipeline_from_yaml(pipeline_file)
 
-    info = registry.REGISTRY.get("preprocess")
+    info = pipeline.get("preprocess")
     # Deps should be normalized to absolute paths
     assert any("data/raw.csv" in dep for dep in info["deps_paths"])
 
@@ -156,18 +156,18 @@ def test_registered_stage_has_correct_deps(simple_pipeline: pathlib.Path) -> Non
 def test_registered_stage_has_correct_outs(simple_pipeline: pathlib.Path) -> None:
     """Registered stage has correct outputs."""
     pipeline_file = simple_pipeline / "pivot.yaml"
-    pipeline_config.register_from_pipeline_file(pipeline_file)
+    pipeline = pipeline_config.load_pipeline_from_yaml(pipeline_file)
 
-    info = registry.REGISTRY.get("preprocess")
+    info = pipeline.get("preprocess")
     assert any("data/clean.csv" in out for out in info["outs_paths"])
 
 
 def test_registered_stage_function_is_callable(simple_pipeline: pathlib.Path) -> None:
     """Registered stage function is the actual imported function."""
     pipeline_file = simple_pipeline / "pivot.yaml"
-    pipeline_config.register_from_pipeline_file(pipeline_file)
+    pipeline = pipeline_config.load_pipeline_from_yaml(pipeline_file)
 
-    info = registry.REGISTRY.get("preprocess")
+    info = pipeline.get("preprocess")
     assert callable(info["func"])
     assert info["func"].__name__ == "preprocess"
 
@@ -180,9 +180,9 @@ def test_registered_stage_function_is_callable(simple_pipeline: pathlib.Path) ->
 def test_params_introspected_from_signature(params_pipeline: pathlib.Path) -> None:
     """Params class is introspected from function signature."""
     pipeline_file = params_pipeline / "pivot.yaml"
-    pipeline_config.register_from_pipeline_file(pipeline_file)
+    pipeline = pipeline_config.load_pipeline_from_yaml(pipeline_file)
 
-    info = registry.REGISTRY.get("train")
+    info = pipeline.get("train")
     params = info["params"]
     assert params is not None
     assert params.__class__.__name__ == "TrainParams"
@@ -191,9 +191,9 @@ def test_params_introspected_from_signature(params_pipeline: pathlib.Path) -> No
 def test_params_values_from_yaml_override_defaults(params_pipeline: pathlib.Path) -> None:
     """Params values from pivot.yaml override class defaults."""
     pipeline_file = params_pipeline / "pivot.yaml"
-    pipeline_config.register_from_pipeline_file(pipeline_file)
+    pipeline = pipeline_config.load_pipeline_from_yaml(pipeline_file)
 
-    info = registry.REGISTRY.get("train")
+    info = pipeline.get("train")
     params = info["params"]
     assert params is not None, "Expected params to be set"
 
@@ -207,9 +207,9 @@ def test_params_values_from_yaml_override_defaults(params_pipeline: pathlib.Path
 def test_stage_without_params_has_none(simple_pipeline: pathlib.Path) -> None:
     """Stage without params parameter has params=None."""
     pipeline_file = simple_pipeline / "pivot.yaml"
-    pipeline_config.register_from_pipeline_file(pipeline_file)
+    pipeline = pipeline_config.load_pipeline_from_yaml(pipeline_file)
 
-    info = registry.REGISTRY.get("preprocess")
+    info = pipeline.get("preprocess")
     assert info["params"] is None
 
 
@@ -225,7 +225,7 @@ def test_error_if_params_in_yaml_but_no_signature(simple_pipeline: pathlib.Path)
     pipeline_file.write_text(config_text)
 
     with pytest.raises(pipeline_config.PipelineConfigError, match="has no StageParams parameter"):
-        pipeline_config.register_from_pipeline_file(pipeline_file)
+        pipeline_config.load_pipeline_from_yaml(pipeline_file)
 
 
 def test_error_if_params_parameter_has_no_type_hint(
@@ -246,7 +246,7 @@ def test_error_if_params_parameter_has_no_type_hint(
     pipeline_file = params_pipeline / "pivot.yaml"
     # With type-based detection, untyped params won't be detected as StageParams
     with pytest.raises(pipeline_config.PipelineConfigError, match="has no StageParams parameter"):
-        pipeline_config.register_from_pipeline_file(pipeline_file)
+        pipeline_config.load_pipeline_from_yaml(pipeline_file)
 
 
 # =============================================================================
@@ -257,9 +257,9 @@ def test_error_if_params_parameter_has_no_type_hint(
 def test_matrix_expands_to_variants(matrix_pipeline: pathlib.Path) -> None:
     """Matrix config expands to multiple variant stages."""
     pipeline_file = matrix_pipeline / "pivot.yaml"
-    pipeline_config.register_from_pipeline_file(pipeline_file)
+    pipeline = pipeline_config.load_pipeline_from_yaml(pipeline_file)
 
-    stages = registry.REGISTRY.list_stages()
+    stages = pipeline.list_stages()
 
     # Should have preprocess + 4 train variants (2 models x 2 datasets)
     assert "preprocess" in stages
@@ -273,9 +273,9 @@ def test_matrix_expands_to_variants(matrix_pipeline: pathlib.Path) -> None:
 def test_matrix_variant_has_interpolated_deps(matrix_pipeline: pathlib.Path) -> None:
     """Matrix variant has ${dim} interpolated in deps."""
     pipeline_file = matrix_pipeline / "pivot.yaml"
-    pipeline_config.register_from_pipeline_file(pipeline_file)
+    pipeline = pipeline_config.load_pipeline_from_yaml(pipeline_file)
 
-    info = registry.REGISTRY.get("train@bert_swe")
+    info = pipeline.get("train@bert_swe")
     deps_str = " ".join(info["deps_paths"])
 
     assert "configs/bert.yaml" in deps_str
@@ -287,9 +287,9 @@ def test_matrix_variant_has_interpolated_deps(matrix_pipeline: pathlib.Path) -> 
 def test_matrix_variant_has_interpolated_outs(matrix_pipeline: pathlib.Path) -> None:
     """Matrix variant has ${dim} interpolated in outs."""
     pipeline_file = matrix_pipeline / "pivot.yaml"
-    pipeline_config.register_from_pipeline_file(pipeline_file)
+    pipeline = pipeline_config.load_pipeline_from_yaml(pipeline_file)
 
-    info = registry.REGISTRY.get("train@bert_swe")
+    info = pipeline.get("train@bert_swe")
     outs_str = " ".join(info["outs_paths"])
 
     assert "models/bert_swe.pkl" in outs_str
@@ -299,9 +299,9 @@ def test_matrix_variant_has_interpolated_outs(matrix_pipeline: pathlib.Path) -> 
 def test_matrix_variant_has_interpolated_params(matrix_pipeline: pathlib.Path) -> None:
     """Matrix variant has ${dim} interpolated in params values."""
     pipeline_file = matrix_pipeline / "pivot.yaml"
-    pipeline_config.register_from_pipeline_file(pipeline_file)
+    pipeline = pipeline_config.load_pipeline_from_yaml(pipeline_file)
 
-    info = registry.REGISTRY.get("train@bert_swe")
+    info = pipeline.get("train@bert_swe")
     params = info["params"]
     assert params is not None
 
@@ -311,10 +311,10 @@ def test_matrix_variant_has_interpolated_params(matrix_pipeline: pathlib.Path) -
 def test_matrix_dict_dimension_applies_overrides(matrix_pipeline: pathlib.Path) -> None:
     """Dict dimension applies overrides to specific variants."""
     pipeline_file = matrix_pipeline / "pivot.yaml"
-    pipeline_config.register_from_pipeline_file(pipeline_file)
+    pipeline = pipeline_config.load_pipeline_from_yaml(pipeline_file)
 
-    bert_info = registry.REGISTRY.get("train@bert_swe")
-    gpt_info = registry.REGISTRY.get("train@gpt_swe")
+    bert_info = pipeline.get("train@bert_swe")
+    gpt_info = pipeline.get("train@gpt_swe")
     bert_params = bert_info["params"]
     gpt_params = gpt_info["params"]
     assert bert_params is not None
@@ -328,11 +328,11 @@ def test_matrix_dict_dimension_applies_overrides(matrix_pipeline: pathlib.Path) 
 def test_matrix_list_dimension_uses_value_as_key(matrix_pipeline: pathlib.Path) -> None:
     """List dimension uses primitive value as key (no overrides)."""
     pipeline_file = matrix_pipeline / "pivot.yaml"
-    pipeline_config.register_from_pipeline_file(pipeline_file)
+    pipeline = pipeline_config.load_pipeline_from_yaml(pipeline_file)
 
     # Both swe and human variants should exist
-    assert "train@bert_swe" in registry.REGISTRY.list_stages()
-    assert "train@bert_human" in registry.REGISTRY.list_stages()
+    assert "train@bert_swe" in pipeline.list_stages()
+    assert "train@bert_human" in pipeline.list_stages()
 
 
 # =============================================================================
@@ -343,9 +343,9 @@ def test_matrix_list_dimension_uses_value_as_key(matrix_pipeline: pathlib.Path) 
 def test_dag_built_from_registered_stages(simple_pipeline: pathlib.Path) -> None:
     """DAG can be built from registered stages."""
     pipeline_file = simple_pipeline / "pivot.yaml"
-    pipeline_config.register_from_pipeline_file(pipeline_file)
+    pipeline = pipeline_config.load_pipeline_from_yaml(pipeline_file)
 
-    dag = registry.REGISTRY.build_dag()
+    dag = pipeline.build_dag()
 
     # train depends on preprocess (via data/clean.csv)
     assert dag.has_edge("train", "preprocess")
@@ -354,9 +354,9 @@ def test_dag_built_from_registered_stages(simple_pipeline: pathlib.Path) -> None
 def test_matrix_dag_has_correct_dependencies(matrix_pipeline: pathlib.Path) -> None:
     """Matrix variants have correct dependencies in DAG."""
     pipeline_file = matrix_pipeline / "pivot.yaml"
-    pipeline_config.register_from_pipeline_file(pipeline_file)
+    pipeline = pipeline_config.load_pipeline_from_yaml(pipeline_file)
 
-    dag = registry.REGISTRY.build_dag()
+    dag = pipeline.build_dag()
 
     # All train variants depend on preprocess (via data/clean.csv)
     assert dag.has_edge("train@bert_swe", "preprocess")
@@ -406,7 +406,7 @@ stages:
     )
 
     with pytest.raises(pipeline_config.PipelineConfigError, match="module.function"):
-        pipeline_config.register_from_pipeline_file(pipeline_file)
+        pipeline_config.load_pipeline_from_yaml(pipeline_file)
 
 
 def test_import_nonexistent_module_raises(tmp_path: pathlib.Path) -> None:
@@ -423,7 +423,7 @@ stages:
     )
 
     with pytest.raises(pipeline_config.PipelineConfigError, match="import module"):
-        pipeline_config.register_from_pipeline_file(pipeline_file)
+        pipeline_config.load_pipeline_from_yaml(pipeline_file)
 
 
 def test_import_nonexistent_function_raises(tmp_path: pathlib.Path) -> None:
@@ -440,7 +440,7 @@ stages:
     )
 
     with pytest.raises(pipeline_config.PipelineConfigError, match="no function"):
-        pipeline_config.register_from_pipeline_file(pipeline_file)
+        pipeline_config.load_pipeline_from_yaml(pipeline_file)
 
 
 def test_import_non_callable_raises(tmp_path: pathlib.Path) -> None:
@@ -457,7 +457,7 @@ stages:
     )
 
     with pytest.raises(pipeline_config.PipelineConfigError, match="not callable"):
-        pipeline_config.register_from_pipeline_file(pipeline_file)
+        pipeline_config.load_pipeline_from_yaml(pipeline_file)
 
 
 # =============================================================================
@@ -482,9 +482,9 @@ stages:
 """
     )
 
-    pipeline_config.register_from_pipeline_file(pipeline_file)
+    pipeline = pipeline_config.load_pipeline_from_yaml(pipeline_file)
 
-    info = registry.REGISTRY.get("preprocess")
+    info = pipeline.get("preprocess")
     out = info["outs"][0]
     assert isinstance(out, outputs.Out)
     assert out.cache is False
@@ -524,9 +524,9 @@ stages:
     if "stages" in sys.modules:
         del sys.modules["stages"]
 
-    pipeline_config.register_from_pipeline_file(pipeline_file)
+    pipeline = pipeline_config.load_pipeline_from_yaml(pipeline_file)
 
-    info = registry.REGISTRY.get("preprocess")
+    info = pipeline.get("preprocess")
     # Should have 2 outputs registered
     assert len(info["outs"]) == 2
     paths = " ".join(info["outs_paths"])
@@ -557,7 +557,7 @@ stages:
     )
 
     with pytest.raises(pipeline_config.PipelineConfigError, match="empty"):
-        pipeline_config.register_from_pipeline_file(pipeline_file)
+        pipeline_config.load_pipeline_from_yaml(pipeline_file)
 
 
 def test_matrix_empty_dimension_dict_raises(simple_pipeline: pathlib.Path) -> None:
@@ -578,7 +578,7 @@ stages:
     )
 
     with pytest.raises(pipeline_config.PipelineConfigError, match="empty"):
-        pipeline_config.register_from_pipeline_file(pipeline_file)
+        pipeline_config.load_pipeline_from_yaml(pipeline_file)
 
 
 def test_matrix_unresolved_variable_raises(simple_pipeline: pathlib.Path) -> None:
@@ -600,7 +600,7 @@ stages:
     )
 
     with pytest.raises(pipeline_config.PipelineConfigError, match="unresolved"):
-        pipeline_config.register_from_pipeline_file(pipeline_file)
+        pipeline_config.load_pipeline_from_yaml(pipeline_file)
 
 
 def test_matrix_interpolates_plots(simple_pipeline: pathlib.Path) -> None:
@@ -637,10 +637,10 @@ stages:
 """
     )
 
-    pipeline_config.register_from_pipeline_file(pipeline_file)
+    pipeline = pipeline_config.load_pipeline_from_yaml(pipeline_file)
 
-    bert_info = registry.REGISTRY.get("train@bert")
-    gpt_info = registry.REGISTRY.get("train@gpt")
+    bert_info = pipeline.get("train@bert")
+    gpt_info = pipeline.get("train@gpt")
 
     # Plot paths should be interpolated
     assert any("plots/bert_curve.png" in p for p in bert_info["outs_paths"])
@@ -683,10 +683,10 @@ stages:
 """
     )
 
-    pipeline_config.register_from_pipeline_file(pipeline_file)
+    pipeline = pipeline_config.load_pipeline_from_yaml(pipeline_file)
 
-    bert_info = registry.REGISTRY.get("train@bert")
-    gpt_info = registry.REGISTRY.get("train@gpt")
+    bert_info = pipeline.get("train@bert")
+    gpt_info = pipeline.get("train@gpt")
 
     # Metric paths should be interpolated
     assert any("metrics/bert_results.json" in p for p in bert_info["outs_paths"])
@@ -734,7 +734,7 @@ stages:
     )
 
     with pytest.raises(pipeline_config.PipelineConfigError, match="unresolved"):
-        pipeline_config.register_from_pipeline_file(pipeline_file)
+        pipeline_config.load_pipeline_from_yaml(pipeline_file)
 
 
 def test_matrix_name_template_missing_dimensions_raises(
@@ -762,7 +762,7 @@ stages:
     )
 
     with pytest.raises(pipeline_config.PipelineConfigError, match="missing dimensions"):
-        pipeline_config.register_from_pipeline_file(pipeline_file)
+        pipeline_config.load_pipeline_from_yaml(pipeline_file)
 
 
 def test_matrix_name_template_unknown_variables_raises(
@@ -787,7 +787,7 @@ stages:
     )
 
     with pytest.raises(pipeline_config.PipelineConfigError, match="unknown variables"):
-        pipeline_config.register_from_pipeline_file(pipeline_file)
+        pipeline_config.load_pipeline_from_yaml(pipeline_file)
 
 
 def test_matrix_name_with_at_but_no_template_raises(
@@ -811,7 +811,7 @@ stages:
     )
 
     with pytest.raises(pipeline_config.PipelineConfigError, match="no template"):
-        pipeline_config.register_from_pipeline_file(pipeline_file)
+        pipeline_config.load_pipeline_from_yaml(pipeline_file)
 
 
 # =============================================================================
@@ -864,9 +864,9 @@ stages:
 """
     )
 
-    pipeline_config.register_from_pipeline_file(pipeline_file)
+    pipeline = pipeline_config.load_pipeline_from_yaml(pipeline_file)
 
-    stages = registry.REGISTRY.list_stages()
+    stages = pipeline.list_stages()
     assert "train@v1" in stages
     assert "train@v2" in stages
 
@@ -900,7 +900,7 @@ stages:
     )
 
     with pytest.raises(pipeline_config.PipelineConfigError, match="must return a list"):
-        pipeline_config.register_from_pipeline_file(pipeline_file)
+        pipeline_config.load_pipeline_from_yaml(pipeline_file)
 
 
 def test_variants_function_unknown_keys_raises(
@@ -940,7 +940,7 @@ stages:
     )
 
     with pytest.raises(pipeline_config.PipelineConfigError, match="unknown keys.*parmas"):
-        pipeline_config.register_from_pipeline_file(pipeline_file)
+        pipeline_config.load_pipeline_from_yaml(pipeline_file)
 
 
 # =============================================================================
@@ -991,10 +991,10 @@ stages:
     if "stages" in sys.modules:
         del sys.modules["stages"]
 
-    pipeline_config.register_from_pipeline_file(pipeline_file)
+    pipeline = pipeline_config.load_pipeline_from_yaml(pipeline_file)
 
-    bert_info = registry.REGISTRY.get("train@bert")
-    gpt_info = registry.REGISTRY.get("train@gpt")
+    bert_info = pipeline.get("train@bert")
+    gpt_info = pipeline.get("train@gpt")
 
     # Each variant has 2 outputs with interpolated paths
     assert len(bert_info["outs"]) == 2
@@ -1051,10 +1051,10 @@ stages:
     if "stages" in sys.modules:
         del sys.modules["stages"]
 
-    pipeline_config.register_from_pipeline_file(pipeline_file)
+    pipeline = pipeline_config.load_pipeline_from_yaml(pipeline_file)
 
-    bert_info = registry.REGISTRY.get("train@bert")
-    gpt_info = registry.REGISTRY.get("train@gpt")
+    bert_info = pipeline.get("train@bert")
+    gpt_info = pipeline.get("train@gpt")
 
     # Each variant has 2 outputs with interpolated paths
     assert len(bert_info["outs"]) == 2
@@ -1112,10 +1112,10 @@ stages:
 """
     )
 
-    pipeline_config.register_from_pipeline_file(pipeline_file)
+    pipeline = pipeline_config.load_pipeline_from_yaml(pipeline_file)
 
-    bert_info = registry.REGISTRY.get("train@bert")
-    gpt_info = registry.REGISTRY.get("train@gpt")
+    bert_info = pipeline.get("train@bert")
+    gpt_info = pipeline.get("train@gpt")
 
     # Both variants have their mutex list replaced (not merged with base)
     assert bert_info["mutex"] == ["cpu"]
@@ -1161,10 +1161,10 @@ stages:
 """
     )
 
-    pipeline_config.register_from_pipeline_file(pipeline_file)
+    pipeline = pipeline_config.load_pipeline_from_yaml(pipeline_file)
 
-    bert_info = registry.REGISTRY.get("train@bert")
-    gpt_info = registry.REGISTRY.get("train@gpt")
+    bert_info = pipeline.get("train@bert")
+    gpt_info = pipeline.get("train@gpt")
 
     # Each variant has its out path interpolated
     assert len(bert_info["outs_paths"]) == 1
@@ -1220,9 +1220,9 @@ stages:
 """
     )
 
-    pipeline_config.register_from_pipeline_file(pipeline_file)
+    pipeline = pipeline_config.load_pipeline_from_yaml(pipeline_file)
 
-    info = registry.REGISTRY.get("train@bert")
+    info = pipeline.get("train@bert")
     params = info["params"]
     assert params is not None
 
@@ -1267,9 +1267,9 @@ stages:
 """
     )
 
-    pipeline_config.register_from_pipeline_file(pipeline_file)
+    pipeline = pipeline_config.load_pipeline_from_yaml(pipeline_file)
 
-    info = registry.REGISTRY.get("train@bert")
+    info = pipeline.get("train@bert")
     assert "models/bert.pkl" in info["outs_paths"][0]
 
 
@@ -1321,14 +1321,14 @@ stages:
 """
     )
 
-    pipeline_config.register_from_pipeline_file(pipeline_file)
+    pipeline = pipeline_config.load_pipeline_from_yaml(pipeline_file)
 
-    stages = registry.REGISTRY.list_stages()
+    stages = pipeline.list_stages()
     assert "train@True" in stages
     assert "train@False" in stages
 
-    true_info = registry.REGISTRY.get("train@True")
-    false_info = registry.REGISTRY.get("train@False")
+    true_info = pipeline.get("train@True")
+    false_info = pipeline.get("train@False")
 
     # Params should preserve boolean type
     assert true_info["params"] is not None
@@ -1386,14 +1386,14 @@ stages:
 """
     )
 
-    pipeline_config.register_from_pipeline_file(pipeline_file)
+    pipeline = pipeline_config.load_pipeline_from_yaml(pipeline_file)
 
-    stages = registry.REGISTRY.list_stages()
+    stages = pipeline.list_stages()
     assert "train@16" in stages
     assert "train@32" in stages
 
-    info_16 = registry.REGISTRY.get("train@16")
-    info_32 = registry.REGISTRY.get("train@32")
+    info_16 = pipeline.get("train@16")
+    info_32 = pipeline.get("train@32")
 
     # Params should preserve int type
     assert info_16["params"] is not None
@@ -1453,14 +1453,14 @@ stages:
 """
     )
 
-    pipeline_config.register_from_pipeline_file(pipeline_file)
+    pipeline = pipeline_config.load_pipeline_from_yaml(pipeline_file)
 
-    stages = registry.REGISTRY.list_stages()
+    stages = pipeline.list_stages()
     assert "train@0.001" in stages
     assert "train@0.01" in stages
 
-    info_001 = registry.REGISTRY.get("train@0.001")
-    info_01 = registry.REGISTRY.get("train@0.01")
+    info_001 = pipeline.get("train@0.001")
+    info_01 = pipeline.get("train@0.01")
 
     # Params should preserve float type
     assert info_001["params"] is not None
@@ -1519,9 +1519,9 @@ stages:
 """
     )
 
-    pipeline_config.register_from_pipeline_file(pipeline_file)
+    pipeline = pipeline_config.load_pipeline_from_yaml(pipeline_file)
 
-    info = registry.REGISTRY.get("train@0.001")
+    info = pipeline.get("train@0.001")
 
     # Params validation
     assert info["params"] is not None
@@ -1575,9 +1575,9 @@ stages:
     if "stages" in sys.modules:
         del sys.modules["stages"]
 
-    pipeline_config.register_from_pipeline_file(pipeline_file)
+    pipeline = pipeline_config.load_pipeline_from_yaml(pipeline_file)
 
-    info = registry.REGISTRY.get("preprocess")
+    info = pipeline.get("preprocess")
     paths = info["outs_paths"]
     assert len(paths) == 2
     assert any("out/a.csv" in p for p in paths)
@@ -1621,10 +1621,149 @@ stages:
     if "stages" in sys.modules:
         del sys.modules["stages"]
 
-    pipeline_config.register_from_pipeline_file(pipeline_file)
+    pipeline = pipeline_config.load_pipeline_from_yaml(pipeline_file)
 
-    info = registry.REGISTRY.get("preprocess@bert")
+    info = pipeline.get("preprocess@bert")
     paths = info["outs_paths"]
     assert len(paths) == 2
     assert any("out/bert/a.csv" in p for p in paths)
     assert any("out/bert/b.csv" in p for p in paths)
+
+
+# =============================================================================
+# load_pipeline_from_yaml Tests (Task 6)
+# =============================================================================
+
+
+def test_load_pipeline_from_yaml_creates_pipeline(simple_pipeline: pathlib.Path) -> None:
+    """load_pipeline_from_yaml should return a Pipeline instance."""
+    from pivot.pipeline.pipeline import Pipeline
+
+    pipeline_file = simple_pipeline / "pivot.yaml"
+
+    result = pipeline_config.load_pipeline_from_yaml(pipeline_file)
+
+    assert isinstance(result, Pipeline)
+    assert result.root == simple_pipeline
+
+
+def test_load_pipeline_from_yaml_uses_pipeline_name(tmp_path: pathlib.Path) -> None:
+    """load_pipeline_from_yaml should use 'pipeline' field for name if present."""
+    # Create a simple stage module
+    stages_py = tmp_path / "stages.py"
+    stages_py.write_text(
+        """\
+import pathlib
+from typing import Annotated, TypedDict
+from pivot import loaders, outputs
+
+class ProcessOutputs(TypedDict):
+    out: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
+
+def process() -> ProcessOutputs:
+    return {"out": pathlib.Path("output.txt")}
+"""
+    )
+
+    yaml_content = """\
+pipeline: my_custom_name
+stages:
+  process:
+    python: stages.process
+"""
+    yaml_path = tmp_path / "pivot.yaml"
+    yaml_path.write_text(yaml_content)
+
+    with stage_module_isolation(tmp_path):
+        result = pipeline_config.load_pipeline_from_yaml(yaml_path)
+
+    assert result.name == "my_custom_name"
+
+
+def test_load_pipeline_from_yaml_defaults_to_directory_name(tmp_path: pathlib.Path) -> None:
+    """load_pipeline_from_yaml should default name to parent directory."""
+    # Create a subdirectory to test directory name extraction
+    subdir = tmp_path / "my_project"
+    subdir.mkdir()
+
+    # Create a simple stage module
+    stages_py = subdir / "stages.py"
+    stages_py.write_text(
+        """\
+import pathlib
+from typing import Annotated, TypedDict
+from pivot import loaders, outputs
+
+class ProcessOutputs(TypedDict):
+    out: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
+
+def process() -> ProcessOutputs:
+    return {"out": pathlib.Path("output.txt")}
+"""
+    )
+
+    yaml_content = """\
+stages:
+  process:
+    python: stages.process
+"""
+    yaml_path = subdir / "pivot.yaml"
+    yaml_path.write_text(yaml_content)
+
+    with stage_module_isolation(subdir):
+        result = pipeline_config.load_pipeline_from_yaml(yaml_path)
+
+    assert result.name == "my_project"
+
+
+def test_load_pipeline_from_yaml_registers_stages(simple_pipeline: pathlib.Path) -> None:
+    """load_pipeline_from_yaml should register all stages to the returned Pipeline."""
+    pipeline_file = simple_pipeline / "pivot.yaml"
+
+    result = pipeline_config.load_pipeline_from_yaml(pipeline_file)
+
+    # Pipeline should have the stages from pivot.yaml
+    stages = result.list_stages()
+    assert "preprocess" in stages
+    assert "train" in stages
+
+
+def test_load_pipeline_from_yaml_matrix_expansion(matrix_pipeline: pathlib.Path) -> None:
+    """load_pipeline_from_yaml should expand matrix variants."""
+    pipeline_file = matrix_pipeline / "pivot.yaml"
+
+    result = pipeline_config.load_pipeline_from_yaml(pipeline_file)
+
+    stages = result.list_stages()
+    assert "preprocess" in stages
+    assert "train@bert_swe" in stages
+    assert "train@bert_human" in stages
+    assert "train@gpt_swe" in stages
+    assert "train@gpt_human" in stages
+
+
+def test_pipeline_config_accepts_pipeline_field(tmp_path: pathlib.Path) -> None:
+    """PipelineConfig should accept optional 'pipeline' field."""
+    yaml_content = """\
+pipeline: custom_name
+stages: {}
+"""
+    yaml_path = tmp_path / "pivot.yaml"
+    yaml_path.write_text(yaml_content)
+
+    config = pipeline_config.load_pipeline_file(yaml_path)
+
+    assert config.pipeline == "custom_name"
+
+
+def test_pipeline_config_pipeline_field_defaults_to_none(tmp_path: pathlib.Path) -> None:
+    """PipelineConfig 'pipeline' field should default to None."""
+    yaml_content = """\
+stages: {}
+"""
+    yaml_path = tmp_path / "pivot.yaml"
+    yaml_path.write_text(yaml_content)
+
+    config = pipeline_config.load_pipeline_file(yaml_path)
+
+    assert config.pipeline is None

@@ -9,11 +9,14 @@ from typing import TYPE_CHECKING, Annotated, TypedDict
 import pandas
 import pytest
 
-from pivot import executor, loaders, outputs
-from pivot.registry import REGISTRY
+from helpers import register_test_stage
+from pivot import loaders, outputs
+from pivot.engine import sources
 
 if TYPE_CHECKING:
     import pathlib
+
+    from pivot.pipeline.pipeline import Pipeline
 
 
 class _CompareOutputs(TypedDict):
@@ -46,16 +49,19 @@ def comparison_data(tmp_path: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]
     return baseline, experiment
 
 
-@pytest.mark.usefixtures("set_project_root")
 def test_placeholder_dep_e2e_execution(
+    test_pipeline: Pipeline,
+    mock_discovery: Pipeline,
     tmp_path: pathlib.Path,
     comparison_data: tuple[pathlib.Path, pathlib.Path],
 ) -> None:
     """PlaceholderDep stage should execute correctly with overridden paths."""
+    from pivot.engine.engine import Engine
+
     baseline_path, experiment_path = comparison_data
 
     # Register with overrides
-    REGISTRY.register(
+    register_test_stage(
         _compare_datasets,
         name="compare_ab",
         dep_path_overrides={
@@ -64,8 +70,10 @@ def test_placeholder_dep_e2e_execution(
         },
     )
 
-    # Execute via run
-    executor.run(["compare_ab"], force=True)
+    # Execute via Engine
+    with Engine(pipeline=test_pipeline) as engine:
+        engine.add_source(sources.OneShotSource(stages=["compare_ab"], force=True, reason="test"))
+        engine.run(exit_on_completion=True)
 
     # Verify output
     output = tmp_path / "diff.json"
@@ -74,8 +82,8 @@ def test_placeholder_dep_e2e_execution(
     assert result["delta"] == 5.0  # (15+25+35)/3 - (10+20+30)/3 = 25 - 20 = 5
 
 
-@pytest.mark.usefixtures("set_project_root")
 def test_placeholder_dep_reuse_function_different_overrides(
+    test_pipeline: Pipeline,
     tmp_path: pathlib.Path,
     comparison_data: tuple[pathlib.Path, pathlib.Path],
 ) -> None:
@@ -88,7 +96,7 @@ def test_placeholder_dep_reuse_function_different_overrides(
     third.write_text("value\n100\n200\n300\n")
 
     # Register same function twice with different overrides
-    REGISTRY.register(
+    register_test_stage(
         _compare_datasets,
         name="compare_ab_v2",
         dep_path_overrides={
@@ -98,7 +106,7 @@ def test_placeholder_dep_reuse_function_different_overrides(
         out_path_overrides={"diff": "diff_ab.json"},
     )
 
-    REGISTRY.register(
+    register_test_stage(
         _compare_datasets,
         name="compare_ac",
         dep_path_overrides={
@@ -109,11 +117,11 @@ def test_placeholder_dep_reuse_function_different_overrides(
     )
 
     # Both should be registered
-    assert REGISTRY.get("compare_ab_v2") is not None
-    assert REGISTRY.get("compare_ac") is not None
+    assert test_pipeline.get("compare_ab_v2") is not None
+    assert test_pipeline.get("compare_ac") is not None
 
     # Dependencies should be different
-    ab_info = REGISTRY.get("compare_ab_v2")
-    ac_info = REGISTRY.get("compare_ac")
+    ab_info = test_pipeline.get("compare_ab_v2")
+    ac_info = test_pipeline.get("compare_ac")
 
     assert ab_info["deps"]["experiment"] != ac_info["deps"]["experiment"]

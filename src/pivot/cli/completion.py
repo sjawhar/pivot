@@ -126,12 +126,13 @@ def _get_stages_fast() -> list[str] | None:
 
 def _get_stages_full() -> list[str]:
     """Fallback: get stage names via full discovery (~500ms)."""
-    from pivot import discovery, registry
+    from pivot import discovery
 
-    if not discovery.has_registered_stages():
-        discovery.discover_and_register()
+    pipeline = discovery.discover_pipeline()
+    if pipeline is None:
+        return []
 
-    return registry.REGISTRY.list_stages()
+    return pipeline.list_stages()
 
 
 def _find_project_root_fast() -> pathlib.Path | None:

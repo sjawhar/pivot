@@ -2,16 +2,58 @@ from __future__ import annotations
 
 import enum
 import json
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, cast, override
 
 import click
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from pivot.cli import CliContext
+    from networkx import DiGraph
 
-from pivot import exceptions, registry
+    from pivot.cli import CliContext
+    from pivot.pipeline.pipeline import Pipeline
+    from pivot.registry import RegistryStageInfo
+
+from pivot import exceptions
+from pivot.cli import decorators as cli_decorators
+
+
+class NoPipelineError(exceptions.PivotError):
+    """Raised when no Pipeline is available in context."""
+
+    @override
+    def format_user_message(self) -> str:
+        return "No Pipeline in context. Ensure the command uses @pivot_command() decorator with auto_discover=True."
+
+
+def _get_pipeline() -> Pipeline:
+    """Get Pipeline from context, raising NoPipelineError if not found."""
+    pipeline = cli_decorators.get_pipeline_from_context()
+    if pipeline is None:
+        raise NoPipelineError()
+    return pipeline
+
+
+def list_stages() -> list[str]:
+    """List stage names from Pipeline in context."""
+    return _get_pipeline().list_stages()
+
+
+def get_stage(name: str) -> RegistryStageInfo:
+    """Get stage info from Pipeline in context."""
+    return _get_pipeline().get(name)
+
+
+def get_all_stages() -> dict[str, RegistryStageInfo]:
+    """Get all stages as a dict from Pipeline in context."""
+    pipeline = _get_pipeline()
+    return {name: pipeline.get(name) for name in pipeline.list_stages()}
+
+
+def build_dag(validate: bool = True) -> DiGraph[str]:
+    """Build DAG from Pipeline in context."""
+    return _get_pipeline().build_dag(validate=validate)
 
 
 def _json_default(obj: Any) -> Any:  # noqa: ANN401 - json.dumps default requires Any
@@ -52,7 +94,7 @@ def validate_stages_exist(stages: list[str] | None) -> None:
     """Validate that specified stages exist in the registry."""
     if not stages:
         return
-    registered = set(registry.REGISTRY.list_stages())
+    registered = set(list_stages())
     unknown = [s for s in stages if s not in registered]
     if unknown:
         raise exceptions.StageNotFoundError(unknown, available_stages=list(registered))

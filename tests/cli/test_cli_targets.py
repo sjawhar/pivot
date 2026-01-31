@@ -13,6 +13,8 @@ from pivot.cli import targets
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from pivot.pipeline.pipeline import Pipeline
+
 
 # =============================================================================
 # Output TypedDicts for annotation-based stages
@@ -69,7 +71,7 @@ def test_validate_targets_logs_warning_for_invalid(caplog: pytest.LogCaptureFixt
 # --- _classify_targets tests ---
 
 
-def test_classify_targets_stage_only(set_project_root: Path) -> None:
+def test_classify_targets_stage_only(mock_discovery: Pipeline, set_project_root: Path) -> None:
     """Target that is only a stage name."""
     # Register a real stage (autouse fixture clears between tests)
     register_test_stage(_noop, name="my_stage")
@@ -82,7 +84,7 @@ def test_classify_targets_stage_only(set_project_root: Path) -> None:
     assert result[0]["is_file"] is False
 
 
-def test_classify_targets_file_only(set_project_root: Path) -> None:
+def test_classify_targets_file_only(mock_discovery: Pipeline, set_project_root: Path) -> None:
     """Target that is only a file path."""
     data_file = set_project_root / "data.csv"
     data_file.touch()
@@ -95,7 +97,7 @@ def test_classify_targets_file_only(set_project_root: Path) -> None:
     assert result[0]["is_file"] is True
 
 
-def test_classify_targets_neither(set_project_root: Path) -> None:
+def test_classify_targets_neither(mock_discovery: Pipeline, set_project_root: Path) -> None:
     """Target that is neither a stage nor existing file."""
     result = targets._classify_targets(["nonexistent"], set_project_root)
 
@@ -105,6 +107,7 @@ def test_classify_targets_neither(set_project_root: Path) -> None:
 
 
 def test_classify_targets_both_warns(
+    mock_discovery: Pipeline,
     set_project_root: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -125,7 +128,7 @@ def test_classify_targets_both_warns(
 # --- resolve_output_paths tests ---
 
 
-def test_resolve_output_paths_file(set_project_root: Path) -> None:
+def test_resolve_output_paths_file(mock_discovery: Pipeline, set_project_root: Path) -> None:
     """Resolving a file target should return the file path."""
     metrics_file = set_project_root / "my_metrics.yaml"
     metrics_file.touch()
@@ -138,7 +141,7 @@ def test_resolve_output_paths_file(set_project_root: Path) -> None:
     assert missing == []
 
 
-def test_resolve_output_paths_unknown(set_project_root: Path) -> None:
+def test_resolve_output_paths_unknown(mock_discovery: Pipeline, set_project_root: Path) -> None:
     """Unknown targets should be returned in missing list."""
     resolved, missing = targets.resolve_output_paths(
         ["nonexistent.yaml"], set_project_root, outputs.Metric
@@ -151,7 +154,7 @@ def test_resolve_output_paths_unknown(set_project_root: Path) -> None:
 # --- resolve_plot_infos tests ---
 
 
-def test_resolve_plot_infos_file(set_project_root: Path) -> None:
+def test_resolve_plot_infos_file(mock_discovery: Pipeline, set_project_root: Path) -> None:
     """Resolving a file target should return PlotInfo with (direct) stage."""
     plot_file = set_project_root / "my_plot.png"
     plot_file.touch()
@@ -185,13 +188,17 @@ def test_format_unknown_targets_error_multiple() -> None:
 # --- resolve_and_validate tests ---
 
 
-def test_resolve_and_validate_empty_targets(set_project_root: Path) -> None:
+def test_resolve_and_validate_empty_targets(
+    mock_discovery: Pipeline, set_project_root: Path
+) -> None:
     result = targets.resolve_and_validate((), set_project_root, outputs.Metric)
 
     assert result is None
 
 
-def test_resolve_and_validate_raises_on_unknown(set_project_root: Path) -> None:
+def test_resolve_and_validate_raises_on_unknown(
+    mock_discovery: Pipeline, set_project_root: Path
+) -> None:
     """Should raise ClickException with helpful message for unknown targets."""
     with pytest.raises(click.ClickException) as exc_info:
         targets.resolve_and_validate(("nonexistent.yaml",), set_project_root, outputs.Metric)
@@ -199,7 +206,9 @@ def test_resolve_and_validate_raises_on_unknown(set_project_root: Path) -> None:
     assert "neither a registered stage nor an existing file" in str(exc_info.value)
 
 
-def test_resolve_and_validate_returns_paths(set_project_root: Path) -> None:
+def test_resolve_and_validate_returns_paths(
+    mock_discovery: Pipeline, set_project_root: Path
+) -> None:
     """Should return resolved paths on success."""
     metrics_file = set_project_root / "data.yaml"
     metrics_file.touch()

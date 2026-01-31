@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import pathlib
-from typing import Annotated, TypedDict
+from typing import TYPE_CHECKING, Annotated, TypedDict
 
 from helpers import register_test_stage
 from pivot import executor, loaders, outputs
+
+if TYPE_CHECKING:
+    from pivot.pipeline.pipeline import Pipeline
 
 # =============================================================================
 # TypedDict output types for module-level stage functions
@@ -695,7 +698,7 @@ def _disconn_stage_y(
 # =============================================================================
 
 
-def test_linear_dag_three_stages(pipeline_dir: pathlib.Path) -> None:
+def test_linear_dag_three_stages(pipeline_dir: pathlib.Path, test_pipeline: Pipeline) -> None:
     """Linear DAG A -> B -> C executes in correct order.
 
     Each stage appends to the data, creating a chain that proves order.
@@ -709,7 +712,7 @@ def test_linear_dag_three_stages(pipeline_dir: pathlib.Path) -> None:
     register_test_stage(_linear3_stage_b, name="stage_b")
     register_test_stage(_linear3_stage_c, name="stage_c")
 
-    results = executor.run()
+    results = executor.run(pipeline=test_pipeline)
 
     # Verify all stages ran
     assert all(r["status"] == "ran" for r in results.values())
@@ -732,7 +735,9 @@ def test_linear_dag_three_stages(pipeline_dir: pathlib.Path) -> None:
 # =============================================================================
 
 
-def test_tree_dag_one_root_two_children(pipeline_dir: pathlib.Path) -> None:
+def test_tree_dag_one_root_two_children(
+    pipeline_dir: pathlib.Path, test_pipeline: Pipeline
+) -> None:
     """Tree DAG: A -> B, A -> C (B and C both depend on A, but not each other)."""
     (pipeline_dir / "input.txt").write_text("ROOT")
     log_file = pipeline_dir / "execution_log.txt"
@@ -742,7 +747,7 @@ def test_tree_dag_one_root_two_children(pipeline_dir: pathlib.Path) -> None:
     register_test_stage(_tree1_stage_b, name="stage_b")
     register_test_stage(_tree1_stage_c, name="stage_c")
 
-    executor.run()
+    executor.run(pipeline=test_pipeline)
 
     execution_log = log_file.read_text().strip().split("\n")
 
@@ -757,7 +762,7 @@ def test_tree_dag_one_root_two_children(pipeline_dir: pathlib.Path) -> None:
     assert (pipeline_dir / "c.txt").read_text() == "ROOT->A->C"
 
 
-def test_tree_dag_deeper(pipeline_dir: pathlib.Path) -> None:
+def test_tree_dag_deeper(pipeline_dir: pathlib.Path, test_pipeline: Pipeline) -> None:
     """Deeper tree: A -> B -> D, A -> C -> E.
 
          A
@@ -776,7 +781,7 @@ def test_tree_dag_deeper(pipeline_dir: pathlib.Path) -> None:
     register_test_stage(_tree2_stage_d, name="stage_d")
     register_test_stage(_tree2_stage_e, name="stage_e")
 
-    executor.run()
+    executor.run(pipeline=test_pipeline)
 
     execution_log = log_file.read_text().strip().split("\n")
 
@@ -798,7 +803,7 @@ def test_tree_dag_deeper(pipeline_dir: pathlib.Path) -> None:
 # =============================================================================
 
 
-def test_diamond_dag(pipeline_dir: pathlib.Path) -> None:
+def test_diamond_dag(pipeline_dir: pathlib.Path, test_pipeline: Pipeline) -> None:
     """Diamond DAG: A -> B -> D, A -> C -> D.
 
     D depends on both B and C, which both depend on A.
@@ -812,7 +817,7 @@ def test_diamond_dag(pipeline_dir: pathlib.Path) -> None:
     register_test_stage(_diamond1_stage_c, name="stage_c")
     register_test_stage(_diamond1_stage_d, name="stage_d")
 
-    executor.run()
+    executor.run(pipeline=test_pipeline)
 
     execution_log = log_file.read_text().strip().split("\n")
 
@@ -829,7 +834,7 @@ def test_diamond_dag(pipeline_dir: pathlib.Path) -> None:
     assert (pipeline_dir / "d.txt").read_text() == "D(B_OUTPUT+C_OUTPUT)"
 
 
-def test_diamond_dag_with_shared_data(pipeline_dir: pathlib.Path) -> None:
+def test_diamond_dag_with_shared_data(pipeline_dir: pathlib.Path, test_pipeline: Pipeline) -> None:
     """Diamond DAG where D combines data from both paths.
 
     A produces a number, B doubles it, C triples it, D sums both.
@@ -842,7 +847,7 @@ def test_diamond_dag_with_shared_data(pipeline_dir: pathlib.Path) -> None:
     register_test_stage(_diamond2_triple_c, name="triple_c")
     register_test_stage(_diamond2_sum_d, name="sum_d")
 
-    executor.run()
+    executor.run(pipeline=test_pipeline)
 
     # If execution order was wrong, this would be incorrect
     assert (pipeline_dir / "d.txt").read_text() == "50"
@@ -857,7 +862,7 @@ def test_diamond_dag_with_shared_data(pipeline_dir: pathlib.Path) -> None:
 # =============================================================================
 
 
-def test_fanout_dag(pipeline_dir: pathlib.Path) -> None:
+def test_fanout_dag(pipeline_dir: pathlib.Path, test_pipeline: Pipeline) -> None:
     """Fan-out DAG: A -> B, A -> C, A -> D (one source, three consumers)."""
     (pipeline_dir / "input.txt").write_text("SOURCE")
     log_file = pipeline_dir / "execution_log.txt"
@@ -868,7 +873,7 @@ def test_fanout_dag(pipeline_dir: pathlib.Path) -> None:
     register_test_stage(_fanout1_stage_c, name="stage_c")
     register_test_stage(_fanout1_stage_d, name="stage_d")
 
-    executor.run()
+    executor.run(pipeline=test_pipeline)
 
     execution_log = log_file.read_text().strip().split("\n")
 
@@ -879,7 +884,7 @@ def test_fanout_dag(pipeline_dir: pathlib.Path) -> None:
     assert set(execution_log[1:]) == {"b", "c", "d"}
 
 
-def test_fanout_dag_wide(pipeline_dir: pathlib.Path) -> None:
+def test_fanout_dag_wide(pipeline_dir: pathlib.Path, test_pipeline: Pipeline) -> None:
     """Wide fan-out: A -> B, C, D, E, F (five consumers)."""
     consumer_names = ["b", "c", "d", "e", "f"]
 
@@ -894,7 +899,7 @@ def test_fanout_dag_wide(pipeline_dir: pathlib.Path) -> None:
     register_test_stage(_fanout2_consumer_e, name="consumer_e")
     register_test_stage(_fanout2_consumer_f, name="consumer_f")
 
-    executor.run()
+    executor.run(pipeline=test_pipeline)
 
     execution_log = log_file.read_text().strip().split("\n")
     assert execution_log[0] == "a"
@@ -910,7 +915,7 @@ def test_fanout_dag_wide(pipeline_dir: pathlib.Path) -> None:
 # =============================================================================
 
 
-def test_fanin_dag(pipeline_dir: pathlib.Path) -> None:
+def test_fanin_dag(pipeline_dir: pathlib.Path, test_pipeline: Pipeline) -> None:
     """Fan-in DAG: A -> D, B -> D, C -> D (three sources, one consumer)."""
     # Create separate input files for each source
     (pipeline_dir / "input_a.txt").write_text("A_INPUT")
@@ -924,7 +929,7 @@ def test_fanin_dag(pipeline_dir: pathlib.Path) -> None:
     register_test_stage(_fanin1_stage_c, name="stage_c")
     register_test_stage(_fanin1_stage_d, name="stage_d")
 
-    executor.run()
+    executor.run(pipeline=test_pipeline)
 
     execution_log = log_file.read_text().strip().split("\n")
 
@@ -936,7 +941,7 @@ def test_fanin_dag(pipeline_dir: pathlib.Path) -> None:
     assert (pipeline_dir / "d.txt").read_text() == "A_OUT+B_OUT+C_OUT"
 
 
-def test_fanin_dag_with_computation(pipeline_dir: pathlib.Path) -> None:
+def test_fanin_dag_with_computation(pipeline_dir: pathlib.Path, test_pipeline: Pipeline) -> None:
     """Fan-in where D computes sum of all inputs.
 
     A=10, B=20, C=30 -> D=60
@@ -950,7 +955,7 @@ def test_fanin_dag_with_computation(pipeline_dir: pathlib.Path) -> None:
     register_test_stage(_fanin2_compute_c, name="compute_c")
     register_test_stage(_fanin2_compute_sum, name="compute_sum")
 
-    executor.run()
+    executor.run(pipeline=test_pipeline)
 
     assert (pipeline_dir / "sum.txt").read_text() == "60"
 
@@ -968,7 +973,7 @@ def test_fanin_dag_with_computation(pipeline_dir: pathlib.Path) -> None:
 # =============================================================================
 
 
-def test_complex_dag_tree_then_diamond(pipeline_dir: pathlib.Path) -> None:
+def test_complex_dag_tree_then_diamond(pipeline_dir: pathlib.Path, test_pipeline: Pipeline) -> None:
     r"""Complex DAG combining tree and diamond patterns.
 
          A
@@ -990,7 +995,7 @@ def test_complex_dag_tree_then_diamond(pipeline_dir: pathlib.Path) -> None:
     register_test_stage(_complex1_stage_e, name="stage_e")
     register_test_stage(_complex1_stage_f, name="stage_f")
 
-    executor.run()
+    executor.run(pipeline=test_pipeline)
 
     execution_log = log_file.read_text().strip().split("\n")
 
@@ -1010,7 +1015,7 @@ def test_complex_dag_tree_then_diamond(pipeline_dir: pathlib.Path) -> None:
     assert (pipeline_dir / "f.txt").read_text() == "F(D,E)"
 
 
-def test_complex_dag_multiple_diamonds(pipeline_dir: pathlib.Path) -> None:
+def test_complex_dag_multiple_diamonds(pipeline_dir: pathlib.Path, test_pipeline: Pipeline) -> None:
     r"""Two diamonds sharing a common root.
 
            A
@@ -1034,7 +1039,7 @@ def test_complex_dag_multiple_diamonds(pipeline_dir: pathlib.Path) -> None:
     register_test_stage(_complex2_lower_g, name="lower_g")
     register_test_stage(_complex2_final_h, name="final_h")
 
-    executor.run()
+    executor.run(pipeline=test_pipeline)
 
     execution_log = log_file.read_text().strip().split("\n")
 
@@ -1065,19 +1070,19 @@ def test_complex_dag_multiple_diamonds(pipeline_dir: pathlib.Path) -> None:
 # =============================================================================
 
 
-def test_single_stage_dag(pipeline_dir: pathlib.Path) -> None:
+def test_single_stage_dag(pipeline_dir: pathlib.Path, test_pipeline: Pipeline) -> None:
     """Single stage with no dependencies on other stages."""
     (pipeline_dir / "input.txt").write_text("DATA")
 
     register_test_stage(_single_only_stage, name="only_stage")
 
-    results = executor.run()
+    results = executor.run(pipeline=test_pipeline)
 
     assert results["only_stage"]["status"] == "ran"
     assert (pipeline_dir / "output.txt").read_text() == "PROCESSED:DATA"
 
 
-def test_disconnected_dags(pipeline_dir: pathlib.Path) -> None:
+def test_disconnected_dags(pipeline_dir: pathlib.Path, test_pipeline: Pipeline) -> None:
     """Two independent pipelines in same registry.
 
     Pipeline 1: A -> B
@@ -1093,7 +1098,7 @@ def test_disconnected_dags(pipeline_dir: pathlib.Path) -> None:
     register_test_stage(_disconn_stage_x, name="stage_x")
     register_test_stage(_disconn_stage_y, name="stage_y")
 
-    executor.run()
+    executor.run(pipeline=test_pipeline)
 
     execution_log = log_file.read_text().strip().split("\n")
 

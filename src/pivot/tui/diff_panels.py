@@ -21,7 +21,7 @@ import textual.css.query
 import textual.widgets
 
 from pivot import config, explain, outputs, parameters, project
-from pivot.registry import REGISTRY
+from pivot.cli import helpers as cli_helpers
 from pivot.show import data as data_mod
 from pivot.show import metrics as metrics_mod
 from pivot.show.metrics import MetricDiff
@@ -429,7 +429,7 @@ class InputDiffPanel(_SelectableExpandablePanel):
     def _load_stage_data(self, stage_name: str) -> None:  # pragma: no cover
         """Load and cache stage data."""
         try:
-            self._registry_info = REGISTRY.get(stage_name)
+            self._registry_info = cli_helpers.get_stage(stage_name)
         except KeyError:
             logger.debug("Stage %s not in registry", stage_name)
             return
@@ -688,7 +688,7 @@ class InputDiffPanel(_SelectableExpandablePanel):
         self._explanation = snapshot
         self._stage_name = snapshot["stage_name"]
         try:
-            self._registry_info = REGISTRY.get(snapshot["stage_name"])
+            self._registry_info = cli_helpers.get_stage(snapshot["stage_name"])
         except KeyError:
             self._registry_info = None
         self._code_by_key = {c["key"]: c for c in snapshot["code_changes"]}
@@ -740,7 +740,7 @@ class OutputDiffPanel(_SelectableExpandablePanel):
     def _load_stage_data(self, stage_name: str) -> None:  # pragma: no cover
         """Load and cache stage data."""
         try:
-            self._registry_info = REGISTRY.get(stage_name)
+            self._registry_info = cli_helpers.get_stage(stage_name)
         except KeyError:
             logger.debug("Stage %s not in registry", stage_name)
             return
@@ -1115,7 +1115,7 @@ class OutputDiffPanel(_SelectableExpandablePanel):
         self._stage_name = stage_name
         self._stage_status = status
         try:
-            self._registry_info = REGISTRY.get(stage_name)
+            self._registry_info = cli_helpers.get_stage(stage_name)
         except KeyError:
             self._registry_info = None
         self._output_by_path = {c["path"]: c for c in changes}

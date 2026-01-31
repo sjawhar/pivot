@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 
 from conftest import init_git_repo
 from pivot import loaders, outputs, project
-from pivot.registry import REGISTRY, RegistryStageInfo
+from pivot.registry import RegistryStageInfo
 from pivot.show import plots
 from pivot.storage import lock
 from pivot.types import ChangeType, LockData, OutputFormat
@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from pytest_mock import MockerFixture
 
     from conftest import GitRepo
+    from pivot.pipeline import pipeline as pipeline_mod
 
 
 # =============================================================================
@@ -26,6 +27,7 @@ if TYPE_CHECKING:
 
 
 def _register_plot_stage(
+    test_pipeline: pipeline_mod.Pipeline,
     name: str,
     plot_path: str,
     x: str | None = None,
@@ -41,7 +43,7 @@ def _register_plot_stage(
     def _stage_func() -> None:
         pass
 
-    REGISTRY._stages[name] = RegistryStageInfo(
+    test_pipeline._registry._stages[name] = RegistryStageInfo(
         func=_stage_func,
         name=name,
         deps={},
@@ -56,10 +58,12 @@ def _register_plot_stage(
         dep_specs={},
         out_specs={},
         params_arg_name=None,
+        state_dir=None,
     )
 
 
 def _register_mixed_output_stage(
+    test_pipeline: pipeline_mod.Pipeline,
     name: str,
     out_path: str,
     metric_path: str,
@@ -70,7 +74,7 @@ def _register_mixed_output_stage(
     def _stage_func() -> None:
         pass
 
-    REGISTRY._stages[name] = RegistryStageInfo(
+    test_pipeline._registry._stages[name] = RegistryStageInfo(
         func=_stage_func,
         name=name,
         deps={},
@@ -89,6 +93,7 @@ def _register_mixed_output_stage(
         dep_specs={},
         out_specs={},
         params_arg_name=None,
+        state_dir=None,
     )
 
 
@@ -97,19 +102,19 @@ def _register_mixed_output_stage(
 # =============================================================================
 
 
-def test_collect_plots_from_stages_empty(clean_registry: None) -> None:
+def test_collect_plots_from_stages_empty(mock_discovery: pipeline_mod.Pipeline) -> None:
     """Empty registry returns empty list."""
     result = plots.collect_plots_from_stages()
 
     assert result == []
 
 
-def test_collect_plots_from_stages_finds_plots(set_project_root: Path) -> None:
+def test_collect_plots_from_stages_finds_plots(mock_discovery: pipeline_mod.Pipeline) -> None:
     """Finds Plot outputs from registered stages."""
-    plot_path = set_project_root / "plot.png"
+    plot_path = mock_discovery.root / "plot.png"
     plot_path.write_bytes(b"data")
 
-    _register_plot_stage("my_stage", str(plot_path), x="epoch", y="loss")
+    _register_plot_stage(mock_discovery, "my_stage", str(plot_path), x="epoch", y="loss")
 
     result = plots.collect_plots_from_stages()
 
@@ -119,16 +124,17 @@ def test_collect_plots_from_stages_finds_plots(set_project_root: Path) -> None:
     assert result[0]["y"] == "loss"
 
 
-def test_collect_plots_from_stages_ignores_non_plots(set_project_root: Path) -> None:
+def test_collect_plots_from_stages_ignores_non_plots(mock_discovery: pipeline_mod.Pipeline) -> None:
     """Ignores Out and Metric outputs, only returns Plot outputs."""
-    out_file = set_project_root / "output.txt"
-    metric_file = set_project_root / "metrics.json"
-    plot_file = set_project_root / "chart.png"
+    out_file = mock_discovery.root / "output.txt"
+    metric_file = mock_discovery.root / "metrics.json"
+    plot_file = mock_discovery.root / "chart.png"
     out_file.write_text("data")
     metric_file.write_text("{}")
     plot_file.write_bytes(b"png")
 
     _register_mixed_output_stage(
+        mock_discovery,
         "mixed_stage",
         str(out_file),
         str(metric_file),
@@ -146,12 +152,12 @@ def test_collect_plots_from_stages_ignores_non_plots(set_project_root: Path) -> 
 # =============================================================================
 
 
-def test_get_plot_hashes_from_lock_no_lock_file(set_project_root: Path) -> None:
+def test_get_plot_hashes_from_lock_no_lock_file(mock_discovery: pipeline_mod.Pipeline) -> None:
     """Returns None for plots without lock files."""
-    plot_file = set_project_root / "plot.png"
+    plot_file = mock_discovery.root / "plot.png"
     plot_file.write_bytes(b"data")
 
-    _register_plot_stage("test_stage", str(plot_file))
+    _register_plot_stage(mock_discovery, "test_stage", str(plot_file))
 
     result = plots.get_plot_hashes_from_lock()
 
@@ -160,15 +166,15 @@ def test_get_plot_hashes_from_lock_no_lock_file(set_project_root: Path) -> None:
     assert result["plot.png"] is None
 
 
-def test_get_plot_hashes_from_lock_with_hash(set_project_root: Path) -> None:
+def test_get_plot_hashes_from_lock_with_hash(mock_discovery: pipeline_mod.Pipeline) -> None:
     """Returns hash from lock file."""
-    plot_file = set_project_root / "plot.png"
+    plot_file = mock_discovery.root / "plot.png"
     plot_file.write_bytes(b"data")
 
-    _register_plot_stage("test_stage", str(plot_file))
+    _register_plot_stage(mock_discovery, "test_stage", str(plot_file))
 
     # Create lock file with hash
-    state_dir = set_project_root / ".pivot"
+    state_dir = mock_discovery.root / ".pivot"
     stages_dir = lock.get_stages_dir(state_dir)
     stages_dir.mkdir(parents=True, exist_ok=True)
     stage_lock = lock.StageLock("test_stage", stages_dir)
@@ -188,15 +194,15 @@ def test_get_plot_hashes_from_lock_with_hash(set_project_root: Path) -> None:
     assert result["plot.png"] == "abc123def456"
 
 
-def test_get_plot_hashes_from_lock_with_none_hash(set_project_root: Path) -> None:
+def test_get_plot_hashes_from_lock_with_none_hash(mock_discovery: pipeline_mod.Pipeline) -> None:
     """Returns None for plots with null hash in lock file."""
-    plot_file = set_project_root / "plot.png"
+    plot_file = mock_discovery.root / "plot.png"
     plot_file.write_bytes(b"data")
 
-    _register_plot_stage("test_stage", str(plot_file))
+    _register_plot_stage(mock_discovery, "test_stage", str(plot_file))
 
     # Create lock file with None hash (uncached output)
-    state_dir = set_project_root / ".pivot"
+    state_dir = mock_discovery.root / ".pivot"
     stages_dir = lock.get_stages_dir(state_dir)
     stages_dir.mkdir(parents=True, exist_ok=True)
     stage_lock = lock.StageLock("test_stage", stages_dir)
@@ -221,12 +227,12 @@ def test_get_plot_hashes_from_lock_with_none_hash(set_project_root: Path) -> Non
 # =============================================================================
 
 
-def test_get_plot_hashes_from_head_no_git_repo(set_project_root: Path) -> None:
+def test_get_plot_hashes_from_head_no_git_repo(mock_discovery: pipeline_mod.Pipeline) -> None:
     """Returns empty dict when not in a git repo."""
-    plot_file = set_project_root / "plot.png"
+    plot_file = mock_discovery.root / "plot.png"
     plot_file.write_bytes(b"data")
 
-    _register_plot_stage("test_stage", str(plot_file))
+    _register_plot_stage(mock_discovery, "test_stage", str(plot_file))
 
     result = plots.get_plot_hashes_from_head()
 
@@ -237,6 +243,7 @@ def test_get_plot_hashes_from_head_no_git_repo(set_project_root: Path) -> None:
 
 def test_get_plot_hashes_from_head_returns_committed_hash(
     git_repo: GitRepo,
+    mock_discovery: pipeline_mod.Pipeline,
     mocker: MockerFixture,
 ) -> None:
     """Returns hash from lock file committed to HEAD."""
@@ -246,7 +253,7 @@ def test_get_plot_hashes_from_head_returns_committed_hash(
     plot_file = repo_path / "plot.png"
     plot_file.write_bytes(b"data")
 
-    _register_plot_stage("test_stage", str(plot_file))
+    _register_plot_stage(mock_discovery, "test_stage", str(plot_file))
 
     # Create and commit lock file with hash
     state_dir = repo_path / ".pivot"
@@ -272,6 +279,7 @@ def test_get_plot_hashes_from_head_returns_committed_hash(
 
 def test_get_plot_hashes_from_head_ignores_uncommitted_changes(
     git_repo: GitRepo,
+    mock_discovery: pipeline_mod.Pipeline,
     mocker: MockerFixture,
 ) -> None:
     """Returns committed hash, not uncommitted changes."""
@@ -281,7 +289,7 @@ def test_get_plot_hashes_from_head_ignores_uncommitted_changes(
     plot_file = repo_path / "plot.png"
     plot_file.write_bytes(b"data")
 
-    _register_plot_stage("test_stage", str(plot_file))
+    _register_plot_stage(mock_discovery, "test_stage", str(plot_file))
 
     # Create and commit lock file with original hash
     state_dir = repo_path / ".pivot"
@@ -318,6 +326,7 @@ def test_get_plot_hashes_from_head_ignores_uncommitted_changes(
 
 def test_get_plot_hashes_from_head_no_lock_in_head(
     git_repo: GitRepo,
+    mock_discovery: pipeline_mod.Pipeline,
     mocker: MockerFixture,
 ) -> None:
     """Returns None for plots with no lock file in HEAD."""
@@ -331,7 +340,7 @@ def test_get_plot_hashes_from_head_no_lock_in_head(
     (repo_path / "readme.txt").write_text("readme")
     commit("initial")
 
-    _register_plot_stage("test_stage", str(plot_file))
+    _register_plot_stage(mock_discovery, "test_stage", str(plot_file))
 
     result = plots.get_plot_hashes_from_head()
 

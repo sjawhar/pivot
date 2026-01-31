@@ -5,7 +5,6 @@ from typing import TypedDict
 
 import click
 
-from pivot import registry
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
 
@@ -31,7 +30,7 @@ def _get_output_sources(stage_list: list[str]) -> dict[str, str]:
     return {
         out_path: name
         for name in stage_list
-        for out_path in registry.REGISTRY.get(name)["outs_paths"]
+        for out_path in cli_helpers.get_stage(name)["outs_paths"]
     }
 
 
@@ -44,7 +43,7 @@ def list_cmd(ctx: click.Context, as_json: bool, show_deps: bool) -> None:
     cli_ctx = cli_helpers.get_cli_context(ctx)
     verbose = cli_ctx["verbose"]
     quiet = cli_ctx["quiet"]
-    stage_list = registry.REGISTRY.list_stages()
+    stage_list = cli_helpers.list_stages()
 
     if not stage_list:
         if as_json:
@@ -58,7 +57,7 @@ def list_cmd(ctx: click.Context, as_json: bool, show_deps: bool) -> None:
         stages = [
             StageJsonOutput(
                 name=name,
-                deps=(info := registry.REGISTRY.get(name))["deps_paths"],
+                deps=(info := cli_helpers.get_stage(name))["deps_paths"],
                 outs=info["outs_paths"],
                 mutex=info["mutex"],
                 variant=info["variant"],
@@ -77,7 +76,7 @@ def list_cmd(ctx: click.Context, as_json: bool, show_deps: bool) -> None:
 
     click.echo(f"Registered stages ({len(stage_list)}):")
     for name in stage_list:
-        info = registry.REGISTRY.get(name)
+        info = cli_helpers.get_stage(name)
         deps = info["deps_paths"]
         outs = info["outs_paths"]
         click.echo(f"  {name}")

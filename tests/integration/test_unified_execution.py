@@ -13,16 +13,16 @@ from typing import TYPE_CHECKING, override
 
 import pytest
 
-from pivot import registry
+from helpers import register_test_stage
 from pivot.engine import engine as engine_mod
 from pivot.engine import sinks, sources
 from pivot.types import StageStatus
-from tests.helpers import register_test_stage
 
 if TYPE_CHECKING:
     import pathlib
 
     from pivot.engine.types import OutputEvent, PipelineReloaded, RunRequested
+    from pivot.pipeline.pipeline import Pipeline
 
 
 def _helper_noop(params: None) -> dict[str, str]:
@@ -44,7 +44,9 @@ class EventCaptureSink:
 
 
 @pytest.fixture
-def minimal_pipeline(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> pathlib.Path:
+def minimal_pipeline(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, test_pipeline: Pipeline
+) -> Pipeline:
     """Set up a minimal pipeline for testing."""
     from pivot import config
 
@@ -56,16 +58,16 @@ def minimal_pipeline(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) ->
     # Create git directory (required for project root detection)
     (tmp_path / ".git").mkdir()
 
-    return tmp_path
+    return test_pipeline
 
 
 def test_engine_run_completes_with_exit_on_completion(
-    minimal_pipeline: pathlib.Path,
+    minimal_pipeline: Pipeline,
 ) -> None:
     """Engine.run(exit_on_completion=True) should exit when stages complete."""
     register_test_stage(_helper_noop, name="test_stage")
 
-    with engine_mod.Engine() as eng:
+    with engine_mod.Engine(pipeline=minimal_pipeline) as eng:
         collector = sinks.ResultCollectorSink()
         eng.add_sink(collector)
         eng.add_source(sources.OneShotSource(stages=["test_stage"], force=True, reason="test"))
@@ -84,12 +86,12 @@ def test_engine_run_completes_with_exit_on_completion(
 
 
 def test_engine_exit_on_completion_false_blocks_until_shutdown(
-    minimal_pipeline: pathlib.Path,
+    minimal_pipeline: Pipeline,
 ) -> None:
     """Engine.run(exit_on_completion=False) should block until shutdown() is called."""
     register_test_stage(_helper_noop, name="blocking_test")
 
-    with engine_mod.Engine() as eng:
+    with engine_mod.Engine(pipeline=minimal_pipeline) as eng:
         collector = sinks.ResultCollectorSink()
         eng.add_sink(collector)
         eng.add_source(sources.OneShotSource(stages=["blocking_test"], force=True, reason="test"))
@@ -120,7 +122,7 @@ def test_engine_exit_on_completion_false_blocks_until_shutdown(
 
 
 def test_pipeline_reloaded_includes_stages_field(
-    minimal_pipeline: pathlib.Path,
+    minimal_pipeline: Pipeline,
 ) -> None:
     """PipelineReloaded event should include the stages field with topologically sorted stages."""
     register_test_stage(_helper_noop, name="stage_a")
@@ -129,11 +131,11 @@ def test_pipeline_reloaded_includes_stages_field(
     # Capture events to verify PipelineReloaded
     capture_sink = EventCaptureSink()
 
-    with engine_mod.Engine() as eng:
+    with engine_mod.Engine(pipeline=minimal_pipeline) as eng:
         eng.add_sink(capture_sink)
 
         # Emit a reload event manually by calling the internal method
-        old_stages = registry.REGISTRY.snapshot()
+        old_stages = eng._get_all_stages()
         eng._emit_reload_event(old_stages)
 
     # Find the PipelineReloaded event
@@ -148,13 +150,13 @@ def test_pipeline_reloaded_includes_stages_field(
 
 
 def test_result_collector_sink_collects_all_stage_results(
-    minimal_pipeline: pathlib.Path,
+    minimal_pipeline: Pipeline,
 ) -> None:
     """ResultCollectorSink should collect results from all stages."""
     register_test_stage(_helper_noop, name="stage_1")
     register_test_stage(_helper_noop, name="stage_2")
 
-    with engine_mod.Engine() as eng:
+    with engine_mod.Engine(pipeline=minimal_pipeline) as eng:
         collector = sinks.ResultCollectorSink()
         eng.add_sink(collector)
         eng.add_source(sources.OneShotSource(stages=None, force=True, reason="test"))
@@ -167,7 +169,7 @@ def test_result_collector_sink_collects_all_stage_results(
 
 
 def test_oneshot_source_passes_orchestration_params(
-    minimal_pipeline: pathlib.Path,
+    minimal_pipeline: Pipeline,
 ) -> None:
     """OneShotSource should pass orchestration parameters through to RunRequested."""
     from pivot.types import OnError
@@ -182,7 +184,7 @@ def test_oneshot_source_passes_orchestration_params(
 
     register_test_stage(_helper_noop, name="param_test")
 
-    with EventCapturingEngine() as eng:
+    with EventCapturingEngine(pipeline=minimal_pipeline) as eng:
         collector = sinks.ResultCollectorSink()
         eng.add_sink(collector)
 

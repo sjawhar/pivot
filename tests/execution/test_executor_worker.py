@@ -13,7 +13,8 @@ from typing import TYPE_CHECKING, Annotated, Any, TypedDict
 
 import pytest
 
-from pivot import exceptions, executor, loaders, outputs, stage_def
+from pivot import exceptions, executor, loaders, outputs, registry, stage_def
+from pivot.executor import core as executor_core
 from pivot.executor import worker
 from pivot.storage import cache, lock, state
 
@@ -2488,3 +2489,80 @@ def test_execute_stage_returns_failed_for_missing_directory_dep(
     assert result["status"] == "failed"
     assert "missing deps" in result["reason"]
     assert "missing_dir" in result["reason"]
+
+
+# =============================================================================
+# prepare_worker_info Tests
+# =============================================================================
+
+
+class _PrepareWorkerInfoOutput(TypedDict):
+    """TypedDict for prepare_worker_info test stages."""
+
+    result: Annotated[pathlib.Path, outputs.Out("result.txt", loaders.PathOnly())]
+
+
+def _stage_with_custom_state_dir() -> _PrepareWorkerInfoOutput:
+    """Stage function for testing prepare_worker_info with custom state_dir."""
+    return _PrepareWorkerInfoOutput(result=pathlib.Path("result.txt"))
+
+
+def _stage_without_custom_state_dir() -> _PrepareWorkerInfoOutput:
+    """Stage function for testing prepare_worker_info with default state_dir."""
+    return _PrepareWorkerInfoOutput(result=pathlib.Path("result.txt"))
+
+
+def test_prepare_worker_info_uses_stage_state_dir(
+    set_project_root: pathlib.Path,
+    test_registry: registry.StageRegistry,
+) -> None:
+    """prepare_worker_info should use stage's state_dir when set."""
+    custom_state_dir = set_project_root / "custom_pipeline" / ".pivot"
+    test_registry.register(
+        _stage_with_custom_state_dir,
+        name="stage_with_custom_state",
+        state_dir=custom_state_dir,
+    )
+
+    stage_info = test_registry.get("stage_with_custom_state")
+    worker_info = executor_core.prepare_worker_info(
+        stage_info=stage_info,
+        overrides={},
+        checkout_modes=[],
+        run_id="test-run",
+        force=False,
+        no_commit=False,
+        no_cache=False,
+        project_root=set_project_root,
+        default_state_dir=set_project_root / ".pivot",  # Fallback
+    )
+
+    assert worker_info["state_dir"] == custom_state_dir
+
+
+def test_prepare_worker_info_uses_default_state_dir_when_stage_has_none(
+    set_project_root: pathlib.Path,
+    test_registry: registry.StageRegistry,
+) -> None:
+    """prepare_worker_info should use default_state_dir when stage has no state_dir."""
+    # Register without state_dir
+    test_registry.register(
+        _stage_without_custom_state_dir,
+        name="stage_without_custom_state",
+    )
+
+    stage_info = test_registry.get("stage_without_custom_state")
+    default_state_dir = set_project_root / ".pivot"
+    worker_info = executor_core.prepare_worker_info(
+        stage_info=stage_info,
+        overrides={},
+        checkout_modes=[],
+        run_id="test-run",
+        force=False,
+        no_commit=False,
+        no_cache=False,
+        project_root=set_project_root,
+        default_state_dir=default_state_dir,
+    )
+
+    assert worker_info["state_dir"] == default_state_dir

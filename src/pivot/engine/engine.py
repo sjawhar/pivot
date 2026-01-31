@@ -10,15 +10,12 @@ import logging
 import multiprocessing as mp
 import pathlib
 import queue
-import runpy
 import sys
 import threading
 import time
 from typing import TYPE_CHECKING, Self
 
-import yaml
-
-from pivot import config, dag, parameters, project, registry
+from pivot import config, dag, parameters, project
 from pivot.engine import graph as engine_graph
 from pivot.engine.types import (
     CodeOrConfigChanged,
@@ -60,6 +57,7 @@ if TYPE_CHECKING:
 
     import networkx as nx
 
+    from pivot.pipeline.pipeline import Pipeline
     from pivot.registry import RegistryStageInfo
     from pivot.storage.cache import CheckoutMode
     from pivot.types import RunJsonEvent
@@ -80,8 +78,14 @@ class Engine:
     (CLI, watch mode, agent RPC) go through the Engine.
     """
 
-    def __init__(self) -> None:
-        """Initialize the engine in IDLE state."""
+    def __init__(self, *, pipeline: Pipeline | None = None) -> None:
+        """Initialize the engine in IDLE state.
+
+        Args:
+            pipeline: Pipeline instance to use for stage lookup.
+                Required for execution - must be set before calling run methods.
+        """
+        self._pipeline: Pipeline | None = pipeline
         self._state: EngineState = EngineState.IDLE
         self._sinks: list[EventSink] = list[EventSink]()
         self._sources: list[EventSource] = list[EventSource]()
@@ -133,6 +137,27 @@ class Engine:
     def sources(self) -> list[EventSource]:
         """Registered event sources (returns a copy)."""
         return list(self._sources)
+
+    def _require_pipeline(self) -> Pipeline:
+        """Get the pipeline, raising RuntimeError if not set."""
+        if self._pipeline is None:
+            raise RuntimeError(
+                "Engine requires a Pipeline. Pass pipeline= to Engine() constructor."
+            )
+        return self._pipeline
+
+    def _list_stages(self) -> list[str]:
+        """List registered stage names from pipeline."""
+        return self._require_pipeline().list_stages()
+
+    def _get_stage(self, name: str) -> RegistryStageInfo:
+        """Get stage info from pipeline."""
+        return self._require_pipeline().get(name)
+
+    def _get_all_stages(self) -> dict[str, RegistryStageInfo]:
+        """Get all stages as a dict from pipeline."""
+        pipeline = self._require_pipeline()
+        return {name: pipeline.get(name) for name in pipeline.list_stages()}
 
     @property
     def cancel_event(self) -> threading.Event:
@@ -424,15 +449,17 @@ class Engine:
         self.emit(EngineStateChanged(type="engine_state_changed", state=EngineState.ACTIVE))
 
         # Extract optional fields with defaults
-        single_stage = event.get("single_stage", False)
-        parallel = event.get("parallel", True)
-        max_workers = event.get("max_workers")
-        no_commit = event.get("no_commit", False)
-        no_cache = event.get("no_cache", False)
-        on_error = event.get("on_error", OnError.KEEP_GOING)
-        cache_dir = event.get("cache_dir")
-        allow_uncached_incremental = event.get("allow_uncached_incremental", False)
-        checkout_missing = event.get("checkout_missing", False)
+        single_stage = event["single_stage"] if "single_stage" in event else False
+        parallel = event["parallel"] if "parallel" in event else True
+        max_workers = event["max_workers"] if "max_workers" in event else None
+        no_commit = event["no_commit"] if "no_commit" in event else False
+        no_cache = event["no_cache"] if "no_cache" in event else False
+        on_error = event["on_error"] if "on_error" in event else OnError.KEEP_GOING
+        cache_dir = event["cache_dir"] if "cache_dir" in event else None
+        allow_uncached_incremental = (
+            event["allow_uncached_incremental"] if "allow_uncached_incremental" in event else False
+        )
+        checkout_missing = event["checkout_missing"] if "checkout_missing" in event else False
 
         try:
             self._orchestrate_execution(
@@ -511,7 +538,7 @@ class Engine:
             return
 
         # Rebuild graph
-        all_stages = {name: registry.REGISTRY.get(name) for name in registry.REGISTRY.list_stages()}
+        all_stages = self._get_all_stages()
         self._graph = engine_graph.build_graph(all_stages)
 
         # Update watch paths if we have a FilesystemSource
@@ -523,7 +550,7 @@ class Engine:
                 source.set_watch_paths(watch_paths)
 
         # Re-run all stages
-        stages = list(registry.REGISTRY.list_stages())
+        stages = self._list_stages()
 
         if stages:
             self._execute_affected_stages(stages)
@@ -654,42 +681,41 @@ class Engine:
         linecache.clearcache()
         importlib.invalidate_caches()
         self._graph = None
-        registry.REGISTRY.invalidate_dag_cache()
+        if self._pipeline is not None:
+            self._pipeline.invalidate_dag_cache()
 
     def _reload_registry(self) -> bool:
-        """Reload the registry by re-importing pipeline definition.
+        """Reload the pipeline by re-importing pipeline definition.
 
         Returns True if reload succeeded, False if pipeline is invalid.
         """
-        old_stages = registry.REGISTRY.snapshot()
+        old_pipeline = self._pipeline
+        old_stages = old_pipeline.snapshot() if old_pipeline else {}
         root = project.get_project_root()
 
         # Clear project modules from sys.modules
         self._clear_project_modules(root)
 
-        # Try pivot.yaml first
-        for name in ("pivot.yaml", "pivot.yml"):
-            path = root / name
-            if path.exists():
-                try:
-                    with open(path, encoding="utf-8") as f:
-                        yaml_config = yaml.safe_load(f)
-                    if isinstance(yaml_config, dict) and "stages" in yaml_config:
-                        return self._reload_from_pipeline_file(path, old_stages)
-                except Exception:
-                    continue
+        # Use discovery to reload the pipeline
+        try:
+            from pivot import discovery
 
-        # Try pipeline.py
-        pipeline_py = root / "pipeline.py"
-        if pipeline_py.exists():
-            return self._reload_from_pipeline_py(pipeline_py, old_stages)
+            new_pipeline = discovery.discover_pipeline(root)
+            if new_pipeline is None:
+                _logger.warning("No pipeline found during reload")
+                return False
 
-        # Fallback: reimport stage modules
-        return self._reload_from_decorators(old_stages)
+            self._pipeline = new_pipeline
+            self._emit_reload_event(old_stages)
+            return True
+        except Exception as e:
+            _logger.warning(f"Pipeline invalid: {e}")
+            # Restore old pipeline on failure
+            self._pipeline = old_pipeline
+            return False
 
     def _clear_project_modules(self, root: pathlib.Path) -> None:
         """Remove project modules from sys.modules."""
-        root_str = str(root)
         to_remove = list[str]()
 
         for name, module in list(sys.modules.items()):
@@ -699,85 +725,18 @@ class Engine:
             if module_file is None:
                 continue
             try:
-                if module_file.startswith(root_str):
+                module_path = pathlib.Path(module_file)
+                if module_path.is_relative_to(root):
                     to_remove.append(name)
-            except (TypeError, AttributeError):
+            except (TypeError, ValueError):
                 continue
 
         for name in to_remove:
             del sys.modules[name]
 
-    def _try_reload(
-        self,
-        action: Callable[[], object],
-        old_stages: dict[str, RegistryStageInfo],
-    ) -> bool:
-        """Execute a reload action with standard error handling.
-
-        Clears registry, runs action, emits reload event on success.
-        On failure, restores old stages and returns False.
-        """
-        registry.REGISTRY.clear()
-        try:
-            action()
-            self._emit_reload_event(old_stages)
-            return True
-        except Exception as e:
-            _logger.warning(f"Pipeline invalid: {e}")
-            registry.REGISTRY.restore(old_stages)
-            return False
-
-    def _reload_from_pipeline_file(
-        self, path: pathlib.Path, old_stages: dict[str, RegistryStageInfo]
-    ) -> bool:
-        """Reload from pivot.yaml file."""
-        from pivot.pipeline import yaml as pipeline_yaml
-
-        return self._try_reload(
-            lambda: pipeline_yaml.register_from_pipeline_file(path),
-            old_stages,
-        )
-
-    def _reload_from_pipeline_py(
-        self, path: pathlib.Path, old_stages: dict[str, RegistryStageInfo]
-    ) -> bool:
-        """Reload from pipeline.py file."""
-        return self._try_reload(
-            lambda: runpy.run_path(str(path), run_name="_pivot_pipeline"),
-            old_stages,
-        )
-
-    def _reload_from_decorators(self, old_stages: dict[str, RegistryStageInfo]) -> bool:
-        """Reload by reimporting stage modules."""
-        modules: set[str] = set()
-        for info in old_stages.values():
-            func = info["func"]
-            module_name = getattr(func, "__module__", None)
-            if module_name and module_name in sys.modules:
-                modules.add(module_name)
-
-        if not modules:
-            return True
-
-        registry.REGISTRY.clear()
-        errors = list[str]()
-
-        for module_name in modules:
-            try:
-                importlib.import_module(module_name)
-            except Exception as e:
-                errors.append(f"{module_name}: {e}")
-
-        if errors:
-            registry.REGISTRY.restore(old_stages)
-            return False
-
-        self._emit_reload_event(old_stages)
-        return True
-
     def _emit_reload_event(self, old_stages: dict[str, RegistryStageInfo]) -> None:
         """Emit PipelineReloaded event with diff information."""
-        new_stage_names = list(registry.REGISTRY.list_stages())
+        new_stage_names = self._list_stages()
         new_stages_set = set(new_stage_names)
         old_stage_names = set(old_stages.keys())
 
@@ -788,7 +747,7 @@ class Engine:
         modified = list[str]()
         for stage_name in sorted(old_stage_names & new_stages_set):
             old_info = old_stages[stage_name]
-            new_info = registry.REGISTRY.get(stage_name)
+            new_info = self._get_stage(stage_name)
             if old_info["fingerprint"] != new_info["fingerprint"]:
                 modified.append(stage_name)
 
@@ -833,7 +792,7 @@ class Engine:
         stages_set = set(execution_order)
 
         for stage_name in execution_order:
-            stage_info = registry.REGISTRY.get(stage_name)
+            stage_info = self._get_stage(stage_name)
 
             # Upstream stages that must complete first (uses bipartite graph)
             if self._graph is not None:
@@ -912,9 +871,16 @@ class Engine:
         """Get (1-based index, total count) for a stage.
 
         Used for progress reporting in events.
+        Returns (0, 0) if stage is not tracked (defensive fallback).
         """
-        stage_index = list(self._stage_states.keys()).index(stage_name) + 1
-        total_stages = len(self._stage_states)
+        stage_keys = list(self._stage_states.keys())
+        total_stages = len(stage_keys)
+        try:
+            stage_index = stage_keys.index(stage_name) + 1
+        except ValueError:
+            # Stage not in tracking dict - shouldn't happen but return safe default
+            _logger.warning("Stage %s not found in stage_states during index lookup", stage_name)
+            return 0, total_stages
         return stage_index, total_stages
 
     def _emit_skipped_stage(
@@ -987,7 +953,7 @@ class Engine:
 
             # Get stage info and prepare worker info in main process
             # (worker processes may not have test-registered stages)
-            stage_info = registry.REGISTRY.get(stage_name)
+            stage_info = self._get_stage(stage_name)
             worker_info = executor_core.prepare_worker_info(
                 stage_info,
                 overrides,
@@ -997,7 +963,7 @@ class Engine:
                 no_commit,
                 no_cache,
                 project_root,
-                state_dir,
+                default_state_dir=state_dir,
             )
 
             # Submit to executor using worker.execute_stage directly
@@ -1181,7 +1147,7 @@ class Engine:
         executor_core.verify_tracked_files(project_root, checkout_missing=checkout_missing)
 
         # Build bipartite graph (single source of truth)
-        all_stages = {name: registry.REGISTRY.get(name) for name in registry.REGISTRY.list_stages()}
+        all_stages = self._get_all_stages()
         self._graph = engine_graph.build_graph(all_stages)
 
         # Validate dependencies exist (raises DependencyNotFoundError if missing)
@@ -1207,7 +1173,9 @@ class Engine:
 
         # Check for uncached IncrementalOut files that would be lost
         if not allow_uncached_incremental:
-            uncached = executor_core.check_uncached_incremental_outputs(execution_order)
+            uncached = executor_core.check_uncached_incremental_outputs(
+                execution_order, self._get_all_stages()
+            )
             if uncached:
                 from pivot import exceptions
 
@@ -1311,7 +1279,7 @@ class Engine:
 
                             # Apply deferred writes for successful stages (only in commit mode)
                             if result["status"] == StageStatus.RAN and not no_commit:
-                                stage_info = registry.REGISTRY.get(stage_name)
+                                stage_info = self._get_stage(stage_name)
                                 output_paths = [str(out.path) for out in stage_info["outs"]]
                                 executor_core.apply_deferred_writes(
                                     stage_name, output_paths, result, state_db
@@ -1345,7 +1313,8 @@ class Engine:
                             n
                             for n, s in self._stage_states.items()
                             if s == StageExecutionState.COMPLETED
-                            and results.get(n, {}).get("status") == StageStatus.FAILED
+                            and n in results
+                            and results[n]["status"] == StageStatus.FAILED
                         ]
                         if failed:
                             self._stop_starting_new = True
@@ -1396,11 +1365,7 @@ class Engine:
                     if state == StageExecutionState.BLOCKED and name not in results:
                         # Find which upstream stage failed
                         failed_upstream = next(
-                            (
-                                n
-                                for n, r in results.items()
-                                if r.get("status") == StageStatus.FAILED
-                            ),
+                            (n for n, r in results.items() if r["status"] == StageStatus.FAILED),
                             "unknown",
                         )
                         self._emit_skipped_stage(
@@ -1485,7 +1450,7 @@ class Engine:
         Sets state to ACTIVE atomically before submitting to prevent race
         conditions where concurrent calls could both see IDLE state.
         """
-        stages_to_run = stages or list(registry.REGISTRY.list_stages())
+        stages_to_run = stages or self._list_stages()
 
         with self._run_lock:
             if self._state != EngineState.IDLE:

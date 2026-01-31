@@ -11,6 +11,8 @@ from pivot.storage import cache, track
 if TYPE_CHECKING:
     import click.testing
 
+    from pivot.pipeline.pipeline import Pipeline
+
 
 # =============================================================================
 # Path Traversal Security Tests
@@ -232,50 +234,56 @@ def test_pvt_file_yaml_invalid_type_rejected(tmp_path: pathlib.Path) -> None:
 
 
 def test_directory_track_processes_valid_files(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    mock_discovery: Pipeline,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Track on directory processes valid regular files."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        pathlib.Path(".pivot").mkdir()
+    monkeypatch.chdir(tmp_path)
+    pathlib.Path(".git").mkdir()
+    pathlib.Path(".pivot").mkdir()
 
-        # Create directory with valid file
-        data_dir = pathlib.Path("data_dir")
-        data_dir.mkdir()
-        (data_dir / "valid.txt").write_text("content")
+    # Create directory with valid file
+    data_dir = pathlib.Path("data_dir")
+    data_dir.mkdir()
+    (data_dir / "valid.txt").write_text("content")
 
-        result = runner.invoke(cli.cli, ["track", "data_dir"])
+    result = runner.invoke(cli.cli, ["track", "data_dir"])
 
-        # Should succeed and track the directory
-        assert result.exit_code == 0
-        assert "Tracked: data_dir" in result.output
+    # Should succeed and track the directory
+    assert result.exit_code == 0
+    assert "Tracked: data_dir" in result.output
 
 
 def test_directory_track_creates_pvt_file(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    mock_discovery: Pipeline,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Track on directory creates .pvt file with manifest."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        pathlib.Path(".pivot").mkdir()
+    monkeypatch.chdir(tmp_path)
+    pathlib.Path(".git").mkdir()
+    pathlib.Path(".pivot").mkdir()
 
-        # Create directory with files
-        data_dir = pathlib.Path("data_dir")
-        data_dir.mkdir()
-        (data_dir / "file1.txt").write_text("content1")
-        (data_dir / "file2.txt").write_text("content2")
+    # Create directory with files
+    data_dir = pathlib.Path("data_dir")
+    data_dir.mkdir()
+    (data_dir / "file1.txt").write_text("content1")
+    (data_dir / "file2.txt").write_text("content2")
 
-        result = runner.invoke(cli.cli, ["track", "data_dir"])
+    result = runner.invoke(cli.cli, ["track", "data_dir"])
 
-        assert result.exit_code == 0
+    assert result.exit_code == 0
 
-        # Check pvt file was created
-        pvt_path = pathlib.Path("data_dir.pvt")
-        assert pvt_path.exists()
+    # Check pvt file was created
+    pvt_path = pathlib.Path("data_dir.pvt")
+    assert pvt_path.exists()
 
-        # Read and verify structure
-        pvt_data = track.read_pvt_file(pvt_path)
-        assert pvt_data is not None
-        assert pvt_data["path"] == "data_dir"
-        assert "manifest" in pvt_data
-        assert "num_files" in pvt_data and pvt_data["num_files"] == 2
+    # Read and verify structure
+    pvt_data = track.read_pvt_file(pvt_path)
+    assert pvt_data is not None
+    assert pvt_data["path"] == "data_dir"
+    assert "manifest" in pvt_data
+    assert "num_files" in pvt_data and pvt_data["num_files"] == 2

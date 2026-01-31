@@ -3,8 +3,8 @@ from __future__ import annotations
 import pathlib
 from typing import TYPE_CHECKING, Annotated, TypedDict
 
-from helpers import register_test_stage
-from pivot import cli, executor, loaders, outputs
+from helpers import create_pipeline_py
+from pivot import cli, loaders, outputs
 from pivot.storage import lock
 
 if TYPE_CHECKING:
@@ -29,6 +29,13 @@ def _helper_process(
     return {"output": pathlib.Path("output.txt")}
 
 
+# Extra code to include the TypedDict in generated pipeline.py
+_EXTRA_CODE = """
+class _ProcessOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
+"""
+
+
 # =============================================================================
 # commit --list tests
 # =============================================================================
@@ -50,12 +57,16 @@ def test_commit_list_shows_pending(runner: click.testing.CliRunner, tmp_path: pa
     """commit --list shows stages pending from --no-commit runs."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
+        pathlib.Path(".pivot/cache/files").mkdir(parents=True)
         pathlib.Path("input.txt").write_text("data")
 
-        register_test_stage(_helper_process, name="process")
+        create_pipeline_py(
+            [_helper_process], names={"_helper_process": "process"}, extra_code=_EXTRA_CODE
+        )
 
         # Run with --no-commit
-        executor.run(no_commit=True)
+        run_result = runner.invoke(cli.cli, ["run", "--no-commit"])
+        assert run_result.exit_code == 0, f"Run failed: {run_result.output}"
 
         result = runner.invoke(cli.cli, ["commit", "--list"])
 
@@ -88,12 +99,16 @@ def test_commit_promotes_pending_to_production(
     """commit promotes pending locks to production."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
+        pathlib.Path(".pivot/cache/files").mkdir(parents=True)
         pathlib.Path("input.txt").write_text("data")
 
-        register_test_stage(_helper_process, name="process")
+        create_pipeline_py(
+            [_helper_process], names={"_helper_process": "process"}, extra_code=_EXTRA_CODE
+        )
 
         # Run with --no-commit
-        executor.run(no_commit=True)
+        run_result = runner.invoke(cli.cli, ["run", "--no-commit"])
+        assert run_result.exit_code == 0, f"Run failed: {run_result.output}"
 
         # Verify pending lock exists
         project_root = pathlib.Path.cwd()
@@ -134,12 +149,16 @@ def test_commit_discard_removes_pending(
     """commit --discard removes pending locks without committing."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
+        pathlib.Path(".pivot/cache/files").mkdir(parents=True)
         pathlib.Path("input.txt").write_text("data")
 
-        register_test_stage(_helper_process, name="process")
+        create_pipeline_py(
+            [_helper_process], names={"_helper_process": "process"}, extra_code=_EXTRA_CODE
+        )
 
         # Run with --no-commit
-        executor.run(no_commit=True)
+        run_result = runner.invoke(cli.cli, ["run", "--no-commit"])
+        assert run_result.exit_code == 0, f"Run failed: {run_result.output}"
 
         # Verify pending lock exists
         project_root = pathlib.Path.cwd()
@@ -167,13 +186,16 @@ def test_run_no_commit_creates_pending_lock(
     """run --no-commit creates pending lock instead of production lock."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
+        pathlib.Path(".pivot/cache/files").mkdir(parents=True)
         pathlib.Path("input.txt").write_text("data")
 
-        register_test_stage(_helper_process, name="process")
+        create_pipeline_py(
+            [_helper_process], names={"_helper_process": "process"}, extra_code=_EXTRA_CODE
+        )
 
         result = runner.invoke(cli.cli, ["run", "--no-commit"])
 
-        assert result.exit_code == 0
+        assert result.exit_code == 0, f"Run failed: {result.output}"
 
         # Verify pending lock exists
         project_root = pathlib.Path.cwd()
@@ -192,12 +214,16 @@ def test_run_no_commit_second_run_skips(
     """Second run --no-commit skips unchanged stages (uses pending lock)."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
+        pathlib.Path(".pivot/cache/files").mkdir(parents=True)
         pathlib.Path("input.txt").write_text("data")
 
-        register_test_stage(_helper_process, name="process")
+        create_pipeline_py(
+            [_helper_process], names={"_helper_process": "process"}, extra_code=_EXTRA_CODE
+        )
 
-        # First run via executor to set up pending lock
-        executor.run(no_commit=True)
+        # First run via CLI to set up pending lock
+        first_result = runner.invoke(cli.cli, ["run", "--no-commit"])
+        assert first_result.exit_code == 0, f"First run failed: {first_result.output}"
 
         # Second run via CLI should use cache
         result = runner.invoke(cli.cli, ["run", "--no-commit"])
@@ -211,12 +237,16 @@ def test_run_no_commit_then_commit_workflow(
     """Full workflow: run --no-commit, then commit, then run uses production lock."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
+        pathlib.Path(".pivot/cache/files").mkdir(parents=True)
         pathlib.Path("input.txt").write_text("data")
 
-        register_test_stage(_helper_process, name="process")
+        create_pipeline_py(
+            [_helper_process], names={"_helper_process": "process"}, extra_code=_EXTRA_CODE
+        )
 
-        # Run with --no-commit via executor
-        executor.run(no_commit=True)
+        # Run with --no-commit via CLI
+        run_result = runner.invoke(cli.cli, ["run", "--no-commit"])
+        assert run_result.exit_code == 0, f"Run failed: {run_result.output}"
 
         # Commit via CLI
         result1 = runner.invoke(cli.cli, ["commit"])

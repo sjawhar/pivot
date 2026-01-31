@@ -4,21 +4,39 @@ import json
 import pathlib
 from typing import TYPE_CHECKING, Annotated, TypedDict
 
-from helpers import register_test_stage
-from pivot import cli, executor, loaders, outputs
+from helpers import create_pipeline_py, get_test_pipeline, register_test_stage
+from pivot import cli, loaders, outputs
 from pivot import status as status_mod
-from pivot.registry import REGISTRY
 from pivot.storage import cache, track
 from pivot.types import RemoteSyncInfo
 
 if TYPE_CHECKING:
     import click.testing
+    import pytest
     from pytest_mock import MockerFixture
+
+    from pivot.pipeline.pipeline import Pipeline
 
 
 # =============================================================================
 # Module-level TypedDicts and Stage Functions for annotation-based registration
 # =============================================================================
+
+# TypedDict definitions for use with create_pipeline_py extra_code
+_TYPEDDICT_OUTPUT_TXT = """\
+class _OutputTxtOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
+"""
+
+_TYPEDDICT_A_TXT = """\
+class _ATxtOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("a.txt", loaders.PathOnly())]
+"""
+
+_TYPEDDICT_B_TXT = """\
+class _BTxtOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("b.txt", loaders.PathOnly())]
+"""
 
 
 class _OutputTxtOutputs(TypedDict):
@@ -55,6 +73,14 @@ def test_status_no_stages(runner: click.testing.CliRunner, tmp_path: pathlib.Pat
     """Status with no stages shows appropriate message."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
+
+        # Create empty pipeline
+        pathlib.Path("pipeline.py").write_text("""\
+from __future__ import annotations
+from pivot.pipeline.pipeline import Pipeline
+
+pipeline = Pipeline('test')
+""")
 
         result = runner.invoke(cli.cli, ["status"])
 
@@ -113,7 +139,11 @@ def test_status_shows_stale_stages(runner: click.testing.CliRunner, tmp_path: pa
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
 
-        register_test_stage(_helper_process, name="process")
+        create_pipeline_py(
+            [_helper_process],
+            extra_code=_TYPEDDICT_OUTPUT_TXT,
+            names={"_helper_process": "process"},
+        )
 
         result = runner.invoke(cli.cli, ["status"])
 
@@ -131,9 +161,13 @@ def test_status_shows_cached_stages(
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
 
-        register_test_stage(_helper_process, name="process")
+        create_pipeline_py(
+            [_helper_process],
+            extra_code=_TYPEDDICT_OUTPUT_TXT,
+            names={"_helper_process": "process"},
+        )
 
-        executor.run()
+        runner.invoke(cli.cli, ["run"])
 
         result = runner.invoke(cli.cli, ["status"])
 
@@ -150,10 +184,13 @@ def test_status_verbose_shows_all_stages(
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
 
-        register_test_stage(_helper_stage_a, name="stage_a")
-        register_test_stage(_helper_stage_b, name="stage_b")
+        create_pipeline_py(
+            [_helper_stage_a, _helper_stage_b],
+            extra_code=_TYPEDDICT_A_TXT + "\n" + _TYPEDDICT_B_TXT,
+            names={"_helper_stage_a": "stage_a", "_helper_stage_b": "stage_b"},
+        )
 
-        executor.run()
+        runner.invoke(cli.cli, ["run"])
 
         result = runner.invoke(cli.cli, ["status", "--verbose"])
 
@@ -168,8 +205,11 @@ def test_status_specific_stages(runner: click.testing.CliRunner, tmp_path: pathl
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
 
-        register_test_stage(_helper_stage_a, name="stage_a")
-        register_test_stage(_helper_stage_b, name="stage_b")
+        create_pipeline_py(
+            [_helper_stage_a, _helper_stage_b],
+            extra_code=_TYPEDDICT_A_TXT + "\n" + _TYPEDDICT_B_TXT,
+            names={"_helper_stage_a": "stage_a", "_helper_stage_b": "stage_b"},
+        )
 
         result = runner.invoke(cli.cli, ["status", "stage_a"])
 
@@ -183,6 +223,14 @@ def test_status_unknown_stage_errors(
     """Status with unknown stage shows error."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
+
+        # Create empty pipeline
+        pathlib.Path("pipeline.py").write_text("""\
+from __future__ import annotations
+from pivot.pipeline.pipeline import Pipeline
+
+pipeline = Pipeline('test')
+""")
 
         result = runner.invoke(cli.cli, ["status", "nonexistent"])
 
@@ -201,6 +249,14 @@ def test_status_shows_tracked_files(
     """Status shows tracked files section with verbose."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
+
+        # Create empty pipeline
+        pathlib.Path("pipeline.py").write_text("""\
+from __future__ import annotations
+from pivot.pipeline.pipeline import Pipeline
+
+pipeline = Pipeline('test')
+""")
 
         data_file = pathlib.Path("data.txt")
         data_file.write_text("content")
@@ -223,6 +279,14 @@ def test_status_shows_modified_tracked_files(
     """Status shows modified tracked files."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
+
+        # Create empty pipeline
+        pathlib.Path("pipeline.py").write_text("""\
+from __future__ import annotations
+from pivot.pipeline.pipeline import Pipeline
+
+pipeline = Pipeline('test')
+""")
 
         data_file = pathlib.Path("data.txt")
         data_file.write_text("original")
@@ -257,7 +321,11 @@ def test_status_stages_only(runner: click.testing.CliRunner, tmp_path: pathlib.P
         pvt_data = track.PvtData(path="data.txt", hash=file_hash, size=7)
         track.write_pvt_file(pathlib.Path("data.txt.pvt"), pvt_data)
 
-        register_test_stage(_helper_process, name="process")
+        create_pipeline_py(
+            [_helper_process],
+            extra_code=_TYPEDDICT_OUTPUT_TXT,
+            names={"_helper_process": "process"},
+        )
 
         result = runner.invoke(cli.cli, ["status", "--stages-only"])
 
@@ -279,7 +347,11 @@ def test_status_tracked_only(runner: click.testing.CliRunner, tmp_path: pathlib.
         pvt_data = track.PvtData(path="data.txt", hash=file_hash, size=7)
         track.write_pvt_file(pathlib.Path("data.txt.pvt"), pvt_data)
 
-        register_test_stage(_helper_process, name="process")
+        create_pipeline_py(
+            [_helper_process],
+            extra_code=_TYPEDDICT_OUTPUT_TXT,
+            names={"_helper_process": "process"},
+        )
 
         result = runner.invoke(cli.cli, ["status", "--tracked-only"])
 
@@ -306,7 +378,9 @@ def test_status_remote_only_no_remotes(
 # =============================================================================
 
 
-def test_status_json_output(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
+def test_status_json_output(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, mock_discovery: Pipeline
+) -> None:
     """--json outputs valid JSON."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
@@ -324,7 +398,7 @@ def test_status_json_output(runner: click.testing.CliRunner, tmp_path: pathlib.P
 
 
 def test_status_json_includes_suggestions(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, mock_discovery: Pipeline
 ) -> None:
     """--json includes suggestions when applicable."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
@@ -346,7 +420,9 @@ def test_status_json_includes_suggestions(
 # =============================================================================
 
 
-def test_status_shows_suggestions(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
+def test_status_shows_suggestions(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, mock_discovery: Pipeline
+) -> None:
     """Status shows actionable suggestions."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
@@ -381,7 +457,7 @@ def test_status_tracked_only_no_files(
 
 
 def test_status_stages_only_no_stages(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, mock_discovery: Pipeline
 ) -> None:
     """--stages-only with no stages shows explicit message."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
@@ -395,7 +471,7 @@ def test_status_stages_only_no_stages(
 
 
 def test_status_json_includes_empty_arrays(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, mock_discovery: Pipeline
 ) -> None:
     """--json includes empty arrays for requested sections."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
@@ -412,7 +488,7 @@ def test_status_json_includes_empty_arrays(
 
 
 def test_status_json_stages_only_empty(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, mock_discovery: Pipeline
 ) -> None:
     """--json --stages-only includes empty stages array."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
@@ -433,26 +509,29 @@ def test_status_json_stages_only_empty(
 
 
 def test_status_quiet_no_output_when_clean(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    mock_discovery: Pipeline,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """pivot --quiet status produces no output when all stages are cached."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        pathlib.Path("input.txt").write_text("data")
+    monkeypatch.chdir(tmp_path)
+    pathlib.Path(".git").mkdir()
+    pathlib.Path("input.txt").write_text("data")
 
-        register_test_stage(_helper_process, name="process")
+    register_test_stage(_helper_process, name="process")
 
-        # Run once to cache
-        executor.run()
+    # Run once to cache via CLI
+    runner.invoke(cli.cli, ["run"])
 
-        result = runner.invoke(cli.cli, ["--quiet", "status"])
+    result = runner.invoke(cli.cli, ["--quiet", "status"])
 
-        assert result.exit_code == 0
-        assert result.output.strip() == "", "Quiet mode should suppress output when clean"
+    assert result.exit_code == 0
+    assert result.output.strip() == "", "Quiet mode should suppress output when clean"
 
 
 def test_status_quiet_exits_1_when_stale(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, mock_discovery: Pipeline
 ) -> None:
     """pivot --quiet status exits 1 when stages are stale."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
@@ -469,7 +548,7 @@ def test_status_quiet_exits_1_when_stale(
 
 
 def test_status_quiet_exits_1_when_modified(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, mock_discovery: Pipeline
 ) -> None:
     """pivot --quiet status exits 1 when files are modified."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
@@ -478,8 +557,8 @@ def test_status_quiet_exits_1_when_modified(
 
         register_test_stage(_helper_process, name="process")
 
-        # Run to cache
-        executor.run()
+        # Run to cache via CLI
+        runner.invoke(cli.cli, ["run"])
 
         # Modify input file
         pathlib.Path("input.txt").write_text("modified data")
@@ -497,7 +576,10 @@ def test_status_quiet_exits_1_when_modified(
 
 
 def test_status_remote_with_configured_remote(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path, mocker: MockerFixture
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    mocker: MockerFixture,
+    mock_discovery: Pipeline,
 ) -> None:
     """--remote shows sync status when remote is configured."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
@@ -523,7 +605,10 @@ def test_status_remote_with_configured_remote(
 
 
 def test_status_remote_only_with_remote(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path, mocker: MockerFixture
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    mocker: MockerFixture,
+    mock_discovery: Pipeline,
 ) -> None:
     """--remote-only shows only remote sync counts."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
@@ -552,7 +637,10 @@ def test_status_remote_only_with_remote(
 
 
 def test_status_json_with_remote(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path, mocker: MockerFixture
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    mocker: MockerFixture,
+    mock_discovery: Pipeline,
 ) -> None:
     """JSON output includes remote status when --remote is used."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
@@ -592,7 +680,7 @@ def test_status_explain_flag_in_help(runner: click.testing.CliRunner) -> None:
 
 
 def test_status_explain_shows_detailed_output(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, mock_discovery: Pipeline
 ) -> None:
     """--explain shows detailed change information."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
@@ -610,26 +698,33 @@ def test_status_explain_shows_detailed_output(
 
 
 def test_status_explain_shows_code_changes(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    mock_discovery: Pipeline,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """--explain shows code changes when code differs."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        pathlib.Path("input.txt").write_text("data")
+    monkeypatch.chdir(tmp_path)
+    pathlib.Path(".git").mkdir()
+    pathlib.Path("input.txt").write_text("data")
 
-        register_test_stage(_helper_process_v1, name="process")
-        executor.run()
+    register_test_stage(_helper_process_v1, name="process")
+    runner.invoke(cli.cli, ["run"])
 
-        REGISTRY._stages.clear()
-        register_test_stage(_helper_process_v2, name="process")
+    # Clear and re-register with different implementation to simulate code change
+    pipeline = get_test_pipeline()
+    pipeline.clear()
+    register_test_stage(_helper_process_v2, name="process")
 
-        result = runner.invoke(cli.cli, ["status", "--explain"])
+    result = runner.invoke(cli.cli, ["status", "--explain"])
 
-        assert result.exit_code == 0
-        assert "Code" in result.output
+    assert result.exit_code == 0
+    assert "Code" in result.output
 
 
-def test_status_explain_short_flag(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
+def test_status_explain_short_flag(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, mock_discovery: Pipeline
+) -> None:
     """-e short flag works like --explain."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
@@ -644,7 +739,7 @@ def test_status_explain_short_flag(runner: click.testing.CliRunner, tmp_path: pa
 
 
 def test_status_explain_json_format(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, mock_discovery: Pipeline
 ) -> None:
     """--explain --json returns extended format with change arrays."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
@@ -666,7 +761,7 @@ def test_status_explain_json_format(
 
 
 def test_status_json_without_explain_no_changes(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, mock_discovery: Pipeline
 ) -> None:
     """--json without --explain does NOT include change arrays."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
@@ -721,89 +816,99 @@ def _upstream_stage_b(
 
 
 def test_status_upstream_propagation(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    mock_discovery: Pipeline,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Status shows B as stale when upstream A is stale."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        pathlib.Path("input.txt").write_text("data")
+    monkeypatch.chdir(tmp_path)
+    pathlib.Path(".git").mkdir()
+    pathlib.Path("input.txt").write_text("data")
 
-        register_test_stage(_upstream_stage_a_v1, name="stage_a")
-        register_test_stage(_upstream_stage_b, name="stage_b")
+    register_test_stage(_upstream_stage_a_v1, name="stage_a")
+    register_test_stage(_upstream_stage_b, name="stage_b")
 
-        executor.run()
+    runner.invoke(cli.cli, ["run"])
 
-        # Modify stage_a's code
-        REGISTRY._stages.clear()
-        register_test_stage(_upstream_stage_a_v2, name="stage_a")
-        register_test_stage(_upstream_stage_b, name="stage_b")
+    # Modify stage_a's code - clear and re-register via test pipeline
+    pipeline = get_test_pipeline()
+    pipeline.clear()
+    register_test_stage(_upstream_stage_a_v2, name="stage_a")
+    register_test_stage(_upstream_stage_b, name="stage_b")
 
-        result = runner.invoke(cli.cli, ["status", "--verbose"])
+    result = runner.invoke(cli.cli, ["status", "--verbose"])
 
-        assert result.exit_code == 0
-        # Both stages should show as stale
-        assert "stage_a" in result.output
-        assert "stage_b" in result.output
-        # B should show upstream stale reason
-        assert "Upstream stale" in result.output or "upstream" in result.output.lower()
+    assert result.exit_code == 0
+    # Both stages should show as stale
+    assert "stage_a" in result.output
+    assert "stage_b" in result.output
+    # B should show upstream stale reason
+    assert "Upstream stale" in result.output or "upstream" in result.output.lower()
 
 
 def test_status_explain_upstream_propagation(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    mock_discovery: Pipeline,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """--explain shows B with upstream_stale when A is stale."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        pathlib.Path("input.txt").write_text("data")
+    monkeypatch.chdir(tmp_path)
+    pathlib.Path(".git").mkdir()
+    pathlib.Path("input.txt").write_text("data")
 
-        register_test_stage(_upstream_stage_a_v1, name="stage_a")
-        register_test_stage(_upstream_stage_b, name="stage_b")
+    register_test_stage(_upstream_stage_a_v1, name="stage_a")
+    register_test_stage(_upstream_stage_b, name="stage_b")
 
-        executor.run()
+    runner.invoke(cli.cli, ["run"])
 
-        # Modify stage_a's code
-        REGISTRY._stages.clear()
-        register_test_stage(_upstream_stage_a_v2, name="stage_a")
-        register_test_stage(_upstream_stage_b, name="stage_b")
+    # Modify stage_a's code - clear and re-register via test pipeline
+    pipeline = get_test_pipeline()
+    pipeline.clear()
+    register_test_stage(_upstream_stage_a_v2, name="stage_a")
+    register_test_stage(_upstream_stage_b, name="stage_b")
 
-        result = runner.invoke(cli.cli, ["status", "--explain"])
+    result = runner.invoke(cli.cli, ["status", "--explain"])
 
-        assert result.exit_code == 0
-        # B should show upstream stale reason
-        assert "Upstream stale" in result.output or "upstream" in result.output.lower()
+    assert result.exit_code == 0
+    # B should show upstream stale reason
+    assert "Upstream stale" in result.output or "upstream" in result.output.lower()
 
 
 def test_status_explain_json_upstream_propagation(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    mock_discovery: Pipeline,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """--explain --json shows upstream_stale in stage info."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        pathlib.Path("input.txt").write_text("data")
+    monkeypatch.chdir(tmp_path)
+    pathlib.Path(".git").mkdir()
+    pathlib.Path("input.txt").write_text("data")
 
-        register_test_stage(_upstream_stage_a_v1, name="stage_a")
-        register_test_stage(_upstream_stage_b, name="stage_b")
+    register_test_stage(_upstream_stage_a_v1, name="stage_a")
+    register_test_stage(_upstream_stage_b, name="stage_b")
 
-        executor.run()
+    runner.invoke(cli.cli, ["run"])
 
-        # Modify stage_a's code
-        REGISTRY._stages.clear()
-        register_test_stage(_upstream_stage_a_v2, name="stage_a")
-        register_test_stage(_upstream_stage_b, name="stage_b")
+    # Modify stage_a's code - clear and re-register via test pipeline
+    pipeline = get_test_pipeline()
+    pipeline.clear()
+    register_test_stage(_upstream_stage_a_v2, name="stage_a")
+    register_test_stage(_upstream_stage_b, name="stage_b")
 
-        result = runner.invoke(cli.cli, ["status", "--explain", "--json"])
+    result = runner.invoke(cli.cli, ["status", "--explain", "--json"])
 
-        assert result.exit_code == 0
-        data = json.loads(result.output)
-        assert "stages" in data
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert "stages" in data
 
-        # Find stage_b in output
-        stage_b = next((s for s in data["stages"] if s["name"] == "stage_b"), None)
-        assert stage_b is not None, "stage_b should be in output"
-        assert "upstream_stale" in stage_b, "stage_b should have upstream_stale field"
-        assert "stage_a" in stage_b["upstream_stale"], (
-            "stage_a should be in stage_b's upstream_stale"
-        )
+    # Find stage_b in output
+    stage_b = next((s for s in data["stages"] if s["name"] == "stage_b"), None)
+    assert stage_b is not None, "stage_b should be in output"
+    assert "upstream_stale" in stage_b, "stage_b should have upstream_stale field"
+    assert "stage_a" in stage_b["upstream_stale"], "stage_a should be in stage_b's upstream_stale"
 
 
 # =============================================================================

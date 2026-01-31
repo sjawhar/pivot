@@ -5,8 +5,9 @@ import logging
 import click
 import networkx as nx
 
-from pivot import dag, project, registry
+from pivot import dag, project
 from pivot.cli import decorators as cli_decorators
+from pivot.cli import helpers as cli_helpers
 from pivot.cli import targets as cli_targets
 from pivot.engine import graph as engine_graph
 from pivot.engine import types as engine_types
@@ -26,7 +27,7 @@ def _resolve_targets_to_stages(
     Returns:
         Tuple of (resolved stage names, unresolved targets).
     """
-    registered_stages = set(registry.REGISTRY.list_stages())
+    registered_stages = set(cli_helpers.list_stages())
     result = set[str]()
     unresolved = list[str]()
 
@@ -100,8 +101,8 @@ def dag_cmd(
     TARGETS can be stage names or artifact paths. Stage names take precedence
     when a name matches both a stage and a file path.
     """
-    # Build bipartite graph from registry
-    all_stages = {name: registry.REGISTRY.get(name) for name in registry.REGISTRY.list_stages()}
+    # Build bipartite graph from pipeline
+    all_stages = cli_helpers.get_all_stages()
     bipartite_graph = engine_graph.build_graph(all_stages)
 
     # Filter to subgraph if targets provided

@@ -3,15 +3,45 @@ from typing import TYPE_CHECKING, Annotated, Any, TypedDict, cast
 
 import pytest
 
-from helpers import register_test_stage
-from pivot import exceptions, executor, loaders, outputs
+from helpers import get_test_pipeline, register_test_stage
+from pivot import exceptions, loaders, outputs
+from pivot.engine import sinks, sources
+from pivot.engine.engine import Engine
+from pivot.executor import core as executor_core
 from pivot.executor import worker
-from pivot.registry import REGISTRY
+from pivot.pipeline.pipeline import Pipeline
+from pivot.registry import StageRegistry
 from pivot.storage import cache, lock
 from pivot.types import FileHash, LockData
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+
+def _run_engine_once(
+    engine: Engine,
+    *,
+    cache_dir: pathlib.Path | None = None,
+    force: bool = False,
+    no_commit: bool = False,
+    allow_uncached_incremental: bool = False,
+) -> dict[str, executor_core.ExecutionSummary]:
+    """Helper to run engine in one-shot mode (replaces deprecated run_once)."""
+    collector = sinks.ResultCollectorSink()
+    engine.add_sink(collector)
+    engine.add_source(
+        sources.OneShotSource(
+            stages=None,
+            force=force,
+            reason="test",
+            no_commit=no_commit,
+            cache_dir=cache_dir,
+            allow_uncached_incremental=allow_uncached_incremental,
+        )
+    )
+    engine.run(exit_on_completion=True)
+    return collector.get_execution_summaries()
+
 
 # =============================================================================
 # Output TypedDicts for annotation-based stages
@@ -77,7 +107,8 @@ def _register_incremental_stage(
 
     # Replace the Out with IncrementalOut in the registry
     # This is a test-only hack to test IncrementalOut behavior
-    stage_info = REGISTRY._stages[name]
+    pipeline = get_test_pipeline()
+    stage_info = pipeline._registry._stages[name]
     stage_info["outs"] = [outputs.IncrementalOut(path=out_path, loader=loaders.PathOnly())]
     stage_info["outs_paths"] = [out_path]
 
@@ -214,7 +245,7 @@ def test_prepare_outputs_incremental_missing_cache_error(
 def test_integration_missing_cache_error_includes_recovery_suggestion(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
-    clean_registry: None,
+    test_pipeline: Pipeline,
     no_commit: bool,
     expected_lock_dir: str,
 ) -> None:
@@ -234,7 +265,14 @@ def test_integration_missing_cache_error_includes_recovery_suggestion(
     )
 
     # First run creates and caches the output
-    results1 = executor.run(cache_dir=cache_dir, no_commit=no_commit)
+    with Engine(pipeline=test_pipeline) as engine:
+        collector1 = sinks.ResultCollectorSink()
+        engine.add_sink(collector1)
+        engine.add_source(
+            sources.OneShotSource(stages=None, force=False, reason="test", no_commit=no_commit)
+        )
+        engine.run(exit_on_completion=True)
+        results1 = collector1.get_execution_summaries()
     assert results1["append_stage"]["status"] == "ran"
 
     # Delete the cache files AND output file (but keep the lock file)
@@ -243,7 +281,14 @@ def test_integration_missing_cache_error_includes_recovery_suggestion(
     db_path.unlink()
 
     # Second run with force should fail with helpful error message
-    results2 = executor.run(cache_dir=cache_dir, force=True, no_commit=no_commit)
+    with Engine(pipeline=test_pipeline) as engine:
+        collector2 = sinks.ResultCollectorSink()
+        engine.add_sink(collector2)
+        engine.add_source(
+            sources.OneShotSource(stages=None, force=True, reason="test", no_commit=no_commit)
+        )
+        engine.run(exit_on_completion=True)
+        results2 = collector2.get_execution_summaries()
     assert results2["append_stage"]["status"] == "failed"
 
     reason = results2["append_stage"]["reason"]
@@ -282,7 +327,7 @@ def test_dvc_export_incremental_out_with_cache_false() -> None:
 
 
 def test_integration_first_run_creates_output(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, clean_registry: None
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, test_pipeline: Pipeline
 ) -> None:
     """First run with IncrementalOut should create the output from scratch."""
     monkeypatch.setattr("pivot.project.get_project_root", lambda: tmp_path)
@@ -296,7 +341,8 @@ def test_integration_first_run_creates_output(
         out_path=str(db_path),
     )
 
-    results = executor.run(cache_dir=tmp_path / ".pivot" / "cache")
+    with Engine(pipeline=test_pipeline) as engine:
+        results = _run_engine_once(engine, cache_dir=tmp_path / ".pivot" / "cache")
 
     assert results["append_stage"]["status"] == "ran"
     assert db_path.exists()
@@ -304,7 +350,7 @@ def test_integration_first_run_creates_output(
 
 
 def test_integration_second_run_appends_to_output(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, clean_registry: None
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, test_pipeline: Pipeline
 ) -> None:
     """Second run should restore and append to existing output."""
     monkeypatch.setattr("pivot.project.get_project_root", lambda: tmp_path)
@@ -321,7 +367,8 @@ def test_integration_second_run_appends_to_output(
     )
 
     # First run
-    executor.run(cache_dir=cache_dir)
+    with Engine(pipeline=test_pipeline) as engine:
+        _run_engine_once(engine, cache_dir=cache_dir)
     assert db_path.read_text() == "line 1\n"
 
     # Simulate code change by modifying the lock file's code_manifest
@@ -336,7 +383,8 @@ def test_integration_second_run_appends_to_output(
     db_path.unlink()
 
     # Second run - should restore from cache and append
-    results = executor.run(cache_dir=cache_dir)
+    with Engine(pipeline=test_pipeline) as engine:
+        results = _run_engine_once(engine, cache_dir=cache_dir)
 
     assert results["append_stage"]["status"] == "ran"
     assert db_path.read_text() == "line 1\nline 2\n"
@@ -525,7 +573,7 @@ def test_executable_bit_restored_with_copy_mode(tmp_path: pathlib.Path) -> None:
 
 
 def test_uncached_incremental_output_raises_error(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, clean_registry: None
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, test_pipeline: Pipeline
 ) -> None:
     """Should raise error when IncrementalOut file exists but has no cache entry."""
     from pivot import exceptions
@@ -542,15 +590,18 @@ def test_uncached_incremental_output_raises_error(
         out_path=str(db_path),
     )
 
-    with pytest.raises(exceptions.UncachedIncrementalOutputError) as exc_info:
-        executor.run(cache_dir=tmp_path / ".pivot" / "cache")
+    with (
+        pytest.raises(exceptions.UncachedIncrementalOutputError) as exc_info,
+        Engine(pipeline=test_pipeline) as engine,
+    ):
+        _run_engine_once(engine, cache_dir=tmp_path / ".pivot" / "cache")
 
     assert "database.txt" in str(exc_info.value)
     assert "not in cache" in str(exc_info.value)
 
 
 def test_uncached_incremental_output_allow_uncached_incremental_allows_run(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, clean_registry: None
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, test_pipeline: Pipeline
 ) -> None:
     """allow_uncached_incremental=True should bypass the uncached output check."""
     monkeypatch.setattr("pivot.project.get_project_root", lambda: tmp_path)
@@ -566,12 +617,15 @@ def test_uncached_incremental_output_allow_uncached_incremental_allows_run(
     )
 
     # allow_uncached_incremental=True should allow run even with uncached file
-    results = executor.run(cache_dir=tmp_path / ".pivot" / "cache", allow_uncached_incremental=True)
+    with Engine(pipeline=test_pipeline) as engine:
+        results = _run_engine_once(
+            engine, cache_dir=tmp_path / ".pivot" / "cache", allow_uncached_incremental=True
+        )
     assert results["append_stage"]["status"] == "ran"
 
 
 def test_cached_incremental_output_runs_normally(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, clean_registry: None
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, test_pipeline: Pipeline
 ) -> None:
     """IncrementalOut that is properly cached should run without error."""
     monkeypatch.setattr("pivot.project.get_project_root", lambda: tmp_path)
@@ -587,16 +641,18 @@ def test_cached_incremental_output_runs_normally(
     )
 
     # First run creates and caches the output
-    results1 = executor.run(cache_dir=cache_dir)
+    with Engine(pipeline=test_pipeline) as engine:
+        results1 = _run_engine_once(engine, cache_dir=cache_dir)
     assert results1["append_stage"]["status"] == "ran"
 
     # Second run should skip without error (output is cached, nothing changed)
-    results2 = executor.run(cache_dir=cache_dir)
+    with Engine(pipeline=test_pipeline) as engine:
+        results2 = _run_engine_once(engine, cache_dir=cache_dir)
     assert results2["append_stage"]["status"] == "skipped"
 
 
 def test_force_runs_incremental_stage_even_when_unchanged(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, clean_registry: None
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, test_pipeline: Pipeline
 ) -> None:
     """force=True should re-run IncrementalOut stage even when nothing changed."""
     monkeypatch.setattr("pivot.project.get_project_root", lambda: tmp_path)
@@ -612,24 +668,27 @@ def test_force_runs_incremental_stage_even_when_unchanged(
     )
 
     # First run creates the output
-    results1 = executor.run(cache_dir=cache_dir)
+    with Engine(pipeline=test_pipeline) as engine:
+        results1 = _run_engine_once(engine, cache_dir=cache_dir)
     assert results1["append_stage"]["status"] == "ran"
     assert db_path.read_text() == "line 1\n"
 
     # Second run without force should skip
-    results2 = executor.run(cache_dir=cache_dir)
+    with Engine(pipeline=test_pipeline) as engine:
+        results2 = _run_engine_once(engine, cache_dir=cache_dir)
     assert results2["append_stage"]["status"] == "skipped"
     assert db_path.read_text() == "line 1\n"
 
     # Third run with force=True should run and append
-    results3 = executor.run(cache_dir=cache_dir, force=True)
+    with Engine(pipeline=test_pipeline) as engine:
+        results3 = _run_engine_once(engine, cache_dir=cache_dir, force=True)
     assert results3["append_stage"]["status"] == "ran"
     assert results3["append_stage"]["reason"] == "forced"
     assert db_path.read_text() == "line 1\nline 2\n"
 
 
 def test_force_and_allow_uncached_incremental_are_orthogonal(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, clean_registry: None
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, test_pipeline: Pipeline
 ) -> None:
     """force and allow_uncached_incremental are independent flags."""
     monkeypatch.setattr("pivot.project.get_project_root", lambda: tmp_path)
@@ -649,11 +708,17 @@ def test_force_and_allow_uncached_incremental_are_orthogonal(
     # force=True alone should still raise error for uncached incremental
     from pivot import exceptions
 
-    with pytest.raises(exceptions.UncachedIncrementalOutputError):
-        executor.run(cache_dir=cache_dir, force=True)
+    with (
+        pytest.raises(exceptions.UncachedIncrementalOutputError),
+        Engine(pipeline=test_pipeline) as engine,
+    ):
+        _run_engine_once(engine, cache_dir=cache_dir, force=True)
 
     # Both flags together should work
-    results = executor.run(cache_dir=cache_dir, force=True, allow_uncached_incremental=True)
+    with Engine(pipeline=test_pipeline) as engine:
+        results = _run_engine_once(
+            engine, cache_dir=cache_dir, force=True, allow_uncached_incremental=True
+        )
     assert results["append_stage"]["status"] == "ran"
 
 
@@ -730,17 +795,17 @@ def test_incremental_input_subsequent_run_loads_value(tmp_path: pathlib.Path) ->
 
 
 def test_incremental_input_no_circular_dependency(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, clean_registry: None
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, test_registry: StageRegistry
 ) -> None:
     """IncrementalOut as input should NOT create DAG circular dependency."""
     monkeypatch.setattr("pivot.project.get_project_root", lambda: tmp_path)
     monkeypatch.chdir(tmp_path)
 
     # Register the stage - should NOT raise circular dependency error
-    REGISTRY.register(_test_cache_stage, name="cache_stage")
+    test_registry.register(_test_cache_stage, name="cache_stage")
 
     # Build DAG - should succeed without circular dependency
-    dag = REGISTRY.build_dag(validate=False)
+    dag = test_registry.build_dag(validate=False)
     assert "cache_stage" in dag.nodes()
 
 
@@ -881,7 +946,7 @@ def _stage_multiple_incremental_matched(
 
 
 def test_incremental_out_input_requires_matching_output(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, clean_registry: None
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, test_registry: StageRegistry
 ) -> None:
     """IncrementalOut input must have a matching IncrementalOut output."""
     from pivot import exceptions
@@ -890,14 +955,14 @@ def test_incremental_out_input_requires_matching_output(
     monkeypatch.chdir(tmp_path)
 
     with pytest.raises(exceptions.ValidationError) as exc_info:
-        REGISTRY.register(_stage_incremental_input_no_output, name="test_stage")
+        test_registry.register(_stage_incremental_input_no_output, name="test_stage")
 
     # TypedDict return has outputs but none are IncrementalOut matching the input
     assert "no matching IncrementalOut output field" in str(exc_info.value)
 
 
 def test_incremental_out_typeddict_name_must_match(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, clean_registry: None
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, test_registry: StageRegistry
 ) -> None:
     """For TypedDict returns, output field name must match parameter name."""
     from pivot import exceptions
@@ -906,14 +971,14 @@ def test_incremental_out_typeddict_name_must_match(
     monkeypatch.chdir(tmp_path)
 
     with pytest.raises(exceptions.ValidationError) as exc_info:
-        REGISTRY.register(_stage_incremental_input_wrong_field_name, name="test_stage")
+        test_registry.register(_stage_incremental_input_wrong_field_name, name="test_stage")
 
     assert "no matching IncrementalOut output field" in str(exc_info.value)
     assert "existing" in str(exc_info.value)
 
 
 def test_incremental_out_input_output_path_must_match(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, clean_registry: None
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, test_registry: StageRegistry
 ) -> None:
     """IncrementalOut input and output paths must match."""
     from pivot import exceptions
@@ -922,14 +987,14 @@ def test_incremental_out_input_output_path_must_match(
     monkeypatch.chdir(tmp_path)
 
     with pytest.raises(exceptions.ValidationError) as exc_info:
-        REGISTRY.register(_stage_incremental_input_wrong_path, name="test_stage")
+        test_registry.register(_stage_incremental_input_wrong_path, name="test_stage")
 
     assert "path" in str(exc_info.value).lower()
     assert "doesn't match" in str(exc_info.value)
 
 
 def test_incremental_out_input_output_loader_must_match(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, clean_registry: None
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, test_registry: StageRegistry
 ) -> None:
     """IncrementalOut input and output loaders must match."""
     from pivot import exceptions
@@ -938,14 +1003,14 @@ def test_incremental_out_input_output_loader_must_match(
     monkeypatch.chdir(tmp_path)
 
     with pytest.raises(exceptions.ValidationError) as exc_info:
-        REGISTRY.register(_stage_incremental_input_wrong_loader, name="test_stage")
+        test_registry.register(_stage_incremental_input_wrong_loader, name="test_stage")
 
     assert "loader" in str(exc_info.value).lower()
     assert "doesn't match" in str(exc_info.value)
 
 
 def test_incremental_out_single_output_only_one_input(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, clean_registry: None
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, test_registry: StageRegistry
 ) -> None:
     """Single-output stages can only have one IncrementalOut input."""
     from pivot import exceptions
@@ -954,13 +1019,13 @@ def test_incremental_out_single_output_only_one_input(
     monkeypatch.chdir(tmp_path)
 
     with pytest.raises(exceptions.ValidationError) as exc_info:
-        REGISTRY.register(_stage_multiple_incremental_inputs_single_output, name="test_stage")
+        test_registry.register(_stage_multiple_incremental_inputs_single_output, name="test_stage")
 
     assert "single-output stages can only have one" in str(exc_info.value)
 
 
 def test_incremental_out_single_output_path_must_match(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, clean_registry: None
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, test_registry: StageRegistry
 ) -> None:
     """Single IncrementalOut input and output paths must match."""
     from pivot import exceptions
@@ -969,36 +1034,36 @@ def test_incremental_out_single_output_path_must_match(
     monkeypatch.chdir(tmp_path)
 
     with pytest.raises(exceptions.ValidationError) as exc_info:
-        REGISTRY.register(_stage_single_output_wrong_path, name="test_stage")
+        test_registry.register(_stage_single_output_wrong_path, name="test_stage")
 
     assert "path" in str(exc_info.value).lower()
     assert "doesn't match" in str(exc_info.value)
 
 
 def test_multiple_incremental_outs_matched_by_name(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, clean_registry: None
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, test_registry: StageRegistry
 ) -> None:
     """Multiple IncrementalOut pairs work when names match."""
     monkeypatch.setattr("pivot.project.get_project_root", lambda: tmp_path)
     monkeypatch.chdir(tmp_path)
 
     # Should NOT raise - names match (cache_a -> cache_a, cache_b -> cache_b)
-    REGISTRY.register(_stage_multiple_incremental_matched, name="test_stage")
+    test_registry.register(_stage_multiple_incremental_matched, name="test_stage")
 
-    info = REGISTRY.get("test_stage")
+    info = test_registry.get("test_stage")
     assert len(info["outs"]) == 2
 
 
 def test_incremental_out_single_output_valid(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, clean_registry: None
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, test_registry: StageRegistry
 ) -> None:
     """Single IncrementalOut input with matching single output is valid."""
     monkeypatch.setattr("pivot.project.get_project_root", lambda: tmp_path)
     monkeypatch.chdir(tmp_path)
 
     # Should NOT raise - input and output use same type alias (same path/loader)
-    REGISTRY.register(_stage_single_output_incremental, name="test_stage")
+    test_registry.register(_stage_single_output_incremental, name="test_stage")
 
-    info = REGISTRY.get("test_stage")
+    info = test_registry.get("test_stage")
     assert len(info["outs"]) == 1
     assert isinstance(info["outs"][0], outputs.IncrementalOut)

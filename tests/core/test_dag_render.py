@@ -43,6 +43,7 @@ def _create_stage(
         dep_specs={},
         out_specs={},
         params_arg_name=None,
+        state_dir=None,
     )
 
 

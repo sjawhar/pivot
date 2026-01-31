@@ -5,7 +5,8 @@ from typing import TYPE_CHECKING, Any, TypedDict, cast
 
 import click
 
-from pivot import outputs, project, registry
+from pivot import outputs, project
+from pivot.cli import helpers as cli_helpers
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -50,7 +51,7 @@ def _classify_targets(
     proj_root: Path,
 ) -> list[ResolvedTarget]:
     """Classify each target as stage, file, both, or neither."""
-    registered_stages = set(registry.REGISTRY.list_stages())
+    registered_stages = set(cli_helpers.list_stages())
     results = list[ResolvedTarget]()
 
     for target in targets:
@@ -90,7 +91,7 @@ def resolve_output_paths(
 
     for item in _classify_targets(targets, proj_root):
         if item["is_stage"]:
-            info = registry.REGISTRY.get(item["target"])
+            info = cli_helpers.get_stage(item["target"])
             for out in info["outs"]:
                 if isinstance(out, output_type):
                     # Registry always stores single-file outputs (multi-file are expanded)
@@ -121,7 +122,7 @@ def resolve_plot_infos(
 
     for item in _classify_targets(targets, proj_root):
         if item["is_stage"]:
-            info = registry.REGISTRY.get(item["target"])
+            info = cli_helpers.get_stage(item["target"])
             for out in info["outs"]:
                 if isinstance(out, outputs.Plot):
                     # Registry always stores single-file outputs (multi-file are expanded)

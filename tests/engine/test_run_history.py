@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     import pathlib
 
     from pivot.engine import engine
+    from pivot.pipeline.pipeline import Pipeline
 
 
 def _helper_stage_func(params: None) -> dict[str, str]:
@@ -23,11 +24,12 @@ def _helper_stage_func(params: None) -> dict[str, str]:
 
 
 @pytest.fixture
-def registered_stage() -> str:
+def registered_stage(test_pipeline: Pipeline) -> str:
     """Register a simple stage for testing."""
     helpers.register_test_stage(
         func=_helper_stage_func,
         name="history_test",
+        pipeline=test_pipeline,
     )
     return "history_test"
 

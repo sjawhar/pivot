@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Literal
 
 import click
 
-from pivot import config, project, registry
+from pivot import config, project
 from pivot.cli import completion
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
@@ -36,7 +36,7 @@ def _get_stage_output_info(state_dir: pathlib.Path) -> dict[str, OutputHash]:
     """Get output hash info from lock files for all stages."""
     outputs = dict[str, OutputHash]()
 
-    for stage_name in registry.REGISTRY.list_stages():
+    for stage_name in cli_helpers.list_stages():
         stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(state_dir))
         lock_data = stage_lock.read()
         if lock_data and "output_hashes" in lock_data:

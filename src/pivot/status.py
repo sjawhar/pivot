@@ -26,12 +26,12 @@ Example::
     from pivot.engine import graph as engine_graph
     from pivot import status
 
-    # Build bipartite graph
-    all_stages = {name: registry.REGISTRY.get(name) for name in registry.REGISTRY.list_stages()}
+    # Build bipartite graph from Pipeline
+    all_stages = {name: pipeline.get(name) for name in pipeline.list_stages()}
     graph = engine_graph.build_graph(all_stages)
 
     # Use graph for status query
-    statuses, dag = status.get_pipeline_status(["train"], single_stage=False, graph=graph)
+    statuses, dag = status.get_pipeline_status(["train"], single_stage=False, all_stages=all_stages, graph=graph)
 """
 
 from __future__ import annotations
@@ -50,7 +50,6 @@ from pivot import (
     metrics,
     parameters,
     project,
-    registry,
 )
 from pivot.engine import graph as engine_graph
 from pivot.remote import config as remote_config
@@ -76,6 +75,7 @@ if TYPE_CHECKING:
     import pygtrie
     from networkx import DiGraph
 
+    from pivot.registry import RegistryStageInfo
     from pivot.storage.track import PvtData
 
 logger = logging.getLogger(__name__)
@@ -97,6 +97,7 @@ def _get_explanations_in_parallel(
     execution_order: list[str],
     state_dir: pathlib.Path,
     overrides: parameters.ParamsOverrides | None,
+    all_stages: dict[str, RegistryStageInfo],
     force: bool = False,
     allow_missing: bool = False,
     tracked_files: dict[str, PvtData] | None = None,
@@ -109,7 +110,7 @@ def _get_explanations_in_parallel(
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = dict[Future[StageExplanation], str]()
         for stage_name in execution_order:
-            stage_info = registry.REGISTRY.get(stage_name)
+            stage_info = all_stages[stage_name]
             future = pool.submit(
                 explain.get_stage_explanation,
                 stage_name,
@@ -149,6 +150,7 @@ def _get_explanations_in_parallel(
 def get_pipeline_explanations(
     stages: list[str] | None,
     single_stage: bool,
+    all_stages: dict[str, RegistryStageInfo],
     force: bool = False,
     allow_missing: bool = False,
     graph: nx.DiGraph[str] | None = None,
@@ -162,18 +164,17 @@ def get_pipeline_explanations(
     Args:
         stages: List of stage names to explain, or None for all stages.
         single_stage: If True, only explain the specified stages without dependencies.
+        all_stages: Dict mapping stage names to RegistryStageInfo.
         force: If True, mark all stages as would run due to force flag.
         allow_missing: If True, use .pvt hashes for missing dependency files.
         graph: Optional bipartite graph from Engine. If provided, extracts stage DAG
-            via get_stage_dag() instead of building one from the registry.
+            via get_stage_dag() instead of building a new one.
     """
     with metrics.timed("status.get_pipeline_explanations"):
         tracked_files, tracked_trie = _discover_tracked_files(allow_missing)
-        stage_graph = (
-            engine_graph.get_stage_dag(graph)
-            if graph is not None
-            else registry.REGISTRY.build_dag(validate=not allow_missing)
-        )
+        if graph is None:
+            graph = engine_graph.build_graph(all_stages)
+        stage_graph = engine_graph.get_stage_dag(graph)
         execution_order = dag.get_execution_order(stage_graph, stages, single_stage=single_stage)
 
         if not execution_order:
@@ -186,6 +187,7 @@ def get_pipeline_explanations(
             execution_order,
             state_dir,
             overrides,
+            all_stages=all_stages,
             force=force,
             allow_missing=allow_missing,
             tracked_files=tracked_files,
@@ -243,7 +245,8 @@ def _compute_explanations_with_upstream(
 def get_pipeline_status(
     stages: list[str] | None,
     single_stage: bool,
-    validate: bool = True,
+    all_stages: dict[str, RegistryStageInfo],
+    validate: bool = True,  # noqa: ARG001 - kept for API compatibility
     allow_missing: bool = False,
     graph: nx.DiGraph[str] | None = None,
 ) -> tuple[list[PipelineStatusInfo], DiGraph[str]]:
@@ -252,19 +255,19 @@ def get_pipeline_status(
     Args:
         stages: Stage names to check, or None for all stages.
         single_stage: If True, check only specified stages without dependencies.
-        validate: If True, validate dependency files exist during DAG building.
-            Set to False with --allow-missing to skip validation.
+        all_stages: Dict mapping stage names to RegistryStageInfo.
+        validate: Deprecated, kept for API compatibility. Validation is now implicit
+            via all_stages - callers must provide validated stage data.
         allow_missing: If True, use .pvt hashes for missing dependency files.
         graph: Optional bipartite graph from Engine. If provided, extracts stage DAG
-            via get_stage_dag() instead of building one from the registry.
+            via get_stage_dag() instead of building a new one.
     """
+    _ = validate  # Suppress unused parameter warning
     with metrics.timed("status.get_pipeline_status"):
         tracked_files, tracked_trie = _discover_tracked_files(allow_missing)
-        stage_graph = (
-            engine_graph.get_stage_dag(graph)
-            if graph is not None
-            else registry.REGISTRY.build_dag(validate=validate)
-        )
+        if graph is None:
+            graph = engine_graph.build_graph(all_stages)
+        stage_graph = engine_graph.get_stage_dag(graph)
         execution_order = dag.get_execution_order(stage_graph, stages, single_stage=single_stage)
 
         if not execution_order:
@@ -277,6 +280,7 @@ def get_pipeline_status(
             execution_order,
             state_dir,
             overrides,
+            all_stages=all_stages,
             allow_missing=allow_missing,
             tracked_files=tracked_files,
             tracked_trie=tracked_trie,
@@ -429,19 +433,20 @@ def get_suggestions(
 
 def what_if_changed(
     paths: list[pathlib.Path],
+    all_stages: dict[str, RegistryStageInfo],
     graph: nx.DiGraph[str] | None = None,
 ) -> list[str]:
     """Determine which stages would run if these paths changed.
 
     Args:
         paths: Paths that hypothetically changed (relative or absolute).
+        all_stages: Dict mapping stage names to RegistryStageInfo.
         graph: Optional bipartite graph from Engine.
 
     Returns:
         List of stage names that would be affected.
     """
     if graph is None:
-        all_stages = {name: registry.REGISTRY.get(name) for name in registry.REGISTRY.list_stages()}
         graph = engine_graph.build_graph(all_stages)
 
     affected = set[str]()

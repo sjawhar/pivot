@@ -73,6 +73,7 @@ class RegistryStageInfo(TypedDict):
         out_specs: Output specs from return type (return key -> resolved Out, pre-expansion).
             For single-output stages, uses SINGLE_OUTPUT_KEY (convention for non-TypedDict returns).
         params_arg_name: Name of the StageParams parameter in function signature (or None).
+        state_dir: Per-stage state directory (None means use default determined at runtime).
     """
 
     func: Callable[..., Any]
@@ -91,6 +92,7 @@ class RegistryStageInfo(TypedDict):
     dep_specs: dict[str, stage_def.FuncDepSpec]
     out_specs: dict[str, outputs.Out[Any]]
     params_arg_name: str | None
+    state_dir: pathlib.Path | None
 
 
 class ValidationMode(enum.StrEnum):
@@ -130,7 +132,7 @@ def _apply_out_overrides(
 
     # Determine final cache (override takes precedence, then annotation default)
     # Note: annotation default is already set correctly for Out/Metric/Plot subclasses
-    cache = override.get("cache", out_spec.cache) if override else out_spec.cache
+    cache = override["cache"] if override and "cache" in override else out_spec.cache
 
     return dataclasses.replace(out_spec, path=path, cache=cache)
 
@@ -186,24 +188,24 @@ def _resolve_out_spec(
 
 
 class StageRegistry:
-    """Global registry for all pipeline stages.
+    """Registry for pipeline stages.
 
-    The registry stores metadata for all stages registered via `REGISTRY.register()`.
+    The registry stores metadata for all stages registered via `register()`.
     It handles validation, path normalization, and dependency graph construction.
 
     Stages are registered from pivot.yaml or programmatically. Dependencies and outputs
     are extracted from function annotations (Annotated[T, Dep(...)] and TypedDict
     return types with Out annotations).
 
-    The global `REGISTRY` singleton is used by default. Direct instantiation is
-    mainly useful for testing with isolated registries.
+    Direct instantiation of StageRegistry is mainly useful for testing
+    with isolated registries. For production use, use the `Pipeline` class.
 
     Example:
         ```python
-        from pivot.registry import REGISTRY
-        REGISTRY.list_stages()  # ['preprocess', 'train']
-        info = REGISTRY.get('train')
-        info['deps']  # Dict of dependency name -> path(s)
+        from pivot.pipeline import Pipeline
+        pipeline = Pipeline("my_pipeline")
+        pipeline.register(my_stage)
+        pipeline.list_stages()  # ['my_stage']
         ```
     """
 
@@ -221,6 +223,7 @@ class StageRegistry:
         variant: str | None = None,
         dep_path_overrides: Mapping[str, outputs.PathType] | None = None,
         out_path_overrides: Mapping[str, OutOverrideInput] | None = None,
+        state_dir: pathlib.Path | None = None,
     ) -> None:
         """Register a stage function with metadata.
 
@@ -238,6 +241,7 @@ class StageRegistry:
             out_path_overrides: Override paths/options for outputs. Accepts simple path strings
                 or dicts with path and options: `{"result": "out.csv"}` or
                 `{"result": {"path": "out.csv", "cache": False}}`.
+            state_dir: Per-stage state directory (None means use default determined at runtime).
 
         Raises:
             ValidationError: If stage name is invalid or already registered.
@@ -431,6 +435,7 @@ class StageRegistry:
                 dep_specs=dep_specs,
                 out_specs=out_specs,
                 params_arg_name=params_arg_name,
+                state_dir=state_dir,
             )
 
     def get(self, name: str) -> RegistryStageInfo:
@@ -469,6 +474,10 @@ class StageRegistry:
 
         graph = dag.build_dag(self._stages, validate=validate, tracked_files=tracked_files)
 
+        # Validate output paths don't conflict (only when validate=True)
+        if validate:
+            self.validate_outputs()
+
         # Cache only when validating (safe to reuse)
         if validate:
             self._cached_dag = graph
@@ -496,12 +505,12 @@ class StageRegistry:
         valid state if the reload fails.
 
         Example:
-            backup = REGISTRY.snapshot()
-            REGISTRY.clear()
+            backup = registry.snapshot()
+            registry.clear()
             try:
                 reload_stages()
             except Exception:
-                REGISTRY.restore(backup)  # Rollback on failure
+                registry.restore(backup)  # Rollback on failure
         """
         return dict(self._stages)
 
@@ -874,6 +883,3 @@ def _normalize_deps_dict(
             normalized = _normalize_paths([value], path_policy.PathType.DEP, validation_mode)
             result[name] = normalized[0]
     return result
-
-
-REGISTRY = StageRegistry()

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import atexit
 import logging
 import multiprocessing as mp
@@ -15,10 +17,11 @@ import yaml
 from helpers import register_test_stage
 from pivot import exceptions, executor, loaders, outputs
 from pivot.executor import core as executor_core
-from pivot.registry import REGISTRY
 
 if TYPE_CHECKING:
     from pytest_mock import MockerFixture
+
+    from pivot.pipeline.pipeline import Pipeline
 
 
 # =============================================================================
@@ -877,57 +880,59 @@ def _many_deps_process(
 # =============================================================================
 
 
-def test_simple_pipeline_runs_in_order(pipeline_dir: pathlib.Path) -> None:
+def test_simple_pipeline_runs_in_order(pipeline_dir: pathlib.Path, test_pipeline: Pipeline) -> None:
     """Stages execute in dependency order and produce correct outputs."""
     (pipeline_dir / "input.txt").write_text("hello")
 
     register_test_stage(_step1_upper, name="step1")
     register_test_stage(_step2_result, name="step2")
 
-    results = executor.run()
+    results = executor.run(pipeline=test_pipeline)
 
     assert (pipeline_dir / "step2.txt").read_text() == "Result: HELLO"
     assert results["step1"]["status"] == "ran"
     assert results["step2"]["status"] == "ran"
 
 
-def test_unchanged_stages_are_skipped(pipeline_dir: pathlib.Path) -> None:
+def test_unchanged_stages_are_skipped(pipeline_dir: pathlib.Path, test_pipeline: Pipeline) -> None:
     """Stages with unchanged code and deps are skipped on re-run."""
     (pipeline_dir / "input.txt").write_text("hello")
 
     register_test_stage(_output_upper, name="step1")
 
     # First run - should execute
-    results = executor.run()
+    results = executor.run(pipeline=test_pipeline)
     assert results["step1"]["status"] == "ran"
     assert (pipeline_dir / "output.txt").read_text() == "HELLO"
 
     # Second run - should skip (nothing changed)
-    results = executor.run()
+    results = executor.run(pipeline=test_pipeline)
     assert results["step1"]["status"] == "skipped"
 
 
-def test_code_change_triggers_rerun(pipeline_dir: pathlib.Path) -> None:
+def test_code_change_triggers_rerun(pipeline_dir: pathlib.Path, test_pipeline: Pipeline) -> None:
     """Changing stage code triggers re-execution."""
     (pipeline_dir / "input.txt").write_text("hello")
 
     register_test_stage(_output_upper, name="process")
 
-    results = executor.run()
+    results = executor.run(pipeline=test_pipeline)
     assert results["process"]["status"] == "ran"
     assert (pipeline_dir / "output.txt").read_text() == "HELLO"
 
     # Clear and re-register with different implementation
-    REGISTRY.clear()
+    test_pipeline.clear()
 
     register_test_stage(_output_lower, name="process")
 
-    results = executor.run()
+    results = executor.run(pipeline=test_pipeline)
     assert results["process"]["status"] == "ran"
     assert (pipeline_dir / "output.txt").read_text() == "hello"
 
 
-def test_code_change_rerun_with_hardlinked_readonly_output(pipeline_dir: pathlib.Path) -> None:
+def test_code_change_rerun_with_hardlinked_readonly_output(
+    pipeline_dir: pathlib.Path, test_pipeline: Pipeline
+) -> None:
     """Re-running stage after code change works even when output is hardlinked to read-only cache.
 
     Reproduces bug where hardlinked outputs (the default checkout mode) become read-only
@@ -940,7 +945,7 @@ def test_code_change_rerun_with_hardlinked_readonly_output(pipeline_dir: pathlib
     register_test_stage(_output_upper, name="process")
 
     # First run - creates output
-    results = executor.run()
+    results = executor.run(pipeline=test_pipeline)
     assert results["process"]["status"] == "ran"
 
     output_file = pipeline_dir / "output.txt"
@@ -953,17 +958,19 @@ def test_code_change_rerun_with_hardlinked_readonly_output(pipeline_dir: pathlib
     assert stat_info.st_mode & 0o777 == 0o444, "Output should be read-only (hardlink to cache)"
 
     # Re-register with different implementation (simulates code change)
-    REGISTRY.clear()
+    test_pipeline.clear()
     register_test_stage(_output_lower, name="process")
 
     # Second run - should re-run due to fingerprint change
     # BUG: This may fail with PermissionError if framework doesn't handle read-only outputs
-    results = executor.run()
+    results = executor.run(pipeline=test_pipeline)
     assert results["process"]["status"] == "ran", f"Stage should re-run, got: {results['process']}"
     assert output_file.read_text() == "hello"
 
 
-def test_code_change_rerun_with_hardlinked_directory_output(pipeline_dir: pathlib.Path) -> None:
+def test_code_change_rerun_with_hardlinked_directory_output(
+    pipeline_dir: pathlib.Path, test_pipeline: Pipeline
+) -> None:
     """Re-running stage with directory output works even when files are hardlinked read-only.
 
     Tests the scenario where a stage produces a directory output with multiple files.
@@ -976,7 +983,7 @@ def test_code_change_rerun_with_hardlinked_directory_output(pipeline_dir: pathli
     register_test_stage(_dir_output_process, name="process")
 
     # First run - creates directory output
-    results = executor.run()
+    results = executor.run(pipeline=test_pipeline)
     assert results["process"]["status"] == "ran"
 
     output_dir = pipeline_dir / "output_dir"
@@ -990,23 +997,23 @@ def test_code_change_rerun_with_hardlinked_directory_output(pipeline_dir: pathli
     assert stat_info.st_mode & 0o777 == 0o444, "File should be read-only"
 
     # Re-register with different implementation (simulates code change)
-    REGISTRY.clear()
+    test_pipeline.clear()
     register_test_stage(_dir_output_process_v2, name="process")
 
     # Second run - should re-run due to fingerprint change
-    results = executor.run()
+    results = executor.run(pipeline=test_pipeline)
     assert results["process"]["status"] == "ran", f"Stage should re-run, got: {results['process']}"
     assert (output_dir / "file1.txt").read_text() == "file1_v2"
 
 
-def test_input_change_triggers_rerun(pipeline_dir: pathlib.Path) -> None:
+def test_input_change_triggers_rerun(pipeline_dir: pathlib.Path, test_pipeline: Pipeline) -> None:
     """Changing input file triggers re-execution."""
     (pipeline_dir / "input.txt").write_text("hello")
 
     register_test_stage(_output_upper, name="process")
 
     # First run
-    results = executor.run()
+    results = executor.run(pipeline=test_pipeline)
     assert results["process"]["status"] == "ran"
     assert (pipeline_dir / "output.txt").read_text() == "HELLO"
 
@@ -1014,12 +1021,14 @@ def test_input_change_triggers_rerun(pipeline_dir: pathlib.Path) -> None:
     (pipeline_dir / "input.txt").write_text("world")
 
     # Should re-run due to input change
-    results = executor.run()
+    results = executor.run(pipeline=test_pipeline)
     assert results["process"]["status"] == "ran"
     assert (pipeline_dir / "output.txt").read_text() == "WORLD"
 
 
-def test_downstream_runs_when_upstream_changes(pipeline_dir: pathlib.Path) -> None:
+def test_downstream_runs_when_upstream_changes(
+    pipeline_dir: pathlib.Path, test_pipeline: Pipeline
+) -> None:
     """Downstream stages re-run when upstream output changes."""
     (pipeline_dir / "input.txt").write_text("hello")
 
@@ -1027,20 +1036,20 @@ def test_downstream_runs_when_upstream_changes(pipeline_dir: pathlib.Path) -> No
     register_test_stage(_final_from_intermediate, name="step2")
 
     # First run - both execute
-    results = executor.run()
+    results = executor.run(pipeline=test_pipeline)
     assert results["step1"]["status"] == "ran"
     assert results["step2"]["status"] == "ran"
     assert (pipeline_dir / "final.txt").read_text() == "Final: HELLO"
 
     # Change input - both should re-run
     (pipeline_dir / "input.txt").write_text("world")
-    results = executor.run()
+    results = executor.run(pipeline=test_pipeline)
     assert results["step1"]["status"] == "ran"
     assert results["step2"]["status"] == "ran"
     assert (pipeline_dir / "final.txt").read_text() == "Final: WORLD"
 
 
-def test_run_specific_stage(pipeline_dir: pathlib.Path) -> None:
+def test_run_specific_stage(pipeline_dir: pathlib.Path, test_pipeline: Pipeline) -> None:
     """Can run a specific stage and its dependencies only."""
     (pipeline_dir / "input.txt").write_text("data")
 
@@ -1049,7 +1058,7 @@ def test_run_specific_stage(pipeline_dir: pathlib.Path) -> None:
     register_test_stage(_c_stage, name="c")
 
     # Run only 'b' (should also run 'a' as dependency, but not 'c')
-    results = executor.run(stages=["b"])
+    results = executor.run(stages=["b"], pipeline=test_pipeline)
 
     assert results["a"]["status"] == "ran", "Dependency 'a' should run"
     assert results["b"]["status"] == "ran", "Target 'b' should run"
@@ -1057,39 +1066,43 @@ def test_run_specific_stage(pipeline_dir: pathlib.Path) -> None:
     assert not (pipeline_dir / "c.txt").exists(), "Stage 'c' output should not exist"
 
 
-def test_missing_dependency_raises_error(pipeline_dir: pathlib.Path) -> None:
+def test_missing_dependency_raises_error(
+    pipeline_dir: pathlib.Path, test_pipeline: Pipeline
+) -> None:
     """Missing dependency file raises DependencyNotFoundError before stage runs."""
     # Don't create the input file - it's missing
 
     register_test_stage(_missing_dep_process, name="process")
 
     with pytest.raises(exceptions.DependencyNotFoundError) as exc_info:
-        executor.run()
+        executor.run(pipeline=test_pipeline)
 
     assert "missing_input.txt" in str(exc_info.value)
 
 
-def test_nonexistent_stage_raises_error(pipeline_dir: pathlib.Path) -> None:
+def test_nonexistent_stage_raises_error(
+    pipeline_dir: pathlib.Path, test_pipeline: Pipeline
+) -> None:
     """Requesting a non-existent stage raises StageNotFoundError."""
     (pipeline_dir / "input.txt").write_text("data")
 
     register_test_stage(_real_stage, name="real_stage")
 
     with pytest.raises(exceptions.StageNotFoundError) as exc_info:
-        executor.run(stages=["nonexistent_stage"])
+        executor.run(stages=["nonexistent_stage"], pipeline=test_pipeline)
 
     assert "nonexistent_stage" in str(exc_info.value)
 
 
 def test_execution_lock_created_and_removed(
-    pipeline_dir: pathlib.Path, stages_dir: pathlib.Path
+    pipeline_dir: pathlib.Path, stages_dir: pathlib.Path, test_pipeline: Pipeline
 ) -> None:
     """Execution lock file is created during run and removed after."""
     (pipeline_dir / "input.txt").write_text("hello")
 
     register_test_stage(_check_lock, name="check_lock")
 
-    executor.run()
+    executor.run(pipeline=test_pipeline)
 
     lock_check_file = pipeline_dir / "lock_existed.txt"
     assert lock_check_file.read_text() == "yes", "Lock file should exist during stage execution"
@@ -1097,7 +1110,7 @@ def test_execution_lock_created_and_removed(
 
 
 def test_execution_lock_removed_on_stage_failure(
-    pipeline_dir: pathlib.Path, stages_dir: pathlib.Path
+    pipeline_dir: pathlib.Path, stages_dir: pathlib.Path, test_pipeline: Pipeline
 ) -> None:
     """Execution lock is released even if stage raises an exception."""
     (pipeline_dir / "input.txt").write_text("hello")
@@ -1105,7 +1118,7 @@ def test_execution_lock_removed_on_stage_failure(
     register_test_stage(_failing_stage, name="failing_stage")
 
     # Executor now catches exceptions and returns failed status
-    results = executor.run()
+    results = executor.run(pipeline=test_pipeline)
 
     assert results["failing_stage"]["status"] == "failed"
     assert "Stage failed!" in results["failing_stage"]["reason"]
@@ -1113,7 +1126,7 @@ def test_execution_lock_removed_on_stage_failure(
 
 
 def test_stale_lock_from_dead_process_is_broken(
-    pipeline_dir: pathlib.Path, stages_dir: pathlib.Path
+    pipeline_dir: pathlib.Path, stages_dir: pathlib.Path, test_pipeline: Pipeline
 ) -> None:
     """Stale lock file from crashed process is automatically removed."""
     (pipeline_dir / "input.txt").write_text("hello")
@@ -1125,14 +1138,14 @@ def test_stale_lock_from_dead_process_is_broken(
     register_test_stage(_process_basic, name="process")
 
     # Should succeed by breaking the stale lock
-    results = executor.run()
+    results = executor.run(pipeline=test_pipeline)
 
     assert results["process"]["status"] == "ran"
     assert not stale_lock.exists(), "Stale lock should be removed"
 
 
 def test_concurrent_execution_returns_failed_status(
-    pipeline_dir: pathlib.Path, stages_dir: pathlib.Path
+    pipeline_dir: pathlib.Path, stages_dir: pathlib.Path, test_pipeline: Pipeline
 ) -> None:
     """Running stage that's already running returns failed status."""
     (pipeline_dir / "input.txt").write_text("hello")
@@ -1144,7 +1157,7 @@ def test_concurrent_execution_returns_failed_status(
     register_test_stage(_process_basic, name="process")
 
     # Executor now returns failed status instead of raising
-    results = executor.run()
+    results = executor.run(pipeline=test_pipeline)
 
     assert results["process"]["status"] == "failed"
     assert "already running" in results["process"]["reason"]
@@ -1155,7 +1168,7 @@ def test_concurrent_execution_returns_failed_status(
 
 
 def test_corrupted_lock_file_is_broken(
-    pipeline_dir: pathlib.Path, stages_dir: pathlib.Path
+    pipeline_dir: pathlib.Path, stages_dir: pathlib.Path, test_pipeline: Pipeline
 ) -> None:
     """Corrupted lock file (invalid content) is treated as stale and removed."""
     (pipeline_dir / "input.txt").write_text("hello")
@@ -1167,14 +1180,14 @@ def test_corrupted_lock_file_is_broken(
     register_test_stage(_process_basic, name="process")
 
     # Should succeed by treating corrupted lock as stale
-    results = executor.run()
+    results = executor.run(pipeline=test_pipeline)
 
     assert results["process"]["status"] == "ran"
     assert not corrupted_lock.exists(), "Corrupted lock should be removed"
 
 
 def test_negative_pid_in_lock_is_treated_as_stale(
-    pipeline_dir: pathlib.Path, stages_dir: pathlib.Path
+    pipeline_dir: pathlib.Path, stages_dir: pathlib.Path, test_pipeline: Pipeline
 ) -> None:
     """Lock file with invalid PID (negative) is treated as stale."""
     (pipeline_dir / "input.txt").write_text("hello")
@@ -1186,24 +1199,28 @@ def test_negative_pid_in_lock_is_treated_as_stale(
     register_test_stage(_process_basic, name="process")
 
     # Should succeed by treating invalid PID as stale
-    results = executor.run()
+    results = executor.run(pipeline=test_pipeline)
 
     assert results["process"]["status"] == "ran"
     assert not invalid_lock.exists(), "Invalid PID lock should be removed"
 
 
-def test_output_queue_reader_only_catches_empty(pipeline_dir: pathlib.Path) -> None:
+def test_output_queue_reader_only_catches_empty(
+    pipeline_dir: pathlib.Path, test_pipeline: Pipeline
+) -> None:
     """Output queue reader should only catch queue.Empty, not other exceptions."""
     (pipeline_dir / "input.txt").write_text("hello")
 
     register_test_stage(_output_queue_stage, name="process")
 
     # This test verifies the output queue reader behavior exists and handles Empty properly
-    results = executor.run()
+    results = executor.run(pipeline=test_pipeline)
     assert results["process"]["status"] == "ran"
 
 
-def test_output_thread_cleanup_completes(pipeline_dir: pathlib.Path) -> None:
+def test_output_thread_cleanup_completes(
+    pipeline_dir: pathlib.Path, test_pipeline: Pipeline
+) -> None:
     """Output thread should be properly cleaned up after execution."""
     (pipeline_dir / "input.txt").write_text("hello")
 
@@ -1211,7 +1228,7 @@ def test_output_thread_cleanup_completes(pipeline_dir: pathlib.Path) -> None:
 
     register_test_stage(_print_stage, name="process")
 
-    results = executor.run()
+    results = executor.run(pipeline=test_pipeline)
 
     # Poll for thread cleanup with timeout (more robust than fixed sleep)
     deadline = time.monotonic() + 1.0  # 1 second timeout
@@ -1230,7 +1247,7 @@ def test_output_thread_cleanup_completes(pipeline_dir: pathlib.Path) -> None:
     assert results["process"]["status"] == "ran"
 
 
-def _loky_worker_with_queue(queue: "mp.Queue[str]", message: str) -> str:
+def _loky_worker_with_queue(queue: mp.Queue[str], message: str) -> str:
     """Worker function that writes to a queue and returns a value."""
     queue.put(message)
     return f"processed: {message}"
@@ -1267,7 +1284,9 @@ def test_spawn_context_manager_works_with_loky() -> None:
         manager.shutdown()
 
 
-def test_mutex_prevents_concurrent_execution(pipeline_dir: pathlib.Path) -> None:
+def test_mutex_prevents_concurrent_execution(
+    pipeline_dir: pathlib.Path, test_pipeline: Pipeline
+) -> None:
     """Stages in same mutex group run sequentially, not concurrently."""
     (pipeline_dir / "input.txt").write_text("data")
     timing_file = pipeline_dir / "timing.txt"
@@ -1275,7 +1294,7 @@ def test_mutex_prevents_concurrent_execution(pipeline_dir: pathlib.Path) -> None
     register_test_stage(_mutex_a, name="stage_a", mutex=["gpu"])
     register_test_stage(_mutex_b, name="stage_b", mutex=["gpu"])
 
-    results = executor.run(max_workers=4)
+    results = executor.run(max_workers=4, pipeline=test_pipeline)
 
     assert results["stage_a"]["status"] == "ran"
     assert results["stage_b"]["status"] == "ran"
@@ -1288,14 +1307,14 @@ def test_mutex_prevents_concurrent_execution(pipeline_dir: pathlib.Path) -> None
     ], f"Stages ran concurrently: {timing}"
 
 
-def test_mutex_releases_on_completion(pipeline_dir: pathlib.Path) -> None:
+def test_mutex_releases_on_completion(pipeline_dir: pathlib.Path, test_pipeline: Pipeline) -> None:
     """Mutex is released when stage completes, allowing next stage to start."""
     (pipeline_dir / "input.txt").write_text("data")
 
     register_test_stage(_first_basic, name="first", mutex=["resource"])
     register_test_stage(_second_basic, name="second", mutex=["resource"])
 
-    results = executor.run(max_workers=4)
+    results = executor.run(max_workers=4, pipeline=test_pipeline)
 
     assert results["first"]["status"] == "ran"
     assert results["second"]["status"] == "ran"
@@ -1303,21 +1322,23 @@ def test_mutex_releases_on_completion(pipeline_dir: pathlib.Path) -> None:
     assert (pipeline_dir / "second.txt").exists()
 
 
-def test_mutex_releases_on_failure(pipeline_dir: pathlib.Path) -> None:
+def test_mutex_releases_on_failure(pipeline_dir: pathlib.Path, test_pipeline: Pipeline) -> None:
     """Mutex is released even when stage fails, allowing other stages to run."""
     (pipeline_dir / "input.txt").write_text("data")
 
     register_test_stage(_failing_mutex, name="failing", mutex=["resource"])
     register_test_stage(_succeeding_mutex, name="succeeding", mutex=["resource"])
 
-    results = executor.run(max_workers=4, on_error="keep_going")
+    results = executor.run(max_workers=4, on_error="keep_going", pipeline=test_pipeline)
 
     assert results["failing"]["status"] == "failed"
     assert results["succeeding"]["status"] == "ran"
     assert (pipeline_dir / "succeeding.txt").exists()
 
 
-def test_multiple_mutex_groups_per_stage(pipeline_dir: pathlib.Path) -> None:
+def test_multiple_mutex_groups_per_stage(
+    pipeline_dir: pathlib.Path, test_pipeline: Pipeline
+) -> None:
     """Stage with multiple mutex groups blocks all of them."""
     (pipeline_dir / "input.txt").write_text("data")
     timing_file = pipeline_dir / "timing.txt"
@@ -1325,7 +1346,7 @@ def test_multiple_mutex_groups_per_stage(pipeline_dir: pathlib.Path) -> None:
     register_test_stage(_multi_resource, name="multi_resource", mutex=["gpu", "disk"])
     register_test_stage(_gpu_only, name="gpu_only", mutex=["gpu"])
 
-    results = executor.run(max_workers=4)
+    results = executor.run(max_workers=4, pipeline=test_pipeline)
 
     assert results["multi_resource"]["status"] == "ran"
     assert results["gpu_only"]["status"] == "ran"
@@ -1338,21 +1359,21 @@ def test_multiple_mutex_groups_per_stage(pipeline_dir: pathlib.Path) -> None:
     ], f"Stages ran concurrently despite shared mutex: {timing}"
 
 
-def test_mutex_with_dependencies(pipeline_dir: pathlib.Path) -> None:
+def test_mutex_with_dependencies(pipeline_dir: pathlib.Path, test_pipeline: Pipeline) -> None:
     """Mutex works correctly with stage dependencies."""
     (pipeline_dir / "input.txt").write_text("data")
 
     register_test_stage(_first_dep_mutex, name="first", mutex=["resource"])
     register_test_stage(_second_dep_mutex, name="second", mutex=["resource"])
 
-    results = executor.run(max_workers=4)
+    results = executor.run(max_workers=4, pipeline=test_pipeline)
 
     assert results["first"]["status"] == "ran"
     assert results["second"]["status"] == "ran"
     assert (pipeline_dir / "second.txt").read_text() == "second: first"
 
 
-def test_no_mutex_stages_unaffected(pipeline_dir: pathlib.Path) -> None:
+def test_no_mutex_stages_unaffected(pipeline_dir: pathlib.Path, test_pipeline: Pipeline) -> None:
     """Stages without mutex run normally in parallel."""
     (pipeline_dir / "input.txt").write_text("data")
     timing_file = pipeline_dir / "timing.txt"
@@ -1360,7 +1381,7 @@ def test_no_mutex_stages_unaffected(pipeline_dir: pathlib.Path) -> None:
     register_test_stage(_timing_a, name="stage_a")
     register_test_stage(_timing_b, name="stage_b")
 
-    results = executor.run(max_workers=4)
+    results = executor.run(max_workers=4, pipeline=test_pipeline)
 
     assert results["stage_a"]["status"] == "ran"
     assert results["stage_b"]["status"] == "ran"
@@ -1371,7 +1392,7 @@ def test_no_mutex_stages_unaffected(pipeline_dir: pathlib.Path) -> None:
 
 
 def test_single_stage_mutex_warning(
-    pipeline_dir: pathlib.Path, caplog: pytest.LogCaptureFixture
+    pipeline_dir: pathlib.Path, caplog: pytest.LogCaptureFixture, test_pipeline: Pipeline
 ) -> None:
     """Warning is logged when mutex group has only one stage."""
     (pipeline_dir / "input.txt").write_text("data")
@@ -1379,7 +1400,7 @@ def test_single_stage_mutex_warning(
     register_test_stage(_lonely_mutex, name="lonely", mutex=["lonely_group"])
 
     with caplog.at_level(logging.WARNING):
-        results = executor.run()
+        results = executor.run(pipeline=test_pipeline)
 
     assert results["lonely"]["status"] == "ran"
     assert any(
@@ -1394,7 +1415,9 @@ def test_single_stage_mutex_warning(
 # =============================================================================
 
 
-def test_on_error_fail_stops_on_first_failure(pipeline_dir: pathlib.Path) -> None:
+def test_on_error_fail_stops_on_first_failure(
+    pipeline_dir: pathlib.Path, test_pipeline: Pipeline
+) -> None:
     """on_error='fail' stops pipeline when first stage fails."""
     (pipeline_dir / "input.txt").write_text("data")
     execution_log = pipeline_dir / "execution.log"
@@ -1402,7 +1425,7 @@ def test_on_error_fail_stops_on_first_failure(pipeline_dir: pathlib.Path) -> Non
     register_test_stage(_error_stage_a, name="stage_a")
     register_test_stage(_error_stage_b, name="stage_b")
 
-    results = executor.run(on_error="fail")
+    results = executor.run(on_error="fail", pipeline=test_pipeline)
 
     assert results["stage_a"]["status"] == "failed"
     # stage_b may or may not run depending on timing, but pipeline should stop
@@ -1410,21 +1433,25 @@ def test_on_error_fail_stops_on_first_failure(pipeline_dir: pathlib.Path) -> Non
     assert "a" in log_content, "Stage A should have executed"
 
 
-def test_on_error_keep_going_continues_independent_stages(pipeline_dir: pathlib.Path) -> None:
+def test_on_error_keep_going_continues_independent_stages(
+    pipeline_dir: pathlib.Path, test_pipeline: Pipeline
+) -> None:
     """on_error='keep_going' continues running independent stages after failure."""
     (pipeline_dir / "input.txt").write_text("data")
 
     register_test_stage(_keep_going_failing, name="failing")
     register_test_stage(_keep_going_succeeding, name="succeeding")
 
-    results = executor.run(on_error="keep_going")
+    results = executor.run(on_error="keep_going", pipeline=test_pipeline)
 
     assert results["failing"]["status"] == "failed"
     assert results["succeeding"]["status"] == "ran"
     assert (pipeline_dir / "succeeding.txt").read_text() == "success"
 
 
-def test_on_error_keep_going_skips_downstream_of_failed(pipeline_dir: pathlib.Path) -> None:
+def test_on_error_keep_going_skips_downstream_of_failed(
+    pipeline_dir: pathlib.Path, test_pipeline: Pipeline
+) -> None:
     """on_error='keep_going' skips stages that depend on failed stage."""
     (pipeline_dir / "input.txt").write_text("data")
 
@@ -1432,7 +1459,7 @@ def test_on_error_keep_going_skips_downstream_of_failed(pipeline_dir: pathlib.Pa
     register_test_stage(_second_depends_first, name="second")
     register_test_stage(_independent_stage, name="independent")
 
-    results = executor.run(on_error="keep_going")
+    results = executor.run(on_error="keep_going", pipeline=test_pipeline)
 
     assert results["first"]["status"] == "failed"
     assert results["second"]["status"] == "skipped"
@@ -1440,14 +1467,16 @@ def test_on_error_keep_going_skips_downstream_of_failed(pipeline_dir: pathlib.Pa
     assert results["independent"]["status"] == "ran"
 
 
-def test_invalid_on_error_raises_value_error(pipeline_dir: pathlib.Path) -> None:
+def test_invalid_on_error_raises_value_error(
+    pipeline_dir: pathlib.Path, test_pipeline: Pipeline
+) -> None:
     """Invalid on_error value raises ValueError."""
     (pipeline_dir / "input.txt").write_text("data")
 
     register_test_stage(_invalid_error_process, name="process")
 
     with pytest.raises(ValueError) as exc_info:
-        executor.run(on_error="invalid_mode")
+        executor.run(on_error="invalid_mode", pipeline=test_pipeline)
 
     assert "invalid_mode" in str(exc_info.value)
     assert "fail" in str(exc_info.value)  # Should mention valid options
@@ -1458,38 +1487,44 @@ def test_invalid_on_error_raises_value_error(pipeline_dir: pathlib.Path) -> None
 # =============================================================================
 
 
-def test_stage_calling_sys_exit_returns_failed(pipeline_dir: pathlib.Path) -> None:
+def test_stage_calling_sys_exit_returns_failed(
+    pipeline_dir: pathlib.Path, test_pipeline: Pipeline
+) -> None:
     """Stage calling sys.exit() returns failed status with exit code."""
     (pipeline_dir / "input.txt").write_text("data")
 
     register_test_stage(_exits_with_code, name="exits_with_code")
 
-    results = executor.run()
+    results = executor.run(pipeline=test_pipeline)
 
     assert results["exits_with_code"]["status"] == "failed"
     assert "sys.exit" in results["exits_with_code"]["reason"]
     assert "42" in results["exits_with_code"]["reason"]
 
 
-def test_stage_calling_sys_exit_zero_returns_failed(pipeline_dir: pathlib.Path) -> None:
+def test_stage_calling_sys_exit_zero_returns_failed(
+    pipeline_dir: pathlib.Path, test_pipeline: Pipeline
+) -> None:
     """Stage calling sys.exit(0) still returns failed (stages shouldn't exit)."""
     (pipeline_dir / "input.txt").write_text("data")
 
     register_test_stage(_exits_zero, name="exits_zero")
 
-    results = executor.run()
+    results = executor.run(pipeline=test_pipeline)
 
     assert results["exits_zero"]["status"] == "failed"
     assert "sys.exit" in results["exits_zero"]["reason"]
 
 
-def test_stage_raising_keyboard_interrupt_returns_failed(pipeline_dir: pathlib.Path) -> None:
+def test_stage_raising_keyboard_interrupt_returns_failed(
+    pipeline_dir: pathlib.Path, test_pipeline: Pipeline
+) -> None:
     """Stage raising KeyboardInterrupt returns failed status."""
     (pipeline_dir / "input.txt").write_text("data")
 
     register_test_stage(_keyboard_interrupt, name="keyboard_interrupt")
 
-    results = executor.run()
+    results = executor.run(pipeline=test_pipeline)
 
     assert results["keyboard_interrupt"]["status"] == "failed"
     assert "KeyboardInterrupt" in results["keyboard_interrupt"]["reason"]
@@ -1500,7 +1535,9 @@ def test_stage_raising_keyboard_interrupt_returns_failed(pipeline_dir: pathlib.P
 # =============================================================================
 
 
-def test_directory_dependency_hashed_and_runs(pipeline_dir: pathlib.Path) -> None:
+def test_directory_dependency_hashed_and_runs(
+    pipeline_dir: pathlib.Path, test_pipeline: Pipeline
+) -> None:
     """Stage with directory as dependency hashes it and runs successfully."""
     # Create a directory with files
     data_dir = pipeline_dir / "data_dir"
@@ -1510,7 +1547,7 @@ def test_directory_dependency_hashed_and_runs(pipeline_dir: pathlib.Path) -> Non
 
     register_test_stage(_dir_dep_process, name="process")
 
-    results = executor.run()
+    results = executor.run(pipeline=test_pipeline)
 
     assert results["process"]["status"] == "ran"
     assert (pipeline_dir / "output.txt").read_text() == "done"
@@ -1521,7 +1558,9 @@ def test_directory_dependency_hashed_and_runs(pipeline_dir: pathlib.Path) -> Non
 # =============================================================================
 
 
-def test_parallel_false_runs_sequentially(pipeline_dir: pathlib.Path) -> None:
+def test_parallel_false_runs_sequentially(
+    pipeline_dir: pathlib.Path, test_pipeline: Pipeline
+) -> None:
     """parallel=False runs stages one at a time."""
     (pipeline_dir / "input.txt").write_text("data")
     timing_file = pipeline_dir / "timing.txt"
@@ -1529,7 +1568,7 @@ def test_parallel_false_runs_sequentially(pipeline_dir: pathlib.Path) -> None:
     register_test_stage(_parallel_false_a, name="stage_a")
     register_test_stage(_parallel_false_b, name="stage_b")
 
-    results = executor.run(parallel=False)
+    results = executor.run(parallel=False, pipeline=test_pipeline)
 
     assert results["stage_a"]["status"] == "ran"
     assert results["stage_b"]["status"] == "ran"
@@ -1547,26 +1586,30 @@ def test_parallel_false_runs_sequentially(pipeline_dir: pathlib.Path) -> None:
 # =============================================================================
 
 
-def test_stage_stdout_and_stderr_captured(pipeline_dir: pathlib.Path) -> None:
+def test_stage_stdout_and_stderr_captured(
+    pipeline_dir: pathlib.Path, test_pipeline: Pipeline
+) -> None:
     """Stage stdout and stderr are captured in results."""
     (pipeline_dir / "input.txt").write_text("data")
 
     register_test_stage(_prints_output, name="prints_output")
 
-    results = executor.run()
+    results = executor.run(pipeline=test_pipeline)
 
     assert results["prints_output"]["status"] == "ran"
     # Output lines are captured in results but not exposed in dict
     # The stage should run successfully with captured output
 
 
-def test_stage_partial_line_output_captured(pipeline_dir: pathlib.Path) -> None:
+def test_stage_partial_line_output_captured(
+    pipeline_dir: pathlib.Path, test_pipeline: Pipeline
+) -> None:
     """Stage output without trailing newline is captured."""
     (pipeline_dir / "input.txt").write_text("data")
 
     register_test_stage(_partial_output, name="partial_output")
 
-    results = executor.run()
+    results = executor.run(pipeline=test_pipeline)
     assert results["partial_output"]["status"] == "ran"
 
 
@@ -1576,7 +1619,7 @@ def test_stage_partial_line_output_captured(pipeline_dir: pathlib.Path) -> None:
 
 
 def test_lock_retry_exhaustion_returns_failed(
-    pipeline_dir: pathlib.Path, stages_dir: pathlib.Path
+    pipeline_dir: pathlib.Path, stages_dir: pathlib.Path, test_pipeline: Pipeline
 ) -> None:
     """Multiple failed lock attempts return failed status."""
     (pipeline_dir / "input.txt").write_text("data")
@@ -1587,7 +1630,7 @@ def test_lock_retry_exhaustion_returns_failed(
 
     register_test_stage(_process_basic, name="process")
 
-    results = executor.run()
+    results = executor.run(pipeline=test_pipeline)
 
     assert results["process"]["status"] == "failed"
     assert "already running" in results["process"]["reason"]
@@ -1600,7 +1643,9 @@ def test_lock_retry_exhaustion_returns_failed(
 # =============================================================================
 
 
-def test_mutex_names_are_case_insensitive(pipeline_dir: pathlib.Path) -> None:
+def test_mutex_names_are_case_insensitive(
+    pipeline_dir: pathlib.Path, test_pipeline: Pipeline
+) -> None:
     """Mutex names are normalized to lowercase for comparison."""
     (pipeline_dir / "input.txt").write_text("data")
     timing_file = pipeline_dir / "timing.txt"
@@ -1608,7 +1653,7 @@ def test_mutex_names_are_case_insensitive(pipeline_dir: pathlib.Path) -> None:
     register_test_stage(_upper_mutex, name="upper_mutex", mutex=["GPU"])
     register_test_stage(_lower_mutex, name="lower_mutex", mutex=["gpu"])
 
-    results = executor.run(max_workers=4)
+    results = executor.run(max_workers=4, pipeline=test_pipeline)
 
     assert results["upper_mutex"]["status"] == "ran"
     assert results["lower_mutex"]["status"] == "ran"
@@ -1621,7 +1666,9 @@ def test_mutex_names_are_case_insensitive(pipeline_dir: pathlib.Path) -> None:
     ], f"Mutex names not normalized - stages ran concurrently: {timing}"
 
 
-def test_mutex_names_whitespace_stripped(pipeline_dir: pathlib.Path) -> None:
+def test_mutex_names_whitespace_stripped(
+    pipeline_dir: pathlib.Path, test_pipeline: Pipeline
+) -> None:
     """Mutex names have whitespace stripped."""
     (pipeline_dir / "input.txt").write_text("data")
     timing_file = pipeline_dir / "timing.txt"
@@ -1629,7 +1676,7 @@ def test_mutex_names_whitespace_stripped(pipeline_dir: pathlib.Path) -> None:
     register_test_stage(_spaced_mutex, name="spaced_mutex", mutex=["  resource  "])
     register_test_stage(_clean_mutex, name="clean_mutex", mutex=["resource"])
 
-    results = executor.run(max_workers=4)
+    results = executor.run(max_workers=4, pipeline=test_pipeline)
 
     assert results["spaced_mutex"]["status"] == "ran"
     assert results["clean_mutex"]["status"] == "ran"
@@ -1642,7 +1689,7 @@ def test_mutex_names_whitespace_stripped(pipeline_dir: pathlib.Path) -> None:
     ], f"Mutex whitespace not stripped - stages ran concurrently: {timing}"
 
 
-def test_exclusive_mutex_runs_alone(pipeline_dir: pathlib.Path) -> None:
+def test_exclusive_mutex_runs_alone(pipeline_dir: pathlib.Path, test_pipeline: Pipeline) -> None:
     """Stage with mutex=['*'] runs exclusively - no other stages run concurrently."""
     (pipeline_dir / "input.txt").write_text("data")
     timing_file = pipeline_dir / "timing.txt"
@@ -1651,7 +1698,7 @@ def test_exclusive_mutex_runs_alone(pipeline_dir: pathlib.Path) -> None:
     register_test_stage(_normal_a, name="normal_a")
     register_test_stage(_normal_b, name="normal_b")
 
-    results = executor.run(max_workers=4)
+    results = executor.run(max_workers=4, pipeline=test_pipeline)
 
     assert results["exclusive_stage"]["status"] == "ran"
     assert results["normal_a"]["status"] == "ran"
@@ -1674,7 +1721,9 @@ def test_exclusive_mutex_runs_alone(pipeline_dir: pathlib.Path) -> None:
 # =============================================================================
 
 
-def test_executor_removes_outputs_before_run(pipeline_dir: pathlib.Path) -> None:
+def test_executor_removes_outputs_before_run(
+    pipeline_dir: pathlib.Path, test_pipeline: Pipeline
+) -> None:
     """Outputs are removed before stage execution (clean state)."""
     (pipeline_dir / "input.txt").write_text("data")
     output_file = pipeline_dir / "output.txt"
@@ -1682,20 +1731,22 @@ def test_executor_removes_outputs_before_run(pipeline_dir: pathlib.Path) -> None
 
     register_test_stage(_removes_output_process, name="process")
 
-    results = executor.run()
+    results = executor.run(pipeline=test_pipeline)
 
     assert results["process"]["status"] == "ran"
     assert output_file.read_text() == "fresh data"
 
 
-def test_executor_saves_outputs_to_cache(pipeline_dir: pathlib.Path) -> None:
+def test_executor_saves_outputs_to_cache(
+    pipeline_dir: pathlib.Path, test_pipeline: Pipeline
+) -> None:
     """Outputs are saved to cache after successful execution."""
     (pipeline_dir / "input.txt").write_text("data")
     cache_dir = pipeline_dir / ".pivot" / "cache"
 
     register_test_stage(_cache_output_process, name="process")
 
-    results = executor.run()
+    results = executor.run(pipeline=test_pipeline)
 
     assert results["process"]["status"] == "ran"
 
@@ -1711,14 +1762,16 @@ def test_executor_saves_outputs_to_cache(pipeline_dir: pathlib.Path) -> None:
     assert len(cache_files) >= 1, "Cache should contain files"
 
 
-def test_executor_restores_missing_outputs_on_skip(pipeline_dir: pathlib.Path) -> None:
+def test_executor_restores_missing_outputs_on_skip(
+    pipeline_dir: pathlib.Path, test_pipeline: Pipeline
+) -> None:
     """Skipped stages restore missing outputs from cache."""
     (pipeline_dir / "input.txt").write_text("data")
 
     register_test_stage(_cache_output_process, name="process")
 
     # First run - executes and caches
-    results = executor.run()
+    results = executor.run(pipeline=test_pipeline)
     assert results["process"]["status"] == "ran"
 
     # Delete output (simulating user deleting file)
@@ -1731,31 +1784,33 @@ def test_executor_restores_missing_outputs_on_skip(pipeline_dir: pathlib.Path) -
     assert not output_file.exists()
 
     # Second run - should skip but restore output from cache
-    results = executor.run()
+    results = executor.run(pipeline=test_pipeline)
     assert results["process"]["status"] == "skipped"
     assert output_file.exists(), "Output should be restored from cache"
     assert output_file.read_text() == "result"
 
 
-def test_executor_fails_if_output_missing(pipeline_dir: pathlib.Path) -> None:
+def test_executor_fails_if_output_missing(
+    pipeline_dir: pathlib.Path, test_pipeline: Pipeline
+) -> None:
     """Stage fails if declared output is not produced."""
     (pipeline_dir / "input.txt").write_text("data")
 
     register_test_stage(_no_output_process, name="process")
 
-    results = executor.run()
+    results = executor.run(pipeline=test_pipeline)
 
     assert results["process"]["status"] == "failed"
     assert "output" in results["process"]["reason"].lower()
 
 
-def test_executor_handles_json_outputs(pipeline_dir: pathlib.Path) -> None:
+def test_executor_handles_json_outputs(pipeline_dir: pathlib.Path, test_pipeline: Pipeline) -> None:
     """JSON outputs are created correctly."""
     (pipeline_dir / "input.txt").write_text("data")
 
     register_test_stage(_metrics_process, name="process")
 
-    results = executor.run()
+    results = executor.run(pipeline=test_pipeline)
 
     assert results["process"]["status"] == "ran"
 
@@ -1767,25 +1822,29 @@ def test_executor_handles_json_outputs(pipeline_dir: pathlib.Path) -> None:
     assert json.loads(metrics_file.read_text()) == {"accuracy": 0.95}
 
 
-def test_executor_fails_if_json_output_missing(pipeline_dir: pathlib.Path) -> None:
+def test_executor_fails_if_json_output_missing(
+    pipeline_dir: pathlib.Path, test_pipeline: Pipeline
+) -> None:
     """Stage fails if JSON output is not produced."""
     (pipeline_dir / "input.txt").write_text("data")
 
     register_test_stage(_no_metrics_process, name="process")
 
-    results = executor.run()
+    results = executor.run(pipeline=test_pipeline)
 
     assert results["process"]["status"] == "failed"
     assert "metrics.json" in results["process"]["reason"]
 
 
-def test_executor_output_hashes_in_lock_file(pipeline_dir: pathlib.Path) -> None:
+def test_executor_output_hashes_in_lock_file(
+    pipeline_dir: pathlib.Path, test_pipeline: Pipeline
+) -> None:
     """Output hashes are stored in lock file."""
     (pipeline_dir / "input.txt").write_text("data")
 
     register_test_stage(_cache_output_process, name="process")
 
-    executor.run()
+    executor.run(pipeline=test_pipeline)
 
     lock_file = pipeline_dir / ".pivot" / "stages" / "process.lock"
     assert lock_file.exists()
@@ -1797,7 +1856,9 @@ def test_executor_output_hashes_in_lock_file(pipeline_dir: pathlib.Path) -> None
     assert lock_data["outs"][0]["path"] == "output.txt"
 
 
-def test_executor_lock_file_deterministic_sort(pipeline_dir: pathlib.Path) -> None:
+def test_executor_lock_file_deterministic_sort(
+    pipeline_dir: pathlib.Path, test_pipeline: Pipeline
+) -> None:
     """Lock file entries are sorted for deterministic output."""
     (pipeline_dir / "input.txt").write_text("data")
     (pipeline_dir / "z_input.txt").write_text("z")
@@ -1805,7 +1866,7 @@ def test_executor_lock_file_deterministic_sort(pipeline_dir: pathlib.Path) -> No
 
     register_test_stage(_multi_input_process, name="process")
 
-    executor.run()
+    executor.run(pipeline=test_pipeline)
 
     lock_file = pipeline_dir / ".pivot" / "stages" / "process.lock"
     lock_data = yaml.safe_load(lock_file.read_text())
@@ -1818,13 +1879,15 @@ def test_executor_lock_file_deterministic_sort(pipeline_dir: pathlib.Path) -> No
     assert out_paths == sorted(out_paths), "outs should be sorted by path"
 
 
-def test_executor_directory_output_cached(pipeline_dir: pathlib.Path) -> None:
+def test_executor_directory_output_cached(
+    pipeline_dir: pathlib.Path, test_pipeline: Pipeline
+) -> None:
     """Directory outputs are cached with manifest."""
     (pipeline_dir / "input.txt").write_text("data")
 
     register_test_stage(_dir_output_process, name="process")
 
-    results = executor.run()
+    results = executor.run(pipeline=test_pipeline)
 
     assert results["process"]["status"] == "ran"
 
@@ -1834,7 +1897,9 @@ def test_executor_directory_output_cached(pipeline_dir: pathlib.Path) -> None:
     assert (output_dir / "file2.txt").read_text() == "file2"
 
 
-def test_executor_lock_file_missing_outs_triggers_rerun(pipeline_dir: pathlib.Path) -> None:
+def test_executor_lock_file_missing_outs_triggers_rerun(
+    pipeline_dir: pathlib.Path, test_pipeline: Pipeline
+) -> None:
     """Lock file without outs section triggers re-execution."""
     (pipeline_dir / "input.txt").write_text("data")
     stages_dir = pipeline_dir / ".pivot" / "stages"
@@ -1856,7 +1921,7 @@ def test_executor_lock_file_missing_outs_triggers_rerun(pipeline_dir: pathlib.Pa
 
     register_test_stage(_lock_missing_outs, name="process")
 
-    results = executor.run()
+    results = executor.run(pipeline=test_pipeline)
 
     # Should re-run because outs is missing
     assert results["process"]["status"] == "ran"
@@ -1871,41 +1936,41 @@ def test_executor_lock_file_missing_outs_triggers_rerun(pipeline_dir: pathlib.Pa
 # ============================================================================
 
 
-def test_force_runs_unchanged_stage(pipeline_dir: pathlib.Path) -> None:
+def test_force_runs_unchanged_stage(pipeline_dir: pathlib.Path, test_pipeline: Pipeline) -> None:
     """Force flag should run stage even when nothing changed."""
     (pipeline_dir / "input.txt").write_text("hello")
 
     register_test_stage(_force_process, name="process")
 
     # First run - should execute
-    results = executor.run()
+    results = executor.run(pipeline=test_pipeline)
     assert results["process"]["status"] == "ran"
 
     # Second run without force - should skip (nothing changed)
-    results = executor.run()
+    results = executor.run(pipeline=test_pipeline)
     assert results["process"]["status"] == "skipped"
 
     # Third run with force - should run despite no changes
-    results = executor.run(force=True)
+    results = executor.run(force=True, pipeline=test_pipeline)
     assert results["process"]["status"] == "ran"
 
 
-def test_force_updates_lock_file(pipeline_dir: pathlib.Path) -> None:
+def test_force_updates_lock_file(pipeline_dir: pathlib.Path, test_pipeline: Pipeline) -> None:
     """After forced run, lock file should have current fingerprints."""
     (pipeline_dir / "input.txt").write_text("test")
 
     register_test_stage(_cache_output_process, name="process")
 
     # First run with force
-    results = executor.run(force=True)
+    results = executor.run(force=True, pipeline=test_pipeline)
     assert results["process"]["status"] == "ran"
 
     # Second run without force - should skip (lock file should be correct)
-    results = executor.run()
+    results = executor.run(pipeline=test_pipeline)
     assert results["process"]["status"] == "skipped", "Lock file should be valid after forced run"
 
 
-def test_force_with_specific_stage(pipeline_dir: pathlib.Path) -> None:
+def test_force_with_specific_stage(pipeline_dir: pathlib.Path, test_pipeline: Pipeline) -> None:
     """Force flag with specific stage forces that stage and its dependencies."""
     (pipeline_dir / "input.txt").write_text("data")
 
@@ -1914,19 +1979,19 @@ def test_force_with_specific_stage(pipeline_dir: pathlib.Path) -> None:
     register_test_stage(_force_other, name="other")
 
     # First run - all execute
-    results = executor.run()
+    results = executor.run(pipeline=test_pipeline)
     assert results["step1"]["status"] == "ran"
     assert results["step2"]["status"] == "ran"
     assert results["other"]["status"] == "ran"
 
     # Force run of step2 only - should force step1 and step2, skip other
-    results = executor.run(stages=["step2"], force=True)
+    results = executor.run(stages=["step2"], force=True, pipeline=test_pipeline)
     assert results["step1"]["status"] == "ran"
     assert results["step2"]["status"] == "ran"
     assert "other" not in results  # Not in execution set
 
 
-def test_force_with_single_stage(pipeline_dir: pathlib.Path) -> None:
+def test_force_with_single_stage(pipeline_dir: pathlib.Path, test_pipeline: Pipeline) -> None:
     """Force with single_stage should only force specified stage."""
     (pipeline_dir / "input.txt").write_text("data")
     (pipeline_dir / "step1.txt").write_text("existing")
@@ -1935,12 +2000,12 @@ def test_force_with_single_stage(pipeline_dir: pathlib.Path) -> None:
     register_test_stage(_force_single_step2, name="step2")
 
     # First run - both execute
-    results = executor.run()
+    results = executor.run(pipeline=test_pipeline)
     assert results["step1"]["status"] == "ran"
     assert results["step2"]["status"] == "ran"
 
     # Force run step2 with single_stage - step1 should skip
-    results = executor.run(stages=["step2"], single_stage=True, force=True)
+    results = executor.run(stages=["step2"], single_stage=True, force=True, pipeline=test_pipeline)
     assert "step1" not in results  # Not in execution set due to single_stage
     assert results["step2"]["status"] == "ran"
 
@@ -1950,7 +2015,7 @@ def test_force_with_single_stage(pipeline_dir: pathlib.Path) -> None:
 # =============================================================================
 
 
-def test_ensure_cleanup_registered_registers_atexit(mocker: "MockerFixture") -> None:
+def test_ensure_cleanup_registered_registers_atexit(mocker: MockerFixture) -> None:
     """Verify cleanup handler is registered exactly once via functools.cache."""
     executor_core._ensure_cleanup_registered.cache_clear()
 
@@ -1971,7 +2036,9 @@ def test_ensure_cleanup_registered_registers_atexit(mocker: "MockerFixture") -> 
 # =============================================================================
 
 
-def test_executor_deferred_writes_applied(pipeline_dir: pathlib.Path) -> None:
+def test_executor_deferred_writes_applied(
+    pipeline_dir: pathlib.Path, test_pipeline: Pipeline
+) -> None:
     """Coordinator applies deferred_writes from worker results.
 
     Verifies that after stage execution:
@@ -1984,7 +2051,7 @@ def test_executor_deferred_writes_applied(pipeline_dir: pathlib.Path) -> None:
 
     register_test_stage(_deferred_process, name="process")
 
-    results = executor.run()
+    results = executor.run(pipeline=test_pipeline)
     assert results["process"]["status"] == "ran"
 
     # Verify StateDB has output generation incremented
@@ -1997,13 +2064,15 @@ def test_executor_deferred_writes_applied(pipeline_dir: pathlib.Path) -> None:
         )
 
     # Verify deferred writes were applied by checking skip works on second run
-    results = executor.run()
+    results = executor.run(pipeline=test_pipeline)
     assert results["process"]["status"] == "skipped", (
         "Stage should skip on second run - deferred writes recorded run cache"
     )
 
 
-def test_executor_multi_stage_generation_tracking(pipeline_dir: pathlib.Path) -> None:
+def test_executor_multi_stage_generation_tracking(
+    pipeline_dir: pathlib.Path, test_pipeline: Pipeline
+) -> None:
     """Generations increment correctly across stage chain."""
     from pivot.storage import state
 
@@ -2013,7 +2082,7 @@ def test_executor_multi_stage_generation_tracking(pipeline_dir: pathlib.Path) ->
     register_test_stage(_deferred_step2, name="step2")
 
     # First run
-    results = executor.run()
+    results = executor.run(pipeline=test_pipeline)
     assert results["step1"]["status"] == "ran"
     assert results["step2"]["status"] == "ran"
 
@@ -2026,7 +2095,7 @@ def test_executor_multi_stage_generation_tracking(pipeline_dir: pathlib.Path) ->
 
     # Modify input - both should re-run since step1 output changes
     (pipeline_dir / "input.txt").write_text("data_v2")
-    results = executor.run()
+    results = executor.run(pipeline=test_pipeline)
     assert results["step1"]["status"] == "ran"
     assert results["step2"]["status"] == "ran"
 
@@ -2043,7 +2112,9 @@ def test_executor_multi_stage_generation_tracking(pipeline_dir: pathlib.Path) ->
 # =============================================================================
 
 
-def test_concurrent_runs_different_stages_allowed(pipeline_dir: pathlib.Path) -> None:
+def test_concurrent_runs_different_stages_allowed(
+    pipeline_dir: pathlib.Path, test_pipeline: Pipeline
+) -> None:
     """Two pivot runs targeting different stages can proceed independently."""
     (pipeline_dir / "input.txt").write_text("data")
 
@@ -2051,7 +2122,7 @@ def test_concurrent_runs_different_stages_allowed(pipeline_dir: pathlib.Path) ->
     register_test_stage(_concurrent_b, name="stage_b")
 
     # Both stages can run in parallel since they have different execution locks
-    results = executor.run(max_workers=4)
+    results = executor.run(max_workers=4, pipeline=test_pipeline)
     assert results["stage_a"]["status"] == "ran"
     assert results["stage_b"]["status"] == "ran"
 
@@ -2061,7 +2132,7 @@ def test_concurrent_runs_different_stages_allowed(pipeline_dir: pathlib.Path) ->
 # =============================================================================
 
 
-def test_many_stage_pipeline_completes(pipeline_dir: pathlib.Path) -> None:
+def test_many_stage_pipeline_completes(pipeline_dir: pathlib.Path, test_pipeline: Pipeline) -> None:
     """Pipeline with many stages completes in reasonable time."""
     (pipeline_dir / "input.txt").write_text("start")
 
@@ -2073,7 +2144,7 @@ def test_many_stage_pipeline_completes(pipeline_dir: pathlib.Path) -> None:
     register_test_stage(_helper_chain_step5, name="step5")
 
     start_time = time.time()
-    results = executor.run()
+    results = executor.run(pipeline=test_pipeline)
     elapsed = time.time() - start_time
 
     # All stages should run
@@ -2084,7 +2155,9 @@ def test_many_stage_pipeline_completes(pipeline_dir: pathlib.Path) -> None:
     assert elapsed < 15, f"5-stage pipeline took too long: {elapsed:.1f}s"
 
 
-def test_skip_detection_fast_with_many_deps(pipeline_dir: pathlib.Path) -> None:
+def test_skip_detection_fast_with_many_deps(
+    pipeline_dir: pathlib.Path, test_pipeline: Pipeline
+) -> None:
     """Second run with many deps skips quickly via generation check."""
     # Create many input files
     for i in range(20):
@@ -2093,12 +2166,12 @@ def test_skip_detection_fast_with_many_deps(pipeline_dir: pathlib.Path) -> None:
     register_test_stage(_many_deps_process, name="process")
 
     # First run
-    results = executor.run()
+    results = executor.run(pipeline=test_pipeline)
     assert results["process"]["status"] == "ran"
 
     # Second run - should skip quickly (generation-based check)
     start_time = time.time()
-    results = executor.run()
+    results = executor.run(pipeline=test_pipeline)
     elapsed = time.time() - start_time
 
     assert results["process"]["status"] == "skipped"

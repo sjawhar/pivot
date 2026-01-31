@@ -6,14 +6,15 @@ import contextlib
 import pathlib
 import threading
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Annotated, TypedDict
 from unittest.mock import patch
 
 import networkx as nx
 
-from pivot import registry
+from pivot import loaders, outputs, registry
 from pivot.engine import engine, sinks, sources, types
 from pivot.engine import graph as engine_graph
+from pivot.pipeline import pipeline as pipeline_mod
 from pivot.types import (
     OnError,
     RunEventType,
@@ -25,6 +26,8 @@ from pivot.types import (
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+    from pivot.pipeline.pipeline import Pipeline
 
 
 # =============================================================================
@@ -104,6 +107,7 @@ def _make_stage_info(
         dep_specs={},
         out_specs={},
         params_arg_name=None,
+        state_dir=None,
     )
 
 
@@ -1546,8 +1550,8 @@ def test_engine_initialize_orchestration_sets_up_state(tmp_path: pathlib.Path) -
 
         eng._graph = g
 
-        # Register the stages in the registry (with patch)
-        with patch.object(registry.REGISTRY, "get", side_effect=_helper_mock_get_stage):
+        # Mock _get_stage to return stage info with mutex
+        with patch.object(eng, "_get_stage", side_effect=_helper_mock_get_stage):
             eng._initialize_orchestration(
                 ["stage_a", "stage_b"], max_workers=2, error_mode=OnError.FAIL
             )
@@ -1782,9 +1786,14 @@ def _helper_code_change_stage_func(params: None) -> dict[str, str]:
     return {"result": "ok"}
 
 
-def test_engine_handle_code_or_config_changed_triggers_full_rerun() -> None:
+def test_engine_handle_code_or_config_changed_triggers_full_rerun(
+    test_pipeline: Pipeline,
+) -> None:
     """_handle_code_or_config_changed() triggers re-execution of all stages."""
-    with engine.Engine() as eng:
+    # Register a stage in the test pipeline
+    test_pipeline.register(_helper_code_change_stage_func, name="test_code_change_stage")
+
+    with engine.Engine(pipeline=test_pipeline) as eng:
         sink = _MockSink()
         eng.add_sink(sink)
 
@@ -1799,14 +1808,6 @@ def test_engine_handle_code_or_config_changed_triggers_full_rerun() -> None:
             patch.object(eng, "_invalidate_caches"),
             patch.object(eng, "_reload_registry", return_value=True),
             patch.object(eng, "_execute_affected_stages", side_effect=mock_execute),
-            patch(
-                "pivot.engine.engine.registry.REGISTRY.list_stages",
-                return_value=["test_code_change_stage"],
-            ),
-            patch(
-                "pivot.engine.engine.registry.REGISTRY.get",
-                return_value={"deps_paths": [], "outs_paths": [], "mutex": []},
-            ),
             patch("pivot.engine.engine.engine_graph.build_graph", return_value=nx.DiGraph()),
             patch("pivot.engine.engine.engine_graph.get_watch_paths", return_value=[]),
         ):
@@ -1968,26 +1969,34 @@ def test_engine_invalidate_caches_clears_graph() -> None:
         assert eng._graph is None
 
 
-def test_engine_invalidate_caches_calls_registry_invalidate() -> None:
-    """_invalidate_caches() calls REGISTRY.invalidate_dag_cache()."""
+def test_engine_invalidate_caches_calls_pipeline_invalidate(test_pipeline: Pipeline) -> None:
+    """_invalidate_caches() calls pipeline.invalidate_dag_cache()."""
     with (
-        engine.Engine() as eng,
-        patch("pivot.engine.engine.registry.REGISTRY.invalidate_dag_cache") as mock_invalidate,
+        engine.Engine(pipeline=test_pipeline) as eng,
+        patch.object(test_pipeline, "invalidate_dag_cache") as mock_invalidate,
     ):
         eng._invalidate_caches()
         mock_invalidate.assert_called_once()
 
 
-def test_engine_emit_reload_event_emits_pipeline_reloaded(tmp_path: pathlib.Path) -> None:
+def test_engine_emit_reload_event_emits_pipeline_reloaded(test_pipeline: Pipeline) -> None:
     """_emit_reload_event() emits PipelineReloaded with diff information."""
-    with engine.Engine() as eng:
+    # Register stage_a and stage_c in the current pipeline (stage_b will be removed)
+    test_pipeline.register(_helper_code_change_stage_func, name="stage_a")
+    test_pipeline.register(_helper_code_change_stage_func, name="stage_c")
+
+    # Get actual fingerprint from registered stage_a to use in old_stages
+    stage_a_info = test_pipeline.get("stage_a")
+    stage_a_fingerprint = stage_a_info["fingerprint"]
+
+    with engine.Engine(pipeline=test_pipeline) as eng:
         sink = _MockSink()
         eng.add_sink(sink)
 
-        # Create old stages snapshot
+        # Create old stages snapshot (had stage_a and stage_b)
         old_stages: dict[str, registry.RegistryStageInfo] = {
             "stage_a": registry.RegistryStageInfo(
-                func=lambda: None,
+                func=_helper_code_change_stage_func,
                 name="stage_a",
                 deps={},
                 deps_paths=[],
@@ -1997,13 +2006,14 @@ def test_engine_emit_reload_event_emits_pipeline_reloaded(tmp_path: pathlib.Path
                 mutex=[],
                 variant=None,
                 signature=None,
-                fingerprint={},
+                fingerprint=stage_a_fingerprint,  # Same fingerprint as current
                 dep_specs={},
                 out_specs={},
                 params_arg_name=None,
+                state_dir=None,
             ),
             "stage_b": registry.RegistryStageInfo(
-                func=lambda: None,
+                func=_helper_code_change_stage_func,
                 name="stage_b",
                 deps={},
                 deps_paths=[],
@@ -2017,22 +2027,12 @@ def test_engine_emit_reload_event_emits_pipeline_reloaded(tmp_path: pathlib.Path
                 dep_specs={},
                 out_specs={},
                 params_arg_name=None,
+                state_dir=None,
             ),
         }
 
-        # Simulate registry now has stage_a, stage_c (stage_b removed, stage_c added)
-        # stage_a exists in both, so we need to mock get() to return its info for fingerprint comparison
-        with (
-            patch(
-                "pivot.engine.engine.registry.REGISTRY.list_stages",
-                return_value=["stage_a", "stage_c"],
-            ),
-            patch(
-                "pivot.engine.engine.registry.REGISTRY.get",
-                return_value=old_stages["stage_a"],  # Same fingerprint, so not modified
-            ),
-        ):
-            eng._emit_reload_event(old_stages)
+        # Current pipeline has stage_a, stage_c (stage_b removed, stage_c added)
+        eng._emit_reload_event(old_stages)
 
         # Should have emitted PipelineReloaded event
         reload_events = [e for e in sink.events if e["type"] == "pipeline_reloaded"]
@@ -2047,16 +2047,23 @@ def test_engine_emit_reload_event_emits_pipeline_reloaded(tmp_path: pathlib.Path
         assert event["error"] is None
 
 
-def test_engine_emit_reload_event_detects_modified_stages(tmp_path: pathlib.Path) -> None:
+def test_engine_emit_reload_event_detects_modified_stages(test_pipeline: Pipeline) -> None:
     """_emit_reload_event() detects stages with changed fingerprints."""
-    with engine.Engine() as eng:
+    # Register stages - these will have specific fingerprints from registration
+    test_pipeline.register(_helper_code_change_stage_func, name="stage_a")
+    test_pipeline.register(_helper_code_change_stage_func, name="stage_b")
+
+    with engine.Engine(pipeline=test_pipeline) as eng:
         sink = _MockSink()
         eng.add_sink(sink)
+
+        # Get actual fingerprints from the pipeline for stage_b (unchanged)
+        stage_b_info = test_pipeline.get("stage_b")
 
         # Create old stages snapshot with specific fingerprints
         old_stages: dict[str, registry.RegistryStageInfo] = {
             "stage_a": registry.RegistryStageInfo(
-                func=lambda: None,
+                func=_helper_code_change_stage_func,
                 name="stage_a",
                 deps={},
                 deps_paths=[],
@@ -2066,13 +2073,14 @@ def test_engine_emit_reload_event_detects_modified_stages(tmp_path: pathlib.Path
                 mutex=[],
                 variant=None,
                 signature=None,
-                fingerprint={"code": "abc123"},  # Old fingerprint
+                fingerprint={"code": "abc123"},  # Different fingerprint - modified
                 dep_specs={},
                 out_specs={},
                 params_arg_name=None,
+                state_dir=None,
             ),
             "stage_b": registry.RegistryStageInfo(
-                func=lambda: None,
+                func=_helper_code_change_stage_func,
                 name="stage_b",
                 deps={},
                 deps_paths=[],
@@ -2082,59 +2090,15 @@ def test_engine_emit_reload_event_detects_modified_stages(tmp_path: pathlib.Path
                 mutex=[],
                 variant=None,
                 signature=None,
-                fingerprint={"code": "unchanged"},  # Same fingerprint
+                fingerprint=stage_b_info["fingerprint"],  # Same fingerprint - not modified
                 dep_specs={},
                 out_specs={},
                 params_arg_name=None,
+                state_dir=None,
             ),
         }
 
-        # Mock registry to return both stages, but stage_a has different fingerprint
-        new_stage_a = registry.RegistryStageInfo(
-            func=lambda: None,
-            name="stage_a",
-            deps={},
-            deps_paths=[],
-            outs=[],
-            outs_paths=[],
-            params=None,
-            mutex=[],
-            variant=None,
-            signature=None,
-            fingerprint={"code": "xyz789"},  # New fingerprint - modified
-            dep_specs={},
-            out_specs={},
-            params_arg_name=None,
-        )
-        new_stage_b = registry.RegistryStageInfo(
-            func=lambda: None,
-            name="stage_b",
-            deps={},
-            deps_paths=[],
-            outs=[],
-            outs_paths=[],
-            params=None,
-            mutex=[],
-            variant=None,
-            signature=None,
-            fingerprint={"code": "unchanged"},  # Same fingerprint - not modified
-            dep_specs={},
-            out_specs={},
-            params_arg_name=None,
-        )
-
-        new_stages_map = {"stage_a": new_stage_a, "stage_b": new_stage_b}
-        with (
-            patch(
-                "pivot.engine.engine.registry.REGISTRY.list_stages",
-                return_value=["stage_a", "stage_b"],
-            ),
-            patch(
-                "pivot.engine.engine.registry.REGISTRY.get",
-                side_effect=new_stages_map.__getitem__,
-            ),
-        ):
-            eng._emit_reload_event(old_stages)
+        eng._emit_reload_event(old_stages)
 
         # Should have emitted PipelineReloaded event with stage_a as modified
         reload_events = [e for e in sink.events if e["type"] == "pipeline_reloaded"]
@@ -2200,41 +2164,29 @@ def test_engine_reload_registry_returns_true_on_success(tmp_path: pathlib.Path) 
         assert result is True
 
 
-def test_engine_reload_registry_returns_false_on_failure(tmp_path: pathlib.Path) -> None:
+def test_engine_reload_registry_returns_false_on_failure(test_pipeline: Pipeline) -> None:
     """_reload_registry() returns False and restores when reload fails."""
-    with engine.Engine() as eng:
-        # Create a pivot.yaml
-        pivot_yaml = tmp_path / "pivot.yaml"
-        pivot_yaml.write_text("stages:\n  bad_stage:\n    python: nonexistent.module.func")
-
+    with engine.Engine(pipeline=test_pipeline) as eng:
         with (
-            patch("pivot.engine.engine.project.get_project_root", return_value=tmp_path),
+            patch("pivot.engine.engine.project.get_project_root", return_value=test_pipeline.root),
             patch.object(eng, "_clear_project_modules"),
             patch(
-                "pivot.pipeline.yaml.register_from_pipeline_file",
+                "pivot.discovery.discover_pipeline",
                 side_effect=Exception("Import failed"),
             ),
         ):
             result = eng._reload_registry()
 
         assert result is False
-        # Registry should be restored
-        # (We can't easily verify the exact state, but the method should have called restore)
+        # Pipeline should be restored (unchanged)
+        assert eng._pipeline is test_pipeline
 
 
-def test_engine_reload_from_decorators_returns_true_with_no_modules() -> None:
-    """_reload_from_decorators() returns True when no modules to reload."""
-    with engine.Engine() as eng:
-        old_stages: dict[str, registry.RegistryStageInfo] = {}  # No stages = no modules
-
-        result = eng._reload_from_decorators(old_stages)
-
-        assert result is True
-
-
-def test_engine_handle_code_or_config_changed_calls_invalidate_caches() -> None:
+def test_engine_handle_code_or_config_changed_calls_invalidate_caches(
+    test_pipeline: Pipeline,
+) -> None:
     """_handle_code_or_config_changed() calls _invalidate_caches()."""
-    with engine.Engine() as eng:
+    with engine.Engine(pipeline=test_pipeline) as eng:
         invalidate_called = [False]
 
         def mock_invalidate() -> None:
@@ -2247,16 +2199,11 @@ def test_engine_handle_code_or_config_changed_calls_invalidate_caches() -> None:
         eng._reload_registry = mock_reload  # type: ignore[method-assign]
         eng._execute_affected_stages = lambda stages: None  # type: ignore[method-assign]
 
-        # Need to mock project.get_project_root and registry.REGISTRY.list_stages
-        with (
-            patch("pivot.engine.engine.registry.REGISTRY.list_stages", return_value=[]),
-            patch("pivot.engine.engine.registry.REGISTRY.get", return_value={}),
-        ):
-            event: types.CodeOrConfigChanged = {
-                "type": "code_or_config_changed",
-                "paths": ["pivot.yaml"],
-            }
-            eng._handle_code_or_config_changed(event)
+        event: types.CodeOrConfigChanged = {
+            "type": "code_or_config_changed",
+            "paths": ["pivot.yaml"],
+        }
+        eng._handle_code_or_config_changed(event)
 
         assert invalidate_called[0] is True
 
@@ -2290,9 +2237,12 @@ def test_engine_handle_code_or_config_changed_aborts_on_invalid_pipeline() -> No
         assert len(executed_stages) == 0
 
 
-def test_engine_handle_code_or_config_changed_rebuilds_graph() -> None:
+def test_engine_handle_code_or_config_changed_rebuilds_graph(test_pipeline: Pipeline) -> None:
     """_handle_code_or_config_changed() rebuilds the bipartite graph after reload."""
-    with engine.Engine() as eng:
+    # Register a stage so _list_stages returns something
+    test_pipeline.register(_helper_code_change_stage_func, name="stage_a")
+
+    with engine.Engine(pipeline=test_pipeline) as eng:
         # Verify graph is None initially
         assert eng._graph is None
 
@@ -2300,11 +2250,6 @@ def test_engine_handle_code_or_config_changed_rebuilds_graph() -> None:
             patch.object(eng, "_invalidate_caches"),
             patch.object(eng, "_reload_registry", return_value=True),
             patch.object(eng, "_execute_affected_stages"),
-            patch("pivot.engine.engine.registry.REGISTRY.list_stages", return_value=["stage_a"]),
-            patch(
-                "pivot.engine.engine.registry.REGISTRY.get",
-                return_value={"deps_paths": [], "outs_paths": [], "mutex": []},
-            ),
             patch(
                 "pivot.engine.engine.engine_graph.build_graph",
                 return_value=nx.DiGraph(),
@@ -2321,11 +2266,13 @@ def test_engine_handle_code_or_config_changed_rebuilds_graph() -> None:
             mock_build_graph.assert_called_once()
 
 
-def test_engine_handle_code_or_config_changed_updates_watch_paths() -> None:
+def test_engine_handle_code_or_config_changed_updates_watch_paths(
+    test_pipeline: Pipeline,
+) -> None:
     """_handle_code_or_config_changed() updates FilesystemSource watch paths."""
     from pivot.engine import sources
 
-    with engine.Engine() as eng:
+    with engine.Engine(pipeline=test_pipeline) as eng:
         # Add a FilesystemSource
         fs_source = sources.FilesystemSource([])
         eng.add_source(fs_source)
@@ -2336,8 +2283,6 @@ def test_engine_handle_code_or_config_changed_updates_watch_paths() -> None:
             patch.object(eng, "_invalidate_caches"),
             patch.object(eng, "_reload_registry", return_value=True),
             patch.object(eng, "_execute_affected_stages"),
-            patch("pivot.engine.engine.registry.REGISTRY.list_stages", return_value=[]),
-            patch("pivot.engine.engine.registry.REGISTRY.get", return_value={}),
             patch(
                 "pivot.engine.engine.engine_graph.build_graph",
                 return_value=nx.DiGraph(),
@@ -2362,12 +2307,13 @@ def test_engine_handle_code_or_config_changed_updates_watch_paths() -> None:
 # =============================================================================
 
 
-def test_engine_try_start_run_returns_start_result_when_idle() -> None:
+def test_engine_try_start_run_returns_start_result_when_idle(test_pipeline: Pipeline) -> None:
     """try_start_run() returns AgentRunStartResult when engine is IDLE."""
-    with engine.Engine() as eng:
-        # Mock registry to return some stages
-        with patch("pivot.engine.engine.registry.REGISTRY.list_stages", return_value=["stage_a"]):
-            result = eng.try_start_run(run_id="test-run-123", stages=None, force=False)
+    # Register a stage in the pipeline
+    test_pipeline.register(_helper_code_change_stage_func, name="stage_a")
+
+    with engine.Engine(pipeline=test_pipeline) as eng:
+        result = eng.try_start_run(run_id="test-run-123", stages=None, force=False)
 
         # Should return start result
         assert "run_id" in result
@@ -2386,9 +2332,9 @@ def test_engine_try_start_run_accepts_specific_stages() -> None:
         assert result["stages_queued"] == ["my_stage"]
 
 
-def test_engine_try_start_run_rejects_when_active() -> None:
+def test_engine_try_start_run_rejects_when_active(test_pipeline: Pipeline) -> None:
     """try_start_run() returns AgentRunRejection when engine is ACTIVE."""
-    with engine.Engine() as eng:
+    with engine.Engine(pipeline=test_pipeline) as eng:
         # Set engine to ACTIVE state
         eng._state = types.EngineState.ACTIVE
         eng._current_run_id = "existing-run"
@@ -2402,22 +2348,23 @@ def test_engine_try_start_run_rejects_when_active() -> None:
         assert result.get("current_run_id") == "existing-run"
 
 
-def test_engine_try_start_run_sets_current_run_id() -> None:
+def test_engine_try_start_run_sets_current_run_id(test_pipeline: Pipeline) -> None:
     """try_start_run() sets _current_run_id on success."""
-    with engine.Engine() as eng:
+    with engine.Engine(pipeline=test_pipeline) as eng:
         assert eng._current_run_id is None
 
-        with patch("pivot.engine.engine.registry.REGISTRY.list_stages", return_value=[]):
-            eng.try_start_run(run_id="my-run-id", stages=[], force=False)
+        eng.try_start_run(run_id="my-run-id", stages=[], force=False)
 
         assert eng._current_run_id == "my-run-id"
 
 
-def test_engine_try_start_run_submits_run_requested_event() -> None:
+def test_engine_try_start_run_submits_run_requested_event(test_pipeline: Pipeline) -> None:
     """try_start_run() submits RunRequested event to queue."""
-    with engine.Engine() as eng:
-        with patch("pivot.engine.engine.registry.REGISTRY.list_stages", return_value=["stage_a"]):
-            eng.try_start_run(run_id="test-run", stages=None, force=True)
+    # Register a stage in the pipeline
+    test_pipeline.register(_helper_code_change_stage_func, name="stage_a")
+
+    with engine.Engine(pipeline=test_pipeline) as eng:
+        eng.try_start_run(run_id="test-run", stages=None, force=True)
 
         # Check the event was queued
         assert not eng._event_queue.empty()
@@ -2723,19 +2670,15 @@ def test_engine_code_change_emits_stages_modified_to_sink() -> None:
             eng._emit_reload_event(old_stages)
             return True
 
-        # Mock registry to return the stage with new fingerprint
+        # Mock engine methods to return the stage with new fingerprint
+        new_stages_dict = {"train_stage": new_stage_info}
         with (
             patch.object(eng, "_invalidate_caches"),
             patch.object(eng, "_reload_registry", side_effect=mock_reload),
             patch.object(eng, "_execute_affected_stages"),
-            patch(
-                "pivot.engine.engine.registry.REGISTRY.list_stages",
-                return_value=["train_stage"],
-            ),
-            patch(
-                "pivot.engine.engine.registry.REGISTRY.get",
-                return_value=new_stage_info,
-            ),
+            patch.object(eng, "_list_stages", return_value=["train_stage"]),
+            patch.object(eng, "_get_stage", return_value=new_stage_info),
+            patch.object(eng, "_get_all_stages", return_value=new_stages_dict),
             patch("pivot.engine.engine.engine_graph.build_graph", return_value=nx.DiGraph()),
             patch("pivot.engine.engine.engine_graph.get_watch_paths", return_value=[]),
         ):
@@ -2782,18 +2725,14 @@ def test_engine_reload_detects_added_stages() -> None:
             eng._emit_reload_event(old_stages)
             return True
 
+        new_stages_dict = {"new_stage": new_stage_info}
         with (
             patch.object(eng, "_invalidate_caches"),
             patch.object(eng, "_reload_registry", side_effect=mock_reload),
             patch.object(eng, "_execute_affected_stages"),
-            patch(
-                "pivot.engine.engine.registry.REGISTRY.list_stages",
-                return_value=["new_stage"],
-            ),
-            patch(
-                "pivot.engine.engine.registry.REGISTRY.get",
-                return_value=new_stage_info,
-            ),
+            patch.object(eng, "_list_stages", return_value=["new_stage"]),
+            patch.object(eng, "_get_stage", return_value=new_stage_info),
+            patch.object(eng, "_get_all_stages", return_value=new_stages_dict),
             patch("pivot.engine.engine.engine_graph.build_graph", return_value=nx.DiGraph()),
             patch("pivot.engine.engine.engine_graph.get_watch_paths", return_value=[]),
         ):
@@ -2831,10 +2770,8 @@ def test_engine_reload_detects_removed_stages() -> None:
             patch.object(eng, "_invalidate_caches"),
             patch.object(eng, "_reload_registry", side_effect=mock_reload),
             patch.object(eng, "_execute_affected_stages"),
-            patch(
-                "pivot.engine.engine.registry.REGISTRY.list_stages",
-                return_value=[],  # Stage was removed
-            ),
+            patch.object(eng, "_list_stages", return_value=[]),  # Stage was removed
+            patch.object(eng, "_get_all_stages", return_value={}),  # Empty - stage removed
             patch("pivot.engine.engine.engine_graph.build_graph", return_value=nx.DiGraph()),
             patch("pivot.engine.engine.engine_graph.get_watch_paths", return_value=[]),
         ):
@@ -2881,14 +2818,9 @@ def test_engine_code_change_detects_multiple_modified_stages() -> None:
             patch.object(eng, "_invalidate_caches"),
             patch.object(eng, "_reload_registry", side_effect=mock_reload),
             patch.object(eng, "_execute_affected_stages"),
-            patch(
-                "pivot.engine.engine.registry.REGISTRY.list_stages",
-                return_value=["stage_a", "stage_b", "stage_c"],
-            ),
-            patch(
-                "pivot.engine.engine.registry.REGISTRY.get",
-                side_effect=new_stages_map.__getitem__,
-            ),
+            patch.object(eng, "_list_stages", return_value=["stage_a", "stage_b", "stage_c"]),
+            patch.object(eng, "_get_stage", side_effect=new_stages_map.__getitem__),
+            patch.object(eng, "_get_all_stages", return_value=new_stages_map),
             patch("pivot.engine.engine.engine_graph.build_graph", return_value=nx.DiGraph()),
             patch("pivot.engine.engine.engine_graph.get_watch_paths", return_value=[]),
         ):
@@ -2929,3 +2861,34 @@ def test_engine_reload_failure_does_not_emit_pipeline_reloaded() -> None:
         # No PipelineReloaded event should be emitted when reload fails
         reload_events = [e for e in sink.events if e["type"] == "pipeline_reloaded"]
         assert reload_events == [], "No PipelineReloaded events when reload fails"
+
+
+# =============================================================================
+# Pipeline Integration Tests
+# =============================================================================
+
+
+class _PipelineTestOutput(TypedDict):
+    """Module-level TypedDict for test_engine_accepts_pipeline."""
+
+    result: Annotated[pathlib.Path, outputs.Out("result.txt", loaders.PathOnly())]
+
+
+def _helper_pipeline_stage() -> _PipelineTestOutput:
+    """Module-level helper for test_engine_accepts_pipeline."""
+    return _PipelineTestOutput(result=pathlib.Path("result.txt"))
+
+
+def test_engine_accepts_pipeline(tmp_path: pathlib.Path) -> None:
+    """Engine should accept a Pipeline instance and use it for stage lookup."""
+    p = pipeline_mod.Pipeline("test", root=tmp_path)
+    p.register(_helper_pipeline_stage, name="my_stage")
+
+    with engine.Engine(pipeline=p) as eng:
+        # Verify pipeline is stored
+        assert eng._pipeline is p
+
+        # Verify helper methods use the pipeline
+        assert eng._list_stages() == ["my_stage"]
+        assert eng._get_stage("my_stage")["func"] is _helper_pipeline_stage
+        assert "my_stage" in eng._get_all_stages()

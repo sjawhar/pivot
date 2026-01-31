@@ -12,10 +12,9 @@ from pivot.show import params
 from pivot.types import ChangeType, OutputFormat
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     from pytest_mock import MockerFixture
 
+    from pivot.pipeline.pipeline import Pipeline
     from tests.conftest import ValidLockContentFactory
 
 
@@ -24,7 +23,7 @@ if TYPE_CHECKING:
 # =============================================================================
 
 
-def test_collect_params_from_stages_empty(clean_registry: None) -> None:
+def test_collect_params_from_stages_empty(mock_discovery: Pipeline) -> None:
     """Empty registry returns empty result."""
     result = params.collect_params_from_stages()
     assert result["params"] == {}
@@ -40,7 +39,7 @@ def _helper_params_stage(params: _MyParams) -> None:
     pass
 
 
-def test_collect_params_from_stages_with_params(set_project_root: Path) -> None:
+def test_collect_params_from_stages_with_params(mock_discovery: Pipeline) -> None:
     """Collects params from stage with Pydantic model."""
     register_test_stage(
         _helper_params_stage,
@@ -60,7 +59,7 @@ def _helper_no_params_stage() -> None:
     pass
 
 
-def test_collect_params_from_stages_without_params(set_project_root: Path) -> None:
+def test_collect_params_from_stages_without_params(mock_discovery: Pipeline) -> None:
     """Stages without params are not included."""
     register_test_stage(_helper_no_params_stage, name="no_params")
 
@@ -77,11 +76,11 @@ def _helper_override_stage(params: _OverrideParams) -> None:
     pass
 
 
-def test_collect_params_from_stages_with_overrides(set_project_root: Path) -> None:
+def test_collect_params_from_stages_with_overrides(mock_discovery: Pipeline) -> None:
     """Applies params.yaml overrides."""
     register_test_stage(_helper_override_stage, name="train", params=_OverrideParams())
 
-    params_yaml = set_project_root / "params.yaml"
+    params_yaml = mock_discovery.root / "params.yaml"
     params_yaml.write_text(yaml.dump({"train": {"learning_rate": 0.05}}))
 
     result = params.collect_params_from_stages()
@@ -106,7 +105,7 @@ def _helper_filter_c(params: _FilterParams) -> None:
 
 
 def test_collect_params_from_stages_filters_by_stage_names(
-    set_project_root: Path,
+    mock_discovery: Pipeline,
 ) -> None:
     """Filters to specific stage names."""
     register_test_stage(_helper_filter_a, name="stage_a", params=_FilterParams())
@@ -121,7 +120,7 @@ def test_collect_params_from_stages_filters_by_stage_names(
 
 
 def test_collect_params_from_stages_unknown_stage(
-    set_project_root: Path,
+    mock_discovery: Pipeline,
 ) -> None:
     """Unknown stage name is returned in unknown_stages list."""
     result = params.collect_params_from_stages(["nonexistent"])
@@ -135,7 +134,7 @@ def test_collect_params_from_stages_unknown_stage(
 # =============================================================================
 
 
-def test_get_params_from_head_no_stages(set_project_root: Path) -> None:
+def test_get_params_from_head_no_stages(mock_discovery: Pipeline) -> None:
     """No registered stages returns empty result."""
     result = params.get_params_from_head()
     assert result["params"] == {}
@@ -151,7 +150,7 @@ def _helper_lock_stage(params: _LockParams) -> None:
 
 
 def test_get_params_from_head_with_lock_file(
-    set_project_root: Path,
+    mock_discovery: Pipeline,
     mocker: MockerFixture,
     make_valid_lock_content: ValidLockContentFactory,
 ) -> None:
@@ -176,7 +175,7 @@ def test_get_params_from_head_with_lock_file(
 
 
 def test_get_params_from_head_no_lock_file(
-    set_project_root: Path,
+    mock_discovery: Pipeline,
     mocker: MockerFixture,
 ) -> None:
     """Missing lock file means stage not in result."""
@@ -193,7 +192,7 @@ def test_get_params_from_head_no_lock_file(
 
 
 def test_get_params_from_head_no_git_repo(
-    set_project_root: Path,
+    mock_discovery: Pipeline,
     mocker: MockerFixture,
 ) -> None:
     """Returns git_available=False when not in git repo."""
@@ -210,7 +209,7 @@ def test_get_params_from_head_no_git_repo(
 
 
 def test_get_params_from_head_invalid_yaml(
-    set_project_root: Path,
+    mock_discovery: Pipeline,
     mocker: MockerFixture,
 ) -> None:
     """Invalid YAML in lock file is skipped."""
@@ -229,7 +228,7 @@ def test_get_params_from_head_invalid_yaml(
 
 
 def test_get_params_from_head_missing_params_key(
-    set_project_root: Path,
+    mock_discovery: Pipeline,
     mocker: MockerFixture,
 ) -> None:
     """Lock file without params key is skipped."""
@@ -249,7 +248,7 @@ def test_get_params_from_head_missing_params_key(
 
 
 def test_get_params_from_head_empty_params(
-    set_project_root: Path,
+    mock_discovery: Pipeline,
     mocker: MockerFixture,
 ) -> None:
     """Lock file with empty params dict is skipped."""
@@ -269,7 +268,7 @@ def test_get_params_from_head_empty_params(
 
 
 def test_get_params_from_head_filters_by_stage_names(
-    set_project_root: Path,
+    mock_discovery: Pipeline,
     mocker: MockerFixture,
     make_valid_lock_content: ValidLockContentFactory,
 ) -> None:

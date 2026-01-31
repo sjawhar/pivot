@@ -3,14 +3,20 @@ from __future__ import annotations
 import functools
 import os
 import sys
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import click
 
-from pivot import discovery, exceptions, metrics, registry
+from pivot import discovery, exceptions, metrics
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+    from pivot.pipeline.pipeline import Pipeline
+
+
+# Context key for storing the discovered Pipeline
+PIPELINE_CONTEXT_KEY = "_pivot_pipeline"
 
 
 def _handle_pivot_error(e: exceptions.PivotError) -> click.ClickException:
@@ -70,12 +76,16 @@ def pivot_command(
         def wrapper(*args: Any, **kwargs: Any) -> Any:
             try:
                 with metrics.timed("cli.total"):
-                    if auto_discover and not discovery.has_registered_stages():
+                    # Check if Pipeline is already in context (e.g., when invoking subcommand)
+                    if auto_discover and not _has_pipeline_in_context():
                         try:
                             with metrics.timed("cli.discover"):
-                                discovery.discover_and_register()
-                            with metrics.timed("cli.validate_outputs"):
-                                registry.REGISTRY.validate_outputs()
+                                pipeline = discovery.discover_pipeline()
+                                if pipeline is not None:
+                                    # Store Pipeline in context for commands that need it
+                                    store_pipeline_in_context(pipeline)
+                                # If no Pipeline found, commands that need stages will fail
+                                # with NoPipelineError when they try to access stages
                         except discovery.DiscoveryError as e:
                             raise click.ClickException(str(e)) from e
                     return func(*args, **kwargs)
@@ -87,6 +97,43 @@ def pivot_command(
         return click.command(name=name, **attrs)(wrapped)
 
     return decorator
+
+
+def store_pipeline_in_context(pipeline: Pipeline) -> None:
+    """Store a Pipeline in the Click context."""
+    ctx = click.get_current_context(silent=True)
+    if ctx is None:
+        return
+    # Context obj is set by CLI group as a dict-like CliContext
+    if ctx.obj is None:
+        ctx.obj = {}
+    # TypedDict is a dict, so we can add extra keys
+    ctx.obj[PIPELINE_CONTEXT_KEY] = pipeline  # type: ignore[literal-required]
+
+
+def get_pipeline_from_context() -> Pipeline | None:
+    """Get the discovered Pipeline from Click context, if any.
+
+    Returns None if no Pipeline was discovered.
+    """
+    from pivot.pipeline.pipeline import Pipeline
+
+    ctx = click.get_current_context(silent=True)
+    if ctx is None:
+        return None
+    obj = ctx.obj
+    if obj is None or not isinstance(obj, dict):
+        return None
+    # ctx.obj is typed as Any, so dict.get returns Unknown
+    pipeline = cast("Any", obj).get(PIPELINE_CONTEXT_KEY)
+    if pipeline is None or not isinstance(pipeline, Pipeline):
+        return None
+    return pipeline
+
+
+def _has_pipeline_in_context() -> bool:
+    """Check if a Pipeline is stored in the current Click context."""
+    return get_pipeline_from_context() is not None
 
 
 def _print_metrics_summary() -> None:

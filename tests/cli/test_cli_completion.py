@@ -14,6 +14,8 @@ if TYPE_CHECKING:
 
     from pytest_mock import MockerFixture
 
+    from pivot.pipeline.pipeline import Pipeline
+
 
 def _noop() -> None:
     """Module-level no-op function for stage registration in tests."""
@@ -220,8 +222,9 @@ def test_find_project_root_fast_returns_none_when_no_marker(
 # =============================================================================
 
 
-def test_get_stages_full_returns_registered_stages() -> None:
+def test_get_stages_full_returns_registered_stages(mock_discovery: Pipeline) -> None:
     """Returns stages from registry after registration."""
+    _ = mock_discovery
 
     # Register real stages (autouse fixture clears registry between tests)
     register_test_stage(_noop, name="stage1")
@@ -284,9 +287,13 @@ stages:
 
 
 def test_complete_stages_falls_back_to_registry(
-    mock_ctx: mock.MagicMock, mock_param: mock.MagicMock, mocker: MockerFixture
+    mock_discovery: Pipeline,
+    mock_ctx: mock.MagicMock,
+    mock_param: mock.MagicMock,
+    mocker: MockerFixture,
 ) -> None:
     """Falls back to registry when fast path returns None (no YAML)."""
+    _ = mock_discovery
 
     # No YAML file, fast path returns None
     mocker.patch.object(completion, "_find_project_root_fast", return_value=None)
