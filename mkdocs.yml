@@ -101,6 +101,8 @@ nav:
     - CLI Development: contributing/cli.md
     - Adding Loaders: contributing/loaders.md
     - Common Gotchas: contributing/gotchas.md
+  - Prevention Strategies:
+    - TypedDict Field Synchronization: prevention/typeddictfield-synchronization.md
   - Comparison: comparison.md
 
 markdown_extensions:

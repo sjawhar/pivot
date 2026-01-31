@@ -86,22 +86,20 @@ def test_sliding_window_counter_excludes_old_buckets(mocker: MockerFixture) -> N
 
 
 # =============================================================================
-# QueueStatsTracker Tests
+# MessageStatsTracker Tests
 # =============================================================================
 
 
-def test_queue_stats_tracker_initial_state() -> None:
-    tracker = stats.QueueStatsTracker("test_queue")
+def test_message_stats_tracker_initial_state() -> None:
+    tracker = stats.MessageStatsTracker("test_messages")
     result = tracker.get_stats()
-    assert result["name"] == "test_queue"
+    assert result["name"] == "test_messages"
     assert result["messages_received"] == 0
     assert result["messages_per_second"] == 0.0
-    assert result["approximate_size"] is None
-    assert result["high_water_mark"] == 0
 
 
-def test_queue_stats_tracker_records_messages() -> None:
-    tracker = stats.QueueStatsTracker("test_queue")
+def test_message_stats_tracker_records_messages() -> None:
+    tracker = stats.MessageStatsTracker("test_messages")
     tracker.record_message()
     tracker.record_message()
     tracker.record_message()
@@ -109,46 +107,8 @@ def test_queue_stats_tracker_records_messages() -> None:
     assert result["messages_received"] == 3
 
 
-def test_queue_stats_tracker_with_queue(mocker: MockerFixture) -> None:
-    mock_queue = mocker.Mock()
-    mock_queue.qsize.return_value = 5
-    tracker = stats.QueueStatsTracker("test_queue", mock_queue)
-    result = tracker.get_stats()
-    assert result["approximate_size"] == 5
-    assert result["high_water_mark"] == 5
-
-
-def test_queue_stats_tracker_tracks_high_water_mark(mocker: MockerFixture) -> None:
-    mock_queue = mocker.Mock()
-    tracker = stats.QueueStatsTracker("test_queue", mock_queue)
-
-    # First check with size 10
-    mock_queue.qsize.return_value = 10
-    result1 = tracker.get_stats()
-    assert result1["high_water_mark"] == 10
-
-    # Size drops to 3
-    mock_queue.qsize.return_value = 3
-    result2 = tracker.get_stats()
-    assert result2["approximate_size"] == 3
-    assert result2["high_water_mark"] == 10, "High water mark should stay at 10"
-
-    # Size rises to 15
-    mock_queue.qsize.return_value = 15
-    result3 = tracker.get_stats()
-    assert result3["high_water_mark"] == 15
-
-
-def test_queue_stats_tracker_handles_qsize_not_implemented(mocker: MockerFixture) -> None:
-    mock_queue = mocker.Mock()
-    mock_queue.qsize.side_effect = NotImplementedError
-    tracker = stats.QueueStatsTracker("test_queue", mock_queue)
-    result = tracker.get_stats()
-    assert result["approximate_size"] is None
-
-
-def test_queue_stats_tracker_thread_safety() -> None:
-    tracker = stats.QueueStatsTracker("test_queue")
+def test_message_stats_tracker_thread_safety() -> None:
+    tracker = stats.MessageStatsTracker("test_messages")
     errors = list[Exception]()
 
     def writer() -> None:
@@ -207,30 +167,24 @@ def test_get_memory_mb_returns_float_type() -> None:
 # =============================================================================
 
 
-def test_queue_stats_has_required_keys() -> None:
-    tracker = stats.QueueStatsTracker("test")
+def test_message_stats_has_required_keys() -> None:
+    tracker = stats.MessageStatsTracker("test")
     result = tracker.get_stats()
     assert "name" in result
     assert "messages_received" in result
     assert "messages_per_second" in result
-    assert "approximate_size" in result
-    assert "high_water_mark" in result
 
 
 def test_debug_stats_type_structure() -> None:
     # Verify the TypedDict can be constructed with expected structure
     debug_stats: stats.DebugStats = {
-        "tui_queue": {
+        "tui_messages": {
             "name": "tui",
             "messages_received": 10,
             "messages_per_second": 2.0,
-            "approximate_size": 5,
-            "high_water_mark": 8,
         },
-        "output_queue": None,
         "active_workers": 2,
         "memory_mb": 123.4,
         "uptime_seconds": 60.0,
     }
-    assert debug_stats["tui_queue"]["name"] == "tui"
-    assert debug_stats["output_queue"] is None
+    assert debug_stats["tui_messages"]["name"] == "tui"

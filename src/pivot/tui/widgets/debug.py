@@ -5,19 +5,18 @@ from typing import TYPE_CHECKING
 import textual.widgets
 
 if TYPE_CHECKING:
-    from pivot.tui.stats import DebugStats, QueueStats
+    from pivot.tui.stats import DebugStats, MessageStats
 
 
-def _format_queue_stats(q: QueueStats | None, label: str) -> str:
-    """Format queue statistics for display."""
-    if q is None:
-        return f"{label}: N/A"
-    size = str(q["approximate_size"]) if q["approximate_size"] is not None else "N/A"
-    return f"{label}: {size} (peak {q['high_water_mark']})"
+def _format_message_stats(stats: MessageStats) -> str:
+    """Format message statistics for display."""
+    return (
+        f"{stats['name']}: {stats['messages_received']} msgs ({stats['messages_per_second']:.1f}/s)"
+    )
 
 
 class DebugPanel(textual.widgets.Static):
-    """Debug panel showing queue statistics and system info."""
+    """Debug panel showing message statistics and system info."""
 
     _stats: DebugStats | None
 
@@ -35,13 +34,8 @@ class DebugPanel(textual.widgets.Static):
             self.update("[dim]No stats available[/]")
             return
 
-        tui_q = self._stats["tui_queue"]
-        tui_str = _format_queue_stats(tui_q, "TUI")
-        out_str = _format_queue_stats(self._stats["output_queue"], "Output")
-
-        # Format message count with K suffix for large numbers
-        total_msgs = tui_q["messages_received"]
-        msgs_str = f"{total_msgs / 1000:.1f}k" if total_msgs >= 1000 else str(total_msgs)
+        msg_stats = self._stats["tui_messages"]
+        msg_str = _format_message_stats(msg_stats)
 
         # Format memory
         mem = self._stats["memory_mb"]
@@ -53,10 +47,10 @@ class DebugPanel(textual.widgets.Static):
         uptime_str = f"{mins}:{secs:02d}"
 
         lines = [
-            f"[cyan]Queues:[/]  {tui_str}  {out_str}",
+            f"[cyan]Messages:[/] {msg_str}",
             (
-                f"[cyan]Stats:[/]   {msgs_str} msgs @ {tui_q['messages_per_second']:.1f}/s   "
-                f"Workers: {self._stats['active_workers']}   Mem: {mem_str}   Up: {uptime_str}"
+                f"[cyan]Stats:[/]    Workers: {self._stats['active_workers']}   "
+                f"Mem: {mem_str}   Up: {uptime_str}"
             ),
         ]
         self.update("\n".join(lines))

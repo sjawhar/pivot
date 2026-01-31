@@ -119,7 +119,7 @@ def test_keep_going_flag_continues_after_failure(
 
     assert result.exit_code == 0
     assert "failing: FAILED" in result.output
-    assert "succeeding: ran" in result.output
+    assert "succeeding: done" in result.output  # Console sink outputs "done" for successful stages
     assert (tmp_path / "succeeding.txt").read_text() == "success"
 
 
@@ -142,9 +142,11 @@ def test_keep_going_flag_skips_downstream(
 
     assert result.exit_code == 0
     assert "first: FAILED" in result.output
-    assert "second: blocked" in result.output
-    assert "upstream" in result.output  # Reason should mention upstream failed
-    assert "independent: ran" in result.output
+    # Blocked stages show as "skipped" in console output (status is SKIPPED with reason)
+    assert "second: skipped" in result.output
+    # Summary shows blocked count
+    assert "blocked" in result.output
+    assert "independent: done" in result.output
 
 
 def test_keep_going_short_flag(
@@ -165,7 +167,7 @@ def test_keep_going_short_flag(
 
     assert result.exit_code == 0
     assert "failing: FAILED" in result.output
-    assert "succeeding: ran" in result.output
+    assert "succeeding: done" in result.output
 
 
 def test_without_keep_going_stops_on_failure(
@@ -188,8 +190,10 @@ def test_without_keep_going_stops_on_failure(
 
     assert result.exit_code == 0
     assert "failing: FAILED" in result.output
-    # Without --keep-going, downstream stages are blocked due to upstream failure
-    assert "downstream: blocked" in result.output
+    # Without --keep-going, downstream stages show as skipped (blocked internally)
+    assert "downstream: skipped" in result.output
+    # Summary shows blocked count
+    assert "blocked" in result.output
     assert not (tmp_path / "downstream.txt").exists()
 
 
@@ -223,11 +227,11 @@ def test_keep_going_with_json_output(
     lines = result.output.strip().split("\n")
     events = [json.loads(line) for line in lines if line.strip()]
 
-    # Should have both stage completions
-    stage_complete_events = [e for e in events if e.get("type") == "stage_complete"]
-    assert len(stage_complete_events) == 2
+    # Should have both stage completions (JSONL uses stage_complete)
+    stage_completed_events = [e for e in events if e.get("type") == "stage_complete"]
+    assert len(stage_completed_events) == 2
 
-    statuses = {e["stage"]: e["status"] for e in stage_complete_events}
+    statuses = {e["stage"]: e["status"] for e in stage_completed_events}
     assert statuses["failing"] == "failed"
     assert statuses["succeeding"] == "ran"
 

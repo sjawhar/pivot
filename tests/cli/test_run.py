@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import pathlib
 from typing import TYPE_CHECKING, Annotated, TypedDict
 
@@ -8,7 +9,10 @@ from pivot import cli, executor, loaders, outputs, project
 from pivot.storage import cache, track
 
 if TYPE_CHECKING:
+    from collections.abc import Generator
+
     import click.testing
+    import filelock
     import pytest
     from pytest_mock import MockerFixture
 
@@ -157,22 +161,22 @@ def test_run_tui_log_requires_tui(
     assert "--tui-log requires --tui" in result.output
 
 
-def test_run_serve_requires_tui(
+def test_run_serve_requires_watch(
     mock_discovery: Pipeline,
     runner: click.testing.CliRunner,
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """--serve requires --tui flag in watch mode."""
+    """--serve requires --watch flag."""
     monkeypatch.chdir(tmp_path)
     pathlib.Path(".git").mkdir()
     register_test_stage(_helper_process, name="process")
     pathlib.Path("input.txt").write_text("data")
 
-    result = runner.invoke(cli.cli, ["run", "--watch", "--serve"])
+    result = runner.invoke(cli.cli, ["run", "--serve"])
 
     assert result.exit_code != 0
-    assert "--serve requires --tui" in result.output
+    assert "--serve requires --watch" in result.output
 
 
 def test_run_help_includes_tui_flag(
@@ -232,24 +236,6 @@ def test_run_uses_plain_mode_by_default(
     assert '"type":' not in result.output
     # Should contain stage name in output
     assert "process" in result.output.lower()
-
-
-def test_run_serve_requires_watch(
-    mock_discovery: Pipeline,
-    runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """--serve requires --watch mode."""
-    monkeypatch.chdir(tmp_path)
-    pathlib.Path(".git").mkdir()
-    pathlib.Path("input.txt").write_text("data")
-    register_test_stage(_helper_process, name="process")
-
-    result = runner.invoke(cli.cli, ["run", "--serve"])
-
-    assert result.exit_code != 0
-    assert "--serve requires --watch" in result.output
 
 
 def test_run_tui_with_tui_log_validation_passes(
@@ -355,3 +341,89 @@ def test_run_dry_run_allow_missing_no_pvt_shows_would_run(
     assert "would run" in result.output.lower()
     # Reason should indicate no previous run (not missing deps)
     assert "No previous run" in result.output or "no previous" in result.output.lower()
+
+
+# =============================================================================
+# --no-commit Lock Acquisition Tests
+# =============================================================================
+
+
+def test_run_no_commit_acquires_pending_state_lock(
+    mock_discovery: Pipeline,
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mocker: MockerFixture,
+) -> None:
+    """run --no-commit acquires pending_state_lock during execution."""
+    monkeypatch.chdir(tmp_path)
+    pathlib.Path(".git").mkdir()
+    pathlib.Path("input.txt").write_text("data")
+    register_test_stage(_helper_process, name="process")
+
+    # Mock pending_state_lock to track calls
+    from pivot.storage import project_lock
+
+    lock_context_entered = False
+    lock_context_exited = False
+
+    original_pending_state_lock = project_lock.pending_state_lock
+
+    @contextlib.contextmanager
+    def mock_pending_state_lock(timeout: float = -1) -> Generator[filelock.BaseFileLock]:
+        nonlocal lock_context_entered, lock_context_exited
+        lock_context_entered = True
+        with original_pending_state_lock(timeout=timeout) as lock:
+            yield lock
+        lock_context_exited = True
+
+    mocker.patch.object(
+        project_lock,
+        "pending_state_lock",
+        mock_pending_state_lock,
+    )
+
+    result = runner.invoke(cli.cli, ["run", "--no-commit"])
+
+    assert result.exit_code == 0, f"Expected success, got: {result.output}"
+    assert lock_context_entered, "pending_state_lock should have been acquired"
+    assert lock_context_exited, "pending_state_lock should have been released"
+
+
+def test_run_without_no_commit_does_not_acquire_pending_state_lock(
+    mock_discovery: Pipeline,
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mocker: MockerFixture,
+) -> None:
+    """run without --no-commit does not acquire pending_state_lock."""
+    monkeypatch.chdir(tmp_path)
+    pathlib.Path(".git").mkdir()
+    pathlib.Path("input.txt").write_text("data")
+    register_test_stage(_helper_process, name="process")
+
+    # Mock pending_state_lock to track calls
+    from pivot.storage import project_lock
+
+    lock_acquired = False
+
+    original_pending_state_lock = project_lock.pending_state_lock
+
+    @contextlib.contextmanager
+    def mock_pending_state_lock(timeout: float = -1) -> Generator[filelock.BaseFileLock]:
+        nonlocal lock_acquired
+        lock_acquired = True
+        with original_pending_state_lock(timeout=timeout) as lock:
+            yield lock
+
+    mocker.patch.object(
+        project_lock,
+        "pending_state_lock",
+        mock_pending_state_lock,
+    )
+
+    result = runner.invoke(cli.cli, ["run"])
+
+    assert result.exit_code == 0, f"Expected success, got: {result.output}"
+    assert not lock_acquired, "pending_state_lock should NOT have been acquired without --no-commit"

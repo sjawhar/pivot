@@ -1,25 +1,27 @@
-"""Event source implementations for the engine."""
-
 from __future__ import annotations
 
 import logging
-import threading
 from typing import TYPE_CHECKING
 
+import anyio
 import watchfiles
 
 from pivot.engine.types import CodeOrConfigChanged, DataArtifactChanged, RunRequested
 from pivot.types import OnError
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
     from pathlib import Path
+
+    from anyio.streams.memory import MemoryObjectSendStream
 
     from pivot.engine.types import InputEvent
 
 __all__ = ["FilesystemSource", "OneShotSource"]
 
 _logger = logging.getLogger(__name__)
+
+# watchfiles default debounce delay
+_DEFAULT_DEBOUNCE_MS = 1600
 
 # File patterns that trigger code reload (same as watch/engine.py)
 _CODE_FILE_SUFFIXES = (".py",)
@@ -44,156 +46,21 @@ def _is_code_or_config(path: str) -> bool:
     return name in _CONFIG_FILE_NAMES
 
 
-class FilesystemSource:
-    """Event source that watches filesystem for changes.
-
-    Wraps watchfiles to detect file changes and emit DataArtifactChanged
-    or CodeOrConfigChanged events.
-    """
-
-    _watch_paths: list[Path]
-    _debounce: int | None
-    _submit: Callable[[InputEvent], None] | None
-    _running: bool
-    _shutdown_event: threading.Event
-    _watcher_thread: threading.Thread | None
-
-    def __init__(self, watch_paths: list[Path], debounce: int | None = None) -> None:
-        """Initialize with paths to watch.
-
-        Args:
-            watch_paths: Directories/files to watch for changes.
-            debounce: Debounce delay in milliseconds for watchfiles. None uses watchfiles default.
-        """
-        self._watch_paths = list(watch_paths)
-        self._debounce = debounce
-        self._submit = None
-        self._running = False
-        self._shutdown_event = threading.Event()
-        self._watcher_thread = None
-
-    @property
-    def watch_paths(self) -> list[Path]:
-        """Current paths being watched."""
-        return list(self._watch_paths)
-
-    @property
-    def debounce(self) -> int | None:
-        """Debounce delay in milliseconds, or None for watchfiles default (1600ms)."""
-        return self._debounce
-
-    def set_watch_paths(self, paths: list[Path]) -> None:
-        """Update watched paths.
-
-        Called by engine when DAG changes and watch scope needs updating.
-        Note: Changes only take effect on the next start(). If the watcher
-        is currently running, stop() and start() must be called to apply
-        the new paths.
-        """
-        self._watch_paths = list(paths)
-
-    def start(self, submit: Callable[[InputEvent], None]) -> None:
-        """Begin producing events. Call submit() for each event."""
-        self._submit = submit
-        self._running = True
-        self._shutdown_event.clear()
-
-        # Don't spawn a thread if there are no paths to watch
-        if not self._watch_paths:
-            return
-
-        self._watcher_thread = threading.Thread(
-            target=self._watch_loop,
-            daemon=True,
-        )
-        self._watcher_thread.start()
-
-    def stop(self) -> None:
-        """Stop producing events."""
-        self._running = False
-        self._shutdown_event.set()
-
-        if self._watcher_thread is not None:
-            self._watcher_thread.join(timeout=3.0)
-            if self._watcher_thread.is_alive():
-                _logger.warning("FilesystemSource watcher thread did not terminate within timeout")
-            self._watcher_thread = None
-
-        # Always clear submit callback, even if no thread was started
-        self._submit = None
-
-    def _watch_loop(self) -> None:
-        """Watch for file changes and submit events."""
-        debounce = self._debounce if self._debounce is not None else 1600  # watchfiles default
-        for changes in watchfiles.watch(
-            *self._watch_paths,
-            stop_event=self._shutdown_event,
-            debounce=debounce,
-        ):
-            # Capture submit callback to avoid race with stop()
-            submit = self._submit
-            if submit is None:
-                break
-
-            # Classify changes as code/config or data
-            code_paths = list[str]()
-            data_paths = list[str]()
-
-            for _change_type, path in changes:
-                if _is_code_or_config(path):
-                    code_paths.append(path)
-                else:
-                    data_paths.append(path)
-
-            # Emit appropriate events
-            if code_paths:
-                submit(
-                    CodeOrConfigChanged(
-                        type="code_or_config_changed",
-                        paths=code_paths,
-                    )
-                )
-
-            if data_paths:
-                submit(
-                    DataArtifactChanged(
-                        type="data_artifact_changed",
-                        paths=data_paths,
-                    )
-                )
-
-
 class OneShotSource:
-    """Event source that emits a single RunRequested event.
+    """Async source that emits a single RunRequested event then exits.
 
-    Used for 'pivot run' without --watch. Emits the run request
-    immediately when start() is called, then becomes inactive.
-
-    This source is single-use: once start() has been called and the
-    event emitted, subsequent calls to start() will be no-ops.
-    Create a new instance for each run request.
+    Used for 'pivot run' without --watch in the async engine. Emits the
+    run request when run() is called, then returns.
     """
 
-    _stages: list[str] | None
-    _force: bool
-    _reason: str
-    _single_stage: bool
-    _parallel: bool
-    _max_workers: int | None
-    _no_commit: bool
-    _no_cache: bool
-    _on_error: OnError
-    _cache_dir: Path | None
-    _allow_uncached_incremental: bool
-    _checkout_missing: bool
-    _emitted: bool
+    _event: RunRequested
 
     def __init__(
         self,
+        *,
         stages: list[str] | None,
         force: bool,
         reason: str,
-        *,
         single_stage: bool = False,
         parallel: bool = True,
         max_workers: int | None = None,
@@ -220,43 +87,110 @@ class OneShotSource:
             allow_uncached_incremental: Allow incremental outputs without cache.
             checkout_missing: Checkout missing dependency files from cache.
         """
-        self._stages = stages
-        self._force = force
-        self._reason = reason
-        self._single_stage = single_stage
-        self._parallel = parallel
-        self._max_workers = max_workers
-        self._no_commit = no_commit
-        self._no_cache = no_cache
-        self._on_error = on_error
-        self._cache_dir = cache_dir
-        self._allow_uncached_incremental = allow_uncached_incremental
-        self._checkout_missing = checkout_missing
-        self._emitted = False
-
-    def start(self, submit: Callable[[InputEvent], None]) -> None:
-        """Emit a single RunRequested event."""
-        if self._emitted:
-            return
-
-        event = RunRequested(
+        self._event = RunRequested(
             type="run_requested",
-            stages=self._stages,
-            force=self._force,
-            reason=self._reason,
-            single_stage=self._single_stage,
-            parallel=self._parallel,
-            max_workers=self._max_workers,
-            no_commit=self._no_commit,
-            no_cache=self._no_cache,
-            on_error=self._on_error,
-            cache_dir=self._cache_dir,
-            allow_uncached_incremental=self._allow_uncached_incremental,
-            checkout_missing=self._checkout_missing,
+            stages=stages,
+            force=force,
+            reason=reason,
+            single_stage=single_stage,
+            parallel=parallel,
+            max_workers=max_workers,
+            no_commit=no_commit,
+            no_cache=no_cache,
+            on_error=on_error,
+            cache_dir=cache_dir,
+            allow_uncached_incremental=allow_uncached_incremental,
+            checkout_missing=checkout_missing,
         )
-        submit(event)
-        self._emitted = True
 
-    def stop(self) -> None:
-        """No-op for one-shot source."""
-        pass
+    async def run(self, send: MemoryObjectSendStream[InputEvent]) -> None:
+        """Emit single event then exit."""
+        await send.send(self._event)
+
+
+class FilesystemSource:
+    """Async source that watches filesystem for changes using watchfiles.awatch()."""
+
+    _watch_paths: list[Path]
+    _debounce_ms: int | None
+    _stop_event: anyio.Event | None
+    _running: bool
+
+    def __init__(
+        self,
+        *,
+        watch_paths: list[Path],
+        debounce_ms: int | None = None,
+    ) -> None:
+        """Initialize with paths to watch.
+
+        Args:
+            watch_paths: Directories/files to watch for changes.
+            debounce_ms: Debounce delay in milliseconds. None uses watchfiles default (1600ms).
+        """
+        self._watch_paths = list(watch_paths)
+        self._debounce_ms = debounce_ms
+        self._stop_event = None
+        self._running = False
+
+    @property
+    def watch_paths(self) -> list[Path]:
+        """Current watch paths."""
+        return list(self._watch_paths)
+
+    def set_watch_paths(self, paths: list[Path]) -> None:
+        """Update watched paths.
+
+        If run() is currently active, this will restart the watcher with the new paths.
+        """
+        self._watch_paths = list(paths)
+        # Signal current watcher to stop so it restarts with new paths
+        if self._running and self._stop_event is not None:
+            self._stop_event.set()
+
+    async def run(self, send: MemoryObjectSendStream[InputEvent]) -> None:
+        """Watch filesystem and emit change events.
+
+        Restarts automatically if set_watch_paths() is called while running.
+        """
+        self._running = True
+        try:
+            while True:
+                if not self._watch_paths:
+                    # No paths to watch, wait for paths to be set
+                    await anyio.sleep(1.0)
+                    continue
+
+                # Create fresh stop event for this watch iteration
+                self._stop_event = anyio.Event()
+                debounce = (
+                    self._debounce_ms if self._debounce_ms is not None else _DEFAULT_DEBOUNCE_MS
+                )
+
+                async for changes in watchfiles.awatch(
+                    *self._watch_paths,
+                    debounce=debounce,
+                    stop_event=self._stop_event,
+                ):
+                    code_paths = list[str]()
+                    data_paths = list[str]()
+
+                    for _change_type, path_str in changes:
+                        if _is_code_or_config(path_str):
+                            code_paths.append(path_str)
+                        else:
+                            data_paths.append(path_str)
+
+                    if code_paths:
+                        await send.send(
+                            CodeOrConfigChanged(type="code_or_config_changed", paths=code_paths)
+                        )
+                    if data_paths:
+                        await send.send(
+                            DataArtifactChanged(type="data_artifact_changed", paths=data_paths)
+                        )
+
+                # awatch() exited - either stop_event was set or paths changed
+                # Loop continues to restart with current paths
+        finally:
+            self._running = False

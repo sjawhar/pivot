@@ -1073,6 +1073,41 @@ def test_cli_history_quiet_produces_no_output(runner: CliRunner, tmp_path: pathl
         assert result.output.strip() == "", "Quiet mode should suppress output"
 
 
+def test_cli_dry_run_quiet_suppresses_output(runner: CliRunner, tmp_path: pathlib.Path) -> None:
+    """pivot --quiet run --dry-run should suppress output."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        pathlib.Path("input.txt").write_text("data")
+
+        pathlib.Path("pipeline.py").write_text("""\
+from __future__ import annotations
+import pathlib
+from typing import Annotated, TypedDict
+from pivot import loaders, outputs
+from pivot.pipeline.pipeline import Pipeline
+
+pipeline = Pipeline('test')
+
+class _OutputTxtOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
+
+def process(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _OutputTxtOutputs:
+    _ = input_file
+    return {"output": pathlib.Path("output.txt")}
+
+pipeline.register(process)
+""")
+
+        result = runner.invoke(cli.cli, ["--quiet", "run", "--dry-run"])
+
+        assert result.exit_code == 0
+        assert result.output.strip() == "", (
+            f"Expected empty output with --quiet, got: {result.output}"
+        )
+
+
 # =============================================================================
 # Metrics Output Tests
 # =============================================================================

@@ -10,8 +10,10 @@ import pandas
 import pytest
 
 from helpers import register_test_stage
-from pivot import loaders, outputs
+from pivot import exceptions, loaders, outputs
 from pivot.engine import sources
+from pivot.engine.engine import Engine
+from pivot.engine.sinks import ResultCollectorSink
 
 if TYPE_CHECKING:
     import pathlib
@@ -49,15 +51,14 @@ def comparison_data(tmp_path: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]
     return baseline, experiment
 
 
-def test_placeholder_dep_e2e_execution(
+@pytest.mark.anyio
+async def test_placeholder_dep_e2e_execution(
     test_pipeline: Pipeline,
     mock_discovery: Pipeline,
     tmp_path: pathlib.Path,
     comparison_data: tuple[pathlib.Path, pathlib.Path],
 ) -> None:
     """PlaceholderDep stage should execute correctly with overridden paths."""
-    from pivot.engine.engine import Engine
-
     baseline_path, experiment_path = comparison_data
 
     # Register with overrides
@@ -71,9 +72,9 @@ def test_placeholder_dep_e2e_execution(
     )
 
     # Execute via Engine
-    with Engine(pipeline=test_pipeline) as engine:
+    async with Engine(pipeline=test_pipeline) as engine:
         engine.add_source(sources.OneShotSource(stages=["compare_ab"], force=True, reason="test"))
-        engine.run(exit_on_completion=True)
+        await engine.run(exit_on_completion=True)
 
     # Verify output
     output = tmp_path / "diff.json"
@@ -125,3 +126,113 @@ def test_placeholder_dep_reuse_function_different_overrides(
     ac_info = test_pipeline.get("compare_ac")
 
     assert ab_info["deps"]["experiment"] != ac_info["deps"]["experiment"]
+
+
+@pytest.mark.anyio
+async def test_placeholder_dep_missing_file_fails_execution(
+    test_pipeline: Pipeline,
+    mock_discovery: Pipeline,
+    tmp_path: pathlib.Path,
+) -> None:
+    """PlaceholderDep with nonexistent file path fails during execution."""
+    # Register stage with override to nonexistent path
+    nonexistent = tmp_path / "does_not_exist.csv"
+
+    register_test_stage(
+        _compare_datasets,
+        name="compare_missing",
+        dep_path_overrides={
+            "baseline": str(nonexistent.relative_to(tmp_path)),
+            "experiment": str(nonexistent.relative_to(tmp_path)),
+        },
+    )
+
+    # Execute via Engine - should fail with DependencyNotFoundError
+    async with Engine(pipeline=test_pipeline) as engine:
+        collector = ResultCollectorSink()
+        engine.add_sink(collector)
+        engine.add_source(
+            sources.OneShotSource(stages=["compare_missing"], force=True, reason="test")
+        )
+
+        # Should raise ExceptionGroup wrapping DependencyNotFoundError
+        with pytest.raises(ExceptionGroup) as exc_info:
+            await engine.run(exit_on_completion=True)
+
+        # Verify the error is about missing dependency
+        assert len(exc_info.value.exceptions) == 1
+        inner = exc_info.value.exceptions[0]
+        assert isinstance(inner, exceptions.DependencyNotFoundError)
+        assert "does_not_exist.csv" in str(inner)
+
+
+def test_placeholder_dep_override_validation(
+    test_pipeline: Pipeline,
+    tmp_path: pathlib.Path,
+) -> None:
+    """PlaceholderDep stage validates override paths are provided at registration."""
+    # Register stage without providing required override
+    # This should raise ValidationError at registration time
+    with pytest.raises(
+        exceptions.ValidationError, match="Placeholder dependencies missing overrides"
+    ):
+        register_test_stage(
+            _compare_datasets,
+            name="compare_no_override",
+            dep_path_overrides={
+                # Only provide one of two required overrides
+                "baseline": "model_a/results.csv",
+                # "experiment" is missing - validation catches this
+            },
+        )
+
+
+def test_placeholder_dep_multiple_stages_independent_overrides(
+    test_pipeline: Pipeline,
+    tmp_path: pathlib.Path,
+    comparison_data: tuple[pathlib.Path, pathlib.Path],
+) -> None:
+    """Multiple stages using same function maintain independent override namespaces."""
+    baseline_path, experiment_path = comparison_data
+
+    # Create additional files
+    alt_baseline = tmp_path / "alt_baseline.csv"
+    alt_baseline.write_text("value\n100\n")
+
+    alt_experiment = tmp_path / "alt_experiment.csv"
+    alt_experiment.write_text("value\n200\n")
+
+    # Register same function twice with different overrides
+    register_test_stage(
+        _compare_datasets,
+        name="compare_original",
+        dep_path_overrides={
+            "baseline": str(baseline_path.relative_to(tmp_path)),
+            "experiment": str(experiment_path.relative_to(tmp_path)),
+        },
+        out_path_overrides={"diff": "diff_original.json"},
+    )
+
+    register_test_stage(
+        _compare_datasets,
+        name="compare_alt",
+        dep_path_overrides={
+            "baseline": str(alt_baseline.relative_to(tmp_path)),
+            "experiment": str(alt_experiment.relative_to(tmp_path)),
+        },
+        out_path_overrides={"diff": "diff_alt.json"},
+    )
+
+    # Verify stages are independent
+    original_info = test_pipeline.get("compare_original")
+    alt_info = test_pipeline.get("compare_alt")
+
+    # deps is a dict
+    assert original_info["deps"]["baseline"] != alt_info["deps"]["baseline"]
+    assert original_info["deps"]["experiment"] != alt_info["deps"]["experiment"]
+
+    # outs is a list of Out objects
+    original_out_paths = [str(out.path) for out in original_info["outs"]]
+    alt_out_paths = [str(out.path) for out in alt_info["outs"]]
+    assert any("diff_original.json" in p for p in original_out_paths)
+    assert any("diff_alt.json" in p for p in alt_out_paths)

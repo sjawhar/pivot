@@ -58,6 +58,10 @@ Stages using joblib/scikit-learn with `n_jobs > 1` create nested multiprocessing
 
 **Override:** Set `PIVOT_NESTED_PARALLELISM=processes` to use loky with memmapping disabled.
 
+## Caching Principle
+
+**Files are cached individually, not directories.** Each output file is hashed and stored in cache by its content hash. The stage lockfile contains a manifest listing all output files with their hashes. This enables fine-grained cache hits even when only some files change.
+
 ## Artifact-Centric Mental Model (Critical)
 
 - Think **artifact-first**, not **stage-first**. The DAG emerges from artifact dependencies.

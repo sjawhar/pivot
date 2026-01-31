@@ -6,6 +6,7 @@ from pivot import config, exceptions
 from pivot.cli import completion
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
+from pivot.cli.run import ensure_stages_registered
 from pivot.show import params as params_mod
 from pivot.types import OutputFormat
 
@@ -35,6 +36,7 @@ def params_show(
     If STAGES are specified, shows params for those stages only.
     Otherwise, shows params from all registered stages.
     """
+    ensure_stages_registered()
     precision = precision if precision is not None else config.get_display_precision()
     stages_list = list(stages) if stages else None
     result = params_mod.collect_params_from_stages(stages_list)
@@ -67,6 +69,7 @@ def params_diff(
     If STAGES are specified, compares those stages only.
     Otherwise, compares all registered stages.
     """
+    ensure_stages_registered()
     precision = precision if precision is not None else config.get_display_precision()
     stages_list = list(stages) if stages else None
 

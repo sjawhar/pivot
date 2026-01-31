@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import collections
-import queue
 import time
 from typing import TYPE_CHECKING
 
 from pivot.tui import run as run_tui
 from pivot.tui.types import ExecutionHistoryEntry, LogEntry, PendingHistoryState, StageInfo
 from pivot.tui.widgets import TabbedDetailPanel
-from pivot.types import StageStatus, TuiQueue
+from pivot.types import StageStatus
 
 if TYPE_CHECKING:
     from pivot.engine.engine import Engine
@@ -193,8 +192,7 @@ def test_watch_tui_app_has_history_tracking_state(
     mock_watch_engine: Engine,
 ) -> None:
     """PivotApp (watch mode) has state for tracking history navigation."""
-    tui_queue: TuiQueue = queue.Queue()
-    app = run_tui.PivotApp(tui_queue, engine=mock_watch_engine, stage_names=["test"])
+    app = run_tui.PivotApp(engine=mock_watch_engine, stage_names=["test"])
 
     assert app._viewing_history_index is None
 
@@ -203,8 +201,7 @@ def test_watch_tui_app_pending_history_tracking(
     mock_watch_engine: Engine,
 ) -> None:
     """PivotApp (watch mode) tracks pending history entries during execution."""
-    tui_queue: TuiQueue = queue.Queue()
-    app = run_tui.PivotApp(tui_queue, engine=mock_watch_engine, stage_names=["test"])
+    app = run_tui.PivotApp(engine=mock_watch_engine, stage_names=["test"])
 
     assert isinstance(app._pending_history, dict)
     assert len(app._pending_history) == 0
@@ -214,8 +211,7 @@ def test_watch_tui_app_get_current_stage_history_empty(
     mock_watch_engine: Engine,
 ) -> None:
     """_get_current_stage_history returns empty deque when no selection."""
-    tui_queue: TuiQueue = queue.Queue()
-    app = run_tui.PivotApp(tui_queue, engine=mock_watch_engine, stage_names=[])
+    app = run_tui.PivotApp(engine=mock_watch_engine, stage_names=[])
 
     history = app._get_current_stage_history()
     assert len(history) == 0
@@ -225,8 +221,7 @@ def test_watch_tui_app_get_current_stage_history_with_stage(
     mock_watch_engine: Engine,
 ) -> None:
     """_get_current_stage_history returns stage's history deque."""
-    tui_queue: TuiQueue = queue.Queue()
-    app = run_tui.PivotApp(tui_queue, engine=mock_watch_engine, stage_names=["stage_a"])
+    app = run_tui.PivotApp(engine=mock_watch_engine, stage_names=["stage_a"])
 
     # Add a history entry
     entry = ExecutionHistoryEntry(
@@ -260,8 +255,7 @@ def test_finalize_history_skipped_without_pending_creates_entry(
     This tests the fix for upstream-skipped stages that never went through
     IN_PROGRESS (so never had _pending_history entry created).
     """
-    tui_queue: TuiQueue = queue.Queue()
-    app = run_tui.PivotApp(tui_queue, engine=mock_watch_engine, stage_names=["downstream_stage"])
+    app = run_tui.PivotApp(engine=mock_watch_engine, stage_names=["downstream_stage"])
 
     # Verify no pending history
     assert "downstream_stage" not in app._pending_history
@@ -289,8 +283,7 @@ def test_finalize_history_skipped_without_run_id_does_not_create_entry(
     mock_watch_engine: Engine,
 ) -> None:
     """Skipped stages without run_id don't get history entries (defensive)."""
-    tui_queue: TuiQueue = queue.Queue()
-    app = run_tui.PivotApp(tui_queue, engine=mock_watch_engine, stage_names=["downstream_stage"])
+    app = run_tui.PivotApp(engine=mock_watch_engine, stage_names=["downstream_stage"])
 
     # Call without run_id - should not create entry
     app._finalize_history_entry(
@@ -313,8 +306,7 @@ def test_finalize_history_failed_without_pending_does_not_create_entry(
     Only SKIPPED is special-cased for upstream failures. FAILED/RAN/etc
     should always have gone through IN_PROGRESS.
     """
-    tui_queue: TuiQueue = queue.Queue()
-    app = run_tui.PivotApp(tui_queue, engine=mock_watch_engine, stage_names=["some_stage"])
+    app = run_tui.PivotApp(engine=mock_watch_engine, stage_names=["some_stage"])
 
     # Call with FAILED status but no pending state - unusual case
     app._finalize_history_entry(
@@ -337,8 +329,7 @@ def test_watch_tui_app_new_run_clears_stale_pending_entries(
     This handles the crash condition where a run is interrupted mid-execution
     and a new run starts, leaving orphaned pending entries.
     """
-    tui_queue: TuiQueue = queue.Queue()
-    app = run_tui.PivotApp(tui_queue, engine=mock_watch_engine, stage_names=["stage_a", "stage_b"])
+    app = run_tui.PivotApp(engine=mock_watch_engine, stage_names=["stage_a", "stage_b"])
 
     # Set up first run with pending entries
     app._current_run_id = "run_001"
@@ -365,7 +356,182 @@ def test_watch_tui_app_tracks_current_run_id(
     mock_watch_engine: Engine,
 ) -> None:
     """PivotApp (watch mode) tracks current run_id for detecting new runs."""
-    tui_queue: TuiQueue = queue.Queue()
-    app = run_tui.PivotApp(tui_queue, engine=mock_watch_engine, stage_names=[])
+    app = run_tui.PivotApp(engine=mock_watch_engine, stage_names=[])
 
     assert app._current_run_id is None
+
+
+# =============================================================================
+# History Edge Cases
+# =============================================================================
+
+
+def test_history_entry_with_very_long_logs(
+    mock_watch_engine: Engine,
+) -> None:
+    """History entry handles stages with many log lines efficiently."""
+    app = run_tui.PivotApp(engine=mock_watch_engine, stage_names=["verbose_stage"])
+
+    # Create entry with many logs (testing memory bounds)
+    logs = [LogEntry(f"line {i}", False, float(i)) for i in range(1000)]
+
+    entry = ExecutionHistoryEntry(
+        run_id="test_run",
+        stage_name="verbose_stage",
+        timestamp=time.time(),
+        duration=10.0,
+        status=StageStatus.RAN,
+        reason="test",
+        logs=logs,
+        input_snapshot=None,
+        output_snapshot=None,
+    )
+
+    app._stages["verbose_stage"].history.append(entry)
+
+    # History should be accessible
+    history = app._get_current_stage_history()
+    assert len(history) == 1
+    assert len(history[0].logs) == 1000
+
+
+def test_pending_history_state_logs_maxlen_enforcement(
+    mock_watch_engine: Engine,
+) -> None:
+    """PendingHistoryState enforces maxlen strictly during rapid updates."""
+    state = PendingHistoryState(run_id="test", timestamp=1.0)
+
+    # Add exactly at boundary
+    for i in range(500):
+        state.logs.append(LogEntry(f"line {i}", False, float(i)))
+    assert len(state.logs) == 500
+
+    # Add one more - should evict oldest
+    state.logs.append(LogEntry("line 500", False, 500.0))
+    assert len(state.logs) == 500
+    assert state.logs[0].line == "line 1", "Oldest entry (line 0) should be evicted"
+    assert state.logs[-1].line == "line 500", "Newest entry should be kept"
+
+
+def test_stage_info_history_separate_instances(
+    mock_watch_engine: Engine,
+) -> None:
+    """Each StageInfo has independent history deque instance."""
+    app = run_tui.PivotApp(engine=mock_watch_engine, stage_names=["stage_a", "stage_b"])
+
+    # Add entry to stage_a
+    entry_a = ExecutionHistoryEntry(
+        run_id="run_a",
+        stage_name="stage_a",
+        timestamp=time.time(),
+        duration=1.0,
+        status=StageStatus.RAN,
+        reason="test_a",
+        logs=[],
+        input_snapshot=None,
+        output_snapshot=None,
+    )
+    app._stages["stage_a"].history.append(entry_a)
+
+    # stage_b history should be independent and empty
+    assert len(app._stages["stage_a"].history) == 1
+    assert len(app._stages["stage_b"].history) == 0
+
+    # Add entry to stage_b
+    entry_b = ExecutionHistoryEntry(
+        run_id="run_b",
+        stage_name="stage_b",
+        timestamp=time.time(),
+        duration=2.0,
+        status=StageStatus.RAN,
+        reason="test_b",
+        logs=[],
+        input_snapshot=None,
+        output_snapshot=None,
+    )
+    app._stages["stage_b"].history.append(entry_b)
+
+    # Both should now have one entry each
+    assert len(app._stages["stage_a"].history) == 1
+    assert len(app._stages["stage_b"].history) == 1
+
+    # Verify entries are different
+    assert app._stages["stage_a"].history[0].run_id == "run_a"
+    assert app._stages["stage_b"].history[0].run_id == "run_b"
+
+
+def test_finalize_history_with_empty_logs(
+    mock_watch_engine: Engine,
+) -> None:
+    """_finalize_history_entry handles stages with no log output."""
+    app = run_tui.PivotApp(engine=mock_watch_engine, stage_names=["silent_stage"])
+
+    # No pending state (stage didn't produce logs)
+    assert "silent_stage" not in app._pending_history
+
+    # Finalize with SKIPPED status (special case that creates entry without pending)
+    app._finalize_history_entry(
+        stage_name="silent_stage",
+        status=StageStatus.SKIPPED,
+        reason="upstream failed",
+        elapsed=None,
+        run_id="test_run",
+    )
+
+    # Should have created entry with empty logs
+    assert len(app._stages["silent_stage"].history) == 1
+    entry = app._stages["silent_stage"].history[0]
+    assert len(entry.logs) == 0
+    assert entry.status == StageStatus.SKIPPED
+
+
+def test_get_current_stage_history_with_no_stages(
+    mock_watch_engine: Engine,
+) -> None:
+    """_get_current_stage_history returns empty deque when stage list is empty."""
+    app = run_tui.PivotApp(engine=mock_watch_engine, stage_names=[])
+
+    # No stages, so no selection possible
+    history = app._get_current_stage_history()
+    assert len(history) == 0
+    assert isinstance(history, collections.deque)
+
+
+def test_history_bounded_eviction_order(
+    mock_watch_engine: Engine,
+) -> None:
+    """StageInfo history evicts oldest entries when exceeding maxlen."""
+    info = StageInfo(name="test_stage", index=1, total=1)
+
+    # Add entries in order with identifiable data
+    for i in range(60):
+        entry = ExecutionHistoryEntry(
+            run_id=f"run_{i:03d}",
+            stage_name="test_stage",
+            timestamp=float(i),
+            duration=float(i),
+            status=StageStatus.RAN,
+            reason=f"iteration_{i}",
+            logs=[],
+            input_snapshot=None,
+            output_snapshot=None,
+        )
+        info.history.append(entry)
+
+    # Should have exactly 50 entries (maxlen)
+    assert len(info.history) == 50
+
+    # First 10 entries should be evicted (run_000 through run_009)
+    # Remaining should be run_010 through run_059
+    assert info.history[0].run_id == "run_010"
+    assert info.history[0].timestamp == 10.0
+    assert info.history[0].reason == "iteration_10"
+
+    assert info.history[-1].run_id == "run_059"
+    assert info.history[-1].timestamp == 59.0
+    assert info.history[-1].reason == "iteration_59"
+
+    # Verify ordering is maintained
+    for idx, entry in enumerate(info.history):
+        expected_run_num = idx + 10
+        assert entry.run_id == f"run_{expected_run_num:03d}"

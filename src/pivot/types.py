@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import enum
-import queue as _thread_queue
 from collections.abc import Callable
 from typing import (
     TYPE_CHECKING,
@@ -559,12 +558,6 @@ class TuiReloadMessage(TypedDict):
 
 
 TuiMessage = TuiLogMessage | TuiStatusMessage | TuiWatchMessage | TuiReloadMessage | None
-
-
-# Queue type for TUI messages - inter-thread communication within same process.
-# Uses stdlib queue.Queue (not mp.Manager().Queue) since it never crosses process boundaries.
-# This avoids Manager subprocess dependency issues that can cause blocking puts.
-TuiQueue = _thread_queue.Queue[TuiMessage]
 
 
 def is_tui_status_message(msg: TuiMessage) -> TypeGuard[TuiStatusMessage]:

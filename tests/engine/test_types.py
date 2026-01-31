@@ -2,13 +2,8 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 from pivot.engine import types
-from pivot.types import StageStatus
-
-if TYPE_CHECKING:
-    from collections.abc import Callable
+from pivot.types import OnError, StageStatus
 
 
 def test_stage_execution_state_ordering() -> None:
@@ -66,6 +61,15 @@ def test_run_requested_event() -> None:
         "stages": ["train", "evaluate"],
         "force": False,
         "reason": "cli",
+        "single_stage": False,
+        "parallel": True,
+        "max_workers": None,
+        "no_commit": False,
+        "no_cache": False,
+        "on_error": OnError.FAIL,
+        "cache_dir": None,
+        "allow_uncached_incremental": False,
+        "checkout_missing": False,
     }
     assert event["type"] == "run_requested"
     assert event["stages"] == ["train", "evaluate"]
@@ -77,6 +81,15 @@ def test_run_requested_event() -> None:
         "stages": None,
         "force": True,
         "reason": "agent:run-123",
+        "single_stage": False,
+        "parallel": True,
+        "max_workers": None,
+        "no_commit": False,
+        "no_cache": False,
+        "on_error": OnError.FAIL,
+        "cache_dir": None,
+        "allow_uncached_incremental": False,
+        "checkout_missing": False,
     }
     assert event_all["stages"] is None
 
@@ -93,7 +106,21 @@ def test_input_event_union() -> None:
     events: list[types.InputEvent] = [
         {"type": "data_artifact_changed", "paths": []},
         {"type": "code_or_config_changed", "paths": []},
-        {"type": "run_requested", "stages": None, "force": False, "reason": "test"},
+        {
+            "type": "run_requested",
+            "stages": None,
+            "force": False,
+            "reason": "test",
+            "single_stage": False,
+            "parallel": True,
+            "max_workers": None,
+            "no_commit": False,
+            "no_cache": False,
+            "on_error": OnError.FAIL,
+            "cache_dir": None,
+            "allow_uncached_incremental": False,
+            "checkout_missing": False,
+        },
         {"type": "cancel_requested"},
     ]
     assert len(events) == 4
@@ -245,33 +272,17 @@ def test_output_event_union() -> None:
     assert len(events) == 6
 
 
-def test_event_source_protocol() -> None:
-    """EventSource protocol defines start/stop interface."""
+async def test_async_event_source_protocol_defined() -> None:
+    """EventSource protocol is importable and has run method signature."""
+    from pivot.engine.types import EventSource
 
-    class MockSource:
-        def start(self, submit: Callable[[types.InputEvent], None]) -> None:
-            pass
-
-        def stop(self) -> None:
-            pass
-
-    # Protocol should accept this implementation
-    source: types.EventSource = MockSource()
-    assert hasattr(source, "start")
-    assert hasattr(source, "stop")
+    # Verify protocol has required method
+    assert hasattr(EventSource, "run")
 
 
-def test_event_sink_protocol() -> None:
-    """EventSink protocol defines handle/close interface."""
+async def test_async_event_sink_protocol_defined() -> None:
+    """EventSink protocol is importable and has handle/close signatures."""
+    from pivot.engine.types import EventSink
 
-    class MockSink:
-        def handle(self, event: types.OutputEvent) -> None:
-            pass
-
-        def close(self) -> None:
-            pass
-
-    # Protocol should accept this implementation
-    sink: types.EventSink = MockSink()
-    assert hasattr(sink, "handle")
-    assert hasattr(sink, "close")
+    assert hasattr(EventSink, "handle")
+    assert hasattr(EventSink, "close")

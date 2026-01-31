@@ -149,6 +149,35 @@ def my_stage():
         f.write("ran\n")
 ```
 
+## TypedDict Test Patterns
+
+When tests construct TypedDict instances (like `PipelineReloaded`, `StageCompleted`), they must include all required fields:
+
+```python
+# Good - includes all required fields
+event: types.PipelineReloaded = {
+    "type": "pipeline_reloaded",
+    "stages": ["stage_a", "stage_b"],  # Required field
+    "stages_added": ["stage_b"],
+    "stages_removed": [],
+    "stages_modified": [],
+    "error": None,
+}
+
+# Bad - missing required "stages" field (basedpyright will catch this)
+event: types.PipelineReloaded = {
+    "type": "pipeline_reloaded",
+    "stages_added": ["stage_b"],
+    ...
+}
+```
+
+**When adding required fields to TypedDicts:**
+
+1. Search for all test usages: `rg "TypedDictName" tests/`
+2. Update all instances with the new field
+3. Run `uv run basedpyright .` locally before pushing
+
 ## See Also
 
 - [Code Style](style.md) - Coding conventions
