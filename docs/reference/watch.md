@@ -120,4 +120,4 @@ def filter_positive(x: float) -> bool:
 ## See Also
 
 - [Watch Mode Tutorial](../tutorial/watch.md) - Getting started with watch mode
-- [Architecture: Watch Engine](../architecture/watch.md) - How watch mode works internally
+- [Watch Mode Architecture](../architecture/watch.md) - How watch mode works internally

@@ -7,9 +7,7 @@ import json
 import shutil
 from typing import TYPE_CHECKING, Any
 
-import pytest
-
-from pivot import loaders, outputs, project, run_history, watch
+from pivot import loaders, outputs, project, run_history
 from pivot.executor import commit as commit_mod
 from pivot.executor import worker
 from pivot.storage import cache, lock, state
@@ -19,6 +17,8 @@ if TYPE_CHECKING:
     import multiprocessing as mp
     import pathlib
     from collections.abc import Callable
+
+    import pytest
 
     from pivot.types import OutputMessage
 
@@ -380,54 +380,6 @@ def test_committed_run_cache_entries_survive_pruning(
         found_after_prune = db.lookup_run_cache("test_stage", "input_hash_123")
         assert found_after_prune is not None, "Committed entry should survive pruning"
         assert found_after_prune["run_id"] == commit_mod.COMMITTED_RUN_ID
-
-
-@pytest.mark.parametrize(
-    ("flag_name", "flag_value", "expected_value"),
-    [
-        ("no_commit", True, True),
-        ("no_commit", None, False),  # None means use default
-        ("no_cache", True, True),
-        ("no_cache", None, False),
-    ],
-    ids=[
-        "no_commit=True",
-        "no_commit_defaults_to_False",
-        "no_cache=True",
-        "no_cache_defaults_to_False",
-    ],
-)
-def test_watch_engine_flag_passed_to_executor(
-    monkeypatch: pytest.MonkeyPatch,
-    flag_name: str,
-    flag_value: bool | None,
-    expected_value: bool,
-) -> None:
-    """WatchEngine should pass flags correctly to executor.run."""
-    executor_call_args = dict[str, object]()
-
-    def mock_executor_run(**kwargs: object) -> dict[str, object]:
-        executor_call_args.update(kwargs)
-        return {}
-
-    monkeypatch.setattr("pivot.executor.run", mock_executor_run)
-
-    # Build engine kwargs - only include flag if explicitly set
-    engine_kwargs: dict[str, Any] = {
-        "stages": None,
-        "single_stage": False,
-        "cache_dir": None,
-    }
-    if flag_value is not None:
-        engine_kwargs[flag_name] = flag_value
-
-    engine = watch.WatchEngine(**engine_kwargs)
-    engine._execute_stages(None)
-
-    assert flag_name in executor_call_args, f"{flag_name} should be passed to executor.run"
-    assert executor_call_args[flag_name] is expected_value, (
-        f"{flag_name} should be {expected_value}"
-    )
 
 
 # -----------------------------------------------------------------------------

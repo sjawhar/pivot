@@ -173,3 +173,4 @@ uv run ruff format . && uv run ruff check . && uv run basedpyright .  # Quality
 14. **Stage functions and TypedDicts must be module-level**—`get_type_hints()` needs importable `__module__`
 15. **Lambda fingerprinting is non-deterministic**—lambdas without source fall back to `id(func)`, causing unnecessary re-runs across interpreter sessions. Always use named functions in stage definitions.
 16. **Use `loky.cpu_count()` over `os.cpu_count()`**—loky's version respects cgroup CPU limits in containers/cgroupsv2
+17. **Engine is a context manager**—use `with Engine() as engine:` to ensure sinks are closed properly on exit

@@ -23,7 +23,10 @@ __all__ = [
     "get_producer",
     "get_watch_paths",
     "get_downstream_stages",
+    "get_upstream_stages",
+    "get_stage_dag",
     "update_stage",
+    "get_artifact_consumers",
 ]
 
 
@@ -56,6 +59,11 @@ def build_graph(stages: dict[str, RegistryStageInfo]) -> nx.DiGraph[str]:
         Directed graph where:
         - Nodes are either artifacts (files) or stages (functions)
         - Edges go: artifact -> stage (consumed by) and stage -> artifact (produces)
+
+    Note:
+        Paths are stored as-is from the registry (via pathlib.Path normalization).
+        Callers querying the graph (e.g., what_if_changed) should normalize paths
+        using project.normalize_path() to ensure consistent matching.
     """
     g: nx.DiGraph[str] = nx.DiGraph()
 
@@ -204,3 +212,80 @@ def update_stage(g: nx.DiGraph[str], stage_name: str, new_info: RegistryStageInf
         if artifact not in g:
             g.add_node(artifact, type=NodeType.ARTIFACT)
         g.add_edge(stage, artifact)
+
+
+def get_upstream_stages(g: nx.DiGraph[str], stage_name: str) -> list[str]:
+    """Get stages whose outputs are consumed by this stage."""
+    node = stage_node(stage_name)
+    if node not in g:
+        return []
+
+    upstream = list[str]()
+    for artifact in g.predecessors(node):
+        if g.nodes[artifact]["type"] != NodeType.ARTIFACT:
+            continue
+        for producer in g.predecessors(artifact):
+            if g.nodes[producer]["type"] == NodeType.STAGE:
+                upstream.append(parse_node(producer)[1])
+    return upstream
+
+
+def get_stage_dag(g: nx.DiGraph[str]) -> nx.DiGraph[str]:
+    """Extract stage-only DAG from bipartite graph.
+
+    Returns a DAG with edges from consumer to producer, matching dag.build_dag()
+    convention. This allows dag.get_execution_order() to work correctly with
+    dfs_postorder_nodes traversal.
+    """
+    stage_dag: nx.DiGraph[str] = nx.DiGraph()
+
+    for node in g.nodes():
+        if g.nodes[node]["type"] == NodeType.STAGE:
+            stage_name = parse_node(node)[1]
+            stage_dag.add_node(stage_name)
+
+    for node in g.nodes():
+        if g.nodes[node]["type"] != NodeType.STAGE:
+            continue
+        stage_name = parse_node(node)[1]
+
+        for artifact in g.successors(node):
+            if g.nodes[artifact]["type"] != NodeType.ARTIFACT:
+                continue
+            for consumer in g.successors(artifact):
+                if g.nodes[consumer]["type"] == NodeType.STAGE:
+                    consumer_name = parse_node(consumer)[1]
+                    # Edge from consumer to producer (matches dag.build_dag() convention)
+                    stage_dag.add_edge(consumer_name, stage_name)
+
+    return stage_dag
+
+
+def get_artifact_consumers(
+    g: nx.DiGraph[str],
+    path: Path,
+    include_downstream: bool = True,
+) -> list[str]:
+    """Get all stages affected by a change to this artifact.
+
+    Args:
+        g: The bipartite graph.
+        path: Path to the artifact.
+        include_downstream: If True, include transitive dependents.
+
+    Returns:
+        Sorted list of stage names that would be affected (deterministic order).
+    """
+    direct = get_consumers(g, path)
+    if not direct:
+        return []
+
+    if not include_downstream:
+        return sorted(direct)
+
+    all_affected = set(direct)
+    for stage in direct:
+        downstream = get_downstream_stages(g, stage)
+        all_affected.update(downstream)
+
+    return sorted(all_affected)

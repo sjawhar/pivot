@@ -112,7 +112,7 @@ def test_run_succeeds_with_existing_tracked_file(pipeline_dir: pathlib.Path) -> 
 
     register_test_stage(_process_data, name="process")
 
-    results = executor.run(show_output=False)
+    results = executor.run()
 
     assert results["process"]["status"] == "ran"
     assert (pipeline_dir / "output.txt").exists()
@@ -133,7 +133,7 @@ def test_run_fails_when_tracked_file_missing(pipeline_dir: pathlib.Path) -> None
         exceptions.TrackedFileMissingError,
         match=r"checkout|restore|missing",
     ):
-        executor.run(show_output=False)
+        executor.run()
 
 
 def test_run_succeeds_with_hash_mismatch(
@@ -154,7 +154,7 @@ def test_run_succeeds_with_hash_mismatch(
     register_test_stage(_process_simple, name="process")
 
     # Should succeed (warning logged but execution continues)
-    results = executor.run(show_output=False)
+    results = executor.run()
     assert results["process"]["status"] == "ran"
     assert (pipeline_dir / "output.txt").exists()
 
@@ -178,7 +178,7 @@ def test_tracked_file_change_triggers_downstream_rerun(
     register_test_stage(_process_data_content, name="process")
 
     # First run
-    results = executor.run(show_output=False)
+    results = executor.run()
     assert results["process"]["status"] == "ran"
     assert (pipeline_dir / "output.txt").read_text() == "processed: original"
 
@@ -188,7 +188,7 @@ def test_tracked_file_change_triggers_downstream_rerun(
     assert result.exit_code == 0
 
     # Second run - should re-execute due to tracked file change
-    results = executor.run(show_output=False)
+    results = executor.run()
     assert results["process"]["status"] == "ran"
     assert (pipeline_dir / "output.txt").read_text() == "processed: modified"
 
@@ -206,11 +206,11 @@ def test_unchanged_tracked_file_allows_skip(
     register_test_stage(_process_data_content, name="process")
 
     # First run
-    results = executor.run(show_output=False)
+    results = executor.run()
     assert results["process"]["status"] == "ran"
 
     # Second run - should skip (nothing changed)
-    results = executor.run(show_output=False)
+    results = executor.run()
     assert results["process"]["status"] == "skipped"
 
 
@@ -235,7 +235,7 @@ def test_tracked_directory_change_triggers_rerun(
     register_test_stage(_count_images, name="count_images")
 
     # First run
-    results = executor.run(show_output=False)
+    results = executor.run()
     assert results["count_images"]["status"] == "ran"
     assert (pipeline_dir / "count.txt").read_text() == "2"
 
@@ -245,7 +245,7 @@ def test_tracked_directory_change_triggers_rerun(
     assert result.exit_code == 0
 
     # Second run - should re-execute
-    results = executor.run(show_output=False)
+    results = executor.run()
     assert results["count_images"]["status"] == "ran"
     assert (pipeline_dir / "count.txt").read_text() == "3"
 
@@ -273,7 +273,7 @@ def test_run_fails_when_tracked_directory_missing(pipeline_dir: pathlib.Path) ->
         exceptions.TrackedFileMissingError,
         match=r"checkout|restore|missing",
     ):
-        executor.run(show_output=False)
+        executor.run()
 
 
 # =============================================================================
@@ -298,12 +298,12 @@ def test_mixed_tracked_and_regular_dependencies(
     register_test_stage(_process_mixed, name="process")
 
     # First run
-    results = executor.run(show_output=False)
+    results = executor.run()
     assert results["process"]["status"] == "ran"
 
     # Change regular file - should trigger rerun
     config_file.write_text("setting=2")
-    results = executor.run(show_output=False)
+    results = executor.run()
     assert results["process"]["status"] == "ran"
 
 
@@ -335,6 +335,6 @@ def test_checkout_then_run_succeeds(
     register_test_stage(_process_uppercase, name="process")
 
     # Pipeline should run successfully
-    results = executor.run(show_output=False)
+    results = executor.run()
     assert results["process"]["status"] == "ran"
     assert (pipeline_dir / "output.txt").read_text() == "IMPORTANT DATA"

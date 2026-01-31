@@ -2,7 +2,7 @@
 
 **Change your code. Pivot knows what to run.**
 
-Pivot is a Python pipeline tool with automatic code change detection. Define stages in YAML with typed Python functions, and Pivot figures out what needs to re-run—no manual dependency declarations, no stale caches.
+Pivot is a Python pipeline tool with automatic code change detection. Define stages with typed Python functions and annotations, and Pivot figures out what needs to re-run—no manual dependency declarations, no stale caches.
 
 ```bash
 pivot run        # Run your pipeline
@@ -12,31 +12,14 @@ pivot run        # Pivot detects the change and re-runs affected stages
 
 ## Quick Example
 
-```yaml
-# pivot.yaml
-stages:
-  preprocess:
-    python: stages.preprocess
-    deps:
-      raw: data.csv
-    outs:
-      clean: processed.parquet
-
-  train:
-    python: stages.train
-    deps:
-      data: processed.parquet
-    outs:
-      model: model.pkl
-```
-
 ```python
-# stages.py
+# pipeline.py
 import pathlib
 from typing import Annotated, TypedDict
 
 import pandas
 from pivot import loaders, outputs
+from pivot.registry import REGISTRY
 
 
 class PreprocessOutputs(TypedDict):
@@ -49,7 +32,7 @@ def preprocess(
     df = raw.dropna()
     out_path = pathlib.Path("processed.parquet")
     df.to_parquet(out_path)
-    return {"clean": out_path}
+    return PreprocessOutputs(clean=out_path)
 
 
 class TrainOutputs(TypedDict):
@@ -62,7 +45,12 @@ def train(
     df = pandas.read_parquet(data)
     model_path = pathlib.Path("model.pkl")
     # ... train model ...
-    return {"model": model_path}
+    return TrainOutputs(model=model_path)
+
+
+# Register stages - Pivot discovers deps/outs from annotations
+REGISTRY.register(preprocess)
+REGISTRY.register(train)
 ```
 
 ```bash
@@ -71,15 +59,6 @@ pivot run  # Instant - nothing changed
 ```
 
 Modify `preprocess`, and Pivot automatically re-runs both stages. Modify `train`, and only `train` re-runs.
-
-> **How YAML and Python Work Together**
->
-> Your Python function's annotations define *what* the stage needs (types and default paths).
-> The YAML file lets you override those paths without editing Python code.
->
-> - If YAML specifies a path, it overrides the annotation's default
-> - If YAML doesn't specify a path, the annotation's default is used
-> - YAML `deps:`/`outs:` keys must match the Python parameter/output names
 
 ## What Makes Pivot Different
 
@@ -102,7 +81,7 @@ No YAML to update (for code changes). No manual declarations. Pivot parses your 
 ### See Why Stages Run
 
 ```bash
-$ pivot explain train
+$ pivot status --explain train
 
 Stage: train
   Status: WILL RUN

@@ -8,16 +8,17 @@ Complete the [Quick Start](../getting-started/quickstart.md). You should have a 
 
 ## Add Parameters to a Stage
 
-Update `stages.py` to add a `TrainParams` class:
+Update `pipeline.py` to add a `TrainParams` class:
 
 ```python
-# stages.py
+# pipeline.py
 import pathlib
 import pickle
 from typing import Annotated, TypedDict
 
 import pandas
 from pivot import loaders, outputs
+from pivot.registry import REGISTRY
 from pivot.stage_def import StageParams
 
 
@@ -57,14 +58,19 @@ def train(
         pickle.dump(model, f)
 
     # Return metrics for tracking
-    return {
-        "model": model_path,
-        "metrics": {
+    return TrainOutputs(
+        model=model_path,
+        metrics={
             "accuracy": 0.95,
             "loss": 0.05,
             "learning_rate": params.learning_rate,
         }
-    }
+    )
+
+
+# Register stages
+REGISTRY.register(preprocess)
+REGISTRY.register(train)
 ```
 
 Note the changes:
@@ -74,49 +80,23 @@ Note the changes:
 3. Add `params: TrainParams` as the first parameter
 4. Added a `Metric` output for tracking
 
-## Override Parameters in YAML
-
-Update `pivot.yaml` to override defaults:
-
-```yaml
-# pivot.yaml
-stages:
-  preprocess:
-    python: stages.preprocess
-    deps:
-      raw: data.csv
-    outs:
-      clean: processed.parquet
-
-  train:
-    python: stages.train
-    deps:
-      data: processed.parquet
-    outs:
-      model: model.pkl
-    metrics:
-      metrics: metrics.json
-    params:
-      learning_rate: 0.05  # Override default
-      epochs: 200
-```
-
 ## Run and See Parameter Change Detection
 
 ```bash
 pivot run
 ```
 
-Now change a parameter in `pivot.yaml`:
+Now change a parameter default in `pipeline.py`:
 
-```yaml
-    params:
-      learning_rate: 0.001  # Changed!
-      epochs: 200
+```python
+class TrainParams(StageParams):
+    learning_rate: float = 0.001  # Changed from 0.01!
+    epochs: int = 100
+    batch_size: int = 32
 ```
 
 ```bash
-pivot explain train
+pivot status --explain train
 ```
 
 Output shows what changed:
@@ -127,8 +107,21 @@ Stage: train
   Reason: Parameters changed
 
   Param changes:
-    learning_rate: 0.05 -> 0.001
+    learning_rate: 0.01 -> 0.001
 ```
+
+## Override Parameters at Runtime
+
+You can override parameter defaults using `params.yaml` at your project root:
+
+```yaml
+# params.yaml - git-ignore this file
+train:
+  learning_rate: 0.0005
+  epochs: 10  # Quick local test
+```
+
+This lets you experiment without modifying your code.
 
 ## View Current Parameters
 
@@ -155,22 +148,11 @@ pivot params diff
 Parameters can come from multiple sources. Precedence (highest to lowest):
 
 1. **`params.yaml`** at project root (git-ignored for local experiments)
-2. **`pivot.yaml`** `params:` section
-3. **Python `StageParams` defaults**
-
-Create `params.yaml` for local overrides:
-
-```yaml
-# params.yaml - git-ignore this file
-train:
-  learning_rate: 0.001
-  epochs: 10  # Quick local test
-```
+2. **Python `StageParams` defaults**
 
 This lets you:
 
-- Define sensible defaults in Python
-- Configure experiments in `pivot.yaml` (committed)
+- Define sensible defaults in Python (committed)
 - Override for local testing via `params.yaml` (not committed)
 
 ## Add More Metrics

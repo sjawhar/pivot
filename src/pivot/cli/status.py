@@ -7,11 +7,12 @@ import sys
 import click
 import tqdm
 
-from pivot import config, exceptions, project
+from pivot import config, exceptions, project, registry
 from pivot import status as status_mod
 from pivot.cli import completion
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
+from pivot.engine import graph as engine_graph
 from pivot.tui import console
 from pivot.types import (
     ExplainOutput,
@@ -73,12 +74,18 @@ def status(
     remote_status: RemoteSyncInfo | None = None
 
     if show_stages:
+        # Build bipartite graph for consistent execution order with Engine
+        all_stages = {name: registry.REGISTRY.get(name) for name in registry.REGISTRY.list_stages()}
+        graph = engine_graph.build_graph(all_stages)
+
         if explain:
             pipeline_explanations = status_mod.get_pipeline_explanations(
-                stages_list, single_stage=False
+                stages_list, single_stage=False, graph=graph
             )
         else:
-            pipeline_status, _ = status_mod.get_pipeline_status(stages_list, single_stage=False)
+            pipeline_status, _ = status_mod.get_pipeline_status(
+                stages_list, single_stage=False, graph=graph
+            )
 
     if show_tracked:
         # Show progress bar only on TTY and not in quiet/JSON mode

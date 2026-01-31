@@ -29,8 +29,8 @@ if str(_tests_dir) not in sys.path:
 if TYPE_CHECKING:
     from pytest_mock import MockerFixture
 
-    from pivot.types import OutputMessage, TuiQueue
-    from pivot.watch.engine import WatchEngine
+    from pivot.engine.engine import Engine
+    from pivot.types import OutputMessage
 
 # Type alias for git_repo fixture: (repo_path, commit_fn)
 GitRepo = tuple[pathlib.Path, Callable[[str], str]]
@@ -270,35 +270,51 @@ def output_queue() -> Generator[mp.Queue[OutputMessage]]:
 # =============================================================================
 
 
-class MockWatchEngine:
-    """Mock watch engine for TUI testing."""
+class MockEngine:
+    """Mock engine for TUI testing (implements Engine interface for watch mode)."""
 
     def __init__(self) -> None:
         self._keep_going: bool = False
 
-    def run(
-        self,
-        tui_queue: TuiQueue | None = None,
-        output_queue: mp.Queue[OutputMessage] | None = None,
-    ) -> None:
+    def run_loop(self) -> None:
+        """Mock run loop - does nothing."""
         pass
 
     def shutdown(self) -> None:
+        """Mock shutdown - does nothing."""
         pass
 
     def toggle_keep_going(self) -> bool:
+        """Toggle keep-going mode."""
         self._keep_going = not self._keep_going
         return self._keep_going
 
+    def set_keep_going(self, enabled: bool) -> None:
+        """Set keep-going mode."""
+        self._keep_going = enabled
+
     @property
     def keep_going(self) -> bool:
+        """Return keep-going state."""
         return self._keep_going
 
 
 @pytest.fixture
-def mock_watch_engine() -> WatchEngine:
-    """Provide a mock watch engine for TUI testing."""
-    return MockWatchEngine()  # pyright: ignore[reportReturnType]
+def mock_watch_engine() -> Engine:
+    """Provide a mock engine for TUI watch mode testing."""
+    return MockEngine()  # pyright: ignore[reportReturnType]
+
+
+@pytest.fixture
+def test_engine() -> Generator[Engine]:
+    """Provide a context-managed Engine instance.
+
+    The engine is properly closed after each test to ensure sinks are cleaned up.
+    """
+    from pivot.engine.engine import Engine
+
+    with Engine() as eng:
+        yield eng
 
 
 @pytest.fixture

@@ -498,21 +498,6 @@ def _invalid_error_process(
     return {"output": pathlib.Path("output.txt")}
 
 
-def _slow_stage(
-    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
-) -> _OutputTxt:
-    time.sleep(0.2)
-    pathlib.Path("output.txt").write_text("done")
-    return {"output": pathlib.Path("output.txt")}
-
-
-def _fast_stage(
-    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
-) -> _OutputTxt:
-    pathlib.Path("output.txt").write_text("done")
-    return {"output": pathlib.Path("output.txt")}
-
-
 def _exits_with_code(
     input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
 ) -> _OutputTxt:
@@ -1120,7 +1105,7 @@ def test_execution_lock_removed_on_stage_failure(
     register_test_stage(_failing_stage, name="failing_stage")
 
     # Executor now catches exceptions and returns failed status
-    results = executor.run(show_output=False)
+    results = executor.run()
 
     assert results["failing_stage"]["status"] == "failed"
     assert "Stage failed!" in results["failing_stage"]["reason"]
@@ -1159,7 +1144,7 @@ def test_concurrent_execution_returns_failed_status(
     register_test_stage(_process_basic, name="process")
 
     # Executor now returns failed status instead of raising
-    results = executor.run(show_output=False)
+    results = executor.run()
 
     assert results["process"]["status"] == "failed"
     assert "already running" in results["process"]["reason"]
@@ -1214,7 +1199,7 @@ def test_output_queue_reader_only_catches_empty(pipeline_dir: pathlib.Path) -> N
     register_test_stage(_output_queue_stage, name="process")
 
     # This test verifies the output queue reader behavior exists and handles Empty properly
-    results = executor.run(show_output=True)
+    results = executor.run()
     assert results["process"]["status"] == "ran"
 
 
@@ -1226,7 +1211,7 @@ def test_output_thread_cleanup_completes(pipeline_dir: pathlib.Path) -> None:
 
     register_test_stage(_print_stage, name="process")
 
-    results = executor.run(show_output=True)
+    results = executor.run()
 
     # Poll for thread cleanup with timeout (more robust than fixed sleep)
     deadline = time.monotonic() + 1.0  # 1 second timeout
@@ -1290,7 +1275,7 @@ def test_mutex_prevents_concurrent_execution(pipeline_dir: pathlib.Path) -> None
     register_test_stage(_mutex_a, name="stage_a", mutex=["gpu"])
     register_test_stage(_mutex_b, name="stage_b", mutex=["gpu"])
 
-    results = executor.run(max_workers=4, show_output=False)
+    results = executor.run(max_workers=4)
 
     assert results["stage_a"]["status"] == "ran"
     assert results["stage_b"]["status"] == "ran"
@@ -1310,7 +1295,7 @@ def test_mutex_releases_on_completion(pipeline_dir: pathlib.Path) -> None:
     register_test_stage(_first_basic, name="first", mutex=["resource"])
     register_test_stage(_second_basic, name="second", mutex=["resource"])
 
-    results = executor.run(max_workers=4, show_output=False)
+    results = executor.run(max_workers=4)
 
     assert results["first"]["status"] == "ran"
     assert results["second"]["status"] == "ran"
@@ -1325,7 +1310,7 @@ def test_mutex_releases_on_failure(pipeline_dir: pathlib.Path) -> None:
     register_test_stage(_failing_mutex, name="failing", mutex=["resource"])
     register_test_stage(_succeeding_mutex, name="succeeding", mutex=["resource"])
 
-    results = executor.run(max_workers=4, on_error="keep_going", show_output=False)
+    results = executor.run(max_workers=4, on_error="keep_going")
 
     assert results["failing"]["status"] == "failed"
     assert results["succeeding"]["status"] == "ran"
@@ -1340,7 +1325,7 @@ def test_multiple_mutex_groups_per_stage(pipeline_dir: pathlib.Path) -> None:
     register_test_stage(_multi_resource, name="multi_resource", mutex=["gpu", "disk"])
     register_test_stage(_gpu_only, name="gpu_only", mutex=["gpu"])
 
-    results = executor.run(max_workers=4, show_output=False)
+    results = executor.run(max_workers=4)
 
     assert results["multi_resource"]["status"] == "ran"
     assert results["gpu_only"]["status"] == "ran"
@@ -1360,7 +1345,7 @@ def test_mutex_with_dependencies(pipeline_dir: pathlib.Path) -> None:
     register_test_stage(_first_dep_mutex, name="first", mutex=["resource"])
     register_test_stage(_second_dep_mutex, name="second", mutex=["resource"])
 
-    results = executor.run(max_workers=4, show_output=False)
+    results = executor.run(max_workers=4)
 
     assert results["first"]["status"] == "ran"
     assert results["second"]["status"] == "ran"
@@ -1375,7 +1360,7 @@ def test_no_mutex_stages_unaffected(pipeline_dir: pathlib.Path) -> None:
     register_test_stage(_timing_a, name="stage_a")
     register_test_stage(_timing_b, name="stage_b")
 
-    results = executor.run(max_workers=4, show_output=False)
+    results = executor.run(max_workers=4)
 
     assert results["stage_a"]["status"] == "ran"
     assert results["stage_b"]["status"] == "ran"
@@ -1394,7 +1379,7 @@ def test_single_stage_mutex_warning(
     register_test_stage(_lonely_mutex, name="lonely", mutex=["lonely_group"])
 
     with caplog.at_level(logging.WARNING):
-        results = executor.run(show_output=False)
+        results = executor.run()
 
     assert results["lonely"]["status"] == "ran"
     assert any(
@@ -1417,7 +1402,7 @@ def test_on_error_fail_stops_on_first_failure(pipeline_dir: pathlib.Path) -> Non
     register_test_stage(_error_stage_a, name="stage_a")
     register_test_stage(_error_stage_b, name="stage_b")
 
-    results = executor.run(on_error="fail", show_output=False)
+    results = executor.run(on_error="fail")
 
     assert results["stage_a"]["status"] == "failed"
     # stage_b may or may not run depending on timing, but pipeline should stop
@@ -1432,7 +1417,7 @@ def test_on_error_keep_going_continues_independent_stages(pipeline_dir: pathlib.
     register_test_stage(_keep_going_failing, name="failing")
     register_test_stage(_keep_going_succeeding, name="succeeding")
 
-    results = executor.run(on_error="keep_going", show_output=False)
+    results = executor.run(on_error="keep_going")
 
     assert results["failing"]["status"] == "failed"
     assert results["succeeding"]["status"] == "ran"
@@ -1447,7 +1432,7 @@ def test_on_error_keep_going_skips_downstream_of_failed(pipeline_dir: pathlib.Pa
     register_test_stage(_second_depends_first, name="second")
     register_test_stage(_independent_stage, name="independent")
 
-    results = executor.run(on_error="keep_going", show_output=False)
+    results = executor.run(on_error="keep_going")
 
     assert results["first"]["status"] == "failed"
     assert results["second"]["status"] == "skipped"
@@ -1462,39 +1447,10 @@ def test_invalid_on_error_raises_value_error(pipeline_dir: pathlib.Path) -> None
     register_test_stage(_invalid_error_process, name="process")
 
     with pytest.raises(ValueError) as exc_info:
-        executor.run(on_error="invalid_mode", show_output=False)
+        executor.run(on_error="invalid_mode")
 
     assert "invalid_mode" in str(exc_info.value)
     assert "fail" in str(exc_info.value)  # Should mention valid options
-
-
-# =============================================================================
-# Timeout Tests
-# =============================================================================
-
-
-def test_stage_timeout_marks_stage_as_failed(pipeline_dir: pathlib.Path) -> None:
-    """Stage exceeding timeout is marked as failed."""
-    (pipeline_dir / "input.txt").write_text("data")
-
-    register_test_stage(_slow_stage, name="slow_stage")
-
-    results = executor.run(stage_timeout=0.1, show_output=False)
-
-    assert results["slow_stage"]["status"] == "failed"
-    assert "timed out" in results["slow_stage"]["reason"]
-
-
-def test_stage_timeout_does_not_affect_fast_stages(pipeline_dir: pathlib.Path) -> None:
-    """Fast stages complete normally even with timeout set."""
-    (pipeline_dir / "input.txt").write_text("data")
-
-    register_test_stage(_fast_stage, name="fast_stage")
-
-    results = executor.run(stage_timeout=60.0, show_output=False)
-
-    assert results["fast_stage"]["status"] == "ran"
-    assert (pipeline_dir / "output.txt").read_text() == "done"
 
 
 # =============================================================================
@@ -1508,7 +1464,7 @@ def test_stage_calling_sys_exit_returns_failed(pipeline_dir: pathlib.Path) -> No
 
     register_test_stage(_exits_with_code, name="exits_with_code")
 
-    results = executor.run(show_output=False)
+    results = executor.run()
 
     assert results["exits_with_code"]["status"] == "failed"
     assert "sys.exit" in results["exits_with_code"]["reason"]
@@ -1521,7 +1477,7 @@ def test_stage_calling_sys_exit_zero_returns_failed(pipeline_dir: pathlib.Path) 
 
     register_test_stage(_exits_zero, name="exits_zero")
 
-    results = executor.run(show_output=False)
+    results = executor.run()
 
     assert results["exits_zero"]["status"] == "failed"
     assert "sys.exit" in results["exits_zero"]["reason"]
@@ -1533,7 +1489,7 @@ def test_stage_raising_keyboard_interrupt_returns_failed(pipeline_dir: pathlib.P
 
     register_test_stage(_keyboard_interrupt, name="keyboard_interrupt")
 
-    results = executor.run(show_output=False)
+    results = executor.run()
 
     assert results["keyboard_interrupt"]["status"] == "failed"
     assert "KeyboardInterrupt" in results["keyboard_interrupt"]["reason"]
@@ -1554,7 +1510,7 @@ def test_directory_dependency_hashed_and_runs(pipeline_dir: pathlib.Path) -> Non
 
     register_test_stage(_dir_dep_process, name="process")
 
-    results = executor.run(show_output=False)
+    results = executor.run()
 
     assert results["process"]["status"] == "ran"
     assert (pipeline_dir / "output.txt").read_text() == "done"
@@ -1573,7 +1529,7 @@ def test_parallel_false_runs_sequentially(pipeline_dir: pathlib.Path) -> None:
     register_test_stage(_parallel_false_a, name="stage_a")
     register_test_stage(_parallel_false_b, name="stage_b")
 
-    results = executor.run(parallel=False, show_output=False)
+    results = executor.run(parallel=False)
 
     assert results["stage_a"]["status"] == "ran"
     assert results["stage_b"]["status"] == "ran"
@@ -1597,7 +1553,7 @@ def test_stage_stdout_and_stderr_captured(pipeline_dir: pathlib.Path) -> None:
 
     register_test_stage(_prints_output, name="prints_output")
 
-    results = executor.run(show_output=False)
+    results = executor.run()
 
     assert results["prints_output"]["status"] == "ran"
     # Output lines are captured in results but not exposed in dict
@@ -1610,7 +1566,7 @@ def test_stage_partial_line_output_captured(pipeline_dir: pathlib.Path) -> None:
 
     register_test_stage(_partial_output, name="partial_output")
 
-    results = executor.run(show_output=False)
+    results = executor.run()
     assert results["partial_output"]["status"] == "ran"
 
 
@@ -1631,7 +1587,7 @@ def test_lock_retry_exhaustion_returns_failed(
 
     register_test_stage(_process_basic, name="process")
 
-    results = executor.run(show_output=False)
+    results = executor.run()
 
     assert results["process"]["status"] == "failed"
     assert "already running" in results["process"]["reason"]
@@ -1652,7 +1608,7 @@ def test_mutex_names_are_case_insensitive(pipeline_dir: pathlib.Path) -> None:
     register_test_stage(_upper_mutex, name="upper_mutex", mutex=["GPU"])
     register_test_stage(_lower_mutex, name="lower_mutex", mutex=["gpu"])
 
-    results = executor.run(max_workers=4, show_output=False)
+    results = executor.run(max_workers=4)
 
     assert results["upper_mutex"]["status"] == "ran"
     assert results["lower_mutex"]["status"] == "ran"
@@ -1673,7 +1629,7 @@ def test_mutex_names_whitespace_stripped(pipeline_dir: pathlib.Path) -> None:
     register_test_stage(_spaced_mutex, name="spaced_mutex", mutex=["  resource  "])
     register_test_stage(_clean_mutex, name="clean_mutex", mutex=["resource"])
 
-    results = executor.run(max_workers=4, show_output=False)
+    results = executor.run(max_workers=4)
 
     assert results["spaced_mutex"]["status"] == "ran"
     assert results["clean_mutex"]["status"] == "ran"
@@ -1695,7 +1651,7 @@ def test_exclusive_mutex_runs_alone(pipeline_dir: pathlib.Path) -> None:
     register_test_stage(_normal_a, name="normal_a")
     register_test_stage(_normal_b, name="normal_b")
 
-    results = executor.run(max_workers=4, show_output=False)
+    results = executor.run(max_workers=4)
 
     assert results["exclusive_stage"]["status"] == "ran"
     assert results["normal_a"]["status"] == "ran"
@@ -1726,7 +1682,7 @@ def test_executor_removes_outputs_before_run(pipeline_dir: pathlib.Path) -> None
 
     register_test_stage(_removes_output_process, name="process")
 
-    results = executor.run(show_output=False)
+    results = executor.run()
 
     assert results["process"]["status"] == "ran"
     assert output_file.read_text() == "fresh data"
@@ -1739,7 +1695,7 @@ def test_executor_saves_outputs_to_cache(pipeline_dir: pathlib.Path) -> None:
 
     register_test_stage(_cache_output_process, name="process")
 
-    results = executor.run(show_output=False)
+    results = executor.run()
 
     assert results["process"]["status"] == "ran"
 
@@ -1762,7 +1718,7 @@ def test_executor_restores_missing_outputs_on_skip(pipeline_dir: pathlib.Path) -
     register_test_stage(_cache_output_process, name="process")
 
     # First run - executes and caches
-    results = executor.run(show_output=False)
+    results = executor.run()
     assert results["process"]["status"] == "ran"
 
     # Delete output (simulating user deleting file)
@@ -1775,7 +1731,7 @@ def test_executor_restores_missing_outputs_on_skip(pipeline_dir: pathlib.Path) -
     assert not output_file.exists()
 
     # Second run - should skip but restore output from cache
-    results = executor.run(show_output=False)
+    results = executor.run()
     assert results["process"]["status"] == "skipped"
     assert output_file.exists(), "Output should be restored from cache"
     assert output_file.read_text() == "result"
@@ -1787,7 +1743,7 @@ def test_executor_fails_if_output_missing(pipeline_dir: pathlib.Path) -> None:
 
     register_test_stage(_no_output_process, name="process")
 
-    results = executor.run(show_output=False)
+    results = executor.run()
 
     assert results["process"]["status"] == "failed"
     assert "output" in results["process"]["reason"].lower()
@@ -1799,7 +1755,7 @@ def test_executor_handles_json_outputs(pipeline_dir: pathlib.Path) -> None:
 
     register_test_stage(_metrics_process, name="process")
 
-    results = executor.run(show_output=False)
+    results = executor.run()
 
     assert results["process"]["status"] == "ran"
 
@@ -1817,7 +1773,7 @@ def test_executor_fails_if_json_output_missing(pipeline_dir: pathlib.Path) -> No
 
     register_test_stage(_no_metrics_process, name="process")
 
-    results = executor.run(show_output=False)
+    results = executor.run()
 
     assert results["process"]["status"] == "failed"
     assert "metrics.json" in results["process"]["reason"]
@@ -1829,7 +1785,7 @@ def test_executor_output_hashes_in_lock_file(pipeline_dir: pathlib.Path) -> None
 
     register_test_stage(_cache_output_process, name="process")
 
-    executor.run(show_output=False)
+    executor.run()
 
     lock_file = pipeline_dir / ".pivot" / "stages" / "process.lock"
     assert lock_file.exists()
@@ -1849,7 +1805,7 @@ def test_executor_lock_file_deterministic_sort(pipeline_dir: pathlib.Path) -> No
 
     register_test_stage(_multi_input_process, name="process")
 
-    executor.run(show_output=False)
+    executor.run()
 
     lock_file = pipeline_dir / ".pivot" / "stages" / "process.lock"
     lock_data = yaml.safe_load(lock_file.read_text())
@@ -1868,7 +1824,7 @@ def test_executor_directory_output_cached(pipeline_dir: pathlib.Path) -> None:
 
     register_test_stage(_dir_output_process, name="process")
 
-    results = executor.run(show_output=False)
+    results = executor.run()
 
     assert results["process"]["status"] == "ran"
 
@@ -1900,7 +1856,7 @@ def test_executor_lock_file_missing_outs_triggers_rerun(pipeline_dir: pathlib.Pa
 
     register_test_stage(_lock_missing_outs, name="process")
 
-    results = executor.run(show_output=False)
+    results = executor.run()
 
     # Should re-run because outs is missing
     assert results["process"]["status"] == "ran"
@@ -1922,15 +1878,15 @@ def test_force_runs_unchanged_stage(pipeline_dir: pathlib.Path) -> None:
     register_test_stage(_force_process, name="process")
 
     # First run - should execute
-    results = executor.run(show_output=False)
+    results = executor.run()
     assert results["process"]["status"] == "ran"
 
     # Second run without force - should skip (nothing changed)
-    results = executor.run(show_output=False)
+    results = executor.run()
     assert results["process"]["status"] == "skipped"
 
     # Third run with force - should run despite no changes
-    results = executor.run(force=True, show_output=False)
+    results = executor.run(force=True)
     assert results["process"]["status"] == "ran"
 
 
@@ -1941,11 +1897,11 @@ def test_force_updates_lock_file(pipeline_dir: pathlib.Path) -> None:
     register_test_stage(_cache_output_process, name="process")
 
     # First run with force
-    results = executor.run(force=True, show_output=False)
+    results = executor.run(force=True)
     assert results["process"]["status"] == "ran"
 
     # Second run without force - should skip (lock file should be correct)
-    results = executor.run(show_output=False)
+    results = executor.run()
     assert results["process"]["status"] == "skipped", "Lock file should be valid after forced run"
 
 
@@ -1958,13 +1914,13 @@ def test_force_with_specific_stage(pipeline_dir: pathlib.Path) -> None:
     register_test_stage(_force_other, name="other")
 
     # First run - all execute
-    results = executor.run(show_output=False)
+    results = executor.run()
     assert results["step1"]["status"] == "ran"
     assert results["step2"]["status"] == "ran"
     assert results["other"]["status"] == "ran"
 
     # Force run of step2 only - should force step1 and step2, skip other
-    results = executor.run(stages=["step2"], force=True, show_output=False)
+    results = executor.run(stages=["step2"], force=True)
     assert results["step1"]["status"] == "ran"
     assert results["step2"]["status"] == "ran"
     assert "other" not in results  # Not in execution set
@@ -1979,12 +1935,12 @@ def test_force_with_single_stage(pipeline_dir: pathlib.Path) -> None:
     register_test_stage(_force_single_step2, name="step2")
 
     # First run - both execute
-    results = executor.run(show_output=False)
+    results = executor.run()
     assert results["step1"]["status"] == "ran"
     assert results["step2"]["status"] == "ran"
 
     # Force run step2 with single_stage - step1 should skip
-    results = executor.run(stages=["step2"], single_stage=True, force=True, show_output=False)
+    results = executor.run(stages=["step2"], single_stage=True, force=True)
     assert "step1" not in results  # Not in execution set due to single_stage
     assert results["step2"]["status"] == "ran"
 
@@ -2028,7 +1984,7 @@ def test_executor_deferred_writes_applied(pipeline_dir: pathlib.Path) -> None:
 
     register_test_stage(_deferred_process, name="process")
 
-    results = executor.run(show_output=False)
+    results = executor.run()
     assert results["process"]["status"] == "ran"
 
     # Verify StateDB has output generation incremented
@@ -2041,7 +1997,7 @@ def test_executor_deferred_writes_applied(pipeline_dir: pathlib.Path) -> None:
         )
 
     # Verify deferred writes were applied by checking skip works on second run
-    results = executor.run(show_output=False)
+    results = executor.run()
     assert results["process"]["status"] == "skipped", (
         "Stage should skip on second run - deferred writes recorded run cache"
     )
@@ -2057,7 +2013,7 @@ def test_executor_multi_stage_generation_tracking(pipeline_dir: pathlib.Path) ->
     register_test_stage(_deferred_step2, name="step2")
 
     # First run
-    results = executor.run(show_output=False)
+    results = executor.run()
     assert results["step1"]["status"] == "ran"
     assert results["step2"]["status"] == "ran"
 
@@ -2070,7 +2026,7 @@ def test_executor_multi_stage_generation_tracking(pipeline_dir: pathlib.Path) ->
 
     # Modify input - both should re-run since step1 output changes
     (pipeline_dir / "input.txt").write_text("data_v2")
-    results = executor.run(show_output=False)
+    results = executor.run()
     assert results["step1"]["status"] == "ran"
     assert results["step2"]["status"] == "ran"
 
@@ -2095,7 +2051,7 @@ def test_concurrent_runs_different_stages_allowed(pipeline_dir: pathlib.Path) ->
     register_test_stage(_concurrent_b, name="stage_b")
 
     # Both stages can run in parallel since they have different execution locks
-    results = executor.run(max_workers=4, show_output=False)
+    results = executor.run(max_workers=4)
     assert results["stage_a"]["status"] == "ran"
     assert results["stage_b"]["status"] == "ran"
 
@@ -2117,7 +2073,7 @@ def test_many_stage_pipeline_completes(pipeline_dir: pathlib.Path) -> None:
     register_test_stage(_helper_chain_step5, name="step5")
 
     start_time = time.time()
-    results = executor.run(show_output=False)
+    results = executor.run()
     elapsed = time.time() - start_time
 
     # All stages should run
@@ -2137,12 +2093,12 @@ def test_skip_detection_fast_with_many_deps(pipeline_dir: pathlib.Path) -> None:
     register_test_stage(_many_deps_process, name="process")
 
     # First run
-    results = executor.run(show_output=False)
+    results = executor.run()
     assert results["process"]["status"] == "ran"
 
     # Second run - should skip quickly (generation-based check)
     start_time = time.time()
-    results = executor.run(show_output=False)
+    results = executor.run()
     elapsed = time.time() - start_time
 
     assert results["process"]["status"] == "skipped"

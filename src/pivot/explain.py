@@ -7,13 +7,13 @@ showing specific code, param, and dependency changes.
 from __future__ import annotations
 
 import pathlib
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, Literal, TypedDict, TypeVar
 
 import pydantic
 
 from pivot import parameters, project
 from pivot.executor import worker
-from pivot.storage import lock, state
+from pivot.storage import cache, lock, state
 from pivot.types import (
     ChangeType,
     CodeChange,
@@ -30,6 +30,18 @@ if TYPE_CHECKING:
     import pygtrie
 
     from pivot.storage.track import PvtData
+
+
+class HashResolution(TypedDict):
+    """Result of resolving an artifact's hash.
+
+    Unlike HashInfo (which describes hash structure: file vs directory),
+    this type tracks where the hash was obtained from (provenance).
+    """
+
+    hash: str
+    source: Literal["disk", "pvt"]  # disk = computed from file, pvt = from .pvt tracking file
+
 
 T = TypeVar("T")
 C = TypeVar("C")
@@ -82,7 +94,10 @@ def _extract_hash(info: HashInfo) -> str:
 
 
 def diff_dep_hashes(old: dict[str, HashInfo], new: dict[str, HashInfo]) -> list[DepChange]:
-    """Diff two dep_hashes dicts, returning list of changes."""
+    """Diff two dep_hashes dicts, returning list of changes.
+
+    Paths in the result are relative to project root for user-facing display.
+    """
 
     def make_dep_change(
         path: str,
@@ -92,7 +107,11 @@ def diff_dep_hashes(old: dict[str, HashInfo], new: dict[str, HashInfo]) -> list[
     ) -> DepChange:
         old_hash = _extract_hash(old_info) if old_info else None
         new_hash = _extract_hash(new_info) if new_info else None
-        return DepChange(path=path, old_hash=old_hash, new_hash=new_hash, change_type=change_type)
+        # Convert absolute paths to relative for user-facing output
+        rel_path = project.to_relative_path(path)
+        return DepChange(
+            path=rel_path, old_hash=old_hash, new_hash=new_hash, change_type=change_type
+        )
 
     return _diff_dicts(old, new, make_dep_change)
 
@@ -145,6 +164,51 @@ def _find_tracked_hash(
             return {"hash": entry["hash"]}
 
     return None  # Path not found in manifest
+
+
+def hash_artifact(
+    path: pathlib.Path,
+    allow_missing: bool = False,
+    tracked_trie: pygtrie.Trie[str] | None = None,
+) -> HashResolution | None:
+    """Get artifact hash with fallback to .pvt if allow_missing.
+
+    This is a utility function that encapsulates the disk -> .pvt fallback logic.
+    It can be used by status, explain, and verify code to determine artifact hashes
+    with consistent resolution behavior.
+
+    Resolution order:
+    1. Actual file on disk (primary)
+    2. .pvt file hash (fallback when file missing/unreadable + allow_missing)
+
+    Args:
+        path: Path to the artifact.
+        allow_missing: If True, fall back to .pvt hash when file is missing or unreadable.
+        tracked_trie: Trie mapping path tuples to tracked hashes (from .pvt files).
+            Keys are Path.parts tuples, values are hash strings.
+
+    Returns:
+        HashResolution with hash and source, or None if not found.
+    """
+    # Primary: file on disk
+    if path.exists():
+        try:
+            if path.is_dir():
+                file_hash, _ = cache.hash_directory(path)
+            else:
+                file_hash = cache.hash_file(path)
+            return HashResolution(hash=file_hash, source="disk")
+        except PermissionError:
+            # File exists but unreadable - fall through to .pvt fallback
+            pass
+
+    # Fallback: .pvt tracked hash
+    if allow_missing and tracked_trie is not None:
+        path_key = path.parts
+        if path_key in tracked_trie:
+            return HashResolution(hash=tracked_trie[path_key], source="pvt")
+
+    return None
 
 
 def get_stage_explanation(
@@ -245,22 +309,26 @@ def get_stage_explanation(
         dep_hashes, missing_deps, unreadable_deps = worker.hash_dependencies(deps)
 
     if missing_deps:
+        # Convert to relative paths for user-facing message
+        rel_missing = [project.to_relative_path(p) for p in missing_deps]
         return StageExplanation(
             stage_name=stage_name,
             will_run=True,
             is_forced=force,
-            reason=f"Missing deps: {', '.join(missing_deps)}",
+            reason=f"Missing deps: {', '.join(rel_missing)}",
             code_changes=[],
             param_changes=[],
             dep_changes=[],
         )
 
     if unreadable_deps:
+        # Convert to relative paths for user-facing message
+        rel_unreadable = [project.to_relative_path(p) for p in unreadable_deps]
         return StageExplanation(
             stage_name=stage_name,
             will_run=True,
             is_forced=force,
-            reason=f"Unreadable deps: {', '.join(unreadable_deps)}",
+            reason=f"Unreadable deps: {', '.join(rel_unreadable)}",
             code_changes=[],
             param_changes=[],
             dep_changes=[],

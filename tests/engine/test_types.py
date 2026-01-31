@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from pivot.engine import types
 from pivot.types import StageStatus
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 def test_stage_execution_state_ordering() -> None:
@@ -150,9 +155,13 @@ def test_stage_completed_event() -> None:
         "status": StageStatus.RAN,
         "reason": "inputs changed",
         "duration_ms": 1234.5,
+        "index": 3,
+        "total": 5,
     }
     assert event["type"] == "stage_completed"
     assert event["status"] == StageStatus.RAN
+    assert event["index"] == 3
+    assert event["total"] == 5
 
     # Skipped stage
     event_skip: types.StageCompleted = {
@@ -161,6 +170,8 @@ def test_stage_completed_event() -> None:
         "status": StageStatus.SKIPPED,
         "reason": "unchanged",
         "duration_ms": 0.0,
+        "index": 4,
+        "total": 5,
     }
     assert event_skip["status"] == StageStatus.SKIPPED
 
@@ -185,6 +196,20 @@ def test_log_line_event() -> None:
     assert event_err["is_stderr"] is True
 
 
+def test_stage_state_changed_event() -> None:
+    """StageStateChanged event has required fields."""
+    event: types.StageStateChanged = {
+        "type": "stage_state_changed",
+        "stage": "train",
+        "state": types.StageExecutionState.RUNNING,
+        "previous_state": types.StageExecutionState.PREPARING,
+    }
+    assert event["type"] == "stage_state_changed"
+    assert event["stage"] == "train"
+    assert event["state"] == types.StageExecutionState.RUNNING
+    assert event["previous_state"] == types.StageExecutionState.PREPARING
+
+
 def test_output_event_union() -> None:
     """OutputEvent is a union of all output event types."""
     events: list[types.OutputEvent] = [
@@ -203,7 +228,47 @@ def test_output_event_union() -> None:
             "status": StageStatus.RAN,
             "reason": "",
             "duration_ms": 0,
+            "index": 1,
+            "total": 1,
+        },
+        {
+            "type": "stage_state_changed",
+            "stage": "x",
+            "state": types.StageExecutionState.RUNNING,
+            "previous_state": types.StageExecutionState.PREPARING,
         },
         {"type": "log_line", "stage": "x", "line": "", "is_stderr": False},
     ]
-    assert len(events) == 5
+    assert len(events) == 6
+
+
+def test_event_source_protocol() -> None:
+    """EventSource protocol defines start/stop interface."""
+
+    class MockSource:
+        def start(self, submit: Callable[[types.InputEvent], None]) -> None:
+            pass
+
+        def stop(self) -> None:
+            pass
+
+    # Protocol should accept this implementation
+    source: types.EventSource = MockSource()
+    assert hasattr(source, "start")
+    assert hasattr(source, "stop")
+
+
+def test_event_sink_protocol() -> None:
+    """EventSink protocol defines handle/close interface."""
+
+    class MockSink:
+        def handle(self, event: types.OutputEvent) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    # Protocol should accept this implementation
+    sink: types.EventSink = MockSink()
+    assert hasattr(sink, "handle")
+    assert hasattr(sink, "close")

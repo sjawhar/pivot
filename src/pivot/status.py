@@ -1,3 +1,39 @@
+"""Pipeline status queries using Engine's bipartite graph.
+
+This module provides the primary query API for determining pipeline status.
+It orchestrates calls to explain.py for individual stage explanations.
+
+Graph Parameter
+---------------
+Query functions accept an optional `graph` parameter:
+
+- If provided, uses the bipartite artifact-stage graph from Engine
+- If None, builds a stage-only DAG from the registry (legacy path)
+
+The Engine's bipartite graph is preferred because:
+1. It's already built for execution
+2. It includes artifact nodes for path-based queries
+3. It ensures consistency between queries and execution
+
+Module Relationships
+--------------------
+- status.py: Orchestrates queries, handles graph, computes execution order
+- explain.py: Provides per-stage explanations (receives data from status.py)
+- cli/verify.py: Verification commands (uses status.py internally)
+
+Example::
+
+    from pivot.engine import graph as engine_graph
+    from pivot import status
+
+    # Build bipartite graph
+    all_stages = {name: registry.REGISTRY.get(name) for name in registry.REGISTRY.list_stages()}
+    graph = engine_graph.build_graph(all_stages)
+
+    # Use graph for status query
+    statuses, dag = status.get_pipeline_status(["train"], single_stage=False, graph=graph)
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -16,6 +52,7 @@ from pivot import (
     project,
     registry,
 )
+from pivot.engine import graph as engine_graph
 from pivot.remote import config as remote_config
 from pivot.remote import sync as transfer
 from pivot.storage import cache, track
@@ -35,6 +72,7 @@ from pivot.types import (
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    import networkx as nx
     import pygtrie
     from networkx import DiGraph
 
@@ -112,6 +150,7 @@ def get_pipeline_explanations(
     single_stage: bool,
     force: bool = False,
     allow_missing: bool = False,
+    graph: nx.DiGraph[str] | None = None,
 ) -> list[StageExplanation]:
     """Get detailed explanations for all stages with upstream staleness populated.
 
@@ -124,11 +163,17 @@ def get_pipeline_explanations(
         single_stage: If True, only explain the specified stages without dependencies.
         force: If True, mark all stages as would run due to force flag.
         allow_missing: If True, use .pvt hashes for missing dependency files.
+        graph: Optional bipartite graph from Engine. If provided, extracts stage DAG
+            via get_stage_dag() instead of building one from the registry.
     """
     with metrics.timed("status.get_pipeline_explanations"):
         tracked_files, tracked_trie = _discover_tracked_files(allow_missing)
-        graph = registry.REGISTRY.build_dag(validate=not allow_missing)
-        execution_order = dag.get_execution_order(graph, stages, single_stage=single_stage)
+        stage_graph = (
+            engine_graph.get_stage_dag(graph)
+            if graph is not None
+            else registry.REGISTRY.build_dag(validate=not allow_missing)
+        )
+        execution_order = dag.get_execution_order(stage_graph, stages, single_stage=single_stage)
 
         if not execution_order:
             return []
@@ -149,7 +194,7 @@ def get_pipeline_explanations(
         # Preserve original order for staleness propagation
         explanations = [explanations_by_name[name] for name in execution_order]
 
-        return _compute_explanations_with_upstream(explanations, graph)
+        return _compute_explanations_with_upstream(explanations, stage_graph)
 
 
 def _compute_explanations_with_upstream(
@@ -199,6 +244,7 @@ def get_pipeline_status(
     single_stage: bool,
     validate: bool = True,
     allow_missing: bool = False,
+    graph: nx.DiGraph[str] | None = None,
 ) -> tuple[list[PipelineStatusInfo], DiGraph[str]]:
     """Get status for all stages, tracking upstream staleness.
 
@@ -208,14 +254,20 @@ def get_pipeline_status(
         validate: If True, validate dependency files exist during DAG building.
             Set to False with --allow-missing to skip validation.
         allow_missing: If True, use .pvt hashes for missing dependency files.
+        graph: Optional bipartite graph from Engine. If provided, extracts stage DAG
+            via get_stage_dag() instead of building one from the registry.
     """
     with metrics.timed("status.get_pipeline_status"):
         tracked_files, tracked_trie = _discover_tracked_files(allow_missing)
-        graph = registry.REGISTRY.build_dag(validate=validate)
-        execution_order = dag.get_execution_order(graph, stages, single_stage=single_stage)
+        stage_graph = (
+            engine_graph.get_stage_dag(graph)
+            if graph is not None
+            else registry.REGISTRY.build_dag(validate=validate)
+        )
+        execution_order = dag.get_execution_order(stage_graph, stages, single_stage=single_stage)
 
         if not execution_order:
-            return [], graph
+            return [], stage_graph
 
         state_dir = config.get_state_dir()
         overrides = parameters.load_params_yaml()
@@ -233,8 +285,8 @@ def get_pipeline_status(
         explanations = [explanations_by_name[name] for name in execution_order]
 
         # Reuse the shared upstream computation logic
-        enriched = _compute_explanations_with_upstream(explanations, graph)
-        return _explanations_to_status(enriched), graph
+        enriched = _compute_explanations_with_upstream(explanations, stage_graph)
+        return _explanations_to_status(enriched), stage_graph
 
 
 def _explanations_to_status(explanations: list[StageExplanation]) -> list[PipelineStatusInfo]:
@@ -372,3 +424,32 @@ def get_suggestions(
         )
 
     return suggestions
+
+
+def what_if_changed(
+    paths: list[pathlib.Path],
+    graph: nx.DiGraph[str] | None = None,
+) -> list[str]:
+    """Determine which stages would run if these paths changed.
+
+    Args:
+        paths: Paths that hypothetically changed (relative or absolute).
+        graph: Optional bipartite graph from Engine.
+
+    Returns:
+        List of stage names that would be affected.
+    """
+    if graph is None:
+        all_stages = {name: registry.REGISTRY.get(name) for name in registry.REGISTRY.list_stages()}
+        graph = engine_graph.build_graph(all_stages)
+
+    affected = set[str]()
+    for path in paths:
+        # Normalize paths (graph stores normalized paths, not resolved)
+        normalized_path = project.normalize_path(path)
+        consumers = engine_graph.get_artifact_consumers(
+            graph, normalized_path, include_downstream=True
+        )
+        affected.update(consumers)
+
+    return sorted(affected)

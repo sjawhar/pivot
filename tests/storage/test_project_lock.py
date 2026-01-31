@@ -243,7 +243,7 @@ def test_commit_blocks_during_no_commit_execution(pipeline_dir: pathlib.Path) ->
     def run_execution() -> None:
         try:
             execution_started.set()
-            executor.run(show_output=False, no_commit=True)
+            executor.run(no_commit=True)
         except Exception as e:
             errors["exec"] = e
 
@@ -329,7 +329,7 @@ def test_concurrent_commits_serialize(pipeline_dir: pathlib.Path) -> None:
     register_test_stage(stage2)
 
     # Run with --no-commit
-    executor.run(show_output=False, no_commit=True)
+    executor.run(no_commit=True)
 
     # Now try two concurrent commits
     results = list[tuple[str, list[str]]]()

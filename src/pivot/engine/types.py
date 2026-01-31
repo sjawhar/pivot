@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from enum import Enum, IntEnum
-from typing import TYPE_CHECKING, Literal, TypedDict
+from typing import TYPE_CHECKING, Literal, Protocol, TypedDict
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from pivot.types import StageStatus
 
 __all__ = [
@@ -23,8 +25,12 @@ __all__ = [
     "PipelineReloaded",
     "StageStarted",
     "StageCompleted",
+    "StageStateChanged",
     "LogLine",
     "OutputEvent",
+    # Protocols
+    "EventSource",
+    "EventSink",
 ]
 
 
@@ -134,6 +140,8 @@ class StageCompleted(TypedDict):
     status: StageStatus
     reason: str
     duration_ms: float
+    index: int
+    total: int
 
 
 class LogLine(TypedDict):
@@ -145,4 +153,49 @@ class LogLine(TypedDict):
     is_stderr: bool
 
 
-OutputEvent = EngineStateChanged | PipelineReloaded | StageStarted | StageCompleted | LogLine
+class StageStateChanged(TypedDict):
+    """Emitted when a stage's execution state changes."""
+
+    type: Literal["stage_state_changed"]
+    stage: str
+    state: StageExecutionState
+    previous_state: StageExecutionState
+
+
+OutputEvent = (
+    EngineStateChanged
+    | PipelineReloaded
+    | StageStarted
+    | StageCompleted
+    | StageStateChanged
+    | LogLine
+)
+
+
+# =============================================================================
+# Protocols
+# =============================================================================
+
+
+class EventSource(Protocol):
+    """Source that produces input events."""
+
+    def start(self, submit: Callable[[InputEvent], None]) -> None:
+        """Begin producing events. Call submit() for each event."""
+        ...
+
+    def stop(self) -> None:
+        """Stop producing events."""
+        ...
+
+
+class EventSink(Protocol):
+    """Sink that consumes output events."""
+
+    def handle(self, event: OutputEvent) -> None:
+        """Process an event. Must be non-blocking."""
+        ...
+
+    def close(self) -> None:
+        """Clean up resources."""
+        ...

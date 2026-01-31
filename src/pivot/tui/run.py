@@ -81,8 +81,8 @@ if TYPE_CHECKING:
     import multiprocessing as mp
     from collections.abc import Callable
 
+    from pivot.engine.engine import Engine
     from pivot.types import OutputChange, OutputMessage
-    from pivot.watch.engine import WatchEngine
 
 
 class TuiUpdate(textual.message.Message):
@@ -175,7 +175,7 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
     # Instance attributes (annotated for type checking since class is not @final)
     _executor_func: Callable[[], dict[str, ExecutionSummary]] | None
     _cancel_event: threading.Event | None
-    _engine: WatchEngine | None
+    _engine: Engine | None
     _output_queue: mp.Queue[OutputMessage] | None
 
     def __init__(
@@ -188,7 +188,7 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
         executor_func: Callable[[], dict[str, ExecutionSummary]] | None = None,
         cancel_event: threading.Event | None = None,
         # Watch mode parameters
-        engine: WatchEngine | None = None,
+        engine: Engine | None = None,
         output_queue: mp.Queue[OutputMessage] | None = None,
         no_commit: bool = False,
         serve: bool = False,
@@ -432,7 +432,7 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
         """Run the watch engine (watch mode, background thread)."""
         try:
             if self._engine:
-                self._engine.run(tui_queue=self._tui_queue, output_queue=self._output_queue)
+                self._engine.run_loop()
         except Exception as e:
             _logger.exception(f"Watch engine failed: {e}")
             error_msg = TuiWatchMessage(
@@ -1322,7 +1322,7 @@ def run_with_tui(
 
 
 def run_watch_tui(
-    engine: WatchEngine,
+    engine: Engine,
     message_queue: TuiQueue,
     output_queue: mp.Queue[OutputMessage] | None = None,
     tui_log: pathlib.Path | None = None,

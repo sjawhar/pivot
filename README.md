@@ -8,7 +8,7 @@
 
 ## What is Pivot?
 
-Pivot is a Python pipeline tool with automatic code change detection. Define stages in YAML or with typed Python classes, and Pivot figures out what needs to re-run—no manual dependency declarations, no stale caches. It provides:
+Pivot is a Python pipeline tool with automatic code change detection. Define stages with typed Python functions and annotations, and Pivot figures out what needs to re-run—no manual dependency declarations, no stale caches. It provides:
 
 - **32x faster lock file operations** through per-stage lock files
 - **Automatic code change detection** using Python introspection (no manual declarations!)
@@ -31,45 +31,49 @@ Pivot is a Python pipeline tool with automatic code change detection. Define sta
 pip install pivot
 ```
 
-### YAML Configuration (Recommended)
+### Python-First Pipeline Definition
 
-Define pipelines in `pivot.yaml`:
-
-```yaml
-# pivot.yaml
-stages:
-  preprocess:
-    python: stages.preprocess
-    deps:
-      - data.csv
-    outs:
-      - processed.parquet
-
-  train:
-    python: stages.train
-    deps:
-      - processed.parquet
-    outs:
-      - model.pkl
-    params:
-      lr: 0.01
-```
+Define stages with typed Python functions using annotations:
 
 ```python
-# stages.py
+# pipeline.py
+import pathlib
+from typing import Annotated, TypedDict
+
 import pandas
-import pickle
+from pivot import loaders, outputs
+from pivot.registry import REGISTRY
 
-def preprocess():
-    df = pandas.read_csv('data.csv')
-    df = df.dropna()
-    df.to_parquet('processed.parquet')
 
-def train():
-    df = pandas.read_parquet('processed.parquet')
-    model = {'rows': len(df), 'columns': len(df.columns)}
-    with open('model.pkl', 'wb') as f:
-        pickle.dump(model, f)
+class PreprocessOutputs(TypedDict):
+    clean: Annotated[pathlib.Path, outputs.Out("processed.parquet", loaders.PathOnly())]
+
+
+def preprocess(
+    raw: Annotated[pandas.DataFrame, outputs.Dep("data.csv", loaders.CSV())],
+) -> PreprocessOutputs:
+    df = raw.dropna()
+    out_path = pathlib.Path("processed.parquet")
+    df.to_parquet(out_path)
+    return PreprocessOutputs(clean=out_path)
+
+
+class TrainOutputs(TypedDict):
+    model: Annotated[pathlib.Path, outputs.Out("model.pkl", loaders.PathOnly())]
+
+
+def train(
+    data: Annotated[pathlib.Path, outputs.Dep("processed.parquet", loaders.PathOnly())],
+) -> TrainOutputs:
+    df = pandas.read_parquet(data)
+    model_path = pathlib.Path("model.pkl")
+    # ... train model ...
+    return TrainOutputs(model=model_path)
+
+
+# Register stages
+REGISTRY.register(preprocess)
+REGISTRY.register(train)
 ```
 
 ```bash
@@ -79,35 +83,11 @@ pivot run  # Instant - nothing changed
 
 Modify `preprocess`, and Pivot automatically re-runs both stages. Modify `train`, and only `train` re-runs.
 
-**Auto-discovery order:** `pivot.yaml` → `pivot.yml`
-
-### Matrix Expansion (pivot.yaml)
-
-Generate multiple stage variants from a single definition:
-
-```yaml
-stages:
-  train:
-    python: stages.train
-    deps:
-      data: data/clean.csv
-      config: "configs/${model}.yaml"
-    outs:
-      model: "models/${model}_${dataset}.pkl"
-    matrix:
-      model:
-        bert:
-          params:
-            hidden_size: 768
-        gpt:
-          params:
-            hidden_size: 1024
-          deps:
-            tokenizer: data/gpt_tokenizer.json
-      dataset: [swe, human]
-```
-
-This generates 4 stages: `train@bert_swe`, `train@bert_human`, `train@gpt_swe`, `train@gpt_human`
+**Why Python-first?**
+- Full type safety and IDE autocomplete
+- Dependencies and outputs declared in one place (the function)
+- Loader code changes automatically trigger re-runs
+- No YAML to keep in sync with your Python code
 
 ---
 
@@ -188,26 +168,27 @@ Stage: train
 
 ### 6. Stage Parameters
 
-**Type-safe parameters via pivot.yaml:**
+**Type-safe parameters via Pydantic classes:**
 
-```yaml
-# pivot.yaml
-stages:
-  train:
-    python: stages.train
-    deps:
-      - data.csv
-    outs:
-      - model.pkl
-    params:
-      learning_rate: 0.01
-      epochs: 100
-      batch_size: 32
+```python
+from pivot.stage_def import StageParams
+
+class TrainParams(StageParams):
+    learning_rate: float = 0.01
+    epochs: int = 100
+    batch_size: int = 32
+
+def train(
+    params: TrainParams,
+    data: Annotated[pandas.DataFrame, outputs.Dep("data.csv", loaders.CSV())],
+) -> TrainOutputs:
+    # params.learning_rate, params.epochs, params.batch_size available
+    ...
 ```
 
 **How it works:**
 
-- Define parameters in the `params:` section of your stage
+- Define parameters as Pydantic classes inheriting from `StageParams`
 - Parameter changes trigger re-execution (tracked in lock files)
 
 **View and compare params:**
@@ -223,16 +204,16 @@ pivot params diff --precision 4      # Control float precision
 
 Outputs that preserve state between runs for append-only workloads:
 
-```yaml
-# pivot.yaml
-stages:
-  append_to_database:
-    python: stages.append_to_database
-    deps:
-      - new_data.csv
-    outs:
-      - database.db:
-          incremental: true
+```python
+class AppendOutputs(TypedDict):
+    database: Annotated[pathlib.Path, outputs.IncrementalOut("database.db", loaders.PathOnly())]
+
+def append_to_database(
+    new_data: Annotated[pandas.DataFrame, outputs.Dep("new_data.csv", loaders.CSV())],
+) -> AppendOutputs:
+    # database.db is restored from cache before this runs
+    # Modify in place, then return the path
+    ...
 ```
 
 **How it works:**
@@ -377,7 +358,7 @@ def train(params: TrainParams) -> None:
 - **Type-safe** - IDE autocomplete, type checking for loaded data
 - **Auto-load/save** - No boilerplate file I/O code
 - **Automatic fingerprinting** - Loader code changes trigger re-runs
-- **Works with pivot.yaml** - Deps/outs are extracted from StageDef
+- **Fully self-contained** - Deps/outs are extracted from StageDef, no external config needed
 
 **Built-in loaders:**
 
@@ -388,17 +369,6 @@ def train(params: TrainParams) -> None:
 | `loaders.YAML()` | dict/list | dict/list | - |
 | `loaders.Pickle()` | Any | Any | - |
 | `loaders.PathOnly()` | pathlib.Path | (validates exists) | - |
-
-**With pivot.yaml:**
-
-```yaml
-stages:
-  train:
-    python: stages.train
-    # No deps/outs needed - extracted from StageDef!
-    params:
-      learning_rate: 0.001
-```
 
 **Custom loaders:**
 
@@ -460,7 +430,7 @@ Full documentation available at the [Pivot Documentation Site](https://anthropic
 - **DVC export** - `pivot export` command for YAML generation
 - **Explain mode** - `pivot run --explain` and `pivot explain` show detailed breakdown of WHY stages would run
 - **Observability** - `pivot metrics show/diff`, `pivot plots show/diff`, and `pivot params show/diff` commands
-- **Pipeline configuration** - `pivot.yaml` files with matrix expansion, `Pipeline` class, CLI auto-discovery
+- **Pipeline configuration** - Python-first with `REGISTRY.register()`, optional `pivot.yaml` for matrix expansion
 - **S3 remote cache** - `pivot push/pull` with async I/O, LMDB index, per-stage filtering
 - **Data diff** - `pivot data diff` command with interactive TUI for comparing data file changes
 - **Version retrieval** - `pivot data get --rev` to materialize files from any git revision
@@ -480,12 +450,10 @@ Full documentation available at the [Pivot Documentation Site](https://anthropic
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  User Pipeline Code (pivot.yaml or StageDef classes)        │
-│  stages:                                                    │
-│    train:                                                   │
-│      python: stages.train                                   │
-│      deps: [data.csv]                                       │
-│      outs: [model.pkl]                                      │
+│  User Pipeline Code (pipeline.py with REGISTRY.register())  │
+│  @outputs.Dep("data.csv", loaders.CSV())                    │
+│  @outputs.Out("model.pkl", loaders.PathOnly())              │
+│  def train(data: ...) -> TrainOutputs: ...                  │
 └─────────────────────────────────────────────────────────────┘
                          │
                          ▼
@@ -553,7 +521,7 @@ basedpyright src/
 | **Executor**              | ThreadPoolExecutor          | Warm workers + Interpreters |
 | **Explain mode**          | ❌                          | ✅ Shows WHY stages run     |
 | **YAML export**           | N/A                         | ✅ For code review          |
-| **Python-first**          | Config-first (YAML)         | YAML + typed Python classes |
+| **Python-first**          | Config-first (YAML)         | Python annotations + optional YAML |
 | **Remote storage**        | S3/GCS/Azure via dvc-data   | S3 with async I/O           |
 
 ---

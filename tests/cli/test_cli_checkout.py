@@ -212,7 +212,7 @@ def test_checkout_stage_output(runner: click.testing.CliRunner, tmp_path: pathli
         register_test_stage(_helper_process, name="process")
 
         # Run to generate output
-        executor.run(show_output=False)
+        executor.run()
         assert pathlib.Path("output.txt").exists()
 
         # Delete output

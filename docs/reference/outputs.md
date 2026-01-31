@@ -39,9 +39,10 @@ def train(
     }
 ```
 
-YAML provides path overrides:
+Optionally, `pivot.yaml` can override paths without changing Python code:
 
 ```yaml
+# pivot.yaml (optional - for path overrides)
 stages:
   train:
     python: stages.train
@@ -299,10 +300,10 @@ ls -la output.csv
 
 **Cause:** Pivot detected a change in code, parameters, or dependencies.
 
-**Solution:** Use `pivot explain` to see what changed:
+**Solution:** Use `pivot status --explain` to see what changed:
 
 ```bash
-$ pivot explain train
+$ pivot status --explain train
 
 Stage: train
   Status: WILL RUN

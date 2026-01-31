@@ -133,7 +133,7 @@ def test_status_shows_cached_stages(
 
         register_test_stage(_helper_process, name="process")
 
-        executor.run(show_output=False)
+        executor.run()
 
         result = runner.invoke(cli.cli, ["status"])
 
@@ -153,7 +153,7 @@ def test_status_verbose_shows_all_stages(
         register_test_stage(_helper_stage_a, name="stage_a")
         register_test_stage(_helper_stage_b, name="stage_b")
 
-        executor.run(show_output=False)
+        executor.run()
 
         result = runner.invoke(cli.cli, ["status", "--verbose"])
 
@@ -443,7 +443,7 @@ def test_status_quiet_no_output_when_clean(
         register_test_stage(_helper_process, name="process")
 
         # Run once to cache
-        executor.run(show_output=False)
+        executor.run()
 
         result = runner.invoke(cli.cli, ["--quiet", "status"])
 
@@ -479,7 +479,7 @@ def test_status_quiet_exits_1_when_modified(
         register_test_stage(_helper_process, name="process")
 
         # Run to cache
-        executor.run(show_output=False)
+        executor.run()
 
         # Modify input file
         pathlib.Path("input.txt").write_text("modified data")
@@ -618,7 +618,7 @@ def test_status_explain_shows_code_changes(
         pathlib.Path("input.txt").write_text("data")
 
         register_test_stage(_helper_process_v1, name="process")
-        executor.run(show_output=False)
+        executor.run()
 
         REGISTRY._stages.clear()
         register_test_stage(_helper_process_v2, name="process")
@@ -731,7 +731,7 @@ def test_status_upstream_propagation(
         register_test_stage(_upstream_stage_a_v1, name="stage_a")
         register_test_stage(_upstream_stage_b, name="stage_b")
 
-        executor.run(show_output=False)
+        executor.run()
 
         # Modify stage_a's code
         REGISTRY._stages.clear()
@@ -759,7 +759,7 @@ def test_status_explain_upstream_propagation(
         register_test_stage(_upstream_stage_a_v1, name="stage_a")
         register_test_stage(_upstream_stage_b, name="stage_b")
 
-        executor.run(show_output=False)
+        executor.run()
 
         # Modify stage_a's code
         REGISTRY._stages.clear()
@@ -784,7 +784,7 @@ def test_status_explain_json_upstream_propagation(
         register_test_stage(_upstream_stage_a_v1, name="stage_a")
         register_test_stage(_upstream_stage_b, name="stage_b")
 
-        executor.run(show_output=False)
+        executor.run()
 
         # Modify stage_a's code
         REGISTRY._stages.clear()
