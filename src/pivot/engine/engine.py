@@ -17,6 +17,7 @@ import anyio
 import anyio.to_thread
 
 from pivot import config, dag, parameters, project
+from pivot.engine import agent_rpc
 from pivot.engine import graph as engine_graph
 from pivot.engine.types import (
     CodeOrConfigChanged,
@@ -73,6 +74,7 @@ class Engine:
     _state: EngineState
     _sources: list[EventSource]
     _sinks: list[EventSink]
+    _event_buffer: agent_rpc.EventBuffer
     _input_send: MemoryObjectSendStream[InputEvent] | None
     _input_recv: MemoryObjectReceiveStream[InputEvent] | None
     _output_send: MemoryObjectSendStream[OutputEvent] | None
@@ -111,6 +113,7 @@ class Engine:
         self._state = EngineState.IDLE
         self._sources = list[EventSource]()
         self._sinks = list[EventSink]()
+        self._event_buffer = agent_rpc.EventBuffer(max_events=1000)
 
         # Channels created on __aenter__
         self._input_send = None
@@ -263,8 +266,8 @@ class Engine:
             tg.cancel_scope.cancel()
 
         # Mark as completed to prevent re-use (channels are closed, state is inconsistent)
-        if exit_on_completion:
-            self._run_completed = True
+        # This applies regardless of exit_on_completion since channels are always closed
+        self._run_completed = True
 
     async def _run_source_with_cleanup(
         self,

@@ -5,14 +5,22 @@ Tests E2E flow: socket creation, status queries, event broadcast.
 
 from __future__ import annotations
 
+import json
+import os
+import signal
+import socket
+import subprocess
+import time
 from typing import TYPE_CHECKING
 
 import anyio
 import pytest
 
-from helpers import register_test_stage
-from pivot.engine.agent_rpc import AgentEventSink, AgentRpcHandler, AgentRpcSource
+from helpers import register_test_stage, wait_for_socket
+from pivot import config
+from pivot.engine.agent_rpc import AgentRpcHandler, AgentRpcSource, EventSink
 from pivot.engine.engine import Engine
+from pivot.engine.sources import OneShotSource
 
 if TYPE_CHECKING:
     import pathlib
@@ -24,16 +32,6 @@ if TYPE_CHECKING:
 def _helper_noop(params: None) -> dict[str, str]:
     """No-op stage for testing."""
     return {"result": "ok"}
-
-
-async def _wait_for_socket(socket_path: pathlib.Path, timeout_seconds: float = 5.0) -> None:
-    """Wait for Unix socket to be created, polling every 100ms."""
-    iterations = int(timeout_seconds / 0.1)
-    for _ in range(iterations):
-        if socket_path.exists():
-            return
-        await anyio.sleep(0.1)
-    raise TimeoutError(f"Socket {socket_path} not created within {timeout_seconds}s")
 
 
 # =============================================================================
@@ -55,7 +53,6 @@ async def test_socket_creation_and_permissions(
     test_pipeline: Pipeline,
 ) -> None:
     """AgentRpcSource creates socket with correct permissions."""
-    from pivot import config
 
     monkeypatch.setattr(config, "get_cache_dir", lambda: tmp_path / "cache")
     monkeypatch.setattr(config, "get_state_dir", lambda: tmp_path / "state")
@@ -77,7 +74,7 @@ async def test_socket_creation_and_permissions(
             tg.start_soon(run_engine)
 
             # Wait for socket to be created
-            await _wait_for_socket(socket_path)
+            await wait_for_socket(socket_path)
 
             # Check permissions (owner-only)
             mode = socket_path.stat().st_mode
@@ -87,14 +84,14 @@ async def test_socket_creation_and_permissions(
 
 
 # =============================================================================
-# AgentEventSink Integration Tests
+# EventSink Integration Tests
 # =============================================================================
 
 
 @pytest.mark.anyio
 async def test_event_sink_broadcasts_to_multiple_subscribers() -> None:
-    """AgentEventSink broadcasts events to all subscribers."""
-    sink = AgentEventSink()
+    """EventSink broadcasts events to all subscribers."""
+    sink = EventSink()
 
     recv1 = await sink.subscribe("client1")
     recv2 = await sink.subscribe("client2")
@@ -112,8 +109,9 @@ async def test_event_sink_broadcasts_to_multiple_subscribers() -> None:
     event1 = recv1.receive_nowait()
     event2 = recv2.receive_nowait()
 
-    assert event1["stage"] == "test"  # pyright: ignore[reportGeneralTypeIssues]
-    assert event2["stage"] == "test"  # pyright: ignore[reportGeneralTypeIssues]
+    # Type narrow using discriminated union on "type" field
+    assert event1["type"] == "stage_started" and event1["stage"] == "test"
+    assert event2["type"] == "stage_started" and event2["stage"] == "test"
 
     await sink.close()
 
@@ -121,7 +119,7 @@ async def test_event_sink_broadcasts_to_multiple_subscribers() -> None:
 @pytest.mark.anyio
 async def test_unsubscribe_stops_event_delivery() -> None:
     """Unsubscribed clients stop receiving events."""
-    sink = AgentEventSink()
+    sink = EventSink()
 
     recv = await sink.subscribe("client")
 
@@ -154,10 +152,10 @@ async def test_agent_rpc_handler_status_query(test_pipeline: Pipeline) -> None:
         handler = AgentRpcHandler(engine=engine)
 
         result = await handler.handle_query("status")
-        # Type narrowing: result is QueryStatusResult based on "state" query
-        assert result["state"] == "idle"  # pyright: ignore[reportGeneralTypeIssues]
-        assert result["running"] == []  # pyright: ignore[reportGeneralTypeIssues]
-        assert result["pending"] == []  # pyright: ignore[reportGeneralTypeIssues]
+        # Type narrow by checking for "state" key (discriminates QueryStatusResult from other types)
+        assert "state" in result and result["state"] == "idle"
+        assert "running" in result and result["running"] == []
+        assert "pending" in result and result["pending"] == []
 
 
 @pytest.mark.anyio
@@ -216,9 +214,6 @@ async def test_socket_handles_chunked_messages(
     test_pipeline: Pipeline,
 ) -> None:
     """AgentRpcSource correctly reassembles messages split across chunks."""
-    import json
-
-    from pivot import config
 
     monkeypatch.setattr(config, "get_cache_dir", lambda: tmp_path / "cache")
     monkeypatch.setattr(config, "get_state_dir", lambda: tmp_path / "state")
@@ -239,7 +234,7 @@ async def test_socket_handles_chunked_messages(
             tg.start_soon(run_engine)
 
             # Wait for socket to be created
-            await _wait_for_socket(socket_path)
+            await wait_for_socket(socket_path)
 
             # Connect and send a request in multiple chunks
             async with await anyio.connect_unix(str(socket_path)) as conn:
@@ -299,7 +294,6 @@ class _CollectingSink:
 @pytest.mark.anyio
 async def test_sink_error_does_not_crash_engine(test_pipeline: Pipeline) -> None:
     """Errors in sink.handle() are logged but don't crash the engine."""
-    from pivot.engine.sources import OneShotSource
 
     collecting_sink = _CollectingSink()
 
@@ -336,15 +330,9 @@ def test_serve_mode_cli_responds_to_status_query(
     """E2E test: pivot run --watch --serve creates working RPC endpoint.
 
     This test verifies the complete CLI integration - that _run_serve_mode
-    correctly wires up AgentRpcHandler and AgentEventSink. Without this test,
+    correctly wires up AgentRpcHandler and EventSink. Without this test,
     we caught bugs where components worked individually but weren't connected.
     """
-    import json
-    import os
-    import signal
-    import socket
-    import subprocess
-    import time
 
     # Create minimal project structure with a valid pipeline
     (tmp_path / ".git").mkdir()
@@ -446,9 +434,6 @@ async def test_rpc_source_without_handler_returns_method_not_found(
     The fix: _run_serve_mode must create AgentRpcHandler and pass it to
     AgentRpcSource(socket_path=socket_path, handler=handler).
     """
-    import json
-
-    from pivot import config
 
     monkeypatch.setattr(config, "get_cache_dir", lambda: tmp_path / "cache")
     monkeypatch.setattr(config, "get_state_dir", lambda: tmp_path / "state")
@@ -467,7 +452,7 @@ async def test_rpc_source_without_handler_returns_method_not_found(
                 await engine.run(exit_on_completion=False)
 
             tg.start_soon(run_engine)
-            await _wait_for_socket(socket_path)
+            await wait_for_socket(socket_path)
 
             # Connect and send status query
             async with await anyio.connect_unix(str(socket_path)) as conn:
@@ -494,9 +479,6 @@ async def test_rpc_source_with_handler_returns_status(
 
     This is the correct behavior - when handler is provided, status queries work.
     """
-    import json
-
-    from pivot import config
 
     monkeypatch.setattr(config, "get_cache_dir", lambda: tmp_path / "cache")
     monkeypatch.setattr(config, "get_state_dir", lambda: tmp_path / "state")
@@ -515,7 +497,7 @@ async def test_rpc_source_with_handler_returns_status(
                 await engine.run(exit_on_completion=False)
 
             tg.start_soon(run_engine)
-            await _wait_for_socket(socket_path)
+            await wait_for_socket(socket_path)
 
             # Connect and send status query
             async with await anyio.connect_unix(str(socket_path)) as conn:
@@ -530,3 +512,111 @@ async def test_rpc_source_with_handler_returns_status(
                 assert response["result"]["state"] in ("idle", "active")
 
             tg.cancel_scope.cancel()
+
+
+# =============================================================================
+# EventBuffer Integration Tests
+# =============================================================================
+
+
+@pytest.mark.anyio
+async def test_event_buffer_integration_with_engine(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    test_pipeline: Pipeline,
+) -> None:
+    """EventBuffer correctly captures events from engine execution.
+
+    Integration: Verifies buffer is wired as sink and receives events.
+    """
+    from pivot import config
+    from pivot.engine.agent_rpc import EventBuffer
+    from pivot.engine.sources import OneShotSource
+
+    monkeypatch.setattr(config, "get_cache_dir", lambda: tmp_path / "cache")
+    monkeypatch.setattr(config, "get_state_dir", lambda: tmp_path / "state")
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".git").mkdir()
+
+    register_test_stage(_helper_noop, name="test_stage")
+
+    buffer = EventBuffer(max_events=100)
+
+    async with Engine(pipeline=test_pipeline) as engine:
+        engine.add_sink(buffer)
+        source = OneShotSource(stages=None, force=True, reason="test")
+        engine.add_source(source)
+
+        await engine.run(exit_on_completion=True)
+
+    # Buffer should have captured events
+    result = buffer.events_since(0)
+    assert result["version"] > 0, "Buffer should have recorded events"
+    assert len(result["events"]) > 0, "Buffer should contain events from execution"
+
+    # Check for expected event types
+    event_types = [e["event"]["type"] for e in result["events"]]
+    assert "engine_state_changed" in event_types
+
+
+@pytest.mark.anyio
+async def test_event_buffer_polling_during_execution(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    test_pipeline: Pipeline,
+) -> None:
+    """EventBuffer allows polling events_since during execution.
+
+    Integration: Simulates client polling while engine is running.
+    """
+    import time
+
+    from pivot import config
+    from pivot.engine.agent_rpc import EventBuffer
+    from pivot.engine.sources import OneShotSource
+
+    monkeypatch.setattr(config, "get_cache_dir", lambda: tmp_path / "cache")
+    monkeypatch.setattr(config, "get_state_dir", lambda: tmp_path / "state")
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".git").mkdir()
+
+    def _slow_stage(params: None) -> dict[str, str]:
+        """Stage that takes time to execute."""
+        time.sleep(0.2)
+        return {"result": "done"}
+
+    register_test_stage(_slow_stage, name="slow_stage")
+
+    buffer = EventBuffer(max_events=100)
+    versions_seen = list[int]()
+
+    async def poll_buffer() -> None:
+        """Simulate client polling every 50ms."""
+        last_version = 0
+        for _ in range(10):
+            await anyio.sleep(0.05)
+            result = buffer.events_since(last_version)
+            if result["version"] > last_version:
+                versions_seen.append(result["version"])
+                last_version = result["version"]
+
+    async with Engine(pipeline=test_pipeline) as engine:
+        engine.add_sink(buffer)
+        source = OneShotSource(stages=None, force=True, reason="test")
+        engine.add_source(source)
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(poll_buffer)
+
+            async def run_engine() -> None:
+                await engine.run(exit_on_completion=True)
+
+            tg.start_soon(run_engine)
+
+    # Should have seen multiple version updates during execution
+    assert len(versions_seen) > 0, "Polling should capture events during execution"
+
+
+# =============================================================================
+# Error Handling Edge Cases
+# =============================================================================
