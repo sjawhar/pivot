@@ -16,10 +16,12 @@ from typing import TYPE_CHECKING, Annotated, TypedDict
 import pytest
 
 from helpers import register_test_stage
-from pivot import executor, loaders, outputs, registry
+from pivot import executor, loaders, outputs
 
 if TYPE_CHECKING:
     import click.testing
+
+    from pivot.pipeline.pipeline import Pipeline
 
 
 class _SingleFileOutResult(TypedDict):
@@ -51,7 +53,7 @@ def _assert_file_content(path: pathlib.Path, expected: dict[str, int | bool]) ->
 
 
 def test_missing_file_restored_on_cache_hit(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, test_pipeline: Pipeline
 ) -> None:
     """Cache has file. Workspace missing file. Expected: Restore file.
 
@@ -65,7 +67,7 @@ def test_missing_file_restored_on_cache_hit(
 
         # First run - creates and caches file
         register_test_stage(_stage_produces_single_file_with_marker, name="produce")
-        executor.run()
+        executor.run(pipeline=test_pipeline)
 
         output_file = pathlib.Path("output.json")
         assert output_file.exists()
@@ -77,7 +79,7 @@ def test_missing_file_restored_on_cache_hit(
         assert not output_file.exists(), "File should be deleted"
 
         # Second run - should skip and restore from cache
-        executor.run()
+        executor.run(pipeline=test_pipeline)
 
         # Verify: stage did NOT re-run (counter still 1)
         assert _get_run_count() == 1, "Stage should have skipped, not re-run"
@@ -95,7 +97,10 @@ def test_missing_file_restored_on_cache_hit(
     ],
 )
 def test_corrupted_file_restored_on_cache_hit(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path, unlink_before_corrupt: bool
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    unlink_before_corrupt: bool,
+    test_pipeline: Pipeline,
 ) -> None:
     """Cache has correct file. Workspace has corrupted file. Expected: Restore correct file.
 
@@ -112,7 +117,7 @@ def test_corrupted_file_restored_on_cache_hit(
 
         # First run - creates and caches file
         register_test_stage(_stage_produces_single_file_with_marker, name="produce")
-        executor.run()
+        executor.run(pipeline=test_pipeline)
 
         output_file = pathlib.Path("output.json")
         assert output_file.exists()
@@ -131,7 +136,7 @@ def test_corrupted_file_restored_on_cache_hit(
         _assert_file_content(output_file, {"corrupted": True})
 
         # Second run - should skip and restore correct content
-        executor.run()
+        executor.run(pipeline=test_pipeline)
 
         # Verify: stage did NOT re-run
         assert _get_run_count() == 1, "Stage should have skipped, not re-run"
@@ -141,7 +146,7 @@ def test_corrupted_file_restored_on_cache_hit(
 
 
 def test_corrupted_file_triggers_rerun_when_cache_empty(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, test_pipeline: Pipeline
 ) -> None:
     """Cache empty, workspace has corrupted file. Expected: Re-run stage.
 
@@ -157,7 +162,7 @@ def test_corrupted_file_triggers_rerun_when_cache_empty(
 
         # First run - creates and caches file
         register_test_stage(_stage_produces_single_file_with_marker, name="produce")
-        executor.run()
+        executor.run(pipeline=test_pipeline)
 
         output_file = pathlib.Path("output.json")
         assert output_file.exists()
@@ -175,7 +180,7 @@ def test_corrupted_file_triggers_rerun_when_cache_empty(
         output_file.write_text('{"corrupted": true}')
 
         # Second run - should RE-RUN because cache can't restore
-        executor.run()
+        executor.run(pipeline=test_pipeline)
 
         # Verify: stage DID re-run (counter is now 2)
         assert _get_run_count() == 2, "Stage should have re-run when cache is empty"
@@ -185,7 +190,7 @@ def test_corrupted_file_triggers_rerun_when_cache_empty(
 
 
 def test_perfect_match_skips_without_modification(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, test_pipeline: Pipeline
 ) -> None:
     """Cache and workspace are identical. Expected: Skip without touching file.
 
@@ -198,7 +203,7 @@ def test_perfect_match_skips_without_modification(
 
         # First run - creates and caches file
         register_test_stage(_stage_produces_single_file_with_marker, name="produce")
-        executor.run()
+        executor.run(pipeline=test_pipeline)
 
         output_file = pathlib.Path("output.json")
         assert output_file.exists()
@@ -206,7 +211,7 @@ def test_perfect_match_skips_without_modification(
         assert _get_run_count() == 1
 
         # Second run - should skip
-        executor.run()
+        executor.run(pipeline=test_pipeline)
 
         # Verify: stage did NOT re-run
         assert _get_run_count() == 1, "Stage should have skipped"
@@ -216,7 +221,7 @@ def test_perfect_match_skips_without_modification(
 
 
 def test_invalid_json_in_corrupted_file_handled_gracefully(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, test_pipeline: Pipeline
 ) -> None:
     """Corrupted file with invalid JSON is detected and restored.
 
@@ -233,7 +238,7 @@ def test_invalid_json_in_corrupted_file_handled_gracefully(
 
         # First run - creates and caches file
         register_test_stage(_stage_produces_single_file_with_marker, name="produce")
-        executor.run()
+        executor.run(pipeline=test_pipeline)
 
         output_file = pathlib.Path("output.json")
         assert output_file.exists()
@@ -245,7 +250,7 @@ def test_invalid_json_in_corrupted_file_handled_gracefully(
         output_file.write_text('{"invalid": json content missing closing brace')
 
         # Second run - should skip and restore (not crash)
-        executor.run()
+        executor.run(pipeline=test_pipeline)
 
         # Verify: stage did NOT re-run
         assert _get_run_count() == 1, "Stage should have skipped, not re-run"
@@ -255,7 +260,7 @@ def test_invalid_json_in_corrupted_file_handled_gracefully(
 
 
 def test_cache_files_are_readonly_and_properly_structured(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, test_pipeline: Pipeline
 ) -> None:
     """Verify cache files are created read-only with correct hash structure.
 
@@ -269,7 +274,7 @@ def test_cache_files_are_readonly_and_properly_structured(
 
         # Run pipeline to cache file
         register_test_stage(_stage_produces_single_file_with_marker, name="produce")
-        executor.run()
+        executor.run(pipeline=test_pipeline)
 
         output_file = pathlib.Path("output.json")
         assert output_file.exists()
@@ -316,7 +321,7 @@ def _stage_fails_after_partial_write() -> _FailingStageResult:
 
 
 def test_stage_failure_leaves_workspace_consistent(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, test_pipeline: Pipeline
 ) -> None:
     """Stage failure after partial write leaves workspace consistent.
 
@@ -333,7 +338,7 @@ def test_stage_failure_leaves_workspace_consistent(
         register_test_stage(_stage_fails_after_partial_write, name="failing")
 
         # First run - should complete but stage fails
-        executor.run()
+        executor.run(pipeline=test_pipeline)
 
         output_file = pathlib.Path("output.json")
 
@@ -347,11 +352,11 @@ def test_stage_failure_leaves_workspace_consistent(
             output_file.unlink()
 
         # Register successful stage (clear registry first to allow re-registration)
-        registry.REGISTRY.clear()
+        test_pipeline.clear()
         register_test_stage(_stage_produces_single_file_with_marker, name="failing")
 
         # Second run - should succeed
-        executor.run()
+        executor.run(pipeline=test_pipeline)
 
         # Verify success
         assert output_file.exists()

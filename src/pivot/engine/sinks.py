@@ -266,16 +266,10 @@ class WatchSink:
             with contextlib.suppress(queue.Full):
                 self._queue.put_nowait(restart_msg)
 
-            # Import registry here to avoid circular import
-            from pivot import registry
-
             # Send reload notification with stage list and changes
-            # Use blocking put with timeout for reload_msg - more important than restart_msg,
-            # but still acceptable to drop if queue stays full for 1s (unlikely in practice)
-            new_stages = list(registry.REGISTRY.list_stages())
             reload_msg = TuiReloadMessage(
                 type=TuiMessageType.RELOAD,
-                stages=new_stages,
+                stages=event["stages"],
                 stages_added=event["stages_added"],
                 stages_removed=event["stages_removed"],
                 stages_modified=event["stages_modified"],

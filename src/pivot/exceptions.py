@@ -372,3 +372,11 @@ class AlreadyInitializedError(InitError):
     @override
     def get_suggestion(self) -> str:
         return "Use --force to reinitialize"
+
+
+class PipelineNotFoundError(PivotError):
+    """Raised when no pipeline is found (no pivot.yaml or pipeline.py)."""
+
+    @override
+    def get_suggestion(self) -> str:
+        return "Create pivot.yaml or pipeline.py to define your pipeline"

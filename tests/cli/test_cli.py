@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Annotated, TypedDict
 import pandas  # noqa: TC002 - needed for type hint resolution
 
 from helpers import register_test_stage
-from pivot import cli, executor, loaders, outputs
+from pivot import cli, loaders, outputs
 from pivot.tui import console
 
 if TYPE_CHECKING:
@@ -123,12 +123,12 @@ def test_cli_run_help(runner: CliRunner) -> None:
 
 
 def test_cli_run_no_stages_registered(runner: CliRunner, tmp_path: pathlib.Path) -> None:
-    """Run with no stages should report empty pipeline."""
+    """Run with no stages should error when no pipeline found."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         (pathlib.Path.cwd() / ".git").mkdir()
         result = runner.invoke(cli.cli, ["run"])
-        assert result.exit_code == 0
-        assert "No stages to run" in result.output
+        assert result.exit_code != 0
+        assert "pipeline" in result.output.lower() or "no pipeline" in result.output
 
 
 def test_cli_verbose_accepted(runner: CliRunner) -> None:
@@ -144,7 +144,8 @@ def test_cli_list_command_exists(runner: CliRunner) -> None:
 
 
 def test_cli_list_shows_registered_stages(
-    runner: CliRunner, set_project_root: pathlib.Path
+    runner: CliRunner,
+    mock_discovery: object,  # type: ignore[type-arg]
 ) -> None:
     """List should show registered stages."""
     register_test_stage(_stage_my_stage, name="my_stage")
@@ -154,7 +155,10 @@ def test_cli_list_shows_registered_stages(
     assert "my_stage" in result.output
 
 
-def test_cli_list_verbose_shows_details(runner: CliRunner, set_project_root: pathlib.Path) -> None:
+def test_cli_list_verbose_shows_details(
+    runner: CliRunner,
+    mock_discovery: object,  # type: ignore[type-arg]
+) -> None:
     """List --verbose should show deps and outputs."""
     register_test_stage(_stage_with_input, name="my_stage")
 
@@ -176,7 +180,26 @@ def test_cli_dry_run_shows_what_would_run(runner: CliRunner, tmp_path: pathlib.P
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
 
-        register_test_stage(_stage_process, name="process")
+        pathlib.Path("pipeline.py").write_text("""\
+from __future__ import annotations
+import pathlib
+from typing import Annotated, TypedDict
+from pivot import loaders, outputs
+from pivot.pipeline.pipeline import Pipeline
+
+pipeline = Pipeline('test')
+
+class _OutputTxtOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
+
+def process(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _OutputTxtOutputs:
+    _ = input_file
+    return {"output": pathlib.Path("output.txt")}
+
+pipeline.register(process)
+""")
 
         result = runner.invoke(cli.cli, ["run", "--dry-run"])
 
@@ -192,10 +215,31 @@ def test_cli_dry_run_shows_unchanged_as_skip(runner: CliRunner, tmp_path: pathli
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
 
-        register_test_stage(_stage_process_creates_file, name="process")
+        pathlib.Path("pipeline.py").write_text("""\
+from __future__ import annotations
+import pathlib
+from typing import Annotated, TypedDict
+from pivot import loaders, outputs
+from pivot.pipeline.pipeline import Pipeline
+
+pipeline = Pipeline('test')
+
+class _OutputTxtOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
+
+def process(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _OutputTxtOutputs:
+    _ = input_file
+    pathlib.Path("output.txt").write_text("done")
+    return {"output": pathlib.Path("output.txt")}
+
+pipeline.register(process)
+""")
 
         # First, actually run to create lock file
-        executor.run()
+        result1 = runner.invoke(cli.cli, ["run"])
+        assert result1.exit_code == 0, f"First run failed: {result1.output}"
 
         # Now dry-run should show as unchanged
         result = runner.invoke(cli.cli, ["run", "--dry-run"])
@@ -211,10 +255,31 @@ def test_cli_force_dry_run_shows_forced(runner: CliRunner, tmp_path: pathlib.Pat
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
 
-        register_test_stage(_stage_process_creates_file, name="process")
+        pathlib.Path("pipeline.py").write_text("""\
+from __future__ import annotations
+import pathlib
+from typing import Annotated, TypedDict
+from pivot import loaders, outputs
+from pivot.pipeline.pipeline import Pipeline
+
+pipeline = Pipeline('test')
+
+class _OutputTxtOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
+
+def process(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _OutputTxtOutputs:
+    _ = input_file
+    pathlib.Path("output.txt").write_text("done")
+    return {"output": pathlib.Path("output.txt")}
+
+pipeline.register(process)
+""")
 
         # First, actually run to create lock file
-        executor.run()
+        result1 = runner.invoke(cli.cli, ["run"])
+        assert result1.exit_code == 0, f"First run failed: {result1.output}"
 
         # Now dry-run with --force should show as 'would run (forced)'
         result = runner.invoke(cli.cli, ["run", "--dry-run", "--force"])
@@ -231,7 +296,26 @@ def test_cli_dry_run_missing_deps_errors(runner: CliRunner, tmp_path: pathlib.Pa
         pathlib.Path(".git").mkdir()
         # Don't create input.txt - it's missing and not produced by any stage
 
-        register_test_stage(_stage_missing_input, name="process")
+        pathlib.Path("pipeline.py").write_text("""\
+from __future__ import annotations
+import pathlib
+from typing import Annotated, TypedDict
+from pivot import loaders, outputs
+from pivot.pipeline.pipeline import Pipeline
+
+pipeline = Pipeline('test')
+
+class _OutputTxtOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
+
+def process(
+    missing_input: Annotated[pathlib.Path, outputs.Dep("missing_input.txt", loaders.PathOnly())],
+) -> _OutputTxtOutputs:
+    _ = missing_input
+    return {"output": pathlib.Path("output.txt")}
+
+pipeline.register(process)
+""")
 
         result = runner.invoke(cli.cli, ["run", "--dry-run"])
 
@@ -245,6 +329,14 @@ def test_cli_dry_run_no_stages(runner: CliRunner, tmp_path: pathlib.Path) -> Non
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
 
+        # Create empty pipeline
+        pathlib.Path("pipeline.py").write_text("""\
+from __future__ import annotations
+from pivot.pipeline.pipeline import Pipeline
+
+pipeline = Pipeline('test')
+""")
+
         result = runner.invoke(cli.cli, ["run", "--dry-run"])
 
         assert result.exit_code == 0
@@ -257,8 +349,36 @@ def test_cli_dry_run_specific_stage(runner: CliRunner, tmp_path: pathlib.Path) -
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
 
-        register_test_stage(_stage_a, name="stage_a")
-        register_test_stage(_stage_b, name="stage_b")
+        pathlib.Path("pipeline.py").write_text("""\
+from __future__ import annotations
+import pathlib
+from typing import Annotated, TypedDict
+from pivot import loaders, outputs
+from pivot.pipeline.pipeline import Pipeline
+
+pipeline = Pipeline('test')
+
+class _ATxtOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("a.txt", loaders.PathOnly())]
+
+class _BTxtOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("b.txt", loaders.PathOnly())]
+
+def stage_a(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _ATxtOutputs:
+    _ = input_file
+    return {"output": pathlib.Path("a.txt")}
+
+def stage_b(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _BTxtOutputs:
+    _ = input_file
+    return {"output": pathlib.Path("b.txt")}
+
+pipeline.register(stage_a)
+pipeline.register(stage_b)
+""")
 
         result = runner.invoke(cli.cli, ["run", "--dry-run", "stage_a"])
 
@@ -273,9 +393,28 @@ def test_cli_dry_run_json_output(runner: CliRunner, tmp_path: pathlib.Path) -> N
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
 
-        register_test_stage(_stage_process, name="process")
+        pathlib.Path("pipeline.py").write_text("""\
+from __future__ import annotations
+import pathlib
+from typing import Annotated, TypedDict
+from pivot import loaders, outputs
+from pivot.pipeline.pipeline import Pipeline
 
-        result = runner.invoke(cli.cli, ["run", "--dry-run", "--json"])
+pipeline = Pipeline('test')
+
+class _OutputTxtOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
+
+def process(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _OutputTxtOutputs:
+    _ = input_file
+    return {"output": pathlib.Path("output.txt")}
+
+pipeline.register(process)
+""")
+
+        result = runner.invoke(cli.cli, ["--quiet", "run", "--dry-run", "--json"])
 
         assert result.exit_code == 0
         data = json.loads(result.output)
@@ -290,7 +429,15 @@ def test_cli_dry_run_json_empty_pipeline(runner: CliRunner, tmp_path: pathlib.Pa
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
 
-        result = runner.invoke(cli.cli, ["run", "--dry-run", "--json"])
+        # Create empty pipeline
+        pathlib.Path("pipeline.py").write_text("""\
+from __future__ import annotations
+from pivot.pipeline.pipeline import Pipeline
+
+pipeline = Pipeline('test')
+""")
+
+        result = runner.invoke(cli.cli, ["--quiet", "run", "--dry-run", "--json"])
 
         assert result.exit_code == 0
         data = json.loads(result.output)
@@ -303,13 +450,34 @@ def test_cli_dry_run_json_with_force(runner: CliRunner, tmp_path: pathlib.Path) 
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
 
-        register_test_stage(_stage_process_creates_file, name="process")
+        pathlib.Path("pipeline.py").write_text("""\
+from __future__ import annotations
+import pathlib
+from typing import Annotated, TypedDict
+from pivot import loaders, outputs
+from pivot.pipeline.pipeline import Pipeline
+
+pipeline = Pipeline('test')
+
+class _OutputTxtOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
+
+def process(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _OutputTxtOutputs:
+    _ = input_file
+    pathlib.Path("output.txt").write_text("done")
+    return {"output": pathlib.Path("output.txt")}
+
+pipeline.register(process)
+""")
 
         # First, actually run to create lock file
-        executor.run()
+        result1 = runner.invoke(cli.cli, ["run"])
+        assert result1.exit_code == 0, f"First run failed: {result1.output}"
 
-        # Now dry-run with --force --json
-        result = runner.invoke(cli.cli, ["run", "--dry-run", "--force", "--json"])
+        # Now dry-run with --force --json (--quiet to suppress logging)
+        result = runner.invoke(cli.cli, ["--quiet", "run", "--dry-run", "--force", "--json"])
 
         assert result.exit_code == 0
         data = json.loads(result.output)
@@ -356,7 +524,27 @@ def test_cli_run_prints_results(runner: CliRunner, tmp_path: pathlib.Path) -> No
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
 
-        register_test_stage(_stage_my_stage_with_input, name="my_stage")
+        pathlib.Path("pipeline.py").write_text("""\
+from __future__ import annotations
+import pathlib
+from typing import Annotated, TypedDict
+from pivot import loaders, outputs
+from pivot.pipeline.pipeline import Pipeline
+
+pipeline = Pipeline('test')
+
+class _OutputTxtOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
+
+def my_stage(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _OutputTxtOutputs:
+    _ = input_file
+    pathlib.Path("output.txt").write_text("done")
+    return {"output": pathlib.Path("output.txt")}
+
+pipeline.register(my_stage)
+""")
 
         result = runner.invoke(cli.cli, ["run"])
 
@@ -372,7 +560,27 @@ def test_cli_run_prints_skipped_stages(runner: CliRunner, tmp_path: pathlib.Path
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
 
-        register_test_stage(_stage_my_stage_with_input, name="my_stage")
+        pathlib.Path("pipeline.py").write_text("""\
+from __future__ import annotations
+import pathlib
+from typing import Annotated, TypedDict
+from pivot import loaders, outputs
+from pivot.pipeline.pipeline import Pipeline
+
+pipeline = Pipeline('test')
+
+class _OutputTxtOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
+
+def my_stage(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _OutputTxtOutputs:
+    _ = input_file
+    pathlib.Path("output.txt").write_text("done")
+    return {"output": pathlib.Path("output.txt")}
+
+pipeline.register(my_stage)
+""")
 
         # First run via CLI
         result1 = runner.invoke(cli.cli, ["run"])
@@ -394,12 +602,23 @@ def test_cli_run_prints_skipped_stages(runner: CliRunner, tmp_path: pathlib.Path
 # =============================================================================
 
 
-def test_cli_list_no_stages(runner: CliRunner) -> None:
+def test_cli_list_no_stages(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """List with no stages shows appropriate message."""
-    result = runner.invoke(cli.cli, ["list"])
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
 
-    assert result.exit_code == 0
-    assert "No stages registered" in result.output
+        # Create empty pipeline
+        pathlib.Path("pipeline.py").write_text("""\
+from __future__ import annotations
+from pivot.pipeline.pipeline import Pipeline
+
+pipeline = Pipeline('test')
+""")
+
+        result = runner.invoke(cli.cli, ["list"])
+
+        assert result.exit_code == 0
+        assert "No stages registered" in result.output
 
 
 # =============================================================================
@@ -451,7 +670,26 @@ def test_cli_run_unknown_stage_shows_suggestion(runner: CliRunner, tmp_path: pat
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
 
-        register_test_stage(_stage_with_input, name="my_stage")
+        pathlib.Path("pipeline.py").write_text("""\
+from __future__ import annotations
+import pathlib
+from typing import Annotated, TypedDict
+from pivot import loaders, outputs
+from pivot.pipeline.pipeline import Pipeline
+
+pipeline = Pipeline('test')
+
+class _OutputTxtOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
+
+def my_stage(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _OutputTxtOutputs:
+    _ = input_file
+    return {"output": pathlib.Path("output.txt")}
+
+pipeline.register(my_stage)
+""")
 
         result = runner.invoke(cli.cli, ["run", "nonexistent_stage"])
 
@@ -471,9 +709,29 @@ def test_cli_run_json_emits_schema_version(runner: CliRunner, tmp_path: pathlib.
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
 
-        register_test_stage(_stage_my_stage_with_input, name="my_stage")
+        pathlib.Path("pipeline.py").write_text("""\
+from __future__ import annotations
+import pathlib
+from typing import Annotated, TypedDict
+from pivot import loaders, outputs
+from pivot.pipeline.pipeline import Pipeline
 
-        result = runner.invoke(cli.cli, ["run", "--json"])
+pipeline = Pipeline('test')
+
+class _OutputTxtOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
+
+def my_stage(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _OutputTxtOutputs:
+    _ = input_file
+    pathlib.Path("output.txt").write_text("done")
+    return {"output": pathlib.Path("output.txt")}
+
+pipeline.register(my_stage)
+""")
+
+        result = runner.invoke(cli.cli, ["--quiet", "run", "--json"])
 
         assert result.exit_code == 0
         lines = [line for line in result.output.strip().split("\n") if line]
@@ -490,9 +748,29 @@ def test_cli_run_json_emits_stage_events(runner: CliRunner, tmp_path: pathlib.Pa
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
 
-        register_test_stage(_stage_my_stage_with_input, name="my_stage")
+        pathlib.Path("pipeline.py").write_text("""\
+from __future__ import annotations
+import pathlib
+from typing import Annotated, TypedDict
+from pivot import loaders, outputs
+from pivot.pipeline.pipeline import Pipeline
 
-        result = runner.invoke(cli.cli, ["run", "--json"])
+pipeline = Pipeline('test')
+
+class _OutputTxtOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
+
+def my_stage(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _OutputTxtOutputs:
+    _ = input_file
+    pathlib.Path("output.txt").write_text("done")
+    return {"output": pathlib.Path("output.txt")}
+
+pipeline.register(my_stage)
+""")
+
+        result = runner.invoke(cli.cli, ["--quiet", "run", "--json"])
 
         assert result.exit_code == 0
         events = [json.loads(line) for line in result.output.strip().split("\n") if line]
@@ -508,9 +786,29 @@ def test_cli_run_json_emits_execution_result(runner: CliRunner, tmp_path: pathli
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
 
-        register_test_stage(_stage_my_stage_with_input, name="my_stage")
+        pathlib.Path("pipeline.py").write_text("""\
+from __future__ import annotations
+import pathlib
+from typing import Annotated, TypedDict
+from pivot import loaders, outputs
+from pivot.pipeline.pipeline import Pipeline
 
-        result = runner.invoke(cli.cli, ["run", "--json"])
+pipeline = Pipeline('test')
+
+class _OutputTxtOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
+
+def my_stage(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _OutputTxtOutputs:
+    _ = input_file
+    pathlib.Path("output.txt").write_text("done")
+    return {"output": pathlib.Path("output.txt")}
+
+pipeline.register(my_stage)
+""")
+
+        result = runner.invoke(cli.cli, ["--quiet", "run", "--json"])
 
         assert result.exit_code == 0
         events = [json.loads(line) for line in result.output.strip().split("\n") if line]
@@ -528,7 +826,15 @@ def test_cli_run_json_no_stages_emits_events(runner: CliRunner, tmp_path: pathli
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
 
-        result = runner.invoke(cli.cli, ["run", "--json"])
+        # Create empty pipeline
+        pathlib.Path("pipeline.py").write_text("""\
+from __future__ import annotations
+from pivot.pipeline.pipeline import Pipeline
+
+pipeline = Pipeline('test')
+""")
+
+        result = runner.invoke(cli.cli, ["--quiet", "run", "--json"])
 
         assert result.exit_code == 0
         events = [json.loads(line) for line in result.output.strip().split("\n") if line]
@@ -546,9 +852,29 @@ def test_cli_run_json_stage_complete_has_duration(
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
 
-        register_test_stage(_stage_my_stage_with_input, name="my_stage")
+        pathlib.Path("pipeline.py").write_text("""\
+from __future__ import annotations
+import pathlib
+from typing import Annotated, TypedDict
+from pivot import loaders, outputs
+from pivot.pipeline.pipeline import Pipeline
 
-        result = runner.invoke(cli.cli, ["run", "--json"])
+pipeline = Pipeline('test')
+
+class _OutputTxtOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
+
+def my_stage(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _OutputTxtOutputs:
+    _ = input_file
+    pathlib.Path("output.txt").write_text("done")
+    return {"output": pathlib.Path("output.txt")}
+
+pipeline.register(my_stage)
+""")
+
+        result = runner.invoke(cli.cli, ["--quiet", "run", "--json"])
 
         assert result.exit_code == 0
         events = [json.loads(line) for line in result.output.strip().split("\n") if line]
@@ -582,6 +908,14 @@ def test_cli_list_quiet_produces_no_output(runner: CliRunner, tmp_path: pathlib.
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
 
+        # Create empty pipeline
+        pathlib.Path("pipeline.py").write_text("""\
+from __future__ import annotations
+from pivot.pipeline.pipeline import Pipeline
+
+pipeline = Pipeline('test')
+""")
+
         result = runner.invoke(cli.cli, ["--quiet", "list"])
 
         assert result.exit_code == 0
@@ -594,13 +928,14 @@ def test_cli_run_quiet_produces_no_output(runner: CliRunner, tmp_path: pathlib.P
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
 
-        # Create a simple pipeline using pipeline.py
-        pathlib.Path("pipeline.py").write_text(
-            """\
-from typing import Annotated, TypedDict
-from pivot.registry import REGISTRY
-from pivot import outputs, loaders
+        pathlib.Path("pipeline.py").write_text("""\
+from __future__ import annotations
 import pathlib
+from typing import Annotated, TypedDict
+from pivot import loaders, outputs
+from pivot.pipeline.pipeline import Pipeline
+
+pipeline = Pipeline('test')
 
 class _TestOutputs(TypedDict):
     output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
@@ -609,9 +944,8 @@ def test_stage() -> _TestOutputs:
     pathlib.Path("output.txt").write_text("hello")
     return {"output": pathlib.Path("output.txt")}
 
-REGISTRY.register(test_stage)
-"""
-        )
+pipeline.register(test_stage)
+""")
 
         result = runner.invoke(cli.cli, ["--quiet", "run"])
 
@@ -627,6 +961,14 @@ def test_cli_track_quiet_produces_no_output(runner: CliRunner, tmp_path: pathlib
         pathlib.Path(".git").mkdir()
         pathlib.Path("data.txt").write_text("test data")
 
+        # Create empty pipeline
+        pathlib.Path("pipeline.py").write_text("""\
+from __future__ import annotations
+from pivot.pipeline.pipeline import Pipeline
+
+pipeline = Pipeline('test')
+""")
+
         result = runner.invoke(cli.cli, ["--quiet", "track", "data.txt"])
 
         assert result.exit_code == 0
@@ -639,6 +981,15 @@ def test_cli_checkout_quiet_produces_no_output(runner: CliRunner, tmp_path: path
     """pivot --quiet checkout produces no output."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
+
+        # Create empty pipeline
+        pathlib.Path("pipeline.py").write_text("""\
+from __future__ import annotations
+from pivot.pipeline.pipeline import Pipeline
+
+pipeline = Pipeline('test')
+""")
+
         # Track a file first
         pathlib.Path("data.txt").write_text("test data")
         runner.invoke(cli.cli, ["track", "data.txt"])
@@ -659,6 +1010,14 @@ def test_cli_commit_quiet_produces_no_output(runner: CliRunner, tmp_path: pathli
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
 
+        # Create empty pipeline
+        pathlib.Path("pipeline.py").write_text("""\
+from __future__ import annotations
+from pivot.pipeline.pipeline import Pipeline
+
+pipeline = Pipeline('test')
+""")
+
         # No pending stages, but --list should still be quiet
         result = runner.invoke(cli.cli, ["--quiet", "commit", "--list"])
 
@@ -671,17 +1030,17 @@ def test_cli_export_quiet_produces_no_output(runner: CliRunner, tmp_path: pathli
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
 
-        # Create a simple pipeline using pipeline.py
-        pathlib.Path("pipeline.py").write_text(
-            """\
-from pivot.registry import REGISTRY
+        pathlib.Path("pipeline.py").write_text("""\
+from __future__ import annotations
+from pivot.pipeline.pipeline import Pipeline
 
-def test_stage():
+pipeline = Pipeline('test')
+
+def test_stage() -> None:
     pass
 
-REGISTRY.register(test_stage)
-"""
-        )
+pipeline.register(test_stage)
+""")
 
         result = runner.invoke(cli.cli, ["--quiet", "export"])
 
@@ -725,7 +1084,27 @@ def test_cli_run_metrics_env_var(runner: CliRunner, tmp_path: pathlib.Path) -> N
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
 
-        register_test_stage(_stage_my_stage_with_input, name="my_stage")
+        pathlib.Path("pipeline.py").write_text("""\
+from __future__ import annotations
+import pathlib
+from typing import Annotated, TypedDict
+from pivot import loaders, outputs
+from pivot.pipeline.pipeline import Pipeline
+
+pipeline = Pipeline('test')
+
+class _OutputTxtOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
+
+def my_stage(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _OutputTxtOutputs:
+    _ = input_file
+    pathlib.Path("output.txt").write_text("done")
+    return {"output": pathlib.Path("output.txt")}
+
+pipeline.register(my_stage)
+""")
 
         result = runner.invoke(cli.cli, ["run"], env={"PIVOT_METRICS": "1"})
 
@@ -742,9 +1121,60 @@ def test_cli_run_no_metrics_by_default(runner: CliRunner, tmp_path: pathlib.Path
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
 
-        register_test_stage(_stage_my_stage_with_input, name="my_stage")
+        pathlib.Path("pipeline.py").write_text("""\
+from __future__ import annotations
+import pathlib
+from typing import Annotated, TypedDict
+from pivot import loaders, outputs
+from pivot.pipeline.pipeline import Pipeline
+
+pipeline = Pipeline('test')
+
+class _OutputTxtOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
+
+def my_stage(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _OutputTxtOutputs:
+    _ = input_file
+    pathlib.Path("output.txt").write_text("done")
+    return {"output": pathlib.Path("output.txt")}
+
+pipeline.register(my_stage)
+""")
 
         result = runner.invoke(cli.cli, ["run"])
 
         assert result.exit_code == 0
         assert "Metrics:" not in result.output
+
+
+def test_cli_run_unknown_stage_in_empty_pipeline_shows_error(
+    runner: CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """Running unknown stage in empty pipeline shows clear error.
+
+    Edge case: combines two error conditions (no stages + unknown target).
+    Should prioritize the stage-not-found error with helpful suggestion.
+    """
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+
+        # Create empty pipeline
+        pathlib.Path("pipeline.py").write_text("""\
+from __future__ import annotations
+from pivot.pipeline.pipeline import Pipeline
+
+pipeline = Pipeline('test')
+""")
+
+        result = runner.invoke(cli.cli, ["run", "nonexistent_stage"])
+
+        assert result.exit_code != 0
+        assert "nonexistent_stage" in result.output
+        # Should suggest listing stages or note that no stages are registered
+        assert (
+            "pivot list" in result.output
+            or "No stages" in result.output
+            or "not found" in result.output.lower()
+        ), f"Got: {result.output}"

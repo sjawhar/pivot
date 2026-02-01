@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Literal, TypedDict
 
 import loky
 
-from pivot import config, exceptions, outputs, parameters, registry
+from pivot import config, discovery, exceptions, outputs, parameters
 from pivot.executor import worker
 from pivot.storage import cache, lock, track
 from pivot.storage import state as state_mod
@@ -27,6 +27,8 @@ if TYPE_CHECKING:
     import threading
     from collections.abc import Callable
 
+    from pivot.pipeline.pipeline import Pipeline
+    from pivot.registry import RegistryStageInfo
     from pivot.types import RunJsonEvent
 
 logger = logging.getLogger(__name__)
@@ -163,6 +165,7 @@ def run(
     progress_callback: Callable[[RunJsonEvent], None] | None = None,
     cancel_event: threading.Event | None = None,
     checkout_missing: bool = False,
+    pipeline: Pipeline | None = None,
 ) -> dict[str, ExecutionSummary]:
     """Execute pipeline stages via Engine.
 
@@ -211,6 +214,7 @@ def run(
             progress_callback=progress_callback,
             cancel_event=cancel_event,
             checkout_missing=checkout_missing,
+            pipeline=pipeline,
         )
 
 
@@ -228,6 +232,7 @@ def _run_inner(
     progress_callback: Callable[[RunJsonEvent], None] | None,
     cancel_event: threading.Event | None,
     checkout_missing: bool,
+    pipeline: Pipeline | None,
 ) -> dict[str, ExecutionSummary]:
     """Inner implementation of run(), called with lock already held if needed."""
     # Import here to avoid circular import (engine imports executor_core)
@@ -243,8 +248,16 @@ def _run_inner(
                 f"Invalid on_error mode: {on_error}. Use 'fail' or 'keep_going'"
             ) from None
 
+    # Use provided pipeline or discover from project root
+    if pipeline is None:
+        pipeline = discovery.discover_pipeline()
+        if pipeline is None:
+            raise exceptions.PipelineNotFoundError(
+                "No pipeline found. Create pivot.yaml or pipeline.py to define stages."
+            )
+
     # Create engine with event-driven execution
-    with Engine() as engine:
+    with Engine(pipeline=pipeline) as engine:
         # Pass cancel event to engine if provided
         if cancel_event is not None:
             engine.set_cancel_event(cancel_event)
@@ -304,7 +317,7 @@ def create_executor(max_workers: int) -> concurrent.futures.Executor:
 
 
 def prepare_worker_info(
-    stage_info: registry.RegistryStageInfo,
+    stage_info: RegistryStageInfo,
     overrides: parameters.ParamsOverrides,
     checkout_modes: list[cache.CheckoutMode],
     run_id: str,
@@ -312,9 +325,18 @@ def prepare_worker_info(
     no_commit: bool,
     no_cache: bool,
     project_root: pathlib.Path,
-    state_dir: pathlib.Path,
+    default_state_dir: pathlib.Path,
 ) -> worker.WorkerStageInfo:
-    """Prepare stage info for pickling to worker process."""
+    """Prepare stage info for pickling to worker process.
+
+    Uses stage's state_dir if set, otherwise falls back to default_state_dir.
+    """
+    # Use stage's state_dir if set, otherwise fall back to default
+    state_dir = stage_info["state_dir"] or default_state_dir
+
+    # Ensure state directory exists (workers open StateDB in readonly mode)
+    state_dir.mkdir(parents=True, exist_ok=True)
+
     return worker.WorkerStageInfo(
         func=stage_info["func"],
         fingerprint=stage_info["fingerprint"],
@@ -426,6 +448,7 @@ def verify_tracked_files(project_root: pathlib.Path, checkout_missing: bool = Fa
 
 def check_uncached_incremental_outputs(
     execution_order: list[str],
+    all_stages: dict[str, RegistryStageInfo],
 ) -> list[tuple[str, str]]:
     """Check for IncrementalOut files that exist but aren't cached.
 
@@ -435,7 +458,7 @@ def check_uncached_incremental_outputs(
     state_dir = config.get_state_dir()
 
     for stage_name in execution_order:
-        stage_info = registry.REGISTRY.get(stage_name)
+        stage_info = all_stages[stage_name]
         stage_outs = stage_info["outs"]
 
         # Read lock file to get cached output hashes

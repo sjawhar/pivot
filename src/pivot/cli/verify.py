@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, TypedDict
 
 import click
 
-from pivot import config, exceptions, registry
+from pivot import config, exceptions
 from pivot import status as status_mod
 from pivot.cli import completion
 from pivot.cli import decorators as cli_decorators
@@ -233,7 +233,7 @@ def verify(
     cli_helpers.validate_stages_exist(stages_list)
 
     # Check if any stages are registered
-    all_stages = registry.REGISTRY.list_stages()
+    all_stages = cli_helpers.get_all_stages()
     if not all_stages:
         raise click.ClickException("No stages registered. Nothing to verify.")
 
@@ -245,7 +245,11 @@ def verify(
     # When allow_missing is set, skip DAG validation so missing dependency files
     # don't cause DependencyNotFoundError before we can check the remote
     pipeline_status, _ = status_mod.get_pipeline_status(
-        stages_list, single_stage=False, validate=not allow_missing, allow_missing=allow_missing
+        stages_list,
+        single_stage=False,
+        all_stages=all_stages,
+        validate=not allow_missing,
+        allow_missing=allow_missing,
     )
 
     if not pipeline_status:

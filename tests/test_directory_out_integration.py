@@ -19,6 +19,8 @@ from pivot import executor, loaders, outputs
 if TYPE_CHECKING:
     import click.testing
 
+    from pivot.pipeline.pipeline import Pipeline
+
 
 # =============================================================================
 # Module-level TypedDicts and Stage Functions
@@ -80,7 +82,7 @@ def _assert_file_content(path: pathlib.Path, expected: dict[str, Any]) -> None:
 
 
 def test_h3_empty_directory_restored_on_cache_hit(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+    test_pipeline: Pipeline, runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
     """H3: Cache has A,B,C. Workspace has empty dir. Expected: Restore A,B,C.
 
@@ -94,7 +96,7 @@ def test_h3_empty_directory_restored_on_cache_hit(
 
         # First run - creates and caches files
         register_test_stage(_stage_produces_abc_with_marker, name="produce")
-        executor.run()
+        executor.run(pipeline=test_pipeline)
 
         results_dir = pathlib.Path("results")
         _assert_files_exist(results_dir, ["a.json", "b.json", "c.json"])
@@ -108,7 +110,7 @@ def test_h3_empty_directory_restored_on_cache_hit(
         assert not (results_dir / "a.json").exists(), "Files should be deleted"
 
         # Second run - should skip and restore from cache
-        executor.run()
+        executor.run(pipeline=test_pipeline)
 
         # Verify: stage did NOT re-run (counter still 1)
         assert _get_run_count() == 1, "Stage should have skipped, not re-run"
@@ -124,7 +126,7 @@ def test_h3_empty_directory_restored_on_cache_hit(
 
 
 def test_h4_partial_directory_restored_on_cache_hit(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+    test_pipeline: Pipeline, runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
     """H4: Cache has A,B,C. Workspace has only A. Expected: Restore B,C, keep A.
 
@@ -138,7 +140,7 @@ def test_h4_partial_directory_restored_on_cache_hit(
 
         # First run - creates and caches files
         register_test_stage(_stage_produces_abc_with_marker, name="produce")
-        executor.run()
+        executor.run(pipeline=test_pipeline)
 
         results_dir = pathlib.Path("results")
         _assert_files_exist(results_dir, ["a.json", "b.json", "c.json"])
@@ -150,7 +152,7 @@ def test_h4_partial_directory_restored_on_cache_hit(
         _assert_files_exist(results_dir, ["a.json"])
 
         # Second run - should skip and restore missing files
-        executor.run()
+        executor.run(pipeline=test_pipeline)
 
         # Verify: stage did NOT re-run
         assert _get_run_count() == 1, "Stage should have skipped, not re-run"
@@ -166,7 +168,7 @@ def test_h4_partial_directory_restored_on_cache_hit(
 
 
 def test_h5_extra_files_removed_on_cache_hit(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+    test_pipeline: Pipeline, runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
     """H5: Cache has A,B,C. Workspace has A,B,C,D (extra file). Expected: Remove D.
 
@@ -180,7 +182,7 @@ def test_h5_extra_files_removed_on_cache_hit(
 
         # First run - creates and caches files
         register_test_stage(_stage_produces_abc_with_marker, name="produce")
-        executor.run()
+        executor.run(pipeline=test_pipeline)
 
         results_dir = pathlib.Path("results")
         _assert_files_exist(results_dir, ["a.json", "b.json", "c.json"])
@@ -191,7 +193,7 @@ def test_h5_extra_files_removed_on_cache_hit(
         _assert_files_exist(results_dir, ["a.json", "b.json", "c.json", "d.json"])
 
         # Second run - should skip and remove extra file
-        executor.run()
+        executor.run(pipeline=test_pipeline)
 
         # Verify: stage did NOT re-run
         assert _get_run_count() == 1, "Stage should have skipped, not re-run"
@@ -206,7 +208,7 @@ def test_h5_extra_files_removed_on_cache_hit(
 
 
 def test_h6_wrong_files_replaced_on_cache_hit(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+    test_pipeline: Pipeline, runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
     """H6: Cache has A,B,C. Workspace has A,B,X (wrong file). Expected: Restore C, remove X.
 
@@ -220,7 +222,7 @@ def test_h6_wrong_files_replaced_on_cache_hit(
 
         # First run - creates and caches files
         register_test_stage(_stage_produces_abc_with_marker, name="produce")
-        executor.run()
+        executor.run(pipeline=test_pipeline)
 
         results_dir = pathlib.Path("results")
         _assert_files_exist(results_dir, ["a.json", "b.json", "c.json"])
@@ -232,7 +234,7 @@ def test_h6_wrong_files_replaced_on_cache_hit(
         _assert_files_exist(results_dir, ["a.json", "b.json", "x.json"])
 
         # Second run - should skip, restore C, remove X
-        executor.run()
+        executor.run(pipeline=test_pipeline)
 
         # Verify: stage did NOT re-run
         assert _get_run_count() == 1, "Stage should have skipped, not re-run"
@@ -248,7 +250,7 @@ def test_h6_wrong_files_replaced_on_cache_hit(
 
 
 def test_h7_corrupted_files_restored_on_cache_hit(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+    test_pipeline: Pipeline, runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
     """H7: Cache has A,B,C. Workspace has A (corrupted). Expected: Restore correct A.
 
@@ -262,7 +264,7 @@ def test_h7_corrupted_files_restored_on_cache_hit(
 
         # First run - creates and caches files
         register_test_stage(_stage_produces_abc_with_marker, name="produce")
-        executor.run()
+        executor.run(pipeline=test_pipeline)
 
         results_dir = pathlib.Path("results")
         _assert_files_exist(results_dir, ["a.json", "b.json", "c.json"])
@@ -275,7 +277,7 @@ def test_h7_corrupted_files_restored_on_cache_hit(
         _assert_file_content(results_dir / "a.json", {"corrupted": True})
 
         # Second run - should skip and restore correct content
-        executor.run()
+        executor.run(pipeline=test_pipeline)
 
         # Verify: stage did NOT re-run
         assert _get_run_count() == 1, "Stage should have skipped, not re-run"
@@ -290,7 +292,7 @@ def test_h7_corrupted_files_restored_on_cache_hit(
 
 
 def test_h8_corrupted_file_triggers_rerun_when_cache_empty(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+    test_pipeline: Pipeline, runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
     """H8: Cache empty, workspace has corrupted file. Expected: Re-run stage.
 
@@ -305,7 +307,7 @@ def test_h8_corrupted_file_triggers_rerun_when_cache_empty(
 
         # First run - creates and caches files
         register_test_stage(_stage_produces_abc_with_marker, name="produce")
-        executor.run()
+        executor.run(pipeline=test_pipeline)
 
         results_dir = pathlib.Path("results")
         _assert_files_exist(results_dir, ["a.json", "b.json", "c.json"])
@@ -323,7 +325,7 @@ def test_h8_corrupted_file_triggers_rerun_when_cache_empty(
         (results_dir / "a.json").write_text('{"corrupted": true}')
 
         # Second run - should RE-RUN because cache can't restore
-        executor.run()
+        executor.run(pipeline=test_pipeline)
 
         # Verify: stage DID re-run (counter is now 2)
         assert _get_run_count() == 2, "Stage should have re-run when cache is empty"
@@ -339,7 +341,7 @@ def test_h8_corrupted_file_triggers_rerun_when_cache_empty(
 
 
 def test_h9_missing_directory_restored_on_cache_hit(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+    test_pipeline: Pipeline, runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
     """H9: Cache has A,B,C. Directory does not exist. Expected: Create dir, restore A,B,C.
 
@@ -353,7 +355,7 @@ def test_h9_missing_directory_restored_on_cache_hit(
 
         # First run - creates and caches files
         register_test_stage(_stage_produces_abc_with_marker, name="produce")
-        executor.run()
+        executor.run(pipeline=test_pipeline)
 
         results_dir = pathlib.Path("results")
         _assert_files_exist(results_dir, ["a.json", "b.json", "c.json"])
@@ -364,7 +366,7 @@ def test_h9_missing_directory_restored_on_cache_hit(
         assert not results_dir.exists(), "Directory should be deleted"
 
         # Second run - should skip and restore directory + files
-        executor.run()
+        executor.run(pipeline=test_pipeline)
 
         # Verify: stage did NOT re-run
         assert _get_run_count() == 1, "Stage should have skipped, not re-run"
@@ -381,7 +383,7 @@ def test_h9_missing_directory_restored_on_cache_hit(
 
 
 def test_h10_partial_cache_corruption_triggers_rerun(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+    test_pipeline: Pipeline, runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
     """H10: Cache missing some files. Workspace has corrupted files. Expected: Re-run.
 
@@ -396,7 +398,7 @@ def test_h10_partial_cache_corruption_triggers_rerun(
 
         # First run - creates and caches files
         register_test_stage(_stage_produces_abc_with_marker, name="produce")
-        executor.run()
+        executor.run(pipeline=test_pipeline)
 
         results_dir = pathlib.Path("results")
         _assert_files_exist(results_dir, ["a.json", "b.json", "c.json"])
@@ -416,7 +418,7 @@ def test_h10_partial_cache_corruption_triggers_rerun(
         (results_dir / "a.json").write_text('{"corrupted": true}')
 
         # Second run - should RE-RUN because cache can't fully restore
-        executor.run()
+        executor.run(pipeline=test_pipeline)
 
         # Verify: stage DID re-run
         assert _get_run_count() == 2, "Stage should have re-run with corrupted cache"
@@ -460,7 +462,7 @@ def _assert_nested_files_exist(results_dir: pathlib.Path) -> None:
 
 
 def test_h11_nested_directories_restored_on_cache_hit(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+    test_pipeline: Pipeline, runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
     """H11: Cache has nested files. Workspace empty. Expected: Restore all nested.
 
@@ -474,7 +476,7 @@ def test_h11_nested_directories_restored_on_cache_hit(
 
         # First run - creates nested structure
         register_test_stage(_stage_produces_nested_with_marker, name="produce")
-        executor.run()
+        executor.run(pipeline=test_pipeline)
 
         results_dir = pathlib.Path("results")
         _assert_nested_files_exist(results_dir)
@@ -486,7 +488,7 @@ def test_h11_nested_directories_restored_on_cache_hit(
         assert results_dir.exists()
 
         # Second run - should skip and restore nested structure
-        executor.run()
+        executor.run(pipeline=test_pipeline)
 
         # Verify: stage did NOT re-run
         assert _get_run_count() == 1, "Stage should have skipped"
@@ -499,7 +501,7 @@ def test_h11_nested_directories_restored_on_cache_hit(
 
 
 def test_h11_nested_file_corrupted_restored(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+    test_pipeline: Pipeline, runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
     """H11b: Nested file corrupted. Expected: Restore correct nested file.
 
@@ -513,7 +515,7 @@ def test_h11_nested_file_corrupted_restored(
 
         # First run - creates nested structure
         register_test_stage(_stage_produces_nested_with_marker, name="produce")
-        executor.run()
+        executor.run(pipeline=test_pipeline)
 
         results_dir = pathlib.Path("results")
         _assert_nested_files_exist(results_dir)
@@ -525,7 +527,7 @@ def test_h11_nested_file_corrupted_restored(
         nested_file.write_text('{"corrupted": true}')
 
         # Second run - should skip and restore
-        executor.run()
+        executor.run(pipeline=test_pipeline)
 
         # Verify: stage did NOT re-run
         assert _get_run_count() == 1, "Stage should have skipped"
@@ -558,7 +560,7 @@ def _stage_produces_many_files_with_marker() -> _LargeDirectoryOutResult:
 
 
 def test_h12_large_directory_partial_restore(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+    test_pipeline: Pipeline, runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
     """H12: Cache has 50 files. Workspace missing half. Expected: Restore missing.
 
@@ -572,7 +574,7 @@ def test_h12_large_directory_partial_restore(
 
         # First run - creates many files
         register_test_stage(_stage_produces_many_files_with_marker, name="produce")
-        executor.run()
+        executor.run(pipeline=test_pipeline)
 
         results_dir = pathlib.Path("results")
         all_files = list(results_dir.glob("*.json"))
@@ -586,7 +588,7 @@ def test_h12_large_directory_partial_restore(
         assert len(remaining) == 25
 
         # Second run - should skip and restore missing files
-        executor.run()
+        executor.run(pipeline=test_pipeline)
 
         # Verify: stage did NOT re-run
         assert _get_run_count() == 1, "Stage should have skipped"
@@ -602,7 +604,7 @@ def test_h12_large_directory_partial_restore(
 
 
 def test_h13_perfect_match_skips_without_modification(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+    test_pipeline: Pipeline, runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
     """H13: Cache and workspace are identical. Expected: Skip without touching files.
 
@@ -615,14 +617,14 @@ def test_h13_perfect_match_skips_without_modification(
 
         # First run - creates and caches files
         register_test_stage(_stage_produces_abc_with_marker, name="produce")
-        executor.run()
+        executor.run(pipeline=test_pipeline)
 
         results_dir = pathlib.Path("results")
         _assert_files_exist(results_dir, ["a.json", "b.json", "c.json"])
         assert _get_run_count() == 1
 
         # Second run - should skip
-        executor.run()
+        executor.run(pipeline=test_pipeline)
 
         # Verify: stage did NOT re-run
         assert _get_run_count() == 1, "Stage should have skipped"
@@ -658,7 +660,7 @@ def _stage_produces_multi_directory_with_marker() -> _MultiDirectoryOutResult:
 
 
 def test_h14_multiple_directory_outs_restored(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+    test_pipeline: Pipeline, runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
     """H14: Stage has multiple DirectoryOut. One corrupted. Expected: Both restored.
 
@@ -672,7 +674,7 @@ def test_h14_multiple_directory_outs_restored(
 
         # First run - creates files in both directories
         register_test_stage(_stage_produces_multi_directory_with_marker, name="produce")
-        executor.run()
+        executor.run(pipeline=test_pipeline)
 
         first_dir = pathlib.Path("first")
         second_dir = pathlib.Path("second")
@@ -685,7 +687,7 @@ def test_h14_multiple_directory_outs_restored(
         (first_dir / "a.json").write_text('{"corrupted": true}')
 
         # Second run - should skip and restore
-        executor.run()
+        executor.run(pipeline=test_pipeline)
 
         # Verify: stage did NOT re-run
         assert _get_run_count() == 1, "Stage should have skipped"
@@ -701,7 +703,7 @@ def test_h14_multiple_directory_outs_restored(
 
 
 def test_h15_run_cache_restores_directory_out(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+    test_pipeline: Pipeline, runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
     """H15: Run cache restores DirectoryOut when lock file is deleted.
 
@@ -715,7 +717,7 @@ def test_h15_run_cache_restores_directory_out(
 
         # First run - creates and caches files, records in run cache
         register_test_stage(_stage_produces_abc_with_marker, name="produce")
-        executor.run()
+        executor.run(pipeline=test_pipeline)
 
         results_dir = pathlib.Path("results")
         _assert_files_exist(results_dir, ["a.json", "b.json", "c.json"])
@@ -732,7 +734,7 @@ def test_h15_run_cache_restores_directory_out(
         assert not results_dir.exists(), "Directory should be deleted"
 
         # Second run - should skip via run cache and restore
-        executor.run()
+        executor.run(pipeline=test_pipeline)
 
         # Verify: stage did NOT re-run (counter still 1)
         assert _get_run_count() == 1, "Stage should have skipped via run cache"
@@ -743,7 +745,7 @@ def test_h15_run_cache_restores_directory_out(
 
 
 def test_h15b_run_cache_restores_corrupted_directory(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+    test_pipeline: Pipeline, runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
     """H15b: Run cache detects and restores corrupted DirectoryOut.
 
@@ -757,7 +759,7 @@ def test_h15b_run_cache_restores_corrupted_directory(
 
         # First run
         register_test_stage(_stage_produces_abc_with_marker, name="produce")
-        executor.run()
+        executor.run(pipeline=test_pipeline)
 
         results_dir = pathlib.Path("results")
         _assert_files_exist(results_dir, ["a.json", "b.json", "c.json"])
@@ -773,7 +775,7 @@ def test_h15b_run_cache_restores_corrupted_directory(
         (results_dir / "a.json").write_text('{"corrupted": true}')
 
         # Second run - should skip via run cache and fix corruption
-        executor.run()
+        executor.run(pipeline=test_pipeline)
 
         # Verify: stage did NOT re-run
         assert _get_run_count() == 1, "Stage should have skipped via run cache"
@@ -788,7 +790,7 @@ def test_h15b_run_cache_restores_corrupted_directory(
 
 
 def test_h16_missing_cache_triggers_rerun(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+    test_pipeline: Pipeline, runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
     """H16: When both cache and lock file are missing, stage re-runs.
 
@@ -802,7 +804,7 @@ def test_h16_missing_cache_triggers_rerun(
 
         # First run
         register_test_stage(_stage_produces_abc_with_marker, name="produce")
-        executor.run()
+        executor.run(pipeline=test_pipeline)
 
         results_dir = pathlib.Path("results")
         _assert_files_exist(results_dir, ["a.json", "b.json", "c.json"])
@@ -831,7 +833,7 @@ def test_h16_missing_cache_triggers_rerun(
         (results_dir / "a.json").write_text('{"corrupted": true}')
 
         # Second run - must RE-RUN because no cache or run cache available
-        executor.run()
+        executor.run(pipeline=test_pipeline)
 
         # Verify: stage DID re-run (counter is now 2)
         assert _get_run_count() == 2, "Stage should have re-run when cache is missing"

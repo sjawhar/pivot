@@ -35,9 +35,9 @@ import textual.widget
 import textual.widgets
 
 from pivot import config, explain, parameters, project
+from pivot.cli import helpers as cli_helpers
 from pivot.executor import ExecutionSummary
 from pivot.executor import commit as commit_mod
-from pivot.registry import REGISTRY
 from pivot.storage import lock, project_lock
 from pivot.tui import agent_server, diff_panels
 from pivot.tui.diff_panels import InputDiffPanel, OutputDiffPanel
@@ -698,7 +698,7 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
         """Create a new history entry when stage starts executing."""
         input_snapshot = None
         try:
-            registry_info = REGISTRY.get(stage_name)
+            registry_info = cli_helpers.get_stage(stage_name)
             state_dir = config.get_state_dir()
             input_snapshot = explain.get_stage_explanation(
                 stage_name=stage_name,
@@ -754,7 +754,7 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
         else:
             output_snapshot: list[OutputChange] | None = None
             try:
-                registry_info = REGISTRY.get(stage_name)
+                registry_info = cli_helpers.get_stage(stage_name)
                 state_dir = config.get_state_dir()
                 stages_dir = lock.get_stages_dir(state_dir)
                 lock_data = lock.StageLock(stage_name, stages_dir).read()

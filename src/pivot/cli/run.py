@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, TypedDict
 
 import click
 
-from pivot import config, discovery, registry
+from pivot import config, discovery
 from pivot.cli import completion
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
@@ -60,11 +60,14 @@ def _configure_output_sink(
     watch: bool,
 ) -> None:
     """Configure output sinks based on display mode."""
-    if quiet:
-        return
-
+    # JSON sink is always added when as_json=True, regardless of quiet mode
+    # (quiet only suppresses human-readable console output)
     if as_json and jsonl_callback:
         eng.add_sink(sinks.JsonlSink(callback=jsonl_callback))
+        return
+
+    if quiet:
+        return
     elif tui and tui_queue and run_id:
         eng.add_sink(sinks.TuiSink(tui_queue=tui_queue, run_id=run_id))
         if watch:
@@ -153,7 +156,7 @@ def _run_pipeline(
         )
 
     # Build DAG and get execution order for TUI display and worker pre-warming
-    graph = registry.REGISTRY.build_dag(validate=True)
+    graph = cli_helpers.build_dag(validate=True)
     execution_order = dag.get_execution_order(graph, stages_list, single_stage=single_stage)
 
     if not execution_order and not watch:
@@ -267,14 +270,14 @@ def _run_watch_mode(
     from pivot.tui import run as run_tui
 
     # Build bipartite graph for watch paths
-    all_stages = {name: registry.REGISTRY.get(name) for name in registry.REGISTRY.list_stages()}
+    all_stages = cli_helpers.get_all_stages()
     bipartite_graph = engine_graph.build_graph(all_stages)
     watch_paths = engine_graph.get_watch_paths(bipartite_graph)
 
     # Sort for display: group matrix variants together while preserving DAG structure
     display_order = _sort_for_display(execution_order, graph) if execution_order else None
 
-    with engine.Engine() as eng:
+    with _create_engine() as eng:
         eng.set_keep_going(on_error == OnError.KEEP_GOING)
 
         if cancel_event:
@@ -350,7 +353,7 @@ def _run_oneshot_mode(
         display_order = _sort_for_display(execution_order, graph)
 
         def executor_func() -> dict[str, ExecutionSummary]:
-            with engine.Engine() as eng:
+            with _create_engine() as eng:
                 if cancel_event:
                     eng.set_cancel_event(cancel_event)
 
@@ -387,7 +390,7 @@ def _run_oneshot_mode(
 
     # Non-TUI mode runs directly
     start_time = time.perf_counter()
-    with engine.Engine() as eng:
+    with _create_engine() as eng:
         result_sink = _configure_result_collector(eng)
         _configure_output_sink(
             eng,
@@ -522,14 +525,32 @@ def _sort_for_display(execution_order: list[str], graph: nx.DiGraph[str]) -> lis
 
 
 def ensure_stages_registered() -> None:
-    """Auto-discover and register stages if none are registered."""
-    if not discovery.has_registered_stages():
-        try:
-            discovered = discovery.discover_and_register()
-            if discovered:
-                logger.info(f"Loaded pipeline from {discovered}")
-        except discovery.DiscoveryError as e:
-            raise click.ClickException(str(e)) from e
+    """Ensure a Pipeline is discovered and in context.
+
+    If no Pipeline is in context, attempts discovery and stores the result.
+    """
+    if cli_decorators.get_pipeline_from_context() is not None:
+        return
+    try:
+        pipeline = discovery.discover_pipeline()
+        if pipeline is not None:
+            cli_decorators.store_pipeline_in_context(pipeline)
+            logger.info(f"Loaded pipeline: {pipeline.name}")
+    except discovery.DiscoveryError as e:
+        raise click.ClickException(str(e)) from e
+
+
+def _create_engine() -> engine.Engine:
+    """Create an Engine with the Pipeline from context.
+
+    The Pipeline must have been discovered by the CLI decorator (or ensure_stages_registered).
+    """
+    pipeline = cli_decorators.get_pipeline_from_context()
+    if pipeline is None:
+        raise click.ClickException(
+            "No pipeline discovered. Create a pivot.yaml or pipeline.py file."
+        )
+    return engine.Engine(pipeline=pipeline)
 
 
 def _validate_stages(stages_list: list[str] | None, single_stage: bool) -> None:
@@ -553,16 +574,17 @@ def _output_explain(
     # Validate dependencies exist when allow_missing is False
     # (consistent with dry_run_cmd behavior)
     if not allow_missing:
-        registry.REGISTRY.build_dag(validate=True)
+        cli_helpers.build_dag(validate=True)
 
     # Build graph once for all explanations
-    all_stages = {name: registry.REGISTRY.get(name) for name in registry.REGISTRY.list_stages()}
+    all_stages = cli_helpers.get_all_stages()
     graph = engine_graph.build_graph(all_stages)
 
     explanations = status_mod.get_pipeline_explanations(
         stages_list,
         single_stage,
-        force,
+        all_stages,
+        force=force,
         allow_missing=allow_missing,
         graph=graph,
     )
@@ -710,6 +732,15 @@ def run(
     if allow_missing and not dry_run:
         raise click.ClickException("--allow-missing can only be used with --dry-run")
 
+    # Check that a pipeline was discovered (either Pipeline object or registered stages)
+    # Allow dry-run and JSON modes to proceed with empty pipeline (they'll report "No stages")
+    # Explain mode requires a pipeline - it can't explain stages if there are none
+    pipeline = cli_decorators.get_pipeline_from_context()
+    # Check pipeline exists before checking stages (list_stages() would raise if called on None)
+    has_stages = pipeline is not None and bool(pipeline.list_stages())
+    if not has_stages and not dry_run and not as_json:
+        raise click.ClickException("No pipeline found (pivot.yaml or pipeline.py)")
+
     # Handle explain mode (with or without dry-run) - show explanations without execution
     if explain:
         _output_explain(stages_list, single_stage, force, allow_missing=allow_missing)
@@ -814,14 +845,19 @@ def dry_run_cmd(
     # Validate dependencies exist when allow_missing is False
     # This validation was previously done inside get_pipeline_explanations via build_dag()
     if not allow_missing:
-        registry.REGISTRY.build_dag(validate=True)
+        cli_helpers.build_dag(validate=True)
 
     # Build bipartite graph for consistent execution order with Engine
-    all_stages = {name: registry.REGISTRY.get(name) for name in registry.REGISTRY.list_stages()}
+    all_stages = cli_helpers.get_all_stages()
     graph = engine_graph.build_graph(all_stages)
 
     explanations = status_mod.get_pipeline_explanations(
-        stages_list, single_stage, force=force, allow_missing=allow_missing, graph=graph
+        stages_list,
+        single_stage,
+        force=force,
+        allow_missing=allow_missing,
+        graph=graph,
+        all_stages=all_stages,
     )
 
     if not explanations:

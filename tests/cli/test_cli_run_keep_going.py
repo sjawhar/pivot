@@ -8,7 +8,10 @@ from helpers import register_test_stage
 from pivot import cli, loaders, outputs
 
 if TYPE_CHECKING:
+    import pytest
     from click.testing import CliRunner
+
+    from pivot.pipeline.pipeline import Pipeline
 
 
 # =============================================================================
@@ -98,76 +101,96 @@ def _stage_process(
 # =============================================================================
 
 
-def test_keep_going_flag_continues_after_failure(runner: CliRunner, tmp_path: pathlib.Path) -> None:
+def test_keep_going_flag_continues_after_failure(
+    mock_discovery: Pipeline,
+    runner: CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """--keep-going continues independent stages after failure."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        pathlib.Path("input.txt").write_text("data")
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "input.txt").write_text("data")
 
-        register_test_stage(_stage_failing, name="failing")
-        register_test_stage(_stage_succeeding, name="succeeding")
+    register_test_stage(_stage_failing, name="failing")
+    register_test_stage(_stage_succeeding, name="succeeding")
 
-        result = runner.invoke(cli.cli, ["run", "--keep-going"])
+    result = runner.invoke(cli.cli, ["run", "--keep-going"])
 
-        assert result.exit_code == 0
-        assert "failing: FAILED" in result.output
-        assert "succeeding: ran" in result.output
-        assert pathlib.Path("succeeding.txt").read_text() == "success"
+    assert result.exit_code == 0
+    assert "failing: FAILED" in result.output
+    assert "succeeding: ran" in result.output
+    assert (tmp_path / "succeeding.txt").read_text() == "success"
 
 
-def test_keep_going_flag_skips_downstream(runner: CliRunner, tmp_path: pathlib.Path) -> None:
+def test_keep_going_flag_skips_downstream(
+    mock_discovery: Pipeline,
+    runner: CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """--keep-going skips stages downstream of failed stage."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        pathlib.Path("input.txt").write_text("data")
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "input.txt").write_text("data")
 
-        register_test_stage(_stage_first_failing, name="first")
-        register_test_stage(_stage_second, name="second")
-        register_test_stage(_stage_independent, name="independent")
+    register_test_stage(_stage_first_failing, name="first")
+    register_test_stage(_stage_second, name="second")
+    register_test_stage(_stage_independent, name="independent")
 
-        result = runner.invoke(cli.cli, ["run", "--keep-going"])
+    result = runner.invoke(cli.cli, ["run", "--keep-going"])
 
-        assert result.exit_code == 0
-        assert "first: FAILED" in result.output
-        assert "second: blocked" in result.output
-        assert "upstream" in result.output  # Reason should mention upstream failed
-        assert "independent: ran" in result.output
+    assert result.exit_code == 0
+    assert "first: FAILED" in result.output
+    assert "second: blocked" in result.output
+    assert "upstream" in result.output  # Reason should mention upstream failed
+    assert "independent: ran" in result.output
 
 
-def test_keep_going_short_flag(runner: CliRunner, tmp_path: pathlib.Path) -> None:
+def test_keep_going_short_flag(
+    mock_discovery: Pipeline,
+    runner: CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """-k short flag works the same as --keep-going."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        pathlib.Path("input.txt").write_text("data")
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "input.txt").write_text("data")
 
-        register_test_stage(_stage_failing, name="failing")
-        register_test_stage(_stage_succeeding, name="succeeding")
+    register_test_stage(_stage_failing, name="failing")
+    register_test_stage(_stage_succeeding, name="succeeding")
 
-        result = runner.invoke(cli.cli, ["run", "-k"])
+    result = runner.invoke(cli.cli, ["run", "-k"])
 
-        assert result.exit_code == 0
-        assert "failing: FAILED" in result.output
-        assert "succeeding: ran" in result.output
+    assert result.exit_code == 0
+    assert "failing: FAILED" in result.output
+    assert "succeeding: ran" in result.output
 
 
-def test_without_keep_going_stops_on_failure(runner: CliRunner, tmp_path: pathlib.Path) -> None:
+def test_without_keep_going_stops_on_failure(
+    mock_discovery: Pipeline,
+    runner: CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Default behavior stops pipeline on first failure (downstream stages blocked)."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        pathlib.Path("input.txt").write_text("data")
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "input.txt").write_text("data")
 
-        # Use dependent stages to test deterministically:
-        # failing runs first, downstream depends on its output
-        register_test_stage(_stage_failing, name="failing")
-        register_test_stage(_stage_downstream, name="downstream")
+    # Use dependent stages to test deterministically:
+    # failing runs first, downstream depends on its output
+    register_test_stage(_stage_failing, name="failing")
+    register_test_stage(_stage_downstream, name="downstream")
 
-        result = runner.invoke(cli.cli, ["run"])
+    result = runner.invoke(cli.cli, ["run"])
 
-        assert result.exit_code == 0
-        assert "failing: FAILED" in result.output
-        # Without --keep-going, downstream stages are blocked due to upstream failure
-        assert "downstream: blocked" in result.output
-        assert not pathlib.Path("downstream.txt").exists()
+    assert result.exit_code == 0
+    assert "failing: FAILED" in result.output
+    # Without --keep-going, downstream stages are blocked due to upstream failure
+    assert "downstream: blocked" in result.output
+    assert not (tmp_path / "downstream.txt").exists()
 
 
 def test_keep_going_flag_shown_in_help(runner: CliRunner) -> None:
@@ -179,61 +202,76 @@ def test_keep_going_flag_shown_in_help(runner: CliRunner) -> None:
     assert "-k" in result.output
 
 
-def test_keep_going_with_json_output(runner: CliRunner, tmp_path: pathlib.Path) -> None:
+def test_keep_going_with_json_output(
+    mock_discovery: Pipeline,
+    runner: CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """--keep-going works with --json output mode."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        pathlib.Path("input.txt").write_text("data")
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "input.txt").write_text("data")
 
-        register_test_stage(_stage_failing, name="failing")
-        register_test_stage(_stage_succeeding, name="succeeding")
+    register_test_stage(_stage_failing, name="failing")
+    register_test_stage(_stage_succeeding, name="succeeding")
 
-        result = runner.invoke(cli.cli, ["run", "--keep-going", "--json"])
+    result = runner.invoke(cli.cli, ["run", "--keep-going", "--json"])
 
-        assert result.exit_code == 0
-        # Parse JSONL output - look for the execution result event
-        lines = result.output.strip().split("\n")
-        events = [json.loads(line) for line in lines if line.strip()]
+    assert result.exit_code == 0
+    # Parse JSONL output - look for the execution result event
+    lines = result.output.strip().split("\n")
+    events = [json.loads(line) for line in lines if line.strip()]
 
-        # Should have both stage completions
-        stage_complete_events = [e for e in events if e.get("type") == "stage_complete"]
-        assert len(stage_complete_events) == 2
+    # Should have both stage completions
+    stage_complete_events = [e for e in events if e.get("type") == "stage_complete"]
+    assert len(stage_complete_events) == 2
 
-        statuses = {e["stage"]: e["status"] for e in stage_complete_events}
-        assert statuses["failing"] == "failed"
-        assert statuses["succeeding"] == "ran"
+    statuses = {e["stage"]: e["status"] for e in stage_complete_events}
+    assert statuses["failing"] == "failed"
+    assert statuses["succeeding"] == "ran"
 
 
-def test_keep_going_with_dry_run(runner: CliRunner, tmp_path: pathlib.Path) -> None:
+def test_keep_going_with_dry_run(
+    mock_discovery: Pipeline,
+    runner: CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """--keep-going is accepted with --dry-run (flag is no-op since nothing executes)."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        pathlib.Path("input.txt").write_text("data")
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "input.txt").write_text("data")
 
-        register_test_stage(_stage_process, name="process")
+    register_test_stage(_stage_process, name="process")
 
-        result = runner.invoke(cli.cli, ["run", "--keep-going", "--dry-run"])
+    result = runner.invoke(cli.cli, ["run", "--keep-going", "--dry-run"])
 
-        assert result.exit_code == 0
-        # Dry run shows what would run without executing
-        assert "would run" in result.output.lower() or "Would run" in result.output
-        # The output file should NOT exist (dry run doesn't execute)
-        assert not pathlib.Path("output.txt").exists()
+    assert result.exit_code == 0
+    # Dry run shows what would run without executing
+    assert "would run" in result.output.lower() or "Would run" in result.output
+    # The output file should NOT exist (dry run doesn't execute)
+    assert not (tmp_path / "output.txt").exists()
 
 
-def test_keep_going_with_dry_run_json(runner: CliRunner, tmp_path: pathlib.Path) -> None:
+def test_keep_going_with_dry_run_json(
+    mock_discovery: Pipeline,
+    runner: CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """--keep-going works with --dry-run --json combination."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        pathlib.Path("input.txt").write_text("data")
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "input.txt").write_text("data")
 
-        register_test_stage(_stage_process, name="process")
+    register_test_stage(_stage_process, name="process")
 
-        result = runner.invoke(cli.cli, ["run", "--keep-going", "--dry-run", "--json"])
+    result = runner.invoke(cli.cli, ["run", "--keep-going", "--dry-run", "--json"])
 
-        assert result.exit_code == 0
-        # Should produce valid JSON output
-        output = json.loads(result.output)
-        assert "stages" in output
-        # The stage should be listed as "would_run"
-        assert output["stages"]["process"]["would_run"] is True
+    assert result.exit_code == 0
+    # Should produce valid JSON output
+    output = json.loads(result.output)
+    assert "stages" in output
+    # The stage should be listed as "would_run"
+    assert output["stages"]["process"]["would_run"] is True

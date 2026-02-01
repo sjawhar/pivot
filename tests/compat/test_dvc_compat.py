@@ -1,16 +1,20 @@
 # pyright: reportUnusedFunction=false
+from __future__ import annotations
 
 import inspect
 import pathlib
-from typing import Annotated, TypedDict
+from typing import TYPE_CHECKING, Annotated, TypedDict
 
 import pytest
 import yaml
 
-from helpers import register_test_stage
+from helpers import get_test_pipeline, register_test_stage
 from pivot import dvc_compat, loaders, outputs
 from pivot.exceptions import DVCImportError, ExportError
-from pivot.registry import REGISTRY, RegistryStageInfo
+from pivot.registry import RegistryStageInfo
+
+if TYPE_CHECKING:
+    from pivot.pipeline.pipeline import Pipeline
 
 # =============================================================================
 # Output TypedDicts for annotation-based stages
@@ -181,7 +185,11 @@ def test_build_out_entry_plot_with_options() -> None:
 # === export_dvc_yaml Tests ===
 
 
-def test_export_simple_stage(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_export_simple_stage(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mock_discovery: Pipeline,
+) -> None:
     """Should export basic stage to dvc.yaml."""
     # Mock project root
     monkeypatch.setattr("pivot.project.get_project_root", lambda: tmp_path)
@@ -206,13 +214,16 @@ def test_export_simple_stage(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyP
     assert written == result
 
 
-def test_export_with_rich_outputs(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_export_with_rich_outputs(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, mock_discovery: Pipeline
+) -> None:
     """Should separate Out/Metric/Plot into correct sections."""
     monkeypatch.setattr("pivot.dvc_compat.project.get_project_root", lambda: tmp_path)
 
     # Directly create registry entry with rich output types (Metric, Plot)
     # since annotation-based registration only creates Out types
-    REGISTRY._stages["train"] = RegistryStageInfo(
+    pipeline = get_test_pipeline()
+    pipeline._registry._stages["train"] = RegistryStageInfo(
         name="train",
         func=exportable_stage,
         deps={},
@@ -237,6 +248,7 @@ def test_export_with_rich_outputs(tmp_path: pathlib.Path, monkeypatch: pytest.Mo
         dep_specs={},
         out_specs={},
         params_arg_name=None,
+        state_dir=None,
     )
 
     result = dvc_compat.export_dvc_yaml(tmp_path / "dvc.yaml")
@@ -248,7 +260,7 @@ def test_export_with_rich_outputs(tmp_path: pathlib.Path, monkeypatch: pytest.Mo
 
 
 def test_export_generates_params_yaml(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, mock_discovery: Pipeline
 ) -> None:
     """Should generate params.yaml with function defaults."""
     monkeypatch.setattr("pivot.dvc_compat.project.get_project_root", lambda: tmp_path)
@@ -265,7 +277,9 @@ def test_export_generates_params_yaml(
     assert params == {"train": {"learning_rate": 0.01, "epochs": 100}}
 
 
-def test_export_references_params(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_export_references_params(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, mock_discovery: Pipeline
+) -> None:
     """Stage should reference params from params.yaml."""
     monkeypatch.setattr("pivot.dvc_compat.project.get_project_root", lambda: tmp_path)
 
@@ -281,6 +295,7 @@ def test_export_references_params(tmp_path: pathlib.Path, monkeypatch: pytest.Mo
 def test_export_empty_registry_raises_error(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
+    mock_discovery: Pipeline,
 ) -> None:
     """Should raise error when no stages registered."""
     monkeypatch.setattr("pivot.dvc_compat.project.get_project_root", lambda: tmp_path)
@@ -290,7 +305,7 @@ def test_export_empty_registry_raises_error(
 
 
 def test_export_missing_stages_raises_error(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, mock_discovery: Pipeline
 ) -> None:
     """Should raise error when requested stages don't exist."""
     monkeypatch.setattr("pivot.dvc_compat.project.get_project_root", lambda: tmp_path)
@@ -301,7 +316,9 @@ def test_export_missing_stages_raises_error(
         dvc_compat.export_dvc_yaml(tmp_path / "dvc.yaml", stages=["stage1", "nonexistent"])
 
 
-def test_export_subset_of_stages(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_export_subset_of_stages(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, mock_discovery: Pipeline
+) -> None:
     """Should export only specified stages."""
     monkeypatch.setattr("pivot.dvc_compat.project.get_project_root", lambda: tmp_path)
 
@@ -314,13 +331,16 @@ def test_export_subset_of_stages(tmp_path: pathlib.Path, monkeypatch: pytest.Mon
     assert "stage2" not in result["stages"]
 
 
-def test_export_out_cache_false(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_export_out_cache_false(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, mock_discovery: Pipeline
+) -> None:
     """Out with cache=False should have cache: false in yaml."""
     monkeypatch.setattr("pivot.dvc_compat.project.get_project_root", lambda: tmp_path)
 
     # Directly create registry entry with Out(cache=False)
     # since annotation-based registration always sets cache=True
-    REGISTRY._stages["stage"] = RegistryStageInfo(
+    pipeline = get_test_pipeline()
+    pipeline._registry._stages["stage"] = RegistryStageInfo(
         name="stage",
         func=exportable_stage,
         deps={},
@@ -335,6 +355,7 @@ def test_export_out_cache_false(tmp_path: pathlib.Path, monkeypatch: pytest.Monk
         dep_specs={},
         out_specs={},
         params_arg_name=None,
+        state_dir=None,
     )
 
     result = dvc_compat.export_dvc_yaml(tmp_path / "dvc.yaml")

@@ -15,6 +15,8 @@ from pivot import fingerprint, outputs, parameters, path_policy, registry, stage
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from pivot.pipeline.pipeline import Pipeline
+
 
 class PipelineConfigError(Exception):
     """Error loading or processing pivot.yaml configuration."""
@@ -49,6 +51,10 @@ class VariantDict(TypedDict, total=False):
     outs: dict[str, NamedOutputValue]
     params: dict[str, Any]
     mutex: list[str]
+
+
+# Valid keys for VariantDict - used for validation to catch typos
+_VARIANT_DICT_KEYS = frozenset(["name", "deps", "outs", "params", "mutex"])
 
 
 class DimensionOverrides(pydantic.BaseModel):
@@ -96,6 +102,7 @@ class PipelineConfig(pydantic.BaseModel):
 
     model_config = pydantic.ConfigDict(extra="forbid")  # pyright: ignore[reportUnannotatedClassAttribute]
 
+    pipeline: str | None = None  # Pipeline name (defaults to directory name if not set)
     stages: dict[str, StageConfig]
     vars: list[str] = []  # Files to load variables from for ${var} interpolation
 
@@ -169,52 +176,164 @@ def _load_vars_files(vars_paths: list[str], pipeline_dir: Path) -> dict[str, str
     return result
 
 
-def register_from_pipeline_file(pipeline_file: Path) -> None:
-    """Load pivot.yaml and register all stages to the global registry."""
-    pipeline = load_pipeline_file(pipeline_file)
+def load_pipeline_from_yaml(pipeline_file: Path) -> Pipeline:
+    """Load pivot.yaml and return a Pipeline instance.
+
+    The pipeline name comes from:
+    1. 'pipeline' field in YAML if present
+    2. Otherwise, parent directory name
+    """
+    from pivot.pipeline import pipeline as pipeline_module
+
+    config = load_pipeline_file(pipeline_file)
     pipeline_dir = pipeline_file.parent
 
-    # Load variables from vars files for ${var} interpolation
-    global_vars = _load_vars_files(pipeline.vars, pipeline_dir)
+    # Determine pipeline name
+    name = config.pipeline or pipeline_dir.name
 
-    for stage_name, stage_config in pipeline.stages.items():
-        _register_stage(stage_name, stage_config, global_vars)
+    # Create Pipeline with explicit root
+    p = pipeline_module.Pipeline(name, root=pipeline_dir)
+
+    # Load variables from vars files for ${var} interpolation
+    global_vars = _load_vars_files(config.vars, pipeline_dir)
+
+    # Register all stages to the Pipeline
+    for stage_name, stage_config in config.stages.items():
+        expanded = _expand_stage(stage_name, stage_config, global_vars)
+        for stage in expanded:
+            p.register(
+                func=stage.func,
+                name=stage.name,
+                params=stage.params,
+                mutex=stage.mutex,
+                variant=stage.variant,
+                dep_path_overrides=stage.dep_path_overrides or None,
+                out_path_overrides=stage.out_path_overrides or None,
+            )
 
     # Flush pending AST hash writes to persistent cache
     fingerprint.flush_ast_hash_cache()
 
+    return p
 
-def _register_stage(
+
+def _expand_stage(
     name: str,
     config: StageConfig,
     global_vars: dict[str, str],
-) -> None:
-    """Register a single stage from configuration."""
+) -> list[ExpandedStage]:
+    """Expand a stage configuration into ExpandedStage instances.
+
+    Handles matrix expansion, variants function, and simple stages.
+    """
     if config.matrix is not None:
-        expanded = _expand_matrix(name, config, global_vars)
-        for stage in expanded:
-            registry.REGISTRY.register(
-                func=stage.func,
-                name=stage.name,
-                dep_path_overrides=stage.dep_path_overrides or None,
-                out_path_overrides=stage.out_path_overrides or None,
-                params=stage.params,
-                mutex=stage.mutex,
-                variant=stage.variant,
-            )
+        return _expand_matrix(name, config, global_vars)
     elif config.variants is not None:
-        variants_func = _import_function(config.variants)
-        variants = variants_func()
-        if not isinstance(variants, (list, tuple)):
-            raise PipelineConfigError(
-                f"Stage '{name}': variants function '{config.variants}' must return a list, "
-                + f"got {type(variants).__name__}"
-            )
-        func = _import_function(config.python)
-        for variant in typing.cast("list[VariantDict]", variants):
-            _register_variant_from_dict(name, func, variant)
+        return _expand_variants(name, config)
     else:
-        _register_simple_stage(name, config, global_vars)
+        return [_expand_simple_stage(name, config, global_vars)]
+
+
+def _expand_variants(name: str, config: StageConfig) -> list[ExpandedStage]:
+    """Expand a variants function into ExpandedStage instances."""
+    if config.variants is None:
+        raise PipelineConfigError(f"Stage '{name}' missing 'variants' field")
+
+    variants_func = _import_function(config.variants)
+    variants = variants_func()
+    if not isinstance(variants, (list, tuple)):
+        raise PipelineConfigError(
+            f"Stage '{name}': variants function '{config.variants}' must return a list, "
+            + f"got {type(variants).__name__}"
+        )
+
+    func = _import_function(config.python)
+    result = list[ExpandedStage]()
+
+    for variant in typing.cast("list[VariantDict]", variants):
+        # Validate no unknown keys (catch typos like "parmas" instead of "params")
+        unknown_keys = set(variant.keys()) - _VARIANT_DICT_KEYS
+        if unknown_keys:
+            raise PipelineConfigError(
+                f"Stage '{name}': variant dict has unknown keys: {sorted(unknown_keys)}. "
+                + f"Valid keys are: {sorted(_VARIANT_DICT_KEYS)}"
+            )
+
+        variant_name = variant["name"] if "name" in variant else "default"
+        full_name = f"{name}@{variant_name}"
+
+        deps: DepsSpec = variant["deps"] if "deps" in variant else {}
+        outs_raw: OutputsSpec = variant["outs"] if "outs" in variant else {}
+        params_dict = variant["params"] if "params" in variant else {}
+        mutex = variant["mutex"] if "mutex" in variant else []
+
+        # YAML deps are path overrides only
+        dep_path_overrides: dict[str, str | list[str]] = {}
+        for dep_name, dep_value in deps.items():
+            dep_path_overrides[dep_name] = dep_value
+
+        # YAML outs are path overrides only
+        out_path_overrides = _normalize_out_path_overrides(outs_raw, {}, full_name)
+
+        params_instance = _resolve_params(func, params_dict, full_name)
+
+        result.append(
+            ExpandedStage(
+                name=full_name,
+                func=func,
+                dep_path_overrides=dep_path_overrides,
+                out_path_overrides=out_path_overrides,
+                params=params_instance,
+                mutex=mutex,
+                variant=variant_name,
+            )
+        )
+
+    return result
+
+
+def _expand_simple_stage(
+    name: str,
+    config: StageConfig,
+    global_vars: dict[str, str],
+) -> ExpandedStage:
+    """Expand a simple (non-matrix, non-variants) stage into an ExpandedStage."""
+    func = _import_function(config.python)
+
+    # Interpolate deps path overrides
+    dep_path_overrides = _normalize_deps_spec(config.deps, global_vars, name)
+
+    # Interpolate outs path overrides
+    out_path_overrides = _normalize_out_path_overrides(config.outs, global_vars, name)
+
+    # Get return output specs for type validation
+    return_out_specs = stage_def.get_output_specs_from_return(func, name)
+
+    # Process metrics and plots sections
+    _process_typed_output_section(
+        config.metrics,
+        out_path_overrides,
+        return_out_specs,
+        outputs.Metric,
+        "metrics",
+        name,
+        global_vars,
+    )
+    _process_typed_output_section(
+        config.plots, out_path_overrides, return_out_specs, outputs.Plot, "plots", name, global_vars
+    )
+
+    params_instance = _resolve_params(func, config.params, name)
+
+    return ExpandedStage(
+        name=name,
+        func=func,
+        dep_path_overrides=dep_path_overrides,
+        out_path_overrides=out_path_overrides,
+        params=params_instance,
+        mutex=config.mutex,
+        variant=None,
+    )
 
 
 def _validate_output_type(
@@ -269,95 +388,6 @@ def _process_typed_output_section(
         out_path_overrides.update(
             _normalize_out_path_overrides({out_name: value}, global_vars, stage_name)
         )
-
-
-def _register_simple_stage(
-    name: str,
-    config: StageConfig,
-    global_vars: dict[str, str],
-) -> None:
-    """Register a simple (non-matrix) stage."""
-    func = _import_function(config.python)
-
-    # Interpolate deps path overrides
-    dep_path_overrides = _normalize_deps_spec(config.deps, global_vars, name)
-
-    # Interpolate outs path overrides
-    out_path_overrides = _normalize_out_path_overrides(config.outs, global_vars, name)
-
-    # Get return output specs for type validation
-    return_out_specs = stage_def.get_output_specs_from_return(func, name)
-
-    # Process metrics and plots sections
-    _process_typed_output_section(
-        config.metrics,
-        out_path_overrides,
-        return_out_specs,
-        outputs.Metric,
-        "metrics",
-        name,
-        global_vars,
-    )
-    _process_typed_output_section(
-        config.plots, out_path_overrides, return_out_specs, outputs.Plot, "plots", name, global_vars
-    )
-
-    params_instance = _resolve_params(func, config.params, name)
-
-    registry.REGISTRY.register(
-        func=func,
-        name=name,
-        dep_path_overrides=dep_path_overrides or None,
-        out_path_overrides=out_path_overrides or None,
-        params=params_instance,
-        mutex=config.mutex,
-    )
-
-
-_VARIANT_DICT_KEYS = frozenset({"name", "deps", "outs", "params", "mutex"})
-
-
-def _register_variant_from_dict(
-    base_name: str,
-    func: Callable[..., Any],
-    variant: VariantDict,
-) -> None:
-    """Register a variant from Python escape hatch."""
-    # Validate no unknown keys (catch typos like "parmas" instead of "params")
-    unknown_keys = set(variant.keys()) - _VARIANT_DICT_KEYS
-    if unknown_keys:
-        raise PipelineConfigError(
-            f"Stage '{base_name}': variant dict has unknown keys: {sorted(unknown_keys)}. "
-            + f"Valid keys are: {sorted(_VARIANT_DICT_KEYS)}"
-        )
-
-    variant_name = variant.get("name", "default")
-    full_name = f"{base_name}@{variant_name}"
-
-    deps: DepsSpec = variant.get("deps") or {}
-    outs_raw: OutputsSpec = variant.get("outs") or {}
-    params_dict = variant.get("params", {})
-    mutex = variant.get("mutex", [])
-
-    # YAML deps are path overrides only
-    dep_path_overrides: dict[str, str | list[str]] = {}
-    for dep_name, dep_value in deps.items():
-        dep_path_overrides[dep_name] = dep_value
-
-    # YAML outs are path overrides only
-    out_path_overrides = _normalize_out_path_overrides(outs_raw, {}, full_name)
-
-    params_instance = _resolve_params(func, params_dict, full_name)
-
-    registry.REGISTRY.register(
-        func=func,
-        name=full_name,
-        dep_path_overrides=dep_path_overrides or None,
-        out_path_overrides=out_path_overrides or None,
-        params=params_instance,
-        mutex=mutex,
-        variant=variant_name,
-    )
 
 
 def _expand_matrix(
@@ -642,11 +672,11 @@ def _normalize_out_path_overrides(
             )
         else:
             # Dict with options - extract path and options
-            path = value.get("path")
-            if path is None:
+            if "path" not in value:
                 raise PipelineConfigError(
                     f"Stage '{stage_name}': named output '{name}' missing 'path' field"
                 )
+            path = value["path"]
             # Handle both string and list paths with interpolation
             if isinstance(path, list):
                 interpolated_path: str | list[str] = [
@@ -654,9 +684,10 @@ def _normalize_out_path_overrides(
                 ]
             else:
                 interpolated_path = _interpolate(path, values, stage_name)
-            override = registry.OutOverride(path=interpolated_path)
             if "cache" in value:
-                override["cache"] = value["cache"]
+                override = registry.OutOverride(path=interpolated_path, cache=value["cache"])
+            else:
+                override = registry.OutOverride(path=interpolated_path)
             result[name] = override
     return result
 

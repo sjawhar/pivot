@@ -120,11 +120,11 @@ def collect_metrics_from_stages() -> dict[str, dict[str, MetricData]]:
 
     Returns {stage_name: {path: {key: value}}}
     """
-    from pivot import registry
+    from pivot.cli import helpers as cli_helpers
 
     result = dict[str, dict[str, MetricData]]()
-    for stage_name in registry.REGISTRY.list_stages():
-        stage_info = registry.REGISTRY.get(stage_name)
+    for stage_name in cli_helpers.list_stages():
+        stage_info = cli_helpers.get_stage(stage_name)
         stage_metrics = dict[str, MetricData]()
         for out in stage_info["outs"]:
             if isinstance(out, outputs.Metric):
@@ -287,23 +287,21 @@ def get_metric_info_from_head() -> dict[str, str | None]:
     Returns paths relative to project root mapping to hashes (or None if no hash).
     Returns empty dict if not in a git repo or no HEAD commit exists.
     """
-    from pivot import registry
+    from pivot.cli import helpers as cli_helpers
 
     result = dict[str, str | None]()
     proj_root = project.get_project_root()
 
     # Collect lock file paths and metric paths per stage
-    stage_metric_paths: dict[str, list[str]] = {}  # stage_name -> [rel_metric_paths]
-    for stage_name in registry.REGISTRY.list_stages():
-        info = registry.REGISTRY.get(stage_name)
+    stage_metric_paths = dict[str, list[str]]()  # stage_name -> [rel_metric_paths]
+    for stage_name in cli_helpers.list_stages():
+        info = cli_helpers.get_stage(stage_name)
         for out in info["outs"]:
             if isinstance(out, outputs.Metric):
-                if stage_name not in stage_metric_paths:
-                    stage_metric_paths[stage_name] = []
                 # Registry always stores single-file outputs (multi-file are expanded)
                 abs_path = str(project.normalize_path(cast("str", out.path)))
                 rel_path = project.to_relative_path(abs_path, proj_root)
-                stage_metric_paths[stage_name].append(rel_path)
+                stage_metric_paths.setdefault(stage_name, []).append(rel_path)
                 result[rel_path] = None  # Default to None
 
     # Read all lock files from HEAD in one batch

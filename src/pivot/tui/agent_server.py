@@ -6,10 +6,11 @@ import json
 import logging
 import os
 import socket
+import threading
 import uuid
 from typing import TYPE_CHECKING, Any, cast
 
-from pivot import registry
+from pivot.cli import helpers as cli_helpers
 from pivot.types import (
     AgentCancelResult,
     AgentRunParams,
@@ -69,12 +70,14 @@ class AgentServer:
     _engine: Engine
     _socket_path: Path
     _connected_clients: int
+    _clients_lock: threading.Lock
 
     def __init__(self, engine: Engine, socket_path: Path) -> None:
         self._engine = engine
         self._socket_path = socket_path
         self._server: asyncio.Server | None = None
         self._connected_clients = 0
+        self._clients_lock = threading.Lock()
 
     @property
     def socket_path(self) -> Path:
@@ -89,7 +92,8 @@ class AgentServer:
     @property
     def connected_count(self) -> int:
         """Return the number of connected clients."""
-        return self._connected_clients
+        with self._clients_lock:
+            return self._connected_clients
 
     async def start(self) -> asyncio.Server:
         """Start the server, binding to the Unix socket."""
@@ -142,7 +146,8 @@ class AgentServer:
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
         """Handle a connected client."""
-        self._connected_clients += 1
+        with self._clients_lock:
+            self._connected_clients += 1
         peer = writer.get_extra_info("peername") or "unknown"
         logger.debug(f"Client connected: {peer}")
 
@@ -198,7 +203,8 @@ class AgentServer:
         except Exception:
             logger.exception(f"Error handling client {peer}")
         finally:
-            self._connected_clients -= 1
+            with self._clients_lock:
+                self._connected_clients -= 1
             writer.close()
             await writer.wait_closed()
 
@@ -258,16 +264,16 @@ class AgentServer:
 
     async def _handle_run(self, params: AgentRunParams) -> AgentRunStartResult:
         """Handle run() RPC method."""
-        stages = params["stages"] if "stages" in params else None
+        stages = params.get("stages") or None
         if stages:
-            all_stages = set(registry.REGISTRY.list_stages())
+            all_stages = set(cli_helpers.list_stages())
             for stage in stages:
                 if stage not in all_stages:
                     suggestions = difflib.get_close_matches(stage, all_stages, n=3, cutoff=0.6)
                     raise _StageNotFoundError(stage, suggestions)
 
         run_id = str(uuid.uuid4())[:12]
-        force = params["force"] if "force" in params else False
+        force = params.get("force", False)
 
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(
@@ -288,15 +294,15 @@ class AgentServer:
 
         Uses run_in_executor to avoid blocking the event loop on lock acquisition.
         """
-        run_id = params["run_id"] if "run_id" in params else None
+        run_id = params.get("run_id")
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, self._engine.get_execution_status, run_id)
 
     async def _handle_stages(self) -> AgentStagesResult:
         """Handle stages() RPC method."""
         stages = list[AgentStageInfo]()
-        for name in registry.REGISTRY.list_stages():
-            info = registry.REGISTRY.get(name)
+        for name in cli_helpers.list_stages():
+            info = cli_helpers.get_stage(name)
             stages.append(
                 AgentStageInfo(
                     name=name,

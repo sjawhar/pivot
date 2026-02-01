@@ -513,18 +513,18 @@ def diff_data_files(
     )
 
 
-def get_data_outputs_from_registry() -> dict[str, str]:
-    """Get all data outputs (Out, not Metric/Plot) from registry.
+def get_data_outputs_from_stages() -> dict[str, str]:
+    """Get all data outputs (Out, not Metric/Plot) from Pipeline in context.
 
     Returns dict mapping stage_name -> relative_path for data outputs.
     """
-    from pivot import registry
+    from pivot.cli import helpers as cli_helpers
 
     result = dict[str, str]()
     proj_root = project.get_project_root()
 
-    for stage_name in registry.REGISTRY.list_stages():
-        info = registry.REGISTRY.get(stage_name)
+    for stage_name in cli_helpers.list_stages():
+        info = cli_helpers.get_stage(stage_name)
         for out in info["outs"]:
             # Only include Out types that are data files (not Metric, Plot, etc.)
             if not isinstance(out, (outputs.Metric, outputs.Plot)):
@@ -543,24 +543,22 @@ def get_data_hashes_from_head() -> dict[str, str | None]:
 
     Returns relative paths mapping to hashes (or None if no hash).
     """
-    from pivot import registry
+    from pivot.cli import helpers as cli_helpers
 
     result = dict[str, str | None]()
     proj_root = project.get_project_root()
 
     # Collect lock file paths and data paths per stage
-    stage_data_paths: dict[str, list[str]] = {}
-    for stage_name in registry.REGISTRY.list_stages():
-        info = registry.REGISTRY.get(stage_name)
+    stage_data_paths = dict[str, list[str]]()
+    for stage_name in cli_helpers.list_stages():
+        info = cli_helpers.get_stage(stage_name)
         for out in info["outs"]:
             if not isinstance(out, (outputs.Metric, outputs.Plot)):
                 abs_path = str(project.normalize_path(cast("str", out.path)))
                 rel_path = project.to_relative_path(abs_path, proj_root)
                 fmt = detect_format(pathlib.Path(rel_path))
                 if fmt != DataFileFormat.UNKNOWN:
-                    if stage_name not in stage_data_paths:
-                        stage_data_paths[stage_name] = []
-                    stage_data_paths[stage_name].append(rel_path)
+                    stage_data_paths.setdefault(stage_name, []).append(rel_path)
                     result[rel_path] = None
 
     # Read all lock files from HEAD in one batch

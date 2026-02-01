@@ -5,7 +5,7 @@ from typing import TypedDict
 
 import click
 
-from pivot import config, project, registry
+from pivot import config, project
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
 from pivot.storage import cache
@@ -50,8 +50,8 @@ def _get_all_stage_outputs() -> dict[str, pathlib.Path]:
         This provides clear error messages showing ALL issues at once.
     """
     outputs_normalized = set[str]()
-    for stage_name in registry.REGISTRY.list_stages():
-        info = registry.REGISTRY.get(stage_name)
+    for stage_name in cli_helpers.list_stages():
+        info = cli_helpers.get_stage(stage_name)
         outputs_normalized.update(info.get("outs_paths", []))
 
     # Pre-resolve all stage outputs with explicit error handling

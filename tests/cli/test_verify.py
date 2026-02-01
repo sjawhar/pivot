@@ -10,7 +10,10 @@ from pivot.storage import cache, lock
 
 if TYPE_CHECKING:
     import click.testing
+    import pytest
     from pytest_mock import MockerFixture
+
+    from pivot.pipeline.pipeline import Pipeline
 
 
 def _setup_mock_remote(mocker: MockerFixture, *, files_exist_on_remote: bool) -> None:
@@ -95,15 +98,19 @@ def test_verify_help(runner: click.testing.CliRunner) -> None:
     assert "--allow-missing" in result.output
 
 
-def test_verify_no_stages(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
+def test_verify_no_stages(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Verify with no stages shows appropriate error."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".git").mkdir()
+    # Create empty pivot.yaml so pipeline can be discovered
+    (tmp_path / "pivot.yaml").write_text("stages: {}")
 
-        result = runner.invoke(cli.cli, ["verify"])
+    result = runner.invoke(cli.cli, ["verify"])
 
-        assert result.exit_code != 0
-        assert "No stages registered" in result.output
+    assert result.exit_code != 0
+    assert "No stages registered" in result.output
 
 
 # =============================================================================
@@ -111,130 +118,156 @@ def test_verify_no_stages(runner: click.testing.CliRunner, tmp_path: pathlib.Pat
 # =============================================================================
 
 
-def test_verify_all_cached_exits_0(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
+def test_verify_all_cached_exits_0(
+    mock_discovery: Pipeline,
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """pivot verify with all stages cached and files present exits 0."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        pathlib.Path("input.txt").write_text("data")
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "input.txt").write_text("data")
 
-        register_test_stage(_helper_process, name="process")
+    register_test_stage(_helper_process, name="process")
 
-        # Run to cache
-        executor.run()
+    # Run to cache
+    executor.run(pipeline=mock_discovery)
 
-        result = runner.invoke(cli.cli, ["verify"])
+    result = runner.invoke(cli.cli, ["verify"])
 
-        assert result.exit_code == 0
-        assert "Verification passed" in result.output
+    assert result.exit_code == 0
+    assert "Verification passed" in result.output
 
 
-def test_verify_stale_code_exits_1(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
+def test_verify_stale_code_exits_1(
+    mock_discovery: Pipeline,
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """pivot verify with stale stage (code changed) exits 1."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        pathlib.Path("input.txt").write_text("data")
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "input.txt").write_text("data")
 
-        register_test_stage(_helper_process, name="process")
+    register_test_stage(_helper_process, name="process")
 
-        # Run to cache
-        executor.run()
+    # Run to cache
+    executor.run(pipeline=mock_discovery)
 
-        # Modify the lock file to simulate code change
-        state_dir = pathlib.Path(".pivot")
-        stage_lock = lock.StageLock("process", lock.get_stages_dir(state_dir))
-        lock_data = stage_lock.read()
-        assert lock_data is not None
-        lock_data["code_manifest"]["process"] = "changed_hash"
-        stage_lock.write(lock_data)
+    # Modify the lock file to simulate code change
+    state_dir = tmp_path / ".pivot"
+    stage_lock = lock.StageLock("process", lock.get_stages_dir(state_dir))
+    lock_data = stage_lock.read()
+    assert lock_data is not None
+    lock_data["code_manifest"]["process"] = "changed_hash"
+    stage_lock.write(lock_data)
 
-        result = runner.invoke(cli.cli, ["verify"])
+    result = runner.invoke(cli.cli, ["verify"])
 
-        assert result.exit_code == 1
-        assert "Code changed" in result.output
+    assert result.exit_code == 1
+    assert "Code changed" in result.output
 
 
 def test_verify_stale_params_exits_1(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+    mock_discovery: Pipeline,
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """pivot verify with stale stage (params changed) exits 1."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        pathlib.Path("input.txt").write_text("data")
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "input.txt").write_text("data")
 
-        register_test_stage(_helper_process, name="process")
+    register_test_stage(_helper_process, name="process")
 
-        # Run to cache
-        executor.run()
+    # Run to cache
+    executor.run(pipeline=mock_discovery)
 
-        # Modify the lock file to simulate params change
-        state_dir = pathlib.Path(".pivot")
-        stage_lock = lock.StageLock("process", lock.get_stages_dir(state_dir))
-        lock_data = stage_lock.read()
-        assert lock_data is not None
-        lock_data["params"]["new_param"] = "value"
-        stage_lock.write(lock_data)
+    # Modify the lock file to simulate params change
+    state_dir = tmp_path / ".pivot"
+    stage_lock = lock.StageLock("process", lock.get_stages_dir(state_dir))
+    lock_data = stage_lock.read()
+    assert lock_data is not None
+    lock_data["params"]["new_param"] = "value"
+    stage_lock.write(lock_data)
 
-        result = runner.invoke(cli.cli, ["verify"])
+    result = runner.invoke(cli.cli, ["verify"])
 
-        assert result.exit_code == 1
-        assert "Params changed" in result.output
+    assert result.exit_code == 1
+    assert "Params changed" in result.output
 
 
-def test_verify_stale_deps_exits_1(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
+def test_verify_stale_deps_exits_1(
+    mock_discovery: Pipeline,
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """pivot verify with stale stage (deps changed) exits 1."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        pathlib.Path("input.txt").write_text("data")
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "input.txt").write_text("data")
 
-        register_test_stage(_helper_process, name="process")
+    register_test_stage(_helper_process, name="process")
 
-        # Run to cache
-        executor.run()
+    # Run to cache
+    executor.run(pipeline=mock_discovery)
 
-        # Modify input file to change deps
-        pathlib.Path("input.txt").write_text("modified data")
+    # Modify input file to change deps
+    (tmp_path / "input.txt").write_text("modified data")
 
-        result = runner.invoke(cli.cli, ["verify"])
+    result = runner.invoke(cli.cli, ["verify"])
 
-        assert result.exit_code == 1
-        assert "Input dependencies changed" in result.output
+    assert result.exit_code == 1
+    assert "Input dependencies changed" in result.output
 
 
 def test_verify_missing_dep_file_exits_1(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+    mock_discovery: Pipeline,
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """pivot verify with missing dependency file exits 1."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        pathlib.Path("input.txt").write_text("data")
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "input.txt").write_text("data")
 
-        register_test_stage(_helper_process, name="process")
+    register_test_stage(_helper_process, name="process")
 
-        # Run to cache
-        executor.run()
+    # Run to cache
+    executor.run(pipeline=mock_discovery)
 
-        # Delete the dependency file
-        pathlib.Path("input.txt").unlink()
+    # Delete the dependency file
+    (tmp_path / "input.txt").unlink()
 
-        result = runner.invoke(cli.cli, ["verify"])
+    result = runner.invoke(cli.cli, ["verify"])
 
-        assert result.exit_code == 1
-        assert "depends on" in result.output and "does not exist" in result.output
+    assert result.exit_code == 1
+    assert "Missing deps" in result.output and "input.txt" in result.output
 
 
-def test_verify_never_run_exits_1(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
+def test_verify_never_run_exits_1(
+    mock_discovery: Pipeline,
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """pivot verify with stage that was never run exits 1."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        pathlib.Path("input.txt").write_text("data")
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "input.txt").write_text("data")
 
-        register_test_stage(_helper_process, name="process")
+    register_test_stage(_helper_process, name="process")
 
-        # Don't run - no lock file exists
-        result = runner.invoke(cli.cli, ["verify"])
+    # Don't run - no lock file exists
+    result = runner.invoke(cli.cli, ["verify"])
 
-        assert result.exit_code == 1
-        assert "No previous run" in result.output
+    assert result.exit_code == 1
+    assert "No previous run" in result.output
 
 
 # =============================================================================
@@ -242,59 +275,72 @@ def test_verify_never_run_exits_1(runner: click.testing.CliRunner, tmp_path: pat
 # =============================================================================
 
 
-def test_verify_specific_stage(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
+def test_verify_specific_stage(
+    mock_discovery: Pipeline,
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """pivot verify train verifies only the train stage."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        pathlib.Path("input.txt").write_text("data")
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "input.txt").write_text("data")
 
-        register_test_stage(_helper_stage_a, name="stage_a")
-        register_test_stage(_helper_stage_b, name="stage_b")
+    register_test_stage(_helper_stage_a, name="stage_a")
+    register_test_stage(_helper_stage_b, name="stage_b")
 
-        # Run to cache both
-        executor.run()
+    # Run to cache both
+    executor.run(pipeline=mock_discovery)
 
-        # Verify only stage_a
-        result = runner.invoke(cli.cli, ["verify", "stage_a"])
+    # Verify only stage_a
+    result = runner.invoke(cli.cli, ["verify", "stage_a"])
 
-        assert result.exit_code == 0
-        assert "stage_a" in result.output
+    assert result.exit_code == 0
+    assert "stage_a" in result.output
 
 
-def test_verify_multiple_stages(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
+def test_verify_multiple_stages(
+    mock_discovery: Pipeline,
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """pivot verify stage_a stage_b verifies both stages."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        pathlib.Path("input.txt").write_text("data")
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "input.txt").write_text("data")
 
-        register_test_stage(_helper_stage_a, name="stage_a")
-        register_test_stage(_helper_stage_b, name="stage_b")
+    register_test_stage(_helper_stage_a, name="stage_a")
+    register_test_stage(_helper_stage_b, name="stage_b")
 
-        # Run to cache both
-        executor.run()
+    # Run to cache both
+    executor.run(pipeline=mock_discovery)
 
-        # Verify both
-        result = runner.invoke(cli.cli, ["verify", "stage_a", "stage_b"])
+    # Verify both
+    result = runner.invoke(cli.cli, ["verify", "stage_a", "stage_b"])
 
-        assert result.exit_code == 0
-        assert "stage_a" in result.output
-        assert "stage_b" in result.output
+    assert result.exit_code == 0
+    assert "stage_a" in result.output
+    assert "stage_b" in result.output
 
 
 def test_verify_nonexistent_stage_errors(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+    mock_discovery: Pipeline,
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """pivot verify nonexistent exits non-zero with stage not found error."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        pathlib.Path("input.txt").write_text("data")
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "input.txt").write_text("data")
 
-        register_test_stage(_helper_process, name="process")
+    register_test_stage(_helper_process, name="process")
 
-        result = runner.invoke(cli.cli, ["verify", "nonexistent"])
+    result = runner.invoke(cli.cli, ["verify", "nonexistent"])
 
-        assert result.exit_code != 0
-        assert "nonexistent" in result.output.lower()
+    assert result.exit_code != 0
+    assert "nonexistent" in result.output.lower()
 
 
 # =============================================================================
@@ -303,124 +349,143 @@ def test_verify_nonexistent_stage_errors(
 
 
 def test_verify_allow_missing_no_remote_errors(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+    mock_discovery: Pipeline,
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """pivot verify --allow-missing with no remote configured exits non-zero."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        pathlib.Path("input.txt").write_text("data")
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "input.txt").write_text("data")
 
-        register_test_stage(_helper_process, name="process")
+    register_test_stage(_helper_process, name="process")
 
-        # Run to cache
-        executor.run()
+    # Run to cache
+    executor.run(pipeline=mock_discovery)
 
-        result = runner.invoke(cli.cli, ["verify", "--allow-missing"])
+    result = runner.invoke(cli.cli, ["verify", "--allow-missing"])
 
-        assert result.exit_code != 0
-        assert "remote" in result.output.lower()
+    assert result.exit_code != 0
+    assert "remote" in result.output.lower()
 
 
 def test_verify_allow_missing_file_on_remote_passes(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path, mocker: MockerFixture
+    mock_discovery: Pipeline,
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    mocker: MockerFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """pivot verify --allow-missing with missing local file that exists on remote exits 0."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        pathlib.Path("input.txt").write_text("data")
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "input.txt").write_text("data")
 
-        register_test_stage(_helper_process, name="process")
+    register_test_stage(_helper_process, name="process")
 
-        # Run to cache
-        executor.run()
+    # Run to cache
+    executor.run(pipeline=mock_discovery)
 
-        # Get the output hash before deleting
-        state_dir = pathlib.Path(".pivot")
-        cache_dir = pathlib.Path(".pivot/cache")
-        stage_lock = lock.StageLock("process", lock.get_stages_dir(state_dir))
-        lock_data = stage_lock.read()
-        assert lock_data is not None
-        output_hash = list(lock_data["output_hashes"].values())[0]
-        assert output_hash is not None
+    # Get the output hash before deleting
+    state_dir = tmp_path / ".pivot"
+    cache_dir = tmp_path / ".pivot/cache"
+    stage_lock = lock.StageLock("process", lock.get_stages_dir(state_dir))
+    lock_data = stage_lock.read()
+    assert lock_data is not None
+    output_hash = list(lock_data["output_hashes"].values())[0]
+    assert output_hash is not None
 
-        # Delete output file and its cache entry
-        pathlib.Path("output.txt").unlink()
-        cache_path = cache.get_cache_path(cache_dir / "files", output_hash["hash"])
-        if cache_path.exists():
-            cache_path.unlink()
+    # Delete output file and its cache entry
+    (tmp_path / "output.txt").unlink()
+    cache_path = cache.get_cache_path(cache_dir / "files", output_hash["hash"])
+    if cache_path.exists():
+        cache_path.unlink()
 
-        _setup_mock_remote(mocker, files_exist_on_remote=True)
+    _setup_mock_remote(mocker, files_exist_on_remote=True)
 
-        result = runner.invoke(cli.cli, ["verify", "--allow-missing"])
+    result = runner.invoke(cli.cli, ["verify", "--allow-missing"])
 
-        assert result.exit_code == 0
+    assert result.exit_code == 0
 
 
 def test_verify_allow_missing_file_not_on_remote_fails(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path, mocker: MockerFixture
+    mock_discovery: Pipeline,
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    mocker: MockerFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """pivot verify --allow-missing with missing local file not on remote exits 1."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        pathlib.Path("input.txt").write_text("data")
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "input.txt").write_text("data")
 
-        register_test_stage(_helper_process, name="process")
+    register_test_stage(_helper_process, name="process")
 
-        # Run to cache
-        executor.run()
+    # Run to cache
+    executor.run(pipeline=mock_discovery)
 
-        # Delete output file and its cache entry
-        pathlib.Path("output.txt").unlink()
-        state_dir = pathlib.Path(".pivot")
-        cache_dir = pathlib.Path(".pivot/cache")
-        stage_lock = lock.StageLock("process", lock.get_stages_dir(state_dir))
-        lock_data = stage_lock.read()
-        assert lock_data is not None
-        output_hash = list(lock_data["output_hashes"].values())[0]
-        assert output_hash is not None
-        cache_path = cache.get_cache_path(cache_dir / "files", output_hash["hash"])
-        if cache_path.exists():
-            cache_path.unlink()
+    # Delete output file and its cache entry
+    (tmp_path / "output.txt").unlink()
+    state_dir = tmp_path / ".pivot"
+    cache_dir = tmp_path / ".pivot/cache"
+    stage_lock = lock.StageLock("process", lock.get_stages_dir(state_dir))
+    lock_data = stage_lock.read()
+    assert lock_data is not None
+    output_hash = list(lock_data["output_hashes"].values())[0]
+    assert output_hash is not None
+    cache_path = cache.get_cache_path(cache_dir / "files", output_hash["hash"])
+    if cache_path.exists():
+        cache_path.unlink()
 
-        _setup_mock_remote(mocker, files_exist_on_remote=False)
+    _setup_mock_remote(mocker, files_exist_on_remote=False)
 
-        result = runner.invoke(cli.cli, ["verify", "--allow-missing"])
+    result = runner.invoke(cli.cli, ["verify", "--allow-missing"])
 
-        assert result.exit_code == 1
-        assert "Missing files:" in result.output
+    assert result.exit_code == 1
+    assert "Missing files:" in result.output
 
 
 def test_verify_allow_missing_code_changed_still_fails(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path, mocker: MockerFixture
+    mock_discovery: Pipeline,
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    mocker: MockerFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """pivot verify --allow-missing with code changes still exits 1."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        pathlib.Path("input.txt").write_text("data")
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "input.txt").write_text("data")
 
-        register_test_stage(_helper_process, name="process")
+    register_test_stage(_helper_process, name="process")
 
-        # Run to cache
-        executor.run()
+    # Run to cache
+    executor.run(pipeline=mock_discovery)
 
-        # Modify the lock file to simulate code change
-        state_dir = pathlib.Path(".pivot")
-        stage_lock = lock.StageLock("process", lock.get_stages_dir(state_dir))
-        lock_data = stage_lock.read()
-        assert lock_data is not None
-        lock_data["code_manifest"]["process"] = "changed_hash"
-        stage_lock.write(lock_data)
+    # Modify the lock file to simulate code change
+    state_dir = tmp_path / ".pivot"
+    stage_lock = lock.StageLock("process", lock.get_stages_dir(state_dir))
+    lock_data = stage_lock.read()
+    assert lock_data is not None
+    lock_data["code_manifest"]["process"] = "changed_hash"
+    stage_lock.write(lock_data)
 
-        _setup_mock_remote(mocker, files_exist_on_remote=True)
+    _setup_mock_remote(mocker, files_exist_on_remote=True)
 
-        result = runner.invoke(cli.cli, ["verify", "--allow-missing"])
+    result = runner.invoke(cli.cli, ["verify", "--allow-missing"])
 
-        assert result.exit_code == 1
-        assert "Code changed" in result.output
+    assert result.exit_code == 1
+    assert "Code changed" in result.output
 
 
 def test_verify_allow_missing_without_prior_run(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path, mocker: MockerFixture
+    mock_discovery: Pipeline,
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    mocker: MockerFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """verify --allow-missing works when dep files missing (CI scenario).
 
@@ -430,19 +495,19 @@ def test_verify_allow_missing_without_prior_run(
     Scenario: CI clone has no dep files yet, but they would exist after setup.
     With validate=False, DAG building doesn't error on missing deps.
     """
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".git").mkdir()
 
-        register_test_stage(_helper_process, name="process")
+    register_test_stage(_helper_process, name="process")
 
-        _setup_mock_remote(mocker, files_exist_on_remote=True)
+    _setup_mock_remote(mocker, files_exist_on_remote=True)
 
-        result = runner.invoke(cli.cli, ["verify", "--allow-missing"])
+    result = runner.invoke(cli.cli, ["verify", "--allow-missing"])
 
-        # Should NOT raise DependencyNotFoundError during DAG building
-        assert "does not exist on disk" not in result.output, f"Got error: {result.output}"
-        # Verification fails (exit 1) because stage is stale, but command completes
-        assert result.exit_code == 1
+    # Should NOT raise DependencyNotFoundError during DAG building
+    assert "does not exist on disk" not in result.output, f"Got error: {result.output}"
+    # Verification fails (exit 1) because stage is stale, but command completes
+    assert result.exit_code == 1
 
 
 # =============================================================================
@@ -450,76 +515,89 @@ def test_verify_allow_missing_without_prior_run(
 # =============================================================================
 
 
-def test_verify_json_output_passed(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
+def test_verify_json_output_passed(
+    mock_discovery: Pipeline,
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """--json outputs valid JSON with passed=true when all cached."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        pathlib.Path("input.txt").write_text("data")
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "input.txt").write_text("data")
 
-        register_test_stage(_helper_process, name="process")
+    register_test_stage(_helper_process, name="process")
 
-        # Run to cache
-        executor.run()
+    # Run to cache
+    executor.run(pipeline=mock_discovery)
 
-        result = runner.invoke(cli.cli, ["verify", "--json"])
+    result = runner.invoke(cli.cli, ["verify", "--json"])
 
-        assert result.exit_code == 0
-        data = json.loads(result.output)
-        assert "passed" in data
-        assert data["passed"] is True
-        assert "stages" in data
-        assert len(data["stages"]) == 1
-        assert data["stages"][0]["name"] == "process"
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert "passed" in data
+    assert data["passed"] is True
+    assert "stages" in data
+    assert len(data["stages"]) == 1
+    assert data["stages"][0]["name"] == "process"
 
 
-def test_verify_json_output_failed(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
+def test_verify_json_output_failed(
+    mock_discovery: Pipeline,
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """--json outputs valid JSON with passed=false and reasons when stale."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        pathlib.Path("input.txt").write_text("data")
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "input.txt").write_text("data")
 
-        register_test_stage(_helper_process, name="process")
+    register_test_stage(_helper_process, name="process")
 
-        # Don't run - stage is stale
-        result = runner.invoke(cli.cli, ["verify", "--json"])
+    # Don't run - stage is stale
+    result = runner.invoke(cli.cli, ["verify", "--json"])
 
-        assert result.exit_code == 1
-        data = json.loads(result.output)
-        assert "passed" in data
-        assert data["passed"] is False
-        assert "stages" in data
-        assert len(data["stages"]) == 1
-        assert data["stages"][0]["name"] == "process"
-        assert "reason" in data["stages"][0]
+    assert result.exit_code == 1
+    data = json.loads(result.output)
+    assert "passed" in data
+    assert data["passed"] is False
+    assert "stages" in data
+    assert len(data["stages"]) == 1
+    assert data["stages"][0]["name"] == "process"
+    assert "reason" in data["stages"][0]
 
 
 def test_verify_json_includes_all_keys(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+    mock_discovery: Pipeline,
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """--json output always includes passed, stages, and failure reasons."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        pathlib.Path("input.txt").write_text("data")
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "input.txt").write_text("data")
 
-        register_test_stage(_helper_process, name="process")
+    register_test_stage(_helper_process, name="process")
 
-        # Run to cache
-        executor.run()
+    # Run to cache
+    executor.run(pipeline=mock_discovery)
 
-        # Modify deps to make stale
-        pathlib.Path("input.txt").write_text("modified")
+    # Modify deps to make stale
+    (tmp_path / "input.txt").write_text("modified")
 
-        result = runner.invoke(cli.cli, ["verify", "--json"])
+    result = runner.invoke(cli.cli, ["verify", "--json"])
 
-        assert result.exit_code == 1
-        data = json.loads(result.output)
-        assert "passed" in data
-        assert "stages" in data
-        # Each stage should have name, status, and reason
-        for stage in data["stages"]:
-            assert "name" in stage
-            assert "status" in stage
-            assert "reason" in stage
+    assert result.exit_code == 1
+    data = json.loads(result.output)
+    assert "passed" in data
+    assert "stages" in data
+    # Each stage should have name, status, and reason
+    for stage in data["stages"]:
+        assert "name" in stage
+        assert "status" in stage
+        assert "reason" in stage
 
 
 # =============================================================================
@@ -528,39 +606,45 @@ def test_verify_json_includes_all_keys(
 
 
 def test_verify_quiet_no_output_when_passed(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+    mock_discovery: Pipeline,
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """pivot --quiet verify produces no output when all stages are cached."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        pathlib.Path("input.txt").write_text("data")
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "input.txt").write_text("data")
 
-        register_test_stage(_helper_process, name="process")
+    register_test_stage(_helper_process, name="process")
 
-        # Run to cache
-        executor.run()
+    # Run to cache
+    executor.run(pipeline=mock_discovery)
 
-        result = runner.invoke(cli.cli, ["--quiet", "verify"])
+    result = runner.invoke(cli.cli, ["--quiet", "verify"])
 
-        assert result.exit_code == 0
-        assert result.output.strip() == "", "Quiet mode should suppress output when passing"
+    assert result.exit_code == 0
+    assert result.output.strip() == "", "Quiet mode should suppress output when passing"
 
 
 def test_verify_quiet_exits_1_when_failed(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+    mock_discovery: Pipeline,
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """pivot --quiet verify exits 1 when verification fails."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        pathlib.Path("input.txt").write_text("data")
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "input.txt").write_text("data")
 
-        register_test_stage(_helper_process, name="process")
+    register_test_stage(_helper_process, name="process")
 
-        # Don't run - stage is stale
-        result = runner.invoke(cli.cli, ["--quiet", "verify"])
+    # Don't run - stage is stale
+    result = runner.invoke(cli.cli, ["--quiet", "verify"])
 
-        assert result.exit_code == 1
-        assert result.output.strip() == "", "Quiet mode should suppress output"
+    assert result.exit_code == 1
+    assert result.output.strip() == "", "Quiet mode should suppress output"
 
 
 # =============================================================================
@@ -569,73 +653,83 @@ def test_verify_quiet_exits_1_when_failed(
 
 
 def test_verify_allow_missing_uses_pvt_hash_for_deps(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path, mocker: MockerFixture
+    mock_discovery: Pipeline,
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    mocker: MockerFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """verify --allow-missing uses .pvt hash when dep file is missing."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".git").mkdir()
 
-        # Create input.txt and run stage to cache
-        pathlib.Path("input.txt").write_text("data")
-        register_test_stage(_helper_process, name="process")
-        executor.run()
+    # Create input.txt and run stage to cache
+    (tmp_path / "input.txt").write_text("data")
+    register_test_stage(_helper_process, name="process")
+    executor.run(pipeline=mock_discovery)
 
-        # Track the input file (create .pvt)
-        from pivot.storage import track
+    # Track the input file (create .pvt)
+    from pivot.storage import track
 
-        input_hash = cache.hash_file(pathlib.Path("input.txt"))
-        pvt_data = track.PvtData(path="input.txt", hash=input_hash, size=4)
-        track.write_pvt_file(pathlib.Path("input.txt.pvt"), pvt_data)
+    input_hash = cache.hash_file(tmp_path / "input.txt")
+    pvt_data = track.PvtData(path="input.txt", hash=input_hash, size=4)
+    track.write_pvt_file(tmp_path / "input.txt.pvt", pvt_data)
 
-        # Delete the actual input file (simulating CI without data)
-        pathlib.Path("input.txt").unlink()
+    # Delete the actual input file (simulating CI without data)
+    (tmp_path / "input.txt").unlink()
 
-        _setup_mock_remote(mocker, files_exist_on_remote=True)
+    _setup_mock_remote(mocker, files_exist_on_remote=True)
 
-        result = runner.invoke(cli.cli, ["verify", "--allow-missing"])
+    result = runner.invoke(cli.cli, ["verify", "--allow-missing"])
 
-        # Should NOT fail with "Missing deps" - should use .pvt hash
-        assert "Missing deps" not in result.output, f"Got: {result.output}"
-        assert result.exit_code == 0, f"Expected pass, got: {result.output}"
+    # Should NOT fail with "Missing deps" - should use .pvt hash
+    assert "Missing deps" not in result.output, f"Got: {result.output}"
+    assert result.exit_code == 0, f"Expected pass, got: {result.output}"
 
 
 def test_verify_allow_missing_uses_pvt_hash_for_nested_dep(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path, mocker: MockerFixture
+    mock_discovery: Pipeline,
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    mocker: MockerFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """verify --allow-missing uses directory .pvt manifest for nested file dep."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
+    # Change to tmp_path (matches mock_discovery pipeline root)
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".git").mkdir()
 
-        # Create data directory with file
-        data_dir = pathlib.Path("data")
-        data_dir.mkdir()
-        (data_dir / "file.csv").write_text("content")
+    # Create data directory with file
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "file.csv").write_text("content")
 
-        register_test_stage(_helper_dir_dep_stage, name="process")
-        executor.run()
+    register_test_stage(_helper_dir_dep_stage, name="process")
+    run_result = runner.invoke(cli.cli, ["run"])
+    assert run_result.exit_code == 0, f"Run failed: {run_result.output}"
 
-        # Track the directory (create .pvt with manifest)
-        from pivot.storage import track
+    # Track the directory (create .pvt with manifest)
+    from pivot.storage import track
 
-        dir_hash, manifest = cache.hash_directory(data_dir)
-        pvt_data = track.PvtData(
-            path="data",
-            hash=dir_hash,
-            size=7,
-            num_files=1,
-            manifest=manifest,
-        )
-        track.write_pvt_file(pathlib.Path("data.pvt"), pvt_data)
+    dir_hash, manifest = cache.hash_directory(data_dir)
+    pvt_data = track.PvtData(
+        path="data",
+        hash=dir_hash,
+        size=7,
+        num_files=1,
+        manifest=manifest,
+    )
+    track.write_pvt_file(tmp_path / "data.pvt", pvt_data)
 
-        # Delete the actual data directory (simulating CI without data)
-        import shutil
+    # Delete the actual data directory (simulating CI without data)
+    import shutil
 
-        shutil.rmtree(data_dir)
+    shutil.rmtree(data_dir)
 
-        _setup_mock_remote(mocker, files_exist_on_remote=True)
+    _setup_mock_remote(mocker, files_exist_on_remote=True)
 
-        result = runner.invoke(cli.cli, ["verify", "--allow-missing"])
+    result = runner.invoke(cli.cli, ["verify", "--allow-missing"])
 
-        # Should use manifest entry hash for data/file.csv
-        assert "Missing deps" not in result.output, f"Got: {result.output}"
-        assert result.exit_code == 0, f"Expected pass, got: {result.output}"
+    # Should use manifest entry hash for data/file.csv
+    assert "Missing deps" not in result.output, f"Got: {result.output}"
+    assert result.exit_code == 0, f"Expected pass, got: {result.output}"

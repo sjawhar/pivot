@@ -1,10 +1,17 @@
-import pathlib
-from typing import Annotated, TypedDict
+from __future__ import annotations
 
-import click.testing
+import pathlib
+from typing import TYPE_CHECKING, Annotated, TypedDict
+
 import pytest
 
 from helpers import register_test_stage
+
+if TYPE_CHECKING:
+    import click.testing
+
+    from pivot.pipeline.pipeline import Pipeline
+
 from pivot import cli, exceptions, executor, loaders, outputs, project
 from pivot.storage import track
 
@@ -99,7 +106,9 @@ def _process_uppercase(
     return {"output": pathlib.Path("output.txt")}
 
 
-def test_run_succeeds_with_existing_tracked_file(pipeline_dir: pathlib.Path) -> None:
+def test_run_succeeds_with_existing_tracked_file(
+    test_pipeline: Pipeline, pipeline_dir: pathlib.Path
+) -> None:
     """Pipeline runs successfully when tracked file exists."""
     # Create and track a data file
     data_file = pipeline_dir / "data.csv"
@@ -112,13 +121,15 @@ def test_run_succeeds_with_existing_tracked_file(pipeline_dir: pathlib.Path) -> 
 
     register_test_stage(_process_data, name="process")
 
-    results = executor.run()
+    results = executor.run(pipeline=test_pipeline)
 
     assert results["process"]["status"] == "ran"
     assert (pipeline_dir / "output.txt").exists()
 
 
-def test_run_fails_when_tracked_file_missing(pipeline_dir: pathlib.Path) -> None:
+def test_run_fails_when_tracked_file_missing(
+    test_pipeline: Pipeline, pipeline_dir: pathlib.Path
+) -> None:
     """Pipeline fails if tracked file is missing (with helpful error message)."""
     # Create .pvt file but NOT the data file
     track.write_pvt_file(
@@ -133,11 +144,11 @@ def test_run_fails_when_tracked_file_missing(pipeline_dir: pathlib.Path) -> None
         exceptions.TrackedFileMissingError,
         match=r"checkout|restore|missing",
     ):
-        executor.run()
+        executor.run(pipeline=test_pipeline)
 
 
 def test_run_succeeds_with_hash_mismatch(
-    pipeline_dir: pathlib.Path, runner: click.testing.CliRunner
+    test_pipeline: Pipeline, pipeline_dir: pathlib.Path, runner: click.testing.CliRunner
 ) -> None:
     """Pipeline runs successfully when tracked file hash doesn't match .pvt."""
     # Create data file with some content
@@ -154,7 +165,7 @@ def test_run_succeeds_with_hash_mismatch(
     register_test_stage(_process_simple, name="process")
 
     # Should succeed (warning logged but execution continues)
-    results = executor.run()
+    results = executor.run(pipeline=test_pipeline)
     assert results["process"]["status"] == "ran"
     assert (pipeline_dir / "output.txt").exists()
 
@@ -165,7 +176,7 @@ def test_run_succeeds_with_hash_mismatch(
 
 
 def test_tracked_file_change_triggers_downstream_rerun(
-    pipeline_dir: pathlib.Path, runner: click.testing.CliRunner
+    test_pipeline: Pipeline, pipeline_dir: pathlib.Path, runner: click.testing.CliRunner
 ) -> None:
     """Changing a tracked file triggers re-execution of dependent stages."""
     # Create and track initial data
@@ -178,7 +189,7 @@ def test_tracked_file_change_triggers_downstream_rerun(
     register_test_stage(_process_data_content, name="process")
 
     # First run
-    results = executor.run()
+    results = executor.run(pipeline=test_pipeline)
     assert results["process"]["status"] == "ran"
     assert (pipeline_dir / "output.txt").read_text() == "processed: original"
 
@@ -188,13 +199,13 @@ def test_tracked_file_change_triggers_downstream_rerun(
     assert result.exit_code == 0
 
     # Second run - should re-execute due to tracked file change
-    results = executor.run()
+    results = executor.run(pipeline=test_pipeline)
     assert results["process"]["status"] == "ran"
     assert (pipeline_dir / "output.txt").read_text() == "processed: modified"
 
 
 def test_unchanged_tracked_file_allows_skip(
-    pipeline_dir: pathlib.Path, runner: click.testing.CliRunner
+    test_pipeline: Pipeline, pipeline_dir: pathlib.Path, runner: click.testing.CliRunner
 ) -> None:
     """Unchanged tracked file allows stage to be skipped."""
     data_file = pipeline_dir / "data.csv"
@@ -206,11 +217,11 @@ def test_unchanged_tracked_file_allows_skip(
     register_test_stage(_process_data_content, name="process")
 
     # First run
-    results = executor.run()
+    results = executor.run(pipeline=test_pipeline)
     assert results["process"]["status"] == "ran"
 
     # Second run - should skip (nothing changed)
-    results = executor.run()
+    results = executor.run(pipeline=test_pipeline)
     assert results["process"]["status"] == "skipped"
 
 
@@ -220,7 +231,7 @@ def test_unchanged_tracked_file_allows_skip(
 
 
 def test_tracked_directory_change_triggers_rerun(
-    pipeline_dir: pathlib.Path, runner: click.testing.CliRunner
+    test_pipeline: Pipeline, pipeline_dir: pathlib.Path, runner: click.testing.CliRunner
 ) -> None:
     """Changing a tracked directory triggers re-execution."""
     # Create and track directory
@@ -235,7 +246,7 @@ def test_tracked_directory_change_triggers_rerun(
     register_test_stage(_count_images, name="count_images")
 
     # First run
-    results = executor.run()
+    results = executor.run(pipeline=test_pipeline)
     assert results["count_images"]["status"] == "ran"
     assert (pipeline_dir / "count.txt").read_text() == "2"
 
@@ -245,12 +256,14 @@ def test_tracked_directory_change_triggers_rerun(
     assert result.exit_code == 0
 
     # Second run - should re-execute
-    results = executor.run()
+    results = executor.run(pipeline=test_pipeline)
     assert results["count_images"]["status"] == "ran"
     assert (pipeline_dir / "count.txt").read_text() == "3"
 
 
-def test_run_fails_when_tracked_directory_missing(pipeline_dir: pathlib.Path) -> None:
+def test_run_fails_when_tracked_directory_missing(
+    test_pipeline: Pipeline, pipeline_dir: pathlib.Path
+) -> None:
     """Pipeline fails if tracked directory is missing (with helpful error message)."""
     track.write_pvt_file(
         pipeline_dir / "images.pvt",
@@ -273,7 +286,7 @@ def test_run_fails_when_tracked_directory_missing(pipeline_dir: pathlib.Path) ->
         exceptions.TrackedFileMissingError,
         match=r"checkout|restore|missing",
     ):
-        executor.run()
+        executor.run(pipeline=test_pipeline)
 
 
 # =============================================================================
@@ -282,7 +295,7 @@ def test_run_fails_when_tracked_directory_missing(pipeline_dir: pathlib.Path) ->
 
 
 def test_mixed_tracked_and_regular_dependencies(
-    pipeline_dir: pathlib.Path, runner: click.testing.CliRunner
+    test_pipeline: Pipeline, pipeline_dir: pathlib.Path, runner: click.testing.CliRunner
 ) -> None:
     """Stages can depend on both tracked files and regular files."""
     # Create tracked file
@@ -298,12 +311,12 @@ def test_mixed_tracked_and_regular_dependencies(
     register_test_stage(_process_mixed, name="process")
 
     # First run
-    results = executor.run()
+    results = executor.run(pipeline=test_pipeline)
     assert results["process"]["status"] == "ran"
 
     # Change regular file - should trigger rerun
     config_file.write_text("setting=2")
-    results = executor.run()
+    results = executor.run(pipeline=test_pipeline)
     assert results["process"]["status"] == "ran"
 
 
@@ -313,7 +326,7 @@ def test_mixed_tracked_and_regular_dependencies(
 
 
 def test_checkout_then_run_succeeds(
-    pipeline_dir: pathlib.Path, runner: click.testing.CliRunner
+    test_pipeline: Pipeline, pipeline_dir: pathlib.Path, runner: click.testing.CliRunner
 ) -> None:
     """After checkout, pipeline can run successfully."""
     # Create, track, then delete a file
@@ -335,6 +348,6 @@ def test_checkout_then_run_succeeds(
     register_test_stage(_process_uppercase, name="process")
 
     # Pipeline should run successfully
-    results = executor.run()
+    results = executor.run(pipeline=test_pipeline)
     assert results["process"]["status"] == "ran"
     assert (pipeline_dir / "output.txt").read_text() == "IMPORTANT DATA"

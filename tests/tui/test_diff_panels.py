@@ -26,6 +26,7 @@ if TYPE_CHECKING:
 
     from pytest_mock import MockerFixture
 
+    from pivot.pipeline.pipeline import Pipeline
     from pivot.registry import RegistryStageInfo
 
 
@@ -180,6 +181,7 @@ def test_compute_output_changes_no_lock_shows_added(tmp_path: pathlib.Path) -> N
         "dep_specs": {},
         "out_specs": {},
         "params_arg_name": None,
+        "state_dir": None,
     }
 
     result = diff_panels.compute_output_changes(None, registry_info)
@@ -211,6 +213,7 @@ def test_compute_output_changes_missing_file_shows_removed(tmp_path: pathlib.Pat
         "dep_specs": {},
         "out_specs": {},
         "params_arg_name": None,
+        "state_dir": None,
     }
 
     lock_data: LockData = {
@@ -251,6 +254,7 @@ def test_compute_output_changes_unchanged(tmp_path: pathlib.Path) -> None:
         "dep_specs": {},
         "out_specs": {},
         "params_arg_name": None,
+        "state_dir": None,
     }
 
     lock_data: LockData = {
@@ -295,6 +299,7 @@ def test_compute_output_changes_detects_output_types(tmp_path: pathlib.Path) -> 
         "dep_specs": {},
         "out_specs": {},
         "params_arg_name": None,
+        "state_dir": None,
     }
 
     result = diff_panels.compute_output_changes(None, registry_info)
@@ -505,6 +510,7 @@ def test_input_panel_empty_state_no_explanation() -> None:
         "dep_specs": {},
         "out_specs": {},
         "params_arg_name": None,
+        "state_dir": None,
     }
     panel._explanation = None
     result = panel._render_empty_state()
@@ -530,6 +536,7 @@ def test_input_panel_empty_state_no_inputs() -> None:
         "dep_specs": {},
         "out_specs": {},
         "params_arg_name": None,
+        "state_dir": None,
     }
     panel._explanation = StageExplanation(
         stage_name="some_stage",
@@ -586,6 +593,7 @@ def test_output_panel_empty_state_in_progress() -> None:
         "dep_specs": {},
         "out_specs": {},
         "params_arg_name": None,
+        "state_dir": None,
     }
     panel._stage_status = StageStatus.IN_PROGRESS
     result = panel._render_empty_state()
@@ -611,6 +619,7 @@ def test_output_panel_empty_state_no_outputs() -> None:
         "dep_specs": {},
         "out_specs": {},
         "params_arg_name": None,
+        "state_dir": None,
     }
     panel._stage_status = None
     result = panel._render_empty_state()
@@ -736,7 +745,9 @@ def test_output_panel_is_changed_not_found() -> None:
 # =============================================================================
 
 
-def test_input_panel_set_from_snapshot(mocker: MockerFixture) -> None:
+def test_input_panel_set_from_snapshot(
+    test_pipeline: Pipeline, mock_discovery: Pipeline, mocker: MockerFixture
+) -> None:
     """InputDiffPanel.set_from_snapshot loads snapshot data correctly."""
     panel = diff_panels.InputDiffPanel()
 
@@ -767,7 +778,9 @@ def test_input_panel_set_from_snapshot(mocker: MockerFixture) -> None:
     mock_update.assert_called_once()
 
 
-def test_output_panel_set_from_snapshot(mocker: MockerFixture) -> None:
+def test_output_panel_set_from_snapshot(
+    test_pipeline: Pipeline, mock_discovery: Pipeline, mocker: MockerFixture
+) -> None:
     """OutputDiffPanel.set_from_snapshot loads snapshot data correctly."""
     panel = diff_panels.OutputDiffPanel()
 

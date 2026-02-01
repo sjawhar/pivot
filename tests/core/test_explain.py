@@ -1,16 +1,20 @@
 """Tests for explain module - detailed change explanations."""
 
+from __future__ import annotations
+
 import contextlib
 import pathlib
 from pathlib import Path
-from typing import Annotated, ClassVar, TypedDict
+from typing import TYPE_CHECKING, Annotated, ClassVar, TypedDict
+
+if TYPE_CHECKING:
+    from pivot.pipeline.pipeline import Pipeline
 
 import pydantic
 import pytest
 
 from helpers import register_test_stage
 from pivot import executor, explain, loaders, outputs, status
-from pivot.registry import REGISTRY
 from pivot.storage import lock
 from pivot.types import (
     ChangeType,
@@ -671,8 +675,13 @@ def test_get_stage_explanation_force_with_missing_deps(tmp_path: Path) -> None:
 # =============================================================================
 
 
-def test_get_pipeline_explanations_upstream_propagation(tmp_path: Path) -> None:
+def test_get_pipeline_explanations_upstream_propagation(
+    tmp_path: Path, mock_discovery: object, test_pipeline: Pipeline
+) -> None:
     """get_pipeline_explanations propagates staleness to downstream stages."""
+    # mock_discovery provides a test_pipeline that is returned by discover_pipeline()
+    pipeline = test_pipeline
+
     with contextlib.chdir(tmp_path):
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
@@ -681,15 +690,20 @@ def test_get_pipeline_explanations_upstream_propagation(tmp_path: Path) -> None:
         register_test_stage(_helper_stage_a_v1, name="stage_a")
         register_test_stage(_helper_stage_b, name="stage_b")
 
-        executor.run()
+        executor.run(pipeline=test_pipeline)
 
-        # Modify stage_a's code (re-register with different implementation)
-        REGISTRY._stages.clear()
+        # Clear and re-register with modified stage_a code
+        # This simulates modifying stage_a's implementation
+        pipeline.clear()
+        pipeline.invalidate_dag_cache()
+
         register_test_stage(_helper_stage_a_v2, name="stage_a")
         register_test_stage(_helper_stage_b, name="stage_b")
 
         # Get pipeline explanations
-        explanations = status.get_pipeline_explanations(stages=None, single_stage=False)
+        explanations = status.get_pipeline_explanations(
+            stages=None, single_stage=False, all_stages=pipeline.snapshot()
+        )
 
         # Find stage_b's explanation
         stage_b_exp = next((e for e in explanations if e["stage_name"] == "stage_b"), None)

@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     from pytest_mock import MockerFixture
 
     from pivot.engine.engine import Engine
+    from pivot.pipeline.pipeline import Pipeline
 
 # =============================================================================
 # Output TypedDicts for annotation-based stages
@@ -321,6 +322,8 @@ def test_run_tui_app_stage_info_indexes(
 
 
 def test_engine_emits_status_messages_via_tui_sink(
+    test_pipeline: Pipeline,
+    mock_discovery: Pipeline,
     pipeline_dir: pathlib.Path,
     tui_queue: TuiQueue,
 ) -> None:
@@ -334,7 +337,7 @@ def test_engine_emits_status_messages_via_tui_sink(
     register_test_stage(_helper_process, name="process")
 
     run_id = "test_run_123"
-    with engine_mod.Engine() as eng:
+    with engine_mod.Engine(pipeline=test_pipeline) as eng:
         eng.add_sink(engine_sinks.TuiSink(tui_queue=tui_queue, run_id=run_id))
         eng.add_source(engine_sources.OneShotSource(stages=None, force=False, reason="test"))
         eng.run(exit_on_completion=True)
@@ -362,6 +365,8 @@ def test_engine_emits_status_messages_via_tui_sink(
 
 
 def test_engine_emits_failed_status_via_tui_sink(
+    test_pipeline: Pipeline,
+    mock_discovery: Pipeline,
     pipeline_dir: pathlib.Path,
     tui_queue: TuiQueue,
 ) -> None:
@@ -375,7 +380,7 @@ def test_engine_emits_failed_status_via_tui_sink(
     register_test_stage(_helper_failing_stage, name="failing_stage")
 
     run_id = "test_run_456"
-    with engine_mod.Engine() as eng:
+    with engine_mod.Engine(pipeline=test_pipeline) as eng:
         eng.add_sink(engine_sinks.TuiSink(tui_queue=tui_queue, run_id=run_id))
         eng.add_source(engine_sources.OneShotSource(stages=None, force=False, reason="test"))
         eng.run(exit_on_completion=True)
@@ -391,6 +396,8 @@ def test_engine_emits_failed_status_via_tui_sink(
 
 
 def test_engine_emits_status_for_multiple_stages(
+    test_pipeline: Pipeline,
+    mock_discovery: Pipeline,
     pipeline_dir: pathlib.Path,
     tui_queue: TuiQueue,
 ) -> None:
@@ -406,7 +413,7 @@ def test_engine_emits_status_for_multiple_stages(
     register_test_stage(_helper_step3, name="step3")
 
     run_id = "test_run_789"
-    with engine_mod.Engine() as eng:
+    with engine_mod.Engine(pipeline=test_pipeline) as eng:
         eng.add_sink(engine_sinks.TuiSink(tui_queue=tui_queue, run_id=run_id))
         eng.add_source(engine_sources.OneShotSource(stages=None, force=False, reason="test"))
         eng.run(exit_on_completion=True)
@@ -426,6 +433,8 @@ def test_engine_emits_status_for_multiple_stages(
 
 
 def test_engine_status_includes_correct_index_and_total(
+    test_pipeline: Pipeline,
+    mock_discovery: Pipeline,
     pipeline_dir: pathlib.Path,
     tui_queue: TuiQueue,
 ) -> None:
@@ -440,7 +449,7 @@ def test_engine_status_includes_correct_index_and_total(
     register_test_stage(_helper_step2, name="step2")
 
     run_id = "test_run_abc"
-    with engine_mod.Engine() as eng:
+    with engine_mod.Engine(pipeline=test_pipeline) as eng:
         eng.add_sink(engine_sinks.TuiSink(tui_queue=tui_queue, run_id=run_id))
         eng.add_source(engine_sources.OneShotSource(stages=None, force=False, reason="test"))
         eng.run(exit_on_completion=True)
@@ -545,7 +554,11 @@ def test_confirm_commit_screen_instantiation() -> None:
 
 
 @pytest.fixture
-def simple_run_app(tui_queue: TuiQueue) -> run_tui.PivotApp:
+def simple_run_app(
+    tui_queue: TuiQueue,
+    test_pipeline: Pipeline,
+    mock_discovery: Pipeline,
+) -> run_tui.PivotApp:
     """Create a simple PivotApp for testing."""
 
     def executor_func() -> dict[str, executor.ExecutionSummary]:
@@ -652,7 +665,11 @@ async def test_run_app_quit_action(simple_run_app: run_tui.PivotApp) -> None:
 
 
 @pytest.mark.asyncio
-async def test_run_app_stages_shown(tui_queue: TuiQueue) -> None:
+async def test_run_app_stages_shown(
+    tui_queue: TuiQueue,
+    test_pipeline: Pipeline,
+    mock_discovery: Pipeline,
+) -> None:
     """Stage names appear in the app."""
     stage_names = ["alpha", "beta", "gamma"]
 
@@ -728,6 +745,8 @@ def test_stage_log_panel_init() -> None:
 async def test_tui_app_with_tui_log_writes_to_file(
     tui_queue: TuiQueue,
     tmp_path: pathlib.Path,
+    test_pipeline: Pipeline,
+    mock_discovery: Pipeline,
 ) -> None:
     """PivotApp writes messages to tui_log file when configured."""
     import json
@@ -786,6 +805,8 @@ async def test_tui_app_with_tui_log_writes_to_file(
 async def test_tui_app_without_tui_log_no_file_created(
     tui_queue: TuiQueue,
     tmp_path: pathlib.Path,
+    test_pipeline: Pipeline,
+    mock_discovery: Pipeline,
 ) -> None:
     """PivotApp does not create log file when tui_log is None."""
     log_path = tmp_path / "tui.jsonl"
@@ -815,6 +836,8 @@ async def test_tui_app_without_tui_log_no_file_created(
 @pytest.mark.asyncio
 async def test_watch_tui_app_with_serve_flag(
     mock_watch_engine: Engine,
+    test_pipeline: Pipeline,
+    mock_discovery: Pipeline,
 ) -> None:
     """PivotApp (watch mode) initializes serve mode correctly."""
     tui_queue: TuiQueue = thread_queue.Queue()
@@ -838,6 +861,8 @@ async def test_watch_tui_app_with_serve_flag(
 async def test_watch_tui_app_with_tui_log(
     mock_watch_engine: Engine,
     tmp_path: pathlib.Path,
+    test_pipeline: Pipeline,
+    mock_discovery: Pipeline,
 ) -> None:
     """PivotApp (watch mode) writes to tui_log when configured."""
     tui_queue: TuiQueue = thread_queue.Queue()

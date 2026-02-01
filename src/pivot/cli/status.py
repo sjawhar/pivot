@@ -6,7 +6,7 @@ import sys
 import click
 import tqdm
 
-from pivot import config, exceptions, project, registry
+from pivot import config, exceptions, project
 from pivot import status as status_mod
 from pivot.cli import completion
 from pivot.cli import decorators as cli_decorators
@@ -72,16 +72,16 @@ def status(
 
     if show_stages:
         # Build bipartite graph for consistent execution order with Engine
-        all_stages = {name: registry.REGISTRY.get(name) for name in registry.REGISTRY.list_stages()}
+        all_stages = cli_helpers.get_all_stages()
         graph = engine_graph.build_graph(all_stages)
 
         if explain:
             pipeline_explanations = status_mod.get_pipeline_explanations(
-                stages_list, single_stage=False, graph=graph
+                stages_list, single_stage=False, all_stages=all_stages, graph=graph
             )
         else:
             pipeline_status, _ = status_mod.get_pipeline_status(
-                stages_list, single_stage=False, graph=graph
+                stages_list, single_stage=False, all_stages=all_stages, graph=graph
             )
 
     if show_tracked:

@@ -1239,41 +1239,49 @@ def test_get_schema_unsupported(tmp_path: Path) -> None:
 # =============================================================================
 
 
-def test_get_data_outputs_from_registry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Get data outputs from mocked registry."""
-    from pivot import loaders, outputs, project, registry
+def test_get_data_outputs_from_stages(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Get data outputs from mocked cli_helpers."""
+    from pivot import loaders, outputs, project
+    from pivot.cli import helpers as cli_helpers
 
     # Mock project root
     monkeypatch.setattr(project, "_project_root_cache", tmp_path)
 
-    # Create a mock registry
-    class MockRegistry:
-        def list_stages(self) -> list[str]:
-            return ["process_data", "train_model"]
+    # Define mock stage info
+    stage_info: dict[str, dict[str, object]] = {
+        "process_data": {
+            "outs": [outputs.Out("output.csv", loader=loaders.PathOnly())],
+            "deps": [],
+            "func": lambda: None,
+            "params": None,
+        },
+        "train_model": {
+            "outs": [
+                outputs.Out("model.pkl", loader=loaders.PathOnly()),
+                outputs.Metric("metrics.json"),
+            ],
+            "deps": [],
+            "func": lambda: None,
+            "params": None,
+        },
+    }
+    default_stage: dict[str, object] = {
+        "outs": [],
+        "deps": [],
+        "func": lambda: None,
+        "params": None,
+    }
 
-        def get(self, name: str) -> dict[str, object]:
-            if name == "process_data":
-                return {
-                    "outs": [outputs.Out("output.csv", loader=loaders.PathOnly())],
-                    "deps": [],
-                    "func": lambda: None,
-                    "params": None,
-                }
-            elif name == "train_model":
-                return {
-                    "outs": [
-                        outputs.Out("model.pkl", loader=loaders.PathOnly()),
-                        outputs.Metric("metrics.json"),
-                    ],
-                    "deps": [],
-                    "func": lambda: None,
-                    "params": None,
-                }
-            return {"outs": [], "deps": [], "func": lambda: None, "params": None}
+    def mock_list_stages() -> list[str]:
+        return ["process_data", "train_model"]
 
-    monkeypatch.setattr(registry, "REGISTRY", MockRegistry())
+    def mock_get_stage(name: str) -> dict[str, object]:
+        return stage_info.get(name, default_stage)
 
-    result = data.get_data_outputs_from_registry()
+    monkeypatch.setattr(cli_helpers, "list_stages", mock_list_stages)
+    monkeypatch.setattr(cli_helpers, "get_stage", mock_get_stage)
+
+    result = data.get_data_outputs_from_stages()
 
     # Only CSV files should be included (not metrics, not pkl)
     assert "process_data" in result
@@ -1282,28 +1290,37 @@ def test_get_data_outputs_from_registry(tmp_path: Path, monkeypatch: pytest.Monk
 
 
 def test_get_data_hashes_from_head(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Get data hashes from mocked registry and git HEAD."""
-    from pivot import git, loaders, outputs, project, registry
+    """Get data hashes from mocked cli_helpers and git HEAD."""
+    from pivot import git, loaders, outputs, project
+    from pivot.cli import helpers as cli_helpers
 
     # Mock project root
     monkeypatch.setattr(project, "_project_root_cache", tmp_path)
 
-    # Create a mock registry
-    class MockRegistry:
-        def list_stages(self) -> list[str]:
-            return ["process_data"]
+    # Define mock stage info
+    stage_info: dict[str, dict[str, object]] = {
+        "process_data": {
+            "outs": [outputs.Out("output.csv", loader=loaders.PathOnly())],
+            "deps": [],
+            "func": lambda: None,
+            "params": None,
+        },
+    }
+    default_stage: dict[str, object] = {
+        "outs": [],
+        "deps": [],
+        "func": lambda: None,
+        "params": None,
+    }
 
-        def get(self, name: str) -> dict[str, object]:
-            if name == "process_data":
-                return {
-                    "outs": [outputs.Out("output.csv", loader=loaders.PathOnly())],
-                    "deps": [],
-                    "func": lambda: None,
-                    "params": None,
-                }
-            return {"outs": [], "deps": [], "func": lambda: None, "params": None}
+    def mock_list_stages() -> list[str]:
+        return ["process_data"]
 
-    monkeypatch.setattr(registry, "REGISTRY", MockRegistry())
+    def mock_get_stage(name: str) -> dict[str, object]:
+        return stage_info.get(name, default_stage)
+
+    monkeypatch.setattr(cli_helpers, "list_stages", mock_list_stages)
+    monkeypatch.setattr(cli_helpers, "get_stage", mock_get_stage)
 
     # Mock git.read_files_from_head to return a lock file
     lock_content = """
@@ -1332,23 +1349,24 @@ def test_get_data_hashes_from_head_no_lock_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Handle missing lock file gracefully."""
-    from pivot import git, loaders, outputs, project, registry
+    from pivot import git, loaders, outputs, project
+    from pivot.cli import helpers as cli_helpers
 
     monkeypatch.setattr(project, "_project_root_cache", tmp_path)
 
-    class MockRegistry:
-        def list_stages(self) -> list[str]:
-            return ["process_data"]
+    def mock_list_stages() -> list[str]:
+        return ["process_data"]
 
-        def get(self, name: str) -> dict[str, object]:
-            return {
-                "outs": [outputs.Out("output.csv", loader=loaders.PathOnly())],
-                "deps": [],
-                "func": lambda: None,
-                "params": None,
-            }
+    def mock_get_stage(name: str) -> dict[str, object]:
+        return {
+            "outs": [outputs.Out("output.csv", loader=loaders.PathOnly())],
+            "deps": [],
+            "func": lambda: None,
+            "params": None,
+        }
 
-    monkeypatch.setattr(registry, "REGISTRY", MockRegistry())
+    monkeypatch.setattr(cli_helpers, "list_stages", mock_list_stages)
+    monkeypatch.setattr(cli_helpers, "get_stage", mock_get_stage)
 
     # No lock file found
     def mock_read_files(paths: list[str]) -> dict[str, str | None]:
@@ -1366,23 +1384,24 @@ def test_get_data_hashes_from_head_invalid_yaml(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Handle invalid YAML in lock file gracefully."""
-    from pivot import git, loaders, outputs, project, registry
+    from pivot import git, loaders, outputs, project
+    from pivot.cli import helpers as cli_helpers
 
     monkeypatch.setattr(project, "_project_root_cache", tmp_path)
 
-    class MockRegistry:
-        def list_stages(self) -> list[str]:
-            return ["process_data"]
+    def mock_list_stages() -> list[str]:
+        return ["process_data"]
 
-        def get(self, name: str) -> dict[str, object]:
-            return {
-                "outs": [outputs.Out("output.csv", loader=loaders.PathOnly())],
-                "deps": [],
-                "func": lambda: None,
-                "params": None,
-            }
+    def mock_get_stage(name: str) -> dict[str, object]:
+        return {
+            "outs": [outputs.Out("output.csv", loader=loaders.PathOnly())],
+            "deps": [],
+            "func": lambda: None,
+            "params": None,
+        }
 
-    monkeypatch.setattr(registry, "REGISTRY", MockRegistry())
+    monkeypatch.setattr(cli_helpers, "list_stages", mock_list_stages)
+    monkeypatch.setattr(cli_helpers, "get_stage", mock_get_stage)
 
     # Invalid YAML
     def mock_read_files(paths: list[str]) -> dict[str, str | None]:
@@ -1400,23 +1419,24 @@ def test_get_data_hashes_from_head_missing_outs_key(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Handle lock file missing outs key."""
-    from pivot import git, loaders, outputs, project, registry
+    from pivot import git, loaders, outputs, project
+    from pivot.cli import helpers as cli_helpers
 
     monkeypatch.setattr(project, "_project_root_cache", tmp_path)
 
-    class MockRegistry:
-        def list_stages(self) -> list[str]:
-            return ["process_data"]
+    def mock_list_stages() -> list[str]:
+        return ["process_data"]
 
-        def get(self, name: str) -> dict[str, object]:
-            return {
-                "outs": [outputs.Out("output.csv", loader=loaders.PathOnly())],
-                "deps": [],
-                "func": lambda: None,
-                "params": None,
-            }
+    def mock_get_stage(name: str) -> dict[str, object]:
+        return {
+            "outs": [outputs.Out("output.csv", loader=loaders.PathOnly())],
+            "deps": [],
+            "func": lambda: None,
+            "params": None,
+        }
 
-    monkeypatch.setattr(registry, "REGISTRY", MockRegistry())
+    monkeypatch.setattr(cli_helpers, "list_stages", mock_list_stages)
+    monkeypatch.setattr(cli_helpers, "get_stage", mock_get_stage)
 
     # Lock file without outs key
     def mock_read_files(paths: list[str]) -> dict[str, str | None]:
@@ -1433,23 +1453,24 @@ def test_get_data_hashes_from_head_outs_not_list(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Handle lock file where outs is not a list."""
-    from pivot import git, loaders, outputs, project, registry
+    from pivot import git, loaders, outputs, project
+    from pivot.cli import helpers as cli_helpers
 
     monkeypatch.setattr(project, "_project_root_cache", tmp_path)
 
-    class MockRegistry:
-        def list_stages(self) -> list[str]:
-            return ["process_data"]
+    def mock_list_stages() -> list[str]:
+        return ["process_data"]
 
-        def get(self, name: str) -> dict[str, object]:
-            return {
-                "outs": [outputs.Out("output.csv", loader=loaders.PathOnly())],
-                "deps": [],
-                "func": lambda: None,
-                "params": None,
-            }
+    def mock_get_stage(name: str) -> dict[str, object]:
+        return {
+            "outs": [outputs.Out("output.csv", loader=loaders.PathOnly())],
+            "deps": [],
+            "func": lambda: None,
+            "params": None,
+        }
 
-    monkeypatch.setattr(registry, "REGISTRY", MockRegistry())
+    monkeypatch.setattr(cli_helpers, "list_stages", mock_list_stages)
+    monkeypatch.setattr(cli_helpers, "get_stage", mock_get_stage)
 
     # Lock file with outs as string instead of list
     def mock_read_files(paths: list[str]) -> dict[str, str | None]:

@@ -38,12 +38,12 @@ class PlotDiffEntry(TypedDict):
 
 
 def collect_plots_from_stages() -> list[PlotInfo]:
-    """Discover Plot outputs from registry."""
-    from pivot import registry
+    """Discover Plot outputs from Pipeline in context."""
+    from pivot.cli import helpers as cli_helpers
 
     result = list[PlotInfo]()
-    for stage_name in registry.REGISTRY.list_stages():
-        info = registry.REGISTRY.get(stage_name)
+    for stage_name in cli_helpers.list_stages():
+        info = cli_helpers.get_stage(stage_name)
         for out in info["outs"]:
             if isinstance(out, outputs.Plot):
                 # Registry always stores single-file outputs (multi-file are expanded)
@@ -66,15 +66,15 @@ def get_plot_hashes_from_lock(
 
     Returns paths relative to project root for consistent comparison with user input.
     """
-    from pivot import registry
+    from pivot.cli import helpers as cli_helpers
 
     if state_dir is None:
         state_dir = config.get_state_dir()
 
     proj_root = project.get_project_root()
     result = dict[str, str | None]()
-    for stage_name in registry.REGISTRY.list_stages():
-        info = registry.REGISTRY.get(stage_name)
+    for stage_name in cli_helpers.list_stages():
+        info = cli_helpers.get_stage(stage_name)
         stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(state_dir))
         lock_data = stage_lock.read()
 
@@ -97,22 +97,20 @@ def get_plot_hashes_from_head() -> dict[str, str | None]:
     Returns paths relative to project root for consistent comparison with workspace.
     Returns empty dict if not in a git repo or no HEAD commit exists.
     """
-    from pivot import registry
+    from pivot.cli import helpers as cli_helpers
 
     result = dict[str, str | None]()
     proj_root = project.get_project_root()
 
     # Collect lock file paths we need to read
-    stage_plot_paths: dict[str, list[str]] = {}  # stage_name -> [rel_plot_paths]
-    for stage_name in registry.REGISTRY.list_stages():
-        info = registry.REGISTRY.get(stage_name)
+    stage_plot_paths = dict[str, list[str]]()  # stage_name -> [rel_plot_paths]
+    for stage_name in cli_helpers.list_stages():
+        info = cli_helpers.get_stage(stage_name)
         for out in info["outs"]:
             if isinstance(out, outputs.Plot):
-                if stage_name not in stage_plot_paths:
-                    stage_plot_paths[stage_name] = []
                 abs_path = str(project.normalize_path(cast("str", out.path)))
                 rel_path = project.to_relative_path(abs_path, proj_root)
-                stage_plot_paths[stage_name].append(rel_path)
+                stage_plot_paths.setdefault(stage_name, []).append(rel_path)
                 result[rel_path] = None  # Default to None
 
     # Read all lock files from HEAD in one batch

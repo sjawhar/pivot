@@ -16,6 +16,8 @@ from pivot.types import RemoteStatus
 if TYPE_CHECKING:
     from pytest_mock import MockerFixture
 
+    from pivot.pipeline import pipeline as pipeline_mod
+
 # =============================================================================
 # Note: Tests use set_project_root fixture from conftest.py which patches
 # project._project_root_cache using patch.object for safety (fails if attr
@@ -58,7 +60,9 @@ def _helper_stage_b(
 
 
 def test_pipeline_status_all_cached(
-    set_project_root: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    set_project_root: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    test_pipeline: pipeline_mod.Pipeline,
 ) -> None:
     """All stages should show cached after successful run."""
     (set_project_root / ".git").mkdir()
@@ -67,8 +71,9 @@ def test_pipeline_status_all_cached(
     register_test_stage(_helper_stage_a, name="stage_a")
 
     monkeypatch.chdir(set_project_root)
-    executor.run()
-    results, _ = status.get_pipeline_status(None, single_stage=False)
+    executor.run(pipeline=test_pipeline)
+    all_stages = test_pipeline.snapshot()
+    results, _ = status.get_pipeline_status(None, single_stage=False, all_stages=all_stages)
 
     assert len(results) == 1
     assert results[0]["name"] == "stage_a"
@@ -76,14 +81,17 @@ def test_pipeline_status_all_cached(
     assert results[0]["reason"] == ""
 
 
-def test_pipeline_status_some_stale(set_project_root: pathlib.Path) -> None:
+def test_pipeline_status_some_stale(
+    set_project_root: pathlib.Path, test_pipeline: pipeline_mod.Pipeline
+) -> None:
     """Stages with changed code should show stale."""
     (set_project_root / ".git").mkdir()
     (set_project_root / "input.txt").write_text("data")
 
     register_test_stage(_helper_stage_a, name="stage_a")
 
-    results, _ = status.get_pipeline_status(None, single_stage=False)
+    all_stages = test_pipeline.snapshot()
+    results, _ = status.get_pipeline_status(None, single_stage=False, all_stages=all_stages)
 
     assert len(results) == 1
     assert results[0]["name"] == "stage_a"
@@ -91,7 +99,9 @@ def test_pipeline_status_some_stale(set_project_root: pathlib.Path) -> None:
     assert results[0]["reason"] == "No previous run"
 
 
-def test_pipeline_status_upstream_stale(set_project_root: pathlib.Path) -> None:
+def test_pipeline_status_upstream_stale(
+    set_project_root: pathlib.Path, test_pipeline: pipeline_mod.Pipeline
+) -> None:
     """Stage should be marked stale if upstream is stale."""
     (set_project_root / ".git").mkdir()
     (set_project_root / "input.txt").write_text("data")
@@ -99,7 +109,8 @@ def test_pipeline_status_upstream_stale(set_project_root: pathlib.Path) -> None:
     register_test_stage(_helper_stage_a, name="stage_a")
     register_test_stage(_helper_stage_b, name="stage_b")
 
-    results, _ = status.get_pipeline_status(None, single_stage=False)
+    all_stages = test_pipeline.snapshot()
+    results, _ = status.get_pipeline_status(None, single_stage=False, all_stages=all_stages)
 
     assert len(results) == 2
 
@@ -113,7 +124,9 @@ def test_pipeline_status_upstream_stale(set_project_root: pathlib.Path) -> None:
     assert "stage_a" in stage_b["upstream_stale"]
 
 
-def test_pipeline_status_specific_stages(set_project_root: pathlib.Path) -> None:
+def test_pipeline_status_specific_stages(
+    set_project_root: pathlib.Path, test_pipeline: pipeline_mod.Pipeline
+) -> None:
     """Should only return status for specified stages."""
     (set_project_root / ".git").mkdir()
     (set_project_root / "input.txt").write_text("data")
@@ -121,7 +134,8 @@ def test_pipeline_status_specific_stages(set_project_root: pathlib.Path) -> None
     register_test_stage(_helper_stage_a, name="stage_a")
     register_test_stage(_helper_stage_b, name="stage_b")
 
-    results, _ = status.get_pipeline_status(["stage_a"], single_stage=False)
+    all_stages = test_pipeline.snapshot()
+    results, _ = status.get_pipeline_status(["stage_a"], single_stage=False, all_stages=all_stages)
 
     assert len(results) == 1
     assert results[0]["name"] == "stage_a"
@@ -418,9 +432,9 @@ def _helper_test_stage(
 
 def test_get_pipeline_status_uses_provided_graph(
     set_project_root: pathlib.Path,
+    test_pipeline: pipeline_mod.Pipeline,
 ) -> None:
     """get_pipeline_status uses provided graph instead of building one."""
-    from pivot import registry
     from pivot.engine import graph as engine_graph
 
     (set_project_root / ".git").mkdir()
@@ -429,13 +443,14 @@ def test_get_pipeline_status_uses_provided_graph(
     register_test_stage(_helper_test_stage, name="test_stage")
 
     # Build graph externally (simulating Engine)
-    all_stages = {name: registry.REGISTRY.get(name) for name in registry.REGISTRY.list_stages()}
+    all_stages = test_pipeline.snapshot()
     external_graph = engine_graph.build_graph(all_stages)
 
     # Call status with provided graph
     results, returned_graph = status.get_pipeline_status(
         stages=["test_stage"],
         single_stage=False,
+        all_stages=all_stages,
         graph=external_graph,
     )
 
@@ -451,9 +466,9 @@ def test_get_pipeline_status_uses_provided_graph(
 
 def test_get_pipeline_explanations_uses_provided_graph(
     set_project_root: pathlib.Path,
+    test_pipeline: pipeline_mod.Pipeline,
 ) -> None:
     """get_pipeline_explanations uses provided graph instead of building one."""
-    from pivot import registry
     from pivot.engine import graph as engine_graph
 
     (set_project_root / ".git").mkdir()
@@ -462,13 +477,14 @@ def test_get_pipeline_explanations_uses_provided_graph(
     register_test_stage(_helper_test_stage, name="test_stage")
 
     # Build graph externally (simulating Engine)
-    all_stages = {name: registry.REGISTRY.get(name) for name in registry.REGISTRY.list_stages()}
+    all_stages = test_pipeline.snapshot()
     external_graph = engine_graph.build_graph(all_stages)
 
     # Call explanations with provided graph
     explanations = status.get_pipeline_explanations(
         stages=["test_stage"],
         single_stage=False,
+        all_stages=all_stages,
         graph=external_graph,
     )
 
@@ -482,7 +498,9 @@ def test_get_pipeline_explanations_uses_provided_graph(
 # =============================================================================
 
 
-def test_what_if_changed_single_path(set_project_root: pathlib.Path) -> None:
+def test_what_if_changed_single_path(
+    set_project_root: pathlib.Path, test_pipeline: pipeline_mod.Pipeline
+) -> None:
     """what_if_changed returns affected stages for a single path."""
     (set_project_root / ".git").mkdir()
     (set_project_root / "input.txt").write_text("data")
@@ -491,13 +509,16 @@ def test_what_if_changed_single_path(set_project_root: pathlib.Path) -> None:
     register_test_stage(_helper_stage_b, name="stage_b")
 
     # input.txt affects stage_a, which in turn affects stage_b
-    affected = status.what_if_changed([pathlib.Path("input.txt")])
+    all_stages = test_pipeline.snapshot()
+    affected = status.what_if_changed([pathlib.Path("input.txt")], all_stages=all_stages)
 
     assert "stage_a" in affected
     assert "stage_b" in affected, "Should include downstream stages"
 
 
-def test_what_if_changed_intermediate_path(set_project_root: pathlib.Path) -> None:
+def test_what_if_changed_intermediate_path(
+    set_project_root: pathlib.Path, test_pipeline: pipeline_mod.Pipeline
+) -> None:
     """what_if_changed returns only downstream stages for intermediate artifact."""
     (set_project_root / ".git").mkdir()
     (set_project_root / "input.txt").write_text("data")
@@ -506,25 +527,31 @@ def test_what_if_changed_intermediate_path(set_project_root: pathlib.Path) -> No
     register_test_stage(_helper_stage_b, name="stage_b")
 
     # a.txt is output of stage_a, input to stage_b
-    affected = status.what_if_changed([pathlib.Path("a.txt")])
+    all_stages = test_pipeline.snapshot()
+    affected = status.what_if_changed([pathlib.Path("a.txt")], all_stages=all_stages)
 
     assert "stage_a" not in affected, "stage_a produces a.txt, doesn't consume it"
     assert "stage_b" in affected, "stage_b consumes a.txt"
 
 
-def test_what_if_changed_unknown_path(set_project_root: pathlib.Path) -> None:
+def test_what_if_changed_unknown_path(
+    set_project_root: pathlib.Path, test_pipeline: pipeline_mod.Pipeline
+) -> None:
     """what_if_changed returns empty list for unknown paths."""
     (set_project_root / ".git").mkdir()
     (set_project_root / "input.txt").write_text("data")
 
     register_test_stage(_helper_stage_a, name="stage_a")
 
-    affected = status.what_if_changed([pathlib.Path("unknown.txt")])
+    all_stages = test_pipeline.snapshot()
+    affected = status.what_if_changed([pathlib.Path("unknown.txt")], all_stages=all_stages)
 
     assert affected == []
 
 
-def test_what_if_changed_multiple_paths(set_project_root: pathlib.Path) -> None:
+def test_what_if_changed_multiple_paths(
+    set_project_root: pathlib.Path, test_pipeline: pipeline_mod.Pipeline
+) -> None:
     """what_if_changed returns union of affected stages for multiple paths."""
     (set_project_root / ".git").mkdir()
     (set_project_root / "input.txt").write_text("data")
@@ -533,20 +560,23 @@ def test_what_if_changed_multiple_paths(set_project_root: pathlib.Path) -> None:
     register_test_stage(_helper_stage_b, name="stage_b")
 
     # Both paths affect different parts of the pipeline
+    all_stages = test_pipeline.snapshot()
     affected = status.what_if_changed(
         [
             pathlib.Path("input.txt"),  # affects stage_a -> stage_b
             pathlib.Path("a.txt"),  # affects stage_b
-        ]
+        ],
+        all_stages=all_stages,
     )
 
     assert "stage_a" in affected
     assert "stage_b" in affected
 
 
-def test_what_if_changed_with_provided_graph(set_project_root: pathlib.Path) -> None:
+def test_what_if_changed_with_provided_graph(
+    set_project_root: pathlib.Path, test_pipeline: pipeline_mod.Pipeline
+) -> None:
     """what_if_changed uses provided graph instead of building one."""
-    from pivot import registry
     from pivot.engine import graph as engine_graph
 
     (set_project_root / ".git").mkdir()
@@ -555,10 +585,12 @@ def test_what_if_changed_with_provided_graph(set_project_root: pathlib.Path) -> 
     register_test_stage(_helper_stage_a, name="stage_a")
 
     # Build graph externally
-    all_stages = {name: registry.REGISTRY.get(name) for name in registry.REGISTRY.list_stages()}
+    all_stages = test_pipeline.snapshot()
     external_graph = engine_graph.build_graph(all_stages)
 
     # Call with provided graph
-    affected = status.what_if_changed([pathlib.Path("input.txt")], graph=external_graph)
+    affected = status.what_if_changed(
+        [pathlib.Path("input.txt")], all_stages=all_stages, graph=external_graph
+    )
 
     assert "stage_a" in affected

@@ -4,15 +4,20 @@ import json
 import pathlib
 from typing import TYPE_CHECKING, Annotated, TypedDict
 
+import helpers
 from helpers import register_test_stage
-from pivot import cli, loaders, outputs, project
+from pivot import cli, discovery, loaders, outputs, project
+from pivot.cli import decorators as cli_decorators
+from pivot.pipeline import pipeline as pipeline_mod
 from pivot.storage import cache
 
 if TYPE_CHECKING:
     import click.testing
     from pytest import MonkeyPatch
+    from pytest_mock import MockerFixture
 
     from conftest import GitRepo
+    from pivot.pipeline.pipeline import Pipeline
 
 
 # =============================================================================
@@ -63,7 +68,9 @@ def test_data_in_main_help(runner: click.testing.CliRunner) -> None:
 # =============================================================================
 
 
-def test_data_diff_no_stages(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
+def test_data_diff_no_stages(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, mock_discovery: Pipeline
+) -> None:
     """Data diff with no registered stages should report no data files."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
@@ -78,7 +85,7 @@ def test_data_diff_no_stages(runner: click.testing.CliRunner, tmp_path: pathlib.
 
 
 def test_data_diff_key_and_positional_conflict(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, mock_discovery: Pipeline
 ) -> None:
     """Data diff should error when both --key and --positional are specified."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
@@ -98,7 +105,7 @@ def test_data_diff_key_and_positional_conflict(
 
 
 def test_data_diff_requires_targets(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, mock_discovery: Pipeline
 ) -> None:
     """Data diff requires at least one target."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
@@ -120,14 +127,21 @@ def _helper_make_csv_output() -> _CsvOutputs:
 
 
 def test_data_diff_csv_file(
-    runner: click.testing.CliRunner, git_repo: GitRepo, monkeypatch: MonkeyPatch
+    runner: click.testing.CliRunner,
+    git_repo: GitRepo,
+    mocker: MockerFixture,
 ) -> None:
     """Diff CSV files against HEAD."""
     repo_path, commit = git_repo
     (repo_path / ".pivot" / "cache" / "files").mkdir(parents=True)
     (repo_path / ".pivot" / "stages").mkdir(parents=True)
 
-    monkeypatch.setattr(project, "_project_root_cache", repo_path)
+    # Create Pipeline with git_repo path and mock discovery to return it
+    pipeline = pipeline_mod.Pipeline("test", root=repo_path)
+    helpers.set_test_pipeline(pipeline)
+    mocker.patch.object(discovery, "discover_pipeline", return_value=pipeline)
+    mocker.patch.object(project, "_project_root_cache", repo_path)
+    mocker.patch.object(cli_decorators, "get_pipeline_from_context", return_value=pipeline)
 
     # Register stage with CSV output
     register_test_stage(
@@ -170,14 +184,21 @@ dep_generations: {{}}
 
 
 def test_data_diff_json_output(
-    runner: click.testing.CliRunner, git_repo: GitRepo, monkeypatch: MonkeyPatch
+    runner: click.testing.CliRunner,
+    git_repo: GitRepo,
+    mocker: MockerFixture,
 ) -> None:
     """--json outputs structured diff."""
     repo_path, commit = git_repo
     (repo_path / ".pivot" / "cache" / "files").mkdir(parents=True)
     (repo_path / ".pivot" / "stages").mkdir(parents=True)
 
-    monkeypatch.setattr(project, "_project_root_cache", repo_path)
+    # Create Pipeline with git_repo path and mock discovery to return it
+    pipeline = pipeline_mod.Pipeline("test", root=repo_path)
+    helpers.set_test_pipeline(pipeline)
+    mocker.patch.object(discovery, "discover_pipeline", return_value=pipeline)
+    mocker.patch.object(project, "_project_root_cache", repo_path)
+    mocker.patch.object(cli_decorators, "get_pipeline_from_context", return_value=pipeline)
 
     register_test_stage(_helper_make_csv_output, name="make_csv")
 
@@ -215,14 +236,21 @@ dep_generations: {{}}
 
 
 def test_data_diff_key_columns(
-    runner: click.testing.CliRunner, git_repo: GitRepo, monkeypatch: MonkeyPatch
+    runner: click.testing.CliRunner,
+    git_repo: GitRepo,
+    mocker: MockerFixture,
 ) -> None:
     """--key uses columns for row matching."""
     repo_path, commit = git_repo
     (repo_path / ".pivot" / "cache" / "files").mkdir(parents=True)
     (repo_path / ".pivot" / "stages").mkdir(parents=True)
 
-    monkeypatch.setattr(project, "_project_root_cache", repo_path)
+    # Create Pipeline with git_repo path and mock discovery to return it
+    pipeline = pipeline_mod.Pipeline("test", root=repo_path)
+    helpers.set_test_pipeline(pipeline)
+    mocker.patch.object(discovery, "discover_pipeline", return_value=pipeline)
+    mocker.patch.object(project, "_project_root_cache", repo_path)
+    mocker.patch.object(cli_decorators, "get_pipeline_from_context", return_value=pipeline)
 
     register_test_stage(_helper_make_csv_output, name="make_csv")
 
@@ -256,14 +284,21 @@ dep_generations: {{}}
 
 
 def test_data_diff_positional(
-    runner: click.testing.CliRunner, git_repo: GitRepo, monkeypatch: MonkeyPatch
+    runner: click.testing.CliRunner,
+    git_repo: GitRepo,
+    mocker: MockerFixture,
 ) -> None:
     """--positional uses row position matching."""
     repo_path, commit = git_repo
     (repo_path / ".pivot" / "cache" / "files").mkdir(parents=True)
     (repo_path / ".pivot" / "stages").mkdir(parents=True)
 
-    monkeypatch.setattr(project, "_project_root_cache", repo_path)
+    # Create Pipeline with git_repo path and mock discovery to return it
+    pipeline = pipeline_mod.Pipeline("test", root=repo_path)
+    helpers.set_test_pipeline(pipeline)
+    mocker.patch.object(discovery, "discover_pipeline", return_value=pipeline)
+    mocker.patch.object(project, "_project_root_cache", repo_path)
+    mocker.patch.object(cli_decorators, "get_pipeline_from_context", return_value=pipeline)
 
     register_test_stage(_helper_make_csv_output, name="make_csv")
 
@@ -297,14 +332,21 @@ dep_generations: {{}}
 
 
 def test_data_diff_no_changes_message(
-    runner: click.testing.CliRunner, git_repo: GitRepo, monkeypatch: MonkeyPatch
+    runner: click.testing.CliRunner,
+    git_repo: GitRepo,
+    mocker: MockerFixture,
 ) -> None:
     """No changes shows explicit message, not empty output."""
     repo_path, commit = git_repo
     (repo_path / ".pivot" / "cache" / "files").mkdir(parents=True)
     (repo_path / ".pivot" / "stages").mkdir(parents=True)
 
-    monkeypatch.setattr(project, "_project_root_cache", repo_path)
+    # Create Pipeline with git_repo path and mock discovery to return it
+    pipeline = pipeline_mod.Pipeline("test", root=repo_path)
+    helpers.set_test_pipeline(pipeline)
+    mocker.patch.object(discovery, "discover_pipeline", return_value=pipeline)
+    mocker.patch.object(project, "_project_root_cache", repo_path)
+    mocker.patch.object(cli_decorators, "get_pipeline_from_context", return_value=pipeline)
 
     register_test_stage(_helper_make_csv_output, name="make_csv")
 
@@ -336,14 +378,21 @@ dep_generations: {{}}
 
 
 def test_data_diff_json_empty_returns_valid_json(
-    runner: click.testing.CliRunner, git_repo: GitRepo, monkeypatch: MonkeyPatch
+    runner: click.testing.CliRunner,
+    git_repo: GitRepo,
+    mocker: MockerFixture,
 ) -> None:
     """Empty diff returns valid JSON, not empty string."""
     repo_path, commit = git_repo
     (repo_path / ".pivot" / "cache" / "files").mkdir(parents=True)
     (repo_path / ".pivot" / "stages").mkdir(parents=True)
 
-    monkeypatch.setattr(project, "_project_root_cache", repo_path)
+    # Create Pipeline with git_repo path and mock discovery to return it
+    pipeline = pipeline_mod.Pipeline("test", root=repo_path)
+    helpers.set_test_pipeline(pipeline)
+    mocker.patch.object(discovery, "discover_pipeline", return_value=pipeline)
+    mocker.patch.object(project, "_project_root_cache", repo_path)
+    mocker.patch.object(cli_decorators, "get_pipeline_from_context", return_value=pipeline)
 
     register_test_stage(_helper_make_csv_output, name="make_csv")
 

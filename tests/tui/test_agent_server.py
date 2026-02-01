@@ -22,6 +22,8 @@ from pivot.types import (
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from pivot.pipeline.pipeline import Pipeline
+
 
 # =============================================================================
 # Output TypedDicts for annotation-based stages
@@ -221,7 +223,7 @@ async def test_dispatch_cancel(mock_engine: MagicMock, socket_path: Path) -> Non
 
 @pytest.mark.asyncio
 async def test_dispatch_stages_returns_registered_stages(
-    mock_engine: MagicMock, socket_path: Path
+    test_pipeline: Pipeline, mock_discovery: Pipeline, mock_engine: MagicMock, socket_path: Path
 ) -> None:
     """Test stages method returns all registered stages."""
 
@@ -249,7 +251,9 @@ async def test_dispatch_stages_returns_registered_stages(
 
 
 @pytest.mark.asyncio
-async def test_dispatch_run_queues_execution(mock_engine: MagicMock, socket_path: Path) -> None:
+async def test_dispatch_run_queues_execution(
+    test_pipeline: Pipeline, mock_discovery: Pipeline, mock_engine: MagicMock, socket_path: Path
+) -> None:
     """Test run() queues execution request to engine via try_start_run."""
 
     # Register a test stage (clean_registry autouse fixture handles cleanup)
@@ -281,7 +285,7 @@ async def test_dispatch_run_queues_execution(mock_engine: MagicMock, socket_path
 
 @pytest.mark.asyncio
 async def test_dispatch_run_with_invalid_stage_returns_error(
-    mock_engine: MagicMock, socket_path: Path
+    test_pipeline: Pipeline, mock_discovery: Pipeline, mock_engine: MagicMock, socket_path: Path
 ) -> None:
     """Test run() with non-existent stage returns STAGE_NOT_FOUND error."""
     server = agent_server.AgentServer(mock_engine, socket_path)

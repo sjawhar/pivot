@@ -15,6 +15,8 @@ if TYPE_CHECKING:
 
     from click.testing import CliRunner
 
+    from pivot.pipeline.pipeline import Pipeline
+
 
 # =============================================================================
 # Module-level TypedDicts and Stage Functions for annotation-based registration
@@ -104,10 +106,12 @@ def test_export_help_shows_options(runner: CliRunner) -> None:
 
 
 def test_export_default_output_creates_dvc_yaml(
+    mock_discovery: Pipeline,
     runner: CliRunner,
     set_project_root: Path,
 ) -> None:
     """Export without args creates dvc.yaml in current directory."""
+    _ = mock_discovery
     (set_project_root / ".git").mkdir()
 
     register_test_stage(_helper_preprocess_with_data_dep, name="preprocess")
@@ -121,10 +125,12 @@ def test_export_default_output_creates_dvc_yaml(
 
 
 def test_export_custom_output_path(
+    mock_discovery: Pipeline,
     runner: CliRunner,
     set_project_root: Path,
 ) -> None:
     """Export with --output writes to specified path."""
+    _ = mock_discovery
     (set_project_root / ".git").mkdir()
 
     register_test_stage(_helper_preprocess_no_deps, name="preprocess")
@@ -137,10 +143,12 @@ def test_export_custom_output_path(
 
 
 def test_export_specific_stages_only(
+    mock_discovery: Pipeline,
     runner: CliRunner,
     set_project_root: Path,
 ) -> None:
     """Export with stage names exports only those stages."""
+    _ = mock_discovery
     (set_project_root / ".git").mkdir()
 
     register_test_stage(_helper_preprocess_a_txt, name="preprocess")
@@ -160,10 +168,12 @@ def test_export_specific_stages_only(
 
 
 def test_export_generates_params_yaml(
+    mock_discovery: Pipeline,
     runner: CliRunner,
     set_project_root: Path,
 ) -> None:
     """Export generates params.yaml with Pydantic model defaults."""
+    _ = mock_discovery
     (set_project_root / ".git").mkdir()
 
     register_test_stage(
@@ -186,10 +196,12 @@ def test_export_generates_params_yaml(
 
 
 def test_export_unknown_stage_error(
+    mock_discovery: Pipeline,
     runner: CliRunner,
     set_project_root: Path,
 ) -> None:
     """Export with unknown stage name shows error."""
+    _ = mock_discovery
     (set_project_root / ".git").mkdir()
 
     register_test_stage(_helper_preprocess_a_txt, name="preprocess")
@@ -202,10 +214,12 @@ def test_export_unknown_stage_error(
 
 
 def test_export_no_stages_error(
+    mock_discovery: Pipeline,
     runner: CliRunner,
     tmp_path: Path,
 ) -> None:
     """Export with no registered stages shows error."""
+    _ = mock_discovery
     (tmp_path / ".git").mkdir()
 
     with contextlib.chdir(tmp_path):
@@ -216,10 +230,12 @@ def test_export_no_stages_error(
 
 
 def test_export_dvc_yaml_structure(
+    mock_discovery: Pipeline,
     runner: CliRunner,
     set_project_root: Path,
 ) -> None:
     """Exported dvc.yaml has correct structure with cmd, deps, outs."""
+    _ = mock_discovery
     (set_project_root / ".git").mkdir()
 
     register_test_stage(_helper_preprocess_with_input_dep, name="preprocess")

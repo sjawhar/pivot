@@ -29,6 +29,7 @@ def _create_stage(name: str, deps: list[str], outs: list[str]) -> RegistryStageI
         dep_specs={},
         out_specs={},
         params_arg_name=None,
+        state_dir=None,
     )
 
 

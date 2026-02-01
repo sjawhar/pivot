@@ -5,8 +5,7 @@ from typing import TYPE_CHECKING
 __version__ = "0.1.0-dev"
 
 # Public API - only exports that users need when writing pipelines
-# Internal modules like REGISTRY, BaseOut, and show.* are accessible
-# via their full paths (e.g., pivot.registry.REGISTRY) for advanced use
+# Internal modules like BaseOut and show.* are accessible via their full paths
 
 if TYPE_CHECKING:
     from pivot import loaders as loaders

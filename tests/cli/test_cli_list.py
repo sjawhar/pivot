@@ -10,6 +10,8 @@ from pivot import cli, loaders, outputs
 if TYPE_CHECKING:
     import click.testing
 
+    from pivot.pipeline.pipeline import Pipeline
+
 
 # =============================================================================
 # Output TypedDicts for annotation-based stages
@@ -75,9 +77,12 @@ def _helper_consumer(
 
 
 def test_list_no_stages_explains_how_to_create(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+    mock_discovery: Pipeline,
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
 ) -> None:
     """Empty pipeline shows help text for creating stages."""
+    _ = mock_discovery
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
 
@@ -89,8 +94,13 @@ def test_list_no_stages_explains_how_to_create(
         assert "pivot.yaml" in result.output
 
 
-def test_list_no_stages_json(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
+def test_list_no_stages_json(
+    mock_discovery: Pipeline,
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+) -> None:
     """Returns {"stages": []} for JSON output with no stages."""
+    _ = mock_discovery
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
 
@@ -107,8 +117,11 @@ def test_list_no_stages_json(runner: click.testing.CliRunner, tmp_path: pathlib.
 # =============================================================================
 
 
-def test_list_with_stages_json(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
+def test_list_with_stages_json(
+    mock_discovery: Pipeline, runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
     """JSON output includes name, deps, outs, mutex, variant for all stages."""
+    _ = mock_discovery
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
@@ -144,9 +157,10 @@ def test_list_with_stages_json(runner: click.testing.CliRunner, tmp_path: pathli
 
 
 def test_list_deps_shows_source_stage(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+    mock_discovery: Pipeline, runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
     """--deps shows source stage for dependencies that are outputs of other stages."""
+    _ = mock_discovery
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")

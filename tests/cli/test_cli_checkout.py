@@ -4,12 +4,20 @@ import pathlib
 import shutil
 from typing import TYPE_CHECKING, Annotated, TypedDict
 
-from helpers import register_test_stage
-from pivot import cli, executor, loaders, outputs, project
+from pivot import cli, loaders, outputs, project
 from pivot.storage import cache, track
 
 if TYPE_CHECKING:
     import click.testing
+
+
+def _setup_test_project() -> pathlib.Path:
+    """Set up minimal project structure for checkout tests."""
+    pathlib.Path(".git").mkdir()
+    pathlib.Path("pivot.yaml").write_text("stages: {}")
+    cache_dir = pathlib.Path(".pivot") / "cache" / "files"
+    cache_dir.mkdir(parents=True)
+    return cache_dir
 
 
 # =============================================================================
@@ -71,9 +79,7 @@ def test_checkout_help(runner: click.testing.CliRunner) -> None:
 def test_checkout_tracked_file(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
     """Checkout restores a .pvt tracked file from cache."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        cache_dir = pathlib.Path(".pivot") / "cache" / "files"
-        cache_dir.mkdir(parents=True)
+        cache_dir = _setup_test_project()
 
         # Create a file, save to cache, then track it
         data_file = pathlib.Path("data.txt")
@@ -103,9 +109,7 @@ def test_checkout_accepts_pvt_file_path(
 ) -> None:
     """Checkout accepts .pvt file paths and restores the corresponding data file."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        cache_dir = pathlib.Path(".pivot") / "cache" / "files"
-        cache_dir.mkdir(parents=True)
+        cache_dir = _setup_test_project()
 
         # Create a file, save to cache, then track it
         data_file = pathlib.Path("data.txt")
@@ -135,9 +139,7 @@ def test_checkout_all_tracked_files(
 ) -> None:
     """Checkout with no targets restores all tracked files."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        cache_dir = pathlib.Path(".pivot") / "cache" / "files"
-        cache_dir.mkdir(parents=True)
+        cache_dir = _setup_test_project()
 
         # Create and track two files
         for name in ["data1.txt", "data2.txt"]:
@@ -172,7 +174,7 @@ def test_checkout_tracked_directory(
 ) -> None:
     """Checkout restores a tracked directory from cache."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
+        _setup_test_project()
         project._project_root_cache = None
 
         # Create directory with files
@@ -208,7 +210,7 @@ def test_checkout_only_missing_restores_directory_with_missing_file(
     to proceed so missing files are restored.
     """
     with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
+        _setup_test_project()
         project._project_root_cache = None
 
         # Create directory with files
@@ -248,7 +250,7 @@ def test_checkout_replaces_file_with_directory(
     restore the correct directory structure.
     """
     with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
+        _setup_test_project()
         project._project_root_cache = None
 
         # Create and track a directory
@@ -283,14 +285,27 @@ def test_checkout_replaces_file_with_directory(
 
 def test_checkout_stage_output(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
     """Checkout restores a stage output from cache using lock file hash."""
+    from helpers import create_pipeline_py
+
     with runner.isolated_filesystem(temp_dir=tmp_path):
+        # Set up project without pivot.yaml (we'll use pipeline.py instead)
         pathlib.Path(".git").mkdir()
+        pathlib.Path(".pivot/cache/files").mkdir(parents=True)
         pathlib.Path("input.txt").write_text("data")
 
-        register_test_stage(_helper_process, name="process")
+        # Create pipeline.py for CLI discovery
+        # Include the TypedDict definition since it's needed by the stage function
+        extra_code = """
+class _ProcessOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
+"""
+        create_pipeline_py(
+            [_helper_process], names={"_helper_process": "process"}, extra_code=extra_code
+        )
 
-        # Run to generate output
-        executor.run()
+        # Run to generate output via CLI
+        run_result = runner.invoke(cli.cli, ["run"])
+        assert run_result.exit_code == 0, f"Run failed: {run_result.output}"
         assert pathlib.Path("output.txt").exists()
 
         # Delete output
@@ -313,9 +328,7 @@ def test_checkout_stage_output(runner: click.testing.CliRunner, tmp_path: pathli
 def test_checkout_mode_symlink(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
     """--checkout-mode symlink creates symlinks."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        cache_dir = pathlib.Path(".pivot") / "cache" / "files"
-        cache_dir.mkdir(parents=True)
+        cache_dir = _setup_test_project()
 
         data_file = pathlib.Path("data.txt")
         data_file.write_text("tracked content")
@@ -336,9 +349,7 @@ def test_checkout_mode_symlink(runner: click.testing.CliRunner, tmp_path: pathli
 def test_checkout_mode_copy(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
     """--checkout-mode copy creates independent copies."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        cache_dir = pathlib.Path(".pivot") / "cache" / "files"
-        cache_dir.mkdir(parents=True)
+        cache_dir = _setup_test_project()
 
         data_file = pathlib.Path("data.txt")
         data_file.write_text("tracked content")
@@ -366,9 +377,7 @@ def test_checkout_errors_on_existing_by_default(
 ) -> None:
     """Checkout errors on existing files by default."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        cache_dir = pathlib.Path(".pivot") / "cache" / "files"
-        cache_dir.mkdir(parents=True)
+        cache_dir = _setup_test_project()
 
         data_file = pathlib.Path("data.txt")
         data_file.write_text("tracked content")
@@ -392,9 +401,7 @@ def test_checkout_only_missing_skips_existing(
 ) -> None:
     """--only-missing skips existing files and shows 'Skipped' message."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        cache_dir = pathlib.Path(".pivot") / "cache" / "files"
-        cache_dir.mkdir(parents=True)
+        cache_dir = _setup_test_project()
 
         data_file = pathlib.Path("data.txt")
         data_file.write_text("tracked content")
@@ -414,9 +421,7 @@ def test_checkout_only_missing_skips_existing(
 def test_checkout_force_overwrites(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
     """--force replaces existing files."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        cache_dir = pathlib.Path(".pivot") / "cache" / "files"
-        cache_dir.mkdir(parents=True)
+        cache_dir = _setup_test_project()
 
         data_file = pathlib.Path("data.txt")
         data_file.write_text("original content")
@@ -451,8 +456,7 @@ def test_checkout_cache_miss_suggests_pull(
 ) -> None:
     """Missing cache entry error suggests 'pivot pull'."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        pathlib.Path(".pivot").mkdir()
+        _setup_test_project()
 
         # Create pvt file pointing to non-existent cache entry
         pvt_data = track.PvtData(path="data.txt", hash="deadbeef12345678", size=100)
@@ -469,8 +473,7 @@ def test_checkout_unknown_target_suggests_list_and_track(
 ) -> None:
     """Unknown target suggests 'pivot list' and 'pivot track'."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        pathlib.Path(".pivot").mkdir()
+        _setup_test_project()
 
         result = runner.invoke(cli.cli, ["checkout", "unknown_file.txt"])
 
@@ -483,12 +486,23 @@ def test_checkout_uncached_output_suggests_run_or_pull(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
     """Uncached stage output suggests 'pivot run' or 'pivot pull'."""
+    from helpers import create_pipeline_py
+
     with runner.isolated_filesystem(temp_dir=tmp_path):
+        # Set up project without pivot.yaml (we'll use pipeline.py instead)
         pathlib.Path(".git").mkdir()
+        pathlib.Path(".pivot/cache/files").mkdir(parents=True)
         pathlib.Path("input.txt").write_text("data")
 
-        # Register stage but don't run it (so no cached output)
-        register_test_stage(_helper_stage_a, name="stage_a")
+        # Create pipeline but don't run it (so no cached output)
+        # Include the TypedDict definition since it's needed by the stage function
+        extra_code = """
+class _StageAOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("a.txt", loaders.PathOnly())]
+"""
+        create_pipeline_py(
+            [_helper_stage_a], names={"_helper_stage_a": "stage_a"}, extra_code=extra_code
+        )
 
         # Try to checkout the output that was never produced
         result = runner.invoke(cli.cli, ["checkout", "a.txt"])
@@ -503,8 +517,7 @@ def test_checkout_path_traversal_rejected(
 ) -> None:
     """Checkout rejects paths with traversal components."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        pathlib.Path(".pivot").mkdir()
+        _setup_test_project()
 
         result = runner.invoke(cli.cli, ["checkout", "../outside.txt"])
 
@@ -517,8 +530,7 @@ def test_checkout_no_targets_no_files_shows_nothing_restored(
 ) -> None:
     """Checkout with nothing to restore completes without error."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        pathlib.Path(".pivot").mkdir()
+        _setup_test_project()
 
         # No tracked files, no stages - should complete successfully
         result = runner.invoke(cli.cli, ["checkout"])
@@ -537,9 +549,7 @@ def test_checkout_partial_success_some_missing(
 ) -> None:
     """Checkout continues with partial success, reports cache misses at end."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        cache_dir = pathlib.Path(".pivot") / "cache" / "files"
-        cache_dir.mkdir(parents=True)
+        cache_dir = _setup_test_project()
 
         # Create first file - will be in cache
         data1 = pathlib.Path("data1.txt")
@@ -575,9 +585,7 @@ def test_checkout_duplicate_targets_deduplicated(
 ) -> None:
     """data.txt and data.txt.pvt resolve to same file, only restored once."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        cache_dir = pathlib.Path(".pivot") / "cache" / "files"
-        cache_dir.mkdir(parents=True)
+        cache_dir = _setup_test_project()
 
         # Create and track a file
         data_file = pathlib.Path("data.txt")
@@ -604,8 +612,7 @@ def test_checkout_quiet_with_failures_shows_summary(
 ) -> None:
     """--quiet still shows failure summary when cache misses occur."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        pathlib.Path(".pivot").mkdir()
+        _setup_test_project()
 
         # Create pvt file pointing to non-existent cache entry
         pvt_data = track.PvtData(path="data.txt", hash="deadbeef12345678", size=100)
@@ -625,9 +632,7 @@ def test_checkout_multiple_immediate_errors_aggregated(
 ) -> None:
     """Multiple 'already exists' errors are aggregated into single message."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        cache_dir = pathlib.Path(".pivot") / "cache" / "files"
-        cache_dir.mkdir(parents=True)
+        cache_dir = _setup_test_project()
 
         # Create and track two files that already exist
         for name in ["data1.txt", "data2.txt"]:
@@ -656,9 +661,7 @@ def test_checkout_shows_aggregate_counts(
 ) -> None:
     """Checkout shows aggregate counts, not interleaved file names."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        cache_dir = pathlib.Path(".pivot") / "cache" / "files"
-        cache_dir.mkdir(parents=True)
+        cache_dir = _setup_test_project()
 
         # Create 3 tracked files
         for i in range(1, 4):

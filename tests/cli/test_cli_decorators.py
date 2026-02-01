@@ -150,12 +150,11 @@ def test_with_error_handling_with_group_command(runner: CliRunner) -> None:
 # =============================================================================
 
 
-def test_pivot_command_auto_discover_calls_discovery_when_no_stages(
+def test_pivot_command_auto_discover_calls_discovery(
     runner: CliRunner, mocker: MockerFixture
 ) -> None:
-    """auto_discover=True calls discover_and_register when no stages registered."""
-    mock_has_stages = mocker.patch.object(discovery, "has_registered_stages", return_value=False)
-    mock_discover = mocker.patch.object(discovery, "discover_and_register")
+    """auto_discover=True calls discover_pipeline."""
+    mock_discover_pipeline = mocker.patch.object(discovery, "discover_pipeline", return_value=None)
 
     @cli_decorators.pivot_command()
     def my_command() -> None:
@@ -164,27 +163,7 @@ def test_pivot_command_auto_discover_calls_discovery_when_no_stages(
     result = runner.invoke(my_command)
 
     assert result.exit_code == 0
-    mock_has_stages.assert_called_once()
-    mock_discover.assert_called_once()
-    assert "Command executed" in result.output
-
-
-def test_pivot_command_auto_discover_skips_when_stages_exist(
-    runner: CliRunner, mocker: MockerFixture
-) -> None:
-    """auto_discover=True skips discovery when stages already registered."""
-    mock_has_stages = mocker.patch.object(discovery, "has_registered_stages", return_value=True)
-    mock_discover = mocker.patch.object(discovery, "discover_and_register")
-
-    @cli_decorators.pivot_command()
-    def my_command() -> None:
-        click.echo("Command executed")
-
-    result = runner.invoke(my_command)
-
-    assert result.exit_code == 0
-    mock_has_stages.assert_called_once()
-    mock_discover.assert_not_called()
+    mock_discover_pipeline.assert_called_once()
     assert "Command executed" in result.output
 
 
@@ -192,8 +171,7 @@ def test_pivot_command_auto_discover_false_skips_discovery(
     runner: CliRunner, mocker: MockerFixture
 ) -> None:
     """auto_discover=False skips discovery entirely."""
-    mock_has_stages = mocker.patch.object(discovery, "has_registered_stages")
-    mock_discover = mocker.patch.object(discovery, "discover_and_register")
+    mock_discover = mocker.patch.object(discovery, "discover_pipeline")
 
     @cli_decorators.pivot_command(auto_discover=False)
     def my_command() -> None:
@@ -202,7 +180,6 @@ def test_pivot_command_auto_discover_false_skips_discovery(
     result = runner.invoke(my_command)
 
     assert result.exit_code == 0
-    mock_has_stages.assert_not_called()
     mock_discover.assert_not_called()
     assert "Command executed" in result.output
 
@@ -211,10 +188,9 @@ def test_pivot_command_auto_discover_converts_discovery_error(
     runner: CliRunner, mocker: MockerFixture
 ) -> None:
     """auto_discover converts DiscoveryError to ClickException."""
-    mocker.patch.object(discovery, "has_registered_stages", return_value=False)
     mocker.patch.object(
         discovery,
-        "discover_and_register",
+        "discover_pipeline",
         side_effect=discovery.DiscoveryError("No pivot.yaml found"),
     )
 
