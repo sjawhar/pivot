@@ -18,8 +18,10 @@ from typing import Annotated, TypedDict
 
 import pandas
 from pivot import loaders, outputs
-from pivot.registry import REGISTRY
+from pivot.pipeline import Pipeline
 from pivot.stage_def import StageParams
+
+pipeline = Pipeline("my_pipeline")
 
 
 # ... preprocess function stays the same ...
@@ -69,8 +71,8 @@ def train(
 
 
 # Register stages
-REGISTRY.register(preprocess)
-REGISTRY.register(train)
+pipeline.register(preprocess)
+pipeline.register(train)
 ```
 
 Note the changes:

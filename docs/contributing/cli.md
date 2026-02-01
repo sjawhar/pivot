@@ -26,16 +26,17 @@ This decorator provides:
 
 ```python
 from pivot.cli import decorators as cli_decorators
+from pivot.cli import helpers as cli_helpers
 
 # Standard command - auto-discovers stages before running
 @cli_decorators.pivot_command()
 def list_cmd() -> None:
     """List registered stages."""
-    # Registry is guaranteed to be populated here
-    stages = registry.REGISTRY.list_stages()
+    # Pipeline is guaranteed to be in context here
+    stages = cli_helpers.list_stages()
     ...
 
-# Command that doesn't need the registry
+# Command that doesn't need the pipeline
 @cli_decorators.pivot_command(auto_discover=False)
 def init() -> None:
     """Initialize new project."""
@@ -45,22 +46,22 @@ def init() -> None:
 
 ### When to Use `auto_discover=False`
 
-Set `auto_discover=False` only for commands that don't use the stage registry:
+Set `auto_discover=False` only for commands that don't need the pipeline:
 
 | Command | auto_discover | Reason |
 |---------|---------------|--------|
-| run, list, export | True (default) | Need registry to find stages |
-| checkout, track | True (default) | Need registry for validation |
+| run, list, export | True (default) | Need pipeline to find stages |
+| checkout, track | True (default) | Need pipeline for validation |
 | init | False | Creates new project (no pipeline yet) |
 | schema | False | Outputs JSON schema only |
-| push, pull | False | Read from lock files, not registry |
+| push, pull | False | Read from lock files, not pipeline |
 
 ### Group Subcommands
 
 Commands under a `@click.group()` (like `pivot metrics show`) can't use `pivot_command`. Use `@with_error_handling` and call `ensure_stages_registered()` explicitly:
 
 ```python
-from pivot.cli.run import ensure_stages_registered
+from pivot.cli._run_common import ensure_stages_registered
 
 @metrics.command("show")
 @cli_decorators.with_error_handling
@@ -86,24 +87,24 @@ from pivot.cli import decorators as cli_decorators
 @click.option("--json", "output_json", is_flag=True, help="Output as JSON")
 def mycommand(stages: tuple[str, ...], verbose: bool, output_json: bool) -> None:
     """One-line description of what this command does."""
-    from pivot import registry
+    from pivot.cli import helpers as cli_helpers
 
-    all_stages = registry.REGISTRY.list_stages()
+    all_stages = cli_helpers.list_stages()
 
     if not all_stages:
         click.echo("No stages registered.")
         return
 
     if stages:
-        all_stages = [s for s in all_stages if s.name in stages]
+        all_stages = [s for s in all_stages if s in stages]
 
     if output_json:
         import json
-        result = {"stages": [s.name for s in all_stages]}
+        result = {"stages": all_stages}
         click.echo(json.dumps(result, indent=2))
     else:
         for stage in all_stages:
-            click.echo(stage.name)
+            click.echo(stage)
 ```
 
 ### 2. Register the Command

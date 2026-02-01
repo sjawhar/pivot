@@ -19,7 +19,7 @@ from typing import Annotated, TypedDict
 
 import pandas
 from pivot import loaders, outputs
-from pivot.registry import REGISTRY
+from pivot.pipeline import Pipeline
 
 
 class PreprocessOutputs(TypedDict):
@@ -49,8 +49,9 @@ def train(
 
 
 # Register stages - Pivot discovers deps/outs from annotations
-REGISTRY.register(preprocess)
-REGISTRY.register(train)
+pipeline = Pipeline("my_pipeline")
+pipeline.register(preprocess)
+pipeline.register(train)
 ```
 
 ```bash

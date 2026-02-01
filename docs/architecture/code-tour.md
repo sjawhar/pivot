@@ -6,11 +6,11 @@ This guide maps Pivot's architectural concepts to actual file paths, helping you
 
 | Command | Entry Point | Description |
 |---------|-------------|-------------|
-| `pivot repro` | `src/pivot/cli/repro.py` → `Engine.run_once()` | DAG-aware batch execution |
-| `pivot run` | `src/pivot/cli/run.py` → `Engine.run_once()` | Single-stage execution |
+| `pivot repro` | `src/pivot/cli/repro.py` → `Engine.run(exit_on_completion=True)` | DAG-aware batch execution |
+| `pivot run` | `src/pivot/cli/run.py` → `Engine.run(exit_on_completion=True)` | Single-stage execution |
 | `pivot list` | `src/pivot/cli/list.py` | Stage listing |
 | `pivot status --explain` | `src/pivot/cli/status.py` → `status.get_pipeline_explanations()` | Change detection explanation |
-| `pivot repro --watch` | `src/pivot/cli/repro.py` → `Engine.run_loop()` | Watch mode |
+| `pivot repro --watch` | `src/pivot/cli/repro.py` → `Engine.run(exit_on_completion=False)` | Watch mode |
 
 ## Core Subsystems
 
@@ -20,16 +20,16 @@ This guide maps Pivot's architectural concepts to actual file paths, helping you
 
 - `src/pivot/discovery.py` - Auto-discovers `pivot.yaml`, `pipeline.py`
 - `src/pivot/pipeline/yaml.py` - Parses `pivot.yaml` into internal structures
-- `src/pivot/registry.py` - Global stage registry (`REGISTRY`)
+- `src/pivot/registry.py` - Stage metadata extraction (used internally by Pipeline)
 - `src/pivot/stage_def.py` - Stage definition classes (`StageDef`, `StageParams`)
 
 **How it works:**
 
-1. `discovery.discover_and_register(project_root)` finds pipeline definition (defaults to current project root)
-2. For YAML: `pipeline.yaml.register_from_pipeline_file()` parses and registers stages
-3. For Python: module is imported, which calls `REGISTRY.register()`
+1. `discovery.discover_pipeline(project_root)` finds pipeline definition (defaults to current project root)
+2. For YAML: `pipeline.yaml.load_pipeline_from_yaml()` parses and registers stages
+3. For Python: module is imported, which calls `pipeline.register()`
 
-**Start reading:** `src/pivot/discovery.py:discover_and_register()`
+**Start reading:** `src/pivot/discovery.py:discover_pipeline()`
 
 ### DAG Construction
 
@@ -79,12 +79,12 @@ This guide maps Pivot's architectural concepts to actual file paths, helping you
 **How it works:**
 
 1. CLI creates Engine and registers sinks/sources
-2. `Engine.run_once()` for batch mode; `Engine.run_loop()` for watch mode
+2. `Engine.run(exit_on_completion=True)` for batch mode; `Engine.run(exit_on_completion=False)` for watch mode
 3. Engine builds bipartite graph and orchestrates execution
 4. Workers execute stages via `worker.execute_stage()`
 5. Lock files updated after each stage
 
-**Start reading:** `src/pivot/engine/engine.py:Engine.run_once()`
+**Start reading:** `src/pivot/engine/engine.py:Engine.run()`
 
 ### Caching & Storage
 
@@ -118,7 +118,7 @@ This guide maps Pivot's architectural concepts to actual file paths, helping you
 **How it works:**
 
 1. Sources submit events to Engine via `engine.submit()`
-2. Engine processes events in `run_loop()` or `run_once()`
+2. Engine processes events in `run()` (with `exit_on_completion` controlling batch vs watch mode)
 3. Engine emits output events to registered sinks
 4. Sinks handle display (TUI, console, JSON)
 
@@ -132,7 +132,7 @@ This guide maps Pivot's architectural concepts to actual file paths, helping you
 - `src/pivot/tui/widgets/` - UI components (stage list, panels, logs, debug)
 - `src/pivot/tui/screens/` - Modal screens (help, history list, confirm dialogs)
 - `src/pivot/tui/console.py` - Plain-text console output (non-TUI mode)
-- `src/pivot/tui/agent_server.py` - JSON-RPC server for external control
+- `src/pivot/engine/agent_rpc.py` - JSON-RPC server for external control
 - `src/pivot/tui/diff_panels.py` - Input/output diff visualization
 
 **How it works:**
@@ -140,8 +140,8 @@ This guide maps Pivot's architectural concepts to actual file paths, helping you
 1. `PivotApp` is the main Textual application (supports both run and watch mode)
 2. `StageListPanel` displays scrollable stage list with grouping
 3. `TabbedDetailPanel` shows Logs/Input/Output tabs for selected stage
-4. `RunDisplay` handles plain-text output in non-TUI mode
-5. `AgentServer` provides JSON-RPC endpoint for programmatic control
+4. `Console` handles plain-text output in non-TUI mode
+5. `AgentRpcHandler` provides JSON-RPC endpoint for programmatic control
 
 **Start reading:** `src/pivot/tui/run.py:PivotApp`
 
@@ -170,7 +170,7 @@ CLI (run.py)
 Discovery (discovery.py)
     │
     ▼
-Registry (registry.py) ◄── YAML Parser (pipeline/yaml.py)
+Pipeline (pipeline.py) ◄── YAML Parser (pipeline/yaml.py)
     │
     ▼
 Engine (engine/engine.py)

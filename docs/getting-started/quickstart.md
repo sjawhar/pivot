@@ -33,7 +33,9 @@ from typing import Annotated, TypedDict
 
 import pandas
 from pivot import loaders, outputs
-from pivot.registry import REGISTRY
+from pivot.pipeline import Pipeline
+
+pipeline = Pipeline("my_pipeline")
 
 
 class PreprocessOutputs(TypedDict):
@@ -67,8 +69,8 @@ def train(
 
 
 # Register stages - Pivot discovers deps/outs from annotations
-REGISTRY.register(preprocess)
-REGISTRY.register(train)
+pipeline.register(preprocess)
+pipeline.register(train)
 ```
 
 ## 3. Create Sample Data
