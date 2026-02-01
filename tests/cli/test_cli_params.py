@@ -428,3 +428,58 @@ def test_params_diff_no_git_warning(
 
     assert result.exit_code == 0
     assert "Warning: Not in a git repository" in result.output
+
+
+# =============================================================================
+# Pipeline Discovery Tests
+# =============================================================================
+
+
+def test_params_show_without_prior_run_discovers_pipeline(
+    runner: click.testing.CliRunner,
+    test_pipeline: Pipeline,
+    mocker: MockerFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """pivot params show discovers pipeline without needing prior command."""
+    from pivot import discovery, project
+
+    monkeypatch.chdir(test_pipeline.root)
+    (test_pipeline.root / ".pivot").mkdir(exist_ok=True)
+
+    # Mock discover_pipeline to return the test pipeline
+    mocker.patch.object(discovery, "discover_pipeline", return_value=test_pipeline)
+    mocker.patch.object(project, "_project_root_cache", test_pipeline.root)
+    # IMPORTANT: Do NOT mock get_pipeline_from_context - we want to test that
+    # ensure_stages_registered() is called and populates the context
+
+    result = runner.invoke(cli.cli, ["params", "show"])
+
+    # Should not raise NoPipelineError - discovery should have been called
+    assert "No pipeline found" not in result.output, f"Output: {result.output}"
+    assert result.exit_code == 0, f"Output: {result.output}"
+
+
+def test_params_diff_without_prior_run_discovers_pipeline(
+    runner: click.testing.CliRunner,
+    test_pipeline: Pipeline,
+    mocker: MockerFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """pivot params diff discovers pipeline without needing prior command."""
+    from pivot import discovery, project
+
+    monkeypatch.chdir(test_pipeline.root)
+    (test_pipeline.root / ".pivot").mkdir(exist_ok=True)
+
+    # Mock discover_pipeline to return the test pipeline
+    mocker.patch.object(discovery, "discover_pipeline", return_value=test_pipeline)
+    mocker.patch.object(project, "_project_root_cache", test_pipeline.root)
+    # IMPORTANT: Do NOT mock get_pipeline_from_context - we want to test that
+    # ensure_stages_registered() is called and populates the context
+
+    result = runner.invoke(cli.cli, ["params", "diff"])
+
+    # Should not raise NoPipelineError - discovery should have been called
+    assert "No pipeline found" not in result.output, f"Output: {result.output}"
+    assert result.exit_code == 0, f"Output: {result.output}"

@@ -114,6 +114,17 @@ Required: success paths, error paths, output formats (`--json`, `--md`).
 
 ---
 
+## Feature Integration Tests
+
+Major features (new CLI modes, protocols, architectural components) need E2E tests that exercise the complete path—unit tests for components are insufficient since they can pass individually but fail when wired together.
+
+**E2E test pattern:**
+1. Start the actual CLI command (subprocess if async)
+2. Exercise through public interface (socket, HTTP, filesystem)
+3. Verify end-to-end behavior, not just component existence
+
+---
+
 ## Coverage
 
 - Minimum: 90%

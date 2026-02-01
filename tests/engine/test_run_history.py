@@ -34,7 +34,8 @@ def registered_stage(test_pipeline: Pipeline) -> str:
     return "history_test"
 
 
-def test_engine_writes_run_history(
+@pytest.mark.anyio
+async def test_engine_writes_run_history(
     registered_stage: str,
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -59,8 +60,8 @@ def test_engine_writes_run_history(
             cache_dir=cache_dir,
         )
     )
-    test_engine.run(exit_on_completion=True)
-    results = collector.get_execution_summaries()
+    await test_engine.run(exit_on_completion=True)
+    results = await collector.get_results()
 
     assert registered_stage in results
 
@@ -76,7 +77,8 @@ def test_engine_writes_run_history(
     assert "ended_at" in latest
 
 
-def test_engine_run_history_contains_stage_records(
+@pytest.mark.anyio
+async def test_engine_run_history_contains_stage_records(
     registered_stage: str,
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -100,7 +102,7 @@ def test_engine_run_history_contains_stage_records(
             cache_dir=cache_dir,
         )
     )
-    test_engine.run(exit_on_completion=True)
+    await test_engine.run(exit_on_completion=True)
 
     # Verify run history contains stage record
     with state_mod.StateDB(state_dir / "state.db") as state_db:
@@ -117,44 +119,50 @@ def test_engine_run_history_contains_stage_records(
     assert "duration_ms" in stage_record
 
 
-def test_engine_writes_run_cache_entry(
+@pytest.mark.anyio
+async def test_engine_writes_run_cache_entry(
     registered_stage: str,
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
-    test_engine: engine.Engine,
+    test_pipeline: Pipeline,
 ) -> None:
     """Engine writes run cache entries for successful stages."""
+    from pivot.engine.engine import Engine
+
     cache_dir = tmp_path / "cache"
     state_dir = tmp_path / "state"
     monkeypatch.setattr(config, "get_cache_dir", lambda: cache_dir)
     monkeypatch.setattr(config, "get_state_dir", lambda: state_dir)
     monkeypatch.setattr(config, "get_state_db_path", lambda: state_dir / "state.db")
 
-    # Run twice - second should be cached
-    collector1 = sinks.ResultCollectorSink()
-    test_engine.add_sink(collector1)
-    test_engine.add_source(
-        sources.OneShotSource(
-            stages=[registered_stage],
-            force=False,
-            reason="test",
-            cache_dir=cache_dir,
+    # First run - executes the stage
+    async with Engine(pipeline=test_pipeline) as engine1:
+        collector1 = sinks.ResultCollectorSink()
+        engine1.add_sink(collector1)
+        engine1.add_source(
+            sources.OneShotSource(
+                stages=[registered_stage],
+                force=False,
+                reason="test",
+                cache_dir=cache_dir,
+            )
         )
-    )
-    test_engine.run(exit_on_completion=True)
+        await engine1.run(exit_on_completion=True)
 
-    collector2 = sinks.ResultCollectorSink()
-    test_engine.add_sink(collector2)
-    test_engine.add_source(
-        sources.OneShotSource(
-            stages=[registered_stage],
-            force=False,
-            reason="test",
-            cache_dir=cache_dir,
+    # Second run - should be cached (new engine instance required)
+    async with Engine(pipeline=test_pipeline) as engine2:
+        collector2 = sinks.ResultCollectorSink()
+        engine2.add_sink(collector2)
+        engine2.add_source(
+            sources.OneShotSource(
+                stages=[registered_stage],
+                force=False,
+                reason="test",
+                cache_dir=cache_dir,
+            )
         )
-    )
-    test_engine.run(exit_on_completion=True)
-    results = collector2.get_execution_summaries()
+        await engine2.run(exit_on_completion=True)
+        results = await collector2.get_results()
 
     # Should be skipped due to cache
     assert results[registered_stage]["reason"] != "", "Stage should have a skip reason"

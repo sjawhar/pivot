@@ -18,7 +18,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
 
-def _run_engine_once(
+async def _run_engine_once(
     engine: Engine,
     *,
     cache_dir: pathlib.Path | None = None,
@@ -39,8 +39,13 @@ def _run_engine_once(
             allow_uncached_incremental=allow_uncached_incremental,
         )
     )
-    engine.run(exit_on_completion=True)
-    return collector.get_execution_summaries()
+    await engine.run(exit_on_completion=True)
+    # Convert StageCompleted events to ExecutionSummary
+    raw_results = await collector.get_results()
+    return {
+        name: executor_core.ExecutionSummary(status=event["status"], reason=event["reason"])
+        for name, event in raw_results.items()
+    }
 
 
 # =============================================================================
@@ -242,7 +247,8 @@ def test_prepare_outputs_incremental_missing_cache_error(
         pytest.param(True, ".pivot/pending/stages", id="pending_lock"),
     ],
 )
-def test_integration_missing_cache_error_includes_recovery_suggestion(
+@pytest.mark.anyio
+async def test_integration_missing_cache_error_includes_recovery_suggestion(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
     test_pipeline: Pipeline,
@@ -265,14 +271,18 @@ def test_integration_missing_cache_error_includes_recovery_suggestion(
     )
 
     # First run creates and caches the output
-    with Engine(pipeline=test_pipeline) as engine:
+    async with Engine(pipeline=test_pipeline) as engine:
         collector1 = sinks.ResultCollectorSink()
         engine.add_sink(collector1)
         engine.add_source(
             sources.OneShotSource(stages=None, force=False, reason="test", no_commit=no_commit)
         )
-        engine.run(exit_on_completion=True)
-        results1 = collector1.get_execution_summaries()
+        await engine.run(exit_on_completion=True)
+        raw1 = await collector1.get_results()
+        results1 = {
+            name: executor_core.ExecutionSummary(status=e["status"], reason=e["reason"])
+            for name, e in raw1.items()
+        }
     assert results1["append_stage"]["status"] == "ran"
 
     # Delete the cache files AND output file (but keep the lock file)
@@ -281,14 +291,18 @@ def test_integration_missing_cache_error_includes_recovery_suggestion(
     db_path.unlink()
 
     # Second run with force should fail with helpful error message
-    with Engine(pipeline=test_pipeline) as engine:
+    async with Engine(pipeline=test_pipeline) as engine:
         collector2 = sinks.ResultCollectorSink()
         engine.add_sink(collector2)
         engine.add_source(
             sources.OneShotSource(stages=None, force=True, reason="test", no_commit=no_commit)
         )
-        engine.run(exit_on_completion=True)
-        results2 = collector2.get_execution_summaries()
+        await engine.run(exit_on_completion=True)
+        raw2 = await collector2.get_results()
+        results2 = {
+            name: executor_core.ExecutionSummary(status=e["status"], reason=e["reason"])
+            for name, e in raw2.items()
+        }
     assert results2["append_stage"]["status"] == "failed"
 
     reason = results2["append_stage"]["reason"]
@@ -326,7 +340,8 @@ def test_dvc_export_incremental_out_with_cache_false() -> None:
 # =============================================================================
 
 
-def test_integration_first_run_creates_output(
+@pytest.mark.anyio
+async def test_integration_first_run_creates_output(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, test_pipeline: Pipeline
 ) -> None:
     """First run with IncrementalOut should create the output from scratch."""
@@ -341,15 +356,16 @@ def test_integration_first_run_creates_output(
         out_path=str(db_path),
     )
 
-    with Engine(pipeline=test_pipeline) as engine:
-        results = _run_engine_once(engine, cache_dir=tmp_path / ".pivot" / "cache")
+    async with Engine(pipeline=test_pipeline) as engine:
+        results = await _run_engine_once(engine, cache_dir=tmp_path / ".pivot" / "cache")
 
     assert results["append_stage"]["status"] == "ran"
     assert db_path.exists()
     assert db_path.read_text() == "line 1\n"
 
 
-def test_integration_second_run_appends_to_output(
+@pytest.mark.anyio
+async def test_integration_second_run_appends_to_output(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, test_pipeline: Pipeline
 ) -> None:
     """Second run should restore and append to existing output."""
@@ -367,8 +383,8 @@ def test_integration_second_run_appends_to_output(
     )
 
     # First run
-    with Engine(pipeline=test_pipeline) as engine:
-        _run_engine_once(engine, cache_dir=cache_dir)
+    async with Engine(pipeline=test_pipeline) as engine:
+        await _run_engine_once(engine, cache_dir=cache_dir)
     assert db_path.read_text() == "line 1\n"
 
     # Simulate code change by modifying the lock file's code_manifest
@@ -383,8 +399,8 @@ def test_integration_second_run_appends_to_output(
     db_path.unlink()
 
     # Second run - should restore from cache and append
-    with Engine(pipeline=test_pipeline) as engine:
-        results = _run_engine_once(engine, cache_dir=cache_dir)
+    async with Engine(pipeline=test_pipeline) as engine:
+        results = await _run_engine_once(engine, cache_dir=cache_dir)
 
     assert results["append_stage"]["status"] == "ran"
     assert db_path.read_text() == "line 1\nline 2\n"
@@ -572,7 +588,8 @@ def test_executable_bit_restored_with_copy_mode(tmp_path: pathlib.Path) -> None:
 # =============================================================================
 
 
-def test_uncached_incremental_output_raises_error(
+@pytest.mark.anyio
+async def test_uncached_incremental_output_raises_error(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, test_pipeline: Pipeline
 ) -> None:
     """Should raise error when IncrementalOut file exists but has no cache entry."""
@@ -590,17 +607,22 @@ def test_uncached_incremental_output_raises_error(
         out_path=str(db_path),
     )
 
-    with (
-        pytest.raises(exceptions.UncachedIncrementalOutputError) as exc_info,
-        Engine(pipeline=test_pipeline) as engine,
-    ):
-        _run_engine_once(engine, cache_dir=tmp_path / ".pivot" / "cache")
+    # Async engine wraps exceptions in ExceptionGroup
+    with pytest.raises(ExceptionGroup) as exc_info:
+        async with Engine(pipeline=test_pipeline) as engine:
+            await _run_engine_once(engine, cache_dir=tmp_path / ".pivot" / "cache")
 
-    assert "database.txt" in str(exc_info.value)
-    assert "not in cache" in str(exc_info.value)
+    # Extract the actual exception from the group
+    exc_group = exc_info.value
+    assert len(exc_group.exceptions) == 1
+    actual_exc = exc_group.exceptions[0]
+    assert isinstance(actual_exc, exceptions.UncachedIncrementalOutputError)
+    assert "database.txt" in str(actual_exc)
+    assert "not in cache" in str(actual_exc)
 
 
-def test_uncached_incremental_output_allow_uncached_incremental_allows_run(
+@pytest.mark.anyio
+async def test_uncached_incremental_output_allow_uncached_incremental_allows_run(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, test_pipeline: Pipeline
 ) -> None:
     """allow_uncached_incremental=True should bypass the uncached output check."""
@@ -617,14 +639,15 @@ def test_uncached_incremental_output_allow_uncached_incremental_allows_run(
     )
 
     # allow_uncached_incremental=True should allow run even with uncached file
-    with Engine(pipeline=test_pipeline) as engine:
-        results = _run_engine_once(
+    async with Engine(pipeline=test_pipeline) as engine:
+        results = await _run_engine_once(
             engine, cache_dir=tmp_path / ".pivot" / "cache", allow_uncached_incremental=True
         )
     assert results["append_stage"]["status"] == "ran"
 
 
-def test_cached_incremental_output_runs_normally(
+@pytest.mark.anyio
+async def test_cached_incremental_output_runs_normally(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, test_pipeline: Pipeline
 ) -> None:
     """IncrementalOut that is properly cached should run without error."""
@@ -641,17 +664,18 @@ def test_cached_incremental_output_runs_normally(
     )
 
     # First run creates and caches the output
-    with Engine(pipeline=test_pipeline) as engine:
-        results1 = _run_engine_once(engine, cache_dir=cache_dir)
+    async with Engine(pipeline=test_pipeline) as engine:
+        results1 = await _run_engine_once(engine, cache_dir=cache_dir)
     assert results1["append_stage"]["status"] == "ran"
 
     # Second run should skip without error (output is cached, nothing changed)
-    with Engine(pipeline=test_pipeline) as engine:
-        results2 = _run_engine_once(engine, cache_dir=cache_dir)
+    async with Engine(pipeline=test_pipeline) as engine:
+        results2 = await _run_engine_once(engine, cache_dir=cache_dir)
     assert results2["append_stage"]["status"] == "skipped"
 
 
-def test_force_runs_incremental_stage_even_when_unchanged(
+@pytest.mark.anyio
+async def test_force_runs_incremental_stage_even_when_unchanged(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, test_pipeline: Pipeline
 ) -> None:
     """force=True should re-run IncrementalOut stage even when nothing changed."""
@@ -668,29 +692,32 @@ def test_force_runs_incremental_stage_even_when_unchanged(
     )
 
     # First run creates the output
-    with Engine(pipeline=test_pipeline) as engine:
-        results1 = _run_engine_once(engine, cache_dir=cache_dir)
+    async with Engine(pipeline=test_pipeline) as engine:
+        results1 = await _run_engine_once(engine, cache_dir=cache_dir)
     assert results1["append_stage"]["status"] == "ran"
     assert db_path.read_text() == "line 1\n"
 
     # Second run without force should skip
-    with Engine(pipeline=test_pipeline) as engine:
-        results2 = _run_engine_once(engine, cache_dir=cache_dir)
+    async with Engine(pipeline=test_pipeline) as engine:
+        results2 = await _run_engine_once(engine, cache_dir=cache_dir)
     assert results2["append_stage"]["status"] == "skipped"
     assert db_path.read_text() == "line 1\n"
 
     # Third run with force=True should run and append
-    with Engine(pipeline=test_pipeline) as engine:
-        results3 = _run_engine_once(engine, cache_dir=cache_dir, force=True)
+    async with Engine(pipeline=test_pipeline) as engine:
+        results3 = await _run_engine_once(engine, cache_dir=cache_dir, force=True)
     assert results3["append_stage"]["status"] == "ran"
     assert results3["append_stage"]["reason"] == "forced"
     assert db_path.read_text() == "line 1\nline 2\n"
 
 
-def test_force_and_allow_uncached_incremental_are_orthogonal(
+@pytest.mark.anyio
+async def test_force_and_allow_uncached_incremental_are_orthogonal(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, test_pipeline: Pipeline
 ) -> None:
     """force and allow_uncached_incremental are independent flags."""
+    from pivot import exceptions
+
     monkeypatch.setattr("pivot.project.get_project_root", lambda: tmp_path)
     monkeypatch.chdir(tmp_path)
 
@@ -706,17 +733,18 @@ def test_force_and_allow_uncached_incremental_are_orthogonal(
     )
 
     # force=True alone should still raise error for uncached incremental
-    from pivot import exceptions
+    # Async engine wraps exceptions in ExceptionGroup
+    with pytest.raises(ExceptionGroup) as exc_info:
+        async with Engine(pipeline=test_pipeline) as engine:
+            await _run_engine_once(engine, cache_dir=cache_dir, force=True)
 
-    with (
-        pytest.raises(exceptions.UncachedIncrementalOutputError),
-        Engine(pipeline=test_pipeline) as engine,
-    ):
-        _run_engine_once(engine, cache_dir=cache_dir, force=True)
+    # Verify it's the expected exception
+    assert len(exc_info.value.exceptions) == 1
+    assert isinstance(exc_info.value.exceptions[0], exceptions.UncachedIncrementalOutputError)
 
     # Both flags together should work
-    with Engine(pipeline=test_pipeline) as engine:
-        results = _run_engine_once(
+    async with Engine(pipeline=test_pipeline) as engine:
+        results = await _run_engine_once(
             engine, cache_dir=cache_dir, force=True, allow_uncached_incremental=True
         )
     assert results["append_stage"]["status"] == "ran"

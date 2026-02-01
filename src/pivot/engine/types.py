@@ -1,13 +1,12 @@
-"""Core type definitions for the engine module."""
-
 from __future__ import annotations
 
 from enum import Enum, IntEnum
-from typing import TYPE_CHECKING, Literal, NotRequired, Protocol, TypedDict
+from typing import TYPE_CHECKING, Literal, Protocol, TypedDict
 
 if TYPE_CHECKING:
     import pathlib
-    from collections.abc import Callable
+
+    from anyio.streams.memory import MemoryObjectSendStream
 
     from pivot.types import CompletionType, OnError
 
@@ -87,24 +86,23 @@ class CodeOrConfigChanged(TypedDict):
 class RunRequested(TypedDict):
     """Explicit run request from CLI, RPC, or agent.
 
-    Required fields are always present. Optional fields use NotRequired
-    and have defaults applied in _handle_run_requested().
+    All fields are required. Callers must provide all fields with their
+    default values when creating events.
     """
 
     type: Literal["run_requested"]
     stages: list[str] | None  # None = all stages
     force: bool
     reason: str  # "cli", "agent:{run_id}", "watch:initial"
-    # Optional execution parameters (NotRequired = may be absent)
-    single_stage: NotRequired[bool]  # Default: False
-    parallel: NotRequired[bool]  # Default: True
-    max_workers: NotRequired[int | None]  # Default: None (auto)
-    no_commit: NotRequired[bool]  # Default: False
-    no_cache: NotRequired[bool]  # Default: False
-    on_error: NotRequired[OnError]  # Default: OnError.FAIL
-    cache_dir: NotRequired[pathlib.Path | None]  # Default: None (auto)
-    allow_uncached_incremental: NotRequired[bool]  # Default: False
-    checkout_missing: NotRequired[bool]  # Default: False
+    single_stage: bool
+    parallel: bool
+    max_workers: int | None
+    no_commit: bool
+    no_cache: bool
+    on_error: OnError
+    cache_dir: pathlib.Path | None
+    allow_uncached_incremental: bool
+    checkout_missing: bool
 
 
 class CancelRequested(TypedDict):
@@ -194,24 +192,23 @@ OutputEvent = (
 
 
 class EventSource(Protocol):
-    """Source that produces input events."""
+    """Protocol for async event sources that push events to the engine."""
 
-    def start(self, submit: Callable[[InputEvent], None]) -> None:
-        """Begin producing events. Call submit() for each event."""
-        ...
+    async def run(self, send: MemoryObjectSendStream[InputEvent]) -> None:
+        """Run the source, pushing events to the send channel.
 
-    def stop(self) -> None:
-        """Stop producing events."""
+        The source should run until cancelled via task group cancellation.
+        """
         ...
 
 
 class EventSink(Protocol):
-    """Sink that consumes output events."""
+    """Protocol for async event sinks that receive engine output."""
 
-    def handle(self, event: OutputEvent) -> None:
-        """Process an event. Must be non-blocking."""
+    async def handle(self, event: OutputEvent) -> None:
+        """Handle a single output event. Must be non-blocking."""
         ...
 
-    def close(self) -> None:
-        """Clean up resources."""
+    async def close(self) -> None:
+        """Clean up resources when engine shuts down."""
         ...

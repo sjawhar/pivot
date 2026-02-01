@@ -24,7 +24,15 @@ class NoPipelineError(exceptions.PivotError):
 
     @override
     def format_user_message(self) -> str:
-        return "No Pipeline in context. Ensure the command uses @pivot_command() decorator with auto_discover=True."
+        return (
+            "No pipeline found. This command requires a Pivot project.\n"
+            "\n"
+            "To create a new project, run: pivot init\n"
+            "\n"
+            "If you're in an existing project, ensure one of these exists:\n"
+            "  - pivot.yaml (or pivot.yml)\n"
+            "  - pipeline.py"
+        )
 
 
 def _get_pipeline() -> Pipeline:

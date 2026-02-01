@@ -24,12 +24,9 @@ from pivot.types import (
 
 if TYPE_CHECKING:
     import concurrent.futures
-    import threading
-    from collections.abc import Callable
 
     from pivot.pipeline.pipeline import Pipeline
     from pivot.registry import RegistryStageInfo
-    from pivot.types import RunJsonEvent
 
 logger = logging.getLogger(__name__)
 
@@ -162,8 +159,6 @@ def run(
     force: bool = False,
     no_commit: bool = False,
     no_cache: bool = False,
-    progress_callback: Callable[[RunJsonEvent], None] | None = None,
-    cancel_event: threading.Event | None = None,
     checkout_missing: bool = False,
     pipeline: Pipeline | None = None,
 ) -> dict[str, ExecutionSummary]:
@@ -184,8 +179,6 @@ def run(
         force: If True, bypass cache and force all stages to re-execute.
         no_commit: If True, defer lock files to pending dir (faster iteration).
         no_cache: If True, skip caching outputs entirely (maximum iteration speed).
-        progress_callback: Callback for JSONL progress events (stage start/complete).
-        cancel_event: If set, stop starting new stages and mark pending as cancelled.
         checkout_missing: If True, restore missing tracked files from cache before running.
 
     Returns:
@@ -211,8 +204,6 @@ def run(
             force=force,
             no_commit=no_commit,
             no_cache=no_cache,
-            progress_callback=progress_callback,
-            cancel_event=cancel_event,
             checkout_missing=checkout_missing,
             pipeline=pipeline,
         )
@@ -229,13 +220,13 @@ def _run_inner(
     force: bool,
     no_commit: bool,
     no_cache: bool,
-    progress_callback: Callable[[RunJsonEvent], None] | None,
-    cancel_event: threading.Event | None,
     checkout_missing: bool,
     pipeline: Pipeline | None,
 ) -> dict[str, ExecutionSummary]:
     """Inner implementation of run(), called with lock already held if needed."""
     # Import here to avoid circular import (engine imports executor_core)
+    import anyio
+
     from pivot.engine.engine import Engine
     from pivot.engine.sinks import ResultCollectorSink
     from pivot.engine.sources import OneShotSource
@@ -256,42 +247,48 @@ def _run_inner(
                 "No pipeline found. Create pivot.yaml or pipeline.py to define stages."
             )
 
-    # Create engine with event-driven execution
-    with Engine(pipeline=pipeline) as engine:
-        # Pass cancel event to engine if provided
-        if cancel_event is not None:
-            engine.set_cancel_event(cancel_event)
+    # Run async execution
+    async def execute() -> dict[str, ExecutionSummary]:
+        async with Engine(pipeline=pipeline) as eng:
+            # Add ResultCollectorSink to collect results
+            result_sink = ResultCollectorSink()
+            eng.add_sink(result_sink)
 
-        # Set progress callback on engine for JSONL output
-        if progress_callback is not None:
-            engine.set_progress_callback(progress_callback)
+            # Create OneShotSource with all orchestration parameters
+            source = OneShotSource(
+                stages=stages,
+                force=force,
+                reason="cli",
+                single_stage=single_stage,
+                parallel=parallel,
+                max_workers=max_workers,
+                no_commit=no_commit,
+                no_cache=no_cache,
+                on_error=on_error,
+                cache_dir=cache_dir,
+                allow_uncached_incremental=allow_uncached_incremental,
+                checkout_missing=checkout_missing,
+            )
+            eng.add_source(source)
 
-        # Add ResultCollectorSink to collect results
-        result_sink = ResultCollectorSink()
-        engine.add_sink(result_sink)
+            # Run event loop until all stages complete
+            await eng.run(exit_on_completion=True)
 
-        # Create OneShotSource with all orchestration parameters
-        source = OneShotSource(
-            stages=stages,
-            force=force,
-            reason="cli",
-            single_stage=single_stage,
-            parallel=parallel,
-            max_workers=max_workers,
-            no_commit=no_commit,
-            no_cache=no_cache,
-            on_error=on_error,
-            cache_dir=cache_dir,
-            allow_uncached_incremental=allow_uncached_incremental,
-            checkout_missing=checkout_missing,
-        )
-        engine.add_source(source)
+            # Convert results from StageCompleted to ExecutionSummary
+            raw_results = await result_sink.get_results()
+            return {
+                name: ExecutionSummary(status=event["status"], reason=event["reason"])
+                for name, event in raw_results.items()
+            }
 
-        # Run event loop until all stages complete
-        engine.run(exit_on_completion=True)
-
-        # Return collected results
-        return result_sink.get_execution_summaries()
+    try:
+        return anyio.run(execute)
+    except BaseExceptionGroup as eg:
+        # Unwrap single-exception groups for cleaner error handling
+        # anyio's task groups wrap exceptions in ExceptionGroup
+        if len(eg.exceptions) == 1:
+            raise eg.exceptions[0] from None
+        raise
 
 
 # =========================================================================

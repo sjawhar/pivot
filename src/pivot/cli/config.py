@@ -73,15 +73,46 @@ def config_list(use_global: bool, use_local: bool, output_json: bool) -> None:
             click.echo(f"{key} = {_format_value(value)} ({source})")
 
 
+def _get_nested_value(data: dict[str, Any], key: str) -> Any:
+    """Get nested value from dict using dotted key."""
+    keys = key.split(".")
+    current: dict[str, Any] = data
+    for i, k in enumerate(keys):
+        if k not in current:
+            return None
+        value: Any = current[k]
+        if i < len(keys) - 1:
+            if not isinstance(value, dict):
+                return None
+            current = cast("dict[str, Any]", value)
+        else:
+            return value
+    return None
+
+
 @config_cmd.command("get")
 @click.argument("key", shell_complete=completion.complete_config_keys)
+@click.option("--global", "use_global", is_flag=True, help="Get from global config only")
+@click.option("--local", "use_local", is_flag=True, help="Get from local config only")
 @click.option("--json", "output_json", is_flag=True, help="Output as JSON")
-def config_get(key: str, output_json: bool) -> None:
+def config_get(key: str, use_global: bool, use_local: bool, output_json: bool) -> None:
     """Get a configuration value by dotted key."""
+    if use_global and use_local:
+        raise click.ClickException("Cannot use both --global and --local")
+
     if not config.is_valid_key(key):
         raise click.ClickException(f"Unknown config key: '{key}'")
 
-    value, source = config.get_config_value(key)
+    if use_global:
+        data = config.load_config_file(config.get_global_config_path())
+        value = _get_nested_value(data, key)
+        source = config.ConfigScope.GLOBAL
+    elif use_local:
+        data = config.load_config_file(config.get_local_config_path())
+        value = _get_nested_value(data, key)
+        source = config.ConfigScope.LOCAL
+    else:
+        value, source = config.get_config_value(key)
 
     if output_json:
         click.echo(json.dumps({"key": key, "value": value, "source": str(source)}))

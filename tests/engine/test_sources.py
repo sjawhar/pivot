@@ -2,258 +2,201 @@
 
 from __future__ import annotations
 
-import threading
-import time
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 from pivot.engine import sources, types
-
-if TYPE_CHECKING:
-    from collections.abc import Generator
-
-    import pytest
-
-
-def test_filesystem_source_instantiation() -> None:
-    """FilesystemSource can be instantiated with watch paths."""
-    source = sources.FilesystemSource(watch_paths=[Path("/tmp/test")])
-    assert hasattr(source, "start")
-    assert hasattr(source, "stop")
-
-
-def test_filesystem_source_conforms_to_protocol() -> None:
-    """FilesystemSource conforms to EventSource protocol."""
-    source = sources.FilesystemSource(watch_paths=[])
-    # Protocol conformance: has start(submit) and stop()
-    _source: types.EventSource = source
-    assert _source is source
-
-
-def test_filesystem_source_set_watch_paths() -> None:
-    """FilesystemSource.set_watch_paths() updates watched paths."""
-    source = sources.FilesystemSource(watch_paths=[Path("/tmp/a")])
-
-    new_paths = [Path("/tmp/b"), Path("/tmp/c")]
-    source.set_watch_paths(new_paths)
-
-    assert source.watch_paths == new_paths
-
-
-def test_filesystem_source_watch_paths_property() -> None:
-    """FilesystemSource.watch_paths returns current paths."""
-    paths = [Path("/tmp/test1"), Path("/tmp/test2")]
-    source = sources.FilesystemSource(watch_paths=paths)
-
-    assert source.watch_paths == paths
-
 
 # =============================================================================
 # OneShotSource
 # =============================================================================
 
 
-def test_oneshot_source_emits_run_requested() -> None:
-    """OneShotSource emits a single RunRequested event then stops."""
-    events_received = list[types.InputEvent]()
+async def test_async_oneshot_source_emits_run_requested() -> None:
+    """OneShotSource emits a single RunRequested event."""
+    import anyio
 
-    def submit(event: types.InputEvent) -> None:
-        events_received.append(event)
+    from pivot.engine.sources import OneShotSource
+    from pivot.engine.types import InputEvent
 
-    source = sources.OneShotSource(
+    events_received = list[InputEvent]()
+    send, recv = anyio.create_memory_object_stream[InputEvent](10)
+
+    source = OneShotSource(
         stages=["train", "evaluate"],
         force=True,
         reason="cli",
     )
-    source.start(submit)
 
-    assert len(events_received) == 1
-    event = events_received[0]
-    assert event["type"] == "run_requested"
-    assert event["stages"] == ["train", "evaluate"]
-    assert event["force"] is True
-    assert event["reason"] == "cli"
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(source.run, send)
 
-
-def test_oneshot_source_with_none_stages() -> None:
-    """OneShotSource with stages=None emits event with stages=None."""
-    events_received = list[types.InputEvent]()
-
-    def submit(event: types.InputEvent) -> None:
+        # Receive the event
+        event = await recv.receive()
         events_received.append(event)
 
-    source = sources.OneShotSource(stages=None, force=False, reason="test")
-    source.start(submit)
+        # Source should exit after one event
+        tg.cancel_scope.cancel()
 
     assert len(events_received) == 1
-    event = events_received[0]
-    assert event["type"] == "run_requested"
-    assert event["stages"] is None
+    assert events_received[0]["type"] == "run_requested"
+    assert events_received[0]["stages"] == ["train", "evaluate"]
+    assert events_received[0]["force"] is True
 
 
-def test_oneshot_source_stop_is_noop() -> None:
-    """OneShotSource.stop() is safe to call multiple times."""
-    source = sources.OneShotSource(stages=None, force=False, reason="test")
-    source.stop()  # Should not raise
-    source.stop()  # Should not raise
-
-
-def test_oneshot_source_conforms_to_protocol() -> None:
+def test_async_oneshot_source_conforms_to_protocol() -> None:
     """OneShotSource conforms to EventSource protocol."""
     source = sources.OneShotSource(stages=None, force=False, reason="test")
-    # Protocol conformance: has start(submit) and stop()
+    # Protocol conformance: has async run(send)
     _source: types.EventSource = source
     assert _source is source
 
 
 # =============================================================================
-# FilesystemSource Watcher Tests
+# FilesystemSource
 # =============================================================================
 
 
-def test_filesystem_source_starts_watcher_thread(tmp_path: Path) -> None:
-    """FilesystemSource.start() spawns a watcher thread."""
-    watch_file = tmp_path / "data.csv"
-    watch_file.touch()
+async def test_async_filesystem_source_instantiation() -> None:
+    """FilesystemSource can be instantiated with watch paths."""
+    from pivot.engine.sources import FilesystemSource
 
-    events_received = list[types.InputEvent]()
-    event_received = threading.Event()
-
-    def submit(event: types.InputEvent) -> None:
-        events_received.append(event)
-        event_received.set()
-
-    source = sources.FilesystemSource(watch_paths=[tmp_path])
-    source.start(submit)
-
-    # Give watcher time to start
-    time.sleep(0.2)
-
-    # Modify file to trigger event
-    watch_file.write_text("new content")
-
-    # Wait for event with timeout
-    assert event_received.wait(timeout=2.0), "Timed out waiting for file change event"
-
-    source.stop()
-
-    # Should have received at least one event
-    assert len(events_received) >= 1
-    assert events_received[0]["type"] == "data_artifact_changed"
+    source = FilesystemSource(watch_paths=[Path("/tmp/test")])
+    assert hasattr(source, "run")
+    assert source.watch_paths == [Path("/tmp/test")]
 
 
-def test_filesystem_source_stop_terminates_watcher(tmp_path: Path) -> None:
-    """FilesystemSource.stop() terminates the watcher thread."""
-    source = sources.FilesystemSource(watch_paths=[tmp_path])
-    source.start(lambda _: None)
+async def test_async_filesystem_source_set_watch_paths() -> None:
+    """FilesystemSource.set_watch_paths() updates watched paths."""
+    from pivot.engine.sources import FilesystemSource
 
-    # Give watcher time to start
-    time.sleep(0.1)
-
-    source.stop()
-
-    # Verify stop() is idempotent (can be called multiple times safely)
-    # This implicitly verifies cleanup completed since repeated join() on
-    # a non-terminated thread would hang or error
-    source.stop()
+    source = FilesystemSource(watch_paths=[Path("/tmp/a")])
+    new_paths = [Path("/tmp/b"), Path("/tmp/c")]
+    source.set_watch_paths(new_paths)
+    assert source.watch_paths == new_paths
 
 
-def test_filesystem_source_emits_code_changed_for_python_files(tmp_path: Path) -> None:
+async def test_async_filesystem_source_emits_code_changed_for_py_files(tmp_path: Path) -> None:
     """FilesystemSource emits code_or_config_changed for .py files."""
+    import anyio
+
+    from pivot.engine.sources import FilesystemSource
+    from pivot.engine.types import InputEvent
+
     watch_file = tmp_path / "module.py"
-    watch_file.touch()
+    watch_file.write_text("# initial")
 
-    events_received = list[types.InputEvent]()
-    event_received = threading.Event()
+    events_received = list[InputEvent]()
+    send, recv = anyio.create_memory_object_stream[InputEvent](10)
 
-    def submit(event: types.InputEvent) -> None:
-        events_received.append(event)
-        event_received.set()
+    async def collect_events() -> None:
+        async for event in recv:
+            events_received.append(event)
+            return  # Exit after first event
 
-    source = sources.FilesystemSource(watch_paths=[tmp_path])
-    source.start(submit)
+    async with anyio.create_task_group() as tg:
+        source = FilesystemSource(watch_paths=[tmp_path], debounce_ms=100)
+        tg.start_soon(source.run, send)
+        tg.start_soon(collect_events)
 
-    # Give watcher time to start
-    time.sleep(0.2)
+        # Wait for watcher to start
+        await anyio.sleep(0.2)
 
-    # Modify Python file to trigger event
-    watch_file.write_text("# new content")
+        # Modify Python file
+        watch_file.write_text("# modified")
 
-    # Wait for event with timeout
-    assert event_received.wait(timeout=2.0), "Timed out waiting for file change event"
+        # Wait for event
+        await anyio.sleep(0.3)
 
-    source.stop()
+        tg.cancel_scope.cancel()
 
     # Should have received code_or_config_changed event
-    assert len(events_received) >= 1
-    assert events_received[0]["type"] == "code_or_config_changed"
-
-
-def test_filesystem_source_emits_code_changed_for_config_files(tmp_path: Path) -> None:
-    """FilesystemSource emits code_or_config_changed for pivot.yaml."""
-    config_file = tmp_path / "pivot.yaml"
-    config_file.write_text("# initial")
-
-    events_received = list[types.InputEvent]()
-    event_received = threading.Event()
-
-    def submit(event: types.InputEvent) -> None:
-        events_received.append(event)
-        event_received.set()
-
-    source = sources.FilesystemSource(watch_paths=[tmp_path])
-    source.start(submit)
-
-    time.sleep(0.2)
-    config_file.write_text("# modified")
-
-    assert event_received.wait(timeout=2.0), "Timed out waiting for config change event"
-    source.stop()
-
     code_events = [e for e in events_received if e["type"] == "code_or_config_changed"]
-    assert len(code_events) >= 1
+    assert len(code_events) >= 1, "Should emit code_or_config_changed for .py files"
 
 
-def test_filesystem_source_debounce_parameter() -> None:
-    """FilesystemSource accepts and stores debounce parameter."""
-    # Default is None
-    source_default = sources.FilesystemSource(watch_paths=[])
-    assert source_default.debounce is None
+async def test_async_filesystem_source_set_watch_paths_signals_stop_event() -> None:
+    """FilesystemSource.set_watch_paths() signals stop event when running."""
+    from pivot.engine.sources import FilesystemSource
 
-    # Explicit value is stored
-    source_with_debounce = sources.FilesystemSource(watch_paths=[], debounce=500)
-    assert source_with_debounce.debounce == 500
+    source = FilesystemSource(watch_paths=[Path("/tmp/a")])
 
-    # Explicit None works
-    source_explicit_none = sources.FilesystemSource(watch_paths=[], debounce=None)
-    assert source_explicit_none.debounce is None
+    # Simulate running state
+    import anyio
+
+    source._running = True
+    source._stop_event = anyio.Event()
+
+    # set_watch_paths should signal the stop event
+    source.set_watch_paths([Path("/tmp/b")])
+
+    assert source._stop_event.is_set(), "stop_event should be set when paths change while running"
+    assert source.watch_paths == [Path("/tmp/b")]
 
 
-def test_filesystem_source_debounce_passed_to_watchfiles(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """FilesystemSource passes debounce to watchfiles.watch()."""
-    import watchfiles as watchfiles_module
+async def test_async_filesystem_source_set_watch_paths_no_op_when_not_running() -> None:
+    """FilesystemSource.set_watch_paths() doesn't signal stop event when not running."""
+    from pivot.engine.sources import FilesystemSource
 
-    captured_kwargs = dict[str, object]()
+    source = FilesystemSource(watch_paths=[Path("/tmp/a")])
 
-    def mock_watch(*args: object, **kwargs: object) -> Generator[object]:
-        captured_kwargs.update(kwargs)
-        # Empty generator - yields nothing, exits immediately
-        yield from []
+    # Not running, so stop_event should not be set
+    assert source._running is False
+    source.set_watch_paths([Path("/tmp/b")])
 
-    monkeypatch.setattr(watchfiles_module, "watch", mock_watch)
+    # Should just update paths without any stop event issues
+    assert source.watch_paths == [Path("/tmp/b")]
 
-    # Test with explicit debounce value
-    source = sources.FilesystemSource(watch_paths=[tmp_path], debounce=250)
-    source._watch_loop()
 
-    assert "debounce" in captured_kwargs, "debounce should be passed to watchfiles.watch()"
-    assert captured_kwargs["debounce"] == 250
+async def test_async_filesystem_source_restarts_after_set_watch_paths(tmp_path: Path) -> None:
+    """FilesystemSource restarts and watches new paths after set_watch_paths() called."""
+    import anyio
 
-    # Test with None (should use default 1600)
-    captured_kwargs.clear()
-    source_default = sources.FilesystemSource(watch_paths=[tmp_path], debounce=None)
-    source_default._watch_loop()
+    from pivot.engine.sources import FilesystemSource
+    from pivot.engine.types import InputEvent
 
-    assert captured_kwargs["debounce"] == 1600, "None debounce should default to 1600ms"
+    # Create initial and new directories
+    initial_dir = tmp_path / "initial"
+    initial_dir.mkdir()
+    new_dir = tmp_path / "new"
+    new_dir.mkdir()
+
+    events_received = list[InputEvent]()
+    send, recv = anyio.create_memory_object_stream[InputEvent](10)
+
+    async def collect_events() -> None:
+        async for event in recv:
+            events_received.append(event)
+
+    source = FilesystemSource(watch_paths=[initial_dir], debounce_ms=100)
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(source.run, send)
+        tg.start_soon(collect_events)
+
+        # Wait for watcher to start on initial paths
+        await anyio.sleep(0.2)
+
+        # Change watch paths to new directory
+        source.set_watch_paths([new_dir])
+
+        # Give watcher time to restart with new paths
+        await anyio.sleep(0.3)
+
+        # Verify the paths were updated
+        assert source.watch_paths == [new_dir], "Watch paths should be updated"
+
+        # Create file in new directory
+        new_file = new_dir / "test.txt"
+        new_file.write_text("test content")
+
+        # Wait for event
+        with anyio.move_on_after(1.0):
+            while not events_received:
+                await anyio.sleep(0.1)
+
+        tg.cancel_scope.cancel()
+
+    # Should have received an event for the new file
+    assert len(events_received) >= 1, "Should receive event for file in new watch path"
+    data_events = [e for e in events_received if e["type"] == "data_artifact_changed"]
+    assert len(data_events) >= 1, "Should emit data_artifact_changed for .txt file"

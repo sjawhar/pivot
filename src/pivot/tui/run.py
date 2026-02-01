@@ -8,17 +8,17 @@ import json
 import logging
 import os
 import pathlib
-import queue
-import sys
 import threading
 import time
 from typing import (
     IO,
     TYPE_CHECKING,
     ClassVar,
+    Protocol,
     override,
 )
 
+import anyio
 import filelock
 import loky
 import loky.process_executor
@@ -39,7 +39,7 @@ from pivot.cli import helpers as cli_helpers
 from pivot.executor import ExecutionSummary
 from pivot.executor import commit as commit_mod
 from pivot.storage import lock, project_lock
-from pivot.tui import agent_server, diff_panels
+from pivot.tui import diff_panels
 from pivot.tui.diff_panels import InputDiffPanel, OutputDiffPanel
 from pivot.tui.screens import (
     ConfirmCommitScreen,
@@ -47,7 +47,7 @@ from pivot.tui.screens import (
     HelpScreen,
     HistoryListScreen,
 )
-from pivot.tui.stats import DebugStats, QueueStatsTracker, get_memory_mb
+from pivot.tui.stats import DebugStats, MessageStatsTracker, get_memory_mb
 from pivot.tui.types import ExecutionHistoryEntry, LogEntry, PendingHistoryState, StageInfo
 from pivot.tui.widgets import (
     DebugPanel,
@@ -60,7 +60,6 @@ from pivot.types import (
     StageStatus,
     TuiLogMessage,
     TuiMessageType,
-    TuiQueue,
     TuiReloadMessage,
     TuiStatusMessage,
     TuiWatchMessage,
@@ -68,11 +67,10 @@ from pivot.types import (
 )
 
 __all__ = [
+    "MessagePoster",
     "PivotApp",
+    "TuiShutdown",
     "TuiUpdate",
-    "ExecutorComplete",
-    "run_with_tui",
-    "run_watch_tui",
     "format_reload_summary",
 ]
 
@@ -102,11 +100,22 @@ def format_reload_summary(
 
 
 if TYPE_CHECKING:
-    import multiprocessing as mp
     from collections.abc import Callable
 
     from pivot.engine.engine import Engine
-    from pivot.types import OutputChange, OutputMessage
+    from pivot.types import OutputChange
+
+
+class MessagePoster(Protocol):
+    """Protocol for posting messages to a Textual app.
+
+    Textual's post_message() is thread-safe and can be called from any thread.
+    See: https://textual.textualize.io/guide/workers/#posting-messages
+    """
+
+    def post_message(self, message: textual.message.Message) -> bool:
+        """Post a message to the app's message queue."""
+        ...
 
 
 class TuiUpdate(textual.message.Message):
@@ -119,6 +128,13 @@ class TuiUpdate(textual.message.Message):
     ) -> None:
         self.msg = msg
         super().__init__()
+
+
+class TuiShutdown(textual.message.Message):
+    """Message sent when TuiSink is closing.
+
+    Used by both run mode and watch mode to signal clean shutdown.
+    """
 
 
 class ExecutorComplete(textual.message.Message):
@@ -200,11 +216,9 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
     _executor_func: Callable[[], dict[str, ExecutionSummary]] | None
     _cancel_event: threading.Event | None
     _engine: Engine | None
-    _output_queue: mp.Queue[OutputMessage] | None
 
     def __init__(
         self,
-        message_queue: TuiQueue,
         stage_names: list[str] | None = None,
         tui_log: pathlib.Path | None = None,
         *,
@@ -212,40 +226,35 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
         executor_func: Callable[[], dict[str, ExecutionSummary]] | None = None,
         cancel_event: threading.Event | None = None,
         # Watch mode parameters
+        watch_mode: bool = False,
         engine: Engine | None = None,
-        output_queue: mp.Queue[OutputMessage] | None = None,
         no_commit: bool = False,
         serve: bool = False,
     ) -> None:
         """Initialize TUI app.
 
         For run mode: provide executor_func
-        For watch mode: provide engine
+        For watch mode: set watch_mode=True (engine is optional, may be managed externally)
         """
         super().__init__()
 
         # Determine mode from parameters
-        self._watch_mode: bool = engine is not None
+        # watch_mode=True explicitly, or inferred from engine presence (backward compat)
+        self._watch_mode: bool = watch_mode or engine is not None
         if not self._watch_mode and executor_func is None:
-            msg = "Either executor_func (run mode) or engine (watch mode) must be provided"
+            msg = "Either executor_func (run mode) or watch_mode=True must be provided"
             raise ValueError(msg)
 
         # Core state
-        self._tui_queue: TuiQueue = message_queue
         self._stages: dict[str, StageInfo] = {}
         self._stage_order: list[str] = []
         self._selected_idx: int = 0
         self._selected_stage_name: str | None = None
-        self._reader_thread: threading.Thread | None = None
         self._shutdown_event: threading.Event = threading.Event()
         self._log_file: IO[str] | None = None
 
         # Debug panel stats tracking
-        self._tui_stats: QueueStatsTracker = QueueStatsTracker(
-            "tui_queue",
-            message_queue,
-        )
-        self._output_stats: QueueStatsTracker | None = None
+        self._message_stats: MessageStatsTracker = MessageStatsTracker("tui_messages")
         self._start_time: float = 0.0
         self._debug_timer: textual.timer.Timer | None = None
         self._stats_log_timer: textual.timer.Timer | None = None
@@ -260,12 +269,6 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
 
         # Watch mode state
         self._engine = engine
-        self._output_queue = output_queue
-        if output_queue is not None:
-            self._output_stats = QueueStatsTracker(
-                "output_queue",
-                output_queue,
-            )
         self._engine_thread: threading.Thread | None = None
         self._no_commit: bool = no_commit
         self._commit_in_progress: bool = False
@@ -274,16 +277,18 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
         self._pending_history: dict[str, PendingHistoryState] = {}
         self._current_run_id: str | None = None
         self._serve: bool = serve
-        self._agent_server: agent_server.AgentServer | None = None
-        self._agent_server_task: asyncio.Task[None] | None = None
         self._quitting: bool = False
         self._quit_lock: threading.Lock = threading.Lock()
         self._log_file_lock: threading.Lock = threading.Lock()
 
         # Open log file if configured
         if tui_log:
-            self._log_file = open(tui_log, "w", buffering=1)  # noqa: SIM115
-            os.set_inheritable(self._log_file.fileno(), False)
+            log_file = open(tui_log, "w", buffering=1)  # noqa: SIM115
+            # set_inheritable failure is non-fatal, just means child processes
+            # might inherit the fd (harmless for a log file)
+            with contextlib.suppress(OSError):
+                os.set_inheritable(log_file.fileno(), False)
+            self._log_file = log_file
             atexit.register(self._close_log_file)
 
         # Initialize stages
@@ -322,11 +327,6 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
         with contextlib.suppress(Exception):
             # kill_workers=True forces immediate termination of worker processes
             loky.get_reusable_executor(max_workers=1, kill_workers=True)
-
-    def select_stage_by_index(self, idx: int) -> None:
-        """Select a stage by index (for testing)."""
-        self._select_stage(idx)
-        self._update_detail_panel()
 
     def _close_log_file(self) -> None:
         """Close the log file if open (thread-safe)."""
@@ -368,6 +368,9 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
                     self._log_file.write(data)
                 except OSError as e:
                     _logger.warning(f"TUI log write failed: {e}")
+                    # Close the file to avoid fd leak before clearing reference
+                    with contextlib.suppress(OSError):
+                        self._log_file.close()
                     self._log_file = None
 
     @override
@@ -389,16 +392,16 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
 
         # Defer initial panel update to after widgets are fully mounted
         self.call_after_refresh(self._update_detail_panel)
-        self._start_queue_reader()
 
         if self._watch_mode:
-            # Watch mode: start engine and optionally agent server
+            # Watch mode: set title (engine may be managed externally by CLI)
             prefix = self._get_keep_going_prefix()
             self.title = f"{prefix}[●] Watching for changes..."  # pyright: ignore[reportUnannotatedClassAttribute] - inherited from App
-            self._engine_thread = threading.Thread(target=self._run_engine, daemon=True)
-            self._engine_thread.start()
-            if self._serve:
-                await self._start_agent_server()
+            # Only start engine thread if engine was passed directly (legacy mode)
+            # When engine is None, CLI manages the async Engine externally
+            if self._engine is not None:
+                self._engine_thread = threading.Thread(target=self._run_engine, daemon=True)
+                self._engine_thread.start()
         else:
             # Run mode: start executor
             self._executor_thread = threading.Thread(target=self._run_executor, daemon=True)
@@ -417,28 +420,6 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
     # Background threads
     # =========================================================================
 
-    def _start_queue_reader(self) -> None:  # pragma: no cover
-        """Start the background queue reader thread."""
-        self._reader_thread = threading.Thread(target=self._read_queue, daemon=True)
-        self._reader_thread.start()
-
-    def _read_queue(self) -> None:  # pragma: no cover
-        """Read from queue and post messages to Textual."""
-        while not self._shutdown_event.is_set():
-            try:
-                msg = self._tui_queue.get(timeout=0.02)
-                self._tui_stats.record_message()
-                if msg is None:
-                    self._write_to_log('{"type": "shutdown"}\n')
-                    break
-                self._write_to_log(json.dumps(msg, default=str) + "\n")
-                _logger.debug(f"TUI recv: {msg['type']} stage={msg.get('stage', '?')}")  # noqa: G004
-                self.post_message(TuiUpdate(msg))
-            except queue.Empty:
-                continue
-            except Exception:
-                _logger.exception("Error in TUI queue reader")
-
     def _run_executor(self) -> None:  # pragma: no cover
         """Run the executor (run mode, background thread)."""
         results: dict[str, ExecutionSummary] = {}
@@ -449,14 +430,24 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
         except Exception as e:
             error = e
         finally:
-            self._tui_queue.put(None)
             self.post_message(ExecutorComplete(results, error))
 
     def _run_engine(self) -> None:  # pragma: no cover
-        """Run the watch engine (watch mode, background thread)."""
+        """Run the watch engine (watch mode, background thread).
+
+        Uses anyio.run() to execute the async Engine.run() in this thread.
+        The Engine must already be set up with sources and sinks by the caller.
+        """
+
+        async def _async_run_engine() -> None:
+            if self._engine is None:
+                return
+            # Engine must be used as async context manager
+            async with self._engine:
+                await self._engine.run(exit_on_completion=False)
+
         try:
-            if self._engine:
-                self._engine.run(exit_on_completion=False)
+            anyio.run(_async_run_engine)
         except Exception as e:
             _logger.exception(f"Watch engine failed: {e}")
             error_msg = TuiWatchMessage(
@@ -465,42 +456,7 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
                 message="Watch mode crashed. Please restart 'pivot watch'.",
             )
             with contextlib.suppress(Exception):
-                self._tui_queue.put_nowait(error_msg)
-
-    # =========================================================================
-    # Agent server (watch mode only)
-    # =========================================================================
-
-    async def _start_agent_server(self) -> None:  # pragma: no cover
-        """Start the JSON-RPC agent server."""
-        if self._engine is None:
-            return
-        socket_path = project.get_project_root() / ".pivot" / "agent.sock"
-        # Clean up stale socket from previous crash
-        socket_path.unlink(missing_ok=True)
-        self._agent_server = agent_server.AgentServer(self._engine, socket_path)
-
-        try:
-            server = await self._agent_server.start()
-            _logger.info(f"Agent server listening on {socket_path}")
-            self._agent_server_task = asyncio.create_task(server.serve_forever())
-        except Exception as e:
-            _logger.warning(f"Failed to start agent server: {e}")
-            await self._agent_server.stop()
-            self._agent_server = None
-
-    async def _stop_agent_server(self) -> None:  # pragma: no cover
-        """Stop the JSON-RPC agent server if running."""
-        if self._agent_server_task is not None:
-            self._agent_server_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
-                await asyncio.wait_for(self._agent_server_task, timeout=2.0)
-            self._agent_server_task = None
-
-        if self._agent_server is not None:
-            with contextlib.suppress(asyncio.TimeoutError):
-                await asyncio.wait_for(self._agent_server.stop(), timeout=2.0)
-            self._agent_server = None
+                self.post_message(TuiUpdate(error_msg))
 
     # =========================================================================
     # Message handling
@@ -508,6 +464,8 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
 
     def on_tui_update(self, event: TuiUpdate) -> None:  # pragma: no cover
         """Handle executor/engine updates."""
+        self._message_stats.record_message()
+        self._write_to_log(json.dumps(event.msg, default=str) + "\n")
         msg = event.msg
         try:
             match msg["type"]:
@@ -521,6 +479,20 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
                     self._handle_reload(msg)
         except Exception:
             _logger.exception("Error handling TUI update for %s: %s", msg["type"], msg)
+
+    def on_tui_shutdown(self, _event: TuiShutdown) -> None:  # pragma: no cover
+        """Handle TuiSink shutdown signal (both run and watch modes).
+
+        In run mode: signals execution is complete, triggers exit
+        In watch mode: logs shutdown, TUI continues until user quits
+        """
+        self._write_to_log('{"type": "shutdown"}\n')
+        if not self._watch_mode:
+            # Run mode: exit after shutdown signal
+            self._shutdown_event.set()
+            self._close_log_file()
+            self._shutdown_loky_pool()
+            self.exit(self._results)
 
     def _handle_log(self, msg: TuiLogMessage) -> None:  # pragma: no cover
         """Handle log message."""
@@ -682,10 +654,8 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
             self.title = f"pivot run - FAILED: {event.error}"
         else:
             self.title = "pivot run - Complete"
-        # Clean up threads before exiting (same as action_quit for run mode)
+        # Clean up before exiting
         self._shutdown_event.set()
-        if self._reader_thread:
-            self._reader_thread.join(timeout=2.0)
         self._close_log_file()
         self._shutdown_loky_pool()
         self.exit(self._results)
@@ -906,9 +876,11 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
             stage_list.rebuild(ordered_stages)
 
     def _get_keep_going_prefix(self) -> str:  # pragma: no cover
-        """Return title prefix for keep-going mode."""
-        if self._watch_mode and self._engine:
-            return "[-k] " if self._engine.keep_going else ""
+        """Return title prefix for keep-going mode.
+
+        Note: keep_going toggle is not yet implemented in async Engine.
+        """
+        # TODO: Add keep_going support to async Engine
         return ""
 
     # =========================================================================
@@ -1093,16 +1065,15 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
             self._debug_timer = None
 
     def action_toggle_keep_going(self) -> None:  # pragma: no cover
-        """Toggle keep-going mode (watch mode only)."""
-        if not self._watch_mode or not self._engine:
-            self.notify(
-                "Keep-going toggle is only available in watch mode (use --watch)",
-                severity="warning",
-            )
-            return
-        enabled = self._engine.toggle_keep_going()
-        self.notify(f"Keep-going: {'ON' if enabled else 'OFF'}")
-        self.title = f"{self._get_keep_going_prefix()}[●] Watching for changes..."
+        """Toggle keep-going mode (watch mode only).
+
+        Note: This feature is temporarily unavailable while migrating to async Engine.
+        """
+        # TODO: Add keep_going support to async Engine
+        self.notify(
+            "Keep-going toggle is temporarily unavailable during async migration",
+            severity="warning",
+        )
 
     def action_show_help(self) -> None:  # pragma: no cover
         """Show help screen with all keybindings."""
@@ -1215,8 +1186,7 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
         """Collect current debug statistics."""
         counts = status_utils.count_statuses(self._stages.values())
         return DebugStats(
-            tui_queue=self._tui_stats.get_stats(),
-            output_queue=self._output_stats.get_stats() if self._output_stats else None,
+            tui_messages=self._message_stats.get_stats(),
             active_workers=counts["running"],
             memory_mb=get_memory_mb(),
             uptime_seconds=time.monotonic() - self._start_time,
@@ -1284,8 +1254,6 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
             )
         # Exit cleanly - Textual restores terminal, loky cleanup skipped
         self._shutdown_event.set()
-        if self._reader_thread:
-            self._reader_thread.join(timeout=1.0)
         self._close_log_file()
         self.exit()
 
@@ -1293,8 +1261,6 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
     async def _quit_with_commit_prompt(self) -> None:  # pragma: no cover
         """Worker to handle quit with commit prompt (watch mode)."""
         try:
-            await self._stop_agent_server()
-
             if self._commit_in_progress:
                 self._cancel_commit = True
 
@@ -1320,58 +1286,5 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
                             finally:
                                 commit_lock.release()
         finally:
-            if self._engine:
-                self._engine.shutdown()
+            # Engine is managed externally (by CLI) - just exit TUI
             self.exit()
-
-
-# =============================================================================
-# Entry points
-# =============================================================================
-
-
-def run_with_tui(
-    stage_names: list[str],
-    message_queue: TuiQueue,
-    executor_func: Callable[[], dict[str, ExecutionSummary]],
-    tui_log: pathlib.Path | None = None,
-    cancel_event: threading.Event | None = None,
-) -> dict[str, ExecutionSummary]:  # pragma: no cover
-    """Run pipeline with TUI display. Raises if executor fails."""
-    app = PivotApp(
-        message_queue,
-        stage_names=stage_names,
-        tui_log=tui_log,
-        executor_func=executor_func,
-        cancel_event=cancel_event,
-    )
-    results = app.run()
-    # Print exit message if user quit with running stages
-    if app.exit_message:
-        print(app.exit_message, file=sys.stderr)
-    if app.error is not None:
-        raise app.error
-    return results or {}
-
-
-def run_watch_tui(
-    engine: Engine,
-    message_queue: TuiQueue,
-    output_queue: mp.Queue[OutputMessage] | None = None,
-    tui_log: pathlib.Path | None = None,
-    stage_names: list[str] | None = None,
-    *,
-    no_commit: bool = False,
-    serve: bool = False,
-) -> None:  # pragma: no cover
-    """Run watch mode with TUI display."""
-    app = PivotApp(
-        message_queue,
-        stage_names=stage_names,
-        tui_log=tui_log,
-        engine=engine,
-        output_queue=output_queue,
-        no_commit=no_commit,
-        serve=serve,
-    )
-    app.run()

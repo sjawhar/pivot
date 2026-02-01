@@ -524,3 +524,91 @@ size: 14
     # With copy mode, file should not be a symlink
     assert not data_file.is_symlink()
     assert data_file.read_text() == "cached content"
+
+
+# =============================================================================
+# Data Diff/Get - Pipeline Discovery Tests
+# =============================================================================
+
+
+def test_data_diff_without_prior_run_discovers_pipeline(
+    runner: click.testing.CliRunner,
+    git_repo: GitRepo,
+    monkeypatch: MonkeyPatch,
+    mocker: MockerFixture,
+) -> None:
+    """pivot data diff discovers pipeline without needing prior command."""
+    repo_path, commit = git_repo
+    monkeypatch.chdir(repo_path)
+    (repo_path / ".pivot").mkdir()
+
+    # Create Pipeline with git_repo path and mock discovery to return it
+    pipeline = pipeline_mod.Pipeline("test", root=repo_path)
+    helpers.set_test_pipeline(pipeline)
+    mocker.patch.object(discovery, "discover_pipeline", return_value=pipeline)
+    mocker.patch.object(project, "_project_root_cache", repo_path)
+    # IMPORTANT: Do NOT mock get_pipeline_from_context - we want to test that
+    # ensure_stages_registered() is called and populates the context
+
+    (repo_path / "output.csv").write_text("x,y\n3,4")
+
+    commit("Initial setup")
+
+    result = runner.invoke(cli.cli, ["data", "diff", "--no-tui", "output.csv"])
+
+    # Should not raise NoPipelineError - discovery should have been called
+    assert "No pipeline found" not in result.output
+    # The test passes if discovery succeeded (no error about missing pipeline)
+    # It may show "No data files found" since we have no registered stages, which is fine
+    assert result.exit_code == 0 or "No data" in result.output
+
+
+def test_data_get_without_prior_run_discovers_pipeline(
+    runner: click.testing.CliRunner,
+    git_repo: GitRepo,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """pivot data get discovers pipeline without needing prior command."""
+    repo_path, commit = git_repo
+    monkeypatch.chdir(repo_path)
+    (repo_path / ".pivot" / "cache" / "files").mkdir(parents=True)
+    (repo_path / ".pivot" / "stages").mkdir(parents=True)
+
+    # Create minimal pivot.yaml with stage
+    (repo_path / "pivot.yaml").write_text("""\
+stages:
+  process:
+    python: stages.process
+    outs:
+      output.csv: {}
+""")
+    (repo_path / "stages.py").write_text("def process(): pass")
+
+    # Create output and cache it
+    output_file = repo_path / "output.csv"
+    output_file.write_text("x,y\n3,4")
+    cache_dir = repo_path / ".pivot" / "cache" / "files"
+    output_hash = cache.save_to_cache(output_file, cache_dir)
+    assert output_hash is not None
+
+    # Create .pvt file to track it
+    pvt_content = f"""path: output.csv
+hash: {output_hash["hash"]}
+size: 8
+"""
+    (repo_path / "output.csv.pvt").write_text(pvt_content)
+
+    sha = commit("Initial setup with tracked output")
+
+    # Delete output file
+    output_file.unlink()
+    assert not output_file.exists()
+
+    result = runner.invoke(cli.cli, ["data", "get", "--rev", sha[:7], "output.csv"])
+
+    # Should not raise NoPipelineError - may fail for other reasons but not discovery
+    assert "No pipeline" not in result.output
+    # Should restore the file successfully
+    assert result.exit_code == 0, f"Failed: {result.output}"
+    assert "Restored" in result.output
+    assert output_file.exists()

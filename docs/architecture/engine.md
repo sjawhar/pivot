@@ -26,13 +26,12 @@ The Engine is Pivot's central coordinator for all execution paths. It provides a
 
 ### Engine States
 
-The Engine has three states:
+The Engine has two states:
 
 | State | Description |
 |-------|-------------|
 | `IDLE` | Not executing stages |
 | `ACTIVE` | Processing events and executing stages |
-| `SHUTDOWN` | Draining, no new stages started |
 
 ### Stage Execution States
 
@@ -52,14 +51,15 @@ The IntEnum ordering enables comparisons like `state >= PREPARING` for output fi
 
 ### Event Sources
 
-Sources produce input events via `engine.submit()`:
+Sources push input events via memory channels (`MemoryObjectSendStream[InputEvent]`):
 
 | Source | Events | Use Case |
 |--------|--------|----------|
 | `FilesystemSource` | `DataArtifactChanged`, `CodeOrConfigChanged` | Watch mode |
 | `OneShotSource` | `RunRequested` | Batch mode |
+| `AgentRpcSource` | `RunRequested`, `CancelRequested` | Agent RPC control |
 
-For RPC control (agent integration), use the Engine's direct methods: `try_start_run()`, `get_execution_status()`, and `request_cancel()`.
+For RPC control (agent integration), use `AgentRpcSource` which converts JSON-RPC commands into input events.
 
 ### Event Sinks
 
@@ -108,15 +108,15 @@ Both batch and watch modes use the same `run()` method with the `exit_on_complet
 ### Batch Mode (`exit_on_completion=True`)
 
 ```python
-with Engine() as engine:
+async with Engine() as engine:
     collector = ResultCollectorSink()
     engine.add_sink(collector)
     engine.add_sink(ConsoleSink())
     engine.add_source(OneShotSource(stages=["train"], force=True, reason="cli"))
 
-    engine.run(exit_on_completion=True)
+    await engine.run(exit_on_completion=True)
 
-    results = collector.get_results()
+    results = await collector.get_results()
 ```
 
 1. Builds bipartite graph
@@ -127,11 +127,11 @@ with Engine() as engine:
 ### Watch Mode (`exit_on_completion=False`)
 
 ```python
-with Engine() as engine:
+async with Engine() as engine:
     engine.add_sink(TuiSink())
     engine.add_source(FilesystemSource(watch_paths))
 
-    engine.run(exit_on_completion=False)  # Blocks until shutdown
+    await engine.run(exit_on_completion=False)  # Blocks until shutdown
 ```
 
 1. Starts all sources
@@ -161,29 +161,83 @@ with Engine() as engine:
 | `PipelineReloaded` | Registry reload | Stages list, added/removed/modified |
 | `StageStateChanged` | State transition | Stage, old/new state |
 
-## Thread Safety
+## Async Safety
 
-The Engine is designed for multi-threaded use:
+The Engine uses structured concurrency with anyio:
 
-- `submit()` is thread-safe (uses queue)
-- `try_start_run()` uses lock for atomic check-and-start
-- `get_execution_status()` reads thread-safe state
-- `request_cancel()` sets threading.Event
+- All state access occurs within the event loop task in `run()`
+- Sources run in separate tasks but only send events to channels—they don't access engine state
+- Memory channels provide implicit serialization, so no explicit locks are needed
+- Cancellation uses `anyio.Event`, not `threading.Event`
 
 ## Agent RPC Integration
 
-The Engine provides methods for external control:
+Agent RPC control uses event sources and handlers, not direct Engine methods:
 
 ```python
-# Atomically start a run
-result = engine.try_start_run(run_id, stages, force)
+from pivot.engine.agent_rpc import AgentRpcSource, AgentRpcHandler
 
-# Query current status
-status = engine.get_execution_status(run_id)
+# Create handler for status/stages queries
+handler = AgentRpcHandler(engine=engine)
 
-# Request cancellation
-engine.request_cancel()
+# Add RPC source to Engine (converts JSON-RPC to events)
+engine.add_source(AgentRpcSource(socket_path=socket_path, handler=handler))
 ```
+
+## Serve Mode
+
+For headless daemon operation (`pivot run --serve --watch`), the Engine supports RPC sources:
+
+```python
+async with Engine(pipeline=pipeline) as engine:
+    engine.add_source(FilesystemSource(watch_paths=paths))
+    engine.add_source(AgentRpcSource(socket_path=socket_path, handler=handler))
+    engine.add_sink(AgentEventSink())
+
+    await engine.run(exit_on_completion=False)
+```
+
+### Serve Mode Components
+
+| Component | Purpose |
+|-----------|---------|
+| `AgentRpcSource` | JSON-RPC 2.0 over Unix socket |
+| `AgentEventSink` | Broadcast events to subscribed clients |
+
+### Agent RPC Protocol
+
+The `AgentRpcSource` implements JSON-RPC 2.0 over Unix socket:
+
+**Commands** (become input events):
+- `run` - Start a run with optional stages/force
+- `cancel` - Request cancellation
+
+**Queries** (handled by `AgentRpcHandler`):
+- `status` - Get engine state (idle/active)
+- `stages` - List registered stages
+
+```json
+{"jsonrpc": "2.0", "method": "run", "params": {"stages": ["train"]}, "id": 1}
+{"jsonrpc": "2.0", "result": "accepted", "id": 1}
+```
+
+### Event Broadcasting
+
+`AgentEventSink` provides pub-sub event delivery to connected agents:
+
+```python
+# Subscribe a client
+recv = event_sink.subscribe("client_id")
+
+# Receive events
+async for event in recv:
+    process(event)
+
+# Unsubscribe when done
+event_sink.unsubscribe("client_id")
+```
+
+**Backpressure Handling:** If a client's buffer is full, events are dropped silently with a debug log. Clients should process events quickly or increase buffer size.
 
 ## Code Locations
 
@@ -194,6 +248,7 @@ engine.request_cancel()
 | Event types | `src/pivot/engine/types.py` |
 | Event sources | `src/pivot/engine/sources.py` |
 | Event sinks | `src/pivot/engine/sinks.py` |
+| Agent RPC | `src/pivot/engine/agent_rpc.py` |
 
 ## See Also
 

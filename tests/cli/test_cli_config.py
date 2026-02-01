@@ -311,3 +311,84 @@ def test_config_list_help_shows_options(runner: click.testing.CliRunner) -> None
     assert result.exit_code == 0
     assert "--json" in result.output
     assert "--local" in result.output or "--global" in result.output
+
+
+# --- config get --global/--local tests ---
+
+
+def test_config_get_global_flag(
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """config get --global reads from global config only."""
+    # Set up global config path before entering isolated filesystem
+    global_dir = tmp_path / "global"
+    global_dir.mkdir()
+    global_config = global_dir / "config.yaml"
+    global_config.write_text("display:\n  precision: 7\n")
+
+    from pivot import config
+    from pivot.config import io
+
+    # Patch both locations since CLI uses `config.get_global_config_path`
+    monkeypatch.setattr(io, "get_global_config_path", lambda: global_config)
+    monkeypatch.setattr(config, "get_global_config_path", lambda: global_config)
+
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        pathlib.Path(".pivot").mkdir()
+
+        # Set local value (different from global)
+        local_config = pathlib.Path(".pivot/config.yaml")
+        local_config.write_text("display:\n  precision: 3\n")
+
+        result = runner.invoke(cli.cli, ["config", "get", "--global", "display.precision"])
+
+        assert result.exit_code == 0
+        assert "7" in result.output  # Global value, not local
+
+
+def test_config_get_local_flag(
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+) -> None:
+    """config get --local reads from local config only."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        pathlib.Path(".pivot").mkdir()
+
+        # Set local value
+        local_config = pathlib.Path(".pivot/config.yaml")
+        local_config.write_text("display:\n  precision: 3\n")
+
+        result = runner.invoke(cli.cli, ["config", "get", "--local", "display.precision"])
+
+        assert result.exit_code == 0
+        assert "3" in result.output  # Local value
+
+
+def test_config_get_global_local_mutually_exclusive(
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+) -> None:
+    """config get --global --local should error."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        pathlib.Path(".pivot").mkdir()
+
+        result = runner.invoke(
+            cli.cli, ["config", "get", "--global", "--local", "display.precision"]
+        )
+
+        assert result.exit_code != 0
+        assert "Cannot use both" in result.output
+
+
+def test_config_get_help_shows_scope_options(runner: click.testing.CliRunner) -> None:
+    """config get --help should show --global and --local options."""
+    result = runner.invoke(cli.cli, ["config", "get", "--help"])
+
+    assert result.exit_code == 0
+    assert "--global" in result.output
+    assert "--local" in result.output

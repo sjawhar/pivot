@@ -9,7 +9,7 @@ import pathlib
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable, Generator
+from collections.abc import AsyncGenerator, Callable, Generator
 from typing import TYPE_CHECKING, cast
 
 import click.testing
@@ -359,14 +359,14 @@ def mock_watch_engine() -> Engine:
 
 
 @pytest.fixture
-def test_engine(test_pipeline: pipeline_mod.Pipeline) -> Generator[Engine]:
+async def test_engine(test_pipeline: pipeline_mod.Pipeline) -> AsyncGenerator[Engine]:
     """Provide a context-managed Engine instance.
 
     The engine is properly closed after each test to ensure sinks are cleaned up.
     """
     from pivot.engine.engine import Engine
 
-    with Engine(pipeline=test_pipeline) as eng:
+    async with Engine(pipeline=test_pipeline) as eng:
         yield eng
 
 

@@ -5,13 +5,13 @@ import datetime
 import json
 import logging
 import pathlib
-import queue as thread_queue
 import sys
 import threading
 import time
 import uuid
 from typing import TYPE_CHECKING, TypedDict
 
+import anyio
 import click
 
 from pivot import config, discovery
@@ -21,13 +21,13 @@ from pivot.cli import helpers as cli_helpers
 from pivot.engine import engine, sinks
 from pivot.engine import sources as engine_sources
 from pivot.executor import prepare_workers
+from pivot.storage import project_lock
 from pivot.types import (
     ExecutionResultEvent,
     OnError,
     RunEventType,
     SchemaVersionEvent,
     StageStatus,
-    TuiMessage,
 )
 
 if TYPE_CHECKING:
@@ -35,9 +35,10 @@ if TYPE_CHECKING:
 
     import networkx as nx
 
+    from pivot.engine.types import OutputEvent, StageCompleted
     from pivot.executor import ExecutionSummary
     from pivot.tui import console as tui_console
-    from pivot.types import TuiQueue
+    from pivot.tui.run import MessagePoster
 
 
 def _configure_result_collector(eng: engine.Engine) -> sinks.ResultCollectorSink:
@@ -47,33 +48,89 @@ def _configure_result_collector(eng: engine.Engine) -> sinks.ResultCollectorSink
     return result_sink
 
 
+class _JsonlSink:
+    """Async sink that calls a callback for each stage event."""
+
+    _callback: Callable[[dict[str, object]], None]
+
+    def __init__(self, callback: Callable[[dict[str, object]], None]) -> None:
+        self._callback = callback
+
+    async def handle(self, event: OutputEvent) -> None:
+        """Convert stage events to JSONL records.
+
+        Note: Engine uses "stage_started"/"stage_completed" internally, but
+        JSONL schema (pivot/types.py) uses "stage_start"/"stage_complete".
+        We convert to match the documented public API.
+        """
+        match event["type"]:
+            case "stage_started":
+                # Convert to documented JSONL schema type
+                self._callback(
+                    {
+                        "type": "stage_start",  # Matches RunEventType.STAGE_START
+                        "stage": event["stage"],
+                        "index": event["index"],
+                        "total": event["total"],
+                    }
+                )
+            case "stage_completed":
+                # Convert to documented JSONL schema type
+                self._callback(
+                    {
+                        "type": "stage_complete",  # Matches RunEventType.STAGE_COMPLETE
+                        "stage": event["stage"],
+                        "status": event["status"].value,
+                        "reason": event["reason"],
+                        "duration_ms": event["duration_ms"],
+                        "index": event["index"],
+                        "total": event["total"],
+                    }
+                )
+            case "pipeline_reloaded":
+                # All fields are JSON-serializable (strings and lists of strings)
+                self._callback(dict(event))
+            case "engine_state_changed":
+                # Convert state enum to string for JSON serialization
+                self._callback(
+                    {
+                        "type": "engine_state_changed",
+                        "state": event["state"].value,
+                    }
+                )
+            case _:
+                pass  # Ignore other event types (log_line, stage_state_changed)
+
+    async def close(self) -> None:
+        """No cleanup needed."""
+
+
 def _configure_output_sink(
     eng: engine.Engine,
     *,
     quiet: bool,
     as_json: bool,
     tui: bool,
-    tui_queue: TuiQueue | None,
+    app: MessagePoster | None,
     run_id: str | None,
-    console: tui_console.Console | None,
+    use_console: bool,
     jsonl_callback: Callable[[dict[str, object]], None] | None,
-    watch: bool,
 ) -> None:
     """Configure output sinks based on display mode."""
+    import rich.console
+
     # JSON sink is always added when as_json=True, regardless of quiet mode
-    # (quiet only suppresses human-readable console output)
     if as_json and jsonl_callback:
-        eng.add_sink(sinks.JsonlSink(callback=jsonl_callback))
+        eng.add_sink(_JsonlSink(callback=jsonl_callback))
         return
 
     if quiet:
         return
-    elif tui and tui_queue and run_id:
-        eng.add_sink(sinks.TuiSink(tui_queue=tui_queue, run_id=run_id))
-        if watch:
-            eng.add_sink(sinks.WatchSink(tui_queue=tui_queue))
-    elif console:
-        eng.add_sink(sinks.ConsoleSink(console))
+
+    if tui and app and run_id:
+        eng.add_sink(sinks.TuiSink(app=app, run_id=run_id))
+    elif use_console:
+        eng.add_sink(sinks.ConsoleSink(console=rich.console.Console()))
 
 
 def _configure_watch_sources(
@@ -83,15 +140,21 @@ def _configure_watch_sources(
     *,
     force: bool,
     stages: list[str] | None,
+    no_commit: bool,
+    no_cache: bool,
+    on_error: OnError,
 ) -> None:
     """Configure sources for watch mode."""
-    eng.add_source(engine_sources.FilesystemSource(watch_paths, debounce=debounce))
+    eng.add_source(engine_sources.FilesystemSource(watch_paths=watch_paths, debounce_ms=debounce))
     if force:
         eng.add_source(
             engine_sources.OneShotSource(
                 stages=stages,
                 force=True,
                 reason="watch:initial:forced",
+                no_commit=no_commit,
+                no_cache=no_cache,
+                on_error=on_error,
             )
         )
 
@@ -181,11 +244,9 @@ def _run_pipeline(
     if tui:
         prepare_workers(num_workers)
 
-    # Set up TUI queue and run_id if using TUI
-    tui_queue: thread_queue.Queue[TuiMessage] | None = None
+    # Set up run_id if using TUI
     run_id: str | None = None
     if tui:
-        tui_queue = thread_queue.Queue()
         run_id = str(uuid.uuid4())[:8]
 
     # Set up console for plain text output
@@ -214,38 +275,42 @@ def _run_pipeline(
             on_error=on_error,
             serve=serve,
             force=force,
-            tui_queue=tui_queue,
             run_id=run_id,
             console=console,
             jsonl_callback=jsonl_callback,
             cancel_event=cancel_event,
             no_commit=no_commit,
+            no_cache=no_cache,
         )
 
-    return _run_oneshot_mode(
-        stages_list=stages_list,
-        execution_order=execution_order,
-        graph=graph,
-        quiet=quiet,
-        tui=tui,
-        as_json=as_json,
-        tui_log=tui_log,
-        force=force,
-        single_stage=single_stage,
-        no_commit=no_commit,
-        no_cache=no_cache,
-        on_error=on_error,
-        allow_uncached_incremental=allow_uncached_incremental,
-        checkout_missing=checkout_missing,
-        tui_queue=tui_queue,
-        run_id=run_id,
-        console=console,
-        jsonl_callback=jsonl_callback,
-        cancel_event=cancel_event,
-    )
+    # Acquire lock for oneshot mode when no_commit=True to prevent race conditions
+    # with concurrent commit operations. Watch mode handles this differently - the
+    # TUI allows manual commit when ready.
+    lock_context = project_lock.pending_state_lock() if no_commit else contextlib.nullcontext()
+    with lock_context:
+        return _run_oneshot_mode(
+            stages_list=stages_list,
+            execution_order=execution_order,
+            graph=graph,
+            quiet=quiet,
+            tui=tui,
+            as_json=as_json,
+            tui_log=tui_log,
+            force=force,
+            single_stage=single_stage,
+            no_commit=no_commit,
+            no_cache=no_cache,
+            on_error=on_error,
+            allow_uncached_incremental=allow_uncached_incremental,
+            checkout_missing=checkout_missing,
+            run_id=run_id,
+            console=console,
+            jsonl_callback=jsonl_callback,
+            cancel_event=cancel_event,
+        )
 
 
-def _run_watch_mode(
+def _run_watch_mode(  # noqa: PLR0913 - many params needed for different modes
     stages_list: list[str] | None,
     execution_order: list[str],
     graph: nx.DiGraph[str],
@@ -258,16 +323,29 @@ def _run_watch_mode(
     on_error: OnError,
     serve: bool,
     force: bool,
-    tui_queue: TuiQueue | None,
     run_id: str | None,
     console: tui_console.Console | None,
     jsonl_callback: Callable[[dict[str, object]], None] | None,
-    cancel_event: threading.Event | None,
+    cancel_event: threading.Event | None,  # Reserved for future use
     no_commit: bool,
+    no_cache: bool,
 ) -> None:
     """Run watch mode with unified event-driven execution."""
+    _ = cancel_event  # Reserved for future graceful cancellation support
+
     from pivot.engine import graph as engine_graph
-    from pivot.tui import run as run_tui
+
+    # Use async serve mode for headless daemon
+    if serve and not tui:
+        return _run_serve_mode(
+            stages_list,
+            force=force,
+            quiet=quiet,
+            debounce=debounce,
+            on_error=on_error,
+            no_commit=no_commit,
+            no_cache=no_cache,
+        )
 
     # Build bipartite graph for watch paths
     all_stages = cli_helpers.get_all_stages()
@@ -275,50 +353,195 @@ def _run_watch_mode(
     watch_paths = engine_graph.get_watch_paths(bipartite_graph)
 
     # Sort for display: group matrix variants together while preserving DAG structure
-    display_order = _sort_for_display(execution_order, graph) if execution_order else None
+    display_order = _sort_for_display(execution_order, graph) if execution_order else []
 
-    with _create_engine() as eng:
-        eng.set_keep_going(on_error == OnError.KEEP_GOING)
+    pipeline = cli_decorators.get_pipeline_from_context()
 
-        if cancel_event:
-            eng.set_cancel_event(cancel_event)
+    if tui and run_id:
+        # TUI mode with async Engine
+        async def tui_watch_main() -> None:
+            from pivot.tui import run as tui_run
 
-        # Configure sinks
-        _configure_result_collector(eng)
-        _configure_output_sink(
-            eng,
-            quiet=quiet,
-            as_json=as_json,
-            tui=tui,
-            tui_queue=tui_queue,
-            run_id=run_id,
-            console=console,
-            jsonl_callback=jsonl_callback,
-            watch=True,
-        )
+            # Create TUI app first (needed for TuiSink)
+            app = tui_run.PivotApp(
+                stage_names=display_order,
+                tui_log=tui_log,
+                watch_mode=True,
+                engine=None,  # Engine is managed by CLI
+                no_commit=no_commit,
+                serve=serve,
+            )
 
-        # Configure sources
-        _configure_watch_sources(eng, watch_paths, debounce, force=force, stages=stages_list)
-
-        if tui and tui_queue:
-            with _suppress_stderr_logging():
-                run_tui.run_watch_tui(
+            async with engine.Engine(pipeline=pipeline) as eng:
+                # Configure sinks - TuiSink for direct post_message
+                _configure_result_collector(eng)
+                _configure_output_sink(
                     eng,
-                    tui_queue,
-                    tui_log=tui_log,
-                    stage_names=display_order,
-                    no_commit=no_commit,
-                    serve=serve,
+                    quiet=quiet,
+                    as_json=as_json,
+                    tui=True,
+                    app=app,
+                    run_id=run_id,
+                    use_console=False,
+                    jsonl_callback=jsonl_callback,
                 )
-        else:
-            try:
-                eng.run(exit_on_completion=False)
-            except KeyboardInterrupt:
-                pass  # Normal exit via Ctrl+C
-            finally:
-                eng.shutdown()
 
-    return None
+                # Add agent RPC source if serve mode
+                if serve:
+                    from pivot import project
+                    from pivot.engine.agent_rpc import (
+                        AgentEventSink,
+                        AgentRpcHandler,
+                        AgentRpcSource,
+                    )
+
+                    state_dir = project.get_project_root() / ".pivot"
+                    socket_path = state_dir / "agent.sock"
+                    state_dir.mkdir(parents=True, exist_ok=True)
+
+                    rpc_handler = AgentRpcHandler(engine=eng)
+                    eng.add_source(AgentRpcSource(socket_path=socket_path, handler=rpc_handler))
+                    eng.add_sink(AgentEventSink())
+
+                # Configure watch sources
+                _configure_watch_sources(
+                    eng,
+                    watch_paths,
+                    debounce,
+                    force=force,
+                    stages=stages_list,
+                    no_commit=no_commit,
+                    no_cache=no_cache,
+                    on_error=on_error,
+                )
+
+                # Suppress stderr logging while TUI is active
+                with _suppress_stderr_logging():
+                    async with anyio.create_task_group() as tg:
+                        # Start Engine.run() in background
+                        async def run_engine() -> None:
+                            await eng.run(exit_on_completion=False)
+
+                        tg.start_soon(run_engine)
+                        # Run Textual in a thread (it takes over terminal)
+                        await anyio.to_thread.run_sync(app.run)  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType] - anyio stub issue
+                        # When TUI exits, cancel the engine task
+                        tg.cancel_scope.cancel()
+
+        with contextlib.suppress(KeyboardInterrupt):
+            anyio.run(tui_watch_main)
+    else:
+        # Non-TUI async mode
+        async def watch_main() -> None:
+            async with engine.Engine(pipeline=pipeline) as eng:
+                # Configure sinks
+                _configure_result_collector(eng)
+                _configure_output_sink(
+                    eng,
+                    quiet=quiet,
+                    as_json=as_json,
+                    tui=False,
+                    app=None,
+                    run_id=None,
+                    use_console=console is not None,
+                    jsonl_callback=jsonl_callback,
+                )
+
+                # Configure sources
+                _configure_watch_sources(
+                    eng,
+                    watch_paths,
+                    debounce,
+                    force=force,
+                    stages=stages_list,
+                    no_commit=no_commit,
+                    no_cache=no_cache,
+                    on_error=on_error,
+                )
+
+                await eng.run(exit_on_completion=False)
+
+        with contextlib.suppress(KeyboardInterrupt):
+            anyio.run(watch_main)
+
+
+def _run_serve_mode(
+    stages_list: list[str] | None,
+    *,
+    force: bool,
+    quiet: bool,
+    debounce: int,
+    on_error: OnError,
+    no_commit: bool,
+    no_cache: bool,
+) -> None:
+    """Run serve mode with Engine and agent RPC.
+
+    This is the headless daemon mode that accepts agent connections
+    via Unix socket while watching for file changes.
+    """
+    import rich.console
+
+    from pivot import project
+    from pivot.engine import graph as engine_graph
+    from pivot.engine.agent_rpc import AgentEventSink, AgentRpcHandler, AgentRpcSource
+
+    # Get project paths
+    project_root = project.get_project_root()
+    state_dir = project_root / ".pivot"
+    socket_path = state_dir / "agent.sock"
+
+    # Ensure state directory exists
+    state_dir.mkdir(parents=True, exist_ok=True)
+
+    # Get pipeline for Engine
+    pipeline = cli_decorators.get_pipeline_from_context()
+
+    async def serve_main() -> None:
+        # Build watch paths
+        all_stages = cli_helpers.get_all_stages()
+        bipartite_graph = engine_graph.build_graph(all_stages)
+        watch_paths = engine_graph.get_watch_paths(bipartite_graph)
+
+        async with engine.Engine(pipeline=pipeline) as eng:
+            # Add filesystem watch source
+            eng.add_source(
+                engine_sources.FilesystemSource(
+                    watch_paths=watch_paths,
+                    debounce_ms=debounce,
+                )
+            )
+
+            # Add initial run source if force specified
+            if force:
+                eng.add_source(
+                    engine_sources.OneShotSource(
+                        stages=stages_list,
+                        force=True,
+                        reason="serve:initial",
+                        no_commit=no_commit,
+                        no_cache=no_cache,
+                        on_error=on_error,
+                    )
+                )
+
+            # Add agent RPC source with handler for status/stages queries
+            rpc_handler = AgentRpcHandler(engine=eng)
+            eng.add_source(AgentRpcSource(socket_path=socket_path, handler=rpc_handler))
+
+            # Add sinks
+            if not quiet:
+                serve_console = rich.console.Console()
+                eng.add_sink(sinks.ConsoleSink(console=serve_console))
+            eng.add_sink(sinks.ResultCollectorSink())
+            eng.add_sink(AgentEventSink())  # Broadcast events to connected agents
+
+            # Run until interrupted (watch mode never exits on its own)
+            await eng.run(exit_on_completion=False)
+
+    # Run the async event loop
+    with contextlib.suppress(KeyboardInterrupt):
+        anyio.run(serve_main)
 
 
 def _run_oneshot_mode(
@@ -337,7 +560,6 @@ def _run_oneshot_mode(
     on_error: OnError,
     allow_uncached_incremental: bool,
     checkout_missing: bool,
-    tui_queue: TuiQueue | None,
     run_id: str | None,
     console: tui_console.Console | None,
     jsonl_callback: Callable[[dict[str, object]], None] | None,
@@ -345,29 +567,53 @@ def _run_oneshot_mode(
 ) -> dict[str, ExecutionSummary]:
     """Run non-watch (one-shot) mode with unified event-driven execution."""
     from pivot.executor import core as executor_core
-    from pivot.tui import run as run_tui
 
-    # TUI mode uses a thread to run executor
-    if tui and tui_queue and run_id:
-        # Sort for display
-        display_order = _sort_for_display(execution_order, graph)
+    def _convert_results(
+        stage_results: dict[str, StageCompleted],
+    ) -> dict[str, executor_core.ExecutionSummary]:
+        """Convert StageCompleted events to ExecutionSummary."""
+        return {
+            name: executor_core.ExecutionSummary(
+                status=event["status"],
+                reason=event["reason"],
+            )
+            for name, event in stage_results.items()
+        }
 
-        def executor_func() -> dict[str, ExecutionSummary]:
-            with _create_engine() as eng:
-                if cancel_event:
-                    eng.set_cancel_event(cancel_event)
+    # Sort for display
+    display_order = _sort_for_display(execution_order, graph) if execution_order else []
 
+    pipeline = cli_decorators.get_pipeline_from_context()
+
+    # TUI mode for oneshot
+    if tui and run_id:
+        from pivot.tui import run as tui_run
+
+        async def tui_oneshot_main() -> dict[str, executor_core.ExecutionSummary]:
+            # Create TUI app first (needed for TuiSink)
+            # Placeholder executor_func - not used since we manage engine ourselves
+            def executor_wrapper() -> dict[str, ExecutionSummary]:
+                return {}
+
+            app = tui_run.PivotApp(
+                stage_names=display_order,
+                tui_log=tui_log,
+                executor_func=executor_wrapper,
+                cancel_event=cancel_event,
+            )
+
+            async with engine.Engine(pipeline=pipeline) as eng:
+                # Configure sinks - TuiSink for direct post_message
                 result_sink = _configure_result_collector(eng)
                 _configure_output_sink(
                     eng,
                     quiet=quiet,
                     as_json=as_json,
-                    tui=tui,
-                    tui_queue=tui_queue,
+                    tui=True,
+                    app=app,
                     run_id=run_id,
-                    console=console,
+                    use_console=False,
                     jsonl_callback=jsonl_callback,
-                    watch=False,
                 )
                 _configure_oneshot_source(
                     eng,
@@ -380,42 +626,70 @@ def _run_oneshot_mode(
                     allow_uncached_incremental=allow_uncached_incremental,
                     checkout_missing=checkout_missing,
                 )
-                eng.run(exit_on_completion=True)
-                return result_sink.get_execution_summaries()
 
-        with _suppress_stderr_logging():
-            return run_tui.run_with_tui(
-                display_order, tui_queue, executor_func, tui_log=tui_log, cancel_event=cancel_event
-            )
+                # Run engine and TUI concurrently
+                async def engine_task() -> dict[str, executor_core.ExecutionSummary]:
+                    await eng.run(exit_on_completion=True)
+                    stage_results = await result_sink.get_results()
+                    return _convert_results(stage_results)
 
-    # Non-TUI mode runs directly
+                # Suppress stderr logging while TUI is active
+                with _suppress_stderr_logging():
+                    # Initialize results outside task group to avoid "possibly unbound" error
+                    engine_results: dict[str, executor_core.ExecutionSummary] = {}
+
+                    async def run_engine_and_signal() -> None:
+                        nonlocal engine_results
+                        engine_results = await engine_task()
+                        # TuiSink.close() sends TuiShutdown when Engine closes sinks
+
+                    # Note: If engine_task raises, anyio's task group will collect the
+                    # exception and re-raise it after the TUI thread completes or is
+                    # cancelled. The cancel_scope.cancel() only cancels tasks that
+                    # haven't completed yet - any exception from a completed task
+                    # is still propagated.
+                    async with anyio.create_task_group() as tg:
+                        tg.start_soon(run_engine_and_signal)
+                        await anyio.to_thread.run_sync(app.run)  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType] - anyio stub issue
+                        # TUI exited - if engine is still running, cancel it
+                        tg.cancel_scope.cancel()
+
+                    return engine_results
+
+        return anyio.run(tui_oneshot_main)
+
+    # Non-TUI async mode
     start_time = time.perf_counter()
-    with _create_engine() as eng:
-        result_sink = _configure_result_collector(eng)
-        _configure_output_sink(
-            eng,
-            quiet=quiet,
-            as_json=as_json,
-            tui=tui,
-            tui_queue=tui_queue,
-            run_id=run_id,
-            console=console,
-            jsonl_callback=jsonl_callback,
-            watch=False,
-        )
-        _configure_oneshot_source(
-            eng,
-            stages_list,
-            force=force,
-            single_stage=single_stage,
-            no_commit=no_commit,
-            no_cache=no_cache,
-            on_error=on_error,
-            allow_uncached_incremental=allow_uncached_incremental,
-            checkout_missing=checkout_missing,
-        )
-        eng.run(exit_on_completion=True)
-        results = result_sink.get_execution_summaries()
+
+    async def oneshot_main() -> dict[str, executor_core.ExecutionSummary]:
+        async with engine.Engine(pipeline=pipeline) as eng:
+            result_sink = _configure_result_collector(eng)
+            _configure_output_sink(
+                eng,
+                quiet=quiet,
+                as_json=as_json,
+                tui=False,
+                app=None,
+                run_id=None,
+                use_console=console is not None,
+                jsonl_callback=jsonl_callback,
+            )
+            _configure_oneshot_source(
+                eng,
+                stages_list,
+                force=force,
+                single_stage=single_stage,
+                no_commit=no_commit,
+                no_cache=no_cache,
+                on_error=on_error,
+                allow_uncached_incremental=allow_uncached_incremental,
+                checkout_missing=checkout_missing,
+            )
+            await eng.run(exit_on_completion=True)
+            stage_results = await result_sink.get_results()
+            return _convert_results(stage_results)
+
+    results = anyio.run(oneshot_main)
 
     # Emit JSONL final result
     if as_json:
@@ -452,16 +726,19 @@ def _suppress_stderr_logging() -> Generator[None]:
     in the upper-left corner. This temporarily removes StreamHandlers
     that write to stderr and restores them on exit.
     """
+    from typing import TextIO, cast
+
     root = logging.getLogger()
     removed_handlers = list[logging.Handler]()
 
     for handler in root.handlers[:]:
         if isinstance(handler, logging.StreamHandler):
-            # StreamHandler is generic but handlers list is Handler[]
-            stream = getattr(handler, "stream", None)  # pyright: ignore[reportUnknownArgumentType]
-            if stream in (sys.stderr, sys.stdout):
-                root.removeHandler(handler)  # pyright: ignore[reportUnknownArgumentType]
-                removed_handlers.append(handler)  # pyright: ignore[reportUnknownArgumentType]
+            # Cast to known type - stdlib handlers writing to stderr/stdout use TextIO
+            # Use string literal because generic type isn't narrowed by isinstance
+            stream_handler = cast("logging.StreamHandler[TextIO]", handler)
+            if stream_handler.stream in (sys.stderr, sys.stdout):
+                root.removeHandler(stream_handler)
+                removed_handlers.append(stream_handler)
     try:
         yield
     finally:
@@ -486,7 +763,7 @@ def _compute_dag_levels(graph: nx.DiGraph[str]) -> dict[str, int]:
     """
     import networkx as nx
 
-    levels: dict[str, int] = {}
+    levels = dict[str, int]()
     # Process in topological order (dependencies before dependents)
     for stage in nx.dfs_postorder_nodes(graph):
         # successors = what this stage depends on (edges go consumer -> producer)
@@ -538,19 +815,6 @@ def ensure_stages_registered() -> None:
             logger.info(f"Loaded pipeline: {pipeline.name}")
     except discovery.DiscoveryError as e:
         raise click.ClickException(str(e)) from e
-
-
-def _create_engine() -> engine.Engine:
-    """Create an Engine with the Pipeline from context.
-
-    The Pipeline must have been discovered by the CLI decorator (or ensure_stages_registered).
-    """
-    pipeline = cli_decorators.get_pipeline_from_context()
-    if pipeline is None:
-        raise click.ClickException(
-            "No pipeline discovered. Create a pivot.yaml or pipeline.py file."
-        )
-    return engine.Engine(pipeline=pipeline)
 
 
 def _validate_stages(stages_list: list[str] | None, single_stage: bool) -> None:
@@ -760,10 +1024,6 @@ def run(
 
     on_error = OnError.KEEP_GOING if keep_going else OnError.FAIL
 
-    # Validate --serve requires TUI mode
-    if watch and serve and not tui_flag:
-        raise click.ClickException("--serve requires --tui")
-
     show_human_output = not as_json and not quiet
 
     try:
@@ -828,7 +1088,9 @@ class DryRunJsonOutput(TypedDict):
 )
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON")
 @click.option("--allow-missing", is_flag=True, help="Allow missing dep files if tracked")
+@click.pass_context
 def dry_run_cmd(
+    ctx: click.Context,
     stages: tuple[str, ...],
     single_stage: bool,
     force: bool,
@@ -836,6 +1098,13 @@ def dry_run_cmd(
     allow_missing: bool,
 ) -> None:
     """Show what would run without executing."""
+    cli_ctx = cli_helpers.get_cli_context(ctx)
+    quiet = cli_ctx["quiet"]
+
+    # Quiet mode suppresses output (except JSON which is always emitted)
+    if quiet and not as_json:
+        return
+
     from pivot import status as status_mod
     from pivot.engine import graph as engine_graph
 

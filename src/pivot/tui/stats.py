@@ -4,24 +4,21 @@ import sys
 import threading
 import time
 from collections import deque
-from typing import Protocol, TypedDict
+from typing import TypedDict
 
 
-class QueueStats(TypedDict):
-    """Statistics for a single queue."""
+class MessageStats(TypedDict):
+    """Statistics for message throughput."""
 
     name: str
     messages_received: int
     messages_per_second: float
-    approximate_size: int | None  # None if qsize() not supported
-    high_water_mark: int
 
 
 class DebugStats(TypedDict):
     """Full debug statistics for TUI display."""
 
-    tui_queue: QueueStats
-    output_queue: QueueStats | None  # None in RunTuiApp
+    tui_messages: MessageStats
     active_workers: int
     memory_mb: float | None
     uptime_seconds: float
@@ -77,64 +74,37 @@ class SlidingWindowCounter:
         return total / _THROUGHPUT_WINDOW_SECS
 
 
-class SizedQueue(Protocol):
-    """Protocol for queues that support qsize()."""
+class MessageStatsTracker:
+    """Thread-safe tracker for message throughput statistics.
 
-    def qsize(self) -> int:
-        """Return the approximate size of the queue."""
-        ...
-
-
-class QueueStatsTracker:
-    """Thread-safe tracker for queue statistics.
-
-    Designed to be called from background reader thread (record_message)
-    and main Textual thread (get_stats). All mutable state protected by lock.
+    Designed to be called from message handler (record_message)
+    and debug panel updater (get_stats). All mutable state protected by lock.
     """
 
     _name: str
-    _queue: SizedQueue | None
     _lock: threading.Lock
     _messages_received: int
-    _high_water_mark: int
     _throughput: SlidingWindowCounter
 
-    def __init__(self, name: str, queue: SizedQueue | None = None) -> None:
+    def __init__(self, name: str) -> None:
         self._name = name
-        self._queue = queue
         self._lock = threading.Lock()
         self._messages_received = 0
-        self._high_water_mark = 0
         self._throughput = SlidingWindowCounter()
 
     def record_message(self) -> None:
-        """Record that a message was received. Called from reader thread."""
+        """Record that a message was received."""
         with self._lock:
             self._messages_received += 1
             self._throughput.record()
 
-    def get_stats(self) -> QueueStats:
-        """Get current statistics snapshot. Called from main thread.
-
-        Also samples qsize() and updates high-water mark here (every 500ms)
-        instead of per-message to reduce overhead.
-        """
+    def get_stats(self) -> MessageStats:
+        """Get current statistics snapshot."""
         with self._lock:
-            # Sample queue size and update high-water mark
-            approx_size: int | None = None
-            if self._queue is not None:
-                try:
-                    approx_size = self._queue.qsize()
-                    self._high_water_mark = max(self._high_water_mark, approx_size)
-                except NotImplementedError:
-                    pass  # macOS doesn't support qsize() on mp.Queue
-
-            return QueueStats(
+            return MessageStats(
                 name=self._name,
                 messages_received=self._messages_received,
                 messages_per_second=self._throughput.get_throughput(),
-                approximate_size=approx_size,
-                high_water_mark=self._high_water_mark,
             )
 
 
