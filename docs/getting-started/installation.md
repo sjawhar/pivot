@@ -54,9 +54,6 @@ pip install -e ".[dev]"
 ## Verifying Installation
 
 ```bash
-# Check version
-pivot --version
-
 # List available commands
 pivot --help
 ```

@@ -1,0 +1,12 @@
+{
+  "name": "pivot",
+  "description": "Skills for writing Pivot pipeline stages - file I/O annotations, loaders, and output types",
+  "version": "0.1.0",
+  "author": {
+    "name": "Sami Alabed"
+  },
+  "homepage": "https://github.com/sjawhar/pivot",
+  "repository": "https://github.com/sjawhar/pivot",
+  "license": "MIT",
+  "keywords": ["pivot", "pipelines", "data-science", "stages", "annotations"]
+}

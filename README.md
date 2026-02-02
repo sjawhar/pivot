@@ -42,7 +42,7 @@ from typing import Annotated, TypedDict
 
 import pandas
 from pivot import loaders, outputs
-from pivot.registry import REGISTRY
+from pivot.pipeline import Pipeline
 
 
 class PreprocessOutputs(TypedDict):
@@ -71,14 +71,15 @@ def train(
     return TrainOutputs(model=model_path)
 
 
-# Register stages
-REGISTRY.register(preprocess)
-REGISTRY.register(train)
+# Create pipeline and register stages
+pipeline = Pipeline("my_pipeline")
+pipeline.register(preprocess)
+pipeline.register(train)
 ```
 
 ```bash
-pivot run  # Runs both stages
-pivot run  # Instant - nothing changed
+pivot repro  # Runs both stages
+pivot repro  # Instant - nothing changed
 ```
 
 Modify `preprocess`, and Pivot automatically re-runs both stages. Modify `train`, and only `train` re-runs.
@@ -143,7 +144,7 @@ pivot export --validate  # Creates dvc.yaml and validates against DVC
 **Killer feature:** See WHY a stage would run
 
 ```bash
-pivot run --explain
+pivot repro --explain
 
 Stage: train
   Status: WILL RUN
@@ -276,7 +277,7 @@ default_remote: origin
 2. `pivot push` → upload cache files to S3
 3. On another machine: clone repo (includes lock files in git)
 4. `pivot pull train_model` → download only files needed for that stage
-5. `pivot run` → stages with cached outputs skip execution
+5. `pivot repro` → stages with cached outputs skip execution
 
 ### 9. Data Diff
 
@@ -400,7 +401,6 @@ pip install pivot
 Full documentation available at the [Pivot Documentation Site](https://anthropics.github.io/pivot/).
 
 - **[Quick Start](docs/getting-started/quickstart.md)** - Build your first pipeline in 5 minutes
-- **[Core Concepts](docs/getting-started/concepts.md)** - Stages, dependencies, caching
 - **[CLI Reference](docs/cli/index.md)** - All available commands
 - **[Architecture](docs/architecture/overview.md)** - Design decisions and internals
 - **[Comparison](docs/comparison.md)** - How Pivot compares to DVC, Prefect, Dagster
@@ -418,9 +418,9 @@ Full documentation available at the [Pivot Documentation Site](https://anthropic
 - **Watch mode** - File system monitoring with configurable globs and debounce
 - **Incremental outputs** - Restore-before-run for append-only workloads
 - **DVC export** - `pivot export` command for YAML generation
-- **Explain mode** - `pivot run --explain` and `pivot explain` show detailed breakdown of WHY stages would run
+- **Explain mode** - `pivot repro --explain` and `pivot status --explain` show detailed breakdown of WHY stages would run
 - **Observability** - `pivot metrics show/diff`, `pivot plots show/diff`, and `pivot params show/diff` commands
-- **Pipeline configuration** - Python-first with `REGISTRY.register()`, optional `pivot.yaml` for matrix expansion
+- **Pipeline configuration** - Python-first with `Pipeline.register()`, optional `pivot.yaml` for matrix expansion
 - **S3 remote cache** - `pivot push/pull` with async I/O, LMDB index, per-stage filtering
 - **Data diff** - `pivot data diff` command with interactive TUI for comparing data file changes
 - **Version retrieval** - `pivot data get --rev` to materialize files from any git revision
@@ -440,7 +440,7 @@ Full documentation available at the [Pivot Documentation Site](https://anthropic
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  User Pipeline Code (pipeline.py with REGISTRY.register())  │
+│  User Pipeline Code (pipeline.py with Pipeline.register())  │
 │  @outputs.Dep("data.csv", loaders.CSV())                    │
 │  @outputs.Out("model.pkl", loaders.PathOnly())              │
 │  def train(data: ...) -> TrainOutputs: ...                  │

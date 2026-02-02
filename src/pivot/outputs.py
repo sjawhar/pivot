@@ -65,7 +65,7 @@ class PlaceholderDep(Generic[T]):  # noqa: UP046 - basedpyright doesn't support 
         ) -> CompareOutputs:
             ...
 
-        REGISTRY.register(
+        pipeline.register(
             compare,
             dep_path_overrides={
                 "baseline": "model_a/results.csv",

@@ -12,7 +12,7 @@ Pivot uses a parallel execution model with warm worker pools for maximum perform
        ▼
 ┌──────────────────┐
 │  Engine          │  ← Central coordinator
-│  (run_once)      │
+│  (run)           │
 └──────┬───────────┘
        │
        ▼
@@ -56,7 +56,7 @@ The Engine uses event-driven orchestration for maximum parallelism:
 3. **Mutex Handling** - Prevents conflicting stages from running concurrently
 4. **Event Emission** - StageStarted/StageCompleted events to sinks
 
-As stages complete, their downstream stages become ready. The Engine handles both batch (`run_once`) and continuous (`run_loop`) execution through the same orchestration code.
+As stages complete, their downstream stages become ready. The Engine handles both batch (`exit_on_completion=True`) and continuous (`exit_on_completion=False`) execution through the same orchestration code.
 
 ## Stage Execution States
 

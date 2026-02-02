@@ -17,7 +17,7 @@ The Engine is Pivot's central coordinator for all execution paths. It provides a
 │ Filesystem   │          │        ▼              │        │ Event Sinks  │
 │ OneShot      │          │  Stage Orchestration  │──emit──▶              │
 │              │          │        │              │        │ Console      │
-└──────────────┘          │        ▼              │        │ TUI/JSONL    │
+└──────────────┘          │        ▼              │        │ TUI/Agent    │
                           │  Worker Pool          │        └──────────────┘
                           └───────────────────────┘
 ```
@@ -69,9 +69,9 @@ Sinks consume output events via `sink.handle()`:
 |------|--------|----------|
 | `ConsoleSink` | Rich terminal | Plain CLI mode |
 | `TuiSink` | Textual app | TUI mode |
-| `JsonlSink` | Newline JSON | Tooling integration |
-| `WatchSink` | Engine state | Watch mode state handling |
 | `ResultCollectorSink` | Dict collection | Programmatic result access |
+| `EventSink` | Memory channels | Agent RPC pub-sub |
+| `EventBuffer` | Ring buffer | Agent RPC polling |
 
 ## Bipartite Graph
 
@@ -192,7 +192,7 @@ For headless daemon operation (`pivot run --serve --watch`), the Engine supports
 async with Engine(pipeline=pipeline) as engine:
     engine.add_source(FilesystemSource(watch_paths=paths))
     engine.add_source(AgentRpcSource(socket_path=socket_path, handler=handler))
-    engine.add_sink(AgentEventSink())
+    engine.add_sink(EventSink())
 
     await engine.run(exit_on_completion=False)
 ```
@@ -202,7 +202,8 @@ async with Engine(pipeline=pipeline) as engine:
 | Component | Purpose |
 |-----------|---------|
 | `AgentRpcSource` | JSON-RPC 2.0 over Unix socket |
-| `AgentEventSink` | Broadcast events to subscribed clients |
+| `EventSink` | Broadcast events to subscribed clients |
+| `EventBuffer` | Ring buffer for event polling |
 
 ### Agent RPC Protocol
 
@@ -223,21 +224,31 @@ The `AgentRpcSource` implements JSON-RPC 2.0 over Unix socket:
 
 ### Event Broadcasting
 
-`AgentEventSink` provides pub-sub event delivery to connected agents:
+`EventSink` provides pub-sub event delivery to connected agents:
 
 ```python
 # Subscribe a client
-recv = event_sink.subscribe("client_id")
+recv = await event_sink.subscribe("client_id")
 
 # Receive events
 async for event in recv:
     process(event)
 
 # Unsubscribe when done
-event_sink.unsubscribe("client_id")
+await event_sink.unsubscribe("client_id")
 ```
 
 **Backpressure Handling:** If a client's buffer is full, events are dropped silently with a debug log. Clients should process events quickly or increase buffer size.
+
+Alternatively, `EventBuffer` provides polling-based access via `events_since(version)`:
+
+```python
+# Poll for new events
+result = event_buffer.events_since(last_version)
+for versioned_event in result["events"]:
+    process(versioned_event["event"])
+last_version = result["version"]
+```
 
 ## Code Locations
 

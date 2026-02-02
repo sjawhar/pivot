@@ -197,7 +197,7 @@ pivot repro --watch --tui
 
 ## References
 
-- [Architecture doc](/docs/architecture/watch.md)
+- [Architecture doc](../architecture/watch.md)
 - [Buck2 incremental computation](https://engineering.fb.com/2023/04/06/open-source/buck2-open-source-large-scale-build-system/)
 - [watchfiles library](https://github.com/samuelcolvin/watchfiles)
 - [loky reusable executor](https://loky.readthedocs.io/)

@@ -13,6 +13,8 @@ Complete reference for all Pivot command-line commands.
 | Understand why stage runs | `pivot status --explain stage` |
 | List all stages | `pivot list` |
 | Show stage status | `pivot status` |
+| Visualize DAG | `pivot dag` |
+| Verify reproducibility | `pivot verify` |
 | Push outputs to remote | `pivot push` |
 | Pull outputs from remote | `pivot pull` |
 | Watch for changes | `pivot repro --watch` |
@@ -248,6 +250,94 @@ pivot export [STAGES...] [OPTIONS]
 | Option | Description |
 |--------|-------------|
 | `--output` / `-o PATH` | Output path (default: `dvc.yaml`) |
+
+---
+
+### `pivot dag`
+
+Visualize the pipeline DAG.
+
+```bash
+pivot dag [TARGETS...] [OPTIONS]
+```
+
+Shows the dependency graph of artifacts (default) or stages. Without targets, shows the entire graph. With targets, shows the subgraph containing those targets and their upstream dependencies.
+
+**Arguments:**
+
+- `TARGETS` - Stage names or artifact paths to filter (optional, shows entire graph if not specified). Stage names take precedence when a name matches both a stage and a file path.
+
+**Options:**
+
+| Option | Description |
+|--------|-------------|
+| `--dot` | Output Graphviz DOT format |
+| `--mermaid` | Output Mermaid format |
+| `--md` | Output Mermaid wrapped in markdown |
+| `--stages` | Show stages as nodes (default: artifacts) |
+
+**Examples:**
+
+```bash
+# Show entire artifact DAG
+pivot dag
+
+# Show DAG for specific stage and its dependencies
+pivot dag train
+
+# Output as Mermaid diagram
+pivot dag --mermaid
+
+# Show stage-level DAG instead of artifacts
+pivot dag --stages
+
+# Output Graphviz DOT for external rendering
+pivot dag --dot > pipeline.dot
+```
+
+---
+
+### `pivot verify`
+
+Verify pipeline was reproduced and outputs are available.
+
+```bash
+pivot verify [STAGES...] [OPTIONS]
+```
+
+Checks that all stages are cached (code, params, deps match lock files) and output files exist locally or on remote. Use in CI pre-merge gates to ensure pipeline is reproducible.
+
+**Arguments:**
+
+- `STAGES` - Stage names to verify (optional, verifies all if not specified)
+
+**Options:**
+
+| Option | Description |
+|--------|-------------|
+| `--allow-missing` | Allow missing local files if on remote |
+| `--json` | Output as JSON |
+
+**Exit Codes:**
+
+- `0` - Verification passed
+- `1` - Verification failed (stale stages or missing files)
+
+**Examples:**
+
+```bash
+# Verify entire pipeline
+pivot verify
+
+# Verify specific stages
+pivot verify train evaluate
+
+# CI gate: allow missing local files if on remote
+pivot verify --allow-missing
+
+# JSON output for scripting
+pivot verify --json
+```
 
 ---
 

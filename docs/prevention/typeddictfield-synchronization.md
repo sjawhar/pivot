@@ -66,7 +66,7 @@ This can be aliased or added to pre-commit hooks:
 
 ```bash
 # Add to ~/.bashrc or ~/.zshrc
-alias check-pivot="cd ~/pivot/watch && uv run ruff format . && uv run ruff check . && uv run basedpyright ."
+alias check-pivot="cd ~/pivot/default && uv run ruff format . && uv run ruff check . && uv run basedpyright ."
 ```
 
 **Frequency:**

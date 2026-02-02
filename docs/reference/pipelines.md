@@ -7,13 +7,13 @@ Pipelines are defined in Python using typed functions with annotations. Pivot di
 Pivot searches for pipeline definitions in this order:
 
 1. `pivot.yaml` / `pivot.yml` - YAML configuration (for path overrides)
-2. `pipeline.py` - Python module calling `REGISTRY.register()`
+2. `pipeline.py` - Python module calling `pipeline.register()`
 
 The first method found is used.
 
 ## Python Registration
 
-Define pipelines in `pipeline.py` using `REGISTRY.register()`:
+Define pipelines in `pipeline.py` using `Pipeline.register()`:
 
 ```python
 # pipeline.py
@@ -22,8 +22,10 @@ from typing import Annotated, TypedDict
 
 import pandas
 from pivot import loaders, outputs
-from pivot.registry import REGISTRY
+from pivot.pipeline import Pipeline
 from pivot.stage_def import StageParams
+
+pipeline = Pipeline("my_pipeline")
 
 
 class TrainParams(StageParams):
@@ -66,8 +68,8 @@ def train(
 
 
 # Register stages
-REGISTRY.register(preprocess)
-REGISTRY.register(train)
+pipeline.register(preprocess)
+pipeline.register(train)
 ```
 
 ### Path Overrides at Registration
@@ -75,7 +77,7 @@ REGISTRY.register(train)
 Override annotation paths at registration time:
 
 ```python
-REGISTRY.register(
+pipeline.register(
     train,
     dep_path_overrides={"data": "custom/input.csv"},
     out_path_overrides={"model": {"path": "custom/model.pkl"}},
@@ -88,7 +90,7 @@ Register variants manually for matrix-like behavior:
 
 ```python
 for dataset in ["train", "test"]:
-    REGISTRY.register(
+    pipeline.register(
         train,
         name=f"train@{dataset}",
         variant=dataset,
@@ -170,16 +172,8 @@ Use parameters instead of closures to configure stage behavior.
 Prevent stages from running concurrently:
 
 ```python
-REGISTRY.register(train_gpu, mutex=["gpu"])
-REGISTRY.register(train_gpu_2, mutex=["gpu"])  # Won't run at same time as train_gpu
-```
-
-## Working Directory
-
-Set a working directory for path resolution:
-
-```python
-REGISTRY.register(process, cwd="subproject/")
+pipeline.register(train_gpu, mutex=["gpu"])
+pipeline.register(train_gpu_2, mutex=["gpu"])  # Won't run at same time as train_gpu
 ```
 
 ## Testing Stage Functions
@@ -221,7 +215,6 @@ stages:
       learning_rate: 0.01
     mutex:
       - gpu
-    cwd: subdir/
 ```
 
 **When to use YAML:**
