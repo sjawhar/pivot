@@ -1,0 +1,16 @@
+{
+  "name": "pivot",
+  "description": "Skills for writing Pivot pipeline stages",
+  "owner": {
+    "name": "Sami Jawhar",
+    "email": "sami@sjawhar.me"
+  },
+  "plugins": [
+    {
+      "name": "pivot",
+      "description": "Skills for writing Pivot pipeline stages - file I/O annotations, loaders, and output types",
+      "version": "0.1.0",
+      "source": "./"
+    }
+  ]
+}
