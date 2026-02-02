@@ -390,18 +390,24 @@ def _run_watch_mode(  # noqa: PLR0913 - many params needed for different modes
                 if serve:
                     from pivot import project
                     from pivot.engine.agent_rpc import (
-                        AgentEventSink,
                         AgentRpcHandler,
                         AgentRpcSource,
+                        EventSink,
                     )
 
                     state_dir = project.get_project_root() / ".pivot"
                     socket_path = state_dir / "agent.sock"
                     state_dir.mkdir(parents=True, exist_ok=True)
 
-                    rpc_handler = AgentRpcHandler(engine=eng)
+                    # Add event buffer as sink so it captures events
+                    eng.add_sink(eng._event_buffer)  # pyright: ignore[reportPrivateUsage]
+
+                    rpc_handler = AgentRpcHandler(
+                        engine=eng,
+                        event_buffer=eng._event_buffer,  # pyright: ignore[reportPrivateUsage]
+                    )
                     eng.add_source(AgentRpcSource(socket_path=socket_path, handler=rpc_handler))
-                    eng.add_sink(AgentEventSink())
+                    eng.add_sink(EventSink())
 
                 # Configure watch sources
                 _configure_watch_sources(
@@ -484,7 +490,7 @@ def _run_serve_mode(
 
     from pivot import project
     from pivot.engine import graph as engine_graph
-    from pivot.engine.agent_rpc import AgentEventSink, AgentRpcHandler, AgentRpcSource
+    from pivot.engine.agent_rpc import AgentRpcHandler, AgentRpcSource, EventSink
 
     # Get project paths
     project_root = project.get_project_root()
@@ -525,8 +531,11 @@ def _run_serve_mode(
                     )
                 )
 
+            # Add event buffer as sink so it captures events
+            eng.add_sink(eng._event_buffer)  # pyright: ignore[reportPrivateUsage]
+
             # Add agent RPC source with handler for status/stages queries
-            rpc_handler = AgentRpcHandler(engine=eng)
+            rpc_handler = AgentRpcHandler(engine=eng, event_buffer=eng._event_buffer)  # pyright: ignore[reportPrivateUsage]
             eng.add_source(AgentRpcSource(socket_path=socket_path, handler=rpc_handler))
 
             # Add sinks
@@ -534,7 +543,7 @@ def _run_serve_mode(
                 serve_console = rich.console.Console()
                 eng.add_sink(sinks.ConsoleSink(console=serve_console))
             eng.add_sink(sinks.ResultCollectorSink())
-            eng.add_sink(AgentEventSink())  # Broadcast events to connected agents
+            eng.add_sink(EventSink())  # Broadcast events to connected agents
 
             # Run until interrupted (watch mode never exits on its own)
             await eng.run(exit_on_completion=False)

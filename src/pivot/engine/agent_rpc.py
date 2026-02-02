@@ -1,16 +1,22 @@
 from __future__ import annotations
 
 import contextlib
+import enum
 import json
 import logging
+import threading
+from collections import deque
 from typing import TYPE_CHECKING, Literal, TypedDict, cast
 
 import anyio
 from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
 from pydantic import BaseModel, ValidationError, field_validator
 
+from pivot import explain as explain_mod
+from pivot import parameters
+from pivot.config import io as config_io
 from pivot.engine.types import CancelRequested, EngineState, OutputEvent, RunRequested
-from pivot.types import OnError
+from pivot.types import OnError, StageExplanation
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -19,10 +25,28 @@ if TYPE_CHECKING:
 
     from pivot.engine.engine import Engine
     from pivot.engine.types import InputEvent
+    from pivot.registry import RegistryStageInfo
 
-__all__ = ["AgentEventSink", "AgentRpcHandler", "AgentRpcSource"]
+__all__ = [
+    "AgentRpcHandler",
+    "AgentRpcSource",
+    "EventBuffer",
+    "EventSink",
+    "EventsResult",
+    "VersionedEvent",
+]
 
 _logger = logging.getLogger(__name__)
+
+_MAX_VERSION = 2**63 - 1
+
+
+def _json_default(obj: object) -> object:
+    """Custom JSON encoder for enums and other non-serializable types."""
+    if isinstance(obj, enum.Enum):
+        return obj.value
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
 
 # JSON-RPC 2.0: id can be string, number, or null (for notifications)
 type JsonRpcId = str | int | None
@@ -93,7 +117,17 @@ class QueryStagesResult(TypedDict):
     stages: list[str]
 
 
-type QueryResult = QueryStatusResult | QueryStagesResult
+class QueryStageInfoResult(TypedDict):
+    """Result type for stage_info query."""
+
+    name: str
+    deps: list[str]
+    outs: list[str]
+
+
+type QueryResult = (
+    QueryStatusResult | QueryStagesResult | EventsResult | StageExplanation | QueryStageInfoResult
+)
 
 
 def _validate_json_rpc_request(
@@ -159,9 +193,16 @@ class AgentRpcHandler:
     """Handles JSON-RPC queries that need engine/inspector access."""
 
     _engine: Engine
+    _event_buffer: EventBuffer | None
 
-    def __init__(self, *, engine: Engine) -> None:
+    def __init__(
+        self,
+        *,
+        engine: Engine,
+        event_buffer: EventBuffer | None = None,
+    ) -> None:
         self._engine = engine
+        self._event_buffer = event_buffer
 
     def validate_stages(self, stages: list[str] | None) -> str | None:
         """Validate stage names exist. Returns error message or None if valid."""
@@ -176,9 +217,38 @@ class AgentRpcHandler:
             return f"Unknown stages: {', '.join(unknown)}"
         return None
 
-    async def handle_query(self, method: str) -> QueryResult:
+    def _get_stage_info(self, params: dict[str, object]) -> tuple[str, RegistryStageInfo]:
+        """Extract and validate stage param, return (stage_name, reg_info)."""
+        stage = params.get("stage")
+        if not isinstance(stage, str):
+            raise ValueError("stage must be string")
+        pipeline = self._engine._pipeline  # pyright: ignore[reportPrivateUsage]
+        if pipeline is None:
+            raise ValueError("No pipeline loaded")
+        try:
+            reg_info = pipeline.get(stage)
+        except KeyError:
+            raise ValueError(f"Unknown stage: {stage}") from None
+        return stage, reg_info
+
+    async def handle_query(
+        self, method: str, params: dict[str, object] | None = None
+    ) -> QueryResult:
         """Handle a query request and return the result."""
+        if params is None:
+            params = {}
+
         match method:
+            case "events_since":
+                if self._event_buffer is None:
+                    raise ValueError("Event buffer not configured")
+                version = params.get("version", 0)
+                # Note: isinstance(True, int) is True in Python, so check bool explicitly
+                if isinstance(version, bool) or not isinstance(version, int):
+                    raise ValueError(f"version must be integer between 0 and {_MAX_VERSION}")
+                if version < 0 or version > _MAX_VERSION:
+                    raise ValueError(f"version must be integer between 0 and {_MAX_VERSION}")
+                return self._event_buffer.events_since(version)
             case "status":
                 return QueryStatusResult(
                     state="idle" if self._engine.state == EngineState.IDLE else "active",
@@ -186,11 +256,36 @@ class AgentRpcHandler:
                     pending=list[str](),
                 )
             case "stages":
-                # Access _pipeline directly - this handler is tightly coupled to engine internals
                 pipeline = self._engine._pipeline  # pyright: ignore[reportPrivateUsage]
                 if pipeline is None:
                     return QueryStagesResult(stages=list[str]())
                 return QueryStagesResult(stages=pipeline.list_stages())
+            case "explain":
+                stage, reg_info = self._get_stage_info(params)
+
+                def _get_explanation() -> StageExplanation:
+                    try:
+                        overrides = parameters.load_params_yaml()
+                    except Exception as e:
+                        raise ValueError(f"Failed to load params.yaml: {e}") from e
+                    return explain_mod.get_stage_explanation(
+                        stage_name=stage,
+                        fingerprint=reg_info["fingerprint"],
+                        deps=reg_info["deps_paths"],
+                        outs_paths=reg_info["outs_paths"],
+                        params_instance=reg_info["params"],
+                        overrides=overrides,
+                        state_dir=config_io.get_state_dir(),
+                    )
+
+                return await anyio.to_thread.run_sync(_get_explanation)  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType, reportUnknownVariableType] - anyio stub issue
+            case "stage_info":
+                stage, reg_info = self._get_stage_info(params)
+                return QueryStageInfoResult(
+                    name=stage,
+                    deps=reg_info["deps_paths"],
+                    outs=reg_info["outs_paths"],
+                )
             case _:
                 raise ValueError(f"Unknown query method: {method}")
 
@@ -217,9 +312,9 @@ class AgentRpcSource:
                 self._socket_path.unlink()
 
         listener = await anyio.create_unix_listener(self._socket_path)
-        self._socket_path.chmod(0o600)  # Owner-only access
 
         try:
+            self._socket_path.chmod(0o600)  # Owner-only access
             async with listener, anyio.create_task_group() as tg:
                 while True:
                     conn = await listener.accept()
@@ -291,7 +386,9 @@ class AgentRpcSource:
                     response = await self._handle_request(request, send)
 
                     if response is not None:
-                        await conn.send(json.dumps(response).encode() + b"\n")
+                        await conn.send(
+                            json.dumps(response, default=_json_default).encode() + b"\n"
+                        )
 
                 except (json.JSONDecodeError, UnicodeDecodeError):
                     error_response = {
@@ -360,16 +457,21 @@ class AgentRpcSource:
         # Queries handled by handler (if available)
         if self._handler is not None:
             try:
-                result = await self._handler.handle_query(method)
+                result = await self._handler.handle_query(method, params)
                 return _json_rpc_response(result, request_id)
-            except ValueError:
-                return _json_rpc_error(-32601, "Method not found", request_id)
+            except ValueError as e:
+                # Distinguish "unknown method" from "invalid params" by checking message
+                msg = str(e)
+                if "Unknown query method" in msg:
+                    return _json_rpc_error(-32601, "Method not found", request_id)
+                # Invalid params or other handler errors
+                return _json_rpc_error(-32602, f"Invalid params: {msg}", request_id)
 
         # Unknown method, no handler
         return _json_rpc_error(-32601, "Method not found", request_id)
 
 
-class AgentEventSink:
+class EventSink:
     """Async sink that broadcasts events to connected agents.
 
     Thread safety: All subscriber dict operations are protected by a lock
@@ -433,3 +535,74 @@ class AgentEventSink:
             self._subscribers.clear()
         for client_id, error in errors:
             _logger.warning("Error closing channel for client %s: %s", client_id, error)
+
+
+class VersionedEvent(TypedDict):
+    """Event with version number."""
+
+    version: int
+    event: OutputEvent
+
+
+class EventsResult(TypedDict):
+    """Result of events_since query."""
+
+    version: int
+    events: list[VersionedEvent]
+
+
+class EventBuffer:
+    """Ring buffer for event polling via events_since.
+
+    Thread-safe: uses threading.Lock since buffer is accessed from both
+    sync (events_since) and async (handle) contexts.
+    """
+
+    _max_events: int
+    _events: deque[tuple[int, OutputEvent]]
+    _version: int
+    _lock: threading.Lock
+
+    def __init__(self, max_events: int = 1000) -> None:
+        self._max_events = max_events
+        self._events = deque[tuple[int, OutputEvent]](maxlen=max_events)
+        self._version = 0
+        self._lock = threading.Lock()
+
+    def handle_sync(self, event: OutputEvent) -> None:
+        """Store event with version number (sync, thread-safe).
+
+        Version wraps at _MAX_VERSION to prevent overflow. Clients polling
+        with a version from before wrap will receive all buffered events.
+        """
+        with self._lock:
+            self._version += 1
+            # Wrap version to prevent overflow - clients will get all events on wrap
+            if self._version > _MAX_VERSION:
+                self._version = 1
+            self._events.append((self._version, event))
+
+    async def handle(self, event: OutputEvent) -> None:
+        """Async wrapper for sink interface compatibility."""
+        self.handle_sync(event)
+
+    def events_since(self, since_version: int) -> EventsResult:
+        """Return events after the given version.
+
+        If since_version > current version (e.g., after version wrap), returns
+        all buffered events to ensure clients don't miss events. Clients should
+        dedupe by version since wraparound may return previously-seen events.
+        """
+        with self._lock:
+            # Handle version wrap: if client's version is higher than current,
+            # they're from before a wrap - return all events
+            if since_version > self._version:
+                result = [VersionedEvent(version=v, event=e) for v, e in self._events]
+            else:
+                result = [
+                    VersionedEvent(version=v, event=e) for v, e in self._events if v > since_version
+                ]
+            return EventsResult(version=self._version, events=result)
+
+    async def close(self) -> None:
+        """No cleanup needed for EventBuffer."""

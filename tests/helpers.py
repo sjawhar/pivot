@@ -7,11 +7,39 @@ import pathlib
 import textwrap
 from typing import TYPE_CHECKING, Any
 
+import anyio
+
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
 
     from pivot import outputs, registry, stage_def
     from pivot.pipeline import pipeline as pipeline_mod
+
+
+async def wait_for_socket(socket_path: pathlib.Path, timeout: float = 5.0) -> None:
+    """Wait for Unix socket to be created and connectable.
+
+    Args:
+        socket_path: Path to the Unix socket file.
+        timeout: Maximum time to wait in seconds.
+
+    Raises:
+        TimeoutError: If socket is not created within timeout.
+    """
+    import stat
+
+    deadline = anyio.current_time() + timeout
+    while anyio.current_time() < deadline:
+        if socket_path.exists():
+            try:
+                mode = socket_path.stat().st_mode
+                if stat.S_ISSOCK(mode):
+                    return
+            except OSError:
+                pass
+        await anyio.sleep(0.05)
+    msg = f"Socket {socket_path} not created within {timeout}s"
+    raise TimeoutError(msg)
 
 
 # Module-level test pipeline for tests that don't have explicit Pipeline context.
