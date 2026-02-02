@@ -12,7 +12,7 @@ Replace the current separate watch mode with a unified watch execution engine th
 
 ## Motivation
 
-The current watch mode (`pivot run --watch`) works but has limitations:
+The current watch mode (`pivot repro --watch`) works but has limitations:
 - Separate code path from normal execution
 - Full pipeline re-run on any change
 - No TUI integration for live status
@@ -175,10 +175,10 @@ Filter all registered stage outputs from watcher to prevent infinite loops.
 
 ```bash
 # Plain text output (default)
-pivot run --watch
+pivot repro --watch
 
 # With TUI
-pivot run --watch --tui
+pivot repro --watch --tui
 ```
 
 ## Performance Targets

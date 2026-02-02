@@ -55,13 +55,13 @@ def train(variant: str):
 
 ```bash
 # Run all variants
-pivot run
+pivot repro
 
 # Run specific variant
-pivot run train@bert_swe
+pivot repro train@bert_swe
 
 # Run all variants of a base stage
-pivot run "train@*"
+pivot repro "train@*"
 ```
 
 ## Listing Matrix Stages

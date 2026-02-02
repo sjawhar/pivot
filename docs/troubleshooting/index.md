@@ -25,13 +25,13 @@ pivot list
 pivot status --explain stage_name
 
 # Show what would run without executing
-pivot run --dry-run
+pivot repro --dry-run
 
 # Force a stage to run regardless of cache
-pivot run stage_name --force
+pivot repro stage_name --force
 
 # Verbose logging for more detail
-PIVOT_LOG_LEVEL=DEBUG pivot run
+PIVOT_LOG_LEVEL=DEBUG pivot repro
 ```
 
 ## Inspect Lock Files
@@ -64,6 +64,6 @@ See: [Stage Reruns Unexpectedly](../reference/outputs.md#stage-reruns-unexpected
 
 1. Ensure lock files are committed: `git add .pivot/stages/*.lock`
 2. Ensure remote is configured: `pivot config list`
-3. Run `pivot pull` before `pivot run` in CI
+3. Run `pivot pull` before `pivot repro` in CI
 
 See: [CI Fails but Local Passes](../reference/configuration.md#ci-fails-but-local-passes)

@@ -1,4 +1,4 @@
-"""Tests for --explain CLI flag."""
+"""Tests for --explain CLI flag (repro command)."""
 
 from __future__ import annotations
 
@@ -160,24 +160,24 @@ def train(
 
 
 # =============================================================================
-# Basic --explain flag tests
+# Basic --explain flag tests (repro command)
 # =============================================================================
 
 
 def test_explain_flag_in_help(runner: CliRunner) -> None:
-    """--explain flag should appear in help output."""
-    result = runner.invoke(cli.cli, ["run", "--help"])
+    """--explain flag should appear in repro help output."""
+    result = runner.invoke(cli.cli, ["repro", "--help"])
 
     assert result.exit_code == 0
     assert "--explain" in result.output
 
 
 def test_explain_no_stages(runner: CliRunner, tmp_path: pathlib.Path) -> None:
-    """--explain with no pipeline errors with appropriate message."""
+    """repro --explain with no pipeline errors with appropriate message."""
     with _cli_isolated_filesystem(runner, tmp_path):
         pathlib.Path(".git").mkdir()
 
-        result = runner.invoke(cli.cli, ["run", "--explain"])
+        result = runner.invoke(cli.cli, ["repro", "--explain"])
 
         assert result.exit_code != 0
         # Either "No pipeline found" or "No Pipeline in context" depending on discovery path
@@ -185,7 +185,7 @@ def test_explain_no_stages(runner: CliRunner, tmp_path: pathlib.Path) -> None:
 
 
 def test_explain_flag_works(runner: CliRunner, tmp_path: pathlib.Path) -> None:
-    """--explain produces output for stages."""
+    """repro --explain produces output for stages."""
     with _cli_isolated_filesystem(runner, tmp_path):
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
@@ -196,7 +196,7 @@ stages:
     python: stages.process
 """)
 
-        result = runner.invoke(cli.cli, ["run", "--explain"])
+        result = runner.invoke(cli.cli, ["repro", "--explain"])
 
         assert result.exit_code == 0, f"Failed with: {result.output}"
         assert "process" in result.output
@@ -204,7 +204,7 @@ stages:
 
 
 def test_explain_specific_stages(runner: CliRunner, tmp_path: pathlib.Path) -> None:
-    """--explain can target specific stages."""
+    """repro --explain can target specific stages."""
     with _cli_isolated_filesystem(runner, tmp_path):
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
@@ -217,7 +217,7 @@ stages:
     python: stages.stage_b
 """)
 
-        result = runner.invoke(cli.cli, ["run", "--explain", "stage_a"])
+        result = runner.invoke(cli.cli, ["repro", "--explain", "stage_a"])
 
         assert result.exit_code == 0
         assert "stage_a" in result.output
@@ -230,7 +230,7 @@ stages:
 
 
 def test_explain_shows_code_changes(runner: CliRunner, tmp_path: pathlib.Path) -> None:
-    """--explain shows code changes when code differs."""
+    """repro --explain shows code changes when code differs."""
     # Skip this test for now - testing code change detection requires proper multiprocessing
     # setup which is complex in isolated CLI tests. The core behavior is tested elsewhere.
     import pytest
@@ -239,7 +239,7 @@ def test_explain_shows_code_changes(runner: CliRunner, tmp_path: pathlib.Path) -
 
 
 def test_explain_shows_param_changes(runner: CliRunner, tmp_path: pathlib.Path) -> None:
-    """--explain shows param changes when params differ."""
+    """repro --explain shows param changes when params differ."""
     # Skip this test for now - testing param change detection requires prior execution
     # which is complex in isolated CLI tests due to multiprocessing. Tested in unit tests.
     import pytest
@@ -248,7 +248,7 @@ def test_explain_shows_param_changes(runner: CliRunner, tmp_path: pathlib.Path) 
 
 
 def test_explain_shows_dep_changes(runner: CliRunner, tmp_path: pathlib.Path) -> None:
-    """--explain shows dependency changes when deps differ."""
+    """repro --explain shows dependency changes when deps differ."""
     # Skip this test for now - testing dep change detection requires prior execution
     # which is complex in isolated CLI tests due to multiprocessing. Tested in unit tests.
     import pytest
@@ -257,7 +257,7 @@ def test_explain_shows_dep_changes(runner: CliRunner, tmp_path: pathlib.Path) ->
 
 
 def test_explain_shows_unchanged(runner: CliRunner, tmp_path: pathlib.Path) -> None:
-    """--explain shows stages as unchanged when nothing differs."""
+    """repro --explain shows stages as unchanged when nothing differs."""
     # Skip this test for now - testing unchanged detection requires prior execution
     # which is complex in isolated CLI tests due to multiprocessing. Tested in unit tests.
     import pytest
@@ -266,7 +266,7 @@ def test_explain_shows_unchanged(runner: CliRunner, tmp_path: pathlib.Path) -> N
 
 
 def test_explain_shows_no_previous_run(runner: CliRunner, tmp_path: pathlib.Path) -> None:
-    """--explain shows 'No previous run' for never-run stages."""
+    """repro --explain shows 'No previous run' for never-run stages."""
     with _cli_isolated_filesystem(runner, tmp_path):
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
@@ -277,7 +277,7 @@ stages:
     python: stages.process
 """)
 
-        result = runner.invoke(cli.cli, ["run", "--explain"])
+        result = runner.invoke(cli.cli, ["repro", "--explain"])
 
         assert result.exit_code == 0
         assert "No previous run" in result.output
@@ -289,7 +289,7 @@ stages:
 
 
 def test_explain_short_flag(runner: CliRunner, tmp_path: pathlib.Path) -> None:
-    """-e short flag works like --explain."""
+    """repro -e short flag works like --explain."""
     with _cli_isolated_filesystem(runner, tmp_path):
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
@@ -300,7 +300,7 @@ stages:
     python: stages.process
 """)
 
-        result = runner.invoke(cli.cli, ["run", "-e"])
+        result = runner.invoke(cli.cli, ["repro", "-e"])
 
         assert result.exit_code == 0
         assert "process" in result.output
@@ -313,7 +313,7 @@ stages:
 
 
 def test_explain_unknown_stage_errors(runner: CliRunner, tmp_path: pathlib.Path) -> None:
-    """--explain with unknown stage shows error."""
+    """repro --explain with unknown stage shows error."""
     with _cli_isolated_filesystem(runner, tmp_path):
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
@@ -324,7 +324,7 @@ stages:
     python: stages.process
 """)
 
-        result = runner.invoke(cli.cli, ["run", "--explain", "nonexistent"])
+        result = runner.invoke(cli.cli, ["repro", "--explain", "nonexistent"])
 
         assert result.exit_code != 0
         assert "nonexistent" in result.output.lower() or "unknown" in result.output.lower()

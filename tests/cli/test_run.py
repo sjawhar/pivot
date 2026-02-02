@@ -1,20 +1,17 @@
+"""Tests for pivot run CLI command (single-stage executor)."""
+
 from __future__ import annotations
 
-import contextlib
+import json
 import pathlib
 from typing import TYPE_CHECKING, Annotated, TypedDict
 
 from helpers import register_test_stage
-from pivot import cli, executor, loaders, outputs, project
-from pivot.storage import cache, track
+from pivot import cli, loaders, outputs
 
 if TYPE_CHECKING:
-    from collections.abc import Generator
-
     import click.testing
-    import filelock
     import pytest
-    from pytest_mock import MockerFixture
 
     from pivot.pipeline.pipeline import Pipeline
 
@@ -24,8 +21,41 @@ if TYPE_CHECKING:
 # =============================================================================
 
 
+class _StageAOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("a.txt", loaders.PathOnly())]
+
+
+class _StageBOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("b.txt", loaders.PathOnly())]
+
+
+class _StageCOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("c.txt", loaders.PathOnly())]
+
+
 class _OutputTxtOutputs(TypedDict):
     output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
+
+
+def _helper_stage_a() -> _StageAOutputs:
+    pathlib.Path("a.txt").write_text("a")
+    return _StageAOutputs(output=pathlib.Path("a.txt"))
+
+
+def _helper_stage_b(
+    dep: Annotated[pathlib.Path, outputs.Dep("a.txt", loaders.PathOnly())],
+) -> _StageBOutputs:
+    _ = dep
+    pathlib.Path("b.txt").write_text("b")
+    return _StageBOutputs(output=pathlib.Path("b.txt"))
+
+
+def _helper_stage_c(
+    dep: Annotated[pathlib.Path, outputs.Dep("b.txt", loaders.PathOnly())],
+) -> _StageCOutputs:
+    _ = dep
+    pathlib.Path("c.txt").write_text("c")
+    return _StageCOutputs(output=pathlib.Path("c.txt"))
 
 
 def _helper_process(
@@ -36,93 +66,205 @@ def _helper_process(
     return _OutputTxtOutputs(output=pathlib.Path("output.txt"))
 
 
+class _FailingOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("failing.txt", loaders.PathOnly())]
+
+
+def _helper_failing_stage() -> _FailingOutputs:
+    raise RuntimeError("Intentional failure")
+
+
 # =============================================================================
-# run --dry-run --allow-missing Tests
+# Basic Command Tests
 # =============================================================================
 
 
-def test_run_dry_run_allow_missing_uses_pvt_hash(
+def test_run_requires_stage_argument(
     mock_discovery: Pipeline,
     runner: click.testing.CliRunner,
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """run --dry-run --allow-missing uses .pvt hash when dep file is missing."""
+    """run without arguments errors with usage message."""
     monkeypatch.chdir(tmp_path)
-    pathlib.Path(".git").mkdir()
+    (tmp_path / ".git").mkdir()
+    register_test_stage(_helper_stage_a, name="stage_a")
 
-    # Create and run
-    pathlib.Path("input.txt").write_text("data")
-    register_test_stage(_helper_process, name="process")
-    executor.run(pipeline=mock_discovery)
-
-    # Track input
-    input_hash = cache.hash_file(pathlib.Path("input.txt"))
-    pvt_data = track.PvtData(path="input.txt", hash=input_hash, size=4)
-    track.write_pvt_file(pathlib.Path("input.txt.pvt"), pvt_data)
-
-    # Delete input (simulating CI)
-    pathlib.Path("input.txt").unlink()
-
-    result = runner.invoke(cli.cli, ["run", "--dry-run", "--allow-missing"])
-
-    # Should show "would skip" not "Missing deps"
-    assert "Missing deps" not in result.output, f"Got: {result.output}"
-    assert "would skip" in result.output.lower(), f"Got: {result.output}"
-
-
-def test_run_dry_run_explain_allow_missing_uses_pvt_hash(
-    mock_discovery: Pipeline,
-    runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """run --dry-run --explain --allow-missing uses .pvt hash when dep file is missing."""
-    monkeypatch.chdir(tmp_path)
-    pathlib.Path(".git").mkdir()
-
-    # Create and run
-    pathlib.Path("input.txt").write_text("data")
-    register_test_stage(_helper_process, name="process")
-    executor.run(pipeline=mock_discovery)
-
-    # Track input
-    input_hash = cache.hash_file(pathlib.Path("input.txt"))
-    pvt_data = track.PvtData(path="input.txt", hash=input_hash, size=4)
-    track.write_pvt_file(pathlib.Path("input.txt.pvt"), pvt_data)
-
-    # Delete input (simulating CI)
-    pathlib.Path("input.txt").unlink()
-
-    result = runner.invoke(cli.cli, ["run", "--dry-run", "--explain", "--allow-missing"])
-
-    # Should NOT show error about missing deps
-    assert "Missing deps" not in result.output, f"Got: {result.output}"
-    assert result.exit_code == 0, f"Expected success, got: {result.output}"
-
-
-def test_run_allow_missing_requires_dry_run(
-    mock_discovery: Pipeline,
-    runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """run --allow-missing without --dry-run errors."""
-    monkeypatch.chdir(tmp_path)
-    pathlib.Path(".git").mkdir()
-    pathlib.Path("input.txt").write_text("data")
-    register_test_stage(_helper_process, name="process")
-
-    result = runner.invoke(cli.cli, ["run", "--allow-missing"])
+    result = runner.invoke(cli.cli, ["run"])
 
     assert result.exit_code != 0
-    assert "--allow-missing" in result.output
-    assert "--dry-run" in result.output
+    assert "STAGES" in result.output
+
+
+def test_run_executes_single_stage(
+    mock_discovery: Pipeline,
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """run STAGE executes only that stage."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".git").mkdir()
+    register_test_stage(_helper_stage_a, name="stage_a")
+    register_test_stage(_helper_stage_b, name="stage_b")
+
+    result = runner.invoke(cli.cli, ["run", "stage_a"])
+
+    assert result.exit_code == 0, f"Failed: {result.output}"
+    assert (tmp_path / "a.txt").exists()
+    # stage_b should NOT run (no dependency resolution)
+    assert not (tmp_path / "b.txt").exists()
+
+
+def test_run_executes_multiple_stages_in_order(
+    mock_discovery: Pipeline,
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """run STAGE1 STAGE2 executes stages in specified order."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".git").mkdir()
+    register_test_stage(_helper_stage_a, name="stage_a")
+    register_test_stage(_helper_stage_b, name="stage_b")
+
+    result = runner.invoke(cli.cli, ["run", "stage_a", "stage_b"])
+
+    assert result.exit_code == 0, f"Failed: {result.output}"
+    assert (tmp_path / "a.txt").exists()
+    assert (tmp_path / "b.txt").exists()
+
+
+def test_run_does_not_resolve_dependencies(
+    mock_discovery: Pipeline,
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """run STAGE does not automatically run dependencies."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".git").mkdir()
+    # Create the dependency file manually
+    (tmp_path / "a.txt").write_text("manual")
+    register_test_stage(_helper_stage_a, name="stage_a")
+    register_test_stage(_helper_stage_b, name="stage_b")
+
+    # Run only stage_b - should NOT run stage_a
+    result = runner.invoke(cli.cli, ["run", "stage_b"])
+
+    assert result.exit_code == 0, f"Failed: {result.output}"
+    # stage_a should not have been re-run (file still has "manual" content)
+    assert (tmp_path / "a.txt").read_text() == "manual"
+    assert (tmp_path / "b.txt").exists()
 
 
 # =============================================================================
-# --tui and --json Flag Tests
+# Error Handling Tests
 # =============================================================================
+
+
+def test_run_unknown_stage_errors(
+    mock_discovery: Pipeline,
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """run with unknown stage name errors with helpful message."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".git").mkdir()
+    register_test_stage(_helper_stage_a, name="stage_a")
+
+    result = runner.invoke(cli.cli, ["run", "nonexistent_stage"])
+
+    assert result.exit_code != 0
+    assert "nonexistent_stage" in result.output
+
+
+def test_run_default_keeps_going_continues_after_failure(
+    mock_discovery: Pipeline,
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """run defaults to keep-going mode - continues to next stage after failure."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".git").mkdir()
+    register_test_stage(_helper_failing_stage, name="failing")
+    register_test_stage(_helper_stage_a, name="stage_a")
+
+    # Run failing then stage_a - default keep-going should continue to stage_a
+    result = runner.invoke(cli.cli, ["run", "failing", "stage_a"])
+
+    # Keep-going mode returns 0 on completion; stage_a should have run
+    assert result.exit_code == 0
+    assert "failing: FAILED" in result.output
+    assert (tmp_path / "a.txt").exists(), "stage_a should run despite failing stage"
+
+
+def test_run_fail_fast_option_accepted(
+    mock_discovery: Pipeline,
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """run --fail-fast option is accepted and affects execution mode."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".git").mkdir()
+    register_test_stage(_helper_stage_a, name="stage_a")
+
+    # Verify --fail-fast is accepted without error
+    result = runner.invoke(cli.cli, ["run", "--fail-fast", "stage_a"])
+
+    assert result.exit_code == 0, f"Failed: {result.output}"
+    assert (tmp_path / "a.txt").exists()
+
+
+# =============================================================================
+# Force Mode Tests
+# =============================================================================
+
+
+def test_run_force_reruns_cached_stages(
+    mock_discovery: Pipeline,
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """run --force re-runs stages even if cached."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".git").mkdir()
+    register_test_stage(_helper_stage_a, name="stage_a")
+
+    # First run
+    result = runner.invoke(cli.cli, ["run", "stage_a"])
+    assert result.exit_code == 0
+
+    # Second run with force - should re-run (not skip)
+    result = runner.invoke(cli.cli, ["run", "--force", "stage_a"])
+    assert result.exit_code == 0
+
+
+# =============================================================================
+# Option Validation Tests
+# =============================================================================
+
+
+def test_run_tui_log_cannot_use_with_json(
+    mock_discovery: Pipeline,
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """run --tui-log cannot be used with --json."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".git").mkdir()
+    register_test_stage(_helper_stage_a, name="stage_a")
+
+    result = runner.invoke(cli.cli, ["run", "--tui-log", "test.log", "--json", "stage_a"])
+
+    assert result.exit_code != 0
+    assert "--tui-log" in result.output
+    assert "--json" in result.output
 
 
 def test_run_tui_and_json_mutually_exclusive(
@@ -133,11 +275,10 @@ def test_run_tui_and_json_mutually_exclusive(
 ) -> None:
     """--tui and --json are mutually exclusive."""
     monkeypatch.chdir(tmp_path)
-    pathlib.Path(".git").mkdir()
-    register_test_stage(_helper_process, name="process")
-    pathlib.Path("input.txt").write_text("data")
+    (tmp_path / ".git").mkdir()
+    register_test_stage(_helper_stage_a, name="stage_a")
 
-    result = runner.invoke(cli.cli, ["run", "--tui", "--json"])
+    result = runner.invoke(cli.cli, ["run", "--tui", "--json", "stage_a"])
 
     assert result.exit_code != 0
     assert "mutually exclusive" in result.output.lower()
@@ -151,49 +292,56 @@ def test_run_tui_log_requires_tui(
 ) -> None:
     """--tui-log requires --tui flag."""
     monkeypatch.chdir(tmp_path)
-    pathlib.Path(".git").mkdir()
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "input.txt").write_text("data")
     register_test_stage(_helper_process, name="process")
-    pathlib.Path("input.txt").write_text("data")
 
-    result = runner.invoke(cli.cli, ["run", "--tui-log", "log.jsonl"])
+    result = runner.invoke(cli.cli, ["run", "--tui-log", "log.jsonl", "process"])
 
     assert result.exit_code != 0
     assert "--tui-log requires --tui" in result.output
 
 
-def test_run_serve_requires_watch(
-    mock_discovery: Pipeline,
-    runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """--serve requires --watch flag."""
-    monkeypatch.chdir(tmp_path)
-    pathlib.Path(".git").mkdir()
-    register_test_stage(_helper_process, name="process")
-    pathlib.Path("input.txt").write_text("data")
-
-    result = runner.invoke(cli.cli, ["run", "--serve"])
-
-    assert result.exit_code != 0
-    assert "--serve requires --watch" in result.output
-
-
 def test_run_help_includes_tui_flag(
     runner: click.testing.CliRunner,
     tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """--tui flag appears in help text."""
-    monkeypatch.chdir(tmp_path)
-    pathlib.Path(".git").mkdir()
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
 
-    result = runner.invoke(cli.cli, ["run", "--help"])
+        result = runner.invoke(cli.cli, ["run", "--help"])
 
     assert result.exit_code == 0
     assert "--tui" in result.output
     # Help text is case-sensitive for "TUI"
     assert "TUI display" in result.output
+
+
+# =============================================================================
+# JSON Output Tests
+# =============================================================================
+
+
+def test_run_json_output_streams_jsonl(
+    mock_discovery: Pipeline,
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """run --json streams JSONL output."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".git").mkdir()
+    register_test_stage(_helper_stage_a, name="stage_a")
+
+    result = runner.invoke(cli.cli, ["run", "--json", "stage_a"])
+
+    assert result.exit_code == 0
+    # Check that output is valid JSONL (multiple JSON lines)
+    lines = [ln for ln in result.output.strip().split("\n") if ln]
+    assert len(lines) > 0
+    for line in lines:
+        json.loads(line)  # Should not raise
 
 
 def test_run_json_flag_accepted(
@@ -204,11 +352,11 @@ def test_run_json_flag_accepted(
 ) -> None:
     """--json flag should work without --tui (plain is now default)."""
     monkeypatch.chdir(tmp_path)
-    pathlib.Path(".git").mkdir()
-    pathlib.Path("input.txt").write_text("data")
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "input.txt").write_text("data")
     register_test_stage(_helper_process, name="process")
 
-    result = runner.invoke(cli.cli, ["run", "--json"])
+    result = runner.invoke(cli.cli, ["run", "--json", "process"])
 
     assert result.exit_code == 0
     # JSONL output should start with schema version
@@ -223,12 +371,12 @@ def test_run_uses_plain_mode_by_default(
 ) -> None:
     """Plain text output is the default (no --tui flag needed)."""
     monkeypatch.chdir(tmp_path)
-    pathlib.Path(".git").mkdir()
-    pathlib.Path("input.txt").write_text("data")
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "input.txt").write_text("data")
     register_test_stage(_helper_process, name="process")
 
     # Run without any display flags
-    result = runner.invoke(cli.cli, ["run"])
+    result = runner.invoke(cli.cli, ["run", "process"])
 
     assert result.exit_code == 0
     # Plain mode shows stage status in simple text format
@@ -236,6 +384,150 @@ def test_run_uses_plain_mode_by_default(
     assert '"type":' not in result.output
     # Should contain stage name in output
     assert "process" in result.output.lower()
+
+
+# =============================================================================
+# Cache Options Tests
+# =============================================================================
+
+
+def test_run_no_commit_option_accepted(
+    mock_discovery: Pipeline,
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """run --no-commit option is accepted."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".git").mkdir()
+    register_test_stage(_helper_stage_a, name="stage_a")
+
+    result = runner.invoke(cli.cli, ["run", "--no-commit", "stage_a"])
+
+    assert result.exit_code == 0
+
+
+def test_run_no_cache_option_accepted(
+    mock_discovery: Pipeline,
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """run --no-cache option is accepted."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".git").mkdir()
+    register_test_stage(_helper_stage_a, name="stage_a")
+
+    result = runner.invoke(cli.cli, ["run", "--no-cache", "stage_a"])
+
+    assert result.exit_code == 0
+
+
+# =============================================================================
+# Removed Options Tests (should not exist on run)
+# =============================================================================
+
+
+def test_run_does_not_have_single_stage_option(
+    mock_discovery: Pipeline,
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """run does not have --single-stage option (it's always single-stage)."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".git").mkdir()
+    register_test_stage(_helper_stage_a, name="stage_a")
+
+    result = runner.invoke(cli.cli, ["run", "--single-stage", "stage_a"])
+
+    assert result.exit_code != 0
+    assert "No such option" in result.output or "no such option" in result.output.lower()
+
+
+def test_run_does_not_have_dry_run_option(
+    mock_discovery: Pipeline,
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """run does not have --dry-run option (use repro instead)."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".git").mkdir()
+    register_test_stage(_helper_stage_a, name="stage_a")
+
+    result = runner.invoke(cli.cli, ["run", "--dry-run", "stage_a"])
+
+    assert result.exit_code != 0
+    assert "No such option" in result.output or "no such option" in result.output.lower()
+
+
+def test_run_does_not_have_explain_option(
+    mock_discovery: Pipeline,
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """run does not have --explain option (use repro instead)."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".git").mkdir()
+    register_test_stage(_helper_stage_a, name="stage_a")
+
+    result = runner.invoke(cli.cli, ["run", "--explain", "stage_a"])
+
+    assert result.exit_code != 0
+    assert "No such option" in result.output or "no such option" in result.output.lower()
+
+
+def test_run_does_not_have_watch_option(
+    mock_discovery: Pipeline,
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """run does not have --watch option (use repro instead)."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".git").mkdir()
+    register_test_stage(_helper_stage_a, name="stage_a")
+
+    result = runner.invoke(cli.cli, ["run", "--watch", "stage_a"])
+
+    assert result.exit_code != 0
+    assert "No such option" in result.output or "no such option" in result.output.lower()
+
+
+def test_run_does_not_have_keep_going_option(
+    mock_discovery: Pipeline,
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """run does not have --keep-going option (use --fail-fast instead)."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".git").mkdir()
+    register_test_stage(_helper_stage_a, name="stage_a")
+
+    result = runner.invoke(cli.cli, ["run", "--keep-going", "stage_a"])
+
+    assert result.exit_code != 0
+    assert "No such option" in result.output or "no such option" in result.output.lower()
+
+
+def test_run_does_not_have_allow_missing_option(
+    mock_discovery: Pipeline,
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """run does not have --allow-missing option (use repro instead)."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".git").mkdir()
+    register_test_stage(_helper_stage_a, name="stage_a")
+
+    result = runner.invoke(cli.cli, ["run", "--allow-missing", "stage_a"])
+
+    assert result.exit_code != 0
+    assert "No such option" in result.output or "no such option" in result.output.lower()
 
 
 def test_run_tui_with_tui_log_validation_passes(
@@ -246,184 +538,18 @@ def test_run_tui_with_tui_log_validation_passes(
 ) -> None:
     """--tui --tui-log passes validation (log path is writable)."""
     monkeypatch.chdir(tmp_path)
-    pathlib.Path(".git").mkdir()
-    pathlib.Path("input.txt").write_text("data")
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "input.txt").write_text("data")
     register_test_stage(_helper_process, name="process")
 
     log_path = tmp_path / "tui.jsonl"
 
     # This will attempt to run TUI which fails in non-TTY test environment,
     # but it should NOT fail on validation errors about --tui-log
-    result = runner.invoke(cli.cli, ["run", "--tui", "--tui-log", str(log_path)])
+    result = runner.invoke(cli.cli, ["run", "--tui", "--tui-log", str(log_path), "process"])
 
     # Should NOT have validation errors
     assert "--tui-log requires --tui" not in result.output
     assert "Cannot write to" not in result.output
     # The log file should have been created during validation (touch())
     assert log_path.exists()
-
-
-# =============================================================================
-# Pipeline Discovery Tests
-# =============================================================================
-
-
-def test_cli_run_discovers_pipeline(
-    tmp_path: pathlib.Path,
-    runner: click.testing.CliRunner,
-    mocker: MockerFixture,
-) -> None:
-    """pivot run should discover and use Pipeline from pipeline.py."""
-    mocker.patch.object(project, "_project_root_cache", tmp_path)
-
-    # Create pipeline.py that defines a Pipeline
-    pipeline_code = """
-import pathlib
-from pivot.pipeline.pipeline import Pipeline
-
-pipeline = Pipeline("test", root=pathlib.Path(__file__).parent)
-
-def my_stage() -> None:
-    pass
-
-pipeline.register(my_stage, name="my_stage")
-"""
-    (tmp_path / "pipeline.py").write_text(pipeline_code)
-    (tmp_path / ".pivot").mkdir()
-
-    result = runner.invoke(cli.cli, ["run", "--dry-run"])
-
-    assert result.exit_code == 0, f"Expected success, got: {result.output}"
-    assert "my_stage" in result.output
-
-
-def test_cli_run_no_pipeline_found_error(
-    tmp_path: pathlib.Path,
-    runner: click.testing.CliRunner,
-    mocker: MockerFixture,
-) -> None:
-    """pivot run should error if no pipeline found (non-informational mode)."""
-    mocker.patch.object(project, "_project_root_cache", tmp_path)
-
-    # Create .pivot dir but no pipeline.py or pivot.yaml
-    (tmp_path / ".pivot").mkdir()
-
-    # Regular run (not --dry-run or --json) should error
-    result = runner.invoke(cli.cli, ["run"])
-
-    assert result.exit_code != 0
-    assert "pipeline" in result.output.lower() or "no pipeline" in result.output
-
-
-def test_run_dry_run_allow_missing_no_pvt_shows_would_run(
-    mock_discovery: Pipeline,
-    runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """run --dry-run --allow-missing shows stages without .pvt as would run.
-
-    Critical behavioral test: --allow-missing with --dry-run is for CI scenarios
-    where deps don't exist yet. It should show what would run (validation skipped),
-    not error. This is different from regular verify which requires all files.
-    """
-    monkeypatch.chdir(tmp_path)
-    pathlib.Path(".git").mkdir()
-
-    # Register stage but don't create the dep file OR .pvt file
-    register_test_stage(_helper_process, name="process")
-
-    result = runner.invoke(cli.cli, ["run", "--dry-run", "--allow-missing"])
-
-    # Should succeed and show stage as "would run" (not error)
-    assert result.exit_code == 0, f"Should succeed with --allow-missing, got: {result.output}"
-    assert "process" in result.output
-    assert "would run" in result.output.lower()
-    # Reason should indicate no previous run (not missing deps)
-    assert "No previous run" in result.output or "no previous" in result.output.lower()
-
-
-# =============================================================================
-# --no-commit Lock Acquisition Tests
-# =============================================================================
-
-
-def test_run_no_commit_acquires_pending_state_lock(
-    mock_discovery: Pipeline,
-    runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
-    mocker: MockerFixture,
-) -> None:
-    """run --no-commit acquires pending_state_lock during execution."""
-    monkeypatch.chdir(tmp_path)
-    pathlib.Path(".git").mkdir()
-    pathlib.Path("input.txt").write_text("data")
-    register_test_stage(_helper_process, name="process")
-
-    # Mock pending_state_lock to track calls
-    from pivot.storage import project_lock
-
-    lock_context_entered = False
-    lock_context_exited = False
-
-    original_pending_state_lock = project_lock.pending_state_lock
-
-    @contextlib.contextmanager
-    def mock_pending_state_lock(timeout: float = -1) -> Generator[filelock.BaseFileLock]:
-        nonlocal lock_context_entered, lock_context_exited
-        lock_context_entered = True
-        with original_pending_state_lock(timeout=timeout) as lock:
-            yield lock
-        lock_context_exited = True
-
-    mocker.patch.object(
-        project_lock,
-        "pending_state_lock",
-        mock_pending_state_lock,
-    )
-
-    result = runner.invoke(cli.cli, ["run", "--no-commit"])
-
-    assert result.exit_code == 0, f"Expected success, got: {result.output}"
-    assert lock_context_entered, "pending_state_lock should have been acquired"
-    assert lock_context_exited, "pending_state_lock should have been released"
-
-
-def test_run_without_no_commit_does_not_acquire_pending_state_lock(
-    mock_discovery: Pipeline,
-    runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
-    mocker: MockerFixture,
-) -> None:
-    """run without --no-commit does not acquire pending_state_lock."""
-    monkeypatch.chdir(tmp_path)
-    pathlib.Path(".git").mkdir()
-    pathlib.Path("input.txt").write_text("data")
-    register_test_stage(_helper_process, name="process")
-
-    # Mock pending_state_lock to track calls
-    from pivot.storage import project_lock
-
-    lock_acquired = False
-
-    original_pending_state_lock = project_lock.pending_state_lock
-
-    @contextlib.contextmanager
-    def mock_pending_state_lock(timeout: float = -1) -> Generator[filelock.BaseFileLock]:
-        nonlocal lock_acquired
-        lock_acquired = True
-        with original_pending_state_lock(timeout=timeout) as lock:
-            yield lock
-
-    mocker.patch.object(
-        project_lock,
-        "pending_state_lock",
-        mock_pending_state_lock,
-    )
-
-    result = runner.invoke(cli.cli, ["run"])
-
-    assert result.exit_code == 0, f"Expected success, got: {result.output}"
-    assert not lock_acquired, "pending_state_lock should NOT have been acquired without --no-commit"

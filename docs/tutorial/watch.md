@@ -15,7 +15,7 @@ Complete the Quick Start tutorial. You should have:
 Instead of running once, keep Pivot watching for changes:
 
 ```bash
-pivot run --watch
+pivot repro --watch
 ```
 
 Pivot will:
@@ -30,7 +30,7 @@ For an interactive interface, add the `--tui` flag. This shows a two-panel layou
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│  pivot run --watch --tui                                             │
+│  pivot repro --watch --tui                                          │
 ├─────────────────────────────────────────────────────────────────────┤
 │  Stages (2) $2                         │  train $ LIVE              │
 │  ─────────────────────────────────────┼──────────────────────────────│
@@ -113,10 +113,10 @@ Some editors save multiple times in quick succession. The `--debounce` flag cont
 
 ```bash
 # Longer debounce for slow editors/network drives
-pivot run --watch --debounce 1000
+pivot repro --watch --debounce 1000
 
 # Shorter debounce for fast iteration
-pivot run --watch --debounce 100
+pivot repro --watch --debounce 100
 ```
 
 Default is 300ms.
@@ -130,7 +130,7 @@ Default is 300ms.
 Watch mode outputs plain text by default:
 
 ```bash
-pivot run --watch
+pivot repro --watch
 ```
 
 ### Interactive TUI
@@ -138,7 +138,7 @@ pivot run --watch
 For the interactive TUI with the two-panel layout described above, use the `--tui` flag:
 
 ```bash
-pivot run --watch --tui
+pivot repro --watch --tui
 ```
 
 ## Best Practices

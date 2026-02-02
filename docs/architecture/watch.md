@@ -7,7 +7,7 @@ Watch mode provides continuous pipeline monitoring and automatic re-execution wh
 Watch mode uses the same Engine as batch mode, with a FilesystemSource for continuous event production:
 
 ```bash
-pivot run --watch
+pivot repro --watch
 ```
 
 The Engine monitors:
@@ -53,8 +53,8 @@ The same Engine code handles both batch and watch mode:
 
 | Mode | Entry Point | Event Source |
 |------|-------------|--------------|
-| Batch (`pivot run`) | `engine.run(exit_on_completion=True)` | OneShotSource |
-| Watch (`pivot run --watch`) | `engine.run(exit_on_completion=False)` | FilesystemSource |
+| Batch (`pivot repro`) | `engine.run(exit_on_completion=True)` | OneShotSource |
+| Watch (`pivot repro --watch`) | `engine.run(exit_on_completion=False)` | FilesystemSource |
 
 This unified architecture eliminates divergent code paths between batch and watch modes. Both modes use identical sink configuration, ensuring flags like `--quiet` work consistently.
 
@@ -91,7 +91,7 @@ Stage outputs are filtered to prevent infinite loops. The Engine tracks stage ex
 For IDE integrations and automation:
 
 ```bash
-pivot run --watch --json
+pivot repro --watch --json
 ```
 
 This uses a JsonlSink instead of TuiSink, emitting newline-delimited JSON events:
@@ -101,7 +101,7 @@ This uses a JsonlSink instead of TuiSink, emitting newline-delimited JSON events
 | `stage_start` | Stage began execution (stage, index, total) |
 | `stage_complete` | Stage finished (stage, status, reason, duration_ms, index, total) |
 
-Note: JsonlSink translates internal engine events to the existing `pivot run --json` format for backwards compatibility. Other engine events (state changes, log lines, pipeline reloads) are not emitted in JSON mode.
+Note: JsonlSink translates internal engine events to the existing `pivot repro --json` format for backwards compatibility. Other engine events (state changes, log lines, pipeline reloads) are not emitted in JSON mode.
 
 ## Worker Pool Management
 

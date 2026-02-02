@@ -6,15 +6,16 @@ Complete reference for all Pivot command-line commands.
 
 | Task | Command |
 |------|---------|
-| Run pipeline | `pivot run` |
-| Run specific stages | `pivot run stage1 stage2` |
-| See what would run | `pivot run -n` |
+| Run pipeline | `pivot repro` |
+| Run specific stages + deps | `pivot repro stage1 stage2` |
+| Run single stage (no deps) | `pivot run stage` |
+| See what would run | `pivot repro -n` |
 | Understand why stage runs | `pivot status --explain stage` |
 | List all stages | `pivot list` |
 | Show stage status | `pivot status` |
 | Push outputs to remote | `pivot push` |
 | Pull outputs from remote | `pivot pull` |
-| Watch for changes | `pivot run --watch` |
+| Watch for changes | `pivot repro --watch` |
 
 ---
 
@@ -42,12 +43,12 @@ All commands support:
 
 ## Pipeline Execution
 
-### `pivot run`
+### `pivot repro`
 
-Execute pipeline stages.
+Reproduce pipeline stages with full dependency resolution. This is the primary command for running pipelines.
 
 ```bash
-pivot run [STAGES...] [OPTIONS]
+pivot repro [STAGES...] [OPTIONS]
 ```
 
 **Arguments:**
@@ -58,39 +59,80 @@ pivot run [STAGES...] [OPTIONS]
 
 | Option | Description |
 |--------|-------------|
-| `--single-stage` / `-s` | Run only specified stages without dependencies |
 | `--dry-run` / `-n` | Show what would run without executing |
 | `--explain` / `-e` | Show detailed breakdown of why stages run |
 | `--force` / `-f` | Force re-run of stages, ignoring cache (in --watch mode, first run only) |
 | `--watch` / `-w` | Watch for file changes and re-run affected stages |
-| `--debounce MS` | Debounce delay in milliseconds (default: 300) |
+| `--debounce MS` | Debounce delay in milliseconds (default: 300, requires --watch) |
 | `--tui` | Use interactive TUI display (default: plain text) |
 | `--json` | Output results as JSON |
 | `--tui-log PATH` | Write TUI messages to JSONL file for monitoring |
 | `--no-commit` | Defer lock files to pending dir for faster iteration |
 | `--no-cache` | Skip caching outputs entirely for maximum iteration speed |
-| `--keep-going` / `-k` | Continue running stages after failures |
+| `--keep-going` / `-k` | Continue running stages after failures (default: fail-fast) |
 | `--serve` | Start RPC server for agent control (requires --watch) |
+| `--allow-uncached-incremental` | Allow running stages with IncrementalOut files not in cache |
+| `--checkout-missing` | Restore tracked files from cache before running |
+| `--allow-missing` | Allow missing dep files if tracked (only with --dry-run or --explain) |
+
+**Examples:**
+
+```bash
+# Run entire pipeline
+pivot repro
+
+# Run specific stages and their dependencies
+pivot repro train evaluate
+
+# See what would run
+pivot repro --dry-run
+
+# Watch mode - re-run on file changes
+pivot repro --watch
+
+# Continue after failures
+pivot repro --keep-going
+```
+
+---
+
+### `pivot run`
+
+Execute specified stages directly, without resolving dependencies. Use this when you want to run specific stages in a specific order.
+
+```bash
+pivot run STAGES... [OPTIONS]
+```
+
+**Arguments:**
+
+- `STAGES` - Stage names to run (required, at least one)
+
+**Options:**
+
+| Option | Description |
+|--------|-------------|
+| `--force` / `-f` | Force re-run of stages, ignoring cache |
+| `--tui` | Use interactive TUI display (default: plain text) |
+| `--json` | Output results as JSON |
+| `--tui-log PATH` | Write TUI messages to JSONL file for monitoring |
+| `--no-commit` | Defer lock files to pending dir for faster iteration |
+| `--no-cache` | Skip caching outputs entirely for maximum iteration speed |
+| `--fail-fast` | Stop on first failure (default: keep-going) |
 | `--allow-uncached-incremental` | Allow running stages with IncrementalOut files not in cache |
 | `--checkout-missing` | Restore tracked files from cache before running |
 
 **Examples:**
 
 ```bash
-# Run all stages
-pivot run
+# Run a single stage (no dependencies)
+pivot run train
 
-# Run specific stages
+# Run multiple stages in order
 pivot run preprocess train
 
-# Run single stage without dependencies
-pivot run train --single-stage
-
-# Dry run
-pivot run --dry-run
-
-# Watch mode
-pivot run --watch
+# Stop immediately on failure
+pivot run preprocess train --fail-fast
 ```
 
 ---

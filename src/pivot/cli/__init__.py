@@ -8,7 +8,7 @@ import click
 
 # Command categories for organized help output
 COMMAND_CATEGORIES = {
-    "Pipeline": ["run", "status", "verify", "commit"],
+    "Pipeline": ["run", "repro", "status", "verify", "commit"],
     "Inspection": ["list", "dag", "metrics", "params", "plots", "data", "history", "show"],
     "Versioning": ["track", "checkout"],
     "Remote": ["remote", "push", "pull"],
@@ -28,6 +28,7 @@ COMMAND_CATEGORIES = {
 _LAZY_COMMANDS: dict[str, tuple[str, str, str]] = {
     "init": ("pivot.cli.init", "init", "Initialize a new Pivot project."),
     "run": ("pivot.cli.run", "run", "Execute pipeline stages."),
+    "repro": ("pivot.cli.repro", "repro", "Reproduce pipeline with full DAG resolution."),
     "dag": ("pivot.cli.dag", "dag_cmd", "Visualize pipeline DAG."),
     "list": ("pivot.cli.list", "list_cmd", "List registered stages."),
     "export": ("pivot.cli.export", "export", "Export pipeline to DVC YAML format."),

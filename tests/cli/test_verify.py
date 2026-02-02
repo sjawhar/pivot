@@ -705,7 +705,7 @@ def test_verify_allow_missing_uses_pvt_hash_for_nested_dep(
     (data_dir / "file.csv").write_text("content")
 
     register_test_stage(_helper_dir_dep_stage, name="process")
-    run_result = runner.invoke(cli.cli, ["run"])
+    run_result = runner.invoke(cli.cli, ["repro"])
     assert run_result.exit_code == 0, f"Run failed: {run_result.output}"
 
     # Track the directory (create .pvt with manifest)

@@ -118,17 +118,9 @@ def test_cli_run_help(runner: CliRunner) -> None:
     """Run subcommand should show its own help."""
     result = runner.invoke(cli.cli, ["run", "--help"])
     assert result.exit_code == 0
-    assert "--single-stage" in result.output
-    assert "--dry-run" in result.output
-
-
-def test_cli_run_no_stages_registered(runner: CliRunner, tmp_path: pathlib.Path) -> None:
-    """Run with no stages should error when no pipeline found."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        (pathlib.Path.cwd() / ".git").mkdir()
-        result = runner.invoke(cli.cli, ["run"])
-        assert result.exit_code != 0
-        assert "pipeline" in result.output.lower() or "no pipeline" in result.output
+    # run always uses single-stage mode, no --single-stage or --dry-run options
+    assert "--fail-fast" in result.output
+    assert "--force" in result.output
 
 
 def test_cli_verbose_accepted(runner: CliRunner) -> None:
@@ -170,7 +162,7 @@ def test_cli_list_verbose_shows_details(
 
 
 # =============================================================================
-# Dry-Run Command Tests
+# Dry-Run Command Tests (repro command)
 # =============================================================================
 
 
@@ -201,7 +193,7 @@ def process(
 pipeline.register(process)
 """)
 
-        result = runner.invoke(cli.cli, ["run", "--dry-run"])
+        result = runner.invoke(cli.cli, ["repro", "--dry-run"])
 
         assert result.exit_code == 0
         assert "Would run:" in result.output
@@ -238,11 +230,11 @@ pipeline.register(process)
 """)
 
         # First, actually run to create lock file
-        result1 = runner.invoke(cli.cli, ["run"])
+        result1 = runner.invoke(cli.cli, ["run", "process"])
         assert result1.exit_code == 0, f"First run failed: {result1.output}"
 
         # Now dry-run should show as unchanged
-        result = runner.invoke(cli.cli, ["run", "--dry-run"])
+        result = runner.invoke(cli.cli, ["repro", "--dry-run"])
 
         assert result.exit_code == 0
         assert "process" in result.output
@@ -278,11 +270,11 @@ pipeline.register(process)
 """)
 
         # First, actually run to create lock file
-        result1 = runner.invoke(cli.cli, ["run"])
+        result1 = runner.invoke(cli.cli, ["run", "process"])
         assert result1.exit_code == 0, f"First run failed: {result1.output}"
 
         # Now dry-run with --force should show as 'would run (forced)'
-        result = runner.invoke(cli.cli, ["run", "--dry-run", "--force"])
+        result = runner.invoke(cli.cli, ["repro", "--dry-run", "--force"])
 
         assert result.exit_code == 0
         assert "process" in result.output
@@ -317,7 +309,7 @@ def process(
 pipeline.register(process)
 """)
 
-        result = runner.invoke(cli.cli, ["run", "--dry-run"])
+        result = runner.invoke(cli.cli, ["repro", "--dry-run"])
 
         # This should fail because the dependency doesn't exist
         assert result.exit_code != 0
@@ -337,7 +329,7 @@ from pivot.pipeline.pipeline import Pipeline
 pipeline = Pipeline('test')
 """)
 
-        result = runner.invoke(cli.cli, ["run", "--dry-run"])
+        result = runner.invoke(cli.cli, ["repro", "--dry-run"])
 
         assert result.exit_code == 0
         assert "No stages" in result.output
@@ -380,7 +372,7 @@ pipeline.register(stage_a)
 pipeline.register(stage_b)
 """)
 
-        result = runner.invoke(cli.cli, ["run", "--dry-run", "stage_a"])
+        result = runner.invoke(cli.cli, ["repro", "--dry-run", "stage_a"])
 
         assert result.exit_code == 0
         assert "stage_a" in result.output
@@ -414,7 +406,7 @@ def process(
 pipeline.register(process)
 """)
 
-        result = runner.invoke(cli.cli, ["--quiet", "run", "--dry-run", "--json"])
+        result = runner.invoke(cli.cli, ["--quiet", "repro", "--dry-run", "--json"])
 
         assert result.exit_code == 0
         data = json.loads(result.output)
@@ -437,7 +429,7 @@ from pivot.pipeline.pipeline import Pipeline
 pipeline = Pipeline('test')
 """)
 
-        result = runner.invoke(cli.cli, ["--quiet", "run", "--dry-run", "--json"])
+        result = runner.invoke(cli.cli, ["--quiet", "repro", "--dry-run", "--json"])
 
         assert result.exit_code == 0
         data = json.loads(result.output)
@@ -473,11 +465,11 @@ pipeline.register(process)
 """)
 
         # First, actually run to create lock file
-        result1 = runner.invoke(cli.cli, ["run"])
+        result1 = runner.invoke(cli.cli, ["run", "process"])
         assert result1.exit_code == 0, f"First run failed: {result1.output}"
 
         # Now dry-run with --force --json (--quiet to suppress logging)
-        result = runner.invoke(cli.cli, ["--quiet", "run", "--dry-run", "--force", "--json"])
+        result = runner.invoke(cli.cli, ["--quiet", "repro", "--dry-run", "--force", "--json"])
 
         assert result.exit_code == 0
         data = json.loads(result.output)
@@ -508,7 +500,7 @@ def test_cli_dry_run_exception_shows_error(runner: CliRunner, tmp_path: pathlib.
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
 
-        result = runner.invoke(cli.cli, ["run", "--dry-run", "nonexistent"])
+        result = runner.invoke(cli.cli, ["repro", "--dry-run", "nonexistent"])
 
         assert result.exit_code != 0
 
@@ -546,7 +538,7 @@ def my_stage(
 pipeline.register(my_stage)
 """)
 
-        result = runner.invoke(cli.cli, ["run"])
+        result = runner.invoke(cli.cli, ["run", "my_stage"])
 
         assert result.exit_code == 0
         assert "my_stage" in result.output
@@ -583,7 +575,7 @@ pipeline.register(my_stage)
 """)
 
         # First run via CLI
-        result1 = runner.invoke(cli.cli, ["run"])
+        result1 = runner.invoke(cli.cli, ["run", "my_stage"])
         assert result1.exit_code == 0
         assert "ran" in result1.output.lower()
 
@@ -591,7 +583,7 @@ pipeline.register(my_stage)
         console._console = None
 
         # Second run via CLI - should skip
-        result2 = runner.invoke(cli.cli, ["run"])
+        result2 = runner.invoke(cli.cli, ["run", "my_stage"])
 
         assert result2.exit_code == 0
         assert "cached" in result2.output.lower()
@@ -731,7 +723,7 @@ def my_stage(
 pipeline.register(my_stage)
 """)
 
-        result = runner.invoke(cli.cli, ["--quiet", "run", "--json"])
+        result = runner.invoke(cli.cli, ["--quiet", "run", "--json", "my_stage"])
 
         assert result.exit_code == 0
         lines = [line for line in result.output.strip().split("\n") if line]
@@ -770,7 +762,7 @@ def my_stage(
 pipeline.register(my_stage)
 """)
 
-        result = runner.invoke(cli.cli, ["--quiet", "run", "--json"])
+        result = runner.invoke(cli.cli, ["--quiet", "run", "--json", "my_stage"])
 
         assert result.exit_code == 0
         events = [json.loads(line) for line in result.output.strip().split("\n") if line]
@@ -808,7 +800,7 @@ def my_stage(
 pipeline.register(my_stage)
 """)
 
-        result = runner.invoke(cli.cli, ["--quiet", "run", "--json"])
+        result = runner.invoke(cli.cli, ["--quiet", "run", "--json", "my_stage"])
 
         assert result.exit_code == 0
         events = [json.loads(line) for line in result.output.strip().split("\n") if line]
@@ -821,8 +813,8 @@ pipeline.register(my_stage)
         assert "total_duration_ms" in last_event
 
 
-def test_cli_run_json_no_stages_emits_events(runner: CliRunner, tmp_path: pathlib.Path) -> None:
-    """pivot run --json emits events even with no stages."""
+def test_cli_repro_json_no_stages_emits_events(runner: CliRunner, tmp_path: pathlib.Path) -> None:
+    """pivot repro --json emits events even with no stages (run requires stages)."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
 
@@ -834,7 +826,8 @@ from pivot.pipeline.pipeline import Pipeline
 pipeline = Pipeline('test')
 """)
 
-        result = runner.invoke(cli.cli, ["--quiet", "run", "--json"])
+        # Use repro for "no stages" case since run requires at least one stage
+        result = runner.invoke(cli.cli, ["--quiet", "repro", "--json"])
 
         assert result.exit_code == 0
         events = [json.loads(line) for line in result.output.strip().split("\n") if line]
@@ -874,7 +867,7 @@ def my_stage(
 pipeline.register(my_stage)
 """)
 
-        result = runner.invoke(cli.cli, ["--quiet", "run", "--json"])
+        result = runner.invoke(cli.cli, ["--quiet", "run", "--json", "my_stage"])
 
         assert result.exit_code == 0
         events = [json.loads(line) for line in result.output.strip().split("\n") if line]
@@ -947,7 +940,7 @@ def test_stage() -> _TestOutputs:
 pipeline.register(test_stage)
 """)
 
-        result = runner.invoke(cli.cli, ["--quiet", "run"])
+        result = runner.invoke(cli.cli, ["--quiet", "run", "test_stage"])
 
         assert result.exit_code == 0, f"Run failed: {result.output}"
         assert result.output.strip() == "", "Quiet mode should suppress all output"
@@ -1074,7 +1067,7 @@ def test_cli_history_quiet_produces_no_output(runner: CliRunner, tmp_path: pathl
 
 
 def test_cli_dry_run_quiet_suppresses_output(runner: CliRunner, tmp_path: pathlib.Path) -> None:
-    """pivot --quiet run --dry-run should suppress output."""
+    """pivot --quiet repro --dry-run should suppress output."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
@@ -1100,7 +1093,7 @@ def process(
 pipeline.register(process)
 """)
 
-        result = runner.invoke(cli.cli, ["--quiet", "run", "--dry-run"])
+        result = runner.invoke(cli.cli, ["--quiet", "repro", "--dry-run"])
 
         assert result.exit_code == 0
         assert result.output.strip() == "", (
@@ -1141,7 +1134,7 @@ def my_stage(
 pipeline.register(my_stage)
 """)
 
-        result = runner.invoke(cli.cli, ["run"], env={"PIVOT_METRICS": "1"})
+        result = runner.invoke(cli.cli, ["run", "my_stage"], env={"PIVOT_METRICS": "1"})
 
         assert result.exit_code == 0
         assert "Metrics:" in result.output
@@ -1178,7 +1171,7 @@ def my_stage(
 pipeline.register(my_stage)
 """)
 
-        result = runner.invoke(cli.cli, ["run"])
+        result = runner.invoke(cli.cli, ["run", "my_stage"])
 
         assert result.exit_code == 0
         assert "Metrics:" not in result.output
