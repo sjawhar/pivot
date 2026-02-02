@@ -116,6 +116,9 @@ See the [Quick Start](getting-started/quickstart.md) to build your first pipelin
 - Python 3.13+
 - Unix only (Linux/macOS)
 
+!!! note "Loaders and Protocols"
+    `Dep()` accepts any `Reader[R]` and `Out()` accepts any `Writer[W]`. Built-in loaders like `CSV()` and `PathOnly()` implement both protocols.
+
 ## Learn More
 
 - [Tutorials](tutorial/watch.md) - Watch mode, parameters, CI integration

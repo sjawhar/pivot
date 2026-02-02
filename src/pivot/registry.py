@@ -7,7 +7,7 @@ import logging
 import pathlib
 import re
 from difflib import get_close_matches
-from typing import TYPE_CHECKING, Any, TypedDict
+from typing import TYPE_CHECKING, Any, TypedDict, cast
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
@@ -82,7 +82,7 @@ class RegistryStageInfo(TypedDict):
     # deps_paths: Flat list for DAG construction and fingerprint hashing
     deps: dict[str, outputs.PathType]
     deps_paths: list[str]
-    outs: list[outputs.Out[Any]]
+    outs: list[outputs.BaseOut]
     outs_paths: list[str]
     params: stage_def.StageParams | None
     mutex: list[str]
@@ -90,7 +90,7 @@ class RegistryStageInfo(TypedDict):
     signature: Signature | None
     fingerprint: dict[str, str]
     dep_specs: dict[str, stage_def.FuncDepSpec]
-    out_specs: dict[str, outputs.Out[Any]]
+    out_specs: dict[str, outputs.BaseOut]
     params_arg_name: str | None
     state_dir: pathlib.Path | None
 
@@ -117,16 +117,41 @@ def _normalize_out_override(value: OutOverrideInput) -> OutOverride:
 
 
 def _apply_out_overrides(
-    out_spec: outputs.Out[Any],
+    out_spec: outputs.BaseOut,
     override: OutOverride | None,
-) -> outputs.Out[Any]:
-    """Apply path and option overrides to an Out spec, preserving subclass type and loader.
+) -> outputs.BaseOut:
+    """Apply path and option overrides to an output spec, preserving subclass type and loader.
 
-    Does NOT expand multi-file paths - returns a single Out with the resolved path (may be list/tuple).
+    Does NOT expand multi-file paths - returns a single output with the resolved path (may be list/tuple).
     Expansion for DAG/caching is handled separately.
 
-    Returns a single Out object with overrides applied.
+    Returns a single output object with overrides applied.
     """
+    # DirectoryOut has str path (ends with '/'), can't be overridden the same way
+    if isinstance(out_spec, outputs.DirectoryOut):
+        # Cast to DirectoryOut[Any] - isinstance narrows but basedpyright keeps Unknown params
+        dir_out = cast("outputs.DirectoryOut[Any]", out_spec)
+        if override:
+            path = override["path"]
+            if not isinstance(path, str) or not path.endswith("/"):
+                raise exceptions.ValidationError(
+                    f"DirectoryOut path override must be a string ending with '/': {path!r}"
+                )
+            cache = override.get("cache", dir_out.cache)
+            return dataclasses.replace(dir_out, path=path, cache=cache)
+        return dir_out
+
+    # IncrementalOut - can update cache but not path (handled by _resolve_out_spec)
+    if isinstance(out_spec, outputs.IncrementalOut):
+        # Cast to IncrementalOut[Any, Any] - isinstance narrows but basedpyright keeps Unknown params
+        inc_out = cast("outputs.IncrementalOut[Any, Any]", out_spec)
+        if override:
+            cache = override.get("cache", inc_out.cache)
+            path = override["path"] if "path" in override else inc_out.path
+            return dataclasses.replace(inc_out, path=path, cache=cache)
+        return inc_out
+
+    # Out and subclasses (Metric, Plot)
     # Determine final path (override or annotation default)
     path = override["path"] if override else out_spec.path
 
@@ -134,43 +159,56 @@ def _apply_out_overrides(
     # Note: annotation default is already set correctly for Out/Metric/Plot subclasses
     cache = override["cache"] if override and "cache" in override else out_spec.cache
 
-    return dataclasses.replace(out_spec, path=path, cache=cache)
+    # Cast to Out for dataclasses.replace - we checked it's not DirectoryOut/IncrementalOut
+    out = cast("outputs.Out[Any]", out_spec)
+    return dataclasses.replace(out, path=path, cache=cache)
 
 
-def _expand_out_spec(out_spec: outputs.Out[Any]) -> list[outputs.Out[Any]]:
-    """Expand multi-file output spec into individual Out objects for DAG/caching.
+def _expand_out_spec(out_spec: outputs.BaseOut) -> list[outputs.BaseOut]:
+    """Expand multi-file output spec into individual output objects for DAG/caching.
 
-    For multi-file outputs (path is list/tuple), creates individual Out objects for each path.
+    For multi-file outputs (path is list/tuple), creates individual output objects for each path.
     For single-file outputs, returns a single-item list.
+    DirectoryOut is not expanded (paths are determined at runtime).
     """
-    path = out_spec.path
-    if isinstance(path, (list, tuple)):
-        return [dataclasses.replace(out_spec, path=p) for p in path]
-    else:
+    # DirectoryOut is not expanded - its paths are determined at runtime
+    if isinstance(out_spec, outputs.DirectoryOut):
         return [out_spec]
+
+    # IncrementalOut - single path only, return as-is
+    if isinstance(out_spec, outputs.IncrementalOut):
+        return [out_spec]
+
+    # Out and subclasses (Metric, Plot) - may have list/tuple paths
+    out = cast("outputs.Out[Any]", out_spec)
+    path = out.path
+    if isinstance(path, (list, tuple)):
+        return [dataclasses.replace(out, path=p) for p in path]
+    else:
+        return [out]
 
 
 def _resolve_out_spec(
     out_name: str,
-    out_spec: outputs.Out[Any],
+    out_spec: outputs.BaseOut,
     override: OutOverride | None,
     stage_name: str,
-) -> tuple[outputs.Out[Any], list[outputs.Out[Any]]]:
+) -> tuple[outputs.BaseOut, list[outputs.BaseOut]]:
     """Apply overrides to an output spec and expand for DAG/caching.
 
     Validates that IncrementalOut outputs aren't overridden, applies path/cache overrides,
-    and expands multi-file specs into individual Out objects.
+    and expands multi-file specs into individual output objects.
 
     Args:
         out_name: Output key name (for error messages).
-        out_spec: Original Out spec from function annotations.
+        out_spec: Original output spec from function annotations.
         override: Path/cache override from YAML (or None).
         stage_name: Stage name (for error messages).
 
     Returns:
         Tuple of (resolved_spec, expanded_specs) where:
-        - resolved_spec: Single Out with overrides applied (may have list/tuple path)
-        - expanded_specs: List of Outs with single-string paths for DAG/caching
+        - resolved_spec: Single output with overrides applied (may have list/tuple path)
+        - expanded_specs: List of outputs with single-string paths for DAG/caching
 
     Raises:
         ValidationError: If trying to override an IncrementalOut path.
@@ -338,10 +376,10 @@ class StageRegistry:
                 stage_name, dep_specs, return_out_specs, single_out_spec
             )
 
-            # Build out_specs from return annotations (return key -> resolved Out, pre-expansion)
+            # Build out_specs from return annotations (return key -> resolved output, pre-expansion)
             # For single-output stages (non-TypedDict return), uses SINGLE_OUTPUT_KEY convention
-            out_specs: dict[str, outputs.Out[Any]] = {}
-            outs_from_annotations: list[outputs.Out[Any]] = []
+            out_specs: dict[str, outputs.BaseOut] = {}
+            outs_from_annotations: list[outputs.BaseOut] = []
 
             if return_out_specs:
                 # Validate out_path_overrides match annotation out names
@@ -403,10 +441,26 @@ class StageRegistry:
             deps_normalized = _normalize_deps_dict(deps_dict, self.validation_mode)
 
             # Update normalized outputs with absolute paths
-            outs_normalized = [
-                dataclasses.replace(out, path=path)
-                for out, path in zip(outs_list, outs_paths, strict=True)
-            ]
+            # All concrete output types (Out, DirectoryOut, IncrementalOut) are dataclasses
+            outs_normalized: list[outputs.BaseOut] = []
+            for out, path in zip(outs_list, outs_paths, strict=True):
+                if isinstance(out, outputs.DirectoryOut):
+                    # Cast to DirectoryOut[Any] - isinstance narrows but basedpyright keeps Unknown params
+                    outs_normalized.append(
+                        dataclasses.replace(cast("outputs.DirectoryOut[Any]", out), path=path)
+                    )
+                elif isinstance(out, outputs.IncrementalOut):
+                    # Cast to IncrementalOut[Any, Any] - isinstance narrows but basedpyright keeps Unknown
+                    outs_normalized.append(
+                        dataclasses.replace(
+                            cast("outputs.IncrementalOut[Any, Any]", out), path=path
+                        )
+                    )
+                else:
+                    # Out and subclasses (Metric, Plot)
+                    outs_normalized.append(
+                        dataclasses.replace(cast("outputs.Out[Any]", out), path=path)
+                    )
 
             # Output overlap validation is deferred to validate_outputs() for performance
             # (single O(N) pass instead of O(N²) from checking on every register)
@@ -675,7 +729,7 @@ def _validate_incremental_spec_match(
     stage_name: str,
     input_name: str | None,
     input_spec: stage_def.FuncDepSpec,
-    output_spec: outputs.Out[Any],
+    output_spec: outputs.BaseOut,
 ) -> None:
     """Validate IncrementalOut input/output specs match (path and loader)."""
     name_part = f"'{input_name}' " if input_name else ""
@@ -695,8 +749,8 @@ def _validate_incremental_spec_match(
 def _validate_incremental_out_matching(
     stage_name: str,
     dep_specs: dict[str, stage_def.FuncDepSpec],
-    return_out_specs: dict[str, outputs.Out[Any]],
-    single_out_spec: outputs.Out[Any] | None,
+    return_out_specs: dict[str, outputs.BaseOut],
+    single_out_spec: outputs.BaseOut | None,
 ) -> None:
     """Validate IncrementalOut inputs have matching outputs.
 
@@ -715,8 +769,9 @@ def _validate_incremental_out_matching(
 
     # Case 1: TypedDict return
     if return_out_specs:
-        incremental_outputs = {
-            name: spec
+        # Cast dict values to BaseOut to satisfy type checker
+        incremental_outputs: dict[str, outputs.BaseOut] = {
+            name: cast("outputs.BaseOut", spec)
             for name, spec in return_out_specs.items()
             if isinstance(spec, outputs.IncrementalOut)
         }
@@ -748,7 +803,10 @@ def _validate_incremental_out_matching(
             )
 
         input_spec = next(iter(incremental_inputs.values()))
-        _validate_incremental_spec_match(stage_name, None, input_spec, single_out_spec)
+        # Cast to BaseOut - isinstance above narrowed to IncrementalOut[Unknown, Unknown]
+        _validate_incremental_spec_match(
+            stage_name, None, input_spec, cast("outputs.BaseOut", single_out_spec)
+        )
 
     # Case 3: No matching output
     else:
@@ -839,8 +897,8 @@ def _resolve_params(
 
 def _get_annotation_loader_fingerprints(
     dep_specs: dict[str, stage_def.FuncDepSpec],
-    return_out_specs: dict[str, outputs.Out[Any]],
-    single_out_spec: outputs.Out[Any] | None,
+    return_out_specs: dict[str, outputs.BaseOut],
+    single_out_spec: outputs.BaseOut | None,
 ) -> dict[str, str]:
     """Get fingerprints for all loaders from annotations."""
     result = dict[str, str]()

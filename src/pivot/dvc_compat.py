@@ -4,7 +4,7 @@ import dataclasses
 import functools
 import logging
 import pathlib
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import yaml
 
@@ -182,8 +182,10 @@ def _build_out_entry(out: outputs.BaseOut, rel_path: str) -> str | dict[str, Any
 
     # Plot-specific options
     if isinstance(out, outputs.Plot):
+        # Cast to Plot[Any] - isinstance narrows but basedpyright keeps Unknown params
+        plot = cast("outputs.Plot[Any]", out)
         for attr in ("x", "y", "template"):
-            if (value := getattr(out, attr)) is not None:
+            if (value := getattr(plot, attr)) is not None:
                 options[attr] = value
 
     return {rel_path: options} if options else rel_path

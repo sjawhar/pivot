@@ -130,8 +130,9 @@ def train(
     return data.dropna()
 ```
 
-- **Dependencies**: `Annotated[T, Dep(path, loader)]` on parameters
-- **Outputs**: `Annotated[T, Out(path, loader)]` in TypedDict return type
+- **Dependencies**: `Annotated[T, Dep(path, reader)]` on parameters (reader is `Reader[R]`)
+- **Outputs**: `Annotated[T, Out(path, writer)]` in TypedDict return type (writer is `Writer[W]`)
+- **Incremental Outputs**: `Annotated[T, IncrementalOut(path, loader)]` for bidirectional (loader is `Loader[W, R]`)
 - **Parameters**: `params: MyParams` where `MyParams` extends `StageParams`
 - Stages must be **pure, serializable, module-level functions** (lambdas/closures fail pickling)
 - Config belongs in Pydantic classes, not YAML files

@@ -49,7 +49,7 @@ def _make_stage_info(
     no_commit: bool = False,
     no_cache: bool = False,
     dep_specs: dict[str, stage_def.FuncDepSpec] | None = None,
-    out_specs: dict[str, outputs.Out[object]] | None = None,
+    out_specs: dict[str, outputs.BaseOut] | None = None,
     params_arg_name: str | None = None,
 ) -> WorkerStageInfo:
     """Create a WorkerStageInfo with sensible defaults for testing."""

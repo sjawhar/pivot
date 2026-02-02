@@ -229,6 +229,10 @@ stages:
 - If YAML specifies a path, it overrides the annotation's default
 - If YAML doesn't specify a path, the annotation's default is used
 
+## Reader and Writer Protocols
+
+`Dep` accepts any object implementing the `Reader[R]` protocol, while `Out` accepts any `Writer[W]`. All built-in loaders (like `CSV()`, `PathOnly()`, `Pickle()`) implement both protocols, so they work with either annotation.
+
 ## See Also
 
 - [Dependencies & Loaders](dependencies.md) - Declaring inputs

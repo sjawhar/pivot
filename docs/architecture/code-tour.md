@@ -241,8 +241,11 @@ See [CLI Development](../contributing/cli.md)
 ### New Loader Type
 
 1. Add to `src/pivot/loaders.py`
-2. Extend `Loader[T]` base class
-3. Implement `load()` and `save()`
+2. Choose the appropriate base class:
+   - `Reader[R]` - read-only (for dependencies), implement `load() -> R`
+   - `Writer[W]` - write-only (for outputs), implement `save(data: W, ...)`
+   - `Loader[W, R]` - bidirectional, implement both; use `Loader[T]` when W == R (symmetric)
+3. Implement required methods
 4. Add tests
 
 See [Adding Loaders](../contributing/loaders.md)

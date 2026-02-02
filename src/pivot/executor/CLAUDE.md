@@ -34,5 +34,5 @@ Stages using joblib/scikit-learn with `n_jobs > 1` create nested multiprocessing
 ## Pickling Requirements
 
 - Stage functions must be **module-level** (not lambdas, closures, or `__main__` definitions)
-- Output TypedDicts and custom loaders must also be module-level
+- Output TypedDicts and custom Reader/Writer/Loader instances must also be module-level
 - See `docs/solutions/` for loky pickling gotchas
