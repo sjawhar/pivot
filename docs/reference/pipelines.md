@@ -285,6 +285,103 @@ When including external pipelines:
 - Only include pipelines from trusted sources
 - Review included pipeline code before use
 
+## Path Resolution
+
+Paths in annotations are resolved relative to the **pipeline root** - the directory containing the `pipeline.py` file. This enables simple, portable paths that work regardless of where the pipeline is located within your project.
+
+### Pipeline-Relative Paths
+
+```python
+# eval_pipeline/horizon/pipeline.py
+pipeline = Pipeline("horizon")
+
+def compute_weights(
+    data: Annotated[DataFrame, Dep("data/raw.csv", CSV())]
+) -> Annotated[DataFrame, Out("data/weights.csv", CSV())]:
+    ...
+
+pipeline.register(compute_weights)
+# data/raw.csv → eval_pipeline/horizon/data/raw.csv (project-relative)
+# data/weights.csv → eval_pipeline/horizon/data/weights.csv (project-relative)
+```
+
+This mirrors DVC's behavior where `dvc.yaml` paths are relative to their containing directory.
+
+### Cross-Pipeline References
+
+Use `../` to reference files in other pipelines:
+
+```python
+# eval_pipeline/ga_paper/pipeline.py
+pipeline = Pipeline("ga_paper")
+
+def analyze(
+    weights: Annotated[DataFrame, Dep("../horizon/data/weights.csv", CSV())],
+) -> AnalyzeOutputs:
+    ...
+
+pipeline.register(analyze)
+# ../horizon/data/weights.csv → eval_pipeline/horizon/data/weights.csv
+```
+
+The `../` is resolved at registration time, producing a clean project-relative path in the stage registry.
+
+### Absolute Paths
+
+Absolute paths are passed through unchanged:
+
+```python
+Dep("/shared/datasets/common.csv", CSV())  # Used as-is
+```
+
+### Path Overrides
+
+Path overrides (`dep_path_overrides`, `out_path_overrides`) are also pipeline-relative:
+
+```python
+# eval_pipeline/horizon/pipeline.py
+pipeline.register(
+    shared_stage,
+    dep_path_overrides={"data": "custom/input.csv"},  # → eval_pipeline/horizon/custom/input.csv
+)
+```
+
+### Windows Path Support
+
+Pivot accepts Windows-style paths with backslashes, normalizing them to POSIX format:
+
+```python
+Dep("data\\raw.csv", CSV())  # Treated as data/raw.csv
+```
+
+This allows paths from Windows tools or configurations to work on Unix systems.
+
+### Path Storage Summary
+
+| Location | Format |
+|----------|--------|
+| Annotations | Pipeline-relative (`data/raw.csv`) |
+| Stage registry | Project-relative (`horizon/data/raw.csv`) |
+| Lock files | Project-relative (`horizon/data/raw.csv`) |
+| Execution | Absolute (resolved at runtime) |
+
+Resolution happens once at registration time. All downstream code sees project-relative paths.
+
+### Interaction with `include()`
+
+When Pipeline A includes Pipeline B, B's stages retain their already-resolved paths:
+
+```python
+# horizon/pipeline.py
+horizon = Pipeline("horizon")
+horizon.register(make_weights)  # Dep("data/raw.csv") → horizon/data/raw.csv
+
+# main/pipeline.py
+main = Pipeline("main")
+main.include(horizon)  # Copies stage with paths already resolved
+# make_weights still reads from horizon/data/raw.csv
+```
+
 ## See Also
 
 - [Dependencies & Loaders](dependencies.md) - Declaring inputs

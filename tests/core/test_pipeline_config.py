@@ -1647,8 +1647,13 @@ def test_load_pipeline_from_yaml_creates_pipeline(simple_pipeline: pathlib.Path)
     assert result.root == simple_pipeline
 
 
-def test_load_pipeline_from_yaml_uses_pipeline_name(tmp_path: pathlib.Path) -> None:
+def test_load_pipeline_from_yaml_uses_pipeline_name(
+    tmp_path: pathlib.Path, mocker: MockerFixture
+) -> None:
     """load_pipeline_from_yaml should use 'pipeline' field for name if present."""
+    mocker.patch.object(project, "_project_root_cache", tmp_path)
+    (tmp_path / ".git").mkdir(exist_ok=True)
+
     # Create a simple stage module
     stages_py = tmp_path / "stages.py"
     stages_py.write_text(
@@ -1680,8 +1685,13 @@ stages:
     assert result.name == "my_custom_name"
 
 
-def test_load_pipeline_from_yaml_defaults_to_directory_name(tmp_path: pathlib.Path) -> None:
+def test_load_pipeline_from_yaml_defaults_to_directory_name(
+    tmp_path: pathlib.Path, mocker: MockerFixture
+) -> None:
     """load_pipeline_from_yaml should default name to parent directory."""
+    mocker.patch.object(project, "_project_root_cache", tmp_path)
+    (tmp_path / ".git").mkdir(exist_ok=True)
+
     # Create a subdirectory to test directory name extraction
     subdir = tmp_path / "my_project"
     subdir.mkdir()

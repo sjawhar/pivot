@@ -43,7 +43,7 @@ def send_rpc(
 @pytest.fixture
 def serve_pipeline(tmp_path: pathlib.Path) -> Generator[pathlib.Path]:
     """Start a minimal pipeline in serve mode, yield socket path."""
-    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git").mkdir(exist_ok=True)
     (tmp_path / ".pivot").mkdir()
 
     # Use pipeline.py only (not pivot.yaml) to avoid ambiguity error

@@ -57,7 +57,7 @@ async def test_socket_creation_and_permissions(
     monkeypatch.setattr(config, "get_cache_dir", lambda: tmp_path / "cache")
     monkeypatch.setattr(config, "get_state_dir", lambda: tmp_path / "state")
     monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git").mkdir(exist_ok=True)
 
     register_test_stage(_helper_noop, name="test_stage")
 
@@ -166,7 +166,7 @@ async def test_agent_rpc_handler_stages_query(
 ) -> None:
     """AgentRpcHandler.handle_query returns stages correctly."""
     monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git").mkdir(exist_ok=True)
 
     register_test_stage(_helper_noop, name="stage_a")
     register_test_stage(_helper_noop, name="stage_b")
@@ -218,7 +218,7 @@ async def test_socket_handles_chunked_messages(
     monkeypatch.setattr(config, "get_cache_dir", lambda: tmp_path / "cache")
     monkeypatch.setattr(config, "get_state_dir", lambda: tmp_path / "state")
     monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git").mkdir(exist_ok=True)
 
     # Need to create engine first to create handler, then create source with handler
     async with Engine(pipeline=test_pipeline) as engine:
@@ -335,7 +335,7 @@ def test_serve_mode_cli_responds_to_status_query(
     """
 
     # Create minimal project structure with a valid pipeline
-    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git").mkdir(exist_ok=True)
     (tmp_path / ".pivot").mkdir()
     pipeline_code = """\
 import pathlib
@@ -438,7 +438,7 @@ async def test_rpc_source_without_handler_returns_method_not_found(
     monkeypatch.setattr(config, "get_cache_dir", lambda: tmp_path / "cache")
     monkeypatch.setattr(config, "get_state_dir", lambda: tmp_path / "state")
     monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git").mkdir(exist_ok=True)
 
     # Create source WITHOUT handler (mimics current _run_serve_mode bug)
     rpc_source = AgentRpcSource(socket_path=socket_path, handler=None)
@@ -483,7 +483,7 @@ async def test_rpc_source_with_handler_returns_status(
     monkeypatch.setattr(config, "get_cache_dir", lambda: tmp_path / "cache")
     monkeypatch.setattr(config, "get_state_dir", lambda: tmp_path / "state")
     monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git").mkdir(exist_ok=True)
 
     async with Engine(pipeline=test_pipeline) as engine:
         # Create source WITH handler (correct implementation)
@@ -536,7 +536,7 @@ async def test_event_buffer_integration_with_engine(
     monkeypatch.setattr(config, "get_cache_dir", lambda: tmp_path / "cache")
     monkeypatch.setattr(config, "get_state_dir", lambda: tmp_path / "state")
     monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git").mkdir(exist_ok=True)
 
     register_test_stage(_helper_noop, name="test_stage")
 
@@ -578,7 +578,7 @@ async def test_event_buffer_polling_during_execution(
     monkeypatch.setattr(config, "get_cache_dir", lambda: tmp_path / "cache")
     monkeypatch.setattr(config, "get_state_dir", lambda: tmp_path / "state")
     monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git").mkdir(exist_ok=True)
 
     def _slow_stage(params: None) -> dict[str, str]:
         """Stage that takes time to execute."""

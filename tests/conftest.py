@@ -56,6 +56,11 @@ def test_pipeline(tmp_path: pathlib.Path) -> Generator[pipeline_mod.Pipeline]:
 
     Also sets up the module-level test pipeline in helpers.py so that
     register_test_stage() works without explicit pipeline parameter.
+
+    Note: This fixture does NOT mock the project root. Tests that register
+    stages with path annotations should either:
+    1. Use mock_discovery fixture (which mocks project root)
+    2. Or explicitly mock project._project_root_cache themselves
     """
     import helpers
 

@@ -101,7 +101,9 @@ def _plain_stage(
 # =============================================================================
 
 
-def test_register_registers_function(test_pipeline: "Pipeline") -> None:
+def test_register_registers_function(
+    test_pipeline: "Pipeline", set_project_root: pathlib.Path
+) -> None:
     """Should register function when calling register_test_stage()."""
     register_test_stage(_process_with_dep, name="process")
 
@@ -541,7 +543,9 @@ def test_stage_duplicate_registration_raises_error(test_pipeline: "Pipeline") ->
         register_test_stage(func_two, name="my_stage")
 
 
-def test_multiple_stages_registered(test_pipeline: "Pipeline") -> None:
+def test_multiple_stages_registered(
+    test_pipeline: "Pipeline", set_project_root: pathlib.Path
+) -> None:
     """Should register multiple stages independently."""
     register_test_stage(_stage1_with_dep, name="stage1")
     register_test_stage(_stage2_with_out, name="stage2")
@@ -759,7 +763,7 @@ def test_registry_restore_preserves_metadata() -> None:
 # ==============================================================================
 
 
-def test_stageparams_work(test_pipeline: "Pipeline") -> None:
+def test_stageparams_work(test_pipeline: "Pipeline", set_project_root: pathlib.Path) -> None:
     """StageParams should work for stage parameters."""
     register_test_stage(_plain_stage, name="plain_stage", params=PlainParams())
 
@@ -773,7 +777,9 @@ def test_stageparams_work(test_pipeline: "Pipeline") -> None:
 # ==============================================================================
 
 
-def test_out_path_overrides_accepts_simple_string(test_pipeline: "Pipeline") -> None:
+def test_out_path_overrides_accepts_simple_string(
+    test_pipeline: "Pipeline", set_project_root: pathlib.Path
+) -> None:
     """out_path_overrides should accept simple strings, not just dicts with path key."""
 
     def my_stage() -> _OutputTxt:
@@ -786,7 +792,9 @@ def test_out_path_overrides_accepts_simple_string(test_pipeline: "Pipeline") -> 
     assert info["out_specs"]["output"].path == "override.txt"
 
 
-def test_out_path_overrides_accepts_dict_with_options(test_pipeline: "Pipeline") -> None:
+def test_out_path_overrides_accepts_dict_with_options(
+    test_pipeline: "Pipeline", set_project_root: pathlib.Path
+) -> None:
     """out_path_overrides should accept dicts with path and options."""
 
     def my_stage2() -> _OutputTxt:
@@ -802,7 +810,9 @@ def test_out_path_overrides_accepts_dict_with_options(test_pipeline: "Pipeline")
     assert info["out_specs"]["output"].cache is False
 
 
-def test_out_path_overrides_accepts_list_paths(test_pipeline: Pipeline) -> None:
+def test_out_path_overrides_accepts_list_paths(
+    test_pipeline: Pipeline, set_project_root: pathlib.Path
+) -> None:
     """out_path_overrides should accept list paths for multi-file outputs."""
 
     class MultiOutput(TypedDict):

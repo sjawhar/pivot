@@ -461,7 +461,7 @@ async def test_rpc_run_invalid_stage_returns_error(
 ) -> None:
     """RPC run with invalid stage name returns descriptive error."""
     monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git").mkdir(exist_ok=True)
     (tmp_path / ".pivot").mkdir()
 
     from pivot.pipeline.pipeline import Pipeline
