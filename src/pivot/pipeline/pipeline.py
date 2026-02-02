@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import copy
 import inspect
+import logging
 import pathlib
 import re
 from typing import TYPE_CHECKING
 
 from pivot import outputs, registry
 from pivot.pipeline.yaml import PipelineConfigError
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -148,3 +152,42 @@ class Pipeline:
     def clear(self) -> None:
         """Clear all registered stages (for testing)."""
         self._registry.clear()
+
+    def include(self, other: Pipeline) -> None:
+        """Include all stages from another pipeline.
+
+        Stages are deep-copied with their original state_dir preserved, enabling
+        composition where sub-pipeline stages maintain independent state tracking.
+        The copy is a point-in-time snapshot; subsequent changes to the source
+        pipeline are not reflected.
+
+        Args:
+            other: Pipeline whose stages to include.
+
+        Raises:
+            PipelineConfigError: If ``other`` is ``self`` (self-include) or if
+                any stage name in ``other`` already exists in this pipeline.
+        """
+        if other is self:
+            raise PipelineConfigError(f"Pipeline '{self.name}' cannot include itself")
+
+        # Collect stages to add (validates all before adding any - atomic)
+        stages_to_add: list[registry.RegistryStageInfo] = []
+        existing_names = set(self._registry.list_stages())
+
+        for stage_name in other.list_stages():
+            if stage_name in existing_names:
+                raise PipelineConfigError(
+                    f"Cannot include pipeline '{other.name}': stage '{stage_name}' already exists in '{self.name}'. Rename the stage using name= at registration time."
+                )
+            # Deep copy to prevent shared mutable state
+            stages_to_add.append(copy.deepcopy(other.get(stage_name)))
+
+        # Add all stages (only reached if validation passes)
+        for stage_info in stages_to_add:
+            self._registry.add_existing(stage_info)
+
+        if stages_to_add:
+            logger.debug(
+                f"Included {len(stages_to_add)} stages from pipeline '{other.name}' into '{self.name}'"
+            )
