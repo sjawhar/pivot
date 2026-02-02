@@ -1,5 +1,5 @@
 ---
-name: pivot-stages
+name: writing-pivot-stages
 description: Use when writing Pivot pipeline stages, seeing annotation errors (Dep, Out, Annotated), loader mismatches, "cannot pickle" errors, DirectoryOut validation failures, or IncrementalOut path mismatches
 ---
 
