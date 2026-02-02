@@ -242,13 +242,10 @@ def verify(
     cache_dir = config.get_cache_dir()
 
     # Get pipeline status (uses default state directory internally)
-    # When allow_missing is set, skip DAG validation so missing dependency files
-    # don't cause DependencyNotFoundError before we can check the remote
     pipeline_status, _ = status_mod.get_pipeline_status(
         stages_list,
         single_stage=False,
         all_stages=all_stages,
-        validate=not allow_missing,
         allow_missing=allow_missing,
     )
 

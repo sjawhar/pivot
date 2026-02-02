@@ -1,4 +1,4 @@
-"""Pipeline status queries using Engine's bipartite graph.
+"""Pipeline status queries using the bipartite artifact-stage graph.
 
 This module provides the primary query API for determining pipeline status.
 It orchestrates calls to explain.py for individual stage explanations.
@@ -7,13 +7,13 @@ Graph Parameter
 ---------------
 Query functions accept an optional `graph` parameter:
 
-- If provided, uses the bipartite artifact-stage graph from Engine
-- If None, builds a stage-only DAG from the registry (legacy path)
+- If provided, uses the bipartite artifact-stage graph directly
+- If None, builds a bipartite graph from all_stages
 
-The Engine's bipartite graph is preferred because:
-1. It's already built for execution
-2. It includes artifact nodes for path-based queries
-3. It ensures consistency between queries and execution
+The graph is used for:
+1. Computing execution order via get_stage_dag() + get_execution_order()
+2. Artifact path-based queries
+3. Ensuring consistency between queries and execution
 
 Module Relationships
 --------------------
@@ -44,7 +44,6 @@ from typing import TYPE_CHECKING
 
 from pivot import (
     config,
-    dag,
     exceptions,
     explain,
     metrics,
@@ -89,7 +88,7 @@ def _discover_tracked_files(
         return None, None
 
     tracked_files = track.discover_pvt_files(project.get_project_root())
-    tracked_trie = dag.build_tracked_trie(tracked_files) if tracked_files else None
+    tracked_trie = engine_graph.build_tracked_trie(tracked_files) if tracked_files else None
     return tracked_files, tracked_trie
 
 
@@ -175,7 +174,9 @@ def get_pipeline_explanations(
         if graph is None:
             graph = engine_graph.build_graph(all_stages)
         stage_graph = engine_graph.get_stage_dag(graph)
-        execution_order = dag.get_execution_order(stage_graph, stages, single_stage=single_stage)
+        execution_order = engine_graph.get_execution_order(
+            stage_graph, stages, single_stage=single_stage
+        )
 
         if not execution_order:
             return []
@@ -246,7 +247,6 @@ def get_pipeline_status(
     stages: list[str] | None,
     single_stage: bool,
     all_stages: dict[str, RegistryStageInfo],
-    validate: bool = True,  # noqa: ARG001 - kept for API compatibility
     allow_missing: bool = False,
     graph: nx.DiGraph[str] | None = None,
 ) -> tuple[list[PipelineStatusInfo], DiGraph[str]]:
@@ -256,19 +256,18 @@ def get_pipeline_status(
         stages: Stage names to check, or None for all stages.
         single_stage: If True, check only specified stages without dependencies.
         all_stages: Dict mapping stage names to RegistryStageInfo.
-        validate: Deprecated, kept for API compatibility. Validation is now implicit
-            via all_stages - callers must provide validated stage data.
         allow_missing: If True, use .pvt hashes for missing dependency files.
-        graph: Optional bipartite graph from Engine. If provided, extracts stage DAG
+        graph: Optional bipartite graph. If provided, extracts stage DAG
             via get_stage_dag() instead of building a new one.
     """
-    _ = validate  # Suppress unused parameter warning
     with metrics.timed("status.get_pipeline_status"):
         tracked_files, tracked_trie = _discover_tracked_files(allow_missing)
         if graph is None:
             graph = engine_graph.build_graph(all_stages)
         stage_graph = engine_graph.get_stage_dag(graph)
-        execution_order = dag.get_execution_order(stage_graph, stages, single_stage=single_stage)
+        execution_order = engine_graph.get_execution_order(
+            stage_graph, stages, single_stage=single_stage
+        )
 
         if not execution_order:
             return [], stage_graph

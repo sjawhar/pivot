@@ -189,17 +189,20 @@ def _output_explain(
     allow_missing: bool = False,
 ) -> None:
     """Output detailed stage explanations using status logic."""
+    from pivot import project
     from pivot import status as status_mod
     from pivot.cli import status as status_cli
     from pivot.engine import graph as engine_graph
+    from pivot.storage import track
 
-    # Validate dependencies exist when allow_missing is False
-    if not allow_missing:
-        cli_helpers.build_dag(validate=True)
-
-    # Build graph once for all explanations
     all_stages = cli_helpers.get_all_stages()
-    graph = engine_graph.build_graph(all_stages)
+
+    # Build graph with validation when allow_missing is False
+    # When allow_missing=True, tracked files are used for validation
+    tracked_files = track.discover_pvt_files(project.get_project_root()) if allow_missing else None
+    graph = engine_graph.build_graph(
+        all_stages, validate=not allow_missing, tracked_files=tracked_files
+    )
 
     explanations = status_mod.get_pipeline_explanations(
         stages_list,
@@ -220,18 +223,23 @@ def _dry_run(
     quiet: bool,
 ) -> None:
     """Show what would run without executing."""
+    from pivot import project
     from pivot import status as status_mod
     from pivot.engine import graph as engine_graph
+    from pivot.storage import track
 
     # Quiet mode suppresses output (except JSON which is always emitted)
     if quiet and not as_json:
         return
 
-    if not allow_missing:
-        cli_helpers.build_dag(validate=True)
-
     all_stages = cli_helpers.get_all_stages()
-    graph = engine_graph.build_graph(all_stages)
+
+    # Build graph with validation when allow_missing is False
+    # When allow_missing=True, tracked files are used for validation
+    tracked_files = track.discover_pvt_files(project.get_project_root()) if allow_missing else None
+    graph = engine_graph.build_graph(
+        all_stages, validate=not allow_missing, tracked_files=tracked_files
+    )
 
     explanations = status_mod.get_pipeline_explanations(
         stages_list,
@@ -289,7 +297,7 @@ def _run_pipeline(
 
     Returns execution results for non-watch mode, None for watch mode.
     """
-    from pivot import dag
+    from pivot.engine import graph as engine_graph
     from pivot.tui import console as tui_console_mod
 
     # Emit schema version early for JSONL mode (even if no stages to run)
@@ -300,7 +308,7 @@ def _run_pipeline(
 
     # Build DAG and get execution order for TUI display and worker pre-warming
     graph = cli_helpers.build_dag(validate=True)
-    execution_order = dag.get_execution_order(graph, stages_list, single_stage=False)
+    execution_order = engine_graph.get_execution_order(graph, stages_list, single_stage=False)
 
     if not execution_order and not watch:
         # Emit execution result for JSONL mode

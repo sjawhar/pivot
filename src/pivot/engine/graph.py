@@ -6,6 +6,7 @@ import pathlib
 from typing import TYPE_CHECKING
 
 import networkx as nx
+import pygtrie
 
 from pivot.engine.types import NodeType
 
@@ -13,12 +14,14 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from pivot.registry import RegistryStageInfo
+    from pivot.storage.track import PvtData
 
 __all__ = [
     "artifact_node",
     "stage_node",
     "parse_node",
     "build_graph",
+    "build_tracked_trie",
     "get_consumers",
     "get_producer",
     "get_watch_paths",
@@ -27,6 +30,7 @@ __all__ = [
     "get_stage_dag",
     "update_stage",
     "get_artifact_consumers",
+    "get_execution_order",
 ]
 
 
@@ -49,23 +53,155 @@ def parse_node(node: str) -> tuple[NodeType, str]:
     return NodeType(prefix), value
 
 
-def build_graph(stages: dict[str, RegistryStageInfo]) -> nx.DiGraph[str]:
+def _build_outputs_map(stages: dict[str, RegistryStageInfo]) -> dict[str, str]:
+    """Build mapping from output path to stage name.
+
+    Returns:
+        Dict of output_path -> stage_name
+
+    Note:
+        All paths are already normalized (absolute) by registry.py,
+        so simple dict lookup is sufficient.
+    """
+    outputs_map = {
+        out_path: stage_name
+        for stage_name, stage_info in stages.items()
+        for out_path in stage_info["outs_paths"]
+    }
+    return outputs_map
+
+
+def _build_outputs_trie(stages: dict[str, RegistryStageInfo]) -> pygtrie.Trie[tuple[str, str]]:
+    """Build trie of output paths for directory dependency resolution."""
+    trie: pygtrie.Trie[tuple[str, str]] = pygtrie.Trie()
+    for stage_name, stage_info in stages.items():
+        for out_path in stage_info["outs_paths"]:
+            out_key = pathlib.Path(out_path).parts
+            trie[out_key] = (stage_name, out_path)
+    return trie
+
+
+def _find_producers_for_path_with_artifacts(
+    dep_path: str, outputs_trie: pygtrie.Trie[tuple[str, str]]
+) -> list[tuple[str, str]]:
+    """Find stages and their output paths overlapping the dependency path.
+
+    Returns:
+        List of (stage_name, output_path) tuples for producers with outputs
+        that overlap the dependency path (either as parent or child).
+    """
+    dep_key = pathlib.Path(dep_path).parts
+    results = list[tuple[str, str]]()
+    seen_stages = set[str]()
+
+    # Case 1: Dependency is parent of outputs (dir depends on files inside)
+    if outputs_trie.has_subtrie(dep_key):
+        for stage_name, out_path in outputs_trie.values(prefix=dep_key):
+            if stage_name not in seen_stages:
+                results.append((stage_name, out_path))
+                seen_stages.add(stage_name)
+
+    # Case 2: Dependency is child of output (file depends on parent dir)
+    prefix_item = outputs_trie.shortest_prefix(dep_key)
+    if prefix_item is not None and prefix_item.value is not None:
+        stage_name, out_path = prefix_item.value
+        if stage_name not in seen_stages:
+            results.append((stage_name, out_path))
+
+    return results
+
+
+def _check_acyclic(g: nx.DiGraph[str]) -> None:
+    """Check graph for cycles, raise if found."""
+    from pivot import exceptions
+
+    try:
+        cycle = nx.find_cycle(g, orientation="original")
+    except nx.NetworkXNoCycle:
+        return
+
+    # Extract stage names from cycle for error message
+    # Cycle is a list of (from_node, to_node, direction) tuples
+    stages_in_cycle = list[str]()
+    for from_node, _, _ in cycle:
+        node_type, name = parse_node(from_node)
+        if node_type == NodeType.STAGE and name not in stages_in_cycle:
+            stages_in_cycle.append(name)
+
+    if not stages_in_cycle:
+        # Fallback if cycle is artifact-only (shouldn't happen in valid graph)
+        # Extract readable names from the cycle edges
+        nodes_in_cycle = list[str]()
+        for from_node, _, _ in cycle:
+            _, from_name = parse_node(from_node)
+            if from_name not in nodes_in_cycle:
+                nodes_in_cycle.append(from_name)
+        stages_in_cycle = nodes_in_cycle if nodes_in_cycle else ["<unknown>"]
+
+    raise exceptions.CyclicGraphError(
+        f"Circular dependency detected: {' -> '.join(stages_in_cycle)}"
+    )
+
+
+def build_tracked_trie(tracked_files: dict[str, PvtData]) -> pygtrie.Trie[str]:
+    """Build trie of tracked file paths for dependency checking.
+
+    Keys are path tuples (from Path.parts), values are the absolute path string.
+    """
+    trie: pygtrie.Trie[str] = pygtrie.Trie()
+    for abs_path in tracked_files:
+        path_key = pathlib.Path(abs_path).parts
+        trie[path_key] = abs_path
+    return trie
+
+
+def _is_tracked_path(dep: str, tracked_trie: pygtrie.Trie[str]) -> bool:
+    """Check if dependency is a tracked file (exact match or inside tracked directory)."""
+    dep_key = pathlib.Path(dep).parts
+
+    # Exact match
+    if dep_key in tracked_trie:
+        return True
+
+    # Dependency is inside a tracked directory
+    prefix_item = tracked_trie.shortest_prefix(dep_key)
+    if prefix_item is not None and prefix_item.value is not None:
+        return True
+
+    # Dependency is a directory containing tracked files
+    return tracked_trie.has_subtrie(dep_key)
+
+
+def build_graph(
+    stages: dict[str, RegistryStageInfo],
+    validate: bool = False,
+    tracked_files: dict[str, PvtData] | None = None,
+) -> nx.DiGraph[str]:
     """Build bipartite artifact-stage graph from stage definitions.
 
     Args:
         stages: Dict mapping stage name to RegistryStageInfo.
+        validate: If True, validate that all dependencies exist.
+        tracked_files: Dict of tracked file paths -> PvtData (from .pvt files).
+            If provided, tracked files are recognized as valid dependency sources.
 
     Returns:
         Directed graph where:
         - Nodes are either artifacts (files) or stages (functions)
         - Edges go: artifact -> stage (consumed by) and stage -> artifact (produces)
 
-    Note:
-        Paths are stored as-is from the registry (via pathlib.Path normalization).
-        Callers querying the graph (e.g., what_if_changed) should normalize paths
-        using project.normalize_path() to ensure consistent matching.
+    Raises:
+        CyclicGraphError: If graph contains cycles (always checked)
+        DependencyNotFoundError: If dependency doesn't exist (when validate=True)
     """
+    from pivot import exceptions
+
     g: nx.DiGraph[str] = nx.DiGraph()
+
+    # Build lookup structures - outputs_trie needed for directory dependency edges
+    outputs_map = _build_outputs_map(stages)
+    outputs_trie = _build_outputs_trie(stages)
+    tracked_trie = build_tracked_trie(tracked_files) if tracked_files else None
 
     for stage_name, info in stages.items():
         stage = stage_node(stage_name)
@@ -77,11 +213,46 @@ def build_graph(stages: dict[str, RegistryStageInfo]) -> nx.DiGraph[str]:
             g.add_node(artifact, type=NodeType.ARTIFACT)
             g.add_edge(artifact, stage)
 
+            # Check for direct producer via exact match
+            producer = outputs_map.get(dep_path)
+            if producer:
+                continue
+
+            # Check for directory dependency via trie - add edges from output files
+            # inside the directory to ensure proper stage DAG extraction
+            producers_info = _find_producers_for_path_with_artifacts(dep_path, outputs_trie)
+            if producers_info:
+                for _, out_path in producers_info:
+                    out_artifact = artifact_node(pathlib.Path(out_path))
+                    # Ensure output artifact node exists and add edge to consuming stage
+                    if out_artifact not in g:
+                        g.add_node(out_artifact, type=NodeType.ARTIFACT)
+                    g.add_edge(out_artifact, stage)
+                continue
+
+            # Validation: check dependency source exists (only when validate=True)
+            if validate:
+                # Check if exists on disk
+                if pathlib.Path(dep_path).exists():
+                    continue
+                # Check if tracked file
+                if tracked_trie and _is_tracked_path(dep_path, tracked_trie):
+                    continue
+                # Dependency not found
+                raise exceptions.DependencyNotFoundError(
+                    stage=stage_name,
+                    dep=dep_path,
+                    available_outputs=list(outputs_map.keys()),
+                )
+
         # Outs: stage -> artifact
         for out in info["outs"]:
             artifact = artifact_node(pathlib.Path(str(out.path)))
             g.add_node(artifact, type=NodeType.ARTIFACT)
             g.add_edge(stage, artifact)
+
+    # Always check for cycles - a cyclic graph is never valid
+    _check_acyclic(g)
 
     return g
 
@@ -233,9 +404,8 @@ def get_upstream_stages(g: nx.DiGraph[str], stage_name: str) -> list[str]:
 def get_stage_dag(g: nx.DiGraph[str]) -> nx.DiGraph[str]:
     """Extract stage-only DAG from bipartite graph.
 
-    Returns a DAG with edges from consumer to producer, matching dag.build_dag()
-    convention. This allows dag.get_execution_order() to work correctly with
-    dfs_postorder_nodes traversal.
+    Returns a DAG with edges from consumer to producer. This allows
+    get_execution_order() to work correctly with dfs_postorder_nodes traversal.
     """
     stage_dag: nx.DiGraph[str] = nx.DiGraph()
 
@@ -255,7 +425,7 @@ def get_stage_dag(g: nx.DiGraph[str]) -> nx.DiGraph[str]:
             for consumer in g.successors(artifact):
                 if g.nodes[consumer]["type"] == NodeType.STAGE:
                     consumer_name = parse_node(consumer)[1]
-                    # Edge from consumer to producer (matches dag.build_dag() convention)
+                    # Edge from consumer to producer (for DFS postorder execution)
                     stage_dag.add_edge(consumer_name, stage_name)
 
     return stage_dag
@@ -289,3 +459,48 @@ def get_artifact_consumers(
         all_affected.update(downstream)
 
     return sorted(all_affected)
+
+
+def get_execution_order(
+    graph: nx.DiGraph[str],
+    stages: list[str] | None = None,
+    single_stage: bool = False,
+) -> list[str]:
+    """Get execution order using DFS postorder traversal.
+
+    Args:
+        graph: Stage-only DAG (from get_stage_dag)
+        stages: Optional target stages to execute (default: all stages)
+        single_stage: If True, run only the specified stages without dependencies.
+            Stages are executed in the order provided, not DAG order.
+
+    Returns:
+        List of stage names in execution order (dependencies first, unless single_stage)
+    """
+    if stages:
+        if single_stage:
+            return stages
+        subgraph = _get_subgraph(graph, stages)
+        return list(nx.dfs_postorder_nodes(subgraph))
+
+    return list(nx.dfs_postorder_nodes(graph))
+
+
+def _get_subgraph(graph: nx.DiGraph[str], source_stages: list[str]) -> nx.DiGraph[str]:
+    """Get subgraph containing sources and all their dependencies.
+
+    Raises:
+        StageNotFoundError: If any source stage is not in the graph.
+    """
+    from pivot import exceptions
+
+    # Validate all stages exist before traversing
+    graph_nodes = set(graph.nodes())
+    unknown = [s for s in source_stages if s not in graph_nodes]
+    if unknown:
+        raise exceptions.StageNotFoundError(unknown, available_stages=list(graph_nodes))
+
+    nodes = set[str]()
+    for stage in source_stages:
+        nodes.update(nx.dfs_postorder_nodes(graph, stage))
+    return graph.subgraph(nodes)

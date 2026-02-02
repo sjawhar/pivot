@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Self
 import anyio
 import anyio.to_thread
 
-from pivot import config, dag, parameters, project
+from pivot import config, parameters, project
 from pivot.engine import agent_rpc
 from pivot.engine import graph as engine_graph
 from pivot.engine.types import (
@@ -452,12 +452,14 @@ class Engine:
         project_root = project.get_project_root()
         executor_core.verify_tracked_files(project_root, checkout_missing=checkout_missing)
 
-        # Build bipartite graph (single source of truth)
+        # Build bipartite graph (single source of truth) with validation
         all_stages = self._get_all_stages()
-        self._graph = engine_graph.build_graph(all_stages)
+        from pivot.storage import track
 
-        # Validate dependencies exist
-        dag.build_dag(all_stages, validate=True)
+        tracked_files = track.discover_pvt_files(project_root)
+        self._graph = engine_graph.build_graph(
+            all_stages, validate=True, tracked_files=tracked_files
+        )
 
         # Extract stage-only DAG for execution order
         stage_dag = engine_graph.get_stage_dag(self._graph)
@@ -470,7 +472,9 @@ class Engine:
 
                 raise exceptions.StageNotFoundError(unknown, available_stages=list(registered))
 
-        execution_order = dag.get_execution_order(stage_dag, stages, single_stage=single_stage)
+        execution_order = engine_graph.get_execution_order(
+            stage_dag, stages, single_stage=single_stage
+        )
 
         if not execution_order:
             return {}
