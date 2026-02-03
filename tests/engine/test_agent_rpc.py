@@ -14,8 +14,8 @@ from helpers import wait_for_socket
 from pivot.engine.agent_rpc import (
     AgentRpcHandler,
     AgentRpcSource,
+    BroadcastEventSink,
     EventBuffer,
-    EventSink,
     QueryResult,
     QueryStatusResult,
 )
@@ -266,7 +266,7 @@ def test_agent_rpc_source_conforms_to_protocol() -> None:
 @pytest.mark.anyio
 async def test_agent_event_sink_broadcasts_to_subscribers() -> None:
     """EventSink broadcasts events to all subscribers."""
-    sink = EventSink()
+    sink = BroadcastEventSink()
 
     # Subscribe two clients
     recv1 = await sink.subscribe("client1")
@@ -298,7 +298,7 @@ async def test_agent_event_sink_broadcasts_to_subscribers() -> None:
 @pytest.mark.anyio
 async def test_agent_event_sink_unsubscribe() -> None:
     """EventSink removes client on unsubscribe and closes channel."""
-    sink = EventSink()
+    sink = BroadcastEventSink()
 
     recv = await sink.subscribe("client1")
     await sink.unsubscribe("client1")
@@ -957,8 +957,6 @@ async def test_agent_rpc_source_empty_lines_ignored(tmp_path: Path) -> None:
             msg_with_blanks = '\n\n{"jsonrpc":"2.0","method":"run","id":1}\n\n'
             await conn.send(msg_with_blanks.encode())
 
-            import json
-
             response_line = await conn.receive(4096)
             response = json.loads(response_line.decode())
 
@@ -987,8 +985,6 @@ async def test_agent_rpc_source_message_at_size_boundary(tmp_path: Path) -> None
             # _MAX_MESSAGE_SIZE = 1MB
             max_size = 1024 * 1024
             padding = "x" * (max_size - 100)  # Leave room for JSON structure
-
-            import json
 
             at_limit = json.dumps(
                 {"jsonrpc": "2.0", "method": "run", "id": 1, "params": {"data": padding}}
@@ -1028,8 +1024,6 @@ async def test_agent_rpc_source_run_empty_stages_list(tmp_path: Path) -> None:
         await wait_for_socket(socket_path)
 
         async with await anyio.connect_unix(str(socket_path)) as conn:
-            import json
-
             request = {
                 "jsonrpc": "2.0",
                 "method": "run",
@@ -1105,8 +1099,6 @@ async def test_agent_rpc_source_run_force_invalid_type(tmp_path: Path) -> None:
         await wait_for_socket(socket_path)
 
         async with await anyio.connect_unix(str(socket_path)) as conn:
-            import json
-
             # Send force as string instead of boolean
             request = {
                 "jsonrpc": "2.0",
@@ -1137,7 +1129,7 @@ async def test_event_sink_slow_subscriber_drops_events() -> None:
 
     Critical: Slow clients should not block engine - events must be dropped.
     """
-    sink = EventSink(buffer_size=3)  # Small buffer for testing
+    sink = BroadcastEventSink(buffer_size=3)  # Small buffer for testing
 
     recv = await sink.subscribe("slow_client")
 

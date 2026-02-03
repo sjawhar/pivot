@@ -57,6 +57,7 @@ def is_lock_data(data: object) -> TypeGuard[StorageLockData]:
     """Validate that parsed YAML has valid storage format structure."""
     if not isinstance(data, dict):
         return False
+    # Cast to dict[str, object] for type-safe key access
     typed_data = cast("dict[str, object]", data)
     # Require all required keys (allow extra keys for forward compatibility)
     if not _REQUIRED_LOCK_KEYS.issubset(typed_data.keys()):
@@ -161,6 +162,7 @@ class StageLock:
                 data: object = yaml.load(f, Loader=yaml_config.Loader)
             if not is_lock_data(data):
                 if isinstance(data, dict):
+                    # Cast to get typed keys for debug logging
                     actual_keys = set(cast("dict[str, object]", data).keys())
                     logger.debug(
                         "Lock file validation failed for %s: keys=%s, expected=%s",
@@ -417,8 +419,8 @@ def _atomic_lock_takeover(sentinel: Path, stale_pid: int | None) -> bool:
                 logger.warning(f"Removed stale lock file: {sentinel} (was PID {stale_pid})")
             return True
         return False
-    except OSError as e:
-        logger.debug(f"Lock takeover failed for {sentinel}: {e}")
+    except OSError:
+        logger.debug("Lock takeover failed for %s", sentinel, exc_info=True)
         with contextlib.suppress(OSError):
             os.unlink(tmp_path)
         return False

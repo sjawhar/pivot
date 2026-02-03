@@ -805,8 +805,6 @@ def test_load_deps_invalid_json_raises(tmp_path: pathlib.Path) -> None:
 
 def test_load_deps_wrong_type_in_file(tmp_path: pathlib.Path) -> None:
     """load_deps_from_specs handles type mismatches gracefully."""
-    import json
-
     # Create JSON file with list instead of dict
     (tmp_path / "data.json").write_text(json.dumps([1, 2, 3]))
 

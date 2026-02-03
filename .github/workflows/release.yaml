@@ -55,8 +55,8 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -uo pipefail
-          uvx --from="python-semantic-release@10" semantic-release version || exit $?
-          uvx --from="python-semantic-release@10" semantic-release publish || exit $?
+          uvx --from="python-semantic-release==10.5.3" semantic-release version || exit $?
+          uvx --from="python-semantic-release==10.5.3" semantic-release publish || exit $?
           if [ -d dist ] && [ -n "$(ls -A dist/)" ]; then
             echo "released=true" >> "$GITHUB_OUTPUT"
           fi

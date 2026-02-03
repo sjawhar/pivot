@@ -48,9 +48,6 @@ class PivotFooter(textual.widgets.Static):
 
     DEFAULT_CSS: ClassVar[str] = """
     PivotFooter {
-        dock: bottom;
-        height: 1;
-        background: $surface;
         color: $text-muted;
     }
     """

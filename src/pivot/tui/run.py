@@ -1008,6 +1008,12 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
         except ValueError:
             _logger.debug("Tab index error during next_tab")
 
+    def on_tabbed_content_tab_activated(
+        self, _event: textual.widgets.TabbedContent.TabActivated
+    ) -> None:  # pragma: no cover
+        """Update footer context when tab is clicked."""
+        self._update_footer_context()
+
     def _goto_tab(self, tab_id: str) -> None:  # pragma: no cover
         """Jump to a specific tab."""
         tabs = self._try_query_one("#detail-tabs", textual.widgets.TabbedContent)

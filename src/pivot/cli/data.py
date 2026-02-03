@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import pathlib
 
 import click
@@ -120,8 +121,6 @@ def diff(
             )
             click.echo(output)
         finally:
-            import contextlib
-
             for temp_file in temp_files:
                 with contextlib.suppress(OSError):
                     temp_file.unlink(missing_ok=True)

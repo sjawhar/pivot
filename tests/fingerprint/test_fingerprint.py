@@ -532,8 +532,6 @@ def test_is_user_code_stdlib_via_symlink() -> None:
 
     The _is_stdlib_path check must resolve symlinks to correctly identify stdlib.
     """
-    import math
-
     # math module should be identified as NOT user code
     assert fingerprint.is_user_code(math) is False
     assert fingerprint.is_user_code(math.ceil) is False

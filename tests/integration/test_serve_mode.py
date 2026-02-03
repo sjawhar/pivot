@@ -18,7 +18,7 @@ import pytest
 
 from helpers import register_test_stage, wait_for_socket
 from pivot import config
-from pivot.engine.agent_rpc import AgentRpcHandler, AgentRpcSource, EventSink
+from pivot.engine.agent_rpc import AgentRpcHandler, AgentRpcSource, BroadcastEventSink
 from pivot.engine.engine import Engine
 from pivot.engine.sources import OneShotSource
 
@@ -91,7 +91,7 @@ async def test_socket_creation_and_permissions(
 @pytest.mark.anyio
 async def test_event_sink_broadcasts_to_multiple_subscribers() -> None:
     """EventSink broadcasts events to all subscribers."""
-    sink = EventSink()
+    sink = BroadcastEventSink()
 
     recv1 = await sink.subscribe("client1")
     recv2 = await sink.subscribe("client2")
@@ -119,7 +119,7 @@ async def test_event_sink_broadcasts_to_multiple_subscribers() -> None:
 @pytest.mark.anyio
 async def test_unsubscribe_stops_event_delivery() -> None:
     """Unsubscribed clients stop receiving events."""
-    sink = EventSink()
+    sink = BroadcastEventSink()
 
     recv = await sink.subscribe("client")
 
