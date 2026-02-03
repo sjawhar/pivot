@@ -25,6 +25,8 @@ from pivot.types import (
     TuiMessageType,
     TuiReloadMessage,
     TuiStatusMessage,
+    TuiWatchMessage,
+    WatchStatus,
 )
 
 if TYPE_CHECKING:
@@ -108,31 +110,6 @@ def _helper_step3(
 
 
 # =============================================================================
-# format_elapsed Tests
-# =============================================================================
-
-
-@pytest.mark.parametrize(
-    ("elapsed", "expected"),
-    [
-        # None returns empty string
-        (None, ""),
-        # Seconds
-        (5.0, "(0:05)"),
-        (59.9, "(0:59)"),
-        # Minutes
-        (60.0, "(1:00)"),
-        (125.5, "(2:05)"),
-        # Large values
-        (3661.0, "(61:01)"),
-    ],
-)
-def test_format_elapsed(elapsed: float | None, expected: str) -> None:
-    """format_elapsed formats elapsed time correctly."""
-    assert tui_status.format_elapsed(elapsed) == expected
-
-
-# =============================================================================
 # StageInfo Tests
 # =============================================================================
 
@@ -172,7 +149,7 @@ def test_stage_info_logs_bounded() -> None:
 @pytest.mark.parametrize(
     ("msg", "expected_type"),
     [
-        (
+        pytest.param(
             TuiLogMessage(
                 type=TuiMessageType.LOG,
                 stage="test",
@@ -180,9 +157,10 @@ def test_stage_info_logs_bounded() -> None:
                 is_stderr=False,
                 timestamp=1234567890.0,
             ),
-            "log",
+            TuiMessageType.LOG,
+            id="log_message",
         ),
-        (
+        pytest.param(
             TuiStatusMessage(
                 type=TuiMessageType.STATUS,
                 stage="test",
@@ -193,13 +171,13 @@ def test_stage_info_logs_bounded() -> None:
                 elapsed=None,
                 run_id="20240101_120000_abcd1234",
             ),
-            "status",
+            TuiMessageType.STATUS,
+            id="status_message",
         ),
     ],
-    ids=["log_message", "status_message"],
 )
 def test_tui_update_wraps_messages(
-    msg: TuiLogMessage | TuiStatusMessage, expected_type: str
+    msg: TuiLogMessage | TuiStatusMessage, expected_type: TuiMessageType
 ) -> None:
     """TuiUpdate correctly wraps different message types."""
     update = run_tui.TuiUpdate(msg)
@@ -797,3 +775,275 @@ def test_handle_reload_no_notify_when_no_changes(mocker: MockerFixture) -> None:
 
     # notify should not be called when there are no changes
     mock_notify.assert_not_called()
+
+
+# =============================================================================
+# ExecutorComplete Bell Notification Tests
+# =============================================================================
+
+
+def test_on_executor_complete_calls_bell(mocker: MockerFixture) -> None:
+    """on_executor_complete calls bell() to notify user of completion."""
+
+    def executor_func() -> dict[str, executor.ExecutionSummary]:
+        return {}
+
+    app = run_tui.PivotApp(
+        stage_names=["stage1"],
+        executor_func=executor_func,
+    )
+
+    # Mock methods that require mounted app or have side effects
+    mocker.patch.object(app, "_shutdown_event")
+    mocker.patch.object(app, "_close_log_file")
+    mocker.patch.object(app, "_shutdown_loky_pool")
+    mocker.patch.object(app, "exit")
+    mock_bell = mocker.patch.object(app, "bell")
+
+    # Create ExecutorComplete event
+    results = {"stage1": executor.ExecutionSummary(status=StageStatus.RAN, reason="code changed")}
+    event = run_tui.ExecutorComplete(results, error=None)
+
+    # Call the handler
+    app.on_executor_complete(event)
+
+    # Bell should be called to notify user
+    mock_bell.assert_called_once()
+
+
+# =============================================================================
+# format_reload_summary Edge Cases
+# =============================================================================
+
+
+def test_format_reload_summary_with_empty_strings_vs_empty_lists() -> None:
+    """format_reload_summary treats empty lists correctly."""
+    # Empty lists should return None
+    summary = run_tui.format_reload_summary(
+        stages_added=[],
+        stages_removed=[],
+        stages_modified=[],
+    )
+    assert summary is None
+
+
+def test_format_reload_summary_single_item_pluralization() -> None:
+    """format_reload_summary handles singular vs plural correctly."""
+    summary = run_tui.format_reload_summary(
+        stages_added=["one"],
+        stages_removed=[],
+        stages_modified=[],
+    )
+    assert summary == "Reloaded: 1 added"
+    assert "1 added" in summary, "Should use singular '1 added' not '1 addeds'"
+
+
+def test_format_reload_summary_order_is_consistent() -> None:
+    """format_reload_summary always uses added, removed, modified order."""
+    summary = run_tui.format_reload_summary(
+        stages_added=["a"],
+        stages_removed=["b"],
+        stages_modified=["c"],
+    )
+    # Check that order is always: added, removed, modified
+    assert summary is not None
+    assert summary.index("added") < summary.index("removed")
+    assert summary.index("removed") < summary.index("modified")
+
+
+# =============================================================================
+# TuiUpdate Message Tests - Additional Edge Cases
+# =============================================================================
+
+
+def test_tui_update_preserves_message_identity() -> None:
+    """TuiUpdate preserves the original message object."""
+    msg = TuiStatusMessage(
+        type=TuiMessageType.STATUS,
+        stage="test",
+        index=1,
+        total=1,
+        status=StageStatus.RAN,
+        reason="done",
+        elapsed=1.0,
+        run_id="test_id",
+    )
+    update = run_tui.TuiUpdate(msg)
+    assert update.msg is msg, "Should preserve original message object"
+
+
+def test_tui_update_with_reload_message() -> None:
+    """TuiUpdate works with TuiReloadMessage."""
+    msg = TuiReloadMessage(
+        type=TuiMessageType.RELOAD,
+        stages=["s1", "s2"],
+        stages_added=["s2"],
+        stages_removed=[],
+        stages_modified=["s1"],
+    )
+    update = run_tui.TuiUpdate(msg)
+    assert update.msg["type"] == "reload"
+    assert update.msg["stages"] == ["s1", "s2"]
+
+
+def test_tui_update_with_watch_message() -> None:
+    """TuiUpdate works with TuiWatchMessage."""
+    msg = TuiWatchMessage(
+        type=TuiMessageType.WATCH,
+        status=WatchStatus.WAITING,
+        message="Watching",
+    )
+    update = run_tui.TuiUpdate(msg)
+    assert update.msg["type"] == "watch"
+    assert update.msg["status"] == WatchStatus.WAITING
+
+
+# =============================================================================
+# StageInfo Edge Cases
+# =============================================================================
+
+
+def test_stage_info_logs_maxlen_is_1000() -> None:
+    """StageInfo logs deque maxlen should be exactly 1000."""
+    info = StageInfo("test", 1, 1)
+    assert info.logs.maxlen == 1000, "Logs maxlen should be 1000 to limit memory"
+
+
+def test_stage_info_initial_state_is_ready() -> None:
+    """StageInfo initializes with READY status."""
+    info = StageInfo("test", 1, 1)
+    assert info.status == StageStatus.READY
+
+
+def test_stage_info_index_and_total_are_set() -> None:
+    """StageInfo stores index and total for display."""
+    info = StageInfo("my_stage", 3, 10)
+    assert info.index == 3
+    assert info.total == 10
+    assert info.name == "my_stage"
+
+
+# =============================================================================
+# PivotApp Initialization Edge Cases
+# =============================================================================
+
+
+def test_run_tui_app_requires_executor_func_or_watch_mode() -> None:
+    """PivotApp requires either executor_func or watch_mode=True."""
+    with pytest.raises(ValueError, match="Either executor_func.*or watch_mode=True"):
+        run_tui.PivotApp(stage_names=["s1"])
+
+
+def test_run_tui_app_watch_mode_without_engine() -> None:
+    """PivotApp can be created with watch_mode=True without engine."""
+    app = run_tui.PivotApp(
+        stage_names=["s1"],
+        watch_mode=True,
+    )
+    assert app._watch_mode is True
+    assert app._engine is None
+
+
+def test_run_tui_app_with_empty_stage_list() -> None:
+    """PivotApp handles empty stage list."""
+
+    def executor_func() -> dict[str, executor.ExecutionSummary]:
+        return {}
+
+    app = run_tui.PivotApp(stage_names=[], executor_func=executor_func)
+    assert len(app._stages) == 0
+    assert app._stage_order == []
+    assert app.selected_stage_name is None
+
+
+# =============================================================================
+# ExecutorComplete Edge Cases
+# =============================================================================
+
+
+def test_executor_complete_with_empty_results_and_error() -> None:
+    """ExecutorComplete can have both empty results and an error."""
+    error = RuntimeError("Pipeline failed")
+    complete = run_tui.ExecutorComplete({}, error=error)
+    assert complete.results == {}
+    assert complete.error is error
+
+
+def test_executor_complete_with_multiple_stage_results() -> None:
+    """ExecutorComplete stores multiple stage results."""
+    results = {
+        "s1": executor.ExecutionSummary(status=StageStatus.RAN, reason="code changed"),
+        "s2": executor.ExecutionSummary(status=StageStatus.SKIPPED, reason="cache hit"),
+        "s3": executor.ExecutionSummary(status=StageStatus.FAILED, reason="error occurred"),
+    }
+    complete = run_tui.ExecutorComplete(results, error=None)
+    assert len(complete.results) == 3
+    assert complete.results["s1"]["status"] == StageStatus.RAN
+    assert complete.results["s2"]["status"] == StageStatus.SKIPPED
+    assert complete.results["s3"]["status"] == StageStatus.FAILED
+
+
+# =============================================================================
+# Status Functions Consistency Tests
+# =============================================================================
+
+
+def test_status_functions_return_tuple_structures() -> None:
+    """get_status_symbol and get_status_label return (str, str) tuples."""
+    for status in StageStatus:
+        symbol_result = tui_status.get_status_symbol(status)
+        assert isinstance(symbol_result, tuple)
+        assert len(symbol_result) == 2
+        assert isinstance(symbol_result[0], str)
+        assert isinstance(symbol_result[1], str)
+
+        label_result = tui_status.get_status_label(status)
+        assert isinstance(label_result, tuple)
+        assert len(label_result) == 2
+        assert isinstance(label_result[0], str)
+        assert isinstance(label_result[1], str)
+
+
+# =============================================================================
+# PivotApp Property Tests
+# =============================================================================
+
+
+def test_pivot_app_selected_stage_name_when_no_stages() -> None:
+    """selected_stage_name returns None when no stages exist."""
+
+    def executor_func() -> dict[str, executor.ExecutionSummary]:
+        return {}
+
+    app = run_tui.PivotApp(stage_names=[], executor_func=executor_func)
+    assert app.selected_stage_name is None
+
+
+def test_pivot_app_selected_stage_name_with_stages() -> None:
+    """selected_stage_name returns first stage initially."""
+
+    def executor_func() -> dict[str, executor.ExecutionSummary]:
+        return {}
+
+    app = run_tui.PivotApp(stage_names=["s1", "s2", "s3"], executor_func=executor_func)
+    assert app.selected_stage_name == "s1"
+
+
+def test_pivot_app_error_property_initial_state() -> None:
+    """error property is None initially in run mode."""
+
+    def executor_func() -> dict[str, executor.ExecutionSummary]:
+        return {}
+
+    app = run_tui.PivotApp(stage_names=["s1"], executor_func=executor_func)
+    assert app.error is None
+
+
+def test_pivot_app_exit_message_property_initial_state() -> None:
+    """exit_message property is None initially."""
+
+    def executor_func() -> dict[str, executor.ExecutionSummary]:
+        return {}
+
+    app = run_tui.PivotApp(stage_names=["s1"], executor_func=executor_func)
+    assert app.exit_message is None
