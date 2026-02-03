@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 
 from pivot import cli, project
 from pivot import config as config_mod
+from pivot.cli import checkout as checkout_mod
 from pivot.remote import sync as transfer
 from pivot.storage import state
 from pivot.types import TransferSummary
@@ -195,6 +196,169 @@ def test_push_with_targets(
 
 
 # =============================================================================
+# Fetch Command Tests
+# =============================================================================
+
+
+def test_fetch_dry_run_with_targets(
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mocker: MockerFixture,
+) -> None:
+    """Fetch dry run shows what would be fetched for targets."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        monkeypatch.setattr(project, "_project_root_cache", None)
+
+        mocker.patch.object(config_mod, "get_cache_dir", return_value=tmp_path / ".pivot/cache")
+        mocker.patch.object(
+            transfer,
+            "create_remote_from_name",
+            return_value=(mocker.MagicMock(), "my-remote"),
+        )
+        mocker.patch.object(transfer, "get_target_hashes", return_value={"hash1", "hash2", "hash3"})
+        mocker.patch.object(transfer, "get_local_cache_hashes", return_value={"hash1"})
+
+        result = runner.invoke(cli.cli, ["fetch", "--dry-run", "train_model"])
+
+        assert result.exit_code == 0
+        assert "Would fetch 2 file(s) from 'my-remote'" in result.output
+
+
+def test_fetch_dry_run_all(
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mocker: MockerFixture,
+) -> None:
+    """Fetch dry run without stages lists all remote files."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        monkeypatch.setattr(project, "_project_root_cache", None)
+
+        mock_remote = mocker.MagicMock()
+
+        async def mock_list_hashes() -> set[str]:
+            return {"remote1", "remote2", "remote3"}
+
+        mock_remote.list_hashes = mock_list_hashes
+
+        mocker.patch.object(config_mod, "get_cache_dir", return_value=tmp_path / ".pivot/cache")
+        mocker.patch.object(
+            transfer,
+            "create_remote_from_name",
+            return_value=(mock_remote, "origin"),
+        )
+        mocker.patch.object(transfer, "get_local_cache_hashes", return_value={"remote1"})
+
+        result = runner.invoke(cli.cli, ["fetch", "--dry-run"])
+
+        assert result.exit_code == 0
+        assert "Would fetch 2 file(s) from 'origin'" in result.output
+
+
+def test_fetch_success(
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mocker: MockerFixture,
+) -> None:
+    """Fetch command downloads files to cache and shows summary."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        cache_dir = tmp_path / ".pivot" / "cache"
+        cache_dir.mkdir(parents=True)
+        monkeypatch.setattr(project, "_project_root_cache", None)
+
+        mocker.patch.object(config_mod, "get_cache_dir", return_value=cache_dir)
+        mocker.patch.object(
+            transfer,
+            "create_remote_from_name",
+            return_value=(mocker.MagicMock(), "origin"),
+        )
+
+        mock_pull = mocker.patch.object(
+            transfer,
+            "pull",
+            return_value=TransferSummary(transferred=3, skipped=1, failed=0, errors=[]),
+        )
+
+        mock_state_db = mocker.MagicMock()
+        mocker.patch.object(state, "StateDB", return_value=mock_state_db)
+
+        result = runner.invoke(cli.cli, ["fetch"])
+
+        assert result.exit_code == 0
+        assert "Fetched from 'origin': 3 transferred, 1 skipped, 0 failed" in result.output
+        mock_pull.assert_called_once()
+
+
+def test_fetch_with_errors(
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mocker: MockerFixture,
+) -> None:
+    """Fetch command shows errors when downloads fail."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        cache_dir = tmp_path / ".pivot" / "cache"
+        cache_dir.mkdir(parents=True)
+        monkeypatch.setattr(project, "_project_root_cache", None)
+
+        mocker.patch.object(config_mod, "get_cache_dir", return_value=cache_dir)
+        mocker.patch.object(
+            transfer,
+            "create_remote_from_name",
+            return_value=(mocker.MagicMock(), "origin"),
+        )
+        mocker.patch.object(
+            transfer,
+            "pull",
+            return_value=TransferSummary(
+                transferred=2,
+                skipped=0,
+                failed=2,
+                errors=["Download failed: hash1", "Download failed: hash2"],
+            ),
+        )
+
+        mock_state_db = mocker.MagicMock()
+        mocker.patch.object(state, "StateDB", return_value=mock_state_db)
+
+        result = runner.invoke(cli.cli, ["fetch"])
+
+        assert result.exit_code == 1, "Should exit non-zero when transfers fail"
+        assert "2 transferred" in result.output
+        assert "2 failed" in result.output
+        assert "Download failed: hash1" in result.output
+
+
+def test_fetch_exception_shows_click_error(
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mocker: MockerFixture,
+) -> None:
+    """Fetch exception is wrapped in ClickException with user-friendly message."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        monkeypatch.setattr(project, "_project_root_cache", None)
+
+        mocker.patch.object(
+            config_mod,
+            "get_cache_dir",
+            side_effect=RuntimeError("Test error"),
+        )
+
+        result = runner.invoke(cli.cli, ["fetch"])
+
+        assert result.exit_code != 0
+        assert "Test error" in result.output
+
+
+# =============================================================================
 # Pull Command Tests
 # =============================================================================
 
@@ -289,10 +453,13 @@ def test_pull_success(
         mock_state_db = mocker.MagicMock()
         mocker.patch.object(state, "StateDB", return_value=mock_state_db)
 
+        # Mock checkout to prevent actual file restoration
+        mocker.patch.object(checkout_mod, "checkout")
+
         result = runner.invoke(cli.cli, ["pull"])
 
         assert result.exit_code == 0
-        assert "Pulled from 'origin': 3 transferred, 1 skipped, 0 failed" in result.output
+        assert "Fetched from 'origin': 3 transferred, 1 skipped, 0 failed" in result.output
         mock_pull.assert_called_once()
 
 
@@ -376,6 +543,9 @@ def test_pull_with_stages(
 
         mock_state_db = mocker.MagicMock()
         mocker.patch.object(state, "StateDB", return_value=mock_state_db)
+
+        # Mock checkout to prevent actual file restoration
+        mocker.patch.object(checkout_mod, "checkout")
 
         result = runner.invoke(cli.cli, ["pull", "train_model", "evaluate"])
 
@@ -499,3 +669,77 @@ def test_remote_list_shows_default(
 
         assert result.exit_code == 0
         assert "(default)" in result.output
+
+
+# =============================================================================
+# Remote Commands - Quiet Mode Tests
+# =============================================================================
+
+
+def test_push_quiet_mode_no_output(
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mocker: MockerFixture,
+) -> None:
+    """Push with --quiet produces no output."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        cache_dir = tmp_path / ".pivot" / "cache"
+        cache_dir.mkdir(parents=True)
+        monkeypatch.setattr(project, "_project_root_cache", None)
+
+        mocker.patch.object(config_mod, "get_cache_dir", return_value=cache_dir)
+        mocker.patch.object(
+            transfer,
+            "create_remote_from_name",
+            return_value=(mocker.MagicMock(), "origin"),
+        )
+        mocker.patch.object(transfer, "get_local_cache_hashes", return_value={"hash1"})
+        mocker.patch.object(
+            transfer,
+            "push",
+            return_value=TransferSummary(transferred=1, skipped=0, failed=0, errors=[]),
+        )
+
+        mock_state_db = mocker.MagicMock()
+        mocker.patch.object(state, "StateDB", return_value=mock_state_db)
+
+        result = runner.invoke(cli.cli, ["--quiet", "push"])
+
+        assert result.exit_code == 0
+        assert result.output.strip() == "", "Quiet mode should suppress output"
+
+
+def test_fetch_quiet_mode_no_output(
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mocker: MockerFixture,
+) -> None:
+    """Fetch with --quiet produces no output."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".git").mkdir()
+        cache_dir = tmp_path / ".pivot" / "cache"
+        cache_dir.mkdir(parents=True)
+        monkeypatch.setattr(project, "_project_root_cache", None)
+
+        mocker.patch.object(config_mod, "get_cache_dir", return_value=cache_dir)
+        mocker.patch.object(
+            transfer,
+            "create_remote_from_name",
+            return_value=(mocker.MagicMock(), "origin"),
+        )
+        mocker.patch.object(
+            transfer,
+            "pull",
+            return_value=TransferSummary(transferred=1, skipped=0, failed=0, errors=[]),
+        )
+
+        mock_state_db = mocker.MagicMock()
+        mocker.patch.object(state, "StateDB", return_value=mock_state_db)
+
+        result = runner.invoke(cli.cli, ["--quiet", "fetch"])
+
+        assert result.exit_code == 0
+        assert result.output.strip() == "", "Quiet mode should suppress output"

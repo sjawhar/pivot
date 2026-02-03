@@ -6,17 +6,11 @@ import click
 
 from pivot import config, project
 from pivot.cli import decorators as cli_decorators
-from pivot.cli._run_common import ensure_stages_registered
 from pivot.storage import cache, restore
 from pivot.types import DataDiffResult, OutputFormat
 
 
-@click.group()
-def data() -> None:
-    """Inspect and compare data files."""
-
-
-@data.command("diff")
+@cli_decorators.pivot_command()
 @click.argument("targets", nargs=-1, required=True)
 @click.option("--key", "key_cols", help="Comma-separated key columns for row matching")
 @click.option("--positional", is_flag=True, help="Use positional (row-by-row) matching")
@@ -37,8 +31,7 @@ def data() -> None:
 @click.option(
     "--max-rows", default=None, type=click.IntRange(min=1), help="Max rows for comparison"
 )
-@cli_decorators.with_error_handling
-def data_diff(
+def diff(
     targets: tuple[str, ...],
     key_cols: str | None,
     positional: bool,
@@ -53,8 +46,6 @@ def data_diff(
     deletions, and modifications. Detects reorder-only changes.
     """
     from pivot.show import data as data_module
-
-    ensure_stages_registered()
 
     max_rows = max_rows if max_rows is not None else config.get_diff_max_rows()
 
@@ -87,7 +78,10 @@ def data_diff(
     hash_diffs = data_module.diff_data_hashes(filtered_head_hashes, workspace_hashes)
 
     if not hash_diffs:
-        click.echo("No data file changes detected.")
+        if output_format == OutputFormat.JSON:
+            click.echo("[]")
+        else:
+            click.echo("No data file changes detected.")
         return
 
     if no_tui or summary:
@@ -126,8 +120,11 @@ def data_diff(
             )
             click.echo(output)
         finally:
+            import contextlib
+
             for temp_file in temp_files:
-                temp_file.unlink(missing_ok=True)
+                with contextlib.suppress(OSError):
+                    temp_file.unlink(missing_ok=True)
     else:
         # Launch TUI
         from pivot.tui import diff as data_tui
@@ -139,7 +136,7 @@ def data_diff(
         )
 
 
-@data.command("get")
+@cli_decorators.pivot_command(auto_discover=False)
 @click.argument("targets", nargs=-1, required=True)
 @click.option(
     "--rev",
@@ -161,8 +158,7 @@ def data_diff(
     help="Checkout mode for restoration (default: project config or hardlink)",
 )
 @click.option("--force", "-f", is_flag=True, help="Overwrite existing files")
-@cli_decorators.with_error_handling
-def data_get(
+def get(
     targets: tuple[str, ...],
     rev: str,
     output: pathlib.Path | None,
@@ -175,9 +171,9 @@ def data_get(
 
     \b
     Examples:
-      pivot data get --rev v1.0 model.pkl              # Get file from tag
-      pivot data get --rev v1.0 model.pkl -o old.pkl   # Get file to alternate location
-      pivot data get --rev abc123 train                # Get all outputs from stage
+      pivot get --rev v1.0 model.pkl              # Get file from tag
+      pivot get --rev v1.0 model.pkl -o old.pkl   # Get file to alternate location
+      pivot get --rev abc123 train                # Get all outputs from stage
     """
     cache_dir = config.get_cache_dir()
     state_dir = config.get_state_dir()
@@ -186,7 +182,7 @@ def data_get(
         [cache.CheckoutMode(checkout_mode)] if checkout_mode else config.get_checkout_mode_order()
     )
 
-    messages = restore.restore_targets_from_revision(
+    messages, success = restore.restore_targets_from_revision(
         targets=list(targets),
         rev=rev,
         output=output,
@@ -198,3 +194,6 @@ def data_get(
 
     for msg in messages:
         click.echo(msg)
+
+    if not success:
+        raise SystemExit(1)

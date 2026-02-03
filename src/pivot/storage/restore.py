@@ -294,21 +294,24 @@ def restore_file(
             try:
                 dest_path.parent.mkdir(parents=True, exist_ok=True)
                 dest_path.write_bytes(content)
-                # Cache the fetched content for future use
-                cached_path = cache.get_cache_path(cache_dir / "files", file_hash)
-                cached_path.parent.mkdir(parents=True, exist_ok=True)
-                cached_path.write_bytes(content)
-                return RestoreResult(
-                    status=RestoreStatus.RESTORED,
-                    path=path_str,
-                    message=f"Restored: {dest_path} (from remote)",
-                )
             except OSError as e:
                 return RestoreResult(
                     status=RestoreStatus.ERROR,
                     path=path_str,
                     message=f"Error: {dest_path} - failed to write from remote: {e}",
                 )
+            # Cache the fetched content for future use (best effort)
+            try:
+                cached_path = cache.get_cache_path(cache_dir / "files", file_hash)
+                cached_path.parent.mkdir(parents=True, exist_ok=True)
+                cached_path.write_bytes(content)
+            except OSError:
+                pass  # Caching failure is non-fatal
+            return RestoreResult(
+                status=RestoreStatus.RESTORED,
+                path=path_str,
+                message=f"Restored: {dest_path} (from remote)",
+            )
 
     return RestoreResult(
         status=RestoreStatus.ERROR,
@@ -325,8 +328,12 @@ def restore_targets_from_revision(
     state_dir: pathlib.Path,
     checkout_modes: list[cache.CheckoutMode],
     force: bool,
-) -> list[str]:
-    """Restore targets from a git revision. Returns list of status messages."""
+) -> tuple[list[str], bool]:
+    """Restore targets from a git revision.
+
+    Returns:
+        Tuple of (messages, success) where success is False if any files failed.
+    """
     proj_root = project.get_project_root()
 
     # Validate revision exists
@@ -343,7 +350,7 @@ def restore_targets_from_revision(
             raise exceptions.GetError("--output/-o can only be used with a single target")
         if target_infos[0]["target_type"] == TargetType.STAGE:
             raise exceptions.GetError(
-                "--output/-o cannot be used with stage names (stages have multiple outputs)"
+                "--output/-o cannot be used with stage names (use file path instead)"
             )
         if len(target_infos[0]["paths"]) != 1:
             raise exceptions.GetError("--output/-o cannot be used with directory targets")
@@ -374,4 +381,4 @@ def restore_targets_from_revision(
         messages.append("")
         messages.append(f"Failed to restore {len(errors)} file(s). See errors above.")
 
-    return messages
+    return (messages, len(errors) == 0)
