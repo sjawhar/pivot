@@ -13,6 +13,37 @@ import textual.widgets
 from pivot.tui.types import LogEntry
 from pivot.types import StageStatus
 
+# Matches: [optional ANSI][optional timestamp][LEVEL][delimiter]
+# Examples: "INFO: msg", "[DEBUG] msg", "2024-01-01 10:00:00 WARNING msg"
+_LOG_LEVEL_PATTERN = re.compile(
+    r"^(?:\x1b\[[0-9;]*m)*"  # Skip leading ANSI escape sequences
+    + r"(?:\[?[\d\-:.\s,TZ]+\]?\s*)?"  # Optional timestamp (various formats)
+    + r"(?:\[?(INFO|WARNING|WARN|ERROR|DEBUG|CRITICAL|FATAL)\]?)"  # Level
+    + r"[\s:\-\]]",  # Delimiter after level
+    re.IGNORECASE,
+)
+
+# Single dict: level string -> Rich style (None = default color)
+_LEVEL_STYLES: dict[str, str | None] = {
+    "DEBUG": "dim",
+    "INFO": None,
+    "WARNING": "yellow",
+    "WARN": "yellow",
+    "ERROR": "red",
+    "CRITICAL": "red bold",
+    "FATAL": "red bold",
+}
+
+
+def _get_line_style(line: str, is_stderr: bool) -> str | None:
+    """Determine Rich style for a log line based on level or stderr status."""
+    if match := _LOG_LEVEL_PATTERN.match(line):
+        return _LEVEL_STYLES.get(match.group(1).upper())
+    if is_stderr:
+        return "red"  # Fallback for unrecognized stderr
+    return None
+
+
 if TYPE_CHECKING:
     from pivot.tui.types import StageInfo
 
@@ -93,8 +124,9 @@ class StageLogPanel(textual.widgets.RichLog):
         else:
             time_str = time.strftime("[%H:%M:%S]", time.localtime(timestamp))
             escaped_line = rich.markup.escape(line)
-            if is_stderr:
-                self.write(f"[dim]{time_str}[/] [red]{escaped_line}[/]")
+            style = _get_line_style(line, is_stderr)
+            if style:
+                self.write(f"[dim]{time_str}[/] [{style}]{escaped_line}[/]")
             else:
                 self.write(f"[dim]{time_str}[/] {escaped_line}")
         self.refresh()
@@ -114,8 +146,10 @@ class StageLogPanel(textual.widgets.RichLog):
 
         time_str = time.strftime("[%H:%M:%S]", time.localtime(timestamp))
         escaped_line = rich.markup.escape(line)
-        if is_stderr:
-            self.write(f"[dim]{time_str}[/] [red]{escaped_line}[/]")
+        style = _get_line_style(line, is_stderr)
+
+        if style:
+            self.write(f"[dim]{time_str}[/] [{style}]{escaped_line}[/]")
         else:
             self.write(f"[dim]{time_str}[/] {escaped_line}")
 
@@ -204,14 +238,18 @@ class StageLogPanel(textual.widgets.RichLog):
             else rich.markup.escape(entry.line)
         )
 
-        # Build format: stderr gets [red], current match gets background highlight
-        if entry.is_stderr:
-            if is_current:
-                self.write(f"[dim]{time_str}[/] [on yellow][red]{text}[/][/]")
+        # Determine style based on log level (or stderr fallback)
+        style = _get_line_style(entry.line, entry.is_stderr)
+
+        # Current match gets background highlight (yellow for red text, dark_blue otherwise)
+        if is_current:
+            bg = "on yellow" if style and "red" in style else "on dark_blue"
+            if style:
+                self.write(f"[dim]{time_str}[/] [{bg} {style}]{text}[/]")
             else:
-                self.write(f"[dim]{time_str}[/] [red]{text}[/]")
-        elif is_current:
-            self.write(f"[dim]{time_str}[/] [on dark_blue]{text}[/]")
+                self.write(f"[dim]{time_str}[/] [{bg}]{text}[/]")
+        elif style:
+            self.write(f"[dim]{time_str}[/] [{style}]{text}[/]")
         else:
             self.write(f"[dim]{time_str}[/] {text}")
 
