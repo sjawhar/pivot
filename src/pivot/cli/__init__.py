@@ -9,9 +9,8 @@ import click
 # Command categories for organized help output
 COMMAND_CATEGORIES = {
     "Pipeline": ["run", "repro", "status", "verify", "commit"],
-    "Inspection": ["list", "dag", "metrics", "params", "plots", "data", "history", "show"],
-    "Versioning": ["track", "checkout"],
-    "Remote": ["remote", "push", "pull"],
+    "Sync": ["checkout", "fetch", "get", "pull", "push", "remote", "track"],
+    "Inspection": ["dag", "diff", "history", "list", "metrics", "params", "plots", "show"],
     "Other": [
         "init",
         "export",
@@ -54,8 +53,10 @@ _LAZY_COMMANDS: dict[str, tuple[str, str, str]] = {
     "params": ("pivot.cli.params", "params", "Display and compare parameters."),
     "remote": ("pivot.cli.remote", "remote", "Manage remote storage for cache synchronization."),
     "push": ("pivot.cli.remote", "push", "Push cached outputs to remote storage."),
-    "pull": ("pivot.cli.remote", "pull", "Pull cached outputs from remote storage."),
-    "data": ("pivot.cli.data", "data", "Inspect and compare data files."),
+    "fetch": ("pivot.cli.remote", "fetch", "Fetch cached outputs from remote to local cache."),
+    "pull": ("pivot.cli.remote", "pull", "Pull and restore outputs from remote storage."),
+    "diff": ("pivot.cli.data", "diff", "Compare data files against git HEAD."),
+    "get": ("pivot.cli.data", "get", "Retrieve files from a specific git revision."),
     "completion": ("pivot.cli.completion", "completion_cmd", "Generate shell completion script."),
     "config": ("pivot.cli.config", "config_cmd", "View and modify Pivot configuration."),
     "history": ("pivot.cli.history", "history", "List recent pipeline runs."),
@@ -99,34 +100,31 @@ class PivotGroup(click.Group):
     @override
     def format_commands(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
         """Format commands grouped by category using cached help strings."""
-        commands: list[tuple[str, str]] = []
+        # Build reverse lookup: command name -> category
+        cmd_to_category: dict[str, str] = {}
+        for category, cmd_names in COMMAND_CATEGORIES.items():
+            for cmd_name in cmd_names:
+                cmd_to_category[cmd_name] = category
+
+        # Group commands by category
+        categorized: dict[str, list[tuple[str, str]]] = {cat: [] for cat in COMMAND_CATEGORIES}
+        uncategorized: list[tuple[str, str]] = []
+
         for name in self.list_commands(ctx):
             if name not in _LAZY_COMMANDS:
                 continue
             _module, _attr, help_text = _LAZY_COMMANDS[name]
-            commands.append((name, help_text))
-
-        if not commands:
-            return
-
-        categorized: dict[str, list[tuple[str, str]]] = {cat: [] for cat in COMMAND_CATEGORIES}
-        uncategorized: list[tuple[str, str]] = []
-
-        for name, help_text in commands:
-            found = False
-            for cat, cmd_names in COMMAND_CATEGORIES.items():
-                if name in cmd_names:
-                    categorized[cat].append((name, help_text))
-                    found = True
-                    break
-            if not found:
+            category = cmd_to_category.get(name)
+            if category:
+                categorized[category].append((name, help_text))
+            else:
                 uncategorized.append((name, help_text))
 
+        # Output each category
         for category, cmds in categorized.items():
-            if not cmds:
-                continue
-            with formatter.section(f"{category} Commands"):
-                formatter.write_dl(cmds)
+            if cmds:
+                with formatter.section(f"{category} Commands"):
+                    formatter.write_dl(cmds)
 
         if uncategorized:
             with formatter.section("Other Commands"):

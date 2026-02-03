@@ -274,7 +274,7 @@ def test_restore_targets_from_revision_git_file(
     state_dir = repo_path / ".pivot"
     output_path = repo_path / "restored.txt"
 
-    messages = restore.restore_targets_from_revision(
+    messages, _ = restore.restore_targets_from_revision(
         targets=["file.txt"],
         rev=sha[:7],
         output=output_path,
@@ -306,7 +306,7 @@ def test_restore_targets_from_revision_skip_existing(
     cache_dir = repo_path / ".pivot" / "cache"
     state_dir = repo_path / ".pivot"
 
-    messages = restore.restore_targets_from_revision(
+    messages, _ = restore.restore_targets_from_revision(
         targets=["file.txt"],
         rev=sha[:7],
         output=output_path,
@@ -338,7 +338,7 @@ def test_restore_targets_from_revision_force_overwrite(
     cache_dir = repo_path / ".pivot" / "cache"
     state_dir = repo_path / ".pivot"
 
-    messages = restore.restore_targets_from_revision(
+    messages, _ = restore.restore_targets_from_revision(
         targets=["file.txt"],
         rev=sha[:7],
         output=output_path,
@@ -431,7 +431,7 @@ def test_restore_file_cache_miss_error(git_repo: GitRepo, monkeypatch: pytest.Mo
     cache_dir = repo_path / ".pivot" / "cache"
     state_dir = repo_path / ".pivot"
 
-    messages = restore.restore_targets_from_revision(
+    messages, _ = restore.restore_targets_from_revision(
         targets=["data.csv"],
         rev=sha[:7],
         output=None,
@@ -472,7 +472,7 @@ def test_restore_file_from_cache(git_repo: GitRepo, monkeypatch: pytest.MonkeyPa
 
     output_path = repo_path / "restored_data.csv"
 
-    messages = restore.restore_targets_from_revision(
+    messages, _ = restore.restore_targets_from_revision(
         targets=["data.csv"],
         rev=sha[:7],
         output=output_path,

@@ -13,6 +13,8 @@ from pivot.tui import console
 if TYPE_CHECKING:
     from click.testing import CliRunner
 
+    from pivot.pipeline.pipeline import Pipeline
+
 
 # =============================================================================
 # Module-level stage functions for testing (required for pickling)
@@ -137,7 +139,7 @@ def test_cli_list_command_exists(runner: CliRunner) -> None:
 
 def test_cli_list_shows_registered_stages(
     runner: CliRunner,
-    mock_discovery: object,  # type: ignore[type-arg]
+    mock_discovery: Pipeline,
 ) -> None:
     """List should show registered stages."""
     register_test_stage(_stage_my_stage, name="my_stage")
@@ -149,7 +151,7 @@ def test_cli_list_shows_registered_stages(
 
 def test_cli_list_verbose_shows_details(
     runner: CliRunner,
-    mock_discovery: object,  # type: ignore[type-arg]
+    mock_discovery: Pipeline,
 ) -> None:
     """List --verbose should show deps and outputs."""
     register_test_stage(_stage_with_input, name="my_stage")
@@ -624,8 +626,8 @@ def test_cli_help_shows_categorized_commands(runner: CliRunner) -> None:
     assert result.exit_code == 0
     assert "Pipeline Commands:" in result.output
     assert "Inspection Commands:" in result.output
-    assert "Versioning Commands:" in result.output
-    assert "Remote Commands:" in result.output
+    assert "Sync Commands:" in result.output
+    assert "Other Commands:" in result.output
 
 
 def test_cli_help_contains_pipeline_commands(runner: CliRunner) -> None:
@@ -648,7 +650,7 @@ def test_cli_help_contains_inspection_commands(runner: CliRunner) -> None:
     assert "metrics" in result.output, "Should show 'metrics' command"
     assert "params" in result.output, "Should show 'params' command"
     assert "plots" in result.output, "Should show 'plots' command"
-    assert "data" in result.output, "Should show 'data' command"
+    assert "diff" in result.output, "Should show 'diff' command"
 
 
 # =============================================================================
