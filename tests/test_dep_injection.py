@@ -398,59 +398,6 @@ def test_load_deps_list_path(tmp_path: pathlib.Path) -> None:
 
 
 # ==============================================================================
-# Test: Path overrides (for matrices/YAML)
-# ==============================================================================
-
-
-def test_dep_spec_path_override() -> None:
-    """DepSpec should support path overrides."""
-
-    def process(
-        data: Annotated[
-            dict[str, int], outputs.Dep("default.json", loaders.JSON[dict[str, int]]())
-        ],
-    ) -> _ProcessOutputs:
-        return {"result": data}
-
-    specs = stage_def.get_dep_specs_from_signature(process)
-    overridden = stage_def.apply_dep_path_overrides(specs, {"data": "custom/data.json"})
-
-    assert overridden["data"].path == "custom/data.json"
-    # Original spec unchanged
-    assert specs["data"].path == "default.json"
-
-
-def test_dep_spec_path_override_partial() -> None:
-    """Path overrides can be partial (only override some deps)."""
-
-    def process(
-        left: Annotated[dict[str, int], outputs.Dep("left.json", loaders.JSON[dict[str, int]]())],
-        right: Annotated[dict[str, int], outputs.Dep("right.json", loaders.JSON[dict[str, int]]())],
-    ) -> _MultiDepOutputs:
-        return {"combined": {**left, **right}}
-
-    specs = stage_def.get_dep_specs_from_signature(process)
-    overridden = stage_def.apply_dep_path_overrides(specs, {"left": "custom_left.json"})
-
-    assert overridden["left"].path == "custom_left.json"
-    assert overridden["right"].path == "right.json"  # Unchanged
-
-
-def test_dep_spec_path_override_unknown_key_raises() -> None:
-    """Path override with unknown key should raise ValueError."""
-
-    def process(
-        data: Annotated[dict[str, int], outputs.Dep("input.json", loaders.JSON[dict[str, int]]())],
-    ) -> _ProcessOutputs:
-        return {"result": data}
-
-    specs = stage_def.get_dep_specs_from_signature(process)
-
-    with pytest.raises(ValueError, match="Unknown dependency"):
-        stage_def.apply_dep_path_overrides(specs, {"unknown": "path.json"})
-
-
-# ==============================================================================
 # Test: Identify params type in signature
 # ==============================================================================
 
@@ -817,3 +764,80 @@ def test_placeholder_dep_list_with_empty_element_raises() -> None:
 
     with pytest.raises(ValueError, match="override contains empty path"):
         stage_def.get_dep_specs_from_signature(process, {"shards": ["a.csv", "", "c.csv"]})
+
+
+# ==============================================================================
+# Error Scenario Tests
+# ==============================================================================
+
+
+def test_load_deps_missing_file_raises(tmp_path: pathlib.Path) -> None:
+    """load_deps_from_specs raises RuntimeError for missing dependency files."""
+
+    def process(
+        data: Annotated[
+            dict[str, int], outputs.Dep("missing.json", loaders.JSON[dict[str, int]]())
+        ],
+    ) -> _ProcessOutputs:
+        return {"result": data}
+
+    specs = stage_def.get_dep_specs_from_signature(process)
+
+    with pytest.raises(RuntimeError, match="Failed to load dependency"):
+        stage_def.load_deps_from_specs(specs, tmp_path)
+
+
+def test_load_deps_invalid_json_raises(tmp_path: pathlib.Path) -> None:
+    """load_deps_from_specs raises error for malformed JSON files."""
+    # Create invalid JSON file
+    (tmp_path / "bad.json").write_text("{ invalid json")
+
+    def process(
+        data: Annotated[dict[str, int], outputs.Dep("bad.json", loaders.JSON[dict[str, int]]())],
+    ) -> _ProcessOutputs:
+        return {"result": data}
+
+    specs = stage_def.get_dep_specs_from_signature(process)
+
+    with pytest.raises(RuntimeError, match="Failed to load dependency"):
+        stage_def.load_deps_from_specs(specs, tmp_path)
+
+
+def test_load_deps_wrong_type_in_file(tmp_path: pathlib.Path) -> None:
+    """load_deps_from_specs handles type mismatches gracefully."""
+    import json
+
+    # Create JSON file with list instead of dict
+    (tmp_path / "data.json").write_text(json.dumps([1, 2, 3]))
+
+    def process(
+        data: Annotated[dict[str, int], outputs.Dep("data.json", loaders.JSON[dict[str, int]]())],
+    ) -> _ProcessOutputs:
+        return {"result": data}
+
+    specs = stage_def.get_dep_specs_from_signature(process)
+
+    # Should load successfully - type checking is not enforced at load time
+    loaded = stage_def.load_deps_from_specs(specs, tmp_path)
+    # The type mismatch will be caught by the stage function if it expects dict operations
+    assert loaded["data"] == [1, 2, 3]
+
+
+def test_get_dep_specs_unresolved_placeholder_with_partial_overrides() -> None:
+    """get_dep_specs raises when PlaceholderDep missing from overrides dict."""
+
+    def compare(
+        baseline: Annotated[
+            pandas.DataFrame, outputs.PlaceholderDep(loaders.CSV[pandas.DataFrame]())
+        ],
+        experiment: Annotated[
+            pandas.DataFrame, outputs.PlaceholderDep(loaders.CSV[pandas.DataFrame]())
+        ],
+    ) -> _MultiDepOutputs:
+        return {"combined": {"count": 0}}
+
+    # Only provide override for one placeholder
+    overrides = {"baseline": "model_a/results.csv"}
+
+    with pytest.raises(ValueError, match="PlaceholderDep.*experiment.*requires override"):
+        stage_def.get_dep_specs_from_signature(compare, overrides)

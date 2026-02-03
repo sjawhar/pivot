@@ -7,13 +7,13 @@ showing specific code, param, and dependency changes.
 from __future__ import annotations
 
 import pathlib
-from typing import TYPE_CHECKING, Any, Literal, TypedDict, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 import pydantic
 
 from pivot import parameters, project
 from pivot.executor import worker
-from pivot.storage import cache, lock, state
+from pivot.storage import lock, state
 from pivot.types import (
     ChangeType,
     CodeChange,
@@ -30,17 +30,6 @@ if TYPE_CHECKING:
     import pygtrie
 
     from pivot.storage.track import PvtData
-
-
-class HashResolution(TypedDict):
-    """Result of resolving an artifact's hash.
-
-    Unlike HashInfo (which describes hash structure: file vs directory),
-    this type tracks where the hash was obtained from (provenance).
-    """
-
-    hash: str
-    source: Literal["disk", "pvt"]  # disk = computed from file, pvt = from .pvt tracking file
 
 
 T = TypeVar("T")
@@ -164,51 +153,6 @@ def _find_tracked_hash(
             return {"hash": entry["hash"]}
 
     return None  # Path not found in manifest
-
-
-def hash_artifact(
-    path: pathlib.Path,
-    allow_missing: bool = False,
-    tracked_trie: pygtrie.Trie[str] | None = None,
-) -> HashResolution | None:
-    """Get artifact hash with fallback to .pvt if allow_missing.
-
-    This is a utility function that encapsulates the disk -> .pvt fallback logic.
-    It can be used by status, explain, and verify code to determine artifact hashes
-    with consistent resolution behavior.
-
-    Resolution order:
-    1. Actual file on disk (primary)
-    2. .pvt file hash (fallback when file missing/unreadable + allow_missing)
-
-    Args:
-        path: Path to the artifact.
-        allow_missing: If True, fall back to .pvt hash when file is missing or unreadable.
-        tracked_trie: Trie mapping path tuples to tracked hashes (from .pvt files).
-            Keys are Path.parts tuples, values are hash strings.
-
-    Returns:
-        HashResolution with hash and source, or None if not found.
-    """
-    # Primary: file on disk
-    if path.exists():
-        try:
-            if path.is_dir():
-                file_hash, _ = cache.hash_directory(path)
-            else:
-                file_hash = cache.hash_file(path)
-            return HashResolution(hash=file_hash, source="disk")
-        except PermissionError:
-            # File exists but unreadable - fall through to .pvt fallback
-            pass
-
-    # Fallback: .pvt tracked hash
-    if allow_missing and tracked_trie is not None:
-        path_key = path.parts
-        if path_key in tracked_trie:
-            return HashResolution(hash=tracked_trie[path_key], source="pvt")
-
-    return None
 
 
 def get_stage_explanation(
@@ -339,10 +283,10 @@ def get_stage_explanation(
             upstream_stale=[],
         )
 
-    # Extract lock data fields (LockData uses total=False, so check membership)
-    old_manifest = lock_data["code_manifest"] if "code_manifest" in lock_data else {}  # noqa: SIM401
-    old_params = lock_data["params"] if "params" in lock_data else {}  # noqa: SIM401
-    old_dep_hashes = lock_data["dep_hashes"] if "dep_hashes" in lock_data else {}  # noqa: SIM401
+    # Extract lock data fields (LockData has all required keys after _convert_from_storage_format)
+    old_manifest = lock_data["code_manifest"]
+    old_params = lock_data["params"]
+    old_dep_hashes = lock_data["dep_hashes"]
 
     # lock.StageLock.read() already converts paths to absolute
     code_changes = diff_code_manifests(old_manifest, fingerprint)

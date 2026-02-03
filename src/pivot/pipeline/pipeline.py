@@ -7,7 +7,7 @@ import pathlib
 import re
 from typing import TYPE_CHECKING
 
-from pivot import discovery, outputs, path_policy, project, registry, stage_def
+from pivot import discovery, outputs, path_policy, path_utils, project, registry, stage_def
 from pivot.pipeline.yaml import PipelineConfigError
 
 logger = logging.getLogger(__name__)
@@ -113,8 +113,6 @@ class Pipeline:
             raise ValueError(f"Path cannot be a root directory: {annotation_path!r}")
 
         project_root = project.get_project_root()
-        # Preserve trailing slash for directory paths (DirectoryOut requires it)
-        has_trailing_slash = annotation_path.endswith("/")
 
         # Absolute paths: normalize but keep absolute
         # Check for Unix absolute (/), UNC paths (\\), and Windows drive letters (C:\ or C:/)
@@ -143,9 +141,8 @@ class Pipeline:
                 ) from e
             resolved = project.to_relative_path(abs_path)
 
-        # Restore trailing slash if original had it
-        if has_trailing_slash and not resolved.endswith("/"):
-            resolved = resolved + "/"
+        # Restore trailing slash for directory paths (DirectoryOut requires it)
+        resolved = path_utils.preserve_trailing_slash(annotation_path, resolved)
 
         # Validate the RESOLVED path (after ../ is collapsed)
         if error := path_policy.validate_path_syntax(resolved):

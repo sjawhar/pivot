@@ -339,3 +339,205 @@ def test_dry_run_json_output_has_required_fields() -> None:
     output = _run_common.DryRunJsonOutput(stages={"train": stage_output})
     assert "train" in output["stages"]
     assert output["stages"]["train"]["would_run"] is True
+
+
+# =============================================================================
+# configure_result_collector Tests
+# =============================================================================
+
+
+def test_configure_result_collector_adds_sink(mocker: MockerFixture) -> None:
+    """configure_result_collector adds ResultCollectorSink to engine."""
+    from pivot.engine import engine
+
+    mock_engine = mocker.MagicMock(spec=engine.Engine)
+    result_sink = _run_common.configure_result_collector(mock_engine)
+
+    mock_engine.add_sink.assert_called_once()
+    # Check that the sink added is the one returned
+    call_args = mock_engine.add_sink.call_args
+    assert call_args[0][0] is result_sink
+
+
+# =============================================================================
+# configure_output_sink Tests
+# =============================================================================
+
+
+def test_configure_output_sink_json_mode(mocker: MockerFixture) -> None:
+    """configure_output_sink adds JsonlSink when as_json=True."""
+    from pivot.engine import engine
+
+    mock_engine = mocker.MagicMock(spec=engine.Engine)
+    callback = mocker.MagicMock()
+
+    _run_common.configure_output_sink(
+        mock_engine,
+        quiet=False,
+        as_json=True,
+        tui=False,
+        app=None,
+        run_id=None,
+        use_console=True,
+        jsonl_callback=callback,
+    )
+
+    mock_engine.add_sink.assert_called_once()
+    added_sink = mock_engine.add_sink.call_args[0][0]
+    assert isinstance(added_sink, _run_common.JsonlSink)
+
+
+def test_configure_output_sink_quiet_mode(mocker: MockerFixture) -> None:
+    """configure_output_sink adds no sinks when quiet=True and not JSON."""
+    from pivot.engine import engine
+
+    mock_engine = mocker.MagicMock(spec=engine.Engine)
+
+    _run_common.configure_output_sink(
+        mock_engine,
+        quiet=True,
+        as_json=False,
+        tui=False,
+        app=None,
+        run_id=None,
+        use_console=True,
+        jsonl_callback=None,
+    )
+
+    mock_engine.add_sink.assert_not_called()
+
+
+def test_configure_output_sink_tui_mode(mocker: MockerFixture) -> None:
+    """configure_output_sink adds TuiSink when tui=True."""
+    from pivot.engine import engine, sinks
+
+    mock_engine = mocker.MagicMock(spec=engine.Engine)
+    mock_app = mocker.MagicMock()
+
+    _run_common.configure_output_sink(
+        mock_engine,
+        quiet=False,
+        as_json=False,
+        tui=True,
+        app=mock_app,
+        run_id="test-run-123",
+        use_console=False,
+        jsonl_callback=None,
+    )
+
+    mock_engine.add_sink.assert_called_once()
+    added_sink = mock_engine.add_sink.call_args[0][0]
+    assert isinstance(added_sink, sinks.TuiSink)
+
+
+def test_configure_output_sink_console_mode(mocker: MockerFixture) -> None:
+    """configure_output_sink adds ConsoleSink when use_console=True."""
+    from pivot.engine import engine, sinks
+
+    mock_engine = mocker.MagicMock(spec=engine.Engine)
+
+    _run_common.configure_output_sink(
+        mock_engine,
+        quiet=False,
+        as_json=False,
+        tui=False,
+        app=None,
+        run_id=None,
+        use_console=True,
+        jsonl_callback=None,
+    )
+
+    mock_engine.add_sink.assert_called_once()
+    added_sink = mock_engine.add_sink.call_args[0][0]
+    assert isinstance(added_sink, sinks.ConsoleSink)
+
+
+def test_configure_output_sink_json_overrides_quiet(mocker: MockerFixture) -> None:
+    """configure_output_sink adds JsonlSink even when quiet=True if as_json=True."""
+    from pivot.engine import engine
+
+    mock_engine = mocker.MagicMock(spec=engine.Engine)
+    callback = mocker.MagicMock()
+
+    _run_common.configure_output_sink(
+        mock_engine,
+        quiet=True,
+        as_json=True,
+        tui=False,
+        app=None,
+        run_id=None,
+        use_console=False,
+        jsonl_callback=callback,
+    )
+
+    mock_engine.add_sink.assert_called_once()
+    added_sink = mock_engine.add_sink.call_args[0][0]
+    assert isinstance(added_sink, _run_common.JsonlSink)
+
+
+# =============================================================================
+# convert_results Tests
+# =============================================================================
+
+
+def test_convert_results_converts_ran_status() -> None:
+    """convert_results converts StageCompleted events to ExecutionSummary."""
+    from pivot.engine.types import StageCompleted
+    from pivot.types import StageStatus
+
+    stage_results: dict[str, StageCompleted] = {
+        "train": StageCompleted(
+            type="stage_completed",
+            stage="train",
+            status=StageStatus.RAN,
+            reason="inputs changed",
+            duration_ms=1234.5,
+            index=0,
+            total=1,
+        )
+    }
+
+    summaries = _run_common.convert_results(stage_results)
+
+    assert "train" in summaries
+    assert summaries["train"]["status"] == StageStatus.RAN
+    assert summaries["train"]["reason"] == "inputs changed"
+
+
+def test_convert_results_handles_multiple_stages() -> None:
+    """convert_results handles multiple stages with different statuses."""
+    from pivot.engine.types import StageCompleted
+    from pivot.types import StageStatus
+
+    stage_results: dict[str, StageCompleted] = {
+        "train": StageCompleted(
+            type="stage_completed",
+            stage="train",
+            status=StageStatus.RAN,
+            reason="code changed",
+            duration_ms=100.0,
+            index=0,
+            total=2,
+        ),
+        "evaluate": StageCompleted(
+            type="stage_completed",
+            stage="evaluate",
+            status=StageStatus.SKIPPED,
+            reason="unchanged",
+            duration_ms=0.0,
+            index=1,
+            total=2,
+        ),
+    }
+
+    summaries = _run_common.convert_results(stage_results)
+
+    assert len(summaries) == 2
+    assert summaries["train"]["status"] == StageStatus.RAN
+    assert summaries["evaluate"]["status"] == StageStatus.SKIPPED
+
+
+def test_convert_results_empty_dict() -> None:
+    """convert_results handles empty stage results."""
+    summaries = _run_common.convert_results({})
+    assert summaries == {}

@@ -20,6 +20,7 @@ from pivot import (
     metrics,
     outputs,
     path_policy,
+    path_utils,
     project,
     stage_def,
     trie,
@@ -137,7 +138,7 @@ def _apply_out_overrides(
                 raise exceptions.ValidationError(
                     f"DirectoryOut path override must be a string ending with '/': {path!r}"
                 )
-            cache = override.get("cache", dir_out.cache)
+            cache = override["cache"] if "cache" in override else dir_out.cache
             return dataclasses.replace(dir_out, path=path, cache=cache)
         return dir_out
 
@@ -146,7 +147,7 @@ def _apply_out_overrides(
         # Cast to IncrementalOut[Any, Any] - isinstance narrows but basedpyright keeps Unknown params
         inc_out = cast("outputs.IncrementalOut[Any, Any]", out_spec)
         if override:
-            cache = override.get("cache", inc_out.cache)
+            cache = override["cache"] if "cache" in override else inc_out.cache
             path = override["path"] if "path" in override else inc_out.path
             return dataclasses.replace(inc_out, path=path, cache=cache)
         return inc_out
@@ -419,9 +420,8 @@ class StageRegistry:
                 out_specs[stage_def.SINGLE_OUTPUT_KEY] = resolved
                 outs_from_annotations.extend(expanded)
 
-            outs_list = outs_from_annotations
             # After _apply_out_overrides, each Out has a single-string path (multi-file paths expanded)
-            outs_paths = [str(o.path) for o in outs_list]
+            outs_paths = [str(o.path) for o in outs_from_annotations]
 
             # Validate paths BEFORE normalizing (check ".." on original paths)
             # Use all_deps_flat to include IncrementalOut paths in security validation
@@ -443,7 +443,7 @@ class StageRegistry:
             # Update normalized outputs with absolute paths
             # All concrete output types (Out, DirectoryOut, IncrementalOut) are dataclasses
             outs_normalized: list[outputs.BaseOut] = []
-            for out, path in zip(outs_list, outs_paths, strict=True):
+            for out, path in zip(outs_from_annotations, outs_paths, strict=True):
                 if isinstance(out, outputs.DirectoryOut):
                     # Cast to DirectoryOut[Any] - isinstance narrows but basedpyright keeps Unknown params
                     outs_normalized.append(
@@ -635,9 +635,6 @@ def _normalize_paths(
     policy = path_policy.POLICIES[path_type]
 
     for path in paths:
-        # Preserve trailing slash for directory paths (DirectoryOut)
-        is_dir_path = path.endswith("/")
-
         try:
             # Normalize path to absolute (from project root)
             if pathlib.Path(path).is_absolute():
@@ -676,13 +673,12 @@ def _normalize_paths(
                         )
 
             # Restore trailing slash for directory paths (pathlib strips it)
-            result_path = str(norm_path) + "/" if is_dir_path else str(norm_path)
+            result_path = path_utils.preserve_trailing_slash(path, str(norm_path))
             normalized.append(result_path)
         except (ValueError, OSError, exceptions.InvalidPathError):
             if validation_mode == ValidationMode.WARN:
                 result_path = str(project.normalize_path(path))
-                if is_dir_path:
-                    result_path += "/"
+                result_path = path_utils.preserve_trailing_slash(path, result_path)
                 normalized.append(result_path)
             else:
                 raise

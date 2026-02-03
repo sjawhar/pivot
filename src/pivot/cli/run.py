@@ -12,7 +12,6 @@ import pathlib
 import threading
 import time
 import uuid
-from collections.abc import Callable  # noqa: TC003 - used in function signatures
 from typing import TYPE_CHECKING
 
 import anyio
@@ -21,7 +20,7 @@ import click
 from pivot.cli import _run_common, completion
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
-from pivot.engine import engine, sinks
+from pivot.engine import engine
 from pivot.engine import sources as engine_sources
 from pivot.executor import prepare_workers
 from pivot.storage import project_lock
@@ -34,105 +33,11 @@ from pivot.types import (
 )
 
 if TYPE_CHECKING:
-    from pivot.engine.types import OutputEvent, StageCompleted
     from pivot.executor import ExecutionSummary
-    from pivot.tui.run import MessagePoster
 
 
 # JSONL schema version for forward compatibility
 _JSONL_SCHEMA_VERSION = 1
-
-
-def _configure_result_collector(eng: engine.Engine) -> sinks.ResultCollectorSink:
-    """Add ResultCollectorSink to collect execution results."""
-    result_sink = sinks.ResultCollectorSink()
-    eng.add_sink(result_sink)
-    return result_sink
-
-
-class _JsonlSink:
-    """Async sink that calls a callback for each stage event."""
-
-    _callback: Callable[[dict[str, object]], None]
-
-    def __init__(self, callback: Callable[[dict[str, object]], None]) -> None:
-        self._callback = callback
-
-    async def handle(self, event: OutputEvent) -> None:
-        """Convert stage events to JSONL records.
-
-        Note: Engine uses "stage_started"/"stage_completed" internally, but
-        JSONL schema (pivot/types.py) uses "stage_start"/"stage_complete".
-        We convert to match the documented public API.
-        """
-        match event["type"]:
-            case "stage_started":
-                # Convert to documented JSONL schema type
-                self._callback(
-                    {
-                        "type": "stage_start",  # Matches RunEventType.STAGE_START
-                        "stage": event["stage"],
-                        "index": event["index"],
-                        "total": event["total"],
-                    }
-                )
-            case "stage_completed":
-                # Convert to documented JSONL schema type
-                self._callback(
-                    {
-                        "type": "stage_complete",  # Matches RunEventType.STAGE_COMPLETE
-                        "stage": event["stage"],
-                        "status": event["status"].value,
-                        "reason": event["reason"],
-                        "duration_ms": event["duration_ms"],
-                        "index": event["index"],
-                        "total": event["total"],
-                    }
-                )
-            case "pipeline_reloaded":
-                # All fields are JSON-serializable (strings and lists of strings)
-                self._callback(dict(event))
-            case "engine_state_changed":
-                # Convert state enum to string for JSON serialization
-                self._callback(
-                    {
-                        "type": "engine_state_changed",
-                        "state": event["state"].value,
-                    }
-                )
-            case _:
-                pass  # Ignore other event types (log_line, stage_state_changed)
-
-    async def close(self) -> None:
-        """No cleanup needed."""
-
-
-def _configure_output_sink(
-    eng: engine.Engine,
-    *,
-    quiet: bool,
-    as_json: bool,
-    tui: bool,
-    app: MessagePoster | None,
-    run_id: str | None,
-    use_console: bool,
-    jsonl_callback: Callable[[dict[str, object]], None] | None,
-) -> None:
-    """Configure output sinks based on display mode."""
-    import rich.console
-
-    # JSON sink is always added when as_json=True, regardless of quiet mode
-    if as_json and jsonl_callback:
-        eng.add_sink(_JsonlSink(callback=jsonl_callback))
-        return
-
-    if quiet:
-        return
-
-    if tui and app and run_id:
-        eng.add_sink(sinks.TuiSink(app=app, run_id=run_id))
-    elif use_console:
-        eng.add_sink(sinks.ConsoleSink(console=rich.console.Console()))
 
 
 def _configure_oneshot_source(
@@ -188,18 +93,6 @@ def _run_with_tui(
 
     pipeline = cli_decorators.get_pipeline_from_context()
 
-    def _convert_results(
-        stage_results: dict[str, StageCompleted],
-    ) -> dict[str, executor_core.ExecutionSummary]:
-        """Convert StageCompleted events to ExecutionSummary."""
-        return {
-            name: executor_core.ExecutionSummary(
-                status=event["status"],
-                reason=event["reason"],
-            )
-            for name, event in stage_results.items()
-        }
-
     async def tui_oneshot_main() -> dict[str, executor_core.ExecutionSummary]:
         from pivot.tui import run as tui_run
 
@@ -216,8 +109,8 @@ def _run_with_tui(
 
         async with engine.Engine(pipeline=pipeline) as eng:
             # Configure sinks - TuiSink for direct post_message
-            result_sink = _configure_result_collector(eng)
-            _configure_output_sink(
+            result_sink = _run_common.configure_result_collector(eng)
+            _run_common.configure_output_sink(
                 eng,
                 quiet=False,
                 as_json=False,
@@ -242,7 +135,7 @@ def _run_with_tui(
             async def engine_task() -> dict[str, executor_core.ExecutionSummary]:
                 await eng.run(exit_on_completion=True)
                 stage_results = await result_sink.get_results()
-                return _convert_results(stage_results)
+                return _run_common.convert_results(stage_results)
 
             # Suppress stderr logging while TUI is active
             with _run_common.suppress_stderr_logging():
@@ -262,7 +155,11 @@ def _run_with_tui(
 
                 return engine_results
 
-    return anyio.run(tui_oneshot_main)
+    # Acquire lock for oneshot mode when no_commit=True to prevent race conditions
+    # with concurrent commit operations
+    lock_context = project_lock.pending_state_lock() if no_commit else contextlib.nullcontext()
+    with lock_context:
+        return anyio.run(tui_oneshot_main)
 
 
 def _run_json_mode(
@@ -286,22 +183,10 @@ def _run_json_mode(
     start_time = time.perf_counter()
     pipeline = cli_decorators.get_pipeline_from_context()
 
-    def _convert_results(
-        stage_results: dict[str, StageCompleted],
-    ) -> dict[str, executor_core.ExecutionSummary]:
-        """Convert StageCompleted events to ExecutionSummary."""
-        return {
-            name: executor_core.ExecutionSummary(
-                status=event["status"],
-                reason=event["reason"],
-            )
-            for name, event in stage_results.items()
-        }
-
     async def json_main() -> dict[str, executor_core.ExecutionSummary]:
         async with engine.Engine(pipeline=pipeline) as eng:
-            result_sink = _configure_result_collector(eng)
-            _configure_output_sink(
+            result_sink = _run_common.configure_result_collector(eng)
+            _run_common.configure_output_sink(
                 eng,
                 quiet=False,
                 as_json=True,
@@ -323,9 +208,13 @@ def _run_json_mode(
             )
             await eng.run(exit_on_completion=True)
             stage_results = await result_sink.get_results()
-            return _convert_results(stage_results)
+            return _run_common.convert_results(stage_results)
 
-    results = anyio.run(json_main)
+    # Acquire lock for oneshot mode when no_commit=True to prevent race conditions
+    # with concurrent commit operations
+    lock_context = project_lock.pending_state_lock() if no_commit else contextlib.nullcontext()
+    with lock_context:
+        results = anyio.run(json_main)
 
     # Emit execution result
     total_duration_ms = (time.perf_counter() - start_time) * 1000
@@ -369,22 +258,10 @@ def _run_plain_mode(
     start_time = time.perf_counter()
     pipeline = cli_decorators.get_pipeline_from_context()
 
-    def _convert_results(
-        stage_results: dict[str, StageCompleted],
-    ) -> dict[str, executor_core.ExecutionSummary]:
-        """Convert StageCompleted events to ExecutionSummary."""
-        return {
-            name: executor_core.ExecutionSummary(
-                status=event["status"],
-                reason=event["reason"],
-            )
-            for name, event in stage_results.items()
-        }
-
     async def plain_main() -> dict[str, executor_core.ExecutionSummary]:
         async with engine.Engine(pipeline=pipeline) as eng:
-            result_sink = _configure_result_collector(eng)
-            _configure_output_sink(
+            result_sink = _run_common.configure_result_collector(eng)
+            _run_common.configure_output_sink(
                 eng,
                 quiet=quiet,
                 as_json=False,
@@ -406,7 +283,7 @@ def _run_plain_mode(
             )
             await eng.run(exit_on_completion=True)
             stage_results = await result_sink.get_results()
-            return _convert_results(stage_results)
+            return _run_common.convert_results(stage_results)
 
     # Acquire lock for oneshot mode when no_commit=True to prevent race conditions
     # with concurrent commit operations. Watch mode handles this differently - the
@@ -516,10 +393,7 @@ def run(
     # Default: keep going; --fail-fast stops on first failure
     on_error = OnError.FAIL if fail_fast else OnError.KEEP_GOING
 
-    # Determine display mode from flags
-    use_tui = tui_flag
-
-    if use_tui:
+    if tui_flag:
         results = _run_with_tui(
             stages_list,
             force=force,

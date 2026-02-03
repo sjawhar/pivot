@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from pivot.cli.run import _JsonlSink
+from pivot.cli._run_common import JsonlSink
 from pivot.engine.types import (
     EngineState,
     EngineStateChanged,
@@ -13,14 +13,14 @@ from pivot.engine.types import (
     StageCompleted,
     StageStarted,
 )
-from pivot.types import StageStatus
+from pivot.types import CompletionType, StageStatus
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
 
 # =============================================================================
-# _JsonlSink Event Handling Tests
+# JsonlSink Event Handling Tests
 # =============================================================================
 
 
@@ -45,8 +45,8 @@ async def test_jsonl_sink_converts_stage_started_to_stage_start(
     callback: Callable[[dict[str, object]], None],
     collected_events: list[dict[str, object]],
 ) -> None:
-    """_JsonlSink converts engine 'stage_started' to JSONL 'stage_start' type."""
-    sink = _JsonlSink(callback)
+    """JsonlSink converts engine 'stage_started' to JSONL 'stage_start' type."""
+    sink = JsonlSink(callback)
 
     event = StageStarted(type="stage_started", stage="my_stage", index=0, total=3)
     await sink.handle(event)
@@ -64,8 +64,8 @@ async def test_jsonl_sink_converts_stage_completed_to_stage_complete(
     callback: Callable[[dict[str, object]], None],
     collected_events: list[dict[str, object]],
 ) -> None:
-    """_JsonlSink converts engine 'stage_completed' to JSONL 'stage_complete' type."""
-    sink = _JsonlSink(callback)
+    """JsonlSink converts engine 'stage_completed' to JSONL 'stage_complete' type."""
+    sink = JsonlSink(callback)
 
     event = StageCompleted(
         type="stage_completed",
@@ -89,8 +89,8 @@ async def test_jsonl_sink_passes_pipeline_reloaded_event(
     callback: Callable[[dict[str, object]], None],
     collected_events: list[dict[str, object]],
 ) -> None:
-    """_JsonlSink passes pipeline_reloaded events to callback."""
-    sink = _JsonlSink(callback)
+    """JsonlSink passes pipeline_reloaded events to callback."""
+    sink = JsonlSink(callback)
 
     event = PipelineReloaded(
         type="pipeline_reloaded",
@@ -116,8 +116,8 @@ async def test_jsonl_sink_passes_pipeline_reloaded_with_error(
     callback: Callable[[dict[str, object]], None],
     collected_events: list[dict[str, object]],
 ) -> None:
-    """_JsonlSink passes pipeline_reloaded events with errors to callback."""
-    sink = _JsonlSink(callback)
+    """JsonlSink passes pipeline_reloaded events with errors to callback."""
+    sink = JsonlSink(callback)
 
     event = PipelineReloaded(
         type="pipeline_reloaded",
@@ -139,8 +139,8 @@ async def test_jsonl_sink_converts_engine_state_changed_enum_to_string(
     callback: Callable[[dict[str, object]], None],
     collected_events: list[dict[str, object]],
 ) -> None:
-    """_JsonlSink converts state enum to string for engine_state_changed."""
-    sink = _JsonlSink(callback)
+    """JsonlSink converts state enum to string for engine_state_changed."""
+    sink = JsonlSink(callback)
 
     event = EngineStateChanged(type="engine_state_changed", state=EngineState.ACTIVE)
     await sink.handle(event)
@@ -155,8 +155,8 @@ async def test_jsonl_sink_handles_engine_state_idle(
     callback: Callable[[dict[str, object]], None],
     collected_events: list[dict[str, object]],
 ) -> None:
-    """_JsonlSink handles engine_state_changed with IDLE state."""
-    sink = _JsonlSink(callback)
+    """JsonlSink handles engine_state_changed with IDLE state."""
+    sink = JsonlSink(callback)
 
     event = EngineStateChanged(type="engine_state_changed", state=EngineState.IDLE)
     await sink.handle(event)
@@ -170,8 +170,8 @@ async def test_jsonl_sink_ignores_log_line_events(
     callback: Callable[[dict[str, object]], None],
     collected_events: list[dict[str, object]],
 ) -> None:
-    """_JsonlSink ignores log_line events."""
-    sink = _JsonlSink(callback)
+    """JsonlSink ignores log_line events."""
+    sink = JsonlSink(callback)
 
     event = LogLine(type="log_line", stage="my_stage", line="some output", is_stderr=False)
     await sink.handle(event)
@@ -183,6 +183,50 @@ async def test_jsonl_sink_ignores_log_line_events(
 async def test_jsonl_sink_close_is_noop(
     callback: Callable[[dict[str, object]], None],
 ) -> None:
-    """_JsonlSink.close() completes without error."""
-    sink = _JsonlSink(callback)
+    """JsonlSink.close() completes without error."""
+    sink = JsonlSink(callback)
     await sink.close()  # Should not raise
+
+
+# =============================================================================
+# JsonlSink StageStatus Coverage Tests
+# =============================================================================
+
+
+@pytest.mark.parametrize(
+    ("status", "reason", "duration"),
+    [
+        pytest.param(StageStatus.SKIPPED, "unchanged", 0.0, id="skipped"),
+        pytest.param(StageStatus.FAILED, "execution error", 1234.5, id="failed"),
+        pytest.param(StageStatus.RAN, "executed", 100.0, id="ran"),
+        pytest.param(StageStatus.RAN, "executed", 0.0, id="instant_completion"),
+        pytest.param(StageStatus.RAN, "executed", 999999.9, id="long_duration"),
+    ],
+)
+@pytest.mark.anyio
+async def test_jsonl_sink_handles_all_stage_statuses(
+    callback: Callable[[dict[str, object]], None],
+    collected_events: list[dict[str, object]],
+    status: CompletionType,
+    reason: str,
+    duration: float,
+) -> None:
+    """JsonlSink correctly converts all StageStatus values to strings."""
+    sink = JsonlSink(callback)
+
+    event = StageCompleted(
+        type="stage_completed",
+        stage="test_stage",
+        status=status,
+        reason=reason,
+        duration_ms=duration,
+        index=0,
+        total=1,
+    )
+    await sink.handle(event)
+
+    assert len(collected_events) == 1
+    assert collected_events[0]["type"] == "stage_complete"
+    assert collected_events[0]["status"] == status.value
+    assert collected_events[0]["reason"] == reason
+    assert collected_events[0]["duration_ms"] == duration

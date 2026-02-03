@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Any, TypeGuard, cast
 
 import yaml
 
-from pivot import exceptions, project, yaml_config
+from pivot import exceptions, path_utils, project, yaml_config
 from pivot.storage import cache
 from pivot.types import DepEntry, HashInfo, LockData, OutEntry, OutputHash, StorageLockData
 
@@ -80,11 +80,8 @@ def _convert_to_storage_format(data: LockData) -> StorageLockData:
 
     outs_list = list[OutEntry]()
     for abs_path, hash_info in data["output_hashes"].items():
-        # Preserve trailing slash for DirectoryOut paths (pathlib strips it)
-        is_dir_path = abs_path.endswith("/")
         rel_path = project.to_relative_path(abs_path, proj_root)
-        if is_dir_path and not rel_path.endswith("/"):
-            rel_path += "/"
+        rel_path = path_utils.preserve_trailing_slash(abs_path, rel_path)
         if hash_info is None:
             entry = OutEntry(path=rel_path, hash=None)
         else:
@@ -121,11 +118,9 @@ def _convert_from_storage_format(data: StorageLockData) -> LockData:
 
     output_hashes = dict[str, OutputHash]()
     for entry in data["outs"]:
-        # Preserve trailing slash for DirectoryOut paths (pathlib strips it)
-        is_dir_path = entry["path"].endswith("/")
-        abs_path = str(project.to_absolute_path(entry["path"], proj_root))
-        if is_dir_path and not abs_path.endswith("/"):
-            abs_path += "/"
+        rel_path = entry["path"]
+        abs_path = str(project.to_absolute_path(rel_path, proj_root))
+        abs_path = path_utils.preserve_trailing_slash(rel_path, abs_path)
         if entry["hash"] is None:
             output_hashes[abs_path] = None
         elif "manifest" in entry:
@@ -422,7 +417,8 @@ def _atomic_lock_takeover(sentinel: Path, stale_pid: int | None) -> bool:
                 logger.warning(f"Removed stale lock file: {sentinel} (was PID {stale_pid})")
             return True
         return False
-    except OSError:
+    except OSError as e:
+        logger.debug(f"Lock takeover failed for {sentinel}: {e}")
         with contextlib.suppress(OSError):
             os.unlink(tmp_path)
         return False

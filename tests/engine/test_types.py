@@ -29,10 +29,9 @@ def test_node_type_enum() -> None:
 
 
 def test_engine_state_enum() -> None:
-    """EngineState has idle, active, shutdown states."""
+    """EngineState has idle and active states."""
     assert types.EngineState.IDLE.value == "idle"
     assert types.EngineState.ACTIVE.value == "active"
-    assert types.EngineState.SHUTDOWN.value == "shutdown"
 
 
 def test_data_artifact_changed_event() -> None:

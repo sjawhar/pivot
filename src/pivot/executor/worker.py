@@ -19,7 +19,16 @@ from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast, override
 
 import pydantic
 
-from pivot import exceptions, metrics, outputs, parameters, project, run_history, stage_def
+from pivot import (
+    exceptions,
+    metrics,
+    outputs,
+    parameters,
+    path_utils,
+    project,
+    run_history,
+    stage_def,
+)
 from pivot.storage import cache, lock, state
 from pivot.types import (
     DeferredWrites,
@@ -324,9 +333,9 @@ def execute_stage(
                 # Compute output hashes (null for no_cache, actual otherwise)
                 if no_cache:
                     _verify_outputs_exist(stage_outs)
-                    output_hashes = dict[str, OutputHash](
-                        {str(out.path): None for out in stage_outs}
-                    )
+                    output_hashes: dict[str, OutputHash] = {
+                        str(out.path): None for out in stage_outs
+                    }
                 else:
                     output_hashes = _save_outputs_to_cache(
                         stage_outs, files_cache_dir, checkout_modes
@@ -381,10 +390,7 @@ def execute_stage(
 def _normalize_out_path(path: str) -> str:
     """Normalize output path, preserving trailing slash for DirectoryOut."""
     normalized = str(project.normalize_path(path))
-    # Preserve trailing slash for DirectoryOut paths
-    if path.endswith("/") and not normalized.endswith("/"):
-        return normalized + "/"
-    return normalized
+    return path_utils.preserve_trailing_slash(path, normalized)
 
 
 def _get_normalized_out_paths(stage_info: WorkerStageInfo) -> list[str]:
