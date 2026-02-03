@@ -169,7 +169,7 @@ def get_stage_fingerprint(
     - 'self:<name>': Function itself (hash)
     - 'func:<name>': Referenced helper functions (hash, transitive)
     - 'class:<name>': Referenced class definitions (hash, transitive)
-    - 'mod:<module>.<attr>': User-code module attributes (hash)
+    - 'mod:<module>.<attr>': User-code module attributes (hash for callables, repr for primitives)
     - 'const:<name>': Global constants (repr value)
     """
     if visited is None:
@@ -542,8 +542,12 @@ def _process_module_dependency(
             continue
         if callable(attr_value) and is_user_code(attr_value):
             _add_callable_to_manifest(key, attr_value, manifest, visited)
-        else:
+        elif isinstance(attr_value, (bool, int, float, str, bytes, type(None))):
             manifest[key] = repr(attr_value)
+        else:
+            raise TypeError(
+                f"Cannot fingerprint module attribute '{key}': type {type(attr_value).__name__!r} is not supported. Supported types: callable, bool, int, float, str, bytes, None."
+            )
 
 
 def _should_skip_persistent_cache(func: Callable[..., Any]) -> bool:
