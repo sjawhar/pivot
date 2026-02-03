@@ -7,7 +7,7 @@ import pathlib
 import re
 from typing import TYPE_CHECKING
 
-from pivot import outputs, path_policy, project, registry, stage_def
+from pivot import discovery, outputs, path_policy, project, registry, stage_def
 from pivot.pipeline.yaml import PipelineConfigError
 
 logger = logging.getLogger(__name__)
@@ -216,7 +216,7 @@ class Pipeline:
             if spec.creates_dep_edge  # IncrementalOut has creates_dep_edge=False
         }
         resolved_outs: dict[str, registry.OutOverride] = {
-            out_name: self._resolve_out_override(spec.path)
+            out_name: registry.OutOverride(path=self._resolve_path_type(spec.path))
             for out_name, spec in out_specs.items()
             if not isinstance(spec, outputs.IncrementalOut)
         }
@@ -318,3 +318,86 @@ class Pipeline:
             logger.debug(
                 f"Included {len(stages_to_add)} stages from pipeline '{other.name}' into '{self.name}'"
             )
+
+    def resolve_from_parents(self) -> None:
+        """Resolve unresolved dependencies by searching parent pipelines.
+
+        For each dependency that has no local producer:
+        1. Traverse up directory tree looking for pivot.yaml or pipeline.py
+        2. Load each parent pipeline and search for a stage producing the artifact
+        3. Include that stage and add its dependencies to the work queue
+
+        Dependencies that exist on disk are treated as external inputs.
+        Uses per-call caching (parents loaded once per resolve, discarded after).
+        """
+        project_root = project.get_project_root()
+
+        # Build set of locally produced outputs and unresolved dependencies in single pass
+        local_outputs = set[str]()
+        all_deps = set[str]()
+        for stage_name in self.list_stages():
+            info = self.get(stage_name)
+            local_outputs.update(info["outs_paths"])
+            all_deps.update(info["deps_paths"])
+
+        # Work queue is deps not satisfied locally
+        work = all_deps - local_outputs
+
+        if not work:
+            return
+
+        # Find parent pipeline files once
+        parent_files = list(discovery.find_parent_pipeline_paths(self.root, project_root))
+        if not parent_files:
+            return
+
+        # Per-call cache: avoid reloading same parent for each unresolved dep
+        loaded_parents: dict[pathlib.Path, Pipeline | None] = {}
+
+        def get_parent(path: pathlib.Path) -> Pipeline | None:
+            if path not in loaded_parents:
+                loaded_parents[path] = discovery.load_pipeline_from_path(path)
+            return loaded_parents[path]
+
+        # Process work queue iteratively
+        while work:
+            dep_path = work.pop()
+
+            # Skip if already resolved (by a stage we just added) or exists on disk
+            if dep_path in local_outputs or pathlib.Path(dep_path).exists():
+                continue
+
+            # Search parent pipelines for producer
+            for parent_file in parent_files:
+                parent = get_parent(parent_file)
+                if parent is None:
+                    continue
+
+                # Find stage that produces this artifact
+                producer_name = next(
+                    (
+                        name
+                        for name in parent.list_stages()
+                        if dep_path in parent.get(name)["outs_paths"]
+                    ),
+                    None,
+                )
+                if producer_name is None:
+                    continue
+
+                # Skip if already included (idempotency)
+                if producer_name in self._registry.list_stages():
+                    break
+
+                # Include the producer stage
+                stage_info = copy.deepcopy(parent.get(producer_name))
+                self._registry.add_existing(stage_info)
+                local_outputs.update(stage_info["outs_paths"])
+
+                # Add producer's unresolved dependencies to work queue
+                work.update(dep for dep in stage_info["deps_paths"] if dep not in local_outputs)
+
+                logger.debug(
+                    f"Included stage '{producer_name}' from parent pipeline '{parent.name}'"
+                )
+                break
