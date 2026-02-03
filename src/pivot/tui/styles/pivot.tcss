@@ -3,9 +3,7 @@
 }
 
 #stage-list {
-    width: 40%;
-    min-width: 35;
-    max-width: 60;
+    width: 32;
     height: 100%;
     border: solid $surface-lighten-1;
     padding: 0 1;
@@ -42,6 +40,16 @@
 
 #detail-tabs TabPane {
     height: 100%;
+}
+
+/* Active tab styling */
+Tab.-active {
+    background: $primary-darken-2;
+    text-style: bold;
+}
+
+Tab:hover {
+    background: $primary-darken-3;
 }
 
 #stage-logs {
@@ -101,6 +109,8 @@
 /* Group header styling */
 .stage-group-header {
     background: $surface-lighten-1;
+    border-left: thick $primary;
+    padding-left: 1;
 }
 
 /* Split-view layout for diff panels */
@@ -146,4 +156,12 @@
 
 #debug-panel.visible {
     display: block;
+}
+
+/* Context-aware footer */
+#pivot-footer {
+    dock: bottom;
+    height: 1;
+    background: $surface;
+    padding: 0 1;
 }

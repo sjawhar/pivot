@@ -51,6 +51,8 @@ from pivot.tui.stats import DebugStats, MessageStatsTracker, get_memory_mb
 from pivot.tui.types import ExecutionHistoryEntry, LogEntry, PendingHistoryState, StageInfo
 from pivot.tui.widgets import (
     DebugPanel,
+    FooterContext,
+    PivotFooter,
     StageListPanel,
     StageLogPanel,
     TabbedDetailPanel,
@@ -382,7 +384,7 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
             yield TabbedDetailPanel(id="detail-panel")
 
         yield DebugPanel(id="debug-panel")
-        yield textual.widgets.Footer()
+        yield PivotFooter(id="pivot-footer")
 
     async def on_mount(self) -> None:  # pragma: no cover
         """Initialize TUI on mount."""
@@ -650,6 +652,7 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
         """Handle executor completion (run mode only)."""
         self._results = event.results
         self._error = event.error
+        self.bell()
         if event.error:
             self.title = f"pivot run - FAILED: {event.error}"
         else:
@@ -875,6 +878,38 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
             ]
             stage_list.rebuild(ordered_stages)
 
+    def _update_footer_context(self) -> None:  # pragma: no cover
+        """Update footer context based on focus and active tab."""
+        footer = self._try_query_one("#pivot-footer", PivotFooter)
+        if footer is None:
+            return
+
+        # Check if stage list has focus
+        stage_list = self._try_query_one("#stage-list", StageListPanel)
+        if stage_list is not None and stage_list.has_focus:
+            footer.set_context(FooterContext.STAGE_LIST)
+            return
+
+        # Otherwise, base context on active tab
+        tabs = self._try_query_one("#detail-tabs", textual.widgets.TabbedContent)
+        if tabs is None:
+            footer.set_context(FooterContext.STAGE_LIST)
+            return
+
+        match tabs.active:
+            case "tab-logs":
+                footer.set_context(FooterContext.LOGS)
+            case "tab-input" | "tab-output":
+                footer.set_context(FooterContext.DIFF)
+            case _:
+                footer.set_context(FooterContext.STAGE_LIST)
+
+    def on_descendant_focus(
+        self, _event: textual.events.DescendantFocus
+    ) -> None:  # pragma: no cover
+        """Update footer context when focus changes."""
+        self._update_footer_context()
+
     def _get_keep_going_prefix(self) -> str:  # pragma: no cover
         """Return title prefix for keep-going mode.
 
@@ -954,6 +989,7 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
                 # Wrap around to last tab if at first
                 new_idx = (current_idx - 1) % len(self._TAB_IDS)
                 tabs.active = self._TAB_IDS[new_idx]
+                self._update_footer_context()
         except ValueError:
             _logger.debug("Tab index error during prev_tab")
 
@@ -968,6 +1004,7 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
                 # Wrap around to first tab if at last
                 new_idx = (current_idx + 1) % len(self._TAB_IDS)
                 tabs.active = self._TAB_IDS[new_idx]
+                self._update_footer_context()
         except ValueError:
             _logger.debug("Tab index error during next_tab")
 
@@ -976,6 +1013,7 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
         tabs = self._try_query_one("#detail-tabs", textual.widgets.TabbedContent)
         if tabs:
             tabs.active = tab_id
+            self._update_footer_context()
 
     def action_goto_tab_logs(self) -> None:  # pragma: no cover
         self._goto_tab("tab-logs")

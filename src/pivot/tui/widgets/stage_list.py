@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING, ClassVar, override
 
 import rich.markup
@@ -193,13 +194,20 @@ class StageRow(textual.widgets.Static):
 
         # Format elapsed time (only for running/completed/failed)
         elapsed_str = ""
-        if self._info.elapsed is not None and self._info.status in (
-            StageStatus.IN_PROGRESS,
-            StageStatus.COMPLETED,
-            StageStatus.RAN,
-            StageStatus.FAILED,
+        elapsed = self._info.elapsed
+        if (
+            elapsed is not None
+            and not math.isnan(elapsed)
+            and not math.isinf(elapsed)
+            and self._info.status
+            in (
+                StageStatus.IN_PROGRESS,
+                StageStatus.COMPLETED,
+                StageStatus.RAN,
+                StageStatus.FAILED,
+            )
         ):
-            mins, secs = divmod(int(self._info.elapsed), 60)
+            mins, secs = divmod(max(0, int(elapsed)), 60)
             elapsed_str = f"{mins}:{secs:02d} "
 
         # Selected row has slight indent, others are left-aligned

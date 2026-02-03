@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING, TypedDict
 
 from pivot.types import DisplayCategory, StageStatus, categorize_stage_result
@@ -11,8 +12,11 @@ if TYPE_CHECKING:
 
 
 def format_elapsed(elapsed: float | None) -> str:
-    """Format elapsed time as (M:SS) or empty string if None."""
-    if elapsed is None:
+    """Format elapsed time as (M:SS) or empty string if None.
+
+    Handles None, negative values, infinity, and NaN gracefully.
+    """
+    if elapsed is None or math.isnan(elapsed) or math.isinf(elapsed):
         return ""
     mins, secs = divmod(max(0, int(elapsed)), 60)
     return f"({mins}:{secs:02d})"
@@ -29,9 +33,9 @@ def get_status_symbol(status: StageStatus, reason: str = "") -> tuple[str, str]:
         case DisplayCategory.SUCCESS:
             return ("●", "green bold")
         case DisplayCategory.CACHED:
-            return ("$", "yellow")
+            return ("↺", "yellow")
         case DisplayCategory.BLOCKED:
-            return ("⊘", "red")
+            return ("◇", "red")
         case DisplayCategory.CANCELLED:
             return ("!", "yellow dim")
         case DisplayCategory.FAILED:
@@ -71,12 +75,12 @@ def get_status_icon(status: StageStatus, reason: str = "") -> str:
         case DisplayCategory.FAILED:
             return "[red]✗[/]"
         case DisplayCategory.CACHED:
-            return "[yellow]$[/]"
+            return "[yellow]↺[/]"
         case DisplayCategory.BLOCKED:
-            return "[red]⊘[/]"
+            return "[red]◇[/]"
         case DisplayCategory.CANCELLED:
             return "[yellow dim]![/]"
-        case _:
+        case DisplayCategory.PENDING | DisplayCategory.RUNNING | DisplayCategory.UNKNOWN:
             return ""
 
 
@@ -84,8 +88,8 @@ def get_status_icon(status: StageStatus, reason: str = "") -> str:
 _STATUS_ICON_PLAIN: dict[DisplayCategory, str] = {
     DisplayCategory.SUCCESS: "✓",
     DisplayCategory.FAILED: "✗",
-    DisplayCategory.CACHED: "$",
-    DisplayCategory.BLOCKED: "⊘",
+    DisplayCategory.CACHED: "↺",
+    DisplayCategory.BLOCKED: "◇",
     DisplayCategory.CANCELLED: "!",
 }
 
@@ -105,14 +109,17 @@ def get_status_table_cell(status: StageStatus, reason: str) -> str:
         case DisplayCategory.FAILED:
             return "[red]✗ fail[/] "
         case DisplayCategory.CACHED:
-            return "[yellow]$ cache[/]"
+            return "[yellow]↺ cache[/]"
         case DisplayCategory.BLOCKED:
-            return "[red]⊘ block[/]"
+            return "[red]◇ block[/]"
         case DisplayCategory.CANCELLED:
             return "[yellow dim]! cncl[/] "
-        case _:
-            label, style = get_status_label(status, reason)
-            return f"[{style}]{label:<7}[/] "
+        case DisplayCategory.PENDING:
+            return "[dim]PENDING[/] "
+        case DisplayCategory.RUNNING:
+            return "[blue bold]RUNNING[/] "
+        case DisplayCategory.UNKNOWN:
+            return "[dim]UNKNOWN[/] "
 
 
 class StatusCounts(TypedDict):
