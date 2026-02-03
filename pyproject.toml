@@ -1,6 +1,6 @@
 [project]
 name = "pivot"
-version = "0.1.0-dev"
+version = "0.1.0"
 description = "High-performance Python pipeline tool with automatic code change detection"
 readme = "README.md"
 requires-python = ">=3.13,<3.14"
@@ -184,3 +184,7 @@ ignore = [
 quote-style = "double"
 indent-style = "space"
 line-ending = "auto"
+
+[tool.semantic_release]
+version_toml = ["pyproject.toml:project.version"]
+build_command = "uv lock --upgrade-package pivot && git add uv.lock && uv build"
