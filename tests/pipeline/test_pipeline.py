@@ -7,6 +7,8 @@ import pytest
 
 from pivot import exceptions, loaders, outputs, project
 from pivot.pipeline.pipeline import Pipeline
+from pivot.pipeline.yaml import PipelineConfigError
+from pivot.stage_def import StageParams
 
 if TYPE_CHECKING:
     from pytest_mock import MockerFixture
@@ -19,6 +21,16 @@ class _SimpleOutput(TypedDict):
 
 def _simple_stage() -> _SimpleOutput:
     pathlib.Path("result.txt").write_text("done")
+    return _SimpleOutput(result=pathlib.Path("result.txt"))
+
+
+# Helper for params preservation test
+class _TestIncludeParams(StageParams):
+    value: int = 42
+
+
+def _parameterized_stage_for_include(params: _TestIncludeParams) -> _SimpleOutput:
+    pathlib.Path("result.txt").write_text(str(params.value))
     return _SimpleOutput(result=pathlib.Path("result.txt"))
 
 
@@ -315,3 +327,337 @@ def test_pipeline_clear_removes_all_stages(tmp_path: pathlib.Path) -> None:
     p.clear()
 
     assert len(p.list_stages()) == 0
+
+
+# =============================================================================
+# include() Tests
+# =============================================================================
+
+
+def test_pipeline_include_copies_stages(tmp_path: pathlib.Path) -> None:
+    """include() should copy all stages from the included pipeline."""
+    main = Pipeline("main", root=tmp_path / "main")
+    sub = Pipeline("sub", root=tmp_path / "sub")
+
+    sub.register(_simple_stage, name="sub_stage")
+
+    main.include(sub)
+
+    assert "sub_stage" in main.list_stages()
+
+
+def test_pipeline_include_preserves_state_dir(tmp_path: pathlib.Path) -> None:
+    """Included stages should keep their original state_dir."""
+    main = Pipeline("main", root=tmp_path / "main")
+    sub = Pipeline("sub", root=tmp_path / "sub")
+
+    sub.register(_simple_stage, name="sub_stage")
+    main.include(sub)
+
+    # Stage should have sub's state_dir, not main's
+    info = main.get("sub_stage")
+    assert info["state_dir"] == tmp_path / "sub" / ".pivot"
+
+
+def test_pipeline_include_preserves_state_dir_transitively(tmp_path: pathlib.Path) -> None:
+    """Transitive inclusion should preserve original state_dir through multiple levels.
+
+    When A includes B and B includes C, C's stages in A should retain C's state_dir.
+    Critical for ensuring lock files and state.db remain in correct locations.
+    """
+    # Level 1: Base pipeline
+    base = Pipeline("base", root=tmp_path / "base")
+    base.register(_simple_stage, name="base_stage")
+
+    # Level 2: Intermediate pipeline includes base
+    intermediate = Pipeline("intermediate", root=tmp_path / "intermediate")
+    intermediate.include(base)
+    intermediate.register(_stage_a, name="intermediate_stage")
+
+    # Level 3: Main pipeline includes intermediate (gets base transitively)
+    main = Pipeline("main", root=tmp_path / "main")
+    main.include(intermediate)
+
+    # Verify base_stage retained base's state_dir (not intermediate's)
+    base_info = main.get("base_stage")
+    assert base_info["state_dir"] == tmp_path / "base" / ".pivot"
+
+    # Verify intermediate_stage has intermediate's state_dir
+    intermediate_info = main.get("intermediate_stage")
+    assert intermediate_info["state_dir"] == tmp_path / "intermediate" / ".pivot"
+
+
+def test_pipeline_include_name_collision_raises(tmp_path: pathlib.Path) -> None:
+    """include() should raise PipelineConfigError on stage name collision."""
+    main = Pipeline("main", root=tmp_path / "main")
+    sub = Pipeline("sub", root=tmp_path / "sub")
+
+    main.register(_simple_stage, name="train")
+    sub.register(_simple_stage, name="train")
+
+    with pytest.raises(PipelineConfigError, match="train.*already exists"):
+        main.include(sub)
+
+
+def test_pipeline_include_collision_transitive(tmp_path: pathlib.Path) -> None:
+    """Name collision should be detected even in transitively included stages."""
+    main = Pipeline("main", root=tmp_path / "main")
+    main.register(_simple_stage, name="train")
+
+    # Nested pipeline has same stage name
+    subsub = Pipeline("subsub", root=tmp_path / "subsub")
+    subsub.register(_stage_a, name="train")
+
+    # Intermediate includes nested
+    sub = Pipeline("sub", root=tmp_path / "sub")
+    sub.include(subsub)
+
+    # Should detect collision with transitively included stage
+    with pytest.raises(PipelineConfigError, match="train.*already exists"):
+        main.include(sub)
+
+
+def test_pipeline_include_collision_is_atomic(tmp_path: pathlib.Path) -> None:
+    """Include should be atomic: collision should not partially add stages.
+
+    Important for preventing registry corruption when include() fails partway through.
+    """
+    main = Pipeline("main", root=tmp_path / "main")
+    main.register(_simple_stage, name="conflict")
+
+    sub = Pipeline("sub", root=tmp_path / "sub")
+    sub.register(_stage_a, name="safe")
+    sub.register(_stage_b, name="conflict")
+
+    initial_stages = set(main.list_stages())
+
+    with pytest.raises(PipelineConfigError):
+        main.include(sub)
+
+    # Should be unchanged (not have "safe" added)
+    assert set(main.list_stages()) == initial_stages
+
+
+def test_pipeline_include_empty_pipeline(tmp_path: pathlib.Path) -> None:
+    """include() with empty pipeline should be a no-op."""
+    main = Pipeline("main", root=tmp_path / "main")
+    main.register(_simple_stage, name="existing")
+
+    empty = Pipeline("empty", root=tmp_path / "empty")
+
+    main.include(empty)  # Should not raise
+
+    assert set(main.list_stages()) == {"existing"}
+
+
+def test_pipeline_include_self_raises(tmp_path: pathlib.Path) -> None:
+    """Including a pipeline into itself should raise."""
+    main = Pipeline("main", root=tmp_path / "main")
+    main.register(_simple_stage, name="stage")
+
+    with pytest.raises(PipelineConfigError, match="cannot include itself"):
+        main.include(main)
+
+
+def test_pipeline_include_same_pipeline_twice_raises(tmp_path: pathlib.Path) -> None:
+    """Including the same pipeline twice should raise on collision."""
+    main = Pipeline("main", root=tmp_path / "main")
+    sub = Pipeline("sub", root=tmp_path / "sub")
+    sub.register(_simple_stage, name="sub_stage")
+
+    main.include(sub)
+
+    with pytest.raises(PipelineConfigError, match="sub_stage.*already exists"):
+        main.include(sub)
+
+
+def test_pipeline_include_multiple_different_pipelines(tmp_path: pathlib.Path) -> None:
+    """Including multiple different pipelines should work."""
+    main = Pipeline("main", root=tmp_path / "main")
+    sub1 = Pipeline("sub1", root=tmp_path / "sub1")
+    sub2 = Pipeline("sub2", root=tmp_path / "sub2")
+
+    sub1.register(_simple_stage, name="stage1")
+    sub2.register(_simple_stage, name="stage2")
+
+    main.include(sub1)
+    main.include(sub2)
+
+    assert set(main.list_stages()) == {"stage1", "stage2"}
+
+
+def test_pipeline_include_preserves_params(tmp_path: pathlib.Path) -> None:
+    """Included stages should keep their params."""
+    main = Pipeline("main", root=tmp_path / "main")
+    sub = Pipeline("sub", root=tmp_path / "sub")
+
+    sub.register(
+        _parameterized_stage_for_include,
+        name="param_stage",
+        params=_TestIncludeParams(value=100),
+    )
+    main.include(sub)
+
+    info = main.get("param_stage")
+    params = info["params"]
+    assert params is not None
+    assert isinstance(params, _TestIncludeParams)
+    assert params.value == 100
+
+
+def test_pipeline_include_isolates_mutations(tmp_path: pathlib.Path) -> None:
+    """Mutations to included stages shouldn't affect source pipeline.
+
+    Critical for preventing action-at-a-distance bugs where modifying one
+    pipeline unexpectedly affects another.
+    """
+    main = Pipeline("main", root=tmp_path / "main")
+    sub = Pipeline("sub", root=tmp_path / "sub")
+
+    sub.register(_simple_stage, name="stage", mutex=["original"])
+    main.include(sub)
+
+    # Mutate main's copy
+    main.get("stage")["mutex"].append("test_mutex")
+
+    # Sub's copy should be unaffected
+    assert "test_mutex" not in sub.get("stage")["mutex"]
+
+
+def test_pipeline_include_is_independent_copy(tmp_path: pathlib.Path) -> None:
+    """Stages are copied at include time; subsequent changes don't propagate."""
+    main = Pipeline("main", root=tmp_path / "main")
+    sub = Pipeline("sub", root=tmp_path / "sub")
+
+    sub.register(_simple_stage, name="original")
+    main.include(sub)
+
+    # Modify sub after inclusion
+    sub.register(_stage_a, name="new_stage")
+
+    # Main should be unaffected
+    assert "original" in main.list_stages()
+    assert "new_stage" not in main.list_stages()
+
+
+def test_pipeline_include_invalidates_dag_cache(
+    tmp_path: pathlib.Path, mocker: MockerFixture
+) -> None:
+    """Include should invalidate cached DAG to ensure freshness."""
+    mocker.patch.object(project, "_project_root_cache", tmp_path)
+    (tmp_path / ".git").mkdir()
+
+    main = Pipeline("main", root=tmp_path)
+    main.register(_stage_a, name="stage_a")
+
+    # Build DAG (caches it)
+    dag1 = main.build_dag(validate=False)
+    assert len(dag1.nodes) == 1
+
+    # Include another pipeline
+    sub = Pipeline("sub", root=tmp_path / "sub")
+    sub.register(_stage_b, name="stage_b")
+    main.include(sub)
+
+    # Subsequent build_dag should see new stage
+    dag2 = main.build_dag(validate=False)
+    assert len(dag2.nodes) == 2
+    assert "stage_b" in dag2.nodes
+
+
+def test_pipeline_include_dag_connects_across_pipelines(
+    tmp_path: pathlib.Path, mocker: MockerFixture
+) -> None:
+    """DAG should connect main stage depending on included sub-pipeline stage."""
+    mocker.patch.object(project, "_project_root_cache", tmp_path)
+    (tmp_path / ".git").mkdir()
+
+    main = Pipeline("main", root=tmp_path)
+    sub = Pipeline("sub", root=tmp_path / "sub")
+
+    sub.register(_stage_a, name="producer")
+    main.include(sub)
+    main.register(_stage_b, name="consumer")
+
+    dag = main.build_dag(validate=True)
+
+    assert "producer" in dag.nodes
+    assert "consumer" in dag.nodes
+    # consumer depends on producer (edge from consumer -> producer)
+    assert dag.has_edge("consumer", "producer")
+
+
+def test_pipeline_include_preserves_all_metadata(tmp_path: pathlib.Path) -> None:
+    """Included stages should preserve all metadata fields (deps, outs, mutex, variant, fingerprint)."""
+    main = Pipeline("main", root=tmp_path / "main")
+    sub = Pipeline("sub", root=tmp_path / "sub")
+
+    # Register stage with various metadata
+    sub.register(
+        _stage_b,
+        name="complex_stage",
+        mutex=["gpu", "memory"],
+        variant="test_variant",
+    )
+
+    original_info = sub.get("complex_stage")
+    main.include(sub)
+    included_info = main.get("complex_stage")
+
+    # Verify all critical fields preserved
+    assert included_info["deps"] == original_info["deps"]
+    assert included_info["deps_paths"] == original_info["deps_paths"]
+    assert included_info["outs"] == original_info["outs"]
+    assert included_info["outs_paths"] == original_info["outs_paths"]
+    assert included_info["mutex"] == original_info["mutex"]
+    assert included_info["variant"] == original_info["variant"]
+    assert included_info["fingerprint"] == original_info["fingerprint"]
+    assert included_info["signature"] == original_info["signature"]
+    assert included_info["func"] == original_info["func"]
+
+
+def test_pipeline_include_isolates_nested_mutations(tmp_path: pathlib.Path) -> None:
+    """Deep copy should isolate mutations to nested structures (params object)."""
+    main = Pipeline("main", root=tmp_path / "main")
+    sub = Pipeline("sub", root=tmp_path / "sub")
+
+    sub.register(
+        _parameterized_stage_for_include,
+        name="stage",
+        params=_TestIncludeParams(value=100),
+    )
+
+    main.include(sub)
+
+    # Get params from both pipelines
+    included_params = main.get("stage")["params"]
+    original_params = sub.get("stage")["params"]
+
+    assert isinstance(included_params, _TestIncludeParams)
+    assert isinstance(original_params, _TestIncludeParams)
+
+    # Params should be different objects (deep copied)
+    assert included_params is not original_params
+
+    # Verify values are equal but independent
+    assert included_params.value == original_params.value == 100
+
+
+def test_pipeline_include_multiple_collisions_atomic(tmp_path: pathlib.Path) -> None:
+    """Multiple collisions should still be atomic (no partial adds)."""
+    main = Pipeline("main", root=tmp_path / "main")
+    main.register(_simple_stage, name="collide_a")
+    main.register(_stage_a, name="collide_b")
+
+    sub = Pipeline("sub", root=tmp_path / "sub")
+    sub.register(_stage_b, name="collide_a")  # First collision
+    sub.register(_simple_stage, name="collide_b")  # Second collision
+    sub.register(_stage_a, name="safe_stage")  # Would be safe if others didn't collide
+
+    initial_stages = set(main.list_stages())
+
+    with pytest.raises(PipelineConfigError, match="collide_a.*already exists"):
+        main.include(sub)
+
+    # Should be unchanged (safe_stage not added)
+    assert set(main.list_stages()) == initial_stages

@@ -77,7 +77,7 @@ def test_build_graph_simple_chain(tmp_path: Path) -> None:
     output_file = tmp_path / "output.csv"
     input_file.touch()
 
-    # Register stages directly (bypass REGISTRY for isolated test)
+    # Create stages dict directly for isolated graph test
     stages = {
         "stage_a": _create_stage("stage_a", [str(input_file)], [str(intermediate)]),
         "stage_b": _create_stage("stage_b", [str(intermediate)], [str(output_file)]),

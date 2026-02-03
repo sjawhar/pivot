@@ -492,6 +492,24 @@ class StageRegistry:
                 state_dir=state_dir,
             )
 
+    def add_existing(self, stage_info: RegistryStageInfo) -> None:
+        """Add a pre-validated stage info (for pipeline composition).
+
+        Unlike register(), this accepts already-validated stage info from another
+        registry. Use for copying stages between pipelines.
+
+        Args:
+            stage_info: Complete stage info to add.
+
+        Raises:
+            ValidationError: If stage name already exists.
+        """
+        name = stage_info["name"]
+        if name in self._stages:
+            raise exceptions.ValidationError(f"Stage '{name}' already registered")
+        self._stages[name] = stage_info
+        self._cached_dag = None
+
     def get(self, name: str) -> RegistryStageInfo:
         """Get stage info by name (raises KeyError if not found)."""
         return self._stages[name]

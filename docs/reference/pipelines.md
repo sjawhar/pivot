@@ -233,6 +233,58 @@ stages:
 
 `Dep` accepts any object implementing the `Reader[R]` protocol, while `Out` accepts any `Writer[W]`. All built-in loaders (like `CSV()`, `PathOnly()`, `Pickle()`) implement both protocols, so they work with either annotation.
 
+## Pipeline Composition
+
+Pipelines can include other pipelines to compose larger workflows:
+
+```python
+from pivot.pipeline import Pipeline
+
+# Create sub-pipeline for data preprocessing
+preprocessing = Pipeline("preprocessing")
+preprocessing.register(clean_data)
+preprocessing.register(normalize)
+
+# Create main pipeline that includes preprocessing
+main = Pipeline("main")
+main.include(preprocessing)
+main.register(train)
+main.register(evaluate)
+```
+
+### State Isolation
+
+When Pipeline A includes Pipeline B:
+- B's stages are deep-copied into A's registry
+- B's stages keep their original `state_dir` (`.pivot/` in B's root)
+- Lock files and state.db remain in B's directory
+- The project-wide cache is shared
+- Mutations to stages in A don't affect B (and vice versa)
+
+This enables modular pipeline organization where each sub-pipeline can be developed, tested, and run independently.
+
+### Name Collisions
+
+If an included pipeline has a stage with the same name as an existing stage, `include()` raises `PipelineConfigError`. Rename stages at registration time to avoid collisions:
+
+```python
+sub.register(my_stage, name="sub_preprocess")  # Use unique name
+main.include(sub)
+```
+
+### Semantics
+
+- **Point-in-time snapshot:** `include()` copies stages at call time. Later registrations in the source pipeline are not reflected.
+- **Atomic operation:** If any stage name collides, no stages are added (all-or-nothing).
+- **Transitive:** If B includes C, then A includes B, A gets all of C's stages (they're already in B's registry when A.include(B) runs).
+
+### Security Considerations
+
+When including external pipelines:
+- Included stages execute with the same privileges as your pipeline
+- Only include pipelines from trusted sources
+- Review included pipeline code before use
+
 ## See Also
 
 - [Dependencies & Loaders](dependencies.md) - Declaring inputs

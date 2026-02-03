@@ -984,3 +984,102 @@ def test_registry_stage_info_state_dir_defaults_to_none() -> None:
 
     info = reg.get("my_stage")
     assert info["state_dir"] is None
+
+
+# ==============================================================================
+# add_existing() method tests (pipeline composition)
+# ==============================================================================
+
+
+def test_registry_add_existing_stage(tmp_path: pathlib.Path) -> None:
+    """add_existing() should add a pre-built RegistryStageInfo."""
+    reg = StageRegistry()
+
+    # Create a stage info manually (simulating copy from another registry)
+    info = RegistryStageInfo(
+        func=_stage3_no_deps,
+        name="added_stage",
+        deps={},
+        deps_paths=[],
+        outs=[],
+        outs_paths=[],
+        params=None,
+        mutex=[],
+        variant=None,
+        signature=None,
+        fingerprint={},
+        dep_specs={},
+        out_specs={},
+        params_arg_name=None,
+        state_dir=tmp_path / ".pivot",
+    )
+
+    reg.add_existing(info)
+
+    assert "added_stage" in reg.list_stages()
+    assert reg.get("added_stage")["state_dir"] == tmp_path / ".pivot"
+
+
+def test_registry_add_existing_collision_raises() -> None:
+    """add_existing() should raise ValidationError on name collision."""
+    reg = StageRegistry()
+    reg.register(_stage3_no_deps, name="existing")
+
+    info = RegistryStageInfo(
+        func=_stage3_no_deps,
+        name="existing",  # Collision!
+        deps={},
+        deps_paths=[],
+        outs=[],
+        outs_paths=[],
+        params=None,
+        mutex=[],
+        variant=None,
+        signature=None,
+        fingerprint={},
+        dep_specs={},
+        out_specs={},
+        params_arg_name=None,
+        state_dir=None,
+    )
+
+    with pytest.raises(exceptions.ValidationError, match="already registered"):
+        reg.add_existing(info)
+
+
+def test_registry_add_existing_invalidates_dag_cache(set_project_root: pathlib.Path) -> None:
+    """add_existing() should invalidate the cached DAG."""
+    reg = StageRegistry()
+
+    # Create test file for stage dependency
+    (set_project_root / "a.csv").touch()
+
+    # Register initial stage and build DAG (caches it)
+    reg.register(_stage_a_for_dag, name="stage_a")
+    dag1 = reg.build_dag(validate=False)
+    assert len(dag1.nodes) == 1
+
+    # Add existing stage info
+    info = RegistryStageInfo(
+        func=_stage3_no_deps,
+        name="added_stage",
+        deps={},
+        deps_paths=[],
+        outs=[],
+        outs_paths=[],
+        params=None,
+        mutex=[],
+        variant=None,
+        signature=None,
+        fingerprint={},
+        dep_specs={},
+        out_specs={},
+        params_arg_name=None,
+        state_dir=set_project_root / ".pivot",
+    )
+    reg.add_existing(info)
+
+    # Subsequent build_dag should see new stage (cache was invalidated)
+    dag2 = reg.build_dag(validate=False)
+    assert len(dag2.nodes) == 2
+    assert "added_stage" in dag2.nodes

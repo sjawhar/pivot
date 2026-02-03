@@ -257,6 +257,36 @@ pivot repro --dry-run        # Validate DAG without executing
 pivot run my_stage           # Run ONLY my_stage (no dependency resolution)
 ```
 
+## Pipeline Composition
+
+Include stages from sub-pipelines while preserving their state directories:
+
+```python
+# Define sub-pipeline
+preprocessing = Pipeline("preprocessing")
+preprocessing.register(clean_data, name="clean")
+preprocessing.register(normalize, name="normalize")
+
+# Include in main pipeline
+main = Pipeline("main")
+main.include(preprocessing)  # Deep-copies stages, preserves state_dir
+main.register(train, name="train")  # Can depend on preprocessing outputs
+```
+
+**Behavior:**
+- Included stages keep their original `state_dir` (for lock files, state.db)
+- Stages are deep-copied: mutations don't propagate between pipelines
+- `include()` is a point-in-time snapshot; later registrations in source don't propagate
+- Including empty pipeline is a no-op
+- Including same pipeline twice raises (name collision)
+- Transitive: if B includes C, then A includes B, A gets C's stages (already in B's registry)
+
+**Rules:**
+- Stage name collisions raise `PipelineConfigError`
+- Cannot include a pipeline into itself
+
+**Security Note:** Only include pipelines from trusted sources. Included stages execute with the same privileges as your pipeline.
+
 ## Testing
 
 Pass data directly (annotations are bypassed):
@@ -281,6 +311,8 @@ def test_my_stage():
 | `DirectoryOut key must have extension` | Key like `"task_a"` | Use `"task_a.json"` |
 | `loader is required` | `Out("file.json")` without loader | Add loader: `Out("file.json", JSON())` |
 | `TypedDict field missing Out annotation` | Field without `Out`/`Metric`/`Plot` | Add annotation to all fields |
+| `stage 'X' already exists` | Name collision in `include()` | Rename stage with `name=` at registration |
+| `cannot include itself` | Self-include attempted | Use a separate Pipeline instance |
 
 ## Checklist
 
