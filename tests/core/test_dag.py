@@ -1,20 +1,12 @@
 from pathlib import Path
 
 import pytest
-from pydantic import BaseModel
 
-from pivot import dag, loaders, outputs
+from pivot import loaders, outputs
+from pivot.engine import graph as engine_graph
 from pivot.exceptions import CyclicGraphError, DependencyNotFoundError
 from pivot.registry import RegistryStageInfo
 from pivot.storage.track import PvtData
-
-# Test helpers for creating dummy stages
-
-
-class MockParams(BaseModel):
-    """Mock Pydantic params model for test stage fixtures."""
-
-    pass
 
 
 def _create_stage(name: str, deps: list[str], outs: list[str]) -> RegistryStageInfo:
@@ -52,7 +44,8 @@ def test_build_dag_simple_chain(tmp_path: Path) -> None:
         "stage_c": _create_stage("stage_c", [str(tmp_path / "b.csv")], [str(tmp_path / "c.csv")]),
     }
 
-    graph = dag.build_dag(stages)
+    bipartite = engine_graph.build_graph(stages)
+    graph = engine_graph.get_stage_dag(bipartite)
 
     # Check nodes exist
     assert set(graph.nodes()) == {"stage_a", "stage_b", "stage_c"}
@@ -89,7 +82,8 @@ def test_build_dag_diamond(tmp_path: Path) -> None:
         ),
     }
 
-    graph = dag.build_dag(stages)
+    bipartite = engine_graph.build_graph(stages)
+    graph = engine_graph.get_stage_dag(bipartite)
 
     # Check all nodes
     assert set(graph.nodes()) == {"data", "preproc", "features", "train"}
@@ -111,7 +105,8 @@ def test_build_dag_independent_stages(tmp_path: Path) -> None:
         "stage_x": _create_stage("stage_x", [str(tmp_path / "x.csv")], [str(tmp_path / "y.csv")]),
     }
 
-    graph = dag.build_dag(stages)
+    bipartite = engine_graph.build_graph(stages)
+    graph = engine_graph.get_stage_dag(bipartite)
 
     # No edges between independent stages
     assert not graph.has_edge("stage_a", "stage_x")
@@ -120,7 +115,8 @@ def test_build_dag_independent_stages(tmp_path: Path) -> None:
 
 def test_build_dag_empty() -> None:
     """Build DAG with no stages."""
-    graph = dag.build_dag({})
+    bipartite = engine_graph.build_graph({})
+    graph = engine_graph.get_stage_dag(bipartite)
     assert len(list(graph.nodes())) == 0
 
 
@@ -138,7 +134,8 @@ def test_file_dependency_resolution(tmp_path: Path) -> None:
         ),
     }
 
-    graph = dag.build_dag(stages)
+    bipartite = engine_graph.build_graph(stages)
+    graph = engine_graph.get_stage_dag(bipartite)
 
     # transform depends on extract
     assert graph.has_edge("transform", "extract")
@@ -154,7 +151,8 @@ def test_dependency_on_existing_file(tmp_path: Path) -> None:
         )
     }
 
-    graph = dag.build_dag(stages)
+    bipartite = engine_graph.build_graph(stages)
+    graph = engine_graph.get_stage_dag(bipartite)
 
     # No edges (external file is not a stage)
     assert len(list(graph.edges())) == 0
@@ -172,7 +170,7 @@ def test_missing_dependency_raises_error(tmp_path: Path) -> None:
         DependencyNotFoundError,
         match="depends on.*missing.csv.*not produced by any stage and does not exist on disk",
     ):
-        dag.build_dag(stages)
+        engine_graph.build_graph(stages, validate=True)
 
 
 def test_missing_dependency_with_validate_false(tmp_path: Path) -> None:
@@ -184,7 +182,8 @@ def test_missing_dependency_with_validate_false(tmp_path: Path) -> None:
     }
 
     # Should not raise
-    graph = dag.build_dag(stages, validate=False)
+    bipartite = engine_graph.build_graph(stages, validate=False)
+    graph = engine_graph.get_stage_dag(bipartite)
     assert "process" in graph.nodes()
 
 
@@ -199,7 +198,7 @@ def test_circular_dependency_raises_error(tmp_path: Path) -> None:
     }
 
     with pytest.raises(CyclicGraphError, match="Circular dependency detected"):
-        dag.build_dag(stages, validate=False)
+        engine_graph.build_graph(stages)  # cycles always checked
 
 
 def test_self_dependency_raises_error(tmp_path: Path) -> None:
@@ -209,7 +208,7 @@ def test_self_dependency_raises_error(tmp_path: Path) -> None:
     }
 
     with pytest.raises(CyclicGraphError, match="Circular dependency detected"):
-        dag.build_dag(stages, validate=False)
+        engine_graph.build_graph(stages)  # cycles always checked
 
 
 def test_transitive_cycle_raises_error(tmp_path: Path) -> None:
@@ -221,7 +220,7 @@ def test_transitive_cycle_raises_error(tmp_path: Path) -> None:
     }
 
     with pytest.raises(CyclicGraphError, match="Circular dependency detected"):
-        dag.build_dag(stages, validate=False)
+        engine_graph.build_graph(stages)  # cycles always checked
 
 
 # --- Execution order tests ---
@@ -237,8 +236,9 @@ def test_execution_order_simple_chain(tmp_path: Path) -> None:
         "stage_c": _create_stage("stage_c", [str(tmp_path / "b.csv")], [str(tmp_path / "c.csv")]),
     }
 
-    graph = dag.build_dag(stages)
-    order = dag.get_execution_order(graph)
+    bipartite = engine_graph.build_graph(stages)
+    graph = engine_graph.get_stage_dag(bipartite)
+    order = engine_graph.get_execution_order(graph)
 
     assert order == ["stage_a", "stage_b", "stage_c"]
 
@@ -262,8 +262,9 @@ def test_execution_order_diamond(tmp_path: Path) -> None:
         ),
     }
 
-    graph = dag.build_dag(stages)
-    order = dag.get_execution_order(graph)
+    bipartite = engine_graph.build_graph(stages)
+    graph = engine_graph.get_stage_dag(bipartite)
+    order = engine_graph.get_execution_order(graph)
 
     # data must run first
     assert order[0] == "data"
@@ -287,8 +288,9 @@ def test_execution_order_parallel_branches(tmp_path: Path) -> None:
         "stage_y": _create_stage("stage_y", [str(tmp_path / "y.csv")], [str(tmp_path / "z.csv")]),
     }
 
-    graph = dag.build_dag(stages)
-    order = dag.get_execution_order(graph)
+    bipartite = engine_graph.build_graph(stages)
+    graph = engine_graph.get_stage_dag(bipartite)
+    order = engine_graph.get_execution_order(graph)
 
     # stage_a before stage_b
     assert order.index("stage_a") < order.index("stage_b")
@@ -307,10 +309,11 @@ def test_execution_order_subset(tmp_path: Path) -> None:
         "stage_c": _create_stage("stage_c", [str(tmp_path / "b.csv")], [str(tmp_path / "c.csv")]),
     }
 
-    graph = dag.build_dag(stages)
+    bipartite = engine_graph.build_graph(stages)
+    graph = engine_graph.get_stage_dag(bipartite)
 
     # Execute only stage_b and its dependencies
-    order = dag.get_execution_order(graph, stages=["stage_b"])
+    order = engine_graph.get_execution_order(graph, stages=["stage_b"])
 
     # Should include stage_a (dependency) and stage_b, but not stage_c
     assert set(order) == {"stage_a", "stage_b"}
@@ -330,10 +333,11 @@ def test_get_subgraph_single_stage(tmp_path: Path) -> None:
         "stage_c": _create_stage("stage_c", [str(tmp_path / "b.csv")], [str(tmp_path / "c.csv")]),
     }
 
-    graph = dag.build_dag(stages)
+    bipartite = engine_graph.build_graph(stages)
+    graph = engine_graph.get_stage_dag(bipartite)
 
     # Get execution order for just stage_b
-    order = dag.get_execution_order(graph, stages=["stage_b"])
+    order = engine_graph.get_execution_order(graph, stages=["stage_b"])
 
     # Should include dependencies
     assert "stage_a" in order
@@ -360,10 +364,11 @@ def test_get_subgraph_single_stage_with_shared_dependency(tmp_path: Path) -> Non
         ),
     }
 
-    graph = dag.build_dag(stages)
+    bipartite = engine_graph.build_graph(stages)
+    graph = engine_graph.get_stage_dag(bipartite)
 
     # Get execution order for train (depends on preproc and features)
-    order = dag.get_execution_order(graph, stages=["train"])
+    order = engine_graph.get_execution_order(graph, stages=["train"])
 
     # Should include data (dependency), preproc, features, and train
     assert set(order) == {"data", "preproc", "features", "train"}
@@ -379,13 +384,14 @@ def test_get_downstream_stages(tmp_path: Path) -> None:
         "stage_c": _create_stage("stage_c", [str(tmp_path / "b.csv")], [str(tmp_path / "c.csv")]),
     }
 
-    graph = dag.build_dag(stages)
+    bipartite = engine_graph.build_graph(stages)
 
-    # Get all stages downstream of stage_a
-    downstream = dag.get_downstream_stages(graph, "stage_a")
+    # Get all stages downstream of stage_a (uses bipartite graph)
+    downstream = engine_graph.get_downstream_stages(bipartite, "stage_a")
 
     # stage_b and stage_c depend on stage_a (directly or transitively)
-    assert set(downstream) == {"stage_a", "stage_b", "stage_c"}
+    # Note: engine_graph.get_downstream_stages does NOT include the source stage itself
+    assert set(downstream) == {"stage_b", "stage_c"}
 
 
 # --- Edge case tests ---
@@ -395,7 +401,8 @@ def test_stage_with_no_deps(tmp_path: Path) -> None:
     """Stage with no dependencies (leaf node)."""
     stages = {"stage_a": _create_stage("stage_a", [], [str(tmp_path / "a.csv")])}
 
-    graph = dag.build_dag(stages, validate=False)
+    bipartite = engine_graph.build_graph(stages, validate=False)
+    graph = engine_graph.get_stage_dag(bipartite)
 
     assert "stage_a" in graph.nodes()
     assert len(list(graph.edges())) == 0
@@ -407,7 +414,8 @@ def test_stage_with_no_outs(tmp_path: Path) -> None:
 
     stages = {"stage_a": _create_stage("stage_a", [str(tmp_path / "input.csv")], [])}
 
-    graph = dag.build_dag(stages)
+    bipartite = engine_graph.build_graph(stages)
+    graph = engine_graph.get_stage_dag(bipartite)
 
     assert "stage_a" in graph.nodes()
 
@@ -426,7 +434,8 @@ def test_multiple_stages_same_dependency(tmp_path: Path) -> None:
         ),
     }
 
-    graph = dag.build_dag(stages)
+    bipartite = engine_graph.build_graph(stages)
+    graph = engine_graph.get_stage_dag(bipartite)
 
     # Both analyze and visualize depend on extract
     assert graph.has_edge("analyze", "extract")
@@ -448,10 +457,11 @@ def test_directory_depends_on_file_outputs(tmp_path: Path) -> None:
         ),
     }
 
-    graph = dag.build_dag(stages, validate=False)
+    bipartite = engine_graph.build_graph(stages, validate=False)
+    graph = engine_graph.get_stage_dag(bipartite)
 
     assert graph.has_edge("consume_dir", "produce_file"), (
-        "Should create edge for dir→file dependency"
+        "Should create edge for dir->file dependency"
     )
 
 
@@ -468,7 +478,8 @@ def test_directory_depends_on_multiple_file_outputs(tmp_path: Path) -> None:
         ),
     }
 
-    graph = dag.build_dag(stages, validate=False)
+    bipartite = engine_graph.build_graph(stages, validate=False)
+    graph = engine_graph.get_stage_dag(bipartite)
 
     assert graph.has_edge("consume_dir", "produce_a"), "Should depend on first producer"
     assert graph.has_edge("consume_dir", "produce_b"), "Should depend on second producer"
@@ -487,7 +498,8 @@ def test_nested_directory_dependency(tmp_path: Path) -> None:
         ),
     }
 
-    graph = dag.build_dag(stages, validate=False)
+    bipartite = engine_graph.build_graph(stages, validate=False)
+    graph = engine_graph.get_stage_dag(bipartite)
 
     assert graph.has_edge("consume_parent", "produce_nested"), "Should detect nested file outputs"
 
@@ -508,7 +520,8 @@ def test_tracked_file_recognized_as_valid_source(tmp_path: Path) -> None:
     }
 
     # Should not raise - tracked file is recognized as valid source
-    graph = dag.build_dag(stages, validate=True, tracked_files=tracked_files)
+    bipartite = engine_graph.build_graph(stages, validate=True, tracked_files=tracked_files)
+    graph = engine_graph.get_stage_dag(bipartite)
     assert "process" in graph.nodes()
 
 
@@ -531,7 +544,8 @@ def test_tracked_file_inside_directory_recognized(tmp_path: Path) -> None:
     }
 
     # Should not raise - file inside tracked directory is valid
-    graph = dag.build_dag(stages, validate=True, tracked_files=tracked_files)
+    bipartite = engine_graph.build_graph(stages, validate=True, tracked_files=tracked_files)
+    graph = engine_graph.get_stage_dag(bipartite)
     assert "process" in graph.nodes()
 
 
@@ -545,7 +559,8 @@ def test_dependency_on_tracked_directory(tmp_path: Path) -> None:
         tracked_dir: PvtData(path="tracked_data", hash="abc123", size=500, num_files=2),
     }
 
-    graph = dag.build_dag(stages, validate=True, tracked_files=tracked_files)
+    bipartite = engine_graph.build_graph(stages, validate=True, tracked_files=tracked_files)
+    graph = engine_graph.get_stage_dag(bipartite)
     assert "process" in graph.nodes()
 
 
@@ -561,4 +576,4 @@ def test_untracked_missing_dependency_still_raises(tmp_path: Path) -> None:
     }
 
     with pytest.raises(DependencyNotFoundError):
-        dag.build_dag(stages, validate=True, tracked_files=tracked_files)
+        engine_graph.build_graph(stages, validate=True, tracked_files=tracked_files)

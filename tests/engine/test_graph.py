@@ -6,10 +6,10 @@ from pathlib import Path
 
 import pytest
 
-from pivot import dag as legacy_dag
-from pivot import loaders, outputs
+from pivot import exceptions, loaders, outputs
 from pivot.engine import graph, types
 from pivot.registry import RegistryStageInfo
+from pivot.storage.track import PvtData
 
 
 def _create_stage(name: str, deps: list[str], outs: list[str]) -> RegistryStageInfo:
@@ -336,42 +336,6 @@ def test_update_stage_preserves_shared_artifacts(tmp_path: Path) -> None:
     assert graph.get_consumers(g, shared_input) == ["stage_b"]
 
 
-# --- Integration test ---
-
-
-@pytest.mark.usefixtures("clean_registry")
-def test_graph_consistent_with_legacy_dag(tmp_path: Path) -> None:
-    """Bipartite graph encodes same relationships as legacy stage-only DAG."""
-    # Build a pipeline with multiple stages
-    input_file = tmp_path / "input.csv"
-    clean = tmp_path / "clean.csv"
-    feats = tmp_path / "feats.csv"
-    model = tmp_path / "model.pkl"
-    input_file.touch()
-
-    stages = {
-        "preprocess": _create_stage("preprocess", [str(input_file)], [str(clean)]),
-        "features": _create_stage("features", [str(input_file)], [str(feats)]),
-        "train": _create_stage("train", [str(clean), str(feats)], [str(model)]),
-    }
-
-    # Build both graphs
-    bipartite = graph.build_graph(stages)
-    legacy = legacy_dag.build_dag(stages)
-
-    # Verify same stage relationships
-    # Legacy DAG has edge (consumer -> producer), meaning train -> preprocess, train -> features
-    for stage_name in stages:
-        legacy_deps = set(legacy.successors(stage_name))  # Stages this depends on
-        bipartite_deps = set[str]()
-        for dep_path in stages[stage_name]["deps_paths"]:
-            producer = graph.get_producer(bipartite, Path(dep_path))
-            if producer:
-                bipartite_deps.add(producer)
-
-        assert legacy_deps == bipartite_deps, f"Mismatch for {stage_name}"
-
-
 # --- get_stage_dag tests ---
 
 
@@ -401,7 +365,7 @@ def test_get_stage_dag_extracts_stage_only_graph(tmp_path: Path) -> None:
         assert not node.startswith("artifact:")
         assert not node.startswith("stage:")
 
-    # Edge direction: consumer -> producer (matches dag.build_dag() convention)
+    # Edge direction: consumer -> producer (for DFS postorder execution)
     # train depends on preprocess, so edge goes train -> preprocess
     assert stage_dag.has_edge("train", "preprocess")
 
@@ -443,3 +407,467 @@ def test_get_artifact_consumers_returns_empty_for_unknown_path(tmp_path: Path) -
     g = graph.build_graph({})
     consumers = graph.get_artifact_consumers(g, tmp_path / "unknown.csv")
     assert consumers == []
+
+
+# --- Validation tests ---
+
+
+def test_build_graph_raises_on_cycle(tmp_path: Path) -> None:
+    """build_graph raises CyclicGraphError when graph has cycles."""
+    file_a = tmp_path / "a.csv"
+    file_b = tmp_path / "b.csv"
+
+    stages = {
+        "stage_a": _create_stage("stage_a", [str(file_b)], [str(file_a)]),
+        "stage_b": _create_stage("stage_b", [str(file_a)], [str(file_b)]),
+    }
+
+    with pytest.raises(exceptions.CyclicGraphError, match="Circular dependency"):
+        graph.build_graph(stages)  # Cycles always checked
+
+
+def test_build_graph_raises_on_missing_dependency(tmp_path: Path) -> None:
+    """build_graph raises DependencyNotFoundError when validate=True."""
+    output_file = tmp_path / "output.csv"
+    missing_dep = tmp_path / "missing.csv"
+
+    stages = {
+        "stage_a": _create_stage("stage_a", [str(missing_dep)], [str(output_file)]),
+    }
+
+    with pytest.raises(exceptions.DependencyNotFoundError):
+        graph.build_graph(stages, validate=True)
+
+
+def test_build_graph_allows_missing_when_validate_false(tmp_path: Path) -> None:
+    """build_graph allows missing deps when validate=False."""
+    output_file = tmp_path / "output.csv"
+    missing_dep = tmp_path / "missing.csv"
+
+    stages = {
+        "stage_a": _create_stage("stage_a", [str(missing_dep)], [str(output_file)]),
+    }
+
+    # Should not raise
+    g = graph.build_graph(stages, validate=False)
+    assert "stage:stage_a" in g
+
+
+def test_build_graph_accepts_tracked_file(tmp_path: Path) -> None:
+    """build_graph accepts tracked files as valid dependency sources."""
+    output_file = tmp_path / "output.csv"
+    tracked_input = tmp_path / "tracked.csv"
+
+    tracked_files: dict[str, PvtData] = {
+        str(tracked_input): PvtData(path="tracked.csv", hash="abc123", size=100)
+    }
+
+    stages = {
+        "stage_a": _create_stage("stage_a", [str(tracked_input)], [str(output_file)]),
+    }
+
+    # Should not raise - tracked file is valid
+    g = graph.build_graph(stages, validate=True, tracked_files=tracked_files)
+    assert "stage:stage_a" in g
+
+
+def test_build_graph_directory_dependency(tmp_path: Path) -> None:
+    """build_graph resolves directory dependencies via trie."""
+    input_file = tmp_path / "input.csv"
+    output_dir = tmp_path / "outputs"
+    file_a = output_dir / "a.csv"
+    input_file.touch()
+
+    stages = {
+        "producer": _create_stage("producer", [str(input_file)], [str(file_a)]),
+        "consumer": _create_stage("consumer", [str(output_dir)], [str(tmp_path / "final.csv")]),
+    }
+
+    # Should not raise - output_dir contains file_a from producer
+    g = graph.build_graph(stages, validate=True)
+    assert "stage:producer" in g
+    assert "stage:consumer" in g
+
+
+# --- get_upstream_stages tests ---
+
+
+@pytest.mark.usefixtures("clean_registry")
+def test_get_upstream_stages_returns_producing_stages(tmp_path: Path) -> None:
+    """get_upstream_stages returns stages that produce inputs for a stage."""
+    input_file = tmp_path / "input.csv"
+    cleaned = tmp_path / "cleaned.csv"
+    features = tmp_path / "features.csv"
+    model = tmp_path / "model.pkl"
+    input_file.touch()
+
+    stages = {
+        "preprocess": _create_stage("preprocess", [str(input_file)], [str(cleaned)]),
+        "extract": _create_stage("extract", [str(input_file)], [str(features)]),
+        "train": _create_stage("train", [str(cleaned), str(features)], [str(model)]),
+    }
+
+    g = graph.build_graph(stages)
+    upstream = graph.get_upstream_stages(g, "train")
+
+    # train depends on outputs from preprocess and extract
+    assert set(upstream) == {"preprocess", "extract"}
+
+
+@pytest.mark.usefixtures("clean_registry")
+def test_get_upstream_stages_empty_for_root_stage(tmp_path: Path) -> None:
+    """get_upstream_stages returns empty list for stage with no upstream dependencies."""
+    input_file = tmp_path / "input.csv"
+    output_file = tmp_path / "output.csv"
+    input_file.touch()
+
+    stages = {
+        "stage_a": _create_stage("stage_a", [str(input_file)], [str(output_file)]),
+    }
+
+    g = graph.build_graph(stages)
+    upstream = graph.get_upstream_stages(g, "stage_a")
+
+    # stage_a has no upstream stages (only external input)
+    assert upstream == []
+
+
+@pytest.mark.usefixtures("clean_registry")
+def test_get_upstream_stages_empty_for_unknown_stage(tmp_path: Path) -> None:
+    """get_upstream_stages returns empty list for unknown stage."""
+    g = graph.build_graph({})
+    upstream = graph.get_upstream_stages(g, "unknown_stage")
+    assert upstream == []
+
+
+# --- get_execution_order with single_stage tests ---
+
+
+@pytest.mark.usefixtures("clean_registry")
+def test_get_execution_order_single_stage_mode(tmp_path: Path) -> None:
+    """get_execution_order with single_stage=True returns only requested stages."""
+    input_file = tmp_path / "input.csv"
+    intermediate = tmp_path / "intermediate.csv"
+    output_file = tmp_path / "output.csv"
+    input_file.touch()
+
+    stages = {
+        "stage_a": _create_stage("stage_a", [str(input_file)], [str(intermediate)]),
+        "stage_b": _create_stage("stage_b", [str(intermediate)], [str(output_file)]),
+    }
+
+    bipartite = graph.build_graph(stages)
+    stage_dag = graph.get_stage_dag(bipartite)
+
+    # Single stage mode - should return only stage_b, NOT its dependency stage_a
+    order = graph.get_execution_order(stage_dag, stages=["stage_b"], single_stage=True)
+
+    assert order == ["stage_b"]
+    assert "stage_a" not in order
+
+
+@pytest.mark.usefixtures("clean_registry")
+def test_get_execution_order_single_stage_preserves_order(tmp_path: Path) -> None:
+    """get_execution_order with single_stage=True preserves input order."""
+    input_file = tmp_path / "input.csv"
+    out_a = tmp_path / "a.csv"
+    out_b = tmp_path / "b.csv"
+    input_file.touch()
+
+    stages = {
+        "stage_a": _create_stage("stage_a", [str(input_file)], [str(out_a)]),
+        "stage_b": _create_stage("stage_b", [str(input_file)], [str(out_b)]),
+    }
+
+    bipartite = graph.build_graph(stages)
+    stage_dag = graph.get_stage_dag(bipartite)
+
+    # Request in specific order - should be preserved
+    order = graph.get_execution_order(stage_dag, stages=["stage_b", "stage_a"], single_stage=True)
+
+    assert order == ["stage_b", "stage_a"]
+
+
+# --- Additional edge case tests ---
+
+
+@pytest.mark.usefixtures("clean_registry")
+def test_get_producer_returns_none_for_unknown_path(tmp_path: Path) -> None:
+    """get_producer returns None for completely unknown artifact path."""
+    input_file = tmp_path / "input.csv"
+    output_file = tmp_path / "output.csv"
+    input_file.touch()
+
+    stages = {
+        "stage_a": _create_stage("stage_a", [str(input_file)], [str(output_file)]),
+    }
+
+    g = graph.build_graph(stages)
+    producer = graph.get_producer(g, tmp_path / "completely_unknown.csv")
+
+    assert producer is None
+
+
+@pytest.mark.usefixtures("clean_registry")
+def test_get_downstream_stages_empty_for_unknown_stage(tmp_path: Path) -> None:
+    """get_downstream_stages returns empty list for unknown stage."""
+    input_file = tmp_path / "input.csv"
+    output_file = tmp_path / "output.csv"
+    input_file.touch()
+
+    stages = {
+        "stage_a": _create_stage("stage_a", [str(input_file)], [str(output_file)]),
+    }
+
+    g = graph.build_graph(stages)
+    downstream = graph.get_downstream_stages(g, "unknown_stage")
+
+    assert downstream == []
+
+
+@pytest.mark.usefixtures("clean_registry")
+def test_update_stage_adds_new_out(tmp_path: Path) -> None:
+    """update_stage adds new output edges."""
+    input_file = tmp_path / "input.csv"
+    out_a = tmp_path / "a.csv"
+    out_b = tmp_path / "b.csv"
+    input_file.touch()
+
+    # Initial: stage_a produces only out_a
+    stages = {
+        "stage_a": _create_stage("stage_a", [str(input_file)], [str(out_a)]),
+    }
+    g = graph.build_graph(stages)
+
+    assert graph.get_producer(g, out_a) == "stage_a"
+    assert graph.get_producer(g, out_b) is None
+
+    # Update: stage_a now also produces out_b
+    new_info = _create_stage("stage_a", [str(input_file)], [str(out_a), str(out_b)])
+    graph.update_stage(g, "stage_a", new_info)
+
+    assert graph.get_producer(g, out_a) == "stage_a"
+    assert graph.get_producer(g, out_b) == "stage_a"
+
+
+@pytest.mark.usefixtures("clean_registry")
+def test_update_stage_removes_old_out(tmp_path: Path) -> None:
+    """update_stage removes old output edges and orphaned artifacts."""
+    input_file = tmp_path / "input.csv"
+    out_a = tmp_path / "a.csv"
+    out_b = tmp_path / "b.csv"
+    input_file.touch()
+
+    # Initial: stage_a produces both outputs
+    stages = {
+        "stage_a": _create_stage("stage_a", [str(input_file)], [str(out_a), str(out_b)]),
+    }
+    g = graph.build_graph(stages)
+
+    # Update: stage_a now only produces out_a
+    new_info = _create_stage("stage_a", [str(input_file)], [str(out_a)])
+    graph.update_stage(g, "stage_a", new_info)
+
+    assert graph.get_producer(g, out_a) == "stage_a"
+    assert graph.get_producer(g, out_b) is None
+
+    # out_b should be removed from graph (orphaned)
+    assert graph.artifact_node(out_b) not in g
+
+
+@pytest.mark.usefixtures("clean_registry")
+def test_build_tracked_trie_empty() -> None:
+    """build_tracked_trie handles empty tracked files dict."""
+    trie = graph.build_tracked_trie({})
+    assert len(trie) == 0
+
+
+@pytest.mark.usefixtures("clean_registry")
+def test_build_tracked_trie_single_file(tmp_path: Path) -> None:
+    """build_tracked_trie creates trie from single file."""
+    tracked_path = str(tmp_path / "file.csv")
+    tracked_files: dict[str, PvtData] = {
+        tracked_path: PvtData(path="file.csv", hash="abc123", size=100)
+    }
+
+    trie = graph.build_tracked_trie(tracked_files)
+
+    # Trie should contain the path
+    path_key = (tmp_path / "file.csv").parts
+    assert trie[path_key] == tracked_path
+
+
+@pytest.mark.usefixtures("clean_registry")
+def test_build_tracked_trie_nested_files(tmp_path: Path) -> None:
+    """build_tracked_trie creates trie from nested file structure."""
+    file1 = str(tmp_path / "data" / "a.csv")
+    file2 = str(tmp_path / "data" / "b.csv")
+    tracked_files: dict[str, PvtData] = {
+        file1: PvtData(path="data/a.csv", hash="abc", size=50),
+        file2: PvtData(path="data/b.csv", hash="def", size=50),
+    }
+
+    trie = graph.build_tracked_trie(tracked_files)
+
+    # Both files should be in trie
+    assert trie[(tmp_path / "data" / "a.csv").parts] == file1
+    assert trie[(tmp_path / "data" / "b.csv").parts] == file2
+
+
+# --- Edge cases for directory dependency resolution ---
+
+
+@pytest.mark.usefixtures("clean_registry")
+def test_directory_dependency_parent_is_output(tmp_path: Path) -> None:
+    """File depends on parent directory that is produced by a stage."""
+    data_dir = tmp_path / "data"
+    file_in_dir = data_dir / "file.csv"
+    output_file = tmp_path / "output.csv"
+    data_dir.mkdir()
+    file_in_dir.touch()
+
+    stages = {
+        # Producer outputs the directory
+        "produce_dir": _create_stage("produce_dir", [], [str(data_dir)]),
+        # Consumer depends on a file inside the directory
+        "consume_file": _create_stage("consume_file", [str(file_in_dir)], [str(output_file)]),
+    }
+
+    g = graph.build_graph(stages, validate=False)
+
+    # Should create edge from consumer to producer
+    stage_dag = graph.get_stage_dag(g)
+    assert stage_dag.has_edge("consume_file", "produce_dir")
+
+
+@pytest.mark.usefixtures("clean_registry")
+def test_directory_dependency_with_seen_stages_dedupe(tmp_path: Path) -> None:
+    """Directory dependency correctly deduplicates stages producing multiple files."""
+    output_dir = tmp_path / "outputs"
+    output_dir.mkdir()
+
+    stages = {
+        # Producer outputs multiple files in the same directory
+        "producer": _create_stage(
+            "producer",
+            [],
+            [str(output_dir / "a.csv"), str(output_dir / "b.csv"), str(output_dir / "c.csv")],
+        ),
+        # Consumer depends on the directory
+        "consumer": _create_stage("consumer", [str(output_dir)], [str(tmp_path / "result.csv")]),
+    }
+
+    g = graph.build_graph(stages, validate=False)
+    stage_dag = graph.get_stage_dag(g)
+
+    # Should have exactly one edge from consumer to producer (not three)
+    edges_to_producer = list(stage_dag.successors("consumer"))
+    assert edges_to_producer == ["producer"]
+
+
+# --- Error path tests ---
+
+
+@pytest.mark.usefixtures("clean_registry")
+def test_cycle_detection_error_message_format(tmp_path: Path) -> None:
+    """Cycle error message contains affected stage names."""
+    stages = {
+        "stage_a": _create_stage("stage_a", [str(tmp_path / "b.csv")], [str(tmp_path / "a.csv")]),
+        "stage_b": _create_stage("stage_b", [str(tmp_path / "a.csv")], [str(tmp_path / "b.csv")]),
+    }
+
+    try:
+        graph.build_graph(stages)
+        pytest.fail("Should have raised CyclicGraphError")
+    except exceptions.CyclicGraphError as e:
+        # Error message should contain stage names
+        assert "stage_a" in str(e) or "stage_b" in str(e)
+        assert "Circular dependency" in str(e)
+
+
+def test_get_execution_order_unknown_stage_raises_error(tmp_path: Path) -> None:
+    """get_execution_order raises StageNotFoundError for unknown stages."""
+    input_file = tmp_path / "input.csv"
+    output_file = tmp_path / "output.csv"
+    input_file.touch()
+
+    stages = {
+        "stage_a": _create_stage("stage_a", [str(input_file)], [str(output_file)]),
+    }
+
+    bipartite = graph.build_graph(stages)
+    stage_dag = graph.get_stage_dag(bipartite)
+
+    # Should raise StageNotFoundError, not raw NetworkXError
+    with pytest.raises(exceptions.StageNotFoundError, match="unknown_stage"):
+        graph.get_execution_order(stage_dag, stages=["unknown_stage"])
+
+
+def test_get_execution_order_mixed_known_unknown_stages(tmp_path: Path) -> None:
+    """get_execution_order raises StageNotFoundError with all unknown stages."""
+    input_file = tmp_path / "input.csv"
+    output_file = tmp_path / "output.csv"
+    input_file.touch()
+
+    stages = {
+        "stage_a": _create_stage("stage_a", [str(input_file)], [str(output_file)]),
+    }
+
+    bipartite = graph.build_graph(stages)
+    stage_dag = graph.get_stage_dag(bipartite)
+
+    # Should raise with both unknown stages listed
+    with pytest.raises(exceptions.StageNotFoundError, match="unknown"):
+        graph.get_execution_order(stage_dag, stages=["stage_a", "unknown1", "unknown2"])
+
+
+def test_get_execution_order_with_stages_returns_subgraph_order(tmp_path: Path) -> None:
+    """get_execution_order with stages returns dependencies in correct order."""
+    # Build diamond: input -> A, B -> C
+    input_file = tmp_path / "input.csv"
+    a_out = tmp_path / "a.csv"
+    b_out = tmp_path / "b.csv"
+    c_out = tmp_path / "c.csv"
+    input_file.touch()
+
+    stages = {
+        "stage_a": _create_stage("stage_a", [str(input_file)], [str(a_out)]),
+        "stage_b": _create_stage("stage_b", [str(input_file)], [str(b_out)]),
+        "stage_c": _create_stage("stage_c", [str(a_out), str(b_out)], [str(c_out)]),
+    }
+
+    bipartite = graph.build_graph(stages)
+    stage_dag = graph.get_stage_dag(bipartite)
+
+    # Request only stage_c - should include its dependencies (a and b)
+    order = graph.get_execution_order(stage_dag, stages=["stage_c"])
+
+    assert "stage_a" in order
+    assert "stage_b" in order
+    assert "stage_c" in order
+    # C must come after A and B
+    assert order.index("stage_c") > order.index("stage_a")
+    assert order.index("stage_c") > order.index("stage_b")
+
+
+def test_tracked_file_inside_directory_validates(tmp_path: Path) -> None:
+    """Dependency inside a tracked directory is recognized as valid."""
+    # Track a directory
+    tracked_dir = tmp_path / "tracked_data"
+    tracked_dir.mkdir()
+
+    # Stage depends on a file INSIDE the tracked directory
+    dep_inside = tracked_dir / "nested" / "data.csv"
+
+    stages = {
+        "consumer": _create_stage("consumer", [str(dep_inside)], [str(tmp_path / "out.csv")]),
+    }
+
+    # The tracked_files dict has the directory tracked
+    tracked_files: dict[str, PvtData] = {
+        str(tracked_dir): {"path": "tracked_data", "hash": "abc123", "size": 0}
+    }
+
+    # Should NOT raise - dependency is inside tracked directory
+    g = graph.build_graph(stages, validate=True, tracked_files=tracked_files)
+    assert "stage:consumer" in g

@@ -521,37 +521,29 @@ class StageRegistry:
     def build_dag(self, validate: bool = True) -> DiGraph[str]:
         """Build DAG from registered stages.
 
-        Args:
-            validate: If True, validate that all dependencies exist
-
         Returns:
             NetworkX DiGraph with stages as nodes and dependencies as edges
-
-        Raises:
-            CyclicGraphError: If graph contains cycles
-            DependencyNotFoundError: If dependency doesn't exist (when validate=True)
         """
-        # Return cached DAG if available and validation matches
-        # Only cache when validate=True (the common case for commands)
         if validate and self._cached_dag is not None:
             return self._cached_dag
 
-        from pivot import dag
+        from pivot.engine import graph as engine_graph
         from pivot.storage import track
 
-        # Discover tracked files to recognize them as valid dependency sources
         tracked_files = None
         if validate:
             tracked_files = track.discover_pvt_files(project.get_project_root())
 
-        graph = dag.build_dag(self._stages, validate=validate, tracked_files=tracked_files)
+        # Build bipartite graph with validation, extract stage DAG
+        bipartite = engine_graph.build_graph(
+            self._stages,
+            validate=validate,
+            tracked_files=tracked_files,
+        )
+        graph = engine_graph.get_stage_dag(bipartite)
 
-        # Validate output paths don't conflict (only when validate=True)
         if validate:
             self.validate_outputs()
-
-        # Cache only when validating (safe to reuse)
-        if validate:
             self._cached_dag = graph
 
         return graph
