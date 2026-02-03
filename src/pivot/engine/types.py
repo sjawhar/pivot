@@ -61,7 +61,6 @@ class EngineState(Enum):
 
     IDLE = "idle"  # Not started
     ACTIVE = "active"  # Processing events and executing
-    SHUTDOWN = "shutdown"  # Draining, no new stages started
 
 
 # =============================================================================

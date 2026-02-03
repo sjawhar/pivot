@@ -27,7 +27,6 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator
 
-    from pivot import ignore as ignore_mod
     from pivot.storage import state as state_mod
 
 CHUNK_SIZE = 1024 * 1024  # 1MB chunks for hashing
@@ -143,11 +142,7 @@ def _should_skip_entry(entry: os.DirEntry[str]) -> bool:
     return name.endswith(_IGNORE_SUFFIXES) or name.endswith("~") or name.startswith(".#")
 
 
-def _scandir_recursive(
-    path: pathlib.Path,
-    ignore_filter: ignore_mod.IgnoreFilter | None = None,
-    base_path: pathlib.Path | None = None,
-) -> Generator[os.DirEntry[str]]:
+def _scandir_recursive(path: pathlib.Path) -> Generator[os.DirEntry[str]]:
     """Yield all files recursively using os.scandir() for efficiency.
 
     DirEntry objects cache stat results, avoiding redundant syscalls.
@@ -156,39 +151,22 @@ def _scandir_recursive(
 
     Args:
         path: Directory to scan
-        ignore_filter: Optional IgnoreFilter for .pivotignore patterns
-        base_path: Base path for computing relative paths (for ignore matching).
-            Defaults to the initial path if not provided.
     """
-    if base_path is None:
-        base_path = path
-
     with os.scandir(path) as entries:
         for entry in entries:
             if entry.is_symlink():
                 continue
-            # Fast path: hardcoded patterns (O(1) lookup)
             if _should_skip_entry(entry):
                 continue
-            # Slow path: .pivotignore patterns (if provided)
-            if ignore_filter is not None:
-                # Pass absolute path so is_ignored() can relativize to project root.
-                # This ensures patterns like "data/raw/*.csv" match when hashing
-                # a subdirectory like "data/".
-                entry_path = pathlib.Path(entry.path)
-                is_dir = entry.is_dir(follow_symlinks=False)
-                if ignore_filter.is_ignored(str(entry_path), is_dir=is_dir):
-                    continue
             if entry.is_file():
                 yield entry
             elif entry.is_dir():
-                yield from _scandir_recursive(pathlib.Path(entry.path), ignore_filter, base_path)
+                yield from _scandir_recursive(pathlib.Path(entry.path))
 
 
 def hash_directory(
     path: pathlib.Path,
     state_db: state_mod.StateDB | None = None,
-    ignore_filter: ignore_mod.IgnoreFilter | None = None,
 ) -> tuple[str, list[DirManifestEntry]]:
     """Compute tree hash of directory, returning hash and manifest.
 
@@ -203,15 +181,12 @@ def hash_directory(
     Args:
         path: Directory to hash
         state_db: Optional StateDB for caching file hashes
-        ignore_filter: Optional IgnoreFilter for .pivotignore patterns.
-            When provided, files matching .pivotignore patterns are excluded
-            from the hash (in addition to hardcoded patterns like __pycache__).
     """
     with metrics.timed("cache.hash_directory"):
         manifest = list[DirManifestEntry]()
         resolved_base = path.resolve()
 
-        for entry in sorted(_scandir_recursive(path, ignore_filter), key=lambda e: e.path):
+        for entry in sorted(_scandir_recursive(path), key=lambda e: e.path):
             file_path = pathlib.Path(entry.path)
             # Verify file is still within the directory (paranoid check)
             if not file_path.resolve().is_relative_to(resolved_base):

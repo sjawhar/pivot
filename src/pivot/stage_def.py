@@ -105,53 +105,6 @@ class StageParams(pydantic.BaseModel):
 # ==============================================================================
 
 
-def _validate_path_overrides_common(
-    overrides: Mapping[str, outputs.PathType],
-    spec_paths: Mapping[str, outputs.PathType],
-    kind: str,
-) -> None:
-    """Validate path overrides against spec paths.
-
-    Args:
-        overrides: Dict of name -> path overrides
-        spec_paths: Dict of name -> spec path (from specs)
-        kind: "dependency", "output", or "return output" for error messages
-
-    Raises:
-        ValueError: If override keys unknown
-        TypeError: If override type (str vs sequence) doesn't match spec type
-        ValueError: If tuple spec overridden with different length
-
-    Note:
-        - List specs allow variable-length overrides (can change count)
-        - Tuple specs require exact length match (fixed-size)
-    """
-    unknown = set(overrides.keys()) - set(spec_paths.keys())
-    if unknown:
-        raise ValueError(f"Unknown {kind} names in path_overrides: {unknown}")
-
-    for name, override_path in overrides.items():
-        spec_path = spec_paths[name]
-
-        # Check type compatibility: str vs sequence (list/tuple)
-        spec_is_seq = isinstance(spec_path, (list, tuple))
-        override_is_seq = isinstance(override_path, (list, tuple))
-
-        if spec_is_seq != override_is_seq:
-            spec_type = "sequence" if spec_is_seq else "str"
-            override_type = "sequence" if override_is_seq else "str"
-            raise TypeError(
-                f"Path type mismatch for {kind} '{name}': spec is {spec_type}, override is {override_type}"
-            )
-
-        # For tuple specs (fixed-length), validate exact length match
-        # (spec_is_seq check above guarantees override_path is also a sequence here)
-        if isinstance(spec_path, tuple) and len(override_path) != len(spec_path):
-            raise ValueError(
-                f"Path count mismatch for {kind} '{name}': tuple spec has {len(spec_path)} paths, override has {len(override_path)} (tuple indicates fixed-length, use list for variable-length)"
-            )
-
-
 def _validate_path_not_escaped(path: pathlib.Path, project_root: pathlib.Path) -> None:
     """Validate that resolved path is within project root (no path traversal)."""
     resolved = path.resolve()
@@ -736,41 +689,6 @@ def load_deps_from_specs(
             loaded[name] = _load_single_dep(name, path, spec, project_root)
 
     return loaded
-
-
-def apply_dep_path_overrides(
-    specs: dict[str, FuncDepSpec],
-    overrides: Mapping[str, outputs.PathType],
-) -> dict[str, FuncDepSpec]:
-    """Apply path overrides to dep specs, returning new specs.
-
-    Args:
-        specs: Original dep specs
-        overrides: Dict of dep name -> new path(s)
-
-    Returns:
-        New dict with overridden paths (original specs unchanged)
-
-    Raises:
-        ValueError: If override keys don't match spec keys or tuple lengths mismatch
-        TypeError: If override type (str vs sequence) doesn't match spec type
-    """
-    # Validate overrides (unknown keys, type compatibility, tuple lengths)
-    spec_paths = {name: spec.path for name, spec in specs.items()}
-    _validate_path_overrides_common(overrides, spec_paths, "dependency")
-
-    result = dict[str, FuncDepSpec]()
-    for name, spec in specs.items():
-        if name in overrides:
-            result[name] = FuncDepSpec(
-                path=overrides[name],
-                loader=spec.loader,
-                creates_dep_edge=spec.creates_dep_edge,
-            )
-        else:
-            result[name] = spec
-
-    return result
 
 
 def find_params_type_in_signature(func: Callable[..., Any]) -> type[StageParams] | None:

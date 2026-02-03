@@ -38,96 +38,12 @@ from pivot.types import (
 if TYPE_CHECKING:
     import networkx as nx
 
-    from pivot.engine.types import OutputEvent, StageCompleted
     from pivot.executor import ExecutionSummary
     from pivot.tui import console as tui_console
-    from pivot.tui.run import MessagePoster
 
 
 # JSONL schema version for forward compatibility
 _JSONL_SCHEMA_VERSION = 1
-
-
-def _configure_result_collector(eng: engine.Engine) -> sinks.ResultCollectorSink:
-    """Add ResultCollectorSink to collect execution results."""
-    result_sink = sinks.ResultCollectorSink()
-    eng.add_sink(result_sink)
-    return result_sink
-
-
-class _JsonlSink:
-    """Async sink that calls a callback for each stage event."""
-
-    _callback: Callable[[dict[str, object]], None]
-
-    def __init__(self, callback: Callable[[dict[str, object]], None]) -> None:
-        self._callback = callback
-
-    async def handle(self, event: OutputEvent) -> None:
-        """Convert stage events to JSONL records."""
-        match event["type"]:
-            case "stage_started":
-                self._callback(
-                    {
-                        "type": "stage_start",
-                        "stage": event["stage"],
-                        "index": event["index"],
-                        "total": event["total"],
-                    }
-                )
-            case "stage_completed":
-                self._callback(
-                    {
-                        "type": "stage_complete",
-                        "stage": event["stage"],
-                        "status": event["status"].value,
-                        "reason": event["reason"],
-                        "duration_ms": event["duration_ms"],
-                        "index": event["index"],
-                        "total": event["total"],
-                    }
-                )
-            case "pipeline_reloaded":
-                self._callback(dict(event))
-            case "engine_state_changed":
-                self._callback(
-                    {
-                        "type": "engine_state_changed",
-                        "state": event["state"].value,
-                    }
-                )
-            case _:
-                pass
-
-    async def close(self) -> None:
-        """No cleanup needed."""
-
-
-def _configure_output_sink(
-    eng: engine.Engine,
-    *,
-    quiet: bool,
-    as_json: bool,
-    tui: bool,
-    app: MessagePoster | None,
-    run_id: str | None,
-    use_console: bool,
-    jsonl_callback: Callable[[dict[str, object]], None] | None,
-) -> None:
-    """Configure output sinks based on display mode."""
-    import rich.console
-
-    if as_json and jsonl_callback:
-        eng.add_sink(_JsonlSink(callback=jsonl_callback))
-        return
-
-    if quiet:
-        return
-
-    if tui and app and run_id:
-        eng.add_sink(sinks.TuiSink(app=app, run_id=run_id))
-    elif use_console:
-        eng.add_sink(sinks.ConsoleSink(console=rich.console.Console()))
 
 
 def _configure_watch_sources(
@@ -457,8 +373,8 @@ def _run_watch_mode(  # noqa: PLR0913 - many params needed for different modes
 
             async with engine.Engine(pipeline=pipeline) as eng:
                 # Configure sinks - TuiSink for direct post_message
-                _configure_result_collector(eng)
-                _configure_output_sink(
+                _run_common.configure_result_collector(eng)
+                _run_common.configure_output_sink(
                     eng,
                     quiet=quiet,
                     as_json=as_json,
@@ -524,8 +440,8 @@ def _run_watch_mode(  # noqa: PLR0913 - many params needed for different modes
         async def watch_main() -> None:
             async with engine.Engine(pipeline=pipeline) as eng:
                 # Configure sinks
-                _configure_result_collector(eng)
-                _configure_output_sink(
+                _run_common.configure_result_collector(eng)
+                _run_common.configure_output_sink(
                     eng,
                     quiet=quiet,
                     as_json=as_json,
@@ -659,18 +575,6 @@ def _run_oneshot_mode(
     """Run non-watch (one-shot) mode with unified event-driven execution."""
     from pivot.executor import core as executor_core
 
-    def _convert_results(
-        stage_results: dict[str, StageCompleted],
-    ) -> dict[str, executor_core.ExecutionSummary]:
-        """Convert StageCompleted events to ExecutionSummary."""
-        return {
-            name: executor_core.ExecutionSummary(
-                status=event["status"],
-                reason=event["reason"],
-            )
-            for name, event in stage_results.items()
-        }
-
     # Sort for display
     display_order = _run_common.sort_for_display(execution_order, graph) if execution_order else []
 
@@ -694,8 +598,8 @@ def _run_oneshot_mode(
 
             async with engine.Engine(pipeline=pipeline) as eng:
                 # Configure sinks - TuiSink for direct post_message
-                result_sink = _configure_result_collector(eng)
-                _configure_output_sink(
+                result_sink = _run_common.configure_result_collector(eng)
+                _run_common.configure_output_sink(
                     eng,
                     quiet=quiet,
                     as_json=as_json,
@@ -720,7 +624,7 @@ def _run_oneshot_mode(
                 async def engine_task() -> dict[str, executor_core.ExecutionSummary]:
                     await eng.run(exit_on_completion=True)
                     stage_results = await result_sink.get_results()
-                    return _convert_results(stage_results)
+                    return _run_common.convert_results(stage_results)
 
                 # Suppress stderr logging while TUI is active
                 with _run_common.suppress_stderr_logging():
@@ -744,8 +648,8 @@ def _run_oneshot_mode(
 
     async def oneshot_main() -> dict[str, executor_core.ExecutionSummary]:
         async with engine.Engine(pipeline=pipeline) as eng:
-            result_sink = _configure_result_collector(eng)
-            _configure_output_sink(
+            result_sink = _run_common.configure_result_collector(eng)
+            _run_common.configure_output_sink(
                 eng,
                 quiet=quiet,
                 as_json=as_json,
@@ -767,7 +671,7 @@ def _run_oneshot_mode(
             )
             await eng.run(exit_on_completion=True)
             stage_results = await result_sink.get_results()
-            return _convert_results(stage_results)
+            return _run_common.convert_results(stage_results)
 
     results = anyio.run(oneshot_main)
 
@@ -791,8 +695,6 @@ def _run_oneshot_mode(
 
     # Print summary for plain mode
     if console and results:
-        from pivot.executor import core as executor_core
-
         ran, cached, blocked, failed = executor_core.count_results(results)
         total_duration = time.perf_counter() - start_time
         console.summary(ran, cached, blocked, failed, total_duration)
