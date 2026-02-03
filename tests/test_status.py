@@ -65,7 +65,7 @@ def test_pipeline_status_all_cached(
     test_pipeline: pipeline_mod.Pipeline,
 ) -> None:
     """All stages should show cached after successful run."""
-    (set_project_root / ".git").mkdir()
+    (set_project_root / ".git").mkdir(exist_ok=True)
     (set_project_root / "input.txt").write_text("data")
 
     register_test_stage(_helper_stage_a, name="stage_a")
@@ -85,7 +85,7 @@ def test_pipeline_status_some_stale(
     set_project_root: pathlib.Path, test_pipeline: pipeline_mod.Pipeline
 ) -> None:
     """Stages with changed code should show stale."""
-    (set_project_root / ".git").mkdir()
+    (set_project_root / ".git").mkdir(exist_ok=True)
     (set_project_root / "input.txt").write_text("data")
 
     register_test_stage(_helper_stage_a, name="stage_a")
@@ -103,7 +103,7 @@ def test_pipeline_status_upstream_stale(
     set_project_root: pathlib.Path, test_pipeline: pipeline_mod.Pipeline
 ) -> None:
     """Stage should be marked stale if upstream is stale."""
-    (set_project_root / ".git").mkdir()
+    (set_project_root / ".git").mkdir(exist_ok=True)
     (set_project_root / "input.txt").write_text("data")
 
     register_test_stage(_helper_stage_a, name="stage_a")
@@ -128,7 +128,7 @@ def test_pipeline_status_specific_stages(
     set_project_root: pathlib.Path, test_pipeline: pipeline_mod.Pipeline
 ) -> None:
     """Should only return status for specified stages."""
-    (set_project_root / ".git").mkdir()
+    (set_project_root / ".git").mkdir(exist_ok=True)
     (set_project_root / "input.txt").write_text("data")
 
     register_test_stage(_helper_stage_a, name="stage_a")
@@ -148,7 +148,7 @@ def test_pipeline_status_specific_stages(
 
 def test_tracked_files_clean(set_project_root: pathlib.Path) -> None:
     """Tracked file should show clean when unchanged."""
-    (set_project_root / ".git").mkdir()
+    (set_project_root / ".git").mkdir(exist_ok=True)
 
     data_file = set_project_root / "data.txt"
     data_file.write_text("content")
@@ -166,7 +166,7 @@ def test_tracked_files_clean(set_project_root: pathlib.Path) -> None:
 
 def test_tracked_files_modified(set_project_root: pathlib.Path) -> None:
     """Tracked file should show modified when changed."""
-    (set_project_root / ".git").mkdir()
+    (set_project_root / ".git").mkdir(exist_ok=True)
 
     data_file = set_project_root / "data.txt"
     data_file.write_text("original")
@@ -186,7 +186,7 @@ def test_tracked_files_modified(set_project_root: pathlib.Path) -> None:
 
 def test_tracked_files_missing(set_project_root: pathlib.Path) -> None:
     """Tracked file should show missing when deleted."""
-    (set_project_root / ".git").mkdir()
+    (set_project_root / ".git").mkdir(exist_ok=True)
 
     pvt_data = track.PvtData(path="data.txt", hash="abc123", size=100)
     track.write_pvt_file(set_project_root / "data.txt.pvt", pvt_data)
@@ -200,7 +200,7 @@ def test_tracked_files_missing(set_project_root: pathlib.Path) -> None:
 
 def test_tracked_files_empty(set_project_root: pathlib.Path) -> None:
     """Should return empty list when no tracked files."""
-    (set_project_root / ".git").mkdir()
+    (set_project_root / ".git").mkdir(exist_ok=True)
 
     results = status.get_tracked_files_status(set_project_root)
 
@@ -209,7 +209,7 @@ def test_tracked_files_empty(set_project_root: pathlib.Path) -> None:
 
 def test_tracked_directory_clean(set_project_root: pathlib.Path) -> None:
     """Tracked directory should show clean when unchanged."""
-    (set_project_root / ".git").mkdir()
+    (set_project_root / ".git").mkdir(exist_ok=True)
 
     data_dir = set_project_root / "data"
     data_dir.mkdir()
@@ -231,7 +231,7 @@ def test_tracked_directory_clean(set_project_root: pathlib.Path) -> None:
 
 def test_tracked_directory_modified(set_project_root: pathlib.Path) -> None:
     """Tracked directory should show modified when contents change."""
-    (set_project_root / ".git").mkdir()
+    (set_project_root / ".git").mkdir(exist_ok=True)
 
     data_dir = set_project_root / "data"
     data_dir.mkdir()
@@ -254,7 +254,7 @@ def test_tracked_directory_modified(set_project_root: pathlib.Path) -> None:
 
 def test_tracked_files_progress_callback(set_project_root: pathlib.Path) -> None:
     """Progress callback should be called with (completed, total) for each file."""
-    (set_project_root / ".git").mkdir()
+    (set_project_root / ".git").mkdir(exist_ok=True)
 
     # Create two tracked files
     file1 = set_project_root / "file1.txt"
@@ -437,7 +437,7 @@ def test_get_pipeline_status_uses_provided_graph(
     """get_pipeline_status uses provided graph instead of building one."""
     from pivot.engine import graph as engine_graph
 
-    (set_project_root / ".git").mkdir()
+    (set_project_root / ".git").mkdir(exist_ok=True)
     (set_project_root / "test_input.txt").write_text("data")
 
     register_test_stage(_helper_test_stage, name="test_stage")
@@ -471,7 +471,7 @@ def test_get_pipeline_explanations_uses_provided_graph(
     """get_pipeline_explanations uses provided graph instead of building one."""
     from pivot.engine import graph as engine_graph
 
-    (set_project_root / ".git").mkdir()
+    (set_project_root / ".git").mkdir(exist_ok=True)
     (set_project_root / "test_input.txt").write_text("data")
 
     register_test_stage(_helper_test_stage, name="test_stage")
@@ -502,7 +502,7 @@ def test_what_if_changed_single_path(
     set_project_root: pathlib.Path, test_pipeline: pipeline_mod.Pipeline
 ) -> None:
     """what_if_changed returns affected stages for a single path."""
-    (set_project_root / ".git").mkdir()
+    (set_project_root / ".git").mkdir(exist_ok=True)
     (set_project_root / "input.txt").write_text("data")
 
     register_test_stage(_helper_stage_a, name="stage_a")
@@ -520,7 +520,7 @@ def test_what_if_changed_intermediate_path(
     set_project_root: pathlib.Path, test_pipeline: pipeline_mod.Pipeline
 ) -> None:
     """what_if_changed returns only downstream stages for intermediate artifact."""
-    (set_project_root / ".git").mkdir()
+    (set_project_root / ".git").mkdir(exist_ok=True)
     (set_project_root / "input.txt").write_text("data")
 
     register_test_stage(_helper_stage_a, name="stage_a")
@@ -538,7 +538,7 @@ def test_what_if_changed_unknown_path(
     set_project_root: pathlib.Path, test_pipeline: pipeline_mod.Pipeline
 ) -> None:
     """what_if_changed returns empty list for unknown paths."""
-    (set_project_root / ".git").mkdir()
+    (set_project_root / ".git").mkdir(exist_ok=True)
     (set_project_root / "input.txt").write_text("data")
 
     register_test_stage(_helper_stage_a, name="stage_a")
@@ -553,7 +553,7 @@ def test_what_if_changed_multiple_paths(
     set_project_root: pathlib.Path, test_pipeline: pipeline_mod.Pipeline
 ) -> None:
     """what_if_changed returns union of affected stages for multiple paths."""
-    (set_project_root / ".git").mkdir()
+    (set_project_root / ".git").mkdir(exist_ok=True)
     (set_project_root / "input.txt").write_text("data")
 
     register_test_stage(_helper_stage_a, name="stage_a")
@@ -579,7 +579,7 @@ def test_what_if_changed_with_provided_graph(
     """what_if_changed uses provided graph instead of building one."""
     from pivot.engine import graph as engine_graph
 
-    (set_project_root / ".git").mkdir()
+    (set_project_root / ".git").mkdir(exist_ok=True)
     (set_project_root / "input.txt").write_text("data")
 
     register_test_stage(_helper_stage_a, name="stage_a")

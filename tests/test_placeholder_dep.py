@@ -84,11 +84,12 @@ async def test_placeholder_dep_e2e_execution(
 
 
 def test_placeholder_dep_reuse_function_different_overrides(
-    test_pipeline: Pipeline,
-    tmp_path: pathlib.Path,
+    mock_discovery: Pipeline,
     comparison_data: tuple[pathlib.Path, pathlib.Path],
 ) -> None:
     """Same function can be registered multiple times with different overrides."""
+    test_pipeline = mock_discovery
+    tmp_path = test_pipeline.root
     baseline_path, experiment_path = comparison_data
 
     # Create a third dataset
@@ -172,10 +173,8 @@ def test_placeholder_dep_override_validation(
 ) -> None:
     """PlaceholderDep stage validates override paths are provided at registration."""
     # Register stage without providing required override
-    # This should raise ValidationError at registration time
-    with pytest.raises(
-        exceptions.ValidationError, match="Placeholder dependencies missing overrides"
-    ):
+    # This should raise ValueError at registration time when PlaceholderDep override is missing
+    with pytest.raises(ValueError, match="PlaceholderDep.*requires override"):
         register_test_stage(
             _compare_datasets,
             name="compare_no_override",
@@ -188,11 +187,12 @@ def test_placeholder_dep_override_validation(
 
 
 def test_placeholder_dep_multiple_stages_independent_overrides(
-    test_pipeline: Pipeline,
-    tmp_path: pathlib.Path,
+    mock_discovery: Pipeline,
     comparison_data: tuple[pathlib.Path, pathlib.Path],
 ) -> None:
     """Multiple stages using same function maintain independent override namespaces."""
+    test_pipeline = mock_discovery
+    tmp_path = test_pipeline.root
     baseline_path, experiment_path = comparison_data
 
     # Create additional files

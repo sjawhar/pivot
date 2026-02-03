@@ -54,7 +54,7 @@ def minimal_pipeline(
     monkeypatch.chdir(tmp_path)
 
     # Create git directory (required for project root detection)
-    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git").mkdir(exist_ok=True)
 
     return test_pipeline
 
