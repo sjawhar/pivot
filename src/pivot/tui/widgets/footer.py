@@ -26,9 +26,9 @@ _SHORTCUTS: dict[FooterContext, list[tuple[str, str]]] = {
     ],
     FooterContext.LOGS: [
         ("Ctrl+j/k", "Scroll"),
-        ("L", "Logs"),
-        ("I", "Input"),
-        ("O", "Output"),
+        ("Ctrl+F", "Search"),
+        ("n/N", "Match ↑/↓"),
+        ("L/I/O", "Tabs"),
         ("q", "Quit"),
         ("?", "Help"),
     ],

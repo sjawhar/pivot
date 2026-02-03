@@ -3,6 +3,7 @@ from __future__ import annotations
 import collections
 import pathlib
 from typing import TYPE_CHECKING, Annotated, TypedDict
+from unittest.mock import AsyncMock
 
 import pytest
 import textual.binding
@@ -1047,3 +1048,134 @@ def test_pivot_app_exit_message_property_initial_state() -> None:
 
     app = run_tui.PivotApp(stage_names=["s1"], executor_func=executor_func)
     assert app.exit_message is None
+
+
+# =============================================================================
+# Force Re-Run Action Tests
+# =============================================================================
+
+
+@pytest.mark.anyio
+async def test_action_force_rerun_stage_calls_rpc(mocker: MockerFixture) -> None:
+    """action_force_rerun_stage should send RPC command for selected stage."""
+    app = run_tui.PivotApp(stage_names=["stage_a", "stage_b"], watch_mode=True)
+    app._selected_stage_name = "stage_a"
+
+    mock_send = mocker.patch("pivot.tui.run.rpc_client.send_run_command", new_callable=AsyncMock)
+    mock_send.return_value = True
+    mocker.patch.object(app, "notify")
+    mocker.patch("pivot.tui.run.project.get_project_root", return_value=pathlib.Path("/fake/root"))
+
+    await app.action_force_rerun_stage()
+
+    mock_send.assert_called_once()
+    call_kwargs = mock_send.call_args.kwargs
+    assert call_kwargs["stages"] == ["stage_a"]
+    assert call_kwargs["force"] is True
+
+
+@pytest.mark.anyio
+async def test_action_force_rerun_all_calls_rpc(mocker: MockerFixture) -> None:
+    """action_force_rerun_all should send RPC command for all stages."""
+    app = run_tui.PivotApp(stage_names=["stage_a", "stage_b"], watch_mode=True)
+
+    mock_send = mocker.patch("pivot.tui.run.rpc_client.send_run_command", new_callable=AsyncMock)
+    mock_send.return_value = True
+    mocker.patch.object(app, "notify")
+    mocker.patch("pivot.tui.run.project.get_project_root", return_value=pathlib.Path("/fake/root"))
+
+    await app.action_force_rerun_all()
+
+    mock_send.assert_called_once()
+    call_kwargs = mock_send.call_args.kwargs
+    assert call_kwargs["stages"] is None
+    assert call_kwargs["force"] is True
+
+
+@pytest.mark.anyio
+async def test_action_force_rerun_not_in_watch_mode(mocker: MockerFixture) -> None:
+    """action_force_rerun should do nothing in run mode."""
+
+    def executor_func() -> dict[str, executor.ExecutionSummary]:
+        return {}
+
+    # Create run mode app (not watch mode)
+    app = run_tui.PivotApp(stage_names=["stage_a"], executor_func=executor_func)
+    app._selected_stage_name = "stage_a"
+
+    mock_send = mocker.patch("pivot.tui.run.rpc_client.send_run_command", new_callable=AsyncMock)
+
+    await app.action_force_rerun_stage()
+
+    mock_send.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_action_force_rerun_no_stage_selected(mocker: MockerFixture) -> None:
+    """action_force_rerun_stage should notify when no stage selected."""
+    app = run_tui.PivotApp(stage_names=[], watch_mode=True)
+    app._selected_stage_name = None
+
+    mock_send = mocker.patch("pivot.tui.run.rpc_client.send_run_command", new_callable=AsyncMock)
+    mock_notify = mocker.patch.object(app, "notify")
+
+    await app.action_force_rerun_stage()
+
+    mock_send.assert_not_called()
+    mock_notify.assert_called_once()
+    assert "No stage selected" in str(mock_notify.call_args)
+
+
+@pytest.mark.anyio
+async def test_action_force_rerun_while_running(mocker: MockerFixture) -> None:
+    """action_force_rerun should warn when stages are running."""
+    app = run_tui.PivotApp(stage_names=["stage_a"], watch_mode=True)
+    app._selected_stage_name = "stage_a"
+    # Simulate running stage
+    app._stages["stage_a"].status = StageStatus.IN_PROGRESS
+
+    mock_send = mocker.patch("pivot.tui.run.rpc_client.send_run_command", new_callable=AsyncMock)
+    mock_notify = mocker.patch.object(app, "notify")
+
+    await app.action_force_rerun_stage()
+
+    mock_send.assert_not_called()
+    mock_notify.assert_called_once()
+    assert "running" in str(mock_notify.call_args).lower()
+
+
+@pytest.mark.anyio
+async def test_action_force_rerun_all_while_running(mocker: MockerFixture) -> None:
+    """action_force_rerun_all should warn when stages are running."""
+    app = run_tui.PivotApp(stage_names=["stage_a", "stage_b"], watch_mode=True)
+    # Simulate running stage
+    app._stages["stage_a"].status = StageStatus.IN_PROGRESS
+
+    mock_send = mocker.patch("pivot.tui.run.rpc_client.send_run_command", new_callable=AsyncMock)
+    mock_notify = mocker.patch.object(app, "notify")
+
+    await app.action_force_rerun_all()
+
+    mock_send.assert_not_called()
+    mock_notify.assert_called_once()
+    assert "running" in str(mock_notify.call_args).lower()
+
+
+@pytest.mark.anyio
+async def test_action_force_rerun_stage_failure_notifies(mocker: MockerFixture) -> None:
+    """action_force_rerun_stage should notify on RPC failure."""
+    app = run_tui.PivotApp(stage_names=["stage_a"], watch_mode=True)
+    app._selected_stage_name = "stage_a"
+
+    mock_send = mocker.patch("pivot.tui.run.rpc_client.send_run_command", new_callable=AsyncMock)
+    mock_send.return_value = False  # RPC failure
+    mock_notify = mocker.patch.object(app, "notify")
+    mocker.patch("pivot.tui.run.project.get_project_root", return_value=pathlib.Path("/fake/root"))
+
+    await app.action_force_rerun_stage()
+
+    # Should have been called twice: once for "Forcing re-run...", once for failure
+    assert mock_notify.call_count == 2
+    # Last call should be the error
+    last_call_args = str(mock_notify.call_args_list[-1])
+    assert "Failed" in last_call_args or "error" in last_call_args
