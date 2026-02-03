@@ -134,8 +134,12 @@ def reset_pivot_state(mocker: MockerFixture) -> Generator[None]:
 
 @pytest.fixture
 def set_project_root(tmp_path: pathlib.Path, mocker: MockerFixture) -> Generator[pathlib.Path]:
-    """Set project root to tmp_path for tests that register stages with temp paths."""
+    """Set project root to tmp_path for tests that register stages with temp paths.
+
+    Also creates .git directory so fingerprinting and other git-dependent operations work.
+    """
     mocker.patch.object(project, "_project_root_cache", tmp_path)
+    (tmp_path / ".git").mkdir(exist_ok=True)
     yield tmp_path
 
 

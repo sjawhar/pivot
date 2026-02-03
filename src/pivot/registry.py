@@ -61,7 +61,7 @@ class RegistryStageInfo(TypedDict):
         func: The stage function to execute.
         name: Unique stage identifier (function name or custom name).
         deps: Named input file dependencies (name -> path(s), absolute paths).
-        deps_paths: Flattened list of all dependency paths (for DAG/worker).
+        deps_paths: Flattened list of all dependency paths (absolute paths, for DAG/worker).
         outs: Output specifications (expanded for DAG/caching - one Out per file).
         outs_paths: Output file paths (absolute paths).
         params: Pydantic model instance with parameter values.

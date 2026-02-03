@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, Annotated, TypedDict
 
 import pytest
 
-from pivot import exceptions, loaders, outputs, project
+from pivot import exceptions, loaders, outputs
 from pivot.pipeline.pipeline import Pipeline
 from pivot.pipeline.yaml import PipelineConfigError
 from pivot.stage_def import StageParams
@@ -116,26 +116,20 @@ def test_pipeline_name_validation_invalid_patterns() -> None:
 # Stage registration tests
 
 
-def test_pipeline_register_stage(tmp_path: pathlib.Path, mocker: MockerFixture) -> None:
+def test_pipeline_register_stage(set_project_root: pathlib.Path) -> None:
     """Pipeline.register should register a stage with the pipeline's state_dir."""
-    mocker.patch.object(project, "_project_root_cache", tmp_path)
-    (tmp_path / ".git").mkdir()
-
-    p = Pipeline("test", root=tmp_path)
+    p = Pipeline("test", root=set_project_root)
     p.register(_simple_stage, name="my_stage")
 
     assert "my_stage" in p.list_stages()
     info = p.get("my_stage")
-    assert info["state_dir"] == tmp_path / ".pivot"
+    assert info["state_dir"] == set_project_root / ".pivot"
 
 
-def test_pipeline_stages_isolated(tmp_path: pathlib.Path, mocker: MockerFixture) -> None:
+def test_pipeline_stages_isolated(set_project_root: pathlib.Path) -> None:
     """Two pipelines can have stages with the same name."""
-    mocker.patch.object(project, "_project_root_cache", tmp_path)
-    (tmp_path / ".git").mkdir()
-
-    p1 = Pipeline("pipeline1", root=tmp_path / "p1")
-    p2 = Pipeline("pipeline2", root=tmp_path / "p2")
+    p1 = Pipeline("pipeline1", root=set_project_root / "p1")
+    p2 = Pipeline("pipeline2", root=set_project_root / "p2")
 
     p1.register(_simple_stage, name="train")
     p2.register(_simple_stage, name="train")
@@ -144,8 +138,8 @@ def test_pipeline_stages_isolated(tmp_path: pathlib.Path, mocker: MockerFixture)
     assert "train" in p2.list_stages()
 
     # Each has its own state_dir
-    assert p1.get("train")["state_dir"] == tmp_path / "p1" / ".pivot"
-    assert p2.get("train")["state_dir"] == tmp_path / "p2" / ".pivot"
+    assert p1.get("train")["state_dir"] == set_project_root / "p1" / ".pivot"
+    assert p2.get("train")["state_dir"] == set_project_root / "p2" / ".pivot"
 
 
 # =============================================================================
@@ -163,18 +157,13 @@ def _stage_with_invalid_output_missing_annotation() -> _InvalidOutputMissingAnno
     return _InvalidOutputMissingAnnotation(result=pathlib.Path("result.txt"))
 
 
-def test_pipeline_register_missing_annotation_fails(
-    tmp_path: pathlib.Path, mocker: MockerFixture
-) -> None:
+def test_pipeline_register_missing_annotation_fails(set_project_root: pathlib.Path) -> None:
     """Pipeline.register fails when output TypedDict field missing Annotated wrapper.
 
     Critical for catching user errors where they forget Annotated[] on TypedDict fields.
     This prevents silent registration of stages that won't work at runtime.
     """
-    mocker.patch.object(project, "_project_root_cache", tmp_path)
-    (tmp_path / ".git").mkdir()
-
-    p = Pipeline("test", root=tmp_path)
+    p = Pipeline("test", root=set_project_root)
 
     with pytest.raises(exceptions.StageDefinitionError, match="without Out annotations"):
         p.register(_stage_with_invalid_output_missing_annotation, name="invalid")
@@ -240,14 +229,9 @@ def _cycle_b(
     return _CycleBOutput(data=pathlib.Path("cycle_b.txt"))
 
 
-def test_pipeline_build_dag_with_valid_stages(
-    tmp_path: pathlib.Path, mocker: MockerFixture
-) -> None:
+def test_pipeline_build_dag_with_valid_stages(set_project_root: pathlib.Path) -> None:
     """build_dag() should return a valid DAG for registered stages."""
-    mocker.patch.object(project, "_project_root_cache", tmp_path)
-    (tmp_path / ".git").mkdir()  # Project root marker
-
-    p = Pipeline("test", root=tmp_path)
+    p = Pipeline("test", root=set_project_root)
     p.register(_stage_a, name="stage_a")
     p.register(_stage_b, name="stage_b")
 
@@ -262,13 +246,10 @@ def test_pipeline_build_dag_with_valid_stages(
 
 
 def test_pipeline_build_dag_validate_false_skips_dependency_check(
-    tmp_path: pathlib.Path, mocker: MockerFixture
+    set_project_root: pathlib.Path,
 ) -> None:
     """build_dag(validate=False) should not raise for missing dependencies."""
-    mocker.patch.object(project, "_project_root_cache", tmp_path)
-    (tmp_path / ".git").mkdir()
-
-    p = Pipeline("test", root=tmp_path)
+    p = Pipeline("test", root=set_project_root)
     # Only register stage_b which depends on a.txt (not provided by any stage)
     p.register(_stage_b, name="stage_b")
 
@@ -277,12 +258,9 @@ def test_pipeline_build_dag_validate_false_skips_dependency_check(
     assert "stage_b" in dag.nodes
 
 
-def test_pipeline_build_dag_detects_cycles(tmp_path: pathlib.Path, mocker: MockerFixture) -> None:
+def test_pipeline_build_dag_detects_cycles(set_project_root: pathlib.Path) -> None:
     """build_dag() should raise CyclicGraphError for circular dependencies."""
-    mocker.patch.object(project, "_project_root_cache", tmp_path)
-    (tmp_path / ".git").mkdir()
-
-    p = Pipeline("test", root=tmp_path)
+    p = Pipeline("test", root=set_project_root)
     p.register(_cycle_a, name="cycle_a")
     p.register(_cycle_b, name="cycle_b")
 
@@ -295,14 +273,9 @@ def test_pipeline_build_dag_detects_cycles(tmp_path: pathlib.Path, mocker: Mocke
 # =============================================================================
 
 
-def test_pipeline_snapshot_captures_current_state(
-    tmp_path: pathlib.Path, mocker: MockerFixture
-) -> None:
+def test_pipeline_snapshot_captures_current_state(set_project_root: pathlib.Path) -> None:
     """snapshot() should capture current registry state for rollback."""
-    mocker.patch.object(project, "_project_root_cache", tmp_path)
-    (tmp_path / ".git").mkdir()
-
-    p = Pipeline("test", root=tmp_path)
+    p = Pipeline("test", root=set_project_root)
     p.register(_simple_stage, name="stage1")
 
     snap = p.snapshot()
@@ -312,12 +285,9 @@ def test_pipeline_snapshot_captures_current_state(
     assert snap["stage1"]["func"] == _simple_stage
 
 
-def test_pipeline_restore_replaces_state(tmp_path: pathlib.Path, mocker: MockerFixture) -> None:
+def test_pipeline_restore_replaces_state(set_project_root: pathlib.Path) -> None:
     """restore() should replace registry state from snapshot."""
-    mocker.patch.object(project, "_project_root_cache", tmp_path)
-    (tmp_path / ".git").mkdir()
-
-    p = Pipeline("test", root=tmp_path)
+    p = Pipeline("test", root=set_project_root)
     p.register(_simple_stage, name="stage1")
 
     # Take snapshot
@@ -335,12 +305,9 @@ def test_pipeline_restore_replaces_state(tmp_path: pathlib.Path, mocker: MockerF
     assert "stage_a" not in p.list_stages()
 
 
-def test_pipeline_clear_removes_all_stages(tmp_path: pathlib.Path, mocker: MockerFixture) -> None:
+def test_pipeline_clear_removes_all_stages(set_project_root: pathlib.Path) -> None:
     """clear() should remove all registered stages."""
-    mocker.patch.object(project, "_project_root_cache", tmp_path)
-    (tmp_path / ".git").mkdir()
-
-    p = Pipeline("test", root=tmp_path)
+    p = Pipeline("test", root=set_project_root)
     p.register(_simple_stage, name="stage1")
     p.register(_stage_a, name="stage_a")
 
@@ -356,13 +323,10 @@ def test_pipeline_clear_removes_all_stages(tmp_path: pathlib.Path, mocker: Mocke
 # =============================================================================
 
 
-def test_pipeline_include_copies_stages(tmp_path: pathlib.Path, mocker: MockerFixture) -> None:
+def test_pipeline_include_copies_stages(set_project_root: pathlib.Path) -> None:
     """include() should copy all stages from the included pipeline."""
-    mocker.patch.object(project, "_project_root_cache", tmp_path)
-    (tmp_path / ".git").mkdir()
-
-    main = Pipeline("main", root=tmp_path / "main")
-    sub = Pipeline("sub", root=tmp_path / "sub")
+    main = Pipeline("main", root=set_project_root / "main")
+    sub = Pipeline("sub", root=set_project_root / "sub")
 
     sub.register(_simple_stage, name="sub_stage")
 
@@ -371,66 +335,51 @@ def test_pipeline_include_copies_stages(tmp_path: pathlib.Path, mocker: MockerFi
     assert "sub_stage" in main.list_stages()
 
 
-def test_pipeline_include_preserves_state_dir(
-    tmp_path: pathlib.Path, mocker: MockerFixture
-) -> None:
+def test_pipeline_include_preserves_state_dir(set_project_root: pathlib.Path) -> None:
     """Included stages should keep their original state_dir."""
-    mocker.patch.object(project, "_project_root_cache", tmp_path)
-    (tmp_path / ".git").mkdir()
-
-    main = Pipeline("main", root=tmp_path / "main")
-    sub = Pipeline("sub", root=tmp_path / "sub")
+    main = Pipeline("main", root=set_project_root / "main")
+    sub = Pipeline("sub", root=set_project_root / "sub")
 
     sub.register(_simple_stage, name="sub_stage")
     main.include(sub)
 
     # Stage should have sub's state_dir, not main's
     info = main.get("sub_stage")
-    assert info["state_dir"] == tmp_path / "sub" / ".pivot"
+    assert info["state_dir"] == set_project_root / "sub" / ".pivot"
 
 
-def test_pipeline_include_preserves_state_dir_transitively(
-    tmp_path: pathlib.Path, mocker: MockerFixture
-) -> None:
+def test_pipeline_include_preserves_state_dir_transitively(set_project_root: pathlib.Path) -> None:
     """Transitive inclusion should preserve original state_dir through multiple levels.
 
     When A includes B and B includes C, C's stages in A should retain C's state_dir.
     Critical for ensuring lock files and state.db remain in correct locations.
     """
-    mocker.patch.object(project, "_project_root_cache", tmp_path)
-    (tmp_path / ".git").mkdir()
-
     # Level 1: Base pipeline
-    base = Pipeline("base", root=tmp_path / "base")
+    base = Pipeline("base", root=set_project_root / "base")
     base.register(_simple_stage, name="base_stage")
 
     # Level 2: Intermediate pipeline includes base
-    intermediate = Pipeline("intermediate", root=tmp_path / "intermediate")
+    intermediate = Pipeline("intermediate", root=set_project_root / "intermediate")
     intermediate.include(base)
     intermediate.register(_stage_a, name="intermediate_stage")
 
     # Level 3: Main pipeline includes intermediate (gets base transitively)
-    main = Pipeline("main", root=tmp_path / "main")
+    main = Pipeline("main", root=set_project_root / "main")
     main.include(intermediate)
 
     # Verify base_stage retained base's state_dir (not intermediate's)
     base_info = main.get("base_stage")
-    assert base_info["state_dir"] == tmp_path / "base" / ".pivot"
+    assert base_info["state_dir"] == set_project_root / "base" / ".pivot"
 
     # Verify intermediate_stage has intermediate's state_dir
     intermediate_info = main.get("intermediate_stage")
-    assert intermediate_info["state_dir"] == tmp_path / "intermediate" / ".pivot"
+    assert intermediate_info["state_dir"] == set_project_root / "intermediate" / ".pivot"
 
 
-def test_pipeline_include_name_collision_raises(
-    tmp_path: pathlib.Path, mocker: MockerFixture
-) -> None:
+def test_pipeline_include_name_collision_raises(set_project_root: pathlib.Path) -> None:
     """include() should raise PipelineConfigError on stage name collision."""
-    mocker.patch.object(project, "_project_root_cache", tmp_path)
-    (tmp_path / ".git").mkdir()
-
-    main = Pipeline("main", root=tmp_path / "main")
-    sub = Pipeline("sub", root=tmp_path / "sub")
+    main = Pipeline("main", root=set_project_root / "main")
+    sub = Pipeline("sub", root=set_project_root / "sub")
 
     main.register(_simple_stage, name="train")
     sub.register(_simple_stage, name="train")
@@ -439,22 +388,17 @@ def test_pipeline_include_name_collision_raises(
         main.include(sub)
 
 
-def test_pipeline_include_collision_transitive(
-    tmp_path: pathlib.Path, mocker: MockerFixture
-) -> None:
+def test_pipeline_include_collision_transitive(set_project_root: pathlib.Path) -> None:
     """Name collision should be detected even in transitively included stages."""
-    mocker.patch.object(project, "_project_root_cache", tmp_path)
-    (tmp_path / ".git").mkdir()
-
-    main = Pipeline("main", root=tmp_path / "main")
+    main = Pipeline("main", root=set_project_root / "main")
     main.register(_simple_stage, name="train")
 
     # Nested pipeline has same stage name
-    subsub = Pipeline("subsub", root=tmp_path / "subsub")
+    subsub = Pipeline("subsub", root=set_project_root / "subsub")
     subsub.register(_stage_a, name="train")
 
     # Intermediate includes nested
-    sub = Pipeline("sub", root=tmp_path / "sub")
+    sub = Pipeline("sub", root=set_project_root / "sub")
     sub.include(subsub)
 
     # Should detect collision with transitively included stage
@@ -462,20 +406,15 @@ def test_pipeline_include_collision_transitive(
         main.include(sub)
 
 
-def test_pipeline_include_collision_is_atomic(
-    tmp_path: pathlib.Path, mocker: MockerFixture
-) -> None:
+def test_pipeline_include_collision_is_atomic(set_project_root: pathlib.Path) -> None:
     """Include should be atomic: collision should not partially add stages.
 
     Important for preventing registry corruption when include() fails partway through.
     """
-    mocker.patch.object(project, "_project_root_cache", tmp_path)
-    (tmp_path / ".git").mkdir()
-
-    main = Pipeline("main", root=tmp_path / "main")
+    main = Pipeline("main", root=set_project_root / "main")
     main.register(_simple_stage, name="conflict")
 
-    sub = Pipeline("sub", root=tmp_path / "sub")
+    sub = Pipeline("sub", root=set_project_root / "sub")
     sub.register(_stage_a, name="safe")
     sub.register(_stage_b, name="conflict")
 
@@ -488,42 +427,31 @@ def test_pipeline_include_collision_is_atomic(
     assert set(main.list_stages()) == initial_stages
 
 
-def test_pipeline_include_empty_pipeline(tmp_path: pathlib.Path, mocker: MockerFixture) -> None:
+def test_pipeline_include_empty_pipeline(set_project_root: pathlib.Path) -> None:
     """include() with empty pipeline should be a no-op."""
-    mocker.patch.object(project, "_project_root_cache", tmp_path)
-    (tmp_path / ".git").mkdir()
-
-    main = Pipeline("main", root=tmp_path / "main")
+    main = Pipeline("main", root=set_project_root / "main")
     main.register(_simple_stage, name="existing")
 
-    empty = Pipeline("empty", root=tmp_path / "empty")
+    empty = Pipeline("empty", root=set_project_root / "empty")
 
     main.include(empty)  # Should not raise
 
     assert set(main.list_stages()) == {"existing"}
 
 
-def test_pipeline_include_self_raises(tmp_path: pathlib.Path, mocker: MockerFixture) -> None:
+def test_pipeline_include_self_raises(set_project_root: pathlib.Path) -> None:
     """Including a pipeline into itself should raise."""
-    mocker.patch.object(project, "_project_root_cache", tmp_path)
-    (tmp_path / ".git").mkdir()
-
-    main = Pipeline("main", root=tmp_path / "main")
+    main = Pipeline("main", root=set_project_root / "main")
     main.register(_simple_stage, name="stage")
 
     with pytest.raises(PipelineConfigError, match="cannot include itself"):
         main.include(main)
 
 
-def test_pipeline_include_same_pipeline_twice_raises(
-    tmp_path: pathlib.Path, mocker: MockerFixture
-) -> None:
+def test_pipeline_include_same_pipeline_twice_raises(set_project_root: pathlib.Path) -> None:
     """Including the same pipeline twice should raise on collision."""
-    mocker.patch.object(project, "_project_root_cache", tmp_path)
-    (tmp_path / ".git").mkdir()
-
-    main = Pipeline("main", root=tmp_path / "main")
-    sub = Pipeline("sub", root=tmp_path / "sub")
+    main = Pipeline("main", root=set_project_root / "main")
+    sub = Pipeline("sub", root=set_project_root / "sub")
     sub.register(_simple_stage, name="sub_stage")
 
     main.include(sub)
@@ -532,16 +460,11 @@ def test_pipeline_include_same_pipeline_twice_raises(
         main.include(sub)
 
 
-def test_pipeline_include_multiple_different_pipelines(
-    tmp_path: pathlib.Path, mocker: MockerFixture
-) -> None:
+def test_pipeline_include_multiple_different_pipelines(set_project_root: pathlib.Path) -> None:
     """Including multiple different pipelines should work."""
-    mocker.patch.object(project, "_project_root_cache", tmp_path)
-    (tmp_path / ".git").mkdir()
-
-    main = Pipeline("main", root=tmp_path / "main")
-    sub1 = Pipeline("sub1", root=tmp_path / "sub1")
-    sub2 = Pipeline("sub2", root=tmp_path / "sub2")
+    main = Pipeline("main", root=set_project_root / "main")
+    sub1 = Pipeline("sub1", root=set_project_root / "sub1")
+    sub2 = Pipeline("sub2", root=set_project_root / "sub2")
 
     sub1.register(_simple_stage, name="stage1")
     sub2.register(_simple_stage, name="stage2")
@@ -552,13 +475,10 @@ def test_pipeline_include_multiple_different_pipelines(
     assert set(main.list_stages()) == {"stage1", "stage2"}
 
 
-def test_pipeline_include_preserves_params(tmp_path: pathlib.Path, mocker: MockerFixture) -> None:
+def test_pipeline_include_preserves_params(set_project_root: pathlib.Path) -> None:
     """Included stages should keep their params."""
-    mocker.patch.object(project, "_project_root_cache", tmp_path)
-    (tmp_path / ".git").mkdir()
-
-    main = Pipeline("main", root=tmp_path / "main")
-    sub = Pipeline("sub", root=tmp_path / "sub")
+    main = Pipeline("main", root=set_project_root / "main")
+    sub = Pipeline("sub", root=set_project_root / "sub")
 
     sub.register(
         _parameterized_stage_for_include,
@@ -574,17 +494,14 @@ def test_pipeline_include_preserves_params(tmp_path: pathlib.Path, mocker: Mocke
     assert params.value == 100
 
 
-def test_pipeline_include_isolates_mutations(tmp_path: pathlib.Path, mocker: MockerFixture) -> None:
+def test_pipeline_include_isolates_mutations(set_project_root: pathlib.Path) -> None:
     """Mutations to included stages shouldn't affect source pipeline.
 
     Critical for preventing action-at-a-distance bugs where modifying one
     pipeline unexpectedly affects another.
     """
-    mocker.patch.object(project, "_project_root_cache", tmp_path)
-    (tmp_path / ".git").mkdir()
-
-    main = Pipeline("main", root=tmp_path / "main")
-    sub = Pipeline("sub", root=tmp_path / "sub")
+    main = Pipeline("main", root=set_project_root / "main")
+    sub = Pipeline("sub", root=set_project_root / "sub")
 
     sub.register(_simple_stage, name="stage", mutex=["original"])
     main.include(sub)
@@ -596,15 +513,10 @@ def test_pipeline_include_isolates_mutations(tmp_path: pathlib.Path, mocker: Moc
     assert "test_mutex" not in sub.get("stage")["mutex"]
 
 
-def test_pipeline_include_is_independent_copy(
-    tmp_path: pathlib.Path, mocker: MockerFixture
-) -> None:
+def test_pipeline_include_is_independent_copy(set_project_root: pathlib.Path) -> None:
     """Stages are copied at include time; subsequent changes don't propagate."""
-    mocker.patch.object(project, "_project_root_cache", tmp_path)
-    (tmp_path / ".git").mkdir()
-
-    main = Pipeline("main", root=tmp_path / "main")
-    sub = Pipeline("sub", root=tmp_path / "sub")
+    main = Pipeline("main", root=set_project_root / "main")
+    sub = Pipeline("sub", root=set_project_root / "sub")
 
     sub.register(_simple_stage, name="original")
     main.include(sub)
@@ -617,14 +529,9 @@ def test_pipeline_include_is_independent_copy(
     assert "new_stage" not in main.list_stages()
 
 
-def test_pipeline_include_invalidates_dag_cache(
-    tmp_path: pathlib.Path, mocker: MockerFixture
-) -> None:
+def test_pipeline_include_invalidates_dag_cache(set_project_root: pathlib.Path) -> None:
     """Include should invalidate cached DAG to ensure freshness."""
-    mocker.patch.object(project, "_project_root_cache", tmp_path)
-    (tmp_path / ".git").mkdir()
-
-    main = Pipeline("main", root=tmp_path)
+    main = Pipeline("main", root=set_project_root)
     main.register(_stage_a, name="stage_a")
 
     # Build DAG (caches it)
@@ -632,7 +539,7 @@ def test_pipeline_include_invalidates_dag_cache(
     assert len(dag1.nodes) == 1
 
     # Include another pipeline
-    sub = Pipeline("sub", root=tmp_path / "sub")
+    sub = Pipeline("sub", root=set_project_root / "sub")
     sub.register(_stage_b, name="stage_b")
     main.include(sub)
 
@@ -642,20 +549,15 @@ def test_pipeline_include_invalidates_dag_cache(
     assert "stage_b" in dag2.nodes
 
 
-def test_pipeline_include_dag_connects_across_pipelines(
-    tmp_path: pathlib.Path, mocker: MockerFixture
-) -> None:
+def test_pipeline_include_dag_connects_across_pipelines(set_project_root: pathlib.Path) -> None:
     """DAG should connect main stage depending on included sub-pipeline stage.
 
     When including a sub-pipeline, cross-pipeline dependencies work because:
     - Producer in sub outputs sub/a.txt (relative to project root)
     - Consumer in main can reference sub/a.txt to depend on it
     """
-    mocker.patch.object(project, "_project_root_cache", tmp_path)
-    (tmp_path / ".git").mkdir()
-
-    main = Pipeline("main", root=tmp_path)
-    sub = Pipeline("sub", root=tmp_path / "sub")
+    main = Pipeline("main", root=set_project_root)
+    sub = Pipeline("sub", root=set_project_root / "sub")
 
     # Producer outputs a.txt (resolved to sub/a.txt project-relative)
     sub.register(_stage_a, name="producer")
@@ -677,15 +579,10 @@ def test_pipeline_include_dag_connects_across_pipelines(
     assert dag.has_edge("consumer", "producer")
 
 
-def test_pipeline_include_preserves_all_metadata(
-    tmp_path: pathlib.Path, mocker: MockerFixture
-) -> None:
+def test_pipeline_include_preserves_all_metadata(set_project_root: pathlib.Path) -> None:
     """Included stages should preserve all metadata fields (deps, outs, mutex, variant, fingerprint)."""
-    mocker.patch.object(project, "_project_root_cache", tmp_path)
-    (tmp_path / ".git").mkdir()
-
-    main = Pipeline("main", root=tmp_path / "main")
-    sub = Pipeline("sub", root=tmp_path / "sub")
+    main = Pipeline("main", root=set_project_root / "main")
+    sub = Pipeline("sub", root=set_project_root / "sub")
 
     # Register stage with various metadata
     sub.register(
@@ -711,15 +608,10 @@ def test_pipeline_include_preserves_all_metadata(
     assert included_info["func"] == original_info["func"]
 
 
-def test_pipeline_include_isolates_nested_mutations(
-    tmp_path: pathlib.Path, mocker: MockerFixture
-) -> None:
+def test_pipeline_include_isolates_nested_mutations(set_project_root: pathlib.Path) -> None:
     """Deep copy should isolate mutations to nested structures (params object)."""
-    mocker.patch.object(project, "_project_root_cache", tmp_path)
-    (tmp_path / ".git").mkdir()
-
-    main = Pipeline("main", root=tmp_path / "main")
-    sub = Pipeline("sub", root=tmp_path / "sub")
+    main = Pipeline("main", root=set_project_root / "main")
+    sub = Pipeline("sub", root=set_project_root / "sub")
 
     sub.register(
         _parameterized_stage_for_include,
@@ -743,18 +635,13 @@ def test_pipeline_include_isolates_nested_mutations(
     assert included_params.value == original_params.value == 100
 
 
-def test_pipeline_include_multiple_collisions_atomic(
-    tmp_path: pathlib.Path, mocker: MockerFixture
-) -> None:
+def test_pipeline_include_multiple_collisions_atomic(set_project_root: pathlib.Path) -> None:
     """Multiple collisions should still be atomic (no partial adds)."""
-    mocker.patch.object(project, "_project_root_cache", tmp_path)
-    (tmp_path / ".git").mkdir()
-
-    main = Pipeline("main", root=tmp_path / "main")
+    main = Pipeline("main", root=set_project_root / "main")
     main.register(_simple_stage, name="collide_a")
     main.register(_stage_a, name="collide_b")
 
-    sub = Pipeline("sub", root=tmp_path / "sub")
+    sub = Pipeline("sub", root=set_project_root / "sub")
     sub.register(_stage_b, name="collide_a")  # First collision
     sub.register(_simple_stage, name="collide_b")  # Second collision
     sub.register(_stage_a, name="safe_stage")  # Would be safe if others didn't collide
@@ -769,7 +656,7 @@ def test_pipeline_include_multiple_collisions_atomic(
 
 
 def test_pipeline_include_deepcopy_failure_is_atomic(
-    tmp_path: pathlib.Path, mocker: MockerFixture
+    set_project_root: pathlib.Path, mocker: MockerFixture
 ) -> None:
     """Include should be atomic even when deepcopy fails mid-operation.
 
@@ -777,11 +664,8 @@ def test_pipeline_include_deepcopy_failure_is_atomic(
     """
     import copy
 
-    mocker.patch.object(project, "_project_root_cache", tmp_path)
-    (tmp_path / ".git").mkdir()
-
-    main = Pipeline("main", root=tmp_path / "main")
-    sub = Pipeline("sub", root=tmp_path / "sub")
+    main = Pipeline("main", root=set_project_root / "main")
+    sub = Pipeline("sub", root=set_project_root / "sub")
 
     # Register 3 stages in sub
     sub.register(_simple_stage, name="stage1")
@@ -901,21 +785,15 @@ def _cache_option_stage() -> Annotated[
     return pathlib.Path("output.txt")
 
 
-def test_register_resolves_relative_to_pipeline_root(
-    tmp_path: pathlib.Path, mocker: MockerFixture
-) -> None:
+def test_register_resolves_relative_to_pipeline_root(set_project_root: pathlib.Path) -> None:
     """Paths in annotations should be resolved relative to pipeline root, not project root.
 
     Pipeline at /project/subdir/ with annotation path "data/input.txt"
     should resolve to /project/subdir/data/input.txt, stored as project-relative
     "subdir/data/input.txt".
     """
-    project_root = tmp_path
-    mocker.patch.object(project, "_project_root_cache", project_root)
-    (project_root / ".git").mkdir()
-
     # Pipeline in subdirectory
-    pipeline_root = project_root / "subdir"
+    pipeline_root = set_project_root / "subdir"
     pipeline_root.mkdir()
 
     p = Pipeline("test", root=pipeline_root)
@@ -928,30 +806,24 @@ def test_register_resolves_relative_to_pipeline_root(
     # The deps dict should have the resolved path
     assert "data" in info["deps"]
     # After normalization, paths are absolute in deps_paths
-    expected_dep = str(project_root / "subdir" / "data" / "input.txt")
+    expected_dep = str(set_project_root / "subdir" / "data" / "input.txt")
     assert expected_dep in info["deps_paths"]
 
     # Out path should also be project-relative
-    expected_out = str(project_root / "subdir" / "data" / "output.txt")
+    expected_out = str(set_project_root / "subdir" / "data" / "output.txt")
     assert expected_out in info["outs_paths"]
 
 
-def test_register_cross_pipeline_dep_with_dotdot(
-    tmp_path: pathlib.Path, mocker: MockerFixture
-) -> None:
+def test_register_cross_pipeline_dep_with_dotdot(set_project_root: pathlib.Path) -> None:
     """Pipeline can depend on files outside its root using ../ traversal.
 
     Pipeline at /project/pipelines/eval/ depending on ../shared/data.csv
     should resolve to /project/pipelines/shared/data.csv.
     """
-    project_root = tmp_path
-    mocker.patch.object(project, "_project_root_cache", project_root)
-    (project_root / ".git").mkdir()
-
     # Create directory structure
-    eval_pipeline = project_root / "pipelines" / "eval"
+    eval_pipeline = set_project_root / "pipelines" / "eval"
     eval_pipeline.mkdir(parents=True)
-    shared_dir = project_root / "pipelines" / "shared"
+    shared_dir = set_project_root / "pipelines" / "shared"
     shared_dir.mkdir(parents=True)
 
     p = Pipeline("eval", root=eval_pipeline)
@@ -961,21 +833,17 @@ def test_register_cross_pipeline_dep_with_dotdot(
 
     # Dep should resolve to pipelines/shared/data.csv (project-relative)
     # After normalization, stored as absolute path
-    expected_dep = str(project_root / "pipelines" / "shared" / "data.csv")
+    expected_dep = str(set_project_root / "pipelines" / "shared" / "data.csv")
     assert expected_dep in info["deps_paths"]
 
 
-def test_register_absolute_path_unchanged(tmp_path: pathlib.Path, mocker: MockerFixture) -> None:
+def test_register_absolute_path_unchanged(set_project_root: pathlib.Path) -> None:
     """Absolute paths should be normalized but kept absolute.
 
     An absolute path like /data/external/file.csv should remain absolute
     (not converted to project-relative).
     """
-    project_root = tmp_path
-    mocker.patch.object(project, "_project_root_cache", project_root)
-    (project_root / ".git").mkdir()
-
-    pipeline_root = project_root / "subdir"
+    pipeline_root = set_project_root / "subdir"
     pipeline_root.mkdir()
 
     p = Pipeline("test", root=pipeline_root)
@@ -987,16 +855,12 @@ def test_register_absolute_path_unchanged(tmp_path: pathlib.Path, mocker: Mocker
     assert "/data/external/file.csv" in info["deps_paths"]
 
 
-def test_register_windows_path_normalized(tmp_path: pathlib.Path, mocker: MockerFixture) -> None:
+def test_register_windows_path_normalized(set_project_root: pathlib.Path) -> None:
     """Windows-style paths should be normalized to POSIX format.
 
     A path like "data\\subdir\\file.txt" should become "data/subdir/file.txt".
     """
-    project_root = tmp_path
-    mocker.patch.object(project, "_project_root_cache", project_root)
-    (project_root / ".git").mkdir()
-
-    pipeline_root = project_root / "subdir"
+    pipeline_root = set_project_root / "subdir"
     pipeline_root.mkdir()
 
     p = Pipeline("test", root=pipeline_root)
@@ -1011,15 +875,9 @@ def test_register_windows_path_normalized(tmp_path: pathlib.Path, mocker: Mocker
         assert "\\" not in out_path, f"Backslash found in out path: {out_path}"
 
 
-def test_register_overrides_are_pipeline_relative(
-    tmp_path: pathlib.Path, mocker: MockerFixture
-) -> None:
+def test_register_overrides_are_pipeline_relative(set_project_root: pathlib.Path) -> None:
     """dep_path_overrides and out_path_overrides should be resolved relative to pipeline root."""
-    project_root = tmp_path
-    mocker.patch.object(project, "_project_root_cache", project_root)
-    (project_root / ".git").mkdir()
-
-    pipeline_root = project_root / "subdir"
+    pipeline_root = set_project_root / "subdir"
     pipeline_root.mkdir()
 
     p = Pipeline("test", root=pipeline_root)
@@ -1033,27 +891,21 @@ def test_register_overrides_are_pipeline_relative(
     info = p.get("override_stage")
 
     # Override paths should be resolved from pipeline root (subdir/)
-    expected_dep = str(project_root / "subdir" / "custom" / "input.csv")
+    expected_dep = str(set_project_root / "subdir" / "custom" / "input.csv")
     assert expected_dep in info["deps_paths"]
 
-    expected_out = str(project_root / "subdir" / "custom" / "output.csv")
+    expected_out = str(set_project_root / "subdir" / "custom" / "output.csv")
     assert expected_out in info["outs_paths"]
 
 
-def test_register_validates_after_normalization(
-    tmp_path: pathlib.Path, mocker: MockerFixture
-) -> None:
+def test_register_validates_after_normalization(set_project_root: pathlib.Path) -> None:
     """Validation should happen after path normalization.
 
     - ../foo should be allowed (collapses to valid path)
     - But escaping project root should be rejected
     """
-    project_root = tmp_path
-    mocker.patch.object(project, "_project_root_cache", project_root)
-    (project_root / ".git").mkdir()
-
     # Pipeline at project root level
-    pipeline_root = project_root / "subdir"
+    pipeline_root = set_project_root / "subdir"
     pipeline_root.mkdir()
 
     p = Pipeline("test", root=pipeline_root)
@@ -1065,13 +917,9 @@ def test_register_validates_after_normalization(
         p.register(_escape_stage, name="escape_stage")
 
 
-def test_register_single_output_stage(tmp_path: pathlib.Path, mocker: MockerFixture) -> None:
+def test_register_single_output_stage(set_project_root: pathlib.Path) -> None:
     """Single-output stages (non-TypedDict return) should have paths resolved correctly."""
-    project_root = tmp_path
-    mocker.patch.object(project, "_project_root_cache", project_root)
-    (project_root / ".git").mkdir()
-
-    pipeline_root = project_root / "subdir"
+    pipeline_root = set_project_root / "subdir"
     pipeline_root.mkdir()
 
     p = Pipeline("test", root=pipeline_root)
@@ -1080,22 +928,16 @@ def test_register_single_output_stage(tmp_path: pathlib.Path, mocker: MockerFixt
     info = p.get("single_out")
 
     # Both dep and out should be resolved from pipeline root
-    expected_dep = str(project_root / "subdir" / "input.txt")
+    expected_dep = str(set_project_root / "subdir" / "input.txt")
     assert expected_dep in info["deps_paths"]
 
-    expected_out = str(project_root / "subdir" / "output.txt")
+    expected_out = str(set_project_root / "subdir" / "output.txt")
     assert expected_out in info["outs_paths"]
 
 
-def test_register_out_override_with_cache_option(
-    tmp_path: pathlib.Path, mocker: MockerFixture
-) -> None:
+def test_register_out_override_with_cache_option(set_project_root: pathlib.Path) -> None:
     """OutOverride dict with cache option should preserve the cache flag."""
-    project_root = tmp_path
-    mocker.patch.object(project, "_project_root_cache", project_root)
-    (project_root / ".git").mkdir()
-
-    pipeline_root = project_root / "subdir"
+    pipeline_root = set_project_root / "subdir"
     pipeline_root.mkdir()
 
     p = Pipeline("test", root=pipeline_root)
@@ -1108,7 +950,7 @@ def test_register_out_override_with_cache_option(
     info = p.get("cache_stage")
 
     # Output path should be resolved from pipeline root
-    expected_out = str(project_root / "subdir" / "custom" / "output.txt")
+    expected_out = str(set_project_root / "subdir" / "custom" / "output.txt")
     assert expected_out in info["outs_paths"]
 
     # Cache option should be preserved
@@ -1116,13 +958,9 @@ def test_register_out_override_with_cache_option(
     assert info["outs"][0].cache is False
 
 
-def test_register_multi_path_dep_resolved(tmp_path: pathlib.Path, mocker: MockerFixture) -> None:
+def test_register_multi_path_dep_resolved(set_project_root: pathlib.Path) -> None:
     """Multi-path deps (list/tuple) should have each path resolved relative to pipeline root."""
-    project_root = tmp_path
-    mocker.patch.object(project, "_project_root_cache", project_root)
-    (project_root / ".git").mkdir()
-
-    pipeline_root = project_root / "subdir"
+    pipeline_root = set_project_root / "subdir"
     pipeline_root.mkdir()
 
     p = Pipeline("test", root=pipeline_root)
@@ -1131,8 +969,8 @@ def test_register_multi_path_dep_resolved(tmp_path: pathlib.Path, mocker: Mocker
     info = p.get("multi_dep")
 
     # Both paths should be resolved from pipeline root
-    expected_a = str(project_root / "subdir" / "data" / "a.txt")
-    expected_b = str(project_root / "subdir" / "data" / "b.txt")
+    expected_a = str(set_project_root / "subdir" / "data" / "a.txt")
+    expected_b = str(set_project_root / "subdir" / "data" / "b.txt")
 
     assert expected_a in info["deps_paths"]
     assert expected_b in info["deps_paths"]
@@ -1163,25 +1001,21 @@ def _cross_pipeline_consumer(
     return _CrossPipelineConsumerOutput(result=pathlib.Path("result.txt"))
 
 
-def test_dag_connects_cross_pipeline_deps(tmp_path: pathlib.Path, mocker: MockerFixture) -> None:
+def test_dag_connects_cross_pipeline_deps(set_project_root: pathlib.Path) -> None:
     """DAG should correctly connect stages when dependency uses ../ to reference cross-pipeline output.
 
     When pipeline at /project/pipelines/eval/ depends on ../shared/data.csv,
     and pipeline at /project/pipelines/shared/ produces data.csv,
     the DAG should have an edge from consumer to producer.
     """
-    project_root = tmp_path
-    mocker.patch.object(project, "_project_root_cache", project_root)
-    (project_root / ".git").mkdir()
-
     # Create directory structure: pipelines/shared/ and pipelines/eval/
-    shared_root = project_root / "pipelines" / "shared"
+    shared_root = set_project_root / "pipelines" / "shared"
     shared_root.mkdir(parents=True)
-    eval_root = project_root / "pipelines" / "eval"
+    eval_root = set_project_root / "pipelines" / "eval"
     eval_root.mkdir(parents=True)
 
     # Main pipeline at project root - will include both sub-pipelines
-    main = Pipeline("main", root=project_root)
+    main = Pipeline("main", root=set_project_root)
 
     # Shared pipeline produces data.csv (resolved to pipelines/shared/data.csv)
     shared = Pipeline("shared", root=shared_root)
@@ -1206,7 +1040,7 @@ def test_dag_connects_cross_pipeline_deps(tmp_path: pathlib.Path, mocker: Mocker
     )
 
 
-def test_dag_missing_dep_raises(tmp_path: pathlib.Path, mocker: MockerFixture) -> None:
+def test_dag_missing_dep_raises(set_project_root: pathlib.Path) -> None:
     """DAG validation should raise DependencyNotFoundError when dep doesn't match any output.
 
     When a stage depends on a path that:
@@ -1214,11 +1048,7 @@ def test_dag_missing_dep_raises(tmp_path: pathlib.Path, mocker: MockerFixture) -
     2. Does not exist on disk
     The build_dag(validate=True) should raise DependencyNotFoundError.
     """
-    project_root = tmp_path
-    mocker.patch.object(project, "_project_root_cache", project_root)
-    (project_root / ".git").mkdir()
-
-    eval_root = project_root / "pipelines" / "eval"
+    eval_root = set_project_root / "pipelines" / "eval"
     eval_root.mkdir(parents=True)
 
     p = Pipeline("eval", root=eval_root)
@@ -1234,27 +1064,21 @@ def test_dag_missing_dep_raises(tmp_path: pathlib.Path, mocker: MockerFixture) -
     assert "shared" in str(exc_info.value) or "data.csv" in str(exc_info.value)
 
 
-def test_included_pipeline_paths_resolve_correctly(
-    tmp_path: pathlib.Path, mocker: MockerFixture
-) -> None:
+def test_included_pipeline_paths_resolve_correctly(set_project_root: pathlib.Path) -> None:
     """When using include(), included pipeline stages should have paths already resolved.
 
     The included stage's paths should be resolved relative to its original pipeline root,
     not the including pipeline's root.
     """
-    project_root = tmp_path
-    mocker.patch.object(project, "_project_root_cache", project_root)
-    (project_root / ".git").mkdir()
-
     # Sub-pipeline in subdir/
-    sub_root = project_root / "subdir"
+    sub_root = set_project_root / "subdir"
     sub_root.mkdir()
 
     sub = Pipeline("sub", root=sub_root)
     sub.register(_path_resolution_stage, name="sub_stage")
 
     # Main pipeline at project root
-    main = Pipeline("main", root=project_root)
+    main = Pipeline("main", root=set_project_root)
     main.include(sub)
 
     # Get the included stage's info
@@ -1262,21 +1086,19 @@ def test_included_pipeline_paths_resolve_correctly(
 
     # Paths should be resolved from sub_root (subdir/), not main's root
     # Dep: data/input.txt -> subdir/data/input.txt (absolute)
-    expected_dep = str(project_root / "subdir" / "data" / "input.txt")
+    expected_dep = str(set_project_root / "subdir" / "data" / "input.txt")
     assert expected_dep in info["deps_paths"], (
         f"Expected dep path {expected_dep} in {info['deps_paths']}"
     )
 
     # Out: data/output.txt -> subdir/data/output.txt (absolute)
-    expected_out = str(project_root / "subdir" / "data" / "output.txt")
+    expected_out = str(set_project_root / "subdir" / "data" / "output.txt")
     assert expected_out in info["outs_paths"], (
         f"Expected out path {expected_out} in {info['outs_paths']}"
     )
 
 
-def test_lockfile_contains_project_relative_paths(
-    tmp_path: pathlib.Path, mocker: MockerFixture
-) -> None:
+def test_lockfile_contains_project_relative_paths(set_project_root: pathlib.Path) -> None:
     """Lock files should store project-relative paths, not absolute or pipeline-relative.
 
     This test verifies that when a lock file is written, the paths stored in it
@@ -1285,20 +1107,16 @@ def test_lockfile_contains_project_relative_paths(
     from pivot.storage import lock
     from pivot.types import LockData
 
-    project_root = tmp_path
-    mocker.patch.object(project, "_project_root_cache", project_root)
-    (project_root / ".git").mkdir()
-
     # Create stages dir
-    stages_dir = project_root / ".pivot" / "stages"
+    stages_dir = set_project_root / ".pivot" / "stages"
     stages_dir.mkdir(parents=True)
 
     # Create a StageLock and write data with absolute paths
     stage_lock = lock.StageLock("test_stage", stages_dir)
 
     # Simulate lock data with absolute paths (as used internally)
-    abs_dep = str(project_root / "subdir" / "data" / "input.txt")
-    abs_out = str(project_root / "subdir" / "data" / "output.txt")
+    abs_dep = str(set_project_root / "subdir" / "data" / "input.txt")
+    abs_out = str(set_project_root / "subdir" / "data" / "output.txt")
 
     lock_data = LockData(
         code_manifest={"main": "abc123"},
@@ -1345,25 +1163,17 @@ def test_lockfile_contains_project_relative_paths(
 # =============================================================================
 
 
-def test_resolve_path_rejects_empty_string(tmp_path: pathlib.Path, mocker: MockerFixture) -> None:
+def test_resolve_path_rejects_empty_string(set_project_root: pathlib.Path) -> None:
     """_resolve_path should reject empty string paths."""
-    mocker.patch.object(project, "_project_root_cache", tmp_path)
-    (tmp_path / ".git").mkdir()
-
-    p = Pipeline("test", root=tmp_path)
+    p = Pipeline("test", root=set_project_root)
 
     with pytest.raises(ValueError, match="cannot be empty"):
         p._resolve_path("")
 
 
-def test_resolve_path_rejects_whitespace_only(
-    tmp_path: pathlib.Path, mocker: MockerFixture
-) -> None:
+def test_resolve_path_rejects_whitespace_only(set_project_root: pathlib.Path) -> None:
     """_resolve_path should reject whitespace-only paths."""
-    mocker.patch.object(project, "_project_root_cache", tmp_path)
-    (tmp_path / ".git").mkdir()
-
-    p = Pipeline("test", root=tmp_path)
+    p = Pipeline("test", root=set_project_root)
 
     with pytest.raises(ValueError, match="cannot be empty or whitespace"):
         p._resolve_path("   ")
@@ -1372,14 +1182,9 @@ def test_resolve_path_rejects_whitespace_only(
         p._resolve_path("\t\n")
 
 
-def test_resolve_path_rejects_root_only_paths(
-    tmp_path: pathlib.Path, mocker: MockerFixture
-) -> None:
+def test_resolve_path_rejects_root_only_paths(set_project_root: pathlib.Path) -> None:
     """_resolve_path should reject root-only paths like '/' or 'C:\\'."""
-    mocker.patch.object(project, "_project_root_cache", tmp_path)
-    (tmp_path / ".git").mkdir()
-
-    p = Pipeline("test", root=tmp_path)
+    p = Pipeline("test", root=set_project_root)
 
     with pytest.raises(ValueError, match="cannot be a root directory"):
         p._resolve_path("/")
@@ -1395,18 +1200,13 @@ def test_resolve_path_rejects_root_only_paths(
         p._resolve_path("D:/")
 
 
-def test_resolve_path_handles_windows_drive_letters(
-    tmp_path: pathlib.Path, mocker: MockerFixture
-) -> None:
+def test_resolve_path_handles_windows_drive_letters(set_project_root: pathlib.Path) -> None:
     """_resolve_path should recognize Windows drive letters as absolute paths.
 
     Windows paths like C:\\path or D:/path should be treated as absolute,
     not joined with the pipeline root.
     """
-    mocker.patch.object(project, "_project_root_cache", tmp_path)
-    (tmp_path / ".git").mkdir()
-
-    p = Pipeline("test", root=tmp_path / "subdir")
+    p = Pipeline("test", root=set_project_root / "subdir")
 
     # Windows paths should be preserved as absolute (converted to POSIX format)
     # Note: On Unix, these paths are still "absolute" in the sense they have a drive letter
@@ -1441,19 +1241,14 @@ def incremental_cache_stage(
     return existing
 
 
-def test_pipeline_register_incremental_out_stage(
-    tmp_path: pathlib.Path, mocker: MockerFixture
-) -> None:
+def test_pipeline_register_incremental_out_stage(set_project_root: pathlib.Path) -> None:
     """Pipeline.register() should succeed for stages using IncrementalOut.
 
     IncrementalOut paths cannot be overridden (registry rejects path overrides
     for them), so Pipeline must NOT pass IncrementalOut paths as overrides.
     The paths remain as specified in the annotations (normalized by registry).
     """
-    mocker.patch.object(project, "_project_root_cache", tmp_path)
-    (tmp_path / ".git").mkdir()
-
-    p = Pipeline("test", root=tmp_path / "subdir")
+    p = Pipeline("test", root=set_project_root / "subdir")
 
     # This should NOT raise - IncrementalOut paths are not overridden
     p.register(incremental_cache_stage)
@@ -1465,3 +1260,365 @@ def test_pipeline_register_incremental_out_stage(
     # IncrementalOut path is preserved (not resolved relative to pipeline root)
     # Registry normalizes it to absolute based on project root
     assert info["outs_paths"][0].endswith("data/cache.yaml")
+
+
+# =============================================================================
+# resolve_from_parents() Tests
+# =============================================================================
+
+
+def _make_producer_pipeline_code(name: str, stage_name: str, output_path: str) -> str:
+    """Generate pipeline code for a producer stage."""
+    return f'''
+from typing import Annotated, TypedDict
+from pathlib import Path
+from pivot.pipeline import Pipeline
+from pivot import loaders
+from pivot.outputs import Out
+
+pipeline = Pipeline("{name}")
+
+class _Output(TypedDict):
+    data: Annotated[Path, Out("{output_path}", loaders.PathOnly())]
+
+def {stage_name}() -> _Output:
+    Path("{output_path}").parent.mkdir(parents=True, exist_ok=True)
+    Path("{output_path}").write_text("produced")
+    return _Output(data=Path("{output_path}"))
+
+pipeline.register({stage_name})
+'''
+
+
+# Consolidated TypedDict for consumer stages that output result.txt
+class _ResultOutput(TypedDict):
+    result: Annotated[pathlib.Path, outputs.Out("result.txt", loaders.PathOnly())]
+
+
+def _external_consumer(
+    data: Annotated[pathlib.Path, outputs.Dep("external.txt", loaders.PathOnly())],
+) -> _ResultOutput:
+    return _ResultOutput(result=pathlib.Path("result.txt"))
+
+
+def _parent_data_consumer(
+    data: Annotated[pathlib.Path, outputs.Dep("../data.txt", loaders.PathOnly())],
+) -> _ResultOutput:
+    """Consumer that depends on data.txt from parent pipeline (using ../)."""
+    return _ResultOutput(result=pathlib.Path("result.txt"))
+
+
+def _shared_txt_consumer(
+    data: Annotated[pathlib.Path, outputs.Dep("../shared.txt", loaders.PathOnly())],
+) -> _ResultOutput:
+    """Consumer that depends on shared.txt from parent pipeline."""
+    return _ResultOutput(result=pathlib.Path("result.txt"))
+
+
+def _grandparent_data_consumer(
+    data: Annotated[pathlib.Path, outputs.Dep("../../data.txt", loaders.PathOnly())],
+) -> _ResultOutput:
+    """Consumer that depends on data.txt from grandparent (skipping mid parent)."""
+    return _ResultOutput(result=pathlib.Path("result.txt"))
+
+
+def _missing_file_consumer(
+    data: Annotated[pathlib.Path, outputs.Dep("../missing.txt", loaders.PathOnly())],
+) -> _ResultOutput:
+    """Consumer that depends on a file that doesn't exist."""
+    return _ResultOutput(result=pathlib.Path("result.txt"))
+
+
+# Cycle detection helper - produces a.txt, depends on b.txt
+class _CycleChildOutput(TypedDict):
+    a: Annotated[pathlib.Path, outputs.Out("a.txt", loaders.PathOnly())]
+
+
+def _cycle_child_stage(
+    b: Annotated[pathlib.Path, outputs.Dep("../b.txt", loaders.PathOnly())],
+) -> _CycleChildOutput:
+    """Child stage that produces a.txt and depends on b.txt."""
+    return _CycleChildOutput(a=pathlib.Path("a.txt"))
+
+
+def test_pipeline_resolve_from_parents_skips_existing_files(
+    set_project_root: pathlib.Path,
+) -> None:
+    """Should treat existing files as external inputs."""
+    # Create external input file
+    (set_project_root / "external.txt").write_text("external data")
+
+    # No parent pipeline
+    child = Pipeline("child", root=set_project_root)
+    child.register(_external_consumer, name="external_consumer")
+
+    # Should not raise, external.txt exists
+    child.resolve_from_parents()
+
+    assert child.list_stages() == ["external_consumer"]
+
+
+def test_pipeline_resolve_from_parents_is_idempotent(set_project_root: pathlib.Path) -> None:
+    """Calling resolve_from_parents multiple times should be safe."""
+    (set_project_root / "pipeline.py").write_text(
+        _make_producer_pipeline_code("parent", "producer", "data.txt")
+    )
+
+    child_dir = set_project_root / "child"
+    child_dir.mkdir()
+    child = Pipeline("child", root=child_dir)
+    child.register(_parent_data_consumer, name="consumer")
+
+    child.resolve_from_parents()
+    count_after_first = len(child.list_stages())
+
+    child.resolve_from_parents()
+    count_after_second = len(child.list_stages())
+
+    assert count_after_first == count_after_second == 2
+
+
+def test_pipeline_resolve_from_parents_prefers_closest_parent(
+    set_project_root: pathlib.Path,
+) -> None:
+    """When multiple parents produce same artifact, should use closest parent first.
+
+    Critical for ensuring lock files and state are stored in expected locations.
+    If wrong producer is selected, incremental builds will break.
+    """
+    # Root parent produces shared.txt
+    (set_project_root / "pipeline.py").write_text(
+        _make_producer_pipeline_code("root_parent", "root_producer", "shared.txt")
+    )
+
+    # Mid-level parent also produces shared.txt (should be preferred)
+    mid_dir = set_project_root / "mid"
+    mid_dir.mkdir()
+    (mid_dir / "pipeline.py").write_text(
+        _make_producer_pipeline_code("mid_parent", "mid_producer", "shared.txt")
+    )
+
+    # Child depends on shared.txt
+    child_dir = mid_dir / "child"
+    child_dir.mkdir()
+    child = Pipeline("child", root=child_dir)
+    child.register(_shared_txt_consumer, name="consumer")
+
+    child.resolve_from_parents()
+
+    # Should include mid_producer (closest), not root_producer
+    assert "mid_producer" in child.list_stages(), (
+        "Expected closest parent's producer (mid_producer) to be included"
+    )
+    assert "root_producer" not in child.list_stages(), (
+        "Root producer should not be included when closer parent provides same artifact"
+    )
+    assert "consumer" in child.list_stages()
+
+    # Verify state_dir is from mid parent
+    producer_info = child.get("mid_producer")
+    assert producer_info["state_dir"] == mid_dir / ".pivot", (
+        f"Expected state_dir to be mid parent's .pivot, got {producer_info['state_dir']}"
+    )
+
+
+def test_pipeline_resolve_from_parents_continues_on_load_failure(
+    set_project_root: pathlib.Path,
+) -> None:
+    """When parent pipeline fails to load, should continue searching other parents.
+
+    Critical: broken parent shouldn't prevent resolution from working parents.
+    Without this, cryptic DependencyNotFoundError occurs when valid producer exists.
+    """
+    # Root parent has valid producer
+    (set_project_root / "pipeline.py").write_text(
+        _make_producer_pipeline_code("root_parent", "producer", "data.txt")
+    )
+
+    # Mid-level parent has broken pipeline.py (wrong variable name)
+    mid_dir = set_project_root / "mid"
+    mid_dir.mkdir()
+    (mid_dir / "pipeline.py").write_text("""
+from pivot.pipeline import Pipeline
+# Wrong variable name - should trigger DiscoveryError
+wrong_name = Pipeline("broken")
+""")
+
+    # Child depends on data.txt from root
+    child_dir = mid_dir / "child"
+    child_dir.mkdir()
+    child = Pipeline("child", root=child_dir)
+    child.register(_grandparent_data_consumer, name="consumer")
+
+    # Should succeed by falling back to root parent
+    child.resolve_from_parents()
+
+    assert "producer" in child.list_stages(), (
+        "Expected to find producer from root parent despite mid parent load failure"
+    )
+    assert "consumer" in child.list_stages()
+
+
+def test_pipeline_resolve_from_parents_detects_cycles_across_boundaries(
+    set_project_root: pathlib.Path,
+) -> None:
+    """Should detect circular dependencies when parent stages are included.
+
+    Critical: cycles cause infinite loops/deadlocks during execution.
+    Must verify cycle detector works across pipeline boundaries.
+    """
+    # Parent produces b.txt, depends on child/a.txt
+    parent_code = """
+from typing import Annotated, TypedDict
+from pathlib import Path
+from pivot.pipeline import Pipeline
+from pivot import loaders
+from pivot.outputs import Out, Dep
+
+pipeline = Pipeline("parent")
+
+class _Output(TypedDict):
+    b: Annotated[Path, Out("b.txt", loaders.PathOnly())]
+
+def parent_stage(
+    a: Annotated[Path, Dep("child/a.txt", loaders.PathOnly())]
+) -> _Output:
+    return _Output(b=Path("b.txt"))
+
+pipeline.register(parent_stage)
+"""
+    (set_project_root / "pipeline.py").write_text(parent_code)
+
+    # Child produces a.txt, depends on b.txt (creates cycle)
+    child_dir = set_project_root / "child"
+    child_dir.mkdir()
+    child = Pipeline("child", root=child_dir)
+    child.register(_cycle_child_stage, name="child_stage")
+
+    # Resolve includes parent_stage
+    child.resolve_from_parents()
+
+    # build_dag should detect cycle
+    with pytest.raises(exceptions.CyclicGraphError) as exc_info:
+        child.build_dag(validate=True)
+
+    # Verify error message mentions involved stages
+    error_msg = str(exc_info.value)
+    assert "child_stage" in error_msg or "parent_stage" in error_msg, (
+        "Cycle error should mention one of the involved stages"
+    )
+
+
+def test_pipeline_resolve_from_parents_no_parents_is_noop(set_project_root: pathlib.Path) -> None:
+    """When child is at project root with no parents, should be a no-op.
+
+    Edge case: ensures we handle the boundary condition gracefully.
+    """
+    # Pipeline at project root (no parents to search)
+    pipeline = Pipeline("root_pipeline", root=set_project_root)
+
+    class Output(TypedDict):
+        result: Annotated[pathlib.Path, outputs.Out("result.txt", loaders.PathOnly())]
+
+    def stage() -> Output:
+        return Output(result=pathlib.Path("result.txt"))
+
+    pipeline.register(stage, name="stage")
+
+    # Should not raise, just be a no-op
+    pipeline.resolve_from_parents()
+
+    assert pipeline.list_stages() == ["stage"]
+
+
+def test_pipeline_resolve_from_parents_empty_work_queue_optimization(
+    set_project_root: pathlib.Path, mocker: MockerFixture
+) -> None:
+    """When all dependencies are locally satisfied, should return early without searching parents.
+
+    Performance optimization: ensures we don't do unnecessary parent traversal.
+    """
+    # Parent pipeline exists but should not be loaded
+    (set_project_root / "pipeline.py").write_text("""
+from pivot.pipeline import Pipeline
+pipeline = Pipeline("parent")
+raise RuntimeError("Parent should not be loaded!")
+""")
+
+    # Child has self-contained stages (no unresolved deps)
+    child_dir = set_project_root / "child"
+    child_dir.mkdir()
+    child = Pipeline("child", root=child_dir)
+    child.register(_stage_a, name="stage_a")  # Produces a.txt
+
+    # Spy on find_parent_pipeline_paths to verify it's not called
+    from pivot import discovery
+
+    spy = mocker.spy(discovery, "find_parent_pipeline_paths")
+
+    child.resolve_from_parents()
+
+    # Should return early without parent traversal
+    assert spy.call_count == 0, (
+        "Expected early return without calling find_parent_pipeline_paths when no unresolved deps"
+    )
+    assert child.list_stages() == ["stage_a"]
+
+
+def test_pipeline_resolve_from_parents_empty_parent_pipeline(
+    set_project_root: pathlib.Path,
+) -> None:
+    """Parent pipeline with no stages should be skipped gracefully.
+
+    Robustness: ensures empty parents don't cause issues.
+    """
+    # Empty parent pipeline
+    (set_project_root / "pipeline.py").write_text("""
+from pivot.pipeline import Pipeline
+pipeline = Pipeline("empty_parent")
+# No stages registered
+""")
+
+    # Child depends on artifact not in parent
+    child_dir = set_project_root / "child"
+    child_dir.mkdir()
+    child = Pipeline("child", root=child_dir)
+    child.register(_missing_file_consumer, name="consumer")
+
+    # Should not raise during resolution (will fail at build_dag validation)
+    child.resolve_from_parents()
+
+    assert child.list_stages() == ["consumer"], "Empty parent shouldn't add stages"
+
+    # Validation should fail at build_dag time, not during resolution
+    with pytest.raises(exceptions.DependencyNotFoundError):
+        child.build_dag(validate=True)
+
+
+def test_pipeline_resolve_from_parents_logs_included_stages(
+    set_project_root: pathlib.Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Should log debug messages when including stages from parent.
+
+    Important for troubleshooting: users need visibility into what's being included.
+    """
+    import logging
+
+    # Parent pipeline
+    (set_project_root / "pipeline.py").write_text(
+        _make_producer_pipeline_code("parent", "producer", "data.txt")
+    )
+
+    # Child pipeline
+    child_dir = set_project_root / "child"
+    child_dir.mkdir()
+    child = Pipeline("child", root=child_dir)
+    child.register(_parent_data_consumer, name="consumer")
+
+    with caplog.at_level(logging.DEBUG):
+        child.resolve_from_parents()
+
+    # Verify log messages about included stage
+    assert any(
+        "producer" in record.message and "parent" in record.message for record in caplog.records
+    ), "Expected debug log about including producer from parent pipeline"

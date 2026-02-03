@@ -112,7 +112,6 @@ def test_export_default_output_creates_dvc_yaml(
 ) -> None:
     """Export without args creates dvc.yaml in current directory."""
     _ = mock_discovery
-    (set_project_root / ".git").mkdir()
 
     register_test_stage(_helper_preprocess_with_data_dep, name="preprocess")
 
@@ -131,7 +130,6 @@ def test_export_custom_output_path(
 ) -> None:
     """Export with --output writes to specified path."""
     _ = mock_discovery
-    (set_project_root / ".git").mkdir()
 
     register_test_stage(_helper_preprocess_no_deps, name="preprocess")
 
@@ -149,7 +147,6 @@ def test_export_specific_stages_only(
 ) -> None:
     """Export with stage names exports only those stages."""
     _ = mock_discovery
-    (set_project_root / ".git").mkdir()
 
     register_test_stage(_helper_preprocess_a_txt, name="preprocess")
     register_test_stage(_helper_evaluate_b_txt, name="evaluate")
@@ -174,7 +171,6 @@ def test_export_generates_params_yaml(
 ) -> None:
     """Export generates params.yaml with Pydantic model defaults."""
     _ = mock_discovery
-    (set_project_root / ".git").mkdir()
 
     register_test_stage(
         _helper_train_with_params,
@@ -202,7 +198,6 @@ def test_export_unknown_stage_error(
 ) -> None:
     """Export with unknown stage name shows error."""
     _ = mock_discovery
-    (set_project_root / ".git").mkdir()
 
     register_test_stage(_helper_preprocess_a_txt, name="preprocess")
 
@@ -236,7 +231,6 @@ def test_export_dvc_yaml_structure(
 ) -> None:
     """Exported dvc.yaml has correct structure with cmd, deps, outs."""
     _ = mock_discovery
-    (set_project_root / ".git").mkdir()
 
     register_test_stage(_helper_preprocess_with_input_dep, name="preprocess")
 
