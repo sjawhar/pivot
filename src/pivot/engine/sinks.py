@@ -93,6 +93,10 @@ class ConsoleSink:
                         self._console.print(f"  {stage}: done ({duration:.1f}s)")
                     case StageStatus.FAILED:
                         self._console.print(f"  {stage}: [red]FAILED[/red]")
+                        if event["reason"]:
+                            # Indent each line of the error for readability
+                            for line in event["reason"].rstrip().split("\n"):
+                                self._console.print(f"    [dim]{line}[/dim]")
             case _:
                 pass  # Ignore log_line, engine_state_changed, etc.
 
