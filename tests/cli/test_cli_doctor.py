@@ -15,12 +15,9 @@ from pivot.cli import doctor as doctor_module
 
 
 def test_doctor_basic_output(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    runner: click.testing.CliRunner, set_project_root: pathlib.Path
 ) -> None:
     """pivot doctor shows human-readable output."""
-    (tmp_path / ".pivot").mkdir()
-    monkeypatch.chdir(tmp_path)
-
     result = runner.invoke(cli, ["doctor"])
 
     assert result.exit_code == 0
@@ -30,12 +27,10 @@ def test_doctor_basic_output(
 
 
 def test_doctor_shows_all_checks_passing(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    runner: click.testing.CliRunner, set_project_root: pathlib.Path
 ) -> None:
     """pivot doctor shows all checks passing when environment is correct."""
-    (tmp_path / ".pivot").mkdir()
-    (tmp_path / "pivot.yaml").write_text("stages:\n  test:\n    cmd: echo hi\n")
-    monkeypatch.chdir(tmp_path)
+    (set_project_root / "pivot.yaml").write_text("stages:\n  test:\n    cmd: echo hi\n")
 
     result = runner.invoke(cli, ["doctor"])
 
@@ -45,12 +40,9 @@ def test_doctor_shows_all_checks_passing(
 
 
 def test_doctor_shows_pipeline_config_warning(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    runner: click.testing.CliRunner, set_project_root: pathlib.Path
 ) -> None:
     """pivot doctor warns when no pipeline config exists."""
-    (tmp_path / ".pivot").mkdir()
-    monkeypatch.chdir(tmp_path)
-
     result = runner.invoke(cli, ["doctor"])
 
     assert result.exit_code == 0
@@ -58,13 +50,11 @@ def test_doctor_shows_pipeline_config_warning(
 
 
 def test_doctor_exits_1_on_error(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    runner: click.testing.CliRunner, set_project_root: pathlib.Path
 ) -> None:
     """pivot doctor exits 1 when errors are found."""
     # Create a malformed pivot.yaml to trigger a parse error
-    (tmp_path / ".pivot").mkdir()
-    (tmp_path / "pivot.yaml").write_text("stages:\n  - invalid: yaml: content\n")
-    monkeypatch.chdir(tmp_path)
+    (set_project_root / "pivot.yaml").write_text("stages:\n  - invalid: yaml: content\n")
 
     result = runner.invoke(cli, ["doctor"])
 
@@ -78,12 +68,9 @@ def test_doctor_exits_1_on_error(
 
 
 def test_doctor_json_output(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    runner: click.testing.CliRunner, set_project_root: pathlib.Path
 ) -> None:
     """pivot doctor --json outputs JSONL format."""
-    (tmp_path / ".pivot").mkdir()
-    monkeypatch.chdir(tmp_path)
-
     result = runner.invoke(cli, ["doctor", "--json"])
 
     assert result.exit_code == 0
@@ -99,12 +86,9 @@ def test_doctor_json_output(
 
 
 def test_doctor_json_includes_all_checks(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    runner: click.testing.CliRunner, set_project_root: pathlib.Path
 ) -> None:
     """pivot doctor --json includes all check events."""
-    (tmp_path / ".pivot").mkdir()
-    monkeypatch.chdir(tmp_path)
-
     result = runner.invoke(cli, ["doctor", "--json"])
 
     events = [json.loads(line) for line in result.output.strip().split("\n") if line]
@@ -118,12 +102,9 @@ def test_doctor_json_includes_all_checks(
 
 
 def test_doctor_json_ends_with_summary(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    runner: click.testing.CliRunner, set_project_root: pathlib.Path
 ) -> None:
     """pivot doctor --json ends with summary event."""
-    (tmp_path / ".pivot").mkdir()
-    monkeypatch.chdir(tmp_path)
-
     result = runner.invoke(cli, ["doctor", "--json"])
 
     events = [json.loads(line) for line in result.output.strip().split("\n") if line]
@@ -141,12 +122,9 @@ def test_doctor_json_ends_with_summary(
 
 
 def test_doctor_remote_flag_checks_remotes(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    runner: click.testing.CliRunner, set_project_root: pathlib.Path
 ) -> None:
     """pivot doctor --remote checks configured remotes."""
-    (tmp_path / ".pivot").mkdir()
-    monkeypatch.chdir(tmp_path)
-
     result = runner.invoke(cli, ["doctor", "--remote"])
 
     assert result.exit_code == 0
@@ -155,12 +133,9 @@ def test_doctor_remote_flag_checks_remotes(
 
 
 def test_doctor_remote_json_includes_remote_checks(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    runner: click.testing.CliRunner, set_project_root: pathlib.Path
 ) -> None:
     """pivot doctor --remote --json includes remote check events."""
-    (tmp_path / ".pivot").mkdir()
-    monkeypatch.chdir(tmp_path)
-
     result = runner.invoke(cli, ["doctor", "--remote", "--json"])
 
     events = [json.loads(line) for line in result.output.strip().split("\n") if line]
@@ -204,9 +179,7 @@ def test_check_pipeline_config_ok_with_yaml(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """_check_pipeline_config returns OK when pivot.yaml exists."""
-    (tmp_path / ".pivot").mkdir()
     (tmp_path / "pivot.yaml").write_text("stages:\n  test:\n    cmd: echo\n")
-    monkeypatch.chdir(tmp_path)
 
     result = doctor_module._check_pipeline_config(tmp_path)
 
@@ -220,9 +193,7 @@ def test_check_pipeline_config_ok_with_pipeline_py(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """_check_pipeline_config returns OK when pipeline.py exists."""
-    (tmp_path / ".pivot").mkdir()
     (tmp_path / "pipeline.py").write_text("# pipeline")
-    monkeypatch.chdir(tmp_path)
 
     result = doctor_module._check_pipeline_config(tmp_path)
 
@@ -234,8 +205,6 @@ def test_check_pipeline_config_warn_when_missing(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """_check_pipeline_config returns WARN when no config exists."""
-    (tmp_path / ".pivot").mkdir()
-    monkeypatch.chdir(tmp_path)
 
     result = doctor_module._check_pipeline_config(tmp_path)
 
@@ -247,9 +216,7 @@ def test_check_pipeline_config_handles_scalar_yaml(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """_check_pipeline_config handles scalar YAML (not a dict)."""
-    (tmp_path / ".pivot").mkdir()
     (tmp_path / "pivot.yaml").write_text("just a string")
-    monkeypatch.chdir(tmp_path)
 
     result = doctor_module._check_pipeline_config(tmp_path)
 
@@ -281,7 +248,6 @@ def test_check_cache_directory_ok_when_not_exists(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """_check_cache_directory returns OK when cache doesn't exist yet."""
-    (tmp_path / ".pivot").mkdir()
     # Don't create cache directory
 
     # Set up project root so config.get_cache_dir() works correctly
@@ -299,7 +265,6 @@ def test_check_git_repository_ok_when_in_repo(
 ) -> None:
     """_check_git_repository returns OK when in git repo."""
     subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
-    monkeypatch.chdir(tmp_path)
 
     result = doctor_module._check_git_repository(tmp_path)
 

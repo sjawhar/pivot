@@ -72,18 +72,24 @@ def test_pipeline(tmp_path: pathlib.Path) -> Generator[pipeline_mod.Pipeline]:
 
 @pytest.fixture
 def mock_discovery(
-    test_pipeline: pipeline_mod.Pipeline, mocker: MockerFixture
+    test_pipeline: pipeline_mod.Pipeline,
+    mocker: MockerFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> pipeline_mod.Pipeline:
     """Mock discover_pipeline to return the test_pipeline.
 
     Use this fixture for CLI tests that need stages to be discovered
     without creating actual pivot.yaml or pipeline.py files.
 
-    Also sets project._project_root_cache to the pipeline's root directory
-    so that project.get_project_root() works correctly.
+    This fixture:
+    - Creates .pivot and .git directories in the pipeline root
+    - Changes cwd to the pipeline root
+    - Sets project._project_root_cache to the pipeline root
+    - Mocks discover_pipeline to return test_pipeline
+    - Mocks get_pipeline_from_context for cli_helpers
 
-    Additionally mocks get_pipeline_from_context() so that cli_helpers
-    functions work even when not running inside a Click command context.
+    Tests using this fixture should NOT use isolated_filesystem() since
+    this fixture already sets up the environment correctly.
 
     Note: The test_pipeline fixture is automatically used, so stages
     can be registered via register_test_stage().
@@ -91,6 +97,12 @@ def mock_discovery(
     from pivot import discovery
     from pivot.cli import decorators as cli_decorators
 
+    # Set up filesystem environment
+    (test_pipeline.root / ".pivot").mkdir(exist_ok=True)
+    (test_pipeline.root / ".git").mkdir(exist_ok=True)
+    monkeypatch.chdir(test_pipeline.root)
+
+    # Mock discovery
     mocker.patch.object(discovery, "discover_pipeline", return_value=test_pipeline)
     mocker.patch.object(project, "_project_root_cache", test_pipeline.root)
     mocker.patch.object(cli_decorators, "get_pipeline_from_context", return_value=test_pipeline)
@@ -117,28 +129,54 @@ def clean_registry() -> None:
 _PIVOT_LOGGERS = ("pivot", "pivot.project", "pivot.executor", "pivot.registry", "")
 
 
+@pytest.fixture(scope="session")
+def _default_project_root(tmp_path_factory: pytest.TempPathFactory) -> pathlib.Path:
+    """Session-scoped default project root with .pivot directory.
+
+    Provides a fallback project root for tests that don't explicitly set one.
+    This prevents ProjectNotInitializedError when code calls get_project_root().
+    """
+    root = tmp_path_factory.mktemp("default_project")
+    (root / ".pivot").mkdir()
+    (root / ".git").mkdir()
+    return root
+
+
 @pytest.fixture(autouse=True)
-def reset_pivot_state(mocker: MockerFixture) -> Generator[None]:
+def reset_pivot_state(
+    mocker: MockerFixture, _default_project_root: pathlib.Path
+) -> Generator[None]:
     """Reset global pivot state between tests.
 
     CliRunner can leave console singleton pointing to closed streams,
     project root cache pointing to old directories, and merged config cached.
+
+    Sets project root to a default directory with .pivot to prevent
+    ProjectNotInitializedError. Tests that need a specific project root
+    should use set_project_root, mock_discovery, or pipeline_dir fixtures.
+
+    Tests using isolated_filesystem() that create their own .pivot should
+    reset the cache: project._project_root_cache = None
     """
     mocker.patch.object(console, "_console", None)
-    mocker.patch.object(project, "_project_root_cache", None)
+    # Direct assignment (not mocker.patch) so tests can override by setting to None
+    project._project_root_cache = _default_project_root
     config_io.clear_config_cache()
     for name in _PIVOT_LOGGERS:
         logging.getLogger(name).handlers.clear()
     yield
+    project._project_root_cache = None
 
 
 @pytest.fixture
 def set_project_root(tmp_path: pathlib.Path, mocker: MockerFixture) -> Generator[pathlib.Path]:
     """Set project root to tmp_path for tests that register stages with temp paths.
 
-    Also creates .git directory so fingerprinting and other git-dependent operations work.
+    Creates .pivot directory so project root discovery works.
+    Also creates .git for fingerprinting and other git-dependent operations.
     """
     mocker.patch.object(project, "_project_root_cache", tmp_path)
+    (tmp_path / ".pivot").mkdir(exist_ok=True)
     (tmp_path / ".git").mkdir(exist_ok=True)
     yield tmp_path
 
@@ -259,6 +297,7 @@ def cleanup_worker_pool() -> Generator[None]:
 
 
 # Type alias for make_valid_lock_content fixture
+# Returns dict matching StorageLockData structure (code_manifest, params, deps, outs, dep_generations)
 ValidLockContentFactory = Callable[..., dict[str, object]]
 
 
@@ -312,6 +351,32 @@ def runner() -> click.testing.CliRunner:
     return click.testing.CliRunner()
 
 
+@contextlib.contextmanager
+def isolated_pivot_dir(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> Generator[pathlib.Path]:
+    """Context manager for isolated filesystem with .pivot directory.
+
+    Use this instead of runner.isolated_filesystem() for tests that need
+    real pipeline discovery (not using mock_discovery fixture).
+
+    Creates .pivot and .git directories and resets the project root cache
+    so find_project_root() discovers the isolated directory.
+
+    Example:
+        def test_something(runner, tmp_path):
+            with isolated_pivot_dir(runner, tmp_path) as cwd:
+                Path("pipeline.py").write_text("...")
+                result = runner.invoke(cli, ["status"])
+    """
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        cwd = pathlib.Path.cwd()
+        (cwd / ".pivot").mkdir()
+        (cwd / ".git").mkdir()
+        project._project_root_cache = None
+        yield cwd
+
+
 @pytest.fixture
 def output_queue() -> Generator[mp.Queue[OutputMessage]]:
     """Create a multiprocessing queue for worker output using spawn context.
@@ -363,8 +428,12 @@ class MockEngine:
 
 @pytest.fixture
 def mock_watch_engine() -> Engine:
-    """Provide a mock engine for TUI watch mode testing."""
-    return MockEngine()  # pyright: ignore[reportReturnType]
+    """Provide a mock engine for TUI watch mode testing.
+
+    Returns MockEngine which implements the subset of Engine interface
+    needed for watch mode tests (keep_going property and toggle).
+    """
+    return MockEngine()  # pyright: ignore[reportReturnType] - MockEngine is test double
 
 
 @pytest.fixture

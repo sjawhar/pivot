@@ -6,6 +6,7 @@ import json
 import pathlib
 from typing import TYPE_CHECKING, Annotated, TypedDict
 
+from conftest import isolated_pivot_dir
 from helpers import register_test_stage
 from pivot import cli, executor, loaders, outputs
 from pivot.storage import cache, track
@@ -15,7 +16,6 @@ if TYPE_CHECKING:
     import pytest
 
     from pivot.pipeline.pipeline import Pipeline
-
 
 # =============================================================================
 # Module-level TypedDicts and Stage Functions for annotation-based registration
@@ -79,8 +79,6 @@ def test_repro_runs_entire_pipeline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """repro without arguments runs entire pipeline."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     register_test_stage(_helper_stage_a, name="stage_a")
     register_test_stage(_helper_stage_b, name="stage_b")
     register_test_stage(_helper_stage_c, name="stage_c")
@@ -100,8 +98,6 @@ def test_repro_runs_stage_with_dependencies(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """repro STAGE runs stage and its dependencies."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     register_test_stage(_helper_stage_a, name="stage_a")
     register_test_stage(_helper_stage_b, name="stage_b")
     register_test_stage(_helper_stage_c, name="stage_c")
@@ -127,8 +123,6 @@ def test_repro_dry_run_shows_what_would_run(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """repro --dry-run shows what would run without executing."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     register_test_stage(_helper_stage_a, name="stage_a")
     register_test_stage(_helper_stage_b, name="stage_b")
 
@@ -148,8 +142,6 @@ def test_repro_dry_run_json_output(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """repro --dry-run --json outputs JSON format."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     register_test_stage(_helper_stage_a, name="stage_a")
 
     result = runner.invoke(cli.cli, ["repro", "--dry-run", "--json"])
@@ -167,8 +159,6 @@ def test_repro_dry_run_allow_missing_uses_pvt_hash(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """repro --dry-run --allow-missing uses .pvt hash when dep file is missing."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
 
     # Create and run
     (tmp_path / "input.txt").write_text("data")
@@ -202,8 +192,6 @@ def test_repro_explain_shows_detailed_breakdown(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """repro --explain shows detailed stage explanations."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     register_test_stage(_helper_stage_a, name="stage_a")
     register_test_stage(_helper_stage_b, name="stage_b")
 
@@ -222,8 +210,6 @@ def test_repro_explain_allow_missing_uses_pvt_hash(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """repro --explain --allow-missing uses .pvt hash when dep file is missing."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
 
     # Create and run
     (tmp_path / "input.txt").write_text("data")
@@ -257,8 +243,6 @@ def test_repro_allow_missing_requires_dry_run_or_explain(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """repro --allow-missing without --dry-run or --explain errors."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     (tmp_path / "input.txt").write_text("data")
     register_test_stage(_helper_process, name="process")
 
@@ -276,8 +260,6 @@ def test_repro_serve_requires_watch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """repro --serve without --watch errors."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     register_test_stage(_helper_stage_a, name="stage_a")
 
     result = runner.invoke(cli.cli, ["repro", "--serve"])
@@ -299,8 +281,6 @@ def test_repro_serve_with_watch_uses_headless_mode(
     daemon functionality here since it would require socket interactions.
     The error we get is from trying to run watch mode in test environment.
     """
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     register_test_stage(_helper_stage_a, name="stage_a")
 
     result = runner.invoke(cli.cli, ["repro", "--serve", "--watch"])
@@ -318,8 +298,6 @@ def test_repro_debounce_requires_watch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """repro --debounce without --watch errors."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     register_test_stage(_helper_stage_a, name="stage_a")
 
     result = runner.invoke(cli.cli, ["repro", "--debounce", "500"])
@@ -336,8 +314,6 @@ def test_repro_tui_log_cannot_use_with_json(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """repro --tui-log cannot be used with --json."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     register_test_stage(_helper_stage_a, name="stage_a")
 
     result = runner.invoke(cli.cli, ["repro", "--tui-log", "test.log", "--json"])
@@ -354,8 +330,6 @@ def test_repro_tui_log_cannot_use_with_dry_run(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """repro --tui-log cannot be used with --dry-run."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     register_test_stage(_helper_stage_a, name="stage_a")
 
     # Note: --tui is required for --tui-log, so we include it to test the --dry-run validation
@@ -373,8 +347,6 @@ def test_repro_unknown_stage_errors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """repro with unknown stage name errors with helpful message."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     register_test_stage(_helper_stage_a, name="stage_a")
 
     result = runner.invoke(cli.cli, ["repro", "nonexistent_stage"])
@@ -395,8 +367,6 @@ def test_repro_force_reruns_cached_stages(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """repro --force re-runs stages even if cached."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     register_test_stage(_helper_stage_a, name="stage_a")
 
     # First run
@@ -424,8 +394,6 @@ def test_repro_keep_going_option_accepted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """repro --keep-going option is accepted."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     register_test_stage(_helper_stage_a, name="stage_a")
 
     result = runner.invoke(cli.cli, ["repro", "--keep-going"])
@@ -447,8 +415,6 @@ def test_repro_does_not_have_single_stage_option(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """repro does not have --single-stage option."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     register_test_stage(_helper_stage_a, name="stage_a")
 
     result = runner.invoke(cli.cli, ["repro", "--single-stage"])
@@ -467,8 +433,7 @@ def test_repro_empty_pipeline_shows_message(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
     """repro with no stages shows appropriate message."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
+    with isolated_pivot_dir(runner, tmp_path):
         # Don't register any stages
         # Create minimal pivot.yaml with empty stages dict
         pathlib.Path("pivot.yaml").write_text("stages: {}\n")
@@ -492,8 +457,6 @@ def test_repro_json_output_streams_jsonl(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """repro --json streams JSONL output."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     register_test_stage(_helper_stage_a, name="stage_a")
 
     result = runner.invoke(cli.cli, ["repro", "--json"])
@@ -518,8 +481,6 @@ def test_repro_no_commit_option_accepted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """repro --no-commit option is accepted."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     register_test_stage(_helper_stage_a, name="stage_a")
 
     result = runner.invoke(cli.cli, ["repro", "--no-commit"])
@@ -534,8 +495,6 @@ def test_repro_no_cache_option_accepted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """repro --no-cache option is accepted."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     register_test_stage(_helper_stage_a, name="stage_a")
 
     result = runner.invoke(cli.cli, ["repro", "--no-cache"])

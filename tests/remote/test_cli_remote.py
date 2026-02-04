@@ -30,6 +30,7 @@ def test_push_no_files_to_push(
     """Push exits early when no files to push."""
 
     with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".pivot").mkdir()
         pathlib.Path(".git").mkdir()
         monkeypatch.setattr(project, "_project_root_cache", None)
 
@@ -57,6 +58,7 @@ def test_push_dry_run(
     """Push dry run shows what would be pushed."""
 
     with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".pivot").mkdir()
         pathlib.Path(".git").mkdir()
         monkeypatch.setattr(project, "_project_root_cache", None)
 
@@ -85,6 +87,7 @@ def test_push_success(
     """Push command transfers files and shows summary."""
 
     with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".pivot").mkdir()
         pathlib.Path(".git").mkdir()
         cache_dir = tmp_path / ".pivot" / "cache"
         cache_dir.mkdir(parents=True)
@@ -124,6 +127,7 @@ def test_push_with_errors(
     """Push command shows errors when transfers fail."""
 
     with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".pivot").mkdir()
         pathlib.Path(".git").mkdir()
         cache_dir = tmp_path / ".pivot" / "cache"
         cache_dir.mkdir(parents=True)
@@ -164,6 +168,7 @@ def test_push_with_targets(
     """Push with targets filters to those targets."""
 
     with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".pivot").mkdir()
         pathlib.Path(".git").mkdir()
         cache_dir = tmp_path / ".pivot" / "cache"
         state_dir = tmp_path / ".pivot"
@@ -208,6 +213,7 @@ def test_fetch_dry_run_with_targets(
 ) -> None:
     """Fetch dry run shows what would be fetched for targets."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".pivot").mkdir()
         pathlib.Path(".git").mkdir()
         monkeypatch.setattr(project, "_project_root_cache", None)
 
@@ -234,6 +240,7 @@ def test_fetch_dry_run_all(
 ) -> None:
     """Fetch dry run without stages lists all remote files."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".pivot").mkdir()
         pathlib.Path(".git").mkdir()
         monkeypatch.setattr(project, "_project_root_cache", None)
 
@@ -266,6 +273,7 @@ def test_fetch_success(
 ) -> None:
     """Fetch command downloads files to cache and shows summary."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".pivot").mkdir()
         pathlib.Path(".git").mkdir()
         cache_dir = tmp_path / ".pivot" / "cache"
         cache_dir.mkdir(parents=True)
@@ -302,6 +310,7 @@ def test_fetch_with_errors(
 ) -> None:
     """Fetch command shows errors when downloads fail."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".pivot").mkdir()
         pathlib.Path(".git").mkdir()
         cache_dir = tmp_path / ".pivot" / "cache"
         cache_dir.mkdir(parents=True)
@@ -343,6 +352,7 @@ def test_fetch_exception_shows_click_error(
 ) -> None:
     """Fetch exception is wrapped in ClickException with user-friendly message."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".pivot").mkdir()
         pathlib.Path(".git").mkdir()
         monkeypatch.setattr(project, "_project_root_cache", None)
 
@@ -372,6 +382,7 @@ def test_pull_dry_run_with_targets(
     """Pull dry run shows what would be pulled for targets."""
 
     with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".pivot").mkdir()
         pathlib.Path(".git").mkdir()
         monkeypatch.setattr(project, "_project_root_cache", None)
 
@@ -399,6 +410,7 @@ def test_pull_dry_run_all(
     """Pull dry run without stages lists all remote files."""
 
     with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".pivot").mkdir()
         pathlib.Path(".git").mkdir()
         monkeypatch.setattr(project, "_project_root_cache", None)
 
@@ -432,6 +444,7 @@ def test_pull_success(
     """Pull command downloads files and shows summary."""
 
     with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".pivot").mkdir()
         pathlib.Path(".git").mkdir()
         cache_dir = tmp_path / ".pivot" / "cache"
         cache_dir.mkdir(parents=True)
@@ -472,6 +485,7 @@ def test_pull_with_errors(
     """Pull command shows errors when downloads fail."""
 
     with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".pivot").mkdir()
         pathlib.Path(".git").mkdir()
         cache_dir = tmp_path / ".pivot" / "cache"
         cache_dir.mkdir(parents=True)
@@ -522,6 +536,7 @@ def test_pull_with_stages(
     """Pull with stage names downloads those stages."""
 
     with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".pivot").mkdir()
         pathlib.Path(".git").mkdir()
         cache_dir = tmp_path / ".pivot" / "cache"
         state_dir = tmp_path / ".pivot"
@@ -565,6 +580,7 @@ def test_push_exception_shows_click_error(
     """Push exception is wrapped in ClickException with user-friendly message."""
 
     with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".pivot").mkdir()
         pathlib.Path(".git").mkdir()
         monkeypatch.setattr(project, "_project_root_cache", None)
 
@@ -589,6 +605,7 @@ def test_pull_exception_shows_click_error(
     """Pull exception is wrapped in ClickException with user-friendly message."""
 
     with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".pivot").mkdir()
         pathlib.Path(".git").mkdir()
         monkeypatch.setattr(project, "_project_root_cache", None)
 
@@ -616,8 +633,8 @@ def test_remote_list_empty(
 ) -> None:
     """remote list shows no remotes when none configured."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
         pathlib.Path(".pivot").mkdir()
+        pathlib.Path(".git").mkdir()
         monkeypatch.setattr(project, "_project_root_cache", None)
 
         result = runner.invoke(cli.cli, ["remote", "list"])
@@ -633,8 +650,8 @@ def test_remote_list_shows_remotes(
 ) -> None:
     """remote list shows all configured remotes."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
         pathlib.Path(".pivot").mkdir()
+        pathlib.Path(".git").mkdir()
         monkeypatch.setattr(project, "_project_root_cache", None)
 
         # Use config set to add remotes (new CLI approach)
@@ -657,8 +674,8 @@ def test_remote_list_shows_default(
 ) -> None:
     """remote list marks default remote."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
         pathlib.Path(".pivot").mkdir()
+        pathlib.Path(".git").mkdir()
         monkeypatch.setattr(project, "_project_root_cache", None)
 
         # Use config set to add remote and set default
@@ -684,6 +701,7 @@ def test_push_quiet_mode_no_output(
 ) -> None:
     """Push with --quiet produces no output."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".pivot").mkdir()
         pathlib.Path(".git").mkdir()
         cache_dir = tmp_path / ".pivot" / "cache"
         cache_dir.mkdir(parents=True)
@@ -719,6 +737,7 @@ def test_fetch_quiet_mode_no_output(
 ) -> None:
     """Fetch with --quiet produces no output."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".pivot").mkdir()
         pathlib.Path(".git").mkdir()
         cache_dir = tmp_path / ".pivot" / "cache"
         cache_dir.mkdir(parents=True)

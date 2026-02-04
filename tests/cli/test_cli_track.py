@@ -13,7 +13,6 @@ if TYPE_CHECKING:
 
     from pivot.pipeline.pipeline import Pipeline
 
-
 # =============================================================================
 # Output TypedDicts for annotation-based stages
 # =============================================================================
@@ -99,8 +98,6 @@ def test_track_single_file(
 ) -> None:
     """Track one file creates .pvt file."""
     _ = mock_discovery
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
 
     data_file = tmp_path / "data.txt"
     data_file.write_text("tracked content")
@@ -130,8 +127,6 @@ def test_track_directory(
 ) -> None:
     """Track directory creates .pvt file with manifest."""
     _ = mock_discovery
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
 
     # Create directory with files
     data_dir = tmp_path / "data_dir"
@@ -163,8 +158,6 @@ def test_track_force_overwrites(
 ) -> None:
     """--force updates existing .pvt file."""
     _ = mock_discovery
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
 
     data_file = tmp_path / "data.txt"
     data_file.write_text("original content")
@@ -197,8 +190,6 @@ def test_track_already_tracked_suggests_force(
 ) -> None:
     """Already tracked error suggests --force."""
     _ = mock_discovery
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
 
     data_file = tmp_path / "data.txt"
     data_file.write_text("content")
@@ -226,8 +217,6 @@ def test_track_path_traversal_rejected(
 ) -> None:
     """Rejects paths with ../ components."""
     _ = mock_discovery
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
 
     result = runner.invoke(cli.cli, ["track", "../outside.txt"])
 
@@ -243,8 +232,6 @@ def test_track_broken_symlink_rejected(
 ) -> None:
     """Rejects broken symlinks with clear error message."""
     _ = mock_discovery
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
 
     # Create broken symlink
     broken_link = tmp_path / "broken_link"
@@ -264,8 +251,6 @@ def test_track_overlap_with_stage_output_rejected(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Rejects paths that overlap with declared stage outputs."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     (tmp_path / "input.txt").write_text("input")
 
     # Register a stage with output
@@ -294,8 +279,6 @@ def test_track_echoes_user_path_in_output(
 ) -> None:
     """Track echoes the path as user provided it."""
     _ = mock_discovery
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
 
     (tmp_path / "data.csv").write_text("a,b\n1,2")
 
@@ -316,8 +299,6 @@ def test_track_file_not_found_error(
 ) -> None:
     """Track nonexistent file shows clear error."""
     _ = mock_discovery
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
 
     result = runner.invoke(cli.cli, ["track", "nonexistent.txt"])
 
@@ -333,8 +314,6 @@ def test_track_multiple_files(
 ) -> None:
     """Track multiple files at once."""
     _ = mock_discovery
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
 
     (tmp_path / "file1.txt").write_text("content1")
     (tmp_path / "file2.txt").write_text("content2")
@@ -360,8 +339,6 @@ def test_track_symlink_to_stage_output_file_rejected(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Tracking symlink that points to stage output file is rejected."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
 
     # Create stage output file
     (tmp_path / "model.pkl").write_bytes(b"model")
@@ -389,8 +366,6 @@ def test_track_symlink_to_stage_output_directory_rejected(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Tracking symlink that points to stage output directory is rejected."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
 
     # Create stage output directory
     output_dir = tmp_path / "outputs"
@@ -417,8 +392,6 @@ def test_track_file_inside_symlinked_stage_output_rejected(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Tracking file inside symlinked directory that's a stage output is rejected."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
 
     # Create actual directory with files
     real_dir = tmp_path / "real_outputs"
@@ -447,8 +420,6 @@ def test_track_symlink_aliasing_same_file_different_paths(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Tracking same file via different symlink paths detects aliasing."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
 
     # Create real file
     (tmp_path / "real_data.csv").write_text("data")
@@ -474,8 +445,6 @@ def test_track_parent_directory_with_symlinked_stage_output(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Tracking parent directory when child is symlinked stage output is rejected."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
 
     # Create directory structure
     parent_dir = tmp_path / "data"
@@ -504,8 +473,6 @@ def test_track_with_normalized_vs_resolved_paths(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Error messages show both normalized and resolved paths for debugging."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
 
     # Create nested directory structure with symlink
     (tmp_path / "real").mkdir()

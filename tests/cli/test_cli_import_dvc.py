@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import contextlib
 import pathlib
 import shutil
 from typing import TYPE_CHECKING
@@ -8,7 +7,7 @@ from typing import TYPE_CHECKING
 import pytest
 import yaml
 
-from pivot import cli
+from pivot import cli, project
 
 if TYPE_CHECKING:
     from click.testing import CliRunner
@@ -17,10 +16,11 @@ FIXTURES_DIR = pathlib.Path(__file__).parent.parent / "fixtures" / "dvc_import"
 
 
 @pytest.fixture
-def dvc_project(tmp_path: pathlib.Path) -> pathlib.Path:
+def dvc_project(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> pathlib.Path:
     """Create minimal project structure for DVC import tests."""
-    (tmp_path / ".git").mkdir()
     (tmp_path / ".pivot").mkdir()
+    monkeypatch.chdir(tmp_path)
+    project._project_root_cache = None
     return tmp_path
 
 
@@ -46,12 +46,11 @@ def test_import_dvc_creates_pivot_yaml(
     """import-dvc creates pivot.yaml from dvc.yaml."""
     shutil.copy(FIXTURES_DIR / "simple" / "dvc.yaml", dvc_project / "dvc.yaml")
 
-    with contextlib.chdir(dvc_project):
-        result = runner.invoke(cli.cli, ["import-dvc"])
+    result = runner.invoke(cli.cli, ["import-dvc"])
 
-        assert result.exit_code == 0, f"Failed: {result.output}"
-        assert (dvc_project / "pivot.yaml").exists()
-        assert "Converted 2 stages" in result.output
+    assert result.exit_code == 0, f"Failed: {result.output}"
+    assert (dvc_project / "pivot.yaml").exists()
+    assert "Converted 2 stages" in result.output
 
 
 def test_import_dvc_with_explicit_input(
@@ -61,11 +60,10 @@ def test_import_dvc_with_explicit_input(
     """import-dvc with --input flag reads specified file."""
     src = FIXTURES_DIR / "simple" / "dvc.yaml"
 
-    with contextlib.chdir(dvc_project):
-        result = runner.invoke(cli.cli, ["import-dvc", "--input", str(src)])
+    result = runner.invoke(cli.cli, ["import-dvc", "--input", str(src)])
 
-        assert result.exit_code == 0, f"Failed: {result.output}"
-        assert (dvc_project / "pivot.yaml").exists()
+    assert result.exit_code == 0, f"Failed: {result.output}"
+    assert (dvc_project / "pivot.yaml").exists()
 
 
 def test_import_dvc_custom_output_path(
@@ -75,12 +73,11 @@ def test_import_dvc_custom_output_path(
     """import-dvc with --output writes to specified path."""
     shutil.copy(FIXTURES_DIR / "simple" / "dvc.yaml", dvc_project / "dvc.yaml")
 
-    with contextlib.chdir(dvc_project):
-        result = runner.invoke(cli.cli, ["import-dvc", "--output", "custom.yaml"])
+    result = runner.invoke(cli.cli, ["import-dvc", "--output", "custom.yaml"])
 
-        assert result.exit_code == 0, f"Failed: {result.output}"
-        assert (dvc_project / "custom.yaml").exists()
-        assert not (dvc_project / "pivot.yaml").exists()
+    assert result.exit_code == 0, f"Failed: {result.output}"
+    assert (dvc_project / "custom.yaml").exists()
+    assert not (dvc_project / "pivot.yaml").exists()
 
 
 def test_import_dvc_generates_migration_notes(
@@ -90,14 +87,13 @@ def test_import_dvc_generates_migration_notes(
     """import-dvc creates migration notes file."""
     shutil.copy(FIXTURES_DIR / "simple" / "dvc.yaml", dvc_project / "dvc.yaml")
 
-    with contextlib.chdir(dvc_project):
-        result = runner.invoke(cli.cli, ["import-dvc"])
+    result = runner.invoke(cli.cli, ["import-dvc"])
 
-        assert result.exit_code == 0, f"Failed: {result.output}"
-        notes_path = dvc_project / ".pivot" / "migration-notes.md"
-        assert notes_path.exists()
-        content = notes_path.read_text()
-        assert "DVC to Pivot Migration Notes" in content
+    assert result.exit_code == 0, f"Failed: {result.output}"
+    notes_path = dvc_project / ".pivot" / "migration-notes.md"
+    assert notes_path.exists()
+    content = notes_path.read_text()
+    assert "DVC to Pivot Migration Notes" in content
 
 
 # =============================================================================
@@ -113,11 +109,10 @@ def test_import_dvc_refuses_overwrite_without_force(
     shutil.copy(FIXTURES_DIR / "simple" / "dvc.yaml", dvc_project / "dvc.yaml")
     (dvc_project / "pivot.yaml").write_text("existing content")
 
-    with contextlib.chdir(dvc_project):
-        result = runner.invoke(cli.cli, ["import-dvc"])
+    result = runner.invoke(cli.cli, ["import-dvc"])
 
-        assert result.exit_code != 0
-        assert "already exists" in result.output
+    assert result.exit_code != 0
+    assert "already exists" in result.output
 
 
 def test_import_dvc_force_overwrites(
@@ -128,14 +123,13 @@ def test_import_dvc_force_overwrites(
     shutil.copy(FIXTURES_DIR / "simple" / "dvc.yaml", dvc_project / "dvc.yaml")
     (dvc_project / "pivot.yaml").write_text("old content")
 
-    with contextlib.chdir(dvc_project):
-        result = runner.invoke(cli.cli, ["import-dvc", "--force"])
+    result = runner.invoke(cli.cli, ["import-dvc", "--force"])
 
-        assert result.exit_code == 0, f"Failed: {result.output}"
+    assert result.exit_code == 0, f"Failed: {result.output}"
 
-        content = (dvc_project / "pivot.yaml").read_text()
-        assert "old content" not in content
-        assert "stages:" in content
+    content = (dvc_project / "pivot.yaml").read_text()
+    assert "old content" not in content
+    assert "stages:" in content
 
 
 # =============================================================================
@@ -150,13 +144,12 @@ def test_import_dvc_dry_run_no_files_created(
     """import-dvc --dry-run shows output without creating files."""
     shutil.copy(FIXTURES_DIR / "simple" / "dvc.yaml", dvc_project / "dvc.yaml")
 
-    with contextlib.chdir(dvc_project):
-        result = runner.invoke(cli.cli, ["import-dvc", "--dry-run"])
+    result = runner.invoke(cli.cli, ["import-dvc", "--dry-run"])
 
-        assert result.exit_code == 0, f"Failed: {result.output}"
-        assert "Dry run" in result.output
-        assert not (dvc_project / "pivot.yaml").exists()
-        assert not (dvc_project / ".pivot" / "migration-notes.md").exists()
+    assert result.exit_code == 0, f"Failed: {result.output}"
+    assert "Dry run" in result.output
+    assert not (dvc_project / "pivot.yaml").exists()
+    assert not (dvc_project / ".pivot" / "migration-notes.md").exists()
 
 
 # =============================================================================
@@ -172,32 +165,33 @@ def test_import_dvc_auto_detects_files(
     shutil.copy(FIXTURES_DIR / "with_params" / "dvc.yaml", dvc_project / "dvc.yaml")
     shutil.copy(FIXTURES_DIR / "with_params" / "params.yaml", dvc_project / "params.yaml")
 
-    with contextlib.chdir(dvc_project):
-        result = runner.invoke(cli.cli, ["import-dvc"])
+    result = runner.invoke(cli.cli, ["import-dvc"])
 
-        assert result.exit_code == 0, f"Failed: {result.output}"
-        assert "params.yaml" in result.output
+    assert result.exit_code == 0, f"Failed: {result.output}"
+    assert "params.yaml" in result.output
 
-        # Check params were inlined
-        with open(dvc_project / "pivot.yaml") as f:
-            pivot_yaml = yaml.safe_load(f)
+    # Check params were inlined
+    with open(dvc_project / "pivot.yaml") as f:
+        pivot_yaml = yaml.safe_load(f)
 
-        train_params = pivot_yaml["stages"]["train"].get("params", {})
-        assert train_params.get("learning_rate") == 0.01
+    train_params = pivot_yaml["stages"]["train"].get("params", {})
+    assert train_params.get("learning_rate") == 0.01
 
 
 def test_import_dvc_no_dvc_yaml_error(
     runner: CliRunner,
     tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """import-dvc without dvc.yaml shows error."""
-    (tmp_path / ".git").mkdir()
+    (tmp_path / ".pivot").mkdir()
+    monkeypatch.chdir(tmp_path)
+    project._project_root_cache = None
 
-    with contextlib.chdir(tmp_path):
-        result = runner.invoke(cli.cli, ["import-dvc"])
+    result = runner.invoke(cli.cli, ["import-dvc"])
 
-        assert result.exit_code != 0
-        assert "No dvc.yaml found" in result.output
+    assert result.exit_code != 0
+    assert "No dvc.yaml found" in result.output
 
 
 # =============================================================================
@@ -212,24 +206,23 @@ def test_import_dvc_generated_yaml_has_stages(
     """Generated pivot.yaml has correct stage structure."""
     shutil.copy(FIXTURES_DIR / "simple" / "dvc.yaml", dvc_project / "dvc.yaml")
 
-    with contextlib.chdir(dvc_project):
-        result = runner.invoke(cli.cli, ["import-dvc"])
+    result = runner.invoke(cli.cli, ["import-dvc"])
 
-        assert result.exit_code == 0, f"Failed: {result.output}"
+    assert result.exit_code == 0, f"Failed: {result.output}"
 
-        with open(dvc_project / "pivot.yaml") as f:
-            pivot_yaml = yaml.safe_load(f)
+    with open(dvc_project / "pivot.yaml") as f:
+        pivot_yaml = yaml.safe_load(f)
 
-        assert "stages" in pivot_yaml
-        assert "preprocess" in pivot_yaml["stages"]
-        assert "train" in pivot_yaml["stages"]
+    assert "stages" in pivot_yaml
+    assert "preprocess" in pivot_yaml["stages"]
+    assert "train" in pivot_yaml["stages"]
 
-        # Check stage has required fields
-        preprocess = pivot_yaml["stages"]["preprocess"]
-        assert "python" in preprocess
-        assert preprocess["python"] == "PLACEHOLDER.preprocess"
-        assert "deps" in preprocess
-        assert "data/raw.csv" in preprocess["deps"]
+    # Check stage has required fields
+    preprocess = pivot_yaml["stages"]["preprocess"]
+    assert "python" in preprocess
+    assert preprocess["python"] == "PLACEHOLDER.preprocess"
+    assert "deps" in preprocess
+    assert "data/raw.csv" in preprocess["deps"]
 
 
 def test_import_dvc_quiet_mode(
@@ -239,12 +232,11 @@ def test_import_dvc_quiet_mode(
     """import-dvc with --quiet suppresses output."""
     shutil.copy(FIXTURES_DIR / "simple" / "dvc.yaml", dvc_project / "dvc.yaml")
 
-    with contextlib.chdir(dvc_project):
-        result = runner.invoke(cli.cli, ["--quiet", "import-dvc"])
+    result = runner.invoke(cli.cli, ["--quiet", "import-dvc"])
 
-        assert result.exit_code == 0, f"Failed: {result.output}"
-        assert result.output.strip() == ""
-        assert (dvc_project / "pivot.yaml").exists()
+    assert result.exit_code == 0, f"Failed: {result.output}"
+    assert result.output.strip() == ""
+    assert (dvc_project / "pivot.yaml").exists()
 
 
 # =============================================================================
@@ -255,14 +247,15 @@ def test_import_dvc_quiet_mode(
 def test_import_dvc_output_path_validation(
     runner: CliRunner,
     tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """import-dvc validates output path stays within project."""
+    (tmp_path / ".pivot").mkdir()
     shutil.copy(FIXTURES_DIR / "simple" / "dvc.yaml", tmp_path / "dvc.yaml")
+    monkeypatch.chdir(tmp_path)
+    project._project_root_cache = None
 
-    (tmp_path / ".git").mkdir()
+    result = runner.invoke(cli.cli, ["import-dvc", "--output", "/etc/pivot.yaml"])
 
-    with contextlib.chdir(tmp_path):
-        result = runner.invoke(cli.cli, ["import-dvc", "--output", "/etc/pivot.yaml"])
-
-        assert result.exit_code != 0
-        # Should fail path validation
+    assert result.exit_code != 0
+    # Should fail path validation

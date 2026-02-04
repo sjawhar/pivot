@@ -3,45 +3,147 @@ from pathlib import Path
 
 import pytest
 
-from pivot import project
+from pivot import exceptions, project
 
 # --- Tests for find_project_root() ---
 
 
 @pytest.mark.parametrize(
-    ("directories", "work_dir", "expected_root"),
+    ("directories", "work_dir", "expected_root_subpath", "expect_error"),
     [
-        pytest.param([".git"], ".", None, id="git_at_root"),
-        pytest.param([".pivot"], ".", None, id="pivot_at_root"),
-        pytest.param([".git", "src/pivot/nested"], "src/pivot/nested", None, id="git_from_subdir"),
+        pytest.param([".pivot"], ".", "", False, id="pivot_at_root"),
+        pytest.param([".pivot", "src/nested"], "src/nested", "", False, id="pivot_from_subdir"),
         pytest.param(
-            [".pivot", "src/pivot/nested"], "src/pivot/nested", None, id="pivot_from_subdir"
+            [".pivot", "src/very/deeply/nested/dir"],
+            "src/very/deeply/nested/dir",
+            "",
+            False,
+            id="pivot_from_deeply_nested_subdir",
         ),
-        pytest.param([".git", "subproject/.pivot"], "subproject", "subproject", id="closer_marker"),
-        pytest.param([".git", ".pivot"], ".", None, id="both_markers"),
-        pytest.param(["no_markers"], "no_markers", "no_markers", id="no_markers_fallback"),
-        pytest.param([".git", "inner/.git"], "inner", "inner", id="nested_repos"),
+        pytest.param([".pivot", "child/.pivot"], "child", "", False, id="topmost_over_nearest"),
+        pytest.param(
+            [".pivot", "mid/.pivot", "mid/deep/.pivot"],
+            "mid/deep",
+            "",
+            False,
+            id="topmost_over_nearest_and_mid",
+        ),
+        pytest.param(
+            ["outer/.pivot", "outer/inner/.pivot"],
+            "outer/inner",
+            "outer",
+            False,
+            id="nested_pivot_returns_outer",
+        ),
+        pytest.param([".git"], ".", "", True, id="git_only_raises"),
+        pytest.param(["no_markers"], "no_markers", "", True, id="no_markers_raises"),
     ],
 )
 def test_find_project_root(
-    tmp_path: Path, directories: list[str], work_dir: str, expected_root: str | None
+    tmp_path: Path,
+    directories: list[str],
+    work_dir: str,
+    expected_root_subpath: str,
+    expect_error: bool,
 ) -> None:
-    """Should find project root by walking up to marker directory."""
+    """Should find project root by walking up to top-most .pivot directory."""
     for directory in directories:
         (tmp_path / directory).mkdir(parents=True, exist_ok=True)
 
     with contextlib.chdir(tmp_path / work_dir):
+        if expect_error:
+            with pytest.raises(exceptions.ProjectNotInitializedError):
+                project.find_project_root()
+        else:
+            root = project.find_project_root()
+            expected = tmp_path if not expected_root_subpath else tmp_path / expected_root_subpath
+            assert root == expected, f"Expected {expected}, got {root}"
+
+
+def test_find_project_root_ignores_pivot_file(tmp_path: Path) -> None:
+    """Should ignore .pivot that is a file, not a directory."""
+    (tmp_path / ".pivot").write_text("not a directory")
+    subdir = tmp_path / "project"
+    subdir.mkdir()
+    (subdir / ".pivot").mkdir()
+
+    with contextlib.chdir(subdir):
         root = project.find_project_root()
-        expected = tmp_path if expected_root is None else tmp_path / expected_root
-        assert root == expected
+        assert root == subdir, "Should use .pivot directory, not file"
 
 
-def test_find_git_root_at_filesystem_root(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Should handle reaching filesystem root without finding .git."""
-    monkeypatch.setattr(Path, "cwd", lambda: Path("/"))
+def test_find_project_root_follows_pivot_symlink(tmp_path: Path) -> None:
+    """Should recognize .pivot even when it's a symlink to a directory."""
+    real_pivot = tmp_path / ".real_pivot"
+    real_pivot.mkdir()
+    pivot_symlink = tmp_path / ".pivot"
+    pivot_symlink.symlink_to(real_pivot)
 
-    root = project.find_project_root()
-    assert root == Path("/"), "Should return root (fallback to cwd)"
+    # Verify precondition: symlink exists and points to directory
+    assert pivot_symlink.is_symlink(), "Test setup: .pivot should be a symlink"
+    assert pivot_symlink.is_dir(), "Test setup: .pivot symlink should point to directory"
+
+    with contextlib.chdir(tmp_path):
+        root = project.find_project_root()
+        assert root == tmp_path
+
+
+def test_find_project_root_ignores_broken_symlink(tmp_path: Path) -> None:
+    """Should ignore .pivot that is a broken/dangling symlink."""
+    # Create broken symlink at root
+    broken_symlink = tmp_path / ".pivot"
+    broken_symlink.symlink_to(tmp_path / "nonexistent_target")
+
+    # Verify precondition: symlink is broken
+    assert broken_symlink.is_symlink(), "Test setup: .pivot should be a symlink"
+    assert not broken_symlink.is_dir(), "Test setup: broken symlink should not be a directory"
+
+    # Create valid .pivot in subdirectory
+    subdir = tmp_path / "project"
+    subdir.mkdir()
+    (subdir / ".pivot").mkdir()
+
+    with contextlib.chdir(subdir):
+        root = project.find_project_root()
+        assert root == subdir, "Should use valid .pivot directory, not broken symlink"
+
+
+def test_find_project_root_raises_for_only_broken_symlink(tmp_path: Path) -> None:
+    """Should raise error when only .pivot is a broken symlink."""
+    broken_symlink = tmp_path / ".pivot"
+    broken_symlink.symlink_to(tmp_path / "nonexistent_target")
+
+    with contextlib.chdir(tmp_path), pytest.raises(exceptions.ProjectNotInitializedError):
+        project.find_project_root()
+
+
+def test_find_project_root_at_filesystem_root(tmp_path: Path) -> None:
+    """Should raise error when no .pivot exists in directory hierarchy."""
+    # Create a directory without .pivot anywhere above it
+    # tmp_path itself won't have .pivot, and we don't create one
+    no_pivot_dir = tmp_path / "no_pivot_here"
+    no_pivot_dir.mkdir()
+
+    with contextlib.chdir(no_pivot_dir):
+        with pytest.raises(exceptions.ProjectNotInitializedError) as exc_info:
+            project.find_project_root()
+
+        # Verify error message is helpful
+        assert "No .pivot directory found" in str(exc_info.value)
+        assert "pivot init" in str(exc_info.value)
+
+
+def test_find_project_root_error_message_includes_cwd(tmp_path: Path) -> None:
+    """Error message should include the current directory for context."""
+    no_pivot_dir = tmp_path / "my_project"
+    no_pivot_dir.mkdir()
+
+    with contextlib.chdir(no_pivot_dir):
+        with pytest.raises(exceptions.ProjectNotInitializedError) as exc_info:
+            project.find_project_root()
+
+        # Error should mention the directory searched from
+        assert str(no_pivot_dir) in str(exc_info.value)
 
 
 # --- Tests for get_project_root() caching ---
@@ -49,8 +151,7 @@ def test_find_git_root_at_filesystem_root(monkeypatch: pytest.MonkeyPatch) -> No
 
 def test_get_project_root_caches_result(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Should cache result after first call."""
-    git_dir = tmp_path / ".git"
-    git_dir.mkdir()
+    (tmp_path / ".pivot").mkdir()
 
     with contextlib.chdir(tmp_path):
         monkeypatch.setattr(project, "_project_root_cache", None)
@@ -67,8 +168,7 @@ def test_get_project_root_respects_cached_value(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Should return cached value even if cwd changes."""
-    git_dir = tmp_path / ".git"
-    git_dir.mkdir()
+    (tmp_path / ".pivot").mkdir()
 
     subdir = tmp_path / "subdir"
     subdir.mkdir()
@@ -100,8 +200,7 @@ def test_resolve_relative_paths(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, input_path: str, expected_relative: str
 ) -> None:
     """Should resolve paths relative to project root, not cwd."""
-    git_dir = tmp_path / ".git"
-    git_dir.mkdir()
+    (tmp_path / ".pivot").mkdir()
 
     # Work from subdirectory to prove resolution is from project root
     subdir = tmp_path / "src" / "pivot"
@@ -117,8 +216,7 @@ def test_resolve_relative_paths(
 
 def test_resolve_absolute_path_unchanged(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Should return absolute paths unchanged (already absolute)."""
-    git_dir = tmp_path / ".git"
-    git_dir.mkdir()
+    (tmp_path / ".pivot").mkdir()
 
     with contextlib.chdir(tmp_path):
         monkeypatch.setattr(project, "_project_root_cache", None)
@@ -133,8 +231,7 @@ def test_resolve_absolute_path_unchanged(tmp_path: Path, monkeypatch: pytest.Mon
 
 def test_normalize_path_preserves_symlinks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Should preserve symlinks in path (not resolve to real path)."""
-    git_dir = tmp_path / ".git"
-    git_dir.mkdir()
+    (tmp_path / ".pivot").mkdir()
 
     # Create real directory and symlink to it
     real_dir = tmp_path / "real_data"
@@ -164,8 +261,7 @@ def test_normalize_path_allows_outside_project(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Should allow paths outside project root (caller validates if needed)."""
-    git_dir = tmp_path / ".git"
-    git_dir.mkdir()
+    (tmp_path / ".pivot").mkdir()
 
     # Create symlink pointing outside project
     outside_dir = tmp_path.parent / "outside_project"
@@ -185,8 +281,7 @@ def test_normalize_path_handles_absolute_paths(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Should handle absolute paths correctly."""
-    git_dir = tmp_path / ".git"
-    git_dir.mkdir()
+    (tmp_path / ".pivot").mkdir()
 
     # Create symlink with absolute path
     real_dir = tmp_path / "real_data"
@@ -205,8 +300,7 @@ def test_normalize_path_handles_absolute_paths(
 
 def test_normalize_path_from_subdirectory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Should resolve paths relative to project root, not cwd."""
-    git_dir = tmp_path / ".git"
-    git_dir.mkdir()
+    (tmp_path / ".pivot").mkdir()
 
     # Create symlink at project root
     real_dir = tmp_path / "real_data"
@@ -314,8 +408,7 @@ def test_resolve_path_for_comparison_existing_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Should resolve existing file normally."""
-    git_dir = tmp_path / ".git"
-    git_dir.mkdir()
+    (tmp_path / ".pivot").mkdir()
     test_file = tmp_path / "data.csv"
     test_file.write_text("test")
 
@@ -329,8 +422,7 @@ def test_resolve_path_for_comparison_missing_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Should resolve missing files without raising (Path.resolve() doesn't raise)."""
-    git_dir = tmp_path / ".git"
-    git_dir.mkdir()
+    (tmp_path / ".pivot").mkdir()
 
     with contextlib.chdir(tmp_path):
         monkeypatch.setattr(project, "_project_root_cache", None)

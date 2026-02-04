@@ -15,7 +15,6 @@ if TYPE_CHECKING:
 
     from pivot.pipeline.pipeline import Pipeline
 
-
 # =============================================================================
 # plots group Tests
 # =============================================================================
@@ -54,10 +53,9 @@ def test_plots_show_no_plots(
 ) -> None:
     """plots show with no registered plots should report empty."""
     _ = mock_discovery
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        result = runner.invoke(cli.cli, ["plots", "show"])
-        assert result.exit_code == 0
-        assert "No plots found" in result.output
+    result = runner.invoke(cli.cli, ["plots", "show"])
+    assert result.exit_code == 0
+    assert "No plots found" in result.output
 
 
 def test_plots_show_explicit_file_no_stages(
@@ -68,8 +66,6 @@ def test_plots_show_explicit_file_no_stages(
 ) -> None:
     """Issue #62: plots show TARGET should work with explicit file when no stages registered."""
     _ = mock_discovery
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     # Create a plot file
     plot_file = tmp_path / "results.png"
     plot_file.write_bytes(b"fake png data")
@@ -90,7 +86,6 @@ def test_plots_show_creates_html(
 ) -> None:
     """plots show creates HTML output file with explicit file target."""
     _ = mock_discovery
-    monkeypatch.chdir(tmp_path)
     plot_file = tmp_path / "plot.png"
     plot_file.write_bytes(b"fake png data")
 
@@ -107,7 +102,6 @@ def test_plots_show_custom_output_path(
 ) -> None:
     """plots show with custom output path."""
     _ = mock_discovery
-    monkeypatch.chdir(tmp_path)
     plot_file = tmp_path / "plot.png"
     plot_file.write_bytes(b"fake png data")
 
@@ -135,10 +129,9 @@ def test_plots_diff_no_plots(
 ) -> None:
     """plots diff with no registered plots should report empty."""
     _ = mock_discovery
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        result = runner.invoke(cli.cli, ["plots", "diff"])
-        assert result.exit_code == 0
-        assert "No plots found" in result.output
+    result = runner.invoke(cli.cli, ["plots", "diff"])
+    assert result.exit_code == 0
+    assert "No plots found" in result.output
 
 
 def test_plots_diff_explicit_file_no_stages(
@@ -149,7 +142,6 @@ def test_plots_diff_explicit_file_no_stages(
 ) -> None:
     """Issue #62: plots diff TARGET should work with explicit file when no stages registered."""
     _ = mock_discovery
-    monkeypatch.chdir(tmp_path)
     init_git_repo(tmp_path, monkeypatch)
     # Create a plot file
     plot_file = tmp_path / "results.png"

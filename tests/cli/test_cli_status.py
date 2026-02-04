@@ -4,6 +4,7 @@ import json
 import pathlib
 from typing import TYPE_CHECKING, Annotated, TypedDict
 
+from conftest import isolated_pivot_dir
 from helpers import create_pipeline_py, get_test_pipeline, register_test_stage
 from pivot import cli, loaders, outputs
 from pivot import status as status_mod
@@ -16,7 +17,6 @@ if TYPE_CHECKING:
     from pytest_mock import MockerFixture
 
     from pivot.pipeline.pipeline import Pipeline
-
 
 # =============================================================================
 # Module-level TypedDicts and Stage Functions for annotation-based registration
@@ -71,9 +71,7 @@ def test_status_help(runner: click.testing.CliRunner) -> None:
 
 def test_status_no_stages(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
     """Status with no stages shows appropriate message."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-
+    with isolated_pivot_dir(runner, tmp_path):
         # Create empty pipeline
         pathlib.Path("pipeline.py").write_text("""\
 from __future__ import annotations
@@ -135,8 +133,7 @@ def _helper_process_v2(
 
 def test_status_shows_stale_stages(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
     """Status shows stale stages."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
+    with isolated_pivot_dir(runner, tmp_path):
         pathlib.Path("input.txt").write_text("data")
 
         create_pipeline_py(
@@ -157,8 +154,7 @@ def test_status_shows_cached_stages(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
     """Status shows cached stages after run."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
+    with isolated_pivot_dir(runner, tmp_path):
         pathlib.Path("input.txt").write_text("data")
 
         create_pipeline_py(
@@ -180,8 +176,7 @@ def test_status_verbose_shows_all_stages(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
     """Verbose status shows all stages including cached."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
+    with isolated_pivot_dir(runner, tmp_path):
         pathlib.Path("input.txt").write_text("data")
 
         create_pipeline_py(
@@ -201,8 +196,7 @@ def test_status_verbose_shows_all_stages(
 
 def test_status_specific_stages(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
     """Status with stage argument filters to specific stage."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
+    with isolated_pivot_dir(runner, tmp_path):
         pathlib.Path("input.txt").write_text("data")
 
         create_pipeline_py(
@@ -221,9 +215,7 @@ def test_status_unknown_stage_errors(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
     """Status with unknown stage shows error."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-
+    with isolated_pivot_dir(runner, tmp_path):
         # Create empty pipeline
         pathlib.Path("pipeline.py").write_text("""\
 from __future__ import annotations
@@ -247,9 +239,7 @@ def test_status_shows_tracked_files(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
     """Status shows tracked files section with verbose."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-
+    with isolated_pivot_dir(runner, tmp_path):
         # Create empty pipeline
         pathlib.Path("pipeline.py").write_text("""\
 from __future__ import annotations
@@ -277,9 +267,7 @@ def test_status_shows_modified_tracked_files(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
     """Status shows modified tracked files."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-
+    with isolated_pivot_dir(runner, tmp_path):
         # Create empty pipeline
         pathlib.Path("pipeline.py").write_text("""\
 from __future__ import annotations
@@ -310,8 +298,7 @@ pipeline = Pipeline('test')
 
 def test_status_stages_only(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
     """--stages-only shows only pipeline status."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
+    with isolated_pivot_dir(runner, tmp_path):
         pathlib.Path("input.txt").write_text("data")
 
         data_file = pathlib.Path("data.txt")
@@ -336,8 +323,7 @@ def test_status_stages_only(runner: click.testing.CliRunner, tmp_path: pathlib.P
 
 def test_status_tracked_only(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
     """--tracked-only shows only tracked files."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
+    with isolated_pivot_dir(runner, tmp_path):
         pathlib.Path("input.txt").write_text("data")
 
         data_file = pathlib.Path("data.txt")
@@ -364,9 +350,7 @@ def test_status_remote_only_no_remotes(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
     """--remote-only without configured remotes shows error."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-
+    with isolated_pivot_dir(runner, tmp_path):
         result = runner.invoke(cli.cli, ["status", "--remote-only"])
 
         assert result.exit_code != 0
@@ -382,37 +366,33 @@ def test_status_json_output(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path, mock_discovery: Pipeline
 ) -> None:
     """--json outputs valid JSON."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        pathlib.Path("input.txt").write_text("data")
+    pathlib.Path("input.txt").write_text("data")
 
-        register_test_stage(_helper_process, name="process")
+    register_test_stage(_helper_process, name="process")
 
-        result = runner.invoke(cli.cli, ["status", "--json"])
+    result = runner.invoke(cli.cli, ["status", "--json"])
 
-        assert result.exit_code == 0
-        data = json.loads(result.output)
-        assert "stages" in data
-        assert len(data["stages"]) == 1
-        assert data["stages"][0]["name"] == "process"
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert "stages" in data
+    assert len(data["stages"]) == 1
+    assert data["stages"][0]["name"] == "process"
 
 
 def test_status_json_includes_suggestions(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path, mock_discovery: Pipeline
 ) -> None:
     """--json includes suggestions when applicable."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        pathlib.Path("input.txt").write_text("data")
+    pathlib.Path("input.txt").write_text("data")
 
-        register_test_stage(_helper_process, name="process")
+    register_test_stage(_helper_process, name="process")
 
-        result = runner.invoke(cli.cli, ["status", "--json"])
+    result = runner.invoke(cli.cli, ["status", "--json"])
 
-        assert result.exit_code == 0
-        data = json.loads(result.output)
-        assert "suggestions" in data
-        assert any("pivot run" in s for s in data["suggestions"])
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert "suggestions" in data
+    assert any("pivot run" in s for s in data["suggestions"])
 
 
 # =============================================================================
@@ -424,17 +404,15 @@ def test_status_shows_suggestions(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path, mock_discovery: Pipeline
 ) -> None:
     """Status shows actionable suggestions."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        pathlib.Path("input.txt").write_text("data")
+    pathlib.Path("input.txt").write_text("data")
 
-        register_test_stage(_helper_process, name="process")
+    register_test_stage(_helper_process, name="process")
 
-        result = runner.invoke(cli.cli, ["status"])
+    result = runner.invoke(cli.cli, ["status"])
 
-        assert result.exit_code == 0
-        assert "Suggestions" in result.output
-        assert "pivot run" in result.output
+    assert result.exit_code == 0
+    assert "Suggestions" in result.output
+    assert "pivot run" in result.output
 
 
 # =============================================================================
@@ -446,9 +424,7 @@ def test_status_tracked_only_no_files(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
     """--tracked-only with no tracked files shows explicit message."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-
+    with isolated_pivot_dir(runner, tmp_path):
         result = runner.invoke(cli.cli, ["status", "--tracked-only"])
 
         assert result.exit_code == 0
@@ -461,8 +437,6 @@ def test_status_stages_only_no_stages(
 ) -> None:
     """--stages-only with no stages shows explicit message."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-
         result = runner.invoke(cli.cli, ["status", "--stages-only"])
 
         assert result.exit_code == 0
@@ -475,8 +449,6 @@ def test_status_json_includes_empty_arrays(
 ) -> None:
     """--json includes empty arrays for requested sections."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-
         result = runner.invoke(cli.cli, ["status", "--json"])
 
         assert result.exit_code == 0
@@ -492,8 +464,6 @@ def test_status_json_stages_only_empty(
 ) -> None:
     """--json --stages-only includes empty stages array."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-
         result = runner.invoke(cli.cli, ["status", "--json", "--stages-only"])
 
         assert result.exit_code == 0
@@ -510,13 +480,9 @@ def test_status_json_stages_only_empty(
 
 def test_status_quiet_no_output_when_clean(
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
     mock_discovery: Pipeline,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """pivot --quiet status produces no output when all stages are cached."""
-    monkeypatch.chdir(tmp_path)
-    pathlib.Path(".git").mkdir()
     pathlib.Path("input.txt").write_text("data")
 
     register_test_stage(_helper_process, name="process")
@@ -535,7 +501,6 @@ def test_status_quiet_exits_1_when_stale(
 ) -> None:
     """pivot --quiet status exits 1 when stages are stale."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
 
         register_test_stage(_helper_process, name="process")
@@ -552,7 +517,6 @@ def test_status_quiet_exits_1_when_modified(
 ) -> None:
     """pivot --quiet status exits 1 when files are modified."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
 
         register_test_stage(_helper_process, name="process")
@@ -583,8 +547,6 @@ def test_status_remote_with_configured_remote(
 ) -> None:
     """--remote shows sync status when remote is configured."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-
         # Mock the remote status function
         mock_remote_status = RemoteSyncInfo(
             name="default",
@@ -612,7 +574,6 @@ def test_status_remote_only_with_remote(
 ) -> None:
     """--remote-only shows only remote sync counts."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
 
         register_test_stage(_helper_process, name="process")
@@ -644,8 +605,6 @@ def test_status_json_with_remote(
 ) -> None:
     """JSON output includes remote status when --remote is used."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-
         mock_remote_status = RemoteSyncInfo(
             name="default",
             url="s3://bucket/cache",
@@ -684,7 +643,6 @@ def test_status_explain_shows_detailed_output(
 ) -> None:
     """--explain shows detailed change information."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
 
         register_test_stage(_helper_process, name="process")
@@ -699,13 +657,9 @@ def test_status_explain_shows_detailed_output(
 
 def test_status_explain_shows_code_changes(
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
     mock_discovery: Pipeline,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """--explain shows code changes when code differs."""
-    monkeypatch.chdir(tmp_path)
-    pathlib.Path(".git").mkdir()
     pathlib.Path("input.txt").write_text("data")
 
     register_test_stage(_helper_process_v1, name="process")
@@ -727,7 +681,6 @@ def test_status_explain_short_flag(
 ) -> None:
     """-e short flag works like --explain."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
 
         register_test_stage(_helper_process, name="process")
@@ -743,7 +696,6 @@ def test_status_explain_json_format(
 ) -> None:
     """--explain --json returns extended format with change arrays."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
 
         register_test_stage(_helper_process, name="process")
@@ -765,7 +717,6 @@ def test_status_json_without_explain_no_changes(
 ) -> None:
     """--json without --explain does NOT include change arrays."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
 
         register_test_stage(_helper_process, name="process")
@@ -822,8 +773,6 @@ def test_status_upstream_propagation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Status shows B as stale when upstream A is stale."""
-    monkeypatch.chdir(tmp_path)
-    pathlib.Path(".git").mkdir()
     pathlib.Path("input.txt").write_text("data")
 
     register_test_stage(_upstream_stage_a_v1, name="stage_a")
@@ -854,8 +803,6 @@ def test_status_explain_upstream_propagation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """--explain shows B with upstream_stale when A is stale."""
-    monkeypatch.chdir(tmp_path)
-    pathlib.Path(".git").mkdir()
     pathlib.Path("input.txt").write_text("data")
 
     register_test_stage(_upstream_stage_a_v1, name="stage_a")
@@ -883,8 +830,6 @@ def test_status_explain_json_upstream_propagation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """--explain --json shows upstream_stale in stage info."""
-    monkeypatch.chdir(tmp_path)
-    pathlib.Path(".git").mkdir()
     pathlib.Path("input.txt").write_text("data")
 
     register_test_stage(_upstream_stage_a_v1, name="stage_a")
@@ -918,9 +863,7 @@ def test_status_explain_json_upstream_propagation(
 
 def test_explain_command_removed(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
     """pivot explain command should no longer exist."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-
+    with isolated_pivot_dir(runner, tmp_path):
         result = runner.invoke(cli.cli, ["explain"])
 
         assert result.exit_code != 0

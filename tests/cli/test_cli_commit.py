@@ -3,6 +3,7 @@ from __future__ import annotations
 import pathlib
 from typing import TYPE_CHECKING, Annotated, TypedDict
 
+from conftest import isolated_pivot_dir
 from helpers import create_pipeline_py
 from pivot import cli, loaders, outputs
 from pivot.storage import lock
@@ -43,8 +44,7 @@ class _ProcessOutputs(TypedDict):
 
 def test_commit_list_empty(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
     """commit --list shows no pending stages when none exist."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
+    with isolated_pivot_dir(runner, tmp_path):
         pathlib.Path(".pivot/pending/stages").mkdir(parents=True)
 
         result = runner.invoke(cli.cli, ["commit", "--list"])
@@ -55,8 +55,7 @@ def test_commit_list_empty(runner: click.testing.CliRunner, tmp_path: pathlib.Pa
 
 def test_commit_list_shows_pending(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
     """commit --list shows stages pending from --no-commit runs."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
+    with isolated_pivot_dir(runner, tmp_path):
         pathlib.Path(".pivot/cache/files").mkdir(parents=True)
         pathlib.Path("input.txt").write_text("data")
 
@@ -82,8 +81,7 @@ def test_commit_list_shows_pending(runner: click.testing.CliRunner, tmp_path: pa
 
 def test_commit_nothing_to_commit(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
     """commit with no pending stages shows nothing to commit."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
+    with isolated_pivot_dir(runner, tmp_path):
         pathlib.Path(".pivot/pending/stages").mkdir(parents=True)
         pathlib.Path(".pivot/cache/stages").mkdir(parents=True)
 
@@ -97,8 +95,7 @@ def test_commit_promotes_pending_to_production(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
     """commit promotes pending locks to production."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
+    with isolated_pivot_dir(runner, tmp_path):
         pathlib.Path(".pivot/cache/files").mkdir(parents=True)
         pathlib.Path("input.txt").write_text("data")
 
@@ -133,8 +130,7 @@ def test_commit_promotes_pending_to_production(
 
 def test_commit_discard_nothing(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
     """commit --discard with no pending stages shows nothing to discard."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
+    with isolated_pivot_dir(runner, tmp_path):
         pathlib.Path(".pivot/pending/stages").mkdir(parents=True)
 
         result = runner.invoke(cli.cli, ["commit", "--discard"])
@@ -147,8 +143,7 @@ def test_commit_discard_removes_pending(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
     """commit --discard removes pending locks without committing."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
+    with isolated_pivot_dir(runner, tmp_path):
         pathlib.Path(".pivot/cache/files").mkdir(parents=True)
         pathlib.Path("input.txt").write_text("data")
 
@@ -184,8 +179,7 @@ def test_run_no_commit_creates_pending_lock(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
     """run --no-commit creates pending lock instead of production lock."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
+    with isolated_pivot_dir(runner, tmp_path):
         pathlib.Path(".pivot/cache/files").mkdir(parents=True)
         pathlib.Path("input.txt").write_text("data")
 
@@ -212,8 +206,7 @@ def test_run_no_commit_second_run_skips(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
     """Second run --no-commit skips unchanged stages (uses pending lock)."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
+    with isolated_pivot_dir(runner, tmp_path):
         pathlib.Path(".pivot/cache/files").mkdir(parents=True)
         pathlib.Path("input.txt").write_text("data")
 
@@ -235,8 +228,7 @@ def test_run_no_commit_then_commit_workflow(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
     """Full workflow: run --no-commit, then commit, then run uses production lock."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
+    with isolated_pivot_dir(runner, tmp_path):
         pathlib.Path(".pivot/cache/files").mkdir(parents=True)
         pathlib.Path("input.txt").write_text("data")
 

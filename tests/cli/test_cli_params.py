@@ -15,7 +15,6 @@ if TYPE_CHECKING:
 
     from pivot.pipeline.pipeline import Pipeline
 
-
 # =============================================================================
 # Module-level StageParams classes for annotation-based registration
 # =============================================================================

@@ -102,10 +102,13 @@ def test_verify_no_stages(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Verify with no stages shows appropriate error."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
+    from pivot import project
+
     # Create empty pivot.yaml so pipeline can be discovered
+    (tmp_path / ".pivot").mkdir()
     (tmp_path / "pivot.yaml").write_text("stages: {}")
+    monkeypatch.chdir(tmp_path)
+    project._project_root_cache = None
 
     result = runner.invoke(cli.cli, ["verify"])
 
@@ -125,8 +128,6 @@ def test_verify_all_cached_exits_0(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """pivot verify with all stages cached and files present exits 0."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     (tmp_path / "input.txt").write_text("data")
 
     register_test_stage(_helper_process, name="process")
@@ -147,8 +148,6 @@ def test_verify_stale_code_exits_1(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """pivot verify with stale stage (code changed) exits 1."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     (tmp_path / "input.txt").write_text("data")
 
     register_test_stage(_helper_process, name="process")
@@ -177,8 +176,6 @@ def test_verify_stale_params_exits_1(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """pivot verify with stale stage (params changed) exits 1."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     (tmp_path / "input.txt").write_text("data")
 
     register_test_stage(_helper_process, name="process")
@@ -207,8 +204,6 @@ def test_verify_stale_deps_exits_1(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """pivot verify with stale stage (deps changed) exits 1."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     (tmp_path / "input.txt").write_text("data")
 
     register_test_stage(_helper_process, name="process")
@@ -232,8 +227,6 @@ def test_verify_missing_dep_file_exits_1(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """pivot verify with missing dependency file exits 1."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     (tmp_path / "input.txt").write_text("data")
 
     register_test_stage(_helper_process, name="process")
@@ -257,8 +250,6 @@ def test_verify_never_run_exits_1(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """pivot verify with stage that was never run exits 1."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     (tmp_path / "input.txt").write_text("data")
 
     register_test_stage(_helper_process, name="process")
@@ -282,8 +273,6 @@ def test_verify_specific_stage(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """pivot verify train verifies only the train stage."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     (tmp_path / "input.txt").write_text("data")
 
     register_test_stage(_helper_stage_a, name="stage_a")
@@ -306,8 +295,6 @@ def test_verify_multiple_stages(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """pivot verify stage_a stage_b verifies both stages."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     (tmp_path / "input.txt").write_text("data")
 
     register_test_stage(_helper_stage_a, name="stage_a")
@@ -331,8 +318,6 @@ def test_verify_nonexistent_stage_errors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """pivot verify nonexistent exits non-zero with stage not found error."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     (tmp_path / "input.txt").write_text("data")
 
     register_test_stage(_helper_process, name="process")
@@ -355,8 +340,6 @@ def test_verify_allow_missing_no_remote_errors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """pivot verify --allow-missing with no remote configured exits non-zero."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     (tmp_path / "input.txt").write_text("data")
 
     register_test_stage(_helper_process, name="process")
@@ -378,8 +361,6 @@ def test_verify_allow_missing_file_on_remote_passes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """pivot verify --allow-missing with missing local file that exists on remote exits 0."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     (tmp_path / "input.txt").write_text("data")
 
     register_test_stage(_helper_process, name="process")
@@ -417,8 +398,6 @@ def test_verify_allow_missing_file_not_on_remote_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """pivot verify --allow-missing with missing local file not on remote exits 1."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     (tmp_path / "input.txt").write_text("data")
 
     register_test_stage(_helper_process, name="process")
@@ -455,8 +434,6 @@ def test_verify_allow_missing_code_changed_still_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """pivot verify --allow-missing with code changes still exits 1."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     (tmp_path / "input.txt").write_text("data")
 
     register_test_stage(_helper_process, name="process")
@@ -495,8 +472,6 @@ def test_verify_allow_missing_without_prior_run(
     Scenario: CI clone has no dep files yet, but they would exist after setup.
     With validate=False, DAG building doesn't error on missing deps.
     """
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
 
     register_test_stage(_helper_process, name="process")
 
@@ -522,8 +497,6 @@ def test_verify_json_output_passed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """--json outputs valid JSON with passed=true when all cached."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     (tmp_path / "input.txt").write_text("data")
 
     register_test_stage(_helper_process, name="process")
@@ -549,8 +522,6 @@ def test_verify_json_output_failed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """--json outputs valid JSON with passed=false and reasons when stale."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     (tmp_path / "input.txt").write_text("data")
 
     register_test_stage(_helper_process, name="process")
@@ -575,8 +546,6 @@ def test_verify_json_includes_all_keys(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """--json output always includes passed, stages, and failure reasons."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     (tmp_path / "input.txt").write_text("data")
 
     register_test_stage(_helper_process, name="process")
@@ -612,8 +581,6 @@ def test_verify_quiet_no_output_when_passed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """pivot --quiet verify produces no output when all stages are cached."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     (tmp_path / "input.txt").write_text("data")
 
     register_test_stage(_helper_process, name="process")
@@ -634,8 +601,6 @@ def test_verify_quiet_exits_1_when_failed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """pivot --quiet verify exits 1 when verification fails."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     (tmp_path / "input.txt").write_text("data")
 
     register_test_stage(_helper_process, name="process")
@@ -660,8 +625,6 @@ def test_verify_allow_missing_uses_pvt_hash_for_deps(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """verify --allow-missing uses .pvt hash when dep file is missing."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
 
     # Create input.txt and run stage to cache
     (tmp_path / "input.txt").write_text("data")
@@ -696,8 +659,6 @@ def test_verify_allow_missing_uses_pvt_hash_for_nested_dep(
 ) -> None:
     """verify --allow-missing uses directory .pvt manifest for nested file dep."""
     # Change to tmp_path (matches mock_discovery pipeline root)
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
 
     # Create data directory with file
     data_dir = tmp_path / "data"

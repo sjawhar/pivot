@@ -29,13 +29,9 @@ class PivotError(Exception):
 class ValidationError(PivotError):
     """Raised when stage validation fails."""
 
-    pass
-
 
 class StageDefinitionError(ValidationError):
     """Raised when a stage function has invalid annotations (return type, deps, etc)."""
-
-    pass
 
 
 class SecurityValidationError(PivotError):
@@ -45,31 +41,21 @@ class SecurityValidationError(PivotError):
     are never accidentally caught by broad ValidationError handlers.
     """
 
-    pass
-
 
 class OutputDuplicationError(ValidationError):
     """Raised when two stages produce the same output."""
-
-    pass
 
 
 class OverlappingOutputPathsError(ValidationError):
     """Raised when output paths overlap (one is parent/child of another)."""
 
-    pass
-
 
 class InvalidPathError(ValidationError):
     """Raised when a path is invalid (e.g., resolves outside project root)."""
 
-    pass
-
 
 class DAGError(PivotError):
     """Base class for DAG-related errors."""
-
-    pass
 
 
 class CyclicGraphError(DAGError):
@@ -167,61 +153,41 @@ class StageAlreadyRunningError(PivotError):
 class ExecutionError(PivotError):
     """Raised when pipeline execution fails."""
 
-    pass
-
 
 class DVCCompatError(PivotError):
     """Base class for DVC compatibility errors."""
-
-    pass
 
 
 class ExportError(DVCCompatError):
     """Raised when stage export to DVC format fails."""
 
-    pass
-
 
 class DVCImportError(DVCCompatError):
     """Raised when dvc.yaml import fails."""
-
-    pass
 
 
 class CacheError(PivotError):
     """Base class for cache-related errors."""
 
-    pass
-
 
 class OutputMissingError(CacheError):
     """Raised when a stage did not produce a declared output."""
-
-    pass
 
 
 class CacheRestoreError(CacheError):
     """Raised when restoring outputs from cache fails."""
 
-    pass
-
 
 class UncachedIncrementalOutputError(CacheError):
     """Raised when an IncrementalOut file exists but is not in cache."""
-
-    pass
 
 
 class ParamsError(PivotError):
     """Raised when parameter validation or loading fails."""
 
-    pass
-
 
 class PlotsError(PivotError):
     """Raised when plot processing fails."""
-
-    pass
 
 
 class TrackedFileMissingError(CacheError):
@@ -263,19 +229,13 @@ class TrackedFileMissingError(CacheError):
 class GetError(PivotError):
     """Base class for get command errors."""
 
-    pass
-
 
 class RevisionNotFoundError(GetError):
     """Raised when git revision cannot be resolved."""
 
-    pass
-
 
 class TargetNotFoundError(GetError):
     """Raised when target is not found at specified revision."""
-
-    pass
 
 
 class CacheMissError(GetError):
@@ -288,8 +248,6 @@ class CacheMissError(GetError):
 
 class RemoteError(PivotError):
     """Base class for remote storage errors."""
-
-    pass
 
 
 class RemoteNotFoundError(RemoteError):
@@ -343,13 +301,9 @@ class RemoteNotConfiguredError(RemoteError):
 class ConfigError(PivotError):
     """Base class for configuration errors."""
 
-    pass
-
 
 class ConfigValidationError(ConfigError):
     """Raised when config value fails validation."""
-
-    pass
 
 
 class ConfigKeyError(ConfigError):
@@ -363,8 +317,6 @@ class ConfigKeyError(ConfigError):
 class InitError(PivotError):
     """Base class for initialization errors."""
 
-    pass
-
 
 class AlreadyInitializedError(InitError):
     """Raised when project is already initialized."""
@@ -372,6 +324,14 @@ class AlreadyInitializedError(InitError):
     @override
     def get_suggestion(self) -> str:
         return "Use --force to reinitialize"
+
+
+class ProjectNotInitializedError(InitError):
+    """Raised when no .pivot directory exists above the current directory."""
+
+    @override
+    def get_suggestion(self) -> str:
+        return "Run 'pivot init' in your project root to initialize Pivot"
 
 
 class PipelineNotFoundError(PivotError):

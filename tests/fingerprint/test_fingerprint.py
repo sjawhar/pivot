@@ -1375,8 +1375,13 @@ def test_should_skip_persistent_cache_normal_function():
     assert fingerprint._should_skip_persistent_cache(_helper_for_hash_test_1) is False
 
 
-def test_get_func_source_info_normal_function():
+def test_get_func_source_info_normal_function(monkeypatch: pytest.MonkeyPatch):
     """Should return source info for normal functions."""
+    from pivot import project
+
+    # Set cache to the repo root (parent of src/ and tests/) so test file is within project
+    repo_root = pathlib.Path(__file__).parent.parent.parent
+    project._project_root_cache = repo_root
     # _helper_for_hash_test_1 is defined in this file
     result = fingerprint._get_func_source_info(_helper_for_hash_test_1)
 
@@ -1394,8 +1399,13 @@ def test_get_func_source_info_builtin():
     assert result is None
 
 
-def test_get_func_source_info_lambda():
+def test_get_func_source_info_lambda(monkeypatch: pytest.MonkeyPatch):
     """Lambdas defined in source files should have source info."""
+    from pivot import project
+
+    # Set cache to the repo root (parent of src/ and tests/) so test file is within project
+    repo_root = pathlib.Path(__file__).parent.parent.parent
+    project._project_root_cache = repo_root
     my_lambda = lambda x: x * 2  # noqa: E731
     result = fingerprint._get_func_source_info(my_lambda)
 

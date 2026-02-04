@@ -122,6 +122,7 @@ See the [Quick Start](getting-started/quickstart.md) to build your first pipelin
 ## Learn More
 
 - [Tutorials](tutorial/watch.md) - Watch mode, parameters, CI integration
+- [Multi-Pipeline Projects](tutorial/multi-pipeline.md) - Organize larger codebases with automatic cross-pipeline discovery
 - [Reference](reference/pipelines.md) - Complete documentation by task
 - [Migrating from DVC](migrating-from-dvc.md) - Step-by-step migration guide
 - [Architecture](architecture/overview.md) - Design decisions and internals

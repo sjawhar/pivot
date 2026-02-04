@@ -43,9 +43,10 @@ def test_checkout_manifest_path_traversal_rejected(
 ) -> None:
     """Manifest with ../ in relpath rejected during checkout."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".pivot").mkdir()
         pathlib.Path(".git").mkdir()
         cache_dir = pathlib.Path(".pivot") / "cache" / "files"
-        cache_dir.mkdir(parents=True)
+        cache_dir.mkdir(parents=True, exist_ok=True)
 
         # Create a malicious pvt file with path traversal in manifest
         malicious_pvt = """path: data_dir
@@ -235,15 +236,9 @@ def test_pvt_file_yaml_invalid_type_rejected(tmp_path: pathlib.Path) -> None:
 
 def test_directory_track_processes_valid_files(
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
     mock_discovery: Pipeline,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Track on directory processes valid regular files."""
-    monkeypatch.chdir(tmp_path)
-    pathlib.Path(".git").mkdir()
-    pathlib.Path(".pivot").mkdir()
-
     # Create directory with valid file
     data_dir = pathlib.Path("data_dir")
     data_dir.mkdir()
@@ -258,15 +253,9 @@ def test_directory_track_processes_valid_files(
 
 def test_directory_track_creates_pvt_file(
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
     mock_discovery: Pipeline,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Track on directory creates .pvt file with manifest."""
-    monkeypatch.chdir(tmp_path)
-    pathlib.Path(".git").mkdir()
-    pathlib.Path(".pivot").mkdir()
-
     # Create directory with files
     data_dir = pathlib.Path("data_dir")
     data_dir.mkdir()

@@ -247,10 +247,11 @@ def test_ensure_stages_registered_raises_on_discovery_error(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
     """ensure_stages_registered raises ClickException on discovery error."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
+    from conftest import isolated_pivot_dir
+
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
         # Create invalid pivot.yaml
-        pathlib.Path("pivot.yaml").write_text("stages:\n  - invalid: true\n")
-        pathlib.Path(".pivot").mkdir()
+        (cwd / "pivot.yaml").write_text("stages:\n  - invalid: true\n")
 
         with pytest.raises(click.ClickException):
             _run_common.ensure_stages_registered()

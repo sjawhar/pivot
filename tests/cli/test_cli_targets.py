@@ -15,7 +15,6 @@ if TYPE_CHECKING:
 
     from pivot.pipeline.pipeline import Pipeline
 
-
 # =============================================================================
 # Output TypedDicts for annotation-based stages
 # =============================================================================

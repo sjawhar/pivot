@@ -12,6 +12,7 @@ def test_init_creates_pivot_directory(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
     with runner.isolated_filesystem(temp_dir=tmp_path):
+        project._project_root_cache = None
         result = runner.invoke(cli.cli, ["init"])
 
         assert result.exit_code == 0
@@ -20,6 +21,7 @@ def test_init_creates_pivot_directory(
 
 def test_init_creates_gitignore(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
     with runner.isolated_filesystem(temp_dir=tmp_path):
+        project._project_root_cache = None
         result = runner.invoke(cli.cli, ["init"])
 
         assert result.exit_code == 0
@@ -39,6 +41,7 @@ def test_init_gitignore_contains_expected_entries(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path, expected_content: str
 ) -> None:
     with runner.isolated_filesystem(temp_dir=tmp_path):
+        project._project_root_cache = None
         result = runner.invoke(cli.cli, ["init"])
 
         assert result.exit_code == 0
@@ -52,6 +55,7 @@ def test_init_gitignore_contains_expected_entries(
 def test_init_creates_pivotignore(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
     """init creates .pivotignore file in project root."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
+        project._project_root_cache = None
         result = runner.invoke(cli.cli, ["init"])
 
         assert result.exit_code == 0
@@ -73,6 +77,7 @@ def test_init_pivotignore_contains_expected_patterns(
 ) -> None:
     """init creates .pivotignore with standard patterns."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
+        project._project_root_cache = None
         result = runner.invoke(cli.cli, ["init"])
 
         assert result.exit_code == 0
@@ -85,6 +90,7 @@ def test_init_pivotignore_uses_default_patterns(
 ) -> None:
     """init creates .pivotignore containing all default patterns from ignore module."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
+        project._project_root_cache = None
         result = runner.invoke(cli.cli, ["init"])
 
         assert result.exit_code == 0
@@ -101,6 +107,7 @@ def test_init_does_not_overwrite_existing_pivotignore(
 ) -> None:
     """init preserves existing .pivotignore file."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
+        project._project_root_cache = None
         pathlib.Path(".pivotignore").write_text("# Custom patterns\n*.custom\n")
 
         result = runner.invoke(cli.cli, ["init"])
@@ -116,6 +123,7 @@ def test_init_force_does_not_overwrite_pivotignore(
 ) -> None:
     """init --force still preserves existing .pivotignore."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
+        project._project_root_cache = None
         pathlib.Path(".pivot").mkdir()
         pathlib.Path(".pivotignore").write_text("# My patterns\n*.log\n")
 
@@ -132,6 +140,7 @@ def test_init_output_mentions_pivotignore(
 ) -> None:
     """init output lists .pivotignore as created file."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
+        project._project_root_cache = None
         result = runner.invoke(cli.cli, ["init"])
 
         assert result.exit_code == 0
@@ -145,6 +154,7 @@ def test_init_fails_with_suggestion_when_already_initialized(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
     with runner.isolated_filesystem(temp_dir=tmp_path):
+        project._project_root_cache = None
         pathlib.Path(".pivot").mkdir()
 
         result = runner.invoke(cli.cli, ["init"])
@@ -161,6 +171,7 @@ def test_init_force_succeeds_when_already_initialized(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
     with runner.isolated_filesystem(temp_dir=tmp_path):
+        project._project_root_cache = None
         pathlib.Path(".pivot").mkdir()
 
         result = runner.invoke(cli.cli, ["init", "--force"])
@@ -172,6 +183,7 @@ def test_init_force_overwrites_gitignore(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
     with runner.isolated_filesystem(temp_dir=tmp_path):
+        project._project_root_cache = None
         pathlib.Path(".pivot").mkdir()
         pathlib.Path(".pivot/.gitignore").write_text("old content")
 
@@ -186,6 +198,7 @@ def test_init_force_preserves_other_files(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
     with runner.isolated_filesystem(temp_dir=tmp_path):
+        project._project_root_cache = None
         pathlib.Path(".pivot").mkdir()
         pathlib.Path(".pivot/config.yaml").write_text("cache:\n  dir: /custom\n")
 
@@ -203,6 +216,7 @@ def test_init_output_contains_expected_elements(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
     with runner.isolated_filesystem(temp_dir=tmp_path):
+        project._project_root_cache = None
         result = runner.invoke(cli.cli, ["init"])
 
         assert result.exit_code == 0
@@ -219,6 +233,7 @@ def test_init_fails_when_pivot_is_symlink_to_directory(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
     with runner.isolated_filesystem(temp_dir=tmp_path):
+        project._project_root_cache = None
         target = pathlib.Path("real_dir")
         target.mkdir()
         pathlib.Path(".pivot").symlink_to(target)
@@ -233,6 +248,7 @@ def test_init_fails_when_pivot_is_symlink_to_file(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
     with runner.isolated_filesystem(temp_dir=tmp_path):
+        project._project_root_cache = None
         target = pathlib.Path("some_file")
         target.write_text("content")
         pathlib.Path(".pivot").symlink_to(target)
@@ -247,6 +263,7 @@ def test_init_fails_when_pivot_is_dangling_symlink(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
     with runner.isolated_filesystem(temp_dir=tmp_path):
+        project._project_root_cache = None
         pathlib.Path(".pivot").symlink_to("nonexistent")
 
         result = runner.invoke(cli.cli, ["init"])
@@ -259,6 +276,7 @@ def test_init_force_still_rejects_symlink(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
     with runner.isolated_filesystem(temp_dir=tmp_path):
+        project._project_root_cache = None
         target = pathlib.Path("real_dir")
         target.mkdir()
         pathlib.Path(".pivot").symlink_to(target)
@@ -273,6 +291,7 @@ def test_init_fails_when_pivot_is_regular_file(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
     with runner.isolated_filesystem(temp_dir=tmp_path):
+        project._project_root_cache = None
         pathlib.Path(".pivot").write_text("I am a file")
 
         result = runner.invoke(cli.cli, ["init"])
@@ -285,6 +304,7 @@ def test_init_force_still_rejects_file(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
     with runner.isolated_filesystem(temp_dir=tmp_path):
+        project._project_root_cache = None
         pathlib.Path(".pivot").write_text("I am a file")
 
         result = runner.invoke(cli.cli, ["init", "--force"])
@@ -300,6 +320,7 @@ def test_init_fails_with_read_only_directory(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
     with runner.isolated_filesystem(temp_dir=tmp_path):
+        project._project_root_cache = None
         cwd = pathlib.Path.cwd()
         cwd.chmod(0o555)  # read + execute only
         try:
@@ -357,6 +378,7 @@ def test_init_quiet_produces_no_output(
 ) -> None:
     """pivot --quiet init produces no output."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
+        project._project_root_cache = None
         result = runner.invoke(cli.cli, ["--quiet", "init"])
 
         assert result.exit_code == 0
@@ -369,6 +391,7 @@ def test_init_quiet_still_creates_files(
 ) -> None:
     """pivot --quiet init still creates all expected files."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
+        project._project_root_cache = None
         result = runner.invoke(cli.cli, ["--quiet", "init"])
 
         assert result.exit_code == 0
@@ -384,6 +407,7 @@ def test_init_force_warns_when_overwriting_custom_gitignore(
 ) -> None:
     """pivot init --force warns when overwriting custom .gitignore."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
+        project._project_root_cache = None
         pathlib.Path(".pivot").mkdir()
         pathlib.Path(".pivot/.gitignore").write_text("# Custom gitignore\nmy_custom_entry/\n")
 
@@ -400,6 +424,7 @@ def test_init_force_no_warning_for_identical_gitignore(
     from pivot.cli import init as init_module
 
     with runner.isolated_filesystem(temp_dir=tmp_path):
+        project._project_root_cache = None
         pathlib.Path(".pivot").mkdir()
         # Write the exact same content that init would write
         pathlib.Path(".pivot/.gitignore").write_text(init_module._GITIGNORE_CONTENT)
@@ -415,6 +440,7 @@ def test_init_force_quiet_suppresses_warning(
 ) -> None:
     """pivot --quiet init --force suppresses overwrite warning."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
+        project._project_root_cache = None
         pathlib.Path(".pivot").mkdir()
         pathlib.Path(".pivot/.gitignore").write_text("# Custom content")
 
@@ -422,3 +448,31 @@ def test_init_force_quiet_suppresses_warning(
 
         assert result.exit_code == 0
         assert result.output.strip() == "", "Quiet mode should suppress warning"
+
+
+# --- not initialized tests ---
+
+
+def test_repro_fails_without_pivot_init(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """Running pivot repro without .pivot should error with helpful message."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        project._project_root_cache = None
+        result = runner.invoke(cli.cli, ["repro"])
+
+        assert result.exit_code == 1
+        assert "No .pivot directory found" in result.output
+        assert "pivot init" in result.output
+
+
+def test_list_fails_without_pivot_init(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """Running pivot list without .pivot should error with helpful message."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        project._project_root_cache = None
+        result = runner.invoke(cli.cli, ["list"])
+
+        assert result.exit_code == 1
+        assert "No .pivot directory found" in result.output

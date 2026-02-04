@@ -128,12 +128,12 @@ def test_parent_dir_created_by_pending_state_lock(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """pending_state_lock creates .pivot directory if it doesn't exist."""
-    # Create minimal pivot dir marker but not the subdirectory
+    # Create .pivot and cache the project root before removing .pivot
     (tmp_path / ".pivot").mkdir()
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(project, "_project_root_cache", None)
+    monkeypatch.setattr(project, "_project_root_cache", tmp_path)
 
-    # Remove .pivot dir to test creation
+    # Remove .pivot dir to test that the lock recreates it
     (tmp_path / ".pivot").rmdir()
     assert not (tmp_path / ".pivot").exists()
 
@@ -146,10 +146,12 @@ def test_parent_dir_created_by_acquire_pending_state_lock(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """acquire_pending_state_lock creates .pivot directory if it doesn't exist."""
+    # Create .pivot and cache the project root before removing .pivot
     (tmp_path / ".pivot").mkdir()
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(project, "_project_root_cache", None)
+    monkeypatch.setattr(project, "_project_root_cache", tmp_path)
 
+    # Remove .pivot dir to test that the lock recreates it
     (tmp_path / ".pivot").rmdir()
     assert not (tmp_path / ".pivot").exists()
 
