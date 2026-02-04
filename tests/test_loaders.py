@@ -92,6 +92,18 @@ def test_csv_loader_with_index_col(tmp_path: pathlib.Path) -> None:
     assert list(df.index) == ["a", "b"]
 
 
+def test_csv_loader_with_multi_index_col(tmp_path: pathlib.Path) -> None:
+    """CSV loader supports list index_col for MultiIndex."""
+    csv_file = tmp_path / "data.csv"
+    csv_file.write_text("idx1,idx2,val\na,x,1\nb,y,2\n")
+
+    loader = loaders.CSV(index_col=[0, 1])
+    df = loader.load(csv_file)
+
+    assert df.index.names == ["idx1", "idx2"]
+    assert list(df.index) == [("a", "x"), ("b", "y")]
+
+
 def test_csv_loader_with_sep(tmp_path: pathlib.Path) -> None:
     """CSV loader respects sep option."""
     csv_file = tmp_path / "data.tsv"
