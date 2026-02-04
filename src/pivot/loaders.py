@@ -77,7 +77,7 @@ class CSV[T](Loader[T, T]):
     Always returns pandas.DataFrame at runtime.
     """
 
-    index_col: int | str | None = None
+    index_col: int | str | list[int | str] | None = None
     sep: str = ","
     dtype: dict[str, str] | None = None
 
