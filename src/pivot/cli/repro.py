@@ -368,7 +368,6 @@ def _run_watch_mode(  # noqa: PLR0913 - many params needed for different modes
             stage_names=display_order,
             tui_log=tui_log,
             watch_mode=True,
-            engine=None,  # Engine is managed by CLI
             no_commit=no_commit,
             serve=serve,
         )
@@ -595,13 +594,9 @@ def _run_oneshot_mode(
         from pivot.tui import run as tui_run
 
         # Create TUI app (will run in main thread)
-        def executor_wrapper() -> dict[str, ExecutionSummary]:
-            return {}
-
         app = tui_run.PivotApp(
             stage_names=display_order,
             tui_log=tui_log,
-            executor_func=executor_wrapper,
             cancel_event=cancel_event,
         )
 

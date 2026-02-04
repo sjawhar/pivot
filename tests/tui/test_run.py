@@ -9,7 +9,7 @@ import pytest
 import textual.binding
 import textual.widgets
 
-from pivot import executor, loaders, outputs
+from pivot import loaders, outputs
 from pivot.tui import run as run_tui
 from pivot.tui.screens import ConfirmCommitScreen
 from pivot.tui.types import LogEntry, StageInfo
@@ -33,7 +33,6 @@ from pivot.types import (
 if TYPE_CHECKING:
     from pytest_mock import MockerFixture
 
-    from pivot.engine.engine import Engine
     from pivot.pipeline.pipeline import Pipeline
 
 # =============================================================================
@@ -188,39 +187,6 @@ def test_tui_update_wraps_messages(
 
 
 # =============================================================================
-# ExecutorComplete Message Tests
-# =============================================================================
-
-
-@pytest.mark.parametrize(
-    ("results", "error", "expected_results", "has_error"),
-    [
-        (
-            {"stage1": executor.ExecutionSummary(status=StageStatus.RAN, reason="code changed")},
-            None,
-            {"stage1": executor.ExecutionSummary(status=StageStatus.RAN, reason="code changed")},
-            False,
-        ),
-        ({}, ValueError("something went wrong"), {}, True),
-    ],
-    ids=["success", "with_error"],
-)
-def test_executor_complete(
-    results: dict[str, executor.ExecutionSummary],
-    error: Exception | None,
-    expected_results: dict[str, executor.ExecutionSummary],
-    has_error: bool,
-) -> None:
-    """ExecutorComplete stores results and error appropriately."""
-    complete = run_tui.ExecutorComplete(results, error=error)
-    assert complete.results == expected_results
-    if has_error:
-        assert complete.error is not None
-    else:
-        assert complete.error is None
-
-
-# =============================================================================
 # PivotApp Initialization Tests (Run Mode)
 # =============================================================================
 
@@ -229,26 +195,19 @@ def test_run_tui_app_init() -> None:
     """PivotApp initializes with stage names."""
     stage_names = ["stage1", "stage2", "stage3"]
 
-    def executor_func() -> dict[str, executor.ExecutionSummary]:
-        return {}
-
-    app = run_tui.PivotApp(stage_names=stage_names, executor_func=executor_func)
+    app = run_tui.PivotApp(stage_names=stage_names)
 
     assert len(app._stages) == 3
     assert list(app._stage_order) == stage_names
     assert app._selected_idx == 0
     assert app._results is None
-    assert app.error is None
 
 
 def test_run_tui_app_stage_info_indexes() -> None:
     """PivotApp assigns correct 1-based indexes to stages."""
     stage_names = ["first", "second", "third"]
 
-    def executor_func() -> dict[str, executor.ExecutionSummary]:
-        return {}
-
-    app = run_tui.PivotApp(stage_names=stage_names, executor_func=executor_func)
+    app = run_tui.PivotApp(stage_names=stage_names)
 
     assert app._stages["first"].index == 1
     assert app._stages["second"].index == 2
@@ -297,12 +256,11 @@ def test_status_functions_return_non_empty() -> None:
         (True, True),
     ],
 )
-def test_watch_tui_app_init_no_commit(
-    mock_watch_engine: Engine, no_commit: bool, expected: bool
-) -> None:
+def test_watch_tui_app_init_no_commit(no_commit: bool, expected: bool) -> None:
     """PivotApp (watch mode) initializes no_commit correctly."""
     app = run_tui.PivotApp(
-        engine=mock_watch_engine,
+        stage_names=["stage1"],
+        watch_mode=True,
         no_commit=no_commit,
     )
     assert app._no_commit is expected
@@ -352,13 +310,8 @@ def simple_run_app(
     mock_discovery: Pipeline,
 ) -> run_tui.PivotApp:
     """Create a simple PivotApp for testing."""
-
-    def executor_func() -> dict[str, executor.ExecutionSummary]:
-        return {}
-
     return run_tui.PivotApp(
         stage_names=["stage1", "stage2", "stage3"],
-        executor_func=executor_func,
     )
 
 
@@ -466,10 +419,7 @@ async def test_run_app_stages_shown(
     """Stage names appear in the app."""
     stage_names = ["alpha", "beta", "gamma"]
 
-    def executor_func() -> dict[str, executor.ExecutionSummary]:
-        return {}
-
-    app = run_tui.PivotApp(stage_names=stage_names, executor_func=executor_func)
+    app = run_tui.PivotApp(stage_names=stage_names)
 
     async with app.run_test() as pilot:
         await pilot.pause()
@@ -545,13 +495,9 @@ async def test_tui_app_with_tui_log_writes_to_file(
 
     log_path = tmp_path / "tui.jsonl"
 
-    def executor_func() -> dict[str, executor.ExecutionSummary]:
-        return {"stage1": executor.ExecutionSummary(status=StageStatus.RAN, reason="code changed")}
-
     app = run_tui.PivotApp(
         stage_names=["stage1"],
         tui_log=log_path,
-        executor_func=executor_func,
     )
 
     async with app.run_test() as pilot:
@@ -601,13 +547,9 @@ async def test_tui_app_without_tui_log_no_file_created(
     """PivotApp does not create log file when tui_log is None."""
     log_path = tmp_path / "tui.jsonl"
 
-    def executor_func() -> dict[str, executor.ExecutionSummary]:
-        return {}
-
     app = run_tui.PivotApp(
         stage_names=["stage1"],
         tui_log=None,  # No log file
-        executor_func=executor_func,
     )
 
     async with app.run_test() as pilot:
@@ -624,13 +566,13 @@ async def test_tui_app_without_tui_log_no_file_created(
 
 @pytest.mark.asyncio
 async def test_watch_tui_app_with_serve_flag(
-    mock_watch_engine: Engine,
     test_pipeline: Pipeline,
     mock_discovery: Pipeline,
 ) -> None:
     """PivotApp (watch mode) initializes serve mode correctly."""
     app = run_tui.PivotApp(
-        engine=mock_watch_engine,
+        stage_names=["stage1"],
+        watch_mode=True,
         serve=True,
     )
 
@@ -639,13 +581,12 @@ async def test_watch_tui_app_with_serve_flag(
 
     async with app.run_test() as pilot:
         await pilot.pause()
-        # App should mount and be ready
-        assert app._engine is mock_watch_engine
+        # App should mount and be ready in watch mode
+        assert app._watch_mode is True
 
 
 @pytest.mark.asyncio
 async def test_watch_tui_app_with_tui_log(
-    mock_watch_engine: Engine,
     tmp_path: pathlib.Path,
     test_pipeline: Pipeline,
     mock_discovery: Pipeline,
@@ -654,7 +595,8 @@ async def test_watch_tui_app_with_tui_log(
     log_path = tmp_path / "watch_tui.jsonl"
 
     app = run_tui.PivotApp(
-        engine=mock_watch_engine,
+        stage_names=["stage1"],
+        watch_mode=True,
         tui_log=log_path,
     )
 
@@ -714,14 +656,9 @@ def test_format_reload_summary(
 
 def test_handle_reload_calls_notify_with_summary(mocker: MockerFixture) -> None:
     """_handle_reload calls notify with formatted summary when stages change."""
-    from unittest.mock import MagicMock
-
-    # Create a mock engine to enable watch mode
-    mock_engine = MagicMock()
-
     app = run_tui.PivotApp(
         stage_names=["stage_a", "stage_b"],
-        engine=mock_engine,
+        watch_mode=True,
     )
 
     # Mock internal methods that require mounted app
@@ -748,13 +685,9 @@ def test_handle_reload_calls_notify_with_summary(mocker: MockerFixture) -> None:
 
 def test_handle_reload_no_notify_when_no_changes(mocker: MockerFixture) -> None:
     """_handle_reload does not call notify when no stages changed."""
-    from unittest.mock import MagicMock
-
-    mock_engine = MagicMock()
-
     app = run_tui.PivotApp(
         stage_names=["stage_a"],
-        engine=mock_engine,
+        watch_mode=True,
     )
 
     # Mock internal methods that require mounted app
@@ -779,37 +712,48 @@ def test_handle_reload_no_notify_when_no_changes(mocker: MockerFixture) -> None:
 
 
 # =============================================================================
-# ExecutorComplete Bell Notification Tests
+# TuiShutdown Bell Notification Tests (Run Mode)
 # =============================================================================
 
 
-def test_on_executor_complete_calls_bell(mocker: MockerFixture) -> None:
-    """on_executor_complete calls bell() to notify user of completion."""
-
-    def executor_func() -> dict[str, executor.ExecutionSummary]:
-        return {}
-
-    app = run_tui.PivotApp(
-        stage_names=["stage1"],
-        executor_func=executor_func,
-    )
+def test_on_tui_shutdown_calls_bell_in_run_mode(mocker: MockerFixture) -> None:
+    """on_tui_shutdown calls bell() in run mode to notify user of completion."""
+    app = run_tui.PivotApp(stage_names=["stage1"])
 
     # Mock methods that require mounted app or have side effects
     mocker.patch.object(app, "_shutdown_event")
     mocker.patch.object(app, "_close_log_file")
     mocker.patch.object(app, "_shutdown_loky_pool")
     mocker.patch.object(app, "exit")
+    mocker.patch.object(app, "_write_to_log")
     mock_bell = mocker.patch.object(app, "bell")
 
-    # Create ExecutorComplete event
-    results = {"stage1": executor.ExecutionSummary(status=StageStatus.RAN, reason="code changed")}
-    event = run_tui.ExecutorComplete(results, error=None)
+    # Create TuiShutdown event
+    event = run_tui.TuiShutdown()
 
     # Call the handler
-    app.on_executor_complete(event)
+    app.on_tui_shutdown(event)
 
-    # Bell should be called to notify user
+    # Bell should be called in run mode
     mock_bell.assert_called_once()
+
+
+def test_on_tui_shutdown_no_bell_in_watch_mode(mocker: MockerFixture) -> None:
+    """on_tui_shutdown does not call bell() in watch mode."""
+    app = run_tui.PivotApp(stage_names=["stage1"], watch_mode=True)
+
+    # Mock methods that require mounted app
+    mocker.patch.object(app, "_write_to_log")
+    mock_bell = mocker.patch.object(app, "bell")
+
+    # Create TuiShutdown event
+    event = run_tui.TuiShutdown()
+
+    # Call the handler
+    app.on_tui_shutdown(event)
+
+    # Bell should NOT be called in watch mode
+    mock_bell.assert_not_called()
 
 
 # =============================================================================
@@ -929,59 +873,21 @@ def test_stage_info_index_and_total_are_set() -> None:
 # =============================================================================
 
 
-def test_run_tui_app_requires_executor_func_or_watch_mode() -> None:
-    """PivotApp requires either executor_func or watch_mode=True."""
-    with pytest.raises(ValueError, match="Either executor_func.*or watch_mode=True"):
-        run_tui.PivotApp(stage_names=["s1"])
-
-
-def test_run_tui_app_watch_mode_without_engine() -> None:
-    """PivotApp can be created with watch_mode=True without engine."""
+def test_run_tui_app_watch_mode() -> None:
+    """PivotApp can be created with watch_mode=True."""
     app = run_tui.PivotApp(
         stage_names=["s1"],
         watch_mode=True,
     )
     assert app._watch_mode is True
-    assert app._engine is None
 
 
 def test_run_tui_app_with_empty_stage_list() -> None:
     """PivotApp handles empty stage list."""
-
-    def executor_func() -> dict[str, executor.ExecutionSummary]:
-        return {}
-
-    app = run_tui.PivotApp(stage_names=[], executor_func=executor_func)
+    app = run_tui.PivotApp(stage_names=[])
     assert len(app._stages) == 0
     assert app._stage_order == []
     assert app.selected_stage_name is None
-
-
-# =============================================================================
-# ExecutorComplete Edge Cases
-# =============================================================================
-
-
-def test_executor_complete_with_empty_results_and_error() -> None:
-    """ExecutorComplete can have both empty results and an error."""
-    error = RuntimeError("Pipeline failed")
-    complete = run_tui.ExecutorComplete({}, error=error)
-    assert complete.results == {}
-    assert complete.error is error
-
-
-def test_executor_complete_with_multiple_stage_results() -> None:
-    """ExecutorComplete stores multiple stage results."""
-    results = {
-        "s1": executor.ExecutionSummary(status=StageStatus.RAN, reason="code changed"),
-        "s2": executor.ExecutionSummary(status=StageStatus.SKIPPED, reason="cache hit"),
-        "s3": executor.ExecutionSummary(status=StageStatus.FAILED, reason="error occurred"),
-    }
-    complete = run_tui.ExecutorComplete(results, error=None)
-    assert len(complete.results) == 3
-    assert complete.results["s1"]["status"] == StageStatus.RAN
-    assert complete.results["s2"]["status"] == StageStatus.SKIPPED
-    assert complete.results["s3"]["status"] == StageStatus.FAILED
 
 
 # =============================================================================
@@ -1012,41 +918,19 @@ def test_status_functions_return_tuple_structures() -> None:
 
 def test_pivot_app_selected_stage_name_when_no_stages() -> None:
     """selected_stage_name returns None when no stages exist."""
-
-    def executor_func() -> dict[str, executor.ExecutionSummary]:
-        return {}
-
-    app = run_tui.PivotApp(stage_names=[], executor_func=executor_func)
+    app = run_tui.PivotApp(stage_names=[])
     assert app.selected_stage_name is None
 
 
 def test_pivot_app_selected_stage_name_with_stages() -> None:
     """selected_stage_name returns first stage initially."""
-
-    def executor_func() -> dict[str, executor.ExecutionSummary]:
-        return {}
-
-    app = run_tui.PivotApp(stage_names=["s1", "s2", "s3"], executor_func=executor_func)
+    app = run_tui.PivotApp(stage_names=["s1", "s2", "s3"])
     assert app.selected_stage_name == "s1"
-
-
-def test_pivot_app_error_property_initial_state() -> None:
-    """error property is None initially in run mode."""
-
-    def executor_func() -> dict[str, executor.ExecutionSummary]:
-        return {}
-
-    app = run_tui.PivotApp(stage_names=["s1"], executor_func=executor_func)
-    assert app.error is None
 
 
 def test_pivot_app_exit_message_property_initial_state() -> None:
     """exit_message property is None initially."""
-
-    def executor_func() -> dict[str, executor.ExecutionSummary]:
-        return {}
-
-    app = run_tui.PivotApp(stage_names=["s1"], executor_func=executor_func)
+    app = run_tui.PivotApp(stage_names=["s1"])
     assert app.exit_message is None
 
 
@@ -1095,12 +979,8 @@ async def test_action_force_rerun_all_calls_rpc(mocker: MockerFixture) -> None:
 @pytest.mark.anyio
 async def test_action_force_rerun_not_in_watch_mode(mocker: MockerFixture) -> None:
     """action_force_rerun should do nothing in run mode."""
-
-    def executor_func() -> dict[str, executor.ExecutionSummary]:
-        return {}
-
-    # Create run mode app (not watch mode)
-    app = run_tui.PivotApp(stage_names=["stage_a"], executor_func=executor_func)
+    # Create run mode app (not watch mode - default)
+    app = run_tui.PivotApp(stage_names=["stage_a"])
     app._selected_stage_name = "stage_a"
 
     mock_send = mocker.patch("pivot.tui.run.rpc_client.send_run_command", new_callable=AsyncMock)

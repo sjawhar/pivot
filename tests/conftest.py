@@ -392,50 +392,6 @@ def output_queue() -> Generator[mp.Queue[OutputMessage]]:
     manager.shutdown()
 
 
-# =============================================================================
-# TUI Test Mocks
-# =============================================================================
-
-
-class MockEngine:
-    """Mock engine for TUI testing (implements Engine interface for watch mode)."""
-
-    def __init__(self) -> None:
-        self._keep_going: bool = False
-
-    def run(self, *, exit_on_completion: bool = True) -> None:
-        """Mock run - does nothing."""
-        pass
-
-    def shutdown(self) -> None:
-        """Mock shutdown - does nothing."""
-        pass
-
-    def toggle_keep_going(self) -> bool:
-        """Toggle keep-going mode."""
-        self._keep_going = not self._keep_going
-        return self._keep_going
-
-    def set_keep_going(self, enabled: bool) -> None:
-        """Set keep-going mode."""
-        self._keep_going = enabled
-
-    @property
-    def keep_going(self) -> bool:
-        """Return keep-going state."""
-        return self._keep_going
-
-
-@pytest.fixture
-def mock_watch_engine() -> Engine:
-    """Provide a mock engine for TUI watch mode testing.
-
-    Returns MockEngine which implements the subset of Engine interface
-    needed for watch mode tests (keep_going property and toggle).
-    """
-    return MockEngine()  # pyright: ignore[reportReturnType] - MockEngine is test double
-
-
 @pytest.fixture
 async def test_engine(test_pipeline: pipeline_mod.Pipeline) -> AsyncGenerator[Engine]:
     """Provide a context-managed Engine instance.

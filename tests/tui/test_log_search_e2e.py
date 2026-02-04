@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING
 
 import pytest
 
@@ -12,16 +11,13 @@ from pivot.tui.run import PivotApp
 from pivot.tui.widgets.logs import StageLogPanel
 from pivot.tui.widgets.panels import TabbedDetailPanel
 
-if TYPE_CHECKING:
-    from pivot.engine.engine import Engine
-
 
 @pytest.mark.asyncio
 @pytest.mark.flaky(reruns=2)
-async def test_log_search_smoke(mock_watch_engine: Engine) -> None:
+async def test_log_search_smoke() -> None:
     """E2E: Verify search bar opens, accepts input, and closes."""
     # Use empty stage_names to avoid triggering pipeline lookups
-    app = PivotApp(engine=mock_watch_engine, stage_names=[])
+    app = PivotApp(stage_names=[], watch_mode=True)
 
     async with app.run_test() as pilot:
         await pilot.pause()  # Let app initialize
@@ -64,9 +60,9 @@ async def test_log_search_smoke(mock_watch_engine: Engine) -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.flaky(reruns=2)
-async def test_log_search_navigation_keys(mock_watch_engine: Engine) -> None:
+async def test_log_search_navigation_keys() -> None:
     """E2E: Verify n/N navigation works after submitting search."""
-    app = PivotApp(engine=mock_watch_engine, stage_names=[])
+    app = PivotApp(stage_names=[], watch_mode=True)
 
     async with app.run_test() as pilot:
         await pilot.pause()

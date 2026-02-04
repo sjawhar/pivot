@@ -4,15 +4,11 @@ from __future__ import annotations
 
 import collections
 import time
-from typing import TYPE_CHECKING
 
 from pivot.tui import run as run_tui
 from pivot.tui.types import ExecutionHistoryEntry, LogEntry, PendingHistoryState, StageInfo
 from pivot.tui.widgets import TabbedDetailPanel
 from pivot.types import StageStatus
-
-if TYPE_CHECKING:
-    from pivot.engine.engine import Engine
 
 # =============================================================================
 # ExecutionHistoryEntry Tests
@@ -188,40 +184,32 @@ def test_tabbed_detail_panel_history_index_starts_none() -> None:
 # =============================================================================
 
 
-def test_watch_tui_app_has_history_tracking_state(
-    mock_watch_engine: Engine,
-) -> None:
+def test_watch_tui_app_has_history_tracking_state() -> None:
     """PivotApp (watch mode) has state for tracking history navigation."""
-    app = run_tui.PivotApp(engine=mock_watch_engine, stage_names=["test"])
+    app = run_tui.PivotApp(stage_names=["test"], watch_mode=True)
 
     assert app._viewing_history_index is None
 
 
-def test_watch_tui_app_pending_history_tracking(
-    mock_watch_engine: Engine,
-) -> None:
+def test_watch_tui_app_pending_history_tracking() -> None:
     """PivotApp (watch mode) tracks pending history entries during execution."""
-    app = run_tui.PivotApp(engine=mock_watch_engine, stage_names=["test"])
+    app = run_tui.PivotApp(stage_names=["test"], watch_mode=True)
 
     assert isinstance(app._pending_history, dict)
     assert len(app._pending_history) == 0
 
 
-def test_watch_tui_app_get_current_stage_history_empty(
-    mock_watch_engine: Engine,
-) -> None:
+def test_watch_tui_app_get_current_stage_history_empty() -> None:
     """_get_current_stage_history returns empty deque when no selection."""
-    app = run_tui.PivotApp(engine=mock_watch_engine, stage_names=[])
+    app = run_tui.PivotApp(stage_names=[], watch_mode=True)
 
     history = app._get_current_stage_history()
     assert len(history) == 0
 
 
-def test_watch_tui_app_get_current_stage_history_with_stage(
-    mock_watch_engine: Engine,
-) -> None:
+def test_watch_tui_app_get_current_stage_history_with_stage() -> None:
     """_get_current_stage_history returns stage's history deque."""
-    app = run_tui.PivotApp(engine=mock_watch_engine, stage_names=["stage_a"])
+    app = run_tui.PivotApp(stage_names=["stage_a"], watch_mode=True)
 
     # Add a history entry
     entry = ExecutionHistoryEntry(
@@ -247,15 +235,13 @@ def test_watch_tui_app_get_current_stage_history_with_stage(
 # =============================================================================
 
 
-def test_finalize_history_skipped_without_pending_creates_entry(
-    mock_watch_engine: Engine,
-) -> None:
+def test_finalize_history_skipped_without_pending_creates_entry() -> None:
     """Skipped stages without pending state still get history entries.
 
     This tests the fix for upstream-skipped stages that never went through
     IN_PROGRESS (so never had _pending_history entry created).
     """
-    app = run_tui.PivotApp(engine=mock_watch_engine, stage_names=["downstream_stage"])
+    app = run_tui.PivotApp(stage_names=["downstream_stage"], watch_mode=True)
 
     # Verify no pending history
     assert "downstream_stage" not in app._pending_history
@@ -279,11 +265,9 @@ def test_finalize_history_skipped_without_pending_creates_entry(
     assert entry.logs == []
 
 
-def test_finalize_history_skipped_without_run_id_does_not_create_entry(
-    mock_watch_engine: Engine,
-) -> None:
+def test_finalize_history_skipped_without_run_id_does_not_create_entry() -> None:
     """Skipped stages without run_id don't get history entries (defensive)."""
-    app = run_tui.PivotApp(engine=mock_watch_engine, stage_names=["downstream_stage"])
+    app = run_tui.PivotApp(stage_names=["downstream_stage"], watch_mode=True)
 
     # Call without run_id - should not create entry
     app._finalize_history_entry(
@@ -298,15 +282,13 @@ def test_finalize_history_skipped_without_run_id_does_not_create_entry(
     assert len(app._stages["downstream_stage"].history) == 0
 
 
-def test_finalize_history_failed_without_pending_does_not_create_entry(
-    mock_watch_engine: Engine,
-) -> None:
+def test_finalize_history_failed_without_pending_does_not_create_entry() -> None:
     """Non-SKIPPED statuses without pending state don't get history entries.
 
     Only SKIPPED is special-cased for upstream failures. FAILED/RAN/etc
     should always have gone through IN_PROGRESS.
     """
-    app = run_tui.PivotApp(engine=mock_watch_engine, stage_names=["some_stage"])
+    app = run_tui.PivotApp(stage_names=["some_stage"], watch_mode=True)
 
     # Call with FAILED status but no pending state - unusual case
     app._finalize_history_entry(
@@ -321,15 +303,13 @@ def test_finalize_history_failed_without_pending_does_not_create_entry(
     assert len(app._stages["some_stage"].history) == 0
 
 
-def test_watch_tui_app_new_run_clears_stale_pending_entries(
-    mock_watch_engine: Engine,
-) -> None:
+def test_watch_tui_app_new_run_clears_stale_pending_entries() -> None:
     """New run_id clears pending entries from previous run.
 
     This handles the crash condition where a run is interrupted mid-execution
     and a new run starts, leaving orphaned pending entries.
     """
-    app = run_tui.PivotApp(engine=mock_watch_engine, stage_names=["stage_a", "stage_b"])
+    app = run_tui.PivotApp(stage_names=["stage_a", "stage_b"], watch_mode=True)
 
     # Set up first run with pending entries
     app._current_run_id = "run_001"
@@ -352,11 +332,9 @@ def test_watch_tui_app_new_run_clears_stale_pending_entries(
     assert app._current_run_id == "run_002"
 
 
-def test_watch_tui_app_tracks_current_run_id(
-    mock_watch_engine: Engine,
-) -> None:
+def test_watch_tui_app_tracks_current_run_id() -> None:
     """PivotApp (watch mode) tracks current run_id for detecting new runs."""
-    app = run_tui.PivotApp(engine=mock_watch_engine, stage_names=[])
+    app = run_tui.PivotApp(stage_names=[], watch_mode=True)
 
     assert app._current_run_id is None
 
@@ -366,11 +344,9 @@ def test_watch_tui_app_tracks_current_run_id(
 # =============================================================================
 
 
-def test_history_entry_with_very_long_logs(
-    mock_watch_engine: Engine,
-) -> None:
+def test_history_entry_with_very_long_logs() -> None:
     """History entry handles stages with many log lines efficiently."""
-    app = run_tui.PivotApp(engine=mock_watch_engine, stage_names=["verbose_stage"])
+    app = run_tui.PivotApp(stage_names=["verbose_stage"], watch_mode=True)
 
     # Create entry with many logs (testing memory bounds)
     logs = [LogEntry(f"line {i}", False, float(i)) for i in range(1000)]
@@ -395,9 +371,7 @@ def test_history_entry_with_very_long_logs(
     assert len(history[0].logs) == 1000
 
 
-def test_pending_history_state_logs_maxlen_enforcement(
-    mock_watch_engine: Engine,
-) -> None:
+def test_pending_history_state_logs_maxlen_enforcement() -> None:
     """PendingHistoryState enforces maxlen strictly during rapid updates."""
     state = PendingHistoryState(run_id="test", timestamp=1.0)
 
@@ -413,11 +387,9 @@ def test_pending_history_state_logs_maxlen_enforcement(
     assert state.logs[-1].line == "line 500", "Newest entry should be kept"
 
 
-def test_stage_info_history_separate_instances(
-    mock_watch_engine: Engine,
-) -> None:
+def test_stage_info_history_separate_instances() -> None:
     """Each StageInfo has independent history deque instance."""
-    app = run_tui.PivotApp(engine=mock_watch_engine, stage_names=["stage_a", "stage_b"])
+    app = run_tui.PivotApp(stage_names=["stage_a", "stage_b"], watch_mode=True)
 
     # Add entry to stage_a
     entry_a = ExecutionHistoryEntry(
@@ -460,11 +432,9 @@ def test_stage_info_history_separate_instances(
     assert app._stages["stage_b"].history[0].run_id == "run_b"
 
 
-def test_finalize_history_with_empty_logs(
-    mock_watch_engine: Engine,
-) -> None:
+def test_finalize_history_with_empty_logs() -> None:
     """_finalize_history_entry handles stages with no log output."""
-    app = run_tui.PivotApp(engine=mock_watch_engine, stage_names=["silent_stage"])
+    app = run_tui.PivotApp(stage_names=["silent_stage"], watch_mode=True)
 
     # No pending state (stage didn't produce logs)
     assert "silent_stage" not in app._pending_history
@@ -485,11 +455,9 @@ def test_finalize_history_with_empty_logs(
     assert entry.status == StageStatus.SKIPPED
 
 
-def test_get_current_stage_history_with_no_stages(
-    mock_watch_engine: Engine,
-) -> None:
+def test_get_current_stage_history_with_no_stages() -> None:
     """_get_current_stage_history returns empty deque when stage list is empty."""
-    app = run_tui.PivotApp(engine=mock_watch_engine, stage_names=[])
+    app = run_tui.PivotApp(stage_names=[], watch_mode=True)
 
     # No stages, so no selection possible
     history = app._get_current_stage_history()
@@ -497,9 +465,7 @@ def test_get_current_stage_history_with_no_stages(
     assert isinstance(history, collections.deque)
 
 
-def test_history_bounded_eviction_order(
-    mock_watch_engine: Engine,
-) -> None:
+def test_history_bounded_eviction_order() -> None:
     """StageInfo history evicts oldest entries when exceeding maxlen."""
     info = StageInfo(name="test_stage", index=1, total=1)
 

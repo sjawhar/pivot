@@ -6,6 +6,7 @@ resolving dependencies. Use `pivot repro` for DAG-aware execution.
 
 from __future__ import annotations
 
+import concurrent.futures
 import contextlib
 import datetime
 import pathlib
@@ -77,8 +78,13 @@ def _run_with_tui(
     allow_uncached_incremental: bool = False,
     checkout_missing: bool = False,
 ) -> dict[str, ExecutionSummary] | None:
-    """Run pipeline with TUI display."""
+    """Run pipeline with TUI display.
+
+    Uses the same threading pattern as repro.py: background thread for engine,
+    main thread for TUI (required for signal handlers like SIGTSTP).
+    """
     from pivot.executor import core as executor_core
+    from pivot.tui import run as tui_run
 
     # Pre-warm loky executor before starting Textual TUI.
     # Textual manipulates terminal file descriptors which breaks loky's
@@ -93,73 +99,77 @@ def _run_with_tui(
 
     pipeline = cli_decorators.get_pipeline_from_context()
 
-    async def tui_oneshot_main() -> dict[str, executor_core.ExecutionSummary]:
-        from pivot.tui import run as tui_run
+    # Create TUI app (will run in main thread)
+    app = tui_run.PivotApp(
+        stage_names=stages_list,
+        tui_log=tui_log,
+        cancel_event=cancel_event,
+    )
 
-        # Create TUI app first (needed for TuiSink)
-        def executor_wrapper() -> dict[str, ExecutionSummary]:
-            return {}
+    # Use Future for thread-safe result passing
+    result_future: concurrent.futures.Future[dict[str, executor_core.ExecutionSummary]] = (
+        concurrent.futures.Future()
+    )
 
-        app = tui_run.PivotApp(
-            stage_names=stages_list,
-            tui_log=tui_log,
-            executor_func=executor_wrapper,
-            cancel_event=cancel_event,
-        )
+    def engine_thread_target() -> None:
+        """Run the async Engine in a background thread with its own event loop."""
 
-        async with engine.Engine(pipeline=pipeline) as eng:
-            # Configure sinks - TuiSink for direct post_message
-            result_sink = _run_common.configure_result_collector(eng)
-            _run_common.configure_output_sink(
-                eng,
-                quiet=False,
-                as_json=False,
-                tui=True,
-                app=app,
-                run_id=run_id,
-                use_console=False,
-                jsonl_callback=None,
-            )
-            _configure_oneshot_source(
-                eng,
-                stages_list,
-                force=force,
-                no_commit=no_commit,
-                no_cache=no_cache,
-                on_error=on_error,
-                allow_uncached_incremental=allow_uncached_incremental,
-                checkout_missing=checkout_missing,
-            )
-
-            # Run engine and TUI concurrently
-            async def engine_task() -> dict[str, executor_core.ExecutionSummary]:
+        async def engine_main() -> dict[str, executor_core.ExecutionSummary]:
+            async with engine.Engine(pipeline=pipeline) as eng:
+                # Configure sinks - TuiSink posts to app (thread-safe)
+                result_sink = _run_common.configure_result_collector(eng)
+                _run_common.configure_output_sink(
+                    eng,
+                    quiet=False,
+                    as_json=False,
+                    tui=True,
+                    app=app,
+                    run_id=run_id,
+                    use_console=False,
+                    jsonl_callback=None,
+                )
+                _configure_oneshot_source(
+                    eng,
+                    stages_list,
+                    force=force,
+                    no_commit=no_commit,
+                    no_cache=no_cache,
+                    on_error=on_error,
+                    allow_uncached_incremental=allow_uncached_incremental,
+                    checkout_missing=checkout_missing,
+                )
                 await eng.run(exit_on_completion=True)
                 stage_results = await result_sink.get_results()
                 return _run_common.convert_results(stage_results)
 
-            # Suppress stderr logging while TUI is active
-            with _run_common.suppress_stderr_logging():
-                # Initialize results outside task group to avoid "possibly unbound" error
-                engine_results: dict[str, executor_core.ExecutionSummary] = {}
-
-                async def run_engine_and_signal() -> None:
-                    nonlocal engine_results
-                    engine_results = await engine_task()
-                    # TuiSink.close() sends TuiShutdown when Engine closes sinks
-
-                async with anyio.create_task_group() as tg:
-                    tg.start_soon(run_engine_and_signal)
-                    await anyio.to_thread.run_sync(app.run)  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType] - anyio stub issue
-                    # TUI exited - if engine is still running, cancel it
-                    tg.cancel_scope.cancel()
-
-                return engine_results
+        try:
+            result_future.set_result(anyio.run(engine_main))
+        except BaseException as e:
+            result_future.set_exception(e)
+        finally:
+            # Signal TUI to exit when engine completes (success or failure)
+            with contextlib.suppress(Exception):
+                app.post_message(tui_run.TuiShutdown())
 
     # Acquire lock for oneshot mode when no_commit=True to prevent race conditions
     # with concurrent commit operations
     lock_context = project_lock.pending_state_lock() if no_commit else contextlib.nullcontext()
     with lock_context:
-        return anyio.run(tui_oneshot_main)
+        # Start engine in background thread
+        engine_thread = threading.Thread(target=engine_thread_target, daemon=True)
+        engine_thread.start()
+
+        # Run TUI in main thread (required for signal handlers)
+        with _run_common.suppress_stderr_logging():
+            app.run()
+
+        # Wait for engine thread to finish (should be quick since TUI already exited)
+        engine_thread.join(timeout=5.0)
+
+        # Return results (re-raises if engine raised an exception)
+        if result_future.done():
+            return result_future.result()
+        return {}
 
 
 def _run_json_mode(
