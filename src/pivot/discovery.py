@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import pathlib
 import runpy
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Final
 
 from pivot import fingerprint, metrics, project
 from pivot.pipeline import yaml as pipeline_config
@@ -102,6 +102,7 @@ def discover_pipeline(project_root: pathlib.Path | None = None) -> Pipeline | No
                 raise DiscoveryError(f"Failed to load {config_path}: {e}") from e
 
         # pipeline.py
+        _t_module = metrics.start()
         try:
             return _load_pipeline_from_module(config_path)
         except SystemExit as e:
@@ -112,6 +113,7 @@ def discover_pipeline(project_root: pathlib.Path | None = None) -> Pipeline | No
         except Exception as e:
             raise DiscoveryError(f"Failed to load {config_path}: {e}") from e
         finally:
+            metrics.end("discovery.load_module", _t_module)
             fingerprint.flush_ast_hash_cache()
     finally:
         metrics.end("discovery.total", _t)
@@ -127,16 +129,16 @@ def _load_pipeline_from_module(path: pathlib.Path) -> Pipeline | None:
     """
     from pivot.pipeline.pipeline import Pipeline
 
-    module_dict: dict[str, Any] = runpy.run_path(str(path), run_name="_pivot_pipeline")
+    module_dict = runpy.run_path(str(path), run_name="_pivot_pipeline")
 
     # Look for 'pipeline' variable
-    pipeline: Any = module_dict.get("pipeline")
-    if pipeline is not None:
-        if not isinstance(pipeline, Pipeline):
+    pipeline_obj = module_dict.get("pipeline")
+    if pipeline_obj is not None:
+        if not isinstance(pipeline_obj, Pipeline):
             raise DiscoveryError(
-                f"{path} defines 'pipeline' but it's not a Pipeline instance (got {type(pipeline).__name__})"
+                f"{path} defines 'pipeline' but it's not a Pipeline instance (got {type(pipeline_obj).__name__})"
             )
-        return pipeline
+        return pipeline_obj
 
     # No 'pipeline' variable - check if there's a Pipeline under a different name
     # This catches cases where user creates a Pipeline but forgets to name it 'pipeline'

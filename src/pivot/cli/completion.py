@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import logging
 import pathlib
-from typing import Literal
+import tempfile
+from typing import Any, Literal, cast
 
 import click
 from click.shell_completion import CompletionItem
@@ -10,6 +11,8 @@ from click.shell_completion import CompletionItem
 from pivot.config.models import CONFIG_KEY_DESCRIPTIONS, VALID_REMOTE_NAME
 
 logger = logging.getLogger(__name__)
+
+CACHE_VERSION = "v1"
 
 
 def complete_config_keys(
@@ -30,8 +33,6 @@ def complete_config_keys(
 
 def _get_config_keys() -> dict[str, str]:
     """Get all valid config keys with descriptions, including dynamic remotes."""
-    from typing import Any, cast
-
     import yaml
 
     keys = dict(CONFIG_KEY_DESCRIPTIONS)
@@ -41,14 +42,15 @@ def _get_config_keys() -> dict[str, str]:
         try:
             if not path.exists():
                 continue
-            data = cast("dict[str, Any] | None", yaml.safe_load(path.read_text(encoding="utf-8")))
-            if data is None:
+            data: object = yaml.safe_load(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
                 continue
-            remotes = data.get("remotes")
+            typed_data = cast("dict[str, Any]", data)
+            remotes: object = typed_data.get("remotes")
             if isinstance(remotes, dict):
-                for name in remotes:  # pyright: ignore[reportUnknownVariableType] - validated below
-                    if isinstance(name, str) and VALID_REMOTE_NAME.match(name):
-                        keys[f"remotes.{name}"] = f"Remote '{name}'"
+                for remote_name in cast("dict[str, Any]", remotes):
+                    if VALID_REMOTE_NAME.match(remote_name):
+                        keys[f"remotes.{remote_name}"] = f"Remote '{remote_name}'"
         except Exception:
             logger.debug("Config completion: failed to load %s", path, exc_info=True)
             continue
@@ -87,6 +89,81 @@ def complete_stages(
 complete_targets = complete_stages
 
 
+def _detect_config_file(root: pathlib.Path) -> tuple[str, float] | None:
+    """Detect config file and capture its mtime.
+
+    Returns (relative_path, mtime) or None if no config found.
+    """
+    from pivot import discovery
+
+    for name in (*discovery.PIVOT_YAML_NAMES, discovery.PIPELINE_PY_NAME):
+        path = root / name
+        if path.exists():
+            return (name, path.stat().st_mtime)
+    return None
+
+
+def _get_stages_from_cache(root: pathlib.Path) -> list[str] | None:
+    """Read stage names from cache if fresh.
+
+    Returns stage names if cache exists and is valid, None otherwise.
+    Cache is valid when version matches and config file mtime unchanged.
+    """
+    cache_path = root / ".pivot" / "cache" / "stages.cache"
+    try:
+        lines = cache_path.read_text().splitlines()
+    except OSError:
+        return None
+
+    if len(lines) < 2 or lines[0] != CACHE_VERSION:
+        return None
+
+    header = lines[1]
+    sep_idx = header.rfind(":")
+    if sep_idx == -1:
+        return None
+
+    config_file, mtime_str = header[:sep_idx], header[sep_idx + 1 :]
+
+    try:
+        current_mtime = (root / config_file).stat().st_mtime
+    except OSError:
+        return None
+
+    if str(current_mtime) != mtime_str:
+        return None
+
+    return [line for line in lines[2:] if line]
+
+
+def _write_stages_cache(
+    root: pathlib.Path, config_file: str, mtime: float, stages: list[str]
+) -> None:
+    """Write stage names to cache (atomic).
+
+    Uses temp file + rename for atomic write on POSIX.
+    Cleans up temp file on failure before re-raising OSError.
+    Caller is responsible for handling write failures.
+    """
+    cache_dir = root / ".pivot" / "cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    cache_path = cache_dir / "stages.cache"
+    content = f"{CACHE_VERSION}\n{config_file}:{mtime}\n" + "\n".join(stages) + "\n"
+
+    # Write to temp file in same directory, then rename atomically
+    fd, tmp_path_str = tempfile.mkstemp(dir=cache_dir, suffix=".tmp")
+    tmp_path = pathlib.Path(tmp_path_str)
+    try:
+        with open(fd, "w") as f:
+            f.write(content)
+        tmp_path.rename(cache_path)
+    except OSError:
+        # Clean up temp file on failure
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
 def _get_stages_fast() -> list[str] | None:
     """Fast path: get stage names without full Pivot imports (~10ms).
 
@@ -99,6 +176,10 @@ def _get_stages_fast() -> list[str] | None:
     root = _find_project_root_fast()
     if root is None:
         return None
+
+    # Try cache first (works for both YAML and pipeline.py)
+    if (stages := _get_stages_from_cache(root)) is not None:
+        return stages
 
     yaml_path = next(
         (p for p in [root / "pivot.yaml", root / "pivot.yml"] if p.exists()),
@@ -113,10 +194,12 @@ def _get_stages_fast() -> list[str] | None:
     from pivot import matrix
 
     try:
-        config = yaml.safe_load(yaml_path.read_text())
+        raw: object = yaml.safe_load(yaml_path.read_text())
     except yaml.YAMLError:
         logger.debug("YAML parse error in %s", yaml_path)
         return None
+
+    config = cast("dict[str, Any]", raw) if isinstance(raw, dict) else None
 
     if matrix.needs_fallback(config):
         return None
@@ -125,14 +208,35 @@ def _get_stages_fast() -> list[str] | None:
 
 
 def _get_stages_full() -> list[str]:
-    """Fallback: get stage names via full discovery (~500ms)."""
+    """Fallback: get stage names via full discovery (~500ms).
+
+    Writes stage names to cache after discovery for future fast lookups.
+    Cache is only written if config file mtime is unchanged during discovery
+    (prevents race condition where config changes during slow discovery).
+    """
     from pivot import discovery
+
+    # Capture config file and mtime BEFORE discovery (race condition prevention)
+    root = _find_project_root_fast()
+    pre_discovery = _detect_config_file(root) if root else None
 
     pipeline = discovery.discover_pipeline()
     if pipeline is None:
         return []
 
-    return pipeline.list_stages()
+    stages = pipeline.list_stages()
+
+    # Write cache only if config file unchanged during discovery
+    if root and pre_discovery:
+        config_file, pre_mtime = pre_discovery
+        try:
+            post_mtime = (root / config_file).stat().st_mtime
+            if pre_mtime == post_mtime:
+                _write_stages_cache(root, config_file, pre_mtime, stages)
+        except OSError:
+            pass  # Cache write failure is non-fatal
+
+    return stages
 
 
 def _find_project_root_fast() -> pathlib.Path | None:
