@@ -256,6 +256,7 @@ def _run_plain_mode(
     allow_uncached_incremental: bool,
     checkout_missing: bool,
     quiet: bool,
+    show_output: bool = False,
 ) -> dict[str, ExecutionSummary]:
     """Run pipeline in plain (non-TUI) mode with optional console output."""
     from pivot.executor import core as executor_core
@@ -280,6 +281,7 @@ def _run_plain_mode(
                 run_id=None,
                 use_console=console is not None,
                 jsonl_callback=None,
+                show_output=show_output,
             )
             _configure_oneshot_source(
                 eng,
@@ -333,6 +335,11 @@ def _validate_stages_required(stages_list: list[str] | None) -> list[str]:
 )
 @click.option("--json", "as_json", is_flag=True, help="Output results as JSON")
 @click.option(
+    "--show-output",
+    is_flag=True,
+    help="Stream stage output (stdout/stderr) to terminal",
+)
+@click.option(
     "--tui-log",
     type=click.Path(path_type=pathlib.Path),
     help="Write TUI messages to JSONL file for monitoring",
@@ -369,6 +376,7 @@ def run(
     force: bool,
     tui_flag: bool,
     as_json: bool,
+    show_output: bool,
     tui_log: pathlib.Path | None,
     no_commit: bool,
     no_cache: bool,
@@ -396,6 +404,9 @@ def run(
     # Validate --tui and --json are mutually exclusive
     if tui_flag and as_json:
         raise click.ClickException("--tui and --json are mutually exclusive")
+
+    # Validate --show-output combinations
+    _run_common.validate_show_output(show_output, tui_flag, as_json, quiet)
 
     # Validate tui_log
     tui_log = _run_common.validate_tui_log(tui_log, as_json, tui_flag)
@@ -437,6 +448,7 @@ def run(
             allow_uncached_incremental=allow_uncached_incremental,
             checkout_missing=checkout_missing,
             quiet=quiet,
+            show_output=show_output,
         )
 
     if not results and show_human_output:

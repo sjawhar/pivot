@@ -355,3 +355,199 @@ async def test_console_sink_running_message_format() -> None:
     text = output.getvalue()
     assert "Running train" in text, "Should include 'Running' prefix"
     assert "..." in text, "Should include trailing ellipsis"
+
+
+async def test_console_sink_handles_log_line_when_show_output_enabled() -> None:
+    """ConsoleSink prints log lines when show_output=True."""
+    from io import StringIO
+
+    from rich.console import Console
+
+    from pivot.engine.sinks import ConsoleSink
+    from pivot.engine.types import LogLine
+
+    output = StringIO()
+    console = Console(file=output, force_terminal=True)
+    sink = ConsoleSink(console=console, show_output=True)
+
+    event = LogLine(
+        type="log_line",
+        stage="train",
+        line="Processing batch 1...",
+        is_stderr=False,
+    )
+    await sink.handle(event)
+
+    result = output.getvalue()
+    # Rich adds ANSI codes that can split brackets, check components separately
+    assert "train" in result
+    assert "Processing batch" in result
+
+
+async def test_console_sink_stderr_line_contains_content() -> None:
+    """ConsoleSink prints stderr lines with stage prefix."""
+    from io import StringIO
+
+    from rich.console import Console
+
+    from pivot.engine.sinks import ConsoleSink
+    from pivot.engine.types import LogLine
+
+    output = StringIO()
+    console = Console(file=output, force_terminal=True)
+    sink = ConsoleSink(console=console, show_output=True)
+
+    event = LogLine(
+        type="log_line",
+        stage="train",
+        line="Warning: GPU not available",
+        is_stderr=True,
+    )
+    await sink.handle(event)
+
+    result = output.getvalue()
+    # Rich adds ANSI codes that can split brackets, check components separately
+    assert "train" in result
+    assert "Warning: GPU not available" in result
+
+
+async def test_console_sink_ignores_log_line_when_show_output_disabled() -> None:
+    """ConsoleSink ignores log lines when show_output=False (default)."""
+    from io import StringIO
+
+    from rich.console import Console
+
+    from pivot.engine.sinks import ConsoleSink
+    from pivot.engine.types import LogLine
+
+    output = StringIO()
+    console = Console(file=output, force_terminal=True)
+    sink = ConsoleSink(console=console)  # show_output defaults to False
+
+    event = LogLine(
+        type="log_line",
+        stage="train",
+        line="Processing batch 1...",
+        is_stderr=False,
+    )
+    await sink.handle(event)
+
+    # Should not print anything when show_output is False
+    assert output.getvalue() == ""
+
+
+async def test_console_sink_handles_empty_log_line() -> None:
+    """ConsoleSink handles empty log lines without errors."""
+    from io import StringIO
+
+    from rich.console import Console
+
+    from pivot.engine.sinks import ConsoleSink
+    from pivot.engine.types import LogLine
+
+    output = StringIO()
+    console = Console(file=output, force_terminal=True)
+    sink = ConsoleSink(console=console, show_output=True)
+
+    event = LogLine(
+        type="log_line",
+        stage="train",
+        line="",
+        is_stderr=False,
+    )
+    await sink.handle(event)
+
+    result = output.getvalue()
+    # Should still print stage prefix even with empty line
+    assert "train" in result
+
+
+async def test_console_sink_handles_multiline_log_output() -> None:
+    """ConsoleSink prints each line from multiline output separately."""
+    from io import StringIO
+
+    from rich.console import Console
+
+    from pivot.engine.sinks import ConsoleSink
+    from pivot.engine.types import LogLine
+
+    output = StringIO()
+    console = Console(file=output, force_terminal=True)
+    sink = ConsoleSink(console=console, show_output=True)
+
+    # Simulate a stage that outputs multiline logs
+    event = LogLine(
+        type="log_line",
+        stage="train",
+        line="Line 1\nLine 2\nLine 3",
+        is_stderr=False,
+    )
+    await sink.handle(event)
+
+    result = output.getvalue()
+    assert "train" in result
+    # Rich may tokenize numbers separately, check components
+    assert "Line" in result
+    assert "1" in result and "2" in result and "3" in result
+
+
+async def test_console_sink_handles_special_characters() -> None:
+    """ConsoleSink handles special characters without crashing."""
+    from io import StringIO
+
+    from rich.console import Console
+
+    from pivot.engine.sinks import ConsoleSink
+    from pivot.engine.types import LogLine
+
+    output = StringIO()
+    console = Console(file=output, force_terminal=True)
+    sink = ConsoleSink(console=console, show_output=True)
+
+    # Test with brackets that could conflict with Rich markup
+    event = LogLine(
+        type="log_line",
+        stage="train",
+        line="[INFO] Processing <data> with 'quotes' and \"double quotes\"",
+        is_stderr=False,
+    )
+    await sink.handle(event)
+
+    result = output.getvalue()
+    assert "train" in result
+    assert "INFO" in result
+    assert "Processing" in result
+
+
+async def test_console_sink_escapes_rich_markup_in_log_lines() -> None:
+    """ConsoleSink escapes Rich markup in log lines to prevent injection.
+
+    Stage output containing Rich markup syntax (e.g. [red]text[/red]) should
+    be displayed literally, not interpreted as formatting instructions.
+    """
+    from io import StringIO
+
+    from rich.console import Console
+
+    from pivot.engine.sinks import ConsoleSink
+    from pivot.engine.types import LogLine
+
+    output = StringIO()
+    # no_color=True ensures we get plain text output for easier assertion
+    console = Console(file=output, force_terminal=False, no_color=True)
+    sink = ConsoleSink(console=console, show_output=True)
+
+    # Simulate a stage that outputs text containing Rich markup syntax
+    event = LogLine(
+        type="log_line",
+        stage="train",
+        line="[bold red]FAKE ERROR[/bold red] - this should display literally",
+        is_stderr=False,
+    )
+    await sink.handle(event)
+
+    result = output.getvalue()
+    # The markup tags should be visible as literal text, not interpreted
+    assert "[bold red]" in result or "\\[bold red]" in result
+    assert "FAKE ERROR" in result
+    assert "this should display literally" in result

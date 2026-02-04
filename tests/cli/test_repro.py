@@ -500,3 +500,127 @@ def test_repro_no_cache_option_accepted(
     result = runner.invoke(cli.cli, ["repro", "--no-cache"])
 
     assert result.exit_code == 0
+
+
+# =============================================================================
+# Show Output Flag Tests
+# =============================================================================
+
+
+def test_repro_show_output_mutually_exclusive_with_tui(
+    runner: click.testing.CliRunner,
+) -> None:
+    """--show-output and --tui are mutually exclusive."""
+    with runner.isolated_filesystem():
+        pathlib.Path("pivot.yaml").write_text("stages: {}")
+
+        result = runner.invoke(cli.cli, ["repro", "--show-output", "--tui"])
+
+        assert result.exit_code != 0
+        assert "--show-output and --tui are mutually exclusive" in result.output
+
+
+def test_repro_show_output_mutually_exclusive_with_json(
+    runner: click.testing.CliRunner,
+) -> None:
+    """--show-output and --json are mutually exclusive."""
+    with runner.isolated_filesystem():
+        pathlib.Path("pivot.yaml").write_text("stages: {}")
+
+        result = runner.invoke(cli.cli, ["repro", "--show-output", "--json"])
+
+        assert result.exit_code != 0
+        assert "--show-output and --json are mutually exclusive" in result.output
+
+
+def test_repro_show_output_mutually_exclusive_with_quiet(
+    runner: click.testing.CliRunner,
+) -> None:
+    """--show-output and --quiet are mutually exclusive."""
+    with runner.isolated_filesystem():
+        pathlib.Path("pivot.yaml").write_text("stages: {}")
+
+        result = runner.invoke(cli.cli, ["--quiet", "repro", "--show-output"])
+
+        assert result.exit_code != 0
+        assert "--show-output and --quiet are mutually exclusive" in result.output
+
+
+def test_repro_show_output_streams_stage_logs(
+    mock_discovery: Pipeline,
+    runner: click.testing.CliRunner,
+) -> None:
+    """--show-output streams stage stdout to terminal."""
+    import sys
+
+    class _PrintOutputs(TypedDict):
+        output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
+
+    def _helper_printing_stage() -> _PrintOutputs:
+        # This will be captured and should appear in output
+        sys.stdout.write("Processing data...\n")
+        sys.stdout.flush()
+        pathlib.Path("output.txt").write_text("done")
+        return _PrintOutputs(output=pathlib.Path("output.txt"))
+
+    register_test_stage(_helper_printing_stage, name="printer")
+
+    result = runner.invoke(cli.cli, ["repro", "--show-output"])
+
+    assert result.exit_code == 0, f"Failed: {result.output}"
+    # Should contain the log line with stage prefix
+    assert "printer" in result.output
+    assert "Processing data..." in result.output
+
+
+def test_repro_show_output_streams_stderr_in_red(
+    mock_discovery: Pipeline,
+    runner: click.testing.CliRunner,
+) -> None:
+    """--show-output streams stderr with red formatting."""
+    import sys
+
+    class _StderrOutputs(TypedDict):
+        output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
+
+    def _helper_stderr_stage() -> _StderrOutputs:
+        sys.stderr.write("Warning: something happened\n")
+        sys.stderr.flush()
+        pathlib.Path("output.txt").write_text("done")
+        return _StderrOutputs(output=pathlib.Path("output.txt"))
+
+    register_test_stage(_helper_stderr_stage, name="warner")
+
+    result = runner.invoke(cli.cli, ["repro", "--show-output"])
+
+    assert result.exit_code == 0, f"Failed: {result.output}"
+    # Should contain stderr line
+    assert "warner" in result.output
+    assert "Warning: something happened" in result.output
+
+
+def test_repro_without_show_output_hides_logs(
+    mock_discovery: Pipeline,
+    runner: click.testing.CliRunner,
+) -> None:
+    """Default behavior (no --show-output) doesn't show stage logs."""
+    import sys
+
+    class _QuietOutputs(TypedDict):
+        output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
+
+    def _helper_quiet_stage() -> _QuietOutputs:
+        sys.stdout.write("This should not appear\n")
+        sys.stdout.flush()
+        pathlib.Path("output.txt").write_text("done")
+        return _QuietOutputs(output=pathlib.Path("output.txt"))
+
+    register_test_stage(_helper_quiet_stage, name="quiet")
+
+    result = runner.invoke(cli.cli, ["repro"])
+
+    assert result.exit_code == 0, f"Failed: {result.output}"
+    # Should NOT contain the log line (only stage completion message)
+    assert "This should not appear" not in result.output
+    # But should show completion
+    assert "quiet" in result.output

@@ -5,6 +5,8 @@ from typing import TYPE_CHECKING
 
 import anyio
 import anyio.to_thread
+import rich.console
+import rich.markup
 
 from pivot.engine.types import StageCompleted
 from pivot.types import (
@@ -15,8 +17,6 @@ from pivot.types import (
 )
 
 if TYPE_CHECKING:
-    import rich.console
-
     from pivot.engine.types import (
         LogLine,
         OutputEvent,
@@ -74,9 +74,11 @@ class ConsoleSink:
     """Async sink that prints stage events to console."""
 
     _console: rich.console.Console
+    _show_output: bool
 
-    def __init__(self, *, console: rich.console.Console) -> None:
+    def __init__(self, *, console: rich.console.Console, show_output: bool = False) -> None:
         self._console = console
+        self._show_output = show_output
 
     async def handle(self, event: OutputEvent) -> None:
         """Handle output event by printing to console."""
@@ -95,10 +97,19 @@ class ConsoleSink:
                         self._console.print(f"  {stage}: [red]FAILED[/red]")
                         if event["reason"]:
                             # Indent each line of the error for readability
+                            # Escape to prevent Rich markup injection from error messages
                             for line in event["reason"].rstrip().split("\n"):
-                                self._console.print(f"    [dim]{line}[/dim]")
+                                self._console.print(f"    [dim]{rich.markup.escape(line)}[/dim]")
+            case "log_line" if self._show_output:
+                stage = event["stage"]
+                # Escape line content to prevent Rich markup injection from stage output
+                line = rich.markup.escape(event["line"])
+                if event["is_stderr"]:
+                    self._console.print(f"[red]\\[{stage}][/red] [red]{line}[/red]")
+                else:
+                    self._console.print(f"\\[{stage}] {line}")
             case _:
-                pass  # Ignore log_line, engine_state_changed, etc.
+                pass  # Ignore other events
 
     async def close(self) -> None:
         """No cleanup needed."""
