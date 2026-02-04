@@ -683,6 +683,7 @@ def test_get_pipeline_explanations_upstream_propagation(
     pipeline = test_pipeline
 
     with contextlib.chdir(tmp_path):
+        pathlib.Path(".pivot").mkdir(exist_ok=True)
         pathlib.Path(".git").mkdir(exist_ok=True)
         pathlib.Path("input.txt").write_text("data")
 

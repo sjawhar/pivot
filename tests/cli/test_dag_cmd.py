@@ -14,7 +14,6 @@ if TYPE_CHECKING:
 
     from pivot.pipeline.pipeline import Pipeline
 
-
 # =============================================================================
 # Output TypedDicts for annotation-based stages
 # =============================================================================
@@ -107,8 +106,6 @@ def test_dag_empty_pipeline_ascii(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Empty pipeline shows empty graph placeholder in ASCII (default) format."""
-    monkeypatch.chdir(tmp_path)
-    pathlib.Path(".git").mkdir()
 
     result = runner.invoke(cli.cli, ["dag"])
 
@@ -123,8 +120,6 @@ def test_dag_empty_pipeline_mermaid(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Empty pipeline shows valid empty Mermaid flowchart."""
-    monkeypatch.chdir(tmp_path)
-    pathlib.Path(".git").mkdir()
 
     result = runner.invoke(cli.cli, ["dag", "--mermaid"])
 
@@ -139,8 +134,6 @@ def test_dag_empty_pipeline_dot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Empty pipeline shows minimal DOT graph."""
-    monkeypatch.chdir(tmp_path)
-    pathlib.Path(".git").mkdir()
 
     result = runner.invoke(cli.cli, ["dag", "--dot"])
 
@@ -156,8 +149,6 @@ def test_dag_empty_pipeline_md(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Empty pipeline shows Mermaid wrapped in markdown code block."""
-    monkeypatch.chdir(tmp_path)
-    pathlib.Path(".git").mkdir()
 
     result = runner.invoke(cli.cli, ["dag", "--md"])
 
@@ -179,8 +170,6 @@ def test_dag_single_stage_ascii(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Single stage shows output artifact in ASCII."""
-    monkeypatch.chdir(tmp_path)
-    pathlib.Path(".git").mkdir()
 
     register_test_stage(_helper_extract, name="extract")
 
@@ -198,8 +187,6 @@ def test_dag_single_stage_stages_flag(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Single stage shows stage name with --stages flag."""
-    monkeypatch.chdir(tmp_path)
-    pathlib.Path(".git").mkdir()
 
     register_test_stage(_helper_extract, name="extract")
 
@@ -221,8 +208,6 @@ def test_dag_linear_chain_ascii(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Linear pipeline shows all artifacts in ASCII."""
-    monkeypatch.chdir(tmp_path)
-    pathlib.Path(".git").mkdir()
 
     register_test_stage(_helper_extract, name="extract")
     register_test_stage(_helper_transform, name="transform")
@@ -243,8 +228,6 @@ def test_dag_linear_chain_stages(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Linear pipeline shows all stages with --stages flag."""
-    monkeypatch.chdir(tmp_path)
-    pathlib.Path(".git").mkdir()
 
     register_test_stage(_helper_extract, name="extract")
     register_test_stage(_helper_transform, name="transform")
@@ -265,8 +248,6 @@ def test_dag_linear_chain_mermaid(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Linear pipeline shows edges in Mermaid format."""
-    monkeypatch.chdir(tmp_path)
-    pathlib.Path(".git").mkdir()
 
     register_test_stage(_helper_extract, name="extract")
     register_test_stage(_helper_transform, name="transform")
@@ -289,8 +270,6 @@ def test_dag_linear_chain_dot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Linear pipeline shows edges in DOT format."""
-    monkeypatch.chdir(tmp_path)
-    pathlib.Path(".git").mkdir()
 
     register_test_stage(_helper_extract, name="extract")
     register_test_stage(_helper_transform, name="transform")
@@ -318,8 +297,6 @@ def test_dag_diamond_pattern_stages(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Diamond pattern shows all stages."""
-    monkeypatch.chdir(tmp_path)
-    pathlib.Path(".git").mkdir()
 
     register_test_stage(_helper_extract, name="extract")
     register_test_stage(_helper_branch_a, name="branch_a")
@@ -342,8 +319,6 @@ def test_dag_diamond_pattern_mermaid(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Diamond pattern shows correct edges in Mermaid."""
-    monkeypatch.chdir(tmp_path)
-    pathlib.Path(".git").mkdir()
 
     register_test_stage(_helper_extract, name="extract")
     register_test_stage(_helper_branch_a, name="branch_a")
@@ -369,8 +344,6 @@ def test_dag_target_single_stage(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Target filtering by stage name shows stage and its upstream."""
-    monkeypatch.chdir(tmp_path)
-    pathlib.Path(".git").mkdir()
 
     register_test_stage(_helper_extract, name="extract")
     register_test_stage(_helper_transform, name="transform")
@@ -393,8 +366,6 @@ def test_dag_target_artifact_path(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Target filtering by artifact path resolves to producing stage and upstream."""
-    monkeypatch.chdir(tmp_path)
-    pathlib.Path(".git").mkdir()
 
     register_test_stage(_helper_extract, name="extract")
     register_test_stage(_helper_transform, name="transform")
@@ -418,8 +389,6 @@ def test_dag_target_multiple_targets(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Multiple targets includes all specified stages and their upstreams."""
-    monkeypatch.chdir(tmp_path)
-    pathlib.Path(".git").mkdir()
 
     register_test_stage(_helper_extract, name="extract")
     register_test_stage(_helper_branch_a, name="branch_a")
@@ -442,8 +411,6 @@ def test_dag_target_invalid_stage_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Invalid target that doesn't match any stage or artifact shows error."""
-    monkeypatch.chdir(tmp_path)
-    pathlib.Path(".git").mkdir()
 
     register_test_stage(_helper_extract, name="extract")
 
@@ -466,8 +433,6 @@ def test_dag_md_format_wraps_mermaid(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """--md flag wraps Mermaid output in markdown code block."""
-    monkeypatch.chdir(tmp_path)
-    pathlib.Path(".git").mkdir()
 
     register_test_stage(_helper_extract, name="extract")
     register_test_stage(_helper_transform, name="transform")
@@ -491,8 +456,6 @@ def test_dag_ascii_default_format(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Default output format is ASCII."""
-    monkeypatch.chdir(tmp_path)
-    pathlib.Path(".git").mkdir()
 
     register_test_stage(_helper_extract, name="extract")
     register_test_stage(_helper_transform, name="transform")
@@ -516,8 +479,6 @@ def test_dag_artifact_view_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Default view shows artifacts, not stage names."""
-    monkeypatch.chdir(tmp_path)
-    pathlib.Path(".git").mkdir()
 
     register_test_stage(_helper_extract, name="extract")
 
@@ -535,8 +496,6 @@ def test_dag_stage_view_with_flag(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """--stages flag shows stage names instead of artifacts."""
-    monkeypatch.chdir(tmp_path)
-    pathlib.Path(".git").mkdir()
 
     register_test_stage(_helper_extract, name="extract")
 
@@ -553,8 +512,6 @@ def test_dag_stages_flag_with_mermaid(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """--stages flag works with --mermaid format."""
-    monkeypatch.chdir(tmp_path)
-    pathlib.Path(".git").mkdir()
 
     register_test_stage(_helper_extract, name="extract")
     register_test_stage(_helper_transform, name="transform")
@@ -575,8 +532,6 @@ def test_dag_stages_flag_with_dot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """--stages flag works with --dot format."""
-    monkeypatch.chdir(tmp_path)
-    pathlib.Path(".git").mkdir()
 
     register_test_stage(_helper_extract, name="extract")
     register_test_stage(_helper_transform, name="transform")
@@ -595,8 +550,6 @@ def test_dag_target_partial_resolution(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Command succeeds with partial target resolution (valid + invalid targets)."""
-    monkeypatch.chdir(tmp_path)
-    pathlib.Path(".git").mkdir()
 
     register_test_stage(_helper_extract, name="extract")
     register_test_stage(_helper_transform, name="transform")

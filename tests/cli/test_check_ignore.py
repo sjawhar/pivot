@@ -4,6 +4,7 @@ import json
 import pathlib
 from typing import TYPE_CHECKING
 
+from conftest import isolated_pivot_dir
 from pivot import cli
 
 if TYPE_CHECKING:
@@ -34,8 +35,7 @@ def test_check_ignore_matches_default_pattern(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
     """check-ignore should match files against .pivotignore patterns."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
+    with isolated_pivot_dir(runner, tmp_path):
         pathlib.Path(".pivotignore").write_text("*.log\n")
 
         result = runner.invoke(cli.cli, ["check-ignore", "app.log"])
@@ -46,8 +46,7 @@ def test_check_ignore_matches_default_pattern(
 
 def test_check_ignore_no_match(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
     """check-ignore should return exit code 1 when no targets are ignored."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
+    with isolated_pivot_dir(runner, tmp_path):
         pathlib.Path(".pivotignore").write_text("*.log\n")
 
         result = runner.invoke(cli.cli, ["check-ignore", "important.txt"])
@@ -59,8 +58,7 @@ def test_check_ignore_details_shows_source(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
     """check-ignore --details should show matching pattern and source."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
+    with isolated_pivot_dir(runner, tmp_path):
         pathlib.Path(".pivotignore").write_text("*.log\n")
 
         result = runner.invoke(cli.cli, ["check-ignore", "--details", "app.log"])
@@ -72,8 +70,7 @@ def test_check_ignore_details_shows_source(
 
 def test_check_ignore_json_output(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
     """check-ignore --json should output JSON format."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
+    with isolated_pivot_dir(runner, tmp_path):
         pathlib.Path(".pivotignore").write_text("*.log\n")
 
         result = runner.invoke(cli.cli, ["check-ignore", "--json", "app.log"])
@@ -91,9 +88,7 @@ def test_check_ignore_show_defaults(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
     """check-ignore --show-defaults should list default patterns."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-
+    with isolated_pivot_dir(runner, tmp_path):
         result = runner.invoke(cli.cli, ["check-ignore", "--show-defaults"])
 
         assert result.exit_code == 0
@@ -106,8 +101,7 @@ def test_check_ignore_multiple_targets(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
     """check-ignore should handle multiple targets."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
+    with isolated_pivot_dir(runner, tmp_path):
         pathlib.Path(".pivotignore").write_text("*.log\n*.tmp\n")
 
         result = runner.invoke(cli.cli, ["check-ignore", "app.log", "cache.tmp", "keep.txt"])
@@ -121,8 +115,7 @@ def test_check_ignore_negation_pattern(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
     """check-ignore should respect negation patterns."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
+    with isolated_pivot_dir(runner, tmp_path):
         pathlib.Path(".pivotignore").write_text("*.log\n!important.log\n")
 
         result = runner.invoke(cli.cli, ["check-ignore", "important.log"])
@@ -135,8 +128,7 @@ def test_check_ignore_negation_pattern_details(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
     """check-ignore --details should show negation pattern."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
+    with isolated_pivot_dir(runner, tmp_path):
         pathlib.Path(".pivotignore").write_text("*.log\n!important.log\n")
 
         result = runner.invoke(cli.cli, ["check-ignore", "--details", "important.log"])
@@ -149,8 +141,7 @@ def test_check_ignore_without_pivotignore(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
     """check-ignore should work without .pivotignore file."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
+    with isolated_pivot_dir(runner, tmp_path):
         # No .pivotignore file
 
         result = runner.invoke(cli.cli, ["check-ignore", "file.txt"])
@@ -162,8 +153,7 @@ def test_check_ignore_directory_pattern(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
     """check-ignore should handle directory patterns."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
+    with isolated_pivot_dir(runner, tmp_path):
         pathlib.Path(".pivotignore").write_text("build/\n")
         pathlib.Path("build").mkdir()
 
@@ -177,9 +167,7 @@ def test_check_ignore_no_targets_shows_help(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
     """check-ignore without targets or --show-defaults should show message."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-
+    with isolated_pivot_dir(runner, tmp_path):
         result = runner.invoke(cli.cli, ["check-ignore"])
 
         # Should indicate how to use the command

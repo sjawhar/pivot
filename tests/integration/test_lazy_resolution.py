@@ -277,3 +277,89 @@ stages:
     # Build DAG should succeed
     dag = child.build_dag(validate=True)
     assert dag.has_edge("consumer", "producer")
+
+
+def test_resolve_external_dependencies_sibling_pipelines(
+    set_project_root: pathlib.Path,
+) -> None:
+    """Should resolve dependencies from sibling pipeline directories.
+
+    This is the core use case: time_horizon_1_0 depends on output from
+    time_horizon_1_1, where both are siblings under model_reports/.
+    """
+    # Create sibling structure:
+    # project_root/
+    #   model_reports/
+    #     sibling_a/pipeline.py  <- consumer, depends on ../sibling_b/data/output.txt
+    #     sibling_b/pipeline.py  <- producer of data/output.txt
+
+    model_reports = set_project_root / "model_reports"
+    sibling_a = model_reports / "sibling_a"
+    sibling_b = model_reports / "sibling_b"
+    sibling_a.mkdir(parents=True)
+    sibling_b.mkdir(parents=True)
+
+    # Producer in sibling_b
+    (sibling_b / "pipeline.py").write_text(
+        _make_producer_pipeline_code("sibling_b", "producer", "data/output.txt")
+    )
+
+    # Consumer in sibling_a depends on sibling_b's output
+    (sibling_a / "pipeline.py").write_text(
+        _make_consumer_pipeline_code(
+            "sibling_a", "consumer", "../sibling_b/data/output.txt", "result.txt"
+        )
+    )
+
+    # Load consumer pipeline and resolve
+    consumer = discovery.load_pipeline_from_path(sibling_a / "pipeline.py")
+    assert consumer is not None
+
+    consumer.resolve_external_dependencies()
+
+    # Should include producer from sibling
+    assert "producer" in consumer.list_stages()
+    assert "consumer" in consumer.list_stages()
+
+    # Build DAG should succeed
+    dag = consumer.build_dag(validate=True)
+    assert dag.has_edge("consumer", "producer")
+
+    # Producer's state_dir should be sibling_b's .pivot
+    producer_info = consumer.get("producer")
+    assert producer_info["state_dir"] == sibling_b / ".pivot"
+
+
+def test_build_dag_auto_resolves_external_dependencies(
+    set_project_root: pathlib.Path,
+) -> None:
+    """build_dag() should automatically resolve external dependencies.
+
+    Users shouldn't need to call resolve_external_dependencies() explicitly.
+    """
+    # Same sibling structure as previous test
+    model_reports = set_project_root / "model_reports"
+    sibling_a = model_reports / "sibling_a"
+    sibling_b = model_reports / "sibling_b"
+    sibling_a.mkdir(parents=True)
+    sibling_b.mkdir(parents=True)
+
+    (sibling_b / "pipeline.py").write_text(
+        _make_producer_pipeline_code("sibling_b", "producer", "data/output.txt")
+    )
+    (sibling_a / "pipeline.py").write_text(
+        _make_consumer_pipeline_code(
+            "sibling_a", "consumer", "../sibling_b/data/output.txt", "result.txt"
+        )
+    )
+
+    # Load consumer pipeline - do NOT call resolve_external_dependencies()
+    consumer = discovery.load_pipeline_from_path(sibling_a / "pipeline.py")
+    assert consumer is not None
+
+    # build_dag should auto-resolve and succeed
+    dag = consumer.build_dag(validate=True)
+
+    # Should have included producer automatically
+    assert "producer" in consumer.list_stages()
+    assert dag.has_edge("consumer", "producer")

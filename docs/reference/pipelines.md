@@ -285,6 +285,16 @@ When including external pipelines:
 - Only include pipelines from trusted sources
 - Review included pipeline code before use
 
+## Multi-Pipeline Projects
+
+For projects with multiple pipelines in separate directories, Pivot automatically discovers and includes stages from other pipelines when resolving dependencies. This enables:
+
+- Parent pipelines providing shared data to child pipelines
+- Sibling pipelines depending on each other's outputs
+- Modular project organization without explicit `include()` calls
+
+See the [Multi-Pipeline Tutorial](../tutorial/multi-pipeline.md) for a hands-on guide, or [Pipeline Discovery & Resolution](discovery.md) for detailed mechanics.
+
 ## Path Resolution
 
 Paths in annotations are resolved relative to the **pipeline root** - the directory containing the `pipeline.py` file. This enables simple, portable paths that work regardless of where the pipeline is located within your project.

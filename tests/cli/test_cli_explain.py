@@ -7,6 +7,7 @@ import pathlib
 import sys
 from typing import TYPE_CHECKING
 
+from conftest import isolated_pivot_dir
 from pivot import cli
 
 if TYPE_CHECKING:
@@ -30,12 +31,11 @@ def _cli_isolated_filesystem(runner: CliRunner, tmp_path: pathlib.Path) -> Gener
     """Set up isolated filesystem with sys.path for stage imports.
 
     This context manager:
-    1. Creates an isolated filesystem via CliRunner
+    1. Creates an isolated filesystem via isolated_pivot_dir (includes .pivot and .git)
     2. Adds the directory to sys.path so 'stages' module can be imported
     3. Cleans up sys.path and cached modules on exit
     """
-    with runner.isolated_filesystem(temp_dir=tmp_path) as path_str:
-        path = pathlib.Path(path_str)
+    with isolated_pivot_dir(runner, tmp_path) as path:
         sys.path.insert(0, str(path))
         # Clear any cached stages module
         if "stages" in sys.modules:
@@ -175,8 +175,6 @@ def test_explain_flag_in_help(runner: CliRunner) -> None:
 def test_explain_no_stages(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """repro --explain with no pipeline errors with appropriate message."""
     with _cli_isolated_filesystem(runner, tmp_path):
-        pathlib.Path(".git").mkdir()
-
         result = runner.invoke(cli.cli, ["repro", "--explain"])
 
         assert result.exit_code != 0
@@ -187,7 +185,6 @@ def test_explain_no_stages(runner: CliRunner, tmp_path: pathlib.Path) -> None:
 def test_explain_flag_works(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """repro --explain produces output for stages."""
     with _cli_isolated_filesystem(runner, tmp_path):
-        pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
         _write_stages_py(_PROCESS_STAGE)
         _write_pivot_yaml("""\
@@ -206,7 +203,6 @@ stages:
 def test_explain_specific_stages(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """repro --explain can target specific stages."""
     with _cli_isolated_filesystem(runner, tmp_path):
-        pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
         _write_stages_py(_STAGES_A_B)
         _write_pivot_yaml("""\
@@ -268,7 +264,6 @@ def test_explain_shows_unchanged(runner: CliRunner, tmp_path: pathlib.Path) -> N
 def test_explain_shows_no_previous_run(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """repro --explain shows 'No previous run' for never-run stages."""
     with _cli_isolated_filesystem(runner, tmp_path):
-        pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
         _write_stages_py(_PROCESS_STAGE)
         _write_pivot_yaml("""\
@@ -291,7 +286,6 @@ stages:
 def test_explain_short_flag(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """repro -e short flag works like --explain."""
     with _cli_isolated_filesystem(runner, tmp_path):
-        pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
         _write_stages_py(_PROCESS_STAGE)
         _write_pivot_yaml("""\
@@ -315,7 +309,6 @@ stages:
 def test_explain_unknown_stage_errors(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """repro --explain with unknown stage shows error."""
     with _cli_isolated_filesystem(runner, tmp_path):
-        pathlib.Path(".git").mkdir()
         pathlib.Path("input.txt").write_text("data")
         _write_stages_py(_PROCESS_STAGE)
         _write_pivot_yaml("""\

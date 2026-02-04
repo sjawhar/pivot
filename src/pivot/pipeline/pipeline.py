@@ -249,6 +249,10 @@ class Pipeline:
     def build_dag(self, validate: bool = True) -> DiGraph[str]:
         """Build DAG from registered stages.
 
+        Automatically resolves external dependencies before building. For each
+        dependency without a local producer, searches for pipelines starting from
+        the dependency's directory and traversing up to project root.
+
         Args:
             validate: If True, validate that all dependencies exist
 
@@ -259,6 +263,8 @@ class Pipeline:
             CyclicGraphError: If graph contains cycles
             DependencyNotFoundError: If dependency doesn't exist (when validate=True)
         """
+        # Auto-resolve external dependencies before building
+        self.resolve_external_dependencies()
         return self._registry.build_dag(validate=validate)
 
     def snapshot(self) -> dict[str, registry.RegistryStageInfo]:
@@ -316,16 +322,18 @@ class Pipeline:
                 f"Included {len(stages_to_add)} stages from pipeline '{other.name}' into '{self.name}'"
             )
 
-    def resolve_from_parents(self) -> None:
-        """Resolve unresolved dependencies by searching parent pipelines.
+    def resolve_external_dependencies(self) -> None:
+        """Resolve unresolved dependencies by searching for external pipelines.
 
         For each dependency that has no local producer:
-        1. Traverse up directory tree looking for pivot.yaml or pipeline.py
-        2. Load each parent pipeline and search for a stage producing the artifact
+        1. Start from the dependency's directory and traverse up to project root
+        2. Load each pipeline found and search for a stage producing the artifact
         3. Include that stage and add its dependencies to the work queue
 
-        Dependencies that exist on disk are treated as external inputs.
-        Uses per-call caching (parents loaded once per resolve, discarded after).
+        This enables both parent and sibling pipeline dependencies to be resolved
+        automatically. Dependencies that exist on disk are treated as external inputs.
+
+        Uses per-call caching (pipelines loaded once per resolve, discarded after).
         """
         project_root = project.get_project_root()
 
@@ -343,18 +351,13 @@ class Pipeline:
         if not work:
             return
 
-        # Find parent pipeline files once
-        parent_files = list(discovery.find_parent_pipeline_paths(self.root, project_root))
-        if not parent_files:
-            return
+        # Per-call cache: avoid reloading same pipeline for each unresolved dep
+        loaded_pipelines: dict[pathlib.Path, Pipeline | None] = {}
 
-        # Per-call cache: avoid reloading same parent for each unresolved dep
-        loaded_parents: dict[pathlib.Path, Pipeline | None] = {}
-
-        def get_parent(path: pathlib.Path) -> Pipeline | None:
-            if path not in loaded_parents:
-                loaded_parents[path] = discovery.load_pipeline_from_path(path)
-            return loaded_parents[path]
+        def get_pipeline(path: pathlib.Path) -> Pipeline | None:
+            if path not in loaded_pipelines:
+                loaded_pipelines[path] = discovery.load_pipeline_from_path(path)
+            return loaded_pipelines[path]
 
         # Process work queue iteratively
         while work:
@@ -364,18 +367,22 @@ class Pipeline:
             if dep_path in local_outputs or pathlib.Path(dep_path).exists():
                 continue
 
-            # Search parent pipelines for producer
-            for parent_file in parent_files:
-                parent = get_parent(parent_file)
-                if parent is None:
+            # Search for pipelines starting from the dependency's directory
+            pipeline_files = discovery.find_pipeline_paths_for_dependency(
+                pathlib.Path(dep_path), project_root
+            )
+
+            for pipeline_file in pipeline_files:
+                pipeline = get_pipeline(pipeline_file)
+                if pipeline is None:
                     continue
 
                 # Find stage that produces this artifact
                 producer_name = next(
                     (
                         name
-                        for name in parent.list_stages()
-                        if dep_path in parent.get(name)["outs_paths"]
+                        for name in pipeline.list_stages()
+                        if dep_path in pipeline.get(name)["outs_paths"]
                     ),
                     None,
                 )
@@ -387,14 +394,15 @@ class Pipeline:
                     break
 
                 # Include the producer stage
-                stage_info = copy.deepcopy(parent.get(producer_name))
+                stage_info = copy.deepcopy(pipeline.get(producer_name))
                 self._registry.add_existing(stage_info)
                 local_outputs.update(stage_info["outs_paths"])
 
                 # Add producer's unresolved dependencies to work queue
                 work.update(dep for dep in stage_info["deps_paths"] if dep not in local_outputs)
 
-                logger.debug(
-                    f"Included stage '{producer_name}' from parent pipeline '{parent.name}'"
-                )
+                logger.debug(f"Included stage '{producer_name}' from pipeline '{pipeline.name}'")
                 break
+
+    # Keep old name as alias for backwards compatibility
+    resolve_from_parents = resolve_external_dependencies  # pyright: ignore[reportUnannotatedClassAttribute] - method alias

@@ -53,8 +53,9 @@ def minimal_pipeline(
     monkeypatch.setattr(config, "get_state_db_path", lambda: tmp_path / "state" / "state.db")
     monkeypatch.chdir(tmp_path)
 
-    # Create git directory (required for project root detection)
-    (tmp_path / ".git").mkdir(exist_ok=True)
+    # Create .pivot directory (required for project root detection)
+    (tmp_path / ".pivot").mkdir(exist_ok=True)
+    (tmp_path / ".git").mkdir(exist_ok=True)  # For git operations
 
     return test_pipeline
 

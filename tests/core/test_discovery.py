@@ -923,3 +923,90 @@ def test_find_parent_pipeline_paths_raises_on_path_resolution_failure(
 
     with pytest.raises(discovery.DiscoveryError, match="Failed to resolve paths"):
         list(discovery.find_parent_pipeline_paths(broken_dir, stop_at=tmp_path))
+
+
+# =============================================================================
+# Dependency Pipeline Discovery Tests (find_pipeline_paths_for_dependency)
+# =============================================================================
+
+
+def test_find_pipeline_paths_for_dependency_finds_sibling(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Should find pipeline in dependency's directory, not just parents."""
+    # Create sibling pipeline structure:
+    # tmp_path/
+    #   sibling_a/pipeline.py  <- consuming pipeline
+    #   sibling_b/pipeline.py  <- produces the dependency
+    sibling_a = tmp_path / "sibling_a"
+    sibling_b = tmp_path / "sibling_b"
+    sibling_a.mkdir()
+    sibling_b.mkdir()
+
+    (sibling_a / "pipeline.py").write_text("# consumer")
+    (sibling_b / "pipeline.py").write_text("# producer")
+
+    # Dependency path is in sibling_b
+    dep_path = sibling_b / "data" / "output.csv"
+
+    paths = list(discovery.find_pipeline_paths_for_dependency(dep_path, tmp_path))
+
+    # Should find sibling_b's pipeline (closest to dependency)
+    assert sibling_b / "pipeline.py" in paths
+
+
+def test_find_pipeline_paths_for_dependency_nested(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Should find pipelines at multiple levels when dependency is deeply nested."""
+    # Structure:
+    # tmp_path/
+    #   pipeline.py           <- root pipeline
+    #   subdir/
+    #     pipeline.py         <- intermediate pipeline
+    #     deep/
+    #       data/output.csv   <- dependency location
+
+    subdir = tmp_path / "subdir"
+    deep = subdir / "deep"
+    deep.mkdir(parents=True)
+
+    (tmp_path / "pipeline.py").write_text("# root")
+    (subdir / "pipeline.py").write_text("# intermediate")
+
+    dep_path = deep / "data" / "output.csv"
+
+    paths = list(discovery.find_pipeline_paths_for_dependency(dep_path, tmp_path))
+
+    # Should find both, closest first
+    assert paths == [subdir / "pipeline.py", tmp_path / "pipeline.py"]
+
+
+def test_find_pipeline_paths_for_dependency_stops_at_project_root(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Should not traverse above project root."""
+    # Dependency outside project root should still be bounded
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    (project_root / "pipeline.py").write_text("# project root")
+
+    # Dep path within project
+    dep_path = project_root / "data" / "file.csv"
+
+    paths = list(discovery.find_pipeline_paths_for_dependency(dep_path, project_root))
+
+    assert paths == [project_root / "pipeline.py"]
+
+
+def test_find_pipeline_paths_for_dependency_no_pipelines(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Should return empty when no pipelines exist."""
+    subdir = tmp_path / "empty"
+    subdir.mkdir()
+    dep_path = subdir / "data.csv"
+
+    paths = list(discovery.find_pipeline_paths_for_dependency(dep_path, tmp_path))
+
+    assert paths == []

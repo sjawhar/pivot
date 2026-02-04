@@ -53,7 +53,6 @@ stages:
     python: stages.train
 """
     (tmp_path / "pivot.yaml").write_text(yaml_content)
-    (tmp_path / ".git").mkdir()
 
     mocker.patch.object(completion, "_find_project_root_fast", return_value=tmp_path)
 
@@ -73,7 +72,6 @@ stages:
       dataset: [swe, human]
 """
     (tmp_path / "pivot.yaml").write_text(yaml_content)
-    (tmp_path / ".git").mkdir()
 
     mocker.patch.object(completion, "_find_project_root_fast", return_value=tmp_path)
 
@@ -99,7 +97,6 @@ stages:
       model: [bert, gpt]
 """
     (tmp_path / "pivot.yaml").write_text(yaml_content)
-    (tmp_path / ".git").mkdir()
 
     mocker.patch.object(completion, "_find_project_root_fast", return_value=tmp_path)
 
@@ -118,7 +115,6 @@ def test_get_stages_fast_returns_none_when_no_project_root(mocker: MockerFixture
 
 def test_get_stages_fast_returns_none_when_no_yaml(tmp_path: Path, mocker: MockerFixture) -> None:
     """Returns None when pivot.yaml doesn't exist."""
-    (tmp_path / ".git").mkdir()
 
     mocker.patch.object(completion, "_find_project_root_fast", return_value=tmp_path)
 
@@ -135,7 +131,6 @@ stages:
     variants: stages.get_variants
 """
     (tmp_path / "pivot.yaml").write_text(yaml_content)
-    (tmp_path / ".git").mkdir()
 
     mocker.patch.object(completion, "_find_project_root_fast", return_value=tmp_path)
 
@@ -146,7 +141,6 @@ stages:
 def test_get_stages_fast_returns_none_on_yaml_error(tmp_path: Path, mocker: MockerFixture) -> None:
     """Returns None on YAML parse error."""
     (tmp_path / "pivot.yaml").write_text("invalid: yaml: [[[")
-    (tmp_path / ".git").mkdir()
 
     mocker.patch.object(completion, "_find_project_root_fast", return_value=tmp_path)
 
@@ -162,7 +156,6 @@ stages:
     python: stages.test
 """
     (tmp_path / "pivot.yml").write_text(yaml_content)
-    (tmp_path / ".git").mkdir()
 
     mocker.patch.object(completion, "_find_project_root_fast", return_value=tmp_path)
 
@@ -196,7 +189,7 @@ def test_find_project_root_fast_finds_pivot_marker(tmp_path: Path, mocker: Mocke
 
 def test_find_project_root_fast_walks_up(tmp_path: Path, mocker: MockerFixture) -> None:
     """Walks up directory tree to find marker."""
-    (tmp_path / ".git").mkdir()
+    (tmp_path / ".pivot").mkdir()
     subdir = tmp_path / "src" / "pkg"
     subdir.mkdir(parents=True)
     mocker.patch("pathlib.Path.cwd", return_value=subdir)
@@ -257,7 +250,6 @@ stages:
     python: stages.preprocess
 """
     (tmp_path / "pivot.yaml").write_text(yaml_content)
-    (tmp_path / ".git").mkdir()
     mocker.patch.object(completion, "_find_project_root_fast", return_value=tmp_path)
 
     result = completion.complete_stages(mock_ctx, mock_param, "tr")
@@ -279,7 +271,6 @@ stages:
     python: stages.test
 """
     (tmp_path / "pivot.yaml").write_text(yaml_content)
-    (tmp_path / ".git").mkdir()
     mocker.patch.object(completion, "_find_project_root_fast", return_value=tmp_path)
 
     result = completion.complete_stages(mock_ctx, mock_param, "")
@@ -333,7 +324,6 @@ stages:
     python: stages.preprocess
 """
     (tmp_path / "pivot.yaml").write_text(yaml_content)
-    (tmp_path / ".git").mkdir()
     mocker.patch.object(completion, "_find_project_root_fast", return_value=tmp_path)
 
     result = completion.complete_stages(mock_ctx, mock_param, "train@b")
@@ -357,7 +347,6 @@ stages:
     python: stages.TRAIN
 """
     (tmp_path / "pivot.yaml").write_text(yaml_content)
-    (tmp_path / ".git").mkdir()
     mocker.patch.object(completion, "_find_project_root_fast", return_value=tmp_path)
 
     result = completion.complete_stages(mock_ctx, mock_param, "tr")
@@ -384,7 +373,6 @@ stages:
     python: stages.test
 """
     (tmp_path / "pivot.yaml").write_text(yaml_content)
-    (tmp_path / ".git").mkdir()
     mocker.patch.object(completion, "_find_project_root_fast", return_value=tmp_path)
 
     result = completion.complete_targets(mock_ctx, mock_param, "tr")
@@ -408,7 +396,6 @@ stages:
     python: stages.deploy
 """
     (tmp_path / "pivot.yaml").write_text(yaml_content)
-    (tmp_path / ".git").mkdir()
     mocker.patch.object(completion, "_find_project_root_fast", return_value=tmp_path)
 
     result = completion.complete_targets(mock_ctx, mock_param, "t")

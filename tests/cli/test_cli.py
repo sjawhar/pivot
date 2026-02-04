@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Annotated, TypedDict
 
 import pandas  # noqa: TC002 - needed for type hint resolution
 
+from conftest import isolated_pivot_dir
 from helpers import register_test_stage
 from pivot import cli, loaders, outputs
 from pivot.tui import console
@@ -170,8 +171,7 @@ def test_cli_list_verbose_shows_details(
 
 def test_cli_dry_run_shows_what_would_run(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """Dry-run shows stages that would run."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
+    with isolated_pivot_dir(runner, tmp_path):
         pathlib.Path("input.txt").write_text("data")
 
         pathlib.Path("pipeline.py").write_text("""\
@@ -205,8 +205,7 @@ pipeline.register(process)
 
 def test_cli_dry_run_shows_unchanged_as_skip(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """Dry-run shows unchanged stages as 'would skip'."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
+    with isolated_pivot_dir(runner, tmp_path):
         pathlib.Path("input.txt").write_text("data")
 
         pathlib.Path("pipeline.py").write_text("""\
@@ -245,8 +244,7 @@ pipeline.register(process)
 
 def test_cli_force_dry_run_shows_forced(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """Dry-run with --force shows stages as 'would run (forced)'."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
+    with isolated_pivot_dir(runner, tmp_path):
         pathlib.Path("input.txt").write_text("data")
 
         pathlib.Path("pipeline.py").write_text("""\
@@ -286,8 +284,7 @@ pipeline.register(process)
 
 def test_cli_dry_run_missing_deps_errors(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """Dry-run fails when dependencies don't exist and aren't produced by other stages."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
+    with isolated_pivot_dir(runner, tmp_path):
         # Don't create input.txt - it's missing and not produced by any stage
 
         pathlib.Path("pipeline.py").write_text("""\
@@ -320,9 +317,7 @@ pipeline.register(process)
 
 def test_cli_dry_run_no_stages(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """Dry-run with no stages reports empty pipeline."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-
+    with isolated_pivot_dir(runner, tmp_path):
         # Create empty pipeline
         pathlib.Path("pipeline.py").write_text("""\
 from __future__ import annotations
@@ -339,8 +334,7 @@ pipeline = Pipeline('test')
 
 def test_cli_dry_run_specific_stage(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """Dry-run with stage argument only shows specified stage and dependencies."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
+    with isolated_pivot_dir(runner, tmp_path):
         pathlib.Path("input.txt").write_text("data")
 
         pathlib.Path("pipeline.py").write_text("""\
@@ -383,8 +377,7 @@ pipeline.register(stage_b)
 
 def test_cli_dry_run_json_output(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """Dry-run with --json outputs valid JSON with stage information."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
+    with isolated_pivot_dir(runner, tmp_path):
         pathlib.Path("input.txt").write_text("data")
 
         pathlib.Path("pipeline.py").write_text("""\
@@ -420,9 +413,7 @@ pipeline.register(process)
 
 def test_cli_dry_run_json_empty_pipeline(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """Dry-run --json with no stages outputs empty stages dict."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-
+    with isolated_pivot_dir(runner, tmp_path):
         # Create empty pipeline
         pathlib.Path("pipeline.py").write_text("""\
 from __future__ import annotations
@@ -440,8 +431,7 @@ pipeline = Pipeline('test')
 
 def test_cli_dry_run_json_with_force(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """Dry-run --json --force shows forced status."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
+    with isolated_pivot_dir(runner, tmp_path):
         pathlib.Path("input.txt").write_text("data")
 
         pathlib.Path("pipeline.py").write_text("""\
@@ -488,9 +478,7 @@ pipeline.register(process)
 
 def test_cli_run_exception_shows_error(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """Run command shows error when exception occurs."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-
+    with isolated_pivot_dir(runner, tmp_path):
         result = runner.invoke(cli.cli, ["run", "nonexistent"])
 
         assert result.exit_code != 0
@@ -499,9 +487,7 @@ def test_cli_run_exception_shows_error(runner: CliRunner, tmp_path: pathlib.Path
 
 def test_cli_dry_run_exception_shows_error(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """Dry-run command shows error when exception occurs."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-
+    with isolated_pivot_dir(runner, tmp_path):
         result = runner.invoke(cli.cli, ["repro", "--dry-run", "nonexistent"])
 
         assert result.exit_code != 0
@@ -514,8 +500,7 @@ def test_cli_dry_run_exception_shows_error(runner: CliRunner, tmp_path: pathlib.
 
 def test_cli_run_prints_results(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """Run command prints results for each stage."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
+    with isolated_pivot_dir(runner, tmp_path):
         pathlib.Path("input.txt").write_text("data")
 
         pathlib.Path("pipeline.py").write_text("""\
@@ -550,8 +535,7 @@ pipeline.register(my_stage)
 
 def test_cli_run_prints_skipped_stages(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """Run command correctly shows skipped stages."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
+    with isolated_pivot_dir(runner, tmp_path):
         pathlib.Path("input.txt").write_text("data")
 
         pathlib.Path("pipeline.py").write_text("""\
@@ -598,9 +582,7 @@ pipeline.register(my_stage)
 
 def test_cli_list_no_stages(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """List with no stages shows appropriate message."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-
+    with isolated_pivot_dir(runner, tmp_path):
         # Create empty pipeline
         pathlib.Path("pipeline.py").write_text("""\
 from __future__ import annotations
@@ -660,8 +642,7 @@ def test_cli_help_contains_inspection_commands(runner: CliRunner) -> None:
 
 def test_cli_run_unknown_stage_shows_suggestion(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """Running unknown stage shows error with suggestion to run pivot list."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
+    with isolated_pivot_dir(runner, tmp_path):
         pathlib.Path("input.txt").write_text("data")
 
         pathlib.Path("pipeline.py").write_text("""\
@@ -699,8 +680,7 @@ pipeline.register(my_stage)
 
 def test_cli_run_json_emits_schema_version(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """pivot run --json emits schema_version event first."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
+    with isolated_pivot_dir(runner, tmp_path):
         pathlib.Path("input.txt").write_text("data")
 
         pathlib.Path("pipeline.py").write_text("""\
@@ -738,8 +718,7 @@ pipeline.register(my_stage)
 
 def test_cli_run_json_emits_stage_events(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """pivot run --json emits stage_start and stage_complete events."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
+    with isolated_pivot_dir(runner, tmp_path):
         pathlib.Path("input.txt").write_text("data")
 
         pathlib.Path("pipeline.py").write_text("""\
@@ -776,8 +755,7 @@ pipeline.register(my_stage)
 
 def test_cli_run_json_emits_execution_result(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """pivot run --json emits execution_result event at end."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
+    with isolated_pivot_dir(runner, tmp_path):
         pathlib.Path("input.txt").write_text("data")
 
         pathlib.Path("pipeline.py").write_text("""\
@@ -817,9 +795,7 @@ pipeline.register(my_stage)
 
 def test_cli_repro_json_no_stages_emits_events(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """pivot repro --json emits events even with no stages (run requires stages)."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-
+    with isolated_pivot_dir(runner, tmp_path):
         # Create empty pipeline
         pathlib.Path("pipeline.py").write_text("""\
 from __future__ import annotations
@@ -843,8 +819,7 @@ def test_cli_run_json_stage_complete_has_duration(
     runner: CliRunner, tmp_path: pathlib.Path
 ) -> None:
     """pivot run --json stage_complete events include duration_ms."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
+    with isolated_pivot_dir(runner, tmp_path):
         pathlib.Path("input.txt").write_text("data")
 
         pathlib.Path("pipeline.py").write_text("""\
@@ -900,9 +875,7 @@ def test_cli_quiet_verbose_mutually_exclusive(runner: CliRunner) -> None:
 
 def test_cli_list_quiet_produces_no_output(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """pivot --quiet list produces no output."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-
+    with isolated_pivot_dir(runner, tmp_path):
         # Create empty pipeline
         pathlib.Path("pipeline.py").write_text("""\
 from __future__ import annotations
@@ -920,9 +893,7 @@ pipeline = Pipeline('test')
 
 def test_cli_run_quiet_produces_no_output(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """pivot --quiet run produces no output when stages run successfully."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-
+    with isolated_pivot_dir(runner, tmp_path):
         pathlib.Path("pipeline.py").write_text("""\
 from __future__ import annotations
 import pathlib
@@ -952,8 +923,7 @@ pipeline.register(test_stage)
 
 def test_cli_track_quiet_produces_no_output(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """pivot --quiet track produces no output."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
+    with isolated_pivot_dir(runner, tmp_path):
         pathlib.Path("data.txt").write_text("test data")
 
         # Create empty pipeline
@@ -974,9 +944,7 @@ pipeline = Pipeline('test')
 
 def test_cli_checkout_quiet_produces_no_output(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """pivot --quiet checkout produces no output."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-
+    with isolated_pivot_dir(runner, tmp_path):
         # Create empty pipeline
         pathlib.Path("pipeline.py").write_text("""\
 from __future__ import annotations
@@ -1002,9 +970,7 @@ pipeline = Pipeline('test')
 
 def test_cli_commit_quiet_produces_no_output(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """pivot --quiet commit produces no output."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-
+    with isolated_pivot_dir(runner, tmp_path):
         # Create empty pipeline
         pathlib.Path("pipeline.py").write_text("""\
 from __future__ import annotations
@@ -1022,9 +988,7 @@ pipeline = Pipeline('test')
 
 def test_cli_export_quiet_produces_no_output(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """pivot --quiet export produces no output."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-
+    with isolated_pivot_dir(runner, tmp_path):
         pathlib.Path("pipeline.py").write_text("""\
 from __future__ import annotations
 from pivot.pipeline.pipeline import Pipeline
@@ -1047,9 +1011,7 @@ pipeline.register(test_stage)
 
 def test_cli_doctor_quiet_produces_no_output(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """pivot --quiet doctor produces no output."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-
+    with isolated_pivot_dir(runner, tmp_path):
         result = runner.invoke(cli.cli, ["--quiet", "doctor"])
 
         assert result.exit_code == 0
@@ -1058,10 +1020,7 @@ def test_cli_doctor_quiet_produces_no_output(runner: CliRunner, tmp_path: pathli
 
 def test_cli_history_quiet_produces_no_output(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """pivot --quiet history produces no output."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        pathlib.Path(".pivot").mkdir()
-
+    with isolated_pivot_dir(runner, tmp_path):
         result = runner.invoke(cli.cli, ["--quiet", "history"])
 
         assert result.exit_code == 0
@@ -1070,8 +1029,7 @@ def test_cli_history_quiet_produces_no_output(runner: CliRunner, tmp_path: pathl
 
 def test_cli_dry_run_quiet_suppresses_output(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """pivot --quiet repro --dry-run should suppress output."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
+    with isolated_pivot_dir(runner, tmp_path):
         pathlib.Path("input.txt").write_text("data")
 
         pathlib.Path("pipeline.py").write_text("""\
@@ -1110,8 +1068,7 @@ pipeline.register(process)
 
 def test_cli_run_metrics_env_var(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """PIVOT_METRICS=1 enables metrics display to stderr."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
+    with isolated_pivot_dir(runner, tmp_path):
         pathlib.Path("input.txt").write_text("data")
 
         pathlib.Path("pipeline.py").write_text("""\
@@ -1147,8 +1104,7 @@ pipeline.register(my_stage)
 
 def test_cli_run_no_metrics_by_default(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """pivot run does not show metrics by default."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
+    with isolated_pivot_dir(runner, tmp_path):
         pathlib.Path("input.txt").write_text("data")
 
         pathlib.Path("pipeline.py").write_text("""\
@@ -1187,9 +1143,7 @@ def test_cli_run_unknown_stage_in_empty_pipeline_shows_error(
     Edge case: combines two error conditions (no stages + unknown target).
     Should prioritize the stage-not-found error with helpful suggestion.
     """
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-
+    with isolated_pivot_dir(runner, tmp_path):
         # Create empty pipeline
         pathlib.Path("pipeline.py").write_text("""\
 from __future__ import annotations

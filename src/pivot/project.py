@@ -8,15 +8,26 @@ _project_root_cache: pathlib.Path | None = None
 
 
 def find_project_root() -> pathlib.Path:
-    """Walk up from cwd to find .pivot or .git directory."""
-    current = pathlib.Path.cwd().resolve()
-    for parent in [current, *current.parents]:
-        if (parent / ".pivot").exists() or (parent / ".git").exists():
-            logger.debug(f"Found project root: {parent}")
-            return parent
+    """Walk up from cwd to find the top-most .pivot directory.
 
-    logger.warning("No project markers (.pivot or .git) found, using current directory")
-    return current
+    Raises:
+        ProjectNotInitializedError: If no .pivot directory exists above cwd.
+    """
+    from pivot import exceptions
+
+    current = pathlib.Path.cwd().resolve()
+    topmost_pivot: pathlib.Path | None = None
+
+    for parent in [current, *current.parents]:
+        if (parent / ".pivot").is_dir():
+            topmost_pivot = parent
+
+    if topmost_pivot is None:
+        msg = f"No .pivot directory found above '{current}'. Run 'pivot init' to initialize a Pivot project."
+        raise exceptions.ProjectNotInitializedError(msg)
+
+    logger.debug(f"Project root: {topmost_pivot}")
+    return topmost_pivot
 
 
 def get_project_root() -> pathlib.Path:
@@ -24,7 +35,6 @@ def get_project_root() -> pathlib.Path:
     global _project_root_cache
     if _project_root_cache is None:
         _project_root_cache = find_project_root()
-        logger.debug(f"Project root: {_project_root_cache}")
     return _project_root_cache
 
 

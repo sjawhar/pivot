@@ -15,7 +15,6 @@ if TYPE_CHECKING:
 
     from pivot.pipeline.pipeline import Pipeline
 
-
 # =============================================================================
 # Module-level TypedDicts and Stage Functions for annotation-based registration
 # =============================================================================
@@ -86,8 +85,6 @@ def test_run_requires_stage_argument(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """run without arguments errors with usage message."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     register_test_stage(_helper_stage_a, name="stage_a")
 
     result = runner.invoke(cli.cli, ["run"])
@@ -103,8 +100,6 @@ def test_run_executes_single_stage(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """run STAGE executes only that stage."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     register_test_stage(_helper_stage_a, name="stage_a")
     register_test_stage(_helper_stage_b, name="stage_b")
 
@@ -123,8 +118,6 @@ def test_run_executes_multiple_stages_in_order(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """run STAGE1 STAGE2 executes stages in specified order."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     register_test_stage(_helper_stage_a, name="stage_a")
     register_test_stage(_helper_stage_b, name="stage_b")
 
@@ -142,8 +135,6 @@ def test_run_does_not_resolve_dependencies(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """run STAGE does not automatically run dependencies."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     # Create the dependency file manually
     (tmp_path / "a.txt").write_text("manual")
     register_test_stage(_helper_stage_a, name="stage_a")
@@ -170,8 +161,6 @@ def test_run_unknown_stage_errors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """run with unknown stage name errors with helpful message."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     register_test_stage(_helper_stage_a, name="stage_a")
 
     result = runner.invoke(cli.cli, ["run", "nonexistent_stage"])
@@ -187,8 +176,6 @@ def test_run_default_keeps_going_continues_after_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """run defaults to keep-going mode - continues to next stage after failure."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     register_test_stage(_helper_failing_stage, name="failing")
     register_test_stage(_helper_stage_a, name="stage_a")
 
@@ -208,8 +195,6 @@ def test_run_fail_fast_option_accepted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """run --fail-fast option is accepted and affects execution mode."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     register_test_stage(_helper_stage_a, name="stage_a")
 
     # Verify --fail-fast is accepted without error
@@ -231,8 +216,6 @@ def test_run_force_reruns_cached_stages(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """run --force re-runs stages even if cached."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     register_test_stage(_helper_stage_a, name="stage_a")
 
     # First run
@@ -256,8 +239,6 @@ def test_run_tui_log_cannot_use_with_json(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """run --tui-log cannot be used with --json."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     register_test_stage(_helper_stage_a, name="stage_a")
 
     result = runner.invoke(cli.cli, ["run", "--tui-log", "test.log", "--json", "stage_a"])
@@ -274,8 +255,6 @@ def test_run_tui_and_json_mutually_exclusive(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """--tui and --json are mutually exclusive."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     register_test_stage(_helper_stage_a, name="stage_a")
 
     result = runner.invoke(cli.cli, ["run", "--tui", "--json", "stage_a"])
@@ -291,8 +270,6 @@ def test_run_tui_log_requires_tui(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """--tui-log requires --tui flag."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     (tmp_path / "input.txt").write_text("data")
     register_test_stage(_helper_process, name="process")
 
@@ -308,6 +285,7 @@ def test_run_help_includes_tui_flag(
 ) -> None:
     """--tui flag appears in help text."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".pivot").mkdir()
         pathlib.Path(".git").mkdir()
 
         result = runner.invoke(cli.cli, ["run", "--help"])
@@ -330,8 +308,6 @@ def test_run_json_output_streams_jsonl(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """run --json streams JSONL output."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     register_test_stage(_helper_stage_a, name="stage_a")
 
     result = runner.invoke(cli.cli, ["run", "--json", "stage_a"])
@@ -351,8 +327,6 @@ def test_run_json_flag_accepted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """--json flag should work without --tui (plain is now default)."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     (tmp_path / "input.txt").write_text("data")
     register_test_stage(_helper_process, name="process")
 
@@ -370,8 +344,6 @@ def test_run_uses_plain_mode_by_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Plain text output is the default (no --tui flag needed)."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     (tmp_path / "input.txt").write_text("data")
     register_test_stage(_helper_process, name="process")
 
@@ -398,8 +370,6 @@ def test_run_no_commit_option_accepted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """run --no-commit option is accepted."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     register_test_stage(_helper_stage_a, name="stage_a")
 
     result = runner.invoke(cli.cli, ["run", "--no-commit", "stage_a"])
@@ -414,8 +384,6 @@ def test_run_no_cache_option_accepted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """run --no-cache option is accepted."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     register_test_stage(_helper_stage_a, name="stage_a")
 
     result = runner.invoke(cli.cli, ["run", "--no-cache", "stage_a"])
@@ -435,8 +403,6 @@ def test_run_does_not_have_single_stage_option(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """run does not have --single-stage option (it's always single-stage)."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     register_test_stage(_helper_stage_a, name="stage_a")
 
     result = runner.invoke(cli.cli, ["run", "--single-stage", "stage_a"])
@@ -452,8 +418,6 @@ def test_run_does_not_have_dry_run_option(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """run does not have --dry-run option (use repro instead)."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     register_test_stage(_helper_stage_a, name="stage_a")
 
     result = runner.invoke(cli.cli, ["run", "--dry-run", "stage_a"])
@@ -469,8 +433,6 @@ def test_run_does_not_have_explain_option(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """run does not have --explain option (use repro instead)."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     register_test_stage(_helper_stage_a, name="stage_a")
 
     result = runner.invoke(cli.cli, ["run", "--explain", "stage_a"])
@@ -486,8 +448,6 @@ def test_run_does_not_have_watch_option(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """run does not have --watch option (use repro instead)."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     register_test_stage(_helper_stage_a, name="stage_a")
 
     result = runner.invoke(cli.cli, ["run", "--watch", "stage_a"])
@@ -503,8 +463,6 @@ def test_run_does_not_have_keep_going_option(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """run does not have --keep-going option (use --fail-fast instead)."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     register_test_stage(_helper_stage_a, name="stage_a")
 
     result = runner.invoke(cli.cli, ["run", "--keep-going", "stage_a"])
@@ -520,8 +478,6 @@ def test_run_does_not_have_allow_missing_option(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """run does not have --allow-missing option (use repro instead)."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     register_test_stage(_helper_stage_a, name="stage_a")
 
     result = runner.invoke(cli.cli, ["run", "--allow-missing", "stage_a"])
@@ -537,8 +493,6 @@ def test_run_tui_with_tui_log_validation_passes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """--tui --tui-log passes validation (log path is writable)."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     (tmp_path / "input.txt").write_text("data")
     register_test_stage(_helper_process, name="process")
 

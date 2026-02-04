@@ -19,7 +19,6 @@ if TYPE_CHECKING:
     from conftest import GitRepo
     from pivot.pipeline.pipeline import Pipeline
 
-
 # =============================================================================
 # Output TypedDicts for annotation-based stages
 # =============================================================================
@@ -71,9 +70,7 @@ def test_diff_no_stages(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path, mock_discovery: Pipeline
 ) -> None:
     """Diff with no registered stages should report no data files."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        result = runner.invoke(cli.cli, ["diff", "--no-tui", "data.csv"])
+    result = runner.invoke(cli.cli, ["diff", "--no-tui", "data.csv"])
     assert result.exit_code == 0
     assert "No data files found" in result.output
 
@@ -87,13 +84,9 @@ def test_diff_key_and_positional_conflict(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path, mock_discovery: Pipeline
 ) -> None:
     """Diff should error when both --key and --positional are specified."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        # Need to create a file so the targets validation passes
-        pathlib.Path("data.csv").write_text("id,name\n1,alice\n")
-        result = runner.invoke(
-            cli.cli, ["diff", "--no-tui", "--key", "id", "--positional", "data.csv"]
-        )
+    # Need to create a file so the targets validation passes
+    pathlib.Path("data.csv").write_text("id,name\n1,alice\n")
+    result = runner.invoke(cli.cli, ["diff", "--no-tui", "--key", "id", "--positional", "data.csv"])
     assert result.exit_code != 0
     assert "Cannot use both --key and --positional" in result.output
 
@@ -107,9 +100,7 @@ def test_diff_requires_targets(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path, mock_discovery: Pipeline
 ) -> None:
     """Diff requires at least one target."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        result = runner.invoke(cli.cli, ["diff", "--no-tui"])
+    result = runner.invoke(cli.cli, ["diff", "--no-tui"])
     assert result.exit_code != 0
     assert "Missing argument" in result.output or "required" in result.output.lower()
 
@@ -562,6 +553,8 @@ def test_get_without_prior_run_discovers_pipeline(
     repo_path, commit = git_repo
     monkeypatch.chdir(repo_path)
     (repo_path / ".pivot" / "cache" / "files").mkdir(parents=True)
+    # Reset cache so discovery finds this project root
+    project._project_root_cache = None
     (repo_path / ".pivot" / "stages").mkdir(parents=True)
 
     # Create minimal pivot.yaml with stage

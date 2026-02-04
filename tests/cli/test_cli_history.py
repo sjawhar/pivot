@@ -20,11 +20,15 @@ if TYPE_CHECKING:
 @pytest.fixture
 def project_with_runs(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> pathlib.Path:
     """Create a project directory with some run history."""
+    from pivot import project
+
     project_dir = tmp_path / "project"
     project_dir.mkdir()
     (project_dir / ".pivot").mkdir()
 
     monkeypatch.chdir(project_dir)
+    # Reset cache so discovery finds this project root
+    project._project_root_cache = None
 
     # Write some test runs
     state_db_path = project_dir / ".pivot" / "state.db"

@@ -17,7 +17,6 @@ if TYPE_CHECKING:
 
     from pivot.pipeline.pipeline import Pipeline
 
-
 # =============================================================================
 # Module-level TypedDicts and Stage Functions for annotation-based registration
 # =============================================================================
@@ -215,7 +214,6 @@ def test_export_no_stages_error(
 ) -> None:
     """Export with no registered stages shows error."""
     _ = mock_discovery
-    (tmp_path / ".git").mkdir()
 
     with contextlib.chdir(tmp_path):
         result = runner.invoke(cli.cli, ["export"])

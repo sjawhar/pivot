@@ -4,6 +4,7 @@ import pathlib
 import click.testing
 import pytest
 
+from conftest import isolated_pivot_dir
 from pivot import cli
 
 # --- config list tests ---
@@ -12,10 +13,7 @@ from pivot import cli
 def test_config_list_shows_defaults(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        pathlib.Path(".pivot").mkdir()
-
+    with isolated_pivot_dir(runner, tmp_path):
         result = runner.invoke(cli.cli, ["config", "list"])
 
         assert result.exit_code == 0
@@ -26,9 +24,7 @@ def test_config_list_shows_defaults(
 def test_config_list_shows_local_override(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        pathlib.Path(".pivot").mkdir()
+    with isolated_pivot_dir(runner, tmp_path):
         pathlib.Path(".pivot/config.yaml").write_text("cache:\n  dir: /custom\n")
 
         result = runner.invoke(cli.cli, ["config", "list"])
@@ -39,10 +35,7 @@ def test_config_list_shows_local_override(
 
 
 def test_config_list_json_output(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        pathlib.Path(".pivot").mkdir()
-
+    with isolated_pivot_dir(runner, tmp_path):
         result = runner.invoke(cli.cli, ["config", "list", "--json"])
 
         assert result.exit_code == 0
@@ -52,9 +45,7 @@ def test_config_list_json_output(runner: click.testing.CliRunner, tmp_path: path
 
 
 def test_config_list_local_only(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        pathlib.Path(".pivot").mkdir()
+    with isolated_pivot_dir(runner, tmp_path):
         pathlib.Path(".pivot/config.yaml").write_text("cache:\n  dir: /local\n")
 
         result = runner.invoke(cli.cli, ["config", "list", "--local"])
@@ -67,9 +58,7 @@ def test_config_list_local_only(runner: click.testing.CliRunner, tmp_path: pathl
 
 
 def test_config_get_returns_value(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        pathlib.Path(".pivot").mkdir()
+    with isolated_pivot_dir(runner, tmp_path):
         pathlib.Path(".pivot/config.yaml").write_text("cache:\n  dir: /custom\n")
 
         result = runner.invoke(cli.cli, ["config", "get", "cache.dir"])
@@ -81,10 +70,7 @@ def test_config_get_returns_value(runner: click.testing.CliRunner, tmp_path: pat
 def test_config_get_returns_default(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        pathlib.Path(".pivot").mkdir()
-
+    with isolated_pivot_dir(runner, tmp_path):
         result = runner.invoke(cli.cli, ["config", "get", "core.max_workers"])
 
         assert result.exit_code == 0
@@ -93,10 +79,7 @@ def test_config_get_returns_default(
 
 
 def test_config_get_json_output(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        pathlib.Path(".pivot").mkdir()
-
+    with isolated_pivot_dir(runner, tmp_path):
         result = runner.invoke(cli.cli, ["config", "get", "cache.dir", "--json"])
 
         assert result.exit_code == 0
@@ -109,10 +92,7 @@ def test_config_get_json_output(runner: click.testing.CliRunner, tmp_path: pathl
 def test_config_get_unknown_key_errors(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        pathlib.Path(".pivot").mkdir()
-
+    with isolated_pivot_dir(runner, tmp_path):
         result = runner.invoke(cli.cli, ["config", "get", "unknown.key"])
 
         assert result.exit_code != 0
@@ -123,10 +103,7 @@ def test_config_get_unknown_key_errors(
 
 
 def test_config_set_creates_value(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        pathlib.Path(".pivot").mkdir()
-
+    with isolated_pivot_dir(runner, tmp_path):
         result = runner.invoke(cli.cli, ["config", "set", "cache.dir", "/custom"])
 
         assert result.exit_code == 0
@@ -140,10 +117,7 @@ def test_config_set_creates_value(runner: click.testing.CliRunner, tmp_path: pat
 def test_config_set_validates_value(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        pathlib.Path(".pivot").mkdir()
-
+    with isolated_pivot_dir(runner, tmp_path):
         result = runner.invoke(cli.cli, ["config", "set", "core.max_workers", "not-a-number"])
 
         assert result.exit_code != 0
@@ -153,10 +127,7 @@ def test_config_set_validates_value(
 def test_config_set_coerces_string_to_int(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        pathlib.Path(".pivot").mkdir()
-
+    with isolated_pivot_dir(runner, tmp_path):
         result = runner.invoke(cli.cli, ["config", "set", "core.max_workers", "4"])
 
         assert result.exit_code == 0
@@ -175,10 +146,7 @@ def test_config_set_global_flag(
 
     monkeypatch.setattr(io, "get_global_config_path", lambda: global_config)
 
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        pathlib.Path(".pivot").mkdir()
-
+    with isolated_pivot_dir(runner, tmp_path):
         result = runner.invoke(cli.cli, ["config", "set", "--global", "display.precision", "3"])
 
         assert result.exit_code == 0
@@ -188,10 +156,7 @@ def test_config_set_global_flag(
 def test_config_set_checkout_mode_comma_separated(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        pathlib.Path(".pivot").mkdir()
-
+    with isolated_pivot_dir(runner, tmp_path):
         result = runner.invoke(cli.cli, ["config", "set", "cache.checkout_mode", "symlink,copy"])
 
         assert result.exit_code == 0
@@ -203,10 +168,7 @@ def test_config_set_checkout_mode_comma_separated(
 
 
 def test_config_set_remote(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        pathlib.Path(".pivot").mkdir()
-
+    with isolated_pivot_dir(runner, tmp_path):
         result = runner.invoke(cli.cli, ["config", "set", "remotes.origin", "s3://my-bucket/cache"])
 
         assert result.exit_code == 0
@@ -220,10 +182,7 @@ def test_config_set_remote(runner: click.testing.CliRunner, tmp_path: pathlib.Pa
 def test_config_set_invalid_remote_url(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        pathlib.Path(".pivot").mkdir()
-
+    with isolated_pivot_dir(runner, tmp_path):
         result = runner.invoke(cli.cli, ["config", "set", "remotes.origin", "not-an-s3-url"])
 
         assert result.exit_code != 0
@@ -236,9 +195,7 @@ def test_config_set_invalid_remote_url(
 def test_config_unset_removes_value(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        pathlib.Path(".pivot").mkdir()
+    with isolated_pivot_dir(runner, tmp_path):
         pathlib.Path(".pivot/config.yaml").write_text("cache:\n  dir: /custom\n")
 
         result = runner.invoke(cli.cli, ["config", "unset", "cache.dir"])
@@ -252,10 +209,7 @@ def test_config_unset_removes_value(
 
 
 def test_config_unset_missing_key(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        pathlib.Path(".pivot").mkdir()
-
+    with isolated_pivot_dir(runner, tmp_path):
         result = runner.invoke(cli.cli, ["config", "unset", "cache.dir"])
 
         assert result.exit_code == 0
@@ -273,10 +227,7 @@ def test_config_unset_global_flag(
 
     monkeypatch.setattr(io, "get_global_config_path", lambda: global_config)
 
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        pathlib.Path(".pivot").mkdir()
-
+    with isolated_pivot_dir(runner, tmp_path):
         result = runner.invoke(cli.cli, ["config", "unset", "--global", "display.precision"])
 
         assert result.exit_code == 0
@@ -335,10 +286,7 @@ def test_config_get_global_flag(
     monkeypatch.setattr(io, "get_global_config_path", lambda: global_config)
     monkeypatch.setattr(config, "get_global_config_path", lambda: global_config)
 
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        pathlib.Path(".pivot").mkdir()
-
+    with isolated_pivot_dir(runner, tmp_path):
         # Set local value (different from global)
         local_config = pathlib.Path(".pivot/config.yaml")
         local_config.write_text("display:\n  precision: 3\n")
@@ -354,10 +302,7 @@ def test_config_get_local_flag(
     tmp_path: pathlib.Path,
 ) -> None:
     """config get --local reads from local config only."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        pathlib.Path(".pivot").mkdir()
-
+    with isolated_pivot_dir(runner, tmp_path):
         # Set local value
         local_config = pathlib.Path(".pivot/config.yaml")
         local_config.write_text("display:\n  precision: 3\n")
@@ -373,10 +318,7 @@ def test_config_get_global_local_mutually_exclusive(
     tmp_path: pathlib.Path,
 ) -> None:
     """config get --global --local should error."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        pathlib.Path(".pivot").mkdir()
-
+    with isolated_pivot_dir(runner, tmp_path):
         result = runner.invoke(
             cli.cli, ["config", "get", "--global", "--local", "display.precision"]
         )

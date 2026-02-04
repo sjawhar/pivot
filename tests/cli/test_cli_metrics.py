@@ -16,7 +16,6 @@ if TYPE_CHECKING:
 
     from pivot.pipeline.pipeline import Pipeline
 
-
 # =============================================================================
 # Metrics Show Tests
 # =============================================================================
@@ -34,10 +33,8 @@ def test_metrics_show_help(runner: click.testing.CliRunner) -> None:
 def test_metrics_show_file(
     mock_discovery: Pipeline,
     runner: click.testing.CliRunner,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Metrics show displays file contents."""
-    monkeypatch.chdir(mock_discovery.root)
     metric_file = mock_discovery.root / "metrics.json"
     metric_file.write_text(json.dumps({"accuracy": 0.95, "loss": 0.05}))
 
@@ -51,11 +48,8 @@ def test_metrics_show_file(
 def test_metrics_show_json_format(
     mock_discovery: Pipeline,
     runner: click.testing.CliRunner,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Metrics show --json outputs valid JSON."""
-    monkeypatch.chdir(mock_discovery.root)
-    (mock_discovery.root / ".git").mkdir()
     metric_file = mock_discovery.root / "metrics.json"
     metric_file.write_text(json.dumps({"accuracy": 0.95}))
 
@@ -69,10 +63,8 @@ def test_metrics_show_json_format(
 def test_metrics_show_markdown_format(
     mock_discovery: Pipeline,
     runner: click.testing.CliRunner,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Metrics show --md outputs markdown table."""
-    monkeypatch.chdir(mock_discovery.root)
     metric_file = mock_discovery.root / "metrics.json"
     metric_file.write_text(json.dumps({"accuracy": 0.95}))
 
@@ -86,10 +78,8 @@ def test_metrics_show_markdown_format(
 def test_metrics_show_precision(
     mock_discovery: Pipeline,
     runner: click.testing.CliRunner,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Metrics show respects --precision flag."""
-    monkeypatch.chdir(mock_discovery.root)
     metric_file = mock_discovery.root / "metrics.json"
     metric_file.write_text(json.dumps({"accuracy": 0.123456789}))
 
@@ -103,10 +93,8 @@ def test_metrics_show_precision(
 def test_metrics_show_yaml_file(
     mock_discovery: Pipeline,
     runner: click.testing.CliRunner,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Metrics show handles YAML files."""
-    monkeypatch.chdir(mock_discovery.root)
     metric_file = mock_discovery.root / "metrics.yaml"
     metric_file.write_text(yaml.dump({"f1_score": 0.88}))
 
@@ -119,10 +107,8 @@ def test_metrics_show_yaml_file(
 def test_metrics_show_csv_file(
     mock_discovery: Pipeline,
     runner: click.testing.CliRunner,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Metrics show handles CSV files."""
-    monkeypatch.chdir(mock_discovery.root)
     metric_file = mock_discovery.root / "metrics.csv"
     metric_file.write_text("accuracy,0.95\nloss,0.05\n")
 
@@ -136,10 +122,8 @@ def test_metrics_show_csv_file(
 def test_metrics_show_directory(
     mock_discovery: Pipeline,
     runner: click.testing.CliRunner,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Metrics show handles directory target."""
-    monkeypatch.chdir(mock_discovery.root)
     (mock_discovery.root / "a.json").write_text(json.dumps({"a": 1}))
     (mock_discovery.root / "b.json").write_text(json.dumps({"b": 2}))
 
@@ -153,10 +137,8 @@ def test_metrics_show_directory(
 def test_metrics_show_recursive(
     mock_discovery: Pipeline,
     runner: click.testing.CliRunner,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Metrics show -R searches recursively."""
-    monkeypatch.chdir(mock_discovery.root)
     (mock_discovery.root / "a.json").write_text(json.dumps({"a": 1}))
     subdir = mock_discovery.root / "sub"
     subdir.mkdir()
@@ -182,11 +164,8 @@ def test_metrics_show_file_not_found(
 def test_metrics_show_no_targets_no_stages(
     mock_discovery: Pipeline,
     runner: click.testing.CliRunner,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Metrics show with no targets and no stages shows no metrics."""
-    monkeypatch.chdir(mock_discovery.root)
-    (mock_discovery.root / ".git").mkdir()
     result = runner.invoke(cli.cli, ["metrics", "show"])
 
     assert result.exit_code == 0
@@ -211,11 +190,8 @@ def test_metrics_diff_help(runner: click.testing.CliRunner) -> None:
 def test_metrics_diff_no_metrics(
     mock_discovery: Pipeline,
     runner: click.testing.CliRunner,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Metrics diff with no registered stages should report empty."""
-    monkeypatch.chdir(mock_discovery.root)
-    (mock_discovery.root / ".git").mkdir()
     result = runner.invoke(cli.cli, ["metrics", "diff"])
     assert result.exit_code == 0
     assert "No metrics found" in result.output
@@ -224,11 +200,8 @@ def test_metrics_diff_no_metrics(
 def test_metrics_diff_explicit_file_no_stages(
     mock_discovery: Pipeline,
     runner: click.testing.CliRunner,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Issue #62: metrics diff TARGET should work with explicit file when no stages registered."""
-    monkeypatch.chdir(mock_discovery.root)
-    (mock_discovery.root / ".git").mkdir()
     # Create a metrics file
     metrics_file = mock_discovery.root / "metrics.json"
     metrics_file.write_text(json.dumps({"accuracy": 0.95}))
@@ -307,7 +280,6 @@ def test_metrics_in_main_help(runner: click.testing.CliRunner) -> None:
 def test_metrics_diff_integration(
     mock_discovery: Pipeline,
     runner: click.testing.CliRunner,
-    monkeypatch: pytest.MonkeyPatch,
     mocker: MockerFixture,
     head_metrics: dict[str, float],
     workspace_metrics: dict[str, float],
@@ -315,9 +287,6 @@ def test_metrics_diff_integration(
     test_id: str,
 ) -> None:
     """Integration test: metrics diff with various formats and scenarios using file targets."""
-    monkeypatch.chdir(mock_discovery.root)
-    (mock_discovery.root / ".git").mkdir()
-
     # Mock git.read_files_from_head to return HEAD version of metrics file
     mocker.patch.object(
         git,

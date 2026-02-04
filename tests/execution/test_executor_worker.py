@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Annotated, Any, TypedDict
 
 import pytest
 
-from pivot import exceptions, executor, loaders, outputs, registry, stage_def
+from pivot import exceptions, executor, loaders, outputs, project, registry, stage_def
 from pivot.executor import core as executor_core
 from pivot.executor import worker
 from pivot.storage import cache, lock, state
@@ -914,10 +914,12 @@ def test_hash_dependencies_with_existing_files(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """hash_dependencies hashes existing files as FileHash dicts."""
+    (tmp_path / ".pivot").mkdir()
     (tmp_path / "file1.txt").write_text("content1")
     (tmp_path / "file2.txt").write_text("content2")
 
     monkeypatch.chdir(tmp_path)
+    project._project_root_cache = None
     hashes, missing, unreadable = executor.hash_dependencies(["file1.txt", "file2.txt"])
 
     assert len(hashes) == 2
@@ -948,11 +950,13 @@ def test_hash_dependencies_with_directory(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """hash_dependencies hashes directories with manifest."""
+    (tmp_path / ".pivot").mkdir()
     data_dir = tmp_path / "data_dir"
     data_dir.mkdir()
     (data_dir / "file.txt").write_text("content")
 
     monkeypatch.chdir(tmp_path)
+    project._project_root_cache = None
     hashes, missing, unreadable = executor.hash_dependencies(["data_dir"])
 
     assert len(hashes) == 1, "Directory should be hashed"

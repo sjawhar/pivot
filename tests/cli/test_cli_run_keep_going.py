@@ -19,7 +19,6 @@ if TYPE_CHECKING:
 
     from pivot.pipeline.pipeline import Pipeline
 
-
 # =============================================================================
 # Module-level stage functions for testing (required for pickling)
 # =============================================================================
@@ -114,8 +113,6 @@ def test_repro_keep_going_flag_continues_after_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """repro --keep-going continues independent stages after failure."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     (tmp_path / "input.txt").write_text("data")
 
     register_test_stage(_stage_failing, name="failing")
@@ -136,8 +133,6 @@ def test_repro_keep_going_flag_skips_downstream(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """repro --keep-going skips stages downstream of failed stage."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     (tmp_path / "input.txt").write_text("data")
 
     register_test_stage(_stage_first_failing, name="first")
@@ -162,8 +157,6 @@ def test_repro_keep_going_short_flag(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """repro -k short flag works the same as --keep-going."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     (tmp_path / "input.txt").write_text("data")
 
     register_test_stage(_stage_failing, name="failing")
@@ -183,8 +176,6 @@ def test_repro_without_keep_going_stops_on_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """repro default behavior stops pipeline on first failure (downstream stages blocked)."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     (tmp_path / "input.txt").write_text("data")
 
     # Use dependent stages to test deterministically:
@@ -219,8 +210,6 @@ def test_repro_keep_going_with_json_output(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """repro --keep-going works with --json output mode."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     (tmp_path / "input.txt").write_text("data")
 
     register_test_stage(_stage_failing, name="failing")
@@ -249,8 +238,6 @@ def test_repro_keep_going_with_dry_run(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """repro --keep-going is accepted with --dry-run (flag is no-op since nothing executes)."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     (tmp_path / "input.txt").write_text("data")
 
     register_test_stage(_stage_process, name="process")
@@ -271,8 +258,6 @@ def test_repro_keep_going_with_dry_run_json(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """repro --keep-going works with --dry-run --json combination."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     (tmp_path / "input.txt").write_text("data")
 
     register_test_stage(_stage_process, name="process")
@@ -307,8 +292,6 @@ def test_run_default_keeps_going(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """run defaults to keep-going mode (continues after failures)."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     (tmp_path / "input.txt").write_text("data")
 
     register_test_stage(_stage_failing, name="failing")
@@ -338,8 +321,6 @@ def test_run_fail_fast_stops_early(
 
     This test verifies --fail-fast is accepted and the failed stage shows failure status.
     """
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".git").mkdir()
     (tmp_path / "input.txt").write_text("data")
 
     register_test_stage(_stage_failing, name="failing")
