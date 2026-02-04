@@ -1,36 +1,36 @@
 from __future__ import annotations
 
 import logging
+import pathlib
 import runpy
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Final
 
 from pivot import fingerprint, metrics, project
 from pivot.pipeline import yaml as pipeline_config
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
-    from pathlib import Path
 
     from pivot.pipeline.pipeline import Pipeline
 
 logger = logging.getLogger(__name__)
 
-PIVOT_YAML_NAMES = ("pivot.yaml", "pivot.yml")
-PIPELINE_PY_NAME = "pipeline.py"
+PIVOT_YAML_NAMES: Final = ("pivot.yaml", "pivot.yml")
+PIPELINE_PY_NAME: Final = "pipeline.py"
 
 
 class DiscoveryError(Exception):
     """Error during pipeline discovery."""
 
 
-def _find_config_path_in_dir(directory: Path) -> Path | None:
+def _find_config_path_in_dir(directory: pathlib.Path) -> pathlib.Path | None:
     """Find the pipeline config file in a directory.
 
     Returns the path to pivot.yaml/yml or pipeline.py if found.
     Raises DiscoveryError if both exist in the same directory.
     Returns None if neither exists.
     """
-    yaml_path = None
+    yaml_path: pathlib.Path | None = None
     for yaml_name in PIVOT_YAML_NAMES:
         candidate = directory / yaml_name
         if candidate.is_file():
@@ -52,12 +52,16 @@ def _find_config_path_in_dir(directory: Path) -> Path | None:
     return None
 
 
-def discover_pipeline(project_root: Path | None = None) -> Pipeline | None:
+def discover_pipeline(project_root: pathlib.Path | None = None) -> Pipeline | None:
     """Discover and return Pipeline from pivot.yaml or pipeline.py.
 
-    Looks in project root for:
-    1. pivot.yaml (or pivot.yml) - creates implicit Pipeline
-    2. pipeline.py - looks for `pipeline` variable (Pipeline instance)
+    Looks for pipeline config in this order:
+    1. Current working directory (if within project root)
+    2. Project root
+
+    In each location, checks for:
+    - pivot.yaml (or pivot.yml) - creates implicit Pipeline
+    - pipeline.py - looks for `pipeline` variable (Pipeline instance)
 
     Args:
         project_root: Override project root (default: auto-detect)
@@ -70,7 +74,20 @@ def discover_pipeline(project_root: Path | None = None) -> Pipeline | None:
     """
     with metrics.timed("discovery.total"):
         root = project_root or project.get_project_root()
-        config_path = _find_config_path_in_dir(root)
+        try:
+            cwd = pathlib.Path.cwd().resolve()
+            root_resolved = root.resolve()
+        except OSError as e:
+            raise DiscoveryError(f"Failed to resolve paths: {e}") from e
+
+        # Check cwd first if it's within project root but not the root itself
+        config_path: pathlib.Path | None = None
+        if cwd != root_resolved and cwd.is_relative_to(root_resolved):
+            config_path = _find_config_path_in_dir(cwd)
+
+        # Fall back to project root (use resolved path for consistency)
+        if config_path is None:
+            config_path = _find_config_path_in_dir(root_resolved)
 
         if config_path is None:
             return None
@@ -97,7 +114,7 @@ def discover_pipeline(project_root: Path | None = None) -> Pipeline | None:
             fingerprint.flush_ast_hash_cache()
 
 
-def _load_pipeline_from_module(path: Path) -> Pipeline | None:
+def _load_pipeline_from_module(path: pathlib.Path) -> Pipeline | None:
     """Load Pipeline instance from a pipeline.py file.
 
     Returns None if the file doesn't define a 'pipeline' variable.
@@ -107,10 +124,10 @@ def _load_pipeline_from_module(path: Path) -> Pipeline | None:
     """
     from pivot.pipeline.pipeline import Pipeline
 
-    module_dict = runpy.run_path(str(path), run_name="_pivot_pipeline")
+    module_dict: dict[str, Any] = runpy.run_path(str(path), run_name="_pivot_pipeline")
 
     # Look for 'pipeline' variable
-    pipeline = module_dict.get("pipeline")
+    pipeline: Any = module_dict.get("pipeline")
     if pipeline is not None:
         if not isinstance(pipeline, Pipeline):
             raise DiscoveryError(
@@ -131,9 +148,9 @@ def _load_pipeline_from_module(path: Path) -> Pipeline | None:
 
 
 def find_parent_pipeline_paths(
-    start_dir: Path,
-    stop_at: Path,
-) -> Iterator[Path]:
+    start_dir: pathlib.Path,
+    stop_at: pathlib.Path,
+) -> Iterator[pathlib.Path]:
     """Find pipeline config files in parent directories.
 
     Traverses up from start_dir (exclusive) to stop_at (inclusive),
@@ -148,19 +165,16 @@ def find_parent_pipeline_paths(
         Paths to pivot.yaml or pipeline.py files.
 
     Raises:
-        DiscoveryError: If a directory has both pivot.yaml and pipeline.py.
+        DiscoveryError: If a directory has both pivot.yaml and pipeline.py,
+            or if path resolution fails.
     """
-    current = start_dir.resolve().parent
-    stop_at_resolved = stop_at.resolve()
+    try:
+        current = start_dir.resolve().parent
+        stop_at_resolved = stop_at.resolve()
+    except OSError as e:
+        raise DiscoveryError(f"Failed to resolve paths: {e}") from e
 
-    while True:
-        # Stop if we've gone above stop_at (stop_at must be ancestor of start_dir)
-        try:
-            current.relative_to(stop_at_resolved)
-        except ValueError:
-            # current is not under stop_at - we've gone too far
-            break
-
+    while current.is_relative_to(stop_at_resolved):
         config_path = _find_config_path_in_dir(current)
         if config_path:
             yield config_path
@@ -170,11 +184,11 @@ def find_parent_pipeline_paths(
         current = current.parent
 
 
-def load_pipeline_from_path(path: Path) -> Pipeline | None:
+def load_pipeline_from_path(path: pathlib.Path) -> Pipeline | None:
     """Load a Pipeline from a pivot.yaml or pipeline.py file.
 
     Args:
-        path: Path to pivot.yaml or pipeline.py file.
+        path: pathlib.Path to pivot.yaml or pipeline.py file.
 
     Returns:
         Pipeline instance, or None if file doesn't define one.

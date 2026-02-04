@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from pathlib import Path
+import pathlib
 
 import pytest
 
@@ -15,7 +15,7 @@ from pivot import discovery
 # =============================================================================
 
 
-def test_discover_pipeline_returns_none_when_no_files(set_project_root: Path) -> None:
+def test_discover_pipeline_returns_none_when_no_files(set_project_root: pathlib.Path) -> None:
     """discover_pipeline returns None when no pivot.yaml or pipeline.py exist.
 
     Prevents regression where discovery fails instead of returning None.
@@ -24,7 +24,9 @@ def test_discover_pipeline_returns_none_when_no_files(set_project_root: Path) ->
     assert result is None
 
 
-def test_discover_pipeline_ignores_directories_with_config_names(set_project_root: Path) -> None:
+def test_discover_pipeline_ignores_directories_with_config_names(
+    set_project_root: pathlib.Path,
+) -> None:
     """discover_pipeline ignores directories named pivot.yaml or pipeline.py.
 
     Tests that _find_config_path_in_dir uses is_file() not exists(), preventing
@@ -40,7 +42,7 @@ def test_discover_pipeline_ignores_directories_with_config_names(set_project_roo
     assert result is None
 
 
-def test_discover_pipeline_from_pipeline_py(set_project_root: Path) -> None:
+def test_discover_pipeline_from_pipeline_py(set_project_root: pathlib.Path) -> None:
     """discover_pipeline finds and loads Pipeline instance from pipeline.py.
 
     Tests the pipeline.py discovery path including stage registration.
@@ -68,7 +70,267 @@ pipeline.register(_stage, name="my_stage")
     assert "my_stage" in result.list_stages()
 
 
-def test_discover_pipeline_py_no_pipeline_variable(set_project_root: Path) -> None:
+def test_discover_pipeline_prefers_cwd_over_project_root(
+    set_project_root: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """discover_pipeline finds pipeline.py in cwd before checking project root.
+
+    When running from a subdirectory that has its own pipeline.py, discovery
+    should use that instead of the project root's pipeline.py.
+    """
+    from pivot.pipeline.pipeline import Pipeline
+
+    # Create pipeline.py at project root
+    root_pipeline_code = """\
+from pivot.pipeline.pipeline import Pipeline
+pipeline = Pipeline("root_pipeline")
+"""
+    (set_project_root / "pipeline.py").write_text(root_pipeline_code)
+
+    # Create subdirectory with its own pipeline.py
+    subdir = set_project_root / "subproject"
+    subdir.mkdir()
+    subdir_pipeline_code = """\
+from pivot.pipeline.pipeline import Pipeline
+pipeline = Pipeline("subdir_pipeline")
+"""
+    (subdir / "pipeline.py").write_text(subdir_pipeline_code)
+
+    # Change cwd to subdirectory
+    monkeypatch.chdir(subdir)
+
+    # Discovery should find subdir's pipeline, not root's
+    result = discovery.discover_pipeline(set_project_root)
+
+    assert result is not None
+    assert isinstance(result, Pipeline)
+    assert result.name == "subdir_pipeline"
+
+
+@pytest.mark.parametrize(
+    "yaml_name",
+    [
+        pytest.param("pivot.yaml", id="yaml"),
+        pytest.param("pivot.yml", id="yml"),
+    ],
+)
+def test_discover_pipeline_prefers_cwd_yaml_over_project_root(
+    set_project_root: pathlib.Path, monkeypatch: pytest.MonkeyPatch, yaml_name: str
+) -> None:
+    """discover_pipeline finds YAML config in cwd before checking project root.
+
+    Tests that cwd-first discovery works for pivot.yaml/yml files, not just pipeline.py.
+    This ensures YAML configs in subdirectories are preferred over root configs.
+    """
+    from pivot.pipeline.pipeline import Pipeline
+
+    # Create minimal stage module for YAML configs
+    stages_py = set_project_root / "stages.py"
+    stages_py.write_text(
+        """\
+import pathlib
+from typing import Annotated, TypedDict
+from pivot import loaders, outputs
+
+class ProcessOutputs(TypedDict):
+    out: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
+
+def process() -> ProcessOutputs:
+    return {"out": pathlib.Path("output.txt")}
+"""
+    )
+
+    # Create YAML config at project root
+    (set_project_root / yaml_name).write_text(
+        """\
+pipeline: root_pipeline
+stages:
+  process:
+    python: stages.process
+"""
+    )
+
+    # Create subdirectory with its own YAML config
+    subdir = set_project_root / "subproject"
+    subdir.mkdir()
+    (subdir / yaml_name).write_text(
+        """\
+pipeline: subdir_pipeline
+stages:
+  process:
+    python: stages.process
+"""
+    )
+
+    # Change cwd to subdirectory
+    monkeypatch.chdir(subdir)
+
+    # Discovery should find subdir's YAML config, not root's
+    with stage_module_isolation(set_project_root):
+        result = discovery.discover_pipeline(set_project_root)
+
+    assert result is not None
+    assert isinstance(result, Pipeline)
+    assert result.name == "subdir_pipeline"
+
+
+def test_discover_pipeline_cwd_invalid_config_raises_error(
+    set_project_root: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """discover_pipeline raises error when cwd has invalid config even if root is valid.
+
+    When cwd has a broken pipeline config, discovery should fail immediately rather
+    than falling back to the root config. This enforces fail-fast behavior and prevents
+    confusing scenarios where users think they're using cwd config but root is used.
+    """
+
+    # Create valid pipeline.py at project root
+    root_pipeline_code = """\
+from pivot.pipeline.pipeline import Pipeline
+pipeline = Pipeline("root_pipeline")
+"""
+    (set_project_root / "pipeline.py").write_text(root_pipeline_code)
+
+    # Create subdirectory with BROKEN pipeline.py
+    subdir = set_project_root / "subproject"
+    subdir.mkdir()
+    broken_pipeline_code = """\
+from pivot.pipeline.pipeline import Pipeline
+# Wrong variable name - should raise DiscoveryError
+wrong_name = Pipeline("subdir_pipeline")
+"""
+    (subdir / "pipeline.py").write_text(broken_pipeline_code)
+
+    # Change cwd to subdirectory with broken config
+    monkeypatch.chdir(subdir)
+
+    # Should raise error from cwd config, not silently use root
+    with pytest.raises(
+        discovery.DiscoveryError,
+        match="does not define a 'pipeline' variable.*Found Pipeline instance named 'wrong_name'",
+    ):
+        discovery.discover_pipeline(set_project_root)
+
+
+def test_discover_pipeline_cwd_equals_root_checks_once(
+    set_project_root: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """discover_pipeline doesn't double-check when cwd equals project root.
+
+    When running from the project root, discovery should check the directory only once,
+    not twice (once as cwd, once as root). This test verifies the cwd != root_resolved
+    guard works correctly.
+    """
+    from pivot.pipeline.pipeline import Pipeline
+
+    # Create pipeline.py at project root
+    root_pipeline_code = """\
+from pivot.pipeline.pipeline import Pipeline
+pipeline = Pipeline("root_pipeline")
+"""
+    (set_project_root / "pipeline.py").write_text(root_pipeline_code)
+
+    # Change cwd to project root (cwd == root)
+    monkeypatch.chdir(set_project_root)
+
+    result = discovery.discover_pipeline(set_project_root)
+
+    # Should successfully find pipeline (checked once)
+    assert result is not None
+    assert isinstance(result, Pipeline)
+    assert result.name == "root_pipeline"
+
+
+def test_discover_pipeline_cwd_outside_project_uses_root(
+    set_project_root: pathlib.Path,
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """discover_pipeline uses root config when cwd is outside project tree.
+
+    When running from a directory outside the project (e.g., parent or /tmp),
+    discovery should skip cwd check and use project root config only.
+    """
+    from pivot.pipeline.pipeline import Pipeline
+
+    # Create pipeline.py at project root
+    root_pipeline_code = """\
+from pivot.pipeline.pipeline import Pipeline
+pipeline = Pipeline("root_pipeline")
+"""
+    (set_project_root / "pipeline.py").write_text(root_pipeline_code)
+
+    # Create a separate temp directory outside the project root
+    outside_dir = tmp_path_factory.mktemp("outside")
+    monkeypatch.chdir(outside_dir)
+
+    result = discovery.discover_pipeline(set_project_root)
+
+    # Should find root config (cwd is outside project tree)
+    assert result is not None
+    assert isinstance(result, Pipeline)
+    assert result.name == "root_pipeline"
+
+
+def test_discover_pipeline_mixed_config_types_prefers_cwd(
+    set_project_root: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """discover_pipeline prefers cwd config regardless of type differences.
+
+    When cwd has pipeline.py and root has pivot.yaml (or vice versa),
+    the cwd config should win. This verifies cwd-first logic doesn't
+    incorrectly prioritize YAML over Python across directories.
+    """
+    from pivot.pipeline.pipeline import Pipeline
+
+    # Create minimal stage module for YAML config
+    stages_py = set_project_root / "stages.py"
+    stages_py.write_text(
+        """\
+import pathlib
+from typing import Annotated, TypedDict
+from pivot import loaders, outputs
+
+class ProcessOutputs(TypedDict):
+    out: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
+
+def process() -> ProcessOutputs:
+    return {"out": pathlib.Path("output.txt")}
+"""
+    )
+
+    # Create pivot.yaml at project root
+    (set_project_root / "pivot.yaml").write_text(
+        """\
+pipeline: root_yaml_pipeline
+stages:
+  process:
+    python: stages.process
+"""
+    )
+
+    # Create subdirectory with pipeline.py (different type)
+    subdir = set_project_root / "subproject"
+    subdir.mkdir()
+    subdir_pipeline_code = """\
+from pivot.pipeline.pipeline import Pipeline
+pipeline = Pipeline("subdir_py_pipeline")
+"""
+    (subdir / "pipeline.py").write_text(subdir_pipeline_code)
+
+    # Change cwd to subdirectory
+    monkeypatch.chdir(subdir)
+
+    # Discovery should find subdir's pipeline.py, not root's pivot.yaml
+    with stage_module_isolation(set_project_root):
+        result = discovery.discover_pipeline(set_project_root)
+
+    assert result is not None
+    assert isinstance(result, Pipeline)
+    assert result.name == "subdir_py_pipeline"
+
+
+def test_discover_pipeline_py_no_pipeline_variable(set_project_root: pathlib.Path) -> None:
     """discover_pipeline returns None when pipeline.py has no Pipeline at all.
 
     Tests the case where pipeline.py exists but doesn't define a Pipeline instance
@@ -88,7 +350,7 @@ y = "hello"
     assert result is None
 
 
-def test_discover_pipeline_missing_pipeline_variable(set_project_root: Path) -> None:
+def test_discover_pipeline_missing_pipeline_variable(set_project_root: pathlib.Path) -> None:
     """discover_pipeline raises DiscoveryError when Pipeline exists with wrong variable name.
 
     This catches the common mistake of creating a Pipeline but naming it something other
@@ -110,7 +372,7 @@ my_pipe = Pipeline("oops")
         discovery.discover_pipeline(set_project_root)
 
 
-def test_discover_pipeline_wrong_type(set_project_root: Path) -> None:
+def test_discover_pipeline_wrong_type(set_project_root: pathlib.Path) -> None:
     """discover_pipeline raises DiscoveryError when 'pipeline' variable is not a Pipeline.
 
     Prevents confusion when someone assigns a non-Pipeline value to 'pipeline'.
@@ -136,7 +398,7 @@ pipeline = "not a Pipeline"
     ],
 )
 def test_discover_pipeline_both_yaml_and_pipeline_py_raises_error(
-    set_project_root: Path, yaml_name: str
+    set_project_root: pathlib.Path, yaml_name: str
 ) -> None:
     """discover_pipeline raises DiscoveryError when both YAML config and pipeline.py exist.
 
@@ -160,7 +422,7 @@ pipeline = Pipeline("test")
         discovery.discover_pipeline(set_project_root)
 
 
-def test_discover_pipeline_prefers_yaml_over_yml(set_project_root: Path) -> None:
+def test_discover_pipeline_prefers_yaml_over_yml(set_project_root: pathlib.Path) -> None:
     """discover_pipeline prefers pivot.yaml when both pivot.yaml and pivot.yml exist.
 
     Tests the PIVOT_YAML_NAMES tuple ordering to ensure .yaml takes precedence.
@@ -210,7 +472,7 @@ stages:
     assert result.name == "yaml_wins"
 
 
-def test_discover_pipeline_sys_exit_raises(set_project_root: Path) -> None:
+def test_discover_pipeline_sys_exit_raises(set_project_root: pathlib.Path) -> None:
     """discover_pipeline raises DiscoveryError when pipeline.py calls sys.exit().
 
     Prevents silent failures when pipeline.py has top-level sys.exit() calls.
@@ -226,7 +488,7 @@ sys.exit(42)
         discovery.discover_pipeline(set_project_root)
 
 
-def test_discover_pipeline_runtime_error_raises(set_project_root: Path) -> None:
+def test_discover_pipeline_runtime_error_raises(set_project_root: pathlib.Path) -> None:
     """discover_pipeline wraps non-DiscoveryError exceptions in DiscoveryError.
 
     Tests generic exception handling during pipeline.py loading.
@@ -241,7 +503,7 @@ raise RuntimeError("intentional error")
         discovery.discover_pipeline(set_project_root)
 
 
-def test_discover_pipeline_reraises_discovery_error(set_project_root: Path) -> None:
+def test_discover_pipeline_reraises_discovery_error(set_project_root: pathlib.Path) -> None:
     """discover_pipeline re-raises DiscoveryError from _load_pipeline_from_module without wrapping.
 
     Tests that internal DiscoveryErrors (like wrong variable name) are not double-wrapped.
@@ -269,7 +531,7 @@ wrong_name = Pipeline("test")
     ],
 )
 def test_discover_pipeline_from_yaml_files(
-    set_project_root: Path, yaml_name: str, pipeline_name: str
+    set_project_root: pathlib.Path, yaml_name: str, pipeline_name: str
 ) -> None:
     """discover_pipeline loads Pipeline from both pivot.yaml and pivot.yml files.
 
@@ -312,7 +574,7 @@ stages:
     assert "process" in result.list_stages()
 
 
-def test_discover_pipeline_invalid_yaml_raises(set_project_root: Path) -> None:
+def test_discover_pipeline_invalid_yaml_raises(set_project_root: pathlib.Path) -> None:
     """discover_pipeline raises DiscoveryError for invalid pivot.yaml content.
 
     Tests error handling when YAML config references non-existent modules.
@@ -336,7 +598,7 @@ stages:
 # =============================================================================
 
 
-def test_find_parent_pipeline_paths_finds_pipeline_py(set_project_root: Path) -> None:
+def test_find_parent_pipeline_paths_finds_pipeline_py(set_project_root: pathlib.Path) -> None:
     """find_parent_pipeline_paths finds pipeline.py files in parent directories.
 
     Tests traversal order: closest parents first, stopping at specified directory.
@@ -356,7 +618,7 @@ def test_find_parent_pipeline_paths_finds_pipeline_py(set_project_root: Path) ->
     assert result[1] == set_project_root / "pipeline.py"
 
 
-def test_find_parent_pipeline_paths_finds_pivot_yaml(set_project_root: Path) -> None:
+def test_find_parent_pipeline_paths_finds_pivot_yaml(set_project_root: pathlib.Path) -> None:
     """find_parent_pipeline_paths finds pivot.yaml in parent directories."""
     (set_project_root / "pivot.yaml").touch()
     child = set_project_root / "child"
@@ -367,7 +629,7 @@ def test_find_parent_pipeline_paths_finds_pivot_yaml(set_project_root: Path) -> 
     assert result == [set_project_root / "pivot.yaml"]
 
 
-def test_find_parent_pipeline_paths_finds_pivot_yml(set_project_root: Path) -> None:
+def test_find_parent_pipeline_paths_finds_pivot_yml(set_project_root: pathlib.Path) -> None:
     """find_parent_pipeline_paths finds pivot.yml in parent directories."""
     (set_project_root / "pivot.yml").touch()
     child = set_project_root / "child"
@@ -378,7 +640,7 @@ def test_find_parent_pipeline_paths_finds_pivot_yml(set_project_root: Path) -> N
     assert result == [set_project_root / "pivot.yml"]
 
 
-def test_find_parent_pipeline_paths_errors_on_both(set_project_root: Path) -> None:
+def test_find_parent_pipeline_paths_errors_on_both(set_project_root: pathlib.Path) -> None:
     """find_parent_pipeline_paths raises DiscoveryError when directory has both configs.
 
     Prevents ambiguity during parent traversal, same as discover_pipeline.
@@ -392,7 +654,7 @@ def test_find_parent_pipeline_paths_errors_on_both(set_project_root: Path) -> No
         list(discovery.find_parent_pipeline_paths(child, stop_at=set_project_root))
 
 
-def test_find_parent_pipeline_paths_skips_own_directory(set_project_root: Path) -> None:
+def test_find_parent_pipeline_paths_skips_own_directory(set_project_root: pathlib.Path) -> None:
     """find_parent_pipeline_paths does not include start_dir's own config files.
 
     Tests that traversal starts from start_dir.parent, not start_dir itself.
@@ -406,7 +668,7 @@ def test_find_parent_pipeline_paths_skips_own_directory(set_project_root: Path) 
     assert result == []
 
 
-def test_find_parent_pipeline_paths_stops_at_root(tmp_path: Path) -> None:
+def test_find_parent_pipeline_paths_stops_at_root(tmp_path: pathlib.Path) -> None:
     """find_parent_pipeline_paths stops at filesystem root without infinite loop.
 
     Tests the current.parent == current safety check that prevents infinite loops
@@ -418,13 +680,15 @@ def test_find_parent_pipeline_paths_stops_at_root(tmp_path: Path) -> None:
 
     # No stop_at specified would normally go to filesystem root
     # Should stop when it reaches filesystem root (parent == self)
-    result = list(discovery.find_parent_pipeline_paths(deep_dir, stop_at=Path(tmp_path.root)))
+    result = list(
+        discovery.find_parent_pipeline_paths(deep_dir, stop_at=pathlib.Path(tmp_path.root))
+    )
 
     # Should not raise, should complete (likely finding nothing unless files exist in path)
     assert isinstance(result, list)
 
 
-def test_find_parent_pipeline_paths_start_equals_stop(set_project_root: Path) -> None:
+def test_find_parent_pipeline_paths_start_equals_stop(set_project_root: pathlib.Path) -> None:
     """find_parent_pipeline_paths returns empty when start_dir equals stop_at.
 
     When start_dir equals stop_at, the range is empty (start_dir is exclusive),
@@ -440,7 +704,7 @@ def test_find_parent_pipeline_paths_start_equals_stop(set_project_root: Path) ->
     assert result == []
 
 
-def test_find_parent_pipeline_paths_does_not_traverse_above_stop_at(tmp_path: Path) -> None:
+def test_find_parent_pipeline_paths_does_not_traverse_above_stop_at(tmp_path: pathlib.Path) -> None:
     """find_parent_pipeline_paths stops traversal at stop_at boundary.
 
     Tests that the function doesn't find configs in directories above stop_at,
@@ -468,7 +732,7 @@ def test_find_parent_pipeline_paths_does_not_traverse_above_stop_at(tmp_path: Pa
 # =============================================================================
 
 
-def test_load_pipeline_from_path_loads_pipeline_py(set_project_root: Path) -> None:
+def test_load_pipeline_from_path_loads_pipeline_py(set_project_root: pathlib.Path) -> None:
     """load_pipeline_from_path loads Pipeline from pipeline.py file."""
     pipeline_code = """
 from pivot.pipeline import Pipeline
@@ -482,7 +746,7 @@ pipeline = Pipeline("test")
     assert result.name == "test"
 
 
-def test_load_pipeline_from_path_loads_pivot_yaml(set_project_root: Path) -> None:
+def test_load_pipeline_from_path_loads_pivot_yaml(set_project_root: pathlib.Path) -> None:
     """load_pipeline_from_path loads Pipeline from pivot.yaml file."""
     stages_py = set_project_root / "stages.py"
     stages_py.write_text(
@@ -513,7 +777,7 @@ stages:
     assert result.name == "yaml_test"
 
 
-def test_load_pipeline_from_path_loads_pivot_yml(set_project_root: Path) -> None:
+def test_load_pipeline_from_path_loads_pivot_yml(set_project_root: pathlib.Path) -> None:
     """load_pipeline_from_path loads Pipeline from pivot.yml file."""
     stages_py = set_project_root / "stages.py"
     stages_py.write_text(
@@ -544,7 +808,9 @@ stages:
     assert result.name == "yml_test"
 
 
-def test_load_pipeline_from_path_returns_none_for_no_pipeline(set_project_root: Path) -> None:
+def test_load_pipeline_from_path_returns_none_for_no_pipeline(
+    set_project_root: pathlib.Path,
+) -> None:
     """load_pipeline_from_path returns None when pipeline.py has no Pipeline."""
     (set_project_root / "pipeline.py").write_text("x = 1\n")
 
@@ -553,7 +819,9 @@ def test_load_pipeline_from_path_returns_none_for_no_pipeline(set_project_root: 
     assert result is None
 
 
-def test_load_pipeline_from_path_returns_none_for_discovery_error(set_project_root: Path) -> None:
+def test_load_pipeline_from_path_returns_none_for_discovery_error(
+    set_project_root: pathlib.Path,
+) -> None:
     """load_pipeline_from_path returns None when pipeline.py raises DiscoveryError.
 
     Tests that DiscoveryErrors (like wrong variable name) are swallowed and return None,
@@ -572,7 +840,7 @@ wrong_name = Pipeline("test")
 
 
 def test_load_pipeline_from_path_logs_errors(
-    set_project_root: Path, caplog: pytest.LogCaptureFixture
+    set_project_root: pathlib.Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """load_pipeline_from_path logs errors at DEBUG level and returns None.
 
@@ -588,7 +856,7 @@ def test_load_pipeline_from_path_logs_errors(
 
 
 def test_load_pipeline_from_path_unknown_file_type(
-    set_project_root: Path, caplog: pytest.LogCaptureFixture
+    set_project_root: pathlib.Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """load_pipeline_from_path returns None and logs for unknown file types.
 
@@ -602,3 +870,56 @@ def test_load_pipeline_from_path_unknown_file_type(
 
     assert result is None
     assert "Unknown pipeline file type" in caplog.text
+
+
+# =============================================================================
+# Path Resolution Error Tests
+# =============================================================================
+
+
+def test_discover_pipeline_raises_on_path_resolution_failure(
+    set_project_root: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """discover_pipeline raises DiscoveryError when path resolution fails.
+
+    Tests error handling for scenarios like broken symlinks or permission errors
+    during path resolution.
+    """
+    original_resolve = pathlib.Path.resolve
+
+    def mock_resolve(self: pathlib.Path, strict: bool = False) -> pathlib.Path:
+        if "broken" in str(self):
+            raise OSError("Simulated path resolution failure")
+        return original_resolve(self, strict=strict)
+
+    monkeypatch.setattr(pathlib.Path, "resolve", mock_resolve)
+
+    # Create a directory whose name triggers the mocked error
+    broken_root = set_project_root / "broken_link"
+    broken_root.mkdir()
+
+    with pytest.raises(discovery.DiscoveryError, match="Failed to resolve paths"):
+        discovery.discover_pipeline(broken_root)
+
+
+def test_find_parent_pipeline_paths_raises_on_path_resolution_failure(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """find_parent_pipeline_paths raises DiscoveryError when path resolution fails.
+
+    Tests error handling for OSError during path resolution in parent traversal.
+    """
+    original_resolve = pathlib.Path.resolve
+
+    def mock_resolve(self: pathlib.Path, strict: bool = False) -> pathlib.Path:
+        if "broken" in str(self):
+            raise OSError("Simulated path resolution failure")
+        return original_resolve(self, strict=strict)
+
+    monkeypatch.setattr(pathlib.Path, "resolve", mock_resolve)
+
+    broken_dir = tmp_path / "broken_dir"
+    broken_dir.mkdir()
+
+    with pytest.raises(discovery.DiscoveryError, match="Failed to resolve paths"):
+        list(discovery.find_parent_pipeline_paths(broken_dir, stop_at=tmp_path))
