@@ -499,6 +499,38 @@ def _sort_key(value: Any) -> tuple[str, str]:
     return (type(value).__name__, str(value))
 
 
+def _is_primitive_collection(value: object, _seen: set[int] | None = None) -> bool:
+    """Check if value is a collection containing only primitives (recursively).
+
+    Uses _seen set to detect circular references and prevent infinite recursion.
+    Circular references return False (not a primitive collection).
+    """
+    if isinstance(value, (bool, int, float, str, bytes, type(None))):
+        return True
+    if isinstance(value, (list, tuple, set, frozenset)):
+        obj_id = id(cast("object", value))  # Cast: isinstance leaves element types Unknown
+        if _seen is None:
+            _seen = set()
+        if obj_id in _seen:
+            return False  # Circular reference
+        _seen.add(obj_id)
+        items = cast("list[object] | tuple[object, ...] | set[object] | frozenset[object]", value)
+        return all(_is_primitive_collection(item, _seen) for item in items)
+    if isinstance(value, dict):
+        obj_id = id(cast("object", value))  # Cast: isinstance leaves key/value types Unknown
+        if _seen is None:
+            _seen = set()
+        if obj_id in _seen:
+            return False  # Circular reference
+        _seen.add(obj_id)
+        items_dict = cast("dict[object, object]", value)
+        return all(
+            _is_primitive_collection(k, _seen) and _is_primitive_collection(v, _seen)
+            for k, v in items_dict.items()
+        )
+    return False
+
+
 def _add_callable_to_manifest(
     key: str, func: Callable[..., Any], manifest: dict[str, str], visited: set[int]
 ) -> None:
@@ -544,9 +576,12 @@ def _process_module_dependency(
             _add_callable_to_manifest(key, attr_value, manifest, visited)
         elif isinstance(attr_value, (bool, int, float, str, bytes, type(None))):
             manifest[key] = repr(attr_value)
+        elif _is_primitive_collection(attr_value):
+            value_str = _serialize_value_for_hash(attr_value)
+            manifest[key] = xxhash.xxh64(value_str.encode()).hexdigest()
         else:
             raise TypeError(
-                f"Cannot fingerprint module attribute '{key}': type {type(attr_value).__name__!r} is not supported. Supported types: callable, bool, int, float, str, bytes, None."
+                f"Cannot fingerprint module attribute '{key}': type {type(attr_value).__name__!r} is not supported. Supported types: callable, primitives, or collections of primitives."
             )
 
 

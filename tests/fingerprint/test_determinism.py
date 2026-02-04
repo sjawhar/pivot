@@ -6,6 +6,7 @@ invocations. This is critical because stages may be fingerprinted in different
 processes (main process vs worker) and must produce identical results.
 """
 
+import pathlib
 import subprocess
 import sys
 
@@ -215,3 +216,42 @@ def test_different_builtin_factories_have_different_hashes():
     assert fp_list["pydantic:ModelWithList.items"] != fp_dict["pydantic:ModelWithDict.items"], (
         "Different builtin factories should produce different hashes"
     )
+
+
+# --- Cross-process determinism for primitive collections ---
+
+
+@pytest.mark.slow
+def test_primitive_collection_deterministic_across_processes(tmp_path: pathlib.Path) -> None:
+    """Module-level primitive collections have stable hashes across processes."""
+    # Create a module with primitive collections
+    module_file = tmp_path / "constants.py"
+    module_file.write_text("""\
+AGENTS = {"agent1": "config1", "agent2": "config2"}
+NESTED = {"key": [1, 2, {"inner": "value"}]}
+""")
+
+    script = f"""\
+import sys
+sys.path.insert(0, {str(tmp_path)!r})
+
+import constants
+from pivot import fingerprint
+
+def stage():
+    return constants.AGENTS, constants.NESTED
+
+manifest = fingerprint.get_stage_fingerprint(stage)
+print(manifest["mod:constants.AGENTS"], manifest["mod:constants.NESTED"])
+"""
+    results = list[str]()
+    for _ in range(2):
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        results.append(result.stdout.strip())
+
+    assert results[0] == results[1], f"Hashes differ across processes: {results}"
