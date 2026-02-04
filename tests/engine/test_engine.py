@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import pathlib
 
+import networkx as nx
 import pytest
 
 from pivot.engine import graph as engine_graph
@@ -17,9 +18,6 @@ from pivot.engine.types import (
     OutputEvent,
     StageExecutionState,
 )
-
-if TYPE_CHECKING:
-    import pathlib
 
 
 class _MockAsyncSink:
@@ -144,7 +142,6 @@ async def test_engine_handle_data_artifact_changed_filters_executing_outputs(
     tmp_path: pathlib.Path,
 ) -> None:
     """_handle_data_artifact_changed() filters events for executing stage outputs."""
-    import networkx as nx
 
     sink = _MockAsyncSink()
 
@@ -195,7 +192,6 @@ async def test_engine_handle_data_artifact_changed_no_affected_stages(
     tmp_path: pathlib.Path,
 ) -> None:
     """_handle_data_artifact_changed() does nothing for paths with no consumers."""
-    import networkx as nx
 
     sink = _MockAsyncSink()
 
@@ -250,8 +246,6 @@ async def test_engine_process_deferred_events_empty_list() -> None:
 @pytest.mark.anyio
 async def test_engine_should_filter_path_returns_false_without_graph() -> None:
     """_should_filter_path() returns False when graph is None."""
-    import pathlib
-
     async with Engine() as engine:
         assert engine._graph is None
         assert engine._should_filter_path(pathlib.Path("any/path.csv")) is False
@@ -262,7 +256,6 @@ async def test_engine_should_filter_path_returns_false_for_input_artifacts(
     tmp_path: pathlib.Path,
 ) -> None:
     """_should_filter_path() returns False for input artifacts (no producer)."""
-    import networkx as nx
 
     async with Engine() as engine:
         input_path = tmp_path / "input.csv"
@@ -285,8 +278,6 @@ async def test_engine_should_filter_path_returns_false_for_input_artifacts(
 @pytest.mark.anyio
 async def test_engine_get_affected_stages_for_path_returns_empty_without_graph() -> None:
     """_get_affected_stages_for_path() returns empty list when graph is None."""
-    import pathlib
-
     async with Engine() as engine:
         assert engine._graph is None
         assert engine._get_affected_stages_for_path(pathlib.Path("any/path.csv")) == []
@@ -297,7 +288,6 @@ async def test_engine_get_affected_stages_for_paths_deduplicates(
     tmp_path: pathlib.Path,
 ) -> None:
     """_get_affected_stages_for_paths() deduplicates affected stages."""
-    import networkx as nx
 
     async with Engine() as engine:
         # Create paths
@@ -328,7 +318,6 @@ async def test_engine_get_affected_stages_for_paths_deduplicates(
 @pytest.mark.anyio
 async def test_engine_invalidate_caches_clears_graph() -> None:
     """_invalidate_caches() clears the graph."""
-    import networkx as nx
 
     async with Engine() as engine:
         # Set a graph

@@ -3,16 +3,12 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from pathlib import Path
 
 import pytest
 
 from conftest import stage_module_isolation
 from pivot import discovery
-
-if TYPE_CHECKING:
-    from pathlib import Path
-
 
 # =============================================================================
 # Pipeline Discovery Tests (discover_pipeline)
@@ -422,11 +418,7 @@ def test_find_parent_pipeline_paths_stops_at_root(tmp_path: Path) -> None:
 
     # No stop_at specified would normally go to filesystem root
     # Should stop when it reaches filesystem root (parent == self)
-    import pathlib
-
-    result = list(
-        discovery.find_parent_pipeline_paths(deep_dir, stop_at=pathlib.Path(tmp_path.root))
-    )
+    result = list(discovery.find_parent_pipeline_paths(deep_dir, stop_at=Path(tmp_path.root)))
 
     # Should not raise, should complete (likely finding nothing unless files exist in path)
     assert isinstance(result, list)

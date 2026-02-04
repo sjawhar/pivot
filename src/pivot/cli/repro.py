@@ -391,7 +391,7 @@ def _run_watch_mode(  # noqa: PLR0913 - many params needed for different modes
                     from pivot.engine.agent_rpc import (
                         AgentRpcHandler,
                         AgentRpcSource,
-                        EventSink,
+                        BroadcastEventSink,
                     )
 
                     state_dir = project.get_project_root() / ".pivot"
@@ -406,7 +406,7 @@ def _run_watch_mode(  # noqa: PLR0913 - many params needed for different modes
                         event_buffer=eng._event_buffer,  # pyright: ignore[reportPrivateUsage]
                     )
                     eng.add_source(AgentRpcSource(socket_path=socket_path, handler=rpc_handler))
-                    eng.add_sink(EventSink())
+                    eng.add_sink(BroadcastEventSink())
 
                 # Configure watch sources
                 _configure_watch_sources(
@@ -489,7 +489,7 @@ def _run_serve_mode(
 
     from pivot import project
     from pivot.engine import graph as engine_graph
-    from pivot.engine.agent_rpc import AgentRpcHandler, AgentRpcSource, EventSink
+    from pivot.engine.agent_rpc import AgentRpcHandler, AgentRpcSource, BroadcastEventSink
 
     # Get project paths
     project_root = project.get_project_root()
@@ -542,7 +542,7 @@ def _run_serve_mode(
                 serve_console = rich.console.Console()
                 eng.add_sink(sinks.ConsoleSink(console=serve_console))
             eng.add_sink(sinks.ResultCollectorSink())
-            eng.add_sink(EventSink())  # Broadcast events to connected agents
+            eng.add_sink(BroadcastEventSink())  # Broadcast events to connected agents
 
             # Run until interrupted (watch mode never exits on its own)
             await eng.run(exit_on_completion=False)

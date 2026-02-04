@@ -30,8 +30,8 @@ if TYPE_CHECKING:
 __all__ = [
     "AgentRpcHandler",
     "AgentRpcSource",
+    "BroadcastEventSink",
     "EventBuffer",
-    "EventSink",
     "EventsResult",
     "VersionedEvent",
 ]
@@ -183,9 +183,11 @@ def _validate_stages_param(raw: object) -> list[str] | None | str:
         return None
     if not isinstance(raw, list):
         return "stages must be list of strings"
+    # Cast to list[object] for type-safe iteration, then validate each item
     for item in cast("list[object]", raw):
         if not isinstance(item, str):
             return "stages must be list of strings"
+    # After validation, we know all items are strings
     return cast("list[str]", raw)
 
 
@@ -471,7 +473,7 @@ class AgentRpcSource:
         return _json_rpc_error(-32601, "Method not found", request_id)
 
 
-class EventSink:
+class BroadcastEventSink:
     """Async sink that broadcasts events to connected agents.
 
     Thread safety: All subscriber dict operations are protected by a lock

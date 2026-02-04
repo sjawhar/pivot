@@ -992,27 +992,14 @@ class Engine:
     async def _cascade_failure(self, failed_stage: str) -> None:
         """Mark downstream stages as blocked due to upstream failure.
 
-        Uses iterative approach with explicit stack to avoid RecursionError on deep DAGs.
-        Tracks visited nodes to handle cycles (shouldn't happen in valid DAG, but defensive).
+        Since _stage_downstream already contains all transitive descendants (computed
+        via get_downstream_stages which uses nx.descendants), we simply iterate through
+        them once without recursion.
         """
-        visited = set[str]()
-        stack = [failed_stage]
-
-        while stack:
-            current_stage = stack.pop()
-
-            for downstream_name in self._stage_downstream.get(current_stage, []):
-                if downstream_name in visited:
-                    _logger.warning(
-                        "Cycle detected in stage graph at %s -> %s", current_stage, downstream_name
-                    )
-                    continue
-                visited.add(downstream_name)
-
-                state = self._get_stage_state(downstream_name)
-                if state in (StageExecutionState.PENDING, StageExecutionState.READY):
-                    await self._set_stage_state(downstream_name, StageExecutionState.BLOCKED)
-                    stack.append(downstream_name)
+        for downstream_name in self._stage_downstream.get(failed_stage, []):
+            state = self._get_stage_state(downstream_name)
+            if state in (StageExecutionState.PENDING, StageExecutionState.READY):
+                await self._set_stage_state(downstream_name, StageExecutionState.BLOCKED)
 
     async def _emit_skipped_stage(
         self,

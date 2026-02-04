@@ -197,14 +197,13 @@ def test_multiple_queries_same_connection(serve_pipeline: pathlib.Path) -> None:
 
     Integration test: Verifies connection reuse and state handling.
     """
-    import json
-    import socket
+    import contextlib
 
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.settimeout(5.0)
     sock.connect(str(serve_pipeline))
 
-    try:
+    with contextlib.closing(sock):
         # First query: status
         request1 = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "status"})
         sock.sendall(request1.encode() + b"\n")
@@ -224,5 +223,3 @@ def test_multiple_queries_same_connection(serve_pipeline: pathlib.Path) -> None:
         sock.sendall(request3.encode() + b"\n")
         response3 = json.loads(sock.recv(4096).decode())
         assert "result" in response3, "Third query should succeed"
-    finally:
-        sock.close()
