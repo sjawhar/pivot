@@ -15,6 +15,7 @@ import queue
 import random
 import sys
 import threading
+import traceback
 from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast, override
 
 import pydantic
@@ -383,8 +384,8 @@ def execute_stage(
             )
         except KeyboardInterrupt:
             return _make_result(StageStatus.FAILED, "KeyboardInterrupt", output_lines)
-        except Exception as e:
-            return _make_result(StageStatus.FAILED, repr(e), output_lines)
+        except Exception:
+            return _make_result(StageStatus.FAILED, traceback.format_exc(), output_lines)
 
 
 def _normalize_out_path(path: str) -> str:

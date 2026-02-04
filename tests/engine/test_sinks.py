@@ -118,8 +118,40 @@ async def test_console_sink_handles_stage_completed_failed() -> None:
     )
     await sink.handle(event)
 
-    assert "train" in output.getvalue()
-    assert "FAILED" in output.getvalue()
+    result = output.getvalue()
+    assert "train" in result
+    assert "FAILED" in result
+    assert "exception" in result  # Reason should now be displayed
+
+
+async def test_console_sink_handles_multiline_reason() -> None:
+    """ConsoleSink indents multi-line error reasons."""
+    from io import StringIO
+
+    from rich.console import Console
+
+    from pivot.engine.sinks import ConsoleSink
+    from pivot.engine.types import StageCompleted
+
+    output = StringIO()
+    console = Console(file=output, force_terminal=True)
+    sink = ConsoleSink(console=console)
+
+    event = StageCompleted(
+        type="stage_completed",
+        stage="train",
+        status=StageStatus.FAILED,
+        reason="Traceback (most recent call last):\n  File test.py\nValueError: bad",
+        duration_ms=100,
+        index=0,
+        total=1,
+    )
+    await sink.handle(event)
+
+    result = output.getvalue()
+    assert "FAILED" in result
+    assert "Traceback" in result
+    assert "ValueError" in result
 
 
 async def test_console_sink_ignores_other_events() -> None:
