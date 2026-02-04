@@ -503,3 +503,218 @@ manifest:
     assert result["path"] == "data/"
     assert result["hash"] == "abc123"
     assert "manifest" in result
+
+
+# =============================================================================
+# Cache Permission Tests
+# =============================================================================
+
+
+def test_restore_directory_from_cache_with_manifest(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Restores directory from cache when manifest files are present (not tree hash)."""
+    repo_path, commit = git_repo
+
+    # Set up cache directory
+    cache_dir = repo_path / ".pivot" / "cache"
+    state_dir = repo_path / ".pivot"
+    (cache_dir / "files").mkdir(parents=True)
+
+    # Create cached files (individual file hashes, NOT the tree hash)
+    file1_hash = "1111111111111111"
+    file2_hash = "2222222222222222"
+    cache.get_cache_path(cache_dir / "files", file1_hash).parent.mkdir(parents=True, exist_ok=True)
+    cache.get_cache_path(cache_dir / "files", file1_hash).write_bytes(b"file 1 content")
+    cache.get_cache_path(cache_dir / "files", file2_hash).parent.mkdir(parents=True, exist_ok=True)
+    cache.get_cache_path(cache_dir / "files", file2_hash).write_bytes(b"file 2 content")
+
+    # Create a .pvt file for a directory with manifest
+    # Tree hash is different from file hashes - it's a hash of the manifest JSON
+    tree_hash = "aaaaaaaaaaaaaaaa"
+    manifest = [
+        {"relpath": "a.txt", "hash": file1_hash, "size": 14, "isexec": False},
+        {"relpath": "b.txt", "hash": file2_hash, "size": 14, "isexec": False},
+    ]
+    pvt_content = {"path": "data/", "hash": tree_hash, "size": 28, "manifest": manifest}
+    (repo_path / "data.pvt").write_text(yaml.dump(pvt_content))
+
+    sha = commit("add pvt file")
+
+    monkeypatch.setattr(project, "_project_root_cache", repo_path)
+
+    output_path = repo_path / "restored_data"
+
+    messages, success = restore.restore_targets_from_revision(
+        targets=["data"],
+        rev=sha[:7],
+        output=output_path,
+        cache_dir=cache_dir,
+        state_dir=state_dir,
+        checkout_modes=[cache.CheckoutMode.COPY],
+        force=False,
+    )
+
+    assert success, f"Expected success, got messages: {messages}"
+    assert len(messages) == 1
+    assert "from cache" in messages[0]
+    assert (output_path / "a.txt").read_bytes() == b"file 1 content"
+    assert (output_path / "b.txt").read_bytes() == b"file 2 content"
+
+
+def test_restore_file_from_remote_caches_with_readonly_permissions(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Files cached from remote have read-only (0o444) permissions."""
+    import xxhash
+
+    repo_path, commit = git_repo
+
+    # Set up directories
+    cache_dir = repo_path / ".pivot" / "cache"
+    state_dir = repo_path / ".pivot"
+    (cache_dir / "files").mkdir(parents=True)
+
+    # Create content that will "come from remote"
+    content = b"content from remote"
+    file_hash = xxhash.xxh64(content).hexdigest()
+
+    # Create a .pvt file pointing to that hash (not in local cache)
+    pvt_content = {"path": "data.csv", "hash": file_hash, "size": len(content)}
+    (repo_path / "data.csv.pvt").write_text(yaml.dump(pvt_content))
+
+    sha = commit("add pvt file")
+
+    monkeypatch.setattr(project, "_project_root_cache", repo_path)
+
+    # Mock remote.fetch_from_remote to return our content
+    monkeypatch.setattr(
+        "pivot.storage.restore.remote.fetch_from_remote",
+        lambda h: content,  # pyright: ignore[reportUnknownLambdaType, reportUnknownArgumentType]
+    )
+
+    output_path = repo_path / "restored_data.csv"
+
+    messages, success = restore.restore_targets_from_revision(
+        targets=["data.csv"],
+        rev=sha[:7],
+        output=output_path,
+        cache_dir=cache_dir,
+        state_dir=state_dir,
+        checkout_modes=[cache.CheckoutMode.COPY],
+        force=False,
+    )
+
+    assert success
+    assert len(messages) == 1
+    assert "from remote" in messages[0]
+    assert output_path.read_bytes() == content
+
+    # Verify cached file has read-only permissions
+    cached_path = cache.get_cache_path(cache_dir / "files", file_hash)
+    assert cached_path.exists(), "File should be cached after restore from remote"
+    mode = cached_path.stat().st_mode & 0o777
+    assert mode == 0o444, f"Cache file should have 0o444 permissions, got {oct(mode)}"
+
+
+def test_restore_file_from_remote_hash_mismatch(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Remote content with hash mismatch is rejected and returns error."""
+    import xxhash
+
+    repo_path, commit = git_repo
+
+    # Set up directories
+    cache_dir = repo_path / ".pivot" / "cache"
+    state_dir = repo_path / ".pivot"
+    (cache_dir / "files").mkdir(parents=True)
+
+    # Create content but calculate hash for DIFFERENT content
+    actual_content = b"corrupted content from remote"
+    expected_content = b"original content"
+    expected_hash = xxhash.xxh64(expected_content).hexdigest()
+
+    # Create a .pvt file pointing to the expected hash (not in local cache)
+    pvt_content = {"path": "data.csv", "hash": expected_hash, "size": len(expected_content)}
+    (repo_path / "data.csv.pvt").write_text(yaml.dump(pvt_content))
+
+    sha = commit("add pvt file")
+
+    monkeypatch.setattr(project, "_project_root_cache", repo_path)
+
+    # Mock remote.fetch_from_remote to return WRONG content (simulating corruption)
+    monkeypatch.setattr(
+        "pivot.storage.restore.remote.fetch_from_remote",
+        lambda h: actual_content,  # pyright: ignore[reportUnknownLambdaType, reportUnknownArgumentType]
+    )
+
+    output_path = repo_path / "restored_data.csv"
+
+    messages, success = restore.restore_targets_from_revision(
+        targets=["data.csv"],
+        rev=sha[:7],
+        output=output_path,
+        cache_dir=cache_dir,
+        state_dir=state_dir,
+        checkout_modes=[cache.CheckoutMode.COPY],
+        force=False,
+    )
+
+    # Should fail due to hash mismatch
+    assert not success
+    assert any("corrupted" in msg or "hash mismatch" in msg for msg in messages), (
+        f"Should have hash mismatch error, got: {messages}"
+    )
+    # Output file should NOT be created with corrupted content
+    assert not output_path.exists(), "Corrupted content should not be written to output"
+    # Cache should NOT store corrupted content
+    cached_path = cache.get_cache_path(cache_dir / "files", expected_hash)
+    assert not cached_path.exists(), "Corrupted content should not be cached"
+
+
+def test_restore_file_from_remote_success(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Remote content is restored and cached successfully."""
+    import xxhash
+
+    repo_path, commit = git_repo
+
+    # Set up directories
+    cache_dir = repo_path / ".pivot" / "cache"
+    state_dir = repo_path / ".pivot"
+    (cache_dir / "files").mkdir(parents=True)
+
+    content = b"content from remote"
+    file_hash = xxhash.xxh64(content).hexdigest()
+
+    pvt_content = {"path": "data.csv", "hash": file_hash, "size": len(content)}
+    (repo_path / "data.csv.pvt").write_text(yaml.dump(pvt_content))
+
+    sha = commit("add pvt file")
+
+    monkeypatch.setattr(project, "_project_root_cache", repo_path)
+    monkeypatch.setattr(
+        "pivot.storage.restore.remote.fetch_from_remote",
+        lambda h: content,  # pyright: ignore[reportUnknownLambdaType, reportUnknownArgumentType]
+    )
+
+    # Create output directory as read-only to simulate write failure
+    output_dir = repo_path / "readonly_dir"
+    output_dir.mkdir()
+    output_path = output_dir / "data.csv"
+
+    # First restore should succeed
+    messages, success = restore.restore_targets_from_revision(
+        targets=["data.csv"],
+        rev=sha[:7],
+        output=output_path,
+        cache_dir=cache_dir,
+        state_dir=state_dir,
+        checkout_modes=[cache.CheckoutMode.COPY],
+        force=False,
+    )
+
+    assert success
+    assert output_path.read_bytes() == content

@@ -20,11 +20,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _get_cache_files_dir(cache_dir: pathlib.Path) -> pathlib.Path:
-    """Get the files subdirectory of the cache."""
-    return cache_dir / "files"
-
-
 def get_local_cache_hashes(cache_dir: pathlib.Path) -> set[str]:
     """Scan local cache and return all content hashes.
 
@@ -32,7 +27,7 @@ def get_local_cache_hashes(cache_dir: pathlib.Path) -> set[str]:
     redundant syscalls compared to pathlib.iterdir + is_file/is_dir.
     """
     _t = metrics.start()
-    files_dir = _get_cache_files_dir(cache_dir)
+    files_dir = cache_dir / "files"
     if not files_dir.exists():
         metrics.end("sync.get_local_cache_hashes", _t)
         return set()
@@ -249,7 +244,7 @@ async def _push_async(
         metrics.end("sync.push_async", _t)
         return TransferSummary(transferred=0, skipped=len(status["common"]), failed=0, errors=[])
 
-    files_dir = _get_cache_files_dir(cache_dir)
+    files_dir = cache_dir / "files"
     items = list[tuple[pathlib.Path, str]]()
     for hash_ in status["local_only"]:
         cache_path = cache.get_cache_path(files_dir, hash_)
@@ -320,13 +315,13 @@ async def _pull_async(
         metrics.end("sync.pull_async", _t)
         return TransferSummary(transferred=0, skipped=len(needed_hashes), failed=0, errors=[])
 
-    files_dir = _get_cache_files_dir(cache_dir)
+    files_dir = cache_dir / "files"
     items = list[tuple[str, pathlib.Path]]()
     for hash_ in missing_locally:
         cache_path = cache.get_cache_path(files_dir, hash_)
         items.append((hash_, cache_path))
 
-    results = await remote.download_batch(items, concurrency=jobs, callback=callback)
+    results = await remote.download_batch(items, concurrency=jobs, callback=callback, readonly=True)
 
     transferred = [r for r in results if r["success"]]
     failed = [r for r in results if not r["success"]]
