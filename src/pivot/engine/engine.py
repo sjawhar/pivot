@@ -666,6 +666,19 @@ class Engine:
                                 state_dir=state_dir,
                             )
 
+                    # Diagnostic: log stages not in results after main loop
+                    missing_by_state: dict[str, list[str]] = {}
+                    for name, state in self._stage_states.items():
+                        if name not in results:
+                            missing_by_state.setdefault(state.name, []).append(name)
+                    if missing_by_state:
+                        for state_name, stages in missing_by_state.items():
+                            _logger.debug(
+                                "Stages not in results (state=%s): %s",
+                                state_name,
+                                stages[:10] if len(stages) > 10 else stages,
+                            )
+
                     # Handle any blocked stages not yet processed
                     for name, state in self._stage_states.items():
                         if state == StageExecutionState.BLOCKED and name not in results:

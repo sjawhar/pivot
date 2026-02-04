@@ -184,6 +184,50 @@ def find_parent_pipeline_paths(
         current = current.parent
 
 
+def find_pipeline_paths_for_dependency(
+    dep_path: pathlib.Path,
+    stop_at: pathlib.Path,
+) -> Iterator[pathlib.Path]:
+    """Find pipeline config files starting from a dependency's directory.
+
+    Starts from the directory containing the dependency and traverses up to
+    stop_at, yielding each pivot.yaml or pipeline.py found. Closest directories
+    first. Unlike find_parent_pipeline_paths (which excludes start_dir), this
+    function INCLUDES the dependency's containing directory in the search.
+
+    This enables resolution of sibling pipeline dependencies - if a dependency
+    is in ../sibling_b/data/file.csv, we search sibling_b/ for a pipeline that
+    produces it.
+
+    Args:
+        dep_path: Path to the dependency (file or directory).
+        stop_at: Stop traversal at this directory (inclusive).
+
+    Yields:
+        Paths to pivot.yaml or pipeline.py files.
+
+    Raises:
+        DiscoveryError: If a directory has both pivot.yaml and pipeline.py,
+            or if path resolution fails.
+    """
+    try:
+        # Start from dependency's parent directory (the directory containing the dep)
+        current = dep_path.resolve().parent
+        stop_at_resolved = stop_at.resolve()
+    except OSError as e:
+        raise DiscoveryError(f"Failed to resolve paths: {e}") from e
+
+    # Traverse up to project root
+    while current.is_relative_to(stop_at_resolved):
+        config_path = _find_config_path_in_dir(current)
+        if config_path:
+            yield config_path
+
+        if current == stop_at_resolved or current.parent == current:
+            break
+        current = current.parent
+
+
 def load_pipeline_from_path(path: pathlib.Path) -> Pipeline | None:
     """Load a Pipeline from a pivot.yaml or pipeline.py file.
 
