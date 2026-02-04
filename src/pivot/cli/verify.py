@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import pathlib
 from typing import TYPE_CHECKING, TypedDict
 
 import click
@@ -15,9 +16,10 @@ from pivot.remote import config as remote_config
 from pivot.remote import storage as remote_mod
 from pivot.remote import sync as transfer
 from pivot.storage import lock
-from pivot.types import PipelineStatus, PipelineStatusInfo
+from pivot.types import OutputHash, PipelineStatus, PipelineStatusInfo, is_dir_hash
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
     from pathlib import Path
 
 
@@ -37,24 +39,44 @@ class VerifyOutput(TypedDict):
     stages: list[StageVerifyInfo]
 
 
-def _get_stage_output_hashes(stage_name: str, state_dir: Path) -> dict[str, str]:
-    """Get output file hashes from a stage's lock file (outputs only, not deps)."""
+def _extract_file_hashes(hash_infos: Mapping[str, OutputHash]) -> dict[str, str]:
+    """Extract individual file hashes from a hash_info dict.
+
+    Tree hashes (directory hashes) are computed, not cached - only individual
+    file hashes are stored in the cache. For directories with manifests,
+    extracts each manifest entry's hash.
+    """
+    result = dict[str, str]()
+    for path, hash_info in hash_infos.items():
+        if hash_info is None:
+            continue
+        if is_dir_hash(hash_info):
+            for entry in hash_info["manifest"]:
+                entry_path = str(pathlib.Path(path) / entry["relpath"])
+                result[entry_path] = entry["hash"]
+        else:
+            result[path] = hash_info["hash"]
+    return result
+
+
+def _get_stage_lock_hashes(
+    stage_name: str, state_dir: Path
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Get output and dep file hashes from a stage's lock file.
+
+    Returns (output_hashes, dep_hashes) where each is {path: hash}.
+
+    For both outputs and deps, includes manifest entry hashes for directories.
+    """
     stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(state_dir))
     lock_data = stage_lock.read()
     if lock_data is None:
-        return {}
+        return {}, {}
 
-    hashes = dict[str, str]()
-
-    # Collect only output hashes - deps are inputs that exist in working dir, not cache
-    for path, hash_info in lock_data["output_hashes"].items():
-        if hash_info is not None:
-            hashes[path] = hash_info["hash"]
-            if "manifest" in hash_info:
-                for entry in hash_info["manifest"]:
-                    hashes[f"{path}/{entry['relpath']}"] = entry["hash"]
-
-    return hashes
+    return (
+        _extract_file_hashes(lock_data["output_hashes"]),
+        _extract_file_hashes(lock_data["dep_hashes"]),
+    )
 
 
 def _verify_stage_files(
@@ -66,18 +88,29 @@ def _verify_stage_files(
 ) -> list[str]:
     """Verify all files for a stage exist locally or on remote.
 
+    When allow_missing=True, also verifies deps on remote (if missing locally).
     Returns list of missing file paths.
     """
-    stage_hashes = _get_stage_output_hashes(stage_name, state_dir)
-    if not stage_hashes:
-        return []
+    output_hashes, dep_hashes = _get_stage_lock_hashes(stage_name, state_dir)
 
     # Track unique missing hashes and all paths that map to them
     missing_hashes = set[str]()
     hash_to_paths = dict[str, list[str]]()
 
-    for path, hash_val in stage_hashes.items():
+    # Check outputs: must be in local cache or (with allow_missing) on remote
+    for path, hash_val in output_hashes.items():
         if hash_val not in local_hashes:
+            missing_hashes.add(hash_val)
+            hash_to_paths.setdefault(hash_val, []).append(path)
+
+    # Check deps only when allow_missing: must exist locally OR on remote
+    # (deps are in working dir, not cache, so we check file existence)
+    if allow_missing:
+        for path, hash_val in dep_hashes.items():
+            # Skip deps that exist locally (in working directory)
+            if pathlib.Path(path).exists():
+                continue
+            # Dep missing locally - must be on remote
             missing_hashes.add(hash_val)
             hash_to_paths.setdefault(hash_val, []).append(path)
 
@@ -218,6 +251,9 @@ def verify(
 
     Checks that all stages are cached (code, params, deps match lock files)
     and output files exist locally or on remote.
+
+    With --allow-missing, both stage dependencies and outputs are verified
+    to exist on the remote cache, enabling CI verification without local data.
 
     Use in CI pre-merge gates to ensure pipeline is reproducible.
 
