@@ -277,3 +277,29 @@ def run_stage():
     # Both should be hashes (not "callable")
     assert len(fp["func:func_a"]) == 16, "Direct import should be hashed"
     assert len(fp["mod:helpers.func_b"]) == 16, "Module attr should be hashed"
+
+
+def test_unsupported_module_attr_type_raises_error(module_dir: pathlib.Path) -> None:
+    """Unsupported types (like lists, arrays) in module attrs raise TypeError."""
+    helpers_py = module_dir / "test_mod_helpers_v8.py"
+    helpers_py.write_text("""
+# This is an unsupported type for module attribute fingerprinting
+MY_LIST = [1, 2, 3, 4, 5]
+
+def process(x):
+    return x in MY_LIST
+""")
+
+    stage_py = module_dir / "test_mod_stage_v8.py"
+    stage_py.write_text("""
+import test_mod_helpers_v8 as helpers
+
+def run_stage():
+    # Uses the list via module attribute access
+    return helpers.process(3) and len(helpers.MY_LIST) > 0
+""")
+
+    stage_mod = _import_module("test_mod_stage_v8")
+
+    with pytest.raises(TypeError, match="Cannot fingerprint module attribute"):
+        fingerprint.get_stage_fingerprint(stage_mod.run_stage)
