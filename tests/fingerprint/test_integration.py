@@ -280,14 +280,18 @@ def run_stage():
 
 
 def test_unsupported_module_attr_type_raises_error(module_dir: pathlib.Path) -> None:
-    """Unsupported types (like lists, arrays) in module attrs raise TypeError."""
+    """Unsupported types (custom objects, non-primitive collections) in module attrs raise TypeError."""
     helpers_py = module_dir / "test_mod_helpers_v8.py"
     helpers_py.write_text("""
-# This is an unsupported type for module attribute fingerprinting
-MY_LIST = [1, 2, 3, 4, 5]
+# This is an unsupported type - a list containing a custom object
+class Config:
+    def __init__(self, value: int) -> None:
+        self.value = value
 
-def process(x):
-    return x in MY_LIST
+MY_CONFIGS = [Config(1), Config(2)]
+
+def process(x: int) -> bool:
+    return any(c.value == x for c in MY_CONFIGS)
 """)
 
     stage_py = module_dir / "test_mod_stage_v8.py"
@@ -296,10 +300,297 @@ import test_mod_helpers_v8 as helpers
 
 def run_stage():
     # Uses the list via module attribute access
-    return helpers.process(3) and len(helpers.MY_LIST) > 0
+    return helpers.process(1) and len(helpers.MY_CONFIGS) > 0
 """)
 
     stage_mod = _import_module("test_mod_stage_v8")
 
+    with pytest.raises(TypeError, match="Cannot fingerprint module attribute"):
+        fingerprint.get_stage_fingerprint(stage_mod.run_stage)
+
+
+def test_primitive_collection_module_attr_fingerprinting(module_dir: pathlib.Path) -> None:
+    """Primitive collections (dict/list/tuple/set of primitives) are supported."""
+    helpers_py = module_dir / "test_mod_helpers_v9.py"
+    helpers_py.write_text("""
+# Primitive collections - should be fingerprinted
+AGENTS = {"agent1": "config1", "agent2": "config2"}
+NUMBERS = [1, 2, 3, 4, 5]
+NESTED = {"key": [1, 2, {"inner": "value"}]}
+""")
+
+    stage_py = module_dir / "test_mod_stage_v9.py"
+    stage_py.write_text("""
+import test_mod_helpers_v9 as helpers
+
+def run_stage():
+    # Access all primitive collection attrs
+    return list(helpers.AGENTS.keys()) + helpers.NUMBERS + list(helpers.NESTED.keys())
+""")
+
+    stage_mod = _import_module("test_mod_stage_v9")
+    manifest = fingerprint.get_stage_fingerprint(stage_mod.run_stage)
+
+    # Should have entries for the primitive collections
+    assert "mod:helpers.AGENTS" in manifest
+    assert "mod:helpers.NUMBERS" in manifest
+    assert "mod:helpers.NESTED" in manifest
+
+    # Values should be hashes (not repr strings)
+    for key in ["mod:helpers.AGENTS", "mod:helpers.NUMBERS", "mod:helpers.NESTED"]:
+        assert len(manifest[key]) == 16  # xxhash64 hex digest length
+
+
+def test_primitive_collection_change_detected(module_dir: pathlib.Path) -> None:
+    """Changing a primitive collection module attribute changes fingerprint."""
+    helpers_py = module_dir / "test_mod_helpers_v10.py"
+    helpers_py.write_text("""
+AGENTS = {"agent1": "config1", "agent2": "config2"}
+""")
+
+    stage_py = module_dir / "test_mod_stage_v10.py"
+    stage_py.write_text("""
+import test_mod_helpers_v10 as helpers
+
+def run_stage():
+    return list(helpers.AGENTS.keys())
+""")
+
+    stage_mod = _import_module("test_mod_stage_v10")
+    fp1 = fingerprint.get_stage_fingerprint(stage_mod.run_stage)
+    hash1 = fp1["mod:helpers.AGENTS"]
+
+    # Modify the collection
+    helpers_py.write_text("""
+AGENTS = {"agent1": "config1", "agent3": "config3"}  # CHANGED!
+""")
+
+    # Force re-import
+    _reimport_module("test_mod_helpers_v10")
+    stage_mod_v2 = _reimport_module("test_mod_stage_v10")
+    fp2 = fingerprint.get_stage_fingerprint(stage_mod_v2.run_stage)
+    hash2 = fp2["mod:helpers.AGENTS"]
+
+    # Fingerprint MUST be different
+    assert hash1 != hash2, f"Fingerprint must change when collection changes: {hash1} vs {hash2}"
+
+
+def test_primitive_collection_fingerprint_deterministic(module_dir: pathlib.Path) -> None:
+    """Same primitive collection produces same fingerprint (stability check)."""
+    helpers_py = module_dir / "test_mod_helpers_v11.py"
+    helpers_py.write_text("""
+# Test determinism with various collection types
+DICT_DATA = {"z": 1, "a": 2, "m": 3}  # Dict with unsorted keys
+SET_DATA = {5, 1, 3, 2, 4}  # Set (unordered)
+FROZENSET_DATA = frozenset([3, 1, 4, 1, 5])  # Frozenset (unordered, with duplicate)
+""")
+
+    stage_py = module_dir / "test_mod_stage_v11.py"
+    stage_py.write_text("""
+import test_mod_helpers_v11 as helpers
+
+def run_stage():
+    return helpers.DICT_DATA and helpers.SET_DATA and helpers.FROZENSET_DATA
+""")
+
+    stage_mod = _import_module("test_mod_stage_v11")
+    fp1 = fingerprint.get_stage_fingerprint(stage_mod.run_stage)
+
+    # Get fingerprint again without changes
+    fp2 = fingerprint.get_stage_fingerprint(stage_mod.run_stage)
+
+    # Hashes must be identical (deterministic)
+    assert fp1["mod:helpers.DICT_DATA"] == fp2["mod:helpers.DICT_DATA"]
+    assert fp1["mod:helpers.SET_DATA"] == fp2["mod:helpers.SET_DATA"]
+    assert fp1["mod:helpers.FROZENSET_DATA"] == fp2["mod:helpers.FROZENSET_DATA"]
+
+
+def test_primitive_collection_edge_cases(module_dir: pathlib.Path) -> None:
+    """Empty and deeply nested primitive collections are supported."""
+    helpers_py = module_dir / "test_mod_helpers_v12.py"
+    helpers_py.write_text("""
+# Edge cases
+EMPTY_LIST = []
+EMPTY_DICT = {}
+EMPTY_SET = set()
+EMPTY_TUPLE = ()
+DEEPLY_NESTED = {"a": {"b": {"c": {"d": [1, 2, {"e": "value"}]}}}}
+LARGE_LIST = list(range(200))  # 200 elements
+""")
+
+    stage_py = module_dir / "test_mod_stage_v12.py"
+    stage_py.write_text("""
+import test_mod_helpers_v12 as helpers
+
+def run_stage():
+    return (
+        helpers.EMPTY_LIST
+        or helpers.EMPTY_DICT
+        or helpers.EMPTY_SET
+        or helpers.EMPTY_TUPLE
+        or helpers.DEEPLY_NESTED
+        or helpers.LARGE_LIST
+    )
+""")
+
+    stage_mod = _import_module("test_mod_stage_v12")
+    manifest = fingerprint.get_stage_fingerprint(stage_mod.run_stage)
+
+    # All edge cases should be fingerprinted successfully
+    assert "mod:helpers.EMPTY_LIST" in manifest
+    assert "mod:helpers.EMPTY_DICT" in manifest
+    assert "mod:helpers.EMPTY_SET" in manifest
+    assert "mod:helpers.EMPTY_TUPLE" in manifest
+    assert "mod:helpers.DEEPLY_NESTED" in manifest
+    assert "mod:helpers.LARGE_LIST" in manifest
+
+    # All should be hashes
+    for key in [
+        "mod:helpers.EMPTY_LIST",
+        "mod:helpers.EMPTY_DICT",
+        "mod:helpers.EMPTY_SET",
+        "mod:helpers.EMPTY_TUPLE",
+        "mod:helpers.DEEPLY_NESTED",
+        "mod:helpers.LARGE_LIST",
+    ]:
+        assert len(manifest[key]) == 16
+
+
+def test_all_primitive_types_supported(module_dir: pathlib.Path) -> None:
+    """All primitive types (bool/int/float/str/bytes/None) in all collection types are supported."""
+    helpers_py = module_dir / "test_mod_helpers_v13.py"
+    helpers_py.write_text("""
+# All primitive types in various collections
+LIST_ALL_TYPES = [True, 42, 3.14, "text", b"bytes", None]
+TUPLE_ALL_TYPES = (False, -1, -2.5, "tuple", b"data", None)
+SET_PRIMITIVES = {1, 2, 3, "a", "b"}  # Set can't contain mutable types
+FROZENSET_PRIMITIVES = frozenset([True, False, 0, 1])
+DICT_ALL_TYPES = {
+    "bool": True,
+    "int": 123,
+    "float": 45.67,
+    "str": "value",
+    "bytes": b"raw",
+    "none": None,
+}
+""")
+
+    stage_py = module_dir / "test_mod_stage_v13.py"
+    stage_py.write_text("""
+import test_mod_helpers_v13 as helpers
+
+def run_stage():
+    return (
+        helpers.LIST_ALL_TYPES
+        or helpers.TUPLE_ALL_TYPES
+        or helpers.SET_PRIMITIVES
+        or helpers.FROZENSET_PRIMITIVES
+        or helpers.DICT_ALL_TYPES
+    )
+""")
+
+    stage_mod = _import_module("test_mod_stage_v13")
+    manifest = fingerprint.get_stage_fingerprint(stage_mod.run_stage)
+
+    # All should be fingerprinted
+    assert "mod:helpers.LIST_ALL_TYPES" in manifest
+    assert "mod:helpers.TUPLE_ALL_TYPES" in manifest
+    assert "mod:helpers.SET_PRIMITIVES" in manifest
+    assert "mod:helpers.FROZENSET_PRIMITIVES" in manifest
+    assert "mod:helpers.DICT_ALL_TYPES" in manifest
+
+    # All should be hashes
+    for key in [
+        "mod:helpers.LIST_ALL_TYPES",
+        "mod:helpers.TUPLE_ALL_TYPES",
+        "mod:helpers.SET_PRIMITIVES",
+        "mod:helpers.FROZENSET_PRIMITIVES",
+        "mod:helpers.DICT_ALL_TYPES",
+    ]:
+        assert len(manifest[key]) == 16
+
+
+def test_unsupported_types_comprehensive_errors(module_dir: pathlib.Path) -> None:
+    """Various unsupported types in collections raise clear TypeErrors."""
+    # Test 1: Mixed collection with custom object
+    helpers_py = module_dir / "test_mod_helpers_v14.py"
+    helpers_py.write_text("""
+class Config:
+    pass
+
+MIXED = [1, 2, Config()]  # Primitive + custom object
+""")
+
+    stage_py = module_dir / "test_mod_stage_v14.py"
+    stage_py.write_text("""
+import test_mod_helpers_v14 as helpers
+
+def run_stage():
+    return len(helpers.MIXED) > 0
+""")
+
+    stage_mod = _import_module("test_mod_stage_v14")
+    with pytest.raises(TypeError, match="Cannot fingerprint module attribute"):
+        fingerprint.get_stage_fingerprint(stage_mod.run_stage)
+
+    # Test 2: Dict containing callable (module attributes don't support callable extraction)
+    helpers_py.write_text("""
+def callback():
+    return None
+
+CALLBACKS = {"func": callback}
+""")
+    stage_py.write_text("""
+import test_mod_helpers_v14 as helpers
+
+def run_stage():
+    return helpers.CALLBACKS
+""")
+    _reimport_module("test_mod_helpers_v14")
+    stage_mod_v2 = _reimport_module("test_mod_stage_v14")
+
+    # Module attribute collections with callables are not supported
+    with pytest.raises(TypeError, match="Cannot fingerprint module attribute"):
+        fingerprint.get_stage_fingerprint(stage_mod_v2.run_stage)
+
+    # Test 3: Deeply nested unsupported type
+    helpers_py.write_text("""
+class DeepConfig:
+    pass
+
+NESTED_BAD = {"level1": {"level2": [1, 2, DeepConfig()]}}
+""")
+    stage_py.write_text("""
+import test_mod_helpers_v14 as helpers
+
+def run_stage():
+    return helpers.NESTED_BAD
+""")
+    _reimport_module("test_mod_helpers_v14")
+    stage_mod_v3 = _reimport_module("test_mod_stage_v14")
+
+    with pytest.raises(TypeError, match="Cannot fingerprint module attribute"):
+        fingerprint.get_stage_fingerprint(stage_mod_v3.run_stage)
+
+
+def test_circular_reference_in_collection_raises_error(module_dir: pathlib.Path) -> None:
+    """Circular references in module-level collections should raise TypeError."""
+    helpers_py = module_dir / "test_mod_helpers_circular.py"
+    helpers_py.write_text("""
+CIRCULAR = [1, 2, 3]
+CIRCULAR.append(CIRCULAR)
+""")
+
+    stage_py = module_dir / "test_mod_stage_circular.py"
+    stage_py.write_text("""
+import test_mod_helpers_circular as helpers
+
+def run_stage():
+    return helpers.CIRCULAR[0]
+""")
+
+    stage_mod = _import_module("test_mod_stage_circular")
+
+    # Circular reference fails _is_primitive_collection check, so raises TypeError
     with pytest.raises(TypeError, match="Cannot fingerprint module attribute"):
         fingerprint.get_stage_fingerprint(stage_mod.run_stage)

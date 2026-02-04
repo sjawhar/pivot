@@ -92,6 +92,7 @@ This document exhaustively catalogs what code changes are and are not detected b
 | Transitive dependency change        | ✅        | `test_change_detection.py::test_transitive_dependency_change_causes_miss`               |
 | Module constant                     | ✅        | `test_integration.py::test_constant_via_module_attr_captured`                           |
 | Module constant captured            | ✅        | `test_change_detection.py::test_module_constant_captured_via_module_attr`               |
+| Module primitive collection         | ✅        | `test_integration.py::test_primitive_collection_module_attr_fingerprinting`             |
 | Nested attribute (`X.sub.func`)     | ⚠️        | `test_fingerprint.py::test_extract_nested_attr_access` (extracted but not fully tested) |
 | Multiple attrs from same module     | ✅        | `test_fingerprint.py::test_multiple_module_attrs_detected`                              |
 | Both import styles in same stage    | ✅        | `test_integration.py::test_both_import_styles_in_same_stage`                            |
@@ -293,3 +294,7 @@ Tests in `test_callback_vulnerabilities.py` document edge cases where callback c
 18. **Builtin types ARE deterministic**: Builtin types (`list`, `dict`, `set`, `tuple`, etc.) used as `default_factory` in Pydantic fields are hashed using their qualified name (e.g., `builtin:list`) rather than `id()`. This ensures fingerprints are stable across Python sessions. Previously, `id()` was used as a fallback for objects without source code, causing spurious "Code changed" invalidations.
 
     Tests: `test_determinism.py::test_builtin_default_factory_deterministic_across_processes`, `test_determinism.py::test_builtin_type_deterministic`
+
+19. **Module attribute primitive collections ARE tracked**: Module-level collections (dict, list, tuple, set, frozenset) containing only primitive values (bool, int, float, str, bytes, None) are fingerprinted via JSON serialization. Collections containing non-primitives (custom objects, class instances, numpy arrays) raise a `TypeError` to prevent non-deterministic `repr()` output. The primitive check is recursive, so nested structures like `{"key": [1, 2, {"inner": "value"}]}` are supported.
+
+    Tests: `test_integration.py::test_primitive_collection_module_attr_fingerprinting`, `test_integration.py::test_unsupported_module_attr_type_raises_error`
