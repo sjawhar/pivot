@@ -107,6 +107,9 @@ class Engine:
     # Track whether run() has completed to prevent re-use
     _run_completed: bool
 
+    # Event signaling dispatcher has finished draining
+    _dispatch_complete: anyio.Event
+
     def __init__(self, *, pipeline: Pipeline | None = None) -> None:
         """Initialize the async engine in IDLE state."""
         self._pipeline = pipeline
@@ -147,6 +150,9 @@ class Engine:
 
         # Track whether run() has completed to prevent re-use
         self._run_completed = False
+
+        # Event signaling dispatcher has finished draining (recreated each run())
+        self._dispatch_complete = anyio.Event()
 
     @property
     def state(self) -> EngineState:
@@ -238,6 +244,9 @@ class Engine:
         if self._output_send is None or self._output_recv is None:
             raise RuntimeError("Engine must be used as async context manager")
 
+        # Create fresh dispatch completion event (Events can only be set once)
+        self._dispatch_complete = anyio.Event()
+
         async with anyio.create_task_group() as tg:
             # Start all sources with channel cleanup
             for source in self._sources:
@@ -258,11 +267,14 @@ class Engine:
             if self._output_send:
                 await self._output_send.aclose()
 
-            # Brief yield to let dispatcher process remaining buffered events.
-            # The dispatcher will exit naturally when it sees end-of-stream.
-            await anyio.sleep(0)
+            # Wait for dispatcher to finish draining all buffered events.
+            # The dispatcher sets _dispatch_complete when it exits (after the
+            # async for loop ends due to channel closure).
+            # Use a timeout to prevent infinite hang if dispatcher gets stuck.
+            with anyio.move_on_after(5.0):
+                await self._dispatch_complete.wait()
 
-            # Cancel remaining tasks (sources)
+            # Cancel remaining tasks (sources and possibly stuck dispatcher)
             tg.cancel_scope.cancel()
 
         # Mark as completed to prevent re-use (channels are closed, state is inconsistent)
@@ -289,12 +301,16 @@ class Engine:
 
         Assumes run() has validated that channels are initialized.
         Errors in individual sinks are logged but don't stop event dispatch.
+        Sets _dispatch_complete when finished draining events.
         """
         assert self._output_recv is not None  # Validated by run()
-        async for event in self._output_recv:
-            async with anyio.create_task_group() as tg:
-                for sink in self._sinks:
-                    tg.start_soon(self._dispatch_to_sink, sink, event)
+        try:
+            async for event in self._output_recv:
+                async with anyio.create_task_group() as tg:
+                    for sink in self._sinks:
+                        tg.start_soon(self._dispatch_to_sink, sink, event)
+        finally:
+            self._dispatch_complete.set()
 
     async def _dispatch_to_sink(self, sink: EventSink, event: OutputEvent) -> None:
         """Dispatch event to a single sink, catching errors."""
