@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
+    from pivot.fingerprint import AstHashEntry
     from pivot.run_history import RunCacheEntry, RunManifest
     from pivot.types import DeferredWrites
 
@@ -81,25 +82,40 @@ class InvalidAstHashKeyError(Exception):
     """Raised when AST hash key components contain invalid characters."""
 
 
-def _make_key_ast_hash(rel_path: str, mtime_ns: int, size: int, inode: int, qualname: str) -> bytes:
+def _make_key_ast_hash(
+    rel_path: str,
+    mtime_ns: int,
+    size: int,
+    inode: int,
+    qualname: str,
+    py_version: str,
+    schema_version: int,
+) -> bytes:
     """Create LMDB key for AST hash entry.
 
-    Key format: fp:{rel_path}\x00{mtime_ns}\x00{size}\x00{inode}\x00{qualname}
+    Key format: fp:{rel_path}\x00{mtime_ns}\x00{size}\x00{inode}\x00{qualname}\x00{py_version}\x00{schema_version}
     Uses null byte separator (can't appear in paths or qualnames).
 
     Raises:
-        InvalidAstHashKeyError: If rel_path or qualname contains null bytes or is empty
+        InvalidAstHashKeyError: If rel_path, qualname, or py_version contains null bytes or is empty
     """
     if not rel_path:
         raise InvalidAstHashKeyError("rel_path cannot be empty")
     if not qualname:
         raise InvalidAstHashKeyError("qualname cannot be empty")
+    if not py_version:
+        raise InvalidAstHashKeyError("py_version cannot be empty")
     if "\x00" in rel_path:
         raise InvalidAstHashKeyError(f"rel_path contains null byte: {rel_path!r}")
     if "\x00" in qualname:
         raise InvalidAstHashKeyError(f"qualname contains null byte: {qualname!r}")
+    if "\x00" in py_version:
+        raise InvalidAstHashKeyError(f"py_version contains null byte: {py_version!r}")
 
-    key = _FP_PREFIX + f"{rel_path}\x00{mtime_ns}\x00{size}\x00{inode}\x00{qualname}".encode()
+    key = (
+        _FP_PREFIX
+        + f"{rel_path}\x00{mtime_ns}\x00{size}\x00{inode}\x00{qualname}\x00{py_version}\x00{schema_version}".encode()
+    )
     if len(key) > _MAX_KEY_SIZE:
         raise InvalidAstHashKeyError(f"key exceeds {_MAX_KEY_SIZE} bytes: {len(key)}")
     return key
@@ -233,12 +249,21 @@ class StateDB:
     # -------------------------------------------------------------------------
 
     def get_ast_hash(
-        self, rel_path: str, mtime_ns: int, size: int, inode: int, qualname: str
+        self,
+        rel_path: str,
+        mtime_ns: int,
+        size: int,
+        inode: int,
+        qualname: str,
+        py_version: str,
+        schema_version: int,
     ) -> str | None:
         """Get cached AST hash; returns None if not found or key is invalid."""
         self._check_closed()
         try:
-            key = _make_key_ast_hash(rel_path, mtime_ns, size, inode, qualname)
+            key = _make_key_ast_hash(
+                rel_path, mtime_ns, size, inode, qualname, py_version, schema_version
+            )
         except InvalidAstHashKeyError:
             return None
         with self._env.begin() as txn:
@@ -247,7 +272,7 @@ class StateDB:
             return None
         return value.decode("ascii")
 
-    def save_ast_hash_many(self, entries: list[tuple[str, int, int, int, str, str]]) -> None:
+    def save_ast_hash_many(self, entries: list[AstHashEntry]) -> None:
         """Batch save AST hash entries; skips entries with invalid keys."""
         self._check_closed()
         self._check_write_allowed()
@@ -255,14 +280,46 @@ class StateDB:
             return
         try:
             with self._env.begin(write=True) as txn:
-                for rel_path, mtime_ns, size, inode, qualname, hash_hex in entries:
+                for (
+                    rel_path,
+                    mtime_ns,
+                    size,
+                    inode,
+                    qualname,
+                    py_version,
+                    schema_version,
+                    hash_hex,
+                ) in entries:
                     try:
-                        key = _make_key_ast_hash(rel_path, mtime_ns, size, inode, qualname)
+                        key = _make_key_ast_hash(
+                            rel_path, mtime_ns, size, inode, qualname, py_version, schema_version
+                        )
                     except InvalidAstHashKeyError:
                         continue  # Skip invalid entries
                     txn.put(key, hash_hex.encode("ascii"))
         except lmdb.MapFullError as e:
             raise DatabaseFullError(_DB_FULL_MSG) from e
+
+    def clear_ast_hashes(self) -> int:
+        """Clear all AST hash cache entries.
+
+        Returns number of entries deleted.
+        """
+        self._check_closed()
+        self._check_write_allowed()
+        deleted = 0
+        with self._env.begin(write=True) as txn:
+            cursor = txn.cursor()
+            keys_to_delete = list[bytes]()
+            if cursor.set_range(_FP_PREFIX):
+                for key, _ in cursor:
+                    if not key.startswith(_FP_PREFIX):
+                        break
+                    keys_to_delete.append(key)
+            for key in keys_to_delete:
+                txn.delete(key)
+                deleted += 1
+        return deleted
 
     # -------------------------------------------------------------------------
     # Generation tracking for O(1) skip detection
