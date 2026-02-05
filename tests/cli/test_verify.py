@@ -650,6 +650,59 @@ def test_verify_allow_missing_uses_pvt_hash_for_deps(
     assert result.exit_code == 0, f"Expected pass, got: {result.output}"
 
 
+def test_verify_allow_missing_uses_lock_hash_when_no_pvt(
+    mock_discovery: Pipeline,
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    mocker: MockerFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """verify --allow-missing uses lock file hash when dep missing and no .pvt exists.
+
+    This is the key CI scenario: dep files don't exist locally, no .pvt tracking,
+    but the dep hashes are available in the remote cache.
+    """
+    # Create input.txt and run stage to cache
+    (tmp_path / "input.txt").write_text("data")
+    register_test_stage(_helper_process, name="process")
+    executor.run(pipeline=mock_discovery)
+
+    # Delete the input file (simulating CI without data) - NO .pvt file created
+    (tmp_path / "input.txt").unlink()
+
+    _setup_mock_remote(mocker, files_exist_on_remote=True)
+
+    result = runner.invoke(cli.cli, ["verify", "--allow-missing"])
+
+    # Should NOT fail with "Missing deps" - should use lock file hash and verify on remote
+    assert "Missing deps" not in result.output, f"Got: {result.output}"
+    assert result.exit_code == 0, f"Expected pass, got: {result.output}"
+
+
+def test_verify_allow_missing_fails_when_dep_not_on_remote(
+    mock_discovery: Pipeline,
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    mocker: MockerFixture,
+) -> None:
+    """verify --allow-missing fails when dep hash not on remote (no .pvt)."""
+    # Create input.txt and run stage to cache
+    (tmp_path / "input.txt").write_text("data")
+    register_test_stage(_helper_process, name="process")
+    executor.run(pipeline=mock_discovery)
+
+    # Delete the input file - NO .pvt file
+    (tmp_path / "input.txt").unlink()
+
+    _setup_mock_remote(mocker, files_exist_on_remote=False)
+
+    result = runner.invoke(cli.cli, ["verify", "--allow-missing"])
+
+    # Should fail - dep hash not on remote
+    assert result.exit_code == 1
+    assert "Missing files:" in result.output or "input.txt" in result.output
+
+
 def test_verify_allow_missing_uses_pvt_hash_for_nested_dep(
     mock_discovery: Pipeline,
     runner: click.testing.CliRunner,

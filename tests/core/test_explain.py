@@ -950,3 +950,50 @@ def test_get_stage_explanation_allow_missing_untracked_still_fails(tmp_path: Pat
 
     assert result["will_run"] is True
     assert "missing" in result["reason"].lower()
+
+
+def test_get_stage_explanation_allow_missing_uses_lock_file_hash(tmp_path: Path) -> None:
+    """Uses lock file dep hash when allow_missing=True and no .pvt exists."""
+    import pygtrie
+
+    from pivot import project
+    from pivot.storage.track import PvtData
+
+    data_path = tmp_path / "data.csv"
+    normalized_path = str(project.normalize_path(str(data_path)))
+
+    # Empty tracked files - simulating no .pvt file
+    tracked_files = dict[str, PvtData]()
+    tracked_trie: pygtrie.Trie[str] = pygtrie.Trie()
+
+    # Lock file has the dep hash (from previous run)
+    stage_lock = lock.StageLock("lock_fallback_stage", tmp_path / "stages")
+    stage_lock.write(
+        LockData(
+            code_manifest={"self:lock_fallback_stage": "abc"},
+            params={},
+            dep_hashes={normalized_path: {"hash": "lock_hash_123"}},
+            output_hashes={},
+            dep_generations={},
+        )
+    )
+
+    # File does NOT exist on disk
+    assert not data_path.exists()
+
+    result = explain.get_stage_explanation(
+        stage_name="lock_fallback_stage",
+        fingerprint={"self:lock_fallback_stage": "abc"},
+        deps=[str(data_path)],
+        outs_paths=[],
+        params_instance=None,
+        overrides=None,
+        state_dir=tmp_path,
+        allow_missing=True,
+        tracked_files=tracked_files,
+        tracked_trie=tracked_trie,
+    )
+
+    # Should NOT report as missing deps - should use lock file hash
+    assert "missing" not in result["reason"].lower(), f"Got: {result['reason']}"
+    assert result["will_run"] is False, "Stage should be cached (hashes match from lock file)"

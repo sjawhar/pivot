@@ -172,7 +172,8 @@ def get_stage_explanation(
 
     Args:
         allow_missing: If True and a dep file is missing, try to use hash from
-            tracked_files (.pvt data) instead of reporting as missing.
+            tracked_files (.pvt data) first, then fall back to the lock file's
+            recorded hash for that dep (enabling remote verification).
         tracked_files: Dict of absolute path -> PvtData from .pvt files.
         tracked_trie: Trie of tracked paths for efficient lookup.
     """
@@ -231,10 +232,10 @@ def get_stage_explanation(
                     upstream_stale=[],
                 )
 
-    # Hash dependencies - with optional .pvt fallback for missing files
-    if allow_missing and tracked_files is not None and tracked_trie is not None:
+    # Hash dependencies - with optional fallback for missing files
+    if allow_missing:
         deps_to_hash = list[str]()
-        pvt_hashes = dict[str, HashInfo]()
+        fallback_hashes = dict[str, HashInfo]()
         missing_deps = list[str]()
 
         for dep in deps:
@@ -242,15 +243,21 @@ def get_stage_explanation(
             if dep_path.exists():
                 deps_to_hash.append(dep)
             else:
-                hash_info = _find_tracked_hash(dep_path, tracked_files, tracked_trie)
+                # Try .pvt file first
+                hash_info = None
+                if tracked_files is not None and tracked_trie is not None:
+                    hash_info = _find_tracked_hash(dep_path, tracked_files, tracked_trie)
+                # Fall back to lock file hash (for remote verification)
+                normalized = str(project.normalize_path(dep))
+                if hash_info is None:
+                    hash_info = lock_data["dep_hashes"].get(normalized)
                 if hash_info:
-                    normalized = str(project.normalize_path(dep))
-                    pvt_hashes[normalized] = hash_info
+                    fallback_hashes[normalized] = hash_info
                 else:
                     missing_deps.append(dep)
 
         file_hashes, more_missing, unreadable_deps = worker.hash_dependencies(deps_to_hash)
-        dep_hashes = {**file_hashes, **pvt_hashes}
+        dep_hashes = {**file_hashes, **fallback_hashes}
         missing_deps.extend(more_missing)
     else:
         dep_hashes, missing_deps, unreadable_deps = worker.hash_dependencies(deps)
