@@ -1,6 +1,7 @@
 # pyright: reportUnusedFunction=false, reportUnusedParameter=false, reportUnknownLambdaType=false, reportUnknownParameterType=false, reportMissingParameterType=false, reportUnknownVariableType=false, reportUnknownArgumentType=false, reportImplicitOverride=false
 
 import ast
+import importlib.util
 import math
 import os
 import pathlib
@@ -1485,9 +1486,13 @@ def my_stage():
 
         # Verify entry was queued for persistent cache
         assert len(fingerprint._pending_ast_writes) == 1
-        rel_path, mtime_ns, size, inode, qualname, hash_hex = fingerprint._pending_ast_writes[0]
+        rel_path, mtime_ns, size, inode, qualname, py_version, schema_version, hash_hex = (
+            fingerprint._pending_ast_writes[0]
+        )
         assert rel_path == "test_stage.py"
         assert qualname == "my_stage"
+        assert py_version == fingerprint._PYTHON_VERSION
+        assert schema_version == fingerprint._CACHE_SCHEMA_VERSION
         assert hash_hex == result
         assert mtime_ns > 0
         assert size > 0
@@ -1721,10 +1726,21 @@ def test_flush_ast_hash_cache_writes_to_statedb(tmp_path, monkeypatch):
     fingerprint._hash_function_ast_cache.clear()
 
     # Manually queue some entries (simulating what hash_function_ast does)
-    test_entries = [
-        ("src/a.py", 1000000000, 100, 111, "func_a", "aaaa111122223333"),
-        ("src/b.py", 2000000000, 200, 222, "func_b", "bbbb444455556666"),
-        ("src/c.py", 3000000000, 300, 333, "MyClass.method", "cccc777788889999"),
+    py_ver = fingerprint._PYTHON_VERSION
+    schema_ver = fingerprint._CACHE_SCHEMA_VERSION
+    test_entries: list[tuple[str, int, int, int, str, str, int, str]] = [
+        ("src/a.py", 1000000000, 100, 111, "func_a", py_ver, schema_ver, "aaaa111122223333"),
+        ("src/b.py", 2000000000, 200, 222, "func_b", py_ver, schema_ver, "bbbb444455556666"),
+        (
+            "src/c.py",
+            3000000000,
+            300,
+            333,
+            "MyClass.method",
+            py_ver,
+            schema_ver,
+            "cccc777788889999",
+        ),
     ]
     fingerprint._pending_ast_writes.extend(test_entries)
 
@@ -1733,11 +1749,125 @@ def test_flush_ast_hash_cache_writes_to_statedb(tmp_path, monkeypatch):
 
     # Verify entries were actually written
     with state.StateDB(db_path, readonly=True) as db:
-        for rel_path, mtime_ns, size, inode, qualname, expected_hash in test_entries:
-            actual_hash = db.get_ast_hash(rel_path, mtime_ns, size, inode, qualname)
+        for (
+            rel_path,
+            mtime_ns,
+            size,
+            inode,
+            qualname,
+            py_version,
+            schema_version,
+            expected_hash,
+        ) in test_entries:
+            actual_hash = db.get_ast_hash(
+                rel_path, mtime_ns, size, inode, qualname, py_version, schema_version
+            )
             assert actual_hash == expected_hash, (
                 f"Expected {expected_hash} for {rel_path}:{qualname}, got {actual_hash}"
             )
 
     # Pending writes should be cleared
     assert len(fingerprint._pending_ast_writes) == 0
+
+
+# ==============================================================================
+# Lambda disambiguation and dedent fix tests
+# ==============================================================================
+
+
+def test_multiple_lambdas_same_file_different_hashes(tmp_path, monkeypatch):
+    """Two lambdas on different lines get different cache keys."""
+    # Set project root so _get_func_source_info works
+    monkeypatch.setattr("pivot.project._project_root_cache", tmp_path)
+
+    mod_py = tmp_path / "test_lambdas.py"
+    mod_py.write_text("""
+lambda_a = lambda x: x + 1
+lambda_b = lambda x: x + 2
+""")
+
+    # Import fresh module
+    spec = importlib.util.spec_from_file_location("test_lambdas", mod_py)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["test_lambdas"] = mod
+    try:
+        spec.loader.exec_module(mod)
+
+        h1 = fingerprint.hash_function_ast(mod.lambda_a)
+        h2 = fingerprint.hash_function_ast(mod.lambda_b)
+
+        assert h1 != h2, "Different lambdas should have different hashes"
+
+        q1 = fingerprint._get_qualname_for_cache(mod.lambda_a)
+        q2 = fingerprint._get_qualname_for_cache(mod.lambda_b)
+        assert q1 != q2, "Different lambdas should have different qualnames"
+        assert "<lambda>:" in q1, f"Lambda qualname should have line info: {q1}"
+    finally:
+        sys.modules.pop("test_lambdas", None)
+
+
+def test_same_line_lambdas_disambiguated(tmp_path, monkeypatch):
+    """Two lambdas on same line get different cache keys via column."""
+    monkeypatch.setattr("pivot.project._project_root_cache", tmp_path)
+
+    mod_py = tmp_path / "test_same_line.py"
+    mod_py.write_text("pair = (lambda x: x, lambda y: y)\n")
+
+    spec = importlib.util.spec_from_file_location("test_same_line", mod_py)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["test_same_line"] = mod
+    try:
+        spec.loader.exec_module(mod)
+
+        q1 = fingerprint._get_qualname_for_cache(mod.pair[0])
+        q2 = fingerprint._get_qualname_for_cache(mod.pair[1])
+        assert q1 != q2, f"Same-line lambdas should have different qualnames: {q1} vs {q2}"
+    finally:
+        sys.modules.pop("test_same_line", None)
+
+
+def test_method_comment_change_no_hash_change(tmp_path, monkeypatch):
+    """Changing comments in methods should not change hash (dedent fix)."""
+    monkeypatch.setattr("pivot.project._project_root_cache", tmp_path)
+
+    mod_py = tmp_path / "test_method.py"
+    mod_py.write_text("""
+class MyClass:
+    def method(self):
+        # original comment
+        return 42
+""")
+
+    spec = importlib.util.spec_from_file_location("test_method", mod_py)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["test_method"] = mod
+    try:
+        spec.loader.exec_module(mod)
+        h1 = fingerprint.hash_function_ast(mod.MyClass.method)
+
+        # Clear memory cache
+        fingerprint._hash_function_ast_cache.clear()
+
+        # Modify comment
+        mod_py.write_text("""
+class MyClass:
+    def method(self):
+        # CHANGED comment
+        return 42
+""")
+
+        # Reimport
+        del sys.modules["test_method"]
+        spec2 = importlib.util.spec_from_file_location("test_method", mod_py)
+        assert spec2 is not None and spec2.loader is not None
+        mod2 = importlib.util.module_from_spec(spec2)
+        sys.modules["test_method"] = mod2
+        spec2.loader.exec_module(mod2)
+        h2 = fingerprint.hash_function_ast(mod2.MyClass.method)
+
+        assert h1 == h2, "Comment change should not affect hash (dedent fix)"
+    finally:
+        sys.modules.pop("test_method", None)

@@ -9,6 +9,7 @@ import logging
 import marshal
 import pathlib
 import sys
+import textwrap
 import types
 import typing
 import weakref
@@ -25,7 +26,14 @@ if TYPE_CHECKING:
 
 _logger = logging.getLogger(__name__)
 
+_PYTHON_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}"
+_CACHE_SCHEMA_VERSION = 1
+
 _SITE_PACKAGE_PATHS = ("site-packages", "dist-packages")
+
+# Type alias for AST hash cache entry tuple.
+# Format: (rel_path, mtime_ns, size, inode, qualname, py_version, schema_version, hash_hex)
+type AstHashEntry = tuple[str, int, int, int, str, str, int, str]
 
 
 def _init_stdlib_paths() -> tuple[pathlib.Path, ...]:
@@ -78,7 +86,7 @@ _get_type_hints_cache: weakref.WeakKeyDictionary[Callable[..., Any], dict[str, A
 # readonly StateDB and fingerprinting should complete during discovery.
 _state_db: "StateDB | None" = None
 _state_db_init_attempted: bool = False
-_pending_ast_writes: list[tuple[str, int, int, int, str, str]] = []
+_pending_ast_writes: list[AstHashEntry] = []
 
 
 def _close_state_db() -> None:
@@ -156,7 +164,9 @@ def flush_ast_hash_cache() -> None:
         metrics.count("fingerprint.ast_hash_cache.flush")
     except Exception:
         # OSError (filesystem), ImportError (module), lmdb.Error, etc.
-        # Log but don't fail - cache is a performance optimization, not critical
+        # Restore pending writes on failure so they can be retried on next flush.
+        # This prevents permanent loss of cache entries on transient failures.
+        _pending_ast_writes.extend(pending)
         _logger.debug("Failed to flush AST hash cache (%d entries)", len(pending), exc_info=True)
 
 
@@ -199,10 +209,7 @@ def _get_stage_fingerprint_impl(func: Callable[..., Any], visited: set[int]) -> 
     _t_closure = metrics.start()
     try:
         # Use cached result if available (getclosurevars is expensive at ~0.5ms)
-        cached_closure = _getclosurevars_cache.get(func)
-        if cached_closure is not None:
-            closure_vars = cached_closure
-        else:
+        if (closure_vars := _getclosurevars_cache.get(func)) is None:
             closure_vars = inspect.getclosurevars(func)
             _getclosurevars_cache[func] = closure_vars
     except (TypeError, AttributeError):
@@ -373,25 +380,22 @@ def _process_type_hint_dependencies(
 ) -> None:
     """Process user-defined classes in type hints, including Pydantic model defaults."""
     _t = metrics.start()
-    # Use cached result if available
+    # Check cache first. TypeError raised for non-weakly-referenceable functions (builtins).
     try:
-        cached = _get_type_hints_cache.get(func)
-        if cached is not None:
-            hints = cached
-        else:
-            try:
-                hints = typing.get_type_hints(func)
-            except Exception:
-                metrics.end("fingerprint.get_type_hints", _t)
-                return
-            _get_type_hints_cache[func] = hints
+        hints = _get_type_hints_cache.get(func)
     except TypeError:
-        # Not weakly referenceable
+        hints = None  # Not in cache and can't be cached
+
+    if hints is None:
         try:
             hints = typing.get_type_hints(func)
         except Exception:
             metrics.end("fingerprint.get_type_hints", _t)
             return
+        # Cache result if function is weakly referenceable
+        with contextlib.suppress(TypeError):
+            _get_type_hints_cache[func] = hints
+
     metrics.end("fingerprint.get_type_hints", _t)
 
     for hint in hints.values():
@@ -593,6 +597,34 @@ def _process_module_dependency(
             )
 
 
+def _get_qualname_for_cache(func: Callable[..., Any]) -> str:
+    """Get qualname, disambiguated for lambdas.
+
+    Normal functions return their __qualname__ unchanged.
+    Lambdas return qualname with line and column appended (e.g., "<lambda>:42:8")
+    to avoid cache key collisions when multiple lambdas exist in the same file.
+    """
+    qualname = getattr(func, "__qualname__", None) or getattr(func, "__name__", "<unknown>")
+
+    if "<lambda>" not in qualname:
+        return qualname
+
+    code = getattr(func, "__code__", None)
+    if code is None:
+        return qualname
+
+    lineno = code.co_firstlineno
+    col = 0
+    if hasattr(code, "co_positions"):
+        for _, _, c, _ in code.co_positions():
+            # Skip col=0 which is the RESUME instruction, not the actual lambda
+            if c is not None and c > 0:
+                col = c
+                break
+
+    return f"{qualname}:{lineno}:{col}"
+
+
 def _should_skip_persistent_cache(func: Callable[..., Any]) -> bool:
     """Check if function should skip persistent cache.
 
@@ -610,7 +642,8 @@ def hash_function_ast(func: Callable[..., Any]) -> str:
     """Hash function AST (ignores whitespace, comments, docstrings).
 
     Uses persistent cache in StateDB when available, keyed by
-    (file_path, mtime_ns, size, inode, qualname) for automatic invalidation.
+    (file_path, mtime_ns, size, inode, qualname, py_version, schema_version)
+    for automatic invalidation on file changes or Python upgrades.
 
     Limitation: Lambdas and functions without source code fall back to id(func),
     which is non-deterministic across runs. This causes unnecessary re-runs for
@@ -622,8 +655,7 @@ def hash_function_ast(func: Callable[..., Any]) -> str:
         # 1. Check in-memory WeakKeyDictionary cache first (fastest)
         # WeakKeyDictionary raises TypeError for non-weakly-referenceable functions (builtins)
         try:
-            cached = _hash_function_ast_cache.get(func)
-            if cached is not None:
+            if (cached := _hash_function_ast_cache.get(func)) is not None:
                 metrics.count("fingerprint.hash_function_ast.memory_cache_hit")
                 return cached
         except TypeError:
@@ -637,17 +669,19 @@ def hash_function_ast(func: Callable[..., Any]) -> str:
         if not _should_skip_persistent_cache(func):
             source_info = _get_func_source_info(func)
             if source_info is not None:
-                qualname = getattr(func, "__qualname__", None) or getattr(func, "__name__", None)
-                if qualname is None:
-                    raise RuntimeError(
-                        f"Cannot fingerprint {func!r}: missing __qualname__ and __name__. This indicates a bug in pivot's fingerprinting logic."
-                    )
+                qualname = _get_qualname_for_cache(func)
                 db = _get_state_db()
                 if db is not None:
                     rel_path, mtime_ns, size, inode = source_info
                     try:
                         persistent_cached = db.get_ast_hash(
-                            rel_path, mtime_ns, size, inode, qualname
+                            rel_path,
+                            mtime_ns,
+                            size,
+                            inode,
+                            qualname,
+                            _PYTHON_VERSION,
+                            _CACHE_SCHEMA_VERSION,
                         )
                         if persistent_cached is not None:
                             metrics.count("fingerprint.hash_function_ast.persistent_cache_hit")
@@ -667,7 +701,18 @@ def hash_function_ast(func: Callable[..., Any]) -> str:
         # 5. Queue persistent write (if source info available and not skipping)
         if source_info is not None and qualname is not None:
             rel_path, mtime_ns, size, inode = source_info
-            _pending_ast_writes.append((rel_path, mtime_ns, size, inode, qualname, result))
+            _pending_ast_writes.append(
+                (
+                    rel_path,
+                    mtime_ns,
+                    size,
+                    inode,
+                    qualname,
+                    _PYTHON_VERSION,
+                    _CACHE_SCHEMA_VERSION,
+                    result,
+                )
+            )
             metrics.count("fingerprint.hash_function_ast.persistent_cache_miss")
 
         return result
@@ -705,11 +750,13 @@ def _compute_function_hash(func: Callable[..., Any]) -> str:
         metrics.end("fingerprint.inspect_getsource", _t_source)
 
         _t_parse = metrics.start()
+        dedented_source = textwrap.dedent(source)
         try:
-            tree = ast.parse(source)
+            tree = ast.parse(dedented_source)
         except SyntaxError:
             metrics.end("fingerprint.ast_parse", _t_parse)
-            return xxhash.xxh64(source.encode()).hexdigest()
+            # Fallback: hash dedented source (not raw source)
+            return xxhash.xxh64(dedented_source.encode()).hexdigest()
         metrics.end("fingerprint.ast_parse", _t_parse)
 
         _t_norm = metrics.start()
@@ -757,14 +804,10 @@ def is_user_code(obj: Any) -> bool:
         if obj is None:
             return False
 
-        # Use cached result if available (called 10K+ times with many repeats)
-        try:
-            cached = _is_user_code_cache.get(obj)
-            if cached is not None:
+        # Check cache (TypeError if obj not weakly referenceable)
+        with contextlib.suppress(TypeError):
+            if (cached := _is_user_code_cache.get(obj)) is not None:
                 return cached
-        except TypeError:
-            # Not weakly referenceable
-            pass
 
         result = _is_user_code_impl(obj)
 
