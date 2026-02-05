@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import enum
 import logging
+import os
 import pathlib
 from typing import TYPE_CHECKING, TypedDict, TypeGuard
 
@@ -236,13 +237,21 @@ def restore_file(
             message=f"Error: {dest_path} - failed to remove existing file: {e}",
         )
 
+    # Ensure parent directory exists before any restore strategy
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+
     # Strategy 1: Try local cache (if hash available)
     if output_hash is not None:
-        file_hash = output_hash["hash"]
-        cached_path = cache.get_cache_path(cache_dir / "files", file_hash)
-        if cached_path.exists():
+        # For directories with manifest, restore_from_cache checks each file in manifest.
+        # For files, we check if the single cached file exists first.
+        should_try_cache = True
+        if "manifest" not in output_hash:
+            file_hash = output_hash["hash"]
+            cached_path = cache.get_cache_path(cache_dir / "files", file_hash)
+            should_try_cache = cached_path.exists()
+
+        if should_try_cache:
             try:
-                dest_path.parent.mkdir(parents=True, exist_ok=True)
                 success = cache.restore_from_cache(
                     dest_path,
                     output_hash,
@@ -262,7 +271,6 @@ def restore_file(
     content = git.read_file_from_revision(rel_path, rev)
     if content is not None:
         try:
-            dest_path.parent.mkdir(parents=True, exist_ok=True)
             dest_path.write_bytes(content)
             return RestoreResult(
                 status=RestoreStatus.RESTORED,
@@ -279,10 +287,10 @@ def restore_file(
     # Strategy 3: Try remote fallback (if hash available)
     if output_hash is not None:
         file_hash = output_hash["hash"]
-        content = remote.fetch_from_remote(file_hash)
-        if content is not None:
+        remote_content = remote.fetch_from_remote(file_hash)
+        if remote_content is not None:
             # Verify hash before trusting remote content
-            if not _verify_content_hash(content, file_hash):
+            if not _verify_content_hash(remote_content, file_hash):
                 return RestoreResult(
                     status=RestoreStatus.ERROR,
                     path=path_str,
@@ -292,8 +300,7 @@ def restore_file(
                     ),
                 )
             try:
-                dest_path.parent.mkdir(parents=True, exist_ok=True)
-                dest_path.write_bytes(content)
+                dest_path.write_bytes(remote_content)
             except OSError as e:
                 return RestoreResult(
                     status=RestoreStatus.ERROR,
@@ -303,8 +310,12 @@ def restore_file(
             # Cache the fetched content for future use (best effort)
             try:
                 cached_path = cache.get_cache_path(cache_dir / "files", file_hash)
-                cached_path.parent.mkdir(parents=True, exist_ok=True)
-                cached_path.write_bytes(content)
+
+                def write_content(fd: int) -> None:
+                    with os.fdopen(fd, "wb") as f:
+                        f.write(remote_content)
+
+                cache.atomic_write_file(cached_path, write_content, mode=0o444)
             except OSError:
                 pass  # Caching failure is non-fatal
             return RestoreResult(

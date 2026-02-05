@@ -8,6 +8,8 @@ import shutil
 import tempfile
 from typing import TYPE_CHECKING, Any, Protocol, TypedDict
 
+import aioboto3
+
 from pivot import config, exceptions, metrics
 from pivot.remote import config as remote_config
 from pivot.types import TransferResult
@@ -171,12 +173,18 @@ async def _stream_download_to_fd(
 
 
 async def _atomic_download(
-    s3: Any,  # S3 client
+    s3: Any,
     bucket: str,
     key: str,
     local_path: Path,
+    *,
+    readonly: bool = False,
 ) -> None:
-    """Download S3 object to local path atomically via temp file with streaming."""
+    """Download S3 object to local path atomically via temp file with streaming.
+
+    Args:
+        readonly: If True, set file permissions to 0o444 (for cache files).
+    """
     local_path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_path = tempfile.mkstemp(dir=local_path.parent, prefix=".pivot_download_")
     move_succeeded = False
@@ -185,6 +193,8 @@ async def _atomic_download(
         await _stream_download_to_fd(response, fd)
         os.close(fd)
         fd = -1  # Mark as closed
+        if readonly:
+            os.chmod(tmp_path, 0o444)
         shutil.move(tmp_path, local_path)
         move_succeeded = True
     finally:
@@ -195,7 +205,7 @@ async def _atomic_download(
 
 
 async def _stream_upload(
-    s3: Any,  # S3 client
+    s3: Any,
     bucket: str,
     key: str,
     local_path: Path,
@@ -211,7 +221,7 @@ async def _stream_upload(
 
     # For large files, use multipart upload
     mpu = await s3.create_multipart_upload(Bucket=bucket, Key=key)
-    upload_id = mpu["UploadId"]
+    upload_id: str = mpu["UploadId"]
     parts = list[_MultipartPart]()
 
     try:
@@ -267,7 +277,6 @@ class S3Remote:
 
     async def exists(self, cache_hash: str) -> bool:
         """Check if hash exists on remote via HEAD request."""
-        import aioboto3
         from botocore import exceptions as botocore_exc
 
         _validate_hash(cache_hash)
@@ -292,8 +301,6 @@ class S3Remote:
         For small batches (< BULK_EXISTS_LIST_THRESHOLD), uses parallel HEAD requests.
         For large batches, uses LIST by prefix which is more efficient (1 LIST = up to 1000 keys).
         """
-        import aioboto3
-
         _t = metrics.start()
         if not hashes:
             metrics.end("storage.bulk_exists", _t)
@@ -403,7 +410,6 @@ class S3Remote:
 
     async def iter_hashes(self) -> AsyncIterator[str]:
         """Iterate over all cache hashes on remote (memory-efficient streaming)."""
-        import aioboto3
 
         session = aioboto3.Session()
         prefix = f"{self._prefix}files/"
@@ -430,7 +436,6 @@ class S3Remote:
 
     async def upload_file(self, local_path: Path, cache_hash: str) -> None:
         """Upload a single file to remote with streaming for large files."""
-        import aioboto3
 
         _validate_hash(cache_hash)
         session = aioboto3.Session()
@@ -439,15 +444,20 @@ class S3Remote:
                 s3, self._bucket, _hash_to_key(self._prefix, cache_hash), local_path
             )
 
-    async def download_file(self, cache_hash: str, local_path: Path) -> None:
+    async def download_file(
+        self, cache_hash: str, local_path: Path, *, readonly: bool = False
+    ) -> None:
         """Download a single file from remote (atomic write via temp file, streamed)."""
-        import aioboto3
 
         _validate_hash(cache_hash)
         session = aioboto3.Session()
         async with session.client("s3", config=_get_s3_config()) as s3:
             await _atomic_download(
-                s3, self._bucket, _hash_to_key(self._prefix, cache_hash), local_path
+                s3,
+                self._bucket,
+                _hash_to_key(self._prefix, cache_hash),
+                local_path,
+                readonly=readonly,
             )
 
     async def upload_batch(
@@ -457,7 +467,6 @@ class S3Remote:
         callback: Callable[[int], None] | None = None,
     ) -> list[TransferResult]:
         """Upload multiple files in parallel with streaming for large files."""
-        import aioboto3
 
         _t = metrics.start()
         if not items:
@@ -498,9 +507,14 @@ class S3Remote:
         items: list[tuple[str, Path]],
         concurrency: int = DEFAULT_CONCURRENCY,
         callback: Callable[[int], None] | None = None,
+        *,
+        readonly: bool = False,
     ) -> list[TransferResult]:
-        """Download multiple files in parallel with atomic writes and streaming."""
-        import aioboto3
+        """Download multiple files in parallel with atomic writes and streaming.
+
+        Args:
+            readonly: If True, set file permissions to 0o444 (for cache files).
+        """
 
         _t = metrics.start()
         if not items:
@@ -522,7 +536,11 @@ class S3Remote:
                 async with semaphore:
                     try:
                         await _atomic_download(
-                            s3, self._bucket, _hash_to_key(self._prefix, hash_), local_path
+                            s3,
+                            self._bucket,
+                            _hash_to_key(self._prefix, hash_),
+                            local_path,
+                            readonly=readonly,
                         )
                         completed += 1
                         if callback:

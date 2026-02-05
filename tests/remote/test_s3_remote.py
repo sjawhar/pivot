@@ -43,15 +43,9 @@ class MockBody:
         pass
 
 
-def _make_mock_body(data: bytes = b"content") -> MockBody:
-    return MockBody(data)
-
-
-def _make_mock_body_factory() -> Any:
-    def factory(**_: Any) -> dict[str, Any]:
-        return {"Body": MockBody()}
-
-    return factory
+def _make_mock_get_object_response(**_kwargs: object) -> dict[str, MockBody]:
+    """Create a mock S3 get_object response for testing."""
+    return {"Body": MockBody()}
 
 
 # -----------------------------------------------------------------------------
@@ -227,16 +221,20 @@ def test_validate_hash_valid() -> None:
 
 def test_is_not_found_error_true() -> None:
     """_is_not_found_error returns True for 404."""
-    error = type("MockError", (), {"response": {"Error": {"Code": "404"}}})()
+    error = botocore_exc.ClientError(
+        {"Error": {"Code": "404", "Message": "Not Found"}}, "HeadObject"
+    )
     assert remote_mod._is_not_found_error(error) is True
 
 
 def test_is_not_found_error_false() -> None:
     """_is_not_found_error returns False for non-404."""
-    error_403 = type("MockError", (), {"response": {"Error": {"Code": "403"}}})()
+    error_403 = botocore_exc.ClientError(
+        {"Error": {"Code": "403", "Message": "Forbidden"}}, "HeadObject"
+    )
     assert remote_mod._is_not_found_error(error_403) is False
 
-    error_empty = type("MockError", (), {"response": {}})()
+    error_empty = botocore_exc.ClientError({}, "HeadObject")
     assert remote_mod._is_not_found_error(error_empty) is False
 
 
@@ -330,7 +328,7 @@ async def test_download_file(
     """download_file gets object from S3."""
     mock_client = mocker.AsyncMock()
     mock_client.get_object = mocker.AsyncMock(
-        return_value={"Body": _make_mock_body(b"downloaded content")}
+        return_value={"Body": MockBody(b"downloaded content")}
     )
     mock_s3_session.client.return_value.__aenter__.return_value = mock_client
 
@@ -340,6 +338,26 @@ async def test_download_file(
     await r.download_file("abc123def45678", dest_file)
 
     assert dest_file.read_bytes() == b"downloaded content"
+
+
+@pytest.mark.asyncio
+async def test_download_file_readonly(
+    mock_s3_session: MagicMock, tmp_path: pathlib.Path, mocker: MockerFixture
+) -> None:
+    """download_file with readonly=True sets 0o444 permissions (for cache files)."""
+    mock_client = mocker.AsyncMock()
+    mock_client.get_object = mocker.AsyncMock(return_value={"Body": MockBody(b"cached content")})
+    mock_s3_session.client.return_value.__aenter__.return_value = mock_client
+
+    dest_file = tmp_path / "cached.txt"
+
+    r = remote_mod.S3Remote("s3://bucket/prefix")
+    await r.download_file("abc123def45678", dest_file, readonly=True)
+
+    assert dest_file.read_bytes() == b"cached content"
+    # Verify read-only permissions (0o444)
+    mode = dest_file.stat().st_mode & 0o777
+    assert mode == 0o444, f"Expected 0o444, got {oct(mode)}"
 
 
 @pytest.mark.asyncio
@@ -570,7 +588,7 @@ async def test_download_batch(
 ) -> None:
     """download_batch downloads multiple files in parallel."""
     mock_client = mocker.AsyncMock()
-    mock_client.get_object = mocker.AsyncMock(side_effect=_make_mock_body_factory())
+    mock_client.get_object = mocker.AsyncMock(side_effect=_make_mock_get_object_response)
     mock_s3_session.client.return_value.__aenter__.return_value = mock_client
 
     items = [(f"a{i}b2c3d4e5f6789a", tmp_path / f"dest{i}.txt") for i in range(3)]
@@ -703,7 +721,7 @@ async def test_download_batch_with_callback(
 ) -> None:
     """download_batch calls callback for each completed download."""
     mock_client = mocker.AsyncMock()
-    mock_client.get_object = mocker.AsyncMock(side_effect=_make_mock_body_factory())
+    mock_client.get_object = mocker.AsyncMock(side_effect=_make_mock_get_object_response)
     mock_s3_session.client.return_value.__aenter__.return_value = mock_client
 
     items = [(f"a{i}b2c3d4e5f6789a", tmp_path / f"dest{i}.txt") for i in range(3)]
@@ -718,3 +736,49 @@ async def test_download_batch_with_callback(
 
     assert len(callback_values) == 3
     assert set(callback_values) == {1, 2, 3}
+
+
+@pytest.mark.asyncio
+async def test_download_file_default_permissions(
+    mock_s3_session: MagicMock, tmp_path: pathlib.Path, mocker: MockerFixture
+) -> None:
+    """download_file without readonly flag creates file with default permissions."""
+    mock_client = mocker.AsyncMock()
+    mock_client.get_object = mocker.AsyncMock(return_value={"Body": MockBody(b"writable content")})
+    mock_s3_session.client.return_value.__aenter__.return_value = mock_client
+
+    dest_file = tmp_path / "writable.txt"
+
+    r = remote_mod.S3Remote("s3://bucket/prefix")
+    await r.download_file("abc123def45678", dest_file, readonly=False)
+
+    assert dest_file.read_bytes() == b"writable content"
+    # Verify file is writable (not 0o444)
+    mode = dest_file.stat().st_mode & 0o777
+    assert mode != 0o444, f"Expected writable permissions, got {oct(mode)}"
+    # Default umask typically results in 0o644 or similar
+    assert mode & 0o200, f"Expected owner write permission, got {oct(mode)}"
+
+
+@pytest.mark.asyncio
+async def test_download_batch_readonly(
+    mock_s3_session: MagicMock, tmp_path: pathlib.Path, mocker: MockerFixture
+) -> None:
+    """download_batch with readonly=True sets 0o444 permissions on all files."""
+    mock_client = mocker.AsyncMock()
+    mock_client.get_object = mocker.AsyncMock(side_effect=_make_mock_get_object_response)
+    mock_s3_session.client.return_value.__aenter__.return_value = mock_client
+
+    items = [(f"a{i}b2c3d4e5f6789a", tmp_path / f"cached{i}.txt") for i in range(3)]
+
+    r = remote_mod.S3Remote("s3://bucket/prefix")
+    results = await r.download_batch(items, concurrency=10, readonly=True)
+
+    assert len(results) == 3
+    assert all(r["success"] for r in results)
+
+    # Verify all files have read-only permissions
+    for _, path in items:
+        assert path.exists()
+        mode = path.stat().st_mode & 0o777
+        assert mode == 0o444, f"Expected 0o444 for {path}, got {oct(mode)}"
