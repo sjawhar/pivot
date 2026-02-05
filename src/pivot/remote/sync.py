@@ -67,12 +67,8 @@ def get_stage_output_hashes(state_dir: pathlib.Path, stage_names: list[str]) -> 
             continue
 
         for output_hash in lock_data["output_hashes"].values():
-            if output_hash is None:
-                continue
-            hashes.add(output_hash["hash"])
-            if "manifest" in output_hash:
-                for entry in output_hash["manifest"]:
-                    hashes.add(entry["hash"])
+            if output_hash is not None:
+                hashes |= _extract_hashes_from_hash_info(output_hash)
 
     return hashes
 
@@ -88,15 +84,12 @@ def get_stage_dep_hashes(state_dir: pathlib.Path, stage_names: list[str]) -> set
             continue
 
         for dep_hash in lock_data["dep_hashes"].values():
-            hashes.add(dep_hash["hash"])
-            if "manifest" in dep_hash:
-                for entry in dep_hash["manifest"]:
-                    hashes.add(entry["hash"])
+            hashes |= _extract_hashes_from_hash_info(dep_hash)
 
     return hashes
 
 
-def _extract_hashes_from_output(output_hash: HashInfo) -> set[str]:
+def _extract_hashes_from_hash_info(output_hash: HashInfo) -> set[str]:
     """Extract all hashes from a HashInfo (file or directory)."""
     hashes = set[str]()
     hashes.add(output_hash["hash"])
@@ -167,10 +160,10 @@ def get_target_hashes(
             if lock_data is not None:
                 for out_hash in lock_data["output_hashes"].values():
                     if out_hash is not None:
-                        hashes |= _extract_hashes_from_output(out_hash)
+                        hashes |= _extract_hashes_from_hash_info(out_hash)
                 if include_deps:
                     for dep_hash in lock_data["dep_hashes"].values():
-                        hashes |= _extract_hashes_from_output(dep_hash)
+                        hashes |= _extract_hashes_from_hash_info(dep_hash)
                 continue
 
         # Try as file path
@@ -179,13 +172,13 @@ def get_target_hashes(
         # Check stage outputs
         out_hash = _get_file_hash_from_stages(rel_path, state_dir)
         if out_hash is not None:
-            hashes |= _extract_hashes_from_output(out_hash)
+            hashes |= _extract_hashes_from_hash_info(out_hash)
             continue
 
         # Check .pvt tracked files
         pvt_hash = _get_file_hash_from_pvt(rel_path, proj_root)
         if pvt_hash is not None:
-            hashes |= _extract_hashes_from_output(pvt_hash)
+            hashes |= _extract_hashes_from_hash_info(pvt_hash)
             continue
 
         unresolved.append(target)
