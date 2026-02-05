@@ -603,9 +603,15 @@ def test_pipeline_include_preserves_all_metadata(set_project_root: pathlib.Path)
     assert included_info["outs_paths"] == original_info["outs_paths"]
     assert included_info["mutex"] == original_info["mutex"]
     assert included_info["variant"] == original_info["variant"]
-    assert included_info["fingerprint"] == original_info["fingerprint"]
     assert included_info["signature"] == original_info["signature"]
     assert included_info["func"] == original_info["func"]
+
+    # Fingerprints are lazy (None after registration) — verify both registries
+    # compute the same fingerprint for the included stage
+    original_fp = sub._registry.ensure_fingerprint("complex_stage")
+    included_fp = main._registry.ensure_fingerprint("complex_stage")
+    assert original_fp == included_fp
+    assert original_fp, "fingerprint should be non-empty"
 
 
 def test_pipeline_include_isolates_nested_mutations(set_project_root: pathlib.Path) -> None:

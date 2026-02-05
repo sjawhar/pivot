@@ -77,11 +77,19 @@ def status(
 
         if explain:
             pipeline_explanations = status_mod.get_pipeline_explanations(
-                stages_list, single_stage=False, all_stages=all_stages, graph=graph
+                stages_list,
+                single_stage=False,
+                all_stages=all_stages,
+                stage_registry=cli_helpers.get_registry(),
+                graph=graph,
             )
         else:
             pipeline_status, _ = status_mod.get_pipeline_status(
-                stages_list, single_stage=False, all_stages=all_stages, graph=graph
+                stages_list,
+                single_stage=False,
+                all_stages=all_stages,
+                stage_registry=cli_helpers.get_registry(),
+                graph=graph,
             )
 
     if show_tracked:

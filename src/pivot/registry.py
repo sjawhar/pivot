@@ -69,7 +69,7 @@ class RegistryStageInfo(TypedDict):
         mutex: Mutex groups for exclusive execution.
         variant: Variant name for matrix stages (None for regular stages).
         signature: Function signature for parameter injection.
-        fingerprint: Code fingerprint mapping (key -> hash).
+        fingerprint: Code fingerprint mapping (key -> hash), or None if not computed yet.
         dep_specs: Dependency specs from function annotations.
         out_specs: Output specs from return type (return key -> resolved Out, pre-expansion).
             For single-output stages, uses SINGLE_OUTPUT_KEY (convention for non-TypedDict returns).
@@ -89,7 +89,7 @@ class RegistryStageInfo(TypedDict):
     mutex: list[str]
     variant: str | None
     signature: Signature | None
-    fingerprint: dict[str, str]
+    fingerprint: dict[str, str] | None
     dep_specs: dict[str, stage_def.FuncDepSpec]
     out_specs: dict[str, outputs.BaseOut]
     params_arg_name: str | None
@@ -466,12 +466,6 @@ class StageRegistry:
             # Output overlap validation is deferred to validate_outputs() for performance
             # (single O(N) pass instead of O(N²) from checking on every register)
 
-            # Build stage fingerprint (includes loader fingerprints from annotations)
-            stage_fp = fingerprint.get_stage_fingerprint(func)
-            stage_fp.update(
-                _get_annotation_loader_fingerprints(dep_specs, return_out_specs, single_out_spec)
-            )
-
             # Get params arg name for worker (avoids re-inspecting signature at execution time)
             params_arg_name, _ = stage_def.find_params_in_signature(func)
 
@@ -486,7 +480,7 @@ class StageRegistry:
                 mutex=mutex_list,
                 variant=variant,
                 signature=inspect.signature(func),
-                fingerprint=stage_fp,
+                fingerprint=None,
                 dep_specs=dep_specs,
                 out_specs=out_specs,
                 params_arg_name=params_arg_name,
@@ -520,6 +514,13 @@ class StageRegistry:
     def list_stages(self) -> list[str]:
         """Get list of all stage names."""
         return list(self._stages.keys())
+
+    def ensure_fingerprint(self, stage_name: str) -> dict[str, str]:
+        """Ensure a stage fingerprint is computed and cached."""
+        info = self._stages[stage_name]
+        if info["fingerprint"] is None:
+            info["fingerprint"] = _compute_fingerprint(stage_name, info)
+        return info["fingerprint"]
 
     def build_dag(self, validate: bool = True) -> DiGraph[str]:
         """Build DAG from registered stages.
@@ -904,24 +905,17 @@ def _resolve_params(
                 ) from e
 
 
-def _get_annotation_loader_fingerprints(
-    dep_specs: dict[str, stage_def.FuncDepSpec],
-    return_out_specs: dict[str, outputs.BaseOut],
-    single_out_spec: outputs.BaseOut | None,
-) -> dict[str, str]:
-    """Get fingerprints for all loaders from annotations."""
-    result = dict[str, str]()
-
-    for spec in dep_specs.values():
-        result.update(fingerprint.get_loader_fingerprint(spec.loader))
-
-    for out in return_out_specs.values():
-        result.update(fingerprint.get_loader_fingerprint(out.loader))
-
-    if single_out_spec is not None:
-        result.update(fingerprint.get_loader_fingerprint(single_out_spec.loader))
-
-    return result
+def _compute_fingerprint(stage_name: str, info: RegistryStageInfo) -> dict[str, str]:
+    """Compute and return a stage fingerprint, wrapping errors."""
+    try:
+        result = fingerprint.get_stage_fingerprint(info["func"])
+        for spec in info["dep_specs"].values():
+            result.update(fingerprint.get_loader_fingerprint(spec.loader))
+        for out in info["out_specs"].values():
+            result.update(fingerprint.get_loader_fingerprint(out.loader))
+        return result
+    except Exception as exc:
+        raise exceptions.PivotError(f"Stage '{stage_name}': fingerprinting failed: {exc}") from exc
 
 
 def _flatten_deps(deps: dict[str, outputs.PathType]) -> list[str]:

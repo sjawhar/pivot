@@ -264,6 +264,10 @@ class AgentRpcHandler:
                 return QueryStagesResult(stages=pipeline.list_stages())
             case "explain":
                 stage, reg_info = self._get_stage_info(params)
+                pipeline = self._engine._pipeline  # pyright: ignore[reportPrivateUsage]
+                if pipeline is None:
+                    raise ValueError("No pipeline loaded")
+                fingerprint = pipeline._registry.ensure_fingerprint(stage)  # pyright: ignore[reportPrivateUsage]
 
                 def _get_explanation() -> StageExplanation:
                     try:
@@ -272,7 +276,7 @@ class AgentRpcHandler:
                         raise ValueError(f"Failed to load params.yaml: {e}") from e
                     return explain_mod.get_stage_explanation(
                         stage_name=stage,
-                        fingerprint=reg_info["fingerprint"],
+                        fingerprint=fingerprint,
                         deps=reg_info["deps_paths"],
                         outs_paths=reg_info["outs_paths"],
                         params_instance=reg_info["params"],

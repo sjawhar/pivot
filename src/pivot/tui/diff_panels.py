@@ -436,9 +436,10 @@ class InputDiffPanel(_SelectableExpandablePanel):
 
         state_dir = config.get_state_dir()
         try:
+            fingerprint = cli_helpers.get_registry().ensure_fingerprint(stage_name)
             self._explanation = explain.get_stage_explanation(
                 stage_name=stage_name,
-                fingerprint=self._registry_info["fingerprint"],
+                fingerprint=fingerprint,
                 deps=self._registry_info["deps_paths"],
                 outs_paths=self._registry_info["outs_paths"],
                 params_instance=self._registry_info["params"],

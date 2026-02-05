@@ -13,7 +13,7 @@ if TYPE_CHECKING:
 
     from pivot.cli import CliContext
     from pivot.pipeline.pipeline import Pipeline
-    from pivot.registry import RegistryStageInfo
+    from pivot.registry import RegistryStageInfo, StageRegistry
 
 from pivot import exceptions
 from pivot.cli import decorators as cli_decorators
@@ -41,6 +41,11 @@ def _get_pipeline() -> Pipeline:
     if pipeline is None:
         raise NoPipelineError()
     return pipeline
+
+
+def get_registry() -> StageRegistry:
+    """Get StageRegistry from Pipeline in context."""
+    return _get_pipeline()._registry  # pyright: ignore[reportPrivateUsage]
 
 
 def list_stages() -> list[str]:

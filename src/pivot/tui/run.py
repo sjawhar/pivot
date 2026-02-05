@@ -571,10 +571,11 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
         input_snapshot = None
         try:
             registry_info = cli_helpers.get_stage(stage_name)
+            fingerprint = cli_helpers.get_registry().ensure_fingerprint(stage_name)
             state_dir = config.get_state_dir()
             input_snapshot = explain.get_stage_explanation(
                 stage_name=stage_name,
-                fingerprint=registry_info["fingerprint"],
+                fingerprint=fingerprint,
                 deps=registry_info["deps_paths"],
                 outs_paths=registry_info["outs_paths"],
                 params_instance=registry_info["params"],

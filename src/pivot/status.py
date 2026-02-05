@@ -31,7 +31,13 @@ Example::
     graph = engine_graph.build_graph(all_stages)
 
     # Use graph for status query
-    statuses, dag = status.get_pipeline_status(["train"], single_stage=False, all_stages=all_stages, graph=graph)
+    statuses, dag = status.get_pipeline_status(
+        ["train"],
+        single_stage=False,
+        all_stages=all_stages,
+        stage_registry=pipeline._registry,
+        graph=graph,
+    )
 """
 
 from __future__ import annotations
@@ -40,7 +46,7 @@ import asyncio
 import logging
 import pathlib
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from pivot import (
     config,
@@ -49,6 +55,7 @@ from pivot import (
     metrics,
     parameters,
     project,
+    registry,
 )
 from pivot.engine import graph as engine_graph
 from pivot.remote import config as remote_config
@@ -110,10 +117,11 @@ def _get_explanations_in_parallel(
         futures = dict[Future[StageExplanation], str]()
         for stage_name in execution_order:
             stage_info = all_stages[stage_name]
+            fingerprint = cast("dict[str, str]", stage_info["fingerprint"])
             future = pool.submit(
                 explain.get_stage_explanation,
                 stage_name,
-                stage_info["fingerprint"],
+                fingerprint,
                 stage_info["deps_paths"],
                 stage_info["outs_paths"],
                 stage_info["params"],
@@ -150,6 +158,7 @@ def get_pipeline_explanations(
     stages: list[str] | None,
     single_stage: bool,
     all_stages: dict[str, RegistryStageInfo],
+    stage_registry: registry.StageRegistry,
     force: bool = False,
     allow_missing: bool = False,
     graph: nx.DiGraph[str] | None = None,
@@ -164,6 +173,7 @@ def get_pipeline_explanations(
         stages: List of stage names to explain, or None for all stages.
         single_stage: If True, only explain the specified stages without dependencies.
         all_stages: Dict mapping stage names to RegistryStageInfo.
+        stage_registry: Registry used to ensure fingerprints are computed.
         force: If True, mark all stages as would run due to force flag.
         allow_missing: If True, use .pvt hashes for missing dependency files.
         graph: Optional bipartite graph from Engine. If provided, extracts stage DAG
@@ -182,6 +192,8 @@ def get_pipeline_explanations(
         if not execution_order:
             return []
 
+        for stage_name in execution_order:
+            stage_registry.ensure_fingerprint(stage_name)
         state_dir = config.get_state_dir()
         overrides = parameters.load_params_yaml()
 
@@ -250,6 +262,7 @@ def get_pipeline_status(
     stages: list[str] | None,
     single_stage: bool,
     all_stages: dict[str, RegistryStageInfo],
+    stage_registry: registry.StageRegistry,
     allow_missing: bool = False,
     graph: nx.DiGraph[str] | None = None,
 ) -> tuple[list[PipelineStatusInfo], DiGraph[str]]:
@@ -259,6 +272,7 @@ def get_pipeline_status(
         stages: Stage names to check, or None for all stages.
         single_stage: If True, check only specified stages without dependencies.
         all_stages: Dict mapping stage names to RegistryStageInfo.
+        stage_registry: Registry used to ensure fingerprints are computed.
         allow_missing: If True, use .pvt hashes for missing dependency files.
         graph: Optional bipartite graph. If provided, extracts stage DAG
             via get_stage_dag() instead of building a new one.
@@ -276,6 +290,8 @@ def get_pipeline_status(
         if not execution_order:
             return [], stage_graph
 
+        for stage_name in execution_order:
+            stage_registry.ensure_fingerprint(stage_name)
         state_dir = config.get_state_dir()
         overrides = parameters.load_params_yaml()
 

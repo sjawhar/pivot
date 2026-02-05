@@ -73,7 +73,12 @@ def test_pipeline_status_all_cached(
     monkeypatch.chdir(set_project_root)
     executor.run(pipeline=test_pipeline)
     all_stages = test_pipeline.snapshot()
-    results, _ = status.get_pipeline_status(None, single_stage=False, all_stages=all_stages)
+    results, _ = status.get_pipeline_status(
+        None,
+        single_stage=False,
+        all_stages=all_stages,
+        stage_registry=test_pipeline._registry,
+    )
 
     assert len(results) == 1
     assert results[0]["name"] == "stage_a"
@@ -91,7 +96,12 @@ def test_pipeline_status_some_stale(
     register_test_stage(_helper_stage_a, name="stage_a")
 
     all_stages = test_pipeline.snapshot()
-    results, _ = status.get_pipeline_status(None, single_stage=False, all_stages=all_stages)
+    results, _ = status.get_pipeline_status(
+        None,
+        single_stage=False,
+        all_stages=all_stages,
+        stage_registry=test_pipeline._registry,
+    )
 
     assert len(results) == 1
     assert results[0]["name"] == "stage_a"
@@ -110,7 +120,12 @@ def test_pipeline_status_upstream_stale(
     register_test_stage(_helper_stage_b, name="stage_b")
 
     all_stages = test_pipeline.snapshot()
-    results, _ = status.get_pipeline_status(None, single_stage=False, all_stages=all_stages)
+    results, _ = status.get_pipeline_status(
+        None,
+        single_stage=False,
+        all_stages=all_stages,
+        stage_registry=test_pipeline._registry,
+    )
 
     assert len(results) == 2
 
@@ -135,7 +150,12 @@ def test_pipeline_status_specific_stages(
     register_test_stage(_helper_stage_b, name="stage_b")
 
     all_stages = test_pipeline.snapshot()
-    results, _ = status.get_pipeline_status(["stage_a"], single_stage=False, all_stages=all_stages)
+    results, _ = status.get_pipeline_status(
+        ["stage_a"],
+        single_stage=False,
+        all_stages=all_stages,
+        stage_registry=test_pipeline._registry,
+    )
 
     assert len(results) == 1
     assert results[0]["name"] == "stage_a"
@@ -451,6 +471,7 @@ def test_get_pipeline_status_uses_provided_graph(
         stages=["test_stage"],
         single_stage=False,
         all_stages=all_stages,
+        stage_registry=test_pipeline._registry,
         graph=external_graph,
     )
 
@@ -485,6 +506,7 @@ def test_get_pipeline_explanations_uses_provided_graph(
         stages=["test_stage"],
         single_stage=False,
         all_stages=all_stages,
+        stage_registry=test_pipeline._registry,
         graph=external_graph,
     )
 

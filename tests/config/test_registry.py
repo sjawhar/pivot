@@ -119,8 +119,8 @@ def test_register_registers_function(
     assert str(info["outs"][0].path).endswith("output.txt")
 
 
-def test_register_captures_fingerprint(test_pipeline: "Pipeline") -> None:
-    """Should capture code fingerprint on registration."""
+def test_register_defers_fingerprint_until_requested(test_pipeline: "Pipeline") -> None:
+    """Should compute and cache fingerprints lazily."""
 
     def my_stage():
         return 42
@@ -129,8 +129,12 @@ def test_register_captures_fingerprint(test_pipeline: "Pipeline") -> None:
 
     info = test_pipeline.get("my_stage")
     assert "fingerprint" in info
-    assert isinstance(info["fingerprint"], dict)
-    assert "self:my_stage" in info["fingerprint"]
+    assert info["fingerprint"] is None
+
+    fingerprint = test_pipeline._registry.ensure_fingerprint("my_stage")
+    assert isinstance(fingerprint, dict)
+    assert "self:my_stage" in fingerprint
+    assert info["fingerprint"] is fingerprint
 
 
 def test_register_captures_signature(test_pipeline: "Pipeline") -> None:
@@ -385,8 +389,7 @@ def test_register_captures_transitive_dependencies(test_pipeline: "Pipeline") ->
 
     register_test_stage(my_stage)
 
-    info = test_pipeline.get("my_stage")
-    fp = info["fingerprint"]
+    fp = test_pipeline._registry.ensure_fingerprint("my_stage")
     assert "self:my_stage" in fp
     assert "func:helper" in fp
 
@@ -576,8 +579,7 @@ def test_register_captures_constants(test_pipeline: "Pipeline") -> None:
 
     register_test_stage(uses_constant)
 
-    info = test_pipeline.get("uses_constant")
-    fp = info["fingerprint"]
+    fp = test_pipeline._registry.ensure_fingerprint("uses_constant")
     assert "const:LEARNING_RATE" in fp
 
 
