@@ -288,7 +288,8 @@ class StageRegistry:
             InvalidPathError: If paths resolve outside project root.
             ParamsError: If params specified but function lacks params argument.
         """
-        with metrics.timed("registry.register"):
+        _t = metrics.start()
+        try:
             # Invalidate DAG cache on any registration
             self._cached_dag = None
 
@@ -491,6 +492,8 @@ class StageRegistry:
                 params_arg_name=params_arg_name,
                 state_dir=state_dir,
             )
+        finally:
+            metrics.end("registry.register", _t)
 
     def add_existing(self, stage_info: RegistryStageInfo) -> None:
         """Add a pre-validated stage info (for pipeline composition).

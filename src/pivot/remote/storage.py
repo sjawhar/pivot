@@ -8,13 +8,15 @@ import shutil
 import tempfile
 from typing import TYPE_CHECKING, Any, Protocol, TypedDict
 
-from pivot import config, exceptions
+from pivot import config, exceptions, metrics
 from pivot.remote import config as remote_config
 from pivot.types import TransferResult
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable, Sequence
     from pathlib import Path
+
+    from aiobotocore.config import AioConfig
 
 logger = logging.getLogger(__name__)
 
@@ -23,8 +25,15 @@ DEFAULT_CONCURRENCY = 20
 STREAM_CHUNK_SIZE = 8 * 1024 * 1024  # 8MB chunks for streaming
 STREAM_READ_TIMEOUT = 60  # Seconds to wait for each chunk read
 MIN_HASH_LENGTH = 3  # Minimum hash length (2-char prefix + at least 1 char)
+# Threshold for using LIST vs HEAD in bulk_exists (LIST returns up to 1000 keys per request)
+BULK_EXISTS_LIST_THRESHOLD = 50
 
 _HEX_PATTERN = re.compile(r"^[a-f0-9]+$", re.IGNORECASE)
+
+# Cached S3 config to avoid re-parsing config on every call.
+# Safe without locking - asyncio is single-threaded, worst case race just
+# creates duplicate config (harmless).
+_cached_s3_config: AioConfig | None = None
 
 
 # =============================================================================
@@ -89,14 +98,17 @@ class _MultipartPart(TypedDict):
 
 
 def _get_s3_config() -> Any:
-    """Get standard S3 client config with retries and timeouts."""
-    from aiobotocore.config import AioConfig
+    """Get standard S3 client config with retries and timeouts (cached)."""
+    global _cached_s3_config
+    if _cached_s3_config is None:
+        from aiobotocore.config import AioConfig
 
-    return AioConfig(
-        retries={"max_attempts": config.get_remote_retries()},
-        connect_timeout=config.get_remote_connect_timeout(),
-        read_timeout=STREAM_READ_TIMEOUT,
-    )
+        _cached_s3_config = AioConfig(
+            retries={"max_attempts": config.get_remote_retries()},
+            connect_timeout=config.get_remote_connect_timeout(),
+            read_timeout=STREAM_READ_TIMEOUT,
+        )
+    return _cached_s3_config
 
 
 def _validate_hash(cache_hash: str) -> None:
@@ -273,37 +285,56 @@ class S3Remote:
     async def bulk_exists(
         self, hashes: list[str], concurrency: int = DEFAULT_CONCURRENCY
     ) -> dict[str, bool]:
-        """Check which hashes exist on remote using parallel HEAD requests."""
-        import aioboto3
-        from botocore import exceptions as botocore_exc
+        """Check which hashes exist on remote.
 
+        For small batches (< BULK_EXISTS_LIST_THRESHOLD), uses parallel HEAD requests.
+        For large batches, uses LIST by prefix which is more efficient (1 LIST = up to 1000 keys).
+        """
+        import aioboto3
+
+        _t = metrics.start()
         if not hashes:
+            metrics.end("storage.bulk_exists", _t)
             return {}
 
         for h in hashes:
             _validate_hash(h)
 
-        semaphore = asyncio.Semaphore(concurrency)
         session = aioboto3.Session()
 
+        # Single S3 client for all operations - reuses connection pool
         async with session.client("s3", config=_get_s3_config()) as s3:
+            # For large batches, LIST by prefix is more efficient than HEAD per hash
+            if len(hashes) >= BULK_EXISTS_LIST_THRESHOLD:
+                output = await self._bulk_exists_via_list(s3, hashes, concurrency)
+            else:
+                output = await self._bulk_exists_via_head(s3, hashes, concurrency)
 
-            async def check_one(hash_: str) -> tuple[str, bool]:
-                async with semaphore:
-                    try:
-                        await s3.head_object(
-                            Bucket=self._bucket,
-                            Key=_hash_to_key(self._prefix, hash_),
-                        )
-                        return (hash_, True)
-                    except botocore_exc.ClientError as e:
-                        if _is_not_found_error(e):
-                            return (hash_, False)
-                        raise exceptions.RemoteConnectionError(
-                            f"S3 HEAD error for {hash_}: {e}"
-                        ) from e
+        metrics.end("storage.bulk_exists", _t)
+        return output
 
-            results = await asyncio.gather(*[check_one(h) for h in hashes], return_exceptions=True)
+    async def _bulk_exists_via_head(
+        self, s3: Any, hashes: list[str], concurrency: int
+    ) -> dict[str, bool]:
+        """Check existence using parallel HEAD requests (better for small batches)."""
+        from botocore import exceptions as botocore_exc
+
+        semaphore = asyncio.Semaphore(concurrency)
+
+        async def check_one(hash_: str) -> tuple[str, bool]:
+            async with semaphore:
+                try:
+                    await s3.head_object(
+                        Bucket=self._bucket,
+                        Key=_hash_to_key(self._prefix, hash_),
+                    )
+                    return (hash_, True)
+                except botocore_exc.ClientError as e:
+                    if _is_not_found_error(e):
+                        return (hash_, False)
+                    raise exceptions.RemoteConnectionError(f"S3 HEAD error for {hash_}: {e}") from e
+
+        results = await asyncio.gather(*[check_one(h) for h in hashes], return_exceptions=True)
 
         output = dict[str, bool]()
         for result in results:
@@ -313,6 +344,58 @@ class S3Remote:
                 ) from result
             hash_, exists = result
             output[hash_] = exists
+
+        return output
+
+    async def _bulk_exists_via_list(
+        self, s3: Any, hashes: list[str], concurrency: int
+    ) -> dict[str, bool]:
+        """Check existence using LIST by prefix (better for large batches).
+
+        Groups hashes by their 2-char prefix, then lists each prefix bucket.
+        One LIST request can return up to 1000 keys, so for N hashes spread
+        across P prefixes, we make P requests instead of N.
+        """
+        from collections import defaultdict
+
+        # Group hashes by prefix
+        by_prefix = defaultdict[str, set[str]](set)
+        for h in hashes:
+            by_prefix[h[:2]].add(h)
+
+        # List each prefix in parallel
+        semaphore = asyncio.Semaphore(concurrency)
+
+        async def list_prefix(prefix: str, wanted: set[str]) -> dict[str, bool]:
+            async with semaphore:
+                found = set[str]()
+                s3_prefix = f"{self._prefix}files/{prefix}/"
+                paginator = s3.get_paginator("list_objects_v2")
+                async for page in paginator.paginate(Bucket=self._bucket, Prefix=s3_prefix):
+                    for obj in page.get("Contents", []):
+                        key = obj.get("Key")
+                        if key is None:
+                            continue
+                        hash_ = _key_to_hash(self._prefix, key)
+                        if hash_ and hash_ in wanted:
+                            found.add(hash_)
+                            # Early exit if we found all we're looking for
+                            if found == wanted:
+                                break
+                    if found == wanted:
+                        break
+                return {h: h in found for h in wanted}
+
+        tasks = [list_prefix(prefix, wanted) for prefix, wanted in by_prefix.items()]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        output = dict[str, bool]()
+        for result in results:
+            if isinstance(result, BaseException):
+                raise exceptions.RemoteConnectionError(
+                    f"S3 bulk_exists LIST failed: {result}"
+                ) from result
+            output.update(result)
 
         return output
 
@@ -336,9 +419,11 @@ class S3Remote:
 
     async def list_hashes(self) -> set[str]:
         """List all cache hashes on remote (collects into memory)."""
+        _t = metrics.start()
         hashes = set[str]()
         async for hash_ in self.iter_hashes():
             hashes.add(hash_)
+        metrics.end("storage.list_hashes", _t)
         return hashes
 
     async def upload_file(self, local_path: Path, cache_hash: str) -> None:
@@ -372,7 +457,9 @@ class S3Remote:
         """Upload multiple files in parallel with streaming for large files."""
         import aioboto3
 
+        _t = metrics.start()
         if not items:
+            metrics.end("storage.upload_batch", _t)
             return []
 
         for _, h in items:
@@ -382,22 +469,27 @@ class S3Remote:
         session = aioboto3.Session()
         completed = 0
 
-        async def upload_one(local_path: Path, hash_: str) -> TransferResult:
-            nonlocal completed
-            async with semaphore:
-                try:
-                    async with session.client("s3", config=_get_s3_config()) as s3:
+        # Single S3 client for all uploads - reuses connection pool
+        async with session.client("s3", config=_get_s3_config()) as s3:
+
+            async def upload_one(local_path: Path, hash_: str) -> TransferResult:
+                nonlocal completed
+                async with semaphore:
+                    try:
                         await _stream_upload(
                             s3, self._bucket, _hash_to_key(self._prefix, hash_), local_path
                         )
-                    completed += 1
-                    if callback:
-                        callback(completed)
-                    return TransferResult(hash=hash_, success=True)
-                except Exception as e:
-                    return TransferResult(hash=hash_, success=False, error=str(e))
+                        completed += 1
+                        if callback:
+                            callback(completed)
+                        return TransferResult(hash=hash_, success=True)
+                    except Exception as e:
+                        return TransferResult(hash=hash_, success=False, error=str(e))
 
-        return await asyncio.gather(*[upload_one(p, h) for p, h in items])
+            results = await asyncio.gather(*[upload_one(p, h) for p, h in items])
+
+        metrics.end("storage.upload_batch", _t)
+        return results
 
     async def download_batch(
         self,
@@ -408,7 +500,9 @@ class S3Remote:
         """Download multiple files in parallel with atomic writes and streaming."""
         import aioboto3
 
+        _t = metrics.start()
         if not items:
+            metrics.end("storage.download_batch", _t)
             return []
 
         for h, _ in items:
@@ -418,19 +512,24 @@ class S3Remote:
         session = aioboto3.Session()
         completed = 0
 
-        async def download_one(hash_: str, local_path: Path) -> TransferResult:
-            nonlocal completed
-            async with semaphore:
-                try:
-                    async with session.client("s3", config=_get_s3_config()) as s3:
+        # Single S3 client for all downloads - reuses connection pool
+        async with session.client("s3", config=_get_s3_config()) as s3:
+
+            async def download_one(hash_: str, local_path: Path) -> TransferResult:
+                nonlocal completed
+                async with semaphore:
+                    try:
                         await _atomic_download(
                             s3, self._bucket, _hash_to_key(self._prefix, hash_), local_path
                         )
-                    completed += 1
-                    if callback:
-                        callback(completed)
-                    return TransferResult(hash=hash_, success=True)
-                except Exception as e:
-                    return TransferResult(hash=hash_, success=False, error=str(e))
+                        completed += 1
+                        if callback:
+                            callback(completed)
+                        return TransferResult(hash=hash_, success=True)
+                    except Exception as e:
+                        return TransferResult(hash=hash_, success=False, error=str(e))
 
-        return await asyncio.gather(*[download_one(h, p) for h, p in items])
+            results = await asyncio.gather(*[download_one(h, p) for h, p in items])
+
+        metrics.end("storage.download_batch", _t)
+        return results

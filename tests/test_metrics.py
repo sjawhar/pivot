@@ -47,8 +47,8 @@ def test_enable_idempotent():
 
 def test_clear_removes_all_entries():
     metrics._enabled = True
-    with metrics.timed("test"):
-        pass
+    _t = metrics.start()
+    metrics.end("test", _t)
     assert len(metrics._durations) > 0
     metrics.clear()
     assert len(metrics._durations) == 0
@@ -145,50 +145,58 @@ def test_summary_multiple_metrics_sorted():
 
 
 # =============================================================================
-# timed() tests
+# start()/end() tests
 # =============================================================================
 
 
-def test_timed_disabled_does_not_record():
+def test_start_end_disabled_does_not_record():
     metrics._enabled = False
-    with metrics.timed("test"):
-        pass
+    _t = metrics.start()
+    metrics.end("test", _t)
     assert len(metrics._durations) == 0
 
 
-def test_timed_enabled_records_duration():
+def test_start_end_enabled_records_duration():
     metrics._enabled = True
-    with metrics.timed("test"):
-        time.sleep(0.01)  # 10ms
+    _t = metrics.start()
+    time.sleep(0.01)  # 10ms
+    metrics.end("test", _t)
     assert "test" in metrics._durations
     assert len(metrics._durations["test"]) == 1
     # Duration should be at least 10ms
     assert metrics._durations["test"][0] >= 10.0
 
 
-def test_timed_records_on_exception():
+def test_start_end_records_on_exception():
     metrics._enabled = True
-    with pytest.raises(ValueError), metrics.timed("test"):
+    _t = metrics.start()
+    try:
         raise ValueError("test error")
+    except ValueError:
+        pass
+    finally:
+        metrics.end("test", _t)
     # Metrics should still be recorded even when exception occurs
     assert "test" in metrics._durations
     assert len(metrics._durations["test"]) == 1
 
 
-def test_timed_nested():
+def test_start_end_nested():
     metrics._enabled = True
-    with metrics.timed("outer"), metrics.timed("inner"):
-        pass
+    _t_outer = metrics.start()
+    _t_inner = metrics.start()
+    metrics.end("inner", _t_inner)
+    metrics.end("outer", _t_outer)
     assert "outer" in metrics._durations
     assert "inner" in metrics._durations
 
 
-def test_timed_same_name_accumulates():
+def test_start_end_same_name_accumulates():
     metrics._enabled = True
-    with metrics.timed("test"):
-        pass
-    with metrics.timed("test"):
-        pass
+    _t = metrics.start()
+    metrics.end("test", _t)
+    _t = metrics.start()
+    metrics.end("test", _t)
     assert len(metrics._durations["test"]) == 2
 
 
@@ -253,8 +261,8 @@ def test_roundtrip_serialization():
     metrics._enabled = True
 
     # Simulate worker: collect metrics
-    with metrics.timed("worker.task"):
-        pass
+    _t = metrics.start()
+    metrics.end("worker.task", _t)
     entries = metrics.get_entries()
 
     # Clear to simulate new process

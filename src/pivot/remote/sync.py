@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import pathlib
 from typing import TYPE_CHECKING
 
-from pivot import config, exceptions, project
+from pivot import config, exceptions, metrics, project
 from pivot.remote import config as remote_config
 from pivot.remote import storage as remote_mod
 from pivot.storage import cache, lock, track
@@ -25,21 +26,32 @@ def _get_cache_files_dir(cache_dir: pathlib.Path) -> pathlib.Path:
 
 
 def get_local_cache_hashes(cache_dir: pathlib.Path) -> set[str]:
-    """Scan local cache and return all content hashes."""
+    """Scan local cache and return all content hashes.
+
+    Uses os.scandir for efficiency - DirEntry caches stat results, eliminating
+    redundant syscalls compared to pathlib.iterdir + is_file/is_dir.
+    """
+    _t = metrics.start()
     files_dir = _get_cache_files_dir(cache_dir)
     if not files_dir.exists():
+        metrics.end("sync.get_local_cache_hashes", _t)
         return set()
 
     hashes = set[str]()
-    for prefix_dir in files_dir.iterdir():
-        if not prefix_dir.is_dir() or len(prefix_dir.name) != 2:
-            continue
-        for hash_file in prefix_dir.iterdir():
-            if hash_file.is_file():
-                full_hash = prefix_dir.name + hash_file.name
-                if len(full_hash) == cache.XXHASH64_HEX_LENGTH:
-                    hashes.add(full_hash)
+    with os.scandir(files_dir) as prefix_entries:
+        for prefix_entry in prefix_entries:
+            # DirEntry.is_dir() uses cached stat from scandir
+            if not prefix_entry.is_dir() or len(prefix_entry.name) != 2:
+                continue
+            with os.scandir(prefix_entry.path) as hash_entries:
+                for hash_entry in hash_entries:
+                    # DirEntry.is_file() uses cached stat from scandir
+                    if hash_entry.is_file():
+                        full_hash = prefix_entry.name + hash_entry.name
+                        if len(full_hash) == cache.XXHASH64_HEX_LENGTH:
+                            hashes.add(full_hash)
 
+    metrics.end("sync.get_local_cache_hashes", _t)
     return hashes
 
 
@@ -142,6 +154,7 @@ def get_target_hashes(
     Returns:
         Set of content hashes for all resolved targets
     """
+    _t = metrics.start()
     proj_root = project.get_project_root()
     hashes = set[str]()
     unresolved = list[str]()
@@ -180,6 +193,7 @@ def get_target_hashes(
     if unresolved:
         logger.warning(f"Could not resolve targets: {', '.join(unresolved)}")
 
+    metrics.end("sync.get_target_hashes", _t)
     return hashes
 
 
@@ -191,7 +205,9 @@ async def compare_status(
     jobs: int | None = None,
 ) -> RemoteStatus:
     """Compare local cache against remote, using index to minimize HEAD requests."""
+    _t = metrics.start()
     if not local_hashes:
+        metrics.end("sync.compare_status", _t)
         return RemoteStatus(local_only=set(), remote_only=set(), common=set())
 
     jobs = jobs if jobs is not None else config.get_remote_jobs()
@@ -207,6 +223,7 @@ async def compare_status(
     local_only = local_hashes - known_on_remote
     common = local_hashes & known_on_remote
 
+    metrics.end("sync.compare_status", _t)
     return RemoteStatus(local_only=local_only, remote_only=set(), common=common)
 
 
@@ -221,6 +238,7 @@ async def _push_async(
     callback: Callable[[int], None] | None = None,
 ) -> TransferSummary:
     """Push cache files to remote (async implementation)."""
+    _t = metrics.start()
     jobs = jobs if jobs is not None else config.get_remote_jobs()
 
     if targets:
@@ -229,11 +247,13 @@ async def _push_async(
         local_hashes = get_local_cache_hashes(cache_dir)
 
     if not local_hashes:
+        metrics.end("sync.push_async", _t)
         return TransferSummary(transferred=0, skipped=0, failed=0, errors=[])
 
     status = await compare_status(local_hashes, remote, state_db, remote_name, jobs)
 
     if not status["local_only"]:
+        metrics.end("sync.push_async", _t)
         return TransferSummary(transferred=0, skipped=len(status["common"]), failed=0, errors=[])
 
     files_dir = _get_cache_files_dir(cache_dir)
@@ -252,6 +272,7 @@ async def _push_async(
 
     errors = [r["error"] for r in failed if "error" in r]
 
+    metrics.end("sync.push_async", _t)
     return TransferSummary(
         transferred=len(transferred),
         skipped=len(status["common"]),
@@ -287,6 +308,7 @@ async def _pull_async(
     callback: Callable[[int], None] | None = None,
 ) -> TransferSummary:
     """Pull cache files from remote (async implementation)."""
+    _t = metrics.start()
     jobs = jobs if jobs is not None else config.get_remote_jobs()
 
     if targets:
@@ -295,12 +317,14 @@ async def _pull_async(
         needed_hashes = await remote.list_hashes()
 
     if not needed_hashes:
+        metrics.end("sync.pull_async", _t)
         return TransferSummary(transferred=0, skipped=0, failed=0, errors=[])
 
     local_hashes = get_local_cache_hashes(cache_dir)
     missing_locally = needed_hashes - local_hashes
 
     if not missing_locally:
+        metrics.end("sync.pull_async", _t)
         return TransferSummary(transferred=0, skipped=len(needed_hashes), failed=0, errors=[])
 
     files_dir = _get_cache_files_dir(cache_dir)
@@ -318,6 +342,7 @@ async def _pull_async(
 
     errors = [r["error"] for r in failed if "error" in r]
 
+    metrics.end("sync.pull_async", _t)
     return TransferSummary(
         transferred=len(transferred),
         skipped=len(needed_hashes) - len(missing_locally),

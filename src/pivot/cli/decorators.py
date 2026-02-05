@@ -74,22 +74,26 @@ def pivot_command(
     def decorator(func: Callable[..., Any]) -> click.Command:
         @functools.wraps(func)
         def wrapper(*args: Any, **kwargs: Any) -> Any:
+            _t_total = metrics.start()
             try:
-                with metrics.timed("cli.total"):
-                    # Check if Pipeline is already in context (e.g., when invoking subcommand)
-                    if auto_discover and not _has_pipeline_in_context():
+                # Check if Pipeline is already in context (e.g., when invoking subcommand)
+                if auto_discover and not _has_pipeline_in_context():
+                    try:
+                        _t_discover = metrics.start()
                         try:
-                            with metrics.timed("cli.discover"):
-                                pipeline = discovery.discover_pipeline()
-                                if pipeline is not None:
-                                    # Store Pipeline in context for commands that need it
-                                    store_pipeline_in_context(pipeline)
-                                # If no Pipeline found, commands that need stages will fail
-                                # with NoPipelineError when they try to access stages
-                        except discovery.DiscoveryError as e:
-                            raise click.ClickException(str(e)) from e
-                    return func(*args, **kwargs)
+                            pipeline = discovery.discover_pipeline()
+                            if pipeline is not None:
+                                # Store Pipeline in context for commands that need it
+                                store_pipeline_in_context(pipeline)
+                            # If no Pipeline found, commands that need stages will fail
+                            # with NoPipelineError when they try to access stages
+                        finally:
+                            metrics.end("cli.discover", _t_discover)
+                    except discovery.DiscoveryError as e:
+                        raise click.ClickException(str(e)) from e
+                return func(*args, **kwargs)
             finally:
+                metrics.end("cli.total", _t_total)
                 if os.environ.get("PIVOT_METRICS"):
                     _print_metrics_summary()
 
