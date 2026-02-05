@@ -25,7 +25,9 @@ DEFAULT_CONCURRENCY = 20
 STREAM_CHUNK_SIZE = 8 * 1024 * 1024  # 8MB chunks for streaming
 STREAM_READ_TIMEOUT = 60  # Seconds to wait for each chunk read
 MIN_HASH_LENGTH = 3  # Minimum hash length (2-char prefix + at least 1 char)
-# Threshold for using LIST vs HEAD in bulk_exists (LIST returns up to 1000 keys per request)
+# Threshold for using LIST vs HEAD in bulk_exists. HEAD is O(n) requests but lower latency;
+# LIST is O(prefixes) requests (max 256 for 2-char hex) but returns up to 1000 keys each.
+# At 50 hashes, LIST wins unless hashes are spread across 50+ prefixes (unlikely).
 BULK_EXISTS_LIST_THRESHOLD = 50
 
 _HEX_PATTERN = re.compile(r"^[a-f0-9]+$", re.IGNORECASE)
