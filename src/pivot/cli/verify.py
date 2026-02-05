@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import pathlib
-from typing import TYPE_CHECKING, TypedDict
+from typing import TYPE_CHECKING, Literal, TypedDict
 
 import click
 
@@ -23,11 +23,14 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 
+VerifyStatus = Literal["passed", "failed"]
+
+
 class StageVerifyInfo(TypedDict):
     """Verification info for a single stage."""
 
     name: str
-    status: str
+    status: VerifyStatus
     reason: str
     missing_files: list[str]
 
@@ -79,60 +82,38 @@ def _get_stage_lock_hashes(
     )
 
 
-def _verify_stage_files(
+def _get_stage_missing_hashes(
     stage_name: str,
     state_dir: Path,
     local_hashes: set[str],
     allow_missing: bool,
-    remote: remote_mod.S3Remote | None,
-) -> list[str]:
-    """Verify all files for a stage exist locally or on remote.
+) -> dict[str, list[str]]:
+    """Get hashes missing from local cache for a stage.
 
-    When allow_missing=True, also verifies deps on remote (if missing locally).
-    Returns list of missing file paths.
+    Returns {hash: [paths]} for hashes not in local cache.
+    When allow_missing=True, also includes deps missing locally.
     """
     output_hashes, dep_hashes = _get_stage_lock_hashes(stage_name, state_dir)
-
-    # Track unique missing hashes and all paths that map to them
-    missing_hashes = set[str]()
     hash_to_paths = dict[str, list[str]]()
 
     # Check outputs: must be in local cache or (with allow_missing) on remote
     for path, hash_val in output_hashes.items():
         if hash_val not in local_hashes:
-            missing_hashes.add(hash_val)
             hash_to_paths.setdefault(hash_val, []).append(path)
 
-    # Check deps only when allow_missing: must exist locally OR on remote
-    # (deps are in working dir, not cache, so we check file existence)
+    # Check deps only when allow_missing: must exist on disk OR in cache OR on remote
     if allow_missing:
         for path, hash_val in dep_hashes.items():
-            # Skip deps that exist locally (in working directory)
+            # Skip if file exists on disk
             if pathlib.Path(path).exists():
                 continue
-            # Dep missing locally - must be on remote
-            missing_hashes.add(hash_val)
+            # Skip if hash is in local cache (can be restored)
+            if hash_val in local_hashes:
+                continue
+            # File missing from disk and cache - need to check remote
             hash_to_paths.setdefault(hash_val, []).append(path)
 
-    if not missing_hashes:
-        return []
-
-    if not allow_missing or remote is None:
-        # Return all paths for all missing hashes
-        return [p for paths in hash_to_paths.values() for p in paths]
-
-    # Check remote for missing hashes (deduplicated to avoid redundant HEAD requests)
-    try:
-        remote_exists = asyncio.run(remote.bulk_exists(list(missing_hashes)))
-    except exceptions.RemoteError as e:
-        raise exceptions.RemoteError(f"Failed to check remote for missing files: {e}") from e
-
-    missing_files = list[str]()
-    for hash_val, paths in hash_to_paths.items():
-        if not remote_exists.get(hash_val, False):
-            missing_files.extend(paths)
-
-    return missing_files
+    return hash_to_paths
 
 
 def _create_remote_if_needed(allow_missing: bool) -> remote_mod.S3Remote | None:
@@ -146,10 +127,7 @@ def _create_remote_if_needed(allow_missing: bool) -> remote_mod.S3Remote | None:
             "No remotes configured. --allow-missing requires a remote to check for files."
         )
 
-    try:
-        remote, _ = transfer.create_remote_from_name(None)
-    except exceptions.RemoteError as e:
-        raise exceptions.RemoteError(f"Failed to connect to remote: {e}") from e
+    remote, _ = transfer.create_remote_from_name(None)
     return remote
 
 
@@ -159,36 +137,67 @@ def _verify_stages(
     cache_dir: Path,
     allow_missing: bool,
 ) -> tuple[bool, list[StageVerifyInfo]]:
-    """Verify all stages and return pass/fail status with details."""
+    """Verify all stages and return pass/fail status with details.
+
+    Batches all S3 existence checks into a single call for performance.
+    """
     remote = _create_remote_if_needed(allow_missing)
     local_hashes = transfer.get_local_cache_hashes(cache_dir)
 
+    # Phase 1: Collect missing hashes from all non-stale stages
+    stage_hash_to_paths = dict[str, dict[str, list[str]]]()
+    all_missing_hashes = set[str]()
+
+    for stage_info in pipeline_status:
+        if stage_info["status"] == PipelineStatus.STALE:
+            continue
+        hash_to_paths = _get_stage_missing_hashes(
+            stage_info["name"], state_dir, local_hashes, allow_missing
+        )
+        stage_hash_to_paths[stage_info["name"]] = hash_to_paths
+        all_missing_hashes.update(hash_to_paths.keys())
+
+    # Phase 2: Single batched S3 existence check for all hashes
+    remote_exists = dict[str, bool]()
+    if all_missing_hashes and remote is not None:
+        remote_exists = asyncio.run(remote.bulk_exists(list(all_missing_hashes)))
+
+    # Phase 3: Build results using cached remote existence info
     results = list[StageVerifyInfo]()
-    all_passed = True
 
     for stage_info in pipeline_status:
         stage_name = stage_info["name"]
-        status = stage_info["status"]
-        reason = stage_info["reason"]
 
-        # Check if stage is stale (code/params/deps changed)
-        if status == PipelineStatus.STALE:
+        # Stale stages always fail
+        if stage_info["status"] == PipelineStatus.STALE:
             results.append(
                 StageVerifyInfo(
                     name=stage_name,
                     status="failed",
-                    reason=reason or "Stage is stale",
+                    reason=stage_info["reason"] or "Stage is stale",
                     missing_files=[],
                 )
             )
-            all_passed = False
             continue
 
-        # Check if files exist locally or on remote
-        missing_files = _verify_stage_files(
-            stage_name, state_dir, local_hashes, allow_missing, remote
-        )
+        hash_to_paths = stage_hash_to_paths[stage_name]
 
+        # Determine missing files based on mode
+        if not hash_to_paths:
+            missing_files = list[str]()
+        elif allow_missing and remote is not None:
+            # With allow_missing, only files absent from remote are truly missing
+            missing_files = [
+                path
+                for hash_val, paths in hash_to_paths.items()
+                if not remote_exists.get(hash_val, False)
+                for path in paths
+            ]
+        else:
+            # Without allow_missing, all locally missing hashes are failures
+            missing_files = [p for paths in hash_to_paths.values() for p in paths]
+
+        # Create result based on whether any files are missing
         if missing_files:
             results.append(
                 StageVerifyInfo(
@@ -198,17 +207,12 @@ def _verify_stages(
                     missing_files=missing_files,
                 )
             )
-            all_passed = False
         else:
             results.append(
-                StageVerifyInfo(
-                    name=stage_name,
-                    status="passed",
-                    reason="",
-                    missing_files=[],
-                )
+                StageVerifyInfo(name=stage_name, status="passed", reason="", missing_files=[])
             )
 
+    all_passed = all(r["status"] == "passed" for r in results)
     return all_passed, results
 
 
@@ -217,11 +221,7 @@ def _output_text(passed: bool, results: list[StageVerifyInfo], quiet: bool) -> N
     if quiet:
         return
 
-    if passed:
-        click.echo("Verification passed")
-    else:
-        click.echo("Verification failed")
-
+    click.echo("Verification passed" if passed else "Verification failed")
     click.echo()
     for stage in results:
         status_icon = "✓" if stage["status"] == "passed" else "✗"
