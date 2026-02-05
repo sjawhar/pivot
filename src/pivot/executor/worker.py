@@ -629,22 +629,23 @@ def _save_outputs_to_cache(
     checkout_modes: list[cache.CheckoutMode],
 ) -> dict[str, OutputHash]:
     """Save outputs to cache after successful execution."""
-    with metrics.timed("worker.save_outputs_to_cache"):
-        output_hashes = dict[str, OutputHash]()
+    _t = metrics.start()
+    output_hashes = dict[str, OutputHash]()
 
-        for out in stage_outs:
-            path = pathlib.Path(cast("str", out.path))
-            if not path.exists():
-                raise exceptions.OutputMissingError(f"Stage did not produce output: {out.path}")
+    for out in stage_outs:
+        path = pathlib.Path(cast("str", out.path))
+        if not path.exists():
+            raise exceptions.OutputMissingError(f"Stage did not produce output: {out.path}")
 
-            if out.cache:
-                output_hashes[str(out.path)] = cache.save_to_cache(
-                    path, files_cache_dir, checkout_modes=checkout_modes
-                )
-            else:
-                output_hashes[str(out.path)] = None
+        if out.cache:
+            output_hashes[str(out.path)] = cache.save_to_cache(
+                path, files_cache_dir, checkout_modes=checkout_modes
+            )
+        else:
+            output_hashes[str(out.path)] = None
 
-        return output_hashes
+    metrics.end("worker.save_outputs_to_cache", _t)
+    return output_hashes
 
 
 def _verify_outputs_exist(stage_outs: list[outputs.BaseOut]) -> None:
@@ -866,24 +867,25 @@ def hash_dependencies(
     For directories, includes full manifest with file hashes/sizes for provenance.
     Paths are normalized (symlinks preserved) for portability in lock files.
     """
-    with metrics.timed("worker.hash_dependencies"):
-        hashes = dict[str, HashInfo]()
-        missing = list[str]()
-        unreadable = list[str]()
-        for dep in deps:
-            normalized = str(project.normalize_path(dep))
-            path = pathlib.Path(dep)
-            try:
-                if path.is_dir():
-                    tree_hash, manifest = cache.hash_directory(path, state_db)
-                    hashes[normalized] = {"hash": tree_hash, "manifest": manifest}
-                else:
-                    hashes[normalized] = {"hash": cache.hash_file(path, state_db)}
-            except FileNotFoundError:
-                missing.append(dep)
-            except OSError:
-                unreadable.append(dep)
-        return hashes, missing, unreadable
+    _t = metrics.start()
+    hashes = dict[str, HashInfo]()
+    missing = list[str]()
+    unreadable = list[str]()
+    for dep in deps:
+        normalized = str(project.normalize_path(dep))
+        path = pathlib.Path(dep)
+        try:
+            if path.is_dir():
+                tree_hash, manifest = cache.hash_directory(path, state_db)
+                hashes[normalized] = {"hash": tree_hash, "manifest": manifest}
+            else:
+                hashes[normalized] = {"hash": cache.hash_file(path, state_db)}
+        except FileNotFoundError:
+            missing.append(dep)
+        except OSError:
+            unreadable.append(dep)
+    metrics.end("worker.hash_dependencies", _t)
+    return hashes, missing, unreadable
 
 
 # -----------------------------------------------------------------------------

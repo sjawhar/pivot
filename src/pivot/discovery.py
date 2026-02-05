@@ -72,7 +72,8 @@ def discover_pipeline(project_root: pathlib.Path | None = None) -> Pipeline | No
     Raises:
         DiscoveryError: If discovery fails, or if both config types exist
     """
-    with metrics.timed("discovery.total"):
+    _t = metrics.start()
+    try:
         root = project_root or project.get_project_root()
         try:
             cwd = pathlib.Path.cwd().resolve()
@@ -112,6 +113,8 @@ def discover_pipeline(project_root: pathlib.Path | None = None) -> Pipeline | No
             raise DiscoveryError(f"Failed to load {config_path}: {e}") from e
         finally:
             fingerprint.flush_ast_hash_cache()
+    finally:
+        metrics.end("discovery.total", _t)
 
 
 def _load_pipeline_from_module(path: pathlib.Path) -> Pipeline | None:

@@ -1,13 +1,9 @@
 from __future__ import annotations
 
-import contextlib
 import math
 import os
 import time
-from typing import TYPE_CHECKING, TypedDict
-
-if TYPE_CHECKING:
-    from collections.abc import Generator
+from typing import TypedDict
 
 # Not thread-safe by design; each worker process has its own copy (process isolation).
 
@@ -58,6 +54,36 @@ def count(name: str) -> None:
     _add(name, 0.0)
 
 
+def start() -> float:
+    """Start timing an operation. Returns start time or 0.0 if disabled.
+
+    Zero-overhead when disabled: only a boolean check and float return.
+
+    Usage:
+        t = metrics.start()
+        # ... do work ...
+        metrics.end("remote.download", t)
+    """
+    if not _enabled:
+        return 0.0
+    return time.perf_counter()
+
+
+def end(name: str, start_time: float) -> None:
+    """End timing an operation started with start().
+
+    Zero-overhead when disabled: only a boolean check.
+
+    Args:
+        name: Metric name for this timing measurement.
+        start_time: Value returned by start()
+    """
+    if not _enabled:
+        return
+    duration_ms = (time.perf_counter() - start_time) * 1000
+    _add(name, duration_ms)
+
+
 def _add(name: str, duration_ms: float) -> None:
     """Internal: add a single metric entry."""
     # Skip invalid values that would poison summary statistics
@@ -89,25 +115,3 @@ def summary() -> dict[str, MetricSummary]:
             max_ms=max(durations),
         )
     return result
-
-
-@contextlib.contextmanager
-def timed(name: str) -> Generator[None]:
-    """Context manager to time a block of code.
-
-    Usage:
-        with metrics.timed("cache.hash_file"):
-            ...
-
-    Metrics are only collected when enabled via PIVOT_METRICS=1 or enable().
-    """
-    if not _enabled:
-        yield
-        return
-
-    start = time.perf_counter()
-    try:
-        yield
-    finally:
-        duration_ms = (time.perf_counter() - start) * 1000
-        _add(name, duration_ms)

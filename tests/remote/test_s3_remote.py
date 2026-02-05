@@ -395,6 +395,55 @@ async def test_bulk_exists_raises_on_non_404_error(
 
 
 @pytest.mark.asyncio
+async def test_bulk_exists_uses_list_for_large_batches(
+    mock_s3_session: MagicMock, mocker: MockerFixture
+) -> None:
+    """bulk_exists uses LIST instead of HEAD for large batches (>= 50 hashes)."""
+    from collections.abc import AsyncIterator  # noqa: TC003
+
+    # Generate 60 hashes to exceed the LIST threshold (50)
+    hashes = [f"a{i:015x}" for i in range(60)]
+    # Mark some as existing on remote (every other one)
+    existing_hashes = set(hashes[::2])
+
+    class MockPaginator:
+        async def paginate(
+            self,
+            Bucket: str,  # noqa: N803
+            Prefix: str,  # noqa: N803
+        ) -> AsyncIterator[dict[str, Any]]:
+            # Extract the prefix part (e.g., "a0" from "prefix/files/a0/")
+            hash_prefix = Prefix.split("/")[-2] if Prefix.endswith("/") else ""
+            # Return only existing hashes that match this prefix
+            contents = [
+                {"Key": f"prefix/files/{h[:2]}/{h[2:]}"}
+                for h in existing_hashes
+                if h.startswith(hash_prefix)
+            ]
+            yield {"Contents": contents}
+
+    mock_client = mocker.AsyncMock()
+    mock_client.get_paginator = mocker.Mock(return_value=MockPaginator())
+    # HEAD should NOT be called (we use LIST for large batches)
+    mock_client.head_object = mocker.AsyncMock()
+    mock_s3_session.client.return_value.__aenter__.return_value = mock_client
+
+    r = remote_mod.S3Remote("s3://bucket/prefix")
+    result = await r.bulk_exists(hashes)
+
+    # Verify results
+    for h in existing_hashes:
+        assert result[h] is True, f"Hash {h} should exist"
+    for h in set(hashes) - existing_hashes:
+        assert result[h] is False, f"Hash {h} should not exist"
+
+    # HEAD should NOT have been called (we use LIST for large batches)
+    assert mock_client.head_object.call_count == 0
+    # get_paginator should have been called
+    assert mock_client.get_paginator.call_count > 0
+
+
+@pytest.mark.asyncio
 async def test_list_hashes(mock_s3_session: MagicMock, mocker: MockerFixture) -> None:
     """list_hashes returns all cache hashes from S3."""
     from collections.abc import AsyncIterator  # noqa: TC003

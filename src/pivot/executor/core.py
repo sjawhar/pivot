@@ -404,43 +404,44 @@ def verify_tracked_files(project_root: pathlib.Path, checkout_missing: bool = Fa
     if not tracked_files:
         return
 
-    with metrics.timed("core.verify_tracked_files"):
-        missing = list[str]()
-        cache_dir = config.get_cache_dir() / "files"
+    _t = metrics.start()
+    missing = list[str]()
+    cache_dir = config.get_cache_dir() / "files"
 
-        with state_mod.StateDB(config.get_state_db_path()) as state_db:
-            for data_path, track_data in tracked_files.items():
-                path = pathlib.Path(data_path)
+    with state_mod.StateDB(config.get_state_db_path()) as state_db:
+        for data_path, track_data in tracked_files.items():
+            path = pathlib.Path(data_path)
 
-                # Try to hash the file - handles race conditions where file disappears
-                try:
-                    if path.is_file():
-                        current_hash = cache.hash_file(path, state_db)
-                    elif path.is_dir():
-                        current_hash, _ = cache.hash_directory(path, state_db)
+            # Try to hash the file - handles race conditions where file disappears
+            try:
+                if path.is_file():
+                    current_hash = cache.hash_file(path, state_db)
+                elif path.is_dir():
+                    current_hash, _ = cache.hash_directory(path, state_db)
+                else:
+                    # Path doesn't exist
+                    raise FileNotFoundError(data_path)
+            except FileNotFoundError:
+                if checkout_missing:
+                    if _restore_tracked_file(path, track_data, cache_dir):
+                        logger.info(f"Restored tracked file: {data_path}")
                     else:
-                        # Path doesn't exist
-                        raise FileNotFoundError(data_path)
-                except FileNotFoundError:
-                    if checkout_missing:
-                        if _restore_tracked_file(path, track_data, cache_dir):
-                            logger.info(f"Restored tracked file: {data_path}")
-                        else:
-                            logger.debug(f"Failed to restore tracked file from cache: {data_path}")
-                            missing.append(data_path)
-                    else:
+                        logger.debug(f"Failed to restore tracked file from cache: {data_path}")
                         missing.append(data_path)
-                    continue
+                else:
+                    missing.append(data_path)
+                continue
 
-                # Check hash mismatch (file exists but content changed)
-                if current_hash != track_data["hash"]:
-                    logger.warning(
-                        f"Tracked file '{data_path}' has changed since tracking. "
-                        + f"Run 'pivot track --force {track_data['path']}' to update."
-                    )
+            # Check hash mismatch (file exists but content changed)
+            if current_hash != track_data["hash"]:
+                logger.warning(
+                    f"Tracked file '{data_path}' has changed since tracking. "
+                    + f"Run 'pivot track --force {track_data['path']}' to update."
+                )
 
-        if missing:
-            raise exceptions.TrackedFileMissingError(missing, checkout_attempted=checkout_missing)
+    metrics.end("core.verify_tracked_files", _t)
+    if missing:
+        raise exceptions.TrackedFileMissingError(missing, checkout_attempted=checkout_missing)
 
 
 def check_uncached_incremental_outputs(

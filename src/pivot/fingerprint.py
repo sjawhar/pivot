@@ -178,8 +178,10 @@ def get_stage_fingerprint(
         # to protect visited set from race conditions. Current single-threaded
         # usage is safe.
 
-    with metrics.timed("fingerprint.get_stage_fingerprint"):
-        return _get_stage_fingerprint_impl(func, visited)
+    _t = metrics.start()
+    result = _get_stage_fingerprint_impl(func, visited)
+    metrics.end("fingerprint.get_stage_fingerprint", _t)
+    return result
 
 
 def _get_stage_fingerprint_impl(func: Callable[..., Any], visited: set[int]) -> dict[str, str]:
@@ -194,17 +196,19 @@ def _get_stage_fingerprint_impl(func: Callable[..., Any], visited: set[int]) -> 
     func_name = getattr(func, "__name__", "<lambda>")
     manifest[f"self:{func_name}"] = hash_function_ast(func)
 
-    with metrics.timed("fingerprint.getclosurevars"):
-        try:
-            # Use cached result if available (getclosurevars is expensive at ~0.5ms)
-            cached_closure = _getclosurevars_cache.get(func)
-            if cached_closure is not None:
-                closure_vars = cached_closure
-            else:
-                closure_vars = inspect.getclosurevars(func)
-                _getclosurevars_cache[func] = closure_vars
-        except (TypeError, AttributeError):
-            return manifest
+    _t_closure = metrics.start()
+    try:
+        # Use cached result if available (getclosurevars is expensive at ~0.5ms)
+        cached_closure = _getclosurevars_cache.get(func)
+        if cached_closure is not None:
+            closure_vars = cached_closure
+        else:
+            closure_vars = inspect.getclosurevars(func)
+            _getclosurevars_cache[func] = closure_vars
+    except (TypeError, AttributeError):
+        metrics.end("fingerprint.getclosurevars", _t_closure)
+        return manifest
+    metrics.end("fingerprint.getclosurevars", _t_closure)
 
     _process_closure_values(
         closure_vars.globals,
@@ -368,24 +372,27 @@ def _process_type_hint_dependencies(
     func: Callable[..., Any], manifest: dict[str, str], visited: set[int]
 ) -> None:
     """Process user-defined classes in type hints, including Pydantic model defaults."""
-    with metrics.timed("fingerprint.get_type_hints"):
-        # Use cached result if available
-        try:
-            cached = _get_type_hints_cache.get(func)
-            if cached is not None:
-                hints = cached
-            else:
-                try:
-                    hints = typing.get_type_hints(func)
-                except Exception:
-                    return
-                _get_type_hints_cache[func] = hints
-        except TypeError:
-            # Not weakly referenceable
+    _t = metrics.start()
+    # Use cached result if available
+    try:
+        cached = _get_type_hints_cache.get(func)
+        if cached is not None:
+            hints = cached
+        else:
             try:
                 hints = typing.get_type_hints(func)
             except Exception:
+                metrics.end("fingerprint.get_type_hints", _t)
                 return
+            _get_type_hints_cache[func] = hints
+    except TypeError:
+        # Not weakly referenceable
+        try:
+            hints = typing.get_type_hints(func)
+        except Exception:
+            metrics.end("fingerprint.get_type_hints", _t)
+            return
+    metrics.end("fingerprint.get_type_hints", _t)
 
     for hint in hints.values():
         _process_type_hint(hint, manifest, visited)
@@ -557,8 +564,9 @@ def _process_module_dependency(
     if not is_user_code(module):
         return
 
-    with metrics.timed("fingerprint.extract_module_attr_usage"):
-        attrs = ast_utils.extract_module_attr_usage(func)
+    _t = metrics.start()
+    attrs = ast_utils.extract_module_attr_usage(func)
+    metrics.end("fingerprint.extract_module_attr_usage", _t)
     module_name = getattr(module, "__name__", name)
 
     for mod_name, attr_name in attrs:
@@ -609,7 +617,8 @@ def hash_function_ast(func: Callable[..., Any]) -> str:
     stages using lambdas. Mitigation: Use named functions instead of lambdas in
     pipeline stages for stable fingerprinting.
     """
-    with metrics.timed("fingerprint.hash_function_ast"):
+    _t = metrics.start()
+    try:
         # 1. Check in-memory WeakKeyDictionary cache first (fastest)
         # WeakKeyDictionary raises TypeError for non-weakly-referenceable functions (builtins)
         try:
@@ -662,11 +671,14 @@ def hash_function_ast(func: Callable[..., Any]) -> str:
             metrics.count("fingerprint.hash_function_ast.persistent_cache_miss")
 
         return result
+    finally:
+        metrics.end("fingerprint.hash_function_ast", _t)
 
 
 def _compute_function_hash(func: Callable[..., Any]) -> str:
     """Compute hash for a function (uncached implementation)."""
-    with metrics.timed("fingerprint._compute_function_hash"):
+    _t = metrics.start()
+    try:
         # Builtins (list, dict, set, etc.) have no source - use stable name-based hash.
         # This is deterministic across Python sessions unlike id(func).
         if isinstance(func, type) and func.__module__ == "builtins":
@@ -678,28 +690,35 @@ def _compute_function_hash(func: Callable[..., Any]) -> str:
         if hasattr(func, "__wrapped__") and hasattr(func, "__code__"):
             return xxhash.xxh64(marshal.dumps(func.__code__)).hexdigest()  # pyright: ignore[reportUnknownMemberType,reportUnknownArgumentType] - hasattr guards access
 
-        with metrics.timed("fingerprint.inspect_getsource"):
-            try:
-                source = inspect.getsource(func)
-            except (OSError, TypeError):
-                if hasattr(func, "__code__"):
-                    # marshal.dumps captures full code object including co_consts
-                    # (co_code alone doesn't include constants - x+1 and x+999 have same co_code!)
-                    return xxhash.xxh64(marshal.dumps(func.__code__)).hexdigest()  # pyright: ignore[reportUnknownMemberType,reportUnknownArgumentType] - hasattr guards access
-                # KNOWN ISSUE: Using id(func) is non-deterministic across runs
-                # This affects lambdas without source code, causing unnecessary re-runs
-                return xxhash.xxh64(str(id(func)).encode()).hexdigest()
+        _t_source = metrics.start()
+        try:
+            source = inspect.getsource(func)
+        except (OSError, TypeError):
+            metrics.end("fingerprint.inspect_getsource", _t_source)
+            if hasattr(func, "__code__"):
+                # marshal.dumps captures full code object including co_consts
+                # (co_code alone doesn't include constants - x+1 and x+999 have same co_code!)
+                return xxhash.xxh64(marshal.dumps(func.__code__)).hexdigest()  # pyright: ignore[reportUnknownMemberType,reportUnknownArgumentType] - hasattr guards access
+            # KNOWN ISSUE: Using id(func) is non-deterministic across runs
+            # This affects lambdas without source code, causing unnecessary re-runs
+            return xxhash.xxh64(str(id(func)).encode()).hexdigest()
+        metrics.end("fingerprint.inspect_getsource", _t_source)
 
-        with metrics.timed("fingerprint.ast_parse"):
-            try:
-                tree = ast.parse(source)
-            except SyntaxError:
-                return xxhash.xxh64(source.encode()).hexdigest()
+        _t_parse = metrics.start()
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            metrics.end("fingerprint.ast_parse", _t_parse)
+            return xxhash.xxh64(source.encode()).hexdigest()
+        metrics.end("fingerprint.ast_parse", _t_parse)
 
-        with metrics.timed("fingerprint.normalize_and_dump"):
-            tree = _normalize_ast(tree)
-            ast_str = ast.dump(tree, annotate_fields=True, include_attributes=False)
+        _t_norm = metrics.start()
+        tree = _normalize_ast(tree)
+        ast_str = ast.dump(tree, annotate_fields=True, include_attributes=False)
+        metrics.end("fingerprint.normalize_and_dump", _t_norm)
         return xxhash.xxh64(ast_str.encode()).hexdigest()
+    finally:
+        metrics.end("fingerprint._compute_function_hash", _t)
 
 
 def _normalize_ast(node: ast.AST) -> ast.AST:
@@ -733,7 +752,8 @@ def _has_docstring(node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef) 
 
 def is_user_code(obj: Any) -> bool:
     """Check if object is user code (not stdlib/site-packages/builtins)."""
-    with metrics.timed("fingerprint.is_user_code"):
+    _t = metrics.start()
+    try:
         if obj is None:
             return False
 
@@ -752,6 +772,8 @@ def is_user_code(obj: Any) -> bool:
             _is_user_code_cache[obj] = result
 
         return result
+    finally:
+        metrics.end("fingerprint.is_user_code", _t)
 
 
 def _is_user_code_impl(obj: Any) -> bool:

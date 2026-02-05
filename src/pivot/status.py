@@ -169,7 +169,8 @@ def get_pipeline_explanations(
         graph: Optional bipartite graph from Engine. If provided, extracts stage DAG
             via get_stage_dag() instead of building a new one.
     """
-    with metrics.timed("status.get_pipeline_explanations"):
+    _t = metrics.start()
+    try:
         tracked_files, tracked_trie = _discover_tracked_files(allow_missing)
         if graph is None:
             graph = engine_graph.build_graph(all_stages)
@@ -199,6 +200,8 @@ def get_pipeline_explanations(
         explanations = [explanations_by_name[name] for name in execution_order]
 
         return _compute_explanations_with_upstream(explanations, stage_graph)
+    finally:
+        metrics.end("status.get_pipeline_explanations", _t)
 
 
 def _compute_explanations_with_upstream(
@@ -260,7 +263,8 @@ def get_pipeline_status(
         graph: Optional bipartite graph. If provided, extracts stage DAG
             via get_stage_dag() instead of building a new one.
     """
-    with metrics.timed("status.get_pipeline_status"):
+    _t = metrics.start()
+    try:
         tracked_files, tracked_trie = _discover_tracked_files(allow_missing)
         if graph is None:
             graph = engine_graph.build_graph(all_stages)
@@ -291,6 +295,8 @@ def get_pipeline_status(
         # Reuse the shared upstream computation logic
         enriched = _compute_explanations_with_upstream(explanations, stage_graph)
         return _explanations_to_status(enriched), stage_graph
+    finally:
+        metrics.end("status.get_pipeline_status", _t)
 
 
 def _explanations_to_status(explanations: list[StageExplanation]) -> list[PipelineStatusInfo]:
