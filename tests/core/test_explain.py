@@ -703,7 +703,10 @@ def test_get_pipeline_explanations_upstream_propagation(
 
         # Get pipeline explanations
         explanations = status.get_pipeline_explanations(
-            stages=None, single_stage=False, all_stages=pipeline.snapshot()
+            stages=None,
+            single_stage=False,
+            all_stages=pipeline.snapshot(),
+            stage_registry=pipeline._registry,
         )
 
         # Find stage_b's explanation

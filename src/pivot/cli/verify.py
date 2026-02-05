@@ -282,6 +282,7 @@ def verify(
         stages_list,
         single_stage=False,
         all_stages=all_stages,
+        stage_registry=cli_helpers.get_registry(),
         allow_missing=allow_missing,
     )
 

@@ -128,6 +128,7 @@ def _output_explain(
         stages_list,
         single_stage=False,
         all_stages=all_stages,
+        stage_registry=cli_helpers.get_registry(),
         force=force,
         allow_missing=allow_missing,
         graph=graph,
@@ -168,6 +169,7 @@ def _dry_run(
         allow_missing=allow_missing,
         graph=graph,
         all_stages=all_stages,
+        stage_registry=cli_helpers.get_registry(),
     )
 
     if not explanations:

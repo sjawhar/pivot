@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Self
 import anyio
 import anyio.to_thread
 
-from pivot import config, parameters, project
+from pivot import config, exceptions, parameters, project
 from pivot.engine import agent_rpc
 from pivot.engine import graph as engine_graph
 from pivot.engine.types import (
@@ -45,6 +45,7 @@ if TYPE_CHECKING:
     import networkx as nx
     from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
 
+    from pivot import registry
     from pivot.pipeline.pipeline import Pipeline
     from pivot.registry import RegistryStageInfo
     from pivot.storage.cache import CheckoutMode
@@ -904,6 +905,7 @@ class Engine:
         if self._executor is None or self._stop_starting_new:
             return
 
+        pipeline = self._require_pipeline()
         started = 0
         max_to_start = self._max_workers - len(self._futures)
         if max_to_start <= 0:
@@ -929,6 +931,7 @@ class Engine:
             stage_info = self._get_stage(stage_name)
             worker_info = executor_core.prepare_worker_info(
                 stage_info,
+                pipeline._registry,  # pyright: ignore[reportPrivateUsage]
                 overrides,
                 checkout_modes,
                 run_id,
@@ -1158,14 +1161,15 @@ class Engine:
         self._invalidate_caches()
 
         # Reload registry - returns old_stages on success, None on failure
-        old_stages = self._reload_registry()
+        reload_result = self._reload_registry()
 
-        if old_stages is None:
+        if reload_result is None:
             _logger.error("Pipeline invalid - waiting for fix")
             return
 
         # Emit reload event
-        await self._emit_reload_event(old_stages)
+        old_stages, old_registry = reload_result
+        await self._emit_reload_event(old_stages, old_registry)
 
         # Rebuild graph
         all_stages = self._get_all_stages()
@@ -1286,14 +1290,17 @@ class Engine:
         if self._pipeline is not None:
             self._pipeline.invalidate_dag_cache()
 
-    def _reload_registry(self) -> dict[str, RegistryStageInfo] | None:
+    def _reload_registry(
+        self,
+    ) -> tuple[dict[str, RegistryStageInfo], registry.StageRegistry | None] | None:
         """Reload the pipeline by re-importing pipeline definition.
 
-        Returns old_stages dict if reload succeeded, None if pipeline is invalid.
+        Returns old_stages and old_registry if reload succeeded, None if pipeline is invalid.
         The caller should emit the reload event using the returned old_stages.
         """
         old_pipeline = self._pipeline
         old_stages = old_pipeline.snapshot() if old_pipeline else {}
+        old_registry = old_pipeline._registry if old_pipeline else None  # pyright: ignore[reportPrivateUsage]
         root = project.get_project_root()
 
         # Clear project modules from sys.modules
@@ -1309,7 +1316,7 @@ class Engine:
                 return None
 
             self._pipeline = new_pipeline
-            return old_stages
+            return old_stages, old_registry
         except Exception as e:
             _logger.warning(f"Pipeline invalid: {e}")
             # Restore old pipeline on failure
@@ -1336,7 +1343,11 @@ class Engine:
         for name in to_remove:
             del sys.modules[name]
 
-    async def _emit_reload_event(self, old_stages: dict[str, RegistryStageInfo]) -> None:
+    async def _emit_reload_event(
+        self,
+        old_stages: dict[str, RegistryStageInfo],
+        old_registry: registry.StageRegistry | None,
+    ) -> None:
         """Emit PipelineReloaded event with diff information."""
         new_stage_names = self._list_stages()
         new_stages_set = set(new_stage_names)
@@ -1347,10 +1358,41 @@ class Engine:
 
         # Detect modified stages by comparing fingerprints
         modified = list[str]()
+        pipeline = self._require_pipeline()
+        new_registry = pipeline._registry  # pyright: ignore[reportPrivateUsage]
         for stage_name in sorted(old_stage_names & new_stages_set):
-            old_info = old_stages[stage_name]
-            new_info = self._get_stage(stage_name)
-            if old_info["fingerprint"] != new_info["fingerprint"]:
+            had_error = False
+            if old_registry is None:
+                old_fp = None
+                had_error = True
+                _logger.warning(
+                    "Fingerprinting failed for stage '%s' during reload (old registry unavailable)",
+                    stage_name,
+                )
+            else:
+                try:
+                    old_fp = old_registry.ensure_fingerprint(stage_name)
+                except exceptions.PivotError as exc:
+                    old_fp = None
+                    had_error = True
+                    _logger.warning(
+                        "Fingerprinting failed for stage '%s' during reload (old registry): %s",
+                        stage_name,
+                        exc,
+                    )
+
+            try:
+                new_fp = new_registry.ensure_fingerprint(stage_name)
+            except exceptions.PivotError as exc:
+                new_fp = None
+                had_error = True
+                _logger.warning(
+                    "Fingerprinting failed for stage '%s' during reload (new registry): %s",
+                    stage_name,
+                    exc,
+                )
+
+            if had_error or old_fp != new_fp:
                 modified.append(stage_name)
 
         await self.emit(

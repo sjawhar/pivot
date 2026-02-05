@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Literal, TypedDict
 
 import loky
 
-from pivot import config, discovery, exceptions, outputs, parameters
+from pivot import config, discovery, exceptions, outputs, parameters, registry
 from pivot.executor import worker
 from pivot.storage import cache, lock, track
 from pivot.storage import state as state_mod
@@ -315,6 +315,7 @@ def create_executor(max_workers: int) -> concurrent.futures.Executor:
 
 def prepare_worker_info(
     stage_info: RegistryStageInfo,
+    stage_registry: registry.StageRegistry,
     overrides: parameters.ParamsOverrides,
     checkout_modes: list[cache.CheckoutMode],
     run_id: str,
@@ -336,7 +337,7 @@ def prepare_worker_info(
 
     return worker.WorkerStageInfo(
         func=stage_info["func"],
-        fingerprint=stage_info["fingerprint"],
+        fingerprint=stage_registry.ensure_fingerprint(stage_info["name"]),
         deps=stage_info["deps_paths"],
         outs=stage_info["outs"],
         signature=stage_info["signature"],

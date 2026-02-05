@@ -2531,6 +2531,7 @@ def test_prepare_worker_info_uses_stage_state_dir(
     stage_info = test_registry.get("stage_with_custom_state")
     worker_info = executor_core.prepare_worker_info(
         stage_info=stage_info,
+        stage_registry=test_registry,
         overrides={},
         checkout_modes=[],
         run_id="test-run",
@@ -2559,6 +2560,7 @@ def test_prepare_worker_info_uses_default_state_dir_when_stage_has_none(
     default_state_dir = set_project_root / ".pivot"
     worker_info = executor_core.prepare_worker_info(
         stage_info=stage_info,
+        stage_registry=test_registry,
         overrides={},
         checkout_modes=[],
         run_id="test-run",
