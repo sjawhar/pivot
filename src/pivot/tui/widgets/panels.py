@@ -8,11 +8,12 @@ import rich.markup
 import textual.app
 import textual.containers
 import textual.css.query
+import textual.timer
 import textual.widgets
 
 from pivot.tui.diff_panels import InputDiffPanel, OutputDiffPanel
 from pivot.tui.widgets import status
-from pivot.tui.widgets.logs import StageLogPanel
+from pivot.tui.widgets.logs import LogSearchEscapePressed, LogSearchInput, StageLogPanel
 
 if TYPE_CHECKING:
     from pivot.tui.types import ExecutionHistoryEntry, StageInfo
@@ -27,6 +28,9 @@ class TabbedDetailPanel(textual.containers.Vertical):
     _history_index: int | None  # None = live view, else index into history deque
     _history_total: int
     _log_panel: StageLogPanel | None
+    _search_input: LogSearchInput | None
+    _search_container: textual.containers.Horizontal | None
+    _search_debounce_timer: textual.timer.Timer | None
 
     def __init__(self, *, id: str | None = None, classes: str | None = None) -> None:
         super().__init__(id=id, classes=classes)
@@ -34,6 +38,9 @@ class TabbedDetailPanel(textual.containers.Vertical):
         self._history_index = None
         self._history_total = 0
         self._log_panel = None
+        self._search_input = None
+        self._search_container = None
+        self._search_debounce_timer = None
 
     @override
     def compose(self) -> textual.app.ComposeResult:  # pragma: no cover
@@ -42,10 +49,33 @@ class TabbedDetailPanel(textual.containers.Vertical):
             with textual.widgets.TabPane("Logs", id="tab-logs"):
                 self._log_panel = StageLogPanel(id="stage-logs")
                 yield self._log_panel
+                # Search bar (hidden by default)
+                self._search_input = LogSearchInput(
+                    placeholder="Search...",
+                    id="log-search-input",
+                )
+                self._search_container = textual.containers.Horizontal(
+                    textual.widgets.Static("Search: ", id="search-label"),
+                    self._search_input,
+                    textual.widgets.Static("", id="search-count"),
+                    id="log-search-bar",
+                    classes="hidden",
+                )
+                yield self._search_container
             with textual.widgets.TabPane("Input", id="tab-input"):
                 yield InputDiffPanel(id="input-panel")
             with textual.widgets.TabPane("Output", id="tab-output"):
                 yield OutputDiffPanel(id="output-panel")
+
+    def on_unmount(self) -> None:  # pragma: no cover
+        """Clean up timer when unmounted."""
+        self._cancel_debounce_timer()
+
+    def _cancel_debounce_timer(self) -> None:
+        """Stop and clear the debounce timer if active."""
+        if self._search_debounce_timer is not None:
+            self._search_debounce_timer.stop()
+            self._search_debounce_timer = None
 
     def set_stage(self, stage: StageInfo | None) -> None:  # pragma: no cover
         """Update the displayed stage."""
@@ -55,6 +85,7 @@ class TabbedDetailPanel(textual.containers.Vertical):
         stage_name = stage.name if stage else None
 
         self._update_header()
+        self.hide_log_search()  # Reset search on stage change
 
         # Update log panel (takes StageInfo)
         if self._log_panel:
@@ -183,3 +214,69 @@ class TabbedDetailPanel(textual.containers.Vertical):
         if self._stage:
             self._history_total = len(self._stage.history)
         self._update_header()
+
+    # =========================================================================
+    # Log search functionality
+    # =========================================================================
+
+    def show_log_search(self) -> None:  # pragma: no cover
+        """Show the log search bar and focus input."""
+        if self._search_container and self._search_input:
+            self._search_container.remove_class("hidden")
+            self._search_input.focus()
+
+    def hide_log_search(self) -> None:  # pragma: no cover
+        """Hide the log search bar and clear search."""
+        self._cancel_debounce_timer()
+        # Clear search state in log panel unconditionally
+        if self._log_panel:
+            self._log_panel.apply_search("")
+        # Hide UI elements if present
+        if self._search_container:
+            self._search_container.add_class("hidden")
+        if self._search_input:
+            self._search_input.value = ""
+
+    def update_search_count(self) -> None:  # pragma: no cover
+        """Update the search match count display."""
+        try:
+            count_widget = self.query_one("#search-count", textual.widgets.Static)
+            if self._log_panel:
+                match_count = self._log_panel.match_count
+                count_widget.update(f" {match_count}" if match_count else "")
+        except textual.css.query.NoMatches:
+            pass
+
+    def _apply_debounced_search(self) -> None:  # pragma: no cover
+        """Apply the search after debounce delay."""
+        # Guard: timer might fire after unmount despite cancellation
+        if not self.is_attached:
+            return
+        if self._search_input and self._log_panel:
+            self._log_panel.apply_search(self._search_input.value)
+            self.update_search_count()
+
+    def on_input_changed(self, event: textual.widgets.Input.Changed) -> None:  # pragma: no cover
+        """Handle search input changes with 200ms debounce."""
+        if event.input.id == "log-search-input":
+            self._cancel_debounce_timer()
+            self._search_debounce_timer = self.set_timer(0.2, self._apply_debounced_search)
+
+    def on_input_submitted(
+        self, event: textual.widgets.Input.Submitted
+    ) -> None:  # pragma: no cover
+        """Handle Enter in search: apply immediately and return focus to logs."""
+        if event.input.id == "log-search-input" and self._log_panel:
+            self._cancel_debounce_timer()
+            self._log_panel.apply_search(event.value)
+            self.update_search_count()
+            self._log_panel.focus()
+
+    def on_log_search_escape_pressed(
+        self, event: LogSearchEscapePressed
+    ) -> None:  # pragma: no cover
+        """Handle Escape: close search bar."""
+        event.stop()
+        self.hide_log_search()
+        if self._log_panel:
+            self._log_panel.focus()

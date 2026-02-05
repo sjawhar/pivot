@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import pytest
 
 from pivot.tui.widgets import FooterContext, PivotFooter
+
+if TYPE_CHECKING:
+    from pytest_mock import MockerFixture
 
 # =============================================================================
 # Context State Tests
@@ -41,7 +46,7 @@ def test_footer_set_context_updates_internal_state(context: FooterContext) -> No
         ),
         pytest.param(
             FooterContext.LOGS,
-            ["Ctrl+j/k", "Scroll", "L", "Logs", "I", "Input", "O", "Output", "q", "?"],
+            ["Ctrl+j/k", "Scroll", "Ctrl+F", "Search", "n/N", "Match", "L/I/O", "Tabs", "q", "?"],
             id="logs",
         ),
         pytest.param(
@@ -123,3 +128,31 @@ def test_footer_all_contexts_have_quit_and_help() -> None:
         content = footer.get_shortcuts_text()
         assert "q" in content, f"Context {context} should show quit shortcut"
         assert "?" in content, f"Context {context} should show help shortcut"
+
+
+def test_footer_set_same_context_updates_anyway(mocker: MockerFixture) -> None:
+    """Setting same context currently updates display (documents current behavior)."""
+
+    footer = PivotFooter()
+    footer.set_context(FooterContext.LOGS)
+
+    # Mock the update method to count calls
+    update_mock = mocker.patch.object(footer, "update", wraps=footer.update)
+
+    # Set same context again
+    footer.set_context(FooterContext.LOGS)
+
+    # Current implementation calls update even for same context
+    assert update_mock.call_count == 1, "Current implementation updates even for same context"
+
+
+def test_footer_get_shortcuts_without_mount() -> None:
+    """get_shortcuts_text should work before widget is mounted."""
+    footer = PivotFooter()
+
+    # Should work even before mount
+    text = footer.get_shortcuts_text()
+
+    assert "q" in text, "Should include quit shortcut"
+    assert "?" in text, "Should include help shortcut"
+    assert "[bold]" in text, "Should include markup"

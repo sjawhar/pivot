@@ -392,50 +392,6 @@ def output_queue() -> Generator[mp.Queue[OutputMessage]]:
     manager.shutdown()
 
 
-# =============================================================================
-# TUI Test Mocks
-# =============================================================================
-
-
-class MockEngine:
-    """Mock engine for TUI testing (implements Engine interface for watch mode)."""
-
-    def __init__(self) -> None:
-        self._keep_going: bool = False
-
-    def run(self, *, exit_on_completion: bool = True) -> None:
-        """Mock run - does nothing."""
-        pass
-
-    def shutdown(self) -> None:
-        """Mock shutdown - does nothing."""
-        pass
-
-    def toggle_keep_going(self) -> bool:
-        """Toggle keep-going mode."""
-        self._keep_going = not self._keep_going
-        return self._keep_going
-
-    def set_keep_going(self, enabled: bool) -> None:
-        """Set keep-going mode."""
-        self._keep_going = enabled
-
-    @property
-    def keep_going(self) -> bool:
-        """Return keep-going state."""
-        return self._keep_going
-
-
-@pytest.fixture
-def mock_watch_engine() -> Engine:
-    """Provide a mock engine for TUI watch mode testing.
-
-    Returns MockEngine which implements the subset of Engine interface
-    needed for watch mode tests (keep_going property and toggle).
-    """
-    return MockEngine()  # pyright: ignore[reportReturnType] - MockEngine is test double
-
-
 @pytest.fixture
 async def test_engine(test_pipeline: pipeline_mod.Pipeline) -> AsyncGenerator[Engine]:
     """Provide a context-managed Engine instance.
@@ -458,3 +414,39 @@ def worker_env(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> pathl
     (tmp_path / ".pivot" / "pending" / "stages").mkdir(parents=True, exist_ok=True)
     monkeypatch.chdir(tmp_path)
     return cache_dir
+
+
+# =============================================================================
+# RPC Test Utilities
+# =============================================================================
+
+
+def send_rpc(
+    sock_path: pathlib.Path, method: str, params: dict[str, object] | None = None
+) -> dict[str, object]:
+    """Send JSON-RPC request via Unix socket and return response.
+
+    This is a synchronous helper for integration tests that need to communicate
+    with the engine's RPC server via agent.sock.
+
+    Args:
+        sock_path: Path to the Unix socket (typically .pivot/agent.sock).
+        method: JSON-RPC method name (e.g., "status", "run", "events_since").
+        params: Optional parameters for the method.
+
+    Returns:
+        Parsed JSON response as a dict.
+    """
+    import json
+    import socket
+
+    request: dict[str, object] = {"jsonrpc": "2.0", "id": 1, "method": method}
+    if params:
+        request["params"] = params
+
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+        sock.settimeout(5.0)
+        sock.connect(str(sock_path))
+        sock.sendall(json.dumps(request).encode() + b"\n")
+        response = sock.recv(4096).decode()
+    return json.loads(response)

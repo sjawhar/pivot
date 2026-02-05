@@ -165,3 +165,32 @@ Tab:hover {
     background: $surface;
     padding: 0 1;
 }
+
+/* Log search bar */
+#log-search-bar {
+    height: 1;
+    background: $surface-lighten-1;
+    padding: 0 1;
+    dock: bottom;
+}
+
+#log-search-bar.hidden {
+    display: none;
+}
+
+#log-search-input {
+    width: 1fr;
+    height: 1;
+    border: none;
+    background: $surface;
+}
+
+#search-label {
+    width: auto;
+    color: $text-muted;
+}
+
+#search-count {
+    width: auto;
+    color: $text-muted;
+}

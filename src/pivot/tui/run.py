@@ -18,7 +18,6 @@ from typing import (
     override,
 )
 
-import anyio
 import filelock
 import loky
 import loky.process_executor
@@ -39,7 +38,7 @@ from pivot.cli import helpers as cli_helpers
 from pivot.executor import ExecutionSummary
 from pivot.executor import commit as commit_mod
 from pivot.storage import lock, project_lock
-from pivot.tui import diff_panels
+from pivot.tui import diff_panels, rpc_client
 from pivot.tui.diff_panels import InputDiffPanel, OutputDiffPanel
 from pivot.tui.screens import (
     ConfirmCommitScreen,
@@ -102,9 +101,6 @@ def format_reload_summary(
 
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
-
-    from pivot.engine.engine import Engine
     from pivot.types import OutputChange
 
 
@@ -139,18 +135,6 @@ class TuiShutdown(textual.message.Message):
     """
 
 
-class ExecutorComplete(textual.message.Message):
-    """Signal that executor has finished (run mode only)."""
-
-    results: dict[str, ExecutionSummary]
-    error: Exception | None
-
-    def __init__(self, results: dict[str, ExecutionSummary], error: Exception | None) -> None:
-        self.results = results
-        self.error = error
-        super().__init__()
-
-
 _TUI_BINDINGS: list[textual.binding.BindingType] = [
     textual.binding.Binding("q", "quit", "Quit"),
     textual.binding.Binding("c", "commit", "Commit"),
@@ -179,6 +163,8 @@ _TUI_BINDINGS: list[textual.binding.BindingType] = [
     textual.binding.Binding("=", "expand_all_groups", "Expand All", show=False),
     # Stage filtering
     textual.binding.Binding("/", "focus_filter", "Filter", show=False),
+    # Log search (Logs tab only)
+    textual.binding.Binding("ctrl+f", "log_search", "Search Logs", show=False),
     # History navigation (works in all tabs, watch mode only)
     textual.binding.Binding("[", "history_older", "Older", show=False),
     textual.binding.Binding("]", "history_newer", "Newer", show=False),
@@ -192,6 +178,9 @@ _TUI_BINDINGS: list[textual.binding.BindingType] = [
     textual.binding.Binding("~", "toggle_debug", "Debug"),
     # Keep-going toggle (watch mode only)
     textual.binding.Binding("g", "toggle_keep_going", "Keep-going"),
+    # Force re-run (watch mode only)
+    textual.binding.Binding("r", "force_rerun_stage", "Force Re-run", show=False),
+    textual.binding.Binding("R", "force_rerun_all", "Force All", show=False),
 ]
 
 _logger = logging.getLogger(__name__)
@@ -215,37 +204,26 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
     _TAB_IDS: ClassVar[tuple[str, str, str]] = ("tab-logs", "tab-input", "tab-output")
 
     # Instance attributes (annotated for type checking since class is not @final)
-    _executor_func: Callable[[], dict[str, ExecutionSummary]] | None
     _cancel_event: threading.Event | None
-    _engine: Engine | None
 
     def __init__(
         self,
         stage_names: list[str] | None = None,
         tui_log: pathlib.Path | None = None,
         *,
-        # Run mode parameters
-        executor_func: Callable[[], dict[str, ExecutionSummary]] | None = None,
         cancel_event: threading.Event | None = None,
-        # Watch mode parameters
         watch_mode: bool = False,
-        engine: Engine | None = None,
         no_commit: bool = False,
         serve: bool = False,
     ) -> None:
         """Initialize TUI app.
 
-        For run mode: provide executor_func
-        For watch mode: set watch_mode=True (engine is optional, may be managed externally)
+        TUI is a pure display client. Engine is always managed externally by CLI.
+        TUI waits for TuiShutdown message to exit (run mode) or user quit (watch mode).
         """
         super().__init__()
 
-        # Determine mode from parameters
-        # watch_mode=True explicitly, or inferred from engine presence (backward compat)
-        self._watch_mode: bool = watch_mode or engine is not None
-        if not self._watch_mode and executor_func is None:
-            msg = "Either executor_func (run mode) or watch_mode=True must be provided"
-            raise ValueError(msg)
+        self._watch_mode: bool = watch_mode
 
         # Core state
         self._stages: dict[str, StageInfo] = {}
@@ -262,16 +240,11 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
         self._stats_log_timer: textual.timer.Timer | None = None
 
         # Run mode state
-        self._executor_func = executor_func
         self._cancel_event = cancel_event
         self._results: dict[str, ExecutionSummary] | None = None
-        self._error: Exception | None = None
-        self._executor_thread: threading.Thread | None = None
         self._exit_message: str | None = None
 
         # Watch mode state
-        self._engine = engine
-        self._engine_thread: threading.Thread | None = None
         self._no_commit: bool = no_commit
         self._commit_in_progress: bool = False
         self._cancel_commit: bool = False
@@ -285,7 +258,7 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
 
         # Open log file if configured
         if tui_log:
-            log_file = open(tui_log, "w", buffering=1)  # noqa: SIM115
+            log_file = open(tui_log, "w", encoding="utf-8", buffering=1)  # noqa: SIM115
             # set_inheritable failure is non-fatal, just means child processes
             # might inherit the fd (harmless for a log file)
             with contextlib.suppress(OSError):
@@ -304,14 +277,7 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
     @property
     def selected_stage_name(self) -> str | None:
         """Return name of currently selected stage, or None if no stages."""
-        if self._stage_order and self._selected_idx < len(self._stage_order):
-            return self._stage_order[self._selected_idx]
-        return None
-
-    @property
-    def error(self) -> Exception | None:
-        """Return any exception that occurred during execution (run mode only)."""
-        return self._error
+        return self._selected_stage_name
 
     @property
     def exit_message(self) -> str | None:
@@ -391,23 +357,12 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
         self._start_time = time.monotonic()
         if self._log_file is not None:
             self._stats_log_timer = self.set_interval(1.0, self._write_stats_to_log)
-
-        # Defer initial panel update to after widgets are fully mounted
         self.call_after_refresh(self._update_detail_panel)
 
         if self._watch_mode:
-            # Watch mode: set title (engine may be managed externally by CLI)
             prefix = self._get_keep_going_prefix()
             self.title = f"{prefix}[●] Watching for changes..."  # pyright: ignore[reportUnannotatedClassAttribute] - inherited from App
-            # Only start engine thread if engine was passed directly (legacy mode)
-            # When engine is None, CLI manages the async Engine externally
-            if self._engine is not None:
-                self._engine_thread = threading.Thread(target=self._run_engine, daemon=True)
-                self._engine_thread.start()
-        else:
-            # Run mode: start executor
-            self._executor_thread = threading.Thread(target=self._run_executor, daemon=True)
-            self._executor_thread.start()
+        # Run mode: TUI waits for TuiShutdown from external engine
 
     def on_resize(self, event: textual.events.Resize) -> None:  # pragma: no cover
         """Handle terminal resize - warn if too small."""
@@ -417,48 +372,6 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
                 f"Minimum: {_MIN_TERMINAL_WIDTH}x{_MIN_TERMINAL_HEIGHT}"
             )
             self.notify(msg, severity="warning", timeout=5)
-
-    # =========================================================================
-    # Background threads
-    # =========================================================================
-
-    def _run_executor(self) -> None:  # pragma: no cover
-        """Run the executor (run mode, background thread)."""
-        results: dict[str, ExecutionSummary] = {}
-        error: Exception | None = None
-        try:
-            if self._executor_func:
-                results = self._executor_func()
-        except Exception as e:
-            error = e
-        finally:
-            self.post_message(ExecutorComplete(results, error))
-
-    def _run_engine(self) -> None:  # pragma: no cover
-        """Run the watch engine (watch mode, background thread).
-
-        Uses anyio.run() to execute the async Engine.run() in this thread.
-        The Engine must already be set up with sources and sinks by the caller.
-        """
-
-        async def _async_run_engine() -> None:
-            if self._engine is None:
-                return
-            # Engine must be used as async context manager
-            async with self._engine:
-                await self._engine.run(exit_on_completion=False)
-
-        try:
-            anyio.run(_async_run_engine)
-        except Exception as e:
-            _logger.exception(f"Watch engine failed: {e}")
-            error_msg = TuiWatchMessage(
-                type=TuiMessageType.WATCH,
-                status=WatchStatus.ERROR,
-                message="Watch mode crashed. Please restart 'pivot watch'.",
-            )
-            with contextlib.suppress(Exception):
-                self.post_message(TuiUpdate(error_msg))
 
     # =========================================================================
     # Message handling
@@ -485,12 +398,13 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
     def on_tui_shutdown(self, _event: TuiShutdown) -> None:  # pragma: no cover
         """Handle TuiSink shutdown signal (both run and watch modes).
 
-        In run mode: signals execution is complete, triggers exit
+        In run mode: signals execution is complete, triggers exit with bell notification
         In watch mode: logs shutdown, TUI continues until user quits
         """
         self._write_to_log('{"type": "shutdown"}\n')
         if not self._watch_mode:
-            # Run mode: exit after shutdown signal
+            # Run mode: notify user and exit after shutdown signal
+            self.bell()
             self._shutdown_event.set()
             self._close_log_file()
             self._shutdown_loky_pool()
@@ -648,21 +562,6 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
         if summary:
             self.notify(summary)
 
-    def on_executor_complete(self, event: ExecutorComplete) -> None:  # pragma: no cover
-        """Handle executor completion (run mode only)."""
-        self._results = event.results
-        self._error = event.error
-        self.bell()
-        if event.error:
-            self.title = f"pivot run - FAILED: {event.error}"
-        else:
-            self.title = "pivot run - Complete"
-        # Clean up before exiting
-        self._shutdown_event.set()
-        self._close_log_file()
-        self._shutdown_loky_pool()
-        self.exit(self._results)
-
     # =========================================================================
     # History tracking (watch mode only)
     # =========================================================================
@@ -774,7 +673,7 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
         """Get the history deque for the currently selected stage."""
         if self._selected_stage_name and self._selected_stage_name in self._stages:
             return self._stages[self._selected_stage_name].history
-        return collections.deque(maxlen=50)
+        return collections.deque[ExecutionHistoryEntry]()
 
     def _navigate_history_prev(self) -> bool:  # pragma: no cover
         """Navigate to previous (older) history entry."""
@@ -978,35 +877,23 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
             self._update_stage_list_selection()
             self._update_detail_panel()
 
+    def _navigate_tab(self, direction: int) -> None:  # pragma: no cover
+        """Navigate tabs by direction (+1 for next, -1 for prev)."""
+        tabs = self._try_query_one("#detail-tabs", textual.widgets.TabbedContent)
+        if tabs is None or tabs.active not in self._TAB_IDS:
+            return
+        current_idx = self._TAB_IDS.index(tabs.active)
+        new_idx = (current_idx + direction) % len(self._TAB_IDS)
+        tabs.active = self._TAB_IDS[new_idx]
+        self._update_footer_context()
+
     def action_prev_tab(self) -> None:  # pragma: no cover
         """Navigate to previous tab."""
-        tabs = self._try_query_one("#detail-tabs", textual.widgets.TabbedContent)
-        if tabs is None:
-            return
-        try:
-            if tabs.active in self._TAB_IDS:
-                current_idx = self._TAB_IDS.index(tabs.active)
-                # Wrap around to last tab if at first
-                new_idx = (current_idx - 1) % len(self._TAB_IDS)
-                tabs.active = self._TAB_IDS[new_idx]
-                self._update_footer_context()
-        except ValueError:
-            _logger.debug("Tab index error during prev_tab")
+        self._navigate_tab(-1)
 
     def action_next_tab(self) -> None:  # pragma: no cover
         """Navigate to next tab."""
-        tabs = self._try_query_one("#detail-tabs", textual.widgets.TabbedContent)
-        if tabs is None:
-            return
-        try:
-            if tabs.active in self._TAB_IDS:
-                current_idx = self._TAB_IDS.index(tabs.active)
-                # Wrap around to first tab if at last
-                new_idx = (current_idx + 1) % len(self._TAB_IDS)
-                tabs.active = self._TAB_IDS[new_idx]
-                self._update_footer_context()
-        except ValueError:
-            _logger.debug("Tab index error during next_tab")
+        self._navigate_tab(1)
 
     def on_tabbed_content_tab_activated(
         self, _event: textual.widgets.TabbedContent.TabActivated
@@ -1085,15 +972,60 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
 
     def action_next_changed(self) -> None:  # pragma: no cover
         """Move selection to next changed item in detail panel."""
+        # Don't intercept if an Input widget has focus (let it type the character)
+        if isinstance(self.focused, textual.widgets.Input):
+            return
+        # On Logs tab with active search, navigate to next match
+        if self._is_log_search_active():
+            log_panel = self._try_query_one("#stage-logs", StageLogPanel)
+            if log_panel:
+                log_panel.next_match()
+                self._update_search_count()
+            return
+
         panel = self._get_active_diff_panel()
         if panel:
             panel.select_next_changed()
 
     def action_prev_changed(self) -> None:  # pragma: no cover
         """Move selection to previous changed item in detail panel."""
+        # Don't intercept if an Input widget has focus (let it type the character)
+        if isinstance(self.focused, textual.widgets.Input):
+            return
+        # On Logs tab with active search, navigate to previous match
+        if self._is_log_search_active():
+            log_panel = self._try_query_one("#stage-logs", StageLogPanel)
+            if log_panel:
+                log_panel.prev_match()
+                self._update_search_count()
+            return
+
         panel = self._get_active_diff_panel()
         if panel:
             panel.select_prev_changed()
+
+    def action_log_search(self) -> None:  # pragma: no cover
+        """Activate log search (Logs tab only)."""
+        tabs = self._try_query_one("#detail-tabs", textual.widgets.TabbedContent)
+        if tabs is None or tabs.active != "tab-logs":
+            return
+        detail_panel = self._try_query_one("#detail-panel", TabbedDetailPanel)
+        if detail_panel:
+            detail_panel.show_log_search()
+
+    def _is_log_search_active(self) -> bool:  # pragma: no cover
+        """Check if we're on Logs tab with active search."""
+        tabs = self._try_query_one("#detail-tabs", textual.widgets.TabbedContent)
+        if tabs is None or tabs.active != "tab-logs":
+            return False
+        log_panel = self._try_query_one("#stage-logs", StageLogPanel)
+        return log_panel is not None and log_panel.is_search_active
+
+    def _update_search_count(self) -> None:  # pragma: no cover
+        """Update the search match count display."""
+        detail_panel = self._try_query_one("#detail-panel", TabbedDetailPanel)
+        if detail_panel:
+            detail_panel.update_search_count()
 
     def action_toggle_debug(self) -> None:  # pragma: no cover
         """Toggle debug panel visibility."""
@@ -1211,6 +1143,40 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
             self._commit_in_progress = False
             if acquired is not None:
                 acquired.release()
+
+    async def action_force_rerun_stage(self) -> None:  # pragma: no cover
+        """Force re-run the currently selected stage (watch mode only)."""
+        if not self._watch_mode:
+            return
+        if self._selected_stage_name is None:
+            self.notify("No stage selected", severity="warning")
+            return
+        if self._has_running_stages:
+            self.notify("Cannot re-run while stages are running", severity="warning")
+            return
+
+        stage_name = self._selected_stage_name
+        socket_path = project.get_project_root() / ".pivot" / "agent.sock"
+
+        self.notify(f"Forcing re-run of {stage_name}...")
+        success = await rpc_client.send_run_command(socket_path, stages=[stage_name], force=True)
+        if not success:
+            self.notify("Failed to send re-run command", severity="error")
+
+    async def action_force_rerun_all(self) -> None:  # pragma: no cover
+        """Force re-run all stages (watch mode only)."""
+        if not self._watch_mode:
+            return
+        if self._has_running_stages:
+            self.notify("Cannot re-run while stages are running", severity="warning")
+            return
+
+        socket_path = project.get_project_root() / ".pivot" / "agent.sock"
+
+        self.notify("Forcing re-run of all stages...")
+        success = await rpc_client.send_run_command(socket_path, stages=None, force=True)
+        if not success:
+            self.notify("Failed to send re-run command", severity="error")
 
     # =========================================================================
     # Debug stats

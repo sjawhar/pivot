@@ -29,6 +29,8 @@ _HELP_TEXT = """\
 
 [bold cyan]Actions[/]
   c                 Commit changes
+  r                 Force re-run selected stage
+  R                 Force re-run all stages
   g                 Toggle keep-going mode (watch)
   ~                 Toggle debug panel
   q                 Quit"""
@@ -39,7 +41,7 @@ class HelpScreen(textual.screen.ModalScreen[None]):
 
     CSS_PATH: ClassVar[str] = "../styles/modal.tcss"  # pyright: ignore[reportIncompatibleVariableOverride]
 
-    BINDINGS: list[textual.binding.BindingType] = [
+    BINDINGS: ClassVar[list[textual.binding.BindingType]] = [
         textual.binding.Binding("escape", "dismiss", "Close"),
         textual.binding.Binding("?", "dismiss", "Close", show=False),
         textual.binding.Binding("q", "dismiss", "Close", show=False),

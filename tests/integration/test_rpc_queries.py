@@ -19,25 +19,11 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from conftest import send_rpc
+
 if TYPE_CHECKING:
     import pathlib
     from collections.abc import Generator
-
-
-def send_rpc(
-    sock_path: pathlib.Path, method: str, params: dict[str, object] | None = None
-) -> dict[str, object]:
-    """Send JSON-RPC request and return response."""
-    request: dict[str, object] = {"jsonrpc": "2.0", "id": 1, "method": method}
-    if params:
-        request["params"] = params
-
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-        sock.settimeout(5.0)
-        sock.connect(str(sock_path))
-        sock.sendall(json.dumps(request).encode() + b"\n")
-        response = sock.recv(4096).decode()
-    return json.loads(response)
 
 
 @pytest.fixture

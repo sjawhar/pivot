@@ -6,9 +6,11 @@ watch mode for continuous re-execution on file changes.
 
 from __future__ import annotations
 
+import concurrent.futures
 import contextlib
 import datetime
 import json
+import logging
 import pathlib
 import threading
 import time
@@ -41,6 +43,8 @@ if TYPE_CHECKING:
     from pivot.executor import ExecutionSummary
     from pivot.tui import console as tui_console
 
+
+_logger = logging.getLogger(__name__)
 
 # JSONL schema version for forward compatibility
 _JSONL_SCHEMA_VERSION = 1
@@ -280,7 +284,6 @@ def _run_pipeline(
             run_id=run_id,
             console=console,
             jsonl_callback=jsonl_callback,
-            cancel_event=cancel_event,
             no_commit=no_commit,
             no_cache=no_cache,
         )
@@ -325,12 +328,10 @@ def _run_watch_mode(  # noqa: PLR0913 - many params needed for different modes
     run_id: str | None,
     console: tui_console.Console | None,
     jsonl_callback: Callable[[dict[str, object]], None] | None,
-    cancel_event: threading.Event | None,
     no_commit: bool,
     no_cache: bool,
 ) -> None:
     """Run watch mode with unified event-driven execution."""
-    _ = cancel_event  # Reserved for future graceful cancellation support
 
     from pivot.engine import graph as engine_graph
 
@@ -358,83 +359,89 @@ def _run_watch_mode(  # noqa: PLR0913 - many params needed for different modes
 
     if tui and run_id:
         # TUI mode with async Engine
-        async def tui_watch_main() -> None:
-            from pivot.tui import run as tui_run
+        # IMPORTANT: Textual must run in the main thread for signal handlers (SIGTSTP, etc.)
+        # to work correctly. We run the Engine in a background thread instead.
+        from pivot.tui import run as tui_run
 
-            # Create TUI app first (needed for TuiSink)
-            app = tui_run.PivotApp(
-                stage_names=display_order,
-                tui_log=tui_log,
-                watch_mode=True,
-                engine=None,  # Engine is managed by CLI
-                no_commit=no_commit,
-                serve=serve,
-            )
+        # Create TUI app (will run in main thread)
+        app = tui_run.PivotApp(
+            stage_names=display_order,
+            tui_log=tui_log,
+            watch_mode=True,
+            no_commit=no_commit,
+            serve=serve,
+        )
 
-            async with engine.Engine(pipeline=pipeline) as eng:
-                # Configure sinks - TuiSink for direct post_message
-                _run_common.configure_result_collector(eng)
-                _run_common.configure_output_sink(
-                    eng,
-                    quiet=quiet,
-                    as_json=as_json,
-                    tui=True,
-                    app=app,
-                    run_id=run_id,
-                    use_console=False,
-                    jsonl_callback=jsonl_callback,
-                )
+        def engine_thread_target() -> None:
+            """Run the async Engine in a background thread with its own event loop."""
 
-                # Add agent RPC source if serve mode
-                if serve:
-                    from pivot import project
-                    from pivot.engine.agent_rpc import (
-                        AgentRpcHandler,
-                        AgentRpcSource,
-                        BroadcastEventSink,
+            async def engine_main() -> None:
+                async with engine.Engine(pipeline=pipeline) as eng:
+                    # Configure sinks - TuiSink posts to app (thread-safe)
+                    _run_common.configure_result_collector(eng)
+                    _run_common.configure_output_sink(
+                        eng,
+                        quiet=quiet,
+                        as_json=as_json,
+                        tui=True,
+                        app=app,
+                        run_id=run_id,
+                        use_console=False,
+                        jsonl_callback=jsonl_callback,
                     )
 
-                    state_dir = project.get_project_root() / ".pivot"
-                    socket_path = state_dir / "agent.sock"
-                    state_dir.mkdir(parents=True, exist_ok=True)
+                    # Add agent RPC source for TUI (needed for force re-run) or serve mode
+                    if serve or tui:
+                        from pivot import project
+                        from pivot.engine.agent_rpc import (
+                            AgentRpcHandler,
+                            AgentRpcSource,
+                            BroadcastEventSink,
+                        )
 
-                    # Add event buffer as sink so it captures events
-                    eng.add_sink(eng._event_buffer)  # pyright: ignore[reportPrivateUsage]
+                        state_dir = project.get_project_root() / ".pivot"
+                        socket_path = state_dir / "agent.sock"
+                        state_dir.mkdir(parents=True, exist_ok=True)
 
-                    rpc_handler = AgentRpcHandler(
-                        engine=eng,
-                        event_buffer=eng._event_buffer,  # pyright: ignore[reportPrivateUsage]
+                        # Add event buffer as sink so it captures events
+                        eng.add_sink(eng._event_buffer)  # pyright: ignore[reportPrivateUsage]
+
+                        rpc_handler = AgentRpcHandler(
+                            engine=eng,
+                            event_buffer=eng._event_buffer,  # pyright: ignore[reportPrivateUsage]
+                        )
+                        eng.add_source(AgentRpcSource(socket_path=socket_path, handler=rpc_handler))
+                        eng.add_sink(BroadcastEventSink())
+
+                    # Configure watch sources
+                    _configure_watch_sources(
+                        eng,
+                        watch_paths,
+                        debounce,
+                        force=force,
+                        stages=stages_list,
+                        no_commit=no_commit,
+                        no_cache=no_cache,
+                        on_error=on_error,
                     )
-                    eng.add_source(AgentRpcSource(socket_path=socket_path, handler=rpc_handler))
-                    eng.add_sink(BroadcastEventSink())
 
-                # Configure watch sources
-                _configure_watch_sources(
-                    eng,
-                    watch_paths,
-                    debounce,
-                    force=force,
-                    stages=stages_list,
-                    no_commit=no_commit,
-                    no_cache=no_cache,
-                    on_error=on_error,
-                )
+                    await eng.run(exit_on_completion=False)
 
-                # Suppress stderr logging while TUI is active
-                with _run_common.suppress_stderr_logging():
-                    async with anyio.create_task_group() as tg:
-                        # Start Engine.run() in background
-                        async def run_engine() -> None:
-                            await eng.run(exit_on_completion=False)
+            try:
+                anyio.run(engine_main)
+            except Exception:
+                # Engine failed - log and signal TUI to exit
+                _logger.exception("Engine thread failed in watch mode")
+                with contextlib.suppress(Exception):
+                    app.post_message(tui_run.TuiShutdown())
 
-                        tg.start_soon(run_engine)
-                        # Run Textual in a thread (it takes over terminal)
-                        await anyio.to_thread.run_sync(app.run)  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType] - anyio stub issue
-                        # When TUI exits, cancel the engine task
-                        tg.cancel_scope.cancel()
+        # Start engine in background thread
+        engine_thread = threading.Thread(target=engine_thread_target, daemon=True)
+        engine_thread.start()
 
-        with contextlib.suppress(KeyboardInterrupt):
-            anyio.run(tui_watch_main)
+        # Run TUI in main thread (required for signal handlers)
+        with contextlib.suppress(KeyboardInterrupt), _run_common.suppress_stderr_logging():
+            app.run()
     else:
         # Non-TUI async mode
         async def watch_main() -> None:
@@ -581,67 +588,78 @@ def _run_oneshot_mode(
     pipeline = cli_decorators.get_pipeline_from_context()
 
     # TUI mode for oneshot
+    # IMPORTANT: Textual must run in the main thread for signal handlers (SIGTSTP, etc.)
+    # to work correctly. We run the Engine in a background thread instead.
     if tui and run_id:
         from pivot.tui import run as tui_run
 
-        async def tui_oneshot_main() -> dict[str, executor_core.ExecutionSummary]:
-            # Create TUI app first (needed for TuiSink)
-            def executor_wrapper() -> dict[str, ExecutionSummary]:
-                return {}
+        # Create TUI app (will run in main thread)
+        app = tui_run.PivotApp(
+            stage_names=display_order,
+            tui_log=tui_log,
+            cancel_event=cancel_event,
+        )
 
-            app = tui_run.PivotApp(
-                stage_names=display_order,
-                tui_log=tui_log,
-                executor_func=executor_wrapper,
-                cancel_event=cancel_event,
-            )
+        # Use Future for thread-safe result passing
+        result_future: concurrent.futures.Future[dict[str, executor_core.ExecutionSummary]] = (
+            concurrent.futures.Future()
+        )
 
-            async with engine.Engine(pipeline=pipeline) as eng:
-                # Configure sinks - TuiSink for direct post_message
-                result_sink = _run_common.configure_result_collector(eng)
-                _run_common.configure_output_sink(
-                    eng,
-                    quiet=quiet,
-                    as_json=as_json,
-                    tui=True,
-                    app=app,
-                    run_id=run_id,
-                    use_console=False,
-                    jsonl_callback=jsonl_callback,
-                )
-                _configure_oneshot_source(
-                    eng,
-                    stages_list,
-                    force=force,
-                    no_commit=no_commit,
-                    no_cache=no_cache,
-                    on_error=on_error,
-                    allow_uncached_incremental=allow_uncached_incremental,
-                    checkout_missing=checkout_missing,
-                )
+        def engine_thread_target() -> None:
+            """Run the async Engine in a background thread with its own event loop."""
 
-                # Run engine and TUI concurrently
-                async def engine_task() -> dict[str, executor_core.ExecutionSummary]:
+            async def engine_main() -> dict[str, executor_core.ExecutionSummary]:
+                async with engine.Engine(pipeline=pipeline) as eng:
+                    # Configure sinks - TuiSink posts to app (thread-safe)
+                    result_sink = _run_common.configure_result_collector(eng)
+                    _run_common.configure_output_sink(
+                        eng,
+                        quiet=quiet,
+                        as_json=as_json,
+                        tui=True,
+                        app=app,
+                        run_id=run_id,
+                        use_console=False,
+                        jsonl_callback=jsonl_callback,
+                    )
+                    _configure_oneshot_source(
+                        eng,
+                        stages_list,
+                        force=force,
+                        no_commit=no_commit,
+                        no_cache=no_cache,
+                        on_error=on_error,
+                        allow_uncached_incremental=allow_uncached_incremental,
+                        checkout_missing=checkout_missing,
+                    )
                     await eng.run(exit_on_completion=True)
                     stage_results = await result_sink.get_results()
                     return _run_common.convert_results(stage_results)
 
-                # Suppress stderr logging while TUI is active
-                with _run_common.suppress_stderr_logging():
-                    engine_results: dict[str, executor_core.ExecutionSummary] = {}
+            try:
+                result_future.set_result(anyio.run(engine_main))
+            except BaseException as e:
+                result_future.set_exception(e)
+            finally:
+                # Signal TUI to exit when engine completes (success or failure)
+                with contextlib.suppress(Exception):
+                    app.post_message(tui_run.TuiShutdown())
 
-                    async def run_engine_and_signal() -> None:
-                        nonlocal engine_results
-                        engine_results = await engine_task()
+        # Start engine in background thread
+        engine_thread = threading.Thread(target=engine_thread_target, daemon=True)
+        engine_thread.start()
 
-                    async with anyio.create_task_group() as tg:
-                        tg.start_soon(run_engine_and_signal)
-                        await anyio.to_thread.run_sync(app.run)  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType] - anyio stub issue
-                        tg.cancel_scope.cancel()
+        # Run TUI in main thread (required for signal handlers)
+        with _run_common.suppress_stderr_logging():
+            app.run()
 
-                    return engine_results
+        # Wait for engine thread to finish (should be quick since TUI already exited)
+        engine_thread.join(timeout=5.0)
 
-        return anyio.run(tui_oneshot_main)
+        # Return results (re-raises if engine raised an exception)
+        if result_future.done():
+            return result_future.result()
+        return {}
 
     # Non-TUI async mode
     start_time = time.perf_counter()
