@@ -144,6 +144,16 @@ def validate_tui_log(
     return resolved
 
 
+def validate_show_output(show_output: bool, tui_flag: bool, as_json: bool, quiet: bool) -> None:
+    """Validate --show-output mutual exclusions."""
+    if show_output and tui_flag:
+        raise click.ClickException("--show-output and --tui are mutually exclusive")
+    if show_output and as_json:
+        raise click.ClickException("--show-output and --json are mutually exclusive")
+    if show_output and quiet:
+        raise click.ClickException("--show-output and --quiet are mutually exclusive")
+
+
 class DryRunJsonStageOutput(TypedDict):
     """JSON output for a single stage in dry-run mode."""
 
@@ -239,6 +249,7 @@ def configure_output_sink(
     run_id: str | None,
     use_console: bool,
     jsonl_callback: Callable[[dict[str, object]], None] | None,
+    show_output: bool = False,
 ) -> None:
     """Configure output sinks based on display mode."""
     import rich.console
@@ -254,7 +265,7 @@ def configure_output_sink(
     if tui and app and run_id:
         eng.add_sink(sinks.TuiSink(app=app, run_id=run_id))
     elif use_console:
-        eng.add_sink(sinks.ConsoleSink(console=rich.console.Console()))
+        eng.add_sink(sinks.ConsoleSink(console=rich.console.Console(), show_output=show_output))
 
 
 def convert_results(

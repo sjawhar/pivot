@@ -204,6 +204,7 @@ def _run_pipeline(
     quiet: bool,
     tui: bool,
     as_json: bool,
+    show_output: bool,
     debounce: int,
     tui_log: pathlib.Path | None,
     no_commit: bool,
@@ -276,6 +277,7 @@ def _run_pipeline(
             quiet=quiet,
             tui=tui,
             as_json=as_json,
+            show_output=show_output,
             debounce=debounce,
             tui_log=tui_log,
             on_error=on_error,
@@ -298,6 +300,7 @@ def _run_pipeline(
             quiet=quiet,
             tui=tui,
             as_json=as_json,
+            show_output=show_output,
             tui_log=tui_log,
             force=force,
             no_commit=no_commit,
@@ -320,6 +323,7 @@ def _run_watch_mode(  # noqa: PLR0913 - many params needed for different modes
     quiet: bool,
     tui: bool,
     as_json: bool,
+    show_output: bool,
     debounce: int,
     tui_log: pathlib.Path | None,
     on_error: OnError,
@@ -341,6 +345,7 @@ def _run_watch_mode(  # noqa: PLR0913 - many params needed for different modes
             stages_list,
             force=force,
             quiet=quiet,
+            show_output=show_output,
             debounce=debounce,
             on_error=on_error,
             no_commit=no_commit,
@@ -457,6 +462,7 @@ def _run_watch_mode(  # noqa: PLR0913 - many params needed for different modes
                     run_id=None,
                     use_console=console is not None,
                     jsonl_callback=jsonl_callback,
+                    show_output=show_output,
                 )
 
                 # Configure sources
@@ -482,6 +488,7 @@ def _run_serve_mode(
     *,
     force: bool,
     quiet: bool,
+    show_output: bool,
     debounce: int,
     on_error: OnError,
     no_commit: bool,
@@ -547,7 +554,7 @@ def _run_serve_mode(
             # Add sinks
             if not quiet:
                 serve_console = rich.console.Console()
-                eng.add_sink(sinks.ConsoleSink(console=serve_console))
+                eng.add_sink(sinks.ConsoleSink(console=serve_console, show_output=show_output))
             eng.add_sink(sinks.ResultCollectorSink())
             eng.add_sink(BroadcastEventSink())  # Broadcast events to connected agents
 
@@ -567,6 +574,7 @@ def _run_oneshot_mode(
     quiet: bool,
     tui: bool,
     as_json: bool,
+    show_output: bool,
     tui_log: pathlib.Path | None,
     force: bool,
     no_commit: bool,
@@ -676,6 +684,7 @@ def _run_oneshot_mode(
                 run_id=None,
                 use_console=console is not None,
                 jsonl_callback=jsonl_callback,
+                show_output=show_output,
             )
             _configure_oneshot_source(
                 eng,
@@ -752,6 +761,11 @@ def _run_oneshot_mode(
 )
 @click.option("--json", "as_json", is_flag=True, help="Output results as JSON")
 @click.option(
+    "--show-output",
+    is_flag=True,
+    help="Stream stage output (stdout/stderr) to terminal",
+)
+@click.option(
     "--tui-log",
     type=click.Path(path_type=pathlib.Path),
     help="Write TUI messages to JSONL file for monitoring",
@@ -803,6 +817,7 @@ def repro(
     debounce: int | None,
     tui_flag: bool,
     as_json: bool,
+    show_output: bool,
     tui_log: pathlib.Path | None,
     no_commit: bool,
     no_cache: bool,
@@ -834,6 +849,9 @@ def repro(
     # Validate --tui and --json are mutually exclusive
     if tui_flag and as_json:
         raise click.ClickException("--tui and --json are mutually exclusive")
+
+    # Validate --show-output combinations
+    _run_common.validate_show_output(show_output, tui_flag, as_json, quiet)
 
     # Validate tui_log
     tui_log = _run_common.validate_tui_log(tui_log, as_json, tui_flag, dry_run=dry_run)
@@ -876,6 +894,7 @@ def repro(
             quiet=quiet,
             tui=tui_flag,
             as_json=as_json,
+            show_output=show_output,
             debounce=debounce_ms,
             tui_log=tui_log,
             no_commit=no_commit,

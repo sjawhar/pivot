@@ -323,6 +323,53 @@ def test_validate_tui_log_raises_on_unwritable_path(
 
 
 # =============================================================================
+# validate_show_output Tests
+# =============================================================================
+
+
+def test_validate_show_output_raises_for_tui() -> None:
+    """validate_show_output raises when used with --tui."""
+    with pytest.raises(
+        click.ClickException, match="--show-output and --tui are mutually exclusive"
+    ):
+        _run_common.validate_show_output(
+            show_output=True, tui_flag=True, as_json=False, quiet=False
+        )
+
+
+def test_validate_show_output_raises_for_json() -> None:
+    """validate_show_output raises when used with --json."""
+    with pytest.raises(
+        click.ClickException, match="--show-output and --json are mutually exclusive"
+    ):
+        _run_common.validate_show_output(
+            show_output=True, tui_flag=False, as_json=True, quiet=False
+        )
+
+
+def test_validate_show_output_raises_for_quiet() -> None:
+    """validate_show_output raises when used with --quiet."""
+    with pytest.raises(
+        click.ClickException, match="--show-output and --quiet are mutually exclusive"
+    ):
+        _run_common.validate_show_output(
+            show_output=True, tui_flag=False, as_json=False, quiet=True
+        )
+
+
+def test_validate_show_output_succeeds_when_valid() -> None:
+    """validate_show_output returns None when all flags are compatible."""
+    _run_common.validate_show_output(show_output=True, tui_flag=False, as_json=False, quiet=False)
+    # Should not raise
+
+
+def test_validate_show_output_succeeds_when_disabled() -> None:
+    """validate_show_output returns None when show_output=False regardless of other flags."""
+    _run_common.validate_show_output(show_output=False, tui_flag=True, as_json=True, quiet=True)
+    # Should not raise
+
+
+# =============================================================================
 # TypedDict Types Tests
 # =============================================================================
 
