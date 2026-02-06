@@ -985,6 +985,33 @@ def test_get_config_keys_skips_empty_yaml_file(
 # =============================================================================
 
 
+def test_complete_config_keys_skips_non_string_remote_names(
+    tmp_path: Path,
+    mock_ctx: mock.MagicMock,
+    mock_param: mock.MagicMock,
+    mocker: MockerFixture,
+) -> None:
+    """Skips non-string YAML keys (integers, booleans) in remotes."""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("remotes:\n  123: s3://a\n  true: s3://b\n  valid-name: s3://c\n")
+    mocker.patch.object(
+        completion,
+        "_get_config_paths",
+        return_value=[config_path],
+    )
+
+    result = completion.complete_config_keys(mock_ctx, mock_param, "remotes")
+    values = [item.value for item in result]
+    assert "remotes.valid-name" in values
+    assert "remotes.123" not in values
+    assert "remotes.True" not in values
+
+
+# =============================================================================
+# Cache write-then-read roundtrip tests
+# =============================================================================
+
+
 def test_cache_roundtrip_preserves_stages(tmp_path: Path) -> None:
     """Writing then reading cache preserves the exact stage list."""
     config = tmp_path / "pivot.yaml"

@@ -782,3 +782,126 @@ async def test_download_batch_readonly(
         assert path.exists()
         mode = path.stat().st_mode & 0o777
         assert mode == 0o444, f"Expected 0o444 for {path}, got {oct(mode)}"
+
+
+# -----------------------------------------------------------------------------
+# Metrics / Finally Tests
+# -----------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_bulk_exists_calls_metrics_end_on_error(
+    mock_s3_session: MagicMock, mocker: MockerFixture
+) -> None:
+    """bulk_exists calls metrics.end even when an error occurs."""
+    from pivot import metrics
+
+    error = botocore_exc.ClientError(
+        {"Error": {"Code": "403", "Message": "Forbidden"}}, "HeadObject"
+    )
+    mock_client = mocker.AsyncMock()
+    mock_client.head_object = mocker.AsyncMock(side_effect=error)
+    mock_s3_session.client.return_value.__aenter__.return_value = mock_client
+
+    spy_end = mocker.spy(metrics, "end")
+
+    r = remote_mod.S3Remote("s3://bucket/prefix")
+
+    with pytest.raises(exceptions.RemoteConnectionError):
+        await r.bulk_exists(["a1b2c3d4e5f6789a"])
+
+    spy_end.assert_any_call("storage.bulk_exists", mocker.ANY)
+
+
+@pytest.mark.asyncio
+async def test_upload_batch_calls_metrics_end_on_error(
+    mock_s3_session: MagicMock, tmp_path: pathlib.Path, mocker: MockerFixture
+) -> None:
+    """upload_batch calls metrics.end even when uploads fail."""
+    from pivot import metrics
+
+    mock_client = mocker.AsyncMock()
+    mock_client.put_object = mocker.AsyncMock(side_effect=Exception("upload boom"))
+    mock_s3_session.client.return_value.__aenter__.return_value = mock_client
+
+    spy_end = mocker.spy(metrics, "end")
+
+    f = tmp_path / "file.txt"
+    f.write_text("content")
+
+    r = remote_mod.S3Remote("s3://bucket/prefix")
+    # upload_batch catches per-item errors, so it completes without raising
+    await r.upload_batch([(f, "a1b2c3d4e5f6789a")])
+
+    spy_end.assert_any_call("storage.upload_batch", mocker.ANY)
+
+
+@pytest.mark.asyncio
+async def test_download_batch_calls_metrics_end_on_error(
+    mock_s3_session: MagicMock, tmp_path: pathlib.Path, mocker: MockerFixture
+) -> None:
+    """download_batch calls metrics.end even when downloads fail."""
+    from pivot import metrics
+
+    mock_client = mocker.AsyncMock()
+    mock_client.get_object = mocker.AsyncMock(side_effect=Exception("download boom"))
+    mock_s3_session.client.return_value.__aenter__.return_value = mock_client
+
+    spy_end = mocker.spy(metrics, "end")
+
+    r = remote_mod.S3Remote("s3://bucket/prefix")
+    await r.download_batch([("a1b2c3d4e5f6789a", tmp_path / "dest.txt")])
+
+    spy_end.assert_any_call("storage.download_batch", mocker.ANY)
+
+
+# -----------------------------------------------------------------------------
+# Session Reuse Tests
+# -----------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_s3_remote_reuses_session_across_methods(
+    mock_s3_session: MagicMock, tmp_path: pathlib.Path, mocker: MockerFixture
+) -> None:
+    """S3Remote reuses the same aioboto3 session across multiple method calls."""
+    mock_client = mocker.AsyncMock()
+    mock_client.head_object = mocker.AsyncMock(return_value={})
+    mock_client.put_object = mocker.AsyncMock()
+    mock_s3_session.client.return_value.__aenter__.return_value = mock_client
+
+    r = remote_mod.S3Remote("s3://bucket/prefix")
+    await r.exists("abc123def45678")
+
+    test_file = tmp_path / "test.txt"
+    test_file.write_text("content")
+    await r.upload_file(test_file, "abc123def45678")
+
+    # Session created once in __init__; both methods share it via self._session.client()
+    # The mock_s3_session fixture patches aioboto3.Session — verify it was called once
+    import aioboto3
+
+    session_cls = aioboto3.Session  # type: ignore[attr-defined] - mocked by fixture
+    assert session_cls.call_count == 1  # pyright: ignore[reportAttributeAccessIssue] - mock attribute
+
+
+# -----------------------------------------------------------------------------
+# Init Error Tests
+# -----------------------------------------------------------------------------
+
+
+def test_s3_remote_init_raises_on_missing_aioboto3(mocker: MockerFixture) -> None:
+    """S3Remote raises RemoteError when aioboto3 is not installed."""
+    import builtins
+
+    original_import = builtins.__import__
+
+    def mock_import(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name == "aioboto3":
+            raise ModuleNotFoundError("No module named 'aioboto3'")
+        return original_import(name, *args, **kwargs)
+
+    mocker.patch("builtins.__import__", side_effect=mock_import)
+
+    with pytest.raises(exceptions.RemoteError, match="pip install pivot\\[s3\\]"):
+        remote_mod.S3Remote("s3://bucket/prefix")

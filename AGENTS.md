@@ -146,6 +146,8 @@ def train(
 - Zero tolerance for basedpyright warnings—use targeted ignores: `# type: ignore[code] - reason`
 - Prefer type stubs (`pandas-stubs`, `types-PyYAML`) over ignores
 - Check `typings/` first for untyped packages; use `scripts/generate_stubs.py` if needed
+- **aioboto3/S3 types:** Use `types_aiobotocore_s3.S3Client` (not `Any`) for S3 client parameters. Import under `TYPE_CHECKING`. The `types-aioboto3[all]` stubs are in dev deps.
+- **aioboto3 sessions:** Create one `aioboto3.Session()` per `S3Remote` instance (in `__init__`), not per method call. Sessions are credential-management objects — recreating them re-reads credential chains and env vars. Each method creates its own client via `async with self._session.client("s3")`, which is lightweight but gets a fresh connection pool. Batch methods share one client across concurrent tasks via `asyncio.gather`.
 
 ## Python 3.13+ Types
 

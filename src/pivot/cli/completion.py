@@ -49,7 +49,7 @@ def _get_config_keys() -> dict[str, str]:
             remotes: object = typed_data.get("remotes")
             if isinstance(remotes, dict):
                 for remote_name in cast("dict[str, Any]", remotes):
-                    if VALID_REMOTE_NAME.match(remote_name):
+                    if isinstance(remote_name, str) and VALID_REMOTE_NAME.match(remote_name):  # pyright: ignore[reportUnnecessaryIsInstance] - YAML can parse non-string keys
                         keys[f"remotes.{remote_name}"] = f"Remote '{remote_name}'"
         except Exception:
             logger.debug("Config completion: failed to load %s", path, exc_info=True)

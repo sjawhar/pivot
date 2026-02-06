@@ -5,7 +5,7 @@ import pathlib
 from typing import TYPE_CHECKING, Annotated, TypedDict
 
 from helpers import register_test_stage
-from pivot import cli, executor, loaders, outputs
+from pivot import cli, exceptions, executor, loaders, outputs
 from pivot.storage import cache, lock
 
 if TYPE_CHECKING:
@@ -747,3 +747,87 @@ def test_verify_allow_missing_uses_pvt_hash_for_nested_dep(
     # Should use manifest entry hash for data/file.csv
     assert "Missing deps" not in result.output, f"Got: {result.output}"
     assert result.exit_code == 0, f"Expected pass, got: {result.output}"
+
+
+# =============================================================================
+# Path Resolution and Remote Error Wrapping Tests
+# =============================================================================
+
+
+def test_verify_allow_missing_resolves_paths_relative_to_project_root(
+    mock_discovery: Pipeline,
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    mocker: MockerFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """verify --allow-missing resolves dep paths against project root, not cwd."""
+    (tmp_path / "input.txt").write_text("data")
+
+    register_test_stage(_helper_process, name="process")
+
+    # Run to cache
+    executor.run(pipeline=mock_discovery)
+
+    # Delete the input file to trigger allow-missing path
+    (tmp_path / "input.txt").unlink()
+
+    # Change cwd into a subdirectory (away from project root)
+    subdir = tmp_path / "sub"
+    subdir.mkdir()
+    monkeypatch.chdir(subdir)
+
+    _setup_mock_remote(mocker, files_exist_on_remote=True)
+
+    result = runner.invoke(cli.cli, ["verify", "--allow-missing"])
+
+    # Should not error about missing deps — path resolution uses project root
+    assert "Missing deps" not in result.output, f"Got: {result.output}"
+
+
+def test_verify_allow_missing_wraps_remote_creation_error(
+    mock_discovery: Pipeline,
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    mocker: MockerFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """verify --allow-missing wraps non-RemoteError from create_remote_from_name."""
+    (tmp_path / "input.txt").write_text("data")
+
+    register_test_stage(_helper_process, name="process")
+
+    mocker.patch("pivot.remote.config.list_remotes", return_value={"default": "s3://bucket/cache"})
+    mocker.patch(
+        "pivot.remote.sync.create_remote_from_name",
+        side_effect=RuntimeError("connection refused"),
+    )
+
+    result = runner.invoke(cli.cli, ["verify", "--allow-missing"])
+
+    assert result.exit_code != 0
+    assert "Failed to create remote connection" in result.output
+
+
+def test_verify_allow_missing_preserves_remote_error_subclass(
+    mock_discovery: Pipeline,
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    mocker: MockerFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """verify --allow-missing preserves RemoteError subclasses (not re-wrapped)."""
+    (tmp_path / "input.txt").write_text("data")
+
+    register_test_stage(_helper_process, name="process")
+
+    mocker.patch("pivot.remote.config.list_remotes", return_value={"default": "s3://bucket/cache"})
+    mocker.patch(
+        "pivot.remote.sync.create_remote_from_name",
+        side_effect=exceptions.RemoteNotFoundError("no-such"),
+    )
+
+    result = runner.invoke(cli.cli, ["verify", "--allow-missing"])
+
+    assert result.exit_code != 0
+    assert "no-such" in result.output

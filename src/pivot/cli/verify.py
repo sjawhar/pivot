@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Literal, TypedDict
 
 import click
 
-from pivot import config, exceptions
+from pivot import config, exceptions, project
 from pivot import status as status_mod
 from pivot.cli import completion
 from pivot.cli import decorators as cli_decorators
@@ -87,6 +87,7 @@ def _get_stage_missing_hashes(
     state_dir: Path,
     local_hashes: set[str],
     allow_missing: bool,
+    project_root: Path,
 ) -> dict[str, list[str]]:
     """Get hashes missing from local cache for a stage.
 
@@ -105,7 +106,7 @@ def _get_stage_missing_hashes(
     if allow_missing:
         for path, hash_val in dep_hashes.items():
             # Skip if file exists on disk
-            if pathlib.Path(path).exists():
+            if (project_root / path).exists():
                 continue
             # Skip if hash is in local cache (can be restored)
             if hash_val in local_hashes:
@@ -127,7 +128,12 @@ def _create_remote_if_needed(allow_missing: bool) -> remote_mod.S3Remote | None:
             "No remotes configured. --allow-missing requires a remote to check for files."
         )
 
-    remote, _ = transfer.create_remote_from_name(None)
+    try:
+        remote, _ = transfer.create_remote_from_name(None)
+    except exceptions.RemoteError:
+        raise
+    except Exception as e:
+        raise exceptions.RemoteError(f"Failed to create remote connection: {e}") from e
     return remote
 
 
@@ -143,6 +149,7 @@ def _verify_stages(
     """
     remote = _create_remote_if_needed(allow_missing)
     local_hashes = transfer.get_local_cache_hashes(cache_dir)
+    project_root = project.get_project_root()
 
     # Phase 1: Collect missing hashes from all non-stale stages
     stage_hash_to_paths = dict[str, dict[str, list[str]]]()
@@ -152,7 +159,7 @@ def _verify_stages(
         if stage_info["status"] == PipelineStatus.STALE:
             continue
         hash_to_paths = _get_stage_missing_hashes(
-            stage_info["name"], state_dir, local_hashes, allow_missing
+            stage_info["name"], state_dir, local_hashes, allow_missing, project_root
         )
         stage_hash_to_paths[stage_info["name"]] = hash_to_paths
         all_missing_hashes.update(hash_to_paths.keys())
@@ -160,7 +167,12 @@ def _verify_stages(
     # Phase 2: Single batched S3 existence check for all hashes
     remote_exists = dict[str, bool]()
     if all_missing_hashes and remote is not None:
-        remote_exists = asyncio.run(remote.bulk_exists(list(all_missing_hashes)))
+        try:
+            remote_exists = asyncio.run(remote.bulk_exists(list(all_missing_hashes)))
+        except exceptions.RemoteError:
+            raise
+        except Exception as e:
+            raise exceptions.RemoteError(f"Failed to check remote existence: {e}") from e
 
     # Phase 3: Build results using cached remote existence info
     results = list[StageVerifyInfo]()
