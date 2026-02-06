@@ -19,8 +19,157 @@ if TYPE_CHECKING:
 
     from pivot.types import StageFunc
 
+# Directories excluded from tier 3 full scan
+_SCAN_EXCLUDE_DIRS = frozenset(
+    {
+        ".pivot",
+        ".git",
+        ".venv",
+        "venv",
+        "__pycache__",
+        "node_modules",
+        ".tox",
+        ".nox",
+        ".mypy_cache",
+        ".ruff_cache",
+    }
+)
+
 # Pipeline name pattern: alphanumeric, underscore, hyphen (like stage names)
 _PIPELINE_NAME_PATTERN = re.compile(r"^[a-zA-Z][a-zA-Z0-9_-]*$")
+
+
+def _find_pipeline_dir_for_stage(
+    info: registry.RegistryStageInfo,
+    project_root: pathlib.Path,
+) -> str | None:
+    """Find the pipeline directory for a stage, relative to project root.
+
+    Walks up from the stage function's source file to find the nearest directory
+    containing a pipeline config (pipeline.py or pivot.yaml). Falls back to
+    state_dir derivation if inspect fails.
+    """
+    # Try to find the pipeline dir from the function's source file
+    try:
+        source_file = pathlib.Path(inspect.getfile(info["func"])).resolve()
+        current = source_file.parent
+        project_root_resolved = project_root.resolve()
+        while current.is_relative_to(project_root_resolved):
+            if discovery.find_config_in_dir(current) is not None:
+                return str(current.relative_to(project_root_resolved))
+            if current == project_root_resolved:
+                break
+            current = current.parent
+    except (TypeError, OSError, ValueError):
+        pass
+
+    # Fall back to state_dir derivation
+    state_dir = info["state_dir"]
+    if state_dir is not None:
+        try:
+            return str(state_dir.parent.relative_to(project_root))
+        except ValueError:
+            pass
+
+    return None
+
+
+def _find_producer_in_pipeline(
+    dep_path: str,
+    pipeline: Pipeline,
+) -> registry.RegistryStageInfo | None:
+    """Find the stage in a pipeline that produces dep_path."""
+    for name in pipeline.list_stages():
+        info = pipeline.get(name)
+        if dep_path in info["outs_paths"]:
+            return info
+    return None
+
+
+def _load_pipeline(
+    path: pathlib.Path,
+    loaded_pipelines: dict[pathlib.Path, Pipeline | None],
+) -> Pipeline | None:
+    """Load a pipeline from path, using the shared cache."""
+    if path not in loaded_pipelines:
+        loaded_pipelines[path] = discovery.load_pipeline_from_path(path)
+    return loaded_pipelines[path]
+
+
+def _find_producer_via_traversal(
+    dep_path: str,
+    project_root: pathlib.Path,
+    loaded_pipelines: dict[pathlib.Path, Pipeline | None],
+) -> registry.RegistryStageInfo | None:
+    """Tier 1: Walk up from dep's directory looking for a producer."""
+    pipeline_files = discovery.find_pipeline_paths_for_dependency(
+        pathlib.Path(dep_path), project_root
+    )
+    for pipeline_file in pipeline_files:
+        pipeline = _load_pipeline(pipeline_file, loaded_pipelines)
+        if pipeline is None:
+            continue
+        producer = _find_producer_in_pipeline(dep_path, pipeline)
+        if producer is not None:
+            return producer
+    return None
+
+
+def _find_producer_via_index(
+    dep_path: str,
+    project_root: pathlib.Path,
+    loaded_pipelines: dict[pathlib.Path, Pipeline | None],
+) -> registry.RegistryStageInfo | None:
+    """Tier 2: Read cached output index hint, verify it's still valid."""
+    # Index keys are project-relative; dep_path is absolute
+    try:
+        rel_dep = str(pathlib.Path(dep_path).relative_to(project_root))
+    except ValueError:
+        return None
+    try:
+        pipeline_dir = (project_root / ".pivot" / "cache" / "outputs" / rel_dep).read_text().strip()
+    except OSError:
+        return None
+
+    # Find the pipeline config in the hinted directory
+    hint_path = project_root / pipeline_dir
+    config_path = discovery.find_config_in_dir(hint_path)
+    if config_path is None:
+        return None
+
+    pipeline = _load_pipeline(config_path, loaded_pipelines)
+    if pipeline is None:
+        return None
+
+    # Verify the pipeline still produces this dep
+    return _find_producer_in_pipeline(dep_path, pipeline)
+
+
+def _glob_all_pipelines(project_root: pathlib.Path) -> list[pathlib.Path]:
+    """Glob all pipeline.py and pivot.yaml/yml files in the project."""
+    results = list[pathlib.Path]()
+    target_names = (discovery.PIPELINE_PY_NAME, *discovery.PIVOT_YAML_NAMES)
+    for name in target_names:
+        for path in project_root.rglob(name):
+            if not any(part in _SCAN_EXCLUDE_DIRS for part in path.parts):
+                results.append(path)
+    return results
+
+
+def _find_producer_via_scan(
+    dep_path: str,
+    all_pipeline_paths: list[pathlib.Path],
+    loaded_pipelines: dict[pathlib.Path, Pipeline | None],
+) -> registry.RegistryStageInfo | None:
+    """Tier 3: Full scan of all pipeline files in the project."""
+    for pipeline_file in all_pipeline_paths:
+        pipeline = _load_pipeline(pipeline_file, loaded_pipelines)
+        if pipeline is None:
+            continue
+        producer = _find_producer_in_pipeline(dep_path, pipeline)
+        if producer is not None:
+            return producer
+    return None
 
 
 class Pipeline:
@@ -265,7 +414,9 @@ class Pipeline:
         """
         # Auto-resolve external dependencies before building
         self.resolve_external_dependencies()
-        return self._registry.build_dag(validate=validate)
+        dag = self._registry.build_dag(validate=validate)
+        self._write_output_index()
+        return dag
 
     def snapshot(self) -> dict[str, registry.RegistryStageInfo]:
         """Create a snapshot of current registry state for backup/restore."""
@@ -323,15 +474,12 @@ class Pipeline:
             )
 
     def resolve_external_dependencies(self) -> None:
-        """Resolve unresolved dependencies by searching for external pipelines.
+        """Resolve unresolved dependencies using three-tier discovery.
 
-        For each dependency that has no local producer:
-        1. Start from the dependency's directory and traverse up to project root
-        2. Load each pipeline found and search for a stage producing the artifact
-        3. Include that stage and add its dependencies to the work queue
-
-        This enables both parent and sibling pipeline dependencies to be resolved
-        automatically. Dependencies that exist on disk are treated as external inputs.
+        For each dependency that has no local producer, tries:
+        1. Traverse-up from the dependency's file path
+        2. Output index cache (``.pivot/cache/outputs/``)
+        3. Full scan of all pipeline files in the project
 
         Uses per-call caching (pipelines loaded once per resolve, discarded after).
         """
@@ -351,58 +499,85 @@ class Pipeline:
         if not work:
             return
 
-        # Per-call cache: avoid reloading same pipeline for each unresolved dep
+        # Per-call caches (fresh every call — safe for watch mode)
         loaded_pipelines: dict[pathlib.Path, Pipeline | None] = {}
-
-        def get_pipeline(path: pathlib.Path) -> Pipeline | None:
-            if path not in loaded_pipelines:
-                loaded_pipelines[path] = discovery.load_pipeline_from_path(path)
-            return loaded_pipelines[path]
+        all_pipeline_paths: list[pathlib.Path] | None = None  # lazy, for tier 3
 
         # Process work queue iteratively
         while work:
             dep_path = work.pop()
 
-            # Skip if already resolved (by a stage we just added) or exists on disk
-            if dep_path in local_outputs or pathlib.Path(dep_path).exists():
+            # Skip if already resolved (by a stage we just added)
+            if dep_path in local_outputs:
                 continue
 
-            # Search for pipelines starting from the dependency's directory
-            pipeline_files = discovery.find_pipeline_paths_for_dependency(
-                pathlib.Path(dep_path), project_root
-            )
+            # Tier 1: traverse-up (existing behavior)
+            producer = _find_producer_via_traversal(dep_path, project_root, loaded_pipelines)
 
-            for pipeline_file in pipeline_files:
-                pipeline = get_pipeline(pipeline_file)
-                if pipeline is None:
+            # Tier 2: output index cache
+            if producer is None:
+                producer = _find_producer_via_index(dep_path, project_root, loaded_pipelines)
+
+            # Tier 3: full scan
+            if producer is None:
+                if all_pipeline_paths is None:
+                    all_pipeline_paths = _glob_all_pipelines(project_root)
+                producer = _find_producer_via_scan(dep_path, all_pipeline_paths, loaded_pipelines)
+
+            if producer is None:
+                continue
+
+            producer_name = producer["name"]
+
+            # Skip if already included (idempotency)
+            if producer_name in self._registry.list_stages():
+                continue
+
+            # Include the producer stage
+            stage_info = copy.deepcopy(producer)
+            self._registry.add_existing(stage_info)
+            local_outputs.update(stage_info["outs_paths"])
+
+            # Add producer's unresolved dependencies to work queue
+            work.update(dep for dep in stage_info["deps_paths"] if dep not in local_outputs)
+
+            logger.debug(f"Included stage '{producer_name}' via three-tier discovery")
+
+    def _write_output_index(self) -> None:
+        """Write output index cache for future tier 2 lookups.
+
+        For every stage, writes each output path to
+        ``.pivot/cache/outputs/{out_path}`` with the producing pipeline's
+        project-relative directory as content. Cache writes are never fatal.
+
+        The pipeline directory is derived from the stage function's source file
+        by walking up to find a directory containing a pipeline config file
+        (pipeline.py or pivot.yaml). This is more robust than using state_dir,
+        which can be shared when sub-pipelines use the same project root.
+        """
+        try:
+            project_root = project.get_project_root()
+        except Exception:
+            return
+
+        cache_dir = project_root / ".pivot" / "cache" / "outputs"
+        for stage_name in self.list_stages():
+            info = self.get(stage_name)
+            pipeline_dir = _find_pipeline_dir_for_stage(info, project_root)
+            if pipeline_dir is None:
+                continue
+            for out_path in info["outs_paths"]:
+                # Convert absolute out_path to project-relative for the index key
+                try:
+                    rel_path = str(pathlib.Path(out_path).relative_to(project_root))
+                except ValueError:
                     continue
-
-                # Find stage that produces this artifact
-                producer_name = next(
-                    (
-                        name
-                        for name in pipeline.list_stages()
-                        if dep_path in pipeline.get(name)["outs_paths"]
-                    ),
-                    None,
-                )
-                if producer_name is None:
-                    continue
-
-                # Skip if already included (idempotency)
-                if producer_name in self._registry.list_stages():
-                    break
-
-                # Include the producer stage
-                stage_info = copy.deepcopy(pipeline.get(producer_name))
-                self._registry.add_existing(stage_info)
-                local_outputs.update(stage_info["outs_paths"])
-
-                # Add producer's unresolved dependencies to work queue
-                work.update(dep for dep in stage_info["deps_paths"] if dep not in local_outputs)
-
-                logger.debug(f"Included stage '{producer_name}' from pipeline '{pipeline.name}'")
-                break
+                target = cache_dir / rel_path
+                try:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text(pipeline_dir)
+                except OSError:
+                    logger.debug(f"Failed to write output index for {out_path}")
 
     # Keep old name as alias for backwards compatibility
     resolve_from_parents = resolve_external_dependencies  # pyright: ignore[reportUnannotatedClassAttribute] - method alias

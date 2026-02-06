@@ -23,7 +23,7 @@ class DiscoveryError(Exception):
     """Error during pipeline discovery."""
 
 
-def _find_config_path_in_dir(directory: pathlib.Path) -> pathlib.Path | None:
+def find_config_in_dir(directory: pathlib.Path) -> pathlib.Path | None:
     """Find the pipeline config file in a directory.
 
     Returns the path to pivot.yaml/yml or pipeline.py if found.
@@ -84,11 +84,11 @@ def discover_pipeline(project_root: pathlib.Path | None = None) -> Pipeline | No
         # Check cwd first if it's within project root but not the root itself
         config_path: pathlib.Path | None = None
         if cwd != root_resolved and cwd.is_relative_to(root_resolved):
-            config_path = _find_config_path_in_dir(cwd)
+            config_path = find_config_in_dir(cwd)
 
         # Fall back to project root (use resolved path for consistency)
         if config_path is None:
-            config_path = _find_config_path_in_dir(root_resolved)
+            config_path = find_config_in_dir(root_resolved)
 
         if config_path is None:
             return None
@@ -180,7 +180,7 @@ def find_parent_pipeline_paths(
         raise DiscoveryError(f"Failed to resolve paths: {e}") from e
 
     while current.is_relative_to(stop_at_resolved):
-        config_path = _find_config_path_in_dir(current)
+        config_path = find_config_in_dir(current)
         if config_path:
             yield config_path
 
@@ -224,7 +224,7 @@ def find_pipeline_paths_for_dependency(
 
     # Traverse up to project root
     while current.is_relative_to(stop_at_resolved):
-        config_path = _find_config_path_in_dir(current)
+        config_path = find_config_in_dir(current)
         if config_path:
             yield config_path
 

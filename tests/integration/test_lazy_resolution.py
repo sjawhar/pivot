@@ -363,3 +363,330 @@ def test_build_dag_auto_resolves_external_dependencies(
     # Should have included producer automatically
     assert "producer" in consumer.list_stages()
     assert dag.has_edge("consumer", "producer")
+
+
+# =============================================================================
+# Three-Tier Discovery Tests
+# =============================================================================
+
+
+def test_tier2_output_index_hit(set_project_root: pathlib.Path) -> None:
+    """Tier 2: Output index cache should resolve deps without traversal.
+
+    When the output index points to the correct pipeline, resolution should
+    succeed via the cached hint without needing a full scan.
+    """
+    # Producer in a separate directory tree (not discoverable via traverse-up)
+    producer_dir = set_project_root / "eval_pipeline" / "difficulty"
+    producer_dir.mkdir(parents=True)
+    (producer_dir / "pipeline.py").write_text(
+        _make_producer_pipeline_code("difficulty", "compute", "data/difficulty/processed/task.yaml")
+    )
+
+    # Consumer in a different tree
+    consumer_dir = set_project_root / "reports"
+    consumer_dir.mkdir(parents=True)
+    (consumer_dir / "pipeline.py").write_text(
+        _make_consumer_pipeline_code(
+            "reports",
+            "report",
+            "../eval_pipeline/difficulty/data/difficulty/processed/task.yaml",
+            "report.txt",
+        )
+    )
+
+    # Pre-populate output index (simulates a previous build_dag)
+    index_path = (
+        set_project_root
+        / ".pivot"
+        / "cache"
+        / "outputs"
+        / "eval_pipeline"
+        / "difficulty"
+        / "data"
+        / "difficulty"
+        / "processed"
+        / "task.yaml"
+    )
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    index_path.write_text("eval_pipeline/difficulty")
+
+    consumer = discovery.load_pipeline_from_path(consumer_dir / "pipeline.py")
+    assert consumer is not None
+
+    dag = consumer.build_dag(validate=True)
+    assert "compute" in dag.nodes, "Tier 2 should resolve producer via index"
+    assert dag.has_edge("report", "compute")
+
+
+def test_tier2_stale_index_falls_through_to_tier3(set_project_root: pathlib.Path) -> None:
+    """Tier 2 stale: Index points to wrong pipeline, should fall through to tier 3.
+
+    When the index entry is stale (points to a pipeline that no longer produces
+    the dep), resolution should fall through to tier 3 (full scan) and find
+    the actual producer.
+    """
+    # Actual producer — outputs ../shared/output.csv relative to new_location/
+    # which resolves to <root>/shared/output.csv
+    producer_dir = set_project_root / "new_location"
+    producer_dir.mkdir(parents=True)
+    (producer_dir / "pipeline.py").write_text(
+        _make_producer_pipeline_code("new_loc", "produce", "../shared/output.csv")
+    )
+
+    # Stale pipeline that no longer produces shared/output.csv
+    stale_dir = set_project_root / "old_location"
+    stale_dir.mkdir(parents=True)
+    (stale_dir / "pipeline.py").write_text(
+        _make_producer_pipeline_code("old_loc", "old_produce", "old/output.csv")
+    )
+
+    # Consumer — depends on ../shared/output.csv relative to consumer/
+    # which also resolves to <root>/shared/output.csv
+    consumer_dir = set_project_root / "consumer"
+    consumer_dir.mkdir(parents=True)
+    (consumer_dir / "pipeline.py").write_text(
+        _make_consumer_pipeline_code("consumer", "consume", "../shared/output.csv", "result.csv")
+    )
+
+    # Stale index pointing to old_location
+    index_path = set_project_root / ".pivot" / "cache" / "outputs" / "shared" / "output.csv"
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    index_path.write_text("old_location")
+
+    consumer = discovery.load_pipeline_from_path(consumer_dir / "pipeline.py")
+    assert consumer is not None
+
+    dag = consumer.build_dag(validate=True)
+    assert "produce" in dag.nodes, "Tier 3 should find actual producer after stale tier 2"
+    assert dag.has_edge("consume", "produce")
+
+
+def test_tier3_cold_start_different_directory_tree(set_project_root: pathlib.Path) -> None:
+    """Tier 3 cold start: No index, producer in different tree, found via full scan.
+
+    This is the core motivation for three-tier discovery — code and data live
+    in different directory trees, so traverse-up can't find the producer.
+    """
+    # Producer pipeline — code in eval_pipeline/, outputs in data/
+    producer_dir = set_project_root / "eval_pipeline" / "difficulty"
+    producer_dir.mkdir(parents=True)
+    (producer_dir / "pipeline.py").write_text(
+        _make_producer_pipeline_code(
+            "difficulty", "compute_difficulty", "data/difficulty/processed/metrics.yaml"
+        )
+    )
+
+    # Consumer pipeline — code in reports/, depends on data/ output
+    consumer_dir = set_project_root / "reports" / "summary"
+    consumer_dir.mkdir(parents=True)
+    (consumer_dir / "pipeline.py").write_text(
+        _make_consumer_pipeline_code(
+            "summary",
+            "summarize",
+            "../../eval_pipeline/difficulty/data/difficulty/processed/metrics.yaml",
+            "summary.txt",
+        )
+    )
+
+    # No output index exists (cold start)
+    consumer = discovery.load_pipeline_from_path(consumer_dir / "pipeline.py")
+    assert consumer is not None
+
+    dag = consumer.build_dag(validate=True)
+    assert "compute_difficulty" in dag.nodes, "Tier 3 full scan should find cross-tree producer"
+    assert dag.has_edge("summarize", "compute_difficulty")
+
+
+def test_output_index_written_after_build_dag(set_project_root: pathlib.Path) -> None:
+    """Output index should be written after successful build_dag().
+
+    Verifies that .pivot/cache/outputs/ files are created with correct content
+    pointing to the producing pipeline's directory.
+    """
+    # Simple producer
+    (set_project_root / "pipeline.py").write_text(
+        _make_producer_pipeline_code("root", "produce", "data/output.txt")
+    )
+    child_dir = set_project_root / "child"
+    child_dir.mkdir()
+    (child_dir / "pipeline.py").write_text(
+        _make_consumer_pipeline_code("child", "consume", "../data/output.txt", "result.txt")
+    )
+
+    child = discovery.load_pipeline_from_path(child_dir / "pipeline.py")
+    assert child is not None
+    child.build_dag(validate=True)
+
+    # Check output index files
+    producer_index = set_project_root / ".pivot" / "cache" / "outputs" / "data" / "output.txt"
+    assert producer_index.exists(), "Output index should be written for producer"
+    assert producer_index.read_text() == ".", "Producer pipeline dir should be project root"
+
+    consumer_index = set_project_root / ".pivot" / "cache" / "outputs" / "child" / "result.txt"
+    assert consumer_index.exists(), "Output index should be written for consumer"
+    assert consumer_index.read_text() == "child", "Consumer pipeline dir should be 'child'"
+
+
+def _make_shared_root_pipeline_code(
+    name: str,
+    stage_name: str,
+    output_path: str,
+) -> str:
+    """Generate pipeline code that uses root=project.get_project_root() (shared root)."""
+    return f'''
+from typing import Annotated, TypedDict
+from pathlib import Path
+from pivot.pipeline import Pipeline
+from pivot import loaders, project
+from pivot.outputs import Out
+
+pipeline = Pipeline("{name}", root=project.get_project_root())
+
+class _Output(TypedDict):
+    data: Annotated[Path, Out("{output_path}", loaders.PathOnly())]
+
+def {stage_name}() -> _Output:
+    Path("{output_path}").parent.mkdir(parents=True, exist_ok=True)
+    Path("{output_path}").write_text("produced")
+    return _Output(data=Path("{output_path}"))
+
+pipeline.register({stage_name})
+'''
+
+
+def _make_shared_root_consumer_code(
+    name: str,
+    stage_name: str,
+    dep_path: str,
+    output_path: str,
+) -> str:
+    """Generate consumer pipeline code that uses root=project.get_project_root() (shared root)."""
+    return f'''
+from typing import Annotated, TypedDict
+from pathlib import Path
+from pivot.pipeline import Pipeline
+from pivot import loaders, project
+from pivot.outputs import Out, Dep
+
+pipeline = Pipeline("{name}", root=project.get_project_root())
+
+class _Output(TypedDict):
+    result: Annotated[Path, Out("{output_path}", loaders.PathOnly())]
+
+def {stage_name}(
+    data: Annotated[Path, Dep("{dep_path}", loaders.PathOnly())]
+) -> _Output:
+    return _Output(result=Path("{output_path}"))
+
+pipeline.register({stage_name})
+'''
+
+
+def test_output_index_shared_root_pipelines(set_project_root: pathlib.Path) -> None:
+    """Output index should distinguish pipelines sharing the same project root.
+
+    When sub-pipelines use root=project.get_project_root(), they all share
+    the same state_dir. The output index must still record the correct
+    pipeline directory (derived from the function's source file, not state_dir).
+    """
+    # Two sub-pipelines both using root=project.get_project_root()
+    sub_a = set_project_root / "sub_a"
+    sub_b = set_project_root / "sub_b"
+    sub_a.mkdir()
+    sub_b.mkdir()
+
+    # Producer in sub_a
+    (sub_a / "pipeline.py").write_text(
+        _make_shared_root_pipeline_code("sub_a", "produce", "data/output.txt")
+    )
+
+    # Consumer in sub_b depends on sub_a's output
+    (sub_b / "pipeline.py").write_text(
+        _make_shared_root_consumer_code("sub_b", "consume", "data/output.txt", "sub_b/result.txt")
+    )
+
+    consumer = discovery.load_pipeline_from_path(sub_b / "pipeline.py")
+    assert consumer is not None
+
+    dag = consumer.build_dag(validate=True)
+    assert "produce" in dag.nodes
+    assert dag.has_edge("consume", "produce")
+
+    # Check output index — producer should point to sub_a, NOT "."
+    producer_index = set_project_root / ".pivot" / "cache" / "outputs" / "data" / "output.txt"
+    assert producer_index.exists(), "Output index should be written for producer"
+    assert producer_index.read_text() == "sub_a", (
+        f"Producer pipeline dir should be 'sub_a', got '{producer_index.read_text()}'"
+    )
+
+    # Consumer should point to sub_b
+    consumer_index = set_project_root / ".pivot" / "cache" / "outputs" / "sub_b" / "result.txt"
+    assert consumer_index.exists(), "Output index should be written for consumer"
+    assert consumer_index.read_text() == "sub_b", (
+        f"Consumer pipeline dir should be 'sub_b', got '{consumer_index.read_text()}'"
+    )
+
+
+def test_watch_mode_safety_fresh_state_per_call(set_project_root: pathlib.Path) -> None:
+    """Watch mode: Each build_dag() call uses fresh per-call state.
+
+    Simulates watch-mode reload by building twice — both builds should succeed,
+    demonstrating per-call freshness of loaded_pipelines and all_pipeline_paths.
+    """
+    (set_project_root / "pipeline.py").write_text(
+        _make_producer_pipeline_code("root", "produce", "data/output.txt")
+    )
+    child_dir = set_project_root / "child"
+    child_dir.mkdir()
+    (child_dir / "pipeline.py").write_text(
+        _make_consumer_pipeline_code("child", "consume", "../data/output.txt", "result.txt")
+    )
+
+    # First build
+    child1 = discovery.load_pipeline_from_path(child_dir / "pipeline.py")
+    assert child1 is not None
+    dag1 = child1.build_dag(validate=True)
+    assert "produce" in dag1.nodes
+
+    # Second build (simulates watch-mode reload with fresh Pipeline)
+    child2 = discovery.load_pipeline_from_path(child_dir / "pipeline.py")
+    assert child2 is not None
+    dag2 = child2.build_dag(validate=True)
+    assert "produce" in dag2.nodes
+
+
+def test_dep_exists_on_disk_producer_still_found(set_project_root: pathlib.Path) -> None:
+    """Producer should be found even when dep file exists on disk.
+
+    The exists() check was previously skipping resolution when the output file
+    was already on disk. With three-tier discovery, we always try to find the
+    producer to ensure it's in the DAG for re-execution.
+    """
+    # Producer in separate tree
+    producer_dir = set_project_root / "pipelines" / "etl"
+    producer_dir.mkdir(parents=True)
+    (producer_dir / "pipeline.py").write_text(
+        _make_producer_pipeline_code("etl", "extract", "data/raw/input.csv")
+    )
+
+    # Consumer in different tree
+    consumer_dir = set_project_root / "pipelines" / "analysis"
+    consumer_dir.mkdir(parents=True)
+    (consumer_dir / "pipeline.py").write_text(
+        _make_consumer_pipeline_code(
+            "analysis", "analyze", "../etl/data/raw/input.csv", "results.csv"
+        )
+    )
+
+    # Create the output file on disk (simulates previous successful run)
+    output_file = producer_dir / "data" / "raw" / "input.csv"
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    output_file.write_text("existing,data\n1,2\n")
+
+    consumer = discovery.load_pipeline_from_path(consumer_dir / "pipeline.py")
+    assert consumer is not None
+
+    dag = consumer.build_dag(validate=True)
+    assert "extract" in dag.nodes, "Producer should be found even when output exists on disk"
+    assert dag.has_edge("analyze", "extract")

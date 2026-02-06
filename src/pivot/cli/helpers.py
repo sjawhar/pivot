@@ -58,6 +58,11 @@ def get_stage(name: str) -> RegistryStageInfo:
     return _get_pipeline().get(name)
 
 
+def resolve_external_dependencies() -> None:
+    """Resolve external dependencies on the Pipeline in context."""
+    _get_pipeline().resolve_external_dependencies()
+
+
 def get_all_stages() -> dict[str, RegistryStageInfo]:
     """Get all stages as a dict from Pipeline in context."""
     pipeline = _get_pipeline()
