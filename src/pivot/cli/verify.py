@@ -3,11 +3,11 @@ from __future__ import annotations
 import asyncio
 import json
 import pathlib
-from typing import TYPE_CHECKING, Literal, TypedDict
+from typing import TYPE_CHECKING, Literal, TypedDict, cast
 
 import click
 
-from pivot import config, exceptions, project
+from pivot import config, exceptions, path_utils, project
 from pivot import status as status_mod
 from pivot.cli import completion
 from pivot.cli import decorators as cli_decorators
@@ -70,14 +70,33 @@ def _get_stage_lock_hashes(
     Returns (output_hashes, dep_hashes) where each is {path: hash}.
 
     For both outputs and deps, includes manifest entry hashes for directories.
+    Non-cached outputs (e.g. Metric with cache=False) are excluded —
+    they are git-tracked, not in cache.
     """
     stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(state_dir))
     lock_data = stage_lock.read()
     if lock_data is None:
         return {}, {}
 
+    # Filter non-cached outputs — they're git-tracked, not in cache
+    stage_info = cli_helpers.get_stage(stage_name)
+    cached_paths = {
+        path_utils.preserve_trailing_slash(
+            str(out.path),
+            str(project.normalize_path(cast("str", out.path))),
+        )
+        for out in stage_info["outs"]
+        if out.cache
+    }
+    cached_output_hashes: dict[str, OutputHash] = {
+        path: h
+        for path, h in lock_data["output_hashes"].items()
+        if path_utils.preserve_trailing_slash(path, str(project.normalize_path(path)))
+        in cached_paths
+    }
+
     return (
-        _extract_file_hashes(lock_data["output_hashes"]),
+        _extract_file_hashes(cached_output_hashes),
         _extract_file_hashes(lock_data["dep_hashes"]),
     )
 

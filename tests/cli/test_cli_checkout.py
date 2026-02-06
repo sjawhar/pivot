@@ -5,6 +5,7 @@ import shutil
 from typing import TYPE_CHECKING, Annotated, TypedDict
 
 from conftest import isolated_pivot_dir
+from helpers import create_pipeline_py
 from pivot import cli, loaders, outputs
 from pivot.storage import cache, track
 
@@ -56,6 +57,27 @@ def _helper_stage_a(
     _ = input_file  # deps tracked but not loaded in this simple test
     pathlib.Path("a.txt").write_text("output a")
     return {"output": pathlib.Path("a.txt")}
+
+
+class _MixedOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
+    metrics: Annotated[dict[str, float], outputs.Metric("metrics.json")]
+
+
+_MIXED_OUTPUTS_CODE = """
+class _MixedOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
+    metrics: Annotated[dict[str, float], outputs.Metric("metrics.json")]
+"""
+
+
+def _helper_mixed(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _MixedOutputs:
+    _ = input_file
+    pathlib.Path("output.txt").write_text("cached output")
+    pathlib.Path("metrics.json").write_text('{"accuracy": 0.95}')
+    return {"output": pathlib.Path("output.txt"), "metrics": {"accuracy": 0.95}}
 
 
 # =============================================================================
@@ -264,8 +286,6 @@ def test_checkout_replaces_file_with_directory(
         assert result.exit_code == 0, f"Track failed: {result.output}"
 
         # Replace directory with a file (simulates accidental overwrite)
-        import shutil
-
         shutil.rmtree(data_dir)
         pathlib.Path("images").write_bytes(b"oops, this is a file now")
         assert pathlib.Path("images").is_file(), "images should be a file"
@@ -286,8 +306,6 @@ def test_checkout_replaces_file_with_directory(
 
 def test_checkout_stage_output(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
     """Checkout restores a stage output from cache using lock file hash."""
-    from helpers import create_pipeline_py
-
     with isolated_pivot_dir(runner, tmp_path):
         # Set up project without pivot.yaml (we'll use pipeline.py instead)
         pathlib.Path(".pivot/cache/files").mkdir(parents=True, exist_ok=True)
@@ -486,8 +504,6 @@ def test_checkout_uncached_output_suggests_run_or_pull(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
     """Uncached stage output suggests 'pivot run' or 'pivot pull'."""
-    from helpers import create_pipeline_py
-
     with isolated_pivot_dir(runner, tmp_path):
         # Set up project without pivot.yaml (we'll use pipeline.py instead)
         pathlib.Path(".pivot/cache/files").mkdir(parents=True, exist_ok=True)
@@ -681,3 +697,53 @@ def test_checkout_shows_aggregate_counts(
         assert "Restored 3 file(s)" in result.output
         # Individual "Restored: data1.txt" lines should NOT appear
         assert "Restored: data" not in result.output
+
+
+# =============================================================================
+# Non-Cached Output (Metric) Checkout Tests
+# =============================================================================
+
+
+def test_checkout_restores_only_cached_outputs_not_metrics(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """Checkout restores Out() outputs but skips Metric() outputs.
+
+    When a stage has both Out() and Metric() outputs, deleting both and running
+    `pivot checkout` should only restore the Out() (cached) output. The Metric()
+    output is not cached — it's git-tracked and not Pivot's responsibility.
+    """
+    with isolated_pivot_dir(runner, tmp_path):
+        pathlib.Path(".pivot/cache/files").mkdir(parents=True, exist_ok=True)
+        pathlib.Path("input.txt").write_text("data")
+
+        create_pipeline_py(
+            [_helper_mixed],
+            names={"_helper_mixed": "mixed"},
+            extra_code=_MIXED_OUTPUTS_CODE,
+        )
+
+        # Run to generate both outputs
+        run_result = runner.invoke(cli.cli, ["repro"])
+        assert run_result.exit_code == 0, f"Repro failed: {run_result.output}"
+        assert pathlib.Path("output.txt").exists(), "Out() output should exist after repro"
+        assert pathlib.Path("metrics.json").exists(), "Metric() output should exist after repro"
+
+        # Delete both output files
+        pathlib.Path("output.txt").unlink(missing_ok=True)
+        # metrics.json may be a regular file (not cached/symlinked)
+        pathlib.Path("metrics.json").unlink(missing_ok=True)
+        assert not pathlib.Path("output.txt").exists()
+        assert not pathlib.Path("metrics.json").exists()
+
+        # Checkout should restore only the cached output
+        result = runner.invoke(cli.cli, ["checkout"])
+
+        assert result.exit_code == 0, f"Checkout failed: {result.output}"
+        assert pathlib.Path("output.txt").exists(), (
+            "Cached Out() output should be restored by checkout"
+        )
+        assert pathlib.Path("output.txt").read_text() == "cached output"
+        assert not pathlib.Path("metrics.json").exists(), (
+            "Non-cached Metric() output should NOT be restored by checkout"
+        )

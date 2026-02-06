@@ -17,15 +17,16 @@ from pivot import exceptions, executor, loaders, outputs, project, registry, sta
 from pivot.executor import core as executor_core
 from pivot.executor import worker
 from pivot.storage import cache, lock, state
+from pivot.types import FileHash, LockData
 
 if TYPE_CHECKING:
     import multiprocessing as mp
-    from collections.abc import Callable, Generator
+    from collections.abc import Callable, Generator, Iterator
 
     from pytest_mock import MockerFixture
 
     from pivot.executor import WorkerStageInfo
-    from pivot.types import DirHash, DirManifestEntry, FileHash, OutputHash, OutputMessage
+    from pivot.types import DirHash, DirManifestEntry, OutputHash, OutputMessage
 
 
 class _PlainParams(stage_def.StageParams):
@@ -87,10 +88,28 @@ def _helper_identity(x: int) -> int:
     return x
 
 
+def _helper_noop_stage() -> None:
+    """No-op stage helper for tests that need a module-level function."""
+    return None
+
+
 def _helper_always_fail_takeover(sentinel: pathlib.Path, stale_pid: int | None) -> bool:
     """Helper that always fails lock takeover (for testing retry exhaustion)."""
     _ = sentinel, stale_pid  # Unused
     return False
+
+
+@contextlib.contextmanager
+def _chdir_and_reset_project_root(path: pathlib.Path) -> Iterator[None]:
+    """Temporarily chdir and reset cached project root."""
+    original_cwd = pathlib.Path.cwd()
+    os.chdir(path)
+    project._project_root_cache = None
+    try:
+        yield
+    finally:
+        os.chdir(original_cwd)
+        project._project_root_cache = None
 
 
 # =============================================================================
@@ -2572,3 +2591,373 @@ def test_prepare_worker_info_uses_default_state_dir_when_stage_has_none(
     )
 
     assert worker_info["state_dir"] == default_state_dir
+
+
+class _RunCacheMixedOutputResult(TypedDict):
+    """TypedDict for run cache test with mixed cached/non-cached outputs."""
+
+    output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
+    metrics: Annotated[dict[str, float], outputs.Metric("metrics.json")]
+
+
+def _run_cache_mixed_output_stage() -> _RunCacheMixedOutputResult:
+    """Stage producing both Out (cached) and Metric (non-cached) outputs."""
+    pathlib.Path("output.txt").write_text("cached output")
+    pathlib.Path("metrics.json").write_text('{"accuracy": 0.95}')
+    return _RunCacheMixedOutputResult(
+        output=pathlib.Path("output.txt"),
+        metrics={"accuracy": 0.95},
+    )
+
+
+# =============================================================================
+# Non-Cached Output (Metric) Tests
+# =============================================================================
+
+
+def test_save_outputs_to_cache_computes_real_hash_for_metric(tmp_path: pathlib.Path) -> None:
+    """_save_outputs_to_cache computes real hashes for Metric() outputs (cache=False).
+
+    Non-cached outputs like Metric should get a real FileHash recorded in the
+    lock file (for provenance), but the file should NOT be saved to the cache dir.
+    """
+    # Create the output file
+    output_file = tmp_path / "metrics.json"
+    output_file.write_text('{"accuracy": 0.95}')
+
+    # Create cache directory
+    cache_dir = tmp_path / "cache" / "files"
+    cache_dir.mkdir(parents=True)
+
+    metric_out = outputs.Metric("metrics.json")
+    checkout_modes = [cache.CheckoutMode.COPY]
+
+    # chdir so the relative path resolves
+    with _chdir_and_reset_project_root(tmp_path):
+        result = worker._save_outputs_to_cache([metric_out], cache_dir, checkout_modes)
+
+    # The hash should be a real FileHash, not None
+    output_hash = result["metrics.json"]
+    assert output_hash is not None, "Metric output should have a real hash, not None"
+    assert "hash" in output_hash, "Metric output should be a FileHash with 'hash' key"
+
+    # The file should NOT be in the cache directory (non-cached outputs stay in place)
+    cached_files = [f for f in cache_dir.rglob("*") if f.is_file()]
+    assert len(cached_files) == 0, "Non-cached output should not be saved to cache directory"
+
+    # The original file should still be in place (not replaced with symlink/hardlink)
+    assert output_file.exists(), "Original file should still exist"
+    assert output_file.read_text() == '{"accuracy": 0.95}'
+
+
+def test_save_outputs_to_cache_mixed_cached_and_noncached(tmp_path: pathlib.Path) -> None:
+    """_save_outputs_to_cache handles mix of cached (Out) and non-cached (Metric) outputs.
+
+    Out() outputs should be saved to cache with real hashes.
+    Metric() outputs should get real hashes but NOT be saved to cache.
+    """
+    # Create output files
+    (tmp_path / "output.txt").write_text("output data")
+    (tmp_path / "metrics.json").write_text('{"loss": 0.1}')
+
+    cache_dir = tmp_path / "cache" / "files"
+    cache_dir.mkdir(parents=True)
+
+    out = outputs.Out("output.txt", loader=loaders.PathOnly())
+    metric = outputs.Metric("metrics.json")
+    checkout_modes = [cache.CheckoutMode.COPY]
+
+    with _chdir_and_reset_project_root(tmp_path):
+        result = worker._save_outputs_to_cache([out, metric], cache_dir, checkout_modes)
+
+    # Both should have real hashes
+    assert result["output.txt"] is not None, "Cached output should have a hash"
+    assert "hash" in result["output.txt"]
+    assert result["metrics.json"] is not None, "Non-cached output should have a hash"
+    assert "hash" in result["metrics.json"]
+
+    # The cached output should be in the cache directory
+    cached_files = [f for f in cache_dir.rglob("*") if f.is_file()]
+    assert len(cached_files) > 0, "Cached output should be saved to cache directory"
+
+
+def test_restore_outputs_from_cache_skips_noncached_outputs(
+    tmp_path: pathlib.Path,
+) -> None:
+    """_restore_outputs_from_cache verifies non-cached outputs exist on disk.
+
+    Non-cached outputs (Metric) should be verified to exist but NOT restored
+    from cache. Cached outputs (Out) should be restored normally.
+    """
+    # Set up project structure so normalize_path works
+    (tmp_path / ".pivot").mkdir()
+
+    # Set up cache directory with a cached file
+    cache_dir = tmp_path / "cache" / "files"
+    cache_dir.mkdir(parents=True)
+
+    # Create the cached output file and save to cache
+    cached_file = tmp_path / "output.txt"
+    cached_file.write_text("cached output")
+    cached_hash = cache.save_to_cache(cached_file, cache_dir, checkout_mode=cache.CheckoutMode.COPY)
+    assert cached_hash is not None
+
+    # Create the non-cached (metric) file on disk
+    metric_file = tmp_path / "metrics.json"
+    metric_file.write_text('{"accuracy": 0.95}')
+
+    out = outputs.Out("output.txt", loader=loaders.PathOnly())
+    metric = outputs.Metric("metrics.json")
+
+    # Build lock data with normalized paths
+    with _chdir_and_reset_project_root(tmp_path):
+        norm_output = str(project.normalize_path("output.txt"))
+        norm_metric = str(project.normalize_path("metrics.json"))
+
+        lock_data: LockData = {
+            "code_manifest": {},
+            "params": {},
+            "dep_hashes": {},
+            "output_hashes": {
+                norm_output: cached_hash,
+                norm_metric: FileHash(hash="somehash"),
+            },
+            "dep_generations": {},
+        }
+
+        checkout_modes = [cache.CheckoutMode.COPY]
+
+        # Delete the cached file (simulating it being missing)
+        cached_file.unlink()
+        assert not cached_file.exists()
+
+        # Restore should succeed — cached output restored from cache,
+        # non-cached output verified as existing on disk
+        restored = worker._restore_outputs_from_cache(
+            [out, metric], lock_data, cache_dir, checkout_modes
+        )
+        assert restored, (
+            "Should succeed when cached output is in cache and non-cached exists on disk"
+        )
+        assert cached_file.exists(), "Cached output should be restored from cache"
+
+
+def test_restore_outputs_from_cache_fails_when_noncached_missing(
+    tmp_path: pathlib.Path,
+) -> None:
+    """_restore_outputs_from_cache fails when non-cached output is missing from disk.
+
+    If a Metric file doesn't exist on disk, we can't restore it from cache
+    (it's not cached), so the skip should fail and the stage should re-run.
+    """
+    # Set up project structure so normalize_path works
+    (tmp_path / ".pivot").mkdir()
+
+    cache_dir = tmp_path / "cache" / "files"
+    cache_dir.mkdir(parents=True)
+
+    # Only the non-cached output — and it's missing from disk
+    metric = outputs.Metric("metrics.json")
+
+    with _chdir_and_reset_project_root(tmp_path):
+        norm_metric = str(project.normalize_path("metrics.json"))
+
+        lock_data: LockData = {
+            "code_manifest": {},
+            "params": {},
+            "dep_hashes": {},
+            "output_hashes": {
+                norm_metric: FileHash(hash="somehash"),
+            },
+            "dep_generations": {},
+        }
+
+        checkout_modes = [cache.CheckoutMode.COPY]
+
+        # metrics.json does NOT exist on disk
+        assert not (tmp_path / "metrics.json").exists()
+
+        restored = worker._restore_outputs_from_cache(
+            [metric], lock_data, cache_dir, checkout_modes
+        )
+        assert not restored, "Should fail when non-cached output is missing from disk"
+
+
+def test_hash_output_computes_correct_hash_for_file(tmp_path: pathlib.Path) -> None:
+    """_hash_output returns a FileHash matching cache.hash_file for regular files.
+
+    Verifies the hash is deterministic and consistent with the canonical hash function,
+    preventing regressions where _hash_output diverges from save_to_cache hashing.
+    """
+    test_file = tmp_path / "data.txt"
+    test_file.write_text("hash me")
+
+    result = worker._hash_output(test_file)
+
+    expected_hash = cache.hash_file(test_file)
+    assert result == FileHash(hash=expected_hash), (
+        "FileHash from _hash_output should match cache.hash_file"
+    )
+    assert "manifest" not in result, "File hash should not contain manifest key"
+
+
+def test_hash_output_computes_correct_hash_for_directory(tmp_path: pathlib.Path) -> None:
+    """_hash_output returns a DirHash with manifest for directories.
+
+    The directory branch of _hash_output is exercised when non-cached DirectoryOut
+    outputs need hashing in _try_skip_via_run_cache. Verifies the result matches
+    cache.hash_directory.
+    """
+    dir_path = tmp_path / "results"
+    dir_path.mkdir()
+    (dir_path / "a.json").write_text('{"value": 1}')
+    (dir_path / "b.json").write_text('{"value": 2}')
+
+    result = worker._hash_output(dir_path)
+
+    expected_hash, expected_manifest = cache.hash_directory(dir_path)
+    assert "hash" in result, "DirHash should have a hash key"
+    assert "manifest" in result, "DirHash should have a manifest key"
+    assert result["hash"] == expected_hash, "Directory hash should match cache.hash_directory"
+    assert result["manifest"] == expected_manifest, (
+        "Directory manifest should match cache.hash_directory"
+    )
+
+
+def test_build_deferred_writes_excludes_noncached_from_run_cache(
+    tmp_path: pathlib.Path,
+) -> None:
+    """_build_deferred_writes excludes non-cached outputs from run cache entries.
+
+    When a stage has both Out() (cached) and Metric() (non-cached) outputs,
+    only the cached output should appear in the run cache entry. Non-cached
+    outputs in the run cache would cause run cache skip to fail validation
+    (expected_cached_paths mismatch in _try_skip_via_run_cache).
+    """
+    state_dir = tmp_path / ".pivot"
+    state_dir.mkdir()
+    state_db = state.StateDB(state_dir / "state.db")
+
+    out = outputs.Out("output.txt", loader=loaders.PathOnly())
+    metric = outputs.Metric("metrics.json")
+
+    stage_info: WorkerStageInfo = _make_stage_info(
+        _helper_noop_stage,  # func not called, just need the structure
+        tmp_path,
+        outs=[out, metric],
+    )
+
+    output_hashes: dict[str, OutputHash] = {
+        "output.txt": FileHash(hash="abc123"),
+        "metrics.json": FileHash(hash="def456"),
+    }
+
+    result = worker._build_deferred_writes(stage_info, "input_hash_1", output_hashes, state_db)
+
+    # Run cache entry should exist (there is a cached output)
+    assert "run_cache_entry" in result, "Should have run cache entry for cached output"
+    assert "run_cache_input_hash" in result
+
+    # Only the cached output should be in run cache entry
+    entry_paths = [oh["path"] for oh in result["run_cache_entry"]["output_hashes"]]
+    assert "output.txt" in entry_paths, "Cached output should be in run cache"
+    assert "metrics.json" not in entry_paths, "Non-cached Metric output should NOT be in run cache"
+
+    state_db.close()
+
+
+def test_build_deferred_writes_no_run_cache_when_all_noncached(
+    tmp_path: pathlib.Path,
+) -> None:
+    """_build_deferred_writes omits run cache entry when all outputs are non-cached.
+
+    If a stage only has Metric() outputs (all cache=False), no run cache entry
+    should be written since there's nothing to restore from cache on skip.
+    """
+    state_dir = tmp_path / ".pivot"
+    state_dir.mkdir()
+    state_db = state.StateDB(state_dir / "state.db")
+
+    metric1 = outputs.Metric("metrics1.json")
+    metric2 = outputs.Metric("metrics2.json")
+
+    stage_info: WorkerStageInfo = _make_stage_info(
+        _helper_noop_stage,
+        tmp_path,
+        outs=[metric1, metric2],
+    )
+
+    output_hashes: dict[str, OutputHash] = {
+        "metrics1.json": FileHash(hash="aaa111"),
+        "metrics2.json": FileHash(hash="bbb222"),
+    }
+
+    result = worker._build_deferred_writes(stage_info, "input_hash_2", output_hashes, state_db)
+
+    assert "run_cache_entry" not in result, (
+        "Should not have run cache entry when all outputs are non-cached"
+    )
+    assert "run_cache_input_hash" not in result
+
+    state_db.close()
+
+
+def test_run_cache_skip_with_mixed_cached_and_noncached_outputs(
+    worker_env: pathlib.Path, output_queue: mp.Queue[OutputMessage], tmp_path: pathlib.Path
+) -> None:
+    """Run cache skip computes real hashes for non-cached outputs.
+
+    When a stage has both Out() and Metric() outputs and is skipped via run cache,
+    the cached output should be restored from cache and the non-cached output
+    should get a real hash computed (not None) for the lockfile.
+    """
+    out_specs = stage_def.get_output_specs_from_return(_run_cache_mixed_output_stage, "test_stage")
+    out = outputs.Out(str(tmp_path / "output.txt"), loaders.PathOnly())
+    metric = outputs.Metric(str(tmp_path / "metrics.json"))
+
+    stage_info = _make_stage_info(
+        _run_cache_mixed_output_stage,
+        tmp_path,
+        fingerprint={"self:_run_cache_mixed_output_stage": "fp_mixed"},
+        out_specs=out_specs,
+        outs=[out, metric],
+    )
+
+    # First run — produces both outputs, writes run cache entry
+    result1 = executor.execute_stage("test_mixed_rc", stage_info, worker_env, output_queue)
+    assert result1["status"] == "ran"
+    assert (tmp_path / "output.txt").exists()
+    assert (tmp_path / "metrics.json").exists()
+
+    # Apply deferred writes (run cache entry) to state DB
+    deferred = result1.get("deferred_writes", {})
+    if "run_cache_input_hash" in deferred and "run_cache_entry" in deferred:
+        with state.StateDB(tmp_path / ".pivot" / "state.db") as state_db:
+            state_db.write_run_cache(
+                "test_mixed_rc", deferred["run_cache_input_hash"], deferred["run_cache_entry"]
+            )
+
+    # Delete cached output and lock file to force run cache path
+    (tmp_path / "output.txt").unlink()
+    lock_file = tmp_path / ".pivot" / "stages" / "test_mixed_rc.lock"
+    if lock_file.exists():
+        lock_file.unlink()
+
+    # Metric file must remain on disk (git-tracked, not cached)
+    assert (tmp_path / "metrics.json").exists()
+
+    # Second run — should skip via run cache
+    result2 = executor.execute_stage("test_mixed_rc", stage_info, worker_env, output_queue)
+    assert result2["status"] == "skipped", f"Expected skipped, got {result2}"
+    assert "run cache" in result2["reason"]
+
+    # Cached output should be restored
+    assert (tmp_path / "output.txt").exists()
+
+    # Output hashes in lock data should have real hashes for BOTH outputs
+    lock_obj = lock.StageLock("test_mixed_rc", lock.get_stages_dir(tmp_path / ".pivot"))
+    lock_data = lock_obj.read()
+    assert lock_data is not None
+    for out_path, out_hash in lock_data["output_hashes"].items():
+        assert out_hash is not None, f"Output {out_path} should have a real hash, not None"
+        assert "hash" in out_hash, f"Output {out_path} should have a 'hash' key"

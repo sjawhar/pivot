@@ -538,13 +538,16 @@ def _restore_outputs_from_cache(
     *,
     state_db: state.StateDB | None = None,
 ) -> bool:
-    """Restore missing outputs from cache for lock file skip detection.
+    """Restore missing outputs from cache for lock file skip detection."""
+    # Non-cached outputs (Metric) are git-tracked — just verify they exist
+    for out in stage_outs:
+        if not out.cache and not pathlib.Path(cast("str", out.path)).exists():
+            return False
 
-    Returns True if all outputs exist or were restored.
-    """
-    output_path_strings = [cast("str", out.path) for out in stage_outs]
+    # Only restore cached outputs from cache
+    cached_path_strings = [cast("str", out.path) for out in stage_outs if out.cache]
     return _restore_outputs(
-        output_path_strings,
+        cached_path_strings,
         lock_data["output_hashes"],
         files_cache_dir,
         checkout_modes,
@@ -642,7 +645,7 @@ def _save_outputs_to_cache(
                 path, files_cache_dir, checkout_modes=checkout_modes
             )
         else:
-            output_hashes[str(out.path)] = None
+            output_hashes[str(out.path)] = _hash_output(path)
 
     metrics.end("worker.save_outputs_to_cache", _t)
     return output_hashes
@@ -658,6 +661,15 @@ def _verify_outputs_exist(stage_outs: list[outputs.BaseOut]) -> None:
         path = pathlib.Path(cast("str", out.path))
         if not path.exists():
             raise exceptions.OutputMissingError(f"Stage did not produce output: {out.path}")
+
+
+def _hash_output(path: pathlib.Path, state_db: state.StateDB | None = None) -> HashInfo:
+    """Compute output hash without saving to cache."""
+    if path.is_dir():
+        tree_hash, manifest = cache.hash_directory(path, state_db)
+        return DirHash(hash=tree_hash, manifest=manifest)
+    file_hash = cache.hash_file(path, state_db)
+    return FileHash(hash=file_hash)
 
 
 def _set_deterministic_seeds() -> None:
@@ -1022,11 +1034,13 @@ def _build_deferred_writes(
     if gen_record:
         result["dep_generations"] = gen_record
 
-    # Run cache entry (only if there are cached outputs)
+    # Run cache entry — only cached outputs belong in run cache
+    cached_paths = {cast("str", out.path) for out in stage_info["outs"] if out.cache}
     output_entries = [
         entry
         for path, oh in output_hashes.items()
-        if (entry := run_history.output_hash_to_entry(path, oh)) is not None
+        if path in cached_paths
+        and (entry := run_history.output_hash_to_entry(path, oh)) is not None
     ]
     if output_entries:
         result["run_cache_input_hash"] = input_hash
@@ -1075,8 +1089,8 @@ def _try_skip_via_run_cache(
     # Validate cached outputs match expected: run cache entry should only contain
     # outputs that have cache=True. The input hash includes cache flags, so a mismatch
     # here indicates corruption or a bug.
-    expected_cached_paths = {str(out.path) for out in stage_outs if out.cache}
-    if set(output_hash_map.keys()) != expected_cached_paths:
+    cached_path_strings = [cast("str", out.path) for out in stage_outs if out.cache]
+    if set(output_hash_map.keys()) != set(cached_path_strings):
         return None
 
     # Non-cached outputs (like Metrics) must exist on disk - we can't restore them from cache
@@ -1086,11 +1100,8 @@ def _try_skip_via_run_cache(
             if not path.exists():
                 return None  # Must re-run to recreate non-cached output
 
-    # Only restore cached outputs (run cache doesn't store non-cached outputs)
-    cached_output_path_strings = [cast("str", out.path) for out in stage_outs if out.cache]
-
     restored = _restore_outputs(
-        cached_output_path_strings,
+        cached_path_strings,
         cast(
             "dict[str, OutputHash]", output_hash_map
         ),  # FileHash | DirHash is subset of OutputHash
@@ -1105,11 +1116,11 @@ def _try_skip_via_run_cache(
     # Build output_hashes for lock file update, including non-cached outputs
     output_hashes: dict[str, OutputHash] = {}
     for out in stage_outs:
-        out_path = str(out.path)
+        out_path = cast("str", out.path)
         if out.cache:
             output_hashes[out_path] = output_hash_map[out_path]
         else:
-            output_hashes[out_path] = None
+            output_hashes[out_path] = _hash_output(pathlib.Path(out_path), state_db)
 
     return RunCacheSkipResult(
         result=_make_result(StageStatus.SKIPPED, "unchanged (run cache)", []),
