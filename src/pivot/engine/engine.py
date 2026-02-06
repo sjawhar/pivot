@@ -272,8 +272,14 @@ class Engine:
             # The dispatcher sets _dispatch_complete when it exits (after the
             # async for loop ends due to channel closure).
             # Use a timeout to prevent infinite hang if dispatcher gets stuck.
+            timed_out = True
             with anyio.move_on_after(5.0):
                 await self._dispatch_complete.wait()
+                timed_out = False
+            if timed_out:
+                _logger.warning(
+                    "Dispatcher drain timed out after 5s — events may have been dropped"
+                )
 
             # Cancel remaining tasks (sources and possibly stuck dispatcher)
             tg.cancel_scope.cancel()

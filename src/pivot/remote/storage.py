@@ -8,8 +8,6 @@ import shutil
 import tempfile
 from typing import TYPE_CHECKING, Any, Protocol, TypedDict
 
-import aioboto3
-
 from pivot import config, exceptions, metrics
 from pivot.remote import config as remote_config
 from pivot.types import TransferResult
@@ -18,7 +16,10 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable, Sequence
     from pathlib import Path
 
+    import aioboto3
     from aiobotocore.config import AioConfig
+    from botocore.exceptions import ClientError
+    from types_aiobotocore_s3 import S3Client
 
 logger = logging.getLogger(__name__)
 
@@ -101,7 +102,7 @@ class _MultipartPart(TypedDict):
     ETag: str
 
 
-def _get_s3_config() -> Any:
+def _get_s3_config() -> AioConfig:
     """Get standard S3 client config with retries and timeouts (cached)."""
     global _cached_s3_config
     if _cached_s3_config is None:
@@ -125,7 +126,7 @@ def _validate_hash(cache_hash: str) -> None:
         raise exceptions.RemoteError(f"Invalid cache hash '{cache_hash}': must be hexadecimal")
 
 
-def _is_not_found_error(e: Any) -> bool:
+def _is_not_found_error(e: ClientError) -> bool:
     """Check if botocore ClientError is a 404 Not Found."""
     return e.response.get("Error", {}).get("Code") == "404"
 
@@ -173,7 +174,7 @@ async def _stream_download_to_fd(
 
 
 async def _atomic_download(
-    s3: Any,
+    s3: S3Client,
     bucket: str,
     key: str,
     local_path: Path,
@@ -205,7 +206,7 @@ async def _atomic_download(
 
 
 async def _stream_upload(
-    s3: Any,
+    s3: S3Client,
     bucket: str,
     key: str,
     local_path: Path,
@@ -245,7 +246,7 @@ async def _stream_upload(
             Bucket=bucket,
             Key=key,
             UploadId=upload_id,
-            MultipartUpload={"Parts": parts},
+            MultipartUpload={"Parts": parts},  # pyright: ignore[reportArgumentType] - _MultipartPart is compatible with CompletedPartTypeDef
         )
     except Exception:
         try:
@@ -256,16 +257,31 @@ async def _stream_upload(
 
 
 class S3Remote:
-    """Async S3 remote storage backend."""
+    """Async S3 remote storage backend.
+
+    Creates one aioboto3 session at init time and reuses it across all methods.
+    Each method creates its own S3 client via ``async with self._session.client()``,
+    which is lightweight (reuses the session's credential chain) but gets a fresh
+    connection pool. Batch methods share a single client across concurrent tasks.
+    """
 
     _bucket: str
     _prefix: str
+    _session: aioboto3.Session
 
     def __init__(self, url: str) -> None:
         """Initialize S3 remote from s3://bucket/prefix URL."""
+        try:
+            import aioboto3
+        except ModuleNotFoundError:
+            raise exceptions.RemoteError(
+                "aioboto3 is required for S3 remote storage. Install with: pip install pivot[s3]"
+            ) from None
+
         bucket, prefix = remote_config.validate_s3_url(url)
         self._bucket = bucket
         self._prefix = prefix.rstrip("/") + "/" if prefix else ""
+        self._session = aioboto3.Session()
 
     @property
     def bucket(self) -> str:
@@ -280,8 +296,7 @@ class S3Remote:
         from botocore import exceptions as botocore_exc
 
         _validate_hash(cache_hash)
-        session = aioboto3.Session()
-        async with session.client("s3", config=_get_s3_config()) as s3:
+        async with self._session.client("s3", config=_get_s3_config()) as s3:
             try:
                 await s3.head_object(
                     Bucket=self._bucket,
@@ -309,21 +324,21 @@ class S3Remote:
         for h in hashes:
             _validate_hash(h)
 
-        session = aioboto3.Session()
+        try:
+            # Single S3 client for all operations - reuses connection pool
+            async with self._session.client("s3", config=_get_s3_config()) as s3:
+                # For large batches, LIST by prefix is more efficient than HEAD per hash
+                if len(hashes) >= BULK_EXISTS_LIST_THRESHOLD:
+                    output = await self._bulk_exists_via_list(s3, hashes, concurrency)
+                else:
+                    output = await self._bulk_exists_via_head(s3, hashes, concurrency)
 
-        # Single S3 client for all operations - reuses connection pool
-        async with session.client("s3", config=_get_s3_config()) as s3:
-            # For large batches, LIST by prefix is more efficient than HEAD per hash
-            if len(hashes) >= BULK_EXISTS_LIST_THRESHOLD:
-                output = await self._bulk_exists_via_list(s3, hashes, concurrency)
-            else:
-                output = await self._bulk_exists_via_head(s3, hashes, concurrency)
-
-        metrics.end("storage.bulk_exists", _t)
-        return output
+            return output
+        finally:
+            metrics.end("storage.bulk_exists", _t)
 
     async def _bulk_exists_via_head(
-        self, s3: Any, hashes: list[str], concurrency: int
+        self, s3: S3Client, hashes: list[str], concurrency: int
     ) -> dict[str, bool]:
         """Check existence using parallel HEAD requests (better for small batches)."""
         from botocore import exceptions as botocore_exc
@@ -357,7 +372,7 @@ class S3Remote:
         return output
 
     async def _bulk_exists_via_list(
-        self, s3: Any, hashes: list[str], concurrency: int
+        self, s3: S3Client, hashes: list[str], concurrency: int
     ) -> dict[str, bool]:
         """Check existence using LIST by prefix (better for large batches).
 
@@ -410,11 +425,9 @@ class S3Remote:
 
     async def iter_hashes(self) -> AsyncIterator[str]:
         """Iterate over all cache hashes on remote (memory-efficient streaming)."""
-
-        session = aioboto3.Session()
         prefix = f"{self._prefix}files/"
 
-        async with session.client("s3", config=_get_s3_config()) as s3:
+        async with self._session.client("s3", config=_get_s3_config()) as s3:
             paginator = s3.get_paginator("list_objects_v2")
             async for page in paginator.paginate(Bucket=self._bucket, Prefix=prefix):
                 for obj in page.get("Contents", []):
@@ -436,10 +449,8 @@ class S3Remote:
 
     async def upload_file(self, local_path: Path, cache_hash: str) -> None:
         """Upload a single file to remote with streaming for large files."""
-
         _validate_hash(cache_hash)
-        session = aioboto3.Session()
-        async with session.client("s3", config=_get_s3_config()) as s3:
+        async with self._session.client("s3", config=_get_s3_config()) as s3:
             await _stream_upload(
                 s3, self._bucket, _hash_to_key(self._prefix, cache_hash), local_path
             )
@@ -448,10 +459,8 @@ class S3Remote:
         self, cache_hash: str, local_path: Path, *, readonly: bool = False
     ) -> None:
         """Download a single file from remote (atomic write via temp file, streamed)."""
-
         _validate_hash(cache_hash)
-        session = aioboto3.Session()
-        async with session.client("s3", config=_get_s3_config()) as s3:
+        async with self._session.client("s3", config=_get_s3_config()) as s3:
             await _atomic_download(
                 s3,
                 self._bucket,
@@ -467,7 +476,6 @@ class S3Remote:
         callback: Callable[[int], None] | None = None,
     ) -> list[TransferResult]:
         """Upload multiple files in parallel with streaming for large files."""
-
         _t = metrics.start()
         if not items:
             metrics.end("storage.upload_batch", _t)
@@ -476,31 +484,32 @@ class S3Remote:
         for _, h in items:
             _validate_hash(h)
 
-        semaphore = asyncio.Semaphore(concurrency)
-        session = aioboto3.Session()
-        completed = 0
+        try:
+            semaphore = asyncio.Semaphore(concurrency)
+            completed = 0
 
-        # Single S3 client for all uploads - reuses connection pool
-        async with session.client("s3", config=_get_s3_config()) as s3:
+            # Single S3 client for all uploads - reuses connection pool
+            async with self._session.client("s3", config=_get_s3_config()) as s3:
 
-            async def upload_one(local_path: Path, hash_: str) -> TransferResult:
-                nonlocal completed
-                async with semaphore:
-                    try:
-                        await _stream_upload(
-                            s3, self._bucket, _hash_to_key(self._prefix, hash_), local_path
-                        )
-                        completed += 1
-                        if callback:
-                            callback(completed)
-                        return TransferResult(hash=hash_, success=True)
-                    except Exception as e:
-                        return TransferResult(hash=hash_, success=False, error=str(e))
+                async def upload_one(local_path: Path, hash_: str) -> TransferResult:
+                    nonlocal completed
+                    async with semaphore:
+                        try:
+                            await _stream_upload(
+                                s3, self._bucket, _hash_to_key(self._prefix, hash_), local_path
+                            )
+                            completed += 1
+                            if callback:
+                                callback(completed)
+                            return TransferResult(hash=hash_, success=True)
+                        except Exception as e:
+                            return TransferResult(hash=hash_, success=False, error=str(e))
 
-            results = await asyncio.gather(*[upload_one(p, h) for p, h in items])
+                results = await asyncio.gather(*[upload_one(p, h) for p, h in items])
 
-        metrics.end("storage.upload_batch", _t)
-        return results
+            return results
+        finally:
+            metrics.end("storage.upload_batch", _t)
 
     async def download_batch(
         self,
@@ -515,7 +524,6 @@ class S3Remote:
         Args:
             readonly: If True, set file permissions to 0o444 (for cache files).
         """
-
         _t = metrics.start()
         if not items:
             metrics.end("storage.download_batch", _t)
@@ -524,32 +532,33 @@ class S3Remote:
         for h, _ in items:
             _validate_hash(h)
 
-        semaphore = asyncio.Semaphore(concurrency)
-        session = aioboto3.Session()
-        completed = 0
+        try:
+            semaphore = asyncio.Semaphore(concurrency)
+            completed = 0
 
-        # Single S3 client for all downloads - reuses connection pool
-        async with session.client("s3", config=_get_s3_config()) as s3:
+            # Single S3 client for all downloads - reuses connection pool
+            async with self._session.client("s3", config=_get_s3_config()) as s3:
 
-            async def download_one(hash_: str, local_path: Path) -> TransferResult:
-                nonlocal completed
-                async with semaphore:
-                    try:
-                        await _atomic_download(
-                            s3,
-                            self._bucket,
-                            _hash_to_key(self._prefix, hash_),
-                            local_path,
-                            readonly=readonly,
-                        )
-                        completed += 1
-                        if callback:
-                            callback(completed)
-                        return TransferResult(hash=hash_, success=True)
-                    except Exception as e:
-                        return TransferResult(hash=hash_, success=False, error=str(e))
+                async def download_one(hash_: str, local_path: Path) -> TransferResult:
+                    nonlocal completed
+                    async with semaphore:
+                        try:
+                            await _atomic_download(
+                                s3,
+                                self._bucket,
+                                _hash_to_key(self._prefix, hash_),
+                                local_path,
+                                readonly=readonly,
+                            )
+                            completed += 1
+                            if callback:
+                                callback(completed)
+                            return TransferResult(hash=hash_, success=True)
+                        except Exception as e:
+                            return TransferResult(hash=hash_, success=False, error=str(e))
 
-            results = await asyncio.gather(*[download_one(h, p) for h, p in items])
+                results = await asyncio.gather(*[download_one(h, p) for h, p in items])
 
-        metrics.end("storage.download_batch", _t)
-        return results
+            return results
+        finally:
+            metrics.end("storage.download_batch", _t)
