@@ -690,3 +690,260 @@ def test_dep_exists_on_disk_producer_still_found(set_project_root: pathlib.Path)
     dag = consumer.build_dag(validate=True)
     assert "extract" in dag.nodes, "Producer should be found even when output exists on disk"
     assert dag.has_edge("analyze", "extract")
+
+
+def test_resolve_external_dependencies_when_output_exists_on_disk(
+    set_project_root: pathlib.Path,
+) -> None:
+    """Should resolve sibling dependencies even when output files already exist on disk.
+
+    Regression test: if the producer's output file already exists (from a previous run),
+    resolve_external_dependencies() must still find and include the producing stage.
+    Without this, re-running a consumer pipeline skips the producer entirely.
+    """
+    model_reports = set_project_root / "model_reports"
+    sibling_a = model_reports / "sibling_a"
+    sibling_b = model_reports / "sibling_b"
+    sibling_a.mkdir(parents=True)
+    sibling_b.mkdir(parents=True)
+
+    # Producer in sibling_b outputs data/output.txt (relative to sibling_b)
+    (sibling_b / "pipeline.py").write_text(
+        _make_producer_pipeline_code("sibling_b", "producer", "data/output.txt")
+    )
+
+    # Consumer in sibling_a depends on sibling_b's output
+    (sibling_a / "pipeline.py").write_text(
+        _make_consumer_pipeline_code(
+            "sibling_a", "consumer", "../sibling_b/data/output.txt", "result.txt"
+        )
+    )
+
+    # Simulate a previous run: create the output file on disk
+    output_dir = sibling_b / "data"
+    output_dir.mkdir(parents=True)
+    (output_dir / "output.txt").write_text("previously produced data")
+
+    # Load consumer pipeline and resolve
+    consumer = discovery.load_pipeline_from_path(sibling_a / "pipeline.py")
+    assert consumer is not None, "Pipeline should load successfully"
+
+    consumer.resolve_external_dependencies()
+
+    # Should still include producer from sibling, even though the file exists
+    assert "producer" in consumer.list_stages(), (
+        "Producer stage should be included even when its output file exists on disk"
+    )
+    assert "consumer" in consumer.list_stages(), "Consumer stage should be in pipeline"
+
+    dag = consumer.build_dag(validate=True)
+    assert dag.has_edge("consumer", "producer"), "DAG should have edge from consumer to producer"
+
+
+def test_resolution_skipped_after_first_build_dag(
+    set_project_root: pathlib.Path,
+) -> None:
+    """Second build_dag() call should return cached DAG without rebuilding.
+
+    The _external_deps_resolved flag avoids redundant O(n) stage iteration
+    and filesystem traversal on repeated build_dag() calls.
+    """
+    # Simple parent-child setup
+    (set_project_root / "pipeline.py").write_text(
+        _make_producer_pipeline_code("parent", "producer", "data/output.txt")
+    )
+    child_dir = set_project_root / "child"
+    child_dir.mkdir()
+    (child_dir / "pipeline.py").write_text(
+        _make_consumer_pipeline_code("child", "consumer", "../data/output.txt", "result.txt")
+    )
+
+    child = discovery.load_pipeline_from_path(child_dir / "pipeline.py")
+    assert child is not None, "Child pipeline should load successfully"
+
+    # First build_dag resolves external deps
+    dag1 = child.build_dag(validate=True)
+    assert "producer" in child.list_stages(), "Producer stage should be resolved in child pipeline"
+
+    # Second call should return the same cached DAG object
+    dag2 = child.build_dag(validate=True)
+    assert dag2 is dag1, "Second call should return cached DAG"
+    assert "producer" in child.list_stages(), "Producer should still be present"
+
+
+def test_resolution_resets_after_invalidate_dag_cache(
+    set_project_root: pathlib.Path,
+) -> None:
+    """invalidate_dag_cache() should force re-resolution on next build_dag()."""
+    (set_project_root / "pipeline.py").write_text(
+        _make_producer_pipeline_code("parent", "producer", "data/output.txt")
+    )
+    child_dir = set_project_root / "child"
+    child_dir.mkdir()
+    (child_dir / "pipeline.py").write_text(
+        _make_consumer_pipeline_code("child", "consumer", "../data/output.txt", "result.txt")
+    )
+
+    child = discovery.load_pipeline_from_path(child_dir / "pipeline.py")
+    assert child is not None, "Child pipeline should load successfully"
+
+    # First build
+    dag1 = child.build_dag(validate=True)
+    assert "producer" in child.list_stages(), "Producer stage should be resolved after invalidation"
+
+    # Invalidate and rebuild — should get a fresh DAG
+    child.invalidate_dag_cache()
+    dag2 = child.build_dag(validate=True)
+    assert dag2 is not dag1, "Should rebuild DAG after invalidation"
+    assert "producer" in child.list_stages(), "Producer stage should still be resolved"
+
+
+def test_resolution_resets_after_clear(
+    set_project_root: pathlib.Path,
+) -> None:
+    """clear() should force re-resolution on next build_dag().
+
+    After clearing all stages and re-loading the pipeline, external
+    dependency resolution must run again to discover the producer.
+    """
+    (set_project_root / "pipeline.py").write_text(
+        _make_producer_pipeline_code("parent", "producer", "data/output.txt")
+    )
+    child_dir = set_project_root / "child"
+    child_dir.mkdir()
+    (child_dir / "pipeline.py").write_text(
+        _make_consumer_pipeline_code("child", "consumer", "../data/output.txt", "result.txt")
+    )
+
+    child = discovery.load_pipeline_from_path(child_dir / "pipeline.py")
+    assert child is not None
+
+    # First build resolves external deps and caches
+    child.build_dag(validate=True)
+    assert "producer" in child.list_stages()
+
+    # Clear and re-load the pipeline from scratch
+    child.clear()
+    assert child.list_stages() == [], "Pipeline should have no stages after clear"
+
+    # Re-load (simulates what watch-mode reload does)
+    child2 = discovery.load_pipeline_from_path(child_dir / "pipeline.py")
+    assert child2 is not None
+
+    # The re-loaded pipeline is a fresh instance, so resolution must run
+    dag = child2.build_dag(validate=True)
+    assert "producer" in child2.list_stages(), "Producer should be re-resolved after reload"
+    assert dag.has_edge("consumer", "producer"), "DAG should have edge from consumer to producer"
+
+
+def test_resolution_resets_after_restore(
+    set_project_root: pathlib.Path,
+) -> None:
+    """restore() should force re-resolution on next build_dag().
+
+    After restoring a snapshot that only contains the consumer (no producer),
+    external dependency resolution must run again to re-discover the producer.
+    """
+    (set_project_root / "pipeline.py").write_text(
+        _make_producer_pipeline_code("parent", "producer", "data/output.txt")
+    )
+    child_dir = set_project_root / "child"
+    child_dir.mkdir()
+    (child_dir / "pipeline.py").write_text(
+        _make_consumer_pipeline_code("child", "consumer", "../data/output.txt", "result.txt")
+    )
+
+    child = discovery.load_pipeline_from_path(child_dir / "pipeline.py")
+    assert child is not None
+
+    # Snapshot BEFORE resolution (only has consumer)
+    pre_resolution_snapshot = child.snapshot()
+    assert "producer" not in pre_resolution_snapshot, "Snapshot should not contain producer yet"
+
+    # Build DAG triggers resolution
+    child.build_dag(validate=True)
+    assert "producer" in child.list_stages()
+
+    # Restore to pre-resolution state (consumer only)
+    child.restore(pre_resolution_snapshot)
+    assert "producer" not in child.list_stages(), "Producer should be gone after restore"
+
+    # Rebuild should re-resolve and rediscover the producer
+    dag = child.build_dag(validate=True)
+    assert "producer" in child.list_stages(), "Producer should be re-resolved after restore"
+    assert dag.has_edge("consumer", "producer"), "DAG should have edge from consumer to producer"
+
+
+def test_resolution_resets_after_include(
+    set_project_root: pathlib.Path,
+) -> None:
+    """include() should force re-resolution when new stages introduce unresolved deps.
+
+    When a pipeline has resolved its external dependencies, then a new sub-pipeline
+    is included that has its own unresolved deps, resolution must run again to
+    discover producers for the newly-included consumer's dependencies.
+    """
+    # Parent pipeline at project root produces both data/output.txt and extra_data.txt
+    parent_code = """
+from typing import Annotated, TypedDict
+from pathlib import Path
+from pivot.pipeline import Pipeline
+from pivot import loaders
+from pivot.outputs import Out
+
+pipeline = Pipeline("parent")
+
+class _Output(TypedDict):
+    data: Annotated[Path, Out("data/output.txt", loaders.PathOnly())]
+
+class _Output2(TypedDict):
+    extra: Annotated[Path, Out("extra_data.txt", loaders.PathOnly())]
+
+def producer() -> _Output:
+    Path("data/output.txt").parent.mkdir(parents=True, exist_ok=True)
+    Path("data/output.txt").write_text("produced")
+    return _Output(data=Path("data/output.txt"))
+
+def extra_producer() -> _Output2:
+    Path("extra_data.txt").write_text("extra")
+    return _Output2(extra=Path("extra_data.txt"))
+
+pipeline.register(producer)
+pipeline.register(extra_producer)
+"""
+    (set_project_root / "pipeline.py").write_text(parent_code)
+
+    # Child consumer depends on parent's data/output.txt
+    child_dir = set_project_root / "child"
+    child_dir.mkdir()
+    (child_dir / "pipeline.py").write_text(
+        _make_consumer_pipeline_code("child", "consumer", "../data/output.txt", "result.txt")
+    )
+
+    # Sibling pipeline has a consumer that depends on extra_data.txt from parent
+    sibling_dir = set_project_root / "sibling"
+    sibling_dir.mkdir()
+    (sibling_dir / "pipeline.py").write_text(
+        _make_consumer_pipeline_code(
+            "sibling", "sibling_consumer", "../extra_data.txt", "sibling_result.txt"
+        )
+    )
+
+    child = discovery.load_pipeline_from_path(child_dir / "pipeline.py")
+    assert child is not None
+
+    # First build resolves consumer -> producer
+    child.build_dag(validate=True)
+    assert "producer" in child.list_stages()
+
+    # Include the sibling pipeline (which has an unresolved dep on extra_data.txt)
+    sibling = discovery.load_pipeline_from_path(sibling_dir / "pipeline.py")
+    assert sibling is not None
+    child.include(sibling)
+
+    # Rebuild should re-resolve and discover extra_producer for sibling_consumer's dep
+    dag = child.build_dag(validate=True)
+    assert "sibling_consumer" in dag.nodes, "Included stage should be in DAG"
+    assert "extra_producer" in dag.nodes, "Producer for included consumer's dep should be resolved"
+    assert "consumer" in dag.nodes, "Original consumer should still be in DAG"
+    assert "producer" in dag.nodes, "Original producer should still be in DAG"

@@ -187,6 +187,7 @@ class Pipeline:
     _name: str
     _root: pathlib.Path
     _registry: registry.StageRegistry
+    _external_deps_resolved: bool
 
     def __init__(
         self,
@@ -204,6 +205,7 @@ class Pipeline:
 
         self._name = name
         self._registry = registry.StageRegistry()
+        self._external_deps_resolved = False
 
         if root is not None:
             self._root = root.resolve()
@@ -387,6 +389,9 @@ class Pipeline:
             state_dir=self.state_dir,
         )
 
+        # New stage may introduce unresolved external deps — force re-resolution
+        self._reset_resolution_cache()
+
     def list_stages(self) -> list[str]:
         """List all registered stage names."""
         return self._registry.list_stages()
@@ -422,16 +427,23 @@ class Pipeline:
         """Create a snapshot of current registry state for backup/restore."""
         return self._registry.snapshot()
 
-    def invalidate_dag_cache(self) -> None:
-        """Invalidate cached DAG without clearing stages."""
+    def _reset_resolution_cache(self) -> None:
+        """Reset resolution state and DAG cache after registry changes."""
+        self._external_deps_resolved = False
         self._registry.invalidate_dag_cache()
+
+    def invalidate_dag_cache(self) -> None:
+        """Invalidate cached DAG and resolution state."""
+        self._reset_resolution_cache()
 
     def restore(self, snapshot: dict[str, registry.RegistryStageInfo]) -> None:
         """Restore registry state from a previous snapshot."""
+        self._reset_resolution_cache()
         self._registry.restore(snapshot)
 
     def clear(self) -> None:
         """Clear all registered stages (for testing)."""
+        self._reset_resolution_cache()
         self._registry.clear()
 
     def include(self, other: Pipeline) -> None:
@@ -469,6 +481,7 @@ class Pipeline:
             self._registry.add_existing(stage_info)
 
         if stages_to_add:
+            self._reset_resolution_cache()
             logger.debug(
                 f"Included {len(stages_to_add)} stages from pipeline '{other.name}' into '{self.name}'"
             )
@@ -482,7 +495,11 @@ class Pipeline:
         3. Full scan of all pipeline files in the project
 
         Uses per-call caching (pipelines loaded once per resolve, discarded after).
+        Skipped if already resolved (reset by invalidate_dag_cache, include, etc.).
         """
+        if self._external_deps_resolved:
+            return
+
         project_root = project.get_project_root()
 
         # Build set of locally produced outputs and unresolved dependencies in single pass
@@ -497,6 +514,7 @@ class Pipeline:
         work = all_deps - local_outputs
 
         if not work:
+            self._external_deps_resolved = True
             return
 
         # Per-call caches (fresh every call — safe for watch mode)
@@ -578,6 +596,8 @@ class Pipeline:
                     target.write_text(pipeline_dir)
                 except OSError:
                     logger.debug(f"Failed to write output index for {out_path}")
+
+        self._external_deps_resolved = True
 
     # Keep old name as alias for backwards compatibility
     resolve_from_parents = resolve_external_dependencies  # pyright: ignore[reportUnannotatedClassAttribute] - method alias
