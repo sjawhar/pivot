@@ -115,6 +115,9 @@ def _output_explain(
     from pivot.engine import graph as engine_graph
     from pivot.storage import track
 
+    # Resolve cross-pipeline dependencies before getting stages
+    cli_helpers.resolve_external_dependencies()
+
     all_stages = cli_helpers.get_all_stages()
 
     # Build graph with validation when allow_missing is False
@@ -152,6 +155,10 @@ def _dry_run(
     # Quiet mode suppresses output (except JSON which is always emitted)
     if quiet and not as_json:
         return
+
+    # Resolve cross-pipeline dependencies before getting stages
+    # (build_dag() does this automatically, but dry-run builds the graph directly)
+    cli_helpers.resolve_external_dependencies()
 
     all_stages = cli_helpers.get_all_stages()
 

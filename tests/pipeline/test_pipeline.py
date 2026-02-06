@@ -1626,5 +1626,5 @@ def test_pipeline_resolve_from_parents_logs_included_stages(
 
     # Verify log messages about included stage
     assert any(
-        "producer" in record.message and "parent" in record.message for record in caplog.records
-    ), "Expected debug log about including producer from parent pipeline"
+        "producer" in record.message and "three-tier" in record.message for record in caplog.records
+    ), "Expected debug log about including producer via three-tier discovery"
