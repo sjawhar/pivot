@@ -13,7 +13,7 @@ import textwrap
 import types
 import typing
 import weakref
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from typing import TYPE_CHECKING, Any, cast
 
 import xxhash
@@ -88,6 +88,15 @@ _state_db: "StateDB | None" = None
 _state_db_init_attempted: bool = False
 _pending_ast_writes: list[AstHashEntry] = []
 
+# Pending manifest cache writes, flushed at process exit.
+# Format: list of (key_bytes, value_bytes) tuples.
+_pending_manifest_writes: list[tuple[bytes, bytes]] = []
+
+
+# Source files visited during a single stage's fingerprinting.
+# Maps rel_path -> (mtime_ns, size, ino). Set by _collecting_sources().
+_active_source_map: dict[str, tuple[int, int, int]] | None = None
+
 
 def _close_state_db() -> None:
     """Close the readonly StateDB on process exit."""
@@ -98,6 +107,17 @@ def _close_state_db() -> None:
 
 
 atexit.register(_close_state_db)
+
+
+@atexit.register
+def _flush_pending_caches() -> None:  # pyright: ignore[reportUnusedFunction] - called by atexit
+    """Flush all pending cache writes at process exit.
+
+    Registered AFTER _close_state_db so LIFO ordering runs this first.
+    Flush opens its own writable StateDB, so readonly close is irrelevant.
+    """
+    flush_ast_hash_cache()
+    flush_manifest_cache()
 
 
 def _get_state_db() -> "StateDB | None":
@@ -123,6 +143,11 @@ def _get_state_db() -> "StateDB | None":
         return None
 
 
+def _make_manifest_cache_key(stage_name: str) -> bytes:
+    """Build StateDB key for manifest cache entry."""
+    return f"sm:{stage_name}\x00{_PYTHON_VERSION}\x00{_CACHE_SCHEMA_VERSION}".encode()
+
+
 def _get_func_source_info(func: Callable[..., Any]) -> tuple[str, int, int, int] | None:
     """Get (rel_path, mtime_ns, size, inode) for function source file.
 
@@ -144,6 +169,82 @@ def _get_func_source_info(func: Callable[..., Any]) -> tuple[str, int, int, int]
         # OSError: file doesn't exist
         # ValueError: path outside project root
         return None
+
+
+@contextlib.contextmanager
+def _collecting_sources() -> Iterator[dict[str, tuple[int, int, int]]]:
+    """Scope a source map for the duration of a fingerprint walk.
+
+    Saves and restores any previously active source map, so nested calls
+    (if they ever occur) don't clobber the outer collector.
+    """
+    global _active_source_map
+    previous = _active_source_map
+    source_map = dict[str, tuple[int, int, int]]()
+    _active_source_map = source_map
+    try:
+        yield source_map
+    finally:
+        _active_source_map = previous
+
+
+def _try_manifest_cache_hit(stage_name: str) -> dict[str, str] | None:
+    """Try to load a cached manifest; returns None on miss."""
+    db = _get_state_db()
+    if db is None:
+        return None
+
+    key = _make_manifest_cache_key(stage_name)
+    try:
+        raw = db.get_raw(key)
+    except Exception:
+        return None
+    if raw is None:
+        return None
+
+    try:
+        data: object = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+
+    if not isinstance(data, dict):
+        return None
+    # Cast to dict[str, Any] after isinstance validation - json.loads returns dict[str, Any] for objects
+    typed_data = cast("dict[str, Any]", data)
+    manifest_raw: object = typed_data.get("m")
+    sources_raw: object = typed_data.get("s")
+    if not isinstance(manifest_raw, dict) or not isinstance(sources_raw, dict):
+        return None
+
+    # Narrow types after validation: manifest is {str: str}, sources is {str: [int, int, int]}
+    manifest = cast("dict[str, str]", manifest_raw)
+    sources = cast("dict[str, list[int]]", sources_raw)
+
+    # If no source files were tracked, we have nothing to validate against.
+    # This happens for stages with only builtins/exec'd code. Force recompute
+    # rather than returning a stale manifest that can never be invalidated.
+    if not sources:
+        return None
+
+    # Stat-check every source file
+    from pivot import project
+
+    project_root = project.get_project_root()
+    for rel_path, stats in sources.items():
+        if len(stats) != 3:
+            return None  # Corrupted cache entry
+        cached_mtime, cached_size, cached_ino = stats
+        # Guard against path traversal from corrupted/malicious cache entries
+        if rel_path.startswith("/") or ".." in pathlib.Path(rel_path).parts:
+            return None
+        try:
+            st = (project_root / rel_path).stat()
+        except OSError:
+            return None  # File deleted or inaccessible
+        if st.st_mtime_ns != cached_mtime or st.st_size != cached_size or st.st_ino != cached_ino:
+            return None  # File changed
+
+    return manifest
 
 
 def flush_ast_hash_cache() -> None:
@@ -170,6 +271,27 @@ def flush_ast_hash_cache() -> None:
         _logger.debug("Failed to flush AST hash cache (%d entries)", len(pending), exc_info=True)
 
 
+def flush_manifest_cache() -> None:
+    """Flush pending manifest writes to StateDB."""
+    global _pending_manifest_writes
+    if not _pending_manifest_writes:
+        return
+
+    pending = _pending_manifest_writes
+    _pending_manifest_writes = []
+
+    try:
+        from pivot.config import io
+        from pivot.storage import state
+
+        with state.StateDB(io.get_state_db_path(), readonly=False) as db:
+            db.put_raw_many(pending)
+        metrics.count("fingerprint.manifest_cache.flush")
+    except Exception:
+        _pending_manifest_writes.extend(pending)
+        _logger.debug("Failed to flush manifest cache (%d entries)", len(pending), exc_info=True)
+
+
 def get_stage_fingerprint(
     func: Callable[..., Any], visited: set[int] | None = None
 ) -> dict[str, str]:
@@ -192,6 +314,42 @@ def get_stage_fingerprint(
     result = _get_stage_fingerprint_impl(func, visited)
     metrics.end("fingerprint.get_stage_fingerprint", _t)
     return result
+
+
+def get_stage_fingerprint_cached(stage_name: str, func: Callable[..., Any]) -> dict[str, str]:
+    """Like get_stage_fingerprint, but with manifest-level caching.
+
+    On hit, skips the entire closure walk. On miss, computes normally and
+    queues the result for flush at process exit.
+    """
+    _t = metrics.start()
+
+    # Try cache hit
+    cached = _try_manifest_cache_hit(stage_name)
+    if cached is not None:
+        metrics.count("fingerprint.manifest_cache.hit")
+        metrics.end("fingerprint.get_stage_fingerprint_cached", _t)
+        return cached
+
+    metrics.count("fingerprint.manifest_cache.miss")
+
+    # Compute with source tracking
+    with _collecting_sources() as source_map:
+        manifest = get_stage_fingerprint(func)
+
+    # Queue for flush
+    key = _make_manifest_cache_key(stage_name)
+    value = json.dumps(
+        {
+            "m": manifest,
+            "s": {rel_path: list(stats) for rel_path, stats in source_map.items()},
+        },
+        separators=(",", ":"),
+    ).encode()
+    _pending_manifest_writes.append((key, value))
+
+    metrics.end("fingerprint.get_stage_fingerprint_cached", _t)
+    return manifest
 
 
 def _get_stage_fingerprint_impl(func: Callable[..., Any], visited: set[int]) -> dict[str, str]:
@@ -650,6 +808,12 @@ def hash_function_ast(func: Callable[..., Any]) -> str:
     stages using lambdas. Mitigation: Use named functions instead of lambdas in
     pipeline stages for stable fingerprinting.
     """
+    if _active_source_map is not None:
+        info = _get_func_source_info(func)
+        if info is not None:
+            rel_path, mtime_ns, size, ino = info
+            if rel_path not in _active_source_map:
+                _active_source_map[rel_path] = (mtime_ns, size, ino)
     _t = metrics.start()
     try:
         # 1. Check in-memory WeakKeyDictionary cache first (fastest)

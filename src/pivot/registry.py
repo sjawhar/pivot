@@ -908,7 +908,7 @@ def _resolve_params(
 def _compute_fingerprint(stage_name: str, info: RegistryStageInfo) -> dict[str, str]:
     """Compute and return a stage fingerprint, wrapping errors."""
     try:
-        result = fingerprint.get_stage_fingerprint(info["func"])
+        result = fingerprint.get_stage_fingerprint_cached(stage_name, info["func"])
         for spec in info["dep_specs"].values():
             result.update(fingerprint.get_loader_fingerprint(spec.loader))
         for out in info["out_specs"].values():
