@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import pathlib
 import time
@@ -1635,3 +1636,134 @@ def test_clear_ast_hashes_readonly_blocked(tmp_path: pathlib.Path) -> None:
         pytest.raises(RuntimeError, match="readonly StateDB"),
     ):
         db.clear_ast_hashes()
+
+
+# -----------------------------------------------------------------------------
+# Raw key-value access tests (stage manifest cache)
+# -----------------------------------------------------------------------------
+
+
+def test_stage_manifest_roundtrip(tmp_path: pathlib.Path) -> None:
+    """Save and retrieve a stage manifest."""
+    db_path = tmp_path / "state.db"
+    key = "sm:my_stage\x003.13\x001"
+    manifest = {"self:train": "aabb", "func:helper": "ccdd"}
+    sources = {"src/train.py": [1000, 200, 555], "src/helper.py": [2000, 300, 666]}
+    value = json.dumps({"m": manifest, "s": sources}, separators=(",", ":"))
+
+    with state.StateDB(db_path) as db:
+        db.put_raw(key.encode(), value.encode())
+        result = db.get_raw(key.encode())
+
+    assert result is not None
+    assert json.loads(result.decode()) == {"m": manifest, "s": sources}
+
+
+def test_stage_manifest_not_found(tmp_path: pathlib.Path) -> None:
+    """Returns None for unknown key."""
+    db_path = tmp_path / "state.db"
+    with state.StateDB(db_path) as db:
+        result = db.get_raw(b"sm:nonexistent\x003.13\x001")
+    assert result is None
+
+
+def test_put_raw_readonly_blocked(tmp_path: pathlib.Path) -> None:
+    """put_raw blocked in readonly mode."""
+    db_path = tmp_path / "state.db"
+
+    with state.StateDB(db_path) as db:
+        pass  # Create database
+
+    with (
+        state.StateDB(db_path, readonly=True) as db,
+        pytest.raises(RuntimeError, match="readonly StateDB"),
+    ):
+        db.put_raw(b"sm:test\x003.13\x001", b"value")
+
+
+def test_put_raw_many_readonly_blocked(tmp_path: pathlib.Path) -> None:
+    """put_raw_many blocked in readonly mode."""
+    db_path = tmp_path / "state.db"
+
+    with state.StateDB(db_path) as db:
+        pass  # Create database
+
+    with (
+        state.StateDB(db_path, readonly=True) as db,
+        pytest.raises(RuntimeError, match="readonly StateDB"),
+    ):
+        db.put_raw_many([(b"sm:test\x003.13\x001", b"value")])
+
+
+def test_put_raw_key_too_long(tmp_path: pathlib.Path) -> None:
+    """put_raw raises PathTooLongError for oversized keys."""
+    db_path = tmp_path / "state.db"
+    long_key = b"k" * 512  # Exceeds 511 byte limit
+
+    with state.StateDB(db_path) as db, pytest.raises(state.PathTooLongError):
+        db.put_raw(long_key, b"value")
+
+
+def test_put_raw_many_skips_oversized_keys(tmp_path: pathlib.Path) -> None:
+    """put_raw_many silently skips entries with oversized keys."""
+    db_path = tmp_path / "state.db"
+    long_key = b"k" * 512  # Exceeds 511 byte limit
+    normal_key = b"sm:normal\x003.13\x001"
+
+    with state.StateDB(db_path) as db:
+        db.put_raw_many(
+            [
+                (long_key, b"should_be_skipped"),
+                (normal_key, b"should_be_saved"),
+            ]
+        )
+        # Oversized key was skipped
+        assert db.get_raw(long_key) is None
+        # Normal key was saved
+        assert db.get_raw(normal_key) == b"should_be_saved"
+
+
+def test_put_raw_many_empty(tmp_path: pathlib.Path) -> None:
+    """put_raw_many with empty list does not error."""
+    db_path = tmp_path / "state.db"
+
+    with state.StateDB(db_path) as db:
+        db.put_raw_many([])  # Should not raise
+
+
+def test_put_raw_many_persistence(tmp_path: pathlib.Path) -> None:
+    """put_raw_many entries persist across DB instances."""
+    db_path = tmp_path / "state.db"
+    entries = [
+        (b"sm:stage_a\x003.13\x001", b'{"m":{"self:a":"hash_a"},"s":{}}'),
+        (b"sm:stage_b\x003.13\x001", b'{"m":{"self:b":"hash_b"},"s":{}}'),
+    ]
+
+    with state.StateDB(db_path) as db:
+        db.put_raw_many(entries)
+
+    with state.StateDB(db_path, readonly=True) as db:
+        for key, expected_value in entries:
+            assert db.get_raw(key) == expected_value
+
+
+def test_get_raw_after_close_raises(tmp_path: pathlib.Path) -> None:
+    """get_raw on closed StateDB raises RuntimeError."""
+    db_path = tmp_path / "state.db"
+
+    db = state.StateDB(db_path)
+    db.close()
+
+    with pytest.raises(RuntimeError, match="closed StateDB"):
+        db.get_raw(b"sm:test\x003.13\x001")
+
+
+def test_put_raw_overwrites_existing(tmp_path: pathlib.Path) -> None:
+    """put_raw with same key overwrites the previous value."""
+    db_path = tmp_path / "state.db"
+    key = b"sm:overwrite_test\x003.13\x001"
+
+    with state.StateDB(db_path) as db:
+        db.put_raw(key, b"old_value")
+        db.put_raw(key, b"new_value")
+        assert db.get_raw(key) == b"new_value"

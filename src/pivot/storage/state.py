@@ -27,6 +27,7 @@ _REMOTE_PREFIX = b"remote:"  # Remote index entries
 _RUN_PREFIX = b"run:"  # Run history entries
 _RUNCACHE_PREFIX = b"runcache:"  # Run cache entries for skip detection
 _FP_PREFIX = b"fp:"  # AST fingerprint/hash cache entries
+_SM_PREFIX = b"sm:"  # Stage manifest cache entries
 
 # Default LMDB map size (10GB virtual - grows as needed)
 _MAP_SIZE = 10 * 1024 * 1024 * 1024
@@ -320,6 +321,45 @@ class StateDB:
                 txn.delete(key)
                 deleted += 1
         return deleted
+
+    # -------------------------------------------------------------------------
+    # Raw key-value access for stage manifest cache
+    # -------------------------------------------------------------------------
+
+    def get_raw(self, key: bytes) -> bytes | None:
+        """Get raw value by key. Returns None if not found."""
+        self._check_closed()
+        with self._env.begin() as txn:
+            return txn.get(key)
+
+    def put_raw(self, key: bytes, value: bytes) -> None:
+        """Put raw key-value pair."""
+        self._check_closed()
+        self._check_write_allowed()
+        if len(key) > _MAX_KEY_SIZE:
+            raise PathTooLongError(
+                f"Key too long for state cache ({len(key)} bytes, max {_MAX_KEY_SIZE})"
+            )
+        try:
+            with self._env.begin(write=True) as txn:
+                txn.put(key, value)
+        except lmdb.MapFullError as e:
+            raise DatabaseFullError(_DB_FULL_MSG) from e
+
+    def put_raw_many(self, entries: list[tuple[bytes, bytes]]) -> None:
+        """Batch put raw key-value pairs atomically."""
+        self._check_closed()
+        self._check_write_allowed()
+        if not entries:
+            return
+        try:
+            with self._env.begin(write=True) as txn:
+                for key, value in entries:
+                    if len(key) > _MAX_KEY_SIZE:
+                        continue  # Skip oversized keys
+                    txn.put(key, value)
+        except lmdb.MapFullError as e:
+            raise DatabaseFullError(_DB_FULL_MSG) from e
 
     # -------------------------------------------------------------------------
     # Generation tracking for O(1) skip detection
