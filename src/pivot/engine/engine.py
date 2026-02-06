@@ -1171,11 +1171,13 @@ class Engine:
         old_stages, old_registry = reload_result
         await self._emit_reload_event(old_stages, old_registry)
 
-        # Rebuild graph
+        # Resolve external deps (e.g. sibling pipelines) before reading stages.
+        # Reload bypasses Pipeline.build_dag() so we must resolve explicitly.
+        self._require_pipeline().resolve_external_dependencies()
         all_stages = self._get_all_stages()
         self._graph = engine_graph.build_graph(all_stages)
 
-        # Update watch paths if we have an FilesystemSource
+        # Update watch paths if we have a FilesystemSource
         from pivot.engine.sources import FilesystemSource
 
         watch_paths = engine_graph.get_watch_paths(self._graph)
