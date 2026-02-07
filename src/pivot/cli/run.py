@@ -70,7 +70,7 @@ def _run_with_tui(
     force: bool = False,
     tui_log: pathlib.Path | None = None,
     no_commit: bool = False,
-    on_error: OnError = OnError.KEEP_GOING,
+    on_error: OnError = OnError.FAIL,
     allow_uncached_incremental: bool = False,
     checkout_missing: bool = False,
 ) -> dict[str, ExecutionSummary] | None:
@@ -311,7 +311,13 @@ def _validate_stages_required(stages_list: list[str] | None) -> list[str]:
     is_flag=True,
     help="Use interactive TUI display (default: plain text)",
 )
-@click.option("--json", "as_json", is_flag=True, help="Output results as JSON")
+@click.option(
+    "--jsonl",
+    "--json",
+    "as_json",
+    is_flag=True,
+    help="Stream results as JSONL (one JSON object per line).",
+)
 @click.option(
     "--show-output",
     is_flag=True,
@@ -330,7 +336,13 @@ def _validate_stages_required(stages_list: list[str] | None) -> list[str]:
 @click.option(
     "--fail-fast",
     is_flag=True,
-    help="Stop on first failure (default: keep going)",
+    help="Stop on first failure (default).",
+)
+@click.option(
+    "--keep-going",
+    "-k",
+    is_flag=True,
+    help="Continue running stages after failures.",
 )
 @click.option(
     "--allow-uncached-incremental",
@@ -353,6 +365,7 @@ def run(
     tui_log: pathlib.Path | None,
     no_commit: bool,
     fail_fast: bool,
+    keep_going: bool,
     allow_uncached_incremental: bool,
     checkout_missing: bool,
 ) -> None:
@@ -373,18 +386,11 @@ def run(
     # Validate stages exist in registry
     cli_helpers.validate_stages_exist(stages_list)
 
-    # Validate --tui and --json are mutually exclusive
-    if tui_flag and as_json:
-        raise click.ClickException("--tui and --json are mutually exclusive")
-
-    # Validate --show-output combinations
+    # Validate mutual exclusions
+    _run_common.validate_display_mode(tui_flag, as_json)
     _run_common.validate_show_output(show_output, tui_flag, as_json, quiet)
-
-    # Validate tui_log
     tui_log = _run_common.validate_tui_log(tui_log, as_json, tui_flag)
-
-    # Default: keep going; --fail-fast stops on first failure
-    on_error = OnError.FAIL if fail_fast else OnError.KEEP_GOING
+    on_error = _run_common.resolve_on_error(fail_fast, keep_going)
 
     if tui_flag:
         results = _run_with_tui(

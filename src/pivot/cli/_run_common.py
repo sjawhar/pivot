@@ -13,6 +13,7 @@ import click
 from pivot import discovery
 from pivot.cli import decorators as cli_decorators
 from pivot.engine import engine, sinks
+from pivot.types import OnError
 
 if TYPE_CHECKING:
     import pathlib
@@ -129,7 +130,7 @@ def validate_tui_log(
     if not tui_log:
         return None
     if as_json:
-        raise click.ClickException("--tui-log cannot be used with --json")
+        raise click.ClickException("--tui-log cannot be used with --jsonl")
     if not tui_flag:
         raise click.ClickException("--tui-log requires --tui")
     if dry_run:
@@ -149,9 +150,26 @@ def validate_show_output(show_output: bool, tui_flag: bool, as_json: bool, quiet
     if show_output and tui_flag:
         raise click.ClickException("--show-output and --tui are mutually exclusive")
     if show_output and as_json:
-        raise click.ClickException("--show-output and --json are mutually exclusive")
+        raise click.ClickException("--show-output and --jsonl are mutually exclusive")
     if show_output and quiet:
         raise click.ClickException("--show-output and --quiet are mutually exclusive")
+
+
+def validate_display_mode(tui_flag: bool, as_json: bool) -> None:
+    """Validate --tui and --jsonl are mutually exclusive."""
+    if tui_flag and as_json:
+        raise click.ClickException("--tui and --jsonl are mutually exclusive")
+
+
+def resolve_on_error(fail_fast: bool, keep_going: bool) -> OnError:
+    """Resolve --fail-fast / --keep-going flags to OnError enum.
+
+    Validates mutual exclusion and returns the appropriate enum value.
+    Default (neither flag) is fail-fast.
+    """
+    if fail_fast and keep_going:
+        raise click.ClickException("--fail-fast and --keep-going are mutually exclusive")
+    return OnError.KEEP_GOING if keep_going else OnError.FAIL
 
 
 class DryRunJsonStageOutput(TypedDict):

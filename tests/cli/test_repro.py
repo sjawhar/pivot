@@ -320,7 +320,7 @@ def test_repro_tui_log_cannot_use_with_json(
 
     assert result.exit_code != 0
     assert "--tui-log" in result.output
-    assert "--json" in result.output
+    assert "--jsonl" in result.output
 
 
 def test_repro_tui_log_cannot_use_with_dry_run(
@@ -469,6 +469,40 @@ def test_repro_json_output_streams_jsonl(
         json.loads(line)  # Should not raise
 
 
+def test_repro_jsonl_flag_accepted(
+    mock_discovery: Pipeline,
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--jsonl flag works and streams JSONL output."""
+    register_test_stage(_helper_stage_a, name="stage_a")
+
+    result = runner.invoke(cli.cli, ["repro", "--jsonl"])
+
+    assert result.exit_code == 0
+    lines = [ln for ln in result.output.strip().split("\n") if ln]
+    assert len(lines) > 0
+    for line in lines:
+        json.loads(line)  # Should not raise
+
+
+def test_repro_help_shows_jsonl(
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+) -> None:
+    """repro help shows --jsonl flag with JSONL description."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".pivot").mkdir()
+        pathlib.Path(".git").mkdir()
+
+        result = runner.invoke(cli.cli, ["repro", "--help"])
+
+    assert result.exit_code == 0
+    assert "--jsonl" in result.output
+    assert "JSONL" in result.output
+
+
 # =============================================================================
 # Cache Options Tests
 # =============================================================================
@@ -516,7 +550,7 @@ def test_repro_show_output_mutually_exclusive_with_json(
         result = runner.invoke(cli.cli, ["repro", "--show-output", "--json"])
 
         assert result.exit_code != 0
-        assert "--show-output and --json are mutually exclusive" in result.output
+        assert "--show-output and --jsonl are mutually exclusive" in result.output
 
 
 def test_repro_show_output_mutually_exclusive_with_quiet(

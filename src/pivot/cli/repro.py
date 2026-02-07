@@ -748,7 +748,13 @@ def _run_oneshot_mode(
     is_flag=True,
     help="Use interactive TUI display (default: plain text)",
 )
-@click.option("--json", "as_json", is_flag=True, help="Output results as JSON")
+@click.option(
+    "--jsonl",
+    "--json",
+    "as_json",
+    is_flag=True,
+    help="Stream results as JSONL (one JSON object per line).",
+)
 @click.option(
     "--show-output",
     is_flag=True,
@@ -763,6 +769,11 @@ def _run_oneshot_mode(
     "--no-commit",
     is_flag=True,
     help="Skip writing lock files. Run 'pivot commit' to finalize.",
+)
+@click.option(
+    "--fail-fast",
+    is_flag=True,
+    help="Stop on first failure (default).",
 )
 @click.option(
     "--keep-going",
@@ -804,6 +815,7 @@ def repro(
     show_output: bool,
     tui_log: pathlib.Path | None,
     no_commit: bool,
+    fail_fast: bool,
     keep_going: bool,
     serve: bool,
     allow_uncached_incremental: bool,
@@ -829,25 +841,16 @@ def repro(
     stages_list = cli_helpers.stages_to_list(stages)
     cli_helpers.validate_stages_exist(stages_list)
 
-    # Validate --tui and --json are mutually exclusive
-    if tui_flag and as_json:
-        raise click.ClickException("--tui and --json are mutually exclusive")
-
-    # Validate --show-output combinations
+    # Validate mutual exclusions
+    _run_common.validate_display_mode(tui_flag, as_json)
     _run_common.validate_show_output(show_output, tui_flag, as_json, quiet)
-
-    # Validate tui_log
     tui_log = _run_common.validate_tui_log(tui_log, as_json, tui_flag, dry_run=dry_run)
 
-    # Validate --serve requires --watch
+    # Validate flag prerequisites
     if serve and not watch:
         raise click.ClickException("--serve requires --watch mode")
-
-    # Validate --debounce requires --watch
     if debounce_from_cli and not watch:
         raise click.ClickException("--debounce requires --watch mode")
-
-    # Validate --allow-missing requires --dry-run or --explain
     if allow_missing and not dry_run and not explain:
         raise click.ClickException("--allow-missing can only be used with --dry-run or --explain")
 
@@ -862,12 +865,12 @@ def repro(
         _output_explain(stages_list, force, allow_missing=allow_missing)
         return
 
+    on_error = _run_common.resolve_on_error(fail_fast, keep_going)
+
     # Handle dry-run mode
     if dry_run:
         _dry_run(stages_list, force, as_json, allow_missing, quiet)
         return
-
-    on_error = OnError.KEEP_GOING if keep_going else OnError.FAIL
 
     try:
         results = _run_pipeline(
