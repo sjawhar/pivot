@@ -10,7 +10,7 @@ import subprocess
 import sys
 import tempfile
 from collections.abc import AsyncGenerator, Callable, Generator
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 import click.testing
 import pytest
@@ -385,11 +385,8 @@ def output_queue() -> Generator[mp.Queue[OutputMessage]]:
     deprecation warnings about fork() in multi-threaded contexts.
     """
     spawn_ctx = mp.get_context("spawn")
-    manager = spawn_ctx.Manager()
-    # Manager().Queue() returns Queue[Any] - cast through object for type safety
-    queue = cast("mp.Queue[OutputMessage]", cast("object", manager.Queue()))
-    yield queue
-    manager.shutdown()
+    q: mp.Queue[OutputMessage] = spawn_ctx.Queue()
+    yield q
 
 
 @pytest.fixture

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import contextlib
 import inspect
-import io
 import json
 import os
 import pathlib
@@ -271,14 +270,14 @@ def test_run_stage_function_captures_stdout(output_queue: mp.Queue[OutputMessage
         print("line1")
         print("line2")
 
-    output_lines: list[tuple[str, bool]] = []
+    ring_buffer = worker._OutputRingBuffer()
     worker._run_stage_function_with_injection(
-        stage_with_output, "test_stage", output_queue, output_lines
+        stage_with_output, "test_stage", output_queue, ring_buffer
     )
 
-    assert len(output_lines) == 2
-    assert output_lines[0] == ("line1", False)  # stdout
-    assert output_lines[1] == ("line2", False)
+    assert len(ring_buffer.snapshot()) == 2
+    assert ring_buffer.snapshot()[0] == ("line1", False)  # stdout
+    assert ring_buffer.snapshot()[1] == ("line2", False)
 
 
 def test_run_stage_function_captures_stderr(output_queue: mp.Queue[OutputMessage]) -> None:
@@ -288,14 +287,14 @@ def test_run_stage_function_captures_stderr(output_queue: mp.Queue[OutputMessage
         print("error1", file=sys.stderr)
         print("error2", file=sys.stderr)
 
-    output_lines: list[tuple[str, bool]] = []
+    ring_buffer = worker._OutputRingBuffer()
     worker._run_stage_function_with_injection(
-        stage_with_errors, "test_stage", output_queue, output_lines
+        stage_with_errors, "test_stage", output_queue, ring_buffer
     )
 
-    assert len(output_lines) == 2
-    assert output_lines[0] == ("error1", True)  # stderr
-    assert output_lines[1] == ("error2", True)
+    assert len(ring_buffer.snapshot()) == 2
+    assert ring_buffer.snapshot()[0] == ("error1", True)  # stderr
+    assert ring_buffer.snapshot()[1] == ("error2", True)
 
 
 def test_run_stage_function_captures_mixed_output(output_queue: mp.Queue[OutputMessage]) -> None:
@@ -306,13 +305,13 @@ def test_run_stage_function_captures_mixed_output(output_queue: mp.Queue[OutputM
         print("stderr1", file=sys.stderr)
         print("stdout2")
 
-    output_lines: list[tuple[str, bool]] = []
-    worker._run_stage_function_with_injection(stage_mixed, "test_stage", output_queue, output_lines)
+    ring_buffer = worker._OutputRingBuffer()
+    worker._run_stage_function_with_injection(stage_mixed, "test_stage", output_queue, ring_buffer)
 
-    assert len(output_lines) == 3
-    assert output_lines[0] == ("stdout1", False)
-    assert output_lines[1] == ("stderr1", True)
-    assert output_lines[2] == ("stdout2", False)
+    assert len(ring_buffer.snapshot()) == 3
+    assert ring_buffer.snapshot()[0] == ("stdout1", False)
+    assert ring_buffer.snapshot()[1] == ("stderr1", True)
+    assert ring_buffer.snapshot()[2] == ("stdout2", False)
 
 
 def test_run_stage_function_restores_streams(output_queue: mp.Queue[OutputMessage]) -> None:
@@ -323,8 +322,8 @@ def test_run_stage_function_restores_streams(output_queue: mp.Queue[OutputMessag
     def noop_stage() -> None:
         pass
 
-    output_lines: list[tuple[str, bool]] = []
-    worker._run_stage_function_with_injection(noop_stage, "test", output_queue, output_lines)
+    ring_buffer = worker._OutputRingBuffer()
+    worker._run_stage_function_with_injection(noop_stage, "test", output_queue, ring_buffer)
 
     assert sys.stdout is original_stdout
     assert sys.stderr is original_stderr
@@ -340,9 +339,9 @@ def test_run_stage_function_restores_streams_on_exception(
     def failing_stage() -> None:
         raise RuntimeError("fail")
 
-    output_lines: list[tuple[str, bool]] = []
+    ring_buffer = worker._OutputRingBuffer()
     with pytest.raises(RuntimeError):
-        worker._run_stage_function_with_injection(failing_stage, "test", output_queue, output_lines)
+        worker._run_stage_function_with_injection(failing_stage, "test", output_queue, ring_buffer)
 
     assert sys.stdout is original_stdout
     assert sys.stderr is original_stderr
@@ -355,13 +354,13 @@ def test_run_stage_function_captures_partial_lines(output_queue: mp.Queue[Output
         sys.stdout.write("no newline")
         sys.stdout.flush()
 
-    output_lines: list[tuple[str, bool]] = []
+    ring_buffer = worker._OutputRingBuffer()
     worker._run_stage_function_with_injection(
-        stage_no_newline, "test_stage", output_queue, output_lines
+        stage_no_newline, "test_stage", output_queue, ring_buffer
     )
 
-    assert len(output_lines) == 1
-    assert output_lines[0] == ("no newline", False)
+    assert len(ring_buffer.snapshot()) == 1
+    assert ring_buffer.snapshot()[0] == ("no newline", False)
 
 
 # =============================================================================
@@ -371,133 +370,163 @@ def test_run_stage_function_captures_partial_lines(output_queue: mp.Queue[Output
 
 def test_queue_writer_splits_on_newlines(output_queue: mp.Queue[OutputMessage]) -> None:
     """_QueueWriter splits output on newlines."""
-    output_lines: list[tuple[str, bool]] = []
-    writer = worker._QueueWriter(
-        "test_stage", output_queue, is_stderr=False, output_lines=output_lines
-    )
+    ring_buffer = worker._OutputRingBuffer()
+    with worker._QueueWriter(
+        "test_stage", output_queue, is_stderr=False, ring_buffer=ring_buffer
+    ) as writer:
+        bytes_written = writer.write("line1\nline2\n")
 
-    bytes_written = writer.write("line1\nline2\n")
-
-    assert bytes_written == len("line1\nline2\n")
-    assert output_lines == [("line1", False), ("line2", False)]
+        assert bytes_written == len("line1\nline2\n")
+        assert ring_buffer.snapshot() == [("line1", False), ("line2", False)]
 
 
 def test_queue_writer_buffers_partial_lines(output_queue: mp.Queue[OutputMessage]) -> None:
     """_QueueWriter buffers incomplete lines."""
-    output_lines: list[tuple[str, bool]] = []
-    writer = worker._QueueWriter(
-        "test_stage", output_queue, is_stderr=False, output_lines=output_lines
-    )
+    ring_buffer = worker._OutputRingBuffer()
+    with worker._QueueWriter(
+        "test_stage", output_queue, is_stderr=False, ring_buffer=ring_buffer
+    ) as writer:
+        writer.write("partial")
+        assert ring_buffer.snapshot() == []  # Not flushed yet
 
-    writer.write("partial")
-    assert output_lines == []  # Not flushed yet
-
-    writer.write(" line\n")
-    assert output_lines == [("partial line", False)]
+        writer.write(" line\n")
+        assert ring_buffer.snapshot() == [("partial line", False)]
 
 
 def test_queue_writer_flush_writes_buffer(output_queue: mp.Queue[OutputMessage]) -> None:
     """_QueueWriter.flush() writes buffered content."""
-    output_lines: list[tuple[str, bool]] = []
-    writer = worker._QueueWriter(
-        "test_stage", output_queue, is_stderr=False, output_lines=output_lines
-    )
+    ring_buffer = worker._OutputRingBuffer()
+    with worker._QueueWriter(
+        "test_stage", output_queue, is_stderr=False, ring_buffer=ring_buffer
+    ) as writer:
+        writer.write("no newline")
+        assert ring_buffer.snapshot() == []
 
-    writer.write("no newline")
-    assert output_lines == []
-
-    writer.flush()
-    assert output_lines == [("no newline", False)]
+        writer.flush()
+        assert ring_buffer.snapshot() == [("no newline", False)]
 
 
 def test_queue_writer_distinguishes_stderr(output_queue: mp.Queue[OutputMessage]) -> None:
     """_QueueWriter marks stderr lines correctly."""
-    output_lines: list[tuple[str, bool]] = []
-    writer = worker._QueueWriter(
-        "test_stage", output_queue, is_stderr=True, output_lines=output_lines
-    )
-
-    writer.write("error\n")
-    assert output_lines == [("error", True)]
+    ring_buffer = worker._OutputRingBuffer()
+    with worker._QueueWriter(
+        "test_stage", output_queue, is_stderr=True, ring_buffer=ring_buffer
+    ) as writer:
+        writer.write("error\n")
+        assert ring_buffer.snapshot() == [("error", True)]
 
 
 def test_queue_writer_handles_multiple_newlines(output_queue: mp.Queue[OutputMessage]) -> None:
     """_QueueWriter handles text with multiple consecutive newlines."""
-    output_lines: list[tuple[str, bool]] = []
-    writer = worker._QueueWriter(
-        "test_stage", output_queue, is_stderr=False, output_lines=output_lines
-    )
-
-    writer.write("line1\n\nline2\n")
-    # Empty lines are skipped (code checks 'if line:')
-    assert output_lines == [("line1", False), ("line2", False)]
+    ring_buffer = worker._OutputRingBuffer()
+    with worker._QueueWriter(
+        "test_stage", output_queue, is_stderr=False, ring_buffer=ring_buffer
+    ) as writer:
+        writer.write("line1\n\nline2\n")
+        # Empty lines are skipped (code checks 'if line:')
+        assert ring_buffer.snapshot() == [("line1", False), ("line2", False)]
 
 
 def test_queue_writer_empty_flush_does_nothing(output_queue: mp.Queue[OutputMessage]) -> None:
     """_QueueWriter.flush() with empty buffer does nothing."""
-    output_lines: list[tuple[str, bool]] = []
-    writer = worker._QueueWriter(
-        "test_stage", output_queue, is_stderr=False, output_lines=output_lines
-    )
-
-    writer.flush()
-    assert output_lines == []
+    ring_buffer = worker._OutputRingBuffer()
+    with worker._QueueWriter(
+        "test_stage", output_queue, is_stderr=False, ring_buffer=ring_buffer
+    ) as writer:
+        writer.flush()
+        assert ring_buffer.snapshot() == []
 
 
 def test_queue_writer_isatty_returns_false(output_queue: mp.Queue[OutputMessage]) -> None:
     """_QueueWriter.isatty() returns False."""
-    output_lines: list[tuple[str, bool]] = []
-    writer = worker._QueueWriter(
-        "test_stage", output_queue, is_stderr=False, output_lines=output_lines
-    )
+    ring_buffer = worker._OutputRingBuffer()
+    with worker._QueueWriter(
+        "test_stage", output_queue, is_stderr=False, ring_buffer=ring_buffer
+    ) as writer:
+        assert writer.isatty() is False
 
-    assert writer.isatty() is False
 
-
-def test_queue_writer_fileno_raises_unsupported_operation(
+def test_queue_writer_fileno_returns_valid_fd(
     output_queue: mp.Queue[OutputMessage],
 ) -> None:
-    """_QueueWriter.fileno() raises io.UnsupportedOperation."""
-    output_lines: list[tuple[str, bool]] = []
-    writer = worker._QueueWriter(
-        "test_stage", output_queue, is_stderr=False, output_lines=output_lines
-    )
+    """_QueueWriter.fileno() returns a writable file descriptor."""
+    ring_buffer = worker._OutputRingBuffer()
+    with worker._QueueWriter(
+        "test_stage", output_queue, is_stderr=False, ring_buffer=ring_buffer
+    ) as writer:
+        fd = writer.fileno()
+        assert isinstance(fd, int)
+        # Write through the FD directly
+        os.write(fd, b"hello from fd\n")
+    # Reader thread drains pipe into ring buffer
+    assert ("hello from fd", False) in ring_buffer.snapshot()
 
-    with pytest.raises(io.UnsupportedOperation, match="file descriptor"):
-        writer.fileno()
+
+def test_queue_writer_fd_captures_subprocess_output(
+    output_queue: mp.Queue[OutputMessage],
+) -> None:
+    """_QueueWriter captures output from subprocess using fileno()."""
+    import subprocess
+
+    ring_buffer = worker._OutputRingBuffer()
+    with worker._QueueWriter(
+        "test_stage", output_queue, is_stderr=False, ring_buffer=ring_buffer
+    ) as writer:
+        subprocess.run(
+            [sys.executable, "-c", "print('subprocess hello')"],
+            stdout=writer.fileno(),
+            check=True,
+        )
+    assert ("subprocess hello", False) in ring_buffer.snapshot()
+
+
+def test_queue_writer_pipe_and_write_interleave(
+    output_queue: mp.Queue[OutputMessage],
+) -> None:
+    """Output via write() and via FD both appear in ring buffer."""
+    ring_buffer = worker._OutputRingBuffer()
+    with worker._QueueWriter(
+        "test_stage", output_queue, is_stderr=False, ring_buffer=ring_buffer
+    ) as writer:
+        writer.write("from write\n")
+        os.write(writer.fileno(), b"from fd\n")
+    snap = ring_buffer.snapshot()
+    lines = [line for line, _ in snap]
+    assert "from write" in lines
+    assert "from fd" in lines
 
 
 def test_queue_writer_context_manager_flushes_on_exit(
     output_queue: mp.Queue[OutputMessage],
 ) -> None:
     """_QueueWriter context manager flushes buffer on exit."""
-    output_lines: list[tuple[str, bool]] = []
+    ring_buffer = worker._OutputRingBuffer()
 
     with worker._QueueWriter(
-        "test_stage", output_queue, is_stderr=False, output_lines=output_lines
+        "test_stage", output_queue, is_stderr=False, ring_buffer=ring_buffer
     ) as writer:
         writer.write("no newline")
-        assert output_lines == []  # Not flushed yet
+        assert ring_buffer.snapshot() == []  # Not flushed yet
 
     # Flushed on context exit
-    assert output_lines == [("no newline", False)]
+    assert ring_buffer.snapshot() == [("no newline", False)]
 
 
 def test_queue_writer_context_manager_flushes_on_exception(
     output_queue: mp.Queue[OutputMessage],
 ) -> None:
     """_QueueWriter context manager flushes buffer even when exception raised."""
-    output_lines: list[tuple[str, bool]] = []
+    ring_buffer = worker._OutputRingBuffer()
 
     with (
         pytest.raises(RuntimeError),
-        worker._QueueWriter("test_stage", output_queue, is_stderr=False, output_lines=output_lines),
+        worker._QueueWriter("test_stage", output_queue, is_stderr=False, ring_buffer=ring_buffer),
     ):
         print("before error")
         raise RuntimeError("test error")
 
     # Output captured despite exception
-    assert output_lines == [("before error", False)]
+    assert ring_buffer.snapshot() == [("before error", False)]
 
 
 def test_run_stage_function_preserves_output_on_exception(
@@ -509,15 +538,160 @@ def test_run_stage_function_preserves_output_on_exception(
         print("line before error")
         raise RuntimeError("stage failed")
 
-    output_lines: list[tuple[str, bool]] = []
+    ring_buffer = worker._OutputRingBuffer()
     with pytest.raises(RuntimeError):
         worker._run_stage_function_with_injection(
-            failing_stage, "test_stage", output_queue, output_lines
+            failing_stage, "test_stage", output_queue, ring_buffer
         )
 
     # Output captured despite exception
-    assert len(output_lines) == 1
-    assert output_lines[0] == ("line before error", False)
+    assert len(ring_buffer.snapshot()) == 1
+    assert ring_buffer.snapshot()[0] == ("line before error", False)
+
+
+# =============================================================================
+# _OutputRingBuffer Tests
+# =============================================================================
+
+
+def test_ring_buffer_stores_lines_within_capacity() -> None:
+    """Ring buffer stores lines when under max_lines."""
+    buf = worker._OutputRingBuffer(max_lines=5)
+    buf.append("line1", False)
+    buf.append("line2", True)
+    assert buf.snapshot() == [("line1", False), ("line2", True)]
+
+
+def test_ring_buffer_evicts_oldest_on_overflow() -> None:
+    """Ring buffer evicts oldest lines when exceeding max_lines."""
+    buf = worker._OutputRingBuffer(max_lines=3)
+    for i in range(5):
+        buf.append(f"line{i}", False)
+    snap = buf.snapshot()
+    # 2 lines dropped: indicator + 3 kept lines
+    assert len(snap) == 4
+    assert snap[0] == ("[2 earlier lines truncated]", False)
+    assert snap[1] == ("line2", False)
+    assert snap[3] == ("line4", False)
+
+
+def test_ring_buffer_truncation_indicator() -> None:
+    """Ring buffer includes truncation indicator when lines were dropped."""
+    buf = worker._OutputRingBuffer(max_lines=2)
+    for i in range(5):
+        buf.append(f"line{i}", False)
+    snap = buf.snapshot()
+    assert len(snap) == 3  # indicator + 2 kept lines
+    assert snap[0] == ("[3 earlier lines truncated]", False)
+    assert snap[1] == ("line3", False)
+    assert snap[2] == ("line4", False)
+
+
+def test_ring_buffer_no_truncation_indicator_when_no_overflow() -> None:
+    """Ring buffer snapshot returns plain lines when nothing was dropped."""
+    buf = worker._OutputRingBuffer(max_lines=10)
+    buf.append("only line", False)
+    snap = buf.snapshot()
+    assert snap == [("only line", False)]
+
+
+def test_ring_buffer_thread_safe() -> None:
+    """Ring buffer is thread-safe under concurrent appends."""
+    import concurrent.futures
+    import threading
+
+    buf = worker._OutputRingBuffer(max_lines=500)
+    barrier = threading.Barrier(5)
+
+    def writer(tid: int) -> None:
+        barrier.wait()
+        for i in range(100):
+            buf.append(f"t{tid}-{i}", False)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
+        futs = [pool.submit(writer, t) for t in range(5)]
+        for f in futs:
+            f.result()
+
+    snap = buf.snapshot()
+    assert len(snap) == 500
+
+
+def test_ring_buffer_empty_snapshot() -> None:
+    """Ring buffer snapshot returns empty list when no lines appended."""
+    buf = worker._OutputRingBuffer(max_lines=10)
+    assert buf.snapshot() == []
+
+
+def test_ring_buffer_max_lines_one() -> None:
+    """Ring buffer with max_lines=1 keeps only the most recent line."""
+    buf = worker._OutputRingBuffer(max_lines=1)
+    buf.append("first", False)
+    buf.append("second", True)
+    snap = buf.snapshot()
+    # 1 dropped line => indicator + 1 kept line
+    assert len(snap) == 2
+    assert snap[0] == ("[1 earlier lines truncated]", False)
+    assert snap[1] == ("second", True)
+
+
+def test_ring_buffer_truncation_indicator_is_not_stderr() -> None:
+    """Truncation indicator is always marked as stdout even when all dropped lines were stderr."""
+    buf = worker._OutputRingBuffer(max_lines=2)
+    # Append 4 stderr lines; 2 will be dropped
+    for i in range(4):
+        buf.append(f"err{i}", True)
+    snap = buf.snapshot()
+    assert len(snap) == 3  # indicator + 2 kept
+    indicator_line, indicator_is_stderr = snap[0]
+    assert "2 earlier lines truncated" in indicator_line
+    assert indicator_is_stderr is False, "Truncation indicator should not be marked as stderr"
+    # Kept lines are still stderr
+    assert snap[1] == ("err2", True)
+    assert snap[2] == ("err3", True)
+
+
+def test_ring_buffer_snapshot_returns_copy() -> None:
+    """Ring buffer snapshot returns a new list each call (not a reference to internal state)."""
+    buf = worker._OutputRingBuffer(max_lines=10)
+    buf.append("line1", False)
+    snap1 = buf.snapshot()
+    buf.append("line2", False)
+    snap2 = buf.snapshot()
+    assert len(snap1) == 1, "First snapshot should not be affected by later appends"
+    assert len(snap2) == 2
+
+
+def test_queue_writer_fd_is_closed_after_context_exit(
+    output_queue: mp.Queue[OutputMessage],
+) -> None:
+    """_QueueWriter pipe FDs are closed after context manager exit."""
+    ring_buffer = worker._OutputRingBuffer()
+    with worker._QueueWriter(
+        "test_stage", output_queue, is_stderr=False, ring_buffer=ring_buffer
+    ) as writer:
+        write_fd = writer.fileno()
+        read_fd = writer._read_fd
+    # Both FDs should be closed after __exit__
+    with pytest.raises(OSError):
+        os.fstat(write_fd)
+    with pytest.raises(OSError):
+        os.fstat(read_fd)
+
+
+def test_queue_writer_reader_thread_joins_on_exit(
+    output_queue: mp.Queue[OutputMessage],
+) -> None:
+    """_QueueWriter reader thread is joined (not left running) after context exit."""
+    ring_buffer = worker._OutputRingBuffer()
+    with worker._QueueWriter(
+        "test_stage", output_queue, is_stderr=False, ring_buffer=ring_buffer
+    ) as writer:
+        thread = writer._reader_thread
+        assert thread is not None
+        assert thread.is_alive()
+    # Thread should be joined after __exit__
+    assert not thread.is_alive(), "Reader thread should be stopped after context exit"
 
 
 # =============================================================================
@@ -1545,36 +1719,35 @@ def test_queue_writer_thread_safety_concurrent_writes(
     import concurrent.futures
     import threading
 
-    output_lines: list[tuple[str, bool]] = []
+    ring_buffer = worker._OutputRingBuffer()
 
-    writer = worker._QueueWriter(
+    with worker._QueueWriter(
         "test_stage",
         output_queue,
         is_stderr=False,
-        output_lines=output_lines,
-    )
+        ring_buffer=ring_buffer,
+    ) as writer:
+        num_threads = 10
+        lines_per_thread = 100
+        barrier = threading.Barrier(num_threads)
 
-    num_threads = 10
-    lines_per_thread = 100
-    barrier = threading.Barrier(num_threads)
+        def write_lines(thread_id: int) -> None:
+            # Wait for all threads to be ready before starting
+            barrier.wait()
+            for i in range(lines_per_thread):
+                writer.write(f"thread-{thread_id}-line-{i}\n")
 
-    def write_lines(thread_id: int) -> None:
-        # Wait for all threads to be ready before starting
-        barrier.wait()
-        for i in range(lines_per_thread):
-            writer.write(f"thread-{thread_id}-line-{i}\n")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=num_threads) as pool:
+            futures = [pool.submit(write_lines, tid) for tid in range(num_threads)]
+            for f in futures:
+                f.result()
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=num_threads) as pool:
-        futures = [pool.submit(write_lines, tid) for tid in range(num_threads)]
-        for f in futures:
-            f.result()
-
-    writer.flush()
+        writer.flush()
 
     # All lines should be captured (no data loss from race conditions)
     expected_line_count = num_threads * lines_per_thread
-    assert len(output_lines) == expected_line_count, (
-        f"Expected {expected_line_count} lines, got {len(output_lines)} - possible thread safety issue"
+    assert len(ring_buffer.snapshot()) == expected_line_count, (
+        f"Expected {expected_line_count} lines, got {len(ring_buffer.snapshot())} - possible thread safety issue"
     )
 
 
@@ -1592,40 +1765,39 @@ def test_queue_writer_thread_safety_atomic_writes(
     import concurrent.futures
     import threading
 
-    output_lines: list[tuple[str, bool]] = []
+    ring_buffer = worker._OutputRingBuffer()
 
-    writer = worker._QueueWriter(
+    with worker._QueueWriter(
         "test_stage",
         output_queue,
         is_stderr=False,
-        output_lines=output_lines,
-    )
+        ring_buffer=ring_buffer,
+    ) as writer:
+        num_threads = 5
+        lines_per_thread = 10
+        barrier = threading.Barrier(num_threads)
 
-    num_threads = 5
-    lines_per_thread = 10
-    barrier = threading.Barrier(num_threads)
+        def write_complete_lines(thread_id: int) -> None:
+            barrier.wait()
+            # Write complete lines (full line in single write call) - these should NOT interleave
+            for i in range(lines_per_thread):
+                writer.write(f"t{thread_id}-i{i}\n")
 
-    def write_complete_lines(thread_id: int) -> None:
-        barrier.wait()
-        # Write complete lines (full line in single write call) - these should NOT interleave
-        for i in range(lines_per_thread):
-            writer.write(f"t{thread_id}-i{i}\n")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=num_threads) as pool:
+            futures = [pool.submit(write_complete_lines, tid) for tid in range(num_threads)]
+            for f in futures:
+                f.result()
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=num_threads) as pool:
-        futures = [pool.submit(write_complete_lines, tid) for tid in range(num_threads)]
-        for f in futures:
-            f.result()
-
-    writer.flush()
+        writer.flush()
 
     # All lines should be captured
     expected_count = num_threads * lines_per_thread
-    assert len(output_lines) == expected_count, (
-        f"Expected {expected_count} lines, got {len(output_lines)}"
+    assert len(ring_buffer.snapshot()) == expected_count, (
+        f"Expected {expected_count} lines, got {len(ring_buffer.snapshot())}"
     )
 
     # Each line should be properly formatted (not corrupted by interleaving)
-    for line, is_stderr in output_lines:
+    for line, is_stderr in ring_buffer.snapshot():
         assert not is_stderr
         # Line format: t{thread_id}-i{iteration}
         assert line.startswith("t"), f"Corrupted line: {line}"
