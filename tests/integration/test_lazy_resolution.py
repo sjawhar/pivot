@@ -947,3 +947,63 @@ pipeline.register(extra_producer)
     assert "extra_producer" in dag.nodes, "Producer for included consumer's dep should be resolved"
     assert "consumer" in dag.nodes, "Original consumer should still be in DAG"
     assert "producer" in dag.nodes, "Original producer should still be in DAG"
+
+
+def test_resolve_does_not_reload_own_pipeline(set_project_root: pathlib.Path) -> None:
+    """Resolution should not re-execute the pipeline's own module.
+
+    When Tier 3 scans all pipeline.py files, it should skip the one that was
+    already loaded (via pre-seeded cache). Without this fix, the pipeline's
+    module is executed twice — once at discovery and again during resolution.
+    """
+    # Counter file tracks how many times the pipeline module executes
+    counter_file = set_project_root / "load_count.txt"
+    counter_file.write_text("0")
+
+    # Producer in separate dir (unresolvable via traverse-up from consumer)
+    producer_dir = set_project_root / "producer"
+    producer_dir.mkdir()
+    (producer_dir / "pipeline.py").write_text(
+        _make_producer_pipeline_code("producer_pipe", "produce", "shared/data.txt")
+    )
+
+    # Consumer pipeline that increments a counter on each execution
+    consumer_dir = set_project_root / "consumer"
+    consumer_dir.mkdir()
+    (consumer_dir / "pipeline.py").write_text(f'''
+from typing import Annotated, TypedDict
+from pathlib import Path
+from pivot.pipeline import Pipeline
+from pivot import loaders
+from pivot.outputs import Out, Dep
+
+# Track how many times this module is executed
+_counter_path = Path("{counter_file}")
+_count = int(_counter_path.read_text()) + 1
+_counter_path.write_text(str(_count))
+
+pipeline = Pipeline("consumer_pipe")
+
+class _Output(TypedDict):
+    result: Annotated[Path, Out("result.txt", loaders.PathOnly())]
+
+def consume(
+    data: Annotated[Path, Dep("../producer/shared/data.txt", loaders.PathOnly())]
+) -> _Output:
+    return _Output(result=Path("result.txt"))
+
+pipeline.register(consume)
+''')
+
+    # Load pipeline (first execution of module)
+    consumer = discovery.load_pipeline_from_path(consumer_dir / "pipeline.py")
+    assert consumer is not None
+    assert counter_file.read_text() == "1", "Module should be loaded exactly once"
+
+    # build_dag triggers resolve_external_dependencies which scans all pipelines
+    consumer.build_dag(validate=True)
+
+    # Module should NOT be executed again (pre-seeded cache prevents reload)
+    assert counter_file.read_text() == "1", (
+        "Module should not be re-executed during resolution (was loaded twice)"
+    )

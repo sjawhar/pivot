@@ -17,6 +17,7 @@ if TYPE_CHECKING:
 
 # Context key for storing the discovered Pipeline
 PIPELINE_CONTEXT_KEY = "_pivot_pipeline"
+ALL_PIPELINES_CONTEXT_KEY = "_pivot_all_pipelines"
 
 
 def _handle_pivot_error(e: exceptions.PivotError) -> click.ClickException:
@@ -53,7 +54,11 @@ def with_error_handling[**P, R](func: Callable[P, R]) -> Callable[P, R]:
 
 
 def pivot_command(
-    name: str | None = None, *, auto_discover: bool = True, **attrs: Any
+    name: str | None = None,
+    *,
+    auto_discover: bool = True,
+    allow_all: bool = False,
+    **attrs: Any,
 ) -> Callable[[Callable[..., Any]], click.Command]:
     """Create a Click command with Pivot error handling and optional auto-discovery.
 
@@ -65,6 +70,7 @@ def pivot_command(
         auto_discover: If True (default), automatically discover and register
             stages before running the command. Set to False for commands that
             don't need the registry (e.g., init, schema).
+        allow_all: If True, add --all flag for multi-pipeline discovery.
         **attrs: Additional arguments passed to click.command()
 
     Returns:
@@ -74,14 +80,19 @@ def pivot_command(
     def decorator(func: Callable[..., Any]) -> click.Command:
         @functools.wraps(func)
         def wrapper(*args: Any, **kwargs: Any) -> Any:
+            # Pop all_pipelines before passing to the actual function —
+            # it's consumed by the decorator, not the command function
+            use_all = kwargs.pop("all_pipelines", False) if allow_all else False
             _t_total = metrics.start()
             try:
                 # Check if Pipeline is already in context (e.g., when invoking subcommand)
-                if auto_discover and not _has_pipeline_in_context():
+                if (auto_discover or use_all) and not _has_pipeline_in_context():
                     try:
                         _t_discover = metrics.start()
                         try:
-                            pipeline = discovery.discover_pipeline()
+                            pipeline = discovery.discover_pipeline(
+                                all_pipelines=use_all,
+                            )
                             if pipeline is not None:
                                 # Store Pipeline in context for commands that need it
                                 store_pipeline_in_context(pipeline)
@@ -91,6 +102,9 @@ def pivot_command(
                             metrics.end("cli.discover", _t_discover)
                     except discovery.DiscoveryError as e:
                         raise click.ClickException(str(e)) from e
+                # Store all_pipelines flag so Engine can use it for watch mode reload
+                if use_all:
+                    _store_all_pipelines_in_context(use_all)
                 return func(*args, **kwargs)
             finally:
                 metrics.end("cli.total", _t_total)
@@ -98,7 +112,19 @@ def pivot_command(
                     _print_metrics_summary()
 
         wrapped = with_error_handling(wrapper)
-        return click.command(name=name, **attrs)(wrapped)
+        cmd = click.command(name=name, **attrs)(wrapped)
+
+        # Add --all option if allowed
+        if allow_all:
+            cmd = click.option(
+                "--all",
+                "all_pipelines",
+                is_flag=True,
+                default=False,
+                help="Run across all pipelines in the project.",
+            )(cmd)
+
+        return cmd
 
     return decorator
 
@@ -138,6 +164,30 @@ def get_pipeline_from_context() -> Pipeline | None:
 def _has_pipeline_in_context() -> bool:
     """Check if a Pipeline is stored in the current Click context."""
     return get_pipeline_from_context() is not None
+
+
+def _store_all_pipelines_in_context(value: bool) -> None:
+    """Store the all_pipelines flag in the Click context."""
+    ctx = click.get_current_context(silent=True)
+    if ctx is None:
+        return
+    if ctx.obj is None:
+        ctx.obj = {}
+    ctx.obj[ALL_PIPELINES_CONTEXT_KEY] = value  # type: ignore[literal-required]
+
+
+def get_all_pipelines_from_context() -> bool:
+    """Get the all_pipelines flag from Click context.
+
+    Returns False if not set.
+    """
+    ctx = click.get_current_context(silent=True)
+    if ctx is None:
+        return False
+    obj = ctx.obj
+    if obj is None or not isinstance(obj, dict):
+        return False
+    return bool(cast("Any", obj).get(ALL_PIPELINES_CONTEXT_KEY, False))
 
 
 def _print_metrics_summary() -> None:

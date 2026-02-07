@@ -26,7 +26,7 @@ from pivot.types import (
 )
 
 
-@cli_decorators.pivot_command()
+@cli_decorators.pivot_command(allow_all=True)
 @click.argument("stages", nargs=-1, shell_complete=completion.complete_stages)
 @click.option("--verbose", "-v", is_flag=True, help="Show all stages, not just stale")
 @click.option(

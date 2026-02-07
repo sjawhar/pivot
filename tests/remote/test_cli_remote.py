@@ -197,7 +197,9 @@ def test_push_with_targets(
         result = runner.invoke(cli.cli, ["push", "train_model"])
 
         assert result.exit_code == 0
-        mock_target_hashes.assert_called_once_with(["train_model"], state_dir, include_deps=False)
+        mock_target_hashes.assert_called_once_with(
+            ["train_model"], state_dir, include_deps=False, all_stages=None
+        )
 
 
 # =============================================================================

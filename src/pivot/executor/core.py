@@ -320,7 +320,7 @@ def prepare_worker_info(
     Uses stage's state_dir if set, otherwise falls back to default_state_dir.
     """
     # Use stage's state_dir if set, otherwise fall back to default
-    state_dir = stage_info["state_dir"] or default_state_dir
+    state_dir = registry.get_stage_state_dir(stage_info, default_state_dir)
 
     # Ensure state directory exists (workers open StateDB in readonly mode)
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -443,16 +443,17 @@ def check_uncached_incremental_outputs(
     Returns list of (stage_name, output_path) tuples for uncached files.
     """
     uncached = list[tuple[str, str]]()
-    state_dir = config.get_state_dir()
+    default_state_dir = config.get_state_dir()
 
     for stage_name in execution_order:
         stage_info = all_stages[stage_name]
+        stage_state_dir = registry.get_stage_state_dir(stage_info, default_state_dir)
         stage_outs = stage_info["outs"]
 
-        # Read lock file to get cached output hashes
-        stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(state_dir))
+        # Read lock file from stage's state_dir
+        stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(stage_state_dir))
         lock_data = stage_lock.read()
-        output_hashes = lock_data.get("output_hashes", {}) if lock_data else {}
+        output_hashes = lock_data["output_hashes"] if lock_data else {}
 
         for out in stage_outs:
             if isinstance(out, outputs.IncrementalOut):

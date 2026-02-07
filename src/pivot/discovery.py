@@ -52,7 +52,11 @@ def find_config_in_dir(directory: pathlib.Path) -> pathlib.Path | None:
     return None
 
 
-def discover_pipeline(project_root: pathlib.Path | None = None) -> Pipeline | None:
+def discover_pipeline(
+    project_root: pathlib.Path | None = None,
+    *,
+    all_pipelines: bool = False,
+) -> Pipeline | None:
     """Discover and return Pipeline from pivot.yaml or pipeline.py.
 
     Looks for pipeline config in this order:
@@ -63,8 +67,14 @@ def discover_pipeline(project_root: pathlib.Path | None = None) -> Pipeline | No
     - pivot.yaml (or pivot.yml) - creates implicit Pipeline
     - pipeline.py - looks for `pipeline` variable (Pipeline instance)
 
+    When all_pipelines=True, discovers ALL pipeline config files in the project,
+    loads each, and merges them into a single Pipeline via include(). The combined
+    pipeline contains stages from all discovered pipelines, each retaining its
+    original state_dir.
+
     Args:
         project_root: Override project root (default: auto-detect)
+        all_pipelines: If True, discover and combine all pipelines in project.
 
     Returns:
         Pipeline instance, or None if nothing found
@@ -75,6 +85,9 @@ def discover_pipeline(project_root: pathlib.Path | None = None) -> Pipeline | No
     _t = metrics.start()
     try:
         root = project_root or project.get_project_root()
+
+        if all_pipelines:
+            return _discover_all_pipelines(root)
         try:
             cwd = pathlib.Path.cwd().resolve()
             root_resolved = root.resolve()
@@ -150,6 +163,53 @@ def _load_pipeline_from_module(path: pathlib.Path) -> Pipeline | None:
 
     # No Pipeline found anywhere
     return None
+
+
+def _discover_all_pipelines(root: pathlib.Path) -> Pipeline | None:
+    """Discover all pipelines and combine into one.
+
+    Globs all pipeline config files, loads each, and merges via include().
+    """
+    from pivot.pipeline.pipeline import Pipeline
+
+    config_paths = glob_all_pipelines(root)
+    if not config_paths:
+        return None
+
+    pipelines = list[Pipeline]()
+    for path in config_paths:
+        pipeline = load_pipeline_from_path(path)
+        if pipeline is not None:
+            pipelines.append(pipeline)
+        else:
+            logger.warning(f"--all: failed to load pipeline from {path}, skipping")
+
+    if not pipelines:
+        return None
+
+    combined = Pipeline("all", root=root)
+    for pipeline in pipelines:
+        combined.include(pipeline)  # Auto-prefixes on name collision
+
+    # Warn about unresolved external dependencies in --all mode
+    local_outputs = set[str]()
+    all_deps = set[str]()
+    for stage_name in combined.list_stages():
+        info = combined.get(stage_name)
+        local_outputs.update(info["outs_paths"])
+        all_deps.update(info["deps_paths"])
+    unresolved = all_deps - local_outputs
+    if unresolved:
+        sample = ", ".join(sorted(unresolved)[:5])
+        suffix = f"... ({len(unresolved)} total)" if len(unresolved) > 5 else ""
+        logger.warning(
+            f"--all: dependency path(s) not produced by any discovered pipeline: {sample}{suffix}"
+        )
+
+    logger.info(
+        f"Discovered {len(pipelines)} pipelines with {len(combined.list_stages())} total stages"
+    )
+    return combined
 
 
 def find_parent_pipeline_paths(
@@ -231,6 +291,69 @@ def find_pipeline_paths_for_dependency(
         if current == stop_at_resolved or current.parent == current:
             break
         current = current.parent
+
+
+# Directories excluded from all-pipelines scan
+_SCAN_EXCLUDE_DIRS = frozenset(
+    {
+        ".pivot",
+        ".git",
+        ".venv",
+        "venv",
+        "__pycache__",
+        "node_modules",
+        ".tox",
+        ".nox",
+        ".mypy_cache",
+        ".ruff_cache",
+    }
+)
+
+
+def glob_all_pipelines(project_root: pathlib.Path) -> list[pathlib.Path]:
+    """Find all pipeline config files in the project.
+
+    Scans project_root recursively for pipeline.py and pivot.yaml/yml files,
+    skipping common non-project directories (.venv, __pycache__, etc.).
+
+    Deduplicates by directory: if a directory contains both pipeline.py and
+    pivot.yaml, raises DiscoveryError (same constraint as find_config_in_dir).
+
+    Args:
+        project_root: Project root directory to scan.
+
+    Returns:
+        List of paths to pipeline config files.
+
+    Raises:
+        DiscoveryError: If any directory has both pipeline.py and pivot.yaml.
+    """
+    # Collect all candidate paths grouped by directory
+    by_dir = dict[pathlib.Path, list[pathlib.Path]]()
+    target_names = (PIPELINE_PY_NAME, *PIVOT_YAML_NAMES)
+    for name in target_names:
+        for path in project_root.rglob(name):
+            # Only check path components relative to project_root to avoid
+            # false exclusions when project_root itself is inside a directory
+            # named "venv", "__pycache__", etc.
+            try:
+                rel_parts = path.relative_to(project_root).parts
+            except ValueError:
+                continue
+            if any(part in _SCAN_EXCLUDE_DIRS for part in rel_parts):
+                continue
+            by_dir.setdefault(path.parent, list[pathlib.Path]()).append(path)
+
+    # Validate and select canonical config per directory, sorted for deterministic
+    # ordering (auto-prefix collision resolution depends on include order).
+    results = list[pathlib.Path]()
+    for directory in sorted(by_dir):
+        paths = by_dir[directory]
+        chosen = find_config_in_dir(directory) if len(paths) > 1 else paths[0]
+        if chosen is not None:
+            results.append(chosen)
+
+    return results
 
 
 def load_pipeline_from_path(path: pathlib.Path) -> Pipeline | None:

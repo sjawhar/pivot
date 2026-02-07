@@ -1010,3 +1010,290 @@ def test_find_pipeline_paths_for_dependency_no_pipelines(
     paths = list(discovery.find_pipeline_paths_for_dependency(dep_path, tmp_path))
 
     assert paths == []
+
+
+# =============================================================================
+# glob_all_pipelines Tests
+# =============================================================================
+
+
+def test_glob_all_pipelines_finds_pipeline_py(set_project_root: pathlib.Path) -> None:
+    """glob_all_pipelines discovers pipeline.py files in subdirectories."""
+    sub = set_project_root / "sub"
+    sub.mkdir()
+    (sub / "pipeline.py").write_text("pipeline = None")
+
+    result = discovery.glob_all_pipelines(set_project_root)
+
+    assert len(result) == 1
+    assert result[0] == sub / "pipeline.py"
+
+
+def test_glob_all_pipelines_finds_pivot_yaml(set_project_root: pathlib.Path) -> None:
+    """glob_all_pipelines discovers pivot.yaml files in subdirectories."""
+    sub = set_project_root / "sub"
+    sub.mkdir()
+    (sub / "pivot.yaml").write_text("stages: {}")
+
+    result = discovery.glob_all_pipelines(set_project_root)
+
+    assert len(result) == 1
+    assert result[0] == sub / "pivot.yaml"
+
+
+def test_glob_all_pipelines_skips_excluded_dirs(set_project_root: pathlib.Path) -> None:
+    """glob_all_pipelines skips .venv, __pycache__, .git, etc."""
+    venv = set_project_root / ".venv" / "lib"
+    venv.mkdir(parents=True)
+    (venv / "pipeline.py").write_text("pipeline = None")
+
+    result = discovery.glob_all_pipelines(set_project_root)
+
+    assert len(result) == 0
+
+
+def test_glob_all_pipelines_deduplicates_by_directory(
+    set_project_root: pathlib.Path,
+) -> None:
+    """glob_all_pipelines raises DiscoveryError if directory has both config types.
+
+    A directory with both pipeline.py and pivot.yaml is ambiguous. This is the
+    same constraint as find_config_in_dir but applied during project-wide scan.
+    """
+    sub = set_project_root / "sub"
+    sub.mkdir()
+    (sub / "pipeline.py").write_text("pipeline = None")
+    (sub / "pivot.yaml").write_text("stages: {}")
+
+    with pytest.raises(discovery.DiscoveryError, match="both"):
+        discovery.glob_all_pipelines(set_project_root)
+
+
+def test_glob_all_pipelines_finds_multiple_pipelines(
+    set_project_root: pathlib.Path,
+) -> None:
+    """glob_all_pipelines finds pipelines in multiple subdirectories."""
+    for name in ("alpha", "beta", "gamma"):
+        sub = set_project_root / name
+        sub.mkdir()
+        (sub / "pipeline.py").write_text("pipeline = None")
+
+    result = discovery.glob_all_pipelines(set_project_root)
+
+    assert len(result) == 3
+
+
+# =============================================================================
+# discover_pipeline(all_pipelines=True) Tests
+# =============================================================================
+
+
+def test_discover_all_pipelines_combines_stages(
+    set_project_root: pathlib.Path,
+) -> None:
+    """discover_pipeline(all_pipelines=True) creates a combined pipeline with all stages."""
+    from pivot.pipeline.pipeline import Pipeline
+
+    # Create two sub-pipelines with distinct stages
+    for name, stage_name in [("alpha", "stage_a"), ("beta", "stage_b")]:
+        sub = set_project_root / name
+        sub.mkdir()
+        code = f"""\
+from pivot.pipeline.pipeline import Pipeline
+
+pipeline = Pipeline("{name}", root=__import__("pathlib").Path(__file__).parent)
+
+def _stage():
+    pass
+
+pipeline.register(_stage, name="{stage_name}")
+"""
+        (sub / "pipeline.py").write_text(code)
+
+    result = discovery.discover_pipeline(set_project_root, all_pipelines=True)
+
+    assert result is not None
+    assert isinstance(result, Pipeline)
+    assert "stage_a" in result.list_stages()
+    assert "stage_b" in result.list_stages()
+
+
+def test_discover_all_pipelines_preserves_state_dir(
+    set_project_root: pathlib.Path,
+) -> None:
+    """Each included stage retains its original pipeline's state_dir."""
+    alpha_dir = set_project_root / "alpha"
+    alpha_dir.mkdir()
+    code_a = """\
+from pivot.pipeline.pipeline import Pipeline
+
+pipeline = Pipeline("alpha", root=__import__("pathlib").Path(__file__).parent)
+
+def _stage():
+    pass
+
+pipeline.register(_stage, name="stage_a")
+"""
+    (alpha_dir / "pipeline.py").write_text(code_a)
+
+    result = discovery.discover_pipeline(set_project_root, all_pipelines=True)
+
+    assert result is not None
+    info = result.get("stage_a")
+    assert info["state_dir"] == alpha_dir / ".pivot"
+
+
+def test_discover_all_pipelines_name_collision_auto_prefixes(
+    set_project_root: pathlib.Path,
+) -> None:
+    """Name collisions across pipelines are resolved by auto-prefixing."""
+    for name in ("alpha", "beta"):
+        sub = set_project_root / name
+        sub.mkdir()
+        code = f"""\
+from pivot.pipeline.pipeline import Pipeline
+
+pipeline = Pipeline("{name}", root=__import__("pathlib").Path(__file__).parent)
+
+def _stage():
+    pass
+
+pipeline.register(_stage, name="duplicate_name")
+"""
+        (sub / "pipeline.py").write_text(code)
+
+    result = discovery.discover_pipeline(set_project_root, all_pipelines=True)
+
+    assert result is not None
+    stage_names = result.list_stages()
+    # One pipeline keeps bare name, the other gets prefixed
+    assert "duplicate_name" in stage_names
+    prefixed = [n for n in stage_names if "/" in n and n.endswith("/duplicate_name")]
+    assert len(prefixed) == 1, f"Expected one prefixed stage, got: {stage_names}"
+
+
+def test_discover_all_pipelines_returns_none_when_empty(
+    set_project_root: pathlib.Path,
+) -> None:
+    """discover_pipeline(all_pipelines=True) returns None when no pipelines found."""
+    result = discovery.discover_pipeline(set_project_root, all_pipelines=True)
+
+    assert result is None
+
+
+def test_discover_all_pipelines_skips_failed_loads(
+    set_project_root: pathlib.Path,
+) -> None:
+    """discover_pipeline(all_pipelines=True) skips pipelines that fail to load.
+
+    When a sub-pipeline has a broken config (e.g., wrong variable name),
+    it should be skipped rather than failing the entire discovery. This
+    prevents one bad pipeline from blocking all others.
+    """
+    from pivot.pipeline.pipeline import Pipeline
+
+    # Create a valid sub-pipeline
+    good_dir = set_project_root / "good"
+    good_dir.mkdir()
+    good_code = """\
+from pivot.pipeline.pipeline import Pipeline
+
+pipeline = Pipeline("good", root=__import__("pathlib").Path(__file__).parent)
+
+def _stage():
+    pass
+
+pipeline.register(_stage, name="good_stage")
+"""
+    (good_dir / "pipeline.py").write_text(good_code)
+
+    # Create a broken sub-pipeline (wrong variable name triggers DiscoveryError)
+    bad_dir = set_project_root / "bad"
+    bad_dir.mkdir()
+    bad_code = """\
+from pivot.pipeline.pipeline import Pipeline
+wrong_name = Pipeline("bad")
+"""
+    (bad_dir / "pipeline.py").write_text(bad_code)
+
+    result = discovery.discover_pipeline(set_project_root, all_pipelines=True)
+
+    # Should succeed, only including the good pipeline
+    assert result is not None
+    assert isinstance(result, Pipeline)
+    assert "good_stage" in result.list_stages()
+    assert len(result.list_stages()) == 1, "Only the good pipeline's stages should be included"
+
+
+def test_discover_all_pipelines_warns_on_unresolved_deps(
+    set_project_root: pathlib.Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """discover_pipeline(all_pipelines=True) warns when deps are not produced by any pipeline.
+
+    When a stage depends on a file not produced by any discovered pipeline,
+    a warning is logged. This catches missing cross-pipeline dependencies early.
+    """
+    # Create a pipeline with a stage that has a dep not produced by any pipeline
+    sub_dir = set_project_root / "sub"
+    sub_dir.mkdir()
+    code = """\
+import pathlib
+from typing import Annotated, TypedDict
+from pivot.pipeline.pipeline import Pipeline
+from pivot import loaders, outputs
+
+pipeline = Pipeline("sub", root=__import__("pathlib").Path(__file__).parent)
+
+class _Outputs(TypedDict):
+    out: Annotated[pathlib.Path, outputs.Out("result.csv", loaders.PathOnly())]
+
+def _stage(
+    external: Annotated[pathlib.Path, outputs.Dep("external_data.csv", loaders.PathOnly())],
+) -> _Outputs:
+    return {"out": pathlib.Path("result.csv")}
+
+pipeline.register(_stage, name="consumer")
+"""
+    (sub_dir / "pipeline.py").write_text(code)
+
+    with caplog.at_level(logging.WARNING):
+        result = discovery.discover_pipeline(set_project_root, all_pipelines=True)
+
+    assert result is not None
+    assert "consumer" in result.list_stages()
+    # Should warn about the unresolved dependency
+    assert any("not produced by any discovered pipeline" in msg for msg in caplog.messages), (
+        f"Expected warning about unresolved deps, got: {caplog.messages}"
+    )
+
+
+def test_glob_all_pipelines_finds_pivot_yml(set_project_root: pathlib.Path) -> None:
+    """glob_all_pipelines discovers pivot.yml files in subdirectories."""
+    sub = set_project_root / "sub"
+    sub.mkdir()
+    (sub / "pivot.yml").write_text("stages: {}")
+
+    result = discovery.glob_all_pipelines(set_project_root)
+
+    assert len(result) == 1
+    assert result[0] == sub / "pivot.yml"
+
+
+def test_discover_all_pipelines_returns_none_when_all_fail(
+    set_project_root: pathlib.Path,
+) -> None:
+    """discover_pipeline(all_pipelines=True) returns None when all pipelines fail to load.
+
+    If every discovered config file fails to load (e.g., all have errors),
+    the function should return None rather than an empty pipeline.
+    """
+    # Create two broken sub-pipelines
+    for name in ("broken1", "broken2"):
+        sub = set_project_root / name
+        sub.mkdir()
+        (sub / "pipeline.py").write_text("raise RuntimeError('intentional')\n")
+
+    result = discovery.discover_pipeline(set_project_root, all_pipelines=True)
+
+    assert result is None

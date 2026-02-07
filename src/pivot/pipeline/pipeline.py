@@ -19,22 +19,6 @@ if TYPE_CHECKING:
 
     from pivot.types import StageFunc
 
-# Directories excluded from tier 3 full scan
-_SCAN_EXCLUDE_DIRS = frozenset(
-    {
-        ".pivot",
-        ".git",
-        ".venv",
-        "venv",
-        "__pycache__",
-        "node_modules",
-        ".tox",
-        ".nox",
-        ".mypy_cache",
-        ".ruff_cache",
-    }
-)
-
 # Pipeline name pattern: alphanumeric, underscore, hyphen (like stage names)
 _PIPELINE_NAME_PATTERN = re.compile(r"^[a-zA-Z][a-zA-Z0-9_-]*$")
 
@@ -77,12 +61,15 @@ def _find_pipeline_dir_for_stage(
 def _find_producer_in_pipeline(
     dep_path: str,
     pipeline: Pipeline,
-) -> registry.RegistryStageInfo | None:
-    """Find the stage in a pipeline that produces dep_path."""
+) -> tuple[registry.RegistryStageInfo, str] | None:
+    """Find the stage in a pipeline that produces dep_path.
+
+    Returns (stage_info, pipeline_name) or None if not found.
+    """
     for name in pipeline.list_stages():
         info = pipeline.get(name)
         if dep_path in info["outs_paths"]:
-            return info
+            return info, pipeline.name
     return None
 
 
@@ -100,8 +87,11 @@ def _find_producer_via_traversal(
     dep_path: str,
     project_root: pathlib.Path,
     loaded_pipelines: dict[pathlib.Path, Pipeline | None],
-) -> registry.RegistryStageInfo | None:
-    """Tier 1: Walk up from dep's directory looking for a producer."""
+) -> tuple[registry.RegistryStageInfo, str] | None:
+    """Tier 1: Walk up from dep's directory looking for a producer.
+
+    Returns (stage_info, pipeline_name) or None.
+    """
     pipeline_files = discovery.find_pipeline_paths_for_dependency(
         pathlib.Path(dep_path), project_root
     )
@@ -109,9 +99,9 @@ def _find_producer_via_traversal(
         pipeline = _load_pipeline(pipeline_file, loaded_pipelines)
         if pipeline is None:
             continue
-        producer = _find_producer_in_pipeline(dep_path, pipeline)
-        if producer is not None:
-            return producer
+        result = _find_producer_in_pipeline(dep_path, pipeline)
+        if result is not None:
+            return result
     return None
 
 
@@ -119,8 +109,11 @@ def _find_producer_via_index(
     dep_path: str,
     project_root: pathlib.Path,
     loaded_pipelines: dict[pathlib.Path, Pipeline | None],
-) -> registry.RegistryStageInfo | None:
-    """Tier 2: Read cached output index hint, verify it's still valid."""
+) -> tuple[registry.RegistryStageInfo, str] | None:
+    """Tier 2: Read cached output index hint, verify it's still valid.
+
+    Returns (stage_info, pipeline_name) or None.
+    """
     # Index keys are project-relative; dep_path is absolute
     try:
         rel_dep = str(pathlib.Path(dep_path).relative_to(project_root))
@@ -145,30 +138,22 @@ def _find_producer_via_index(
     return _find_producer_in_pipeline(dep_path, pipeline)
 
 
-def _glob_all_pipelines(project_root: pathlib.Path) -> list[pathlib.Path]:
-    """Glob all pipeline.py and pivot.yaml/yml files in the project."""
-    results = list[pathlib.Path]()
-    target_names = (discovery.PIPELINE_PY_NAME, *discovery.PIVOT_YAML_NAMES)
-    for name in target_names:
-        for path in project_root.rglob(name):
-            if not any(part in _SCAN_EXCLUDE_DIRS for part in path.parts):
-                results.append(path)
-    return results
-
-
 def _find_producer_via_scan(
     dep_path: str,
     all_pipeline_paths: list[pathlib.Path],
     loaded_pipelines: dict[pathlib.Path, Pipeline | None],
-) -> registry.RegistryStageInfo | None:
-    """Tier 3: Full scan of all pipeline files in the project."""
+) -> tuple[registry.RegistryStageInfo, str] | None:
+    """Tier 3: Full scan of all pipeline files in the project.
+
+    Returns (stage_info, pipeline_name) or None.
+    """
     for pipeline_file in all_pipeline_paths:
         pipeline = _load_pipeline(pipeline_file, loaded_pipelines)
         if pipeline is None:
             continue
-        producer = _find_producer_in_pipeline(dep_path, pipeline)
-        if producer is not None:
-            return producer
+        result = _find_producer_in_pipeline(dep_path, pipeline)
+        if result is not None:
+            return result
     return None
 
 
@@ -459,36 +444,50 @@ class Pipeline:
         The copy is a point-in-time snapshot; subsequent changes to the source
         pipeline are not reflected.
 
+        On name collision, all stages from the incoming pipeline are automatically
+        prefixed with ``{other.name}/`` to disambiguate. The first pipeline's
+        stages keep their bare names.
+
         Args:
             other: Pipeline whose stages to include.
 
         Raises:
-            PipelineConfigError: If ``other`` is ``self`` (self-include) or if
-                any stage name in ``other`` already exists in this pipeline.
+            PipelineConfigError: If ``other`` is ``self`` (self-include).
         """
         if other is self:
             raise PipelineConfigError(f"Pipeline '{self.name}' cannot include itself")
 
-        # Collect stages to add (validates all before adding any - atomic)
-        stages_to_add = list[registry.RegistryStageInfo]()
+        # Check if any names collide — if so, prefix all incoming stages
         existing_names = set(self._registry.list_stages())
+        needs_prefix = any(name in existing_names for name in other.list_stages())
 
+        # Collect stages to add with deep copy
+        stages_to_add = list[registry.RegistryStageInfo]()
         for stage_name in other.list_stages():
-            if stage_name in existing_names:
-                raise PipelineConfigError(
-                    f"Cannot include pipeline '{other.name}': stage '{stage_name}' already exists in '{self.name}'. Rename the stage using name= at registration time."
-                )
-            # Deep copy to prevent shared mutable state
-            stages_to_add.append(copy.deepcopy(other.get(stage_name)))
+            stage_info = copy.deepcopy(other.get(stage_name))
+            if needs_prefix:
+                prefixed = f"{other.name}/{stage_name}"
+                # If the prefixed name also collides (e.g. two pipelines with the
+                # same name both have a stage with the same name), add a numeric
+                # suffix to guarantee uniqueness.
+                if prefixed in existing_names:
+                    counter = 2
+                    while f"{prefixed}_{counter}" in existing_names:
+                        counter += 1
+                    prefixed = f"{prefixed}_{counter}"
+                stage_info["name"] = prefixed
+            stages_to_add.append(stage_info)
 
-        # Add all stages (only reached if validation passes)
+        # Add all stages (and track names to avoid intra-batch collisions)
         for stage_info in stages_to_add:
             self._registry.add_existing(stage_info)
+            existing_names.add(stage_info["name"])
 
         if stages_to_add:
             self._reset_resolution_cache()
+            prefix_note = f" (prefixed with '{other.name}/')" if needs_prefix else ""
             logger.debug(
-                f"Included {len(stages_to_add)} stages from pipeline '{other.name}' into '{self.name}'"
+                f"Included {len(stages_to_add)} stages from pipeline '{other.name}' into '{self.name}'{prefix_note}"
             )
 
     def resolve_external_dependencies(self) -> None:
@@ -526,6 +525,11 @@ class Pipeline:
         loaded_pipelines = dict[pathlib.Path, Pipeline | None]()
         all_pipeline_paths: list[pathlib.Path] | None = None  # lazy, for tier 3
 
+        # Pre-seed cache with own config path to prevent re-loading self
+        own_config = discovery.find_config_in_dir(self._root)
+        if own_config is not None:
+            loaded_pipelines[own_config] = self
+
         # Process work queue iteratively
         while work:
             dep_path = work.pop()
@@ -535,29 +539,32 @@ class Pipeline:
                 continue
 
             # Tier 1: traverse-up (existing behavior)
-            producer = _find_producer_via_traversal(dep_path, project_root, loaded_pipelines)
+            result = _find_producer_via_traversal(dep_path, project_root, loaded_pipelines)
 
             # Tier 2: output index cache
-            if producer is None:
-                producer = _find_producer_via_index(dep_path, project_root, loaded_pipelines)
+            if result is None:
+                result = _find_producer_via_index(dep_path, project_root, loaded_pipelines)
 
             # Tier 3: full scan
-            if producer is None:
+            if result is None:
                 if all_pipeline_paths is None:
-                    all_pipeline_paths = _glob_all_pipelines(project_root)
-                producer = _find_producer_via_scan(dep_path, all_pipeline_paths, loaded_pipelines)
+                    all_pipeline_paths = discovery.glob_all_pipelines(project_root)
+                result = _find_producer_via_scan(dep_path, all_pipeline_paths, loaded_pipelines)
 
-            if producer is None:
+            if result is None:
                 continue
 
+            producer, source_pipeline_name = result
             producer_name = producer["name"]
 
             # Skip if already included (idempotency)
             if producer_name in self._registry.list_stages():
                 continue
 
-            # Include the producer stage
+            # Include the producer stage, prefixing on name collision
             stage_info = copy.deepcopy(producer)
+            if stage_info["name"] in self._registry.list_stages():
+                stage_info["name"] = f"{source_pipeline_name}/{stage_info['name']}"
             self._registry.add_existing(stage_info)
             local_outputs.update(stage_info["outs_paths"])
 

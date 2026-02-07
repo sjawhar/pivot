@@ -41,6 +41,7 @@ if TYPE_CHECKING:
 
     from pivot.executor import ExecutionSummary
     from pivot.tui import console as tui_console
+    from pivot.types import StageExplanation
 
 
 _logger = logging.getLogger(__name__)
@@ -98,15 +99,17 @@ def _configure_oneshot_source(
     )
 
 
-def _output_explain(
+def _get_explanations(
     stages_list: list[str] | None,
     force: bool = False,
     allow_missing: bool = False,
-) -> None:
-    """Output detailed stage explanations using status logic."""
+) -> list[StageExplanation]:
+    """Resolve dependencies, build graph, and return stage explanations.
+
+    Shared by --explain and --dry-run modes.
+    """
     from pivot import project
     from pivot import status as status_mod
-    from pivot.cli import status as status_cli
     from pivot.engine import graph as engine_graph
     from pivot.storage import track
 
@@ -122,7 +125,7 @@ def _output_explain(
         all_stages, validate=not allow_missing, tracked_files=tracked_files
     )
 
-    explanations = status_mod.get_pipeline_explanations(
+    return status_mod.get_pipeline_explanations(
         stages_list,
         single_stage=False,
         all_stages=all_stages,
@@ -131,6 +134,17 @@ def _output_explain(
         allow_missing=allow_missing,
         graph=graph,
     )
+
+
+def _output_explain(
+    stages_list: list[str] | None,
+    force: bool = False,
+    allow_missing: bool = False,
+) -> None:
+    """Output detailed stage explanations using status logic."""
+    from pivot.cli import status as status_cli
+
+    explanations = _get_explanations(stages_list, force, allow_missing)
     status_cli.output_explain_text(explanations)
 
 
@@ -142,37 +156,11 @@ def _dry_run(
     quiet: bool,
 ) -> None:
     """Show what would run without executing."""
-    from pivot import project
-    from pivot import status as status_mod
-    from pivot.engine import graph as engine_graph
-    from pivot.storage import track
-
     # Quiet mode suppresses output (except JSON which is always emitted)
     if quiet and not as_json:
         return
 
-    # Resolve cross-pipeline dependencies before getting stages
-    # (build_dag() does this automatically, but dry-run builds the graph directly)
-    cli_helpers.resolve_external_dependencies()
-
-    all_stages = cli_helpers.get_all_stages()
-
-    # Build graph with validation when allow_missing is False
-    # When allow_missing=True, tracked files are used for validation
-    tracked_files = track.discover_pvt_files(project.get_project_root()) if allow_missing else None
-    graph = engine_graph.build_graph(
-        all_stages, validate=not allow_missing, tracked_files=tracked_files
-    )
-
-    explanations = status_mod.get_pipeline_explanations(
-        stages_list,
-        single_stage=False,
-        force=force,
-        allow_missing=allow_missing,
-        graph=graph,
-        all_stages=all_stages,
-        stage_registry=cli_helpers.get_registry(),
-    )
+    explanations = _get_explanations(stages_list, force, allow_missing)
 
     if not explanations:
         if as_json:
@@ -357,6 +345,7 @@ def _run_watch_mode(  # noqa: PLR0913 - many params needed for different modes
     display_order = _run_common.sort_for_display(execution_order, graph) if execution_order else []
 
     pipeline = cli_decorators.get_pipeline_from_context()
+    use_all_pipelines = cli_decorators.get_all_pipelines_from_context()
 
     if tui and run_id:
         # TUI mode with async Engine
@@ -378,7 +367,7 @@ def _run_watch_mode(  # noqa: PLR0913 - many params needed for different modes
             """Run the async Engine in a background thread with its own event loop."""
 
             async def engine_main() -> None:
-                async with engine.Engine(pipeline=pipeline) as eng:
+                async with engine.Engine(pipeline=pipeline, all_pipelines=use_all_pipelines) as eng:
                     # Configure sinks - TuiSink posts to app (thread-safe)
                     _run_common.configure_result_collector(eng)
                     _run_common.configure_output_sink(
@@ -446,7 +435,7 @@ def _run_watch_mode(  # noqa: PLR0913 - many params needed for different modes
     else:
         # Non-TUI async mode
         async def watch_main() -> None:
-            async with engine.Engine(pipeline=pipeline) as eng:
+            async with engine.Engine(pipeline=pipeline, all_pipelines=use_all_pipelines) as eng:
                 # Configure sinks
                 _run_common.configure_result_collector(eng)
                 _run_common.configure_output_sink(
@@ -509,6 +498,7 @@ def _run_serve_mode(
 
     # Get pipeline for Engine
     pipeline = cli_decorators.get_pipeline_from_context()
+    use_all_pipelines = cli_decorators.get_all_pipelines_from_context()
 
     async def serve_main() -> None:
         # Build watch paths
@@ -516,7 +506,7 @@ def _run_serve_mode(
         bipartite_graph = engine_graph.build_graph(all_stages)
         watch_paths = engine_graph.get_watch_paths(bipartite_graph)
 
-        async with engine.Engine(pipeline=pipeline) as eng:
+        async with engine.Engine(pipeline=pipeline, all_pipelines=use_all_pipelines) as eng:
             # Add filesystem watch source
             eng.add_source(
                 engine_sources.FilesystemSource(
@@ -586,6 +576,7 @@ def _run_oneshot_mode(
     display_order = _run_common.sort_for_display(execution_order, graph) if execution_order else []
 
     pipeline = cli_decorators.get_pipeline_from_context()
+    use_all_pipelines = cli_decorators.get_all_pipelines_from_context()
 
     # TUI mode for oneshot
     # IMPORTANT: Textual must run in the main thread for signal handlers (SIGTSTP, etc.)
@@ -610,7 +601,7 @@ def _run_oneshot_mode(
             """Run the async Engine in a background thread with its own event loop."""
 
             async def engine_main() -> dict[str, executor_core.ExecutionSummary]:
-                async with engine.Engine(pipeline=pipeline) as eng:
+                async with engine.Engine(pipeline=pipeline, all_pipelines=use_all_pipelines) as eng:
                     # Configure sinks - TuiSink posts to app (thread-safe)
                     result_sink = _run_common.configure_result_collector(eng)
                     _run_common.configure_output_sink(
@@ -665,7 +656,7 @@ def _run_oneshot_mode(
     start_time = time.perf_counter()
 
     async def oneshot_main() -> dict[str, executor_core.ExecutionSummary]:
-        async with engine.Engine(pipeline=pipeline) as eng:
+        async with engine.Engine(pipeline=pipeline, all_pipelines=use_all_pipelines) as eng:
             result_sink = _run_common.configure_result_collector(eng)
             _run_common.configure_output_sink(
                 eng,
@@ -720,7 +711,7 @@ def _run_oneshot_mode(
     return results
 
 
-@cli_decorators.pivot_command()
+@cli_decorators.pivot_command(allow_all=True)
 @click.argument("stages", nargs=-1, shell_complete=completion.complete_stages)
 @click.option("--dry-run", "-n", is_flag=True, help="Show what would run without executing")
 @click.option(

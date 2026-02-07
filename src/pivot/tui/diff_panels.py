@@ -20,7 +20,7 @@ import textual.containers
 import textual.css.query
 import textual.widgets
 
-from pivot import config, explain, outputs, parameters, project
+from pivot import config, explain, outputs, parameters, project, registry
 from pivot.cli import helpers as cli_helpers
 from pivot.show import data as data_mod
 from pivot.show import metrics as metrics_mod
@@ -447,7 +447,7 @@ class InputDiffPanel(_SelectableExpandablePanel):
             logger.debug("Stage %s not in registry", stage_name)
             return
 
-        state_dir = config.get_state_dir()
+        state_dir = registry.get_stage_state_dir(self._registry_info, config.get_state_dir())
         try:
             fingerprint = self._stage_data_provider.ensure_fingerprint(stage_name)
             self._explanation = explain.get_stage_explanation(
@@ -770,7 +770,7 @@ class OutputDiffPanel(_SelectableExpandablePanel):
             logger.debug("Stage %s not in registry", stage_name)
             return
 
-        state_dir = config.get_state_dir()
+        state_dir = registry.get_stage_state_dir(self._registry_info, config.get_state_dir())
         stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(state_dir))
         try:
             lock_data = stage_lock.read()

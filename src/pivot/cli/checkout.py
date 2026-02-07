@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Literal, cast
 
 import click
 
-from pivot import config, path_utils, project
+from pivot import config, path_utils, project, registry
 from pivot.cli import completion
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
@@ -32,11 +32,13 @@ class CheckoutBehavior(enum.StrEnum):
     FORCE = "force"  # Overwrite existing files (--force)
 
 
-def _get_stage_output_info(state_dir: pathlib.Path) -> dict[str, HashInfo]:
+def _get_stage_output_info() -> dict[str, HashInfo]:
     """Get output hash info from lock files for cached stage outputs only.
 
     Non-cached outputs (e.g. Metric with cache=False) are excluded —
     they are git-tracked and not Pivot's responsibility to restore.
+
+    Uses per-stage state_dir from the registry for lock file lookup.
     """
     result = dict[str, HashInfo]()
 
@@ -51,9 +53,10 @@ def _get_stage_output_info(state_dir: pathlib.Path) -> dict[str, HashInfo]:
             if out.cache
         }
 
-        stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(state_dir))
+        stage_state_dir = registry.get_stage_state_dir(stage_info, config.get_state_dir())
+        stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(stage_state_dir))
         lock_data = stage_lock.read()
-        if lock_data and "output_hashes" in lock_data:
+        if lock_data:
             for out_path, out_hash in lock_data["output_hashes"].items():
                 norm_path = path_utils.preserve_trailing_slash(
                     out_path, str(project.normalize_path(out_path))
@@ -330,7 +333,6 @@ def checkout(
 
     project_root = project.get_project_root()
     cache_dir = config.get_cache_dir() / "files"
-    state_dir = config.get_state_dir()
 
     # Determine checkout modes - CLI flag overrides config (single mode, no fallback)
     checkout_modes = (
@@ -341,7 +343,7 @@ def checkout(
     tracked_files = track.discover_pvt_files(project_root)
 
     # Get stage output info from lock files (cached outputs only)
-    stage_outputs = _get_stage_output_info(state_dir)
+    stage_outputs = _get_stage_output_info()
 
     # Run async checkout
     failures, restored, skipped = asyncio.run(
