@@ -5,6 +5,7 @@ import importlib
 import linecache
 import logging
 import multiprocessing as mp
+import os
 import pathlib
 import subprocess
 import sys
@@ -35,6 +36,48 @@ if TYPE_CHECKING:
 
 # Type alias for git_repo fixture: (repo_path, commit_fn)
 GitRepo = tuple[pathlib.Path, Callable[[str], str]]
+
+_MEMORY_PER_WORKER_BYTES = 2 * 1024**3
+_MAX_WORKERS_CAP = 16
+
+
+@pytest.hookimpl(tryfirst=True, optionalhook=True)
+def pytest_xdist_auto_num_workers(config: pytest.Config) -> int:
+    """Cap ``-n auto`` based on cgroup memory, not CPU count.
+
+    Each xdist worker spawns loky workers + a multiprocessing Manager,
+    so ~2 GB per worker is needed. Falls back to min(cpu_count, 8)
+    outside containers, capped at 16 workers.
+    """
+    try:
+        cpu_count = len(os.sched_getaffinity(0))
+    except AttributeError:
+        cpu_count = os.cpu_count() or 1
+    limit_bytes = _get_cgroup_memory_limit_bytes()
+    if limit_bytes is not None:
+        workers = min(limit_bytes // _MEMORY_PER_WORKER_BYTES, cpu_count)
+    else:
+        workers = min(cpu_count, 8)
+    return max(1, min(workers, _MAX_WORKERS_CAP))
+
+
+def _get_cgroup_memory_limit_bytes() -> int | None:
+    try:
+        v2 = pathlib.Path("/sys/fs/cgroup/memory.max")
+        if v2.exists():
+            text = v2.read_text().strip()
+            if text != "max":
+                return int(text)
+
+        v1 = pathlib.Path("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+        if v1.exists():
+            limit = int(v1.read_text().strip())
+            if limit < (1 << 60):
+                return limit
+    except (OSError, ValueError):
+        pass
+
+    return None
 
 
 @pytest.fixture
