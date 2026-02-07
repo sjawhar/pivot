@@ -70,90 +70,98 @@ def commit_stages(
     failed = list[str]()
     overrides = parameters.load_params_yaml()
 
-    for stage_name in targets:
-        stage_info = stage_registry.get(stage_name)
+    with state_mod.StateDB(state_db_path) as state_db:
+        for stage_name in targets:
+            stage_info = stage_registry.get(stage_name)
 
-        # 1. Get fingerprint
-        fingerprint = stage_registry.ensure_fingerprint(stage_name)
+            # 1. Get fingerprint
+            fingerprint = stage_registry.ensure_fingerprint(stage_name)
 
-        # 2. Get effective params
-        current_params = parameters.get_effective_params(
-            stage_info["params"], stage_name, overrides
-        )
-
-        # 3. Hash deps
-        dep_hashes, missing, unreadable = worker.hash_dependencies(stage_info["deps_paths"])
-        if missing:
-            logger.error("Stage '%s': missing deps: %s — skipping", stage_name, ", ".join(missing))
-            failed.append(stage_name)
-            continue
-        if unreadable:
-            logger.error(
-                "Stage '%s': unreadable deps: %s — skipping", stage_name, ", ".join(unreadable)
+            # 2. Get effective params
+            current_params = parameters.get_effective_params(
+                stage_info["params"], stage_name, overrides
             )
-            failed.append(stage_name)
-            continue
 
-        # 4. Compute input_hash
-        stage_outs = stage_info["outs"]
-        out_specs = [(worker.normalize_out_path(str(out.path)), out.cache) for out in stage_outs]
-        deps_list = [
-            DepEntry(path=dep_path, hash=info["hash"]) for dep_path, info in dep_hashes.items()
-        ]
-        input_hash = run_history.compute_input_hash(
-            fingerprint, current_params, deps_list, out_specs
-        )
-
-        # Compute normalized output paths once (used for skip check, lock data, and StateDB)
-        out_paths = [worker.normalize_out_path(str(out.path)) for out in stage_outs]
-        production_lock = lock.StageLock(stage_name, stages_dir)
-
-        # 5. If not force and no explicit stages, check lock — skip if unchanged
-        if not force and stage_names is None:
-            lock_data = production_lock.read()
-            if lock_data is not None:
-                changed, _ = production_lock.is_changed_with_lock_data(
-                    lock_data, fingerprint, current_params, dep_hashes, out_paths
+            # 3. Hash deps (pass state_db for hash caching)
+            dep_hashes, missing, unreadable = worker.hash_dependencies(
+                stage_info["deps_paths"], state_db
+            )
+            if missing:
+                logger.error(
+                    "Stage '%s': missing deps: %s — skipping", stage_name, ", ".join(missing)
                 )
-                if not changed:
-                    continue
-
-        # 6. Hash and cache outputs
-        output_hashes = dict[str, HashInfo]()
-        outputs_missing = False
-
-        for out in stage_outs:
-            out_path = pathlib.Path(cast("str", out.path))
-            if not out_path.exists():
-                logger.error("Stage '%s': output missing: %s — skipping", stage_name, out.path)
-                outputs_missing = True
-                break
-
-            if out.cache:
-                output_hashes[str(out.path)] = cache.save_to_cache(
-                    out_path, files_cache_dir, checkout_modes=checkout_modes
+                failed.append(stage_name)
+                continue
+            if unreadable:
+                logger.error(
+                    "Stage '%s': unreadable deps: %s — skipping",
+                    stage_name,
+                    ", ".join(unreadable),
                 )
-            else:
-                output_hashes[str(out.path)] = worker.hash_output(out_path)
+                failed.append(stage_name)
+                continue
 
-        if outputs_missing:
-            failed.append(stage_name)
-            continue
+            # 4. Compute input_hash
+            stage_outs = stage_info["outs"]
+            out_specs = [
+                (worker.normalize_out_path(str(out.path)), out.cache) for out in stage_outs
+            ]
+            deps_list = [
+                DepEntry(path=dep_path, hash=info["hash"]) for dep_path, info in dep_hashes.items()
+            ]
+            input_hash = run_history.compute_input_hash(
+                fingerprint, current_params, deps_list, out_specs
+            )
 
-        # 7. Write production lock
-        new_lock_data = LockData(
-            code_manifest=fingerprint,
-            params=current_params,
-            dep_hashes=dict(sorted(dep_hashes.items())),
-            output_hashes=dict(sorted(output_hashes.items())),
-            dep_generations={},
-        )
-        production_lock.write(new_lock_data)
+            # Compute normalized output paths once (used for skip check, lock data, and StateDB)
+            out_paths = [worker.normalize_out_path(str(out.path)) for out in stage_outs]
+            production_lock = lock.StageLock(stage_name, stages_dir)
 
-        # 8. Update StateDB: dep generations, output generations, run cache entry
-        run_id = run_history.generate_run_id()
+            # 5. If not force and no explicit stages, check lock — skip if unchanged
+            if not force and stage_names is None:
+                lock_data = production_lock.read()
+                if lock_data is not None:
+                    changed, _ = production_lock.is_changed_with_lock_data(
+                        lock_data, fingerprint, current_params, dep_hashes, out_paths
+                    )
+                    if not changed:
+                        continue
 
-        with state_mod.StateDB(state_db_path) as state_db:
+            # 6. Hash and cache outputs
+            output_hashes = dict[str, HashInfo]()
+            outputs_missing = False
+
+            for out in stage_outs:
+                out_path = pathlib.Path(cast("str", out.path))
+                if not out_path.exists():
+                    logger.error("Stage '%s': output missing: %s — skipping", stage_name, out.path)
+                    outputs_missing = True
+                    break
+
+                if out.cache:
+                    output_hashes[str(out.path)] = cache.save_to_cache(
+                        out_path, files_cache_dir, checkout_modes=checkout_modes
+                    )
+                else:
+                    output_hashes[str(out.path)] = worker.hash_output(out_path)
+
+            if outputs_missing:
+                failed.append(stage_name)
+                continue
+
+            # 7. Write production lock
+            new_lock_data = LockData(
+                code_manifest=fingerprint,
+                params=current_params,
+                dep_hashes=dict(sorted(dep_hashes.items())),
+                output_hashes=dict(sorted(output_hashes.items())),
+                dep_generations={},
+            )
+            production_lock.write(new_lock_data)
+
+            # 8. Update StateDB: dep generations, output generations, run cache entry
+            run_id = run_history.generate_run_id()
+
             dep_gen_map = worker.compute_dep_generation_map(stage_info["deps_paths"], state_db)
 
             # Only cached outputs belong in run cache
@@ -179,6 +187,6 @@ def commit_stages(
 
             state_db.apply_deferred_writes(stage_name, out_paths, deferred)
 
-        committed.append(stage_name)
+            committed.append(stage_name)
 
     return committed, failed
