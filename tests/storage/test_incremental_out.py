@@ -788,7 +788,9 @@ def test_incremental_out_recognized_as_input_annotation() -> None:
     """IncrementalOut should be recognized as a valid input annotation."""
     from pivot import stage_def
 
-    dep_specs = stage_def.get_dep_specs_from_signature(_test_stage_with_incremental_input)
+    dep_specs = stage_def.extract_stage_definition(
+        _test_stage_with_incremental_input, _test_stage_with_incremental_input.__name__
+    ).dep_specs
     assert "existing" in dep_specs
     assert dep_specs["existing"].path == "cache.json"
     assert dep_specs["existing"].creates_dep_edge is False
@@ -798,7 +800,9 @@ def test_incremental_input_first_run_returns_empty(tmp_path: pathlib.Path) -> No
     """IncrementalOut as input should return empty value if file doesn't exist."""
     from pivot import stage_def
 
-    dep_specs = stage_def.get_dep_specs_from_signature(_test_stage_with_incremental_input)
+    dep_specs = stage_def.extract_stage_definition(
+        _test_stage_with_incremental_input, _test_stage_with_incremental_input.__name__
+    ).dep_specs
     loaded = stage_def.load_deps_from_specs(dep_specs, tmp_path)
 
     # JSON loader returns empty dict for first run
@@ -813,7 +817,9 @@ def test_incremental_input_subsequent_run_loads_value(tmp_path: pathlib.Path) ->
     cache_file = tmp_path / "cache.json"
     cache_file.write_text('{"key": "value"}')
 
-    dep_specs = stage_def.get_dep_specs_from_signature(_test_stage_with_incremental_input)
+    dep_specs = stage_def.extract_stage_definition(
+        _test_stage_with_incremental_input, _test_stage_with_incremental_input.__name__
+    ).dep_specs
     loaded = stage_def.load_deps_from_specs(dep_specs, tmp_path)
 
     assert loaded["existing"] == {"key": "value"}
@@ -839,11 +845,13 @@ def test_incremental_input_type_alias_pattern() -> None:
     from pivot import stage_def
 
     # Verify both input and output recognized
-    dep_specs = stage_def.get_dep_specs_from_signature(_test_cache_stage)
+    dep_specs = stage_def.extract_stage_definition(
+        _test_cache_stage, _test_cache_stage.__name__
+    ).dep_specs
     assert "existing" in dep_specs
     assert dep_specs["existing"].creates_dep_edge is False
 
-    out_specs = stage_def.get_output_specs_from_return(_test_cache_stage, "_test_cache_stage")
+    out_specs = stage_def.extract_stage_definition(_test_cache_stage, "_test_cache_stage").out_specs
     assert "existing" in out_specs
     assert isinstance(out_specs["existing"], outputs.IncrementalOut)
 
@@ -852,7 +860,9 @@ def test_incremental_input_mixed_with_regular_deps() -> None:
     """IncrementalOut input can coexist with regular Dep annotations."""
     from pivot import stage_def
 
-    dep_specs = stage_def.get_dep_specs_from_signature(_test_stage_with_mixed_deps)
+    dep_specs = stage_def.extract_stage_definition(
+        _test_stage_with_mixed_deps, _test_stage_with_mixed_deps.__name__
+    ).dep_specs
 
     # Regular Dep creates edge
     assert "data" in dep_specs

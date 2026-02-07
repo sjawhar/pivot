@@ -336,40 +336,44 @@ class Pipeline:
 
         stage_name = name or func.__name__
 
-        # 1. Extract annotation paths using existing functions
-        # Pass dep_path_overrides to handle PlaceholderDep correctly
-        dep_specs = stage_def.get_dep_specs_from_signature(func, dep_path_overrides)
+        # 1. Extract stage definition (single pass over annotations)
+        definition = stage_def.extract_stage_definition(func, stage_name, dep_path_overrides)
 
-        # Handle both TypedDict returns and single-output returns
-        out_specs = stage_def.get_output_specs_from_return(func, stage_name)
-        if not out_specs:
-            single_out = stage_def.get_single_output_spec_from_return(func)
-            if single_out is not None:
-                out_specs = {stage_def.SINGLE_OUTPUT_KEY: single_out}
+        # 2. Validate all PlaceholderDeps have overrides (before path resolution)
+        if definition.placeholder_dep_names:
+            provided = set(dep_path_overrides.keys()) if dep_path_overrides else set[str]()
+            missing = definition.placeholder_dep_names - provided
+            if missing:
+                raise ValueError(
+                    f"PlaceholderDep {', '.join(repr(n) for n in sorted(missing))} "
+                    + "requires override in dep_path_overrides"
+                )
 
-        # 2. Resolve annotation paths relative to pipeline root
+        # 3. Resolve annotation paths relative to pipeline root
         # Skip IncrementalOut - registry disallows path overrides for them
-        # (IncrementalOut input/output paths must match in annotations)
         resolved_deps: dict[str, outputs.PathType] = {
             dep_name: self._resolve_path_type(spec.path)
-            for dep_name, spec in dep_specs.items()
+            for dep_name, spec in definition.dep_specs.items()
             if spec.creates_dep_edge  # IncrementalOut has creates_dep_edge=False
         }
+
+        out_specs = definition.out_specs
+        if not out_specs and definition.single_out_spec is not None:
+            out_specs = {stage_def.SINGLE_OUTPUT_KEY: definition.single_out_spec}
+
         resolved_outs: dict[str, registry.OutOverride] = {
             out_name: registry.OutOverride(path=self._resolve_path_type(spec.path))
             for out_name, spec in out_specs.items()
             if not isinstance(spec, outputs.IncrementalOut)
         }
 
-        # 3. Apply explicit overrides (also pipeline-relative)
-        if dep_path_overrides:
-            for dep_name, path in dep_path_overrides.items():
-                resolved_deps[dep_name] = self._resolve_path_type(path)
+        # 4. Apply explicit output overrides (also pipeline-relative)
+        # (dep overrides are already applied via extract_stage_definition above)
         if out_path_overrides:
             for out_name, override in out_path_overrides.items():
                 resolved_outs[out_name] = self._resolve_out_override(override)
 
-        # 4. Pass all as overrides to registry
+        # 5. Pass definition + resolved overrides to registry
         self._registry.register(
             func=func,
             name=name,
@@ -379,6 +383,7 @@ class Pipeline:
             dep_path_overrides=resolved_deps,
             out_path_overrides=resolved_outs,
             state_dir=self.state_dir,
+            definition=definition,
         )
 
         # New stage may introduce unresolved external deps — force re-resolution
@@ -391,6 +396,14 @@ class Pipeline:
     def get(self, name: str) -> registry.RegistryStageInfo:
         """Get stage info by name."""
         return self._registry.get(name)
+
+    def get_stage(self, name: str) -> registry.RegistryStageInfo:
+        """Look up stage metadata by name. Alias for get(), satisfies StageDataProvider."""
+        return self.get(name)
+
+    def ensure_fingerprint(self, name: str) -> dict[str, str]:
+        """Compute/return cached code fingerprint for a stage."""
+        return self._registry.ensure_fingerprint(name)
 
     def build_dag(self, validate: bool = True) -> DiGraph[str]:
         """Build DAG from registered stages.
@@ -457,7 +470,7 @@ class Pipeline:
             raise PipelineConfigError(f"Pipeline '{self.name}' cannot include itself")
 
         # Collect stages to add (validates all before adding any - atomic)
-        stages_to_add: list[registry.RegistryStageInfo] = []
+        stages_to_add = list[registry.RegistryStageInfo]()
         existing_names = set(self._registry.list_stages())
 
         for stage_name in other.list_stages():
@@ -510,7 +523,7 @@ class Pipeline:
             return
 
         # Per-call caches (fresh every call — safe for watch mode)
-        loaded_pipelines: dict[pathlib.Path, Pipeline | None] = {}
+        loaded_pipelines = dict[pathlib.Path, Pipeline | None]()
         all_pipeline_paths: list[pathlib.Path] | None = None  # lazy, for tier 3
 
         # Process work queue iteratively
@@ -590,6 +603,3 @@ class Pipeline:
                     logger.debug(f"Failed to write output index for {out_path}")
 
         self._external_deps_resolved = True
-
-    # Keep old name as alias for backwards compatibility
-    resolve_from_parents = resolve_external_dependencies  # pyright: ignore[reportUnannotatedClassAttribute] - method alias

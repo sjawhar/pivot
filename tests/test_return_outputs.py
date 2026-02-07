@@ -95,7 +95,7 @@ def test_get_output_specs_from_return_single_output() -> None:
     def process() -> _SingleOutputResult:
         return {"result": {"count": 42}}
 
-    specs = stage_def.get_output_specs_from_return(process, "test_stage")
+    specs = stage_def.extract_stage_definition(process, "test_stage").out_specs
 
     assert len(specs) == 1
     assert "result" in specs
@@ -109,7 +109,7 @@ def test_get_output_specs_from_return_multiple_outputs() -> None:
     def train() -> _MultipleOutputsResult:
         return {"model": b"model_bytes", "metrics": {"accuracy": 0.95}}
 
-    specs = stage_def.get_output_specs_from_return(train, "test_stage")
+    specs = stage_def.extract_stage_definition(train, "test_stage").out_specs
 
     assert len(specs) == 2
     assert "model" in specs
@@ -126,7 +126,7 @@ def test_get_output_specs_from_return_none_returns_empty() -> None:
     def process() -> None:
         pass
 
-    specs = stage_def.get_output_specs_from_return(process, "test_stage")
+    specs = stage_def.extract_stage_definition(process, "test_stage").out_specs
 
     assert specs == {}
 
@@ -137,7 +137,7 @@ def test_get_output_specs_from_return_non_typeddict_returns_empty() -> None:
     def process() -> dict[str, int]:
         return {"count": 42}
 
-    specs = stage_def.get_output_specs_from_return(process, "test_stage")
+    specs = stage_def.extract_stage_definition(process, "test_stage").out_specs
     assert specs == {}
 
 
@@ -151,7 +151,7 @@ def test_get_output_specs_from_return_raises_on_unannotated_fields() -> None:
     with pytest.raises(
         exceptions.StageDefinitionError, match="fields without Out annotations.*extra"
     ):
-        stage_def.get_output_specs_from_return(process, "test_stage")
+        stage_def.extract_stage_definition(process, "test_stage")
 
 
 # ==============================================================================
@@ -165,7 +165,7 @@ def test_save_return_outputs_writes_file(tmp_path: pathlib.Path) -> None:
     def process() -> _SingleOutputResult:
         return {"result": {"count": 42}}
 
-    specs = stage_def.get_output_specs_from_return(process, "test_stage")
+    specs = stage_def.extract_stage_definition(process, "test_stage").out_specs
     return_value: _SingleOutputResult = {"result": {"count": 42}}
 
     stage_def.save_return_outputs(return_value, specs, tmp_path)
@@ -181,7 +181,7 @@ def test_save_return_outputs_multiple_files(tmp_path: pathlib.Path) -> None:
     def train() -> _MultipleOutputsResult:
         return {"model": b"model_bytes", "metrics": {"accuracy": 0.95}}
 
-    specs = stage_def.get_output_specs_from_return(train, "test_stage")
+    specs = stage_def.extract_stage_definition(train, "test_stage").out_specs
     return_value: _MultipleOutputsResult = {"model": b"model_bytes", "metrics": {"accuracy": 0.95}}
 
     stage_def.save_return_outputs(return_value, specs, tmp_path)
@@ -203,7 +203,7 @@ def test_save_return_outputs_creates_parent_dirs(tmp_path: pathlib.Path) -> None
     def process() -> _NestedPathResult:
         return {"result": {"count": 42}}
 
-    specs = stage_def.get_output_specs_from_return(process, "test_stage")
+    specs = stage_def.extract_stage_definition(process, "test_stage").out_specs
     return_value: _NestedPathResult = {"result": {"count": 42}}
 
     stage_def.save_return_outputs(return_value, specs, tmp_path)
@@ -223,7 +223,7 @@ def test_get_output_specs_from_return_list_path() -> None:
     def process() -> _ListPathResult:
         return {"items": [{"a": 1}, {"b": 2}]}
 
-    specs = stage_def.get_output_specs_from_return(process, "test_stage")
+    specs = stage_def.extract_stage_definition(process, "test_stage").out_specs
 
     assert len(specs) == 1
     assert "items" in specs
@@ -237,7 +237,7 @@ def test_get_output_specs_from_return_mixed_path_types() -> None:
     def process() -> _MixedPathTypesResult:
         return {"single": {"x": 1}, "multi": [{"a": 1}, {"b": 2}]}
 
-    specs = stage_def.get_output_specs_from_return(process, "test_stage")
+    specs = stage_def.extract_stage_definition(process, "test_stage").out_specs
 
     assert len(specs) == 2
     assert specs["single"].path == "single.json"
@@ -250,7 +250,7 @@ def test_save_return_outputs_list_path(tmp_path: pathlib.Path) -> None:
     def process() -> _ListPathResult:
         return {"items": [{"a": 1}, {"b": 2}]}
 
-    specs = stage_def.get_output_specs_from_return(process, "test_stage")
+    specs = stage_def.extract_stage_definition(process, "test_stage").out_specs
     return_value: _ListPathResult = {"items": [{"a": 1}, {"b": 2}]}
 
     stage_def.save_return_outputs(return_value, specs, tmp_path)
@@ -270,7 +270,7 @@ def test_save_return_outputs_mixed_path_types(tmp_path: pathlib.Path) -> None:
     def process() -> _MixedPathTypesResult:
         return {"single": {"x": 1}, "multi": [{"a": 1}, {"b": 2}]}
 
-    specs = stage_def.get_output_specs_from_return(process, "test_stage")
+    specs = stage_def.extract_stage_definition(process, "test_stage").out_specs
     return_value: _MixedPathTypesResult = {"single": {"x": 1}, "multi": [{"a": 1}, {"b": 2}]}
 
     stage_def.save_return_outputs(return_value, specs, tmp_path)
@@ -297,7 +297,7 @@ def test_save_return_outputs_validates_missing_keys(tmp_path: pathlib.Path) -> N
     def process() -> _MultipleOutputsResult:
         return {"model": b"data", "metrics": {"acc": 0.9}}
 
-    specs = stage_def.get_output_specs_from_return(process, "test_stage")
+    specs = stage_def.extract_stage_definition(process, "test_stage").out_specs
     # Missing 'metrics' key
     return_value = {"model": b"data"}
 
@@ -311,7 +311,7 @@ def test_save_return_outputs_validates_list_value_length(tmp_path: pathlib.Path)
     def process() -> _ListPathResult:
         return {"items": [{"a": 1}, {"b": 2}]}
 
-    specs = stage_def.get_output_specs_from_return(process, "test_stage")
+    specs = stage_def.extract_stage_definition(process, "test_stage").out_specs
     # Return value has 3 items but spec declares 2 paths
     return_value = {"items": [{"a": 1}, {"b": 2}, {"c": 3}]}
 
@@ -333,7 +333,7 @@ def test_save_return_outputs_warns_on_extra_keys(
     def process() -> _SingleOutputResult:
         return {"result": {"count": 42}}
 
-    specs = stage_def.get_output_specs_from_return(process, "test_stage")
+    specs = stage_def.extract_stage_definition(process, "test_stage").out_specs
     # Return value has extra keys not declared as outputs
     return_value = {"result": {"count": 42}, "undeclared": "data", "another": 123}
 
@@ -360,7 +360,7 @@ def test_typing_extensions_typeddict_detected() -> None:
     def process() -> _ExtensionsTypedDictResult:
         return {"result": {"count": 42}}
 
-    specs = stage_def.get_output_specs_from_return(process, "test_stage")
+    specs = stage_def.extract_stage_definition(process, "test_stage").out_specs
 
     assert len(specs) == 1
     assert "result" in specs
@@ -373,7 +373,7 @@ def test_plain_dict_return_returns_empty() -> None:
     def process() -> dict[str, int]:
         return {"count": 42}
 
-    specs = stage_def.get_output_specs_from_return(process, "test_stage")
+    specs = stage_def.extract_stage_definition(process, "test_stage").out_specs
     assert specs == {}
 
 
@@ -383,7 +383,7 @@ def test_annotated_without_out_returns_empty() -> None:
     def process() -> Annotated[dict[str, int], _SomeOtherMetadata()]:
         return {"count": 42}
 
-    specs = stage_def.get_output_specs_from_return(process, "test_stage")
+    specs = stage_def.extract_stage_definition(process, "test_stage").out_specs
     assert specs == {}
 
 
@@ -393,7 +393,7 @@ def test_dataclass_return_returns_empty() -> None:
     def process() -> _DataclassResult:
         return _DataclassResult(count=42)
 
-    specs = stage_def.get_output_specs_from_return(process, "test_stage")
+    specs = stage_def.extract_stage_definition(process, "test_stage").out_specs
     assert specs == {}
 
 
@@ -408,7 +408,7 @@ def test_partial_out_annotations_raises_error() -> None:
     with pytest.raises(
         exceptions.StageDefinitionError, match="fields without Out annotations.*extra"
     ):
-        stage_def.get_output_specs_from_return(process, "test_stage")
+        stage_def.extract_stage_definition(process, "test_stage")
 
 
 def test_error_message_includes_stage_name() -> None:
@@ -422,7 +422,7 @@ def test_error_message_includes_stage_name() -> None:
         return {"result": {"count": 42}, "extra": "ignored"}
 
     with pytest.raises(exceptions.StageDefinitionError, match="Stage 'my_custom_stage'"):
-        stage_def.get_output_specs_from_return(my_custom_stage, "my_custom_stage")
+        stage_def.extract_stage_definition(my_custom_stage, "my_custom_stage")
 
 
 # ==============================================================================

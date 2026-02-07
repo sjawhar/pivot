@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+import sys
 from typing import TYPE_CHECKING, Annotated, TypedDict
 
 from helpers import register_test_stage
@@ -71,6 +72,27 @@ class _FailingOutputs(TypedDict):
 
 def _helper_failing_stage() -> _FailingOutputs:
     raise RuntimeError("Intentional failure")
+
+
+def _helper_printing_stage() -> _OutputTxtOutputs:
+    sys.stdout.write("Processing data...\n")
+    sys.stdout.flush()
+    pathlib.Path("output.txt").write_text("done")
+    return _OutputTxtOutputs(output=pathlib.Path("output.txt"))
+
+
+def _helper_stderr_stage() -> _OutputTxtOutputs:
+    sys.stderr.write("Warning: something happened\n")
+    sys.stderr.flush()
+    pathlib.Path("output.txt").write_text("done")
+    return _OutputTxtOutputs(output=pathlib.Path("output.txt"))
+
+
+def _helper_quiet_stage() -> _OutputTxtOutputs:
+    sys.stdout.write("This should not appear\n")
+    sys.stdout.flush()
+    pathlib.Path("output.txt").write_text("done")
+    return _OutputTxtOutputs(output=pathlib.Path("output.txt"))
 
 
 # =============================================================================
@@ -561,17 +583,6 @@ def test_run_show_output_streams_stage_logs(
     runner: click.testing.CliRunner,
 ) -> None:
     """--show-output streams stage stdout to terminal."""
-    import sys
-
-    class _PrintOutputs(TypedDict):
-        output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
-
-    def _helper_printing_stage() -> _PrintOutputs:
-        sys.stdout.write("Processing data...\n")
-        sys.stdout.flush()
-        pathlib.Path("output.txt").write_text("done")
-        return _PrintOutputs(output=pathlib.Path("output.txt"))
-
     register_test_stage(_helper_printing_stage, name="printer")
 
     result = runner.invoke(cli.cli, ["run", "printer", "--show-output"])
@@ -586,17 +597,6 @@ def test_run_show_output_streams_stderr(
     runner: click.testing.CliRunner,
 ) -> None:
     """--show-output streams stderr with red formatting."""
-    import sys
-
-    class _StderrOutputs(TypedDict):
-        output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
-
-    def _helper_stderr_stage() -> _StderrOutputs:
-        sys.stderr.write("Warning: something happened\n")
-        sys.stderr.flush()
-        pathlib.Path("output.txt").write_text("done")
-        return _StderrOutputs(output=pathlib.Path("output.txt"))
-
     register_test_stage(_helper_stderr_stage, name="warner")
 
     result = runner.invoke(cli.cli, ["run", "warner", "--show-output"])
@@ -611,17 +611,6 @@ def test_run_without_show_output_hides_logs(
     runner: click.testing.CliRunner,
 ) -> None:
     """Default behavior (no --show-output) doesn't show stage logs."""
-    import sys
-
-    class _QuietOutputs(TypedDict):
-        output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
-
-    def _helper_quiet_stage() -> _QuietOutputs:
-        sys.stdout.write("This should not appear\n")
-        sys.stdout.flush()
-        pathlib.Path("output.txt").write_text("done")
-        return _QuietOutputs(output=pathlib.Path("output.txt"))
-
     register_test_stage(_helper_quiet_stage, name="quiet")
 
     result = runner.invoke(cli.cli, ["run", "quiet"])

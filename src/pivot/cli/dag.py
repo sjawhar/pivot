@@ -123,17 +123,20 @@ def dag_cmd(
             raise click.ClickException(msg)
         bipartite_graph = _get_upstream_subgraph(bipartite_graph, stage_names)
 
+    # Extract view for rendering
+    view = engine_graph.extract_graph_view(bipartite_graph)
+
     # Render the graph
     match output_format:
         case "dot":
-            output = dag.render_dot(bipartite_graph, stages=show_stages)
+            output = dag.render_dot(view, stages=show_stages)
         case "mermaid":
-            output = dag.render_mermaid(bipartite_graph, stages=show_stages)
+            output = dag.render_mermaid(view, stages=show_stages)
         case "md":
-            mermaid = dag.render_mermaid(bipartite_graph, stages=show_stages)
+            mermaid = dag.render_mermaid(view, stages=show_stages)
             output = f"```mermaid\n{mermaid}\n```"
         case _:
             # Default: ASCII
-            output = dag.render_ascii(bipartite_graph, stages=show_stages)
+            output = dag.render_ascii(view, stages=show_stages)
 
     click.echo(output)

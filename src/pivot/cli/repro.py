@@ -371,6 +371,7 @@ def _run_watch_mode(  # noqa: PLR0913 - many params needed for different modes
             watch_mode=True,
             no_commit=no_commit,
             serve=serve,
+            stage_data_provider=pipeline,
         )
 
         def engine_thread_target() -> None:
@@ -597,6 +598,7 @@ def _run_oneshot_mode(
             stage_names=display_order,
             tui_log=tui_log,
             cancel_event=cancel_event,
+            stage_data_provider=pipeline,
         )
 
         # Use Future for thread-safe result passing

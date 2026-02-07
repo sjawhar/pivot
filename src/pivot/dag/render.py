@@ -7,11 +7,8 @@ import wcwidth
 from grandalf import graphs as grandalf_graphs
 from grandalf import layouts as grandalf_layouts
 
-from pivot.engine import graph as engine_graph
-from pivot.engine import types as engine_types
-
 if TYPE_CHECKING:
-    import networkx as nx
+    from pivot.engine.graph import GraphView
 
 __all__ = [
     "render_ascii",
@@ -53,63 +50,6 @@ def _escape_dot_label(label: str) -> str:
     return label.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("|", "\\|")
 
 
-def _extract_nodes_and_edges(
-    g: nx.DiGraph[str],
-    stages: bool,
-) -> tuple[list[str], list[tuple[str, str]]]:
-    """Extract nodes and edges for the requested view (stages or artifacts).
-
-    For stages=True: Returns stage names and stage->stage edges (derived from artifact flow).
-    For stages=False: Returns artifact paths and artifact->artifact edges.
-    """
-    target_type = engine_types.NodeType.STAGE if stages else engine_types.NodeType.ARTIFACT
-
-    # Collect nodes of the target type
-    nodes = list[str]()
-    for node in g.nodes():
-        node_type, value = engine_graph.parse_node(node)
-        if node_type == target_type:
-            nodes.append(value)
-
-    # Collect edges between nodes of the target type
-    # We need to find paths through the bipartite graph
-    edges = list[tuple[str, str]]()
-    if stages:
-        # Stage -> artifact -> stage becomes stage -> stage
-        for node in g.nodes():
-            node_type, source_name = engine_graph.parse_node(node)
-            if node_type != engine_types.NodeType.STAGE:
-                continue
-            # Find artifacts this stage produces
-            for artifact_node in g.successors(node):
-                artifact_type, _ = engine_graph.parse_node(artifact_node)
-                if artifact_type != engine_types.NodeType.ARTIFACT:
-                    continue
-                # Find stages that consume this artifact
-                for consumer_node in g.successors(artifact_node):
-                    consumer_type, consumer_name = engine_graph.parse_node(consumer_node)
-                    if consumer_type == engine_types.NodeType.STAGE:
-                        edges.append((source_name, consumer_name))
-    else:
-        # Artifact -> stage -> artifact becomes artifact -> artifact
-        for node in g.nodes():
-            node_type, source_path = engine_graph.parse_node(node)
-            if node_type != engine_types.NodeType.ARTIFACT:
-                continue
-            # Find stages that consume this artifact
-            for stage_node in g.successors(node):
-                stage_type, _ = engine_graph.parse_node(stage_node)
-                if stage_type != engine_types.NodeType.STAGE:
-                    continue
-                # Find artifacts this stage produces
-                for output_node in g.successors(stage_node):
-                    output_type, output_path = engine_graph.parse_node(output_node)
-                    if output_type == engine_types.NodeType.ARTIFACT:
-                        edges.append((source_path, output_path))
-
-    return nodes, edges
-
-
 class _VertexView:
     """View for grandalf vertex layout."""
 
@@ -123,17 +63,21 @@ class _VertexView:
         self.xy = (0.0, 0.0)
 
 
-def render_ascii(g: nx.DiGraph[str], stages: bool = False) -> str:
+def render_ascii(view: GraphView, stages: bool = False) -> str:
     """Render graph as ASCII art using grandalf Sugiyama layout.
 
     Args:
-        g: Bipartite NetworkX graph from engine/graph.py.
+        view: GraphView from extract_graph_view().
         stages: If True, render stage nodes; if False (default), render artifact nodes.
 
     Returns:
         ASCII art representation of the graph.
     """
-    nodes, edges = _extract_nodes_and_edges(g, stages)
+    nodes, edges = (
+        (view["stages"], view["stage_edges"])
+        if stages
+        else (view["artifacts"], view["artifact_edges"])
+    )
 
     if not nodes:
         return "(empty graph)"
@@ -342,17 +286,21 @@ def _write_str(
             canvas[y][px] = ch
 
 
-def render_mermaid(g: nx.DiGraph[str], stages: bool = False) -> str:
+def render_mermaid(view: GraphView, stages: bool = False) -> str:
     """Render graph as Mermaid flowchart TD format.
 
     Args:
-        g: Bipartite NetworkX graph from engine/graph.py.
+        view: GraphView from extract_graph_view().
         stages: If True, render stage nodes; if False (default), render artifact nodes.
 
     Returns:
         Mermaid flowchart string.
     """
-    nodes, edges = _extract_nodes_and_edges(g, stages)
+    nodes, edges = (
+        (view["stages"], view["stage_edges"])
+        if stages
+        else (view["artifacts"], view["artifact_edges"])
+    )
 
     if not nodes:
         return "flowchart TD"
@@ -382,17 +330,21 @@ def render_mermaid(g: nx.DiGraph[str], stages: bool = False) -> str:
     return "\n".join(lines)
 
 
-def render_dot(g: nx.DiGraph[str], stages: bool = False) -> str:
+def render_dot(view: GraphView, stages: bool = False) -> str:
     """Render graph as Graphviz DOT format.
 
     Args:
-        g: Bipartite NetworkX graph from engine/graph.py.
+        view: GraphView from extract_graph_view().
         stages: If True, render stage nodes; if False (default), render artifact nodes.
 
     Returns:
         DOT format string.
     """
-    nodes, edges = _extract_nodes_and_edges(g, stages)
+    nodes, edges = (
+        (view["stages"], view["stage_edges"])
+        if stages
+        else (view["artifacts"], view["artifact_edges"])
+    )
 
     if not nodes:
         return "digraph {\n}"

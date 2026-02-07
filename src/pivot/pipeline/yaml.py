@@ -248,6 +248,8 @@ def _expand_variants(name: str, config: StageConfig) -> list[ExpandedStage]:
         )
 
     func = _import_function(config.python)
+    # Extract definition once (function is the same for all variants)
+    definition = stage_def.extract_stage_definition(func, name)
     result = list[ExpandedStage]()
 
     for variant in typing.cast("list[VariantDict]", variants):
@@ -268,14 +270,14 @@ def _expand_variants(name: str, config: StageConfig) -> list[ExpandedStage]:
         mutex = variant["mutex"] if "mutex" in variant else []
 
         # YAML deps are path overrides only
-        dep_path_overrides: dict[str, str | list[str]] = {}
-        for dep_name, dep_value in deps.items():
-            dep_path_overrides[dep_name] = dep_value
+        dep_path_overrides: dict[str, str | list[str]] = dict(deps)
 
         # YAML outs are path overrides only
         out_path_overrides = _normalize_out_path_overrides(outs_raw, {}, full_name)
 
-        params_instance = _resolve_params(func, params_dict, full_name)
+        params_instance = _resolve_params(
+            definition.params_arg_name, definition.params_type, params_dict, full_name
+        )
 
         result.append(
             ExpandedStage(
@@ -306,8 +308,10 @@ def _expand_simple_stage(
     # Interpolate outs path overrides
     out_path_overrides = _normalize_out_path_overrides(config.outs, global_vars, name)
 
-    # Get return output specs for type validation
-    return_out_specs = stage_def.get_output_specs_from_return(func, name)
+    # Get return output specs for type validation (only out_specs used).
+    # Pass dep overrides so PlaceholderDep deps resolve into dep_specs.
+    definition = stage_def.extract_stage_definition(func, name, dep_path_overrides)
+    return_out_specs = definition.out_specs
 
     # Process metrics and plots sections
     _process_typed_output_section(
@@ -323,7 +327,9 @@ def _expand_simple_stage(
         config.plots, out_path_overrides, return_out_specs, outputs.Plot, "plots", name, global_vars
     )
 
-    params_instance = _resolve_params(func, config.params, name)
+    params_instance = _resolve_params(
+        definition.params_arg_name, definition.params_type, config.params, name
+    )
 
     return ExpandedStage(
         name=name,
@@ -410,6 +416,9 @@ def _expand_matrix(
     combinations = list(itertools.product(*dim_keys))
 
     expanded = list[ExpandedStage]()
+    # Extract definition once (function is the same for all combos).
+    # Pass base deps so PlaceholderDep deps resolve into dep_specs (only out_specs used here).
+    definition = stage_def.extract_stage_definition(func, name, config.deps or None)
     for combo in combinations:
         # combo contains string keys; build both string and typed value dicts
         string_values = dict(zip(dim_names, combo, strict=True))
@@ -441,7 +450,7 @@ def _expand_matrix(
         out_path_overrides = _normalize_out_path_overrides(outs_raw, all_vars, full_name)
 
         # Get return output specs for type validation
-        return_out_specs = stage_def.get_output_specs_from_return(func, full_name)
+        return_out_specs = definition.out_specs
 
         # Process metrics and plots sections
         _process_typed_output_section(
@@ -467,7 +476,9 @@ def _expand_matrix(
         params_dict = {
             k: _interpolate_value(v, typed_values, full_name) for k, v in params_dict.items()
         }
-        params_instance = _resolve_params(func, params_dict, full_name)
+        params_instance = _resolve_params(
+            definition.params_arg_name, definition.params_type, params_dict, full_name
+        )
 
         expanded.append(
             ExpandedStage(
@@ -717,28 +728,27 @@ def _import_function(import_path: str) -> Callable[..., Any]:
 
 
 def _resolve_params(
-    func: Callable[..., Any],
+    params_arg_name: str | None,
+    params_type: type[pydantic.BaseModel] | None,
     overrides: dict[str, Any],
     stage_name: str,
 ) -> pydantic.BaseModel | None:
-    """Resolve params from function signature + config overrides.
+    """Resolve params from pre-extracted definition fields + config overrides.
 
-    Uses type-based detection to find any StageParams/BaseModel parameter,
-    regardless of parameter name.
+    Uses params_arg_name and params_type from StageDefinition to find the
+    StageParams/BaseModel parameter, regardless of parameter name.
     """
-    params_arg_name, params_type = stage_def.find_params_in_signature(func)
-
     if params_arg_name is None:
         if overrides:
             raise PipelineConfigError(
                 f"Stage '{stage_name}': pivot.yaml has 'params' but function "
-                + f"'{func.__name__}' has no StageParams parameter"
+                + "has no StageParams parameter"
             )
         return None
 
     if params_type is None:
         raise PipelineConfigError(
-            f"Stage '{stage_name}': function '{func.__name__}' has '{params_arg_name}' parameter "
+            f"Stage '{stage_name}': function has '{params_arg_name}' parameter "
             + "but no type hint. Add a type hint like 'config: MyParams'"
         )
 

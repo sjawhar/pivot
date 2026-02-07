@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pathlib
 from typing import TYPE_CHECKING
 
 import pytest
@@ -22,8 +23,6 @@ from pivot.types import (
 )
 
 if TYPE_CHECKING:
-    import pathlib
-
     from pytest_mock import MockerFixture
 
     from pivot.pipeline.pipeline import Pipeline
@@ -800,3 +799,81 @@ def test_output_panel_set_from_snapshot(
     assert panel._stage_name == "test_stage"
     assert "/path/output.csv" in panel._output_by_path
     mock_update.assert_called_once()
+
+
+# =============================================================================
+# StageDataProvider Integration Tests
+# =============================================================================
+
+
+def test_input_panel_load_uses_provider(mocker: MockerFixture) -> None:
+    """InputDiffPanel._load_stage_data uses provider instead of cli_helpers."""
+    from pivot.tui.types import StageDataProvider
+
+    mock_provider = mocker.MagicMock(spec=StageDataProvider)
+    mock_provider.get_stage.return_value = {
+        "deps_paths": [],
+        "outs_paths": [],
+        "params": None,
+    }
+    mock_provider.ensure_fingerprint.return_value = {"func": "abc"}
+
+    panel = diff_panels.InputDiffPanel(stage_data_provider=mock_provider)
+
+    mock_explanation = StageExplanation(
+        stage_name="my_stage",
+        will_run=True,
+        is_forced=False,
+        reason="Code changed",
+        code_changes=[],
+        dep_changes=[],
+        param_changes=[],
+        upstream_stale=[],
+    )
+    mocker.patch(
+        "pivot.tui.diff_panels.explain.get_stage_explanation",
+        return_value=mock_explanation,
+    )
+    mocker.patch("pivot.tui.diff_panels.parameters.load_params_yaml", return_value={})
+    mocker.patch("pivot.tui.diff_panels.config.get_state_dir", return_value=pathlib.Path("/fake"))
+
+    panel._load_stage_data("my_stage")
+
+    mock_provider.get_stage.assert_called_with("my_stage")
+    mock_provider.ensure_fingerprint.assert_called_with("my_stage")
+
+
+def test_output_panel_load_uses_provider(mocker: MockerFixture) -> None:
+    """OutputDiffPanel._load_stage_data uses provider instead of cli_helpers."""
+    from pivot.tui.types import StageDataProvider
+
+    mock_provider = mocker.MagicMock(spec=StageDataProvider)
+    mock_provider.get_stage.return_value = {
+        "deps_paths": [],
+        "outs_paths": [],
+        "outs": [],
+        "params": None,
+    }
+
+    panel = diff_panels.OutputDiffPanel(stage_data_provider=mock_provider)
+
+    mocker.patch("pivot.tui.diff_panels.config.get_state_dir", return_value=pathlib.Path("/fake"))
+    mocker.patch("pivot.tui.diff_panels.lock.StageLock")
+
+    panel._load_stage_data("my_stage")
+
+    mock_provider.get_stage.assert_called_with("my_stage")
+
+
+def test_input_panel_without_provider_returns_early(mocker: MockerFixture) -> None:
+    """InputDiffPanel._load_stage_data returns early without provider."""
+    panel = diff_panels.InputDiffPanel()
+    panel._load_stage_data("my_stage")
+    assert panel._registry_info is None
+
+
+def test_output_panel_without_provider_returns_early(mocker: MockerFixture) -> None:
+    """OutputDiffPanel._load_stage_data returns early without provider."""
+    panel = diff_panels.OutputDiffPanel()
+    panel._load_stage_data("my_stage")
+    assert panel._registry_info is None

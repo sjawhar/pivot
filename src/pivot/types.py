@@ -572,16 +572,6 @@ def is_tui_log_message(msg: TuiMessage) -> TypeGuard[TuiLogMessage]:
     return msg is not None and msg["type"] == TuiMessageType.LOG
 
 
-def is_tui_watch_message(msg: TuiMessage) -> TypeGuard[TuiWatchMessage]:
-    """TypeGuard to narrow TuiMessage to TuiWatchMessage."""
-    return msg is not None and msg["type"] == TuiMessageType.WATCH
-
-
-def is_tui_reload_message(msg: TuiMessage) -> TypeGuard[TuiReloadMessage]:
-    """TypeGuard to narrow TuiMessage to TuiReloadMessage."""
-    return msg is not None and msg["type"] == TuiMessageType.RELOAD
-
-
 # =============================================================================
 # Watch Mode JSONL Events (--json output)
 # =============================================================================
@@ -822,7 +812,7 @@ class AgentStagesResult(TypedDict):
 #
 # Note: The constraint "TypedDict where all fields have Out annotations" cannot
 # be expressed in Python's type system. Validation is performed at registration
-# time in stage_def.get_output_specs_from_return().
+# time in stage_def.extract_stage_definition().
 #
 
 # Return type for stage functions. The actual constraint is validated at

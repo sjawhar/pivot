@@ -33,7 +33,6 @@ import textual.widget
 import textual.widgets
 
 from pivot import config, explain, parameters, project
-from pivot.cli import helpers as cli_helpers
 from pivot.executor import ExecutionSummary
 from pivot.storage import lock
 from pivot.tui import diff_panels, rpc_client
@@ -44,7 +43,13 @@ from pivot.tui.screens import (
     HistoryListScreen,
 )
 from pivot.tui.stats import DebugStats, MessageStatsTracker, get_memory_mb
-from pivot.tui.types import ExecutionHistoryEntry, LogEntry, PendingHistoryState, StageInfo
+from pivot.tui.types import (
+    ExecutionHistoryEntry,
+    LogEntry,
+    PendingHistoryState,
+    StageDataProvider,
+    StageInfo,
+)
 from pivot.tui.widgets import (
     DebugPanel,
     FooterContext,
@@ -200,6 +205,10 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
 
     # Instance attributes (annotated for type checking since class is not @final)
     _cancel_event: threading.Event | None
+    _stage_data_provider: StageDataProvider | None
+    _stages: dict[str, StageInfo]
+    _stage_order: list[str]
+    _pending_history: dict[str, PendingHistoryState]
 
     def __init__(
         self,
@@ -210,6 +219,7 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
         watch_mode: bool = False,
         no_commit: bool = False,
         serve: bool = False,
+        stage_data_provider: StageDataProvider | None = None,
     ) -> None:
         """Initialize TUI app.
 
@@ -221,8 +231,8 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
         self._watch_mode: bool = watch_mode
 
         # Core state
-        self._stages: dict[str, StageInfo] = {}
-        self._stage_order: list[str] = []
+        self._stages = dict[str, StageInfo]()
+        self._stage_order = list[str]()
         self._selected_idx: int = 0
         self._selected_stage_name: str | None = None
         self._shutdown_event: threading.Event = threading.Event()
@@ -244,11 +254,12 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
         self._commit_in_progress: bool = False
         self._cancel_commit: bool = False
         self._viewing_history_index: int | None = None
-        self._pending_history: dict[str, PendingHistoryState] = {}
+        self._pending_history = dict[str, PendingHistoryState]()
         self._current_run_id: str | None = None
         self._serve: bool = serve
         self._quitting: bool = False
         self._quit_lock: threading.Lock = threading.Lock()
+        self._stage_data_provider = stage_data_provider
         self._log_file_lock: threading.Lock = threading.Lock()
 
         # Open log file if configured
@@ -342,7 +353,9 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
 
         with textual.containers.Horizontal(id="main-split"):
             yield StageListPanel(list(self._stages.values()), id="stage-list")
-            yield TabbedDetailPanel(id="detail-panel")
+            yield TabbedDetailPanel(
+                id="detail-panel", stage_data_provider=self._stage_data_provider
+            )
 
         yield DebugPanel(id="debug-panel")
         yield PivotFooter(id="pivot-footer")
@@ -564,21 +577,22 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
     def _create_history_entry(self, stage_name: str, run_id: str) -> None:
         """Create a new history entry when stage starts executing."""
         input_snapshot = None
-        try:
-            registry_info = cli_helpers.get_stage(stage_name)
-            fingerprint = cli_helpers.get_registry().ensure_fingerprint(stage_name)
-            state_dir = config.get_state_dir()
-            input_snapshot = explain.get_stage_explanation(
-                stage_name=stage_name,
-                fingerprint=fingerprint,
-                deps=registry_info["deps_paths"],
-                outs_paths=registry_info["outs_paths"],
-                params_instance=registry_info["params"],
-                overrides=parameters.load_params_yaml(),
-                state_dir=state_dir,
-            )
-        except Exception:
-            _logger.debug("Failed to capture input snapshot for %s", stage_name)
+        if self._stage_data_provider is not None:
+            try:
+                registry_info = self._stage_data_provider.get_stage(stage_name)
+                fingerprint = self._stage_data_provider.ensure_fingerprint(stage_name)
+                state_dir = config.get_state_dir()
+                input_snapshot = explain.get_stage_explanation(
+                    stage_name=stage_name,
+                    fingerprint=fingerprint,
+                    deps=registry_info["deps_paths"],
+                    outs_paths=registry_info["outs_paths"],
+                    params_instance=registry_info["params"],
+                    overrides=parameters.load_params_yaml(),
+                    state_dir=state_dir,
+                )
+            except Exception:
+                _logger.debug("Failed to capture input snapshot for %s", stage_name)
 
         self._pending_history[stage_name] = PendingHistoryState(
             run_id=run_id,
@@ -621,14 +635,15 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
                 return
         else:
             output_snapshot: list[OutputChange] | None = None
-            try:
-                registry_info = cli_helpers.get_stage(stage_name)
-                state_dir = config.get_state_dir()
-                stages_dir = lock.get_stages_dir(state_dir)
-                lock_data = lock.StageLock(stage_name, stages_dir).read()
-                output_snapshot = diff_panels.compute_output_changes(lock_data, registry_info)
-            except Exception:
-                _logger.debug("Failed to capture output snapshot for %s", stage_name)
+            if self._stage_data_provider is not None:
+                try:
+                    registry_info = self._stage_data_provider.get_stage(stage_name)
+                    state_dir = config.get_state_dir()
+                    stages_dir = lock.get_stages_dir(state_dir)
+                    lock_data = lock.StageLock(stage_name, stages_dir).read()
+                    output_snapshot = diff_panels.compute_output_changes(lock_data, registry_info)
+                except Exception:
+                    _logger.debug("Failed to capture output snapshot for %s", stage_name)
 
             if self._viewing_history_index is None:
                 info.live_output_snapshot = output_snapshot

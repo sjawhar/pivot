@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import contextlib
 import dataclasses
 import logging
 import pathlib  # noqa: TC003 - used at runtime in _write_output
 import unicodedata
-import weakref
 from collections.abc import Callable, Mapping  # noqa: TC003 - used in function signatures
 from typing import (
     TYPE_CHECKING,
@@ -31,12 +29,6 @@ logger = logging.getLogger(__name__)
 
 # Key used in out_specs for single-output stages (non-TypedDict Annotated[T, Out(...)] returns)
 SINGLE_OUTPUT_KEY = "_single"
-
-# Cache for find_params_in_signature results. Uses WeakKeyDictionary to avoid
-# retaining old function objects during watch mode module reloads.
-_params_signature_cache: weakref.WeakKeyDictionary[
-    Callable[..., Any], tuple[str | None, type[StageParams] | None]
-] = weakref.WeakKeyDictionary()
 
 
 def _get_type_hints_safe(
@@ -182,9 +174,9 @@ def _collect_directory_out_ops(
     dir_path = spec.path
 
     # Track normalized keys to detect duplicates after normalization
-    seen_normalized: dict[str, str] = {}  # normalized -> original
+    seen_normalized = dict[str, str]()  # normalized -> original
     # Track lowercased keys to detect case collisions (for case-insensitive filesystems)
-    seen_lowercase: dict[str, str] = {}  # lowercase -> original normalized
+    seen_lowercase = dict[str, str]()  # lowercase -> original normalized
 
     # Cast value to dict[Any, Any] - we validated it's a dict above
     value_dict = cast("dict[Any, Any]", value)
@@ -287,58 +279,6 @@ def _extract_typeddict_outputs(
     return specs
 
 
-def get_output_specs_from_return(
-    func: Callable[..., Any],
-    stage_name: str,
-) -> dict[str, outputs.BaseOut]:
-    """Extract output specs from a function's return type annotation (TypedDict only).
-
-    For TypedDict returns, extracts Out specs from field annotations.
-    For other return types (None, Annotated[T, Out(...)], or plain types), returns {}.
-
-    Single-output stages (Annotated[T, Out(...)]) are handled by get_single_output_spec_from_return.
-    Stages without tracked outputs can have any return type.
-
-    Example:
-        class ProcessOutputs(TypedDict):
-            result: Annotated[dict[str, int], Out("output.json", JSON())]
-
-        def process(params: ProcessParams) -> ProcessOutputs:
-            return {"result": {"count": 42}}
-
-        specs = get_output_specs_from_return(process, "process")
-        # specs["result"].path == "output.json"
-        # specs["result"].loader == JSON()
-
-    Returns empty dict if return type is not a TypedDict with Out annotations.
-    Recognizes Out subclasses (Metric, Plot, IncrementalOut).
-
-    Raises:
-        StageDefinitionError: If TypedDict has fields without Out annotations
-    """
-    hints = _get_type_hints_safe(func, func.__name__, include_extras=True)
-    if hints is None:
-        return {}
-
-    return_type = hints.get("return")
-
-    # No return annotation or explicit None return
-    if return_type is None or return_type is type(None):
-        return {}
-
-    # Unwrap type aliases (Python 3.12+ 'type X = ...' syntax)
-    return_type = _unwrap_type_alias(return_type)
-
-    # TypedDict with Out annotations - extract specs
-    if is_typeddict(return_type):
-        return _extract_typeddict_outputs(return_type, stage_name)
-
-    # Everything else (single Annotated[T, Out(...)], plain types, etc.)
-    # Returns empty dict - single outputs handled by get_single_output_spec_from_return,
-    # and stages without tracked outputs are allowed
-    return {}
-
-
 def save_return_outputs(
     return_value: Mapping[str, Any],
     specs: dict[str, outputs.BaseOut],
@@ -433,55 +373,78 @@ class FuncDepSpec:
     creates_dep_edge: bool = True
 
 
-def get_dep_specs_from_signature(
+@dataclasses.dataclass(frozen=True)
+class StageDefinition:
+    """Complete parsed definition of a stage function's annotations.
+
+    Produced once by extract_stage_definition() and consumed by Pipeline/Registry.
+    Avoids redundant get_type_hints() calls across registration layers.
+    """
+
+    dep_specs: dict[str, FuncDepSpec]
+    out_specs: dict[str, outputs.BaseOut]
+    single_out_spec: outputs.BaseOut | None
+    placeholder_dep_names: frozenset[str]
+    params_arg_name: str | None
+    params_type: type[StageParams] | None
+    hints_resolved: bool
+
+
+def extract_stage_definition(
     func: Callable[..., Any],
+    stage_name: str,
     dep_path_overrides: Mapping[str, outputs.PathType] | None = None,
-) -> dict[str, FuncDepSpec]:
-    """Extract dependency specs from a function's parameter annotations.
+    *,
+    strict: bool = True,
+) -> StageDefinition:
+    """Extract complete stage definition from function annotations in a single pass.
 
-    Looks for Annotated type hints containing Dep, PlaceholderDep, or IncrementalOut markers:
+    Calls get_type_hints() once and derives all dep/output/params specs from the
+    result. This is the single extraction point -- Pipeline and Registry should
+    call this instead of individual extraction functions.
 
-        def process(
-            data: Annotated[DataFrame, Dep("input.csv", CSV())],
-            config: Annotated[dict, Dep("config.json", JSON())],
-        ) -> OutputType:
-            ...
+    Args:
+        func: Stage function to extract from.
+        stage_name: Name for error messages.
+        dep_path_overrides: Override paths for PlaceholderDep and Dep annotations.
+        strict: If True (default), raise StageDefinitionError when type hints
+            can't be resolved. If False, return a definition with hints_resolved=False
+            and empty specs.
 
-        specs = get_dep_specs_from_signature(process)
-        # specs["data"].path == "input.csv"
-        # specs["config"].path == "config.json"
+    Returns:
+        StageDefinition with all parsed annotation data.
 
-    PlaceholderDep requires an override path:
-
-        def compare(
-            baseline: Annotated[DataFrame, PlaceholderDep(CSV())],
-        ) -> OutputType:
-            ...
-
-        specs = get_dep_specs_from_signature(compare, {"baseline": "model/out.csv"})
-        # specs["baseline"].path == "model/out.csv"
-
-    IncrementalOut as input creates a FuncDepSpec with creates_dep_edge=False:
-
-        MyCache = Annotated[dict | None, IncrementalOut("cache.json", JSON())]
-
-        def my_stage(existing: MyCache) -> MyCache:
-            ...
-
-        specs = get_dep_specs_from_signature(my_stage)
-        # specs["existing"].creates_dep_edge == False
-
-    Returns empty dict if no Dep/PlaceholderDep/IncrementalOut annotations found.
+    Raises:
+        StageDefinitionError: If strict=True and type hints can't be resolved.
+        ValueError: If PlaceholderDep override is provided but empty.
     """
     import inspect as inspect_module
 
-    overrides = dep_path_overrides or {}
     hints = _get_type_hints_safe(func, func.__name__, include_extras=True)
     if hints is None:
-        return {}
+        if strict:
+            raise exceptions.StageDefinitionError(
+                f"Stage '{stage_name}': failed to resolve type hints for '{func.__name__}'. "
+                + "Check that all type annotations are importable."
+            )
+        return StageDefinition(
+            dep_specs={},
+            out_specs={},
+            single_out_spec=None,
+            placeholder_dep_names=frozenset(),
+            params_arg_name=None,
+            params_type=None,
+            hints_resolved=False,
+        )
 
     sig = inspect_module.signature(func)
-    specs = dict[str, FuncDepSpec]()
+
+    # --- Extract deps, placeholders, and params from parameters ---
+    overrides = dep_path_overrides or {}
+    dep_specs = dict[str, FuncDepSpec]()
+    placeholder_dep_names = set[str]()
+    params_arg_name: str | None = None
+    params_type: type[StageParams] | None = None
 
     for param_name in sig.parameters:
         if param_name not in hints:
@@ -489,25 +452,31 @@ def get_dep_specs_from_signature(
 
         param_type = _unwrap_type_alias(hints[param_name])
 
-        # Check if it's an Annotated type
+        # Check for StageParams: strip Annotated wrapper to get the base type.
+        # Only match the first StageParams parameter.
+        if params_arg_name is None:
+            base_type = (
+                get_args(param_type)[0] if get_origin(param_type) is Annotated else param_type
+            )
+            if isinstance(base_type, type) and issubclass(base_type, StageParams):
+                params_arg_name = param_name
+                params_type = base_type
+
+        # Check for Annotated deps
         if get_origin(param_type) is not Annotated:
             continue
 
-        # Get the annotation args (first is the actual type, rest are metadata)
         args = get_args(param_type)
         if len(args) < 2:
             continue
 
-        # Look for PlaceholderDep, Dep, or IncrementalOut in the metadata
         for metadata in args[1:]:
             if isinstance(metadata, outputs.PlaceholderDep):
-                # PlaceholderDep requires override
+                placeholder_dep_names.add(param_name)
                 if param_name not in overrides:
-                    raise ValueError(
-                        f"PlaceholderDep '{param_name}' requires override in dep_path_overrides"
-                    )
+                    # Skip resolution -- caller checks placeholder_dep_names
+                    break
                 override_path = overrides[param_name]
-                # Validate non-empty path
                 if isinstance(override_path, (list, tuple)):
                     if not override_path or any(not p for p in override_path):
                         raise ValueError(
@@ -516,117 +485,54 @@ def get_dep_specs_from_signature(
                 elif not override_path:
                     raise ValueError(f"PlaceholderDep '{param_name}' override cannot be empty")
                 placeholder = cast("outputs.PlaceholderDep[Any]", metadata)
-                specs[param_name] = FuncDepSpec(
+                dep_specs[param_name] = FuncDepSpec(
                     path=override_path,
                     loader=placeholder.loader,
                 )
                 break
             elif isinstance(metadata, outputs.Dep):
-                # Cast to Dep[Any] - isinstance narrows to Dep[Unknown]
                 dep = cast("outputs.Dep[Any]", metadata)
-                # Use override if provided, otherwise annotation path
                 path = overrides.get(param_name, dep.path)
-                specs[param_name] = FuncDepSpec(path=path, loader=dep.loader)
+                dep_specs[param_name] = FuncDepSpec(path=path, loader=dep.loader)
                 break
             elif isinstance(metadata, outputs.IncrementalOut):
-                # IncrementalOut as input: loads file if exists, returns None if not
-                # Does NOT create DAG edge (self-referential, avoids circular dependency)
-                inc = cast("outputs.IncrementalOut[Any]", metadata)
-                specs[param_name] = FuncDepSpec(
+                inc = cast("outputs.IncrementalOut[Any, Any]", metadata)
+                dep_specs[param_name] = FuncDepSpec(
                     path=inc.path,
                     loader=inc.loader,
                     creates_dep_edge=False,
                 )
                 break
 
-    return specs
-
-
-def get_placeholder_dep_names(func: Callable[..., Any]) -> set[str]:
-    """Get parameter names that use PlaceholderDep annotations.
-
-    Scans function parameters for Annotated hints containing PlaceholderDep.
-    Used to validate that all placeholders have overrides before registration.
-
-    Returns:
-        Set of parameter names that have PlaceholderDep annotations.
-    """
-    import inspect as inspect_module
-
-    hints = _get_type_hints_safe(func, func.__name__, include_extras=True)
-    if hints is None:
-        return set()
-
-    sig = inspect_module.signature(func)
-    placeholder_names = set[str]()
-
-    for param_name in sig.parameters:
-        if param_name not in hints:
-            continue
-
-        param_type = _unwrap_type_alias(hints[param_name])
-
-        if get_origin(param_type) is not Annotated:
-            continue
-
-        args = get_args(param_type)
-        if len(args) < 2:
-            continue
-
-        for metadata in args[1:]:
-            if isinstance(metadata, outputs.PlaceholderDep):
-                placeholder_names.add(param_name)
-                break
-
-    return placeholder_names
-
-
-def get_single_output_spec_from_return(func: Callable[..., Any]) -> outputs.BaseOut | None:
-    """Extract single output spec from a function's return annotation (non-TypedDict).
-
-    For functions with a single output, the return type can be directly annotated:
-
-        def transform(
-            data: Annotated[DataFrame, Dep("input.csv", CSV())],
-        ) -> Annotated[DataFrame, Out("output.csv", CSV())]:
-            return data.dropna()
-
-        spec = get_single_output_spec_from_return(transform)
-        # spec.path == "output.csv"
-
-    Returns None if return type is TypedDict (use get_output_specs_from_return instead)
-    or if no output annotation found (Out, IncrementalOut, or DirectoryOut).
-    """
-    hints = _get_type_hints_safe(func, func.__name__, include_extras=True)
-    if hints is None:
-        return None
+    # --- Extract output specs from return type ---
+    out_specs = dict[str, outputs.BaseOut]()
+    single_out_spec: outputs.BaseOut | None = None
 
     return_type = hints.get("return")
-    if return_type is None:
-        return None
+    if return_type is not None and return_type is not type(None):
+        return_type = _unwrap_type_alias(return_type)
 
-    return_type = _unwrap_type_alias(return_type)
+        if is_typeddict(return_type):
+            out_specs = _extract_typeddict_outputs(return_type, stage_name)
+        elif get_origin(return_type) is Annotated:
+            rt_args = get_args(return_type)
+            if len(rt_args) >= 2:
+                for metadata in rt_args[1:]:
+                    if isinstance(
+                        metadata, (outputs.Out, outputs.IncrementalOut, outputs.DirectoryOut)
+                    ):
+                        single_out_spec = cast("outputs.BaseOut", metadata)
+                        break
 
-    # If it's a TypedDict, return None (use get_output_specs_from_return instead)
-    if is_typeddict(return_type):
-        return None
-
-    # Check if it's an Annotated type
-    if get_origin(return_type) is not Annotated:
-        return None
-
-    # Get the annotation args (first is the actual type, rest are metadata)
-    args = get_args(return_type)
-    if len(args) < 2:
-        return None
-
-    # Look for any output spec type in the metadata
-    for metadata in args[1:]:
-        if isinstance(metadata, (outputs.Out, outputs.IncrementalOut, outputs.DirectoryOut)):
-            # Cast to BaseOut to satisfy type checker - isinstance narrows to Unknown generic params
-            return cast("outputs.BaseOut", metadata)
-
-    return None
+    return StageDefinition(
+        dep_specs=dep_specs,
+        out_specs=out_specs,
+        single_out_spec=single_out_spec,
+        placeholder_dep_names=frozenset(placeholder_dep_names),
+        params_arg_name=params_arg_name,
+        params_type=params_type,
+        hints_resolved=True,
+    )
 
 
 def _load_single_dep(
@@ -670,7 +576,7 @@ def load_deps_from_specs(
     For multi-file deps (path is list/tuple), loads each file and returns as list/tuple.
 
     Args:
-        specs: Dep specs from get_dep_specs_from_signature()
+        specs: Dep specs from extract_stage_definition()
         project_root: Root directory for relative paths
         path_overrides: Optional dict of dep name -> custom path(s)
 
@@ -689,66 +595,3 @@ def load_deps_from_specs(
             loaded[name] = _load_single_dep(name, path, spec, project_root)
 
     return loaded
-
-
-def find_params_type_in_signature(func: Callable[..., Any]) -> type[StageParams] | None:
-    """Find StageParams subclass type in function signature.
-
-    Scans function parameters for a type hint that's a StageParams subclass.
-
-    Args:
-        func: Function to inspect
-
-    Returns:
-        The StageParams subclass type, or None if not found
-    """
-    _, params_type = find_params_in_signature(func)
-    return params_type
-
-
-def find_params_in_signature(
-    func: Callable[..., Any],
-) -> tuple[str | None, type[StageParams] | None]:
-    """Find StageParams argument name and type in function signature.
-
-    Scans function parameters for a type hint that's a StageParams subclass.
-    Results are cached using WeakKeyDictionary to avoid retaining old function
-    objects during watch mode module reloads.
-    """
-    # Check cache first (WeakKeyDictionary raises TypeError for non-weakly-referenceable)
-    with contextlib.suppress(TypeError):
-        cached = _params_signature_cache.get(func)
-        if cached is not None:
-            return cached
-
-    result = _find_params_in_signature_impl(func)
-
-    with contextlib.suppress(TypeError):
-        _params_signature_cache[func] = result
-
-    return result
-
-
-def _find_params_in_signature_impl(
-    func: Callable[..., Any],
-) -> tuple[str | None, type[StageParams] | None]:
-    """Internal implementation of find_params_in_signature."""
-    import inspect as inspect_module
-
-    hints = _get_type_hints_safe(func, func.__name__)
-    if hints is None:
-        return None, None
-
-    sig = inspect_module.signature(func)
-
-    for param_name in sig.parameters:
-        if param_name not in hints:
-            continue
-
-        param_type = hints[param_name]
-
-        # Check if it's a StageParams subclass
-        if isinstance(param_type, type) and issubclass(param_type, StageParams):
-            return param_name, param_type
-
-    return None, None

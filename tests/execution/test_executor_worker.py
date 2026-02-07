@@ -1586,9 +1586,10 @@ def test_single_annotated_return_saves_output(
     Regression test for GitHub issue #233.
     """
     # Get the output spec from the single annotated return type
-    single_out_spec = stage_def.get_single_output_spec_from_return(
-        _stage_with_single_annotated_return
-    )
+    single_out_spec = stage_def.extract_stage_definition(
+        _stage_with_single_annotated_return,
+        _stage_with_single_annotated_return.__name__,
+    ).single_out_spec
     assert single_out_spec is not None, "Should have single output spec"
 
     stage_info = _make_stage_info(
@@ -1888,7 +1889,7 @@ def test_directory_out_first_run_writes_files(
     worker_env: pathlib.Path, output_queue: mp.Queue[OutputMessage], tmp_path: pathlib.Path
 ) -> None:
     """DirectoryOut stage writes all files on first run."""
-    out_specs = stage_def.get_output_specs_from_return(_directory_out_stage, "test_stage")
+    out_specs = stage_def.extract_stage_definition(_directory_out_stage, "test_stage").out_specs
     # Create outs list with absolute path (preserving trailing slash)
     dir_out: outputs.BaseOut = outputs.DirectoryOut(
         str(tmp_path / "results") + "/", loaders.JSON[dict[str, int]]()
@@ -1922,7 +1923,7 @@ def test_directory_out_skipped_on_second_run(
     worker_env: pathlib.Path, output_queue: mp.Queue[OutputMessage], tmp_path: pathlib.Path
 ) -> None:
     """DirectoryOut stage is skipped on second run when unchanged."""
-    out_specs = stage_def.get_output_specs_from_return(_directory_out_stage, "test_stage")
+    out_specs = stage_def.extract_stage_definition(_directory_out_stage, "test_stage").out_specs
     dir_out: outputs.BaseOut = outputs.DirectoryOut(
         str(tmp_path / "results") + "/", loaders.JSON[dict[str, int]]()
     )
@@ -1949,7 +1950,7 @@ def test_directory_out_reruns_on_fingerprint_change(
     worker_env: pathlib.Path, output_queue: mp.Queue[OutputMessage], tmp_path: pathlib.Path
 ) -> None:
     """DirectoryOut stage re-runs when code fingerprint changes."""
-    out_specs = stage_def.get_output_specs_from_return(_directory_out_stage, "test_stage")
+    out_specs = stage_def.extract_stage_definition(_directory_out_stage, "test_stage").out_specs
     dir_out: outputs.BaseOut = outputs.DirectoryOut(
         str(tmp_path / "results") + "/", loaders.JSON[dict[str, int]]()
     )
@@ -1985,7 +1986,7 @@ def test_directory_out_restored_from_cache(
     worker_env: pathlib.Path, output_queue: mp.Queue[OutputMessage], tmp_path: pathlib.Path
 ) -> None:
     """DirectoryOut files are restored from cache when missing."""
-    out_specs = stage_def.get_output_specs_from_return(_directory_out_stage, "test_stage")
+    out_specs = stage_def.extract_stage_definition(_directory_out_stage, "test_stage").out_specs
     dir_out: outputs.BaseOut = outputs.DirectoryOut(
         str(tmp_path / "results") + "/", loaders.JSON[dict[str, int]]()
     )
@@ -2436,7 +2437,9 @@ def test_run_cache_skip_with_directory_out(
     worker_env: pathlib.Path, output_queue: mp.Queue[OutputMessage], tmp_path: pathlib.Path
 ) -> None:
     """Run cache correctly handles DirectoryOut restoration."""
-    out_specs = stage_def.get_output_specs_from_return(_run_cache_directory_stage, "test_stage")
+    out_specs = stage_def.extract_stage_definition(
+        _run_cache_directory_stage, "test_stage"
+    ).out_specs
     dir_out: outputs.BaseOut = outputs.DirectoryOut(
         str(tmp_path / "results") + "/", loaders.JSON[dict[str, int]]()
     )
@@ -2491,7 +2494,9 @@ def test_run_cache_skip_restores_corrupted_directory(
     worker_env: pathlib.Path, output_queue: mp.Queue[OutputMessage], tmp_path: pathlib.Path
 ) -> None:
     """Run cache restores DirectoryOut when files are corrupted."""
-    out_specs = stage_def.get_output_specs_from_return(_run_cache_directory_stage, "test_stage")
+    out_specs = stage_def.extract_stage_definition(
+        _run_cache_directory_stage, "test_stage"
+    ).out_specs
     dir_out: outputs.BaseOut = outputs.DirectoryOut(
         str(tmp_path / "results") + "/", loaders.JSON[dict[str, int]]()
     )
@@ -3082,7 +3087,9 @@ def test_run_cache_skip_with_mixed_cached_and_noncached_outputs(
     the cached output should be restored from cache and the non-cached output
     should get a real hash computed (not None) for the lockfile.
     """
-    out_specs = stage_def.get_output_specs_from_return(_run_cache_mixed_output_stage, "test_stage")
+    out_specs = stage_def.extract_stage_definition(
+        _run_cache_mixed_output_stage, "test_stage"
+    ).out_specs
     out = outputs.Out(str(tmp_path / "output.txt"), loaders.PathOnly())
     metric = outputs.Metric(str(tmp_path / "metrics.json"))
 
