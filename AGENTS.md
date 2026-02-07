@@ -50,6 +50,7 @@ src/pivot/
 ## Core Design
 
 - **Artifact-first**: The DAG emerges from artifact dependencies, not explicit wiring
+- **Pipeline is canonical**: The registry (from `pivot.yaml`/`pipeline.py`) is the single source of truth for stage metadata — deps, outs, cache flags, params. Lock files record execution state (hashes, generations), not stage definitions. Never infer stage properties from lock files.
 - Per-stage lock files, automatic code fingerprinting, warm worker pools
 - `ProcessPoolExecutor` for true parallelism (GIL would serialize threads)
 - Invalidation is content-addressed: same inputs + same code = same outputs

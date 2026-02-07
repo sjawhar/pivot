@@ -236,7 +236,7 @@ class StorageLockData(TypedDict):
     params: dict[str, Any]
     deps: list[DepEntry]
     outs: list[OutEntry]
-    # Stored at execution time for --no-commit mode (used by commit to record correct generations)
+    # Always empty in lock files; dep generations are tracked in StateDB
     dep_generations: dict[str, int]
 
 
@@ -247,7 +247,7 @@ class LockData(TypedDict):
     params: dict[str, Any]
     dep_hashes: dict[str, HashInfo]
     output_hashes: dict[str, HashInfo]
-    # Stored at execution time for --no-commit mode (used by commit to record correct generations)
+    # Always empty in lock files; dep generations are tracked in StateDB
     dep_generations: dict[str, int]
 
 

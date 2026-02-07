@@ -40,7 +40,7 @@ def _get_targets_list(targets: tuple[str, ...]) -> list[str] | None:
     return list(targets) if targets else None
 
 
-@cli_decorators.pivot_command(auto_discover=False)
+@cli_decorators.pivot_command()
 @click.argument("targets", nargs=-1, shell_complete=completion.complete_targets)
 @click.option("-r", "--remote", "remote_name", help="Remote name (uses default if not specified)")
 @click.option("--dry-run", "-n", is_flag=True, help="Show what would be pushed")
@@ -109,7 +109,7 @@ def push(
         raise SystemExit(1)
 
 
-@cli_decorators.pivot_command(auto_discover=False)
+@cli_decorators.pivot_command()
 @click.argument("targets", nargs=-1, shell_complete=completion.complete_targets)
 @click.option("-r", "--remote", "remote_name", help="Remote name (uses default if not specified)")
 @click.option("--dry-run", "-n", is_flag=True, help="Show what would be fetched")
@@ -180,7 +180,7 @@ def fetch(
         raise SystemExit(1)
 
 
-@cli_decorators.pivot_command(auto_discover=False)
+@cli_decorators.pivot_command()
 @click.argument("targets", nargs=-1, shell_complete=completion.complete_targets)
 @click.option("-r", "--remote", "remote_name", help="Remote name (uses default if not specified)")
 @click.option("--dry-run", "-n", is_flag=True, help="Show what would be pulled")

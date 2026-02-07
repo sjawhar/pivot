@@ -38,7 +38,9 @@ Set `auto_discover=False` only for commands that don't use the stage registry:
 | checkout, track | True (default) | Need registry for validation |
 | init | False | Creates new project (no pipeline yet) |
 | schema | False | Outputs JSON schema only |
-| push, pull | False | Read from lock files, not registry |
+| push, pull, fetch | True (default) | Need registry for output cache filtering |
+
+**Principle:** The pipeline registry is the canonical source of stage metadata. Commands that inspect stage properties (cache flags, dep/out paths) must use auto-discovery. Only commands that truly don't touch stage data (init, schema, history) should use `auto_discover=False`.
 
 ### Why this matters
 
