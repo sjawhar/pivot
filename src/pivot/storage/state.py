@@ -695,12 +695,14 @@ class StateDB:
                         f"Dependency path too long ({len(key)} bytes, max {_MAX_KEY_SIZE}): {dep_path}"
                     )
 
-        for path_str in output_paths:
-            key = _make_key_output_generation(pathlib.Path(path_str))
-            if len(key) > _MAX_KEY_SIZE:
-                raise PathTooLongError(
-                    f"Output path too long ({len(key)} bytes, max {_MAX_KEY_SIZE}): {path_str}"
-                )
+        increment_outputs = "increment_outputs" in deferred and deferred["increment_outputs"]
+        if increment_outputs:
+            for path_str in output_paths:
+                key = _make_key_output_generation(pathlib.Path(path_str))
+                if len(key) > _MAX_KEY_SIZE:
+                    raise PathTooLongError(
+                        f"Output path too long ({len(key)} bytes, max {_MAX_KEY_SIZE}): {path_str}"
+                    )
 
         try:
             with self._env.begin(write=True) as txn:
@@ -720,13 +722,14 @@ class StateDB:
                         key = _make_key_dep_generation(stage_name, dep_path)
                         txn.put(key, struct.pack(">Q", gen))
 
-                # Output generations (increment)
-                for path_str in output_paths:
-                    path = pathlib.Path(path_str)
-                    key = _make_key_output_generation(path)
-                    value = txn.get(key)
-                    current = struct.unpack(">Q", value)[0] if value else 0
-                    txn.put(key, struct.pack(">Q", current + 1))
+                # Output generations (increment only when flag is set)
+                if increment_outputs:
+                    for path_str in output_paths:
+                        path = pathlib.Path(path_str)
+                        key = _make_key_output_generation(path)
+                        value = txn.get(key)
+                        current = struct.unpack(">Q", value)[0] if value else 0
+                        txn.put(key, struct.pack(">Q", current + 1))
 
                 # Run cache (only if both keys present)
                 if "run_cache_input_hash" in deferred and "run_cache_entry" in deferred:

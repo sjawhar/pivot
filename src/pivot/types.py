@@ -120,6 +120,7 @@ class DeferredWrites(TypedDict, total=False):
     dep_generations: dict[str, int]  # {dep_path: generation}
     run_cache_input_hash: str
     run_cache_entry: RunCacheEntry
+    increment_outputs: bool  # True → increment output generations; absent → skip
 
 
 class StageResult(TypedDict):

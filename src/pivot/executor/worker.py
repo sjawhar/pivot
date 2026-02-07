@@ -290,6 +290,7 @@ def execute_stage(
                                 run_cache_skip["output_hashes"],
                                 production_lock,
                                 state_db,
+                                increment_outputs=False,
                             )
                             return StageResult(
                                 status=StageStatus.SKIPPED,
@@ -994,6 +995,8 @@ def _commit_lock_and_build_deferred(
     output_hashes: dict[str, HashInfo],
     production_lock: lock.StageLock,
     state_db: state.StateDB,
+    *,
+    increment_outputs: bool = True,
 ) -> DeferredWrites:
     """Commit lock file and build deferred writes for StateDB.
 
@@ -1001,7 +1004,9 @@ def _commit_lock_and_build_deferred(
     lock file and returns DeferredWrites for the coordinator to apply.
     """
     production_lock.write(lock_data)
-    return _build_deferred_writes(stage_info, input_hash, output_hashes, state_db)
+    return _build_deferred_writes(
+        stage_info, input_hash, output_hashes, state_db, increment_outputs=increment_outputs
+    )
 
 
 def _build_deferred_writes(
@@ -1009,9 +1014,14 @@ def _build_deferred_writes(
     input_hash: str,
     output_hashes: dict[str, HashInfo],
     state_db: state.StateDB,
+    *,
+    increment_outputs: bool = True,
 ) -> DeferredWrites:
     """Build deferred writes for coordinator to apply."""
     result: DeferredWrites = {}
+
+    if increment_outputs:
+        result["increment_outputs"] = True
 
     # Dependency generations (read current values)
     gen_record = compute_dep_generation_map(stage_info["deps"], state_db)
