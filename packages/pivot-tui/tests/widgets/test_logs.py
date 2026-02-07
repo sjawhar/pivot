@@ -4,8 +4,8 @@ from __future__ import annotations
 import collections
 from typing import TYPE_CHECKING
 
-from pivot.tui.types import LogEntry
-from pivot.tui.widgets.logs import StageLogPanel
+from pivot_tui.types import LogEntry
+from pivot_tui.widgets.logs import StageLogPanel
 
 if TYPE_CHECKING:
     from pytest_mock import MockerFixture

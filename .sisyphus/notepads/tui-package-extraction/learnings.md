@@ -324,3 +324,92 @@ The old `src/pivot/tui/` was a stub directory with only `__init__.py`. All actua
 - **Core** (`pivot`): `rich`, `tqdm` (for CLI console output)
 - **Optional** (`pivot[tui]`): `pivot-tui` (which brings in `textual`)
 - This allows users to install core without TUI overhead
+
+## Task 7: Move TUI Tests to pivot-tui Package
+
+**Completed**: 2026-02-07
+
+### Objective
+Move all TUI-specific test files from `tests/` to `packages/pivot-tui/tests/` and update imports to use `pivot_tui` instead of `pivot.tui`.
+
+### Files Moved
+- **From tests/tui/ → packages/pivot-tui/tests/**
+  - test_console.py
+  - test_diff.py
+  - test_diff_panels.py
+  - test_history.py
+  - test_log_search_e2e.py
+  - test_rpc_client.py
+  - test_run.py
+  - test_stats.py
+  - widgets/test_footer.py
+  - widgets/test_log_level_detection.py
+  - widgets/test_logs.py
+  - widgets/test_status.py
+
+- **From tests/engine/test_tui_sink.py → packages/pivot-tui/tests/**
+  - test_tui_sink.py
+
+- **From tests/integration/test_tui_force_rerun.py → packages/pivot-tui/tests/**
+  - test_tui_force_rerun.py
+
+- **From tests/cli/test_watch.py → packages/pivot-tui/tests/**
+  - test_watch.py (extracted TUI-specific tests)
+
+- **From tests/cli/test_cli_run_common.py → packages/pivot-tui/tests/**
+  - test_cli_run_common.py (extracted test_configure_output_sink_tui_mode)
+
+### Import Updates
+1. **pivot.tui → pivot_tui**: Updated all `from pivot.tui import X` and `from pivot.tui.Y import Z` statements
+2. **pivot.engine.sinks.TuiSink → pivot_tui.sink.TuiSink**: Updated TuiSink imports
+3. **Mocker patches**: Updated all `mocker.patch("pivot.tui.X")` to `mocker.patch("pivot_tui.X")`
+
+### Supporting Files Copied
+- `tests/conftest.py` → `packages/pivot-tui/tests/conftest.py` (provides send_rpc fixture)
+- `tests/helpers.py` → `packages/pivot-tui/tests/helpers.py` (test utilities)
+
+### Test Results
+- ✅ Core tests: 3133 passed, 4 skipped, 6 xfailed
+- ✅ TUI tests: 366 passed, 1 rerun
+- ✅ No TUI tests remain in root test suite
+- ✅ All imports updated correctly
+
+### Key Learnings
+
+1. **Test File Organization**: TUI tests are now fully isolated in the pivot-tui package, making it clear which tests depend on TUI functionality.
+
+2. **Conftest and Helpers**: Test support files (conftest.py, helpers.py) need to be copied to the new test location since pytest discovers them relative to the test directory.
+
+3. **Mocker Patches**: When moving tests between packages, all mocker.patch() calls that reference the old module path must be updated. This includes:
+   - Direct module patches: `"pivot.tui.module.function"`
+   - Nested patches: `"pivot.tui.module.submodule.function"`
+
+4. **Test Isolation**: The separation enables:
+   - Running core tests without TUI dependencies: `uv run pytest tests/ -n auto`
+   - Running TUI tests in isolation: `uv run --package pivot-tui pytest packages/pivot-tui/tests/ -n auto`
+   - Clear dependency boundaries between core and TUI functionality
+
+### Files Deleted from Root
+- `tests/tui/` (entire directory)
+- `tests/engine/test_tui_sink.py`
+- `tests/integration/test_tui_force_rerun.py`
+- `tests/cli/test_watch.py` (after extracting TUI tests)
+- `test_configure_output_sink_tui_mode` from `tests/cli/test_cli_run_common.py`
+
+### Verification Commands
+```bash
+# Core tests pass without TUI tests
+uv run pytest tests/ -n auto -x
+
+# TUI tests pass in pivot-tui package
+uv run --package pivot-tui pytest packages/pivot-tui/tests/ -n auto -x
+
+# No stale TUI test imports
+grep -rn "from pivot\.tui" packages/pivot-tui/tests/ --include="*.py"  # Should be empty
+grep -rn "from pivot\.engine\.sinks import TuiSink" packages/pivot-tui/tests/ --include="*.py"  # Should be empty
+```
+
+### Commit
+YES - Message: `test(tui): move TUI tests to pivot-tui package`
+Files: `packages/pivot-tui/tests/`, deleted test files from `tests/`
+Pre-commit: Both test suites pass

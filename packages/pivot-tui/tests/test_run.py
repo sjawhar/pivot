@@ -10,16 +10,16 @@ import textual.binding
 import textual.widgets
 
 from pivot import loaders, outputs
-from pivot.tui import run as run_tui
-from pivot.tui.screens import ConfirmCommitScreen
-from pivot.tui.types import LogEntry, StageInfo
-from pivot.tui.widgets import (
+from pivot_tui import run as run_tui
+from pivot_tui.screens import ConfirmCommitScreen
+from pivot_tui.types import LogEntry, StageInfo
+from pivot_tui.widgets import (
     StageListPanel,
     StageLogPanel,
     StageRow,
     TabbedDetailPanel,
 )
-from pivot.tui.widgets import status as tui_status
+from pivot_tui.widgets import status as tui_status
 from pivot.types import (
     StageStatus,
     TuiLogMessage,
@@ -945,10 +945,10 @@ async def test_action_force_rerun_stage_calls_rpc(mocker: MockerFixture) -> None
     app = run_tui.PivotApp(stage_names=["stage_a", "stage_b"], watch_mode=True)
     app._selected_stage_name = "stage_a"
 
-    mock_send = mocker.patch("pivot.tui.run.rpc_client.send_run_command", new_callable=AsyncMock)
+    mock_send = mocker.patch("pivot_tui.run.rpc_client.send_run_command", new_callable=AsyncMock)
     mock_send.return_value = True
     mocker.patch.object(app, "notify")
-    mocker.patch("pivot.tui.run.project.get_project_root", return_value=pathlib.Path("/fake/root"))
+    mocker.patch("pivot_tui.run.project.get_project_root", return_value=pathlib.Path("/fake/root"))
 
     await app.action_force_rerun_stage()
 
@@ -963,10 +963,10 @@ async def test_action_force_rerun_all_calls_rpc(mocker: MockerFixture) -> None:
     """action_force_rerun_all should send RPC command for all stages."""
     app = run_tui.PivotApp(stage_names=["stage_a", "stage_b"], watch_mode=True)
 
-    mock_send = mocker.patch("pivot.tui.run.rpc_client.send_run_command", new_callable=AsyncMock)
+    mock_send = mocker.patch("pivot_tui.run.rpc_client.send_run_command", new_callable=AsyncMock)
     mock_send.return_value = True
     mocker.patch.object(app, "notify")
-    mocker.patch("pivot.tui.run.project.get_project_root", return_value=pathlib.Path("/fake/root"))
+    mocker.patch("pivot_tui.run.project.get_project_root", return_value=pathlib.Path("/fake/root"))
 
     await app.action_force_rerun_all()
 
@@ -983,7 +983,7 @@ async def test_action_force_rerun_not_in_watch_mode(mocker: MockerFixture) -> No
     app = run_tui.PivotApp(stage_names=["stage_a"])
     app._selected_stage_name = "stage_a"
 
-    mock_send = mocker.patch("pivot.tui.run.rpc_client.send_run_command", new_callable=AsyncMock)
+    mock_send = mocker.patch("pivot_tui.run.rpc_client.send_run_command", new_callable=AsyncMock)
 
     await app.action_force_rerun_stage()
 
@@ -996,7 +996,7 @@ async def test_action_force_rerun_no_stage_selected(mocker: MockerFixture) -> No
     app = run_tui.PivotApp(stage_names=[], watch_mode=True)
     app._selected_stage_name = None
 
-    mock_send = mocker.patch("pivot.tui.run.rpc_client.send_run_command", new_callable=AsyncMock)
+    mock_send = mocker.patch("pivot_tui.run.rpc_client.send_run_command", new_callable=AsyncMock)
     mock_notify = mocker.patch.object(app, "notify")
 
     await app.action_force_rerun_stage()
@@ -1014,7 +1014,7 @@ async def test_action_force_rerun_while_running(mocker: MockerFixture) -> None:
     # Simulate running stage
     app._stages["stage_a"].status = StageStatus.IN_PROGRESS
 
-    mock_send = mocker.patch("pivot.tui.run.rpc_client.send_run_command", new_callable=AsyncMock)
+    mock_send = mocker.patch("pivot_tui.run.rpc_client.send_run_command", new_callable=AsyncMock)
     mock_notify = mocker.patch.object(app, "notify")
 
     await app.action_force_rerun_stage()
@@ -1031,7 +1031,7 @@ async def test_action_force_rerun_all_while_running(mocker: MockerFixture) -> No
     # Simulate running stage
     app._stages["stage_a"].status = StageStatus.IN_PROGRESS
 
-    mock_send = mocker.patch("pivot.tui.run.rpc_client.send_run_command", new_callable=AsyncMock)
+    mock_send = mocker.patch("pivot_tui.run.rpc_client.send_run_command", new_callable=AsyncMock)
     mock_notify = mocker.patch.object(app, "notify")
 
     await app.action_force_rerun_all()
@@ -1047,10 +1047,10 @@ async def test_action_force_rerun_stage_failure_notifies(mocker: MockerFixture) 
     app = run_tui.PivotApp(stage_names=["stage_a"], watch_mode=True)
     app._selected_stage_name = "stage_a"
 
-    mock_send = mocker.patch("pivot.tui.run.rpc_client.send_run_command", new_callable=AsyncMock)
+    mock_send = mocker.patch("pivot_tui.run.rpc_client.send_run_command", new_callable=AsyncMock)
     mock_send.return_value = False  # RPC failure
     mock_notify = mocker.patch.object(app, "notify")
-    mocker.patch("pivot.tui.run.project.get_project_root", return_value=pathlib.Path("/fake/root"))
+    mocker.patch("pivot_tui.run.project.get_project_root", return_value=pathlib.Path("/fake/root"))
 
     await app.action_force_rerun_stage()
 
@@ -1068,7 +1068,7 @@ async def test_action_force_rerun_stage_failure_notifies(mocker: MockerFixture) 
 
 def test_stage_data_provider_protocol_is_importable() -> None:
     """StageDataProvider protocol can be imported from tui.types."""
-    from pivot.tui.types import StageDataProvider
+    from pivot_tui.types import StageDataProvider
 
     assert hasattr(StageDataProvider, "get_stage")
     assert hasattr(StageDataProvider, "ensure_fingerprint")
@@ -1076,7 +1076,7 @@ def test_stage_data_provider_protocol_is_importable() -> None:
 
 def test_pivot_app_accepts_stage_data_provider(mocker: MockerFixture) -> None:
     """PivotApp stores stage_data_provider when passed."""
-    from pivot.tui.types import StageDataProvider
+    from pivot_tui.types import StageDataProvider
 
     provider = mocker.MagicMock(spec=StageDataProvider)
     app = run_tui.PivotApp(stage_names=["s1"], stage_data_provider=provider)
@@ -1085,7 +1085,7 @@ def test_pivot_app_accepts_stage_data_provider(mocker: MockerFixture) -> None:
 
 def test_create_history_entry_uses_provider(mocker: MockerFixture) -> None:
     """_create_history_entry uses stage_data_provider instead of cli_helpers."""
-    from pivot.tui.types import StageDataProvider
+    from pivot_tui.types import StageDataProvider
 
     mock_provider = mocker.MagicMock(spec=StageDataProvider)
     mock_provider.get_stage.return_value = {
@@ -1101,9 +1101,9 @@ def test_create_history_entry_uses_provider(mocker: MockerFixture) -> None:
         stage_data_provider=mock_provider,
     )
 
-    mocker.patch("pivot.tui.run.explain.get_stage_explanation", return_value=None)
-    mocker.patch("pivot.tui.run.parameters.load_params_yaml", return_value={})
-    mocker.patch("pivot.tui.run.config.get_state_dir", return_value=pathlib.Path("/fake"))
+    mocker.patch("pivot_tui.run.explain.get_stage_explanation", return_value=None)
+    mocker.patch("pivot_tui.run.parameters.load_params_yaml", return_value={})
+    mocker.patch("pivot_tui.run.config.get_state_dir", return_value=pathlib.Path("/fake"))
 
     app._create_history_entry("stage_a", "run-1")
 

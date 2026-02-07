@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from pivot.tui.widgets.logs import _LEVEL_STYLES, _LOG_LEVEL_PATTERN, _get_line_style
+from pivot_tui.widgets.logs import _LEVEL_STYLES, _LOG_LEVEL_PATTERN, _get_line_style
 
 # =============================================================================
 # Pattern Matching - Basic Formats

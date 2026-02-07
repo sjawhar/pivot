@@ -7,9 +7,9 @@ import asyncio
 
 import pytest
 
-from pivot.tui.run import PivotApp
-from pivot.tui.widgets.logs import StageLogPanel
-from pivot.tui.widgets.panels import TabbedDetailPanel
+from pivot_tui.run import PivotApp
+from pivot_tui.widgets.logs import StageLogPanel
+from pivot_tui.widgets.panels import TabbedDetailPanel
 
 
 @pytest.mark.asyncio

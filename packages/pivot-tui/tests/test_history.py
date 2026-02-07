@@ -5,9 +5,9 @@ from __future__ import annotations
 import collections
 import time
 
-from pivot.tui import run as run_tui
-from pivot.tui.types import ExecutionHistoryEntry, LogEntry, PendingHistoryState, StageInfo
-from pivot.tui.widgets import TabbedDetailPanel
+from pivot_tui import run as run_tui
+from pivot_tui.types import ExecutionHistoryEntry, LogEntry, PendingHistoryState, StageInfo
+from pivot_tui.widgets import TabbedDetailPanel
 from pivot.types import StageStatus
 
 # =============================================================================

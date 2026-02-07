@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any
 import anyio
 import pytest
 
-from pivot.tui import rpc_client
+from pivot_tui import rpc_client
 
 if TYPE_CHECKING:
     from pathlib import Path

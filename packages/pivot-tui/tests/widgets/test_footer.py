@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from pivot.tui.widgets import FooterContext, PivotFooter
+from pivot_tui.widgets import FooterContext, PivotFooter
 
 if TYPE_CHECKING:
     from pytest_mock import MockerFixture

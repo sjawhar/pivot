@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from pivot.tui import stats
+from pivot_tui import stats
 
 if TYPE_CHECKING:
     from pytest_mock import MockerFixture
@@ -43,7 +43,7 @@ def test_sliding_window_counter_throughput_reflects_window() -> None:
 
 def test_sliding_window_counter_handles_bucket_transitions(mocker: MockerFixture) -> None:
     # Mock time.monotonic to control bucket transitions
-    mock_time = mocker.patch("pivot.tui.stats.time.monotonic", autospec=True)
+    mock_time = mocker.patch("pivot_tui.stats.time.monotonic", autospec=True)
 
     counter = stats.SlidingWindowCounter()
 
@@ -68,7 +68,7 @@ def test_sliding_window_counter_handles_bucket_transitions(mocker: MockerFixture
 
 
 def test_sliding_window_counter_excludes_old_buckets(mocker: MockerFixture) -> None:
-    mock_time = mocker.patch("pivot.tui.stats.time.monotonic", autospec=True)
+    mock_time = mocker.patch("pivot_tui.stats.time.monotonic", autospec=True)
 
     counter = stats.SlidingWindowCounter()
 

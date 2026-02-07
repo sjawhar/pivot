@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import pytest
 
-from pivot.tui.types import StageInfo
-from pivot.tui.widgets import status
+from pivot_tui.types import StageInfo
+from pivot_tui.widgets import status
 from pivot.types import StageStatus
 
 # =============================================================================

@@ -1,4 +1,4 @@
-"""Tests for watch mode functionality."""
+"""Tests for TUI watch mode functionality."""
 
 from __future__ import annotations
 

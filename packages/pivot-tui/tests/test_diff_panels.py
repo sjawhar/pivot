@@ -9,7 +9,7 @@ import pytest
 
 from pivot import loaders, outputs, project
 from pivot.storage import cache
-from pivot.tui import diff_panels
+from pivot_tui import diff_panels
 from pivot.types import (
     ChangeType,
     CodeChange,
@@ -808,7 +808,7 @@ def test_output_panel_set_from_snapshot(
 
 def test_input_panel_load_uses_provider(mocker: MockerFixture) -> None:
     """InputDiffPanel._load_stage_data uses provider instead of cli_helpers."""
-    from pivot.tui.types import StageDataProvider
+    from pivot_tui.types import StageDataProvider
 
     mock_provider = mocker.MagicMock(spec=StageDataProvider)
     mock_provider.get_stage.return_value = {
@@ -831,11 +831,11 @@ def test_input_panel_load_uses_provider(mocker: MockerFixture) -> None:
         upstream_stale=[],
     )
     mocker.patch(
-        "pivot.tui.diff_panels.explain.get_stage_explanation",
+        "pivot_tui.diff_panels.explain.get_stage_explanation",
         return_value=mock_explanation,
     )
-    mocker.patch("pivot.tui.diff_panels.parameters.load_params_yaml", return_value={})
-    mocker.patch("pivot.tui.diff_panels.config.get_state_dir", return_value=pathlib.Path("/fake"))
+    mocker.patch("pivot_tui.diff_panels.parameters.load_params_yaml", return_value={})
+    mocker.patch("pivot_tui.diff_panels.config.get_state_dir", return_value=pathlib.Path("/fake"))
 
     panel._load_stage_data("my_stage")
 
@@ -845,7 +845,7 @@ def test_input_panel_load_uses_provider(mocker: MockerFixture) -> None:
 
 def test_output_panel_load_uses_provider(mocker: MockerFixture) -> None:
     """OutputDiffPanel._load_stage_data uses provider instead of cli_helpers."""
-    from pivot.tui.types import StageDataProvider
+    from pivot_tui.types import StageDataProvider
 
     mock_provider = mocker.MagicMock(spec=StageDataProvider)
     mock_provider.get_stage.return_value = {
@@ -857,8 +857,8 @@ def test_output_panel_load_uses_provider(mocker: MockerFixture) -> None:
 
     panel = diff_panels.OutputDiffPanel(stage_data_provider=mock_provider)
 
-    mocker.patch("pivot.tui.diff_panels.config.get_state_dir", return_value=pathlib.Path("/fake"))
-    mocker.patch("pivot.tui.diff_panels.lock.StageLock")
+    mocker.patch("pivot_tui.diff_panels.config.get_state_dir", return_value=pathlib.Path("/fake"))
+    mocker.patch("pivot_tui.diff_panels.lock.StageLock")
 
     panel._load_stage_data("my_stage")
 
