@@ -14,6 +14,7 @@ import time
 from typing import TYPE_CHECKING, Self
 
 import anyio
+import anyio.from_thread
 import anyio.to_thread
 
 from pivot import config, exceptions, parameters, project
@@ -57,9 +58,6 @@ _logger = logging.getLogger(__name__)
 # Channel buffer sizes for backpressure
 _INPUT_BUFFER_SIZE = 32
 _OUTPUT_BUFFER_SIZE = 64
-
-# Timeout for draining output queue from worker processes (seconds)
-_OUTPUT_QUEUE_DRAIN_TIMEOUT = 0.02
 
 
 class Engine:
@@ -544,7 +542,8 @@ class Engine:
         # Create executor
         self._executor = executor_core.create_executor(effective_max_workers)
 
-        # Create output queue
+        # Create output queue via Manager so the proxy is picklable across loky workers.
+        # Plain spawn_ctx.Queue() cannot be pickled for ProcessPoolExecutor.submit().
         spawn_ctx = mp.get_context("spawn")
         local_manager = spawn_ctx.Manager()
         output_queue: mp.Queue[OutputMessage] = local_manager.Queue()  # pyright: ignore[reportAssignmentType]
@@ -558,11 +557,8 @@ class Engine:
         state_db_path = config.get_state_db_path()
 
         try:
-            # Start output drain task
-            output_stop_event = anyio.Event()
-
             async with anyio.create_task_group() as tg:
-                tg.start_soon(self._drain_output_queue, output_queue, output_stop_event)
+                tg.start_soon(self._drain_output_queue, output_queue)
 
                 # Open StateDB to ensure database exists before workers start
                 with state_mod.StateDB(state_db_path) as state_db:
@@ -722,12 +718,19 @@ class Engine:
                                 name, f"upstream '{failed_upstream}' failed", results
                             )
 
-                # Signal output drain task to stop
-                output_stop_event.set()
+                # Send sentinel to stop blocking drain thread without blocking event loop
+                with contextlib.suppress(queue.Full, OSError, BrokenPipeError):
+                    output_queue.put_nowait(None)
 
         finally:
+            # Ensure drain thread can exit even on exception path.
+            # Suppress Full in case the queue is at capacity (e.g., sentinel
+            # already enqueued on the happy path).
+            with contextlib.suppress(OSError, BrokenPipeError, queue.Full):
+                output_queue.put_nowait(None)
             self._executor = None
-            # Manager shutdown can fail if the manager process died unexpectedly
+            # Manager shutdown can fail if the manager process died unexpectedly.
+            # Must happen after sentinel send so drain thread exits first.
             with contextlib.suppress(OSError, BrokenPipeError):
                 local_manager.shutdown()
 
@@ -769,45 +772,51 @@ class Engine:
     async def _drain_output_queue(
         self,
         output_queue: mp.Queue[OutputMessage],
-        stop_event: anyio.Event,
     ) -> None:
-        """Drain output messages from worker processes and emit LogLine events."""
-        while not stop_event.is_set():
-            try:
-                # Poll the queue in a thread to not block the event loop
-                msg = await anyio.to_thread.run_sync(
-                    lambda: self._get_from_queue(output_queue, timeout=_OUTPUT_QUEUE_DRAIN_TIMEOUT)
-                )
-                if msg is None:
-                    continue
+        """Drain output messages from worker processes and emit LogLine events.
 
-                # Emit LogLine event for each output message
+        Runs a blocking thread that calls queue.get() without polling.
+        The thread exits when it receives a sentinel (None).
+        Messages are forwarded into the async event loop via anyio.from_thread.run.
+        """
+
+        def _blocking_drain() -> None:
+            while True:
+                try:
+                    # Use a timeout so the thread can exit even if the sentinel
+                    # is never delivered (e.g., put() failed on exception path).
+                    # The thread is abandoned on task-group cancellation, but a
+                    # bounded get prevents it from blocking the interpreter at
+                    # shutdown indefinitely.
+                    msg = output_queue.get(timeout=5.0)
+                except queue.Empty:
+                    continue
+                except (EOFError, OSError):
+                    break
+
+                if msg is None:
+                    break
+
                 try:
                     stage_name, line, is_stderr = msg
                 except (TypeError, ValueError):
-                    _logger.debug(f"Malformed output message, skipping: {msg!r}")
                     continue
 
-                await self.emit(
-                    LogLine(
-                        type="log_line",
-                        stage=stage_name,
-                        line=line,
-                        is_stderr=is_stderr,
+                try:
+                    anyio.from_thread.run(
+                        self.emit,
+                        LogLine(
+                            type="log_line",
+                            stage=stage_name,
+                            line=line,
+                            is_stderr=is_stderr,
+                        ),
                     )
-                )
-            except Exception:
-                _logger.debug("Output queue drain error", exc_info=True)
-                await anyio.sleep(0.01)
+                except Exception:
+                    # Event loop closed or cancelled -- stop draining
+                    break
 
-    def _get_from_queue(self, q: mp.Queue[OutputMessage], timeout: float) -> OutputMessage | None:
-        """Get from queue with timeout. Returns None on timeout."""
-        try:
-            return q.get(timeout=timeout)
-        except queue.Empty:
-            return None
-        except (EOFError, OSError, BrokenPipeError):
-            return None
+        await anyio.to_thread.run_sync(_blocking_drain, abandon_on_cancel=True)
 
     async def _initialize_orchestration(
         self,
