@@ -7,8 +7,8 @@ import yaml
 
 from pivot import exceptions, project
 from pivot.cli import helpers as cli_helpers
-from pivot.remote import S3Remote
 from pivot.remote import config as remote_config
+from pivot.remote import storage as remote_storage
 from pivot.remote import sync as transfer
 from pivot.storage import state as state_mod
 from pivot.types import RemoteStatus, TransferResult
@@ -173,7 +173,7 @@ def test_get_stage_output_hashes_directory_output(
         yaml.dump(lock_data, f)
 
     result = transfer.get_stage_output_hashes(state_dir, ["my_stage"])
-    assert result == {"treehash1234567", "filehash1234567", "filehash2345678"}
+    assert result == {"filehash1234567", "filehash2345678"}
 
 
 def test_get_stage_output_hashes_multiple_stages(
@@ -243,7 +243,7 @@ def test_get_stage_dep_hashes_with_manifest(
         yaml.dump(lock_data, f)
 
     result = transfer.get_stage_dep_hashes(state_dir, ["my_stage"])
-    assert result == {"dirtreehash1234", "afilehash123456", "bfilehash123456"}
+    assert result == {"afilehash123456", "bfilehash123456"}
 
 
 def test_get_stage_dep_hashes_no_lock(lock_project: Path) -> None:
@@ -262,7 +262,7 @@ def test_get_stage_dep_hashes_no_lock(lock_project: Path) -> None:
 async def test_compare_status_empty_hashes(lock_project: Path, mocker: MockerFixture) -> None:
     """Empty local hashes returns empty status."""
 
-    mock_remote = mocker.Mock(spec=S3Remote)
+    mock_remote = mocker.Mock(spec=remote_storage.S3Remote)
     mock_state = mocker.Mock(spec=state_mod.StateDB)
 
     result = await transfer.compare_status(set(), mock_remote, mock_state, "origin")
@@ -274,7 +274,7 @@ async def test_compare_status_empty_hashes(lock_project: Path, mocker: MockerFix
 async def test_compare_status_all_known_in_index(lock_project: Path, mocker: MockerFixture) -> None:
     """All hashes known in index skips remote check."""
 
-    mock_remote = mocker.Mock(spec=S3Remote)
+    mock_remote = mocker.Mock(spec=remote_storage.S3Remote)
     mock_state = mocker.Mock(spec=state_mod.StateDB)
 
     local_hashes = {"abc123def4567890", "def456abc7890123"}
@@ -290,7 +290,7 @@ async def test_compare_status_all_known_in_index(lock_project: Path, mocker: Moc
 async def test_compare_status_queries_unknown(lock_project: Path, mocker: MockerFixture) -> None:
     """Unknown hashes query remote and update index."""
 
-    mock_remote = mocker.Mock(spec=S3Remote)
+    mock_remote = mocker.Mock(spec=remote_storage.S3Remote)
     mock_state = mocker.Mock(spec=state_mod.StateDB)
 
     local_hashes = {"abc123def4567890", "def456abc7890123", "111222333444555a"}
@@ -316,7 +316,7 @@ async def test_push_async_no_local_hashes(lock_project: Path, mocker: MockerFixt
 
     cache_dir = lock_project / ".pivot" / "cache"
     state_dir = lock_project / ".pivot"
-    mock_remote = mocker.Mock(spec=S3Remote)
+    mock_remote = mocker.Mock(spec=remote_storage.S3Remote)
     mock_state = mocker.Mock(spec=state_mod.StateDB)
 
     result = await transfer._push_async(cache_dir, state_dir, mock_remote, mock_state, "origin")
@@ -337,7 +337,7 @@ async def test_push_async_all_already_on_remote(lock_project: Path, mocker: Mock
     (files_dir / "ab").mkdir(parents=True)
     (files_dir / "ab" / ("c" * 14)).write_text("content1")
 
-    mock_remote = mocker.Mock(spec=S3Remote)
+    mock_remote = mocker.Mock(spec=remote_storage.S3Remote)
     mock_state = mocker.Mock(spec=state_mod.StateDB)
     mock_state.remote_hashes_intersection.return_value = {hash1}
 
@@ -359,7 +359,7 @@ async def test_push_async_uploads_missing(lock_project: Path, mocker: MockerFixt
     (files_dir / "ab").mkdir(parents=True)
     (files_dir / "ab" / ("c" * 14)).write_text("content1")
 
-    mock_remote = mocker.Mock(spec=S3Remote)
+    mock_remote = mocker.Mock(spec=remote_storage.S3Remote)
     mock_state = mocker.Mock(spec=state_mod.StateDB)
     mock_state.remote_hashes_intersection.return_value = set()
     mock_remote.bulk_exists = mocker.AsyncMock(return_value={hash1: False})
@@ -386,7 +386,7 @@ async def test_push_async_handles_failures(lock_project: Path, mocker: MockerFix
     (files_dir / "ab").mkdir(parents=True)
     (files_dir / "ab" / ("c" * 14)).write_text("content1")
 
-    mock_remote = mocker.Mock(spec=S3Remote)
+    mock_remote = mocker.Mock(spec=remote_storage.S3Remote)
     mock_state = mocker.Mock(spec=state_mod.StateDB)
     mock_state.remote_hashes_intersection.return_value = set()
     mock_remote.bulk_exists = mocker.AsyncMock(return_value={hash1: False})
@@ -420,7 +420,7 @@ async def test_push_async_with_stages(
     with lock_path.open("w") as f:
         yaml.dump(lock_data, f)
 
-    mock_remote = mocker.Mock(spec=S3Remote)
+    mock_remote = mocker.Mock(spec=remote_storage.S3Remote)
     mock_state = mocker.Mock(spec=state_mod.StateDB)
     mock_state.remote_hashes_intersection.return_value = set()
     mock_remote.bulk_exists = mocker.AsyncMock(return_value={hash1: False})
@@ -445,7 +445,7 @@ async def test_pull_async_no_needed_hashes(lock_project: Path, mocker: MockerFix
 
     cache_dir = lock_project / ".pivot" / "cache"
     state_dir = lock_project / ".pivot"
-    mock_remote = mocker.Mock(spec=S3Remote)
+    mock_remote = mocker.Mock(spec=remote_storage.S3Remote)
     mock_state = mocker.Mock(spec=state_mod.StateDB)
 
     result = await transfer._pull_async(
@@ -476,7 +476,7 @@ async def test_pull_async_all_already_local(
     with lock_path.open("w") as f:
         yaml.dump(lock_data, f)
 
-    mock_remote = mocker.Mock(spec=S3Remote)
+    mock_remote = mocker.Mock(spec=remote_storage.S3Remote)
     mock_state = mocker.Mock(spec=state_mod.StateDB)
 
     result = await transfer._pull_async(
@@ -503,7 +503,7 @@ async def test_pull_async_downloads_missing(
     with lock_path.open("w") as f:
         yaml.dump(lock_data, f)
 
-    mock_remote = mocker.Mock(spec=S3Remote)
+    mock_remote = mocker.Mock(spec=remote_storage.S3Remote)
     mock_state = mocker.Mock(spec=state_mod.StateDB)
     mock_remote.download_batch = mocker.AsyncMock(
         return_value=[TransferResult(hash=hash1, success=True)]
@@ -529,7 +529,7 @@ async def test_pull_async_without_stages_lists_remote(
     (cache_dir / "files").mkdir(parents=True)
 
     hash1 = "ab" + "c" * 14
-    mock_remote = mocker.Mock(spec=S3Remote)
+    mock_remote = mocker.Mock(spec=remote_storage.S3Remote)
     mock_state = mocker.Mock(spec=state_mod.StateDB)
     mock_remote.list_hashes = mocker.AsyncMock(return_value={hash1})
     mock_remote.download_batch = mocker.AsyncMock(
@@ -559,7 +559,7 @@ async def test_pull_async_handles_failures(
     with lock_path.open("w") as f:
         yaml.dump(lock_data, f)
 
-    mock_remote = mocker.Mock(spec=S3Remote)
+    mock_remote = mocker.Mock(spec=remote_storage.S3Remote)
     mock_state = mocker.Mock(spec=state_mod.StateDB)
     mock_remote.download_batch = mocker.AsyncMock(
         return_value=[TransferResult(hash=hash1, success=False, error="Download failed")]
@@ -593,7 +593,7 @@ async def test_pull_async_includes_deps(
     with lock_path.open("w") as f:
         yaml.dump(lock_data, f)
 
-    mock_remote = mocker.Mock(spec=S3Remote)
+    mock_remote = mocker.Mock(spec=remote_storage.S3Remote)
     mock_state = mocker.Mock(spec=state_mod.StateDB)
     mock_remote.download_batch = mocker.AsyncMock(
         return_value=[

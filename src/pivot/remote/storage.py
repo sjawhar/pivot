@@ -6,7 +6,7 @@ import os
 import re
 import shutil
 import tempfile
-from typing import TYPE_CHECKING, Any, Protocol, TypedDict
+from typing import TYPE_CHECKING, Protocol, TypedDict
 
 from pivot import config, exceptions, metrics
 from pivot.remote import config as remote_config
@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     from aiobotocore.config import AioConfig
     from botocore.exceptions import ClientError
     from types_aiobotocore_s3 import S3Client
+    from types_aiobotocore_s3.type_defs import GetObjectOutputTypeDef
 
 logger = logging.getLogger(__name__)
 
@@ -27,13 +28,12 @@ logger = logging.getLogger(__name__)
 DEFAULT_CONCURRENCY = 20
 STREAM_CHUNK_SIZE = 8 * 1024 * 1024  # 8MB chunks for streaming
 STREAM_READ_TIMEOUT = 60  # Seconds to wait for each chunk read
-MIN_HASH_LENGTH = 3  # Minimum hash length (2-char prefix + at least 1 char)
 # Threshold for using LIST vs HEAD in bulk_exists. HEAD is O(n) requests but lower latency;
 # LIST is O(prefixes) requests (max 256 for 2-char hex) but returns up to 1000 keys each.
 # At 50 hashes, LIST wins unless hashes are spread across 50+ prefixes (unlikely).
 BULK_EXISTS_LIST_THRESHOLD = 50
 
-_HEX_PATTERN = re.compile(r"^[a-f0-9]+$", re.IGNORECASE)
+_HEX_PATTERN = re.compile(r"^[a-f0-9]{16}$")
 
 # Cached S3 config to avoid re-parsing config on every call.
 # Safe without locking - asyncio is single-threaded, worst case race just
@@ -117,13 +117,11 @@ def _get_s3_config() -> AioConfig:
 
 
 def _validate_hash(cache_hash: str) -> None:
-    """Validate hash has minimum length and is hexadecimal."""
-    if len(cache_hash) < MIN_HASH_LENGTH:
-        raise exceptions.RemoteError(
-            f"Invalid cache hash '{cache_hash}': must be at least {MIN_HASH_LENGTH} characters"
-        )
+    """Validate hash is exactly 16 lowercase hex characters (xxhash64 format)."""
     if not _HEX_PATTERN.match(cache_hash):
-        raise exceptions.RemoteError(f"Invalid cache hash '{cache_hash}': must be hexadecimal")
+        raise exceptions.RemoteError(
+            f"Invalid cache hash '{cache_hash}': expected 16 lowercase hex characters"
+        )
 
 
 def _is_not_found_error(e: ClientError) -> bool:
@@ -137,14 +135,21 @@ def _hash_to_key(prefix: str, hash_: str) -> str:
 
 
 def _key_to_hash(prefix: str, key: str) -> str | None:
-    """Extract hash from S3 key, or None if not a cache file key."""
+    """Extract valid hash from S3 key, or None if not a valid cache file key.
+
+    Returns None if the key doesn't match the expected structure or if the
+    reconstructed hash isn't a valid 16-char lowercase hex string.
+    """
     expected_prefix = f"{prefix}files/"
     if not key.startswith(expected_prefix):
         return None
     parts = key[len(expected_prefix) :].split("/")
     if len(parts) != 2 or not parts[0] or not parts[1]:
         return None
-    return parts[0] + parts[1]
+    hash_ = parts[0] + parts[1]
+    if not _HEX_PATTERN.match(hash_):
+        return None
+    return hash_
 
 
 async def _write_all_async(fd: int, data: bytes) -> None:
@@ -158,14 +163,14 @@ async def _write_all_async(fd: int, data: bytes) -> None:
 
 
 async def _stream_download_to_fd(
-    response: Any,  # S3 get_object response
+    response: GetObjectOutputTypeDef,
     fd: int,
 ) -> None:
     """Stream S3 response body to file descriptor in chunks with timeout."""
     async with response["Body"] as stream:
         while True:
             chunk: bytes = await asyncio.wait_for(
-                stream.content.read(STREAM_CHUNK_SIZE),
+                stream.read(STREAM_CHUNK_SIZE),
                 timeout=STREAM_READ_TIMEOUT,
             )
             if not chunk:
@@ -435,7 +440,7 @@ class S3Remote:
                     if key is None:
                         continue
                     hash_ = _key_to_hash(self._prefix, key)
-                    if hash_:
+                    if hash_ is not None:
                         yield hash_
 
     async def list_hashes(self) -> set[str]:

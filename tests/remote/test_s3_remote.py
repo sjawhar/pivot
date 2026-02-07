@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import pathlib
 from typing import TYPE_CHECKING, Any
 
@@ -10,37 +11,38 @@ from pivot import exceptions
 from pivot.remote import storage as remote_mod
 
 if TYPE_CHECKING:
+    import types
+    from collections.abc import AsyncIterator
     from unittest.mock import MagicMock
 
     from pytest_mock import MockerFixture
 
 
-class MockStreamContent:
+class MockBody:
+    """Mock S3 StreamingBody for testing.
+
+    Supports async context manager (``async with response["Body"] as stream``)
+    and ``stream.read(size)`` matching the aiobotocore StreamingBody stub API.
+    """
+
     _data: bytes
     _read_called: bool
 
-    def __init__(self, data: bytes) -> None:
+    def __init__(self, data: bytes = b"content") -> None:
         self._data = data
         self._read_called = False
-
-    async def read(self, size: int = -1) -> bytes:
-        if self._read_called:
-            return b""
-        self._read_called = True
-        return self._data
-
-
-class MockBody:
-    content: MockStreamContent
-
-    def __init__(self, data: bytes = b"content") -> None:
-        self.content = MockStreamContent(data)
 
     async def __aenter__(self) -> MockBody:
         return self
 
     async def __aexit__(self, *args: object) -> None:
         pass
+
+    async def read(self, size: int = -1) -> bytes:
+        if self._read_called:
+            return b""
+        self._read_called = True
+        return self._data
 
 
 def _make_mock_get_object_response(**_kwargs: object) -> dict[str, MockBody]:
@@ -193,30 +195,41 @@ def test_key_to_hash_empty_parts() -> None:
     assert remote_mod._key_to_hash("", "files/ab/") is None
 
 
+def test_key_to_hash_rejects_invalid_hex() -> None:
+    """Key producing non-hex or wrong-length hash returns None."""
+    assert remote_mod._key_to_hash("", "files/AB/CDEF1234567890") is None  # Uppercase
+    assert remote_mod._key_to_hash("", "files/ab/c") is None  # Too short
+    assert remote_mod._key_to_hash("", "files/ab/cdef12345678901234") is None  # Too long
+
+
 def test_validate_hash_short_raises() -> None:
-    """Short hash raises RemoteError."""
-    with pytest.raises(exceptions.RemoteError, match="must be at least"):
+    """Hash with wrong length raises RemoteError."""
+    with pytest.raises(exceptions.RemoteError, match="16 lowercase hex"):
         remote_mod._validate_hash("")
-    with pytest.raises(exceptions.RemoteError, match="must be at least"):
+    with pytest.raises(exceptions.RemoteError, match="16 lowercase hex"):
         remote_mod._validate_hash("ab")
+    with pytest.raises(exceptions.RemoteError, match="16 lowercase hex"):
+        remote_mod._validate_hash("abc")  # Was valid before, now too short
+    with pytest.raises(exceptions.RemoteError, match="16 lowercase hex"):
+        remote_mod._validate_hash("abcdef123456789")  # 15 chars
 
 
 def test_validate_hash_non_hex_raises() -> None:
-    """Non-hexadecimal hash raises RemoteError."""
-    with pytest.raises(exceptions.RemoteError, match="must be hexadecimal"):
-        remote_mod._validate_hash("ghijkl")  # g-z are not hex
-    with pytest.raises(exceptions.RemoteError, match="must be hexadecimal"):
-        remote_mod._validate_hash("abc/def")  # Contains path separator
-    with pytest.raises(exceptions.RemoteError, match="must be hexadecimal"):
-        remote_mod._validate_hash("abc def")  # Contains space
+    """Non-lowercase-hex hash raises RemoteError."""
+    with pytest.raises(exceptions.RemoteError, match="16 lowercase hex"):
+        remote_mod._validate_hash("ghijklmnopqrstuv")  # Non-hex chars
+    with pytest.raises(exceptions.RemoteError, match="16 lowercase hex"):
+        remote_mod._validate_hash("ABCDEF1234567890")  # Uppercase
+    with pytest.raises(exceptions.RemoteError, match="16 lowercase hex"):
+        remote_mod._validate_hash("abc/def123456789")  # Path separator
 
 
 def test_validate_hash_valid() -> None:
-    """Valid hash passes validation."""
-    remote_mod._validate_hash("abc")  # Minimum length
-    remote_mod._validate_hash("abcdef1234567890")  # Typical length
-    remote_mod._validate_hash("ABCDEF")  # Uppercase hex is valid
-    remote_mod._validate_hash("0123456789abcdef")  # All hex chars
+    """Valid 16-char lowercase hex hash passes validation."""
+    remote_mod._validate_hash("abcdef1234567890")
+    remote_mod._validate_hash("0123456789abcdef")
+    remote_mod._validate_hash("0000000000000000")
+    remote_mod._validate_hash("ffffffffffffffff")
 
 
 def test_is_not_found_error_true() -> None:
@@ -252,7 +265,6 @@ def mock_s3_session(mocker: MockerFixture) -> MagicMock:
     return mock_session
 
 
-@pytest.mark.asyncio
 async def test_exists_true(mock_s3_session: MagicMock, mocker: MockerFixture) -> None:
     """exists returns True when object exists."""
     mock_client = mocker.AsyncMock()
@@ -260,13 +272,12 @@ async def test_exists_true(mock_s3_session: MagicMock, mocker: MockerFixture) ->
     mock_s3_session.client.return_value.__aenter__.return_value = mock_client
 
     r = remote_mod.S3Remote("s3://bucket/prefix")
-    result = await r.exists("abc123def45678")
+    result = await r.exists("abc123def4567890")
 
     assert result is True
     mock_client.head_object.assert_called_once()
 
 
-@pytest.mark.asyncio
 async def test_exists_false_404(mock_s3_session: MagicMock, mocker: MockerFixture) -> None:
     """exists returns False on 404 error."""
     mock_client = mocker.AsyncMock()
@@ -277,12 +288,11 @@ async def test_exists_false_404(mock_s3_session: MagicMock, mocker: MockerFixtur
     mock_s3_session.client.return_value.__aenter__.return_value = mock_client
 
     r = remote_mod.S3Remote("s3://bucket/prefix")
-    result = await r.exists("abc123def45678")
+    result = await r.exists("abc123def4567890")
 
     assert result is False
 
 
-@pytest.mark.asyncio
 async def test_exists_raises_on_other_error(
     mock_s3_session: MagicMock, mocker: MockerFixture
 ) -> None:
@@ -297,10 +307,9 @@ async def test_exists_raises_on_other_error(
     r = remote_mod.S3Remote("s3://bucket/prefix")
 
     with pytest.raises(exceptions.RemoteConnectionError, match="S3 error"):
-        await r.exists("abc123def45678")
+        await r.exists("abc123def4567890")
 
 
-@pytest.mark.asyncio
 async def test_upload_file(
     mock_s3_session: MagicMock, tmp_path: pathlib.Path, mocker: MockerFixture
 ) -> None:
@@ -313,15 +322,14 @@ async def test_upload_file(
     test_file.write_text("test content")
 
     r = remote_mod.S3Remote("s3://bucket/prefix")
-    await r.upload_file(test_file, "abc123def45678")
+    await r.upload_file(test_file, "abc123def4567890")
 
     mock_client.put_object.assert_called_once()
     call_kwargs = mock_client.put_object.call_args[1]
     assert call_kwargs["Bucket"] == "bucket"
-    assert call_kwargs["Key"] == "prefix/files/ab/c123def45678"
+    assert call_kwargs["Key"] == "prefix/files/ab/c123def4567890"
 
 
-@pytest.mark.asyncio
 async def test_download_file(
     mock_s3_session: MagicMock, tmp_path: pathlib.Path, mocker: MockerFixture
 ) -> None:
@@ -335,12 +343,11 @@ async def test_download_file(
     dest_file = tmp_path / "dest.txt"
 
     r = remote_mod.S3Remote("s3://bucket/prefix")
-    await r.download_file("abc123def45678", dest_file)
+    await r.download_file("abc123def4567890", dest_file)
 
     assert dest_file.read_bytes() == b"downloaded content"
 
 
-@pytest.mark.asyncio
 async def test_download_file_readonly(
     mock_s3_session: MagicMock, tmp_path: pathlib.Path, mocker: MockerFixture
 ) -> None:
@@ -352,7 +359,7 @@ async def test_download_file_readonly(
     dest_file = tmp_path / "cached.txt"
 
     r = remote_mod.S3Remote("s3://bucket/prefix")
-    await r.download_file("abc123def45678", dest_file, readonly=True)
+    await r.download_file("abc123def4567890", dest_file, readonly=True)
 
     assert dest_file.read_bytes() == b"cached content"
     # Verify read-only permissions (0o444)
@@ -360,7 +367,6 @@ async def test_download_file_readonly(
     assert mode == 0o444, f"Expected 0o444, got {oct(mode)}"
 
 
-@pytest.mark.asyncio
 async def test_bulk_exists(mock_s3_session: MagicMock, mocker: MockerFixture) -> None:
     """bulk_exists checks multiple hashes in parallel."""
 
@@ -387,7 +393,6 @@ async def test_bulk_exists(mock_s3_session: MagicMock, mocker: MockerFixture) ->
     assert mock_client.head_object.call_count == 3
 
 
-@pytest.mark.asyncio
 async def test_bulk_exists_raises_on_non_404_error(
     mock_s3_session: MagicMock, mocker: MockerFixture
 ) -> None:
@@ -412,12 +417,10 @@ async def test_bulk_exists_raises_on_non_404_error(
         await r.bulk_exists(["a1b2c3d4e5f6789a", "b2c3d4e5f6789ab1", "c3d4e5f6789ab1c2"])
 
 
-@pytest.mark.asyncio
 async def test_bulk_exists_uses_list_for_large_batches(
     mock_s3_session: MagicMock, mocker: MockerFixture
 ) -> None:
     """bulk_exists uses LIST instead of HEAD for large batches (>= 50 hashes)."""
-    from collections.abc import AsyncIterator  # noqa: TC003
 
     # Generate 60 hashes to exceed the LIST threshold (50)
     hashes = [f"a{i:015x}" for i in range(60)]
@@ -429,7 +432,7 @@ async def test_bulk_exists_uses_list_for_large_batches(
             self,
             Bucket: str,  # noqa: N803
             Prefix: str,  # noqa: N803
-        ) -> AsyncIterator[dict[str, Any]]:
+        ) -> AsyncIterator[dict[str, list[dict[str, str]]]]:
             # Extract the prefix part (e.g., "a0" from "prefix/files/a0/")
             hash_prefix = Prefix.split("/")[-2] if Prefix.endswith("/") else ""
             # Return only existing hashes that match this prefix
@@ -461,10 +464,8 @@ async def test_bulk_exists_uses_list_for_large_batches(
     assert mock_client.get_paginator.call_count > 0
 
 
-@pytest.mark.asyncio
 async def test_list_hashes(mock_s3_session: MagicMock, mocker: MockerFixture) -> None:
     """list_hashes returns all cache hashes from S3."""
-    from collections.abc import AsyncIterator  # noqa: TC003
 
     class MockPaginator:
         async def paginate(
@@ -473,13 +474,13 @@ async def test_list_hashes(mock_s3_session: MagicMock, mocker: MockerFixture) ->
             pages = [
                 {
                     "Contents": [
-                        {"Key": "prefix/files/ab/c123def45678"},
-                        {"Key": "prefix/files/de/f456abc12345"},
+                        {"Key": "prefix/files/ab/c123def4567890"},
+                        {"Key": "prefix/files/de/f456abc1234567"},
                     ]
                 },
                 {
                     "Contents": [
-                        {"Key": "prefix/files/12/3456789abcde"},
+                        {"Key": "prefix/files/12/3456789abcdef0"},
                     ]
                 },
             ]
@@ -493,21 +494,19 @@ async def test_list_hashes(mock_s3_session: MagicMock, mocker: MockerFixture) ->
     r = remote_mod.S3Remote("s3://bucket/prefix")
     result = await r.list_hashes()
 
-    assert result == {"abc123def45678", "def456abc12345", "123456789abcde"}
+    assert result == {"abc123def4567890", "def456abc1234567", "123456789abcdef0"}
 
 
-@pytest.mark.asyncio
 async def test_iter_hashes(mock_s3_session: MagicMock, mocker: MockerFixture) -> None:
     """iter_hashes yields hashes without collecting into memory."""
-    from collections.abc import AsyncIterator  # noqa: TC003
 
     class MockPaginator:
         async def paginate(
             self, **kwargs: object
         ) -> AsyncIterator[dict[str, list[dict[str, str]]]]:
             pages = [
-                {"Contents": [{"Key": "prefix/files/ab/c123def45678"}]},
-                {"Contents": [{"Key": "prefix/files/de/f456abc12345"}]},
+                {"Contents": [{"Key": "prefix/files/ab/c123def4567890"}]},
+                {"Contents": [{"Key": "prefix/files/de/f456abc1234567"}]},
             ]
             for page in pages:
                 yield page
@@ -521,10 +520,40 @@ async def test_iter_hashes(mock_s3_session: MagicMock, mocker: MockerFixture) ->
     async for h in r.iter_hashes():
         hashes.append(h)
 
-    assert hashes == ["abc123def45678", "def456abc12345"]
+    assert hashes == ["abc123def4567890", "def456abc1234567"]
 
 
-@pytest.mark.asyncio
+async def test_iter_hashes_skips_invalid_keys(
+    mock_s3_session: MagicMock, mocker: MockerFixture
+) -> None:
+    """iter_hashes skips keys that don't produce valid 16-char lowercase hex hashes."""
+
+    class MockPaginator:
+        async def paginate(
+            self, **kwargs: object
+        ) -> AsyncIterator[dict[str, list[dict[str, str]]]]:
+            yield {
+                "Contents": [
+                    {"Key": "prefix/files/ab/cdef1234567890"},  # Valid: 16 lowercase hex
+                    {"Key": "prefix/files/AB/CDEF1234567890"},  # Invalid: uppercase
+                    {"Key": "prefix/files/ab/c"},  # Invalid: too short
+                    {"Key": "prefix/files/ab/cdef12345678901234"},  # Invalid: too long
+                    {"Key": "prefix/stages/my_stage.lock"},  # Invalid: not a cache file
+                ]
+            }
+
+    mock_client = mocker.AsyncMock()
+    mock_client.get_paginator = mocker.MagicMock(return_value=MockPaginator())
+    mock_s3_session.client.return_value.__aenter__.return_value = mock_client
+
+    r = remote_mod.S3Remote("s3://bucket/prefix")
+    hashes = []
+    async for h in r.iter_hashes():
+        hashes.append(h)
+
+    assert hashes == ["abcdef1234567890"]
+
+
 async def test_upload_batch(
     mock_s3_session: MagicMock, tmp_path: pathlib.Path, mocker: MockerFixture
 ) -> None:
@@ -546,7 +575,6 @@ async def test_upload_batch(
     assert all(r["success"] for r in results)
 
 
-@pytest.mark.asyncio
 async def test_upload_batch_with_callback(
     mock_s3_session: MagicMock, tmp_path: pathlib.Path, mocker: MockerFixture
 ) -> None:
@@ -573,7 +601,6 @@ async def test_upload_batch_with_callback(
     assert set(callback_values) == {1, 2, 3}
 
 
-@pytest.mark.asyncio
 async def test_upload_batch_empty() -> None:
     """upload_batch with empty list returns empty results."""
     r = remote_mod.S3Remote("s3://bucket/prefix")
@@ -582,7 +609,6 @@ async def test_upload_batch_empty() -> None:
     assert results == []
 
 
-@pytest.mark.asyncio
 async def test_download_batch(
     mock_s3_session: MagicMock, tmp_path: pathlib.Path, mocker: MockerFixture
 ) -> None:
@@ -602,7 +628,6 @@ async def test_download_batch(
         assert path.exists()
 
 
-@pytest.mark.asyncio
 async def test_download_batch_empty() -> None:
     """download_batch with empty list returns empty results."""
     r = remote_mod.S3Remote("s3://bucket/prefix")
@@ -616,7 +641,6 @@ async def test_download_batch_empty() -> None:
 # -----------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
 async def test_upload_file_large_uses_multipart(
     mock_s3_session: MagicMock, tmp_path: pathlib.Path, mocker: MockerFixture
 ) -> None:
@@ -637,14 +661,13 @@ async def test_upload_file_large_uses_multipart(
     test_file.write_bytes(b"x" * 250)  # 250 bytes = 3 parts (100 + 100 + 50)
 
     r = remote_mod.S3Remote("s3://bucket/prefix")
-    await r.upload_file(test_file, "abc123def45678")
+    await r.upload_file(test_file, "abc123def4567890")
 
     mock_client.create_multipart_upload.assert_called_once()
     assert mock_client.upload_part.call_count == 3  # 250 bytes = 3 parts at 100 byte chunks
     mock_client.complete_multipart_upload.assert_called_once()
 
 
-@pytest.mark.asyncio
 async def test_upload_file_small_uses_put_object(
     mock_s3_session: MagicMock, tmp_path: pathlib.Path, mocker: MockerFixture
 ) -> None:
@@ -657,12 +680,11 @@ async def test_upload_file_small_uses_put_object(
     test_file.write_text("small content")
 
     r = remote_mod.S3Remote("s3://bucket/prefix")
-    await r.upload_file(test_file, "abc123def45678")
+    await r.upload_file(test_file, "abc123def4567890")
 
     mock_client.put_object.assert_called_once()
 
 
-@pytest.mark.asyncio
 async def test_upload_file_multipart_aborts_on_error(
     mock_s3_session: MagicMock, tmp_path: pathlib.Path, mocker: MockerFixture
 ) -> None:
@@ -683,7 +705,7 @@ async def test_upload_file_multipart_aborts_on_error(
 
     r = remote_mod.S3Remote("s3://bucket/prefix")
     with pytest.raises(Exception, match="Upload failed"):
-        await r.upload_file(test_file, "abc123def45678")
+        await r.upload_file(test_file, "abc123def4567890")
 
     mock_client.abort_multipart_upload.assert_called_once()
 
@@ -693,12 +715,10 @@ async def test_upload_file_multipart_aborts_on_error(
 # -----------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
 async def test_download_file_cleans_up_on_error(
     mock_s3_session: MagicMock, tmp_path: pathlib.Path, mocker: MockerFixture
 ) -> None:
     """download_file cleans up temp file on error."""
-    import os
 
     mock_client = mocker.AsyncMock()
     mock_client.get_object = mocker.AsyncMock(side_effect=Exception("Download failed"))
@@ -708,14 +728,13 @@ async def test_download_file_cleans_up_on_error(
 
     r = remote_mod.S3Remote("s3://bucket/prefix")
     with pytest.raises(Exception, match="Download failed"):
-        await r.download_file("abc123def45678", dest_file)
+        await r.download_file("abc123def4567890", dest_file)
 
     # Verify no temp files left behind
     temp_files = [f for f in os.listdir(tmp_path) if f.startswith(".pivot_download_")]
     assert len(temp_files) == 0, f"Temp files not cleaned up: {temp_files}"
 
 
-@pytest.mark.asyncio
 async def test_download_batch_with_callback(
     mock_s3_session: MagicMock, tmp_path: pathlib.Path, mocker: MockerFixture
 ) -> None:
@@ -738,7 +757,6 @@ async def test_download_batch_with_callback(
     assert set(callback_values) == {1, 2, 3}
 
 
-@pytest.mark.asyncio
 async def test_download_file_default_permissions(
     mock_s3_session: MagicMock, tmp_path: pathlib.Path, mocker: MockerFixture
 ) -> None:
@@ -750,7 +768,7 @@ async def test_download_file_default_permissions(
     dest_file = tmp_path / "writable.txt"
 
     r = remote_mod.S3Remote("s3://bucket/prefix")
-    await r.download_file("abc123def45678", dest_file, readonly=False)
+    await r.download_file("abc123def4567890", dest_file, readonly=False)
 
     assert dest_file.read_bytes() == b"writable content"
     # Verify file is writable (not 0o444)
@@ -760,7 +778,6 @@ async def test_download_file_default_permissions(
     assert mode & 0o200, f"Expected owner write permission, got {oct(mode)}"
 
 
-@pytest.mark.asyncio
 async def test_download_batch_readonly(
     mock_s3_session: MagicMock, tmp_path: pathlib.Path, mocker: MockerFixture
 ) -> None:
@@ -789,7 +806,6 @@ async def test_download_batch_readonly(
 # -----------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
 async def test_bulk_exists_calls_metrics_end_on_error(
     mock_s3_session: MagicMock, mocker: MockerFixture
 ) -> None:
@@ -813,7 +829,6 @@ async def test_bulk_exists_calls_metrics_end_on_error(
     spy_end.assert_any_call("storage.bulk_exists", mocker.ANY)
 
 
-@pytest.mark.asyncio
 async def test_upload_batch_calls_metrics_end_on_error(
     mock_s3_session: MagicMock, tmp_path: pathlib.Path, mocker: MockerFixture
 ) -> None:
@@ -836,7 +851,6 @@ async def test_upload_batch_calls_metrics_end_on_error(
     spy_end.assert_any_call("storage.upload_batch", mocker.ANY)
 
 
-@pytest.mark.asyncio
 async def test_download_batch_calls_metrics_end_on_error(
     mock_s3_session: MagicMock, tmp_path: pathlib.Path, mocker: MockerFixture
 ) -> None:
@@ -860,7 +874,6 @@ async def test_download_batch_calls_metrics_end_on_error(
 # -----------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
 async def test_s3_remote_reuses_session_across_methods(
     mock_s3_session: MagicMock, tmp_path: pathlib.Path, mocker: MockerFixture
 ) -> None:
@@ -871,11 +884,11 @@ async def test_s3_remote_reuses_session_across_methods(
     mock_s3_session.client.return_value.__aenter__.return_value = mock_client
 
     r = remote_mod.S3Remote("s3://bucket/prefix")
-    await r.exists("abc123def45678")
+    await r.exists("abc123def4567890")
 
     test_file = tmp_path / "test.txt"
     test_file.write_text("content")
-    await r.upload_file(test_file, "abc123def45678")
+    await r.upload_file(test_file, "abc123def4567890")
 
     # Session created once in __init__; both methods share it via self._session.client()
     # The mock_s3_session fixture patches aioboto3.Session — verify it was called once
@@ -896,7 +909,7 @@ def test_s3_remote_init_raises_on_missing_aioboto3(mocker: MockerFixture) -> Non
 
     original_import = builtins.__import__
 
-    def mock_import(name: str, *args: Any, **kwargs: Any) -> Any:
+    def mock_import(name: str, *args: Any, **kwargs: Any) -> types.ModuleType:  # noqa: ANN401 - wraps builtins.__import__ which requires Any for forwarded args
         if name == "aioboto3":
             raise ModuleNotFoundError("No module named 'aioboto3'")
         return original_import(name, *args, **kwargs)

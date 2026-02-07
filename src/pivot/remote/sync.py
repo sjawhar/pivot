@@ -71,7 +71,7 @@ def get_stage_output_hashes(state_dir: pathlib.Path, stage_names: list[str]) -> 
 
         for out_path, output_hash in lock_data["output_hashes"].items():
             if out_path not in non_cached_paths:
-                hashes |= _extract_hashes_from_hash_info(output_hash)
+                hashes |= _extract_file_hashes_from_hash_info(output_hash)
 
     return hashes
 
@@ -87,19 +87,21 @@ def get_stage_dep_hashes(state_dir: pathlib.Path, stage_names: list[str]) -> set
             continue
 
         for dep_hash in lock_data["dep_hashes"].values():
-            hashes |= _extract_hashes_from_hash_info(dep_hash)
+            hashes |= _extract_file_hashes_from_hash_info(dep_hash)
 
     return hashes
 
 
-def _extract_hashes_from_hash_info(output_hash: HashInfo) -> set[str]:
-    """Extract all hashes from a HashInfo (file or directory)."""
-    hashes = set[str]()
-    hashes.add(output_hash["hash"])
+def _extract_file_hashes_from_hash_info(output_hash: HashInfo) -> set[str]:
+    """Extract file-only hashes from a HashInfo, excluding directory tree hashes.
+
+    For FileHash: returns {hash}.
+    For DirHash: returns only manifest entry hashes, NOT the top-level tree hash.
+    The tree hash identifies directory structure, not a cached file.
+    """
     if is_dir_hash(output_hash):
-        for entry in output_hash["manifest"]:
-            hashes.add(entry["hash"])
-    return hashes
+        return {entry["hash"] for entry in output_hash["manifest"]}
+    return {output_hash["hash"]}
 
 
 def _get_file_hash_from_stages(rel_path: str, state_dir: pathlib.Path) -> HashInfo | None:
@@ -171,18 +173,26 @@ def get_target_hashes(
     for target in targets:
         # Try as stage name first (no path separators)
         if "/" not in target and "\\" not in target:
-            stage_lock = lock.StageLock(target, lock.get_stages_dir(state_dir))
-            lock_data = stage_lock.read()
-            if lock_data is not None:
-                stage_info = cli_helpers.get_stage(target)
-                non_cached_paths = {str(out.path) for out in stage_info["outs"] if not out.cache}
-                for out_path, out_hash in lock_data["output_hashes"].items():
-                    if out_path not in non_cached_paths:
-                        hashes |= _extract_hashes_from_hash_info(out_hash)
-                if include_deps:
-                    for dep_hash in lock_data["dep_hashes"].values():
-                        hashes |= _extract_hashes_from_hash_info(dep_hash)
-                continue
+            try:
+                stage_lock = lock.StageLock(target, lock.get_stages_dir(state_dir))
+            except ValueError:
+                # Target contains characters invalid for stage names (spaces, etc.)
+                # Fall through to file path resolution below
+                pass
+            else:
+                lock_data = stage_lock.read()
+                if lock_data is not None:
+                    stage_info = cli_helpers.get_stage(target)
+                    non_cached_paths = {
+                        str(out.path) for out in stage_info["outs"] if not out.cache
+                    }
+                    for out_path, out_hash in lock_data["output_hashes"].items():
+                        if out_path not in non_cached_paths:
+                            hashes |= _extract_file_hashes_from_hash_info(out_hash)
+                    if include_deps:
+                        for dep_hash in lock_data["dep_hashes"].values():
+                            hashes |= _extract_file_hashes_from_hash_info(dep_hash)
+                    continue
 
         # Try as file path
         rel_path = project.to_relative_path(project.normalize_path(target), proj_root)
@@ -190,13 +200,13 @@ def get_target_hashes(
         # Check stage outputs
         out_hash = _get_file_hash_from_stages(rel_path, state_dir)
         if out_hash is not None:
-            hashes |= _extract_hashes_from_hash_info(out_hash)
+            hashes |= _extract_file_hashes_from_hash_info(out_hash)
             continue
 
         # Check .pvt tracked files
         pvt_hash = _get_file_hash_from_pvt(rel_path, proj_root)
         if pvt_hash is not None:
-            hashes |= _extract_hashes_from_hash_info(pvt_hash)
+            hashes |= _extract_file_hashes_from_hash_info(pvt_hash)
             continue
 
         unresolved.append(target)
@@ -269,10 +279,15 @@ async def _push_async(
 
     files_dir = cache_dir / "files"
     items = list[tuple[pathlib.Path, str]]()
+    skipped_non_file = 0
     for hash_ in status["local_only"]:
         cache_path = cache.get_cache_path(files_dir, hash_)
-        if cache_path.exists():
+        if cache_path.is_file():
             items.append((cache_path, hash_))
+        else:
+            skipped_non_file += 1
+    if skipped_non_file:
+        logger.debug("Skipped %d non-file cache entries during push", skipped_non_file)
 
     results = await remote.upload_batch(items, concurrency=jobs, callback=callback)
 
