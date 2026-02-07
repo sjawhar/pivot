@@ -103,6 +103,8 @@ class Engine:
     # Stored orchestration params (for watch mode re-runs)
     _stored_no_commit: bool
     _stored_on_error: OnError
+    _stored_parallel: bool
+    _stored_max_workers: int | None
 
     # Track whether run() has completed to prevent re-use
     _run_completed: bool
@@ -146,6 +148,8 @@ class Engine:
         # Stored orchestration params (for watch mode re-runs)
         self._stored_no_commit = False
         self._stored_on_error = OnError.FAIL
+        self._stored_parallel = True
+        self._stored_max_workers = None
 
         # Track whether run() has completed to prevent re-use
         self._run_completed = False
@@ -341,6 +345,8 @@ class Engine:
         # Store orchestration params for watch mode re-runs
         self._stored_no_commit = event["no_commit"]
         self._stored_on_error = event["on_error"]
+        self._stored_parallel = event["parallel"]
+        self._stored_max_workers = event["max_workers"]
 
         # Clear cancel event before starting new execution
         self._cancel_event = anyio.Event()  # Reset by creating new event
@@ -1185,6 +1191,24 @@ class Engine:
         stages = self._list_stages()
 
         if stages:
+            # Restart worker pool so workers pick up reloaded code.
+            # Run in thread to avoid blocking the event loop during process kill/spawn.
+            # Catch errors so a failed restart doesn't kill the watch session;
+            # create_executor() in _orchestrate_execution will retry pool creation.
+            if self._stored_parallel:
+                n_stages = len(stages)
+                stored_max = self._stored_max_workers
+                try:
+                    await anyio.to_thread.run_sync(
+                        lambda: executor_core.restart_workers(n_stages, stored_max)
+                    )
+                    _logger.info("Worker pool restarted for code reload (%d stages)", n_stages)
+                except Exception:
+                    _logger.warning(
+                        "Failed to restart worker pool - continuing with existing workers",
+                        exc_info=True,
+                    )
+
             await self._execute_affected_stages(stages)
 
     async def _execute_affected_stages(self, stages: list[str]) -> None:
@@ -1199,8 +1223,8 @@ class Engine:
                 stages=stages,
                 force=False,
                 single_stage=False,
-                parallel=True,
-                max_workers=None,
+                parallel=self._stored_parallel,
+                max_workers=self._stored_max_workers,
                 no_commit=self._stored_no_commit,
                 on_error=self._stored_on_error,
                 cache_dir=None,

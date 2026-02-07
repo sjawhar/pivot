@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import pathlib
+from unittest.mock import MagicMock
 
+import anyio
 import networkx as nx
 import pytest
 
@@ -12,12 +14,15 @@ from pivot.engine.engine import Engine
 from pivot.engine.sinks import ResultCollectorSink
 from pivot.engine.sources import OneShotSource
 from pivot.engine.types import (
+    CodeOrConfigChanged,
     DataArtifactChanged,
     EngineState,
     NodeType,
     OutputEvent,
+    RunRequested,
     StageExecutionState,
 )
+from pivot.types import OnError
 
 
 class _MockAsyncSink:
@@ -446,14 +451,14 @@ async def test_engine_process_deferred_events_with_multiple_events() -> None:
 
 @pytest.mark.anyio
 async def test_engine_stores_orchestration_params_on_run_requested() -> None:
-    """Engine stores no_commit/on_error from RunRequested for watch re-runs."""
-    from pivot.engine.types import RunRequested
-    from pivot.types import OnError
+    """Engine stores all orchestration params from RunRequested for watch re-runs."""
 
     async with Engine() as engine:
         # Initial state - defaults
         assert engine._stored_no_commit is False
         assert engine._stored_on_error == OnError.FAIL
+        assert engine._stored_parallel is True
+        assert engine._stored_max_workers is None
 
         # Create event with non-default params
         event = RunRequested(
@@ -462,8 +467,8 @@ async def test_engine_stores_orchestration_params_on_run_requested() -> None:
             force=False,
             reason="test",
             single_stage=False,
-            parallel=True,
-            max_workers=None,
+            parallel=False,
+            max_workers=4,
             no_commit=True,
             on_error=OnError.KEEP_GOING,
             cache_dir=None,
@@ -485,17 +490,20 @@ async def test_engine_stores_orchestration_params_on_run_requested() -> None:
         # Params should be stored
         assert engine._stored_no_commit is True
         assert engine._stored_on_error == OnError.KEEP_GOING
+        assert engine._stored_parallel is False
+        assert engine._stored_max_workers == 4
 
 
 @pytest.mark.anyio
 async def test_engine_execute_affected_stages_uses_stored_params() -> None:
     """_execute_affected_stages() uses stored orchestration params instead of hardcoded defaults."""
-    from pivot.types import OnError
 
     async with Engine() as engine:
         # Set stored params (simulating what _handle_run_requested would do)
         engine._stored_no_commit = True
         engine._stored_on_error = OnError.KEEP_GOING
+        engine._stored_parallel = True
+        engine._stored_max_workers = 4
 
         # Mock _orchestrate_execution to capture what params it receives
         captured_kwargs: dict[str, object] = {}
@@ -512,6 +520,32 @@ async def test_engine_execute_affected_stages_uses_stored_params() -> None:
         # Verify stored params were used
         assert captured_kwargs["no_commit"] is True, "no_commit should use stored value"
         assert captured_kwargs["on_error"] == OnError.KEEP_GOING, "on_error should use stored value"
+        assert captured_kwargs["parallel"] is True, "parallel should use stored value"
+        assert captured_kwargs["max_workers"] == 4, "max_workers should use stored value"
+
+
+@pytest.mark.anyio
+async def test_engine_execute_affected_stages_propagates_non_parallel_mode() -> None:
+    """_execute_affected_stages() correctly propagates parallel=False to orchestration."""
+
+    async with Engine() as engine:
+        engine._stored_parallel = False
+        engine._stored_max_workers = None
+        engine._stored_no_commit = False
+        engine._stored_on_error = OnError.FAIL
+
+        captured_kwargs: dict[str, object] = {}
+
+        async def mock_orchestrate(**kwargs: object) -> dict[str, object]:
+            captured_kwargs.update(kwargs)
+            return {}
+
+        engine._orchestrate_execution = mock_orchestrate  # pyright: ignore[reportAttributeAccessIssue] - test mock
+
+        await engine._execute_affected_stages(["stage_a"])
+
+        assert captured_kwargs["parallel"] is False, "parallel=False should be propagated"
+        assert captured_kwargs["max_workers"] is None, "max_workers=None should be propagated"
 
 
 # =============================================================================
@@ -522,10 +556,6 @@ async def test_engine_execute_affected_stages_uses_stored_params() -> None:
 @pytest.mark.anyio
 async def test_engine_cancel_during_active_execution() -> None:
     """CancelRequested stops pending stages from starting during active execution."""
-    import anyio
-
-    from pivot.engine.types import RunRequested
-    from pivot.types import OnError
 
     sink = _MockAsyncSink()
 
@@ -583,10 +613,6 @@ async def test_engine_cancel_during_active_execution() -> None:
 @pytest.mark.anyio
 async def test_engine_concurrent_run_requests_serialized() -> None:
     """Multiple concurrent RunRequested events are serialized (not run in parallel)."""
-    import anyio
-
-    from pivot.engine.types import RunRequested
-    from pivot.types import OnError
 
     execution_order = list[str]()
 
@@ -684,3 +710,196 @@ async def test_engine_aexit_closes_sinks_when_source_raises() -> None:
             await engine.run(exit_on_completion=True)
 
     assert sink.closed, "Sink should be closed even when source raises"
+
+
+# =============================================================================
+# Worker Restart on Code/Config Change Tests
+# =============================================================================
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("parallel", "max_workers", "expected_restart_calls"),
+    [
+        pytest.param(True, 4, [(3, 4)], id="parallel-restarts-workers"),
+        pytest.param(False, None, [], id="non-parallel-skips-restart"),
+    ],
+)
+async def test_engine_handle_code_or_config_changed_restart_behavior(
+    monkeypatch: pytest.MonkeyPatch,
+    parallel: bool,
+    max_workers: int | None,
+    expected_restart_calls: list[tuple[int, int | None]],
+) -> None:
+    """_handle_code_or_config_changed restarts workers only in parallel mode."""
+
+    restart_calls = list[tuple[int, int | None]]()
+
+    def mock_restart_workers(stage_count: int, max_workers: int | None = None) -> int:
+        restart_calls.append((stage_count, max_workers))
+        return stage_count
+
+    monkeypatch.setattr("pivot.executor.core.restart_workers", mock_restart_workers)
+
+    async with Engine() as engine:
+        engine._stored_parallel = parallel
+        engine._stored_max_workers = max_workers
+
+        mock_pipeline = MagicMock()
+        mock_pipeline.list_stages.return_value = ["a", "b", "c"]
+        mock_pipeline.snapshot.return_value = {}
+        mock_pipeline._registry = None
+        mock_pipeline.get.return_value = MagicMock()
+        mock_pipeline.resolve_external_dependencies.return_value = None
+        mock_pipeline.invalidate_dag_cache.return_value = None
+        engine._pipeline = mock_pipeline
+
+        engine._reload_registry = lambda: ({}, None)  # type: ignore[assignment] - test mock
+
+        async def mock_emit_reload(*_args: object) -> None:
+            pass
+
+        engine._emit_reload_event = mock_emit_reload  # pyright: ignore[reportAttributeAccessIssue]
+
+        async def mock_execute_affected(stages: list[str]) -> None:
+            pass
+
+        engine._execute_affected_stages = mock_execute_affected  # type: ignore[assignment] - test mock
+
+        def mock_build_graph(*_a: object) -> MagicMock:
+            return MagicMock()
+
+        def mock_get_watch_paths(*_a: object) -> set[str]:
+            return set[str]()
+
+        monkeypatch.setattr("pivot.engine.engine.engine_graph.build_graph", mock_build_graph)
+        monkeypatch.setattr(
+            "pivot.engine.engine.engine_graph.get_watch_paths", mock_get_watch_paths
+        )
+
+        event = CodeOrConfigChanged(type="code_or_config_changed", paths=["pipeline.py"])
+        await engine._handle_code_or_config_changed(event)
+
+        assert restart_calls == expected_restart_calls
+
+
+@pytest.mark.anyio
+async def test_engine_handle_code_or_config_changed_no_restart_on_failed_reload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_handle_code_or_config_changed does NOT restart workers when reload fails."""
+
+    restart_calls = list[object]()
+
+    def mock_restart_workers(*args: object, **kwargs: object) -> int:
+        restart_calls.append(args)
+        return 1
+
+    monkeypatch.setattr("pivot.executor.core.restart_workers", mock_restart_workers)
+
+    async with Engine() as engine:
+        engine._stored_parallel = True
+
+        # Mock reload to FAIL
+        engine._reload_registry = lambda: None  # type: ignore[assignment] - test mock
+        engine._invalidate_caches = lambda: None  # type: ignore[assignment] - test mock
+
+        event = CodeOrConfigChanged(type="code_or_config_changed", paths=["pipeline.py"])
+        await engine._handle_code_or_config_changed(event)
+
+        assert len(restart_calls) == 0, "Should not restart workers on failed reload"
+
+
+@pytest.mark.anyio
+async def test_engine_handle_code_or_config_changed_continues_on_restart_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_handle_code_or_config_changed continues if restart_workers raises."""
+
+    def mock_restart_workers(stage_count: int, max_workers: int | None = None) -> int:
+        raise RuntimeError("loky pool broken")
+
+    monkeypatch.setattr("pivot.executor.core.restart_workers", mock_restart_workers)
+
+    executed = list[list[str]]()
+
+    async with Engine() as engine:
+        engine._stored_parallel = True
+        engine._stored_max_workers = 2
+
+        mock_pipeline = MagicMock()
+        mock_pipeline.list_stages.return_value = ["a", "b"]
+        mock_pipeline.snapshot.return_value = {}
+        mock_pipeline._registry = None
+        mock_pipeline.resolve_external_dependencies.return_value = None
+        mock_pipeline.invalidate_dag_cache.return_value = None
+        engine._pipeline = mock_pipeline
+
+        engine._reload_registry = lambda: ({}, None)  # type: ignore[assignment] - test mock
+
+        async def mock_emit_reload(*_args: object) -> None:
+            pass
+
+        engine._emit_reload_event = mock_emit_reload  # pyright: ignore[reportAttributeAccessIssue]
+
+        async def mock_execute_affected(stages: list[str]) -> None:
+            executed.append(stages)
+
+        engine._execute_affected_stages = mock_execute_affected  # type: ignore[assignment] - test mock
+
+        def mock_build_graph(*_a: object) -> MagicMock:
+            return MagicMock()
+
+        def mock_get_watch_paths(*_a: object) -> set[str]:
+            return set[str]()
+
+        monkeypatch.setattr("pivot.engine.engine.engine_graph.build_graph", mock_build_graph)
+        monkeypatch.setattr(
+            "pivot.engine.engine.engine_graph.get_watch_paths", mock_get_watch_paths
+        )
+
+        event = CodeOrConfigChanged(type="code_or_config_changed", paths=["pipeline.py"])
+        await engine._handle_code_or_config_changed(event)
+
+        assert len(executed) == 1, "Execution should proceed despite restart failure"
+        assert executed[0] == ["a", "b"]
+
+
+@pytest.mark.anyio
+async def test_engine_handle_data_artifact_changed_does_not_restart_workers(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_handle_data_artifact_changed does NOT restart worker pool (data-only change)."""
+    restart_calls = list[object]()
+
+    def mock_restart_workers(*args: object, **kwargs: object) -> int:
+        restart_calls.append(args)
+        return 1
+
+    monkeypatch.setattr("pivot.executor.core.restart_workers", mock_restart_workers)
+
+    async with Engine() as engine:
+        # Build minimal graph: input.csv -> stage_a
+        input_path = tmp_path / "input.csv"
+
+        g: nx.DiGraph[str] = nx.DiGraph()
+        input_node = engine_graph.artifact_node(input_path)
+        stage_node_name = engine_graph.stage_node("stage_a")
+        g.add_node(input_node, type=NodeType.ARTIFACT)
+        g.add_node(stage_node_name, type=NodeType.STAGE)
+        g.add_edge(input_node, stage_node_name)
+        engine._graph = g
+
+        # Mock _execute_affected_stages to avoid actual execution
+        executed_stages = list[list[str]]()
+
+        async def mock_execute(stages: list[str]) -> None:
+            executed_stages.append(stages)
+
+        engine._execute_affected_stages = mock_execute  # type: ignore[assignment] - test mock
+
+        event = DataArtifactChanged(type="data_artifact_changed", paths=[str(input_path)])
+        await engine._handle_data_artifact_changed(event)
+
+        assert len(restart_calls) == 0, "Data changes should NOT restart workers"
