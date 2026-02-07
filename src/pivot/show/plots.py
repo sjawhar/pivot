@@ -85,7 +85,7 @@ def get_plot_hashes_from_lock(
                 rel_path = project.to_relative_path(abs_path, proj_root)
                 if lock_data and abs_path in lock_data["output_hashes"]:
                     hash_info = lock_data["output_hashes"][abs_path]
-                    result[rel_path] = hash_info["hash"] if hash_info else None
+                    result[rel_path] = hash_info["hash"]
                 else:
                     result[rel_path] = None
     return result

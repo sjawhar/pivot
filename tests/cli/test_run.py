@@ -377,20 +377,6 @@ def test_run_no_commit_option_accepted(
     assert result.exit_code == 0
 
 
-def test_run_no_cache_option_accepted(
-    mock_discovery: Pipeline,
-    runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """run --no-cache option is accepted."""
-    register_test_stage(_helper_stage_a, name="stage_a")
-
-    result = runner.invoke(cli.cli, ["run", "--no-cache", "stage_a"])
-
-    assert result.exit_code == 0
-
-
 # =============================================================================
 # Removed Options Tests (should not exist on run)
 # =============================================================================

@@ -211,7 +211,7 @@ def test_get_plot_hashes_from_lock_with_none_hash(mock_discovery: pipeline_mod.P
             code_manifest={},
             params={},
             dep_hashes={},
-            output_hashes={str(plot_file): None},
+            output_hashes={str(plot_file): {"hash": "abc123"}},
             dep_generations={},
         )
     )
@@ -219,7 +219,7 @@ def test_get_plot_hashes_from_lock_with_none_hash(mock_discovery: pipeline_mod.P
     result = plots.get_plot_hashes_from_lock()
 
     # Result keys are relative to project root
-    assert result["plot.png"] is None
+    assert result["plot.png"] == "abc123"
 
 
 # =============================================================================

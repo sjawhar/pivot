@@ -119,6 +119,7 @@ class ExecutionSummary(TypedDict):
 
     status: Literal[StageStatus.RAN, StageStatus.SKIPPED, StageStatus.FAILED, StageStatus.UNKNOWN]
     reason: str
+    input_hash: str | None
 
 
 def count_results(results: dict[str, ExecutionSummary]) -> tuple[int, int, int, int]:
@@ -158,7 +159,6 @@ def run(
     allow_uncached_incremental: bool = False,
     force: bool = False,
     no_commit: bool = False,
-    no_cache: bool = False,
     checkout_missing: bool = False,
     pipeline: Pipeline | None = None,
 ) -> dict[str, ExecutionSummary]:
@@ -177,36 +177,25 @@ def run(
         on_error: Error handling mode - "fail" or "keep_going".
         allow_uncached_incremental: If True, skip safety check for uncached IncrementalOut files.
         force: If True, bypass cache and force all stages to re-execute.
-        no_commit: If True, defer lock files to pending dir (faster iteration).
-        no_cache: If True, skip caching outputs entirely (maximum iteration speed).
+        no_commit: If True, skip writing lock files (faster iteration).
         checkout_missing: If True, restore missing tracked files from cache before running.
 
     Returns:
         Dict of stage_name -> {status: "ran"|"skipped"|"failed", reason: str}
     """
-    # Import project_lock early to acquire lock BEFORE importing Engine.
-    # Engine import is slow (~500ms) and we need to hold the lock during that time
-    # to prevent race conditions with concurrent commit operations.
-    from pivot.storage import project_lock
-
-    # Acquire lock FIRST if in no_commit mode - before any slow imports
-    lock_context = project_lock.pending_state_lock() if no_commit else contextlib.nullcontext()
-
-    with lock_context:
-        return _run_inner(
-            stages=stages,
-            single_stage=single_stage,
-            cache_dir=cache_dir,
-            parallel=parallel,
-            max_workers=max_workers,
-            on_error=on_error,
-            allow_uncached_incremental=allow_uncached_incremental,
-            force=force,
-            no_commit=no_commit,
-            no_cache=no_cache,
-            checkout_missing=checkout_missing,
-            pipeline=pipeline,
-        )
+    return _run_inner(
+        stages=stages,
+        single_stage=single_stage,
+        cache_dir=cache_dir,
+        parallel=parallel,
+        max_workers=max_workers,
+        on_error=on_error,
+        allow_uncached_incremental=allow_uncached_incremental,
+        force=force,
+        no_commit=no_commit,
+        checkout_missing=checkout_missing,
+        pipeline=pipeline,
+    )
 
 
 def _run_inner(
@@ -219,7 +208,6 @@ def _run_inner(
     allow_uncached_incremental: bool,
     force: bool,
     no_commit: bool,
-    no_cache: bool,
     checkout_missing: bool,
     pipeline: Pipeline | None,
 ) -> dict[str, ExecutionSummary]:
@@ -263,7 +251,6 @@ def _run_inner(
                 parallel=parallel,
                 max_workers=max_workers,
                 no_commit=no_commit,
-                no_cache=no_cache,
                 on_error=on_error,
                 cache_dir=cache_dir,
                 allow_uncached_incremental=allow_uncached_incremental,
@@ -277,7 +264,11 @@ def _run_inner(
             # Convert results from StageCompleted to ExecutionSummary
             raw_results = await result_sink.get_results()
             return {
-                name: ExecutionSummary(status=event["status"], reason=event["reason"])
+                name: ExecutionSummary(
+                    status=event["status"],
+                    reason=event["reason"],
+                    input_hash=event["input_hash"],
+                )
                 for name, event in raw_results.items()
             }
 
@@ -321,7 +312,6 @@ def prepare_worker_info(
     run_id: str,
     force: bool,
     no_commit: bool,
-    no_cache: bool,
     project_root: pathlib.Path,
     default_state_dir: pathlib.Path,
 ) -> worker.WorkerStageInfo:
@@ -348,7 +338,6 @@ def prepare_worker_info(
         run_id=run_id,
         force=force,
         no_commit=no_commit,
-        no_cache=no_cache,
         dep_specs=stage_info["dep_specs"],
         out_specs=stage_info["out_specs"],
         params_arg_name=stage_info["params_arg_name"],

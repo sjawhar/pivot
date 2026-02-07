@@ -411,7 +411,6 @@ def worker_env(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> pathl
     cache_dir.mkdir(parents=True, exist_ok=True)
     (cache_dir / "files").mkdir(exist_ok=True)
     (tmp_path / ".pivot" / "stages").mkdir(parents=True, exist_ok=True)
-    (tmp_path / ".pivot" / "pending" / "stages").mkdir(parents=True, exist_ok=True)
     monkeypatch.chdir(tmp_path)
     return cache_dir
 

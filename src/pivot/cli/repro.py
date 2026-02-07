@@ -28,7 +28,6 @@ from pivot.cli import helpers as cli_helpers
 from pivot.engine import engine, sinks
 from pivot.engine import sources as engine_sources
 from pivot.executor import prepare_workers
-from pivot.storage import project_lock
 from pivot.types import (
     ExecutionResultEvent,
     OnError,
@@ -58,7 +57,6 @@ def _configure_watch_sources(
     force: bool,
     stages: list[str] | None,
     no_commit: bool,
-    no_cache: bool,
     on_error: OnError,
 ) -> None:
     """Configure sources for watch mode."""
@@ -70,7 +68,6 @@ def _configure_watch_sources(
                 force=True,
                 reason="watch:initial:forced",
                 no_commit=no_commit,
-                no_cache=no_cache,
                 on_error=on_error,
             )
         )
@@ -82,7 +79,6 @@ def _configure_oneshot_source(
     *,
     force: bool,
     no_commit: bool,
-    no_cache: bool,
     on_error: OnError,
     allow_uncached_incremental: bool,
     checkout_missing: bool,
@@ -95,7 +91,6 @@ def _configure_oneshot_source(
             reason="cli",
             single_stage=False,  # Always resolve deps for repro
             no_commit=no_commit,
-            no_cache=no_cache,
             on_error=on_error,
             allow_uncached_incremental=allow_uncached_incremental,
             checkout_missing=checkout_missing,
@@ -217,7 +212,6 @@ def _run_pipeline(
     debounce: int,
     tui_log: pathlib.Path | None,
     no_commit: bool,
-    no_cache: bool,
     on_error: OnError,
     serve: bool,
     allow_uncached_incremental: bool,
@@ -296,32 +290,27 @@ def _run_pipeline(
             console=console,
             jsonl_callback=jsonl_callback,
             no_commit=no_commit,
-            no_cache=no_cache,
         )
 
-    # Acquire lock for oneshot mode when no_commit=True
-    lock_context = project_lock.pending_state_lock() if no_commit else contextlib.nullcontext()
-    with lock_context:
-        return _run_oneshot_mode(
-            stages_list=stages_list,
-            execution_order=execution_order,
-            graph=graph,
-            quiet=quiet,
-            tui=tui,
-            as_json=as_json,
-            show_output=show_output,
-            tui_log=tui_log,
-            force=force,
-            no_commit=no_commit,
-            no_cache=no_cache,
-            on_error=on_error,
-            allow_uncached_incremental=allow_uncached_incremental,
-            checkout_missing=checkout_missing,
-            run_id=run_id,
-            console=console,
-            jsonl_callback=jsonl_callback,
-            cancel_event=cancel_event,
-        )
+    return _run_oneshot_mode(
+        stages_list=stages_list,
+        execution_order=execution_order,
+        graph=graph,
+        quiet=quiet,
+        tui=tui,
+        as_json=as_json,
+        show_output=show_output,
+        tui_log=tui_log,
+        force=force,
+        no_commit=no_commit,
+        on_error=on_error,
+        allow_uncached_incremental=allow_uncached_incremental,
+        checkout_missing=checkout_missing,
+        run_id=run_id,
+        console=console,
+        jsonl_callback=jsonl_callback,
+        cancel_event=cancel_event,
+    )
 
 
 def _run_watch_mode(  # noqa: PLR0913 - many params needed for different modes
@@ -342,7 +331,6 @@ def _run_watch_mode(  # noqa: PLR0913 - many params needed for different modes
     console: tui_console.Console | None,
     jsonl_callback: Callable[[dict[str, object]], None] | None,
     no_commit: bool,
-    no_cache: bool,
 ) -> None:
     """Run watch mode with unified event-driven execution."""
 
@@ -358,7 +346,6 @@ def _run_watch_mode(  # noqa: PLR0913 - many params needed for different modes
             debounce=debounce,
             on_error=on_error,
             no_commit=no_commit,
-            no_cache=no_cache,
         )
 
     # Build bipartite graph for watch paths
@@ -435,7 +422,6 @@ def _run_watch_mode(  # noqa: PLR0913 - many params needed for different modes
                         force=force,
                         stages=stages_list,
                         no_commit=no_commit,
-                        no_cache=no_cache,
                         on_error=on_error,
                     )
 
@@ -482,7 +468,6 @@ def _run_watch_mode(  # noqa: PLR0913 - many params needed for different modes
                     force=force,
                     stages=stages_list,
                     no_commit=no_commit,
-                    no_cache=no_cache,
                     on_error=on_error,
                 )
 
@@ -501,7 +486,6 @@ def _run_serve_mode(
     debounce: int,
     on_error: OnError,
     no_commit: bool,
-    no_cache: bool,
 ) -> None:
     """Run serve mode with Engine and agent RPC.
 
@@ -548,7 +532,6 @@ def _run_serve_mode(
                         force=True,
                         reason="serve:initial",
                         no_commit=no_commit,
-                        no_cache=no_cache,
                         on_error=on_error,
                     )
                 )
@@ -587,7 +570,6 @@ def _run_oneshot_mode(
     tui_log: pathlib.Path | None,
     force: bool,
     no_commit: bool,
-    no_cache: bool,
     on_error: OnError,
     allow_uncached_incremental: bool,
     checkout_missing: bool,
@@ -644,7 +626,6 @@ def _run_oneshot_mode(
                         stages_list,
                         force=force,
                         no_commit=no_commit,
-                        no_cache=no_cache,
                         on_error=on_error,
                         allow_uncached_incremental=allow_uncached_incremental,
                         checkout_missing=checkout_missing,
@@ -700,7 +681,6 @@ def _run_oneshot_mode(
                 stages_list,
                 force=force,
                 no_commit=no_commit,
-                no_cache=no_cache,
                 on_error=on_error,
                 allow_uncached_incremental=allow_uncached_incremental,
                 checkout_missing=checkout_missing,
@@ -782,12 +762,7 @@ def _run_oneshot_mode(
 @click.option(
     "--no-commit",
     is_flag=True,
-    help="Defer lock files to pending dir for faster iteration. Run 'pivot commit' to finalize.",
-)
-@click.option(
-    "--no-cache",
-    is_flag=True,
-    help="Skip caching outputs entirely for maximum iteration speed. Outputs won't be cached.",
+    help="Skip writing lock files. Run 'pivot commit' to finalize.",
 )
 @click.option(
     "--keep-going",
@@ -829,7 +804,6 @@ def repro(
     show_output: bool,
     tui_log: pathlib.Path | None,
     no_commit: bool,
-    no_cache: bool,
     keep_going: bool,
     serve: bool,
     allow_uncached_incremental: bool,
@@ -907,7 +881,6 @@ def repro(
             debounce=debounce_ms,
             tui_log=tui_log,
             no_commit=no_commit,
-            no_cache=no_cache,
             on_error=on_error,
             serve=serve,
             allow_uncached_incremental=allow_uncached_incremental,

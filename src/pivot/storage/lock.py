@@ -22,7 +22,16 @@ import yaml
 
 from pivot import exceptions, path_utils, project, yaml_config
 from pivot.storage import cache
-from pivot.types import DepEntry, HashInfo, LockData, OutEntry, OutputHash, StorageLockData
+from pivot.types import (
+    DepEntry,
+    DirHash,
+    FileHash,
+    HashInfo,
+    LockData,
+    OutEntry,
+    StorageLockData,
+    is_dir_hash,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -34,8 +43,6 @@ _VALID_STAGE_NAME = re.compile(r"^[a-zA-Z0-9_@.-]+$")  # Allow . for DVC matrix 
 _MAX_STAGE_NAME_LEN = 200  # Leave room for ".lock" suffix within filesystem NAME_MAX (255)
 _REQUIRED_LOCK_KEYS = frozenset({"code_manifest", "params", "deps", "outs", "dep_generations"})
 
-# Pending directory for --no-commit mode (relative to .pivot/)
-_PENDING_DIR = "pending"
 STAGES_REL_PATH = ".pivot/stages"
 
 
@@ -46,11 +53,6 @@ def get_stages_dir(state_dir: Path) -> Path:
     .pivot/cache/stages/ so they can be versioned for reproducibility.
     """
     return state_dir / "stages"
-
-
-def get_pending_stages_dir(project_root: Path) -> Path:
-    """Return the pending stages directory for --no-commit mode."""
-    return project_root / ".pivot" / _PENDING_DIR / "stages"
 
 
 def is_lock_data(data: object) -> TypeGuard[StorageLockData]:
@@ -74,7 +76,7 @@ def _convert_to_storage_format(data: LockData) -> StorageLockData:
     for abs_path, hash_info in data["dep_hashes"].items():
         rel_path = project.to_relative_path(abs_path, proj_root)
         entry = DepEntry(path=rel_path, hash=hash_info["hash"])
-        if "manifest" in hash_info:
+        if is_dir_hash(hash_info):
             entry["manifest"] = hash_info["manifest"]
         deps_list.append(entry)
     deps_list.sort(key=lambda e: e["path"])
@@ -83,12 +85,9 @@ def _convert_to_storage_format(data: LockData) -> StorageLockData:
     for abs_path, hash_info in data["output_hashes"].items():
         rel_path = project.to_relative_path(abs_path, proj_root)
         rel_path = path_utils.preserve_trailing_slash(abs_path, rel_path)
-        if hash_info is None:
-            entry = OutEntry(path=rel_path, hash=None)
-        else:
-            entry = OutEntry(path=rel_path, hash=hash_info["hash"])
-            if "manifest" in hash_info:
-                entry["manifest"] = hash_info["manifest"]
+        entry = OutEntry(path=rel_path, hash=hash_info["hash"])
+        if is_dir_hash(hash_info):
+            entry["manifest"] = hash_info["manifest"]
         outs_list.append(entry)
     outs_list.sort(key=lambda e: e["path"])
 
@@ -113,21 +112,19 @@ def _convert_from_storage_format(data: StorageLockData) -> LockData:
     for entry in data["deps"]:
         abs_path = str(project.to_absolute_path(entry["path"], proj_root))
         if "manifest" in entry:
-            dep_hashes[abs_path] = {"hash": entry["hash"], "manifest": entry["manifest"]}
+            dep_hashes[abs_path] = DirHash(hash=entry["hash"], manifest=entry["manifest"])
         else:
-            dep_hashes[abs_path] = {"hash": entry["hash"]}
+            dep_hashes[abs_path] = FileHash(hash=entry["hash"])
 
-    output_hashes = dict[str, OutputHash]()
+    output_hashes = dict[str, HashInfo]()
     for entry in data["outs"]:
         rel_path = entry["path"]
         abs_path = str(project.to_absolute_path(rel_path, proj_root))
         abs_path = path_utils.preserve_trailing_slash(rel_path, abs_path)
-        if entry["hash"] is None:
-            output_hashes[abs_path] = None
-        elif "manifest" in entry:
-            output_hashes[abs_path] = {"hash": entry["hash"], "manifest": entry["manifest"]}
+        if "manifest" in entry:
+            output_hashes[abs_path] = DirHash(hash=entry["hash"], manifest=entry["manifest"])
         else:
-            output_hashes[abs_path] = {"hash": entry["hash"]}
+            output_hashes[abs_path] = FileHash(hash=entry["hash"])
 
     result = LockData(
         code_manifest=data["code_manifest"],
@@ -225,19 +222,6 @@ class StageLock:
                 return True, "Output paths changed"
 
         return False, ""
-
-
-def get_pending_lock(stage_name: str, project_root: Path) -> StageLock:
-    """Get StageLock pointing to pending directory for --no-commit mode."""
-    return StageLock(stage_name, get_pending_stages_dir(project_root))
-
-
-def list_pending_stages(project_root: Path) -> list[str]:
-    """List all stages with pending lock files."""
-    pending_dir = get_pending_stages_dir(project_root)
-    if not pending_dir.exists():
-        return []
-    return sorted(p.stem for p in pending_dir.glob("*.lock"))
 
 
 # =============================================================================

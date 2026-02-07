@@ -102,7 +102,6 @@ class Engine:
 
     # Stored orchestration params (for watch mode re-runs)
     _stored_no_commit: bool
-    _stored_no_cache: bool
     _stored_on_error: OnError
 
     # Track whether run() has completed to prevent re-use
@@ -146,7 +145,6 @@ class Engine:
 
         # Stored orchestration params (for watch mode re-runs)
         self._stored_no_commit = False
-        self._stored_no_cache = False
         self._stored_on_error = OnError.FAIL
 
         # Track whether run() has completed to prevent re-use
@@ -342,7 +340,6 @@ class Engine:
         """Handle a RunRequested event by executing stages."""
         # Store orchestration params for watch mode re-runs
         self._stored_no_commit = event["no_commit"]
-        self._stored_no_cache = event["no_cache"]
         self._stored_on_error = event["on_error"]
 
         # Clear cancel event before starting new execution
@@ -366,7 +363,6 @@ class Engine:
                 parallel=event["parallel"],
                 max_workers=event["max_workers"],
                 no_commit=event["no_commit"],
-                no_cache=event["no_cache"],
                 on_error=event["on_error"],
                 cache_dir=event["cache_dir"],
                 allow_uncached_incremental=event["allow_uncached_incremental"],
@@ -454,7 +450,6 @@ class Engine:
         parallel: bool,
         max_workers: int | None,
         no_commit: bool,
-        no_cache: bool,
         on_error: OnError,
         cache_dir: pathlib.Path | None,
         allow_uncached_incremental: bool = False,
@@ -573,7 +568,6 @@ class Engine:
                         checkout_modes=checkout_modes,
                         force=force,
                         no_commit=no_commit,
-                        no_cache=no_cache,
                         stage_start_times=stage_start_times,
                         run_id=run_id,
                         project_root=project_root,
@@ -605,7 +599,8 @@ class Engine:
                                 stage_durations[stage_name] = duration_ms
 
                                 # Apply deferred writes for successful stages
-                                if result["status"] == StageStatus.RAN and not no_commit:
+                                # Both RAN and SKIPPED (run cache) can carry deferred writes
+                                if result["status"] != StageStatus.FAILED and not no_commit:
                                     stage_info = self._get_stage(stage_name)
                                     output_paths = [str(out.path) for out in stage_info["outs"]]
                                     executor_core.apply_deferred_writes(
@@ -616,6 +611,7 @@ class Engine:
                                 results[stage_name] = executor_core.ExecutionSummary(
                                     status=result["status"],
                                     reason=result["reason"],
+                                    input_hash=result["input_hash"],
                                 )
 
                             except Exception as e:
@@ -623,6 +619,7 @@ class Engine:
                                 failed_result = StageResult(
                                     status=StageStatus.FAILED,
                                     reason=str(e),
+                                    input_hash=None,
                                     output_lines=[],
                                 )
                                 duration_ms = await self._handle_stage_completion(
@@ -632,6 +629,7 @@ class Engine:
                                 results[stage_name] = executor_core.ExecutionSummary(
                                     status=StageStatus.FAILED,
                                     reason=str(e),
+                                    input_hash=None,
                                 )
 
                         # Check error mode
@@ -682,7 +680,6 @@ class Engine:
                                 checkout_modes=checkout_modes,
                                 force=force,
                                 no_commit=no_commit,
-                                no_cache=no_cache,
                                 stage_start_times=stage_start_times,
                                 run_id=run_id,
                                 project_root=project_root,
@@ -901,7 +898,6 @@ class Engine:
         checkout_modes: list[CheckoutMode],
         force: bool,
         no_commit: bool,
-        no_cache: bool,
         stage_start_times: dict[str, float],
         run_id: str,
         project_root: pathlib.Path,
@@ -943,7 +939,6 @@ class Engine:
                 run_id,
                 force,
                 no_commit,
-                no_cache,
                 project_root,
                 default_state_dir=state_dir,
             )
@@ -997,6 +992,7 @@ class Engine:
                 duration_ms=duration_ms,
                 index=stage_index,
                 total=total_stages,
+                input_hash=result["input_hash"],
             )
         )
 
@@ -1049,6 +1045,7 @@ class Engine:
         results[stage_name] = executor_core.ExecutionSummary(
             status=StageStatus.SKIPPED,
             reason=reason,
+            input_hash=None,
         )
         stage_index, total_stages = self._get_stage_index(stage_name)
         await self.emit(
@@ -1060,6 +1057,7 @@ class Engine:
                 duration_ms=0.0,
                 index=stage_index,
                 total=total_stages,
+                input_hash=None,
             )
         )
 
@@ -1076,20 +1074,10 @@ class Engine:
     ) -> None:
         """Build and write run manifest to StateDB."""
         from pivot import run_history
-        from pivot.storage import lock
-
-        state_dir = config.get_state_dir()
 
         stages_records = dict[str, run_history.StageRunRecord]()
         for name, summary in results.items():
-            stage_lock = lock.StageLock(name, lock.get_stages_dir(state_dir))
-            lock_data = stage_lock.read()
-
-            if lock_data:
-                input_hash = run_history.compute_input_hash_from_lock(lock_data)
-            else:
-                input_hash = "<no-lock>"
-
+            input_hash = summary["input_hash"]
             duration_ms = int(stage_durations.get(name, 0))
 
             stages_records[name] = run_history.StageRunRecord(
@@ -1212,7 +1200,6 @@ class Engine:
                 parallel=True,
                 max_workers=None,
                 no_commit=self._stored_no_commit,
-                no_cache=self._stored_no_cache,
                 on_error=self._stored_on_error,
                 cache_dir=None,
             )

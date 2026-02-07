@@ -2,60 +2,37 @@ from __future__ import annotations
 
 import click
 
-from pivot import project
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
 from pivot.executor import commit
-from pivot.storage import lock, project_lock
 
 
 @cli_decorators.pivot_command("commit")
-@click.option("--list", "list_pending", is_flag=True, help="List pending stages without committing")
-@click.option("--discard", is_flag=True, help="Discard pending changes without committing")
+@click.argument("stages", nargs=-1)
 @click.pass_context
-def commit_command(ctx: click.Context, list_pending: bool, discard: bool) -> None:
-    """Commit pending locks from --no-commit runs to production.
+def commit_command(ctx: click.Context, stages: tuple[str, ...]) -> None:
+    """Commit current workspace state for stages.
 
-    After running with --no-commit, use this command to finalize your changes.
+    Hashes current deps and outputs, writes lock files and cache.
+    Without arguments, commits all stale stages.
     """
     cli_ctx = cli_helpers.get_cli_context(ctx)
     quiet = cli_ctx["quiet"]
 
-    project_root = project.get_project_root()
+    stage_names = list(stages) if stages else None
+    committed, failed = commit.commit_stages(stage_names)
 
-    # --list is read-only, doesn't need lock
-    if list_pending:
-        pending_stages = lock.list_pending_stages(project_root)
-        if not quiet:
-            if not pending_stages:
-                click.echo("No pending stages")
-            else:
-                click.echo("Pending stages:")
-                for stage_name in pending_stages:
-                    click.echo(f"  {stage_name}")
-        return
-
-    # Acquire lock before reading/modifying pending state to prevent races
-    with project_lock.pending_state_lock():
-        pending_stages = lock.list_pending_stages(project_root)
-
-        if discard:
-            if not pending_stages:
-                if not quiet:
-                    click.echo("No pending stages to discard")
-                return
-            discarded = commit.discard_pending()
-            if not quiet:
-                click.echo(f"Discarded {len(discarded)} pending stage(s)")
-            return
-
-        if not pending_stages:
-            if not quiet:
-                click.echo("Nothing to commit")
-            return
-
-        committed = commit.commit_pending()
-        if not quiet:
+    if not quiet:
+        if committed:
             click.echo(f"Committed {len(committed)} stage(s):")
             for stage_name in committed:
                 click.echo(f"  {stage_name}")
+        if failed:
+            click.echo(f"Failed {len(failed)} stage(s):")
+            for stage_name in failed:
+                click.echo(f"  {stage_name}")
+        if not committed and not failed:
+            click.echo("Nothing to commit")
+
+    if failed:
+        ctx.exit(1)

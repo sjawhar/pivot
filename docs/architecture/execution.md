@@ -352,7 +352,7 @@ This avoids write contention between workers while maintaining consistency.
 |----------|--------|
 | Two `pivot repro`, same stage | Execution lock prevents concurrent execution |
 | Two `pivot repro`, different stages | Both execute independently, writes serialize |
-| `pivot repro --no-commit` + `pivot commit` | `pending_state_lock` coordinates |
+| `pivot repro --no-commit` + `pivot commit` | Independent operations, no lock needed |
 | Cache writes by both processes | Idempotent (check exists before writing) |
 
 ## Error Handling
@@ -415,44 +415,24 @@ Without this flag, Pivot validates that all tracked outputs exist before running
 
 ## Deferred Commit Mode
 
-The `--no-commit` flag defers lock file updates and caching until explicitly committed:
+The `--no-commit` flag runs stages without writing durable state:
 
 ```bash
-# Run stages but don't update locks or cache outputs
+# Run stages — outputs land on disk but no locks, cache, or StateDB updates
 pivot repro --no-commit
 
-# Inspect results, then commit when satisfied
+# Inspect results, then snapshot current workspace state
 pivot commit
 ```
 
 ### How It Works
 
-1. Stages execute normally but write to `.pivot/pending/` instead of `.pivot/stages/`
-2. Output files are written to disk but not cached
-3. `pivot commit` promotes pending locks to production and updates the cache
-4. `pivot commit --discard` removes pending locks without committing
+1. `--no-commit`: stages execute and outputs are written to disk. No lock files, no cache copies, no StateDB updates. Output hashes are computed for the `StageResult` but nothing is persisted.
+2. `pivot commit [stage_names...]`: computes current workspace state (fingerprints code, hashes deps and outputs), writes production lock files, saves outputs to cache, and updates StateDB. Without arguments, commits all stale stages. With stage names, unconditionally commits those stages.
 
 ### Use Case
 
-This workflow avoids caching overhead during rapid iteration. Instead of hashing and caching outputs after every run, you can iterate quickly and commit only when you have results worth keeping.
-
-Note that for pure iteration speed, running the Python code directly (without Pivot) is often faster. The `--no-commit` mode is useful when you want Pivot's stage orchestration but want to batch the caching overhead.
-
-## No-Cache Mode
-
-The `--no-cache` flag skips caching outputs entirely for maximum iteration speed:
-
-```bash
-pivot repro --no-cache
-```
-
-In this mode:
-
-- Outputs are written to disk but not stored in the content-addressable cache
-- Lock files record `null` for output hashes (no provenance tracking)
-- Combined with `--force`, this is the fastest execution mode
-
-**Limitation:** `--no-cache` is incompatible with `IncrementalOut` outputs. Incremental outputs require the cache to restore previous state before appending new data. Attempting to use both will fail with an error.
+This workflow avoids caching overhead during rapid iteration. `pivot commit` is also the "trust me" path — if you change code but know outputs are still correct, `pivot commit` records the current state without re-running stages.
 
 ## See Also
 

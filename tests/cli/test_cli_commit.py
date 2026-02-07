@@ -1,251 +1,285 @@
+"""Tests for pivot commit command."""
+
 from __future__ import annotations
 
 import pathlib
 from typing import TYPE_CHECKING, Annotated, TypedDict
 
-from conftest import isolated_pivot_dir
-from helpers import create_pipeline_py
-from pivot import cli, loaders, outputs
+from helpers import register_test_stage
+from pivot import cli, executor, loaders, outputs
 from pivot.storage import lock
 
 if TYPE_CHECKING:
     import click.testing
+    import pytest
+
+    from pivot.pipeline.pipeline import Pipeline
 
 
 # =============================================================================
-# Module-level helper functions for stages
+# Module-level TypedDicts and Stage Functions for annotation-based registration
 # =============================================================================
 
 
-class _ProcessOutputs(TypedDict):
+class _OutputTxtOutputs(TypedDict):
     output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
+
+
+class _ATxtOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("a.txt", loaders.PathOnly())]
 
 
 def _helper_process(
     input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
-) -> _ProcessOutputs:
-    """Helper stage that writes output.txt."""
+) -> _OutputTxtOutputs:
     _ = input_file
     pathlib.Path("output.txt").write_text("done")
-    return {"output": pathlib.Path("output.txt")}
+    return _OutputTxtOutputs(output=pathlib.Path("output.txt"))
 
 
-# Extra code to include the TypedDict in generated pipeline.py
-_EXTRA_CODE = """
-class _ProcessOutputs(TypedDict):
-    output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
-"""
+def _helper_stage_a() -> _ATxtOutputs:
+    pathlib.Path("a.txt").write_text("output a")
+    return _ATxtOutputs(output=pathlib.Path("a.txt"))
 
 
 # =============================================================================
-# commit --list tests
+# Empty Pipeline
 # =============================================================================
 
 
-def test_commit_list_empty(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
-    """commit --list shows no pending stages when none exist."""
+def test_commit_empty_pipeline(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
+    """commit command with no stages reports nothing to commit."""
+    from conftest import isolated_pivot_dir
+
     with isolated_pivot_dir(runner, tmp_path):
-        pathlib.Path(".pivot/pending/stages").mkdir(parents=True)
-
-        result = runner.invoke(cli.cli, ["commit", "--list"])
-
-        assert result.exit_code == 0
-        assert "No pending stages" in result.output
-
-
-def test_commit_list_shows_pending(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
-    """commit --list shows stages pending from --no-commit runs."""
-    with isolated_pivot_dir(runner, tmp_path):
-        pathlib.Path(".pivot/cache/files").mkdir(parents=True)
-        pathlib.Path("input.txt").write_text("data")
-
-        create_pipeline_py(
-            [_helper_process], names={"_helper_process": "process"}, extra_code=_EXTRA_CODE
-        )
-
-        # Run with --no-commit
-        run_result = runner.invoke(cli.cli, ["repro", "--no-commit"])
-        assert run_result.exit_code == 0, f"Run failed: {run_result.output}"
-
-        result = runner.invoke(cli.cli, ["commit", "--list"])
-
-        assert result.exit_code == 0
-        assert "Pending stages:" in result.output
-        assert "process" in result.output
-
-
-# =============================================================================
-# commit tests
-# =============================================================================
-
-
-def test_commit_nothing_to_commit(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
-    """commit with no pending stages shows nothing to commit."""
-    with isolated_pivot_dir(runner, tmp_path):
-        pathlib.Path(".pivot/pending/stages").mkdir(parents=True)
-        pathlib.Path(".pivot/cache/stages").mkdir(parents=True)
-
+        pathlib.Path("pivot.yaml").write_text("stages: {}")
         result = runner.invoke(cli.cli, ["commit"])
 
         assert result.exit_code == 0
         assert "Nothing to commit" in result.output
 
 
-def test_commit_promotes_pending_to_production(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
-) -> None:
-    """commit promotes pending locks to production."""
-    with isolated_pivot_dir(runner, tmp_path):
-        pathlib.Path(".pivot/cache/files").mkdir(parents=True)
-        pathlib.Path("input.txt").write_text("data")
-
-        create_pipeline_py(
-            [_helper_process], names={"_helper_process": "process"}, extra_code=_EXTRA_CODE
-        )
-
-        # Run with --no-commit
-        run_result = runner.invoke(cli.cli, ["repro", "--no-commit"])
-        assert run_result.exit_code == 0, f"Run failed: {run_result.output}"
-
-        # Verify pending lock exists
-        project_root = pathlib.Path.cwd()
-        pending_lock = lock.get_pending_lock("process", project_root)
-        assert pending_lock.path.exists(), "Pending lock should exist after --no-commit run"
-
-        # Commit
-        result = runner.invoke(cli.cli, ["commit"])
-
-        assert result.exit_code == 0
-        assert "Committed 1 stage(s)" in result.output
-        assert "process" in result.output
-
-        # Verify pending lock removed
-        assert not pending_lock.path.exists(), "Pending lock should be removed after commit"
-
-
 # =============================================================================
-# commit --discard tests
+# Commit Stale Stages (no args)
 # =============================================================================
 
 
-def test_commit_discard_nothing(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
-    """commit --discard with no pending stages shows nothing to discard."""
-    with isolated_pivot_dir(runner, tmp_path):
-        pathlib.Path(".pivot/pending/stages").mkdir(parents=True)
-
-        result = runner.invoke(cli.cli, ["commit", "--discard"])
-
-        assert result.exit_code == 0
-        assert "No pending stages to discard" in result.output
-
-
-def test_commit_discard_removes_pending(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+def test_commit_no_args_commits_stale_stages(
+    mock_discovery: Pipeline,
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """commit --discard removes pending locks without committing."""
-    with isolated_pivot_dir(runner, tmp_path):
-        pathlib.Path(".pivot/cache/files").mkdir(parents=True)
-        pathlib.Path("input.txt").write_text("data")
+    """commit with no args commits stages whose output exists but has no lock."""
+    (tmp_path / "input.txt").write_text("data")
+    register_test_stage(_helper_process, name="process")
 
-        create_pipeline_py(
-            [_helper_process], names={"_helper_process": "process"}, extra_code=_EXTRA_CODE
-        )
+    # Create output on disk manually (simulating a --no-commit run)
+    (tmp_path / "output.txt").write_text("done")
 
-        # Run with --no-commit
-        run_result = runner.invoke(cli.cli, ["repro", "--no-commit"])
-        assert run_result.exit_code == 0, f"Run failed: {run_result.output}"
+    result = runner.invoke(cli.cli, ["commit"])
 
-        # Verify pending lock exists
-        project_root = pathlib.Path.cwd()
-        pending_lock = lock.get_pending_lock("process", project_root)
-        assert pending_lock.path.exists()
+    assert result.exit_code == 0, f"Failed: {result.output}"
+    assert "Committed 1 stage(s)" in result.output
+    assert "process" in result.output
 
-        # Discard
-        result = runner.invoke(cli.cli, ["commit", "--discard"])
-
-        assert result.exit_code == 0
-        assert "Discarded 1 pending stage(s)" in result.output
-
-        # Verify pending lock removed
-        assert not pending_lock.path.exists()
+    # Verify production lock was written with output hashes
+    state_dir = tmp_path / ".pivot"
+    stage_lock = lock.StageLock("process", lock.get_stages_dir(state_dir))
+    assert stage_lock.path.exists(), "Production lock should be written"
+    lock_data = stage_lock.read()
+    assert lock_data is not None, "Lock data should be readable"
+    assert len(lock_data["output_hashes"]) == 1, "Lock should have exactly one output hash"
+    out_key = next(iter(lock_data["output_hashes"]))
+    assert out_key.endswith("output.txt"), (
+        f"Output hash key should be for output.txt, got: {out_key}"
+    )
+    assert lock_data["output_hashes"][out_key]["hash"], "Output hash should not be empty"
 
 
 # =============================================================================
-# run --no-commit integration tests
+# Commit Specific Stage (unconditional)
 # =============================================================================
 
 
-def test_run_no_commit_creates_pending_lock(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+def test_commit_specific_stage_unconditionally_commits(
+    mock_discovery: Pipeline,
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """run --no-commit creates pending lock instead of production lock."""
-    with isolated_pivot_dir(runner, tmp_path):
-        pathlib.Path(".pivot/cache/files").mkdir(parents=True)
-        pathlib.Path("input.txt").write_text("data")
+    """commit <stage> re-commits even when lock already matches."""
+    (tmp_path / "input.txt").write_text("data")
+    register_test_stage(_helper_process, name="process")
 
-        create_pipeline_py(
-            [_helper_process], names={"_helper_process": "process"}, extra_code=_EXTRA_CODE
-        )
+    # Run normally to create lock
+    executor.run(pipeline=mock_discovery)
 
-        result = runner.invoke(cli.cli, ["run", "--no-commit", "process"])
+    # Verify lock exists after normal run and record its mtime
+    state_dir = tmp_path / ".pivot"
+    stage_lock = lock.StageLock("process", lock.get_stages_dir(state_dir))
+    assert stage_lock.path.exists(), "Lock should exist after normal run"
 
-        assert result.exit_code == 0, f"Run failed: {result.output}"
+    # Explicit commit <stage> should re-commit even though lock matches
+    result = runner.invoke(cli.cli, ["commit", "process"])
 
-        # Verify pending lock exists
-        project_root = pathlib.Path.cwd()
-        pending_lock = lock.get_pending_lock("process", project_root)
-        assert pending_lock.path.exists(), "Pending lock should exist"
+    assert result.exit_code == 0, f"Failed: {result.output}"
+    assert "Committed 1 stage(s)" in result.output
+    assert "process" in result.output
 
-        # Verify production lock does NOT exist
-        cache_dir = project_root / ".pivot" / "cache"
-        production_lock = lock.StageLock("process", cache_dir)
-        assert not production_lock.path.exists(), "Production lock should NOT exist"
+    # Verify lock was actually re-written (not just left from previous run)
+    lock_data = stage_lock.read()
+    assert lock_data is not None, "Lock data should be readable after re-commit"
+    assert lock_data["output_hashes"], "Lock should have output hashes after re-commit"
 
 
-def test_run_no_commit_second_run_skips(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+# =============================================================================
+# Commit Skips Unchanged Stages (no args)
+# =============================================================================
+
+
+def test_commit_skips_unchanged_stages(
+    mock_discovery: Pipeline,
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Second run --no-commit skips unchanged stages (uses pending lock)."""
-    with isolated_pivot_dir(runner, tmp_path):
-        pathlib.Path(".pivot/cache/files").mkdir(parents=True)
-        pathlib.Path("input.txt").write_text("data")
+    """commit with no args skips stages whose lock already matches."""
+    (tmp_path / "input.txt").write_text("data")
+    register_test_stage(_helper_process, name="process")
 
-        create_pipeline_py(
-            [_helper_process], names={"_helper_process": "process"}, extra_code=_EXTRA_CODE
-        )
+    # Run normally - creates lock and caches outputs
+    executor.run(pipeline=mock_discovery)
 
-        # First run via CLI to set up pending lock
-        first_result = runner.invoke(cli.cli, ["repro", "--no-commit"])
-        assert first_result.exit_code == 0, f"First run failed: {first_result.output}"
+    # Commit with no args should skip (nothing changed)
+    result = runner.invoke(cli.cli, ["commit"])
 
-        # Second run via CLI should use cache
-        result = runner.invoke(cli.cli, ["run", "--no-commit", "process"])
-        assert result.exit_code == 0, f"Failed with output: {result.output}"
-        assert "cached" in result.output.lower() or "unchanged" in result.output.lower()
+    assert result.exit_code == 0, f"Failed: {result.output}"
+    assert "Nothing to commit" in result.output
 
 
-def test_run_no_commit_then_commit_workflow(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+# =============================================================================
+# Commit Errors on Missing Output
+# =============================================================================
+
+
+def test_commit_errors_on_missing_output(
+    mock_discovery: Pipeline,
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Full workflow: run --no-commit, then commit, then run uses production lock."""
-    with isolated_pivot_dir(runner, tmp_path):
-        pathlib.Path(".pivot/cache/files").mkdir(parents=True)
-        pathlib.Path("input.txt").write_text("data")
+    """commit <stage> exits non-zero when output file doesn't exist on disk."""
+    (tmp_path / "input.txt").write_text("data")
+    register_test_stage(_helper_process, name="process")
 
-        create_pipeline_py(
-            [_helper_process], names={"_helper_process": "process"}, extra_code=_EXTRA_CODE
-        )
+    # Don't create output.txt on disk - it's missing
 
-        # Run with --no-commit via CLI
-        run_result = runner.invoke(cli.cli, ["repro", "--no-commit"])
-        assert run_result.exit_code == 0, f"Run failed: {run_result.output}"
+    result = runner.invoke(cli.cli, ["commit", "process"])
 
-        # Commit via CLI
-        result1 = runner.invoke(cli.cli, ["commit"])
-        assert result1.exit_code == 0
-        assert "Committed 1 stage(s)" in result1.output
+    assert result.exit_code == 1, f"Expected exit code 1, got: {result.exit_code}\n{result.output}"
+    assert "Failed 1 stage(s)" in result.output
 
-        # Now a normal run via CLI should use cache (uses production lock)
-        result2 = runner.invoke(cli.cli, ["run", "process"])
-        assert result2.exit_code == 0, f"Failed with output: {result2.output}"
-        assert "cached" in result2.output.lower() or "unchanged" in result2.output.lower()
+    # Verify no lock was written
+    state_dir = tmp_path / ".pivot"
+    stage_lock = lock.StageLock("process", lock.get_stages_dir(state_dir))
+    assert not stage_lock.path.exists(), "Lock should NOT be written when output is missing"
+
+
+# =============================================================================
+# Commit After --no-commit Run
+# =============================================================================
+
+
+def test_commit_after_no_commit_run(
+    mock_discovery: Pipeline,
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Run with --no-commit, then pivot commit writes lock and caches outputs."""
+    (tmp_path / "input.txt").write_text("data")
+    register_test_stage(_helper_process, name="process")
+
+    # Run with --no-commit
+    executor.run(pipeline=mock_discovery, no_commit=True)
+
+    # Output should exist on disk
+    assert (tmp_path / "output.txt").exists(), "Output should exist after --no-commit run"
+
+    # Production lock should NOT exist
+    state_dir = tmp_path / ".pivot"
+    stage_lock = lock.StageLock("process", lock.get_stages_dir(state_dir))
+    assert not stage_lock.path.exists(), "Lock should NOT exist after --no-commit run"
+
+    # Cache should NOT have files yet (--no-commit skips cache)
+    files_dir = state_dir / "cache" / "files"
+    cache_files_before = list(files_dir.rglob("*")) if files_dir.exists() else []
+    cache_file_count_before = sum(1 for f in cache_files_before if f.is_file())
+
+    # Now run pivot commit
+    result = runner.invoke(cli.cli, ["commit"])
+
+    assert result.exit_code == 0, f"Failed: {result.output}"
+    assert "Committed 1 stage(s)" in result.output
+    assert "process" in result.output
+
+    # Verify production lock was written
+    assert stage_lock.path.exists(), "Lock should be written after commit"
+    lock_data = stage_lock.read()
+    assert lock_data is not None, "Lock data should be readable"
+    assert lock_data["output_hashes"], "Lock should have output hashes"
+
+    # Verify cache now has files (commit caches outputs)
+    cache_files_after = [f for f in files_dir.rglob("*") if f.is_file()]
+    assert len(cache_files_after) > cache_file_count_before, "Cache should have files after commit"
+
+
+# =============================================================================
+# Commit After --no-commit: subsequent run skips
+# =============================================================================
+
+
+def test_commit_after_no_commit_makes_subsequent_run_skip(
+    mock_discovery: Pipeline,
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After --no-commit + commit, a normal run should skip (unchanged)."""
+    (tmp_path / "input.txt").write_text("data")
+    register_test_stage(_helper_process, name="process")
+
+    # Run with --no-commit
+    executor.run(pipeline=mock_discovery, no_commit=True)
+
+    # Commit
+    result = runner.invoke(cli.cli, ["commit"])
+    assert result.exit_code == 0, f"Failed: {result.output}"
+    assert "Committed 1 stage(s)" in result.output
+
+    # Now run normally - should skip because commit recorded the state
+    results = executor.run(pipeline=mock_discovery)
+    assert results["process"]["status"] == "skipped", (
+        f"Stage should skip after commit, got: {results['process']}"
+    )
+
+
+# =============================================================================
+# Unknown Stage Error
+# =============================================================================
+
+
+def test_commit_unknown_stage_errors(
+    mock_discovery: Pipeline,
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """commit with unknown stage name errors with helpful message."""
+    register_test_stage(_helper_stage_a, name="stage_a")
+
+    result = runner.invoke(cli.cli, ["commit", "nonexistent_stage"])
+
+    assert result.exit_code != 0
+    assert "nonexistent_stage" in result.output

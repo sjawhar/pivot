@@ -41,7 +41,7 @@ from pivot.types import (
 
 if TYPE_CHECKING:
     from pivot.registry import RegistryStageInfo
-    from pivot.types import LockData, OutputHash
+    from pivot.types import HashInfo, LockData
 
 logger = logging.getLogger(__name__)
 
@@ -141,7 +141,7 @@ def compute_output_changes(
             path_to_type[path] = "out"
 
     # Get old hashes from lock
-    old_hashes: dict[str, OutputHash] = {}
+    old_hashes: dict[str, HashInfo] = {}
     if lock_data and "output_hashes" in lock_data:
         old_hashes = lock_data["output_hashes"]
 
@@ -150,7 +150,7 @@ def compute_output_changes(
         old_hash_info = old_hashes.get(path)
         old_hash: str | None = None
         if old_hash_info is not None:
-            old_hash = old_hash_info.get("hash")
+            old_hash = old_hash_info["hash"]
 
         # Compute current hash
         new_hash: str | None = None

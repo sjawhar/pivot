@@ -97,7 +97,6 @@ class RunRequested(TypedDict):
     parallel: bool
     max_workers: int | None
     no_commit: bool
-    no_cache: bool
     on_error: OnError
     cache_dir: pathlib.Path | None
     allow_uncached_incremental: bool
@@ -155,6 +154,7 @@ class StageCompleted(TypedDict):
     duration_ms: float
     index: int
     total: int
+    input_hash: str | None
 
 
 class LogLine(TypedDict):

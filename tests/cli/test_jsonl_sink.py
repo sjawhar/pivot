@@ -75,6 +75,7 @@ async def test_jsonl_sink_converts_stage_completed_to_stage_complete(
         duration_ms=1234.5,
         index=1,
         total=3,
+        input_hash=None,
     )
     await sink.handle(event)
 
@@ -222,6 +223,7 @@ async def test_jsonl_sink_handles_all_stage_statuses(
         duration_ms=duration,
         index=0,
         total=1,
+        input_hash=None,
     )
     await sink.handle(event)
 

@@ -394,21 +394,21 @@ def test_restore_targets_from_revision_output_with_stage(
 
 
 def test_out_entry_to_output_hash_with_manifest() -> None:
-    """Converts OutEntry with manifest to OutputHash."""
+    """Converts OutEntry with manifest to HashInfo."""
     entry = {"path": "data/", "hash": "abc123", "manifest": {"a.txt": "def456"}}
     result = restore._out_entry_to_output_hash(entry)  # pyright: ignore[reportArgumentType]
 
-    assert result is not None
     assert result["hash"] == "abc123"
     assert "manifest" in result
 
 
-def test_out_entry_to_output_hash_no_hash() -> None:
-    """Returns None for entry with no hash."""
-    entry = {"path": "data.csv", "hash": None}
+def test_out_entry_to_output_hash_file() -> None:
+    """Converts OutEntry without manifest to FileHash."""
+    entry = {"path": "data.csv", "hash": "abc123"}
     result = restore._out_entry_to_output_hash(entry)  # pyright: ignore[reportArgumentType]
 
-    assert result is None
+    assert result["hash"] == "abc123"
+    assert "manifest" not in result
 
 
 # =============================================================================

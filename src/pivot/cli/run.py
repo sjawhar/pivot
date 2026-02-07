@@ -24,7 +24,6 @@ from pivot.cli import helpers as cli_helpers
 from pivot.engine import engine
 from pivot.engine import sources as engine_sources
 from pivot.executor import prepare_workers
-from pivot.storage import project_lock
 from pivot.types import (
     ExecutionResultEvent,
     OnError,
@@ -47,7 +46,6 @@ def _configure_oneshot_source(
     *,
     force: bool,
     no_commit: bool,
-    no_cache: bool,
     on_error: OnError,
     allow_uncached_incremental: bool,
     checkout_missing: bool,
@@ -60,7 +58,6 @@ def _configure_oneshot_source(
             reason="cli",
             single_stage=True,  # Always single-stage for run command
             no_commit=no_commit,
-            no_cache=no_cache,
             on_error=on_error,
             allow_uncached_incremental=allow_uncached_incremental,
             checkout_missing=checkout_missing,
@@ -73,7 +70,6 @@ def _run_with_tui(
     force: bool = False,
     tui_log: pathlib.Path | None = None,
     no_commit: bool = False,
-    no_cache: bool = False,
     on_error: OnError = OnError.KEEP_GOING,
     allow_uncached_incremental: bool = False,
     checkout_missing: bool = False,
@@ -133,7 +129,6 @@ def _run_with_tui(
                     stages_list,
                     force=force,
                     no_commit=no_commit,
-                    no_cache=no_cache,
                     on_error=on_error,
                     allow_uncached_incremental=allow_uncached_incremental,
                     checkout_missing=checkout_missing,
@@ -151,25 +146,21 @@ def _run_with_tui(
             with contextlib.suppress(Exception):
                 app.post_message(tui_run.TuiShutdown())
 
-    # Acquire lock for oneshot mode when no_commit=True to prevent race conditions
-    # with concurrent commit operations
-    lock_context = project_lock.pending_state_lock() if no_commit else contextlib.nullcontext()
-    with lock_context:
-        # Start engine in background thread
-        engine_thread = threading.Thread(target=engine_thread_target, daemon=True)
-        engine_thread.start()
+    # Start engine in background thread
+    engine_thread = threading.Thread(target=engine_thread_target, daemon=True)
+    engine_thread.start()
 
-        # Run TUI in main thread (required for signal handlers)
-        with _run_common.suppress_stderr_logging():
-            app.run()
+    # Run TUI in main thread (required for signal handlers)
+    with _run_common.suppress_stderr_logging():
+        app.run()
 
-        # Wait for engine thread to finish (should be quick since TUI already exited)
-        engine_thread.join(timeout=5.0)
+    # Wait for engine thread to finish (should be quick since TUI already exited)
+    engine_thread.join(timeout=5.0)
 
-        # Return results (re-raises if engine raised an exception)
-        if result_future.done():
-            return result_future.result()
-        return {}
+    # Return results (re-raises if engine raised an exception)
+    if result_future.done():
+        return result_future.result()
+    return {}
 
 
 def _run_json_mode(
@@ -177,7 +168,6 @@ def _run_json_mode(
     *,
     force: bool,
     no_commit: bool,
-    no_cache: bool,
     on_error: OnError,
     allow_uncached_incremental: bool,
     checkout_missing: bool,
@@ -211,7 +201,6 @@ def _run_json_mode(
                 stages_list,
                 force=force,
                 no_commit=no_commit,
-                no_cache=no_cache,
                 on_error=on_error,
                 allow_uncached_incremental=allow_uncached_incremental,
                 checkout_missing=checkout_missing,
@@ -220,11 +209,7 @@ def _run_json_mode(
             stage_results = await result_sink.get_results()
             return _run_common.convert_results(stage_results)
 
-    # Acquire lock for oneshot mode when no_commit=True to prevent race conditions
-    # with concurrent commit operations
-    lock_context = project_lock.pending_state_lock() if no_commit else contextlib.nullcontext()
-    with lock_context:
-        results = anyio.run(json_main)
+    results = anyio.run(json_main)
 
     # Emit execution result
     total_duration_ms = (time.perf_counter() - start_time) * 1000
@@ -251,7 +236,6 @@ def _run_plain_mode(
     *,
     force: bool,
     no_commit: bool,
-    no_cache: bool,
     on_error: OnError,
     allow_uncached_incremental: bool,
     checkout_missing: bool,
@@ -288,7 +272,6 @@ def _run_plain_mode(
                 stages_list,
                 force=force,
                 no_commit=no_commit,
-                no_cache=no_cache,
                 on_error=on_error,
                 allow_uncached_incremental=allow_uncached_incremental,
                 checkout_missing=checkout_missing,
@@ -297,12 +280,7 @@ def _run_plain_mode(
             stage_results = await result_sink.get_results()
             return _run_common.convert_results(stage_results)
 
-    # Acquire lock for oneshot mode when no_commit=True to prevent race conditions
-    # with concurrent commit operations. Watch mode handles this differently - the
-    # TUI allows manual commit when ready.
-    lock_context = project_lock.pending_state_lock() if no_commit else contextlib.nullcontext()
-    with lock_context:
-        results = anyio.run(plain_main)
+    results = anyio.run(plain_main)
 
     if console and results:
         ran, cached, blocked, failed = executor_core.count_results(results)
@@ -347,12 +325,7 @@ def _validate_stages_required(stages_list: list[str] | None) -> list[str]:
 @click.option(
     "--no-commit",
     is_flag=True,
-    help="Defer lock files to pending dir for faster iteration. Run 'pivot commit' to finalize.",
-)
-@click.option(
-    "--no-cache",
-    is_flag=True,
-    help="Skip caching outputs entirely for maximum iteration speed. Outputs won't be cached.",
+    help="Skip writing lock files. Run 'pivot commit' to finalize.",
 )
 @click.option(
     "--fail-fast",
@@ -379,7 +352,6 @@ def run(
     show_output: bool,
     tui_log: pathlib.Path | None,
     no_commit: bool,
-    no_cache: bool,
     fail_fast: bool,
     allow_uncached_incremental: bool,
     checkout_missing: bool,
@@ -420,7 +392,6 @@ def run(
             force=force,
             tui_log=tui_log,
             no_commit=no_commit,
-            no_cache=no_cache,
             on_error=on_error,
             allow_uncached_incremental=allow_uncached_incremental,
             checkout_missing=checkout_missing,
@@ -433,7 +404,6 @@ def run(
             stages_list,
             force=force,
             no_commit=no_commit,
-            no_cache=no_cache,
             on_error=on_error,
             allow_uncached_incremental=allow_uncached_incremental,
             checkout_missing=checkout_missing,
@@ -443,7 +413,6 @@ def run(
             stages_list,
             force=force,
             no_commit=no_commit,
-            no_cache=no_cache,
             on_error=on_error,
             allow_uncached_incremental=allow_uncached_incremental,
             checkout_missing=checkout_missing,

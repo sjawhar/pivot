@@ -127,6 +127,7 @@ class StageResult(TypedDict):
 
     status: CompletionType
     reason: str
+    input_hash: str | None  # None only for early failures before dep hashing
     output_lines: list[tuple[str, bool]]
     metrics: NotRequired[list[tuple[str, float]]]  # (name, duration_ms) for cross-process
     deferred_writes: NotRequired[DeferredWrites]
@@ -144,10 +145,7 @@ class StageResult(TypedDict):
 #   DirHash           Tree hash with manifest listing all files. The manifest
 #                     enables incremental sync (only transfer changed files).
 #
-#   HashInfo          Union type for non-null hashes (files or directories).
-#
-#   OutputHash        Nullable variant for lock files. None means the output
-#                     exists but wasn't cached (e.g., cache: false in YAML).
+#   HashInfo          Union type for hashes (files or directories).
 #
 
 
@@ -174,12 +172,11 @@ class DirHash(TypedDict):
 
 
 HashInfo = FileHash | DirHash
-OutputHash = FileHash | DirHash | None
 
 
-def is_dir_hash(h: OutputHash) -> TypeGuard[DirHash]:
-    """Type guard to narrow OutputHash to DirHash based on manifest presence."""
-    return h is not None and "manifest" in h
+def is_dir_hash(h: HashInfo) -> TypeGuard[DirHash]:
+    """Type guard to narrow HashInfo to DirHash based on manifest presence."""
+    return "manifest" in h
 
 
 MetricValue = str | int | float | bool | None
@@ -225,7 +222,7 @@ class OutEntry(TypedDict):
     """Entry in outs list for lock file storage."""
 
     path: str
-    hash: str | None  # None for uncached outputs
+    hash: str
     size: NotRequired[int]
     manifest: NotRequired[list[DirManifestEntry]]
 
@@ -249,7 +246,7 @@ class LockData(TypedDict):
     code_manifest: dict[str, str]
     params: dict[str, Any]
     dep_hashes: dict[str, HashInfo]
-    output_hashes: dict[str, OutputHash]
+    output_hashes: dict[str, HashInfo]
     # Stored at execution time for --no-commit mode (used by commit to record correct generations)
     dep_generations: dict[str, int]
 

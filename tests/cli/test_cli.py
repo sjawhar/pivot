@@ -979,8 +979,7 @@ from pivot.pipeline.pipeline import Pipeline
 pipeline = Pipeline('test')
 """)
 
-        # No pending stages, but --list should still be quiet
-        result = runner.invoke(cli.cli, ["--quiet", "commit", "--list"])
+        result = runner.invoke(cli.cli, ["--quiet", "commit"])
 
         assert result.exit_code == 0
         assert result.output.strip() == "", "Quiet mode should suppress output"

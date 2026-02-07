@@ -64,7 +64,6 @@ def test_run_requested_event() -> None:
         "parallel": True,
         "max_workers": None,
         "no_commit": False,
-        "no_cache": False,
         "on_error": OnError.FAIL,
         "cache_dir": None,
         "allow_uncached_incremental": False,
@@ -84,7 +83,6 @@ def test_run_requested_event() -> None:
         "parallel": True,
         "max_workers": None,
         "no_commit": False,
-        "no_cache": False,
         "on_error": OnError.FAIL,
         "cache_dir": None,
         "allow_uncached_incremental": False,
@@ -114,7 +112,6 @@ def test_input_event_union() -> None:
             "parallel": True,
             "max_workers": None,
             "no_commit": False,
-            "no_cache": False,
             "on_error": OnError.FAIL,
             "cache_dir": None,
             "allow_uncached_incremental": False,
@@ -185,11 +182,13 @@ def test_stage_completed_event() -> None:
         "duration_ms": 1234.5,
         "index": 3,
         "total": 5,
+        "input_hash": "abc123",
     }
     assert event["type"] == "stage_completed"
     assert event["status"] == StageStatus.RAN
     assert event["index"] == 3
     assert event["total"] == 5
+    assert event["input_hash"] == "abc123"
 
     # Skipped stage
     event_skip: types.StageCompleted = {
@@ -200,6 +199,7 @@ def test_stage_completed_event() -> None:
         "duration_ms": 0.0,
         "index": 4,
         "total": 5,
+        "input_hash": None,
     }
     assert event_skip["status"] == StageStatus.SKIPPED
 
@@ -259,6 +259,7 @@ def test_output_event_union() -> None:
             "duration_ms": 0,
             "index": 1,
             "total": 1,
+            "input_hash": None,
         },
         {
             "type": "stage_state_changed",

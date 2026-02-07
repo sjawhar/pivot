@@ -13,7 +13,7 @@ from pivot.cli import completion
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
 from pivot.storage import cache, lock, track
-from pivot.types import HashInfo, OutputHash, is_dir_hash
+from pivot.types import HashInfo, is_dir_hash
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -32,13 +32,13 @@ class CheckoutBehavior(enum.StrEnum):
     FORCE = "force"  # Overwrite existing files (--force)
 
 
-def _get_stage_output_info(state_dir: pathlib.Path) -> dict[str, OutputHash]:
+def _get_stage_output_info(state_dir: pathlib.Path) -> dict[str, HashInfo]:
     """Get output hash info from lock files for cached stage outputs only.
 
     Non-cached outputs (e.g. Metric with cache=False) are excluded —
     they are git-tracked and not Pivot's responsibility to restore.
     """
-    result = dict[str, OutputHash]()
+    result = dict[str, HashInfo]()
 
     for stage_name in cli_helpers.list_stages():
         stage_info = cli_helpers.get_stage(stage_name)
@@ -108,7 +108,7 @@ def _restore_path_sync(
 
 
 async def _checkout_files_async(
-    files: Mapping[str, OutputHash],
+    files: Mapping[str, HashInfo],
     cache_dir: pathlib.Path,
     checkout_modes: list[cache.CheckoutMode],
     behavior: CheckoutBehavior,
@@ -149,9 +149,6 @@ async def _checkout_files_async(
     try:
         async with asyncio.TaskGroup() as tg:
             for abs_path_str, output_hash in files.items():
-                if output_hash is None:
-                    logger.debug(f"Skipping output with no cached hash: {abs_path_str}")
-                    continue
                 tg.create_task(restore_one(abs_path_str, output_hash))
     except* Exception as eg:
         # Convert unexpected exceptions to friendly error message
@@ -190,8 +187,8 @@ def _dedupe_targets(targets: tuple[str, ...]) -> list[str]:
 def _validate_and_build_files(
     targets: list[str],
     tracked_files: dict[str, track.PvtData],
-    stage_outputs: dict[str, OutputHash],
-) -> dict[str, OutputHash]:
+    stage_outputs: dict[str, HashInfo],
+) -> dict[str, HashInfo]:
     """Validate targets and build files dict for checkout.
 
     Targets should already have .pvt suffixes converted by _dedupe_targets().
@@ -199,7 +196,7 @@ def _validate_and_build_files(
     Raises:
         click.ClickException: For path traversal or unknown targets.
     """
-    files = dict[str, OutputHash]()
+    files = dict[str, HashInfo]()
 
     for target in targets:
         # Validate path doesn't escape project
@@ -233,7 +230,7 @@ def _validate_and_build_files(
 async def _checkout_main_async(
     targets: tuple[str, ...],
     tracked_files: dict[str, track.PvtData],
-    stage_outputs: dict[str, OutputHash],
+    stage_outputs: dict[str, HashInfo],
     cache_dir: pathlib.Path,
     checkout_modes: list[cache.CheckoutMode],
     behavior: CheckoutBehavior,
@@ -249,7 +246,7 @@ async def _checkout_main_async(
         return await _checkout_files_async(files, cache_dir, checkout_modes, behavior)
     else:
         # Checkout all tracked files and stage outputs
-        tracked_as_hashes: dict[str, OutputHash] = {
+        tracked_as_hashes: dict[str, HashInfo] = {
             path: track.pvt_to_hash_info(pvt) for path, pvt in tracked_files.items()
         }
         # Run both in parallel

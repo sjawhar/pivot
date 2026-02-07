@@ -59,6 +59,7 @@ async def test_console_sink_handles_stage_completed_ran() -> None:
         duration_ms=1500,
         index=0,
         total=1,
+        input_hash=None,
     )
     await sink.handle(event)
 
@@ -87,6 +88,7 @@ async def test_console_sink_handles_stage_completed_skipped() -> None:
         duration_ms=10,
         index=0,
         total=1,
+        input_hash=None,
     )
     await sink.handle(event)
 
@@ -115,6 +117,7 @@ async def test_console_sink_handles_stage_completed_failed() -> None:
         duration_ms=100,
         index=0,
         total=1,
+        input_hash=None,
     )
     await sink.handle(event)
 
@@ -145,6 +148,7 @@ async def test_console_sink_handles_multiline_reason() -> None:
         duration_ms=100,
         index=0,
         total=1,
+        input_hash=None,
     )
     await sink.handle(event)
 
@@ -196,6 +200,7 @@ async def test_result_collector_sink_collects_completed() -> None:
         duration_ms=1000,
         index=0,
         total=1,
+        input_hash=None,
     )
     await sink.handle(event)
 
@@ -242,6 +247,7 @@ async def test_result_collector_sink_concurrent_access() -> None:
             duration_ms=100.0,
             index=0,
             total=1,
+            input_hash=None,
         )
         for _ in range(50):
             await sink.handle(event)
@@ -278,6 +284,7 @@ async def test_result_collector_sink_prevents_lost_updates() -> None:
                 duration_ms=float(i),
                 index=0,
                 total=1,
+                input_hash=None,
             )
             await sink.handle(event)
 
@@ -321,6 +328,7 @@ async def test_console_sink_formats_duration_correctly() -> None:
         duration_ms=1500.0,
         index=0,
         total=1,
+        input_hash=None,
     )
     await sink.handle(event)
 
