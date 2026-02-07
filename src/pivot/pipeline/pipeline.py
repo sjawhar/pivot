@@ -240,20 +240,17 @@ class Pipeline:
         return self._root / ".pivot"
 
     def _resolve_path(self, annotation_path: str) -> str:
-        """Convert pipeline-relative path to project-relative.
+        """Convert annotation path to canonical absolute form.
 
-        Validation happens AFTER normalization to allow ../ traversal.
-        Paths that escape project root are rejected.
+        All artifact paths are stored as absolute, normalized paths in memory.
         Trailing slashes are preserved (important for DirectoryOut).
+        Lockfiles handle conversion to/from project-relative at their own boundary.
         """
-
         # Reject empty or whitespace-only paths early
-        # (before normalization would turn them into a directory)
         if not annotation_path or not annotation_path.strip():
             raise ValueError("Path cannot be empty or whitespace-only")
 
         # Reject root-only paths (e.g., "/", "\\", "C:\\", "C:/")
-        # These don't refer to a specific file and are almost certainly mistakes
         stripped = annotation_path.strip()
         if stripped in ("/", "\\") or (
             len(stripped) == 3
@@ -265,8 +262,8 @@ class Pipeline:
 
         project_root = project.get_project_root()
 
-        # Absolute paths: normalize but keep absolute
-        # Check for Unix absolute (/), UNC paths (\\), and Windows drive letters (C:\ or C:/)
+        # Determine base for resolution: absolute paths are used as-is (base unused),
+        # relative paths resolve from pipeline root
         is_absolute = (
             annotation_path.startswith("/")
             or annotation_path.startswith("\\")
@@ -277,23 +274,18 @@ class Pipeline:
                 and annotation_path[2] in ("/", "\\")
             )
         )
-        if is_absolute:
-            abs_path = project.normalize_path(annotation_path)
-            resolved = abs_path.as_posix()
-        else:
-            # Relative paths: resolve from pipeline root -> project-relative
-            abs_path = project.normalize_path(annotation_path, base=self.root)
-            # Check if path escapes project root (reject paths outside project)
+
+        base = project_root if is_absolute else self.root
+        resolved = path_utils.canonicalize_artifact_path(annotation_path, base)
+
+        # Check if path escapes project root (reject paths outside project)
+        if not is_absolute:
             try:
-                abs_path.relative_to(project_root)
+                pathlib.Path(resolved.rstrip("/")).relative_to(project_root)
             except ValueError as e:
                 raise ValueError(
-                    f"Path '{annotation_path}' resolves to '{abs_path}' which is outside project root '{project_root}'"
+                    f"Path '{annotation_path}' resolves to '{resolved}' which is outside project root '{project_root}'"
                 ) from e
-            resolved = project.to_relative_path(abs_path)
-
-        # Restore trailing slash for directory paths (DirectoryOut requires it)
-        resolved = path_utils.preserve_trailing_slash(annotation_path, resolved)
 
         # Validate the RESOLVED path (after ../ is collapsed)
         if error := path_policy.validate_path_syntax(resolved):
