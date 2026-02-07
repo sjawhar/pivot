@@ -9,7 +9,6 @@ import pytest
 
 from pivot import loaders, outputs, project
 from pivot.storage import cache
-from pivot_tui import diff_panels
 from pivot.types import (
     ChangeType,
     CodeChange,
@@ -21,6 +20,7 @@ from pivot.types import (
     StageExplanation,
     StageStatus,
 )
+from pivot_tui import diff_panels
 
 if TYPE_CHECKING:
     from pytest_mock import MockerFixture

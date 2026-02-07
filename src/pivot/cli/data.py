@@ -130,8 +130,7 @@ def diff(
             from pivot_tui import diff as data_tui
         except ImportError as err:
             raise click.UsageError(
-                "The TUI requires the 'pivot-tui' package. "
-                "Install it with: uv pip install pivot-tui"
+                "The TUI requires the 'pivot-tui' package. Install it with: pip install 'pivot[tui]' or: uv pip install pivot-tui"
             ) from err
 
         data_tui.run_diff_app(

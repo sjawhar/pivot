@@ -31,9 +31,10 @@ from pivot.types import (
     DataDiffResult,
     DataFileFormat,
     DepChange,
+    HashInfo,
+    LockData,
     MetricValue,
     OutputChange,
-    OutputHash,
     ParamChange,
     StageExplanation,
     StageStatus,
@@ -41,7 +42,6 @@ from pivot.types import (
 
 if TYPE_CHECKING:
     from pivot.registry import RegistryStageInfo
-    from pivot.types import LockData
     from pivot_tui.types import StageDataProvider
 
 logger = logging.getLogger(__name__)
@@ -152,7 +152,7 @@ def compute_output_changes(
             path_to_type[path] = "out"
 
     # Get old hashes from lock
-    old_hashes = dict[str, OutputHash]()
+    old_hashes = dict[str, HashInfo]()
     if lock_data and "output_hashes" in lock_data:
         old_hashes = lock_data["output_hashes"]
 
@@ -457,7 +457,7 @@ class InputDiffPanel(_SelectableExpandablePanel):
         state_dir = config.get_state_dir()
         try:
             fingerprint = self._stage_data_provider.ensure_fingerprint(stage_name)
-            self._explanation = explain.get_stage_explanation(
+            explanation = explain.get_stage_explanation(
                 stage_name=stage_name,
                 fingerprint=fingerprint,
                 deps=self._registry_info["deps_paths"],
@@ -471,10 +471,12 @@ class InputDiffPanel(_SelectableExpandablePanel):
             self._explanation = None
             return
 
+        self._explanation = explanation
+
         # Cache items as dicts for O(1) lookup
-        self._code_by_key = {c["key"]: c for c in self._explanation["code_changes"]}
-        self._dep_by_path = {c["path"]: c for c in self._explanation["dep_changes"]}
-        self._param_by_key = {c["key"]: c for c in self._explanation["param_changes"]}
+        self._code_by_key = {c["key"]: c for c in explanation["code_changes"]}
+        self._dep_by_path = {c["path"]: c for c in explanation["dep_changes"]}
+        self._param_by_key = {c["key"]: c for c in explanation["param_changes"]}
 
     @override
     def _build_items(self) -> list[str]:  # pragma: no cover

@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import pytest
 
+from pivot.types import StageStatus
 from pivot_tui.types import StageInfo
 from pivot_tui.widgets import status
-from pivot.types import StageStatus
 
 # =============================================================================
 # Status Symbol Tests (Consolidated)

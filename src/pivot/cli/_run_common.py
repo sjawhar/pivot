@@ -20,11 +20,11 @@ if TYPE_CHECKING:
     from collections.abc import Generator
 
     import networkx as nx
-    from pivot_tui.run import MessagePoster
 
     from pivot.engine.types import OutputEvent, StageCompleted
     from pivot.executor import ExecutionSummary
     from pivot.pipeline.pipeline import Pipeline
+    from pivot_tui.run import MessagePoster
 
 
 logger = logging.getLogger(__name__)

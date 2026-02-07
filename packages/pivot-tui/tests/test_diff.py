@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import pathlib
 
-from pivot_tui import diff as data_tui
 from pivot.types import ChangeType, DataDiffResult, RowChange, SchemaChange
+from pivot_tui import diff as data_tui
 
 # =============================================================================
 # DiffSummaryPanel Tests

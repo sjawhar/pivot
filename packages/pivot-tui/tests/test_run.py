@@ -10,6 +10,15 @@ import textual.binding
 import textual.widgets
 
 from pivot import loaders, outputs
+from pivot.types import (
+    StageStatus,
+    TuiLogMessage,
+    TuiMessageType,
+    TuiReloadMessage,
+    TuiStatusMessage,
+    TuiWatchMessage,
+    WatchStatus,
+)
 from pivot_tui import run as run_tui
 from pivot_tui.screens import ConfirmCommitScreen
 from pivot_tui.types import LogEntry, StageInfo
@@ -20,15 +29,6 @@ from pivot_tui.widgets import (
     TabbedDetailPanel,
 )
 from pivot_tui.widgets import status as tui_status
-from pivot.types import (
-    StageStatus,
-    TuiLogMessage,
-    TuiMessageType,
-    TuiReloadMessage,
-    TuiStatusMessage,
-    TuiWatchMessage,
-    WatchStatus,
-)
 
 if TYPE_CHECKING:
     from pytest_mock import MockerFixture

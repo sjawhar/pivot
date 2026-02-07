@@ -5,10 +5,10 @@ from __future__ import annotations
 import collections
 import time
 
+from pivot.types import StageStatus
 from pivot_tui import run as run_tui
 from pivot_tui.types import ExecutionHistoryEntry, LogEntry, PendingHistoryState, StageInfo
 from pivot_tui.widgets import TabbedDetailPanel
-from pivot.types import StageStatus
 
 # =============================================================================
 # ExecutionHistoryEntry Tests

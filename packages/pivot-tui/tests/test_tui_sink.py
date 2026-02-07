@@ -64,6 +64,7 @@ async def test_tui_sink_posts_stage_completed() -> None:
         "stage": "train",
         "index": 0,
         "total": 3,
+        "input_hash": "abc123",
         "status": StageStatus.RAN,
         "reason": "success",
         "duration_ms": 1500,

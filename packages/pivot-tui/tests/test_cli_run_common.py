@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
-
-import pytest
-from pytest_mock import MockerFixture
+from typing import TYPE_CHECKING
 
 from pivot.cli import _run_common
 from pivot.engine import engine
 from pivot_tui.sink import TuiSink
+
+if TYPE_CHECKING:
+    from pytest_mock import MockerFixture
 
 
 def test_configure_output_sink_tui_mode(mocker: MockerFixture) -> None:

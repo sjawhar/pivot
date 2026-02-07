@@ -78,12 +78,12 @@ Establish `pivot-tui` as a standalone uv workspace package that contains all Tex
 - Import boundary test enforcing zero Textual imports in core
 
 ### Definition of Done
-- [ ] `uv sync --all-packages --active` succeeds
-- [ ] `uv run ruff format . && uv run ruff check . && uv run basedpyright` — all clean
-- [ ] `uv run pytest tests/ -n auto` — all tests pass
-- [ ] `uv run --package pivot-tui pytest packages/pivot-tui/tests/ -n auto` — all TUI tests pass
-- [ ] Zero `import textual` or `from textual` in `src/pivot/` (enforced by script)
-- [ ] `pivot --help`, `pivot repro --help`, `pivot run --help` succeed without pivot-tui installed
+- [x] `uv sync --all-packages --active` succeeds
+- [x] `uv run ruff format . && uv run ruff check . && uv run basedpyright` — all clean
+- [x] `uv run pytest tests/ -n auto` — all tests pass
+- [x] `uv run --package pivot-tui pytest packages/pivot-tui/tests/ -n auto` — all TUI tests pass
+- [x] Zero `import textual` or `from textual` in `src/pivot/` (enforced by script)
+- [x] `pivot --help`, `pivot repro --help`, `pivot run --help` succeed without pivot-tui installed
 
 ### Must Have
 - One-way dependency: `pivot-tui → pivot`, never reverse
@@ -811,7 +811,7 @@ Parallel Speedup: ~35% faster than sequential
 
 ---
 
-- [ ] 7. Clean up old `pivot.tui` + update dependencies
+- [x] 7. Clean up old `pivot.tui` + update dependencies
 
   **What to do**:
   - **Remove the old `src/pivot/tui/` directory** entirely. After Tasks 1-6:
@@ -897,7 +897,7 @@ Parallel Speedup: ~35% faster than sequential
 
 ---
 
-- [ ] 8. Move TUI tests to `pivot-tui` package
+- [x] 8. Move TUI tests to `pivot-tui` package
 
   **What to do**:
   - Identify all TUI-specific test files:
@@ -985,7 +985,7 @@ Parallel Speedup: ~35% faster than sequential
 
 ---
 
-- [ ] 9. Tooling updates, import boundary enforcement, and full verification
+- [x] 9. Tooling updates, import boundary enforcement, and full verification
 
   **What to do**:
   - **Update basedpyright configuration**:
@@ -1179,9 +1179,9 @@ uv run python -c "import pivot; import pivot.cli; import pivot.engine; print('ok
 ```
 
 ### Final Checklist
-- [ ] All "Must Have" present (one-way dependency, Textual confined, CLI works without pivot-tui)
-- [ ] All "Must NOT Have" absent (no new abstractions, no RPC changes, no compat shims)
-- [ ] All tests pass (both packages)
-- [ ] Import boundary enforced (zero Textual in core)
-- [ ] `textual` removed from core dependencies
-- [ ] `pivot[tui]` optional extra available
+- [x] All "Must Have" present (one-way dependency, Textual confined, CLI works without pivot-tui)
+- [x] All "Must NOT Have" absent (no new abstractions, no RPC changes, no compat shims)
+- [x] All tests pass (both packages)
+- [x] Import boundary enforced (zero Textual in core)
+- [x] `textual` removed from core dependencies
+- [x] `pivot[tui]` optional extra available

@@ -6,7 +6,6 @@ import time
 from typing import TYPE_CHECKING
 
 import anyio
-import anyio.to_thread
 
 from pivot.types import (
     StageStatus,
@@ -105,10 +104,9 @@ class TuiSink:
         """Signal TUI that sink is closing.
 
         Uses a brief timeout to avoid blocking the event loop if TUI is unresponsive.
-        Textual's post_message is thread-safe but we run it via to_thread.run_sync
-        with a timeout to ensure the engine can shut down cleanly.
+        Textual's post_message is thread-safe, so we can call it directly.
         """
         from pivot_tui.run import TuiShutdown
 
         with anyio.move_on_after(1.0):  # 1 second timeout
-            await anyio.to_thread.run_sync(lambda: self._app.post_message(TuiShutdown()))
+            self._app.post_message(TuiShutdown())

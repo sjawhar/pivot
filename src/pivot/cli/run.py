@@ -85,7 +85,7 @@ def _run_with_tui(
         from pivot_tui import run as tui_run
     except ImportError as err:
         raise click.UsageError(
-            "The TUI requires the 'pivot-tui' package. Install it with: uv pip install pivot-tui"
+            "The TUI requires the 'pivot-tui' package. Install it with: pip install 'pivot[tui]' or: uv pip install pivot-tui"
         ) from err
 
     # Pre-warm loky executor before starting Textual TUI.
