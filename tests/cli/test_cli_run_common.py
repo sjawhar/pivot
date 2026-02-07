@@ -271,7 +271,7 @@ def test_validate_tui_log_returns_none_for_none() -> None:
 def test_validate_tui_log_raises_for_json(tmp_path: pathlib.Path) -> None:
     """validate_tui_log raises when used with --json."""
     tui_log = tmp_path / "test.jsonl"
-    with pytest.raises(click.ClickException, match="cannot be used with --json"):
+    with pytest.raises(click.ClickException, match="cannot be used with --jsonl"):
         _run_common.validate_tui_log(tui_log, as_json=True, tui_flag=True)
 
 
@@ -338,9 +338,9 @@ def test_validate_show_output_raises_for_tui() -> None:
 
 
 def test_validate_show_output_raises_for_json() -> None:
-    """validate_show_output raises when used with --json."""
+    """validate_show_output raises when used with --jsonl."""
     with pytest.raises(
-        click.ClickException, match="--show-output and --json are mutually exclusive"
+        click.ClickException, match="--show-output and --jsonl are mutually exclusive"
     ):
         _run_common.validate_show_output(
             show_output=True, tui_flag=False, as_json=True, quiet=False
@@ -593,3 +593,67 @@ def test_convert_results_empty_dict() -> None:
     """convert_results handles empty stage results."""
     summaries = _run_common.convert_results({})
     assert summaries == {}
+
+
+# =============================================================================
+# validate_display_mode Tests
+# =============================================================================
+
+
+def test_validate_display_mode_raises_for_tui_and_json() -> None:
+    """validate_display_mode raises when --tui and --jsonl both set."""
+    with pytest.raises(click.ClickException, match="--tui and --jsonl are mutually exclusive"):
+        _run_common.validate_display_mode(tui_flag=True, as_json=True)
+
+
+def test_validate_display_mode_accepts_tui_only() -> None:
+    """validate_display_mode accepts --tui alone."""
+    _run_common.validate_display_mode(tui_flag=True, as_json=False)
+    # Should not raise
+
+
+def test_validate_display_mode_accepts_json_only() -> None:
+    """validate_display_mode accepts --jsonl alone."""
+    _run_common.validate_display_mode(tui_flag=False, as_json=True)
+    # Should not raise
+
+
+def test_validate_display_mode_accepts_neither() -> None:
+    """validate_display_mode accepts neither flag."""
+    _run_common.validate_display_mode(tui_flag=False, as_json=False)
+    # Should not raise
+
+
+# =============================================================================
+# resolve_on_error Tests
+# =============================================================================
+
+
+def test_resolve_on_error_default_is_fail() -> None:
+    """resolve_on_error returns FAIL when neither flag is set."""
+    from pivot.types import OnError
+
+    result = _run_common.resolve_on_error(fail_fast=False, keep_going=False)
+    assert result == OnError.FAIL
+
+
+def test_resolve_on_error_fail_fast_returns_fail() -> None:
+    """resolve_on_error returns FAIL when --fail-fast is set."""
+    from pivot.types import OnError
+
+    result = _run_common.resolve_on_error(fail_fast=True, keep_going=False)
+    assert result == OnError.FAIL
+
+
+def test_resolve_on_error_keep_going_returns_keep_going() -> None:
+    """resolve_on_error returns KEEP_GOING when --keep-going is set."""
+    from pivot.types import OnError
+
+    result = _run_common.resolve_on_error(fail_fast=False, keep_going=True)
+    assert result == OnError.KEEP_GOING
+
+
+def test_resolve_on_error_both_flags_raises() -> None:
+    """resolve_on_error raises when both flags are set."""
+    with pytest.raises(click.ClickException, match="mutually exclusive"):
+        _run_common.resolve_on_error(fail_fast=True, keep_going=True)

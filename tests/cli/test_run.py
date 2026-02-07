@@ -169,23 +169,21 @@ def test_run_unknown_stage_errors(
     assert "nonexistent_stage" in result.output
 
 
-def test_run_default_keeps_going_continues_after_failure(
+def test_run_default_fails_fast(
     mock_discovery: Pipeline,
     runner: click.testing.CliRunner,
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """run defaults to keep-going mode - continues to next stage after failure."""
+    """run defaults to fail-fast mode - stops on first failure."""
     register_test_stage(_helper_failing_stage, name="failing")
     register_test_stage(_helper_stage_a, name="stage_a")
 
-    # Run failing then stage_a - default keep-going should continue to stage_a
+    # Run failing then stage_a - default fail-fast should stop
     result = runner.invoke(cli.cli, ["run", "failing", "stage_a"])
 
-    # Keep-going mode returns 0 on completion; stage_a should have run
     assert result.exit_code == 0
     assert "failing: FAILED" in result.output
-    assert (tmp_path / "a.txt").exists(), "stage_a should run despite failing stage"
 
 
 def test_run_fail_fast_option_accepted(
@@ -245,7 +243,7 @@ def test_run_tui_log_cannot_use_with_json(
 
     assert result.exit_code != 0
     assert "--tui-log" in result.output
-    assert "--json" in result.output
+    assert "--jsonl" in result.output
 
 
 def test_run_tui_and_json_mutually_exclusive(
@@ -335,6 +333,40 @@ def test_run_json_flag_accepted(
     assert result.exit_code == 0
     # JSONL output should start with schema version
     assert '"type": "schema_version"' in result.output
+
+
+def test_run_jsonl_flag_accepted(
+    mock_discovery: Pipeline,
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--jsonl flag works and streams JSONL output."""
+    register_test_stage(_helper_stage_a, name="stage_a")
+
+    result = runner.invoke(cli.cli, ["run", "--jsonl", "stage_a"])
+
+    assert result.exit_code == 0
+    lines = [ln for ln in result.output.strip().split("\n") if ln]
+    assert len(lines) > 0
+    for line in lines:
+        json.loads(line)  # Should not raise
+
+
+def test_run_help_shows_jsonl(
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+) -> None:
+    """run help shows --jsonl flag with JSONL description."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".pivot").mkdir()
+        pathlib.Path(".git").mkdir()
+
+        result = runner.invoke(cli.cli, ["run", "--help"])
+
+    assert result.exit_code == 0
+    assert "--jsonl" in result.output
+    assert "JSONL" in result.output
 
 
 def test_run_uses_plain_mode_by_default(
@@ -442,21 +474,6 @@ def test_run_does_not_have_watch_option(
     assert "No such option" in result.output or "no such option" in result.output.lower()
 
 
-def test_run_does_not_have_keep_going_option(
-    mock_discovery: Pipeline,
-    runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """run does not have --keep-going option (use --fail-fast instead)."""
-    register_test_stage(_helper_stage_a, name="stage_a")
-
-    result = runner.invoke(cli.cli, ["run", "--keep-going", "stage_a"])
-
-    assert result.exit_code != 0
-    assert "No such option" in result.output or "no such option" in result.output.lower()
-
-
 def test_run_does_not_have_allow_missing_option(
     mock_discovery: Pipeline,
     runner: click.testing.CliRunner,
@@ -523,7 +540,7 @@ def test_run_show_output_mutually_exclusive_with_json(
     result = runner.invoke(cli.cli, ["run", "stage_a", "--show-output", "--json"])
 
     assert result.exit_code != 0
-    assert "--show-output and --json are mutually exclusive" in result.output
+    assert "--show-output and --jsonl are mutually exclusive" in result.output
 
 
 def test_run_show_output_mutually_exclusive_with_quiet(

@@ -1,7 +1,7 @@
 """Tests for keep-going / fail-fast behavior in CLI commands.
 
-run: Uses --fail-fast (default is keep-going)
-repro: Uses --keep-going (default is fail)
+Both run and repro default to fail-fast.
+Use --keep-going / -k to continue after failures.
 """
 
 from __future__ import annotations
@@ -285,25 +285,23 @@ def test_run_fail_fast_flag_shown_in_help(runner: CliRunner) -> None:
     assert "--fail-fast" in result.output
 
 
-def test_run_default_keeps_going(
+def test_run_default_fails_fast(
     mock_discovery: Pipeline,
     runner: CliRunner,
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """run defaults to keep-going mode (continues after failures)."""
+    """run defaults to fail-fast mode (stops on first failure)."""
     (tmp_path / "input.txt").write_text("data")
 
     register_test_stage(_stage_failing, name="failing")
     register_test_stage(_stage_succeeding, name="succeeding")
 
-    # Run both stages - default should be keep-going
+    # Run both stages - default should be fail-fast
     result = runner.invoke(cli.cli, ["run", "failing", "succeeding"])
 
     assert result.exit_code == 0
     assert "failing: FAILED" in result.output
-    assert "succeeding: done" in result.output
-    assert (tmp_path / "succeeding.txt").read_text() == "success"
 
 
 def test_run_fail_fast_stops_early(
@@ -331,3 +329,112 @@ def test_run_fail_fast_stops_early(
 
     assert result.exit_code == 0
     assert "failing: FAILED" in result.output
+
+
+def test_run_keep_going_continues_after_failure(
+    mock_discovery: Pipeline,
+    runner: CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """run --keep-going continues after failures."""
+    (tmp_path / "input.txt").write_text("data")
+
+    register_test_stage(_stage_failing, name="failing")
+    register_test_stage(_stage_succeeding, name="succeeding")
+
+    result = runner.invoke(cli.cli, ["run", "--keep-going", "failing", "succeeding"])
+
+    assert result.exit_code == 0
+    assert "failing: FAILED" in result.output
+    assert "succeeding: done" in result.output
+    assert (tmp_path / "succeeding.txt").read_text() == "success"
+
+
+def test_run_keep_going_short_flag(
+    mock_discovery: Pipeline,
+    runner: CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """run -k short flag works the same as --keep-going."""
+    (tmp_path / "input.txt").write_text("data")
+
+    register_test_stage(_stage_failing, name="failing")
+    register_test_stage(_stage_succeeding, name="succeeding")
+
+    result = runner.invoke(cli.cli, ["run", "-k", "failing", "succeeding"])
+
+    assert result.exit_code == 0
+    assert "failing: FAILED" in result.output
+    assert "succeeding: done" in result.output
+
+
+def test_run_keep_going_flag_shown_in_help(runner: CliRunner) -> None:
+    """run --keep-going flag is documented in help."""
+    result = runner.invoke(cli.cli, ["run", "--help"])
+
+    assert result.exit_code == 0
+    assert "--keep-going" in result.output
+    assert "-k" in result.output
+
+
+def test_repro_fail_fast_flag_shown_in_help(runner: CliRunner) -> None:
+    """repro --fail-fast flag is documented in help."""
+    result = runner.invoke(cli.cli, ["repro", "--help"])
+
+    assert result.exit_code == 0
+    assert "--fail-fast" in result.output
+
+
+def test_repro_fail_fast_stops_on_failure(
+    mock_discovery: Pipeline,
+    runner: CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """repro --fail-fast stops pipeline on first failure (same as default)."""
+    (tmp_path / "input.txt").write_text("data")
+
+    # Use dependent stages: failing runs first, downstream depends on its output
+    register_test_stage(_stage_failing, name="failing")
+    register_test_stage(_stage_downstream, name="downstream")
+
+    result = runner.invoke(cli.cli, ["repro", "--fail-fast"])
+
+    assert result.exit_code == 0
+    assert "failing: FAILED" in result.output
+    assert "downstream: skipped" in result.output
+    assert not (tmp_path / "downstream.txt").exists()
+
+
+def test_run_fail_fast_and_keep_going_mutually_exclusive(
+    mock_discovery: Pipeline,
+    runner: CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """run --fail-fast and --keep-going are mutually exclusive."""
+    register_test_stage(_stage_process, name="process")
+    (tmp_path / "input.txt").write_text("data")
+
+    result = runner.invoke(cli.cli, ["run", "--fail-fast", "--keep-going", "process"])
+
+    assert result.exit_code != 0
+    assert "mutually exclusive" in result.output.lower()
+
+
+def test_repro_fail_fast_and_keep_going_mutually_exclusive(
+    mock_discovery: Pipeline,
+    runner: CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """repro --fail-fast and --keep-going are mutually exclusive."""
+    register_test_stage(_stage_process, name="process")
+    (tmp_path / "input.txt").write_text("data")
+
+    result = runner.invoke(cli.cli, ["repro", "--fail-fast", "--keep-going"])
+
+    assert result.exit_code != 0
+    assert "mutually exclusive" in result.output.lower()
