@@ -1,14 +1,12 @@
-"""Tests for execution modes: --no-commit, --no-cache, and commit command."""
+"""Tests for execution modes: --no-commit and run cache."""
 
 from __future__ import annotations
 
-import datetime
 import json
 import shutil
 from typing import TYPE_CHECKING, Any
 
-from pivot import loaders, outputs, project, run_history
-from pivot.executor import commit as commit_mod
+from pivot import loaders, outputs
 from pivot.executor import worker
 from pivot.storage import cache, lock, state
 from pivot.types import StageStatus
@@ -17,8 +15,6 @@ if TYPE_CHECKING:
     import multiprocessing as mp
     import pathlib
     from collections.abc import Callable
-
-    import pytest
 
     from pivot.types import OutputMessage
 
@@ -32,7 +28,6 @@ def _make_stage_info(
     fingerprint: dict[str, str] | None = None,
     run_id: str = "test_run",
     no_commit: bool = False,
-    no_cache: bool = False,
     force: bool = False,
 ) -> worker.WorkerStageInfo:
     """Create a WorkerStageInfo for testing."""
@@ -53,7 +48,6 @@ def _make_stage_info(
         run_id=run_id,
         force=force,
         no_commit=no_commit,
-        no_cache=no_cache,
         dep_specs={},
         out_specs={},
         params_arg_name=None,
@@ -67,10 +61,10 @@ def _make_stage_info(
 # -----------------------------------------------------------------------------
 
 
-def test_no_commit_writes_to_pending_lock(
+def test_no_commit_produces_outputs_without_production_lock(
     worker_env: pathlib.Path, tmp_path: pathlib.Path, output_queue: mp.Queue[OutputMessage]
 ) -> None:
-    """When no_commit=True, lock is written to pending directory, not production."""
+    """When no_commit=True, outputs exist on disk but no production lock is written."""
     (tmp_path / "input.txt").write_text("input data")
 
     def stage_func() -> None:
@@ -88,21 +82,21 @@ def test_no_commit_writes_to_pending_lock(
 
     assert result["status"] == StageStatus.RAN
 
-    # Pending lock should exist
-    pending_lock = lock.get_pending_lock("test_stage", tmp_path)
-    assert pending_lock.path.exists(), "Pending lock should be written"
-    pending_data = pending_lock.read()
-    assert pending_data is not None
+    # Output should exist on disk
+    assert (tmp_path / "output.txt").exists(), "Output should exist"
 
     # Production lock should NOT exist
     production_lock = lock.StageLock("test_stage", lock.get_stages_dir(tmp_path / ".pivot"))
     assert not production_lock.path.exists(), "Production lock should NOT be written"
 
+    # No deferred writes should be returned (no lock/cache writes to apply)
+    assert "deferred_writes" not in result, "No deferred writes in no_commit mode"
 
-def test_no_commit_still_writes_to_cache(
+
+def test_no_commit_does_not_write_to_cache(
     worker_env: pathlib.Path, tmp_path: pathlib.Path, output_queue: mp.Queue[OutputMessage]
 ) -> None:
-    """When no_commit=True, outputs are still written to cache (content-addressed)."""
+    """When no_commit=True, outputs are hashed but NOT written to cache."""
     (tmp_path / "input.txt").write_text("input data")
 
     def stage_func() -> None:
@@ -120,423 +114,65 @@ def test_no_commit_still_writes_to_cache(
 
     assert result["status"] == StageStatus.RAN
 
-    # Check that cache files exist
-    cache_files = list((worker_env / "files").rglob("*"))
-    # Should have at least the hash directory and file
-    cache_files_not_dirs = [f for f in cache_files if f.is_file()]
-    assert len(cache_files_not_dirs) > 0, "Cache should have files"
-
-
-def test_second_no_commit_run_uses_pending_lock_for_skip(
-    worker_env: pathlib.Path, tmp_path: pathlib.Path, output_queue: mp.Queue[OutputMessage]
-) -> None:
-    """Second --no-commit run should skip if inputs unchanged (uses pending lock)."""
-    (tmp_path / "input.txt").write_text("input data")
-
-    def stage_func() -> None:
-        (tmp_path / "output.txt").write_text("output data")
-
-    stage_info = _make_stage_info(
-        stage_func,
-        tmp_path,
-        deps=[str(tmp_path / "input.txt")],
-        outs=[outputs.Out("output.txt", loader=loaders.PathOnly())],
-        no_commit=True,
+    # input_hash should still be computed (needed for future run-cache lookups)
+    assert result["input_hash"] is not None, "input_hash should be computed even in no_commit mode"
+    assert isinstance(result["input_hash"], str) and len(result["input_hash"]) > 0, (
+        "input_hash should be a non-empty string for run-cache lookups"
     )
 
-    # First run
-    result1 = worker.execute_stage("test_stage", stage_info, worker_env, output_queue)
-    assert result1["status"] == StageStatus.RAN
-
-    # Second run should skip (using pending lock for comparison)
-    result2 = worker.execute_stage("test_stage", stage_info, worker_env, output_queue)
-    assert result2["status"] == StageStatus.SKIPPED
+    # Cache should NOT have any files (no_commit skips cache writes)
+    files_dir = worker_env / "files"
+    if files_dir.exists():
+        cache_files = [f for f in files_dir.rglob("*") if f.is_file()]
+        assert len(cache_files) == 0, "Cache should have no files in no_commit mode"
 
 
-# -----------------------------------------------------------------------------
-# Commit tests
-# -----------------------------------------------------------------------------
-
-
-def test_list_pending_stages_empty(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """list_pending_stages returns empty list when no pending locks."""
-    (tmp_path / ".pivot" / "pending" / "stages").mkdir(parents=True)
-    monkeypatch.setattr(project, "_project_root_cache", tmp_path)
-
-    result = lock.list_pending_stages(tmp_path)
-    assert result == []
-
-
-def test_list_pending_stages_returns_stage_names(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """list_pending_stages returns stage names from pending lock files."""
-    pending_stages_dir = tmp_path / ".pivot" / "pending" / "stages"
-    pending_stages_dir.mkdir(parents=True)
-    (pending_stages_dir / "stage_a.lock").write_text("code_manifest: {}\n")
-    (pending_stages_dir / "stage_b.lock").write_text("code_manifest: {}\n")
-    monkeypatch.setattr(project, "_project_root_cache", tmp_path)
-
-    result = lock.list_pending_stages(tmp_path)
-    assert result == ["stage_a", "stage_b"]
-
-
-def test_commit_pending_promotes_to_production(
+def test_normal_run_after_no_commit_reruns_and_commits(
     worker_env: pathlib.Path, tmp_path: pathlib.Path, output_queue: mp.Queue[OutputMessage]
 ) -> None:
-    """commit_pending promotes pending locks to production."""
+    """A normal run after --no-commit re-runs and writes lock + cache."""
     (tmp_path / "input.txt").write_text("input data")
-
-    def stage_func() -> None:
-        (tmp_path / "output.txt").write_text("output data")
-
-    stage_info = _make_stage_info(
-        stage_func,
-        tmp_path,
-        deps=[str(tmp_path / "input.txt")],
-        outs=[outputs.Out("output.txt", loader=loaders.PathOnly())],
-        no_commit=True,
-    )
-
-    # Run with no_commit
-    result = worker.execute_stage("test_stage", stage_info, worker_env, output_queue)
-    assert result["status"] == StageStatus.RAN
-
-    # Pending lock exists, production doesn't
-    pending_lock = lock.get_pending_lock("test_stage", tmp_path)
-    production_lock = lock.StageLock("test_stage", lock.get_stages_dir(tmp_path / ".pivot"))
-    assert pending_lock.path.exists()
-    assert not production_lock.path.exists()
-
-    # Commit
-    committed = commit_mod.commit_pending()
-
-    assert committed == ["test_stage"]
-
-    # Now production lock exists, pending doesn't
-    assert production_lock.path.exists()
-    assert not pending_lock.path.exists()
-
-
-def test_discard_pending_removes_pending_locks(
-    worker_env: pathlib.Path, tmp_path: pathlib.Path, output_queue: mp.Queue[OutputMessage]
-) -> None:
-    """discard_pending removes pending locks without committing."""
-    (tmp_path / "input.txt").write_text("input data")
-
-    def stage_func() -> None:
-        (tmp_path / "output.txt").write_text("output data")
-
-    stage_info = _make_stage_info(
-        stage_func,
-        tmp_path,
-        deps=[str(tmp_path / "input.txt")],
-        outs=[outputs.Out("output.txt", loader=loaders.PathOnly())],
-        no_commit=True,
-    )
-
-    # Run with no_commit
-    result = worker.execute_stage("test_stage", stage_info, worker_env, output_queue)
-    assert result["status"] == StageStatus.RAN
-
-    # Pending lock exists
-    pending_lock = lock.get_pending_lock("test_stage", tmp_path)
-    assert pending_lock.path.exists()
-
-    # Discard
-    discarded = commit_mod.discard_pending()
-
-    assert discarded == ["test_stage"]
-    assert not pending_lock.path.exists()
-
-    # Production lock should NOT exist (we discarded, didn't commit)
-    production_lock = lock.StageLock("test_stage", lock.get_stages_dir(tmp_path / ".pivot"))
-    assert not production_lock.path.exists()
-
-
-def test_commit_nothing_to_commit(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """commit_pending returns empty list when nothing to commit."""
-    (tmp_path / ".pivot" / "pending" / "stages").mkdir(parents=True)
-    (tmp_path / ".pivot" / "cache" / "stages").mkdir(parents=True)
-    monkeypatch.setattr(project, "_project_root_cache", tmp_path)
-
-    committed = commit_mod.commit_pending()
-    assert committed == []
-
-
-# -----------------------------------------------------------------------------
-# Commit correctness tests
-# -----------------------------------------------------------------------------
-
-
-def test_commit_records_generation_at_execution_time(
-    worker_env: pathlib.Path, tmp_path: pathlib.Path, output_queue: mp.Queue[OutputMessage]
-) -> None:
-    """commit_pending records generation from execution time, not commit time.
-
-    When a dependency's generation changes between --no-commit run and commit,
-    commit must record the generation from when the stage actually executed
-    (stored in pending lock's dep_generations field).
-    """
-    (tmp_path / "input.txt").write_text("input data v1")
-    state_db_path = tmp_path / ".pivot" / "state.db"
-
-    # Set initial generation for input.txt to 5
-    with state.StateDB(state_db_path) as db:
-        input_path = tmp_path / "input.txt"
-        for _ in range(5):  # Increment to gen 5
-            db.increment_generation(input_path)
-        initial_gen = db.get_generation(input_path)
-        assert initial_gen == 5, "Setup: input should be at generation 5"
-
-    def stage_func() -> None:
-        (tmp_path / "output.txt").write_text("output data")
-
-    stage_info = _make_stage_info(
-        stage_func,
-        tmp_path,
-        deps=[str(tmp_path / "input.txt")],
-        outs=[outputs.Out("output.txt", loader=loaders.PathOnly())],
-        no_commit=True,
-    )
-
-    # Run stage with --no-commit while dep is at generation 5
-    result = worker.execute_stage("test_stage", stage_info, worker_env, output_queue)
-    assert result["status"] == StageStatus.RAN
-
-    # Simulate another stage modifying the dep (increment generation to 6)
-    with state.StateDB(state_db_path) as db:
-        db.increment_generation(tmp_path / "input.txt")
-        new_gen = db.get_generation(tmp_path / "input.txt")
-        assert new_gen == 6, "After increment: input should be at generation 6"
-
-    # Now commit
-    committed = commit_mod.commit_pending()
-    assert committed == ["test_stage"]
-
-    # Check what generation was recorded for the dependency
-    with state.StateDB(state_db_path) as db:
-        recorded_gens = db.get_dep_generations("test_stage")
-        assert recorded_gens is not None, "Should have recorded dep generations"
-
-        # Get the normalized path key
-        normalized_input = str(project.normalize_path(str(tmp_path / "input.txt")))
-        recorded_gen = recorded_gens.get(normalized_input)
-
-        # Should record generation 5 (execution time), not 6 (commit time)
-        assert recorded_gen == 5, "Should record generation from execution time"
-
-
-def test_committed_run_cache_entries_survive_pruning(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Run cache entries with sentinel run_id survive prune_runs().
-
-    The commit command writes run cache entries with run_id='__committed__',
-    a sentinel value that starts with '__' and is never pruned by prune_runs().
-    """
-    (tmp_path / ".pivot" / "pending" / "stages").mkdir(parents=True)
-    (tmp_path / ".pivot" / "cache" / "stages").mkdir(parents=True)
-    monkeypatch.setattr(project, "_project_root_cache", tmp_path)
-    state_db_path = tmp_path / ".pivot" / "state.db"
-
-    with state.StateDB(state_db_path) as db:
-        # Write a run cache entry with the sentinel run_id (what commit_pending uses)
-        commit_entry = run_history.RunCacheEntry(
-            run_id=commit_mod.COMMITTED_RUN_ID,
-            output_hashes=[run_history.OutputHashEntry(path="output.txt", hash="abc123")],
-        )
-        db.write_run_cache("test_stage", "input_hash_123", commit_entry)
-
-        # Verify the entry exists
-        found = db.lookup_run_cache("test_stage", "input_hash_123")
-        assert found is not None, "Setup: commit entry should exist"
-        assert found["run_id"] == commit_mod.COMMITTED_RUN_ID
-
-        # Create some actual run history entries
-        for i in range(5):
-            timestamp = datetime.datetime.now(datetime.UTC).isoformat()
-            stage_record = run_history.StageRunRecord(
-                input_hash=f"hash_{i}",
-                status=StageStatus.RAN,
-                reason="changed",
-                duration_ms=100,
-            )
-            run_manifest = run_history.RunManifest(
-                run_id=f"run_{i}",
-                started_at=timestamp,
-                ended_at=timestamp,
-                targeted_stages=["stage_a"],
-                execution_order=["stage_a"],
-                stages={"stage_a": stage_record},
-            )
-            db.write_run(run_manifest)
-
-        # Now prune with retention=3 (keeps 3 most recent runs)
-        deleted = db.prune_runs(retention=3)
-        assert deleted == 2, "Should delete 2 oldest runs"
-
-        # Sentinel run_id entries should survive pruning
-        found_after_prune = db.lookup_run_cache("test_stage", "input_hash_123")
-        assert found_after_prune is not None, "Committed entry should survive pruning"
-        assert found_after_prune["run_id"] == commit_mod.COMMITTED_RUN_ID
-
-
-# -----------------------------------------------------------------------------
-# No-cache mode tests
-# -----------------------------------------------------------------------------
-
-
-def test_no_cache_skips_cache_operations(
-    worker_env: pathlib.Path, tmp_path: pathlib.Path, output_queue: mp.Queue[OutputMessage]
-) -> None:
-    """When no_cache=True, outputs are not saved to cache."""
-    (tmp_path / "input.txt").write_text("input data")
-
-    def stage_func() -> None:
-        (tmp_path / "output.txt").write_text("output data")
-
-    stage_info = _make_stage_info(
-        stage_func,
-        tmp_path,
-        deps=[str(tmp_path / "input.txt")],
-        outs=[outputs.Out("output.txt", loader=loaders.PathOnly())],
-        no_cache=True,
-    )
-
-    result = worker.execute_stage("test_stage", stage_info, worker_env, output_queue)
-
-    assert result["status"] == StageStatus.RAN
-
-    # Output file should exist
-    assert (tmp_path / "output.txt").exists()
-
-    # Cache should NOT have the output file
-    cache_files = list((worker_env / "files").rglob("*"))
-    cache_files_not_dirs = [f for f in cache_files if f.is_file()]
-    assert len(cache_files_not_dirs) == 0, "Cache should be empty when no_cache=True"
-
-
-def test_no_cache_writes_lock_with_null_hashes(
-    worker_env: pathlib.Path, tmp_path: pathlib.Path, output_queue: mp.Queue[OutputMessage]
-) -> None:
-    """When no_cache=True, lock file is written but with null output hashes."""
-    (tmp_path / "input.txt").write_text("input data")
-
-    def stage_func() -> None:
-        (tmp_path / "output.txt").write_text("output data")
-
-    stage_info = _make_stage_info(
-        stage_func,
-        tmp_path,
-        deps=[str(tmp_path / "input.txt")],
-        outs=[outputs.Out("output.txt", loader=loaders.PathOnly())],
-        no_cache=True,
-    )
-
-    result = worker.execute_stage("test_stage", stage_info, worker_env, output_queue)
-
-    assert result["status"] == StageStatus.RAN
-
-    # Production lock should exist with null hashes
-    production_lock = lock.StageLock("test_stage", lock.get_stages_dir(tmp_path / ".pivot"))
-    assert production_lock.path.exists(), "Production lock should be written"
-    lock_data = production_lock.read()
-    assert lock_data is not None
-    # Output hash should be None since we didn't cache (uses normalized absolute path as key)
-    output_path = str(project.normalize_path("output.txt"))
-    assert output_path in lock_data["output_hashes"], f"Expected {output_path} in output_hashes"
-    assert lock_data["output_hashes"][output_path] is None
-
-
-def test_no_cache_second_run_still_skips(
-    worker_env: pathlib.Path, tmp_path: pathlib.Path, output_queue: mp.Queue[OutputMessage]
-) -> None:
-    """Second --no-cache run should skip if inputs unchanged (lock files work)."""
-    (tmp_path / "input.txt").write_text("input data")
-
     execution_count = [0]
 
     def stage_func() -> None:
         execution_count[0] += 1
-        (tmp_path / "output.txt").write_text(f"output data {execution_count[0]}")
+        (tmp_path / "output.txt").write_text("output data")
 
-    stage_info = _make_stage_info(
+    # First run with no_commit
+    stage_info_nc = _make_stage_info(
         stage_func,
         tmp_path,
         deps=[str(tmp_path / "input.txt")],
         outs=[outputs.Out("output.txt", loader=loaders.PathOnly())],
-        no_cache=True,
+        no_commit=True,
     )
-
-    # First run
-    result1 = worker.execute_stage("test_stage", stage_info, worker_env, output_queue)
+    result1 = worker.execute_stage("test_stage", stage_info_nc, worker_env, output_queue)
     assert result1["status"] == StageStatus.RAN
     assert execution_count[0] == 1
 
-    # Second run should skip (lock file comparison still works)
-    result2 = worker.execute_stage("test_stage", stage_info, worker_env, output_queue)
-    assert result2["status"] == StageStatus.SKIPPED
-    assert execution_count[0] == 1  # Should not have executed again
+    # No lock exists after no_commit
+    production_lock = lock.StageLock("test_stage", lock.get_stages_dir(tmp_path / ".pivot"))
+    assert not production_lock.path.exists(), "Lock should NOT exist after no_commit"
 
-
-def test_no_cache_incompatible_with_incremental_out(
-    worker_env: pathlib.Path, tmp_path: pathlib.Path, output_queue: mp.Queue[OutputMessage]
-) -> None:
-    """When no_cache=True with IncrementalOut, stage should fail."""
-    (tmp_path / "input.txt").write_text("input data")
-
-    def stage_func() -> None:
-        (tmp_path / "output.txt").write_text("output data")
-
-    stage_info = _make_stage_info(
-        stage_func,
-        tmp_path,
-        deps=[str(tmp_path / "input.txt")],
-        outs=[outputs.IncrementalOut("output.txt", loader=loaders.PathOnly())],
-        no_cache=True,
-    )
-
-    result = worker.execute_stage("test_stage", stage_info, worker_env, output_queue)
-
-    assert result["status"] == StageStatus.FAILED
-    assert "IncrementalOut" in result["reason"]
-
-
-def test_no_cache_with_no_commit(
-    worker_env: pathlib.Path, tmp_path: pathlib.Path, output_queue: mp.Queue[OutputMessage]
-) -> None:
-    """Both --no-cache and --no-commit can be used together."""
-    (tmp_path / "input.txt").write_text("input data")
-
-    def stage_func() -> None:
-        (tmp_path / "output.txt").write_text("output data")
-
-    stage_info = _make_stage_info(
+    # Second run with commit (no_commit=False)
+    stage_info_commit = _make_stage_info(
         stage_func,
         tmp_path,
         deps=[str(tmp_path / "input.txt")],
         outs=[outputs.Out("output.txt", loader=loaders.PathOnly())],
-        no_cache=True,
-        no_commit=True,
+        no_commit=False,
     )
+    result2 = worker.execute_stage("test_stage", stage_info_commit, worker_env, output_queue)
+    assert result2["status"] == StageStatus.RAN, "Should re-run since no lock exists"
+    assert execution_count[0] == 2, "Stage should execute again"
 
-    result = worker.execute_stage("test_stage", stage_info, worker_env, output_queue)
+    # Lock should now exist
+    assert production_lock.path.exists(), "Lock should exist after normal run"
 
-    assert result["status"] == StageStatus.RAN
-
-    # Pending lock should exist (because no_commit=True)
-    pending_lock = lock.get_pending_lock("test_stage", tmp_path)
-    assert pending_lock.path.exists(), "Pending lock should be written"
-
-    # Production lock should NOT exist
-    production_lock = lock.StageLock("test_stage", lock.get_stages_dir(tmp_path / ".pivot"))
-    assert not production_lock.path.exists(), "Production lock should NOT be written"
-
-    # Cache should be empty (because no_cache=True)
-    cache_files = list((worker_env / "files").rglob("*"))
-    cache_files_not_dirs = [f for f in cache_files if f.is_file()]
-    assert len(cache_files_not_dirs) == 0, "Cache should be empty"
+    # Cache should have files
+    files_dir = worker_env / "files"
+    cache_files = [f for f in files_dir.rglob("*") if f.is_file()]
+    assert len(cache_files) > 0, "Cache should have files after normal run"
 
 
 # -----------------------------------------------------------------------------

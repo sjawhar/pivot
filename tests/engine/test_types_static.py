@@ -14,6 +14,7 @@ def test_stage_completed_status_is_completion_type() -> None:
         "duration_ms": 100.0,
         "index": 1,
         "total": 1,
+        "input_hash": None,
     }
     # This assignment validates the type
     _status: CompletionType = event["status"]

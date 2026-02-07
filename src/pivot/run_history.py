@@ -11,16 +11,16 @@ from pivot.types import (
     DirHash,
     DirManifestEntry,
     FileHash,
-    LockData,
-    OutputHash,
+    HashInfo,
     StageStatus,
+    is_dir_hash,
 )
 
 
 class StageRunRecord(TypedDict):
     """Record of a stage execution within a run."""
 
-    input_hash: str
+    input_hash: str | None
     status: StageStatus
     reason: str
     duration_ms: int
@@ -52,18 +52,16 @@ class OutputHashEntry(TypedDict):
     manifest: NotRequired[list[DirManifestEntry]]
 
 
-def output_hash_to_entry(path: str, oh: OutputHash) -> OutputHashEntry | None:
-    """Convert internal OutputHash to serializable OutputHashEntry. Returns None for uncached."""
-    if oh is None:
-        return None
+def output_hash_to_entry(path: str, oh: HashInfo) -> OutputHashEntry:
+    """Convert internal HashInfo to serializable OutputHashEntry."""
     entry = OutputHashEntry(path=path, hash=oh["hash"])
-    if "manifest" in oh:
+    if is_dir_hash(oh):
         entry["manifest"] = oh["manifest"]
     return entry
 
 
 def entry_to_output_hash(entry: OutputHashEntry) -> FileHash | DirHash:
-    """Convert serialized OutputHashEntry back to internal OutputHash."""
+    """Convert serialized OutputHashEntry back to internal HashInfo."""
     # Null check guards against corrupted JSON where manifest could be null
     if "manifest" in entry and entry["manifest"] is not None:  # pyright: ignore[reportUnnecessaryComparison]
         return DirHash(hash=entry["hash"], manifest=entry["manifest"])
@@ -97,24 +95,6 @@ def compute_input_hash(
     }
     content = json.dumps(data, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(content.encode()).hexdigest()[:16]
-
-
-def compute_input_hash_from_lock(lock_data: LockData) -> str:
-    """Compute input hash from existing lock data.
-
-    Derives output specs from lock data: outputs with None hash are non-cached.
-    """
-    deps = [
-        DepEntry(path=path, hash=info["hash"]) for path, info in lock_data["dep_hashes"].items()
-    ]
-    # Derive cache flag from output hash: None means cache=False
-    out_specs = [(path, oh is not None) for path, oh in lock_data["output_hashes"].items()]
-    return compute_input_hash(
-        code_manifest=lock_data["code_manifest"],
-        params=lock_data["params"],
-        deps=deps,
-        out_specs=out_specs,
-    )
 
 
 def serialize_to_bytes(data: RunManifest | RunCacheEntry) -> bytes:

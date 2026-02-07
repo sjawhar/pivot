@@ -447,7 +447,6 @@ class AgentRpcSource:
                 parallel=True,
                 max_workers=None,
                 no_commit=False,
-                no_cache=False,
                 on_error=OnError.FAIL,
                 cache_dir=None,
                 allow_uncached_incremental=False,

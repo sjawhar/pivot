@@ -16,7 +16,7 @@ from pivot.remote import config as remote_config
 from pivot.remote import storage as remote_mod
 from pivot.remote import sync as transfer
 from pivot.storage import lock
-from pivot.types import OutputHash, PipelineStatus, PipelineStatusInfo, is_dir_hash
+from pivot.types import HashInfo, PipelineStatus, PipelineStatusInfo, is_dir_hash
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -42,7 +42,7 @@ class VerifyOutput(TypedDict):
     stages: list[StageVerifyInfo]
 
 
-def _extract_file_hashes(hash_infos: Mapping[str, OutputHash]) -> dict[str, str]:
+def _extract_file_hashes(hash_infos: Mapping[str, HashInfo]) -> dict[str, str]:
     """Extract individual file hashes from a hash_info dict.
 
     Tree hashes (directory hashes) are computed, not cached - only individual
@@ -51,8 +51,6 @@ def _extract_file_hashes(hash_infos: Mapping[str, OutputHash]) -> dict[str, str]
     """
     result = dict[str, str]()
     for path, hash_info in hash_infos.items():
-        if hash_info is None:
-            continue
         if is_dir_hash(hash_info):
             for entry in hash_info["manifest"]:
                 entry_path = str(pathlib.Path(path) / entry["relpath"])
@@ -88,7 +86,7 @@ def _get_stage_lock_hashes(
         for out in stage_info["outs"]
         if out.cache
     }
-    cached_output_hashes: dict[str, OutputHash] = {
+    cached_output_hashes: dict[str, HashInfo] = {
         path: h
         for path, h in lock_data["output_hashes"].items()
         if path_utils.preserve_trailing_slash(path, str(project.normalize_path(path)))

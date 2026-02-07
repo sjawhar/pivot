@@ -18,7 +18,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
     from pivot.storage.track import PvtData
-    from pivot.types import OutEntry, OutputHash, StorageLockData
+    from pivot.types import HashInfo, OutEntry, StorageLockData
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +52,7 @@ class TargetInfo(TypedDict):
     target_type: TargetType
     original_target: str
     paths: list[str]
-    hashes: dict[str, OutputHash]
+    hashes: dict[str, HashInfo | None]
 
 
 def _parse_yaml_bytes[T](
@@ -105,10 +105,8 @@ def get_pvt_data_from_revision(pvt_rel_path: str, rev: str) -> PvtData | None:
     return _parse_pvt_data_from_bytes(content)
 
 
-def _out_entry_to_output_hash(entry: OutEntry) -> OutputHash:
-    """Convert OutEntry to OutputHash."""
-    if entry["hash"] is None:
-        return None
+def _out_entry_to_output_hash(entry: OutEntry) -> HashInfo:
+    """Convert OutEntry to HashInfo."""
     if "manifest" in entry:
         return DirHash(hash=entry["hash"], manifest=entry["manifest"])
     return FileHash(hash=entry["hash"])
@@ -148,7 +146,9 @@ def resolve_targets(
             if lock_data is not None and "outs" in lock_data:
                 outs = lock_data["outs"]
                 paths = [entry["path"] for entry in outs]
-                hashes = {entry["path"]: _out_entry_to_output_hash(entry) for entry in outs}
+                hashes: dict[str, HashInfo | None] = {
+                    entry["path"]: _out_entry_to_output_hash(entry) for entry in outs
+                }
                 results.append(
                     TargetInfo(
                         target_type=TargetType.STAGE,
@@ -167,7 +167,7 @@ def resolve_targets(
         pvt_data = get_pvt_data_from_revision(pvt_rel_path, rev)
         if pvt_data is not None:
             file_hash = pvt_data["hash"]
-            hash_info: OutputHash
+            hash_info: HashInfo
             if "manifest" in pvt_data:
                 hash_info = DirHash(hash=file_hash, manifest=pvt_data["manifest"])
             else:
@@ -210,7 +210,7 @@ def _verify_content_hash(content: bytes, expected_hash: str) -> bool:
 
 def restore_file(
     rel_path: str,
-    output_hash: OutputHash,
+    output_hash: HashInfo | None,
     rev: str,
     dest_path: pathlib.Path,
     cache_dir: pathlib.Path,

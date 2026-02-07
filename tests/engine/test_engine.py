@@ -446,14 +446,13 @@ async def test_engine_process_deferred_events_with_multiple_events() -> None:
 
 @pytest.mark.anyio
 async def test_engine_stores_orchestration_params_on_run_requested() -> None:
-    """Engine stores no_commit/no_cache/on_error from RunRequested for watch re-runs."""
+    """Engine stores no_commit/on_error from RunRequested for watch re-runs."""
     from pivot.engine.types import RunRequested
     from pivot.types import OnError
 
     async with Engine() as engine:
         # Initial state - defaults
         assert engine._stored_no_commit is False
-        assert engine._stored_no_cache is False
         assert engine._stored_on_error == OnError.FAIL
 
         # Create event with non-default params
@@ -466,7 +465,6 @@ async def test_engine_stores_orchestration_params_on_run_requested() -> None:
             parallel=True,
             max_workers=None,
             no_commit=True,
-            no_cache=True,
             on_error=OnError.KEEP_GOING,
             cache_dir=None,
             allow_uncached_incremental=False,
@@ -486,7 +484,6 @@ async def test_engine_stores_orchestration_params_on_run_requested() -> None:
 
         # Params should be stored
         assert engine._stored_no_commit is True
-        assert engine._stored_no_cache is True
         assert engine._stored_on_error == OnError.KEEP_GOING
 
 
@@ -498,7 +495,6 @@ async def test_engine_execute_affected_stages_uses_stored_params() -> None:
     async with Engine() as engine:
         # Set stored params (simulating what _handle_run_requested would do)
         engine._stored_no_commit = True
-        engine._stored_no_cache = True
         engine._stored_on_error = OnError.KEEP_GOING
 
         # Mock _orchestrate_execution to capture what params it receives
@@ -515,7 +511,6 @@ async def test_engine_execute_affected_stages_uses_stored_params() -> None:
 
         # Verify stored params were used
         assert captured_kwargs["no_commit"] is True, "no_commit should use stored value"
-        assert captured_kwargs["no_cache"] is True, "no_cache should use stored value"
         assert captured_kwargs["on_error"] == OnError.KEEP_GOING, "on_error should use stored value"
 
 
@@ -560,7 +555,6 @@ async def test_engine_cancel_during_active_execution() -> None:
             parallel=True,
             max_workers=None,
             no_commit=False,
-            no_cache=False,
             on_error=OnError.FAIL,
             cache_dir=None,
             allow_uncached_incremental=False,
@@ -621,7 +615,6 @@ async def test_engine_concurrent_run_requests_serialized() -> None:
             parallel=True,
             max_workers=None,
             no_commit=False,
-            no_cache=False,
             on_error=OnError.FAIL,
             cache_dir=None,
             allow_uncached_incremental=False,
@@ -636,7 +629,6 @@ async def test_engine_concurrent_run_requests_serialized() -> None:
             parallel=True,
             max_workers=None,
             no_commit=False,
-            no_cache=False,
             on_error=OnError.FAIL,
             cache_dir=None,
             allow_uncached_incremental=False,

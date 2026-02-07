@@ -1,81 +1,184 @@
+"""Commit current workspace state for pipeline stages.
+
+Computes hashes from current disk state, writes lock files, caches outputs,
+and updates StateDB. Used by `pivot commit` to record state after running
+stages with --no-commit or making manual edits.
+"""
+
 from __future__ import annotations
 
+import logging
 import pathlib
+from typing import TYPE_CHECKING, cast
 
-from pivot import config, project, run_history
+from pivot import config, exceptions, parameters, run_history
 from pivot.executor import worker
-from pivot.storage import lock
+from pivot.storage import cache, lock
 from pivot.storage import state as state_mod
+from pivot.types import DeferredWrites, DepEntry, HashInfo, LockData
 
-# Sentinel run_id for committed entries - never pruned by prune_run_cache
-COMMITTED_RUN_ID = "__committed__"
+if TYPE_CHECKING:
+    from pivot import registry
+
+logger = logging.getLogger(__name__)
 
 
-def commit_pending() -> list[str]:
-    """Promote pending locks to production and update StateDB.
+def _get_registry() -> registry.StageRegistry:
+    """Get StageRegistry via CLI helpers (lazy import to avoid circular imports)."""
+    from pivot.cli import helpers as cli_helpers
 
-    IMPORTANT: Caller must hold pending_state_lock to prevent races with other
-    processes that may be executing stages or committing concurrently.
+    return cli_helpers.get_registry()
 
-    Returns list of stage names that were committed.
+
+def commit_stages(
+    stage_names: list[str] | None = None,
+    force: bool = False,
+) -> tuple[list[str], list[str]]:
+    """Commit current workspace state for stages.
+
+    Hashes current deps and outputs on disk, writes lock files, caches outputs,
+    and updates StateDB (dep generations, output generations, run cache).
+
+    Args:
+        stage_names: Specific stages to commit. None means all stale stages.
+        force: If True, commit even if lock file is unchanged.
+
+    Returns:
+        Tuple of (committed, failed) stage name lists.
     """
-    project_root = project.get_project_root()
-    pending_stages = lock.list_pending_stages(project_root)
-    if not pending_stages:
-        return []
+    stage_registry = _get_registry()
+    all_stage_names = stage_registry.list_stages()
+
+    # Resolve target stages
+    if stage_names is not None:
+        registered = set(all_stage_names)
+        unknown = [s for s in stage_names if s not in registered]
+        if unknown:
+            raise exceptions.StageNotFoundError(unknown, available_stages=all_stage_names)
+        targets = stage_names
+    else:
+        targets = all_stage_names
 
     state_dir = config.get_state_dir()
+    state_db_path = config.get_state_db_path()
+    cache_dir = config.get_cache_dir()
+    files_cache_dir = cache_dir / "files"
+    checkout_modes = config.get_checkout_mode_order()
+    stages_dir = lock.get_stages_dir(state_dir)
+
     committed = list[str]()
+    failed = list[str]()
+    overrides = parameters.load_params_yaml()
 
-    with state_mod.StateDB(config.get_state_db_path()) as state_db:
-        for stage_name in pending_stages:
-            pending_lock = lock.get_pending_lock(stage_name, project_root)
-            pending_data = pending_lock.read()
+    for stage_name in targets:
+        stage_info = stage_registry.get(stage_name)
 
-            if pending_data is None:
-                continue
+        # 1. Get fingerprint
+        fingerprint = stage_registry.ensure_fingerprint(stage_name)
 
-            # Write to production lock (without dep_generations - that's internal to pending)
-            production_lock = lock.StageLock(stage_name, lock.get_stages_dir(state_dir))
-            production_lock.write(pending_data)
+        # 2. Get effective params
+        current_params = parameters.get_effective_params(
+            stage_info["params"], stage_name, overrides
+        )
 
-            # Record dependency generations from execution time (not commit time!)
-            dep_gens = pending_data["dep_generations"]
-            if dep_gens:
-                state_db.record_dep_generations(stage_name, dep_gens)
-
-            # Increment output generations
-            for out_path in pending_data["output_hashes"]:
-                state_db.increment_generation(pathlib.Path(out_path))
-
-            # Write run cache entry with sentinel run_id (never pruned)
-            input_hash = run_history.compute_input_hash_from_lock(pending_data)
-            worker.write_run_cache_entry(
-                stage_name, input_hash, pending_data["output_hashes"], COMMITTED_RUN_ID, state_db
+        # 3. Hash deps
+        dep_hashes, missing, unreadable = worker.hash_dependencies(stage_info["deps_paths"])
+        if missing:
+            logger.error("Stage '%s': missing deps: %s — skipping", stage_name, ", ".join(missing))
+            failed.append(stage_name)
+            continue
+        if unreadable:
+            logger.error(
+                "Stage '%s': unreadable deps: %s — skipping", stage_name, ", ".join(unreadable)
             )
+            failed.append(stage_name)
+            continue
 
-            # Remove pending lock
-            pending_lock.path.unlink(missing_ok=True)
-            committed.append(stage_name)
+        # 4. Compute input_hash
+        stage_outs = stage_info["outs"]
+        out_specs = [(worker.normalize_out_path(str(out.path)), out.cache) for out in stage_outs]
+        deps_list = [
+            DepEntry(path=dep_path, hash=info["hash"]) for dep_path, info in dep_hashes.items()
+        ]
+        input_hash = run_history.compute_input_hash(
+            fingerprint, current_params, deps_list, out_specs
+        )
 
-    return committed
+        # Compute normalized output paths once (used for skip check, lock data, and StateDB)
+        out_paths = [worker.normalize_out_path(str(out.path)) for out in stage_outs]
+        production_lock = lock.StageLock(stage_name, stages_dir)
 
+        # 5. If not force and no explicit stages, check lock — skip if unchanged
+        if not force and stage_names is None:
+            lock_data = production_lock.read()
+            if lock_data is not None:
+                changed, _ = production_lock.is_changed_with_lock_data(
+                    lock_data, fingerprint, current_params, dep_hashes, out_paths
+                )
+                if not changed:
+                    continue
 
-def discard_pending() -> list[str]:
-    """Discard all pending locks without committing.
+        # 6. Hash and cache outputs
+        output_hashes = dict[str, HashInfo]()
+        outputs_missing = False
 
-    IMPORTANT: Caller must hold pending_state_lock to prevent races with other
-    processes that may be executing stages or committing concurrently.
+        for out in stage_outs:
+            out_path = pathlib.Path(cast("str", out.path))
+            if not out_path.exists():
+                logger.error("Stage '%s': output missing: %s — skipping", stage_name, out.path)
+                outputs_missing = True
+                break
 
-    Returns list of stage names that were discarded.
-    """
-    project_root = project.get_project_root()
-    pending_stages = lock.list_pending_stages(project_root)
+            if out.cache:
+                output_hashes[str(out.path)] = cache.save_to_cache(
+                    out_path, files_cache_dir, checkout_modes=checkout_modes
+                )
+            else:
+                output_hashes[str(out.path)] = worker.hash_output(out_path)
 
-    discarded = list[str]()
-    for stage_name in pending_stages:
-        pending_lock = lock.get_pending_lock(stage_name, project_root)
-        pending_lock.path.unlink(missing_ok=True)
-        discarded.append(stage_name)
+        if outputs_missing:
+            failed.append(stage_name)
+            continue
 
-    return discarded
+        # 7. Write production lock
+        new_lock_data = LockData(
+            code_manifest=fingerprint,
+            params=current_params,
+            dep_hashes=dict(sorted(dep_hashes.items())),
+            output_hashes=dict(sorted(output_hashes.items())),
+            dep_generations={},
+        )
+        production_lock.write(new_lock_data)
+
+        # 8. Update StateDB: dep generations, output generations, run cache entry
+        run_id = run_history.generate_run_id()
+
+        with state_mod.StateDB(state_db_path) as state_db:
+            dep_gen_map = worker.compute_dep_generation_map(stage_info["deps_paths"], state_db)
+
+            # Only cached outputs belong in run cache
+            cached_paths = {cast("str", out.path) for out in stage_outs if out.cache}
+            cached_output_hashes = {
+                path: oh for path, oh in output_hashes.items() if path in cached_paths
+            }
+
+            output_entries = [
+                run_history.output_hash_to_entry(path, oh)
+                for path, oh in cached_output_hashes.items()
+            ]
+
+            deferred = DeferredWrites()
+            if dep_gen_map:
+                deferred["dep_generations"] = dep_gen_map
+            if output_entries:
+                deferred["run_cache_input_hash"] = input_hash
+                deferred["run_cache_entry"] = run_history.RunCacheEntry(
+                    run_id=run_id,
+                    output_hashes=output_entries,
+                )
+
+            state_db.apply_deferred_writes(stage_name, out_paths, deferred)
+
+        committed.append(stage_name)
+
+    return committed, failed

@@ -63,7 +63,7 @@ _LAZY_COMMANDS: dict[str, tuple[str, str, str]] = {
     "history": ("pivot.cli.history", "history", "List recent pipeline runs."),
     "show": ("pivot.cli.history", "show_cmd", "Show details of a specific run."),
     "schema": ("pivot.cli.schema", "schema", "Output JSON Schema for pivot.yaml configuration."),
-    "commit": ("pivot.cli.commit", "commit_command", "Commit pending locks from --no-commit runs."),
+    "commit": ("pivot.cli.commit", "commit_command", "Commit current workspace state for stages."),
     "check-ignore": (
         "pivot.cli.check_ignore",
         "check_ignore",

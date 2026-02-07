@@ -69,8 +69,7 @@ pivot repro [STAGES...] [OPTIONS]
 | `--tui` | Use interactive TUI display (default: plain text) |
 | `--json` | Output results as JSON |
 | `--tui-log PATH` | Write TUI messages to JSONL file for monitoring |
-| `--no-commit` | Defer lock files to pending dir for faster iteration |
-| `--no-cache` | Skip caching outputs entirely for maximum iteration speed |
+| `--no-commit` | Run stages without writing locks, cache, or StateDB |
 | `--keep-going` / `-k` | Continue running stages after failures (default: fail-fast) |
 | `--serve` | Start RPC server for agent control (requires --watch) |
 | `--allow-uncached-incremental` | Allow running stages with IncrementalOut files not in cache |
@@ -118,8 +117,7 @@ pivot run STAGES... [OPTIONS]
 | `--tui` | Use interactive TUI display (default: plain text) |
 | `--json` | Output results as JSON |
 | `--tui-log PATH` | Write TUI messages to JSONL file for monitoring |
-| `--no-commit` | Defer lock files to pending dir for faster iteration |
-| `--no-cache` | Skip caching outputs entirely for maximum iteration speed |
+| `--no-commit` | Run stages without writing locks, cache, or StateDB |
 | `--fail-fast` | Stop on first failure (default: keep-going) |
 | `--allow-uncached-incremental` | Allow running stages with IncrementalOut files not in cache |
 | `--checkout-missing` | Restore tracked files from cache before running |
@@ -185,18 +183,13 @@ pivot status [STAGES...] [OPTIONS]
 
 ### `pivot commit`
 
-Commit pending locks from `--no-commit` runs.
+Commit current workspace state for stages. Hashes deps and outputs on disk, writes lock files, and updates cache.
 
 ```bash
-pivot commit [OPTIONS]
+pivot commit [STAGES...]
 ```
 
-**Options:**
-
-| Option | Description |
-|--------|-------------|
-| `--list` | List pending stages without committing |
-| `--discard` | Discard pending changes without committing |
+Without arguments, commits all stale stages. With stage names, unconditionally commits those stages.
 
 ---
 

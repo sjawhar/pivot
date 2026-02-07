@@ -26,7 +26,7 @@ if TYPE_CHECKING:
     from pytest_mock import MockerFixture
 
     from pivot.executor import WorkerStageInfo
-    from pivot.types import DirHash, DirManifestEntry, OutputHash, OutputMessage
+    from pivot.types import DirHash, DirManifestEntry, HashInfo, OutputMessage
 
 
 class _PlainParams(stage_def.StageParams):
@@ -48,7 +48,6 @@ def _make_stage_info(
     run_id: str = "test_run",
     force: bool = False,
     no_commit: bool = False,
-    no_cache: bool = False,
     dep_specs: dict[str, stage_def.FuncDepSpec] | None = None,
     out_specs: dict[str, outputs.BaseOut] | None = None,
     params_arg_name: str | None = None,
@@ -68,7 +67,6 @@ def _make_stage_info(
         "run_id": run_id,
         "force": force,
         "no_commit": no_commit,
-        "no_cache": no_cache,
         "dep_specs": dep_specs or {},
         "out_specs": out_specs or {},
         "params_arg_name": params_arg_name,
@@ -1857,26 +1855,26 @@ def test_directory_out_restored_from_cache(
 
 
 def test_normalize_out_path_preserves_trailing_slash() -> None:
-    """_normalize_out_path preserves trailing slash for DirectoryOut paths."""
-    result = worker._normalize_out_path("results/")
+    """normalize_out_path preserves trailing slash for DirectoryOut paths."""
+    result = worker.normalize_out_path("results/")
     assert result.endswith("/"), "Should preserve trailing slash for DirectoryOut"
     assert "results" in result
 
-    result2 = worker._normalize_out_path("a/b/c/")
+    result2 = worker.normalize_out_path("a/b/c/")
     assert result2.endswith("/"), "Should preserve trailing slash for nested DirectoryOut"
 
 
 def test_normalize_out_path_no_slash_for_files() -> None:
-    """_normalize_out_path doesn't add trailing slash for regular Out paths."""
-    result = worker._normalize_out_path("output.csv")
+    """normalize_out_path doesn't add trailing slash for regular Out paths."""
+    result = worker.normalize_out_path("output.csv")
     assert not result.endswith("/"), "Should not add trailing slash for files"
     assert result.endswith("output.csv")
 
 
 def test_normalize_out_path_normalizes_relative_paths() -> None:
-    """_normalize_out_path normalizes relative path components."""
+    """normalize_out_path normalizes relative path components."""
     # Note: This depends on project.normalize_path behavior
-    result = worker._normalize_out_path("./results/")
+    result = worker.normalize_out_path("./results/")
     assert result.endswith("/"), "Should preserve trailing slash"
     assert "//" not in result, "Should not have double slashes"
 
@@ -2211,27 +2209,27 @@ def test_file_needs_restore_uses_state_db(tmp_path: pathlib.Path) -> None:
 
 
 # =============================================================================
-# _normalize_out_path Additional Tests
+# normalize_out_path Additional Tests
 # =============================================================================
 
 
 def test_normalize_out_path_handles_absolute_path() -> None:
-    """_normalize_out_path handles absolute paths."""
-    result = worker._normalize_out_path("/absolute/path/output.csv")
+    """normalize_out_path handles absolute paths."""
+    result = worker.normalize_out_path("/absolute/path/output.csv")
     assert not result.endswith("/"), "Files should not have trailing slash"
     assert "output.csv" in result
 
 
 def test_normalize_out_path_handles_absolute_dir_path() -> None:
-    """_normalize_out_path preserves trailing slash for absolute directory paths."""
-    result = worker._normalize_out_path("/absolute/path/results/")
+    """normalize_out_path preserves trailing slash for absolute directory paths."""
+    result = worker.normalize_out_path("/absolute/path/results/")
     assert result.endswith("/"), "Directory paths should preserve trailing slash"
 
 
 def test_normalize_out_path_handles_empty_trailing_component() -> None:
-    """_normalize_out_path handles paths with multiple trailing slashes."""
+    """normalize_out_path handles paths with multiple trailing slashes."""
     # Single trailing slash
-    result = worker._normalize_out_path("results/")
+    result = worker.normalize_out_path("results/")
     assert result.endswith("/")
     assert "//" not in result
 
@@ -2379,7 +2377,7 @@ def test_restore_outputs_fails_when_cache_missing(
 
     output_path = str(tmp_path / "output.txt")
     # Hash must be exactly 16 characters (xxhash64 hexdigest)
-    output_hash_map: dict[str, OutputHash] = {output_path: {"hash": "1234567890abcdef"}}
+    output_hash_map: dict[str, HashInfo] = {output_path: {"hash": "1234567890abcdef"}}
 
     result = worker._restore_outputs(
         [output_path],
@@ -2399,7 +2397,7 @@ def test_restore_outputs_returns_false_for_unrecorded_output(
     files_cache_dir.mkdir(parents=True, exist_ok=True)
 
     output_path = str(tmp_path / "output.txt")
-    output_hash_map: dict[str, OutputHash] = {}  # Empty map
+    output_hash_map: dict[str, HashInfo] = {}  # Empty map
 
     result = worker._restore_outputs(
         [output_path],
@@ -2431,7 +2429,7 @@ def test_restore_outputs_cleans_up_on_partial_failure(
     output1_path = str(tmp_path / "output1.txt")
     output2_path = str(tmp_path / "output2.txt")  # This won't have cache
 
-    output_hash_map: dict[str, OutputHash] = {
+    output_hash_map: dict[str, HashInfo] = {
         output1_path: {"hash": output1_hash},
         output2_path: {"hash": "fedcba0987654321"},  # Valid format but cache doesn't exist
     }
@@ -2556,7 +2554,6 @@ def test_prepare_worker_info_uses_stage_state_dir(
         run_id="test-run",
         force=False,
         no_commit=False,
-        no_cache=False,
         project_root=set_project_root,
         default_state_dir=set_project_root / ".pivot",  # Fallback
     )
@@ -2585,7 +2582,6 @@ def test_prepare_worker_info_uses_default_state_dir_when_stage_has_none(
         run_id="test-run",
         force=False,
         no_commit=False,
-        no_cache=False,
         project_root=set_project_root,
         default_state_dir=default_state_dir,
     )
@@ -2784,27 +2780,27 @@ def test_restore_outputs_from_cache_fails_when_noncached_missing(
 
 
 def test_hash_output_computes_correct_hash_for_file(tmp_path: pathlib.Path) -> None:
-    """_hash_output returns a FileHash matching cache.hash_file for regular files.
+    """hash_output returns a FileHash matching cache.hash_file for regular files.
 
     Verifies the hash is deterministic and consistent with the canonical hash function,
-    preventing regressions where _hash_output diverges from save_to_cache hashing.
+    preventing regressions where hash_output diverges from save_to_cache hashing.
     """
     test_file = tmp_path / "data.txt"
     test_file.write_text("hash me")
 
-    result = worker._hash_output(test_file)
+    result = worker.hash_output(test_file)
 
     expected_hash = cache.hash_file(test_file)
     assert result == FileHash(hash=expected_hash), (
-        "FileHash from _hash_output should match cache.hash_file"
+        "FileHash from hash_output should match cache.hash_file"
     )
     assert "manifest" not in result, "File hash should not contain manifest key"
 
 
 def test_hash_output_computes_correct_hash_for_directory(tmp_path: pathlib.Path) -> None:
-    """_hash_output returns a DirHash with manifest for directories.
+    """hash_output returns a DirHash with manifest for directories.
 
-    The directory branch of _hash_output is exercised when non-cached DirectoryOut
+    The directory branch of hash_output is exercised when non-cached DirectoryOut
     outputs need hashing in _try_skip_via_run_cache. Verifies the result matches
     cache.hash_directory.
     """
@@ -2813,7 +2809,7 @@ def test_hash_output_computes_correct_hash_for_directory(tmp_path: pathlib.Path)
     (dir_path / "a.json").write_text('{"value": 1}')
     (dir_path / "b.json").write_text('{"value": 2}')
 
-    result = worker._hash_output(dir_path)
+    result = worker.hash_output(dir_path)
 
     expected_hash, expected_manifest = cache.hash_directory(dir_path)
     assert "hash" in result, "DirHash should have a hash key"
@@ -2847,7 +2843,7 @@ def test_build_deferred_writes_excludes_noncached_from_run_cache(
         outs=[out, metric],
     )
 
-    output_hashes: dict[str, OutputHash] = {
+    output_hashes: dict[str, HashInfo] = {
         "output.txt": FileHash(hash="abc123"),
         "metrics.json": FileHash(hash="def456"),
     }
@@ -2887,7 +2883,7 @@ def test_build_deferred_writes_no_run_cache_when_all_noncached(
         outs=[metric1, metric2],
     )
 
-    output_hashes: dict[str, OutputHash] = {
+    output_hashes: dict[str, HashInfo] = {
         "metrics1.json": FileHash(hash="aaa111"),
         "metrics2.json": FileHash(hash="bbb222"),
     }

@@ -542,6 +542,7 @@ def test_convert_results_converts_ran_status() -> None:
             duration_ms=1234.5,
             index=0,
             total=1,
+            input_hash="abc123",
         )
     }
 
@@ -550,6 +551,7 @@ def test_convert_results_converts_ran_status() -> None:
     assert "train" in summaries
     assert summaries["train"]["status"] == StageStatus.RAN
     assert summaries["train"]["reason"] == "inputs changed"
+    assert summaries["train"]["input_hash"] == "abc123"
 
 
 def test_convert_results_handles_multiple_stages() -> None:
@@ -566,6 +568,7 @@ def test_convert_results_handles_multiple_stages() -> None:
             duration_ms=100.0,
             index=0,
             total=2,
+            input_hash=None,
         ),
         "evaluate": StageCompleted(
             type="stage_completed",
@@ -575,6 +578,7 @@ def test_convert_results_handles_multiple_stages() -> None:
             duration_ms=0.0,
             index=1,
             total=2,
+            input_hash=None,
         ),
     }
 

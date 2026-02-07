@@ -282,6 +282,7 @@ def convert_results(
         name: executor_core.ExecutionSummary(
             status=event["status"],
             reason=event["reason"],
+            input_hash=event["input_hash"],
         )
         for name, event in stage_results.items()
     }

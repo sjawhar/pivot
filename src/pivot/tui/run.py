@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import atexit
 import collections
 import contextlib
@@ -18,7 +17,6 @@ from typing import (
     override,
 )
 
-import filelock
 import loky
 import loky.process_executor
 import rich.markup
@@ -36,12 +34,10 @@ import textual.widgets
 from pivot import config, explain, parameters, project
 from pivot.cli import helpers as cli_helpers
 from pivot.executor import ExecutionSummary
-from pivot.executor import commit as commit_mod
-from pivot.storage import lock, project_lock
+from pivot.storage import lock
 from pivot.tui import diff_panels, rpc_client
 from pivot.tui.diff_panels import InputDiffPanel, OutputDiffPanel
 from pivot.tui.screens import (
-    ConfirmCommitScreen,
     ConfirmKillWorkersScreen,
     HelpScreen,
     HistoryListScreen,
@@ -190,8 +186,6 @@ _MIN_TERMINAL_WIDTH = 80
 _MIN_TERMINAL_HEIGHT = 24
 
 # Constants for commit lock acquisition
-_COMMIT_LOCK_POLL_INTERVAL = 5.0  # seconds between lock attempts
-_COMMIT_LOCK_TIMEOUT = 60.0  # total seconds before giving up
 
 
 class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
@@ -1092,58 +1086,10 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
         self._update_history_view()
 
     async def action_commit(self) -> None:  # pragma: no cover
-        """Commit pending changes (watch mode only)."""
+        """Commit current workspace state (watch mode only)."""
         if not self._watch_mode:
             return
-        if self._commit_in_progress:
-            return
-        if self._has_running_stages:
-            self.notify("Cannot commit while stages are running", severity="warning")
-            return
-
-        pending = await asyncio.to_thread(lock.list_pending_stages, project.get_project_root())
-        if not pending:
-            self.notify("Nothing to commit")
-            return
-
-        self._commit_in_progress = True
-        self._cancel_commit = False
-        self.notify("Acquiring commit lock... (Esc to cancel)", timeout=0)
-
-        acquired: filelock.BaseFileLock | None = None
-        elapsed = 0.0
-
-        try:
-            while not self._cancel_commit and elapsed < _COMMIT_LOCK_TIMEOUT:
-                try:
-                    acquired = await asyncio.to_thread(
-                        project_lock.acquire_pending_state_lock, _COMMIT_LOCK_POLL_INTERVAL
-                    )
-                    break
-                except filelock.Timeout:
-                    elapsed += _COMMIT_LOCK_POLL_INTERVAL
-                    if not self._cancel_commit and elapsed < _COMMIT_LOCK_TIMEOUT:
-                        self.notify(f"Still waiting for lock... ({int(elapsed)}s)", timeout=0)
-
-            if self._cancel_commit:
-                self.notify("Commit cancelled")
-                return
-
-            if acquired is None:
-                self.notify(
-                    f"Timed out waiting for lock ({int(_COMMIT_LOCK_TIMEOUT)}s). Try again later.",
-                    severity="error",
-                )
-                return
-
-            committed = await asyncio.to_thread(commit_mod.commit_pending)
-            self.notify(f"Committed {len(committed)} stage(s)")
-        except Exception as e:
-            self.notify(f"Commit failed: {e}", severity="error")
-        finally:
-            self._commit_in_progress = False
-            if acquired is not None:
-                acquired.release()
+        self.notify("pivot commit: not yet implemented (rearchitect in progress)")
 
     async def action_force_rerun_stage(self) -> None:  # pragma: no cover
         """Force re-run the currently selected stage (watch mode only)."""
@@ -1271,31 +1217,5 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
     @textual.work
     async def _quit_with_commit_prompt(self) -> None:  # pragma: no cover
         """Worker to handle quit with commit prompt (watch mode)."""
-        try:
-            if self._commit_in_progress:
-                self._cancel_commit = True
-
-            if self._no_commit and not self._has_running_stages:
-                pending = await asyncio.to_thread(
-                    lock.list_pending_stages, project.get_project_root()
-                )
-                if pending:
-                    should_commit = await self.push_screen_wait(ConfirmCommitScreen())
-                    if should_commit:
-                        try:
-                            commit_lock = await asyncio.to_thread(
-                                project_lock.acquire_pending_state_lock, 5.0
-                            )
-                        except filelock.Timeout:
-                            self.notify(
-                                "Could not acquire lock for commit. Exiting without commit.",
-                                severity="warning",
-                            )
-                        else:
-                            try:
-                                await asyncio.to_thread(commit_mod.commit_pending)
-                            finally:
-                                commit_lock.release()
-        finally:
-            # Engine is managed externally (by CLI) - just exit TUI
-            self.exit()
+        # Engine is managed externally (by CLI) - just exit TUI
+        self.exit()

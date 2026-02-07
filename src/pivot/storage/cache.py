@@ -20,7 +20,7 @@ import xxhash
 
 from pivot import exceptions, metrics
 from pivot.config import CheckoutMode as CheckoutMode
-from pivot.types import DirHash, DirManifestEntry, FileHash, OutputHash
+from pivot.types import DirHash, DirManifestEntry, FileHash, HashInfo, is_dir_hash
 
 logger = logging.getLogger(__name__)
 
@@ -435,7 +435,7 @@ def save_to_cache(
     state_db: state_mod.StateDB | None = None,
     checkout_mode: CheckoutMode | None = None,
     checkout_modes: list[CheckoutMode] | None = None,
-) -> OutputHash:
+) -> HashInfo:
     """Save file or directory to cache, replace with link, return hash info.
 
     Args:
@@ -529,7 +529,7 @@ def _save_directory_to_cache(
 
 def restore_from_cache(
     path: pathlib.Path,
-    output_hash: OutputHash,
+    output_hash: HashInfo,
     cache_dir: pathlib.Path,
     checkout_mode: CheckoutMode | None = None,
     checkout_modes: list[CheckoutMode] | None = None,
@@ -543,12 +543,9 @@ def restore_from_cache(
         checkout_mode: Single link mode (no fallback). Takes precedence over checkout_modes.
         checkout_modes: Ordered list of link modes to try with fallback on failure.
     """
-    if output_hash is None:
-        return False
-
     effective_modes = _resolve_checkout_modes(checkout_mode, checkout_modes)
 
-    if "manifest" in output_hash:
+    if is_dir_hash(output_hash):
         return _restore_directory_from_cache(path, output_hash, cache_dir, effective_modes)
     return _restore_file_from_cache(path, output_hash, cache_dir, effective_modes)
 

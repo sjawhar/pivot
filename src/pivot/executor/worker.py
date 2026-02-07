@@ -38,7 +38,6 @@ from pivot.types import (
     FileHash,
     HashInfo,
     LockData,
-    OutputHash,
     OutputMessage,
     StageResult,
     StageStatus,
@@ -139,7 +138,6 @@ class WorkerStageInfo(TypedDict):
     run_id: str
     force: bool
     no_commit: bool
-    no_cache: bool
     dep_specs: dict[str, stage_def.FuncDepSpec]
     out_specs: dict[str, outputs.BaseOut]
     params_arg_name: str | None
@@ -151,11 +149,13 @@ def _make_result(
     status: Literal[StageStatus.RAN, StageStatus.SKIPPED, StageStatus.FAILED],
     reason: str,
     output_lines: list[tuple[str, bool]],
+    input_hash: str | None = None,
 ) -> StageResult:
     """Build StageResult with collected metrics for cross-process transfer."""
     return StageResult(
         status=status,
         reason=reason,
+        input_hash=input_hash,
         output_lines=output_lines,
         metrics=metrics.get_entries(),
     )
@@ -171,9 +171,6 @@ def execute_stage(
 
     Flag interactions:
     - --force: Always run stage, even if skip detection says it's unchanged
-    - --no-cache: Skip caching entirely; lock file records null output hashes
-    - --force + --no-cache: Maximum speed mode - no cache reads/writes, no provenance
-      tracking beyond the lock file. Lock file will have null hashes for all outputs.
     """
     # Clear metrics at start - each stage collects its own metrics
     metrics.clear()
@@ -191,21 +188,10 @@ def execute_stage(
     # _queue_logging captures log messages to the output queue (for TUI display).
     with contextlib.chdir(project_root), _queue_logging(stage_name, output_queue):
         no_commit = stage_info["no_commit"]
-        no_cache = stage_info["no_cache"]
-
-        # Validate --no-cache incompatibility with IncrementalOut
-        if no_cache and any(isinstance(out, outputs.IncrementalOut) for out in stage_info["outs"]):
-            return StageResult(
-                status=StageStatus.FAILED,
-                reason="--no-cache is incompatible with IncrementalOut (requires cache for incremental updates)",
-                output_lines=[],
-            )
 
         checkout_modes = stage_info["checkout_modes"]
 
-        # Production lock for skip detection, pending lock for --no-commit mode
         production_lock = lock.StageLock(stage_name, lock.get_stages_dir(stage_info["state_dir"]))
-        pending_lock = lock.get_pending_lock(stage_name, project_root)
         current_fingerprint = stage_info["fingerprint"]
         stage_outs = stage_info["outs"]
 
@@ -222,12 +208,10 @@ def execute_stage(
                 [],
             )
 
+        input_hash: str | None = None
         try:
             with lock.execution_lock(stage_name, lock.get_stages_dir(stage_info["state_dir"])):
-                # Check pending lock first for IncrementalOut restoration, fall back to production
-                pending_lock_data = pending_lock.read()
-                production_lock_data = production_lock.read()
-                lock_data = pending_lock_data or production_lock_data
+                lock_data = production_lock.read()
 
                 with state.StateDB(state_db_path, readonly=True) as state_db:
                     dep_hashes, missing, unreadable = hash_dependencies(
@@ -269,11 +253,13 @@ def execute_stage(
                             state_db=state_db,
                         )
                         if restored:
-                            return _make_result(StageStatus.SKIPPED, skip_reason, [])
+                            return _make_result(
+                                StageStatus.SKIPPED, skip_reason, [], input_hash=input_hash
+                            )
                         run_reason = "outputs missing from cache"
 
-                    # Check run cache for previously executed configuration (skip if forcing or no_cache)
-                    if run_reason and not stage_info["force"] and not no_cache:
+                    # Check run cache for previously executed configuration (skip if forcing)
+                    if run_reason and not stage_info["force"]:
                         run_cache_skip = _try_skip_via_run_cache(
                             stage_name,
                             input_hash,
@@ -283,6 +269,13 @@ def execute_stage(
                             state_db,
                         )
                         if run_cache_skip is not None:
+                            if no_commit:
+                                return _make_result(
+                                    StageStatus.SKIPPED,
+                                    "unchanged (run cache)",
+                                    [],
+                                    input_hash=input_hash,
+                                )
                             new_lock_data = LockData(
                                 code_manifest=current_fingerprint,
                                 params=current_params,
@@ -295,28 +288,24 @@ def execute_stage(
                                 new_lock_data,
                                 input_hash,
                                 run_cache_skip["output_hashes"],
-                                pending_lock,
                                 production_lock,
                                 state_db,
-                                no_commit,
                             )
-                            if deferred is not None:
-                                return StageResult(
-                                    status=StageStatus.SKIPPED,
-                                    reason="unchanged (run cache)",
-                                    output_lines=[],
-                                    metrics=metrics.get_entries(),
-                                    deferred_writes=deferred,
-                                )
-                            return run_cache_skip["result"]
+                            return StageResult(
+                                status=StageStatus.SKIPPED,
+                                reason="unchanged (run cache)",
+                                input_hash=input_hash,
+                                output_lines=[],
+                                metrics=metrics.get_entries(),
+                                deferred_writes=deferred,
+                            )
 
                 try:
                     _prepare_outputs_for_execution(stage_outs, lock_data, files_cache_dir)
                 except exceptions.CacheRestoreError as e:
-                    lock_path = pending_lock.path if pending_lock_data else production_lock.path
                     raise exceptions.CacheRestoreError(
                         f"{e}. Run `pivot pull` to fetch from remote, or delete "
-                        + f"`{lock_path}` to start fresh."
+                        + f"`{production_lock.path}` to start fresh."
                     ) from e
 
                 _run_stage_function_with_injection(
@@ -331,18 +320,25 @@ def execute_stage(
                     stage_info["params_arg_name"],
                 )
 
-                # Compute output hashes (null for no_cache, actual otherwise)
-                if no_cache:
-                    _verify_outputs_exist(stage_outs)
-                    output_hashes: dict[str, OutputHash] = {
-                        str(out.path): None for out in stage_outs
-                    }
+                # Compute output hashes
+                if no_commit:
+                    output_hashes = _hash_outputs_only(stage_outs)
                 else:
                     output_hashes = _save_outputs_to_cache(
                         stage_outs, files_cache_dir, checkout_modes
                     )
 
-                # Build lock data (dep_generations filled below if no_commit)
+                # For --no-commit, skip lock/cache writes entirely
+                if no_commit:
+                    return StageResult(
+                        status=StageStatus.RAN,
+                        reason=run_reason,
+                        input_hash=input_hash,
+                        output_lines=output_lines,
+                        metrics=metrics.get_entries(),
+                    )
+
+                # Build lock data
                 new_lock_data = LockData(
                     code_manifest=current_fingerprint,
                     params=current_params,
@@ -358,37 +354,40 @@ def execute_stage(
                         new_lock_data,
                         input_hash,
                         output_hashes,
-                        pending_lock,
                         production_lock,
                         state_db,
-                        no_commit,
                     )
-                    if deferred is not None:
-                        return StageResult(
-                            status=StageStatus.RAN,
-                            reason=run_reason,
-                            output_lines=output_lines,
-                            metrics=metrics.get_entries(),
-                            deferred_writes=deferred,
-                        )
-
-            return _make_result(StageStatus.RAN, run_reason, output_lines)
+                    return StageResult(
+                        status=StageStatus.RAN,
+                        reason=run_reason,
+                        input_hash=input_hash,
+                        output_lines=output_lines,
+                        metrics=metrics.get_entries(),
+                        deferred_writes=deferred,
+                    )
 
         except exceptions.StageAlreadyRunningError as e:
             return _make_result(StageStatus.FAILED, str(e), output_lines)
         except exceptions.OutputMissingError as e:
-            return _make_result(StageStatus.FAILED, str(e), output_lines)
+            return _make_result(StageStatus.FAILED, str(e), output_lines, input_hash=input_hash)
         except SystemExit as e:
             return _make_result(
-                StageStatus.FAILED, f"Stage called sys.exit({e.code})", output_lines
+                StageStatus.FAILED,
+                f"Stage called sys.exit({e.code})",
+                output_lines,
+                input_hash=input_hash,
             )
         except KeyboardInterrupt:
-            return _make_result(StageStatus.FAILED, "KeyboardInterrupt", output_lines)
+            return _make_result(
+                StageStatus.FAILED, "KeyboardInterrupt", output_lines, input_hash=input_hash
+            )
         except Exception:
-            return _make_result(StageStatus.FAILED, traceback.format_exc(), output_lines)
+            return _make_result(
+                StageStatus.FAILED, traceback.format_exc(), output_lines, input_hash=input_hash
+            )
 
 
-def _normalize_out_path(path: str) -> str:
+def normalize_out_path(path: str) -> str:
     """Normalize output path, preserving trailing slash for DirectoryOut."""
     normalized = str(project.normalize_path(path))
     return path_utils.preserve_trailing_slash(path, normalized)
@@ -396,12 +395,12 @@ def _normalize_out_path(path: str) -> str:
 
 def _get_normalized_out_paths(stage_info: WorkerStageInfo) -> list[str]:
     """Get normalized output paths from stage info, matching lock_data format."""
-    return [_normalize_out_path(str(out.path)) for out in stage_info["outs"]]
+    return [normalize_out_path(str(out.path)) for out in stage_info["outs"]]
 
 
 def _get_output_specs(stage_info: WorkerStageInfo) -> list[tuple[str, bool]]:
     """Get normalized output specs (path, cache flag) for input hash computation."""
-    return [(_normalize_out_path(str(out.path)), out.cache) for out in stage_info["outs"]]
+    return [(normalize_out_path(str(out.path)), out.cache) for out in stage_info["outs"]]
 
 
 def _check_skip_or_run(
@@ -460,7 +459,7 @@ def _cleanup_restored_paths(restored_paths: list[pathlib.Path]) -> None:
 
 def _restore_outputs(
     output_path_strings: list[str],
-    output_hash_map: dict[str, OutputHash],
+    output_hash_map: dict[str, HashInfo],
     files_cache_dir: pathlib.Path,
     checkout_modes: list[cache.CheckoutMode],
     *,
@@ -488,7 +487,7 @@ def _restore_outputs(
 
     for path_str in output_path_strings:
         path = pathlib.Path(path_str)
-        lookup_key = _normalize_out_path(path_str) if use_normalized_paths else path_str
+        lookup_key = normalize_out_path(path_str) if use_normalized_paths else path_str
 
         # Check if output is recorded
         if lookup_key not in output_hash_map:
@@ -496,13 +495,6 @@ def _restore_outputs(
             return False
 
         output_hash = output_hash_map[lookup_key]
-
-        # None hash means --no-cache mode: just verify file exists
-        if output_hash is None:
-            if path.exists():
-                continue
-            _cleanup_restored_paths(restored_paths)
-            return False
 
         # Verify content matches cached hash (directories and files)
         if is_dir_hash(output_hash):
@@ -630,10 +622,10 @@ def _save_outputs_to_cache(
     stage_outs: list[outputs.BaseOut],
     files_cache_dir: pathlib.Path,
     checkout_modes: list[cache.CheckoutMode],
-) -> dict[str, OutputHash]:
+) -> dict[str, HashInfo]:
     """Save outputs to cache after successful execution."""
     _t = metrics.start()
-    output_hashes = dict[str, OutputHash]()
+    output_hashes = dict[str, HashInfo]()
 
     for out in stage_outs:
         path = pathlib.Path(cast("str", out.path))
@@ -645,25 +637,24 @@ def _save_outputs_to_cache(
                 path, files_cache_dir, checkout_modes=checkout_modes
             )
         else:
-            output_hashes[str(out.path)] = _hash_output(path)
+            output_hashes[str(out.path)] = hash_output(path)
 
     metrics.end("worker.save_outputs_to_cache", _t)
     return output_hashes
 
 
-def _verify_outputs_exist(stage_outs: list[outputs.BaseOut]) -> None:
-    """Verify all outputs exist without caching (for --no-cache mode).
-
-    Note: Only checks existence, not contents. Empty directories pass verification.
-    This is intentional - --no-cache mode trusts that the stage produced valid output.
-    """
+def _hash_outputs_only(stage_outs: list[outputs.BaseOut]) -> dict[str, HashInfo]:
+    """Hash outputs without saving to cache (for --no-commit mode)."""
+    output_hashes = dict[str, HashInfo]()
     for out in stage_outs:
         path = pathlib.Path(cast("str", out.path))
         if not path.exists():
             raise exceptions.OutputMissingError(f"Stage did not produce output: {out.path}")
+        output_hashes[str(out.path)] = hash_output(path)
+    return output_hashes
 
 
-def _hash_output(path: pathlib.Path, state_db: state.StateDB | None = None) -> HashInfo:
+def hash_output(path: pathlib.Path, state_db: state.StateDB | None = None) -> HashInfo:
     """Compute output hash without saving to cache."""
     if path.is_dir():
         tree_hash, manifest = cache.hash_directory(path, state_db)
@@ -889,9 +880,9 @@ def hash_dependencies(
         try:
             if path.is_dir():
                 tree_hash, manifest = cache.hash_directory(path, state_db)
-                hashes[normalized] = {"hash": tree_hash, "manifest": manifest}
+                hashes[normalized] = DirHash(hash=tree_hash, manifest=manifest)
             else:
-                hashes[normalized] = {"hash": cache.hash_file(path, state_db)}
+                hashes[normalized] = FileHash(hash=cache.hash_file(path, state_db))
         except FileNotFoundError:
             missing.append(dep)
         except OSError:
@@ -926,7 +917,7 @@ def can_skip_via_generation(
         return False
 
     # Normalize output paths to match lock_data format (preserve trailing slash for DirectoryOut)
-    normalized_outs = sorted(_normalize_out_path(p) for p in outs_paths)
+    normalized_outs = sorted(normalize_out_path(p) for p in outs_paths)
     locked_out_paths = sorted(lock_data["output_hashes"].keys())
     if normalized_outs != locked_out_paths:
         return False
@@ -1000,22 +991,15 @@ def _commit_lock_and_build_deferred(
     stage_info: WorkerStageInfo,
     lock_data: LockData,
     input_hash: str,
-    output_hashes: dict[str, OutputHash],
-    pending_lock: lock.StageLock,
+    output_hashes: dict[str, HashInfo],
     production_lock: lock.StageLock,
     state_db: state.StateDB,
-    no_commit: bool,
-) -> DeferredWrites | None:
-    """Commit lock file and build deferred writes.
+) -> DeferredWrites:
+    """Commit lock file and build deferred writes for StateDB.
 
-    For no_commit: computes dep_generations, writes to pending_lock, returns None.
-    For commit: writes to production_lock, returns DeferredWrites for StateDB.
+    Only called in the commit (non --no-commit) path. Writes the production
+    lock file and returns DeferredWrites for the coordinator to apply.
     """
-    if no_commit:
-        dep_gens = compute_dep_generation_map(stage_info["deps"], state_db)
-        lock_data["dep_generations"] = dep_gens
-        pending_lock.write(lock_data)
-        return None
     production_lock.write(lock_data)
     return _build_deferred_writes(stage_info, input_hash, output_hashes, state_db)
 
@@ -1023,7 +1007,7 @@ def _commit_lock_and_build_deferred(
 def _build_deferred_writes(
     stage_info: WorkerStageInfo,
     input_hash: str,
-    output_hashes: dict[str, OutputHash],
+    output_hashes: dict[str, HashInfo],
     state_db: state.StateDB,
 ) -> DeferredWrites:
     """Build deferred writes for coordinator to apply."""
@@ -1037,10 +1021,9 @@ def _build_deferred_writes(
     # Run cache entry — only cached outputs belong in run cache
     cached_paths = {cast("str", out.path) for out in stage_info["outs"] if out.cache}
     output_entries = [
-        entry
+        run_history.output_hash_to_entry(path, oh)
         for path, oh in output_hashes.items()
         if path in cached_paths
-        and (entry := run_history.output_hash_to_entry(path, oh)) is not None
     ]
     if output_entries:
         result["run_cache_input_hash"] = input_hash
@@ -1060,8 +1043,7 @@ def _build_deferred_writes(
 class RunCacheSkipResult(TypedDict):
     """Result from successful run cache skip."""
 
-    result: StageResult
-    output_hashes: dict[str, OutputHash]
+    output_hashes: dict[str, HashInfo]
 
 
 def _try_skip_via_run_cache(
@@ -1102,9 +1084,7 @@ def _try_skip_via_run_cache(
 
     restored = _restore_outputs(
         cached_path_strings,
-        cast(
-            "dict[str, OutputHash]", output_hash_map
-        ),  # FileHash | DirHash is subset of OutputHash
+        output_hash_map,
         files_cache_dir,
         checkout_modes,
         use_normalized_paths=False,
@@ -1114,16 +1094,15 @@ def _try_skip_via_run_cache(
         return None
 
     # Build output_hashes for lock file update, including non-cached outputs
-    output_hashes: dict[str, OutputHash] = {}
+    output_hashes: dict[str, HashInfo] = {}
     for out in stage_outs:
         out_path = cast("str", out.path)
         if out.cache:
             output_hashes[out_path] = output_hash_map[out_path]
         else:
-            output_hashes[out_path] = _hash_output(pathlib.Path(out_path), state_db)
+            output_hashes[out_path] = hash_output(pathlib.Path(out_path), state_db)
 
     return RunCacheSkipResult(
-        result=_make_result(StageStatus.SKIPPED, "unchanged (run cache)", []),
         output_hashes=output_hashes,
     )
 
@@ -1131,15 +1110,13 @@ def _try_skip_via_run_cache(
 def write_run_cache_entry(
     stage_name: str,
     input_hash: str,
-    output_hashes: dict[str, OutputHash],
+    output_hashes: dict[str, HashInfo],
     run_id: str,
     state_db: state.StateDB,
 ) -> None:
     """Write run cache entry after successful execution."""
     output_entries = [
-        entry
-        for path, oh in output_hashes.items()
-        if (entry := run_history.output_hash_to_entry(path, oh)) is not None
+        run_history.output_hash_to_entry(path, oh) for path, oh in output_hashes.items()
     ]
     cache_entry = run_history.RunCacheEntry(run_id=run_id, output_hashes=output_entries)
     state_db.write_run_cache(stage_name, input_hash, cache_entry)

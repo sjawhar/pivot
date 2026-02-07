@@ -488,20 +488,6 @@ def test_repro_no_commit_option_accepted(
     assert result.exit_code == 0
 
 
-def test_repro_no_cache_option_accepted(
-    mock_discovery: Pipeline,
-    runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """repro --no-cache option is accepted."""
-    register_test_stage(_helper_stage_a, name="stage_a")
-
-    result = runner.invoke(cli.cli, ["repro", "--no-cache"])
-
-    assert result.exit_code == 0
-
-
 # =============================================================================
 # Show Output Flag Tests
 # =============================================================================

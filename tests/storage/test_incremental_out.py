@@ -43,7 +43,9 @@ async def _run_engine_once(
     # Convert StageCompleted events to ExecutionSummary
     raw_results = await collector.get_results()
     return {
-        name: executor_core.ExecutionSummary(status=event["status"], reason=event["reason"])
+        name: executor_core.ExecutionSummary(
+            status=event["status"], reason=event["reason"], input_hash=None
+        )
         for name, event in raw_results.items()
     }
 
@@ -240,20 +242,11 @@ def test_prepare_outputs_incremental_missing_cache_error(
     assert "Cache missing for IncrementalOut 'database.txt'" in str(exc_info.value)
 
 
-@pytest.mark.parametrize(
-    ("no_commit", "expected_lock_dir"),
-    [
-        pytest.param(False, ".pivot/stages", id="production_lock"),
-        pytest.param(True, ".pivot/pending/stages", id="pending_lock"),
-    ],
-)
 @pytest.mark.anyio
 async def test_integration_missing_cache_error_includes_recovery_suggestion(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
     test_pipeline: Pipeline,
-    no_commit: bool,
-    expected_lock_dir: str,
 ) -> None:
     """Full error message should include correct lock path and recovery suggestions."""
     import shutil
@@ -275,12 +268,14 @@ async def test_integration_missing_cache_error_includes_recovery_suggestion(
         collector1 = sinks.ResultCollectorSink()
         engine.add_sink(collector1)
         engine.add_source(
-            sources.OneShotSource(stages=None, force=False, reason="test", no_commit=no_commit)
+            sources.OneShotSource(stages=None, force=False, reason="test", no_commit=False)
         )
         await engine.run(exit_on_completion=True)
         raw1 = await collector1.get_results()
         results1 = {
-            name: executor_core.ExecutionSummary(status=e["status"], reason=e["reason"])
+            name: executor_core.ExecutionSummary(
+                status=e["status"], reason=e["reason"], input_hash=None
+            )
             for name, e in raw1.items()
         }
     assert results1["append_stage"]["status"] == "ran"
@@ -295,12 +290,14 @@ async def test_integration_missing_cache_error_includes_recovery_suggestion(
         collector2 = sinks.ResultCollectorSink()
         engine.add_sink(collector2)
         engine.add_source(
-            sources.OneShotSource(stages=None, force=True, reason="test", no_commit=no_commit)
+            sources.OneShotSource(stages=None, force=True, reason="test", no_commit=False)
         )
         await engine.run(exit_on_completion=True)
         raw2 = await collector2.get_results()
         results2 = {
-            name: executor_core.ExecutionSummary(status=e["status"], reason=e["reason"])
+            name: executor_core.ExecutionSummary(
+                status=e["status"], reason=e["reason"], input_hash=None
+            )
             for name, e in raw2.items()
         }
     assert results2["append_stage"]["status"] == "failed"
@@ -308,7 +305,7 @@ async def test_integration_missing_cache_error_includes_recovery_suggestion(
     reason = results2["append_stage"]["reason"]
     assert "Cache missing for IncrementalOut" in reason
     assert "pivot pull" in reason
-    assert expected_lock_dir in reason
+    assert ".pivot/stages" in reason
     assert "append_stage.lock" in reason
 
 

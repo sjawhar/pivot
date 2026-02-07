@@ -53,7 +53,6 @@ def _make_stage_info(
         "run_id": run_id,
         "force": False,
         "no_commit": False,
-        "no_cache": False,
         "dep_specs": {},
         "out_specs": {},
         "params_arg_name": None,

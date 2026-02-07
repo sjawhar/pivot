@@ -6,6 +6,7 @@ import pytest
 import yaml
 
 from pivot import exceptions, project
+from pivot.cli import helpers as cli_helpers
 from pivot.remote import S3Remote
 from pivot.remote import config as remote_config
 from pivot.remote import sync as transfer
@@ -101,6 +102,21 @@ def lock_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return tmp_path
 
 
+@pytest.fixture(autouse=True)
+def _mock_get_stage(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Mock cli_helpers.get_stage to return all-cached outputs.
+
+    Since sync functions now use the registry to filter non-cached outputs,
+    tests that don't set up a full pipeline need this mock. Returning empty
+    outs means non_cached_paths is empty, so all lock file hashes pass through.
+    """
+
+    def _get_stage(name: str) -> dict[str, object]:
+        return {"outs": []}
+
+    monkeypatch.setattr(cli_helpers, "get_stage", _get_stage)
+
+
 def test_get_stage_output_hashes_no_lock(lock_project: Path) -> None:
     """Missing lock file returns empty set with warning."""
     state_dir = lock_project / ".pivot"
@@ -177,26 +193,6 @@ def test_get_stage_output_hashes_multiple_stages(
     result = transfer.get_stage_output_hashes(state_dir, ["stage_a", "stage_b"])
     assert "hash0" + "0" * 11 in result
     assert "hash1" + "0" * 11 in result
-
-
-def test_get_stage_output_hashes_skips_uncached(
-    lock_project: Path, make_valid_lock_content: ValidLockContentFactory
-) -> None:
-    """Skips outputs with null hash (uncached)."""
-    state_dir = lock_project / ".pivot"
-
-    lock_data = make_valid_lock_content(
-        outs=[
-            {"path": "cached.csv", "hash": "abc123def45678"},
-            {"path": "uncached.csv", "hash": None},
-        ]
-    )
-    lock_path = lock_project / ".pivot" / "stages" / "my_stage.lock"
-    with lock_path.open("w") as f:
-        yaml.dump(lock_data, f)
-
-    result = transfer.get_stage_output_hashes(state_dir, ["my_stage"])
-    assert result == {"abc123def45678"}
 
 
 # -----------------------------------------------------------------------------

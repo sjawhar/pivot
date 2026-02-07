@@ -10,7 +10,7 @@ from pivot import config, exceptions, metrics, project
 from pivot.remote import config as remote_config
 from pivot.remote import storage as remote_mod
 from pivot.storage import cache, lock, track
-from pivot.types import DirHash, FileHash, HashInfo, RemoteStatus, TransferSummary
+from pivot.types import DirHash, FileHash, HashInfo, RemoteStatus, TransferSummary, is_dir_hash
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -51,18 +51,32 @@ def get_local_cache_hashes(cache_dir: pathlib.Path) -> set[str]:
 
 
 def get_stage_output_hashes(state_dir: pathlib.Path, stage_names: list[str]) -> set[str]:
-    """Extract output hashes from lock files for specific stages."""
+    """Extract output hashes from lock files for specific stages.
+
+    Only includes hashes for outputs with cache=True (skips Metric and other
+    non-cached outputs that are git-tracked and shouldn't be pushed to remote).
+    Falls back to including all output hashes when registry is unavailable
+    (e.g., push/pull commands use auto_discover=False).
+    """
     hashes = set[str]()
 
     for stage_name in stage_names:
+        try:
+            from pivot.cli import helpers as cli_helpers
+
+            stage_info = cli_helpers.get_stage(stage_name)
+            non_cached_paths = {str(out.path) for out in stage_info["outs"] if not out.cache}
+        except Exception:
+            non_cached_paths = set[str]()  # No registry available, include all outputs
+
         stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(state_dir))
         lock_data = stage_lock.read()
         if lock_data is None:
             logger.warning(f"No lock file for stage '{stage_name}'")
             continue
 
-        for output_hash in lock_data["output_hashes"].values():
-            if output_hash is not None:
+        for out_path, output_hash in lock_data["output_hashes"].items():
+            if out_path not in non_cached_paths:
                 hashes |= _extract_hashes_from_hash_info(output_hash)
 
     return hashes
@@ -88,27 +102,39 @@ def _extract_hashes_from_hash_info(output_hash: HashInfo) -> set[str]:
     """Extract all hashes from a HashInfo (file or directory)."""
     hashes = set[str]()
     hashes.add(output_hash["hash"])
-    if "manifest" in output_hash:
+    if is_dir_hash(output_hash):
         for entry in output_hash["manifest"]:
             hashes.add(entry["hash"])
     return hashes
 
 
 def _get_file_hash_from_stages(rel_path: str, state_dir: pathlib.Path) -> HashInfo | None:
-    """Look up a file's hash from stage lock files."""
+    """Look up a file's hash from stage lock files.
+
+    Only returns hashes for outputs with cache=True (skips non-cached outputs).
+    Falls back to including all outputs when registry is unavailable.
+    """
     stages_dir = lock.get_stages_dir(state_dir)
     if not stages_dir.exists():
         return None
 
     for lock_file in stages_dir.glob("*.lock"):
         stage_name = lock_file.stem
+        try:
+            from pivot.cli import helpers as cli_helpers
+
+            stage_info = cli_helpers.get_stage(stage_name)
+            non_cached_paths = {str(out.path) for out in stage_info["outs"] if not out.cache}
+        except Exception:
+            non_cached_paths = set[str]()  # No registry available, include all outputs
+
         stage_lock = lock.StageLock(stage_name, stages_dir)
         lock_data = stage_lock.read()
         if lock_data is None:
             continue
 
         for out_path, out_hash in lock_data["output_hashes"].items():
-            if out_hash is not None and out_path == rel_path:
+            if out_path == rel_path and out_path not in non_cached_paths:
                 return out_hash
 
     return None
@@ -153,8 +179,17 @@ def get_target_hashes(
             stage_lock = lock.StageLock(target, lock.get_stages_dir(state_dir))
             lock_data = stage_lock.read()
             if lock_data is not None:
-                for out_hash in lock_data["output_hashes"].values():
-                    if out_hash is not None:
+                try:
+                    from pivot.cli import helpers as cli_helpers
+
+                    stage_info = cli_helpers.get_stage(target)
+                    non_cached_paths = {
+                        str(out.path) for out in stage_info["outs"] if not out.cache
+                    }
+                except Exception:
+                    non_cached_paths = set[str]()  # No registry available, include all outputs
+                for out_path, out_hash in lock_data["output_hashes"].items():
+                    if out_path not in non_cached_paths:
                         hashes |= _extract_hashes_from_hash_info(out_hash)
                 if include_deps:
                     for dep_hash in lock_data["dep_hashes"].values():

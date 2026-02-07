@@ -65,7 +65,6 @@ class OneShotSource:
         parallel: bool = True,
         max_workers: int | None = None,
         no_commit: bool = False,
-        no_cache: bool = False,
         on_error: OnError = OnError.FAIL,
         cache_dir: Path | None = None,
         allow_uncached_incremental: bool = False,
@@ -81,7 +80,6 @@ class OneShotSource:
             parallel: If True, run stages in parallel.
             max_workers: Maximum worker processes.
             no_commit: If True, don't update lockfiles.
-            no_cache: If True, disable run cache.
             on_error: Error handling mode.
             cache_dir: Directory for lock files.
             allow_uncached_incremental: Allow incremental outputs without cache.
@@ -96,7 +94,6 @@ class OneShotSource:
             parallel=parallel,
             max_workers=max_workers,
             no_commit=no_commit,
-            no_cache=no_cache,
             on_error=on_error,
             cache_dir=cache_dir,
             allow_uncached_incremental=allow_uncached_incremental,
