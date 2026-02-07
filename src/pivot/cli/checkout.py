@@ -4,16 +4,16 @@ import asyncio
 import enum
 import logging
 import pathlib
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, cast
 
 import click
 
-from pivot import config, project
+from pivot import config, path_utils, project
 from pivot.cli import completion
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
 from pivot.storage import cache, lock, track
-from pivot.types import OutputHash
+from pivot.types import HashInfo, OutputHash, is_dir_hash
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -33,25 +33,40 @@ class CheckoutBehavior(enum.StrEnum):
 
 
 def _get_stage_output_info(state_dir: pathlib.Path) -> dict[str, OutputHash]:
-    """Get output hash info from lock files for all stages."""
-    outputs = dict[str, OutputHash]()
+    """Get output hash info from lock files for cached stage outputs only.
+
+    Non-cached outputs (e.g. Metric with cache=False) are excluded —
+    they are git-tracked and not Pivot's responsibility to restore.
+    """
+    result = dict[str, OutputHash]()
 
     for stage_name in cli_helpers.list_stages():
+        stage_info = cli_helpers.get_stage(stage_name)
+        cached_paths = {
+            path_utils.preserve_trailing_slash(
+                str(out.path),
+                str(project.normalize_path(cast("str", out.path))),
+            )
+            for out in stage_info["outs"]
+            if out.cache
+        }
+
         stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(state_dir))
         lock_data = stage_lock.read()
         if lock_data and "output_hashes" in lock_data:
             for out_path, out_hash in lock_data["output_hashes"].items():
-                # Normalize paths for backward compatibility with old lock files
-                # (old lock files may have resolved paths, new ones have normalized)
-                norm_path = str(project.normalize_path(out_path))
-                outputs[norm_path] = out_hash
+                norm_path = path_utils.preserve_trailing_slash(
+                    out_path, str(project.normalize_path(out_path))
+                )
+                if norm_path in cached_paths:
+                    result[norm_path] = out_hash
 
-    return outputs
+    return result
 
 
 def _restore_path_sync(
     path: pathlib.Path,
-    output_hash: OutputHash,
+    output_hash: HashInfo,
     cache_dir: pathlib.Path,
     checkout_modes: list[cache.CheckoutMode],
     behavior: CheckoutBehavior,
@@ -77,7 +92,7 @@ def _restore_path_sync(
                 # For directories with manifests, don't skip - files inside may be missing.
                 # Let restore_from_cache() handle it (does full directory restoration).
                 # DirHash has "manifest" key, FileHash does not.
-                is_directory = output_hash is not None and "manifest" in output_hash
+                is_directory = is_dir_hash(output_hash)
                 if not is_directory:
                     return ("skipped", path.name)
             case CheckoutBehavior.FORCE:
@@ -113,7 +128,7 @@ async def _checkout_files_async(
     skipped = 0
     immediate_errors = list[click.ClickException]()
 
-    async def restore_one(abs_path_str: str, output_hash: OutputHash) -> None:
+    async def restore_one(abs_path_str: str, output_hash: HashInfo) -> None:
         nonlocal restored, skipped
         path = pathlib.Path(abs_path_str)
         try:
@@ -134,10 +149,10 @@ async def _checkout_files_async(
     try:
         async with asyncio.TaskGroup() as tg:
             for abs_path_str, output_hash in files.items():
-                if output_hash is not None:
-                    tg.create_task(restore_one(abs_path_str, output_hash))
-                else:
+                if output_hash is None:
                     logger.debug(f"Skipping output with no cached hash: {abs_path_str}")
+                    continue
+                tg.create_task(restore_one(abs_path_str, output_hash))
     except* Exception as eg:
         # Convert unexpected exceptions to friendly error message
         errors = [str(e) for e in eg.exceptions]
@@ -203,13 +218,7 @@ def _validate_and_build_files(
 
         # Check if it's a stage output
         if abs_path_str in stage_outputs:
-            output_hash = stage_outputs[abs_path_str]
-            if output_hash is None:
-                raise click.ClickException(
-                    f"'{target}' has no cached version. "
-                    + "Run the stage first, or use 'pivot pull' to fetch from remote."
-                )
-            files[abs_path_str] = output_hash
+            files[abs_path_str] = stage_outputs[abs_path_str]
             continue
 
         # Unknown target
@@ -334,7 +343,7 @@ def checkout(
     # Discover tracked files
     tracked_files = track.discover_pvt_files(project_root)
 
-    # Get stage output info from lock files
+    # Get stage output info from lock files (cached outputs only)
     stage_outputs = _get_stage_output_info(state_dir)
 
     # Run async checkout
