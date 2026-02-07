@@ -793,7 +793,7 @@ def test_apply_deferred_writes_output_generations(tmp_path: pathlib.Path) -> Non
     db_path = tmp_path / "state.db"
     output1 = tmp_path / "output1.csv"
     output2 = tmp_path / "output2.csv"
-    deferred: DeferredWrites = {}
+    deferred: DeferredWrites = {"increment_outputs": True}
 
     with state.StateDB(db_path) as db:
         # First apply - outputs should be at generation 1
@@ -805,6 +805,20 @@ def test_apply_deferred_writes_output_generations(tmp_path: pathlib.Path) -> Non
         db.apply_deferred_writes("stage", [str(output1), str(output2)], deferred)
         assert db.get_generation(output1) == 2
         assert db.get_generation(output2) == 2
+
+
+def test_apply_deferred_writes_skips_output_increment_when_flag_absent(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Output generations should NOT be incremented when increment_outputs is absent."""
+    db_path = tmp_path / "state.db"
+    output1 = tmp_path / "output1.csv"
+    deferred: DeferredWrites = {"dep_generations": {"/dep.csv": 5}}
+
+    with state.StateDB(db_path) as db:
+        db.apply_deferred_writes("stage", [str(output1)], deferred)
+        assert db.get_generation(output1) is None
+        assert db.get_dep_generations("stage") == {"/dep.csv": 5}
 
 
 def test_apply_deferred_writes_run_cache(tmp_path: pathlib.Path) -> None:
@@ -841,6 +855,7 @@ def test_apply_deferred_writes_all_fields(tmp_path: pathlib.Path) -> None:
         "dep_generations": {"/dep.csv": 10},
         "run_cache_input_hash": "input_abc",
         "run_cache_entry": run_cache_entry,
+        "increment_outputs": True,
     }
 
     with state.StateDB(db_path) as db:
@@ -898,7 +913,7 @@ def test_apply_deferred_writes_path_too_long_output(tmp_path: pathlib.Path) -> N
     for i in range(12):
         nested = nested / ("o" * 50 + str(i))
     long_output = str(nested / "output.csv")
-    deferred: DeferredWrites = {}
+    deferred: DeferredWrites = {"increment_outputs": True}
 
     with state.StateDB(db_path) as db, pytest.raises(state.PathTooLongError):
         db.apply_deferred_writes("stage", [long_output], deferred)
@@ -1767,3 +1782,39 @@ def test_put_raw_overwrites_existing(tmp_path: pathlib.Path) -> None:
         db.put_raw(key, b"old_value")
         db.put_raw(key, b"new_value")
         assert db.get_raw(key) == b"new_value"
+
+
+def test_apply_deferred_writes_skips_output_increment_when_flag_false(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Output generations should NOT be incremented when increment_outputs is explicitly False.
+
+    This covers the case where the worker explicitly sets increment_outputs=False
+    (as opposed to the key being absent entirely). Both should skip incrementing.
+    """
+    db_path = tmp_path / "state.db"
+    output1 = tmp_path / "output1.csv"
+    deferred: DeferredWrites = {"increment_outputs": False, "dep_generations": {"/dep.csv": 5}}
+
+    with state.StateDB(db_path) as db:
+        db.apply_deferred_writes("stage", [str(output1)], deferred)
+        assert db.get_generation(output1) is None, (
+            "Output generation should not be incremented when flag is explicitly False"
+        )
+        assert db.get_dep_generations("stage") == {"/dep.csv": 5}
+
+
+def test_apply_deferred_writes_empty_output_paths_with_flag_true(
+    tmp_path: pathlib.Path,
+) -> None:
+    """increment_outputs=True with empty output_paths should not error.
+
+    A stage with no declared outputs but increment_outputs=True should
+    simply be a no-op for output generation incrementing.
+    """
+    db_path = tmp_path / "state.db"
+    deferred: DeferredWrites = {"increment_outputs": True}
+
+    with state.StateDB(db_path) as db:
+        # Should not raise
+        db.apply_deferred_writes("stage", [], deferred)

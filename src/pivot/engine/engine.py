@@ -598,9 +598,11 @@ class Engine:
                                 )
                                 stage_durations[stage_name] = duration_ms
 
-                                # Apply deferred writes for successful stages
-                                # Both RAN and SKIPPED (run cache) can carry deferred writes
-                                if result["status"] != StageStatus.FAILED and not no_commit:
+                                # Apply deferred writes for RAN and SKIPPED stages
+                                if (
+                                    result["status"] in (StageStatus.RAN, StageStatus.SKIPPED)
+                                    and not no_commit
+                                ):
                                     stage_info = self._get_stage(stage_name)
                                     output_paths = [str(out.path) for out in stage_info["outs"]]
                                     executor_core.apply_deferred_writes(

@@ -278,3 +278,93 @@ def test_regular_execution_still_works(
     result2 = executor.execute_stage("test_stage", stage_info, worker_env, output_queue)
     assert result2["status"] == "skipped"
     assert "unchanged" in result2["reason"]
+
+
+def test_run_cache_skip_does_not_increment_output_generations(
+    worker_env: pathlib.Path, output_queue: mp.Queue[OutputMessage], tmp_path: pathlib.Path
+) -> None:
+    """Run cache skip should NOT increment output generations.
+
+    This is the critical integration test for the increment_outputs flag:
+    1. First run: outputs get generation 1
+    2. Modify dep, second run: outputs get generation 2
+    3. Revert dep, third run: skips via run cache, outputs stay at generation 2
+
+    If output generations were wrongly incremented on run cache skip, downstream
+    stages would see a generation bump and think they need to re-run even though
+    the outputs are identical to what they already processed.
+    """
+    input_file = tmp_path / "input.txt"
+    input_file.write_text("state_A")
+
+    def stage_func() -> None:
+        content = (tmp_path / "input.txt").read_text()
+        (tmp_path / "output.txt").write_text(f"processed: {content}")
+
+    out = outputs.Out(str(tmp_path / "output.txt"), loader=loaders.PathOnly())
+    stage_info = _make_stage_info(
+        stage_func,
+        tmp_path,
+        fingerprint={"self:stage_func": "fp123"},
+        deps=["input.txt"],
+        outs=[out],
+        run_id="run_1",
+    )
+
+    state_db_path = tmp_path / ".pivot" / "state.db"
+
+    # Step 1: First run - creates lock file with state A, output gen -> 1
+    result1 = executor.execute_stage("test_stage", stage_info, worker_env, output_queue)
+    assert result1["status"] == "ran"
+    _apply_deferred_writes("test_stage", stage_info, result1, state_db_path)
+
+    with state.StateDB(state_db_path) as db:
+        gen_after_run1 = db.get_generation(tmp_path / "output.txt")
+    assert gen_after_run1 == 1, f"Expected generation 1 after first run, got {gen_after_run1}"
+
+    # Step 2: Modify input to state B
+    input_file.write_text("state_B")
+
+    # Step 3: Run again - output gen -> 2
+    stage_info_run2 = _make_stage_info(
+        stage_func,
+        tmp_path,
+        fingerprint={"self:stage_func": "fp123"},
+        deps=["input.txt"],
+        outs=[out],
+        run_id="run_2",
+    )
+    result2 = executor.execute_stage("test_stage", stage_info_run2, worker_env, output_queue)
+    assert result2["status"] == "ran"
+    _apply_deferred_writes("test_stage", stage_info_run2, result2, state_db_path)
+
+    with state.StateDB(state_db_path) as db:
+        gen_after_run2 = db.get_generation(tmp_path / "output.txt")
+    assert gen_after_run2 == 2, f"Expected generation 2 after second run, got {gen_after_run2}"
+
+    # Step 4: Revert input to state A
+    input_file.write_text("state_A")
+
+    # Step 5: Run again - should skip via run cache
+    stage_info_run3 = _make_stage_info(
+        stage_func,
+        tmp_path,
+        fingerprint={"self:stage_func": "fp123"},
+        deps=["input.txt"],
+        outs=[out],
+        run_id="run_3",
+    )
+    result3 = executor.execute_stage("test_stage", stage_info_run3, worker_env, output_queue)
+    assert result3["status"] == "skipped"
+    assert "run cache" in result3["reason"], f"Expected run cache skip, got: {result3['reason']}"
+
+    # Apply deferred writes from the SKIPPED result
+    _apply_deferred_writes("test_stage", stage_info_run3, result3, state_db_path)
+
+    # CRITICAL: Output generation should NOT have been incremented
+    with state.StateDB(state_db_path) as db:
+        gen_after_skip = db.get_generation(tmp_path / "output.txt")
+    assert gen_after_skip == 2, (
+        f"Output generation should remain at 2 after run cache skip, got {gen_after_skip}. "
+        "Run cache skip should not increment output generations since outputs are restored, not rewritten."
+    )

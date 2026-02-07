@@ -2843,7 +2843,7 @@ def test_build_deferred_writes_excludes_noncached_from_run_cache(
         outs=[out, metric],
     )
 
-    output_hashes: dict[str, HashInfo] = {
+    output_hashes: dict[str, FileHash] = {
         "output.txt": FileHash(hash="abc123"),
         "metrics.json": FileHash(hash="def456"),
     }
@@ -2883,7 +2883,7 @@ def test_build_deferred_writes_no_run_cache_when_all_noncached(
         outs=[metric1, metric2],
     )
 
-    output_hashes: dict[str, HashInfo] = {
+    output_hashes: dict[str, FileHash] = {
         "metrics1.json": FileHash(hash="aaa111"),
         "metrics2.json": FileHash(hash="bbb222"),
     }
@@ -2957,3 +2957,66 @@ def test_run_cache_skip_with_mixed_cached_and_noncached_outputs(
     for out_path, out_hash in lock_data["output_hashes"].items():
         assert out_hash is not None, f"Output {out_path} should have a real hash, not None"
         assert "hash" in out_hash, f"Output {out_path} should have a 'hash' key"
+
+
+def test_build_deferred_writes_sets_increment_outputs_true_by_default(
+    tmp_path: pathlib.Path,
+) -> None:
+    """_build_deferred_writes sets increment_outputs=True by default (RAN path).
+
+    When a stage actually executes (RAN), its outputs are new and their
+    generation counters must be incremented so downstream skip detection works.
+    """
+    state_dir = tmp_path / ".pivot"
+    state_dir.mkdir()
+
+    out = outputs.Out("output.txt", loader=loaders.PathOnly())
+    stage_info: WorkerStageInfo = _make_stage_info(
+        _helper_noop_stage,
+        tmp_path,
+        outs=[out],
+    )
+
+    output_hashes: dict[str, HashInfo] = {
+        "output.txt": FileHash(hash="abc123"),
+    }
+
+    with state.StateDB(state_dir / "state.db") as state_db:
+        result = worker._build_deferred_writes(stage_info, "input_hash_1", output_hashes, state_db)
+
+    assert "increment_outputs" in result
+    assert result["increment_outputs"] is True, (
+        "Default (RAN path) should set increment_outputs=True"
+    )
+
+
+def test_build_deferred_writes_omits_increment_outputs_when_false(
+    tmp_path: pathlib.Path,
+) -> None:
+    """_build_deferred_writes omits increment_outputs when flag is False (run cache skip path).
+
+    When a stage is skipped via run cache, its outputs were restored from cache
+    and their generation counters must NOT be incremented — they haven't changed.
+    """
+    state_dir = tmp_path / ".pivot"
+    state_dir.mkdir()
+
+    out = outputs.Out("output.txt", loader=loaders.PathOnly())
+    stage_info: WorkerStageInfo = _make_stage_info(
+        _helper_noop_stage,
+        tmp_path,
+        outs=[out],
+    )
+
+    output_hashes: dict[str, HashInfo] = {
+        "output.txt": FileHash(hash="abc123"),
+    }
+
+    with state.StateDB(state_dir / "state.db") as state_db:
+        result = worker._build_deferred_writes(
+            stage_info, "input_hash_1", output_hashes, state_db, increment_outputs=False
+        )
+
+    assert "increment_outputs" not in result, (
+        "Run cache skip path should NOT set increment_outputs in deferred writes"
+    )
