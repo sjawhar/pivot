@@ -58,13 +58,20 @@ OutOverrideInput = outputs.PathType | OutOverride
 class RegistryStageInfo(TypedDict):
     """Metadata for a registered stage.
 
+    Path Invariant:
+        All paths in deps, deps_paths, outs, and outs_paths are in canonical
+        absolute form (normalized, no .., trailing slash for DirectoryOut).
+        This form is produced by path_utils.canonicalize_artifact_path().
+        Lockfiles are the one boundary where absolute <-> project-relative
+        conversion happens (see storage/lock.py).
+
     Attributes:
         func: The stage function to execute.
         name: Unique stage identifier (function name or custom name).
-        deps: Named input file dependencies (name -> path(s), absolute paths).
-        deps_paths: Flattened list of all dependency paths (absolute paths, for DAG/worker).
+        deps: Named input file dependencies (name -> path(s), canonical absolute).
+        deps_paths: Flattened list of all dependency paths (canonical absolute, for DAG/worker).
         outs: Output specifications (expanded for DAG/caching - one Out per file).
-        outs_paths: Output file paths (absolute paths).
+        outs_paths: Output file paths (canonical absolute).
         params: Pydantic model instance with parameter values.
         mutex: Mutex groups for exclusive execution.
         variant: Variant name for matrix stages (None for regular stages).
@@ -622,17 +629,10 @@ def _normalize_paths(
     path_type: path_policy.PathType,
     validation_mode: ValidationMode,
 ) -> list[str]:
-    """Normalize paths to absolute paths, applying policy-based validation.
+    """Normalize paths to canonical absolute form, applying policy-based validation.
 
-    All paths are relative to project root.
-
-    Args:
-        paths: Paths to normalize
-        path_type: Type of path (DEP or OUT) for policy lookup
-        validation_mode: How to handle validation errors
-
-    Raises:
-        InvalidPathError: If path violates its type's policy
+    Uses canonicalize_artifact_path() for the core normalization, then applies
+    policy checks (project containment, symlink escape detection).
     """
     normalized = list[str]()
     project_root = project.get_project_root()
@@ -640,26 +640,22 @@ def _normalize_paths(
 
     for path in paths:
         try:
-            # Normalize path to absolute (from project root)
-            if pathlib.Path(path).is_absolute():
-                norm_path = pathlib.Path(path)
-            else:
-                norm_path = project.normalize_path(path)
+            # Canonicalize path to absolute form
+            norm_str = path_utils.canonicalize_artifact_path(path, project_root)
+            norm_path = pathlib.Path(norm_str.rstrip("/"))
 
             # Check if path is within project root
             is_within_project = norm_path.is_relative_to(project_root)
 
             if not is_within_project:
-                # Path is outside project root
                 if not policy["allow_absolute"]:
                     raise exceptions.InvalidPathError(
                         f"{path_type.value.capitalize()} path '{path}' resolves to '{norm_path}' "
                         + f"which is outside project root '{project_root}'"
                     )
-                # Allowed (deps only) - warn about reproducibility
                 logger.warning(f"Absolute {path_type.value} path may break reproducibility: {path}")
             else:
-                # Path is within project - check symlink escape (for paths that exist)
+                # Symlink escape check (for paths that exist)
                 if norm_path.exists() and project.contains_symlink_in_path(norm_path, project_root):
                     resolved = norm_path.resolve()
                     if not resolved.is_relative_to(project_root.resolve()):
@@ -676,14 +672,11 @@ def _normalize_paths(
                             + "This may affect portability across environments."
                         )
 
-            # Restore trailing slash for directory paths (pathlib strips it)
-            result_path = path_utils.preserve_trailing_slash(path, str(norm_path))
-            normalized.append(result_path)
+            normalized.append(norm_str)
         except (ValueError, OSError, exceptions.InvalidPathError):
             if validation_mode == ValidationMode.WARN:
-                result_path = str(project.normalize_path(path))
-                result_path = path_utils.preserve_trailing_slash(path, result_path)
-                normalized.append(result_path)
+                norm_str = path_utils.canonicalize_artifact_path(path, project_root)
+                normalized.append(norm_str)
             else:
                 raise
     return normalized

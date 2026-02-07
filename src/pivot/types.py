@@ -202,10 +202,14 @@ class OutputFormat(enum.StrEnum):
 #
 # Two representations exist for different purposes:
 #
-#   StorageLockData   On-disk YAML format. Uses relative paths (portable across
-#                     machines) and list-based deps/outs (stable YAML output).
+#   StorageLockData   On-disk YAML format. Uses project-relative paths
+#                     (portable across machines) and list-based deps/outs
+#                     (stable YAML output). This is the ONLY place relative
+#                     paths appear — converted at read/write boundary in
+#                     storage/lock.py.
 #
-#   LockData          In-memory format. Uses absolute paths (fast comparisons)
+#   LockData          In-memory format. Uses canonical absolute paths
+#                     (matching registry/engine convention, fast comparisons)
 #                     and dict-based deps/outs (O(1) lookups by path).
 #
 # Conversion happens at read/write time in storage/lock.py.

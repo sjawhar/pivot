@@ -791,7 +791,7 @@ def test_out_path_overrides_accepts_simple_string(
     register_test_stage(my_stage, out_path_overrides={"output": "override.txt"})
 
     info = test_pipeline.get("my_stage")
-    assert info["out_specs"]["output"].path == "override.txt"
+    assert info["out_specs"]["output"].path == str(set_project_root / "override.txt")
 
 
 def test_out_path_overrides_accepts_dict_with_options(
@@ -808,7 +808,7 @@ def test_out_path_overrides_accepts_dict_with_options(
     )
 
     info = test_pipeline.get("my_stage2")
-    assert info["out_specs"]["output"].path == "override.txt"
+    assert info["out_specs"]["output"].path == str(set_project_root / "override.txt")
     assert info["out_specs"]["output"].cache is False
 
 
@@ -827,7 +827,10 @@ def test_out_path_overrides_accepts_list_paths(
     register_test_stage(my_stage3, out_path_overrides={"items": ["x.txt", "y.txt"]})
 
     info = test_pipeline.get("my_stage3")
-    assert info["out_specs"]["items"].path == ["x.txt", "y.txt"]
+    assert info["out_specs"]["items"].path == [
+        str(set_project_root / "x.txt"),
+        str(set_project_root / "y.txt"),
+    ]
 
 
 # ==============================================================================
