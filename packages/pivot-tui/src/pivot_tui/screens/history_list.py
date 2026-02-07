@@ -12,12 +12,12 @@ import textual.css.query
 import textual.screen
 import textual.widgets
 
-from pivot.tui.widgets import status
+from pivot_tui.widgets import status
 
 if TYPE_CHECKING:
     import collections
 
-    from pivot.tui.types import ExecutionHistoryEntry
+    from pivot_tui.types import ExecutionHistoryEntry
 
 _logger = logging.getLogger(__name__)
 

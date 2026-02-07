@@ -8,7 +8,7 @@ from pivot.types import DisplayCategory, StageStatus, categorize_stage_result
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
-    from pivot.tui.types import StageInfo
+    from pivot_tui.types import StageInfo
 
 
 def format_elapsed(elapsed: float | None) -> str:

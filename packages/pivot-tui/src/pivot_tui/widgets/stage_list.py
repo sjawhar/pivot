@@ -11,13 +11,13 @@ import textual.css.query
 import textual.message
 import textual.widgets
 
-from pivot.tui.widgets import status
 from pivot.types import StageStatus
+from pivot_tui.widgets import status
 
 if TYPE_CHECKING:
     from textual.events import Resize
 
-    from pivot.tui.types import StageInfo
+    from pivot_tui.types import StageInfo
 
 
 class FilterEscapePressed(textual.message.Message):

@@ -95,6 +95,14 @@ def categorize_stage_result(status: StageStatus, reason: str) -> DisplayCategory
             return DisplayCategory.UNKNOWN
 
 
+def parse_stage_name(name: str) -> tuple[str, str]:
+    """Parse stage name into (base_name, variant). Returns (name, '') if no @."""
+    if "@" in name:
+        base, variant = name.split("@", 1)
+        return (base, variant)
+    return (name, "")
+
+
 class StageDisplayStatus(enum.StrEnum):
     """Display status for stage progress output."""
 

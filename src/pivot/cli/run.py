@@ -80,7 +80,13 @@ def _run_with_tui(
     main thread for TUI (required for signal handlers like SIGTSTP).
     """
     from pivot.executor import core as executor_core
-    from pivot.tui import run as tui_run
+
+    try:
+        from pivot_tui import run as tui_run
+    except ImportError as err:
+        raise click.UsageError(
+            "The TUI requires the 'pivot-tui' package. Install it with: uv pip install pivot-tui"
+        ) from err
 
     # Pre-warm loky executor before starting Textual TUI.
     # Textual manipulates terminal file descriptors which breaks loky's
@@ -244,8 +250,8 @@ def _run_plain_mode(
     show_output: bool = False,
 ) -> dict[str, ExecutionSummary]:
     """Run pipeline in plain (non-TUI) mode with optional console output."""
+    from pivot.cli import console as tui_console
     from pivot.executor import core as executor_core
-    from pivot.tui import console as tui_console
 
     console: tui_console.Console | None = None
     if not quiet:

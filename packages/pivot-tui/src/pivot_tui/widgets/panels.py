@@ -11,12 +11,12 @@ import textual.css.query
 import textual.timer
 import textual.widgets
 
-from pivot.tui.diff_panels import InputDiffPanel, OutputDiffPanel
-from pivot.tui.widgets import status
-from pivot.tui.widgets.logs import LogSearchEscapePressed, LogSearchInput, StageLogPanel
+from pivot_tui.diff_panels import InputDiffPanel, OutputDiffPanel
+from pivot_tui.widgets import status
+from pivot_tui.widgets.logs import LogSearchEscapePressed, LogSearchInput, StageLogPanel
 
 if TYPE_CHECKING:
-    from pivot.tui.types import ExecutionHistoryEntry, StageDataProvider, StageInfo
+    from pivot_tui.types import ExecutionHistoryEntry, StageDataProvider, StageInfo
 
 _logger = logging.getLogger(__name__)
 

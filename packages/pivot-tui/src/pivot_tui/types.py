@@ -4,18 +4,10 @@ import collections
 import dataclasses
 from typing import TYPE_CHECKING, NamedTuple, Protocol
 
-from pivot.types import OutputChange, StageExplanation, StageStatus
+from pivot.types import OutputChange, StageExplanation, StageStatus, parse_stage_name
 
 if TYPE_CHECKING:
     from pivot.registry import RegistryStageInfo
-
-
-def parse_stage_name(name: str) -> tuple[str, str]:
-    """Parse stage name into (base_name, variant). Returns (name, '') if no @."""
-    if "@" in name:
-        base, variant = name.split("@", 1)
-        return (base, variant)
-    return (name, "")
 
 
 class StageDataProvider(Protocol):

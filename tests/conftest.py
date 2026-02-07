@@ -17,11 +17,11 @@ import click.testing
 import pytest
 
 from pivot import project
+from pivot.cli import console
 from pivot.config import io as config_io
 from pivot.executor import core as executor_core
 from pivot.pipeline import pipeline as pipeline_mod
 from pivot.registry import StageRegistry
-from pivot.tui import console
 
 # Add tests directory to sys.path so helpers.py can be imported
 _tests_dir = pathlib.Path(__file__).parent

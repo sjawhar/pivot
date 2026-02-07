@@ -67,7 +67,6 @@ async def test_tui_sink_posts_stage_completed() -> None:
         "status": StageStatus.RAN,
         "reason": "success",
         "duration_ms": 1500,
-        "input_hash": None,
     }
     await sink.handle(event)
 
@@ -141,7 +140,6 @@ async def test_tui_sink_handles_multiple_events() -> None:
             "status": StageStatus.RAN,
             "reason": "",
             "duration_ms": 100,
-            "input_hash": None,
         },
         {"type": "stage_started", "stage": "b", "index": 1, "total": 2},
     ]
@@ -211,7 +209,6 @@ async def test_tui_sink_posts_multiple_event_types_in_sequence() -> None:
             "status": StageStatus.RAN,
             "reason": "code changed",
             "duration_ms": 2500.0,
-            "input_hash": None,
         },
     ]
 

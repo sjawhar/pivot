@@ -458,6 +458,7 @@ def test_configure_output_sink_quiet_mode(mocker: MockerFixture) -> None:
 def test_configure_output_sink_tui_mode(mocker: MockerFixture) -> None:
     """configure_output_sink adds TuiSink when tui=True."""
     from pivot.engine import engine, sinks
+    from pivot_tui.sink import TuiSink
 
     mock_engine = mocker.MagicMock(spec=engine.Engine)
     mock_app = mocker.MagicMock()
@@ -475,7 +476,7 @@ def test_configure_output_sink_tui_mode(mocker: MockerFixture) -> None:
 
     mock_engine.add_sink.assert_called_once()
     added_sink = mock_engine.add_sink.call_args[0][0]
-    assert isinstance(added_sink, sinks.TuiSink)
+    assert isinstance(added_sink, TuiSink)
 
 
 def test_configure_output_sink_console_mode(mocker: MockerFixture) -> None:

@@ -10,8 +10,8 @@ import textual.binding
 import textual.message
 import textual.widgets
 
-from pivot.tui.types import LogEntry
 from pivot.types import StageStatus
+from pivot_tui.types import LogEntry
 
 # Matches: [optional ANSI][optional timestamp][LEVEL][delimiter]
 # Examples: "INFO: msg", "[DEBUG] msg", "2024-01-01 10:00:00 WARNING msg"
@@ -45,7 +45,7 @@ def _get_line_style(line: str, is_stderr: bool) -> str | None:
 
 
 if TYPE_CHECKING:
-    from pivot.tui.types import StageInfo
+    from pivot_tui.types import StageInfo
 
 
 class LogSearchEscapePressed(textual.message.Message):

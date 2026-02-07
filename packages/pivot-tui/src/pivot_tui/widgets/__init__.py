@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from pivot.tui.widgets.debug import DebugPanel
-from pivot.tui.widgets.footer import FooterContext, PivotFooter
-from pivot.tui.widgets.logs import StageLogPanel
-from pivot.tui.widgets.panels import TabbedDetailPanel
-from pivot.tui.widgets.stage_list import StageGroupHeader, StageListPanel, StageRow
-from pivot.tui.widgets.status import (
+from pivot_tui.widgets.debug import DebugPanel
+from pivot_tui.widgets.footer import FooterContext, PivotFooter
+from pivot_tui.widgets.logs import StageLogPanel
+from pivot_tui.widgets.panels import TabbedDetailPanel
+from pivot_tui.widgets.stage_list import StageGroupHeader, StageListPanel, StageRow
+from pivot_tui.widgets.status import (
     StatusCounts,
     count_statuses,
     format_elapsed,

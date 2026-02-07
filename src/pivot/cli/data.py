@@ -126,7 +126,13 @@ def diff(
                     temp_file.unlink(missing_ok=True)
     else:
         # Launch TUI
-        from pivot.tui import diff as data_tui
+        try:
+            from pivot_tui import diff as data_tui
+        except ImportError as err:
+            raise click.UsageError(
+                "The TUI requires the 'pivot-tui' package. "
+                "Install it with: uv pip install pivot-tui"
+            ) from err
 
         data_tui.run_diff_app(
             diff_entries=hash_diffs,

@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 import textual.widgets
 
 if TYPE_CHECKING:
-    from pivot.tui.stats import DebugStats, MessageStats
+    from pivot_tui.stats import DebugStats, MessageStats
 
 
 def _format_message_stats(stats: MessageStats) -> str:
