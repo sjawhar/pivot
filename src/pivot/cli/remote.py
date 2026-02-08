@@ -251,6 +251,13 @@ def pull(
 
     targets_list = _get_targets_list(targets)
 
+    # Fail early if no pipeline and no targets specified (unless --all was used)
+    use_all = cli_decorators.get_all_pipelines_from_context()
+    if pipeline is None and not targets_list and not use_all:
+        raise click.ClickException(
+            "No pipeline found. Use --all to pull from all pipelines, or specify file targets."
+        )
+
     # Dry-run: show what would be fetched, don't proceed to checkout
     if dry_run:
         if targets_list:
@@ -297,6 +304,10 @@ def pull(
     # Step 2: Checkout from cache to workspace
     # Import here to avoid circular imports at module level
     from pivot.cli import checkout as checkout_mod
+
+    # Default to only_missing=True to avoid "already exists" errors
+    if not force and not only_missing:
+        only_missing = True
 
     ctx.invoke(
         checkout_mod.checkout,

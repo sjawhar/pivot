@@ -431,7 +431,7 @@ def test_pull_dry_run_all(
         )
         mocker.patch.object(transfer, "get_local_cache_hashes", return_value={"remote1"})
 
-        result = runner.invoke(cli.cli, ["pull", "--dry-run"])
+        result = runner.invoke(cli.cli, ["pull", "--dry-run", "--all"])
 
         assert result.exit_code == 0
         assert "Would pull 2 file(s) from 'origin'" in result.output
@@ -471,7 +471,7 @@ def test_pull_success(
         # Mock checkout to prevent actual file restoration
         mocker.patch.object(checkout_mod, "checkout")
 
-        result = runner.invoke(cli.cli, ["pull"])
+        result = runner.invoke(cli.cli, ["pull", "output.csv"])
 
         assert result.exit_code == 0
         assert "Fetched from 'origin': 3 transferred, 1 skipped, 0 failed" in result.output
@@ -520,7 +520,7 @@ def test_pull_with_errors(
         mock_state_db = mocker.MagicMock()
         mocker.patch.object(state, "StateDB", return_value=mock_state_db)
 
-        result = runner.invoke(cli.cli, ["pull"])
+        result = runner.invoke(cli.cli, ["pull", "output.csv"])
 
         assert result.exit_code == 1, "Should exit non-zero when transfers fail"
         assert "2 transferred" in result.output
@@ -617,7 +617,7 @@ def test_pull_exception_shows_click_error(
             side_effect=RuntimeError("Test error"),
         )
 
-        result = runner.invoke(cli.cli, ["pull"])
+        result = runner.invoke(cli.cli, ["pull", "output.csv"])
 
         assert result.exit_code != 0
         assert "Test error" in result.output
