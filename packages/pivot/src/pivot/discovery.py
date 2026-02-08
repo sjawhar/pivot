@@ -191,20 +191,25 @@ def _discover_all_pipelines(root: pathlib.Path) -> Pipeline | None:
     for pipeline in pipelines:
         combined.include(pipeline)  # Auto-prefixes on name collision
 
-    # Warn about unresolved external dependencies in --all mode
-    local_outputs = set[str]()
-    all_deps = set[str]()
-    for stage_name in combined.list_stages():
-        info = combined.get(stage_name)
-        local_outputs.update(info["outs_paths"])
-        all_deps.update(info["deps_paths"])
-    unresolved = all_deps - local_outputs
-    if unresolved:
-        sample = ", ".join(sorted(unresolved)[:5])
-        suffix = f"... ({len(unresolved)} total)" if len(unresolved) > 5 else ""
-        logger.warning(
-            f"--all: dependency path(s) not produced by any discovered pipeline: {sample}{suffix}"
-        )
+    if logger.isEnabledFor(logging.DEBUG):
+        local_outputs = set[str]()
+        all_deps = set[str]()
+        for stage_name in combined.list_stages():
+            info = combined.get(stage_name)
+            local_outputs.update(info["outs_paths"])
+            all_deps.update(info["deps_paths"])
+        unresolved = all_deps - local_outputs
+        if unresolved:
+            sample = ", ".join(sorted(unresolved)[:5])
+            suffix = f"... ({len(unresolved)} total)" if len(unresolved) > 5 else ""
+            logger.debug(
+                f"--all: dependency path(s) not produced by any discovered pipeline: {sample}{suffix}"
+            )
+
+    # All pipelines are already merged — no external deps to resolve between them.
+    # Mark resolved to skip the redundant (and expensive) re-discovery in
+    # resolve_external_dependencies(), which would re-load every pipeline.py.
+    combined._external_deps_resolved = True  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
 
     logger.info(
         f"Discovered {len(pipelines)} pipelines with {len(combined.list_stages())} total stages"

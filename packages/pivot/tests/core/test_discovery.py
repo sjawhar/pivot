@@ -1257,14 +1257,14 @@ pipeline.register(_stage, name="consumer")
 """
     (sub_dir / "pipeline.py").write_text(code)
 
-    with caplog.at_level(logging.WARNING):
+    with caplog.at_level(logging.DEBUG):
         result = discovery.discover_pipeline(set_project_root, all_pipelines=True)
 
     assert result is not None
     assert "consumer" in result.list_stages()
-    # Should warn about the unresolved dependency
+    # Should log about the unresolved dependency at debug level
     assert any("not produced by any discovered pipeline" in msg for msg in caplog.messages), (
-        f"Expected warning about unresolved deps, got: {caplog.messages}"
+        f"Expected debug message about unresolved deps, got: {caplog.messages}"
     )
 
 

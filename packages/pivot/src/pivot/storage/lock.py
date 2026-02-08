@@ -346,8 +346,8 @@ def acquire_execution_lock(stage_name: str, stages_dir: Path) -> Path:
                                                     │ "after 3 attempts" │
                                                     └────────────────────┘
     """
-    stages_dir.mkdir(parents=True, exist_ok=True)
     sentinel = stages_dir / f"{stage_name}.running"
+    sentinel.parent.mkdir(parents=True, exist_ok=True)
 
     for _ in range(_MAX_LOCK_ATTEMPTS):
         # Fast path: try atomic create
