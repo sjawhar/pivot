@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     from pytest_mock import MockerFixture
 
     from pivot.engine.engine import Engine
+    from pivot.engine.types import OutputEvent
     from pivot.types import OutputMessage
 
 # Type alias for git_repo fixture: (repo_path, commit_fn)
@@ -499,3 +500,34 @@ def send_rpc(
         sock.sendall(json.dumps(request).encode() + b"\n")
         response = sock.recv(4096).decode()
     return json.loads(response)
+
+
+class AsyncEventCaptureSink:
+    """Async sink that captures all events for inspection."""
+
+    def __init__(self) -> None:
+        self.events: list[OutputEvent] = []
+
+    async def handle(self, event: OutputEvent) -> None:
+        self.events.append(event)
+
+    async def close(self) -> None:
+        pass
+
+
+@pytest.fixture
+def minimal_pipeline(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, test_pipeline: pipeline_mod.Pipeline
+) -> pipeline_mod.Pipeline:
+    """Set up a minimal pipeline for testing."""
+    from pivot import config
+
+    monkeypatch.setattr(config, "get_cache_dir", lambda: tmp_path / "cache")
+    monkeypatch.setattr(config, "get_state_dir", lambda: tmp_path / "state")
+    monkeypatch.setattr(config, "get_state_db_path", lambda: tmp_path / "state" / "state.db")
+    monkeypatch.chdir(tmp_path)
+
+    (tmp_path / ".pivot").mkdir(exist_ok=True)
+    (tmp_path / ".git").mkdir(exist_ok=True)
+
+    return test_pipeline
