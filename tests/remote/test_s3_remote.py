@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import pathlib
 from typing import TYPE_CHECKING, Any
@@ -12,42 +13,19 @@ from pivot.remote import storage as remote_mod
 
 if TYPE_CHECKING:
     import types
-    from collections.abc import AsyncIterator
-    from unittest.mock import MagicMock
 
     from pytest_mock import MockerFixture
+    from types_aiobotocore_s3 import S3Client
 
 
-class MockBody:
-    """Mock S3 StreamingBody for testing.
-
-    Supports async context manager (``async with response["Body"] as stream``)
-    and ``stream.read(size)`` matching the aiobotocore StreamingBody stub API.
-    """
-
-    _data: bytes
-    _read_called: bool
-
-    def __init__(self, data: bytes = b"content") -> None:
-        self._data = data
-        self._read_called = False
-
-    async def __aenter__(self) -> MockBody:
-        return self
-
-    async def __aexit__(self, *args: object) -> None:
-        pass
-
-    async def read(self, size: int = -1) -> bytes:
-        if self._read_called:
-            return b""
-        self._read_called = True
-        return self._data
-
-
-def _make_mock_get_object_response(**_kwargs: object) -> dict[str, MockBody]:
-    """Create a mock S3 get_object response for testing."""
-    return {"Body": MockBody()}
+def _helper_patch_s3_client(
+    mocker: MockerFixture,
+    s3_remote: remote_mod.S3Remote,
+    client: Any,
+) -> None:
+    mock_client_cm = mocker.AsyncMock()
+    mock_client_cm.__aenter__.return_value = client
+    mocker.patch.object(s3_remote._session, "client", return_value=mock_client_cm)
 
 
 # -----------------------------------------------------------------------------
@@ -252,49 +230,33 @@ def test_is_not_found_error_false() -> None:
 
 
 # -----------------------------------------------------------------------------
-# Async Method Tests (Mocked)
+# Async Method Tests (Moto)
 # -----------------------------------------------------------------------------
 
 
-@pytest.fixture
-def mock_s3_session(mocker: MockerFixture) -> MagicMock:
-    """Mock aioboto3 session for testing."""
-    mock_session_class = mocker.patch("aioboto3.Session", autospec=True)
-    mock_session = mocker.MagicMock()
-    mock_session_class.return_value = mock_session
-    return mock_session
-
-
-async def test_exists_true(mock_s3_session: MagicMock, mocker: MockerFixture) -> None:
+async def test_exists_true(s3_remote: remote_mod.S3Remote, aioboto3_s3_client: S3Client) -> None:
     """exists returns True when object exists."""
-    mock_client = mocker.AsyncMock()
-    mock_client.head_object = mocker.AsyncMock(return_value={})
-    mock_s3_session.client.return_value.__aenter__.return_value = mock_client
+    cache_hash = "abcdef1234567890"
+    await aioboto3_s3_client.put_object(
+        Bucket=s3_remote.bucket,
+        Key=remote_mod._hash_to_key(s3_remote.prefix, cache_hash),
+        Body=b"test",
+    )
 
-    r = remote_mod.S3Remote("s3://bucket/prefix")
-    result = await r.exists("abc123def4567890")
+    result = await s3_remote.exists(cache_hash)
 
     assert result is True
-    mock_client.head_object.assert_called_once()
 
 
-async def test_exists_false_404(mock_s3_session: MagicMock, mocker: MockerFixture) -> None:
+async def test_exists_false_404(s3_remote: remote_mod.S3Remote) -> None:
     """exists returns False on 404 error."""
-    mock_client = mocker.AsyncMock()
-    error = botocore_exc.ClientError(
-        {"Error": {"Code": "404", "Message": "Not Found"}}, "HeadObject"
-    )
-    mock_client.head_object = mocker.AsyncMock(side_effect=error)
-    mock_s3_session.client.return_value.__aenter__.return_value = mock_client
-
-    r = remote_mod.S3Remote("s3://bucket/prefix")
-    result = await r.exists("abc123def4567890")
+    result = await s3_remote.exists("abcdef1234567890")
 
     assert result is False
 
 
 async def test_exists_raises_on_other_error(
-    mock_s3_session: MagicMock, mocker: MockerFixture
+    s3_remote: remote_mod.S3Remote, mocker: MockerFixture
 ) -> None:
     """exists raises RemoteConnectionError on non-404 errors."""
     mock_client = mocker.AsyncMock()
@@ -302,64 +264,89 @@ async def test_exists_raises_on_other_error(
         {"Error": {"Code": "403", "Message": "Forbidden"}}, "HeadObject"
     )
     mock_client.head_object = mocker.AsyncMock(side_effect=error)
-    mock_s3_session.client.return_value.__aenter__.return_value = mock_client
-
-    r = remote_mod.S3Remote("s3://bucket/prefix")
+    _helper_patch_s3_client(mocker, s3_remote, mock_client)
 
     with pytest.raises(exceptions.RemoteConnectionError, match="S3 error"):
-        await r.exists("abc123def4567890")
+        await s3_remote.exists("abcdef1234567890")
 
 
 async def test_upload_file(
-    mock_s3_session: MagicMock, tmp_path: pathlib.Path, mocker: MockerFixture
+    s3_remote: remote_mod.S3Remote,
+    tmp_path: pathlib.Path,
+    aioboto3_s3_client: S3Client,
 ) -> None:
     """upload_file puts object to S3."""
-    mock_client = mocker.AsyncMock()
-    mock_client.put_object = mocker.AsyncMock()
-    mock_s3_session.client.return_value.__aenter__.return_value = mock_client
-
+    cache_hash = "abc123def4567890"
     test_file = tmp_path / "test.txt"
-    test_file.write_text("test content")
+    test_file.write_bytes(b"test content")
 
-    r = remote_mod.S3Remote("s3://bucket/prefix")
-    await r.upload_file(test_file, "abc123def4567890")
+    await s3_remote.upload_file(test_file, cache_hash)
 
-    mock_client.put_object.assert_called_once()
-    call_kwargs = mock_client.put_object.call_args[1]
-    assert call_kwargs["Bucket"] == "bucket"
-    assert call_kwargs["Key"] == "prefix/files/ab/c123def4567890"
+    response = await aioboto3_s3_client.get_object(
+        Bucket=s3_remote.bucket,
+        Key=remote_mod._hash_to_key(s3_remote.prefix, cache_hash),
+    )
+    content = await response["Body"].read()
+
+    assert content == b"test content"
 
 
 async def test_download_file(
-    mock_s3_session: MagicMock, tmp_path: pathlib.Path, mocker: MockerFixture
+    s3_remote: remote_mod.S3Remote,
+    tmp_path: pathlib.Path,
+    aioboto3_s3_client: S3Client,
 ) -> None:
     """download_file gets object from S3."""
-    mock_client = mocker.AsyncMock()
-    mock_client.get_object = mocker.AsyncMock(
-        return_value={"Body": MockBody(b"downloaded content")}
+    cache_hash = "abc123def4567890"
+    await aioboto3_s3_client.put_object(
+        Bucket=s3_remote.bucket,
+        Key=remote_mod._hash_to_key(s3_remote.prefix, cache_hash),
+        Body=b"downloaded content",
     )
-    mock_s3_session.client.return_value.__aenter__.return_value = mock_client
 
     dest_file = tmp_path / "dest.txt"
 
-    r = remote_mod.S3Remote("s3://bucket/prefix")
-    await r.download_file("abc123def4567890", dest_file)
+    await s3_remote.download_file(cache_hash, dest_file)
 
     assert dest_file.read_bytes() == b"downloaded content"
 
 
+async def test_download_file_streaming_body_api_regression(
+    s3_remote: remote_mod.S3Remote,
+    tmp_path: pathlib.Path,
+    aioboto3_s3_client: S3Client,
+) -> None:
+    """Regression test: StreamingBody.read() works without async-with."""
+    cache_hash = "abc123def4567890"
+    await aioboto3_s3_client.put_object(
+        Bucket=s3_remote.bucket,
+        Key=remote_mod._hash_to_key(s3_remote.prefix, cache_hash),
+        Body=b"test content for regression",
+    )
+
+    file_path = tmp_path / "downloaded.txt"
+
+    await s3_remote.download_file(cache_hash, file_path)
+
+    assert file_path.read_bytes() == b"test content for regression"
+
+
 async def test_download_file_readonly(
-    mock_s3_session: MagicMock, tmp_path: pathlib.Path, mocker: MockerFixture
+    s3_remote: remote_mod.S3Remote,
+    tmp_path: pathlib.Path,
+    aioboto3_s3_client: S3Client,
 ) -> None:
     """download_file with readonly=True sets 0o444 permissions (for cache files)."""
-    mock_client = mocker.AsyncMock()
-    mock_client.get_object = mocker.AsyncMock(return_value={"Body": MockBody(b"cached content")})
-    mock_s3_session.client.return_value.__aenter__.return_value = mock_client
+    cache_hash = "abc123def4567890"
+    await aioboto3_s3_client.put_object(
+        Bucket=s3_remote.bucket,
+        Key=remote_mod._hash_to_key(s3_remote.prefix, cache_hash),
+        Body=b"cached content",
+    )
 
     dest_file = tmp_path / "cached.txt"
 
-    r = remote_mod.S3Remote("s3://bucket/prefix")
-    await r.download_file("abc123def4567890", dest_file, readonly=True)
+    await s3_remote.download_file(cache_hash, dest_file, readonly=True)
 
     assert dest_file.read_bytes() == b"cached content"
     # Verify read-only permissions (0o444)
@@ -367,222 +354,151 @@ async def test_download_file_readonly(
     assert mode == 0o444, f"Expected 0o444, got {oct(mode)}"
 
 
-async def test_bulk_exists(mock_s3_session: MagicMock, mocker: MockerFixture) -> None:
+async def test_bulk_exists(s3_remote: remote_mod.S3Remote, aioboto3_s3_client: S3Client) -> None:
     """bulk_exists checks multiple hashes in parallel."""
+    hashes = ["a1b2c3d4e5f6789a", "b2c3d4e5f6789ab1", "c3d4e5f6789ab1c2"]
+    existing = {hashes[0], hashes[2]}
 
-    def mock_head_side_effect(**kwargs: str) -> dict[str, str]:
-        key = kwargs.get("Key", "")
-        # Key format is prefix/files/XX/YYYYYY...
-        # b2c3d4e5f6789ab1 becomes prefix/files/b2/c3d4e5f6789ab1
-        if "/b2/" in key:
-            raise botocore_exc.ClientError(
-                {"Error": {"Code": "404", "Message": "Not Found"}}, "HeadObject"
-            )
-        return {}
+    for cache_hash in existing:
+        await aioboto3_s3_client.put_object(
+            Bucket=s3_remote.bucket,
+            Key=remote_mod._hash_to_key(s3_remote.prefix, cache_hash),
+            Body=b"content",
+        )
 
-    mock_client = mocker.AsyncMock()
-    mock_client.head_object = mocker.AsyncMock(side_effect=mock_head_side_effect)
-    mock_s3_session.client.return_value.__aenter__.return_value = mock_client
+    result = await s3_remote.bulk_exists(hashes)
 
-    r = remote_mod.S3Remote("s3://bucket/prefix")
-    result = await r.bulk_exists(["a1b2c3d4e5f6789a", "b2c3d4e5f6789ab1", "c3d4e5f6789ab1c2"])
-
-    assert result["a1b2c3d4e5f6789a"] is True
-    assert result["b2c3d4e5f6789ab1"] is False
-    assert result["c3d4e5f6789ab1c2"] is True
-    assert mock_client.head_object.call_count == 3
+    assert result[hashes[0]] is True
+    assert result[hashes[1]] is False
+    assert result[hashes[2]] is True
 
 
 async def test_bulk_exists_raises_on_non_404_error(
-    mock_s3_session: MagicMock, mocker: MockerFixture
+    s3_remote: remote_mod.S3Remote, mocker: MockerFixture
 ) -> None:
     """bulk_exists raises RemoteConnectionError on non-404 errors."""
-
-    def mock_head_side_effect(**kwargs: str) -> dict[str, str]:
-        key = kwargs.get("Key", "")
-        # Simulate 403 Forbidden for b2c3d4e5f6789ab1 (key has /b2/)
-        if "/b2/" in key:
-            raise botocore_exc.ClientError(
-                {"Error": {"Code": "403", "Message": "Forbidden"}}, "HeadObject"
-            )
-        return {}
-
     mock_client = mocker.AsyncMock()
-    mock_client.head_object = mocker.AsyncMock(side_effect=mock_head_side_effect)
-    mock_s3_session.client.return_value.__aenter__.return_value = mock_client
-
-    r = remote_mod.S3Remote("s3://bucket/prefix")
+    error = botocore_exc.ClientError(
+        {"Error": {"Code": "403", "Message": "Forbidden"}}, "HeadObject"
+    )
+    mock_client.head_object = mocker.AsyncMock(side_effect=error)
+    _helper_patch_s3_client(mocker, s3_remote, mock_client)
 
     with pytest.raises(exceptions.RemoteConnectionError, match="bulk_exists failed"):
-        await r.bulk_exists(["a1b2c3d4e5f6789a", "b2c3d4e5f6789ab1", "c3d4e5f6789ab1c2"])
+        await s3_remote.bulk_exists(["a1b2c3d4e5f6789a", "b2c3d4e5f6789ab1", "c3d4e5f6789ab1c2"])
 
 
 async def test_bulk_exists_uses_list_for_large_batches(
-    mock_s3_session: MagicMock, mocker: MockerFixture
+    s3_remote: remote_mod.S3Remote,
+    aioboto3_s3_client: S3Client,
 ) -> None:
-    """bulk_exists uses LIST instead of HEAD for large batches (>= 50 hashes)."""
-
-    # Generate 60 hashes to exceed the LIST threshold (50)
+    """bulk_exists returns expected results for large batches (>= 50 hashes)."""
     hashes = [f"a{i:015x}" for i in range(60)]
-    # Mark some as existing on remote (every other one)
     existing_hashes = set(hashes[::2])
 
-    class MockPaginator:
-        async def paginate(
-            self,
-            Bucket: str,  # noqa: N803
-            Prefix: str,  # noqa: N803
-        ) -> AsyncIterator[dict[str, list[dict[str, str]]]]:
-            # Extract the prefix part (e.g., "a0" from "prefix/files/a0/")
-            hash_prefix = Prefix.split("/")[-2] if Prefix.endswith("/") else ""
-            # Return only existing hashes that match this prefix
-            contents = [
-                {"Key": f"prefix/files/{h[:2]}/{h[2:]}"}
-                for h in existing_hashes
-                if h.startswith(hash_prefix)
-            ]
-            yield {"Contents": contents}
+    for cache_hash in existing_hashes:
+        await aioboto3_s3_client.put_object(
+            Bucket=s3_remote.bucket,
+            Key=remote_mod._hash_to_key(s3_remote.prefix, cache_hash),
+            Body=b"content",
+        )
 
-    mock_client = mocker.AsyncMock()
-    mock_client.get_paginator = mocker.Mock(return_value=MockPaginator())
-    # HEAD should NOT be called (we use LIST for large batches)
-    mock_client.head_object = mocker.AsyncMock()
-    mock_s3_session.client.return_value.__aenter__.return_value = mock_client
+    result = await s3_remote.bulk_exists(hashes)
 
-    r = remote_mod.S3Remote("s3://bucket/prefix")
-    result = await r.bulk_exists(hashes)
-
-    # Verify results
-    for h in existing_hashes:
-        assert result[h] is True, f"Hash {h} should exist"
-    for h in set(hashes) - existing_hashes:
-        assert result[h] is False, f"Hash {h} should not exist"
-
-    # HEAD should NOT have been called (we use LIST for large batches)
-    assert mock_client.head_object.call_count == 0
-    # get_paginator should have been called
-    assert mock_client.get_paginator.call_count > 0
+    for cache_hash in existing_hashes:
+        assert result[cache_hash] is True, f"Hash {cache_hash} should exist"
+    for cache_hash in set(hashes) - existing_hashes:
+        assert result[cache_hash] is False, f"Hash {cache_hash} should not exist"
 
 
-async def test_list_hashes(mock_s3_session: MagicMock, mocker: MockerFixture) -> None:
+async def test_list_hashes(s3_remote: remote_mod.S3Remote, aioboto3_s3_client: S3Client) -> None:
     """list_hashes returns all cache hashes from S3."""
+    hashes = {"abc123def4567890", "def456abc1234567", "123456789abcdef0"}
+    for cache_hash in hashes:
+        await aioboto3_s3_client.put_object(
+            Bucket=s3_remote.bucket,
+            Key=remote_mod._hash_to_key(s3_remote.prefix, cache_hash),
+            Body=b"content",
+        )
 
-    class MockPaginator:
-        async def paginate(
-            self, **kwargs: object
-        ) -> AsyncIterator[dict[str, list[dict[str, str]]]]:
-            pages = [
-                {
-                    "Contents": [
-                        {"Key": "prefix/files/ab/c123def4567890"},
-                        {"Key": "prefix/files/de/f456abc1234567"},
-                    ]
-                },
-                {
-                    "Contents": [
-                        {"Key": "prefix/files/12/3456789abcdef0"},
-                    ]
-                },
-            ]
-            for page in pages:
-                yield page
+    result = await s3_remote.list_hashes()
 
-    mock_client = mocker.AsyncMock()
-    mock_client.get_paginator = mocker.MagicMock(return_value=MockPaginator())
-    mock_s3_session.client.return_value.__aenter__.return_value = mock_client
-
-    r = remote_mod.S3Remote("s3://bucket/prefix")
-    result = await r.list_hashes()
-
-    assert result == {"abc123def4567890", "def456abc1234567", "123456789abcdef0"}
+    assert result == hashes
 
 
-async def test_iter_hashes(mock_s3_session: MagicMock, mocker: MockerFixture) -> None:
+async def test_iter_hashes(s3_remote: remote_mod.S3Remote, aioboto3_s3_client: S3Client) -> None:
     """iter_hashes yields hashes without collecting into memory."""
+    expected = {"abc123def4567890", "def456abc1234567"}
 
-    class MockPaginator:
-        async def paginate(
-            self, **kwargs: object
-        ) -> AsyncIterator[dict[str, list[dict[str, str]]]]:
-            pages = [
-                {"Contents": [{"Key": "prefix/files/ab/c123def4567890"}]},
-                {"Contents": [{"Key": "prefix/files/de/f456abc1234567"}]},
-            ]
-            for page in pages:
-                yield page
+    for cache_hash in expected:
+        await aioboto3_s3_client.put_object(
+            Bucket=s3_remote.bucket,
+            Key=remote_mod._hash_to_key(s3_remote.prefix, cache_hash),
+            Body=b"content",
+        )
 
-    mock_client = mocker.AsyncMock()
-    mock_client.get_paginator = mocker.MagicMock(return_value=MockPaginator())
-    mock_s3_session.client.return_value.__aenter__.return_value = mock_client
+    hashes = [h async for h in s3_remote.iter_hashes()]
 
-    r = remote_mod.S3Remote("s3://bucket/prefix")
-    hashes = []
-    async for h in r.iter_hashes():
-        hashes.append(h)
-
-    assert hashes == ["abc123def4567890", "def456abc1234567"]
+    assert set(hashes) == expected
 
 
 async def test_iter_hashes_skips_invalid_keys(
-    mock_s3_session: MagicMock, mocker: MockerFixture
+    s3_remote: remote_mod.S3Remote, aioboto3_s3_client: S3Client
 ) -> None:
     """iter_hashes skips keys that don't produce valid 16-char lowercase hex hashes."""
+    keys = [
+        f"{s3_remote.prefix}files/ab/cdef1234567890",  # Valid: 16 lowercase hex
+        f"{s3_remote.prefix}files/AB/CDEF1234567890",  # Invalid: uppercase
+        f"{s3_remote.prefix}files/ab/c",  # Invalid: too short
+        f"{s3_remote.prefix}files/ab/cdef12345678901234",  # Invalid: too long
+        f"{s3_remote.prefix}files/stages/my_stage.lock",  # Invalid: not a cache file
+    ]
 
-    class MockPaginator:
-        async def paginate(
-            self, **kwargs: object
-        ) -> AsyncIterator[dict[str, list[dict[str, str]]]]:
-            yield {
-                "Contents": [
-                    {"Key": "prefix/files/ab/cdef1234567890"},  # Valid: 16 lowercase hex
-                    {"Key": "prefix/files/AB/CDEF1234567890"},  # Invalid: uppercase
-                    {"Key": "prefix/files/ab/c"},  # Invalid: too short
-                    {"Key": "prefix/files/ab/cdef12345678901234"},  # Invalid: too long
-                    {"Key": "prefix/stages/my_stage.lock"},  # Invalid: not a cache file
-                ]
-            }
+    for key in keys:
+        await aioboto3_s3_client.put_object(
+            Bucket=s3_remote.bucket,
+            Key=key,
+            Body=b"content",
+        )
 
-    mock_client = mocker.AsyncMock()
-    mock_client.get_paginator = mocker.MagicMock(return_value=MockPaginator())
-    mock_s3_session.client.return_value.__aenter__.return_value = mock_client
-
-    r = remote_mod.S3Remote("s3://bucket/prefix")
-    hashes = []
-    async for h in r.iter_hashes():
-        hashes.append(h)
+    hashes = [h async for h in s3_remote.iter_hashes()]
 
     assert hashes == ["abcdef1234567890"]
 
 
 async def test_upload_batch(
-    mock_s3_session: MagicMock, tmp_path: pathlib.Path, mocker: MockerFixture
+    s3_remote: remote_mod.S3Remote,
+    tmp_path: pathlib.Path,
+    aioboto3_s3_client: S3Client,
 ) -> None:
     """upload_batch uploads multiple files in parallel."""
-    mock_client = mocker.AsyncMock()
-    mock_client.put_object = mocker.AsyncMock()
-    mock_s3_session.client.return_value.__aenter__.return_value = mock_client
-
     files = list[tuple[pathlib.Path, str]]()
+    contents: dict[str, bytes] = {}
     for i in range(3):
+        cache_hash = f"a{i}b2c3d4e5f6789a"
         f = tmp_path / f"file{i}.txt"
-        f.write_text(f"content {i}")
-        files.append((f, f"a{i}b2c3d4e5f6789a"))
+        data = f"content {i}".encode()
+        f.write_bytes(data)
+        files.append((f, cache_hash))
+        contents[cache_hash] = data
 
-    r = remote_mod.S3Remote("s3://bucket/prefix")
-    results = await r.upload_batch(files, concurrency=10)
+    results = await s3_remote.upload_batch(files, concurrency=10)
 
     assert len(results) == 3
     assert all(r["success"] for r in results)
 
+    for cache_hash, expected in contents.items():
+        response = await aioboto3_s3_client.get_object(
+            Bucket=s3_remote.bucket,
+            Key=remote_mod._hash_to_key(s3_remote.prefix, cache_hash),
+        )
+        assert await response["Body"].read() == expected
+
 
 async def test_upload_batch_with_callback(
-    mock_s3_session: MagicMock, tmp_path: pathlib.Path, mocker: MockerFixture
+    s3_remote: remote_mod.S3Remote, tmp_path: pathlib.Path
 ) -> None:
     """upload_batch calls callback for each completed upload."""
-    mock_client = mocker.AsyncMock()
-    mock_client.put_object = mocker.AsyncMock()
-    mock_s3_session.client.return_value.__aenter__.return_value = mock_client
-
     files = list[tuple[pathlib.Path, str]]()
     for i in range(3):
         f = tmp_path / f"file{i}.txt"
@@ -594,8 +510,7 @@ async def test_upload_batch_with_callback(
     def callback(n: int) -> None:
         callback_values.append(n)
 
-    r = remote_mod.S3Remote("s3://bucket/prefix")
-    await r.upload_batch(files, concurrency=10, callback=callback)
+    await s3_remote.upload_batch(files, concurrency=10, callback=callback)
 
     assert len(callback_values) == 3
     assert set(callback_values) == {1, 2, 3}
@@ -610,22 +525,27 @@ async def test_upload_batch_empty() -> None:
 
 
 async def test_download_batch(
-    mock_s3_session: MagicMock, tmp_path: pathlib.Path, mocker: MockerFixture
+    s3_remote: remote_mod.S3Remote,
+    tmp_path: pathlib.Path,
+    aioboto3_s3_client: S3Client,
 ) -> None:
     """download_batch downloads multiple files in parallel."""
-    mock_client = mocker.AsyncMock()
-    mock_client.get_object = mocker.AsyncMock(side_effect=_make_mock_get_object_response)
-    mock_s3_session.client.return_value.__aenter__.return_value = mock_client
-
     items = [(f"a{i}b2c3d4e5f6789a", tmp_path / f"dest{i}.txt") for i in range(3)]
 
-    r = remote_mod.S3Remote("s3://bucket/prefix")
-    results = await r.download_batch(items, concurrency=10)
+    for cache_hash, _ in items:
+        await aioboto3_s3_client.put_object(
+            Bucket=s3_remote.bucket,
+            Key=remote_mod._hash_to_key(s3_remote.prefix, cache_hash),
+            Body=b"content",
+        )
+
+    results = await s3_remote.download_batch(items, concurrency=10)
 
     assert len(results) == 3
     assert all(r["success"] for r in results)
     for _, path in items:
         assert path.exists()
+        assert path.read_bytes() == b"content"
 
 
 async def test_download_batch_empty() -> None:
@@ -642,51 +562,50 @@ async def test_download_batch_empty() -> None:
 
 
 async def test_upload_file_large_uses_multipart(
-    mock_s3_session: MagicMock, tmp_path: pathlib.Path, mocker: MockerFixture
+    s3_remote: remote_mod.S3Remote,
+    tmp_path: pathlib.Path,
+    aioboto3_s3_client: S3Client,
 ) -> None:
     """upload_file uses multipart upload for large files."""
-    # Monkeypatch chunk size to 100 bytes to avoid writing large files
-    mocker.patch.object(remote_mod, "STREAM_CHUNK_SIZE", 100)
-
-    mock_client = mocker.AsyncMock()
-    mock_client.create_multipart_upload = mocker.AsyncMock(
-        return_value={"UploadId": "test-upload-id"}
-    )
-    mock_client.upload_part = mocker.AsyncMock(return_value={"ETag": "test-etag"})
-    mock_client.complete_multipart_upload = mocker.AsyncMock()
-    mock_s3_session.client.return_value.__aenter__.return_value = mock_client
-
-    # Create file larger than patched STREAM_CHUNK_SIZE (100 bytes)
+    # moto enforces S3's real 5 MiB minimum multipart part size, so we cannot
+    # monkeypatch STREAM_CHUNK_SIZE to a small value — the payload must exceed
+    # the real STREAM_CHUNK_SIZE to trigger the multipart code path.
     test_file = tmp_path / "large_file.bin"
-    test_file.write_bytes(b"x" * 250)  # 250 bytes = 3 parts (100 + 100 + 50)
+    large_payload = b"x" * (remote_mod.STREAM_CHUNK_SIZE + 1)
+    test_file.write_bytes(large_payload)
 
-    r = remote_mod.S3Remote("s3://bucket/prefix")
-    await r.upload_file(test_file, "abc123def4567890")
+    cache_hash = "abc123def4567890"
 
-    mock_client.create_multipart_upload.assert_called_once()
-    assert mock_client.upload_part.call_count == 3  # 250 bytes = 3 parts at 100 byte chunks
-    mock_client.complete_multipart_upload.assert_called_once()
+    await s3_remote.upload_file(test_file, cache_hash)
+
+    response = await aioboto3_s3_client.get_object(
+        Bucket=s3_remote.bucket,
+        Key=remote_mod._hash_to_key(s3_remote.prefix, cache_hash),
+    )
+    assert await response["Body"].read() == large_payload
 
 
 async def test_upload_file_small_uses_put_object(
-    mock_s3_session: MagicMock, tmp_path: pathlib.Path, mocker: MockerFixture
+    s3_remote: remote_mod.S3Remote,
+    tmp_path: pathlib.Path,
+    aioboto3_s3_client: S3Client,
 ) -> None:
     """upload_file uses simple put_object for small files."""
-    mock_client = mocker.AsyncMock()
-    mock_client.put_object = mocker.AsyncMock()
-    mock_s3_session.client.return_value.__aenter__.return_value = mock_client
-
     test_file = tmp_path / "small_file.txt"
     test_file.write_text("small content")
+    cache_hash = "abc123def4567890"
 
-    r = remote_mod.S3Remote("s3://bucket/prefix")
-    await r.upload_file(test_file, "abc123def4567890")
+    await s3_remote.upload_file(test_file, cache_hash)
 
-    mock_client.put_object.assert_called_once()
+    response = await aioboto3_s3_client.get_object(
+        Bucket=s3_remote.bucket,
+        Key=remote_mod._hash_to_key(s3_remote.prefix, cache_hash),
+    )
+    assert await response["Body"].read() == b"small content"
 
 
 async def test_upload_file_multipart_aborts_on_error(
-    mock_s3_session: MagicMock, tmp_path: pathlib.Path, mocker: MockerFixture
+    s3_remote: remote_mod.S3Remote, tmp_path: pathlib.Path, mocker: MockerFixture
 ) -> None:
     """upload_file aborts multipart upload on error."""
     # Monkeypatch chunk size to 100 bytes to avoid writing large files
@@ -698,14 +617,13 @@ async def test_upload_file_multipart_aborts_on_error(
     )
     mock_client.upload_part = mocker.AsyncMock(side_effect=Exception("Upload failed"))
     mock_client.abort_multipart_upload = mocker.AsyncMock()
-    mock_s3_session.client.return_value.__aenter__.return_value = mock_client
+    _helper_patch_s3_client(mocker, s3_remote, mock_client)
 
     test_file = tmp_path / "large_file.bin"
     test_file.write_bytes(b"x" * 150)  # Above 100 byte threshold
 
-    r = remote_mod.S3Remote("s3://bucket/prefix")
     with pytest.raises(Exception, match="Upload failed"):
-        await r.upload_file(test_file, "abc123def4567890")
+        await s3_remote.upload_file(test_file, "abc123def4567890")
 
     mock_client.abort_multipart_upload.assert_called_once()
 
@@ -716,59 +634,151 @@ async def test_upload_file_multipart_aborts_on_error(
 
 
 async def test_download_file_cleans_up_on_error(
-    mock_s3_session: MagicMock, tmp_path: pathlib.Path, mocker: MockerFixture
+    s3_remote: remote_mod.S3Remote, tmp_path: pathlib.Path
 ) -> None:
     """download_file cleans up temp file on error."""
-
-    mock_client = mocker.AsyncMock()
-    mock_client.get_object = mocker.AsyncMock(side_effect=Exception("Download failed"))
-    mock_s3_session.client.return_value.__aenter__.return_value = mock_client
-
     dest_file = tmp_path / "dest.txt"
 
-    r = remote_mod.S3Remote("s3://bucket/prefix")
-    with pytest.raises(Exception, match="Download failed"):
-        await r.download_file("abc123def4567890", dest_file)
+    with pytest.raises(botocore_exc.ClientError):
+        await s3_remote.download_file("abc123def4567890", dest_file)
 
     # Verify no temp files left behind
     temp_files = [f for f in os.listdir(tmp_path) if f.startswith(".pivot_download_")]
     assert len(temp_files) == 0, f"Temp files not cleaned up: {temp_files}"
 
 
+async def test_download_file_mid_stream_error(
+    s3_remote: remote_mod.S3Remote,
+    tmp_path: pathlib.Path,
+    aioboto3_s3_client: S3Client,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """download_file cleans up when stream.read() raises mid-transfer."""
+    cache_hash = "abc123def4567890"
+    await aioboto3_s3_client.put_object(
+        Bucket=s3_remote.bucket,
+        Key=remote_mod._hash_to_key(s3_remote.prefix, cache_hash),
+        Body=b"x" * 1024,
+    )
+
+    call_count = 0
+    real_stream_download = remote_mod._stream_download_to_fd
+
+    async def _inject_read_failure(response: Any, fd: int) -> None:
+        """Wrap stream.read to fail on second call, then delegate to real impl."""
+        nonlocal call_count
+        body = response["Body"]
+        original_read = body.read
+
+        async def _failing_read(amt: int) -> bytes:
+            nonlocal call_count
+            call_count += 1
+            if call_count > 1:
+                raise ConnectionError("network interrupted")
+            return await original_read(amt)
+
+        body.read = _failing_read
+        await real_stream_download(response, fd)
+
+    monkeypatch.setattr(remote_mod, "_stream_download_to_fd", _inject_read_failure)
+
+    dest_file = tmp_path / "dest.txt"
+    with pytest.raises(ConnectionError, match="network interrupted"):
+        await s3_remote.download_file(cache_hash, dest_file)
+
+    temp_files = [f for f in os.listdir(tmp_path) if f.startswith(".pivot_download_")]
+    assert len(temp_files) == 0, f"Temp files not cleaned up: {temp_files}"
+    assert not dest_file.exists(), "Dest file should not exist after mid-stream error"
+
+
+async def test_download_file_stream_read_timeout(
+    s3_remote: remote_mod.S3Remote,
+    tmp_path: pathlib.Path,
+    aioboto3_s3_client: S3Client,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """download_file cleans up when stream.read() times out."""
+    cache_hash = "abc123def4567890"
+    await aioboto3_s3_client.put_object(
+        Bucket=s3_remote.bucket,
+        Key=remote_mod._hash_to_key(s3_remote.prefix, cache_hash),
+        Body=b"x" * 1024,
+    )
+
+    # Use a short timeout so the test doesn't wait 60s
+    monkeypatch.setattr(remote_mod, "STREAM_READ_TIMEOUT", 0.1)
+
+    real_stream_download = remote_mod._stream_download_to_fd
+    hang_event = asyncio.Event()
+
+    async def _inject_hanging_read(response: Any, fd: int) -> None:
+        body = response["Body"]
+        original_read = body.read
+        call_count = 0
+
+        async def _hanging_read(amt: int) -> bytes:
+            nonlocal call_count
+            call_count += 1
+            if call_count > 1:
+                await hang_event.wait()  # Hangs forever (until timeout)
+            return await original_read(amt)
+
+        body.read = _hanging_read
+        await real_stream_download(response, fd)
+
+    monkeypatch.setattr(remote_mod, "_stream_download_to_fd", _inject_hanging_read)
+
+    dest_file = tmp_path / "dest.txt"
+    with pytest.raises(asyncio.TimeoutError):
+        await s3_remote.download_file(cache_hash, dest_file)
+
+    temp_files = [f for f in os.listdir(tmp_path) if f.startswith(".pivot_download_")]
+    assert len(temp_files) == 0, f"Temp files not cleaned up: {temp_files}"
+    assert not dest_file.exists(), "Dest file should not exist after timeout"
+
+
 async def test_download_batch_with_callback(
-    mock_s3_session: MagicMock, tmp_path: pathlib.Path, mocker: MockerFixture
+    s3_remote: remote_mod.S3Remote,
+    tmp_path: pathlib.Path,
+    aioboto3_s3_client: S3Client,
 ) -> None:
     """download_batch calls callback for each completed download."""
-    mock_client = mocker.AsyncMock()
-    mock_client.get_object = mocker.AsyncMock(side_effect=_make_mock_get_object_response)
-    mock_s3_session.client.return_value.__aenter__.return_value = mock_client
-
     items = [(f"a{i}b2c3d4e5f6789a", tmp_path / f"dest{i}.txt") for i in range(3)]
+
+    for cache_hash, _ in items:
+        await aioboto3_s3_client.put_object(
+            Bucket=s3_remote.bucket,
+            Key=remote_mod._hash_to_key(s3_remote.prefix, cache_hash),
+            Body=b"content",
+        )
 
     callback_values = list[int]()
 
     def callback(n: int) -> None:
         callback_values.append(n)
 
-    r = remote_mod.S3Remote("s3://bucket/prefix")
-    await r.download_batch(items, concurrency=10, callback=callback)
+    await s3_remote.download_batch(items, concurrency=10, callback=callback)
 
     assert len(callback_values) == 3
     assert set(callback_values) == {1, 2, 3}
 
 
 async def test_download_file_default_permissions(
-    mock_s3_session: MagicMock, tmp_path: pathlib.Path, mocker: MockerFixture
+    s3_remote: remote_mod.S3Remote,
+    tmp_path: pathlib.Path,
+    aioboto3_s3_client: S3Client,
 ) -> None:
     """download_file without readonly flag creates file with default permissions."""
-    mock_client = mocker.AsyncMock()
-    mock_client.get_object = mocker.AsyncMock(return_value={"Body": MockBody(b"writable content")})
-    mock_s3_session.client.return_value.__aenter__.return_value = mock_client
+    cache_hash = "abc123def4567890"
+    await aioboto3_s3_client.put_object(
+        Bucket=s3_remote.bucket,
+        Key=remote_mod._hash_to_key(s3_remote.prefix, cache_hash),
+        Body=b"writable content",
+    )
 
     dest_file = tmp_path / "writable.txt"
 
-    r = remote_mod.S3Remote("s3://bucket/prefix")
-    await r.download_file("abc123def4567890", dest_file, readonly=False)
+    await s3_remote.download_file(cache_hash, dest_file, readonly=False)
 
     assert dest_file.read_bytes() == b"writable content"
     # Verify file is writable (not 0o444)
@@ -779,17 +789,21 @@ async def test_download_file_default_permissions(
 
 
 async def test_download_batch_readonly(
-    mock_s3_session: MagicMock, tmp_path: pathlib.Path, mocker: MockerFixture
+    s3_remote: remote_mod.S3Remote,
+    tmp_path: pathlib.Path,
+    aioboto3_s3_client: S3Client,
 ) -> None:
     """download_batch with readonly=True sets 0o444 permissions on all files."""
-    mock_client = mocker.AsyncMock()
-    mock_client.get_object = mocker.AsyncMock(side_effect=_make_mock_get_object_response)
-    mock_s3_session.client.return_value.__aenter__.return_value = mock_client
-
     items = [(f"a{i}b2c3d4e5f6789a", tmp_path / f"cached{i}.txt") for i in range(3)]
 
-    r = remote_mod.S3Remote("s3://bucket/prefix")
-    results = await r.download_batch(items, concurrency=10, readonly=True)
+    for cache_hash, _ in items:
+        await aioboto3_s3_client.put_object(
+            Bucket=s3_remote.bucket,
+            Key=remote_mod._hash_to_key(s3_remote.prefix, cache_hash),
+            Body=b"content",
+        )
+
+    results = await s3_remote.download_batch(items, concurrency=10, readonly=True)
 
     assert len(results) == 3
     assert all(r["success"] for r in results)
@@ -807,7 +821,7 @@ async def test_download_batch_readonly(
 
 
 async def test_bulk_exists_calls_metrics_end_on_error(
-    mock_s3_session: MagicMock, mocker: MockerFixture
+    s3_remote: remote_mod.S3Remote, mocker: MockerFixture
 ) -> None:
     """bulk_exists calls metrics.end even when an error occurs."""
     from pivot import metrics
@@ -817,54 +831,50 @@ async def test_bulk_exists_calls_metrics_end_on_error(
     )
     mock_client = mocker.AsyncMock()
     mock_client.head_object = mocker.AsyncMock(side_effect=error)
-    mock_s3_session.client.return_value.__aenter__.return_value = mock_client
+    _helper_patch_s3_client(mocker, s3_remote, mock_client)
 
     spy_end = mocker.spy(metrics, "end")
 
-    r = remote_mod.S3Remote("s3://bucket/prefix")
-
     with pytest.raises(exceptions.RemoteConnectionError):
-        await r.bulk_exists(["a1b2c3d4e5f6789a"])
+        await s3_remote.bulk_exists(["a1b2c3d4e5f6789a"])
 
     spy_end.assert_any_call("storage.bulk_exists", mocker.ANY)
 
 
 async def test_upload_batch_calls_metrics_end_on_error(
-    mock_s3_session: MagicMock, tmp_path: pathlib.Path, mocker: MockerFixture
+    s3_remote: remote_mod.S3Remote, tmp_path: pathlib.Path, mocker: MockerFixture
 ) -> None:
     """upload_batch calls metrics.end even when uploads fail."""
     from pivot import metrics
 
     mock_client = mocker.AsyncMock()
     mock_client.put_object = mocker.AsyncMock(side_effect=Exception("upload boom"))
-    mock_s3_session.client.return_value.__aenter__.return_value = mock_client
+    _helper_patch_s3_client(mocker, s3_remote, mock_client)
 
     spy_end = mocker.spy(metrics, "end")
 
     f = tmp_path / "file.txt"
     f.write_text("content")
 
-    r = remote_mod.S3Remote("s3://bucket/prefix")
     # upload_batch catches per-item errors, so it completes without raising
-    await r.upload_batch([(f, "a1b2c3d4e5f6789a")])
+    await s3_remote.upload_batch([(f, "a1b2c3d4e5f6789a")])
 
     spy_end.assert_any_call("storage.upload_batch", mocker.ANY)
 
 
 async def test_download_batch_calls_metrics_end_on_error(
-    mock_s3_session: MagicMock, tmp_path: pathlib.Path, mocker: MockerFixture
+    s3_remote: remote_mod.S3Remote, tmp_path: pathlib.Path, mocker: MockerFixture
 ) -> None:
     """download_batch calls metrics.end even when downloads fail."""
     from pivot import metrics
 
     mock_client = mocker.AsyncMock()
     mock_client.get_object = mocker.AsyncMock(side_effect=Exception("download boom"))
-    mock_s3_session.client.return_value.__aenter__.return_value = mock_client
+    _helper_patch_s3_client(mocker, s3_remote, mock_client)
 
     spy_end = mocker.spy(metrics, "end")
 
-    r = remote_mod.S3Remote("s3://bucket/prefix")
-    await r.download_batch([("a1b2c3d4e5f6789a", tmp_path / "dest.txt")])
+    await s3_remote.download_batch([("a1b2c3d4e5f6789a", tmp_path / "dest.txt")])
 
     spy_end.assert_any_call("storage.download_batch", mocker.ANY)
 
@@ -875,13 +885,19 @@ async def test_download_batch_calls_metrics_end_on_error(
 
 
 async def test_s3_remote_reuses_session_across_methods(
-    mock_s3_session: MagicMock, tmp_path: pathlib.Path, mocker: MockerFixture
+    tmp_path: pathlib.Path, mocker: MockerFixture
 ) -> None:
     """S3Remote reuses the same aioboto3 session across multiple method calls."""
+    mock_session_class = mocker.patch("aioboto3.Session", autospec=True)
+    mock_session = mocker.MagicMock()
+    mock_session_class.return_value = mock_session
+
     mock_client = mocker.AsyncMock()
     mock_client.head_object = mocker.AsyncMock(return_value={})
     mock_client.put_object = mocker.AsyncMock()
-    mock_s3_session.client.return_value.__aenter__.return_value = mock_client
+    mock_client_cm = mocker.AsyncMock()
+    mock_client_cm.__aenter__.return_value = mock_client
+    mock_session.client.return_value = mock_client_cm
 
     r = remote_mod.S3Remote("s3://bucket/prefix")
     await r.exists("abc123def4567890")
@@ -891,11 +907,7 @@ async def test_s3_remote_reuses_session_across_methods(
     await r.upload_file(test_file, "abc123def4567890")
 
     # Session created once in __init__; both methods share it via self._session.client()
-    # The mock_s3_session fixture patches aioboto3.Session — verify it was called once
-    import aioboto3
-
-    session_cls = aioboto3.Session  # type: ignore[attr-defined] - mocked by fixture
-    assert session_cls.call_count == 1  # pyright: ignore[reportAttributeAccessIssue] - mock attribute
+    assert mock_session_class.call_count == 1
 
 
 # -----------------------------------------------------------------------------
