@@ -57,14 +57,14 @@ Add tqdm progress bars showing file count and current filename to push, pull, fe
 - Progress reporting added to `packages/pivot/src/pivot/cli/checkout.py` → `_checkout_files_async()`
 
 ### Definition of Done
-- [ ] `pivot push` shows tqdm progress bar with file count and filename on TTY
-- [ ] `pivot fetch` shows tqdm progress bar with file count and filename on TTY
-- [ ] `pivot pull` shows tqdm progress bar for fetch phase AND checkout phase
-- [ ] `pivot checkout` shows tqdm progress bar with file count
-- [ ] `pivot push -q` suppresses progress bar
-- [ ] Progress bar does not appear when output is piped (non-TTY)
-- [ ] Zero files to transfer → no bar shown, no crash
-- [ ] Existing tests still pass: `uv run pytest packages/pivot/tests -n auto`
+- [x] `pivot push` shows tqdm progress bar with file count and filename on TTY
+- [x] `pivot fetch` shows tqdm progress bar with file count and filename on TTY
+- [x] `pivot pull` shows tqdm progress bar for fetch phase AND checkout phase
+- [x] `pivot checkout` shows tqdm progress bar with file count
+- [x] `pivot push -q` suppresses progress bar
+- [x] Progress bar does not appear when output is piped (non-TTY)
+- [x] Zero files to transfer → no bar shown, no crash
+- [x] Existing tests still pass: `uv run pytest packages/pivot/tests -n auto`
 
 ### Must Have
 - **Async tqdm** (`tqdm.asyncio.tqdm`) progress bar — non-blocking in async contexts
@@ -138,7 +138,7 @@ Wave 2 (After Wave 1):
 
 ## TODOs
 
-- [ ] 1. Update callback infrastructure: helpers.py, sync.py, storage.py
+- [x] 1. Update callback infrastructure: helpers.py, sync.py, storage.py
 
   **What to do**:
 
@@ -208,12 +208,12 @@ Wave 2 (After Wave 1):
 
   **Acceptance Criteria**:
 
-  - [ ] `make_progress_callback` no longer exists in `cli/helpers.py`
-  - [ ] New `TransferProgress` class (or similar) exists in `cli/helpers.py` with context manager protocol, using `tqdm.asyncio.tqdm` (not regular `tqdm.tqdm`)
-  - [ ] `upload_batch()` and `download_batch()` callback type is `Callable[[int, str], None] | None`
-  - [ ] All type annotations in `sync.py` updated to match
-  - [ ] `uv run basedpyright packages/pivot/src/pivot/cli/helpers.py packages/pivot/src/pivot/remote/sync.py packages/pivot/src/pivot/remote/storage.py` — zero new errors
-  - [ ] `uv run pytest packages/pivot/tests -n auto` — all existing tests pass
+  - [x] `make_progress_callback` no longer exists in `cli/helpers.py`
+  - [x] New `TransferProgress` class (or similar) exists in `cli/helpers.py` with context manager protocol, using `tqdm.asyncio.tqdm` (not regular `tqdm.tqdm`)
+  - [x] `upload_batch()` and `download_batch()` callback type is `Callable[[int, str], None] | None`
+  - [x] All type annotations in `sync.py` updated to match
+  - [x] `uv run basedpyright packages/pivot/src/pivot/cli/helpers.py packages/pivot/src/pivot/remote/sync.py packages/pivot/src/pivot/remote/storage.py` — zero new errors
+  - [x] `uv run pytest packages/pivot/tests -n auto` — all existing tests pass
 
   **Agent-Executed QA Scenarios:**
 
@@ -243,7 +243,7 @@ Wave 2 (After Wave 1):
   - Pre-commit: `uv run pytest packages/pivot/tests -n auto`
 
 
-- [ ] 2. Wire progress bars into push, fetch, pull commands
+- [x] 2. Wire progress bars into push, fetch, pull commands
 
   **What to do**:
 
@@ -303,11 +303,11 @@ Wave 2 (After Wave 1):
 
   **Acceptance Criteria**:
 
-  - [ ] `make_progress_callback("Uploaded")` no longer appears in `cli/remote.py`
-  - [ ] `make_progress_callback("Downloaded")` no longer appears in `cli/remote.py`
-  - [ ] All three commands (push/fetch/pull) use context manager pattern for progress cleanup
-  - [ ] `uv run basedpyright packages/pivot/src/pivot/cli/remote.py` — zero new errors
-  - [ ] `uv run pytest packages/pivot/tests -n auto` — all existing tests pass
+  - [x] `make_progress_callback("Uploaded")` no longer appears in `cli/remote.py`
+  - [x] `make_progress_callback("Downloaded")` no longer appears in `cli/remote.py`
+  - [x] All three commands (push/fetch/pull) use context manager pattern for progress cleanup
+  - [x] `uv run basedpyright packages/pivot/src/pivot/cli/remote.py` — zero new errors
+  - [x] `uv run pytest packages/pivot/tests -n auto` — all existing tests pass
 
   **Agent-Executed QA Scenarios:**
 
@@ -345,7 +345,7 @@ Wave 2 (After Wave 1):
   - Pre-commit: `uv run pytest packages/pivot/tests -n auto`
 
 
-- [ ] 3. Add progress bar to checkout command
+- [x] 3. Add progress bar to checkout command
 
   **What to do**:
 
@@ -395,13 +395,13 @@ Wave 2 (After Wave 1):
 
   **Acceptance Criteria**:
 
-  - [ ] `_checkout_files_async()` accepts a callback parameter
-  - [ ] `_checkout_main_async()` accepts and passes callback parameter
-  - [ ] `checkout()` command creates and uses `TransferProgress` context manager
-  - [ ] Progress bar shows for checkout with targets and without targets
-  - [ ] `uv run basedpyright packages/pivot/src/pivot/cli/checkout.py` — zero new errors
-  - [ ] `uv run pytest packages/pivot/tests/cli/test_cli_checkout.py -v` — all tests pass
-  - [ ] `uv run pytest packages/pivot/tests -n auto` — all tests pass
+  - [x] `_checkout_files_async()` accepts a callback parameter
+  - [x] `_checkout_main_async()` accepts and passes callback parameter
+  - [x] `checkout()` command creates and uses `TransferProgress` context manager
+  - [x] Progress bar shows for checkout with targets and without targets
+  - [x] `uv run basedpyright packages/pivot/src/pivot/cli/checkout.py` — zero new errors
+  - [x] `uv run pytest packages/pivot/tests/cli/test_cli_checkout.py -v` — all tests pass
+  - [x] `uv run pytest packages/pivot/tests -n auto` — all tests pass
 
   **Agent-Executed QA Scenarios:**
 
@@ -457,11 +457,11 @@ uv run ruff format . && uv run ruff check .           # Code quality
 ```
 
 ### Final Checklist
-- [ ] All four commands (push, pull, fetch, checkout) show tqdm progress bars on TTY
-- [ ] Progress bars use `tqdm.asyncio.tqdm` (non-blocking in async contexts)
-- [ ] Progress bars show filename and file count
-- [ ] Progress suppressed with `--quiet` and on non-TTY
-- [ ] No new dependencies added
-- [ ] No S3 streaming changes
-- [ ] All existing tests pass
-- [ ] Type checking passes
+- [x] All four commands (push, pull, fetch, checkout) show tqdm progress bars on TTY
+- [x] Progress bars use `tqdm.asyncio.tqdm` (non-blocking in async contexts)
+- [x] Progress bars show filename and file count
+- [x] Progress suppressed with `--quiet` and on non-TTY
+- [x] No new dependencies added
+- [x] No S3 streaming changes
+- [x] All existing tests pass
+- [x] Type checking passes

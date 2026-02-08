@@ -507,8 +507,8 @@ async def test_upload_batch_with_callback(
 
     callback_values = list[int]()
 
-    def callback(n: int) -> None:
-        callback_values.append(n)
+    def callback(completed: int, total: int, filename: str) -> None:
+        callback_values.append(completed)
 
     await s3_remote.upload_batch(files, concurrency=10, callback=callback)
 
@@ -754,8 +754,8 @@ async def test_download_batch_with_callback(
 
     callback_values = list[int]()
 
-    def callback(n: int) -> None:
-        callback_values.append(n)
+    def callback(completed: int, total: int, filename: str) -> None:
+        callback_values.append(completed)
 
     await s3_remote.download_batch(items, concurrency=10, callback=callback)
 

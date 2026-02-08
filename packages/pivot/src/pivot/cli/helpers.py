@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import enum
 import json
+import sys
 from typing import TYPE_CHECKING, Any, cast, override
 
 import click
+from tqdm.asyncio import tqdm as async_tqdm
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
-
     from networkx import DiGraph
 
     from pivot.cli import CliContext
@@ -118,14 +118,43 @@ def validate_stages_exist(stages: list[str] | None) -> None:
         raise exceptions.StageNotFoundError(unknown, available_stages=list(registered))
 
 
-def make_progress_callback(action: str) -> Callable[[int], None]:
-    """Create a progress callback for file transfer operations."""
+class TransferProgress:
+    """Context manager for transfer progress bars."""
 
-    def callback(completed: int) -> None:
-        click.echo(f"  {action} {completed} files...", nl=False)
-        click.echo("\r", nl=False)
+    _action: str
+    _bar: async_tqdm[Any] | None
+    _show: bool
 
-    return callback
+    def __init__(self, action: str, *, quiet: bool = False) -> None:
+        self._action = action
+        self._bar = None
+        self._show = sys.stderr.isatty() and not quiet
+
+    def __enter__(self) -> TransferProgress:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: object | None,
+    ) -> None:
+        if self._bar is not None:
+            self._bar.close()
+
+    def callback(self, completed: int, total: int, filename: str) -> None:
+        if not self._show:
+            return
+        if self._bar is None:
+            self._bar = async_tqdm(
+                total=total,
+                file=sys.stderr,
+                dynamic_ncols=True,
+                leave=False,
+                unit="file",
+            )
+        self._bar.desc = f"{self._action} {filename}"
+        self._bar.update(completed - self._bar.n)
 
 
 def print_transfer_errors(errors: list[str], max_shown: int = 5) -> None:

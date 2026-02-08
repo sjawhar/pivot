@@ -483,7 +483,7 @@ class S3Remote:
         self,
         items: list[tuple[Path, str]],
         concurrency: int = DEFAULT_CONCURRENCY,
-        callback: Callable[[int], None] | None = None,
+        callback: Callable[[int, int, str], None] | None = None,
     ) -> list[TransferResult]:
         """Upload multiple files in parallel with streaming for large files."""
         _t = metrics.start()
@@ -510,7 +510,7 @@ class S3Remote:
                             )
                             completed += 1
                             if callback:
-                                callback(completed)
+                                callback(completed, len(items), local_path.name)
                             return TransferResult(hash=hash_, success=True)
                         except Exception as e:
                             return TransferResult(hash=hash_, success=False, error=str(e))
@@ -525,7 +525,7 @@ class S3Remote:
         self,
         items: list[tuple[str, Path]],
         concurrency: int = DEFAULT_CONCURRENCY,
-        callback: Callable[[int], None] | None = None,
+        callback: Callable[[int, int, str], None] | None = None,
         *,
         readonly: bool = False,
     ) -> list[TransferResult]:
@@ -562,7 +562,7 @@ class S3Remote:
                             )
                             completed += 1
                             if callback:
-                                callback(completed)
+                                callback(completed, len(items), local_path.name)
                             return TransferResult(hash=hash_, success=True)
                         except Exception as e:
                             return TransferResult(hash=hash_, success=False, error=str(e))

@@ -15,7 +15,7 @@ from pivot.storage import cache, lock, track
 from pivot.types import HashInfo, is_dir_hash
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Callable, Mapping
 
 RestoreResult = Literal["restored", "skipped", "missing"]
 MAX_CONCURRENT_RESTORES = 32
@@ -108,6 +108,7 @@ async def _checkout_files_async(
     cache_dir: pathlib.Path,
     checkout_modes: list[cache.CheckoutMode],
     behavior: CheckoutBehavior,
+    callback: Callable[[int, int, str], None] | None = None,
 ) -> tuple[list[str], int, int]:
     """Restore files in parallel.
 
@@ -139,6 +140,8 @@ async def _checkout_files_async(
                     restored += 1
                 case "skipped":
                     skipped += 1
+            if callback:
+                callback(restored + skipped + len(failures), len(files), name)
         except click.ClickException as e:
             immediate_errors.append(e)
 
@@ -230,6 +233,7 @@ async def _checkout_main_async(
     cache_dir: pathlib.Path,
     checkout_modes: list[cache.CheckoutMode],
     behavior: CheckoutBehavior,
+    callback: Callable[[int, int, str], None] | None = None,
 ) -> tuple[list[str], int, int]:
     """Main async checkout logic.
 
@@ -239,18 +243,30 @@ async def _checkout_main_async(
     if targets:
         unique_targets = _dedupe_targets(targets)
         files = _validate_and_build_files(unique_targets, tracked_files, stage_outputs)
-        return await _checkout_files_async(files, cache_dir, checkout_modes, behavior)
+        return await _checkout_files_async(files, cache_dir, checkout_modes, behavior, callback)
     else:
         # Checkout all tracked files and stage outputs
         tracked_as_hashes: dict[str, HashInfo] = {
             path: track.pvt_to_hash_info(pvt) for path, pvt in tracked_files.items()
         }
-        # Run both in parallel
+        combined_total = len(tracked_as_hashes) + len(stage_outputs)
+        shared_completed = 0
+
+        def shared_callback(_completed: int, _total: int, filename: str) -> None:
+            nonlocal shared_completed
+            shared_completed += 1
+            if callback:
+                callback(shared_completed, combined_total, filename)
+
+        progress_cb = shared_callback if callback else None
+        # Run both in parallel with shared progress counter
         t1 = asyncio.create_task(
-            _checkout_files_async(tracked_as_hashes, cache_dir, checkout_modes, behavior)
+            _checkout_files_async(
+                tracked_as_hashes, cache_dir, checkout_modes, behavior, progress_cb
+            )
         )
         t2 = asyncio.create_task(
-            _checkout_files_async(stage_outputs, cache_dir, checkout_modes, behavior)
+            _checkout_files_async(stage_outputs, cache_dir, checkout_modes, behavior, progress_cb)
         )
         (f1, r1, s1), (f2, r2, s2) = await asyncio.gather(t1, t2)
         return (f1 + f2, r1 + r2, s1 + s2)
@@ -340,11 +356,18 @@ def checkout(
     stage_outputs = {} if pipeline is None else _get_stage_output_info()
 
     # Run async checkout
-    failures, restored, skipped = asyncio.run(
-        _checkout_main_async(
-            targets, tracked_files, stage_outputs, cache_dir, checkout_modes, behavior
+    with cli_helpers.TransferProgress("Restoring", quiet=quiet) as progress:
+        failures, restored, skipped = asyncio.run(
+            _checkout_main_async(
+                targets,
+                tracked_files,
+                stage_outputs,
+                cache_dir,
+                checkout_modes,
+                behavior,
+                callback=progress.callback,
+            )
         )
-    )
 
     success = _print_summary(failures, restored, skipped, quiet)
     if not success:

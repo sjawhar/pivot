@@ -91,7 +91,10 @@ def push(
 
     # Remote hash tracking is project-level (not per-stage), so use the
     # project-level StateDB regardless of --all mode.
-    with state.StateDB(config.get_state_db_path()) as state_db:
+    with (
+        state.StateDB(config.get_state_db_path()) as state_db,
+        cli_helpers.TransferProgress("Uploaded", quiet=quiet) as progress,
+    ):
         result = transfer.push(
             cache_dir,
             state_dir,
@@ -100,7 +103,7 @@ def push(
             resolved_name,
             targets_list,
             jobs,
-            None if quiet else cli_helpers.make_progress_callback("Uploaded"),
+            progress.callback,
             all_stages=all_stages,
         )
 
@@ -170,7 +173,10 @@ def fetch(
             click.echo(f"Would fetch {len(missing)} file(s) from '{resolved_name}'")
         return
 
-    with state.StateDB(config.get_state_db_path()) as state_db:
+    with (
+        state.StateDB(config.get_state_db_path()) as state_db,
+        cli_helpers.TransferProgress("Downloaded", quiet=quiet) as progress,
+    ):
         result = transfer.pull(
             cache_dir,
             state_dir,
@@ -179,7 +185,7 @@ def fetch(
             resolved_name,
             targets_list,
             jobs,
-            None if quiet else cli_helpers.make_progress_callback("Downloaded"),
+            progress.callback,
             all_stages=all_stages,
         )
 
@@ -274,7 +280,10 @@ def pull(
         return
 
     # Step 1: Fetch from remote to cache
-    with state.StateDB(config.get_state_db_path()) as state_db:
+    with (
+        state.StateDB(config.get_state_db_path()) as state_db,
+        cli_helpers.TransferProgress("Downloaded", quiet=quiet) as progress,
+    ):
         fetch_result = transfer.pull(
             cache_dir,
             state_dir,
@@ -283,7 +292,7 @@ def pull(
             resolved_name,
             targets_list,
             jobs,
-            None if quiet else cli_helpers.make_progress_callback("Downloaded"),
+            progress.callback,
             all_stages=all_stages,
         )
 

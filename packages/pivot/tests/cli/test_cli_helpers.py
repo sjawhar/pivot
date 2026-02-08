@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+import sys
 from typing import TYPE_CHECKING, Annotated, TypedDict
 
 import click
@@ -14,6 +15,8 @@ from pivot.cli import CliContext
 from pivot.cli import helpers as cli_helpers
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from pivot.pipeline.pipeline import Pipeline
 
 
@@ -47,6 +50,44 @@ def _known_stage_func() -> _KnownStageOutputs:
 
 def _valid_stage_func() -> _ValidStageOutputs:
     return _ValidStageOutputs(output=pathlib.Path("out.txt"))
+
+
+class _HelperDummyBar:
+    total: int | None
+    n: int
+    desc: str
+    closed: bool
+    refresh_calls: int
+
+    def __init__(self) -> None:
+        self.total = None
+        self.n = 0
+        self.desc = ""
+        self.closed = False
+        self.refresh_calls = 0
+
+    def refresh(self) -> None:
+        self.refresh_calls += 1
+
+    def update(self, n: int) -> None:
+        self.n += n
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _helper_make_dummy_tqdm(
+    bar: _HelperDummyBar,
+) -> Callable[..., _HelperDummyBar]:
+    def _factory(**kwargs: object) -> _HelperDummyBar:
+        # Capture the total kwarg if provided (for lazy bar creation)
+        if "total" in kwargs:
+            total_val = kwargs["total"]
+            assert isinstance(total_val, int)
+            bar.total = total_val
+        return bar
+
+    return _factory
 
 
 # =============================================================================
@@ -117,47 +158,71 @@ def test_validate_stages_exist_raises_for_multiple_unknown(mock_discovery: Pipel
 
 
 # =============================================================================
-# make_progress_callback Tests
+# TransferProgress Tests
 # =============================================================================
 
 
-def test_make_progress_callback_returns_callable() -> None:
-    """make_progress_callback returns a callable."""
-    callback = cli_helpers.make_progress_callback("Uploaded")
-    assert callable(callback)
+def test_transfer_progress_skips_when_quiet(monkeypatch: pytest.MonkeyPatch) -> None:
+    """TransferProgress avoids creating a bar when quiet."""
+    bar = _HelperDummyBar()
+    calls = {"count": 0}
+
+    def _dummy_tqdm(**_kwargs: object) -> _HelperDummyBar:
+        calls["count"] += 1
+        return bar
+
+    monkeypatch.setattr(cli_helpers, "async_tqdm", _dummy_tqdm)
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: True)
+
+    with cli_helpers.TransferProgress("Uploaded", quiet=True) as progress:
+        progress.callback(1, 3, "file.txt")
+
+    assert calls["count"] == 0
 
 
-def test_make_progress_callback_echoes_progress(
-    runner: click.testing.CliRunner,
-) -> None:
-    """make_progress_callback creates callback that echoes progress."""
+def test_transfer_progress_no_bar_without_callback(monkeypatch: pytest.MonkeyPatch) -> None:
+    """TransferProgress does not create bar if callback is never invoked."""
+    calls = {"count": 0}
 
-    @click.command()
-    def test_cmd() -> None:
-        callback = cli_helpers.make_progress_callback("Downloaded")
-        callback(5)
-        callback(10)
+    def _dummy_tqdm(**_kwargs: object) -> _HelperDummyBar:
+        calls["count"] += 1
+        return _HelperDummyBar()
 
-    result = runner.invoke(test_cmd)
+    monkeypatch.setattr(cli_helpers, "async_tqdm", _dummy_tqdm)
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: True)
 
-    assert result.exit_code == 0
-    assert "Downloaded 5 files" in result.output
-    assert "Downloaded 10 files" in result.output
+    with cli_helpers.TransferProgress("Uploaded") as progress:
+        pass  # No callback invoked — simulates 0 files
+
+    assert calls["count"] == 0
+    assert progress._bar is None
 
 
-def test_make_progress_callback_uses_action_text(
-    runner: click.testing.CliRunner,
-) -> None:
-    """make_progress_callback uses provided action text."""
+def test_transfer_progress_updates_bar(monkeypatch: pytest.MonkeyPatch) -> None:
+    """TransferProgress updates the tqdm bar with progress data."""
+    bar = _HelperDummyBar()
+    monkeypatch.setattr(cli_helpers, "async_tqdm", _helper_make_dummy_tqdm(bar))
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: True)
 
-    @click.command()
-    def test_cmd() -> None:
-        callback = cli_helpers.make_progress_callback("Processed")
-        callback(42)
+    progress = cli_helpers.TransferProgress("Uploaded")
+    progress.callback(1, 3, "file.txt")
+    progress.callback(2, 3, "another.txt")
 
-    result = runner.invoke(test_cmd)
+    assert bar.total == 3
+    assert bar.n == 2
+    assert bar.desc == "Uploaded another.txt"
 
-    assert "Processed 42 files" in result.output
+
+def test_transfer_progress_closes_bar(monkeypatch: pytest.MonkeyPatch) -> None:
+    """TransferProgress closes the tqdm bar on exit."""
+    bar = _HelperDummyBar()
+    monkeypatch.setattr(cli_helpers, "async_tqdm", _helper_make_dummy_tqdm(bar))
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: True)
+
+    with cli_helpers.TransferProgress("Downloaded") as progress:
+        progress.callback(1, 1, "file.txt")
+
+    assert bar.closed is True
 
 
 # =============================================================================
@@ -398,49 +463,3 @@ def test_validate_stages_exist_no_context_raises_error() -> None:
     # Don't set up any Click context - just call directly
     with pytest.raises(NoPipelineError):
         cli_helpers.validate_stages_exist(["some_stage"])
-
-
-# =============================================================================
-# Progress Callback Edge Cases
-# =============================================================================
-
-
-def test_make_progress_callback_zero_files(
-    runner: click.testing.CliRunner,
-) -> None:
-    """make_progress_callback handles zero count correctly.
-
-    Edge case: ensure "0 files" displays correctly (not "0 file" or blank).
-    """
-
-    @click.command()
-    def test_cmd() -> None:
-        callback = cli_helpers.make_progress_callback("Processed")
-        callback(0)
-
-    result = runner.invoke(test_cmd)
-
-    assert result.exit_code == 0
-    assert "Processed 0 files" in result.output
-
-
-def test_make_progress_callback_singular_vs_plural(
-    runner: click.testing.CliRunner,
-) -> None:
-    """make_progress_callback uses correct singular/plural for count=1.
-
-    Quality issue: count=1 should say "1 file", not "1 files".
-    This test documents current behavior and can be updated if we fix pluralization.
-    """
-
-    @click.command()
-    def test_cmd() -> None:
-        callback = cli_helpers.make_progress_callback("Downloaded")
-        callback(1)
-
-    result = runner.invoke(test_cmd)
-
-    assert result.exit_code == 0
-    # Current implementation always uses "files" - document this
-    # If we add proper pluralization, change assertion to: "Downloaded 1 file"
-    assert "Downloaded 1 files" in result.output or "Downloaded 1 file" in result.output

@@ -264,7 +264,7 @@ async def _push_async(
     remote_name: str,
     targets: list[str] | None = None,
     jobs: int | None = None,
-    callback: Callable[[int], None] | None = None,
+    callback: Callable[[int, int, str], None] | None = None,
     all_stages: dict[str, RegistryStageInfo] | None = None,
 ) -> TransferSummary:
     """Push cache files to remote (async implementation)."""
@@ -325,7 +325,7 @@ def push(
     remote_name: str,
     targets: list[str] | None = None,
     jobs: int | None = None,
-    callback: Callable[[int], None] | None = None,
+    callback: Callable[[int, int, str], None] | None = None,
     all_stages: dict[str, RegistryStageInfo] | None = None,
 ) -> TransferSummary:
     """Push cache files to remote storage."""
@@ -352,7 +352,7 @@ async def _pull_async(
     remote_name: str,
     targets: list[str] | None = None,
     jobs: int | None = None,
-    callback: Callable[[int], None] | None = None,
+    callback: Callable[[int, int, str], None] | None = None,
     all_stages: dict[str, RegistryStageInfo] | None = None,
 ) -> TransferSummary:
     """Pull cache files from remote (async implementation)."""
@@ -408,7 +408,7 @@ def pull(
     remote_name: str,
     targets: list[str] | None = None,
     jobs: int | None = None,
-    callback: Callable[[int], None] | None = None,
+    callback: Callable[[int, int, str], None] | None = None,
     all_stages: dict[str, RegistryStageInfo] | None = None,
 ) -> TransferSummary:
     """Pull cache files from remote storage."""
