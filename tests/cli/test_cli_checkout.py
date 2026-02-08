@@ -713,7 +713,7 @@ def test_checkout_restores_only_cached_outputs_not_metrics(
     `pivot checkout` should only restore the Out() (cached) output. The Metric()
     output is not cached — it's git-tracked and not Pivot's responsibility.
     """
-    with isolated_pivot_dir(runner, tmp_path) as project_root:
+    with isolated_pivot_dir(runner, tmp_path):
         pathlib.Path(".pivot/cache/files").mkdir(parents=True, exist_ok=True)
         pathlib.Path("input.txt").write_text("data")
 
