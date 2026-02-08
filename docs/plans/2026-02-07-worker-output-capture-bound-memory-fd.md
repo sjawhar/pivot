@@ -1,7 +1,5 @@
 # Worker Output Capture — Bounded Memory + FD-Compatible stdout/stderr
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
-
 **Goal:** Replace the unbounded `output_lines` list with a bounded ring buffer and give `_QueueWriter` a real file descriptor via `os.pipe()` so libraries that call `fileno()` work.
 
 **Architecture:** Two changes to `_QueueWriter` in `src/pivot/executor/worker.py`:
@@ -28,7 +26,7 @@
 
 **Truncation indicator:** When the buffer overflows, the oldest line is evicted. After all output is collected, if `dropped_count > 0`, we prepend a single indicator line: `"[{dropped_count} earlier lines truncated]"`. This goes into the ring buffer's snapshot, not into the real-time queue (which already sent those lines).
 
-**Pipe lifecycle:** The pipe is created in `__enter__`, the reader thread starts immediately, and both FDs are closed in `__exit__` (write-end first to signal EOF, then join reader thread, then close read-end).
+**Pipe lifecycle:** The pipe is lazily initialized via `_ensure_pipe()` on first `fileno()` call, the reader thread starts immediately, and both FDs are closed in `__exit__` (write-end first to signal EOF, then join reader thread, then close read-end).
 
 **`StageResult.output_lines` type change:** Change from `list[tuple[str, bool]]` to `list[tuple[str, bool]]` — same type, but now populated from ring buffer snapshot. No type change needed. We keep the field for backward compatibility of the TypedDict shape (tests and serialization).
 

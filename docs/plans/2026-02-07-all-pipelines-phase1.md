@@ -1,6 +1,5 @@
 # `--all` Flag Phase 1: `verify --all` Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Add `--all` flag to `pivot verify` that discovers all pipelines in the project, merges them into one unified DAG, and verifies all stages — with correct per-stage `state_dir` routing for lock files and StateDB access.
 

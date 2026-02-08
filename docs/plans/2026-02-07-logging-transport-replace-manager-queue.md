@@ -1,10 +1,8 @@
 # Logging Transport: Replace Manager Queue + Polling Drain
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
-
 **Goal:** Replace `multiprocessing.Manager().Queue()` with a plain spawn-context `multiprocessing.Queue` and replace the polling drain loop with a dedicated blocking drain thread that forwards messages into anyio.
 
-**Architecture:** The engine currently uses `Manager().Queue()` (which spawns a separate manager process) and polls it with 20ms timeouts. We replace the Manager queue with `mp.get_context("spawn").Queue()` (no manager process needed), replace the polling drain task with a blocking drain thread that calls `queue.get()` with no timeout, and use a sentinel value to signal clean shutdown. The drain thread forwards messages into the async event loop via `anyio.from_thread.run`.
+**Architecture:** The engine currently uses `Manager().Queue()` (which spawns a separate manager process) and polls it with 20ms timeouts. We replace the Manager queue with `mp.get_context("spawn").Queue()` (no manager process needed), replace the polling drain task with a blocking drain thread that calls `queue.get()` with no timeout, and use a sentinel value to signal clean shutdown. The drain thread forwards messages into the async event loop via `anyio.from_thread.run`. Note: Manager is still used elsewhere for queue pickling across spawn boundaries in ProcessPoolExecutor.
 
 **Tech Stack:** Python multiprocessing, anyio, threading (via `anyio.to_thread`)
 

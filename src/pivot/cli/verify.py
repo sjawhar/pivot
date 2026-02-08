@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import pathlib
-from typing import TYPE_CHECKING, Literal, TypedDict, cast
+from typing import TYPE_CHECKING, Literal, TypedDict
 
 import click
 
@@ -79,19 +79,16 @@ def _get_stage_lock_hashes(
         return {}, {}
 
     # Filter non-cached outputs — they're git-tracked, not in cache
+    project_root = project.get_project_root()
     cached_paths = {
-        path_utils.preserve_trailing_slash(
-            str(out.path),
-            str(project.normalize_path(cast("str", out.path))),
-        )
+        path_utils.canonicalize_artifact_path(str(out.path), project_root)
         for out in stage_info["outs"]
         if out.cache
     }
     cached_output_hashes: dict[str, HashInfo] = {
         path: h
         for path, h in lock_data["output_hashes"].items()
-        if path_utils.preserve_trailing_slash(path, str(project.normalize_path(path)))
-        in cached_paths
+        if path_utils.canonicalize_artifact_path(path, project_root) in cached_paths
     }
 
     return (

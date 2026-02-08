@@ -544,7 +544,8 @@ class Engine:
         self._executor = executor_core.create_executor(effective_max_workers)
 
         # Create output queue via Manager so the proxy is picklable across loky workers.
-        # Plain spawn_ctx.Queue() cannot be pickled for ProcessPoolExecutor.submit().
+        # Manager is still needed: plain spawn_ctx.Queue() cannot be pickled for
+        # ProcessPoolExecutor.submit() (workers run in separate processes).
         spawn_ctx = mp.get_context("spawn")
         local_manager = spawn_ctx.Manager()
         output_queue: mp.Queue[OutputMessage] = local_manager.Queue()  # pyright: ignore[reportAssignmentType]
@@ -722,14 +723,9 @@ class Engine:
                             name, f"upstream '{failed_upstream}' failed", results
                         )
 
-                # Send sentinel to stop blocking drain thread without blocking event loop
-                with contextlib.suppress(queue.Full, OSError, BrokenPipeError):
-                    output_queue.put_nowait(None)
-
         finally:
             # Ensure drain thread can exit even on exception path.
-            # Suppress Full in case the queue is at capacity (e.g., sentinel
-            # already enqueued on the happy path).
+            # Suppress Full in case the queue is at capacity.
             with contextlib.suppress(OSError, BrokenPipeError, queue.Full):
                 output_queue.put_nowait(None)
             self._executor = None

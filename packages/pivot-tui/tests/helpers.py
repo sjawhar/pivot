@@ -36,7 +36,7 @@ async def wait_for_socket(socket_path: pathlib.Path, timeout: float = 5.0) -> No
                 if stat.S_ISSOCK(mode):
                     return
             except OSError:
-                pass
+                pass  # Ignore if terminal is not available (CI environments)
         await anyio.sleep(0.05)
     msg = f"Socket {socket_path} not created within {timeout}s"
     raise TimeoutError(msg)

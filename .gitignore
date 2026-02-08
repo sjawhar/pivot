@@ -289,3 +289,7 @@ $RECYCLE.BIN/
 # Pivot project state
 .pivot/
 /ralph/
+
+# Sisyphus session state (plans, notepads, drafts)
+.sisyphus/
+!.sisyphus/plans/

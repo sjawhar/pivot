@@ -1,6 +1,5 @@
 # Rearchitect Commit Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Eliminate the "pending lock" concept, simplify `--no-commit` mode, drop `--no-cache`, and remove `None` from `OutputHash` throughout the codebase.
 

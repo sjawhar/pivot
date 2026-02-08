@@ -130,7 +130,7 @@ def validate_tui_log(
     if not tui_log:
         return None
     if as_json:
-        raise click.ClickException("--tui-log cannot be used with --jsonl")
+        raise click.ClickException("--tui-log cannot be used with --jsonl/--json")
     if not tui_flag:
         raise click.ClickException("--tui-log requires --tui")
     if dry_run:
@@ -150,7 +150,7 @@ def validate_show_output(show_output: bool, tui_flag: bool, as_json: bool, quiet
     if show_output and tui_flag:
         raise click.ClickException("--show-output and --tui are mutually exclusive")
     if show_output and as_json:
-        raise click.ClickException("--show-output and --jsonl are mutually exclusive")
+        raise click.ClickException("--show-output and --jsonl/--json are mutually exclusive")
     if show_output and quiet:
         raise click.ClickException("--show-output and --quiet are mutually exclusive")
 

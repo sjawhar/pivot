@@ -26,13 +26,13 @@ def canonicalize_artifact_path(path: str, base: pathlib.Path) -> str:
     Returns:
         Canonical absolute path string, with trailing slash preserved if input had one.
     """
-    has_trailing_slash = path.endswith("/") or path.endswith("\\")
+    has_trailing_slash = path.endswith("/")
     # Normalize separators to POSIX before pathlib processing
     posix_path = path.replace("\\", "/")
     p = pathlib.Path(posix_path)
     abs_path = p if p.is_absolute() else base / p
     normalized = pathlib.Path(os.path.normpath(abs_path))
-    result = str(normalized)
+    result = normalized.as_posix()
     if has_trailing_slash and not result.endswith("/"):
         result += "/"
     return result
