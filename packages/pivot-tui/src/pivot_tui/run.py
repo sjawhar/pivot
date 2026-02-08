@@ -1105,14 +1105,20 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
 
     async def action_commit(self) -> None:  # pragma: no cover
         """Commit current workspace state (watch mode only)."""
-        if not self._watch_mode:
+        if self._commit_in_progress:
             return
-        if self._has_running_stages:
-            self.notify("Cannot commit while stages are running", severity="warning")
-            return
-
-        self.notify("Committing...")
+        self._commit_in_progress = True
         try:
+            if not self._watch_mode:
+                return
+            if self._has_running_stages:
+                self.notify("Cannot commit while stages are running", severity="warning")
+                return
+            if self._cancel_commit:
+                self._cancel_commit = False
+                return
+
+            self.notify("Committing...")
             from pivot.executor import commit as commit_mod
 
             committed, failed = await asyncio.to_thread(commit_mod.commit_stages)
@@ -1127,6 +1133,8 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
                 self.notify("Nothing to commit")
         except Exception as e:
             self.notify(f"Commit failed: {e}", severity="error")
+        finally:
+            self._commit_in_progress = False
 
     async def action_force_rerun_stage(self) -> None:  # pragma: no cover
         """Force re-run the currently selected stage (watch mode only)."""

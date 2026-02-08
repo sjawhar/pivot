@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Annotated, Any, TypedDict
 
 import pytest
 
-from pivot import exceptions, executor, loaders, outputs, project, registry, stage_def
+from pivot import exceptions, executor, loaders, outputs, path_utils, project, registry, stage_def
 from pivot.executor import core as executor_core
 from pivot.executor import worker
 from pivot.storage import cache, lock, state
@@ -2030,27 +2030,29 @@ def test_directory_out_restored_from_cache(
 # =============================================================================
 
 
-def test_normalize_out_path_preserves_trailing_slash() -> None:
-    """normalize_out_path preserves trailing slash for DirectoryOut paths."""
-    result = worker.normalize_out_path("results/")
+def test_canonicalize_artifact_path_preserves_trailing_slash() -> None:
+    """canonicalize_artifact_path preserves trailing slash for DirectoryOut paths."""
+    base = project.get_project_root()
+    result = path_utils.canonicalize_artifact_path("results/", base)
     assert result.endswith("/"), "Should preserve trailing slash for DirectoryOut"
     assert "results" in result
 
-    result2 = worker.normalize_out_path("a/b/c/")
+    result2 = path_utils.canonicalize_artifact_path("a/b/c/", base)
     assert result2.endswith("/"), "Should preserve trailing slash for nested DirectoryOut"
 
 
-def test_normalize_out_path_no_slash_for_files() -> None:
-    """normalize_out_path doesn't add trailing slash for regular Out paths."""
-    result = worker.normalize_out_path("output.csv")
+def test_canonicalize_artifact_path_no_slash_for_files() -> None:
+    """canonicalize_artifact_path doesn't add trailing slash for regular Out paths."""
+    base = project.get_project_root()
+    result = path_utils.canonicalize_artifact_path("output.csv", base)
     assert not result.endswith("/"), "Should not add trailing slash for files"
     assert result.endswith("output.csv")
 
 
-def test_normalize_out_path_normalizes_relative_paths() -> None:
-    """normalize_out_path normalizes relative path components."""
-    # Note: This depends on project.normalize_path behavior
-    result = worker.normalize_out_path("./results/")
+def test_canonicalize_artifact_path_normalizes_relative_paths() -> None:
+    """canonicalize_artifact_path normalizes relative path components."""
+    base = project.get_project_root()
+    result = path_utils.canonicalize_artifact_path("./results/", base)
     assert result.endswith("/"), "Should preserve trailing slash"
     assert "//" not in result, "Should not have double slashes"
 
@@ -2385,27 +2387,30 @@ def test_file_needs_restore_uses_state_db(tmp_path: pathlib.Path) -> None:
 
 
 # =============================================================================
-# normalize_out_path Additional Tests
+# canonicalize_artifact_path Additional Tests
 # =============================================================================
 
 
-def test_normalize_out_path_handles_absolute_path() -> None:
-    """normalize_out_path handles absolute paths."""
-    result = worker.normalize_out_path("/absolute/path/output.csv")
+def test_canonicalize_artifact_path_handles_absolute_path() -> None:
+    """canonicalize_artifact_path handles absolute paths."""
+    base = project.get_project_root()
+    result = path_utils.canonicalize_artifact_path("/absolute/path/output.csv", base)
     assert not result.endswith("/"), "Files should not have trailing slash"
     assert "output.csv" in result
 
 
-def test_normalize_out_path_handles_absolute_dir_path() -> None:
-    """normalize_out_path preserves trailing slash for absolute directory paths."""
-    result = worker.normalize_out_path("/absolute/path/results/")
+def test_canonicalize_artifact_path_handles_absolute_dir_path() -> None:
+    """canonicalize_artifact_path preserves trailing slash for absolute directory paths."""
+    base = project.get_project_root()
+    result = path_utils.canonicalize_artifact_path("/absolute/path/results/", base)
     assert result.endswith("/"), "Directory paths should preserve trailing slash"
 
 
-def test_normalize_out_path_handles_empty_trailing_component() -> None:
-    """normalize_out_path handles paths with multiple trailing slashes."""
+def test_canonicalize_artifact_path_handles_empty_trailing_component() -> None:
+    """canonicalize_artifact_path handles paths with multiple trailing slashes."""
+    base = project.get_project_root()
     # Single trailing slash
-    result = worker.normalize_out_path("results/")
+    result = path_utils.canonicalize_artifact_path("results/", base)
     assert result.endswith("/")
     assert "//" not in result
 

@@ -1,6 +1,5 @@
 # Split Deferred StateDB Writes for Run-Cache Skip Safety
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Ensure run-cache SKIPPED results record dep_generations and run_cache metadata in StateDB without incorrectly incrementing output generations.
 
@@ -335,7 +334,7 @@ Before:
 After:
 ```python
                                 # Apply deferred writes for RAN and SKIPPED stages
-                                if result["status"] != StageStatus.FAILED and not no_commit:
+                                if result["status"] in (StageStatus.RAN, StageStatus.SKIPPED) and not no_commit:
                                     stage_info = self._get_stage(stage_name)
                                     output_paths = [str(out.path) for out in stage_info["outs"]]
                                     executor_core.apply_deferred_writes(
@@ -428,6 +427,6 @@ Expected: ALL PASS
 | `src/pivot/types.py` | Add `increment_outputs: bool` field to `DeferredWrites` | ~1 line |
 | `src/pivot/storage/state.py` | Guard output generation increment on `increment_outputs` flag | ~6 lines changed |
 | `src/pivot/executor/worker.py` | Add `increment_outputs` kwarg to `_commit_lock_and_build_deferred` and `_build_deferred_writes`; pass `False` from run-cache skip path | ~8 lines changed |
-| `src/pivot/engine/engine.py` | Change condition from `== StageStatus.RAN` to `!= StageStatus.FAILED` | 1 line changed |
+| `src/pivot/engine/engine.py` | Change condition from `== StageStatus.RAN` to `in (StageStatus.RAN, StageStatus.SKIPPED)` | 1 line changed |
 | `tests/storage/test_state.py` | Add 2 new tests, update 2 existing tests for flag behavior | ~40 lines |
 | `tests/test_run_cache_lock_update.py` | Add integration test for dep_generations after run-cache skip | ~35 lines |

@@ -1,6 +1,5 @@
 # Graph Model Adapter: Decouple Renderer from Engine Node Encoding
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Decouple `dag/render.py` from engine-specific string-encoded node IDs (`parse_node`, `NodeType`) by introducing a `GraphView` adapter that exposes nodes and edges as plain data.
 

@@ -6,7 +6,6 @@ import pytest
 import yaml
 
 from pivot import exceptions, project
-from pivot.cli import helpers as cli_helpers
 from pivot.remote import config as remote_config
 from pivot.remote import storage as remote_storage
 from pivot.remote import sync as transfer
@@ -102,21 +101,6 @@ def lock_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return tmp_path
 
 
-@pytest.fixture(autouse=True)
-def _mock_get_stage(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Mock cli_helpers.get_stage to return all-cached outputs.
-
-    Since sync functions now use the registry to filter non-cached outputs,
-    tests that don't set up a full pipeline need this mock. Returning empty
-    outs means non_cached_paths is empty, so all lock file hashes pass through.
-    """
-
-    def _get_stage(name: str) -> dict[str, object]:
-        return {"outs": []}
-
-    monkeypatch.setattr(cli_helpers, "get_stage", _get_stage)
-
-
 def test_get_stage_output_hashes_no_lock(lock_project: Path) -> None:
     """Missing lock file returns empty set with warning."""
     state_dir = lock_project / ".pivot"
@@ -143,7 +127,7 @@ def test_get_stage_output_hashes_file_output(
 def test_get_stage_output_hashes_directory_output(
     lock_project: Path, make_valid_lock_content: ValidLockContentFactory
 ) -> None:
-    """Extracts all hashes from directory output including manifest."""
+    """Extracts all hashes from directory output including manifest (tree hash excluded)."""
     state_dir = lock_project / ".pivot"
 
     lock_data = make_valid_lock_content(
@@ -223,7 +207,7 @@ def test_get_stage_dep_hashes(
 def test_get_stage_dep_hashes_with_manifest(
     lock_project: Path, make_valid_lock_content: ValidLockContentFactory
 ) -> None:
-    """Extracts all hashes from directory dependency including manifest."""
+    """Extracts all hashes from directory dependency including manifest (tree hash excluded)."""
     state_dir = lock_project / ".pivot"
 
     lock_data = make_valid_lock_content(

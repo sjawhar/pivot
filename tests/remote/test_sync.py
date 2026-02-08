@@ -1,14 +1,18 @@
 from __future__ import annotations
 
-import pathlib
+from typing import TYPE_CHECKING
 
-import pytest
-
-from pivot.cli import helpers as cli_helpers
+from pivot.remote import storage as remote_storage
 from pivot.remote import sync
 from pivot.storage import cache as cache_mod
 from pivot.storage import lock
-from pivot.types import DirHash, DirManifestEntry, FileHash, LockData
+from pivot.storage import state as state_mod
+from pivot.types import DirHash, DirManifestEntry, FileHash, LockData, TransferResult
+
+if TYPE_CHECKING:
+    import pathlib
+
+    from pytest_mock import MockerFixture
 
 # =============================================================================
 # Unit tests for _extract_file_hashes_from_hash_info
@@ -69,20 +73,6 @@ def _write_lock_with_dir_output(
     )
     stage_lock = lock.StageLock(stage_name, stages_dir)
     stage_lock.write(lock_data)
-
-
-@pytest.fixture(autouse=True)
-def _mock_get_stage(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Mock cli_helpers.get_stage to return all-cached outputs.
-
-    Sync functions filter non-cached outputs via registry; tests without a
-    pipeline can return empty outs to allow hashes through.
-    """
-
-    def _get_stage(name: str) -> dict[str, object]:
-        return {"outs": []}
-
-    monkeypatch.setattr(cli_helpers, "get_stage", _get_stage)
 
 
 def test_get_stage_output_hashes_excludes_tree_hash(set_project_root: pathlib.Path) -> None:
@@ -152,9 +142,13 @@ def test_get_target_hashes_invalid_stage_name_falls_through(
 # =============================================================================
 
 
-def test_push_skips_directory_cache_paths(tmp_path: pathlib.Path) -> None:
+async def test_push_skips_directory_cache_paths(
+    tmp_path: pathlib.Path, mocker: MockerFixture
+) -> None:
     """Push should never enqueue directory paths for upload."""
     cache_dir = tmp_path / "cache"
+    state_dir = tmp_path / ".pivot"
+    state_dir.mkdir(parents=True)
     files_dir = cache_dir / "files"
 
     # Create a file cache entry
@@ -169,17 +163,33 @@ def test_push_skips_directory_cache_paths(tmp_path: pathlib.Path) -> None:
     dir_cache.mkdir(parents=True)
     (dir_cache / "some_file.csv").write_text("data")
 
+    # Verify preconditions: both entries exist, one is a file, one is a directory
     file_path = cache_mod.get_cache_path(files_dir, file_hash)
     dir_path = cache_mod.get_cache_path(files_dir, dir_hash)
-    assert file_path.exists() and file_path.is_file()
-    assert dir_path.exists() and dir_path.is_dir()
+    assert file_path.is_file(), "File cache entry should be a file"
+    assert dir_path.is_dir(), "Dir cache entry should be a directory"
 
-    # Verify the filtering logic directly
-    items = list[tuple[pathlib.Path, str]]()
-    for hash_ in [file_hash, dir_hash]:
-        cache_path = cache_mod.get_cache_path(files_dir, hash_)
-        if cache_path.is_file():
-            items.append((cache_path, hash_))
+    mock_remote = mocker.Mock(spec=remote_storage.S3Remote)
+    mock_state = mocker.Mock(spec=state_mod.StateDB)
+    # Both hashes are in local cache; none known on remote
+    mock_state.remote_hashes_intersection.return_value = set()
+    mock_remote.bulk_exists = mocker.AsyncMock(return_value={file_hash: False, dir_hash: False})
+    mock_remote.upload_batch = mocker.AsyncMock(
+        return_value=[TransferResult(hash=file_hash, success=True)]
+    )
 
-    assert len(items) == 1
-    assert items[0][1] == file_hash
+    # Mock get_local_cache_hashes to return both file and directory hashes
+    # (normally it filters out directories, but we want to test the filtering in _push_async)
+    mocker.patch.object(sync, "get_local_cache_hashes", return_value={file_hash, dir_hash})
+
+    result = await sync._push_async(cache_dir, state_dir, mock_remote, mock_state, "origin")
+
+    # upload_batch should only receive the file entry, not the directory
+    mock_remote.upload_batch.assert_called_once()
+    uploaded_items = mock_remote.upload_batch.call_args[0][0]
+    uploaded_hashes = {h for _, h in uploaded_items}
+    assert file_hash in uploaded_hashes, "File hash should be uploaded"
+    assert dir_hash not in uploaded_hashes, "Directory hash should be skipped"
+    assert result["transferred"] == 1
+    # Verify directory was counted in skipped total (skipped_non_file fix from Task 3)
+    assert result["skipped"] == 1, "Directory cache path should be counted in skipped total"

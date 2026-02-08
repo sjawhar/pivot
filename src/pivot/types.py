@@ -128,7 +128,7 @@ class DeferredWrites(TypedDict, total=False):
     dep_generations: dict[str, int]  # {dep_path: generation}
     run_cache_input_hash: str
     run_cache_entry: RunCacheEntry
-    increment_outputs: bool  # True → increment output generations; absent → skip
+    increment_outputs: bool  # True → increment output generations; False/absent → skip
 
 
 class StageResult(TypedDict):
@@ -210,9 +210,9 @@ class OutputFormat(enum.StrEnum):
 #
 #   StorageLockData   On-disk YAML format. Uses project-relative paths
 #                     (portable across machines) and list-based deps/outs
-#                     (stable YAML output). This is the ONLY place relative
-#                     paths appear — converted at read/write boundary in
-#                     storage/lock.py.
+#                     (stable YAML output). This is the only place relative
+#                     paths appear in lockfiles — converted at read/write
+#                     boundary in storage/lock.py.
 #
 #   LockData          In-memory format. Uses canonical absolute paths
 #                     (matching registry/engine convention, fast comparisons)

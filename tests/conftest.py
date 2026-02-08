@@ -37,7 +37,9 @@ if TYPE_CHECKING:
 # Type alias for git_repo fixture: (repo_path, commit_fn)
 GitRepo = tuple[pathlib.Path, Callable[[str], str]]
 
+# Each xdist worker spawns loky workers + Manager; ~2 GB per worker needed
 _MEMORY_PER_WORKER_BYTES = 2 * 1024**3
+# Hard cap on worker count to prevent resource exhaustion
 _MAX_WORKERS_CAP = 16
 
 
@@ -57,6 +59,7 @@ def pytest_xdist_auto_num_workers(config: pytest.Config) -> int:
     if limit_bytes is not None:
         workers = min(limit_bytes // _MEMORY_PER_WORKER_BYTES, cpu_count)
     else:
+        # Fallback: cap at 8 workers outside containers (conservative default)
         workers = min(cpu_count, 8)
     return max(1, min(workers, _MAX_WORKERS_CAP))
 
@@ -72,9 +75,11 @@ def _get_cgroup_memory_limit_bytes() -> int | None:
         v1 = pathlib.Path("/sys/fs/cgroup/memory/memory.limit_in_bytes")
         if v1.exists():
             limit = int(v1.read_text().strip())
+            # Threshold: 2^60 bytes (~1 EB) — skip unrealistic limits
             if limit < (1 << 60):
                 return limit
     except (OSError, ValueError):
+        # Ignore if cgroup files are unreadable (non-Linux, CI, or permission issues)
         pass
 
     return None

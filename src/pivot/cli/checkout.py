@@ -4,7 +4,7 @@ import asyncio
 import enum
 import logging
 import pathlib
-from typing import TYPE_CHECKING, Literal, cast
+from typing import TYPE_CHECKING, Literal
 
 import click
 
@@ -44,11 +44,9 @@ def _get_stage_output_info() -> dict[str, HashInfo]:
 
     for stage_name in cli_helpers.list_stages():
         stage_info = cli_helpers.get_stage(stage_name)
+        project_root = project.get_project_root()
         cached_paths = {
-            path_utils.preserve_trailing_slash(
-                str(out.path),
-                str(project.normalize_path(cast("str", out.path))),
-            )
+            path_utils.canonicalize_artifact_path(str(out.path), project_root)
             for out in stage_info["outs"]
             if out.cache
         }
@@ -58,9 +56,7 @@ def _get_stage_output_info() -> dict[str, HashInfo]:
         lock_data = stage_lock.read()
         if lock_data:
             for out_path, out_hash in lock_data["output_hashes"].items():
-                norm_path = path_utils.preserve_trailing_slash(
-                    out_path, str(project.normalize_path(out_path))
-                )
+                norm_path = path_utils.canonicalize_artifact_path(out_path, project_root)
                 if norm_path in cached_paths:
                     result[norm_path] = out_hash
 

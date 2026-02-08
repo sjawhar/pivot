@@ -62,8 +62,9 @@ class RegistryStageInfo(TypedDict):
         All paths in deps, deps_paths, outs, and outs_paths are in canonical
         absolute form (normalized, no .., trailing slash for DirectoryOut).
         This form is produced by path_utils.canonicalize_artifact_path().
-        Lockfiles are the one boundary where absolute <-> project-relative
-        conversion happens (see storage/lock.py).
+        Lockfiles and the output index cache are key boundaries where absolute
+        <-> project-relative conversion happens (see storage/lock.py and
+        pipeline.py).
 
     Attributes:
         func: The stage function to execute.

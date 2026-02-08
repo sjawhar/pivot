@@ -1,6 +1,5 @@
 # TUI Decoupling: Remove CLI Context Dependency
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Remove all `pivot.cli.helpers` imports from TUI modules by passing registry lookups as explicit constructor arguments, so the TUI is no longer coupled to Click context.
 

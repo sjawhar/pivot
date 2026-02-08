@@ -310,21 +310,12 @@ def test_run_fail_fast_stops_early(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """run --fail-fast stops on first failure.
-
-    Note: In single-stage mode (run command), stages are run in user-specified order
-    without dependency resolution. With parallel execution, both stages may start
-    before the failure is detected. The --fail-fast flag prevents starting NEW stages
-    after a failure is detected.
-
-    This test verifies --fail-fast is accepted and the failed stage shows failure status.
-    """
+    """run --fail-fast prevents subsequent stages from executing after a failure."""
     (tmp_path / "input.txt").write_text("data")
 
     register_test_stage(_stage_failing, name="failing")
     register_test_stage(_stage_succeeding, name="succeeding")
 
-    # With fail-fast, we verify the flag is accepted and failing shows failure
     result = runner.invoke(cli.cli, ["run", "--fail-fast", "failing", "succeeding"])
 
     assert result.exit_code == 0

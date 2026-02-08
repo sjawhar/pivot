@@ -509,8 +509,8 @@ def extract_graph_view(g: nx.DiGraph[str]) -> GraphView:
                 artifact_edges_set.add((input_path, output_path))
 
     return GraphView(
-        stages=stages,
-        artifacts=artifacts,
+        stages=sorted(stages),
+        artifacts=sorted(artifacts),
         stage_edges=sorted(stage_edges_set),
         artifact_edges=sorted(artifact_edges_set),
     )

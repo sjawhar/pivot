@@ -32,7 +32,7 @@ def canonicalize_artifact_path(path: str, base: pathlib.Path) -> str:
     p = pathlib.Path(posix_path)
     abs_path = p if p.is_absolute() else base / p
     normalized = pathlib.Path(os.path.normpath(abs_path))
-    result = str(normalized)
+    result = normalized.as_posix()
     if has_trailing_slash and not result.endswith("/"):
         result += "/"
     return result

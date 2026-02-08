@@ -1,6 +1,5 @@
 # Watch Mode: Restart Worker Pool on Code/Config Reload
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** When watch mode detects code/config changes, restart the loky worker pool so workers execute updated code instead of stale modules.
 
@@ -12,7 +11,7 @@
 
 ### Task 1: Persist `parallel` and `max_workers` in stored orchestration params
 
-The engine already stores `no_commit`, `no_cache`, and `on_error` from the initial `RunRequested` for watch-mode re-runs (see `engine.py:103-106`). But `parallel` and `max_workers` are NOT stored — `_execute_affected_stages` hardcodes `parallel=True, max_workers=None`. We need to persist these too.
+The engine already stores `no_commit` and `on_error` from the initial `RunRequested` for watch-mode re-runs (see `engine.py:103-106`). But `parallel` and `max_workers` are NOT stored — `_execute_affected_stages` hardcodes `parallel=True, max_workers=None`. We need to persist these too.
 
 **Files:**
 - Modify: `src/pivot/engine/engine.py:98-106` (add stored fields)
@@ -42,7 +41,6 @@ async def test_engine_stores_parallel_and_max_workers_on_run_requested() -> None
             parallel=True,
             max_workers=4,
             no_commit=False,
-            no_cache=False,
             on_error=OnError.FAIL,
             cache_dir=None,
             allow_uncached_incremental=False,
@@ -103,7 +101,6 @@ async def test_engine_execute_affected_stages_uses_stored_parallel_and_max_worke
         engine._stored_parallel = True
         engine._stored_max_workers = 4
         engine._stored_no_commit = False
-        engine._stored_no_cache = False
         engine._stored_on_error = OnError.FAIL
 
         captured_kwargs: dict[str, object] = {}

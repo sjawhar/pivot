@@ -229,7 +229,8 @@ class Pipeline:
 
         All artifact paths are stored as absolute, normalized paths in memory.
         Trailing slashes are preserved (important for DirectoryOut).
-        Lockfiles handle conversion to/from project-relative at their own boundary.
+        Lockfiles and the output index cache handle conversion to/from
+        project-relative at their own boundaries.
         """
         # Reject empty or whitespace-only paths early
         if not annotation_path or not annotation_path.strip():
@@ -263,7 +264,8 @@ class Pipeline:
         base = project_root if is_absolute else self.root
         resolved = path_utils.canonicalize_artifact_path(annotation_path, base)
 
-        # Check if path escapes project root (reject paths outside project)
+        # Check if path escapes project root (reject relative paths that escape via ../)
+        # Absolute paths are intentionally allowed outside project root (e.g. /data/external/file.csv)
         if not is_absolute:
             try:
                 pathlib.Path(resolved.rstrip("/")).relative_to(project_root)

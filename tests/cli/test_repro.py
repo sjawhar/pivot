@@ -573,7 +573,7 @@ def test_repro_show_output_mutually_exclusive_with_json(
         result = runner.invoke(cli.cli, ["repro", "--show-output", "--json"])
 
         assert result.exit_code != 0
-        assert "--show-output and --jsonl are mutually exclusive" in result.output
+        assert "--show-output and --jsonl/--json are mutually exclusive" in result.output
 
 
 def test_repro_show_output_mutually_exclusive_with_quiet(
