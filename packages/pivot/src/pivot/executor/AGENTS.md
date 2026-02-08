@@ -11,7 +11,7 @@ Workers execute in separate processes via `loky.get_reusable_executor()`.
 | `func` | Stage function (must be picklable) |
 | `fingerprint` | Code manifest for change detection |
 | `deps` | Input dependency paths |
-| `outs` | Output specs (`BaseOut` instances) |
+| `outs` | Output specs (post-expansion `ExpandedOut` instances) |
 | `project_root` | Absolute path to project root |
 | `state_dir` | Absolute path to `.pivot/` directory |
 

@@ -52,12 +52,14 @@ def _make_stage_info(
     params_arg_name: str | None = None,
 ) -> WorkerStageInfo:
     """Create a WorkerStageInfo with sensible defaults for testing."""
+    expanded_outs = [outputs.require_expanded(out) for out in outs] if outs else []
+    expanded_out_specs = out_specs or {}
     return {
         "func": func,
         "fingerprint": fingerprint or {"self:test": "abc123"},
         "deps": deps or [],
         "signature": signature,
-        "outs": outs or [],
+        "outs": expanded_outs,
         "params": params,
         "variant": None,
         "overrides": {},
@@ -67,7 +69,7 @@ def _make_stage_info(
         "force": force,
         "no_commit": no_commit,
         "dep_specs": dep_specs or {},
-        "out_specs": out_specs or {},
+        "out_specs": expanded_out_specs,
         "params_arg_name": params_arg_name,
         "project_root": tmp_path,
         "state_dir": tmp_path / ".pivot",
@@ -2746,7 +2748,7 @@ def test_try_skip_via_run_cache_returns_none_for_incremental_out(
     result = worker._try_skip_via_run_cache(
         "test_stage",
         "input_hash_123",
-        [incremental_out],
+        [outputs.require_expanded(incremental_out)],
         tmp_path / ".pivot" / "cache" / "files",
         [cache.CheckoutMode.COPY],
         state_db,
@@ -2771,7 +2773,7 @@ def test_try_skip_via_run_cache_returns_none_when_no_entry(
     result = worker._try_skip_via_run_cache(
         "nonexistent_stage",
         "input_hash_never_seen",
-        [out],
+        [outputs.require_expanded(out)],
         tmp_path / ".pivot" / "cache" / "files",
         [cache.CheckoutMode.COPY],
         state_db,
@@ -2915,7 +2917,11 @@ def test_save_outputs_to_cache_computes_real_hash_for_metric(tmp_path: pathlib.P
 
     # chdir so the relative path resolves
     with _chdir_and_reset_project_root(tmp_path):
-        result = worker._save_outputs_to_cache([metric_out], cache_dir, checkout_modes)
+        result = worker._save_outputs_to_cache(
+            [outputs.require_expanded(metric_out)],
+            cache_dir,
+            checkout_modes,
+        )
 
     # The hash should be a real FileHash, not None
     output_hash = result["metrics.json"]
@@ -2949,7 +2955,11 @@ def test_save_outputs_to_cache_mixed_cached_and_noncached(tmp_path: pathlib.Path
     checkout_modes = [cache.CheckoutMode.COPY]
 
     with _chdir_and_reset_project_root(tmp_path):
-        result = worker._save_outputs_to_cache([out, metric], cache_dir, checkout_modes)
+        result = worker._save_outputs_to_cache(
+            [outputs.require_expanded(out), outputs.require_expanded(metric)],
+            cache_dir,
+            checkout_modes,
+        )
 
     # Both should have real hashes
     assert result["output.txt"] is not None, "Cached output should have a hash"
@@ -3014,7 +3024,10 @@ def test_restore_outputs_from_cache_skips_noncached_outputs(
         # Restore should succeed — cached output restored from cache,
         # non-cached output verified as existing on disk
         restored = worker._restore_outputs_from_cache(
-            [out, metric], lock_data, cache_dir, checkout_modes
+            [outputs.require_expanded(out), outputs.require_expanded(metric)],
+            lock_data,
+            cache_dir,
+            checkout_modes,
         )
         assert restored, (
             "Should succeed when cached output is in cache and non-cached exists on disk"
@@ -3057,7 +3070,10 @@ def test_restore_outputs_from_cache_fails_when_noncached_missing(
         assert not (tmp_path / "metrics.json").exists()
 
         restored = worker._restore_outputs_from_cache(
-            [metric], lock_data, cache_dir, checkout_modes
+            [outputs.require_expanded(metric)],
+            lock_data,
+            cache_dir,
+            checkout_modes,
         )
         assert not restored, "Should fail when non-cached output is missing from disk"
 

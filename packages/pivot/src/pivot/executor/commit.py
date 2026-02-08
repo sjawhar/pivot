@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import logging
 import pathlib
-from typing import cast
 
 from pivot import config, exceptions, parameters, path_utils, project, registry, run_history
 from pivot.executor import worker
@@ -146,7 +145,7 @@ def commit_stages(
             outputs_missing = False
 
             for out in stage_outs:
-                out_path = pathlib.Path(cast("str", out.path))
+                out_path = pathlib.Path(out.path)
                 if not out_path.exists():
                     logger.error("Stage '%s': output missing: %s — skipping", stage_name, out.path)
                     outputs_missing = True
@@ -178,7 +177,7 @@ def commit_stages(
             dep_gen_map = worker.compute_dep_generation_map(stage_info["deps_paths"], stage_db)
 
             # Only cached outputs belong in run cache
-            cached_paths = {cast("str", out.path) for out in stage_outs if out.cache}
+            cached_paths = {out.path for out in stage_outs if out.cache}
             cached_output_hashes = {
                 path: oh for path, oh in output_hashes.items() if path in cached_paths
             }

@@ -299,7 +299,7 @@ def get_metric_info_from_head() -> dict[str, str | None]:
         for out in info["outs"]:
             if isinstance(out, outputs.Metric):
                 # Registry always stores single-file outputs (multi-file are expanded)
-                abs_path = str(project.normalize_path(cast("str", out.path)))
+                abs_path = str(project.normalize_path(out.path))
                 rel_path = project.to_relative_path(abs_path, proj_root)
                 stage_metric_paths.setdefault(stage_name, []).append(rel_path)
                 result[rel_path] = None  # Default to None

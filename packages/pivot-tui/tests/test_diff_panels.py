@@ -170,7 +170,9 @@ def test_compute_output_changes_no_lock_shows_added(tmp_path: pathlib.Path) -> N
         "name": "test_stage",
         "deps": {},
         "deps_paths": [],
-        "outs": [outputs.Out(path=str(output_file), loader=loaders.PathOnly())],
+        "outs": [
+            outputs.require_expanded(outputs.Out(path=str(output_file), loader=loaders.PathOnly()))
+        ],
         "outs_paths": [str(output_file)],
         "params": None,
         "mutex": [],
@@ -178,7 +180,7 @@ def test_compute_output_changes_no_lock_shows_added(tmp_path: pathlib.Path) -> N
         "signature": None,
         "fingerprint": {},
         "dep_specs": {},
-        "out_specs": {},
+        "out_specs": dict[str, outputs.BaseOut](),
         "params_arg_name": None,
         "state_dir": None,
     }
@@ -202,7 +204,9 @@ def test_compute_output_changes_missing_file_shows_removed(tmp_path: pathlib.Pat
         "name": "test_stage",
         "deps": {},
         "deps_paths": [],
-        "outs": [outputs.Out(path=str(output_file), loader=loaders.PathOnly())],
+        "outs": [
+            outputs.require_expanded(outputs.Out(path=str(output_file), loader=loaders.PathOnly()))
+        ],
         "outs_paths": [str(output_file)],
         "params": None,
         "mutex": [],
@@ -210,7 +214,7 @@ def test_compute_output_changes_missing_file_shows_removed(tmp_path: pathlib.Pat
         "signature": None,
         "fingerprint": {},
         "dep_specs": {},
-        "out_specs": {},
+        "out_specs": dict[str, outputs.BaseOut](),
         "params_arg_name": None,
         "state_dir": None,
     }
@@ -242,7 +246,9 @@ def test_compute_output_changes_unchanged(tmp_path: pathlib.Path) -> None:
         "name": "test_stage",
         "deps": {},
         "deps_paths": [],
-        "outs": [outputs.Out(path=str(output_file), loader=loaders.PathOnly())],
+        "outs": [
+            outputs.require_expanded(outputs.Out(path=str(output_file), loader=loaders.PathOnly()))
+        ],
         "outs_paths": [str(output_file)],
         "params": None,
         "mutex": [],
@@ -250,7 +256,7 @@ def test_compute_output_changes_unchanged(tmp_path: pathlib.Path) -> None:
         "signature": None,
         "fingerprint": {},
         "dep_specs": {},
-        "out_specs": {},
+        "out_specs": dict[str, outputs.BaseOut](),
         "params_arg_name": None,
         "state_dir": None,
     }
@@ -283,9 +289,9 @@ def test_compute_output_changes_detects_output_types(tmp_path: pathlib.Path) -> 
         "deps": {},
         "deps_paths": [],
         "outs": [
-            outputs.Out(path=str(out_file), loader=loaders.PathOnly()),
-            outputs.Metric(path=str(metric_file)),
-            outputs.Plot(path=str(plot_file), loader=loaders.PathOnly()),
+            outputs.require_expanded(outputs.Out(path=str(out_file), loader=loaders.PathOnly())),
+            outputs.require_expanded(outputs.Metric(path=str(metric_file))),
+            outputs.require_expanded(outputs.Plot(path=str(plot_file), loader=loaders.PathOnly())),
         ],
         "outs_paths": [str(out_file), str(metric_file), str(plot_file)],
         "params": None,
@@ -294,7 +300,7 @@ def test_compute_output_changes_detects_output_types(tmp_path: pathlib.Path) -> 
         "signature": None,
         "fingerprint": {},
         "dep_specs": {},
-        "out_specs": {},
+        "out_specs": dict[str, outputs.BaseOut](),
         "params_arg_name": None,
         "state_dir": None,
     }

@@ -91,7 +91,7 @@ class RegistryStageInfo(TypedDict):
     # deps_paths: Flat list for DAG construction and fingerprint hashing
     deps: dict[str, outputs.PathType]
     deps_paths: list[str]
-    outs: list[outputs.BaseOut]
+    outs: list[outputs.ExpandedOut]
     outs_paths: list[str]
     params: stage_def.StageParams | None
     mutex: list[str]
@@ -497,12 +497,20 @@ class StageRegistry:
                 for dep_name, spec in dep_specs.items()
             }
 
+            # Invariant: after expansion, every out has path: str (multi-path
+            # variants were expanded into individual single-path specs above).
+            if not all(isinstance(o.path, str) for o in outs_normalized):
+                bad = [o for o in outs_normalized if not isinstance(o.path, str)]
+                raise TypeError(
+                    f"Post-expansion outputs must have str paths, got: {[(type(o.path), o.path) for o in bad]}"
+                )
+            expanded_outs = cast("list[outputs.ExpandedOut]", outs_normalized)
             self._stages[stage_name] = RegistryStageInfo(
                 func=func,
                 name=stage_name,
                 deps=deps_normalized,
                 deps_paths=deps_flat_normalized,
-                outs=outs_normalized,
+                outs=expanded_outs,
                 outs_paths=outs_paths,
                 params=params_instance,
                 mutex=mutex_list,

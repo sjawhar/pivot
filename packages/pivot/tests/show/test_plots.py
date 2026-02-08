@@ -48,7 +48,11 @@ def _register_plot_stage(
         name=name,
         deps={},
         deps_paths=[],
-        outs=[outputs.Plot(path=plot_path, loader=loaders.PathOnly(), x=x, y=y, template=template)],
+        outs=[
+            outputs.require_expanded(
+                outputs.Plot(path=plot_path, loader=loaders.PathOnly(), x=x, y=y, template=template)
+            )
+        ],
         outs_paths=[plot_path],
         params=None,
         mutex=[],
@@ -56,7 +60,7 @@ def _register_plot_stage(
         signature=inspect.signature(_stage_func),
         fingerprint={"_code": "fake_hash"},
         dep_specs={},
-        out_specs={},
+        out_specs=dict[str, outputs.BaseOut](),
         params_arg_name=None,
         state_dir=None,
     )
@@ -80,9 +84,9 @@ def _register_mixed_output_stage(
         deps={},
         deps_paths=[],
         outs=[
-            outputs.Out(path=out_path, loader=loaders.PathOnly()),
-            outputs.Metric(path=metric_path),
-            outputs.Plot(path=plot_path, loader=loaders.PathOnly()),
+            outputs.require_expanded(outputs.Out(path=out_path, loader=loaders.PathOnly())),
+            outputs.require_expanded(outputs.Metric(path=metric_path)),
+            outputs.require_expanded(outputs.Plot(path=plot_path, loader=loaders.PathOnly())),
         ],
         outs_paths=[out_path, metric_path, plot_path],
         params=None,
@@ -91,7 +95,7 @@ def _register_mixed_output_stage(
         signature=inspect.signature(_stage_func),
         fingerprint={"_code": "fake_hash"},
         dep_specs={},
-        out_specs={},
+        out_specs=dict[str, outputs.BaseOut](),
         params_arg_name=None,
         state_dir=None,
     )

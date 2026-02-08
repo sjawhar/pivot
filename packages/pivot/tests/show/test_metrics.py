@@ -41,7 +41,7 @@ def _register_metric_stage(
         name=name,
         deps={},
         deps_paths=[],
-        outs=[outputs.Metric(metric_path)],
+        outs=[outputs.require_expanded(outputs.Metric(metric_path))],
         outs_paths=[metric_path],
         params=None,
         mutex=[],
@@ -49,7 +49,7 @@ def _register_metric_stage(
         signature=inspect.signature(_stage_func),
         fingerprint={"_code": "fake_hash"},
         dep_specs={},
-        out_specs={},
+        out_specs=dict[str, outputs.BaseOut](),
         params_arg_name=None,
         state_dir=None,
     )

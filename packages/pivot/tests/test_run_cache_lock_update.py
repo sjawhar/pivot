@@ -36,12 +36,13 @@ def _make_stage_info(
     run_id: str = "test_run",
 ) -> WorkerStageInfo:
     """Create a WorkerStageInfo with sensible defaults for testing."""
+    expanded_outs = [outputs.require_expanded(out) for out in outs] if outs else []
     return {
         "func": func,
         "fingerprint": fingerprint or {"self:test": "abc123"},
         "deps": deps or [],
         "signature": None,
-        "outs": outs or [],
+        "outs": expanded_outs,
         "params": None,
         "variant": None,
         "overrides": {},
@@ -54,7 +55,7 @@ def _make_stage_info(
         "force": False,
         "no_commit": False,
         "dep_specs": {},
-        "out_specs": {},
+        "out_specs": dict[str, outputs.BaseOut](),
         "params_arg_name": None,
         "project_root": tmp_path,
         "state_dir": tmp_path / ".pivot",

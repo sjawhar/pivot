@@ -116,8 +116,15 @@ def _register_incremental_stage(
     # This is a test-only hack to test IncrementalOut behavior
     pipeline = get_test_pipeline()
     stage_info = pipeline._registry._stages[name]
-    stage_info["outs"] = [outputs.IncrementalOut(path=out_path, loader=loaders.PathOnly())]
+    stage_info["outs"] = _helper_expand_outs(
+        [outputs.IncrementalOut(path=out_path, loader=loaders.PathOnly())]
+    )
     stage_info["outs_paths"] = [out_path]
+
+
+def _helper_expand_outs(outs: list[outputs.BaseOut]) -> list[outputs.ExpandedOut]:
+    """Return outs cast to ExpandedOut for post-expansion types."""
+    return [outputs.require_expanded(out) for out in outs]
 
 
 # =============================================================================
@@ -130,9 +137,9 @@ def test_prepare_outputs_regular_out_is_deleted(tmp_path: pathlib.Path) -> None:
     output_file = tmp_path / "output.txt"
     output_file.write_text("existing content")
 
-    stage_outs: list[outputs.BaseOut] = [
-        outputs.Out(path=str(output_file), loader=loaders.PathOnly())
-    ]
+    stage_outs = _helper_expand_outs(
+        [outputs.Out(path=str(output_file), loader=loaders.PathOnly())]
+    )
     worker._prepare_outputs_for_execution(stage_outs, None, tmp_path / "cache")
 
     assert not output_file.exists()
@@ -142,9 +149,9 @@ def test_prepare_outputs_incremental_no_cache_creates_empty(tmp_path: pathlib.Pa
     """IncrementalOut with no cache should start fresh (file doesn't exist)."""
     output_file = tmp_path / "database.txt"
 
-    stage_outs: list[outputs.BaseOut] = [
-        outputs.IncrementalOut(path=str(output_file), loader=loaders.PathOnly())
-    ]
+    stage_outs = _helper_expand_outs(
+        [outputs.IncrementalOut(path=str(output_file), loader=loaders.PathOnly())]
+    )
     worker._prepare_outputs_for_execution(stage_outs, None, tmp_path / "cache")
 
     assert not output_file.exists()
@@ -172,7 +179,9 @@ def test_prepare_outputs_incremental_restores_from_cache(
     )
 
     # Prepare for execution (uses relative path like production)
-    stage_outs = [outputs.IncrementalOut(path="database.txt", loader=loaders.PathOnly())]
+    stage_outs = _helper_expand_outs(
+        [outputs.IncrementalOut(path="database.txt", loader=loaders.PathOnly())]
+    )
     worker._prepare_outputs_for_execution(stage_outs, lock_data, cache_dir)
 
     # File should be restored
@@ -201,7 +210,9 @@ def test_prepare_outputs_incremental_restored_file_is_writable(
     )
 
     # Prepare for execution (uses relative path like production)
-    stage_outs = [outputs.IncrementalOut(path="database.txt", loader=loaders.PathOnly())]
+    stage_outs = _helper_expand_outs(
+        [outputs.IncrementalOut(path="database.txt", loader=loaders.PathOnly())]
+    )
     worker._prepare_outputs_for_execution(stage_outs, lock_data, cache_dir)
 
     # Should NOT be a symlink (should be a copy)
@@ -229,9 +240,9 @@ def test_prepare_outputs_incremental_missing_cache_error(
         output_hashes={"database.txt": fake_hash},
     )
 
-    stage_outs: list[outputs.BaseOut] = [
-        outputs.IncrementalOut(path="database.txt", loader=loaders.PathOnly())
-    ]
+    stage_outs = _helper_expand_outs(
+        [outputs.IncrementalOut(path="database.txt", loader=loaders.PathOnly())]
+    )
 
     with pytest.raises(exceptions.CacheRestoreError) as exc_info:
         worker._prepare_outputs_for_execution(stage_outs, lock_data, cache_dir)
@@ -437,7 +448,9 @@ def test_incremental_out_restores_directory(
     assert not output_dir.exists()
 
     # Prepare for execution (restore with COPY mode, uses relative path)
-    stage_outs = [outputs.IncrementalOut(path="data_dir", loader=loaders.PathOnly())]
+    stage_outs = _helper_expand_outs(
+        [outputs.IncrementalOut(path="data_dir", loader=loaders.PathOnly())]
+    )
     worker._prepare_outputs_for_execution(stage_outs, lock_data, cache_dir)
 
     # Directory should be restored
@@ -471,7 +484,9 @@ def test_incremental_out_directory_is_writable(
 
     # Delete and restore (uses relative path like production)
     cache.remove_output(output_dir)
-    stage_outs = [outputs.IncrementalOut(path="data_dir", loader=loaders.PathOnly())]
+    stage_outs = _helper_expand_outs(
+        [outputs.IncrementalOut(path="data_dir", loader=loaders.PathOnly())]
+    )
     worker._prepare_outputs_for_execution(stage_outs, lock_data, cache_dir)
 
     # Should be able to write new files
@@ -511,7 +526,9 @@ def test_incremental_out_directory_subdirs_writable(
 
     # Delete and restore (uses relative path like production)
     cache.remove_output(output_dir)
-    stage_outs = [outputs.IncrementalOut(path="data_dir", loader=loaders.PathOnly())]
+    stage_outs = _helper_expand_outs(
+        [outputs.IncrementalOut(path="data_dir", loader=loaders.PathOnly())]
+    )
     worker._prepare_outputs_for_execution(stage_outs, lock_data, cache_dir)
 
     # Should be able to create files in subdirectories

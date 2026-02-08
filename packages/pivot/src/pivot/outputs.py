@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import TYPE_CHECKING, Any, Protocol, TypeGuard, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, TypeGuard, cast, override, runtime_checkable
 
 if TYPE_CHECKING:
     from pivot import loaders as loaders_module
@@ -242,6 +242,25 @@ class BaseOut(Protocol):
         ...
 
 
+class ExpandedOut(BaseOut, Protocol):
+    """Protocol for output specs after registry expansion.
+
+    After the registry's expansion step, every output spec has ``path: str``
+    (multi-path variants have been expanded into individual single-path specs).
+    ``RegistryStageInfo["outs"]`` and ``WorkerStageInfo["outs"]`` use this
+    narrower type so downstream code can use ``out.path`` as ``str`` directly.
+
+    At runtime the objects are still the original dataclass instances (Out,
+    DirectoryOut, IncrementalOut), so ``isinstance`` checks continue to work.
+    """
+
+    @property
+    @override
+    def path(self) -> str:
+        """Single path string (post-expansion)."""
+        ...
+
+
 def is_directory_out(spec: BaseOut) -> TypeGuard[DirectoryOut[Any]]:
     """Type guard to narrow output spec to DirectoryOut."""
     return isinstance(spec, DirectoryOut)
@@ -250,6 +269,17 @@ def is_directory_out(spec: BaseOut) -> TypeGuard[DirectoryOut[Any]]:
 def is_incremental_out(spec: BaseOut) -> TypeGuard[IncrementalOut[Any, Any]]:
     """Type guard to narrow output spec to IncrementalOut."""
     return isinstance(spec, IncrementalOut)
+
+
+def require_expanded(out: BaseOut) -> ExpandedOut:
+    """Verify output has a str path (post-expansion) and return as ExpandedOut.
+
+    Use at boundaries where BaseOut instances are known to have str paths
+    (e.g., after registry expansion) but the type system can't prove it.
+    """
+    if not isinstance(out.path, str):
+        raise TypeError(f"Expected expanded output path (str), got {type(out.path)}: {out.path}")
+    return cast("ExpandedOut", out)
 
 
 # Type alias for any output spec

@@ -281,7 +281,7 @@ def _extract_typeddict_outputs(
 
 def save_return_outputs(
     return_value: Mapping[str, Any],
-    specs: dict[str, outputs.BaseOut],
+    specs: Mapping[str, outputs.BaseOut],
     project_root: pathlib.Path,
 ) -> None:
     """Save return value outputs to disk.

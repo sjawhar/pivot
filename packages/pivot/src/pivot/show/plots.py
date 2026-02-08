@@ -5,7 +5,7 @@ import json
 import logging
 import os
 import pathlib
-from typing import TYPE_CHECKING, TypedDict, cast
+from typing import TYPE_CHECKING, TypedDict
 
 from pivot import config, git, outputs, project
 from pivot.show import common
@@ -49,7 +49,7 @@ def collect_plots_from_stages() -> list[PlotInfo]:
                 # Registry always stores single-file outputs (multi-file are expanded)
                 result.append(
                     PlotInfo(
-                        path=str(out.path),
+                        path=out.path,
                         stage_name=stage_name,
                         x=out.x,
                         y=out.y,
@@ -81,7 +81,7 @@ def get_plot_hashes_from_lock(
         for out in info["outs"]:
             if isinstance(out, outputs.Plot):
                 # Normalize to absolute for lock data lookup, then convert to relative for result
-                abs_path = str(project.normalize_path(cast("str", out.path)))
+                abs_path = str(project.normalize_path(out.path))
                 rel_path = project.to_relative_path(abs_path, proj_root)
                 if lock_data and abs_path in lock_data["output_hashes"]:
                     hash_info = lock_data["output_hashes"][abs_path]
@@ -108,7 +108,7 @@ def get_plot_hashes_from_head() -> dict[str, str | None]:
         info = cli_helpers.get_stage(stage_name)
         for out in info["outs"]:
             if isinstance(out, outputs.Plot):
-                abs_path = str(project.normalize_path(cast("str", out.path)))
+                abs_path = str(project.normalize_path(out.path))
                 rel_path = project.to_relative_path(abs_path, proj_root)
                 stage_plot_paths.setdefault(stage_name, []).append(rel_path)
                 result[rel_path] = None  # Default to None

@@ -45,7 +45,7 @@ from pivot.types import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Generator, Sequence
+    from collections.abc import Callable, Generator, Mapping, Sequence
     from inspect import Signature
     from multiprocessing import Queue
     from types import TracebackType
@@ -129,7 +129,7 @@ class WorkerStageInfo(TypedDict):
     func: Callable[..., Any]
     fingerprint: dict[str, str]
     deps: list[str]
-    outs: list[outputs.BaseOut]
+    outs: list[outputs.ExpandedOut]
     signature: Signature | None
     params: stage_def.StageParams | None
     variant: str | None
@@ -568,7 +568,7 @@ def _restore_outputs(
 
 
 def _restore_outputs_from_cache(
-    stage_outs: list[outputs.BaseOut],
+    stage_outs: Sequence[outputs.ExpandedOut],
     lock_data: LockData,
     files_cache_dir: pathlib.Path,
     checkout_modes: list[cache.CheckoutMode],
@@ -578,11 +578,11 @@ def _restore_outputs_from_cache(
     """Restore missing outputs from cache for lock file skip detection."""
     # Non-cached outputs (Metric) are git-tracked — just verify they exist
     for out in stage_outs:
-        if not out.cache and not pathlib.Path(cast("str", out.path)).exists():
+        if not out.cache and not pathlib.Path(out.path).exists():
             return False
 
     # Only restore cached outputs from cache
-    cached_path_strings = [cast("str", out.path) for out in stage_outs if out.cache]
+    cached_path_strings = [out.path for out in stage_outs if out.cache]
     return _restore_outputs(
         cached_path_strings,
         lock_data["output_hashes"],
@@ -635,7 +635,7 @@ def _file_needs_restore(
 
 
 def _prepare_outputs_for_execution(
-    stage_outs: Sequence[outputs.BaseOut],
+    stage_outs: Sequence[outputs.ExpandedOut],
     lock_data: LockData | None,
     files_cache_dir: pathlib.Path,
 ) -> None:
@@ -643,7 +643,7 @@ def _prepare_outputs_for_execution(
     output_hashes = lock_data["output_hashes"] if lock_data else {}
 
     for out in stage_outs:
-        path = pathlib.Path(cast("str", out.path))
+        path = pathlib.Path(out.path)
 
         if isinstance(out, outputs.IncrementalOut):
             # IncrementalOut: restore from cache as writable copy
@@ -664,7 +664,7 @@ def _prepare_outputs_for_execution(
 
 
 def _save_outputs_to_cache(
-    stage_outs: list[outputs.BaseOut],
+    stage_outs: Sequence[outputs.ExpandedOut],
     files_cache_dir: pathlib.Path,
     checkout_modes: list[cache.CheckoutMode],
 ) -> dict[str, HashInfo]:
@@ -673,7 +673,7 @@ def _save_outputs_to_cache(
     output_hashes = dict[str, HashInfo]()
 
     for out in stage_outs:
-        path = pathlib.Path(cast("str", out.path))
+        path = pathlib.Path(out.path)
         if not path.exists():
             raise exceptions.OutputMissingError(f"Stage did not produce output: {out.path}")
 
@@ -688,11 +688,11 @@ def _save_outputs_to_cache(
     return output_hashes
 
 
-def _hash_outputs_only(stage_outs: list[outputs.BaseOut]) -> dict[str, HashInfo]:
+def _hash_outputs_only(stage_outs: Sequence[outputs.ExpandedOut]) -> dict[str, HashInfo]:
     """Hash outputs without saving to cache (for --no-commit mode)."""
     output_hashes = dict[str, HashInfo]()
     for out in stage_outs:
-        path = pathlib.Path(cast("str", out.path))
+        path = pathlib.Path(out.path)
         if not path.exists():
             raise exceptions.OutputMissingError(f"Stage did not produce output: {out.path}")
         output_hashes[str(out.path)] = hash_output(path)
@@ -762,7 +762,7 @@ def _run_stage_function_with_injection(
     params: stage_def.StageParams | None = None,
     dep_specs: dict[str, stage_def.FuncDepSpec] | None = None,
     project_root: pathlib.Path | None = None,
-    out_specs: dict[str, outputs.BaseOut] | None = None,
+    out_specs: Mapping[str, outputs.BaseOut] | None = None,
     params_arg_name: str | None = None,
 ) -> None:
     """Run stage function with dependency injection and output capture.
@@ -1151,7 +1151,7 @@ def _build_deferred_writes(
         result["dep_generations"] = gen_record
 
     # Run cache entry — only cached outputs belong in run cache
-    cached_paths = {cast("str", out.path) for out in stage_info["outs"] if out.cache}
+    cached_paths = {out.path for out in stage_info["outs"] if out.cache}
     output_entries = [
         run_history.output_hash_to_entry(path, oh)
         for path, oh in output_hashes.items()
@@ -1184,7 +1184,7 @@ class RunCacheSkipResult(TypedDict):
 def _try_skip_via_run_cache(
     stage_name: str,
     input_hash: str,
-    stage_outs: list[outputs.BaseOut],
+    stage_outs: Sequence[outputs.ExpandedOut],
     files_cache_dir: pathlib.Path,
     checkout_modes: list[cache.CheckoutMode],
     state_db: state.StateDB,
@@ -1206,14 +1206,14 @@ def _try_skip_via_run_cache(
     # Validate cached outputs match expected: run cache entry should only contain
     # outputs that have cache=True. The input hash includes cache flags, so a mismatch
     # here indicates corruption or a bug.
-    cached_path_strings = [cast("str", out.path) for out in stage_outs if out.cache]
+    cached_path_strings = [out.path for out in stage_outs if out.cache]
     if set(output_hash_map.keys()) != set(cached_path_strings):
         return None
 
     # Non-cached outputs (like Metrics) must exist on disk - we can't restore them from cache
     for out in stage_outs:
         if not out.cache:
-            path = pathlib.Path(cast("str", out.path))
+            path = pathlib.Path(out.path)
             if not path.exists():
                 return None  # Must re-run to recreate non-cached output
 
@@ -1231,7 +1231,7 @@ def _try_skip_via_run_cache(
     # Build output_hashes for lock file update, including non-cached outputs
     output_hashes: dict[str, HashInfo] = {}
     for out in stage_outs:
-        out_path = cast("str", out.path)
+        out_path = out.path
         if out.cache:
             output_hashes[out_path] = output_hash_map[out_path]
         else:

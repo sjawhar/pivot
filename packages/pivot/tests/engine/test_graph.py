@@ -19,7 +19,10 @@ def _create_stage(name: str, deps: list[str], outs: list[str]) -> RegistryStageI
         name=name,
         deps={f"_{i}": d for i, d in enumerate(deps)},
         deps_paths=deps,
-        outs=[outputs.Out(path=out, loader=loaders.PathOnly()) for out in outs],
+        outs=[
+            outputs.require_expanded(outputs.Out(path=out, loader=loaders.PathOnly()))
+            for out in outs
+        ],
         outs_paths=outs,
         params=None,
         mutex=list[str](),
@@ -27,7 +30,7 @@ def _create_stage(name: str, deps: list[str], outs: list[str]) -> RegistryStageI
         signature=None,
         fingerprint=dict[str, str](),
         dep_specs={},
-        out_specs={},
+        out_specs=dict[str, outputs.BaseOut](),
         params_arg_name=None,
         state_dir=None,
     )

@@ -229,10 +229,17 @@ def test_export_with_rich_outputs(
         deps={},
         deps_paths=[],
         outs=[
-            outputs.Out(path=str(tmp_path / "model.pkl"), loader=loaders.PathOnly()),
-            outputs.Metric(path=str(tmp_path / "metrics.json")),
-            outputs.Plot(
-                path=str(tmp_path / "loss.csv"), loader=loaders.PathOnly(), x="epoch", y="loss"
+            outputs.require_expanded(
+                outputs.Out(path=str(tmp_path / "model.pkl"), loader=loaders.PathOnly())
+            ),
+            outputs.require_expanded(outputs.Metric(path=str(tmp_path / "metrics.json"))),
+            outputs.require_expanded(
+                outputs.Plot(
+                    path=str(tmp_path / "loss.csv"),
+                    loader=loaders.PathOnly(),
+                    x="epoch",
+                    y="loss",
+                )
             ),
         ],
         outs_paths=[
@@ -246,7 +253,7 @@ def test_export_with_rich_outputs(
         signature=inspect.signature(exportable_stage),
         fingerprint={},
         dep_specs={},
-        out_specs={},
+        out_specs=dict[str, outputs.BaseOut](),
         params_arg_name=None,
         state_dir=None,
     )
@@ -345,7 +352,11 @@ def test_export_out_cache_false(
         func=exportable_stage,
         deps={},
         deps_paths=[],
-        outs=[outputs.Out(path=str(tmp_path / "file.txt"), loader=loaders.PathOnly(), cache=False)],
+        outs=[
+            outputs.require_expanded(
+                outputs.Out(path=str(tmp_path / "file.txt"), loader=loaders.PathOnly(), cache=False)
+            )
+        ],
         outs_paths=[str(tmp_path / "file.txt")],
         params=None,
         mutex=[],
@@ -353,7 +364,7 @@ def test_export_out_cache_false(
         signature=inspect.signature(exportable_stage),
         fingerprint={},
         dep_specs={},
-        out_specs={},
+        out_specs=dict[str, outputs.BaseOut](),
         params_arg_name=None,
         state_dir=None,
     )

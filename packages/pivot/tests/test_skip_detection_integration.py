@@ -62,12 +62,14 @@ def _make_stage_info(
     params_arg_name: str | None = None,
 ) -> WorkerStageInfo:
     """Create a WorkerStageInfo with sensible defaults for testing."""
+    expanded_outs = [outputs.require_expanded(out) for out in outs] if outs else []
+    expanded_out_specs = out_specs or {}
     return {
         "func": func,
         "fingerprint": fingerprint or {"self:test": "abc123"},
         "deps": deps or [],
         "signature": signature,
-        "outs": outs or [],
+        "outs": expanded_outs,
         "params": params,
         "variant": None,
         "overrides": {},
@@ -77,7 +79,7 @@ def _make_stage_info(
         "force": force,
         "no_commit": no_commit,
         "dep_specs": dep_specs or {},
-        "out_specs": out_specs or {},
+        "out_specs": expanded_out_specs,
         "params_arg_name": params_arg_name,
         "project_root": tmp_path,
         "state_dir": tmp_path / ".pivot",
