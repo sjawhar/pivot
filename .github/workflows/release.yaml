@@ -63,4 +63,8 @@ jobs:
 
       - name: Publish to PyPI
         if: steps.release.outputs.released == 'true'
-        run: uv publish
+        run: |
+          # Publish workspace packages in dependency order.
+          # pivot-tui depends on pivot, so pivot must be published first.
+          # uv publish publishes all distributions in dist/ directory.
+          uv publish

@@ -9,16 +9,15 @@
 ## Project Structure
 
 ```
-src/pivot/
+packages/pivot/src/pivot/
 ├── cli/           # Click commands, decorators, helpers
 ├── config/        # YAML parsing, validation
 ├── dag/           # Dependency graph construction
 ├── engine/        # Execution coordinator, watch mode
-├── executor/      # Worker process execution (see executor/CLAUDE.md)
+├── executor/      # Worker process execution (see executor/AGENTS.md)
 ├── pipeline/      # Pipeline state, lock files
 ├── remote/        # S3/remote storage
-├── storage/       # StateDB, cache management (see storage/CLAUDE.md)
-├── tui/           # Textual-based terminal UI
+├── storage/       # StateDB, cache management (see storage/AGENTS.md)
 ├── fingerprint.py # Code hashing, change detection
 ├── registry.py    # Stage registration, discovery
 ├── stage_def.py   # Stage definition extraction
@@ -31,11 +30,11 @@ src/pivot/
 
 | File | Purpose |
 |------|---------|
-| `src/pivot/cli/__init__.py` | CLI entry point (`pivot` command) |
-| `src/pivot/engine/engine.py` | Pipeline execution coordinator |
-| `src/pivot/executor/worker.py` | Worker process execution |
-| `src/pivot/storage/state_db.py` | LMDB state database |
-| `src/pivot/fingerprint.py` | Code change detection |
+| `packages/pivot/src/pivot/cli/__init__.py` | CLI entry point (`pivot` command) |
+| `packages/pivot/src/pivot/engine/engine.py` | Pipeline execution coordinator |
+| `packages/pivot/src/pivot/executor/worker.py` | Worker process execution |
+| `packages/pivot/src/pivot/storage/state.py` | LMDB state database |
+| `packages/pivot/src/pivot/fingerprint.py` | Code change detection |
 
 ## Institutional Knowledge
 
@@ -67,7 +66,7 @@ Workers execute in separate processes via `loky.get_reusable_executor()`.
 
 ### WorkerStageInfo Contract
 
-`WorkerStageInfo` (TypedDict at `src/pivot/executor/worker.py`) is the coordinator-to-worker contract. Key fields (non-exhaustive):
+`WorkerStageInfo` (TypedDict at `packages/pivot/src/pivot/executor/worker.py`) is the coordinator-to-worker contract. Key fields (non-exhaustive):
 
 | Field | Purpose |
 |-------|---------|
@@ -189,9 +188,9 @@ All paths in lockfiles must be **relative** (to stage cwd), never absolute.
 ## Development
 
 ```bash
-uv sync --active                                                    # Install deps
-uv run pytest tests/ -n auto                                        # Test
-uv run ruff format . && uv run ruff check . && uv run basedpyright  # Quality
+uv sync --active                                                                      # Install deps
+uv run pytest packages/pivot/tests packages/pivot-tui/tests -n auto                  # Test
+uv run ruff format . && uv run ruff check . && uv run basedpyright                    # Quality
 ```
 
 **Run all quality checks before returning to user or pushing.**

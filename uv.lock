@@ -6,6 +6,7 @@ requires-python = "==3.13.*"
 members = [
     "pivot",
     "pivot-tui",
+    "pivot-workspace",
 ]
 
 [[package]]
@@ -2045,7 +2046,7 @@ wheels = [
 [[package]]
 name = "pivot"
 version = "0.1.0"
-source = { editable = "." }
+source = { editable = "packages/pivot" }
 dependencies = [
     { name = "anyio" },
     { name = "click" },
@@ -2071,6 +2072,28 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+dev = [
+    { name = "aioboto3" },
+    { name = "basedpyright" },
+    { name = "botocore-stubs" },
+    { name = "dvc" },
+    { name = "joblib" },
+    { name = "joblib-stubs" },
+    { name = "matplotlib" },
+    { name = "matplotlib-stubs" },
+    { name = "mypy" },
+    { name = "pandas-stubs" },
+    { name = "pytest" },
+    { name = "pytest-aioboto3" },
+    { name = "pytest-asyncio" },
+    { name = "pytest-cov" },
+    { name = "pytest-mock" },
+    { name = "pytest-rerunfailures" },
+    { name = "pytest-watcher" },
+    { name = "pytest-xdist" },
+    { name = "ruff" },
+    { name = "types-aioboto3", extra = ["all"] },
+]
 docs = [
     { name = "griffe" },
     { name = "mkdocs" },
@@ -2093,32 +2116,12 @@ tui = [
     { name = "pivot-tui" },
 ]
 
-[package.dev-dependencies]
-dev = [
-    { name = "basedpyright" },
-    { name = "botocore-stubs" },
-    { name = "joblib" },
-    { name = "joblib-stubs" },
-    { name = "matplotlib-stubs" },
-    { name = "mypy" },
-    { name = "pandas-stubs" },
-    { name = "pivot", extra = ["dvc", "matplotlib", "s3"] },
-    { name = "pytest" },
-    { name = "pytest-aioboto3" },
-    { name = "pytest-asyncio" },
-    { name = "pytest-cov" },
-    { name = "pytest-mock" },
-    { name = "pytest-rerunfailures" },
-    { name = "pytest-watcher" },
-    { name = "pytest-xdist" },
-    { name = "ruff" },
-    { name = "types-aioboto3", extra = ["all"] },
-]
-
 [package.metadata]
 requires-dist = [
     { name = "aioboto3", marker = "extra == 's3'", specifier = ">=13.0.0" },
     { name = "anyio", specifier = ">=4.0" },
+    { name = "basedpyright", marker = "extra == 'dev'", specifier = ">=1.0" },
+    { name = "botocore-stubs", marker = "extra == 'dev'", specifier = ">=1.35.0" },
     { name = "click", specifier = ">=8.0" },
     { name = "deepmerge", specifier = ">=2.0" },
     { name = "dulwich", specifier = ">=0.22.0" },
@@ -2127,54 +2130,48 @@ requires-dist = [
     { name = "flatten-dict", specifier = ">=0.4.0" },
     { name = "grandalf", specifier = ">=0.8" },
     { name = "griffe", marker = "extra == 'docs'", specifier = ">=1.3.0" },
+    { name = "joblib", marker = "extra == 'dev'", specifier = ">=1.4.0" },
+    { name = "joblib-stubs", marker = "extra == 'dev'", specifier = ">=1.5.0" },
     { name = "lmdb", specifier = ">=1.4.0" },
     { name = "loky", specifier = ">=3.4" },
     { name = "matplotlib", marker = "extra == 'matplotlib'", specifier = ">=3.5" },
+    { name = "matplotlib-stubs", marker = "extra == 'dev'", specifier = ">=0.3" },
     { name = "mkdocs", marker = "extra == 'docs'", specifier = ">=1.6.0" },
     { name = "mkdocs-gen-files", marker = "extra == 'docs'", specifier = ">=0.5.0" },
     { name = "mkdocs-literate-nav", marker = "extra == 'docs'", specifier = ">=0.6.0" },
     { name = "mkdocs-material", marker = "extra == 'docs'", specifier = ">=9.5.0" },
     { name = "mkdocs-section-index", marker = "extra == 'docs'", specifier = ">=0.3.9" },
     { name = "mkdocstrings", extras = ["python"], marker = "extra == 'docs'", specifier = ">=0.26.0" },
+    { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.19.1" },
     { name = "networkx", specifier = ">=3.0" },
     { name = "pandas", specifier = ">=2.0" },
+    { name = "pandas-stubs", marker = "extra == 'dev'", specifier = ">=2.0" },
     { name = "pathspec", specifier = ">=0.12.0" },
+    { name = "pivot", extras = ["dvc"], marker = "extra == 'dev'", editable = "packages/pivot" },
+    { name = "pivot", extras = ["matplotlib"], marker = "extra == 'dev'", editable = "packages/pivot" },
+    { name = "pivot", extras = ["s3"], marker = "extra == 'dev'", editable = "packages/pivot" },
     { name = "pivot-tui", marker = "extra == 'tui'", editable = "packages/pivot-tui" },
     { name = "pydantic", specifier = ">=2.0" },
     { name = "pygtrie", specifier = ">=2.5.0" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0" },
+    { name = "pytest-aioboto3", marker = "extra == 'dev'", specifier = ">=0.1.0" },
+    { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.24.0" },
+    { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=4.0" },
+    { name = "pytest-mock", marker = "extra == 'dev'", specifier = ">=3.15.1" },
+    { name = "pytest-rerunfailures", marker = "extra == 'dev'", specifier = ">=16.1" },
+    { name = "pytest-watcher", marker = "extra == 'dev'", specifier = ">=0.6.2" },
+    { name = "pytest-xdist", marker = "extra == 'dev'", specifier = ">=3.8.0" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "rich", specifier = ">=13.0" },
     { name = "ruamel-yaml", specifier = ">=0.18.0" },
+    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.8.0" },
     { name = "tabulate", specifier = ">=0.9.0" },
     { name = "tqdm", specifier = ">=4.66" },
+    { name = "types-aioboto3", extras = ["all"], marker = "extra == 'dev'", specifier = ">=13.0.0" },
     { name = "watchfiles", specifier = ">=1.0" },
     { name = "xxhash", specifier = ">=3.0" },
 ]
-provides-extras = ["dvc", "matplotlib", "s3", "tui", "docs"]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "basedpyright", specifier = ">=1.0" },
-    { name = "botocore-stubs", specifier = ">=1.35.0" },
-    { name = "joblib", specifier = ">=1.4.0" },
-    { name = "joblib-stubs", specifier = ">=1.5.0" },
-    { name = "matplotlib-stubs", specifier = ">=0.3" },
-    { name = "mypy", specifier = ">=1.19.1" },
-    { name = "pandas-stubs", specifier = ">=2.0" },
-    { name = "pivot", extras = ["dvc"], editable = "." },
-    { name = "pivot", extras = ["matplotlib"], editable = "." },
-    { name = "pivot", extras = ["s3"], editable = "." },
-    { name = "pytest", specifier = ">=7.0" },
-    { name = "pytest-aioboto3", specifier = ">=0.1.0" },
-    { name = "pytest-asyncio", specifier = ">=0.24.0" },
-    { name = "pytest-cov", specifier = ">=4.0" },
-    { name = "pytest-mock", specifier = ">=3.15.1" },
-    { name = "pytest-rerunfailures", specifier = ">=16.1" },
-    { name = "pytest-watcher", specifier = ">=0.6.2" },
-    { name = "pytest-xdist", specifier = ">=3.8.0" },
-    { name = "ruff", specifier = ">=0.8.0" },
-    { name = "types-aioboto3", extras = ["all"], specifier = ">=13.0.0" },
-]
+provides-extras = ["dvc", "matplotlib", "s3", "tui", "docs", "dev"]
 
 [[package]]
 name = "pivot-tui"
@@ -2185,10 +2182,40 @@ dependencies = [
     { name = "textual" },
 ]
 
+[package.optional-dependencies]
+dev = [
+    { name = "pytest" },
+    { name = "pytest-asyncio" },
+    { name = "pytest-mock" },
+]
+
 [package.metadata]
 requires-dist = [
-    { name = "pivot", editable = "." },
+    { name = "pivot", editable = "packages/pivot" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0" },
+    { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.24.0" },
+    { name = "pytest-mock", marker = "extra == 'dev'", specifier = ">=3.15.1" },
     { name = "textual", specifier = ">=7.0" },
+]
+provides-extras = ["dev"]
+
+[[package]]
+name = "pivot-workspace"
+version = "0.1.0"
+source = { virtual = "." }
+
+[package.dev-dependencies]
+dev = [
+    { name = "pivot", extra = ["dev"] },
+    { name = "pivot-tui", extra = ["dev"] },
+]
+
+[package.metadata]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "pivot", extras = ["dev"], editable = "packages/pivot" },
+    { name = "pivot-tui", extras = ["dev"], editable = "packages/pivot-tui" },
 ]
 
 [[package]]

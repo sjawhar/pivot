@@ -32,7 +32,7 @@ jobs:
         uses: astral-sh/setup-uv@v4
 
       - name: Install dependencies
-        run: uv sync --active --extra docs
+        run: uv sync --package pivot --extra docs
 
       - name: Build docs
         run: uv run mkdocs build --strict

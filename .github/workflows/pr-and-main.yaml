@@ -66,6 +66,14 @@ jobs:
 
   test:
     runs-on: ubuntu-24.04
+    name: test (${{ matrix.package.name }})
+    strategy:
+      matrix:
+        package:
+          - name: pivot
+            path: packages/pivot/tests
+          - name: pivot-tui
+            path: packages/pivot-tui/tests
 
     steps:
       - uses: actions/checkout@v5
@@ -87,9 +95,5 @@ jobs:
           uv sync --all-extras --all-groups --locked
           echo "$(pwd)/.venv/bin" >> $GITHUB_PATH
 
-      - name: Run core tests
-        run: pytest -n auto
-
-      - name: Run TUI tests
-        working-directory: packages/pivot-tui
-        run: pytest -n auto
+      - name: Run tests for ${{ matrix.package.name }}
+        run: pytest ${{ matrix.package.path }} -n auto
