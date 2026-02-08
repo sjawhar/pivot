@@ -39,8 +39,8 @@ from pivot.types import (
 if TYPE_CHECKING:
     import networkx as nx
 
+    from pivot.cli import console as tui_console
     from pivot.executor import ExecutionSummary
-    from pivot.tui import console as tui_console
     from pivot.types import StageExplanation
 
 
@@ -209,8 +209,8 @@ def _run_pipeline(
 
     Returns execution results for non-watch mode, None for watch mode.
     """
+    from pivot.cli import console as tui_console_mod
     from pivot.engine import graph as engine_graph
-    from pivot.tui import console as tui_console_mod
 
     # Emit schema version early for JSONL mode (even if no stages to run)
     if as_json:
@@ -351,7 +351,7 @@ def _run_watch_mode(  # noqa: PLR0913 - many params needed for different modes
         # TUI mode with async Engine
         # IMPORTANT: Textual must run in the main thread for signal handlers (SIGTSTP, etc.)
         # to work correctly. We run the Engine in a background thread instead.
-        from pivot.tui import run as tui_run
+        import pivot_tui.run as tui_run
 
         # Create TUI app (will run in main thread)
         app = tui_run.PivotApp(
@@ -582,7 +582,7 @@ def _run_oneshot_mode(
     # IMPORTANT: Textual must run in the main thread for signal handlers (SIGTSTP, etc.)
     # to work correctly. We run the Engine in a background thread instead.
     if tui and run_id:
-        from pivot.tui import run as tui_run
+        import pivot_tui.run as tui_run
 
         # Create TUI app (will run in main thread)
         app = tui_run.PivotApp(

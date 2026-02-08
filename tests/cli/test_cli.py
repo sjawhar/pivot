@@ -9,7 +9,7 @@ import pandas  # noqa: TC002 - needed for type hint resolution
 from conftest import isolated_pivot_dir
 from helpers import register_test_stage
 from pivot import cli, loaders, outputs
-from pivot.tui import console
+from pivot.cli import console
 
 if TYPE_CHECKING:
     from click.testing import CliRunner

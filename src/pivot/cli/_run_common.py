@@ -24,7 +24,7 @@ if TYPE_CHECKING:
     from pivot.engine.types import OutputEvent, StageCompleted
     from pivot.executor import ExecutionSummary
     from pivot.pipeline.pipeline import Pipeline
-    from pivot.tui.run import MessagePoster
+    from pivot_tui.run import MessagePoster
 
 
 logger = logging.getLogger(__name__)
@@ -82,7 +82,7 @@ def sort_for_display(execution_order: list[str], graph: nx.DiGraph[str]) -> list
     are treated as equals. Matrix variants are grouped at the level of their
     earliest member.
     """
-    from pivot.tui.types import parse_stage_name
+    from pivot.types import parse_stage_name
 
     levels = compute_dag_levels(graph)
 
@@ -281,7 +281,9 @@ def configure_output_sink(
         return
 
     if tui and app and run_id:
-        eng.add_sink(sinks.TuiSink(app=app, run_id=run_id))
+        from pivot_tui.sink import TuiSink
+
+        eng.add_sink(TuiSink(app=app, run_id=run_id))
     elif use_console:
         eng.add_sink(sinks.ConsoleSink(console=rich.console.Console(), show_output=show_output))
 

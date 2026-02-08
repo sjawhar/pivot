@@ -22,9 +22,9 @@ dependencies = [
   "pydantic>=2.0",
   "pygtrie>=2.5.0",
   "pyyaml>=6.0",
+  "rich>=13.0",
   "ruamel.yaml>=0.18.0",
   "tabulate>=0.9.0",
-  "textual>=7.0",
   "tqdm>=4.66",
   "watchfiles>=1.0",
   "xxhash>=3.0",
@@ -34,6 +34,7 @@ dependencies = [
 dvc = ["dvc>=3.0"]
 matplotlib = ["matplotlib>=3.5"]
 s3 = ["aioboto3>=13.0.0"]
+tui = ["pivot-tui"]
 docs = [
   "mkdocs>=1.6.0",
   "mkdocs-material>=9.5.0",
@@ -95,8 +96,27 @@ reportUnusedCallResult = false
 reportImportCycles = false
 
 [[tool.basedpyright.executionEnvironments]]
+root = "src"
+extraPaths = ["packages/pivot-tui/src"]
+
+[[tool.basedpyright.executionEnvironments]]
 root = "tests"
-extraPaths = ["."]
+extraPaths = [".", "packages/pivot-tui/src"]
+reportUnusedFunction = false
+reportUnusedParameter = false
+reportUnusedVariable = false
+reportPrivateUsage = false
+reportRedeclaration = false
+reportMissingTypeStubs = false
+reportUnknownMemberType = false
+reportUnknownVariableType = false
+
+[[tool.basedpyright.executionEnvironments]]
+root = "packages/pivot-tui/src"
+
+[[tool.basedpyright.executionEnvironments]]
+root = "packages/pivot-tui/tests"
+extraPaths = ["packages/pivot-tui/tests"]
 reportUnusedFunction = false
 reportUnusedParameter = false
 reportUnusedVariable = false
@@ -148,7 +168,7 @@ asyncio_default_fixture_loop_scope = "function"
 [tool.ruff]
 line-length = 100
 target-version = "py313"
-src = ["src", "tests"]
+src = ["src", "tests", "packages/pivot-tui/src", "packages/pivot-tui/tests"]
 exclude = ["benchmarks", "experiments"]
 
 [tool.ruff.lint]
@@ -179,11 +199,26 @@ ignore = [
   "SIM103", # simplification suggestions (readability)
   "SIM118", # dict.keys() usage (readability)
 ]
+"packages/pivot-tui/tests/**/*.py" = [
+  "C401",   # generator vs comprehension (readability)
+  "F811",   # redef allowed in tests (fixtures)
+  "N806",   # variable naming (CONSTANT test fixtures)
+  "S101",   # assert allowed in tests
+  "SIM103", # simplification suggestions (readability)
+  "SIM118", # dict.keys() usage (readability)
+]
 
 [tool.ruff.format]
 quote-style = "double"
 indent-style = "space"
 line-ending = "auto"
+
+[tool.uv.workspace]
+members = ["packages/*"]
+
+[tool.uv.sources]
+pivot = { workspace = true }
+pivot-tui = { workspace = true }
 
 [tool.semantic_release]
 version_toml = ["pyproject.toml:project.version"]

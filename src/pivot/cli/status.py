@@ -8,11 +8,10 @@ import tqdm
 
 from pivot import config, exceptions, project
 from pivot import status as status_mod
-from pivot.cli import completion
+from pivot.cli import completion, console
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
 from pivot.engine import graph as engine_graph
-from pivot.tui import console
 from pivot.types import (
     ExplainOutput,
     ExplainStageJson,

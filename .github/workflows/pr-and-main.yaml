@@ -87,5 +87,9 @@ jobs:
           uv sync --all-extras --all-groups --locked
           echo "$(pwd)/.venv/bin" >> $GITHUB_PATH
 
-      - name: Run tests
+      - name: Run core tests
+        run: pytest -n auto
+
+      - name: Run TUI tests
+        working-directory: packages/pivot-tui
         run: pytest -n auto

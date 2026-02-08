@@ -2,6 +2,12 @@ version = 1
 revision = 3
 requires-python = "==3.13.*"
 
+[manifest]
+members = [
+    "pivot",
+    "pivot-tui",
+]
+
 [[package]]
 name = "aioboto3"
 version = "15.5.0"
@@ -2056,9 +2062,9 @@ dependencies = [
     { name = "pydantic" },
     { name = "pygtrie" },
     { name = "pyyaml" },
+    { name = "rich" },
     { name = "ruamel-yaml" },
     { name = "tabulate" },
-    { name = "textual" },
     { name = "tqdm" },
     { name = "watchfiles" },
     { name = "xxhash" },
@@ -2082,6 +2088,9 @@ matplotlib = [
 ]
 s3 = [
     { name = "aioboto3" },
+]
+tui = [
+    { name = "pivot-tui" },
 ]
 
 [package.dev-dependencies]
@@ -2130,17 +2139,18 @@ requires-dist = [
     { name = "networkx", specifier = ">=3.0" },
     { name = "pandas", specifier = ">=2.0" },
     { name = "pathspec", specifier = ">=0.12.0" },
+    { name = "pivot-tui", marker = "extra == 'tui'", editable = "packages/pivot-tui" },
     { name = "pydantic", specifier = ">=2.0" },
     { name = "pygtrie", specifier = ">=2.5.0" },
     { name = "pyyaml", specifier = ">=6.0" },
+    { name = "rich", specifier = ">=13.0" },
     { name = "ruamel-yaml", specifier = ">=0.18.0" },
     { name = "tabulate", specifier = ">=0.9.0" },
-    { name = "textual", specifier = ">=7.0" },
     { name = "tqdm", specifier = ">=4.66" },
     { name = "watchfiles", specifier = ">=1.0" },
     { name = "xxhash", specifier = ">=3.0" },
 ]
-provides-extras = ["dvc", "matplotlib", "s3", "docs"]
+provides-extras = ["dvc", "matplotlib", "s3", "tui", "docs"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -2151,9 +2161,9 @@ dev = [
     { name = "matplotlib-stubs", specifier = ">=0.3" },
     { name = "mypy", specifier = ">=1.19.1" },
     { name = "pandas-stubs", specifier = ">=2.0" },
-    { name = "pivot", extras = ["dvc"] },
-    { name = "pivot", extras = ["matplotlib"] },
-    { name = "pivot", extras = ["s3"] },
+    { name = "pivot", extras = ["dvc"], editable = "." },
+    { name = "pivot", extras = ["matplotlib"], editable = "." },
+    { name = "pivot", extras = ["s3"], editable = "." },
     { name = "pytest", specifier = ">=7.0" },
     { name = "pytest-aioboto3", specifier = ">=0.1.0" },
     { name = "pytest-asyncio", specifier = ">=0.24.0" },
@@ -2164,6 +2174,21 @@ dev = [
     { name = "pytest-xdist", specifier = ">=3.8.0" },
     { name = "ruff", specifier = ">=0.8.0" },
     { name = "types-aioboto3", extras = ["all"], specifier = ">=13.0.0" },
+]
+
+[[package]]
+name = "pivot-tui"
+version = "0.1.0"
+source = { editable = "packages/pivot-tui" }
+dependencies = [
+    { name = "pivot" },
+    { name = "textual" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "pivot", editable = "." },
+    { name = "textual", specifier = ">=7.0" },
 ]
 
 [[package]]
