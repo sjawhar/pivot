@@ -343,7 +343,8 @@ def checkout(
     tracked_files = track.discover_pvt_files(project_root)
 
     # Get stage output info from lock files (cached outputs only)
-    stage_outputs = _get_stage_output_info()
+    pipeline = cli_decorators.get_pipeline_from_context()
+    stage_outputs = {} if pipeline is None else _get_stage_output_info()
 
     # Run async checkout
     failures, restored, skipped = asyncio.run(
