@@ -11,7 +11,7 @@ import logging
 import pathlib
 from typing import cast
 
-from pivot import config, exceptions, parameters, registry, run_history
+from pivot import config, exceptions, parameters, path_utils, project, registry, run_history
 from pivot.executor import worker
 from pivot.storage import cache, lock
 from pivot.storage import state as state_mod
@@ -35,6 +35,9 @@ def commit_stages(
 
     Hashes current deps and outputs on disk, writes lock files, caches outputs,
     and updates StateDB (dep generations, output generations, run cache).
+
+    Note: Commits are NOT atomic across stages. If a later stage fails, earlier
+    stages' lock files and cache entries remain written.
 
     Args:
         stage_names: Specific stages to commit. None means all stale stages.
@@ -109,8 +112,10 @@ def commit_stages(
 
             # 4. Compute input_hash
             stage_outs = stage_info["outs"]
+            project_root = project.get_project_root()
             out_specs = [
-                (worker.normalize_out_path(str(out.path)), out.cache) for out in stage_outs
+                (path_utils.canonicalize_artifact_path(str(out.path), project_root), out.cache)
+                for out in stage_outs
             ]
             deps_list = [
                 DepEntry(path=dep_path, hash=info["hash"]) for dep_path, info in dep_hashes.items()
@@ -120,7 +125,10 @@ def commit_stages(
             )
 
             # Compute normalized output paths once (used for skip check, lock data, and StateDB)
-            out_paths = [worker.normalize_out_path(str(out.path)) for out in stage_outs]
+            out_paths = [
+                path_utils.canonicalize_artifact_path(str(out.path), project_root)
+                for out in stage_outs
+            ]
             production_lock = lock.StageLock(stage_name, stages_dir)
 
             # 5. If not force and no explicit stages, check lock — skip if unchanged
@@ -149,7 +157,7 @@ def commit_stages(
                         out_path, files_cache_dir, checkout_modes=checkout_modes
                     )
                 else:
-                    output_hashes[str(out.path)] = worker.hash_output(out_path)
+                    output_hashes[str(out.path)] = worker.hash_output(out_path, stage_db)
 
             if outputs_missing:
                 failed.append(stage_name)

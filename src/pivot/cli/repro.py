@@ -351,7 +351,12 @@ def _run_watch_mode(  # noqa: PLR0913 - many params needed for different modes
         # TUI mode with async Engine
         # IMPORTANT: Textual must run in the main thread for signal handlers (SIGTSTP, etc.)
         # to work correctly. We run the Engine in a background thread instead.
-        import pivot_tui.run as tui_run
+        try:
+            import pivot_tui.run as tui_run
+        except ImportError as err:
+            raise click.UsageError(
+                "The TUI requires the 'pivot-tui' package. Install it with: pip install 'pivot[tui]' or: uv pip install pivot-tui"
+            ) from err
 
         # Create TUI app (will run in main thread)
         app = tui_run.PivotApp(
@@ -582,7 +587,12 @@ def _run_oneshot_mode(
     # IMPORTANT: Textual must run in the main thread for signal handlers (SIGTSTP, etc.)
     # to work correctly. We run the Engine in a background thread instead.
     if tui and run_id:
-        import pivot_tui.run as tui_run
+        try:
+            import pivot_tui.run as tui_run
+        except ImportError as err:
+            raise click.UsageError(
+                "The TUI requires the 'pivot-tui' package. Install it with: pip install 'pivot[tui]' or: uv pip install pivot-tui"
+            ) from err
 
         # Create TUI app (will run in main thread)
         app = tui_run.PivotApp(

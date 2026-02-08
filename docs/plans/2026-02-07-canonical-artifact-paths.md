@@ -1,7 +1,5 @@
 # Canonical Artifact Path Representation (#378)
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
-
 **Goal:** Establish a single canonical in-memory form for artifact paths (absolute, normalized, trailing slash for dirs) so that dependency resolution, output indexing, and DAG construction never encounter path mismatches.
 
 **Architecture:** Introduce a `canonicalize_artifact_path()` helper in `path_utils.py` that produces the one canonical form. Make `Pipeline._resolve_path()` return absolute paths directly (instead of project-relative), eliminating the double-normalization where Pipeline makes paths relative and registry makes them absolute again. Keep lockfile storage as the one explicit boundary conversion (absolute <-> project-relative).

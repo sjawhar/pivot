@@ -68,7 +68,11 @@ def get_stage_output_hashes(state_dir: pathlib.Path, stage_names: list[str]) -> 
     from pivot.cli import helpers as cli_helpers
 
     for stage_name in stage_names:
-        stage_info = cli_helpers.get_stage(stage_name)
+        try:
+            stage_info = cli_helpers.get_stage(stage_name)
+        except KeyError:
+            logger.warning(f"Stage {stage_name} not found in registry, skipping")
+            continue
         non_cached_paths = {str(out.path) for out in stage_info["outs"] if not out.cache}
 
         stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(state_dir))
@@ -307,7 +311,7 @@ async def _push_async(
     metrics.end("sync.push_async", _t)
     return TransferSummary(
         transferred=len(transferred),
-        skipped=len(status["common"]),
+        skipped=len(status["common"]) + skipped_non_file,
         failed=len(failed),
         errors=errors,
     )

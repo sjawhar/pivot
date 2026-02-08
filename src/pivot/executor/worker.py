@@ -399,20 +399,19 @@ def execute_stage(
             )
 
 
-def normalize_out_path(path: str) -> str:
-    """Normalize output path, preserving trailing slash for DirectoryOut."""
-    normalized = str(project.normalize_path(path))
-    return path_utils.preserve_trailing_slash(path, normalized)
+def _canonicalize_out(path: str) -> str:
+    """Canonicalize output path via path_utils.canonicalize_artifact_path."""
+    return path_utils.canonicalize_artifact_path(path, project.get_project_root())
 
 
 def _get_normalized_out_paths(stage_info: WorkerStageInfo) -> list[str]:
     """Get normalized output paths from stage info, matching lock_data format."""
-    return [normalize_out_path(str(out.path)) for out in stage_info["outs"]]
+    return [_canonicalize_out(str(out.path)) for out in stage_info["outs"]]
 
 
 def _get_output_specs(stage_info: WorkerStageInfo) -> list[tuple[str, bool]]:
     """Get normalized output specs (path, cache flag) for input hash computation."""
-    return [(normalize_out_path(str(out.path)), out.cache) for out in stage_info["outs"]]
+    return [(_canonicalize_out(str(out.path)), out.cache) for out in stage_info["outs"]]
 
 
 def _check_skip_or_run(
@@ -499,7 +498,7 @@ def _restore_outputs(
 
     for path_str in output_path_strings:
         path = pathlib.Path(path_str)
-        lookup_key = normalize_out_path(path_str) if use_normalized_paths else path_str
+        lookup_key = _canonicalize_out(path_str) if use_normalized_paths else path_str
 
         # Check if output is recorded
         if lookup_key not in output_hash_map:
@@ -796,19 +795,17 @@ class _OutputRingBuffer:
     """Bounded ring buffer for captured output lines."""
 
     _lines: collections.deque[tuple[str, bool]]
-    _max_lines: int
     _dropped_count: int
     _lock: threading.Lock
 
     def __init__(self, max_lines: int = 1000) -> None:
         self._lines = collections.deque(maxlen=max_lines)
-        self._max_lines = max_lines
         self._dropped_count = 0
         self._lock = threading.Lock()
 
     def append(self, line: str, is_stderr: bool) -> None:
         with self._lock:
-            if len(self._lines) == self._max_lines:
+            if len(self._lines) == self._lines.maxlen:
                 self._dropped_count += 1
             self._lines.append((line, is_stderr))
 
@@ -865,10 +862,9 @@ class _QueueWriter:
             self._redirect = contextlib.redirect_stdout(self)
 
     def _pipe_reader(self) -> None:
+        assert self._read_fd is not None  # Guaranteed by _ensure_pipe() before thread starts
         try:
             while True:
-                if self._read_fd is None:
-                    break
                 data = os.read(self._read_fd, 8192)
                 if not data:
                     break
@@ -994,7 +990,7 @@ def can_skip_via_generation(
         return False
 
     # Normalize output paths to match lock_data format (preserve trailing slash for DirectoryOut)
-    normalized_outs = sorted(normalize_out_path(p) for p in outs_paths)
+    normalized_outs = sorted(_canonicalize_out(p) for p in outs_paths)
     locked_out_paths = sorted(lock_data["output_hashes"].keys())
     if normalized_outs != locked_out_paths:
         return False

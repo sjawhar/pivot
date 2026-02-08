@@ -231,37 +231,6 @@ class StageLock:
         return False, ""
 
 
-def get_pending_stages_dir(project_root: Path) -> Path:
-    """Return the pending stages directory for --no-commit mode."""
-    return project_root / ".pivot" / "pending" / "stages"
-
-
-def get_pending_lock(stage_name: str, project_root: Path) -> StageLock:
-    """Get StageLock pointing to pending directory for --no-commit mode."""
-    return StageLock(stage_name, get_pending_stages_dir(project_root))
-
-
-def list_pending_stages(project_root: Path) -> list[str]:
-    """List all stages with pending lock files.
-
-    Supports pipeline-prefixed stage names (e.g. "alpha/stage_a") which
-    create lock files in subdirectories (e.g. pending/stages/alpha/stage_a.lock).
-    """
-    pending_dir = get_pending_stages_dir(project_root)
-    if not pending_dir.exists():
-        return []
-    # Use rglob to find lock files in subdirectories (pipeline-prefixed names)
-    # and reconstruct the stage name from the relative path (minus .lock suffix).
-    results = list[str]()
-    for p in pending_dir.rglob("*.lock"):
-        rel = p.relative_to(pending_dir)
-        # Remove .lock suffix and convert to POSIX-style stage name
-        # e.g. Path("alpha/stage_a.lock") -> "alpha/stage_a"
-        stage_name = rel.with_suffix("").as_posix()
-        results.append(stage_name)
-    return sorted(results)
-
-
 # =============================================================================
 # Execution Locks - Runtime Mutual Exclusion
 # =============================================================================

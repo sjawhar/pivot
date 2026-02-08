@@ -1,6 +1,5 @@
 # Single StageDefinition Extraction Seam — Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Parse stage function annotations exactly once per registration and make type-hint resolution failures explicit.
 

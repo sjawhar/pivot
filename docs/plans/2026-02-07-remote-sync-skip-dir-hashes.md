@@ -1,6 +1,5 @@
 # Remote Sync: Skip Directory Tree Hashes and Enforce Hash Format
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Prevent remote sync from including directory tree hashes in push/pull target sets, and tighten remote hash validation to match local cache invariants (exactly 16 lowercase hex characters).
 

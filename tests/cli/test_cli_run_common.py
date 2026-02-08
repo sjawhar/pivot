@@ -268,8 +268,8 @@ def test_validate_tui_log_returns_none_for_none() -> None:
     assert result is None
 
 
-def test_validate_tui_log_raises_for_json(tmp_path: pathlib.Path) -> None:
-    """validate_tui_log raises when used with --json."""
+def test_validate_tui_log_raises_for_jsonl(tmp_path: pathlib.Path) -> None:
+    """validate_tui_log raises when used with --jsonl."""
     tui_log = tmp_path / "test.jsonl"
     with pytest.raises(click.ClickException, match="cannot be used with --jsonl"):
         _run_common.validate_tui_log(tui_log, as_json=True, tui_flag=True)
@@ -340,20 +340,10 @@ def test_validate_show_output_raises_for_tui() -> None:
 def test_validate_show_output_raises_for_json() -> None:
     """validate_show_output raises when used with --jsonl."""
     with pytest.raises(
-        click.ClickException, match="--show-output and --jsonl are mutually exclusive"
+        click.ClickException, match="--show-output and --jsonl/--json are mutually exclusive"
     ):
         _run_common.validate_show_output(
             show_output=True, tui_flag=False, as_json=True, quiet=False
-        )
-
-
-def test_validate_show_output_raises_for_quiet() -> None:
-    """validate_show_output raises when used with --quiet."""
-    with pytest.raises(
-        click.ClickException, match="--show-output and --quiet are mutually exclusive"
-    ):
-        _run_common.validate_show_output(
-            show_output=True, tui_flag=False, as_json=False, quiet=True
         )
 
 

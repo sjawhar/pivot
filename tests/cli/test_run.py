@@ -206,6 +206,8 @@ def test_run_default_fails_fast(
 
     assert result.exit_code == 0
     assert "failing: FAILED" in result.output
+    # Fail-fast should prevent the second stage from running
+    assert not (tmp_path / "a.txt").exists(), "stage_a should not run after failing stage"
 
 
 def test_run_fail_fast_option_accepted(

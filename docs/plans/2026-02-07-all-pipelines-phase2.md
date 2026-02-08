@@ -1,6 +1,5 @@
 # `--all` Flag Phase 2: Enable Remaining Commands
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Enable `--all` on `repro`, `status`, `commit`, `push`, `pull` and fix all remaining per-stage `state_dir` call sites so the coordinator correctly routes lock files and StateDB writes for multi-pipeline projects.
 
