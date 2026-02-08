@@ -477,7 +477,7 @@ def test_worker_injects_deps(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyP
 
     # Run the stage function through worker
     output_queue: Queue[OutputMessage] = Queue()
-    output_lines: list[tuple[str, bool]] = []
+    ring_buffer = worker._OutputRingBuffer()
 
     # Get dep specs and out specs for the worker
     dep_specs = stage_def.get_dep_specs_from_signature(process)
@@ -487,7 +487,7 @@ def test_worker_injects_deps(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyP
         process,
         "test_stage",
         output_queue,
-        output_lines,
+        ring_buffer,
         params=None,
         dep_specs=dep_specs,
         project_root=tmp_path,
@@ -528,7 +528,7 @@ def test_worker_injects_params_and_deps(
 
     # Run the stage function through worker
     output_queue: Queue[OutputMessage] = Queue()
-    output_lines: list[tuple[str, bool]] = []
+    ring_buffer = worker._OutputRingBuffer()
 
     dep_specs = stage_def.get_dep_specs_from_signature(train)
     out_specs = stage_def.get_output_specs_from_return(train, "test_stage")
@@ -539,7 +539,7 @@ def test_worker_injects_params_and_deps(
         train,
         "test_stage",
         output_queue,
-        output_lines,
+        ring_buffer,
         params=params,
         dep_specs=dep_specs,
         project_root=tmp_path,

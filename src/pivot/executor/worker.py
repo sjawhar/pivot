@@ -6,8 +6,8 @@ Must be module-level and picklable.
 
 from __future__ import annotations
 
+import collections
 import contextlib
-import io
 import logging
 import os
 import pathlib
@@ -148,7 +148,7 @@ class WorkerStageInfo(TypedDict):
 def _make_result(
     status: Literal[StageStatus.RAN, StageStatus.SKIPPED, StageStatus.FAILED],
     reason: str,
-    output_lines: list[tuple[str, bool]],
+    ring_buffer: _OutputRingBuffer,
     input_hash: str | None = None,
 ) -> StageResult:
     """Build StageResult with collected metrics for cross-process transfer."""
@@ -156,7 +156,7 @@ def _make_result(
         status=status,
         reason=reason,
         input_hash=input_hash,
-        output_lines=output_lines,
+        output_lines=ring_buffer.snapshot(),
         metrics=metrics.get_entries(),
     )
 
@@ -174,7 +174,7 @@ def execute_stage(
     """
     # Clear metrics at start - each stage collects its own metrics
     metrics.clear()
-    output_lines: list[tuple[str, bool]] = []
+    ring_buffer = _OutputRingBuffer()
     files_cache_dir = cache_dir / "files"
     state_db_path = stage_info["state_dir"] / "state.db"
     project_root = stage_info["project_root"]
@@ -205,7 +205,7 @@ def execute_stage(
             return _make_result(
                 StageStatus.FAILED,
                 f"Invalid params override in params.yaml: {e.error_count()} validation error(s)",
-                [],
+                ring_buffer,
             )
 
         input_hash: str | None = None
@@ -220,12 +220,14 @@ def execute_stage(
 
                     if missing:
                         return _make_result(
-                            StageStatus.FAILED, f"missing deps: {', '.join(missing)}", []
+                            StageStatus.FAILED, f"missing deps: {', '.join(missing)}", ring_buffer
                         )
 
                     if unreadable:
                         return _make_result(
-                            StageStatus.FAILED, f"unreadable deps: {', '.join(unreadable)}", []
+                            StageStatus.FAILED,
+                            f"unreadable deps: {', '.join(unreadable)}",
+                            ring_buffer,
                         )
 
                     skip_reason, run_reason, input_hash = _check_skip_or_run(
@@ -254,7 +256,10 @@ def execute_stage(
                         )
                         if restored:
                             return _make_result(
-                                StageStatus.SKIPPED, skip_reason, [], input_hash=input_hash
+                                StageStatus.SKIPPED,
+                                skip_reason,
+                                ring_buffer,
+                                input_hash=input_hash,
                             )
                         run_reason = "outputs missing from cache"
 
@@ -273,7 +278,7 @@ def execute_stage(
                                 return _make_result(
                                     StageStatus.SKIPPED,
                                     "unchanged (run cache)",
-                                    [],
+                                    ring_buffer,
                                     input_hash=input_hash,
                                 )
                             new_lock_data = LockData(
@@ -296,7 +301,7 @@ def execute_stage(
                                 status=StageStatus.SKIPPED,
                                 reason="unchanged (run cache)",
                                 input_hash=input_hash,
-                                output_lines=[],
+                                output_lines=ring_buffer.snapshot(),
                                 metrics=metrics.get_entries(),
                                 deferred_writes=deferred,
                             )
@@ -313,7 +318,7 @@ def execute_stage(
                     stage_info["func"],
                     stage_name,
                     output_queue,
-                    output_lines,
+                    ring_buffer,
                     params_instance,
                     stage_info["dep_specs"],
                     project_root,
@@ -335,7 +340,7 @@ def execute_stage(
                         status=StageStatus.RAN,
                         reason=run_reason,
                         input_hash=input_hash,
-                        output_lines=output_lines,
+                        output_lines=ring_buffer.snapshot(),
                         metrics=metrics.get_entries(),
                     )
 
@@ -362,29 +367,35 @@ def execute_stage(
                         status=StageStatus.RAN,
                         reason=run_reason,
                         input_hash=input_hash,
-                        output_lines=output_lines,
+                        output_lines=ring_buffer.snapshot(),
                         metrics=metrics.get_entries(),
                         deferred_writes=deferred,
                     )
 
         except exceptions.StageAlreadyRunningError as e:
-            return _make_result(StageStatus.FAILED, str(e), output_lines)
+            return _make_result(StageStatus.FAILED, str(e), ring_buffer)
         except exceptions.OutputMissingError as e:
-            return _make_result(StageStatus.FAILED, str(e), output_lines, input_hash=input_hash)
+            return _make_result(StageStatus.FAILED, str(e), ring_buffer, input_hash=input_hash)
         except SystemExit as e:
             return _make_result(
                 StageStatus.FAILED,
                 f"Stage called sys.exit({e.code})",
-                output_lines,
+                ring_buffer,
                 input_hash=input_hash,
             )
         except KeyboardInterrupt:
             return _make_result(
-                StageStatus.FAILED, "KeyboardInterrupt", output_lines, input_hash=input_hash
+                StageStatus.FAILED,
+                "KeyboardInterrupt",
+                ring_buffer,
+                input_hash=input_hash,
             )
         except Exception:
             return _make_result(
-                StageStatus.FAILED, traceback.format_exc(), output_lines, input_hash=input_hash
+                StageStatus.FAILED,
+                traceback.format_exc(),
+                ring_buffer,
+                input_hash=input_hash,
             )
 
 
@@ -714,7 +725,7 @@ def _run_stage_function_with_injection(
     func: Callable[..., Any],
     stage_name: str,
     output_queue: Queue[OutputMessage],
-    output_lines: list[tuple[str, bool]],
+    ring_buffer: _OutputRingBuffer,
     params: stage_def.StageParams | None = None,
     dep_specs: dict[str, stage_def.FuncDepSpec] | None = None,
     project_root: pathlib.Path | None = None,
@@ -743,8 +754,8 @@ def _run_stage_function_with_injection(
         params_arg_name: Name of the StageParams parameter (pre-computed at registration).
     """
     with (
-        _QueueWriter(stage_name, output_queue, is_stderr=False, output_lines=output_lines),
-        _QueueWriter(stage_name, output_queue, is_stderr=True, output_lines=output_lines),
+        _QueueWriter(stage_name, output_queue, is_stderr=False, ring_buffer=ring_buffer),
+        _QueueWriter(stage_name, output_queue, is_stderr=True, ring_buffer=ring_buffer),
     ):
         kwargs = dict[str, Any]()
 
@@ -781,6 +792,34 @@ def _run_stage_function_with_injection(
             )
 
 
+class _OutputRingBuffer:
+    """Bounded ring buffer for captured output lines."""
+
+    _lines: collections.deque[tuple[str, bool]]
+    _max_lines: int
+    _dropped_count: int
+    _lock: threading.Lock
+
+    def __init__(self, max_lines: int = 1000) -> None:
+        self._lines = collections.deque(maxlen=max_lines)
+        self._max_lines = max_lines
+        self._dropped_count = 0
+        self._lock = threading.Lock()
+
+    def append(self, line: str, is_stderr: bool) -> None:
+        with self._lock:
+            if len(self._lines) == self._max_lines:
+                self._dropped_count += 1
+            self._lines.append((line, is_stderr))
+
+    def snapshot(self) -> list[tuple[str, bool]]:
+        with self._lock:
+            lines = list(self._lines)
+            if self._dropped_count > 0:
+                lines.insert(0, (f"[{self._dropped_count} earlier lines truncated]", False))
+            return lines
+
+
 class _QueueWriter:
     """Context manager for capturing stdout/stderr to a queue.
 
@@ -793,10 +832,13 @@ class _QueueWriter:
     _stage_name: str
     _queue: Queue[OutputMessage]
     _is_stderr: bool
-    _output_lines: list[tuple[str, bool]]
+    _ring_buffer: _OutputRingBuffer
     _buffer: str
     _redirect: contextlib.AbstractContextManager[object]
     _lock: threading.Lock
+    _read_fd: int | None
+    _write_fd: int | None
+    _reader_thread: threading.Thread | None
 
     def __init__(
         self,
@@ -804,20 +846,44 @@ class _QueueWriter:
         output_queue: Queue[OutputMessage],
         *,
         is_stderr: bool,
-        output_lines: list[tuple[str, bool]],
+        ring_buffer: _OutputRingBuffer,
     ) -> None:
         self._stage_name = stage_name
         self._queue = output_queue
         self._is_stderr = is_stderr
-        self._output_lines = output_lines
+        self._ring_buffer = ring_buffer
         self._buffer = ""
         self._lock = threading.Lock()
+        self._read_fd = None
+        self._write_fd = None
+        self._reader_thread = None
         # Create redirect context manager (not yet entered)
         # _QueueWriter implements write/flush but not full IO[str] interface
         if is_stderr:
             self._redirect = contextlib.redirect_stderr(self)
         else:
             self._redirect = contextlib.redirect_stdout(self)
+
+    def _pipe_reader(self) -> None:
+        try:
+            while True:
+                if self._read_fd is None:
+                    break
+                data = os.read(self._read_fd, 8192)
+                if not data:
+                    break
+                self.write(data.decode("utf-8", errors="replace"))
+        except OSError:
+            pass
+
+    def _ensure_pipe(self) -> None:
+        if self._read_fd is not None:
+            return
+        self._read_fd, self._write_fd = os.pipe()
+        self._reader_thread = threading.Thread(
+            target=self._pipe_reader, daemon=True, name=f"pipe-reader-{self._stage_name}"
+        )
+        self._reader_thread.start()
 
     def __enter__(self) -> _QueueWriter:
         self._redirect.__enter__()
@@ -830,11 +896,19 @@ class _QueueWriter:
         exc_tb: TracebackType | None,
     ) -> None:
         self._redirect.__exit__(exc_type, exc_val, exc_tb)
+        if self._write_fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(self._write_fd)
+        if self._reader_thread is not None:
+            self._reader_thread.join(timeout=5.0)
+        if self._read_fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(self._read_fd)
         self.flush()
 
     def _send_line(self, line: str) -> None:
         """Save line locally and send to queue for real-time display."""
-        self._output_lines.append((line, self._is_stderr))
+        self._ring_buffer.append(line, self._is_stderr)
         # Queue failure only affects real-time display; output is already saved locally
         with contextlib.suppress(queue.Full, ValueError, OSError):
             self._queue.put((self._stage_name, line, self._is_stderr), block=False)
@@ -858,8 +932,10 @@ class _QueueWriter:
         return False
 
     def fileno(self) -> int:
-        """Raise UnsupportedOperation - _QueueWriter has no underlying file descriptor."""
-        raise io.UnsupportedOperation("_QueueWriter does not use a file descriptor")
+        self._ensure_pipe()
+        if self._write_fd is None:
+            raise OSError("QueueWriter pipe not available")
+        return self._write_fd
 
 
 def hash_dependencies(
