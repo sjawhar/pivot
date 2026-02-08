@@ -289,3 +289,5 @@ $RECYCLE.BIN/
 # Pivot project state
 .pivot/
 /ralph/
+.sisyphus/*
+!.sisyphus/rules/

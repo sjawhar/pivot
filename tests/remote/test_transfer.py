@@ -8,8 +8,9 @@ import yaml
 from pivot import exceptions, project
 from pivot.cli import helpers as cli_helpers
 from pivot.remote import config as remote_config
-from pivot.remote import storage as remote_storage
+from pivot.remote import storage as remote_mod
 from pivot.remote import sync as transfer
+from pivot.storage import cache as cache_mod
 from pivot.storage import state as state_mod
 from pivot.types import RemoteStatus, TransferResult
 
@@ -17,6 +18,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from pytest_mock import MockerFixture
+    from types_aiobotocore_s3 import S3Client
 
     from tests.conftest import ValidLockContentFactory
 
@@ -262,7 +264,7 @@ def test_get_stage_dep_hashes_no_lock(lock_project: Path) -> None:
 async def test_compare_status_empty_hashes(lock_project: Path, mocker: MockerFixture) -> None:
     """Empty local hashes returns empty status."""
 
-    mock_remote = mocker.Mock(spec=remote_storage.S3Remote)
+    mock_remote = mocker.Mock(spec=remote_mod.S3Remote)
     mock_state = mocker.Mock(spec=state_mod.StateDB)
 
     result = await transfer.compare_status(set(), mock_remote, mock_state, "origin")
@@ -274,7 +276,7 @@ async def test_compare_status_empty_hashes(lock_project: Path, mocker: MockerFix
 async def test_compare_status_all_known_in_index(lock_project: Path, mocker: MockerFixture) -> None:
     """All hashes known in index skips remote check."""
 
-    mock_remote = mocker.Mock(spec=remote_storage.S3Remote)
+    mock_remote = mocker.Mock(spec=remote_mod.S3Remote)
     mock_state = mocker.Mock(spec=state_mod.StateDB)
 
     local_hashes = {"abc123def4567890", "def456abc7890123"}
@@ -290,7 +292,7 @@ async def test_compare_status_all_known_in_index(lock_project: Path, mocker: Moc
 async def test_compare_status_queries_unknown(lock_project: Path, mocker: MockerFixture) -> None:
     """Unknown hashes query remote and update index."""
 
-    mock_remote = mocker.Mock(spec=remote_storage.S3Remote)
+    mock_remote = mocker.Mock(spec=remote_mod.S3Remote)
     mock_state = mocker.Mock(spec=state_mod.StateDB)
 
     local_hashes = {"abc123def4567890", "def456abc7890123", "111222333444555a"}
@@ -316,7 +318,7 @@ async def test_push_async_no_local_hashes(lock_project: Path, mocker: MockerFixt
 
     cache_dir = lock_project / ".pivot" / "cache"
     state_dir = lock_project / ".pivot"
-    mock_remote = mocker.Mock(spec=remote_storage.S3Remote)
+    mock_remote = mocker.Mock(spec=remote_mod.S3Remote)
     mock_state = mocker.Mock(spec=state_mod.StateDB)
 
     result = await transfer._push_async(cache_dir, state_dir, mock_remote, mock_state, "origin")
@@ -337,7 +339,7 @@ async def test_push_async_all_already_on_remote(lock_project: Path, mocker: Mock
     (files_dir / "ab").mkdir(parents=True)
     (files_dir / "ab" / ("c" * 14)).write_text("content1")
 
-    mock_remote = mocker.Mock(spec=remote_storage.S3Remote)
+    mock_remote = mocker.Mock(spec=remote_mod.S3Remote)
     mock_state = mocker.Mock(spec=state_mod.StateDB)
     mock_state.remote_hashes_intersection.return_value = {hash1}
 
@@ -359,7 +361,7 @@ async def test_push_async_uploads_missing(lock_project: Path, mocker: MockerFixt
     (files_dir / "ab").mkdir(parents=True)
     (files_dir / "ab" / ("c" * 14)).write_text("content1")
 
-    mock_remote = mocker.Mock(spec=remote_storage.S3Remote)
+    mock_remote = mocker.Mock(spec=remote_mod.S3Remote)
     mock_state = mocker.Mock(spec=state_mod.StateDB)
     mock_state.remote_hashes_intersection.return_value = set()
     mock_remote.bulk_exists = mocker.AsyncMock(return_value={hash1: False})
@@ -386,7 +388,7 @@ async def test_push_async_handles_failures(lock_project: Path, mocker: MockerFix
     (files_dir / "ab").mkdir(parents=True)
     (files_dir / "ab" / ("c" * 14)).write_text("content1")
 
-    mock_remote = mocker.Mock(spec=remote_storage.S3Remote)
+    mock_remote = mocker.Mock(spec=remote_mod.S3Remote)
     mock_state = mocker.Mock(spec=state_mod.StateDB)
     mock_state.remote_hashes_intersection.return_value = set()
     mock_remote.bulk_exists = mocker.AsyncMock(return_value={hash1: False})
@@ -420,7 +422,7 @@ async def test_push_async_with_stages(
     with lock_path.open("w") as f:
         yaml.dump(lock_data, f)
 
-    mock_remote = mocker.Mock(spec=remote_storage.S3Remote)
+    mock_remote = mocker.Mock(spec=remote_mod.S3Remote)
     mock_state = mocker.Mock(spec=state_mod.StateDB)
     mock_state.remote_hashes_intersection.return_value = set()
     mock_remote.bulk_exists = mocker.AsyncMock(return_value={hash1: False})
@@ -445,7 +447,7 @@ async def test_pull_async_no_needed_hashes(lock_project: Path, mocker: MockerFix
 
     cache_dir = lock_project / ".pivot" / "cache"
     state_dir = lock_project / ".pivot"
-    mock_remote = mocker.Mock(spec=remote_storage.S3Remote)
+    mock_remote = mocker.Mock(spec=remote_mod.S3Remote)
     mock_state = mocker.Mock(spec=state_mod.StateDB)
 
     result = await transfer._pull_async(
@@ -476,7 +478,7 @@ async def test_pull_async_all_already_local(
     with lock_path.open("w") as f:
         yaml.dump(lock_data, f)
 
-    mock_remote = mocker.Mock(spec=remote_storage.S3Remote)
+    mock_remote = mocker.Mock(spec=remote_mod.S3Remote)
     mock_state = mocker.Mock(spec=state_mod.StateDB)
 
     result = await transfer._pull_async(
@@ -503,7 +505,7 @@ async def test_pull_async_downloads_missing(
     with lock_path.open("w") as f:
         yaml.dump(lock_data, f)
 
-    mock_remote = mocker.Mock(spec=remote_storage.S3Remote)
+    mock_remote = mocker.Mock(spec=remote_mod.S3Remote)
     mock_state = mocker.Mock(spec=state_mod.StateDB)
     mock_remote.download_batch = mocker.AsyncMock(
         return_value=[TransferResult(hash=hash1, success=True)]
@@ -529,7 +531,7 @@ async def test_pull_async_without_stages_lists_remote(
     (cache_dir / "files").mkdir(parents=True)
 
     hash1 = "ab" + "c" * 14
-    mock_remote = mocker.Mock(spec=remote_storage.S3Remote)
+    mock_remote = mocker.Mock(spec=remote_mod.S3Remote)
     mock_state = mocker.Mock(spec=state_mod.StateDB)
     mock_remote.list_hashes = mocker.AsyncMock(return_value={hash1})
     mock_remote.download_batch = mocker.AsyncMock(
@@ -559,7 +561,7 @@ async def test_pull_async_handles_failures(
     with lock_path.open("w") as f:
         yaml.dump(lock_data, f)
 
-    mock_remote = mocker.Mock(spec=remote_storage.S3Remote)
+    mock_remote = mocker.Mock(spec=remote_mod.S3Remote)
     mock_state = mocker.Mock(spec=state_mod.StateDB)
     mock_remote.download_batch = mocker.AsyncMock(
         return_value=[TransferResult(hash=hash1, success=False, error="Download failed")]
@@ -593,7 +595,7 @@ async def test_pull_async_includes_deps(
     with lock_path.open("w") as f:
         yaml.dump(lock_data, f)
 
-    mock_remote = mocker.Mock(spec=remote_storage.S3Remote)
+    mock_remote = mocker.Mock(spec=remote_mod.S3Remote)
     mock_state = mocker.Mock(spec=state_mod.StateDB)
     mock_remote.download_batch = mocker.AsyncMock(
         return_value=[
@@ -663,3 +665,196 @@ def test_create_remote_from_name_multiple_remotes_error(
 
     with pytest.raises(exceptions.RemoteNotFoundError, match="Could not determine remote name"):
         transfer.create_remote_from_name(None)
+
+
+# ============================================================================
+# Integration Tests (with moto)
+# ============================================================================
+
+
+async def test_push_async_integration(
+    tmp_path: Path,
+    s3_remote: remote_mod.S3Remote,
+    aioboto3_s3_client: S3Client,
+) -> None:
+    """Integration: push files to real moto S3."""
+    state_dir = tmp_path / ".pivot"
+    cache_dir = state_dir / "cache"
+    files_dir = cache_dir / "files"
+    files_dir.mkdir(parents=True)
+
+    hash1 = "ab" + "c" * 14
+    hash2 = "de" + "f" * 14
+
+    cache_path1 = cache_mod.get_cache_path(files_dir, hash1)
+    cache_path1.parent.mkdir(parents=True, exist_ok=True)
+    cache_path1.write_bytes(b"content1")
+
+    cache_path2 = cache_mod.get_cache_path(files_dir, hash2)
+    cache_path2.parent.mkdir(parents=True, exist_ok=True)
+    cache_path2.write_bytes(b"content2")
+
+    state_dir.mkdir(parents=True, exist_ok=True)
+    state_db = state_mod.StateDB(state_dir / "state.db")
+
+    await transfer._push_async(cache_dir, state_dir, s3_remote, state_db, "origin")
+
+    response = await aioboto3_s3_client.get_object(
+        Bucket=s3_remote.bucket,
+        Key=remote_mod._hash_to_key(s3_remote.prefix, hash1),
+    )
+    content = await response["Body"].read()
+    assert content == b"content1"
+    state_db.close()
+
+
+async def test_pull_async_integration(
+    tmp_path: Path,
+    s3_remote: remote_mod.S3Remote,
+    aioboto3_s3_client: S3Client,
+) -> None:
+    """Integration: pull files from real moto S3."""
+    hash1 = "ab" + "c" * 14
+
+    await aioboto3_s3_client.put_object(
+        Bucket=s3_remote.bucket,
+        Key=remote_mod._hash_to_key(s3_remote.prefix, hash1),
+        Body=b"content1",
+    )
+
+    state_dir = tmp_path / ".pivot"
+    cache_dir = state_dir / "cache"
+    cache_dir.mkdir(parents=True)
+
+    state_db = state_mod.StateDB(state_dir / "state.db")
+
+    await transfer._pull_async(cache_dir, state_dir, s3_remote, state_db, "origin")
+
+    files_dir = cache_dir / "files"
+    cache_path = cache_mod.get_cache_path(files_dir, hash1)
+    assert cache_path.read_bytes() == b"content1"
+    state_db.close()
+
+
+async def test_push_pull_roundtrip_integration(
+    tmp_path: Path,
+    s3_remote: remote_mod.S3Remote,
+    aioboto3_s3_client: S3Client,
+) -> None:
+    """Integration: push then pull to verify roundtrip."""
+    hash1 = "ab" + "c" * 14
+
+    state_dir1 = tmp_path / ".pivot1"
+    cache_dir1 = state_dir1 / "cache"
+    files_dir1 = cache_dir1 / "files"
+    files_dir1.mkdir(parents=True)
+
+    cache_path1 = cache_mod.get_cache_path(files_dir1, hash1)
+    cache_path1.parent.mkdir(parents=True, exist_ok=True)
+    cache_path1.write_bytes(b"original")
+
+    state_db1 = state_mod.StateDB(state_dir1 / "state.db")
+
+    await transfer._push_async(cache_dir1, state_dir1, s3_remote, state_db1, "origin")
+
+    state_dir2 = tmp_path / ".pivot2"
+    cache_dir2 = state_dir2 / "cache"
+    cache_dir2.mkdir(parents=True)
+    state_db2 = state_mod.StateDB(state_dir2 / "state.db")
+
+    await transfer._pull_async(cache_dir2, state_dir2, s3_remote, state_db2, "origin")
+
+    files_dir2 = cache_dir2 / "files"
+    cache_path2 = cache_mod.get_cache_path(files_dir2, hash1)
+    assert cache_path2.read_bytes() == b"original"
+    state_db1.close()
+    state_db2.close()
+
+
+async def test_compare_status_integration(
+    tmp_path: Path,
+    s3_remote: remote_mod.S3Remote,
+    aioboto3_s3_client: S3Client,
+) -> None:
+    """Integration: compare local vs remote status.
+
+    Note: compare_status only checks local hashes against remote, never
+    enumerates remote-only files. So we only set up the common hash.
+    """
+    hash_common = "de" + "f" * 14
+    hash_local_only = "12" + "3" * 14
+
+    await aioboto3_s3_client.put_object(
+        Bucket=s3_remote.bucket,
+        Key=remote_mod._hash_to_key(s3_remote.prefix, hash_common),
+        Body=b"remote2",
+    )
+
+    state_dir = tmp_path / ".pivot"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    state_db = state_mod.StateDB(state_dir / "state.db")
+
+    status = await transfer.compare_status(
+        {hash_common, hash_local_only},
+        s3_remote,
+        state_db,
+        "origin",
+    )
+
+    assert status["remote_only"] == set()
+    assert status["local_only"] == {hash_local_only}
+    assert status["common"] == {hash_common}
+    state_db.close()
+
+
+async def test_pull_async_with_deps_integration(
+    tmp_path: Path,
+    s3_remote: remote_mod.S3Remote,
+    aioboto3_s3_client: S3Client,
+    make_valid_lock_content: ValidLockContentFactory,
+) -> None:
+    """Integration: pull with dependency hashes."""
+    out_hash = "ab" + "c" * 14
+    dep_hash = "de" + "f" * 14
+
+    await aioboto3_s3_client.put_object(
+        Bucket=s3_remote.bucket,
+        Key=remote_mod._hash_to_key(s3_remote.prefix, out_hash),
+        Body=b"main_file",
+    )
+    await aioboto3_s3_client.put_object(
+        Bucket=s3_remote.bucket,
+        Key=remote_mod._hash_to_key(s3_remote.prefix, dep_hash),
+        Body=b"dependency_file",
+    )
+
+    state_dir = tmp_path / ".pivot"
+    cache_dir = state_dir / "cache"
+    cache_dir.mkdir(parents=True)
+
+    lock_data = make_valid_lock_content(
+        outs=[{"path": "out.csv", "hash": out_hash}],
+        deps=[{"path": "in.csv", "hash": dep_hash}],
+    )
+    lock_path = state_dir / "stages" / "my_stage.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("w") as f:
+        yaml.dump(lock_data, f)
+
+    state_db = state_mod.StateDB(state_dir / "state.db")
+
+    await transfer._pull_async(
+        cache_dir,
+        state_dir,
+        s3_remote,
+        state_db,
+        "origin",
+        targets=["my_stage"],
+    )
+
+    files_dir = cache_dir / "files"
+    out_path = cache_mod.get_cache_path(files_dir, out_hash)
+    dep_path = cache_mod.get_cache_path(files_dir, dep_hash)
+    assert out_path.read_bytes() == b"main_file"
+    assert dep_path.read_bytes() == b"dependency_file"
+    state_db.close()

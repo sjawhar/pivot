@@ -431,7 +431,7 @@ def test_pull_dry_run_all(
         )
         mocker.patch.object(transfer, "get_local_cache_hashes", return_value={"remote1"})
 
-        result = runner.invoke(cli.cli, ["pull", "--dry-run"])
+        result = runner.invoke(cli.cli, ["pull", "--dry-run", "--all"])
 
         assert result.exit_code == 0
         assert "Would pull 2 file(s) from 'origin'" in result.output
@@ -471,7 +471,7 @@ def test_pull_success(
         # Mock checkout to prevent actual file restoration
         mocker.patch.object(checkout_mod, "checkout")
 
-        result = runner.invoke(cli.cli, ["pull"])
+        result = runner.invoke(cli.cli, ["pull", "output.csv"])
 
         assert result.exit_code == 0
         assert "Fetched from 'origin': 3 transferred, 1 skipped, 0 failed" in result.output
@@ -520,7 +520,7 @@ def test_pull_with_errors(
         mock_state_db = mocker.MagicMock()
         mocker.patch.object(state, "StateDB", return_value=mock_state_db)
 
-        result = runner.invoke(cli.cli, ["pull"])
+        result = runner.invoke(cli.cli, ["pull", "output.csv"])
 
         assert result.exit_code == 1, "Should exit non-zero when transfers fail"
         assert "2 transferred" in result.output
@@ -617,7 +617,7 @@ def test_pull_exception_shows_click_error(
             side_effect=RuntimeError("Test error"),
         )
 
-        result = runner.invoke(cli.cli, ["pull"])
+        result = runner.invoke(cli.cli, ["pull", "output.csv"])
 
         assert result.exit_code != 0
         assert "Test error" in result.output
@@ -764,3 +764,145 @@ def test_fetch_quiet_mode_no_output(
 
         assert result.exit_code == 0
         assert result.output.strip() == "", "Quiet mode should suppress output"
+
+
+# =============================================================================
+# Pull Command - No Pipeline Tests
+# =============================================================================
+
+
+def test_pull_no_pipeline_no_targets_fails_early(
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mocker: MockerFixture,
+) -> None:
+    """Pull fails early when no pipeline and no targets (and not using --all).
+
+    Without a pipeline, targets, or --all flag, pull should fail immediately
+    with a clear error message suggesting --all or targets.
+    """
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".pivot").mkdir()
+        pathlib.Path(".git").mkdir()
+        monkeypatch.setattr(project, "_project_root_cache", None)
+
+        # Mock remote and transfer functions
+        mocker.patch.object(
+            transfer,
+            "create_remote_from_name",
+            return_value=(mocker.MagicMock(), "origin"),
+        )
+        # Mock pull to ensure it's not called (early failure should prevent it)
+        mock_pull = mocker.patch.object(
+            transfer,
+            "pull",
+            return_value=TransferSummary(transferred=0, skipped=0, failed=0, errors=[]),
+        )
+
+        # Run pull with no pipeline, no targets, no --all
+        result = runner.invoke(cli.cli, ["pull"])
+
+        # Should fail early
+        assert result.exit_code != 0, f"Expected failure, got: {result.output}"
+        # Error message should suggest --all or targets
+        assert "--all" in result.output or "target" in result.output.lower()
+        # Should not have called pull (early failure prevents fetch)
+        mock_pull.assert_not_called()
+
+
+def test_pull_defaults_to_only_missing_for_checkout(
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mocker: MockerFixture,
+) -> None:
+    """Pull defaults to only_missing=True when neither --force nor --only-missing passed.
+
+    When pull invokes checkout without explicit --force or --only-missing flags,
+    it should default to only_missing=True for safety.
+    """
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".pivot").mkdir()
+        pathlib.Path(".git").mkdir()
+        cache_dir = tmp_path / ".pivot" / "cache"
+        cache_dir.mkdir(parents=True)
+        monkeypatch.setattr(project, "_project_root_cache", None)
+
+        mocker.patch.object(config_mod, "get_cache_dir", return_value=cache_dir)
+        mocker.patch.object(
+            transfer,
+            "create_remote_from_name",
+            return_value=(mocker.MagicMock(), "origin"),
+        )
+
+        mocker.patch.object(
+            transfer,
+            "pull",
+            return_value=TransferSummary(transferred=1, skipped=0, failed=0, errors=[]),
+        )
+
+        mock_state_db = mocker.MagicMock()
+        mocker.patch.object(state, "StateDB", return_value=mock_state_db)
+
+        # Mock checkout to capture the call
+        mock_checkout = mocker.patch.object(checkout_mod, "checkout")
+
+        result = runner.invoke(cli.cli, ["pull", "output.csv"])
+
+        assert result.exit_code == 0, f"Failed: {result.output}"
+        # Verify checkout was called with only_missing=True
+        mock_checkout.assert_called_once()
+        call_kwargs = mock_checkout.call_args.kwargs
+        assert call_kwargs.get("only_missing") is True, (
+            f"Expected only_missing=True, got {call_kwargs}"
+        )
+
+
+def test_pull_force_overrides_default_only_missing(
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mocker: MockerFixture,
+) -> None:
+    """Pull with --force overrides default only_missing, sets force=True.
+
+    When pull is invoked with --force, it should pass force=True and
+    only_missing=False to checkout.
+    """
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".pivot").mkdir()
+        pathlib.Path(".git").mkdir()
+        cache_dir = tmp_path / ".pivot" / "cache"
+        cache_dir.mkdir(parents=True)
+        monkeypatch.setattr(project, "_project_root_cache", None)
+
+        mocker.patch.object(config_mod, "get_cache_dir", return_value=cache_dir)
+        mocker.patch.object(
+            transfer,
+            "create_remote_from_name",
+            return_value=(mocker.MagicMock(), "origin"),
+        )
+
+        mocker.patch.object(
+            transfer,
+            "pull",
+            return_value=TransferSummary(transferred=1, skipped=0, failed=0, errors=[]),
+        )
+
+        mock_state_db = mocker.MagicMock()
+        mocker.patch.object(state, "StateDB", return_value=mock_state_db)
+
+        # Mock checkout to capture the call
+        mock_checkout = mocker.patch.object(checkout_mod, "checkout")
+
+        result = runner.invoke(cli.cli, ["pull", "--force", "output.csv"])
+
+        assert result.exit_code == 0, f"Failed: {result.output}"
+        # Verify checkout was called with force=True and only_missing=False
+        mock_checkout.assert_called_once()
+        call_kwargs = mock_checkout.call_args.kwargs
+        assert call_kwargs.get("force") is True, f"Expected force=True, got {call_kwargs}"
+        assert call_kwargs.get("only_missing") is False, (
+            f"Expected only_missing=False with --force, got {call_kwargs}"
+        )
