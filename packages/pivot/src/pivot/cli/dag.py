@@ -5,7 +5,7 @@ import logging
 import click
 import networkx as nx
 
-from pivot import dag, project
+from pivot import dag
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
 from pivot.cli import targets as cli_targets
@@ -13,38 +13,6 @@ from pivot.engine import graph as engine_graph
 from pivot.engine import types as engine_types
 
 logger = logging.getLogger(__name__)
-
-
-def _resolve_targets_to_stages(
-    target_list: list[str],
-    bipartite_graph: nx.DiGraph[str],
-) -> tuple[set[str], list[str]]:
-    """Resolve targets to stage names.
-
-    Stage names are used directly. Artifact paths are resolved to stages that
-    produce or consume them.
-
-    Returns:
-        Tuple of (resolved stage names, unresolved targets).
-    """
-    registered_stages = set(cli_helpers.list_stages())
-    result = set[str]()
-    unresolved = list[str]()
-
-    for target in target_list:
-        if target in registered_stages:
-            result.add(target)
-        else:
-            # Treat as artifact path - use absolute path to match graph node format
-            # Only find the producer (for upstream-only semantics like stage targets)
-            norm_path = project.normalize_path(target)
-            producer = engine_graph.get_producer(bipartite_graph, norm_path)
-            if producer:
-                result.add(producer)
-            else:
-                unresolved.append(target)
-
-    return result, unresolved
 
 
 def _get_upstream_subgraph(
@@ -108,7 +76,9 @@ def dag_cmd(
     # Filter to subgraph if targets provided
     if targets:
         valid_targets = cli_targets.validate_targets(targets)
-        stage_names, unresolved = _resolve_targets_to_stages(valid_targets, bipartite_graph)
+        stage_names, unresolved = cli_targets.resolve_targets_to_stages(
+            valid_targets, bipartite_graph
+        )
 
         if unresolved:
             unresolved_str = ", ".join(f"'{t}'" for t in unresolved)

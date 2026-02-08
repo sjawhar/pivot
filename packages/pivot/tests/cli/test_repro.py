@@ -379,6 +379,47 @@ def test_repro_unknown_stage_errors(
 
 
 # =============================================================================
+# File Path Resolution Tests
+# =============================================================================
+
+
+def test_repro_with_output_file_path(
+    mock_discovery: Pipeline,
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """repro with output file path runs correct stage and dependencies."""
+    register_test_stage(_helper_stage_a, name="stage_a")
+    register_test_stage(_helper_stage_b, name="stage_b")
+
+    # Run repro with output file path (b.txt is produced by stage_b)
+    result = runner.invoke(cli.cli, ["repro", "b.txt"])
+
+    assert result.exit_code == 0, f"Failed: {result.output}"
+    assert (tmp_path / "a.txt").exists(), "Dependency stage_a should have run"
+    assert (tmp_path / "b.txt").exists(), "Target stage_b should have run"
+
+
+def test_repro_unknown_file_path_errors(
+    mock_discovery: Pipeline,
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """repro with unknown file path shows helpful error mentioning output paths."""
+    register_test_stage(_helper_stage_a, name="stage_a")
+
+    result = runner.invoke(cli.cli, ["repro", "nonexistent.csv"])
+
+    assert result.exit_code != 0, "Should error on unknown file path"
+    assert "nonexistent.csv" in result.output, "Error should mention the unknown target"
+    assert "output file paths" in result.output or "Targets can be" in result.output, (
+        "Error should mention that targets can be file paths"
+    )
+
+
+# =============================================================================
 # Force Mode Tests
 # =============================================================================
 

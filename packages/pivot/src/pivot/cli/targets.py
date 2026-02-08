@@ -7,9 +7,12 @@ import click
 
 from pivot import outputs, project
 from pivot.cli import helpers as cli_helpers
+from pivot.engine import graph as engine_graph
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    import networkx as nx
 
     from pivot.show import plots as plots_mod
 
@@ -44,6 +47,38 @@ def validate_targets(targets: tuple[str, ...]) -> list[str]:
         raise TargetValidationError("All targets are empty or whitespace-only")
 
     return valid
+
+
+def resolve_targets_to_stages(
+    targets: list[str],
+    bipartite_graph: nx.DiGraph[str],
+) -> tuple[set[str], list[str]]:
+    """Resolve targets to stage names.
+
+    Stage names are used directly. Artifact paths are resolved to the stages
+    that produce them.
+
+    Returns:
+        Tuple of (resolved stage names, unresolved targets).
+    """
+    registered_stages = set(cli_helpers.list_stages())
+    result = set[str]()
+    unresolved = list[str]()
+
+    for target in targets:
+        if target in registered_stages:
+            result.add(target)
+        else:
+            # Treat as artifact path - use absolute path to match graph node format
+            # Only find the producer (for upstream-only semantics like stage targets)
+            norm_path = project.normalize_path(target)
+            producer = engine_graph.get_producer(bipartite_graph, norm_path)
+            if producer:
+                result.add(producer)
+            else:
+                unresolved.append(target)
+
+    return result, unresolved
 
 
 def _classify_targets(

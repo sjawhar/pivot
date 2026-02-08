@@ -8,7 +8,9 @@ import pytest
 
 from helpers import register_test_stage
 from pivot import loaders, outputs
+from pivot.cli import helpers as cli_helpers
 from pivot.cli import targets
+from pivot.engine import graph as engine_graph
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -22,6 +24,14 @@ if TYPE_CHECKING:
 
 class _OutputTxtOutputs(TypedDict):
     output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
+
+
+class _OutputCsvOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("output.csv", loaders.PathOnly())]
+
+
+class _OutputJsonOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("output.json", loaders.PathOnly())]
 
 
 # =============================================================================
@@ -39,6 +49,18 @@ def _helper_stage(
     _ = input_file
     pathlib.Path("output.txt").write_text("done")
     return {"output": pathlib.Path("output.txt")}
+
+
+def _helper_stage_csv() -> _OutputCsvOutputs:
+    """Helper stage that produces output.csv."""
+    pathlib.Path("output.csv").write_text("data")
+    return {"output": pathlib.Path("output.csv")}
+
+
+def _helper_stage_json() -> _OutputJsonOutputs:
+    """Helper stage that produces output.json."""
+    pathlib.Path("output.json").write_text("{}")
+    return {"output": pathlib.Path("output.json")}
 
 
 # --- validate_targets tests ---
@@ -216,3 +238,117 @@ def test_resolve_and_validate_returns_paths(
 
     assert result is not None
     assert "data.yaml" in result
+
+
+# --- resolve_targets_to_stages tests ---
+
+
+def test_resolve_targets_to_stages_stage_name(
+    mock_discovery: Pipeline, set_project_root: Path
+) -> None:
+    """Stage name resolves directly to itself."""
+    register_test_stage(_helper_stage_csv, name="my_stage")
+
+    all_stages = cli_helpers.get_all_stages()
+    bipartite_graph = engine_graph.build_graph(all_stages)
+
+    resolved, unresolved = targets.resolve_targets_to_stages(["my_stage"], bipartite_graph)
+
+    assert "my_stage" in resolved, "Stage name should resolve directly"
+    assert unresolved == [], "Should have no unresolved targets"
+
+
+def test_resolve_targets_to_stages_file_path(
+    mock_discovery: Pipeline, set_project_root: Path
+) -> None:
+    """Output file path resolves to producer stage."""
+    register_test_stage(_helper_stage_csv, name="producer_stage")
+
+    all_stages = cli_helpers.get_all_stages()
+    bipartite_graph = engine_graph.build_graph(all_stages)
+
+    resolved, unresolved = targets.resolve_targets_to_stages(["output.csv"], bipartite_graph)
+
+    assert "producer_stage" in resolved, "File path should resolve to producer stage"
+    assert unresolved == [], "Should have no unresolved targets"
+
+
+def test_resolve_targets_to_stages_unknown(
+    mock_discovery: Pipeline, set_project_root: Path
+) -> None:
+    """Unknown target goes to unresolved list."""
+    register_test_stage(_helper_stage_csv, name="some_stage")
+
+    all_stages = cli_helpers.get_all_stages()
+    bipartite_graph = engine_graph.build_graph(all_stages)
+
+    resolved, unresolved = targets.resolve_targets_to_stages(["nonexistent.csv"], bipartite_graph)
+
+    assert resolved == set(), "Should have no resolved stages"
+    assert "nonexistent.csv" in unresolved, "Unknown target should be in unresolved"
+
+
+def test_resolve_targets_to_stages_mixed(mock_discovery: Pipeline, set_project_root: Path) -> None:
+    """Stage names and file paths mix correctly."""
+    register_test_stage(_helper_stage_csv, name="stage_a")
+    register_test_stage(_helper_stage_json, name="stage_b")
+
+    all_stages = cli_helpers.get_all_stages()
+    bipartite_graph = engine_graph.build_graph(all_stages)
+
+    resolved, unresolved = targets.resolve_targets_to_stages(
+        ["stage_a", "output.json"], bipartite_graph
+    )
+
+    assert "stage_a" in resolved, "Stage name should resolve"
+    assert "stage_b" in resolved, "File path should resolve to stage_b"
+    assert unresolved == [], "Should have no unresolved targets"
+
+
+def test_resolve_targets_to_stages_dedup(mock_discovery: Pipeline, set_project_root: Path) -> None:
+    """Duplicate paths to same stage deduplicate."""
+    register_test_stage(_helper_stage_csv, name="my_stage")
+
+    all_stages = cli_helpers.get_all_stages()
+    bipartite_graph = engine_graph.build_graph(all_stages)
+
+    # Resolve both the stage name and its output file
+    resolved, unresolved = targets.resolve_targets_to_stages(
+        ["my_stage", "output.csv"], bipartite_graph
+    )
+
+    assert len(resolved) == 1, "Should deduplicate to single stage"
+    assert "my_stage" in resolved, "Should contain the stage"
+    assert unresolved == [], "Should have no unresolved targets"
+
+
+def test_resolve_targets_to_stages_absolute_path(
+    mock_discovery: Pipeline, set_project_root: Path
+) -> None:
+    """Absolute path to output file resolves to producer stage."""
+    register_test_stage(_helper_stage_csv, name="producer_stage")
+
+    all_stages = cli_helpers.get_all_stages()
+    bipartite_graph = engine_graph.build_graph(all_stages)
+
+    # Use absolute path to the output file
+    abs_path = str(set_project_root / "output.csv")
+    resolved, unresolved = targets.resolve_targets_to_stages([abs_path], bipartite_graph)
+
+    assert "producer_stage" in resolved, "Absolute path should resolve to producer stage"
+    assert unresolved == [], "Should have no unresolved targets"
+
+
+def test_resolve_targets_to_stages_dot_relative_path(
+    mock_discovery: Pipeline, set_project_root: Path
+) -> None:
+    """Dot-relative path (./output.csv) resolves to producer stage."""
+    register_test_stage(_helper_stage_csv, name="producer_stage")
+
+    all_stages = cli_helpers.get_all_stages()
+    bipartite_graph = engine_graph.build_graph(all_stages)
+
+    resolved, unresolved = targets.resolve_targets_to_stages(["./output.csv"], bipartite_graph)
+
+    assert "producer_stage" in resolved, "Dot-relative path should resolve to producer stage"
+    assert unresolved == [], "Should have no unresolved targets"

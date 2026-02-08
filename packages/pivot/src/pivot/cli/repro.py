@@ -25,7 +25,9 @@ from pivot import config
 from pivot.cli import _run_common, completion
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
+from pivot.cli import targets as cli_targets
 from pivot.engine import engine, sinks
+from pivot.engine import graph as engine_graph
 from pivot.engine import sources as engine_sources
 from pivot.executor import prepare_workers
 from pivot.types import (
@@ -828,7 +830,8 @@ def repro(
     """Reproduce pipeline stages with full dependency resolution.
 
     If STAGES are provided, runs those stages and all their dependencies.
-    Without arguments, runs the entire pipeline.
+    STAGES can be stage names or output file paths — file paths are resolved
+    to the stage that produces them. Without arguments, runs the entire pipeline.
 
     Auto-discovers pivot.yaml or pipeline.py if no stages are registered.
     """
@@ -842,7 +845,45 @@ def repro(
     debounce_ms = debounce if debounce is not None else config.get_watch_debounce()
 
     stages_list = cli_helpers.stages_to_list(stages)
-    cli_helpers.validate_stages_exist(stages_list)
+    if stages_list is not None:
+        # Fast-path: if all targets are registered stage names, skip graph construction
+        registered = set(cli_helpers.list_stages())
+        if not all(s in registered for s in stages_list):
+            # Build graph and resolve file paths to producer stages (same as pivot dag)
+            all_stages = cli_helpers.get_all_stages()
+            bipartite_graph = engine_graph.build_graph(all_stages)
+            resolved, unresolved = cli_targets.resolve_targets_to_stages(
+                stages_list, bipartite_graph
+            )
+        else:
+            # All targets are registered stages - no resolution needed
+            resolved = set(stages_list)
+            unresolved: list[str] = []
+        if unresolved:
+            from difflib import get_close_matches
+
+            registered = sorted(cli_helpers.list_stages())
+            unresolved_str = ", ".join(f"'{t}'" for t in unresolved)
+            msg = (
+                f"Unknown target(s): {unresolved_str}\n"
+                f"  Targets can be stage names or output file paths.\n"
+            )
+            # Add fuzzy suggestions for unresolved targets that are reasonably long
+            suggestions: list[str] = []
+            for target in unresolved[:3]:
+                if len(target) >= 3:
+                    matches = get_close_matches(target, registered, n=1, cutoff=0.6)
+                    if matches:
+                        suggestions.append(f"'{target}' -> '{matches[0]}'")
+            if suggestions:
+                msg += f"  Did you mean: {', '.join(suggestions)}?\n"
+            available = ", ".join(registered[:5])
+            msg += f"  Available stages: {available}"
+            if len(registered) > 5:
+                msg += f" (and {len(registered) - 5} more)"
+            msg += "\n  Run 'pivot list' to see all stages."
+            raise click.ClickException(msg)
+        stages_list = sorted(resolved)
 
     # Validate mutual exclusions
     _run_common.validate_display_mode(tui_flag, as_json)
