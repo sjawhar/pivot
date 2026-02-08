@@ -713,7 +713,7 @@ def test_checkout_restores_only_cached_outputs_not_metrics(
     `pivot checkout` should only restore the Out() (cached) output. The Metric()
     output is not cached — it's git-tracked and not Pivot's responsibility.
     """
-    with isolated_pivot_dir(runner, tmp_path):
+    with isolated_pivot_dir(runner, tmp_path) as project_root:
         pathlib.Path(".pivot/cache/files").mkdir(parents=True, exist_ok=True)
         pathlib.Path("input.txt").write_text("data")
 
@@ -747,3 +747,82 @@ def test_checkout_restores_only_cached_outputs_not_metrics(
         assert not pathlib.Path("metrics.json").exists(), (
             "Non-cached Metric() output should NOT be restored by checkout"
         )
+
+
+# =============================================================================
+# No-Pipeline Checkout Tests
+# =============================================================================
+
+
+def test_checkout_pvt_without_pipeline(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """Checkout restores .pvt tracked files even without pipeline.
+
+    When a project has .pvt files but no pivot.yaml/pipeline.py, checkout
+    should still restore the tracked files without errors.
+    """
+    with isolated_pivot_dir(runner, tmp_path):
+        # Set up cache directory but NO pipeline file
+        cache_dir = pathlib.Path(".pivot") / "cache" / "files"
+        cache_dir.mkdir(parents=True)
+
+        # Create and track a file
+        data_file = pathlib.Path("data.txt")
+        data_file.write_text("tracked content")
+        output_hash = cache.save_to_cache(data_file, cache_dir)
+        assert output_hash is not None
+
+        # Create .pvt tracking file
+        pvt_data = track.PvtData(path="data.txt", hash=output_hash["hash"], size=15)
+        track.write_pvt_file(pathlib.Path("data.txt.pvt"), pvt_data)
+
+        # Delete original file
+        data_file.unlink()
+        assert not data_file.exists()
+
+        # Checkout should restore it (no pipeline error)
+        result = runner.invoke(cli.cli, ["checkout", "data.txt"])
+
+        assert result.exit_code == 0, f"Failed: {result.output}"
+        assert data_file.exists(), "File should be restored"
+        assert data_file.read_text() == "tracked content"
+        assert "Restored" in result.output
+        assert "No pipeline" not in result.output.lower()
+
+
+def test_checkout_all_without_pipeline(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """Checkout all restores .pvt files and silently skips stage outputs without pipeline.
+
+    When a project has .pvt files but no pipeline, checkout with no targets
+    should restore tracked files and complete successfully without errors.
+    """
+    with isolated_pivot_dir(runner, tmp_path):
+        # Set up cache directory but NO pipeline file
+        cache_dir = pathlib.Path(".pivot") / "cache" / "files"
+        cache_dir.mkdir(parents=True)
+
+        # Create and track two files
+        for name in ["data1.txt", "data2.txt"]:
+            path = pathlib.Path(name)
+            path.write_text(f"content of {name}")
+            output_hash = cache.save_to_cache(path, cache_dir)
+            assert output_hash is not None
+            pvt_data = track.PvtData(
+                path=name, hash=output_hash["hash"], size=len(f"content of {name}")
+            )
+            track.write_pvt_file(pathlib.Path(f"{name}.pvt"), pvt_data)
+            # Remove the symlink/hardlink
+            path.unlink()
+
+        # Checkout all (no targets, no pipeline)
+        result = runner.invoke(cli.cli, ["checkout"])
+
+        assert result.exit_code == 0, f"Checkout failed: {result.output}"
+        assert pathlib.Path("data1.txt").exists()
+        assert pathlib.Path("data2.txt").exists()
+        assert pathlib.Path("data1.txt").read_text() == "content of data1.txt"
+        assert pathlib.Path("data2.txt").read_text() == "content of data2.txt"
+        assert "No pipeline" not in result.output.lower()
