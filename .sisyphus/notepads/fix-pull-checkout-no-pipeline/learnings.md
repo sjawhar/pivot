@@ -33,3 +33,59 @@
 1. `621782a` - fix(checkout): handle missing pipeline gracefully
 2. `c15d30d` - fix(pull): default to --only-missing for checkout, fail early without pipeline
 
+
+## Task 3: Add comprehensive tests (2026-02-08)
+
+### Implementation Summary
+- Added 2 new tests to `tests/cli/test_cli_checkout.py` for checkout without pipeline
+- Added 3 new tests to `tests/remote/test_cli_remote.py` for pull defaults and early failure
+- All 6 tests pass; total test count: 51 tests in both files
+
+### Tests Added
+
+**Checkout tests (no pipeline):**
+1. `test_checkout_pvt_without_pipeline` — Verifies checkout restores .pvt tracked files even without pipeline
+2. `test_checkout_all_without_pipeline` — Verifies checkout all restores .pvt files and silently skips stage outputs without pipeline
+
+**Pull tests (defaults and early failure):**
+1. `test_pull_no_pipeline_no_targets_fails_early` — Verifies pull fails early with clear error when no pipeline/targets/--all
+2. `test_pull_defaults_to_only_missing_for_checkout` — Verifies pull defaults to `only_missing=True` when neither --force nor --only-missing passed
+3. `test_pull_force_overrides_default_only_missing` — Verifies pull with --force sets `force=True` and `only_missing=False`
+
+### Key Learnings
+
+1. **Test isolation with isolated_pivot_dir**: The `isolated_pivot_dir(runner, tmp_path)` context manager properly sets up `.pivot` and `.git` directories and resets project root cache, allowing tests to run without a pipeline file.
+
+2. **Checkout handles no-pipeline gracefully**: The checkout command already handles missing pipeline via:
+   ```python
+   pipeline = cli_decorators.get_pipeline_from_context()
+   stage_outputs = {} if pipeline is None else _get_stage_output_info()
+   ```
+   This allows checkout to work with just .pvt tracked files even without a pipeline.
+
+3. **Early failure check placement**: The pull command's early failure check (line 256-259 in remote.py) happens AFTER `create_remote_from_name()` is called. This is acceptable because creating the remote doesn't fetch anything - it just creates a connection object. The actual fetch happens later.
+
+4. **Mock boundaries for pull tests**: When testing pull defaults, mock the `checkout` function to verify it's called with correct parameters (`only_missing=True` by default, `force=True` when --force is used).
+
+5. **Test pattern consistency**: All new tests follow existing patterns:
+   - Use `isolated_pivot_dir` for filesystem setup
+   - Use `runner.invoke(cli.cli, [...])` for CLI invocation
+   - Assert on exit codes and output messages
+   - Mock external boundaries (S3, StateDB) not internal functions
+
+### Files Modified
+- `tests/cli/test_cli_checkout.py`: Added 2 tests (lines 757-828)
+- `tests/remote/test_cli_remote.py`: Added 3 tests (lines 770-883)
+
+### Test Results
+- All 51 tests pass: 26 checkout tests + 25 remote tests
+- No regressions: existing tests still pass
+- No use of `@pytest.mark.skip`
+
+### Commits Created
+1. `a5f0354` - test(checkout,pull): add tests for no-pipeline checkout and pull defaults
+
+### Regression Test Status
+- `test_checkout_stage_output` already exists (line 307) and passes
+- No need to create separate regression test for stage output checkout
+
