@@ -3,7 +3,8 @@
   "started_at": "2026-02-07T20:06:25.201Z",
   "session_ids": [
     "ses_3c6681143ffeQTU77Sb49RJAfl",
-    "ses_3c6470490ffeWfDWFfHJjhbhDH"
+    "ses_3c6470490ffeWfDWFfHJjhbhDH",
+    "ses_3c4c9caedffemowZE066IV6bm2"
   ],
   "plan_name": "tui-package-extraction",
   "agent": "atlas"
