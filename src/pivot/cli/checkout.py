@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import enum
-import logging
 import pathlib
 from typing import TYPE_CHECKING, Literal
 
@@ -17,8 +16,6 @@ from pivot.types import HashInfo, is_dir_hash
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
-
-logger = logging.getLogger(__name__)
 
 RestoreResult = Literal["restored", "skipped", "missing"]
 MAX_CONCURRENT_RESTORES = 32

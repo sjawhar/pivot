@@ -4,10 +4,13 @@ import pathlib
 import shutil
 from typing import TYPE_CHECKING, Annotated, TypedDict
 
+import pytest
+import yaml
+
 from conftest import isolated_pivot_dir
 from helpers import create_pipeline_py
 from pivot import cli, loaders, outputs
-from pivot.storage import cache, track
+from pivot.storage import cache, lock, track
 
 if TYPE_CHECKING:
     import click.testing
@@ -78,6 +81,20 @@ def _helper_mixed(
     pathlib.Path("output.txt").write_text("cached output")
     pathlib.Path("metrics.json").write_text('{"accuracy": 0.95}')
     return {"output": pathlib.Path("output.txt"), "metrics": {"accuracy": 0.95}}
+
+
+class _TwoOutputs(TypedDict):
+    output1: Annotated[pathlib.Path, outputs.Out("output1.txt", loaders.PathOnly())]
+    output2: Annotated[pathlib.Path, outputs.Out("output2.txt", loaders.PathOnly())]
+
+
+def _helper_two_outputs(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _TwoOutputs:
+    _ = input_file
+    pathlib.Path("output1.txt").write_text("output 1")
+    pathlib.Path("output2.txt").write_text("output 2")
+    return {"output1": pathlib.Path("output1.txt"), "output2": pathlib.Path("output2.txt")}
 
 
 # =============================================================================
@@ -826,3 +843,129 @@ def test_checkout_all_without_pipeline(
         assert pathlib.Path("data1.txt").read_text() == "content of data1.txt"
         assert pathlib.Path("data2.txt").read_text() == "content of data2.txt"
         assert "No pipeline" not in result.output.lower()
+
+
+# =============================================================================
+# Null/Empty Hash Handling Tests
+# =============================================================================
+
+
+@pytest.mark.parametrize(
+    "bad_hash",
+    [
+        pytest.param(None, id="null"),
+        pytest.param("", id="empty"),
+    ],
+)
+def test_checkout_rejects_lock_with_invalid_hash(
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    bad_hash: str | None,
+) -> None:
+    """Lock files with null/empty hashes are rejected at deserialization boundary.
+
+    is_lock_data() rejects the entire lock file, so checkout treats the stage
+    as having no lock data — the output is not a known stage output.
+    """
+    with isolated_pivot_dir(runner, tmp_path):
+        pathlib.Path(".pivot/cache/files").mkdir(parents=True, exist_ok=True)
+        pathlib.Path("input.txt").write_text("data")
+
+        extra_code = """
+class _ProcessOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
+"""
+        create_pipeline_py(
+            [_helper_process], names={"_helper_process": "process"}, extra_code=extra_code
+        )
+
+        run_result = runner.invoke(cli.cli, ["repro"])
+        assert run_result.exit_code == 0, f"Run failed: {run_result.output}"
+
+        stages_dir = lock.get_stages_dir(pathlib.Path(".pivot"))
+        lock_path = stages_dir / "process.lock"
+        assert lock_path.exists(), f"Lock file not found at {lock_path}"
+
+        with open(lock_path) as f:
+            lock_yaml = yaml.safe_load(f)
+        lock_yaml["outs"][0]["hash"] = bad_hash
+        with open(lock_path, "w") as f:
+            yaml.dump(lock_yaml, f)
+
+        pathlib.Path("output.txt").unlink()
+
+        result = runner.invoke(cli.cli, ["checkout", "output.txt"])
+
+        assert result.exit_code != 0, "Corrupted lock file should cause checkout to fail"
+        assert "not a tracked file or stage output" in result.output
+        assert not pathlib.Path("output.txt").exists()
+
+
+def test_checkout_rejects_entire_lock_when_any_hash_invalid(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """A single null hash invalidates the entire lock file — no partial trust.
+
+    Even valid outputs from the same stage are unavailable because the corrupted
+    lock file is rejected wholesale. Re-run the stage to regenerate.
+    """
+    with isolated_pivot_dir(runner, tmp_path):
+        pathlib.Path(".pivot/cache/files").mkdir(parents=True, exist_ok=True)
+        pathlib.Path("input.txt").write_text("data")
+
+        extra_code = """
+class _TwoOutputs(TypedDict):
+    output1: Annotated[pathlib.Path, outputs.Out("output1.txt", loaders.PathOnly())]
+    output2: Annotated[pathlib.Path, outputs.Out("output2.txt", loaders.PathOnly())]
+"""
+        create_pipeline_py(
+            [_helper_two_outputs],
+            names={"_helper_two_outputs": "two_stage"},
+            extra_code=extra_code,
+        )
+
+        run_result = runner.invoke(cli.cli, ["repro"])
+        assert run_result.exit_code == 0, f"Run failed: {run_result.output}"
+
+        stages_dir = lock.get_stages_dir(pathlib.Path(".pivot"))
+        lock_path = stages_dir / "two_stage.lock"
+        with open(lock_path) as f:
+            lock_yaml = yaml.safe_load(f)
+        assert len(lock_yaml["outs"]) >= 2
+        lock_yaml["outs"][1]["hash"] = None
+        with open(lock_path, "w") as f:
+            yaml.dump(lock_yaml, f)
+
+        pathlib.Path("output1.txt").unlink()
+        pathlib.Path("output2.txt").unlink()
+
+        result = runner.invoke(cli.cli, ["checkout", "output1.txt"])
+
+        assert result.exit_code != 0, (
+            "Valid output should also fail — lock file is rejected entirely"
+        )
+        assert "not a tracked file or stage output" in result.output
+        assert not pathlib.Path("output1.txt").exists()
+        assert not pathlib.Path("output2.txt").exists()
+
+
+def test_verbose_traceback_on_unhandled_error(
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verbose mode logs full traceback for unhandled exceptions at DEBUG level."""
+    with isolated_pivot_dir(runner, tmp_path):
+        _setup_test_project()
+
+        def _raise_on_discover(_root: pathlib.Path) -> dict[str, track.PvtData]:
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(track, "discover_pvt_files", _raise_on_discover)
+
+        result = runner.invoke(cli.cli, ["--verbose", "checkout"])
+
+        assert result.exit_code != 0
+        assert "RuntimeError" in result.output, "Should show exception repr"
+        assert "boom" in result.output, "Should show exception message"
+        assert "Traceback" in result.output, "Should include traceback with --verbose"

@@ -254,7 +254,7 @@ def pull(
     # Fail early if no pipeline and no targets specified (unless --all was used)
     use_all = cli_decorators.get_all_pipelines_from_context()
     if pipeline is None and not targets_list and not use_all:
-        raise click.ClickException(
+        raise click.UsageError(
             "No pipeline found. Use --all to pull from all pipelines, or specify file targets."
         )
 

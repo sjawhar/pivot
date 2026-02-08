@@ -59,7 +59,13 @@ def get_stages_dir(state_dir: Path) -> Path:
 
 
 def is_lock_data(data: object) -> TypeGuard[StorageLockData]:
-    """Validate that parsed YAML has valid storage format structure."""
+    """Validate that parsed YAML has valid storage format structure.
+
+    Rejects lock files with null/empty hashes in deps or outs entries,
+    which can occur when stages were never executed locally (e.g., pulled
+    from remote with incomplete state). Callers already handle None returns
+    gracefully (treated as "no lock = needs re-run").
+    """
     if not isinstance(data, dict):
         return False
     # Cast to dict[str, object] for type-safe key access
@@ -68,7 +74,23 @@ def is_lock_data(data: object) -> TypeGuard[StorageLockData]:
     if not _REQUIRED_LOCK_KEYS.issubset(typed_data.keys()):
         return False
     # Reject null values for required keys (corrupted data)
-    return all(typed_data[key] is not None for key in _REQUIRED_LOCK_KEYS)
+    if not all(typed_data[key] is not None for key in _REQUIRED_LOCK_KEYS):
+        return False
+    # Validate that deps and outs entries have non-null hash values.
+    # YAML `hash: null` deserializes to None, violating the `hash: str` contract
+    # on FileHash/DirHash. Reject at the boundary so consumers never see it.
+    for list_key in ("deps", "outs"):
+        entries = typed_data[list_key]
+        if not isinstance(entries, list):
+            return False
+        entry_list = cast("list[object]", entries)
+        for raw_entry in entry_list:
+            if not isinstance(raw_entry, dict):
+                return False
+            typed_entry = cast("dict[str, object]", raw_entry)
+            if not typed_entry.get("hash"):
+                return False
+    return True
 
 
 def _convert_to_storage_format(data: LockData) -> StorageLockData:

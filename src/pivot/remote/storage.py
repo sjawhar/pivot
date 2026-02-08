@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import re
@@ -178,7 +179,8 @@ async def _stream_download_to_fd(
                 break
             await _write_all_async(fd, chunk)
     finally:
-        stream.close()  # type: ignore[reportUnknownMemberType] - StreamingBody proxies to aiohttp.ClientResponse.close() (sync)
+        with contextlib.suppress(Exception):
+            stream.close()  # pyright: ignore[reportUnknownMemberType]
 
 
 async def _atomic_download(

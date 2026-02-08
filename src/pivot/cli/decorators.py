@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import logging
 import os
 import sys
 from typing import TYPE_CHECKING, Any, cast
@@ -8,6 +9,8 @@ from typing import TYPE_CHECKING, Any, cast
 import click
 
 from pivot import discovery, exceptions, metrics
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -48,6 +51,7 @@ def with_error_handling[**P, R](func: Callable[P, R]) -> Callable[P, R]:
         except exceptions.PivotError as e:
             raise _handle_pivot_error(e) from e
         except Exception as e:
+            logger.debug("Unhandled exception in CLI command", exc_info=True)
             raise click.ClickException(repr(e)) from e
 
     return wrapper
