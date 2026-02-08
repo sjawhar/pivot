@@ -203,3 +203,87 @@ def test_pivot_command_auto_discover_converts_discovery_error(
     assert result.exit_code != 0
     assert "No pivot.yaml found" in result.output
     assert "Should not reach here" not in result.output
+
+
+# =============================================================================
+# allow_all (--all flag) Tests
+# =============================================================================
+
+
+def test_pivot_command_all_flag_when_allowed(runner: CliRunner, mocker: MockerFixture) -> None:
+    """Commands with allow_all=True accept --all flag."""
+    mocker.patch.object(discovery, "discover_pipeline", return_value=None)
+
+    @cli_decorators.pivot_command(allow_all=True)
+    def test_cmd() -> None:
+        click.echo("ok")
+
+    result = runner.invoke(test_cmd, ["--all"])
+
+    assert result.exit_code == 0
+    assert "ok" in result.output
+
+
+def test_pivot_command_all_flag_when_not_allowed(runner: CliRunner) -> None:
+    """Commands without allow_all=True do not accept --all flag."""
+
+    @cli_decorators.pivot_command(auto_discover=False)
+    def test_cmd() -> None:
+        click.echo("ok")
+
+    result = runner.invoke(test_cmd, ["--all"])
+
+    assert result.exit_code != 0
+
+
+def test_pivot_command_all_flag_passes_to_discovery(
+    runner: CliRunner, mocker: MockerFixture
+) -> None:
+    """--all flag causes discover_pipeline(all_pipelines=True) to be called."""
+    mock_discover = mocker.patch.object(discovery, "discover_pipeline", return_value=None)
+
+    @cli_decorators.pivot_command(allow_all=True)
+    def test_cmd() -> None:
+        click.echo("ok")
+
+    runner.invoke(test_cmd, ["--all"])
+
+    mock_discover.assert_called_once_with(all_pipelines=True)
+
+
+def test_pivot_command_without_all_flag_normal_discovery(
+    runner: CliRunner, mocker: MockerFixture
+) -> None:
+    """Without --all flag, discover_pipeline is called without all_pipelines."""
+    mock_discover = mocker.patch.object(discovery, "discover_pipeline", return_value=None)
+
+    @cli_decorators.pivot_command(allow_all=True)
+    def test_cmd() -> None:
+        click.echo("ok")
+
+    runner.invoke(test_cmd)
+
+    mock_discover.assert_called_once_with(all_pipelines=False)
+
+
+def test_pivot_command_all_pipelines_kwarg_not_leaked_to_command(
+    runner: CliRunner, mocker: MockerFixture
+) -> None:
+    """--all flag is consumed by the decorator and not passed to the command function.
+
+    The decorator pops all_pipelines from kwargs before calling the wrapped function.
+    If this pop is removed or broken, the command function receives an unexpected
+    kwarg and raises TypeError.
+    """
+    mocker.patch.object(discovery, "discover_pipeline", return_value=None)
+    received_kwargs = dict[str, object]()
+
+    @cli_decorators.pivot_command(allow_all=True)
+    def test_cmd(**kwargs: object) -> None:
+        received_kwargs.update(kwargs)
+        click.echo("ok")
+
+    result = runner.invoke(test_cmd, ["--all"])
+
+    assert result.exit_code == 0, f"Command failed: {result.output}"
+    assert "all_pipelines" not in received_kwargs, "all_pipelines kwarg leaked to command function"

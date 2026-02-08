@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Literal, TypedDict, cast
 
 import click
 
-from pivot import config, exceptions, path_utils, project
+from pivot import config, exceptions, path_utils, project, registry
 from pivot import status as status_mod
 from pivot.cli import completion
 from pivot.cli import decorators as cli_decorators
@@ -61,7 +61,7 @@ def _extract_file_hashes(hash_infos: Mapping[str, HashInfo]) -> dict[str, str]:
 
 
 def _get_stage_lock_hashes(
-    stage_name: str, state_dir: Path
+    stage_name: str,
 ) -> tuple[dict[str, str], dict[str, str]]:
     """Get output and dep file hashes from a stage's lock file.
 
@@ -71,13 +71,14 @@ def _get_stage_lock_hashes(
     Non-cached outputs (e.g. Metric with cache=False) are excluded —
     they are git-tracked, not in cache.
     """
+    stage_info = cli_helpers.get_stage(stage_name)
+    state_dir = registry.get_stage_state_dir(stage_info, config.get_state_dir())
     stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(state_dir))
     lock_data = stage_lock.read()
     if lock_data is None:
         return {}, {}
 
     # Filter non-cached outputs — they're git-tracked, not in cache
-    stage_info = cli_helpers.get_stage(stage_name)
     cached_paths = {
         path_utils.preserve_trailing_slash(
             str(out.path),
@@ -101,7 +102,6 @@ def _get_stage_lock_hashes(
 
 def _get_stage_missing_hashes(
     stage_name: str,
-    state_dir: Path,
     local_hashes: set[str],
     allow_missing: bool,
     project_root: Path,
@@ -111,7 +111,7 @@ def _get_stage_missing_hashes(
     Returns {hash: [paths]} for hashes not in local cache.
     When allow_missing=True, also includes deps missing locally.
     """
-    output_hashes, dep_hashes = _get_stage_lock_hashes(stage_name, state_dir)
+    output_hashes, dep_hashes = _get_stage_lock_hashes(stage_name)
     hash_to_paths = dict[str, list[str]]()
 
     # Check outputs: must be in local cache or (with allow_missing) on remote
@@ -156,7 +156,6 @@ def _create_remote_if_needed(allow_missing: bool) -> remote_mod.S3Remote | None:
 
 def _verify_stages(
     pipeline_status: list[PipelineStatusInfo],
-    state_dir: Path,
     cache_dir: Path,
     allow_missing: bool,
 ) -> tuple[bool, list[StageVerifyInfo]]:
@@ -176,7 +175,7 @@ def _verify_stages(
         if stage_info["status"] == PipelineStatus.STALE:
             continue
         hash_to_paths = _get_stage_missing_hashes(
-            stage_info["name"], state_dir, local_hashes, allow_missing, project_root
+            stage_info["name"], local_hashes, allow_missing, project_root
         )
         stage_hash_to_paths[stage_info["name"]] = hash_to_paths
         all_missing_hashes.update(hash_to_paths.keys())
@@ -265,7 +264,7 @@ def _output_json(passed: bool, results: list[StageVerifyInfo]) -> None:
     click.echo(json.dumps(output, indent=2))
 
 
-@cli_decorators.pivot_command()
+@cli_decorators.pivot_command(allow_all=True)
 @click.argument("stages", nargs=-1, shell_complete=completion.complete_stages)
 @click.option("--allow-missing", is_flag=True, help="Allow missing local files if on remote")
 @click.option("--json", "output_json", is_flag=True, help="Output as JSON")
@@ -302,8 +301,6 @@ def verify(
     if not all_stages:
         raise click.ClickException("No stages registered. Nothing to verify.")
 
-    # Resolve directories - use same state_dir as get_pipeline_status for consistency
-    state_dir = config.get_state_dir()
     cache_dir = config.get_cache_dir()
 
     # Get pipeline status (uses default state directory internally)
@@ -319,7 +316,7 @@ def verify(
         raise click.ClickException("No stages to verify.")
 
     # Verify stages
-    passed, results = _verify_stages(pipeline_status, state_dir, cache_dir, allow_missing)
+    passed, results = _verify_stages(pipeline_status, cache_dir, allow_missing)
 
     # Output results
     if output_json:

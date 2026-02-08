@@ -39,7 +39,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_VALID_STAGE_NAME = re.compile(r"^[a-zA-Z0-9_@.-]+$")  # Allow . for DVC matrix keys like @0.5
+_VALID_STAGE_NAME = re.compile(
+    r"^[a-zA-Z0-9_@./-]+$"
+)  # Allow / for pipeline-prefixed names, . for DVC matrix keys
+_PATH_TRAVERSAL = re.compile(r"(^|/)\.\.(/|$)")  # Reject ../ path traversal
 _MAX_STAGE_NAME_LEN = 200  # Leave room for ".lock" suffix within filesystem NAME_MAX (255)
 _REQUIRED_LOCK_KEYS = frozenset({"code_manifest", "params", "deps", "outs", "dep_generations"})
 
@@ -145,7 +148,11 @@ class StageLock:
 
     def __init__(self, stage_name: str, stages_dir: Path) -> None:
         """Initialize a stage lock for the given stage in stages_dir."""
-        if not stage_name or not _VALID_STAGE_NAME.match(stage_name):
+        if (
+            not stage_name
+            or not _VALID_STAGE_NAME.match(stage_name)
+            or _PATH_TRAVERSAL.search(stage_name)
+        ):
             raise ValueError(f"Invalid stage name: {stage_name!r}")
         if len(stage_name) > _MAX_STAGE_NAME_LEN:
             raise ValueError(f"Stage name too long ({len(stage_name)} > {_MAX_STAGE_NAME_LEN})")
@@ -222,6 +229,37 @@ class StageLock:
                 return True, "Output paths changed"
 
         return False, ""
+
+
+def get_pending_stages_dir(project_root: Path) -> Path:
+    """Return the pending stages directory for --no-commit mode."""
+    return project_root / ".pivot" / "pending" / "stages"
+
+
+def get_pending_lock(stage_name: str, project_root: Path) -> StageLock:
+    """Get StageLock pointing to pending directory for --no-commit mode."""
+    return StageLock(stage_name, get_pending_stages_dir(project_root))
+
+
+def list_pending_stages(project_root: Path) -> list[str]:
+    """List all stages with pending lock files.
+
+    Supports pipeline-prefixed stage names (e.g. "alpha/stage_a") which
+    create lock files in subdirectories (e.g. pending/stages/alpha/stage_a.lock).
+    """
+    pending_dir = get_pending_stages_dir(project_root)
+    if not pending_dir.exists():
+        return []
+    # Use rglob to find lock files in subdirectories (pipeline-prefixed names)
+    # and reconstruct the stage name from the relative path (minus .lock suffix).
+    results = list[str]()
+    for p in pending_dir.rglob("*.lock"):
+        rel = p.relative_to(pending_dir)
+        # Remove .lock suffix and convert to POSIX-style stage name
+        # e.g. Path("alpha/stage_a.lock") -> "alpha/stage_a"
+        stage_name = rel.with_suffix("").as_posix()
+        results.append(stage_name)
+    return sorted(results)
 
 
 # =============================================================================

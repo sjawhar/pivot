@@ -376,20 +376,24 @@ def test_pipeline_include_preserves_state_dir_transitively(set_project_root: pat
     assert intermediate_info["state_dir"] == set_project_root / "intermediate" / ".pivot"
 
 
-def test_pipeline_include_name_collision_raises(set_project_root: pathlib.Path) -> None:
-    """include() should raise PipelineConfigError on stage name collision."""
+def test_pipeline_include_name_collision_auto_prefixes(set_project_root: pathlib.Path) -> None:
+    """include() auto-prefixes incoming pipeline's stages on name collision."""
     main = Pipeline("main", root=set_project_root / "main")
     sub = Pipeline("sub", root=set_project_root / "sub")
 
     main.register(_simple_stage, name="train")
     sub.register(_simple_stage, name="train")
 
-    with pytest.raises(PipelineConfigError, match="train.*already exists"):
-        main.include(sub)
+    main.include(sub)
+
+    assert "train" in main.list_stages()
+    assert "sub/train" in main.list_stages()
 
 
-def test_pipeline_include_collision_transitive(set_project_root: pathlib.Path) -> None:
-    """Name collision should be detected even in transitively included stages."""
+def test_pipeline_include_collision_transitive_auto_prefixes(
+    set_project_root: pathlib.Path,
+) -> None:
+    """Transitive name collision auto-prefixes the incoming pipeline's stages."""
     main = Pipeline("main", root=set_project_root / "main")
     main.register(_simple_stage, name="train")
 
@@ -401,15 +405,17 @@ def test_pipeline_include_collision_transitive(set_project_root: pathlib.Path) -
     sub = Pipeline("sub", root=set_project_root / "sub")
     sub.include(subsub)
 
-    # Should detect collision with transitively included stage
-    with pytest.raises(PipelineConfigError, match="train.*already exists"):
-        main.include(sub)
+    # Should auto-prefix sub's stages (including the transitively included one)
+    main.include(sub)
+
+    assert "train" in main.list_stages()
+    assert "sub/train" in main.list_stages()
 
 
-def test_pipeline_include_collision_is_atomic(set_project_root: pathlib.Path) -> None:
-    """Include should be atomic: collision should not partially add stages.
+def test_pipeline_include_collision_prefixes_all_incoming(set_project_root: pathlib.Path) -> None:
+    """On collision, ALL incoming stages get prefixed, not just the colliding one.
 
-    Important for preventing registry corruption when include() fails partway through.
+    Ensures consistent naming — all stages from a prefixed pipeline use the prefix.
     """
     main = Pipeline("main", root=set_project_root / "main")
     main.register(_simple_stage, name="conflict")
@@ -418,13 +424,11 @@ def test_pipeline_include_collision_is_atomic(set_project_root: pathlib.Path) ->
     sub.register(_stage_a, name="safe")
     sub.register(_stage_b, name="conflict")
 
-    initial_stages = set(main.list_stages())
+    main.include(sub)
 
-    with pytest.raises(PipelineConfigError):
-        main.include(sub)
-
-    # Should be unchanged (not have "safe" added)
-    assert set(main.list_stages()) == initial_stages
+    assert "conflict" in main.list_stages()
+    assert "sub/safe" in main.list_stages()
+    assert "sub/conflict" in main.list_stages()
 
 
 def test_pipeline_include_empty_pipeline(set_project_root: pathlib.Path) -> None:
@@ -448,16 +452,17 @@ def test_pipeline_include_self_raises(set_project_root: pathlib.Path) -> None:
         main.include(main)
 
 
-def test_pipeline_include_same_pipeline_twice_raises(set_project_root: pathlib.Path) -> None:
-    """Including the same pipeline twice should raise on collision."""
+def test_pipeline_include_same_pipeline_twice_prefixes(set_project_root: pathlib.Path) -> None:
+    """Including the same pipeline twice auto-prefixes the second include."""
     main = Pipeline("main", root=set_project_root / "main")
     sub = Pipeline("sub", root=set_project_root / "sub")
     sub.register(_simple_stage, name="sub_stage")
 
     main.include(sub)
+    main.include(sub)
 
-    with pytest.raises(PipelineConfigError, match="sub_stage.*already exists"):
-        main.include(sub)
+    assert "sub_stage" in main.list_stages()
+    assert "sub/sub_stage" in main.list_stages()
 
 
 def test_pipeline_include_multiple_different_pipelines(set_project_root: pathlib.Path) -> None:
@@ -641,7 +646,7 @@ def test_pipeline_include_isolates_nested_mutations(set_project_root: pathlib.Pa
     assert included_params.value == original_params.value == 100
 
 
-def test_pipeline_include_multiple_collisions_atomic(set_project_root: pathlib.Path) -> None:
+def test_pipeline_include_multiple_collisions_prefixes_all(set_project_root: pathlib.Path) -> None:
     """Multiple collisions should still be atomic (no partial adds)."""
     main = Pipeline("main", root=set_project_root / "main")
     main.register(_simple_stage, name="collide_a")
@@ -652,13 +657,14 @@ def test_pipeline_include_multiple_collisions_atomic(set_project_root: pathlib.P
     sub.register(_simple_stage, name="collide_b")  # Second collision
     sub.register(_stage_a, name="safe_stage")  # Would be safe if others didn't collide
 
-    initial_stages = set(main.list_stages())
+    main.include(sub)
 
-    with pytest.raises(PipelineConfigError, match="collide_a.*already exists"):
-        main.include(sub)
-
-    # Should be unchanged (safe_stage not added)
-    assert set(main.list_stages()) == initial_stages
+    # All incoming stages prefixed (not just colliding ones)
+    assert "collide_a" in main.list_stages()
+    assert "collide_b" in main.list_stages()
+    assert "sub/collide_a" in main.list_stages()
+    assert "sub/collide_b" in main.list_stages()
+    assert "sub/safe_stage" in main.list_stages()
 
 
 def test_pipeline_include_deepcopy_failure_is_atomic(

@@ -955,3 +955,8 @@ def _normalize_deps_dict(
             normalized = _normalize_paths([value], path_policy.PathType.DEP, validation_mode)
             result[name] = normalized[0]
     return result
+
+
+def get_stage_state_dir(stage_info: RegistryStageInfo, default: pathlib.Path) -> pathlib.Path:
+    """Return the stage's state_dir, falling back to the given default."""
+    return stage_info["state_dir"] or default

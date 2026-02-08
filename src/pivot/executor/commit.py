@@ -9,16 +9,13 @@ from __future__ import annotations
 
 import logging
 import pathlib
-from typing import TYPE_CHECKING, cast
+from typing import cast
 
-from pivot import config, exceptions, parameters, run_history
+from pivot import config, exceptions, parameters, registry, run_history
 from pivot.executor import worker
 from pivot.storage import cache, lock
 from pivot.storage import state as state_mod
 from pivot.types import DeferredWrites, DepEntry, HashInfo, LockData
-
-if TYPE_CHECKING:
-    from pivot import registry
 
 logger = logging.getLogger(__name__)
 
@@ -59,20 +56,29 @@ def commit_stages(
     else:
         targets = all_stage_names
 
-    state_dir = config.get_state_dir()
-    state_db_path = config.get_state_db_path()
+    default_state_dir = config.get_state_dir()
     cache_dir = config.get_cache_dir()
     files_cache_dir = cache_dir / "files"
     checkout_modes = config.get_checkout_mode_order()
-    stages_dir = lock.get_stages_dir(state_dir)
 
     committed = list[str]()
     failed = list[str]()
     overrides = parameters.load_params_yaml()
 
-    with state_mod.StateDB(state_db_path) as state_db:
+    state_dbs = dict[pathlib.Path, state_mod.StateDB]()
+
+    def _get_state_db(stage_state_dir: pathlib.Path) -> state_mod.StateDB:
+        if stage_state_dir not in state_dbs:
+            stage_state_dir.mkdir(parents=True, exist_ok=True)
+            state_dbs[stage_state_dir] = state_mod.StateDB(stage_state_dir / "state.db")
+        return state_dbs[stage_state_dir]
+
+    try:
         for stage_name in targets:
             stage_info = stage_registry.get(stage_name)
+            stage_state_dir = registry.get_stage_state_dir(stage_info, default_state_dir)
+            stage_db = _get_state_db(stage_state_dir)
+            stages_dir = lock.get_stages_dir(stage_state_dir)
 
             # 1. Get fingerprint
             fingerprint = stage_registry.ensure_fingerprint(stage_name)
@@ -84,7 +90,7 @@ def commit_stages(
 
             # 3. Hash deps (pass state_db for hash caching)
             dep_hashes, missing, unreadable = worker.hash_dependencies(
-                stage_info["deps_paths"], state_db
+                stage_info["deps_paths"], stage_db
             )
             if missing:
                 logger.error(
@@ -162,7 +168,7 @@ def commit_stages(
             # 8. Update StateDB: dep generations, output generations, run cache entry
             run_id = run_history.generate_run_id()
 
-            dep_gen_map = worker.compute_dep_generation_map(stage_info["deps_paths"], state_db)
+            dep_gen_map = worker.compute_dep_generation_map(stage_info["deps_paths"], stage_db)
 
             # Only cached outputs belong in run cache
             cached_paths = {cast("str", out.path) for out in stage_outs if out.cache}
@@ -185,8 +191,11 @@ def commit_stages(
                     output_hashes=output_entries,
                 )
 
-            state_db.apply_deferred_writes(stage_name, out_paths, deferred)
+            stage_db.apply_deferred_writes(stage_name, out_paths, deferred)
 
             committed.append(stage_name)
+    finally:
+        for db in state_dbs.values():
+            db.close()
 
     return committed, failed

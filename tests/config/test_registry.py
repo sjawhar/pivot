@@ -1098,3 +1098,70 @@ def test_registry_add_existing_invalidates_dag_cache(set_project_root: pathlib.P
     dag2 = reg.build_dag(validate=False)
     assert len(dag2.nodes) == 2
     assert "added_stage" in dag2.nodes
+
+
+# =============================================================================
+# get_stage_state_dir Tests
+# =============================================================================
+
+
+def test_get_stage_state_dir_returns_custom_when_set(set_project_root: pathlib.Path) -> None:
+    """get_stage_state_dir returns the stage's state_dir when it is set.
+
+    Stages from included pipelines have a per-stage state_dir pointing to
+    the original pipeline's .pivot directory. This overrides the default.
+    """
+    custom_dir = set_project_root / "sub" / ".pivot"
+    # Construct a minimal RegistryStageInfo-like dict with state_dir set
+    stage_info = RegistryStageInfo(
+        func=lambda: None,
+        name="test",
+        deps={},
+        deps_paths=[],
+        outs=[],
+        outs_paths=[],
+        params=None,
+        mutex=[],
+        variant=None,
+        signature=None,
+        fingerprint={},
+        dep_specs={},
+        out_specs={},
+        params_arg_name=None,
+        state_dir=custom_dir,
+    )
+    default_dir = set_project_root / ".pivot"
+
+    result = registry.get_stage_state_dir(stage_info, default_dir)
+
+    assert result == custom_dir
+
+
+def test_get_stage_state_dir_returns_default_when_none(set_project_root: pathlib.Path) -> None:
+    """get_stage_state_dir returns the default when stage's state_dir is None.
+
+    Stages from the primary pipeline have state_dir=None, meaning they use
+    the project's default .pivot directory.
+    """
+    stage_info = RegistryStageInfo(
+        func=lambda: None,
+        name="test",
+        deps={},
+        deps_paths=[],
+        outs=[],
+        outs_paths=[],
+        params=None,
+        mutex=[],
+        variant=None,
+        signature=None,
+        fingerprint={},
+        dep_specs={},
+        out_specs={},
+        params_arg_name=None,
+        state_dir=None,
+    )
+    default_dir = set_project_root / ".pivot"
+
+    result = registry.get_stage_state_dir(stage_info, default_dir)
+
+    assert result == default_dir

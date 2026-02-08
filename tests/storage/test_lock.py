@@ -362,7 +362,6 @@ def test_lock_directory_created(tmp_path: Path) -> None:
     [
         pytest.param("", id="empty"),
         pytest.param("../etc/passwd", id="path_traversal"),
-        pytest.param("stage/nested", id="nested_path"),
         pytest.param("stage with spaces", id="spaces"),
         pytest.param("stage\nwith\nnewlines", id="newlines"),
         pytest.param("../../traversal", id="double_traversal"),
@@ -386,10 +385,12 @@ def test_invalid_stage_name_rejected(tmp_path: Path, invalid_name: str) -> None:
         pytest.param("stage.with.dots", id="dots"),
         pytest.param("plot@0.5", id="at_decimal"),
         pytest.param("wrangle@swe_bench", id="at_underscore"),
+        pytest.param("pipeline/stage", id="pipeline_prefixed"),
+        pytest.param("mr_time_horizon_1_1/compute_task_weights", id="pipeline_prefixed_real"),
     ],
 )
 def test_valid_stage_names_accepted(tmp_path: Path, valid_name: str) -> None:
-    """Valid stage names with alphanumeric, underscore, dash, dot, @ are accepted."""
+    """Valid stage names with alphanumeric, underscore, dash, dot, @, / are accepted."""
     stage_lock = lock.StageLock(valid_name, tmp_path)
     assert stage_lock.stage_name == valid_name
 
@@ -782,3 +783,33 @@ def test_directory_out_trailing_slash_preserved_through_lockfile_roundtrip(
     assert result_paths[0] == dir_out_path
     # Verify manifest is preserved
     assert result["output_hashes"][dir_out_path] == dir_hash
+
+
+def test_pipeline_prefixed_stage_name_creates_subdirectory(tmp_path: Path) -> None:
+    """Pipeline-prefixed stage names (with /) create subdirectory lock files.
+
+    When --all mode prefixes stage names as 'pipeline/stage', the lock file
+    is stored at stages_dir/pipeline/stage.lock. This test verifies the
+    full write/read roundtrip works and the subdirectory is created.
+    """
+    stage_lock = lock.StageLock("alpha/my_stage", tmp_path)
+    data = LockData(
+        code_manifest={"self:alpha/my_stage": "abc123"},
+        params={"lr": 0.01},
+        dep_hashes={},
+        output_hashes={},
+        dep_generations={},
+    )
+
+    stage_lock.write(data)
+
+    # Verify subdirectory structure
+    expected_path = tmp_path / "alpha" / "my_stage.lock"
+    assert expected_path.exists(), f"Expected lock file at {expected_path}"
+    assert stage_lock.path == expected_path
+
+    # Verify roundtrip read
+    result = stage_lock.read()
+    assert result is not None
+    assert result["code_manifest"] == data["code_manifest"]
+    assert result["params"] == data["params"]

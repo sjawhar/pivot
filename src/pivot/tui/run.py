@@ -32,7 +32,7 @@ import textual.timer
 import textual.widget
 import textual.widgets
 
-from pivot import config, explain, parameters, project
+from pivot import config, explain, parameters, project, registry
 from pivot.executor import ExecutionSummary
 from pivot.storage import lock
 from pivot.tui import diff_panels, rpc_client
@@ -581,7 +581,11 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
             try:
                 registry_info = self._stage_data_provider.get_stage(stage_name)
                 fingerprint = self._stage_data_provider.ensure_fingerprint(stage_name)
-                state_dir = config.get_state_dir()
+                state_dir = (
+                    registry.get_stage_state_dir(registry_info, config.get_state_dir())
+                    if "state_dir" in registry_info
+                    else config.get_state_dir()
+                )
                 input_snapshot = explain.get_stage_explanation(
                     stage_name=stage_name,
                     fingerprint=fingerprint,
@@ -638,7 +642,11 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
             if self._stage_data_provider is not None:
                 try:
                     registry_info = self._stage_data_provider.get_stage(stage_name)
-                    state_dir = config.get_state_dir()
+                    state_dir = (
+                        registry.get_stage_state_dir(registry_info, config.get_state_dir())
+                        if "state_dir" in registry_info
+                        else config.get_state_dir()
+                    )
                     stages_dir = lock.get_stages_dir(state_dir)
                     lock_data = lock.StageLock(stage_name, stages_dir).read()
                     output_snapshot = diff_panels.compute_output_changes(lock_data, registry_info)

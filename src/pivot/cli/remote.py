@@ -40,7 +40,7 @@ def _get_targets_list(targets: tuple[str, ...]) -> list[str] | None:
     return list(targets) if targets else None
 
 
-@cli_decorators.pivot_command()
+@cli_decorators.pivot_command(allow_all=True)
 @click.argument("targets", nargs=-1, shell_complete=completion.complete_targets)
 @click.option("-r", "--remote", "remote_name", help="Remote name (uses default if not specified)")
 @click.option("--dry-run", "-n", is_flag=True, help="Show what would be pushed")
@@ -66,10 +66,16 @@ def push(
     state_dir = config.get_state_dir()
     s3_remote, resolved_name = transfer.create_remote_from_name(remote_name)
 
+    # Per-stage state_dir lookup when pipeline is available (e.g., --all mode)
+    pipeline = cli_decorators.get_pipeline_from_context()
+    all_stages = cli_helpers.get_all_stages() if pipeline is not None else None
+
     targets_list = _get_targets_list(targets)
 
     if targets_list:
-        local_hashes = transfer.get_target_hashes(targets_list, state_dir, include_deps=False)
+        local_hashes = transfer.get_target_hashes(
+            targets_list, state_dir, include_deps=False, all_stages=all_stages
+        )
     else:
         local_hashes = transfer.get_local_cache_hashes(cache_dir)
 
@@ -83,6 +89,8 @@ def push(
             click.echo(f"Would push {len(local_hashes)} file(s) to '{resolved_name}'")
         return
 
+    # Remote hash tracking is project-level (not per-stage), so use the
+    # project-level StateDB regardless of --all mode.
     with state.StateDB(config.get_state_db_path()) as state_db:
         result = transfer.push(
             cache_dir,
@@ -93,6 +101,7 @@ def push(
             targets_list,
             jobs,
             None if quiet else cli_helpers.make_progress_callback("Uploaded"),
+            all_stages=all_stages,
         )
 
     if not quiet:
@@ -109,7 +118,7 @@ def push(
         raise SystemExit(1)
 
 
-@cli_decorators.pivot_command()
+@cli_decorators.pivot_command(allow_all=True)
 @click.argument("targets", nargs=-1, shell_complete=completion.complete_targets)
 @click.option("-r", "--remote", "remote_name", help="Remote name (uses default if not specified)")
 @click.option("--dry-run", "-n", is_flag=True, help="Show what would be fetched")
@@ -141,11 +150,17 @@ def fetch(
     state_dir = config.get_state_dir()
     s3_remote, resolved_name = transfer.create_remote_from_name(remote_name)
 
+    # Per-stage state_dir lookup when pipeline is available (e.g., --all mode)
+    pipeline = cli_decorators.get_pipeline_from_context()
+    all_stages = cli_helpers.get_all_stages() if pipeline is not None else None
+
     targets_list = _get_targets_list(targets)
 
     if dry_run:
         if targets_list:
-            needed = transfer.get_target_hashes(targets_list, state_dir, include_deps=True)
+            needed = transfer.get_target_hashes(
+                targets_list, state_dir, include_deps=True, all_stages=all_stages
+            )
         else:
             needed = asyncio.run(s3_remote.list_hashes())
 
@@ -165,6 +180,7 @@ def fetch(
             targets_list,
             jobs,
             None if quiet else cli_helpers.make_progress_callback("Downloaded"),
+            all_stages=all_stages,
         )
 
     if not quiet:
@@ -180,7 +196,7 @@ def fetch(
         raise SystemExit(1)
 
 
-@cli_decorators.pivot_command()
+@cli_decorators.pivot_command(allow_all=True)
 @click.argument("targets", nargs=-1, shell_complete=completion.complete_targets)
 @click.option("-r", "--remote", "remote_name", help="Remote name (uses default if not specified)")
 @click.option("--dry-run", "-n", is_flag=True, help="Show what would be pulled")
@@ -229,12 +245,18 @@ def pull(
     state_dir = config.get_state_dir()
     s3_remote, resolved_name = transfer.create_remote_from_name(remote_name)
 
+    # Per-stage state_dir lookup when pipeline is available (e.g., --all mode)
+    pipeline = cli_decorators.get_pipeline_from_context()
+    all_stages = cli_helpers.get_all_stages() if pipeline is not None else None
+
     targets_list = _get_targets_list(targets)
 
     # Dry-run: show what would be fetched, don't proceed to checkout
     if dry_run:
         if targets_list:
-            needed = transfer.get_target_hashes(targets_list, state_dir, include_deps=True)
+            needed = transfer.get_target_hashes(
+                targets_list, state_dir, include_deps=True, all_stages=all_stages
+            )
         else:
             needed = asyncio.run(s3_remote.list_hashes())
 
@@ -255,6 +277,7 @@ def pull(
             targets_list,
             jobs,
             None if quiet else cli_helpers.make_progress_callback("Downloaded"),
+            all_stages=all_stages,
         )
 
     if not quiet:

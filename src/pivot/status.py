@@ -101,7 +101,6 @@ def _discover_tracked_files(
 
 def _get_explanations_in_parallel(
     execution_order: list[str],
-    state_dir: pathlib.Path,
     overrides: parameters.ParamsOverrides | None,
     all_stages: dict[str, RegistryStageInfo],
     force: bool = False,
@@ -110,6 +109,7 @@ def _get_explanations_in_parallel(
     tracked_trie: pygtrie.Trie[str] | None = None,
 ) -> dict[str, StageExplanation]:
     """Compute stage explanations in parallel (I/O-bound: lock file reads, hashing)."""
+    default_state_dir = config.get_state_dir()
     max_workers = min(8, len(execution_order))
     explanations_by_name = dict[str, StageExplanation]()
 
@@ -118,6 +118,7 @@ def _get_explanations_in_parallel(
         for stage_name in execution_order:
             stage_info = all_stages[stage_name]
             fingerprint = cast("dict[str, str]", stage_info["fingerprint"])
+            stage_state_dir = registry.get_stage_state_dir(stage_info, default_state_dir)
             future = pool.submit(
                 explain.get_stage_explanation,
                 stage_name,
@@ -126,7 +127,7 @@ def _get_explanations_in_parallel(
                 stage_info["outs_paths"],
                 stage_info["params"],
                 overrides,
-                state_dir,
+                stage_state_dir,
                 force=force,
                 allow_missing=allow_missing,
                 tracked_files=tracked_files,
@@ -194,12 +195,10 @@ def get_pipeline_explanations(
 
         for stage_name in execution_order:
             stage_registry.ensure_fingerprint(stage_name)
-        state_dir = config.get_state_dir()
         overrides = parameters.load_params_yaml()
 
         explanations_by_name = _get_explanations_in_parallel(
             execution_order,
-            state_dir,
             overrides,
             all_stages=all_stages,
             force=force,
@@ -292,12 +291,10 @@ def get_pipeline_status(
 
         for stage_name in execution_order:
             stage_registry.ensure_fingerprint(stage_name)
-        state_dir = config.get_state_dir()
         overrides = parameters.load_params_yaml()
 
         explanations_by_name = _get_explanations_in_parallel(
             execution_order,
-            state_dir,
             overrides,
             all_stages=all_stages,
             allow_missing=allow_missing,
@@ -322,7 +319,7 @@ def _explanations_to_status(explanations: list[StageExplanation]) -> list[Pipeli
             name=exp["stage_name"],
             status=PipelineStatus.STALE if exp["will_run"] else PipelineStatus.CACHED,
             reason=exp["reason"],
-            upstream_stale=exp.get("upstream_stale", []),
+            upstream_stale=exp["upstream_stale"],
         )
         for exp in explanations
     ]

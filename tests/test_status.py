@@ -6,12 +6,12 @@ from typing import TYPE_CHECKING, Annotated, TypedDict
 import pytest
 
 from helpers import register_test_stage
-from pivot import exceptions, executor, loaders, outputs, status
+from pivot import exceptions, executor, explain, loaders, outputs, status
 from pivot.remote import config as remote_config
 from pivot.remote import sync as transfer
 from pivot.storage import cache, track
 from pivot.storage import state as state_mod
-from pivot.types import RemoteStatus
+from pivot.types import RemoteStatus, StageExplanation
 
 if TYPE_CHECKING:
     from pytest_mock import MockerFixture
@@ -159,6 +159,58 @@ def test_pipeline_status_specific_stages(
 
     assert len(results) == 1
     assert results[0]["name"] == "stage_a"
+
+
+def test_pipeline_status_uses_per_stage_state_dir(
+    set_project_root: pathlib.Path,
+    test_pipeline: pipeline_mod.Pipeline,
+    mocker: MockerFixture,
+) -> None:
+    """get_pipeline_status passes each stage's state_dir, not the global one."""
+    (set_project_root / ".git").mkdir(exist_ok=True)
+    (set_project_root / "input.txt").write_text("data")
+
+    register_test_stage(_helper_stage_a, name="stage_a")
+
+    all_stages = test_pipeline.snapshot()
+
+    # Override stage_a's state_dir to a custom path
+    custom_state_dir = set_project_root / "custom" / ".pivot"
+    all_stages["stage_a"]["state_dir"] = custom_state_dir
+
+    # Mock get_stage_explanation and capture calls via autospec (binds positional
+    # args to parameter names, so the assertion doesn't break if the signature
+    # is reordered or extended)
+    mock_explain = mocker.patch.object(
+        explain,
+        "get_stage_explanation",
+        autospec=True,
+        return_value=StageExplanation(
+            stage_name="stage_a",
+            will_run=True,
+            is_forced=False,
+            reason="mocked",
+            code_changes=[],
+            param_changes=[],
+            dep_changes=[],
+            upstream_stale=[],
+        ),
+    )
+
+    status.get_pipeline_status(
+        None,
+        single_stage=False,
+        all_stages=all_stages,
+        stage_registry=test_pipeline._registry,
+    )
+
+    mock_explain.assert_called_once()
+    call_kwargs = mock_explain.call_args
+    # With autospec, positional args are bound to parameter names
+    assert call_kwargs.kwargs.get("state_dir") == custom_state_dir or (
+        # Fallback: state_dir passed positionally (7th arg, index 6)
+        len(call_kwargs.args) > 6 and call_kwargs.args[6] == custom_state_dir
+    ), f"state_dir not set to custom path; call_args={call_kwargs}"
 
 
 # =============================================================================

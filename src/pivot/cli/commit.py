@@ -7,7 +7,7 @@ from pivot.cli import helpers as cli_helpers
 from pivot.executor import commit
 
 
-@cli_decorators.pivot_command("commit")
+@cli_decorators.pivot_command("commit", allow_all=True)
 @click.argument("stages", nargs=-1)
 @click.pass_context
 def commit_command(ctx: click.Context, stages: tuple[str, ...]) -> None:

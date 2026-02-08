@@ -6,7 +6,7 @@ import os
 import pathlib
 from typing import TYPE_CHECKING
 
-from pivot import config, exceptions, metrics, project
+from pivot import config, exceptions, metrics, project, registry
 from pivot.remote import config as remote_config
 from pivot.remote import storage as remote_mod
 from pivot.storage import cache, lock, track
@@ -15,6 +15,7 @@ from pivot.types import DirHash, FileHash, HashInfo, RemoteStatus, TransferSumma
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from pivot.registry import RegistryStageInfo
     from pivot.storage import state as state_mod
 
 logger = logging.getLogger(__name__)
@@ -35,12 +36,10 @@ def get_local_cache_hashes(cache_dir: pathlib.Path) -> set[str]:
     hashes = set[str]()
     with os.scandir(files_dir) as prefix_entries:
         for prefix_entry in prefix_entries:
-            # DirEntry.is_dir() uses cached stat from scandir
             if not prefix_entry.is_dir() or len(prefix_entry.name) != 2:
                 continue
             with os.scandir(prefix_entry.path) as hash_entries:
                 for hash_entry in hash_entries:
-                    # DirEntry.is_file() uses cached stat from scandir
                     if hash_entry.is_file():
                         full_hash = prefix_entry.name + hash_entry.name
                         if len(full_hash) == cache.XXHASH64_HEX_LENGTH:
@@ -50,11 +49,20 @@ def get_local_cache_hashes(cache_dir: pathlib.Path) -> set[str]:
     return hashes
 
 
+def _extract_file_hashes_from_hash_info(hash_info: HashInfo) -> set[str]:
+    """Extract hashes that correspond to cached file blobs only.
+
+    For directories, returns only manifest entry hashes (not the tree hash).
+    """
+    if is_dir_hash(hash_info):
+        return {entry["hash"] for entry in hash_info["manifest"]}
+    return {hash_info["hash"]}
+
+
 def get_stage_output_hashes(state_dir: pathlib.Path, stage_names: list[str]) -> set[str]:
     """Extract output hashes from lock files for specific stages.
 
-    Only includes hashes for outputs with cache=True (skips Metric and other
-    non-cached outputs that are git-tracked and shouldn't be pushed to remote).
+    Only includes hashes for outputs with cache=True.
     """
     hashes = set[str]()
     from pivot.cli import helpers as cli_helpers
@@ -92,36 +100,37 @@ def get_stage_dep_hashes(state_dir: pathlib.Path, stage_names: list[str]) -> set
     return hashes
 
 
-def _extract_file_hashes_from_hash_info(output_hash: HashInfo) -> set[str]:
-    """Extract file-only hashes from a HashInfo, excluding directory tree hashes.
-
-    For FileHash: returns {hash}.
-    For DirHash: returns only manifest entry hashes, NOT the top-level tree hash.
-    The tree hash identifies directory structure, not a cached file.
-    """
-    if is_dir_hash(output_hash):
-        return {entry["hash"] for entry in output_hash["manifest"]}
-    return {output_hash["hash"]}
-
-
-def _get_file_hash_from_stages(rel_path: str, state_dir: pathlib.Path) -> HashInfo | None:
-    """Look up a file's hash from stage lock files.
-
-    Only returns hashes for outputs with cache=True (skips non-cached outputs).
-    Skips stale lock files for stages that no longer exist in the registry.
-    """
-    stages_dir = lock.get_stages_dir(state_dir)
-    if not stages_dir.exists():
+def _get_file_hash_from_stages(
+    abs_path: str,
+    state_dir: pathlib.Path,
+    all_stages: dict[str, RegistryStageInfo] | None = None,
+) -> HashInfo | None:
+    """Look up a file's hash from stage lock files."""
+    if all_stages is not None:
+        for stage_name, stage_info in all_stages.items():
+            stage_state_dir = registry.get_stage_state_dir(stage_info, state_dir)
+            stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(stage_state_dir))
+            lock_data = stage_lock.read()
+            if lock_data is None:
+                continue
+            non_cached_paths = {str(out.path) for out in stage_info["outs"] if not out.cache}
+            for out_path, out_hash in lock_data["output_hashes"].items():
+                if out_path == abs_path and out_path not in non_cached_paths:
+                    return out_hash
         return None
 
     from pivot.cli import helpers as cli_helpers
 
-    for lock_file in stages_dir.glob("*.lock"):
-        stage_name = lock_file.stem
+    stages_dir = lock.get_stages_dir(state_dir)
+    if not stages_dir.exists():
+        return None
+
+    for lock_file in stages_dir.rglob("*.lock"):
+        stage_name = lock_file.relative_to(stages_dir).with_suffix("").as_posix()
         try:
             stage_info = cli_helpers.get_stage(stage_name)
         except KeyError:
-            continue  # Stale lock file for deleted stage
+            continue
         non_cached_paths = {str(out.path) for out in stage_info["outs"] if not out.cache}
 
         stage_lock = lock.StageLock(stage_name, stages_dir)
@@ -130,7 +139,7 @@ def _get_file_hash_from_stages(rel_path: str, state_dir: pathlib.Path) -> HashIn
             continue
 
         for out_path, out_hash in lock_data["output_hashes"].items():
-            if out_path == rel_path and out_path not in non_cached_paths:
+            if out_path == abs_path and out_path not in non_cached_paths:
                 return out_hash
 
     return None
@@ -152,40 +161,37 @@ def _get_file_hash_from_pvt(rel_path: str, proj_root: pathlib.Path) -> HashInfo 
 
 
 def get_target_hashes(
-    targets: list[str], state_dir: pathlib.Path, include_deps: bool = False
+    targets: list[str],
+    state_dir: pathlib.Path,
+    include_deps: bool = False,
+    all_stages: dict[str, RegistryStageInfo] | None = None,
 ) -> set[str]:
-    """Resolve targets (stage names or file paths) to cache hashes.
-
-    Args:
-        targets: List of stage names or file paths
-        state_dir: State directory path (.pivot)
-        include_deps: If True, also include dependency hashes for stages
-
-    Returns:
-        Set of content hashes for all resolved targets
-    """
+    """Resolve targets (stage names or file paths) to cache hashes."""
     _t = metrics.start()
     proj_root = project.get_project_root()
     hashes = set[str]()
     unresolved = list[str]()
-    from pivot.cli import helpers as cli_helpers
 
     for target in targets:
-        # Try as stage name first (no path separators)
-        if "/" not in target and "\\" not in target:
-            try:
-                stage_lock = lock.StageLock(target, lock.get_stages_dir(state_dir))
-            except ValueError:
-                # Target contains characters invalid for stage names (spaces, etc.)
-                # Fall through to file path resolution below
-                pass
+        is_known_stage = all_stages is not None and target in all_stages
+        looks_like_stage = "/" not in target and "\\" not in target
+        if is_known_stage or looks_like_stage:
+            if all_stages is not None and target in all_stages:
+                stage_info = all_stages[target]
+                target_state_dir = registry.get_stage_state_dir(stage_info, state_dir)
+                non_cached_paths = {str(out.path) for out in stage_info["outs"] if not out.cache}
             else:
+                target_state_dir = state_dir
+                non_cached_paths = set[str]()
+
+            try:
+                stage_lock = lock.StageLock(target, lock.get_stages_dir(target_state_dir))
+            except ValueError:
+                stage_lock = None
+
+            if stage_lock is not None:
                 lock_data = stage_lock.read()
                 if lock_data is not None:
-                    stage_info = cli_helpers.get_stage(target)
-                    non_cached_paths = {
-                        str(out.path) for out in stage_info["outs"] if not out.cache
-                    }
                     for out_path, out_hash in lock_data["output_hashes"].items():
                         if out_path not in non_cached_paths:
                             hashes |= _extract_file_hashes_from_hash_info(out_hash)
@@ -194,16 +200,14 @@ def get_target_hashes(
                             hashes |= _extract_file_hashes_from_hash_info(dep_hash)
                     continue
 
-        # Try as file path
-        rel_path = project.to_relative_path(project.normalize_path(target), proj_root)
+        abs_path = str(project.normalize_path(target))
+        rel_path = project.to_relative_path(abs_path, proj_root)
 
-        # Check stage outputs
-        out_hash = _get_file_hash_from_stages(rel_path, state_dir)
+        out_hash = _get_file_hash_from_stages(abs_path, state_dir, all_stages)
         if out_hash is not None:
             hashes |= _extract_file_hashes_from_hash_info(out_hash)
             continue
 
-        # Check .pvt tracked files
         pvt_hash = _get_file_hash_from_pvt(rel_path, proj_root)
         if pvt_hash is not None:
             hashes |= _extract_file_hashes_from_hash_info(pvt_hash)
@@ -257,13 +261,16 @@ async def _push_async(
     targets: list[str] | None = None,
     jobs: int | None = None,
     callback: Callable[[int], None] | None = None,
+    all_stages: dict[str, RegistryStageInfo] | None = None,
 ) -> TransferSummary:
     """Push cache files to remote (async implementation)."""
     _t = metrics.start()
     jobs = jobs if jobs is not None else config.get_remote_jobs()
 
     if targets:
-        local_hashes = get_target_hashes(targets, state_dir, include_deps=False)
+        local_hashes = get_target_hashes(
+            targets, state_dir, include_deps=False, all_stages=all_stages
+        )
     else:
         local_hashes = get_local_cache_hashes(cache_dir)
 
@@ -295,7 +302,6 @@ async def _push_async(
     failed = [r for r in results if not r["success"]]
 
     state_db.remote_hashes_add(remote_name, [r["hash"] for r in transferred])
-
     errors = [r["error"] for r in failed if "error" in r]
 
     metrics.end("sync.push_async", _t)
@@ -316,10 +322,21 @@ def push(
     targets: list[str] | None = None,
     jobs: int | None = None,
     callback: Callable[[int], None] | None = None,
+    all_stages: dict[str, RegistryStageInfo] | None = None,
 ) -> TransferSummary:
     """Push cache files to remote storage."""
     return asyncio.run(
-        _push_async(cache_dir, state_dir, remote, state_db, remote_name, targets, jobs, callback)
+        _push_async(
+            cache_dir,
+            state_dir,
+            remote,
+            state_db,
+            remote_name,
+            targets,
+            jobs,
+            callback,
+            all_stages,
+        )
     )
 
 
@@ -332,13 +349,16 @@ async def _pull_async(
     targets: list[str] | None = None,
     jobs: int | None = None,
     callback: Callable[[int], None] | None = None,
+    all_stages: dict[str, RegistryStageInfo] | None = None,
 ) -> TransferSummary:
     """Pull cache files from remote (async implementation)."""
     _t = metrics.start()
     jobs = jobs if jobs is not None else config.get_remote_jobs()
 
     if targets:
-        needed_hashes = get_target_hashes(targets, state_dir, include_deps=True)
+        needed_hashes = get_target_hashes(
+            targets, state_dir, include_deps=True, all_stages=all_stages
+        )
     else:
         needed_hashes = await remote.list_hashes()
 
@@ -365,7 +385,6 @@ async def _pull_async(
     failed = [r for r in results if not r["success"]]
 
     state_db.remote_hashes_add(remote_name, [r["hash"] for r in transferred])
-
     errors = [r["error"] for r in failed if "error" in r]
 
     metrics.end("sync.pull_async", _t)
@@ -386,10 +405,21 @@ def pull(
     targets: list[str] | None = None,
     jobs: int | None = None,
     callback: Callable[[int], None] | None = None,
+    all_stages: dict[str, RegistryStageInfo] | None = None,
 ) -> TransferSummary:
     """Pull cache files from remote storage."""
     return asyncio.run(
-        _pull_async(cache_dir, state_dir, remote, state_db, remote_name, targets, jobs, callback)
+        _pull_async(
+            cache_dir,
+            state_dir,
+            remote,
+            state_db,
+            remote_name,
+            targets,
+            jobs,
+            callback,
+            all_stages,
+        )
     )
 
 

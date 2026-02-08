@@ -815,6 +815,7 @@ def test_input_panel_load_uses_provider(mocker: MockerFixture) -> None:
         "deps_paths": [],
         "outs_paths": [],
         "params": None,
+        "state_dir": None,
     }
     mock_provider.ensure_fingerprint.return_value = {"func": "abc"}
 
@@ -853,6 +854,7 @@ def test_output_panel_load_uses_provider(mocker: MockerFixture) -> None:
         "outs_paths": [],
         "outs": [],
         "params": None,
+        "state_dir": None,
     }
 
     panel = diff_panels.OutputDiffPanel(stage_data_provider=mock_provider)
