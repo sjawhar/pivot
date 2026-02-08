@@ -2,6 +2,7 @@
 
 import ast
 import importlib.util
+import json
 import math
 import os
 import pathlib
@@ -12,6 +13,7 @@ import networkx as nx
 import pytest
 
 from pivot import ast_utils, fingerprint
+from pivot.storage import state as state_mod
 
 # --- Module-level helper functions for testing ---
 # These must be at module level to properly capture imports in their closures
@@ -737,8 +739,9 @@ def _collection_helper_b(x):
     return x + 1
 
 
-def test_fingerprint_nonlocal_list_with_callable():
+def test_fingerprint_nonlocal_list_with_callable(monkeypatch: pytest.MonkeyPatch):
     """Should capture callable functions within nonlocal list."""
+    monkeypatch.setenv("PIVOT_UNSAFE_FINGERPRINTING", "1")
 
     def outer():
         transforms = [_collection_helper_a, _collection_helper_b]
@@ -759,8 +762,9 @@ def test_fingerprint_nonlocal_list_with_callable():
     assert "func:transforms[1]" in fp
 
 
-def test_fingerprint_nonlocal_dict_with_callable():
+def test_fingerprint_nonlocal_dict_with_callable(monkeypatch: pytest.MonkeyPatch):
     """Should capture callable functions within nonlocal dict."""
+    monkeypatch.setenv("PIVOT_UNSAFE_FINGERPRINTING", "1")
 
     def outer():
         handlers = {
@@ -803,8 +807,11 @@ def test_fingerprint_nonlocal_tuple_with_callable():
     assert "func:pipeline[1]" in fp
 
 
-def test_fingerprint_nonlocal_collection_callable_change_detected():
+def test_fingerprint_nonlocal_collection_callable_change_detected(
+    monkeypatch: pytest.MonkeyPatch,
+):
     """Changing callable in collection should change fingerprint."""
+    monkeypatch.setenv("PIVOT_UNSAFE_FINGERPRINTING", "1")
 
     def make_func(transform):
         transforms = [transform]
@@ -1316,7 +1323,6 @@ def test_code_manifest_sorted_in_lock_file():
         params={},
         dep_hashes={},
         output_hashes={},
-        dep_generations={},
     )
 
     storage_data = lock._convert_to_storage_format(lock_data)
@@ -2509,6 +2515,203 @@ def test_try_manifest_cache_hit_path_traversal_blocked(tmp_path, monkeypatch):
         result = fingerprint._try_manifest_cache_hit("traversal_dotdot")
         assert result is None, "Path traversal with .. should be rejected"
     finally:
+        if fingerprint._state_db is not None:
+            fingerprint._state_db.close()
+        fingerprint._state_db = None
+        fingerprint._state_db_init_attempted = False
+
+
+def test_manifest_cache_flush_persists_to_statedb(tmp_path, monkeypatch):
+    """Manifest cache flush writes pending manifests to StateDB.
+
+    Verifies that:
+    1. get_stage_fingerprint_cached() queues manifest writes
+    2. flush_manifest_cache() writes to StateDB
+    3. Manifest can be retrieved from StateDB after flush
+    """
+    from pivot.storage import state
+
+    # Set up isolated state directory
+    state_dir = tmp_path / ".pivot"
+    state_dir.mkdir()
+    db_path = state_dir / "state.db"
+
+    # Create initial StateDB
+    with state.StateDB(db_path):
+        pass
+
+    # Patch project root and state db path
+    monkeypatch.setattr("pivot.project._project_root_cache", tmp_path)
+    monkeypatch.setattr("pivot.config.io.get_state_db_path", lambda: db_path)
+
+    # Reset fingerprint module state
+    fingerprint._pending_manifest_writes.clear()
+    fingerprint._state_db = None
+    fingerprint._state_db_init_attempted = False
+
+    # Create test module file
+    test_module = tmp_path / "test_stage.py"
+    test_module.write_text("""
+def test_stage():
+    return 42
+""")
+
+    # Import the function
+    spec = importlib.util.spec_from_file_location("test_stage", test_module)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["test_stage"] = module
+    try:
+        spec.loader.exec_module(module)
+        func = module.test_stage
+
+        # Step 1: Call get_stage_fingerprint_cached() - should queue manifest
+        manifest = fingerprint.get_stage_fingerprint_cached("test_stage", func)
+        assert isinstance(manifest, dict)
+        assert "self:test_stage" in manifest
+        assert len(fingerprint._pending_manifest_writes) > 0, "Should queue manifest writes"
+
+        # Step 2: Flush to StateDB
+        fingerprint.flush_manifest_cache()
+        assert len(fingerprint._pending_manifest_writes) == 0, (
+            "Pending writes should be empty after flush"
+        )
+
+        # Step 3: Verify manifest is in StateDB
+        with state.StateDB(db_path, readonly=True) as db:
+            key = fingerprint._make_manifest_cache_key("test_stage")
+            raw = db.get_raw(key)
+            assert raw is not None, "Manifest should be persisted in StateDB"
+            data = json.loads(raw)
+            assert "m" in data, "Cached data should have manifest key"
+            assert "s" in data, "Cached data should have sources key"
+            cached_manifest = data["m"]
+            assert "self:test_stage" in cached_manifest
+    finally:
+        sys.modules.pop("test_stage", None)
+        # Clean up fingerprint module state
+        if fingerprint._state_db is not None:
+            fingerprint._state_db.close()
+        fingerprint._state_db = None
+        fingerprint._state_db_init_attempted = False
+
+
+def test_invalidate_manifests_for_paths_selective(tmp_path, monkeypatch):
+    """Invalidate only manifests referencing changed source files."""
+    state_dir = tmp_path / ".pivot"
+    state_dir.mkdir()
+    db_path = state_dir / "state.db"
+    with state_mod.StateDB(db_path):
+        pass
+
+    monkeypatch.setattr("pivot.project._project_root_cache", tmp_path)
+    monkeypatch.setattr("pivot.config.io.get_state_db_path", lambda: db_path)
+
+    key_a = fingerprint._make_manifest_cache_key("stage_a")
+    key_b = fingerprint._make_manifest_cache_key("stage_b")
+    key_c = fingerprint._make_manifest_cache_key("stage_c")
+
+    with state_mod.StateDB(db_path) as db:
+        db.put_raw(
+            key_a,
+            json.dumps(
+                {"m": {"self:stage_a": "hash"}, "s": {"a.py": [1, 2, 3]}},
+                separators=(",", ":"),
+            ).encode(),
+        )
+        db.put_raw(
+            key_b,
+            json.dumps(
+                {"m": {"self:stage_b": "hash"}, "s": {"b.py": [1, 2, 3]}},
+                separators=(",", ":"),
+            ).encode(),
+        )
+        db.put_raw(
+            key_c,
+            json.dumps(
+                {"m": {"self:stage_c": "hash"}, "s": {"c.py": [1, 2, 3]}},
+                separators=(",", ":"),
+            ).encode(),
+        )
+
+    fingerprint.invalidate_manifests_for_paths([tmp_path / "b.py"])
+
+    with state_mod.StateDB(db_path, readonly=True) as db:
+        assert db.get_raw(key_a) is not None, "Unchanged manifest should remain"
+        assert db.get_raw(key_b) is None, "Changed manifest should be removed"
+        assert db.get_raw(key_c) is not None, "Unchanged manifest should remain"
+
+
+def test_invalidate_manifests_for_paths_cold_start(tmp_path, monkeypatch):
+    """Invalidation is a no-op when no cached manifests exist."""
+    state_dir = tmp_path / ".pivot"
+    state_dir.mkdir()
+    db_path = state_dir / "state.db"
+    with state_mod.StateDB(db_path):
+        pass
+
+    monkeypatch.setattr("pivot.project._project_root_cache", tmp_path)
+    monkeypatch.setattr("pivot.config.io.get_state_db_path", lambda: db_path)
+
+    fingerprint.invalidate_manifests_for_paths([tmp_path / "missing.py"])
+
+    with state_mod.StateDB(db_path, readonly=True) as db:
+        assert list(db.iter_prefix(b"sm:")) == [], "No manifest entries should exist"
+
+
+def test_invalidate_manifests_for_paths_recomputes_affected_stage(tmp_path, monkeypatch):
+    """Invalidation forces a cache miss and re-cache for affected stages."""
+    state_dir = tmp_path / ".pivot"
+    state_dir.mkdir()
+    db_path = state_dir / "state.db"
+    with state_mod.StateDB(db_path):
+        pass
+
+    monkeypatch.setattr("pivot.project._project_root_cache", tmp_path)
+    monkeypatch.setattr("pivot.config.io.get_state_db_path", lambda: db_path)
+
+    fingerprint._pending_manifest_writes.clear()
+    fingerprint._hash_function_ast_cache.clear()
+    fingerprint._state_db = None
+    fingerprint._state_db_init_attempted = False
+
+    test_module = tmp_path / "invalidate_stage.py"
+    test_module.write_text("""
+def invalidate_stage():
+    return 42
+""")
+
+    spec = importlib.util.spec_from_file_location("invalidate_stage", test_module)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["invalidate_stage"] = module
+    try:
+        spec.loader.exec_module(module)
+
+        key = fingerprint._make_manifest_cache_key("invalidate_stage")
+        fingerprint.get_stage_fingerprint_cached("invalidate_stage", module.invalidate_stage)
+        fingerprint.flush_manifest_cache()
+
+        with state_mod.StateDB(db_path, readonly=True) as db:
+            assert db.get_raw(key) is not None, "Manifest should be cached before invalidation"
+
+        fingerprint.invalidate_manifests_for_paths([test_module])
+
+        with state_mod.StateDB(db_path, readonly=True) as db:
+            assert db.get_raw(key) is None, "Manifest should be removed after invalidation"
+
+        if fingerprint._state_db is not None:
+            fingerprint._state_db.close()
+        fingerprint._state_db = None
+        fingerprint._state_db_init_attempted = False
+
+        fingerprint.get_stage_fingerprint_cached("invalidate_stage", module.invalidate_stage)
+        fingerprint.flush_manifest_cache()
+
+        with state_mod.StateDB(db_path, readonly=True) as db:
+            assert db.get_raw(key) is not None, "Manifest should be re-cached after recompute"
+    finally:
+        sys.modules.pop("invalidate_stage", None)
         if fingerprint._state_db is not None:
             fingerprint._state_db.close()
         fingerprint._state_db = None

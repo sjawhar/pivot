@@ -189,7 +189,7 @@ def test_repro_dry_run_allow_missing_uses_pvt_hash(
     executor.run()
 
     # Track input
-    input_hash = cache.hash_file(tmp_path / "input.txt")
+    input_hash, _ = cache.hash_file(tmp_path / "input.txt")
     pvt_data = track.PvtData(path="input.txt", hash=input_hash, size=4)
     track.write_pvt_file(tmp_path / "input.txt.pvt", pvt_data)
 
@@ -240,7 +240,7 @@ def test_repro_explain_allow_missing_uses_pvt_hash(
     executor.run()
 
     # Track input
-    input_hash = cache.hash_file(tmp_path / "input.txt")
+    input_hash, _ = cache.hash_file(tmp_path / "input.txt")
     pvt_data = track.PvtData(path="input.txt", hash=input_hash, size=4)
     track.write_pvt_file(tmp_path / "input.txt.pvt", pvt_data)
 

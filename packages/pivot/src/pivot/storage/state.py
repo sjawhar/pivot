@@ -361,6 +361,32 @@ class StateDB:
         except lmdb.MapFullError as e:
             raise DatabaseFullError(_DB_FULL_MSG) from e
 
+    def delete_raw_many(self, keys: list[bytes]) -> None:
+        """Batch delete raw key-value pairs atomically."""
+        self._check_closed()
+        self._check_write_allowed()
+        if not keys:
+            return
+        try:
+            with self._env.begin(write=True) as txn:
+                for key in keys:
+                    txn.delete(key)
+        except lmdb.MapFullError as e:
+            raise DatabaseFullError(_DB_FULL_MSG) from e
+
+    def iter_prefix(self, prefix: bytes) -> list[tuple[bytes, bytes]]:
+        """Return all raw key-value pairs matching a prefix."""
+        self._check_closed()
+        results = list[tuple[bytes, bytes]]()
+        with self._env.begin() as txn:
+            cursor = txn.cursor()
+            if cursor.set_range(prefix):
+                for key, value in cursor:
+                    if not key.startswith(prefix):
+                        break
+                    results.append((bytes(key), bytes(value)))
+        return results
+
     # -------------------------------------------------------------------------
     # Generation tracking for O(1) skip detection
     # -------------------------------------------------------------------------
@@ -704,6 +730,14 @@ class StateDB:
                         f"Output path too long ({len(key)} bytes, max {_MAX_KEY_SIZE}): {path_str}"
                     )
 
+        if "file_hash_entries" in deferred:
+            for path_str, _, _, _, _ in deferred["file_hash_entries"]:
+                key = _make_key_file_hash(pathlib.Path(path_str))
+                if len(key) > _MAX_KEY_SIZE:
+                    raise PathTooLongError(
+                        f"Path too long for state cache ({len(key)} bytes, max {_MAX_KEY_SIZE}): {path_str}"
+                    )
+
         try:
             with self._env.begin(write=True) as txn:
                 # Dependency generations (clear old entries first, like record_dep_generations)
@@ -738,6 +772,13 @@ class StateDB:
                         + f"{stage_name}:{deferred['run_cache_input_hash']}".encode()
                     )
                     txn.put(key, run_history.serialize_to_bytes(deferred["run_cache_entry"]))
+
+                # File hash entries
+                if "file_hash_entries" in deferred:
+                    for path_str, mtime_ns, size, inode, hash_hex in deferred["file_hash_entries"]:
+                        key = _make_key_file_hash(pathlib.Path(path_str))
+                        value = _pack_value(mtime_ns, size, inode, hash_hex)
+                        txn.put(key, value)
 
         except lmdb.MapFullError as e:
             raise DatabaseFullError(_DB_FULL_MSG) from e

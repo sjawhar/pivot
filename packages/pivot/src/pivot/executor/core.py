@@ -405,7 +405,7 @@ def verify_tracked_files(project_root: pathlib.Path, checkout_missing: bool = Fa
             # Try to hash the file - handles race conditions where file disappears
             try:
                 if path.is_file():
-                    current_hash = cache.hash_file(path, state_db)
+                    current_hash, _ = cache.hash_file(path, state_db)
                 elif path.is_dir():
                     current_hash, _ = cache.hash_directory(path, state_db)
                 else:

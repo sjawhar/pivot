@@ -224,7 +224,7 @@ def test_tracked_files_clean(set_project_root: pathlib.Path) -> None:
 
     data_file = set_project_root / "data.txt"
     data_file.write_text("content")
-    file_hash = cache.hash_file(data_file)
+    file_hash, _ = cache.hash_file(data_file)
 
     pvt_data = track.PvtData(path="data.txt", hash=file_hash, size=7)
     track.write_pvt_file(set_project_root / "data.txt.pvt", pvt_data)
@@ -242,7 +242,7 @@ def test_tracked_files_modified(set_project_root: pathlib.Path) -> None:
 
     data_file = set_project_root / "data.txt"
     data_file.write_text("original")
-    old_hash = cache.hash_file(data_file)
+    old_hash, _ = cache.hash_file(data_file)
 
     pvt_data = track.PvtData(path="data.txt", hash=old_hash, size=8)
     track.write_pvt_file(set_project_root / "data.txt.pvt", pvt_data)
@@ -331,12 +331,14 @@ def test_tracked_files_progress_callback(set_project_root: pathlib.Path) -> None
     # Create two tracked files
     file1 = set_project_root / "file1.txt"
     file1.write_text("content1")
-    pvt1 = track.PvtData(path="file1.txt", hash=cache.hash_file(file1), size=8)
+    hash1, _ = cache.hash_file(file1)
+    pvt1 = track.PvtData(path="file1.txt", hash=hash1, size=8)
     track.write_pvt_file(set_project_root / "file1.txt.pvt", pvt1)
 
     file2 = set_project_root / "file2.txt"
     file2.write_text("content2")
-    pvt2 = track.PvtData(path="file2.txt", hash=cache.hash_file(file2), size=8)
+    hash2, _ = cache.hash_file(file2)
+    pvt2 = track.PvtData(path="file2.txt", hash=hash2, size=8)
     track.write_pvt_file(set_project_root / "file2.txt.pvt", pvt2)
 
     progress_calls = list[tuple[int, int]]()

@@ -153,7 +153,6 @@ deps: []
 outs:
   - path: output.csv
     hash: {output_hash["hash"]}
-dep_generations: {{}}
 """
     lock_path = repo_path / ".pivot" / "stages" / "make_csv.lock"
     lock_path.write_text(lock_content)
@@ -205,7 +204,6 @@ deps: []
 outs:
   - path: output.csv
     hash: {output_hash["hash"]}
-dep_generations: {{}}
 """
     (repo_path / ".pivot" / "stages" / "make_csv.lock").write_text(lock_content)
     commit("Initial")
@@ -257,7 +255,6 @@ deps: []
 outs:
   - path: output.csv
     hash: {output_hash["hash"]}
-dep_generations: {{}}
 """
     (repo_path / ".pivot" / "stages" / "make_csv.lock").write_text(lock_content)
     commit("Initial")
@@ -305,7 +302,6 @@ deps: []
 outs:
   - path: output.csv
     hash: {output_hash["hash"]}
-dep_generations: {{}}
 """
     (repo_path / ".pivot" / "stages" / "make_csv.lock").write_text(lock_content)
     commit("Initial")
@@ -352,7 +348,6 @@ deps: []
 outs:
   - path: output.csv
     hash: {output_hash["hash"]}
-dep_generations: {{}}
 """
     (repo_path / ".pivot" / "stages" / "make_csv.lock").write_text(lock_content)
     commit("Initial")
@@ -398,7 +393,6 @@ deps: []
 outs:
   - path: output.csv
     hash: {output_hash["hash"]}
-dep_generations: {{}}
 """
     (repo_path / ".pivot" / "stages" / "make_csv.lock").write_text(lock_content)
     commit("Initial")
@@ -443,7 +437,6 @@ deps: []
 outs:
   - path: result.txt
     hash: {output_hash["hash"]}
-dep_generations: {{}}
 """
     lock_path = repo_path / ".pivot" / "stages" / "make_output.lock"
     lock_path.write_text(lock_content)
@@ -634,7 +627,6 @@ deps: []
 outs:
   - path: output.csv
     hash: {output_hash["hash"]}
-dep_generations: {{}}
 """
     (repo_path / ".pivot" / "stages" / "make_csv.lock").write_text(lock_content)
     commit("Initial CSV")
@@ -683,7 +675,6 @@ deps: []
 outs:
   - path: output.csv
     hash: {output_hash["hash"]}
-dep_generations: {{}}
 """
     (repo_path / ".pivot" / "stages" / "make_csv.lock").write_text(lock_content)
     commit("Initial")
@@ -734,7 +725,6 @@ deps: []
 outs:
   - path: output.csv
     hash: {output_hash["hash"]}
-dep_generations: {{}}
 """
     (repo_path / ".pivot" / "stages" / "make_csv.lock").write_text(lock_content)
     commit("Large CSV")
@@ -783,7 +773,6 @@ deps: []
 outs:
   - path: output.csv
     hash: {output_hash["hash"]}
-dep_generations: {{}}
 """
     (repo_path / ".pivot" / "stages" / "make_csv.lock").write_text(lock_content)
     commit("Empty CSV")

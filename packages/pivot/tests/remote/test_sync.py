@@ -69,7 +69,6 @@ def _write_lock_with_dir_output(
         params={},
         dep_hashes={},
         output_hashes={"output_dir": dir_hash},
-        dep_generations={},
     )
     stage_lock = lock.StageLock(stage_name, stages_dir)
     stage_lock.write(lock_data)
@@ -107,7 +106,6 @@ def test_get_stage_dep_hashes_excludes_tree_hash(set_project_root: pathlib.Path)
         params={},
         dep_hashes={str(set_project_root / "input_dir"): dep_hash},
         output_hashes={},
-        dep_generations={},
     )
     stage_lock = lock.StageLock("my_stage", stages_dir)
     stage_lock.write(lock_data)

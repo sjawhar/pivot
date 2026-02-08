@@ -168,6 +168,97 @@ def test_execute_stage_runs_unchanged_stage(
     assert result2["reason"] == "unchanged"
 
 
+def test_execute_stage_generation_skip_avoids_hashing(
+    worker_env: pathlib.Path,
+    output_queue: mp.Queue[OutputMessage],
+    tmp_path: pathlib.Path,
+    mocker: MockerFixture,
+) -> None:
+    """Generation skip avoids dependency hashing and reports reason."""
+    dep_path = tmp_path / "input.txt"
+    dep_path.write_text("data")
+    stage_name = "test_stage"
+    fingerprint = {"self:_helper_noop_stage": "fp123"}
+
+    stage_info = _make_stage_info(
+        _helper_noop_stage,
+        tmp_path,
+        fingerprint=fingerprint,
+        deps=["input.txt"],
+    )
+
+    state_dir = tmp_path / ".pivot"
+    with _chdir_and_reset_project_root(tmp_path):
+        with state.StateDB(state_dir / "state.db") as state_db:
+            dep_hash, _ = cache.hash_file(dep_path, state_db)
+            state_db.increment_generation(dep_path)
+            dep_gen = state_db.get_generation(dep_path)
+            assert dep_gen is not None
+            normalized_dep = str(project.normalize_path("input.txt"))
+            state_db.record_dep_generations(stage_name, {normalized_dep: dep_gen})
+
+        lock_data: LockData = {
+            "code_manifest": fingerprint,
+            "params": {},
+            "dep_hashes": {normalized_dep: FileHash(hash=dep_hash)},
+            "output_hashes": {},
+        }
+        stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(state_dir))
+        stage_lock.write(lock_data)
+
+    hash_mock = mocker.patch("pivot.executor.worker.hash_dependencies", autospec=True)
+    result = executor.execute_stage(stage_name, stage_info, worker_env, output_queue)
+
+    hash_mock.assert_not_called()
+    assert result["status"] == "skipped"
+    assert result["reason"] == "unchanged (generation)"
+
+
+def test_execute_stage_hashes_when_generation_missing(
+    worker_env: pathlib.Path,
+    output_queue: mp.Queue[OutputMessage],
+    tmp_path: pathlib.Path,
+    mocker: MockerFixture,
+) -> None:
+    """Missing dependency generation falls back to hashing."""
+    dep_path = tmp_path / "input.txt"
+    dep_path.write_text("data")
+    stage_name = "test_stage"
+    fingerprint = {"self:_helper_noop_stage": "fp123"}
+
+    stage_info = _make_stage_info(
+        _helper_noop_stage,
+        tmp_path,
+        fingerprint=fingerprint,
+        deps=["input.txt"],
+    )
+
+    state_dir = tmp_path / ".pivot"
+    with _chdir_and_reset_project_root(tmp_path):
+        with state.StateDB(state_dir / "state.db") as state_db:
+            dep_hash, _ = cache.hash_file(dep_path, state_db)
+            normalized_dep = str(project.normalize_path("input.txt"))
+            state_db.record_dep_generations(stage_name, {normalized_dep: 1})
+
+        lock_data: LockData = {
+            "code_manifest": fingerprint,
+            "params": {},
+            "dep_hashes": {normalized_dep: FileHash(hash=dep_hash)},
+            "output_hashes": {},
+        }
+        stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(state_dir))
+        stage_lock.write(lock_data)
+
+    hash_mock = mocker.patch(
+        "pivot.executor.worker.hash_dependencies",
+        autospec=True,
+        wraps=worker.hash_dependencies,
+    )
+    _ = executor.execute_stage(stage_name, stage_info, worker_env, output_queue)
+
+    assert hash_mock.called, "Expected dependency hashing when generation is missing"
+
+
 def test_execute_stage_reruns_when_fingerprint_changes(
     worker_env: pathlib.Path, output_queue: mp.Queue[OutputMessage], tmp_path: pathlib.Path
 ) -> None:
@@ -1114,7 +1205,9 @@ def test_hash_dependencies_with_existing_files(
 
     monkeypatch.chdir(tmp_path)
     project._project_root_cache = None
-    hashes, missing, unreadable = executor.hash_dependencies(["file1.txt", "file2.txt"])
+    hashes, missing, unreadable, file_hash_entries = executor.hash_dependencies(
+        ["file1.txt", "file2.txt"]
+    )
 
     assert len(hashes) == 2
     # Keys are now normalized paths (absolute)
@@ -1129,15 +1222,21 @@ def test_hash_dependencies_with_existing_files(
     assert "manifest" not in file_hash, "Files should not have manifest"
     assert len(missing) == 0
     assert len(unreadable) == 0
+    assert len(file_hash_entries) == 2
+    entry_paths = {entry[0] for entry in file_hash_entries}
+    assert entry_paths == {str(tmp_path / "file1.txt"), str(tmp_path / "file2.txt")}
 
 
 def test_hash_dependencies_with_missing_files() -> None:
     """hash_dependencies reports missing files."""
-    hashes, missing, unreadable = executor.hash_dependencies(["missing1.txt", "missing2.txt"])
+    hashes, missing, unreadable, file_hash_entries = executor.hash_dependencies(
+        ["missing1.txt", "missing2.txt"]
+    )
 
     assert len(hashes) == 0
     assert missing == ["missing1.txt", "missing2.txt"]
     assert len(unreadable) == 0
+    assert file_hash_entries == []
 
 
 def test_hash_dependencies_with_directory(
@@ -1151,7 +1250,7 @@ def test_hash_dependencies_with_directory(
 
     monkeypatch.chdir(tmp_path)
     project._project_root_cache = None
-    hashes, missing, unreadable = executor.hash_dependencies(["data_dir"])
+    hashes, missing, unreadable, file_hash_entries = executor.hash_dependencies(["data_dir"])
 
     assert len(hashes) == 1, "Directory should be hashed"
     # Keys are now normalized paths (absolute)
@@ -1167,6 +1266,7 @@ def test_hash_dependencies_with_directory(
     assert manifest[0]["relpath"] == "file.txt"
     assert len(missing) == 0, "No missing dependencies"
     assert len(unreadable) == 0, "No unreadable dependencies"
+    assert file_hash_entries == []
 
 
 def test_hash_file_produces_consistent_hash(tmp_path: pathlib.Path) -> None:
@@ -1174,8 +1274,8 @@ def test_hash_file_produces_consistent_hash(tmp_path: pathlib.Path) -> None:
     file_path = tmp_path / "test.txt"
     file_path.write_text("test content")
 
-    hash1 = cache.hash_file(file_path)
-    hash2 = cache.hash_file(file_path)
+    hash1, _ = cache.hash_file(file_path)
+    hash2, _ = cache.hash_file(file_path)
 
     assert hash1 == hash2
     assert len(hash1) == 16  # xxhash64 hexdigest
@@ -1188,8 +1288,8 @@ def test_hash_file_different_for_different_content(tmp_path: pathlib.Path) -> No
     file1.write_text("content1")
     file2.write_text("content2")
 
-    hash1 = cache.hash_file(file1)
-    hash2 = cache.hash_file(file2)
+    hash1, _ = cache.hash_file(file1)
+    hash2, _ = cache.hash_file(file2)
 
     assert hash1 != hash2
 
@@ -2307,7 +2407,7 @@ def test_file_needs_restore_returns_false_when_matching(tmp_path: pathlib.Path) 
     file_path = tmp_path / "output.txt"
     file_path.write_text("content")
 
-    file_hash = cache.hash_file(file_path)
+    file_hash, _ = cache.hash_file(file_path)
     cached_hash: FileHash = {"hash": file_hash}
 
     assert not worker._file_needs_restore(file_path, cached_hash)
@@ -2327,7 +2427,7 @@ def test_file_needs_restore_returns_true_for_wrong_content(tmp_path: pathlib.Pat
     file_path.write_text("original")
 
     # Get hash of original content
-    original_hash = cache.hash_file(file_path)
+    original_hash, _ = cache.hash_file(file_path)
     cached_hash: FileHash = {"hash": original_hash}
 
     # Modify content
@@ -2344,7 +2444,7 @@ def test_file_needs_restore_returns_true_on_permission_error(
     file_path.write_text("content")
 
     # Get hash before breaking things
-    file_hash = cache.hash_file(file_path)
+    file_hash, _ = cache.hash_file(file_path)
     cached_hash: FileHash = {"hash": file_hash}
 
     # Make hash_file raise OSError
@@ -2361,7 +2461,7 @@ def test_file_needs_restore_handles_empty_file(tmp_path: pathlib.Path) -> None:
     file_path = tmp_path / "empty.txt"
     file_path.write_text("")
 
-    empty_hash = cache.hash_file(file_path)
+    empty_hash, _ = cache.hash_file(file_path)
     cached_hash: FileHash = {"hash": empty_hash}
 
     # Empty file matches
@@ -2379,7 +2479,7 @@ def test_file_needs_restore_uses_state_db(tmp_path: pathlib.Path) -> None:
     db_path = tmp_path / "state.db"
 
     with state.StateDB(db_path) as db:
-        file_hash = cache.hash_file(file_path, db)
+        file_hash, _ = cache.hash_file(file_path, db)
         cached_hash: FileHash = {"hash": file_hash}
 
         # Should work with state_db
@@ -2604,7 +2704,7 @@ def test_restore_outputs_cleans_up_on_partial_failure(
     # Create a temp file and hash it to get a valid hash
     temp_file = tmp_path / "temp_for_hash.txt"
     temp_file.write_text("output1 content")
-    output1_hash = cache.hash_file(temp_file)
+    output1_hash, _ = cache.hash_file(temp_file)
 
     # Create cached file in the expected location
     cached_file = files_cache_dir / output1_hash[:2] / output1_hash[2:]
@@ -2903,7 +3003,6 @@ def test_restore_outputs_from_cache_skips_noncached_outputs(
                 norm_output: cached_hash,
                 norm_metric: FileHash(hash="somehash"),
             },
-            "dep_generations": {},
         }
 
         checkout_modes = [cache.CheckoutMode.COPY]
@@ -2950,7 +3049,6 @@ def test_restore_outputs_from_cache_fails_when_noncached_missing(
             "output_hashes": {
                 norm_metric: FileHash(hash="somehash"),
             },
-            "dep_generations": {},
         }
 
         checkout_modes = [cache.CheckoutMode.COPY]
@@ -2975,7 +3073,7 @@ def test_hash_output_computes_correct_hash_for_file(tmp_path: pathlib.Path) -> N
 
     result = worker.hash_output(test_file)
 
-    expected_hash = cache.hash_file(test_file)
+    expected_hash, _ = cache.hash_file(test_file)
     assert result == FileHash(hash=expected_hash), (
         "FileHash from hash_output should match cache.hash_file"
     )

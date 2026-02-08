@@ -349,7 +349,7 @@ def get_tracked_files_status(
                 if path.is_dir():
                     current_hash, _ = cache.hash_directory(path, state_db)
                 else:
-                    current_hash = cache.hash_file(path, state_db)
+                    current_hash, _ = cache.hash_file(path, state_db)
             except FileNotFoundError:
                 results.append(
                     TrackedFileInfo(

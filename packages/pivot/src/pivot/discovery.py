@@ -128,6 +128,7 @@ def discover_pipeline(
         finally:
             metrics.end("discovery.load_module", _t_module)
             fingerprint.flush_ast_hash_cache()
+            fingerprint.flush_manifest_cache()
     finally:
         metrics.end("discovery.total", _t)
 
@@ -391,6 +392,7 @@ def load_pipeline_from_path(path: pathlib.Path) -> Pipeline | None:
             return None
         finally:
             fingerprint.flush_ast_hash_cache()
+            fingerprint.flush_manifest_cache()
     else:
         logger.debug(f"Unknown pipeline file type: {path}")
         return None

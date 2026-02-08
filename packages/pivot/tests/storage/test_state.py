@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from pivot import run_history
-from pivot.storage import state
+from pivot.storage import cache, state
 
 if TYPE_CHECKING:
     from pivot.types import DeferredWrites
@@ -821,6 +821,32 @@ def test_apply_deferred_writes_skips_output_increment_when_flag_absent(
         assert db.get_dep_generations("stage") == {"/dep.csv": 5}
 
 
+def test_apply_deferred_writes_file_hash_entries(tmp_path: pathlib.Path) -> None:
+    """apply_deferred_writes stores file hash entries."""
+    db_path = tmp_path / "state.db"
+    file_path = tmp_path / "input.txt"
+    file_path.write_text("data")
+    file_stat = file_path.stat()
+    file_hash, _ = cache.hash_file(file_path)
+    deferred: DeferredWrites = {
+        "file_hash_entries": [
+            (
+                str(file_path),
+                file_stat.st_mtime_ns,
+                file_stat.st_size,
+                file_stat.st_ino,
+                file_hash,
+            )
+        ]
+    }
+
+    with state.StateDB(db_path) as db:
+        db.apply_deferred_writes("stage", [], deferred)
+        result = db.get(file_path, file_stat)
+
+    assert result == file_hash
+
+
 def test_apply_deferred_writes_run_cache(tmp_path: pathlib.Path) -> None:
     """apply_deferred_writes writes run cache entry."""
     db_path = tmp_path / "state.db"
@@ -847,6 +873,10 @@ def test_apply_deferred_writes_all_fields(tmp_path: pathlib.Path) -> None:
     """apply_deferred_writes handles all fields atomically."""
     db_path = tmp_path / "state.db"
     output_path = tmp_path / "output.csv"
+    input_path = tmp_path / "input.csv"
+    input_path.write_text("data")
+    input_stat = input_path.stat()
+    input_hash, _ = cache.hash_file(input_path)
     run_cache_entry = run_history.RunCacheEntry(
         run_id="run_456",
         output_hashes=[run_history.OutputHashEntry(path=str(output_path), hash="def456")],
@@ -856,6 +886,15 @@ def test_apply_deferred_writes_all_fields(tmp_path: pathlib.Path) -> None:
         "run_cache_input_hash": "input_abc",
         "run_cache_entry": run_cache_entry,
         "increment_outputs": True,
+        "file_hash_entries": [
+            (
+                str(input_path),
+                input_stat.st_mtime_ns,
+                input_stat.st_size,
+                input_stat.st_ino,
+                input_hash,
+            )
+        ],
     }
 
     with state.StateDB(db_path) as db:
@@ -867,6 +906,7 @@ def test_apply_deferred_writes_all_fields(tmp_path: pathlib.Path) -> None:
         result = db.lookup_run_cache("stage", "input_abc")
         assert result is not None
         assert result["run_id"] == "run_456"
+        assert db.get(input_path, input_stat) == input_hash
 
 
 def test_apply_deferred_writes_empty(tmp_path: pathlib.Path) -> None:

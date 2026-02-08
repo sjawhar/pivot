@@ -220,7 +220,6 @@ def test_compute_output_changes_missing_file_shows_removed(tmp_path: pathlib.Pat
         "params": {},
         "dep_hashes": {},
         "output_hashes": {str(output_file): {"hash": "oldhash123"}},
-        "dep_generations": {},
     }
 
     result = diff_panels.compute_output_changes(lock_data, registry_info)
@@ -236,7 +235,7 @@ def test_compute_output_changes_unchanged(tmp_path: pathlib.Path) -> None:
     output_file = tmp_path / "output.csv"
     output_file.write_text("data")
 
-    actual_hash = cache.hash_file(output_file)
+    actual_hash, _ = cache.hash_file(output_file)
 
     registry_info: RegistryStageInfo = {
         "func": lambda: None,
@@ -261,7 +260,6 @@ def test_compute_output_changes_unchanged(tmp_path: pathlib.Path) -> None:
         "params": {},
         "dep_hashes": {},
         "output_hashes": {str(output_file): {"hash": actual_hash}},
-        "dep_generations": {},
     }
 
     result = diff_panels.compute_output_changes(lock_data, registry_info)

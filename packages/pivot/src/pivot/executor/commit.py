@@ -92,7 +92,7 @@ def commit_stages(
             )
 
             # 3. Hash deps (pass state_db for hash caching)
-            dep_hashes, missing, unreadable = worker.hash_dependencies(
+            dep_hashes, missing, unreadable, _ = worker.hash_dependencies(
                 stage_info["deps_paths"], stage_db
             )
             if missing:
@@ -169,7 +169,6 @@ def commit_stages(
                 params=current_params,
                 dep_hashes=dict(sorted(dep_hashes.items())),
                 output_hashes=dict(sorted(output_hashes.items())),
-                dep_generations={},
             )
             production_lock.write(new_lock_data)
 

@@ -129,6 +129,7 @@ class DeferredWrites(TypedDict, total=False):
     run_cache_input_hash: str
     run_cache_entry: RunCacheEntry
     increment_outputs: bool  # True → increment output generations; False/absent → skip
+    file_hash_entries: list[tuple[str, int, int, int, str]]  # (path, mtime_ns, size, inode, hash)
 
 
 class StageResult(TypedDict):
@@ -249,8 +250,6 @@ class StorageLockData(TypedDict):
     params: dict[str, Any]
     deps: list[DepEntry]
     outs: list[OutEntry]
-    # Always empty in lock files; dep generations are tracked in StateDB
-    dep_generations: dict[str, int]
 
 
 class LockData(TypedDict):
@@ -260,8 +259,6 @@ class LockData(TypedDict):
     params: dict[str, Any]
     dep_hashes: dict[str, HashInfo]
     output_hashes: dict[str, HashInfo]
-    # Always empty in lock files; dep generations are tracked in StateDB
-    dep_generations: dict[str, int]
 
 
 OutputMessage = tuple[str, str, bool] | None

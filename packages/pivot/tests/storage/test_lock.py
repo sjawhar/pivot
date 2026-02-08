@@ -7,7 +7,7 @@ import pytest
 
 from pivot import project
 from pivot.storage import lock
-from pivot.types import DirHash, LockData
+from pivot.types import DirHash, LockData, StorageLockData
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -27,7 +27,6 @@ def test_lock_file_creation(tmp_path: Path) -> None:
             params={},
             dep_hashes={},
             output_hashes={},
-            dep_generations={},
         )
     )
 
@@ -47,7 +46,6 @@ def test_lock_file_read(set_project_root: Path) -> None:
         params={"learning_rate": 0.01},
         dep_hashes=dep_hashes,
         output_hashes={},
-        dep_generations={},
     )
 
     stage_lock.write(data)
@@ -81,7 +79,6 @@ def test_manifest_preservation(tmp_path: Path) -> None:
         params={},
         dep_hashes={},
         output_hashes={},
-        dep_generations={},
     )
     stage_lock.write(data)
     result = stage_lock.read()
@@ -104,7 +101,6 @@ def test_parallel_lock_writes(tmp_path: Path) -> None:
                     params={},
                     dep_hashes={},
                     output_hashes={},
-                    dep_generations={},
                 )
             )
         except Exception as e:
@@ -126,7 +122,6 @@ def test_parallel_lock_writes(tmp_path: Path) -> None:
             params={},
             dep_hashes={},
             output_hashes={},
-            dep_generations={},
         )
 
 
@@ -159,7 +154,6 @@ def test_stage_unchanged_when_identical(tmp_path: Path) -> None:
             params=params,
             dep_hashes=dep_hashes,
             output_hashes={},
-            dep_generations={},
         )
     )
 
@@ -178,7 +172,6 @@ def test_stage_changed_code_modified(tmp_path: Path) -> None:
             params={},
             dep_hashes={},
             output_hashes={},
-            dep_generations={},
         )
     )
 
@@ -201,7 +194,6 @@ def test_stage_changed_new_dependency(tmp_path: Path) -> None:
             params={},
             dep_hashes={},
             output_hashes={},
-            dep_generations={},
         )
     )
 
@@ -224,7 +216,6 @@ def test_stage_changed_params_modified(tmp_path: Path) -> None:
             params={"learning_rate": 0.01},
             dep_hashes={},
             output_hashes={},
-            dep_generations={},
         )
     )
 
@@ -250,7 +241,6 @@ def test_stage_changed_dep_hash_modified(tmp_path: Path) -> None:
             params={},
             dep_hashes=old_dep_hashes,
             output_hashes={},
-            dep_generations={},
         )
     )
 
@@ -275,7 +265,6 @@ def test_stage_changed_dep_added(tmp_path: Path) -> None:
             "params": {},
             "dep_hashes": old_dep_hashes,
             "output_hashes": {},
-            "dep_generations": {},
         }
     )
 
@@ -305,7 +294,6 @@ def test_stage_changed_dep_removed(tmp_path: Path) -> None:
             "params": {},
             "dep_hashes": old_dep_hashes,
             "output_hashes": {},
-            "dep_generations": {},
         }
     )
 
@@ -329,7 +317,6 @@ def test_atomic_write_no_partial_file(tmp_path: Path) -> None:
             "params": {},
             "dep_hashes": {},
             "output_hashes": {},
-            "dep_generations": {},
         }
     )
 
@@ -349,7 +336,6 @@ def test_lock_directory_created(tmp_path: Path) -> None:
             "params": {},
             "dep_hashes": {},
             "output_hashes": {},
-            "dep_generations": {},
         }
     )
 
@@ -407,7 +393,6 @@ def test_write_failure_no_orphaned_tmp(tmp_path: Path, mocker: MockerFixture) ->
                 "params": {},
                 "dep_hashes": {},
                 "output_hashes": {},
-                "dep_generations": {},
             }
         )
 
@@ -429,7 +414,6 @@ def test_concurrent_same_stage_writes(tmp_path: Path) -> None:
                     "params": {"thread_id": value},
                     "dep_hashes": {},
                     "output_hashes": {},
-                    "dep_generations": {},
                 }
             )
             results.append(value)
@@ -510,14 +494,39 @@ def test_read_empty_file_returns_none(tmp_path: Path) -> None:
     assert result is None
 
 
+def test_is_lock_data_accepts_missing_dep_generations() -> None:
+    """Lock data without dep_generations is valid."""
+    data: StorageLockData = {
+        "code_manifest": {},
+        "params": {},
+        "deps": [],
+        "outs": [],
+    }
+
+    assert lock.is_lock_data(data)
+
+
+def test_read_lock_with_dep_generations_ignored(tmp_path: Path) -> None:
+    """Legacy lock files with dep_generations are still readable."""
+    stage_lock = lock.StageLock("legacy", tmp_path)
+    stage_lock.path.parent.mkdir(parents=True, exist_ok=True)
+    stage_lock.path.write_text(
+        "code_manifest: {}\nparams: {}\ndeps: []\nouts: []\ndep_generations: {}\n"
+    )
+
+    result = stage_lock.read()
+
+    assert result is not None
+    assert "dep_generations" not in result
+
+
 @pytest.mark.parametrize(
     ("missing_key", "lock_content"),
     [
-        ("code_manifest", "params: {}\ndeps: []\nouts: []\ndep_generations: {}\n"),
-        ("params", "code_manifest: {}\ndeps: []\nouts: []\ndep_generations: {}\n"),
-        ("deps", "code_manifest: {}\nparams: {}\nouts: []\ndep_generations: {}\n"),
-        ("outs", "code_manifest: {}\nparams: {}\ndeps: []\ndep_generations: {}\n"),
-        ("dep_generations", "code_manifest: {}\nparams: {}\ndeps: []\nouts: []\n"),
+        ("code_manifest", "params: {}\ndeps: []\nouts: []\n"),
+        ("params", "code_manifest: {}\ndeps: []\nouts: []\n"),
+        ("deps", "code_manifest: {}\nparams: {}\nouts: []\n"),
+        ("outs", "code_manifest: {}\nparams: {}\ndeps: []\n"),
     ],
 )
 def test_is_changed_with_missing_required_key_triggers_rerun(
@@ -544,9 +553,7 @@ def test_is_changed_with_null_values_triggers_rerun(tmp_path: Path) -> None:
     stage_lock = lock.StageLock("nulls", tmp_path)
     stage_lock.path.parent.mkdir(parents=True, exist_ok=True)
     # All required keys present but with null values
-    stage_lock.path.write_text(
-        "code_manifest: null\nparams: null\ndeps: null\nouts: null\ndep_generations: null\n"
-    )
+    stage_lock.path.write_text("code_manifest: null\nparams: null\ndeps: null\nouts: null\n")
 
     changed, reason = stage_lock.is_changed(
         current_fingerprint={},
@@ -565,7 +572,7 @@ def test_read_lock_with_extra_keys_accepted(tmp_path: Path) -> None:
     stage_lock.path.parent.mkdir(parents=True, exist_ok=True)
     stage_lock.path.write_text(
         "code_manifest: {}\nparams: {}\ndeps: []\nouts: []\n"
-        + "dep_generations: {}\nfuture_key: some_value\nanother_new_field: 123\n"
+        + "future_key: some_value\nanother_new_field: 123\n"
     )
 
     result = stage_lock.read()
@@ -589,7 +596,6 @@ def test_stage_changed_output_path_added(tmp_path: Path) -> None:
             params={},
             dep_hashes={},
             output_hashes={"/path/to/output.csv": {"hash": "abc123"}},
-            dep_generations={},
         )
     )
 
@@ -617,7 +623,6 @@ def test_stage_changed_output_path_removed(tmp_path: Path) -> None:
                 "/path/to/output1.csv": {"hash": "abc123"},
                 "/path/to/output2.csv": {"hash": "def456"},
             },
-            dep_generations={},
         )
     )
 
@@ -642,7 +647,6 @@ def test_stage_changed_output_path_modified(tmp_path: Path) -> None:
             params={},
             dep_hashes={},
             output_hashes={"/path/to/output.csv": {"hash": "abc123"}},
-            dep_generations={},
         )
     )
 
@@ -670,7 +674,6 @@ def test_stage_unchanged_with_same_output_paths(tmp_path: Path) -> None:
                 "/path/to/output1.csv": {"hash": "abc123"},
                 "/path/to/output2.csv": {"hash": "def456"},
             },
-            dep_generations={},
         )
     )
 
@@ -696,7 +699,6 @@ def test_stage_unchanged_when_out_paths_none(tmp_path: Path) -> None:
             params={},
             dep_hashes={},
             output_hashes={"/path/to/output.csv": {"hash": "abc123"}},
-            dep_generations={},
         )
     )
 
@@ -721,7 +723,6 @@ def test_dep_path_change_invalidates_cache(tmp_path: Path) -> None:
             params={},
             dep_hashes={"/old/path/data.csv": {"hash": "abc123"}},
             output_hashes={},
-            dep_generations={},
         )
     )
 
@@ -769,7 +770,6 @@ def test_directory_out_trailing_slash_preserved_through_lockfile_roundtrip(
         params={},
         dep_hashes={},
         output_hashes={dir_out_path: dir_hash},
-        dep_generations={},
     )
 
     stage_lock.write(data)
@@ -798,7 +798,6 @@ def test_pipeline_prefixed_stage_name_creates_subdirectory(tmp_path: Path) -> No
         params={"lr": 0.01},
         dep_hashes={},
         output_hashes={},
-        dep_generations={},
     )
 
     stage_lock.write(data)

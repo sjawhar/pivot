@@ -634,7 +634,7 @@ def test_verify_allow_missing_uses_pvt_hash_for_deps(
     # Track the input file (create .pvt)
     from pivot.storage import track
 
-    input_hash = cache.hash_file(tmp_path / "input.txt")
+    input_hash, _ = cache.hash_file(tmp_path / "input.txt")
     pvt_data = track.PvtData(path="input.txt", hash=input_hash, size=4)
     track.write_pvt_file(tmp_path / "input.txt.pvt", pvt_data)
 

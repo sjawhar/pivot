@@ -6,6 +6,7 @@ Changes to default values trigger cache invalidation.
 """
 
 import pydantic
+import pytest
 
 from pivot import fingerprint
 
@@ -65,12 +66,13 @@ def _stage_references_string() -> str:
 # --- Tests for Pydantic default tracking ---
 
 
-def test_list_constants_not_captured_as_const():
+def test_list_constants_not_captured_as_const(monkeypatch: pytest.MonkeyPatch):
     """Lists referenced in function body are NOT captured as 'const:' entries.
 
     Lists are scanned for callables only, not hashed as data. This is intentional
     to avoid sensitivity to mutable runtime state.
     """
+    monkeypatch.setenv("PIVOT_UNSAFE_FINGERPRINTING", "1")
     fp = fingerprint.get_stage_fingerprint(_stage_directly_references_list)
 
     # Lists referenced in function body are NOT captured as const:

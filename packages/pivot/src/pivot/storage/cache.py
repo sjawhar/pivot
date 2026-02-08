@@ -81,14 +81,21 @@ def atomic_write_file(
                 os.close(fd)
 
 
-def hash_file(path: pathlib.Path, state_db: state_mod.StateDB | None = None) -> str:
-    """Compute xxhash64 of file contents, using state cache if available."""
+def hash_file(
+    path: pathlib.Path, state_db: state_mod.StateDB | None = None
+) -> tuple[str, os.stat_result]:
+    """Compute xxhash64 of file contents, using state cache if available.
+
+    Returns:
+        Tuple of (file_hash, file_stat) where file_hash is the xxhash64 hex digest
+        and file_stat is the os.stat_result for the file.
+    """
     file_stat = path.stat()
 
     if state_db is not None:
         cached = state_db.get(path, file_stat)
         if cached is not None:
-            return cached
+            return cached, file_stat
 
     _t = metrics.start()
     hasher = xxhash.xxh64()
@@ -110,7 +117,7 @@ def hash_file(path: pathlib.Path, state_db: state_mod.StateDB | None = None) -> 
     if state_db is not None and not state_db.readonly:
         state_db.save(path, file_stat, file_hash)
 
-    return file_hash
+    return file_hash, file_stat
 
 
 # Hardcoded ignore patterns for hot path - O(1) lookups only.
@@ -195,9 +202,10 @@ def hash_directory(
         try:
             rel = file_path.relative_to(path)
             file_stat = entry.stat(follow_symlinks=True)
+            file_hash, _ = hash_file(file_path, state_db)
             manifest_entry: DirManifestEntry = {
                 "relpath": str(rel),
-                "hash": hash_file(file_path, state_db),
+                "hash": file_hash,
                 "size": file_stat.st_size,
                 "isexec": bool(file_stat.st_mode & stat.S_IXUSR),
             }
@@ -467,7 +475,7 @@ def _save_file_to_cache(
             if cache_path.exists():
                 return FileHash(hash=existing_hash)
 
-    file_hash = hash_file(path, state_db)
+    file_hash, _ = hash_file(path, state_db)
     cache_path = get_cache_path(cache_dir, file_hash)
 
     copy_to_cache(path, cache_path)

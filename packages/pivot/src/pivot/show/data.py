@@ -587,7 +587,8 @@ def get_data_hashes_from_workspace(paths: Sequence[str]) -> dict[str, str | None
     for rel_path in paths:
         abs_path = proj_root / rel_path
         if abs_path.exists():
-            result[rel_path] = cache.hash_file(abs_path)
+            file_hash, _ = cache.hash_file(abs_path)
+            result[rel_path] = file_hash
         else:
             result[rel_path] = None
 

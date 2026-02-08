@@ -233,7 +233,6 @@ def test_params_diff_no_changes(
             "params": {"x": 1},
             "deps": [],
             "outs": [],
-            "dep_generations": {},
         }
     )
     mocker.patch.object(
@@ -267,7 +266,6 @@ def test_params_diff_with_changes(
             "params": {"x": 1},
             "deps": [],
             "outs": [],
-            "dep_generations": {},
         }
     )
     mocker.patch.object(
@@ -302,7 +300,6 @@ def test_params_diff_json_format(
             "params": {"x": 1},
             "deps": [],
             "outs": [],
-            "dep_generations": {},
         }
     )
     mocker.patch.object(
@@ -338,7 +335,6 @@ def test_params_diff_md_format(
             "params": {"x": 1},
             "deps": [],
             "outs": [],
-            "dep_generations": {},
         }
     )
     mocker.patch.object(

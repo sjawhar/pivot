@@ -1331,7 +1331,6 @@ deps: []
 outs:
   - path: output.csv
     hash: deadbeef
-dep_generations: {}
 """
 
     def mock_read_files(paths: list[str]) -> dict[str, str | None]:

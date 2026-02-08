@@ -10,7 +10,7 @@ import functools
 
 import pytest
 
-from pivot import fingerprint
+from pivot import exceptions, fingerprint
 
 # =============================================================================
 # Module-level helpers for testing
@@ -270,19 +270,14 @@ def test_module_variable_callback_change_detected():
 
 
 def test_dict_callback_in_closure_detected():
-    """Callbacks in dict closures ARE detected correctly."""
+    """Callbacks in dict closures are rejected by default."""
     handlers = {"process": _callback_v1}
 
     def stage():
         return handlers["process"]()
 
-    fp1 = fingerprint.get_stage_fingerprint(stage)
-
-    handlers["process"] = _callback_v2
-    fp2 = fingerprint.get_stage_fingerprint(stage)
-
-    # This WORKS correctly
-    assert fp1 != fp2, "Dict callback in closure should be detected"
+    with pytest.raises(exceptions.StageDefinitionError):
+        fingerprint.get_stage_fingerprint(stage)
 
 
 # =============================================================================

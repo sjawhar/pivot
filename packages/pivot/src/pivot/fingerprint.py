@@ -1,24 +1,26 @@
 import ast
 import atexit
 import contextlib
+import contextvars
 import dataclasses
 import functools
 import inspect
 import json
 import logging
 import marshal
+import os
 import pathlib
 import sys
 import textwrap
 import types
 import typing
 import weakref
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, Any, cast
 
 import xxhash
 
-from pivot import ast_utils, metrics
+from pivot import ast_utils, exceptions, metrics
 
 if TYPE_CHECKING:
     from pivot import loaders
@@ -96,6 +98,11 @@ _pending_manifest_writes: list[tuple[bytes, bytes]] = []
 # Source files visited during a single stage's fingerprinting.
 # Maps rel_path -> (mtime_ns, size, ino). Set by _collecting_sources().
 _active_source_map: dict[str, tuple[int, int, int]] | None = None
+
+# Stage name used for error reporting during fingerprinting.
+_current_stage_name: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "_current_stage_name", default=None
+)
 
 
 def _close_state_db() -> None:
@@ -292,6 +299,93 @@ def flush_manifest_cache() -> None:
         _logger.debug("Failed to flush manifest cache (%d entries)", len(pending), exc_info=True)
 
 
+def _normalize_changed_paths(
+    paths: Sequence[str | os.PathLike[str] | pathlib.Path],
+) -> set[str]:
+    """Normalize changed paths to project-relative strings."""
+    from pivot import project
+
+    project_root = project.get_project_root()
+    normalized = set[str]()
+    for path in paths:
+        candidate = pathlib.Path(path)
+        if not candidate.is_absolute():
+            candidate = project_root / candidate
+        with contextlib.suppress(OSError):
+            candidate = candidate.resolve()
+        try:
+            rel_path = candidate.relative_to(project_root)
+        except ValueError:
+            continue
+        normalized.add(str(rel_path))
+    return normalized
+
+
+def _manifest_references_paths(raw: bytes, changed_paths: set[str]) -> bool:
+    """Check if a cached manifest references any changed path."""
+    try:
+        data: object = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    typed_data = cast("dict[str, Any]", data)
+    sources_raw: object = typed_data.get("s")
+    if not isinstance(sources_raw, dict):
+        return False
+    sources = cast("dict[str, list[int]]", sources_raw)
+    return any(source_path in changed_paths for source_path in sources)
+
+
+def invalidate_manifests_for_paths(
+    paths: Sequence[str | os.PathLike[str] | pathlib.Path],
+) -> None:
+    """Invalidate cached manifests that reference changed source files."""
+    global _pending_manifest_writes
+
+    if not paths:
+        return
+    changed_paths = _normalize_changed_paths(paths)
+    if not changed_paths:
+        return
+
+    from pivot.config import io
+    from pivot.storage import state
+
+    keys_to_delete = set[bytes]()
+    try:
+        with state.StateDB(io.get_state_db_path(), readonly=True) as db:
+            for key, raw in db.iter_prefix(b"sm:"):
+                if _manifest_references_paths(raw, changed_paths):
+                    keys_to_delete.add(key)
+    except Exception:
+        _logger.debug("Failed to scan manifest cache for invalidation", exc_info=True)
+
+    if _pending_manifest_writes:
+        pending_keys = set[bytes]()
+        for key, raw in _pending_manifest_writes:
+            if _manifest_references_paths(raw, changed_paths):
+                pending_keys.add(key)
+        if pending_keys:
+            keys_to_delete.update(pending_keys)
+            _pending_manifest_writes = [
+                (key, value) for key, value in _pending_manifest_writes if key not in pending_keys
+            ]
+
+    if not keys_to_delete:
+        return
+
+    try:
+        with state.StateDB(io.get_state_db_path(), readonly=False) as db:
+            db.delete_raw_many(list(keys_to_delete))
+    except Exception:
+        _logger.debug(
+            "Failed to invalidate manifest cache entries (%d)",
+            len(keys_to_delete),
+            exc_info=True,
+        )
+
+
 def get_stage_fingerprint(
     func: Callable[..., Any], visited: set[int] | None = None
 ) -> dict[str, str]:
@@ -334,8 +428,12 @@ def get_stage_fingerprint_cached(stage_name: str, func: Callable[..., Any]) -> d
     metrics.count("fingerprint.manifest_cache.miss")
 
     # Compute with source tracking
-    with _collecting_sources() as source_map:
-        manifest = get_stage_fingerprint(func)
+    token = _current_stage_name.set(stage_name)
+    try:
+        with _collecting_sources() as source_map:
+            manifest = get_stage_fingerprint(func)
+    finally:
+        _current_stage_name.reset(token)
 
     # Queue for flush
     key = _make_manifest_cache_key(stage_name)
@@ -448,6 +546,55 @@ def get_loader_fingerprint(loader: "loaders.Writer[Any] | loaders.Reader[Any]") 
     return manifest
 
 
+def _is_unsafe_fingerprinting_enabled() -> bool:
+    if os.environ.get("PIVOT_UNSAFE_FINGERPRINTING") == "1":
+        return True
+    try:
+        from pivot.config import io
+
+        config = io.get_merged_config()
+        return config.core.unsafe_fingerprinting
+    except (ImportError, FileNotFoundError, AttributeError):
+        # Config not available yet (early in pipeline lifecycle)
+        return False
+    except Exception:
+        _logger.debug("Failed to read unsafe_fingerprinting config", exc_info=True)
+        return False
+
+
+def _check_mutable_capture(var_name: str, value: Any, stage_name: str) -> None:
+    message = (
+        f"Stage '{stage_name}': closure captures mutable variable '{var_name}' "
+        f"(type: {type(value).__name__}).\n"
+        "Pivot cannot track changes to mutable runtime state, which may cause silent wrong outputs.\n"
+        "Fix: pass this data via StageParams or declare it as a Dep(...) input.\n"
+        "To suppress: set core.unsafe_fingerprinting=true or PIVOT_UNSAFE_FINGERPRINTING=1"
+    )
+    if _is_unsafe_fingerprinting_enabled():
+        _logger.warning(message)
+        return
+    raise exceptions.StageDefinitionError(message)
+
+
+def _is_frozen_dataclass(value: Any) -> bool:
+    if not dataclasses.is_dataclass(value):
+        return False
+    cls = cast("type[Any]", type(value))
+    params = getattr(cls, "__dataclass_params__", None)
+    return bool(params and getattr(params, "frozen", False))
+
+
+def _is_frozen_pydantic(value: Any) -> bool:
+    cls = cast("type[Any]", type(value))
+    model_config = getattr(cls, "model_config", None)
+    if model_config is None:
+        return False
+    try:
+        return bool(model_config.get("frozen", False))
+    except AttributeError:
+        return False
+
+
 def _process_closure_values(
     values: Mapping[str, Any],
     func: Callable[..., Any],
@@ -458,6 +605,7 @@ def _process_closure_values(
     include_modules: bool,
 ) -> None:
     """Process closure variable values (globals or nonlocals) and add to manifest."""
+    stage_name = _current_stage_name.get() or getattr(func, "__name__", "<unknown>")
     for name, value in values.items():
         if skip_dunders and name.startswith("__"):
             continue
@@ -475,6 +623,8 @@ def _process_closure_values(
         elif isinstance(value, (bool, int, float, str, bytes, type(None))):
             manifest[f"const:{name}"] = repr(value)
         elif isinstance(value, (dict, list, tuple, set, frozenset)):
+            if isinstance(value, (dict, list, set)):
+                _check_mutable_capture(name, value, stage_name)
             _process_collection_dependency(
                 name,
                 cast(
@@ -485,7 +635,11 @@ def _process_closure_values(
                 visited,
             )
         elif _is_user_class_instance(value):
-            _process_instance_dependency(name, value, manifest, visited)
+            if _is_frozen_dataclass(value) or _is_frozen_pydantic(value):
+                _process_instance_dependency(name, value, manifest, visited)
+            else:
+                _check_mutable_capture(name, value, stage_name)
+                _process_instance_dependency(name, value, manifest, visited)
 
 
 def _process_callable_dependency(

@@ -214,7 +214,40 @@ def execute_stage(
                 lock_data = production_lock.read()
 
                 with state.StateDB(state_db_path, readonly=True) as state_db:
-                    dep_hashes, missing, unreadable = hash_dependencies(
+                    outputs_missing_from_cache = False
+                    if lock_data is not None and not stage_info["force"]:
+                        out_paths = _get_normalized_out_paths(stage_info)
+                        if can_skip_via_generation(
+                            stage_name=stage_name,
+                            fingerprint=stage_info["fingerprint"],
+                            deps=stage_info["deps"],
+                            outs_paths=out_paths,
+                            current_params=current_params,
+                            lock_data=lock_data,
+                            state_db=state_db,
+                            verify_files=True,
+                        ):
+                            out_specs = _get_output_specs(stage_info)
+                            input_hash = _compute_input_hash_from_lock(
+                                lock_data, current_fingerprint, current_params, out_specs
+                            )
+                            restored = _restore_outputs_from_cache(
+                                stage_outs,
+                                lock_data,
+                                files_cache_dir,
+                                checkout_modes,
+                                state_db=state_db,
+                            )
+                            if restored:
+                                return _make_result(
+                                    StageStatus.SKIPPED,
+                                    "unchanged (generation)",
+                                    ring_buffer,
+                                    input_hash=input_hash,
+                                )
+                            outputs_missing_from_cache = True
+
+                    dep_hashes, missing, unreadable, file_hash_entries = hash_dependencies(
                         stage_info["deps"], state_db
                     )
 
@@ -231,15 +264,17 @@ def execute_stage(
                         )
 
                     skip_reason, run_reason, input_hash = _check_skip_or_run(
-                        stage_name,
                         stage_info,
                         production_lock,
                         lock_data,
-                        state_db,
                         current_fingerprint,
                         current_params,
                         dep_hashes,
                     )
+
+                    if outputs_missing_from_cache and skip_reason is not None:
+                        skip_reason = None
+                        run_reason = "outputs missing from cache"
 
                     # Override skip decision if force flag is set
                     if stage_info["force"] and skip_reason is not None:
@@ -286,7 +321,6 @@ def execute_stage(
                                 params=current_params,
                                 dep_hashes=dict(sorted(dep_hashes.items())),
                                 output_hashes=dict(sorted(run_cache_skip["output_hashes"].items())),
-                                dep_generations={},
                             )
                             deferred = _commit_lock_and_build_deferred(
                                 stage_info,
@@ -295,6 +329,7 @@ def execute_stage(
                                 run_cache_skip["output_hashes"],
                                 production_lock,
                                 state_db,
+                                file_hash_entries=file_hash_entries,
                                 increment_outputs=False,
                             )
                             return StageResult(
@@ -350,7 +385,6 @@ def execute_stage(
                     params=current_params,
                     dep_hashes=dict(sorted(dep_hashes.items())),
                     output_hashes=dict(sorted(output_hashes.items())),
-                    dep_generations={},
                 )
 
                 # Single StateDB open for post-execution work
@@ -362,6 +396,7 @@ def execute_stage(
                         output_hashes,
                         production_lock,
                         state_db,
+                        file_hash_entries=file_hash_entries,
                     )
                     return StageResult(
                         status=StageStatus.RAN,
@@ -414,12 +449,23 @@ def _get_output_specs(stage_info: WorkerStageInfo) -> list[tuple[str, bool]]:
     return [(_canonicalize_out(str(out.path)), out.cache) for out in stage_info["outs"]]
 
 
+def _compute_input_hash_from_lock(
+    lock_data: LockData,
+    current_fingerprint: dict[str, str],
+    current_params: dict[str, Any],
+    out_specs: list[tuple[str, bool]],
+) -> str:
+    """Compute input hash using lock file dependency hashes."""
+    deps_list = [
+        DepEntry(path=path, hash=info["hash"]) for path, info in lock_data["dep_hashes"].items()
+    ]
+    return run_history.compute_input_hash(current_fingerprint, current_params, deps_list, out_specs)
+
+
 def _check_skip_or_run(
-    stage_name: str,
     stage_info: WorkerStageInfo,
     stage_lock: lock.StageLock,
     lock_data: LockData | None,
-    state_db: state.StateDB,
     current_fingerprint: dict[str, str],
     current_params: dict[str, Any],
     dep_hashes: dict[str, HashInfo],
@@ -440,18 +486,6 @@ def _check_skip_or_run(
 
     if lock_data is None:
         return None, "No previous run", input_hash
-
-    if can_skip_via_generation(
-        stage_name=stage_name,
-        fingerprint=stage_info["fingerprint"],
-        deps=stage_info["deps"],
-        outs_paths=out_paths,
-        current_params=current_params,
-        lock_data=lock_data,
-        state_db=state_db,
-        verify_files=True,
-    ):
-        return "unchanged (generation)", "", input_hash
 
     changed, run_reason = stage_lock.is_changed_with_lock_data(
         lock_data, current_fingerprint, current_params, dep_hashes, out_paths
@@ -594,7 +628,7 @@ def _file_needs_restore(
         return True
 
     try:
-        current_hash = cache.hash_file(path, state_db)
+        current_hash, _ = cache.hash_file(path, state_db)
         return current_hash != cached_hash["hash"]
     except OSError:
         return True
@@ -670,7 +704,7 @@ def hash_output(path: pathlib.Path, state_db: state.StateDB | None = None) -> Ha
     if path.is_dir():
         tree_hash, manifest = cache.hash_directory(path, state_db)
         return DirHash(hash=tree_hash, manifest=manifest)
-    file_hash = cache.hash_file(path, state_db)
+    file_hash, _ = cache.hash_file(path, state_db)
     return FileHash(hash=file_hash)
 
 
@@ -936,7 +970,7 @@ class _QueueWriter:
 
 def hash_dependencies(
     deps: list[str], state_db: state.StateDB | None = None
-) -> tuple[dict[str, HashInfo], list[str], list[str]]:
+) -> tuple[dict[str, HashInfo], list[str], list[str], list[tuple[str, int, int, int, str]]]:
     """Hash all dependency files and directories.
 
     Returns (hashes, missing_files, unreadable_files).
@@ -947,6 +981,7 @@ def hash_dependencies(
     hashes = dict[str, HashInfo]()
     missing = list[str]()
     unreadable = list[str]()
+    file_hash_entries = list[tuple[str, int, int, int, str]]()
     for dep in deps:
         normalized = str(project.normalize_path(dep))
         path = pathlib.Path(dep)
@@ -955,13 +990,23 @@ def hash_dependencies(
                 tree_hash, manifest = cache.hash_directory(path, state_db)
                 hashes[normalized] = DirHash(hash=tree_hash, manifest=manifest)
             else:
-                hashes[normalized] = FileHash(hash=cache.hash_file(path, state_db))
+                file_hash, file_stat = cache.hash_file(path, state_db)
+                hashes[normalized] = FileHash(hash=file_hash)
+                file_hash_entries.append(
+                    (
+                        normalized,
+                        file_stat.st_mtime_ns,
+                        file_stat.st_size,
+                        file_stat.st_ino,
+                        file_hash,
+                    )
+                )
         except FileNotFoundError:
             missing.append(dep)
         except OSError:
             unreadable.append(dep)
     metrics.end("worker.hash_dependencies", _t)
-    return hashes, missing, unreadable
+    return hashes, missing, unreadable, file_hash_entries
 
 
 # -----------------------------------------------------------------------------
@@ -982,7 +1027,7 @@ def can_skip_via_generation(
     """Check if stage can skip using O(1) generation tracking.
 
     Generation tracking avoids hashing files by tracking monotonic generation counters.
-    Set verify_files=False for status prediction. Falls back to lock_data for --no-commit mode.
+    Set verify_files=False for status prediction.
     """
     if lock_data["code_manifest"] != fingerprint:
         return False
@@ -999,10 +1044,8 @@ def can_skip_via_generation(
     if not deps:
         return True
 
-    # Try StateDB first, fall back to lock_data (for --no-commit mode)
+    # Try StateDB for recorded dependency generations
     recorded_gens = state_db.get_dep_generations(stage_name)
-    if recorded_gens is None:
-        recorded_gens = lock_data["dep_generations"]
     if not recorded_gens:
         return False
 
@@ -1068,6 +1111,7 @@ def _commit_lock_and_build_deferred(
     production_lock: lock.StageLock,
     state_db: state.StateDB,
     *,
+    file_hash_entries: list[tuple[str, int, int, int, str]] | None = None,
     increment_outputs: bool = True,
 ) -> DeferredWrites:
     """Commit lock file and build deferred writes for StateDB.
@@ -1077,7 +1121,12 @@ def _commit_lock_and_build_deferred(
     """
     production_lock.write(lock_data)
     return _build_deferred_writes(
-        stage_info, input_hash, output_hashes, state_db, increment_outputs=increment_outputs
+        stage_info,
+        input_hash,
+        output_hashes,
+        state_db,
+        file_hash_entries=file_hash_entries,
+        increment_outputs=increment_outputs,
     )
 
 
@@ -1087,6 +1136,7 @@ def _build_deferred_writes(
     output_hashes: dict[str, HashInfo],
     state_db: state.StateDB,
     *,
+    file_hash_entries: list[tuple[str, int, int, int, str]] | None = None,
     increment_outputs: bool = True,
 ) -> DeferredWrites:
     """Build deferred writes for coordinator to apply."""
@@ -1113,6 +1163,9 @@ def _build_deferred_writes(
             run_id=stage_info["run_id"],
             output_hashes=output_entries,
         )
+
+    if file_hash_entries:
+        result["file_hash_entries"] = file_hash_entries
 
     return result
 

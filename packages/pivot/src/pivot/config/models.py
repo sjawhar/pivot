@@ -61,6 +61,7 @@ class CoreConfig(pydantic.BaseModel):
     max_workers: int = -2
     state_dir: str = ".pivot"
     run_history_retention: Annotated[int, pydantic.Field(gt=0)] = 100
+    unsafe_fingerprinting: bool = False
 
     @pydantic.field_validator("max_workers")
     @classmethod
@@ -144,6 +145,7 @@ CONFIG_KEY_DESCRIPTIONS: dict[str, str] = {
     "core.max_workers": "Parallel execution workers",
     "core.state_dir": "State directory path",
     "core.run_history_retention": "Keep last N runs",
+    "core.unsafe_fingerprinting": "Allow mutable closure captures (unsafe)",
     "remote.jobs": "Concurrent transfer jobs",
     "remote.retries": "Retry attempts",
     "remote.connect_timeout": "Connection timeout (seconds)",

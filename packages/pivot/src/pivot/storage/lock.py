@@ -44,7 +44,7 @@ _VALID_STAGE_NAME = re.compile(
 )  # Allow / for pipeline-prefixed names, . for DVC matrix keys
 _PATH_TRAVERSAL = re.compile(r"(^|/)\.\.(/|$)")  # Reject ../ path traversal
 _MAX_STAGE_NAME_LEN = 200  # Leave room for ".lock" suffix within filesystem NAME_MAX (255)
-_REQUIRED_LOCK_KEYS = frozenset({"code_manifest", "params", "deps", "outs", "dep_generations"})
+_REQUIRED_LOCK_KEYS = frozenset({"code_manifest", "params", "deps", "outs"})
 
 STAGES_REL_PATH = ".pivot/stages"
 
@@ -125,7 +125,6 @@ def _convert_to_storage_format(data: LockData) -> StorageLockData:
         params=data["params"],
         deps=deps_list,
         outs=outs_list,
-        dep_generations=data["dep_generations"],
     )
 
 
@@ -156,7 +155,6 @@ def _convert_from_storage_format(data: StorageLockData) -> LockData:
         params=data["params"],
         dep_hashes=dep_hashes,
         output_hashes=output_hashes,
-        dep_generations=data["dep_generations"],
     )
 
     return result

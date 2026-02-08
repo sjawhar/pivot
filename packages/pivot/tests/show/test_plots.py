@@ -184,7 +184,6 @@ def test_get_plot_hashes_from_lock_with_hash(mock_discovery: pipeline_mod.Pipeli
             params={},
             dep_hashes={},
             output_hashes={str(plot_file): {"hash": "abc123def456"}},
-            dep_generations={},
         )
     )
 
@@ -212,7 +211,6 @@ def test_get_plot_hashes_from_lock_with_none_hash(mock_discovery: pipeline_mod.P
             params={},
             dep_hashes={},
             output_hashes={str(plot_file): {"hash": "abc123"}},
-            dep_generations={},
         )
     )
 
@@ -266,7 +264,6 @@ def test_get_plot_hashes_from_head_returns_committed_hash(
             params={},
             dep_hashes={},
             output_hashes={str(plot_file): {"hash": "committed_hash_123"}},
-            dep_generations={},
         )
     )
 
@@ -302,7 +299,6 @@ def test_get_plot_hashes_from_head_ignores_uncommitted_changes(
             params={},
             dep_hashes={},
             output_hashes={str(plot_file): {"hash": "original_hash"}},
-            dep_generations={},
         )
     )
 
@@ -315,7 +311,6 @@ def test_get_plot_hashes_from_head_ignores_uncommitted_changes(
             params={},
             dep_hashes={},
             output_hashes={str(plot_file): {"hash": "modified_hash"}},
-            dep_generations={},
         )
     )
 
@@ -675,7 +670,6 @@ def test_get_output_hashes_from_revision_returns_hashes(set_project_root: Path) 
             params={},
             dep_hashes={},
             output_hashes={"output.csv": {"hash": "abc123"}},
-            dep_generations={},
         )
     )
 
@@ -707,7 +701,6 @@ def test_get_output_hashes_from_revision_multiple_stages(set_project_root: Path)
             params={},
             dep_hashes={},
             output_hashes={"plots/chart1.png": {"hash": "hash1"}},
-            dep_generations={},
         )
     )
     lock.StageLock("stage2", stages_dir).write(
@@ -716,7 +709,6 @@ def test_get_output_hashes_from_revision_multiple_stages(set_project_root: Path)
             params={},
             dep_hashes={},
             output_hashes={"plots/chart2.png": {"hash": "hash2"}},
-            dep_generations={},
         )
     )
 
@@ -747,7 +739,6 @@ def test_get_output_hashes_from_revision_normalizes_paths(set_project_root: Path
             params={},
             dep_hashes={},
             output_hashes={"./output.csv": {"hash": "abc123"}},
-            dep_generations={},
         )
     )
 

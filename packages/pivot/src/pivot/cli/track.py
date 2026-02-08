@@ -159,7 +159,7 @@ def _track_single_path(
             "manifest": manifest,
         }
     else:
-        file_hash = cache.hash_file(path)
+        file_hash, _ = cache.hash_file(path)
         file_size = path.stat().st_size
         file_cache_path = cache.get_cache_path(cache_dir, file_hash)
         if not file_cache_path.exists():

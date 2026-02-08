@@ -170,7 +170,8 @@ def get_plot_hashes_from_workspace(
     for path_str in paths:
         path = proj_root / path_str
         if path.exists() and path.is_file():
-            result[path_str] = cache.hash_file(path)
+            file_hash, _ = cache.hash_file(path)
+            result[path_str] = file_hash
     return result
 
 

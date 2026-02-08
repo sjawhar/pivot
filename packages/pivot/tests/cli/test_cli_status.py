@@ -250,7 +250,7 @@ pipeline = Pipeline('test')
 
         data_file = pathlib.Path("data.txt")
         data_file.write_text("content")
-        file_hash = cache.hash_file(data_file)
+        file_hash, _ = cache.hash_file(data_file)
 
         pvt_data = track.PvtData(path="data.txt", hash=file_hash, size=7)
         track.write_pvt_file(pathlib.Path("data.txt.pvt"), pvt_data)
@@ -278,7 +278,7 @@ pipeline = Pipeline('test')
 
         data_file = pathlib.Path("data.txt")
         data_file.write_text("original")
-        old_hash = cache.hash_file(data_file)
+        old_hash, _ = cache.hash_file(data_file)
 
         pvt_data = track.PvtData(path="data.txt", hash=old_hash, size=8)
         track.write_pvt_file(pathlib.Path("data.txt.pvt"), pvt_data)
@@ -303,7 +303,7 @@ def test_status_stages_only(runner: click.testing.CliRunner, tmp_path: pathlib.P
 
         data_file = pathlib.Path("data.txt")
         data_file.write_text("content")
-        file_hash = cache.hash_file(data_file)
+        file_hash, _ = cache.hash_file(data_file)
 
         pvt_data = track.PvtData(path="data.txt", hash=file_hash, size=7)
         track.write_pvt_file(pathlib.Path("data.txt.pvt"), pvt_data)
@@ -328,7 +328,7 @@ def test_status_tracked_only(runner: click.testing.CliRunner, tmp_path: pathlib.
 
         data_file = pathlib.Path("data.txt")
         data_file.write_text("content")
-        file_hash = cache.hash_file(data_file)
+        file_hash, _ = cache.hash_file(data_file)
 
         pvt_data = track.PvtData(path="data.txt", hash=file_hash, size=7)
         track.write_pvt_file(pathlib.Path("data.txt.pvt"), pvt_data)

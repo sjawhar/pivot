@@ -169,7 +169,6 @@ def test_prepare_outputs_incremental_restores_from_cache(
         params={},
         dep_hashes={},
         output_hashes={"database.txt": output_hash},
-        dep_generations={},
     )
 
     # Prepare for execution (uses relative path like production)
@@ -199,7 +198,6 @@ def test_prepare_outputs_incremental_restored_file_is_writable(
         params={},
         dep_hashes={},
         output_hashes={"database.txt": output_hash},
-        dep_generations={},
     )
 
     # Prepare for execution (uses relative path like production)
@@ -229,7 +227,6 @@ def test_prepare_outputs_incremental_missing_cache_error(
         params={},
         dep_hashes={},
         output_hashes={"database.txt": fake_hash},
-        dep_generations={},
     )
 
     stage_outs: list[outputs.BaseOut] = [
@@ -433,7 +430,6 @@ def test_incremental_out_restores_directory(
         params={},
         dep_hashes={},
         output_hashes={"data_dir": output_hash},
-        dep_generations={},
     )
 
     # Delete the output
@@ -471,7 +467,6 @@ def test_incremental_out_directory_is_writable(
         params={},
         dep_hashes={},
         output_hashes={"data_dir": output_hash},
-        dep_generations={},
     )
 
     # Delete and restore (uses relative path like production)
@@ -512,7 +507,6 @@ def test_incremental_out_directory_subdirs_writable(
         params={},
         dep_hashes={},
         output_hashes={"data_dir": output_hash},
-        dep_generations={},
     )
 
     # Delete and restore (uses relative path like production)

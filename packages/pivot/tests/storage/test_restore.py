@@ -30,7 +30,6 @@ deps:
 outs:
   - path: model.pkl
     hash: ghi789
-dep_generations: {}
 """
     result = restore._parse_lock_data_from_bytes(content)
 
@@ -117,7 +116,6 @@ def test_resolve_targets_as_stage(git_repo: GitRepo, monkeypatch: pytest.MonkeyP
         "params": {},
         "deps": [],
         "outs": [{"path": "model.pkl", "hash": "def456"}],
-        "dep_generations": {},
     }
     (repo_path / ".pivot" / "stages" / "train.lock").write_text(yaml.dump(lock_content))
 
@@ -368,7 +366,6 @@ def test_restore_targets_from_revision_output_with_stage(
         "params": {},
         "deps": [],
         "outs": [{"path": "model.pkl", "hash": "def456"}],
-        "dep_generations": {},
     }
     (repo_path / ".pivot" / "stages" / "train.lock").write_text(yaml.dump(lock_content))
 

@@ -60,11 +60,12 @@ def test_hash_file(tmp_path: pathlib.Path) -> None:
     test_file = tmp_path / "file.txt"
     test_file.write_text("hello world")
 
-    hash1 = cache.hash_file(test_file)
-    hash2 = cache.hash_file(test_file)
+    hash1, stat1 = cache.hash_file(test_file)
+    hash2, stat2 = cache.hash_file(test_file)
 
     assert hash1 == hash2
     assert len(hash1) == 16  # xxhash64 hex is 16 chars
+    assert stat1.st_size == stat2.st_size
 
 
 def test_hash_file_different_content(tmp_path: pathlib.Path) -> None:
@@ -74,7 +75,9 @@ def test_hash_file_different_content(tmp_path: pathlib.Path) -> None:
     file1.write_text("hello")
     file2.write_text("world")
 
-    assert cache.hash_file(file1) != cache.hash_file(file2)
+    hash1, _ = cache.hash_file(file1)
+    hash2, _ = cache.hash_file(file2)
+    assert hash1 != hash2
 
 
 def test_hash_file_uses_state_cache(tmp_path: pathlib.Path) -> None:
@@ -86,7 +89,7 @@ def test_hash_file_uses_state_cache(tmp_path: pathlib.Path) -> None:
     with state.StateDB(db_path) as db:
         cache.hash_file(test_file, state_db=db)  # First hash populates cache
         db.save(test_file, test_file.stat(), "cached_hash")
-        hash2 = cache.hash_file(test_file, state_db=db)
+        hash2, _ = cache.hash_file(test_file, state_db=db)
 
     assert hash2 == "cached_hash"
 
@@ -96,7 +99,7 @@ def test_hash_file_binary(tmp_path: pathlib.Path) -> None:
     test_file = tmp_path / "binary.bin"
     test_file.write_bytes(b"\x00\x01\x02\xff\xfe")
 
-    file_hash = cache.hash_file(test_file)
+    file_hash, _ = cache.hash_file(test_file)
 
     assert len(file_hash) == 16
 
@@ -113,8 +116,8 @@ def test_hash_file_large_uses_mmap(tmp_path: pathlib.Path, monkeypatch: pytest.M
     large_file.write_bytes(b"x" * 150)  # Above threshold
 
     # Both should produce valid hashes
-    small_hash = cache.hash_file(small_file)
-    large_hash = cache.hash_file(large_file)
+    small_hash, _ = cache.hash_file(small_file)
+    large_hash, _ = cache.hash_file(large_file)
 
     assert len(small_hash) == 16
     assert len(large_hash) == 16
@@ -131,11 +134,11 @@ def test_hash_file_mmap_consistent(tmp_path: pathlib.Path, monkeypatch: pytest.M
 
     # Set threshold below content size to force mmap path
     monkeypatch.setattr(cache, "MMAP_THRESHOLD", 10)
-    mmap_hash = cache.hash_file(test_file)
+    mmap_hash, _ = cache.hash_file(test_file)
 
     # Set threshold above content size to force buffered path
     monkeypatch.setattr(cache, "MMAP_THRESHOLD", len(content) + 100)
-    buffered_hash = cache.hash_file(test_file)
+    buffered_hash, _ = cache.hash_file(test_file)
 
     # Both methods must produce identical hash
     assert mmap_hash == buffered_hash
@@ -152,7 +155,7 @@ def test_hash_file_mmap_fallback(tmp_path: pathlib.Path, monkeypatch: pytest.Mon
     monkeypatch.setattr(cache, "MMAP_THRESHOLD", 10)
 
     # Get expected hash via normal path first (mmap succeeds)
-    expected_hash = cache.hash_file(test_file)
+    expected_hash, _ = cache.hash_file(test_file)
 
     # Now make mmap fail
     def failing_mmap(*args: object, **kwargs: object) -> mmap.mmap:
@@ -161,7 +164,7 @@ def test_hash_file_mmap_fallback(tmp_path: pathlib.Path, monkeypatch: pytest.Mon
     monkeypatch.setattr(mmap, "mmap", failing_mmap)
 
     # Should fall back to buffered read and produce same hash
-    fallback_hash = cache.hash_file(test_file)
+    fallback_hash, _ = cache.hash_file(test_file)
     assert fallback_hash == expected_hash
 
 
@@ -298,7 +301,9 @@ def test_hash_directory_handles_deleted_file(
     original_hash_file = cache.hash_file
     call_count = 0
 
-    def hash_file_with_delete(path: pathlib.Path, state_db: state.StateDB | None = None) -> str:
+    def hash_file_with_delete(
+        path: pathlib.Path, state_db: state.StateDB | None = None
+    ) -> tuple[str, os.stat_result]:
         nonlocal call_count
         call_count += 1
         if path.name == "delete.txt":
@@ -335,10 +340,10 @@ def test_hash_file_state_cache_invalidation(tmp_path: pathlib.Path) -> None:
 
     with state.StateDB(db_path) as db:
         # First hash - cache miss
-        hash1 = cache.hash_file(test_file, state_db=db)
+        hash1, _ = cache.hash_file(test_file, state_db=db)
 
         # Second hash - cache hit (should return cached value)
-        cached_hash = cache.hash_file(test_file, state_db=db)
+        cached_hash, _ = cache.hash_file(test_file, state_db=db)
         assert cached_hash == hash1
 
         # Modify file content (changes both mtime and size)
@@ -348,7 +353,7 @@ def test_hash_file_state_cache_invalidation(tmp_path: pathlib.Path) -> None:
         test_file.write_text("modified content")
 
         # Third hash - cache should be invalidated
-        hash2 = cache.hash_file(test_file, state_db=db)
+        hash2, _ = cache.hash_file(test_file, state_db=db)
         assert hash2 != hash1, "Hash should change when file content changes"
 
 
@@ -630,7 +635,7 @@ def test_restore_directory_validates_all_entries_before_writing(
     # Create a real cached file for the first entry
     first_file = tmp_path / "first.txt"
     first_file.write_text("first")
-    first_hash = cache.hash_file(first_file)
+    first_hash, _ = cache.hash_file(first_file)
     cache_path = cache.get_cache_path(cache_dir, first_hash)
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     first_file.rename(cache_path)

@@ -18,7 +18,7 @@ import anyio
 import anyio.from_thread
 import anyio.to_thread
 
-from pivot import config, exceptions, parameters, project, registry
+from pivot import config, exceptions, fingerprint, parameters, project, registry
 from pivot.engine import agent_rpc
 from pivot.engine import graph as engine_graph
 from pivot.engine.types import (
@@ -1203,12 +1203,15 @@ class Engine:
         # Execute affected stages
         await self._execute_affected_stages(affected)
 
-    async def _handle_code_or_config_changed(self, _event: CodeOrConfigChanged) -> None:
+    async def _handle_code_or_config_changed(self, event: CodeOrConfigChanged) -> None:
         """Handle code/config changes by reloading registry and re-running."""
         _logger.info("Code/config changed - reloading pipeline")
 
         # Invalidate caches
         self._invalidate_caches()
+
+        # Invalidate manifest cache entries for changed source files
+        fingerprint.invalidate_manifests_for_paths(event["paths"])
 
         # Reload registry - returns old_stages on success, None on failure
         reload_result = self._reload_registry()
@@ -1220,6 +1223,9 @@ class Engine:
         # Emit reload event
         old_stages, old_registry = reload_result
         await self._emit_reload_event(old_stages, old_registry)
+
+        # Flush manifest cache so cached manifests survive the reload
+        fingerprint.flush_manifest_cache()
 
         # Resolve external deps (e.g. sibling pipelines) before reading stages.
         # Reload bypasses Pipeline.build_dag() so we must resolve explicitly.

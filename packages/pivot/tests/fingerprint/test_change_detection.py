@@ -400,8 +400,11 @@ def test_class_instance_method_change_detected(module_dir: pathlib.Path) -> None
     assert "mod:processor.process" in fp, "Should capture instance method usage"
 
 
-def test_dynamic_dispatch_change_detected(module_dir: pathlib.Path) -> None:
+def test_dynamic_dispatch_change_detected(
+    module_dir: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Functions in dispatch dicts are tracked for change detection."""
+    monkeypatch.setenv("PIVOT_UNSAFE_FINGERPRINTING", "1")
     helpers_py = module_dir / "test_limit_helpers_dyn.py"
     helpers_py.write_text(
         "def add(x):\n    return x + 1\n\n"
@@ -471,8 +474,11 @@ def test_multiple_runs_stable(module_dir: pathlib.Path) -> None:
         assert fp == fingerprints[0], "Fingerprints must be stable across runs"
 
 
-def test_dispatch_dict_function_change_causes_miss(module_dir: pathlib.Path) -> None:
+def test_dispatch_dict_function_change_causes_miss(
+    module_dir: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Changing function inside dispatch dict causes cache miss."""
+    monkeypatch.setenv("PIVOT_UNSAFE_FINGERPRINTING", "1")
     helpers_py = module_dir / "test_dispatch_helpers.py"
     helpers_py.write_text(
         "def add(x):\n    return x + 1\n\n"
@@ -504,8 +510,9 @@ def test_dispatch_dict_function_change_causes_miss(module_dir: pathlib.Path) -> 
     assert hash1 != hash2, "Dispatch dict function change must cause cache miss"
 
 
-def test_list_callable_tracking(module_dir: pathlib.Path) -> None:
+def test_list_callable_tracking(module_dir: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Functions in lists are tracked for change detection."""
+    monkeypatch.setenv("PIVOT_UNSAFE_FINGERPRINTING", "1")
     helpers_py = module_dir / "test_list_helpers.py"
     helpers_py.write_text(
         "def step1(x):\n    return x + 1\n\n"
@@ -529,8 +536,11 @@ def test_list_callable_tracking(module_dir: pathlib.Path) -> None:
     assert "func:PIPELINE[1]" in fp, "Should capture second function in list"
 
 
-def test_fingerprint_ordering_stability(module_dir: pathlib.Path) -> None:
+def test_fingerprint_ordering_stability(
+    module_dir: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Fingerprint is stable regardless of dict key ordering in source."""
+    monkeypatch.setenv("PIVOT_UNSAFE_FINGERPRINTING", "1")
     # Test that different dict key ORDER in source produces same fingerprint
     # (because we sort keys during processing)
     helpers_py = module_dir / "test_order_helpers.py"
@@ -611,8 +621,9 @@ def test_class_definition_change_causes_miss(module_dir: pathlib.Path) -> None:
     assert fp1 != fp2, "Class method change must cause cache miss"
 
 
-def test_class_instance_tracked(module_dir: pathlib.Path) -> None:
+def test_class_instance_tracked(module_dir: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Module-level class instances have their class tracked."""
+    monkeypatch.setenv("PIVOT_UNSAFE_FINGERPRINTING", "1")
     helpers_py = module_dir / "test_instance_helpers.py"
     helpers_py.write_text(
         "class Processor:\n"
@@ -633,8 +644,11 @@ def test_class_instance_tracked(module_dir: pathlib.Path) -> None:
     assert "class:processor.__class__" in fp, "Should capture instance's class"
 
 
-def test_class_instance_change_causes_miss(module_dir: pathlib.Path) -> None:
+def test_class_instance_change_causes_miss(
+    module_dir: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Changing class of a module-level instance causes cache miss."""
+    monkeypatch.setenv("PIVOT_UNSAFE_FINGERPRINTING", "1")
     helpers_py = module_dir / "test_instchange_helpers.py"
     helpers_py.write_text(
         "class Processor:\n"
@@ -666,8 +680,11 @@ def test_class_instance_change_causes_miss(module_dir: pathlib.Path) -> None:
     assert fp1 != fp2, "Instance class change must cause cache miss"
 
 
-def test_nonlocal_class_instance_tracked(module_dir: pathlib.Path) -> None:
+def test_nonlocal_class_instance_tracked(
+    module_dir: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Class instances captured as nonlocals have their class tracked."""
+    monkeypatch.setenv("PIVOT_UNSAFE_FINGERPRINTING", "1")
     helpers_py = module_dir / "test_nonlocal_helpers.py"
     helpers_py.write_text(
         "class Processor:\n"

@@ -171,7 +171,7 @@ def compute_output_changes(
                 if path_obj.is_dir():
                     new_hash, _ = cache.hash_directory(path_obj)
                 else:
-                    new_hash = cache.hash_file(path_obj)
+                    new_hash, _ = cache.hash_file(path_obj)
         except OSError as e:
             logger.debug("Failed to read %s for hashing: %s", path, e)
             new_hash = None

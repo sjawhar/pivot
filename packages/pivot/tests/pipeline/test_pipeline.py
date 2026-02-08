@@ -1135,7 +1135,6 @@ def test_lockfile_contains_project_relative_paths(set_project_root: pathlib.Path
         params={"key": "value"},
         dep_hashes={abs_dep: {"hash": "dep_hash_123"}},
         output_hashes={abs_out: {"hash": "out_hash_456"}},
-        dep_generations={"producer": 1},
     )
 
     # Write the lock file

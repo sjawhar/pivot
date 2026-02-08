@@ -256,11 +256,11 @@ def get_stage_explanation(
                 else:
                     missing_deps.append(dep)
 
-        file_hashes, more_missing, unreadable_deps = worker.hash_dependencies(deps_to_hash)
+        file_hashes, more_missing, unreadable_deps, _ = worker.hash_dependencies(deps_to_hash)
         dep_hashes = {**file_hashes, **fallback_hashes}
         missing_deps.extend(more_missing)
     else:
-        dep_hashes, missing_deps, unreadable_deps = worker.hash_dependencies(deps)
+        dep_hashes, missing_deps, unreadable_deps, _ = worker.hash_dependencies(deps)
 
     if missing_deps:
         # Convert to relative paths for user-facing message

@@ -297,7 +297,7 @@ def cleanup_worker_pool() -> Generator[None]:
 
 
 # Type alias for make_valid_lock_content fixture
-# Returns dict matching StorageLockData structure (code_manifest, params, deps, outs, dep_generations)
+# Returns dict matching StorageLockData structure (code_manifest, params, deps, outs)
 ValidLockContentFactory = Callable[..., dict[str, object]]
 
 
@@ -316,7 +316,6 @@ def make_valid_lock_content() -> ValidLockContentFactory:
             "params": params or {},
             "deps": deps or [],
             "outs": outs or [],
-            "dep_generations": {},
         }
 
     return _factory

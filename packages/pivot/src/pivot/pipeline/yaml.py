@@ -213,6 +213,7 @@ def load_pipeline_from_yaml(pipeline_file: Path) -> Pipeline:
 
     # Flush pending AST hash writes to persistent cache
     fingerprint.flush_ast_hash_cache()
+    fingerprint.flush_manifest_cache()
 
     return p
 

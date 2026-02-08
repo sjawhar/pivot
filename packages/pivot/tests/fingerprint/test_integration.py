@@ -279,8 +279,11 @@ def run_stage():
     assert len(fp["mod:helpers.func_b"]) == 16, "Module attr should be hashed"
 
 
-def test_unsupported_module_attr_type_raises_error(module_dir: pathlib.Path) -> None:
+def test_unsupported_module_attr_type_raises_error(
+    module_dir: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Unsupported types (custom objects, non-primitive collections) in module attrs raise TypeError."""
+    monkeypatch.setenv("PIVOT_UNSAFE_FINGERPRINTING", "1")
     helpers_py = module_dir / "test_mod_helpers_v8.py"
     helpers_py.write_text("""
 # This is an unsupported type - a list containing a custom object
