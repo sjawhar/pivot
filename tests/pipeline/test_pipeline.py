@@ -1269,7 +1269,7 @@ def test_pipeline_register_incremental_out_stage(set_project_root: pathlib.Path)
 
 
 # =============================================================================
-# resolve_from_parents() Tests
+# resolve_external_dependencies() Tests
 # =============================================================================
 
 
@@ -1347,7 +1347,7 @@ def _cycle_child_stage(
     return _CycleChildOutput(a=pathlib.Path("a.txt"))
 
 
-def test_pipeline_resolve_from_parents_skips_existing_files(
+def test_pipeline_resolve_external_dependencies_skips_existing_files(
     set_project_root: pathlib.Path,
 ) -> None:
     """Should treat existing files as external inputs."""
@@ -1359,13 +1359,15 @@ def test_pipeline_resolve_from_parents_skips_existing_files(
     child.register(_external_consumer, name="external_consumer")
 
     # Should not raise, external.txt exists
-    child.resolve_from_parents()
+    child.resolve_external_dependencies()
 
     assert child.list_stages() == ["external_consumer"]
 
 
-def test_pipeline_resolve_from_parents_is_idempotent(set_project_root: pathlib.Path) -> None:
-    """Calling resolve_from_parents multiple times should be safe."""
+def test_pipeline_resolve_external_dependencies_is_idempotent(
+    set_project_root: pathlib.Path,
+) -> None:
+    """Calling resolve_external_dependencies multiple times should be safe."""
     (set_project_root / "pipeline.py").write_text(
         _make_producer_pipeline_code("parent", "producer", "data.txt")
     )
@@ -1375,16 +1377,16 @@ def test_pipeline_resolve_from_parents_is_idempotent(set_project_root: pathlib.P
     child = Pipeline("child", root=child_dir)
     child.register(_parent_data_consumer, name="consumer")
 
-    child.resolve_from_parents()
+    child.resolve_external_dependencies()
     count_after_first = len(child.list_stages())
 
-    child.resolve_from_parents()
+    child.resolve_external_dependencies()
     count_after_second = len(child.list_stages())
 
     assert count_after_first == count_after_second == 2
 
 
-def test_pipeline_resolve_from_parents_prefers_closest_parent(
+def test_pipeline_resolve_external_dependencies_prefers_closest_parent(
     set_project_root: pathlib.Path,
 ) -> None:
     """When multiple parents produce same artifact, should use closest parent first.
@@ -1410,7 +1412,7 @@ def test_pipeline_resolve_from_parents_prefers_closest_parent(
     child = Pipeline("child", root=child_dir)
     child.register(_shared_txt_consumer, name="consumer")
 
-    child.resolve_from_parents()
+    child.resolve_external_dependencies()
 
     # Should include mid_producer (closest), not root_producer
     assert "mid_producer" in child.list_stages(), (
@@ -1428,7 +1430,7 @@ def test_pipeline_resolve_from_parents_prefers_closest_parent(
     )
 
 
-def test_pipeline_resolve_from_parents_continues_on_load_failure(
+def test_pipeline_resolve_external_dependencies_continues_on_load_failure(
     set_project_root: pathlib.Path,
 ) -> None:
     """When parent pipeline fails to load, should continue searching other parents.
@@ -1457,7 +1459,7 @@ wrong_name = Pipeline("broken")
     child.register(_grandparent_data_consumer, name="consumer")
 
     # Should succeed by falling back to root parent
-    child.resolve_from_parents()
+    child.resolve_external_dependencies()
 
     assert "producer" in child.list_stages(), (
         "Expected to find producer from root parent despite mid parent load failure"
@@ -1465,7 +1467,7 @@ wrong_name = Pipeline("broken")
     assert "consumer" in child.list_stages()
 
 
-def test_pipeline_resolve_from_parents_detects_cycles_across_boundaries(
+def test_pipeline_resolve_external_dependencies_detects_cycles_across_boundaries(
     set_project_root: pathlib.Path,
 ) -> None:
     """Should detect circular dependencies when parent stages are included.
@@ -1502,7 +1504,7 @@ pipeline.register(parent_stage)
     child.register(_cycle_child_stage, name="child_stage")
 
     # Resolve includes parent_stage
-    child.resolve_from_parents()
+    child.resolve_external_dependencies()
 
     # build_dag should detect cycle
     with pytest.raises(exceptions.CyclicGraphError) as exc_info:
@@ -1515,7 +1517,9 @@ pipeline.register(parent_stage)
     )
 
 
-def test_pipeline_resolve_from_parents_no_parents_is_noop(set_project_root: pathlib.Path) -> None:
+def test_pipeline_resolve_external_dependencies_no_parents_is_noop(
+    set_project_root: pathlib.Path,
+) -> None:
     """When child is at project root with no parents, should be a no-op.
 
     Edge case: ensures we handle the boundary condition gracefully.
@@ -1523,21 +1527,15 @@ def test_pipeline_resolve_from_parents_no_parents_is_noop(set_project_root: path
     # Pipeline at project root (no parents to search)
     pipeline = Pipeline("root_pipeline", root=set_project_root)
 
-    class Output(TypedDict):
-        result: Annotated[pathlib.Path, outputs.Out("result.txt", loaders.PathOnly())]
-
-    def stage() -> Output:
-        return Output(result=pathlib.Path("result.txt"))
-
-    pipeline.register(stage, name="stage")
+    pipeline.register(_simple_stage, name="stage")
 
     # Should not raise, just be a no-op
-    pipeline.resolve_from_parents()
+    pipeline.resolve_external_dependencies()
 
     assert pipeline.list_stages() == ["stage"]
 
 
-def test_pipeline_resolve_from_parents_empty_work_queue_optimization(
+def test_pipeline_resolve_external_dependencies_empty_work_queue_optimization(
     set_project_root: pathlib.Path, mocker: MockerFixture
 ) -> None:
     """When all dependencies are locally satisfied, should return early without searching parents.
@@ -1562,7 +1560,7 @@ raise RuntimeError("Parent should not be loaded!")
 
     spy = mocker.spy(discovery, "find_parent_pipeline_paths")
 
-    child.resolve_from_parents()
+    child.resolve_external_dependencies()
 
     # Should return early without parent traversal
     assert spy.call_count == 0, (
@@ -1571,7 +1569,7 @@ raise RuntimeError("Parent should not be loaded!")
     assert child.list_stages() == ["stage_a"]
 
 
-def test_pipeline_resolve_from_parents_empty_parent_pipeline(
+def test_pipeline_resolve_external_dependencies_empty_parent_pipeline(
     set_project_root: pathlib.Path,
 ) -> None:
     """Parent pipeline with no stages should be skipped gracefully.
@@ -1592,7 +1590,7 @@ pipeline = Pipeline("empty_parent")
     child.register(_missing_file_consumer, name="consumer")
 
     # Should not raise during resolution (will fail at build_dag validation)
-    child.resolve_from_parents()
+    child.resolve_external_dependencies()
 
     assert child.list_stages() == ["consumer"], "Empty parent shouldn't add stages"
 
@@ -1601,7 +1599,7 @@ pipeline = Pipeline("empty_parent")
         child.build_dag(validate=True)
 
 
-def test_pipeline_resolve_from_parents_logs_included_stages(
+def test_pipeline_resolve_external_dependencies_logs_included_stages(
     set_project_root: pathlib.Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Should log debug messages when including stages from parent.
@@ -1622,7 +1620,7 @@ def test_pipeline_resolve_from_parents_logs_included_stages(
     child.register(_parent_data_consumer, name="consumer")
 
     with caplog.at_level(logging.DEBUG):
-        child.resolve_from_parents()
+        child.resolve_external_dependencies()
 
     # Verify log messages about included stage
     assert any(

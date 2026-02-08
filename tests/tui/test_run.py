@@ -1059,3 +1059,62 @@ async def test_action_force_rerun_stage_failure_notifies(mocker: MockerFixture) 
     # Last call should be the error
     last_call_args = str(mock_notify.call_args_list[-1])
     assert "Failed" in last_call_args or "error" in last_call_args
+
+
+# =============================================================================
+# StageDataProvider Protocol Tests
+# =============================================================================
+
+
+def test_stage_data_provider_protocol_is_importable() -> None:
+    """StageDataProvider protocol can be imported from tui.types."""
+    from pivot.tui.types import StageDataProvider
+
+    assert hasattr(StageDataProvider, "get_stage")
+    assert hasattr(StageDataProvider, "ensure_fingerprint")
+
+
+def test_pivot_app_accepts_stage_data_provider(mocker: MockerFixture) -> None:
+    """PivotApp stores stage_data_provider when passed."""
+    from pivot.tui.types import StageDataProvider
+
+    provider = mocker.MagicMock(spec=StageDataProvider)
+    app = run_tui.PivotApp(stage_names=["s1"], stage_data_provider=provider)
+    assert app._stage_data_provider is provider
+
+
+def test_create_history_entry_uses_provider(mocker: MockerFixture) -> None:
+    """_create_history_entry uses stage_data_provider instead of cli_helpers."""
+    from pivot.tui.types import StageDataProvider
+
+    mock_provider = mocker.MagicMock(spec=StageDataProvider)
+    mock_provider.get_stage.return_value = {
+        "deps_paths": [],
+        "outs_paths": [],
+        "params": None,
+    }
+    mock_provider.ensure_fingerprint.return_value = {"func": "abc123"}
+
+    app = run_tui.PivotApp(
+        stage_names=["stage_a"],
+        watch_mode=True,
+        stage_data_provider=mock_provider,
+    )
+
+    mocker.patch("pivot.tui.run.explain.get_stage_explanation", return_value=None)
+    mocker.patch("pivot.tui.run.parameters.load_params_yaml", return_value={})
+    mocker.patch("pivot.tui.run.config.get_state_dir", return_value=pathlib.Path("/fake"))
+
+    app._create_history_entry("stage_a", "run-1")
+
+    mock_provider.get_stage.assert_called_with("stage_a")
+    mock_provider.ensure_fingerprint.assert_called_with("stage_a")
+
+
+def test_create_history_entry_without_provider() -> None:
+    """_create_history_entry works without provider (no snapshot)."""
+    app = run_tui.PivotApp(stage_names=["stage_a"], watch_mode=True)
+    # No provider, no cli_helpers mock — should not raise
+    app._create_history_entry("stage_a", "run-1")
+    assert "stage_a" in app._pending_history
+    assert app._pending_history["stage_a"].input_snapshot is None

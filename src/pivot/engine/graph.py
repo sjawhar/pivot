@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import pathlib
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypedDict
 
 import networkx as nx
 import pygtrie
@@ -19,7 +19,6 @@ if TYPE_CHECKING:
 __all__ = [
     "artifact_node",
     "stage_node",
-    "parse_node",
     "build_graph",
     "build_tracked_trie",
     "get_consumers",
@@ -31,7 +30,25 @@ __all__ = [
     "update_stage",
     "get_artifact_consumers",
     "get_execution_order",
+    "GraphView",
+    "extract_graph_view",
 ]
+
+
+class GraphView(TypedDict):
+    """Pre-extracted graph data for rendering.
+
+    Decouples renderers from the internal bipartite graph representation.
+    All node identifiers are plain strings (stage names, artifact paths)
+    with no encoding prefixes.
+
+    Edge direction is data-flow: producer -> consumer / input -> output.
+    """
+
+    stages: list[str]
+    artifacts: list[str]
+    stage_edges: list[tuple[str, str]]
+    artifact_edges: list[tuple[str, str]]
 
 
 def artifact_node(path: Path) -> str:
@@ -63,12 +80,11 @@ def _build_outputs_map(stages: dict[str, RegistryStageInfo]) -> dict[str, str]:
         All paths are already normalized (absolute) by registry.py,
         so simple dict lookup is sufficient.
     """
-    outputs_map = {
+    return {
         out_path: stage_name
         for stage_name, stage_info in stages.items()
         for out_path in stage_info["outs_paths"]
     }
-    return outputs_map
 
 
 def _build_outputs_trie(stages: dict[str, RegistryStageInfo]) -> pygtrie.Trie[tuple[str, str]]:
@@ -429,6 +445,75 @@ def get_stage_dag(g: nx.DiGraph[str]) -> nx.DiGraph[str]:
                     stage_dag.add_edge(consumer_name, stage_name)
 
     return stage_dag
+
+
+def extract_graph_view(g: nx.DiGraph[str]) -> GraphView:
+    """Extract a renderer-friendly view from the bipartite graph.
+
+    Walks the bipartite graph, collecting stage names, artifact paths,
+    and derived edges without exposing the internal node encoding.
+
+    Edge semantics (data-flow direction):
+    - stage_edges: (producer_stage, consumer_stage)
+    - artifact_edges: (input_artifact, output_artifact)
+
+    Args:
+        g: Bipartite artifact-stage graph from build_graph().
+
+    Returns:
+        GraphView with plain-string nodes and edges.
+    """
+    stages = list[str]()
+    artifacts = list[str]()
+    stage_edges_set = set[tuple[str, str]]()
+    artifact_edges_set = set[tuple[str, str]]()
+
+    # Collect nodes by type
+    for node in g.nodes():
+        node_type, value = parse_node(node)
+        if node_type == NodeType.STAGE:
+            stages.append(value)
+        else:
+            artifacts.append(value)
+
+    # Derive stage-to-stage edges (producer -> consumer)
+    # Walk: stage -> artifact (produces) -> stage (consumes)
+    # Use set to deduplicate edges (directory deps can create multiple paths)
+    for node in g.nodes():
+        if g.nodes[node]["type"] != NodeType.STAGE:
+            continue
+        _, producer_name = parse_node(node)
+        for art_succ in g.successors(node):
+            if g.nodes[art_succ]["type"] != NodeType.ARTIFACT:
+                continue
+            for consumer_node in g.successors(art_succ):
+                if g.nodes[consumer_node]["type"] != NodeType.STAGE:
+                    continue
+                _, consumer_name = parse_node(consumer_node)
+                stage_edges_set.add((producer_name, consumer_name))
+
+    # Derive artifact-to-artifact edges (input -> output)
+    # Walk: artifact -> stage (consumes) -> artifact (produces)
+    # Use set to deduplicate edges (multiple stages can create same artifact flow)
+    for node in g.nodes():
+        if g.nodes[node]["type"] != NodeType.ARTIFACT:
+            continue
+        _, input_path = parse_node(node)
+        for stage_succ in g.successors(node):
+            if g.nodes[stage_succ]["type"] != NodeType.STAGE:
+                continue
+            for output_node in g.successors(stage_succ):
+                if g.nodes[output_node]["type"] != NodeType.ARTIFACT:
+                    continue
+                _, output_path = parse_node(output_node)
+                artifact_edges_set.add((input_path, output_path))
+
+    return GraphView(
+        stages=stages,
+        artifacts=artifacts,
+        stage_edges=sorted(stage_edges_set),
+        artifact_edges=sorted(artifact_edges_set),
+    )
 
 
 def get_artifact_consumers(

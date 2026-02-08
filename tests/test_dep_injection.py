@@ -74,7 +74,7 @@ def test_get_dep_specs_single_dep() -> None:
     ) -> _ProcessOutputs:
         return {"result": {"count": len(data)}}
 
-    specs = stage_def.get_dep_specs_from_signature(process)
+    specs = stage_def.extract_stage_definition(process, process.__name__).dep_specs
 
     assert len(specs) == 1
     assert "data" in specs
@@ -93,7 +93,7 @@ def test_get_dep_specs_multiple_deps() -> None:
     ) -> _MultiDepOutputs:
         return {"combined": {"train": len(train), "test": len(test)}}
 
-    specs = stage_def.get_dep_specs_from_signature(process)
+    specs = stage_def.extract_stage_definition(process, process.__name__).dep_specs
 
     assert len(specs) == 2
     assert "train" in specs
@@ -113,7 +113,7 @@ def test_get_dep_specs_mixed_with_params() -> None:
     ) -> _TrainOutputs:
         return {"model": {"weights": config.learning_rate}}
 
-    specs = stage_def.get_dep_specs_from_signature(train)
+    specs = stage_def.extract_stage_definition(train, train.__name__).dep_specs
 
     # Only 'data' should be extracted as a Dep, not 'config'
     assert len(specs) == 1
@@ -127,7 +127,7 @@ def test_get_dep_specs_no_deps() -> None:
     def simple(config: _TrainParams) -> _TrainOutputs:
         return {"model": {"weights": config.learning_rate}}
 
-    specs = stage_def.get_dep_specs_from_signature(simple)
+    specs = stage_def.extract_stage_definition(simple, simple.__name__).dep_specs
 
     assert specs == {}
 
@@ -143,7 +143,7 @@ def test_get_dep_specs_list_path() -> None:
     ) -> _ProcessOutputs:
         return {"result": {"count": sum(len(df) for df in shards)}}
 
-    specs = stage_def.get_dep_specs_from_signature(process)
+    specs = stage_def.extract_stage_definition(process, process.__name__).dep_specs
 
     assert len(specs) == 1
     assert specs["shards"].path == ["shard1.csv", "shard2.csv"]
@@ -243,7 +243,7 @@ def test_get_output_spec_from_single_return() -> None:
     ) -> Annotated[pandas.DataFrame, outputs.Out("output.csv", loaders.CSV[pandas.DataFrame]())]:
         return data.dropna()
 
-    spec = stage_def.get_single_output_spec_from_return(transform)
+    spec = stage_def.extract_stage_definition(transform, transform.__name__).single_out_spec
 
     assert spec is not None
     assert spec.path == "output.csv"
@@ -260,7 +260,7 @@ def test_get_output_spec_from_single_return_none_for_typeddict() -> None:
     ) -> _ProcessOutputs:
         return {"result": {"count": len(data)}}
 
-    spec = stage_def.get_single_output_spec_from_return(process)
+    spec = stage_def.extract_stage_definition(process, process.__name__).single_out_spec
 
     assert spec is None
 
@@ -310,7 +310,7 @@ def test_out_annotation_extraction_from_typeddict() -> None:
     def train(config: _TrainParams) -> _OutTestOutputs:
         return {"model": {"w": 1.0}, "metrics": {"loss": 0.1}}
 
-    specs = stage_def.get_output_specs_from_return(train, "test_stage")
+    specs = stage_def.extract_stage_definition(train, "test_stage").out_specs
 
     assert len(specs) == 2
     assert "model" in specs
@@ -325,7 +325,7 @@ def test_save_outputs_with_out_annotation(tmp_path: pathlib.Path) -> None:
     def process() -> _SingleOutTestOutputs:
         return {"result": {"count": 42}}
 
-    specs = stage_def.get_output_specs_from_return(process, "test_stage")
+    specs = stage_def.extract_stage_definition(process, "test_stage").out_specs
     return_value: _SingleOutTestOutputs = {"result": {"count": 42}}
 
     stage_def.save_return_outputs(return_value, specs, tmp_path)
@@ -351,7 +351,7 @@ def test_load_deps_from_specs(tmp_path: pathlib.Path) -> None:
     ) -> _ProcessOutputs:
         return {"result": data}
 
-    specs = stage_def.get_dep_specs_from_signature(process)
+    specs = stage_def.extract_stage_definition(process, process.__name__).dep_specs
     loaded = stage_def.load_deps_from_specs(specs, tmp_path)
 
     assert "data" in loaded
@@ -370,7 +370,7 @@ def test_load_deps_multiple_files(tmp_path: pathlib.Path) -> None:
     ) -> _MultiDepOutputs:
         return {"combined": {**left, **right}}
 
-    specs = stage_def.get_dep_specs_from_signature(process)
+    specs = stage_def.extract_stage_definition(process, process.__name__).dep_specs
     loaded = stage_def.load_deps_from_specs(specs, tmp_path)
 
     assert loaded["left"] == {"x": 1}
@@ -391,7 +391,7 @@ def test_load_deps_list_path(tmp_path: pathlib.Path) -> None:
     ) -> _ProcessOutputs:
         return {"result": {"count": len(shards)}}
 
-    specs = stage_def.get_dep_specs_from_signature(process)
+    specs = stage_def.extract_stage_definition(process, process.__name__).dep_specs
     loaded = stage_def.load_deps_from_specs(specs, tmp_path)
 
     assert loaded["shards"] == [{"a": 1}, {"b": 2}]
@@ -413,7 +413,7 @@ def test_find_params_type_in_signature() -> None:
     ) -> _TrainOutputs:
         return {"model": {"weights": config.learning_rate}}
 
-    params_type = stage_def.find_params_type_in_signature(train)
+    params_type = stage_def.extract_stage_definition(train, train.__name__).params_type
 
     assert params_type is _TrainParams
 
@@ -428,7 +428,7 @@ def test_find_params_type_no_params() -> None:
     ) -> _ProcessOutputs:
         return {"result": {"count": len(data)}}
 
-    params_type = stage_def.find_params_type_in_signature(process)
+    params_type = stage_def.extract_stage_definition(process, process.__name__).params_type
 
     assert params_type is None
 
@@ -444,10 +444,10 @@ def test_find_params_arg_name() -> None:
     ) -> _TrainOutputs:
         return {"model": {"weights": cfg.learning_rate}}
 
-    arg_name, params_type = stage_def.find_params_in_signature(train)
+    defn = stage_def.extract_stage_definition(train, train.__name__)
 
-    assert arg_name == "cfg"
-    assert params_type is _TrainParams
+    assert defn.params_arg_name == "cfg"
+    assert defn.params_type is _TrainParams
 
 
 # ==============================================================================
@@ -480,8 +480,9 @@ def test_worker_injects_deps(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyP
     ring_buffer = worker._OutputRingBuffer()
 
     # Get dep specs and out specs for the worker
-    dep_specs = stage_def.get_dep_specs_from_signature(process)
-    out_specs = stage_def.get_output_specs_from_return(process, "test_stage")
+    defn = stage_def.extract_stage_definition(process, "test_stage")
+    dep_specs = defn.dep_specs
+    out_specs = defn.out_specs
 
     worker._run_stage_function_with_injection(
         process,
@@ -530,10 +531,11 @@ def test_worker_injects_params_and_deps(
     output_queue: Queue[OutputMessage] = Queue()
     ring_buffer = worker._OutputRingBuffer()
 
-    dep_specs = stage_def.get_dep_specs_from_signature(train)
-    out_specs = stage_def.get_output_specs_from_return(train, "test_stage")
+    defn = stage_def.extract_stage_definition(train, "test_stage")
+    dep_specs = defn.dep_specs
+    out_specs = defn.out_specs
 
-    params_arg_name, _ = stage_def.find_params_in_signature(train)
+    params_arg_name = defn.params_arg_name
 
     worker._run_stage_function_with_injection(
         train,
@@ -583,9 +585,9 @@ def test_get_placeholder_dep_names_identifies_placeholders() -> None:
     ) -> _MultiDepOutputs:
         return {"combined": {"count": len(baseline) + len(experiment)}}
 
-    placeholder_names = stage_def.get_placeholder_dep_names(compare)
+    defn = stage_def.extract_stage_definition(compare, "compare", strict=False)
 
-    assert placeholder_names == {"baseline", "experiment"}
+    assert defn.placeholder_dep_names == {"baseline", "experiment"}
 
 
 def test_get_placeholder_dep_names_returns_empty_for_no_placeholders() -> None:
@@ -598,9 +600,9 @@ def test_get_placeholder_dep_names_returns_empty_for_no_placeholders() -> None:
     ) -> _ProcessOutputs:
         return {"result": {"count": len(data)}}
 
-    placeholder_names = stage_def.get_placeholder_dep_names(process)
+    defn = stage_def.extract_stage_definition(process, "process", strict=False)
 
-    assert placeholder_names == set()
+    assert defn.placeholder_dep_names == frozenset()
 
 
 def test_get_dep_specs_with_placeholder_and_overrides() -> None:
@@ -620,7 +622,7 @@ def test_get_dep_specs_with_placeholder_and_overrides() -> None:
         "baseline": "model_a/results.csv",
         "experiment": "model_b/results.csv",
     }
-    specs = stage_def.get_dep_specs_from_signature(compare, overrides)
+    specs = stage_def.extract_stage_definition(compare, compare.__name__, overrides).dep_specs
 
     assert specs["baseline"].path == "model_a/results.csv"
     assert specs["experiment"].path == "model_b/results.csv"
@@ -641,14 +643,14 @@ def test_get_dep_specs_mixed_placeholder_and_regular() -> None:
         return {"combined": {"count": 0}}
 
     overrides = {"baseline": "model_a/results.csv"}
-    specs = stage_def.get_dep_specs_from_signature(compare, overrides)
+    specs = stage_def.extract_stage_definition(compare, compare.__name__, overrides).dep_specs
 
     assert specs["baseline"].path == "model_a/results.csv"
     assert specs["config"].path == "config.json"
 
 
-def test_get_dep_specs_placeholder_without_override_raises() -> None:
-    """Should raise when PlaceholderDep has no override."""
+def test_get_dep_specs_placeholder_without_override_skips() -> None:
+    """PlaceholderDep without override is skipped in dep_specs but recorded in placeholder_dep_names."""
 
     def compare(
         baseline: Annotated[
@@ -657,12 +659,13 @@ def test_get_dep_specs_placeholder_without_override_raises() -> None:
     ) -> _MultiDepOutputs:
         return {"combined": {"count": 0}}
 
-    with pytest.raises(ValueError, match="PlaceholderDep .* requires override"):
-        stage_def.get_dep_specs_from_signature(compare, {})
+    defn = stage_def.extract_stage_definition(compare, "compare", {}, strict=False)
+    assert "baseline" not in defn.dep_specs
+    assert "baseline" in defn.placeholder_dep_names
 
 
-def test_get_dep_specs_placeholder_none_overrides_raises() -> None:
-    """Should raise when PlaceholderDep exists but overrides is None."""
+def test_get_dep_specs_placeholder_none_overrides_skips() -> None:
+    """PlaceholderDep with None overrides is skipped in dep_specs but recorded in placeholder_dep_names."""
 
     def compare(
         baseline: Annotated[
@@ -671,8 +674,9 @@ def test_get_dep_specs_placeholder_none_overrides_raises() -> None:
     ) -> _MultiDepOutputs:
         return {"combined": {"count": 0}}
 
-    with pytest.raises(ValueError, match="PlaceholderDep .* requires override"):
-        stage_def.get_dep_specs_from_signature(compare, None)
+    defn = stage_def.extract_stage_definition(compare, "compare", None, strict=False)
+    assert "baseline" not in defn.dep_specs
+    assert "baseline" in defn.placeholder_dep_names
 
 
 def test_placeholder_dep_list_path_override() -> None:
@@ -686,7 +690,9 @@ def test_placeholder_dep_list_path_override() -> None:
         return {"result": {"count": len(shards)}}
 
     overrides = {"shards": ["shard1.csv", "shard2.csv", "shard3.csv"]}
-    specs = stage_def.get_dep_specs_from_signature(process_shards, overrides)
+    specs = stage_def.extract_stage_definition(
+        process_shards, process_shards.__name__, overrides
+    ).dep_specs
 
     assert specs["shards"].path == ["shard1.csv", "shard2.csv", "shard3.csv"]
 
@@ -703,7 +709,9 @@ def test_placeholder_dep_tuple_path_override() -> None:
         return {"result": {"count": 2}}
 
     overrides = {"pair": ("left.csv", "right.csv")}
-    specs = stage_def.get_dep_specs_from_signature(compare_pair, overrides)
+    specs = stage_def.extract_stage_definition(
+        compare_pair, compare_pair.__name__, overrides
+    ).dep_specs
 
     assert specs["pair"].path == ("left.csv", "right.csv")
 
@@ -719,7 +727,7 @@ def test_get_dep_specs_regular_dep_with_override() -> None:
         return {"result": {"count": len(data)}}
 
     overrides = {"data": "custom/override.csv"}
-    specs = stage_def.get_dep_specs_from_signature(process, overrides)
+    specs = stage_def.extract_stage_definition(process, process.__name__, overrides).dep_specs
 
     assert specs["data"].path == "custom/override.csv"
 
@@ -735,7 +743,7 @@ def test_placeholder_dep_empty_string_override_raises() -> None:
         return {"result": {"count": 0}}
 
     with pytest.raises(ValueError, match="override cannot be empty"):
-        stage_def.get_dep_specs_from_signature(process, {"baseline": ""})
+        stage_def.extract_stage_definition(process, process.__name__, {"baseline": ""})
 
 
 def test_placeholder_dep_empty_list_override_raises() -> None:
@@ -749,7 +757,7 @@ def test_placeholder_dep_empty_list_override_raises() -> None:
         return {"result": {"count": 0}}
 
     with pytest.raises(ValueError, match="override contains empty path"):
-        stage_def.get_dep_specs_from_signature(process, {"shards": []})
+        stage_def.extract_stage_definition(process, process.__name__, {"shards": []})
 
 
 def test_placeholder_dep_list_with_empty_element_raises() -> None:
@@ -763,7 +771,9 @@ def test_placeholder_dep_list_with_empty_element_raises() -> None:
         return {"result": {"count": 0}}
 
     with pytest.raises(ValueError, match="override contains empty path"):
-        stage_def.get_dep_specs_from_signature(process, {"shards": ["a.csv", "", "c.csv"]})
+        stage_def.extract_stage_definition(
+            process, process.__name__, {"shards": ["a.csv", "", "c.csv"]}
+        )
 
 
 # ==============================================================================
@@ -781,7 +791,7 @@ def test_load_deps_missing_file_raises(tmp_path: pathlib.Path) -> None:
     ) -> _ProcessOutputs:
         return {"result": data}
 
-    specs = stage_def.get_dep_specs_from_signature(process)
+    specs = stage_def.extract_stage_definition(process, process.__name__).dep_specs
 
     with pytest.raises(RuntimeError, match="Failed to load dependency"):
         stage_def.load_deps_from_specs(specs, tmp_path)
@@ -797,7 +807,7 @@ def test_load_deps_invalid_json_raises(tmp_path: pathlib.Path) -> None:
     ) -> _ProcessOutputs:
         return {"result": data}
 
-    specs = stage_def.get_dep_specs_from_signature(process)
+    specs = stage_def.extract_stage_definition(process, process.__name__).dep_specs
 
     with pytest.raises(RuntimeError, match="Failed to load dependency"):
         stage_def.load_deps_from_specs(specs, tmp_path)
@@ -813,7 +823,7 @@ def test_load_deps_wrong_type_in_file(tmp_path: pathlib.Path) -> None:
     ) -> _ProcessOutputs:
         return {"result": data}
 
-    specs = stage_def.get_dep_specs_from_signature(process)
+    specs = stage_def.extract_stage_definition(process, process.__name__).dep_specs
 
     # Should load successfully - type checking is not enforced at load time
     loaded = stage_def.load_deps_from_specs(specs, tmp_path)
@@ -822,7 +832,7 @@ def test_load_deps_wrong_type_in_file(tmp_path: pathlib.Path) -> None:
 
 
 def test_get_dep_specs_unresolved_placeholder_with_partial_overrides() -> None:
-    """get_dep_specs raises when PlaceholderDep missing from overrides dict."""
+    """Unresolved PlaceholderDep is skipped in dep_specs but recorded in placeholder_dep_names."""
 
     def compare(
         baseline: Annotated[
@@ -837,5 +847,7 @@ def test_get_dep_specs_unresolved_placeholder_with_partial_overrides() -> None:
     # Only provide override for one placeholder
     overrides = {"baseline": "model_a/results.csv"}
 
-    with pytest.raises(ValueError, match="PlaceholderDep.*experiment.*requires override"):
-        stage_def.get_dep_specs_from_signature(compare, overrides)
+    defn = stage_def.extract_stage_definition(compare, "compare", overrides, strict=False)
+    assert "baseline" in defn.dep_specs
+    assert "experiment" not in defn.dep_specs
+    assert defn.placeholder_dep_names == {"baseline", "experiment"}

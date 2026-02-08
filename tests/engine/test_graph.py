@@ -871,3 +871,231 @@ def test_tracked_file_inside_directory_validates(tmp_path: Path) -> None:
     # Should NOT raise - dependency is inside tracked directory
     g = graph.build_graph(stages, validate=True, tracked_files=tracked_files)
     assert "stage:consumer" in g
+
+
+# --- extract_graph_view tests ---
+
+
+@pytest.mark.usefixtures("clean_registry")
+def test_extract_graph_view_empty() -> None:
+    """extract_graph_view on empty graph returns empty lists."""
+    g = graph.build_graph({})
+    view = graph.extract_graph_view(g)
+
+    assert view["stages"] == []
+    assert view["artifacts"] == []
+    assert view["stage_edges"] == []
+    assert view["artifact_edges"] == []
+
+
+@pytest.mark.usefixtures("clean_registry")
+def test_extract_graph_view_single_stage(tmp_path: Path) -> None:
+    """extract_graph_view extracts stage and artifact from single-stage graph."""
+    input_file = tmp_path / "input.csv"
+    output_file = tmp_path / "output.csv"
+    input_file.touch()
+
+    stages = {
+        "stage_a": _create_stage("stage_a", [str(input_file)], [str(output_file)]),
+    }
+    g = graph.build_graph(stages)
+    view = graph.extract_graph_view(g)
+
+    assert view["stages"] == ["stage_a"]
+    assert set(view["artifacts"]) == {str(input_file), str(output_file)}
+    # Single stage with no downstream — no stage edges
+    assert view["stage_edges"] == []
+    # Artifact edges: input -> output (through stage_a)
+    assert (str(input_file), str(output_file)) in view["artifact_edges"]
+
+
+@pytest.mark.usefixtures("clean_registry")
+def test_extract_graph_view_linear_chain(tmp_path: Path) -> None:
+    """extract_graph_view extracts correct edges for a linear chain."""
+    input_file = tmp_path / "input.csv"
+    intermediate = tmp_path / "intermediate.csv"
+    output_file = tmp_path / "output.csv"
+    input_file.touch()
+
+    stages = {
+        "stage_a": _create_stage("stage_a", [str(input_file)], [str(intermediate)]),
+        "stage_b": _create_stage("stage_b", [str(intermediate)], [str(output_file)]),
+    }
+    g = graph.build_graph(stages)
+    view = graph.extract_graph_view(g)
+
+    assert set(view["stages"]) == {"stage_a", "stage_b"}
+    assert set(view["artifacts"]) == {str(input_file), str(intermediate), str(output_file)}
+    # stage_a -> stage_b (producer -> consumer, data-flow direction)
+    assert ("stage_a", "stage_b") in view["stage_edges"]
+    # artifact edges: input -> intermediate, intermediate -> output
+    assert (str(input_file), str(intermediate)) in view["artifact_edges"]
+    assert (str(intermediate), str(output_file)) in view["artifact_edges"]
+
+
+@pytest.mark.usefixtures("clean_registry")
+def test_extract_graph_view_diamond(tmp_path: Path) -> None:
+    """extract_graph_view handles diamond DAG correctly."""
+    input_file = tmp_path / "input.csv"
+    clean = tmp_path / "clean.csv"
+    feats = tmp_path / "feats.csv"
+    model = tmp_path / "model.pkl"
+    input_file.touch()
+
+    stages = {
+        "preprocess": _create_stage("preprocess", [str(input_file)], [str(clean)]),
+        "features": _create_stage("features", [str(input_file)], [str(feats)]),
+        "train": _create_stage("train", [str(clean), str(feats)], [str(model)]),
+    }
+    g = graph.build_graph(stages)
+    view = graph.extract_graph_view(g)
+
+    assert set(view["stages"]) == {"preprocess", "features", "train"}
+    # Stage edges (producer -> consumer)
+    assert ("preprocess", "train") in view["stage_edges"]
+    assert ("features", "train") in view["stage_edges"]
+
+
+@pytest.mark.usefixtures("clean_registry")
+def test_extract_graph_view_stage_with_multiple_outputs(tmp_path: Path) -> None:
+    """extract_graph_view deduplicates stage edges when multiple artifacts connect stages.
+
+    Stage A produces [file1.csv, file2.csv], Stage B consumes both.
+    Should create ONE stage edge (A->B) despite two artifact paths.
+    """
+    input_file = tmp_path / "input.csv"
+    file1 = tmp_path / "file1.csv"
+    file2 = tmp_path / "file2.csv"
+    output_file = tmp_path / "output.csv"
+    input_file.touch()
+
+    stages = {
+        "stage_a": _create_stage("stage_a", [str(input_file)], [str(file1), str(file2)]),
+        "stage_b": _create_stage("stage_b", [str(file1), str(file2)], [str(output_file)]),
+    }
+    g = graph.build_graph(stages)
+    view = graph.extract_graph_view(g)
+
+    assert set(view["stages"]) == {"stage_a", "stage_b"}
+
+    # Stage edges: A->B appears ONCE (deduplicated despite two artifact connections)
+    stage_edges = view["stage_edges"]
+    assert stage_edges.count(("stage_a", "stage_b")) == 1, (
+        "Stage edges should be deduplicated when multiple artifacts connect same stages"
+    )
+    assert len(stage_edges) == 1, f"Expected exactly 1 stage edge, got {len(stage_edges)}"
+
+    # Artifact edges: input -> file1, input -> file2, file1 -> output, file2 -> output
+    artifact_edges = set(view["artifact_edges"])
+    assert (str(input_file), str(file1)) in artifact_edges
+    assert (str(input_file), str(file2)) in artifact_edges
+    assert (str(file1), str(output_file)) in artifact_edges
+    assert (str(file2), str(output_file)) in artifact_edges
+    assert len(artifact_edges) == 4
+
+
+@pytest.mark.usefixtures("clean_registry")
+def test_extract_graph_view_external_input_artifacts(tmp_path: Path) -> None:
+    """extract_graph_view handles external inputs (no producer) correctly.
+
+    External input files should appear in artifacts but have no incoming edges.
+    """
+    input_file = tmp_path / "input.csv"
+    output_file = tmp_path / "output.csv"
+    input_file.touch()
+
+    stages = {
+        "stage_a": _create_stage("stage_a", [str(input_file)], [str(output_file)]),
+    }
+    g = graph.build_graph(stages)
+    view = graph.extract_graph_view(g)
+
+    # Check external input has NO incoming artifact edges
+    artifact_edges = view["artifact_edges"]
+    for _src, dst in artifact_edges:
+        assert dst != str(input_file), (
+            f"External input {input_file} should not be a destination in artifact edges"
+        )
+
+    # But it SHOULD have outgoing edges
+    assert (str(input_file), str(output_file)) in artifact_edges
+
+
+@pytest.mark.usefixtures("clean_registry")
+def test_extract_graph_view_no_spurious_edges(tmp_path: Path) -> None:
+    """extract_graph_view should not create edges between unconnected stages."""
+    input_a = tmp_path / "input_a.csv"
+    input_b = tmp_path / "input_b.csv"
+    output_a = tmp_path / "output_a.csv"
+    output_b = tmp_path / "output_b.csv"
+    input_a.touch()
+    input_b.touch()
+
+    stages = {
+        "stage_a": _create_stage("stage_a", [str(input_a)], [str(output_a)]),
+        "stage_b": _create_stage("stage_b", [str(input_b)], [str(output_b)]),
+    }
+    g = graph.build_graph(stages)
+    view = graph.extract_graph_view(g)
+
+    # No stage edges should exist (disconnected components)
+    assert view["stage_edges"] == []
+
+    # Only artifact edges within each component
+    artifact_edges = set(view["artifact_edges"])
+    assert (str(input_a), str(output_a)) in artifact_edges
+    assert (str(input_b), str(output_b)) in artifact_edges
+
+    # No cross-edges between components
+    assert (str(input_a), str(output_b)) not in artifact_edges
+    assert (str(input_b), str(output_a)) not in artifact_edges
+
+    # Exact count
+    assert len(artifact_edges) == 2
+
+
+@pytest.mark.usefixtures("clean_registry")
+def test_extract_graph_view_complex_diamond_with_edge_verification(tmp_path: Path) -> None:
+    """extract_graph_view with strict edge verification for complex diamond.
+
+    Verifies exact edge count and directionality for diamond pattern.
+    """
+    input_file = tmp_path / "input.csv"
+    clean = tmp_path / "clean.csv"
+    feats = tmp_path / "feats.csv"
+    model = tmp_path / "model.pkl"
+    input_file.touch()
+
+    stages = {
+        "preprocess": _create_stage("preprocess", [str(input_file)], [str(clean)]),
+        "features": _create_stage("features", [str(input_file)], [str(feats)]),
+        "train": _create_stage("train", [str(clean), str(feats)], [str(model)]),
+    }
+    g = graph.build_graph(stages)
+    view = graph.extract_graph_view(g)
+
+    # Verify stage edges with exact counts and no reverse edges
+    stage_edges = view["stage_edges"]
+    assert stage_edges.count(("preprocess", "train")) == 1
+    assert stage_edges.count(("features", "train")) == 1
+    assert ("train", "preprocess") not in stage_edges
+    assert ("train", "features") not in stage_edges
+
+    # Total stage edges should be exactly 2
+    assert len(stage_edges) == 2
+
+    # Verify artifact edges
+    artifact_edges = set(view["artifact_edges"])
+    # From input to intermediates
+    assert (str(input_file), str(clean)) in artifact_edges
+    assert (str(input_file), str(feats)) in artifact_edges
+    # From intermediates to model
+    assert (str(clean), str(model)) in artifact_edges
+    assert (str(feats), str(model)) in artifact_edges
+
+    # NO reverse edges
+    assert (str(clean), str(input_file)) not in artifact_edges
+    assert (str(model), str(clean)) not in artifact_edges
+
+    # Exact count
+    assert len(artifact_edges) == 4

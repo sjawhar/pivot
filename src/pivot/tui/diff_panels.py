@@ -32,6 +32,8 @@ from pivot.types import (
     DataDiffResult,
     DataFileFormat,
     DepChange,
+    HashInfo,
+    LockData,
     MetricValue,
     OutputChange,
     ParamChange,
@@ -41,7 +43,7 @@ from pivot.types import (
 
 if TYPE_CHECKING:
     from pivot.registry import RegistryStageInfo
-    from pivot.types import HashInfo, LockData
+    from pivot.tui.types import StageDataProvider
 
 logger = logging.getLogger(__name__)
 
@@ -399,8 +401,15 @@ class InputDiffPanel(_SelectableExpandablePanel):
     _code_by_key: dict[str, CodeChange]
     _dep_by_path: dict[str, DepChange]
     _param_by_key: dict[str, ParamChange]
+    _stage_data_provider: StageDataProvider | None
 
-    def __init__(self, *, id: str | None = None, classes: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        id: str | None = None,
+        classes: str | None = None,
+        stage_data_provider: StageDataProvider | None = None,
+    ) -> None:
         super().__init__(
             id=id, classes="diff-panel" if classes is None else f"diff-panel {classes}"
         )
@@ -409,6 +418,7 @@ class InputDiffPanel(_SelectableExpandablePanel):
         self._code_by_key = dict[str, CodeChange]()
         self._dep_by_path = dict[str, DepChange]()
         self._param_by_key = dict[str, ParamChange]()
+        self._stage_data_provider = stage_data_provider
 
     @override
     def set_stage(self, stage_name: str | None) -> None:  # pragma: no cover
@@ -428,15 +438,18 @@ class InputDiffPanel(_SelectableExpandablePanel):
 
     def _load_stage_data(self, stage_name: str) -> None:  # pragma: no cover
         """Load and cache stage data."""
+        if self._stage_data_provider is None:
+            return
+
         try:
-            self._registry_info = cli_helpers.get_stage(stage_name)
+            self._registry_info = self._stage_data_provider.get_stage(stage_name)
         except KeyError:
             logger.debug("Stage %s not in registry", stage_name)
             return
 
         state_dir = config.get_state_dir()
         try:
-            fingerprint = cli_helpers.get_registry().ensure_fingerprint(stage_name)
+            fingerprint = self._stage_data_provider.ensure_fingerprint(stage_name)
             self._explanation = explain.get_stage_explanation(
                 stage_name=stage_name,
                 fingerprint=fingerprint,
@@ -709,8 +722,15 @@ class OutputDiffPanel(_SelectableExpandablePanel):
     _output_by_path: dict[str, OutputChange]
     _metric_diff_cache: dict[str, list[MetricDiff]]
     _head_hashes: dict[str, str | None] | None
+    _stage_data_provider: StageDataProvider | None
 
-    def __init__(self, *, id: str | None = None, classes: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        id: str | None = None,
+        classes: str | None = None,
+        stage_data_provider: StageDataProvider | None = None,
+    ) -> None:
         super().__init__(
             id=id, classes="diff-panel" if classes is None else f"diff-panel {classes}"
         )
@@ -719,6 +739,7 @@ class OutputDiffPanel(_SelectableExpandablePanel):
         self._output_by_path = dict[str, OutputChange]()
         self._metric_diff_cache = dict[str, list[MetricDiff]]()
         self._head_hashes = None
+        self._stage_data_provider = stage_data_provider
 
     @override
     def set_stage(  # pragma: no cover
@@ -740,8 +761,11 @@ class OutputDiffPanel(_SelectableExpandablePanel):
 
     def _load_stage_data(self, stage_name: str) -> None:  # pragma: no cover
         """Load and cache stage data."""
+        if self._stage_data_provider is None:
+            return
+
         try:
-            self._registry_info = cli_helpers.get_stage(stage_name)
+            self._registry_info = self._stage_data_provider.get_stage(stage_name)
         except KeyError:
             logger.debug("Stage %s not in registry", stage_name)
             return

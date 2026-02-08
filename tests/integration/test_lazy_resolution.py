@@ -109,7 +109,7 @@ pipeline.register({stage_name})
 def test_lazy_resolution_builds_complete_dag(set_project_root: pathlib.Path) -> None:
     """Child pipeline should build complete DAG including parent stages.
 
-    End-to-end test verifying that resolve_from_parents() enables build_dag()
+    End-to-end test verifying that resolve_external_dependencies() enables build_dag()
     to succeed by including necessary producers from parent pipeline.
     """
     # Parent pipeline at root
@@ -128,7 +128,7 @@ def test_lazy_resolution_builds_complete_dag(set_project_root: pathlib.Path) -> 
     child = discovery.load_pipeline_from_path(child_dir / "pipeline.py")
     assert child is not None, "Failed to load child pipeline"
 
-    child.resolve_from_parents()
+    child.resolve_external_dependencies()
     dag = child.build_dag(validate=True)
 
     assert "producer" in dag.nodes, "Expected producer from parent in DAG"
@@ -159,7 +159,7 @@ def test_lazy_resolution_preserves_parent_state_dir(set_project_root: pathlib.Pa
     child = discovery.load_pipeline_from_path(child_dir / "pipeline.py")
     assert child is not None, "Failed to load child pipeline"
 
-    child.resolve_from_parents()
+    child.resolve_external_dependencies()
 
     # Producer's state_dir should be parent's .pivot, not child's
     producer_info = child.get("producer")
@@ -204,7 +204,7 @@ def test_lazy_resolution_multilevel_hierarchy(set_project_root: pathlib.Path) ->
     child = discovery.load_pipeline_from_path(child_dir / "pipeline.py")
     assert child is not None, "Failed to load child pipeline"
 
-    child.resolve_from_parents()
+    child.resolve_external_dependencies()
 
     # Should have all three stages
     stages = set(child.list_stages())
@@ -268,7 +268,7 @@ stages:
         child = discovery.load_pipeline_from_path(child_dir / "pipeline.py")
         assert child is not None, "Failed to load child pipeline"
 
-        child.resolve_from_parents()
+        child.resolve_external_dependencies()
 
     # Should include producer from YAML parent
     assert "producer" in child.list_stages(), "Expected to include producer from pivot.yaml parent"

@@ -100,6 +100,7 @@ def _run_with_tui(
         stage_names=stages_list,
         tui_log=tui_log,
         cancel_event=cancel_event,
+        stage_data_provider=pipeline,
     )
 
     # Use Future for thread-safe result passing

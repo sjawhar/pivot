@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+import sys
 from typing import TYPE_CHECKING, Annotated, TypedDict
 
 from conftest import isolated_pivot_dir
@@ -63,6 +64,28 @@ def _helper_process(
     input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
 ) -> _OutputTxtOutputs:
     _ = input_file
+    pathlib.Path("output.txt").write_text("done")
+    return _OutputTxtOutputs(output=pathlib.Path("output.txt"))
+
+
+def _helper_printing_stage() -> _OutputTxtOutputs:
+    # This will be captured and should appear in output
+    sys.stdout.write("Processing data...\n")
+    sys.stdout.flush()
+    pathlib.Path("output.txt").write_text("done")
+    return _OutputTxtOutputs(output=pathlib.Path("output.txt"))
+
+
+def _helper_stderr_stage() -> _OutputTxtOutputs:
+    sys.stderr.write("Warning: something happened\n")
+    sys.stderr.flush()
+    pathlib.Path("output.txt").write_text("done")
+    return _OutputTxtOutputs(output=pathlib.Path("output.txt"))
+
+
+def _helper_quiet_stage() -> _OutputTxtOutputs:
+    sys.stdout.write("This should not appear\n")
+    sys.stdout.flush()
     pathlib.Path("output.txt").write_text("done")
     return _OutputTxtOutputs(output=pathlib.Path("output.txt"))
 
@@ -571,18 +594,6 @@ def test_repro_show_output_streams_stage_logs(
     runner: click.testing.CliRunner,
 ) -> None:
     """--show-output streams stage stdout to terminal."""
-    import sys
-
-    class _PrintOutputs(TypedDict):
-        output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
-
-    def _helper_printing_stage() -> _PrintOutputs:
-        # This will be captured and should appear in output
-        sys.stdout.write("Processing data...\n")
-        sys.stdout.flush()
-        pathlib.Path("output.txt").write_text("done")
-        return _PrintOutputs(output=pathlib.Path("output.txt"))
-
     register_test_stage(_helper_printing_stage, name="printer")
 
     result = runner.invoke(cli.cli, ["repro", "--show-output"])
@@ -598,17 +609,6 @@ def test_repro_show_output_streams_stderr_in_red(
     runner: click.testing.CliRunner,
 ) -> None:
     """--show-output streams stderr with red formatting."""
-    import sys
-
-    class _StderrOutputs(TypedDict):
-        output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
-
-    def _helper_stderr_stage() -> _StderrOutputs:
-        sys.stderr.write("Warning: something happened\n")
-        sys.stderr.flush()
-        pathlib.Path("output.txt").write_text("done")
-        return _StderrOutputs(output=pathlib.Path("output.txt"))
-
     register_test_stage(_helper_stderr_stage, name="warner")
 
     result = runner.invoke(cli.cli, ["repro", "--show-output"])
@@ -624,17 +624,6 @@ def test_repro_without_show_output_hides_logs(
     runner: click.testing.CliRunner,
 ) -> None:
     """Default behavior (no --show-output) doesn't show stage logs."""
-    import sys
-
-    class _QuietOutputs(TypedDict):
-        output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
-
-    def _helper_quiet_stage() -> _QuietOutputs:
-        sys.stdout.write("This should not appear\n")
-        sys.stdout.flush()
-        pathlib.Path("output.txt").write_text("done")
-        return _QuietOutputs(output=pathlib.Path("output.txt"))
-
     register_test_stage(_helper_quiet_stage, name="quiet")
 
     result = runner.invoke(cli.cli, ["repro"])

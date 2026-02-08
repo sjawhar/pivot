@@ -255,8 +255,10 @@ class StageRegistry:
         ```
     """
 
+    _stages: dict[str, RegistryStageInfo]
+
     def __init__(self, validation_mode: ValidationMode = ValidationMode.ERROR) -> None:
-        self._stages: dict[str, RegistryStageInfo] = {}
+        self._stages = dict[str, RegistryStageInfo]()
         self._cached_dag: DiGraph[str] | None = None
         self.validation_mode: ValidationMode = validation_mode
 
@@ -270,6 +272,7 @@ class StageRegistry:
         dep_path_overrides: Mapping[str, outputs.PathType] | None = None,
         out_path_overrides: Mapping[str, OutOverrideInput] | None = None,
         state_dir: pathlib.Path | None = None,
+        definition: stage_def.StageDefinition | None = None,
     ) -> None:
         """Register a stage function with metadata.
 
@@ -311,21 +314,25 @@ class StageRegistry:
 
             mutex_list: list[str] = [m.strip().lower() for m in mutex] if mutex else []
 
+            # Extract or reuse stage definition
+            if definition is None:
+                definition = stage_def.extract_stage_definition(
+                    func, stage_name, dep_path_overrides
+                )
+
             # Convert params to instance (instantiate class if needed)
-            params_instance = _resolve_params(params, func, stage_name)
+            params_instance = _resolve_params(
+                params, definition.params_arg_name, definition.params_type, stage_name
+            )
 
-            # Identify placeholder deps BEFORE extraction
-            placeholder_names = stage_def.get_placeholder_dep_names(func)
-
-            # Validate all placeholders have overrides
-            if placeholder_names:
+            # Validate placeholder deps have overrides (rich error with typo suggestions)
+            if definition.placeholder_dep_names:
                 provided_overrides = (
                     set(dep_path_overrides.keys()) if dep_path_overrides else set[str]()
                 )
-                missing = placeholder_names - provided_overrides
+                missing = definition.placeholder_dep_names - provided_overrides
                 if missing:
-                    # Check for typos in provided overrides
-                    unknown_overrides = list(provided_overrides - placeholder_names)
+                    unknown_overrides = list(provided_overrides - definition.placeholder_dep_names)
                     suggestions = list[str]()
                     for m in sorted(missing):
                         matches = get_close_matches(m, unknown_overrides, n=1, cutoff=0.6)
@@ -339,8 +346,8 @@ class StageRegistry:
                         msg += f"\n  - Did you mean: {', '.join(suggestions)}?"
                     raise exceptions.ValidationError(msg)
 
-            # Extract deps from function annotations (PlaceholderDep resolved via overrides)
-            dep_specs = stage_def.get_dep_specs_from_signature(func, dep_path_overrides)
+            # Use deps from pre-extracted definition
+            dep_specs = definition.dep_specs
 
             # Validate dep_path_overrides match annotation dep names
             if dep_path_overrides:
@@ -361,9 +368,12 @@ class StageRegistry:
                         + "input and output annotations."
                     )
 
-            # Build deps dict from specs (all deps, for loading)
+            # Build deps dict from specs, applying path overrides where provided
+            # (Pipeline resolves annotation paths to pipeline-relative before passing as overrides)
+            _overrides = dep_path_overrides or {}
             deps_dict: dict[str, outputs.PathType] = {
-                dep_name: spec.path for dep_name, spec in dep_specs.items()
+                dep_name: _overrides.get(dep_name, spec.path)
+                for dep_name, spec in dep_specs.items()
             }
 
             # Flatten ALL deps for path validation (security check applies to all paths)
@@ -372,13 +382,15 @@ class StageRegistry:
             # Flatten deps for DAG, excluding deps that don't create edges
             # (IncrementalOut as input is self-referential, no DAG edge to avoid circular dependency)
             deps_dict_for_dag = {
-                dep_name: spec.path for dep_name, spec in dep_specs.items() if spec.creates_dep_edge
+                dep_name: _overrides.get(dep_name, spec.path)
+                for dep_name, spec in dep_specs.items()
+                if spec.creates_dep_edge
             }
             deps_flat = _flatten_deps(deps_dict_for_dag)
 
-            # Extract outs from return type annotations
-            return_out_specs = stage_def.get_output_specs_from_return(func, stage_name)
-            single_out_spec = stage_def.get_single_output_spec_from_return(func)
+            # Use outs from pre-extracted definition
+            return_out_specs = definition.out_specs
+            single_out_spec = definition.single_out_spec
 
             # Validate IncrementalOut input/output matching
             _validate_incremental_out_matching(
@@ -387,8 +399,8 @@ class StageRegistry:
 
             # Build out_specs from return annotations (return key -> resolved output, pre-expansion)
             # For single-output stages (non-TypedDict return), uses SINGLE_OUTPUT_KEY convention
-            out_specs: dict[str, outputs.BaseOut] = {}
-            outs_from_annotations: list[outputs.BaseOut] = []
+            out_specs = dict[str, outputs.BaseOut]()
+            outs_from_annotations = list[outputs.BaseOut]()
 
             if return_out_specs:
                 # Validate out_path_overrides match annotation out names
@@ -450,7 +462,7 @@ class StageRegistry:
 
             # Update normalized outputs with absolute paths
             # All concrete output types (Out, DirectoryOut, IncrementalOut) are dataclasses
-            outs_normalized: list[outputs.BaseOut] = []
+            outs_normalized = list[outputs.BaseOut]()
             for out, path in zip(outs_from_annotations, outs_paths, strict=True):
                 if isinstance(out, outputs.DirectoryOut):
                     # Cast to DirectoryOut[Any] - isinstance narrows but basedpyright keeps Unknown params
@@ -473,8 +485,16 @@ class StageRegistry:
             # Output overlap validation is deferred to validate_outputs() for performance
             # (single O(N) pass instead of O(N²) from checking on every register)
 
-            # Get params arg name for worker (avoids re-inspecting signature at execution time)
-            params_arg_name, _ = stage_def.find_params_in_signature(func)
+            # Get params arg name from definition (avoids re-inspecting signature at execution time)
+            params_arg_name = definition.params_arg_name
+
+            # Update dep_specs paths to match the normalized absolute paths.
+            # The definition's dep_specs have annotation-relative paths; the worker
+            # uses dep_specs.path to load files, so they must be absolute.
+            dep_specs_normalized: dict[str, stage_def.FuncDepSpec] = {
+                dep_name: dataclasses.replace(spec, path=deps_normalized[dep_name])
+                for dep_name, spec in dep_specs.items()
+            }
 
             self._stages[stage_name] = RegistryStageInfo(
                 func=func,
@@ -488,7 +508,7 @@ class StageRegistry:
                 variant=variant,
                 signature=inspect.signature(func),
                 fingerprint=None,
-                dep_specs=dep_specs,
+                dep_specs=dep_specs_normalized,
                 out_specs=out_specs,
                 params_arg_name=params_arg_name,
                 state_dir=state_dir,
@@ -772,9 +792,8 @@ def _validate_incremental_out_matching(
 
     # Case 1: TypedDict return
     if return_out_specs:
-        # Cast dict values to BaseOut to satisfy type checker
         incremental_outputs: dict[str, outputs.BaseOut] = {
-            name: cast("outputs.BaseOut", spec)
+            name: spec
             for name, spec in return_out_specs.items()
             if isinstance(spec, outputs.IncrementalOut)
         }
@@ -821,7 +840,8 @@ def _validate_incremental_out_matching(
 
 def _resolve_params(
     params_arg: ParamsArg,
-    func: Callable[..., Any],
+    params_arg_name: str | None,
+    params_type_hint: type[stage_def.StageParams] | None,
     stage_name: str,
 ) -> stage_def.StageParams | None:
     """Resolve params argument to an instance, inferring from function signature if needed.
@@ -833,8 +853,6 @@ def _resolve_params(
 
     The params class must be a StageParams subclass (not plain pydantic.BaseModel).
     """
-    # Find params in signature using StageParams detection
-    params_arg_name, params_type_hint = stage_def.find_params_in_signature(func)
     has_params_param = params_arg_name is not None
 
     match params_arg:
