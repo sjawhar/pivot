@@ -65,6 +65,7 @@ class DisplayCategory(enum.StrEnum):
 
     PENDING = "pending"
     RUNNING = "running"
+    WAITING_ON_LOCK = "waiting_on_lock"
     SUCCESS = "success"
     CACHED = "cached"
     BLOCKED = "blocked"
@@ -261,7 +262,31 @@ class LockData(TypedDict):
     output_hashes: dict[str, HashInfo]
 
 
-OutputMessage = tuple[str, str, bool] | None
+class OutputMessageKind(enum.StrEnum):
+    """Discriminant for worker→engine output messages."""
+
+    LOG = "log"
+    STATE = "state"
+
+
+class LogMessage(TypedDict):
+    """Log line from worker process."""
+
+    kind: Literal[OutputMessageKind.LOG]
+    stage: str
+    line: str
+    is_stderr: bool
+
+
+class StateChange(TypedDict):
+    """Execution state transition from worker process."""
+
+    kind: Literal[OutputMessageKind.STATE]
+    stage: str
+    state: Literal["waiting_on_lock", "running"]
+
+
+OutputMessage = LogMessage | StateChange | None
 
 
 # =============================================================================

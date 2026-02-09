@@ -1,19 +1,22 @@
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import logging
 import os
 import pathlib
 import struct
+import time
 from typing import TYPE_CHECKING, Self
 
 import lmdb
 
-from pivot import run_history
+from pivot import exceptions, run_history
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Generator, Iterable
 
     from pivot.fingerprint import AstHashEntry
     from pivot.run_history import RunCacheEntry, RunManifest
@@ -160,8 +163,15 @@ class StateDB:
     _env: lmdb.Environment
     _closed: bool
     _readonly: bool
+    _write_timeout: float
+    _write_lock_path: pathlib.Path
 
-    def __init__(self, db_path: pathlib.Path, readonly: bool = False) -> None:
+    def __init__(
+        self,
+        db_path: pathlib.Path,
+        readonly: bool = False,
+        write_timeout: float = 30.0,
+    ) -> None:
         lmdb_path = db_path.parent / "state.lmdb"
         lmdb_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -172,6 +182,8 @@ class StateDB:
         self._env = lmdb.open(str(lmdb_path), map_size=_MAP_SIZE, readonly=readonly)
         self._closed = False
         self._readonly = readonly
+        self._write_timeout = write_timeout
+        self._write_lock_path = lmdb_path / "pivot-write.lock"
 
     def _check_closed(self) -> None:
         """Raise if database is closed."""
@@ -184,6 +196,35 @@ class StateDB:
             raise RuntimeError(
                 "Internal error: worker attempted write to readonly StateDB. This is a bug in Pivot. Please report it."
             )
+
+    @contextlib.contextmanager
+    def _write_transaction(self, timeout: float = 30.0) -> Generator[lmdb.Transaction]:
+        """Begin a write transaction with timeout protection.
+
+        The outer flock on pivot-write.lock provides timeout detection only.
+        LMDB's internal write serialization (via lock.mdb) handles actual
+        mutual exclusion. This wrapper exists because LMDB's env.begin(write=True)
+        blocks indefinitely with no timeout mechanism.
+        """
+        self._check_closed()
+        self._check_write_allowed()
+        start = time.monotonic()
+        with self._write_lock_path.open("a+b") as lock_file:
+            while True:
+                try:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() - start >= timeout:
+                        raise exceptions.PivotDBWriteTimeoutError(
+                            f"Timed out after {timeout:.1f}s waiting for LMDB write lock"
+                        ) from None
+                    time.sleep(0.01)
+            try:
+                with self._env.begin(write=True) as txn:
+                    yield txn
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
     @property
     def readonly(self) -> bool:
@@ -222,7 +263,7 @@ class StateDB:
             )
         value = _pack_value(fs_stat.st_mtime_ns, fs_stat.st_size, fs_stat.st_ino, file_hash)
         try:
-            with self._env.begin(write=True) as txn:
+            with self._write_transaction(timeout=self._write_timeout) as txn:
                 txn.put(key, value)
         except lmdb.MapFullError as e:
             raise DatabaseFullError(_DB_FULL_MSG) from e
@@ -232,7 +273,7 @@ class StateDB:
         self._check_closed()
         self._check_write_allowed()
         try:
-            with self._env.begin(write=True) as txn:
+            with self._write_transaction(timeout=self._write_timeout) as txn:
                 for path, fs_stat, file_hash in entries:
                     key = _make_key_file_hash(path)
                     if len(key) > _MAX_KEY_SIZE:
@@ -281,7 +322,7 @@ class StateDB:
         if not entries:
             return
         try:
-            with self._env.begin(write=True) as txn:
+            with self._write_transaction(timeout=self._write_timeout) as txn:
                 for (
                     rel_path,
                     mtime_ns,
@@ -310,7 +351,7 @@ class StateDB:
         self._check_closed()
         self._check_write_allowed()
         deleted = 0
-        with self._env.begin(write=True) as txn:
+        with self._write_transaction(timeout=self._write_timeout) as txn:
             cursor = txn.cursor()
             keys_to_delete = list[bytes]()
             if cursor.set_range(_FP_PREFIX):
@@ -342,7 +383,7 @@ class StateDB:
                 f"Key too long for state cache ({len(key)} bytes, max {_MAX_KEY_SIZE})"
             )
         try:
-            with self._env.begin(write=True) as txn:
+            with self._write_transaction(timeout=self._write_timeout) as txn:
                 txn.put(key, value)
         except lmdb.MapFullError as e:
             raise DatabaseFullError(_DB_FULL_MSG) from e
@@ -354,7 +395,7 @@ class StateDB:
         if not entries:
             return
         try:
-            with self._env.begin(write=True) as txn:
+            with self._write_transaction(timeout=self._write_timeout) as txn:
                 for key, value in entries:
                     if len(key) > _MAX_KEY_SIZE:
                         continue  # Skip oversized keys
@@ -369,7 +410,7 @@ class StateDB:
         if not keys:
             return
         try:
-            with self._env.begin(write=True) as txn:
+            with self._write_transaction(timeout=self._write_timeout) as txn:
                 for key in keys:
                     txn.delete(key)
         except lmdb.MapFullError as e:
@@ -428,7 +469,7 @@ class StateDB:
                 f"Path too long for generation tracking ({len(key)} bytes, max {_MAX_KEY_SIZE}): {path}"
             )
         try:
-            with self._env.begin(write=True) as txn:
+            with self._write_transaction(timeout=self._write_timeout) as txn:
                 value = txn.get(key)
                 new_gen = (struct.unpack(">Q", value)[0] + 1) if value else 1
                 txn.put(key, struct.pack(">Q", new_gen))
@@ -464,7 +505,7 @@ class StateDB:
                     f"Dependency path too long for tracking ({len(key)} bytes, max {_MAX_KEY_SIZE}): {dep_path}"
                 )
         try:
-            with self._env.begin(write=True) as txn:
+            with self._write_transaction(timeout=self._write_timeout) as txn:
                 cursor = txn.cursor()
                 keys_to_delete = list[bytes]()
                 if cursor.set_range(prefix):
@@ -511,7 +552,7 @@ class StateDB:
         self._check_write_allowed()
         prefix = _REMOTE_PREFIX + remote_name.encode() + b":"
         try:
-            with self._env.begin(write=True) as txn:
+            with self._write_transaction(timeout=self._write_timeout) as txn:
                 for hash_ in hashes:
                     key = prefix + hash_.encode()
                     txn.put(key, b"1")
@@ -523,7 +564,7 @@ class StateDB:
         self._check_closed()
         self._check_write_allowed()
         prefix = _REMOTE_PREFIX + remote_name.encode() + b":"
-        with self._env.begin(write=True) as txn:
+        with self._write_transaction(timeout=self._write_timeout) as txn:
             for hash_ in hashes:
                 key = prefix + hash_.encode()
                 txn.delete(key)
@@ -545,7 +586,7 @@ class StateDB:
         key = _REMOTE_URL_PREFIX + remote_name.encode()
         value = url.encode("utf-8")
         try:
-            with self._env.begin(write=True) as txn:
+            with self._write_transaction(timeout=self._write_timeout) as txn:
                 txn.put(key, value)
         except lmdb.MapFullError as e:
             raise DatabaseFullError(_DB_FULL_MSG) from e
@@ -555,7 +596,7 @@ class StateDB:
         self._check_closed()
         self._check_write_allowed()
         prefix = _REMOTE_PREFIX + remote_name.encode() + b":"
-        with self._env.begin(write=True) as txn:
+        with self._write_transaction(timeout=self._write_timeout) as txn:
             cursor = txn.cursor()
             keys_to_delete = list[bytes]()
             if cursor.set_range(prefix):
@@ -581,7 +622,7 @@ class StateDB:
         key = _RUN_PREFIX + manifest["run_id"].encode()
         value = run_history.serialize_to_bytes(manifest)
         try:
-            with self._env.begin(write=True) as txn:
+            with self._write_transaction(timeout=self._write_timeout) as txn:
                 txn.put(key, value)
         except lmdb.MapFullError as e:
             raise DatabaseFullError(_DB_FULL_MSG) from e
@@ -649,7 +690,7 @@ class StateDB:
         to_keep = runs[:retention]
         to_delete = runs[retention:]
 
-        with self._env.begin(write=True) as txn:
+        with self._write_transaction(timeout=self._write_timeout) as txn:
             for run in to_delete:
                 key = _RUN_PREFIX + run["run_id"].encode()
                 txn.delete(key)
@@ -670,7 +711,7 @@ class StateDB:
         key = _RUNCACHE_PREFIX + f"{stage_name}:{input_hash}".encode()
         value = run_history.serialize_to_bytes(entry)
         try:
-            with self._env.begin(write=True) as txn:
+            with self._write_transaction(timeout=self._write_timeout) as txn:
                 txn.put(key, value)
         except lmdb.MapFullError as e:
             raise DatabaseFullError(_DB_FULL_MSG) from e
@@ -714,7 +755,7 @@ class StateDB:
         if not to_delete:
             return 0
 
-        with self._env.begin(write=True) as txn:
+        with self._write_transaction(timeout=self._write_timeout) as txn:
             for key in to_delete:
                 txn.delete(key)
         return len(to_delete)
@@ -765,7 +806,7 @@ class StateDB:
                     )
 
         try:
-            with self._env.begin(write=True) as txn:
+            with self._write_transaction(timeout=self._write_timeout) as txn:
                 # Dependency generations (clear old entries first, like record_dep_generations)
                 if "dep_generations" in deferred:
                     prefix = _DEP_PREFIX + stage_name.encode() + b":"

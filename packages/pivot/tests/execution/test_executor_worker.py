@@ -5,6 +5,7 @@ import inspect
 import json
 import os
 import pathlib
+import queue
 import shutil
 import sys
 import unicodedata
@@ -12,7 +13,7 @@ from typing import TYPE_CHECKING, Annotated, Any, TypedDict
 
 import pytest
 
-from pivot import exceptions, executor, loaders, outputs, path_utils, project, registry, stage_def
+from pivot import executor, loaders, outputs, path_utils, project, registry, stage_def
 from pivot.executor import core as executor_core
 from pivot.executor import worker
 from pivot.storage import cache, lock, state
@@ -20,7 +21,7 @@ from pivot.types import FileHash, LockData
 
 if TYPE_CHECKING:
     import multiprocessing as mp
-    from collections.abc import Callable, Generator, Iterator
+    from collections.abc import Callable, Iterator
 
     from pytest_mock import MockerFixture
 
@@ -90,12 +91,6 @@ def _helper_identity(x: int) -> int:
 def _helper_noop_stage() -> None:
     """No-op stage helper for tests that need a module-level function."""
     return None
-
-
-def _helper_always_fail_takeover(sentinel: pathlib.Path, stale_pid: int | None) -> bool:
-    """Helper that always fails lock takeover (for testing retry exhaustion)."""
-    _ = sentinel, stale_pid  # Unused
-    return False
 
 
 @contextlib.contextmanager
@@ -789,410 +784,6 @@ def test_queue_writer_reader_thread_joins_on_exit(
 
 
 # =============================================================================
-# Execution Lock Tests
-# =============================================================================
-
-
-def test_execution_lock_creates_sentinel_file(worker_env: pathlib.Path) -> None:
-    """Execution lock creates sentinel file during execution."""
-    sentinel_path = worker_env / "test_stage.running"
-
-    with lock.execution_lock("test_stage", worker_env) as sentinel:
-        assert sentinel.exists()
-        assert sentinel == sentinel_path
-        content = sentinel.read_text()
-        assert content.strip().isdigit()  # Just the PID number
-
-    # Cleaned up after context
-    assert not sentinel.exists()
-
-
-@pytest.mark.parametrize(
-    "stage_name",
-    [
-        pytest.param("simple", id="simple"),
-        pytest.param("train@model=gpt4", id="matrix-with-equals"),
-        pytest.param("process@v1.2", id="matrix-with-dot"),
-        pytest.param("stage_with_underscores", id="underscores"),
-        pytest.param("stage-with-dashes", id="dashes"),
-    ],
-)
-def test_execution_lock_with_various_stage_names(worker_env: pathlib.Path, stage_name: str) -> None:
-    """Execution lock works with various stage name formats including matrix names."""
-    sentinel_path = worker_env / f"{stage_name}.running"
-
-    with lock.execution_lock(stage_name, worker_env) as sentinel:
-        assert sentinel.exists()
-        assert sentinel == sentinel_path
-
-    assert not sentinel.exists()
-
-
-def test_execution_lock_removes_sentinel_on_exception(worker_env: pathlib.Path) -> None:
-    """Execution lock removes sentinel even when exception occurs."""
-    sentinel_path = worker_env / "test_stage.running"
-
-    with pytest.raises(RuntimeError), lock.execution_lock("test_stage", worker_env):
-        assert sentinel_path.exists()
-        raise RuntimeError("intentional")
-
-    assert not sentinel_path.exists()
-
-
-def test_acquire_execution_lock_succeeds_when_available(worker_env: pathlib.Path) -> None:
-    """Acquire lock succeeds when no lock exists."""
-    sentinel = lock.acquire_execution_lock("test_stage", worker_env)
-
-    assert sentinel.exists()
-    assert sentinel == worker_env / "test_stage.running"
-
-    # Cleanup
-    sentinel.unlink()
-
-
-def test_acquire_execution_lock_fails_when_held_by_live_process(
-    worker_env: pathlib.Path,
-) -> None:
-    """Acquire lock fails when held by a running process."""
-    sentinel = worker_env / "test_stage.running"
-    sentinel.write_text(str(os.getpid()))
-
-    with pytest.raises(exceptions.StageAlreadyRunningError) as exc_info:
-        lock.acquire_execution_lock("test_stage", worker_env)
-
-    assert "already running" in str(exc_info.value)
-    assert str(os.getpid()) in str(exc_info.value)
-
-    # Cleanup
-    sentinel.unlink()
-
-
-def test_acquire_execution_lock_breaks_stale_lock(worker_env: pathlib.Path) -> None:
-    """Acquire lock breaks stale lock from dead process."""
-    sentinel = worker_env / "test_stage.running"
-    sentinel.write_text("999999999")  # Non-existent PID
-
-    result_sentinel = lock.acquire_execution_lock("test_stage", worker_env)
-
-    assert result_sentinel.exists()
-    assert result_sentinel == sentinel
-
-    # Cleanup
-    result_sentinel.unlink()
-
-
-def test_acquire_execution_lock_breaks_corrupted_lock(worker_env: pathlib.Path) -> None:
-    """Acquire lock breaks corrupted lock file."""
-    sentinel = worker_env / "test_stage.running"
-    sentinel.write_text("corrupted content")
-
-    result_sentinel = lock.acquire_execution_lock("test_stage", worker_env)
-
-    assert result_sentinel.exists()
-
-    # Cleanup
-    result_sentinel.unlink()
-
-
-def test_acquire_execution_lock_breaks_negative_pid_lock(worker_env: pathlib.Path) -> None:
-    """Acquire lock breaks lock with invalid negative PID."""
-    sentinel = worker_env / "test_stage.running"
-    sentinel.write_text("-1")
-
-    result_sentinel = lock.acquire_execution_lock("test_stage", worker_env)
-
-    assert result_sentinel.exists()
-
-    # Cleanup
-    result_sentinel.unlink()
-
-
-# =============================================================================
-# Process Alive Check Tests
-# =============================================================================
-
-
-def test_is_process_alive_returns_true_for_self() -> None:
-    """is_process_alive returns True for own PID."""
-    assert lock._is_process_alive(os.getpid())
-
-
-def test_is_process_alive_returns_false_for_nonexistent() -> None:
-    """is_process_alive returns False for non-existent PID."""
-    assert not lock._is_process_alive(999999999)
-
-
-def test_is_process_alive_returns_true_for_init() -> None:
-    """is_process_alive returns True for PID 1 (init/systemd)."""
-    # PID 1 always exists (init/systemd)
-    assert lock._is_process_alive(1)
-
-
-# =============================================================================
-# _read_lock_pid Tests
-# =============================================================================
-
-
-def test_read_lock_pid_returns_pid_for_valid_file(worker_env: pathlib.Path) -> None:
-    """_read_lock_pid extracts PID from valid lock file."""
-    sentinel = worker_env / "test.running"
-    sentinel.write_text("12345")
-
-    assert lock._read_lock_pid(sentinel) == 12345
-
-
-def test_read_lock_pid_returns_none_for_missing_file(worker_env: pathlib.Path) -> None:
-    """_read_lock_pid returns None for non-existent file."""
-    sentinel = worker_env / "nonexistent.running"
-
-    assert lock._read_lock_pid(sentinel) is None
-
-
-def test_read_lock_pid_returns_none_for_corrupted_file(worker_env: pathlib.Path) -> None:
-    """_read_lock_pid returns None for corrupted content."""
-    sentinel = worker_env / "test.running"
-    sentinel.write_text("garbage content")
-
-    assert lock._read_lock_pid(sentinel) is None
-
-
-def test_read_lock_pid_returns_none_for_negative_pid(worker_env: pathlib.Path) -> None:
-    """_read_lock_pid returns None for invalid negative PID."""
-    sentinel = worker_env / "test.running"
-    sentinel.write_text("-1")
-
-    assert lock._read_lock_pid(sentinel) is None
-
-
-def test_read_lock_pid_returns_none_for_zero_pid(worker_env: pathlib.Path) -> None:
-    """_read_lock_pid returns None for invalid zero PID."""
-    sentinel = worker_env / "test.running"
-    sentinel.write_text("0")
-
-    assert lock._read_lock_pid(sentinel) is None
-
-
-# =============================================================================
-# _atomic_lock_takeover Tests
-# =============================================================================
-
-
-def test_atomic_lock_takeover_succeeds_on_stale_lock(worker_env: pathlib.Path) -> None:
-    """Atomic takeover creates lock with current process PID."""
-    sentinel = worker_env / "test_stage.running"
-    sentinel.write_text("999999999")  # Stale lock
-
-    result = lock._atomic_lock_takeover(sentinel, 999999999)
-
-    assert result is True
-    assert sentinel.exists()
-    content = sentinel.read_text()
-    assert content.strip() == str(os.getpid())
-
-    # Cleanup
-    sentinel.unlink()
-
-
-def test_atomic_lock_takeover_fails_when_another_process_wins(
-    worker_env: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Atomic takeover returns False when another process beats us."""
-    sentinel = worker_env / "test_stage.running"
-    original_replace = os.replace
-
-    def sneaky_replace(src: str, dst: str) -> None:
-        """Simulate another process winning the race after our rename."""
-        original_replace(src, dst)
-        # Immediately overwrite with different PID to simulate race
-        pathlib.Path(dst).write_text("999888777")
-
-    monkeypatch.setattr(os, "replace", sneaky_replace)
-    sentinel.write_text("999999999")  # Stale lock
-
-    result = lock._atomic_lock_takeover(sentinel, 999999999)
-
-    assert result is False
-
-    # Cleanup
-    sentinel.unlink()
-
-
-def test_atomic_takeover_cleans_temp_on_error(
-    worker_env: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Temp file is cleaned up when rename fails."""
-    sentinel = worker_env / "test_stage.running"
-    sentinel.write_text("999999999")
-
-    def failing_replace(src: str, dst: str) -> None:
-        raise OSError("Simulated disk error")
-
-    monkeypatch.setattr(os, "replace", failing_replace)
-
-    result = lock._atomic_lock_takeover(sentinel, 999999999)
-
-    assert result is False
-    # Verify no temp files left behind
-    temp_files = list(worker_env.glob(".test_stage.running.*"))
-    assert len(temp_files) == 0, f"Temp files should be cleaned up: {temp_files}"
-
-    # Cleanup
-    sentinel.unlink()
-
-
-def test_acquire_lock_retries_after_failed_takeover(
-    worker_env: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Lock acquisition retries when atomic takeover fails."""
-    sentinel = worker_env / "test_stage.running"
-    call_count = 0
-    my_pid = os.getpid()
-
-    def mock_takeover(sent: pathlib.Path, pid: int | None) -> bool:
-        nonlocal call_count
-        call_count += 1
-        if call_count < 2:
-            return False  # Fail first attempt
-        # Second attempt: actually create the lock
-        sent.write_text(str(my_pid))
-        return True
-
-    # Start with stale lock
-    sentinel.write_text("999999999")
-    monkeypatch.setattr(lock, "_atomic_lock_takeover", mock_takeover)
-
-    result = lock.acquire_execution_lock("test_stage", worker_env)
-
-    assert result == sentinel
-    assert call_count >= 2, "Should have retried after failed takeover"
-
-    # Cleanup
-    sentinel.unlink()
-
-
-def test_acquire_lock_exhausts_attempts_and_fails(
-    worker_env: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Lock acquisition fails after exhausting all attempts."""
-    sentinel = worker_env / "test_stage.running"
-    sentinel.write_text("999999999")
-
-    monkeypatch.setattr(lock, "_atomic_lock_takeover", _helper_always_fail_takeover)
-
-    with pytest.raises(exceptions.StageAlreadyRunningError, match="after 3 attempts"):
-        lock.acquire_execution_lock("test_stage", worker_env)
-
-    # Cleanup
-    sentinel.unlink()
-
-
-# =============================================================================
-# Multiprocess Race Condition Tests
-# =============================================================================
-
-
-def _race_worker_try_takeover(args: tuple[int, str]) -> str:
-    """Module-level worker function for stale lock takeover test.
-
-    Takes a tuple of (worker_id, cache_dir_path) for cross-process pickling.
-    """
-    import time
-
-    worker_id, cache_dir_str = args
-    cache_dir = pathlib.Path(cache_dir_str)
-    try:
-        sentinel = lock.acquire_execution_lock("race_stage", cache_dir)
-        time.sleep(0.05)  # Hold lock briefly
-        sentinel.unlink(missing_ok=True)
-        return f"{worker_id}:success"
-    except exceptions.StageAlreadyRunningError:
-        return f"{worker_id}:failed"
-
-
-def _race_worker_try_fresh_acquire(args: tuple[int, str]) -> tuple[int, str]:
-    """Module-level worker function for fresh lock acquisition test.
-
-    Takes a tuple of (worker_id, cache_dir_path) for cross-process pickling.
-    """
-    import time
-
-    worker_id, cache_dir_str = args
-    cache_dir = pathlib.Path(cache_dir_str)
-    try:
-        sentinel = lock.acquire_execution_lock("fresh_lock_test", cache_dir)
-        time.sleep(0.1)  # Hold lock to force others to wait/fail
-        sentinel.unlink(missing_ok=True)
-        return (worker_id, "success")
-    except exceptions.StageAlreadyRunningError:
-        return (worker_id, "blocked")
-
-
-def test_concurrent_stale_lock_takeover_race(worker_env: pathlib.Path) -> None:
-    """Multiple processes racing to take over a stale lock - only one should win.
-
-    This tests the real race condition scenario where multiple processes detect
-    a stale lock and all try to take it over using atomic replace.
-    """
-    from concurrent import futures
-
-    NUM_PROCESSES = 5
-    cache_dir_str = str(worker_env)
-
-    # Create a stale lock (non-existent PID)
-    stale_sentinel = worker_env / "race_stage.running"
-    stale_sentinel.write_text("999999999")
-
-    try:
-        # Pass both worker_id and cache_dir as tuple for each worker
-        args = [(i, cache_dir_str) for i in range(NUM_PROCESSES)]
-
-        with futures.ProcessPoolExecutor(max_workers=NUM_PROCESSES) as pool:
-            results = list(pool.map(_race_worker_try_takeover, args))
-
-        successes = [r for r in results if ":success" in r]
-        failures = [r for r in results if ":failed" in r]
-
-        # At least one should succeed (first one to get the lock)
-        # Others should either fail or succeed after the first one releases
-        assert len(successes) >= 1, f"Expected at least 1 success, got {successes}"
-
-        # Total should equal NUM_PROCESSES
-        assert len(successes) + len(failures) == NUM_PROCESSES
-    finally:
-        stale_sentinel.unlink(missing_ok=True)
-
-
-def test_concurrent_fresh_lock_acquisition(worker_env: pathlib.Path) -> None:
-    """Multiple processes racing to acquire a fresh lock - only one should succeed at a time."""
-    from concurrent import futures
-
-    NUM_PROCESSES = 3
-    cache_dir_str = str(worker_env)
-    sentinel_path = worker_env / "fresh_lock_test.running"
-    sentinel_path.unlink(missing_ok=True)
-
-    try:
-        args = [(i, cache_dir_str) for i in range(NUM_PROCESSES)]
-
-        with futures.ProcessPoolExecutor(max_workers=NUM_PROCESSES) as pool:
-            results = list(pool.map(_race_worker_try_fresh_acquire, args))
-
-        # At least one should succeed
-        successes = [r for r in results if r[1] == "success"]
-        blocked = [r for r in results if r[1] == "blocked"]
-
-        assert len(successes) >= 1, "At least one process should acquire the lock"
-        # Total should be NUM_PROCESSES
-        assert len(successes) + len(blocked) == NUM_PROCESSES
-    finally:
-        sentinel_path.unlink(missing_ok=True)
-
-
-# =============================================================================
 # Helper Function Tests
 # =============================================================================
 
@@ -1518,127 +1109,6 @@ def test_deps_list_change_same_fingerprint_detected_by_hash(
     )
 
 
-# =============================================================================
-# TOCTOU Prevention Tests
-# =============================================================================
-
-
-def test_skip_acquires_execution_lock(
-    worker_env: pathlib.Path,
-    output_queue: mp.Queue[OutputMessage],
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Skipped stages still acquire execution lock (TOCTOU prevention).
-
-    This ensures output restoration happens inside the lock, preventing race
-    conditions between parallel processes.
-    """
-    (tmp_path / "input.txt").write_text("data")
-
-    def stage_func() -> None:
-        (tmp_path / "output.txt").write_text("result")
-
-    out = outputs.Out(str(tmp_path / "output.txt"), loader=loaders.PathOnly())
-    stage_info = _make_stage_info(
-        stage_func,
-        tmp_path,
-        fingerprint={"self:stage_func": "fp123"},
-        deps=["input.txt"],
-        outs=[out],
-    )
-
-    # First run - creates lock file and output
-    result1 = executor.execute_stage("test_stage", stage_info, worker_env, output_queue)
-    assert result1["status"] == "ran"
-
-    # Track if execution lock was acquired during second (skip) run
-    lock_acquired = False
-    original_execution_lock = lock.execution_lock
-
-    @contextlib.contextmanager
-    def tracking_execution_lock(
-        stage_name: str, cache_dir: pathlib.Path
-    ) -> Generator[pathlib.Path]:
-        nonlocal lock_acquired
-        lock_acquired = True
-        with original_execution_lock(stage_name, cache_dir) as sentinel:
-            yield sentinel
-
-    monkeypatch.setattr(lock, "execution_lock", tracking_execution_lock)
-
-    # Second run - should skip but still acquire lock
-    result2 = executor.execute_stage("test_stage", stage_info, worker_env, output_queue)
-
-    assert result2["status"] == "skipped"
-    assert lock_acquired, "Execution lock should be acquired even when skipping (TOCTOU prevention)"
-
-
-def test_restore_happens_inside_lock(
-    worker_env: pathlib.Path,
-    output_queue: mp.Queue[OutputMessage],
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Output restoration occurs while execution lock is held.
-
-    Verifies the fix for TOCTOU race condition where output could be modified
-    between skip decision and restoration.
-    """
-    (tmp_path / "input.txt").write_text("data")
-    output_path = tmp_path / "output.txt"
-
-    def stage_func() -> None:
-        output_path.write_text("result")
-
-    out = outputs.Out(str(output_path), loader=loaders.PathOnly())
-    stage_info = _make_stage_info(
-        stage_func,
-        tmp_path,
-        fingerprint={"self:stage_func": "fp123"},
-        deps=["input.txt"],
-        outs=[out],
-        checkout_modes=[cache.CheckoutMode.COPY],  # Use copy mode for simpler testing
-    )
-
-    # First run - creates lock file and caches output
-    result1 = executor.execute_stage("test_stage", stage_info, worker_env, output_queue)
-    assert result1["status"] == "ran"
-
-    # Delete output to force restoration
-    output_path.unlink()
-
-    # Track order of operations
-    operations: list[str] = []
-    original_execution_lock = lock.execution_lock
-    original_restore = worker._restore_outputs_from_cache
-
-    @contextlib.contextmanager
-    def tracking_lock(stage_name: str, cache_dir: pathlib.Path) -> Generator[pathlib.Path]:
-        operations.append("lock_acquire")
-        with original_execution_lock(stage_name, cache_dir) as sentinel:
-            yield sentinel
-        operations.append("lock_release")
-
-    def tracking_restore(*args: object, **kwargs: object) -> bool:
-        operations.append("restore")
-        return original_restore(*args, **kwargs)  # pyright: ignore[reportArgumentType]
-
-    monkeypatch.setattr(lock, "execution_lock", tracking_lock)
-    monkeypatch.setattr(worker, "_restore_outputs_from_cache", tracking_restore)
-
-    # Second run - should restore output
-    result2 = executor.execute_stage("test_stage", stage_info, worker_env, output_queue)
-
-    assert result2["status"] == "skipped"
-    assert output_path.exists(), "Output should be restored"
-
-    # Verify restore happened between lock acquire and release
-    assert operations == ["lock_acquire", "restore", "lock_release"], (
-        f"Restore should happen inside lock. Got: {operations}"
-    )
-
-
 def test_plain_params_no_auto_load_save(
     worker_env: pathlib.Path, output_queue: mp.Queue[OutputMessage], tmp_path: pathlib.Path
 ) -> None:
@@ -1816,18 +1286,17 @@ def test_user_explicit_parallel_config_overrides_protection() -> None:
 
 
 @pytest.mark.slow
-def test_queue_writer_thread_safety_concurrent_writes(
-    output_queue: mp.Queue[OutputMessage],
-) -> None:
+def test_queue_writer_thread_safety_concurrent_writes() -> None:
     """_QueueWriter handles concurrent writes from multiple threads."""
     import concurrent.futures
     import threading
 
+    output_queue: queue.Queue[OutputMessage] = queue.Queue()
     ring_buffer = worker._OutputRingBuffer()
 
     with worker._QueueWriter(
         "test_stage",
-        output_queue,
+        output_queue,  # pyright: ignore[reportArgumentType] - stdlib Queue compatible with mp.Queue for put()
         is_stderr=False,
         ring_buffer=ring_buffer,
     ) as writer:
@@ -1856,9 +1325,7 @@ def test_queue_writer_thread_safety_concurrent_writes(
 
 
 @pytest.mark.slow
-def test_queue_writer_thread_safety_atomic_writes(
-    output_queue: mp.Queue[OutputMessage],
-) -> None:
+def test_queue_writer_thread_safety_atomic_writes() -> None:
     """_QueueWriter write() calls are atomic - individual lines are not corrupted.
 
     When multiple threads write complete lines (ending with newline), each line
@@ -1869,11 +1336,12 @@ def test_queue_writer_thread_safety_atomic_writes(
     import concurrent.futures
     import threading
 
+    output_queue: queue.Queue[OutputMessage] = queue.Queue()
     ring_buffer = worker._OutputRingBuffer()
 
     with worker._QueueWriter(
         "test_stage",
-        output_queue,
+        output_queue,  # pyright: ignore[reportArgumentType] - stdlib Queue compatible with mp.Queue for put()
         is_stderr=False,
         ring_buffer=ring_buffer,
     ) as writer:

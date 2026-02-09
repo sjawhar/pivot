@@ -15,7 +15,7 @@ from conftest import AsyncEventCaptureSink
 from helpers import register_test_stage
 from pivot.engine import engine as engine_mod
 from pivot.engine import sinks, sources
-from pivot.types import OutputMessage, StageStatus
+from pivot.types import LogMessage, OutputMessage, OutputMessageKind, StageStatus
 
 if TYPE_CHECKING:
     from pytest_mock import MockerFixture
@@ -102,8 +102,19 @@ async def test_drain_thread_exits_on_sentinel(minimal_pipeline: Pipeline) -> Non
             with anyio.fail_after(7.0):
                 async with anyio.create_task_group() as tg:
                     tg.start_soon(eng._drain_output_queue, output_queue, shutdown_event)
-                    output_queue.put(("stage", "line-1", False))
-                    output_queue.put(("stage", "line-2", True))
+                    output_queue.put(
+                        LogMessage(
+                            kind=OutputMessageKind.LOG,
+                            stage="stage",
+                            line="line-1",
+                            is_stderr=False,
+                        )
+                    )
+                    output_queue.put(
+                        LogMessage(
+                            kind=OutputMessageKind.LOG, stage="stage", line="line-2", is_stderr=True
+                        )
+                    )
                     output_queue.put(None)
 
 
@@ -202,7 +213,14 @@ async def test_engine_no_message_loss_on_normal_shutdown(minimal_pipeline: Pipel
                     )
 
                     for i in range(100):
-                        output_queue.put(("stage", f"message-{i}", False))
+                        output_queue.put(
+                            LogMessage(
+                                kind=OutputMessageKind.LOG,
+                                stage="stage",
+                                line=f"message-{i}",
+                                is_stderr=False,
+                            )
+                        )
 
                     output_queue.put(None)
 
@@ -235,7 +253,14 @@ async def test_engine_cancel_during_active_drain(minimal_pipeline: Pipeline) -> 
                         tg.start_soon(eng._drain_output_queue, output_queue, shutdown_event)
 
                         for i in range(50):
-                            output_queue.put(("stage", f"message-{i}", False))
+                            output_queue.put(
+                                LogMessage(
+                                    kind=OutputMessageKind.LOG,
+                                    stage="stage",
+                                    line=f"message-{i}",
+                                    is_stderr=False,
+                                )
+                            )
 
                         await anyio.sleep(0)
                         tg.cancel_scope.cancel()

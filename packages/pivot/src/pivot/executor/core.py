@@ -143,8 +143,13 @@ def count_results(results: dict[str, ExecutionSummary]) -> tuple[int, int, int, 
             case DisplayCategory.CACHED | DisplayCategory.CANCELLED:
                 # Cancelled stages are counted with cached (both are skipped, not failed)
                 cached += 1
-            case DisplayCategory.UNKNOWN | DisplayCategory.PENDING | DisplayCategory.RUNNING:
-                # UNKNOWN/PENDING/RUNNING shouldn't appear in final results
+            case (
+                DisplayCategory.UNKNOWN
+                | DisplayCategory.PENDING
+                | DisplayCategory.WAITING_ON_LOCK
+                | DisplayCategory.RUNNING
+            ):
+                # UNKNOWN/PENDING/WAITING_ON_LOCK/RUNNING shouldn't appear in final results
                 pass
     return ran, cached, blocked, failed
 

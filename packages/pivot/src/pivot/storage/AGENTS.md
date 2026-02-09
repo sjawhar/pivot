@@ -43,6 +43,17 @@ StateDB uses key prefixes for namespacing. Current prefixes in `pivot/storage/st
 - Map size must be set upfront (we use 10GB virtual default)
 - Keys and values are bytes—use consistent encoding
 
+## Concurrent Write Safety
+
+LMDB allows only one writer at a time (process-wide via flock on `data.mdb`).
+When multiple `pivot` processes share the same StateDB:
+- Reads are always non-blocking (MVCC snapshots)
+- Writes serialize — second writer blocks until first commits/aborts
+- `StateDB._write_transaction()` wraps LMDB writes with an outer flock on `pivot-write.lock`
+  - The outer flock provides **timeout detection only** (LMDB's `env.begin(write=True)` blocks indefinitely)
+  - LMDB's internal write serialization (via `lock.mdb`) handles actual mutual exclusion
+- On timeout: raises `PivotDBWriteTimeoutError` with diagnostic message
+
 ## Path Storage
 
 All paths stored in the database must be **relative** to ensure portability across machines and correct cache behavior.

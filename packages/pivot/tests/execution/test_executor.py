@@ -3,7 +3,6 @@ from __future__ import annotations
 import atexit
 import logging
 import multiprocessing as mp
-import os
 import pathlib
 import sys
 import threading
@@ -261,22 +260,6 @@ def _real_stage(
 ) -> _OutputTxt:
     pathlib.Path("output.txt").write_text("done")
     return {"output": pathlib.Path("output.txt")}
-
-
-def _check_lock(
-    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
-) -> _OutputTxt:
-    stages_dir = pathlib.Path(".pivot") / "stages"
-    lock_existed = (stages_dir / "check_lock.running").exists()
-    pathlib.Path("lock_existed.txt").write_text("yes" if lock_existed else "no")
-    pathlib.Path("output.txt").write_text("done")
-    return {"output": pathlib.Path("output.txt")}
-
-
-def _failing_stage(
-    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
-) -> _OutputTxt:
-    raise RuntimeError("Stage failed!")
 
 
 def _process_basic(
@@ -1094,117 +1077,6 @@ def test_nonexistent_stage_raises_error(
     assert "nonexistent_stage" in str(exc_info.value)
 
 
-def test_execution_lock_created_and_removed(
-    pipeline_dir: pathlib.Path, stages_dir: pathlib.Path, test_pipeline: Pipeline
-) -> None:
-    """Execution lock file is created during run and removed after."""
-    (pipeline_dir / "input.txt").write_text("hello")
-
-    register_test_stage(_check_lock, name="check_lock")
-
-    executor.run(pipeline=test_pipeline)
-
-    lock_check_file = pipeline_dir / "lock_existed.txt"
-    assert lock_check_file.read_text() == "yes", "Lock file should exist during stage execution"
-    assert not (stages_dir / "check_lock.running").exists(), "Lock file should be removed after"
-
-
-def test_execution_lock_removed_on_stage_failure(
-    pipeline_dir: pathlib.Path, stages_dir: pathlib.Path, test_pipeline: Pipeline
-) -> None:
-    """Execution lock is released even if stage raises an exception."""
-    (pipeline_dir / "input.txt").write_text("hello")
-
-    register_test_stage(_failing_stage, name="failing_stage")
-
-    # Executor now catches exceptions and returns failed status
-    results = executor.run(pipeline=test_pipeline)
-
-    assert results["failing_stage"]["status"] == "failed"
-    assert "Stage failed!" in results["failing_stage"]["reason"]
-    assert not (stages_dir / "failing_stage.running").exists(), "Lock should be released on failure"
-
-
-def test_stale_lock_from_dead_process_is_broken(
-    pipeline_dir: pathlib.Path, stages_dir: pathlib.Path, test_pipeline: Pipeline
-) -> None:
-    """Stale lock file from crashed process is automatically removed."""
-    (pipeline_dir / "input.txt").write_text("hello")
-
-    # Create a stale lock with a non-existent PID
-    stale_lock = stages_dir / "process.running"
-    stale_lock.write_text("999999999")  # PID that doesn't exist
-
-    register_test_stage(_process_basic, name="process")
-
-    # Should succeed by breaking the stale lock
-    results = executor.run(pipeline=test_pipeline)
-
-    assert results["process"]["status"] == "ran"
-    assert not stale_lock.exists(), "Stale lock should be removed"
-
-
-def test_concurrent_execution_returns_failed_status(
-    pipeline_dir: pathlib.Path, stages_dir: pathlib.Path, test_pipeline: Pipeline
-) -> None:
-    """Running stage that's already running returns failed status."""
-    (pipeline_dir / "input.txt").write_text("hello")
-
-    # Create a lock with our own PID (simulating concurrent run)
-    active_lock = stages_dir / "process.running"
-    active_lock.write_text(str(os.getpid()))
-
-    register_test_stage(_process_basic, name="process")
-
-    # Executor now returns failed status instead of raising
-    results = executor.run(pipeline=test_pipeline)
-
-    assert results["process"]["status"] == "failed"
-    assert "already running" in results["process"]["reason"]
-    assert str(os.getpid()) in results["process"]["reason"]
-
-    # Clean up
-    active_lock.unlink()
-
-
-def test_corrupted_lock_file_is_broken(
-    pipeline_dir: pathlib.Path, stages_dir: pathlib.Path, test_pipeline: Pipeline
-) -> None:
-    """Corrupted lock file (invalid content) is treated as stale and removed."""
-    (pipeline_dir / "input.txt").write_text("hello")
-
-    # Create a corrupted lock file
-    corrupted_lock = stages_dir / "process.running"
-    corrupted_lock.write_text("garbage content without pid")
-
-    register_test_stage(_process_basic, name="process")
-
-    # Should succeed by treating corrupted lock as stale
-    results = executor.run(pipeline=test_pipeline)
-
-    assert results["process"]["status"] == "ran"
-    assert not corrupted_lock.exists(), "Corrupted lock should be removed"
-
-
-def test_negative_pid_in_lock_is_treated_as_stale(
-    pipeline_dir: pathlib.Path, stages_dir: pathlib.Path, test_pipeline: Pipeline
-) -> None:
-    """Lock file with invalid PID (negative) is treated as stale."""
-    (pipeline_dir / "input.txt").write_text("hello")
-
-    # Create a lock with invalid PID
-    invalid_lock = stages_dir / "process.running"
-    invalid_lock.write_text("-1")
-
-    register_test_stage(_process_basic, name="process")
-
-    # Should succeed by treating invalid PID as stale
-    results = executor.run(pipeline=test_pipeline)
-
-    assert results["process"]["status"] == "ran"
-    assert not invalid_lock.exists(), "Invalid PID lock should be removed"
-
-
 def test_output_queue_reader_only_catches_empty(
     pipeline_dir: pathlib.Path, test_pipeline: Pipeline
 ) -> None:
@@ -1616,26 +1488,6 @@ def test_stage_partial_line_output_captured(
 # =============================================================================
 # Lock Retry Exhaustion Tests
 # =============================================================================
-
-
-def test_lock_retry_exhaustion_returns_failed(
-    pipeline_dir: pathlib.Path, stages_dir: pathlib.Path, test_pipeline: Pipeline
-) -> None:
-    """Multiple failed lock attempts return failed status."""
-    (pipeline_dir / "input.txt").write_text("data")
-
-    # Create a lock with our own PID (simulates live concurrent run)
-    lock_file = stages_dir / "process.running"
-    lock_file.write_text(str(os.getpid()))
-
-    register_test_stage(_process_basic, name="process")
-
-    results = executor.run(pipeline=test_pipeline)
-
-    assert results["process"]["status"] == "failed"
-    assert "already running" in results["process"]["reason"]
-
-    lock_file.unlink()
 
 
 # =============================================================================

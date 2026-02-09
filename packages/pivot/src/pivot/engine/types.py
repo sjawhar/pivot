@@ -45,8 +45,9 @@ class StageExecutionState(IntEnum):
     BLOCKED = 1  # Waiting for upstream stages
     READY = 2  # Can run, waiting for worker
     PREPARING = 3  # Pivot clearing outputs
-    RUNNING = 4  # Stage function executing
-    COMPLETED = 5  # Terminal (ran/skipped/failed)
+    WAITING_ON_LOCK = 4  # Waiting for artifact lock
+    RUNNING = 5  # Stage function executing
+    COMPLETED = 6  # Terminal (ran/skipped/failed)
 
 
 class NodeType(Enum):

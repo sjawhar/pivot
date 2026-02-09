@@ -292,3 +292,46 @@ def test_apply_cancel_marks_ready_and_pending_completed() -> None:
     assert old_states["pending"] == StageExecutionState.PENDING, (
         "previous_state should be PENDING for a stage that was PENDING before cancel"
     )
+
+
+def test_state_enum_comparison_for_monotonicity_guard() -> None:
+    """Verify IntEnum comparison works for the drain thread's monotonicity guard.
+
+    The drain thread uses `current >= new_state` to skip backward transitions.
+    This test verifies that StageExecutionState IntEnum values support this comparison.
+    """
+    # Verify enum values are ordered correctly
+    assert StageExecutionState.PENDING < StageExecutionState.BLOCKED
+    assert StageExecutionState.BLOCKED < StageExecutionState.READY
+    assert StageExecutionState.READY < StageExecutionState.PREPARING
+    assert StageExecutionState.PREPARING < StageExecutionState.WAITING_ON_LOCK
+    assert StageExecutionState.WAITING_ON_LOCK < StageExecutionState.RUNNING
+    assert StageExecutionState.RUNNING < StageExecutionState.COMPLETED
+
+    # Test the guard logic: if current >= new_state, skip the transition
+    scheduler = _helper_make_scheduler(
+        stage_states={"stage": StageExecutionState.COMPLETED},
+        upstream_unfinished={"stage": set()},
+        downstream={"stage": []},
+        stage_mutex={"stage": []},
+    )
+
+    # Verify get_state returns the current state
+    current = scheduler.get_state("stage")
+    assert current == StageExecutionState.COMPLETED, "get_state should return COMPLETED"
+
+    # Verify the guard condition: COMPLETED >= RUNNING should be True
+    # (meaning we should skip the transition)
+    assert current >= StageExecutionState.RUNNING, (
+        "COMPLETED should be >= RUNNING for guard to skip"
+    )
+
+    # Verify the guard condition: COMPLETED >= WAITING_ON_LOCK should be True
+    assert current >= StageExecutionState.WAITING_ON_LOCK, (
+        "COMPLETED should be >= WAITING_ON_LOCK for guard to skip"
+    )
+
+    # Verify the guard condition: COMPLETED >= COMPLETED should be True
+    assert current >= StageExecutionState.COMPLETED, (
+        "COMPLETED should be >= COMPLETED for guard to skip duplicate"
+    )

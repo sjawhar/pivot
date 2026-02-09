@@ -142,12 +142,12 @@ class StageNotFoundError(DAGError):
         return (self.__class__, (self._unknown, self._available))
 
 
-class StageAlreadyRunningError(PivotError):
-    """Raised when a stage is already being executed by another process."""
+class PivotDBWriteTimeoutError(PivotError):
+    """Raised when a StateDB write lock cannot be acquired in time."""
 
     @override
     def get_suggestion(self) -> str:
-        return "Wait for the other process to finish or remove stale lock files"
+        return "Another pivot process may be holding the write lock. Check for zombie processes."
 
 
 class ExecutionError(PivotError):

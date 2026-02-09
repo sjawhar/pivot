@@ -28,6 +28,8 @@ def get_status_symbol(status: StageStatus, reason: str = "") -> tuple[str, str]:
     match category:
         case DisplayCategory.PENDING:
             return ("○", "dim")
+        case DisplayCategory.WAITING_ON_LOCK:
+            return ("⏳", "yellow")
         case DisplayCategory.RUNNING:
             return ("▶", "blue bold")
         case DisplayCategory.SUCCESS:
@@ -50,6 +52,8 @@ def get_status_label(status: StageStatus, reason: str = "") -> tuple[str, str]:
     match category:
         case DisplayCategory.PENDING:
             return ("PENDING", "dim")
+        case DisplayCategory.WAITING_ON_LOCK:
+            return ("WAITING ON LOCK", "yellow")
         case DisplayCategory.RUNNING:
             return ("RUNNING", "blue bold")
         case DisplayCategory.SUCCESS:
@@ -80,7 +84,12 @@ def get_status_icon(status: StageStatus, reason: str = "") -> str:
             return "[red]◇[/]"
         case DisplayCategory.CANCELLED:
             return "[yellow dim]![/]"
-        case DisplayCategory.PENDING | DisplayCategory.RUNNING | DisplayCategory.UNKNOWN:
+        case (
+            DisplayCategory.PENDING
+            | DisplayCategory.WAITING_ON_LOCK
+            | DisplayCategory.RUNNING
+            | DisplayCategory.UNKNOWN
+        ):
             return ""
 
 
@@ -116,6 +125,8 @@ def get_status_table_cell(status: StageStatus, reason: str) -> str:
             return "[yellow dim]! cncl[/] "
         case DisplayCategory.PENDING:
             return "[dim]PENDING[/] "
+        case DisplayCategory.WAITING_ON_LOCK:
+            return "[yellow]⏳ wait[/] "
         case DisplayCategory.RUNNING:
             return "[blue bold]RUNNING[/] "
         case DisplayCategory.UNKNOWN:

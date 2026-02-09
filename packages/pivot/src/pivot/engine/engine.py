@@ -42,7 +42,7 @@ from pivot.engine.types import (
 from pivot.executor import core as executor_core
 from pivot.executor import worker
 from pivot.storage import state as state_mod
-from pivot.types import OnError, OutputMessage, StageResult, StageStatus
+from pivot.types import OnError, OutputMessage, OutputMessageKind, StageResult, StageStatus
 
 if TYPE_CHECKING:
     import networkx as nx
@@ -855,9 +855,23 @@ class Engine:
                 if msg is None:
                     break
 
-                try:
-                    stage_name, line, is_stderr = msg
-                except (TypeError, ValueError):
+                if msg["kind"] == OutputMessageKind.STATE:
+                    try:
+                        if msg["state"] == "waiting_on_lock":
+                            new_state = StageExecutionState.WAITING_ON_LOCK
+                        elif msg["state"] == "running":
+                            new_state = StageExecutionState.RUNNING
+                        else:
+                            continue
+                        # Guard: skip if stage already at or past this state.
+                        # Late-arriving messages from the output queue must not
+                        # rewind a stage that has already completed.
+                        current = self._scheduler.get_state(msg["stage"])
+                        if current >= new_state:
+                            continue
+                        anyio.from_thread.run(self._set_stage_state, msg["stage"], new_state)
+                    except Exception:
+                        break
                     continue
 
                 try:
@@ -865,13 +879,12 @@ class Engine:
                         self.emit,
                         LogLine(
                             type="log_line",
-                            stage=stage_name,
-                            line=line,
-                            is_stderr=is_stderr,
+                            stage=msg["stage"],
+                            line=msg["line"],
+                            is_stderr=msg["is_stderr"],
                         ),
                     )
                 except Exception:
-                    # Event loop closed or cancelled -- stop draining
                     break
 
         await anyio.to_thread.run_sync(_blocking_drain, abandon_on_cancel=True)
