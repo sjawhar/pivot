@@ -4,11 +4,13 @@ import logging
 import os
 import pathlib
 import struct
+import threading
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Self
 
 import lmdb
 
-from pivot import run_history
+from pivot import exceptions, run_history
 
 logger = logging.getLogger(__name__)
 
@@ -160,8 +162,12 @@ class StateDB:
     _env: lmdb.Environment
     _closed: bool
     _readonly: bool
+    _write_timeout: float
+    _write_lock: threading.Lock
 
-    def __init__(self, db_path: pathlib.Path, readonly: bool = False) -> None:
+    def __init__(
+        self, db_path: pathlib.Path, readonly: bool = False, write_timeout: float = 30.0
+    ) -> None:
         lmdb_path = db_path.parent / "state.lmdb"
         lmdb_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -172,6 +178,8 @@ class StateDB:
         self._env = lmdb.open(str(lmdb_path), map_size=_MAP_SIZE, readonly=readonly)
         self._closed = False
         self._readonly = readonly
+        self._write_timeout = write_timeout
+        self._write_lock = threading.Lock()
 
     def _check_closed(self) -> None:
         """Raise if database is closed."""
@@ -184,6 +192,42 @@ class StateDB:
             raise RuntimeError(
                 "Internal error: worker attempted write to readonly StateDB. This is a bug in Pivot. Please report it."
             )
+
+    @contextmanager
+    def _write_transaction(self, operation: str = "write"):
+        """Context manager for write transactions with timeout protection.
+
+        Acquires an in-process lock with timeout, then opens an LMDB write
+        transaction on the calling thread. This avoids cross-thread transaction
+        use (LMDB transactions are thread-affine).
+
+        Args:
+            operation: Description of the operation for logging/error messages
+
+        Yields:
+            LMDB transaction object
+
+        Raises:
+            PivotDBWriteTimeoutError: If write lock cannot be acquired within timeout
+        """
+        if self._readonly:
+            raise RuntimeError("Internal error: attempted write transaction on readonly StateDB")
+
+        acquired = self._write_lock.acquire(timeout=self._write_timeout)
+        if not acquired:
+            logger.warning(
+                f"StateDB write lock timeout ({self._write_timeout}s) for operation: {operation}"
+            )
+            raise exceptions.PivotDBWriteTimeoutError(
+                f"StateDB write transaction timed out after {self._write_timeout}s "
+                f"(operation: {operation}). Another process may be holding a write lock."
+            )
+
+        try:
+            with self._env.begin(write=True) as txn:
+                yield txn
+        finally:
+            self._write_lock.release()
 
     @property
     def readonly(self) -> bool:
@@ -222,7 +266,7 @@ class StateDB:
             )
         value = _pack_value(fs_stat.st_mtime_ns, fs_stat.st_size, fs_stat.st_ino, file_hash)
         try:
-            with self._env.begin(write=True) as txn:
+            with self._write_transaction("save") as txn:
                 txn.put(key, value)
         except lmdb.MapFullError as e:
             raise DatabaseFullError(_DB_FULL_MSG) from e
@@ -232,7 +276,7 @@ class StateDB:
         self._check_closed()
         self._check_write_allowed()
         try:
-            with self._env.begin(write=True) as txn:
+            with self._write_transaction("save_many") as txn:
                 for path, fs_stat, file_hash in entries:
                     key = _make_key_file_hash(path)
                     if len(key) > _MAX_KEY_SIZE:
@@ -281,7 +325,7 @@ class StateDB:
         if not entries:
             return
         try:
-            with self._env.begin(write=True) as txn:
+            with self._write_transaction("save_ast_hash_many") as txn:
                 for (
                     rel_path,
                     mtime_ns,
@@ -310,7 +354,7 @@ class StateDB:
         self._check_closed()
         self._check_write_allowed()
         deleted = 0
-        with self._env.begin(write=True) as txn:
+        with self._write_transaction("clear_ast_hashes") as txn:
             cursor = txn.cursor()
             keys_to_delete = list[bytes]()
             if cursor.set_range(_FP_PREFIX):
@@ -342,7 +386,7 @@ class StateDB:
                 f"Key too long for state cache ({len(key)} bytes, max {_MAX_KEY_SIZE})"
             )
         try:
-            with self._env.begin(write=True) as txn:
+            with self._write_transaction("put_raw") as txn:
                 txn.put(key, value)
         except lmdb.MapFullError as e:
             raise DatabaseFullError(_DB_FULL_MSG) from e
@@ -354,7 +398,7 @@ class StateDB:
         if not entries:
             return
         try:
-            with self._env.begin(write=True) as txn:
+            with self._write_transaction("put_raw_many") as txn:
                 for key, value in entries:
                     if len(key) > _MAX_KEY_SIZE:
                         continue  # Skip oversized keys
@@ -369,7 +413,7 @@ class StateDB:
         if not keys:
             return
         try:
-            with self._env.begin(write=True) as txn:
+            with self._write_transaction("delete_raw_many") as txn:
                 for key in keys:
                     txn.delete(key)
         except lmdb.MapFullError as e:
@@ -428,7 +472,7 @@ class StateDB:
                 f"Path too long for generation tracking ({len(key)} bytes, max {_MAX_KEY_SIZE}): {path}"
             )
         try:
-            with self._env.begin(write=True) as txn:
+            with self._write_transaction("increment_generation") as txn:
                 value = txn.get(key)
                 new_gen = (struct.unpack(">Q", value)[0] + 1) if value else 1
                 txn.put(key, struct.pack(">Q", new_gen))
@@ -464,7 +508,7 @@ class StateDB:
                     f"Dependency path too long for tracking ({len(key)} bytes, max {_MAX_KEY_SIZE}): {dep_path}"
                 )
         try:
-            with self._env.begin(write=True) as txn:
+            with self._write_transaction("record_dep_generations") as txn:
                 cursor = txn.cursor()
                 keys_to_delete = list[bytes]()
                 if cursor.set_range(prefix):
@@ -511,7 +555,7 @@ class StateDB:
         self._check_write_allowed()
         prefix = _REMOTE_PREFIX + remote_name.encode() + b":"
         try:
-            with self._env.begin(write=True) as txn:
+            with self._write_transaction("remote_hashes_add") as txn:
                 for hash_ in hashes:
                     key = prefix + hash_.encode()
                     txn.put(key, b"1")
@@ -523,7 +567,7 @@ class StateDB:
         self._check_closed()
         self._check_write_allowed()
         prefix = _REMOTE_PREFIX + remote_name.encode() + b":"
-        with self._env.begin(write=True) as txn:
+        with self._write_transaction("remote_hashes_remove") as txn:
             for hash_ in hashes:
                 key = prefix + hash_.encode()
                 txn.delete(key)
@@ -555,7 +599,7 @@ class StateDB:
         self._check_closed()
         self._check_write_allowed()
         prefix = _REMOTE_PREFIX + remote_name.encode() + b":"
-        with self._env.begin(write=True) as txn:
+        with self._write_transaction("remote_index_clear") as txn:
             cursor = txn.cursor()
             keys_to_delete = list[bytes]()
             if cursor.set_range(prefix):
@@ -581,7 +625,7 @@ class StateDB:
         key = _RUN_PREFIX + manifest["run_id"].encode()
         value = run_history.serialize_to_bytes(manifest)
         try:
-            with self._env.begin(write=True) as txn:
+            with self._write_transaction("write_run") as txn:
                 txn.put(key, value)
         except lmdb.MapFullError as e:
             raise DatabaseFullError(_DB_FULL_MSG) from e
@@ -649,7 +693,7 @@ class StateDB:
         to_keep = runs[:retention]
         to_delete = runs[retention:]
 
-        with self._env.begin(write=True) as txn:
+        with self._write_transaction("prune_runs") as txn:
             for run in to_delete:
                 key = _RUN_PREFIX + run["run_id"].encode()
                 txn.delete(key)
@@ -670,7 +714,7 @@ class StateDB:
         key = _RUNCACHE_PREFIX + f"{stage_name}:{input_hash}".encode()
         value = run_history.serialize_to_bytes(entry)
         try:
-            with self._env.begin(write=True) as txn:
+            with self._write_transaction("write_run_cache") as txn:
                 txn.put(key, value)
         except lmdb.MapFullError as e:
             raise DatabaseFullError(_DB_FULL_MSG) from e
@@ -714,7 +758,7 @@ class StateDB:
         if not to_delete:
             return 0
 
-        with self._env.begin(write=True) as txn:
+        with self._write_transaction("prune_run_cache") as txn:
             for key in to_delete:
                 txn.delete(key)
         return len(to_delete)
@@ -765,7 +809,7 @@ class StateDB:
                     )
 
         try:
-            with self._env.begin(write=True) as txn:
+            with self._write_transaction("apply_deferred_writes") as txn:
                 # Dependency generations (clear old entries first, like record_dep_generations)
                 if "dep_generations" in deferred:
                     prefix = _DEP_PREFIX + stage_name.encode() + b":"

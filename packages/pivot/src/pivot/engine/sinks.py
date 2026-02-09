@@ -48,6 +48,13 @@ class ConsoleSink:
                             # Escape to prevent Rich markup injection from error messages
                             for line in event["reason"].rstrip().split("\n"):
                                 self._console.print(f"    [dim]{rich.markup.escape(line)}[/dim]")
+            case "stage_state_changed":
+                from pivot.engine.types import StageExecutionState
+
+                if event["state"] == StageExecutionState.WAITING_ON_LOCK:
+                    self._console.print(
+                        f"  {event['stage']}: [yellow]waiting on artifact lock...[/yellow]"
+                    )
             case "log_line" if self._show_output:
                 stage = event["stage"]
                 # Escape line content to prevent Rich markup injection from stage output

@@ -30,7 +30,7 @@ from pivot import (
     run_history,
     stage_def,
 )
-from pivot.storage import cache, lock, state
+from pivot.storage import artifact_lock, cache, lock, state
 from pivot.types import (
     DeferredWrites,
     DepEntry,
@@ -208,9 +208,35 @@ def execute_stage(
                 ring_buffer,
             )
 
-        input_hash: str | None = None
-        try:
-            with lock.execution_lock(stage_name, lock.get_stages_dir(stage_info["state_dir"])):
+        lock_requests = artifact_lock.expand_lock_requests(
+            stage_info["deps"], stage_info["outs"], project_root
+        )
+        lock_service = artifact_lock.LocalFlockLockService(stage_info["state_dir"])
+        waiting_on_lock = False
+
+        def _status_callback(key: str, mode: artifact_lock.LockMode, elapsed: float) -> None:
+            nonlocal waiting_on_lock
+            if waiting_on_lock:
+                return
+            waiting_on_lock = True
+            logger.warning(
+                "Stage '%s' waiting on %s lock for %s (%.1fs)",
+                stage_name,
+                mode.name,
+                key,
+                elapsed,
+            )
+            with contextlib.suppress(queue.Full, ValueError, OSError):
+                output_queue.put(("__state__", stage_name, "WAITING_ON_LOCK"), block=False)
+
+        lock_handle = lock_service.acquire_many(lock_requests, status_callback=_status_callback)
+        with lock_handle:
+            if waiting_on_lock:
+                with contextlib.suppress(queue.Full, ValueError, OSError):
+                    output_queue.put(("__state__", stage_name, "RUNNING"), block=False)
+
+            input_hash: str | None = None
+            try:
                 lock_data = production_lock.read()
 
                 with state.StateDB(state_db_path, readonly=True) as state_db:
@@ -407,31 +433,29 @@ def execute_stage(
                         deferred_writes=deferred,
                     )
 
-        except exceptions.StageAlreadyRunningError as e:
-            return _make_result(StageStatus.FAILED, str(e), ring_buffer)
-        except exceptions.OutputMissingError as e:
-            return _make_result(StageStatus.FAILED, str(e), ring_buffer, input_hash=input_hash)
-        except SystemExit as e:
-            return _make_result(
-                StageStatus.FAILED,
-                f"Stage called sys.exit({e.code})",
-                ring_buffer,
-                input_hash=input_hash,
-            )
-        except KeyboardInterrupt:
-            return _make_result(
-                StageStatus.FAILED,
-                "KeyboardInterrupt",
-                ring_buffer,
-                input_hash=input_hash,
-            )
-        except Exception:
-            return _make_result(
-                StageStatus.FAILED,
-                traceback.format_exc(),
-                ring_buffer,
-                input_hash=input_hash,
-            )
+            except exceptions.OutputMissingError as e:
+                return _make_result(StageStatus.FAILED, str(e), ring_buffer, input_hash=input_hash)
+            except SystemExit as e:
+                return _make_result(
+                    StageStatus.FAILED,
+                    f"Stage called sys.exit({e.code})",
+                    ring_buffer,
+                    input_hash=input_hash,
+                )
+            except KeyboardInterrupt:
+                return _make_result(
+                    StageStatus.FAILED,
+                    "KeyboardInterrupt",
+                    ring_buffer,
+                    input_hash=input_hash,
+                )
+            except Exception:
+                return _make_result(
+                    StageStatus.FAILED,
+                    traceback.format_exc(),
+                    ring_buffer,
+                    input_hash=input_hash,
+                )
 
 
 def _canonicalize_out(path: str) -> str:

@@ -261,7 +261,10 @@ class LockData(TypedDict):
     output_hashes: dict[str, HashInfo]
 
 
-OutputMessage = tuple[str, str, bool] | None
+StateMessage = tuple[Literal["__state__"], str, str]
+"""Tagged variant for worker→engine state messages: (sentinel, stage_name, state_name)."""
+
+OutputMessage = tuple[str, str, bool] | StateMessage | None
 
 
 # =============================================================================

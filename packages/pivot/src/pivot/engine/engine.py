@@ -855,6 +855,31 @@ class Engine:
                 if msg is None:
                     break
 
+                # State messages from worker: ("__state__", stage_name, state_name)
+                if msg[0] == "__state__":
+                    _, state_stage_name, state_name = msg
+                    if state_name == "WAITING_ON_LOCK":
+                        new_state = StageExecutionState.WAITING_ON_LOCK
+                        prev_state = StageExecutionState.PREPARING
+                    elif state_name == "RUNNING":
+                        new_state = StageExecutionState.RUNNING
+                        prev_state = StageExecutionState.WAITING_ON_LOCK
+                    else:
+                        continue
+                    try:
+                        anyio.from_thread.run(
+                            self.emit,
+                            StageStateChanged(
+                                type="stage_state_changed",
+                                stage=state_stage_name,
+                                state=new_state,
+                                previous_state=prev_state,
+                            ),
+                        )
+                    except Exception:
+                        break
+                    continue
+
                 try:
                     stage_name, line, is_stderr = msg
                 except (TypeError, ValueError):
@@ -867,7 +892,9 @@ class Engine:
                             type="log_line",
                             stage=stage_name,
                             line=line,
-                            is_stderr=is_stderr,
+                            is_stderr=bool(
+                                is_stderr
+                            ),  # narrow str|bool after StateMessage filtered above
                         ),
                     )
                 except Exception:

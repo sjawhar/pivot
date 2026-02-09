@@ -38,7 +38,8 @@ StateDB uses key prefixes for namespacing. Current prefixes in `pivot/storage/st
 
 ## LMDB Specifics
 
-- Single writer, multiple readers
+- **Single writer, multiple readers** — LMDB serializes ALL writes at the database level (not per-key). Only one process can hold a write transaction at a time. Concurrent `pivot` processes are safe because workers open StateDB in readonly mode; only the coordinator writes.
+- **Write contention** — If multiple processes attempt writes simultaneously, LMDB blocks until the write lock is released. StateDB wraps write transactions with a configurable timeout (default 30s) to detect and report contention clearly via `PivotDBWriteTimeoutError` instead of blocking indefinitely.
 - Transactions are mandatory—use context managers
 - Map size must be set upfront (we use 10GB virtual default)
 - Keys and values are bytes—use consistent encoding

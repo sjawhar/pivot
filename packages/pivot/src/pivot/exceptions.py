@@ -142,14 +142,6 @@ class StageNotFoundError(DAGError):
         return (self.__class__, (self._unknown, self._available))
 
 
-class StageAlreadyRunningError(PivotError):
-    """Raised when a stage is already being executed by another process."""
-
-    @override
-    def get_suggestion(self) -> str:
-        return "Wait for the other process to finish or remove stale lock files"
-
-
 class ExecutionError(PivotError):
     """Raised when pipeline execution fails."""
 
@@ -164,6 +156,14 @@ class ExportError(DVCCompatError):
 
 class DVCImportError(DVCCompatError):
     """Raised when dvc.yaml import fails."""
+
+
+class PivotDBWriteTimeoutError(PivotError):
+    """Raised when StateDB write transaction times out due to contention."""
+
+    @override
+    def get_suggestion(self) -> str:
+        return "Wait for other processes to finish writing to the state database, then retry"
 
 
 class CacheError(PivotError):
