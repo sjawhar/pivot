@@ -562,3 +562,15 @@ def test_dag_target_partial_resolution(
     assert "extract" in result.output
     # transform not requested, should not appear in filtered output
     assert "transform" not in result.output
+
+
+# =============================================================================
+# Flag Tests
+# =============================================================================
+
+
+def test_dag_accepts_all_flag(runner: click.testing.CliRunner) -> None:
+    """Dag should accept the --all flag."""
+    result = runner.invoke(cli.cli, ["dag", "--help"])
+    assert result.exit_code == 0
+    assert "--all" in result.output, "Dag should accept --all flag"

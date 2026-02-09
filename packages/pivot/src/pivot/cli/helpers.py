@@ -25,11 +25,9 @@ class NoPipelineError(exceptions.PivotError):
     @override
     def format_user_message(self) -> str:
         return (
-            "No pipeline found. This command requires a Pivot project.\n"
+            "No pipeline definition found.\n"
             "\n"
-            "To create a new project, run: pivot init\n"
-            "\n"
-            "If you're in an existing project, ensure one of these exists:\n"
+            "This command requires a pipeline to be defined in one of:\n"
             "  - pivot.yaml (or pivot.yml)\n"
             "  - pipeline.py"
         )

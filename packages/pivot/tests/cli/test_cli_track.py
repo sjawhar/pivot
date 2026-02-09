@@ -3,6 +3,7 @@ from __future__ import annotations
 import pathlib
 from typing import TYPE_CHECKING, Annotated, TypedDict
 
+from conftest import isolated_pivot_dir
 from helpers import register_test_stage
 from pivot import cli, loaders, outputs
 from pivot.storage import track
@@ -489,3 +490,37 @@ def test_track_with_normalized_vs_resolved_paths(
     # Both paths should appear in error for clarity
     assert "link_to_real" in result.output, "Should show user's path"
     assert "real" in result.output, "Should show resolved path"
+
+
+# =============================================================================
+# No Pipeline Tests
+# =============================================================================
+
+
+def test_track_works_without_pipeline(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """Track should succeed in a Pivot project without a pipeline definition."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        (cwd / "data.csv").write_text("a,b,c\n1,2,3\n")
+        result = runner.invoke(cli.cli, ["track", "data.csv"])
+        assert result.exit_code == 0, f"Track should succeed without pipeline: {result.output}"
+        assert "Tracked: data.csv" in result.output, "Should show tracked confirmation"
+        assert (cwd / "data.csv.pvt").exists(), "PVT file should be created"
+
+
+def test_track_force_works_without_pipeline(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """Track --force should work without a pipeline definition."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        (cwd / "data.csv").write_text("a,b,c\n1,2,3\n")
+        # First track
+        runner.invoke(cli.cli, ["track", "data.csv"])
+        # Update and re-track with --force
+        (cwd / "data.csv").write_text("a,b,c\n4,5,6\n")
+        result = runner.invoke(cli.cli, ["track", "--force", "data.csv"])
+        assert result.exit_code == 0, (
+            f"Track --force should succeed without pipeline: {result.output}"
+        )
+        assert "Tracked: data.csv" in result.output

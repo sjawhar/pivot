@@ -34,7 +34,7 @@ def _get_output_sources(stage_list: list[str]) -> dict[str, str]:
     }
 
 
-@cli_decorators.pivot_command("list")
+@cli_decorators.pivot_command("list", allow_all=True)
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON")
 @click.option("--deps", "show_deps", is_flag=True, help="Show stage dependencies")
 @click.pass_context

@@ -34,8 +34,11 @@ Set `auto_discover=False` only for commands that don't use the stage registry:
 
 | Command | auto_discover | Reason |
 |---------|---------------|--------|
-| run, list, export | True (default) | Need registry to find stages |
-| checkout, track | True (default) | Need registry for validation |
+| run, export | True (default) | Need registry to find stages |
+| list, dag | True (default), allow_all=True | Need registry; --all for multi-pipeline |
+| checkout | True (default) | Need registry; handles None pipeline gracefully |
+| track | True (default) | Handles None pipeline gracefully (no overlap check) |
+| status | True (default), allow_all=True | Handles None pipeline gracefully (skips stages section) |
 | init | False | Creates new project (no pipeline yet) |
 | schema | False | Outputs JSON schema only |
 | push, pull, fetch | True (default) | Need registry for output cache filtering |

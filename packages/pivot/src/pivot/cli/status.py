@@ -53,7 +53,9 @@ def status(
     quiet = cli_ctx["quiet"]
 
     stages_list = cli_helpers.stages_to_list(stages)
-    cli_helpers.validate_stages_exist(stages_list)
+    pipeline = cli_decorators.get_pipeline_from_context()
+    if pipeline is not None:
+        cli_helpers.validate_stages_exist(stages_list)
 
     project_root = project.get_project_root()
     resolved_cache_dir = config.get_cache_dir()
@@ -69,7 +71,7 @@ def status(
     tracked_status = list[TrackedFileInfo]()
     remote_status: RemoteSyncInfo | None = None
 
-    if show_stages:
+    if show_stages and pipeline is not None:
         # Build bipartite graph for consistent execution order with Engine
         all_stages = cli_helpers.get_all_stages()
         graph = engine_graph.build_graph(all_stages)

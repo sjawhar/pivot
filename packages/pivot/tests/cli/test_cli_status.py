@@ -868,3 +868,33 @@ def test_explain_command_removed(runner: click.testing.CliRunner, tmp_path: path
 
         assert result.exit_code != 0
         assert "No such command" in result.output or "Error" in result.output
+
+
+# =============================================================================
+# No Pipeline Tests
+# =============================================================================
+
+
+def test_status_works_without_pipeline(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """Status should succeed in a Pivot project without a pipeline definition."""
+    with isolated_pivot_dir(runner, tmp_path):
+        result = runner.invoke(cli.cli, ["status"])
+        assert result.exit_code == 0, f"Status should succeed without pipeline: {result.output}"
+        # Should show tracked files section (even if empty)
+        assert "Tracked Files" in result.output or "No tracked files" in result.output, (
+            "Should show tracked files section"
+        )
+
+
+def test_status_json_without_pipeline(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """Status --json should work without a pipeline definition."""
+    with isolated_pivot_dir(runner, tmp_path):
+        result = runner.invoke(cli.cli, ["status", "--json"])
+        assert result.exit_code == 0, f"Status --json should succeed: {result.output}"
+        data = json.loads(result.output)
+        assert "stages" in data, "JSON output should include stages key"
+        assert data["stages"] == [], "Stages should be empty without pipeline"

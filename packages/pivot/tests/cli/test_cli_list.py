@@ -176,3 +176,15 @@ def test_list_deps_shows_source_stage(
     assert "consumer" in result.output
     # Should show that consumer's dep comes from producer
     assert "from: producer" in result.output
+
+
+# =============================================================================
+# No Pipeline Tests
+# =============================================================================
+
+
+def test_list_accepts_all_flag(runner: click.testing.CliRunner) -> None:
+    """List should accept the --all flag."""
+    result = runner.invoke(cli.cli, ["list", "--help"])
+    assert result.exit_code == 0
+    assert "--all" in result.output, "List should accept --all flag"

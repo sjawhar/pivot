@@ -196,7 +196,8 @@ def track(ctx: click.Context, paths: tuple[str, ...], force: bool) -> None:
     cache_dir = config.get_cache_dir() / "files"
 
     # Get all stage outputs for overlap detection
-    stage_outputs = _get_all_stage_outputs()
+    pipeline = cli_decorators.get_pipeline_from_context()
+    stage_outputs = {} if pipeline is None else _get_all_stage_outputs()
 
     # Discover existing .pvt files
     existing_tracked = track_mod.discover_pvt_files(project_root)

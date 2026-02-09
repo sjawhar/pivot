@@ -47,7 +47,7 @@ def _get_upstream_subgraph(
     return bipartite_graph.subgraph(nodes_to_include)
 
 
-@cli_decorators.pivot_command("dag")
+@cli_decorators.pivot_command("dag", allow_all=True)
 @click.argument("targets", nargs=-1)
 @click.option("--dot", "output_format", flag_value="dot", help="Output Graphviz DOT format")
 @click.option("--mermaid", "output_format", flag_value="mermaid", help="Output Mermaid format")
