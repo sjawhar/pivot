@@ -9,6 +9,8 @@ import pytest
 import textual.binding
 import textual.widgets
 
+import pivot_tui.rpc_client_impl
+from helpers import wait_for_socket
 from pivot import loaders, outputs
 from pivot.types import (
     StageStatus,
@@ -21,6 +23,7 @@ from pivot.types import (
 )
 from pivot_tui import run as run_tui
 from pivot_tui.screens import ConfirmCommitScreen
+from pivot_tui.testing import FakeRpcServer
 from pivot_tui.types import LogEntry, StageInfo
 from pivot_tui.widgets import (
     StageListPanel,
@@ -107,6 +110,14 @@ def _helper_step3(
     _ = step2_file
     pathlib.Path("step3.txt").write_text("step3")
     return {"output": pathlib.Path("step3.txt")}
+
+
+class _FailingRpcClient:
+    async def connect(self, _socket_path: pathlib.Path) -> None:
+        raise OSError("connect failed")
+
+    async def disconnect(self) -> None:
+        return None
 
 
 # =============================================================================
@@ -200,7 +211,6 @@ def test_run_tui_app_init() -> None:
     assert len(app._stages) == 3
     assert list(app._stage_order) == stage_names
     assert app._selected_idx == 0
-    assert app._results is None
 
 
 def test_run_tui_app_stage_info_indexes() -> None:
@@ -723,7 +733,6 @@ def test_on_tui_shutdown_calls_bell_in_run_mode(mocker: MockerFixture) -> None:
     # Mock methods that require mounted app or have side effects
     mocker.patch.object(app, "_shutdown_event")
     mocker.patch.object(app, "_close_log_file")
-    mocker.patch.object(app, "_shutdown_loky_pool")
     mocker.patch.object(app, "exit")
     mocker.patch.object(app, "_write_to_log")
     mock_bell = mocker.patch.object(app, "bell")
@@ -754,6 +763,62 @@ def test_on_tui_shutdown_no_bell_in_watch_mode(mocker: MockerFixture) -> None:
 
     # Bell should NOT be called in watch mode
     mock_bell.assert_not_called()
+
+
+def test_on_tui_shutdown_stops_event_poller(mocker: MockerFixture) -> None:
+    """on_tui_shutdown calls event_poller.stop() in run mode."""
+    app = run_tui.PivotApp(stage_names=["stage1"])
+
+    mock_poller = mocker.MagicMock()
+    app.set_event_poller(mock_poller)
+
+    mocker.patch.object(app, "_shutdown_event")
+    mocker.patch.object(app, "_close_log_file")
+    mocker.patch.object(app, "exit")
+    mocker.patch.object(app, "_write_to_log")
+    mocker.patch.object(app, "bell")
+
+    app.on_tui_shutdown(run_tui.TuiShutdown())
+
+    mock_poller.stop.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_pivot_app_on_mount_resets_client_on_connect_failure(
+    mocker: MockerFixture, tmp_path: pathlib.Path
+) -> None:
+    """on_mount clears client when RpcPivotClient connection fails."""
+    socket_path = tmp_path / "pivot.sock"
+    app = run_tui.PivotApp(stage_names=["stage_a"], socket_path=socket_path)
+
+    mocker.patch.object(pivot_tui.rpc_client_impl, "RpcPivotClient", _FailingRpcClient)
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+
+    assert app._client is None
+
+
+def test_on_tui_shutdown_returns_when_already_quitting(mocker: MockerFixture) -> None:
+    """on_tui_shutdown exits early when quitting flag is set."""
+    app = run_tui.PivotApp(stage_names=["stage1"])
+    app._quitting = True
+
+    mock_poller = mocker.MagicMock()
+    app.set_event_poller(mock_poller)
+
+    mocker.patch.object(app, "_shutdown_event")
+    mocker.patch.object(app, "_close_log_file")
+    mock_exit = mocker.patch.object(app, "exit")
+    mock_bell = mocker.patch.object(app, "bell")
+    mock_write = mocker.patch.object(app, "_write_to_log")
+
+    app.on_tui_shutdown(run_tui.TuiShutdown())
+
+    mock_write.assert_called_once()
+    mock_poller.stop.assert_not_called()
+    mock_bell.assert_not_called()
+    mock_exit.assert_not_called()
 
 
 # =============================================================================
@@ -941,67 +1006,58 @@ def test_pivot_app_exit_message_property_initial_state() -> None:
 
 @pytest.mark.anyio
 async def test_action_force_rerun_stage_calls_rpc(mocker: MockerFixture) -> None:
-    """action_force_rerun_stage should send RPC command for selected stage."""
-    app = run_tui.PivotApp(stage_names=["stage_a", "stage_b"], watch_mode=True)
+    """action_force_rerun_stage should send run command via client for selected stage."""
+    mock_client = AsyncMock()
+    mock_client.run.return_value = True
+    app = run_tui.PivotApp(stage_names=["stage_a", "stage_b"], watch_mode=True, client=mock_client)
     app._selected_stage_name = "stage_a"
 
-    mock_send = mocker.patch("pivot_tui.run.rpc_client.send_run_command", new_callable=AsyncMock)
-    mock_send.return_value = True
     mocker.patch.object(app, "notify")
-    mocker.patch("pivot_tui.run.project.get_project_root", return_value=pathlib.Path("/fake/root"))
 
     await app.action_force_rerun_stage()
 
-    mock_send.assert_called_once()
-    call_kwargs = mock_send.call_args.kwargs
-    assert call_kwargs["stages"] == ["stage_a"]
-    assert call_kwargs["force"] is True
+    mock_client.run.assert_called_once_with(stages=["stage_a"], force=True)
 
 
 @pytest.mark.anyio
 async def test_action_force_rerun_all_calls_rpc(mocker: MockerFixture) -> None:
-    """action_force_rerun_all should send RPC command for all stages."""
-    app = run_tui.PivotApp(stage_names=["stage_a", "stage_b"], watch_mode=True)
+    """action_force_rerun_all should send run command via client for all stages."""
+    mock_client = AsyncMock()
+    mock_client.run.return_value = True
+    app = run_tui.PivotApp(stage_names=["stage_a", "stage_b"], watch_mode=True, client=mock_client)
 
-    mock_send = mocker.patch("pivot_tui.run.rpc_client.send_run_command", new_callable=AsyncMock)
-    mock_send.return_value = True
     mocker.patch.object(app, "notify")
-    mocker.patch("pivot_tui.run.project.get_project_root", return_value=pathlib.Path("/fake/root"))
 
     await app.action_force_rerun_all()
 
-    mock_send.assert_called_once()
-    call_kwargs = mock_send.call_args.kwargs
-    assert call_kwargs["stages"] is None
-    assert call_kwargs["force"] is True
+    mock_client.run.assert_called_once_with(force=True)
 
 
 @pytest.mark.anyio
 async def test_action_force_rerun_not_in_watch_mode(mocker: MockerFixture) -> None:
     """action_force_rerun should do nothing in run mode."""
+    mock_client = AsyncMock()
     # Create run mode app (not watch mode - default)
-    app = run_tui.PivotApp(stage_names=["stage_a"])
+    app = run_tui.PivotApp(stage_names=["stage_a"], client=mock_client)
     app._selected_stage_name = "stage_a"
-
-    mock_send = mocker.patch("pivot_tui.run.rpc_client.send_run_command", new_callable=AsyncMock)
 
     await app.action_force_rerun_stage()
 
-    mock_send.assert_not_called()
+    mock_client.run.assert_not_called()
 
 
 @pytest.mark.anyio
 async def test_action_force_rerun_no_stage_selected(mocker: MockerFixture) -> None:
     """action_force_rerun_stage should notify when no stage selected."""
-    app = run_tui.PivotApp(stage_names=[], watch_mode=True)
+    mock_client = AsyncMock()
+    app = run_tui.PivotApp(stage_names=[], watch_mode=True, client=mock_client)
     app._selected_stage_name = None
 
-    mock_send = mocker.patch("pivot_tui.run.rpc_client.send_run_command", new_callable=AsyncMock)
     mock_notify = mocker.patch.object(app, "notify")
 
     await app.action_force_rerun_stage()
 
-    mock_send.assert_not_called()
+    mock_client.run.assert_not_called()
     mock_notify.assert_called_once()
     assert "No stage selected" in str(mock_notify.call_args)
 
@@ -1009,17 +1065,17 @@ async def test_action_force_rerun_no_stage_selected(mocker: MockerFixture) -> No
 @pytest.mark.anyio
 async def test_action_force_rerun_while_running(mocker: MockerFixture) -> None:
     """action_force_rerun should warn when stages are running."""
-    app = run_tui.PivotApp(stage_names=["stage_a"], watch_mode=True)
+    mock_client = AsyncMock()
+    app = run_tui.PivotApp(stage_names=["stage_a"], watch_mode=True, client=mock_client)
     app._selected_stage_name = "stage_a"
     # Simulate running stage
     app._stages["stage_a"].status = StageStatus.IN_PROGRESS
 
-    mock_send = mocker.patch("pivot_tui.run.rpc_client.send_run_command", new_callable=AsyncMock)
     mock_notify = mocker.patch.object(app, "notify")
 
     await app.action_force_rerun_stage()
 
-    mock_send.assert_not_called()
+    mock_client.run.assert_not_called()
     mock_notify.assert_called_once()
     assert "running" in str(mock_notify.call_args).lower()
 
@@ -1027,16 +1083,16 @@ async def test_action_force_rerun_while_running(mocker: MockerFixture) -> None:
 @pytest.mark.anyio
 async def test_action_force_rerun_all_while_running(mocker: MockerFixture) -> None:
     """action_force_rerun_all should warn when stages are running."""
-    app = run_tui.PivotApp(stage_names=["stage_a", "stage_b"], watch_mode=True)
+    mock_client = AsyncMock()
+    app = run_tui.PivotApp(stage_names=["stage_a", "stage_b"], watch_mode=True, client=mock_client)
     # Simulate running stage
     app._stages["stage_a"].status = StageStatus.IN_PROGRESS
 
-    mock_send = mocker.patch("pivot_tui.run.rpc_client.send_run_command", new_callable=AsyncMock)
     mock_notify = mocker.patch.object(app, "notify")
 
     await app.action_force_rerun_all()
 
-    mock_send.assert_not_called()
+    mock_client.run.assert_not_called()
     mock_notify.assert_called_once()
     assert "running" in str(mock_notify.call_args).lower()
 
@@ -1044,13 +1100,12 @@ async def test_action_force_rerun_all_while_running(mocker: MockerFixture) -> No
 @pytest.mark.anyio
 async def test_action_force_rerun_stage_failure_notifies(mocker: MockerFixture) -> None:
     """action_force_rerun_stage should notify on RPC failure."""
-    app = run_tui.PivotApp(stage_names=["stage_a"], watch_mode=True)
+    mock_client = AsyncMock()
+    mock_client.run.return_value = False  # RPC failure
+    app = run_tui.PivotApp(stage_names=["stage_a"], watch_mode=True, client=mock_client)
     app._selected_stage_name = "stage_a"
 
-    mock_send = mocker.patch("pivot_tui.run.rpc_client.send_run_command", new_callable=AsyncMock)
-    mock_send.return_value = False  # RPC failure
     mock_notify = mocker.patch.object(app, "notify")
-    mocker.patch("pivot_tui.run.project.get_project_root", return_value=pathlib.Path("/fake/root"))
 
     await app.action_force_rerun_stage()
 
@@ -1061,60 +1116,175 @@ async def test_action_force_rerun_stage_failure_notifies(mocker: MockerFixture) 
     assert "Failed" in last_call_args or "error" in last_call_args
 
 
-# =============================================================================
-# StageDataProvider Protocol Tests
-# =============================================================================
+def test_pivot_app_accepts_client(mocker: MockerFixture) -> None:
+    """PivotApp stores client when passed."""
+    client = mocker.MagicMock()
+    app = run_tui.PivotApp(stage_names=["s1"], client=client)
+    assert app._client is client
 
 
-def test_stage_data_provider_protocol_is_importable() -> None:
-    """StageDataProvider protocol can be imported from tui.types."""
-    from pivot_tui.types import StageDataProvider
-
-    assert hasattr(StageDataProvider, "get_stage")
-    assert hasattr(StageDataProvider, "ensure_fingerprint")
-
-
-def test_pivot_app_accepts_stage_data_provider(mocker: MockerFixture) -> None:
-    """PivotApp stores stage_data_provider when passed."""
-    from pivot_tui.types import StageDataProvider
-
-    provider = mocker.MagicMock(spec=StageDataProvider)
-    app = run_tui.PivotApp(stage_names=["s1"], stage_data_provider=provider)
-    assert app._stage_data_provider is provider
-
-
-def test_create_history_entry_uses_provider(mocker: MockerFixture) -> None:
-    """_create_history_entry uses stage_data_provider instead of cli_helpers."""
-    from pivot_tui.types import StageDataProvider
-
-    mock_provider = mocker.MagicMock(spec=StageDataProvider)
-    mock_provider.get_stage.return_value = {
-        "deps_paths": [],
-        "outs_paths": [],
-        "params": None,
-    }
-    mock_provider.ensure_fingerprint.return_value = {"func": "abc123"}
-
-    app = run_tui.PivotApp(
-        stage_names=["stage_a"],
-        watch_mode=True,
-        stage_data_provider=mock_provider,
-    )
-
-    mocker.patch("pivot_tui.run.explain.get_stage_explanation", return_value=None)
-    mocker.patch("pivot_tui.run.parameters.load_params_yaml", return_value={})
-    mocker.patch("pivot_tui.run.config.get_state_dir", return_value=pathlib.Path("/fake"))
-
-    app._create_history_entry("stage_a", "run-1")
-
-    mock_provider.get_stage.assert_called_with("stage_a")
-    mock_provider.ensure_fingerprint.assert_called_with("stage_a")
+@pytest.mark.asyncio
+async def test_pivot_app_connects_with_socket_path(
+    mocker: MockerFixture, tmp_path: pathlib.Path
+) -> None:
+    """PivotApp connects in on_mount when socket_path provided."""
+    socket_path = tmp_path / "pivot.sock"
+    server = FakeRpcServer()
+    server.set_commit_result(committed=["stage_a"])
+    await server.start(socket_path)
+    await wait_for_socket(socket_path)
+    try:
+        app = run_tui.PivotApp(
+            stage_names=["stage_a"],
+            watch_mode=True,
+            socket_path=socket_path,
+        )
+        mock_notify = mocker.patch.object(app, "notify")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await app.action_commit()
+        assert any("Committed 1" in str(call) for call in mock_notify.call_args_list), (
+            "Should notify on successful commit"
+        )
+    finally:
+        await server.stop()
 
 
-def test_create_history_entry_without_provider() -> None:
-    """_create_history_entry works without provider (no snapshot)."""
+def test_create_history_entry_uses_live_snapshot() -> None:
+    """_create_history_entry uses live_input_snapshot from StageInfo."""
     app = run_tui.PivotApp(stage_names=["stage_a"], watch_mode=True)
-    # No provider, no cli_helpers mock — should not raise
+    # No live snapshot — should get None
     app._create_history_entry("stage_a", "run-1")
     assert "stage_a" in app._pending_history
     assert app._pending_history["stage_a"].input_snapshot is None
+
+
+def test_handle_status_stores_explanation_on_stage_info() -> None:
+    """_handle_status stores explanation from TuiStatusMessage on StageInfo.live_input_snapshot."""
+    from unittest.mock import patch
+
+    app = run_tui.PivotApp(stage_names=["train"])
+    explanation = {
+        "stage_name": "train",
+        "will_run": True,
+        "is_forced": False,
+        "reason": "Code changed",
+        "code_changes": [],
+        "param_changes": [],
+        "dep_changes": [],
+        "upstream_stale": [],
+    }
+    msg = TuiStatusMessage(
+        type=TuiMessageType.STATUS,
+        stage="train",
+        index=0,
+        total=1,
+        status=StageStatus.IN_PROGRESS,
+        reason="",
+        elapsed=None,
+        run_id="run-1",
+        explanation=explanation,  # pyright: ignore[reportArgumentType]
+    )
+    with (
+        patch.object(app, "_try_query_one", return_value=None),
+        patch.object(app, "_update_detail_panel"),
+    ):
+        app._handle_status(msg)
+    assert app._stages["train"].live_input_snapshot is not None, "explanation should be stored"
+    assert app._stages["train"].live_input_snapshot["stage_name"] == "train"
+
+
+def test_handle_status_stores_output_summary_on_stage_info() -> None:
+    """_handle_status converts output_summary and stores on StageInfo.live_output_snapshot."""
+    from unittest.mock import patch
+
+    app = run_tui.PivotApp(stage_names=["train"])
+    output_summary = [
+        {
+            "path": "output.csv",
+            "change_type": "modified",
+            "output_type": "out",
+            "old_hash": "aaa",
+            "new_hash": "bbb",
+        },
+    ]
+    msg = TuiStatusMessage(
+        type=TuiMessageType.STATUS,
+        stage="train",
+        index=0,
+        total=1,
+        status=StageStatus.RAN,
+        reason="",
+        elapsed=1.0,
+        run_id="run-1",
+        output_summary=output_summary,  # pyright: ignore[reportArgumentType]
+    )
+    with (
+        patch.object(app, "_try_query_one", return_value=None),
+        patch.object(app, "_update_detail_panel"),
+    ):
+        app._handle_status(msg)
+    snapshot = app._stages["train"].live_output_snapshot
+    assert snapshot is not None, "output_summary should be converted and stored"
+    assert len(snapshot) == 1
+    assert snapshot[0]["path"] == "output.csv"
+    assert snapshot[0]["change_type"] == "modified"
+
+
+def test_handle_status_no_snapshot_fields_leaves_none() -> None:
+    """_handle_status without explanation/output_summary leaves snapshots as None."""
+    from unittest.mock import patch
+
+    app = run_tui.PivotApp(stage_names=["train"])
+    msg = TuiStatusMessage(
+        type=TuiMessageType.STATUS,
+        stage="train",
+        index=0,
+        total=1,
+        status=StageStatus.IN_PROGRESS,
+        reason="",
+        elapsed=None,
+        run_id="run-1",
+    )
+    with (
+        patch.object(app, "_try_query_one", return_value=None),
+        patch.object(app, "_update_detail_panel"),
+    ):
+        app._handle_status(msg)
+    assert app._stages["train"].live_input_snapshot is None
+    assert app._stages["train"].live_output_snapshot is None
+
+
+def test_convert_output_summary_none() -> None:
+    """_convert_output_summary returns None for None input."""
+    assert run_tui._convert_output_summary(None) is None
+
+
+def test_convert_output_summary_converts_change_types() -> None:
+    """_convert_output_summary converts string change_types to ChangeType enums."""
+    from pivot.types import ChangeType
+
+    raw = [
+        {
+            "path": "a.csv",
+            "change_type": "added",
+            "output_type": "out",
+            "old_hash": None,
+            "new_hash": "x",
+        },
+        {
+            "path": "b.csv",
+            "change_type": None,
+            "output_type": "metric",
+            "old_hash": "y",
+            "new_hash": "y",
+        },
+    ]
+    result = run_tui._convert_output_summary(raw)  # pyright: ignore[reportArgumentType]
+    assert result is not None
+    assert len(result) == 2
+    assert result[0]["change_type"] == ChangeType.ADDED
+    assert result[0]["old_hash"] is None
+    assert result[0]["new_hash"] == "x"
+    assert result[1]["change_type"] is None
+    assert result[1]["output_type"] == "metric"

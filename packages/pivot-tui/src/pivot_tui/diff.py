@@ -8,8 +8,6 @@ import textual.binding
 import textual.containers
 import textual.widgets
 
-from pivot import project
-from pivot.show import data
 from pivot.types import ChangeType, DataDiffResult, RowChange, SchemaChange
 
 # Rich markup symbols for change types
@@ -21,9 +19,6 @@ STATUS_SYMBOLS_RICH: dict[ChangeType, str] = {
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
-    from pathlib import Path
-
-    from pivot.show.data import DataDiffEntry
 
 
 class DiffSummaryPanel(textual.widgets.Static):
@@ -191,7 +186,11 @@ class FileDiffScreen(textual.widgets.Static):
 
 
 class DataDiffApp(textual.app.App[None]):
-    """Interactive data diff viewer."""
+    """Interactive data diff viewer.
+
+    Accepts pre-computed DataDiffResult list — all diff computation
+    happens before the app is created (typically via PivotClient.diff_output).
+    """
 
     CSS: ClassVar[str] = """
     DiffSummaryPanel {
@@ -224,26 +223,13 @@ class DataDiffApp(textual.app.App[None]):
         textual.binding.Binding("p", "prev_file", "Prev file"),
     ]
 
-    _diff_entries: list[DataDiffEntry]
-    _key_cols: list[str] | None
-    _max_rows: int
-    _current_idx: int
     _results: list[DataDiffResult]
-    _temp_files: list[Path]
+    _current_idx: int
 
-    def __init__(
-        self,
-        diff_entries: Sequence[DataDiffEntry],
-        key_cols: list[str] | None,
-        max_rows: int,
-    ) -> None:
+    def __init__(self, results: Sequence[DataDiffResult]) -> None:
         super().__init__()
-        self._diff_entries = list(diff_entries)
-        self._key_cols = key_cols
-        self._max_rows = max_rows
+        self._results = list(results)
         self._current_idx = 0
-        self._results = []
-        self._temp_files = []
 
     @override
     def compose(self) -> textual.app.ComposeResult:  # pragma: no cover
@@ -252,43 +238,7 @@ class DataDiffApp(textual.app.App[None]):
         yield textual.widgets.Footer()
 
     async def on_mount(self) -> None:  # pragma: no cover
-        # Load diff results
-        self._results = self._load_diff_results()
         self._show_current_file()
-
-    def _load_diff_results(self) -> list[DataDiffResult]:  # pragma: no cover
-        """Load diff results for all entries."""
-        results = list[DataDiffResult]()
-        proj_root = project.get_project_root()
-
-        for entry in self._diff_entries:
-            rel_path = entry["path"]
-            abs_path = proj_root / rel_path
-            old_hash = entry["old_hash"]
-
-            # Restore old file from cache if needed
-            old_path: Path | None = None
-            if old_hash is not None:
-                old_path = data.restore_data_from_cache(rel_path, old_hash)
-                if old_path is not None:
-                    self._temp_files.append(old_path)
-            new_path = abs_path if abs_path.exists() else None
-
-            result = data.diff_data_files(
-                old_path=old_path,
-                new_path=new_path,
-                path_display=rel_path,
-                key_columns=self._key_cols,
-                max_rows=self._max_rows,
-            )
-            results.append(result)
-
-        return results
-
-    def cleanup_temp_files(self) -> None:
-        """Clean up temp files. Call after app.run() returns."""
-        for temp_file in self._temp_files:
-            temp_file.unlink(missing_ok=True)
 
     def _show_current_file(self) -> None:  # pragma: no cover
         """Display the current file's diff."""
@@ -329,14 +279,12 @@ class DataDiffApp(textual.app.App[None]):
         content.scroll_up()
 
 
-def run_diff_app(
-    diff_entries: Sequence[DataDiffEntry],
-    key_cols: list[str] | None,
-    max_rows: int,
-) -> None:  # pragma: no cover
-    """Entry point for TUI."""
-    app = DataDiffApp(diff_entries, key_cols, max_rows)
-    try:
-        app.run()
-    finally:
-        app.cleanup_temp_files()
+def run_diff_app(results: Sequence[DataDiffResult]) -> None:  # pragma: no cover
+    """Entry point for TUI.
+
+    Args:
+        results: Pre-computed diff results. The caller (e.g. CLI `pivot diff`
+                 command) is responsible for computing diffs before passing them.
+    """
+    app = DataDiffApp(results)
+    app.run()

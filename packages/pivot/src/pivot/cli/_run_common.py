@@ -5,9 +5,11 @@ from __future__ import annotations
 import contextlib
 import logging
 import sys
-from collections.abc import Callable  # noqa: TC003 - used in function signatures
-from typing import TYPE_CHECKING, TextIO, TypedDict, cast
+import threading
+from collections.abc import Callable, Coroutine  # noqa: TC003 - used in function signatures
+from typing import TYPE_CHECKING, Any, TextIO, TypedDict, cast
 
+import anyio
 import click
 
 from pivot import discovery
@@ -16,6 +18,7 @@ from pivot.engine import engine, sinks
 from pivot.types import OnError
 
 if TYPE_CHECKING:
+    import concurrent.futures
     import pathlib
     from collections.abc import Generator
 
@@ -24,7 +27,6 @@ if TYPE_CHECKING:
     from pivot.engine.types import OutputEvent, StageCompleted
     from pivot.executor import ExecutionSummary
     from pivot.pipeline.pipeline import Pipeline
-    from pivot_tui.run import MessagePoster
 
 
 logger = logging.getLogger(__name__)
@@ -262,9 +264,6 @@ def configure_output_sink(
     *,
     quiet: bool,
     as_json: bool,
-    tui: bool,
-    app: MessagePoster | None,
-    run_id: str | None,
     use_console: bool,
     jsonl_callback: Callable[[dict[str, object]], None] | None,
     show_output: bool = False,
@@ -280,11 +279,7 @@ def configure_output_sink(
     if quiet:
         return
 
-    if tui and app and run_id:
-        from pivot_tui.sink import TuiSink
-
-        eng.add_sink(TuiSink(app=app, run_id=run_id))
-    elif use_console:
+    if use_console:
         eng.add_sink(sinks.ConsoleSink(console=rich.console.Console(), show_output=show_output))
 
 
@@ -306,3 +301,108 @@ def convert_results(
         )
         for name, event in stage_results.items()
     }
+
+
+# ---------------------------------------------------------------------------
+# TUI + Engine threading helper
+# ---------------------------------------------------------------------------
+
+
+def run_tui_with_engine(
+    app: Any,
+    engine_fn: Callable[[threading.Event], Coroutine[Any, Any, Any]],
+    socket_path: pathlib.Path,
+    *,
+    result_future: concurrent.futures.Future[Any] | None = None,
+    oneshot: bool = True,
+    suppress_keyboard_interrupt: bool = False,
+) -> None:
+    """Run TUI with engine in background thread.
+
+    Three-thread model:
+    - Main thread: Textual TUI (required for signal handlers)
+    - Engine thread: runs engine_fn with its own anyio event loop
+    - Poller thread: connects client, polls events, feeds TUI
+
+    Args:
+        app: PivotApp instance (connects its own client on mount)
+        engine_fn: Async function that runs the engine. Receives socket_ready Event.
+                   Must call ``socket_ready.set()`` after RPC socket is listening.
+        socket_path: Path to Unix socket
+        result_future: Optional Future for returning engine results to caller.
+                       If provided, engine thread joins after TUI exits.
+        oneshot: If True, poller stops on connection close (run mode).
+                 If False, poller retries on disconnect (watch mode).
+        suppress_keyboard_interrupt: If True, suppress KeyboardInterrupt around app.run().
+    """
+    import pivot_tui.run as tui_run
+    from pivot_tui.event_poller import EventPoller
+    from pivot_tui.rpc_client_impl import RpcPivotClient
+
+    socket_ready = threading.Event()
+
+    def engine_thread_target() -> None:
+        """Run the async Engine in a background thread with its own event loop."""
+        try:
+            result = anyio.run(engine_fn, socket_ready)
+            if result_future is not None and not result_future.done():
+                result_future.set_result(result)
+        except BaseException as e:
+            if result_future is not None and not result_future.done():
+                result_future.set_exception(e)
+        finally:
+            socket_ready.set()  # Unblock main thread even on failure
+            # Signal TUI to exit when engine completes (success or failure)
+            with contextlib.suppress(Exception):
+                app.post_message(tui_run.TuiShutdown())
+
+    # Start engine in background thread
+    engine_thread = threading.Thread(target=engine_thread_target, daemon=True)
+    engine_thread.start()
+    if not socket_ready.wait(timeout=10.0):
+        logger.warning("Engine socket not ready after 10s, poller will retry connect")
+
+    def poller_thread_target() -> None:
+        async def poller_main() -> None:
+            poller_client = RpcPivotClient()
+            for _attempt in range(30):
+                try:
+                    await poller_client.connect(socket_path)
+                    break
+                except OSError:
+                    await anyio.sleep(1.0)
+            else:
+                logger.error("Poller failed to connect after 30 attempts")
+                return
+            poller = EventPoller(
+                poller_client,
+                lambda msg: app.post_message(tui_run.TuiUpdate(msg)),
+                oneshot=oneshot,
+            )
+            app.set_event_poller(poller)
+            try:
+                await poller.run()
+            finally:
+                with contextlib.suppress(Exception):
+                    await poller_client.disconnect()
+
+        try:
+            anyio.run(poller_main)
+        except Exception:
+            logger.debug("Event poller stopped", exc_info=True)
+
+    poller_thread = threading.Thread(target=poller_thread_target, daemon=True)
+    poller_thread.start()
+
+    # Run TUI in main thread (required for signal handlers)
+    if suppress_keyboard_interrupt:
+        with contextlib.suppress(KeyboardInterrupt), suppress_stderr_logging():
+            app.run()
+    else:
+        with suppress_stderr_logging():
+            app.run()
+
+    # For oneshot mode, wait for engine thread to finish
+    poller_thread.join(timeout=2.0)
+    if result_future is not None:
+        engine_thread.join(timeout=5.0)

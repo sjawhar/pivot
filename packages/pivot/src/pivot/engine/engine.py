@@ -33,6 +33,7 @@ from pivot.engine.types import (
     EventSource,
     InputEvent,
     LogLine,
+    OutputChangeSummary,
     OutputEvent,
     PipelineReloaded,
     RunRequested,
@@ -46,7 +47,14 @@ from pivot.engine.types import (
 from pivot.executor import core as executor_core
 from pivot.executor import worker
 from pivot.storage import state as state_mod
-from pivot.types import OnError, OutputMessage, OutputMessageKind, StageResult, StageStatus
+from pivot.types import (
+    OnError,
+    OutputMessage,
+    OutputMessageKind,
+    StageExplanation,
+    StageResult,
+    StageStatus,
+)
 
 if TYPE_CHECKING:
     import multiprocessing as mp
@@ -942,7 +950,7 @@ class Engine:
                             try:
                                 result = future.result()
                                 duration_ms = await self._handle_stage_completion(
-                                    stage_name, result, start_time
+                                    stage_name, result, start_time, default_state_dir, run_id=run_id
                                 )
                                 stage_durations[stage_name] = duration_ms
 
@@ -977,7 +985,11 @@ class Engine:
                                     output_lines=[],
                                 )
                                 duration_ms = await self._handle_stage_completion(
-                                    stage_name, failed_result, start_time
+                                    stage_name,
+                                    failed_result,
+                                    start_time,
+                                    default_state_dir,
+                                    run_id=run_id,
                                 )
                                 stage_durations[stage_name] = duration_ms
                                 results[stage_name] = executor_core.ExecutionSummary(
@@ -1019,6 +1031,7 @@ class Engine:
                                             name,
                                             f"upstream '{first_failed}' failed",
                                             results,
+                                            run_id=run_id,
                                         )
 
                         # Check cancellation
@@ -1033,7 +1046,9 @@ class Engine:
                                         previous_state=old_state,
                                     )
                                 )
-                                await self._emit_skipped_stage(name, "cancelled", results)
+                                await self._emit_skipped_stage(
+                                    name, "cancelled", results, run_id=run_id
+                                )
 
                         # Start more stages if slots available
                         if not self._scheduler.stop_starting_new:
@@ -1075,7 +1090,7 @@ class Engine:
                                 "unknown",
                             )
                             await self._emit_skipped_stage(
-                                name, f"upstream '{failed_upstream}' failed", results
+                                name, f"upstream '{failed_upstream}' failed", results, run_id=run_id
                             )
 
                     # Send sentinel to stop blocking drain thread without blocking event loop.
@@ -1330,6 +1345,17 @@ class Engine:
             # Transition to RUNNING and emit StageStarted
             await self._set_stage_state(stage_name, StageExecutionState.RUNNING)
 
+            # Compute explanation (why this stage will run) in a thread
+            # to avoid blocking the event loop with lock file I/O.
+            # Lazy import to avoid circular dependency (explain -> executor -> core).
+            explanation = await self._compute_explanation(
+                stage_name,
+                worker_info,
+                stage_info,
+                overrides,
+                force,
+            )
+
             stage_index, total_stages = self._get_stage_index(stage_name)
             await self.emit(
                 StageStarted(
@@ -1337,20 +1363,122 @@ class Engine:
                     stage=stage_name,
                     index=stage_index,
                     total=total_stages,
+                    run_id=run_id,
+                    explanation=explanation,
                 )
             )
+
+    async def _compute_explanation(
+        self,
+        stage_name: str,
+        worker_info: worker.WorkerStageInfo,
+        stage_info: RegistryStageInfo,
+        overrides: parameters.ParamsOverrides,
+        force: bool,
+    ) -> StageExplanation | None:
+        """Compute explanation for why a stage will run, in a worker thread.
+
+        Returns None if computation fails (explanation should never block execution).
+        """
+        from pivot import explain as explain_mod
+
+        def _compute() -> StageExplanation:
+            return explain_mod.get_stage_explanation(
+                stage_name=stage_name,
+                fingerprint=worker_info["fingerprint"],
+                deps=worker_info["deps"],
+                outs_paths=stage_info["outs_paths"],
+                params_instance=worker_info["params"],
+                overrides=overrides,
+                state_dir=worker_info["state_dir"],
+                force=force,
+            )
+
+        try:
+            return await anyio.to_thread.run_sync(_compute)
+        except Exception:
+            _logger.warning("Failed to compute explanation for %s", stage_name, exc_info=True)
+            return None
+
+    async def _compute_output_summary(
+        self,
+        stage_name: str,
+        state_dir: pathlib.Path,
+    ) -> list[OutputChangeSummary] | None:
+        """Compute output summary from the stage's lock file after execution.
+
+        Reads the lock file (just written by the worker) to get output hashes.
+        Returns None if computation fails (should never block event emission).
+        """
+        from pivot import outputs
+        from pivot.storage import lock
+
+        def _compute() -> list[OutputChangeSummary]:
+            stage_info = self._get_stage(stage_name)
+            stage_state_dir = registry.get_stage_state_dir(stage_info, state_dir)
+            stages_dir = lock.get_stages_dir(stage_state_dir)
+            stage_lock = lock.StageLock(stage_name, stages_dir)
+            lock_data = stage_lock.read()
+
+            # Build path -> output_type map from registry
+            outs = stage_info["outs"]
+            outs_paths = stage_info["outs_paths"]
+            path_to_type = dict[str, str]()
+            for out, path in zip(outs, outs_paths, strict=True):
+                if isinstance(out, outputs.Metric):
+                    path_to_type[path] = "metric"
+                elif isinstance(out, outputs.Plot):
+                    path_to_type[path] = "plot"
+                else:
+                    path_to_type[path] = "out"
+
+            summary = list[OutputChangeSummary]()
+            # Get new hashes from lock file
+            new_hashes = dict[str, str | None]()
+            if lock_data is not None and "output_hashes" in lock_data:
+                for path, hash_info in lock_data["output_hashes"].items():
+                    new_hashes[path] = hash_info["hash"]
+
+            for path in outs_paths:
+                new_hash = new_hashes.get(path)
+                output_type = path_to_type.get(path, "out")
+                # change_type is None because we don't have old hashes at this point
+                summary.append(
+                    OutputChangeSummary(
+                        path=path,
+                        change_type=None,
+                        output_type=output_type,
+                        old_hash=None,
+                        new_hash=new_hash,
+                    )
+                )
+
+            return summary
+
+        try:
+            return await anyio.to_thread.run_sync(_compute)
+        except Exception:
+            _logger.debug("Failed to compute output summary for %s", stage_name, exc_info=True)
+            return None
 
     async def _handle_stage_completion(
         self,
         stage_name: str,
         result: StageResult,
         start_time: float,
+        state_dir: pathlib.Path | None = None,
+        run_id: str = "",
     ) -> float:
         """Handle a stage completing execution. Returns duration in milliseconds."""
         duration_ms = (time.perf_counter() - start_time) * 1000
 
         # Transition to COMPLETED
         await self._set_stage_state(stage_name, StageExecutionState.COMPLETED)
+
+        # Compute output summary for stages that ran (not failed)
+        output_summary: list[OutputChangeSummary] | None = None
+        if result["status"] != StageStatus.FAILED and state_dir is not None:
+            output_summary = await self._compute_output_summary(stage_name, state_dir)
 
         # Emit StageCompleted event
         stage_index, total_stages = self._get_stage_index(stage_name)
@@ -1363,7 +1491,9 @@ class Engine:
                 duration_ms=duration_ms,
                 index=stage_index,
                 total=total_stages,
+                run_id=run_id,
                 input_hash=result["input_hash"],
+                output_summary=output_summary,
             )
         )
 
@@ -1405,6 +1535,7 @@ class Engine:
         stage_name: str,
         reason: str,
         results: dict[str, executor_core.ExecutionSummary],
+        run_id: str = "",
     ) -> None:
         """Record and emit a skipped/blocked stage completion."""
         results[stage_name] = executor_core.ExecutionSummary(
@@ -1422,7 +1553,9 @@ class Engine:
                 duration_ms=0.0,
                 index=stage_index,
                 total=total_stages,
+                run_id=run_id,
                 input_hash=None,
+                output_summary=None,
             )
         )
 

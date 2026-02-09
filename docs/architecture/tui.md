@@ -13,24 +13,45 @@ The TUI supports two modes:
 
 ## Communication Architecture
 
+The TUI is a **pure RPC client** — it communicates with the engine exclusively via JSON-RPC 2.0 over a Unix socket. Zero imports of pivot runtime modules (`engine`, `storage`, `executor`, `config`, etc.) — only `pivot.types` is allowed.
+
 ```
-┌─────────────────┐    mp.Queue     ┌─────────────────┐   queue.Queue   ┌──────────────────┐
-│  Worker Process │ ─────────────▶  │   Coordinator   │ ──────────────▶ │  TUI Event Loop  │
-│  (stdout/stderr)│  (cross-process)│   (main thread) │   (TuiQueue)    │   (Textual)      │
-└─────────────────┘                 └─────────────────┘                 └──────────────────┘
+┌─────────────┐                  ┌──────────────────┐                  ┌──────────────────┐
+│   Engine    │  JSON-RPC/Unix   │  Event Poller    │   post_message   │  TUI (Textual)   │
+│   Thread    │ ◀──────────────▶ │  Thread          │ ────────────────▶│  Main Thread     │
+│  (anyio)    │   socket         │  (anyio)         │                  │                  │
+│             │                  │  polls events    │                  │  UI commands     │
+│             │  JSON-RPC/Unix   │                  │                  │  ──────────────▶ │
+│             │ ◀────────────────┼──────────────────┼──────────────────│  (own client)    │
+└─────────────┘   socket         └──────────────────┘                  └──────────────────┘
 ```
+
+### Three-Thread Model
+
+The `run_tui_with_engine()` helper in `_run_common.py` coordinates three threads:
+
+1. **Main thread**: Runs the Textual TUI (`app.run()`). Required for signal handlers. Owns its own `RpcPivotClient` connected in `on_mount()` for UI commands (commit, run, cancel).
+
+2. **Engine thread**: Runs `anyio.run(engine_fn)` with the pipeline engine and RPC socket server. Sets `socket_ready` event when the socket is listening.
+
+3. **Poller thread**: Runs `anyio.run(poller_main)` with its own `RpcPivotClient` (separate connection). Polls `events_since()` and converts engine events to TUI messages via `app.post_message()`.
+
+Each thread has its own anyio event loop — socket connections are never shared across threads.
 
 ### Message Flow
 
-Two communication channels exist:
+1. **Engine emits events** (`StageStarted`, `StageCompleted`, `LogLine`, etc.) into an `EventBuffer` exposed via the RPC server's `events_since` method.
 
-1. **Output Queue** (`multiprocessing.Queue`): Stage stdout/stderr lines flow from worker processes to the coordinator. Workers capture print statements and write them to this queue for real-time display.
+2. **EventPoller** (in its own thread) polls `events_since(version)` periodically (100ms), converts raw events to typed TUI messages (`TuiStatusMessage`, `TuiLogMessage`, etc.), and posts them to the TUI via `app.post_message()`.
 
-2. **TuiQueue** (`queue.Queue`): Status updates and watch events flow from the coordinator to the TUI within the same process. This is a stdlib thread queue (not multiprocessing) since both ends are in the main process.
+3. **TUI commands** (commit, run, cancel, set_on_error) go directly from the TUI's main thread to the engine via its own RPC client connection.
 
-The coordinator acts as a bridge: it receives output lines from workers via `multiprocessing.Queue`, then forwards them to the TUI via the thread-safe `TuiQueue`.
+### Shutdown
 
-Textual's `@work` decorator and `post_message()` handle thread-to-event-loop safety.
+- `EventPoller.stop()` uses a `threading.Event` + task group cancellation to immediately interrupt blocked RPC calls
+- TUI quit handlers call `poller.stop()` then `client.disconnect()`
+- `poller_thread.join(timeout=2.0)` ensures clean shutdown before process exit
+- Both engine and poller threads are daemon threads — killed on process exit as fallback
 
 ## Message Types
 

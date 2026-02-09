@@ -16,7 +16,7 @@ from pivot_tui.widgets import status
 from pivot_tui.widgets.logs import LogSearchEscapePressed, LogSearchInput, StageLogPanel
 
 if TYPE_CHECKING:
-    from pivot_tui.types import ExecutionHistoryEntry, StageDataProvider, StageInfo
+    from pivot_tui.types import ExecutionHistoryEntry, StageInfo
 
 _logger = logging.getLogger(__name__)
 
@@ -25,7 +25,6 @@ class TabbedDetailPanel(textual.containers.Vertical):
     """Tabbed panel showing stage details with Logs, Input, Output tabs."""
 
     _stage: StageInfo | None
-    _stage_data_provider: StageDataProvider | None
     _history_index: int | None  # None = live view, else index into history deque
     _history_total: int
     _log_panel: StageLogPanel | None
@@ -38,11 +37,10 @@ class TabbedDetailPanel(textual.containers.Vertical):
         *,
         id: str | None = None,
         classes: str | None = None,
-        stage_data_provider: StageDataProvider | None = None,
+        stage_data_provider: object = None,  # Deprecated: accepted but ignored
     ) -> None:
         super().__init__(id=id, classes=classes)
         self._stage = None
-        self._stage_data_provider = stage_data_provider
         self._history_index = None
         self._history_total = 0
         self._log_panel = None
@@ -71,13 +69,9 @@ class TabbedDetailPanel(textual.containers.Vertical):
                 )
                 yield self._search_container
             with textual.widgets.TabPane("Input", id="tab-input"):
-                yield InputDiffPanel(
-                    id="input-panel", stage_data_provider=self._stage_data_provider
-                )
+                yield InputDiffPanel(id="input-panel")
             with textual.widgets.TabPane("Output", id="tab-output"):
-                yield OutputDiffPanel(
-                    id="output-panel", stage_data_provider=self._stage_data_provider
-                )
+                yield OutputDiffPanel(id="output-panel")
 
     def on_unmount(self) -> None:  # pragma: no cover
         """Clean up timer when unmounted."""

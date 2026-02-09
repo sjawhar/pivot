@@ -2,18 +2,14 @@
 
 from __future__ import annotations
 
-import pathlib
 from typing import TYPE_CHECKING
 
 import pytest
 
-from pivot import loaders, outputs, project
-from pivot.storage import cache
 from pivot.types import (
     ChangeType,
     CodeChange,
     DepChange,
-    LockData,
     MetricValue,
     OutputChange,
     ParamChange,
@@ -24,9 +20,6 @@ from pivot_tui import diff_panels
 
 if TYPE_CHECKING:
     from pytest_mock import MockerFixture
-
-    from pivot.pipeline.pipeline import Pipeline
-    from pivot.registry import RegistryStageInfo
 
 
 # =============================================================================
@@ -123,193 +116,6 @@ def test_format_hash_change_modified() -> None:
     assert "oldhasha" in result, "Should truncate to 8 chars"
     assert "newhashx" in result, "Should truncate to 8 chars"
     assert "->" in result
-
-
-# =============================================================================
-# _get_relative_path Tests
-# =============================================================================
-
-
-def test_get_relative_path_absolute(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """_get_relative_path converts absolute path inside project."""
-    (tmp_path / ".pivot").mkdir()
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(project, "_project_root_cache", None)
-
-    abs_path = str(tmp_path / "data" / "file.csv")
-    result = diff_panels._get_relative_path(abs_path)
-    assert result == "data/file.csv"
-
-
-def test_get_relative_path_relative(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """_get_relative_path preserves relative paths."""
-    (tmp_path / ".pivot").mkdir()
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(project, "_project_root_cache", None)
-
-    result = diff_panels._get_relative_path("some/relative/path.txt")
-    assert result == "some/relative/path.txt"
-
-
-# =============================================================================
-# _compute_output_changes Tests
-# =============================================================================
-
-
-def test_compute_output_changes_no_lock_shows_added(tmp_path: pathlib.Path) -> None:
-    """_compute_output_changes shows new outputs as ADDED when no lock exists."""
-    output_file = tmp_path / "output.csv"
-    output_file.write_text("data")
-
-    registry_info: RegistryStageInfo = {
-        "func": lambda: None,
-        "name": "test_stage",
-        "deps": {},
-        "deps_paths": [],
-        "outs": [
-            outputs.require_expanded(outputs.Out(path=str(output_file), loader=loaders.PathOnly()))
-        ],
-        "outs_paths": [str(output_file)],
-        "params": None,
-        "mutex": [],
-        "variant": None,
-        "signature": None,
-        "fingerprint": {},
-        "dep_specs": {},
-        "out_specs": dict[str, outputs.BaseOut](),
-        "params_arg_name": None,
-        "state_dir": None,
-    }
-
-    result = diff_panels.compute_output_changes(None, registry_info)
-
-    assert len(result) == 1
-    assert result[0]["path"] == str(output_file)
-    assert result[0]["old_hash"] is None
-    assert result[0]["new_hash"] is not None
-    assert result[0]["change_type"] == ChangeType.ADDED
-    assert result[0]["output_type"] == "out"
-
-
-def test_compute_output_changes_missing_file_shows_removed(tmp_path: pathlib.Path) -> None:
-    """_compute_output_changes shows missing files as REMOVED."""
-    output_file = tmp_path / "missing.csv"
-
-    registry_info: RegistryStageInfo = {
-        "func": lambda: None,
-        "name": "test_stage",
-        "deps": {},
-        "deps_paths": [],
-        "outs": [
-            outputs.require_expanded(outputs.Out(path=str(output_file), loader=loaders.PathOnly()))
-        ],
-        "outs_paths": [str(output_file)],
-        "params": None,
-        "mutex": [],
-        "variant": None,
-        "signature": None,
-        "fingerprint": {},
-        "dep_specs": {},
-        "out_specs": dict[str, outputs.BaseOut](),
-        "params_arg_name": None,
-        "state_dir": None,
-    }
-
-    lock_data: LockData = {
-        "code_manifest": {},
-        "params": {},
-        "dep_hashes": {},
-        "output_hashes": {str(output_file): {"hash": "oldhash123"}},
-    }
-
-    result = diff_panels.compute_output_changes(lock_data, registry_info)
-
-    assert len(result) == 1
-    assert result[0]["old_hash"] == "oldhash123"
-    assert result[0]["new_hash"] is None
-    assert result[0]["change_type"] == ChangeType.REMOVED
-
-
-def test_compute_output_changes_unchanged(tmp_path: pathlib.Path) -> None:
-    """_compute_output_changes returns None change_type for unchanged files."""
-    output_file = tmp_path / "output.csv"
-    output_file.write_text("data")
-
-    actual_hash, _ = cache.hash_file(output_file)
-
-    registry_info: RegistryStageInfo = {
-        "func": lambda: None,
-        "name": "test_stage",
-        "deps": {},
-        "deps_paths": [],
-        "outs": [
-            outputs.require_expanded(outputs.Out(path=str(output_file), loader=loaders.PathOnly()))
-        ],
-        "outs_paths": [str(output_file)],
-        "params": None,
-        "mutex": [],
-        "variant": None,
-        "signature": None,
-        "fingerprint": {},
-        "dep_specs": {},
-        "out_specs": dict[str, outputs.BaseOut](),
-        "params_arg_name": None,
-        "state_dir": None,
-    }
-
-    lock_data: LockData = {
-        "code_manifest": {},
-        "params": {},
-        "dep_hashes": {},
-        "output_hashes": {str(output_file): {"hash": actual_hash}},
-    }
-
-    result = diff_panels.compute_output_changes(lock_data, registry_info)
-
-    assert len(result) == 1
-    assert result[0]["change_type"] is None, "Unchanged files should have None change_type"
-
-
-def test_compute_output_changes_detects_output_types(tmp_path: pathlib.Path) -> None:
-    """_compute_output_changes correctly identifies Out, Metric, Plot types."""
-    out_file = tmp_path / "output.csv"
-    metric_file = tmp_path / "metrics.json"
-    plot_file = tmp_path / "plot.png"
-
-    for f in [out_file, metric_file, plot_file]:
-        f.write_text("data")
-
-    registry_info: RegistryStageInfo = {
-        "func": lambda: None,
-        "name": "test_stage",
-        "deps": {},
-        "deps_paths": [],
-        "outs": [
-            outputs.require_expanded(outputs.Out(path=str(out_file), loader=loaders.PathOnly())),
-            outputs.require_expanded(outputs.Metric(path=str(metric_file))),
-            outputs.require_expanded(outputs.Plot(path=str(plot_file), loader=loaders.PathOnly())),
-        ],
-        "outs_paths": [str(out_file), str(metric_file), str(plot_file)],
-        "params": None,
-        "mutex": [],
-        "variant": None,
-        "signature": None,
-        "fingerprint": {},
-        "dep_specs": {},
-        "out_specs": dict[str, outputs.BaseOut](),
-        "params_arg_name": None,
-        "state_dir": None,
-    }
-
-    result = diff_panels.compute_output_changes(None, registry_info)
-
-    assert len(result) == 3
-    types = {r["output_type"] for r in result}
-    assert types == {"out", "metric", "plot"}
 
 
 # =============================================================================
@@ -485,62 +291,19 @@ def test_input_panel_empty_state_no_stage() -> None:
     assert "No stage selected" in result
 
 
-def test_input_panel_empty_state_no_registry() -> None:
-    """InputDiffPanel._render_empty_state shows 'Stage not in registry' when registry_info is None."""
+def test_input_panel_empty_state_no_data() -> None:
+    """InputDiffPanel._render_empty_state shows 'No data available' when explanation is None."""
     panel = diff_panels.InputDiffPanel()
     panel._stage_name = "some_stage"
-    panel._registry_info = None
-    result = panel._render_empty_state()
-    assert "Stage not in registry" in result
-
-
-def test_input_panel_empty_state_no_explanation() -> None:
-    """InputDiffPanel._render_empty_state shows 'Error loading' when explanation is None."""
-    panel = diff_panels.InputDiffPanel()
-    panel._stage_name = "some_stage"
-    panel._registry_info = {
-        "func": lambda: None,
-        "name": "some_stage",
-        "deps": {},
-        "deps_paths": [],
-        "outs": [],
-        "outs_paths": [],
-        "params": None,
-        "mutex": [],
-        "variant": None,
-        "signature": None,
-        "fingerprint": {},
-        "dep_specs": {},
-        "out_specs": {},
-        "params_arg_name": None,
-        "state_dir": None,
-    }
     panel._explanation = None
     result = panel._render_empty_state()
-    assert "Error loading" in result
+    assert "No data available" in result
 
 
 def test_input_panel_empty_state_no_inputs() -> None:
-    """InputDiffPanel._render_empty_state shows 'No inputs' when all fields set."""
+    """InputDiffPanel._render_empty_state shows 'No inputs' when explanation has no changes."""
     panel = diff_panels.InputDiffPanel()
     panel._stage_name = "some_stage"
-    panel._registry_info = {
-        "func": lambda: None,
-        "name": "some_stage",
-        "deps": {},
-        "deps_paths": [],
-        "outs": [],
-        "outs_paths": [],
-        "params": None,
-        "mutex": [],
-        "variant": None,
-        "signature": None,
-        "fingerprint": {},
-        "dep_specs": {},
-        "out_specs": {},
-        "params_arg_name": None,
-        "state_dir": None,
-    }
     panel._explanation = StageExplanation(
         stage_name="some_stage",
         will_run=False,
@@ -568,36 +331,10 @@ def test_output_panel_empty_state_no_stage() -> None:
     assert "No stage selected" in result
 
 
-def test_output_panel_empty_state_no_registry() -> None:
-    """OutputDiffPanel._render_empty_state shows 'Stage not in registry' when registry_info is None."""
-    panel = diff_panels.OutputDiffPanel()
-    panel._stage_name = "some_stage"
-    panel._registry_info = None
-    result = panel._render_empty_state()
-    assert "Stage not in registry" in result
-
-
 def test_output_panel_empty_state_in_progress() -> None:
     """OutputDiffPanel._render_empty_state shows 'Running' when stage is IN_PROGRESS."""
     panel = diff_panels.OutputDiffPanel()
     panel._stage_name = "some_stage"
-    panel._registry_info = {
-        "func": lambda: None,
-        "name": "some_stage",
-        "deps": {},
-        "deps_paths": [],
-        "outs": [],
-        "outs_paths": [],
-        "params": None,
-        "mutex": [],
-        "variant": None,
-        "signature": None,
-        "fingerprint": {},
-        "dep_specs": {},
-        "out_specs": {},
-        "params_arg_name": None,
-        "state_dir": None,
-    }
     panel._stage_status = StageStatus.IN_PROGRESS
     result = panel._render_empty_state()
     assert "running" in result.lower()
@@ -607,23 +344,6 @@ def test_output_panel_empty_state_no_outputs() -> None:
     """OutputDiffPanel._render_empty_state shows 'No outputs' by default."""
     panel = diff_panels.OutputDiffPanel()
     panel._stage_name = "some_stage"
-    panel._registry_info = {
-        "func": lambda: None,
-        "name": "some_stage",
-        "deps": {},
-        "deps_paths": [],
-        "outs": [],
-        "outs_paths": [],
-        "params": None,
-        "mutex": [],
-        "variant": None,
-        "signature": None,
-        "fingerprint": {},
-        "dep_specs": {},
-        "out_specs": {},
-        "params_arg_name": None,
-        "state_dir": None,
-    }
     panel._stage_status = None
     result = panel._render_empty_state()
     assert "No outputs" in result
@@ -748,9 +468,7 @@ def test_output_panel_is_changed_not_found() -> None:
 # =============================================================================
 
 
-def test_input_panel_set_from_snapshot(
-    test_pipeline: Pipeline, mock_discovery: Pipeline, mocker: MockerFixture
-) -> None:
+def test_input_panel_set_from_snapshot(mocker: MockerFixture) -> None:
     """InputDiffPanel.set_from_snapshot loads snapshot data correctly."""
     panel = diff_panels.InputDiffPanel()
 
@@ -781,9 +499,7 @@ def test_input_panel_set_from_snapshot(
     mock_update.assert_called_once()
 
 
-def test_output_panel_set_from_snapshot(
-    test_pipeline: Pipeline, mock_discovery: Pipeline, mocker: MockerFixture
-) -> None:
+def test_output_panel_set_from_snapshot(mocker: MockerFixture) -> None:
     """OutputDiffPanel.set_from_snapshot loads snapshot data correctly."""
     panel = diff_panels.OutputDiffPanel()
 
@@ -803,81 +519,3 @@ def test_output_panel_set_from_snapshot(
     assert panel._stage_name == "test_stage"
     assert "/path/output.csv" in panel._output_by_path
     mock_update.assert_called_once()
-
-
-# =============================================================================
-# StageDataProvider Integration Tests
-# =============================================================================
-
-
-def test_input_panel_load_uses_provider(mocker: MockerFixture) -> None:
-    """InputDiffPanel._load_stage_data uses provider instead of cli_helpers."""
-    from pivot_tui.types import StageDataProvider
-
-    mock_provider = mocker.MagicMock(spec=StageDataProvider)
-    mock_provider.get_stage.return_value = {
-        "deps_paths": [],
-        "outs_paths": [],
-        "params": None,
-    }
-    mock_provider.ensure_fingerprint.return_value = {"func": "abc"}
-
-    panel = diff_panels.InputDiffPanel(stage_data_provider=mock_provider)
-
-    mock_explanation = StageExplanation(
-        stage_name="my_stage",
-        will_run=True,
-        is_forced=False,
-        reason="Code changed",
-        code_changes=[],
-        dep_changes=[],
-        param_changes=[],
-        upstream_stale=[],
-    )
-    mocker.patch(
-        "pivot_tui.diff_panels.explain.get_stage_explanation",
-        return_value=mock_explanation,
-    )
-    mocker.patch("pivot_tui.diff_panels.parameters.load_params_yaml", return_value={})
-    mocker.patch("pivot_tui.diff_panels.config.get_state_dir", return_value=pathlib.Path("/fake"))
-
-    panel._load_stage_data("my_stage")
-
-    mock_provider.get_stage.assert_called_with("my_stage")
-    mock_provider.ensure_fingerprint.assert_called_with("my_stage")
-
-
-def test_output_panel_load_uses_provider(mocker: MockerFixture) -> None:
-    """OutputDiffPanel._load_stage_data uses provider instead of cli_helpers."""
-    from pivot_tui.types import StageDataProvider
-
-    mock_provider = mocker.MagicMock(spec=StageDataProvider)
-    mock_provider.get_stage.return_value = {
-        "deps_paths": [],
-        "outs_paths": [],
-        "outs": [],
-        "params": None,
-    }
-
-    panel = diff_panels.OutputDiffPanel(stage_data_provider=mock_provider)
-
-    mocker.patch("pivot_tui.diff_panels.config.get_state_dir", return_value=pathlib.Path("/fake"))
-    mocker.patch("pivot_tui.diff_panels.lock.StageLock")
-
-    panel._load_stage_data("my_stage")
-
-    mock_provider.get_stage.assert_called_with("my_stage")
-
-
-def test_input_panel_without_provider_returns_early(mocker: MockerFixture) -> None:
-    """InputDiffPanel._load_stage_data returns early without provider."""
-    panel = diff_panels.InputDiffPanel()
-    panel._load_stage_data("my_stage")
-    assert panel._registry_info is None
-
-
-def test_output_panel_without_provider_returns_early(mocker: MockerFixture) -> None:
-    """OutputDiffPanel._load_stage_data returns early without provider."""
-    panel = diff_panels.OutputDiffPanel()
-    panel._load_stage_data("my_stage")
-    assert panel._registry_info is None

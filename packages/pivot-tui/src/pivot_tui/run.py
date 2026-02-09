@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import atexit
 import collections
 import contextlib
@@ -18,8 +17,6 @@ from typing import (
     override,
 )
 
-import loky
-import loky.process_executor
 import rich.markup
 import textual  # for textual.work decorator
 import textual.app
@@ -32,10 +29,9 @@ import textual.timer
 import textual.widget
 import textual.widgets
 
-from pivot import config, explain, parameters, project
-from pivot.executor import ExecutionSummary
-from pivot.storage import lock
 from pivot.types import (
+    ChangeType,
+    OutputChange,
     StageStatus,
     TuiLogMessage,
     TuiMessageType,
@@ -44,7 +40,10 @@ from pivot.types import (
     TuiWatchMessage,
     WatchStatus,
 )
-from pivot_tui import diff_panels, rpc_client
+
+if TYPE_CHECKING:
+    from pivot_tui.client import PivotClient
+    from pivot_tui.event_poller import EventPoller
 from pivot_tui.diff_panels import InputDiffPanel, OutputDiffPanel
 from pivot_tui.screens import (
     ConfirmKillWorkersScreen,
@@ -56,7 +55,6 @@ from pivot_tui.types import (
     ExecutionHistoryEntry,
     LogEntry,
     PendingHistoryState,
-    StageDataProvider,
     StageInfo,
 )
 from pivot_tui.widgets import (
@@ -102,8 +100,39 @@ def format_reload_summary(
     return f"Reloaded: {', '.join(parts)}"
 
 
-if TYPE_CHECKING:
-    from pivot.types import OutputChange
+_logger = logging.getLogger(__name__)
+
+
+def _safe_change_type(raw: object) -> ChangeType | None:
+    """Convert raw change_type to ChangeType, returning None for unknown values."""
+    if raw is None:
+        return None
+    try:
+        return ChangeType(str(raw))
+    except ValueError:
+        _logger.warning("Unknown change_type %r, treating as None", raw)
+        return None
+
+
+def _convert_output_summary(
+    raw: list[dict[str, object]] | None,
+) -> list[OutputChange] | None:
+    """Convert raw output_summary dicts from events to typed OutputChange list."""
+    if raw is None:
+        return None
+    result = list[OutputChange]()
+    for item in raw:
+        change_type_raw = item.get("change_type")
+        result.append(
+            OutputChange(
+                path=str(item.get("path", "")),
+                old_hash=str(item["old_hash"]) if item.get("old_hash") is not None else None,
+                new_hash=str(item["new_hash"]) if item.get("new_hash") is not None else None,
+                change_type=_safe_change_type(change_type_raw),
+                output_type=str(item.get("output_type", "out")),  # pyright: ignore[reportArgumentType] - raw JSON str
+            )
+        )
+    return result
 
 
 class MessagePoster(Protocol):
@@ -196,7 +225,7 @@ _COMMIT_LOCK_POLL_INTERVAL = 5.0  # seconds between lock attempts
 _COMMIT_LOCK_TIMEOUT = 60.0  # total seconds before giving up
 
 
-class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
+class PivotApp(textual.app.App[None]):
     """Unified TUI application for both run and watch modes."""
 
     CSS_PATH: ClassVar[str | pathlib.PurePath | list[str | pathlib.PurePath] | None] = (
@@ -207,7 +236,8 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
 
     # Instance attributes (annotated for type checking since class is not @final)
     _cancel_event: threading.Event | None
-    _stage_data_provider: StageDataProvider | None
+    _client: PivotClient | None
+    _socket_path: pathlib.Path | None
     _stages: dict[str, StageInfo]
     _stage_order: list[str]
     _pending_history: dict[str, PendingHistoryState]
@@ -221,12 +251,14 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
         watch_mode: bool = False,
         no_commit: bool = False,
         serve: bool = False,
-        stage_data_provider: StageDataProvider | None = None,
+        socket_path: pathlib.Path | None = None,
+        client: PivotClient | None = None,
     ) -> None:
         """Initialize TUI app.
 
         TUI is a pure display client. Engine is always managed externally by CLI.
         TUI waits for TuiShutdown message to exit (run mode) or user quit (watch mode).
+        If socket_path is provided and client is None, the app connects on mount.
         """
         super().__init__()
 
@@ -248,7 +280,6 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
 
         # Run mode state
         self._cancel_event = cancel_event
-        self._results: dict[str, ExecutionSummary] | None = None
         self._exit_message: str | None = None
 
         # Watch mode state
@@ -261,7 +292,9 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
         self._serve: bool = serve
         self._quitting: bool = False
         self._quit_lock: threading.Lock = threading.Lock()
-        self._stage_data_provider = stage_data_provider
+        self._client = client
+        self._socket_path = socket_path
+        self._event_poller: EventPoller | None = None
         self._log_file_lock: threading.Lock = threading.Lock()
 
         # Open log file if configured
@@ -292,17 +325,17 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
         """Return message to display after TUI exits (e.g., running stages warning)."""
         return self._exit_message
 
+    def set_event_poller(self, poller: EventPoller) -> None:
+        """Set the event poller for clean shutdown.
+
+        Called by CLI after creating the poller, so the TUI can stop it on exit.
+        """
+        self._event_poller = poller
+
     @property
     def _has_running_stages(self) -> bool:
         """Check if any stages are currently in progress."""
         return any(s.status == StageStatus.IN_PROGRESS for s in self._stages.values())
-
-    def _shutdown_loky_pool(self) -> None:
-        """Force-kill loky worker pool to prevent hang on exit."""
-        # Best-effort cleanup - loky can fail with fd errors in some environments
-        with contextlib.suppress(Exception):
-            # kill_workers=True forces immediate termination of worker processes
-            loky.get_reusable_executor(max_workers=1, kill_workers=True)
 
     def _close_log_file(self) -> None:
         """Close the log file if open (thread-safe)."""
@@ -355,9 +388,7 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
 
         with textual.containers.Horizontal(id="main-split"):
             yield StageListPanel(list(self._stages.values()), id="stage-list")
-            yield TabbedDetailPanel(
-                id="detail-panel", stage_data_provider=self._stage_data_provider
-            )
+            yield TabbedDetailPanel(id="detail-panel")
 
         yield DebugPanel(id="debug-panel")
         yield PivotFooter(id="pivot-footer")
@@ -365,6 +396,19 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
     async def on_mount(self) -> None:  # pragma: no cover
         """Initialize TUI on mount."""
         self._start_time = time.monotonic()
+        if self._client is None and self._socket_path is not None:
+            from pivot_tui.rpc_client_impl import RpcPivotClient
+
+            self._client = RpcPivotClient()
+            try:
+                await self._client.connect(self._socket_path)
+            except Exception:
+                _logger.error(
+                    "Failed to connect to engine socket at %s",
+                    self._socket_path,
+                    exc_info=True,
+                )
+                self._client = None
         if self._log_file is not None:
             self._stats_log_timer = self.set_interval(1.0, self._write_stats_to_log)
         self.call_after_refresh(self._update_detail_panel)
@@ -414,11 +458,16 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
         self._write_to_log('{"type": "shutdown"}\n')
         if not self._watch_mode:
             # Run mode: notify user and exit after shutdown signal
+            with self._quit_lock:
+                if self._quitting:
+                    return
+                self._quitting = True
             self.bell()
+            if self._event_poller is not None:
+                self._event_poller.stop()
             self._shutdown_event.set()
             self._close_log_file()
-            self._shutdown_loky_pool()
-            self.exit(self._results)
+            self.exit()
 
     def _handle_log(self, msg: TuiLogMessage) -> None:  # pragma: no cover
         """Handle log message."""
@@ -484,6 +533,12 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
         if is_new_stage:
             info.index = msg["index"]
             info.total = msg["total"]
+
+        # Store live snapshots from engine events for diff panels and history
+        if "explanation" in msg:
+            info.live_input_snapshot = msg["explanation"]
+        if "output_summary" in msg:
+            info.live_output_snapshot = _convert_output_summary(msg["output_summary"])
 
         # Watch mode: history capture
         if self._watch_mode:
@@ -578,23 +633,10 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
 
     def _create_history_entry(self, stage_name: str, run_id: str) -> None:
         """Create a new history entry when stage starts executing."""
-        input_snapshot = None
-        if self._stage_data_provider is not None:
-            try:
-                registry_info = self._stage_data_provider.get_stage(stage_name)
-                fingerprint = self._stage_data_provider.ensure_fingerprint(stage_name)
-                state_dir = config.get_state_dir()
-                input_snapshot = explain.get_stage_explanation(
-                    stage_name=stage_name,
-                    fingerprint=fingerprint,
-                    deps=registry_info["deps_paths"],
-                    outs_paths=registry_info["outs_paths"],
-                    params_instance=registry_info["params"],
-                    overrides=parameters.load_params_yaml(),
-                    state_dir=state_dir,
-                )
-            except Exception:
-                _logger.debug("Failed to capture input snapshot for %s", stage_name)
+        # Input snapshot comes from events (live_input_snapshot on StageInfo)
+        input_snapshot = (
+            self._stages[stage_name].live_input_snapshot if stage_name in self._stages else None
+        )
 
         self._pending_history[stage_name] = PendingHistoryState(
             run_id=run_id,
@@ -636,16 +678,12 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
             else:
                 return
         else:
-            output_snapshot: list[OutputChange] | None = None
-            if self._stage_data_provider is not None:
-                try:
-                    registry_info = self._stage_data_provider.get_stage(stage_name)
-                    state_dir = config.get_state_dir()
-                    stages_dir = lock.get_stages_dir(state_dir)
-                    lock_data = lock.StageLock(stage_name, stages_dir).read()
-                    output_snapshot = diff_panels.compute_output_changes(lock_data, registry_info)
-                except Exception:
-                    _logger.debug("Failed to capture output snapshot for %s", stage_name)
+            # Output snapshot comes from events (live_output_snapshot on StageInfo)
+            output_snapshot = (
+                self._stages[stage_name].live_output_snapshot
+                if stage_name in self._stages
+                else None
+            )
 
             if self._viewing_history_index is None:
                 info.live_output_snapshot = output_snapshot
@@ -1117,11 +1155,14 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
             if self._cancel_commit:
                 self._cancel_commit = False
                 return
+            if self._client is None:
+                self.notify("No client connection", severity="warning")
+                return
 
             self.notify("Committing...")
-            from pivot.executor import commit as commit_mod
-
-            committed, failed = await asyncio.to_thread(commit_mod.commit_stages)
+            result = await self._client.commit()
+            committed = result["committed"]
+            failed = result["failed"]
             if failed:
                 self.notify(
                     f"Committed {len(committed)}, failed {len(failed)} stage(s)",
@@ -1146,12 +1187,13 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
         if self._has_running_stages:
             self.notify("Cannot re-run while stages are running", severity="warning")
             return
+        if self._client is None:
+            self.notify("No client connection", severity="warning")
+            return
 
         stage_name = self._selected_stage_name
-        socket_path = project.get_project_root() / ".pivot" / "agent.sock"
-
         self.notify(f"Forcing re-run of {stage_name}...")
-        success = await rpc_client.send_run_command(socket_path, stages=[stage_name], force=True)
+        success = await self._client.run(stages=[stage_name], force=True)
         if not success:
             self.notify("Failed to send re-run command", severity="error")
 
@@ -1162,11 +1204,12 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
         if self._has_running_stages:
             self.notify("Cannot re-run while stages are running", severity="warning")
             return
-
-        socket_path = project.get_project_root() / ".pivot" / "agent.sock"
+        if self._client is None:
+            self.notify("No client connection", severity="warning")
+            return
 
         self.notify("Forcing re-run of all stages...")
-        success = await rpc_client.send_run_command(socket_path, stages=None, force=True)
+        success = await self._client.run(force=True)
         if not success:
             self.notify("Failed to send re-run command", severity="error")
 
@@ -1242,19 +1285,20 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
             if not should_quit:
                 self._quitting = False  # Allow retry after cancel
                 return
-            # User confirmed quit - unregister loky's atexit handler to prevent hang
-            # The handler waits for worker threads which blocks exit
+            # User confirmed quit - signal cancellation to engine
             if self._cancel_event is not None:
                 self._cancel_event.set()
-            atexit.unregister(
-                loky.process_executor._python_exit  # pyright: ignore[reportPrivateUsage]
-            )
             # Store message to print after TUI exits
             running = sum(1 for s in self._stages.values() if s.status == StageStatus.IN_PROGRESS)
             self._exit_message = (
                 f"Note: {running} stage(s) are still running. Press Ctrl+C to forcefully kill them."
             )
         # Exit cleanly - Textual restores terminal, loky cleanup skipped
+        if self._event_poller is not None:
+            self._event_poller.stop()
+        if self._client is not None:
+            with contextlib.suppress(Exception):
+                await self._client.disconnect()
         self._shutdown_event.set()
         self._close_log_file()
         self.exit()
@@ -1262,5 +1306,11 @@ class PivotApp(textual.app.App[dict[str, ExecutionSummary] | None]):
     @textual.work
     async def _quit_with_commit_prompt(self) -> None:  # pragma: no cover
         """Worker to handle quit with commit prompt (watch mode)."""
+        # Stop event poller before exiting (daemon thread will die with process as fallback)
+        if self._event_poller is not None:
+            self._event_poller.stop()
+        if self._client is not None:
+            with contextlib.suppress(Exception):
+                await self._client.disconnect()
         # Engine is managed externally (by CLI) - just exit TUI
         self.exit()

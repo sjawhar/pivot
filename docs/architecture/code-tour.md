@@ -71,7 +71,7 @@ This guide maps Pivot's architectural concepts to actual file paths, helping you
 - `src/pivot/engine/graph.py` - Bipartite artifact-stage graph
 - `src/pivot/engine/types.py` - Event types and stage states
 - `src/pivot/engine/sources.py` - Event sources (FilesystemSource, OneShotSource)
-- `src/pivot/engine/sinks.py` - Event sinks (ConsoleSink, TuiSink, JsonlSink)
+- `src/pivot/engine/sinks.py` - Event sinks (ConsoleSink, JsonlSink)
 - `src/pivot/executor/core.py` - Worker pool management
 - `src/pivot/executor/worker.py` - Worker process code
 - `src/pivot/outputs.py` - Output type definitions (`Out`, `Metric`, `Plot`, `IncrementalOut`)
@@ -124,26 +124,34 @@ This guide maps Pivot's architectural concepts to actual file paths, helping you
 
 **Start reading:** `src/pivot/engine/engine.py:Engine._handle_input_event()`
 
-### TUI
+### TUI (pivot-tui package)
+
+The TUI is a **pure RPC client** in a separate package (`pivot-tui`). It has zero imports of pivot runtime modules — only `pivot.types` is allowed.
 
 **Key files:**
 
-- `src/pivot/tui/run.py` - Main Textual app (`PivotApp`)
-- `src/pivot/tui/widgets/` - UI components (stage list, panels, logs, debug)
-- `src/pivot/tui/screens/` - Modal screens (help, history list, confirm dialogs)
-- `src/pivot/tui/console.py` - Plain-text console output (non-TUI mode)
-- `src/pivot/engine/agent_rpc.py` - JSON-RPC server for external control
-- `src/pivot/tui/diff_panels.py` - Input/output diff visualization
+- `packages/pivot-tui/src/pivot_tui/run.py` - Main Textual app (`PivotApp`)
+- `packages/pivot-tui/src/pivot_tui/client.py` - `PivotRpc`/`PivotClient` protocols
+- `packages/pivot-tui/src/pivot_tui/rpc_client_impl.py` - `RpcPivotClient` (JSON-RPC 2.0 over Unix socket)
+- `packages/pivot-tui/src/pivot_tui/event_poller.py` - `EventPoller` (polls events, converts to TUI messages)
+- `packages/pivot-tui/src/pivot_tui/diff_panels.py` - Input/Output diff panel renderers
+- `packages/pivot-tui/src/pivot_tui/widgets/` - UI components (stage list, panels, logs, debug)
+- `packages/pivot-tui/src/pivot_tui/screens/` - Modal screens (help, history, confirm dialogs)
+- `packages/pivot-tui/src/pivot_tui/console.py` - Plain-text console output (non-TUI mode)
+- `packages/pivot-tui/src/pivot_tui/testing/fake_server.py` - FakeRpcServer test double
+- `packages/pivot/src/pivot/engine/agent_rpc.py` - JSON-RPC server (engine side)
+- `packages/pivot/src/pivot/cli/_run_common.py` - 3-thread TUI launch coordinator
 
 **How it works:**
 
-1. `PivotApp` is the main Textual application (supports both run and watch mode)
-2. `StageListPanel` displays scrollable stage list with grouping
-3. `TabbedDetailPanel` shows Logs/Input/Output tabs for selected stage
-4. `Console` handles plain-text output in non-TUI mode
-5. `AgentRpcHandler` provides JSON-RPC endpoint for programmatic control
+1. CLI creates engine + `PivotApp`, passes `socket_path` to the app
+2. `run_tui_with_engine()` coordinates 3 threads: engine, poller, and TUI
+3. Engine thread starts RPC socket server; poller thread connects and polls events
+4. TUI connects its own `RpcPivotClient` in `on_mount()` for UI commands
+5. `EventPoller` converts engine events to typed `TuiStatusMessage`/`TuiLogMessage` etc.
+6. Diff panels are pure renderers consuming server-provided explanation + output_summary data
 
-**Start reading:** `src/pivot/tui/run.py:PivotApp`
+**Start reading:** `packages/pivot-tui/src/pivot_tui/run.py:PivotApp`
 
 ### Remote Storage
 

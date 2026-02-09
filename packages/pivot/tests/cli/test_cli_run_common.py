@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import logging
 import pathlib
 import sys
-from typing import TYPE_CHECKING, Annotated, TypedDict
+from typing import TYPE_CHECKING, Annotated, TypedDict, override
 
 import click
 import click.testing
@@ -13,10 +14,14 @@ import networkx as nx
 import pytest
 
 if TYPE_CHECKING:
+    import threading
+
     from pytest_mock import MockerFixture
 
     from pivot.pipeline.pipeline import Pipeline
 
+import pivot_tui.event_poller
+import pivot_tui.rpc_client_impl
 from helpers import register_test_stage
 from pivot import loaders, outputs
 from pivot.cli import _run_common
@@ -54,6 +59,82 @@ def _helper_stage_c(
 ) -> _StageCOutputs:
     _ = dep
     return _StageCOutputs(output=pathlib.Path("c.txt"))
+
+
+class _FakeApp:
+    posted: list[object]
+    event_poller: object | None
+    ran: bool
+
+    def __init__(self) -> None:
+        self.posted = list[object]()
+        self.event_poller = None
+        self.ran = False
+
+    def post_message(self, message: object) -> bool:
+        self.posted.append(message)
+        return True
+
+    def set_event_poller(self, poller: object) -> None:
+        self.event_poller = poller
+
+    def run(self) -> None:
+        self.ran = True
+
+
+class _FakeRpcPivotClient:
+    instances: list[_FakeRpcPivotClient] = []
+    failures_before_success: int = 0
+
+    connect_attempts: int
+
+    def __init__(self) -> None:
+        self.connect_attempts = 0
+        type(self).instances.append(self)
+
+    async def connect(self, _socket_path: pathlib.Path) -> None:
+        self.connect_attempts += 1
+        if self.connect_attempts <= self.failures_before_success:
+            raise OSError("connect failed")
+
+    async def disconnect(self) -> None:
+        return None
+
+
+class _FakeEventPoller:
+    oneshot: bool
+    ran: bool
+
+    def __init__(self, _client: object, _post_fn: object, *, oneshot: bool) -> None:
+        self.oneshot = oneshot
+        self.ran = False
+
+    async def run(self) -> None:
+        self.ran = True
+
+
+class _DoneFuture(concurrent.futures.Future[str]):
+    set_result_called: bool
+    set_exception_called: bool
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.set_result_called = False
+        self.set_exception_called = False
+
+    @override
+    def done(self) -> bool:
+        return True
+
+    @override
+    def set_result(self, result: str) -> None:
+        _ = result
+        self.set_result_called = True
+
+    @override
+    def set_exception(self, exception: BaseException | None) -> None:
+        _ = exception
+        self.set_exception_called = True
 
 
 # =============================================================================
@@ -413,9 +494,6 @@ def test_configure_output_sink_json_mode(mocker: MockerFixture) -> None:
         mock_engine,
         quiet=False,
         as_json=True,
-        tui=False,
-        app=None,
-        run_id=None,
         use_console=True,
         jsonl_callback=callback,
     )
@@ -435,9 +513,6 @@ def test_configure_output_sink_quiet_mode(mocker: MockerFixture) -> None:
         mock_engine,
         quiet=True,
         as_json=False,
-        tui=False,
-        app=None,
-        run_id=None,
         use_console=True,
         jsonl_callback=None,
     )
@@ -455,9 +530,6 @@ def test_configure_output_sink_console_mode(mocker: MockerFixture) -> None:
         mock_engine,
         quiet=False,
         as_json=False,
-        tui=False,
-        app=None,
-        run_id=None,
         use_console=True,
         jsonl_callback=None,
     )
@@ -478,9 +550,6 @@ def test_configure_output_sink_json_overrides_quiet(mocker: MockerFixture) -> No
         mock_engine,
         quiet=True,
         as_json=True,
-        tui=False,
-        app=None,
-        run_id=None,
         use_console=False,
         jsonl_callback=callback,
     )
@@ -627,3 +696,73 @@ def test_resolve_on_error_both_flags_raises() -> None:
     """resolve_on_error raises when both flags are set."""
     with pytest.raises(click.ClickException, match="mutually exclusive"):
         _run_common.resolve_on_error(fail_fast=True, keep_going=True)
+
+
+def test_run_tui_with_engine_retries_poller_connect(
+    mocker: MockerFixture, tmp_path: pathlib.Path
+) -> None:
+    """run_tui_with_engine retries poller connect after failures."""
+    app = _FakeApp()
+    socket_path = tmp_path / "pivot.sock"
+    result_future: concurrent.futures.Future[str] = concurrent.futures.Future()
+
+    _FakeRpcPivotClient.instances = []
+    _FakeRpcPivotClient.failures_before_success = 2
+
+    async def _engine_fn(socket_ready: threading.Event) -> str:
+        socket_ready.set()
+        return "ok"
+
+    async def _fake_sleep(_duration: float) -> None:
+        return None
+
+    mocker.patch("pivot.cli._run_common.anyio.sleep", new=_fake_sleep)
+    mocker.patch.object(pivot_tui.rpc_client_impl, "RpcPivotClient", _FakeRpcPivotClient)
+    mocker.patch.object(pivot_tui.event_poller, "EventPoller", _FakeEventPoller)
+
+    _run_common.run_tui_with_engine(
+        app,
+        _engine_fn,
+        socket_path,
+        result_future=result_future,
+    )
+
+    assert app.ran is True
+    assert _FakeRpcPivotClient.instances, "Expected poller client to be created"
+    poller_client = _FakeRpcPivotClient.instances[0]
+    assert poller_client.connect_attempts == 3, "Should retry poller connect"
+    assert result_future.result(timeout=1) == "ok"
+
+
+def test_run_tui_with_engine_skips_setting_done_future(tmp_path: pathlib.Path) -> None:
+    """run_tui_with_engine does not set result on completed futures."""
+    app = _FakeApp()
+    socket_path = tmp_path / "pivot.sock"
+    result_future = _DoneFuture()
+
+    async def _engine_fn(socket_ready: threading.Event) -> str:
+        socket_ready.set()
+        return "ok"
+
+    _FakeRpcPivotClient.instances = []
+    _FakeRpcPivotClient.failures_before_success = 0
+
+    async def _fake_sleep(_duration: float) -> None:
+        return None
+
+    with (
+        pytest.MonkeyPatch.context() as monkeypatch,
+    ):
+        monkeypatch.setattr("pivot.cli._run_common.anyio.sleep", _fake_sleep, raising=True)
+        monkeypatch.setattr(pivot_tui.rpc_client_impl, "RpcPivotClient", _FakeRpcPivotClient)
+        monkeypatch.setattr(pivot_tui.event_poller, "EventPoller", _FakeEventPoller)
+
+        _run_common.run_tui_with_engine(
+            app,
+            _engine_fn,
+            socket_path,
+            result_future=result_future,
+        )
+
+    assert result_future.set_result_called is False
+    assert result_future.set_exception_called is False

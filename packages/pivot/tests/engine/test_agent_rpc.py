@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import json
 from pathlib import Path
+from typing import cast
 from unittest.mock import MagicMock
 
 import anyio
@@ -15,12 +16,51 @@ from pivot.engine.agent_rpc import (
     AgentRpcHandler,
     AgentRpcSource,
     BroadcastEventSink,
+    CommitResult,
     EventBuffer,
     QueryResult,
     QueryStatusResult,
 )
 from pivot.engine.engine import Engine
 from pivot.engine.types import EventSource, InputEvent, OutputEvent, StageStarted
+from pivot.types import DataDiffResult
+
+_diff_expected: DataDiffResult | None = None
+
+
+def _helper_commit_stages_train_eval() -> tuple[list[str], list[str]]:
+    return (["train", "eval"], ["broken_stage"])
+
+
+def _helper_commit_stages_empty() -> tuple[list[str], list[str]]:
+    return (list[str](), list[str]())
+
+
+def _helper_commit_stages_stage_a() -> tuple[list[str], list[str]]:
+    return (["stage_a"], [])
+
+
+def _helper_restore_data_from_cache(_rel_path: str, file_hash: str) -> Path:
+    return Path(f"/tmp/fake_{file_hash}")
+
+
+def _helper_restore_data_none(_rel_path: str, _file_hash: str) -> None:
+    return None
+
+
+def _helper_diff_data_files(
+    _old_path: object,
+    _new_path: object,
+    path_display: str,
+    **_kwargs: object,
+) -> DataDiffResult:
+    if _diff_expected is not None:
+        return _diff_expected
+    return _make_diff_result(path_display)
+
+
+def _helper_path_unlink(_path: Path, **_kwargs: object) -> None:
+    return None
 
 
 @pytest.mark.anyio
@@ -279,6 +319,7 @@ async def test_agent_event_sink_broadcasts_to_subscribers() -> None:
         stage="train",
         index=0,
         total=1,
+        run_id="test-run",
     )
     await sink.handle(event)
 
@@ -311,6 +352,7 @@ async def test_agent_event_sink_unsubscribe() -> None:
         stage="train",
         index=0,
         total=1,
+        run_id="test-run",
     )
     await sink.handle(event)
 
@@ -636,7 +678,14 @@ async def test_event_buffer_captures_events() -> None:
     """EventBuffer should capture events with version numbers."""
     buffer = EventBuffer(max_events=100)
     buffer.handle_sync(
-        {"type": "stage_started", "seq": 0, "stage": "train", "index": 1, "total": 2}
+        StageStarted(
+            type="stage_started",
+            seq=0,
+            stage="train",
+            index=1,
+            total=2,
+            run_id="test-run",
+        )
     )
 
     result = buffer.events_since(0)
@@ -650,7 +699,14 @@ async def test_event_buffer_eviction() -> None:
     buffer = EventBuffer(max_events=3)
     for i in range(5):
         buffer.handle_sync(
-            {"type": "stage_started", "seq": i, "stage": f"s{i}", "index": i, "total": 5}
+            StageStarted(
+                type="stage_started",
+                seq=i,
+                stage=f"s{i}",
+                index=i,
+                total=5,
+                run_id="test-run",
+            )
         )
 
     result = buffer.events_since(0)
@@ -663,7 +719,14 @@ async def test_handler_events_since_query() -> None:
 
     buffer = EventBuffer(max_events=100)
     buffer.handle_sync(
-        {"type": "stage_started", "seq": 0, "stage": "train", "index": 1, "total": 1}
+        StageStarted(
+            type="stage_started",
+            seq=0,
+            stage="train",
+            index=1,
+            total=1,
+            run_id="test-run",
+        )
     )
 
     mock_engine = MagicMock()
@@ -697,10 +760,28 @@ async def test_event_buffer_version_wraparound() -> None:
     buffer._version = _MAX_VERSION - 1
 
     # Add events that trigger wraparound
-    buffer.handle_sync({"type": "stage_started", "seq": 0, "stage": "s1", "index": 0, "total": 2})
+    buffer.handle_sync(
+        StageStarted(
+            type="stage_started",
+            seq=0,
+            stage="s1",
+            index=0,
+            total=2,
+            run_id="test-run",
+        )
+    )
     assert buffer._version == _MAX_VERSION
 
-    buffer.handle_sync({"type": "stage_started", "seq": 1, "stage": "s2", "index": 1, "total": 2})
+    buffer.handle_sync(
+        StageStarted(
+            type="stage_started",
+            seq=1,
+            stage="s2",
+            index=1,
+            total=2,
+            run_id="test-run",
+        )
+    )
     # Version should wrap to 1, not overflow
     assert buffer._version == 1, "Version should wrap to 1 after reaching _MAX_VERSION"
 
@@ -731,7 +812,14 @@ async def test_event_buffer_query_current_version() -> None:
     """
     buffer = EventBuffer(max_events=100)
     buffer.handle_sync(
-        {"type": "stage_started", "seq": 0, "stage": "train", "index": 0, "total": 1}
+        StageStarted(
+            type="stage_started",
+            seq=0,
+            stage="train",
+            index=0,
+            total=1,
+            run_id="test-run",
+        )
     )
 
     current_version = buffer._version
@@ -751,7 +839,14 @@ async def test_event_buffer_query_future_version() -> None:
     """
     buffer = EventBuffer(max_events=100)
     buffer.handle_sync(
-        {"type": "stage_started", "seq": 0, "stage": "train", "index": 0, "total": 1}
+        StageStarted(
+            type="stage_started",
+            seq=0,
+            stage="train",
+            index=0,
+            total=1,
+            run_id="test-run",
+        )
     )
 
     # Query with version ahead of current (simulates post-wraparound scenario)
@@ -775,7 +870,14 @@ async def test_event_buffer_query_after_eviction() -> None:
     # Fill buffer and cause eviction
     for i in range(5):
         buffer.handle_sync(
-            {"type": "stage_started", "seq": i, "stage": f"s{i}", "index": i, "total": 5}
+            StageStarted(
+                type="stage_started",
+                seq=i,
+                stage=f"s{i}",
+                index=i,
+                total=5,
+                run_id="test-run",
+            )
         )
 
     # Query with version that was evicted (version 1-2 are gone)
@@ -800,13 +902,14 @@ async def test_event_buffer_thread_safety() -> None:
     def add_events(offset: int) -> None:
         for i in range(100):
             buffer.handle_sync(
-                {
-                    "type": "stage_started",
-                    "seq": i,
-                    "stage": f"s{offset}_{i}",
-                    "index": i,
-                    "total": 100,
-                }
+                StageStarted(
+                    type="stage_started",
+                    seq=i,
+                    stage=f"s{offset}_{i}",
+                    index=i,
+                    total=100,
+                    run_id="test-run",
+                )
             )
 
     # Add events concurrently from 5 threads
@@ -1134,6 +1237,152 @@ async def test_agent_rpc_source_run_force_invalid_type(tmp_path: Path) -> None:
 
 
 # =============================================================================
+# set_on_error Command
+# =============================================================================
+
+
+@pytest.mark.anyio
+async def test_agent_rpc_source_set_on_error_fail(tmp_path: Path) -> None:
+    """AgentRpcSource accepts set_on_error with mode='fail'."""
+    socket_path = tmp_path / "agent.sock"
+    send, recv = anyio.create_memory_object_stream[InputEvent](10)
+
+    async with anyio.create_task_group() as tg:
+        source = AgentRpcSource(socket_path=socket_path)
+        tg.start_soon(source.run, send)
+
+        await wait_for_socket(socket_path)
+
+        async with await anyio.connect_unix(str(socket_path)) as conn:
+            request = {
+                "jsonrpc": "2.0",
+                "method": "set_on_error",
+                "params": {"mode": "fail"},
+                "id": 1,
+            }
+            await conn.send(json.dumps(request).encode() + b"\n")
+
+            response_line = await conn.receive(4096)
+            response = json.loads(response_line.decode())
+
+            assert response.get("result") is True, "set_on_error should return True"
+
+        tg.cancel_scope.cancel()
+
+
+@pytest.mark.anyio
+async def test_agent_rpc_source_set_on_error_keep_going(tmp_path: Path) -> None:
+    """AgentRpcSource accepts set_on_error with mode='keep_going'."""
+    socket_path = tmp_path / "agent.sock"
+    send, recv = anyio.create_memory_object_stream[InputEvent](10)
+
+    async with anyio.create_task_group() as tg:
+        source = AgentRpcSource(socket_path=socket_path)
+        tg.start_soon(source.run, send)
+
+        await wait_for_socket(socket_path)
+
+        async with await anyio.connect_unix(str(socket_path)) as conn:
+            request = {
+                "jsonrpc": "2.0",
+                "method": "set_on_error",
+                "params": {"mode": "keep_going"},
+                "id": 2,
+            }
+            await conn.send(json.dumps(request).encode() + b"\n")
+
+            response_line = await conn.receive(4096)
+            response = json.loads(response_line.decode())
+
+            assert response.get("result") is True, "set_on_error should return True"
+
+        tg.cancel_scope.cancel()
+
+
+@pytest.mark.anyio
+async def test_agent_rpc_source_set_on_error_invalid_mode(tmp_path: Path) -> None:
+    """AgentRpcSource rejects set_on_error with invalid mode."""
+    socket_path = tmp_path / "agent.sock"
+    send, recv = anyio.create_memory_object_stream[InputEvent](10)
+
+    async with anyio.create_task_group() as tg:
+        source = AgentRpcSource(socket_path=socket_path)
+        tg.start_soon(source.run, send)
+
+        await wait_for_socket(socket_path)
+
+        async with await anyio.connect_unix(str(socket_path)) as conn:
+            request = {
+                "jsonrpc": "2.0",
+                "method": "set_on_error",
+                "params": {"mode": "invalid_mode"},
+                "id": 3,
+            }
+            await conn.send(json.dumps(request).encode() + b"\n")
+
+            response_line = await conn.receive(4096)
+            response = json.loads(response_line.decode())
+
+            assert "error" in response, "Invalid mode should return error"
+            assert response["error"]["code"] == -32602  # Invalid params
+            assert "mode must be one of" in response["error"]["message"]
+
+        tg.cancel_scope.cancel()
+
+
+@pytest.mark.anyio
+async def test_agent_rpc_source_set_on_error_missing_mode(tmp_path: Path) -> None:
+    """AgentRpcSource rejects set_on_error without mode parameter."""
+    socket_path = tmp_path / "agent.sock"
+    send, recv = anyio.create_memory_object_stream[InputEvent](10)
+
+    async with anyio.create_task_group() as tg:
+        source = AgentRpcSource(socket_path=socket_path)
+        tg.start_soon(source.run, send)
+
+        await wait_for_socket(socket_path)
+
+        async with await anyio.connect_unix(str(socket_path)) as conn:
+            request = {"jsonrpc": "2.0", "method": "set_on_error", "params": {}, "id": 4}
+            await conn.send(json.dumps(request).encode() + b"\n")
+
+            response_line = await conn.receive(4096)
+            response = json.loads(response_line.decode())
+
+            assert "error" in response, "Missing mode should return error"
+            assert response["error"]["code"] == -32602  # Invalid params
+            assert "mode must be string" in response["error"]["message"]
+
+        tg.cancel_scope.cancel()
+
+
+@pytest.mark.anyio
+async def test_agent_rpc_source_set_on_error_non_string_mode(tmp_path: Path) -> None:
+    """AgentRpcSource rejects set_on_error with non-string mode."""
+    socket_path = tmp_path / "agent.sock"
+    send, recv = anyio.create_memory_object_stream[InputEvent](10)
+
+    async with anyio.create_task_group() as tg:
+        source = AgentRpcSource(socket_path=socket_path)
+        tg.start_soon(source.run, send)
+
+        await wait_for_socket(socket_path)
+
+        async with await anyio.connect_unix(str(socket_path)) as conn:
+            request = {"jsonrpc": "2.0", "method": "set_on_error", "params": {"mode": 123}, "id": 5}
+            await conn.send(json.dumps(request).encode() + b"\n")
+
+            response_line = await conn.receive(4096)
+            response = json.loads(response_line.decode())
+
+            assert "error" in response, "Non-string mode should return error"
+            assert response["error"]["code"] == -32602  # Invalid params
+            assert "mode must be string" in response["error"]["message"]
+
+        tg.cancel_scope.cancel()
+
+
+# =============================================================================
 # EventSink Buffer Overflow
 # =============================================================================
 
@@ -1156,6 +1405,7 @@ async def test_event_sink_slow_subscriber_drops_events() -> None:
             stage=f"s{i}",
             index=i,
             total=5,
+            run_id="test-run",
         )
         await sink.handle(event)
 
@@ -1172,3 +1422,315 @@ async def test_event_sink_slow_subscriber_drops_events() -> None:
     assert len(received_events) <= 3, "Slow subscriber should miss events"
 
     await sink.close()
+
+
+# =============================================================================
+# Commit Query
+# =============================================================================
+
+
+@pytest.mark.anyio
+async def test_handler_commit_dispatches_to_commit_stages(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Handler commit query calls commit_stages and returns committed/failed lists."""
+    mock_engine = MagicMock()
+    handler = AgentRpcHandler(engine=mock_engine)
+
+    monkeypatch.setattr(
+        "pivot.executor.commit.commit_stages",
+        _helper_commit_stages_train_eval,
+    )
+
+    result = await handler.handle_query("commit")
+    assert "committed" in result, "Result should have 'committed' key"
+    assert "failed" in result, "Result should have 'failed' key"
+    # Type narrow to CommitResult
+    assert result["committed"] == ["train", "eval"], "Should return committed stages"
+    assert result["failed"] == ["broken_stage"], "Should return failed stages"
+
+
+@pytest.mark.anyio
+async def test_handler_commit_empty_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Handler commit query returns empty lists when nothing to commit."""
+    mock_engine = MagicMock()
+    handler = AgentRpcHandler(engine=mock_engine)
+
+    monkeypatch.setattr(
+        "pivot.executor.commit.commit_stages",
+        _helper_commit_stages_empty,
+    )
+
+    result = cast("CommitResult", await handler.handle_query("commit"))
+    assert result["committed"] == [], "Should return empty committed list"
+    assert result["failed"] == [], "Should return empty failed list"
+
+
+@pytest.mark.anyio
+async def test_rpc_commit_via_socket(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Commit query works end-to-end via Unix socket connection."""
+    socket_path = tmp_path / "agent.sock"
+
+    monkeypatch.setattr(
+        "pivot.executor.commit.commit_stages",
+        _helper_commit_stages_stage_a,
+    )
+
+    async with Engine() as engine:
+        handler = AgentRpcHandler(engine=engine)
+        source = AgentRpcSource(socket_path=socket_path, handler=handler)
+
+        send, recv = anyio.create_memory_object_stream[InputEvent](10)
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(source.run, send)
+            await wait_for_socket(socket_path)
+
+            async with await anyio.connect_unix(str(socket_path)) as conn:
+                request = {"jsonrpc": "2.0", "method": "commit", "id": 1}
+                await conn.send(json.dumps(request).encode() + b"\n")
+
+                response_line = await conn.receive(4096)
+                response = json.loads(response_line.decode())
+
+                assert "result" in response, "Should return result"
+                assert response["result"]["committed"] == ["stage_a"]
+                assert response["result"]["failed"] == []
+
+            tg.cancel_scope.cancel()
+
+
+@pytest.mark.anyio
+async def test_rpc_commit_propagates_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Commit query propagates errors from commit_stages — server closes connection."""
+    socket_path = tmp_path / "agent.sock"
+
+    def _raise() -> tuple[list[str], list[str]]:
+        raise RuntimeError("No pipeline loaded")
+
+    monkeypatch.setattr(
+        "pivot.executor.commit.commit_stages",
+        _raise,
+    )
+
+    async with Engine() as engine:
+        handler = AgentRpcHandler(engine=engine)
+        source = AgentRpcSource(socket_path=socket_path, handler=handler)
+
+        send, recv = anyio.create_memory_object_stream[InputEvent](10)
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(source.run, send)
+            await wait_for_socket(socket_path)
+
+            async with await anyio.connect_unix(str(socket_path)) as conn:
+                request = {"jsonrpc": "2.0", "method": "commit", "id": 1}
+                await conn.send(json.dumps(request).encode() + b"\n")
+
+                # RuntimeError propagates through handle_query → _handle_request →
+                # _handle_connection, which catches all exceptions and closes connection.
+                # Client sees EndOfStream.
+                with pytest.raises(anyio.EndOfStream):
+                    await conn.receive(4096)
+
+            tg.cancel_scope.cancel()
+
+
+# =============================================================================
+# diff_output Query
+# =============================================================================
+
+
+def _make_diff_result(path: str = "output.csv") -> DataDiffResult:
+    """Create a minimal DataDiffResult for testing."""
+    return DataDiffResult(
+        path=path,
+        old_rows=10,
+        new_rows=12,
+        old_cols=["a", "b"],
+        new_cols=["a", "b"],
+        schema_changes=[],
+        row_changes=[],
+        reorder_only=False,
+        truncated=False,
+        summary_only=False,
+    )
+
+
+@pytest.mark.anyio
+async def test_handler_diff_output_returns_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """diff_output returns DataDiffResult shape from mocked data module."""
+    mock_engine = MagicMock()
+    handler = AgentRpcHandler(engine=mock_engine)
+
+    expected = _make_diff_result("data/output.csv")
+
+    global _diff_expected
+    _diff_expected = expected
+    monkeypatch.setattr("pivot.show.data.restore_data_from_cache", _helper_restore_data_from_cache)
+    monkeypatch.setattr(
+        "pivot.show.data.diff_data_files",
+        _helper_diff_data_files,
+    )
+    # Prevent cleanup from failing on non-existent temp files
+    monkeypatch.setattr("pathlib.Path.unlink", _helper_path_unlink)
+
+    try:
+        result = cast(
+            "DataDiffResult",
+            await handler.handle_query(
+                "diff_output",
+                {"path": "data/output.csv", "old_hash": "abc123", "new_hash": "def456"},
+            ),
+        )
+    finally:
+        _diff_expected = None
+
+    assert result["path"] == "data/output.csv", "Should return correct path"
+    assert result["old_rows"] == 10, "Should return old row count"
+    assert result["new_rows"] == 12, "Should return new row count"
+
+
+@pytest.mark.anyio
+async def test_handler_diff_output_missing_path() -> None:
+    """diff_output rejects missing path parameter."""
+    mock_engine = MagicMock()
+    handler = AgentRpcHandler(engine=mock_engine)
+
+    with pytest.raises(ValueError, match="path must be string"):
+        await handler.handle_query("diff_output", {})
+
+
+@pytest.mark.anyio
+async def test_handler_diff_output_invalid_path_type() -> None:
+    """diff_output rejects non-string path parameter."""
+    mock_engine = MagicMock()
+    handler = AgentRpcHandler(engine=mock_engine)
+
+    with pytest.raises(ValueError, match="path must be string"):
+        await handler.handle_query("diff_output", {"path": 123})
+
+
+@pytest.mark.anyio
+async def test_handler_diff_output_invalid_old_hash_type() -> None:
+    """diff_output rejects non-string, non-null old_hash."""
+    mock_engine = MagicMock()
+    handler = AgentRpcHandler(engine=mock_engine)
+
+    with pytest.raises(ValueError, match="old_hash must be string or null"):
+        await handler.handle_query("diff_output", {"path": "out.csv", "old_hash": 123})
+
+
+@pytest.mark.anyio
+async def test_handler_diff_output_invalid_new_hash_type() -> None:
+    """diff_output rejects non-string, non-null new_hash."""
+    mock_engine = MagicMock()
+    handler = AgentRpcHandler(engine=mock_engine)
+
+    with pytest.raises(ValueError, match="new_hash must be string or null"):
+        await handler.handle_query("diff_output", {"path": "out.csv", "new_hash": 42})
+
+
+@pytest.mark.anyio
+async def test_handler_diff_output_null_hashes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """diff_output works with null hashes (file added/removed cases)."""
+    mock_engine = MagicMock()
+    handler = AgentRpcHandler(engine=mock_engine)
+
+    expected = _make_diff_result("new_file.csv")
+
+    # restore_data_from_cache should NOT be called for null hashes
+    restore_calls = list[str]()
+
+    def _mock_restore(rel_path: str, file_hash: str) -> Path | None:
+        restore_calls.append(file_hash)
+        return Path(f"/tmp/fake_{file_hash}")
+
+    monkeypatch.setattr("pivot.show.data.restore_data_from_cache", _mock_restore)
+    monkeypatch.setattr(
+        "pivot.show.data.diff_data_files",
+        _helper_diff_data_files,
+    )
+
+    _diff_expected = expected
+    try:
+        result = cast(
+            "DataDiffResult",
+            await handler.handle_query(
+                "diff_output",
+                {"path": "new_file.csv", "old_hash": None, "new_hash": None},
+            ),
+        )
+    finally:
+        _diff_expected = None
+
+    assert result["path"] == "new_file.csv", "Should return correct path"
+    assert restore_calls == [], "Should not call restore for null hashes"
+
+
+@pytest.mark.anyio
+async def test_handler_diff_output_max_rows_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """diff_output passes max_rows=50 by default."""
+    mock_engine = MagicMock()
+    handler = AgentRpcHandler(engine=mock_engine)
+
+    captured_kwargs = dict[str, object]()
+
+    def _mock_diff(
+        old_path: object, new_path: object, path_display: str, **kwargs: object
+    ) -> DataDiffResult:
+        captured_kwargs.update(kwargs)
+        return _make_diff_result(path_display)
+
+    monkeypatch.setattr("pivot.show.data.restore_data_from_cache", _helper_restore_data_none)
+    monkeypatch.setattr("pivot.show.data.diff_data_files", _mock_diff)
+
+    await handler.handle_query(
+        "diff_output",
+        {"path": "out.csv", "old_hash": None, "new_hash": None},
+    )
+
+    assert captured_kwargs.get("max_rows") == 50, "Default max_rows should be 50"
+
+
+@pytest.mark.anyio
+async def test_handler_diff_output_custom_max_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """diff_output respects custom max_rows parameter."""
+    mock_engine = MagicMock()
+    handler = AgentRpcHandler(engine=mock_engine)
+
+    captured_kwargs = dict[str, object]()
+
+    def _mock_diff(
+        old_path: object, new_path: object, path_display: str, **kwargs: object
+    ) -> DataDiffResult:
+        captured_kwargs.update(kwargs)
+        return _make_diff_result(path_display)
+
+    monkeypatch.setattr("pivot.show.data.restore_data_from_cache", _helper_restore_data_none)
+    monkeypatch.setattr("pivot.show.data.diff_data_files", _mock_diff)
+
+    await handler.handle_query(
+        "diff_output",
+        {"path": "out.csv", "old_hash": None, "new_hash": None, "max_rows": 100},
+    )
+
+    assert captured_kwargs.get("max_rows") == 100, "Should use custom max_rows"

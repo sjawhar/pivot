@@ -21,11 +21,11 @@ from pivot import config
 from pivot.engine.agent_rpc import AgentRpcHandler, AgentRpcSource, BroadcastEventSink
 from pivot.engine.engine import Engine
 from pivot.engine.sources import OneShotSource
+from pivot.engine.types import StageStarted
 
 if TYPE_CHECKING:
     import pathlib
 
-    from pivot.engine.types import StageStarted
     from pivot.pipeline.pipeline import Pipeline
 
 
@@ -98,13 +98,13 @@ async def test_event_sink_broadcasts_to_multiple_subscribers() -> None:
     recv2 = await sink.subscribe("client2")
 
     # Emit an event
-    event: StageStarted = {
-        "type": "stage_started",
-        "seq": 0,
-        "stage": "test",
-        "index": 0,
-        "total": 1,
-    }
+    event: StageStarted = StageStarted(
+        type="stage_started",
+        seq=0,
+        stage="test",
+        index=0,
+        total=1,
+    )
     await sink.handle(event)
 
     # Both clients should receive it
@@ -129,13 +129,13 @@ async def test_unsubscribe_stops_event_delivery() -> None:
     await sink.unsubscribe("client")
 
     # Emit an event
-    event: StageStarted = {
-        "type": "stage_started",
-        "seq": 0,
-        "stage": "test",
-        "index": 0,
-        "total": 1,
-    }
+    event: StageStarted = StageStarted(
+        type="stage_started",
+        seq=0,
+        stage="test",
+        index=0,
+        total=1,
+    )
     await sink.handle(event)
 
     # Channel should be closed - raises EndOfStream on closed channels

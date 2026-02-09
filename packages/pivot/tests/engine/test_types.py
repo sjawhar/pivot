@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pivot.engine import types
-from pivot.types import OnError, StageStatus
+from pivot.types import ChangeType, OnError, StageExplanation, StageStatus
 
 
 def test_stage_execution_state_ordering() -> None:
@@ -163,32 +163,90 @@ def test_pipeline_reloaded_event() -> None:
 
 def test_stage_started_event() -> None:
     """StageStarted event has required fields."""
-    event: types.StageStarted = {
-        "type": "stage_started",
-        "seq": 0,
-        "stage": "train",
-        "index": 3,
-        "total": 5,
-    }
+    event: types.StageStarted = types.StageStarted(
+        type="stage_started",
+        seq=0,
+        stage="train",
+        index=3,
+        total=5,
+    )
     assert event["type"] == "stage_started"
     assert event["stage"] == "train"
     assert event["index"] == 3
     assert event["total"] == 5
 
 
+def test_stage_started_without_explanation_is_valid() -> None:
+    """StageStarted without explanation field is backward-compatible."""
+    event: types.StageStarted = types.StageStarted(
+        type="stage_started",
+        stage="train",
+        index=0,
+        total=1,
+    )
+    assert "explanation" not in event, "explanation should not be present when omitted"
+
+
+def test_stage_started_with_explanation_none() -> None:
+    """StageStarted accepts explanation=None."""
+    event: types.StageStarted = types.StageStarted(
+        type="stage_started",
+        stage="train",
+        index=0,
+        total=1,
+        explanation=None,
+    )
+    assert "explanation" in event, "explanation should be present when set to None"
+    assert event["explanation"] is None
+
+
+def test_stage_started_with_explanation_data() -> None:
+    """StageStarted carries a full StageExplanation when provided."""
+    explanation = StageExplanation(
+        stage_name="train",
+        will_run=True,
+        is_forced=False,
+        reason="Code changed",
+        code_changes=[
+            {
+                "key": "train",
+                "old_hash": "aaa",
+                "new_hash": "bbb",
+                "change_type": ChangeType.MODIFIED,
+            }
+        ],
+        param_changes=[],
+        dep_changes=[],
+        upstream_stale=[],
+    )
+    event: types.StageStarted = types.StageStarted(
+        type="stage_started",
+        stage="train",
+        index=0,
+        total=1,
+        explanation=explanation,
+    )
+    assert "explanation" in event, "explanation should be present when provided"
+    explanation_value = event["explanation"]
+    assert explanation_value is not None
+    assert explanation_value["will_run"] is True
+    assert explanation_value["reason"] == "Code changed"
+    assert len(explanation_value["code_changes"]) == 1
+
+
 def test_stage_completed_event() -> None:
     """StageCompleted event has required fields."""
-    event: types.StageCompleted = {
-        "type": "stage_completed",
-        "seq": 0,
-        "stage": "train",
-        "status": StageStatus.RAN,
-        "reason": "inputs changed",
-        "duration_ms": 1234.5,
-        "index": 3,
-        "total": 5,
-        "input_hash": "abc123",
-    }
+    event: types.StageCompleted = types.StageCompleted(
+        type="stage_completed",
+        seq=0,
+        stage="train",
+        status=StageStatus.RAN,
+        reason="inputs changed",
+        duration_ms=1234.5,
+        index=3,
+        total=5,
+        input_hash="abc123",
+    )
     assert event["type"] == "stage_completed"
     assert event["status"] == StageStatus.RAN
     assert event["index"] == 3
@@ -196,18 +254,116 @@ def test_stage_completed_event() -> None:
     assert event["input_hash"] == "abc123"
 
     # Skipped stage
-    event_skip: types.StageCompleted = {
-        "type": "stage_completed",
-        "seq": 1,
-        "stage": "evaluate",
-        "status": StageStatus.SKIPPED,
-        "reason": "unchanged",
-        "duration_ms": 0.0,
-        "index": 4,
-        "total": 5,
-        "input_hash": None,
-    }
+    event_skip: types.StageCompleted = types.StageCompleted(
+        type="stage_completed",
+        seq=1,
+        stage="evaluate",
+        status=StageStatus.SKIPPED,
+        reason="unchanged",
+        duration_ms=0.0,
+        index=4,
+        total=5,
+        input_hash=None,
+    )
     assert event_skip["status"] == StageStatus.SKIPPED
+
+
+def test_stage_completed_without_output_summary_is_valid() -> None:
+    """StageCompleted without output_summary field is backward-compatible."""
+    event: types.StageCompleted = types.StageCompleted(
+        type="stage_completed",
+        stage="train",
+        status=StageStatus.RAN,
+        reason="inputs changed",
+        duration_ms=100.0,
+        index=0,
+        total=1,
+        input_hash="abc123",
+    )
+    assert "output_summary" not in event, "output_summary should not be present when omitted"
+
+
+def test_stage_completed_with_output_summary_none() -> None:
+    """StageCompleted accepts output_summary=None (e.g., skipped stages)."""
+    event: types.StageCompleted = types.StageCompleted(
+        type="stage_completed",
+        stage="train",
+        status=StageStatus.SKIPPED,
+        reason="unchanged",
+        duration_ms=0.0,
+        index=0,
+        total=1,
+        input_hash=None,
+        output_summary=None,
+    )
+    assert "output_summary" in event, "output_summary should be present when set to None"
+    assert event["output_summary"] is None
+
+
+def test_stage_completed_with_populated_output_summary() -> None:
+    """StageCompleted carries output change summaries when provided."""
+    summary = [
+        types.OutputChangeSummary(
+            path="output.csv",
+            change_type=None,
+            output_type="out",
+            old_hash=None,
+            new_hash="def456",
+        ),
+        types.OutputChangeSummary(
+            path="metrics.json",
+            change_type=None,
+            output_type="metric",
+            old_hash=None,
+            new_hash="ghi789",
+        ),
+    ]
+    event: types.StageCompleted = types.StageCompleted(
+        type="stage_completed",
+        stage="train",
+        status=StageStatus.RAN,
+        reason="inputs changed",
+        duration_ms=1500.0,
+        index=0,
+        total=1,
+        input_hash="abc123",
+        output_summary=summary,
+    )
+    assert "output_summary" in event, "output_summary should be present when provided"
+    output_summary = event["output_summary"]
+    assert output_summary is not None
+    assert len(output_summary) == 2
+    assert output_summary[0]["path"] == "output.csv"
+    assert output_summary[0]["output_type"] == "out"
+    assert output_summary[0]["new_hash"] == "def456"
+    assert output_summary[1]["output_type"] == "metric"
+
+
+def test_output_change_summary_typeddict() -> None:
+    """OutputChangeSummary has all required fields."""
+    summary = types.OutputChangeSummary(
+        path="data/output.csv",
+        change_type="modified",
+        output_type="out",
+        old_hash="aaa111",
+        new_hash="bbb222",
+    )
+    assert summary["path"] == "data/output.csv"
+    assert summary["change_type"] == "modified"
+    assert summary["output_type"] == "out"
+    assert summary["old_hash"] == "aaa111"
+    assert summary["new_hash"] == "bbb222"
+
+    # With None values (no old hash, unknown change type)
+    summary_new = types.OutputChangeSummary(
+        path="new_output.csv",
+        change_type=None,
+        output_type="plot",
+        old_hash=None,
+        new_hash="ccc333",
+    )
+    assert summary_new["change_type"] is None
+    assert summary_new["old_hash"] is None
 
 
 def test_log_line_event() -> None:
@@ -260,18 +416,18 @@ def test_output_event_union() -> None:
             "stages_modified": [],
             "error": None,
         },
-        {"type": "stage_started", "seq": 2, "stage": "x", "index": 1, "total": 1},
-        {
-            "type": "stage_completed",
-            "seq": 3,
-            "stage": "x",
-            "status": StageStatus.RAN,
-            "reason": "",
-            "duration_ms": 0,
-            "index": 1,
-            "total": 1,
-            "input_hash": None,
-        },
+        types.StageStarted(type="stage_started", seq=2, stage="x", index=1, total=1),
+        types.StageCompleted(
+            type="stage_completed",
+            seq=3,
+            stage="x",
+            status=StageStatus.RAN,
+            reason="",
+            duration_ms=0,
+            index=1,
+            total=1,
+            input_hash=None,
+        ),
         {
             "type": "stage_state_changed",
             "seq": 4,

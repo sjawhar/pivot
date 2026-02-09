@@ -8,7 +8,7 @@ if TYPE_CHECKING:
 
     from anyio.streams.memory import MemoryObjectSendStream
 
-    from pivot.types import CompletionType, OnError
+    from pivot.types import CompletionType, OnError, StageExplanation
 
 __all__ = [
     "StageExecutionState",
@@ -23,6 +23,7 @@ __all__ = [
     # Output events
     "EngineStateChanged",
     "PipelineReloaded",
+    "OutputChangeSummary",
     "StageStarted",
     "StageCompleted",
     "StageStateChanged",
@@ -151,10 +152,21 @@ class StageStarted(TypedDict):
 
     type: Literal["stage_started"]
     seq: NotRequired[int]
-    run_id: NotRequired[str]
     stage: str
     index: int
     total: int
+    run_id: NotRequired[str]
+    explanation: NotRequired[StageExplanation | None]
+
+
+class OutputChangeSummary(TypedDict):
+    """Summary of output changes for a single output file."""
+
+    path: str
+    change_type: str | None  # "added", "modified", "removed", "unchanged", or None if unknown
+    output_type: str  # "out", "metric", "plot"
+    old_hash: str | None
+    new_hash: str | None
 
 
 class StageCompleted(TypedDict):
@@ -162,14 +174,15 @@ class StageCompleted(TypedDict):
 
     type: Literal["stage_completed"]
     seq: NotRequired[int]
-    run_id: NotRequired[str]
     stage: str
     status: CompletionType
     reason: str
     duration_ms: float
     index: int
     total: int
+    run_id: NotRequired[str]
     input_hash: str | None
+    output_summary: NotRequired[list[OutputChangeSummary] | None]
 
 
 class LogLine(TypedDict):

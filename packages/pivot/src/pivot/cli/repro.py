@@ -353,9 +353,7 @@ def _run_watch_mode(  # noqa: PLR0913 - many params needed for different modes
     use_all_pipelines = cli_decorators.get_all_pipelines_from_context()
 
     if tui and run_id:
-        # TUI mode with async Engine
-        # IMPORTANT: Textual must run in the main thread for signal handlers (SIGTSTP, etc.)
-        # to work correctly. We run the Engine in a background thread instead.
+        # TUI mode with async Engine via RPC
         try:
             import pivot_tui.run as tui_run
         except ImportError as err:
@@ -363,85 +361,62 @@ def _run_watch_mode(  # noqa: PLR0913 - many params needed for different modes
                 "The TUI requires the 'pivot-tui' package. Install it with: pip install 'pivot[tui]' or: uv pip install pivot-tui"
             ) from err
 
-        # Create TUI app (will run in main thread)
+        from pivot import project
+        from pivot.engine.agent_rpc import AgentRpcHandler, AgentRpcSource, BroadcastEventSink
+
+        state_dir = project.get_project_root() / ".pivot"
+        socket_path = state_dir / "agent.sock"
+        state_dir.mkdir(parents=True, exist_ok=True)
+
         app = tui_run.PivotApp(
             stage_names=display_order,
             tui_log=tui_log,
             watch_mode=True,
             no_commit=no_commit,
             serve=serve,
-            stage_data_provider=pipeline,
+            socket_path=socket_path,
         )
 
-        def engine_thread_target() -> None:
-            """Run the async Engine in a background thread with its own event loop."""
+        async def watch_engine_fn(socket_ready: threading.Event) -> None:
+            async with engine.Engine(pipeline=pipeline, all_pipelines=use_all_pipelines) as eng:
+                _run_common.configure_result_collector(eng)
+                _run_common.configure_output_sink(
+                    eng,
+                    quiet=quiet,
+                    as_json=as_json,
+                    use_console=False,
+                    jsonl_callback=jsonl_callback,
+                )
 
-            async def engine_main() -> None:
-                async with engine.Engine(pipeline=pipeline, all_pipelines=use_all_pipelines) as eng:
-                    # Configure sinks - TuiSink posts to app (thread-safe)
-                    _run_common.configure_result_collector(eng)
-                    _run_common.configure_output_sink(
-                        eng,
-                        quiet=quiet,
-                        as_json=as_json,
-                        tui=True,
-                        app=app,
-                        run_id=run_id,
-                        use_console=False,
-                        jsonl_callback=jsonl_callback,
-                    )
+                eng.add_sink(eng._event_buffer)  # pyright: ignore[reportPrivateUsage]
+                rpc_handler = AgentRpcHandler(
+                    engine=eng,
+                    event_buffer=eng._event_buffer,  # pyright: ignore[reportPrivateUsage]
+                )
+                eng.add_source(AgentRpcSource(socket_path=socket_path, handler=rpc_handler))
+                eng.add_sink(BroadcastEventSink())
 
-                    # Add agent RPC source for TUI (needed for force re-run) or serve mode
-                    if serve or tui:
-                        from pivot import project
-                        from pivot.engine.agent_rpc import (
-                            AgentRpcHandler,
-                            AgentRpcSource,
-                            BroadcastEventSink,
-                        )
+                socket_ready.set()
 
-                        state_dir = project.get_project_root() / ".pivot"
-                        socket_path = state_dir / "agent.sock"
-                        state_dir.mkdir(parents=True, exist_ok=True)
+                _configure_watch_sources(
+                    eng,
+                    watch_paths,
+                    debounce,
+                    force=force,
+                    stages=stages_list,
+                    no_commit=no_commit,
+                    on_error=on_error,
+                )
 
-                        # Add event buffer as sink so it captures events
-                        eng.add_sink(eng._event_buffer)  # pyright: ignore[reportPrivateUsage]
+                await eng.run(exit_on_completion=False)
 
-                        rpc_handler = AgentRpcHandler(
-                            engine=eng,
-                            event_buffer=eng._event_buffer,  # pyright: ignore[reportPrivateUsage]
-                        )
-                        eng.add_source(AgentRpcSource(socket_path=socket_path, handler=rpc_handler))
-                        eng.add_sink(BroadcastEventSink())
-
-                    # Configure watch sources
-                    _configure_watch_sources(
-                        eng,
-                        watch_paths,
-                        debounce,
-                        force=force,
-                        stages=stages_list,
-                        no_commit=no_commit,
-                        on_error=on_error,
-                    )
-
-                    await eng.run(exit_on_completion=False)
-
-            try:
-                anyio.run(engine_main)
-            except Exception:
-                # Engine failed - log and signal TUI to exit
-                _logger.exception("Engine thread failed in watch mode")
-                with contextlib.suppress(Exception):
-                    app.post_message(tui_run.TuiShutdown())
-
-        # Start engine in background thread
-        engine_thread = threading.Thread(target=engine_thread_target, daemon=True)
-        engine_thread.start()
-
-        # Run TUI in main thread (required for signal handlers)
-        with contextlib.suppress(KeyboardInterrupt), _run_common.suppress_stderr_logging():
-            app.run()
+        _run_common.run_tui_with_engine(
+            app,
+            watch_engine_fn,
+            socket_path,
+            oneshot=False,
+            suppress_keyboard_interrupt=True,
+        )
     else:
         # Non-TUI async mode
         async def watch_main() -> None:
@@ -452,9 +427,6 @@ def _run_watch_mode(  # noqa: PLR0913 - many params needed for different modes
                     eng,
                     quiet=quiet,
                     as_json=as_json,
-                    tui=False,
-                    app=None,
-                    run_id=None,
                     use_console=console is not None,
                     jsonl_callback=jsonl_callback,
                     show_output=show_output,
@@ -588,9 +560,7 @@ def _run_oneshot_mode(
     pipeline = cli_decorators.get_pipeline_from_context()
     use_all_pipelines = cli_decorators.get_all_pipelines_from_context()
 
-    # TUI mode for oneshot
-    # IMPORTANT: Textual must run in the main thread for signal handlers (SIGTSTP, etc.)
-    # to work correctly. We run the Engine in a background thread instead.
+    # TUI mode for oneshot via RPC
     if tui and run_id:
         try:
             import pivot_tui.run as tui_run
@@ -599,68 +569,64 @@ def _run_oneshot_mode(
                 "The TUI requires the 'pivot-tui' package. Install it with: pip install 'pivot[tui]' or: uv pip install pivot-tui"
             ) from err
 
-        # Create TUI app (will run in main thread)
+        from pivot.engine.agent_rpc import AgentRpcHandler, AgentRpcSource, BroadcastEventSink
+
+        state_dir = config.get_state_dir()
+        socket_path = state_dir / "agent.sock"
+
         app = tui_run.PivotApp(
             stage_names=display_order,
             tui_log=tui_log,
             cancel_event=cancel_event,
-            stage_data_provider=pipeline,
+            socket_path=socket_path,
         )
 
-        # Use Future for thread-safe result passing
         result_future: concurrent.futures.Future[dict[str, executor_core.ExecutionSummary]] = (
             concurrent.futures.Future()
         )
 
-        def engine_thread_target() -> None:
-            """Run the async Engine in a background thread with its own event loop."""
+        async def oneshot_engine_fn(
+            socket_ready: threading.Event,
+        ) -> dict[str, executor_core.ExecutionSummary]:
+            async with engine.Engine(pipeline=pipeline, all_pipelines=use_all_pipelines) as eng:
+                result_sink = _run_common.configure_result_collector(eng)
+                _run_common.configure_output_sink(
+                    eng,
+                    quiet=quiet,
+                    as_json=as_json,
+                    use_console=False,
+                    jsonl_callback=jsonl_callback,
+                )
 
-            async def engine_main() -> dict[str, executor_core.ExecutionSummary]:
-                async with engine.Engine(pipeline=pipeline, all_pipelines=use_all_pipelines) as eng:
-                    # Configure sinks - TuiSink posts to app (thread-safe)
-                    result_sink = _run_common.configure_result_collector(eng)
-                    _run_common.configure_output_sink(
-                        eng,
-                        quiet=quiet,
-                        as_json=as_json,
-                        tui=True,
-                        app=app,
-                        run_id=run_id,
-                        use_console=False,
-                        jsonl_callback=jsonl_callback,
-                    )
-                    _configure_oneshot_source(
-                        eng,
-                        stages_list,
-                        force=force,
-                        no_commit=no_commit,
-                        on_error=on_error,
-                        allow_uncached_incremental=allow_uncached_incremental,
-                        checkout_missing=checkout_missing,
-                    )
-                    await eng.run(exit_on_completion=True)
-                    stage_results = await result_sink.get_results()
-                    return _run_common.convert_results(stage_results)
+                eng.add_sink(eng._event_buffer)  # pyright: ignore[reportPrivateUsage]
+                rpc_handler = AgentRpcHandler(
+                    engine=eng,
+                    event_buffer=eng._event_buffer,  # pyright: ignore[reportPrivateUsage]
+                )
+                eng.add_source(AgentRpcSource(socket_path=socket_path, handler=rpc_handler))
+                eng.add_sink(BroadcastEventSink())
 
-            try:
-                result_future.set_result(anyio.run(engine_main))
-            except BaseException as e:
-                result_future.set_exception(e)
-            finally:
-                # Signal TUI to exit when engine completes (success or failure)
-                with contextlib.suppress(Exception):
-                    app.post_message(tui_run.TuiShutdown())
+                socket_ready.set()
 
-        # Start engine in background thread
-        engine_thread = threading.Thread(target=engine_thread_target, daemon=True)
-        engine_thread.start()
+                _configure_oneshot_source(
+                    eng,
+                    stages_list,
+                    force=force,
+                    no_commit=no_commit,
+                    on_error=on_error,
+                    allow_uncached_incremental=allow_uncached_incremental,
+                    checkout_missing=checkout_missing,
+                )
+                await eng.run(exit_on_completion=True)
+                stage_results = await result_sink.get_results()
+                return _run_common.convert_results(stage_results)
 
-        # Run TUI in main thread (required for signal handlers)
-        with _run_common.suppress_stderr_logging():
-            app.run()
-
-        # Wait for engine thread to finish (should be quick since TUI already exited)
-        engine_thread.join(timeout=5.0)
+        _run_common.run_tui_with_engine(
+            app,
+            oneshot_engine_fn,
+            socket_path,
+            result_future=result_future,
+        )
 
         # Return results (re-raises if engine raised an exception)
         if result_future.done():
@@ -677,9 +643,6 @@ def _run_oneshot_mode(
                 eng,
                 quiet=quiet,
                 as_json=as_json,
-                tui=False,
-                app=None,
-                run_id=None,
                 use_console=console is not None,
                 jsonl_callback=jsonl_callback,
                 show_output=show_output,

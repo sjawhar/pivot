@@ -37,12 +37,18 @@ Example response:
 
 ## Available Methods
 
-| Method | Params | Description |
-|--------|--------|-------------|
-| `run` | `stages?`, `force?` | Queue execution request |
-| `status` | `run_id?` | Get current execution state |
-| `stages` | - | List all registered stages |
-| `cancel` | - | Request cancellation of current execution |
+| Method | Type | Params | Description |
+|--------|------|--------|-------------|
+| `run` | Command | `stages?`, `force?` | Queue execution request |
+| `cancel` | Command | - | Request cancellation of current execution |
+| `set_on_error` | Command | `mode` | Set error handling (`"fail"` or `"keep_going"`) |
+| `status` | Query | - | Get current execution state |
+| `stages` | Query | - | List all registered stages |
+| `stage_info` | Query | `stage` | Get detailed info for a specific stage |
+| `explain` | Query | `stage` | Get explanation of why a stage will run |
+| `events_since` | Query | `version` | Poll for events since a version cursor |
+| `commit` | Query | - | Commit pending output changes |
+| `diff_output` | Query | `path`, `old_hash?`, `new_hash?`, `max_rows?` | Get diff of an output file |
 
 ### run
 

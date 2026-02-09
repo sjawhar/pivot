@@ -10,10 +10,10 @@
 
 ```
 packages/pivot/src/pivot/
-├── cli/           # Click commands, decorators, helpers
+├── cli/           # Click commands, decorators, helpers (see cli/AGENTS.md)
 ├── config/        # YAML parsing, validation
 ├── dag/           # Dependency graph construction
-├── engine/        # Execution coordinator, watch mode
+├── engine/        # Execution coordinator, watch mode, RPC server
 ├── executor/      # Worker process execution (see executor/AGENTS.md)
 ├── pipeline/      # Pipeline state, lock files
 ├── remote/        # S3/remote storage
@@ -24,6 +24,20 @@ packages/pivot/src/pivot/
 ├── loaders.py     # File I/O (CSV, JSON, Pickle, etc.)
 ├── outputs.py     # Out, DirectoryOut, IncrementalOut
 └── types.py       # TypedDicts, enums, type aliases
+
+packages/pivot-tui/src/pivot_tui/
+├── client.py          # PivotRpc/PivotClient protocols + TypedDicts
+├── rpc_client_impl.py # RpcPivotClient: JSON-RPC 2.0 over Unix socket
+├── event_poller.py    # EventPoller: polls events, converts to TUI messages
+├── run.py             # PivotApp (Textual app), main TUI logic
+├── diff.py            # Diff formatting helpers
+├── diff_panels.py     # Input/Output diff panel renderers
+├── types.py           # TUI message types, enums
+├── widgets/           # Textual widgets (stage list, panels, logs, debug)
+├── screens/           # Modal screens (help, history, confirm dialogs)
+├── console.py         # Plain-text console output (non-TUI mode)
+└── testing/
+    └── fake_server.py # FakeRpcServer test double
 ```
 
 ## Key Entry Points
@@ -32,9 +46,13 @@ packages/pivot/src/pivot/
 |------|---------|
 | `packages/pivot/src/pivot/cli/__init__.py` | CLI entry point (`pivot` command) |
 | `packages/pivot/src/pivot/engine/engine.py` | Pipeline execution coordinator |
+| `packages/pivot/src/pivot/engine/agent_rpc.py` | JSON-RPC 2.0 server (Unix socket) |
 | `packages/pivot/src/pivot/executor/worker.py` | Worker process execution |
 | `packages/pivot/src/pivot/storage/state.py` | LMDB state database |
 | `packages/pivot/src/pivot/fingerprint.py` | Code change detection |
+| `packages/pivot-tui/src/pivot_tui/run.py` | TUI application (Textual) |
+| `packages/pivot-tui/src/pivot_tui/rpc_client_impl.py` | TUI's RPC client |
+| `packages/pivot/src/pivot/cli/_run_common.py` | 3-thread TUI launch coordinator |
 
 ## Institutional Knowledge
 

@@ -63,6 +63,7 @@ async def test_console_sink_handles_stage_completed_ran() -> None:
         duration_ms=1500,
         index=0,
         total=1,
+        run_id="test-run",
         input_hash=None,
     )
     await sink.handle(event)
@@ -93,6 +94,7 @@ async def test_console_sink_handles_stage_completed_skipped() -> None:
         duration_ms=10,
         index=0,
         total=1,
+        run_id="test-run",
         input_hash=None,
     )
     await sink.handle(event)
@@ -123,6 +125,7 @@ async def test_console_sink_handles_stage_completed_failed() -> None:
         duration_ms=100,
         index=0,
         total=1,
+        run_id="test-run",
         input_hash=None,
     )
     await sink.handle(event)
@@ -155,6 +158,7 @@ async def test_console_sink_handles_multiline_reason() -> None:
         duration_ms=100,
         index=0,
         total=1,
+        run_id="test-run",
         input_hash=None,
     )
     await sink.handle(event)
@@ -209,6 +213,7 @@ async def test_result_collector_sink_collects_completed() -> None:
         duration_ms=1000,
         index=0,
         total=1,
+        run_id="test-run",
         input_hash=None,
     )
     await sink.handle(event)
@@ -232,7 +237,8 @@ async def test_result_collector_sink_ignores_other_events() -> None:
         seq=0,
         stage="train",
         index=0,
-        total=1,
+        total=2,
+        run_id="test-run",
     )
     await sink.handle(event)
 
@@ -258,6 +264,7 @@ async def test_result_collector_sink_concurrent_access() -> None:
             duration_ms=100.0,
             index=0,
             total=1,
+            run_id="test-run",
             input_hash=None,
         )
         for _ in range(50):
@@ -296,6 +303,7 @@ async def test_result_collector_sink_prevents_lost_updates() -> None:
                 duration_ms=float(i),
                 index=0,
                 total=1,
+                run_id="test-run",
                 input_hash=None,
             )
             await sink.handle(event)
@@ -341,6 +349,7 @@ async def test_console_sink_formats_duration_correctly() -> None:
         duration_ms=1500.0,
         index=0,
         total=1,
+        run_id="test-run",
         input_hash=None,
     )
     await sink.handle(event)
@@ -371,6 +380,7 @@ async def test_console_sink_running_message_format() -> None:
         stage="train",
         index=0,
         total=2,
+        run_id="test-run",
     )
     await sink.handle(event)
 
@@ -587,7 +597,15 @@ async def test_console_sink_escapes_rich_markup_in_log_lines() -> None:
 # =============================================================================
 
 _EVENTS = [
-    StageStarted(type="stage_started", seq=i, stage=f"s{i}", index=i, total=5) for i in range(5)
+    StageStarted(
+        type="stage_started",
+        seq=i,
+        stage=f"s{i}",
+        index=i,
+        total=5,
+        run_id="test-run",
+    )
+    for i in range(5)
 ]
 
 

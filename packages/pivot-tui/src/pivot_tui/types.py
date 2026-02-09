@@ -2,28 +2,9 @@ from __future__ import annotations
 
 import collections
 import dataclasses
-from typing import TYPE_CHECKING, NamedTuple, Protocol
+from typing import NamedTuple
 
 from pivot.types import OutputChange, StageExplanation, StageStatus, parse_stage_name
-
-if TYPE_CHECKING:
-    from pivot.registry import RegistryStageInfo
-
-
-class StageDataProvider(Protocol):
-    """Protocol for TUI to look up stage metadata without CLI context.
-
-    Decouples the TUI from pivot.cli.helpers by defining the two
-    operations the TUI actually needs from the registry.
-    """
-
-    def get_stage(self, name: str) -> RegistryStageInfo:
-        """Look up stage metadata by name. Raises KeyError if not found."""
-        ...
-
-    def ensure_fingerprint(self, name: str) -> dict[str, str]:
-        """Compute/return cached code fingerprint for a stage."""
-        ...
 
 
 class LogEntry(NamedTuple):

@@ -11,8 +11,7 @@ Users can navigate with j/k and expand details to full-width with Enter.
 from __future__ import annotations
 
 import logging
-import pathlib
-from typing import TYPE_CHECKING, Literal, assert_never, override
+from typing import Literal, assert_never, override
 
 import rich.markup
 import textual.app
@@ -20,29 +19,17 @@ import textual.containers
 import textual.css.query
 import textual.widgets
 
-from pivot import config, explain, outputs, parameters, project
-from pivot.show import data as data_mod
-from pivot.show import metrics as metrics_mod
-from pivot.show.metrics import MetricDiff
-from pivot.storage import cache, lock
 from pivot.types import (
     ChangeType,
     CodeChange,
     DataDiffResult,
-    DataFileFormat,
     DepChange,
-    HashInfo,
-    LockData,
     MetricValue,
     OutputChange,
     ParamChange,
     StageExplanation,
     StageStatus,
 )
-
-if TYPE_CHECKING:
-    from pivot.registry import RegistryStageInfo
-    from pivot_tui.types import StageDataProvider
 
 logger = logging.getLogger(__name__)
 
@@ -106,101 +93,6 @@ def _format_hash_change(
             return f"{_truncate_hash(old_hash)} -> {_truncate_hash(new_hash)}"
         case _ as unreachable:  # pyright: ignore[reportUnnecessaryComparison]
             assert_never(unreachable)
-
-
-def _try_get_stage(provider: StageDataProvider | None, name: str) -> RegistryStageInfo | None:
-    """Look up stage metadata, returning None if provider is absent or stage unknown."""
-    if provider is None:
-        return None
-    try:
-        return provider.get_stage(name)
-    except KeyError:
-        return None
-
-
-def _get_relative_path(abs_path: str) -> str:
-    """Convert absolute path to relative path from project root."""
-    try:
-        proj_root = project.get_project_root()
-        path = pathlib.Path(abs_path)
-        if path.is_absolute():
-            return str(path.relative_to(proj_root))
-    except ValueError:
-        pass
-    return abs_path
-
-
-def compute_output_changes(
-    lock_data: LockData | None,
-    registry_info: RegistryStageInfo,
-) -> list[OutputChange]:
-    """Compute output changes by comparing lock file with current state."""
-    changes = list[OutputChange]()
-
-    # Build maps for easier lookup
-    outs = registry_info["outs"]
-    outs_paths = registry_info["outs_paths"]
-
-    # Map path -> output type (properly typed as Literal)
-    path_to_type = dict[str, OutputType]()
-    for out, path in zip(outs, outs_paths, strict=True):
-        if isinstance(out, outputs.Metric):
-            path_to_type[path] = "metric"
-        elif isinstance(out, outputs.Plot):
-            path_to_type[path] = "plot"
-        else:
-            path_to_type[path] = "out"
-
-    # Get old hashes from lock
-    old_hashes = dict[str, HashInfo]()
-    if lock_data and "output_hashes" in lock_data:
-        old_hashes = lock_data["output_hashes"]
-
-    # Compare each output
-    for path in outs_paths:
-        old_hash_info = old_hashes.get(path)
-        old_hash: str | None = None
-        if old_hash_info is not None:
-            old_hash = old_hash_info["hash"]
-
-        # Compute current hash
-        new_hash: str | None = None
-        path_obj = pathlib.Path(path)
-        try:
-            if path_obj.exists():
-                if path_obj.is_dir():
-                    new_hash, _ = cache.hash_directory(path_obj)
-                else:
-                    new_hash, _ = cache.hash_file(path_obj)
-        except OSError as e:
-            logger.debug("Failed to read %s for hashing: %s", path, e)
-            new_hash = None
-
-        # Determine change type
-        change_type: ChangeType | None = None
-        if old_hash is None and new_hash is not None:
-            change_type = ChangeType.ADDED
-        elif old_hash is not None and new_hash is None:
-            change_type = ChangeType.REMOVED
-        elif old_hash != new_hash and old_hash is not None and new_hash is not None:
-            change_type = ChangeType.MODIFIED
-        # else: both None or equal -> unchanged (None)
-
-        # Since path_to_type is dict[str, OutputType] and we provide "out" as default,
-        # this is already typed as OutputType (Literal["out", "metric", "plot"])
-        output_type: OutputType = path_to_type.get(path, "out")
-
-        changes.append(
-            OutputChange(
-                path=path,
-                old_hash=old_hash,
-                new_hash=new_hash,
-                change_type=change_type,
-                output_type=output_type,
-            )
-        )
-
-    return changes
 
 
 class _SelectableExpandablePanel(textual.containers.Horizontal):
@@ -400,13 +292,14 @@ class _SelectableExpandablePanel(textual.containers.Horizontal):
 
 
 class InputDiffPanel(_SelectableExpandablePanel):
-    """Panel showing input changes for a stage (code, deps, params)."""
+    """Panel showing input changes for a stage (code, deps, params).
 
-    # Cache for stage data to avoid recomputation on selection changes
+    Pure renderer — receives all data via set_from_snapshot(). Does not
+    compute explanations or access pivot internals directly.
+    """
+
     _stage_name: str | None
     _explanation: StageExplanation | None
-    _registry_info: RegistryStageInfo | None
-    _stage_data_provider: StageDataProvider | None
     # Dict-based storage for O(1) lookup by key/path
     _code_by_key: dict[str, CodeChange]
     _dep_by_path: dict[str, DepChange]
@@ -417,66 +310,25 @@ class InputDiffPanel(_SelectableExpandablePanel):
         *,
         id: str | None = None,
         classes: str | None = None,
-        stage_data_provider: StageDataProvider | None = None,
     ) -> None:
         super().__init__(
             id=id, classes="diff-panel" if classes is None else f"diff-panel {classes}"
         )
         self._explanation = None
-        self._registry_info = None
-        self._stage_data_provider = stage_data_provider
         self._code_by_key = dict[str, CodeChange]()
         self._dep_by_path = dict[str, DepChange]()
         self._param_by_key = dict[str, ParamChange]()
 
     @override
     def set_stage(self, stage_name: str | None) -> None:  # pragma: no cover
-        """Update the displayed stage and load data."""
+        """Update the displayed stage (resets state, no data loading)."""
         self._reset_selection_state()
         self._explanation = None
-        self._registry_info = None
         self._code_by_key.clear()
         self._dep_by_path.clear()
         self._param_by_key.clear()
         self._stage_name = stage_name
-
-        if stage_name is not None:
-            self._load_stage_data(stage_name)
-
         self._update_display()
-
-    def _load_stage_data(self, stage_name: str) -> None:
-        """Load and cache stage data."""
-        if self._stage_data_provider is None:
-            return
-
-        self._registry_info = _try_get_stage(self._stage_data_provider, stage_name)
-        if self._registry_info is None:
-            return
-
-        state_dir = config.get_state_dir()
-        try:
-            fingerprint = self._stage_data_provider.ensure_fingerprint(stage_name)
-            explanation = explain.get_stage_explanation(
-                stage_name=stage_name,
-                fingerprint=fingerprint,
-                deps=self._registry_info["deps_paths"],
-                outs_paths=self._registry_info["outs_paths"],
-                params_instance=self._registry_info["params"],
-                overrides=parameters.load_params_yaml(),
-                state_dir=state_dir,
-            )
-        except Exception:
-            logger.debug("Failed to load explanation for %s", stage_name, exc_info=True)
-            self._explanation = None
-            return
-
-        self._explanation = explanation
-
-        # Cache items as dicts for O(1) lookup
-        self._code_by_key = {c["key"]: c for c in explanation["code_changes"]}
-        self._dep_by_path = {c["path"]: c for c in explanation["dep_changes"]}
-        self._param_by_key = {c["key"]: c for c in explanation["param_changes"]}
 
     @override
     def _build_items(self) -> list[str]:  # pragma: no cover
@@ -490,11 +342,6 @@ class InputDiffPanel(_SelectableExpandablePanel):
         # Add dep items
         for path in self._dep_by_path:
             items.append(f"dep:{path}")
-
-        # Add unchanged deps if no changes
-        if not self._dep_by_path and self._registry_info:
-            for dep_path in self._registry_info["deps_paths"]:
-                items.append(f"dep:{dep_path}")
 
         # Add param items
         for key in self._param_by_key:
@@ -525,7 +372,7 @@ class InputDiffPanel(_SelectableExpandablePanel):
 
             case "dep":
                 change = self._find_dep_change(item_key)
-                rel_path = _get_relative_path(item_key)
+                # Paths from RPC events are already relative
                 if change:
                     indicator = _get_indicator(change["change_type"])
                     hash_display = _format_hash_change(
@@ -534,10 +381,10 @@ class InputDiffPanel(_SelectableExpandablePanel):
                         change["change_type"],
                     )
                     return (
-                        f"{prefix}{indicator} {_escape_padded(rel_path, 25)} {hash_display}{suffix}"
+                        f"{prefix}{indicator} {_escape_padded(item_key, 25)} {hash_display}{suffix}"
                     )
                 # Unchanged dep
-                return f"{prefix}{_INDICATOR_UNCHANGED} {_escape_padded(rel_path, 25)} (unchanged){suffix}"
+                return f"{prefix}{_INDICATOR_UNCHANGED} {_escape_padded(item_key, 25)} (unchanged){suffix}"
 
             case "param":
                 change = self._find_param_change(item_key)
@@ -602,13 +449,12 @@ class InputDiffPanel(_SelectableExpandablePanel):
     def _render_dep_detail(self, path: str) -> str:  # pragma: no cover
         """Render detail for a dependency change."""
         change = self._find_dep_change(path)
-        rel_path = _get_relative_path(path)
 
         if not change:
-            return f"[bold]{rich.markup.escape(rel_path)}[/]\n\n[dim]No changes[/]"
+            return f"[bold]{rich.markup.escape(path)}[/]\n\n[dim]No changes[/]"
 
         lines = [
-            f"[bold]{rich.markup.escape(rel_path)}[/]",
+            f"[bold]{rich.markup.escape(path)}[/]",
             "",
             "Type: Dependency",
             f"Status: {self._format_status(change['change_type'])}",
@@ -699,18 +545,15 @@ class InputDiffPanel(_SelectableExpandablePanel):
     def _render_empty_state(self) -> str:
         if self._stage_name is None:
             return "[dim]No stage selected[/]"
-        if self._registry_info is None:
-            return "[dim]Stage not in registry[/]"
         if self._explanation is None:
-            return "[dim]Error loading stage data[/]"
+            return "[dim]No data available[/]"
         return "[dim]No inputs[/]"
 
     def set_from_snapshot(self, snapshot: StageExplanation) -> None:
-        """Display pre-captured snapshot instead of computing from current state."""
+        """Display pre-captured snapshot — the ONLY way to populate the panel."""
         self._reset_selection_state()
         self._explanation = snapshot
         self._stage_name = snapshot["stage_name"]
-        self._registry_info = _try_get_stage(self._stage_data_provider, snapshot["stage_name"])
         self._code_by_key = {c["key"]: c for c in snapshot["code_changes"]}
         self._dep_by_path = {d["path"]: d for d in snapshot["dep_changes"]}
         self._param_by_key = {p["key"]: p for p in snapshot["param_changes"]}
@@ -718,72 +561,39 @@ class InputDiffPanel(_SelectableExpandablePanel):
 
 
 class OutputDiffPanel(_SelectableExpandablePanel):
-    """Panel showing output changes for a stage (outs, metrics, plots)."""
+    """Panel showing output changes for a stage (outs, metrics, plots).
 
-    # Cache for stage data
+    Pure renderer — receives all data via set_from_snapshot(). Does not
+    access lock files, cache, or registry directly.
+    """
+
     _stage_name: str | None
-    _registry_info: RegistryStageInfo | None
-    _stage_data_provider: StageDataProvider | None
     _stage_status: StageStatus | None
     # Dict-based storage for O(1) lookup by path
     _output_by_path: dict[str, OutputChange]
-    _metric_diff_cache: dict[str, list[MetricDiff]]
-    _head_hashes: dict[str, str | None] | None
 
     def __init__(
         self,
         *,
         id: str | None = None,
         classes: str | None = None,
-        stage_data_provider: StageDataProvider | None = None,
     ) -> None:
         super().__init__(
             id=id, classes="diff-panel" if classes is None else f"diff-panel {classes}"
         )
-        self._registry_info = None
-        self._stage_data_provider = stage_data_provider
         self._stage_status = None
         self._output_by_path = dict[str, OutputChange]()
-        self._metric_diff_cache = dict[str, list[MetricDiff]]()
-        self._head_hashes = None
 
     @override
     def set_stage(  # pragma: no cover
         self, stage_name: str | None, *, status: StageStatus | None = None
     ) -> None:
-        """Update the displayed stage and load data."""
+        """Update the displayed stage (resets state, no data loading)."""
         self._reset_selection_state()
-        self._registry_info = None
         self._stage_status = status
         self._output_by_path.clear()
-        self._metric_diff_cache.clear()
-        self._head_hashes = None
         self._stage_name = stage_name
-
-        if stage_name is not None:
-            self._load_stage_data(stage_name)
-
         self._update_display()
-
-    def _load_stage_data(self, stage_name: str) -> None:
-        """Load and cache stage data."""
-        if self._stage_data_provider is None:
-            return
-
-        self._registry_info = _try_get_stage(self._stage_data_provider, stage_name)
-        if self._registry_info is None:
-            return
-
-        state_dir = config.get_state_dir()
-        stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(state_dir))
-        try:
-            lock_data = stage_lock.read()
-        except Exception:
-            logger.debug("Failed to read lock data for %s", stage_name, exc_info=True)
-            lock_data = None
-
-        output_changes = compute_output_changes(lock_data, self._registry_info)
-        self._output_by_path = {c["path"]: c for c in output_changes}
 
     @override
     def _build_items(self) -> list[str]:  # pragma: no cover
@@ -806,18 +616,17 @@ class OutputDiffPanel(_SelectableExpandablePanel):
         change = self._find_output_change(item_path)
 
         if not change:
-            rel_path = _get_relative_path(item_path)
+            # Paths from RPC events are already relative
             return (
-                f"{prefix}{_INDICATOR_UNCHANGED} {_escape_padded(rel_path, 25)} (unknown){suffix}"
+                f"{prefix}{_INDICATOR_UNCHANGED} {_escape_padded(item_path, 25)} (unknown){suffix}"
             )
 
         indicator = _get_indicator(change["change_type"])
-        rel_path = _get_relative_path(change["path"])
         hash_display = _format_hash_change(
             change["old_hash"], change["new_hash"], change["change_type"]
         )
 
-        return f"{prefix}{indicator} {_escape_padded(rel_path, 25)} {hash_display}{suffix}"
+        return f"{prefix}{indicator} {_escape_padded(change['path'], 25)} {hash_display}{suffix}"
 
     @override
     def _render_detail_content(self, item_id: str) -> str:  # pragma: no cover
@@ -828,46 +637,26 @@ class OutputDiffPanel(_SelectableExpandablePanel):
         if not change:
             return "[dim]No changes[/]"
 
-        # When expanded, show data diff for data files with changes
-        if self._detail_expanded:
-            if self._is_data_file(item_path) and change["change_type"] is not None:
-                return self._render_data_diff(item_path, change)
-            # Non-data file or unchanged - show hash detail
-            return self._render_hash_detail(item_path, change)
-
-        # Split view (not expanded) - show summary
-        rel_path = _get_relative_path(item_path)
         # item_type is always one of OutputType values from _build_items
         item_type: OutputType = change["output_type"]
         type_label = self._get_type_label(item_type)
 
         lines = [
-            f"[bold]{rich.markup.escape(rel_path)}[/]",
+            f"[bold]{rich.markup.escape(change['path'])}[/]",
             "",
             f"Type: {type_label}",
             f"Status: {self._format_status(change['change_type'])}",
             "",
         ]
 
-        # For metrics, show detailed diff
-        if item_type == "metric" and change["change_type"] is not None:
-            metric_diffs = self._get_metric_diffs(item_path)
-            if metric_diffs:
-                lines.append("[bold]Metric Values:[/]")
-                for diff in metric_diffs:
-                    old_val = diff["old"]
-                    new_val = diff["new"]
-                    old_str = self._format_metric_value(old_val)
-                    new_str = self._format_metric_value(new_val)
-                    delta_str = self._format_metric_delta(old_val, new_val)
-                    lines.append(
-                        f"  {_escape_padded(diff['key'], 20)} {old_str} -> {new_str}  {delta_str}"
-                    )
-                lines.append("")
-
         self._append_hash_detail(
             lines, change["old_hash"], change["new_hash"], change["change_type"]
         )
+
+        # TODO: data-level diff via RPC (PivotClient.diff_output)
+        if self._detail_expanded and change["change_type"] is not None:
+            lines.append("")
+            lines.append("[dim]Data-level diff available via `pivot diff`[/]")
 
         return "\n".join(lines)
 
@@ -894,36 +683,6 @@ class OutputDiffPanel(_SelectableExpandablePanel):
             case _ as unreachable:  # pyright: ignore[reportUnnecessaryComparison]
                 assert_never(unreachable)
 
-    def _get_metric_diffs(self, path: str) -> list[MetricDiff]:  # pragma: no cover
-        """Get metric diffs for a path, using cache."""
-        # Normalize path for cache key (fallback to raw path if resolve fails)
-        try:
-            cache_key = str(pathlib.Path(path).resolve())
-        except OSError:
-            cache_key = path
-
-        if cache_key in self._metric_diff_cache:
-            return self._metric_diff_cache[cache_key]
-
-        # Load head hashes once per stage
-        if self._head_hashes is None:
-            try:
-                self._head_hashes = metrics_mod.get_metric_info_from_head()
-            except Exception:
-                self._head_hashes = {}
-
-        rel_path = _get_relative_path(path)
-
-        try:
-            head_metrics = metrics_mod.collect_metrics_from_head([rel_path], self._head_hashes)
-            current_metrics = metrics_mod.collect_metrics_from_files([path], tolerant=True)
-            diffs = metrics_mod.diff_metrics(head_metrics, current_metrics)
-        except Exception:
-            diffs = list[MetricDiff]()
-
-        self._metric_diff_cache[cache_key] = diffs
-        return diffs
-
     def _format_metric_value(self, value: MetricValue) -> str:
         """Format a metric value for display."""
         if value is None:
@@ -943,98 +702,6 @@ class OutputDiffPanel(_SelectableExpandablePanel):
                 return f"[dim]({sign}{delta:.4f})[/]"
             return f"[dim]({sign}{delta})[/]"
         return ""
-
-    def _is_data_file(self, path: str) -> bool:  # pragma: no cover
-        """Check if path is a supported data file format."""
-        return data_mod.detect_format(pathlib.Path(path)) != DataFileFormat.UNKNOWN
-
-    def _render_data_diff(self, item_path: str, change: OutputChange) -> str:  # pragma: no cover
-        """Render row-level diff. Temp file scoped to this call."""
-        rel_path = _get_relative_path(item_path)
-        old_hash = change["old_hash"]
-
-        # File added - no old version to compare
-        if old_hash is None:
-            return self._render_file_added(rel_path, change)
-
-        temp_path: pathlib.Path | None = None
-        try:
-            temp_path = data_mod.restore_data_from_cache(rel_path, old_hash)
-            if temp_path is None:
-                return self._render_hash_detail(item_path, change, cache_miss=True)
-
-            new_path = pathlib.Path(item_path)
-            if not new_path.exists():
-                # File removed
-                diff_result = data_mod.diff_data_files(temp_path, None, rel_path)
-            else:
-                diff_result = data_mod.diff_data_files(temp_path, new_path, rel_path)
-
-            return self._format_diff_result(diff_result, change)
-        except Exception as e:
-            return f"[red]Error computing diff: {rich.markup.escape(str(e))}[/]"
-        finally:
-            if temp_path:
-                temp_path.unlink(missing_ok=True)
-
-    def _render_file_added(self, rel_path: str, change: OutputChange) -> str:  # pragma: no cover
-        """Render detail for a newly added file."""
-        lines = [
-            f"[bold]{rich.markup.escape(rel_path)}[/]",
-            "",
-            f"Type: {self._get_type_label(change['output_type'])}",
-            "Status: [green]Added[/]",
-            "",
-        ]
-
-        # Try to get info about the new file
-        new_path = pathlib.Path(change["path"])
-        if new_path.exists():
-            try:
-                df = data_mod.load_dataframe(new_path)
-                lines.append(f"[bold]New File:[/] {len(df)} rows, {len(df.columns)} columns")
-                lines.append(
-                    f"[bold]Columns:[/] {', '.join(rich.markup.escape(str(c)) for c in df.columns[:10])}"
-                )
-                if len(df.columns) > 10:
-                    lines.append(f"  ... and {len(df.columns) - 10} more columns")
-            except Exception:
-                logger.debug("Failed to load dataframe for %s", new_path, exc_info=True)
-
-        lines.append("")
-        lines.append(f"New hash: {rich.markup.escape(str(change['new_hash'] or '(none)'))}")
-
-        return "\n".join(lines)
-
-    def _render_hash_detail(
-        self, item_path: str, change: OutputChange, *, cache_miss: bool = False
-    ) -> str:  # pragma: no cover
-        """Render hash-only detail for non-data files or when cache is unavailable."""
-        rel_path = _get_relative_path(item_path)
-        type_label = self._get_type_label(change["output_type"])
-
-        lines = [
-            f"[bold]{rich.markup.escape(rel_path)}[/]",
-            "",
-            f"Type: {type_label}",
-            f"Status: {self._format_status(change['change_type'])}",
-            "",
-        ]
-
-        if cache_miss:
-            lines.append("[dim]Old version not in cache. Run `pivot cache rebuild` to restore.[/]")
-            lines.append("")
-
-        old_hash = change["old_hash"] or "(none)"
-        new_hash = change["new_hash"] or "(none)"
-        lines.extend(
-            [
-                f"Old hash: {rich.markup.escape(str(old_hash))}",
-                f"New hash: {rich.markup.escape(str(new_hash))}",
-            ]
-        )
-
-        return "\n".join(lines)
 
     def _format_diff_result(
         self, result: DataDiffResult, change: OutputChange
@@ -1129,8 +796,6 @@ class OutputDiffPanel(_SelectableExpandablePanel):
     def _render_empty_state(self) -> str:
         if self._stage_name is None:
             return "[dim]No stage selected[/]"
-        if self._registry_info is None:
-            return "[dim]Stage not in registry[/]"
         # Show "running" message only if stage is actually in progress
         if self._stage_status == StageStatus.IN_PROGRESS:
             return "[dim]Stage running - output will appear when complete[/]"
@@ -1139,12 +804,9 @@ class OutputDiffPanel(_SelectableExpandablePanel):
     def set_from_snapshot(
         self, stage_name: str, changes: list[OutputChange], *, status: StageStatus | None = None
     ) -> None:
-        """Display pre-captured snapshot instead of computing from current state."""
+        """Display pre-captured snapshot — the ONLY way to populate the panel."""
         self._reset_selection_state()
         self._stage_name = stage_name
         self._stage_status = status
-        self._registry_info = _try_get_stage(self._stage_data_provider, stage_name)
         self._output_by_path = {c["path"]: c for c in changes}
-        self._metric_diff_cache.clear()  # Metric diffs not available for historical
-        self._head_hashes = None
         self._update_display()

@@ -7,17 +7,17 @@ resolving dependencies. Use `pivot repro` for DAG-aware execution.
 from __future__ import annotations
 
 import concurrent.futures
-import contextlib
 import datetime
+import logging
 import pathlib
 import threading
 import time
-import uuid
 from typing import TYPE_CHECKING
 
 import anyio
 import click
 
+from pivot import config
 from pivot.cli import _run_common, completion
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
@@ -37,6 +37,8 @@ from pivot.types import (
 if TYPE_CHECKING:
     from pivot.executor import ExecutionSummary
 
+
+_logger = logging.getLogger(__name__)
 
 # JSONL schema version for forward compatibility
 _JSONL_SCHEMA_VERSION = 1
@@ -78,7 +80,7 @@ def _run_with_tui(
 ) -> dict[str, ExecutionSummary] | None:
     """Run pipeline with TUI display.
 
-    Uses the same threading pattern as repro.py: background thread for engine,
+    Uses run_tui_with_engine helper: background thread for engine,
     main thread for TUI (required for signal handlers like SIGTSTP).
     """
     from pivot.executor import core as executor_core
@@ -90,81 +92,72 @@ def _run_with_tui(
             "The TUI requires the 'pivot-tui' package. Install it with: pip install 'pivot[tui]' or: uv pip install pivot-tui"
         ) from err
 
+    from pivot.engine.agent_rpc import AgentRpcHandler, AgentRpcSource, BroadcastEventSink
+
     # Pre-warm loky executor before starting Textual TUI.
     # Textual manipulates terminal file descriptors which breaks loky's
     # resource tracker if spawned after Textual starts.
     prepare_workers(len(stages_list))
 
-    # Cancel event allows TUI to signal executor to stop scheduling new stages
     cancel_event = threading.Event()
-
-    # Generate run_id for TUI tracking
-    run_id = str(uuid.uuid4())[:8]
-
     pipeline = cli_decorators.get_pipeline_from_context()
 
-    # Create TUI app (will run in main thread)
+    state_dir = config.get_state_dir()
+    socket_path = state_dir / "agent.sock"
+
     app = tui_run.PivotApp(
         stage_names=stages_list,
         tui_log=tui_log,
         cancel_event=cancel_event,
-        stage_data_provider=pipeline,
+        socket_path=socket_path,
     )
 
-    # Use Future for thread-safe result passing
     result_future: concurrent.futures.Future[dict[str, executor_core.ExecutionSummary]] = (
         concurrent.futures.Future()
     )
 
-    def engine_thread_target() -> None:
-        """Run the async Engine in a background thread with its own event loop."""
+    async def run_engine_fn(
+        socket_ready: threading.Event,
+    ) -> dict[str, executor_core.ExecutionSummary]:
+        async with engine.Engine(pipeline=pipeline) as eng:
+            result_sink = _run_common.configure_result_collector(eng)
+            _run_common.configure_output_sink(
+                eng,
+                quiet=False,
+                as_json=False,
+                use_console=False,
+                jsonl_callback=None,
+            )
 
-        async def engine_main() -> dict[str, executor_core.ExecutionSummary]:
-            async with engine.Engine(pipeline=pipeline) as eng:
-                # Configure sinks - TuiSink posts to app (thread-safe)
-                result_sink = _run_common.configure_result_collector(eng)
-                _run_common.configure_output_sink(
-                    eng,
-                    quiet=False,
-                    as_json=False,
-                    tui=True,
-                    app=app,
-                    run_id=run_id,
-                    use_console=False,
-                    jsonl_callback=None,
-                )
-                _configure_oneshot_source(
-                    eng,
-                    stages_list,
-                    force=force,
-                    no_commit=no_commit,
-                    on_error=on_error,
-                    allow_uncached_incremental=allow_uncached_incremental,
-                    checkout_missing=checkout_missing,
-                )
-                await eng.run(exit_on_completion=True)
-                stage_results = await result_sink.get_results()
-                return _run_common.convert_results(stage_results)
+            eng.add_sink(eng._event_buffer)  # pyright: ignore[reportPrivateUsage]
+            rpc_handler = AgentRpcHandler(
+                engine=eng,
+                event_buffer=eng._event_buffer,  # pyright: ignore[reportPrivateUsage]
+            )
+            eng.add_source(AgentRpcSource(socket_path=socket_path, handler=rpc_handler))
+            eng.add_sink(BroadcastEventSink())
 
-        try:
-            result_future.set_result(anyio.run(engine_main))
-        except BaseException as e:
-            result_future.set_exception(e)
-        finally:
-            # Signal TUI to exit when engine completes (success or failure)
-            with contextlib.suppress(Exception):
-                app.post_message(tui_run.TuiShutdown())
+            socket_ready.set()
 
-    # Start engine in background thread
-    engine_thread = threading.Thread(target=engine_thread_target, daemon=True)
-    engine_thread.start()
+            _configure_oneshot_source(
+                eng,
+                stages_list,
+                force=force,
+                no_commit=no_commit,
+                on_error=on_error,
+                allow_uncached_incremental=allow_uncached_incremental,
+                checkout_missing=checkout_missing,
+            )
+            await eng.run(exit_on_completion=True)
+            stage_results = await result_sink.get_results()
+            return _run_common.convert_results(stage_results)
 
-    # Run TUI in main thread (required for signal handlers)
-    with _run_common.suppress_stderr_logging():
-        app.run()
-
-    # Wait for engine thread to finish (should be quick since TUI already exited)
-    engine_thread.join(timeout=5.0)
+    _run_common.run_tui_with_engine(
+        app,
+        run_engine_fn,
+        socket_path,
+        result_future=result_future,
+    )
 
     # Return results (re-raises if engine raised an exception)
     if result_future.done():
@@ -199,9 +192,6 @@ def _run_json_mode(
                 eng,
                 quiet=False,
                 as_json=True,
-                tui=False,
-                app=None,
-                run_id=None,
                 use_console=False,
                 jsonl_callback=cli_helpers.emit_jsonl,
             )
@@ -277,9 +267,6 @@ def _run_plain_mode(
                 eng,
                 quiet=quiet,
                 as_json=False,
-                tui=False,
-                app=None,
-                run_id=None,
                 use_console=console is not None,
                 jsonl_callback=None,
                 show_output=show_output,

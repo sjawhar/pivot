@@ -16,7 +16,7 @@ from pivot import explain as explain_mod
 from pivot import parameters
 from pivot.config import io as config_io
 from pivot.engine.types import CancelRequested, EngineState, OutputEvent, RunRequested
-from pivot.types import OnError, StageExplanation
+from pivot.types import DataDiffResult, OnError, StageExplanation
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -31,6 +31,7 @@ __all__ = [
     "AgentRpcHandler",
     "AgentRpcSource",
     "BroadcastEventSink",
+    "CommitResult",
     "EventBuffer",
     "EventsResult",
     "VersionedEvent",
@@ -125,8 +126,21 @@ class QueryStageInfoResult(TypedDict):
     outs: list[str]
 
 
+class CommitResult(TypedDict):
+    """Result type for the 'commit' query."""
+
+    committed: list[str]
+    failed: list[str]
+
+
 type QueryResult = (
-    QueryStatusResult | QueryStagesResult | EventsResult | StageExplanation | QueryStageInfoResult
+    QueryStatusResult
+    | QueryStagesResult
+    | EventsResult
+    | StageExplanation
+    | QueryStageInfoResult
+    | CommitResult
+    | DataDiffResult
 )
 
 
@@ -196,6 +210,7 @@ class AgentRpcHandler:
 
     _engine: Engine
     _event_buffer: EventBuffer | None
+    _on_error: OnError
 
     def __init__(
         self,
@@ -205,6 +220,7 @@ class AgentRpcHandler:
     ) -> None:
         self._engine = engine
         self._event_buffer = event_buffer
+        self._on_error = OnError.FAIL
 
     def validate_stages(self, stages: list[str] | None) -> str | None:
         """Validate stage names exist. Returns error message or None if valid."""
@@ -285,6 +301,15 @@ class AgentRpcHandler:
                     )
 
                 return await anyio.to_thread.run_sync(_get_explanation)  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType, reportUnknownVariableType] - anyio stub issue
+            case "commit":
+
+                def _do_commit() -> CommitResult:
+                    from pivot.executor import commit as commit_mod
+
+                    committed, failed = commit_mod.commit_stages()
+                    return CommitResult(committed=committed, failed=failed)
+
+                return await anyio.to_thread.run_sync(_do_commit)  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType, reportUnknownVariableType] - anyio stub issue
             case "stage_info":
                 stage, reg_info = self._get_stage_info(params)
                 return QueryStageInfoResult(
@@ -292,6 +317,47 @@ class AgentRpcHandler:
                     deps=reg_info["deps_paths"],
                     outs=reg_info["outs_paths"],
                 )
+            case "diff_output":
+                path = params.get("path")
+                old_hash = params.get("old_hash")
+                new_hash = params.get("new_hash")
+                if not isinstance(path, str):
+                    raise ValueError("path must be string")
+                if old_hash is not None and not isinstance(old_hash, str):
+                    raise ValueError("old_hash must be string or null")
+                if new_hash is not None and not isinstance(new_hash, str):
+                    raise ValueError("new_hash must be string or null")
+
+                max_rows = params.get("max_rows", 50)
+                if not isinstance(max_rows, int) or isinstance(max_rows, bool):
+                    max_rows = 50
+
+                # Capture validated locals for closure
+                _path = path
+                _old_hash = old_hash
+                _new_hash = new_hash
+                _max_rows = max_rows
+
+                def _compute_diff() -> DataDiffResult:
+                    from pivot.show import data as data_mod
+
+                    old_path_file = None
+                    new_path_file = None
+                    try:
+                        if _old_hash:
+                            old_path_file = data_mod.restore_data_from_cache(_path, _old_hash)
+                        if _new_hash:
+                            new_path_file = data_mod.restore_data_from_cache(_path, _new_hash)
+                        return data_mod.diff_data_files(
+                            old_path_file, new_path_file, _path, max_rows=_max_rows
+                        )
+                    finally:
+                        if old_path_file:
+                            old_path_file.unlink(missing_ok=True)
+                        if new_path_file:
+                            new_path_file.unlink(missing_ok=True)
+
+                return await anyio.to_thread.run_sync(_compute_diff)  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType, reportUnknownVariableType] - anyio stub issue
             case _:
                 raise ValueError(f"Unknown query method: {method}")
 
@@ -438,6 +504,12 @@ class AgentRpcSource:
                 if validation_error:
                     return _json_rpc_error(_ERR_STAGE_NOT_FOUND, validation_error, request_id)
 
+            # Use stored on_error from handler if available, otherwise default to FAIL
+            on_error = (
+                self._handler._on_error  # pyright: ignore[reportPrivateUsage]
+                if self._handler is not None and hasattr(self._handler, "_on_error")
+                else OnError.FAIL
+            )
             event = RunRequested(
                 type="run_requested",
                 stages=stages,
@@ -447,7 +519,7 @@ class AgentRpcSource:
                 parallel=True,
                 max_workers=None,
                 no_commit=False,
-                on_error=OnError.FAIL,
+                on_error=on_error,
                 cache_dir=None,
                 allow_uncached_incremental=False,
                 checkout_missing=False,
@@ -458,6 +530,22 @@ class AgentRpcSource:
         if method == "cancel":
             await send.send(CancelRequested(type="cancel_requested"))
             return _json_rpc_response("accepted", request_id)
+
+        if method == "set_on_error":
+            mode = params.get("mode")
+            if not isinstance(mode, str):
+                return _json_rpc_error(-32602, "Invalid params: mode must be string", request_id)
+            try:
+                on_error = OnError(mode)
+            except ValueError:
+                valid_modes = ", ".join(m.value for m in OnError)
+                return _json_rpc_error(
+                    -32602, f"Invalid params: mode must be one of: {valid_modes}", request_id
+                )
+            # Store on handler for use in future runs
+            if self._handler is not None:
+                self._handler._on_error = on_error  # pyright: ignore[reportPrivateUsage]
+            return _json_rpc_response(True, request_id)
 
         # Queries handled by handler (if available)
         if self._handler is not None:

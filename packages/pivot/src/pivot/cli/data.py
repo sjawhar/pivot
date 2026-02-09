@@ -125,7 +125,7 @@ def diff(
                 with contextlib.suppress(OSError):
                     temp_file.unlink(missing_ok=True)
     else:
-        # Launch TUI
+        # Launch TUI — compute diffs first, then pass to TUI
         try:
             from pivot_tui import diff as data_tui
         except ImportError as err:
@@ -133,11 +133,36 @@ def diff(
                 "The TUI requires the 'pivot-tui' package. Install it with: pip install 'pivot[tui]' or: uv pip install pivot-tui"
             ) from err
 
-        data_tui.run_diff_app(
-            diff_entries=hash_diffs,
-            key_cols=key_columns,
-            max_rows=max_rows,
-        )
+        diff_results = list[DataDiffResult]()
+        temp_files = list[pathlib.Path]()
+        try:
+            for diff_entry in hash_diffs:
+                rel_path = diff_entry["path"]
+                abs_path = proj_root / rel_path
+                old_hash = diff_entry["old_hash"]
+
+                tui_old_path: pathlib.Path | None = None
+                if old_hash is not None:
+                    tui_old_path = data_module.restore_data_from_cache(rel_path, old_hash)
+                    if tui_old_path is not None:
+                        temp_files.append(tui_old_path)
+                new_path = abs_path if abs_path.exists() else None
+
+                effective_keys = None if positional else key_columns
+                result = data_module.diff_data_files(
+                    old_path=tui_old_path,
+                    new_path=new_path,
+                    path_display=rel_path,
+                    key_columns=effective_keys,
+                    max_rows=max_rows,
+                )
+                diff_results.append(result)
+
+            data_tui.run_diff_app(diff_results)
+        finally:
+            for temp_file in temp_files:
+                with contextlib.suppress(OSError):
+                    temp_file.unlink(missing_ok=True)
 
 
 @cli_decorators.pivot_command(auto_discover=False)

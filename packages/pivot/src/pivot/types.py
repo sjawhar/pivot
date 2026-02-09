@@ -569,6 +569,8 @@ class TuiStatusMessage(TypedDict):
     reason: str
     elapsed: float | None
     run_id: str
+    explanation: NotRequired[StageExplanation | None]
+    output_summary: NotRequired[list[dict[str, object]] | None]
 
 
 class TuiWatchMessage(TypedDict):
