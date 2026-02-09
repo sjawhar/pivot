@@ -178,4 +178,4 @@ def get_effective_params(
         return {}
 
     effective = apply_overrides(params_instance, stage_name, overrides)
-    return effective.model_dump()
+    return effective.model_dump(mode="json")

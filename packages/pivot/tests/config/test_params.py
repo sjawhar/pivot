@@ -39,6 +39,11 @@ class ComplexParams(BaseModel):
     debug: bool = False
 
 
+class TupleParams(BaseModel):
+    token_range: tuple[float, float] = (5000.0, 100000000.0)
+    time_buckets: list[tuple[int, int]] = [(1, 15), (16, 60), (60, 240)]
+
+
 # -----------------------------------------------------------------------------
 # load_params_yaml tests
 # -----------------------------------------------------------------------------
@@ -168,6 +173,21 @@ def test_get_effective_params_with_instance() -> None:
     instance = TrainParams(learning_rate=0.05, epochs=50)
     params_dict = parameters.get_effective_params(instance, "train", None)
     assert params_dict == {"learning_rate": 0.05, "epochs": 50, "batch_size": 32}
+
+
+def test_get_effective_params_normalizes_tuples_to_lists() -> None:
+    """get_effective_params converts tuples to lists via model_dump(mode='json')."""
+    instance = TupleParams()
+    result = parameters.get_effective_params(instance, "plot", None)
+
+    # Top-level tuple should be converted to list
+    assert isinstance(result["token_range"], list), "token_range should be a list"
+    assert result["token_range"] == [5000.0, 100000000.0]
+
+    # Nested tuples in list should be converted to lists
+    assert isinstance(result["time_buckets"], list), "time_buckets should be a list"
+    assert isinstance(result["time_buckets"][0], list), "time_buckets[0] should be a list"
+    assert result["time_buckets"] == [[1, 15], [16, 60], [60, 240]]
 
 
 # -----------------------------------------------------------------------------
