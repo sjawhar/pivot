@@ -120,6 +120,21 @@ def test_s3_remote_init_invalid_url() -> None:
         remote_mod.S3Remote("not-an-s3-url")
 
 
+@pytest.mark.parametrize(
+    "input_url,expected_url",
+    [
+        pytest.param("s3://bucket/prefix", "s3://bucket/prefix", id="basic_prefix"),
+        pytest.param("s3://bucket", "s3://bucket", id="no_prefix"),
+        pytest.param("s3://bucket/path/to/cache", "s3://bucket/path/to/cache", id="nested_prefix"),
+        pytest.param("s3://bucket/prefix/", "s3://bucket/prefix", id="trailing_slash_stripped"),
+    ],
+)
+def test_s3_remote_url_normalization(input_url: str, expected_url: str) -> None:
+    """S3Remote.url property normalizes URLs consistently."""
+    r = remote_mod.S3Remote(input_url)
+    assert r.url == expected_url, f"URL normalization failed for {input_url}"
+
+
 # -----------------------------------------------------------------------------
 # Hash to Key Conversion Tests
 # -----------------------------------------------------------------------------

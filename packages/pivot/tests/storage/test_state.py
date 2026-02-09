@@ -639,6 +639,77 @@ def test_remote_hashes_persistence(tmp_path: pathlib.Path) -> None:
         assert db.remote_hash_exists("origin", "persistent_hash")
 
 
+def test_remote_get_url_returns_none_for_unknown(tmp_path: pathlib.Path) -> None:
+    """remote_get_url returns None for untracked remote."""
+    db_path = tmp_path / "state.db"
+
+    with state.StateDB(db_path) as db:
+        result = db.remote_get_url("unknown")
+
+    assert result is None
+
+
+def test_remote_set_url_and_get_url_roundtrip(tmp_path: pathlib.Path) -> None:
+    """remote_set_url stores URL and remote_get_url retrieves it."""
+    db_path = tmp_path / "state.db"
+    test_url = "s3://my-bucket/prefix"
+
+    with state.StateDB(db_path) as db:
+        db.remote_set_url("origin", test_url)
+        result = db.remote_get_url("origin")
+
+    assert result == test_url
+
+
+def test_remote_set_url_overwrites_existing(tmp_path: pathlib.Path) -> None:
+    """remote_set_url overwrites previously stored URL."""
+    db_path = tmp_path / "state.db"
+
+    with state.StateDB(db_path) as db:
+        db.remote_set_url("origin", "s3://old-bucket")
+        db.remote_set_url("origin", "s3://new-bucket")
+        result = db.remote_get_url("origin")
+
+    assert result == "s3://new-bucket"
+
+
+def test_remote_url_persistence(tmp_path: pathlib.Path) -> None:
+    """Remote URLs persist across DB instances."""
+    db_path = tmp_path / "state.db"
+    test_url = "s3://persistent-bucket/path"
+
+    with state.StateDB(db_path) as db:
+        db.remote_set_url("origin", test_url)
+
+    with state.StateDB(db_path) as db:
+        assert db.remote_get_url("origin") == test_url
+
+
+def test_remote_index_clear_also_deletes_url(tmp_path: pathlib.Path) -> None:
+    """remote_index_clear also deletes the remote URL entry."""
+    db_path = tmp_path / "state.db"
+
+    with state.StateDB(db_path) as db:
+        db.remote_set_url("origin", "s3://bucket")
+        db.remote_hashes_add("origin", ["hash1"])
+        db.remote_index_clear("origin")
+
+        assert db.remote_get_url("origin") is None
+        assert not db.remote_hash_exists("origin", "hash1")
+
+
+def test_remote_urls_different_remotes_independent(tmp_path: pathlib.Path) -> None:
+    """Different remotes have independent URL storage."""
+    db_path = tmp_path / "state.db"
+
+    with state.StateDB(db_path) as db:
+        db.remote_set_url("origin", "s3://origin-bucket")
+        db.remote_set_url("backup", "s3://backup-bucket")
+
+        assert db.remote_get_url("origin") == "s3://origin-bucket"
+        assert db.remote_get_url("backup") == "s3://backup-bucket"
+
+
 # -----------------------------------------------------------------------------
 # Readonly mode tests
 # -----------------------------------------------------------------------------
@@ -769,6 +840,20 @@ def test_readonly_blocks_remote_index_clear(tmp_path: pathlib.Path) -> None:
         pytest.raises(RuntimeError, match="readonly StateDB"),
     ):
         db.remote_index_clear("origin")
+
+
+def test_readonly_blocks_remote_set_url(tmp_path: pathlib.Path) -> None:
+    """Readonly mode blocks remote_set_url operation."""
+    db_path = tmp_path / "state.db"
+
+    with state.StateDB(db_path) as db:
+        pass  # Just create
+
+    with (
+        state.StateDB(db_path, readonly=True) as db,
+        pytest.raises(RuntimeError, match="readonly StateDB"),
+    ):
+        db.remote_set_url("origin", "s3://bucket")
 
 
 # -----------------------------------------------------------------------------

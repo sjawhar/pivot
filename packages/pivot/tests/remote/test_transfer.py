@@ -887,3 +887,150 @@ async def test_pull_async_with_deps_integration(
     assert out_path.read_bytes() == b"main_file"
     assert dep_path.read_bytes() == b"dependency_file"
     state_db.close()
+
+
+# -----------------------------------------------------------------------------
+# URL Change Detection Tests
+# -----------------------------------------------------------------------------
+
+
+async def test_push_url_change_clears_index(lock_project: Path, mocker: MockerFixture) -> None:
+    """Push detects URL change and clears index."""
+
+    cache_dir = lock_project / ".pivot" / "cache"
+    state_dir = lock_project / ".pivot"
+    files_dir = cache_dir / "files"
+
+    hash1 = "ab" + "c" * 14
+    (files_dir / "ab").mkdir(parents=True)
+    (files_dir / "ab" / ("c" * 14)).write_text("content1")
+
+    mock_remote = mocker.Mock(spec=remote_mod.S3Remote)
+    mock_remote.url = "s3://bucket/new-prefix"
+    mock_state = mocker.Mock(spec=state_mod.StateDB)
+    mock_state.remote_get_url.return_value = "s3://bucket/old-prefix"
+    mock_state.remote_hashes_intersection.return_value = set()
+    mock_remote.bulk_exists = mocker.AsyncMock(return_value={hash1: False})
+    mock_remote.upload_batch = mocker.AsyncMock(
+        return_value=[TransferResult(hash=hash1, success=True)]
+    )
+
+    await transfer._push_async(cache_dir, state_dir, mock_remote, mock_state, "origin")
+
+    mock_state.remote_index_clear.assert_called_once_with("origin")
+    mock_state.remote_set_url.assert_called_once_with("origin", "s3://bucket/new-prefix")
+
+
+async def test_push_first_use_sets_url_without_clear(
+    lock_project: Path, mocker: MockerFixture
+) -> None:
+    """Push on first use sets URL without clearing."""
+
+    cache_dir = lock_project / ".pivot" / "cache"
+    state_dir = lock_project / ".pivot"
+    files_dir = cache_dir / "files"
+
+    hash1 = "ab" + "c" * 14
+    (files_dir / "ab").mkdir(parents=True)
+    (files_dir / "ab" / ("c" * 14)).write_text("content1")
+
+    mock_remote = mocker.Mock(spec=remote_mod.S3Remote)
+    mock_remote.url = "s3://bucket/prefix"
+    mock_state = mocker.Mock(spec=state_mod.StateDB)
+    mock_state.remote_get_url.return_value = None
+    mock_state.remote_hashes_intersection.return_value = set()
+    mock_remote.bulk_exists = mocker.AsyncMock(return_value={hash1: False})
+    mock_remote.upload_batch = mocker.AsyncMock(
+        return_value=[TransferResult(hash=hash1, success=True)]
+    )
+
+    await transfer._push_async(cache_dir, state_dir, mock_remote, mock_state, "origin")
+
+    mock_state.remote_set_url.assert_called_once_with("origin", "s3://bucket/prefix")
+    mock_state.remote_index_clear.assert_not_called()
+
+
+async def test_push_same_url_no_clear(lock_project: Path, mocker: MockerFixture) -> None:
+    """Push with same URL does not clear index."""
+
+    cache_dir = lock_project / ".pivot" / "cache"
+    state_dir = lock_project / ".pivot"
+    files_dir = cache_dir / "files"
+
+    hash1 = "ab" + "c" * 14
+    (files_dir / "ab").mkdir(parents=True)
+    (files_dir / "ab" / ("c" * 14)).write_text("content1")
+
+    mock_remote = mocker.Mock(spec=remote_mod.S3Remote)
+    mock_remote.url = "s3://bucket/prefix"
+    mock_state = mocker.Mock(spec=state_mod.StateDB)
+    mock_state.remote_get_url.return_value = "s3://bucket/prefix"
+    mock_state.remote_hashes_intersection.return_value = set()
+    mock_remote.bulk_exists = mocker.AsyncMock(return_value={hash1: False})
+    mock_remote.upload_batch = mocker.AsyncMock(
+        return_value=[TransferResult(hash=hash1, success=True)]
+    )
+
+    await transfer._push_async(cache_dir, state_dir, mock_remote, mock_state, "origin")
+
+    mock_state.remote_index_clear.assert_not_called()
+    mock_state.remote_set_url.assert_not_called()
+
+
+async def test_pull_url_change_clears_index(lock_project: Path, mocker: MockerFixture) -> None:
+    """Pull detects URL change and clears index."""
+
+    cache_dir = lock_project / ".pivot" / "cache"
+    state_dir = lock_project / ".pivot"
+    (cache_dir / "files").mkdir(parents=True)
+
+    mock_remote = mocker.Mock(spec=remote_mod.S3Remote)
+    mock_remote.url = "s3://bucket/new-prefix"
+    mock_remote.list_hashes = mocker.AsyncMock(return_value=set())
+    mock_state = mocker.Mock(spec=state_mod.StateDB)
+    mock_state.remote_get_url.return_value = "s3://bucket/old-prefix"
+
+    await transfer._pull_async(cache_dir, state_dir, mock_remote, mock_state, "origin")
+
+    mock_state.remote_index_clear.assert_called_once_with("origin")
+    mock_state.remote_set_url.assert_called_once_with("origin", "s3://bucket/new-prefix")
+
+
+async def test_pull_first_use_sets_url_without_clear(
+    lock_project: Path, mocker: MockerFixture
+) -> None:
+    """Pull on first use sets URL without clearing."""
+
+    cache_dir = lock_project / ".pivot" / "cache"
+    state_dir = lock_project / ".pivot"
+    (cache_dir / "files").mkdir(parents=True)
+
+    mock_remote = mocker.Mock(spec=remote_mod.S3Remote)
+    mock_remote.url = "s3://bucket/prefix"
+    mock_remote.list_hashes = mocker.AsyncMock(return_value=set())
+    mock_state = mocker.Mock(spec=state_mod.StateDB)
+    mock_state.remote_get_url.return_value = None
+
+    await transfer._pull_async(cache_dir, state_dir, mock_remote, mock_state, "origin")
+
+    mock_state.remote_set_url.assert_called_once_with("origin", "s3://bucket/prefix")
+    mock_state.remote_index_clear.assert_not_called()
+
+
+async def test_pull_same_url_no_clear(lock_project: Path, mocker: MockerFixture) -> None:
+    """Pull with same URL does not clear index."""
+
+    cache_dir = lock_project / ".pivot" / "cache"
+    state_dir = lock_project / ".pivot"
+    (cache_dir / "files").mkdir(parents=True)
+
+    mock_remote = mocker.Mock(spec=remote_mod.S3Remote)
+    mock_remote.url = "s3://bucket/prefix"
+    mock_remote.list_hashes = mocker.AsyncMock(return_value=set())
+    mock_state = mocker.Mock(spec=state_mod.StateDB)
+    mock_state.remote_get_url.return_value = "s3://bucket/prefix"
+
+    await transfer._pull_async(cache_dir, state_dir, mock_remote, mock_state, "origin")
+
+    mock_state.remote_index_clear.assert_not_called()
+    mock_state.remote_set_url.assert_not_called()

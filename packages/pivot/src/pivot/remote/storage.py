@@ -301,6 +301,13 @@ class S3Remote:
     def prefix(self) -> str:
         return self._prefix
 
+    @property
+    def url(self) -> str:
+        """Normalized S3 URL for identity comparison."""
+        if self._prefix:
+            return f"s3://{self._bucket}/{self._prefix.rstrip('/')}"
+        return f"s3://{self._bucket}"
+
     async def exists(self, cache_hash: str) -> bool:
         """Check if hash exists on remote via HEAD request."""
         from botocore import exceptions as botocore_exc

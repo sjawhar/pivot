@@ -24,6 +24,7 @@ _HASH_PREFIX = b"hash:"  # File hash entries
 _GEN_PREFIX = b"gen:"  # Output generation counters
 _DEP_PREFIX = b"dep:"  # Stage dependency generations
 _REMOTE_PREFIX = b"remote:"  # Remote index entries
+_REMOTE_URL_PREFIX = b"remote_url:"  # Remote URL tracking
 _RUN_PREFIX = b"run:"  # Run history entries
 _RUNCACHE_PREFIX = b"runcache:"  # Run cache entries for skip detection
 _FP_PREFIX = b"fp:"  # AST fingerprint/hash cache entries
@@ -527,8 +528,30 @@ class StateDB:
                 key = prefix + hash_.encode()
                 txn.delete(key)
 
+    def remote_get_url(self, remote_name: str) -> str | None:
+        """Get stored URL for a remote. Returns None if not tracked."""
+        self._check_closed()
+        key = _REMOTE_URL_PREFIX + remote_name.encode()
+        with self._env.begin() as txn:
+            value = txn.get(key)
+        if value is None:
+            return None
+        return value.decode("utf-8")
+
+    def remote_set_url(self, remote_name: str, url: str) -> None:
+        """Store URL for a remote."""
+        self._check_closed()
+        self._check_write_allowed()
+        key = _REMOTE_URL_PREFIX + remote_name.encode()
+        value = url.encode("utf-8")
+        try:
+            with self._env.begin(write=True) as txn:
+                txn.put(key, value)
+        except lmdb.MapFullError as e:
+            raise DatabaseFullError(_DB_FULL_MSG) from e
+
     def remote_index_clear(self, remote_name: str) -> None:
-        """Clear all index entries for a remote (force re-indexing)."""
+        """Clear all index entries and stored URL for a remote (force re-indexing)."""
         self._check_closed()
         self._check_write_allowed()
         prefix = _REMOTE_PREFIX + remote_name.encode() + b":"
@@ -542,6 +565,9 @@ class StateDB:
                     keys_to_delete.append(key)
             for key in keys_to_delete:
                 txn.delete(key)
+            # Also delete the remote URL entry
+            url_key = _REMOTE_URL_PREFIX + remote_name.encode()
+            txn.delete(url_key)
 
     # -------------------------------------------------------------------------
     # Run history for tracking pipeline executions

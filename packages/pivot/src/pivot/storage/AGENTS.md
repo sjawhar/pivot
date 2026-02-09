@@ -31,6 +31,7 @@ StateDB uses key prefixes for namespacing. Current prefixes in `pivot/storage/st
 | `sm:` | Fingerprint manifest cache (stage manifests + source maps) |
 | `run:` | Run history entries |
 | `remote:` | Remote index entries |
+| `remote_url:` | Remote URL tracking for change detection |
 | `fp:` | AST fingerprint/hash cache entries |
 
 **When adding new state types**, define a new prefix constant and document it here.

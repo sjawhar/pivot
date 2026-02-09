@@ -228,6 +228,30 @@ def get_target_hashes(
     return hashes
 
 
+def _check_remote_url(
+    state_db: state_mod.StateDB,
+    remote_name: str,
+    remote: remote_mod.S3Remote,
+) -> None:
+    """Detect remote URL change and clear stale index."""
+    current_url = remote.url
+    stored_url = state_db.remote_get_url(remote_name)
+    if stored_url is None:
+        # First use — record URL, don't clear (fail-open)
+        state_db.remote_set_url(remote_name, current_url)
+    elif stored_url != current_url:
+        logger.warning(
+            "Remote '%s' URL changed (%s → %s), clearing cached index",
+            remote_name,
+            stored_url,
+            current_url,
+        )
+        state_db.remote_index_clear(remote_name)
+        state_db.remote_set_url(remote_name, current_url)
+    else:
+        logger.debug("Remote '%s' URL unchanged: %s", remote_name, current_url)
+
+
 async def compare_status(
     local_hashes: set[str],
     remote: remote_mod.S3Remote,
@@ -272,6 +296,8 @@ async def _push_async(
     """Push cache files to remote (async implementation)."""
     _t = metrics.start()
     jobs = jobs if jobs is not None else config.get_remote_jobs()
+
+    _check_remote_url(state_db, remote_name, remote)
 
     if targets:
         local_hashes = get_target_hashes(
@@ -360,6 +386,8 @@ async def _pull_async(
     """Pull cache files from remote (async implementation)."""
     _t = metrics.start()
     jobs = jobs if jobs is not None else config.get_remote_jobs()
+
+    _check_remote_url(state_db, remote_name, remote)
 
     if targets:
         needed_hashes = get_target_hashes(
