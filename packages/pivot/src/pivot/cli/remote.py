@@ -1,16 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import pathlib
 
 import click
 
-from pivot import config
+from pivot import config, project
 from pivot.cli import completion
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
 from pivot.remote import config as remote_config
 from pivot.remote import sync as transfer
-from pivot.storage import state
+from pivot.storage import state, track
 
 
 @click.group()
@@ -38,6 +39,39 @@ def remote_list() -> None:
 def _get_targets_list(targets: tuple[str, ...]) -> list[str] | None:
     """Convert targets tuple to list, or None if empty."""
     return list(targets) if targets else None
+
+
+def _normalize_cli_targets(
+    targets: tuple[str, ...],
+    known_stages: set[str] | None = None,
+) -> tuple[str, ...]:
+    """Normalize CLI file targets by resolving from cwd and stripping .pvt suffixes.
+
+    Stage names (matched against known_stages) are passed through unchanged.
+    File paths are resolved relative to cwd (not project root) and .pvt
+    suffixes are stripped to get the data file path.
+    """
+    normalized = list[str]()
+    project_root = project.get_project_root()
+
+    for target in targets:
+        if known_stages is not None and target in known_stages:
+            normalized.append(target)
+            continue
+
+        original = target
+        target_path = pathlib.Path(target)
+        if target_path.suffix == ".pvt":
+            target = str(track.get_data_path(target_path))
+
+        normalized_path = project.normalize_path(target, base=pathlib.Path.cwd())
+
+        if not normalized_path.is_relative_to(project_root):
+            raise click.ClickException(f"Target '{original}' resolves outside project root")
+
+        normalized.append(str(normalized_path))
+
+    return tuple(normalized)
 
 
 @cli_decorators.pivot_command(allow_all=True)
@@ -70,7 +104,9 @@ def push(
     pipeline = cli_decorators.get_pipeline_from_context()
     all_stages = cli_helpers.get_all_stages() if pipeline is not None else None
 
-    targets_list = _get_targets_list(targets)
+    stage_names = set(all_stages) if all_stages is not None else None
+    normalized = _normalize_cli_targets(targets, known_stages=stage_names)
+    targets_list = _get_targets_list(normalized)
 
     if targets_list:
         local_hashes = transfer.get_target_hashes(
@@ -157,7 +193,9 @@ def fetch(
     pipeline = cli_decorators.get_pipeline_from_context()
     all_stages = cli_helpers.get_all_stages() if pipeline is not None else None
 
-    targets_list = _get_targets_list(targets)
+    stage_names = set(all_stages) if all_stages is not None else None
+    normalized = _normalize_cli_targets(targets, known_stages=stage_names)
+    targets_list = _get_targets_list(normalized)
 
     if dry_run:
         if targets_list:
@@ -255,7 +293,9 @@ def pull(
     pipeline = cli_decorators.get_pipeline_from_context()
     all_stages = cli_helpers.get_all_stages() if pipeline is not None else None
 
-    targets_list = _get_targets_list(targets)
+    stage_names = set(all_stages) if all_stages is not None else None
+    normalized = _normalize_cli_targets(targets, known_stages=stage_names)
+    targets_list = _get_targets_list(normalized)
 
     # Fail early if no pipeline and no targets specified (unless --all was used)
     use_all = cli_decorators.get_all_pipelines_from_context()
@@ -320,7 +360,7 @@ def pull(
 
     ctx.invoke(
         checkout_mod.checkout,
-        targets=targets,
+        targets=normalized,
         checkout_mode=checkout_mode,
         force=force,
         only_missing=only_missing,

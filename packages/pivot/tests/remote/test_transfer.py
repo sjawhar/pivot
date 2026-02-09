@@ -19,7 +19,21 @@ if TYPE_CHECKING:
     from pytest_mock import MockerFixture
     from types_aiobotocore_s3 import S3Client
 
+    from pivot.registry import RegistryStageInfo
     from tests.conftest import ValidLockContentFactory
+
+
+def _helper_make_all_stages(*stage_names: str) -> dict[str, RegistryStageInfo]:
+    """Create minimal all_stages dict with only the fields get_target_hashes reads."""
+    from pivot.registry import RegistryStageInfo
+
+    return {
+        name: RegistryStageInfo(  # pyright: ignore[reportCallIssue] - partial for test
+            state_dir=None,
+            outs=[],
+        )
+        for name in stage_names
+    }
 
 
 # -----------------------------------------------------------------------------
@@ -415,7 +429,13 @@ async def test_push_async_with_stages(
     )
 
     result = await transfer._push_async(
-        cache_dir, state_dir, mock_remote, mock_state, "origin", targets=["my_stage"]
+        cache_dir,
+        state_dir,
+        mock_remote,
+        mock_state,
+        "origin",
+        targets=["my_stage"],
+        all_stages=_helper_make_all_stages("my_stage"),
     )
 
     assert result["transferred"] == 1
@@ -466,7 +486,13 @@ async def test_pull_async_all_already_local(
     mock_state = mocker.Mock(spec=state_mod.StateDB)
 
     result = await transfer._pull_async(
-        cache_dir, state_dir, mock_remote, mock_state, "origin", targets=["my_stage"]
+        cache_dir,
+        state_dir,
+        mock_remote,
+        mock_state,
+        "origin",
+        targets=["my_stage"],
+        all_stages=_helper_make_all_stages("my_stage"),
     )
 
     assert result["transferred"] == 0
@@ -496,7 +522,13 @@ async def test_pull_async_downloads_missing(
     )
 
     result = await transfer._pull_async(
-        cache_dir, state_dir, mock_remote, mock_state, "origin", targets=["my_stage"]
+        cache_dir,
+        state_dir,
+        mock_remote,
+        mock_state,
+        "origin",
+        targets=["my_stage"],
+        all_stages=_helper_make_all_stages("my_stage"),
     )
 
     assert result["transferred"] == 1
@@ -552,7 +584,13 @@ async def test_pull_async_handles_failures(
     )
 
     result = await transfer._pull_async(
-        cache_dir, state_dir, mock_remote, mock_state, "origin", targets=["my_stage"]
+        cache_dir,
+        state_dir,
+        mock_remote,
+        mock_state,
+        "origin",
+        targets=["my_stage"],
+        all_stages=_helper_make_all_stages("my_stage"),
     )
 
     assert result["transferred"] == 0
@@ -589,7 +627,13 @@ async def test_pull_async_includes_deps(
     )
 
     result = await transfer._pull_async(
-        cache_dir, state_dir, mock_remote, mock_state, "origin", targets=["my_stage"]
+        cache_dir,
+        state_dir,
+        mock_remote,
+        mock_state,
+        "origin",
+        targets=["my_stage"],
+        all_stages=_helper_make_all_stages("my_stage"),
     )
 
     assert result["transferred"] == 2
@@ -834,6 +878,7 @@ async def test_pull_async_with_deps_integration(
         state_db,
         "origin",
         targets=["my_stage"],
+        all_stages=_helper_make_all_stages("my_stage"),
     )
 
     files_dir = cache_dir / "files"

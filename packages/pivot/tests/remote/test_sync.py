@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 from pivot.remote import storage as remote_storage
 from pivot.remote import sync
 from pivot.storage import cache as cache_mod
-from pivot.storage import lock
+from pivot.storage import lock, track
 from pivot.storage import state as state_mod
 from pivot.types import DirHash, DirManifestEntry, FileHash, LockData, TransferResult
 
@@ -191,3 +191,94 @@ async def test_push_skips_directory_cache_paths(
     assert result["transferred"] == 1
     # Verify directory was counted in skipped total (skipped_non_file fix from Task 3)
     assert result["skipped"] == 1, "Directory cache path should be counted in skipped total"
+
+
+# =============================================================================
+# get_target_hashes: file path targets without pipeline
+# =============================================================================
+
+
+def test_get_target_hashes_file_path_with_lock_files_no_pipeline(
+    set_project_root: pathlib.Path,
+) -> None:
+    """File path target resolves via lock file even without a pipeline."""
+    state_dir = set_project_root / ".pivot"
+    stages_dir = lock.get_stages_dir(state_dir)
+    stages_dir.mkdir(parents=True, exist_ok=True)
+
+    abs_output = str(set_project_root / "data" / "output.csv")
+    output_hash = FileHash(hash="aabbccdd11223344")
+    lock_data = LockData(
+        code_manifest={},
+        params={},
+        dep_hashes={},
+        output_hashes={abs_output: output_hash},
+    )
+    lock.StageLock("train", stages_dir).write(lock_data)
+
+    result = sync.get_target_hashes([abs_output], state_dir, all_stages=None)
+
+    assert result == {"aabbccdd11223344"}, "Should resolve hash from lock file without pipeline"
+
+
+def test_get_target_hashes_pvt_file_target_without_pipeline(
+    set_project_root: pathlib.Path,
+) -> None:
+    """File path target resolves via .pvt tracking file without a pipeline."""
+    state_dir = set_project_root / ".pivot"
+    (state_dir / "stages").mkdir(parents=True, exist_ok=True)
+
+    pvt_path = set_project_root / "data" / "input.csv.pvt"
+    pvt_path.parent.mkdir(parents=True, exist_ok=True)
+    track.write_pvt_file(
+        pvt_path, track.PvtData(path="input.csv", hash="eeff00112233aabb", size=100)
+    )
+
+    result = sync.get_target_hashes(
+        [str(set_project_root / "data" / "input.csv")], state_dir, all_stages=None
+    )
+
+    assert result == {"eeff00112233aabb"}, "Should resolve hash from .pvt file without pipeline"
+
+
+def test_get_target_hashes_pvt_suffix_stripped_before_lookup(
+    set_project_root: pathlib.Path,
+) -> None:
+    """Target with .pvt suffix is stripped before lookup, avoiding .pvt.pvt."""
+    state_dir = set_project_root / ".pivot"
+    (state_dir / "stages").mkdir(parents=True, exist_ok=True)
+
+    pvt_path = set_project_root / "data" / "result.csv.pvt"
+    pvt_path.parent.mkdir(parents=True, exist_ok=True)
+    track.write_pvt_file(
+        pvt_path, track.PvtData(path="result.csv", hash="1122334455667788", size=100)
+    )
+
+    result = sync.get_target_hashes(
+        [str(set_project_root / "data" / "result.csv.pvt")], state_dir, all_stages=None
+    )
+
+    assert result == {"1122334455667788"}, ".pvt suffix should be stripped before hash lookup"
+
+
+def test_get_target_hashes_unresolved_file_target_returns_empty(
+    set_project_root: pathlib.Path,
+) -> None:
+    """File target that matches nothing returns empty set without crashing."""
+    state_dir = set_project_root / ".pivot"
+    stages_dir = lock.get_stages_dir(state_dir)
+    stages_dir.mkdir(parents=True, exist_ok=True)
+
+    lock_data = LockData(
+        code_manifest={},
+        params={},
+        dep_hashes={},
+        output_hashes={str(set_project_root / "other" / "file.csv"): FileHash(hash="aaaa")},
+    )
+    lock.StageLock("train", stages_dir).write(lock_data)
+
+    result = sync.get_target_hashes(
+        [str(set_project_root / "nonexistent.csv")], state_dir, all_stages=None
+    )
+
+    assert result == set(), "Unresolved target should return empty set, not crash"

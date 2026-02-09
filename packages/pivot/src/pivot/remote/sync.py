@@ -133,9 +133,10 @@ def _get_file_hash_from_stages(
         stage_name = lock_file.relative_to(stages_dir).with_suffix("").as_posix()
         try:
             stage_info = cli_helpers.get_stage(stage_name)
-        except KeyError:
-            continue
-        non_cached_paths = {str(out.path) for out in stage_info["outs"] if not out.cache}
+            non_cached_paths = {str(out.path) for out in stage_info["outs"] if not out.cache}
+        except (KeyError, exceptions.PivotError) as exc:
+            logger.debug("Stage %s not available for cache filtering: %s", stage_name, exc)
+            non_cached_paths = set[str]()
 
         stage_lock = lock.StageLock(stage_name, stages_dir)
         lock_data = stage_lock.read()
@@ -178,15 +179,11 @@ def get_target_hashes(
 
     for target in targets:
         is_known_stage = all_stages is not None and target in all_stages
-        looks_like_stage = "/" not in target and "\\" not in target
-        if is_known_stage or looks_like_stage:
-            if all_stages is not None and target in all_stages:
-                stage_info = all_stages[target]
-                target_state_dir = registry.get_stage_state_dir(stage_info, state_dir)
-                non_cached_paths = {str(out.path) for out in stage_info["outs"] if not out.cache}
-            else:
-                target_state_dir = state_dir
-                non_cached_paths = set[str]()
+        if is_known_stage:
+            assert all_stages is not None
+            stage_info = all_stages[target]
+            target_state_dir = registry.get_stage_state_dir(stage_info, state_dir)
+            non_cached_paths = {str(out.path) for out in stage_info["outs"] if not out.cache}
 
             try:
                 stage_lock = lock.StageLock(target, lock.get_stages_dir(target_state_dir))
@@ -203,6 +200,11 @@ def get_target_hashes(
                         for dep_hash in lock_data["dep_hashes"].values():
                             hashes |= _extract_file_hashes_from_hash_info(dep_hash)
                     continue
+
+        # Strip .pvt suffix if present (CLI normalizes these, but be defensive)
+        target_p = pathlib.Path(target)
+        if target_p.suffix == ".pvt":
+            target = str(track.get_data_path(target_p))
 
         abs_path = str(project.normalize_path(target))
         rel_path = project.to_relative_path(abs_path, proj_root)

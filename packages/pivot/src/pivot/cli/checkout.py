@@ -198,12 +198,11 @@ def _validate_and_build_files(
     files = dict[str, HashInfo]()
 
     for target in targets:
-        # Validate path doesn't escape project
-        if track.has_path_traversal(target):
-            raise click.ClickException(f"Path traversal not allowed: {target}")
-
         # Use normalized path (preserve symlinks) to match keys in tracked_files/stage_outputs
         abs_path = project.normalize_path(target)
+        # Validate path is within project root (replaces literal ".." check)
+        if not abs_path.is_relative_to(project.get_project_root()):
+            raise click.ClickException(f"Target '{target}' resolves outside project root")
         abs_path_str = str(abs_path)
 
         # Check if it's a tracked file

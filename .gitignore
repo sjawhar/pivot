@@ -292,5 +292,4 @@ $RECYCLE.BIN/
 
 # Sisyphus session state (plans, notepads, drafts)
 .sisyphus/*
-!.sisyphus/plans/
-.sisyphus/plans/engine-drain-shutdown.md
+!.sisyphus/rules/
