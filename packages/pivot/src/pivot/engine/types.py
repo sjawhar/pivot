@@ -205,7 +205,14 @@ class EventSink(Protocol):
     """Protocol for async event sinks that receive engine output."""
 
     async def handle(self, event: OutputEvent) -> None:
-        """Handle a single output event. Must be non-blocking."""
+        """Handle a single output event. Should complete quickly.
+
+        Events are dispatched to each sink via a dedicated bounded queue
+        (1024 items), preserving per-sink ordering. Slow sinks do not block
+        other sinks until their buffer fills, at which point they backpressure
+        the entire engine. Implementations should avoid blocking IO or long
+        computation.
+        """
         ...
 
     async def close(self) -> None:

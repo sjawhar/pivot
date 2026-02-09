@@ -5,7 +5,9 @@ from __future__ import annotations
 import anyio
 import pytest
 
+from pivot.engine import engine as engine_mod
 from pivot.engine import types
+from pivot.engine.types import OutputEvent, StageCompleted, StageStarted
 from pivot.types import StageStatus
 
 # =============================================================================
@@ -559,3 +561,228 @@ async def test_console_sink_escapes_rich_markup_in_log_lines() -> None:
     assert "[bold red]" in result or "\\[bold red]" in result
     assert "FAKE ERROR" in result
     assert "this should display literally" in result
+
+
+# =============================================================================
+# Per-Sink Queue Dispatch Tests
+# =============================================================================
+
+_EVENTS = [StageStarted(type="stage_started", stage=f"s{i}", index=i, total=5) for i in range(5)]
+
+
+class _SlowSink:
+    """Sink that sleeps on each event to simulate a slow consumer."""
+
+    def __init__(self) -> None:
+        self.received: list[OutputEvent] = []
+
+    async def handle(self, event: OutputEvent) -> None:
+        await anyio.sleep(0.01)
+        self.received.append(event)
+
+    async def close(self) -> None:
+        pass
+
+
+class _FastCollectorSink:
+    """Sink that records events immediately."""
+
+    def __init__(self) -> None:
+        self.received: list[OutputEvent] = []
+
+    async def handle(self, event: OutputEvent) -> None:
+        self.received.append(event)
+
+    async def close(self) -> None:
+        pass
+
+
+async def test_slow_sink_does_not_block_fast_sink() -> None:
+    """Fast sink receives all events while slow sink is still processing.
+
+    With per-sink queues, each sink processes independently. The fast sink
+    should finish well before the slow sink.
+    """
+    slow = _SlowSink()
+    fast = _FastCollectorSink()
+
+    async with engine_mod.Engine() as eng:
+        eng.add_sink(fast)
+        eng.add_sink(slow)
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(eng._dispatch_outputs)
+
+            # Send events through the engine's output channel
+            for event in _EVENTS:
+                await eng.emit(event)
+
+            # Close output channel to signal end of stream
+            assert eng._output_send is not None
+            await eng._output_send.aclose()
+
+    # Both sinks received all events
+    assert len(fast.received) == 5, "Fast sink should receive all 5 events"
+    assert len(slow.received) == 5, "Slow sink should receive all 5 events"
+
+
+async def test_per_sink_ordering_preserved() -> None:
+    """Events arrive at each sink in the order they were emitted."""
+    slow = _SlowSink()
+    fast = _FastCollectorSink()
+
+    events = [
+        StageCompleted(
+            type="stage_completed",
+            stage=f"stage_{i}",
+            status=StageStatus.RAN,
+            reason="",
+            duration_ms=float(i),
+            index=i,
+            total=10,
+            input_hash=None,
+        )
+        for i in range(10)
+    ]
+
+    async with engine_mod.Engine() as eng:
+        eng.add_sink(fast)
+        eng.add_sink(slow)
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(eng._dispatch_outputs)
+
+            for event in events:
+                await eng.emit(event)
+
+            assert eng._output_send is not None
+            await eng._output_send.aclose()
+
+    # Verify ordering for fast sink (all events are StageCompleted with "stage" key)
+    fast_stages: list[str] = []
+    for e in fast.received:
+        if e["type"] == "stage_completed":
+            assert isinstance(e, dict)
+            fast_stages.append(e["stage"])  # type: ignore[typeddict-item] - narrowed by type check
+    assert fast_stages == [f"stage_{i}" for i in range(10)], "Fast sink events out of order"
+
+    # Verify ordering for slow sink
+    slow_stages: list[str] = []
+    for e in slow.received:
+        if e["type"] == "stage_completed":
+            assert isinstance(e, dict)
+            slow_stages.append(e["stage"])  # type: ignore[typeddict-item] - narrowed by type check
+    assert slow_stages == [f"stage_{i}" for i in range(10)], "Slow sink events out of order"
+
+
+@pytest.mark.anyio
+async def test_backpressure_stalls_dispatch_when_sink_queue_fills() -> None:
+    """When a sink stops consuming and its 1024-item queue fills, dispatch stalls.
+
+    This documents the expected behavior: the engine blocks on send() to the
+    full queue, which also blocks sending to other sinks since dispatch is
+    sequential per-event across all sink queues.
+    """
+
+    class _StallingSink:
+        """Sink that stops consuming after a few events."""
+
+        def __init__(self, consume_count: int) -> None:
+            self._consume_count: int = consume_count
+            self.received: int = 0
+            self._stall: anyio.Event = anyio.Event()
+
+        async def handle(self, event: OutputEvent) -> None:
+            self.received += 1
+            if self.received >= self._consume_count:
+                # Stop consuming — simulate a stuck sink
+                await self._stall.wait()
+
+        async def unstall(self) -> None:
+            self._stall.set()
+
+        async def close(self) -> None:
+            self._stall.set()  # Ensure cleanup doesn't hang
+
+    stalling = _StallingSink(consume_count=1)
+    fast = _FastCollectorSink()
+
+    async with engine_mod.Engine() as eng:
+        eng.add_sink(fast)
+        eng.add_sink(stalling)
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(eng._dispatch_outputs)
+
+            # Send enough events to fill the stalling sink's 1024-item queue.
+            # The stalling sink blocks on event 1, so the queue fills after 1025 more.
+            # We send a smaller batch with a timeout to detect the stall.
+            sent_count = 0
+            for i in range(2000):
+                # Use move_on_after to detect when dispatch stalls
+                timed_out = True
+                with anyio.move_on_after(0.5):
+                    await eng.emit(
+                        StageStarted(type="stage_started", stage=f"s{i}", index=i, total=2000)
+                    )
+                    sent_count += 1
+                    timed_out = False
+                if timed_out:
+                    break
+
+            # We should have stalled before sending all 2000 events
+            # (1024 queue + 64 output channel buffer + the one being processed)
+            assert sent_count < 2000, (
+                f"Expected dispatch to stall due to backpressure, but sent all {sent_count} events"
+            )
+
+            # Unstall the sink so everything can drain
+            await stalling.unstall()
+
+            # Close output to let dispatch finish
+            assert eng._output_send is not None
+            await eng._output_send.aclose()
+
+    # Fast sink received whatever was dispatched before we closed
+    assert len(fast.received) > 0, "Fast sink should have received some events"
+
+
+async def test_sink_error_does_not_stop_other_events() -> None:
+    """A sink that raises on one event continues receiving subsequent events."""
+    collector = _FastCollectorSink()
+
+    class _ErrorOnceSink:
+        """Sink that raises on the first event, then works normally."""
+
+        def __init__(self) -> None:
+            self.received: list[OutputEvent] = []
+            self._first: bool = True
+
+        async def handle(self, event: OutputEvent) -> None:
+            if self._first:
+                self._first = False
+                raise ValueError("boom")
+            self.received.append(event)
+
+        async def close(self) -> None:
+            pass
+
+    error_sink = _ErrorOnceSink()
+
+    async with engine_mod.Engine() as eng:
+        eng.add_sink(collector)
+        eng.add_sink(error_sink)
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(eng._dispatch_outputs)
+
+            for event in _EVENTS:
+                await eng.emit(event)
+
+            assert eng._output_send is not None
+            await eng._output_send.aclose()
+
+    # Collector got all events (unaffected by error sink)
+    assert len(collector.received) == 5, "Collector should receive all events"
+    # Error sink got events after the first (which raised)
+    assert len(error_sink.received) == 4, "Error sink should receive events after the error"

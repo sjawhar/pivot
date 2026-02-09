@@ -21,6 +21,7 @@ import anyio.to_thread
 from pivot import config, exceptions, fingerprint, parameters, project, registry
 from pivot.engine import agent_rpc
 from pivot.engine import graph as engine_graph
+from pivot.engine import scheduler as engine_scheduler
 from pivot.engine.types import (
     CodeOrConfigChanged,
     DataArtifactChanged,
@@ -82,21 +83,14 @@ class Engine:
 
     # Orchestration state
     _graph: nx.DiGraph[str] | None
-    _stage_states: dict[str, StageExecutionState]
+    _scheduler: engine_scheduler.Scheduler
     _cancel_event: anyio.Event
     _stage_indices: dict[str, tuple[int, int]]
     _deferred_events: dict[str, list[InputEvent]]
 
     # Execution orchestration state
     _futures: dict[concurrent.futures.Future[StageResult], str]
-    _mutex_counts: collections.defaultdict[str, int]
-    _stage_upstream_unfinished: dict[str, set[str]]
-    _stage_downstream: dict[str, list[str]]
-    _stage_mutex: dict[str, list[str]]
     _executor: concurrent.futures.Executor | None
-    _max_workers: int
-    _error_mode: OnError
-    _stop_starting_new: bool
     _warned_mutex_groups: set[str]
 
     # Stored orchestration params (for watch mode re-runs)
@@ -128,22 +122,16 @@ class Engine:
 
         # Orchestration state
         self._graph = None
-        self._stage_states = dict[str, StageExecutionState]()
+        self._scheduler = engine_scheduler.Scheduler()
         self._cancel_event = anyio.Event()
         self._stage_indices = dict[str, tuple[int, int]]()
         self._deferred_events = collections.defaultdict(list)
 
         # Execution orchestration state
         self._futures = dict[concurrent.futures.Future[StageResult], str]()
-        self._mutex_counts = collections.defaultdict(int)
-        self._stage_upstream_unfinished = dict[str, set[str]]()
-        self._stage_downstream = dict[str, list[str]]()
-        self._stage_mutex = dict[str, list[str]]()
         self._executor = None
-        self._max_workers = 1
-        self._error_mode = OnError.FAIL
-        self._stop_starting_new = False
         self._warned_mutex_groups = set[str]()
+        self._effective_max_workers: int = 1
 
         # Stored orchestration params (for watch mode re-runs)
         self._stored_no_commit = False
@@ -306,7 +294,13 @@ class Engine:
             await send.aclose()
 
     async def _dispatch_outputs(self) -> None:
-        """Dispatch output events to all sinks.
+        """Dispatch output events to all sinks via per-sink bounded queues.
+
+        Each sink gets a dedicated long-lived task that reads from its own
+        bounded queue (1024 items). This ensures:
+        1. Strict per-sink ordering (events processed sequentially per sink)
+        2. Slow sinks don't block fast sinks until their 1024-item buffer fills
+        3. Backpressure: engine blocks when any sink queue is full (correctness-first)
 
         Assumes run() has validated that channels are initialized.
         Errors in individual sinks are logged but don't stop event dispatch.
@@ -314,19 +308,36 @@ class Engine:
         """
         assert self._output_recv is not None  # Validated by run()
         try:
-            async for event in self._output_recv:
-                async with anyio.create_task_group() as tg:
-                    for sink in self._sinks:
-                        tg.start_soon(self._dispatch_to_sink, sink, event)
+            async with anyio.create_task_group() as tg:
+                sink_channels: list[MemoryObjectSendStream[OutputEvent]] = []
+                for sink in self._sinks:
+                    send, recv = anyio.create_memory_object_stream[OutputEvent](1024)
+                    sink_channels.append(send)
+                    tg.start_soon(self._run_sink_task, sink, recv)
+
+                async for event in self._output_recv:
+                    for send in sink_channels:
+                        await send.send(event)
+
+                # Close all send channels when output stream ends
+                for send in sink_channels:
+                    await send.aclose()
         finally:
             self._dispatch_complete.set()
 
-    async def _dispatch_to_sink(self, sink: EventSink, event: OutputEvent) -> None:
-        """Dispatch event to a single sink, catching errors."""
-        try:
-            await sink.handle(event)
-        except Exception:
-            _logger.exception("Error dispatching event to sink %s", sink)
+    async def _run_sink_task(
+        self, sink: EventSink, recv: MemoryObjectReceiveStream[OutputEvent]
+    ) -> None:
+        """Process events for a single sink from its dedicated queue.
+
+        Runs until the send side is closed. Errors in the sink are logged
+        but don't stop processing subsequent events.
+        """
+        async for event in recv:
+            try:
+                await sink.handle(event)
+            except Exception:
+                _logger.exception("Error dispatching event to sink %s", sink)
 
     async def _handle_input_event(self, event: InputEvent) -> None:
         """Process a single input event."""
@@ -414,10 +425,8 @@ class Engine:
 
     async def _set_stage_state(self, stage: str, new_state: StageExecutionState) -> None:
         """Update stage execution state and emit event."""
-        old_state = self._stage_states.get(stage, StageExecutionState.PENDING)
-        is_new = stage not in self._stage_states
-        self._stage_states[stage] = new_state
-        if not is_new and old_state == new_state:
+        old_state, changed = self._scheduler.set_state(stage, new_state)
+        if not changed:
             return
 
         await self.emit(
@@ -431,11 +440,11 @@ class Engine:
 
     def _get_stage_state(self, stage: str) -> StageExecutionState:
         """Get current execution state for a stage."""
-        return self._stage_states.get(stage, StageExecutionState.PENDING)
+        return self._scheduler.get_state(stage)
 
     def _get_stage_index(self, stage_name: str) -> tuple[int, int]:
         """Get (1-based index, total count) for a stage."""
-        stage_keys = list(self._stage_states.keys())
+        stage_keys = list(self._scheduler.stage_states.keys())
         total_stages = len(stage_keys)
         try:
             stage_index = stage_keys.index(stage_name) + 1
@@ -538,7 +547,7 @@ class Engine:
         default_state_dir.mkdir(parents=True, exist_ok=True)
 
         # Initialize orchestration state
-        await self._initialize_orchestration(execution_order, effective_max_workers, on_error)
+        await self._initialize_orchestration(execution_order, effective_max_workers)
         self._warn_single_stage_mutex_groups()
 
         # Create executor
@@ -659,45 +668,55 @@ class Engine:
 
                         # Check error mode
                         if on_error == OnError.FAIL:
-                            failed = [
-                                n
-                                for n, s in self._stage_states.items()
-                                if s == StageExecutionState.COMPLETED
+                            has_failed = any(
+                                s == StageExecutionState.COMPLETED
                                 and n in results
                                 and results[n]["status"] == StageStatus.FAILED
-                            ]
-                            if failed:
-                                self._stop_starting_new = True
-                                for name, state in self._stage_states.items():
-                                    if state in (
-                                        StageExecutionState.READY,
-                                        StageExecutionState.PENDING,
-                                    ):
-                                        await self._set_stage_state(
-                                            name, StageExecutionState.BLOCKED
+                                for n, s in self._scheduler.stage_states.items()
+                            )
+                            if has_failed:
+                                first_failed = next(
+                                    n
+                                    for n, s in self._scheduler.stage_states.items()
+                                    if s == StageExecutionState.COMPLETED
+                                    and n in results
+                                    and results[n]["status"] == StageStatus.FAILED
+                                )
+                                blocked = self._scheduler.apply_fail_fast()
+                                for name, old_state in blocked:
+                                    await self.emit(
+                                        StageStateChanged(
+                                            type="stage_state_changed",
+                                            stage=name,
+                                            state=StageExecutionState.BLOCKED,
+                                            previous_state=old_state,
                                         )
-                                    if (
-                                        state == StageExecutionState.BLOCKED
-                                        or self._get_stage_state(name)
-                                        == StageExecutionState.BLOCKED
-                                    ) and name not in results:
+                                    )
+                                # Emit skipped for all blocked stages not yet in results
+                                for name, state in self._scheduler.stage_states.items():
+                                    if state == StageExecutionState.BLOCKED and name not in results:
                                         await self._emit_skipped_stage(
-                                            name, f"upstream '{failed[0]}' failed", results
+                                            name,
+                                            f"upstream '{first_failed}' failed",
+                                            results,
                                         )
 
                         # Check cancellation
                         if self._cancel_event.is_set():
-                            self._stop_starting_new = True
-                            for name, state in self._stage_states.items():
-                                if state in (
-                                    StageExecutionState.READY,
-                                    StageExecutionState.PENDING,
-                                ):
-                                    await self._set_stage_state(name, StageExecutionState.COMPLETED)
-                                    await self._emit_skipped_stage(name, "cancelled", results)
+                            cancelled = self._scheduler.apply_cancel()
+                            for name, old_state in cancelled:
+                                await self.emit(
+                                    StageStateChanged(
+                                        type="stage_state_changed",
+                                        stage=name,
+                                        state=StageExecutionState.COMPLETED,
+                                        previous_state=old_state,
+                                    )
+                                )
+                                await self._emit_skipped_stage(name, "cancelled", results)
 
                         # Start more stages if slots available
-                        if not self._stop_starting_new:
+                        if not self._scheduler.stop_starting_new:
                             await self._start_ready_stages(
                                 cache_dir=cache_dir,
                                 output_queue=output_queue,
@@ -713,7 +732,7 @@ class Engine:
 
                     # Diagnostic: log stages not in results after main loop
                     missing_by_state: dict[str, list[str]] = {}
-                    for name, state in self._stage_states.items():
+                    for name, state in self._scheduler.stage_states.items():
                         if name not in results:
                             missing_by_state.setdefault(state.name, []).append(name)
                     if missing_by_state:
@@ -725,7 +744,7 @@ class Engine:
                             )
 
                     # Handle any blocked stages not yet processed
-                    for name, state in self._stage_states.items():
+                    for name, state in self._scheduler.stage_states.items():
                         if state == StageExecutionState.BLOCKED and name not in results:
                             failed_upstream = next(
                                 (
@@ -861,61 +880,36 @@ class Engine:
         self,
         execution_order: list[str],
         max_workers: int,
-        error_mode: OnError,
     ) -> None:
         """Initialize orchestration state for a new execution."""
         self._futures.clear()
-        self._mutex_counts.clear()
-        self._stage_upstream_unfinished.clear()
-        self._stage_downstream.clear()
-        self._stage_mutex.clear()
-        self._stage_states.clear()
         self._deferred_events.clear()
-        self._stop_starting_new = False
 
-        self._max_workers = max_workers
-        self._error_mode = error_mode
+        # Build stage_mutex map from pipeline registry
+        stage_mutex = {name: self._get_stage(name)["mutex"] for name in execution_order}
 
-        stages_set = set(execution_order)
+        self._scheduler.initialize(
+            execution_order,
+            self._graph,
+            stage_mutex=stage_mutex,
+        )
+        self._effective_max_workers = max_workers
 
-        for stage_name in execution_order:
-            stage_info = self._get_stage(stage_name)
-
-            # Upstream stages that must complete first
-            if self._graph is not None:
-                upstream = [
-                    u
-                    for u in engine_graph.get_upstream_stages(self._graph, stage_name)
-                    if u in stages_set
-                ]
-            else:
-                upstream = []
-            self._stage_upstream_unfinished[stage_name] = set(upstream)
-
-            # Downstream stages that depend on this one
-            if self._graph is not None:
-                downstream = [
-                    d
-                    for d in engine_graph.get_downstream_stages(self._graph, stage_name)
-                    if d in stages_set
-                ]
-            else:
-                downstream = []
-            self._stage_downstream[stage_name] = downstream
-
-            # Mutex groups
-            self._stage_mutex[stage_name] = stage_info["mutex"]
-
-            # Initial state: READY if no upstream, else PENDING
-            initial_state = (
-                StageExecutionState.READY if not upstream else StageExecutionState.PENDING
+        # Emit initial state events for all stages
+        for stage_name, initial_state in self._scheduler.stage_states.items():
+            await self.emit(
+                StageStateChanged(
+                    type="stage_state_changed",
+                    stage=stage_name,
+                    state=initial_state,
+                    previous_state=StageExecutionState.PENDING,
+                )
             )
-            await self._set_stage_state(stage_name, initial_state)
 
     def _warn_single_stage_mutex_groups(self) -> None:
         """Warn if any mutex group contains only one stage (likely a typo)."""
         groups: collections.defaultdict[str, list[str]] = collections.defaultdict(list)
-        for stage_name, mutexes in self._stage_mutex.items():
+        for stage_name, mutexes in self._scheduler.stage_mutex.items():
             for mutex in mutexes:
                 groups[mutex].append(stage_name)
 
@@ -928,23 +922,7 @@ class Engine:
 
     def _can_start_stage(self, stage_name: str) -> bool:
         """Check if stage is eligible to start (ready and mutex available)."""
-        if self._get_stage_state(stage_name) != StageExecutionState.READY:
-            return False
-
-        if self._stage_upstream_unfinished.get(stage_name):
-            return False
-
-        stage_mutexes = self._stage_mutex.get(stage_name, [])
-        is_exclusive = executor_core.EXCLUSIVE_MUTEX in stage_mutexes
-
-        for mutex in stage_mutexes:
-            if mutex == executor_core.EXCLUSIVE_MUTEX:
-                if self._mutex_counts[mutex] > 0 or len(self._futures) > 0:
-                    return False
-            elif self._mutex_counts[mutex] > 0:
-                return False
-
-        return is_exclusive or self._mutex_counts[executor_core.EXCLUSIVE_MUTEX] == 0
+        return self._scheduler.can_start(stage_name, running_count=len(self._futures))
 
     async def _start_ready_stages(
         self,
@@ -960,26 +938,24 @@ class Engine:
         state_dir: pathlib.Path,
     ) -> None:
         """Start all eligible stages up to max_workers."""
-        if self._executor is None or self._stop_starting_new:
+        if self._executor is None or self._scheduler.stop_starting_new:
             return
 
         pipeline = self._require_pipeline()
         started = 0
-        max_to_start = self._max_workers - len(self._futures)
+        max_to_start = self._effective_max_workers - len(self._futures)
         if max_to_start <= 0:
             return
 
-        for stage_name in list(self._stage_states.keys()):
+        for stage_name in list(self._scheduler.stage_states.keys()):
             if started >= max_to_start:
                 break
 
             if not self._can_start_stage(stage_name):
                 continue
 
-            # Acquire mutex locks
-            for mutex in self._stage_mutex.get(stage_name, []):
-                self._mutex_counts[mutex] += 1
-
+            # Acquire mutex locks (must happen before next can_start check)
+            self._scheduler.acquire_mutexes(stage_name)
             started += 1
 
             # Transition to PREPARING
@@ -1053,43 +1029,37 @@ class Engine:
         )
 
         # Release mutex locks
-        for mutex in self._stage_mutex.get(stage_name, []):
-            self._mutex_counts[mutex] -= 1
-            if self._mutex_counts[mutex] < 0:
-                _logger.error("Mutex '%s' released when not held", mutex)
-                self._mutex_counts[mutex] = 0
+        self._scheduler.release_mutexes(stage_name)
 
-        # Update downstream stages' upstream_unfinished
-        for downstream_name in self._stage_downstream.get(stage_name, []):
-            unfinished = self._stage_upstream_unfinished.get(downstream_name)
-            if unfinished:
-                unfinished.discard(stage_name)
-                if (
-                    not unfinished
-                    and self._get_stage_state(downstream_name) == StageExecutionState.PENDING
-                ):
-                    await self._set_stage_state(downstream_name, StageExecutionState.READY)
+        failed = result["status"] == StageStatus.FAILED
+        newly_ready, newly_blocked = self._scheduler.on_stage_completed(stage_name, failed)
 
-        # Handle failure cascading
-        if result["status"] == StageStatus.FAILED:
-            await self._cascade_failure(stage_name)
+        # Emit events for newly ready stages (PENDING → READY)
+        for ready_name in newly_ready:
+            await self.emit(
+                StageStateChanged(
+                    type="stage_state_changed",
+                    stage=ready_name,
+                    state=StageExecutionState.READY,
+                    previous_state=StageExecutionState.PENDING,
+                )
+            )
+
+        # Emit events for newly blocked stages
+        for blocked_name, old_state in newly_blocked:
+            await self.emit(
+                StageStateChanged(
+                    type="stage_state_changed",
+                    stage=blocked_name,
+                    state=StageExecutionState.BLOCKED,
+                    previous_state=old_state,
+                )
+            )
 
         # Process any deferred events for this stage
         await self._process_deferred_events(stage_name)
 
         return duration_ms
-
-    async def _cascade_failure(self, failed_stage: str) -> None:
-        """Mark downstream stages as blocked due to upstream failure.
-
-        Since _stage_downstream already contains all transitive descendants (computed
-        via get_downstream_stages which uses nx.descendants), we simply iterate through
-        them once without recursion.
-        """
-        for downstream_name in self._stage_downstream.get(failed_stage, []):
-            state = self._get_stage_state(downstream_name)
-            if state in (StageExecutionState.PENDING, StageExecutionState.READY):
-                await self._set_stage_state(downstream_name, StageExecutionState.BLOCKED)
 
     async def _emit_skipped_stage(
         self,

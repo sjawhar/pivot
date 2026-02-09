@@ -171,7 +171,7 @@ async def test_engine_handle_data_artifact_changed_filters_executing_outputs(
         engine._graph = g
 
         # stage_a is currently running
-        engine._stage_states["stage_a"] = StageExecutionState.RUNNING
+        engine._scheduler.set_state("stage_a", StageExecutionState.RUNNING)
 
         # Create event for output change
         event = DataArtifactChanged(
@@ -274,7 +274,7 @@ async def test_engine_should_filter_path_returns_false_for_input_artifacts(
         g.add_edge(input_node, stage_node)  # input consumed by stage_a
 
         engine._graph = g
-        engine._stage_states["stage_a"] = StageExecutionState.RUNNING
+        engine._scheduler.set_state("stage_a", StageExecutionState.RUNNING)
 
         # Input artifact should not be filtered (no producer)
         assert engine._should_filter_path(input_path) is False
