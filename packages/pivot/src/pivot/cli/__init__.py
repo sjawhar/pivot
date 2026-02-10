@@ -9,7 +9,7 @@ import click
 # Command categories for organized help output
 COMMAND_CATEGORIES = {
     "Pipeline": ["run", "repro", "status", "verify", "commit"],
-    "Sync": ["checkout", "fetch", "get", "pull", "push", "remote", "track"],
+    "Sync": ["checkout", "fetch", "get", "import", "pull", "push", "remote", "track", "update"],
     "Inspection": ["dag", "diff", "history", "list", "metrics", "params", "plots", "show"],
     "Other": [
         "init",
@@ -32,6 +32,11 @@ _LAZY_COMMANDS: dict[str, tuple[str, str, str]] = {
     "dag": ("pivot.cli.dag", "dag_cmd", "Visualize pipeline DAG."),
     "list": ("pivot.cli.list", "list_cmd", "List registered stages."),
     "export": ("pivot.cli.export", "export", "Export pipeline to DVC YAML format."),
+    "import": (
+        "pivot.cli.import_cmd",
+        "import_cmd",
+        "Import artifact from a remote Pivot repo.",
+    ),
     "import-dvc": (
         "pivot.cli.import_dvc",
         "import_dvc",
@@ -74,6 +79,11 @@ _LAZY_COMMANDS: dict[str, tuple[str, str, str]] = {
         "pivot.cli.fingerprint",
         "fingerprint",
         "Manage function fingerprinting cache.",
+    ),
+    "update": (
+        "pivot.cli.update",
+        "update",
+        "Update imported artifacts from source repos.",
     ),
 }
 

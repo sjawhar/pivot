@@ -43,6 +43,7 @@ Example::
 from __future__ import annotations
 
 import asyncio
+import enum
 import logging
 import pathlib
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
@@ -52,6 +53,7 @@ from pivot import (
     config,
     exceptions,
     explain,
+    import_artifact,
     metrics,
     parameters,
     project,
@@ -477,3 +479,83 @@ def what_if_changed(
         affected.update(consumers)
 
     return sorted(affected)
+
+
+class ImportCheckStatus(enum.Enum):
+    UP_TO_DATE = "up to date"
+    UPDATE_AVAILABLE = "update available"
+    ERROR = "error"
+
+
+class ImportStatusInfo:
+    __slots__: tuple[str, ...] = ("path", "status", "current_rev", "latest_rev", "error")
+
+    path: str
+    status: ImportCheckStatus
+    current_rev: str
+    latest_rev: str
+    error: str
+
+    def __init__(
+        self,
+        path: str,
+        status: ImportCheckStatus,
+        current_rev: str = "",
+        latest_rev: str = "",
+        error: str = "",
+    ) -> None:
+        self.path = path
+        self.status = status
+        self.current_rev = current_rev
+        self.latest_rev = latest_rev
+        self.error = error
+
+
+async def _check_imports_batch(
+    import_pvts: dict[str, track.PvtData],
+    project_root: pathlib.Path,
+) -> list[ImportStatusInfo]:
+    tasks = list[tuple[str, track.PvtData]]()
+    for data_path, pvt_data in sorted(import_pvts.items()):
+        try:
+            rel_path = str(pathlib.Path(data_path).relative_to(project_root))
+        except ValueError:
+            rel_path = data_path
+        tasks.append((rel_path, pvt_data))
+
+    checks = await asyncio.gather(
+        *[import_artifact.check_for_update(pvt_data) for _, pvt_data in tasks],
+        return_exceptions=True,
+    )
+
+    results = list[ImportStatusInfo]()
+    for (rel_path, _), check_or_exc in zip(tasks, checks, strict=True):
+        if isinstance(check_or_exc, Exception):
+            logger.warning("Failed to check import %s: %s", rel_path, check_or_exc)
+            results.append(
+                ImportStatusInfo(
+                    path=rel_path, status=ImportCheckStatus.ERROR, error=str(check_or_exc)
+                )
+            )
+        else:
+            check = cast("import_artifact.UpdateCheck", check_or_exc)
+            if check["available"]:
+                results.append(
+                    ImportStatusInfo(
+                        path=rel_path,
+                        status=ImportCheckStatus.UPDATE_AVAILABLE,
+                        current_rev=check["current_rev"][:8],
+                        latest_rev=check["latest_rev"][:8],
+                    )
+                )
+            else:
+                results.append(ImportStatusInfo(path=rel_path, status=ImportCheckStatus.UP_TO_DATE))
+    return results
+
+
+def get_import_status(project_root: pathlib.Path) -> list[ImportStatusInfo]:
+    """Check update status for all imported artifacts concurrently."""
+    import_pvts = track.discover_import_pvt_files(project_root)
+    if not import_pvts:
+        return []
+    return asyncio.run(_check_imports_batch(import_pvts, project_root))

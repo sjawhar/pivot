@@ -2048,6 +2048,7 @@ name = "pivot"
 version = "0.1.0"
 source = { editable = "packages/pivot" }
 dependencies = [
+    { name = "aiohttp" },
     { name = "anyio" },
     { name = "click" },
     { name = "deepmerge" },
@@ -2119,6 +2120,7 @@ tui = [
 [package.metadata]
 requires-dist = [
     { name = "aioboto3", marker = "extra == 's3'", specifier = ">=13.0.0" },
+    { name = "aiohttp", specifier = ">=3.9" },
     { name = "anyio", specifier = ">=4.0" },
     { name = "basedpyright", marker = "extra == 'dev'", specifier = ">=1.0" },
     { name = "botocore-stubs", marker = "extra == 'dev'", specifier = ">=1.35.0" },

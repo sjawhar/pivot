@@ -148,6 +148,7 @@ def train(
 - Check `typings/` first for untyped packages; use `scripts/generate_stubs.py` if needed
 - **aioboto3/S3 types:** Use `types_aiobotocore_s3.S3Client` (not `Any`) for S3 client parameters. Import under `TYPE_CHECKING`. The `types-aioboto3[all]` stubs are in dev deps.
 - **aioboto3 sessions:** Create one `aioboto3.Session()` per `S3Remote` instance (in `__init__`), not per method call. Sessions are credential-management objects — recreating them re-reads credential chains and env vars. Each method creates its own client via `async with self._session.client("s3")`, which is lightweight but gets a fresh connection pool. Batch methods share one client across concurrent tasks via `asyncio.gather`.
+- **aiohttp for HTTP APIs:** Use `aiohttp` (direct dependency) for all non-S3 HTTP calls (GitHub API, git forge APIs). Follow the same async pattern as S3Remote: async internals with `asyncio.run()` sync wrappers at CLI boundaries. Do NOT use `httpx`, `urllib.request`, or `requests`.
 
 ## Python 3.13+ Types
 
@@ -166,6 +167,8 @@ def train(
 Import modules, not functions: `from pivot import fingerprint` then `fingerprint.func()`.
 
 **Exceptions:** `TYPE_CHECKING` blocks, `pivot.types`, `typing` module, CLI lazy imports.
+
+**No duplicate imports:** If a module is imported at runtime (`import pathlib`), do NOT also import from it under `TYPE_CHECKING` (`from pathlib import Path`). Use `pathlib.Path` in annotations instead. Each module should appear in exactly one place — either a runtime module import or a `TYPE_CHECKING` import, never both.
 
 ## Error Handling
 

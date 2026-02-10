@@ -5,7 +5,6 @@ import contextlib
 import logging
 import os
 import re
-import shutil
 import tempfile
 from typing import TYPE_CHECKING, Protocol, TypedDict
 
@@ -223,13 +222,25 @@ async def _atomic_download(
     fd, tmp_path = tempfile.mkstemp(dir=local_path.parent, prefix=".pivot_download_")
     move_succeeded = False
     try:
-        response = await s3.get_object(Bucket=bucket, Key=key)
+        try:
+            response = await s3.get_object(Bucket=bucket, Key=key)
+        except Exception as exc:
+            error_str = str(exc)
+            if "NoSuchKey" in error_str or "404" in error_str:
+                raise exceptions.RemoteError(
+                    f"Remote cache file not found: {bucket}/{key}"
+                ) from exc
+            if "AccessDenied" in error_str or "403" in error_str:
+                raise exceptions.RemoteError(
+                    f"Access denied to {bucket}/{key}. Check AWS credentials."
+                ) from exc
+            raise exceptions.RemoteError(f"Failed to download from S3: {exc}") from exc
         await _stream_download_to_fd(response, fd)
         os.close(fd)
         fd = -1  # Mark as closed
         if readonly:
             os.chmod(tmp_path, 0o444)
-        shutil.move(tmp_path, local_path)
+        os.replace(tmp_path, local_path)
         move_succeeded = True
     finally:
         if fd >= 0:

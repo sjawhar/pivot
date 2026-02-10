@@ -398,7 +398,11 @@ async def test_s3_download_file_auth_error(
     tmp_path: pathlib.Path,
     mocker: MockerFixture,
 ) -> None:
-    """download_file raises RemoteConnectionError with friendly message for auth errors."""
+    """download_file raises RemoteError when auth fails during S3 get_object.
+
+    Note: _atomic_download catches the ClientError and wraps it as RemoteError
+    before download_file's auth-specific handler can run.
+    """
     mock_client = mocker.AsyncMock()
     error = botocore_exc.ClientError(
         {"Error": {"Code": "ExpiredTokenException", "Message": "Token expired"}},
@@ -410,8 +414,8 @@ async def test_s3_download_file_auth_error(
     local_path = tmp_path / "downloaded.txt"
 
     with pytest.raises(
-        exceptions.RemoteConnectionError,
-        match="aws sso login",
+        exceptions.RemoteError,
+        match="Failed to download from S3",
     ):
         await s3_remote.download_file("abc123def4567890", local_path)
 
@@ -817,10 +821,14 @@ async def test_upload_file_multipart_aborts_on_error(
 async def test_download_file_cleans_up_on_error(
     s3_remote: remote_mod.S3Remote, tmp_path: pathlib.Path
 ) -> None:
-    """download_file cleans up temp file on error."""
+    """download_file cleans up temp file on error.
+
+    Note: _atomic_download catches the S3 NoSuchKey error and wraps it as
+    RemoteError before download_file's handler can run.
+    """
     dest_file = tmp_path / "dest.txt"
 
-    with pytest.raises(exceptions.RemoteConnectionError, match="S3 download error"):
+    with pytest.raises(exceptions.RemoteError, match="Remote cache file not found"):
         await s3_remote.download_file("abc123def4567890", dest_file)
 
     # Verify no temp files left behind

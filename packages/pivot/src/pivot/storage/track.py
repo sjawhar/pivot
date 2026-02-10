@@ -27,6 +27,17 @@ except AttributeError:
     _Dumper = yaml.SafeDumper
 
 
+class ImportSource(TypedDict):
+    """Source information for imported artifacts."""
+
+    repo: str  # Source repo URL
+    rev: str  # Symbolic ref (branch/tag)
+    rev_lock: str  # Resolved commit SHA
+    stage: str  # Source stage name (auto-discovered)
+    path: str  # Path within source repo
+    remote: str  # Source's S3 remote URL
+
+
 class PvtData(TypedDict):
     """Data stored in .pvt files."""
 
@@ -35,10 +46,12 @@ class PvtData(TypedDict):
     size: int  # Total size (file or sum of directory)
     num_files: NotRequired[int]  # For directories only
     manifest: NotRequired[list[DirManifestEntry]]  # For directories only
+    source: NotRequired[ImportSource]  # Import source metadata
 
 
 _REQUIRED_KEYS = frozenset({"path", "hash", "size"})
-_VALID_KEYS = frozenset({"path", "hash", "size", "num_files", "manifest"})
+_VALID_KEYS = frozenset({"path", "hash", "size", "num_files", "manifest", "source"})
+_REQUIRED_SOURCE_KEYS = frozenset({"repo", "rev", "rev_lock", "stage", "path", "remote"})
 
 
 def is_pvt_data(data: object) -> TypeGuard[PvtData]:
@@ -48,18 +61,30 @@ def is_pvt_data(data: object) -> TypeGuard[PvtData]:
     str_data = cast("dict[str, object]", data)
     if not _REQUIRED_KEYS.issubset(str_data.keys()):
         return False
-    return all(key in _VALID_KEYS for key in str_data)
+    if not all(key in _VALID_KEYS for key in str_data):
+        return False
+    if "source" in str_data:
+        source = str_data["source"]
+        if not isinstance(source, dict):
+            return False
+        source_dict = cast("dict[str, object]", source)
+        if not _REQUIRED_SOURCE_KEYS.issubset(source_dict.keys()):
+            return False
+        if not all(isinstance(source_dict[k], str) for k in _REQUIRED_SOURCE_KEYS):
+            return False
+    return True
 
 
 def has_path_traversal(path: str) -> bool:
-    """Check if path contains traversal components (..)."""
-    return ".." in pathlib.Path(path).parts
+    """Check if path is unsafe: absolute or contains traversal (..)."""
+    p = pathlib.Path(path)
+    return p.is_absolute() or ".." in p.parts
 
 
 def _validate_path(path: str) -> None:
-    """Validate path doesn't contain traversal."""
+    """Validate path is relative and doesn't contain traversal."""
     if has_path_traversal(path):
-        raise exceptions.SecurityValidationError(f"Path contains path traversal: {path!r}")
+        raise exceptions.SecurityValidationError(f"Unsafe path (absolute or traversal): {path!r}")
 
 
 def write_pvt_file(pvt_path: pathlib.Path, data: PvtData) -> None:
@@ -80,7 +105,6 @@ def read_pvt_file(pvt_path: pathlib.Path) -> PvtData | None:
             data: object = yaml.load(f, Loader=_Loader)
         if not is_pvt_data(data):
             return None
-        # Validate path doesn't contain traversal (security check)
         if has_path_traversal(data["path"]):
             return None
         return data
@@ -108,21 +132,33 @@ def discover_pvt_files(root: pathlib.Path) -> dict[str, PvtData]:
 
     result = dict[str, PvtData]()
 
-    for pvt_path in root.rglob("*.pvt"):
-        if not pvt_path.is_file():
-            continue
-        data = read_pvt_file(pvt_path)
-        if data is None:
-            logger.warning(f"Skipping invalid .pvt file: {pvt_path}")
-            continue
+    for dirpath, _dirnames, filenames in os.walk(root, followlinks=False):
+        for fname in filenames:
+            if not fname.endswith(".pvt"):
+                continue
+            pvt_path = pathlib.Path(dirpath) / fname
+            if not pvt_path.is_file():
+                continue
+            data = read_pvt_file(pvt_path)
+            if data is None:
+                logger.warning(f"Skipping invalid .pvt file: {pvt_path}")
+                continue
 
-        # Compute absolute data path from pvt file location + relative path
-        # Use normalized path (preserve symlinks) for portability
-        data_path = pvt_path.parent / data["path"]
-        normalized = project.normalize_path(data_path)
-        result[str(normalized)] = data
+            data_path = pvt_path.parent / data["path"]
+            normalized = project.normalize_path(data_path)
+            result[str(normalized)] = data
 
     return result
+
+
+def is_import(data: PvtData) -> bool:
+    """Check if PvtData represents an imported artifact."""
+    return "source" in data
+
+
+def discover_import_pvt_files(root: pathlib.Path) -> dict[str, PvtData]:
+    """Find all import .pvt files under root."""
+    return {path: data for path, data in discover_pvt_files(root).items() if is_import(data)}
 
 
 def pvt_to_hash_info(pvt_data: PvtData) -> HashInfo:

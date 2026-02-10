@@ -6,6 +6,7 @@ requires-python = ">=3.13,<3.14"
 license = { text = "TBD" }
 authors = [{ name = "Internal Team" }]
 dependencies = [
+  "aiohttp>=3.9",
   "anyio>=4.0",
   "click>=8.0",
   "deepmerge>=2.0",

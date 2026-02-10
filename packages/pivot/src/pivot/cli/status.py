@@ -36,6 +36,7 @@ from pivot.types import (
 @click.option("--tracked-only", is_flag=True, help="Show only tracked files")
 @click.option("--remote-only", is_flag=True, help="Show only remote status")
 @click.option("--remote", "-r", is_flag=True, help="Include remote sync status")
+@click.option("--check-imports", is_flag=True, help="Check for import updates (requires network)")
 @click.pass_context
 def status(
     ctx: click.Context,
@@ -47,6 +48,7 @@ def status(
     tracked_only: bool,
     remote_only: bool,
     remote: bool,
+    check_imports: bool,
 ) -> None:
     """Show pipeline, tracked files, and remote status."""
     cli_ctx = cli_helpers.get_cli_context(ctx)
@@ -130,6 +132,10 @@ def status(
         except exceptions.RemoteError as e:
             raise click.ClickException(f"Remote error: {e}") from e
 
+    import_statuses = list[status_mod.ImportStatusInfo]()
+    if check_imports:
+        import_statuses = status_mod.get_import_status(project_root)
+
     # Compute counts once for suggestions and output
     # When explain mode is used, compute from explanations; otherwise from status
     if explain and pipeline_explanations:
@@ -187,6 +193,9 @@ def status(
                 show_stages,
                 show_tracked,
             )
+
+    if import_statuses:
+        _print_import_section(import_statuses)
 
 
 def _output_json(
@@ -397,6 +406,22 @@ def _print_remote_section(remote_status: RemoteSyncInfo) -> None:
     click.echo(f"Remote Status ({remote_status['name']} \u2192 {remote_status['url']})")
     click.echo(f"  \u2191 {remote_status['push_count']} to push")
     click.echo(f"  \u2193 {remote_status['pull_count']} to pull")
+
+
+def _print_import_section(import_statuses: list[status_mod.ImportStatusInfo]) -> None:
+    """Print import status section."""
+    click.echo()
+    click.echo("Imports")
+
+    for info in import_statuses:
+        if info.status is status_mod.ImportCheckStatus.UPDATE_AVAILABLE:
+            click.echo(
+                f"  \u26a0 {info.path}: update available ({info.current_rev}.. \u2192 {info.latest_rev}..)"
+            )
+        elif info.status is status_mod.ImportCheckStatus.ERROR:
+            click.echo(f"  \u2717 {info.path}: check failed ({info.error})")
+        else:
+            click.echo(f"  \u2713 {info.path}: up to date")
 
 
 def _print_suggestions_section(suggestions: list[str]) -> None:
