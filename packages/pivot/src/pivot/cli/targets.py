@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import logging
+import pathlib
 from typing import TYPE_CHECKING, Any, TypedDict
 
 import click
 
-from pivot import outputs, project
+from pivot import discovery, outputs, project
 from pivot.cli import helpers as cli_helpers
 from pivot.engine import graph as engine_graph
 
@@ -14,6 +15,7 @@ if TYPE_CHECKING:
 
     import networkx as nx
 
+    from pivot.pipeline.pipeline import Pipeline
     from pivot.show import plots as plots_mod
 
 logger = logging.getLogger(__name__)
@@ -47,6 +49,41 @@ def validate_targets(targets: tuple[str, ...]) -> list[str]:
         raise TargetValidationError("All targets are empty or whitespace-only")
 
     return valid
+
+
+_PIPELINE_FILENAMES = frozenset((*discovery.PIVOT_YAML_NAMES, discovery.PIPELINE_PY_NAME))
+
+
+def resolve_pipeline_file_targets(
+    targets: list[str],
+) -> tuple[set[str], list[str], list[Pipeline]]:
+    """Resolve targets that are paths to pipeline config files.
+
+    For each target, checks if it's an existing file whose name matches
+    pipeline.py, pivot.yaml, or pivot.yml. If so, loads the pipeline and
+    extracts all stage names.
+
+    Returns:
+        Tuple of (resolved stage names, remaining unresolved targets, loaded pipelines).
+    """
+    resolved = set[str]()
+    remaining = list[str]()
+    pipelines: list[Pipeline] = []
+
+    for target in targets:
+        path = pathlib.Path(target)
+        if path.is_file() and path.name in _PIPELINE_FILENAMES:
+            pipeline = discovery.load_pipeline_from_path(path)
+            if pipeline is not None:
+                for name in pipeline.list_stages():
+                    resolved.add(name)
+                pipelines.append(pipeline)
+            else:
+                remaining.append(target)
+        else:
+            remaining.append(target)
+
+    return resolved, remaining, pipelines
 
 
 def resolve_targets_to_stages(

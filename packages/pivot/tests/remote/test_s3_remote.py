@@ -285,6 +285,137 @@ async def test_exists_raises_on_other_error(
         await s3_remote.exists("abcdef1234567890")
 
 
+async def test_s3_exists_auth_error_expired_token(
+    s3_remote: remote_mod.S3Remote, mocker: MockerFixture
+) -> None:
+    """exists raises RemoteConnectionError with friendly message for expired token."""
+    mock_client = mocker.AsyncMock()
+    error = botocore_exc.ClientError(
+        {"Error": {"Code": "ExpiredTokenException", "Message": "Token expired"}},
+        "HeadObject",
+    )
+    mock_client.head_object = mocker.AsyncMock(side_effect=error)
+    _helper_patch_s3_client(mocker, s3_remote, mock_client)
+
+    with pytest.raises(
+        exceptions.RemoteConnectionError,
+        match="aws sso login",
+    ):
+        await s3_remote.exists("abcdef1234567890")
+
+
+async def test_s3_exists_auth_error_no_credentials(
+    s3_remote: remote_mod.S3Remote, mocker: MockerFixture
+) -> None:
+    """exists raises RemoteConnectionError with friendly message for missing credentials."""
+    mock_client = mocker.AsyncMock()
+    error = botocore_exc.NoCredentialsError()
+    mock_client.head_object = mocker.AsyncMock(side_effect=error)
+    _helper_patch_s3_client(mocker, s3_remote, mock_client)
+
+    with pytest.raises(
+        exceptions.RemoteConnectionError,
+        match="AWS credentials",
+    ):
+        await s3_remote.exists("abcdef1234567890")
+
+
+async def test_s3_exists_non_auth_error_still_generic(
+    s3_remote: remote_mod.S3Remote, mocker: MockerFixture
+) -> None:
+    """exists raises RemoteConnectionError with generic message for non-auth errors."""
+    mock_client = mocker.AsyncMock()
+    error = botocore_exc.ClientError(
+        {"Error": {"Code": "InternalError", "Message": "Internal server error"}},
+        "HeadObject",
+    )
+    mock_client.head_object = mocker.AsyncMock(side_effect=error)
+    _helper_patch_s3_client(mocker, s3_remote, mock_client)
+
+    with pytest.raises(
+        exceptions.RemoteConnectionError,
+        match="S3 error",
+    ):
+        await s3_remote.exists("abcdef1234567890")
+
+
+async def test_s3_iter_hashes_auth_error(
+    s3_remote: remote_mod.S3Remote, mocker: MockerFixture
+) -> None:
+    """iter_hashes raises RemoteConnectionError with friendly message for auth errors."""
+    mock_client = mocker.AsyncMock()
+    error = botocore_exc.ClientError(
+        {"Error": {"Code": "ExpiredTokenException", "Message": "Token expired"}},
+        "ListObjectsV2",
+    )
+
+    class _FailingAsyncIterator:
+        def __aiter__(self) -> _FailingAsyncIterator:
+            return self
+
+        async def __anext__(self) -> Any:  # noqa: ANN401
+            raise error
+
+    mock_paginator = mocker.MagicMock()
+    mock_paginator.paginate = mocker.MagicMock(return_value=_FailingAsyncIterator())
+    mock_client.get_paginator = mocker.Mock(return_value=mock_paginator)
+    _helper_patch_s3_client(mocker, s3_remote, mock_client)
+
+    with pytest.raises(
+        exceptions.RemoteConnectionError,
+        match="aws sso login",
+    ):
+        async for _ in s3_remote.iter_hashes():
+            pass
+
+
+async def test_s3_upload_file_auth_error(
+    s3_remote: remote_mod.S3Remote,
+    tmp_path: pathlib.Path,
+    mocker: MockerFixture,
+) -> None:
+    """upload_file raises RemoteConnectionError with friendly message for auth errors."""
+    mock_client = mocker.AsyncMock()
+    error = botocore_exc.ClientError(
+        {"Error": {"Code": "ExpiredTokenException", "Message": "Token expired"}},
+        "PutObject",
+    )
+    mock_client.put_object = mocker.AsyncMock(side_effect=error)
+    _helper_patch_s3_client(mocker, s3_remote, mock_client)
+
+    test_file = tmp_path / "test.txt"
+    test_file.write_bytes(b"test content")
+
+    with pytest.raises(
+        exceptions.RemoteConnectionError,
+        match="aws sso login",
+    ):
+        await s3_remote.upload_file(test_file, "abc123def4567890")
+
+
+async def test_s3_download_file_auth_error(
+    s3_remote: remote_mod.S3Remote,
+    tmp_path: pathlib.Path,
+    mocker: MockerFixture,
+) -> None:
+    """download_file raises RemoteConnectionError with friendly message for auth errors."""
+    mock_client = mocker.AsyncMock()
+    error = botocore_exc.ClientError(
+        {"Error": {"Code": "ExpiredTokenException", "Message": "Token expired"}},
+        "GetObject",
+    )
+    mock_client.get_object = mocker.AsyncMock(side_effect=error)
+    _helper_patch_s3_client(mocker, s3_remote, mock_client)
+
+    local_path = tmp_path / "downloaded.txt"
+
+    with pytest.raises(
+        exceptions.RemoteConnectionError,
+        match="aws sso login",
+    ):
+        await s3_remote.download_file("abc123def4567890", local_path)
+
+
 async def test_upload_file(
     s3_remote: remote_mod.S3Remote,
     tmp_path: pathlib.Path,

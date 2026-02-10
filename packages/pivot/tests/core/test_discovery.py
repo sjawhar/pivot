@@ -1083,6 +1083,38 @@ def test_glob_all_pipelines_finds_multiple_pipelines(
     assert len(result) == 3
 
 
+@pytest.mark.parametrize(
+    "excluded_dir",
+    [
+        pytest.param("site-packages", id="site_packages"),
+        pytest.param("dist-packages", id="dist_packages"),
+        pytest.param(".eggs", id="eggs"),
+    ],
+)
+def test_glob_all_pipelines_excludes_python_package_dirs(
+    set_project_root: pathlib.Path,
+    excluded_dir: str,
+) -> None:
+    """glob_all_pipelines skips site-packages, dist-packages, and .eggs directories."""
+    # Create a pipeline.py inside the excluded directory
+    excluded = set_project_root / excluded_dir / "some_lib"
+    excluded.mkdir(parents=True)
+    (excluded / "pipeline.py").write_text("# should be excluded\n")
+
+    # Create a valid pipeline.py that SHOULD be found
+    valid = set_project_root / "app"
+    valid.mkdir()
+    (valid / "pipeline.py").write_text("# valid pipeline\n")
+
+    result = discovery.glob_all_pipelines(set_project_root)
+
+    result_dirs = [p.parent.name for p in result]
+    assert "app" in result_dirs, "Valid pipeline should be found"
+    assert excluded_dir not in [
+        part for p in result for part in p.relative_to(set_project_root).parts
+    ], f"Pipelines inside {excluded_dir}/ should be excluded"
+
+
 # =============================================================================
 # discover_pipeline(all_pipelines=True) Tests
 # =============================================================================
@@ -1265,6 +1297,60 @@ pipeline.register(_stage, name="consumer")
     # Should log about the unresolved dependency at debug level
     assert any("not produced by any discovered pipeline" in msg for msg in caplog.messages), (
         f"Expected debug message about unresolved deps, got: {caplog.messages}"
+    )
+
+
+def test_discover_all_logs_per_pipeline_details(
+    set_project_root: pathlib.Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """discover_pipeline(all_pipelines=True) logs per-pipeline file path and stage count.
+
+    Each successfully loaded pipeline should log a line containing:
+    - The pipeline name
+    - The file path
+    - The number of stages in that pipeline
+    """
+    # Create two sub-pipelines with different stage counts
+    for name, stage_count in [("alpha", 2), ("beta", 1)]:
+        sub = set_project_root / name
+        sub.mkdir()
+        stages_code = "\n".join(
+            f"""\
+def _stage_{i}():
+    pass
+
+pipeline.register(_stage_{i}, name="stage_{name}_{i}")
+"""
+            for i in range(stage_count)
+        )
+        code = f"""\
+from pivot.pipeline.pipeline import Pipeline
+
+pipeline = Pipeline("{name}", root=__import__("pathlib").Path(__file__).parent)
+
+{stages_code}
+"""
+        (sub / "pipeline.py").write_text(code)
+
+    with caplog.at_level(logging.INFO):
+        result = discovery.discover_pipeline(set_project_root, all_pipelines=True)
+
+    assert result is not None
+    # Verify both pipelines were loaded
+    assert len(result.list_stages()) == 3, "Should have 3 total stages (2 from alpha, 1 from beta)"
+
+    # Check that per-pipeline log lines exist with path and stage count
+    alpha_path = set_project_root / "alpha" / "pipeline.py"
+    beta_path = set_project_root / "beta" / "pipeline.py"
+
+    # Look for log messages containing the pipeline name, path, and stage count
+    log_text = caplog.text
+    assert "alpha" in log_text and str(alpha_path) in log_text and "2 stages" in log_text, (
+        f"Expected log line for alpha pipeline with path and stage count, got: {log_text}"
+    )
+    assert "beta" in log_text and str(beta_path) in log_text and "1 stages" in log_text, (
+        f"Expected log line for beta pipeline with path and stage count, got: {log_text}"
     )
 
 

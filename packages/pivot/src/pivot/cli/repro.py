@@ -846,19 +846,43 @@ def repro(
 
     stages_list = cli_helpers.stages_to_list(stages)
     if stages_list is not None:
+        # Try pipeline-file resolution first (e.g., "pivot repro path/to/pipeline.py")
+        pipeline_resolved, stages_list, loaded_pipelines = (
+            cli_targets.resolve_pipeline_file_targets(stages_list)
+        )
+
+        if loaded_pipelines:
+            context_pipeline = cli_decorators.get_pipeline_from_context()
+            if context_pipeline is not None:
+                for pipeline in loaded_pipelines:
+                    context_pipeline.include(pipeline)
+            else:
+                from pivot.pipeline import pipeline as pipeline_mod
+
+                combined = pipeline_mod.Pipeline("cli", root=loaded_pipelines[0].root)
+                for pipeline in loaded_pipelines:
+                    combined.include(pipeline)
+                cli_decorators.store_pipeline_in_context(combined)
+
         # Fast-path: if all targets are registered stage names, skip graph construction
         registered = set(cli_helpers.list_stages())
-        if not all(s in registered for s in stages_list):
+
+        resolved = set[str]()
+        unresolved = list[str]()
+
+        if stages_list and not all(s in registered for s in stages_list):
             # Build graph and resolve file paths to producer stages (same as pivot dag)
             all_stages = cli_helpers.get_all_stages()
             bipartite_graph = engine_graph.build_graph(all_stages)
             resolved, unresolved = cli_targets.resolve_targets_to_stages(
                 stages_list, bipartite_graph
             )
-        else:
-            # All targets are registered stages - no resolution needed
+        elif stages_list:
+            # All remaining targets are registered stages - no resolution needed
             resolved = set(stages_list)
-            unresolved: list[str] = []
+
+        # Merge pipeline-file resolved stages
+        resolved |= pipeline_resolved
         if unresolved:
             from difflib import get_close_matches
 

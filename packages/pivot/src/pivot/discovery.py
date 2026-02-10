@@ -182,6 +182,7 @@ def _discover_all_pipelines(root: pathlib.Path) -> Pipeline | None:
         pipeline = load_pipeline_from_path(path)
         if pipeline is not None:
             pipelines.append(pipeline)
+            logger.info(f"  {pipeline.name}: {path} ({len(pipeline.list_stages())} stages)")
         else:
             logger.warning(f"--all: failed to load pipeline from {path}, skipping")
 
@@ -312,6 +313,9 @@ _SCAN_EXCLUDE_DIRS = frozenset(
         ".nox",
         ".mypy_cache",
         ".ruff_cache",
+        "site-packages",
+        "dist-packages",
+        ".eggs",
     }
 )
 

@@ -130,6 +130,29 @@ def _is_not_found_error(e: ClientError) -> bool:
     return e.response.get("Error", {}).get("Code") == "404"
 
 
+_AUTH_ERROR_CODES = frozenset(
+    {
+        "ExpiredTokenException",
+        "ExpiredToken",
+        "InvalidIdentityToken",
+        "InvalidGrantException",
+        "UnrecognizedClientException",
+        "InvalidClientTokenId",
+        "SignatureDoesNotMatch",
+    }
+)
+
+_AUTH_ERROR_MESSAGE = (
+    "AWS credentials are expired or invalid. "
+    "Run 'aws sso login' to refresh your credentials, or check your AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY."
+)
+
+
+def _is_auth_error(e: ClientError) -> bool:
+    """Check if botocore ClientError is an authentication error."""
+    return e.response.get("Error", {}).get("Code") in _AUTH_ERROR_CODES
+
+
 def _hash_to_key(prefix: str, hash_: str) -> str:
     """Convert cache hash to S3 key (files/XX/YYYYYYYY...)."""
     return f"{prefix}files/{hash_[:2]}/{hash_[2:]}"
@@ -323,7 +346,11 @@ class S3Remote:
             except botocore_exc.ClientError as e:
                 if _is_not_found_error(e):
                     return False
+                if _is_auth_error(e):
+                    raise exceptions.RemoteConnectionError(_AUTH_ERROR_MESSAGE) from e
                 raise exceptions.RemoteConnectionError(f"S3 error: {e}") from e
+            except botocore_exc.NoCredentialsError as e:
+                raise exceptions.RemoteConnectionError(_AUTH_ERROR_MESSAGE) from e
 
     async def bulk_exists(
         self, hashes: list[str], concurrency: int = DEFAULT_CONCURRENCY
@@ -373,7 +400,11 @@ class S3Remote:
                 except botocore_exc.ClientError as e:
                     if _is_not_found_error(e):
                         return (hash_, False)
+                    if _is_auth_error(e):
+                        raise exceptions.RemoteConnectionError(_AUTH_ERROR_MESSAGE) from e
                     raise exceptions.RemoteConnectionError(f"S3 HEAD error for {hash_}: {e}") from e
+                except botocore_exc.NoCredentialsError as e:
+                    raise exceptions.RemoteConnectionError(_AUTH_ERROR_MESSAGE) from e
 
         results = await asyncio.gather(*[check_one(h) for h in hashes], return_exceptions=True)
 
@@ -399,6 +430,8 @@ class S3Remote:
         """
         from collections import defaultdict
 
+        from botocore import exceptions as botocore_exc
+
         # Group hashes by prefix
         by_prefix = defaultdict[str, set[str]](set)
         for h in hashes:
@@ -409,23 +442,30 @@ class S3Remote:
 
         async def list_prefix(prefix: str, wanted: set[str]) -> dict[str, bool]:
             async with semaphore:
-                found = set[str]()
-                s3_prefix = f"{self._prefix}files/{prefix}/"
-                paginator = s3.get_paginator("list_objects_v2")
-                async for page in paginator.paginate(Bucket=self._bucket, Prefix=s3_prefix):
-                    for obj in page.get("Contents", []):
-                        key = obj.get("Key")
-                        if key is None:
-                            continue
-                        hash_ = _key_to_hash(self._prefix, key)
-                        if hash_ and hash_ in wanted:
-                            found.add(hash_)
-                            # Early exit if we found all we're looking for
-                            if found == wanted:
-                                break
-                    if found == wanted:
-                        break
-                return {h: h in found for h in wanted}
+                try:
+                    found = set[str]()
+                    s3_prefix = f"{self._prefix}files/{prefix}/"
+                    paginator = s3.get_paginator("list_objects_v2")
+                    async for page in paginator.paginate(Bucket=self._bucket, Prefix=s3_prefix):
+                        for obj in page.get("Contents", []):
+                            key = obj.get("Key")
+                            if key is None:
+                                continue
+                            hash_ = _key_to_hash(self._prefix, key)
+                            if hash_ and hash_ in wanted:
+                                found.add(hash_)
+                                # Early exit if we found all we're looking for
+                                if found == wanted:
+                                    break
+                        if found == wanted:
+                            break
+                    return {h: h in found for h in wanted}
+                except botocore_exc.ClientError as e:
+                    if _is_auth_error(e):
+                        raise exceptions.RemoteConnectionError(_AUTH_ERROR_MESSAGE) from e
+                    raise exceptions.RemoteConnectionError(f"S3 LIST error: {e}") from e
+                except botocore_exc.NoCredentialsError as e:
+                    raise exceptions.RemoteConnectionError(_AUTH_ERROR_MESSAGE) from e
 
         tasks = [list_prefix(prefix, wanted) for prefix, wanted in by_prefix.items()]
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -442,18 +482,27 @@ class S3Remote:
 
     async def iter_hashes(self) -> AsyncIterator[str]:
         """Iterate over all cache hashes on remote (memory-efficient streaming)."""
+        from botocore import exceptions as botocore_exc
+
         prefix = f"{self._prefix}files/"
 
-        async with self._session.client("s3", config=_get_s3_config()) as s3:
-            paginator = s3.get_paginator("list_objects_v2")
-            async for page in paginator.paginate(Bucket=self._bucket, Prefix=prefix):
-                for obj in page.get("Contents", []):
-                    key = obj.get("Key")
-                    if key is None:
-                        continue
-                    hash_ = _key_to_hash(self._prefix, key)
-                    if hash_ is not None:
-                        yield hash_
+        try:
+            async with self._session.client("s3", config=_get_s3_config()) as s3:
+                paginator = s3.get_paginator("list_objects_v2")
+                async for page in paginator.paginate(Bucket=self._bucket, Prefix=prefix):
+                    for obj in page.get("Contents", []):
+                        key = obj.get("Key")
+                        if key is None:
+                            continue
+                        hash_ = _key_to_hash(self._prefix, key)
+                        if hash_ is not None:
+                            yield hash_
+        except botocore_exc.ClientError as e:
+            if _is_auth_error(e):
+                raise exceptions.RemoteConnectionError(_AUTH_ERROR_MESSAGE) from e
+            raise exceptions.RemoteConnectionError(f"S3 error: {e}") from e
+        except botocore_exc.NoCredentialsError as e:
+            raise exceptions.RemoteConnectionError(_AUTH_ERROR_MESSAGE) from e
 
     async def list_hashes(self) -> set[str]:
         """List all cache hashes on remote (collects into memory)."""
@@ -466,25 +515,43 @@ class S3Remote:
 
     async def upload_file(self, local_path: Path, cache_hash: str) -> None:
         """Upload a single file to remote with streaming for large files."""
+        from botocore import exceptions as botocore_exc
+
         _validate_hash(cache_hash)
-        async with self._session.client("s3", config=_get_s3_config()) as s3:
-            await _stream_upload(
-                s3, self._bucket, _hash_to_key(self._prefix, cache_hash), local_path
-            )
+        try:
+            async with self._session.client("s3", config=_get_s3_config()) as s3:
+                await _stream_upload(
+                    s3, self._bucket, _hash_to_key(self._prefix, cache_hash), local_path
+                )
+        except botocore_exc.ClientError as e:
+            if _is_auth_error(e):
+                raise exceptions.RemoteConnectionError(_AUTH_ERROR_MESSAGE) from e
+            raise
+        except botocore_exc.NoCredentialsError as e:
+            raise exceptions.RemoteConnectionError(_AUTH_ERROR_MESSAGE) from e
 
     async def download_file(
         self, cache_hash: str, local_path: Path, *, readonly: bool = False
     ) -> None:
         """Download a single file from remote (atomic write via temp file, streamed)."""
+        from botocore import exceptions as botocore_exc
+
         _validate_hash(cache_hash)
-        async with self._session.client("s3", config=_get_s3_config()) as s3:
-            await _atomic_download(
-                s3,
-                self._bucket,
-                _hash_to_key(self._prefix, cache_hash),
-                local_path,
-                readonly=readonly,
-            )
+        try:
+            async with self._session.client("s3", config=_get_s3_config()) as s3:
+                await _atomic_download(
+                    s3,
+                    self._bucket,
+                    _hash_to_key(self._prefix, cache_hash),
+                    local_path,
+                    readonly=readonly,
+                )
+        except botocore_exc.ClientError as e:
+            if _is_auth_error(e):
+                raise exceptions.RemoteConnectionError(_AUTH_ERROR_MESSAGE) from e
+            raise
+        except botocore_exc.NoCredentialsError as e:
+            raise exceptions.RemoteConnectionError(_AUTH_ERROR_MESSAGE) from e
 
     async def upload_batch(
         self,

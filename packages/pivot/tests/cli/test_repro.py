@@ -8,7 +8,7 @@ import sys
 from typing import TYPE_CHECKING, Annotated, TypedDict
 
 from conftest import isolated_pivot_dir
-from helpers import register_test_stage
+from helpers import create_pipeline_py, register_test_stage
 from pivot import cli, executor, loaders, outputs
 from pivot.storage import cache, track
 
@@ -376,6 +376,32 @@ def test_repro_unknown_stage_errors(
 
     assert result.exit_code != 0
     assert "nonexistent_stage" in result.output
+
+
+def test_repro_pipeline_file_target_registers_stages(
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+) -> None:
+    """repro with pipeline.py path registers and resolves stage targets."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        subdir = cwd / "sub"
+        subdir.mkdir()
+        extra_code = """\
+class _StageAOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out(\"a.txt\", loaders.PathOnly())]
+"""
+        pipeline_path = create_pipeline_py(
+            [_helper_stage_a],
+            path=subdir,
+            extra_code=extra_code,
+            names={"_helper_stage_a": "stage_a"},
+        )
+
+        result = runner.invoke(cli.cli, ["repro", "--dry-run", str(pipeline_path)])
+
+        assert result.exit_code == 0, f"repro failed: {result.output}"
+        assert "Would run:" in result.output, "Dry-run output should include plan summary"
+        assert "stage_a" in result.output, "Pipeline file stage should be resolved"
 
 
 # =============================================================================
