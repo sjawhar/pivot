@@ -526,7 +526,7 @@ class S3Remote:
         except botocore_exc.ClientError as e:
             if _is_auth_error(e):
                 raise exceptions.RemoteConnectionError(_AUTH_ERROR_MESSAGE) from e
-            raise
+            raise exceptions.RemoteConnectionError(f"S3 upload error: {e}") from e
         except botocore_exc.NoCredentialsError as e:
             raise exceptions.RemoteConnectionError(_AUTH_ERROR_MESSAGE) from e
 
@@ -549,7 +549,7 @@ class S3Remote:
         except botocore_exc.ClientError as e:
             if _is_auth_error(e):
                 raise exceptions.RemoteConnectionError(_AUTH_ERROR_MESSAGE) from e
-            raise
+            raise exceptions.RemoteConnectionError(f"S3 download error: {e}") from e
         except botocore_exc.NoCredentialsError as e:
             raise exceptions.RemoteConnectionError(_AUTH_ERROR_MESSAGE) from e
 

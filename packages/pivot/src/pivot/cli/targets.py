@@ -11,8 +11,6 @@ from pivot.cli import helpers as cli_helpers
 from pivot.engine import graph as engine_graph
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     import networkx as nx
 
     from pivot.pipeline.pipeline import Pipeline
@@ -120,7 +118,7 @@ def resolve_targets_to_stages(
 
 def _classify_targets(
     targets: list[str],
-    proj_root: Path,
+    proj_root: pathlib.Path,
 ) -> list[ResolvedTarget]:
     """Classify each target as stage, file, both, or neither."""
     registered_stages = set(cli_helpers.list_stages())
@@ -151,7 +149,7 @@ def _classify_targets(
 
 def resolve_output_paths(
     targets: list[str],
-    proj_root: Path,
+    proj_root: pathlib.Path,
     output_type: type[outputs.Metric] | type[outputs.Plot[Any]],
 ) -> tuple[set[str], list[str]]:
     """Resolve targets to output file paths.
@@ -179,7 +177,7 @@ def resolve_output_paths(
 
 def resolve_plot_infos(
     targets: list[str],
-    proj_root: Path,
+    proj_root: pathlib.Path,
 ) -> tuple[list[plots_mod.PlotInfo], list[str]]:
     """Resolve targets to PlotInfo entries with full metadata.
 
@@ -233,7 +231,7 @@ def _format_unknown_targets_error(missing: list[str]) -> str:
 
 def resolve_and_validate(
     targets: tuple[str, ...],
-    proj_root: Path,
+    proj_root: pathlib.Path,
     output_type: type[outputs.Metric] | type[outputs.Plot[Any]],
 ) -> set[str] | None:
     """Validate targets and resolve to output paths.
