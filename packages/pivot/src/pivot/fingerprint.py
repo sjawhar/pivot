@@ -450,6 +450,32 @@ def get_stage_fingerprint_cached(stage_name: str, func: Callable[..., Any]) -> d
     return manifest
 
 
+def _collect_nested_code_globals(code: types.CodeType) -> set[str]:
+    """Collect global names referenced by nested code objects in co_consts.
+
+    Recursively walks co_consts to find nested code objects (from nested
+    functions, lambdas, comprehensions, etc.) and returns the set of global
+    names they reference via co_names.
+
+    Notes:
+        co_names is a superset of actual LOAD_GLOBAL names — it also includes
+        attribute access names. The caller filters via func.__globals__ and
+        _process_closure_values, making false positives benign (over-invalidation
+        is safe; under-invalidation is catastrophic).
+
+        On Python 3.12+ (PEP 709), list/dict/set comprehensions are inlined and
+        no longer produce code objects in co_consts. Their globals appear in the
+        parent function's co_names and are handled by getclosurevars() instead.
+        Generator expressions still produce code objects and are walked here.
+    """
+    nested_globals = set[str]()
+    for const in code.co_consts:
+        if isinstance(const, types.CodeType):
+            nested_globals.update(const.co_names)
+            nested_globals.update(_collect_nested_code_globals(const))
+    return nested_globals
+
+
 def _get_stage_fingerprint_impl(func: Callable[..., Any], visited: set[int]) -> dict[str, str]:
     """Internal implementation of get_stage_fingerprint."""
     manifest = dict[str, str]()
@@ -489,6 +515,29 @@ def _get_stage_fingerprint_impl(func: Callable[..., Any], visited: set[int]) -> 
         skip_dunders=False,
         include_modules=False,
     )
+
+    # Discover globals referenced by nested functions/lambdas
+    # (getclosurevars only sees the outer function's own bytecode)
+    code_obj = getattr(func, "__code__", None)
+    func_globals = getattr(func, "__globals__", None)
+    if code_obj is not None and func_globals is not None:
+        already_processed = set(closure_vars.globals.keys())
+        nested_global_names = _collect_nested_code_globals(code_obj)
+        new_names = nested_global_names - already_processed
+        if new_names:
+            nested_globals_dict = dict[str, Any]()
+            for name in new_names:
+                if name in func_globals:
+                    nested_globals_dict[name] = func_globals[name]
+            if nested_globals_dict:
+                _process_closure_values(
+                    nested_globals_dict,
+                    func,
+                    manifest,
+                    visited,
+                    skip_dunders=True,
+                    include_modules=True,
+                )
 
     _process_type_hint_dependencies(func, manifest, visited)
 

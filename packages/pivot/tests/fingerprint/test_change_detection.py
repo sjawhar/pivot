@@ -1,3 +1,5 @@
+# pyright: reportMissingImports=false, reportUnknownVariableType=false, reportUnknownMemberType=false, reportUntypedFunctionDecorator=false, reportUnusedCallResult=false, reportAny=false, reportUnknownParameterType=false, reportUnknownArgumentType=false
+
 import importlib
 import linecache
 import pathlib
@@ -34,6 +36,7 @@ def module_dir(tmp_path: pathlib.Path):
         "test_instchange_",
         "test_nonlocal_",
         "test_params_",
+        "test_nested_",
     )
     to_remove = [name for name in sys.modules if name.startswith(prefixes)]
     for name in to_remove:
@@ -809,4 +812,184 @@ def stage(params: MyParams) -> str:
 
     assert fp1["class:MyParams"] != fp2["class:MyParams"], (
         "Class variable change on StageParams must cause cache miss"
+    )
+
+
+# =============================================================================
+# SECTION 7: Nested function global references
+# =============================================================================
+
+
+def test_nested_function_global_reference_detected(module_dir: pathlib.Path) -> None:
+    """Nested function globals are captured in fingerprint manifest."""
+    mod_py = module_dir / "test_nested_global_ref.py"
+    mod_py.write_text(
+        """def helper(x):
+    return x + 1
+
+def compute():
+    def process_batch(items):
+        return [helper(i) for i in items]
+    return process_batch([1, 2, 3])
+
+def stage():
+    return compute()
+"""
+    )
+
+    mod = _import_fresh("test_nested_global_ref")
+    fp = fingerprint.get_stage_fingerprint(mod.stage)
+
+    assert "func:helper" in fp, "Nested global helper should be captured"
+
+
+def test_nested_function_global_change_causes_miss(module_dir: pathlib.Path) -> None:
+    """Changing nested-only global helper causes fingerprint change."""
+    mod_py = module_dir / "test_nested_global_change.py"
+    mod_py.write_text(
+        """def helper(x):
+    return x + 1
+
+def compute():
+    def process_batch(items):
+        return [helper(i) for i in items]
+    return process_batch([1, 2, 3])
+
+def stage():
+    return compute()
+"""
+    )
+
+    mod = _import_fresh("test_nested_global_change")
+    fp1 = fingerprint.get_stage_fingerprint(mod.stage)
+
+    mod_py.write_text(
+        """def helper(x):
+    return x + 999
+
+def compute():
+    def process_batch(items):
+        return [helper(i) for i in items]
+    return process_batch([1, 2, 3])
+
+def stage():
+    return compute()
+"""
+    )
+    mod = _import_fresh("test_nested_global_change")
+    fp2 = fingerprint.get_stage_fingerprint(mod.stage)
+
+    assert fp1 != fp2, "Nested global helper change must cause cache miss"
+
+
+def test_deeply_nested_function_global_detected(module_dir: pathlib.Path) -> None:
+    """Deeply nested globals are captured in fingerprint manifest."""
+    mod_py = module_dir / "test_nested_deep.py"
+    mod_py.write_text(
+        """def leaf(x):
+    return x + 1
+
+def tweak(x):
+    return x * 2
+
+def outer():
+    def middle():
+        def inner():
+            return leaf(1)
+        return tweak(inner())
+    return middle()
+
+def stage():
+    return outer()
+"""
+    )
+
+    mod = _import_fresh("test_nested_deep")
+    fp = fingerprint.get_stage_fingerprint(mod.stage)
+
+    assert "func:leaf" in fp, "Deeply nested leaf should be captured"
+    assert "func:tweak" in fp, "Deeply nested tweak should be captured"
+
+
+def test_nested_lambda_global_detected(module_dir: pathlib.Path) -> None:
+    """Nested lambda globals are captured in fingerprint manifest."""
+    mod_py = module_dir / "test_nested_lambda.py"
+    mod_py.write_text(
+        """def processor(x):
+    return x * 2
+
+def compute(items):
+    fn = lambda x: processor(x)
+    return [fn(item) for item in items]
+
+def stage():
+    return compute([1, 2])
+"""
+    )
+
+    mod = _import_fresh("test_nested_lambda")
+    fp = fingerprint.get_stage_fingerprint(mod.stage)
+
+    assert "func:processor" in fp, "Nested lambda global should be captured"
+
+
+def test_nested_function_builtin_not_tracked(module_dir: pathlib.Path) -> None:
+    """Builtins used only in nested functions are not tracked."""
+    mod_py = module_dir / "test_nested_builtin.py"
+    mod_py.write_text(
+        """def compute():
+    def inner(items):
+        return min(items) + len(items) + sum(range(3))
+    return inner([1, 2, 3])
+
+def stage():
+    return compute()
+"""
+    )
+
+    mod = _import_fresh("test_nested_builtin")
+    fp = fingerprint.get_stage_fingerprint(mod.stage)
+
+    assert "func:min" not in fp, "Builtins should not be tracked as globals"
+    assert "func:len" not in fp, "Builtins should not be tracked as globals"
+
+
+def test_nested_function_attribute_collision_over_invalidates(
+    module_dir: pathlib.Path,
+) -> None:
+    """Attribute name matching a global is over-included (known benign behavior).
+
+    When a nested function does `text.upper()`, 'upper' appears in co_names.
+    If a module-level function also named 'upper' exists in __globals__,
+    it gets included in the fingerprint even though the nested function
+    only uses it as an attribute.  This is a known benign over-inclusion:
+    co_names is a superset of LOAD_GLOBAL names, and over-invalidation
+    is safe (under-invalidation is catastrophic).
+    """
+    mod_py = module_dir / "test_nested_attr_collision.py"
+    mod_py.write_text(
+        """def upper(x):
+    \"\"\"Module-level function that shares name with str.upper.\"\"\"
+    return x * 2
+
+def compute(text):
+    def nested():
+        # text.upper() puts 'upper' in co_names as attribute access,
+        # but module-level 'upper' also exists in __globals__
+        return text.upper()
+    return nested()
+
+def stage():
+    return compute("hello")
+"""
+    )
+
+    mod = _import_fresh("test_nested_attr_collision")
+    fp = fingerprint.get_stage_fingerprint(mod.stage)
+
+    # 'upper' is over-included because co_names contains attribute access names
+    # and __globals__ has a function with the same name. This is benign:
+    # over-invalidation is safe, under-invalidation is catastrophic.
+    assert "func:upper" in fp, (
+        "Attribute name colliding with global should be over-included (benign)"
     )
