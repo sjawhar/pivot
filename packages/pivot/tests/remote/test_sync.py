@@ -2,6 +2,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import pytest
+
+from pivot import loaders
+from pivot import outputs as outputs_mod
+from pivot.registry import RegistryStageInfo
 from pivot.remote import storage as remote_storage
 from pivot.remote import sync
 from pivot.storage import cache as cache_mod
@@ -11,6 +16,7 @@ from pivot.types import DirHash, DirManifestEntry, FileHash, LockData, TransferR
 
 if TYPE_CHECKING:
     import pathlib
+    from collections.abc import Callable
 
     from pytest_mock import MockerFixture
 
@@ -121,6 +127,16 @@ def test_get_stage_dep_hashes_excludes_tree_hash(set_project_root: pathlib.Path)
 # =============================================================================
 
 
+def _helper_out_cache_false(path: str) -> outputs_mod.Out[pathlib.Path]:
+    """Factory for Out(cache=False) — used in parametrized tests."""
+    return outputs_mod.Out(path=path, loader=loaders.PathOnly(), cache=False)
+
+
+def _helper_metric(path: str) -> outputs_mod.Metric:
+    """Factory for Metric — used in parametrized tests."""
+    return outputs_mod.Metric(path=path)
+
+
 def test_get_target_hashes_invalid_stage_name_falls_through(
     set_project_root: pathlib.Path,
 ) -> None:
@@ -133,6 +149,111 @@ def test_get_target_hashes_invalid_stage_name_falls_through(
     # After the fix it should fall through and end up in `unresolved`.
     result = sync.get_target_hashes(["my data.csv"], state_dir)
     assert result == set()
+
+
+@pytest.mark.parametrize(
+    "make_noncached",
+    [
+        pytest.param(_helper_out_cache_false, id="out-cache-false"),
+        pytest.param(_helper_metric, id="metric"),
+    ],
+)
+def test_get_target_hashes_excludes_noncached_outputs(
+    set_project_root: pathlib.Path,
+    make_noncached: Callable[[str], outputs_mod.BaseOut],
+) -> None:
+    """get_target_hashes excludes cache=False outputs from returned hashes."""
+    state_dir = set_project_root / ".pivot"
+    stages_dir = lock.get_stages_dir(state_dir)
+    stages_dir.mkdir(parents=True, exist_ok=True)
+
+    cached_out = outputs_mod.Out(
+        path=str(set_project_root / "output.csv"),
+        loader=loaders.PathOnly(),
+        cache=True,
+    )
+    noncached = make_noncached(str(set_project_root / "metrics.json"))
+
+    expanded_cached = outputs_mod.require_expanded(cached_out)
+    expanded_noncached = outputs_mod.require_expanded(noncached)
+
+    all_stages = {
+        "my_stage": RegistryStageInfo(  # pyright: ignore[reportCallIssue] - partial for test
+            state_dir=None,
+            outs=[expanded_cached, expanded_noncached],
+        )
+    }
+
+    cached_hash = FileHash(hash="1111111111111111")
+    noncached_hash = FileHash(hash="2222222222222222")
+    lock_data = LockData(
+        code_manifest={},
+        params={},
+        dep_hashes={},
+        output_hashes={
+            str(set_project_root / "output.csv"): cached_hash,
+            str(set_project_root / "metrics.json"): noncached_hash,
+        },
+    )
+    lock.StageLock("my_stage", stages_dir).write(lock_data)
+
+    result = sync.get_target_hashes(["my_stage"], state_dir, all_stages=all_stages)
+
+    assert "1111111111111111" in result, "Cached output hash should be included"
+    assert "2222222222222222" not in result, "Non-cached output hash should be excluded"
+
+
+def test_get_target_hashes_file_target_excludes_noncached(
+    set_project_root: pathlib.Path,
+) -> None:
+    """File-path target for a cache=False output returns no hashes."""
+    state_dir = set_project_root / ".pivot"
+    stages_dir = lock.get_stages_dir(state_dir)
+    stages_dir.mkdir(parents=True, exist_ok=True)
+
+    # Stage with one cached and one non-cached output
+    cached_out = outputs_mod.Out(
+        path=str(set_project_root / "output.csv"),
+        loader=loaders.PathOnly(),
+        cache=True,
+    )
+    metric_out = outputs_mod.Metric(path=str(set_project_root / "metrics.json"))
+
+    expanded_cached = outputs_mod.require_expanded(cached_out)
+    expanded_metric = outputs_mod.require_expanded(metric_out)
+
+    all_stages = {
+        "my_stage": RegistryStageInfo(  # pyright: ignore[reportCallIssue] - partial for test
+            state_dir=None,
+            outs=[expanded_cached, expanded_metric],
+        )
+    }
+
+    cached_hash = FileHash(hash="1111111111111111")
+    metric_hash = FileHash(hash="2222222222222222")
+    lock_data = LockData(
+        code_manifest={},
+        params={},
+        dep_hashes={},
+        output_hashes={
+            str(set_project_root / "output.csv"): cached_hash,
+            str(set_project_root / "metrics.json"): metric_hash,
+        },
+    )
+    lock.StageLock("my_stage", stages_dir).write(lock_data)
+
+    # Target the non-cached file directly by path (not stage name)
+    # This exercises _get_file_hash_from_stages (sync.py:107-124)
+    result = sync.get_target_hashes(
+        [str(set_project_root / "metrics.json")], state_dir, all_stages=all_stages
+    )
+    assert "2222222222222222" not in result, "Non-cached file target should return no hashes"
+
+    # Target the cached file directly — should return its hash
+    result_cached = sync.get_target_hashes(
+        [str(set_project_root / "output.csv")], state_dir, all_stages=all_stages
+    )
+    assert "1111111111111111" in result_cached, "Cached file target should return its hash"
 
 
 # =============================================================================

@@ -127,6 +127,16 @@ def _helper_expand_outs(outs: list[outputs.BaseOut]) -> list[outputs.ExpandedOut
     return [outputs.require_expanded(out) for out in outs]
 
 
+def _helper_out_cache_false(path: str) -> outputs.Out[pathlib.Path]:
+    """Factory for Out(cache=False) — used in parametrized tests."""
+    return outputs.Out(path=path, loader=loaders.PathOnly(), cache=False)
+
+
+def _helper_metric(path: str) -> outputs.Metric:
+    """Factory for Metric — used in parametrized tests."""
+    return outputs.Metric(path=path)
+
+
 # =============================================================================
 # Prepare Outputs for Execution Tests
 # =============================================================================
@@ -143,6 +153,27 @@ def test_prepare_outputs_regular_out_is_deleted(tmp_path: pathlib.Path) -> None:
     worker._prepare_outputs_for_execution(stage_outs, None, tmp_path / "cache")
 
     assert not output_file.exists()
+
+
+@pytest.mark.parametrize(
+    "make_out",
+    [
+        pytest.param(_helper_out_cache_false, id="out-cache-false"),
+        pytest.param(_helper_metric, id="metric"),
+    ],
+)
+def test_prepare_outputs_noncached_out_is_deleted(
+    tmp_path: pathlib.Path,
+    make_out: "Callable[[str], outputs.BaseOut]",
+) -> None:
+    """Non-cached outputs (Out(cache=False) and Metric) should be deleted before execution."""
+    output_file = tmp_path / "output.txt"
+    output_file.write_text("existing content")
+
+    stage_outs = _helper_expand_outs([make_out(str(output_file))])
+    worker._prepare_outputs_for_execution(stage_outs, None, tmp_path / "cache")
+
+    assert not output_file.exists(), "Non-cached output should be deleted before execution"
 
 
 def test_prepare_outputs_incremental_no_cache_creates_empty(tmp_path: pathlib.Path) -> None:
