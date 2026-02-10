@@ -1252,25 +1252,188 @@ def incremental_cache_stage(
     return existing
 
 
+# Module-level helper for mixed Out and IncrementalOut test
+class _MixedOutputs(TypedDict):
+    result: Annotated[dict[str, str], outputs.Out("result.json", loaders.JSON[dict[str, str]]())]
+    cache: Annotated[
+        dict[str, str], outputs.IncrementalOut("data/cache.json", loaders.JSON[dict[str, str]]())
+    ]
+
+
+def mixed_out_and_incremental_stage(
+    input_data: Annotated[
+        dict[str, str], outputs.Dep("input.json", loaders.JSON[dict[str, str]]())
+    ],
+    cache: Annotated[
+        dict[str, str], outputs.IncrementalOut("data/cache.json", loaders.JSON[dict[str, str]]())
+    ],
+) -> _MixedOutputs:
+    """Stage with both Out and IncrementalOut outputs."""
+    result = {**input_data, **cache}
+    return _MixedOutputs(result=result, cache=cache)
+
+
 def test_pipeline_register_incremental_out_stage(set_project_root: pathlib.Path) -> None:
     """Pipeline.register() should succeed for stages using IncrementalOut.
 
-    IncrementalOut paths cannot be overridden (registry rejects path overrides
-    for them), so Pipeline must NOT pass IncrementalOut paths as overrides.
-    The paths remain as specified in the annotations (normalized by registry).
+    IncrementalOut paths are resolved relative to pipeline root (like all other
+    output types) and then normalized to absolute by the registry.
     """
     p = Pipeline("test", root=set_project_root / "subdir")
 
-    # This should NOT raise - IncrementalOut paths are not overridden
+    # This should NOT raise
     p.register(incremental_cache_stage)
 
     # Verify the stage was registered
     assert "incremental_cache_stage" in p.list_stages()
     info = p.get("incremental_cache_stage")
 
-    # IncrementalOut path is preserved (not resolved relative to pipeline root)
-    # Registry normalizes it to absolute based on project root
+    # IncrementalOut path is resolved relative to pipeline root, then normalized
     assert info["outs_paths"][0].endswith("data/cache.yaml")
+
+
+def test_pipeline_incremental_out_path_resolved_relative_to_pipeline_root(
+    set_project_root: pathlib.Path,
+) -> None:
+    """IncrementalOut paths should be resolved relative to pipeline root.
+
+    When a pipeline lives in a subdirectory, IncrementalOut paths should be
+    resolved relative to that subdirectory, not the project root.
+    """
+    subdir = set_project_root / "subdir"
+    subdir.mkdir(exist_ok=True)
+
+    p = Pipeline("test", root=subdir)
+    p.register(incremental_cache_stage)
+
+    info = p.get("incremental_cache_stage")
+    out_path = pathlib.Path(info["outs_paths"][0])
+
+    # The resolved path should be relative to the pipeline root (subdir)
+    # not the project root
+    expected_path = subdir / "data" / "cache.yaml"
+    assert out_path == expected_path, (
+        f"IncrementalOut path should be resolved relative to pipeline root. "
+        f"Expected {expected_path}, got {out_path}"
+    )
+
+
+def test_pipeline_incremental_out_user_override_rejected(
+    set_project_root: pathlib.Path,
+) -> None:
+    """Pipeline.register() should reject user-provided overrides for IncrementalOut.
+
+    User-provided out_path_overrides targeting IncrementalOut outputs should
+    raise ValueError at the Pipeline level.
+    """
+    p = Pipeline("test", root=set_project_root)
+
+    # incremental_cache_stage is a single-output stage — any key is rejected
+    with pytest.raises(ValueError, match="Cannot override IncrementalOut output path"):
+        p.register(
+            incremental_cache_stage,
+            out_path_overrides={"_single": "data/new_cache.yaml"},
+        )
+
+
+def test_pipeline_incremental_out_user_override_rejected_any_key(
+    set_project_root: pathlib.Path,
+) -> None:
+    """Pipeline rejects IncrementalOut overrides regardless of the key used.
+
+    Single-output stages in the registry accept any single override key, so
+    Pipeline must reject based on the output type, not just key matching.
+    """
+    p = Pipeline("test", root=set_project_root)
+
+    # Even with a non-_single key, the override should be rejected
+    with pytest.raises(ValueError, match="Cannot override IncrementalOut output path"):
+        p.register(
+            incremental_cache_stage,
+            out_path_overrides={"output": "data/new_cache.yaml"},
+        )
+
+
+def test_pipeline_mixed_out_and_incremental_out_paths_resolved_relative_to_pipeline_root(
+    set_project_root: pathlib.Path,
+) -> None:
+    """Both Out and IncrementalOut paths should be resolved relative to pipeline root.
+
+    When a stage has both regular Out and IncrementalOut outputs, both should be
+    resolved relative to the pipeline root (not project root) when the pipeline
+    lives in a subdirectory.
+    """
+    subdir = set_project_root / "subdir"
+    subdir.mkdir(exist_ok=True)
+
+    p = Pipeline("test", root=subdir)
+    p.register(mixed_out_and_incremental_stage)
+
+    info = p.get("mixed_out_and_incremental_stage")
+    outs_paths = [pathlib.Path(path) for path in info["outs_paths"]]
+
+    # Should have 2 outputs: result (Out) and cache (IncrementalOut)
+    assert len(outs_paths) == 2, f"Expected 2 outputs (Out + IncrementalOut), got {len(outs_paths)}"
+
+    # Both paths should be resolved relative to pipeline root (subdir)
+    expected_result_path = subdir / "result.json"
+    expected_cache_path = subdir / "data" / "cache.json"
+
+    assert expected_result_path in outs_paths, (
+        f"Out path should be resolved relative to pipeline root. "
+        f"Expected {expected_result_path} in {outs_paths}"
+    )
+    assert expected_cache_path in outs_paths, (
+        f"IncrementalOut path should be resolved relative to pipeline root. "
+        f"Expected {expected_cache_path} in {outs_paths}"
+    )
+
+
+def test_pipeline_incremental_out_dep_path_resolved_relative_to_pipeline_root(
+    set_project_root: pathlib.Path,
+) -> None:
+    """IncrementalOut input dep paths should be resolved relative to pipeline root.
+
+    When a pipeline lives in a subdirectory, IncrementalOut input paths should
+    resolve to the same location as IncrementalOut output paths.
+    """
+    subdir = set_project_root / "subdir"
+    subdir.mkdir(exist_ok=True)
+
+    p = Pipeline("test", root=subdir)
+    p.register(incremental_cache_stage)
+
+    info = p.get("incremental_cache_stage")
+
+    # Output path should be resolved relative to pipeline root
+    out_path = pathlib.Path(info["outs_paths"][0])
+    expected_path = subdir / "data" / "cache.yaml"
+    assert out_path == expected_path, (
+        f"IncrementalOut output path should be {expected_path}, got {out_path}"
+    )
+
+    # Input dep path should match the output path (same file!)
+    # IncrementalOut deps use the param name as key in info["deps"]
+    dep_path_raw = info["deps"]["existing"]
+    assert isinstance(dep_path_raw, str), "IncrementalOut dep should be a single path"
+    dep_path = pathlib.Path(dep_path_raw)
+    assert dep_path == expected_path, (
+        f"IncrementalOut input dep path should match output path. "
+        f"Expected {expected_path}, got {dep_path}"
+    )
+
+
+def test_pipeline_incremental_out_dep_user_override_rejected(
+    set_project_root: pathlib.Path,
+) -> None:
+    """Pipeline.register() should reject user-provided dep_path_overrides for IncrementalOut."""
+    p = Pipeline("test", root=set_project_root)
+
+    with pytest.raises(ValueError, match="Cannot override IncrementalOut input paths"):
+        p.register(
+            incremental_cache_stage,
+            dep_path_overrides={"existing": "data/other.yaml"},
+        )
 
 
 # =============================================================================

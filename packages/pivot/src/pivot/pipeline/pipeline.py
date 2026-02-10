@@ -336,12 +336,22 @@ class Pipeline:
                     + "requires override in dep_path_overrides"
                 )
 
+        # 2b. Reject user overrides for IncrementalOut input deps
+        if dep_path_overrides:
+            incremental_dep_names = {
+                name for name, spec in definition.dep_specs.items() if not spec.creates_dep_edge
+            }
+            user_incremental = set(dep_path_overrides.keys()) & incremental_dep_names
+            if user_incremental:
+                raise ValueError(
+                    f"Cannot override IncrementalOut input paths: {sorted(user_incremental)}. "
+                    + "IncrementalOut paths must match between input and output annotations."
+                )
+
         # 3. Resolve annotation paths relative to pipeline root
-        # Skip IncrementalOut - registry disallows path overrides for them
         resolved_deps: dict[str, outputs.PathType] = {
             dep_name: self._resolve_path_type(spec.path)
             for dep_name, spec in definition.dep_specs.items()
-            if spec.creates_dep_edge  # IncrementalOut has creates_dep_edge=False
         }
 
         out_specs = definition.out_specs
@@ -351,12 +361,30 @@ class Pipeline:
         resolved_outs: dict[str, registry.OutOverride] = {
             out_name: registry.OutOverride(path=self._resolve_path_type(spec.path))
             for out_name, spec in out_specs.items()
-            if not isinstance(spec, outputs.IncrementalOut)
         }
 
         # 4. Apply explicit output overrides (also pipeline-relative)
         # (dep overrides are already applied via extract_stage_definition above)
         if out_path_overrides:
+            # Single-output IncrementalOut: reject ALL overrides regardless of key
+            # (registry accepts any single key for single-output stages)
+            if definition.single_out_spec is not None and isinstance(
+                definition.single_out_spec, outputs.IncrementalOut
+            ):
+                raise ValueError(
+                    "Cannot override IncrementalOut output path. "
+                    + "IncrementalOut paths must match between input and output annotations."
+                )
+            # TypedDict-return: reject overrides targeting specific IncrementalOut fields
+            incremental_out_names = {
+                name for name, spec in out_specs.items() if isinstance(spec, outputs.IncrementalOut)
+            }
+            user_incremental = set(out_path_overrides.keys()) & incremental_out_names
+            if user_incremental:
+                raise ValueError(
+                    f"Cannot override IncrementalOut output paths: {sorted(user_incremental)}. "
+                    + "IncrementalOut paths must match between input and output annotations."
+                )
             for out_name, override in out_path_overrides.items():
                 resolved_outs[out_name] = self._resolve_out_override(override)
 

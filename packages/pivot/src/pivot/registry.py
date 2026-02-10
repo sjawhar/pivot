@@ -150,7 +150,7 @@ def _apply_out_overrides(
             return dataclasses.replace(dir_out, path=path, cache=cache)
         return dir_out
 
-    # IncrementalOut - can update cache but not path (handled by _resolve_out_spec)
+    # IncrementalOut - can update path and/or cache
     if isinstance(out_spec, outputs.IncrementalOut):
         # Cast to IncrementalOut[Any, Any] - isinstance narrows but basedpyright keeps Unknown params
         inc_out = cast("outputs.IncrementalOut[Any, Any]", out_spec)
@@ -198,37 +198,23 @@ def _expand_out_spec(out_spec: outputs.BaseOut) -> list[outputs.BaseOut]:
 
 
 def _resolve_out_spec(
-    out_name: str,
     out_spec: outputs.BaseOut,
     override: OutOverride | None,
-    stage_name: str,
 ) -> tuple[outputs.BaseOut, list[outputs.BaseOut]]:
     """Apply overrides to an output spec and expand for DAG/caching.
 
-    Validates that IncrementalOut outputs aren't overridden, applies path/cache overrides,
-    and expands multi-file specs into individual output objects.
+    Applies path/cache overrides and expands multi-file specs into individual
+    output objects.
 
     Args:
-        out_name: Output key name (for error messages).
         out_spec: Original output spec from function annotations.
-        override: Path/cache override from YAML (or None).
-        stage_name: Stage name (for error messages).
+        override: Path/cache override (or None).
 
     Returns:
         Tuple of (resolved_spec, expanded_specs) where:
         - resolved_spec: Single output with overrides applied (may have list/tuple path)
         - expanded_specs: List of outputs with single-string paths for DAG/caching
-
-    Raises:
-        ValidationError: If trying to override an IncrementalOut path.
     """
-    # IncrementalOut paths must match between input and output - disallow overrides
-    if override is not None and isinstance(out_spec, outputs.IncrementalOut):
-        raise exceptions.ValidationError(
-            f"Stage '{stage_name}': cannot override IncrementalOut output path for '{out_name}'. "
-            + "IncrementalOut paths must match between input and output annotations."
-        )
-
     resolved = _apply_out_overrides(out_spec, override)
     expanded = _expand_out_spec(resolved)
     return resolved, expanded
@@ -358,16 +344,6 @@ class StageRegistry:
                         f"Stage '{stage_name}': dep_path_overrides contains unknown deps: {unknown}. "
                         + f"Available: {list(dep_specs.keys())}"
                     )
-                # Disallow overrides for IncrementalOut inputs - path must match output annotation
-                incremental_overrides = [
-                    name for name in dep_path_overrides if not dep_specs[name].creates_dep_edge
-                ]
-                if incremental_overrides:
-                    raise exceptions.ValidationError(
-                        f"Stage '{stage_name}': cannot override IncrementalOut input paths: "
-                        + f"{incremental_overrides}. IncrementalOut paths must match between "
-                        + "input and output annotations."
-                    )
 
             # Build deps dict from specs, applying path overrides where provided
             # (Pipeline resolves annotation paths to pipeline-relative before passing as overrides)
@@ -417,7 +393,7 @@ class StageRegistry:
                 for out_name, out_spec in return_out_specs.items():
                     raw_override = out_path_overrides.get(out_name) if out_path_overrides else None
                     override = _normalize_out_override(raw_override) if raw_override else None
-                    resolved, expanded = _resolve_out_spec(out_name, out_spec, override, stage_name)
+                    resolved, expanded = _resolve_out_spec(out_spec, override)
                     out_specs[out_name] = resolved
                     outs_from_annotations.extend(expanded)
 
@@ -435,9 +411,7 @@ class StageRegistry:
                     # Get the single override (whatever key the user used)
                     override = _normalize_out_override(next(iter(out_path_overrides.values())))
 
-                resolved, expanded = _resolve_out_spec(
-                    stage_def.SINGLE_OUTPUT_KEY, single_out_spec, override, stage_name
-                )
+                resolved, expanded = _resolve_out_spec(single_out_spec, override)
                 out_specs[stage_def.SINGLE_OUTPUT_KEY] = resolved
                 outs_from_annotations.extend(expanded)
 
@@ -449,6 +423,11 @@ class StageRegistry:
             _validate_stage_registration(
                 self._stages, stage_name, all_deps_flat, outs_paths, self.validation_mode
             )
+
+            # Defense-in-depth: verify IncrementalOut dep/output paths still match
+            # after overrides are applied (pre-override validation checks annotation
+            # specs; this catches mismatched overrides from direct registry callers)
+            _validate_incremental_paths_post_overrides(stage_name, deps_dict, out_specs, dep_specs)
 
             # Normalize dep paths - flatten, normalize, then rebuild dict
             deps_flat_normalized = _normalize_paths(
@@ -776,6 +755,56 @@ def _validate_incremental_spec_match(
             f"Stage '{stage_name}': IncrementalOut input {name_part}loader "
             + f"{input_spec.loader!r} doesn't match output loader {output_spec.loader!r}"
         )
+
+
+def _validate_incremental_paths_post_overrides(
+    stage_name: str,
+    deps_dict: dict[str, outputs.PathType],
+    out_specs: dict[str, outputs.BaseOut],
+    dep_specs: dict[str, stage_def.FuncDepSpec],
+) -> None:
+    """Defense-in-depth: verify IncrementalOut dep/output paths match after overrides.
+
+    The pre-override validation (_validate_incremental_out_matching) checks raw
+    annotation specs. This function checks the effective paths after dep/out overrides
+    are applied, catching mismatched overrides from direct StageRegistry callers.
+    """
+    # Find IncrementalOut outputs
+    incremental_outs: dict[str, outputs.BaseOut] = {
+        name: spec for name, spec in out_specs.items() if isinstance(spec, outputs.IncrementalOut)
+    }
+    if not incremental_outs:
+        return
+
+    # Find IncrementalOut inputs
+    incremental_deps = {
+        name: dep_specs[name] for name in dep_specs if not dep_specs[name].creates_dep_edge
+    }
+    if not incremental_deps:
+        return
+
+    # For TypedDict returns: output field name matches input param name
+    for out_name, out_spec in incremental_outs.items():
+        if out_name in incremental_deps:
+            dep_path = str(deps_dict[out_name])
+            out_path = str(out_spec.path)
+            if dep_path != out_path:
+                raise exceptions.ValidationError(
+                    f"Stage '{stage_name}': IncrementalOut input '{out_name}' path "
+                    + f"'{dep_path}' doesn't match output path '{out_path}' after "
+                    + "applying overrides."
+                )
+        elif out_name == stage_def.SINGLE_OUTPUT_KEY and len(incremental_deps) == 1:
+            # Single-output stage: one IncrementalOut dep maps to _single output
+            dep_name = next(iter(incremental_deps))
+            dep_path = str(deps_dict[dep_name])
+            out_path = str(out_spec.path)
+            if dep_path != out_path:
+                raise exceptions.ValidationError(
+                    f"Stage '{stage_name}': IncrementalOut input '{dep_name}' path "
+                    + f"'{dep_path}' doesn't match output path '{out_path}' after "
+                    + "applying overrides."
+                )
 
 
 def _validate_incremental_out_matching(
