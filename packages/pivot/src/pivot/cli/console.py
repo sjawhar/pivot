@@ -209,6 +209,15 @@ class Console:
 
         self._echo(f"{summary} {duration}")
 
+    def failed_stages(self, failed_names: list[str]) -> None:
+        """Print list of failed stage names after summary."""
+        if not failed_names:
+            return
+        header = self._color("Failed stages:", "red", "bold")
+        self._echo(header)
+        for name in failed_names:
+            self._echo(f"  {self._color(name, 'red')}")
+
     def error(self, message: str, suggestion: str | None = None) -> None:
         """Print error message with optional suggestion."""
         prefix = self._color("Error:", "red", "bold")

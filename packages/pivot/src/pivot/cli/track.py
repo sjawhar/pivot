@@ -87,12 +87,16 @@ def _track_single_path(
     Returns:
         TrackResult with optional warning and the tracked path for the caller to handle output.
     """
-    # Validate path doesn't escape project
-    if track_mod.has_path_traversal(path_str):
-        raise click.ClickException(f"Path traversal not allowed: {path_str}")
+    # Normalize path from cwd (preserving symlinks) for consistency with registry/pvt
+    path = project.normalize_path(path_str, base=pathlib.Path.cwd())
 
-    # Normalize path (preserve symlinks) for consistency with registry/pvt
-    path = project.normalize_path(path_str)
+    # Validate resolved path is within project root
+    project_root = project.get_project_root()
+    try:
+        path.relative_to(project_root)
+    except ValueError:
+        raise click.ClickException(f"Path '{path_str}' resolves outside project root") from None
+
     abs_path_str = str(path)
 
     # Check for broken symlinks (exist as symlinks but target doesn't exist)
@@ -114,8 +118,8 @@ def _track_single_path(
 
     # Check for overlap with stage outputs (resolve paths to detect symlink aliasing)
     try:
-        user_resolved = project.resolve_path_for_comparison(path_str, "user path")
-    except (PermissionError, RuntimeError, OSError) as e:
+        user_resolved = path.resolve()
+    except OSError as e:
         raise click.ClickException(repr(e)) from e
 
     for out_norm, out_resolved in stage_outputs_resolved.items():

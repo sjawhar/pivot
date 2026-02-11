@@ -222,7 +222,9 @@ def test_track_path_traversal_rejected(
     result = runner.invoke(cli.cli, ["track", "../outside.txt"])
 
     assert result.exit_code != 0
-    assert "traversal" in result.output.lower()
+    assert (
+        "outside project root" in result.output.lower() or "traversal" in result.output.lower()
+    ), "Error should mention escaping project root or path traversal"
 
 
 def test_track_broken_symlink_rejected(
@@ -524,3 +526,86 @@ def test_track_force_works_without_pipeline(
             f"Track --force should succeed without pipeline: {result.output}"
         )
         assert "Tracked: data.csv" in result.output
+
+
+# =============================================================================
+# CWD-Relative Path Resolution Tests (RED - failing until feature implemented)
+# =============================================================================
+
+
+def test_track_resolves_from_cwd(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Track should resolve paths relative to cwd, not project root."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        # Create subdirectory with file
+        data_dir = cwd / "data"
+        data_dir.mkdir()
+        (data_dir / "file.csv").write_text("a,b,c\n1,2,3\n")
+
+        # Change to subdirectory
+        monkeypatch.chdir(data_dir)
+
+        # Track file from subdirectory
+        result = runner.invoke(cli.cli, ["track", "file.csv"])
+
+        assert result.exit_code == 0, f"Track should succeed from subdir: {result.output}"
+        assert "Tracked: file.csv" in result.output, "Should echo user's path"
+        # .pvt file should be created next to the tracked file
+        assert (data_dir / "file.csv.pvt").exists(), "PVT file should exist at data/file.csv.pvt"
+
+
+def test_track_dotdot_from_subdir_resolves_correctly(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Track should allow .. in paths when resolved path stays within project root."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        # Create directory structure
+        (cwd / "other").mkdir()
+        (cwd / "other" / "file.txt").write_text("content")
+        (cwd / "data").mkdir()
+
+        # Change to data subdirectory
+        monkeypatch.chdir(cwd / "data")
+
+        # Track file using .. from subdirectory
+        result = runner.invoke(cli.cli, ["track", "../other/file.txt"])
+
+        assert result.exit_code == 0, (
+            f"Track should allow .. when resolved path is within project: {result.output}"
+        )
+        assert "traversal" not in result.output.lower(), "Should not reject .. in valid paths"
+        # .pvt file should exist for the tracked file
+        assert (cwd / "other" / "file.txt.pvt").exists(), (
+            "PVT file should exist at other/file.txt.pvt"
+        )
+
+
+def test_track_dotdot_escaping_project_root_rejected(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """Track should reject paths that escape project root via .."""
+    with isolated_pivot_dir(runner, tmp_path):
+        # Try to track file outside project root
+        result = runner.invoke(cli.cli, ["track", "../../etc/passwd"])
+
+        assert result.exit_code != 0, "Should reject paths escaping project root"
+        assert (
+            "outside project root" in result.output.lower() or "traversal" in result.output.lower()
+        ), "Error should mention escaping project root or path traversal"
+
+
+def test_track_absolute_path_still_works(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """Track should still work with absolute paths."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        # Create file
+        (cwd / "data.csv").write_text("a,b,c\n1,2,3\n")
+
+        # Track using absolute path
+        result = runner.invoke(cli.cli, ["track", str(cwd / "data.csv")])
+
+        assert result.exit_code == 0, f"Track should work with absolute path: {result.output}"
+        # .pvt file should be created
+        assert (cwd / "data.csv.pvt").exists(), "PVT file should exist"

@@ -730,6 +730,7 @@ class ExecutionResultEvent(TypedDict):
     ran: int
     skipped: int
     failed: int
+    failed_stages: list[str]
     total_duration_ms: float
     timestamp: str  # ISO 8601 UTC
 

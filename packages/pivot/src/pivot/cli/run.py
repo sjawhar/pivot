@@ -25,11 +25,13 @@ from pivot.engine import engine
 from pivot.engine import sources as engine_sources
 from pivot.executor import prepare_workers
 from pivot.types import (
+    DisplayCategory,
     ExecutionResultEvent,
     OnError,
     RunEventType,
     SchemaVersionEvent,
     StageStatus,
+    categorize_stage_result,
 )
 
 if TYPE_CHECKING:
@@ -224,12 +226,20 @@ def _run_json_mode(
     skipped = sum(1 for r in results.values() if r["status"] == StageStatus.SKIPPED)
     failed = sum(1 for r in results.values() if r["status"] == StageStatus.FAILED)
 
+    # Compute failed stage names for JSONL output
+    failed_stage_names = sorted(
+        name
+        for name, r in results.items()
+        if categorize_stage_result(r["status"], r["reason"]) == DisplayCategory.FAILED
+    )
+
     cli_helpers.emit_jsonl(
         ExecutionResultEvent(
             type=RunEventType.EXECUTION_RESULT,
             ran=ran,
             skipped=skipped,
             failed=failed,
+            failed_stages=failed_stage_names,
             total_duration_ms=total_duration_ms,
             timestamp=datetime.datetime.now(datetime.UTC).isoformat(),
         )
@@ -293,6 +303,13 @@ def _run_plain_mode(
         ran, cached, blocked, failed = executor_core.count_results(results)
         total_duration = time.perf_counter() - start_time
         console.summary(ran, cached, blocked, failed, total_duration)
+        # Print failed stage names after summary
+        failed_stage_names = sorted(
+            name
+            for name, r in results.items()
+            if categorize_stage_result(r["status"], r["reason"]) == DisplayCategory.FAILED
+        )
+        console.failed_stages(failed_stage_names)
 
     return results
 

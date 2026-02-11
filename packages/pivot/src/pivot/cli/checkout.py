@@ -60,6 +60,18 @@ def _get_stage_output_info() -> dict[str, HashInfo]:
     return result
 
 
+def _on_disk_matches_expected(path: pathlib.Path, expected_hash: HashInfo) -> bool:
+    if is_dir_hash(expected_hash):
+        if not path.is_dir():
+            return False
+        actual_hash, _ = cache.hash_directory(path)
+    else:
+        if not path.is_file():
+            return False
+        actual_hash, _ = cache.hash_file(path)
+    return actual_hash == expected_hash["hash"]
+
+
 def _restore_path_sync(
     path: pathlib.Path,
     output_hash: HashInfo,
@@ -80,8 +92,10 @@ def _restore_path_sync(
     if path.exists():
         match behavior:
             case CheckoutBehavior.ERROR:
+                if _on_disk_matches_expected(path, output_hash):
+                    return ("skipped", path.name)
                 raise click.ClickException(
-                    f"'{path.name}' already exists. "
+                    f"'{path.name}' already exists with different content. "
                     + "Use --force to overwrite or --only-missing to skip existing files."
                 )
             case CheckoutBehavior.SKIP_EXISTING:
@@ -298,7 +312,7 @@ def _print_summary(failures: list[str], restored: int, skipped: int, quiet: bool
     return True
 
 
-@cli_decorators.pivot_command()
+@cli_decorators.pivot_command(allow_all=True)
 @click.argument("targets", nargs=-1, shell_complete=completion.complete_targets)
 @click.option(
     "--checkout-mode",

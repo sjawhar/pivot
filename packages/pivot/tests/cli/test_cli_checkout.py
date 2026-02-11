@@ -114,6 +114,13 @@ def test_checkout_help(runner: click.testing.CliRunner) -> None:
     assert "copy" in result.output
 
 
+def test_checkout_accepts_all_flag(runner: click.testing.CliRunner) -> None:
+    """Checkout should accept the --all flag."""
+    result = runner.invoke(cli.cli, ["checkout", "--all", "--help"])
+    assert result.exit_code == 0, f"Failed: {result.output}"
+    assert "--all" in result.output, "Checkout should show --all option in help"
+
+
 # =============================================================================
 # Tracked File Tests
 # =============================================================================
@@ -407,10 +414,10 @@ def test_checkout_mode_copy(runner: click.testing.CliRunner, tmp_path: pathlib.P
 # =============================================================================
 
 
-def test_checkout_errors_on_existing_by_default(
+def test_checkout_skips_existing_file_with_matching_hash(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
-    """Checkout errors on existing files by default."""
+    """Checkout silently skips existing files whose content matches the expected hash."""
     with isolated_pivot_dir(runner, tmp_path):
         cache_dir = _setup_test_project()
 
@@ -422,7 +429,33 @@ def test_checkout_errors_on_existing_by_default(
         pvt_data = track.PvtData(path="data.txt", hash=output_hash["hash"], size=15)
         track.write_pvt_file(pathlib.Path("data.txt.pvt"), pvt_data)
 
-        # File exists (as symlink after save_to_cache), checkout without flags should error
+        # File exists with correct content — should skip, not error
+        result = runner.invoke(cli.cli, ["checkout", "data.txt"])
+
+        assert result.exit_code == 0, f"Should skip matching file: {result.output}"
+        assert "Skipped" in result.output
+
+
+def test_checkout_errors_on_existing_file_with_different_content(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """Checkout errors when existing file has different content than expected hash."""
+    with isolated_pivot_dir(runner, tmp_path):
+        cache_dir = _setup_test_project()
+
+        data_file = pathlib.Path("data.txt")
+        data_file.write_text("original content")
+        output_hash = cache.save_to_cache(
+            data_file, cache_dir, checkout_mode=cache.CheckoutMode.COPY
+        )
+        assert output_hash is not None and "hash" in output_hash
+
+        pvt_data = track.PvtData(path="data.txt", hash=output_hash["hash"], size=16)
+        track.write_pvt_file(pathlib.Path("data.txt.pvt"), pvt_data)
+
+        # Modify file so content no longer matches
+        data_file.write_text("modified content")
+
         result = runner.invoke(cli.cli, ["checkout", "data.txt"])
 
         assert result.exit_code == 1
@@ -659,14 +692,14 @@ def test_checkout_quiet_with_failures_shows_summary(
         assert "pivot pull" in result.output
 
 
-def test_checkout_multiple_immediate_errors_aggregated(
+def test_checkout_multiple_matching_files_skipped(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
-    """Multiple 'already exists' errors are aggregated into single message."""
+    """Multiple existing files with matching hashes are silently skipped."""
     with isolated_pivot_dir(runner, tmp_path):
         cache_dir = _setup_test_project()
 
-        # Create and track two files that already exist
+        # Create and track two files that already exist with correct content
         for name in ["data1.txt", "data2.txt"]:
             path = pathlib.Path(name)
             path.write_text(f"content of {name}")
@@ -676,13 +709,38 @@ def test_checkout_multiple_immediate_errors_aggregated(
                 path=name, hash=output_hash["hash"], size=len(f"content of {name}")
             )
             track.write_pvt_file(pathlib.Path(f"{name}.pvt"), pvt_data)
-            # Files exist as symlinks after save_to_cache
+            # Files exist as symlinks after save_to_cache — hashes match
 
-        # Try checkout without --force - both should error
+        result = runner.invoke(cli.cli, ["checkout"])
+
+        assert result.exit_code == 0, f"Should skip matching files: {result.output}"
+        assert "Skipped 2 file(s)" in result.output
+
+
+def test_checkout_multiple_modified_files_errors_aggregated(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """Multiple existing files with different content produce aggregated errors."""
+    with isolated_pivot_dir(runner, tmp_path):
+        cache_dir = _setup_test_project()
+
+        for name in ["data1.txt", "data2.txt"]:
+            path = pathlib.Path(name)
+            path.write_text(f"content of {name}")
+            output_hash = cache.save_to_cache(
+                path, cache_dir, checkout_mode=cache.CheckoutMode.COPY
+            )
+            assert output_hash is not None
+            pvt_data = track.PvtData(
+                path=name, hash=output_hash["hash"], size=len(f"content of {name}")
+            )
+            track.write_pvt_file(pathlib.Path(f"{name}.pvt"), pvt_data)
+            # Modify files so content no longer matches
+            path.write_text(f"modified {name}")
+
         result = runner.invoke(cli.cli, ["checkout"])
 
         assert result.exit_code == 1
-        # Both errors should be shown
         assert "data1.txt" in result.output
         assert "data2.txt" in result.output
         assert "already exists" in result.output
