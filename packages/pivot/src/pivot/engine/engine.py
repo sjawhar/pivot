@@ -27,6 +27,7 @@ from pivot.engine import worker_pool as worker_pool_mod
 from pivot.engine.types import (
     CodeOrConfigChanged,
     DataArtifactChanged,
+    EngineDiagnostic,
     EngineState,
     EngineStateChanged,
     EventSink,
@@ -1783,18 +1784,44 @@ class Engine:
         """Defer an event until the stage completes."""
         self._deferred_events[stage].append(event)
 
-    async def _process_deferred_events(self, stage: str) -> None:
-        """Process any deferred events for a completed stage.
+    _DEFERRED_MAX_ITERATIONS: int = 100
 
-        Uses iterative approach to avoid recursion if processing defers more events.
-        Errors in individual events are logged but don't block remaining events.
+    async def _process_deferred_events(self, stage: str) -> None:
+        """Process deferred events for a completed stage, draining until empty.
+
+        If event handlers defer new events for the same stage during processing,
+        those are picked up in subsequent iterations. A max-iterations guard
+        prevents infinite loops — on trip, remaining events are dropped and a
+        diagnostic event is emitted.
         """
-        events = self._deferred_events.pop(stage, [])
-        for event in events:
-            try:
-                await self._handle_input_event(event)
-            except Exception:
-                _logger.exception(f"Error processing deferred event for stage {stage}: {event}")
+        for _ in range(self._DEFERRED_MAX_ITERATIONS):
+            events = self._deferred_events.pop(stage, [])
+            if not events:
+                return
+            for event in events:
+                try:
+                    await self._handle_input_event(event)
+                except Exception:
+                    _logger.exception(
+                        "Error processing deferred event for stage %s: %s", stage, event
+                    )
+
+        # Guard tripped — drop remaining events and emit diagnostic
+        remaining = self._deferred_events.pop(stage, [])
+        remaining_count = len(remaining)
+        message = (
+            f"Deferred event loop for stage '{stage}' hit max iterations "
+            f"({self._DEFERRED_MAX_ITERATIONS})"
+        )
+        detail = f"Dropped {remaining_count} remaining event(s)" if remaining_count else ""
+        _logger.error("%s. %s", message, detail)
+        await self.emit(
+            EngineDiagnostic(
+                type="engine_diagnostic",
+                message=message,
+                detail=detail,
+            )
+        )
 
     def _get_affected_stages_for_path(self, path: pathlib.Path) -> list[str]:
         """Get stages affected by a path change using bipartite graph."""
