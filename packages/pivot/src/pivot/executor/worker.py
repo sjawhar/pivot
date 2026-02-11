@@ -265,6 +265,7 @@ def execute_stage(
                                 files_cache_dir,
                                 checkout_modes,
                                 state_db=state_db,
+                                state_dir=stage_info["state_dir"],
                             )
                             if restored:
                                 return _make_result(
@@ -337,6 +338,7 @@ def execute_stage(
                             files_cache_dir,
                             checkout_modes,
                             state_db,
+                            state_dir=stage_info["state_dir"],
                         )
                         if run_cache_skip is not None:
                             if no_commit:
@@ -372,7 +374,9 @@ def execute_stage(
                             )
 
                 try:
-                    _prepare_outputs_for_execution(stage_outs, lock_data, files_cache_dir)
+                    _prepare_outputs_for_execution(
+                        stage_outs, lock_data, files_cache_dir, state_dir=stage_info["state_dir"]
+                    )
                 except exceptions.CacheRestoreError as e:
                     raise exceptions.CacheRestoreError(
                         f"{e}. Run `pivot pull` to fetch from remote, or delete "
@@ -537,6 +541,7 @@ def _restore_outputs(
     *,
     use_normalized_paths: bool = False,
     state_db: state.StateDB | None = None,
+    state_dir: pathlib.Path | None = None,
 ) -> bool:
     """Restore outputs from cache - shared logic for lock file and run cache paths.
 
@@ -554,6 +559,7 @@ def _restore_outputs(
         use_normalized_paths: If True, normalize paths for lookup (lock data uses
             normalized paths). If False, use raw paths (run cache uses raw paths).
         state_db: Optional state database for hash caching during file verification.
+        state_dir: Per-stage state directory for lock files during directory restores.
     """
     restored_paths = list[pathlib.Path]()
 
@@ -579,7 +585,11 @@ def _restore_outputs(
 
         try:
             restored = cache.restore_from_cache(
-                path, output_hash, files_cache_dir, checkout_modes=checkout_modes
+                path,
+                output_hash,
+                files_cache_dir,
+                checkout_modes=checkout_modes,
+                state_dir=state_dir,
             )
         except OSError:
             _cleanup_restored_paths(restored_paths)
@@ -601,6 +611,7 @@ def _restore_outputs_from_cache(
     checkout_modes: list[cache.CheckoutMode],
     *,
     state_db: state.StateDB | None = None,
+    state_dir: pathlib.Path | None = None,
 ) -> bool:
     """Restore missing outputs from cache for lock file skip detection."""
     # Non-cached outputs (Metric) are git-tracked — just verify they exist
@@ -617,6 +628,7 @@ def _restore_outputs_from_cache(
         checkout_modes,
         use_normalized_paths=True,
         state_db=state_db,
+        state_dir=state_dir,
     )
 
 
@@ -665,6 +677,7 @@ def _prepare_outputs_for_execution(
     stage_outs: Sequence[outputs.ExpandedOut],
     lock_data: LockData | None,
     files_cache_dir: pathlib.Path,
+    state_dir: pathlib.Path | None = None,
 ) -> None:
     """Prepare outputs before stage execution - delete or restore for incremental."""
     output_hashes = lock_data["output_hashes"] if lock_data else {}
@@ -679,7 +692,11 @@ def _prepare_outputs_for_execution(
             if out_hash:
                 # COPY mode makes file writable (not symlink to read-only cache)
                 restored = cache.restore_from_cache(
-                    path, out_hash, files_cache_dir, cache.CheckoutMode.COPY
+                    path,
+                    out_hash,
+                    files_cache_dir,
+                    cache.CheckoutMode.COPY,
+                    state_dir=state_dir,
                 )
                 if not restored:
                     raise exceptions.CacheRestoreError(
@@ -1223,6 +1240,7 @@ def _try_skip_via_run_cache(
     files_cache_dir: pathlib.Path,
     checkout_modes: list[cache.CheckoutMode],
     state_db: state.StateDB,
+    state_dir: pathlib.Path | None = None,
 ) -> RunCacheSkipResult | None:
     """Try to skip using run cache. Returns result and output hashes if skipped, None if must run."""
     # IncrementalOut stages build on previous outputs - run cache doesn't apply
@@ -1259,6 +1277,7 @@ def _try_skip_via_run_cache(
         checkout_modes,
         use_normalized_paths=False,
         state_db=state_db,
+        state_dir=state_dir,
     )
     if not restored:
         return None

@@ -382,7 +382,13 @@ def _restore_tracked_file(
 
     # Use default checkout modes (hardlink with copy fallback)
     checkout_modes = config.get_checkout_mode_order()
-    return cache.restore_from_cache(path, output_hash, cache_dir, checkout_modes=checkout_modes)
+    return cache.restore_from_cache(
+        path,
+        output_hash,
+        cache_dir,
+        checkout_modes=checkout_modes,
+        state_dir=config.get_state_dir(),
+    )
 
 
 def verify_tracked_files(project_root: pathlib.Path, checkout_missing: bool = False) -> None:

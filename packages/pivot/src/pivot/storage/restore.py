@@ -257,6 +257,7 @@ def restore_file(
                     output_hash,
                     cache_dir / "files",
                     checkout_modes=checkout_modes,
+                    state_dir=cache_dir.parent,
                 )
                 if success:
                     return RestoreResult(

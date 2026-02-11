@@ -785,7 +785,7 @@ async def test_download_file_cleans_up_on_error(
     """download_file cleans up temp file on error."""
     dest_file = tmp_path / "dest.txt"
 
-    with pytest.raises(botocore_exc.ClientError):
+    with pytest.raises(exceptions.RemoteConnectionError, match="S3 download error"):
         await s3_remote.download_file("abc123def4567890", dest_file)
 
     # Verify no temp files left behind

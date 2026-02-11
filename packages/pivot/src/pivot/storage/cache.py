@@ -39,14 +39,16 @@ _RESTORE_LOCK_PREFIX = ".pivot_restore_lock_"
 _RESTORE_TEMP_MAX_AGE = 3600  # 1 hour
 
 
-def _get_lock_filename(path_name: str) -> str:
-    """Generate lock filename, hashing if too long for filesystem."""
-    max_name_len = 255 - len(_RESTORE_LOCK_PREFIX)
-    if len(path_name) <= max_name_len:
-        return f"{_RESTORE_LOCK_PREFIX}{path_name}"
-    # Hash long names to fit filesystem limit (first 32 hex chars of SHA-256 = 128 bits)
-    name_hash = hashlib.sha256(path_name.encode()).hexdigest()[:32]
-    return f"{_RESTORE_LOCK_PREFIX}{name_hash}"
+def _get_lock_path(target_path: pathlib.Path, state_dir: pathlib.Path) -> pathlib.Path:
+    """Get lock file path under state_dir/locks/ for a restore target.
+
+    Uses SHA-256 hash of the absolute target path to avoid filename length issues
+    and collisions between targets in different directories.
+    """
+    lock_dir = state_dir / "locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    path_hash = hashlib.sha256(str(target_path.resolve()).encode()).hexdigest()[:32]
+    return lock_dir / f"{_RESTORE_LOCK_PREFIX}{path_hash}"
 
 
 def atomic_write_file(
@@ -295,25 +297,26 @@ def _clear_path(path: pathlib.Path) -> None:
             path.unlink()
 
 
-def _cleanup_stale_restore_temps(parent_dir: pathlib.Path) -> None:
-    """Remove restore temp directories and lock files older than max age."""
+def _cleanup_stale_restore_temps(parent_dir: pathlib.Path, lock_dir: pathlib.Path | None) -> None:
+    """Remove restore temp directories and stale lock files older than max age."""
+    cutoff = time.time() - _RESTORE_TEMP_MAX_AGE
+
+    # Clean stale lock files from centralized lock directory
+    if lock_dir is not None and lock_dir.exists():
+        for entry in os.scandir(lock_dir):
+            if entry.is_file(follow_symlinks=False) and entry.name.startswith(_RESTORE_LOCK_PREFIX):
+                try:
+                    if entry.stat(follow_symlinks=False).st_mtime < cutoff:
+                        logger.debug(f"Cleaning up stale lock file: {entry.path}")
+                        os.unlink(entry.path)
+                except OSError as e:
+                    logger.debug(f"Failed to clean up lock file {entry.path}: {e}")
+
+    # Clean temp/backup directories from data parent dir
     if not parent_dir.exists():
         return
 
-    cutoff = time.time() - _RESTORE_TEMP_MAX_AGE
     for entry in os.scandir(parent_dir):
-        # Handle lock files (regular files)
-        if entry.is_file(follow_symlinks=False) and entry.name.startswith(_RESTORE_LOCK_PREFIX):
-            try:
-                if entry.stat(follow_symlinks=False).st_mtime < cutoff:
-                    logger.debug(f"Cleaning up stale lock file: {entry.path}")
-                    os.unlink(entry.path)
-            except OSError as e:
-                logger.debug(f"Failed to clean up lock file {entry.path}: {e}")
-            continue
-
-        # Handle temp/backup directories
-        # is_dir(follow_symlinks=False) returns False for symlinks, preventing attacks
         if not entry.is_dir(follow_symlinks=False):
             continue
         if not (
@@ -321,7 +324,6 @@ def _cleanup_stale_restore_temps(parent_dir: pathlib.Path) -> None:
             or entry.name.startswith(_BACKUP_TEMP_PREFIX)
         ):
             continue
-        # Use mtime for age check - simpler and more reliable than parsing
         try:
             if entry.stat(follow_symlinks=False).st_mtime < cutoff:
                 logger.debug(f"Cleaning up stale temp: {entry.path}")
@@ -541,6 +543,7 @@ def restore_from_cache(
     cache_dir: pathlib.Path,
     checkout_mode: CheckoutMode | None = None,
     checkout_modes: list[CheckoutMode] | None = None,
+    state_dir: pathlib.Path | None = None,
 ) -> bool:
     """Restore file or directory from cache. Returns True if successful.
 
@@ -550,11 +553,15 @@ def restore_from_cache(
         cache_dir: Cache directory
         checkout_mode: Single link mode (no fallback). Takes precedence over checkout_modes.
         checkout_modes: Ordered list of link modes to try with fallback on failure.
+        state_dir: State directory for lock files (e.g. per-stage .pivot/ dir).
+            Required for directory restores to prevent concurrent restore races.
     """
     effective_modes = _resolve_checkout_modes(checkout_mode, checkout_modes)
 
     if is_dir_hash(output_hash):
-        return _restore_directory_from_cache(path, output_hash, cache_dir, effective_modes)
+        return _restore_directory_from_cache(
+            path, output_hash, cache_dir, effective_modes, state_dir
+        )
     return _restore_file_from_cache(path, output_hash, cache_dir, effective_modes)
 
 
@@ -579,6 +586,7 @@ def _restore_directory_from_cache(
     output_hash: DirHash,
     cache_dir: pathlib.Path,
     checkout_modes: list[CheckoutMode],
+    state_dir: pathlib.Path | None = None,
 ) -> bool:
     """Restore directory from cache atomically with file locking."""
     cache_dir_path = get_cache_path(cache_dir, output_hash["hash"])
@@ -595,14 +603,19 @@ def _restore_directory_from_cache(
 
     # Ensure parent exists and clean up stale temps
     path.parent.mkdir(parents=True, exist_ok=True)
-    _cleanup_stale_restore_temps(path.parent)
+    if state_dir is not None:
+        lock_path = _get_lock_path(path, state_dir)
+        _cleanup_stale_restore_temps(path.parent, lock_path.parent)
+    else:
+        lock_path = None
+        _cleanup_stale_restore_temps(path.parent, None)
 
     # Acquire lock for this specific path to prevent concurrent restore races
-    lock_path = path.parent / _get_lock_filename(path.name)
     lock_fd: int | None = None
     try:
-        lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
-        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        if lock_path is not None:
+            lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
 
         # SYMLINK fast path: create symlink at temp location, then atomic rename
         if symlink_fast_path:
@@ -713,8 +726,7 @@ def _restore_directory_from_cache(
                 _clear_path(backup_path)
 
     finally:
-        # Release lock and clean up lock file
-        if lock_fd is not None:
+        if lock_fd is not None and lock_path is not None:
             try:
                 fcntl.flock(lock_fd, fcntl.LOCK_UN)
             except OSError as e:
@@ -723,7 +735,10 @@ def _restore_directory_from_cache(
                 os.close(lock_fd)
             except OSError as e:
                 logger.debug(f"Failed to close lock fd: {e}")
-            # Don't delete lock file here - let cleanup handle stale ones
+            try:
+                lock_path.unlink(missing_ok=True)
+            except OSError as e:
+                logger.debug(f"Failed to delete lock file: {e}")
 
 
 def remove_output(path: pathlib.Path) -> None:

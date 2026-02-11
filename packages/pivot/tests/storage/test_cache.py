@@ -20,21 +20,26 @@ def _helper_assert_no_temp_dirs(
     parent: pathlib.Path,
     *,
     allow_lock_files: bool = True,
+    state_dir: pathlib.Path | None = None,
 ) -> None:
-    """Assert no restore/backup temp directories exist (lock files allowed by default)."""
+    """Assert no restore/backup temp directories exist.
+
+    Lock files live in state_dir/locks/, not next to data files.
+    When allow_lock_files=False, also checks the locks dir for leftover lock files.
+    """
     unexpected = list[pathlib.Path]()
     for p in parent.iterdir():
-        # Check lock files first (lock prefix is a superset of temp prefix)
-        if p.name.startswith(cache._RESTORE_LOCK_PREFIX):
-            if not allow_lock_files:
-                unexpected.append(p)
-            continue
-        # Check for temp/backup artifacts
         if p.name.startswith(cache._RESTORE_TEMP_PREFIX) or p.name.startswith(
             cache._BACKUP_TEMP_PREFIX
         ):
             unexpected.append(p)
-    assert len(unexpected) == 0, f"Found unexpected temp dirs: {unexpected}"
+    if not allow_lock_files and state_dir is not None:
+        lock_dir = state_dir / "locks"
+        if lock_dir.exists():
+            for p in lock_dir.iterdir():
+                if p.name.startswith(cache._RESTORE_LOCK_PREFIX):
+                    unexpected.append(p)
+    assert len(unexpected) == 0, f"Found unexpected temp artifacts: {unexpected}"
 
 
 if TYPE_CHECKING:
@@ -557,7 +562,7 @@ def test_restore_directory_atomic_cleans_up_on_cache_miss(
 
     assert result is False
     assert not target.exists()
-    _helper_assert_no_temp_dirs(tmp_path, allow_lock_files=False)
+    _helper_assert_no_temp_dirs(tmp_path, allow_lock_files=False, state_dir=tmp_path / ".pivot")
 
 
 def test_restore_directory_atomic_cleans_up_on_exception(
@@ -669,7 +674,7 @@ def test_cleanup_removes_old_temps(tmp_path: pathlib.Path) -> None:
     old_mtime = time.time() - 7200
     os.utime(old_temp, (old_mtime, old_mtime))
 
-    cache._cleanup_stale_restore_temps(tmp_path)
+    cache._cleanup_stale_restore_temps(tmp_path, None)
 
     assert not old_temp.exists()
 
@@ -682,7 +687,7 @@ def test_cleanup_preserves_recent_temps(tmp_path: pathlib.Path) -> None:
     (recent_temp / "file.txt").write_text("recent")
     # mtime is now, which is recent
 
-    cache._cleanup_stale_restore_temps(tmp_path)
+    cache._cleanup_stale_restore_temps(tmp_path, None)
 
     assert recent_temp.exists()
     # Cleanup
@@ -700,7 +705,7 @@ def test_cleanup_skips_symlinks_via_is_dir(tmp_path: pathlib.Path) -> None:
     symlink = tmp_path / f"{cache._RESTORE_TEMP_PREFIX}symlink_attack"
     symlink.symlink_to(real_dir)
 
-    cache._cleanup_stale_restore_temps(tmp_path)
+    cache._cleanup_stale_restore_temps(tmp_path, None)
 
     # The real directory should still exist
     assert real_dir.exists()
@@ -709,46 +714,41 @@ def test_cleanup_skips_symlinks_via_is_dir(tmp_path: pathlib.Path) -> None:
     symlink.unlink()
 
 
-def test_get_lock_filename_short_name_passthrough() -> None:
-    """Short names are passed through unchanged."""
-    result = cache._get_lock_filename("mydir")
-    assert result == f"{cache._RESTORE_LOCK_PREFIX}mydir"
+def test_get_lock_path_lives_under_state_dir_locks(tmp_path: pathlib.Path) -> None:
+    """Lock files are created under state_dir/locks/, not next to data."""
+    state_dir = tmp_path / ".pivot"
+    state_dir.mkdir(parents=True)
+    target = tmp_path / "data" / "mydir"
+
+    result = cache._get_lock_path(target, state_dir)
+
+    assert result.parent == state_dir / "locks"
+    assert result.name.startswith(cache._RESTORE_LOCK_PREFIX)
 
 
-def test_get_lock_filename_long_name_hashed() -> None:
-    """Long names are hashed to fit filesystem limit."""
-    long_name = "a" * 300  # Exceeds 255 - prefix length
-    result = cache._get_lock_filename(long_name)
+def test_get_lock_path_uses_hash_of_resolved_path(tmp_path: pathlib.Path) -> None:
+    """Lock filename is a hash so any target path length is safe."""
+    state_dir = tmp_path / ".pivot"
+    state_dir.mkdir(parents=True)
+    target = tmp_path / ("a" * 300)
 
-    assert result.startswith(cache._RESTORE_LOCK_PREFIX)
-    assert len(result) <= 255, "Lock filename must fit filesystem limit"
-    # Hash portion should be 32 hex chars
-    hash_portion = result[len(cache._RESTORE_LOCK_PREFIX) :]
+    result = cache._get_lock_path(target, state_dir)
+
+    assert len(result.name) <= 255, "Lock filename must fit filesystem limit"
+    hash_portion = result.name[len(cache._RESTORE_LOCK_PREFIX) :]
     assert len(hash_portion) == 32
     assert all(c in "0123456789abcdef" for c in hash_portion)
 
 
-def test_get_lock_filename_boundary() -> None:
-    """Names exactly at the boundary are not hashed."""
-    max_name_len = 255 - len(cache._RESTORE_LOCK_PREFIX)
-    boundary_name = "x" * max_name_len
+def test_get_lock_path_different_targets_different_locks(tmp_path: pathlib.Path) -> None:
+    """Different target paths produce different lock files."""
+    state_dir = tmp_path / ".pivot"
+    state_dir.mkdir(parents=True)
 
-    result = cache._get_lock_filename(boundary_name)
+    lock_a = cache._get_lock_path(tmp_path / "dir_a", state_dir)
+    lock_b = cache._get_lock_path(tmp_path / "dir_b", state_dir)
 
-    assert result == f"{cache._RESTORE_LOCK_PREFIX}{boundary_name}"
-    assert len(result) == 255
-
-
-def test_get_lock_filename_one_over_boundary() -> None:
-    """Names one char over the boundary are hashed."""
-    max_name_len = 255 - len(cache._RESTORE_LOCK_PREFIX)
-    over_boundary_name = "x" * (max_name_len + 1)
-
-    result = cache._get_lock_filename(over_boundary_name)
-
-    assert len(result) < 255, "Hashed result should be shorter than limit"
-    hash_portion = result[len(cache._RESTORE_LOCK_PREFIX) :]
-    assert len(hash_portion) == 32
+    assert lock_a != lock_b
 
 
 def _restore_worker(

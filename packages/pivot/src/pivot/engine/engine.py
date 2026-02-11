@@ -834,26 +834,29 @@ class Engine:
         """
 
         def _blocking_drain() -> None:
+            saw_shutdown = False
             while True:
-                # Check shutdown_event FIRST so we exit even if queue stays busy
+                # If shutdown requested, continue draining until queue is idle.
                 if shutdown_event.is_set():
-                    break
+                    saw_shutdown = True
 
                 try:
                     # Use a 1.0s timeout so the thread can exit even if the
                     # sentinel is never delivered (e.g., put() failed on
-                    # exception path).
-                    # The thread is abandoned on task-group cancellation, but a
-                    # bounded get prevents it from blocking the interpreter at
-                    # shutdown indefinitely.
-                    msg = output_queue.get(timeout=1.0)
+                    # exception path). When shutting down, tighten the timeout
+                    # to drain any remaining messages without blocking forever.
+                    timeout = 0.2 if saw_shutdown else 1.0
+                    msg = output_queue.get(timeout=timeout)
                 except queue.Empty:
+                    if saw_shutdown:
+                        break
                     continue
                 except (EOFError, OSError):
                     break
 
                 if msg is None:
-                    break
+                    saw_shutdown = True
+                    continue
 
                 if msg["kind"] == OutputMessageKind.STATE:
                     try:
