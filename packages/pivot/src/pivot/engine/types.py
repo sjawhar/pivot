@@ -30,6 +30,7 @@ __all__ = [
     "LogLine",
     "SinkState",
     "SinkStateChanged",
+    "EngineDiagnostic",
     "OutputEvent",
     # Protocols
     "EventSource",
@@ -227,6 +228,21 @@ class SinkStateChanged(TypedDict):
     backoff_s: float | None
 
 
+class EngineDiagnostic(TypedDict):
+    """Engine-level diagnostic for non-fatal operational issues.
+
+    Emitted when the engine detects an anomaly that doesn't warrant stopping
+    execution but should be visible to operators (e.g., deferred event loop
+    guard tripped, unexpected state transitions).
+    """
+
+    type: Literal["engine_diagnostic"]
+    seq: NotRequired[int]
+    run_id: NotRequired[str]
+    message: str
+    detail: str
+
+
 OutputEvent = (
     EngineStateChanged
     | PipelineReloaded
@@ -235,6 +251,7 @@ OutputEvent = (
     | StageStateChanged
     | LogLine
     | SinkStateChanged
+    | EngineDiagnostic
 )
 
 
