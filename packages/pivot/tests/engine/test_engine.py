@@ -17,7 +17,9 @@ from pivot.engine.sources import OneShotSource
 from pivot.engine.types import (
     CodeOrConfigChanged,
     DataArtifactChanged,
+    EngineDiagnostic,
     EngineState,
+    InputEvent,
     NodeType,
     OutputEvent,
     RunRequested,
@@ -972,3 +974,101 @@ async def test_engine_handle_data_artifact_changed_does_not_restart_workers(
         await engine._handle_data_artifact_changed(event)
 
         assert len(restart_calls) == 0, "Data changes should NOT restart workers"
+
+
+_deferred_event_call_log: list[str] = []
+
+
+async def _helper_tracking_handle_with_redeferral(engine: Engine, event: InputEvent) -> None:
+    """Module-level handler that defers one additional event on first call."""
+    _deferred_event_call_log.append(event["type"])
+    if len(_deferred_event_call_log) == 1:
+        engine._defer_event_for_stage(
+            "stage_a",
+            DataArtifactChanged(type="data_artifact_changed", paths=["nested.csv"]),
+        )
+
+
+@pytest.mark.anyio
+async def test_deferred_events_during_processing_are_not_lost(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If handling a deferred event defers another for the same stage, both are processed."""
+    _deferred_event_call_log.clear()
+
+    async with Engine() as engine:
+        monkeypatch.setattr(
+            engine,
+            "_handle_input_event",
+            lambda event: _helper_tracking_handle_with_redeferral(engine, event),
+        )
+
+        # Seed one deferred event
+        engine._defer_event_for_stage(
+            "stage_a",
+            DataArtifactChanged(type="data_artifact_changed", paths=["initial.csv"]),
+        )
+
+        await engine._process_deferred_events("stage_a")
+
+        assert len(_deferred_event_call_log) == 2, (
+            f"Expected 2 events processed, got {len(_deferred_event_call_log)}"
+        )
+        assert "stage_a" not in engine._deferred_events, "No leftover deferred events"
+
+
+_infinite_defer_count: int = 0
+
+
+async def _helper_infinite_defer_handle(engine: Engine, event: InputEvent) -> None:
+    """Module-level handler that always defers another event — simulates infinite loop."""
+    global _infinite_defer_count
+    _infinite_defer_count += 1
+    engine._defer_event_for_stage(
+        "stage_a",
+        DataArtifactChanged(type="data_artifact_changed", paths=["loop.csv"]),
+    )
+
+
+@pytest.mark.anyio
+async def test_deferred_events_max_iterations_guard_emits_diagnostic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Infinite deferral loop is caught by guard; diagnostic event emitted, events dropped."""
+    global _infinite_defer_count
+    _infinite_defer_count = 0
+
+    emitted_events: list[OutputEvent] = []
+
+    async def _capture_emit(event: OutputEvent) -> None:
+        emitted_events.append(event)
+
+    async with Engine() as engine:
+        monkeypatch.setattr(engine, "emit", _capture_emit)
+
+        monkeypatch.setattr(
+            engine,
+            "_handle_input_event",
+            lambda event: _helper_infinite_defer_handle(engine, event),
+        )
+
+        # Seed one event
+        engine._defer_event_for_stage(
+            "stage_a",
+            DataArtifactChanged(type="data_artifact_changed", paths=["seed.csv"]),
+        )
+
+        # Should not hang — guard trips
+        await engine._process_deferred_events("stage_a")
+
+        # Guard stopped iteration at max
+        assert _infinite_defer_count == engine._DEFERRED_MAX_ITERATIONS, (
+            f"Expected {engine._DEFERRED_MAX_ITERATIONS} iterations, got {_infinite_defer_count}"
+        )
+
+        # Diagnostic event emitted
+        diagnostics = [e for e in emitted_events if e["type"] == "engine_diagnostic"]
+        assert len(diagnostics) == 1, f"Expected 1 diagnostic event, got {len(diagnostics)}"
+        diag: EngineDiagnostic = diagnostics[0]
+        assert "stage_a" in diag["message"], "Diagnostic should name the stage"
+        assert "stage_a" not in engine._deferred_events, "Remaining events should be dropped"

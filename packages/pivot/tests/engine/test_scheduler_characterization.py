@@ -1,10 +1,7 @@
 from __future__ import annotations
 
-# pyright: reportMissingImports=false, reportMissingModuleSource=false
-# pyright: reportUnknownArgumentType=false, reportUnknownMemberType=false
-# pyright: reportUnknownParameterType=false, reportUnknownVariableType=false
-
 import networkx as nx
+import pytest
 
 from pivot.engine import graph as engine_graph
 from pivot.engine.scheduler import Scheduler
@@ -307,3 +304,25 @@ def test_state_enum_comparison_for_monotonicity_guard() -> None:
     assert current >= StageExecutionState.COMPLETED, (
         "COMPLETED should be >= COMPLETED for guard to skip duplicate"
     )
+
+
+def test_release_mutexes_raises_on_underflow() -> None:
+    """Releasing a mutex that was never acquired should raise ValueError."""
+    scheduler = _helper_init_scheduler(
+        execution_order=["stage"],
+        stage_mutex={"stage": ["my_mutex"]},
+    )
+    # Release without acquire — should fail loud
+    with pytest.raises(ValueError, match="Mutex.*released when not held"):
+        scheduler.release_mutexes("stage")
+
+
+def test_initialize_validates_stage_mutex_consistency() -> None:
+    """initialize() raises if stage_mutex keys don't match execution_order."""
+    scheduler = Scheduler()
+    with pytest.raises(ValueError, match="stage_mutex"):
+        scheduler.initialize(
+            execution_order=["A", "B"],
+            graph=None,
+            stage_mutex={"A": [], "C": []},  # Missing B, has extra C
+        )

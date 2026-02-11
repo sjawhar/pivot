@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import collections
-import logging
 from typing import TYPE_CHECKING
 
 from pivot.engine import graph as engine_graph
@@ -14,8 +13,6 @@ if TYPE_CHECKING:
     import networkx as nx
 
 __all__ = ["Scheduler"]
-
-_logger = logging.getLogger(__name__)
 
 
 class Scheduler:
@@ -76,6 +73,22 @@ class Scheduler:
         *,
         stage_mutex: dict[str, list[str]],
     ) -> None:
+        """Reset and configure scheduler for a new execution.
+
+        Args:
+            execution_order: Stage names in topological order. This order
+                determines the determinism tie-breaker: when multiple stages
+                are eligible to start simultaneously, they are considered in
+                ``execution_order`` sequence (i.e., dict insertion order of
+                ``_stage_states``).
+            graph: Bipartite artifact-stage graph for deriving upstream/downstream
+                relationships. Pass None for single-stage or no-dependency runs.
+            stage_mutex: Mapping of stage name to mutex group names. Must contain
+                exactly the same keys as ``execution_order``.
+
+        Raises:
+            ValueError: If ``stage_mutex`` keys don't match ``execution_order``.
+        """
         self._mutex_counts.clear()
         self._upstream_unfinished.clear()
         self._downstream.clear()
@@ -84,6 +97,17 @@ class Scheduler:
         self._stop_starting_new = False
 
         stages_set = set(execution_order)
+        mutex_keys = set(stage_mutex.keys())
+        missing = stages_set - mutex_keys
+        extra = mutex_keys - stages_set
+        if missing or extra:
+            parts = list[str]()
+            if missing:
+                parts.append(f"missing: {sorted(missing)}")
+            if extra:
+                parts.append(f"unknown: {sorted(extra)}")
+            msg = f"stage_mutex inconsistency — {', '.join(parts)}"
+            raise ValueError(msg)
 
         for stage_name in execution_order:
             if graph is not None:
@@ -151,10 +175,10 @@ class Scheduler:
 
     def release_mutexes(self, stage: str) -> None:
         for mutex in self._stage_mutex.get(stage, []):
+            if self._mutex_counts[mutex] <= 0:
+                msg = f"Mutex '{mutex}' released when not held (stage '{stage}')"
+                raise ValueError(msg)
             self._mutex_counts[mutex] -= 1
-            if self._mutex_counts[mutex] < 0:
-                _logger.error("Mutex '%s' released when not held", mutex)
-                self._mutex_counts[mutex] = 0
 
     def on_stage_completed(
         self, stage: str, failed: bool
