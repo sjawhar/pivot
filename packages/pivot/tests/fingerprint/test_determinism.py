@@ -100,7 +100,7 @@ class Model(pydantic.BaseModel):
 
 def stage(params: Model) -> None: pass
 
-print(fingerprint.get_stage_fingerprint(stage)["pydantic:Model.items"])
+print(fingerprint.get_stage_fingerprint(stage)["schema:Model"])
 """
     results = list[str]()
     for _ in range(2):
@@ -127,7 +127,7 @@ class Model(pydantic.BaseModel):
 
 def stage(params: Model) -> None: pass
 
-print(fingerprint.get_stage_fingerprint(stage)["pydantic:Model.data"])
+print(fingerprint.get_stage_fingerprint(stage)["schema:Model"])
 """
     results = list[str]()
     for _ in range(2):
@@ -177,7 +177,7 @@ def test_default_factory_list_produces_stable_hash():
     fp1 = fingerprint.get_stage_fingerprint(stage)
     fp2 = fingerprint.get_stage_fingerprint(stage)
 
-    assert fp1["pydantic:Model.items"] == fp2["pydantic:Model.items"]
+    assert fp1["schema:Model"] == fp2["schema:Model"]
 
 
 def test_default_factory_dict_produces_stable_hash():
@@ -192,7 +192,7 @@ def test_default_factory_dict_produces_stable_hash():
     fp1 = fingerprint.get_stage_fingerprint(stage)
     fp2 = fingerprint.get_stage_fingerprint(stage)
 
-    assert fp1["pydantic:Model.data"] == fp2["pydantic:Model.data"]
+    assert fp1["schema:Model"] == fp2["schema:Model"]
 
 
 def test_different_builtin_factories_have_different_hashes():
@@ -213,7 +213,7 @@ def test_different_builtin_factories_have_different_hashes():
     fp_list = fingerprint.get_stage_fingerprint(stage_list)
     fp_dict = fingerprint.get_stage_fingerprint(stage_dict)
 
-    assert fp_list["pydantic:ModelWithList.items"] != fp_dict["pydantic:ModelWithDict.items"], (
+    assert fp_list["schema:ModelWithList"] != fp_dict["schema:ModelWithDict"], (
         "Different builtin factories should produce different hashes"
     )
 

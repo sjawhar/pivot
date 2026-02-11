@@ -50,6 +50,15 @@ def with_error_handling[**P, R](func: Callable[P, R]) -> Callable[P, R]:
             raise
         except exceptions.PivotError as e:
             raise _handle_pivot_error(e) from e
+        except BaseExceptionGroup as eg:
+            # Async TaskGroups wrap exceptions in ExceptionGroup.
+            # Unwrap to find PivotErrors for user-friendly formatting.
+            pivot_errors = eg.subgroup(exceptions.PivotError)
+            if pivot_errors is not None:
+                messages = [str(e) for e in pivot_errors.exceptions]
+                raise click.ClickException("\n".join(messages)) from eg
+            logger.debug("Unhandled ExceptionGroup in CLI command", exc_info=True)
+            raise click.ClickException(repr(eg)) from eg
         except Exception as e:
             logger.debug("Unhandled exception in CLI command", exc_info=True)
             raise click.ClickException(repr(e)) from e

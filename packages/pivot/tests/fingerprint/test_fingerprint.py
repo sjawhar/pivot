@@ -1,18 +1,27 @@
 # pyright: reportUnusedFunction=false, reportUnusedParameter=false, reportUnknownLambdaType=false, reportUnknownParameterType=false, reportMissingParameterType=false, reportUnknownVariableType=false, reportUnknownArgumentType=false, reportImplicitOverride=false
 
 import ast
+import dataclasses
+import datetime
 import importlib.util
+import inspect
 import json
+import logging
 import math
 import os
 import pathlib
 import sys
 import time
+import types
+import typing
 
 import networkx as nx
+import pydantic
 import pytest
+import xxhash
+from pydantic import BaseModel
 
-from pivot import ast_utils, fingerprint
+from pivot import ast_utils, exceptions, fingerprint
 from pivot.storage import state as state_mod
 
 # --- Module-level helper functions for testing ---
@@ -79,12 +88,54 @@ def _helper_with_math_pi():
     return math.pi * 2
 
 
+class _HelperForwardRef:
+    pass
+
+
+class _HelperForwardRefString:
+    pass
+
+
+if typing.TYPE_CHECKING:
+
+    class MissingType:
+        pass
+
+
+def _helper_annotations_mixed(
+    a: "int",
+    b: "_HelperForwardRef",
+    c: "MissingType",
+    d: int,
+    e: '"_HelperForwardRefString"',
+    f: typing.Any,
+) -> "_HelperForwardRef":
+    return _HelperForwardRef()
+
+
 # Constants for testing constant capture (no underscore prefix!)
 TEST_STRING = "Hello, World!"
 TEST_BYTES = b"binary data"
 TEST_NONE = None
 TEST_FLOAT = 3.14159
 TEST_BOOL = True
+TEST_DATETIME = datetime.datetime(2024, 1, 2, 3, 4, 5, tzinfo=datetime.UTC)
+
+
+class _HelperReprError:
+    __module__ = "builtins"
+
+    def __repr__(self) -> str:
+        raise RuntimeError("repr failure")
+
+
+class _PydanticInnerModel(pydantic.BaseModel):
+    value: int = 1
+
+
+class _PydanticOuterModel(pydantic.BaseModel):
+    inner: _PydanticInnerModel
+    items: list[_PydanticInnerModel]
 
 
 def _helper_uses_string():
@@ -112,11 +163,127 @@ def _helper_uses_bool():
     return TEST_BOOL
 
 
+def _helper_uses_datetime_constant():
+    """Helper that uses a datetime constant."""
+    return TEST_DATETIME
+
+
+def _helper_uses_stdlib_callable(x: object) -> str:
+    """Helper that uses typing.cast (stdlib callable) in closure."""
+    return typing.cast("str", x)
+
+
+def _helper_load_module_from_path(name: str, path: pathlib.Path) -> types.ModuleType:
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+class _HelperBase:
+    """Base class for class body dependency tests."""
+
+
+class _HelperFieldType:
+    """Field type for class body dependency tests."""
+
+
+class _HelperContainer:
+    """Container for nested class references."""
+
+    class Inner:
+        """Nested class used for dotted annotation refs."""
+
+
+class _HelperPydanticModel(BaseModel):
+    """Pydantic model used for class annotation defaults."""
+
+    value: int = 1
+
+
+class _HelperAnnotatedClass(_HelperBase):
+    """Class with annotations for dependency walk tests."""
+
+    field: _HelperFieldType
+    inner: _HelperContainer.Inner
+    model: _HelperPydanticModel
+
+    def __init__(self) -> None:
+        self.field = _HelperFieldType()
+        self.inner = _HelperContainer.Inner()
+        self.model = _HelperPydanticModel()
+
+
+@dataclasses.dataclass
+class _HelperDataClassNoMethods:
+    value: int
+
+
+@dataclasses.dataclass
+class _HelperDataClassWithMethod:
+    value: int
+
+    def custom(self) -> int:
+        return self.value
+
+
+@dataclasses.dataclass
+class _HelperDataClassWithDunder:
+    value: int
+
+    def __str__(self) -> str:
+        return str(self.value)
+
+
+class _HelperPydanticModelWithAllowedMethod(BaseModel):
+    value: int
+
+    def model_post_init(self, __context: typing.Any) -> None:
+        return None
+
+
+class _HelperPydanticModelWithUserMethod(BaseModel):
+    value: int
+
+    def compute(self) -> int:
+        return self.value + 1
+
+
+def _helper_parse_annotation(expr: str) -> ast.AST:
+    """Parse an annotation expression into an AST node."""
+    tree = ast.parse(f"x: {expr}")
+    ann_assign = next(node for node in ast.walk(tree) if isinstance(node, ast.AnnAssign))
+    return ann_assign.annotation
+
+
 def _helper_outer_uses_inner(x):
     """Helper that references another helper."""
     # Reference the function (not call it) so it's captured in closure
     func = _helper_for_hash_test_1
     return func() + x
+
+
+def _helper_static_getattr(obj: typing.Any) -> object:
+    """Helper with static getattr usage."""
+    return obj.value
+
+
+def _helper_dynamic_getattr(obj: object, name: str) -> object:
+    """Helper with dynamic getattr usage."""
+    return getattr(obj, name)
+
+
+def _helper_uses_globals() -> dict[str, object]:
+    """Helper that uses globals()."""
+    return globals()
+
+
+def _helper_uses_import_module() -> object:
+    """Helper that uses importlib.import_module dynamically."""
+    return importlib.import_module("json")
 
 
 # --- get_stage_fingerprint tests ---
@@ -133,7 +300,18 @@ def test_simple_function_fingerprinted():
     assert "self:simple" in fp
     assert isinstance(fp["self:simple"], str)
     assert len(fp["self:simple"]) > 0
-    assert len(fp) == 1
+
+
+def test_resolve_annotations_individually_mixed():
+    resolved = fingerprint._resolve_annotations_individually(_helper_annotations_mixed)
+
+    assert resolved["a"] is int
+    assert resolved["b"] is _HelperForwardRef
+    assert resolved["d"] is int
+    assert resolved["e"] is _HelperForwardRefString
+    assert resolved["f"] is typing.Any
+    assert resolved["return"] is _HelperForwardRef
+    assert "c" not in resolved
 
 
 def test_helper_function_captured():
@@ -357,6 +535,65 @@ def test_fingerprint_with_default_args(x, y):
     assert "self:func_with_defaults" in fp
 
 
+def test_collect_annotation_names_handles_generics_and_unions():
+    """Collects names from generics and union annotations."""
+    names = set[str]()
+    dotted_refs = list[tuple[str, ...]]()
+
+    node = _helper_parse_annotation("list[_HelperFieldType] | _HelperBase")
+    fingerprint._collect_annotation_names(node, names, dotted_refs)
+
+    assert "_HelperFieldType" in names
+    assert "_HelperBase" in names
+
+
+def test_collect_annotation_names_handles_dotted_and_strings():
+    """Collects dotted refs and string annotations."""
+    names = set[str]()
+    dotted_refs = list[tuple[str, ...]]()
+
+    node = _helper_parse_annotation("_HelperContainer.Inner")
+    fingerprint._collect_annotation_names(node, names, dotted_refs)
+    assert ("_HelperContainer", "Inner") in dotted_refs
+
+    node = _helper_parse_annotation('"ForwardType"')
+    fingerprint._collect_annotation_names(node, names, dotted_refs)
+    assert "ForwardType" in names
+
+
+def test_collect_dotted_path_collects_attribute_chain():
+    """Collects dotted attribute paths from AST nodes."""
+    node = _helper_parse_annotation("_HelperContainer.Inner")
+    attr_node = next(n for n in ast.walk(node) if isinstance(n, ast.Attribute))
+
+    assert fingerprint._collect_dotted_path(attr_node) == ("_HelperContainer", "Inner")
+
+
+def test_resolve_dotted_path_resolves_namespace():
+    """Resolves dotted paths against module namespace."""
+    ns = {"_HelperContainer": _HelperContainer}
+
+    resolved = fingerprint._resolve_dotted_path(("_HelperContainer", "Inner"), ns)
+    assert resolved is _HelperContainer.Inner
+
+    missing = fingerprint._resolve_dotted_path(("Missing", "Type"), ns)
+    assert missing is None
+
+
+def test_process_class_body_dependencies_tracks_bases_and_annotations():
+    """Class body walker should track bases and annotated types."""
+    manifest = dict[str, str]()
+    visited = set[int]()
+
+    fingerprint._process_class_body_dependencies(_HelperAnnotatedClass, manifest, visited)
+
+    assert "class:_HelperBase" in manifest
+    assert "class:_HelperFieldType" in manifest
+    assert "class:Inner" in manifest
+    assert "class:_HelperPydanticModel" in manifest
+    assert "schema:_HelperPydanticModel" in manifest
+
+
 # --- hash_function_ast tests ---
 
 
@@ -513,9 +750,9 @@ def test_is_user_code_lambda():
     assert fingerprint.is_user_code(my_lambda) is True
 
 
-def test_is_user_code_module():
-    """Should identify pivot module as user code."""
-    assert fingerprint.is_user_code(fingerprint) is True
+def test_is_user_code_pivot_is_framework():
+    """Pivot's own modules are framework code, not user code."""
+    assert fingerprint.is_user_code(fingerprint) is False
 
 
 def test_is_user_code_non_callable():
@@ -705,6 +942,59 @@ def test_fingerprint_callable_nonlocal():
     assert "const:n" in fp
 
 
+def test_hash_unrecognized_closure_value_deterministic_repr():
+    """Deterministic repr values should be hashed into the manifest."""
+    manifest: dict[str, str] = {}
+    fingerprint._hash_unrecognized_closure_value("TEST_DATETIME", TEST_DATETIME, manifest, "stage")
+
+    expected = xxhash.xxh64(repr(TEST_DATETIME).encode()).hexdigest()
+    assert manifest["const:TEST_DATETIME"] == expected
+
+
+def test_hash_unrecognized_closure_value_repr_error_raises(monkeypatch: pytest.MonkeyPatch):
+    """repr failures should surface as mutable capture errors."""
+    monkeypatch.delenv("PIVOT_UNSAFE_FINGERPRINTING", raising=False)
+    with pytest.raises(exceptions.StageDefinitionError):
+        fingerprint._hash_unrecognized_closure_value("bad_repr", _HelperReprError(), {}, "stage")
+
+
+def test_hash_unrecognized_closure_value_memory_address_raises(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Memory-address reprs should be rejected as non-deterministic."""
+    monkeypatch.delenv("PIVOT_UNSAFE_FINGERPRINTING", raising=False)
+    with pytest.raises(exceptions.StageDefinitionError):
+        fingerprint._hash_unrecognized_closure_value("addr", object(), {}, "stage")
+
+
+def test_hash_unrecognized_closure_value_large_repr_raises(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Large reprs should be rejected as lossy."""
+    monkeypatch.delenv("PIVOT_UNSAFE_FINGERPRINTING", raising=False)
+    large_value = types.SimpleNamespace(data="x" * 10_001)
+    with pytest.raises(exceptions.StageDefinitionError):
+        fingerprint._hash_unrecognized_closure_value("large", large_value, {}, "stage")
+
+
+def test_fingerprint_captures_unrecognized_closure_value():
+    """Unrecognized closure values should be hashed when deterministic."""
+    fp = fingerprint.get_stage_fingerprint(_helper_uses_datetime_constant)
+
+    expected = xxhash.xxh64(repr(TEST_DATETIME).encode()).hexdigest()
+    assert fp["const:TEST_DATETIME"] == expected
+
+
+def test_stdlib_callable_in_closure_does_not_raise():
+    """Stdlib callables like typing.cast should be silently skipped, not flagged as mutable."""
+    # This was a regression where non-user-code callables hit the catch-all else branch
+    # and _check_mutable_capture raised because repr() contains 0x memory addresses.
+    fp = fingerprint.get_stage_fingerprint(_helper_uses_stdlib_callable)
+    assert "self:_helper_uses_stdlib_callable" in fp
+    # cast should NOT appear as const: or func: — it's a stdlib callable, silently skipped
+    assert not any(k.endswith(":cast") for k in fp), f"cast should be skipped, found in: {fp}"
+
+
 def test_fingerprint_nonlocal_callable_function():
     """Should capture and recurse on nonlocal callable functions."""
 
@@ -848,6 +1138,68 @@ def test_hash_function_no_code_object():
     assert len(h) == 16  # xxhash64 hexdigest
 
 
+def test_check_data_class_methods_allows_dunders_and_pydantic_hooks():
+    """Dunder methods and allowed Pydantic hooks should be allowed."""
+    fingerprint._check_data_class_methods(_HelperDataClassNoMethods)
+    fingerprint._check_data_class_methods(_HelperDataClassWithDunder)
+    fingerprint._check_data_class_methods(_HelperPydanticModelWithAllowedMethod)
+
+
+def test_check_data_class_methods_rejects_user_methods():
+    """User-defined methods on data classes should raise errors."""
+    with pytest.raises(exceptions.StageDefinitionError, match="Data class"):
+        fingerprint._check_data_class_methods(_HelperDataClassWithMethod)
+
+    with pytest.raises(exceptions.StageDefinitionError, match="Data class"):
+        fingerprint._check_data_class_methods(_HelperPydanticModelWithUserMethod)
+
+
+def test_check_dynamic_name_access_allows_literal_getattr():
+    """Literal getattr usage should be allowed."""
+    fingerprint._check_dynamic_name_access(_helper_static_getattr)
+
+
+def test_check_dynamic_name_access_rejects_dynamic_getattr():
+    """Dynamic getattr usage should be rejected."""
+    with pytest.raises(exceptions.StageDefinitionError, match="getattr"):
+        fingerprint._check_dynamic_name_access(_helper_dynamic_getattr)
+
+
+def test_check_dynamic_name_access_rejects_globals():
+    """globals() usage should be rejected."""
+    with pytest.raises(exceptions.StageDefinitionError, match="globals"):
+        fingerprint._check_dynamic_name_access(_helper_uses_globals)
+
+
+def test_check_dynamic_name_access_rejects_import_module():
+    """import_module usage should be rejected."""
+    with pytest.raises(exceptions.StageDefinitionError, match="dynamic imports"):
+        fingerprint._check_dynamic_name_access(_helper_uses_import_module)
+
+
+def test_compute_function_hash_warns_when_source_unavailable_for_user_code(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Missing source should warn for user code when no __code__ exists."""
+
+    class FakeCallable:
+        """Callable without source or __code__."""
+
+        def __call__(self) -> int:
+            return 42
+
+    def _raise_getsource(*_args: object, **_kwargs: object) -> str:
+        raise OSError("missing")
+
+    caplog.set_level(logging.WARNING)
+    monkeypatch.setattr(inspect, "getsource", _raise_getsource)
+
+    fingerprint._compute_function_hash(FakeCallable())
+
+    assert "Cannot get source for" in caplog.text
+
+
 def test_is_user_code_module_not_in_sys_modules():
     """Should return False for modules not in sys.modules."""
 
@@ -973,6 +1325,95 @@ def test_fingerprint_with_bool_constant():
     assert "self:_helper_uses_bool" in fp
     assert "const:TEST_BOOL" in fp
     assert fp["const:TEST_BOOL"] == "True"
+
+
+# --- Pydantic schema hashing tests ---
+
+
+def test_strip_schema_metadata_removes_titles_and_descriptions():
+    """Should remove title/description from schema recursively."""
+    schema = {
+        "title": "Top",
+        "description": "Top desc",
+        "type": "object",
+        "properties": {
+            "name": {
+                "title": "Name",
+                "description": "Name desc",
+                "type": "string",
+            },
+            "items": {
+                "title": "Items",
+                "description": "Items desc",
+                "type": "array",
+                "items": {
+                    "title": "Item",
+                    "description": "Item desc",
+                    "type": "string",
+                },
+            },
+        },
+        "$defs": {
+            "Inner": {
+                "title": "Inner",
+                "description": "Inner desc",
+                "type": "object",
+                "properties": {
+                    "value": {
+                        "title": "Value",
+                        "description": "Value desc",
+                        "type": "integer",
+                    }
+                },
+            }
+        },
+        "anyOf": [
+            {"title": "OptA", "description": "OptA desc", "type": "string"},
+            {"type": "number"},
+        ],
+    }
+
+    stripped = fingerprint._strip_schema_metadata(schema)
+
+    assert "title" not in stripped
+    assert "description" not in stripped
+    assert "title" in schema
+    assert "description" in schema
+    assert "title" not in stripped["$defs"]["Inner"]
+    assert "description" not in stripped["$defs"]["Inner"]
+    assert "title" not in stripped["properties"]["name"]
+    assert stripped["properties"]["name"]["type"] == "string"
+    assert "title" not in stripped["properties"]["items"]["items"]
+    assert stripped["anyOf"][0]["type"] == "string"
+
+
+def test_hash_pydantic_schema_adds_schema_and_nested_models():
+    """Should hash model schema and discover nested models."""
+    manifest = dict[str, str]()
+    visited = set[int]()
+
+    fingerprint._hash_pydantic_schema(
+        typing.cast("type[fingerprint._PydanticModelProtocol]", _PydanticOuterModel),
+        manifest,
+        visited,
+    )
+
+    assert "schema:_PydanticOuterModel" in manifest
+    assert "schema:_PydanticInnerModel" in manifest
+    assert "class:_PydanticInnerModel" in manifest
+    assert "class:_PydanticOuterModel" not in manifest
+    assert len(manifest["schema:_PydanticOuterModel"]) == 16
+
+
+def test_discover_pydantic_field_types_tracks_nested_models():
+    """Should walk annotations and capture nested Pydantic models."""
+    manifest = dict[str, str]()
+    visited = set[int]()
+
+    fingerprint._discover_pydantic_field_types(list[_PydanticInnerModel], manifest, visited)
+
+    assert "class:_PydanticInnerModel" in manifest
+    assert "schema:_PydanticInnerModel" in manifest
 
 
 # ==============================================================================
@@ -1462,97 +1903,117 @@ def reset_fingerprint_cache_state(monkeypatch):
     fingerprint._state_db_init_attempted = orig_attempted
 
 
-def test_hash_function_ast_adds_to_pending_writes(
-    tmp_path, monkeypatch, reset_fingerprint_cache_state
-):
-    """Module-level functions should queue entries for persistent cache."""
-    # Set project root to tmp_path so _get_func_source_info can compute relative paths
-    monkeypatch.setattr("pivot.project._project_root_cache", tmp_path)
-
-    # Create a test module file
-    test_module = tmp_path / "test_stage.py"
-    test_module.write_text("""
-def my_stage():
-    return 42
-""")
-
-    # Import the function
-    import importlib.util
-
-    spec = importlib.util.spec_from_file_location("test_stage", test_module)
-    assert spec is not None
-    assert spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["test_stage"] = module
-    try:
-        spec.loader.exec_module(module)
-
-        # Hash the function - should add to pending writes
-        func = module.my_stage
-        result = fingerprint.hash_function_ast(func)
-
-        # Verify hash was computed
-        assert isinstance(result, str)
-        assert len(result) == 16  # xxhash64 hexdigest
-
-        # Verify entry was queued for persistent cache
-        assert len(fingerprint._pending_ast_writes) == 1
-        rel_path, mtime_ns, size, inode, qualname, py_version, schema_version, hash_hex = (
-            fingerprint._pending_ast_writes[0]
-        )
-        assert rel_path == "test_stage.py"
-        assert qualname == "my_stage"
-        assert py_version == fingerprint._PYTHON_VERSION
-        assert schema_version == fingerprint._CACHE_SCHEMA_VERSION
-        assert hash_hex == result
-        assert mtime_ns > 0
-        assert size > 0
-        assert inode > 0
-    finally:
-        del sys.modules["test_stage"]
+# ==============================================================================
+# Review fix: Recursive Pydantic model infinite recursion
+# ==============================================================================
 
 
-def test_hash_function_ast_skips_closures_for_persistent():
-    """Closures should still hash correctly but not use persistent cache."""
+def test_recursive_pydantic_model_no_infinite_recursion():
+    """Self-referential Pydantic models should not cause infinite recursion."""
+    import pydantic
 
-    def make_adder(n):
-        def add(x):
-            return x + n
+    class TreeNode(pydantic.BaseModel):
+        value: int
+        children: list["TreeNode"] = []
 
-        return add
+    TreeNode.model_rebuild()
 
-    add_five = make_adder(5)
+    # Should not raise RecursionError
+    manifest = dict[str, str]()
+    visited = set[int]()
+    fingerprint._hash_pydantic_schema(
+        TreeNode,  # pyright: ignore[reportArgumentType] - Pydantic model_fields protocol mismatch in tests
+        manifest,
+        visited,
+    )
+    assert f"schema:{TreeNode.__name__}" in manifest
+    assert manifest[f"schema:{TreeNode.__name__}"] != "<pending>"
 
-    # Should hash without error
-    h = fingerprint.hash_function_ast(add_five)
-    assert isinstance(h, str)
-    assert len(h) == 16  # xxhash64 hexdigest
 
+def test_mutual_recursive_pydantic_models():
+    """Mutually recursive Pydantic models should not cause infinite recursion."""
+    import pydantic
 
-def test_hash_function_ast_uses_memory_cache():
-    """Memory cache should be used on repeated calls."""
+    class Parent(pydantic.BaseModel):
+        name: str
+        child: "Child | None" = None
 
-    def test_func():
-        return 42
+    class Child(pydantic.BaseModel):
+        name: str
+        parent: "Parent | None" = None
 
-    # Clear caches
-    fingerprint._hash_function_ast_cache.clear()
+    Parent.model_rebuild()
+    Child.model_rebuild()
 
-    h1 = fingerprint.hash_function_ast(test_func)
-    h2 = fingerprint.hash_function_ast(test_func)
-
-    assert h1 == h2
-    # The function should be in memory cache after first call
-    assert test_func in fingerprint._hash_function_ast_cache
+    manifest = dict[str, str]()
+    visited = set[int]()
+    fingerprint._hash_pydantic_schema(
+        Parent,  # pyright: ignore[reportArgumentType] - Pydantic model_fields protocol mismatch in tests
+        manifest,
+        visited,
+    )
+    assert "schema:Parent" in manifest
+    assert manifest["schema:Parent"] != "<pending>"
 
 
 # ==============================================================================
-# Persistent cache integration tests
+# Review fix: User-defined generic origins tracked
 # ==============================================================================
+
+
+def test_user_defined_generic_origin_tracked():
+    """User-defined generic classes used as origins should be fingerprinted."""
+    import typing
+
+    T = typing.TypeVar("T")
+
+    class MyContainer(typing.Generic[T]):
+        pass
+
+    hint = MyContainer[int]
+
+    manifest = dict[str, str]()
+    visited = set[int]()
+    fingerprint._process_type_hint(hint, manifest, visited)
+
+    assert "class:MyContainer" in manifest
+
+
+# ==============================================================================
+# Review fix: Dotted string forward refs in class annotations
+# ==============================================================================
+
+
+def test_collect_annotation_names_dotted_string_forward_ref():
+    """Dotted string forward refs like 'pkg.Type' should be treated as dotted refs."""
+    import ast as ast_mod
+
+    node = ast_mod.Constant(value="some_module.SomeType")
+    names = set[str]()
+    dotted_refs = list[tuple[str, ...]]()
+    fingerprint._collect_annotation_names(node, names, dotted_refs)
+
+    # Should NOT be in simple names (it has a dot)
+    assert "some_module.SomeType" not in names
+    # Should be treated as dotted ref
+    assert ("some_module", "SomeType") in dotted_refs
+
+
+def test_collect_annotation_names_simple_string_forward_ref():
+    """Simple string forward refs like 'MyType' should still be added as names."""
+    import ast as ast_mod
+
+    node = ast_mod.Constant(value="MyType")
+    names = set[str]()
+    dotted_refs = list[tuple[str, ...]]()
+    fingerprint._collect_annotation_names(node, names, dotted_refs)
+
+    assert "MyType" in names
+    assert len(dotted_refs) == 0
 
 
 def test_persistent_cache_full_roundtrip(tmp_path, monkeypatch):
-    """Full round-trip: compute → flush → hit → modify → miss.
+    """Full round-trip: compute -> flush -> hit -> modify -> miss.
 
     Verifies that:
     1. First call computes and queues for persistent cache

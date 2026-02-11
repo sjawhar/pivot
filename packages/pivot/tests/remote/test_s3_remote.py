@@ -589,9 +589,28 @@ async def test_iter_hashes(s3_remote: remote_mod.S3Remote, aioboto3_s3_client: S
 
 
 async def test_iter_hashes_skips_invalid_keys(
-    s3_remote: remote_mod.S3Remote, aioboto3_s3_client: S3Client
+    s3_remote: remote_mod.S3Remote, mocker: MockerFixture
 ) -> None:
     """iter_hashes skips keys that don't produce valid 16-char lowercase hex hashes."""
+
+    class _PageIterator:
+        _pages: list[dict[str, object]]
+        _idx: int
+
+        def __init__(self, pages: list[dict[str, object]]) -> None:
+            self._pages = pages
+            self._idx = 0
+
+        def __aiter__(self) -> _PageIterator:
+            return self
+
+        async def __anext__(self) -> dict[str, object]:
+            if self._idx >= len(self._pages):
+                raise StopAsyncIteration
+            page = self._pages[self._idx]
+            self._idx += 1
+            return page
+
     keys = [
         f"{s3_remote.prefix}files/ab/cdef1234567890",  # Valid: 16 lowercase hex
         f"{s3_remote.prefix}files/AB/CDEF1234567890",  # Invalid: uppercase
@@ -600,12 +619,14 @@ async def test_iter_hashes_skips_invalid_keys(
         f"{s3_remote.prefix}files/stages/my_stage.lock",  # Invalid: not a cache file
     ]
 
-    for key in keys:
-        await aioboto3_s3_client.put_object(
-            Bucket=s3_remote.bucket,
-            Key=key,
-            Body=b"content",
-        )
+    pages: list[dict[str, object]] = [{"Contents": [{"Key": key} for key in keys]}]
+
+    mock_paginator = mocker.MagicMock()
+    mock_paginator.paginate = mocker.MagicMock(return_value=_PageIterator(pages))
+
+    mock_client = mocker.AsyncMock()
+    mock_client.get_paginator = mocker.Mock(return_value=mock_paginator)
+    _helper_patch_s3_client(mocker, s3_remote, mock_client)
 
     hashes = [h async for h in s3_remote.iter_hashes()]
 
@@ -615,7 +636,7 @@ async def test_iter_hashes_skips_invalid_keys(
 async def test_upload_batch(
     s3_remote: remote_mod.S3Remote,
     tmp_path: pathlib.Path,
-    aioboto3_s3_client: S3Client,
+    mocker: MockerFixture,
 ) -> None:
     """upload_batch uploads multiple files in parallel."""
     files = list[tuple[pathlib.Path, str]]()
@@ -628,21 +649,31 @@ async def test_upload_batch(
         files.append((f, cache_hash))
         contents[cache_hash] = data
 
-    results = await s3_remote.upload_batch(files, concurrency=10)
+    mock_client = mocker.AsyncMock()
+    mock_client.put_object = mocker.AsyncMock(return_value={})
+    _helper_patch_s3_client(mocker, s3_remote, mock_client)
+
+    results = await s3_remote.upload_batch(files, concurrency=1)
 
     assert len(results) == 3
     assert all(r["success"] for r in results)
 
-    for cache_hash, expected in contents.items():
-        response = await aioboto3_s3_client.get_object(
-            Bucket=s3_remote.bucket,
-            Key=remote_mod._hash_to_key(s3_remote.prefix, cache_hash),
-        )
-        assert await response["Body"].read() == expected
+    assert mock_client.put_object.call_count == 3
+    called_keys = {call.kwargs["Key"] for call in mock_client.put_object.call_args_list}
+    called_buckets = {call.kwargs["Bucket"] for call in mock_client.put_object.call_args_list}
+    called_bodies = {call.kwargs["Body"] for call in mock_client.put_object.call_args_list}
+
+    expected_keys = {
+        remote_mod._hash_to_key(s3_remote.prefix, cache_hash) for cache_hash in contents
+    }
+
+    assert called_buckets == {s3_remote.bucket}
+    assert called_keys == expected_keys
+    assert called_bodies == set(contents.values())
 
 
 async def test_upload_batch_with_callback(
-    s3_remote: remote_mod.S3Remote, tmp_path: pathlib.Path
+    s3_remote: remote_mod.S3Remote, tmp_path: pathlib.Path, mocker: MockerFixture
 ) -> None:
     """upload_batch calls callback for each completed upload."""
     files = list[tuple[pathlib.Path, str]]()
@@ -656,7 +687,11 @@ async def test_upload_batch_with_callback(
     def callback(completed: int, total: int, filename: str) -> None:
         callback_values.append(completed)
 
-    await s3_remote.upload_batch(files, concurrency=10, callback=callback)
+    mock_client = mocker.AsyncMock()
+    mock_client.put_object = mocker.AsyncMock(return_value={})
+    _helper_patch_s3_client(mocker, s3_remote, mock_client)
+
+    await s3_remote.upload_batch(files, concurrency=1, callback=callback)
 
     assert len(callback_values) == 3
     assert set(callback_values) == {1, 2, 3}

@@ -16,7 +16,7 @@ import types
 import typing
 import weakref
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import xxhash
 
@@ -29,13 +29,21 @@ if TYPE_CHECKING:
 _logger = logging.getLogger(__name__)
 
 _PYTHON_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}"
-_CACHE_SCHEMA_VERSION = 1
+_CACHE_SCHEMA_VERSION = 2
+_REPR_SIZE_LIMIT = 10_000
 
 _SITE_PACKAGE_PATHS = ("site-packages", "dist-packages")
 
 # Type alias for AST hash cache entry tuple.
 # Format: (rel_path, mtime_ns, size, inode, qualname, py_version, schema_version, hash_hex)
 type AstHashEntry = tuple[str, int, int, int, str, str, int, str]
+
+
+class _PydanticModelProtocol(Protocol):
+    model_fields: Mapping[str, Any]
+
+    @classmethod
+    def model_json_schema(cls) -> dict[str, Any]: ...
 
 
 def _init_stdlib_paths() -> tuple[pathlib.Path, ...]:
@@ -476,6 +484,38 @@ def _collect_nested_code_globals(code: types.CodeType) -> set[str]:
     return nested_globals
 
 
+def _check_dynamic_name_access(func: Callable[..., Any]) -> None:
+    try:
+        source = inspect.getsource(func)
+        tree = ast.parse(textwrap.dedent(source))
+    except (OSError, TypeError, SyntaxError):
+        return
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if isinstance(node.func, ast.Name):
+            if node.func.id == "getattr" and len(node.args) >= 2:
+                if not isinstance(node.args[1], ast.Constant):
+                    message = (
+                        f"'{getattr(func, '__qualname__', '?')}' uses getattr() "
+                        + "with non-literal attribute. Use direct attribute access."
+                    )
+                    raise exceptions.StageDefinitionError(message)
+            elif node.func.id in ("globals", "locals"):
+                message = (
+                    f"'{getattr(func, '__qualname__', '?')}' uses {node.func.id}() "
+                    + "which bypasses fingerprint tracking."
+                )
+                raise exceptions.StageDefinitionError(message)
+        elif isinstance(node.func, ast.Attribute) and node.func.attr == "import_module":
+            message = (
+                f"'{getattr(func, '__qualname__', '?')}' uses dynamic imports. "
+                + "Use static imports instead."
+            )
+            raise exceptions.StageDefinitionError(message)
+
+
 def _get_stage_fingerprint_impl(func: Callable[..., Any], visited: set[int]) -> dict[str, str]:
     """Internal implementation of get_stage_fingerprint."""
     manifest = dict[str, str]()
@@ -488,6 +528,9 @@ def _get_stage_fingerprint_impl(func: Callable[..., Any], visited: set[int]) -> 
     func_name = getattr(func, "__name__", "<lambda>")
     manifest[f"self:{func_name}"] = hash_function_ast(func)
 
+    if is_user_code(func):
+        _check_dynamic_name_access(func)
+
     _t_closure = metrics.start()
     try:
         # Use cached result if available (getclosurevars is expensive at ~0.5ms)
@@ -496,6 +539,8 @@ def _get_stage_fingerprint_impl(func: Callable[..., Any], visited: set[int]) -> 
             _getclosurevars_cache[func] = closure_vars
     except (TypeError, AttributeError):
         metrics.end("fingerprint.getclosurevars", _t_closure)
+        if isinstance(func, type):
+            _process_class_body_dependencies(func, manifest, visited)
         return manifest
     metrics.end("fingerprint.getclosurevars", _t_closure)
 
@@ -542,6 +587,109 @@ def _get_stage_fingerprint_impl(func: Callable[..., Any], visited: set[int]) -> 
     _process_type_hint_dependencies(func, manifest, visited)
 
     return manifest
+
+
+def _process_class_body_dependencies(
+    cls: type, manifest: dict[str, str], visited: set[int]
+) -> None:
+    try:
+        source = inspect.getsource(cls)
+        tree = ast.parse(textwrap.dedent(source))
+    except (OSError, TypeError, SyntaxError):
+        return
+
+    class_def = next((node for node in ast.walk(tree) if isinstance(node, ast.ClassDef)), None)
+    if class_def is None:
+        return
+
+    module = sys.modules.get(cls.__module__)
+    if module is None:
+        return
+    ns = vars(module)
+
+    names = set[str]()
+    dotted_refs = list[tuple[str, ...]]()
+
+    for base_node in class_def.bases:
+        _collect_annotation_names(base_node, names, dotted_refs)
+
+    for stmt in class_def.body:
+        if isinstance(stmt, ast.AnnAssign):
+            _collect_annotation_names(stmt.annotation, names, dotted_refs)
+
+    for name in names:
+        if name not in ns:
+            continue
+        value = ns[name]
+        if isinstance(value, type) and is_user_code(value):
+            key = f"class:{name}"
+            if key not in manifest:
+                _add_callable_to_manifest(key, value, manifest, visited)
+            if hasattr(value, "model_fields"):
+                _hash_pydantic_schema(
+                    cast("type[_PydanticModelProtocol]", value), manifest, visited
+                )
+
+    for parts in dotted_refs:
+        resolved = _resolve_dotted_path(parts, ns)
+        if resolved is None or not isinstance(resolved, type) or not is_user_code(resolved):
+            continue
+        key = f"class:{parts[-1]}"
+        if key not in manifest:
+            _add_callable_to_manifest(key, resolved, manifest, visited)
+        if hasattr(resolved, "model_fields"):
+            _hash_pydantic_schema(cast("type[_PydanticModelProtocol]", resolved), manifest, visited)
+
+
+def _collect_annotation_names(
+    node: ast.AST, names: set[str], dotted_refs: list[tuple[str, ...]]
+) -> None:
+    if isinstance(node, ast.Name):
+        names.add(node.id)
+    elif isinstance(node, ast.Subscript):
+        _collect_annotation_names(node.value, names, dotted_refs)
+        _collect_annotation_names(node.slice, names, dotted_refs)
+    elif isinstance(node, ast.BinOp):
+        _collect_annotation_names(node.left, names, dotted_refs)
+        _collect_annotation_names(node.right, names, dotted_refs)
+    elif isinstance(node, ast.Tuple):
+        for elt in node.elts:
+            _collect_annotation_names(elt, names, dotted_refs)
+    elif isinstance(node, ast.Attribute):
+        parts = _collect_dotted_path(node)
+        if len(parts) >= 2:
+            dotted_refs.append(parts)
+    elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+        # Handle dotted string annotations like "pkg.Type" by treating as dotted ref
+        if "." in node.value:
+            parts = tuple(node.value.split("."))
+            if len(parts) >= 2:
+                dotted_refs.append(parts)
+        else:
+            names.add(node.value)
+
+
+def _collect_dotted_path(node: ast.Attribute) -> tuple[str, ...]:
+    parts = [node.attr]
+    current = node.value
+    while isinstance(current, ast.Attribute):
+        parts.append(current.attr)
+        current = current.value
+    if isinstance(current, ast.Name):
+        parts.append(current.id)
+        return tuple(reversed(parts))
+    return ()
+
+
+def _resolve_dotted_path(parts: tuple[str, ...], ns: dict[str, Any]) -> Any:
+    if parts[0] not in ns:
+        return None
+    obj = ns[parts[0]]
+    for part in parts[1:]:
+        obj = getattr(obj, part, None)
+        if obj is None:
+            return None
+    return obj
 
 
 def get_loader_fingerprint(loader: "loaders.Writer[Any] | loaders.Reader[Any]") -> dict[str, str]:
@@ -614,15 +762,33 @@ def _is_unsafe_fingerprinting_enabled() -> bool:
 def _check_mutable_capture(var_name: str, value: Any, stage_name: str) -> None:
     message = (
         f"Stage '{stage_name}': closure captures mutable variable '{var_name}' "
-        f"(type: {type(value).__name__}).\n"
-        "Pivot cannot track changes to mutable runtime state, which may cause silent wrong outputs.\n"
-        "Fix: pass this data via StageParams or declare it as a Dep(...) input.\n"
-        "To suppress: set core.unsafe_fingerprinting=true or PIVOT_UNSAFE_FINGERPRINTING=1"
+        + f"(type: {type(value).__name__}).\n"
+        + "Pivot cannot track changes to mutable runtime state, which may cause silent wrong "
+        + "outputs.\n"
+        + "Fix: pass this data via StageParams or declare it as a Dep(...) input.\n"
+        + "To suppress: set core.unsafe_fingerprinting=true or PIVOT_UNSAFE_FINGERPRINTING=1"
     )
     if _is_unsafe_fingerprinting_enabled():
         _logger.warning(message)
         return
     raise exceptions.StageDefinitionError(message)
+
+
+def _check_data_class_methods(cls: type) -> None:
+    allowed = frozenset({"model_post_init", "model_validate", "model_rebuild"})
+    user_methods = [
+        name
+        for name, val in vars(cls).items()
+        if callable(val)
+        and not (name.startswith("__") and name.endswith("__"))
+        and name not in allowed
+    ]
+    if user_methods:
+        message = (
+            f"Data class '{cls.__qualname__}' has methods {user_methods}. "
+            + "Move these to standalone functions for reliable change detection."
+        )
+        raise exceptions.StageDefinitionError(message)
 
 
 def _is_frozen_dataclass(value: Any) -> bool:
@@ -642,6 +808,23 @@ def _is_frozen_pydantic(value: Any) -> bool:
         return bool(model_config.get("frozen", False))
     except AttributeError:
         return False
+
+
+def _hash_unrecognized_closure_value(
+    name: str, value: Any, manifest: dict[str, str], stage_name: str
+) -> None:
+    try:
+        value_repr = repr(value)
+    except Exception:
+        _check_mutable_capture(name, value, stage_name)
+        return
+    if "0x" in value_repr:
+        _check_mutable_capture(name, value, stage_name)
+        return
+    if len(value_repr) > _REPR_SIZE_LIMIT:
+        _check_mutable_capture(name, value, stage_name)
+        return
+    manifest[f"const:{name}"] = xxhash.xxh64(value_repr.encode()).hexdigest()
 
 
 def _process_closure_values(
@@ -667,8 +850,16 @@ def _process_closure_values(
             )
         elif callable(value) and is_user_code(value):
             _process_callable_dependency(name, value, manifest, visited)
+        elif callable(value):
+            # Non-user-code callables (stdlib/third-party functions like typing.cast,
+            # json.dumps) are tracked via module dependency when accessed as module.func.
+            # Skip them here — their repr contains memory addresses (0x...) which would
+            # trigger _check_mutable_capture falsely.
+            continue
         elif include_modules and isinstance(value, types.ModuleType):
             _process_module_dependency(name, value, func, manifest, visited)
+        elif isinstance(value, logging.Logger):
+            continue
         elif isinstance(value, (bool, int, float, str, bytes, type(None))):
             manifest[f"const:{name}"] = repr(value)
         elif isinstance(value, (dict, list, tuple, set, frozenset)):
@@ -689,6 +880,8 @@ def _process_closure_values(
             else:
                 _check_mutable_capture(name, value, stage_name)
                 _process_instance_dependency(name, value, manifest, visited)
+        else:
+            _hash_unrecognized_closure_value(name, value, manifest, stage_name)
 
 
 def _process_callable_dependency(
@@ -736,6 +929,31 @@ def _process_instance_dependency(
     _add_callable_to_manifest(f"class:{name}.__class__", cls, manifest, visited)
 
 
+def _resolve_annotations_individually(func: Callable[..., Any]) -> dict[str, Any]:
+    raw = getattr(func, "__annotations__", None)
+    if not raw:
+        return {}
+
+    globalns = getattr(func, "__globals__", {})
+    resolved = dict[str, Any]()
+
+    for name, annotation in raw.items():
+        if isinstance(annotation, type):
+            resolved[name] = annotation
+        elif isinstance(annotation, str):
+            try:
+                result = eval(annotation, globalns)
+            except Exception:
+                continue
+            if isinstance(result, str) and result in globalns:
+                result = globalns[result]
+            resolved[name] = result
+        else:
+            resolved[name] = annotation
+
+    return resolved
+
+
 def _process_type_hint_dependencies(
     func: Callable[..., Any], manifest: dict[str, str], visited: set[int]
 ) -> None:
@@ -751,8 +969,7 @@ def _process_type_hint_dependencies(
         try:
             hints = typing.get_type_hints(func)
         except Exception:
-            metrics.end("fingerprint.get_type_hints", _t)
-            return
+            hints = _resolve_annotations_individually(func)
         # Cache result if function is weakly referenceable
         with contextlib.suppress(TypeError):
             _get_type_hints_cache[func] = hints
@@ -770,6 +987,16 @@ def _process_type_hint(hint: Any, manifest: dict[str, str], visited: set[int]) -
 
     origin = typing.get_origin(hint)
     if origin is not None:
+        # Track user-defined generic classes (e.g., MyGeneric[int] -> hash MyGeneric)
+        if isinstance(origin, type) and is_user_code(origin):
+            origin_type = cast("type[Any]", origin)
+            key = f"class:{origin_type.__name__}"
+            if key not in manifest:
+                _add_callable_to_manifest(key, origin_type, manifest, visited)
+            if hasattr(origin_type, "model_fields"):
+                _hash_pydantic_schema(
+                    cast("type[_PydanticModelProtocol]", origin_type), manifest, visited
+                )
         for arg in typing.get_args(hint):
             _process_type_hint(arg, manifest, visited)
         return
@@ -777,40 +1004,114 @@ def _process_type_hint(hint: Any, manifest: dict[str, str], visited: set[int]) -
     if not isinstance(hint, type):
         return
 
-    if not is_user_code(hint):
-        return
+    hint_type = cast("type[Any]", hint)
 
-    key = f"class:{hint.__name__}"
+    if not is_user_code(hint_type):
+        return
+    if dataclasses.is_dataclass(hint_type):
+        _check_data_class_methods(hint_type)
+
+    key = f"class:{hint_type.__name__}"
     if key not in manifest:
-        _add_callable_to_manifest(key, hint, manifest, visited)
+        _add_callable_to_manifest(key, hint_type, manifest, visited)
 
-    # Always hash Pydantic defaults (even if class was already added via closure vars)
-    if hasattr(hint, "model_fields"):
-        _hash_pydantic_defaults(hint, manifest)
+    # Always hash Pydantic schema (even if class was already added via closure vars)
+    if hasattr(hint_type, "model_fields"):
+        _hash_pydantic_schema(cast("type[_PydanticModelProtocol]", hint_type), manifest, visited)
 
 
-def _hash_pydantic_defaults(model: type, manifest: dict[str, str]) -> None:
-    """Hash Pydantic model field default values including default_factory."""
-    model_fields = getattr(model, "model_fields", {})
-    if not model_fields:
+def _strip_schema_metadata(schema: dict[str, Any]) -> dict[str, Any]:
+    """Strip title/description to avoid false invalidation from docstring changes."""
+    stripped = {k: v for k, v in schema.items() if k not in ("title", "description")}
+    defs_raw = stripped.get("$defs")
+    if isinstance(defs_raw, dict):
+        defs = cast("dict[str, Any]", defs_raw)
+        cleaned_defs = dict[str, Any]()
+        for name, definition in defs.items():
+            if isinstance(definition, dict):
+                cleaned_defs[name] = _strip_schema_metadata(cast("dict[str, Any]", definition))
+            else:
+                cleaned_defs[name] = definition
+        stripped["$defs"] = cleaned_defs
+    properties_raw = stripped.get("properties")
+    if isinstance(properties_raw, dict):
+        properties = cast("dict[str, Any]", properties_raw)
+        cleaned_properties = dict[str, Any]()
+        for name, prop in properties.items():
+            if isinstance(prop, dict):
+                cleaned_properties[name] = _strip_schema_metadata(cast("dict[str, Any]", prop))
+            else:
+                cleaned_properties[name] = prop
+        stripped["properties"] = cleaned_properties
+    for key in ("items", "anyOf", "allOf", "oneOf"):
+        val = stripped.get(key)
+        if isinstance(val, dict):
+            stripped[key] = _strip_schema_metadata(cast("dict[str, Any]", val))
+        elif isinstance(val, list):
+            cleaned_items = list[Any]()
+            items = cast("list[Any]", val)
+            for item in items:
+                if isinstance(item, dict):
+                    cleaned_items.append(_strip_schema_metadata(cast("dict[str, Any]", item)))
+                else:
+                    cleaned_items.append(item)
+            stripped[key] = cleaned_items
+    return stripped
+
+
+def _hash_pydantic_schema(
+    model: type[_PydanticModelProtocol],
+    manifest: dict[str, str],
+    visited: set[int],
+) -> None:
+    schema_model = model
+    schema_key = f"schema:{schema_model.__name__}"
+    if schema_key in manifest:
         return
+    # Insert placeholder to prevent infinite recursion on self-referential models
+    # (e.g., class Node(BaseModel): children: list["Node"])
+    manifest[schema_key] = "<pending>"
+    schema_raw = schema_model.model_json_schema()
+    schema = _strip_schema_metadata(schema_raw)
 
+    model_fields = cast("Mapping[str, Any]", getattr(schema_model, "model_fields", {}))
+    default_hashes = dict[str, str]()
     for field_name, field_info in model_fields.items():
+        annotation = getattr(field_info, "annotation", None)
+        if annotation is not None:
+            _discover_pydantic_field_types(annotation, manifest, visited)
+
         default = getattr(field_info, "default", None)
         default_factory = getattr(field_info, "default_factory", None)
-
-        # Check for PydanticUndefined (no default) - don't skip None, it's a valid default
         if type(default).__name__ == "PydanticUndefinedType":
-            # No static default, check for default_factory
             if default_factory is not None and callable(default_factory):
-                # Hash the factory function itself (tracks code changes)
-                key = f"pydantic:{model.__name__}.{field_name}"
-                manifest[key] = hash_function_ast(default_factory)
+                default_hashes[field_name] = hash_function_ast(default_factory)
             continue
 
         value_str = _serialize_value_for_hash(default)
-        key = f"pydantic:{model.__name__}.{field_name}"
-        manifest[key] = xxhash.xxh64(value_str.encode()).hexdigest()
+        default_hashes[field_name] = xxhash.xxh64(value_str.encode()).hexdigest()
+
+    payload = {"schema": schema, "defaults": default_hashes}
+    manifest[schema_key] = xxhash.xxh64(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+
+def _discover_pydantic_field_types(
+    annotation: Any, manifest: dict[str, str], visited: set[int]
+) -> None:
+    origin = typing.get_origin(annotation)
+    if origin is not None:
+        for arg in typing.get_args(annotation):
+            _discover_pydantic_field_types(arg, manifest, visited)
+        return
+    if isinstance(annotation, type) and is_user_code(annotation):
+        annotation_type = cast("type[Any]", annotation)
+        key = f"class:{annotation_type.__name__}"
+        if key not in manifest:
+            _add_callable_to_manifest(key, annotation_type, manifest, visited)
+        if hasattr(annotation_type, "model_fields"):
+            _hash_pydantic_schema(
+                cast("type[_PydanticModelProtocol]", annotation_type), manifest, visited
+            )
 
 
 def _serialize_value_for_hash(value: Any) -> str:
@@ -1113,6 +1414,13 @@ def _compute_function_hash(func: Callable[..., Any]) -> str:
                 return xxhash.xxh64(marshal.dumps(func.__code__)).hexdigest()  # pyright: ignore[reportUnknownMemberType,reportUnknownArgumentType] - hasattr guards access
             # KNOWN ISSUE: Using id(func) is non-deterministic across runs
             # This affects lambdas without source code, causing unnecessary re-runs
+            if is_user_code(func):
+                message = (
+                    "Cannot get source for '%s'. Using non-deterministic fallback — "
+                    + "this stage will re-run every time. Use a named function defined "
+                    + "in a source file for stable fingerprinting."
+                )
+                _logger.warning(message, getattr(func, "__qualname__", func))
             return xxhash.xxh64(str(id(func)).encode()).hexdigest()
         metrics.end("fingerprint.inspect_getsource", _t_source)
 
@@ -1195,6 +1503,11 @@ def _is_user_code_impl(obj: Any) -> bool:
     # Built-in modules (sys, builtins, _io, etc.) are not user code
     module_name = getattr(module, "__name__", "")
     if module_name in sys.builtin_module_names:
+        return False
+
+    # Pivot's own code is framework, not user code (matters for editable installs
+    # where pivot isn't in site-packages)
+    if module_name == "pivot" or module_name.startswith("pivot."):
         return False
 
     # Check for namespace packages (PEP 420): they have __path__ but no __file__

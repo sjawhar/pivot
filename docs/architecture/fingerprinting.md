@@ -225,7 +225,7 @@ The fingerprint manifest uses prefixed keys to distinguish different types of tr
 | `mod:` | Module attribute access patterns | `mod:utils.helper` |
 | `partial:` | `functools.partial` bound arguments | `partial:0`, `partial:kwarg_name` |
 | `loader:` | Loader class methods and config | `loader:load`, `loader:save`, `loader:config` |
-| `pydantic:` | Pydantic model field defaults | `pydantic:field_name` |
+| `schema:` | Pydantic model JSON schema | `schema:ModelName` |
 | `builtin:` | Built-in types (for deterministic hashing) | `builtin:list` |
 
 ## Comparison with Other Tools
