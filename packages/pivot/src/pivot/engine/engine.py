@@ -23,8 +23,8 @@ from pivot import config, exceptions, fingerprint, parameters, project, registry
 from pivot.engine import agent_rpc
 from pivot.engine import graph as engine_graph
 from pivot.engine import scheduler as engine_scheduler
-from pivot.engine import worker_pool as worker_pool_mod
 from pivot.engine import watch as watch_mod
+from pivot.engine import worker_pool as worker_pool_mod
 from pivot.engine.types import (
     CodeOrConfigChanged,
     DataArtifactChanged,

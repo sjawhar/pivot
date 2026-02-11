@@ -17,13 +17,15 @@ Responsibilities retained by Engine:
 
 from __future__ import annotations
 
-import pathlib
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING
 
 from pivot.engine import graph as engine_graph
 from pivot.engine.types import StageExecutionState
 
 if TYPE_CHECKING:
+    import pathlib
+    from collections.abc import Callable
+
     import networkx as nx
 
 __all__ = ["WatchCoordinator"]

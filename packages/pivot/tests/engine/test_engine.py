@@ -1000,7 +1000,7 @@ async def test_deferred_events_during_processing_are_not_lost(
         monkeypatch.setattr(
             engine,
             "_handle_input_event",
-            lambda event: _helper_tracking_handle_with_redeferral(engine, event),
+            lambda event: _helper_tracking_handle_with_redeferral(engine, event),  # pyright: ignore[reportUnknownLambdaType,reportUnknownArgumentType] - monkeypatch lambda
         )
 
         # Seed one deferred event
@@ -1049,7 +1049,7 @@ async def test_deferred_events_max_iterations_guard_emits_diagnostic(
         monkeypatch.setattr(
             engine,
             "_handle_input_event",
-            lambda event: _helper_infinite_defer_handle(engine, event),
+            lambda event: _helper_infinite_defer_handle(engine, event),  # pyright: ignore[reportUnknownLambdaType,reportUnknownArgumentType] - monkeypatch lambda
         )
 
         # Seed one event
