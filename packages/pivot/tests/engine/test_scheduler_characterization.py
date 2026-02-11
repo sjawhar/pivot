@@ -1,5 +1,3 @@
-# pyright: reportMissingImports=false, reportMissingModuleSource=false, reportUnknownVariableType=false, reportUnknownMemberType=false, reportUnknownParameterType=false, reportUnknownArgumentType=false
-
 from __future__ import annotations
 
 import networkx as nx

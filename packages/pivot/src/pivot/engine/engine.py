@@ -24,6 +24,7 @@ from pivot.engine import agent_rpc
 from pivot.engine import graph as engine_graph
 from pivot.engine import scheduler as engine_scheduler
 from pivot.engine import worker_pool as worker_pool_mod
+from pivot.engine import watch as watch_mod
 from pivot.engine.types import (
     CodeOrConfigChanged,
     DataArtifactChanged,
@@ -178,6 +179,7 @@ class Engine:
 
         # Orchestration state
         self._graph = None
+        self._watch_coordinator: watch_mod.WatchCoordinator | None = None
         self._scheduler = engine_scheduler.Scheduler()
         self._cancel_event = anyio.Event()
         self._stage_indices = dict[str, tuple[int, int]]()
@@ -1629,7 +1631,8 @@ class Engine:
 
         for path in paths:
             if self._should_filter_path(path):
-                producer = engine_graph.get_producer(self._graph, path) if self._graph else None
+                coordinator = self._get_watch_coordinator()
+                producer = coordinator.get_producer(path) if coordinator else None
                 if producer:
                     deferred_paths.append((producer, path))
                     continue
@@ -1725,7 +1728,10 @@ class Engine:
             # Run in thread to avoid blocking the event loop during process kill/spawn.
             # Catch errors so a failed restart doesn't kill the watch session;
             # create_executor() in _orchestrate_execution will retry pool creation.
-            if self._stored_parallel:
+            coordinator = self._get_watch_coordinator()
+            if coordinator is not None and coordinator.should_restart_workers(
+                parallel=self._stored_parallel
+            ):
                 n_stages = len(stages)
                 stored_max = self._stored_max_workers
                 try:
@@ -1763,22 +1769,26 @@ class Engine:
         )
         await self._handle_run_requested(event)
 
-    def _should_filter_path(self, path: pathlib.Path) -> bool:
-        """Check if path should be filtered (output of executing stage).
+    def _get_watch_coordinator(self) -> watch_mod.WatchCoordinator | None:
+        """Lazily create/update WatchCoordinator from current graph.
 
-        Uses IntEnum ordering for comparison: filter if state >= PREPARING and < COMPLETED.
+        This ensures existing tests that set engine._graph directly still work
+        without needing to also set up the coordinator.
         """
         if self._graph is None:
-            return False
+            return None
+        if not hasattr(self, "_watch_coordinator") or self._watch_coordinator is None:
+            self._watch_coordinator = watch_mod.WatchCoordinator(self._graph)
+        elif self._watch_coordinator.graph is not self._graph:
+            self._watch_coordinator.graph = self._graph
+        return self._watch_coordinator
 
-        # Get the stage that produces this artifact
-        producer = engine_graph.get_producer(self._graph, path)
-        if producer is None:
+    def _should_filter_path(self, path: pathlib.Path) -> bool:
+        """Check if path should be filtered (output of executing stage)."""
+        coordinator = self._get_watch_coordinator()
+        if coordinator is None:
             return False
-
-        # Filter if producer is currently executing (PREPARING or RUNNING)
-        state = self._get_stage_state(producer)
-        return StageExecutionState.PREPARING <= state < StageExecutionState.COMPLETED
+        return coordinator.should_filter_path(path, get_stage_state=self._get_stage_state)
 
     def _defer_event_for_stage(self, stage: str, event: InputEvent) -> None:
         """Defer an event until the stage completes."""
@@ -1825,35 +1835,27 @@ class Engine:
 
     def _get_affected_stages_for_path(self, path: pathlib.Path) -> list[str]:
         """Get stages affected by a path change using bipartite graph."""
-        if self._graph is None:
+        coordinator = self._get_watch_coordinator()
+        if coordinator is None:
             return []
-
-        # Use get_consumers() from engine/graph.py
-        consumers = engine_graph.get_consumers(self._graph, path)
-        if not consumers:
-            return []
-
-        # Add downstream stages
-        all_affected = set(consumers)
-        for stage in consumers:
-            downstream = engine_graph.get_downstream_stages(self._graph, stage)
-            all_affected.update(downstream)
-
-        return list(all_affected)
+        return coordinator.get_affected_stages([path])
 
     def _get_affected_stages_for_paths(self, paths: list[pathlib.Path]) -> list[str]:
         """Get all stages affected by multiple path changes (including downstream)."""
-        affected = set[str]()
+        coordinator = self._get_watch_coordinator()
+        if coordinator is None:
+            return []
 
+        filtered = list[pathlib.Path]()
         for path in paths:
             if self._should_filter_path(path):
                 _logger.debug("Filtering event for %s (output of executing stage)", path)
                 continue
+            filtered.append(path)
 
-            stage_affected = self._get_affected_stages_for_path(path)
-            affected.update(stage_affected)
-
-        return list(affected)
+        if not filtered:
+            return []
+        return coordinator.get_affected_stages(filtered)
 
     # =========================================================================
     # Registry Reload
@@ -1864,6 +1866,8 @@ class Engine:
         linecache.clearcache()
         importlib.invalidate_caches()
         self._graph = None
+        if hasattr(self, "_watch_coordinator"):
+            self._watch_coordinator = None
         if self._pipeline is not None:
             self._pipeline.invalidate_dag_cache()
 
