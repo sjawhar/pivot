@@ -239,13 +239,36 @@ class NPY(Loader[np.ndarray, np.ndarray]):
 - Loaders must be module-level classes (not closures)
 - Implement `empty()` only if the loader will be used with `IncrementalOut`
 
+## StageParams Defaults
+
+Pydantic deep-copies all defaults (lists, dicts, nested models, TypedDicts). **Never use `default_factory`** for mutable defaults — use plain values:
+
+```python
+# WRONG — unnecessary complexity
+class MyParams(StageParams):
+    exclude: list[str] = pydantic.Field(default_factory=list)
+    styling: dict[str, Any] = pydantic.Field(default_factory=dict)
+    percents: list[int] = pydantic.Field(default_factory=lambda: [50, 80])
+    plots: PlotParams = pydantic.Field(default_factory=PlotParams)
+
+# CORRECT — Pydantic handles all of these safely
+class MyParams(StageParams):
+    exclude: list[str] = []
+    styling: dict[str, Any] = {}
+    percents: list[int] = [50, 80]
+    plots: PlotParams = PlotParams()
+```
+
+Only use `pydantic.Field()` when you need its features (`alias`, `description`, `ge`, etc.), not just for defaults.
+
 ## Critical Rules
 
 1. **All paths relative to project root** — not relative to stage file
 2. **No manual file I/O** — no `pd.read_csv()`, `to_csv()`, `open()` in stage body
 3. **File paths in annotations, not params** — `StageParams` for config only
-4. **Stages must be module-level functions** — lambdas/closures fail pickling
-5. **TypedDict outputs must be module-level** — not defined inside functions
+4. **No `default_factory` for mutable defaults** — Pydantic deep-copies; use `= []`, `= {}`, `= Model()` directly
+5. **Stages must be module-level functions** — lambdas/closures fail pickling
+6. **TypedDict outputs must be module-level** — not defined inside functions
 
 ## Running Stages
 
@@ -318,6 +341,7 @@ def test_my_stage():
 
 - [ ] No manual file I/O in stage function
 - [ ] No file paths in `StageParams`
+- [ ] No `default_factory` in `StageParams` (use plain defaults: `= []`, `= {}`, `= Model()`)
 - [ ] All Dep/Out paths relative to project root
 - [ ] Stage is module-level function (not closure)
 - [ ] TypedDict outputs defined at module level

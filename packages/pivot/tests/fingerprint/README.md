@@ -238,6 +238,23 @@ Tests in `test_callback_vulnerabilities.py` document edge cases where callback c
 
 ---
 
+## 13. `@no_fingerprint` Decorator (File-Level Hashing)
+
+When a stage uses `@pivot.no_fingerprint()`, AST fingerprinting is bypassed entirely. Change detection uses whole-file hashing instead.
+
+| Change Type                                    | Detected? | Test Reference                                                                  |
+| ---------------------------------------------- | --------- | ------------------------------------------------------------------------------- |
+| Stage source file content change               | ✅        | `test_no_fingerprint.py::test_no_fingerprint_reruns_on_source_file_change`      |
+| `code_deps` file content change                | ✅        | `test_no_fingerprint.py::test_no_fingerprint_reruns_on_code_deps_change`        |
+| Unrelated file change (no re-run)              | ✅        | `test_no_fingerprint.py::test_no_fingerprint_skip_unrelated_change`             |
+| Comment/whitespace change in source file       | ✅        | Not separately tested — file hash changes on any content change                 |
+| Helper function in different file              | ❌        | Not detected unless listed in `code_deps`                                       |
+| Missing `code_deps` file raises error          | ✅        | `test_no_fingerprint.py::test_no_fingerprint_missing_code_deps_file`            |
+| Mixed pipeline (AST + no_fingerprint)          | ✅        | `test_no_fingerprint.py::test_no_fingerprint_mixed_pipeline`                    |
+| Skip on unchanged (second run)                 | ✅        | `test_no_fingerprint.py::test_no_fingerprint_stage_skips_when_unchanged`        |
+
+---
+
 ## Summary: Remaining Gaps
 
 | Gap                                              | Priority | Difficulty                    |

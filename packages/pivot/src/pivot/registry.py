@@ -25,6 +25,7 @@ from pivot import (
     stage_def,
     trie,
 )
+from pivot.storage import cache
 
 if TYPE_CHECKING:
     from inspect import Signature
@@ -957,7 +958,11 @@ def _resolve_params(
 def _compute_fingerprint(stage_name: str, info: RegistryStageInfo) -> dict[str, str]:
     """Compute and return a stage fingerprint, wrapping errors."""
     try:
-        result = fingerprint.get_stage_fingerprint_cached(stage_name, info["func"])
+        unwrapped = inspect.unwrap(info["func"])
+        if getattr(unwrapped, "__pivot_no_fingerprint__", False):
+            result = _compute_file_fingerprint(info["func"])
+        else:
+            result = fingerprint.get_stage_fingerprint_cached(stage_name, info["func"])
         for spec in info["dep_specs"].values():
             result.update(fingerprint.get_loader_fingerprint(spec.loader))
         for out in info["out_specs"].values():
@@ -965,6 +970,36 @@ def _compute_fingerprint(stage_name: str, info: RegistryStageInfo) -> dict[str, 
         return result
     except Exception as exc:
         raise exceptions.PivotError(f"Stage '{stage_name}': fingerprinting failed: {exc}") from exc
+
+
+def _compute_file_fingerprint(func: Callable[..., Any]) -> dict[str, str]:
+    """Compute file-hash fingerprint (no AST analysis).
+
+    Returns dict with keys like ``file:path/to/module.py`` -> hash.
+    Includes the stage function's source file and any ``code_deps``.
+    Uses ``inspect.unwrap`` to handle stacked decorators.
+    """
+    result = dict[str, str]()
+
+    # Unwrap decorators so inspect.getfile returns the actual stage source
+    unwrapped = inspect.unwrap(func)
+    source_file = pathlib.Path(inspect.getfile(unwrapped))
+    file_hash, _ = cache.hash_file(source_file)
+    rel_path = project.to_relative_path(source_file)
+    result[f"file:{rel_path}"] = file_hash
+
+    code_deps: list[str] = getattr(func, "__pivot_code_deps__", [])
+    root = project.get_project_root()
+    for dep_path in code_deps:
+        abs_path = (root / dep_path).resolve()
+        if not abs_path.exists():
+            raise FileNotFoundError(f"code_deps file not found: {dep_path}")
+        dep_hash, _ = cache.hash_file(abs_path)
+        # Normalize key to project-relative path for stable lockfiles
+        dep_rel = project.to_relative_path(abs_path)
+        result[f"file:{dep_rel}"] = dep_hash
+
+    return result
 
 
 def _flatten_deps(deps: dict[str, outputs.PathType]) -> list[str]:

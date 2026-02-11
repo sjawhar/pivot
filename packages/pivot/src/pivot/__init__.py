@@ -10,23 +10,31 @@ __version__ = "0.1.0-dev"
 if TYPE_CHECKING:
     from pivot import loaders as loaders
     from pivot import stage_def as stage_def
+    from pivot.decorators import no_fingerprint as no_fingerprint
     from pivot.outputs import Dep as Dep
+    from pivot.outputs import DirectoryOut as DirectoryOut
     from pivot.outputs import IncrementalOut as IncrementalOut
     from pivot.outputs import Metric as Metric
     from pivot.outputs import Out as Out
     from pivot.outputs import PlaceholderDep as PlaceholderDep
     from pivot.outputs import Plot as Plot
+    from pivot.pipeline.pipeline import Pipeline as Pipeline
+    from pivot.stage_def import StageParams as StageParams
 
 # Lazy import mapping for runtime: (module_path, attr_name or None for module import)
 _LAZY_IMPORTS: dict[str, tuple[str, str | None]] = {
+    "no_fingerprint": ("pivot.decorators", "no_fingerprint"),
     "loaders": ("pivot.loaders", None),
     "stage_def": ("pivot.stage_def", None),
+    "DirectoryOut": ("pivot.outputs", "DirectoryOut"),
     "Dep": ("pivot.outputs", "Dep"),
     "IncrementalOut": ("pivot.outputs", "IncrementalOut"),
     "Metric": ("pivot.outputs", "Metric"),
     "Out": ("pivot.outputs", "Out"),
     "PlaceholderDep": ("pivot.outputs", "PlaceholderDep"),
     "Plot": ("pivot.outputs", "Plot"),
+    "Pipeline": ("pivot.pipeline.pipeline", "Pipeline"),
+    "StageParams": ("pivot.stage_def", "StageParams"),
 }
 
 
