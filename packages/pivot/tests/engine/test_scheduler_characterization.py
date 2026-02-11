@@ -1,88 +1,106 @@
 from __future__ import annotations
 
-# pyright: reportPrivateUsage=false
-import collections
+# pyright: reportMissingImports=false, reportMissingModuleSource=false
+# pyright: reportUnknownArgumentType=false, reportUnknownMemberType=false
+# pyright: reportUnknownParameterType=false, reportUnknownVariableType=false
 
+import networkx as nx
+
+from pivot.engine import graph as engine_graph
 from pivot.engine.scheduler import Scheduler
-from pivot.engine.types import StageExecutionState
+from pivot.engine.types import NodeType, StageExecutionState
 from pivot.executor import core as executor_core
 
 
-def _helper_make_scheduler(
+def _helper_init_scheduler(
     *,
-    stage_states: dict[str, StageExecutionState],
-    upstream_unfinished: dict[str, set[str]],
-    downstream: dict[str, list[str]],
-    stage_mutex: dict[str, list[str]],
-    mutex_counts: dict[str, int] | None = None,
+    execution_order: list[str],
+    edges: list[tuple[str, str]] | None = None,
+    stage_mutex: dict[str, list[str]] | None = None,
 ) -> Scheduler:
+    """Create a Scheduler using only the public API.
+
+    Args:
+        execution_order: Stage names in topological order.
+        edges: (upstream, downstream) stage dependency pairs.
+        stage_mutex: Per-stage mutex list. Defaults to empty list per stage.
+    """
+    if stage_mutex is None:
+        stage_mutex = {name: list[str]() for name in execution_order}
+
+    if edges:
+        g: nx.DiGraph[str] | None = nx.DiGraph()
+        for name in execution_order:
+            g.add_node(engine_graph.stage_node(name), type=NodeType.STAGE)
+        for src, dst in edges:
+            art = f"artifact:{src}__{dst}"
+            g.add_node(art, type=NodeType.ARTIFACT)
+            g.add_edge(engine_graph.stage_node(src), art)
+            g.add_edge(art, engine_graph.stage_node(dst))
+    else:
+        g = None
+
     scheduler = Scheduler()
-    scheduler._stage_states = stage_states
-    scheduler._upstream_unfinished = upstream_unfinished
-    scheduler._downstream = downstream
-    scheduler._stage_mutex = stage_mutex
-    scheduler._mutex_counts = collections.defaultdict(int)
-    if mutex_counts:
-        for name, count in mutex_counts.items():
-            scheduler._mutex_counts[name] = count
+    scheduler.initialize(execution_order, g, stage_mutex=stage_mutex)
     return scheduler
 
 
 def _helper_startable_in_order(scheduler: Scheduler, running_count: int) -> list[str]:
     startable: list[str] = []
-    for name in list(scheduler._stage_states.keys()):
+    for name in list(scheduler.stage_states.keys()):
         if scheduler.can_start(name, running_count=running_count):
             startable.append(name)
     return startable
 
 
 def test_can_start_requires_ready_and_no_upstream() -> None:
-    scheduler = _helper_make_scheduler(
-        stage_states={"stage": StageExecutionState.PENDING},
-        upstream_unfinished={"stage": set()},
-        downstream={"stage": []},
-        stage_mutex={"stage": []},
+    scheduler = _helper_init_scheduler(
+        execution_order=["upstream", "stage"],
+        edges=[("upstream", "stage")],
     )
 
     assert scheduler.can_start("stage", running_count=0) is False, (
         "PENDING stage should not be startable"
     )
 
-    scheduler._stage_states["stage"] = StageExecutionState.READY
+    scheduler.set_state("upstream", StageExecutionState.COMPLETED)
+    scheduler.on_stage_completed("upstream", failed=False)
     assert scheduler.can_start("stage", running_count=0) is True, (
         "READY stage with no upstream should be startable"
     )
 
-    scheduler._upstream_unfinished["stage"] = {"upstream"}
+    scheduler = _helper_init_scheduler(
+        execution_order=["upstream_a", "upstream_b", "stage"],
+        edges=[("upstream_a", "stage"), ("upstream_b", "stage")],
+    )
+    scheduler.set_state("upstream_a", StageExecutionState.COMPLETED)
+    scheduler.on_stage_completed("upstream_a", failed=False)
     assert scheduler.can_start("stage", running_count=0) is False, (
         "READY stage with unfinished upstream should not be startable"
     )
 
 
 def test_can_start_respects_named_mutex() -> None:
-    scheduler = _helper_make_scheduler(
-        stage_states={"stage": StageExecutionState.READY},
-        upstream_unfinished={"stage": set()},
-        downstream={"stage": []},
-        stage_mutex={"stage": ["mutex"]},
-        mutex_counts={"mutex": 1},
+    scheduler = _helper_init_scheduler(
+        execution_order=["holder", "stage"],
+        stage_mutex={"holder": ["mutex"], "stage": ["mutex"]},
     )
+
+    scheduler.acquire_mutexes("holder")
 
     assert scheduler.can_start("stage", running_count=0) is False, (
         "stage should not start when its mutex is held"
     )
 
-    scheduler._mutex_counts["mutex"] = 0
+    scheduler.release_mutexes("holder")
     assert scheduler.can_start("stage", running_count=0) is True, (
         "stage should start when its mutex is released"
     )
 
 
 def test_can_start_respects_exclusive_mutex_and_running() -> None:
-    scheduler = _helper_make_scheduler(
-        stage_states={"exclusive": StageExecutionState.READY, "normal": StageExecutionState.READY},
-        upstream_unfinished={"exclusive": set(), "normal": set()},
-        downstream={"exclusive": [], "normal": []},
+    scheduler = _helper_init_scheduler(
+        execution_order=["exclusive", "normal"],
         stage_mutex={"exclusive": [executor_core.EXCLUSIVE_MUTEX], "normal": []},
     )
 
@@ -94,23 +112,14 @@ def test_can_start_respects_exclusive_mutex_and_running() -> None:
         "exclusive stage should start when nothing else is running"
     )
 
-    scheduler._mutex_counts[executor_core.EXCLUSIVE_MUTEX] = 1
+    scheduler.acquire_mutexes("exclusive")
     assert scheduler.can_start("normal", running_count=0) is False, (
         "normal stage should not start when exclusive mutex is held"
     )
 
 
 def test_ready_selection_respects_stage_state_insertion_order() -> None:
-    scheduler = _helper_make_scheduler(
-        stage_states={
-            "second": StageExecutionState.READY,
-            "first": StageExecutionState.READY,
-            "third": StageExecutionState.READY,
-        },
-        upstream_unfinished={"second": set(), "first": set(), "third": set()},
-        downstream={"second": [], "first": [], "third": []},
-        stage_mutex={"second": [], "first": [], "third": []},
-    )
+    scheduler = _helper_init_scheduler(execution_order=["second", "first", "third"])
 
     assert _helper_startable_in_order(scheduler, running_count=0) == [
         "second",
@@ -120,15 +129,9 @@ def test_ready_selection_respects_stage_state_insertion_order() -> None:
 
 
 def test_chain_updates_downstream_after_completion() -> None:
-    scheduler = _helper_make_scheduler(
-        stage_states={
-            "A": StageExecutionState.READY,
-            "B": StageExecutionState.PENDING,
-            "C": StageExecutionState.PENDING,
-        },
-        upstream_unfinished={"A": set(), "B": {"A"}, "C": {"B"}},
-        downstream={"A": ["B", "C"], "B": ["C"], "C": []},
-        stage_mutex={"A": [], "B": [], "C": []},
+    scheduler = _helper_init_scheduler(
+        execution_order=["A", "B", "C"],
+        edges=[("A", "B"), ("B", "C")],
     )
 
     newly_ready, newly_blocked = scheduler.on_stage_completed("A", failed=False)
@@ -149,15 +152,9 @@ def test_chain_updates_downstream_after_completion() -> None:
 
 
 def test_fan_out_sets_ready_after_upstream_completion() -> None:
-    scheduler = _helper_make_scheduler(
-        stage_states={
-            "A": StageExecutionState.READY,
-            "B": StageExecutionState.PENDING,
-            "C": StageExecutionState.PENDING,
-        },
-        upstream_unfinished={"A": set(), "B": {"A"}, "C": {"A"}},
-        downstream={"A": ["B", "C"], "B": [], "C": []},
-        stage_mutex={"A": [], "B": [], "C": []},
+    scheduler = _helper_init_scheduler(
+        execution_order=["A", "B", "C"],
+        edges=[("A", "B"), ("A", "C")],
     )
 
     newly_ready, newly_blocked = scheduler.on_stage_completed("A", failed=False)
@@ -172,15 +169,9 @@ def test_fan_out_sets_ready_after_upstream_completion() -> None:
 
 
 def test_fan_in_waits_for_all_upstream() -> None:
-    scheduler = _helper_make_scheduler(
-        stage_states={
-            "A": StageExecutionState.READY,
-            "B": StageExecutionState.READY,
-            "C": StageExecutionState.PENDING,
-        },
-        upstream_unfinished={"A": set(), "B": set(), "C": {"A", "B"}},
-        downstream={"A": ["C"], "B": ["C"], "C": []},
-        stage_mutex={"A": [], "B": [], "C": []},
+    scheduler = _helper_init_scheduler(
+        execution_order=["A", "B", "C"],
+        edges=[("A", "C"), ("B", "C")],
     )
 
     newly_ready, newly_blocked = scheduler.on_stage_completed("A", failed=False)
@@ -198,14 +189,13 @@ def test_fan_in_waits_for_all_upstream() -> None:
 
 
 def test_on_stage_completed_cascades_failure() -> None:
-    scheduler = _helper_make_scheduler(
-        stage_states={"A": StageExecutionState.READY, "B": StageExecutionState.READY},
-        upstream_unfinished={"A": set(), "B": {"A"}},
-        downstream={"A": ["B"], "B": []},
+    scheduler = _helper_init_scheduler(
+        execution_order=["A", "B"],
+        edges=[("A", "B")],
         stage_mutex={"A": ["mutex"], "B": ["mutex"]},
-        mutex_counts={"mutex": 1},
     )
 
+    scheduler.acquire_mutexes("A")
     scheduler.release_mutexes("A")
     newly_ready, newly_blocked = scheduler.on_stage_completed("A", failed=True)
 
@@ -218,22 +208,13 @@ def test_on_stage_completed_cascades_failure() -> None:
 
 
 def test_apply_fail_fast_blocks_ready_and_pending() -> None:
-    scheduler = _helper_make_scheduler(
-        stage_states={
-            "failed": StageExecutionState.COMPLETED,
-            "pending": StageExecutionState.PENDING,
-            "ready": StageExecutionState.READY,
-            "blocked": StageExecutionState.BLOCKED,
-        },
-        upstream_unfinished={
-            "failed": set(),
-            "pending": set(),
-            "ready": set(),
-            "blocked": set(),
-        },
-        downstream={"failed": [], "pending": [], "ready": [], "blocked": []},
-        stage_mutex={"failed": [], "pending": [], "ready": [], "blocked": []},
+    scheduler = _helper_init_scheduler(
+        execution_order=["blocker", "pending_dep", "failed", "ready", "pending", "blocked"],
+        edges=[("blocker", "blocked"), ("pending_dep", "pending")],
     )
+    scheduler.set_state("blocker", StageExecutionState.COMPLETED)
+    scheduler.on_stage_completed("blocker", failed=True)
+    scheduler.set_state("failed", StageExecutionState.COMPLETED)
 
     blocked = scheduler.apply_fail_fast()
 
@@ -260,16 +241,11 @@ def test_apply_fail_fast_blocks_ready_and_pending() -> None:
 
 
 def test_apply_cancel_marks_ready_and_pending_completed() -> None:
-    scheduler = _helper_make_scheduler(
-        stage_states={
-            "ready": StageExecutionState.READY,
-            "pending": StageExecutionState.PENDING,
-            "running": StageExecutionState.RUNNING,
-        },
-        upstream_unfinished={"ready": set(), "pending": set(), "running": set()},
-        downstream={"ready": [], "pending": [], "running": []},
-        stage_mutex={"ready": [], "pending": [], "running": []},
+    scheduler = _helper_init_scheduler(
+        execution_order=["pending_dep", "ready", "pending", "running"],
+        edges=[("pending_dep", "pending")],
     )
+    scheduler.set_state("running", StageExecutionState.RUNNING)
 
     cancelled = scheduler.apply_cancel()
 
@@ -309,12 +285,8 @@ def test_state_enum_comparison_for_monotonicity_guard() -> None:
     assert StageExecutionState.RUNNING < StageExecutionState.COMPLETED
 
     # Test the guard logic: if current >= new_state, skip the transition
-    scheduler = _helper_make_scheduler(
-        stage_states={"stage": StageExecutionState.COMPLETED},
-        upstream_unfinished={"stage": set()},
-        downstream={"stage": []},
-        stage_mutex={"stage": []},
-    )
+    scheduler = _helper_init_scheduler(execution_order=["stage"])
+    scheduler.set_state("stage", StageExecutionState.COMPLETED)
 
     # Verify get_state returns the current state
     current = scheduler.get_state("stage")
