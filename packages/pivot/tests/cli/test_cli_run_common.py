@@ -503,6 +503,7 @@ def test_convert_results_converts_ran_status() -> None:
     stage_results: dict[str, StageCompleted] = {
         "train": StageCompleted(
             type="stage_completed",
+            seq=0,
             stage="train",
             status=StageStatus.RAN,
             reason="inputs changed",
@@ -529,6 +530,7 @@ def test_convert_results_handles_multiple_stages() -> None:
     stage_results: dict[str, StageCompleted] = {
         "train": StageCompleted(
             type="stage_completed",
+            seq=0,
             stage="train",
             status=StageStatus.RAN,
             reason="code changed",
@@ -539,6 +541,7 @@ def test_convert_results_handles_multiple_stages() -> None:
         ),
         "evaluate": StageCompleted(
             type="stage_completed",
+            seq=1,
             stage="evaluate",
             status=StageStatus.SKIPPED,
             reason="unchanged",

@@ -100,6 +100,7 @@ async def test_event_sink_broadcasts_to_multiple_subscribers() -> None:
     # Emit an event
     event: StageStarted = {
         "type": "stage_started",
+        "seq": 0,
         "stage": "test",
         "index": 0,
         "total": 1,
@@ -130,6 +131,7 @@ async def test_unsubscribe_stops_event_delivery() -> None:
     # Emit an event
     event: StageStarted = {
         "type": "stage_started",
+        "seq": 0,
         "stage": "test",
         "index": 0,
         "total": 1,

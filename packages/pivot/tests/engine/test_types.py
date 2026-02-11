@@ -126,6 +126,7 @@ def test_engine_state_changed_event() -> None:
     """EngineStateChanged event has required fields."""
     event: types.EngineStateChanged = {
         "type": "engine_state_changed",
+        "seq": 0,
         "state": types.EngineState.ACTIVE,
     }
     assert event["type"] == "engine_state_changed"
@@ -136,6 +137,7 @@ def test_pipeline_reloaded_event() -> None:
     """PipelineReloaded event has required fields."""
     event: types.PipelineReloaded = {
         "type": "pipeline_reloaded",
+        "seq": 0,
         "stages": ["new_stage", "changed_stage"],
         "stages_added": ["new_stage"],
         "stages_removed": ["old_stage"],
@@ -149,6 +151,7 @@ def test_pipeline_reloaded_event() -> None:
     # With error
     event_err: types.PipelineReloaded = {
         "type": "pipeline_reloaded",
+        "seq": 1,
         "stages": [],
         "stages_added": [],
         "stages_removed": [],
@@ -162,6 +165,7 @@ def test_stage_started_event() -> None:
     """StageStarted event has required fields."""
     event: types.StageStarted = {
         "type": "stage_started",
+        "seq": 0,
         "stage": "train",
         "index": 3,
         "total": 5,
@@ -176,6 +180,7 @@ def test_stage_completed_event() -> None:
     """StageCompleted event has required fields."""
     event: types.StageCompleted = {
         "type": "stage_completed",
+        "seq": 0,
         "stage": "train",
         "status": StageStatus.RAN,
         "reason": "inputs changed",
@@ -193,6 +198,7 @@ def test_stage_completed_event() -> None:
     # Skipped stage
     event_skip: types.StageCompleted = {
         "type": "stage_completed",
+        "seq": 1,
         "stage": "evaluate",
         "status": StageStatus.SKIPPED,
         "reason": "unchanged",
@@ -208,6 +214,7 @@ def test_log_line_event() -> None:
     """LogLine event has required fields."""
     event: types.LogLine = {
         "type": "log_line",
+        "seq": 0,
         "stage": "train",
         "line": "Epoch 1/10 loss=0.5",
         "is_stderr": False,
@@ -217,6 +224,7 @@ def test_log_line_event() -> None:
 
     event_err: types.LogLine = {
         "type": "log_line",
+        "seq": 1,
         "stage": "train",
         "line": "Warning: deprecated API",
         "is_stderr": True,
@@ -228,6 +236,7 @@ def test_stage_state_changed_event() -> None:
     """StageStateChanged event has required fields."""
     event: types.StageStateChanged = {
         "type": "stage_state_changed",
+        "seq": 0,
         "stage": "train",
         "state": types.StageExecutionState.RUNNING,
         "previous_state": types.StageExecutionState.PREPARING,
@@ -241,18 +250,20 @@ def test_stage_state_changed_event() -> None:
 def test_output_event_union() -> None:
     """OutputEvent is a union of all output event types."""
     events: list[types.OutputEvent] = [
-        {"type": "engine_state_changed", "state": types.EngineState.IDLE},
+        {"type": "engine_state_changed", "seq": 0, "state": types.EngineState.IDLE},
         {
             "type": "pipeline_reloaded",
+            "seq": 1,
             "stages": [],
             "stages_added": [],
             "stages_removed": [],
             "stages_modified": [],
             "error": None,
         },
-        {"type": "stage_started", "stage": "x", "index": 1, "total": 1},
+        {"type": "stage_started", "seq": 2, "stage": "x", "index": 1, "total": 1},
         {
             "type": "stage_completed",
+            "seq": 3,
             "stage": "x",
             "status": StageStatus.RAN,
             "reason": "",
@@ -263,13 +274,60 @@ def test_output_event_union() -> None:
         },
         {
             "type": "stage_state_changed",
+            "seq": 4,
             "stage": "x",
             "state": types.StageExecutionState.RUNNING,
             "previous_state": types.StageExecutionState.PREPARING,
         },
-        {"type": "log_line", "stage": "x", "line": "", "is_stderr": False},
+        {"type": "log_line", "seq": 5, "stage": "x", "line": "", "is_stderr": False},
+        {
+            "type": "sink_state_changed",
+            "seq": 6,
+            "sink_id": "ConsoleSink",
+            "state": types.SinkState.ENABLED,
+            "reason": "manual",
+            "failure_count": 0,
+            "backoff_s": None,
+        },
     ]
-    assert len(events) == 6
+    assert len(events) == 7
+
+
+def test_output_events_define_seq_field() -> None:
+    assert "seq" in types.EngineStateChanged.__annotations__
+    assert "seq" in types.PipelineReloaded.__annotations__
+    assert "seq" in types.StageStarted.__annotations__
+    assert "seq" in types.StageCompleted.__annotations__
+    assert "seq" in types.StageStateChanged.__annotations__
+    assert "seq" in types.LogLine.__annotations__
+
+
+def test_output_events_define_run_id_field() -> None:
+    assert "run_id" in types.EngineStateChanged.__annotations__
+    assert "run_id" in types.PipelineReloaded.__annotations__
+    assert "run_id" in types.StageStarted.__annotations__
+    assert "run_id" in types.StageCompleted.__annotations__
+    assert "run_id" in types.StageStateChanged.__annotations__
+    assert "run_id" in types.LogLine.__annotations__
+    assert "run_id" in types.SinkStateChanged.__annotations__
+
+
+def test_sink_state_enum() -> None:
+    assert types.SinkState.ENABLED.value == "enabled"
+    assert types.SinkState.DISABLED.value == "disabled"
+
+
+def test_sink_state_changed_event() -> None:
+    event: types.SinkStateChanged = {
+        "type": "sink_state_changed",
+        "seq": 1,
+        "sink_id": "ConsoleSink",
+        "state": types.SinkState.DISABLED,
+        "reason": "exception",
+        "failure_count": 5,
+        "backoff_s": 1.0,
+    }
+    assert event["state"] == types.SinkState.DISABLED
 
 
 async def test_async_event_source_protocol_defined() -> None:

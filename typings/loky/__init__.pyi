@@ -21,6 +21,9 @@ class ProcessPoolExecutor(Executor):
         initargs: tuple[Any, ...] = (),
         env: Mapping[str, str] | None = None,
     ) -> None: ...
+    def shutdown(  # pyright: ignore[reportImplicitOverride] - loky adds kill_workers
+        self, wait: bool = True, *, kill_workers: bool = False, cancel_futures: bool = False
+    ) -> None: ...
 
 def get_reusable_executor(
     max_workers: int | None = None,

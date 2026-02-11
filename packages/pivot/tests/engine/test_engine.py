@@ -9,6 +9,7 @@ import anyio
 import networkx as nx
 import pytest
 
+from pivot.engine import engine as engine_mod
 from pivot.engine import graph as engine_graph
 from pivot.engine.engine import Engine
 from pivot.engine.sinks import ResultCollectorSink
@@ -22,6 +23,7 @@ from pivot.engine.types import (
     RunRequested,
     StageExecutionState,
 )
+from pivot.engine.worker_pool import WorkerPool
 from pivot.types import OnError
 
 
@@ -477,7 +479,7 @@ async def test_engine_stores_orchestration_params_on_run_requested() -> None:
         )
 
         # Mock _orchestrate_execution before calling _handle_run_requested.
-        # _handle_run_requested stores params then calls _orchestrate_execution.
+        # _handle_run_requested stores params then spawns _run_execution_task.
         # Also need to mock _require_pipeline since it's called first.
         async def mock_orchestrate(*_args: object, **_kwargs: object) -> dict[str, object]:
             return {}
@@ -485,7 +487,10 @@ async def test_engine_stores_orchestration_params_on_run_requested() -> None:
         engine._orchestrate_execution = mock_orchestrate  # pyright: ignore[reportAttributeAccessIssue] - test mock
         engine._require_pipeline = lambda: None  # pyright: ignore[reportAttributeAccessIssue] - test mock
 
-        await engine._handle_run_requested(event)
+        # Provide a task group so _handle_run_requested can spawn the execution task
+        async with anyio.create_task_group() as tg:
+            engine._run_task_group = tg
+            await engine._handle_run_requested(event)
 
         # Params should be stored
         assert engine._stored_no_commit is True
@@ -513,9 +518,12 @@ async def test_engine_execute_affected_stages_uses_stored_params() -> None:
             return {}
 
         engine._orchestrate_execution = mock_orchestrate  # pyright: ignore[reportAttributeAccessIssue] - test mock
+        engine._require_pipeline = lambda: None  # pyright: ignore[reportAttributeAccessIssue] - test mock
 
-        # Call _execute_affected_stages
-        await engine._execute_affected_stages(["stage_a"])
+        # Provide task group for non-blocking run handling
+        async with anyio.create_task_group() as tg:
+            engine._run_task_group = tg
+            await engine._execute_affected_stages(["stage_a"])
 
         # Verify stored params were used
         assert captured_kwargs["no_commit"] is True, "no_commit should use stored value"
@@ -541,8 +549,12 @@ async def test_engine_execute_affected_stages_propagates_non_parallel_mode() -> 
             return {}
 
         engine._orchestrate_execution = mock_orchestrate  # pyright: ignore[reportAttributeAccessIssue] - test mock
+        engine._require_pipeline = lambda: None  # pyright: ignore[reportAttributeAccessIssue] - test mock
 
-        await engine._execute_affected_stages(["stage_a"])
+        # Provide task group for non-blocking run handling
+        async with anyio.create_task_group() as tg:
+            engine._run_task_group = tg
+            await engine._execute_affected_stages(["stage_a"])
 
         assert captured_kwargs["parallel"] is False, "parallel=False should be propagated"
         assert captured_kwargs["max_workers"] is None, "max_workers=None should be propagated"
@@ -591,11 +603,12 @@ async def test_engine_cancel_during_active_execution() -> None:
             checkout_missing=False,
         )
 
-        # Start run in background
+        # Provide a task group for spawning execution tasks
         async with anyio.create_task_group() as tg:
-            tg.start_soon(engine._handle_run_requested, run_event)
+            engine._run_task_group = tg
+            await engine._handle_run_requested(run_event)
 
-            # Give run time to start
+            # Give run time to start (execution task runs in background)
             await anyio.sleep(0.02)
 
             # Send cancel while running
@@ -611,9 +624,52 @@ async def test_engine_cancel_during_active_execution() -> None:
 
 
 @pytest.mark.anyio
-async def test_engine_concurrent_run_requests_serialized() -> None:
-    """Multiple concurrent RunRequested events are serialized (not run in parallel)."""
+async def test_engine_cancel_requested_noop_when_idle() -> None:
+    async with Engine() as engine:
+        engine._run_state = engine_mod._RunState.IDLE
+        engine._cancel_event = anyio.Event()
 
+        await engine._handle_cancel_requested()
+
+        assert engine._run_state == engine_mod._RunState.IDLE
+        assert not engine._cancel_event.is_set(), "Cancel should not be set while idle"
+
+
+@pytest.mark.anyio
+async def test_engine_cancel_requested_transitions_to_cancelling() -> None:
+    async with Engine() as engine:
+        engine._run_state = engine_mod._RunState.RUNNING
+        engine._cancel_event = anyio.Event()
+        pool = WorkerPool()
+        engine._worker_pool = pool
+
+        await engine._handle_cancel_requested()
+
+        assert engine._run_state == engine_mod._RunState.CANCELLING
+        assert engine._cancel_event.is_set(), "Cancel should be set for running engine"
+        assert pool._accepting is False
+
+
+@pytest.mark.anyio
+async def test_engine_cancel_requested_noop_when_cancelling() -> None:
+    async with Engine() as engine:
+        engine._run_state = engine_mod._RunState.CANCELLING
+        engine._cancel_event = anyio.Event()
+
+        await engine._handle_cancel_requested()
+
+        assert engine._run_state == engine_mod._RunState.CANCELLING
+        assert not engine._cancel_event.is_set(), "Cancel should not be re-set"
+
+
+@pytest.mark.anyio
+async def test_engine_concurrent_run_requests_coalesced() -> None:
+    """A second RunRequested while running cancels current and restarts with latest event.
+
+    With non-blocking run handling, a second request while running sets
+    _restart_pending and cancels the current run. When the current run
+    completes, _run_execution_task replays the pending restart.
+    """
     execution_order = list[str]()
 
     async with Engine() as engine:
@@ -624,14 +680,18 @@ async def test_engine_concurrent_run_requests_serialized() -> None:
             run_count += 1
             run_id = f"run_{run_count}"
             execution_order.append(f"{run_id}_start")
-            await anyio.sleep(0.05)  # Simulate work
+            # Simulate work, check cancel
+            for _ in range(10):
+                await anyio.sleep(0.01)
+                if engine._cancel_event.is_set():
+                    execution_order.append(f"{run_id}_cancelled")
+                    return {}
             execution_order.append(f"{run_id}_end")
             return {}
 
         engine._orchestrate_execution = mock_orchestrate  # pyright: ignore[reportAttributeAccessIssue] - test mock
         engine._require_pipeline = lambda: None  # pyright: ignore[reportAttributeAccessIssue] - test mock
 
-        # Create two run events
         event1 = RunRequested(
             type="run_requested",
             stages=["stage_a"],
@@ -661,17 +721,26 @@ async def test_engine_concurrent_run_requests_serialized() -> None:
             checkout_missing=False,
         )
 
-        # Handle both events sequentially (as the engine's input loop does)
-        await engine._handle_run_requested(event1)
-        await engine._handle_run_requested(event2)
+        # Handle both events as the input loop would
+        async with anyio.create_task_group() as tg:
+            engine._run_task_group = tg
 
-        # Verify runs completed in sequence, not interleaved
-        assert execution_order == [
-            "run_1_start",
-            "run_1_end",
-            "run_2_start",
-            "run_2_end",
-        ], f"Runs should be serialized, got: {execution_order}"
+            # First run starts immediately
+            await engine._handle_run_requested(event1)
+            # Give it time to start
+            await anyio.sleep(0.02)
+
+            # Second request while first is running → cancels first, queues restart
+            await engine._handle_run_requested(event2)
+
+        # First run was cancelled, second run completed
+        assert "run_1_start" in execution_order, f"First run should have started: {execution_order}"
+        assert "run_2_start" in execution_order, (
+            f"Second run should have started: {execution_order}"
+        )
+        assert "run_2_end" in execution_order, (
+            f"Second run should have completed: {execution_order}"
+        )
 
 
 # =============================================================================

@@ -48,7 +48,7 @@ async def test_jsonl_sink_converts_stage_started_to_stage_start(
     """JsonlSink converts engine 'stage_started' to JSONL 'stage_start' type."""
     sink = JsonlSink(callback)
 
-    event = StageStarted(type="stage_started", stage="my_stage", index=0, total=3)
+    event = StageStarted(type="stage_started", seq=0, stage="my_stage", index=0, total=3)
     await sink.handle(event)
 
     assert len(collected_events) == 1
@@ -69,6 +69,7 @@ async def test_jsonl_sink_converts_stage_completed_to_stage_complete(
 
     event = StageCompleted(
         type="stage_completed",
+        seq=0,
         stage="my_stage",
         status=StageStatus.RAN,
         reason="executed",
@@ -95,6 +96,7 @@ async def test_jsonl_sink_passes_pipeline_reloaded_event(
 
     event = PipelineReloaded(
         type="pipeline_reloaded",
+        seq=0,
         stages=["stage_a", "stage_b", "stage_c"],
         stages_added=["stage_c"],
         stages_removed=[],
@@ -122,6 +124,7 @@ async def test_jsonl_sink_passes_pipeline_reloaded_with_error(
 
     event = PipelineReloaded(
         type="pipeline_reloaded",
+        seq=0,
         stages=[],
         stages_added=[],
         stages_removed=[],
@@ -143,7 +146,7 @@ async def test_jsonl_sink_converts_engine_state_changed_enum_to_string(
     """JsonlSink converts state enum to string for engine_state_changed."""
     sink = JsonlSink(callback)
 
-    event = EngineStateChanged(type="engine_state_changed", state=EngineState.ACTIVE)
+    event = EngineStateChanged(type="engine_state_changed", seq=0, state=EngineState.ACTIVE)
     await sink.handle(event)
 
     assert len(collected_events) == 1
@@ -159,7 +162,7 @@ async def test_jsonl_sink_handles_engine_state_idle(
     """JsonlSink handles engine_state_changed with IDLE state."""
     sink = JsonlSink(callback)
 
-    event = EngineStateChanged(type="engine_state_changed", state=EngineState.IDLE)
+    event = EngineStateChanged(type="engine_state_changed", seq=0, state=EngineState.IDLE)
     await sink.handle(event)
 
     assert len(collected_events) == 1
@@ -174,7 +177,7 @@ async def test_jsonl_sink_ignores_log_line_events(
     """JsonlSink ignores log_line events."""
     sink = JsonlSink(callback)
 
-    event = LogLine(type="log_line", stage="my_stage", line="some output", is_stderr=False)
+    event = LogLine(type="log_line", seq=0, stage="my_stage", line="some output", is_stderr=False)
     await sink.handle(event)
 
     assert len(collected_events) == 0
@@ -217,6 +220,7 @@ async def test_jsonl_sink_handles_all_stage_statuses(
 
     event = StageCompleted(
         type="stage_completed",
+        seq=0,
         stage="test_stage",
         status=status,
         reason=reason,

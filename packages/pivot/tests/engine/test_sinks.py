@@ -7,7 +7,7 @@ import pytest
 
 from pivot.engine import engine as engine_mod
 from pivot.engine import types
-from pivot.engine.types import OutputEvent, StageCompleted, StageStarted
+from pivot.engine.types import OutputEvent, SinkState, StageCompleted, StageStarted
 from pivot.types import StageStatus
 
 # =============================================================================
@@ -30,6 +30,7 @@ async def test_console_sink_handles_stage_started() -> None:
 
     event = StageStarted(
         type="stage_started",
+        seq=0,
         stage="train",
         index=0,
         total=2,
@@ -55,6 +56,7 @@ async def test_console_sink_handles_stage_completed_ran() -> None:
 
     event = StageCompleted(
         type="stage_completed",
+        seq=0,
         stage="train",
         status=StageStatus.RAN,
         reason="",
@@ -84,6 +86,7 @@ async def test_console_sink_handles_stage_completed_skipped() -> None:
 
     event = StageCompleted(
         type="stage_completed",
+        seq=0,
         stage="train",
         status=StageStatus.SKIPPED,
         reason="up-to-date",
@@ -113,6 +116,7 @@ async def test_console_sink_handles_stage_completed_failed() -> None:
 
     event = StageCompleted(
         type="stage_completed",
+        seq=0,
         stage="train",
         status=StageStatus.FAILED,
         reason="exception",
@@ -144,6 +148,7 @@ async def test_console_sink_handles_multiline_reason() -> None:
 
     event = StageCompleted(
         type="stage_completed",
+        seq=0,
         stage="train",
         status=StageStatus.FAILED,
         reason="Traceback (most recent call last):\n  File test.py\nValueError: bad",
@@ -174,6 +179,7 @@ async def test_console_sink_ignores_other_events() -> None:
 
     event: types.EngineStateChanged = {
         "type": "engine_state_changed",
+        "seq": 0,
         "state": types.EngineState.ACTIVE,
     }
     await sink.handle(event)
@@ -196,6 +202,7 @@ async def test_result_collector_sink_collects_completed() -> None:
 
     event = StageCompleted(
         type="stage_completed",
+        seq=0,
         stage="train",
         status=StageStatus.RAN,
         reason="",
@@ -222,6 +229,7 @@ async def test_result_collector_sink_ignores_other_events() -> None:
 
     event = StageStarted(
         type="stage_started",
+        seq=0,
         stage="train",
         index=0,
         total=1,
@@ -243,6 +251,7 @@ async def test_result_collector_sink_concurrent_access() -> None:
     async def worker(stage_name: str) -> None:
         event = StageCompleted(
             type="stage_completed",
+            seq=0,
             stage=stage_name,
             status=StageStatus.RAN,
             reason="test",
@@ -280,6 +289,7 @@ async def test_result_collector_sink_prevents_lost_updates() -> None:
         for i in range(100):
             event = StageCompleted(
                 type="stage_completed",
+                seq=i,
                 stage=stage_name,
                 status=StageStatus.RAN,
                 reason=f"iteration_{i}",
@@ -324,6 +334,7 @@ async def test_console_sink_formats_duration_correctly() -> None:
 
     event = StageCompleted(
         type="stage_completed",
+        seq=0,
         stage="train",
         status=StageStatus.RAN,
         reason="",
@@ -356,6 +367,7 @@ async def test_console_sink_running_message_format() -> None:
 
     event = StageStarted(
         type="stage_started",
+        seq=0,
         stage="train",
         index=0,
         total=2,
@@ -382,6 +394,7 @@ async def test_console_sink_handles_log_line_when_show_output_enabled() -> None:
 
     event = LogLine(
         type="log_line",
+        seq=0,
         stage="train",
         line="Processing batch 1...",
         is_stderr=False,
@@ -409,6 +422,7 @@ async def test_console_sink_stderr_line_contains_content() -> None:
 
     event = LogLine(
         type="log_line",
+        seq=0,
         stage="train",
         line="Warning: GPU not available",
         is_stderr=True,
@@ -436,6 +450,7 @@ async def test_console_sink_ignores_log_line_when_show_output_disabled() -> None
 
     event = LogLine(
         type="log_line",
+        seq=0,
         stage="train",
         line="Processing batch 1...",
         is_stderr=False,
@@ -461,6 +476,7 @@ async def test_console_sink_handles_empty_log_line() -> None:
 
     event = LogLine(
         type="log_line",
+        seq=0,
         stage="train",
         line="",
         is_stderr=False,
@@ -488,6 +504,7 @@ async def test_console_sink_handles_multiline_log_output() -> None:
     # Simulate a stage that outputs multiline logs
     event = LogLine(
         type="log_line",
+        seq=0,
         stage="train",
         line="Line 1\nLine 2\nLine 3",
         is_stderr=False,
@@ -517,6 +534,7 @@ async def test_console_sink_handles_special_characters() -> None:
     # Test with brackets that could conflict with Rich markup
     event = LogLine(
         type="log_line",
+        seq=0,
         stage="train",
         line="[INFO] Processing <data> with 'quotes' and \"double quotes\"",
         is_stderr=False,
@@ -550,6 +568,7 @@ async def test_console_sink_escapes_rich_markup_in_log_lines() -> None:
     # Simulate a stage that outputs text containing Rich markup syntax
     event = LogLine(
         type="log_line",
+        seq=0,
         stage="train",
         line="[bold red]FAKE ERROR[/bold red] - this should display literally",
         is_stderr=False,
@@ -567,7 +586,9 @@ async def test_console_sink_escapes_rich_markup_in_log_lines() -> None:
 # Per-Sink Queue Dispatch Tests
 # =============================================================================
 
-_EVENTS = [StageStarted(type="stage_started", stage=f"s{i}", index=i, total=5) for i in range(5)]
+_EVENTS = [
+    StageStarted(type="stage_started", seq=i, stage=f"s{i}", index=i, total=5) for i in range(5)
+]
 
 
 class _SlowSink:
@@ -634,6 +655,7 @@ async def test_per_sink_ordering_preserved() -> None:
     events = [
         StageCompleted(
             type="stage_completed",
+            seq=i,
             stage=f"stage_{i}",
             status=StageStatus.RAN,
             reason="",
@@ -676,13 +698,8 @@ async def test_per_sink_ordering_preserved() -> None:
 
 
 @pytest.mark.anyio
-async def test_backpressure_stalls_dispatch_when_sink_queue_fills() -> None:
-    """When a sink stops consuming and its 1024-item queue fills, dispatch stalls.
-
-    This documents the expected behavior: the engine blocks on send() to the
-    full queue, which also blocks sending to other sinks since dispatch is
-    sequential per-event across all sink queues.
-    """
+async def test_queue_full_disables_stalled_sink() -> None:
+    """When a sink stops consuming and its queue fills, it is disabled."""
 
     class _StallingSink:
         """Sink that stops consuming after a few events."""
@@ -707,6 +724,8 @@ async def test_backpressure_stalls_dispatch_when_sink_queue_fills() -> None:
     stalling = _StallingSink(consume_count=1)
     fast = _FastCollectorSink()
 
+    sent_count = 0
+
     async with engine_mod.Engine() as eng:
         eng.add_sink(fast)
         eng.add_sink(stalling)
@@ -716,25 +735,11 @@ async def test_backpressure_stalls_dispatch_when_sink_queue_fills() -> None:
 
             # Send enough events to fill the stalling sink's 1024-item queue.
             # The stalling sink blocks on event 1, so the queue fills after 1025 more.
-            # We send a smaller batch with a timeout to detect the stall.
-            sent_count = 0
             for i in range(2000):
-                # Use move_on_after to detect when dispatch stalls
-                timed_out = True
-                with anyio.move_on_after(0.5):
-                    await eng.emit(
-                        StageStarted(type="stage_started", stage=f"s{i}", index=i, total=2000)
-                    )
-                    sent_count += 1
-                    timed_out = False
-                if timed_out:
-                    break
-
-            # We should have stalled before sending all 2000 events
-            # (1024 queue + 64 output channel buffer + the one being processed)
-            assert sent_count < 2000, (
-                f"Expected dispatch to stall due to backpressure, but sent all {sent_count} events"
-            )
+                await eng.emit(
+                    StageStarted(type="stage_started", seq=i, stage=f"s{i}", index=i, total=2000)
+                )
+                sent_count += 1
 
             # Unstall the sink so everything can drain
             await stalling.unstall()
@@ -743,8 +748,16 @@ async def test_backpressure_stalls_dispatch_when_sink_queue_fills() -> None:
             assert eng._output_send is not None
             await eng._output_send.aclose()
 
-    # Fast sink received whatever was dispatched before we closed
-    assert len(fast.received) > 0, "Fast sink should have received some events"
+    # Fast sink receives events and sees the stalled sink disabled
+    assert sent_count == 2000, "Expected to send all events without stalling"
+    disabled_events = [
+        event
+        for event in fast.received
+        if event["type"] == "sink_state_changed"
+        and event["state"] == SinkState.DISABLED
+        and event["sink_id"] == "_StallingSink"
+    ]
+    assert disabled_events, "Expected stalled sink to be disabled"
 
 
 async def test_sink_error_does_not_stop_other_events() -> None:

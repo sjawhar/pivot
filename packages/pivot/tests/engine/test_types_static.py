@@ -8,6 +8,7 @@ def test_stage_completed_status_is_completion_type() -> None:
     """StageCompleted.status should only accept CompletionType values."""
     event: StageCompleted = {
         "type": "stage_completed",
+        "seq": 0,
         "stage": "test",
         "status": StageStatus.RAN,  # Valid
         "reason": "success",
@@ -25,6 +26,7 @@ def test_pipeline_reloaded_has_stages_field() -> None:
     """PipelineReloaded should have a stages field with sorted stage list."""
     event: PipelineReloaded = {
         "type": "pipeline_reloaded",
+        "seq": 0,
         "stages": ["stage_a", "stage_b"],  # Topologically sorted
         "stages_added": [],
         "stages_removed": [],

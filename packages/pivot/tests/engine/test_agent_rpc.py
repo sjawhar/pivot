@@ -275,6 +275,7 @@ async def test_agent_event_sink_broadcasts_to_subscribers() -> None:
     # Emit an event
     event = StageStarted(
         type="stage_started",
+        seq=0,
         stage="train",
         index=0,
         total=1,
@@ -306,6 +307,7 @@ async def test_agent_event_sink_unsubscribe() -> None:
     # Event after unsubscribe should not be received
     event = StageStarted(
         type="stage_started",
+        seq=0,
         stage="train",
         index=0,
         total=1,
@@ -633,7 +635,9 @@ async def test_agent_rpc_source_accepts_new_connections_after_handler_exception(
 async def test_event_buffer_captures_events() -> None:
     """EventBuffer should capture events with version numbers."""
     buffer = EventBuffer(max_events=100)
-    buffer.handle_sync({"type": "stage_started", "stage": "train", "index": 1, "total": 2})
+    buffer.handle_sync(
+        {"type": "stage_started", "seq": 0, "stage": "train", "index": 1, "total": 2}
+    )
 
     result = buffer.events_since(0)
     assert result["version"] == 1, "First event should have version 1"
@@ -645,7 +649,9 @@ async def test_event_buffer_eviction() -> None:
     """EventBuffer should evict oldest events when full."""
     buffer = EventBuffer(max_events=3)
     for i in range(5):
-        buffer.handle_sync({"type": "stage_started", "stage": f"s{i}", "index": i, "total": 5})
+        buffer.handle_sync(
+            {"type": "stage_started", "seq": i, "stage": f"s{i}", "index": i, "total": 5}
+        )
 
     result = buffer.events_since(0)
     assert len(result["events"]) == 3, "Should only keep last 3 events (max_events=3)"
@@ -656,7 +662,9 @@ async def test_handler_events_since_query() -> None:
     """Handler should return events from buffer."""
 
     buffer = EventBuffer(max_events=100)
-    buffer.handle_sync({"type": "stage_started", "stage": "train", "index": 1, "total": 1})
+    buffer.handle_sync(
+        {"type": "stage_started", "seq": 0, "stage": "train", "index": 1, "total": 1}
+    )
 
     mock_engine = MagicMock()
     handler = AgentRpcHandler(engine=mock_engine, event_buffer=buffer)
@@ -689,10 +697,10 @@ async def test_event_buffer_version_wraparound() -> None:
     buffer._version = _MAX_VERSION - 1
 
     # Add events that trigger wraparound
-    buffer.handle_sync({"type": "stage_started", "stage": "s1", "index": 0, "total": 2})
+    buffer.handle_sync({"type": "stage_started", "seq": 0, "stage": "s1", "index": 0, "total": 2})
     assert buffer._version == _MAX_VERSION
 
-    buffer.handle_sync({"type": "stage_started", "stage": "s2", "index": 1, "total": 2})
+    buffer.handle_sync({"type": "stage_started", "seq": 1, "stage": "s2", "index": 1, "total": 2})
     # Version should wrap to 1, not overflow
     assert buffer._version == 1, "Version should wrap to 1 after reaching _MAX_VERSION"
 
@@ -722,7 +730,9 @@ async def test_event_buffer_query_current_version() -> None:
     Boundary condition: Version comparison should be > not >=.
     """
     buffer = EventBuffer(max_events=100)
-    buffer.handle_sync({"type": "stage_started", "stage": "train", "index": 0, "total": 1})
+    buffer.handle_sync(
+        {"type": "stage_started", "seq": 0, "stage": "train", "index": 0, "total": 1}
+    )
 
     current_version = buffer._version
     result = buffer.events_since(current_version)
@@ -740,7 +750,9 @@ async def test_event_buffer_query_future_version() -> None:
     _MAX_VERSION to 1, but client still has old version number.
     """
     buffer = EventBuffer(max_events=100)
-    buffer.handle_sync({"type": "stage_started", "stage": "train", "index": 0, "total": 1})
+    buffer.handle_sync(
+        {"type": "stage_started", "seq": 0, "stage": "train", "index": 0, "total": 1}
+    )
 
     # Query with version ahead of current (simulates post-wraparound scenario)
     future_version = buffer._version + 100
@@ -762,7 +774,9 @@ async def test_event_buffer_query_after_eviction() -> None:
 
     # Fill buffer and cause eviction
     for i in range(5):
-        buffer.handle_sync({"type": "stage_started", "stage": f"s{i}", "index": i, "total": 5})
+        buffer.handle_sync(
+            {"type": "stage_started", "seq": i, "stage": f"s{i}", "index": i, "total": 5}
+        )
 
     # Query with version that was evicted (version 1-2 are gone)
     result = buffer.events_since(0)
@@ -788,6 +802,7 @@ async def test_event_buffer_thread_safety() -> None:
             buffer.handle_sync(
                 {
                     "type": "stage_started",
+                    "seq": i,
                     "stage": f"s{offset}_{i}",
                     "index": i,
                     "total": 100,
@@ -1137,6 +1152,7 @@ async def test_event_sink_slow_subscriber_drops_events() -> None:
     for i in range(5):
         event = StageStarted(
             type="stage_started",
+            seq=i,
             stage=f"s{i}",
             index=i,
             total=5,

@@ -118,6 +118,7 @@ def test_pipeline_reloaded_event_includes_stages_field() -> None:
     # Test that PipelineReloaded includes stages field
     reload_event = PipelineReloaded(
         type="pipeline_reloaded",
+        seq=0,
         stages=["stage_a", "stage_b"],
         stages_added=["stage_b"],
         stages_removed=[],

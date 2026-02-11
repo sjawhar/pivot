@@ -269,6 +269,6 @@ async def test_engine_cancel_during_active_drain(minimal_pipeline: Pipeline) -> 
                 finally:
                     shutdown_event.set()
 
-            # Verify cleanup happened - executor should be None after context exit
+            # Verify cleanup happened - worker pool should be None after context exit
             # (The key test is that we didn't hang; message processing is secondary)
-            assert eng._executor is None, "Executor should be cleaned up after shutdown"
+            assert eng._worker_pool is None, "Worker pool should be cleaned up after shutdown"

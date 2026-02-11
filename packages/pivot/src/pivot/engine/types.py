@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from enum import Enum, IntEnum
-from typing import TYPE_CHECKING, Literal, Protocol, TypedDict
+from typing import TYPE_CHECKING, Literal, NotRequired, Protocol, TypedDict
 
 if TYPE_CHECKING:
     import pathlib
@@ -27,6 +27,8 @@ __all__ = [
     "StageCompleted",
     "StageStateChanged",
     "LogLine",
+    "SinkState",
+    "SinkStateChanged",
     "OutputEvent",
     # Protocols
     "EventSource",
@@ -115,6 +117,10 @@ InputEvent = DataArtifactChanged | CodeOrConfigChanged | RunRequested | CancelRe
 
 # =============================================================================
 # Output Events (notifications)
+#
+# seq and run_id are NotRequired to allow construction without them (e.g. in tests,
+# or from code outside Engine). Engine.emit() always stamps both fields at runtime,
+# so they are guaranteed present on any event that flows through the engine.
 # =============================================================================
 
 
@@ -122,6 +128,8 @@ class EngineStateChanged(TypedDict):
     """Engine transitioned to a new state."""
 
     type: Literal["engine_state_changed"]
+    seq: NotRequired[int]
+    run_id: NotRequired[str]
     state: EngineState
 
 
@@ -129,6 +137,8 @@ class PipelineReloaded(TypedDict):
     """Registry was reloaded, DAG structure may have changed."""
 
     type: Literal["pipeline_reloaded"]
+    seq: NotRequired[int]
+    run_id: NotRequired[str]
     stages: list[str]  # All stages in topological order
     stages_added: list[str]
     stages_removed: list[str]
@@ -140,6 +150,8 @@ class StageStarted(TypedDict):
     """A stage began executing."""
 
     type: Literal["stage_started"]
+    seq: NotRequired[int]
+    run_id: NotRequired[str]
     stage: str
     index: int
     total: int
@@ -149,6 +161,8 @@ class StageCompleted(TypedDict):
     """A stage finished (ran, skipped, or failed)."""
 
     type: Literal["stage_completed"]
+    seq: NotRequired[int]
+    run_id: NotRequired[str]
     stage: str
     status: CompletionType
     reason: str
@@ -162,6 +176,8 @@ class LogLine(TypedDict):
     """A line of output from a running stage."""
 
     type: Literal["log_line"]
+    seq: NotRequired[int]
+    run_id: NotRequired[str]
     stage: str
     line: str
     is_stderr: bool
@@ -171,9 +187,31 @@ class StageStateChanged(TypedDict):
     """Emitted when a stage's execution state changes."""
 
     type: Literal["stage_state_changed"]
+    seq: NotRequired[int]
+    run_id: NotRequired[str]
     stage: str
     state: StageExecutionState
     previous_state: StageExecutionState
+
+
+class SinkState(Enum):
+    """Sink supervision state."""
+
+    ENABLED = "enabled"
+    DISABLED = "disabled"
+
+
+class SinkStateChanged(TypedDict):
+    """Emitted when a sink is disabled or re-enabled by supervision."""
+
+    type: Literal["sink_state_changed"]
+    seq: NotRequired[int]
+    run_id: NotRequired[str]
+    sink_id: str
+    state: SinkState
+    reason: str
+    failure_count: int
+    backoff_s: float | None
 
 
 OutputEvent = (
@@ -183,6 +221,7 @@ OutputEvent = (
     | StageCompleted
     | StageStateChanged
     | LogLine
+    | SinkStateChanged
 )
 
 
@@ -210,9 +249,9 @@ class EventSink(Protocol):
 
         Events are dispatched to each sink via a dedicated bounded queue
         (1024 items), preserving per-sink ordering. Slow sinks do not block
-        other sinks until their buffer fills, at which point they backpressure
-        the entire engine. Implementations should avoid blocking IO or long
-        computation.
+        other sinks; if a sink's queue fills or it raises repeated exceptions
+        or times out, it is automatically disabled by the supervision system
+        and re-enabled after an exponential backoff.
         """
         ...
 

@@ -4,14 +4,15 @@ import collections
 import concurrent.futures
 import contextlib
 import importlib
+import itertools
 import linecache
 import logging
-import multiprocessing as mp
 import pathlib
 import queue
 import sys
-import threading
 import time
+from dataclasses import dataclass, field
+from enum import Enum
 from typing import TYPE_CHECKING, Self
 
 import anyio
@@ -22,6 +23,7 @@ from pivot import config, exceptions, fingerprint, parameters, project, registry
 from pivot.engine import agent_rpc
 from pivot.engine import graph as engine_graph
 from pivot.engine import scheduler as engine_scheduler
+from pivot.engine import worker_pool as worker_pool_mod
 from pivot.engine.types import (
     CodeOrConfigChanged,
     DataArtifactChanged,
@@ -34,6 +36,8 @@ from pivot.engine.types import (
     OutputEvent,
     PipelineReloaded,
     RunRequested,
+    SinkState,
+    SinkStateChanged,
     StageCompleted,
     StageExecutionState,
     StageStarted,
@@ -45,7 +49,11 @@ from pivot.storage import state as state_mod
 from pivot.types import OnError, OutputMessage, OutputMessageKind, StageResult, StageStatus
 
 if TYPE_CHECKING:
+    import multiprocessing as mp
+    import threading
+
     import networkx as nx
+    from anyio.abc import TaskGroup
     from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
 
     from pivot.pipeline.pipeline import Pipeline
@@ -56,9 +64,39 @@ __all__ = ["Engine"]
 
 _logger = logging.getLogger(__name__)
 
+# Process-lifetime sequence counter for OutputEvent.seq monotonicity across Engine instances
+_seq_counter = itertools.count(1)
+
 # Channel buffer sizes for backpressure
 _INPUT_BUFFER_SIZE = 32
 _OUTPUT_BUFFER_SIZE = 64
+_SINK_FAILURE_THRESHOLD = 5
+_SINK_QUEUE_SIZE = 1024
+_SINK_HANDLE_TIMEOUT_S = 5.0
+_SINK_BACKOFF_BASE_S = 1.0
+_SINK_BACKOFF_MAX_S = 1800.0
+_SINK_SHUTDOWN_GRACE_S = 0.05
+
+
+class _RunState(Enum):
+    """Internal state machine for run lifecycle."""
+
+    IDLE = "idle"
+    RUNNING = "running"
+    CANCELLING = "cancelling"
+
+
+@dataclass(slots=True)
+class _SinkRuntime:
+    sink: EventSink
+    sink_id: str
+    send: MemoryObjectSendStream[OutputEvent]
+    recv: MemoryObjectReceiveStream[OutputEvent]
+    failures: int = 0
+    enabled: bool = True
+    backoff_s: float = _SINK_BACKOFF_BASE_S
+    disabled_until: float | None = None
+    disabled_event: anyio.Event = field(default_factory=anyio.Event)
 
 
 class Engine:
@@ -80,6 +118,7 @@ class Engine:
     _input_recv: MemoryObjectReceiveStream[InputEvent] | None
     _output_send: MemoryObjectSendStream[OutputEvent] | None
     _output_recv: MemoryObjectReceiveStream[OutputEvent] | None
+    _sink_runtimes: list[_SinkRuntime] | None
 
     # Orchestration state
     _graph: nx.DiGraph[str] | None
@@ -90,8 +129,15 @@ class Engine:
 
     # Execution orchestration state
     _futures: dict[concurrent.futures.Future[StageResult], str]
-    _executor: concurrent.futures.Executor | None
+    _worker_pool: worker_pool_mod.WorkerPool | None
     _warned_mutex_groups: set[str]
+
+    # Run state machine (Task 10/11)
+    _run_state: _RunState
+    _run_task_group: TaskGroup | None
+    _restart_pending: RunRequested | None
+    _reload_pending: set[str] | None
+    _idle_condition: anyio.Condition
 
     # Stored orchestration params (for watch mode re-runs)
     _stored_no_commit: bool
@@ -119,6 +165,7 @@ class Engine:
         self._input_recv = None
         self._output_send = None
         self._output_recv = None
+        self._sink_runtimes = None
 
         # Orchestration state
         self._graph = None
@@ -129,9 +176,19 @@ class Engine:
 
         # Execution orchestration state
         self._futures = dict[concurrent.futures.Future[StageResult], str]()
-        self._executor = None
+        self._worker_pool = None
         self._warned_mutex_groups = set[str]()
         self._effective_max_workers: int = 1
+
+        # Run state machine (Task 10/11)
+        self._run_state = _RunState.IDLE
+        self._run_task_group = None
+        self._restart_pending = None
+        self._reload_pending = None
+        self._idle_condition = anyio.Condition()
+
+        # Current run_id for stamping events (Task 12)
+        self._current_run_id: str | None = None
 
         # Stored orchestration params (for watch mode re-runs)
         self._stored_no_commit = False
@@ -210,7 +267,13 @@ class Engine:
         """
         if self._output_send:
             with contextlib.suppress(anyio.ClosedResourceError):
+                seq = self._next_seq()
+                event["seq"] = seq
+                event["run_id"] = self._current_run_id or ""
                 await self._output_send.send(event)
+
+    def _next_seq(self) -> int:
+        return next(_seq_counter)
 
     async def run(self, *, exit_on_completion: bool = True) -> None:
         """Run the async engine with registered sources and sinks.
@@ -239,6 +302,8 @@ class Engine:
         self._dispatch_complete = anyio.Event()
 
         async with anyio.create_task_group() as tg:
+            self._run_task_group = tg
+
             # Start all sources with channel cleanup
             for source in self._sources:
                 tg.start_soon(self._run_source_with_cleanup, source, self._input_send.clone())
@@ -246,12 +311,35 @@ class Engine:
             # Start sink dispatcher
             tg.start_soon(self._dispatch_outputs)
 
-            # Process input events
-            async for event in self._input_recv:
-                await self._handle_input_event(event)
+            # Process input events.
+            # In exit_on_completion mode, we also need to wait for background
+            # execution tasks to finish. We interleave checking for new events
+            # and checking for idle state using move_on_after to avoid blocking.
+            if exit_on_completion:
+                saw_run = False
+                while True:
+                    result: tuple[str, InputEvent | None] = await self._receive_input_or_idle(
+                        wait_for_idle=saw_run
+                    )  # type: ignore[reportAttributeAccessIssue] - pyright false positive
+                    kind, event = result
+                    if kind == "idle":
+                        break
+                    if kind == "eos":
+                        if not self._is_idle():
+                            await self._wait_for_idle()
+                        break
 
-                if exit_on_completion and self._is_idle():
-                    break
+                    if event is None:
+                        continue
+                    await self._handle_input_event(event)
+                    if not self._is_idle():
+                        saw_run = True
+
+                    if saw_run and self._is_idle():
+                        break
+            else:
+                async for event in self._input_recv:
+                    await self._handle_input_event(event)
 
             # Close output channel to signal end-of-stream to dispatcher.
             # This lets it drain remaining events before we cancel.
@@ -293,51 +381,188 @@ class Engine:
         finally:
             await send.aclose()
 
+    async def _emit_sink_state(self, event: SinkStateChanged) -> None:
+        event["seq"] = self._next_seq()
+        event["run_id"] = self._current_run_id or ""
+        if self._output_send:
+            try:
+                self._output_send.send_nowait(event)
+                return
+            except (anyio.ClosedResourceError, anyio.WouldBlock):
+                pass
+        if not self._sink_runtimes:
+            return
+        for runtime in self._sink_runtimes:
+            if not runtime.enabled:
+                continue
+            try:
+                runtime.send.send_nowait(event)
+            except anyio.WouldBlock:
+                continue
+            except anyio.ClosedResourceError:
+                # Best-effort direct delivery during shutdown; failures are logged
+                # but not recorded (no disable tracking needed when shutting down)
+                try:
+                    with anyio.fail_after(_SINK_HANDLE_TIMEOUT_S):
+                        await runtime.sink.handle(event)
+                except Exception:
+                    _logger.exception("Error dispatching sink state to sink %s", runtime.sink)
+
+    async def _record_sink_failure(self, runtime: _SinkRuntime, reason: str) -> None:
+        runtime.failures += 1
+        if runtime.failures < _SINK_FAILURE_THRESHOLD:
+            return
+        if not runtime.enabled:
+            return
+        runtime.enabled = False
+        runtime.disabled_until = anyio.current_time() + runtime.backoff_s
+        await runtime.send.aclose()
+        runtime.disabled_event.set()
+        await self._emit_sink_state(
+            SinkStateChanged(
+                type="sink_state_changed",
+                sink_id=runtime.sink_id,
+                state=SinkState.DISABLED,
+                reason=reason,
+                failure_count=runtime.failures,
+                backoff_s=runtime.backoff_s,
+            )
+        )
+
+    async def _reenable_sink(self, runtime: _SinkRuntime, stop_event: anyio.Event) -> None:
+        if runtime.disabled_until is None:
+            return
+        delay = max(0.0, runtime.disabled_until - anyio.current_time())
+        if delay > 0:
+            with anyio.move_on_after(delay):
+                await stop_event.wait()
+            if stop_event.is_set():
+                return
+        if stop_event.is_set():
+            return
+        send, recv = anyio.create_memory_object_stream[OutputEvent](_SINK_QUEUE_SIZE)
+        runtime.send = send
+        runtime.recv = recv
+        runtime.enabled = True
+        runtime.failures = 0
+        runtime.backoff_s = _SINK_BACKOFF_BASE_S
+        runtime.disabled_until = None
+        await self._emit_sink_state(
+            SinkStateChanged(
+                type="sink_state_changed",
+                sink_id=runtime.sink_id,
+                state=SinkState.ENABLED,
+                reason="backoff_elapsed",
+                failure_count=runtime.failures,
+                backoff_s=None,
+            )
+        )
+
+    async def _supervise_sink_reenable(
+        self,
+        runtime: _SinkRuntime,
+        tg: TaskGroup,
+        stop_event: anyio.Event,
+    ) -> None:
+        while not stop_event.is_set():
+            await runtime.disabled_event.wait()
+            if stop_event.is_set():
+                return
+            if runtime.enabled or runtime.disabled_until is None:
+                runtime.disabled_event = anyio.Event()
+                continue
+            await self._reenable_sink(runtime, stop_event)
+            runtime.disabled_event = anyio.Event()
+            if stop_event.is_set():
+                return
+            if runtime.enabled:
+                tg.start_soon(self._run_sink_task, runtime)
+
     async def _dispatch_outputs(self) -> None:
         """Dispatch output events to all sinks via per-sink bounded queues.
 
         Each sink gets a dedicated long-lived task that reads from its own
-        bounded queue (1024 items). This ensures:
+        bounded queue (_SINK_QUEUE_SIZE items). This ensures:
         1. Strict per-sink ordering (events processed sequentially per sink)
-        2. Slow sinks don't block fast sinks until their 1024-item buffer fills
-        3. Backpressure: engine blocks when any sink queue is full (correctness-first)
+        2. Slow sinks don't block fast sinks until their buffer fills
+        3. Backpressure: engine records failures when any sink queue is full
 
         Assumes run() has validated that channels are initialized.
         Errors in individual sinks are logged but don't stop event dispatch.
         Sets _dispatch_complete when finished draining events.
         """
         assert self._output_recv is not None  # Validated by run()
+        stop_event = anyio.Event()
         try:
             async with anyio.create_task_group() as tg:
-                sink_channels: list[MemoryObjectSendStream[OutputEvent]] = []
+                sink_runtimes: list[_SinkRuntime] = []
                 for sink in self._sinks:
-                    send, recv = anyio.create_memory_object_stream[OutputEvent](1024)
-                    sink_channels.append(send)
-                    tg.start_soon(self._run_sink_task, sink, recv)
+                    send, recv = anyio.create_memory_object_stream[OutputEvent](_SINK_QUEUE_SIZE)
+                    runtime = _SinkRuntime(
+                        sink=sink,
+                        sink_id=type(sink).__name__,
+                        send=send,
+                        recv=recv,
+                        backoff_s=_SINK_BACKOFF_BASE_S,
+                    )
+                    sink_runtimes.append(runtime)
+                    tg.start_soon(self._run_sink_task, runtime)
+                    tg.start_soon(self._supervise_sink_reenable, runtime, tg, stop_event)
+
+                self._sink_runtimes = sink_runtimes
 
                 async for event in self._output_recv:
-                    for send in sink_channels:
-                        await send.send(event)
+                    for runtime in sink_runtimes:
+                        if not runtime.enabled:
+                            continue
+                        try:
+                            runtime.send.send_nowait(event)
+                        except anyio.WouldBlock:
+                            await self._record_sink_failure(runtime, reason="queue_full")
+                        except anyio.ClosedResourceError:
+                            continue
 
+                grace_deadline = anyio.current_time() + _SINK_SHUTDOWN_GRACE_S
+                if any(
+                    not runtime.enabled
+                    and runtime.disabled_until is not None
+                    and runtime.disabled_until <= grace_deadline
+                    for runtime in sink_runtimes
+                ):
+                    while any(not runtime.enabled for runtime in sink_runtimes):
+                        if anyio.current_time() >= grace_deadline:
+                            break
+                        await anyio.sleep(0.01)
+
+                stop_event.set()
+                for runtime in sink_runtimes:
+                    runtime.disabled_event.set()
                 # Close all send channels when output stream ends
-                for send in sink_channels:
-                    await send.aclose()
+                for runtime in sink_runtimes:
+                    if runtime.enabled:
+                        await runtime.send.aclose()
         finally:
+            self._sink_runtimes = None
             self._dispatch_complete.set()
 
-    async def _run_sink_task(
-        self, sink: EventSink, recv: MemoryObjectReceiveStream[OutputEvent]
-    ) -> None:
+    async def _run_sink_task(self, runtime: _SinkRuntime) -> None:
         """Process events for a single sink from its dedicated queue.
 
         Runs until the send side is closed. Errors in the sink are logged
         but don't stop processing subsequent events.
         """
-        async for event in recv:
+        async for event in runtime.recv:
+            if not runtime.enabled:
+                continue
             try:
-                await sink.handle(event)
+                with anyio.fail_after(_SINK_HANDLE_TIMEOUT_S):
+                    await runtime.sink.handle(event)
+            except TimeoutError:
+                _logger.warning("Sink %s timed out handling event", runtime.sink)
+                await self._record_sink_failure(runtime, reason="timeout")
             except Exception:
-                _logger.exception("Error dispatching event to sink %s", sink)
+                _logger.exception("Error dispatching event to sink %s", runtime.sink)
+                await self._record_sink_failure(runtime, reason="exception")
 
     async def _handle_input_event(self, event: InputEvent) -> None:
         """Process a single input event."""
@@ -352,12 +577,24 @@ class Engine:
                 await self._handle_code_or_config_changed(event)
 
     async def _handle_run_requested(self, event: RunRequested) -> None:
-        """Handle a RunRequested event by executing stages."""
+        """Handle a RunRequested event by spawning a non-blocking execution task.
+
+        If already running, coalesces into a restart: cancels the current run
+        and queues the new event for replay once the current run completes.
+        """
         # Store orchestration params for watch mode re-runs
         self._stored_no_commit = event["no_commit"]
         self._stored_on_error = event["on_error"]
         self._stored_parallel = event["parallel"]
         self._stored_max_workers = event["max_workers"]
+
+        if self._run_state == _RunState.RUNNING:
+            # Coalesce: only the latest restart request survives
+            self._restart_pending = event
+            await self._handle_cancel_requested()
+            return
+
+        self._run_state = _RunState.RUNNING
 
         # Clear cancel event before starting new execution
         self._cancel_event = anyio.Event()  # Reset by creating new event
@@ -365,12 +602,24 @@ class Engine:
         # Reset stage indices for this run
         self._stage_indices.clear()
 
+        # Generate run_id before ACTIVE event so it's stamped on all run events
+        from pivot import run_history
+
+        self._current_run_id = run_history.generate_run_id()
+
         # Emit state transition: IDLE -> ACTIVE
         self._state = EngineState.ACTIVE
         await self.emit(EngineStateChanged(type="engine_state_changed", state=EngineState.ACTIVE))
 
+        assert self._run_task_group is not None
+        self._run_task_group.start_soon(self._run_execution_task, event)
+
+    async def _run_execution_task(self, event: RunRequested) -> None:
+        """Execute a run in a background task within the run task group.
+
+        Handles ACTIVE→IDLE transitions, restart coalescing, and deferred reloads.
+        """
         try:
-            # Require pipeline for execution
             self._require_pipeline()
 
             await self._orchestrate_execution(
@@ -386,13 +635,88 @@ class Engine:
                 checkout_missing=event["checkout_missing"],
             )
         finally:
-            # Emit state transition: ACTIVE -> IDLE
-            self._state = EngineState.IDLE
-            await self.emit(EngineStateChanged(type="engine_state_changed", state=EngineState.IDLE))
+            pending_reload = self._reload_pending is not None
+            pending_restart = self._restart_pending is not None
+
+            if pending_reload or pending_restart:
+                self._run_state = _RunState.IDLE
+                self._state = EngineState.IDLE
+                self._current_run_id = None
+
+                # Process deferred reload before restart (reload may change stage list)
+                reload_pending = self._reload_pending
+                if reload_pending is not None:
+                    self._reload_pending = None
+                    reload_paths = sorted(reload_pending)
+                    await self._handle_code_or_config_changed(
+                        CodeOrConfigChanged(type="code_or_config_changed", paths=reload_paths)
+                    )
+
+                # Replay coalesced restart request (clear before call for future-safety)
+                if self._restart_pending is not None:
+                    restart = self._restart_pending
+                    self._restart_pending = None
+                    await self._handle_run_requested(restart)
+
+                if self._run_state == _RunState.IDLE and not self._has_pending_work():
+                    async with self._idle_condition:
+                        self._idle_condition.notify_all()
+                    await self.emit(
+                        EngineStateChanged(type="engine_state_changed", state=EngineState.IDLE)
+                    )
+            else:
+                self._run_state = _RunState.IDLE
+                self._state = EngineState.IDLE
+                async with self._idle_condition:
+                    self._idle_condition.notify_all()
+                await self.emit(
+                    EngineStateChanged(type="engine_state_changed", state=EngineState.IDLE)
+                )
+                self._current_run_id = None
+
+    def _has_pending_work(self) -> bool:
+        return self._restart_pending is not None or self._reload_pending is not None
 
     def _is_idle(self) -> bool:
         """Check if engine is idle (no pending work)."""
-        return self._state == EngineState.IDLE
+        return self._run_state == _RunState.IDLE and not self._has_pending_work()
+
+    async def _wait_for_idle(self) -> None:
+        async with self._idle_condition:
+            while not self._is_idle():
+                await self._idle_condition.wait()
+
+    async def _receive_input_or_idle(self, *, wait_for_idle: bool) -> tuple[str, InputEvent | None]:
+        if self._input_recv is None:
+            raise RuntimeError("Input channel not initialized")
+        input_recv = self._input_recv
+
+        kind = "event"
+        event: InputEvent | None = None
+
+        async with anyio.create_task_group() as tg:
+
+            async def _recv() -> None:
+                nonlocal kind, event
+                try:
+                    event = await input_recv.receive()
+                    kind = "event"
+                except anyio.EndOfStream:
+                    kind = "eos"
+                finally:
+                    tg.cancel_scope.cancel()
+
+            async def _idle() -> None:
+                nonlocal kind
+                await self._wait_for_idle()
+                kind = "idle"
+                tg.cancel_scope.cancel()
+
+            tg.start_soon(_recv)
+            if wait_for_idle:
+                tg.start_soon(_idle)
+
+        return kind, event
 
     # =========================================================================
     # Pipeline Access
@@ -541,7 +865,8 @@ class Engine:
         # Get project paths for worker info
         project_root = project.get_project_root()
         default_state_dir = config.get_state_dir()
-        run_id = run_history.generate_run_id()
+        run_id = self._current_run_id or run_history.generate_run_id()
+        self._current_run_id = run_id  # May already be set by _handle_run_requested
 
         # Ensure state directory exists
         default_state_dir.mkdir(parents=True, exist_ok=True)
@@ -550,16 +875,11 @@ class Engine:
         await self._initialize_orchestration(execution_order, effective_max_workers)
         self._warn_single_stage_mutex_groups()
 
-        # Create executor
-        self._executor = executor_core.create_executor(effective_max_workers)
-
-        # Create output queue via Manager so the proxy is picklable across loky workers.
-        # Manager is still needed: plain spawn_ctx.Queue() cannot be pickled for
-        # ProcessPoolExecutor.submit() (workers run in separate processes).
-        spawn_ctx = mp.get_context("spawn")
-        local_manager = spawn_ctx.Manager()
-        output_queue: mp.Queue[OutputMessage] = local_manager.Queue()  # pyright: ignore[reportAssignmentType]
-        shutdown_event = threading.Event()
+        # Create worker pool (replaces direct executor/Manager/queue setup)
+        self._worker_pool = worker_pool_mod.WorkerPool()
+        self._worker_pool.start(max_workers=effective_max_workers)
+        output_queue = self._worker_pool.output_queue()
+        shutdown_event = self._worker_pool.shutdown_event()
 
         # Track results, start times, and actual durations
         results: dict[str, executor_core.ExecutionSummary] = {}
@@ -772,19 +1092,22 @@ class Engine:
                     except (OSError, queue.Full) as exc:
                         _logger.debug("Sentinel send failed (will rely on shutdown_event): %s", exc)
                     with anyio.CancelScope(shield=True):
-                        self._executor = None
                         for db in state_dbs.values():
                             db.close()
                         state_dbs.clear()
 
         finally:
-            # Manager shutdown can fail if the manager process died unexpectedly.
+            # WorkerPool shutdown handles executor + manager cleanup.
             # Must happen after sentinel send so drain thread exits first.
             # Wrapped in outer finally to ensure it always executes, even if task group raises.
-            try:
-                local_manager.shutdown()
-            except (OSError, BrokenPipeError) as exc:
-                _logger.debug("Manager shutdown failed (may already be dead): %s", exc)
+            if self._worker_pool is not None:  # pyright: ignore[reportUnnecessaryComparison] - defensive: start() may have failed
+                worker_pool = self._worker_pool
+                self._worker_pool = None
+                try:
+                    with anyio.CancelScope(shield=True):
+                        await anyio.to_thread.run_sync(worker_pool.shutdown)
+                except (OSError, BrokenPipeError) as exc:
+                    _logger.debug("WorkerPool shutdown failed (may already be dead): %s", exc)
 
         # Write run history after execution completes
         ended_at = datetime.datetime.now(datetime.UTC).isoformat()
@@ -954,7 +1277,7 @@ class Engine:
         state_dir: pathlib.Path,
     ) -> None:
         """Start all eligible stages up to max_workers."""
-        if self._executor is None or self._scheduler.stop_starting_new:
+        if self._worker_pool is None or self._scheduler.stop_starting_new:
             return
 
         pipeline = self._require_pipeline()
@@ -991,8 +1314,8 @@ class Engine:
                 default_state_dir=state_dir,
             )
 
-            # Submit to executor
-            future = self._executor.submit(
+            # Submit to worker pool
+            future = self._worker_pool.submit(
                 worker.execute_stage,
                 stage_name,
                 worker_info,
@@ -1147,8 +1470,20 @@ class Engine:
     # =========================================================================
 
     async def _handle_cancel_requested(self) -> None:
-        """Handle cancel by setting cancel event."""
+        """Handle cancel with explicit state machine.
+
+        IDLE → no-op (nothing to cancel).
+        RUNNING → transition to CANCELLING, set cancel event, stop accepting.
+        CANCELLING → no-op (already cancelling, avoid duplicate work).
+        """
+        if self._run_state == _RunState.CANCELLING:
+            return
+        if self._run_state == _RunState.IDLE:
+            return
+        self._run_state = _RunState.CANCELLING
         self._cancel_event.set()
+        if self._worker_pool is not None:
+            self._worker_pool.stop_accepting()
 
     async def _handle_data_artifact_changed(self, event: DataArtifactChanged) -> None:
         """Handle data artifact changes by running affected stages."""
@@ -1190,7 +1525,18 @@ class Engine:
         await self._execute_affected_stages(affected)
 
     async def _handle_code_or_config_changed(self, event: CodeOrConfigChanged) -> None:
-        """Handle code/config changes by reloading registry and re-running."""
+        """Handle code/config changes by reloading registry and re-running.
+
+        If a run is active, defers the reload until the current run completes.
+        """
+        if self._run_state in (_RunState.RUNNING, _RunState.CANCELLING):
+            _logger.info("Code/config changed while running - deferring reload")
+            if self._reload_pending is None:
+                self._reload_pending = set(event["paths"])
+            else:
+                self._reload_pending.update(event["paths"])
+            return
+
         _logger.info("Code/config changed - reloading pipeline")
 
         # Invalidate caches
@@ -1262,26 +1608,26 @@ class Engine:
             await self._execute_affected_stages(stages)
 
     async def _execute_affected_stages(self, stages: list[str]) -> None:
-        """Execute the specified stages."""
-        self._cancel_event = anyio.Event()  # Reset by creating new event
+        """Execute the specified stages via non-blocking run handling.
 
-        self._state = EngineState.ACTIVE
-        await self.emit(EngineStateChanged(type="engine_state_changed", state=EngineState.ACTIVE))
-
-        try:
-            await self._orchestrate_execution(
-                stages=stages,
-                force=False,
-                single_stage=False,
-                parallel=self._stored_parallel,
-                max_workers=self._stored_max_workers,
-                no_commit=self._stored_no_commit,
-                on_error=self._stored_on_error,
-                cache_dir=None,
-            )
-        finally:
-            self._state = EngineState.IDLE
-            await self.emit(EngineStateChanged(type="engine_state_changed", state=EngineState.IDLE))
+        Constructs a synthetic RunRequested event from stored params and delegates
+        to _handle_run_requested, which manages the run state machine.
+        """
+        event = RunRequested(
+            type="run_requested",
+            stages=stages,
+            force=False,
+            reason="watch:affected",
+            single_stage=False,
+            parallel=self._stored_parallel,
+            max_workers=self._stored_max_workers,
+            no_commit=self._stored_no_commit,
+            on_error=self._stored_on_error,
+            cache_dir=None,
+            allow_uncached_incremental=False,
+            checkout_missing=False,
+        )
+        await self._handle_run_requested(event)
 
     def _should_filter_path(self, path: pathlib.Path) -> bool:
         """Check if path should be filtered (output of executing stage).

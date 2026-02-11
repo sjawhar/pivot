@@ -59,6 +59,7 @@ async def test_console_sink_displays_waiting_on_lock() -> None:
 
     event = StageStateChanged(
         type="stage_state_changed",
+        seq=0,
         stage="train",
         state=StageExecutionState.WAITING_ON_LOCK,
         previous_state=StageExecutionState.PREPARING,
@@ -78,6 +79,7 @@ async def test_console_sink_ignores_other_state_changes() -> None:
 
     event = StageStateChanged(
         type="stage_state_changed",
+        seq=0,
         stage="train",
         state=StageExecutionState.RUNNING,
         previous_state=StageExecutionState.PREPARING,

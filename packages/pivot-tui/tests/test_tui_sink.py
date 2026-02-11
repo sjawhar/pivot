@@ -40,6 +40,7 @@ async def test_tui_sink_posts_stage_started() -> None:
 
     event: StageStarted = {
         "type": "stage_started",
+        "seq": 0,
         "stage": "train",
         "index": 0,
         "total": 3,
@@ -61,6 +62,7 @@ async def test_tui_sink_posts_stage_completed() -> None:
 
     event: StageCompleted = {
         "type": "stage_completed",
+        "seq": 0,
         "stage": "train",
         "index": 0,
         "total": 3,
@@ -87,6 +89,7 @@ async def test_tui_sink_posts_log_line() -> None:
 
     event: LogLine = {
         "type": "log_line",
+        "seq": 0,
         "stage": "train",
         "line": "Processing data...",
         "is_stderr": False,
@@ -106,7 +109,7 @@ async def test_tui_sink_ignores_unknown_events() -> None:
     app = MockApp()
     sink = TuiSink(app=app, run_id="test-run")
 
-    event = {"type": "engine_state_changed", "state": "running"}
+    event = {"type": "engine_state_changed", "seq": 0, "state": "running"}
     await sink.handle(event)  # pyright: ignore[reportArgumentType] - testing unknown event type
 
     assert len(app.messages) == 0
@@ -131,10 +134,11 @@ async def test_tui_sink_handles_multiple_events() -> None:
     sink = TuiSink(app=app, run_id="test-run")
 
     events = [
-        {"type": "stage_started", "stage": "a", "index": 0, "total": 2},
-        {"type": "log_line", "stage": "a", "line": "hello", "is_stderr": False},
+        {"type": "stage_started", "seq": 0, "stage": "a", "index": 0, "total": 2},
+        {"type": "log_line", "seq": 1, "stage": "a", "line": "hello", "is_stderr": False},
         {
             "type": "stage_completed",
+            "seq": 2,
             "stage": "a",
             "index": 0,
             "total": 2,
@@ -142,7 +146,7 @@ async def test_tui_sink_handles_multiple_events() -> None:
             "reason": "",
             "duration_ms": 100,
         },
-        {"type": "stage_started", "stage": "b", "index": 1, "total": 2},
+        {"type": "stage_started", "seq": 3, "stage": "b", "index": 1, "total": 2},
     ]
 
     for event in events:
@@ -177,6 +181,7 @@ async def test_tui_sink_handles_post_message_failure() -> None:
     # Should not raise even if post_message returns False
     event: StageStarted = {
         "type": "stage_started",
+        "seq": 0,
         "stage": "train",
         "index": 0,
         "total": 1,
@@ -199,11 +204,18 @@ async def test_tui_sink_posts_multiple_event_types_in_sequence() -> None:
 
     # Simulate complete stage lifecycle
     events = [
-        {"type": "stage_started", "stage": "process", "index": 0, "total": 1},
-        {"type": "log_line", "stage": "process", "line": "Processing data...", "is_stderr": False},
-        {"type": "log_line", "stage": "process", "line": "Complete!", "is_stderr": False},
+        {"type": "stage_started", "seq": 0, "stage": "process", "index": 0, "total": 1},
+        {
+            "type": "log_line",
+            "seq": 1,
+            "stage": "process",
+            "line": "Processing data...",
+            "is_stderr": False,
+        },
+        {"type": "log_line", "seq": 2, "stage": "process", "line": "Complete!", "is_stderr": False},
         {
             "type": "stage_completed",
+            "seq": 3,
             "stage": "process",
             "index": 0,
             "total": 1,

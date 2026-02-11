@@ -22,6 +22,7 @@ async def test_tui_sink_with_real_app() -> None:
     await sink.handle(
         {
             "type": "stage_started",
+            "seq": 0,
             "stage": "test_stage",
             "index": 0,
             "total": 1,
