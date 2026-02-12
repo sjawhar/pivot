@@ -2443,7 +2443,7 @@ def test_save_outputs_to_cache_mixed_cached_and_noncached(tmp_path: pathlib.Path
 def test_restore_outputs_from_cache_skips_noncached_outputs(
     tmp_path: pathlib.Path,
 ) -> None:
-    """_restore_outputs_from_cache verifies non-cached outputs exist on disk.
+    """restore_outputs_from_cache verifies non-cached outputs exist on disk.
 
     Non-cached outputs (Metric) should be verified to exist but NOT restored
     from cache. Cached outputs (Out) should be restored normally.
@@ -2491,7 +2491,7 @@ def test_restore_outputs_from_cache_skips_noncached_outputs(
 
         # Restore should succeed — cached output restored from cache,
         # non-cached output verified as existing on disk
-        restored = worker._restore_outputs_from_cache(
+        restored = worker.restore_outputs_from_cache(
             [outputs.require_expanded(out), outputs.require_expanded(metric)],
             lock_data,
             cache_dir,
@@ -2506,7 +2506,7 @@ def test_restore_outputs_from_cache_skips_noncached_outputs(
 def test_restore_outputs_from_cache_fails_when_noncached_missing(
     tmp_path: pathlib.Path,
 ) -> None:
-    """_restore_outputs_from_cache fails when non-cached output is missing from disk.
+    """restore_outputs_from_cache fails when non-cached output is missing from disk.
 
     If a Metric file doesn't exist on disk, we can't restore it from cache
     (it's not cached), so the skip should fail and the stage should re-run.
@@ -2537,7 +2537,7 @@ def test_restore_outputs_from_cache_fails_when_noncached_missing(
         # metrics.json does NOT exist on disk
         assert not (tmp_path / "metrics.json").exists()
 
-        restored = worker._restore_outputs_from_cache(
+        restored = worker.restore_outputs_from_cache(
             [outputs.require_expanded(metric)],
             lock_data,
             cache_dir,

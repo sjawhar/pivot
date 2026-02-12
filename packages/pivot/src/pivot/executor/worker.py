@@ -256,10 +256,14 @@ def execute_stage(
                             verify_files=True,
                         ):
                             out_specs = _get_output_specs(stage_info)
-                            input_hash = _compute_input_hash_from_lock(
-                                lock_data, current_fingerprint, current_params, out_specs
+                            deps_list = [
+                                DepEntry(path=path, hash=info["hash"])
+                                for path, info in lock_data["dep_hashes"].items()
+                            ]
+                            input_hash = run_history.compute_input_hash(
+                                current_fingerprint, current_params, deps_list, out_specs
                             )
-                            restored = _restore_outputs_from_cache(
+                            restored = restore_outputs_from_cache(
                                 stage_outs,
                                 lock_data,
                                 files_cache_dir,
@@ -313,7 +317,7 @@ def execute_stage(
                         run_reason = "forced"
 
                     if skip_reason is not None and lock_data is not None:
-                        restored = _restore_outputs_from_cache(
+                        restored = restore_outputs_from_cache(
                             stage_outs,
                             lock_data,
                             files_cache_dir,
@@ -480,19 +484,6 @@ def _get_output_specs(stage_info: WorkerStageInfo) -> list[tuple[str, bool]]:
     return [(_canonicalize_out(str(out.path)), out.cache) for out in stage_info["outs"]]
 
 
-def _compute_input_hash_from_lock(
-    lock_data: LockData,
-    current_fingerprint: dict[str, str],
-    current_params: dict[str, Any],
-    out_specs: list[tuple[str, bool]],
-) -> str:
-    """Compute input hash using lock file dependency hashes."""
-    deps_list = [
-        DepEntry(path=path, hash=info["hash"]) for path, info in lock_data["dep_hashes"].items()
-    ]
-    return run_history.compute_input_hash(current_fingerprint, current_params, deps_list, out_specs)
-
-
 def _check_skip_or_run(
     stage_info: WorkerStageInfo,
     stage_lock: lock.StageLock,
@@ -604,7 +595,7 @@ def _restore_outputs(
     return True
 
 
-def _restore_outputs_from_cache(
+def restore_outputs_from_cache(
     stage_outs: Sequence[outputs.ExpandedOut],
     lock_data: LockData,
     files_cache_dir: pathlib.Path,

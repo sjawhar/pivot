@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import pathlib
+from typing import TYPE_CHECKING, Annotated, TypedDict, cast
 from unittest.mock import MagicMock
 
 import anyio
 import networkx as nx
 import pytest
 
+from pivot import loaders, outputs, parameters, project
 from pivot.engine import engine as engine_mod
 from pivot.engine import graph as engine_graph
 from pivot.engine.engine import Engine
@@ -26,7 +28,25 @@ from pivot.engine.types import (
     StageExecutionState,
 )
 from pivot.engine.worker_pool import WorkerPool
-from pivot.types import OnError
+from pivot.storage import cache, lock
+from pivot.storage import state as state_mod
+from pivot.types import LockData, OnError
+from tests.helpers import register_test_stage
+
+if TYPE_CHECKING:
+    from pivot.executor import core as executor_core
+    from pivot.pipeline.pipeline import Pipeline
+    from pivot.registry import RegistryStageInfo
+
+
+class _CoordinatorSkipOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
+
+
+def _helper_coordinator_skip_stage(
+    _input_path: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _CoordinatorSkipOutputs:
+    return {"output": pathlib.Path("output.txt")}
 
 
 class _MockAsyncSink:
@@ -1119,3 +1139,306 @@ async def test_deferred_events_multi_level_redeferral(
             f"Expected 4 events processed (seed + 3 levels), got {_deferred_multi_count}"
         )
         assert "stage_a" not in engine._deferred_events, "No leftover deferred events"
+
+
+# =============================================================================
+# Coordinator-Side Skip Detection Tests
+# =============================================================================
+
+
+@pytest.mark.anyio
+async def test_coordinator_skip_avoids_worker_dispatch(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    test_pipeline: Pipeline,
+) -> None:
+    """Stages that can skip via generation check are completed inline,
+    never dispatched to the worker pool."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(project, "_project_root_cache", tmp_path)
+
+    (tmp_path / ".pivot").mkdir(exist_ok=True)
+    (tmp_path / ".git").mkdir(exist_ok=True)
+
+    register_test_stage(
+        _helper_coordinator_skip_stage,
+        name="skip_stage",
+        pipeline=test_pipeline,
+    )
+    stage_info = test_pipeline.get("skip_stage")
+
+    input_path = tmp_path / "input.txt"
+    output_path = tmp_path / "output.txt"
+    _ = input_path.write_text("input")
+    _ = output_path.write_text("output")
+
+    state_dir = tmp_path / ".pivot"
+    cache_dir = state_dir / "cache"
+    (cache_dir / "files").mkdir(parents=True, exist_ok=True)
+    lock.get_stages_dir(state_dir).mkdir(parents=True, exist_ok=True)
+
+    fp = test_pipeline.ensure_fingerprint("skip_stage")
+    current_params = parameters.get_effective_params(
+        stage_info["params"], "skip_stage", parameters.ParamsOverrides()
+    )
+
+    with state_mod.StateDB(state_dir / "state.db") as state_db:
+        dep_hash, _ = cache.hash_file(input_path, state_db)
+        out_hash, _ = cache.hash_file(output_path, state_db)
+
+        lock_data = LockData(
+            code_manifest=fp,
+            params=current_params,
+            dep_hashes={str(input_path): {"hash": dep_hash}},
+            output_hashes={str(output_path): {"hash": out_hash}},
+        )
+
+        stage_lock = lock.StageLock("skip_stage", lock.get_stages_dir(state_dir))
+        stage_lock.write(lock_data)
+
+        dep_generation = state_db.increment_generation(input_path)
+        normalized_dep = str(project.normalize_path(input_path))
+        state_db.record_dep_generations("skip_stage", {normalized_dep: dep_generation})
+
+    async with Engine(pipeline=test_pipeline) as engine:
+        await engine._initialize_orchestration(["skip_stage"], max_workers=1)
+        engine._scheduler.acquire_mutexes("skip_stage")
+        await engine._set_stage_state("skip_stage", StageExecutionState.PREPARING)
+
+        results: dict[str, executor_core.ExecutionSummary] = {}
+        engine._worker_pool = MagicMock()
+
+        skipped = await engine._try_skip_in_coordinator(
+            stage_name="skip_stage",
+            stage_info=stage_info,
+            overrides=parameters.ParamsOverrides(),
+            checkout_modes=cache.DEFAULT_CHECKOUT_MODE_ORDER.copy(),
+            force=False,
+            cache_dir=cache_dir,
+            state_dir=state_dir,
+            project_root=tmp_path,
+            results=results,
+            run_id="run-test",
+        )
+
+        assert skipped is True, "Coordinator should skip inline when generations match"
+        assert results["skip_stage"]["status"] == "skipped"
+        engine._worker_pool.submit.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_all_cached_pipeline_skips_without_workers(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    test_pipeline: Pipeline,
+) -> None:
+    """When all stages are cached, _start_ready_stages completes them inline
+    without calling WorkerPool.submit."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(project, "_project_root_cache", tmp_path)
+
+    (tmp_path / ".pivot").mkdir(exist_ok=True)
+    (tmp_path / ".git").mkdir(exist_ok=True)
+
+    register_test_stage(
+        _helper_coordinator_skip_stage,
+        name="cached_stage",
+        pipeline=test_pipeline,
+    )
+    stage_info = test_pipeline.get("cached_stage")
+
+    input_path = tmp_path / "input.txt"
+    output_path = tmp_path / "output.txt"
+    _ = input_path.write_text("input")
+    _ = output_path.write_text("output")
+
+    state_dir = tmp_path / ".pivot"
+    cache_dir = state_dir / "cache"
+    (cache_dir / "files").mkdir(parents=True, exist_ok=True)
+    lock.get_stages_dir(state_dir).mkdir(parents=True, exist_ok=True)
+
+    fp = test_pipeline.ensure_fingerprint("cached_stage")
+    current_params = parameters.get_effective_params(
+        stage_info["params"], "cached_stage", parameters.ParamsOverrides()
+    )
+
+    with state_mod.StateDB(state_dir / "state.db") as state_db:
+        dep_hash, _ = cache.hash_file(input_path, state_db)
+        out_hash, _ = cache.hash_file(output_path, state_db)
+
+        lock_data = LockData(
+            code_manifest=fp,
+            params=current_params,
+            dep_hashes={str(input_path): {"hash": dep_hash}},
+            output_hashes={str(output_path): {"hash": out_hash}},
+        )
+
+        stage_lock = lock.StageLock("cached_stage", lock.get_stages_dir(state_dir))
+        stage_lock.write(lock_data)
+
+        dep_generation = state_db.increment_generation(input_path)
+        normalized_dep = str(project.normalize_path(input_path))
+        state_db.record_dep_generations("cached_stage", {normalized_dep: dep_generation})
+
+    async with Engine(pipeline=test_pipeline) as engine:
+        await engine._initialize_orchestration(["cached_stage"], max_workers=1)
+
+        results: dict[str, executor_core.ExecutionSummary] = {}
+        await engine._start_ready_stages(
+            cache_dir=cache_dir,
+            overrides=parameters.ParamsOverrides(),
+            checkout_modes=cache.DEFAULT_CHECKOUT_MODE_ORDER.copy(),
+            force=False,
+            no_commit=False,
+            stage_start_times={},
+            run_id="run-test",
+            project_root=tmp_path,
+            state_dir=state_dir,
+            results=results,
+        )
+
+        assert engine._worker_pool is None, "Pool should not be created when all stages skip"
+        assert "cached_stage" in results, "Skipped stage should be in results"
+        assert results["cached_stage"]["status"] == "skipped"
+
+
+@pytest.mark.anyio
+async def test_try_skip_returns_false_when_force(
+    tmp_path: pathlib.Path,
+) -> None:
+    """_try_skip_in_coordinator returns False immediately when force=True."""
+    async with Engine() as engine:
+        results: dict[str, executor_core.ExecutionSummary] = {}
+        stage_info = cast("RegistryStageInfo", MagicMock())
+        skipped = await engine._try_skip_in_coordinator(
+            stage_name="any_stage",
+            stage_info=stage_info,
+            overrides={},
+            checkout_modes=[],
+            force=True,
+            cache_dir=tmp_path,
+            state_dir=tmp_path,
+            project_root=tmp_path,
+            results=results,
+            run_id="test",
+        )
+        assert skipped is False, "Should not skip when force=True"
+        assert results == {}, "No results should be recorded"
+
+
+@pytest.mark.anyio
+async def test_try_skip_returns_false_when_no_lock(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_try_skip_in_coordinator returns False when no lock file exists."""
+    monkeypatch.setattr(
+        "pivot.registry.get_stage_state_dir",
+        lambda _info, _default: tmp_path,  # pyright: ignore[reportUnknownLambdaType,reportUnknownArgumentType]
+    )
+
+    async with Engine() as engine:
+        results: dict[str, executor_core.ExecutionSummary] = {}
+        stage_info = cast("RegistryStageInfo", MagicMock())
+        skipped = await engine._try_skip_in_coordinator(
+            stage_name="no_lock_stage",
+            stage_info=stage_info,
+            overrides={},
+            checkout_modes=[],
+            force=False,
+            cache_dir=tmp_path,
+            state_dir=tmp_path,
+            project_root=tmp_path,
+            results=results,
+            run_id="test",
+        )
+        assert skipped is False, "Should not skip when no lock file"
+
+
+@pytest.mark.anyio
+async def test_coordinator_tier2_skip_when_generation_unavailable(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    test_pipeline: Pipeline,
+) -> None:
+    """When Tier 1 (generation) has no data, Tier 2 (lock file comparison) still
+    allows coordinator-side skip — verifying the full fallback path."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(project, "_project_root_cache", tmp_path)
+
+    (tmp_path / ".pivot").mkdir(exist_ok=True)
+    (tmp_path / ".git").mkdir(exist_ok=True)
+
+    register_test_stage(
+        _helper_coordinator_skip_stage,
+        name="tier2_stage",
+        pipeline=test_pipeline,
+    )
+    stage_info = test_pipeline.get("tier2_stage")
+
+    input_path = tmp_path / "input.txt"
+    output_path = tmp_path / "output.txt"
+    _ = input_path.write_text("input")
+    _ = output_path.write_text("output")
+
+    state_dir = tmp_path / ".pivot"
+    cache_dir = state_dir / "cache"
+    (cache_dir / "files").mkdir(parents=True, exist_ok=True)
+    lock.get_stages_dir(state_dir).mkdir(parents=True, exist_ok=True)
+
+    fp = test_pipeline.ensure_fingerprint("tier2_stage")
+    current_params = parameters.get_effective_params(
+        stage_info["params"], "tier2_stage", parameters.ParamsOverrides()
+    )
+
+    # Write lock data and file hashes — but do NOT record dep generations.
+    # This makes Tier 1 (can_skip_via_generation) return False,
+    # forcing the code through Tier 2 (skip.check_stage).
+    with state_mod.StateDB(state_dir / "state.db") as state_db:
+        dep_hash, _ = cache.hash_file(input_path, state_db)
+        out_hash, _ = cache.hash_file(output_path, state_db)
+
+        # Use normalized paths (absolute) as hash_dependencies does
+        normalized_dep = str(project.normalize_path(input_path))
+        normalized_out = str(project.normalize_path(output_path))
+
+        lock_data = LockData(
+            code_manifest=fp,
+            params=current_params,
+            dep_hashes={normalized_dep: {"hash": dep_hash}},
+            output_hashes={normalized_out: {"hash": out_hash}},
+        )
+
+        stage_lock = lock.StageLock("tier2_stage", lock.get_stages_dir(state_dir))
+        stage_lock.write(lock_data)
+
+        # Deliberately NOT calling state_db.record_dep_generations —
+        # this is what forces the Tier 2 path.
+
+    async with Engine(pipeline=test_pipeline) as engine:
+        await engine._initialize_orchestration(["tier2_stage"], max_workers=1)
+        engine._scheduler.acquire_mutexes("tier2_stage")
+        await engine._set_stage_state("tier2_stage", StageExecutionState.PREPARING)
+
+        results: dict[str, executor_core.ExecutionSummary] = {}
+        engine._worker_pool = MagicMock()
+
+        skipped = await engine._try_skip_in_coordinator(
+            stage_name="tier2_stage",
+            stage_info=stage_info,
+            overrides=parameters.ParamsOverrides(),
+            checkout_modes=cache.DEFAULT_CHECKOUT_MODE_ORDER.copy(),
+            force=False,
+            cache_dir=cache_dir,
+            state_dir=state_dir,
+            project_root=tmp_path,
+            results=results,
+            run_id="run-tier2-test",
+        )
+
+        assert skipped is True, "Coordinator should skip via Tier 2 when generations unavailable"
+        assert results["tier2_stage"]["status"] == "skipped"
+        assert results["tier2_stage"]["reason"] == "unchanged", (
+            "Tier 2 skip reason should be 'unchanged', not 'unchanged (generation)'"
+        )
+        engine._worker_pool.submit.assert_not_called()

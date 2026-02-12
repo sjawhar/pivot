@@ -13,7 +13,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Self
+from typing import TYPE_CHECKING, Any, Self
 
 import anyio
 import anyio.from_thread
@@ -50,6 +50,9 @@ from pivot.executor import core as executor_core
 from pivot.executor import worker
 from pivot.storage import state as state_mod
 from pivot.types import (
+    DepEntry,
+    HashInfo,
+    LockData,
     OnError,
     OutputMessage,
     OutputMessageKind,
@@ -887,11 +890,8 @@ class Engine:
         await self._initialize_orchestration(execution_order, effective_max_workers)
         self._warn_single_stage_mutex_groups()
 
-        # Create worker pool (replaces direct executor/Manager/queue setup)
-        self._worker_pool = worker_pool_mod.WorkerPool()
-        self._worker_pool.start(max_workers=effective_max_workers)
-        output_queue = self._worker_pool.output_queue()
-        shutdown_event = self._worker_pool.shutdown_event()
+        # Worker pool is created lazily on first worker dispatch (see _ensure_worker_pool).
+        # If all stages skip in the coordinator, the pool is never started.
 
         # Track results, start times, and actual durations
         results: dict[str, executor_core.ExecutionSummary] = {}
@@ -908,218 +908,238 @@ class Engine:
                 state_dbs[stage_state_dir] = state_mod.StateDB(db_path)
             return state_dbs[stage_state_dir]
 
-        # Three-tier shutdown strategy for drain thread:
-        # 1. Sentinel message (None) - primary happy-path signal
-        # 2. shutdown_event - fallback when sentinel delivery fails or queue stays busy
-        # 3. abandon_on_cancel + timeout - final backstop prevents indefinite blocking
-        # All three are needed to handle different failure modes (PR #400 proved this).
         try:
-            async with anyio.create_task_group() as tg:
-                tg.start_soon(self._drain_output_queue, output_queue, shutdown_event)
-                try:
-                    # Ensure default StateDB exists before workers start
-                    _get_state_db(default_state_dir)
+            # Ensure default StateDB exists before skip checks
+            _get_state_db(default_state_dir)
 
-                    # Start initial ready stages
-                    await self._start_ready_stages(
-                        cache_dir=cache_dir,
-                        output_queue=output_queue,
-                        overrides=overrides,
-                        checkout_modes=checkout_modes,
-                        force=force,
-                        no_commit=no_commit,
-                        stage_start_times=stage_start_times,
-                        run_id=run_id,
-                        project_root=project_root,
-                        state_dir=default_state_dir,
-                    )
+            # Start initial ready stages (may skip all in coordinator, or lazily create pool)
+            await self._start_ready_stages(
+                cache_dir=cache_dir,
+                overrides=overrides,
+                checkout_modes=checkout_modes,
+                force=force,
+                no_commit=no_commit,
+                stage_start_times=stage_start_times,
+                run_id=run_id,
+                project_root=project_root,
+                state_dir=default_state_dir,
+                results=results,
+            )
 
-                    # Main execution loop
-                    while self._futures:
-                        # Snapshot futures keys before passing to thread to avoid
-                        # "dictionary changed size during iteration" race condition.
-                        # The main async loop can modify _futures while thread waits.
-                        futures_snapshot = list(self._futures.keys())
-                        # Use default argument to capture snapshot by value, not reference
-                        done = await anyio.to_thread.run_sync(
-                            lambda fs=futures_snapshot: self._wait_for_futures_snapshot(
-                                fs, timeout=0.1
+            # Only start drain thread and main loop if workers were dispatched.
+            # When all stages skip in the coordinator, the pool is never created.
+            if self._worker_pool is not None:
+                output_queue = self._worker_pool.output_queue()
+                shutdown_event = self._worker_pool.shutdown_event()
+
+                # Three-tier shutdown strategy for drain thread:
+                # 1. Sentinel message (None) - primary happy-path signal
+                # 2. shutdown_event - fallback when sentinel delivery fails or queue stays busy
+                # 3. abandon_on_cancel + timeout - final backstop prevents indefinite blocking
+                # All three are needed to handle different failure modes (PR #400 proved this).
+                async with anyio.create_task_group() as tg:
+                    tg.start_soon(self._drain_output_queue, output_queue, shutdown_event)
+                    try:
+                        # Main execution loop
+                        while self._futures:
+                            # Snapshot futures keys before passing to thread to avoid
+                            # "dictionary changed size during iteration" race condition.
+                            # The main async loop can modify _futures while thread waits.
+                            futures_snapshot = list(self._futures.keys())
+                            # Use default argument to capture snapshot by value, not reference
+                            done = await anyio.to_thread.run_sync(
+                                lambda fs=futures_snapshot: self._wait_for_futures_snapshot(
+                                    fs, timeout=0.1
+                                )
                             )
-                        )
 
-                        for future in done:
-                            stage_name = self._futures.pop(future)
-                            start_time = stage_start_times.get(stage_name, time.perf_counter())
+                            for future in done:
+                                stage_name = self._futures.pop(future)
+                                start_time = stage_start_times.get(stage_name, time.perf_counter())
 
-                            try:
-                                result = future.result()
-                                duration_ms = await self._handle_stage_completion(
-                                    stage_name, result, start_time, default_state_dir, run_id=run_id
-                                )
-                                stage_durations[stage_name] = duration_ms
-
-                                # Apply deferred writes for RAN and SKIPPED stages
-                                if (
-                                    result["status"] in (StageStatus.RAN, StageStatus.SKIPPED)
-                                    and not no_commit
-                                ):
-                                    stage_info = self._get_stage(stage_name)
-                                    output_paths = [str(out.path) for out in stage_info["outs"]]
-                                    stage_state_dir = registry.get_stage_state_dir(
-                                        stage_info, default_state_dir
+                                try:
+                                    result = future.result()
+                                    duration_ms = await self._handle_stage_completion(
+                                        stage_name,
+                                        result,
+                                        start_time,
+                                        default_state_dir,
+                                        run_id=run_id,
                                     )
-                                    stage_db = _get_state_db(stage_state_dir)
-                                    executor_core.apply_deferred_writes(
-                                        stage_name, output_paths, result, stage_db
+                                    stage_durations[stage_name] = duration_ms
+
+                                    # Apply deferred writes for RAN and SKIPPED stages
+                                    if (
+                                        result["status"] in (StageStatus.RAN, StageStatus.SKIPPED)
+                                        and not no_commit
+                                    ):
+                                        stage_info = self._get_stage(stage_name)
+                                        output_paths = [str(out.path) for out in stage_info["outs"]]
+                                        stage_state_dir = registry.get_stage_state_dir(
+                                            stage_info, default_state_dir
+                                        )
+                                        stage_db = _get_state_db(stage_state_dir)
+                                        executor_core.apply_deferred_writes(
+                                            stage_name, output_paths, result, stage_db
+                                        )
+
+                                    # Record result
+                                    results[stage_name] = executor_core.ExecutionSummary(
+                                        status=result["status"],
+                                        reason=result["reason"],
+                                        input_hash=result["input_hash"],
                                     )
 
-                                # Record result
-                                results[stage_name] = executor_core.ExecutionSummary(
-                                    status=result["status"],
-                                    reason=result["reason"],
-                                    input_hash=result["input_hash"],
-                                )
+                                except Exception as e:
+                                    _logger.exception("Stage %s failed with exception", stage_name)
+                                    failed_result = StageResult(
+                                        status=StageStatus.FAILED,
+                                        reason=str(e),
+                                        input_hash=None,
+                                        output_lines=[],
+                                    )
+                                    duration_ms = await self._handle_stage_completion(
+                                        stage_name,
+                                        failed_result,
+                                        start_time,
+                                        default_state_dir,
+                                        run_id=run_id,
+                                    )
+                                    stage_durations[stage_name] = duration_ms
+                                    results[stage_name] = executor_core.ExecutionSummary(
+                                        status=StageStatus.FAILED,
+                                        reason=str(e),
+                                        input_hash=None,
+                                    )
 
-                            except Exception as e:
-                                _logger.exception("Stage %s failed with exception", stage_name)
-                                failed_result = StageResult(
-                                    status=StageStatus.FAILED,
-                                    reason=str(e),
-                                    input_hash=None,
-                                    output_lines=[],
-                                )
-                                duration_ms = await self._handle_stage_completion(
-                                    stage_name,
-                                    failed_result,
-                                    start_time,
-                                    default_state_dir,
-                                    run_id=run_id,
-                                )
-                                stage_durations[stage_name] = duration_ms
-                                results[stage_name] = executor_core.ExecutionSummary(
-                                    status=StageStatus.FAILED,
-                                    reason=str(e),
-                                    input_hash=None,
-                                )
-
-                        # Check error mode
-                        if on_error == OnError.FAIL:
-                            has_failed = any(
-                                s == StageExecutionState.COMPLETED
-                                and n in results
-                                and results[n]["status"] == StageStatus.FAILED
-                                for n, s in self._scheduler.stage_states.items()
-                            )
-                            if has_failed:
-                                first_failed = next(
-                                    n
-                                    for n, s in self._scheduler.stage_states.items()
-                                    if s == StageExecutionState.COMPLETED
+                            # Check error mode
+                            if on_error == OnError.FAIL:
+                                has_failed = any(
+                                    s == StageExecutionState.COMPLETED
                                     and n in results
                                     and results[n]["status"] == StageStatus.FAILED
+                                    for n, s in self._scheduler.stage_states.items()
                                 )
-                                blocked = self._scheduler.apply_fail_fast()
-                                for name, old_state in blocked:
+                                if has_failed:
+                                    first_failed = next(
+                                        n
+                                        for n, s in self._scheduler.stage_states.items()
+                                        if s == StageExecutionState.COMPLETED
+                                        and n in results
+                                        and results[n]["status"] == StageStatus.FAILED
+                                    )
+                                    blocked = self._scheduler.apply_fail_fast()
+                                    for name, old_state in blocked:
+                                        await self.emit(
+                                            StageStateChanged(
+                                                type="stage_state_changed",
+                                                stage=name,
+                                                state=StageExecutionState.BLOCKED,
+                                                previous_state=old_state,
+                                            )
+                                        )
+                                    # Emit skipped for all blocked stages not yet in results
+                                    for name, state in self._scheduler.stage_states.items():
+                                        if (
+                                            state == StageExecutionState.BLOCKED
+                                            and name not in results
+                                        ):
+                                            await self._emit_skipped_stage(
+                                                name,
+                                                f"upstream '{first_failed}' failed",
+                                                results,
+                                                run_id=run_id,
+                                            )
+
+                            # Check cancellation
+                            if self._cancel_event.is_set():
+                                cancelled = self._scheduler.apply_cancel()
+                                for name, old_state in cancelled:
                                     await self.emit(
                                         StageStateChanged(
                                             type="stage_state_changed",
                                             stage=name,
-                                            state=StageExecutionState.BLOCKED,
+                                            state=StageExecutionState.COMPLETED,
                                             previous_state=old_state,
                                         )
                                     )
-                                # Emit skipped for all blocked stages not yet in results
-                                for name, state in self._scheduler.stage_states.items():
-                                    if state == StageExecutionState.BLOCKED and name not in results:
-                                        await self._emit_skipped_stage(
-                                            name,
-                                            f"upstream '{first_failed}' failed",
-                                            results,
-                                            run_id=run_id,
-                                        )
-
-                        # Check cancellation
-                        if self._cancel_event.is_set():
-                            cancelled = self._scheduler.apply_cancel()
-                            for name, old_state in cancelled:
-                                await self.emit(
-                                    StageStateChanged(
-                                        type="stage_state_changed",
-                                        stage=name,
-                                        state=StageExecutionState.COMPLETED,
-                                        previous_state=old_state,
+                                    await self._emit_skipped_stage(
+                                        name, "cancelled", results, run_id=run_id
                                     )
+
+                            # Start more stages if slots available
+                            if not self._scheduler.stop_starting_new:
+                                await self._start_ready_stages(
+                                    cache_dir=cache_dir,
+                                    overrides=overrides,
+                                    checkout_modes=checkout_modes,
+                                    force=force,
+                                    no_commit=no_commit,
+                                    stage_start_times=stage_start_times,
+                                    run_id=run_id,
+                                    project_root=project_root,
+                                    state_dir=default_state_dir,
+                                    results=results,
+                                )
+
+                        # Diagnostic: log stages not in results after main loop
+                        missing_by_state: dict[str, list[str]] = {}
+                        for name, state in self._scheduler.stage_states.items():
+                            if name not in results:
+                                missing_by_state.setdefault(state.name, []).append(name)
+                        if missing_by_state:
+                            for state_name, stages in missing_by_state.items():
+                                _logger.debug(
+                                    "Stages not in results (state=%s): %s",
+                                    state_name,
+                                    stages[:10] if len(stages) > 10 else stages,
+                                )
+
+                        # Handle any blocked stages not yet processed
+                        for name, state in self._scheduler.stage_states.items():
+                            if state == StageExecutionState.BLOCKED and name not in results:
+                                failed_upstream = next(
+                                    (
+                                        n
+                                        for n, r in results.items()
+                                        if r["status"] == StageStatus.FAILED
+                                    ),
+                                    "unknown",
                                 )
                                 await self._emit_skipped_stage(
-                                    name, "cancelled", results, run_id=run_id
+                                    name,
+                                    f"upstream '{failed_upstream}' failed",
+                                    results,
+                                    run_id=run_id,
                                 )
 
-                        # Start more stages if slots available
-                        if not self._scheduler.stop_starting_new:
-                            await self._start_ready_stages(
-                                cache_dir=cache_dir,
-                                output_queue=output_queue,
-                                overrides=overrides,
-                                checkout_modes=checkout_modes,
-                                force=force,
-                                no_commit=no_commit,
-                                stage_start_times=stage_start_times,
-                                run_id=run_id,
-                                project_root=project_root,
-                                state_dir=default_state_dir,
-                            )
+                        # Send sentinel to stop blocking drain thread without blocking event loop.
+                        # Not redundant: this is the primary shutdown signal for the drain thread;
+                        # the finally sentinel below is the fallback for exception paths.
+                        with contextlib.suppress(queue.Full, OSError, BrokenPipeError):
+                            output_queue.put_nowait(None)
 
-                    # Diagnostic: log stages not in results after main loop
-                    missing_by_state: dict[str, list[str]] = {}
-                    for name, state in self._scheduler.stage_states.items():
-                        if name not in results:
-                            missing_by_state.setdefault(state.name, []).append(name)
-                    if missing_by_state:
-                        for state_name, stages in missing_by_state.items():
+                    finally:
+                        # Ensure drain thread can exit even on exception path.
+                        shutdown_event.set()
+                        try:
+                            output_queue.put_nowait(None)
+                        except (OSError, queue.Full) as exc:
                             _logger.debug(
-                                "Stages not in results (state=%s): %s",
-                                state_name,
-                                stages[:10] if len(stages) > 10 else stages,
+                                "Sentinel send failed (will rely on shutdown_event): %s", exc
                             )
-
-                    # Handle any blocked stages not yet processed
-                    for name, state in self._scheduler.stage_states.items():
-                        if state == StageExecutionState.BLOCKED and name not in results:
-                            failed_upstream = next(
-                                (
-                                    n
-                                    for n, r in results.items()
-                                    if r["status"] == StageStatus.FAILED
-                                ),
-                                "unknown",
-                            )
-                            await self._emit_skipped_stage(
-                                name, f"upstream '{failed_upstream}' failed", results, run_id=run_id
-                            )
-
-                    # Send sentinel to stop blocking drain thread without blocking event loop.
-                    # Not redundant: this is the primary shutdown signal for the drain thread;
-                    # the finally sentinel below is the fallback for exception paths.
-                    with contextlib.suppress(queue.Full, OSError, BrokenPipeError):
-                        output_queue.put_nowait(None)
-
-                finally:
-                    # Ensure drain thread can exit even on exception path.
-                    shutdown_event.set()
-                    try:
-                        output_queue.put_nowait(None)
-                    except (OSError, queue.Full) as exc:
-                        _logger.debug("Sentinel send failed (will rely on shutdown_event): %s", exc)
-                    with anyio.CancelScope(shield=True):
-                        for db in state_dbs.values():
-                            db.close()
-                        state_dbs.clear()
 
         finally:
+            # Close StateDBs first (lightweight), then shut down worker pool.
+            with anyio.CancelScope(shield=True):
+                for db in state_dbs.values():
+                    db.close()
+                state_dbs.clear()
+
             # WorkerPool shutdown handles executor + manager cleanup.
             # Must happen after sentinel send so drain thread exits first.
             # Wrapped in outer finally to ensure it always executes, even if task group raises.
-            if self._worker_pool is not None:  # pyright: ignore[reportUnnecessaryComparison] - defensive: start() may have failed
+            if self._worker_pool is not None:
                 worker_pool = self._worker_pool
                 self._worker_pool = None
                 try:
@@ -1282,10 +1302,16 @@ class Engine:
         """Check if stage is eligible to start (ready and mutex available)."""
         return self._scheduler.can_start(stage_name, running_count=len(self._futures))
 
+    def _ensure_worker_pool(self) -> worker_pool_mod.WorkerPool:
+        """Lazily create and start the worker pool on first worker dispatch."""
+        if self._worker_pool is None:
+            self._worker_pool = worker_pool_mod.WorkerPool()
+            self._worker_pool.start(max_workers=self._effective_max_workers)
+        return self._worker_pool
+
     async def _start_ready_stages(
         self,
         cache_dir: pathlib.Path,
-        output_queue: mp.Queue[OutputMessage],
         overrides: parameters.ParamsOverrides,
         checkout_modes: list[CheckoutMode],
         force: bool,
@@ -1294,9 +1320,10 @@ class Engine:
         run_id: str,
         project_root: pathlib.Path,
         state_dir: pathlib.Path,
+        results: dict[str, executor_core.ExecutionSummary],
     ) -> None:
         """Start all eligible stages up to max_workers."""
-        if self._worker_pool is None or self._scheduler.stop_starting_new:
+        if self._scheduler.stop_starting_new:
             return
 
         pipeline = self._require_pipeline()
@@ -1305,72 +1332,360 @@ class Engine:
         if max_to_start <= 0:
             return
 
-        for stage_name in list(self._scheduler.stage_states.keys()):
-            if started >= max_to_start:
-                break
+        # Shared read-only StateDBs for skip checks (one per state_dir).
+        # Closed after the loop to avoid repeated LMDB open/close per stage.
+        skip_state_dbs = dict[pathlib.Path, state_mod.StateDB]()
+        try:
+            for stage_name in list(self._scheduler.stage_states.keys()):
+                if started >= max_to_start:
+                    break
 
-            if not self._can_start_stage(stage_name):
-                continue
+                if self._cancel_event.is_set():
+                    break
 
-            # Acquire mutex locks (must happen before next can_start check)
-            self._scheduler.acquire_mutexes(stage_name)
-            started += 1
+                if not self._can_start_stage(stage_name):
+                    continue
 
-            # Transition to PREPARING
-            await self._set_stage_state(stage_name, StageExecutionState.PREPARING)
+                # Acquire mutex locks (must happen before next can_start check)
+                self._scheduler.acquire_mutexes(stage_name)
 
-            # Get stage info and prepare worker info
-            stage_info = self._get_stage(stage_name)
-            worker_info = executor_core.prepare_worker_info(
-                stage_info,
-                pipeline._registry,  # pyright: ignore[reportPrivateUsage]
-                overrides,
-                checkout_modes,
-                run_id,
-                force,
-                no_commit,
-                project_root,
-                default_state_dir=state_dir,
-            )
+                # Transition to PREPARING
+                await self._set_stage_state(stage_name, StageExecutionState.PREPARING)
 
-            # Submit to worker pool
-            future = self._worker_pool.submit(
-                worker.execute_stage,
-                stage_name,
-                worker_info,
-                cache_dir,
-                output_queue,
-            )
-            self._futures[future] = stage_name
+                stage_info = self._get_stage(stage_name)
 
-            # Record start time
-            stage_start_times[stage_name] = time.perf_counter()
+                try:
+                    skipped = await self._try_skip_in_coordinator(
+                        stage_name,
+                        stage_info,
+                        overrides,
+                        checkout_modes,
+                        force,
+                        cache_dir,
+                        state_dir,
+                        project_root,
+                        results,
+                        run_id,
+                        skip_state_dbs=skip_state_dbs,
+                    )
+                except Exception:
+                    _logger.debug(
+                        "Coordinator skip check failed for %s, dispatching to worker",
+                        stage_name,
+                        exc_info=True,
+                    )
+                    skipped = False
+                if skipped:
+                    continue
 
-            # Transition to RUNNING and emit StageStarted
-            await self._set_stage_state(stage_name, StageExecutionState.RUNNING)
-
-            # Compute explanation (why this stage will run) in a thread
-            # to avoid blocking the event loop with lock file I/O.
-            # Lazy import to avoid circular dependency (explain -> executor -> core).
-            explanation = await self._compute_explanation(
-                stage_name,
-                worker_info,
-                stage_info,
-                overrides,
-                force,
-            )
-
-            stage_index, total_stages = self._get_stage_index(stage_name)
-            await self.emit(
-                StageStarted(
-                    type="stage_started",
-                    stage=stage_name,
-                    index=stage_index,
-                    total=total_stages,
-                    run_id=run_id,
-                    explanation=explanation,
+                # Stage must run — lazily create pool on first dispatch
+                started += 1
+                pool = self._ensure_worker_pool()
+                worker_info = executor_core.prepare_worker_info(
+                    stage_info,
+                    pipeline._registry,  # pyright: ignore[reportPrivateUsage]
+                    overrides,
+                    checkout_modes,
+                    run_id,
+                    force,
+                    no_commit,
+                    project_root,
+                    default_state_dir=state_dir,
                 )
+
+                future = pool.submit(
+                    worker.execute_stage,
+                    stage_name,
+                    worker_info,
+                    cache_dir,
+                    pool.output_queue(),
+                )
+                self._futures[future] = stage_name
+
+                stage_start_times[stage_name] = time.perf_counter()
+
+                await self._set_stage_state(stage_name, StageExecutionState.RUNNING)
+
+                explanation = await self._compute_explanation(
+                    stage_name,
+                    worker_info,
+                    stage_info,
+                    overrides,
+                    force,
+                )
+
+                stage_index, total_stages = self._get_stage_index(stage_name)
+                await self.emit(
+                    StageStarted(
+                        type="stage_started",
+                        stage=stage_name,
+                        index=stage_index,
+                        total=total_stages,
+                        run_id=run_id,
+                        explanation=explanation,
+                    )
+                )
+        finally:
+            for db in skip_state_dbs.values():
+                db.close()
+
+    async def _try_skip_in_coordinator(
+        self,
+        stage_name: str,
+        stage_info: RegistryStageInfo,
+        overrides: parameters.ParamsOverrides,
+        checkout_modes: list[CheckoutMode],
+        force: bool,
+        cache_dir: pathlib.Path,
+        state_dir: pathlib.Path,
+        project_root: pathlib.Path,
+        results: dict[str, executor_core.ExecutionSummary],
+        run_id: str,
+        skip_state_dbs: dict[pathlib.Path, state_mod.StateDB] | None = None,
+    ) -> bool:
+        from pivot.storage import artifact_lock, lock
+
+        if force:
+            return False
+
+        stage_state_dir = registry.get_stage_state_dir(stage_info, state_dir)
+        files_cache_dir = cache_dir / "files"
+
+        def _read_lock() -> LockData | None:
+            stages_dir = lock.get_stages_dir(stage_state_dir)
+            stage_lock = lock.StageLock(stage_name, stages_dir)
+            return stage_lock.read()
+
+        lock_data = await anyio.to_thread.run_sync(_read_lock)
+        if lock_data is None:
+            return False
+
+        def _ensure_fingerprint() -> dict[str, str]:
+            pipeline = self._require_pipeline()
+            stage_registry = pipeline._registry  # pyright: ignore[reportPrivateUsage]
+            return stage_registry.ensure_fingerprint(stage_name)
+
+        current_fingerprint = await anyio.to_thread.run_sync(_ensure_fingerprint)
+
+        try:
+            current_params = parameters.get_effective_params(
+                stage_info["params"], stage_name, overrides
             )
+        except Exception:
+            return False
+
+        out_paths = stage_info["outs_paths"]
+        out_specs = [
+            (path, out.cache) for out, path in zip(stage_info["outs"], out_paths, strict=True)
+        ]
+
+        # Acquire artifact locks (READ on deps, WRITE on outs) to prevent
+        # concurrent pivot runs from racing during skip check + output restore.
+        await self._set_stage_state(stage_name, StageExecutionState.WAITING_ON_LOCK)
+
+        def _acquire_artifact_locks() -> artifact_lock.LockHandle:
+            lock_requests = artifact_lock.expand_lock_requests(
+                stage_info["deps_paths"], stage_info["outs"], project_root
+            )
+            lock_service = artifact_lock.LocalFlockLockService(stage_state_dir / "locks")
+            return lock_service.acquire_many(lock_requests)
+
+        lock_handle = await anyio.to_thread.run_sync(_acquire_artifact_locks)
+        await self._set_stage_state(stage_name, StageExecutionState.PREPARING)
+
+        try:
+            return await self._try_skip_with_locks(
+                stage_name,
+                stage_info,
+                lock_data,
+                current_fingerprint,
+                current_params,
+                out_paths,
+                out_specs,
+                checkout_modes,
+                files_cache_dir,
+                stage_state_dir,
+                state_dir,
+                results,
+                run_id,
+                skip_state_dbs,
+            )
+        finally:
+            lock_handle.release()
+
+    async def _try_skip_with_locks(
+        self,
+        stage_name: str,
+        stage_info: RegistryStageInfo,
+        lock_data: LockData,
+        current_fingerprint: dict[str, str],
+        current_params: dict[str, Any],
+        out_paths: list[str],
+        out_specs: list[tuple[str, bool]],
+        checkout_modes: list[CheckoutMode],
+        files_cache_dir: pathlib.Path,
+        stage_state_dir: pathlib.Path,
+        state_dir: pathlib.Path,
+        results: dict[str, executor_core.ExecutionSummary],
+        run_id: str,
+        skip_state_dbs: dict[pathlib.Path, state_mod.StateDB] | None,
+    ) -> bool:
+        """Perform skip detection while artifact locks are held."""
+        from pivot import run_history
+        from pivot import skip as skip_mod
+
+        def _get_skip_state_db() -> state_mod.StateDB:
+            state_db_path = stage_state_dir / "state.db"
+            if skip_state_dbs is not None:
+                if state_db_path not in skip_state_dbs:
+                    skip_state_dbs[state_db_path] = state_mod.StateDB(state_db_path, readonly=True)
+                return skip_state_dbs[state_db_path]
+            return state_mod.StateDB(state_db_path, readonly=True)
+
+        def _try_generation_skip() -> tuple[bool, str | None]:
+            state_db = _get_skip_state_db()
+            try:
+                can_skip = worker.can_skip_via_generation(
+                    stage_name=stage_name,
+                    fingerprint=current_fingerprint,
+                    deps=stage_info["deps_paths"],
+                    outs_paths=out_paths,
+                    current_params=current_params,
+                    lock_data=lock_data,
+                    state_db=state_db,
+                    verify_files=True,
+                )
+                if not can_skip:
+                    return False, None
+                deps_list = [
+                    DepEntry(path=path, hash=info["hash"])
+                    for path, info in lock_data["dep_hashes"].items()
+                ]
+                input_hash = run_history.compute_input_hash(
+                    current_fingerprint, current_params, deps_list, out_specs
+                )
+                restored = worker.restore_outputs_from_cache(
+                    stage_info["outs"],
+                    lock_data,
+                    files_cache_dir,
+                    checkout_modes,
+                    state_db=state_db,
+                    state_dir=stage_state_dir,
+                )
+                if not restored:
+                    return False, None
+                return True, input_hash
+            finally:
+                if skip_state_dbs is None:
+                    state_db.close()
+
+        skipped, generation_input_hash = await anyio.to_thread.run_sync(_try_generation_skip)
+        if skipped:
+            await self._record_skipped_stage(
+                stage_name,
+                "unchanged (generation)",
+                generation_input_hash,
+                state_dir,
+                results,
+                run_id=run_id,
+            )
+            return True
+
+        def _hash_deps() -> tuple[
+            dict[str, HashInfo], list[str], list[str], list[tuple[str, int, int, int, str]]
+        ]:
+            state_db = _get_skip_state_db()
+            try:
+                return worker.hash_dependencies(stage_info["deps_paths"], state_db)
+            finally:
+                if skip_state_dbs is None:
+                    state_db.close()
+
+        dep_hashes, missing, unreadable, _file_hash_entries = await anyio.to_thread.run_sync(
+            _hash_deps
+        )
+        if missing or unreadable:
+            return False
+
+        decision = skip_mod.check_stage(
+            lock_data,
+            current_fingerprint,
+            current_params,
+            dep_hashes,
+            out_paths,
+            explain=False,
+            force=False,
+        )
+        if decision["changed"]:
+            return False
+
+        deps_list = [DepEntry(path=path, hash=info["hash"]) for path, info in dep_hashes.items()]
+        input_hash = run_history.compute_input_hash(
+            current_fingerprint,
+            current_params,
+            deps_list,
+            out_specs,
+        )
+
+        def _restore_outputs() -> bool:
+            state_db = _get_skip_state_db()
+            try:
+                return worker.restore_outputs_from_cache(
+                    stage_info["outs"],
+                    lock_data,
+                    files_cache_dir,
+                    checkout_modes,
+                    state_db=state_db,
+                    state_dir=stage_state_dir,
+                )
+            finally:
+                if skip_state_dbs is None:
+                    state_db.close()
+
+        restored = await anyio.to_thread.run_sync(_restore_outputs)
+        if not restored:
+            return False
+
+        await self._record_skipped_stage(
+            stage_name,
+            "unchanged",
+            input_hash,
+            state_dir,
+            results,
+            run_id=run_id,
+        )
+        return True
+
+    async def _record_skipped_stage(
+        self,
+        stage_name: str,
+        reason: str,
+        input_hash: str | None,
+        state_dir: pathlib.Path,
+        results: dict[str, executor_core.ExecutionSummary],
+        *,
+        run_id: str,
+    ) -> None:
+        result = StageResult(
+            status=StageStatus.SKIPPED,
+            reason=reason,
+            input_hash=input_hash,
+            output_lines=[],
+        )
+        start_time = time.perf_counter()
+        _ = await self._handle_stage_completion(
+            stage_name,
+            result,
+            start_time,
+            state_dir,
+            run_id=run_id,
+        )
+
+        results[stage_name] = executor_core.ExecutionSummary(
+            status=result["status"],
+            reason=result["reason"],
+            input_hash=result["input_hash"],
+        )
 
     async def _compute_explanation(
         self,
