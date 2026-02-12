@@ -10,7 +10,7 @@ import pytest
 from pydantic import BaseModel
 
 from helpers import register_test_stage
-from pivot import exceptions, fingerprint, loaders, outputs, registry, stage_def
+from pivot import exceptions, fingerprint, loaders, outputs, path_policy, registry, stage_def
 from pivot.exceptions import ParamsError, ValidationError
 from pivot.pipeline.pipeline import Pipeline
 from pivot.registry import RegistryStageInfo, StageRegistry
@@ -1165,3 +1165,42 @@ def test_get_stage_state_dir_returns_default_when_none(set_project_root: pathlib
     result = registry.get_stage_state_dir(stage_info, default_dir)
 
     assert result == default_dir
+
+
+# =============================================================================
+# Symlink escape: cache checkout symlinks should be allowed
+# =============================================================================
+
+
+def test_normalize_paths_ignores_symlink_targets(
+    set_project_root: pathlib.Path,
+) -> None:
+    """_normalize_paths operates on logical paths, not filesystem state.
+
+    When an output path is a symlink (e.g., from cache checkout), normalization
+    should not resolve it. The declared path 'data/output.jsonl' is within the
+    project root — what it symlinks to on disk is irrelevant at registration time.
+    Symlink escape detection happens at execution time in stage_def.py.
+    """
+    project_root = set_project_root
+
+    # Create output file as symlink to a location outside the project
+    # (simulates cross-filesystem cache checkout with symlink mode)
+    external_target = project_root.parent / "external_cache" / "files" / "5b" / "ef87b62b372eca"
+    external_target.parent.mkdir(parents=True)
+    external_target.write_text("cached content")
+
+    out_dir = project_root / "data"
+    out_dir.mkdir(parents=True)
+    output_file = out_dir / "output.jsonl"
+    output_file.symlink_to(external_target)
+
+    # Should NOT raise — normalization checks the logical path, not the symlink target
+    result = registry._normalize_paths(
+        ["data/output.jsonl"],
+        path_policy.PathType.OUT,
+        registry.ValidationMode.ERROR,
+    )
+    expected = str(project_root / "data" / "output.jsonl")
+    assert len(result) == 1
+    assert result[0] == expected

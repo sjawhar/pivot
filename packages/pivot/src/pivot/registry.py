@@ -641,7 +641,13 @@ def _normalize_paths(
     """Normalize paths to canonical absolute form, applying policy-based validation.
 
     Uses canonicalize_artifact_path() for the core normalization, then applies
-    policy checks (project containment, symlink escape detection).
+    policy checks (e.g., project containment for outputs). Symlink resolution is
+    intentionally NOT done here — normalization operates on declared/logical
+    paths, not filesystem state.
+
+    Execution-time symlink escape checks are performed in stage_def.py when
+    writing outputs, as defense-in-depth. Dependency paths may legitimately
+    resolve outside the project root when allowed by the configured policy.
     """
     normalized = list[str]()
     project_root = project.get_project_root()
@@ -653,7 +659,7 @@ def _normalize_paths(
             norm_str = path_utils.canonicalize_artifact_path(path, project_root)
             norm_path = pathlib.Path(norm_str.rstrip("/"))
 
-            # Check if path is within project root
+            # Check if path is within project root (logical path check, no symlink resolution)
             is_within_project = norm_path.is_relative_to(project_root)
 
             if not is_within_project:
@@ -663,23 +669,6 @@ def _normalize_paths(
                         + f"which is outside project root '{project_root}'"
                     )
                 logger.warning(f"Absolute {path_type.value} path may break reproducibility: {path}")
-            else:
-                # Symlink escape check (for paths that exist)
-                if norm_path.exists() and project.contains_symlink_in_path(norm_path, project_root):
-                    resolved = norm_path.resolve()
-                    if not resolved.is_relative_to(project_root.resolve()):
-                        msg = (
-                            f"{path_type.value.capitalize()} path '{path}' resolves outside "
-                            + f"project via symlink: {resolved}"
-                        )
-                        if policy["symlink_escape_action"] == "error":
-                            raise exceptions.InvalidPathError(msg)
-                        logger.warning(msg)
-                    else:
-                        logger.warning(
-                            f"Path '{path}' is inside a symlinked directory. "
-                            + "This may affect portability across environments."
-                        )
 
             normalized.append(norm_str)
         except (ValueError, OSError, exceptions.InvalidPathError):

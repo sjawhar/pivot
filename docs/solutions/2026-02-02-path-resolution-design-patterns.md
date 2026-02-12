@@ -127,11 +127,25 @@ On Unix, `PurePosixPath("foo\\bar")` has one component `"foo\\bar"`, not two.
 
 **Solution:** Always use `PureWindowsPath` for parsing user input, then `.as_posix()` for internal use.
 
+## Invariant: Registration vs Execution Path Validation
+
+Path validation has two distinct phases with different responsibilities:
+
+| Phase | Validates | May call | Must NOT call |
+|-------|-----------|----------|---------------|
+| **Registration** (loading pipeline.py) | Declared/logical paths — syntax, containment, normalization | `normpath`, `is_relative_to` | `.resolve()`, `.exists()`, `.is_symlink()` |
+| **Execution** (running stages) | Filesystem reality — symlink escape, permissions, actual content | `.resolve()`, `.exists()` | N/A |
+
+**Why this matters:** Output files may be symlinks to the cache directory (created by a previous run with symlink checkout mode). If the cache is on a different filesystem (e.g., cross-filesystem worktrees with shared cache), those symlinks point outside the project root. Registration must not reject them — the declared path `data/output.jsonl` is inside the project regardless of what the file currently symlinks to on disk.
+
+**Execution-time defense-in-depth:** `stage_def.py:_validate_path_not_escaped()` checks symlink targets when writing outputs. This is the correct place for filesystem state validation.
+
 ## Prevention
 
 When designing path resolution:
 1. Decide early: implicit vs explicit prefix
 2. Keep resolution in one layer, don't thread through multiple modules
 3. Use `normpath` not `resolve` if symlinks should be preserved
-4. Test with symlinks pointing outside project root
-5. Test with Windows-style paths if accepting user input
+4. Never call `.resolve()`, `.exists()`, or `.is_symlink()` on artifact paths at registration time — see invariant above
+5. Test with symlinks pointing outside project root (especially cross-filesystem cache scenarios)
+6. Test with Windows-style paths if accepting user input

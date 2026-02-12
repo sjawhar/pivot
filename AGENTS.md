@@ -43,6 +43,7 @@ packages/pivot/src/pivot/
 - Type system (TypedDict, generics, Protocol)
 - Fingerprinting (what triggers re-runs)
 - LMDB/StateDB (prefixes, transactions)
+- Path resolution / symlinks (normpath vs resolve, registration vs execution validation)
 
 ---
 
