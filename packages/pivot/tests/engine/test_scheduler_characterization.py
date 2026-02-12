@@ -326,3 +326,41 @@ def test_initialize_validates_stage_mutex_consistency() -> None:
             graph=None,
             stage_mutex={"A": [], "C": []},  # Missing B, has extra C
         )
+
+
+def test_cascade_failure_blocks_all_transitive_downstream() -> None:
+    """When A fails, both B (direct) and C (transitive) get BLOCKED."""
+    scheduler = _helper_init_scheduler(
+        execution_order=["A", "B", "C"],
+        edges=[("A", "B"), ("B", "C")],
+    )
+
+    scheduler.set_state("A", StageExecutionState.COMPLETED)
+    _newly_ready, newly_blocked = scheduler.on_stage_completed("A", failed=True)
+
+    assert scheduler.get_state("B") == StageExecutionState.BLOCKED, (
+        "B (direct downstream) should be BLOCKED"
+    )
+    assert scheduler.get_state("C") == StageExecutionState.BLOCKED, (
+        "C (transitive downstream) should also be BLOCKED"
+    )
+    blocked_names = {name for name, _ in newly_blocked}
+    assert "B" in blocked_names
+    assert "C" in blocked_names
+
+
+def test_initialize_resets_stop_starting_new() -> None:
+    """initialize() resets stop_starting_new after fail-fast or cancel."""
+    scheduler = _helper_init_scheduler(execution_order=["stage"])
+    scheduler.apply_fail_fast()
+    assert scheduler.stop_starting_new is True, "fail-fast should set stop_starting_new"
+
+    # Re-initialize should reset
+    scheduler.initialize(
+        execution_order=["stage"],
+        graph=None,
+        stage_mutex={"stage": []},
+    )
+    assert scheduler.stop_starting_new is False, (
+        "initialize() should reset stop_starting_new for watch-mode re-runs"
+    )

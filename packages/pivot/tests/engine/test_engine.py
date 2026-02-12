@@ -46,6 +46,36 @@ class _MockAsyncSink:
         self.closed = True
 
 
+# Shared mutable state for deferred-event test helpers.
+# Reset via the _reset_deferred_test_state fixture below.
+_deferred_call_log: list[str] = []
+_deferred_infinite_count: int = 0
+_deferred_multi_count: int = 0
+
+
+@pytest.fixture(autouse=False)
+def _reset_deferred_test_state() -> None:
+    """Reset shared state used by deferred-event test helpers."""
+    global _deferred_infinite_count, _deferred_multi_count
+    _deferred_call_log.clear()
+    _deferred_infinite_count = 0
+    _deferred_multi_count = 0
+
+
+async def _helper_multi_level_defer(engine: Engine, event: InputEvent) -> None:
+    """Module-level handler that defers for 3 levels then stops."""
+    global _deferred_multi_count
+    _deferred_multi_count += 1
+    if _deferred_multi_count < 4:
+        engine._defer_event_for_stage(
+            "stage_a",
+            DataArtifactChanged(
+                type="data_artifact_changed",
+                paths=[f"level{_deferred_multi_count}.csv"],
+            ),
+        )
+
+
 @pytest.mark.anyio
 async def test_engine_initial_state_is_idle() -> None:
     """Engine starts in IDLE state."""
@@ -285,11 +315,11 @@ async def test_engine_should_filter_path_returns_false_for_input_artifacts(
 
 
 @pytest.mark.anyio
-async def test_engine_get_affected_stages_for_path_returns_empty_without_graph() -> None:
-    """_get_affected_stages_for_path() returns empty list when graph is None."""
+async def test_engine_get_affected_stages_for_paths_returns_empty_without_graph() -> None:
+    """_get_affected_stages_for_paths() returns empty list when graph is None."""
     async with Engine() as engine:
         assert engine._graph is None
-        assert engine._get_affected_stages_for_path(pathlib.Path("any/path.csv")) == []
+        assert engine._get_affected_stages_for_paths([pathlib.Path("any/path.csv")]) == []
 
 
 @pytest.mark.anyio
@@ -976,13 +1006,10 @@ async def test_engine_handle_data_artifact_changed_does_not_restart_workers(
         assert len(restart_calls) == 0, "Data changes should NOT restart workers"
 
 
-_deferred_event_call_log: list[str] = []
-
-
 async def _helper_tracking_handle_with_redeferral(engine: Engine, event: InputEvent) -> None:
     """Module-level handler that defers one additional event on first call."""
-    _deferred_event_call_log.append(event["type"])
-    if len(_deferred_event_call_log) == 1:
+    _deferred_call_log.append(event["type"])
+    if len(_deferred_call_log) == 1:
         engine._defer_event_for_stage(
             "stage_a",
             DataArtifactChanged(type="data_artifact_changed", paths=["nested.csv"]),
@@ -990,12 +1017,11 @@ async def _helper_tracking_handle_with_redeferral(engine: Engine, event: InputEv
 
 
 @pytest.mark.anyio
+@pytest.mark.usefixtures("_reset_deferred_test_state")
 async def test_deferred_events_during_processing_are_not_lost(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """If handling a deferred event defers another for the same stage, both are processed."""
-    _deferred_event_call_log.clear()
-
     async with Engine() as engine:
         monkeypatch.setattr(
             engine,
@@ -1011,19 +1037,16 @@ async def test_deferred_events_during_processing_are_not_lost(
 
         await engine._process_deferred_events("stage_a")
 
-        assert len(_deferred_event_call_log) == 2, (
-            f"Expected 2 events processed, got {len(_deferred_event_call_log)}"
+        assert len(_deferred_call_log) == 2, (
+            f"Expected 2 events processed, got {len(_deferred_call_log)}"
         )
         assert "stage_a" not in engine._deferred_events, "No leftover deferred events"
 
 
-_infinite_defer_count: int = 0
-
-
 async def _helper_infinite_defer_handle(engine: Engine, event: InputEvent) -> None:
     """Module-level handler that always defers another event — simulates infinite loop."""
-    global _infinite_defer_count
-    _infinite_defer_count += 1
+    global _deferred_infinite_count
+    _deferred_infinite_count += 1
     engine._defer_event_for_stage(
         "stage_a",
         DataArtifactChanged(type="data_artifact_changed", paths=["loop.csv"]),
@@ -1031,13 +1054,11 @@ async def _helper_infinite_defer_handle(engine: Engine, event: InputEvent) -> No
 
 
 @pytest.mark.anyio
+@pytest.mark.usefixtures("_reset_deferred_test_state")
 async def test_deferred_events_max_iterations_guard_emits_diagnostic(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Infinite deferral loop is caught by guard; diagnostic event emitted, events dropped."""
-    global _infinite_defer_count
-    _infinite_defer_count = 0
-
     emitted_events: list[OutputEvent] = []
 
     async def _capture_emit(event: OutputEvent) -> None:
@@ -1062,8 +1083,8 @@ async def test_deferred_events_max_iterations_guard_emits_diagnostic(
         await engine._process_deferred_events("stage_a")
 
         # Guard stopped iteration at max
-        assert _infinite_defer_count == engine._DEFERRED_MAX_ITERATIONS, (
-            f"Expected {engine._DEFERRED_MAX_ITERATIONS} iterations, got {_infinite_defer_count}"
+        assert _deferred_infinite_count == engine._DEFERRED_MAX_ITERATIONS, (
+            f"Expected {engine._DEFERRED_MAX_ITERATIONS} iterations, got {_deferred_infinite_count}"
         )
 
         # Diagnostic event emitted
@@ -1072,3 +1093,29 @@ async def test_deferred_events_max_iterations_guard_emits_diagnostic(
         diag: EngineDiagnostic = diagnostics[0]
         assert "stage_a" in diag["message"], "Diagnostic should name the stage"
         assert "stage_a" not in engine._deferred_events, "Remaining events should be dropped"
+
+
+@pytest.mark.anyio
+@pytest.mark.usefixtures("_reset_deferred_test_state")
+async def test_deferred_events_multi_level_redeferral(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify while-loop processes multiple levels of re-deferral (not just 1)."""
+    async with Engine() as engine:
+        monkeypatch.setattr(
+            engine,
+            "_handle_input_event",
+            lambda event: _helper_multi_level_defer(engine, event),  # pyright: ignore[reportUnknownLambdaType,reportUnknownArgumentType] - monkeypatch lambda
+        )
+
+        engine._defer_event_for_stage(
+            "stage_a",
+            DataArtifactChanged(type="data_artifact_changed", paths=["seed.csv"]),
+        )
+
+        await engine._process_deferred_events("stage_a")
+
+        assert _deferred_multi_count == 4, (  # type: ignore[comparison-overlap] - mutated by async handler
+            f"Expected 4 events processed (seed + 3 levels), got {_deferred_multi_count}"
+        )
+        assert "stage_a" not in engine._deferred_events, "No leftover deferred events"

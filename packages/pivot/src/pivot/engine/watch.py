@@ -73,7 +73,7 @@ class WatchCoordinator:
     def get_affected_stages(self, paths: list[pathlib.Path]) -> list[str]:
         """Get all stages affected by the given path changes (including downstream).
 
-        Deduplicates across paths. Returns a list (order is not guaranteed).
+        Deduplicates across paths. Returns a sorted list for deterministic ordering.
         """
         affected = set[str]()
         for path in paths:
@@ -82,7 +82,7 @@ class WatchCoordinator:
             for stage in consumers:
                 downstream = engine_graph.get_downstream_stages(self._graph, stage)
                 affected.update(downstream)
-        return list(affected)
+        return sorted(affected)
 
     def get_producer(self, path: pathlib.Path) -> str | None:
         """Get the stage that produces a given artifact path."""

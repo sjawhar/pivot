@@ -58,6 +58,12 @@ class ConsoleSink:
                     self._console.print(f"[red]\\[{stage}][/red] [red]{line}[/red]")
                 else:
                     self._console.print(f"\\[{stage}] {line}")
+            case "engine_diagnostic":
+                msg = rich.markup.escape(event["message"])
+                detail = rich.markup.escape(event["detail"]) if event["detail"] else ""
+                self._console.print(f"[yellow bold]⚠ Engine diagnostic:[/yellow bold] {msg}")
+                if detail:
+                    self._console.print(f"  [dim]{detail}[/dim]")
             case _:
                 pass  # Ignore other events
 

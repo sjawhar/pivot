@@ -23,7 +23,7 @@ from pivot import config, exceptions, fingerprint, parameters, project, registry
 from pivot.engine import agent_rpc
 from pivot.engine import graph as engine_graph
 from pivot.engine import scheduler as engine_scheduler
-from pivot.engine import watch as watch_mod
+from pivot.engine import watch as engine_watch
 from pivot.engine import worker_pool as worker_pool_mod
 from pivot.engine.types import (
     CodeOrConfigChanged,
@@ -132,6 +132,7 @@ class Engine:
 
     # Orchestration state
     _graph: nx.DiGraph[str] | None
+    _watch_coordinator: engine_watch.WatchCoordinator | None
     _scheduler: engine_scheduler.Scheduler
     _cancel_event: anyio.Event
     _stage_indices: dict[str, tuple[int, int]]
@@ -179,7 +180,7 @@ class Engine:
 
         # Orchestration state
         self._graph = None
-        self._watch_coordinator: watch_mod.WatchCoordinator | None = None
+        self._watch_coordinator = None
         self._scheduler = engine_scheduler.Scheduler()
         self._cancel_event = anyio.Event()
         self._stage_indices = dict[str, tuple[int, int]]()
@@ -1500,8 +1501,13 @@ class Engine:
             )
         )
 
-        # Release mutex locks
-        self._scheduler.release_mutexes(stage_name)
+        # Release mutex locks — guard against underflow to prevent exception
+        # propagating into _orchestrate_execution's try/except, which would call
+        # _handle_stage_completion again and corrupt scheduler state.
+        try:
+            self._scheduler.release_mutexes(stage_name)
+        except ValueError:
+            _logger.error("Mutex underflow releasing locks for stage %s", stage_name)
 
         failed = result["status"] == StageStatus.FAILED
         newly_ready, newly_blocked = self._scheduler.on_stage_completed(stage_name, failed)
@@ -1769,7 +1775,7 @@ class Engine:
         )
         await self._handle_run_requested(event)
 
-    def _get_watch_coordinator(self) -> watch_mod.WatchCoordinator | None:
+    def _get_watch_coordinator(self) -> engine_watch.WatchCoordinator | None:
         """Lazily create/update WatchCoordinator from current graph.
 
         This ensures existing tests that set engine._graph directly still work
@@ -1777,8 +1783,8 @@ class Engine:
         """
         if self._graph is None:
             return None
-        if not hasattr(self, "_watch_coordinator") or self._watch_coordinator is None:
-            self._watch_coordinator = watch_mod.WatchCoordinator(self._graph)
+        if self._watch_coordinator is None:
+            self._watch_coordinator = engine_watch.WatchCoordinator(self._graph)
         elif self._watch_coordinator.graph is not self._graph:
             self._watch_coordinator.graph = self._graph
         return self._watch_coordinator
@@ -1833,29 +1839,19 @@ class Engine:
             )
         )
 
-    def _get_affected_stages_for_path(self, path: pathlib.Path) -> list[str]:
-        """Get stages affected by a path change using bipartite graph."""
+    def _get_affected_stages_for_paths(self, filtered_paths: list[pathlib.Path]) -> list[str]:
+        """Get all stages affected by multiple path changes (including downstream).
+
+        Args:
+            filtered_paths: Paths that have already been filtered through
+                ``_should_filter_path`` to exclude executing-stage outputs.
+        """
         coordinator = self._get_watch_coordinator()
         if coordinator is None:
             return []
-        return coordinator.get_affected_stages([path])
-
-    def _get_affected_stages_for_paths(self, paths: list[pathlib.Path]) -> list[str]:
-        """Get all stages affected by multiple path changes (including downstream)."""
-        coordinator = self._get_watch_coordinator()
-        if coordinator is None:
+        if not filtered_paths:
             return []
-
-        filtered = list[pathlib.Path]()
-        for path in paths:
-            if self._should_filter_path(path):
-                _logger.debug("Filtering event for %s (output of executing stage)", path)
-                continue
-            filtered.append(path)
-
-        if not filtered:
-            return []
-        return coordinator.get_affected_stages(filtered)
+        return coordinator.get_affected_stages(filtered_paths)
 
     # =========================================================================
     # Registry Reload
@@ -1866,8 +1862,7 @@ class Engine:
         linecache.clearcache()
         importlib.invalidate_caches()
         self._graph = None
-        if hasattr(self, "_watch_coordinator"):
-            self._watch_coordinator = None
+        self._watch_coordinator = None
         if self._pipeline is not None:
             self._pipeline.invalidate_dag_cache()
 
