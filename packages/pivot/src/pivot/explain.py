@@ -7,102 +7,29 @@ showing specific code, param, and dependency changes.
 from __future__ import annotations
 
 import pathlib
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING
 
 import pydantic
 
-from pivot import parameters, project
+from pivot import parameters, project, skip
 from pivot.executor import worker
 from pivot.storage import lock, state
 from pivot.types import (
-    ChangeType,
-    CodeChange,
-    DepChange,
     HashInfo,
-    ParamChange,
     StageExplanation,
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
     from pathlib import Path
 
     import pygtrie
 
     from pivot.storage.track import PvtData
 
-
-T = TypeVar("T")
-C = TypeVar("C")
-
-
-def _diff_dicts(
-    old: dict[str, T],
-    new: dict[str, T],
-    make_change: Callable[[str, T | None, T | None, ChangeType], C],
-) -> list[C]:
-    """Generic dict differ that produces typed change objects."""
-    changes = list[C]()
-    all_keys = set(old.keys()) | set(new.keys())
-
-    for key in sorted(all_keys):
-        in_old = key in old
-        in_new = key in new
-
-        if not in_old:
-            changes.append(make_change(key, None, new[key], ChangeType.ADDED))
-        elif not in_new:
-            changes.append(make_change(key, old[key], None, ChangeType.REMOVED))
-        elif old[key] != new[key]:
-            changes.append(make_change(key, old[key], new[key], ChangeType.MODIFIED))
-
-    return changes
-
-
-def diff_code_manifests(old: dict[str, str], new: dict[str, str]) -> list[CodeChange]:
-    """Diff two code manifests, returning list of changes."""
-    return _diff_dicts(
-        old,
-        new,
-        lambda k, o, n, t: CodeChange(key=k, old_hash=o, new_hash=n, change_type=t),
-    )
-
-
-def diff_params(old: dict[str, Any], new: dict[str, Any]) -> list[ParamChange]:
-    """Diff two param dicts, returning list of changes."""
-    return _diff_dicts(
-        old,
-        new,
-        lambda k, o, n, t: ParamChange(key=k, old_value=o, new_value=n, change_type=t),
-    )
-
-
-def _extract_hash(info: HashInfo) -> str:
-    """Extract hash from HashInfo (FileHash or DirHash)."""
-    return info["hash"]
-
-
-def diff_dep_hashes(old: dict[str, HashInfo], new: dict[str, HashInfo]) -> list[DepChange]:
-    """Diff two dep_hashes dicts, returning list of changes.
-
-    Paths in the result are relative to project root for user-facing display.
-    """
-
-    def make_dep_change(
-        path: str,
-        old_info: HashInfo | None,
-        new_info: HashInfo | None,
-        change_type: ChangeType,
-    ) -> DepChange:
-        old_hash = _extract_hash(old_info) if old_info else None
-        new_hash = _extract_hash(new_info) if new_info else None
-        # Convert absolute paths to relative for user-facing output
-        rel_path = project.to_relative_path(path)
-        return DepChange(
-            path=rel_path, old_hash=old_hash, new_hash=new_hash, change_type=change_type
-        )
-
-    return _diff_dicts(old, new, make_dep_change)
+# Re-exports for backward compatibility (tests reference these)
+diff_code_manifests = skip.diff_code_manifests
+diff_params = skip.diff_params
+diff_dep_hashes = skip.diff_dep_hashes
 
 
 def _find_tracked_ancestor(dep: Path, tracked_trie: pygtrie.Trie[str]) -> Path | None:
@@ -290,37 +217,23 @@ def get_stage_explanation(
             upstream_stale=[],
         )
 
-    # Extract lock data fields (LockData has all required keys after _convert_from_storage_format)
-    old_manifest = lock_data["code_manifest"]
-    old_params = lock_data["params"]
-    old_dep_hashes = lock_data["dep_hashes"]
-
-    # lock.StageLock.read() already converts paths to absolute
-    code_changes = diff_code_manifests(old_manifest, fingerprint)
-    param_changes = diff_params(old_params, current_params)
-    dep_changes = diff_dep_hashes(old_dep_hashes, dep_hashes)
-
-    has_changes = bool(code_changes or param_changes or dep_changes)
-    will_run = has_changes or force
-
-    if force and not has_changes:
-        reason = "forced"
-    elif code_changes:
-        reason = "Code changed"
-    elif param_changes:
-        reason = "Params changed"
-    elif dep_changes:
-        reason = "Input dependencies changed"
-    else:
-        reason = ""
+    decision = skip.check_stage(
+        lock_data=lock_data,
+        fingerprint=fingerprint,
+        params=current_params,
+        dep_hashes=dep_hashes,
+        out_paths=outs_paths,
+        explain=True,
+        force=force,
+    )
 
     return StageExplanation(
         stage_name=stage_name,
-        will_run=will_run,
+        will_run=decision["changed"],
         is_forced=force,
-        reason=reason,
-        code_changes=code_changes,
-        param_changes=param_changes,
-        dep_changes=dep_changes,
+        reason=decision["reason"],
+        code_changes=decision.get("code_changes", []),
+        param_changes=decision.get("param_changes", []),
+        dep_changes=decision.get("dep_changes", []),
         upstream_stale=[],
     )

@@ -343,6 +343,20 @@ class OutputChange(TypedDict):
     output_type: Literal["out", "metric", "plot"]
 
 
+class ChangeDecision(TypedDict, total=False):
+    """Result of skip detection check_stage().
+
+    In fast mode (explain=False), detail fields are omitted (not present).
+    In explain mode (explain=True), they contain the full diff information.
+    """
+
+    changed: Required[bool]
+    reason: Required[str]
+    code_changes: list[CodeChange]
+    param_changes: list[ParamChange]
+    dep_changes: list[DepChange]
+
+
 class StageExplanation(TypedDict, total=False):
     """Detailed explanation of why a stage would run."""
 

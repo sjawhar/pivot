@@ -14,6 +14,7 @@ from pydantic import BaseModel, ValidationError, field_validator
 
 from pivot import explain as explain_mod
 from pivot import parameters
+from pivot import registry as registry_mod
 from pivot.config import io as config_io
 from pivot.engine.types import CancelRequested, EngineState, OutputEvent, RunRequested
 from pivot.types import DataDiffResult, OnError, StageExplanation
@@ -297,7 +298,9 @@ class AgentRpcHandler:
                         outs_paths=reg_info["outs_paths"],
                         params_instance=reg_info["params"],
                         overrides=overrides,
-                        state_dir=config_io.get_state_dir(),
+                        state_dir=registry_mod.get_stage_state_dir(
+                            reg_info, config_io.get_state_dir()
+                        ),
                     )
 
                 return await anyio.to_thread.run_sync(_get_explanation)  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType, reportUnknownVariableType] - anyio stub issue
