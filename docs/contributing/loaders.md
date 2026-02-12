@@ -259,7 +259,7 @@ To add a loader to Pivot's built-in set:
 
 1. Add to `src/pivot/loaders.py`
 2. Export in `__all__`
-3. Add documentation to `docs/reference/dependencies.md`
+3. Add documentation to `docs/concepts/dependencies.md`
 4. Add tests
 
 ## Checklist
@@ -275,5 +275,5 @@ To add a loader to Pivot's built-in set:
 
 ## See Also
 
-- [Dependencies & Loaders](../reference/dependencies.md) - Using loaders
+- [Dependencies](../concepts/dependencies.md) - Using dependencies and loaders
 - [Code Style](style.md) - Coding conventions

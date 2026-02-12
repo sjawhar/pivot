@@ -61,4 +61,4 @@ pivot --help
 ## Next Steps
 
 - [Quick Start Tutorial](quickstart.md) - Build your first pipeline
-- [Tutorials](../tutorial/watch.md) - Watch mode, parameters, CI integration
+- [Guides](../guides/watch-mode.md) - Watch mode, multi-pipeline projects, remote storage, CI

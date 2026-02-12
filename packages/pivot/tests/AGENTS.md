@@ -139,6 +139,10 @@ All fingerprint tests live in `tests/fingerprint/`. Before modifying fingerprint
 
 ---
 
+## S3 Tests
+
+Use `moto` for S3 testing, not manual mocks. Reuse existing fixtures — don't duplicate them.
+
 ## Debugging
 
 ```bash

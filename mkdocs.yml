@@ -66,36 +66,38 @@ nav:
   - Getting Started:
     - Installation: getting-started/installation.md
     - Quick Start: getting-started/quickstart.md
-  - Tutorials:
-    - Watch Mode & Rapid Iteration: tutorial/watch.md
-    - Parameters & Experiments: tutorial/parameters.md
-    - Multi-Pipeline Projects: tutorial/multi-pipeline.md
-    - Remote Storage & CI: tutorial/remote.md
-  - Reference:
-    - Defining Pipelines: reference/pipelines.md
-    - Pipeline Discovery: reference/discovery.md
-    - Dependencies & Loaders: reference/dependencies.md
-    - Outputs & Caching: reference/outputs.md
-    - Parameters: reference/parameters.md
-    - Matrix Stages: reference/matrix.md
-    - Watch Mode: reference/watch.md
-    - Configuration: reference/configuration.md
+  - Concepts:
+    - concepts/index.md
+    - Artifacts & the DAG: concepts/artifacts-and-dag.md
+    - Dependencies: concepts/dependencies.md
+    - Outputs: concepts/outputs.md
+    - Loaders: concepts/loaders.md
+    - Parameters: concepts/parameters.md
+    - Pipelines: concepts/pipelines.md
+    - Fingerprinting: concepts/fingerprinting.md
+    - Caching & Skip Detection: concepts/caching.md
+  - Guides:
+    - Cross-Repo Import: guides/cross-repo-import.md
+    - Watch Mode: guides/watch-mode.md
+    - Multi-Pipeline Projects: guides/multi-pipeline.md
+    - Remote Storage: guides/remote-storage.md
+    - CI Integration: guides/ci-integration.md
+    - TUI: guides/tui.md
+    - Migrating from DVC: migrating-from-dvc.md
   - CLI Reference: cli/index.md
   - API Reference: reference/
-  - Troubleshooting: troubleshooting/index.md
-  - Migrating from DVC: migrating-from-dvc.md
+  - Comparison: comparison.md
   - Architecture:
     - Overview: architecture/overview.md
     - Code Tour: architecture/code-tour.md
     - Fingerprinting: architecture/fingerprinting.md
     - Execution Model: architecture/execution.md
+    - Engine: architecture/engine.md
     - Watch Engine: architecture/watch.md
     - TUI: architecture/tui.md
     - Agent Server: architecture/agent-server.md
-  - Design Decisions:
-    - design/index.md
-    - Watch Engine Design: design/watch-engine.md
-    - Hot Reload Exploration: design/hot-reload-exploration.md
+  - Design Decisions: design/index.md
+  - Solutions: solutions/index.md
   - Contributing:
     - Getting Started: contributing/setup.md
     - Code Style: contributing/style.md
@@ -105,7 +107,6 @@ nav:
     - Common Gotchas: contributing/gotchas.md
   - Prevention Strategies:
     - TypedDict Field Synchronization: prevention/typeddictfield-synchronization.md
-  - Comparison: comparison.md
 
 markdown_extensions:
   - pymdownx.highlight:

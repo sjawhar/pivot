@@ -138,8 +138,8 @@ In the examples above, `Dep()` and `Out()` take a loader like `loaders.CSV()` or
 
 ## Next Steps
 
-- [Watch Mode & Rapid Iteration](../tutorial/watch.md) - Develop faster with auto-rerun
-- [Defining Pipelines](../reference/pipelines.md) - Deep dive into stage definition
-- [Output Types](../reference/outputs.md) - Learn about outputs, metrics, and plots
+- [Watch Mode & Rapid Iteration](../guides/watch-mode.md) - Develop faster with auto-rerun
+- [Pipelines](../concepts/pipelines.md) - Deep dive into stage definition
+- [Outputs](../concepts/outputs.md) - Learn about outputs, metrics, and plots
 
 > **Project Structure**: For larger projects, consider using [Cookiecutter Data Science](https://cookiecutter-data-science.drivendata.org/) as a starting template. Its `data/raw/`, `data/processed/`, and `src/` layout works well with Pivot.

@@ -18,16 +18,15 @@ import pathlib
 from typing import Annotated, TypedDict
 
 import pandas
-from pivot import loaders, outputs
-from pivot.pipeline import Pipeline
+import pivot
 
 
 class PreprocessOutputs(TypedDict):
-    clean: Annotated[pathlib.Path, outputs.Out("processed.parquet", loaders.PathOnly())]
+    clean: Annotated[pathlib.Path, pivot.Out("processed.parquet", pivot.loaders.PathOnly())]
 
 
 def preprocess(
-    raw: Annotated[pandas.DataFrame, outputs.Dep("data.csv", loaders.CSV())],
+    raw: Annotated[pandas.DataFrame, pivot.Dep("data.csv", pivot.loaders.CSV())],
 ) -> PreprocessOutputs:
     df = raw.dropna()
     out_path = pathlib.Path("processed.parquet")
@@ -36,11 +35,11 @@ def preprocess(
 
 
 class TrainOutputs(TypedDict):
-    model: Annotated[pathlib.Path, outputs.Out("model.pkl", loaders.PathOnly())]
+    model: Annotated[pathlib.Path, pivot.Out("model.pkl", pivot.loaders.PathOnly())]
 
 
 def train(
-    data: Annotated[pathlib.Path, outputs.Dep("processed.parquet", loaders.PathOnly())],
+    data: Annotated[pathlib.Path, pivot.Dep("processed.parquet", pivot.loaders.PathOnly())],
 ) -> TrainOutputs:
     df = pandas.read_parquet(data)
     model_path = pathlib.Path("model.pkl")
@@ -49,7 +48,7 @@ def train(
 
 
 # Register stages - Pivot discovers deps/outs from annotations
-pipeline = Pipeline("my_pipeline")
+pipeline = pivot.Pipeline("my_pipeline")
 pipeline.register(preprocess)
 pipeline.register(train)
 ```
@@ -72,7 +71,7 @@ def normalize(x):
     return x / x.max()  # Change this...
 
 def process(
-    data: Annotated[pandas.DataFrame, outputs.Dep("data.csv", loaders.CSV())],
+    data: Annotated[pandas.DataFrame, pivot.Dep("data.csv", pivot.loaders.CSV())],
 ) -> ProcessOutputs:
     return {"result": normalize(data)}  # ...and Pivot re-runs process
 ```
@@ -116,20 +115,18 @@ See the [Quick Start](getting-started/quickstart.md) to build your first pipelin
 - Python 3.13+
 - Unix only (Linux/macOS)
 
-!!! note "Loaders and Protocols"
-    `Dep()` accepts any `Reader[R]` and `Out()` accepts any `Writer[W]`. Built-in loaders like `CSV()` and `PathOnly()` implement both protocols.
-
 ## Learn More
 
-- [Tutorials](tutorial/watch.md) - Watch mode, parameters, CI integration
-- [Multi-Pipeline Projects](tutorial/multi-pipeline.md) - Organize larger codebases with automatic cross-pipeline discovery
-- [Reference](reference/pipelines.md) - Complete documentation by task
-- [Migrating from DVC](migrating-from-dvc.md) - Step-by-step migration guide
-- [Architecture](architecture/overview.md) - Design decisions and internals
-- [Comparison](comparison.md) - How Pivot compares to DVC, Prefect, Dagster
+**Start here:** Follow the [Concepts](concepts/index.md) guide — a linear learning path from
+first principles to advanced caching.
 
-## Roadmap
+Then explore task-oriented [Guides](guides/watch-mode.md) for specific workflows:
+- [Watch Mode](guides/watch-mode.md) — Rapid iteration
+- [Multi-Pipeline Projects](guides/multi-pipeline.md) — Large project organization
+- [Remote Storage](guides/remote-storage.md) — Share cache across machines
+- [CI Integration](guides/ci-integration.md) — Pipeline verification in CI
 
-- **Web UI** - DAG visualization and execution monitoring
-- **Additional remotes** - GCS, Azure, SSH
-- **Cloud orchestration** - Integration with cloud schedulers
+**Reference:**
+- [CLI Reference](cli/index.md) — All commands and options
+- [Architecture](architecture/overview.md) — For contributors
+- [Comparison with DVC](comparison.md) — Feature comparison

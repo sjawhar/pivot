@@ -6,14 +6,14 @@ Quick reference for common issues. Each links to detailed solutions in the relev
 
 | Issue | Solution Location |
 |-------|-------------------|
-| Stage reruns unexpectedly | [Outputs & Caching](../reference/outputs.md#stage-reruns-unexpectedly) |
-| Stage runs but output not cached | [Outputs & Caching](../reference/outputs.md#stage-runs-but-output-not-cached) |
-| "Cannot pickle..." errors | [Defining Pipelines](../reference/pipelines.md#function-requirements) |
-| Parameters not taking effect | [Parameters](../reference/parameters.md#troubleshooting) |
-| Watch mode not detecting changes | [Watch Mode](../reference/watch.md#troubleshooting) |
-| Lambda causes unnecessary re-runs | [Watch Mode](../reference/watch.md#lambda-causes-unnecessary-re-runs) |
-| Remote push/pull fails | [Configuration](../reference/configuration.md#troubleshooting) |
-| CI fails but local passes | [Configuration](../reference/configuration.md#ci-fails-but-local-passes) |
+| Stage reruns unexpectedly | [Caching & Skip Detection](../concepts/caching.md) |
+| Stage runs but output not cached | [Outputs](../concepts/outputs.md) |
+| "Cannot pickle..." errors | [Pipelines](../concepts/pipelines.md) |
+| Parameters not taking effect | [Parameters](../concepts/parameters.md) |
+| Watch mode not detecting changes | [Watch Mode Guide](../guides/watch-mode.md) |
+| Lambda causes unnecessary re-runs | [Fingerprinting](../concepts/fingerprinting.md) |
+| Remote push/pull fails | [Remote Storage Guide](../guides/remote-storage.md) |
+| CI fails but local passes | [CI Integration Guide](../guides/ci-integration.md) |
 
 ## Debugging Commands
 
@@ -50,7 +50,7 @@ Contains: code fingerprint, parameter hash, dependency hashes, output hashes.
 
 Your stage function captures a variable from its enclosing scope. Move the function to module level and pass values through parameters.
 
-See: [Function Requirements](../reference/pipelines.md#function-requirements)
+See: [Pipelines](../concepts/pipelines.md)
 
 ### Stage Re-runs Every Time
 
@@ -58,7 +58,7 @@ See: [Function Requirements](../reference/pipelines.md#function-requirements)
 2. Check if a helper function changed
 3. Run `pivot status --explain stage_name` to see what changed
 
-See: [Stage Reruns Unexpectedly](../reference/outputs.md#stage-reruns-unexpectedly)
+See: [Fingerprinting](../concepts/fingerprinting.md) and [Caching](../concepts/caching.md)
 
 ### Cache Not Shared in CI
 
@@ -66,4 +66,4 @@ See: [Stage Reruns Unexpectedly](../reference/outputs.md#stage-reruns-unexpected
 2. Ensure remote is configured: `pivot config list`
 3. Run `pivot pull` before `pivot repro` in CI
 
-See: [CI Fails but Local Passes](../reference/configuration.md#ci-fails-but-local-passes)
+See: [CI Integration Guide](../guides/ci-integration.md) and [Remote Storage Guide](../guides/remote-storage.md)

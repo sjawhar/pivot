@@ -5,21 +5,19 @@ The Engine is Pivot's central coordinator for all execution paths. It provides a
 ## Overview
 
 ```
-                          ┌───────────────────────┐
-                          │        Engine         │
-                          │                       │
-    ┌─────────────────────┤  Event Queue          │
-    │                     │        │              │
-    ▼                     │        ▼              │───────────────┐
-┌──────────────┐          │  Event Processor      │               │
-│ Event Sources│──submit──▶                       │               ▼
-│              │          │        │              │        ┌──────────────┐
-│ Filesystem   │          │        ▼              │        │ Event Sinks  │
-│ OneShot      │          │  Stage Orchestration  │──emit──▶              │
-│              │          │        │              │        │ Console      │
-└──────────────┘          │        ▼              │        │ TUI/Agent    │
-                          │  Worker Pool          │        └──────────────┘
-                          └───────────────────────┘
+                          ┌──────────────────────────┐
+                          │          Engine          │
+                          │  (async coordinator)     │
+    ┌─────────────────────┤  Input channel           │
+    │                     │        │                 │
+    ▼                     │        ▼                 │───────────────┐
+┌──────────────┐          │  Event processor         │               │
+│ Event Sources│──submit──▶  + Scheduler             │               ▼
+│              │          │  + WatchCoordinator      │        ┌──────────────┐
+│ Filesystem   │          │        │                 │        │ Event Sinks  │
+│ OneShot      │          │        ▼                 │──emit──▶ (supervised) │
+│ Agent RPC    │          │    WorkerPool            │        └──────────────┘
+└──────────────┘          └──────────────────────────┘
 ```
 
 ## Key Components
@@ -43,8 +41,9 @@ class StageExecutionState(IntEnum):
     BLOCKED = 1      # Upstream failed, cannot run
     READY = 2        # Can run, waiting for worker slot
     PREPARING = 3    # Engine clearing outputs
-    RUNNING = 4      # Stage function executing
-    COMPLETED = 5    # Terminal (ran/skipped/failed)
+    WAITING_ON_LOCK = 4  # Worker waiting for artifact locks
+    RUNNING = 5      # Stage function executing
+    COMPLETED = 6    # Terminal (ran/skipped/failed)
 ```
 
 The IntEnum ordering enables comparisons like `state >= PREPARING` for output filtering.
@@ -59,7 +58,7 @@ Sources push input events via memory channels (`MemoryObjectSendStream[InputEven
 | `OneShotSource` | `RunRequested` | Batch mode |
 | `AgentRpcSource` | `RunRequested`, `CancelRequested` | Agent RPC control |
 
-For RPC control (agent integration), use `AgentRpcSource` which converts JSON-RPC commands into input events.
+For RPC control (agent integration), use `AgentRpcSource` which converts JSON-RPC commands into input events and delegates query methods to an `AgentRpcHandler`.
 
 ### Event Sinks
 
@@ -68,10 +67,13 @@ Sinks consume output events via `sink.handle()`:
 | Sink | Output | Use Case |
 |------|--------|----------|
 | `ConsoleSink` | Rich terminal | Plain CLI mode |
-| `TuiSink` | Textual app | TUI mode |
 | `ResultCollectorSink` | Dict collection | Programmatic result access |
-| `EventSink` | Memory channels | Agent RPC pub-sub |
-| `EventBuffer` | Ring buffer | Agent RPC polling |
+| `BroadcastEventSink` | Pub-sub | Agent RPC subscribers |
+| `EventBuffer` | Ring buffer | Agent RPC polling (`events_since`) |
+
+Sinks are supervised by the Engine: each sink receives events via its own bounded
+queue. Slow or failing sinks are temporarily disabled and re-enabled after
+exponential backoff, emitting `SinkStateChanged` events.
 
 ## Bipartite Graph
 
@@ -128,7 +130,6 @@ async with Engine() as engine:
 
 ```python
 async with Engine() as engine:
-    engine.add_sink(TuiSink())
     engine.add_source(FilesystemSource(watch_paths))
 
     await engine.run(exit_on_completion=False)  # Blocks until shutdown
@@ -160,6 +161,8 @@ async with Engine() as engine:
 | `LogLine` | Stage output | Line, is_stderr |
 | `PipelineReloaded` | Registry reload | Stages list, added/removed/modified |
 | `StageStateChanged` | State transition | Stage, old/new state |
+| `SinkStateChanged` | Sink disabled/enabled | Backoff state |
+| `EngineDiagnostic` | Non-fatal anomaly | Message, detail |
 
 ## Async Safety
 
@@ -175,13 +178,16 @@ The Engine uses structured concurrency with anyio:
 Agent RPC control uses event sources and handlers, not direct Engine methods:
 
 ```python
-from pivot.engine.agent_rpc import AgentRpcSource, AgentRpcHandler
+from pivot.engine.agent_rpc import AgentRpcSource, AgentRpcHandler, EventBuffer, BroadcastEventSink
 
-# Create handler for status/stages queries
-handler = AgentRpcHandler(engine=engine)
+# Create handler for status/stages/metadata queries
+handler = AgentRpcHandler(engine=engine, event_buffer=event_buffer)
 
-# Add RPC source to Engine (converts JSON-RPC to events)
+# Add RPC source to Engine (converts JSON-RPC to events; queries handled by handler)
 engine.add_source(AgentRpcSource(socket_path=socket_path, handler=handler))
+# Add sinks for polling and pub-sub
+engine.add_sink(event_buffer)
+engine.add_sink(BroadcastEventSink())
 ```
 
 ## Serve Mode
@@ -192,7 +198,8 @@ For headless daemon operation (`pivot run --serve --watch`), the Engine supports
 async with Engine(pipeline=pipeline) as engine:
     engine.add_source(FilesystemSource(watch_paths=paths))
     engine.add_source(AgentRpcSource(socket_path=socket_path, handler=handler))
-    engine.add_sink(EventSink())
+    engine.add_sink(EventBuffer())
+    engine.add_sink(BroadcastEventSink())
 
     await engine.run(exit_on_completion=False)
 ```
@@ -202,7 +209,7 @@ async with Engine(pipeline=pipeline) as engine:
 | Component | Purpose |
 |-----------|---------|
 | `AgentRpcSource` | JSON-RPC 2.0 over Unix socket |
-| `EventSink` | Broadcast events to subscribed clients |
+| `BroadcastEventSink` | Broadcast events to subscribed clients |
 | `EventBuffer` | Ring buffer for event polling |
 
 ### Agent RPC Protocol
@@ -212,19 +219,26 @@ The `AgentRpcSource` implements JSON-RPC 2.0 over Unix socket:
 **Commands** (become input events):
 - `run` - Start a run with optional stages/force
 - `cancel` - Request cancellation
+- `set_on_error` - Update error mode (`fail`/`keep_going`) for future runs
 
 **Queries** (handled by `AgentRpcHandler`):
 - `status` - Get engine state (idle/active)
 - `stages` - List registered stages
+- `stage_info` - Get deps/outs for a stage
+- `explain` - Compute a `StageExplanation`
+- `events_since` - Poll buffered output events (requires `EventBuffer` sink)
+- `commit` - Persist current workspace state (`pivot commit`)
+- `diff_output` - Diff cached outputs for TUI panels
 
 ```json
 {"jsonrpc": "2.0", "method": "run", "params": {"stages": ["train"]}, "id": 1}
 {"jsonrpc": "2.0", "result": "accepted", "id": 1}
+{"jsonrpc": "2.0", "method": "events_since", "params": {"version": 0}, "id": 2}
 ```
 
 ### Event Broadcasting
 
-`EventSink` provides pub-sub event delivery to connected agents:
+`BroadcastEventSink` provides pub-sub event delivery to connected agents:
 
 ```python
 # Subscribe a client
@@ -254,12 +268,15 @@ last_version = result["version"]
 
 | Component | File |
 |-----------|------|
-| Engine class | `src/pivot/engine/engine.py` |
-| Bipartite graph | `src/pivot/engine/graph.py` |
-| Event types | `src/pivot/engine/types.py` |
-| Event sources | `src/pivot/engine/sources.py` |
-| Event sinks | `src/pivot/engine/sinks.py` |
-| Agent RPC | `src/pivot/engine/agent_rpc.py` |
+| Engine class | `packages/pivot/src/pivot/engine/engine.py` |
+| Scheduler | `packages/pivot/src/pivot/engine/scheduler.py` |
+| Watch coordinator | `packages/pivot/src/pivot/engine/watch.py` |
+| Worker pool | `packages/pivot/src/pivot/engine/worker_pool.py` |
+| Bipartite graph | `packages/pivot/src/pivot/engine/graph.py` |
+| Event types | `packages/pivot/src/pivot/engine/types.py` |
+| Event sources | `packages/pivot/src/pivot/engine/sources.py` |
+| Event sinks | `packages/pivot/src/pivot/engine/sinks.py` |
+| Agent RPC | `packages/pivot/src/pivot/engine/agent_rpc.py` |
 
 ## See Also
 

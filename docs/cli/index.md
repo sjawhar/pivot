@@ -9,14 +9,20 @@ Complete reference for all Pivot command-line commands.
 | Run pipeline | `pivot repro` |
 | Run specific stages + deps | `pivot repro stage1 stage2` |
 | Run single stage (no deps) | `pivot run stage` |
+| Run with live output | `pivot repro --show-output` |
 | See what would run | `pivot repro -n` |
 | Understand why stage runs | `pivot status --explain stage` |
 | List all stages | `pivot list` |
 | Show stage status | `pivot status` |
 | Visualize DAG | `pivot dag` |
+| Compare data files | `pivot diff output.csv` |
 | Verify reproducibility | `pivot verify` |
+| Import from remote repo | `pivot import REPO_URL PATH` |
+| Update imported artifacts | `pivot update` |
 | Push outputs to remote | `pivot push` |
+| Fetch to local cache | `pivot fetch` |
 | Pull outputs from remote | `pivot pull` |
+| Reset fingerprint cache | `pivot fingerprint reset` |
 | Watch for changes | `pivot repro --watch` |
 
 ---
@@ -67,14 +73,17 @@ pivot repro [STAGES...] [OPTIONS]
 | `--watch` / `-w` | Watch for file changes and re-run affected stages |
 | `--debounce MS` | Debounce delay in milliseconds (default: 300, requires --watch) |
 | `--tui` | Use interactive TUI display (default: plain text) |
-| `--json` | Output results as JSON |
+| `--jsonl` / `--json` | Stream results as JSONL (one JSON object per line) |
+| `--show-output` | Stream stage stdout/stderr to terminal |
 | `--tui-log PATH` | Write TUI messages to JSONL file for monitoring |
 | `--no-commit` | Run stages without writing locks, cache, or StateDB |
-| `--keep-going` / `-k` | Continue running stages after failures (default: fail-fast) |
+| `--fail-fast` | Stop on first failure (default) |
+| `--keep-going` / `-k` | Continue running stages after failures; skip only downstream dependents |
 | `--serve` | Start RPC server for agent control (requires --watch) |
 | `--allow-uncached-incremental` | Allow running stages with IncrementalOut files not in cache |
 | `--checkout-missing` | Restore tracked files from cache before running |
-| `--allow-missing` | Allow missing dep files if tracked (only with --dry-run or --explain) |
+| `--allow-missing` | Allow missing dep files if tracked (only affects --dry-run) |
+| `--all` | Run all stages (ignore target filtering) |
 
 **Examples:**
 
@@ -115,10 +124,12 @@ pivot run STAGES... [OPTIONS]
 |--------|-------------|
 | `--force` / `-f` | Force re-run of stages, ignoring cache |
 | `--tui` | Use interactive TUI display (default: plain text) |
-| `--json` | Output results as JSON |
+| `--jsonl` / `--json` | Stream results as JSONL (one JSON object per line) |
+| `--show-output` | Stream stage stdout/stderr to terminal |
 | `--tui-log PATH` | Write TUI messages to JSONL file for monitoring |
 | `--no-commit` | Run stages without writing locks, cache, or StateDB |
-| `--fail-fast` | Stop on first failure (default: keep-going) |
+| `--fail-fast` | Stop on first failure |
+| `--keep-going` / `-k` | Continue running stages after failures |
 | `--allow-uncached-incremental` | Allow running stages with IncrementalOut files not in cache |
 | `--checkout-missing` | Restore tracked files from cache before running |
 
@@ -153,6 +164,7 @@ pivot list [OPTIONS]
 |--------|-------------|
 | `--json` | Output as JSON |
 | `--deps` | Show stage dependencies |
+| `--all` | List all stages (ignore target filtering) |
 
 ---
 
@@ -173,11 +185,14 @@ pivot status [STAGES...] [OPTIONS]
 | Option | Description |
 |--------|-------------|
 | `--verbose` / `-v` | Show all stages, not just stale |
+| `--explain` / `-e` | Show detailed breakdown of why stages would run |
 | `--json` | Output as JSON |
 | `--stages-only` | Show only pipeline status |
 | `--tracked-only` | Show only tracked files |
 | `--remote-only` | Show only remote status |
 | `--remote` / `-r` | Include remote sync status |
+| `--check-imports` | Check for import updates (requires network) |
+| `--all` | Show all stages (ignore target filtering) |
 
 ---
 
@@ -186,10 +201,16 @@ pivot status [STAGES...] [OPTIONS]
 Commit current workspace state for stages. Hashes deps and outputs on disk, writes lock files, and updates cache.
 
 ```bash
-pivot commit [STAGES...]
+pivot commit [STAGES...] [OPTIONS]
 ```
 
 Without arguments, commits all stale stages. With stage names, unconditionally commits those stages.
+
+**Options:**
+
+| Option | Description |
+|--------|-------------|
+| `--all` | Commit all stages |
 
 ---
 
@@ -268,6 +289,7 @@ Shows the dependency graph of artifacts (default) or stages. Without targets, sh
 | `--mermaid` | Output Mermaid format |
 | `--md` | Output Mermaid wrapped in markdown |
 | `--stages` | Show stages as nodes (default: artifacts) |
+| `--all` | Show all stages (ignore target filtering) |
 
 **Examples:**
 
@@ -310,6 +332,7 @@ Checks that all stages are cached (code, params, deps match lock files) and outp
 |--------|-------------|
 | `--allow-missing` | Allow missing local files if on remote |
 | `--json` | Output as JSON |
+| `--all` | Verify all stages (ignore target filtering) |
 
 **Exit Codes:**
 
@@ -377,15 +400,16 @@ pivot checkout [TARGETS...] [OPTIONS]
 | `--checkout-mode MODE` | `symlink`, `hardlink`, or `copy` |
 | `--force` / `-f` | Overwrite existing files |
 | `--only-missing` | Only restore files that don't exist on disk |
+| `--all` | Checkout all targets (ignore target filtering) |
 
 ---
 
-### `pivot data get`
+### `pivot get`
 
 Retrieve files or stage outputs from a specific git revision.
 
 ```bash
-pivot data get TARGETS... --rev REVISION [OPTIONS]
+pivot get TARGETS... --rev REVISION [OPTIONS]
 ```
 
 **Arguments:**
@@ -405,13 +429,13 @@ pivot data get TARGETS... --rev REVISION [OPTIONS]
 
 ```bash
 # Get file from specific commit
-pivot data get model.pkl --rev abc123
+pivot get model.pkl --rev abc123
 
 # Get stage output from branch
-pivot data get train --rev feature-branch
+pivot get train --rev feature-branch
 
 # Get with custom output path
-pivot data get model.pkl --rev v1.0 --output old_model.pkl
+pivot get model.pkl --rev v1.0 --output old_model.pkl
 ```
 
 ---
@@ -534,12 +558,12 @@ pivot params diff [STAGES...] [OPTIONS]
 
 ## Data Comparison
 
-### `pivot data diff`
+### `pivot diff`
 
 Compare data files against git HEAD.
 
 ```bash
-pivot data diff TARGETS... [OPTIONS]
+pivot diff TARGETS... [OPTIONS]
 ```
 
 **Arguments:**
@@ -562,13 +586,13 @@ pivot data diff TARGETS... [OPTIONS]
 
 ```bash
 # Interactive TUI mode
-pivot data diff output.csv
+pivot diff output.csv
 
 # Key-based row matching
-pivot data diff output.csv --key id,timestamp
+pivot diff output.csv --key id,timestamp
 
 # JSON output for scripting
-pivot data diff output.csv --json
+pivot diff output.csv --json
 ```
 
 ---
@@ -608,6 +632,7 @@ pivot push [TARGETS...] [OPTIONS]
 | `--remote` / `-r NAME` | Remote name (uses default if not specified) |
 | `--dry-run` / `-n` | Show what would be pushed |
 | `--jobs` / `-j N` | Parallel upload jobs (default: 20) |
+| `--all` | Push all stages (ignore target filtering) |
 
 ---
 
@@ -629,7 +654,112 @@ pivot pull [TARGETS...] [OPTIONS]
 |--------|-------------|
 | `--remote` / `-r NAME` | Remote name (uses default if not specified) |
 | `--dry-run` / `-n` | Show what would be pulled |
-| `--jobs` / `-j N` | Parallel download jobs (default: 20) |
+| `--jobs` / `-j N` | Parallel download jobs |
+| `--force` / `-f` | Overwrite existing workspace files |
+| `--only-missing` | Only restore files that don't exist in workspace |
+| `--checkout-mode MODE` | `symlink`, `hardlink`, or `copy` |
+| `--all` | Pull all stages (ignore target filtering) |
+
+---
+
+### `pivot fetch`
+
+Fetch cached outputs from remote storage to local cache without restoring to workspace. Use `pivot pull` to also restore files, or `pivot checkout` to restore from cache.
+
+```bash
+pivot fetch [TARGETS...] [OPTIONS]
+```
+
+**Arguments:**
+
+- `TARGETS` - Stage names or file paths to fetch (optional, fetches all if not specified)
+
+**Options:**
+
+| Option | Description |
+|--------|-------------|
+| `--remote` / `-r NAME` | Remote name (uses default if not specified) |
+| `--dry-run` / `-n` | Show what would be fetched |
+| `--jobs` / `-j N` | Parallel download jobs |
+| `--all` | Fetch all stages (ignore target filtering) |
+
+---
+
+## Imports
+
+### `pivot import`
+
+Import an artifact from a remote Pivot repository.
+
+```bash
+pivot import REPO_URL PATH [OPTIONS]
+```
+
+**Arguments:**
+
+- `REPO_URL` - URL of the remote Pivot repository
+- `PATH` - Path to the artifact within the remote repository
+
+**Options:**
+
+| Option | Description |
+|--------|-------------|
+| `--rev REV` | Git ref to import from (branch, tag, commit; default: main) |
+| `--out PATH` | Local output path (default: same as source path) |
+| `--force` | Overwrite existing files |
+| `--no-download` | Create .pvt metadata without downloading |
+
+**Examples:**
+
+```bash
+# Import a model from another repo
+pivot import https://github.com/org/ml-models model.pkl
+
+# Import from a specific tag
+pivot import https://github.com/org/data data.csv --rev v1.0
+
+# Create metadata only (download later with pivot pull)
+pivot import https://github.com/org/data data.csv --no-download
+```
+
+---
+
+### `pivot update`
+
+Update imported artifacts from their source repositories.
+
+```bash
+pivot update [TARGETS...] [OPTIONS]
+```
+
+If no TARGETS specified, updates all imports found in the project.
+
+**Arguments:**
+
+- `TARGETS` - Import targets to update (optional, updates all imports if not specified)
+
+**Options:**
+
+| Option | Description |
+|--------|-------------|
+| `--rev REV` | Override git ref for update |
+| `--dry-run` | Show what would change without modifying |
+
+**Examples:**
+
+```bash
+# Update all imports
+pivot update
+
+# Check for updates without applying
+pivot update --dry-run
+
+# Update specific import
+pivot update data.csv
+
+# Update to a specific revision
+pivot update data.csv --rev v2.0
+```
 
 ---
 
@@ -669,6 +799,8 @@ pivot config get KEY [OPTIONS]
 
 | Option | Description |
 |--------|-------------|
+| `--global` | Get from global config |
+| `--local` | Get from local config |
 | `--json` | Output as JSON |
 
 ---
@@ -859,6 +991,28 @@ pivot schema [OPTIONS]
 | Option | Description |
 |--------|-------------|
 | `--indent N` | JSON indentation (0 for compact) |
+
+---
+
+### `pivot fingerprint`
+
+Manage function fingerprinting cache.
+
+#### `pivot fingerprint reset`
+
+Reset cached function fingerprints. Use after encountering stale cache issues or when troubleshooting unexpected stage re-runs.
+
+```bash
+pivot fingerprint reset
+```
+
+**Example:**
+
+```bash
+# Clear all cached fingerprints
+pivot fingerprint reset
+# Cleared 42 cached fingerprint entries.
+```
 
 ---
 

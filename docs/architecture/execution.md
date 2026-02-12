@@ -51,9 +51,9 @@ Pivot uses a parallel execution model with warm worker pools for maximum perform
 
 The Engine uses event-driven orchestration for maximum parallelism:
 
-1. **Stage States** - Each stage has its own state (PENDING → READY → PREPARING → RUNNING → COMPLETED)
-2. **Ready Queue** - Stages with all dependencies satisfied
-3. **Mutex Handling** - Prevents conflicting stages from running concurrently
+1. **Stage States** - Each stage has its own state (PENDING → READY → PREPARING → WAITING_ON_LOCK → RUNNING → COMPLETED)
+2. **Scheduler** - `Scheduler` owns stage state, upstream/downstream sets, and mutex decisions
+3. **Ready Queue** - Engine asks Scheduler for eligible stages
 4. **Event Emission** - StageStarted/StageCompleted events to sinks
 
 As stages complete, their downstream stages become ready. The Engine handles both batch (`exit_on_completion=True`) and continuous (`exit_on_completion=False`) execution through the same orchestration code.
@@ -68,8 +68,9 @@ class StageExecutionState(IntEnum):
     BLOCKED = 1      # Upstream failed
     READY = 2        # Can run, waiting for worker
     PREPARING = 3    # Engine clearing outputs
-    RUNNING = 4      # Stage function executing
-    COMPLETED = 5    # Terminal
+    WAITING_ON_LOCK = 4  # Worker waiting for artifact locks
+    RUNNING = 5      # Stage function executing
+    COMPLETED = 6    # Terminal
 ```
 
 The IntEnum allows ordered comparisons (e.g., `state >= PREPARING` means execution has begun).
@@ -77,7 +78,7 @@ The IntEnum allows ordered comparisons (e.g., `state >= PREPARING` means executi
 ### State Transitions
 
 ```
-PENDING ──(deps complete)──▶ READY ──(worker available)──▶ PREPARING ──▶ RUNNING ──▶ COMPLETED
+PENDING ──(deps complete)──▶ READY ──(worker available)──▶ PREPARING ──▶ WAITING_ON_LOCK ──▶ RUNNING ──▶ COMPLETED
     │                                                           │
     └──(upstream failed)──▶ BLOCKED                             └──(failed)──▶ COMPLETED
 ```
@@ -87,12 +88,15 @@ PENDING ──(deps complete)──▶ READY ──(worker available)──▶ P
 During watch mode, the Engine filters filesystem events based on stage state:
 
 - **PREPARING**: Silence events for this stage's outputs (Engine is preparing them)
+- **WAITING_ON_LOCK**: Defer events while worker waits on artifact locks
 - **RUNNING**: Defer events for outputs (collect, don't act yet)
 - **COMPLETED**: Process deferred events, compare output hashes, trigger downstream
 
 ## Worker Pool
 
 Pivot uses `loky.get_reusable_executor()` for warm workers with `spawn` context.
+The Engine wraps it in `WorkerPool`, which also manages a manager-backed output
+queue for log streaming and a shutdown event for the drain thread.
 
 ### Why ProcessPoolExecutor?
 
@@ -368,7 +372,7 @@ See `pivot.types.OnError` for the enum definition.
 
 ## Cancellation
 
-The executor supports graceful cancellation via a `cancel_event` (a `threading.Event`). When set:
+The engine supports graceful cancellation via a `CancelRequested` event. When set:
 
 1. **Running stages complete** - The currently executing stage finishes normally
 2. **Pending stages are skipped** - No new stages are started
@@ -376,7 +380,7 @@ The executor supports graceful cancellation via a `cancel_event` (a `threading.E
 
 Cancellation is **stage-level**, not mid-stage. This ensures outputs are always in a consistent state (either fully written or not started).
 
-In watch mode, the Agent Server's `cancel` RPC method sets this event, allowing external tools to stop execution between stages. The TUI also uses this for `Ctrl+C` handling.
+In watch mode, the Agent RPC `cancel` command sends a `CancelRequested` event, allowing external tools to stop execution between stages. The TUI also uses this for `Ctrl+C` handling.
 
 ## Explain Mode
 

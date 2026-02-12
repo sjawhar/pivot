@@ -28,20 +28,21 @@ When changes are detected, only affected stages and their downstream dependencie
 │  ┌──────────────────┐                                               │
 │  │ FilesystemSource │  ← Watches via watchfiles (Rust-backed)       │
 │  │                  │                                               │
-│  │  watchfiles.watch()                                              │
+│  │  watchfiles.awatch()                                             │
 │  │       │                                                          │
 │  │       ▼                                                          │
-│  │  engine.submit(event)                                            │
+│  │  send(event)                                                     │
 │  └──────────────────┘                                               │
 │           │                                                          │
-│           │ Event Queue (thread-safe)                               │
+│           │ Input channel (anyio)                                   │
 │           ▼                                                          │
 │  ┌──────────────────┐                                               │
 │  │ run(exit_on_completion=False)  ← Processes events until shutdown │
-│  │                  │                                               │
-│  │  1. Handle DataArtifactChanged → run affected stages             │
-│  │  2. Handle CodeOrConfigChanged → reload registry, run all        │
-│  │  3. Handle CancelRequested → stop starting new stages            │
+│  │  + WatchCoordinator policy                                       │
+│  │                                                                  │
+│  │  1. DataArtifactChanged → compute affected stages                │
+│  │  2. CodeOrConfigChanged → reload registry, run all               │
+│  │  3. CancelRequested → stop starting new stages                   │
 │  └──────────────────┘                                               │
 │                                                                      │
 └─────────────────────────────────────────────────────────────────────┘
@@ -65,7 +66,7 @@ This unified architecture eliminates divergent code paths between batch and watc
 When a dependency file changes:
 
 1. FilesystemSource emits `DataArtifactChanged(paths=[...])`
-2. Engine queries bipartite graph for affected stages
+2. WatchCoordinator computes affected stages from bipartite graph
 3. Engine executes affected stages and their downstream dependencies
 4. StageStarted/StageCompleted events emitted to sinks
 
@@ -75,7 +76,7 @@ When Python files or `pivot.yaml` change:
 
 1. FilesystemSource emits `CodeOrConfigChanged(paths=[...])`
 2. Engine invalidates caches and reloads registry
-3. Engine rebuilds bipartite graph
+3. Engine rebuilds bipartite graph and updates WatchCoordinator
 4. Engine updates FilesystemSource watch paths
 5. Engine re-runs all stages
 
@@ -83,7 +84,7 @@ When Python files or `pivot.yaml` change:
 
 Stage outputs are filtered to prevent infinite loops. The Engine tracks stage execution state:
 
-- Outputs of PREPARING/RUNNING stages are filtered
+- Outputs of PREPARING/WAITING_ON_LOCK/RUNNING stages are filtered
 - Changes are deferred and processed after COMPLETED
 
 ## JSON Output Mode
@@ -94,7 +95,7 @@ For IDE integrations and automation:
 pivot repro --watch --json
 ```
 
-This uses a JsonlSink instead of TuiSink, emitting newline-delimited JSON events:
+This uses a JsonlSink to emit newline-delimited JSON events:
 
 | Event Type | Description |
 |------------|-------------|
@@ -107,7 +108,7 @@ Note: JsonlSink translates internal engine events to the existing `pivot repro -
 
 ### Code Change Handling
 
-When Python files change, the worker pool is restarted via `loky.get_reusable_executor(kill_workers=True)`:
+When Python files change, the worker pool is restarted via `executor_core.restart_workers()`:
 
 **Why restart instead of hot reload?**
 
@@ -125,13 +126,13 @@ The Engine performs a **full module clear** before restart:
 
 ### Warm Workers
 
-Workers stay alive between execution waves (when no code changes). Expensive imports (numpy, pandas) only happen once per worker restart.
+Workers are warm within a single run (stages reuse the same pool). Watch mode creates a fresh pool per run; code reloads can trigger a restart via `executor_core.restart_workers()` (only in parallel mode, per WatchCoordinator policy).
 
 ## Debouncing
 
 Changes are debounced to prevent rapid file saves from triggering multiple runs:
 
-- **Quiet period:** Configurable via `--debounce` CLI flag (default 300ms)
+- **Quiet period:** Configurable via `--debounce` CLI flag or `watch.debounce` config
 - **Maximum wait:** 5 seconds (prevents indefinite blocking during continuous saves)
 
 ## Error Handling
@@ -170,6 +171,5 @@ On `Ctrl+C`:
 
 ## See Also
 
-- [Watch Mode Reference](../reference/watch.md) - User guide for watch mode
-- [Watch Mode Tutorial](../tutorial/watch.md) - Getting started with watch mode
+- [Watch Mode Guide](../guides/watch-mode.md) - User guide for watch mode
 - [Execution Model](./execution.md) - Batch execution architecture

@@ -6,11 +6,11 @@ This guide maps Pivot's architectural concepts to actual file paths, helping you
 
 | Command | Entry Point | Description |
 |---------|-------------|-------------|
-| `pivot repro` | `src/pivot/cli/repro.py` → `Engine.run(exit_on_completion=True)` | DAG-aware batch execution |
-| `pivot run` | `src/pivot/cli/run.py` → `Engine.run(exit_on_completion=True)` | Single-stage execution |
-| `pivot list` | `src/pivot/cli/list.py` | Stage listing |
-| `pivot status --explain` | `src/pivot/cli/status.py` → `status.get_pipeline_explanations()` | Change detection explanation |
-| `pivot repro --watch` | `src/pivot/cli/repro.py` → `Engine.run(exit_on_completion=False)` | Watch mode |
+| `pivot repro` | `packages/pivot/src/pivot/cli/repro.py` → `Engine.run(exit_on_completion=True)` | DAG-aware batch execution |
+| `pivot run` | `packages/pivot/src/pivot/cli/run.py` → `Engine.run(exit_on_completion=True)` | Single-stage execution |
+| `pivot list` | `packages/pivot/src/pivot/cli/list.py` | Stage listing |
+| `pivot status --explain` | `packages/pivot/src/pivot/cli/status.py` → `status.get_pipeline_explanations()` | Change detection explanation |
+| `pivot repro --watch` | `packages/pivot/src/pivot/cli/repro.py` → `Engine.run(exit_on_completion=False)` | Watch mode |
 
 ## Core Subsystems
 
@@ -18,10 +18,10 @@ This guide maps Pivot's architectural concepts to actual file paths, helping you
 
 **Key files:**
 
-- `src/pivot/discovery.py` - Auto-discovers `pivot.yaml`, `pipeline.py`
-- `src/pivot/pipeline/yaml.py` - Parses `pivot.yaml` into internal structures
-- `src/pivot/registry.py` - Stage metadata extraction (used internally by Pipeline)
-- `src/pivot/stage_def.py` - Stage definition classes (`StageDef`, `StageParams`)
+- `packages/pivot/src/pivot/discovery.py` - Auto-discovers `pivot.yaml`, `pipeline.py`
+- `packages/pivot/src/pivot/pipeline/yaml.py` - Parses `pivot.yaml` into internal structures
+- `packages/pivot/src/pivot/registry.py` - Stage metadata extraction (used internally by Pipeline)
+- `packages/pivot/src/pivot/stage_def.py` - Stage definition classes (`StageDef`, `StageParams`)
 
 **How it works:**
 
@@ -29,29 +29,30 @@ This guide maps Pivot's architectural concepts to actual file paths, helping you
 2. For YAML: `pipeline.yaml.load_pipeline_from_yaml()` parses and registers stages
 3. For Python: module is imported, which calls `pipeline.register()`
 
-**Start reading:** `src/pivot/discovery.py:discover_pipeline()`
+**Start reading:** `packages/pivot/src/pivot/discovery.py:discover_pipeline()`
 
 ### DAG Construction
 
 **Key files:**
 
-- `src/pivot/dag.py` - Builds dependency graph from stages
+- `packages/pivot/src/pivot/engine/graph.py` - Builds bipartite artifact-stage graph from stages
+- `packages/pivot/src/pivot/dag/` - DAG rendering (ASCII, DOT, Mermaid)
 
 **How it works:**
 
-1. `build_dag()` takes registered stages
-2. Creates nodes for each stage
+1. `build_graph()` takes registered stages
+2. Creates artifact nodes and stage nodes (bipartite graph)
 3. Adds edges based on output→input path relationships
-4. Returns a NetworkX DiGraph (use `dag.get_execution_order()` for sorted order)
+4. Returns a NetworkX DiGraph (use `get_execution_order()` for sorted order)
 
-**Start reading:** `src/pivot/dag.py:build_dag()`
+**Start reading:** `packages/pivot/src/pivot/engine/graph.py:build_graph()`
 
 ### Code Fingerprinting
 
 **Key files:**
 
-- `src/pivot/fingerprint.py` - Main fingerprinting logic
-- `src/pivot/ast_utils.py` - AST manipulation helpers
+- `packages/pivot/src/pivot/fingerprint.py` - Main fingerprinting logic
+- `packages/pivot/src/pivot/ast_utils.py` - AST manipulation helpers
 
 **How it works:**
 
@@ -61,20 +62,20 @@ This guide maps Pivot's architectural concepts to actual file paths, helping you
 4. Recursively fingerprints all dependencies
 5. Normalizes and hashes the combined code
 
-**Start reading:** `src/pivot/fingerprint.py:get_stage_fingerprint()`
+**Start reading:** `packages/pivot/src/pivot/fingerprint.py:get_stage_fingerprint()`
 
 ### Execution
 
 **Key files:**
 
-- `src/pivot/engine/engine.py` - Central coordinator (Engine class)
-- `src/pivot/engine/graph.py` - Bipartite artifact-stage graph
-- `src/pivot/engine/types.py` - Event types and stage states
-- `src/pivot/engine/sources.py` - Event sources (FilesystemSource, OneShotSource)
-- `src/pivot/engine/sinks.py` - Event sinks (ConsoleSink, JsonlSink)
-- `src/pivot/executor/core.py` - Worker pool management
-- `src/pivot/executor/worker.py` - Worker process code
-- `src/pivot/outputs.py` - Output type definitions (`Out`, `Metric`, `Plot`, `IncrementalOut`)
+- `packages/pivot/src/pivot/engine/engine.py` - Central coordinator (Engine class)
+- `packages/pivot/src/pivot/engine/graph.py` - Bipartite artifact-stage graph
+- `packages/pivot/src/pivot/engine/types.py` - Event types and stage states
+- `packages/pivot/src/pivot/engine/sources.py` - Event sources (FilesystemSource, OneShotSource)
+- `packages/pivot/src/pivot/engine/sinks.py` - Event sinks (ConsoleSink, JsonlSink)
+- `packages/pivot/src/pivot/executor/core.py` - Worker pool management
+- `packages/pivot/src/pivot/executor/worker.py` - Worker process code
+- `packages/pivot/src/pivot/outputs.py` - Output type definitions (`Out`, `Metric`, `Plot`, `IncrementalOut`)
 
 **How it works:**
 
@@ -84,36 +85,36 @@ This guide maps Pivot's architectural concepts to actual file paths, helping you
 4. Workers execute stages via `worker.execute_stage()`
 5. Lock files updated after each stage
 
-**Start reading:** `src/pivot/engine/engine.py:Engine.run()`
+**Start reading:** `packages/pivot/src/pivot/engine/engine.py:Engine.run()`
 
 ### Caching & Storage
 
 **Key files:**
 
-- `src/pivot/storage/cache.py` - Content-addressable file cache
-- `src/pivot/storage/lock.py` - Per-stage lock files
-- `src/pivot/storage/state.py` - LMDB state database
-- `src/pivot/storage/restore.py` - Restoring outputs from cache
-- `src/pivot/run_history.py` - Run cache entries and manifests
+- `packages/pivot/src/pivot/storage/cache.py` - Content-addressable file cache (module-level functions)
+- `packages/pivot/src/pivot/storage/lock.py` - Per-stage lock files
+- `packages/pivot/src/pivot/storage/state.py` - LMDB state database
+- `packages/pivot/src/pivot/storage/restore.py` - Restoring outputs from cache
+- `packages/pivot/src/pivot/run_history.py` - Run cache entries and manifests
 
 **How it works:**
 
-1. `CacheStore` hashes and stores file contents by xxhash64
+1. `save_to_cache()` hashes and stores file contents by xxhash64
 2. `LockFile` records stage fingerprint + output hashes
 3. `StateDB` provides fast key-value storage for runtime state
-4. `restore_outputs()` retrieves cached files on cache hit
+4. `restore_from_cache()` retrieves cached files on cache hit
 5. `run_history` manages run cache for skip detection across branches
 
-**Start reading:** `src/pivot/storage/cache.py:CacheStore`
+**Start reading:** `packages/pivot/src/pivot/storage/cache.py:save_to_cache()`
 
 ### Engine Event System
 
 **Key files:**
 
-- `src/pivot/engine/engine.py` - Event processing loop
-- `src/pivot/engine/types.py` - Input/output event definitions
-- `src/pivot/engine/sources.py` - Event producers
-- `src/pivot/engine/sinks.py` - Event consumers
+- `packages/pivot/src/pivot/engine/engine.py` - Event processing loop
+- `packages/pivot/src/pivot/engine/types.py` - Input/output event definitions
+- `packages/pivot/src/pivot/engine/sources.py` - Event producers
+- `packages/pivot/src/pivot/engine/sinks.py` - Event consumers
 
 **How it works:**
 
@@ -122,7 +123,7 @@ This guide maps Pivot's architectural concepts to actual file paths, helping you
 3. Engine emits output events to registered sinks
 4. Sinks handle display (TUI, console, JSON)
 
-**Start reading:** `src/pivot/engine/engine.py:Engine._handle_input_event()`
+**Start reading:** `packages/pivot/src/pivot/engine/engine.py:Engine._handle_input_event()`
 
 ### TUI (pivot-tui package)
 
@@ -157,9 +158,9 @@ The TUI is a **pure RPC client** in a separate package (`pivot-tui`). It has zer
 
 **Key files:**
 
-- `src/pivot/remote/storage.py` - S3 operations
-- `src/pivot/remote/sync.py` - Push/pull logic
-- `src/pivot/remote/config.py` - Remote configuration
+- `packages/pivot/src/pivot/remote/storage.py` - S3 operations
+- `packages/pivot/src/pivot/remote/sync.py` - Push/pull logic
+- `packages/pivot/src/pivot/remote/config.py` - Remote configuration
 
 **How it works:**
 
@@ -167,7 +168,7 @@ The TUI is a **pure RPC client** in a separate package (`pivot-tui`). It has zer
 2. `push_outputs()` uploads cache files to S3
 3. `pull_outputs()` downloads cache files by hash
 
-**Start reading:** `src/pivot/remote/sync.py:push_outputs()`
+**Start reading:** `packages/pivot/src/pivot/remote/sync.py:push_outputs()`
 
 ## Data Flow: `pivot repro`
 
@@ -209,19 +210,19 @@ Lock File Update (storage/lock.py)
 
 ### Module-Level Functions
 
-All stage-related functions must be module-level for pickling. See `src/pivot/fingerprint.py` for how we detect and handle this.
+All stage-related functions must be module-level for pickling. See `packages/pivot/src/pivot/fingerprint.py` for how we detect and handle this.
 
 ### Content-Addressable Storage
 
-Files are stored by hash, enabling deduplication. See `src/pivot/storage/cache.py:CacheStore.store()`.
+Files are stored by hash, enabling deduplication. See `packages/pivot/src/pivot/storage/cache.py:save_to_cache()`.
 
 ### Per-Stage Lock Files
 
-Each stage has its own lock file for O(n) updates instead of O(n²). See `src/pivot/storage/lock.py`.
+Each stage has its own lock file for O(n) updates instead of O(n²). See `packages/pivot/src/pivot/storage/lock.py`.
 
 ### Reusable Worker Pool
 
-Workers stay warm across executions. See `src/pivot/executor/core.py` use of `loky.get_reusable_executor()`.
+Workers stay warm across executions. See `packages/pivot/src/pivot/executor/core.py` use of `loky.get_reusable_executor()`.
 
 ## Testing
 
@@ -229,9 +230,9 @@ Test structure mirrors source:
 
 | Source | Tests |
 |--------|-------|
-| `src/pivot/fingerprint.py` | `tests/fingerprint/` |
-| `src/pivot/executor/` | `tests/execution/test_executor.py` |
-| `src/pivot/cli/` | `tests/integration/test_cli_*.py` |
+| `packages/pivot/src/pivot/fingerprint.py` | `packages/pivot/tests/fingerprint/` |
+| `packages/pivot/src/pivot/executor/` | `packages/pivot/tests/execution/test_executor.py` |
+| `packages/pivot/src/pivot/cli/` | `packages/pivot/tests/integration/test_cli_*.py` |
 
 See `tests/CLAUDE.md` for testing guidelines.
 
@@ -239,16 +240,16 @@ See `tests/CLAUDE.md` for testing guidelines.
 
 ### New CLI Command
 
-1. Create `src/pivot/cli/mycommand.py`
+1. Create `packages/pivot/src/pivot/cli/mycommand.py`
 2. Use `@cli_decorators.pivot_command()` decorator
-3. Add to `src/pivot/cli/__init__.py`
-4. Add tests in `tests/integration/test_cli_mycommand.py`
+3. Add to `packages/pivot/src/pivot/cli/__init__.py`
+4. Add tests in `packages/pivot/tests/integration/test_cli_mycommand.py`
 
 See [CLI Development](../contributing/cli.md)
 
 ### New Loader Type
 
-1. Add to `src/pivot/loaders.py`
+1. Add to `packages/pivot/src/pivot/loaders.py`
 2. Choose the appropriate base class:
    - `Reader[R]` - read-only (for dependencies), implement `load() -> R`
    - `Writer[W]` - write-only (for outputs), implement `save(data: W, ...)`
@@ -260,8 +261,8 @@ See [Adding Loaders](../contributing/loaders.md)
 
 ### New Output Type
 
-1. Add to `src/pivot/outputs.py`
-2. Define handling in `src/pivot/executor/commit.py`
+1. Add to `packages/pivot/src/pivot/outputs.py`
+2. Define handling in `packages/pivot/src/pivot/executor/commit.py`
 3. Add tests
 
 ## See Also

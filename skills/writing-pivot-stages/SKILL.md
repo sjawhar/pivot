@@ -14,32 +14,43 @@ Pivot stages are pure Python functions declaring file I/O via type annotations. 
 ## Imports
 
 ```python
+import pivot  # Single import — access everything via pivot.*
+
 from typing import Annotated, TypedDict
-from pivot.outputs import Dep, Out, Metric, Plot, PlaceholderDep, IncrementalOut, DirectoryOut
-from pivot.loaders import CSV, JSON, JSONL, YAML, Text, Pickle, PathOnly, MatplotlibFigure
-from pivot.loaders import Reader, Writer, Loader  # Base classes for custom loaders
-from pivot.stage_def import StageParams
-from pivot.pipeline import Pipeline
 ```
+
+All Pivot types are accessed via the `pivot` namespace:
+
+| What | Access |
+|------|--------|
+| Dependencies | `pivot.Dep`, `pivot.PlaceholderDep` |
+| Outputs | `pivot.Out`, `pivot.Metric`, `pivot.Plot`, `pivot.IncrementalOut`, `pivot.DirectoryOut` |
+| Loaders | `pivot.loaders.CSV()`, `pivot.loaders.JSON()`, `pivot.loaders.YAML()`, etc. |
+| Base classes | `pivot.loaders.Reader`, `pivot.loaders.Writer`, `pivot.loaders.Loader` |
+| Params | `pivot.StageParams` |
+| Pipeline | `pivot.Pipeline` |
+| Decorators | `pivot.no_fingerprint` |
 
 ## Stage Anatomy
 
 ```python
-class MyParams(StageParams):
+import pivot
+
+class MyParams(pivot.StageParams):
     threshold: float = 0.5
 
 class MyOutputs(TypedDict):
-    result: Annotated[pd.DataFrame, Out("output.csv", CSV())]
-    metrics: Annotated[dict, Metric("metrics.json")]
+    result: Annotated[pd.DataFrame, pivot.Out("output.csv", pivot.loaders.CSV())]
+    metrics: Annotated[dict, pivot.Metric("metrics.json")]
 
 def my_stage(
     params: MyParams,
-    data: Annotated[pd.DataFrame, Dep("input.csv", CSV())],
+    data: Annotated[pd.DataFrame, pivot.Dep("input.csv", pivot.loaders.CSV())],
 ) -> MyOutputs:
     filtered = data[data["score"] > params.threshold]
     return {"result": filtered, "metrics": {"count": len(filtered)}}
 
-pipeline = Pipeline("my_pipeline")
+pipeline = pivot.Pipeline("my_pipeline")
 pipeline.register(my_stage, params=MyParams(threshold=0.3))
 ```
 
@@ -47,14 +58,12 @@ pipeline.register(my_stage, params=MyParams(threshold=0.3))
 
 ```python
 def transform(
-    data: Annotated[pd.DataFrame, Dep("input.csv", CSV())],
-) -> Annotated[pd.DataFrame, Out("output.csv", CSV())]:
+    data: Annotated[pd.DataFrame, pivot.Dep("input.csv", pivot.loaders.CSV())],
+) -> Annotated[pd.DataFrame, pivot.Out("output.csv", pivot.loaders.CSV())]:
     return data.dropna()
 ```
 
 ## Loader Hierarchy
-
-The loader system has three base classes:
 
 | Base Class | Methods | Use Case |
 |------------|---------|----------|
@@ -75,6 +84,7 @@ The loader system has three base classes:
 | `CSV()` | `Loader` | DataFrame | `index_col`, `sep`, `dtype` | Yes |
 | `JSON()` | `Loader` | dict/list | `indent=2`, `empty_factory=dict` | Yes |
 | `JSONL()` | `Loader` | list[dict] | — | Yes |
+| `DataFrameJSONL()` | `Loader` | DataFrame | — | Yes |
 | `YAML()` | `Loader` | dict/list | `empty_factory=dict` | Yes |
 | `Text()` | `Loader` | str | — | Yes |
 | `Pickle()` | `Loader` | Any | `protocol` | No |
@@ -82,15 +92,16 @@ The loader system has three base classes:
 | `MatplotlibFigure()` | `Writer` | Figure | `dpi=150`, `bbox_inches`, `transparent` | N/A |
 
 **Notes:**
+- `DataFrameJSONL()` reads/writes DataFrames as JSON Lines (orient=records). Preferred over `CSV()` for non-trivial DataFrames (preserves types, handles nested data).
 - Loaders with `empty()` support are required for `IncrementalOut`.
-- `MatplotlibFigure` is `Writer[Figure]` (write-only) because images cannot be loaded back as Figure objects.
+- `MatplotlibFigure` is `Writer[Figure]` (write-only) — images can't be loaded back as Figure objects.
 
 ## Output Types
 
 | Type | Default Cache | Git-Tracked | Use Case |
 |------|---------------|-------------|----------|
 | `Out` | True | No | Standard outputs |
-| `Metric` | False | Yes | Small JSON metrics (path must end `.json`) |
+| `Metric` | False | Yes | Small YAML/JSON metrics |
 | `Plot` | True | No | Visualizations |
 | `IncrementalOut` | True | No | Builds on previous run's output |
 | `DirectoryOut` | True | No | Dynamic set of files in directory |
@@ -99,10 +110,10 @@ The loader system has three base classes:
 
 ```python
 # Variable-length list (count can change between runs)
-shards: Annotated[list[pd.DataFrame], Dep(["a.csv", "b.csv"], CSV())]
+shards: Annotated[list[pd.DataFrame], pivot.Dep(["a.csv", "b.csv"], pivot.loaders.CSV())]
 
 # Fixed-length tuple (exact count enforced)
-pair: Annotated[tuple[pd.DataFrame, pd.DataFrame], Dep(("x.csv", "y.csv"), CSV())]
+pair: Annotated[tuple[pd.DataFrame, pd.DataFrame], pivot.Dep(("x.csv", "y.csv"), pivot.loaders.CSV())]
 ```
 
 ## IncrementalOut
@@ -111,10 +122,10 @@ Previous output restored from cache before stage runs. Use for append-only state
 
 ```python
 class CacheOutputs(TypedDict):
-    cache: Annotated[dict, IncrementalOut("cache.json", JSON())]
+    cache: Annotated[dict, pivot.IncrementalOut("cache.json", pivot.loaders.JSON())]
 
 def incremental_stage(
-    cache: Annotated[dict | None, IncrementalOut("cache.json", JSON())],  # Input
+    cache: Annotated[dict | None, pivot.IncrementalOut("cache.json", pivot.loaders.JSON())],
 ) -> CacheOutputs:
     existing = cache or {}
     existing["new_key"] = "value"
@@ -129,7 +140,7 @@ For dynamic file sets determined at runtime:
 
 ```python
 class TaskOutputs(TypedDict):
-    results: Annotated[dict[str, dict], DirectoryOut("results/", JSON())]
+    results: Annotated[dict[str, dict], pivot.DirectoryOut("results/", pivot.loaders.JSON())]
 
 def process_tasks(...) -> TaskOutputs:
     return {"results": {
@@ -145,11 +156,11 @@ def process_tasks(...) -> TaskOutputs:
 
 ## PlaceholderDep
 
-Dependency with no default path—must be overridden at registration:
+Dependency with no default path — must be overridden at registration:
 
 ```python
 def compare(
-    baseline: Annotated[pd.DataFrame, PlaceholderDep(CSV())],
+    baseline: Annotated[pd.DataFrame, pivot.PlaceholderDep(pivot.loaders.CSV())],
 ) -> CompareOutputs: ...
 
 pipeline.register(compare, dep_path_overrides={"baseline": "model_a/results.csv"})
@@ -161,69 +172,86 @@ Plots require all three parts in the annotation:
 
 ```python
 Annotated[
-    matplotlib.figure.Figure,              # 1. The type (must be Figure, not Axes)
-    Plot("plots/my_plot.png",              # 2. The output type (Plot, not Out)
-         MatplotlibFigure(dpi=150))        # 3. The loader (required, handles save/close)
+    matplotlib.figure.Figure,                       # 1. Type (must be Figure, not Axes)
+    pivot.Plot("plots/my_plot.png",                 # 2. Output type (Plot, not Out)
+               pivot.loaders.MatplotlibFigure())    # 3. Writer (handles save/close)
 ]
 ```
-
-**Note:** `MatplotlibFigure` is a `Writer[Figure]` (not a full `Loader`) because saved images cannot be loaded back as matplotlib Figure objects. It only has a `save()` method.
 
 **Full example:**
 
 ```python
 import matplotlib.figure
 import matplotlib.pyplot as plt
+import pivot
 
 class PlotOutputs(TypedDict):
-    plot: Annotated[matplotlib.figure.Figure, Plot("plots/my_plot.png", MatplotlibFigure())]
+    plot: Annotated[matplotlib.figure.Figure, pivot.Plot("plots/my.png", pivot.loaders.MatplotlibFigure())]
 
 def make_plot(
-    data: Annotated[pd.DataFrame, Dep("input.csv", CSV())],
+    data: Annotated[pd.DataFrame, pivot.Dep("input.csv", pivot.loaders.CSV())],
 ) -> PlotOutputs:
     fig, ax = plt.subplots()
     ax.plot(data["x"], data["y"])
     return {"plot": fig}  # Return Figure, not Axes. Framework saves and closes.
 ```
 
-## Path Overrides
+## Path Overrides and Variants
+
+Override paths at registration time — useful for running same stage with different inputs/outputs:
 
 ```python
+# Simple override
 pipeline.register(my_stage, name="my_stage@v2", out_path_overrides={"result": "v2/output.csv"})
+
+# Variant pattern: register same function multiple times with different paths
+for variant, suffix in [("current", ""), ("legacy", "_legacy")]:
+    pipeline.register(
+        merge_data,
+        name=f"merge_data@{variant}",
+        dep_path_overrides={"input": f"data/raw/input{suffix}.jsonl"},
+        out_path_overrides={"output": f"data/processed/output{suffix}.jsonl"},
+        params=MergeParams(suffix=suffix),
+    )
+```
+
+## Path Resolution
+
+- Paths in annotations are **relative to the pipeline root** (defaults to directory of the file calling `Pipeline()`)
+- Parent references (`..`) are resolved during registration — `Dep("../shared/data.csv")` works
+- Resolved path must stay within the **project root** (the top-most directory with `.pivot/`)
+- Dependencies may use absolute paths (reduces portability). Outputs must resolve within project root.
+- For multi-pipeline projects, set `root=pivot.project.get_project_root()` to share a common base:
+
+```python
+pipeline = pivot.Pipeline("my_pipeline", root=pivot.project.get_project_root())
 ```
 
 ## Custom Loaders
 
-Create custom loaders by extending the appropriate base class:
-
-**Reader (read-only)** - for dependencies that only need loading:
+Extend the appropriate base class. Use `@dataclasses.dataclass(frozen=True)` for immutability and pickling.
 
 ```python
 import dataclasses
 import pathlib
-from pivot.loaders import Reader
+import pivot
 
+# Reader (read-only) — for Dep
 @dataclasses.dataclass(frozen=True)
-class ImageReader(Reader[np.ndarray]):
+class ImageReader(pivot.loaders.Reader[np.ndarray]):
     def load(self, path: pathlib.Path) -> np.ndarray:
         from PIL import Image
         return np.array(Image.open(path))
-```
 
-**Writer (write-only)** - for outputs that cannot be loaded back:
-
-```python
+# Writer (write-only) — for Out/Plot
 @dataclasses.dataclass(frozen=True)
-class HTMLWriter(Writer[str]):
+class HTMLWriter(pivot.loaders.Writer[str]):
     def save(self, data: str, path: pathlib.Path) -> None:
         path.write_text(data)
-```
 
-**Loader (bidirectional)** - for `IncrementalOut` or symmetric I/O:
-
-```python
+# Loader (bidirectional) — for IncrementalOut or symmetric I/O
 @dataclasses.dataclass(frozen=True)
-class NPY(Loader[np.ndarray, np.ndarray]):
+class NPY(pivot.loaders.Loader[np.ndarray, np.ndarray]):
     def load(self, path: pathlib.Path) -> np.ndarray:
         return np.load(path)
 
@@ -235,80 +263,48 @@ class NPY(Loader[np.ndarray, np.ndarray]):
 ```
 
 **Rules:**
-- Use `@dataclasses.dataclass(frozen=True)` for immutability and pickling
 - Loaders must be module-level classes (not closures)
-- Implement `empty()` only if the loader will be used with `IncrementalOut`
+- Implement `empty()` only if used with `IncrementalOut`
 
 ## StageParams Defaults
 
-Pydantic deep-copies all defaults (lists, dicts, nested models, TypedDicts). **Never use `default_factory`** for mutable defaults — use plain values:
+Pydantic deep-copies all defaults — lists, dicts, nested models. **Never use `default_factory`**, `.model_copy()`, or `.copy()`:
 
 ```python
 # WRONG — unnecessary complexity
-class MyParams(StageParams):
+class MyParams(pivot.StageParams):
     exclude: list[str] = pydantic.Field(default_factory=list)
-    styling: dict[str, Any] = pydantic.Field(default_factory=dict)
-    percents: list[int] = pydantic.Field(default_factory=lambda: [50, 80])
-    plots: PlotParams = pydantic.Field(default_factory=PlotParams)
+    base_cfg: PlotConfig = pydantic.Field(default_factory=lambda: PlotConfig())
 
-# CORRECT — Pydantic handles all of these safely
-class MyParams(StageParams):
+# CORRECT — Pydantic handles safely
+class MyParams(pivot.StageParams):
     exclude: list[str] = []
     styling: dict[str, Any] = {}
     percents: list[int] = [50, 80]
-    plots: PlotParams = PlotParams()
+    nested: SubModel = SubModel()
 ```
 
-Only use `pydantic.Field()` when you need its features (`alias`, `description`, `ge`, etc.), not just for defaults.
+Only use `pydantic.Field()` when you need its features (`alias`, `description`, `ge`), not for defaults. When cleaning up `default_factory`, also strip redundant `pydantic.Field()` wrappers and unused `pydantic` imports in the same pass.
 
-## Critical Rules
-
-1. **All paths relative to project root** — not relative to stage file
-2. **No manual file I/O** — no `pd.read_csv()`, `to_csv()`, `open()` in stage body
-3. **File paths in annotations, not params** — `StageParams` for config only
-4. **No `default_factory` for mutable defaults** — Pydantic deep-copies; use `= []`, `= {}`, `= Model()` directly
-5. **Stages must be module-level functions** — lambdas/closures fail pickling
-6. **TypedDict outputs must be module-level** — not defined inside functions
-
-## Running Stages
-
-```bash
-pivot repro                  # Run entire pipeline (DAG-aware)
-pivot repro my_stage         # Run my_stage AND all dependencies
-pivot repro --dry-run        # Validate DAG without executing
-
-pivot run my_stage           # Run ONLY my_stage (no dependency resolution)
-```
+Don't add `field_validator` or `model_validator` unless strictly necessary — keep params as plain data. Field types must match what the corresponding `Dep` inputs provide. Don't leave placeholder fields that bypass a param pathway — wire it fully or remove it.
 
 ## Pipeline Composition
 
-Include stages from sub-pipelines while preserving their state directories:
-
 ```python
-# Define sub-pipeline
-preprocessing = Pipeline("preprocessing")
+preprocessing = pivot.Pipeline("preprocessing")
 preprocessing.register(clean_data, name="clean")
-preprocessing.register(normalize, name="normalize")
 
-# Include in main pipeline
-main = Pipeline("main")
-main.include(preprocessing)  # Deep-copies stages, preserves state_dir
-main.register(train, name="train")  # Can depend on preprocessing outputs
+main = pivot.Pipeline("main")
+main.include(preprocessing)  # Deep-copies stages
+main.register(train, name="train")
 ```
 
 **Behavior:**
-- Included stages keep their original `state_dir` (for lock files, state.db)
-- Stages are deep-copied: mutations don't propagate between pipelines
-- `include()` is a point-in-time snapshot; later registrations in source don't propagate
-- Including empty pipeline is a no-op
-- Including same pipeline twice raises (name collision)
-- Transitive: if B includes C, then A includes B, A gets C's stages (already in B's registry)
-
-**Rules:**
-- Stage name collisions raise `PipelineConfigError`
+- Included stages keep their original `state_dir`
+- Deep-copied: mutations don't propagate
+- Point-in-time snapshot; later registrations in source don't propagate
+- Name collisions raise `PipelineConfigError`
 - Cannot include a pipeline into itself
-
-**Security Note:** Only include pipelines from trusted sources. Included stages execute with the same privileges as your pipeline.
 
 ## Testing
 
@@ -323,6 +319,26 @@ def test_my_stage():
     assert len(result["result"]) == 2
 ```
 
+## Critical Rules
+
+1. **All paths relative to project root** — not relative to stage file
+2. **No manual file I/O** — no `pd.read_csv()`, `to_csv()`, `open()` in stage body
+3. **File paths in annotations, not params** — `StageParams` for config only
+4. **No `default_factory` for mutable defaults** — Pydantic deep-copies; use `= []`, `= {}`, `= Model()` directly
+5. **Stages must be module-level functions** — lambdas/closures fail pickling
+6. **TypedDict outputs must be module-level** — not defined inside functions
+7. **Use `import pivot`** — then `pivot.Dep`, `pivot.Out`, `pivot.loaders.CSV()`, etc.
+8. **StageParams field types must match Dep types** — don't leave placeholder fields that bypass a param pathway
+
+## Running Stages
+
+```bash
+pivot repro                  # Run entire pipeline (DAG-aware)
+pivot repro my_stage         # Run my_stage AND all dependencies
+pivot repro --dry-run        # Validate DAG without executing
+pivot run my_stage           # Run ONLY my_stage (no dependency resolution)
+```
+
 ## Common Errors
 
 | Error | Cause | Fix |
@@ -332,17 +348,19 @@ def test_my_stage():
 | `IncrementalOut path mismatch` | Input/output paths differ | Use same path in both annotations |
 | `DirectoryOut path must end with '/'` | Missing trailing slash | Add `/` to path |
 | `DirectoryOut key must have extension` | Key like `"task_a"` | Use `"task_a.json"` |
-| `loader is required` | `Out("file.json")` without loader | Add loader: `Out("file.json", JSON())` |
+| `loader is required` | `Out("file.json")` without loader | Add loader: `pivot.Out("file.json", pivot.loaders.JSON())` |
 | `TypedDict field missing Out annotation` | Field without `Out`/`Metric`/`Plot` | Add annotation to all fields |
-| `stage 'X' already exists` | Name collision in `include()` | Rename stage with `name=` at registration |
-| `cannot include itself` | Self-include attempted | Use a separate Pipeline instance |
+| `stage 'X' already exists` | Name collision in `include()` | Rename with `name=` at registration |
+| `resolves outside base directory` | Output path escapes project root | Keep output paths within project |
 
 ## Checklist
 
+- [ ] Using `import pivot` (not `from pivot.outputs import ...`)
 - [ ] No manual file I/O in stage function
 - [ ] No file paths in `StageParams`
-- [ ] No `default_factory` in `StageParams` (use plain defaults: `= []`, `= {}`, `= Model()`)
+- [ ] No `default_factory` in `StageParams`
 - [ ] All Dep/Out paths relative to project root
 - [ ] Stage is module-level function (not closure)
 - [ ] TypedDict outputs defined at module level
-- [ ] Ran `pivot run` and verified outputs exist
+- [ ] No `field_validator`/`model_validator` in `StageParams` unless strictly needed
+- [ ] Ran `pivot repro --dry-run` to validate DAG

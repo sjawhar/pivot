@@ -25,7 +25,7 @@ packages/pivot/src/pivot/
 ├── outputs.py     # Out, DirectoryOut, IncrementalOut
 └── types.py       # TypedDicts, enums, type aliases
 
-packages/pivot-tui/src/pivot_tui/
+packages/pivot-tui/src/pivot_tui/  # (see pivot_tui/AGENTS.md)
 ├── client.py          # PivotRpc/PivotClient protocols + TypedDicts
 ├── rpc_client_impl.py # RpcPivotClient: JSON-RPC 2.0 over Unix socket
 ├── event_poller.py    # EventPoller: polls events, converts to TUI messages
@@ -75,46 +75,31 @@ packages/pivot-tui/src/pivot_tui/
 
 ## Skip Detection
 
-Three-tier algorithm: (1) O(1) generation tracking in `worker.can_skip_via_generation()`, (2) O(n) lock file comparison (fingerprint + params + dep hashes), (3) run cache lookup via input hash match.
+Three-tier algorithm: generation tracking → lock file comparison → run cache lookup. See `storage/AGENTS.md` for StateDB prefixes and implementation details.
 
-StateDB prefixes: `hash:` (file hashes), `gen:` (output generations), `dep:` (stage dep generations), `runcache:` (run cache).
+## Fingerprinting Guidelines
 
-## Worker Execution
+Fingerprint checks must be cheap — O(1) shallow/static checks only. No deep recursive field traversal for immutability detection.
 
-Workers execute in separate processes via `loky.get_reusable_executor()`.
+**Error policy:**
+- **Soundness risk** (changes could go undetected) → error
+- **Noise risk** (spurious reruns only) → warn
 
-### WorkerStageInfo Contract
+Aggregate all fingerprinting errors before reporting. Don't fail on the first one. Error messages must name the captured variables/types and suggest using `StageParams` or `Dep`.
 
-`WorkerStageInfo` (TypedDict at `packages/pivot/src/pivot/executor/worker.py`) is the coordinator-to-worker contract. Key fields (non-exhaustive):
+Unsafe fingerprinting is opt-in via a single config flag. Default is strict (error).
 
-| Field | Purpose |
-|-------|---------|
-| `func` | The stage function (must be picklable) |
-| `fingerprint` | Code manifest for change detection |
-| `deps` | Input dependency paths |
-| `outs` | Output specs (`BaseOut` instances) |
-| `project_root` | Absolute path to project root |
-| `state_dir` | Absolute path to `.pivot/` directory |
+## Caching Guidelines
 
-### Path Derivation
+The manifest cache (`sm:`) is best-effort for performance. Correctness must never depend on it.
 
-Workers derive all paths from `project_root` and `state_dir` explicitly passed in `WorkerStageInfo`:
-- `state_db_path = stage_info["state_dir"] / "state.db"`
-- Workers `chdir(project_root)` before execution
+## Architecture Guidelines
 
-Do not assume paths from `cache_dir` location—it's passed separately to `execute_stage()`.
+Avoid module-level mutable state. Use `contextvars.ContextVar` or explicit parameters for contextual state like "current stage name."
 
-### Nested Parallelism
+Keep LMDB/DB read transactions short-lived. Materialize generator outputs inside a context manager — don't leave transactions pinned via lazy generators.
 
-Stages using joblib/scikit-learn with `n_jobs > 1` create nested multiprocessing, causing `resource_tracker` race conditions between Pivot's loky pool and joblib's nested pool.
-
-**Default behavior:** Threading backend (`parallel_config(backend="threading")`). Safe for NumPy/pandas workloads that release the GIL.
-
-**Override:** Set `PIVOT_NESTED_PARALLELISM=processes` to use loky with memmapping disabled.
-
-## Caching Principle
-
-**Files are cached individually, not directories.** Each output file is hashed and stored in cache by its content hash. The stage lockfile contains a manifest listing all output files with their hashes. This enables fine-grained cache hits even when only some files change.
+Centralize decision logic. The `explain` and `run` paths must use the same skip-decision code — no divergent implementations that can drift.
 
 ## Artifact-Centric Mental Model (Critical)
 
@@ -166,8 +151,7 @@ def train(
 - Prefer type stubs (`pandas-stubs`, `types-PyYAML`) over ignores
 - Check `typings/` first for untyped packages; use `scripts/generate_stubs.py` if needed
 - **aioboto3/S3 types:** Use `types_aiobotocore_s3.S3Client` (not `Any`) for S3 client parameters. Import under `TYPE_CHECKING`. The `types-aioboto3[all]` stubs are in dev deps.
-- **aioboto3 sessions:** Create one `aioboto3.Session()` per `S3Remote` instance (in `__init__`), not per method call. Sessions are credential-management objects — recreating them re-reads credential chains and env vars. Each method creates its own client via `async with self._session.client("s3")`, which is lightweight but gets a fresh connection pool. Batch methods share one client across concurrent tasks via `asyncio.gather`.
-- **aiohttp for HTTP APIs:** Use `aiohttp` (direct dependency) for all non-S3 HTTP calls (GitHub API, git forge APIs). Follow the same async pattern as S3Remote: async internals with `asyncio.run()` sync wrappers at CLI boundaries. Do NOT use `httpx`, `urllib.request`, or `requests`.
+- **Network I/O:** See `remote/AGENTS.md` for async patterns, aioboto3 session management, and aiohttp usage.
 
 ## Python 3.13+ Types
 
@@ -193,7 +177,10 @@ Import modules, not functions: `from pivot import fingerprint` then `fingerprint
 
 - Validate at boundaries (CLI, file I/O, config), trust internals
 - Let errors propagate; catch only where you can handle meaningfully
+- Catch specific expected exceptions — avoid blanket `except Exception` unless re-raising or logging at a boundary
 - Failed operations should be atomic—return to last known good state
+- Before adding defensive changes (locks, guards, extra validation), verify whether existing mechanisms (DAG ordering, lock files, transaction isolation) already guarantee safety. Don't add redundant protection.
+- Demote expensive diagnostic checks (`exists()`, stat calls) to debug level. Guard with `logger.isEnabledFor(logging.DEBUG)` to avoid overhead when debug logging is off.
 
 ## Simplicity Over Abstraction
 

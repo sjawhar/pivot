@@ -11,8 +11,8 @@ Pivot is designed for high-performance pipeline execution with automatic code ch
                          │
                          ▼
 ┌─────────────────────────────────────────────────────────────┐
-│  Stage Registry → Bipartite Graph → Engine                   │
-│  Automatic fingerprinting | Artifact-Stage DAG | Event loop │
+│  Stage Registry → Bipartite Graph → Engine (Coordinator)     │
+│  Automatic fingerprinting | Scheduler | WatchCoordinator     │
 └─────────────────────────────────────────────────────────────┘
                          │
     ┌────────────────────┼────────────────────┐
@@ -56,15 +56,18 @@ The legacy stage-only DAG is derived from the bipartite graph via `get_stage_dag
 
 #### Edge Direction
 
-Edges point **consumer → producer** (the stage that USES an artifact points to the stage that PRODUCES it):
+The bipartite graph follows data flow:
+
+- **Artifact → Stage** for dependencies (consumes)
+- **Stage → Artifact** for outputs (produces)
+
+When extracting the stage-only DAG, edges are reversed to **consumer → producer** so `nx.dfs_postorder_nodes()` yields `[preprocess, train]` without an extra reverse step:
 
 ```
 preprocess (produces data/clean.csv)
     ↑
   train (consumes data/clean.csv)
 ```
-
-This convention may seem counter-intuitive, but it enables natural execution ordering: `nx.dfs_postorder_nodes()` returns `[preprocess, train]` without needing to reverse the graph.
 
 #### Path Resolution
 
@@ -82,20 +85,34 @@ This handles cases where a stage declares a directory output and another stage d
 
 ### Scheduler
 
-Coordinates parallel execution:
+Coordinates deterministic scheduling (sync, no IO):
 
-- Greedy scheduling - runs stages as soon as dependencies complete
-- Mutex handling - prevents concurrent execution of conflicting stages
-- Ready queue - tracks which stages can run
+- Maintains per-stage execution state
+- Tracks upstream/downstream completion
+- Enforces mutex groups (including exclusive `*`)
+- Decides which stages are eligible to start
+
+Implemented in `packages/pivot/src/pivot/engine/scheduler.py` and owned by the Engine.
+
+### WatchCoordinator
+
+Watch-mode policy planner extracted from the Engine:
+
+- Computes affected stages for changed paths
+- Filters events for outputs produced by in-flight stages
+- Decides whether worker pools should restart after code reloads
+
+Implemented in `packages/pivot/src/pivot/engine/watch.py`.
 
 ### Engine
 
-The Engine is the central coordinator for all execution paths. It:
+The Engine is the async coordinator for all execution paths. It:
 
 - Processes input events (file changes, run requests, cancellation)
-- Manages stage execution state machine
+- Delegates scheduling decisions to `Scheduler`
+- Manages run lifecycle and stage state transitions
 - Emits output events (stage started/completed, log lines)
-- Maintains the bipartite artifact-stage graph
+- Owns the bipartite artifact-stage graph and `WatchCoordinator`
 
 All code paths (CLI run, watch mode, agent RPC) route through the Engine.
 
@@ -105,22 +122,25 @@ Sources produce input events:
 
 - **FilesystemSource** - Watches files via watchfiles, emits `DataArtifactChanged` and `CodeOrConfigChanged`
 - **OneShotSource** - Emits single `RunRequested` for batch mode
+- **AgentRpcSource** - Receives JSON-RPC commands (`run`, `cancel`) and emits input events
 
 ### Event Sinks
 
 Sinks consume output events for display:
 
 - **ConsoleSink** - Rich-formatted terminal output
-- **TuiSink** - Forwards to Textual TUI
-- **JsonlSink** - Newline-delimited JSON for tooling integration
-- **WatchSink** - Handles engine state changes for watch mode
+- **ResultCollectorSink** - Collects `StageCompleted` events for programmatic access
+- **BroadcastEventSink** - Pub-sub event delivery for connected agents
+- **EventBuffer** - Ring buffer for `events_since` polling (RPC clients)
+- **JsonlSink** - Newline-delimited JSON for tooling integration (CLI helper)
 
 ### Executor
 
 Runs stages in worker processes:
 
-- Uses `ProcessPoolExecutor` with `spawn` context
-- Warm workers with preloaded imports
+- `WorkerPool` wraps a loky `ProcessPoolExecutor` with `spawn` context
+- Uses a manager-backed output queue for worker log streaming
+- Warm workers with preloaded imports (reusable executor)
 - True parallelism (not limited by GIL)
 
 ### Lock Files
@@ -131,14 +151,13 @@ Per-stage lock files (`.pivot/stages/<name>.lock`) enable fast, parallel writes.
 - **Parameters** - Current parameter values
 - **Dependency hashes** - Content hashes of input files (with manifests for directories)
 - **Output hashes** - Content hashes of output files
-- **Dependency generations** - Generation counters for O(1) skip detection
 
 Lock files use relative paths for portability across machines.
 
 ## Data Flow
 
-1. **Discovery** - CLI discovers pipeline (pivot.yaml)
-2. **Registration** - Stages registered from YAML config
+1. **Discovery** - CLI discovers pipeline (pipeline.py or pivot.yaml)
+2. **Registration** - Stages registered from Python code (or YAML config)
 3. **DAG Construction** - Build dependency graph from outputs/inputs
 4. **Fingerprinting** - Hash code, params, and dependency content
 5. **Comparison** - Compare fingerprints with lock files
@@ -160,7 +179,7 @@ Lock files use relative paths for portability across machines.
 │   ├── preprocess.lock
 │   └── train.lock
 ├── config.yaml          # Remote configuration
-└── state.lmdb/          # LMDB database (hash cache, generations, run cache, remote index)
+└── state.db             # LMDB database (hash cache, generations, run cache, remote index)
 ```
 
 ## Key Design Decisions
@@ -193,7 +212,7 @@ Files are stored by their content hash:
 
 **Problem:** Importing numpy/pandas takes seconds per stage.
 
-**Solution:** `loky.get_reusable_executor()` keeps workers alive across calls. The first stage execution imports heavy dependencies; subsequent stages reuse those imports. Workers persist between execution waves in watch mode, eliminating repeated import overhead.
+**Solution:** `loky.get_reusable_executor()` keeps workers alive across stage executions within a run. The first stage execution imports heavy dependencies; subsequent stages reuse those imports. In watch mode, each run creates a fresh pool, and code reloads trigger an explicit restart via `executor_core.restart_workers()`.
 
 ### Trie for Path Validation
 
