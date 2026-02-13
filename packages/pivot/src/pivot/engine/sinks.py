@@ -38,7 +38,6 @@ _CATEGORY_WORD: dict[DisplayCategory, str] = {
 }
 _SKIP_CATEGORIES = {DisplayCategory.CACHED, DisplayCategory.BLOCKED, DisplayCategory.CANCELLED}
 _MAX_NAME_WIDTH = 50
-_SKIP_COLLAPSE_THRESHOLD = 20
 
 
 def _format_stage_line(
@@ -60,13 +59,17 @@ def _format_stage_line(
     if category == DisplayCategory.SUCCESS:
         duration_s = duration_ms / 1000
         return f"  {counter} {symbol} [bold]{padded_name}[/bold] {word} {duration_s:.1f}s"
+    if category in _SKIP_CATEGORIES:
+        return f"[dim]  {counter} {symbol} {padded_name} {word}[/dim]"
     return f"  {counter} {symbol} [bold]{padded_name}[/bold] {word}"
 
 
-def _format_skip_group_line(*, start_index: int, end_index: int, total: int, count: int) -> str:
+def _format_skip_group_line(
+    *, start_index: int, end_index: int, total: int, count: int, category: DisplayCategory
+) -> str:
     total_digits = len(str(total))
     range_text = f"{start_index:>{total_digits}}–{end_index:>{total_digits}}/{total}"
-    return f"[dim]  [{range_text}] ○ {count} stages not run[/dim]"
+    return f"[dim]  [{range_text}] ○ {count} {category.value}[/dim]"
 
 
 def _format_error_detail(reason: str, *, total: int) -> list[str]:
@@ -100,32 +103,33 @@ def _print_completions(
         event = sorted_events[i]
         category = _categorize(event)
         if category in _SKIP_CATEGORIES:
-            # Collect consecutive skips (cached/blocked/cancelled)
-            skip_group = [event]
+            # Collect consecutive skips of the SAME category
+            same_cat_group = [event]
             j = i + 1
-            while j < len(sorted_events) and _categorize(sorted_events[j]) in _SKIP_CATEGORIES:
-                skip_group.append(sorted_events[j])
+            while j < len(sorted_events) and _categorize(sorted_events[j]) == category:
+                same_cat_group.append(sorted_events[j])
                 j += 1
 
-            if len(skip_group) > _SKIP_COLLAPSE_THRESHOLD:
+            if len(same_cat_group) >= 2:
                 line = _format_skip_group_line(
-                    start_index=skip_group[0]["index"],
-                    end_index=skip_group[-1]["index"],
+                    start_index=same_cat_group[0]["index"],
+                    end_index=same_cat_group[-1]["index"],
                     total=total,
-                    count=len(skip_group),
+                    count=len(same_cat_group),
+                    category=category,
                 )
                 console.print(line)
             else:
-                for ev in skip_group:
-                    line = _format_stage_line(
-                        index=ev["index"],
-                        total=total,
-                        stage=ev["stage"],
-                        category=_categorize(ev),
-                        duration_ms=ev["duration_ms"],
-                        name_width=max_name_width,
-                    )
-                    console.print(line)
+                # Single skip — show individually (already dimmed)
+                line = _format_stage_line(
+                    index=event["index"],
+                    total=total,
+                    stage=event["stage"],
+                    category=category,
+                    duration_ms=event["duration_ms"],
+                    name_width=max_name_width,
+                )
+                console.print(line)
             i = j
         else:
             line = _format_stage_line(
