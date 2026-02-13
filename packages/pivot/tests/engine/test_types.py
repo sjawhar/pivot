@@ -439,7 +439,7 @@ def test_output_event_union() -> None:
         {
             "type": "sink_state_changed",
             "seq": 6,
-            "sink_id": "ConsoleSink",
+            "sink_id": "StaticConsoleSink",
             "state": types.SinkState.ENABLED,
             "reason": "manual",
             "failure_count": 0,
@@ -477,7 +477,7 @@ def test_sink_state_changed_event() -> None:
     event: types.SinkStateChanged = {
         "type": "sink_state_changed",
         "seq": 1,
-        "sink_id": "ConsoleSink",
+        "sink_id": "StaticConsoleSink",
         "state": types.SinkState.DISABLED,
         "reason": "exception",
         "failure_count": 5,

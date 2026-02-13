@@ -519,7 +519,14 @@ def _run_serve_mode(
             # Add sinks
             if not quiet:
                 serve_console = rich.console.Console()
-                eng.add_sink(sinks.ConsoleSink(console=serve_console, show_output=show_output))
+                if serve_console.is_terminal:
+                    eng.add_sink(
+                        sinks.LiveConsoleSink(console=serve_console, show_output=show_output)
+                    )
+                else:
+                    eng.add_sink(
+                        sinks.StaticConsoleSink(console=serve_console, show_output=show_output)
+                    )
             eng.add_sink(sinks.ResultCollectorSink())
             eng.add_sink(BroadcastEventSink())  # Broadcast events to connected agents
 

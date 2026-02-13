@@ -280,7 +280,11 @@ def configure_output_sink(
         return
 
     if use_console:
-        eng.add_sink(sinks.ConsoleSink(console=rich.console.Console(), show_output=show_output))
+        console = rich.console.Console()
+        if console.is_terminal:
+            eng.add_sink(sinks.LiveConsoleSink(console=console, show_output=show_output))
+        else:
+            eng.add_sink(sinks.StaticConsoleSink(console=console, show_output=show_output))
 
 
 def convert_results(

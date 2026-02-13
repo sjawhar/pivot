@@ -2,57 +2,137 @@
 
 from __future__ import annotations
 
+import time
+from io import StringIO
+
 import anyio
 import pytest
+import rich.live
+from rich.console import Console
 
 from pivot.engine import engine as engine_mod
-from pivot.engine import types
-from pivot.engine.types import OutputEvent, SinkState, StageCompleted, StageStarted
-from pivot.types import StageStatus
+from pivot.engine import sinks
+from pivot.engine.types import (
+    EngineDiagnostic,
+    LogLine,
+    OutputEvent,
+    SinkState,
+    StageCompleted,
+    StageExecutionState,
+    StageStarted,
+    StageStateChanged,
+)
+from pivot.types import DisplayCategory, StageStatus
 
-# =============================================================================
-# ConsoleSink Tests
-# =============================================================================
 
-
-async def test_console_sink_handles_stage_started() -> None:
-    """ConsoleSink prints stage_started events."""
-    from io import StringIO
-
-    from rich.console import Console
-
-    from pivot.engine.sinks import ConsoleSink
-    from pivot.engine.types import StageStarted
-
+def _helper_render_markup(text: str) -> str:
     output = StringIO()
-    console = Console(file=output, force_terminal=True)
-    sink = ConsoleSink(console=console)
+    console = Console(file=output, force_terminal=False, no_color=True)
+    console.print(text)
+    return output.getvalue()
 
-    event = StageStarted(
-        type="stage_started",
-        seq=0,
-        stage="train",
+
+def _helper_render_renderable(renderable: object) -> str:
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, no_color=True)
+    console.print(renderable)
+    return output.getvalue()
+
+
+# =============================================================================
+# Formatting Helper Tests
+# =============================================================================
+
+
+def test_format_stage_line_ran_includes_duration() -> None:
+    line = sinks._format_stage_line(
         index=0,
-        total=2,
+        total=12,
+        stage="train",
+        category=DisplayCategory.SUCCESS,
+        duration_ms=3400.0,
+        name_width=10,
     )
-    await sink.handle(event)
-    await sink.close()
+    rendered = _helper_render_markup(line)
+    assert "[ 1/12]" in rendered, "Should include right-aligned progress counter"
+    assert "✓" in rendered, "Should include checkmark for RAN"
+    assert "train" in rendered, "Should include stage name"
+    assert "done" in rendered, "Should include done status word"
+    assert "3.4s" in rendered, "Should include formatted duration"
 
-    assert "train" in output.getvalue()
+
+def test_format_stage_line_skipped_omits_duration() -> None:
+    line = sinks._format_stage_line(
+        index=1,
+        total=12,
+        stage="skip_stage",
+        category=DisplayCategory.CACHED,
+        duration_ms=1200.0,
+        name_width=12,
+    )
+    rendered = _helper_render_markup(line)
+    assert "○" in rendered, "Should include skip symbol"
+    assert "cached" in rendered, "Should include cached status word"
+    assert "1.2s" not in rendered, "Cached stages should not include duration"
 
 
-async def test_console_sink_handles_stage_completed_ran() -> None:
-    """ConsoleSink prints done message for RAN status."""
-    from io import StringIO
+def test_format_stage_line_failed_uses_failed_status() -> None:
+    line = sinks._format_stage_line(
+        index=2,
+        total=12,
+        stage="fail_stage",
+        category=DisplayCategory.FAILED,
+        duration_ms=1000.0,
+        name_width=12,
+    )
+    rendered = _helper_render_markup(line)
+    assert "✗" in rendered, "Should include failure symbol"
+    assert "FAILED" in rendered, "Should include FAILED status word"
+    assert "1.0s" not in rendered, "Failed stages should not include duration"
 
-    from rich.console import Console
 
-    from pivot.engine.sinks import ConsoleSink
-    from pivot.engine.types import StageCompleted
+def test_format_stage_line_truncates_long_names() -> None:
+    line = sinks._format_stage_line(
+        index=0,
+        total=1,
+        stage="very_long_stage_name",
+        category=DisplayCategory.SUCCESS,
+        duration_ms=100.0,
+        name_width=8,
+    )
+    rendered = _helper_render_markup(line)
+    assert "very_lo…" in rendered, "Should truncate long names with ellipsis"
+    assert "very_long_stage_name" not in rendered, "Should not include full long name"
 
+
+def test_format_skip_group_line_includes_range_and_count() -> None:
+    line = sinks._format_skip_group_line(start_index=0, end_index=2, total=9, count=3)
+    rendered = _helper_render_markup(line)
+    assert "1–3/9" in rendered, "Should include collapsed range"
+    assert "3 stages skipped" in rendered, "Should include skipped count text"
+    assert "○" in rendered, "Should include skip symbol"
+
+
+def test_format_error_detail_indents_each_line() -> None:
+    details = sinks._format_error_detail("Line 1\nLine 2", total=12)
+    assert len(details) == 2, "Should return one line per input line"
+    rendered = [_helper_render_markup(line) for line in details]
+    leading_spaces = [len(line) - len(line.lstrip(" ")) for line in rendered]
+    assert leading_spaces[0] >= 2, "Error detail lines should be indented"
+    assert leading_spaces[0] == leading_spaces[1], "Indentation should be consistent"
+    assert "Line 1" in rendered[0], "First error line should be present"
+    assert "Line 2" in rendered[1], "Second error line should be present"
+
+
+# =============================================================================
+# StaticConsoleSink Tests
+# =============================================================================
+
+
+async def test_static_sink_prints_ran_stage_line() -> None:
     output = StringIO()
-    console = Console(file=output, force_terminal=True)
-    sink = ConsoleSink(console=console)
+    console = Console(file=output, force_terminal=False, no_color=True)
+    sink = sinks.StaticConsoleSink(console=console)
 
     event = StageCompleted(
         type="stage_completed",
@@ -60,136 +140,608 @@ async def test_console_sink_handles_stage_completed_ran() -> None:
         stage="train",
         status=StageStatus.RAN,
         reason="",
-        duration_ms=1500,
+        duration_ms=1200.0,
         index=0,
         total=1,
         run_id="test-run",
         input_hash=None,
     )
     await sink.handle(event)
+    await sink.close()
 
-    assert "train" in output.getvalue()
-    assert "done" in output.getvalue()
+    result = output.getvalue()
+    assert "1/1" in result, "Should include progress counter"
+    assert "train" in result, "Should include stage name"
+    assert "done" in result, "Should include done status"
+    assert "1.2s" in result, "Should include duration"
 
 
-async def test_console_sink_handles_stage_completed_skipped() -> None:
-    """ConsoleSink prints skipped message for SKIPPED status."""
-    from io import StringIO
-
-    from rich.console import Console
-
-    from pivot.engine.sinks import ConsoleSink
-    from pivot.engine.types import StageCompleted
-
+async def test_static_sink_prints_skipped_stages_individually_when_low_count() -> None:
     output = StringIO()
-    console = Console(file=output, force_terminal=True)
-    sink = ConsoleSink(console=console)
+    console = Console(file=output, force_terminal=False, no_color=True)
+    sink = sinks.StaticConsoleSink(console=console)
 
-    event = StageCompleted(
-        type="stage_completed",
+    events = [
+        StageCompleted(
+            type="stage_completed",
+            seq=idx,
+            stage=f"skip_{idx}",
+            status=StageStatus.SKIPPED,
+            reason="up-to-date",
+            duration_ms=10.0,
+            index=idx,
+            total=3,
+            run_id="test-run",
+            input_hash=None,
+        )
+        for idx in range(2)
+    ]
+    for event in events:
+        await sink.handle(event)
+    await sink.close()
+
+    result = output.getvalue()
+    assert "skip_0" in result, "Should include first skipped stage"
+    assert "skip_1" in result, "Should include second skipped stage"
+    assert "cached" in result, "Should show cached status for up-to-date stages"
+    assert "stages skipped" not in result, "Should not collapse low skip counts"
+
+
+async def test_static_sink_collapses_skips_over_threshold() -> None:
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, no_color=True)
+    sink = sinks.StaticConsoleSink(console=console)
+
+    for idx in range(21):
+        event = StageCompleted(
+            type="stage_completed",
+            seq=idx,
+            stage=f"skip_{idx}",
+            status=StageStatus.SKIPPED,
+            reason="up-to-date",
+            duration_ms=10.0,
+            index=idx,
+            total=21,
+            run_id="test-run",
+            input_hash=None,
+        )
+        await sink.handle(event)
+    await sink.close()
+
+    result = output.getvalue()
+    assert "21 stages skipped" in result, "Should collapse skipped stages over threshold"
+
+
+async def test_static_sink_does_not_collapse_skips_at_threshold() -> None:
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, no_color=True)
+    sink = sinks.StaticConsoleSink(console=console)
+
+    for idx in range(20):
+        event = StageCompleted(
+            type="stage_completed",
+            seq=idx,
+            stage=f"skip_{idx}",
+            status=StageStatus.SKIPPED,
+            reason="up-to-date",
+            duration_ms=10.0,
+            index=idx,
+            total=20,
+            run_id="test-run",
+            input_hash=None,
+        )
+        await sink.handle(event)
+    await sink.close()
+
+    result = output.getvalue()
+    assert "stages skipped" not in result, "Should not collapse skips at threshold"
+
+
+async def test_static_sink_ignores_waiting_on_lock_state_changes() -> None:
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, no_color=True)
+    sink = sinks.StaticConsoleSink(console=console)
+
+    event = StageStateChanged(
+        type="stage_state_changed",
         seq=0,
         stage="train",
-        status=StageStatus.SKIPPED,
-        reason="up-to-date",
-        duration_ms=10,
-        index=0,
-        total=1,
+        state=StageExecutionState.WAITING_ON_LOCK,
+        previous_state=StageExecutionState.PREPARING,
         run_id="test-run",
-        input_hash=None,
     )
     await sink.handle(event)
+    await sink.close()
 
-    assert "train" in output.getvalue()
-    assert "skipped" in output.getvalue()
+    assert output.getvalue() == "", "Should not print state changes"
 
 
-async def test_console_sink_handles_stage_completed_failed() -> None:
-    """ConsoleSink prints FAILED message for FAILED status."""
-    from io import StringIO
-
-    from rich.console import Console
-
-    from pivot.engine.sinks import ConsoleSink
-    from pivot.engine.types import StageCompleted
-
+async def test_static_sink_prints_failed_with_error_details() -> None:
     output = StringIO()
-    console = Console(file=output, force_terminal=True)
-    sink = ConsoleSink(console=console)
+    console = Console(file=output, force_terminal=False, no_color=True)
+    sink = sinks.StaticConsoleSink(console=console)
 
     event = StageCompleted(
         type="stage_completed",
         seq=0,
         stage="train",
         status=StageStatus.FAILED,
-        reason="exception",
-        duration_ms=100,
+        reason="first line\nsecond line",
+        duration_ms=100.0,
         index=0,
         total=1,
         run_id="test-run",
         input_hash=None,
     )
     await sink.handle(event)
+    await sink.close()
 
     result = output.getvalue()
-    assert "train" in result
-    assert "FAILED" in result
-    assert "exception" in result  # Reason should now be displayed
+    assert "FAILED" in result, "Should include FAILED status"
+    assert "first line" in result, "Should include first error detail"
+    assert "second line" in result, "Should include second error detail"
 
 
-async def test_console_sink_handles_multiline_reason() -> None:
-    """ConsoleSink indents multi-line error reasons."""
-    from io import StringIO
-
-    from rich.console import Console
-
-    from pivot.engine.sinks import ConsoleSink
-    from pivot.engine.types import StageCompleted
-
+async def test_static_sink_ignores_stage_started() -> None:
     output = StringIO()
-    console = Console(file=output, force_terminal=True)
-    sink = ConsoleSink(console=console)
+    console = Console(file=output, force_terminal=False, no_color=True)
+    sink = sinks.StaticConsoleSink(console=console)
 
-    event = StageCompleted(
-        type="stage_completed",
+    event = StageStarted(
+        type="stage_started",
         seq=0,
         stage="train",
-        status=StageStatus.FAILED,
-        reason="Traceback (most recent call last):\n  File test.py\nValueError: bad",
-        duration_ms=100,
         index=0,
-        total=1,
+        total=2,
         run_id="test-run",
-        input_hash=None,
+    )
+    await sink.handle(event)
+    await sink.close()
+
+    assert output.getvalue() == "", "Should not print stage_started events"
+
+
+async def test_static_sink_sorts_completions_by_index() -> None:
+    """Completions are printed sorted by index on close(), not arrival order."""
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, no_color=True)
+    sink = sinks.StaticConsoleSink(console=console)
+
+    # Send in reverse index order
+    for idx, name in [(2, "third"), (0, "first"), (1, "second")]:
+        await sink.handle(
+            StageCompleted(
+                type="stage_completed",
+                seq=idx,
+                stage=name,
+                status=StageStatus.RAN,
+                reason="",
+                duration_ms=100.0,
+                index=idx,
+                total=3,
+                run_id="test-run",
+                input_hash=None,
+            )
+        )
+    await sink.close()
+
+    result = output.getvalue()
+    assert result.index("first") < result.index("second") < result.index("third"), (
+        "Completions should be sorted by index"
+    )
+
+
+async def test_static_sink_prints_log_lines_when_show_output_enabled() -> None:
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, no_color=True)
+    sink = sinks.StaticConsoleSink(console=console, show_output=True)
+
+    event = LogLine(
+        type="log_line",
+        seq=0,
+        stage="train",
+        line="Processing batch 1...",
+        is_stderr=False,
     )
     await sink.handle(event)
 
     result = output.getvalue()
-    assert "FAILED" in result
-    assert "Traceback" in result
-    assert "ValueError" in result
+    assert "train" in result, "Should include stage name"
+    assert "Processing batch" in result, "Should include log line text"
 
 
-async def test_console_sink_ignores_other_events() -> None:
-    """ConsoleSink ignores events it doesn't handle."""
-    from io import StringIO
-
-    from rich.console import Console
-
-    from pivot.engine.sinks import ConsoleSink
-
+async def test_static_sink_stderr_log_line() -> None:
     output = StringIO()
-    console = Console(file=output, force_terminal=True)
-    sink = ConsoleSink(console=console)
+    console = Console(file=output, force_terminal=False, no_color=True)
+    sink = sinks.StaticConsoleSink(console=console, show_output=True)
 
-    event: types.EngineStateChanged = {
-        "type": "engine_state_changed",
-        "seq": 0,
-        "state": types.EngineState.ACTIVE,
-    }
+    event = LogLine(
+        type="log_line",
+        seq=0,
+        stage="train",
+        line="Warning: GPU not available",
+        is_stderr=True,
+    )
     await sink.handle(event)
 
-    # Should not print anything for unhandled events
-    assert output.getvalue() == ""
+    result = output.getvalue()
+    assert "train" in result, "Should include stage name"
+    assert "Warning: GPU not available" in result, "Should include stderr text"
+
+
+async def test_static_sink_escapes_rich_markup_in_log_lines() -> None:
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, no_color=True)
+    sink = sinks.StaticConsoleSink(console=console, show_output=True)
+
+    event = LogLine(
+        type="log_line",
+        seq=0,
+        stage="train",
+        line="[bold red]FAKE ERROR[/bold red] - this should display literally",
+        is_stderr=False,
+    )
+    await sink.handle(event)
+
+    result = output.getvalue()
+    assert "train" in result, "Should include stage name"
+    assert "FAKE ERROR" in result, "Should include escaped log content"
+    assert "this should display literally" in result, "Should include full log line"
+    assert "[bold red]" in result or "\\[bold red]" in result, (
+        "Should render markup tags as literal text"
+    )
+
+
+async def test_static_sink_ignores_log_lines_when_show_output_disabled() -> None:
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, no_color=True)
+    sink = sinks.StaticConsoleSink(console=console, show_output=False)
+
+    event = LogLine(
+        type="log_line",
+        seq=0,
+        stage="train",
+        line="Processing batch 1...",
+        is_stderr=False,
+    )
+    await sink.handle(event)
+
+    assert output.getvalue() == "", "Should ignore log lines when show_output=False"
+
+
+async def test_static_sink_log_lines_stream_before_completions() -> None:
+    """Log lines print in real-time, completions print on close."""
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, no_color=True)
+    sink = sinks.StaticConsoleSink(console=console, show_output=True)
+
+    await sink.handle(
+        StageCompleted(
+            type="stage_completed",
+            seq=0,
+            stage="skip_stage",
+            status=StageStatus.SKIPPED,
+            reason="cached",
+            duration_ms=10.0,
+            index=0,
+            total=2,
+            run_id="test-run",
+            input_hash=None,
+        )
+    )
+    await sink.handle(
+        LogLine(
+            type="log_line",
+            seq=1,
+            stage="log_stage",
+            line="hello",
+            is_stderr=False,
+        )
+    )
+
+    # Before close: only log lines should be printed (completions are buffered)
+    before_close = output.getvalue()
+    assert "log_stage" in before_close, "Log lines should stream immediately"
+    assert "skip_stage" not in before_close, "Completions should be buffered until close"
+
+    await sink.close()
+
+    # After close: completions appear
+    result = output.getvalue()
+    assert "skip_stage" in result, "Completions should appear after close"
+
+
+async def test_static_sink_prints_engine_diagnostics() -> None:
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, no_color=True)
+    sink = sinks.StaticConsoleSink(console=console)
+
+    event = EngineDiagnostic(
+        type="engine_diagnostic",
+        seq=0,
+        message="Scheduler delay",
+        detail="Loop blocked",
+    )
+    await sink.handle(event)
+
+    result = output.getvalue()
+    assert "Engine diagnostic" in result, "Should include diagnostic prefix"
+    assert "Scheduler delay" in result, "Should include diagnostic message"
+    assert "Loop blocked" in result, "Should include diagnostic detail"
+
+
+# =============================================================================
+# LiveConsoleSink Tests
+# =============================================================================
+
+
+async def test_live_sink_prints_completion_to_scrollback() -> None:
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, no_color=True)
+    sink = sinks.LiveConsoleSink(console=console)
+
+    await sink.handle(
+        StageStarted(
+            type="stage_started",
+            seq=0,
+            stage="train",
+            index=0,
+            total=1,
+            run_id="test-run",
+        )
+    )
+    await sink.handle(
+        StageCompleted(
+            type="stage_completed",
+            seq=1,
+            stage="train",
+            status=StageStatus.RAN,
+            reason="",
+            duration_ms=1200.0,
+            index=0,
+            total=1,
+            run_id="test-run",
+            input_hash=None,
+        )
+    )
+    await sink.close()
+
+    result = output.getvalue()
+    assert "train" in result, "Should include stage name"
+    assert "done" in result, "Should include completion status"
+
+
+async def test_live_sink_tracks_running_stages() -> None:
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, no_color=True)
+    sink = sinks.LiveConsoleSink(console=console)
+
+    start = time.monotonic()
+    await sink.handle(
+        StageStarted(
+            type="stage_started",
+            seq=0,
+            stage="train",
+            index=0,
+            total=1,
+            run_id="test-run",
+        )
+    )
+
+    assert "train" in sink._running, "Should track running stage"  # type: ignore[reportPrivateUsage] - testing internal state
+    assert sink._running["train"] >= start, "Start time should be recorded"  # type: ignore[reportPrivateUsage] - testing internal state
+    assert isinstance(sink._live, rich.live.Live), "Should start Rich Live renderer"  # type: ignore[reportPrivateUsage] - testing internal state
+
+    await sink.handle(
+        StageCompleted(
+            type="stage_completed",
+            seq=1,
+            stage="train",
+            status=StageStatus.RAN,
+            reason="",
+            duration_ms=50.0,
+            index=0,
+            total=1,
+            run_id="test-run",
+            input_hash=None,
+        )
+    )
+    await sink.close()
+
+    assert "train" not in sink._running, "Should remove stage after completion"  # type: ignore[reportPrivateUsage] - testing internal state
+
+
+async def test_live_sink_ignores_waiting_on_lock() -> None:
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, no_color=True)
+    sink = sinks.LiveConsoleSink(console=console)
+
+    event = StageStateChanged(
+        type="stage_state_changed",
+        seq=0,
+        stage="train",
+        state=StageExecutionState.WAITING_ON_LOCK,
+        previous_state=StageExecutionState.PREPARING,
+        run_id="test-run",
+    )
+    await sink.handle(event)
+    await sink.close()
+
+    assert output.getvalue() == "", "Should ignore waiting-on-lock events"
+
+
+async def test_live_sink_collapses_many_skips_in_scrollback() -> None:
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, no_color=True)
+    sink = sinks.LiveConsoleSink(console=console)
+
+    for idx in range(21):
+        await sink.handle(
+            StageCompleted(
+                type="stage_completed",
+                seq=idx,
+                stage=f"skip_{idx}",
+                status=StageStatus.SKIPPED,
+                reason="cached",
+                duration_ms=10.0,
+                index=idx,
+                total=21,
+                run_id="test-run",
+                input_hash=None,
+            )
+        )
+    await sink.close()
+
+    result = output.getvalue()
+    assert "21 stages skipped" in result, "Should collapse skipped stages over threshold"
+
+
+async def test_live_sink_prints_all_statuses_on_close() -> None:
+    """LiveConsoleSink prints ran, skipped, failed completions on close."""
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, no_color=True)
+    sink = sinks.LiveConsoleSink(console=console)
+
+    await sink.handle(
+        StageCompleted(
+            type="stage_completed",
+            seq=0,
+            stage="ran_stage",
+            status=StageStatus.RAN,
+            reason="",
+            duration_ms=1000.0,
+            index=0,
+            total=3,
+            run_id="test-run",
+            input_hash=None,
+        )
+    )
+    await sink.handle(
+        StageCompleted(
+            type="stage_completed",
+            seq=1,
+            stage="skipped_stage",
+            status=StageStatus.SKIPPED,
+            reason="cached",
+            duration_ms=2000.0,
+            index=1,
+            total=3,
+            run_id="test-run",
+            input_hash=None,
+        )
+    )
+    await sink.handle(
+        StageCompleted(
+            type="stage_completed",
+            seq=2,
+            stage="failed_stage",
+            status=StageStatus.FAILED,
+            reason="boom",
+            duration_ms=500.0,
+            index=2,
+            total=3,
+            run_id="test-run",
+            input_hash=None,
+        )
+    )
+    await sink.close()
+
+    result = output.getvalue()
+    assert "ran_stage" in result and "done" in result, "Should include ran stage"
+    assert "skipped_stage" in result and "cached" in result, (
+        "Should include skipped stage with cached status"
+    )
+    assert "failed_stage" in result and "FAILED" in result, "Should include failed stage"
+
+
+async def test_live_sink_show_output_prints_log_lines() -> None:
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, no_color=True)
+    sink = sinks.LiveConsoleSink(console=console, show_output=True)
+
+    event = LogLine(
+        type="log_line",
+        seq=0,
+        stage="train",
+        line="Processing batch 1...",
+        is_stderr=False,
+    )
+    await sink.handle(event)
+    await sink.close()
+
+    result = output.getvalue()
+    assert "train" in result, "Should include stage name"
+    assert "Processing batch" in result, "Should include log line text"
+
+
+async def test_live_sink_hides_log_lines_by_default() -> None:
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, no_color=True)
+    sink = sinks.LiveConsoleSink(console=console, show_output=False)
+
+    event = LogLine(
+        type="log_line",
+        seq=0,
+        stage="train",
+        line="Processing batch 1...",
+        is_stderr=False,
+    )
+    await sink.handle(event)
+    await sink.close()
+
+    assert output.getvalue() == "", "Should ignore log lines when show_output=False"
+
+
+async def test_live_sink_live_renderable_shows_running_stages() -> None:
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, no_color=True)
+    sink = sinks.LiveConsoleSink(console=console)
+
+    await sink.handle(
+        StageStarted(
+            type="stage_started",
+            seq=0,
+            stage="train",
+            index=0,
+            total=1,
+            run_id="test-run",
+        )
+    )
+
+    rendered = _helper_render_renderable(
+        sink._build_live_group()  # type: ignore[reportPrivateUsage] - testing live renderable
+    )
+    await sink.close()
+
+    assert "train" in rendered, "Live renderable should include running stage"
+
+
+async def test_live_sink_live_renderable_shows_progress() -> None:
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, no_color=True)
+    sink = sinks.LiveConsoleSink(console=console)
+
+    await sink.handle(
+        StageCompleted(
+            type="stage_completed",
+            seq=0,
+            stage="train",
+            status=StageStatus.RAN,
+            reason="",
+            duration_ms=1000.0,
+            index=0,
+            total=3,
+            run_id="test-run",
+            input_hash=None,
+        )
+    )
+
+    rendered = _helper_render_renderable(
+        sink._build_live_group()  # type: ignore[reportPrivateUsage] - testing live renderable
+    )
+    await sink.close()
+
+    assert "1/3" in rendered, "Live renderable should include progress counts"
 
 
 # =============================================================================
@@ -199,10 +751,7 @@ async def test_console_sink_ignores_other_events() -> None:
 
 async def test_result_collector_sink_collects_completed() -> None:
     """ResultCollectorSink collects stage_completed events."""
-    from pivot.engine.sinks import ResultCollectorSink
-    from pivot.engine.types import StageCompleted
-
-    sink = ResultCollectorSink()
+    sink = sinks.ResultCollectorSink()
 
     event = StageCompleted(
         type="stage_completed",
@@ -227,10 +776,7 @@ async def test_result_collector_sink_collects_completed() -> None:
 
 async def test_result_collector_sink_ignores_other_events() -> None:
     """ResultCollectorSink ignores non-completed events."""
-    from pivot.engine.sinks import ResultCollectorSink
-    from pivot.engine.types import StageStarted
-
-    sink = ResultCollectorSink()
+    sink = sinks.ResultCollectorSink()
 
     event = StageStarted(
         type="stage_started",
@@ -249,10 +795,7 @@ async def test_result_collector_sink_ignores_other_events() -> None:
 @pytest.mark.anyio
 async def test_result_collector_sink_concurrent_access() -> None:
     """ResultCollectorSink protects shared state with lock under concurrent access."""
-    from pivot.engine.sinks import ResultCollectorSink
-    from pivot.engine.types import StageCompleted
-
-    sink = ResultCollectorSink()
+    sink = sinks.ResultCollectorSink()
 
     async def worker(stage_name: str) -> None:
         event = StageCompleted(
@@ -287,10 +830,7 @@ async def test_result_collector_sink_prevents_lost_updates() -> None:
     This test verifies that the lock actually prevents race conditions by
     checking that the final result for each stage matches the last iteration.
     """
-    from pivot.engine.sinks import ResultCollectorSink
-    from pivot.engine.types import StageCompleted
-
-    sink = ResultCollectorSink()
+    sink = sinks.ResultCollectorSink()
 
     async def worker(stage_name: str) -> None:
         for i in range(100):
@@ -325,271 +865,6 @@ async def test_result_collector_sink_prevents_lost_updates() -> None:
         assert stage_result["duration_ms"] == 99.0, (
             f"stage_{i} should have final duration, verifying no corruption"
         )
-
-
-async def test_console_sink_formats_duration_correctly() -> None:
-    """ConsoleSink formats duration with correct precision in output."""
-    from io import StringIO
-
-    from rich.console import Console
-
-    from pivot.engine.sinks import ConsoleSink
-    from pivot.engine.types import StageCompleted
-
-    output = StringIO()
-    console = Console(file=output, force_terminal=True)
-    sink = ConsoleSink(console=console)
-
-    event = StageCompleted(
-        type="stage_completed",
-        seq=0,
-        stage="train",
-        status=StageStatus.RAN,
-        reason="",
-        duration_ms=1500.0,
-        index=0,
-        total=1,
-        run_id="test-run",
-        input_hash=None,
-    )
-    await sink.handle(event)
-
-    text = output.getvalue()
-    assert "train" in text, "Stage name should appear"
-    assert "done" in text, "Status should appear"
-    # Rich adds ANSI escape codes that can split numbers, verify components
-    assert "1." in text and "5s" in text, "Duration components should appear"
-
-
-async def test_console_sink_running_message_format() -> None:
-    """ConsoleSink prints 'Running <stage>...' for stage_started events."""
-    from io import StringIO
-
-    from rich.console import Console
-
-    from pivot.engine.sinks import ConsoleSink
-    from pivot.engine.types import StageStarted
-
-    output = StringIO()
-    console = Console(file=output, force_terminal=True)
-    sink = ConsoleSink(console=console)
-
-    event = StageStarted(
-        type="stage_started",
-        seq=0,
-        stage="train",
-        index=0,
-        total=2,
-        run_id="test-run",
-    )
-    await sink.handle(event)
-
-    text = output.getvalue()
-    assert "Running train" in text, "Should include 'Running' prefix"
-    assert "..." in text, "Should include trailing ellipsis"
-
-
-async def test_console_sink_handles_log_line_when_show_output_enabled() -> None:
-    """ConsoleSink prints log lines when show_output=True."""
-    from io import StringIO
-
-    from rich.console import Console
-
-    from pivot.engine.sinks import ConsoleSink
-    from pivot.engine.types import LogLine
-
-    output = StringIO()
-    console = Console(file=output, force_terminal=True)
-    sink = ConsoleSink(console=console, show_output=True)
-
-    event = LogLine(
-        type="log_line",
-        seq=0,
-        stage="train",
-        line="Processing batch 1...",
-        is_stderr=False,
-    )
-    await sink.handle(event)
-
-    result = output.getvalue()
-    # Rich adds ANSI codes that can split brackets, check components separately
-    assert "train" in result
-    assert "Processing batch" in result
-
-
-async def test_console_sink_stderr_line_contains_content() -> None:
-    """ConsoleSink prints stderr lines with stage prefix."""
-    from io import StringIO
-
-    from rich.console import Console
-
-    from pivot.engine.sinks import ConsoleSink
-    from pivot.engine.types import LogLine
-
-    output = StringIO()
-    console = Console(file=output, force_terminal=True)
-    sink = ConsoleSink(console=console, show_output=True)
-
-    event = LogLine(
-        type="log_line",
-        seq=0,
-        stage="train",
-        line="Warning: GPU not available",
-        is_stderr=True,
-    )
-    await sink.handle(event)
-
-    result = output.getvalue()
-    # Rich adds ANSI codes that can split brackets, check components separately
-    assert "train" in result
-    assert "Warning: GPU not available" in result
-
-
-async def test_console_sink_ignores_log_line_when_show_output_disabled() -> None:
-    """ConsoleSink ignores log lines when show_output=False (default)."""
-    from io import StringIO
-
-    from rich.console import Console
-
-    from pivot.engine.sinks import ConsoleSink
-    from pivot.engine.types import LogLine
-
-    output = StringIO()
-    console = Console(file=output, force_terminal=True)
-    sink = ConsoleSink(console=console)  # show_output defaults to False
-
-    event = LogLine(
-        type="log_line",
-        seq=0,
-        stage="train",
-        line="Processing batch 1...",
-        is_stderr=False,
-    )
-    await sink.handle(event)
-
-    # Should not print anything when show_output is False
-    assert output.getvalue() == ""
-
-
-async def test_console_sink_handles_empty_log_line() -> None:
-    """ConsoleSink handles empty log lines without errors."""
-    from io import StringIO
-
-    from rich.console import Console
-
-    from pivot.engine.sinks import ConsoleSink
-    from pivot.engine.types import LogLine
-
-    output = StringIO()
-    console = Console(file=output, force_terminal=True)
-    sink = ConsoleSink(console=console, show_output=True)
-
-    event = LogLine(
-        type="log_line",
-        seq=0,
-        stage="train",
-        line="",
-        is_stderr=False,
-    )
-    await sink.handle(event)
-
-    result = output.getvalue()
-    # Should still print stage prefix even with empty line
-    assert "train" in result
-
-
-async def test_console_sink_handles_multiline_log_output() -> None:
-    """ConsoleSink prints each line from multiline output separately."""
-    from io import StringIO
-
-    from rich.console import Console
-
-    from pivot.engine.sinks import ConsoleSink
-    from pivot.engine.types import LogLine
-
-    output = StringIO()
-    console = Console(file=output, force_terminal=True)
-    sink = ConsoleSink(console=console, show_output=True)
-
-    # Simulate a stage that outputs multiline logs
-    event = LogLine(
-        type="log_line",
-        seq=0,
-        stage="train",
-        line="Line 1\nLine 2\nLine 3",
-        is_stderr=False,
-    )
-    await sink.handle(event)
-
-    result = output.getvalue()
-    assert "train" in result
-    # Rich may tokenize numbers separately, check components
-    assert "Line" in result
-    assert "1" in result and "2" in result and "3" in result
-
-
-async def test_console_sink_handles_special_characters() -> None:
-    """ConsoleSink handles special characters without crashing."""
-    from io import StringIO
-
-    from rich.console import Console
-
-    from pivot.engine.sinks import ConsoleSink
-    from pivot.engine.types import LogLine
-
-    output = StringIO()
-    console = Console(file=output, force_terminal=True)
-    sink = ConsoleSink(console=console, show_output=True)
-
-    # Test with brackets that could conflict with Rich markup
-    event = LogLine(
-        type="log_line",
-        seq=0,
-        stage="train",
-        line="[INFO] Processing <data> with 'quotes' and \"double quotes\"",
-        is_stderr=False,
-    )
-    await sink.handle(event)
-
-    result = output.getvalue()
-    assert "train" in result
-    assert "INFO" in result
-    assert "Processing" in result
-
-
-async def test_console_sink_escapes_rich_markup_in_log_lines() -> None:
-    """ConsoleSink escapes Rich markup in log lines to prevent injection.
-
-    Stage output containing Rich markup syntax (e.g. [red]text[/red]) should
-    be displayed literally, not interpreted as formatting instructions.
-    """
-    from io import StringIO
-
-    from rich.console import Console
-
-    from pivot.engine.sinks import ConsoleSink
-    from pivot.engine.types import LogLine
-
-    output = StringIO()
-    # no_color=True ensures we get plain text output for easier assertion
-    console = Console(file=output, force_terminal=False, no_color=True)
-    sink = ConsoleSink(console=console, show_output=True)
-
-    # Simulate a stage that outputs text containing Rich markup syntax
-    event = LogLine(
-        type="log_line",
-        seq=0,
-        stage="train",
-        line="[bold red]FAKE ERROR[/bold red] - this should display literally",
-        is_stderr=False,
-    )
-    await sink.handle(event)
-
-    result = output.getvalue()
-    # The markup tags should be visible as literal text, not interpreted
-    assert "[bold red]" in result or "\\[bold red]" in result
-    assert "FAKE ERROR" in result
-    assert "this should display literally" in result
 
 
 # =============================================================================

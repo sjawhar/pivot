@@ -336,9 +336,7 @@ def test_periodic_status_during_contention(tmp_path: pathlib.Path) -> None:
         f"stage_c failed:\nstdout={stdout_c.decode()}\nstderr={stderr_c.decode()}"
     )
 
-    # Check that the blocked process emitted a waiting/lock status message.
-    # The ConsoleSink prints "waiting for artifact lock" to stdout (via rich Console).
     combined_c = stdout_c.decode() + stderr_c.decode()
-    assert "waiting" in combined_c.lower() or "lock" in combined_c.lower(), (
-        f"Expected lock-wait status in stage_c output, got:\nstdout={stdout_c.decode()}\nstderr={stderr_c.decode()}"
+    assert "waiting for artifact lock" not in combined_c.lower(), (
+        "Lock-wait message should not be emitted in console output"
     )

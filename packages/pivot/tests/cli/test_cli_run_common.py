@@ -520,11 +520,16 @@ def test_configure_output_sink_quiet_mode(mocker: MockerFixture) -> None:
     mock_engine.add_sink.assert_not_called()
 
 
-def test_configure_output_sink_console_mode(mocker: MockerFixture) -> None:
-    """configure_output_sink adds ConsoleSink when use_console=True."""
+def test_configure_output_sink_picks_live_for_terminal(mocker: MockerFixture) -> None:
+    """configure_output_sink adds LiveConsoleSink for terminal consoles."""
     from pivot.engine import engine, sinks
 
     mock_engine = mocker.MagicMock(spec=engine.Engine)
+    mocker.patch(
+        "rich.console.Console.is_terminal",
+        new_callable=mocker.PropertyMock,
+        return_value=True,
+    )
 
     _run_common.configure_output_sink(
         mock_engine,
@@ -536,7 +541,31 @@ def test_configure_output_sink_console_mode(mocker: MockerFixture) -> None:
 
     mock_engine.add_sink.assert_called_once()
     added_sink = mock_engine.add_sink.call_args[0][0]
-    assert isinstance(added_sink, sinks.ConsoleSink)
+    assert isinstance(added_sink, sinks.LiveConsoleSink), "Should add LiveConsoleSink"
+
+
+def test_configure_output_sink_picks_static_for_non_terminal(mocker: MockerFixture) -> None:
+    """configure_output_sink adds StaticConsoleSink for non-terminal consoles."""
+    from pivot.engine import engine, sinks
+
+    mock_engine = mocker.MagicMock(spec=engine.Engine)
+    mocker.patch(
+        "rich.console.Console.is_terminal",
+        new_callable=mocker.PropertyMock,
+        return_value=False,
+    )
+
+    _run_common.configure_output_sink(
+        mock_engine,
+        quiet=False,
+        as_json=False,
+        use_console=True,
+        jsonl_callback=None,
+    )
+
+    mock_engine.add_sink.assert_called_once()
+    added_sink = mock_engine.add_sink.call_args[0][0]
+    assert isinstance(added_sink, sinks.StaticConsoleSink), "Should add StaticConsoleSink"
 
 
 def test_configure_output_sink_json_overrides_quiet(mocker: MockerFixture) -> None:

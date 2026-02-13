@@ -121,8 +121,8 @@ def test_repro_keep_going_flag_continues_after_failure(
     result = runner.invoke(cli.cli, ["repro", "--keep-going"])
 
     assert result.exit_code == 0
-    assert "failing: FAILED" in result.output
-    assert "succeeding: done" in result.output  # Console sink outputs "done" for successful stages
+    assert "failing" in result.output and "FAILED" in result.output
+    assert "succeeding" in result.output and "done" in result.output
     assert (tmp_path / "succeeding.txt").read_text() == "success"
 
 
@@ -142,12 +142,12 @@ def test_repro_keep_going_flag_skips_downstream(
     result = runner.invoke(cli.cli, ["repro", "--keep-going"])
 
     assert result.exit_code == 0
-    assert "first: FAILED" in result.output
-    # Blocked stages show as "skipped" in console output (status is SKIPPED with reason)
-    assert "second: skipped" in result.output
+    assert "first" in result.output and "FAILED" in result.output
+    # Blocked stages now show as "blocked" in console output
+    assert "second" in result.output and "blocked" in result.output
     # Summary shows blocked count
     assert "blocked" in result.output
-    assert "independent: done" in result.output
+    assert "independent" in result.output and "done" in result.output
 
 
 def test_repro_keep_going_short_flag(
@@ -165,8 +165,8 @@ def test_repro_keep_going_short_flag(
     result = runner.invoke(cli.cli, ["repro", "-k"])
 
     assert result.exit_code == 0
-    assert "failing: FAILED" in result.output
-    assert "succeeding: done" in result.output
+    assert "failing" in result.output and "FAILED" in result.output
+    assert "succeeding" in result.output and "done" in result.output
 
 
 def test_repro_without_keep_going_stops_on_failure(
@@ -186,9 +186,9 @@ def test_repro_without_keep_going_stops_on_failure(
     result = runner.invoke(cli.cli, ["repro"])
 
     assert result.exit_code == 0
-    assert "failing: FAILED" in result.output
-    # Without --keep-going, downstream stages show as skipped (blocked internally)
-    assert "downstream: skipped" in result.output
+    assert "failing" in result.output and "FAILED" in result.output
+    # Without --keep-going, downstream stages show as blocked
+    assert "downstream" in result.output and "blocked" in result.output
     # Summary shows blocked count
     assert "blocked" in result.output
     assert not (tmp_path / "downstream.txt").exists()
@@ -301,7 +301,7 @@ def test_run_default_fails_fast(
     result = runner.invoke(cli.cli, ["run", "failing", "succeeding"])
 
     assert result.exit_code == 0
-    assert "failing: FAILED" in result.output
+    assert "failing" in result.output and "FAILED" in result.output
 
 
 def test_run_fail_fast_stops_early(
@@ -319,7 +319,7 @@ def test_run_fail_fast_stops_early(
     result = runner.invoke(cli.cli, ["run", "--fail-fast", "failing", "succeeding"])
 
     assert result.exit_code == 0
-    assert "failing: FAILED" in result.output
+    assert "failing" in result.output and "FAILED" in result.output
 
 
 def test_run_keep_going_continues_after_failure(
@@ -337,8 +337,8 @@ def test_run_keep_going_continues_after_failure(
     result = runner.invoke(cli.cli, ["run", "--keep-going", "failing", "succeeding"])
 
     assert result.exit_code == 0
-    assert "failing: FAILED" in result.output
-    assert "succeeding: done" in result.output
+    assert "failing" in result.output and "FAILED" in result.output
+    assert "succeeding" in result.output and "done" in result.output
     assert (tmp_path / "succeeding.txt").read_text() == "success"
 
 
@@ -357,8 +357,8 @@ def test_run_keep_going_short_flag(
     result = runner.invoke(cli.cli, ["run", "-k", "failing", "succeeding"])
 
     assert result.exit_code == 0
-    assert "failing: FAILED" in result.output
-    assert "succeeding: done" in result.output
+    assert "failing" in result.output and "FAILED" in result.output
+    assert "succeeding" in result.output and "done" in result.output
 
 
 def test_run_keep_going_flag_shown_in_help(runner: CliRunner) -> None:
@@ -394,8 +394,8 @@ def test_repro_fail_fast_stops_on_failure(
     result = runner.invoke(cli.cli, ["repro", "--fail-fast"])
 
     assert result.exit_code == 0
-    assert "failing: FAILED" in result.output
-    assert "downstream: skipped" in result.output
+    assert "failing" in result.output and "FAILED" in result.output
+    assert "downstream" in result.output and "blocked" in result.output
     assert not (tmp_path / "downstream.txt").exists()
 
 

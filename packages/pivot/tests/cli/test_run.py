@@ -205,7 +205,7 @@ def test_run_default_fails_fast(
     result = runner.invoke(cli.cli, ["run", "failing", "stage_a"])
 
     assert result.exit_code == 0
-    assert "failing: FAILED" in result.output
+    assert "failing" in result.output and "FAILED" in result.output
 
 
 def test_run_fail_fast_option_accepted(
