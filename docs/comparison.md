@@ -29,7 +29,7 @@ How Pivot compares to other pipeline and workflow tools.
 ### Use Pivot When
 
 - You need fast local iteration with automatic code change detection
-- Your pipeline is Python-native and you want decorator-based configuration
+- Your pipeline is Python-native and you want type-annotation-based configuration
 - You're frustrated by DVC's lock file performance or manual dependency declarations
 - You want watch mode (`pivot repro --watch`) for rapid development cycles
 

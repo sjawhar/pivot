@@ -4,7 +4,7 @@ Pivot includes an interactive terminal interface built with [Textual](https://te
 
 ## Launching
 
-Add `--tui` to any `pivot repro` or `pivot run` command:
+Add `--tui` to any `pivot repro` (full pipeline with dependencies) or `pivot run` (individual stages, no dependency resolution) command:
 
 ```bash
 # One-shot execution with TUI
@@ -20,7 +20,7 @@ pivot repro train evaluate --tui
 The TUI requires the `pivot-tui` package. Install it with:
 
 ```bash
-pip install "pivot[tui]"
+uv add "pivot[tui]"
 ```
 
 ### TUI Log File

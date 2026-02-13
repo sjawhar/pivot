@@ -132,7 +132,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install -e ".[dev]"
+          uv sync --active
 
       - name: Configure remote
         run: |

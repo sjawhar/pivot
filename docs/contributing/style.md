@@ -104,8 +104,8 @@ Prefer over if/elif for enum dispatch and type discrimination:
 
 ```python
 match status:
-    case StageStatus.SUCCESS:
-        handle_success()
+    case StageStatus.RAN:
+        handle_ran()
     case StageStatus.FAILED:
         handle_failure()
     case StageStatus.SKIPPED:

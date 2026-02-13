@@ -2,6 +2,16 @@
 
 Share cached pipeline outputs across machines using S3. Push outputs from your laptop, pull them in CI or on a teammate's machine — stages with matching [cached](../concepts/caching.md) outputs skip instead of re-running.
 
+## Prerequisites
+
+Install Pivot with S3 support:
+
+```bash
+uv add "pivot[s3]"
+```
+
+Pivot uses `aioboto3` under the hood. Standard AWS credentials (env vars, `~/.aws/credentials`, IAM roles) work automatically.
+
 ## Configure a Remote
 
 ```bash

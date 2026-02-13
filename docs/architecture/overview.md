@@ -6,7 +6,7 @@ Pivot is designed for high-performance pipeline execution with automatic code ch
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  User Pipeline Code (pivot.yaml + typed Python functions)   │
+│  User Pipeline Code (pipeline.py or pivot.yaml)             │
 └─────────────────────────────────────────────────────────────┘
                          │
                          ▼

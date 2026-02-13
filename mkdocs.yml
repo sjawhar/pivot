@@ -61,6 +61,11 @@ plugins:
             filters:
               - "!^_"  # Exclude private members
 
+exclude_docs: |
+  plans/
+  solutions/
+  prevention/
+
 nav:
   - Home: index.md
   - Getting Started:
@@ -97,7 +102,6 @@ nav:
     - TUI: architecture/tui.md
     - Agent Server: architecture/agent-server.md
   - Design Decisions: design/index.md
-  - Solutions: solutions/index.md
   - Contributing:
     - Getting Started: contributing/setup.md
     - Code Style: contributing/style.md
@@ -105,8 +109,6 @@ nav:
     - CLI Development: contributing/cli.md
     - Adding Loaders: contributing/loaders.md
     - Common Gotchas: contributing/gotchas.md
-  - Prevention Strategies:
-    - TypedDict Field Synchronization: prevention/typeddictfield-synchronization.md
 
 markdown_extensions:
   - pymdownx.highlight:

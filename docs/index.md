@@ -14,43 +14,44 @@ pivot repro      # Pivot detects the change and re-runs affected stages
 
 ```python
 # pipeline.py
+import json
 import pathlib
 from typing import Annotated, TypedDict
 
-import pandas
 import pivot
 
 
 class PreprocessOutputs(TypedDict):
-    clean: Annotated[pathlib.Path, pivot.Out("processed.parquet", pivot.loaders.PathOnly())]
+    clean: Annotated[pathlib.Path, pivot.Out("clean.json", pivot.loaders.PathOnly())]
 
 
 def preprocess(
-    raw: Annotated[pandas.DataFrame, pivot.Dep("data.csv", pivot.loaders.CSV())],
+    raw: Annotated[dict, pivot.Dep("data.json", pivot.loaders.JSON())],
 ) -> PreprocessOutputs:
-    df = raw.dropna()
-    out_path = pathlib.Path("processed.parquet")
-    df.to_parquet(out_path)
+    clean = [row for row in raw["records"] if all(row.values())]
+    out_path = pathlib.Path("clean.json")
+    out_path.write_text(json.dumps({"records": clean}, indent=2))
     return PreprocessOutputs(clean=out_path)
 
 
-class TrainOutputs(TypedDict):
-    model: Annotated[pathlib.Path, pivot.Out("model.pkl", pivot.loaders.PathOnly())]
+class SummarizeOutputs(TypedDict):
+    summary: Annotated[pathlib.Path, pivot.Out("summary.json", pivot.loaders.PathOnly())]
 
 
-def train(
-    data: Annotated[pathlib.Path, pivot.Dep("processed.parquet", pivot.loaders.PathOnly())],
-) -> TrainOutputs:
-    df = pandas.read_parquet(data)
-    model_path = pathlib.Path("model.pkl")
-    # ... train model ...
-    return TrainOutputs(model=model_path)
+def summarize(
+    data: Annotated[dict, pivot.Dep("clean.json", pivot.loaders.JSON())],
+) -> SummarizeOutputs:
+    records = data["records"]
+    values = [r["value"] for r in records]
+    summary = {"count": len(values), "mean": sum(values) / len(values)}
+    out_path = pathlib.Path("summary.json")
+    out_path.write_text(json.dumps(summary, indent=2))
+    return SummarizeOutputs(summary=out_path)
 
 
-# Register stages - Pivot discovers deps/outs from annotations
 pipeline = pivot.Pipeline("my_pipeline")
 pipeline.register(preprocess)
-pipeline.register(train)
+pipeline.register(summarize)
 ```
 
 ```bash
@@ -67,16 +68,17 @@ Modify `preprocess`, and Pivot automatically re-runs both stages. Modify `train`
 Change a helper function, and Pivot knows to re-run stages that call it:
 
 ```python
-def normalize(x):
-    return x / x.max()  # Change this...
+def normalize(records):
+    max_val = max(r["value"] for r in records)
+    return [{"name": r["name"], "value": r["value"] / max_val} for r in records]
 
 def process(
-    data: Annotated[pandas.DataFrame, pivot.Dep("data.csv", pivot.loaders.CSV())],
+    raw: Annotated[dict, pivot.Dep("data.json", pivot.loaders.JSON())],
 ) -> ProcessOutputs:
-    return {"result": normalize(data)}  # ...and Pivot re-runs process
+    return ProcessOutputs(result=normalize(raw["records"]))  # ...and Pivot re-runs process
 ```
 
-No YAML to update (for code changes). No manual declarations. Pivot parses your Python and tracks what each stage actually calls.
+No YAML to update. No manual declarations. Pivot parses your Python and tracks what each stage actually calls.
 
 ### See Why Stages Run
 
@@ -105,7 +107,7 @@ pivot repro --watch  # Re-runs automatically on file changes
 ## Getting Started
 
 ```bash
-pip install pivot
+uv add pivot
 ```
 
 See the [Quick Start](getting-started/quickstart.md) to build your first pipeline.

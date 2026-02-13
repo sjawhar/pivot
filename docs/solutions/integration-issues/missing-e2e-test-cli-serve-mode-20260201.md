@@ -17,7 +17,7 @@ tags: [integration-testing, e2e-testing, serve-mode, agent-rpc]
 
 ## Problem
 
-The serve mode feature (`pivot run --watch --serve`) had unit tests for all components (`AgentRpcSource`, `AgentRpcHandler`, `AgentEventSink`) that passed, but the CLI integration was broken - status queries returned "Method not found" and agents couldn't subscribe to events.
+The serve mode feature (`pivot repro --watch --serve`) had unit tests for all components (`AgentRpcSource`, `AgentRpcHandler`, `AgentEventSink`) that passed, but the CLI integration was broken - status queries returned "Method not found" and agents couldn't subscribe to events.
 
 ## Environment
 
@@ -67,7 +67,7 @@ eng.add_sink(AgentEventSink())  # Broadcast events to connected agents
 
 ```python
 def test_serve_mode_cli_responds_to_status_query(tmp_path):
-    """E2E test: pivot run --watch --serve creates working RPC endpoint."""
+    """E2E test: pivot repro --watch --serve creates working RPC endpoint."""
     # 1. Start serve mode as subprocess
     proc = subprocess.Popen(
         ["uv", "run", "pivot", "run", "--watch", "--serve"],

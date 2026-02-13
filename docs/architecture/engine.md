@@ -192,7 +192,7 @@ engine.add_sink(BroadcastEventSink())
 
 ## Serve Mode
 
-For headless daemon operation (`pivot run --serve --watch`), the Engine supports RPC sources:
+For headless daemon operation (`pivot repro --watch --serve`), the Engine supports RPC sources:
 
 ```python
 async with Engine(pipeline=pipeline) as engine:

@@ -5,6 +5,13 @@ You create one with `Pipeline(name)`, register stages on it, and Pivot
 handles dependency resolution, DAG construction, and cross-pipeline
 discovery.
 
+!!! tip "pipeline.py vs pivot.yaml"
+    **Start with `pipeline.py`** (recommended). You get full IDE support, type checking,
+    composition with `include()`, matrix stages, and dynamic registration.
+
+    Use `pivot.yaml` when you need to override paths/params without touching Python,
+    or when migrating from DVC. See [The YAML Alternative](#the-yaml-alternative) below.
+
 ## Creating a Pipeline
 
 ```python
