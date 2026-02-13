@@ -14,44 +14,45 @@ Instantiating `Engine` directly and calling methods on it without using the cont
 ```python
 # Wrong - resources not cleaned up
 engine = Engine(pipeline=pipeline)
-engine.add_sink(ConsoleSink(console))
+engine.add_sink(LiveConsoleSink(console=console))
 engine.add_source(OneShotSource(stages=["train"], force=True, reason="cli"))
-engine.run(exit_on_completion=True)
+await engine.run(exit_on_completion=True)
 # If an exception occurs above, sinks are never closed
 # Even without exception, no guarantee close() runs
 ```
 
 Consequences:
-1. **Output not flushed** - ConsoleSink may have buffered output that never reaches the terminal
-2. **TUI termination signal not sent** - TuiSink sends `None` to signal completion; skipping this leaves the TUI hanging
-3. **File handles leaked** - Sinks that write to files may leave them unclosed
-4. **Process hangs on exit** - Background threads or queues may block process termination
+1. **Output not flushed** - Console sinks may have buffered output that never reaches the terminal
+2. **File handles leaked** - Sinks that write to files may leave them unclosed
+3. **Process hangs on exit** - Background threads or queues may block process termination
 
 ## Solution
 
-Always use `Engine` as a context manager with `with` statement:
+Always use `Engine` as an async context manager with `async with`:
 
 ```python
 from pivot.engine.engine import Engine
 from pivot.engine import sinks, sources
 
-with Engine(pipeline=pipeline) as engine:
-    engine.add_sink(sinks.ConsoleSink(console))
+async with Engine(pipeline=pipeline) as engine:
+    engine.add_sink(sinks.LiveConsoleSink(console=console))
     engine.add_source(sources.OneShotSource(stages=["train"], force=True, reason="cli"))
-    engine.run(exit_on_completion=True)
-# __exit__ called here, even on exception
+    await engine.run(exit_on_completion=True)
+# __aexit__ called here, even on exception
 ```
 
-The `__exit__` method calls `engine.close()`, which iterates through all registered sinks and closes each one:
+The `__aexit__` method closes all channels and sinks, iterating through each registered sink:
 
 ```python
-def close(self) -> None:
-    """Close all sinks and clean up resources."""
+async def __aexit__(self, *_exc: object) -> None:
+    # Close send channels first to signal end-of-stream
+    # Close sinks after output_send is closed
     for sink in self._sinks:
         try:
-            sink.close()
+            await sink.close()
         except Exception:
-            _logger.exception("Sink %s failed to close", sink)
+            _logger.exception("Error closing sink %s", sink)
+    # Close receive channels last
 ```
 
 Exceptions from individual sinks are logged but do not prevent other sinks from being closed.
@@ -61,10 +62,9 @@ Exceptions from individual sinks are logged but do not prevent other sinks from 
 For watch mode (long-running), the pattern is identical:
 
 ```python
-with Engine(pipeline=pipeline) as engine:
-    engine.add_sink(sinks.TuiSink(tui_queue, run_id))
-    engine.add_source(sources.FilesystemSource(watch_paths))
-    engine.run(exit_on_completion=False)  # Blocks until shutdown signal
+async with Engine(pipeline=pipeline) as engine:
+    engine.add_source(sources.FilesystemSource(watch_paths=paths))
+    await engine.run(exit_on_completion=False)  # Blocks until shutdown signal
 # Sinks closed on exit, even if interrupted
 ```
 
@@ -73,34 +73,36 @@ with Engine(pipeline=pipeline) as engine:
 In tests, use the context manager to ensure cleanup between test cases:
 
 ```python
-def test_stage_execution(test_pipeline: Pipeline) -> None:
-    with Engine(pipeline=test_pipeline) as engine:
+async def test_stage_execution(test_pipeline: Pipeline) -> None:
+    async with Engine(pipeline=test_pipeline) as engine:
         collector = sinks.ResultCollectorSink()
         engine.add_sink(collector)
         engine.add_source(sources.OneShotSource(stages=None, force=True, reason="test"))
-        engine.run(exit_on_completion=True)
+        await engine.run(exit_on_completion=True)
 
-        assert collector.results["my_stage"]["status"] == "ran"
+        results = await collector.get_results()
+        assert results["my_stage"]["status"] == "ran"
 ```
 
 ## Key Insight
 
-Context managers guarantee cleanup regardless of how the block exits. Python's `with` statement calls `__exit__` on:
+Context managers guarantee cleanup regardless of how the block exits. Python's `async with` statement calls `__aexit__` on:
 - Normal completion
 - `return` from within the block
 - Exceptions (caught or uncaught)
 - `sys.exit()` calls
 
-Without the context manager, you must manually call `close()` in a `finally` block, which is error-prone:
+Without the context manager, you must manually close channels and sinks in a `finally` block, which is error-prone:
 
 ```python
 # Manual cleanup is fragile
 engine = Engine(pipeline=pipeline)
 try:
     engine.add_sink(sink)
-    engine.run(exit_on_completion=True)
+    await engine.run(exit_on_completion=True)
 finally:
-    engine.close()  # Easy to forget
+    # Must close channels and sinks in correct order — easy to get wrong
+    ...
 ```
 
 The context manager encapsulates this pattern, making correct usage the default.

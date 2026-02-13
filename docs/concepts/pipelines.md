@@ -193,20 +193,23 @@ When Pivot looks for a pipeline config in a directory, it checks:
 If both exist in the same directory, Pivot raises a `DiscoveryError`.
 Only one config format per directory is allowed.
 
-## State Isolation
+## State and Cache Layout
 
-Each pipeline maintains its own `.pivot/` directory:
+By default, all pipelines share the project-level `.pivot/` directory:
 
 ```
-pipelines/training/
+<project_root>/
   .pivot/
-    stages/           # Per-stage lock files
-    state.db          # LMDB database (generations, hashes)
-    locks/            # Artifact locks for concurrent execution
+    cache/             # Content-addressable cache (shared across pipelines)
+    stages/            # Per-stage lock files
+    state.db           # LMDB database (generations, hashes)
+    locks/             # Artifact locks for concurrent execution
 ```
 
-The project-wide cache (`<project_root>/.pivot/cache/`) is shared across
-all pipelines. State (lock files, generation counters) is per-pipeline.
+The cache is always project-wide. Lock files and StateDB live under
+`core.state_dir` (default: `.pivot`). Pipelines can override `state_dir`
+at construction time to isolate state (useful for multi-pipeline projects
+with independent release cycles).
 
 ## The YAML Alternative
 
@@ -224,8 +227,9 @@ stages:
 This creates an implicit `Pipeline` from the YAML config. The Python-first
 approach with `pipeline.py` is more flexible — it supports composition,
 matrix stages, dynamic registration, and path overrides that YAML cannot
-express. See the [parameters](parameters.md) page for how params work
-with both approaches.
+express. Run `pivot schema` to output the JSON Schema for `pivot.yaml`.
+See the [parameters](parameters.md) page for how params work with both
+approaches.
 
 ## DAG Construction
 

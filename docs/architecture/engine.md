@@ -43,7 +43,7 @@ class StageExecutionState(IntEnum):
     PREPARING = 3    # Engine clearing outputs
     WAITING_ON_LOCK = 4  # Worker waiting for artifact locks
     RUNNING = 5      # Stage function executing
-    COMPLETED = 6    # Terminal (ran/skipped/failed)
+    COMPLETED = 6    # Terminal (ran/cached/blocked/cancelled/failed)
 ```
 
 The IntEnum ordering enables comparisons like `state >= PREPARING` for output filtering.
@@ -66,10 +66,14 @@ Sinks consume output events via `sink.handle()`:
 
 | Sink | Output | Use Case |
 |------|--------|----------|
-| `ConsoleSink` | Rich terminal | Plain CLI mode |
+| `StaticConsoleSink` | Rich terminal (buffered) | Pipe/CI — buffers completions, prints sorted report on close |
+| `LiveConsoleSink` | Rich terminal (live) | TTY — live progress bar with running/completed counts |
 | `ResultCollectorSink` | Dict collection | Programmatic result access |
+| `JsonlSink` | JSONL records | `--jsonl` output for machine consumption |
 | `BroadcastEventSink` | Pub-sub | Agent RPC subscribers |
 | `EventBuffer` | Ring buffer | Agent RPC polling (`events_since`) |
+
+The CLI chooses between `StaticConsoleSink` and `LiveConsoleSink` automatically based on whether stdout is a TTY. The TUI is **not** a sink — it is a separate package (`pivot-tui`) that connects as a JSON-RPC client. See [TUI Architecture](tui.md).
 
 Sinks are supervised by the Engine: each sink receives events via its own bounded
 queue. Slow or failing sinks are temporarily disabled and re-enabled after
@@ -110,10 +114,15 @@ Both batch and watch modes use the same `run()` method with the `exit_on_complet
 ### Batch Mode (`exit_on_completion=True`)
 
 ```python
-async with Engine() as engine:
+import rich.console
+
+async with Engine(pipeline=pipeline) as engine:
     collector = ResultCollectorSink()
     engine.add_sink(collector)
-    engine.add_sink(ConsoleSink())
+
+    console = rich.console.Console()
+    engine.add_sink(LiveConsoleSink(console=console))
+
     engine.add_source(OneShotSource(stages=["train"], force=True, reason="cli"))
 
     await engine.run(exit_on_completion=True)
@@ -129,8 +138,8 @@ async with Engine() as engine:
 ### Watch Mode (`exit_on_completion=False`)
 
 ```python
-async with Engine() as engine:
-    engine.add_source(FilesystemSource(watch_paths))
+async with Engine(pipeline=pipeline) as engine:
+    engine.add_source(FilesystemSource(watch_paths=paths))
 
     await engine.run(exit_on_completion=False)  # Blocks until shutdown
 ```
@@ -196,9 +205,12 @@ For headless daemon operation (`pivot repro --watch --serve`), the Engine suppor
 
 ```python
 async with Engine(pipeline=pipeline) as engine:
+    event_buffer = EventBuffer()
+    handler = AgentRpcHandler(engine=engine, event_buffer=event_buffer)
+
     engine.add_source(FilesystemSource(watch_paths=paths))
     engine.add_source(AgentRpcSource(socket_path=socket_path, handler=handler))
-    engine.add_sink(EventBuffer())
+    engine.add_sink(event_buffer)
     engine.add_sink(BroadcastEventSink())
 
     await engine.run(exit_on_completion=False)
@@ -264,6 +276,20 @@ for versioned_event in result["events"]:
 last_version = result["version"]
 ```
 
+## TUI Integration
+
+The TUI (`pivot-tui` package) is **not** an engine sink. It runs in a separate process thread and communicates exclusively via JSON-RPC over the same Unix socket used by `AgentRpcSource`. The CLI's `run_tui_with_engine()` helper coordinates a three-thread model:
+
+| Thread | Role |
+|--------|------|
+| Main | Textual TUI — signal handlers require main thread |
+| Engine | `anyio.run()` with Engine + RPC socket server |
+| Poller | Polls `events_since()`, posts `TuiUpdate` messages to app |
+
+The poller thread converts engine output events into typed TUI messages (`TuiStatusMessage`, `TuiLogMessage`, etc.) and feeds them to the Textual app via `post_message()`. UI commands (`run`, `cancel`, `commit`) go from the TUI's own RPC client directly to the engine.
+
+For details, see [TUI Architecture](tui.md).
+
 ## Code Locations
 
 | Component | File |
@@ -277,6 +303,8 @@ last_version = result["version"]
 | Event sources | `packages/pivot/src/pivot/engine/sources.py` |
 | Event sinks | `packages/pivot/src/pivot/engine/sinks.py` |
 | Agent RPC | `packages/pivot/src/pivot/engine/agent_rpc.py` |
+| TUI launch coordinator | `packages/pivot/src/pivot/cli/_run_common.py` |
+| TUI app | `packages/pivot-tui/src/pivot_tui/run.py` |
 
 ## See Also
 

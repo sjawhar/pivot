@@ -72,7 +72,7 @@ This guide maps Pivot's architectural concepts to actual file paths, helping you
 - `packages/pivot/src/pivot/engine/graph.py` - Bipartite artifact-stage graph
 - `packages/pivot/src/pivot/engine/types.py` - Event types and stage states
 - `packages/pivot/src/pivot/engine/sources.py` - Event sources (FilesystemSource, OneShotSource)
-- `packages/pivot/src/pivot/engine/sinks.py` - Event sinks (ConsoleSink, JsonlSink)
+- `packages/pivot/src/pivot/engine/sinks.py` - Event sinks (StaticConsoleSink, LiveConsoleSink, ResultCollectorSink)
 - `packages/pivot/src/pivot/executor/core.py` - Worker pool management
 - `packages/pivot/src/pivot/executor/worker.py` - Worker process code
 - `packages/pivot/src/pivot/outputs.py` - Output type definitions (`Out`, `Metric`, `Plot`, `IncrementalOut`)

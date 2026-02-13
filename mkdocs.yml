@@ -65,6 +65,7 @@ exclude_docs: |
   plans/
   solutions/
   prevention/
+  guide/
 
 nav:
   - Home: index.md

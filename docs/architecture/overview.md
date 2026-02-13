@@ -128,7 +128,7 @@ Sources produce input events:
 
 Sinks consume output events for display:
 
-- **ConsoleSink** - Rich-formatted terminal output
+- **StaticConsoleSink / LiveConsoleSink** - Rich-formatted terminal output (buffered for CI, live for TTY)
 - **ResultCollectorSink** - Collects `StageCompleted` events for programmatic access
 - **BroadcastEventSink** - Pub-sub event delivery for connected agents
 - **EventBuffer** - Ring buffer for `events_since` polling (RPC clients)

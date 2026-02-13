@@ -879,6 +879,7 @@ pivot config unset default_remote
 | `cache.dir` | Cache directory | `.pivot/cache` |
 | `cache.checkout_mode` | Checkout mode order | `hardlink,symlink,copy` |
 | `core.max_workers` | Parallel workers (-1 = all CPUs) | `-2` |
+| `core.run_history_retention` | Keep last N runs | `100` |
 | `core.state_dir` | State directory | `.pivot` |
 | `remote.jobs` | Parallel transfer jobs | `20` |
 | `remote.retries` | Transfer retry count | `10` |

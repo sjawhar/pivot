@@ -303,7 +303,7 @@ main.register(train, name="train")
 - Included stages keep their original `state_dir`
 - Deep-copied: mutations don't propagate
 - Point-in-time snapshot; later registrations in source don't propagate
-- Name collisions raise `PipelineConfigError`
+- Name collisions are auto-prefixed with `{other.name}/` to disambiguate
 - Cannot include a pipeline into itself
 
 ## Testing
@@ -350,7 +350,7 @@ pivot run my_stage           # Run ONLY my_stage (no dependency resolution)
 | `DirectoryOut key must have extension` | Key like `"task_a"` | Use `"task_a.json"` |
 | `loader is required` | `Out("file.json")` without loader | Add loader: `pivot.Out("file.json", pivot.loaders.JSON())` |
 | `TypedDict field missing Out annotation` | Field without `Out`/`Metric`/`Plot` | Add annotation to all fields |
-| `stage 'X' already exists` | Name collision in `include()` | Rename with `name=` at registration |
+| `stage 'X' already exists` | Duplicate registration | Use distinct `name=` at registration. Note: `include()` auto-prefixes on collision (`{pipeline.name}/stage`) |
 | `resolves outside base directory` | Output path escapes project root | Keep output paths within project |
 
 ## Checklist

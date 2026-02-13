@@ -129,9 +129,9 @@ Stages with variants (e.g., `train@small`, `train@large`) are grouped under a co
 | `○` | Pending |
 | `▶` | Running |
 | `●` | Success (completed) |
-| `$` | Cached |
-| `⊘` | Blocked |
-| `!` | Skipped |
+| `↺` | Cached |
+| `◇` | Blocked |
+| `!` | Cancelled |
 | `✗` | Failed |
 
 ### Input/Output Diff Panels

@@ -213,7 +213,7 @@ This happens recursively — if the discovered stage itself has cross-pipeline d
 
 **Use descriptive directory names.** `data_prep/`, `model_training/`, `reports/` — the directory name communicates intent. Pipeline names (the string passed to `Pipeline()`) should match purpose, not location.
 
-**Commit lock files.** Each pipeline's lock files live under the project-level `.pivot/stages/`. Commit them so that `pivot pull` on another machine can restore outputs without re-running.
+**Commit lock files.** Lock files live under `.pivot/stages/` (the project-level state directory by default). Commit them so that `pivot pull` on another machine can restore outputs without re-running.
 
 **Keep dependencies explicit.** Cross-pipeline wiring happens through `Dep` paths. If you can't express the dependency as a file path, the stages probably belong in the same pipeline.
 

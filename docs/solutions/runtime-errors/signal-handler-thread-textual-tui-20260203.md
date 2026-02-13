@@ -79,7 +79,7 @@ def engine_thread_target() -> None:
     """Run async Engine in background thread with its own event loop."""
     async def engine_main():
         async with engine.Engine(pipeline=pipeline) as eng:
-            # Configure sinks - TuiSink posts to app (thread-safe)
+            # Configure sinks and sources
             # ... configure sources ...
             await eng.run(exit_on_completion=True)
             return await result_sink.get_results()

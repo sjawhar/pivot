@@ -76,7 +76,7 @@ class Results(TypedDict):
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `path` | `str \| list[str] \| tuple[str, ...]` | required | Output file path(s) |
-| `loader` | `Writer[W]` | required | Serializer for the data |
+| `loader` | `Writer[W]` | required | Serializer for the data (named `loader` for consistency with `Dep`; accepts any `Writer`) |
 | `cache` | `bool` | `True` | Whether to cache in `.pivot/cache` |
 
 ### Multi-file outputs
