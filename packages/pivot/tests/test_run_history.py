@@ -117,7 +117,7 @@ def test_serialize_deserialize_run_manifest() -> None:
             ),
             "eval": run_history.StageRunRecord(
                 input_hash="def456",
-                status=StageStatus.SKIPPED,
+                status=StageStatus.CACHED,
                 reason="unchanged",
                 duration_ms=0,
             ),
@@ -133,7 +133,7 @@ def test_serialize_deserialize_run_manifest() -> None:
     assert deserialized["targeted_stages"] == manifest["targeted_stages"]
     assert deserialized["execution_order"] == manifest["execution_order"]
     assert deserialized["stages"]["train"]["status"] == StageStatus.RAN
-    assert deserialized["stages"]["eval"]["status"] == StageStatus.SKIPPED
+    assert deserialized["stages"]["eval"]["status"] == StageStatus.CACHED
 
 
 def test_serialize_deserialize_run_cache_entry() -> None:

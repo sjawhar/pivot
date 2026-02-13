@@ -14,13 +14,7 @@ from pivot import config, discovery, exceptions, outputs, parameters, registry
 from pivot.executor import worker
 from pivot.storage import cache, lock, track
 from pivot.storage import state as state_mod
-from pivot.types import (
-    DisplayCategory,
-    OnError,
-    StageResult,
-    StageStatus,
-    categorize_stage_result,
-)
+from pivot.types import OnError, StageResult, StageStatus
 
 if TYPE_CHECKING:
     import concurrent.futures
@@ -117,41 +111,40 @@ def _ensure_cleanup_registered() -> None:
 class ExecutionSummary(TypedDict):
     """Summary result for a single stage after execution (returned by executor.run)."""
 
-    status: Literal[StageStatus.RAN, StageStatus.SKIPPED, StageStatus.FAILED, StageStatus.UNKNOWN]
+    status: Literal[
+        StageStatus.RAN,
+        StageStatus.CACHED,
+        StageStatus.BLOCKED,
+        StageStatus.CANCELLED,
+        StageStatus.FAILED,
+        StageStatus.UNKNOWN,
+    ]
     reason: str
     input_hash: str | None
 
 
-def count_results(results: dict[str, ExecutionSummary]) -> tuple[int, int, int, int]:
-    """Count results by category: ran, cached, blocked, failed.
-
-    Uses shared categorization for consistent treatment across TUI and plain mode.
+def count_results(results: dict[str, ExecutionSummary]) -> tuple[int, int, int, int, int]:
+    """Count results by category.
 
     Returns:
-        Tuple of (ran, cached, blocked, failed) counts
+        Tuple of (ran, cached, blocked, cancelled, failed) counts.
     """
-    ran = cached = blocked = failed = 0
+    ran = cached = blocked = cancelled = failed = 0
     for result in results.values():
-        category = categorize_stage_result(result["status"], result["reason"])
-        match category:
-            case DisplayCategory.SUCCESS:
+        match result["status"]:
+            case StageStatus.RAN:
                 ran += 1
-            case DisplayCategory.FAILED:
+            case StageStatus.FAILED:
                 failed += 1
-            case DisplayCategory.BLOCKED:
+            case StageStatus.BLOCKED:
                 blocked += 1
-            case DisplayCategory.CACHED | DisplayCategory.CANCELLED:
-                # Cancelled stages are counted with cached (both are skipped, not failed)
+            case StageStatus.CACHED:
                 cached += 1
-            case (
-                DisplayCategory.UNKNOWN
-                | DisplayCategory.PENDING
-                | DisplayCategory.WAITING_ON_LOCK
-                | DisplayCategory.RUNNING
-            ):
-                # UNKNOWN/PENDING/WAITING_ON_LOCK/RUNNING shouldn't appear in final results
+            case StageStatus.CANCELLED:
+                cancelled += 1
+            case _:
                 pass
-    return ran, cached, blocked, failed
+    return ran, cached, blocked, cancelled, failed
 
 
 def run(
@@ -186,7 +179,7 @@ def run(
         checkout_missing: If True, restore missing tracked files from cache before running.
 
     Returns:
-        Dict of stage_name -> {status: "ran"|"skipped"|"failed", reason: str}
+        Dict of stage_name -> {status: "ran"|"cached"|"blocked"|"cancelled"|"failed", reason: str}
     """
     return _run_inner(
         stages=stages,

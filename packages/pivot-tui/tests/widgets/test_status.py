@@ -18,8 +18,8 @@ from pivot_tui.widgets import status
         pytest.param(StageStatus.IN_PROGRESS, "", "\u25b6", "blue bold", id="running"),
         pytest.param(StageStatus.RAN, "", "\u25cf", "green bold", id="success"),
         pytest.param(StageStatus.FAILED, "error", "\u2717", "red bold", id="failed"),
-        pytest.param(StageStatus.SKIPPED, "cache hit", "\u21ba", "yellow", id="cached"),
-        pytest.param(StageStatus.SKIPPED, "upstream failed", "\u25c7", "red", id="blocked"),
+        pytest.param(StageStatus.CACHED, "cache hit", "\u21ba", "yellow", id="cached"),
+        pytest.param(StageStatus.BLOCKED, "upstream failed", "\u25c7", "red", id="blocked"),
     ],
 )
 def test_get_status_symbol(
@@ -41,8 +41,8 @@ def test_get_status_symbol(
     [
         pytest.param(StageStatus.RAN, "", "[green]\u2713[/]", id="success"),
         pytest.param(StageStatus.FAILED, "error", "[red]\u2717[/]", id="failed"),
-        pytest.param(StageStatus.SKIPPED, "cache hit", "[yellow]\u21ba[/]", id="cached"),
-        pytest.param(StageStatus.SKIPPED, "upstream failed", "[red]\u25c7[/]", id="blocked"),
+        pytest.param(StageStatus.CACHED, "cache hit", "[yellow]\u21ba[/]", id="cached"),
+        pytest.param(StageStatus.BLOCKED, "upstream failed", "[red]\u25c7[/]", id="blocked"),
         pytest.param(StageStatus.READY, "", "", id="pending_no_icon"),
         pytest.param(StageStatus.IN_PROGRESS, "", "", id="running_no_icon"),
     ],
@@ -57,8 +57,8 @@ def test_get_status_icon(status_val: StageStatus, reason: str, expected_icon: st
     [
         pytest.param(StageStatus.RAN, "", "\u2713", id="success"),
         pytest.param(StageStatus.FAILED, "error", "\u2717", id="failed"),
-        pytest.param(StageStatus.SKIPPED, "cache hit", "\u21ba", id="cached"),
-        pytest.param(StageStatus.SKIPPED, "upstream failed", "\u25c7", id="blocked"),
+        pytest.param(StageStatus.CACHED, "cache hit", "\u21ba", id="cached"),
+        pytest.param(StageStatus.BLOCKED, "upstream failed", "\u25c7", id="blocked"),
         pytest.param(StageStatus.READY, "", "", id="pending_no_icon"),
     ],
 )
@@ -77,8 +77,8 @@ def test_get_status_icon_plain(status_val: StageStatus, reason: str, expected_pl
     [
         pytest.param(StageStatus.RAN, "", ["\u2713", "ran"], id="success"),
         pytest.param(StageStatus.FAILED, "error", ["\u2717", "fail"], id="failed"),
-        pytest.param(StageStatus.SKIPPED, "cache hit", ["\u21ba", "cache"], id="cached"),
-        pytest.param(StageStatus.SKIPPED, "upstream failed", ["\u25c7", "block"], id="blocked"),
+        pytest.param(StageStatus.CACHED, "cache hit", ["\u21ba", "cache"], id="cached"),
+        pytest.param(StageStatus.BLOCKED, "upstream failed", ["\u25c7", "block"], id="blocked"),
         pytest.param(StageStatus.READY, "", ["PENDING"], id="pending"),
         pytest.param(StageStatus.IN_PROGRESS, "", ["RUNNING"], id="running"),
     ],
@@ -134,8 +134,8 @@ def test_format_elapsed(elapsed: float | None, expected: str) -> None:
         pytest.param(StageStatus.RAN, "", "SUCCESS", id="success"),
         pytest.param(StageStatus.COMPLETED, "", "SUCCESS", id="completed_as_success"),
         pytest.param(StageStatus.FAILED, "error", "FAILED", id="failed"),
-        pytest.param(StageStatus.SKIPPED, "cache hit", "CACHED", id="cached"),
-        pytest.param(StageStatus.SKIPPED, "upstream failed", "BLOCKED", id="blocked"),
+        pytest.param(StageStatus.CACHED, "cache hit", "CACHED", id="cached"),
+        pytest.param(StageStatus.BLOCKED, "upstream failed", "BLOCKED", id="blocked"),
         pytest.param(StageStatus.UNKNOWN, "", "UNKNOWN", id="unknown"),
     ],
 )
@@ -165,7 +165,7 @@ def test_count_statuses_mixed_stages() -> None:
     stages[1].status = StageStatus.RAN
     stages[2].status = StageStatus.COMPLETED
     stages[3].status = StageStatus.FAILED
-    stages[4].status = StageStatus.SKIPPED  # Not counted
+    stages[4].status = StageStatus.CACHED  # Not counted
 
     counts = status.count_statuses(stages)
     assert counts == {"running": 1, "completed": 2, "failed": 1}
@@ -175,7 +175,7 @@ def test_count_statuses_ignores_non_terminal_statuses() -> None:
     """count_statuses does not count READY, SKIPPED, or UNKNOWN."""
     stages = [StageInfo(f"s{i}", i, 3) for i in range(1, 4)]
     stages[0].status = StageStatus.READY
-    stages[1].status = StageStatus.SKIPPED
+    stages[1].status = StageStatus.CACHED
     stages[2].status = StageStatus.UNKNOWN
 
     counts = status.count_statuses(stages)

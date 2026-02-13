@@ -10,7 +10,7 @@ import rich.markup
 import rich.text
 
 from pivot.engine.types import StageCompleted
-from pivot.types import DisplayCategory, StageStatus, categorize_stage_result
+from pivot.types import DisplayCategory, categorize_stage_result
 
 if TYPE_CHECKING:
     from pivot.engine.types import OutputEvent
@@ -51,8 +51,7 @@ def _format_stage_line(
     name_width: int,
 ) -> str:
     total_digits = len(str(total))
-    current = index + 1
-    counter = f"[{current:>{total_digits}}/{total}]"
+    counter = f"[{index:>{total_digits}}/{total}]"
     display_width = max(1, min(name_width, _MAX_NAME_WIDTH))
     stage_name = f"{stage[: display_width - 1]}…" if len(stage) > display_width else stage
     padded_name = stage_name.ljust(display_width)
@@ -66,10 +65,8 @@ def _format_stage_line(
 
 def _format_skip_group_line(*, start_index: int, end_index: int, total: int, count: int) -> str:
     total_digits = len(str(total))
-    start = start_index + 1
-    end = end_index + 1
-    range_text = f"{start:>{total_digits}}–{end:>{total_digits}}/{total}"
-    return f"[dim]  [{range_text}] ○ {count} stages skipped[/dim]"
+    range_text = f"{start_index:>{total_digits}}–{end_index:>{total_digits}}/{total}"
+    return f"[dim]  [{range_text}] ○ {count} stages not run[/dim]"
 
 
 def _format_error_detail(reason: str, *, total: int) -> list[str]:
@@ -80,7 +77,7 @@ def _format_error_detail(reason: str, *, total: int) -> list[str]:
 
 
 def _categorize(event: StageCompleted) -> DisplayCategory:
-    return categorize_stage_result(event["status"], event["reason"])
+    return categorize_stage_result(event["status"])
 
 
 def _print_completions(
@@ -244,7 +241,7 @@ class LiveConsoleSink:
     _total: int
     _live: rich.live.Live | None
 
-    _RECENT_COMPLETIONS_LIMIT = 5
+    _RECENT_COMPLETIONS_LIMIT: int = 5
 
     def __init__(self, *, console: rich.console.Console, show_output: bool = False) -> None:
         self._console = console
@@ -300,6 +297,7 @@ class LiveConsoleSink:
         ran = counts.get(DisplayCategory.SUCCESS, 0)
         cached = counts.get(DisplayCategory.CACHED, 0)
         blocked = counts.get(DisplayCategory.BLOCKED, 0)
+        cancelled = counts.get(DisplayCategory.CANCELLED, 0)
         failed = counts.get(DisplayCategory.FAILED, 0)
         parts: list[tuple[str, str]] = []
         if ran:
@@ -308,6 +306,8 @@ class LiveConsoleSink:
             parts.append((f"{cached} cached", "yellow"))
         if blocked:
             parts.append((f"{blocked} blocked", "red"))
+        if cancelled:
+            parts.append((f"{cancelled} cancelled", "yellow"))
         if failed:
             parts.append((f"{failed} failed", "bold red"))
         for i, (text, style) in enumerate(parts):
@@ -346,13 +346,8 @@ class LiveConsoleSink:
                 self._total = event["total"]
                 self._max_name_width = max(self._max_name_width, len(event["stage"]))
                 self._completed_count += 1
-                match event["status"]:
-                    case StageStatus.SKIPPED:
-                        self._skipped_count += 1
-                    case StageStatus.RAN:
-                        self._ran_count += 1
-                    case StageStatus.FAILED:
-                        self._failed_count += 1
+                category = _categorize(event)
+                self._category_counts[category] = self._category_counts.get(category, 0) + 1
                 self._completion_buffer.append(event)
                 self._update_live()
             case "log_line":

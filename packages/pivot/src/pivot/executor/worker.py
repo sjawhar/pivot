@@ -154,7 +154,7 @@ class WorkerStageInfo(TypedDict):
 
 
 def _make_result(
-    status: Literal[StageStatus.RAN, StageStatus.SKIPPED, StageStatus.FAILED],
+    status: Literal[StageStatus.RAN, StageStatus.CACHED, StageStatus.FAILED],
     reason: str,
     ring_buffer: _OutputRingBuffer,
     input_hash: str | None = None,
@@ -273,7 +273,7 @@ def execute_stage(
                             )
                             if restored:
                                 return _make_result(
-                                    StageStatus.SKIPPED,
+                                    StageStatus.CACHED,
                                     "unchanged (generation)",
                                     ring_buffer,
                                     input_hash=input_hash,
@@ -326,7 +326,7 @@ def execute_stage(
                         )
                         if restored:
                             return _make_result(
-                                StageStatus.SKIPPED,
+                                StageStatus.CACHED,
                                 skip_reason,
                                 ring_buffer,
                                 input_hash=input_hash,
@@ -347,7 +347,7 @@ def execute_stage(
                         if run_cache_skip is not None:
                             if no_commit:
                                 return _make_result(
-                                    StageStatus.SKIPPED,
+                                    StageStatus.CACHED,
                                     "unchanged (run cache)",
                                     ring_buffer,
                                     input_hash=input_hash,
@@ -369,7 +369,7 @@ def execute_stage(
                                 increment_outputs=False,
                             )
                             return StageResult(
-                                status=StageStatus.SKIPPED,
+                                status=StageStatus.CACHED,
                                 reason="unchanged (run cache)",
                                 input_hash=input_hash,
                                 output_lines=ring_buffer.snapshot(),

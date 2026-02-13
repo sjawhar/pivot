@@ -1222,7 +1222,7 @@ async def test_coordinator_skip_avoids_worker_dispatch(
         )
 
         assert skipped is True, "Coordinator should skip inline when generations match"
-        assert results["skip_stage"]["status"] == "skipped"
+        assert results["skip_stage"]["status"] == "cached"
         engine._worker_pool.submit.assert_not_called()
 
 
@@ -1299,7 +1299,7 @@ async def test_all_cached_pipeline_skips_without_workers(
 
         assert engine._worker_pool is None, "Pool should not be created when all stages skip"
         assert "cached_stage" in results, "Skipped stage should be in results"
-        assert results["cached_stage"]["status"] == "skipped"
+        assert results["cached_stage"]["status"] == "cached"
 
 
 @pytest.mark.anyio
@@ -1437,7 +1437,7 @@ async def test_coordinator_tier2_skip_when_generation_unavailable(
         )
 
         assert skipped is True, "Coordinator should skip via Tier 2 when generations unavailable"
-        assert results["tier2_stage"]["status"] == "skipped"
+        assert results["tier2_stage"]["status"] == "cached"
         assert results["tier2_stage"]["reason"] == "unchanged", (
             "Tier 2 skip reason should be 'unchanged', not 'unchanged (generation)'"
         )

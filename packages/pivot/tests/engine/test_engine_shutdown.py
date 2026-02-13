@@ -84,7 +84,9 @@ async def test_engine_shutdown_completes_without_hanging(minimal_pipeline: Pipel
         assert "test_stage" in results
         assert results["test_stage"]["status"] in (
             StageStatus.RAN,
-            StageStatus.SKIPPED,
+            StageStatus.CACHED,
+            StageStatus.BLOCKED,
+            StageStatus.CANCELLED,
             StageStatus.FAILED,
         )
 

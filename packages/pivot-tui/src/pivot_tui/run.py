@@ -547,7 +547,9 @@ class PivotApp(textual.app.App[None]):
             elif status in (
                 StageStatus.RAN,
                 StageStatus.COMPLETED,
-                StageStatus.SKIPPED,
+                StageStatus.CACHED,
+                StageStatus.BLOCKED,
+                StageStatus.CANCELLED,
                 StageStatus.FAILED,
             ):
                 self._finalize_history_entry(stage, status, msg["reason"], msg["elapsed"], run_id)
@@ -569,7 +571,14 @@ class PivotApp(textual.app.App[None]):
                 1
                 for s in self._stages.values()
                 if s.status
-                in (StageStatus.COMPLETED, StageStatus.RAN, StageStatus.SKIPPED, StageStatus.FAILED)
+                in (
+                    StageStatus.COMPLETED,
+                    StageStatus.RAN,
+                    StageStatus.CACHED,
+                    StageStatus.BLOCKED,
+                    StageStatus.CANCELLED,
+                    StageStatus.FAILED,
+                )
             )
             self.title = f"pivot run ({completed}/{len(self._stages)})"
 
@@ -663,7 +672,10 @@ class PivotApp(textual.app.App[None]):
         pending = self._pending_history.pop(stage_name, None)
 
         if pending is None:
-            if status == StageStatus.SKIPPED and run_id:
+            if (
+                status in (StageStatus.CACHED, StageStatus.BLOCKED, StageStatus.CANCELLED)
+                and run_id
+            ):
                 entry = ExecutionHistoryEntry(
                     run_id=run_id,
                     stage_name=stage_name,

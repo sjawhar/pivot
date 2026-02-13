@@ -167,7 +167,7 @@ def test_generation_skip_with_pivot_produced_deps(
 
     # Second run: step1 skips (external dep falls through to hash check)
     result2_step1 = executor.execute_stage("step1", step1_info, worker_env, output_queue)
-    assert result2_step1["status"] == "skipped"
+    assert result2_step1["status"] == "cached"
     # No need to re-apply deferred writes for skipped stages (no deferred_writes in result)
 
     # Second run: step2 should skip via generation check (intermediate.txt is Pivot-produced)
@@ -178,7 +178,7 @@ def test_generation_skip_with_pivot_produced_deps(
     )
     result2_step2 = executor.execute_stage("step2", step2_info, worker_env, output_queue)
 
-    assert result2_step2["status"] == "skipped", f"Expected skip, got: {result2_step2}"
+    assert result2_step2["status"] == "cached", f"Expected skip, got: {result2_step2}"
     assert result2_step2["reason"] == "unchanged (generation)", (
         f"Expected generation skip, got: {result2_step2['reason']}"
     )
@@ -230,7 +230,7 @@ def test_external_dep_falls_through_to_hash_check(
     )
     result2 = executor.execute_stage("test_stage", stage_info, worker_env, output_queue)
 
-    assert result2["status"] == "skipped"
+    assert result2["status"] == "cached"
     assert result2["reason"] == "unchanged", (
         f"Expected hash-based skip (not generation), got: {result2['reason']}"
     )
@@ -278,7 +278,7 @@ def test_cleared_statedb_degrades_to_lock_comparison(
 
     # Second run: lock file still exists, so hash comparison should detect unchanged
     result2 = executor.execute_stage("test_stage", stage_info, worker_env, output_queue)
-    assert result2["status"] == "skipped", f"Expected skip via lock comparison, got: {result2}"
+    assert result2["status"] == "cached", f"Expected skip via lock comparison, got: {result2}"
     assert "unchanged" in result2["reason"], (
         f"Expected 'unchanged' reason, got: {result2['reason']}"
     )
@@ -340,7 +340,7 @@ def test_missing_lock_file_triggers_full_run(
 
     # Second run: should skip
     result2 = executor.execute_stage("test_stage", stage_info, worker_env, output_queue)
-    assert result2["status"] == "skipped"
+    assert result2["status"] == "cached"
     assert counter_file.read_text() == "1", "Stage should not have re-executed"
 
 

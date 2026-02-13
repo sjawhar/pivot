@@ -222,7 +222,7 @@ def test_unchanged_tracked_file_allows_skip(
 
     # Second run - should skip (nothing changed)
     results = executor.run(pipeline=test_pipeline)
-    assert results["process"]["status"] == "skipped"
+    assert results["process"]["status"] == "cached"
 
 
 # =============================================================================

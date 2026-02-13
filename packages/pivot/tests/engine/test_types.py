@@ -258,14 +258,14 @@ def test_stage_completed_event() -> None:
         type="stage_completed",
         seq=1,
         stage="evaluate",
-        status=StageStatus.SKIPPED,
+        status=StageStatus.CACHED,
         reason="unchanged",
         duration_ms=0.0,
         index=4,
         total=5,
         input_hash=None,
     )
-    assert event_skip["status"] == StageStatus.SKIPPED
+    assert event_skip["status"] == StageStatus.CACHED
 
 
 def test_stage_completed_without_output_summary_is_valid() -> None:
@@ -288,7 +288,7 @@ def test_stage_completed_with_output_summary_none() -> None:
     event: types.StageCompleted = types.StageCompleted(
         type="stage_completed",
         stage="train",
-        status=StageStatus.SKIPPED,
+        status=StageStatus.CACHED,
         reason="unchanged",
         duration_ms=0.0,
         index=0,

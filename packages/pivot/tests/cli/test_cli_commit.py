@@ -260,7 +260,7 @@ def test_commit_after_no_commit_makes_subsequent_run_skip(
 
     # Now run normally - should skip because commit recorded the state
     results = executor.run(pipeline=mock_discovery)
-    assert results["process"]["status"] == "skipped", (
+    assert results["process"]["status"] == "cached", (
         f"Stage should skip after commit, got: {results['process']}"
     )
 

@@ -890,7 +890,7 @@ def test_unchanged_stages_are_skipped(pipeline_dir: pathlib.Path, test_pipeline:
 
     # Second run - should skip (nothing changed)
     results = executor.run(pipeline=test_pipeline)
-    assert results["step1"]["status"] == "skipped"
+    assert results["step1"]["status"] == "cached"
 
 
 def test_code_change_triggers_rerun(pipeline_dir: pathlib.Path, test_pipeline: Pipeline) -> None:
@@ -1334,7 +1334,7 @@ def test_on_error_keep_going_skips_downstream_of_failed(
     results = executor.run(on_error="keep_going", pipeline=test_pipeline)
 
     assert results["first"]["status"] == "failed"
-    assert results["second"]["status"] == "skipped"
+    assert results["second"]["status"] == "blocked"
     assert "upstream" in results["second"]["reason"]
     assert results["independent"]["status"] == "ran"
 
@@ -1637,7 +1637,7 @@ def test_executor_restores_missing_outputs_on_skip(
 
     # Second run - should skip but restore output from cache
     results = executor.run(pipeline=test_pipeline)
-    assert results["process"]["status"] == "skipped"
+    assert results["process"]["status"] == "cached"
     assert output_file.exists(), "Output should be restored from cache"
     assert output_file.read_text() == "result"
 
@@ -1799,7 +1799,7 @@ def test_force_runs_unchanged_stage(pipeline_dir: pathlib.Path, test_pipeline: P
 
     # Second run without force - should skip (nothing changed)
     results = executor.run(pipeline=test_pipeline)
-    assert results["process"]["status"] == "skipped"
+    assert results["process"]["status"] == "cached"
 
     # Third run with force - should run despite no changes
     results = executor.run(force=True, pipeline=test_pipeline)
@@ -1818,7 +1818,7 @@ def test_force_updates_lock_file(pipeline_dir: pathlib.Path, test_pipeline: Pipe
 
     # Second run without force - should skip (lock file should be correct)
     results = executor.run(pipeline=test_pipeline)
-    assert results["process"]["status"] == "skipped", "Lock file should be valid after forced run"
+    assert results["process"]["status"] == "cached", "Lock file should be valid after forced run"
 
 
 def test_force_with_specific_stage(pipeline_dir: pathlib.Path, test_pipeline: Pipeline) -> None:
@@ -1916,7 +1916,7 @@ def test_executor_deferred_writes_applied(
 
     # Verify deferred writes were applied by checking skip works on second run
     results = executor.run(pipeline=test_pipeline)
-    assert results["process"]["status"] == "skipped", (
+    assert results["process"]["status"] == "cached", (
         "Stage should skip on second run - deferred writes recorded run cache"
     )
 
@@ -2025,6 +2025,6 @@ def test_skip_detection_fast_with_many_deps(
     results = executor.run(pipeline=test_pipeline)
     elapsed = time.time() - start_time
 
-    assert results["process"]["status"] == "skipped"
+    assert results["process"]["status"] == "cached"
     # Skip check should be fast (< 5s even with slow CI)
     assert elapsed < 5, f"Skip detection took too long: {elapsed:.1f}s"

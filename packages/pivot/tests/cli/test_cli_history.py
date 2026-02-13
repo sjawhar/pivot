@@ -43,7 +43,7 @@ def project_with_runs(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -
                 stages={
                     "train": run_history.StageRunRecord(
                         input_hash="hash_train",
-                        status=StageStatus.RAN if i == 2 else StageStatus.SKIPPED,
+                        status=StageStatus.RAN if i == 2 else StageStatus.CACHED,
                         reason="Code changed" if i == 2 else "unchanged",
                         duration_ms=5000 if i == 2 else 100,
                     ),

@@ -30,7 +30,6 @@ from pivot.types import (
     OnError,
     RunEventType,
     SchemaVersionEvent,
-    StageStatus,
     categorize_stage_result,
 )
 
@@ -41,7 +40,7 @@ if TYPE_CHECKING:
 _logger = logging.getLogger(__name__)
 
 # JSONL schema version for forward compatibility
-_JSONL_SCHEMA_VERSION = 1
+_JSONL_SCHEMA_VERSION = 2
 
 
 def _configure_oneshot_source(
@@ -212,15 +211,14 @@ def _run_json_mode(
 
     # Emit execution result
     total_duration_ms = (time.perf_counter() - start_time) * 1000
-    ran = sum(1 for r in results.values() if r["status"] == StageStatus.RAN)
-    skipped = sum(1 for r in results.values() if r["status"] == StageStatus.SKIPPED)
-    failed = sum(1 for r in results.values() if r["status"] == StageStatus.FAILED)
+    ran, cached, blocked, cancelled, failed = executor_core.count_results(results)
+    skipped = cached + blocked + cancelled
 
     # Compute failed stage names for JSONL output
     failed_stage_names = sorted(
         name
         for name, r in results.items()
-        if categorize_stage_result(r["status"], r["reason"]) == DisplayCategory.FAILED
+        if categorize_stage_result(r["status"]) == DisplayCategory.FAILED
     )
 
     cli_helpers.emit_jsonl(
@@ -287,14 +285,14 @@ def _run_plain_mode(
     results = anyio.run(plain_main)
 
     if console and results:
-        ran, cached, blocked, failed = executor_core.count_results(results)
+        ran, cached, blocked, cancelled, failed = executor_core.count_results(results)
         total_duration = time.perf_counter() - start_time
-        console.summary(ran, cached, blocked, failed, total_duration)
+        console.summary(ran, cached, blocked, cancelled, failed, total_duration)
         # Print failed stage names after summary
         failed_stage_names = sorted(
             name
             for name, r in results.items()
-            if categorize_stage_result(r["status"], r["reason"]) == DisplayCategory.FAILED
+            if categorize_stage_result(r["status"]) == DisplayCategory.FAILED
         )
         console.failed_stages(failed_stage_names)
 

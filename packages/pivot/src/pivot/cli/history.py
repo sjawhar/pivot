@@ -51,7 +51,11 @@ def _print_run_summary(run: RunManifest) -> None:
     """Print single-line summary of a run as table row."""
     stages = run["stages"]
     ran = sum(1 for s in stages.values() if s["status"] == StageStatus.RAN)
-    skipped = sum(1 for s in stages.values() if s["status"] == StageStatus.SKIPPED)
+    skipped = sum(
+        1
+        for s in stages.values()
+        if s["status"] in (StageStatus.CACHED, StageStatus.BLOCKED, StageStatus.CANCELLED)
+    )
     failed = sum(1 for s in stages.values() if s["status"] == StageStatus.FAILED)
 
     total_duration_ms = sum(s["duration_ms"] for s in stages.values())
@@ -124,12 +128,10 @@ def _print_run_detail(run: RunManifest) -> None:
         match status:
             case StageStatus.RAN:
                 icon = "\u2713"
-            case StageStatus.SKIPPED:
+            case StageStatus.CACHED | StageStatus.BLOCKED | StageStatus.CANCELLED:
                 icon = "\u2022"
             case StageStatus.FAILED:
                 icon = "\u2717"
-            case _:
-                icon = "?"
 
         click.echo(f"  {icon} {name:<24} {status:<8} {duration_str:>8}  {reason}")
 

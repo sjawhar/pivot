@@ -4,7 +4,7 @@ import datetime
 import hashlib
 import json
 import uuid
-from typing import Any, NotRequired, TypedDict
+from typing import Any, Literal, NotRequired, TypedDict
 
 from pivot.types import (
     DepEntry,
@@ -13,6 +13,7 @@ from pivot.types import (
     FileHash,
     HashInfo,
     StageStatus,
+    ensure_completion_type,
     is_dir_hash,
 )
 
@@ -21,7 +22,13 @@ class StageRunRecord(TypedDict):
     """Record of a stage execution within a run."""
 
     input_hash: str | None
-    status: StageStatus
+    status: Literal[
+        StageStatus.RAN,
+        StageStatus.CACHED,
+        StageStatus.BLOCKED,
+        StageStatus.CANCELLED,
+        StageStatus.FAILED,
+    ]
     reason: str
     duration_ms: int
 
@@ -113,14 +120,17 @@ def deserialize_run_manifest(data: bytes) -> RunManifest:
 
     stages: dict[str, StageRunRecord] = {}
     for stage_name, record in parsed["stages"].items():
+        raw_status = record["status"]
+        if raw_status == "skipped":
+            raw_status = "cached"
         try:
-            status = StageStatus(record["status"])
+            status = StageStatus(raw_status)
         except ValueError:
             msg = f"Invalid status '{record['status']}' for stage '{stage_name}'"
             raise ValueError(msg) from None
         stages[stage_name] = StageRunRecord(
             input_hash=record["input_hash"],
-            status=status,
+            status=ensure_completion_type(status),
             reason=record["reason"],
             duration_ms=record["duration_ms"],
         )

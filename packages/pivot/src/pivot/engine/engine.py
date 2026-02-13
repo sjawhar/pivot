@@ -50,6 +50,7 @@ from pivot.executor import core as executor_core
 from pivot.executor import worker
 from pivot.storage import state as state_mod
 from pivot.types import (
+    CompletionType,
     DepEntry,
     HashInfo,
     LockData,
@@ -59,6 +60,7 @@ from pivot.types import (
     StageExplanation,
     StageResult,
     StageStatus,
+    ensure_completion_type,
 )
 
 if TYPE_CHECKING:
@@ -968,9 +970,9 @@ class Engine:
                                     )
                                     stage_durations[stage_name] = duration_ms
 
-                                    # Apply deferred writes for RAN and SKIPPED stages
+                                    # Apply deferred writes for RAN and CACHED stages
                                     if (
-                                        result["status"] in (StageStatus.RAN, StageStatus.SKIPPED)
+                                        result["status"] in (StageStatus.RAN, StageStatus.CACHED)
                                         and not no_commit
                                     ):
                                         stage_info = self._get_stage(stage_name)
@@ -1038,14 +1040,15 @@ class Engine:
                                                 previous_state=old_state,
                                             )
                                         )
-                                    # Emit skipped for all blocked stages not yet in results
+                                    # Emit terminal events for blocked stages not yet in results
                                     for name, state in self._scheduler.stage_states.items():
                                         if (
                                             state == StageExecutionState.BLOCKED
                                             and name not in results
                                         ):
-                                            await self._emit_skipped_stage(
+                                            await self._emit_terminal_stage(
                                                 name,
+                                                StageStatus.BLOCKED,
                                                 f"upstream '{first_failed}' failed",
                                                 results,
                                                 run_id=run_id,
@@ -1063,8 +1066,12 @@ class Engine:
                                             previous_state=old_state,
                                         )
                                     )
-                                    await self._emit_skipped_stage(
-                                        name, "cancelled", results, run_id=run_id
+                                    await self._emit_terminal_stage(
+                                        name,
+                                        StageStatus.CANCELLED,
+                                        "cancelled",
+                                        results,
+                                        run_id=run_id,
                                     )
 
                             # Start more stages if slots available
@@ -1106,8 +1113,9 @@ class Engine:
                                     ),
                                     "unknown",
                                 )
-                                await self._emit_skipped_stage(
+                                await self._emit_terminal_stage(
                                     name,
+                                    StageStatus.BLOCKED,
                                     f"upstream '{failed_upstream}' failed",
                                     results,
                                     run_id=run_id,
@@ -1581,7 +1589,7 @@ class Engine:
 
         skipped, generation_input_hash = await anyio.to_thread.run_sync(_try_generation_skip)
         if skipped:
-            await self._record_skipped_stage(
+            await self._record_cached_stage(
                 stage_name,
                 "unchanged (generation)",
                 generation_input_hash,
@@ -1646,7 +1654,7 @@ class Engine:
         if not restored:
             return False
 
-        await self._record_skipped_stage(
+        await self._record_cached_stage(
             stage_name,
             "unchanged",
             input_hash,
@@ -1656,7 +1664,7 @@ class Engine:
         )
         return True
 
-    async def _record_skipped_stage(
+    async def _record_cached_stage(
         self,
         stage_name: str,
         reason: str,
@@ -1667,7 +1675,7 @@ class Engine:
         run_id: str,
     ) -> None:
         result = StageResult(
-            status=StageStatus.SKIPPED,
+            status=StageStatus.CACHED,
             reason=reason,
             input_hash=input_hash,
             output_lines=[],
@@ -1854,16 +1862,17 @@ class Engine:
 
         return duration_ms
 
-    async def _emit_skipped_stage(
+    async def _emit_terminal_stage(
         self,
         stage_name: str,
+        status: CompletionType,
         reason: str,
         results: dict[str, executor_core.ExecutionSummary],
         run_id: str = "",
     ) -> None:
-        """Record and emit a skipped/blocked stage completion."""
+        """Record and emit a non-executed stage completion (cached/blocked/cancelled)."""
         results[stage_name] = executor_core.ExecutionSummary(
-            status=StageStatus.SKIPPED,
+            status=status,
             reason=reason,
             input_hash=None,
         )
@@ -1872,7 +1881,7 @@ class Engine:
             StageCompleted(
                 type="stage_completed",
                 stage=stage_name,
-                status=StageStatus.SKIPPED,
+                status=status,
                 reason=reason,
                 duration_ms=0.0,
                 index=stage_index,
@@ -1904,7 +1913,7 @@ class Engine:
 
             stages_records[name] = run_history.StageRunRecord(
                 input_hash=input_hash,
-                status=summary["status"],
+                status=ensure_completion_type(summary["status"]),
                 reason=summary["reason"],
                 duration_ms=duration_ms,
             )

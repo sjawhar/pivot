@@ -161,7 +161,7 @@ def test_execute_stage_runs_unchanged_stage(
 
     # Second run - should skip (unchanged)
     result2 = executor.execute_stage("test_stage", stage_info, worker_env, output_queue)
-    assert result2["status"] == "skipped"
+    assert result2["status"] == "cached"
     assert result2["reason"] == "unchanged"
 
 
@@ -207,7 +207,7 @@ def test_execute_stage_generation_skip_avoids_hashing(
     result = executor.execute_stage(stage_name, stage_info, worker_env, output_queue)
 
     hash_mock.assert_not_called()
-    assert result["status"] == "skipped"
+    assert result["status"] == "cached"
     assert result["reason"] == "unchanged (generation)"
 
 
@@ -917,7 +917,7 @@ def test_generation_skip_on_second_run(
 
     # Second run - should skip via generation check
     result2 = executor.execute_stage("test_stage", stage_info, worker_env, output_queue)
-    assert result2["status"] == "skipped"
+    assert result2["status"] == "cached"
     # Falls back to hash-based skip because input.txt is external (no generation tracking)
     assert "unchanged" in result2["reason"]
 
@@ -964,9 +964,9 @@ def test_generation_mismatch_triggers_rerun(
 
     # Second run - both should skip
     result2_step1 = executor.execute_stage("step1", step1_info, worker_env, output_queue)
-    assert result2_step1["status"] == "skipped"
+    assert result2_step1["status"] == "cached"
     result2_step2 = executor.execute_stage("step2", step2_info, worker_env, output_queue)
-    assert result2_step2["status"] == "skipped"
+    assert result2_step2["status"] == "cached"
 
     # Change input - step1 should re-run
     (tmp_path / "input.txt").write_text("modified")
@@ -1006,7 +1006,7 @@ def test_external_file_fallback_to_hash_check(
 
     # Second run - should skip (external file has no generation, falls back to hash)
     result2 = executor.execute_stage("test_stage", stage_info, worker_env, output_queue)
-    assert result2["status"] == "skipped"
+    assert result2["status"] == "cached"
 
     # Modify external file - should detect change via hash fallback
     (tmp_path / "external_data.txt").write_text("changed")
@@ -1049,7 +1049,7 @@ def test_deps_list_change_triggers_rerun(
 
     # Second run with same config - should skip
     result2 = executor.execute_stage("test_stage", stage_info_v1, worker_env, output_queue)
-    assert result2["status"] == "skipped"
+    assert result2["status"] == "cached"
 
     # Third run with deps=[A] only (B removed), DIFFERENT fingerprint
     # This simulates real usage where changing pivot.yaml deps changes fingerprint
@@ -1512,7 +1512,7 @@ def test_directory_out_skipped_on_second_run(
 
     # Second run - should skip
     result2 = executor.execute_stage("test_dir_out", stage_info, worker_env, output_queue)
-    assert result2["status"] == "skipped", f"Expected skipped, got {result2}"
+    assert result2["status"] == "cached", f"Expected cached, got {result2}"
     assert "unchanged" in result2["reason"]
 
 
@@ -1583,7 +1583,7 @@ def test_directory_out_restored_from_cache(
 
     # Second run - should skip and restore from cache
     result2 = executor.execute_stage("test_dir_out", stage_info, worker_env, output_queue)
-    assert result2["status"] == "skipped", f"Expected skipped, got {result2}"
+    assert result2["status"] == "cached", f"Expected cached, got {result2}"
 
     # Verify files were restored
     assert results_dir.exists()
@@ -2053,7 +2053,7 @@ def test_run_cache_skip_with_directory_out(
 
     # Second run - should skip via run cache and restore directory
     result2 = executor.execute_stage("test_run_cache_dir", stage_info, worker_env, output_queue)
-    assert result2["status"] == "skipped", f"Expected skipped, got {result2}"
+    assert result2["status"] == "cached", f"Expected cached, got {result2}"
     assert "run cache" in result2["reason"]
 
     # Verify files were restored
@@ -2111,7 +2111,7 @@ def test_run_cache_skip_restores_corrupted_directory(
 
     # Second run - should skip via run cache and fix corrupted file
     result2 = executor.execute_stage("test_run_cache_corrupt", stage_info, worker_env, output_queue)
-    assert result2["status"] == "skipped"
+    assert result2["status"] == "cached"
     assert "run cache" in result2["reason"]
 
     # Verify corrupted file was restored
@@ -2713,7 +2713,7 @@ def test_run_cache_skip_with_mixed_cached_and_noncached_outputs(
 
     # Second run — should skip via run cache
     result2 = executor.execute_stage("test_mixed_rc", stage_info, worker_env, output_queue)
-    assert result2["status"] == "skipped", f"Expected skipped, got {result2}"
+    assert result2["status"] == "cached", f"Expected cached, got {result2}"
     assert "run cache" in result2["reason"]
 
     # Cached output should be restored

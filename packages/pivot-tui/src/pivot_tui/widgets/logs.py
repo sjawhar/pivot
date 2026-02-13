@@ -106,7 +106,7 @@ class StageLogPanel(textual.widgets.RichLog):
         else:
             # Show status-appropriate message when no logs
             match stage.status:
-                case StageStatus.SKIPPED:
+                case StageStatus.CACHED | StageStatus.BLOCKED | StageStatus.CANCELLED:
                     self.write("[dim]Stage was skipped[/]")
                 case StageStatus.COMPLETED | StageStatus.RAN | StageStatus.FAILED:
                     self.write("[dim]No logs recorded[/]")

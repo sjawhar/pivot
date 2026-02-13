@@ -120,7 +120,7 @@ def test_no_fingerprint_stage_skips_when_unchanged(
     _apply_deferred_writes("no_fp", stage_info, result1)
 
     result2 = executor.execute_stage("no_fp", stage_info, worker_env, output_queue)
-    assert result2["status"] == "skipped", f"Expected skip, got: {result2}"
+    assert result2["status"] == "cached", f"Expected skip, got: {result2}"
 
 
 def test_no_fingerprint_reruns_on_source_file_change(
@@ -234,7 +234,7 @@ def test_no_fingerprint_skip_unrelated_change(
 
     (tmp_path / "unrelated.txt").write_text("unrelated")
     result2 = executor.execute_stage("no_fp", stage_info, worker_env, output_queue)
-    assert result2["status"] == "skipped", f"Expected skip, got: {result2}"
+    assert result2["status"] == "cached", f"Expected skip, got: {result2}"
 
 
 def test_no_fingerprint_mixed_pipeline(
@@ -274,10 +274,10 @@ def test_no_fingerprint_mixed_pipeline(
     _apply_deferred_writes("no_fp", no_fp_info, result1_no_fp)
 
     result2_ast = executor.execute_stage("ast_stage", ast_info, worker_env, output_queue)
-    assert result2_ast["status"] == "skipped", f"Expected skip, got: {result2_ast}"
+    assert result2_ast["status"] == "cached", f"Expected skip, got: {result2_ast}"
 
     result2_no_fp = executor.execute_stage("no_fp", no_fp_info, worker_env, output_queue)
-    assert result2_no_fp["status"] == "skipped", f"Expected skip, got: {result2_no_fp}"
+    assert result2_no_fp["status"] == "cached", f"Expected skip, got: {result2_no_fp}"
 
 
 def test_no_fingerprint_missing_code_deps_file(

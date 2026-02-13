@@ -51,7 +51,7 @@ class StageExecutionState(IntEnum):
     PREPARING = 3  # Pivot clearing outputs
     WAITING_ON_LOCK = 4  # Waiting for artifact lock
     RUNNING = 5  # Stage function executing
-    COMPLETED = 6  # Terminal (ran/skipped/failed)
+    COMPLETED = 6  # Terminal (ran/cached/blocked/cancelled/failed)
 
 
 class NodeType(Enum):
@@ -171,7 +171,7 @@ class OutputChangeSummary(TypedDict):
 
 
 class StageCompleted(TypedDict):
-    """A stage finished (ran, skipped, or failed)."""
+    """A stage finished (ran, cached, blocked, cancelled, or failed)."""
 
     type: Literal["stage_completed"]
     seq: NotRequired[int]

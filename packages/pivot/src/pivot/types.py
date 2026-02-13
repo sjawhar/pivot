@@ -2,15 +2,7 @@ from __future__ import annotations
 
 import enum
 from collections.abc import Callable
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    Literal,
-    NotRequired,
-    Required,
-    TypedDict,
-    TypeGuard,
-)
+from typing import TYPE_CHECKING, Any, Literal, NotRequired, Required, TypedDict, TypeGuard, cast
 
 if TYPE_CHECKING:
     from pivot.run_history import RunCacheEntry
@@ -46,14 +38,43 @@ class StageStatus(enum.StrEnum):
     READY = "ready"
     IN_PROGRESS = "in_progress"
     COMPLETED = "completed"
-    SKIPPED = "skipped"
+    CACHED = "cached"  # Was SKIPPED — stage up-to-date, outputs restored from cache
+    BLOCKED = "blocked"  # Was SKIPPED — upstream dependency failed
+    CANCELLED = "cancelled"  # Was SKIPPED — run cancelled by user
     FAILED = "failed"
     RAN = "ran"
     UNKNOWN = "unknown"
 
 
-CompletionType = Literal[StageStatus.RAN, StageStatus.SKIPPED, StageStatus.FAILED]
+CompletionType = Literal[
+    StageStatus.RAN,
+    StageStatus.CACHED,
+    StageStatus.BLOCKED,
+    StageStatus.CANCELLED,
+    StageStatus.FAILED,
+]
 """Status values for stages that have finished execution."""
+
+_COMPLETION_STATUSES: frozenset[StageStatus] = frozenset(
+    {
+        StageStatus.RAN,
+        StageStatus.CACHED,
+        StageStatus.BLOCKED,
+        StageStatus.CANCELLED,
+        StageStatus.FAILED,
+    }
+)
+
+
+def ensure_completion_type(status: StageStatus) -> CompletionType:
+    """Validate and narrow StageStatus to CompletionType.
+
+    Raises ValueError if status is not a terminal completion status.
+    """
+    if status not in _COMPLETION_STATUSES:
+        msg = f"Expected completion status, got '{status}'"
+        raise ValueError(msg)
+    return cast("CompletionType", status)
 
 
 class DisplayCategory(enum.StrEnum):
@@ -74,8 +95,8 @@ class DisplayCategory(enum.StrEnum):
     UNKNOWN = "unknown"
 
 
-def categorize_stage_result(status: StageStatus, reason: str) -> DisplayCategory:
-    """Map (status, reason) to display category for consistent UI."""
+def categorize_stage_result(status: StageStatus) -> DisplayCategory:
+    """Map status to display category for consistent UI."""
     match status:
         case StageStatus.READY:
             return DisplayCategory.PENDING
@@ -85,13 +106,12 @@ def categorize_stage_result(status: StageStatus, reason: str) -> DisplayCategory
             return DisplayCategory.SUCCESS
         case StageStatus.FAILED:
             return DisplayCategory.FAILED
-        case StageStatus.SKIPPED:
-            if reason.startswith("upstream"):
-                return DisplayCategory.BLOCKED
-            elif reason == "cancelled":
-                return DisplayCategory.CANCELLED
-            else:
-                return DisplayCategory.CACHED
+        case StageStatus.CACHED:
+            return DisplayCategory.CACHED
+        case StageStatus.BLOCKED:
+            return DisplayCategory.BLOCKED
+        case StageStatus.CANCELLED:
+            return DisplayCategory.CANCELLED
         case StageStatus.UNKNOWN:
             return DisplayCategory.UNKNOWN
 
@@ -733,7 +753,13 @@ class StageCompleteEvent(TypedDict):
 
     type: Literal[RunEventType.STAGE_COMPLETE]
     stage: str
-    status: Literal[StageStatus.RAN, StageStatus.SKIPPED, StageStatus.FAILED]
+    status: Literal[
+        StageStatus.RAN,
+        StageStatus.CACHED,
+        StageStatus.BLOCKED,
+        StageStatus.CANCELLED,
+        StageStatus.FAILED,
+    ]
     reason: str
     duration_ms: float
     timestamp: str  # ISO 8601 UTC

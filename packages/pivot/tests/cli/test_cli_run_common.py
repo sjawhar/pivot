@@ -641,7 +641,7 @@ def test_convert_results_handles_multiple_stages() -> None:
             type="stage_completed",
             seq=1,
             stage="evaluate",
-            status=StageStatus.SKIPPED,
+            status=StageStatus.CACHED,
             reason="unchanged",
             duration_ms=0.0,
             index=1,
@@ -654,7 +654,7 @@ def test_convert_results_handles_multiple_stages() -> None:
 
     assert len(summaries) == 2
     assert summaries["train"]["status"] == StageStatus.RAN
-    assert summaries["evaluate"]["status"] == StageStatus.SKIPPED
+    assert summaries["evaluate"]["status"] == StageStatus.CACHED
 
 
 def test_convert_results_empty_dict() -> None:

@@ -710,7 +710,7 @@ async def test_cached_incremental_output_runs_normally(
     # Second run should skip without error (output is cached, nothing changed)
     async with Engine(pipeline=test_pipeline) as engine:
         results2 = await _run_engine_once(engine, cache_dir=cache_dir)
-    assert results2["append_stage"]["status"] == "skipped"
+    assert results2["append_stage"]["status"] == "cached"
 
 
 @pytest.mark.anyio
@@ -739,7 +739,7 @@ async def test_force_runs_incremental_stage_even_when_unchanged(
     # Second run without force should skip
     async with Engine(pipeline=test_pipeline) as engine:
         results2 = await _run_engine_once(engine, cache_dir=cache_dir)
-    assert results2["append_stage"]["status"] == "skipped"
+    assert results2["append_stage"]["status"] == "cached"
     assert db_path.read_text() == "line 1\n"
 
     # Third run with force=True should run and append

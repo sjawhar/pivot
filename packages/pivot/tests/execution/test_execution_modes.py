@@ -230,7 +230,7 @@ def test_run_cache_restores_directory_output(
 
     # Second run - should skip via run cache and restore directory
     result2 = worker.execute_stage("test_stage", stage_info, worker_env, output_queue)
-    assert result2["status"] == StageStatus.SKIPPED
+    assert result2["status"] == StageStatus.CACHED
     assert "run cache" in result2["reason"], "Should skip via run cache"
     assert execution_count[0] == 1, "Should not have executed again"
 

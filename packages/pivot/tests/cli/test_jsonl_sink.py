@@ -200,7 +200,7 @@ async def test_jsonl_sink_close_is_noop(
 @pytest.mark.parametrize(
     ("status", "reason", "duration"),
     [
-        pytest.param(StageStatus.SKIPPED, "unchanged", 0.0, id="skipped"),
+        pytest.param(StageStatus.CACHED, "unchanged", 0.0, id="cached"),
         pytest.param(StageStatus.FAILED, "execution error", 1234.5, id="failed"),
         pytest.param(StageStatus.RAN, "executed", 100.0, id="ran"),
         pytest.param(StageStatus.RAN, "executed", 0.0, id="instant_completion"),

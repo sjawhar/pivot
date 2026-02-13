@@ -46,7 +46,7 @@ def _helper_render_renderable(renderable: object) -> str:
 
 def test_format_stage_line_ran_includes_duration() -> None:
     line = sinks._format_stage_line(
-        index=0,
+        index=1,
         total=12,
         stage="train",
         category=DisplayCategory.SUCCESS,
@@ -63,7 +63,7 @@ def test_format_stage_line_ran_includes_duration() -> None:
 
 def test_format_stage_line_skipped_omits_duration() -> None:
     line = sinks._format_stage_line(
-        index=1,
+        index=2,
         total=12,
         stage="skip_stage",
         category=DisplayCategory.CACHED,
@@ -78,7 +78,7 @@ def test_format_stage_line_skipped_omits_duration() -> None:
 
 def test_format_stage_line_failed_uses_failed_status() -> None:
     line = sinks._format_stage_line(
-        index=2,
+        index=3,
         total=12,
         stage="fail_stage",
         category=DisplayCategory.FAILED,
@@ -93,7 +93,7 @@ def test_format_stage_line_failed_uses_failed_status() -> None:
 
 def test_format_stage_line_truncates_long_names() -> None:
     line = sinks._format_stage_line(
-        index=0,
+        index=1,
         total=1,
         stage="very_long_stage_name",
         category=DisplayCategory.SUCCESS,
@@ -106,10 +106,10 @@ def test_format_stage_line_truncates_long_names() -> None:
 
 
 def test_format_skip_group_line_includes_range_and_count() -> None:
-    line = sinks._format_skip_group_line(start_index=0, end_index=2, total=9, count=3)
+    line = sinks._format_skip_group_line(start_index=1, end_index=3, total=9, count=3)
     rendered = _helper_render_markup(line)
     assert "1–3/9" in rendered, "Should include collapsed range"
-    assert "3 stages skipped" in rendered, "Should include skipped count text"
+    assert "3 stages not run" in rendered, "Should include skipped count text"
     assert "○" in rendered, "Should include skip symbol"
 
 
@@ -141,7 +141,7 @@ async def test_static_sink_prints_ran_stage_line() -> None:
         status=StageStatus.RAN,
         reason="",
         duration_ms=1200.0,
-        index=0,
+        index=1,
         total=1,
         run_id="test-run",
         input_hash=None,
@@ -166,10 +166,10 @@ async def test_static_sink_prints_skipped_stages_individually_when_low_count() -
             type="stage_completed",
             seq=idx,
             stage=f"skip_{idx}",
-            status=StageStatus.SKIPPED,
+            status=StageStatus.CACHED,
             reason="up-to-date",
             duration_ms=10.0,
-            index=idx,
+            index=idx + 1,
             total=3,
             run_id="test-run",
             input_hash=None,
@@ -184,7 +184,7 @@ async def test_static_sink_prints_skipped_stages_individually_when_low_count() -
     assert "skip_0" in result, "Should include first skipped stage"
     assert "skip_1" in result, "Should include second skipped stage"
     assert "cached" in result, "Should show cached status for up-to-date stages"
-    assert "stages skipped" not in result, "Should not collapse low skip counts"
+    assert "stages not run" not in result, "Should not collapse low skip counts"
 
 
 async def test_static_sink_collapses_skips_over_threshold() -> None:
@@ -197,10 +197,10 @@ async def test_static_sink_collapses_skips_over_threshold() -> None:
             type="stage_completed",
             seq=idx,
             stage=f"skip_{idx}",
-            status=StageStatus.SKIPPED,
+            status=StageStatus.CACHED,
             reason="up-to-date",
             duration_ms=10.0,
-            index=idx,
+            index=idx + 1,
             total=21,
             run_id="test-run",
             input_hash=None,
@@ -209,7 +209,7 @@ async def test_static_sink_collapses_skips_over_threshold() -> None:
     await sink.close()
 
     result = output.getvalue()
-    assert "21 stages skipped" in result, "Should collapse skipped stages over threshold"
+    assert "21 stages not run" in result, "Should collapse skipped stages over threshold"
 
 
 async def test_static_sink_does_not_collapse_skips_at_threshold() -> None:
@@ -222,10 +222,10 @@ async def test_static_sink_does_not_collapse_skips_at_threshold() -> None:
             type="stage_completed",
             seq=idx,
             stage=f"skip_{idx}",
-            status=StageStatus.SKIPPED,
+            status=StageStatus.CACHED,
             reason="up-to-date",
             duration_ms=10.0,
-            index=idx,
+            index=idx + 1,
             total=20,
             run_id="test-run",
             input_hash=None,
@@ -234,7 +234,7 @@ async def test_static_sink_does_not_collapse_skips_at_threshold() -> None:
     await sink.close()
 
     result = output.getvalue()
-    assert "stages skipped" not in result, "Should not collapse skips at threshold"
+    assert "stages not run" not in result, "Should not collapse skips at threshold"
 
 
 async def test_static_sink_ignores_waiting_on_lock_state_changes() -> None:
@@ -268,7 +268,7 @@ async def test_static_sink_prints_failed_with_error_details() -> None:
         status=StageStatus.FAILED,
         reason="first line\nsecond line",
         duration_ms=100.0,
-        index=0,
+        index=1,
         total=1,
         run_id="test-run",
         input_hash=None,
@@ -291,7 +291,7 @@ async def test_static_sink_ignores_stage_started() -> None:
         type="stage_started",
         seq=0,
         stage="train",
-        index=0,
+        index=1,
         total=2,
         run_id="test-run",
     )
@@ -308,11 +308,11 @@ async def test_static_sink_sorts_completions_by_index() -> None:
     sink = sinks.StaticConsoleSink(console=console)
 
     # Send in reverse index order
-    for idx, name in [(2, "third"), (0, "first"), (1, "second")]:
+    for idx, name in [(3, "third"), (1, "first"), (2, "second")]:
         await sink.handle(
             StageCompleted(
                 type="stage_completed",
-                seq=idx,
+                seq=idx - 1,
                 stage=name,
                 status=StageStatus.RAN,
                 reason="",
@@ -420,10 +420,10 @@ async def test_static_sink_log_lines_stream_before_completions() -> None:
             type="stage_completed",
             seq=0,
             stage="skip_stage",
-            status=StageStatus.SKIPPED,
+            status=StageStatus.CACHED,
             reason="cached",
             duration_ms=10.0,
-            index=0,
+            index=1,
             total=2,
             run_id="test-run",
             input_hash=None,
@@ -485,7 +485,7 @@ async def test_live_sink_prints_completion_to_scrollback() -> None:
             type="stage_started",
             seq=0,
             stage="train",
-            index=0,
+            index=1,
             total=1,
             run_id="test-run",
         )
@@ -498,7 +498,7 @@ async def test_live_sink_prints_completion_to_scrollback() -> None:
             status=StageStatus.RAN,
             reason="",
             duration_ms=1200.0,
-            index=0,
+            index=1,
             total=1,
             run_id="test-run",
             input_hash=None,
@@ -522,7 +522,7 @@ async def test_live_sink_tracks_running_stages() -> None:
             type="stage_started",
             seq=0,
             stage="train",
-            index=0,
+            index=1,
             total=1,
             run_id="test-run",
         )
@@ -540,7 +540,7 @@ async def test_live_sink_tracks_running_stages() -> None:
             status=StageStatus.RAN,
             reason="",
             duration_ms=50.0,
-            index=0,
+            index=1,
             total=1,
             run_id="test-run",
             input_hash=None,
@@ -581,7 +581,7 @@ async def test_live_sink_collapses_many_skips_in_scrollback() -> None:
                 type="stage_completed",
                 seq=idx,
                 stage=f"skip_{idx}",
-                status=StageStatus.SKIPPED,
+                status=StageStatus.CACHED,
                 reason="cached",
                 duration_ms=10.0,
                 index=idx,
@@ -593,7 +593,7 @@ async def test_live_sink_collapses_many_skips_in_scrollback() -> None:
     await sink.close()
 
     result = output.getvalue()
-    assert "21 stages skipped" in result, "Should collapse skipped stages over threshold"
+    assert "21 stages not run" in result, "Should collapse skipped stages over threshold"
 
 
 async def test_live_sink_prints_all_statuses_on_close() -> None:
@@ -610,7 +610,7 @@ async def test_live_sink_prints_all_statuses_on_close() -> None:
             status=StageStatus.RAN,
             reason="",
             duration_ms=1000.0,
-            index=0,
+            index=1,
             total=3,
             run_id="test-run",
             input_hash=None,
@@ -621,10 +621,10 @@ async def test_live_sink_prints_all_statuses_on_close() -> None:
             type="stage_completed",
             seq=1,
             stage="skipped_stage",
-            status=StageStatus.SKIPPED,
+            status=StageStatus.CACHED,
             reason="cached",
             duration_ms=2000.0,
-            index=1,
+            index=2,
             total=3,
             run_id="test-run",
             input_hash=None,
@@ -638,7 +638,7 @@ async def test_live_sink_prints_all_statuses_on_close() -> None:
             status=StageStatus.FAILED,
             reason="boom",
             duration_ms=500.0,
-            index=2,
+            index=3,
             total=3,
             run_id="test-run",
             input_hash=None,
@@ -702,7 +702,7 @@ async def test_live_sink_live_renderable_shows_running_stages() -> None:
             type="stage_started",
             seq=0,
             stage="train",
-            index=0,
+            index=1,
             total=1,
             run_id="test-run",
         )
@@ -729,7 +729,7 @@ async def test_live_sink_live_renderable_shows_progress() -> None:
             status=StageStatus.RAN,
             reason="",
             duration_ms=1000.0,
-            index=0,
+            index=1,
             total=3,
             run_id="test-run",
             input_hash=None,
@@ -760,7 +760,7 @@ async def test_result_collector_sink_collects_completed() -> None:
         status=StageStatus.RAN,
         reason="",
         duration_ms=1000,
-        index=0,
+        index=1,
         total=1,
         run_id="test-run",
         input_hash=None,
@@ -782,7 +782,7 @@ async def test_result_collector_sink_ignores_other_events() -> None:
         type="stage_started",
         seq=0,
         stage="train",
-        index=0,
+        index=1,
         total=2,
         run_id="test-run",
     )
@@ -805,7 +805,7 @@ async def test_result_collector_sink_concurrent_access() -> None:
             status=StageStatus.RAN,
             reason="test",
             duration_ms=100.0,
-            index=0,
+            index=1,
             total=1,
             run_id="test-run",
             input_hash=None,
@@ -841,7 +841,7 @@ async def test_result_collector_sink_prevents_lost_updates() -> None:
                 status=StageStatus.RAN,
                 reason=f"iteration_{i}",
                 duration_ms=float(i),
-                index=0,
+                index=1,
                 total=1,
                 run_id="test-run",
                 input_hash=None,
@@ -876,7 +876,7 @@ _EVENTS = [
         type="stage_started",
         seq=i,
         stage=f"s{i}",
-        index=i,
+        index=i + 1,
         total=5,
         run_id="test-run",
     )
@@ -953,7 +953,7 @@ async def test_per_sink_ordering_preserved() -> None:
             status=StageStatus.RAN,
             reason="",
             duration_ms=float(i),
-            index=i,
+            index=i + 1,
             total=10,
             input_hash=None,
         )
@@ -1030,7 +1030,9 @@ async def test_queue_full_disables_stalled_sink() -> None:
             # The stalling sink blocks on event 1, so the queue fills after 1025 more.
             for i in range(2000):
                 await eng.emit(
-                    StageStarted(type="stage_started", seq=i, stage=f"s{i}", index=i, total=2000)
+                    StageStarted(
+                        type="stage_started", seq=i, stage=f"s{i}", index=i + 1, total=2000
+                    )
                 )
                 sent_count += 1
 

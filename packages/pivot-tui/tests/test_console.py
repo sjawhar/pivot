@@ -128,7 +128,7 @@ def test_console_stage_result_cached() -> None:
     stream = io.StringIO()
     con = console.Console(stream=stream, color=False)
 
-    con.stage_result("my_stage", index=1, total=5, status=StageStatus.SKIPPED, reason="unchanged")
+    con.stage_result("my_stage", index=1, total=5, status=StageStatus.CACHED, reason="unchanged")
 
     output = stream.getvalue()
     assert "cached" in output
@@ -140,7 +140,7 @@ def test_console_stage_result_blocked() -> None:
     con = console.Console(stream=stream, color=False)
 
     con.stage_result(
-        "my_stage", index=1, total=5, status=StageStatus.SKIPPED, reason="upstream 'other' failed"
+        "my_stage", index=1, total=5, status=StageStatus.BLOCKED, reason="upstream 'other' failed"
     )
 
     output = stream.getvalue()
@@ -191,7 +191,7 @@ def test_console_summary() -> None:
     stream = io.StringIO()
     con = console.Console(stream=stream, color=False)
 
-    con.summary(ran=5, cached=2, blocked=1, failed=1, total_duration=10.5)
+    con.summary(ran=5, cached=2, blocked=1, cancelled=0, failed=1, total_duration=10.5)
 
     output = stream.getvalue()
     assert "5" in output  # ran

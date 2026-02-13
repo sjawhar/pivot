@@ -146,7 +146,7 @@ class Console:
         progress = self._color(f"[{index}/{total}]", "dim")
 
         # Determine display status and text based on status and reason
-        category = categorize_stage_result(status, reason)
+        category = categorize_stage_result(status)
         match category:
             case DisplayCategory.SUCCESS:
                 status_text = self._color("ran", "green", "bold")
@@ -190,6 +190,7 @@ class Console:
         ran: int,
         cached: int,
         blocked: int,
+        cancelled: int,
         failed: int,
         total_duration: float,
     ) -> None:
@@ -202,9 +203,14 @@ class Console:
         ran_text = self._color(str(ran), "green") if ran > 0 else str(ran)
         cached_text = self._color(str(cached), "yellow") if cached > 0 else str(cached)
         blocked_text = self._color(str(blocked), "red") if blocked > 0 else str(blocked)
+        cancelled_text = self._color(str(cancelled), "yellow") if cancelled > 0 else str(cancelled)
         failed_text = self._color(str(failed), "red", "bold") if failed > 0 else str(failed)
 
-        summary = f"Summary: {ran_text} ran, {cached_text} cached, {blocked_text} blocked, {failed_text} failed"
+        parts = [f"{ran_text} ran", f"{cached_text} cached", f"{blocked_text} blocked"]
+        if cancelled > 0:
+            parts.append(f"{cancelled_text} cancelled")
+        parts.append(f"{failed_text} failed")
+        summary = "Summary: " + ", ".join(parts)
         duration = self._color(f"[{total_duration:.2f}s total]", "dim")
 
         self._echo(f"{summary} {duration}")

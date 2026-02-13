@@ -80,7 +80,9 @@ async def test_engine_run_completes_with_exit_on_completion(
         # Stage completes (any terminal status is acceptable - the point is it doesn't hang)
         assert results["test_stage"]["status"] in (
             StageStatus.RAN,
-            StageStatus.SKIPPED,
+            StageStatus.CACHED,
+            StageStatus.BLOCKED,
+            StageStatus.CANCELLED,
             StageStatus.FAILED,
         )
 

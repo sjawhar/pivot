@@ -147,7 +147,7 @@ def test_run_cache_skip_updates_lock_file(
         run_id="run_3",
     )
     result3 = executor.execute_stage("test_stage", stage_info_run3, worker_env, output_queue)
-    assert result3["status"] == "skipped"
+    assert result3["status"] == "cached"
     assert "run cache" in result3["reason"], f"Expected run cache skip, got: {result3['reason']}"
 
     # CRITICAL: Lock file should now have state A (not stale state B)
@@ -223,7 +223,7 @@ def test_explain_shows_cached_after_run_cache_skip(
         run_id="run_3",
     )
     result3 = executor.execute_stage("test_stage", stage_info_run3, worker_env, output_queue)
-    assert result3["status"] == "skipped"
+    assert result3["status"] == "cached"
     assert "run cache" in result3["reason"]
 
     # CRITICAL: Explain should show stage as NOT needing to run
@@ -277,7 +277,7 @@ def test_regular_execution_still_works(
 
     # Subsequent run should skip (via generation or hash check)
     result2 = executor.execute_stage("test_stage", stage_info, worker_env, output_queue)
-    assert result2["status"] == "skipped"
+    assert result2["status"] == "cached"
     assert "unchanged" in result2["reason"]
 
 
@@ -356,7 +356,7 @@ def test_run_cache_skip_does_not_increment_output_generations(
         run_id="run_3",
     )
     result3 = executor.execute_stage("test_stage", stage_info_run3, worker_env, output_queue)
-    assert result3["status"] == "skipped"
+    assert result3["status"] == "cached"
     assert "run cache" in result3["reason"], f"Expected run cache skip, got: {result3['reason']}"
 
     # Apply deferred writes from the SKIPPED result

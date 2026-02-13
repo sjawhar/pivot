@@ -249,7 +249,7 @@ def test_finalize_history_skipped_without_pending_creates_entry() -> None:
     # Call _finalize_history_entry for a SKIPPED stage with no pending state
     app._finalize_history_entry(
         stage_name="downstream_stage",
-        status=StageStatus.SKIPPED,
+        status=StageStatus.BLOCKED,
         reason="upstream 'stage_a' failed",
         elapsed=None,
         run_id="test_run_123",
@@ -259,7 +259,7 @@ def test_finalize_history_skipped_without_pending_creates_entry() -> None:
     assert len(app._stages["downstream_stage"].history) == 1
     entry = app._stages["downstream_stage"].history[0]
     assert entry.run_id == "test_run_123"
-    assert entry.status == StageStatus.SKIPPED
+    assert entry.status == StageStatus.BLOCKED
     assert "upstream 'stage_a' failed" in entry.reason
     assert entry.duration is None
     assert entry.logs == []
@@ -272,7 +272,7 @@ def test_finalize_history_skipped_without_run_id_does_not_create_entry() -> None
     # Call without run_id - should not create entry
     app._finalize_history_entry(
         stage_name="downstream_stage",
-        status=StageStatus.SKIPPED,
+        status=StageStatus.BLOCKED,
         reason="upstream failed",
         elapsed=None,
         run_id=None,  # No run_id
@@ -442,7 +442,7 @@ def test_finalize_history_with_empty_logs() -> None:
     # Finalize with SKIPPED status (special case that creates entry without pending)
     app._finalize_history_entry(
         stage_name="silent_stage",
-        status=StageStatus.SKIPPED,
+        status=StageStatus.BLOCKED,
         reason="upstream failed",
         elapsed=None,
         run_id="test_run",
@@ -452,7 +452,7 @@ def test_finalize_history_with_empty_logs() -> None:
     assert len(app._stages["silent_stage"].history) == 1
     entry = app._stages["silent_stage"].history[0]
     assert len(entry.logs) == 0
-    assert entry.status == StageStatus.SKIPPED
+    assert entry.status == StageStatus.BLOCKED
 
 
 def test_get_current_stage_history_with_no_stages() -> None:

@@ -713,7 +713,7 @@ pipeline.register(my_stage)
 
         first_event = json.loads(lines[0])
         assert first_event["type"] == "schema_version"
-        assert first_event["version"] == 1
+        assert first_event["version"] == 2
 
 
 def test_cli_run_json_emits_stage_events(runner: CliRunner, tmp_path: pathlib.Path) -> None:
