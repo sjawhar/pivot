@@ -4,16 +4,20 @@ import contextvars
 import dataclasses
 import functools
 import importlib
+import inspect
+import pathlib
 import typing
 from typing import TYPE_CHECKING, Annotated, Any, get_args, get_origin, get_type_hints
 
 from typing_extensions import is_typeddict
 
+from . import outputs, registry, stage_def
+from .pipeline import pipeline as pipeline_mod
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 
     from . import loaders as loaders_mod
-    from . import stage_def
 
 
 def _get_loaders():  # type: ignore[return-value]
@@ -51,8 +55,265 @@ __all__ = [
 ]
 
 
+def _artifact_dir_prefix(tag: _MetricTag | _PlotTag | None) -> str:
+    if isinstance(tag, _MetricTag):
+        return "metrics"
+    if isinstance(tag, _PlotTag):
+        return "plots"
+    return "data"
+
+
+def _generate_artifact_path(
+    pipeline_name: str,
+    stage_name: str,
+    output_spec: _OutputSpec,
+    is_single_output: bool,
+) -> str:
+    prefix = _artifact_dir_prefix(output_spec.tag)
+    ext = _format_extension(output_spec.format)
+    if is_single_output:
+        return f"{prefix}/{pipeline_name}/{stage_name}.{ext}"
+    return f"{prefix}/{pipeline_name}/{stage_name}/{output_spec.key}.{ext}"
+
+
 class Pipeline:
-    pass
+    _name: str
+    _root: pathlib.Path
+    _stages: list[_StageNode]
+    _inputs: dict[str, _InputNode]
+    _call_counts: dict[str, int]
+    _validation_errors: list[str]
+    _token: contextvars.Token[Pipeline | None] | None
+
+    def __init__(self, name: str, *, root: pathlib.Path | None = None) -> None:
+        self._name = name
+        self._stages = []
+        self._inputs = {}
+        self._call_counts = {}
+        self._validation_errors = []
+        self._token = None
+
+        if root is not None:
+            self._root = root.resolve()
+        else:
+            frame = inspect.currentframe()
+            try:
+                if frame is None or frame.f_back is None:
+                    raise RuntimeError("Cannot determine caller frame")
+                caller_file = frame.f_back.f_globals.get("__file__")
+                if caller_file is None:
+                    raise RuntimeError("Provide explicit root= for Pipeline")
+                self._root = pathlib.Path(caller_file).resolve().parent
+            finally:
+                del frame
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    def __enter__(self) -> Pipeline:
+        self._token = _active_pipeline.set(self)
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        if self._token is not None:
+            _active_pipeline.reset(self._token)
+            self._token = None
+        if exc_type is None:
+            self._validate()
+
+    def input(
+        self,
+        name: str,
+        path: str,
+        format: loaders_mod.Reader[object] | loaders_mod.Loader[object, object] | None = None,
+        python_type: type | None = None,
+    ) -> ArtifactHandle:
+        if format is None:
+            format = _infer_format_from_extension(path)
+        node = _InputNode(name=name, python_type=python_type, path=path, format=format)
+        self._inputs[name] = node
+        return ArtifactHandle(
+            pipeline=self,
+            source=node,
+            output_key=None,
+            python_type=python_type or object,
+        )
+
+    def _record_stage(
+        self,
+        original_func: Callable[..., object],
+        wrapper: Callable[..., object],
+        output_specs: list[_OutputSpec],
+        args: tuple[object, ...],
+        kwargs: dict[str, object],
+    ) -> ArtifactHandle:
+        func_name = original_func.__name__
+
+        count = self._call_counts.get(func_name, 0)
+        self._call_counts[func_name] = count + 1
+        stage_name = func_name if count == 0 else f"{func_name}@{count}"
+
+        sig = inspect.signature(original_func)
+        try:
+            bound = sig.bind(*args, **kwargs)
+            bound.apply_defaults()
+        except TypeError as exc:
+            self._validation_errors.append(f"{stage_name}: {exc}")
+            dummy_input = _InputNode(
+                name="__error__",
+                python_type=None,
+                path="__error__",
+                format=_get_loaders().PathOnly(),
+            )
+            return ArtifactHandle(self, dummy_input, None, object)
+
+        input_handles = dict[str, ArtifactHandle]()
+        params: stage_def.StageParams | None = None
+        for param_name, value in bound.arguments.items():
+            if isinstance(value, ArtifactHandle):
+                input_handles[param_name] = value
+            elif isinstance(value, stage_def.StageParams):
+                params = value
+
+        node = _StageNode(
+            func=wrapper,
+            original_func=original_func,
+            name=stage_name,
+            params=params,
+            input_handles=input_handles,
+            output_specs=output_specs,
+            call_index=count,
+        )
+        self._stages.append(node)
+
+        if len(output_specs) == 1:
+            return ArtifactHandle(
+                pipeline=self,
+                source=node,
+                output_key=None,
+                python_type=output_specs[0].python_type,
+            )
+        return ArtifactHandle(
+            pipeline=self,
+            source=node,
+            output_key=None,
+            python_type=dict,
+        )
+
+    def _validate(self) -> None:
+        if self._validation_errors:
+            msg = (
+                f'Pipeline "{self._name}" has {len(self._validation_errors)} '
+                + "validation error(s):\n\n"
+            )
+            for err in self._validation_errors:
+                msg += f"  {err}\n"
+            raise ValueError(msg)
+
+    def build(self) -> pipeline_mod.Pipeline:
+        legacy = pipeline_mod.Pipeline(self._name, root=self._root)
+
+        path_map = dict[tuple[int, str | None], str]()
+        for node in self._stages:
+            is_single_output = len(node.output_specs) == 1
+            for output_spec in node.output_specs:
+                path = _generate_artifact_path(
+                    self._name,
+                    node.name,
+                    output_spec,
+                    is_single_output,
+                )
+                output_key = None if is_single_output else output_spec.key
+                path_map[(id(node), output_key)] = path
+
+        for node in self._stages:
+            func = node.original_func
+            assert not hasattr(func, "_is_stage")
+
+            deps = dict[str, outputs.PathType]()
+            dep_specs = dict[str, stage_def.FuncDepSpec]()
+            deps_paths = list[str]()
+
+            for param_name, handle in node.input_handles.items():
+                if isinstance(handle._source, _InputNode):
+                    path = handle._source.path
+                    loader = handle._source.format
+                else:
+                    source = typing.cast("_StageNode", handle._source)
+                    path = path_map[(id(source), handle._output_key)]
+                    if len(source.output_specs) == 1:
+                        output_spec = source.output_specs[0]
+                    else:
+                        output_spec = next(
+                            spec for spec in source.output_specs if spec.key == handle._output_key
+                        )
+                    loader = output_spec.format
+
+                deps[param_name] = path
+                deps_paths.append(path)
+                dep_specs[param_name] = stage_def.FuncDepSpec(
+                    path=path,
+                    loader=typing.cast("loaders_mod.Reader[object]", loader),
+                    creates_dep_edge=True,
+                )
+
+            outs = list[outputs.ExpandedOut]()
+            outs_paths = list[str]()
+            out_specs = dict[str, outputs.BaseOut]()
+
+            is_single_output = len(node.output_specs) == 1
+            for output_spec in node.output_specs:
+                out_path = _generate_artifact_path(
+                    self._name,
+                    node.name,
+                    output_spec,
+                    is_single_output,
+                )
+                if isinstance(output_spec.tag, _MetricTag):
+                    out = outputs.Metric(out_path, loader=output_spec.format)
+                elif isinstance(output_spec.tag, _PlotTag):
+                    out = outputs.Plot(out_path, loader=output_spec.format)
+                else:
+                    out = outputs.Out(out_path, loader=output_spec.format)
+
+                outs.append(outputs.require_expanded(out))
+                outs_paths.append(out_path)
+                out_specs[output_spec.key] = out
+
+            params_arg_name: str | None = None
+            hints = get_type_hints(func, include_extras=True)
+            for name, hint in hints.items():
+                if name == "return":
+                    continue
+                base_hint = hint
+                if get_origin(base_hint) is Annotated:
+                    base_hint = get_args(base_hint)[0]
+                if isinstance(base_hint, type) and issubclass(base_hint, stage_def.StageParams):
+                    params_arg_name = name
+                    break
+
+            stage_info = registry.RegistryStageInfo(
+                func=func,
+                name=node.name,
+                deps=deps,
+                deps_paths=deps_paths,
+                outs=outs,
+                outs_paths=outs_paths,
+                params=node.params,
+                mutex=[],
+                variant=None,
+                signature=inspect.signature(func),
+                fingerprint=None,
+                dep_specs=dep_specs,
+                out_specs=out_specs,
+                params_arg_name=params_arg_name,
+                state_dir=self._root / ".pivot",
+            )
+
+            legacy._registry.add_existing(stage_info)
+
+        return legacy
 
 
 _active_pipeline: contextvars.ContextVar[Pipeline | None] = contextvars.ContextVar(
@@ -93,7 +354,12 @@ def _infer_format(
 ) -> loaders_mod.Writer[object]:
     loaders = _get_loaders()
     defaults = _resolve_default_formats()
-    loader_name = defaults.get(python_type)
+
+    # Unwrap generic aliases (e.g. dict[str, Any] → dict) for lookup and issubclass
+    origin = get_origin(python_type)
+    lookup_type = origin if origin is not None else python_type
+
+    loader_name = defaults.get(lookup_type)
     if loader_name is not None:
         loader_class = typing.cast(
             "type[loaders_mod.Writer[object]]", getattr(loaders, loader_name)
@@ -101,14 +367,15 @@ def _infer_format(
         return loader_class()
 
     for registered_type, registered_loader in defaults.items():
-        if issubclass(python_type, registered_type):
+        if isinstance(lookup_type, type) and issubclass(lookup_type, registered_type):
             loader_class = typing.cast(
                 "type[loaders_mod.Writer[object]]", getattr(loaders, registered_loader)
             )
             return loader_class()
 
+    type_name = getattr(python_type, "__name__", str(python_type))
     raise ValueError(
-        f"Cannot infer serialization format for type {python_type.__name__}. "
+        f"Cannot infer serialization format for type {type_name}. "
         + "Use Annotated[T, format] on the return type to specify explicitly."
     )
 
