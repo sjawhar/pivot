@@ -208,6 +208,26 @@ def _helper_build_stage_b(
     return {"rows": len(data)}
 
 
+class _HelperOptionalParams(stage_def.StageParams):
+    x: int = 1
+
+
+@stage
+def _helper_optional_params_stage(
+    data: pd.DataFrame,
+    params: _HelperOptionalParams | None = None,
+) -> pd.DataFrame:
+    return data
+
+
+@stage
+def _helper_typing_optional_params_stage(
+    data: pd.DataFrame,
+    params: typing.Optional[_HelperOptionalParams] = None,  # noqa: UP045 - intentionally testing typing.Union path
+) -> pd.DataFrame:
+    return data
+
+
 def test_analyze_return_type_single() -> None:
     specs = _analyze_return_type(_helper_single_output)
     assert len(specs) == 1
@@ -265,6 +285,67 @@ def test_analyze_return_type_typeddict() -> None:
 def test_infer_format_from_extension(path: str, expected_type: type) -> None:
     result = _infer_format_from_extension(path)
     assert isinstance(result, expected_type)
+
+
+# --- Bug 1: p.input() t= parameter format inference ---
+
+
+def test_input_t_pathlib_path_uses_pathonly_regardless_of_extension() -> None:
+    """t=pathlib.Path should use PathOnly, not extension-inferred CSV."""
+    with Pipeline("test", root=pathlib.Path("/tmp")) as pipeline:
+        pipeline.input("data.csv", t=pathlib.Path, path="data/external/data.csv")
+
+    node = pipeline._inputs["data.csv"]
+    assert isinstance(node.format, loaders.PathOnly), (
+        f"Expected PathOnly for t=pathlib.Path, got {type(node.format).__name__}"
+    )
+
+
+def test_input_t_str_uses_text_regardless_of_extension() -> None:
+    """t=str should use Text, not extension-inferred CSV."""
+    with Pipeline("test", root=pathlib.Path("/tmp")) as pipeline:
+        pipeline.input("query.csv", t=str, path="data/external/query.csv")
+
+    node = pipeline._inputs["query.csv"]
+    assert isinstance(node.format, loaders.Text), (
+        f"Expected Text for t=str, got {type(node.format).__name__}"
+    )
+
+
+def test_input_t_dataframe_still_uses_extension_inference() -> None:
+    """t=pd.DataFrame should NOT override extension inference (CSV stays CSV)."""
+    with Pipeline("test", root=pathlib.Path("/tmp")) as pipeline:
+        pipeline.input("data.csv", t=pd.DataFrame, path="data/external/data.csv")
+
+    node = pipeline._inputs["data.csv"]
+    assert isinstance(node.format, loaders.CSV), (
+        f"Expected CSV from extension for t=DataFrame, got {type(node.format).__name__}"
+    )
+
+
+def test_input_explicit_format_takes_priority_over_t() -> None:
+    """Explicit format= parameter should override both t and extension."""
+    with Pipeline("test", root=pathlib.Path("/tmp")) as pipeline:
+        pipeline.input(
+            "data.csv",
+            t=pathlib.Path,
+            path="data/external/data.csv",
+            format=loaders.CSV(),
+        )
+
+    node = pipeline._inputs["data.csv"]
+    assert isinstance(node.format, loaders.CSV), (
+        f"Expected CSV from explicit format, got {type(node.format).__name__}"
+    )
+
+
+def test_input_no_t_uses_extension_inference() -> None:
+    """Without t parameter, extension inference should work as before."""
+    with Pipeline("test", root=pathlib.Path("/tmp")) as pipeline:
+        pipeline.input("data.csv", path="data/raw/data.csv")
+
+    node = pipeline._inputs["data.csv"]
+    assert isinstance(node.format, loaders.CSV)
 
 
 def test_pipeline_context_basic() -> None:
@@ -347,3 +428,24 @@ def test_pipeline_build_bridge(tmp_path: pathlib.Path) -> None:
     dep_spec_b = stage_b["dep_specs"]["data"]
     assert dep_spec_b.path == output_a_path
     assert dep_spec_b.loader == stage_a["out_specs"][stage_def.SINGLE_OUTPUT_KEY].loader
+
+
+# --- Bug 2: Optional[StageParams] params detection ---
+
+
+def test_build_rejects_stage_params_in_pipe_union(tmp_path: pathlib.Path) -> None:
+    with Pipeline("test", root=tmp_path) as pipeline:
+        raw = pipeline.input("raw", path="data/raw.csv", t=pd.DataFrame)
+        _helper_optional_params_stage(data=raw, params=_HelperOptionalParams(x=2))
+
+    with pytest.raises(TypeError, match="StageParams must not be in a union"):
+        pipeline.build()
+
+
+def test_build_rejects_stage_params_in_typing_optional(tmp_path: pathlib.Path) -> None:
+    with Pipeline("test", root=tmp_path) as pipeline:
+        raw = pipeline.input("raw", path="data/raw.csv", t=pd.DataFrame)
+        _helper_typing_optional_params_stage(data=raw, params=_HelperOptionalParams(x=3))
+
+    with pytest.raises(TypeError, match="StageParams must not be in a union"):
+        pipeline.build()
