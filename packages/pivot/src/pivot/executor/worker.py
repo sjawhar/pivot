@@ -802,11 +802,10 @@ def _run_stage_function_with_injection(
 ) -> None:
     """Run stage function with dependency injection and output capture.
 
-    This is the new injection-based execution path for stages using Annotated deps:
+    This is the injection-based execution path for stages using Annotated outputs:
 
         def train(
             config: TrainParams,
-            data: Annotated[DataFrame, Dep("input.csv", CSV())],
         ) -> TrainOutputs:
             ...
 

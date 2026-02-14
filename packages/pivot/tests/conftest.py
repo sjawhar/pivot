@@ -25,14 +25,13 @@ from pivot.executor import core as executor_core
 from pivot.pipeline import pipeline as pipeline_mod
 from pivot.registry import StageRegistry
 
-# Add tests directory to sys.path so helpers.py can be imported
 _tests_dir = pathlib.Path(__file__).parent
 if str(_tests_dir) not in sys.path:
     sys.path.insert(0, str(_tests_dir))
 
+
 if TYPE_CHECKING:
     from pytest_mock import MockerFixture
-    from types_aiobotocore_s3 import S3Client
 
     from pivot.engine.engine import Engine
     from pivot.engine.types import OutputEvent
@@ -96,24 +95,6 @@ def tmp_pipeline_dir() -> Generator[pathlib.Path]:
 
 
 @pytest.fixture
-async def moto_s3_bucket(
-    moto_patch_session: object, aioboto3_s3_client: S3Client
-) -> AsyncGenerator[str]:
-    """Create a test bucket in moto with unique name for xdist support.
-
-    Uses pytest-aioboto3's moto_patch_session to mock S3 and aioboto3_s3_client
-    to create the bucket. Bucket name includes a unique suffix to prevent
-    conflicts when running tests in parallel with pytest-xdist.
-
-    Yields:
-        str: The bucket name (e.g., "test-bucket-a1b2c3d4").
-    """
-    bucket_name = f"test-bucket-{uuid.uuid4().hex[:8]}"
-    await aioboto3_s3_client.create_bucket(Bucket=bucket_name)
-    yield bucket_name
-
-
-@pytest.fixture
 def sample_data_file(tmp_pipeline_dir: pathlib.Path) -> pathlib.Path:
     data_file = tmp_pipeline_dir / "data.csv"
     data_file.write_text("id,value\n1,10\n2,20\n3,30\n")
@@ -124,20 +105,13 @@ def sample_data_file(tmp_pipeline_dir: pathlib.Path) -> pathlib.Path:
 def test_pipeline(tmp_path: pathlib.Path) -> Generator[pipeline_mod.Pipeline]:
     """Provide a fresh Pipeline for tests.
 
-    Also sets up the module-level test pipeline in helpers.py so that
-    register_test_stage() works without explicit pipeline parameter.
-
     Note: This fixture does NOT mock the project root. Tests that register
     stages with path annotations should either:
     1. Use mock_discovery fixture (which mocks project root)
     2. Or explicitly mock project._project_root_cache themselves
     """
-    import helpers
-
     pipeline = pipeline_mod.Pipeline("test", root=tmp_path)
-    helpers.set_test_pipeline(pipeline)
     yield pipeline
-    helpers.set_test_pipeline(None)
 
 
 @pytest.fixture
@@ -161,8 +135,7 @@ def mock_discovery(
     Tests using this fixture should NOT use isolated_filesystem() since
     this fixture already sets up the environment correctly.
 
-    Note: The test_pipeline fixture is automatically used, so stages
-    can be registered via register_test_stage().
+    Note: The test_pipeline fixture is automatically used.
     """
     from pivot import discovery
     from pivot.cli import decorators as cli_decorators

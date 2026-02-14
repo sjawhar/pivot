@@ -5,16 +5,16 @@ import dataclasses
 import functools
 import importlib
 import inspect
-import pathlib
 import typing
-from typing import TYPE_CHECKING, Annotated, Any, get_args, get_origin, get_type_hints
+from typing import TYPE_CHECKING, Annotated, Any, TypeVar, get_args, get_origin, get_type_hints
 
 from typing_extensions import is_typeddict
 
-from . import outputs, registry, stage_def
+from . import outputs, project, registry, stage_def
 from .pipeline import pipeline as pipeline_mod
 
 if TYPE_CHECKING:
+    import pathlib
     from collections.abc import Callable
 
     from . import loaders as loaders_mod
@@ -96,16 +96,7 @@ class Pipeline:
         if root is not None:
             self._root = root.resolve()
         else:
-            frame = inspect.currentframe()
-            try:
-                if frame is None or frame.f_back is None:
-                    raise RuntimeError("Cannot determine caller frame")
-                caller_file = frame.f_back.f_globals.get("__file__")
-                if caller_file is None:
-                    raise RuntimeError("Provide explicit root= for Pipeline")
-                self._root = pathlib.Path(caller_file).resolve().parent
-            finally:
-                del frame
+            self._root = project.get_project_root()
 
     @property
     def name(self) -> str:
@@ -122,22 +113,48 @@ class Pipeline:
         if exc_type is None:
             self._validate()
 
+    @typing.overload
     def input(
         self,
         name: str,
-        path: str,
+        *,
+        t: type[_T],
+        path: str | None = None,
+        external: bool = False,
         format: loaders_mod.Reader[object] | loaders_mod.Loader[object, object] | None = None,
-        python_type: type | None = None,
-    ) -> ArtifactHandle:
+    ) -> _T: ...
+
+    @typing.overload
+    def input(
+        self,
+        name: str,
+        *,
+        path: str | None = None,
+        external: bool = False,
+        format: loaders_mod.Reader[object] | loaders_mod.Loader[object, object] | None = None,
+    ) -> ArtifactHandle: ...
+
+    def input(
+        self,
+        name: str,
+        *,
+        t: type | None = None,
+        path: str | None = None,
+        external: bool = False,
+        format: loaders_mod.Reader[object] | loaders_mod.Loader[object, object] | None = None,
+    ) -> Any:
+        if path is None:
+            prefix = "data/external" if external else "data/raw"
+            path = f"{prefix}/{name}"
         if format is None:
             format = _infer_format_from_extension(path)
-        node = _InputNode(name=name, python_type=python_type, path=path, format=format)
+        node = _InputNode(name=name, python_type=t, path=path, format=format)
         self._inputs[name] = node
         return ArtifactHandle(
             pipeline=self,
             source=node,
             output_key=None,
-            python_type=python_type or object,
+            python_type=t or object,
         )
 
     def _record_stage(
@@ -241,7 +258,6 @@ class Pipeline:
                     loader = handle._source.format
                 else:
                     source = typing.cast("_StageNode", handle._source)
-                    path = path_map[(id(source), handle._output_key)]
                     if len(source.output_specs) == 1:
                         output_spec = source.output_specs[0]
                     else:
@@ -249,6 +265,18 @@ class Pipeline:
                             spec for spec in source.output_specs if spec.key == handle._output_key
                         )
                     loader = output_spec.format
+
+                    local_key = (id(source), handle._output_key)
+                    if local_key in path_map:
+                        path = path_map[local_key]
+                    else:
+                        is_single = len(source.output_specs) == 1
+                        path = _generate_artifact_path(
+                            handle._pipeline._name,
+                            source.name,
+                            output_spec,
+                            is_single,
+                        )
 
                 deps[param_name] = path
                 deps_paths.append(path)
@@ -471,8 +499,10 @@ def _analyze_return_type(func: Callable[..., object]) -> list[_OutputSpec]:
 
 # --- @stage decorator ---
 
+_T = TypeVar("_T")
 
-def stage(func: Callable[..., object]) -> Callable[..., Any]:
+
+def stage[**P, R](func: Callable[P, R]) -> Callable[P, R]:
     """Mark a function as a pipeline stage.
 
     In pipeline context (inside ``with Pipeline()``): records a DAG node, returns ArtifactHandle.
@@ -564,3 +594,17 @@ class ArtifactHandle:
         raise AttributeError(
             f"Stage '{self._source.name}' has no output '{name}'. Available: {available}"
         )
+
+    def __getitem__(self, key: str) -> ArtifactHandle:
+        if not isinstance(self._source, _StageNode):
+            raise KeyError(f"Input '{self._source.name}' has no sub-outputs")
+        for spec in self._source.output_specs:
+            if spec.key == key:
+                return ArtifactHandle(
+                    pipeline=self._pipeline,
+                    source=self._source,
+                    output_key=key,
+                    python_type=spec.python_type,
+                )
+        available = [spec.key for spec in self._source.output_specs]
+        raise KeyError(f"Stage '{self._source.name}' has no output '{key}'. Available: {available}")

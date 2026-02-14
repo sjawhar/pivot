@@ -1,3 +1,4 @@
+# pyright: reportImplicitRelativeImport=false, reportMissingImports=false
 from __future__ import annotations
 
 import dataclasses
@@ -380,10 +381,9 @@ def _register_imported_stage(_spec: StageSpec) -> None:  # pragma: no cover
     """Register an imported DVC stage with Pivot.
 
     Note: This functionality is deprecated. The global REGISTRY has been removed.
-    Use Pipeline.register() directly instead.
+    Use the compose API to build pipelines instead.
     """
     raise NotImplementedError(
         "DVC stage import with automatic registration is no longer supported. "
-        + "Use import_dvc_yaml(path, register=False) and register stages manually "
-        + "with Pipeline.register()."
+        + "Use import_dvc_yaml(path, register=False) and compose stages manually."
     )

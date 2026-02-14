@@ -1,3 +1,4 @@
+# pyright: reportImplicitRelativeImport=false
 from __future__ import annotations
 
 import enum
@@ -883,9 +884,7 @@ class AgentStagesResult(TypedDict):
 #   4. Any other type
 #      No tracked outputs. Return value is ignored by the framework.
 #
-# Note: The constraint "TypedDict where all fields have Out annotations" cannot
-# be expressed in Python's type system. Validation is performed at registration
-# time in stage_def.extract_stage_definition().
+
 #
 
 # Return type for stage functions. The actual constraint is validated at
