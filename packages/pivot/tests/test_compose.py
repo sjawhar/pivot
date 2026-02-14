@@ -1,14 +1,18 @@
 # pyright: reportMissingImports=false, reportUnknownVariableType=false, reportUnknownMemberType=false, reportAttributeAccessIssue=false, reportMissingTypeArgument=false
 from __future__ import annotations
 
+import inspect
+import pathlib
+import typing
 from typing import Annotated, TypedDict
 
 import pandas as pd
 import pytest
 
-from pivot import loaders
+from pivot import loaders, outputs, stage_def
 from pivot.compose import (
     ArtifactHandle,
+    Pipeline,
     _analyze_return_type,
     _format_extension,
     _infer_format,
@@ -145,9 +149,11 @@ def test_stage_preserves_metadata() -> None:
     def my_func(x: pd.DataFrame) -> pd.DataFrame:
         return x
 
+    stage_func = typing.cast("typing.Any", my_func)
+
     assert my_func.__name__ == "my_func"
-    assert my_func._is_stage is True  # pyright: ignore[reportAttributeAccessIssue]
-    assert my_func._original_func is not my_func  # pyright: ignore[reportAttributeAccessIssue]
+    assert stage_func._is_stage is True
+    assert stage_func._original_func is not my_func
 
 
 # --- Return type analysis ---
@@ -165,6 +171,41 @@ class _HelperMultiOutput(TypedDict):
 
 
 def _helper_multi_output() -> _HelperMultiOutput: ...
+
+
+@stage
+def _helper_produce(params: stage_def.StageParams) -> pd.DataFrame:
+    return pd.DataFrame()
+
+
+@stage
+def _helper_consume(data: pd.DataFrame) -> dict:
+    return {}
+
+
+@stage
+def _helper_repeat(params: stage_def.StageParams) -> dict:
+    return {}
+
+
+@stage
+def _helper_consume_dict(data: dict) -> dict:
+    return data
+
+
+@stage
+def _helper_build_stage_a(
+    params: stage_def.StageParams,
+    raw: dict,
+) -> pd.DataFrame:
+    return pd.DataFrame()
+
+
+@stage
+def _helper_build_stage_b(
+    data: pd.DataFrame,
+) -> dict:
+    return {"rows": len(data)}
 
 
 def test_analyze_return_type_single() -> None:
@@ -224,3 +265,85 @@ def test_analyze_return_type_typeddict() -> None:
 def test_infer_format_from_extension(path: str, expected_type: type) -> None:
     result = _infer_format_from_extension(path)
     assert isinstance(result, expected_type)
+
+
+def test_pipeline_context_basic() -> None:
+    with Pipeline("test", root=pathlib.Path("/tmp")) as pipeline:
+        data = _helper_produce(params=stage_def.StageParams())
+        _helper_consume(data)
+
+    assert len(pipeline._stages) == 2
+    assert pipeline._stages[0].name == "_helper_produce"
+    assert pipeline._stages[1].name == "_helper_consume"
+    assert "data" in pipeline._stages[1].input_handles
+
+
+def test_pipeline_disambiguation() -> None:
+    with Pipeline("test", root=pathlib.Path("/tmp")) as pipeline:
+        _helper_repeat(params=stage_def.StageParams())
+        _helper_repeat(params=stage_def.StageParams())
+        _helper_repeat(params=stage_def.StageParams())
+
+    assert pipeline._stages[0].name == "_helper_repeat"
+    assert pipeline._stages[1].name == "_helper_repeat@1"
+    assert pipeline._stages[2].name == "_helper_repeat@2"
+
+
+def test_pipeline_input() -> None:
+    with Pipeline("test", root=pathlib.Path("/tmp")) as pipeline:
+        raw = pipeline.input("raw_data", path="data/raw/input.yaml", python_type=dict)
+        _helper_consume_dict(raw)
+
+    assert "raw_data" in pipeline._inputs
+    assert "data" in pipeline._stages[0].input_handles
+
+
+def test_pipeline_build_bridge(tmp_path: pathlib.Path) -> None:
+    with Pipeline("compose_build", root=tmp_path) as pipeline:
+        raw = pipeline.input("raw", path="data/raw.yaml", python_type=dict)
+        data = _helper_build_stage_a(params=stage_def.StageParams(), raw=raw)
+        _helper_build_stage_b(data)
+
+    legacy = pipeline.build()
+
+    assert legacy.list_stages() == ["_helper_build_stage_a", "_helper_build_stage_b"]
+
+    stage_a = legacy.get("_helper_build_stage_a")
+    stage_b = legacy.get("_helper_build_stage_b")
+
+    assert stage_a["func"] is inspect.unwrap(_helper_build_stage_a)
+    assert not hasattr(stage_a["func"], "_is_stage")
+    assert stage_a["name"] == "_helper_build_stage_a"
+    assert stage_a["deps"] == {"raw": "data/raw.yaml"}
+    assert stage_a["deps_paths"] == ["data/raw.yaml"]
+    assert stage_a["params"] is not None
+    assert isinstance(stage_a["params"], stage_def.StageParams)
+    assert stage_a["params_arg_name"] == "params"
+    assert stage_a["mutex"] == []
+    assert stage_a["variant"] is None
+    assert stage_a["signature"] == inspect.signature(inspect.unwrap(_helper_build_stage_a))
+    assert stage_a["state_dir"] == tmp_path / ".pivot"
+
+    output_a_path = "data/compose_build/_helper_build_stage_a.jsonl"
+    assert stage_a["outs_paths"] == [output_a_path]
+    assert len(stage_a["outs"]) == 1
+    assert isinstance(stage_a["outs"][0], outputs.Out)
+    assert stage_a["outs"][0].path == output_a_path
+    assert isinstance(stage_a["out_specs"][stage_def.SINGLE_OUTPUT_KEY], outputs.Out)
+    assert stage_a["out_specs"][stage_def.SINGLE_OUTPUT_KEY].path == output_a_path
+
+    dep_spec_a = stage_a["dep_specs"]["raw"]
+    assert dep_spec_a.path == "data/raw.yaml"
+    assert isinstance(dep_spec_a.loader, loaders.YAML)
+    assert dep_spec_a.creates_dep_edge is True
+
+    output_b_path = "data/compose_build/_helper_build_stage_b.yaml"
+    assert stage_b["deps"] == {"data": output_a_path}
+    assert stage_b["deps_paths"] == [output_a_path]
+    assert stage_b["outs_paths"] == [output_b_path]
+    assert isinstance(stage_b["out_specs"][stage_def.SINGLE_OUTPUT_KEY], outputs.Out)
+    assert stage_b["out_specs"][stage_def.SINGLE_OUTPUT_KEY].path == output_b_path
+
+    dep_spec_b = stage_b["dep_specs"]["data"]
+    assert dep_spec_b.path == output_a_path
+    assert dep_spec_b.loader == stage_a["out_specs"][stage_def.SINGLE_OUTPUT_KEY].loader
