@@ -5,6 +5,7 @@ import dataclasses
 import functools
 import importlib
 import inspect
+import types
 import typing
 from typing import TYPE_CHECKING, Annotated, Any, TypeVar, get_args, get_origin, get_type_hints
 
@@ -147,7 +148,10 @@ class Pipeline:
             prefix = "data/external" if external else "data/raw"
             path = f"{prefix}/{name}"
         if format is None:
-            format = _infer_format_from_extension(path)
+            if t is not None:
+                format = _infer_input_format_from_type(t)
+            if format is None:
+                format = _infer_format_from_extension(path)
         node = _InputNode(name=name, python_type=t, path=path, format=format)
         self._inputs[name] = node
         return ArtifactHandle(
@@ -317,6 +321,19 @@ class Pipeline:
                 base_hint = hint
                 if get_origin(base_hint) is Annotated:
                     base_hint = get_args(base_hint)[0]
+                origin = get_origin(base_hint)
+                if origin is types.UnionType or origin is typing.Union:  # pyright: ignore[reportDeprecated] - runtime identity check
+                    for union_arg in get_args(base_hint):
+                        if isinstance(union_arg, type) and issubclass(
+                            union_arg, stage_def.StageParams
+                        ):
+                            raise TypeError(
+                                f"Stage '{node.name}' parameter '{name}' has type "
+                                f"'{base_hint}' — StageParams must not be in a union. "
+                                f"Use 'params: {union_arg.__name__}' directly, with a "
+                                f"default if needed (params: {union_arg.__name__} = "
+                                f"{union_arg.__name__}())."
+                            )
                 if isinstance(base_hint, type) and issubclass(base_hint, stage_def.StageParams):
                     params_arg_name = name
                     break
@@ -431,6 +448,17 @@ def _format_extension(
             return "dat"
 
 
+def _infer_input_format_from_type(t: type) -> loaders_mod.Reader[object] | None:
+    import pathlib as _pathlib
+
+    loaders = _get_loaders()
+    if t is _pathlib.Path:
+        return loaders.PathOnly()  # type: ignore[return-value]
+    if t is str:
+        return loaders.Text()  # type: ignore[return-value]
+    return None
+
+
 def _infer_format_from_extension(path: str) -> loaders_mod.Reader[object]:
     """Infer loader from file extension for p.input() declarations."""
     loaders = _get_loaders()
@@ -479,7 +507,12 @@ def _parse_output_type(hint: Any, key: str) -> list[_OutputSpec]:
                 fmt = typing.cast("loaders_mod.Writer[object]", arg)
 
         if fmt is None:
-            fmt = _infer_format(base_type)
+            if isinstance(tag, _PlotTag):
+                fmt = typing.cast("loaders_mod.Writer[object]", loaders.MatplotlibFigure())
+            elif isinstance(tag, _MetricTag):
+                fmt = typing.cast("loaders_mod.Writer[object]", loaders.YAML())
+            else:
+                fmt = _infer_format(base_type)
         return [_OutputSpec(key=key, python_type=base_type, format=fmt, tag=tag)]
 
     # Plain type
