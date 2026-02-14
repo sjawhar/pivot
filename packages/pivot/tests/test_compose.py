@@ -291,7 +291,7 @@ def test_pipeline_disambiguation() -> None:
 
 def test_pipeline_input() -> None:
     with Pipeline("test", root=pathlib.Path("/tmp")) as pipeline:
-        raw = pipeline.input("raw_data", path="data/raw/input.yaml", python_type=dict)
+        raw = pipeline.input("raw_data", path="data/raw/input.yaml", t=dict)
         _helper_consume_dict(raw)
 
     assert "raw_data" in pipeline._inputs
@@ -300,7 +300,7 @@ def test_pipeline_input() -> None:
 
 def test_pipeline_build_bridge(tmp_path: pathlib.Path) -> None:
     with Pipeline("compose_build", root=tmp_path) as pipeline:
-        raw = pipeline.input("raw", path="data/raw.yaml", python_type=dict)
+        raw = pipeline.input("raw", path="data/raw.yaml", t=dict)
         data = _helper_build_stage_a(params=stage_def.StageParams(), raw=raw)
         _helper_build_stage_b(data)
 

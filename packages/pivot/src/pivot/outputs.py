@@ -24,58 +24,6 @@ def _default_json_writer() -> loaders_module.Writer[JsonValue]:
 
 
 @dataclasses.dataclass(frozen=True)
-class Dep[R]:  # noqa: UP046 - basedpyright doesn't support PEP 695 syntax yet
-    """Dependency marker for Annotated type hints.
-
-    Use in function parameters to declare a file dependency:
-
-        def process(
-            data: Annotated[DataFrame, Dep("input.csv", CSV())],
-        ) -> ProcessOutputs:
-            return {"result": {"count": len(data)}}
-
-    For multiple files, use a list (variable-length) or tuple (fixed-length):
-
-        def process(
-            shards: Annotated[list[DataFrame], Dep(["a.csv", "b.csv"], CSV())],
-        ) -> ProcessOutputs:
-            return {"result": {"count": sum(len(df) for df in shards)}}
-
-    Testing is natural - just pass the data directly:
-
-        result = process(test_dataframe)
-    """
-
-    path: PathType
-    loader: loaders_module.Reader[R]
-
-
-@dataclasses.dataclass(frozen=True)
-class PlaceholderDep[R]:  # noqa: UP046 - basedpyright doesn't support PEP 695 syntax yet
-    """Dependency marker with no default path — must be overridden at registration.
-
-    Use when a stage needs a dependency that has no sensible default.
-    Registration fails if dep_path_overrides doesn't include this dependency.
-
-        def compare(
-            baseline: Annotated[DataFrame, PlaceholderDep(CSV())],
-            experiment: Annotated[DataFrame, PlaceholderDep(CSV())],
-        ) -> CompareOutputs:
-            ...
-
-        pipeline.register(
-            compare,
-            dep_path_overrides={
-                "baseline": "model_a/results.csv",
-                "experiment": "model_b/results.csv",
-            },
-        )
-    """
-
-    loader: loaders_module.Reader[R]
-
-
-@dataclasses.dataclass(frozen=True)
 class Out[W]:  # noqa: UP046 - basedpyright doesn't support PEP 695 syntax yet
     """Unified output marker and storage.
 
@@ -87,16 +35,16 @@ class Out[W]:  # noqa: UP046 - basedpyright doesn't support PEP 695 syntax yet
             result: Annotated[dict[str, int], Out("output.json", JSON())]
 
         def process(
-            data: Annotated[DataFrame, Dep("input.csv", CSV())],
+            params: MyParams,
         ) -> ProcessOutputs:
-            return {"result": {"count": len(data)}}
+            return {"result": {"count": 42}}
 
     For single outputs, annotate the return type directly:
 
         def transform(
-            data: Annotated[DataFrame, Dep("input.csv", CSV())],
+            params: MyParams,
         ) -> Annotated[DataFrame, Out("output.csv", CSV())]:
-            return data.dropna()
+            return DataFrame()
 
     For multiple files per output key:
 

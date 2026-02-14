@@ -1,3 +1,4 @@
+# pyright: reportImplicitRelativeImport=false, reportMissingModuleSource=false
 from __future__ import annotations
 
 import copy
@@ -7,17 +8,13 @@ import pathlib
 import re
 from typing import TYPE_CHECKING
 
-from pivot import discovery, outputs, path_policy, path_utils, project, registry, stage_def
+from pivot import discovery, project, registry
 from pivot.pipeline.yaml import PipelineConfigError
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
-
     from networkx import DiGraph
-
-    from pivot.types import StageFunc
 
 # Pipeline name pattern: alphanumeric, underscore, hyphen (like stage names)
 _PIPELINE_NAME_PATTERN = re.compile(r"^[a-zA-Z][a-zA-Z0-9_-]*$")
@@ -223,186 +220,6 @@ class Pipeline:
     def state_dir(self) -> pathlib.Path:
         """State directory for this pipeline's lock files and state.db."""
         return self._root / ".pivot"
-
-    def _resolve_path(self, annotation_path: str) -> str:
-        """Convert annotation path to canonical absolute form.
-
-        All artifact paths are stored as absolute, normalized paths in memory.
-        Trailing slashes are preserved (important for DirectoryOut).
-        Lockfiles and the output index cache handle conversion to/from
-        project-relative at their own boundaries.
-        """
-        # Reject empty or whitespace-only paths early
-        if not annotation_path or not annotation_path.strip():
-            raise ValueError("Path cannot be empty or whitespace-only")
-
-        # Reject root-only paths (e.g., "/", "\\", "C:\\", "C:/")
-        stripped = annotation_path.strip()
-        if stripped in ("/", "\\") or (
-            len(stripped) == 3
-            and stripped[0].isalpha()
-            and stripped[1] == ":"
-            and stripped[2] in ("/", "\\")
-        ):
-            raise ValueError(f"Path cannot be a root directory: {annotation_path!r}")
-
-        project_root = project.get_project_root()
-
-        # Determine base for resolution: absolute paths are used as-is (base unused),
-        # relative paths resolve from pipeline root
-        is_absolute = (
-            annotation_path.startswith("/")
-            or annotation_path.startswith("\\")
-            or (
-                len(annotation_path) >= 3
-                and annotation_path[0].isalpha()
-                and annotation_path[1] == ":"
-                and annotation_path[2] in ("/", "\\")
-            )
-        )
-
-        base = project_root if is_absolute else self.root
-        resolved = path_utils.canonicalize_artifact_path(annotation_path, base)
-
-        # Check if path escapes project root (reject relative paths that escape via ../)
-        # Absolute paths are intentionally allowed outside project root (e.g. /data/external/file.csv)
-        if not is_absolute:
-            try:
-                pathlib.Path(resolved.rstrip("/")).relative_to(project_root)
-            except ValueError as e:
-                raise ValueError(
-                    f"Path '{annotation_path}' resolves to '{resolved}' which is outside project root '{project_root}'"
-                ) from e
-
-        # Validate the RESOLVED path (after ../ is collapsed)
-        if error := path_policy.validate_path_syntax(resolved):
-            raise ValueError(f"Invalid path '{annotation_path}': {error}")
-
-        return resolved
-
-    def _resolve_path_type(self, path: outputs.PathType) -> outputs.PathType:
-        """Resolve a PathType (str, list, or tuple of paths).
-
-        Handles single strings, lists, and tuples of paths.
-        """
-        if isinstance(path, str):
-            return self._resolve_path(path)
-        elif isinstance(path, tuple):
-            return tuple(self._resolve_path(p) for p in path)
-        else:
-            # list
-            return [self._resolve_path(p) for p in path]
-
-    def _resolve_out_override(self, override: registry.OutOverrideInput) -> registry.OutOverride:
-        """Resolve path in an output override, preserving other options."""
-        # PathType (str, list, tuple) - just resolve and wrap
-        if isinstance(override, (str, list, tuple)):
-            return registry.OutOverride(path=self._resolve_path_type(override))
-
-        # OutOverride dict: resolve path, preserve cache option
-        result = registry.OutOverride(path=self._resolve_path_type(override["path"]))
-        if "cache" in override:
-            result["cache"] = override["cache"]
-        return result
-
-    def register(
-        self,
-        func: StageFunc,
-        *,
-        name: str | None = None,
-        params: registry.ParamsArg = None,
-        mutex: list[str] | None = None,
-        variant: str | None = None,
-        dep_path_overrides: Mapping[str, outputs.PathType] | None = None,
-        out_path_overrides: Mapping[str, registry.OutOverrideInput] | None = None,
-    ) -> None:
-        """Register a stage with this pipeline.
-
-        Paths in annotations and overrides are resolved relative to pipeline root.
-        """
-
-        stage_name = name or func.__name__
-
-        # 1. Extract stage definition (single pass over annotations)
-        definition = stage_def.extract_stage_definition(func, stage_name, dep_path_overrides)
-
-        # 2. Validate all PlaceholderDeps have overrides (before path resolution)
-        if definition.placeholder_dep_names:
-            provided = set(dep_path_overrides.keys()) if dep_path_overrides else set[str]()
-            missing = definition.placeholder_dep_names - provided
-            if missing:
-                raise ValueError(
-                    f"PlaceholderDep {', '.join(repr(n) for n in sorted(missing))} "
-                    + "requires override in dep_path_overrides"
-                )
-
-        # 2b. Reject user overrides for IncrementalOut input deps
-        if dep_path_overrides:
-            incremental_dep_names = {
-                name for name, spec in definition.dep_specs.items() if not spec.creates_dep_edge
-            }
-            user_incremental = set(dep_path_overrides.keys()) & incremental_dep_names
-            if user_incremental:
-                raise ValueError(
-                    f"Cannot override IncrementalOut input paths: {sorted(user_incremental)}. "
-                    + "IncrementalOut paths must match between input and output annotations."
-                )
-
-        # 3. Resolve annotation paths relative to pipeline root
-        resolved_deps: dict[str, outputs.PathType] = {
-            dep_name: self._resolve_path_type(spec.path)
-            for dep_name, spec in definition.dep_specs.items()
-        }
-
-        out_specs = definition.out_specs
-        if not out_specs and definition.single_out_spec is not None:
-            out_specs = {stage_def.SINGLE_OUTPUT_KEY: definition.single_out_spec}
-
-        resolved_outs: dict[str, registry.OutOverride] = {
-            out_name: registry.OutOverride(path=self._resolve_path_type(spec.path))
-            for out_name, spec in out_specs.items()
-        }
-
-        # 4. Apply explicit output overrides (also pipeline-relative)
-        # (dep overrides are already applied via extract_stage_definition above)
-        if out_path_overrides:
-            # Single-output IncrementalOut: reject ALL overrides regardless of key
-            # (registry accepts any single key for single-output stages)
-            if definition.single_out_spec is not None and isinstance(
-                definition.single_out_spec, outputs.IncrementalOut
-            ):
-                raise ValueError(
-                    "Cannot override IncrementalOut output path. "
-                    + "IncrementalOut paths must match between input and output annotations."
-                )
-            # TypedDict-return: reject overrides targeting specific IncrementalOut fields
-            incremental_out_names = {
-                name for name, spec in out_specs.items() if isinstance(spec, outputs.IncrementalOut)
-            }
-            user_incremental = set(out_path_overrides.keys()) & incremental_out_names
-            if user_incremental:
-                raise ValueError(
-                    f"Cannot override IncrementalOut output paths: {sorted(user_incremental)}. "
-                    + "IncrementalOut paths must match between input and output annotations."
-                )
-            for out_name, override in out_path_overrides.items():
-                resolved_outs[out_name] = self._resolve_out_override(override)
-
-        # 5. Pass definition + resolved overrides to registry
-        self._registry.register(
-            func=func,
-            name=name,
-            params=params,
-            mutex=mutex,
-            variant=variant,
-            dep_path_overrides=resolved_deps,
-            out_path_overrides=resolved_outs,
-            state_dir=self.state_dir,
-            definition=definition,
-        )
-
-        # New stage may introduce unresolved external deps — force re-resolution
-        self._reset_resolution_cache()
 
     def list_stages(self) -> list[str]:
         """List all registered stage names."""
