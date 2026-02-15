@@ -329,36 +329,36 @@ def test_state_raises_after_close(tmp_path: pathlib.Path) -> None:
 
 
 def test_generation_get_nonexistent(tmp_path: pathlib.Path) -> None:
-    """Getting generation for untracked path returns None."""
+    """Getting generation for untracked identity returns None."""
     db_path = tmp_path / "state.db"
-    test_file = tmp_path / "output.txt"
+    identity = "stage:output"
 
     with state.StateDB(db_path) as db:
-        result = db.get_generation(test_file)
+        result = db.get_generation(identity)
 
     assert result is None
 
 
 def test_generation_increment_creates_new(tmp_path: pathlib.Path) -> None:
-    """Incrementing untracked path creates it with generation 1."""
+    """Incrementing untracked identity creates it with generation 1."""
     db_path = tmp_path / "state.db"
-    test_file = tmp_path / "output.txt"
+    identity = "stage:output"
 
     with state.StateDB(db_path) as db:
-        gen = db.increment_generation(test_file)
+        gen = db.increment_generation(identity)
         assert gen == 1
-        assert db.get_generation(test_file) == 1
+        assert db.get_generation(identity) == 1
 
 
 def test_generation_increment_existing(tmp_path: pathlib.Path) -> None:
-    """Incrementing tracked path increases generation."""
+    """Incrementing tracked identity increases generation."""
     db_path = tmp_path / "state.db"
-    test_file = tmp_path / "output.txt"
+    identity = "stage:output"
 
     with state.StateDB(db_path) as db:
-        db.increment_generation(test_file)
-        db.increment_generation(test_file)
-        gen = db.increment_generation(test_file)
+        db.increment_generation(identity)
+        db.increment_generation(identity)
+        gen = db.increment_generation(identity)
 
     assert gen == 3
 
@@ -366,34 +366,34 @@ def test_generation_increment_existing(tmp_path: pathlib.Path) -> None:
 def test_generation_persistence(tmp_path: pathlib.Path) -> None:
     """Generations persist across DB instances."""
     db_path = tmp_path / "state.db"
-    test_file = tmp_path / "output.txt"
+    identity = "stage:output"
 
     with state.StateDB(db_path) as db:
-        db.increment_generation(test_file)
-        db.increment_generation(test_file)
+        db.increment_generation(identity)
+        db.increment_generation(identity)
 
     with state.StateDB(db_path) as db:
-        assert db.get_generation(test_file) == 2
-        gen = db.increment_generation(test_file)
+        assert db.get_generation(identity) == 2
+        gen = db.increment_generation(identity)
         assert gen == 3
 
 
 def test_generation_get_many(tmp_path: pathlib.Path) -> None:
-    """Batch query returns generations for multiple paths."""
+    """Batch query returns generations for multiple identities."""
     db_path = tmp_path / "state.db"
-    files = [tmp_path / f"file_{i}.txt" for i in range(3)]
+    identities = [f"stage:out_{i}" for i in range(3)]
 
     with state.StateDB(db_path) as db:
-        db.increment_generation(files[0])
-        db.increment_generation(files[0])
-        db.increment_generation(files[1])
-        # files[2] not tracked
+        db.increment_generation(identities[0])
+        db.increment_generation(identities[0])
+        db.increment_generation(identities[1])
+        # identities[2] not tracked
 
-        results = db.get_many_generations(files)
+        results = db.get_many_generations(identities)
 
-    assert results[files[0]] == 2
-    assert results[files[1]] == 1
-    assert results[files[2]] is None
+    assert results[identities[0]] == 2
+    assert results[identities[1]] == 1
+    assert results[identities[2]] is None
 
 
 def test_generation_get_many_empty(tmp_path: pathlib.Path) -> None:
@@ -419,7 +419,7 @@ def test_dep_generations_get_nonexistent(tmp_path: pathlib.Path) -> None:
 def test_dep_generations_record_and_get(tmp_path: pathlib.Path) -> None:
     """Record and retrieve dependency generations."""
     db_path = tmp_path / "state.db"
-    deps = {"/path/to/dep1.csv": 5, "/path/to/dep2.csv": 3}
+    deps = {"upstream:out1": 5, "upstream:out2": 3}
 
     with state.StateDB(db_path) as db:
         db.record_dep_generations("my_stage", deps)
@@ -431,8 +431,8 @@ def test_dep_generations_record_and_get(tmp_path: pathlib.Path) -> None:
 def test_dep_generations_update_replaces(tmp_path: pathlib.Path) -> None:
     """Recording dep generations replaces previous values."""
     db_path = tmp_path / "state.db"
-    old_deps = {"/path/to/dep1.csv": 1, "/path/to/dep2.csv": 2}
-    new_deps = {"/path/to/dep1.csv": 5, "/path/to/dep3.csv": 1}
+    old_deps = {"upstream:out1": 1, "upstream:out2": 2}
+    new_deps = {"upstream:out1": 5, "upstream:out3": 1}
 
     with state.StateDB(db_path) as db:
         db.record_dep_generations("my_stage", old_deps)
@@ -445,8 +445,8 @@ def test_dep_generations_update_replaces(tmp_path: pathlib.Path) -> None:
 def test_dep_generations_multiple_stages(tmp_path: pathlib.Path) -> None:
     """Different stages have independent dep generations."""
     db_path = tmp_path / "state.db"
-    stage1_deps = {"/dep1.csv": 1}
-    stage2_deps = {"/dep2.csv": 2, "/dep3.csv": 3}
+    stage1_deps = {"upstream:out1": 1}
+    stage2_deps = {"upstream:out2": 2, "upstream:out3": 3}
 
     with state.StateDB(db_path) as db:
         db.record_dep_generations("stage1", stage1_deps)
@@ -462,7 +462,7 @@ def test_dep_generations_multiple_stages(tmp_path: pathlib.Path) -> None:
 def test_dep_generations_persistence(tmp_path: pathlib.Path) -> None:
     """Dep generations persist across DB instances."""
     db_path = tmp_path / "state.db"
-    deps = {"/path/to/dep.csv": 42}
+    deps = {"upstream:out": 42}
 
     with state.StateDB(db_path) as db:
         db.record_dep_generations("my_stage", deps)
@@ -478,38 +478,20 @@ def test_dep_generations_persistence(tmp_path: pathlib.Path) -> None:
 # -----------------------------------------------------------------------------
 
 
-def test_generation_tracks_logical_path_not_symlink_target(tmp_path: pathlib.Path) -> None:
-    """Generation tracking uses logical paths, not resolved symlink targets.
-
-    This is critical because Pivot outputs become symlinks to cache after execution.
-    If we resolved symlinks, the generation key would change every time the file's
-    hash changes (different cache path). We need to track the DECLARED path.
-    """
+def test_generation_identity_is_keyed_by_producer_and_key(tmp_path: pathlib.Path) -> None:
+    """Generation tracking is keyed by artifact identity, not filesystem paths."""
     db_path = tmp_path / "state.db"
-    real_dir = tmp_path / "real_data"
-    real_dir.mkdir()
-    output_file = real_dir / "output.csv"
-
-    symlink_dir = tmp_path / "data"
-    symlink_dir.symlink_to(real_dir)
-    symlinked_path = symlink_dir / "output.csv"
 
     with state.StateDB(db_path) as db:
-        # Increment via symlink path
-        gen1 = db.increment_generation(symlinked_path)
+        gen1 = db.increment_generation("stage:out1")
         assert gen1 == 1
 
-        # Get via real path - should be INDEPENDENT (different logical path)
-        gen_via_real = db.get_generation(output_file)
-        assert gen_via_real is None, "Different logical paths should have independent generations"
+        assert db.get_generation("stage:out2") is None
 
-        # Increment via real path - starts fresh
-        gen2 = db.increment_generation(output_file)
-        assert gen2 == 1, "Real path should start at generation 1"
+        gen2 = db.increment_generation("stage:out2")
+        assert gen2 == 1
 
-        # Symlink path still has its own generation
-        gen_via_symlink = db.get_generation(symlinked_path)
-        assert gen_via_symlink == 1, "Symlink path generation unchanged"
+        assert db.get_generation("stage:out1") == 1
 
 
 # -----------------------------------------------------------------------------
@@ -725,15 +707,15 @@ def test_readonly_allows_reads(tmp_path: pathlib.Path) -> None:
     # Create data in write mode
     with state.StateDB(db_path) as db:
         db.save(test_file, file_stat, "hash123")
-        db.increment_generation(test_file)
-        db.record_dep_generations("stage", {"/dep.csv": 1})
+        db.increment_generation("stage:output")
+        db.record_dep_generations("stage", {"upstream:out": 1})
         db.remote_hashes_add("origin", ["remote_hash"])
 
     # Verify reads work in readonly mode
     with state.StateDB(db_path, readonly=True) as db:
         assert db.get(test_file, file_stat) == "hash123"
-        assert db.get_generation(test_file) == 1
-        assert db.get_dep_generations("stage") == {"/dep.csv": 1}
+        assert db.get_generation("stage:output") == 1
+        assert db.get_dep_generations("stage") == {"upstream:out": 1}
         assert db.remote_hash_exists("origin", "remote_hash")
 
 
@@ -783,7 +765,7 @@ def test_readonly_blocks_increment_generation(tmp_path: pathlib.Path) -> None:
         state.StateDB(db_path, readonly=True) as db,
         pytest.raises(RuntimeError, match="readonly StateDB"),
     ):
-        db.increment_generation(test_file)
+        db.increment_generation("stage:output")
 
 
 def test_readonly_blocks_record_dep_generations(tmp_path: pathlib.Path) -> None:
@@ -797,7 +779,7 @@ def test_readonly_blocks_record_dep_generations(tmp_path: pathlib.Path) -> None:
         state.StateDB(db_path, readonly=True) as db,
         pytest.raises(RuntimeError, match="readonly StateDB"),
     ):
-        db.record_dep_generations("stage", {"/dep.csv": 1})
+        db.record_dep_generations("stage", {"upstream:out": 1})
 
 
 def test_readonly_blocks_remote_hashes_add(tmp_path: pathlib.Path) -> None:
@@ -864,30 +846,30 @@ def test_readonly_blocks_remote_set_url(tmp_path: pathlib.Path) -> None:
 def test_apply_deferred_writes_dep_generations(tmp_path: pathlib.Path) -> None:
     """apply_deferred_writes records dependency generations."""
     db_path = tmp_path / "state.db"
-    deferred: DeferredWrites = {"dep_generations": {"/path/dep1.csv": 5, "/path/dep2.csv": 3}}
+    deferred: DeferredWrites = {"dep_generations": {"upstream:out1": 5, "upstream:out2": 3}}
 
     with state.StateDB(db_path) as db:
         db.apply_deferred_writes("my_stage", [], deferred)
         result = db.get_dep_generations("my_stage")
 
-    assert result == {"/path/dep1.csv": 5, "/path/dep2.csv": 3}
+    assert result == {"upstream:out1": 5, "upstream:out2": 3}
 
 
 def test_apply_deferred_writes_output_generations(tmp_path: pathlib.Path) -> None:
     """apply_deferred_writes increments output generations."""
     db_path = tmp_path / "state.db"
-    output1 = tmp_path / "output1.csv"
-    output2 = tmp_path / "output2.csv"
+    output1 = "stage:output1"
+    output2 = "stage:output2"
     deferred: DeferredWrites = {"increment_outputs": True}
 
     with state.StateDB(db_path) as db:
         # First apply - outputs should be at generation 1
-        db.apply_deferred_writes("stage", [str(output1), str(output2)], deferred)
+        db.apply_deferred_writes("stage", [output1, output2], deferred)
         assert db.get_generation(output1) == 1
         assert db.get_generation(output2) == 1
 
         # Second apply - outputs should increment to 2
-        db.apply_deferred_writes("stage", [str(output1), str(output2)], deferred)
+        db.apply_deferred_writes("stage", [output1, output2], deferred)
         assert db.get_generation(output1) == 2
         assert db.get_generation(output2) == 2
 
@@ -897,13 +879,13 @@ def test_apply_deferred_writes_skips_output_increment_when_flag_absent(
 ) -> None:
     """Output generations should NOT be incremented when increment_outputs is absent."""
     db_path = tmp_path / "state.db"
-    output1 = tmp_path / "output1.csv"
-    deferred: DeferredWrites = {"dep_generations": {"/dep.csv": 5}}
+    output1 = "stage:output1"
+    deferred: DeferredWrites = {"dep_generations": {"upstream:out": 5}}
 
     with state.StateDB(db_path) as db:
-        db.apply_deferred_writes("stage", [str(output1)], deferred)
+        db.apply_deferred_writes("stage", [output1], deferred)
         assert db.get_generation(output1) is None
-        assert db.get_dep_generations("stage") == {"/dep.csv": 5}
+        assert db.get_dep_generations("stage") == {"upstream:out": 5}
 
 
 def test_apply_deferred_writes_file_hash_entries(tmp_path: pathlib.Path) -> None:
@@ -957,7 +939,7 @@ def test_apply_deferred_writes_run_cache(tmp_path: pathlib.Path) -> None:
 def test_apply_deferred_writes_all_fields(tmp_path: pathlib.Path) -> None:
     """apply_deferred_writes handles all fields atomically."""
     db_path = tmp_path / "state.db"
-    output_path = tmp_path / "output.csv"
+    output_path = "stage:output"
     input_path = tmp_path / "input.csv"
     input_path.write_text("data")
     input_stat = input_path.stat()
@@ -967,7 +949,7 @@ def test_apply_deferred_writes_all_fields(tmp_path: pathlib.Path) -> None:
         output_hashes=[run_history.OutputHashEntry(path=str(output_path), hash="def456")],
     )
     deferred: DeferredWrites = {
-        "dep_generations": {"/dep.csv": 10},
+        "dep_generations": {"upstream:out": 10},
         "run_cache_input_hash": "input_abc",
         "run_cache_entry": run_cache_entry,
         "increment_outputs": True,
@@ -983,10 +965,10 @@ def test_apply_deferred_writes_all_fields(tmp_path: pathlib.Path) -> None:
     }
 
     with state.StateDB(db_path) as db:
-        db.apply_deferred_writes("stage", [str(output_path)], deferred)
+        db.apply_deferred_writes("stage", [output_path], deferred)
 
         # Verify all writes applied
-        assert db.get_dep_generations("stage") == {"/dep.csv": 10}
+        assert db.get_dep_generations("stage") == {"upstream:out": 10}
         assert db.get_generation(output_path) == 1
         result = db.lookup_run_cache("stage", "input_abc")
         assert result is not None
@@ -1033,11 +1015,7 @@ def test_apply_deferred_writes_path_too_long_dep(tmp_path: pathlib.Path) -> None
 def test_apply_deferred_writes_path_too_long_output(tmp_path: pathlib.Path) -> None:
     """apply_deferred_writes raises PathTooLongError for long output paths."""
     db_path = tmp_path / "state.db"
-    # Create a deeply nested path that exceeds 511 bytes
-    nested = tmp_path
-    for i in range(12):
-        nested = nested / ("o" * 50 + str(i))
-    long_output = str(nested / "output.csv")
+    long_output = "stage:" + "o" * 600
     deferred: DeferredWrites = {"increment_outputs": True}
 
     with state.StateDB(db_path) as db, pytest.raises(state.PathTooLongError):

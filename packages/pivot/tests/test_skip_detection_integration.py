@@ -70,6 +70,13 @@ def _make_stage_info(
         "deps": deps or [],
         "signature": signature,
         "outs": expanded_outs,
+        "store_spec": {
+            "kind": "workspace",
+            "cache_dir": str(tmp_path / ".pivot" / "cache"),
+            "project_root": str(tmp_path),
+            "pipeline_name": "test",
+            "input_bindings": {},
+        },
         "params": params,
         "variant": None,
         "overrides": {},

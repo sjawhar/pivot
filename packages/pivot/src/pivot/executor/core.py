@@ -1,3 +1,4 @@
+# pyright: reportImplicitRelativeImport=false, reportMissingImports=false, reportUnknownArgumentType=false, reportUnknownMemberType=false, reportUnknownParameterType=false, reportUnknownVariableType=false, reportUnusedCallResult=false
 from __future__ import annotations
 
 import atexit
@@ -6,13 +7,13 @@ import functools
 import logging
 import os
 import pathlib
-from typing import TYPE_CHECKING, Literal, TypedDict
+from typing import TYPE_CHECKING, Literal, TypedDict, cast
 
 import loky
 
 from pivot import config, discovery, exceptions, outputs, parameters, registry
 from pivot.executor import worker
-from pivot.storage import cache, lock, track
+from pivot.storage import cache, lock, store as store_mod, track
 from pivot.storage import state as state_mod
 from pivot.types import OnError, StageResult, StageStatus
 
@@ -312,6 +313,7 @@ def prepare_worker_info(
     no_commit: bool,
     project_root: pathlib.Path,
     default_state_dir: pathlib.Path,
+    store_spec: store_mod.StoreSpec,
 ) -> worker.WorkerStageInfo:
     """Prepare stage info for pickling to worker process.
 
@@ -323,25 +325,25 @@ def prepare_worker_info(
     # Ensure state directory exists (workers open StateDB in readonly mode)
     state_dir.mkdir(parents=True, exist_ok=True)
 
-    return worker.WorkerStageInfo(
-        func=stage_info["func"],
-        fingerprint=stage_registry.ensure_fingerprint(stage_info["name"]),
-        deps=stage_info["deps_paths"],
-        outs=stage_info["outs"],
-        signature=stage_info["signature"],
-        params=stage_info["params"],
-        variant=stage_info["variant"],
-        overrides=overrides,
-        checkout_modes=checkout_modes,
-        run_id=run_id,
-        force=force,
-        no_commit=no_commit,
-        dep_specs=stage_info["dep_specs"],
-        out_specs=stage_info["out_specs"],
-        params_arg_name=stage_info["params_arg_name"],
-        project_root=project_root,
-        state_dir=state_dir,
-    )
+    worker_info: dict[str, object] = {
+        "func": stage_info["func"],
+        "fingerprint": stage_registry.ensure_fingerprint(stage_info["name"]),
+        "deps": stage_info["deps"],
+        "outs": stage_info["outs"],
+        "store_spec": store_spec,
+        "signature": stage_info["signature"],
+        "params": stage_info["params"],
+        "variant": stage_info["variant"],
+        "overrides": overrides,
+        "checkout_modes": checkout_modes,
+        "run_id": run_id,
+        "force": force,
+        "no_commit": no_commit,
+        "params_arg_name": stage_info["params_arg_name"],
+        "project_root": project_root,
+        "state_dir": state_dir,
+    }
+    return cast("worker.WorkerStageInfo", cast("object", worker_info))
 
 
 def apply_deferred_writes(

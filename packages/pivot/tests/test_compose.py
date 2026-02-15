@@ -1,4 +1,4 @@
-# pyright: reportMissingImports=false, reportUnknownVariableType=false, reportUnknownMemberType=false, reportAttributeAccessIssue=false, reportMissingTypeArgument=false
+# pyright: reportMissingImports=false, reportUnknownVariableType=false, reportUnknownMemberType=false, reportAttributeAccessIssue=false, reportMissingTypeArgument=false, reportAny=false, reportExplicitAny=false, reportUnknownParameterType=false, reportUnknownArgumentType=false, reportUntypedFunctionDecorator=false, reportUnusedParameter=false, reportUnusedCallResult=false
 from __future__ import annotations
 
 import inspect
@@ -9,7 +9,7 @@ from typing import Annotated, TypedDict
 import pandas as pd
 import pytest
 
-from pivot import loaders, outputs, stage_def
+from pivot import loaders, stage_def, types
 from pivot.compose import (
     ArtifactHandle,
     Pipeline,
@@ -395,8 +395,9 @@ def test_pipeline_build_bridge(tmp_path: pathlib.Path) -> None:
     assert stage_a["func"] is inspect.unwrap(_helper_build_stage_a)
     assert not hasattr(stage_a["func"], "_is_stage")
     assert stage_a["name"] == "_helper_build_stage_a"
-    assert stage_a["deps"] == {"raw": "data/raw.yaml"}
-    assert stage_a["deps_paths"] == ["data/raw.yaml"]
+    assert stage_a["deps"]["raw"].identity == types.ArtifactIdentity(producer="raw", key=None)
+    assert isinstance(stage_a["deps"]["raw"].format, loaders.YAML)
+    assert stage_a["deps"]["raw"].tag is types.ArtifactTag.DATA
     assert stage_a["params"] is not None
     assert isinstance(stage_a["params"], stage_def.StageParams)
     assert stage_a["params_arg_name"] == "params"
@@ -405,29 +406,139 @@ def test_pipeline_build_bridge(tmp_path: pathlib.Path) -> None:
     assert stage_a["signature"] == inspect.signature(inspect.unwrap(_helper_build_stage_a))
     assert stage_a["state_dir"] == tmp_path / ".pivot"
 
-    output_a_path = "data/compose_build/_helper_build_stage_a.jsonl"
-    assert stage_a["outs_paths"] == [output_a_path]
     assert len(stage_a["outs"]) == 1
-    assert isinstance(stage_a["outs"][0], outputs.Out)
-    assert stage_a["outs"][0].path == output_a_path
-    assert isinstance(stage_a["out_specs"][stage_def.SINGLE_OUTPUT_KEY], outputs.Out)
-    assert stage_a["out_specs"][stage_def.SINGLE_OUTPUT_KEY].path == output_a_path
+    assert isinstance(stage_a["outs"][0], types.ArtifactRef)
+    assert stage_a["outs"][0].identity == types.ArtifactIdentity(
+        producer="_helper_build_stage_a", key=None
+    )
+    assert stage_a["outs"][0].tag is types.ArtifactTag.DATA
+    assert isinstance(stage_a["outs"][0].format, loaders.DataFrameJSONL)
 
-    dep_spec_a = stage_a["dep_specs"]["raw"]
-    assert dep_spec_a.path == "data/raw.yaml"
-    assert isinstance(dep_spec_a.loader, loaders.YAML)
-    assert dep_spec_a.creates_dep_edge is True
+    assert stage_b["deps"]["data"].identity == types.ArtifactIdentity(
+        producer="_helper_build_stage_a", key=None
+    )
+    assert stage_b["deps"]["data"].tag is types.ArtifactTag.DATA
+    assert isinstance(stage_b["outs"][0].format, loaders.YAML)
+    assert stage_b["outs"][0].tag is types.ArtifactTag.DATA
 
-    output_b_path = "data/compose_build/_helper_build_stage_b.yaml"
-    assert stage_b["deps"] == {"data": output_a_path}
-    assert stage_b["deps_paths"] == [output_a_path]
-    assert stage_b["outs_paths"] == [output_b_path]
-    assert isinstance(stage_b["out_specs"][stage_def.SINGLE_OUTPUT_KEY], outputs.Out)
-    assert stage_b["out_specs"][stage_def.SINGLE_OUTPUT_KEY].path == output_b_path
 
-    dep_spec_b = stage_b["dep_specs"]["data"]
-    assert dep_spec_b.path == output_a_path
-    assert dep_spec_b.loader == stage_a["out_specs"][stage_def.SINGLE_OUTPUT_KEY].loader
+class _HelperTaggedOutputs(TypedDict):
+    data: pd.DataFrame
+    metrics: Annotated[dict, metric]
+    chart: Annotated[pd.DataFrame, plot]
+
+
+@stage
+def _helper_build_tagged() -> _HelperTaggedOutputs:
+    return {
+        "data": pd.DataFrame(),
+        "metrics": {"rows": 1},
+        "chart": pd.DataFrame(),
+    }
+
+
+def test_pipeline_build_artifact_refs_and_tags(tmp_path: pathlib.Path) -> None:
+    with Pipeline("compose_tagged", root=tmp_path) as pipeline:
+        _helper_build_tagged()
+
+    legacy = pipeline.build()
+    stage_info = legacy.get("_helper_build_tagged")
+
+    outs = stage_info["outs"]
+    assert all(isinstance(out, types.ArtifactRef) for out in outs)
+
+    tags = {out.identity.key: out.tag for out in outs}
+    assert tags["data"] is types.ArtifactTag.DATA
+    assert tags["metrics"] is types.ArtifactTag.METRIC
+    assert tags["chart"] is types.ArtifactTag.PLOT
+
+
+def test_validate_artifact_identity_rejects_path_separators() -> None:
+    with pytest.raises(ValueError):
+        types.validate_artifact_identity(types.ArtifactIdentity(producer="bad/name", key=None))
+    with pytest.raises(ValueError):
+        types.validate_artifact_identity(types.ArtifactIdentity(producer="ok", key="bad/part"))
+
+
+# --- Pipeline variant context manager ---
+
+
+def test_pipeline_variant_basic(tmp_path: pathlib.Path) -> None:
+    with Pipeline("test_variant", root=tmp_path) as pipeline:
+        with pipeline.variant("gpt4"):
+            _helper_produce(params=stage_def.StageParams())
+
+    assert len(pipeline._stages) == 1
+    assert pipeline._stages[0].name == "_helper_produce@gpt4"
+    assert pipeline._stages[0].variant == "gpt4"
+
+
+def test_pipeline_variant_nested(tmp_path: pathlib.Path) -> None:
+    with Pipeline("test_nested", root=tmp_path) as pipeline:
+        with pipeline.variant("base"):
+            with pipeline.variant("gpt4"):
+                _helper_produce(params=stage_def.StageParams())
+
+    assert len(pipeline._stages) == 1
+    assert pipeline._stages[0].name == "_helper_produce@base@gpt4"
+    assert pipeline._stages[0].variant == "base@gpt4"
+
+
+def test_pipeline_variant_multiple_stages(tmp_path: pathlib.Path) -> None:
+    with Pipeline("test_multi", root=tmp_path) as pipeline:
+        with pipeline.variant("v1"):
+            _helper_produce(params=stage_def.StageParams())
+            _helper_consume_dict(data={})
+
+    assert len(pipeline._stages) == 2
+    assert pipeline._stages[0].name == "_helper_produce@v1"
+    assert pipeline._stages[1].name == "_helper_consume_dict@v1"
+    assert pipeline._stages[0].variant == "v1"
+    assert pipeline._stages[1].variant == "v1"
+
+
+def test_pipeline_variant_artifact_identity(tmp_path: pathlib.Path) -> None:
+    with Pipeline("test_artifact_id", root=tmp_path) as pipeline:
+        with pipeline.variant("gpt4"):
+            data = _helper_produce(params=stage_def.StageParams())
+            _helper_consume(data)
+
+    legacy = pipeline.build()
+
+    stage_a = legacy.get("_helper_produce@gpt4")
+    stage_b = legacy.get("_helper_consume@gpt4")
+
+    assert stage_a["variant"] == "gpt4"
+    assert stage_b["variant"] == "gpt4"
+    assert stage_a["outs"][0].identity.producer == "_helper_produce@gpt4"
+    assert stage_b["deps"]["data"].identity.producer == "_helper_produce@gpt4"
+
+
+def test_pipeline_variant_with_repeated_calls(tmp_path: pathlib.Path) -> None:
+    with Pipeline("test_repeat_variant", root=tmp_path) as pipeline:
+        with pipeline.variant("v1"):
+            _helper_repeat(params=stage_def.StageParams())
+            _helper_repeat(params=stage_def.StageParams())
+
+    assert pipeline._stages[0].name == "_helper_repeat@v1"
+    assert pipeline._stages[1].name == "_helper_repeat@1@v1"
+    assert pipeline._stages[0].variant == "v1"
+    assert pipeline._stages[1].variant == "v1"
+
+
+def test_pipeline_variant_mixed_with_non_variant(tmp_path: pathlib.Path) -> None:
+    with Pipeline("test_mixed", root=tmp_path) as pipeline:
+        _helper_produce(params=stage_def.StageParams())
+        with pipeline.variant("v1"):
+            _helper_consume_dict(data={})
+        _helper_repeat(params=stage_def.StageParams())
+
+    assert pipeline._stages[0].name == "_helper_produce"
+    assert pipeline._stages[1].name == "_helper_consume_dict@v1"
+    assert pipeline._stages[2].name == "_helper_repeat"
+    assert pipeline._stages[0].variant is None
+    assert pipeline._stages[1].variant == "v1"
+    assert pipeline._stages[2].variant is None
 
 
 # --- Bug 2: Optional[StageParams] params detection ---

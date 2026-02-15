@@ -5,7 +5,11 @@ from __future__ import annotations
 from typing import Any
 
 from pivot import skip
-from pivot.types import FileHash, HashInfo, LockData
+from pivot.types import DirHash, FileHash, HashInfo, LockData
+
+
+def _identity(producer: str, key: str | None) -> str:
+    return producer if key is None else f"{producer}:{key}"
 
 
 def _helper_make_lock_data(
@@ -18,8 +22,8 @@ def _helper_make_lock_data(
     return LockData(
         code_manifest=code_manifest or {"func:main": "abc123"},
         params=params or {"lr": 0.01},
-        dep_hashes=dep_hashes or {"/data/input.csv": FileHash(hash="hash_a")},
-        output_hashes=output_hashes or {"/data/output.csv": FileHash(hash="hash_out")},
+        dep_hashes=dep_hashes or {_identity("input", None): FileHash(hash="hash_a")},
+        output_hashes=output_hashes or {_identity("stage", "output"): FileHash(hash="hash_out")},
     )
 
 
@@ -33,8 +37,8 @@ def test_no_lock_data_returns_changed() -> None:
         lock_data=None,
         fingerprint={"func:main": "abc123"},
         params={"lr": 0.01},
-        dep_hashes={"/data/input.csv": FileHash(hash="hash_a")},
-        out_paths=["/data/output.csv"],
+        dep_hashes={_identity("input", None): FileHash(hash="hash_a")},
+        out_paths=[_identity("stage", "output")],
     )
     assert result["changed"] is True
     assert "No previous run" in result["reason"]
@@ -51,8 +55,8 @@ def test_fast_code_changed() -> None:
         lock_data=lock_data,
         fingerprint={"func:main": "DIFFERENT"},
         params={"lr": 0.01},
-        dep_hashes={"/data/input.csv": FileHash(hash="hash_a")},
-        out_paths=["/data/output.csv"],
+        dep_hashes={_identity("input", None): FileHash(hash="hash_a")},
+        out_paths=[_identity("stage", "output")],
     )
     assert result["changed"] is True
     assert "Code changed" in result["reason"]
@@ -64,8 +68,8 @@ def test_fast_params_changed() -> None:
         lock_data=lock_data,
         fingerprint={"func:main": "abc123"},
         params={"lr": 0.99},
-        dep_hashes={"/data/input.csv": FileHash(hash="hash_a")},
-        out_paths=["/data/output.csv"],
+        dep_hashes={_identity("input", None): FileHash(hash="hash_a")},
+        out_paths=[_identity("stage", "output")],
     )
     assert result["changed"] is True
     assert "Params changed" in result["reason"]
@@ -77,8 +81,8 @@ def test_fast_deps_changed() -> None:
         lock_data=lock_data,
         fingerprint={"func:main": "abc123"},
         params={"lr": 0.01},
-        dep_hashes={"/data/input.csv": FileHash(hash="DIFFERENT")},
-        out_paths=["/data/output.csv"],
+        dep_hashes={_identity("input", None): FileHash(hash="DIFFERENT")},
+        out_paths=[_identity("stage", "output")],
     )
     assert result["changed"] is True
     assert "dependencies changed" in result["reason"]
@@ -90,8 +94,8 @@ def test_fast_out_paths_changed() -> None:
         lock_data=lock_data,
         fingerprint={"func:main": "abc123"},
         params={"lr": 0.01},
-        dep_hashes={"/data/input.csv": FileHash(hash="hash_a")},
-        out_paths=["/data/output.csv", "/data/new_output.csv"],
+        dep_hashes={_identity("input", None): FileHash(hash="hash_a")},
+        out_paths=[_identity("stage", "output"), _identity("stage", "new_output")],
     )
     assert result["changed"] is True
     assert "Output paths changed" in result["reason"]
@@ -103,8 +107,8 @@ def test_fast_nothing_changed() -> None:
         lock_data=lock_data,
         fingerprint={"func:main": "abc123"},
         params={"lr": 0.01},
-        dep_hashes={"/data/input.csv": FileHash(hash="hash_a")},
-        out_paths=["/data/output.csv"],
+        dep_hashes={_identity("input", None): FileHash(hash="hash_a")},
+        out_paths=[_identity("stage", "output")],
     )
     assert result["changed"] is False
     assert result["reason"] == ""
@@ -116,8 +120,8 @@ def test_fast_force_returns_changed() -> None:
         lock_data=lock_data,
         fingerprint={"func:main": "abc123"},
         params={"lr": 0.01},
-        dep_hashes={"/data/input.csv": FileHash(hash="hash_a")},
-        out_paths=["/data/output.csv"],
+        dep_hashes={_identity("input", None): FileHash(hash="hash_a")},
+        out_paths=[_identity("stage", "output")],
         force=True,
     )
     assert result["changed"] is True
@@ -135,8 +139,8 @@ def test_explain_returns_all_changes() -> None:
         lock_data=lock_data,
         fingerprint={"func:main": "DIFFERENT"},
         params={"lr": 0.99},
-        dep_hashes={"/data/input.csv": FileHash(hash="DIFFERENT")},
-        out_paths=["/data/output.csv"],
+        dep_hashes={_identity("input", None): FileHash(hash="DIFFERENT")},
+        out_paths=[_identity("stage", "output")],
         explain=True,
     )
     assert result["changed"] is True
@@ -151,8 +155,8 @@ def test_explain_nothing_changed() -> None:
         lock_data=lock_data,
         fingerprint={"func:main": "abc123"},
         params={"lr": 0.01},
-        dep_hashes={"/data/input.csv": FileHash(hash="hash_a")},
-        out_paths=["/data/output.csv"],
+        dep_hashes={_identity("input", None): FileHash(hash="hash_a")},
+        out_paths=[_identity("stage", "output")],
         explain=True,
     )
     assert result["changed"] is False
@@ -212,10 +216,10 @@ def test_new_dep_added() -> None:
         fingerprint={"func:main": "abc123"},
         params={"lr": 0.01},
         dep_hashes={
-            "/data/input.csv": {"hash": "hash_a"},
-            "/data/extra.csv": FileHash(hash="hash_b"),
+            _identity("input", None): {"hash": "hash_a"},
+            _identity("extra", None): FileHash(hash="hash_b"),
         },
-        out_paths=["/data/output.csv"],
+        out_paths=[_identity("stage", "output")],
         explain=True,
     )
     assert result["changed"] is True
@@ -231,7 +235,7 @@ def test_dep_removed() -> None:
         fingerprint={"func:main": "abc123"},
         params={"lr": 0.01},
         dep_hashes={},
-        out_paths=["/data/output.csv"],
+        out_paths=[_identity("stage", "output")],
         explain=True,
     )
     assert result["changed"] is True
@@ -246,8 +250,8 @@ def test_code_function_added() -> None:
         lock_data=lock_data,
         fingerprint={"func:main": "abc123", "func:helper": "def456"},
         params={"lr": 0.01},
-        dep_hashes={"/data/input.csv": FileHash(hash="hash_a")},
-        out_paths=["/data/output.csv"],
+        dep_hashes={_identity("input", None): FileHash(hash="hash_a")},
+        out_paths=[_identity("stage", "output")],
         explain=True,
     )
     assert result["changed"] is True
@@ -255,3 +259,64 @@ def test_code_function_added() -> None:
     added = [c for c in code_changes if c["change_type"] == "added"]
     assert len(added) == 1
     assert added[0]["key"] == "func:helper"
+
+
+def test_group_dep_ignores_unaccessed_keys() -> None:
+    lock_data = _helper_make_lock_data(
+        dep_hashes={
+            _identity("group", None): DirHash(
+                hash="group_hash",
+                manifest=[
+                    {"relpath": "x", "hash": "hash_x", "size": 1, "isexec": False},
+                ],
+            ),
+        },
+    )
+    result = skip.check_stage(
+        lock_data=lock_data,
+        fingerprint={"func:main": "abc123"},
+        params={"lr": 0.01},
+        dep_hashes={
+            _identity("group", None): DirHash(
+                hash="group_hash",
+                manifest=[
+                    {"relpath": "x", "hash": "hash_x", "size": 1, "isexec": False},
+                    {"relpath": "y", "hash": "hash_y_changed", "size": 1, "isexec": False},
+                ],
+            )
+        },
+        out_paths=[_identity("stage", "output")],
+        explain=True,
+    )
+    assert result["changed"] is False
+    assert result["dep_changes"] == []
+
+
+def test_group_dep_detects_accessed_key_change() -> None:
+    lock_data = _helper_make_lock_data(
+        dep_hashes={
+            _identity("group", None): DirHash(
+                hash="group_hash",
+                manifest=[
+                    {"relpath": "x", "hash": "hash_x", "size": 1, "isexec": False},
+                ],
+            ),
+        },
+    )
+    result = skip.check_stage(
+        lock_data=lock_data,
+        fingerprint={"func:main": "abc123"},
+        params={"lr": 0.01},
+        dep_hashes={
+            _identity("group", None): DirHash(
+                hash="group_hash",
+                manifest=[
+                    {"relpath": "x", "hash": "hash_x_changed", "size": 1, "isexec": False},
+                ],
+            )
+        },
+        out_paths=[_identity("stage", "output")],
+        explain=True,
+    )
+    assert result["changed"] is True
+    assert result["dep_changes"][0]["identity"] == _identity("group", None)
