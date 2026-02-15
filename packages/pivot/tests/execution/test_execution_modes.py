@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import json
 import shutil
 from typing import TYPE_CHECKING, Any
 
 from pivot import loaders, types
 from pivot.executor import worker
-from pivot.storage import cache, lock, state, store as store_mod
+from pivot.storage import cache, lock
+from pivot.storage import store as store_mod
 from pivot.types import StageStatus
 
 if TYPE_CHECKING:
@@ -24,7 +24,7 @@ def _make_artifact_ref(
     key: str | None,
     *,
     tag: types.ArtifactTag,
-    loader: object,
+    loader: loaders.Reader[object] | loaders.Writer[object] | loaders.Loader[object, object],
     python_type: type,
 ) -> types.ArtifactRef:
     return types.ArtifactRef(

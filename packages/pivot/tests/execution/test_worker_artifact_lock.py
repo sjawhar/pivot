@@ -5,7 +5,6 @@ from __future__ import annotations
 import inspect
 import multiprocessing
 import os
-import pathlib
 import queue
 from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import MagicMock
@@ -16,6 +15,8 @@ from pivot.storage import artifact_lock, cache
 from pivot.types import OutputMessageKind, StateChange
 
 if TYPE_CHECKING:
+    import pathlib
+
     from pytest_mock import MockerFixture
 
 
@@ -29,7 +30,7 @@ def _make_artifact_ref(
     key: str | None,
     *,
     tag: types.ArtifactTag,
-    loader: object,
+    loader: loaders.Reader[object] | loaders.Writer[object] | loaders.Loader[object, object],
     python_type: type,
 ) -> types.ArtifactRef:
     return types.ArtifactRef(

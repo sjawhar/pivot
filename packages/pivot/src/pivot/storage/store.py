@@ -5,11 +5,14 @@ import contextlib
 import os
 import pathlib
 import tempfile
-from collections.abc import Generator
-from typing import Protocol, TypedDict, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, TypedDict, runtime_checkable
 
 from pivot import compose, config, loaders, types
-from pivot.storage import cache, state as state_mod
+from pivot.storage import cache
+from pivot.storage import state as state_mod
+
+if TYPE_CHECKING:
+    from collections.abc import Generator
 
 
 @runtime_checkable
@@ -44,7 +47,7 @@ class CacheStore:
         self._ref_dir = cache_dir / "refs"
 
     @contextlib.contextmanager
-    def _state_db(self) -> Generator[state_mod.StateDB | None, None, None]:
+    def _state_db(self) -> Generator[state_mod.StateDB | None]:
         if self._state_db_path is None:
             yield None
             return
@@ -144,7 +147,10 @@ class WorkspaceStore:
             return False
         if ref.identity.key is not None:
             return False
-        return ref.identity.producer not in self._output_producers
+        if ref.identity.producer in self._output_producers:
+            return False
+        output_path = self._resolve_output_path(ref)
+        return not (output_path.exists() or output_path.is_symlink())
 
     def _resolve_input_path(self, ref: types.ArtifactRef) -> pathlib.Path:
         name = ref.identity.producer

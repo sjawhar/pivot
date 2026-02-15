@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Literal, TypedDict
 
 import click
 
-from pivot import config, exceptions, path_utils, project, registry
+from pivot import config, exceptions, path_utils, project, registry, types
 from pivot import status as status_mod
 from pivot.cli import completion
 from pivot.cli import decorators as cli_decorators
@@ -81,19 +81,23 @@ def _get_stage_lock_hashes(
     # Filter non-cached outputs — they're git-tracked, not in cache
     project_root = project.get_project_root()
     cached_paths = {
-        path_utils.canonicalize_artifact_path(str(out.path), project_root)
+        path_utils.canonicalize_artifact_path(types.identity_key(out.identity), project_root)
         for out in stage_info["outs"]
-        if out.cache
+        if out.tag is not types.ArtifactTag.METRIC
     }
-    cached_output_hashes: dict[str, HashInfo] = {
-        path: h
-        for path, h in lock_data["output_hashes"].items()
-        if path_utils.canonicalize_artifact_path(path, project_root) in cached_paths
-    }
+    cached_output_hashes: dict[str, HashInfo] = {}
+    for identity, hash_info in lock_data["output_hashes"].items():
+        norm_path = path_utils.canonicalize_artifact_path(
+            types.identity_key(identity), project_root
+        )
+        if norm_path in cached_paths:
+            cached_output_hashes[norm_path] = hash_info
+
+    dep_hashes = {types.identity_key(k): v for k, v in lock_data["dep_hashes"].items()}
 
     return (
         _extract_file_hashes(cached_output_hashes),
-        _extract_file_hashes(lock_data["dep_hashes"]),
+        _extract_file_hashes(dep_hashes),
     )
 
 

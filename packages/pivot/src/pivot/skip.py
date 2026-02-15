@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Any, cast
 
 from pivot.types import (
+    ArtifactIdentity,
     ChangeDecision,
     ChangeType,
     CodeChange,
@@ -24,8 +25,8 @@ def check_stage(
     lock_data: LockData | None,
     fingerprint: dict[str, str],
     params: dict[str, Any],
-    dep_hashes: dict[str, HashInfo],
-    out_paths: list[str],
+    dep_hashes: dict[ArtifactIdentity, HashInfo],
+    out_paths: list[ArtifactIdentity],
     *,
     explain: bool = False,
     force: bool = False,
@@ -156,7 +157,9 @@ def diff_params(old: dict[str, Any], new: dict[str, Any]) -> list[ParamChange]:
     return changes
 
 
-def diff_dep_hashes(old: dict[str, HashInfo], new: dict[str, HashInfo]) -> list[DepChange]:
+def diff_dep_hashes(
+    old: dict[ArtifactIdentity, HashInfo], new: dict[ArtifactIdentity, HashInfo]
+) -> list[DepChange]:
     changes = list[DepChange]()
     all_keys = sorted(set(old.keys()) | set(new.keys()))
     for key in all_keys:
@@ -193,7 +196,9 @@ def diff_dep_hashes(old: dict[str, HashInfo], new: dict[str, HashInfo]) -> list[
     return changes
 
 
-def _dep_hashes_match(old: dict[str, HashInfo], new: dict[str, HashInfo]) -> bool:
+def _dep_hashes_match(
+    old: dict[ArtifactIdentity, HashInfo], new: dict[ArtifactIdentity, HashInfo]
+) -> bool:
     if old.keys() != new.keys():
         return False
     return not any(_dep_hash_changed(old[key], new[key]) for key in old)
@@ -207,14 +212,11 @@ def _dep_hash_changed(old: HashInfo, new: HashInfo) -> bool:
     new_accessed = _get_accessed_hashes(new)
     if new_accessed is None:
         return True
-    for dep_key, dep_hash in old_accessed.items():
-        if new_accessed.get(dep_key) != dep_hash:
-            return True
-    return False
+    return any(new_accessed.get(dep_key) != dep_hash for dep_key, dep_hash in old_accessed.items())
 
 
 def _get_accessed_hashes(info: HashInfo) -> dict[str, str] | None:
-    raw: dict[str, object] = cast("dict[str, object]", cast(object, info))
+    raw: dict[str, object] = cast("dict[str, object]", cast("object", info))
     if "accessed_hashes" in raw:
         return cast("dict[str, str]", raw["accessed_hashes"])
     if "manifest" in info:

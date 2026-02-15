@@ -9,8 +9,8 @@ __version__ = "0.1.0-dev"
 # Internal modules like BaseOut and show.* are accessible via their full paths
 
 if TYPE_CHECKING:
-    from pivot import merkle as merkle
     from pivot import loaders as loaders
+    from pivot import merkle as merkle
     from pivot import stage_def as stage_def
     from pivot.compose import Pipeline as Pipeline
     from pivot.compose import metric as metric

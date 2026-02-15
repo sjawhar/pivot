@@ -2,32 +2,43 @@ from pathlib import Path
 
 import pytest
 
-from pivot import loaders, outputs
+from pivot import loaders
 from pivot.engine import graph as engine_graph
 from pivot.exceptions import CyclicGraphError, DependencyNotFoundError
 from pivot.registry import RegistryStageInfo
 from pivot.storage.track import PvtData
+from pivot.types import ArtifactIdentity, ArtifactRef, ArtifactTag
+
+
+def _artifact_ref(identity: ArtifactIdentity) -> ArtifactRef:
+    return ArtifactRef(
+        identity=identity,
+        format=loaders.PathOnly(),
+        python_type=str,
+        tag=ArtifactTag.DATA,
+    )
 
 
 def _create_stage(name: str, deps: list[str], outs: list[str]) -> RegistryStageInfo:
-    """Create a stage dict for testing."""
+    """Create a stage dict for testing.
+
+    Converts string paths to ArtifactIdentity objects using the path as producer.
+    This matches the behavior of the graph building logic which uses paths for matching.
+    """
+    # Use the full path as the producer (key=None) to match path-based artifact matching
+    dep_identities = [ArtifactIdentity(path, None) for path in deps]
+    out_identities = [ArtifactIdentity(path, None) for path in outs]
+
     return RegistryStageInfo(
         func=lambda: None,
         name=name,
-        deps={f"_{i}": d for i, d in enumerate(deps)},
-        deps_paths=deps,
-        outs=[
-            outputs.require_expanded(outputs.Out(path=out, loader=loaders.PathOnly()))
-            for out in outs
-        ],
-        outs_paths=outs,
+        deps={f"_{i}": _artifact_ref(dep) for i, dep in enumerate(dep_identities)},
+        outs=[_artifact_ref(out) for out in out_identities],
         params=None,
-        mutex=[],
+        mutex=list[str](),
         variant=None,
         signature=None,
-        fingerprint={},
-        dep_specs={},
-        out_specs=dict[str, outputs.BaseOut](),
+        fingerprint=dict[str, str](),
         params_arg_name=None,
         state_dir=None,
     )
@@ -162,16 +173,42 @@ def test_dependency_on_existing_file(tmp_path: Path) -> None:
 
 
 def test_missing_dependency_raises_error(tmp_path: Path) -> None:
-    """Dependency not produced AND doesn't exist on disk - raise error."""
+    """Dependency refers to known stage but missing output key raises error."""
+    producer_out = ArtifactIdentity("producer", "output.csv")
+    missing_dep = ArtifactIdentity("producer", "missing.csv")
+
     stages = {
-        "process": _create_stage(
-            "process", [str(tmp_path / "missing.csv")], [str(tmp_path / "output.csv")]
-        )
+        "producer": RegistryStageInfo(
+            func=lambda: None,
+            name="producer",
+            deps={},
+            outs=[_artifact_ref(producer_out)],
+            params=None,
+            mutex=list[str](),
+            variant=None,
+            signature=None,
+            fingerprint=dict[str, str](),
+            params_arg_name=None,
+            state_dir=None,
+        ),
+        "consumer": RegistryStageInfo(
+            func=lambda: None,
+            name="consumer",
+            deps={"_0": _artifact_ref(missing_dep)},
+            outs=[_artifact_ref(ArtifactIdentity("consumer", "output.csv"))],
+            params=None,
+            mutex=list[str](),
+            variant=None,
+            signature=None,
+            fingerprint=dict[str, str](),
+            params_arg_name=None,
+            state_dir=None,
+        ),
     }
 
     with pytest.raises(
         DependencyNotFoundError,
-        match="depends on.*missing.csv.*not produced by any stage and does not exist on disk",
+        match="depends on.*producer:missing.csv.*not produced by any stage and does not exist on disk",
     ):
         engine_graph.build_graph(stages, validate=True)
 

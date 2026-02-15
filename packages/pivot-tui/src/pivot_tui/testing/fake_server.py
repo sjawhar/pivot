@@ -118,7 +118,9 @@ class FakeRpcServer:
     def set_explanation(self, stage: str, explanation: dict[str, object]) -> None:
         self._explanations[stage] = dict(explanation)
 
-    def set_stage_info(self, stage: str, deps: list[str], outs: list[str]) -> None:
+    def set_stage_info(
+        self, stage: str, deps: list[dict[str, object]], outs: list[dict[str, object]]
+    ) -> None:
         self._stage_infos[stage] = {"name": stage, "deps": list(deps), "outs": list(outs)}
 
     def set_commit_result(self, committed: list[str], failed: list[str] | None = None) -> None:

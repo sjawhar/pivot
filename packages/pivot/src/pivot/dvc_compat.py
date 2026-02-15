@@ -5,11 +5,11 @@ import dataclasses
 import functools
 import logging
 import pathlib
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 import yaml
 
-from pivot import exceptions, loaders, outputs, project
+from pivot import exceptions, loaders, outputs, project, types
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -131,7 +131,10 @@ def _build_dvc_stage(
     }
 
     # Add deps section
-    deps = [_to_relative_path(dep, root) for dep in stage_info["deps_paths"]]
+    deps = [
+        _to_relative_path(types.identity_key(dep.identity), root)
+        for dep in stage_info["deps"].values()
+    ]
     if deps:
         stage["deps"] = deps
 
@@ -141,16 +144,14 @@ def _build_dvc_stage(
     plots_section: list[str | dict[str, Any]] = []
 
     for out in stage_info["outs"]:
-        # Registry always stores single-file outputs (multi-file are expanded)
-        rel_path = _to_relative_path(str(out.path), root)
+        rel_path = _to_relative_path(types.identity_key(out.identity), root)
         out_entry = _build_out_entry(out, rel_path)
 
-        if isinstance(out, outputs.Plot):
+        if out.tag is types.ArtifactTag.PLOT:
             plots_section.append(out_entry)
-        elif isinstance(out, outputs.Metric):
+        elif out.tag is types.ArtifactTag.METRIC:
             metrics_section.append(out_entry)
         else:
-            # Out or BaseOut → outs section
             outs_section.append(out_entry)
 
     if outs_section:
@@ -168,26 +169,11 @@ def _build_dvc_stage(
     return stage
 
 
-def _build_out_entry(out: outputs.BaseOut, rel_path: str) -> str | dict[str, Any]:
-    """Build DVC output entry from BaseOut object."""
+def _build_out_entry(out: types.ArtifactRef, rel_path: str) -> str | dict[str, Any]:
     options: dict[str, Any] = {}
 
-    # Only emit cache option when it differs from type default (Metric=False, others=True)
-    default_cache = not isinstance(out, outputs.Metric)
-    if out.cache != default_cache:
-        options["cache"] = out.cache
-
-    # IncrementalOut always exports with persist: true (DVC won't delete it between runs)
-    if isinstance(out, outputs.IncrementalOut):
-        options["persist"] = True
-
-    # Plot-specific options
-    if isinstance(out, outputs.Plot):
-        # Cast to Plot[Any] - isinstance narrows but basedpyright keeps Unknown params
-        plot = cast("outputs.Plot[Any]", out)
-        for attr in ("x", "y", "template"):
-            if (value := getattr(plot, attr)) is not None:
-                options[attr] = value
+    if out.tag is types.ArtifactTag.METRIC:
+        options["cache"] = False
 
     return {rel_path: options} if options else rel_path
 

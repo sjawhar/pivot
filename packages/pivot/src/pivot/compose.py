@@ -166,7 +166,7 @@ class Pipeline:
         )
 
     @contextlib.contextmanager
-    def variant(self, name: str) -> typing.Generator[None, None, None]:
+    def variant(self, name: str) -> typing.Generator[None]:
         """Context manager for registering stages with a variant suffix.
 
         All stages registered within the block get @{name} appended to their stage name.
@@ -278,6 +278,11 @@ class Pipeline:
                     continue
 
                 source = handle._source
+                if not source.output_specs:
+                    raise TypeError(
+                        f"Stage '{node.name}' depends on '{source.name}' which has no outputs "
+                        f"(returns None). A stage must produce outputs to be used as a dependency."
+                    )
                 if len(source.output_specs) == 1:
                     output_spec = source.output_specs[0]
                     output_key = None
@@ -536,6 +541,8 @@ def _analyze_return_type(func: Callable[..., object]) -> list[_OutputSpec]:
     if return_hint is None:
         msg = f"Stage function {func.__name__} must have a return type annotation"
         raise ValueError(msg)
+    if return_hint is type(None):
+        return []
     return _parse_output_type(return_hint, SINGLE_OUTPUT_KEY)
 
 

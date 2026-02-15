@@ -60,9 +60,13 @@ def test_artifact_handle_suboutput() -> None:
     def stage_func() -> None:
         return None
 
-    pipeline = object()
+    pipeline = Pipeline("test", root=pathlib.Path("/tmp"))
     output_specs = [
-        _OutputSpec(key="filtered_runs", python_type=list, format=loaders.JSONL()),
+        _OutputSpec(
+            key="filtered_runs",
+            python_type=list,
+            format=typing.cast("loaders.Writer[object]", loaders.JSONL()),
+        ),
         _OutputSpec(key="raw_runs", python_type=dict, format=loaders.JSON()),
     ]
     stage_node = _StageNode(
@@ -90,9 +94,13 @@ def test_artifact_handle_missing_output_raises() -> None:
     def stage_func() -> None:
         return None
 
-    pipeline = object()
+    pipeline = Pipeline("test", root=pathlib.Path("/tmp"))
     output_specs = [
-        _OutputSpec(key="filtered_runs", python_type=list, format=loaders.JSONL()),
+        _OutputSpec(
+            key="filtered_runs",
+            python_type=list,
+            format=typing.cast("loaders.Writer[object]", loaders.JSONL()),
+        ),
     ]
     stage_node = _StageNode(
         func=stage_func,
@@ -115,7 +123,7 @@ def test_artifact_handle_missing_output_raises() -> None:
 
 
 def test_artifact_handle_input_no_suboutputs() -> None:
-    pipeline = object()
+    pipeline = Pipeline("test", root=pathlib.Path("/tmp"))
     input_node = _InputNode(
         name="source",
         python_type=str,
@@ -454,19 +462,44 @@ def test_pipeline_build_artifact_refs_and_tags(tmp_path: pathlib.Path) -> None:
 
 
 def test_validate_artifact_identity_rejects_path_separators() -> None:
+    # Slashes are allowed as namespace separators
+    types.validate_artifact_identity(
+        types.ArtifactIdentity(producer="blueprints/benchmark.yaml", key=None)
+    )
+    types.validate_artifact_identity(types.ArtifactIdentity(producer="data/raw/input", key=None))
+    types.validate_artifact_identity(types.ArtifactIdentity(producer="ok", key="a/b/c"))
+
+    # But backslashes are rejected
     with pytest.raises(ValueError):
-        types.validate_artifact_identity(types.ArtifactIdentity(producer="bad/name", key=None))
+        types.validate_artifact_identity(types.ArtifactIdentity(producer="bad\\name", key=None))
     with pytest.raises(ValueError):
-        types.validate_artifact_identity(types.ArtifactIdentity(producer="ok", key="bad/part"))
+        types.validate_artifact_identity(types.ArtifactIdentity(producer="ok", key="bad\\part"))
+
+    # Null bytes are rejected
+    with pytest.raises(ValueError):
+        types.validate_artifact_identity(types.ArtifactIdentity(producer="bad\0name", key=None))
+    with pytest.raises(ValueError):
+        types.validate_artifact_identity(types.ArtifactIdentity(producer="ok", key="bad\0part"))
+
+    # Path traversal segments (. or ..) are rejected
+    with pytest.raises(ValueError):
+        types.validate_artifact_identity(types.ArtifactIdentity(producer="..", key=None))
+    with pytest.raises(ValueError):
+        types.validate_artifact_identity(types.ArtifactIdentity(producer="a/../b", key=None))
+    with pytest.raises(ValueError):
+        types.validate_artifact_identity(types.ArtifactIdentity(producer="a/./b", key=None))
+    with pytest.raises(ValueError):
+        types.validate_artifact_identity(types.ArtifactIdentity(producer="ok", key="a/../b"))
+    with pytest.raises(ValueError):
+        types.validate_artifact_identity(types.ArtifactIdentity(producer="ok", key="a/./b"))
 
 
 # --- Pipeline variant context manager ---
 
 
 def test_pipeline_variant_basic(tmp_path: pathlib.Path) -> None:
-    with Pipeline("test_variant", root=tmp_path) as pipeline:
-        with pipeline.variant("gpt4"):
-            _helper_produce(params=stage_def.StageParams())
+    with Pipeline("test_variant", root=tmp_path) as pipeline, pipeline.variant("gpt4"):
+        _helper_produce(params=stage_def.StageParams())
 
     assert len(pipeline._stages) == 1
     assert pipeline._stages[0].name == "_helper_produce@gpt4"
@@ -474,10 +507,9 @@ def test_pipeline_variant_basic(tmp_path: pathlib.Path) -> None:
 
 
 def test_pipeline_variant_nested(tmp_path: pathlib.Path) -> None:
-    with Pipeline("test_nested", root=tmp_path) as pipeline:
-        with pipeline.variant("base"):
-            with pipeline.variant("gpt4"):
-                _helper_produce(params=stage_def.StageParams())
+    with Pipeline("test_nested", root=tmp_path) as pipeline, pipeline.variant("base"):
+        with pipeline.variant("gpt4"):
+            _helper_produce(params=stage_def.StageParams())
 
     assert len(pipeline._stages) == 1
     assert pipeline._stages[0].name == "_helper_produce@base@gpt4"
@@ -485,10 +517,9 @@ def test_pipeline_variant_nested(tmp_path: pathlib.Path) -> None:
 
 
 def test_pipeline_variant_multiple_stages(tmp_path: pathlib.Path) -> None:
-    with Pipeline("test_multi", root=tmp_path) as pipeline:
-        with pipeline.variant("v1"):
-            _helper_produce(params=stage_def.StageParams())
-            _helper_consume_dict(data={})
+    with Pipeline("test_multi", root=tmp_path) as pipeline, pipeline.variant("v1"):
+        _helper_produce(params=stage_def.StageParams())
+        _helper_consume_dict(data={})
 
     assert len(pipeline._stages) == 2
     assert pipeline._stages[0].name == "_helper_produce@v1"
@@ -498,10 +529,9 @@ def test_pipeline_variant_multiple_stages(tmp_path: pathlib.Path) -> None:
 
 
 def test_pipeline_variant_artifact_identity(tmp_path: pathlib.Path) -> None:
-    with Pipeline("test_artifact_id", root=tmp_path) as pipeline:
-        with pipeline.variant("gpt4"):
-            data = _helper_produce(params=stage_def.StageParams())
-            _helper_consume(data)
+    with Pipeline("test_artifact_id", root=tmp_path) as pipeline, pipeline.variant("gpt4"):
+        data = _helper_produce(params=stage_def.StageParams())
+        _helper_consume(data)
 
     legacy = pipeline.build()
 
@@ -515,10 +545,9 @@ def test_pipeline_variant_artifact_identity(tmp_path: pathlib.Path) -> None:
 
 
 def test_pipeline_variant_with_repeated_calls(tmp_path: pathlib.Path) -> None:
-    with Pipeline("test_repeat_variant", root=tmp_path) as pipeline:
-        with pipeline.variant("v1"):
-            _helper_repeat(params=stage_def.StageParams())
-            _helper_repeat(params=stage_def.StageParams())
+    with Pipeline("test_repeat_variant", root=tmp_path) as pipeline, pipeline.variant("v1"):
+        _helper_repeat(params=stage_def.StageParams())
+        _helper_repeat(params=stage_def.StageParams())
 
     assert pipeline._stages[0].name == "_helper_repeat@v1"
     assert pipeline._stages[1].name == "_helper_repeat@1@v1"

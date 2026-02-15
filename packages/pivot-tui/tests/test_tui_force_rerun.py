@@ -36,19 +36,23 @@ def serve_pipeline(tmp_path: pathlib.Path) -> Generator[pathlib.Path]:
     # Use pipeline.py with a simple stage (no outputs)
     pipeline_code = """\
 import pathlib
-from pivot.pipeline.pipeline import Pipeline
+from pivot.compose import Pipeline as ComposePipeline, stage
 
-pipeline = Pipeline("test", root=pathlib.Path(__file__).parent)
+_cp = ComposePipeline("test", root=pathlib.Path(__file__).parent)
 
+@stage
 def my_stage() -> None:
     print("my_stage executed")
 
-pipeline.register(my_stage, name="my_stage")
-
+@stage
 def other_stage() -> None:
     print("other_stage executed")
 
-pipeline.register(other_stage, name="other_stage")
+with _cp:
+    my_stage()
+    other_stage()
+
+pipeline = _cp.build()
 """
     (tmp_path / "pipeline.py").write_text(pipeline_code)
 

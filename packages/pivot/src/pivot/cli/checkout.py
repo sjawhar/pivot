@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Literal
 
 import click
 
-from pivot import config, path_utils, project, registry
+from pivot import config, path_utils, project, registry, types
 from pivot.cli import completion
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
@@ -43,9 +43,9 @@ def _get_stage_output_info() -> dict[str, HashInfo]:
         stage_info = cli_helpers.get_stage(stage_name)
         project_root = project.get_project_root()
         cached_paths = {
-            path_utils.canonicalize_artifact_path(str(out.path), project_root)
+            path_utils.canonicalize_artifact_path(types.identity_key(out.identity), project_root)
             for out in stage_info["outs"]
-            if out.cache
+            if out.tag is not types.ArtifactTag.METRIC
         }
 
         stage_state_dir = registry.get_stage_state_dir(stage_info, config.get_state_dir())
@@ -53,7 +53,9 @@ def _get_stage_output_info() -> dict[str, HashInfo]:
         lock_data = stage_lock.read()
         if lock_data:
             for out_path, out_hash in lock_data["output_hashes"].items():
-                norm_path = path_utils.canonicalize_artifact_path(out_path, project_root)
+                norm_path = path_utils.canonicalize_artifact_path(
+                    types.identity_key(out_path), project_root
+                )
                 if norm_path in cached_paths:
                     result[norm_path] = out_hash
 

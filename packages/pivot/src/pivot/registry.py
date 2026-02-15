@@ -107,17 +107,11 @@ class StageRegistry:
             return self._cached_dag
 
         from pivot.engine import graph as engine_graph
-        from pivot.storage import track
-
-        tracked_files = None
-        if validate:
-            tracked_files = track.discover_pvt_files(project.get_project_root())
 
         # Build bipartite graph with validation, extract stage DAG
         bipartite = engine_graph.build_graph(
             self._stages,
             validate=validate,
-            tracked_files=tracked_files,
         )
         graph = engine_graph.get_stage_dag(bipartite)
 

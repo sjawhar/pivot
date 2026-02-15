@@ -5,7 +5,7 @@ import pathlib
 import runpy
 from typing import TYPE_CHECKING, Final
 
-from pivot import fingerprint, metrics, project
+from pivot import fingerprint, metrics, project, types
 from pivot.pipeline import yaml as pipeline_config
 
 if TYPE_CHECKING:
@@ -198,8 +198,8 @@ def _discover_all_pipelines(root: pathlib.Path) -> Pipeline | None:
         all_deps = set[str]()
         for stage_name in combined.list_stages():
             info = combined.get(stage_name)
-            local_outputs.update(info["outs_paths"])
-            all_deps.update(info["deps_paths"])
+            local_outputs.update(types.identity_key(out.identity) for out in info["outs"])
+            all_deps.update(types.identity_key(dep.identity) for dep in info["deps"].values())
         unresolved = all_deps - local_outputs
         if unresolved:
             sample = ", ".join(sorted(unresolved)[:5])

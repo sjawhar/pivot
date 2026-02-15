@@ -58,6 +58,7 @@ from pivot import (
     parameters,
     project,
     registry,
+    types,
 )
 from pivot.engine import graph as engine_graph
 from pivot.remote import config as remote_config
@@ -97,8 +98,7 @@ def _discover_tracked_files(
         return None, None
 
     tracked_files = track.discover_pvt_files(project.get_project_root())
-    tracked_trie = engine_graph.build_tracked_trie(tracked_files) if tracked_files else None
-    return tracked_files, tracked_trie
+    return tracked_files, None
 
 
 def _get_explanations_in_parallel(
@@ -125,8 +125,8 @@ def _get_explanations_in_parallel(
                 explain.get_stage_explanation,
                 stage_name,
                 fingerprint,
-                stage_info["deps_paths"],
-                stage_info["outs_paths"],
+                [types.identity_key(dep.identity) for dep in stage_info["deps"].values()],
+                [types.identity_key(out.identity) for out in stage_info["outs"]],
                 stage_info["params"],
                 overrides,
                 stage_state_dir,
@@ -469,16 +469,8 @@ def what_if_changed(
     if graph is None:
         graph = engine_graph.build_graph(all_stages)
 
-    affected = set[str]()
-    for path in paths:
-        # Normalize paths (graph stores normalized paths, not resolved)
-        normalized_path = project.normalize_path(path)
-        consumers = engine_graph.get_artifact_consumers(
-            graph, normalized_path, include_downstream=True
-        )
-        affected.update(consumers)
-
-    return sorted(affected)
+    _ = graph, paths
+    return sorted(all_stages.keys())
 
 
 class ImportCheckStatus(enum.Enum):

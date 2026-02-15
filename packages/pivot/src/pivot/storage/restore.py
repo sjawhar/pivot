@@ -4,7 +4,7 @@ import enum
 import logging
 import os
 import pathlib
-from typing import TYPE_CHECKING, TypedDict, TypeGuard
+from typing import TYPE_CHECKING, TypedDict, TypeGuard, cast
 
 import xxhash
 import yaml
@@ -130,6 +130,17 @@ def _normalize_target_path(target: str, proj_root: pathlib.Path) -> str:
         ) from None
 
 
+def _entry_display(entry: OutEntry) -> str:
+    raw = cast("dict[str, object]", cast("object", entry))
+    path_value = raw.get("path")
+    if isinstance(path_value, str):
+        return path_value
+    display = entry.get("display", entry.get("key", "unknown"))
+    if display is None:
+        return "unknown"
+    return display
+
+
 def resolve_targets(
     targets: Sequence[str],
     rev: str,
@@ -145,9 +156,9 @@ def resolve_targets(
             lock_data = get_lock_data_from_revision(target, rev, state_dir)
             if lock_data is not None and "outs" in lock_data:
                 outs = lock_data["outs"]
-                paths = [entry["path"] for entry in outs]
+                paths = [_entry_display(entry) for entry in outs]
                 hashes: dict[str, HashInfo | None] = {
-                    entry["path"]: _out_entry_to_output_hash(entry) for entry in outs
+                    _entry_display(entry): _out_entry_to_output_hash(entry) for entry in outs
                 }
                 results.append(
                     TargetInfo(

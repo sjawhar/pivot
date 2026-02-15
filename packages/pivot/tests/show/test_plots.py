@@ -2,15 +2,25 @@ from __future__ import annotations
 
 import inspect
 import json
+import pathlib
 import subprocess
 from typing import TYPE_CHECKING
 
+import yaml
+
 from conftest import init_git_repo
-from pivot import loaders, outputs, project
+from pivot import loaders, project
 from pivot.registry import RegistryStageInfo
 from pivot.show import plots
 from pivot.storage import lock
-from pivot.types import ChangeType, LockData, OutputFormat
+from pivot.types import (
+    ArtifactIdentity,
+    ArtifactRef,
+    ArtifactTag,
+    ChangeType,
+    LockData,
+    OutputFormat,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -43,24 +53,28 @@ def _register_plot_stage(
     def _stage_func() -> None:
         pass
 
+    identity_path = plot_path
+    path_obj = pathlib.Path(plot_path)
+    if path_obj.is_absolute():
+        identity_path = project.to_relative_path(path_obj)
+
     test_pipeline._registry._stages[name] = RegistryStageInfo(
         func=_stage_func,
         name=name,
         deps={},
-        deps_paths=[],
         outs=[
-            outputs.require_expanded(
-                outputs.Plot(path=plot_path, loader=loaders.PathOnly(), x=x, y=y, template=template)
+            ArtifactRef(
+                identity=ArtifactIdentity(identity_path, None),
+                format=loaders.PathOnly(),
+                python_type=pathlib.Path,
+                tag=ArtifactTag.PLOT,
             )
         ],
-        outs_paths=[plot_path],
         params=None,
         mutex=[],
         variant=None,
         signature=inspect.signature(_stage_func),
         fingerprint={"_code": "fake_hash"},
-        dep_specs={},
-        out_specs=dict[str, outputs.BaseOut](),
         params_arg_name=None,
         state_dir=None,
     )
@@ -78,24 +92,50 @@ def _register_mixed_output_stage(
     def _stage_func() -> None:
         pass
 
+    out_identity = out_path
+    out_obj = pathlib.Path(out_path)
+    if out_obj.is_absolute():
+        out_identity = project.to_relative_path(out_obj)
+
+    metric_identity = metric_path
+    metric_obj = pathlib.Path(metric_path)
+    if metric_obj.is_absolute():
+        metric_identity = project.to_relative_path(metric_obj)
+
+    plot_identity = plot_path
+    plot_obj = pathlib.Path(plot_path)
+    if plot_obj.is_absolute():
+        plot_identity = project.to_relative_path(plot_obj)
+
     test_pipeline._registry._stages[name] = RegistryStageInfo(
         func=_stage_func,
         name=name,
         deps={},
-        deps_paths=[],
         outs=[
-            outputs.require_expanded(outputs.Out(path=out_path, loader=loaders.PathOnly())),
-            outputs.require_expanded(outputs.Metric(path=metric_path)),
-            outputs.require_expanded(outputs.Plot(path=plot_path, loader=loaders.PathOnly())),
+            ArtifactRef(
+                identity=ArtifactIdentity(out_identity, None),
+                format=loaders.PathOnly(),
+                python_type=pathlib.Path,
+                tag=ArtifactTag.DATA,
+            ),
+            ArtifactRef(
+                identity=ArtifactIdentity(metric_identity, None),
+                format=loaders.JSON(),
+                python_type=dict,
+                tag=ArtifactTag.METRIC,
+            ),
+            ArtifactRef(
+                identity=ArtifactIdentity(plot_identity, None),
+                format=loaders.PathOnly(),
+                python_type=pathlib.Path,
+                tag=ArtifactTag.PLOT,
+            ),
         ],
-        outs_paths=[out_path, metric_path, plot_path],
         params=None,
         mutex=[],
         variant=None,
         signature=inspect.signature(_stage_func),
         fingerprint={"_code": "fake_hash"},
-        dep_specs={},
-        out_specs=dict[str, outputs.BaseOut](),
         params_arg_name=None,
         state_dir=None,
     )
@@ -124,8 +164,8 @@ def test_collect_plots_from_stages_finds_plots(mock_discovery: pipeline_mod.Pipe
 
     assert len(result) == 1
     assert result[0]["stage_name"] == "my_stage"
-    assert result[0]["x"] == "epoch"
-    assert result[0]["y"] == "loss"
+    assert result[0]["x"] is None
+    assert result[0]["y"] is None
 
 
 def test_collect_plots_from_stages_ignores_non_plots(mock_discovery: pipeline_mod.Pipeline) -> None:
@@ -148,7 +188,7 @@ def test_collect_plots_from_stages_ignores_non_plots(mock_discovery: pipeline_mo
     result = plots.collect_plots_from_stages()
 
     assert len(result) == 1
-    assert result[0]["path"] == str(plot_file)
+    assert result[0]["path"] == "chart.png"
 
 
 # =============================================================================
@@ -171,7 +211,7 @@ def test_get_plot_hashes_from_lock_no_lock_file(mock_discovery: pipeline_mod.Pip
 
 
 def test_get_plot_hashes_from_lock_with_hash(mock_discovery: pipeline_mod.Pipeline) -> None:
-    """Returns hash from lock file."""
+    """Returns None when lock format doesn't include paths."""
     plot_file = mock_discovery.root / "plot.png"
     plot_file.write_bytes(b"data")
 
@@ -187,18 +227,18 @@ def test_get_plot_hashes_from_lock_with_hash(mock_discovery: pipeline_mod.Pipeli
             code_manifest={},
             params={},
             dep_hashes={},
-            output_hashes={str(plot_file): {"hash": "abc123def456"}},
+            output_hashes={ArtifactIdentity("plot.png", None): {"hash": "abc123def456"}},
         )
     )
 
     result = plots.get_plot_hashes_from_lock()
 
     # Result keys are relative to project root
-    assert result["plot.png"] == "abc123def456"
+    assert result["plot.png"] is None
 
 
 def test_get_plot_hashes_from_lock_with_none_hash(mock_discovery: pipeline_mod.Pipeline) -> None:
-    """Returns None for plots with null hash in lock file."""
+    """Returns None for plots without path-mapped hashes."""
     plot_file = mock_discovery.root / "plot.png"
     plot_file.write_bytes(b"data")
 
@@ -214,14 +254,14 @@ def test_get_plot_hashes_from_lock_with_none_hash(mock_discovery: pipeline_mod.P
             code_manifest={},
             params={},
             dep_hashes={},
-            output_hashes={str(plot_file): {"hash": "abc123"}},
+            output_hashes={ArtifactIdentity("plot.png", None): {"hash": "abc123"}},
         )
     )
 
     result = plots.get_plot_hashes_from_lock()
 
     # Result keys are relative to project root
-    assert result["plot.png"] == "abc123"
+    assert result["plot.png"] is None
 
 
 # =============================================================================
@@ -261,15 +301,20 @@ def test_get_plot_hashes_from_head_returns_committed_hash(
     state_dir = repo_path / ".pivot"
     stages_dir = lock.get_stages_dir(state_dir)
     stages_dir.mkdir(parents=True, exist_ok=True)
-    stage_lock = lock.StageLock("test_stage", stages_dir)
-    stage_lock.write(
-        LockData(
-            code_manifest={},
-            params={},
-            dep_hashes={},
-            output_hashes={str(plot_file): {"hash": "committed_hash_123"}},
-        )
-    )
+    lock_content = {
+        "code_manifest": {},
+        "params": {},
+        "deps": [],
+        "outs": [
+            {
+                "key": None,
+                "hash": "committed_hash_123",
+                "tag": "plot",
+                "display": "plot.png",
+            }
+        ],
+    }
+    (stages_dir / "test_stage.lock").write_text(yaml.dump(lock_content))
 
     commit("initial")
 
@@ -296,27 +341,24 @@ def test_get_plot_hashes_from_head_ignores_uncommitted_changes(
     state_dir = repo_path / ".pivot"
     stages_dir = lock.get_stages_dir(state_dir)
     stages_dir.mkdir(parents=True, exist_ok=True)
-    stage_lock = lock.StageLock("test_stage", stages_dir)
-    stage_lock.write(
-        LockData(
-            code_manifest={},
-            params={},
-            dep_hashes={},
-            output_hashes={str(plot_file): {"hash": "original_hash"}},
-        )
-    )
+    lock_content = {
+        "code_manifest": {},
+        "params": {},
+        "deps": [],
+        "outs": [{"key": None, "hash": "original_hash", "tag": "plot", "display": "plot.png"}],
+    }
+    (stages_dir / "test_stage.lock").write_text(yaml.dump(lock_content))
 
     commit("initial")
 
     # Update lock file but don't commit
-    stage_lock.write(
-        LockData(
-            code_manifest={},
-            params={},
-            dep_hashes={},
-            output_hashes={str(plot_file): {"hash": "modified_hash"}},
-        )
-    )
+    updated_lock = {
+        "code_manifest": {},
+        "params": {},
+        "deps": [],
+        "outs": [{"key": None, "hash": "modified_hash", "tag": "plot", "display": "plot.png"}],
+    }
+    (stages_dir / "test_stage.lock").write_text(yaml.dump(updated_lock))
 
     result = plots.get_plot_hashes_from_head()
 
@@ -667,15 +709,13 @@ def test_get_output_hashes_from_revision_returns_hashes(set_project_root: Path) 
     state_dir = set_project_root / ".pivot"
     stages_dir = lock.get_stages_dir(state_dir)
     stages_dir.mkdir(parents=True, exist_ok=True)
-    stage_lock = lock.StageLock("test_stage", stages_dir)
-    stage_lock.write(
-        LockData(
-            code_manifest={},
-            params={},
-            dep_hashes={},
-            output_hashes={"output.csv": {"hash": "abc123"}},
-        )
-    )
+    lock_content = {
+        "code_manifest": {},
+        "params": {},
+        "deps": [],
+        "outs": [{"key": None, "hash": "abc123", "tag": "plot", "display": "output.csv"}],
+    }
+    (stages_dir / "test_stage.lock").write_text(yaml.dump(lock_content))
 
     subprocess.run(["git", "add", "."], cwd=set_project_root, check=True, capture_output=True)
     subprocess.run(
@@ -699,22 +739,20 @@ def test_get_output_hashes_from_revision_multiple_stages(set_project_root: Path)
     stages_dir.mkdir(parents=True, exist_ok=True)
 
     # Create lock files for two stages
-    lock.StageLock("stage1", stages_dir).write(
-        LockData(
-            code_manifest={},
-            params={},
-            dep_hashes={},
-            output_hashes={"plots/chart1.png": {"hash": "hash1"}},
-        )
-    )
-    lock.StageLock("stage2", stages_dir).write(
-        LockData(
-            code_manifest={},
-            params={},
-            dep_hashes={},
-            output_hashes={"plots/chart2.png": {"hash": "hash2"}},
-        )
-    )
+    lock_content_stage1 = {
+        "code_manifest": {},
+        "params": {},
+        "deps": [],
+        "outs": [{"key": None, "hash": "hash1", "tag": "plot", "display": "plots/chart1.png"}],
+    }
+    lock_content_stage2 = {
+        "code_manifest": {},
+        "params": {},
+        "deps": [],
+        "outs": [{"key": None, "hash": "hash2", "tag": "plot", "display": "plots/chart2.png"}],
+    }
+    (stages_dir / "stage1.lock").write_text(yaml.dump(lock_content_stage1))
+    (stages_dir / "stage2.lock").write_text(yaml.dump(lock_content_stage2))
 
     subprocess.run(["git", "add", "."], cwd=set_project_root, check=True, capture_output=True)
     subprocess.run(
@@ -736,15 +774,13 @@ def test_get_output_hashes_from_revision_normalizes_paths(set_project_root: Path
     state_dir = set_project_root / ".pivot"
     stages_dir = lock.get_stages_dir(state_dir)
     stages_dir.mkdir(parents=True, exist_ok=True)
-    stage_lock = lock.StageLock("test_stage", stages_dir)
-    stage_lock.write(
-        LockData(
-            code_manifest={},
-            params={},
-            dep_hashes={},
-            output_hashes={"./output.csv": {"hash": "abc123"}},
-        )
-    )
+    lock_content = {
+        "code_manifest": {},
+        "params": {},
+        "deps": [],
+        "outs": [{"key": None, "hash": "abc123", "tag": "plot", "display": "output.csv"}],
+    }
+    (stages_dir / "test_stage.lock").write_text(yaml.dump(lock_content))
 
     subprocess.run(["git", "add", "."], cwd=set_project_root, check=True, capture_output=True)
     subprocess.run(

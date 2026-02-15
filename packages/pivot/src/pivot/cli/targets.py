@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any, TypedDict
 
 import click
 
-from pivot import discovery, outputs, project
+from pivot import discovery, outputs, project, types
 from pivot.cli import helpers as cli_helpers
 from pivot.engine import graph as engine_graph
 
@@ -107,7 +107,8 @@ def resolve_targets_to_stages(
             # Treat as artifact path - use absolute path to match graph node format
             # Only find the producer (for upstream-only semantics like stage targets)
             norm_path = project.normalize_path(target)
-            producer = engine_graph.get_producer(bipartite_graph, norm_path)
+            identity = engine_graph.parse_artifact_identity(str(norm_path))
+            producer = engine_graph.get_producer(bipartite_graph, identity)
             if producer:
                 result.add(producer)
             else:
@@ -163,9 +164,20 @@ def resolve_output_paths(
         if item["is_stage"]:
             info = cli_helpers.get_stage(item["target"])
             for out in info["outs"]:
-                if isinstance(out, output_type):
+                if isinstance(out, types.ArtifactRef):
+                    if (
+                        output_type is outputs.Metric
+                        and out.tag is types.ArtifactTag.METRIC
+                        or output_type is outputs.Plot
+                        and out.tag is types.ArtifactTag.PLOT
+                    ):
+                        resolved.add(types.identity_key(out.identity))
+                elif isinstance(out, output_type):
                     # Registry always stores single-file outputs (multi-file are expanded)
-                    rel_path = project.to_relative_path(project.normalize_path(out.path), proj_root)
+                    expanded = outputs.require_expanded(out)
+                    rel_path = project.to_relative_path(
+                        project.normalize_path(expanded.path), proj_root
+                    )
                     resolved.add(rel_path)
         elif item["is_file"]:
             resolved.add(item["norm_path"])
@@ -192,12 +204,24 @@ def resolve_plot_infos(
         if item["is_stage"]:
             info = cli_helpers.get_stage(item["target"])
             for out in info["outs"]:
-                if isinstance(out, outputs.Plot):
+                if isinstance(out, types.ArtifactRef):
+                    if out.tag is types.ArtifactTag.PLOT:
+                        resolved.append(
+                            plots.PlotInfo(
+                                path=types.identity_key(out.identity),
+                                stage_name=item["target"],
+                                x=None,
+                                y=None,
+                                template=None,
+                            )
+                        )
+                elif isinstance(out, outputs.Plot):
                     # Registry always stores single-file outputs (multi-file are expanded)
+                    expanded = outputs.require_expanded(out)
                     resolved.append(
                         plots.PlotInfo(
                             path=project.to_relative_path(
-                                project.normalize_path(out.path), proj_root
+                                project.normalize_path(expanded.path), proj_root
                             ),
                             stage_name=item["target"],
                             x=out.x,

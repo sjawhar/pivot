@@ -9,11 +9,7 @@ import threading
 import time
 from typing import Any, Protocol, cast
 
-from pivot import types
-
-
-class _LoadersModule(Protocol):
-    def JSON(self) -> object: ...  # noqa: N802
+from pivot import loaders, types
 
 
 class _LockMode(enum.IntEnum):
@@ -32,7 +28,6 @@ class _ArtifactLockModule(Protocol):
     ) -> list[dict[str, object]]: ...
 
 
-loaders = cast("_LoadersModule", cast("object", importlib.import_module("pivot.loaders")))
 artifact_lock = cast(
     "_ArtifactLockModule",
     cast("object", importlib.import_module("pivot.storage.artifact_lock")),

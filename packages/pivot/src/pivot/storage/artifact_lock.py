@@ -7,12 +7,14 @@ import enum
 import fcntl
 import hashlib
 import os
-import pathlib
 import time
 from collections.abc import Callable
-from typing import TypedDict, final
+from typing import TYPE_CHECKING, TypedDict, final
 
-import pivot.types as types
+if TYPE_CHECKING:
+    import pathlib
+
+    import pivot.types as types
 
 
 class LockMode(enum.IntEnum):

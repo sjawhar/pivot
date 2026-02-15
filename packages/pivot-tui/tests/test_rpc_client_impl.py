@@ -137,11 +137,31 @@ async def test_stages_empty(tmp_path: Path) -> None:
 @pytest.mark.anyio
 async def test_stage_info(tmp_path: Path) -> None:
     async with _connected(tmp_path / "t.sock") as (server, client):
-        server.set_stage_info("train", deps=["input.csv"], outs=["model.pkl"])
+        server.set_stage_info(
+            "train",
+            deps=[{"producer": "input", "key": None}],
+            outs=[{"producer": "train", "key": None}],
+        )
         result = await client.stage_info("train")
         assert result["name"] == "train"
-        assert result["deps"] == ["input.csv"]
-        assert result["outs"] == ["model.pkl"]
+        assert len(result["deps"]) == 1
+        assert len(result["outs"]) == 1
+
+
+@pytest.mark.anyio
+async def test_stage_info_structured_identity(tmp_path: Path) -> None:
+    """stage_info returns ArtifactIdentity instances, not strings."""
+    from pivot.types import ArtifactIdentity
+
+    async with _connected(tmp_path / "t.sock") as (server, client):
+        server.set_stage_info(
+            "train",
+            deps=[{"producer": "input", "key": None}],
+            outs=[{"producer": "train", "key": "metrics"}],
+        )
+        result = await client.stage_info("train")
+        assert result["deps"][0] == ArtifactIdentity("input", None)
+        assert result["outs"][0] == ArtifactIdentity("train", "metrics")
 
 
 # --- explain ---

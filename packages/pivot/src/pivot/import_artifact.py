@@ -197,15 +197,26 @@ def _entry_size(entry: OutEntry) -> int:
         return int(entry["size"])
     if "manifest" in entry:
         return sum(int(m["size"]) for m in entry["manifest"])
-    entry_path = entry["path"] if "path" in entry else "unknown"
-    logger.warning("Lock entry '%s' has no size information", entry_path)
+    entry_display = _entry_display(entry)
+    logger.warning("Lock entry '%s' has no size information", entry_display)
     return 0
+
+
+def _entry_display(entry: OutEntry) -> str:
+    raw = cast("dict[str, object]", cast("object", entry))
+    path_value = raw.get("path")
+    if isinstance(path_value, str):
+        return path_value
+    display = entry.get("display", entry.get("key", "unknown"))
+    if display is None:
+        return "unknown"
+    return display
 
 
 def _iter_manifest_paths(entry: OutEntry) -> list[tuple[str, DirManifestEntry]]:
     if "manifest" not in entry:
         return []
-    base = entry["path"].rstrip("/")
+    base = _entry_display(entry).rstrip("/")
     return [(f"{base}/{m['relpath']}", m) for m in entry["manifest"]]
 
 
@@ -249,11 +260,12 @@ async def _resolve_remote_path_with_session(
         if lock_data is None:
             continue
         for entry in lock_data["outs"]:
-            available.add(entry["path"])
+            entry_display = _entry_display(entry)
+            available.add(entry_display)
             for full_path, _ in _iter_manifest_paths(entry):
                 available.add(full_path)
 
-            if entry["path"] == path:
+            if entry_display == path:
                 if "manifest" in entry:
                     message = (
                         "Cannot import directory output "

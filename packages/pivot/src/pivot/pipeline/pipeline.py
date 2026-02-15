@@ -8,7 +8,7 @@ import pathlib
 import re
 from typing import TYPE_CHECKING
 
-from pivot import discovery, project, registry
+from pivot import discovery, project, registry, types
 from pivot.pipeline.yaml import PipelineConfigError
 
 logger = logging.getLogger(__name__)
@@ -65,7 +65,7 @@ def _find_producer_in_pipeline(
     """
     for name in pipeline.list_stages():
         info = pipeline.get(name)
-        if dep_path in info["outs_paths"]:
+        if dep_path in [types.identity_key(out.identity) for out in info["outs"]]:
             return info, pipeline.name
     return None
 
@@ -358,8 +358,8 @@ class Pipeline:
         all_deps = set[str]()
         for stage_name in self.list_stages():
             info = self.get(stage_name)
-            local_outputs.update(info["outs_paths"])
-            all_deps.update(info["deps_paths"])
+            local_outputs.update(types.identity_key(out.identity) for out in info["outs"])
+            all_deps.update(types.identity_key(dep.identity) for dep in info["deps"].values())
 
         # Work queue is deps not satisfied locally
         work = all_deps - local_outputs
@@ -413,10 +413,14 @@ class Pipeline:
             if stage_info["name"] in self._registry.list_stages():
                 stage_info["name"] = f"{source_pipeline_name}/{stage_info['name']}"
             self._registry.add_existing(stage_info)
-            local_outputs.update(stage_info["outs_paths"])
+            local_outputs.update(types.identity_key(out.identity) for out in stage_info["outs"])
 
             # Add producer's unresolved dependencies to work queue
-            work.update(dep for dep in stage_info["deps_paths"] if dep not in local_outputs)
+            work.update(
+                dep
+                for dep in [types.identity_key(dep.identity) for dep in stage_info["deps"].values()]
+                if dep not in local_outputs
+            )
 
             logger.debug(f"Included stage '{producer_name}' via three-tier discovery")
 
@@ -443,7 +447,7 @@ class Pipeline:
             pipeline_dir = _find_pipeline_dir_for_stage(info, project_root)
             if pipeline_dir is None:
                 continue
-            for out_path in info["outs_paths"]:
+            for out_path in [types.identity_key(out.identity) for out in info["outs"]]:
                 # Convert absolute out_path to project-relative for the index key
                 try:
                     rel_path = str(pathlib.Path(out_path).relative_to(project_root))

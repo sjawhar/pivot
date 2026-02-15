@@ -2,15 +2,16 @@ from __future__ import annotations
 
 import inspect
 import json
+import pathlib
 from typing import TYPE_CHECKING
 
 import pytest
 import yaml
 
-from pivot import outputs
+from pivot import loaders, project
 from pivot.registry import RegistryStageInfo
 from pivot.show import metrics
-from pivot.types import ChangeType, OutputFormat
+from pivot.types import ArtifactIdentity, ArtifactRef, ArtifactTag, ChangeType, OutputFormat
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -36,20 +37,28 @@ def _register_metric_stage(
     def _stage_func() -> None:
         pass
 
+    identity_path = metric_path
+    path_obj = pathlib.Path(metric_path)
+    if path_obj.is_absolute():
+        identity_path = project.to_relative_path(path_obj)
+
     test_pipeline._registry._stages[name] = RegistryStageInfo(
         func=_stage_func,
         name=name,
         deps={},
-        deps_paths=[],
-        outs=[outputs.require_expanded(outputs.Metric(metric_path))],
-        outs_paths=[metric_path],
+        outs=[
+            ArtifactRef(
+                identity=ArtifactIdentity(identity_path, None),
+                format=loaders.JSON(),
+                python_type=dict,
+                tag=ArtifactTag.METRIC,
+            )
+        ],
         params=None,
         mutex=[],
         variant=None,
         signature=inspect.signature(_stage_func),
         fingerprint={"_code": "fake_hash"},
-        dep_specs={},
-        out_specs=dict[str, outputs.BaseOut](),
         params_arg_name=None,
         state_dir=None,
     )
@@ -560,8 +569,8 @@ def test_collect_metrics_from_stages_with_metric_output(
     result = metrics.collect_metrics_from_stages()
 
     assert "my_stage" in result
-    assert str(metric_file) in result["my_stage"]
-    assert result["my_stage"][str(metric_file)]["accuracy"] == 0.95
+    assert "metrics.json" in result["my_stage"]
+    assert result["my_stage"]["metrics.json"]["accuracy"] == 0.95
 
 
 def test_collect_metrics_from_stages_missing_file(
@@ -607,8 +616,8 @@ def test_collect_all_stage_metrics_flat(
 
     result = metrics.collect_all_stage_metrics_flat()
 
-    assert str(metric_file) in result
-    assert result[str(metric_file)]["accuracy"] == 0.95
+    assert "metrics.json" in result
+    assert result["metrics.json"]["accuracy"] == 0.95
 
 
 # =============================================================================
@@ -636,7 +645,16 @@ def test_get_metric_info_from_head_with_metric_stage(
     _register_metric_stage(mock_discovery, "my_stage", str(metric_file))
 
     lock_content = yaml.dump(
-        make_valid_lock_content(outs=[{"path": "metrics.json", "hash": "abc123"}])
+        make_valid_lock_content(
+            outs=[
+                {
+                    "key": None,
+                    "hash": "abc123",
+                    "tag": "metric",
+                    "path": "metrics.json",
+                }
+            ]
+        )
     )
     mocker.patch.object(
         git,

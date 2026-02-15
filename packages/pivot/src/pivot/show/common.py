@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import tabulate
 import yaml
@@ -73,7 +73,18 @@ def extract_output_hashes_from_lock(
     lock_data: StorageLockData,
 ) -> dict[str, str | None]:
     """Extract path -> hash mapping from lock data 'outs' field."""
-    return {out["path"]: out["hash"] for out in lock_data["outs"]}
+    result = dict[str, str | None]()
+    for out in lock_data["outs"]:
+        raw = cast("dict[str, object]", cast("object", out))
+        path_value = raw.get("path")
+        if isinstance(path_value, str):
+            result[path_value] = out["hash"]
+            continue
+        display = out.get("display", out.get("key", "unknown"))
+        if display is None:
+            display = "unknown"
+        result[display] = out["hash"]
+    return result
 
 
 def format_table(

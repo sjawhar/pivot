@@ -11,7 +11,6 @@ import pathlib
 import subprocess
 import sys
 import tempfile
-import uuid
 from collections.abc import AsyncGenerator, Callable, Generator
 from typing import TYPE_CHECKING
 
