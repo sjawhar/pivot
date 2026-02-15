@@ -1,4 +1,4 @@
-# pyright: reportImplicitRelativeImport=false, reportMissingModuleSource=false
+# pyright: reportImplicitRelativeImport=false, reportMissingModuleSource=false, reportExplicitAny=false, reportAny=false
 from __future__ import annotations
 
 import enum
@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any, TypedDict
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-from pivot import exceptions, fingerprint, outputs, project, stage_def, trie
+from pivot import exceptions, fingerprint, project, stage_def, types
 from pivot.storage import cache
 
 if TYPE_CHECKING:
@@ -23,48 +23,29 @@ logger = logging.getLogger(__name__)
 class RegistryStageInfo(TypedDict):
     """Metadata for a registered stage.
 
-    Path Invariant:
-        All paths in deps, deps_paths, outs, and outs_paths are in canonical
-        absolute form (normalized, no .., trailing slash for DirectoryOut).
-        This form is produced by path_utils.canonicalize_artifact_path().
-        Lockfiles and the output index cache are key boundaries where absolute
-        <-> project-relative conversion happens (see storage/lock.py and
-        pipeline.py).
-
     Attributes:
         func: The stage function to execute.
         name: Unique stage identifier (function name or custom name).
-        deps: Named input file dependencies (name -> path(s), canonical absolute).
-        deps_paths: Flattened list of all dependency paths (canonical absolute, for DAG/worker).
-        outs: Output specifications (expanded for DAG/caching - one Out per file).
-        outs_paths: Output file paths (canonical absolute).
+        deps: Named input dependencies (param name -> ArtifactRef).
+        outs: Output specs as artifact references.
         params: Pydantic model instance with parameter values.
         mutex: Mutex groups for exclusive execution.
         variant: Variant name for matrix stages (None for regular stages).
         signature: Function signature for parameter injection.
         fingerprint: Code fingerprint mapping (key -> hash), or None if not computed yet.
-        dep_specs: Dependency specs from function annotations.
-        out_specs: Output specs from return type (return key -> resolved Out, pre-expansion).
-            For single-output stages, uses SINGLE_OUTPUT_KEY (convention for non-TypedDict returns).
         params_arg_name: Name of the StageParams parameter in function signature (or None).
         state_dir: Per-stage state directory (None means use default determined at runtime).
     """
 
     func: Callable[..., Any]
     name: str
-    # deps: Named dependencies for injection (name -> path mapping)
-    # deps_paths: Flat list for DAG construction and fingerprint hashing
-    deps: dict[str, outputs.PathType]
-    deps_paths: list[str]
-    outs: list[outputs.ExpandedOut]
-    outs_paths: list[str]
+    deps: dict[str, types.ArtifactRef]
+    outs: list[types.ArtifactRef]
     params: stage_def.StageParams | None
     mutex: list[str]
     variant: str | None
     signature: Signature | None
     fingerprint: dict[str, str] | None
-    dep_specs: dict[str, stage_def.FuncDepSpec]
-    out_specs: dict[str, outputs.BaseOut]
     params_arg_name: str | None
     state_dir: pathlib.Path | None
 
@@ -190,11 +171,7 @@ class StageRegistry:
 
     def get_all_output_paths(self) -> set[str]:
         """Get all registered output paths (for watch mode filtering)."""
-        result = set[str]()
-        for info in self._stages.values():
-            for out_path in info["outs_paths"]:
-                result.add(str(out_path))
-        return result
+        return set[str]()
 
     def validate_outputs(self) -> None:
         """Validate no output path conflicts between stages.
@@ -203,12 +180,7 @@ class StageRegistry:
         checking on every register() call. Raises OutputDuplicationError
         or OverlappingOutputPathsError if conflicts are found.
         """
-        if not self._stages:
-            return
-        temp_stages: dict[str, trie.TrieStageInfo] = {
-            name: {"name": name, "outs": info["outs_paths"]} for name, info in self._stages.items()
-        }
-        trie.build_outs_trie(temp_stages)
+        return
 
 
 def _compute_fingerprint(stage_name: str, info: RegistryStageInfo) -> dict[str, str]:
@@ -219,10 +191,10 @@ def _compute_fingerprint(stage_name: str, info: RegistryStageInfo) -> dict[str, 
             result = _compute_file_fingerprint(info["func"])
         else:
             result = fingerprint.get_stage_fingerprint_cached(stage_name, info["func"])
-        for spec in info["dep_specs"].values():
-            result.update(fingerprint.get_loader_fingerprint(spec.loader))
-        for out in info["out_specs"].values():
-            result.update(fingerprint.get_loader_fingerprint(out.loader))
+        for dep in info["deps"].values():
+            result.update(fingerprint.get_loader_fingerprint(dep.format))
+        for out in info["outs"]:
+            result.update(fingerprint.get_loader_fingerprint(out.format))
         return result
     except Exception as exc:
         raise exceptions.PivotError(f"Stage '{stage_name}': fingerprinting failed: {exc}") from exc

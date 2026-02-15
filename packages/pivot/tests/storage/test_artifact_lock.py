@@ -1,3 +1,4 @@
+# pyright: reportMissingImports=false, reportUnknownMemberType=false, reportUnknownVariableType=false, reportUnknownParameterType=false, reportAny=false, reportExplicitAny=false, reportUnusedCallResult=false
 from __future__ import annotations
 
 import enum
@@ -8,15 +9,11 @@ import threading
 import time
 from typing import Any, Protocol, cast
 
+from pivot import types
+
 
 class _LoadersModule(Protocol):
     def JSON(self) -> object: ...  # noqa: N802
-
-
-class _OutputsModule(Protocol):
-    def Out(self, path: str, loader: object) -> object: ...  # noqa: N802
-
-    def DirectoryOut(self, path: str, loader: object) -> object: ...  # noqa: N802
 
 
 class _LockMode(enum.IntEnum):
@@ -29,14 +26,13 @@ class _ArtifactLockModule(Protocol):
 
     def expand_lock_requests(
         self,
-        deps: list[str],
-        outs: list[object],
+        deps: dict[str, types.ArtifactRef],
+        outs: list[types.ArtifactRef],
         project_root: pathlib.Path,
     ) -> list[dict[str, object]]: ...
 
 
 loaders = cast("_LoadersModule", cast("object", importlib.import_module("pivot.loaders")))
-outputs = cast("_OutputsModule", cast("object", importlib.import_module("pivot.outputs")))
 artifact_lock = cast(
     "_ArtifactLockModule",
     cast("object", importlib.import_module("pivot.storage.artifact_lock")),
@@ -50,93 +46,75 @@ def _helper_lock_map(requests: list[dict[str, object]]) -> dict[str, object]:
 def test_expand_lock_requests_empty() -> None:
     project_root = pathlib.Path("/project")
 
-    result = artifact_lock.expand_lock_requests(list[str](), list[object](), project_root)
+    result = artifact_lock.expand_lock_requests({}, [], project_root)
 
     assert result == list[dict[str, object]]()
 
 
-def test_expand_lock_requests_dep_read_and_ancestors() -> None:
+def test_expand_lock_requests_dep_read_identity_key() -> None:
     project_root = pathlib.Path("/project")
+    dep_ref = types.ArtifactRef(
+        identity=types.ArtifactIdentity("source_stage", "input"),
+        format=loaders.JSON(),
+        python_type=dict,
+        tag=types.ArtifactTag.DATA,
+    )
 
-    result = artifact_lock.expand_lock_requests(["data/input.csv"], list[object](), project_root)
+    result = artifact_lock.expand_lock_requests({"dep": dep_ref}, [], project_root)
 
     lock_map = _helper_lock_map(result)
-    assert lock_map["/project/data/input.csv"] is artifact_lock.LockMode.READ
-    assert lock_map["/project/data/"] is artifact_lock.LockMode.READ
-    assert lock_map["/project/"] is artifact_lock.LockMode.READ
+    assert lock_map["source_stage:input"] is artifact_lock.LockMode.READ
 
 
-def test_expand_lock_requests_out_write_and_ancestor() -> None:
+def test_expand_lock_requests_out_write_identity_key() -> None:
     project_root = pathlib.Path("/project")
-    out = outputs.Out("output.csv", loaders.JSON())
+    out_ref = types.ArtifactRef(
+        identity=types.ArtifactIdentity("train", "metrics"),
+        format=loaders.JSON(),
+        python_type=dict,
+        tag=types.ArtifactTag.METRIC,
+    )
 
-    result = artifact_lock.expand_lock_requests(list[str](), [out], project_root)
+    result = artifact_lock.expand_lock_requests({}, [out_ref], project_root)
 
     lock_map = _helper_lock_map(result)
-    assert lock_map["/project/output.csv"] is artifact_lock.LockMode.WRITE
-    assert lock_map["/project/"] is artifact_lock.LockMode.READ
+    assert lock_map["train:metrics"] is artifact_lock.LockMode.WRITE
 
 
 def test_write_dominates_read() -> None:
     project_root = pathlib.Path("/project")
-    out = outputs.Out("output.csv", loaders.JSON())
-
-    result = artifact_lock.expand_lock_requests(["output.csv"], [out], project_root)
-
-    lock_map = _helper_lock_map(result)
-    assert lock_map["/project/output.csv"] is artifact_lock.LockMode.WRITE
-
-
-def test_directory_out_key_normalized() -> None:
-    project_root = pathlib.Path("/project")
-    out = outputs.DirectoryOut("dir/", loaders.JSON())
-
-    result = artifact_lock.expand_lock_requests(list[str](), [out], project_root)
-
-    lock_map = _helper_lock_map(result)
-    assert lock_map["/project/dir"] is artifact_lock.LockMode.WRITE
-    assert "/project/dir/" not in lock_map
-
-
-def test_expand_directory_and_file_same_key() -> None:
-    project_root = pathlib.Path("/project")
-    out_with_slash = outputs.Out("data/", loaders.JSON())
-    out_without_slash = outputs.Out("data", loaders.JSON())
-
-    result_with_slash = artifact_lock.expand_lock_requests(
-        list[str](), [out_with_slash], project_root
-    )
-    result_without_slash = artifact_lock.expand_lock_requests(
-        list[str](), [out_without_slash], project_root
+    ref = types.ArtifactRef(
+        identity=types.ArtifactIdentity("stage", "output"),
+        format=loaders.JSON(),
+        python_type=dict,
+        tag=types.ArtifactTag.DATA,
     )
 
-    lock_map_with_slash = _helper_lock_map(result_with_slash)
-    lock_map_without_slash = _helper_lock_map(result_without_slash)
+    result = artifact_lock.expand_lock_requests({"output": ref}, [ref], project_root)
 
-    assert "/project/data" in lock_map_with_slash
-    assert "/project/data" in lock_map_without_slash
-    assert lock_map_with_slash["/project/data"] is artifact_lock.LockMode.WRITE
-    assert lock_map_without_slash["/project/data"] is artifact_lock.LockMode.WRITE
+    lock_map = _helper_lock_map(result)
+    assert lock_map["stage:output"] is artifact_lock.LockMode.WRITE
 
 
 def test_deterministic_sort() -> None:
     project_root = pathlib.Path("/project")
-
-    result = artifact_lock.expand_lock_requests(["b.txt", "a.txt"], list[object](), project_root)
-
-    keys = [request["key"] for request in result]
-    assert keys == ["/project/", "/project/a.txt", "/project/b.txt"]
-
-
-def test_stop_at_project_root() -> None:
-    project_root = pathlib.Path("/project")
-
-    result = artifact_lock.expand_lock_requests(
-        ["/project/data/input.csv"], list[object](), project_root
+    dep_a = types.ArtifactRef(
+        identity=types.ArtifactIdentity("a", "a"),
+        format=loaders.JSON(),
+        python_type=dict,
+        tag=types.ArtifactTag.DATA,
+    )
+    dep_b = types.ArtifactRef(
+        identity=types.ArtifactIdentity("b", "b"),
+        format=loaders.JSON(),
+        python_type=dict,
+        tag=types.ArtifactTag.DATA,
     )
 
-    lock_map = _helper_lock_map(result)
-    assert "/" not in lock_map
+    result = artifact_lock.expand_lock_requests({"b": dep_b, "a": dep_a}, [], project_root)
+
+    keys = [request["key"] for request in result]
+    assert keys == ["a:a", "b:b"]
 
 
 # ---------------------------------------------------------------------------

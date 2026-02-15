@@ -9,6 +9,7 @@ __version__ = "0.1.0-dev"
 # Internal modules like BaseOut and show.* are accessible via their full paths
 
 if TYPE_CHECKING:
+    from pivot import merkle as merkle
     from pivot import loaders as loaders
     from pivot import stage_def as stage_def
     from pivot.compose import Pipeline as Pipeline
@@ -26,6 +27,7 @@ if TYPE_CHECKING:
 # Lazy import mapping for runtime: (module_path, attr_name or None for module import)
 _LAZY_IMPORTS: dict[str, tuple[str, str | None]] = {
     "no_fingerprint": ("pivot.decorators", "no_fingerprint"),
+    "merkle": ("pivot.merkle", None),
     "loaders": ("pivot.loaders", None),
     "stage_def": ("pivot.stage_def", None),
     "DirectoryOut": ("pivot.outputs", "DirectoryOut"),

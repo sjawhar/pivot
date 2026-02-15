@@ -24,8 +24,8 @@ if TYPE_CHECKING:
 
 # Key prefixes for different entry types
 _HASH_PREFIX = b"hash:"  # File hash entries
-_GEN_PREFIX = b"gen:"  # Output generation counters
-_DEP_PREFIX = b"dep:"  # Stage dependency generations
+_GEN_PREFIX = b"gen:"  # Output generation counters (identity-based)
+_DEP_PREFIX = b"dep:"  # Stage dependency generations (identity-based)
 _REMOTE_PREFIX = b"remote:"  # Remote index entries
 _REMOTE_URL_PREFIX = b"remote_url:"  # Remote URL tracking
 _RUN_PREFIX = b"run:"  # Run history entries
@@ -67,20 +67,33 @@ def _make_key_file_hash(path: pathlib.Path) -> bytes:
     return _HASH_PREFIX + str(path.resolve()).encode()
 
 
-def _make_key_output_generation(path: pathlib.Path) -> bytes:
-    """Create LMDB key for output generation entry (preserves symlinks for logical path tracking).
-
-    Uses normpath(absolute()), NOT resolve(), because Pivot outputs become symlinks
-    to cache after execution. resolve() would follow these symlinks to cache paths
-    that change per-run. We track the LOGICAL path the user declared.
-    Contrast with _make_key_file_hash() which follows symlinks for physical deduplication.
-    """
-    return _GEN_PREFIX + os.path.normpath(path.absolute()).encode()
+def _split_identity(identity: str) -> tuple[str, str | None]:
+    if ":" in identity:
+        producer, key = identity.split(":", 1)
+        if key == "":
+            return producer, None
+        return producer, key
+    return identity, None
 
 
-def _make_key_dep_generation(stage_name: str, dep_path: str) -> bytes:
-    """Create LMDB key for dependency generation record (stage + dep path)."""
-    return _DEP_PREFIX + f"{stage_name}:{dep_path}".encode()
+def _build_identity(producer: str, key: str | None) -> str:
+    if key is None:
+        return producer
+    return f"{producer}:{key}"
+
+
+def _make_key_output_generation(identity: str) -> bytes:
+    """Create LMDB key for output generation entry (identity-based)."""
+    producer, key = _split_identity(identity)
+    key_part = "" if key is None else key
+    return _GEN_PREFIX + f"{producer}:{key_part}".encode()
+
+
+def _make_key_dep_generation(stage_name: str, identity: str) -> bytes:
+    """Create LMDB key for dependency generation record (stage + identity)."""
+    producer, key = _split_identity(identity)
+    key_part = "" if key is None else key
+    return _DEP_PREFIX + f"{stage_name}:{producer}:{key_part}".encode()
 
 
 class InvalidAstHashKeyError(Exception):
@@ -433,40 +446,41 @@ class StateDB:
     # Generation tracking for O(1) skip detection
     # -------------------------------------------------------------------------
 
-    def get_generation(self, path: pathlib.Path) -> int | None:
-        """Get generation counter for an output path. Returns None if not tracked."""
+    def get_generation(self, identity: str) -> int | None:
+        """Get generation counter for an output identity. Returns None if not tracked."""
         self._check_closed()
-        key = _make_key_output_generation(path)
+        key = _make_key_output_generation(identity)
         with self._env.begin() as txn:
             value = txn.get(key)
         if value is None:
             return None
         return struct.unpack(">Q", value)[0]
 
-    def get_many_generations(self, paths: list[pathlib.Path]) -> dict[pathlib.Path, int | None]:
-        """Batch query for multiple path generations."""
+    def get_many_generations(self, identities: list[str]) -> dict[str, int | None]:
+        """Batch query for multiple identity generations."""
         self._check_closed()
-        if not paths:
+        if not identities:
             return {}
-        results = dict[pathlib.Path, int | None]()
+        results = dict[str, int | None]()
         with self._env.begin() as txn:
-            for path in paths:
-                key = _make_key_output_generation(path)
+            for identity in identities:
+                key = _make_key_output_generation(identity)
                 value = txn.get(key)
                 if value is None:
-                    results[path] = None
+                    results[identity] = None
                 else:
-                    results[path] = struct.unpack(">Q", value)[0]
+                    results[identity] = struct.unpack(">Q", value)[0]
         return results
 
-    def increment_generation(self, path: pathlib.Path) -> int:
+    def increment_generation(self, identity: str) -> int:
         """Increment and return new generation (creates with gen=1 if not exists)."""
         self._check_closed()
         self._check_write_allowed()
-        key = _make_key_output_generation(path)
+        key = _make_key_output_generation(identity)
         if len(key) > _MAX_KEY_SIZE:
             raise PathTooLongError(
-                f"Path too long for generation tracking ({len(key)} bytes, max {_MAX_KEY_SIZE}): {path}"
+                "Generation identity too long for tracking "
+                + f"({len(key)} bytes, max {_MAX_KEY_SIZE}): {identity}"
             )
         try:
             with self._write_transaction(timeout=self._write_timeout) as txn:
@@ -488,9 +502,11 @@ class StateDB:
                 for key, value in cursor:
                     if not key.startswith(prefix):
                         break
-                    dep_path = key[len(prefix) :].decode()
+                    dep_identity = key[len(prefix) :].decode()
+                    producer, dep_key = _split_identity(dep_identity)
+                    dep_identity = _build_identity(producer, dep_key)
                     generation = struct.unpack(">Q", value)[0]
-                    results[dep_path] = generation
+                    results[dep_identity] = generation
         return results if results else None
 
     def record_dep_generations(self, stage_name: str, deps: dict[str, int]) -> None:
@@ -498,11 +514,12 @@ class StateDB:
         self._check_closed()
         self._check_write_allowed()
         prefix = _DEP_PREFIX + stage_name.encode() + b":"
-        for dep_path in deps:
-            key = _make_key_dep_generation(stage_name, dep_path)
+        for identity in deps:
+            key = _make_key_dep_generation(stage_name, identity)
             if len(key) > _MAX_KEY_SIZE:
                 raise PathTooLongError(
-                    f"Dependency path too long for tracking ({len(key)} bytes, max {_MAX_KEY_SIZE}): {dep_path}"
+                    "Dependency identity too long for tracking "
+                    + f"({len(key)} bytes, max {_MAX_KEY_SIZE}): {identity}"
                 )
         try:
             with self._write_transaction(timeout=self._write_timeout) as txn:
@@ -515,8 +532,8 @@ class StateDB:
                         keys_to_delete.append(key)
                 for key in keys_to_delete:
                     txn.delete(key)
-                for dep_path, gen in deps.items():
-                    key = _make_key_dep_generation(stage_name, dep_path)
+                for identity, gen in deps.items():
+                    key = _make_key_dep_generation(stage_name, identity)
                     txn.put(key, struct.pack(">Q", gen))
         except lmdb.MapFullError as e:
             raise DatabaseFullError(_DB_FULL_MSG) from e
@@ -781,20 +798,22 @@ class StateDB:
 
         # Pre-validate key lengths before starting transaction
         if "dep_generations" in deferred:
-            for dep_path in deferred["dep_generations"]:
-                key = _make_key_dep_generation(stage_name, dep_path)
+            for identity in deferred["dep_generations"]:
+                key = _make_key_dep_generation(stage_name, identity)
                 if len(key) > _MAX_KEY_SIZE:
                     raise PathTooLongError(
-                        f"Dependency path too long ({len(key)} bytes, max {_MAX_KEY_SIZE}): {dep_path}"
+                        "Dependency identity too long "
+                        + f"({len(key)} bytes, max {_MAX_KEY_SIZE}): {identity}"
                     )
 
         increment_outputs = "increment_outputs" in deferred and deferred["increment_outputs"]
         if increment_outputs:
-            for path_str in output_paths:
-                key = _make_key_output_generation(pathlib.Path(path_str))
+            for identity in output_paths:
+                key = _make_key_output_generation(identity)
                 if len(key) > _MAX_KEY_SIZE:
                     raise PathTooLongError(
-                        f"Output path too long ({len(key)} bytes, max {_MAX_KEY_SIZE}): {path_str}"
+                        "Output identity too long "
+                        + f"({len(key)} bytes, max {_MAX_KEY_SIZE}): {identity}"
                     )
 
         if "file_hash_entries" in deferred:
@@ -819,15 +838,14 @@ class StateDB:
                             keys_to_delete.append(key)
                     for key in keys_to_delete:
                         txn.delete(key)
-                    for dep_path, gen in deferred["dep_generations"].items():
-                        key = _make_key_dep_generation(stage_name, dep_path)
+                    for identity, gen in deferred["dep_generations"].items():
+                        key = _make_key_dep_generation(stage_name, identity)
                         txn.put(key, struct.pack(">Q", gen))
 
                 # Output generations (increment only when flag is set)
                 if increment_outputs:
-                    for path_str in output_paths:
-                        path = pathlib.Path(path_str)
-                        key = _make_key_output_generation(path)
+                    for identity in output_paths:
+                        key = _make_key_output_generation(identity)
                         value = txn.get(key)
                         current = struct.unpack(">Q", value)[0] if value else 0
                         txn.put(key, struct.pack(">Q", current + 1))

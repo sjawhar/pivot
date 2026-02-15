@@ -10,7 +10,7 @@ import queue
 from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import MagicMock
 
-from pivot import loaders, outputs
+from pivot import loaders, types
 from pivot.executor import worker
 from pivot.storage import artifact_lock, cache
 from pivot.types import OutputMessageKind, StateChange
@@ -19,26 +19,48 @@ if TYPE_CHECKING:
     from pytest_mock import MockerFixture
 
 
-def _helper_write_output() -> None:
-    """Stage that writes an output file."""
-    pathlib.Path("out.csv").write_text("a,b\n1,2\n")
+def _helper_write_output(data: str) -> str:
+    _ = data
+    return "a,b\n1,2\n"
+
+
+def _make_artifact_ref(
+    producer: str,
+    key: str | None,
+    *,
+    tag: types.ArtifactTag,
+    loader: object,
+    python_type: type,
+) -> types.ArtifactRef:
+    return types.ArtifactRef(
+        identity=types.ArtifactIdentity(producer=producer, key=key),
+        format=loader,
+        python_type=python_type,
+        tag=tag,
+    )
 
 
 def _make_stage_info(
     func: Any,
     tmp_path: pathlib.Path,
     *,
-    deps: list[str] | None = None,
-    outs: list[outputs.BaseOut] | None = None,
+    deps: dict[str, types.ArtifactRef] | None = None,
+    outs: list[types.ArtifactRef] | None = None,
 ) -> worker.WorkerStageInfo:
     """Create a WorkerStageInfo with sensible defaults for lock tests."""
-    expanded_outs = [outputs.require_expanded(out) for out in outs] if outs else []
     return {
         "func": func,
         "fingerprint": {"self:test": "abc123"},
-        "deps": deps or [],
+        "deps": deps or {},
         "signature": inspect.signature(func),
-        "outs": expanded_outs,
+        "outs": outs or [],
+        "store_spec": {
+            "kind": "workspace",
+            "cache_dir": str(tmp_path / ".pivot" / "cache"),
+            "project_root": str(tmp_path),
+            "pipeline_name": "test",
+            "input_bindings": {"input": "input.csv"},
+        },
         "params": None,
         "variant": None,
         "overrides": {},
@@ -50,8 +72,6 @@ def _make_stage_info(
         "run_id": "test_run",
         "force": True,
         "no_commit": True,
-        "dep_specs": {},
-        "out_specs": {},
         "params_arg_name": None,
         "project_root": tmp_path,
         "state_dir": tmp_path / ".pivot",
@@ -64,11 +84,17 @@ def test_lock_acquired_with_correct_keys(tmp_path: pathlib.Path, mocker: MockerF
     dep_file.write_text("data")
     (tmp_path / ".pivot").mkdir(parents=True)
 
+    input_ref = _make_artifact_ref(
+        "input", None, tag=types.ArtifactTag.DATA, loader=loaders.Text(), python_type=str
+    )
+    output_ref = _make_artifact_ref(
+        "test_stage", None, tag=types.ArtifactTag.DATA, loader=loaders.Text(), python_type=str
+    )
     stage_info = _make_stage_info(
         _helper_write_output,
         tmp_path,
-        deps=["input.csv"],
-        outs=[outputs.Out("out.csv", loader=loaders.PathOnly())],
+        deps={"data": input_ref},
+        outs=[output_ref],
     )
     cache_dir = tmp_path / ".pivot" / "cache"
     cache_dir.mkdir(parents=True)
@@ -92,7 +118,7 @@ def test_lock_acquired_with_correct_keys(tmp_path: pathlib.Path, mocker: MockerF
     # expand_lock_requests called with correct args
     spy_expand.assert_called_once()
     call_args = spy_expand.call_args
-    assert call_args[0][0] == ["input.csv"], "deps should match"
+    assert call_args[0][0] == {"data": input_ref}, "deps should match"
     assert call_args[0][2] == tmp_path, "project_root should match"
 
     # acquire_many called
@@ -104,11 +130,19 @@ def test_lock_acquired_with_correct_keys(tmp_path: pathlib.Path, mocker: MockerF
 def test_lock_released_on_success(tmp_path: pathlib.Path, mocker: MockerFixture) -> None:
     """Verify lock handle __exit__ is called after successful stage execution."""
     (tmp_path / ".pivot").mkdir(parents=True)
+    (tmp_path / "input.csv").write_text("data")
 
+    input_ref = _make_artifact_ref(
+        "input", None, tag=types.ArtifactTag.DATA, loader=loaders.Text(), python_type=str
+    )
+    output_ref = _make_artifact_ref(
+        "test_stage", None, tag=types.ArtifactTag.DATA, loader=loaders.Text(), python_type=str
+    )
     stage_info = _make_stage_info(
         _helper_write_output,
         tmp_path,
-        outs=[outputs.Out("out.csv", loader=loaders.PathOnly())],
+        deps={"data": input_ref},
+        outs=[output_ref],
     )
     cache_dir = tmp_path / ".pivot" / "cache"
     cache_dir.mkdir(parents=True)
@@ -136,10 +170,13 @@ def test_lock_released_on_failure(tmp_path: pathlib.Path, mocker: MockerFixture)
     def _helper_failing_stage() -> None:
         raise RuntimeError("boom")
 
+    output_ref = _make_artifact_ref(
+        "test_stage", None, tag=types.ArtifactTag.DATA, loader=loaders.Text(), python_type=str
+    )
     stage_info = _make_stage_info(
         _helper_failing_stage,
         tmp_path,
-        outs=[outputs.Out("out.csv", loader=loaders.PathOnly())],
+        outs=[output_ref],
     )
     cache_dir = tmp_path / ".pivot" / "cache"
     cache_dir.mkdir(parents=True)
@@ -163,11 +200,19 @@ def test_lock_released_on_failure(tmp_path: pathlib.Path, mocker: MockerFixture)
 def test_waiting_on_lock_status_message(tmp_path: pathlib.Path, mocker: MockerFixture) -> None:
     """Verify WAITING_ON_LOCK status message is sent via on_status callback."""
     (tmp_path / ".pivot").mkdir(parents=True)
+    (tmp_path / "input.csv").write_text("data")
 
+    input_ref = _make_artifact_ref(
+        "input", None, tag=types.ArtifactTag.DATA, loader=loaders.Text(), python_type=str
+    )
+    output_ref = _make_artifact_ref(
+        "test_stage", None, tag=types.ArtifactTag.DATA, loader=loaders.Text(), python_type=str
+    )
     stage_info = _make_stage_info(
         _helper_write_output,
         tmp_path,
-        outs=[outputs.Out("out.csv", loader=loaders.PathOnly())],
+        deps={"data": input_ref},
+        outs=[output_ref],
     )
     cache_dir = tmp_path / ".pivot" / "cache"
     cache_dir.mkdir(parents=True)

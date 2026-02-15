@@ -1,17 +1,19 @@
+# pyright: reportPrivateUsage=false, reportUnusedFunction=false, reportAny=false, reportExplicitAny=false, reportUnknownParameterType=false, reportUnknownMemberType=false, reportUnknownArgumentType=false, reportUntypedFunctionDecorator=false, reportUnusedParameter=false, reportUnusedCallResult=false
 from __future__ import annotations
 
+import contextlib
 import contextvars
 import dataclasses
 import functools
 import importlib
 import inspect
-import types
+import types as _stdlib_types
 import typing
 from typing import TYPE_CHECKING, Annotated, Any, TypeVar, get_args, get_origin, get_type_hints
 
 from typing_extensions import is_typeddict
 
-from . import outputs, project, registry, stage_def
+from . import project, registry, stage_def, types
 from .pipeline import pipeline as pipeline_mod
 
 if TYPE_CHECKING:
@@ -85,6 +87,7 @@ class Pipeline:
     _call_counts: dict[str, int]
     _validation_errors: list[str]
     _token: contextvars.Token[Pipeline | None] | None
+    _variant_stack: list[str]
 
     def __init__(self, name: str, *, root: pathlib.Path | None = None) -> None:
         self._name = name
@@ -93,6 +96,7 @@ class Pipeline:
         self._call_counts = {}
         self._validation_errors = []
         self._token = None
+        self._variant_stack = []
 
         if root is not None:
             self._root = root.resolve()
@@ -161,6 +165,19 @@ class Pipeline:
             python_type=t or object,
         )
 
+    @contextlib.contextmanager
+    def variant(self, name: str) -> typing.Generator[None, None, None]:
+        """Context manager for registering stages with a variant suffix.
+
+        All stages registered within the block get @{name} appended to their stage name.
+        Nesting is supported: variant("a") inside variant("b") → @b@a suffix.
+        """
+        self._variant_stack.append(name)
+        try:
+            yield
+        finally:
+            self._variant_stack.pop()
+
     def _record_stage(
         self,
         original_func: Callable[..., object],
@@ -174,6 +191,10 @@ class Pipeline:
         count = self._call_counts.get(func_name, 0)
         self._call_counts[func_name] = count + 1
         stage_name = func_name if count == 0 else f"{func_name}@{count}"
+
+        if self._variant_stack:
+            for variant in self._variant_stack:
+                stage_name = f"{stage_name}@{variant}"
 
         sig = inspect.signature(original_func)
         try:
@@ -197,6 +218,8 @@ class Pipeline:
             elif isinstance(value, stage_def.StageParams):
                 params = value
 
+        variant_str = "@".join(self._variant_stack) if self._variant_stack else None
+
         node = _StageNode(
             func=wrapper,
             original_func=original_func,
@@ -205,6 +228,7 @@ class Pipeline:
             input_handles=input_handles,
             output_specs=output_specs,
             call_index=count,
+            variant=variant_str,
         )
         self._stages.append(node)
 
@@ -235,83 +259,72 @@ class Pipeline:
     def build(self) -> pipeline_mod.Pipeline:
         legacy = pipeline_mod.Pipeline(self._name, root=self._root)
 
-        path_map = dict[tuple[int, str | None], str]()
-        for node in self._stages:
-            is_single_output = len(node.output_specs) == 1
-            for output_spec in node.output_specs:
-                path = _generate_artifact_path(
-                    self._name,
-                    node.name,
-                    output_spec,
-                    is_single_output,
-                )
-                output_key = None if is_single_output else output_spec.key
-                path_map[(id(node), output_key)] = path
-
         for node in self._stages:
             func = node.original_func
             assert not hasattr(func, "_is_stage")
 
-            deps = dict[str, outputs.PathType]()
-            dep_specs = dict[str, stage_def.FuncDepSpec]()
-            deps_paths = list[str]()
+            deps = dict[str, types.ArtifactRef]()
 
             for param_name, handle in node.input_handles.items():
                 if isinstance(handle._source, _InputNode):
-                    path = handle._source.path
-                    loader = handle._source.format
+                    identity = types.ArtifactIdentity(producer=handle._source.name, key=None)
+                    types.validate_artifact_identity(identity)
+                    deps[param_name] = types.ArtifactRef(
+                        identity=identity,
+                        format=handle._source.format,
+                        python_type=handle._python_type,
+                        tag=types.ArtifactTag.DATA,
+                    )
+                    continue
+
+                source = handle._source
+                if len(source.output_specs) == 1:
+                    output_spec = source.output_specs[0]
+                    output_key = None
                 else:
-                    source = typing.cast("_StageNode", handle._source)
-                    if len(source.output_specs) == 1:
-                        output_spec = source.output_specs[0]
-                    else:
-                        output_spec = next(
-                            spec for spec in source.output_specs if spec.key == handle._output_key
-                        )
-                    loader = output_spec.format
+                    output_spec = next(
+                        spec for spec in source.output_specs if spec.key == handle._output_key
+                    )
+                    output_key = output_spec.key
 
-                    local_key = (id(source), handle._output_key)
-                    if local_key in path_map:
-                        path = path_map[local_key]
-                    else:
-                        is_single = len(source.output_specs) == 1
-                        path = _generate_artifact_path(
-                            handle._pipeline._name,
-                            source.name,
-                            output_spec,
-                            is_single,
-                        )
+                if isinstance(output_spec.tag, _MetricTag):
+                    dep_tag = types.ArtifactTag.METRIC
+                elif isinstance(output_spec.tag, _PlotTag):
+                    dep_tag = types.ArtifactTag.PLOT
+                else:
+                    dep_tag = types.ArtifactTag.DATA
 
-                deps[param_name] = path
-                deps_paths.append(path)
-                dep_specs[param_name] = stage_def.FuncDepSpec(
-                    path=path,
-                    loader=typing.cast("loaders_mod.Reader[object]", loader),
-                    creates_dep_edge=True,
+                identity = types.ArtifactIdentity(producer=source.name, key=output_key)
+                types.validate_artifact_identity(identity)
+                deps[param_name] = types.ArtifactRef(
+                    identity=identity,
+                    format=output_spec.format,
+                    python_type=handle._python_type,
+                    tag=dep_tag,
                 )
 
-            outs = list[outputs.ExpandedOut]()
-            outs_paths = list[str]()
-            out_specs = dict[str, outputs.BaseOut]()
+            outs = list[types.ArtifactRef]()
 
             is_single_output = len(node.output_specs) == 1
             for output_spec in node.output_specs:
-                out_path = _generate_artifact_path(
-                    self._name,
-                    node.name,
-                    output_spec,
-                    is_single_output,
-                )
+                output_key = None if is_single_output else output_spec.key
                 if isinstance(output_spec.tag, _MetricTag):
-                    out = outputs.Metric(out_path, loader=output_spec.format)
+                    out_tag = types.ArtifactTag.METRIC
                 elif isinstance(output_spec.tag, _PlotTag):
-                    out = outputs.Plot(out_path, loader=output_spec.format)
+                    out_tag = types.ArtifactTag.PLOT
                 else:
-                    out = outputs.Out(out_path, loader=output_spec.format)
+                    out_tag = types.ArtifactTag.DATA
 
-                outs.append(outputs.require_expanded(out))
-                outs_paths.append(out_path)
-                out_specs[output_spec.key] = out
+                identity = types.ArtifactIdentity(producer=node.name, key=output_key)
+                types.validate_artifact_identity(identity)
+                outs.append(
+                    types.ArtifactRef(
+                        identity=identity,
+                        format=output_spec.format,
+                        python_type=output_spec.python_type,
+                        tag=out_tag,
+                    )
+                )
 
             params_arg_name: str | None = None
             hints = get_type_hints(func, include_extras=True)
@@ -322,7 +335,7 @@ class Pipeline:
                 if get_origin(base_hint) is Annotated:
                     base_hint = get_args(base_hint)[0]
                 origin = get_origin(base_hint)
-                if origin is types.UnionType or origin is typing.Union:  # pyright: ignore[reportDeprecated] - runtime identity check
+                if origin is _stdlib_types.UnionType or origin is typing.Union:  # pyright: ignore[reportDeprecated] - runtime identity check
                     for union_arg in get_args(base_hint):
                         if isinstance(union_arg, type) and issubclass(
                             union_arg, stage_def.StageParams
@@ -342,16 +355,12 @@ class Pipeline:
                 func=func,
                 name=node.name,
                 deps=deps,
-                deps_paths=deps_paths,
                 outs=outs,
-                outs_paths=outs_paths,
                 params=node.params,
                 mutex=[],
-                variant=None,
+                variant=node.variant,
                 signature=inspect.signature(func),
                 fingerprint=None,
-                dep_specs=dep_specs,
-                out_specs=out_specs,
                 params_arg_name=params_arg_name,
                 state_dir=self._root / ".pivot",
             )
@@ -558,7 +567,7 @@ def stage[**P, R](func: Callable[P, R]) -> Callable[P, R]:
         pipeline = _active_pipeline.get()
         if pipeline is None:
             return func(*args, **kwargs)
-        return pipeline._record_stage(func, wrapper, _get_output_specs(), args, kwargs)  # pyright: ignore[reportAttributeAccessIssue] - _record_stage will be added in Task 1.3
+        return pipeline._record_stage(func, wrapper, _get_output_specs(), args, kwargs)
 
     wrapper._is_stage = True  # pyright: ignore[reportAttributeAccessIssue] - dynamic attr for stage detection
     wrapper._original_func = func  # pyright: ignore[reportAttributeAccessIssue] - for bridge to unwrap
@@ -582,6 +591,7 @@ class _StageNode:
     input_handles: dict[str, ArtifactHandle]
     output_specs: list[_OutputSpec]
     call_index: int
+    variant: str | None = None
 
 
 @dataclasses.dataclass

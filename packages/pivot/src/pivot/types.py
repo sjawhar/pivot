@@ -1,11 +1,23 @@
-# pyright: reportImplicitRelativeImport=false
+# pyright: reportImplicitRelativeImport=false, reportExplicitAny=false
 from __future__ import annotations
 
+import dataclasses
 import enum
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, Literal, NotRequired, Required, TypedDict, TypeGuard, cast
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Literal,
+    NamedTuple,
+    NotRequired,
+    Required,
+    TypedDict,
+    TypeGuard,
+    cast,
+)
 
 if TYPE_CHECKING:
+    from pivot import loaders as loaders_module
     from pivot.run_history import RunCacheEntry
 
 # =============================================================================
@@ -163,6 +175,7 @@ class StageResult(TypedDict):
     output_lines: list[tuple[str, bool]]
     metrics: NotRequired[list[tuple[str, float]]]  # (name, duration_ms) for cross-process
     deferred_writes: NotRequired[DeferredWrites]
+    accessed_dep_keys: NotRequired[dict[str, set[str]]]
 
 
 # =============================================================================
@@ -245,11 +258,57 @@ class OutputFormat(enum.StrEnum):
 #
 
 
+class ArtifactIdentity(NamedTuple):
+    producer: str
+    key: str | None
+
+
+class ArtifactTag(enum.StrEnum):
+    DATA = "data"
+    METRIC = "metric"
+    PLOT = "plot"
+    DIRECTORY = "directory"
+
+
+@dataclasses.dataclass(eq=False)
+class ArtifactRef:
+    identity: ArtifactIdentity
+    format: (
+        "loaders_module.Reader[Any]"
+        | "loaders_module.Writer[Any]"
+        | "loaders_module.Loader[Any, Any]"
+    )
+    python_type: type
+    tag: ArtifactTag
+
+
+def validate_artifact_identity(identity: ArtifactIdentity) -> None:
+    if identity.producer.strip() == "":
+        raise ValueError("Artifact producer cannot be empty")
+    if identity.producer in {".", ".."}:
+        raise ValueError(f"Artifact producer cannot be a traversal segment: {identity.producer!r}")
+    if "/" in identity.producer or "\\" in identity.producer:
+        raise ValueError(f"Artifact producer cannot contain path separators: {identity.producer!r}")
+
+    if identity.key is None:
+        return
+    if identity.key.strip() == "":
+        raise ValueError("Artifact key cannot be empty")
+    if identity.key in {".", ".."}:
+        raise ValueError(f"Artifact key cannot be a traversal segment: {identity.key!r}")
+    if "/" in identity.key or "\\" in identity.key:
+        raise ValueError(f"Artifact key cannot contain path separators: {identity.key!r}")
+
+
 class DepEntry(TypedDict):
     """Entry in deps list for lock file storage."""
 
-    path: str
+    producer: str
+    key: str | None
     hash: str
+    display: NotRequired[str]
+    accessed_keys: NotRequired[list[str]]
+    accessed_hashes: NotRequired[dict[str, str]]
     size: NotRequired[int]
     manifest: NotRequired[list[DirManifestEntry]]
 
@@ -257,8 +316,10 @@ class DepEntry(TypedDict):
 class OutEntry(TypedDict):
     """Entry in outs list for lock file storage."""
 
-    path: str
+    key: str | None
     hash: str
+    tag: str
+    display: NotRequired[str]
     size: NotRequired[int]
     manifest: NotRequired[list[DirManifestEntry]]
 
@@ -272,6 +333,7 @@ class StorageLockData(TypedDict):
     params: dict[str, Any]
     deps: list[DepEntry]
     outs: list[OutEntry]
+    merkle_id: NotRequired[str]
 
 
 class LockData(TypedDict):
@@ -281,6 +343,7 @@ class LockData(TypedDict):
     params: dict[str, Any]
     dep_hashes: dict[str, HashInfo]
     output_hashes: dict[str, HashInfo]
+    merkle_id: NotRequired[str | None]
 
 
 class OutputMessageKind(enum.StrEnum):
@@ -348,7 +411,7 @@ class ParamChange(TypedDict):
 class DepChange(TypedDict):
     """Change info for an input dependency file."""
 
-    path: str
+    identity: str
     old_hash: str | None
     new_hash: str | None
     change_type: ChangeType
