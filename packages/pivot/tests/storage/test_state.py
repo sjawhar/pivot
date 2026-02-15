@@ -756,7 +756,7 @@ def test_readonly_blocks_save_many(tmp_path: pathlib.Path) -> None:
 def test_readonly_blocks_increment_generation(tmp_path: pathlib.Path) -> None:
     """Readonly mode blocks increment_generation operation."""
     db_path = tmp_path / "state.db"
-    test_file = tmp_path / "output.txt"
+    tmp_path / "output.txt"
 
     with state.StateDB(db_path) as db:
         pass  # Just create
@@ -1719,7 +1719,7 @@ def test_clear_ast_hashes_only_deletes_fp_prefix(tmp_path: pathlib.Path) -> None
     test_file = tmp_path / "file.txt"
     test_file.write_text("content")
     file_stat = test_file.stat()
-    output_path = tmp_path / "output.csv"
+    output_identity = "stage:output"
 
     with state.StateDB(db_path) as db:
         # Add various entry types
@@ -1727,8 +1727,8 @@ def test_clear_ast_hashes_only_deletes_fp_prefix(tmp_path: pathlib.Path) -> None
             [("src/a.py", 1000, 100, 1, "func_a", _TEST_PY_VERSION, _TEST_SCHEMA_VERSION, "hash_a")]
         )
         db.save(test_file, file_stat, "file_hash")
-        db.increment_generation(output_path)
-        db.record_dep_generations("my_stage", {"/dep.csv": 5})
+        db.increment_generation(output_identity)
+        db.record_dep_generations("my_stage", {"upstream:out": 5})
 
         # Clear only AST hashes
         deleted = db.clear_ast_hashes()
@@ -1736,8 +1736,8 @@ def test_clear_ast_hashes_only_deletes_fp_prefix(tmp_path: pathlib.Path) -> None
 
         # Verify other entries are untouched
         assert db.get(test_file, file_stat) == "file_hash"
-        assert db.get_generation(output_path) == 1
-        assert db.get_dep_generations("my_stage") == {"/dep.csv": 5}
+        assert db.get_generation(output_identity) == 1
+        assert db.get_dep_generations("my_stage") == {"upstream:out": 5}
 
 
 def test_clear_ast_hashes_readonly_blocked(tmp_path: pathlib.Path) -> None:
@@ -1896,15 +1896,15 @@ def test_apply_deferred_writes_skips_output_increment_when_flag_false(
     (as opposed to the key being absent entirely). Both should skip incrementing.
     """
     db_path = tmp_path / "state.db"
-    output1 = tmp_path / "output1.csv"
-    deferred: DeferredWrites = {"increment_outputs": False, "dep_generations": {"/dep.csv": 5}}
+    output1 = "stage:output1"
+    deferred: DeferredWrites = {"increment_outputs": False, "dep_generations": {"upstream:out": 5}}
 
     with state.StateDB(db_path) as db:
-        db.apply_deferred_writes("stage", [str(output1)], deferred)
+        db.apply_deferred_writes("stage", [output1], deferred)
         assert db.get_generation(output1) is None, (
             "Output generation should not be incremented when flag is explicitly False"
         )
-        assert db.get_dep_generations("stage") == {"/dep.csv": 5}
+        assert db.get_dep_generations("stage") == {"upstream:out": 5}
 
 
 def test_apply_deferred_writes_empty_output_paths_with_flag_true(

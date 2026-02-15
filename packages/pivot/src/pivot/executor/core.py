@@ -12,14 +12,15 @@ from typing import TYPE_CHECKING, Literal, TypedDict, cast
 import loky
 
 from pivot import config, discovery, exceptions, outputs, parameters, registry
-from pivot.executor import worker
-from pivot.storage import cache, lock, store as store_mod, track
+from pivot.storage import cache, lock, track
 from pivot.storage import state as state_mod
+from pivot.storage import store as store_mod
 from pivot.types import OnError, StageResult, StageStatus
 
 if TYPE_CHECKING:
     import concurrent.futures
 
+    from pivot.executor import worker
     from pivot.pipeline.pipeline import Pipeline
     from pivot.registry import RegistryStageInfo
 

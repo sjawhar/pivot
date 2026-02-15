@@ -14,9 +14,10 @@ from __future__ import annotations
 import shutil
 from typing import TYPE_CHECKING
 
-from pivot import executor, loaders, outputs, stage_def
+from pivot import executor, loaders, stage_def
 from pivot.executor import worker
 from pivot.storage import cache, lock, state
+from pivot.types import ArtifactIdentity, ArtifactRef, ArtifactTag, identity_key
 
 if TYPE_CHECKING:
     import inspect
@@ -44,38 +45,56 @@ def _helper_write_output(path: pathlib.Path) -> None:
     path.write_text("output")
 
 
+def _input_ref(name: str) -> ArtifactRef:
+    return ArtifactRef(
+        identity=ArtifactIdentity(name, None),
+        format=loaders.Text(),
+        python_type=str,
+        tag=ArtifactTag.DATA,
+    )
+
+
+def _output_ref(stage_name: str) -> ArtifactRef:
+    return ArtifactRef(
+        identity=ArtifactIdentity(stage_name, None),
+        format=loaders.Text(),
+        python_type=str,
+        tag=ArtifactTag.DATA,
+    )
+
+
 def _make_stage_info(
     func: Callable[..., object],
     tmp_path: pathlib.Path,
     *,
     fingerprint: dict[str, str] | None = None,
-    deps: list[str] | None = None,
-    outs: list[outputs.BaseOut] | None = None,
+    deps: dict[str, ArtifactRef] | None = None,
+    outs: list[ArtifactRef] | None = None,
     params: stage_def.StageParams | None = None,
     signature: inspect.Signature | None = None,
     checkout_modes: list[cache.CheckoutMode] | None = None,
     run_id: str = "test_run",
     force: bool = False,
     no_commit: bool = False,
-    dep_specs: dict[str, stage_def.FuncDepSpec] | None = None,
-    out_specs: dict[str, outputs.BaseOut] | None = None,
     params_arg_name: str | None = None,
 ) -> WorkerStageInfo:
     """Create a WorkerStageInfo with sensible defaults for testing."""
-    expanded_outs = [outputs.require_expanded(out) for out in outs] if outs else []
-    expanded_out_specs = out_specs or {}
+    deps = deps or {}
+    outs = outs or []
     return {
         "func": func,
         "fingerprint": fingerprint or {"self:test": "abc123"},
-        "deps": deps or [],
+        "deps": deps,
         "signature": signature,
-        "outs": expanded_outs,
+        "outs": outs,
         "store_spec": {
             "kind": "workspace",
             "cache_dir": str(tmp_path / ".pivot" / "cache"),
             "project_root": str(tmp_path),
             "pipeline_name": "test",
-            "input_bindings": {},
+            "input_bindings": {
+                ref.identity.producer: ref.identity.producer for ref in deps.values()
+            },
         },
         "params": params,
         "variant": None,
@@ -85,8 +104,6 @@ def _make_stage_info(
         "run_id": run_id,
         "force": force,
         "no_commit": no_commit,
-        "dep_specs": dep_specs or {},
-        "out_specs": expanded_out_specs,
         "params_arg_name": params_arg_name,
         "project_root": tmp_path,
         "state_dir": tmp_path / ".pivot",
@@ -109,8 +126,7 @@ def _apply_deferred_writes(
     deferred = result["deferred_writes"]
     state_dir = stage_info["state_dir"]
 
-    # Compute output paths (same logic as coordinator)
-    out_paths = [str(out.path) for out in stage_info["outs"]]
+    out_paths = [identity_key(out.identity) for out in stage_info["outs"]]
 
     with state.StateDB(state_dir / "state.db") as state_db:
         state_db.apply_deferred_writes(stage_name, out_paths, deferred)
@@ -129,36 +145,33 @@ def test_generation_skip_with_pivot_produced_deps(
 ) -> None:
     """Stage with all Pivot-produced deps skips via generation (no hashing).
 
-    Two-stage pipeline: step1 produces intermediate.txt, step2 consumes it.
+    Two-stage pipeline: step1 produces output, step2 consumes it.
     After both run and deferred writes are applied, step2's second run should
     skip via generation check (Tier 1) without hashing any files.
     """
     (tmp_path / "input.txt").write_text("data")
 
-    def step1_func() -> None:
-        data = (tmp_path / "input.txt").read_text()
-        (tmp_path / "intermediate.txt").write_text(data.upper())
+    def step1_func(_0: str) -> str:
+        return _0.upper()
 
-    def step2_func() -> None:
-        data = (tmp_path / "intermediate.txt").read_text()
-        (tmp_path / "final.txt").write_text(f"Final: {data}")
-
-    step1_out = outputs.Out(str(tmp_path / "intermediate.txt"), loader=loaders.PathOnly())
-    step2_out = outputs.Out(str(tmp_path / "final.txt"), loader=loaders.PathOnly())
+    def step2_func(_0: str) -> str:
+        output = f"Final: {_0}"
+        (tmp_path / "final.txt").write_text(output)
+        return output
 
     step1_info = _make_stage_info(
         step1_func,
         tmp_path,
         fingerprint={"self:step1": "fp1"},
-        deps=["input.txt"],
-        outs=[step1_out],
+        deps={"_0": _input_ref("input.txt")},
+        outs=[_output_ref("step1")],
     )
     step2_info = _make_stage_info(
         step2_func,
         tmp_path,
         fingerprint={"self:step2": "fp2"},
-        deps=["intermediate.txt"],
-        outs=[step2_out],
+        deps={"_0": _output_ref("step1")},
+        outs=[_output_ref("step2")],
     )
 
     # First run: both stages execute
@@ -211,17 +224,18 @@ def test_external_dep_falls_through_to_hash_check(
     """
     (tmp_path / "external_data.txt").write_text("external content")
 
-    def stage_func() -> None:
+    def stage_func(_0: str) -> str:
         data = (tmp_path / "external_data.txt").read_text()
-        (tmp_path / "output.txt").write_text(data.upper())
+        output = data.upper()
+        (tmp_path / "output.txt").write_text(output)
+        return output
 
-    out = outputs.Out(str(tmp_path / "output.txt"), loader=loaders.PathOnly())
     stage_info = _make_stage_info(
         stage_func,
         tmp_path,
         fingerprint={"self:stage": "fp1"},
-        deps=["external_data.txt"],
-        outs=[out],
+        deps={"_0": _input_ref("external_data.txt")},
+        outs=[_output_ref("test_stage")],
     )
 
     # First run
@@ -261,19 +275,20 @@ def test_cleared_statedb_degrades_to_lock_comparison(
     """
     (tmp_path / "input.txt").write_text("data")
 
-    def stage_func() -> None:
-        (tmp_path / "output.txt").write_text("result")
+    def stage_func(_0: str) -> str:
+        result = "result"
+        (tmp_path / "output.txt").write_text(result)
+        return result
 
-    out = outputs.Out(str(tmp_path / "output.txt"), loader=loaders.PathOnly())
     stage_info = _make_stage_info(
         stage_func,
         tmp_path,
         fingerprint={"self:stage": "fp1"},
-        deps=["input.txt"],
-        outs=[out],
+        deps={"_0": _input_ref("input.txt")},
+        outs=[_output_ref("test_stage")],
     )
 
-    # First run - creates lock file and populates StateDB
+    # First run
     result1 = executor.execute_stage("test_stage", stage_info, worker_env, output_queue)
     assert result1["status"] == "ran"
     _apply_deferred_writes("test_stage", stage_info, result1)
@@ -314,18 +329,19 @@ def test_missing_lock_file_triggers_full_run(
     counter_file = tmp_path / "run_counter.txt"
     counter_file.write_text("0")
 
-    def stage_func() -> None:
+    def stage_func(_0: str) -> str:
         count = int(counter_file.read_text())
         counter_file.write_text(str(count + 1))
-        (tmp_path / "output.txt").write_text("done")
+        result = "done"
+        (tmp_path / "output.txt").write_text(result)
+        return result
 
-    out = outputs.Out(str(tmp_path / "output.txt"), loader=loaders.PathOnly())
     stage_info = _make_stage_info(
         stage_func,
         tmp_path,
         fingerprint={"self:stage": "fp1"},
-        deps=["input.txt"],
-        outs=[out],
+        deps={"_0": _input_ref("input.txt")},
+        outs=[_output_ref("test_stage")],
     )
 
     # Verify no lock file exists
@@ -371,30 +387,31 @@ def test_generation_invalidation_propagates(
     """
     (tmp_path / "input.txt").write_text("original")
 
-    def step1_func() -> None:
+    def step1_func(_0: str) -> str:
         data = (tmp_path / "input.txt").read_text()
-        (tmp_path / "intermediate.txt").write_text(data.upper())
+        output = data.upper()
+        (tmp_path / "intermediate.txt").write_text(output)
+        return output
 
-    def step2_func() -> None:
+    def step2_func(_0: str) -> str:
         data = (tmp_path / "intermediate.txt").read_text()
-        (tmp_path / "final.txt").write_text(f"Final: {data}")
-
-    step1_out = outputs.Out(str(tmp_path / "intermediate.txt"), loader=loaders.PathOnly())
-    step2_out = outputs.Out(str(tmp_path / "final.txt"), loader=loaders.PathOnly())
+        output = f"Final: {data}"
+        (tmp_path / "final.txt").write_text(output)
+        return output
 
     step1_info = _make_stage_info(
         step1_func,
         tmp_path,
         fingerprint={"self:step1": "fp1"},
-        deps=["input.txt"],
-        outs=[step1_out],
+        deps={"_0": _input_ref("input.txt")},
+        outs=[_output_ref("step1")],
     )
     step2_info = _make_stage_info(
         step2_func,
         tmp_path,
         fingerprint={"self:step2": "fp2"},
-        deps=["intermediate.txt"],
-        outs=[step2_out],
+        deps={"_0": _input_ref("intermediate.txt")},
+        outs=[_output_ref("step2")],
     )
 
     # First run: both stages execute
@@ -440,16 +457,17 @@ def test_deferred_file_hash_writeback(
     """
     (tmp_path / "input.txt").write_text("data")
 
-    def stage_func() -> None:
-        (tmp_path / "output.txt").write_text("output")
+    def stage_func(_0: str) -> str:
+        result = "output"
+        (tmp_path / "output.txt").write_text(result)
+        return result
 
-    out = outputs.Out(str(tmp_path / "output.txt"), loader=loaders.PathOnly())
     stage_info = _make_stage_info(
         stage_func,
         tmp_path,
         fingerprint={"self:stage": "fp1"},
-        deps=["input.txt"],
-        outs=[out],
+        deps={"_0": _input_ref("input.txt")},
+        outs=[_output_ref("test_stage")],
     )
 
     result = executor.execute_stage("test_stage", stage_info, worker_env, output_queue)

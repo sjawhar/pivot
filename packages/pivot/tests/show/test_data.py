@@ -1329,8 +1329,10 @@ code_manifest:
 params: {}
 deps: []
 outs:
-  - path: output.csv
+  - key: null
     hash: deadbeef
+    tag: data
+    path: output.csv
 """
 
     def mock_read_files(paths: list[str]) -> dict[str, str | None]:

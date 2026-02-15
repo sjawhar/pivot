@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, cast
 
 from pivot import loaders, types
 from pivot.executor import worker
@@ -9,6 +9,7 @@ if TYPE_CHECKING:
     import multiprocessing as mp
     import pathlib
 
+    from pivot.storage import store as store_mod
     from pivot.types import OutputMessage
 
 
@@ -17,7 +18,7 @@ def _make_artifact_ref(
     key: str | None,
     *,
     tag: types.ArtifactTag,
-    loader: object,
+    loader: loaders.Reader[object] | loaders.Writer[object] | loaders.Loader[object, object],
     python_type: type,
 ) -> types.ArtifactRef:
     return types.ArtifactRef(
@@ -42,7 +43,7 @@ def _make_worker_stage_info(
     *,
     deps: dict[str, types.ArtifactRef],
     outs: list[types.ArtifactRef],
-    store_spec: dict[str, str | dict[str, str]],
+    store_spec: store_mod.StoreSpec,
 ) -> worker.WorkerStageInfo:
     state_dir = tmp_path / ".pivot"
     state_dir.mkdir(exist_ok=True)
@@ -101,13 +102,19 @@ def test_execute_stage_uses_store_spec_for_io(
             python_type=str,
         )
     ]
-    store_spec = {
-        "kind": "workspace",
-        "cache_dir": str(worker_env),
-        "project_root": str(tmp_path),
-        "pipeline_name": "pipe",
-        "input_bindings": {"input": "input.txt"},
-    }
+    store_spec = cast(
+        "store_mod.StoreSpec",
+        cast(
+            "object",
+            {
+                "kind": "workspace",
+                "cache_dir": str(worker_env),
+                "project_root": str(tmp_path),
+                "pipeline_name": "pipe",
+                "input_bindings": {"input": "input.txt"},
+            },
+        ),
+    )
 
     stage_info = _make_worker_stage_info(
         _stage_uppercase,
@@ -142,13 +149,19 @@ def test_execute_stage_records_accessed_group_keys(
             python_type=dict,
         )
     }
-    store_spec = {
-        "kind": "workspace",
-        "cache_dir": str(worker_env),
-        "project_root": str(tmp_path),
-        "pipeline_name": "pipe",
-        "input_bindings": {},
-    }
+    store_spec = cast(
+        "store_mod.StoreSpec",
+        cast(
+            "object",
+            {
+                "kind": "workspace",
+                "cache_dir": str(worker_env),
+                "project_root": str(tmp_path),
+                "pipeline_name": "pipe",
+                "input_bindings": {},
+            },
+        ),
+    )
 
     stage_info = _make_worker_stage_info(
         _stage_access_group,
@@ -161,4 +174,5 @@ def test_execute_stage_records_accessed_group_keys(
     result = worker.execute_stage("stage", stage_info, worker_env, output_queue)
 
     assert result["status"] == types.StageStatus.RAN
+    assert "accessed_dep_keys" in result
     assert result["accessed_dep_keys"] == {"group": {"a.txt"}}, "Should record accessed group keys"

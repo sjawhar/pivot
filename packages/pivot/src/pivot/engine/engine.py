@@ -14,13 +14,22 @@ import sys
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Self, cast
+from typing import TYPE_CHECKING, Any, Self
 
 import anyio
 import anyio.from_thread
 import anyio.to_thread
 
-from pivot import config, exceptions, fingerprint, merkle, outputs, parameters, project, registry
+from pivot import (
+    config,
+    exceptions,
+    fingerprint,
+    merkle,
+    parameters,
+    project,
+    registry,
+    types,
+)
 from pivot.engine import agent_rpc
 from pivot.engine import graph as engine_graph
 from pivot.engine import scheduler as engine_scheduler
@@ -52,6 +61,7 @@ from pivot.executor import worker
 from pivot.storage import state as state_mod
 from pivot.storage import store as store_mod
 from pivot.types import (
+    ArtifactTag,
     CompletionType,
     DepEntry,
     HashInfo,
@@ -59,7 +69,6 @@ from pivot.types import (
     OnError,
     OutputMessage,
     OutputMessageKind,
-    ArtifactTag,
     StageExplanation,
     StageResult,
     StageStatus,
@@ -94,15 +103,6 @@ _SINK_HANDLE_TIMEOUT_S = 5.0
 _SINK_BACKOFF_BASE_S = 1.0
 _SINK_BACKOFF_MAX_S = 1800.0
 _SINK_SHUTDOWN_GRACE_S = 0.05
-
-
-def _split_identity(identity: str) -> tuple[str, str | None]:
-    if ":" in identity:
-        producer, key = identity.split(":", 1)
-        if key == "":
-            return producer, None
-        return producer, key
-    return identity, None
 
 
 class _RunState(Enum):
@@ -989,7 +989,8 @@ class Engine:
                                     ):
                                         stage_info = self._get_stage(stage_name)
                                         output_paths = [
-                                            str(out.identity) for out in stage_info["outs"]
+                                            types.identity_key(out.identity)
+                                            for out in stage_info["outs"]
                                         ]
                                         stage_state_dir = registry.get_stage_state_dir(
                                             stage_info, default_state_dir
@@ -1388,7 +1389,6 @@ class Engine:
                         stage_name,
                         stage_info,
                         overrides,
-                        checkout_modes,
                         force,
                         cache_dir,
                         state_dir,
@@ -1464,7 +1464,6 @@ class Engine:
         stage_name: str,
         stage_info: RegistryStageInfo,
         overrides: parameters.ParamsOverrides,
-        checkout_modes: list[CheckoutMode],
         force: bool,
         cache_dir: pathlib.Path,
         state_dir: pathlib.Path,
@@ -1513,9 +1512,10 @@ class Engine:
         except Exception:
             return False
 
-        out_paths = [str(ref.identity) for ref in stage_info["outs"]]
+        out_paths = [types.identity_key(ref.identity) for ref in stage_info["outs"]]
         out_specs = [
-            (str(ref.identity), ref.tag != ArtifactTag.METRIC) for ref in stage_info["outs"]
+            (types.identity_key(ref.identity), ref.tag != ArtifactTag.METRIC)
+            for ref in stage_info["outs"]
         ]
 
         # Acquire artifact locks (READ on deps, WRITE on outs) to prevent
@@ -1541,8 +1541,6 @@ class Engine:
                 current_params,
                 out_paths,
                 out_specs,
-                checkout_modes,
-                files_cache_dir,
                 store,
                 stage_state_dir,
                 state_dir,
@@ -1562,8 +1560,6 @@ class Engine:
         current_params: dict[str, Any],
         out_paths: list[str],
         out_specs: list[tuple[str, bool]],
-        checkout_modes: list[CheckoutMode],
-        files_cache_dir: pathlib.Path,
         store: store_mod.Store,
         stage_state_dir: pathlib.Path,
         state_dir: pathlib.Path,
@@ -1576,6 +1572,15 @@ class Engine:
         from pivot import skip as skip_mod
 
         deps = stage_info["deps"]
+
+        def _outputs_exist() -> bool:
+            if not isinstance(store, store_mod.WorkspaceStore):
+                return False
+            for out_ref in stage_info["outs"]:
+                out_path = store._resolve_output_path(out_ref)  # pyright: ignore[reportPrivateUsage]
+                if not (out_path.exists() or out_path.is_symlink()):
+                    return False
+            return True
 
         def _get_skip_state_db() -> state_mod.StateDB:
             state_db_path = stage_state_dir / "state.db"
@@ -1601,23 +1606,17 @@ class Engine:
                 if not can_skip:
                     return False, None
                 deps_list = [
-                    DepEntry(producer=producer, key=key, hash=info["hash"])
+                    DepEntry(
+                        producer=identity.producer,
+                        key=identity.key,
+                        hash=info["hash"],
+                    )
                     for identity, info in lock_data["dep_hashes"].items()
-                    for producer, key in [_split_identity(identity)]
                 ]
                 input_hash = run_history.compute_input_hash(
                     current_fingerprint, current_params, deps_list, out_specs
                 )
-                stage_outs = cast(list[outputs.ExpandedOut], stage_info["outs"])
-                restored = worker.restore_outputs_from_cache(
-                    stage_outs,
-                    lock_data,
-                    files_cache_dir,
-                    checkout_modes,
-                    state_db=state_db,
-                    state_dir=stage_state_dir,
-                )
-                if not restored:
+                if not _outputs_exist():
                     return False, None
                 return True, input_hash
             finally:
@@ -1649,18 +1648,22 @@ class Engine:
         dep_hashes, missing, unreadable, _file_hash_entries = await anyio.to_thread.run_sync(
             _hash_deps
         )
+        dep_hashes_by_identity = {
+            types.identity_from_key(key): info for key, info in dep_hashes.items()
+        }
         self._update_merkle_ids_for_stage(
-            stage_info, current_fingerprint, current_params, dep_hashes
+            stage_info, current_fingerprint, current_params, dep_hashes_by_identity
         )
         if missing or unreadable:
             return False
 
+        out_identities = [out.identity for out in stage_info["outs"]]
         decision = skip_mod.check_stage(
             lock_data,
             current_fingerprint,
             current_params,
-            dep_hashes,
-            out_paths,
+            dep_hashes_by_identity,
+            out_identities,
             explain=False,
             force=False,
         )
@@ -1668,9 +1671,12 @@ class Engine:
             return False
 
         deps_list = [
-            DepEntry(producer=producer, key=key, hash=info["hash"])
-            for identity, info in dep_hashes.items()
-            for producer, key in [_split_identity(identity)]
+            DepEntry(
+                producer=identity.producer,
+                key=identity.key,
+                hash=info["hash"],
+            )
+            for identity, info in dep_hashes_by_identity.items()
         ]
         input_hash = run_history.compute_input_hash(
             current_fingerprint,
@@ -1680,20 +1686,7 @@ class Engine:
         )
 
         def _restore_outputs() -> bool:
-            state_db = _get_skip_state_db()
-            try:
-                stage_outs = cast(list[outputs.ExpandedOut], stage_info["outs"])
-                return worker.restore_outputs_from_cache(
-                    stage_outs,
-                    lock_data,
-                    files_cache_dir,
-                    checkout_modes,
-                    state_db=state_db,
-                    state_dir=stage_state_dir,
-                )
-            finally:
-                if skip_state_dbs is None:
-                    state_db.close()
+            return _outputs_exist()
 
         restored = await anyio.to_thread.run_sync(_restore_outputs)
         if not restored:
@@ -1745,21 +1738,22 @@ class Engine:
         stage_info: RegistryStageInfo,
         code_manifest: dict[str, str],
         params: dict[str, Any],
-        dep_hashes: dict[str, HashInfo],
+        dep_hashes: dict[types.ArtifactIdentity, HashInfo],
     ) -> None:
         for ref in stage_info["deps"].values():
-            identity_key = str(ref.identity)
-            if identity_key in dep_hashes and identity_key not in self._merkle_ids:
-                self._merkle_ids[identity_key] = dep_hashes[identity_key]["hash"]
+            identity_key = types.identity_key(ref.identity)
+            identity = ref.identity
+            if identity in dep_hashes and identity_key not in self._merkle_ids:
+                self._merkle_ids[identity_key] = dep_hashes[identity]["hash"]
 
         input_merkle_ids = {
-            str(ref.identity): self._merkle_ids[str(ref.identity)]
-            for ref in stage_info["deps"].values()
-            if str(ref.identity) in self._merkle_ids
+            types.identity_key(ref.identity): self._merkle_ids[types.identity_key(ref.identity)]
+            for ref in stage_info["outs"]
+            if types.identity_key(ref.identity) in self._merkle_ids
         }
         stage_merkle_id = merkle.compute_merkle_id(code_manifest, params, input_merkle_ids)
         for out_ref in stage_info["outs"]:
-            self._merkle_ids[str(out_ref.identity)] = stage_merkle_id
+            self._merkle_ids[types.identity_key(out_ref.identity)] = stage_merkle_id
 
     async def _compute_explanation(
         self,
@@ -1779,8 +1773,8 @@ class Engine:
             return explain_mod.get_stage_explanation(
                 stage_name=stage_name,
                 fingerprint=worker_info["fingerprint"],
-                deps=[str(ref.identity) for ref in stage_info["deps"].values()],
-                outs_paths=[str(ref.identity) for ref in stage_info["outs"]],
+                deps=[types.identity_key(ref.identity) for ref in stage_info["deps"].values()],
+                outs_paths=[types.identity_key(ref.identity) for ref in stage_info["outs"]],
                 params_instance=worker_info["params"],
                 overrides=overrides,
                 state_dir=worker_info["state_dir"],
@@ -1814,23 +1808,23 @@ class Engine:
 
             # Build path -> output_type map from registry
             outs = stage_info["outs"]
-            outs_paths = [str(ref.identity) for ref in stage_info["outs"]]
+            outs_paths = [types.identity_key(ref.identity) for ref in stage_info["outs"]]
             path_to_type = dict[str, str]()
             for out in outs:
                 match out.tag:
                     case ArtifactTag.METRIC:
-                        path_to_type[str(out.identity)] = "metric"
+                        path_to_type[types.identity_key(out.identity)] = "metric"
                     case ArtifactTag.PLOT:
-                        path_to_type[str(out.identity)] = "plot"
+                        path_to_type[types.identity_key(out.identity)] = "plot"
                     case _:
-                        path_to_type[str(out.identity)] = "out"
+                        path_to_type[types.identity_key(out.identity)] = "out"
 
             summary = list[OutputChangeSummary]()
             # Get new hashes from lock file
             new_hashes = dict[str, str | None]()
             if lock_data is not None and "output_hashes" in lock_data:
-                for path, hash_info in lock_data["output_hashes"].items():
-                    new_hashes[path] = hash_info["hash"]
+                for identity, hash_info in lock_data["output_hashes"].items():
+                    new_hashes[types.identity_key(identity)] = hash_info["hash"]
 
             for path in outs_paths:
                 new_hash = new_hashes.get(path)

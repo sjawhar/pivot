@@ -29,6 +29,7 @@ import textual.timer
 import textual.widget
 import textual.widgets
 
+from pivot import types
 from pivot.types import (
     ChangeType,
     OutputChange,
@@ -123,9 +124,11 @@ def _convert_output_summary(
     result = list[OutputChange]()
     for item in raw:
         change_type_raw = item.get("change_type")
+        path_raw = item.get("path")
+        path_key = path_raw if isinstance(path_raw, str) else "unknown"
         result.append(
             OutputChange(
-                path=str(item.get("path", "")),
+                path=types.identity_from_key(path_key),
                 old_hash=str(item["old_hash"]) if item.get("old_hash") is not None else None,
                 new_hash=str(item["new_hash"]) if item.get("new_hash") is not None else None,
                 change_type=_safe_change_type(change_type_raw),

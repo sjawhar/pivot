@@ -26,14 +26,18 @@ def tui_watch_pipeline(tmp_path: pathlib.Path) -> Generator[pathlib.Path]:
     # Use pipeline.py only (not pivot.yaml) to avoid ambiguity error
     pipeline_code = """\
 import pathlib
-from pivot.pipeline.pipeline import Pipeline
+from pivot.compose import Pipeline as ComposePipeline, stage
 
-pipeline = Pipeline("test", root=pathlib.Path(__file__).parent)
+_cp = ComposePipeline("test", root=pathlib.Path(__file__).parent)
 
+@stage
 def hello() -> None:
     print("Hello!")
 
-pipeline.register(hello, name="hello")
+with _cp:
+    hello()
+
+pipeline = _cp.build()
 """
     (tmp_path / "pipeline.py").write_text(pipeline_code)
 

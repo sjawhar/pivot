@@ -3,7 +3,6 @@ from __future__ import annotations
 import contextlib
 import fcntl
 import logging
-import os
 import pathlib
 import struct
 import time
@@ -16,6 +15,7 @@ from pivot import exceptions, run_history
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    import os
     from collections.abc import Generator, Iterable
 
     from pivot.fingerprint import AstHashEntry
@@ -67,33 +67,12 @@ def _make_key_file_hash(path: pathlib.Path) -> bytes:
     return _HASH_PREFIX + str(path.resolve()).encode()
 
 
-def _split_identity(identity: str) -> tuple[str, str | None]:
-    if ":" in identity:
-        producer, key = identity.split(":", 1)
-        if key == "":
-            return producer, None
-        return producer, key
-    return identity, None
-
-
-def _build_identity(producer: str, key: str | None) -> str:
-    if key is None:
-        return producer
-    return f"{producer}:{key}"
-
-
 def _make_key_output_generation(identity: str) -> bytes:
-    """Create LMDB key for output generation entry (identity-based)."""
-    producer, key = _split_identity(identity)
-    key_part = "" if key is None else key
-    return _GEN_PREFIX + f"{producer}:{key_part}".encode()
+    return _GEN_PREFIX + identity.encode()
 
 
-def _make_key_dep_generation(stage_name: str, identity: str) -> bytes:
-    """Create LMDB key for dependency generation record (stage + identity)."""
-    producer, key = _split_identity(identity)
-    key_part = "" if key is None else key
-    return _DEP_PREFIX + f"{stage_name}:{producer}:{key_part}".encode()
+def _make_key_dep_generation(stage_name: str, dep_identity: str) -> bytes:
+    return _DEP_PREFIX + f"{stage_name}:{dep_identity}".encode()
 
 
 class InvalidAstHashKeyError(Exception):
@@ -492,7 +471,6 @@ class StateDB:
         return new_gen
 
     def get_dep_generations(self, stage_name: str) -> dict[str, int] | None:
-        """Get recorded dependency generations for a stage. Returns None if no record."""
         self._check_closed()
         prefix = _DEP_PREFIX + stage_name.encode() + b":"
         results = dict[str, int]()
@@ -503,8 +481,6 @@ class StateDB:
                     if not key.startswith(prefix):
                         break
                     dep_identity = key[len(prefix) :].decode()
-                    producer, dep_key = _split_identity(dep_identity)
-                    dep_identity = _build_identity(producer, dep_key)
                     generation = struct.unpack(">Q", value)[0]
                     results[dep_identity] = generation
         return results if results else None

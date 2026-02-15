@@ -15,8 +15,10 @@ from pivot import parameters, project, skip
 from pivot.executor import worker
 from pivot.storage import lock, state
 from pivot.types import (
+    ArtifactIdentity,
     HashInfo,
     StageExplanation,
+    identity_from_key,
 )
 
 if TYPE_CHECKING:
@@ -30,6 +32,10 @@ if TYPE_CHECKING:
 diff_code_manifests = skip.diff_code_manifests
 diff_params = skip.diff_params
 diff_dep_hashes = skip.diff_dep_hashes
+
+
+def _to_identity_keyed(str_hashes: dict[str, HashInfo]) -> dict[ArtifactIdentity, HashInfo]:
+    return {identity_from_key(k): v for k, v in str_hashes.items()}
 
 
 def _find_tracked_ancestor(dep: Path, tracked_trie: pygtrie.Trie[str]) -> Path | None:
@@ -159,10 +165,9 @@ def get_stage_explanation(
                     upstream_stale=[],
                 )
 
-    # Hash dependencies - with optional fallback for missing files
     if allow_missing:
         deps_to_hash = list[str]()
-        fallback_hashes = dict[str, HashInfo]()
+        fallback_hashes = dict[ArtifactIdentity, HashInfo]()
         missing_deps = list[str]()
 
         for dep in deps:
@@ -170,27 +175,26 @@ def get_stage_explanation(
             if dep_path.exists():
                 deps_to_hash.append(dep)
             else:
-                # Try .pvt file first
                 hash_info = None
                 if tracked_files is not None and tracked_trie is not None:
                     hash_info = _find_tracked_hash(dep_path, tracked_files, tracked_trie)
-                # Fall back to lock file hash (for remote verification)
-                normalized = str(project.normalize_path(dep))
+                dep_id = identity_from_key(dep)
                 if hash_info is None:
-                    hash_info = lock_data["dep_hashes"].get(normalized)
+                    hash_info = lock_data["dep_hashes"].get(dep_id)
                 if hash_info:
-                    fallback_hashes[normalized] = hash_info
+                    fallback_hashes[dep_id] = hash_info
                 else:
                     missing_deps.append(dep)
 
-        file_hashes, more_missing, unreadable_deps, _ = worker.hash_dependencies(deps_to_hash)
-        dep_hashes = {**file_hashes, **fallback_hashes}
+        str_hashes, more_missing, unreadable_deps, _ = worker.hash_dependencies(deps_to_hash)
+        dep_hashes = _to_identity_keyed(str_hashes)
+        dep_hashes.update(fallback_hashes)
         missing_deps.extend(more_missing)
     else:
-        dep_hashes, missing_deps, unreadable_deps, _ = worker.hash_dependencies(deps)
+        str_hashes, missing_deps, unreadable_deps, _ = worker.hash_dependencies(deps)
+        dep_hashes = _to_identity_keyed(str_hashes)
 
     if missing_deps:
-        # Convert to relative paths for user-facing message
         rel_missing = [project.to_relative_path(p) for p in missing_deps]
         return StageExplanation(
             stage_name=stage_name,
@@ -204,7 +208,6 @@ def get_stage_explanation(
         )
 
     if unreadable_deps:
-        # Convert to relative paths for user-facing message
         rel_unreadable = [project.to_relative_path(p) for p in unreadable_deps]
         return StageExplanation(
             stage_name=stage_name,
@@ -217,12 +220,14 @@ def get_stage_explanation(
             upstream_stale=[],
         )
 
+    out_identities = [identity_from_key(p) for p in outs_paths]
+
     decision = skip.check_stage(
         lock_data=lock_data,
         fingerprint=fingerprint,
         params=current_params,
         dep_hashes=dep_hashes,
-        out_paths=outs_paths,
+        out_paths=out_identities,
         explain=True,
         force=force,
     )

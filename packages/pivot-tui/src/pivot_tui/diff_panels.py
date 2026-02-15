@@ -19,6 +19,7 @@ import textual.containers
 import textual.css.query
 import textual.widgets
 
+from pivot import types
 from pivot.types import (
     ChangeType,
     CodeChange,
@@ -555,7 +556,7 @@ class InputDiffPanel(_SelectableExpandablePanel):
         self._explanation = snapshot
         self._stage_name = snapshot["stage_name"]
         self._code_by_key = {c["key"]: c for c in snapshot["code_changes"]}
-        self._dep_by_path = {d["path"]: d for d in snapshot["dep_changes"]}
+        self._dep_by_path = {types.identity_key(d["identity"]): d for d in snapshot["dep_changes"]}
         self._param_by_key = {p["key"]: p for p in snapshot["param_changes"]}
         self._update_display()
 
@@ -626,7 +627,8 @@ class OutputDiffPanel(_SelectableExpandablePanel):
             change["old_hash"], change["new_hash"], change["change_type"]
         )
 
-        return f"{prefix}{indicator} {_escape_padded(change['path'], 25)} {hash_display}{suffix}"
+        display = types.identity_key(change["path"])
+        return f"{prefix}{indicator} {_escape_padded(display, 25)} {hash_display}{suffix}"
 
     @override
     def _render_detail_content(self, item_id: str) -> str:  # pragma: no cover
@@ -642,7 +644,7 @@ class OutputDiffPanel(_SelectableExpandablePanel):
         type_label = self._get_type_label(item_type)
 
         lines = [
-            f"[bold]{rich.markup.escape(change['path'])}[/]",
+            f"[bold]{rich.markup.escape(types.identity_key(change['path']))}[/]",
             "",
             f"Type: {type_label}",
             f"Status: {self._format_status(change['change_type'])}",
@@ -808,5 +810,6 @@ class OutputDiffPanel(_SelectableExpandablePanel):
         self._reset_selection_state()
         self._stage_name = stage_name
         self._stage_status = status
-        self._output_by_path = {c["path"]: c for c in changes}
+        self._output_by_path.clear()
+        self._output_by_path.update({types.identity_key(c["path"]): c for c in changes})
         self._update_display()

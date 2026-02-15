@@ -5,6 +5,7 @@ from typing import TypedDict
 
 import click
 
+from pivot import types
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
 
@@ -30,7 +31,9 @@ def _get_output_sources(stage_list: list[str]) -> dict[str, str]:
     return {
         out_path: name
         for name in stage_list
-        for out_path in cli_helpers.get_stage(name)["outs_paths"]
+        for out_path in [
+            types.identity_key(out.identity) for out in cli_helpers.get_stage(name)["outs"]
+        ]
     }
 
 
@@ -54,16 +57,18 @@ def list_cmd(ctx: click.Context, as_json: bool, show_deps: bool) -> None:
         return
 
     if as_json:
-        stages = [
-            StageJsonOutput(
-                name=name,
-                deps=(info := cli_helpers.get_stage(name))["deps_paths"],
-                outs=info["outs_paths"],
-                mutex=info["mutex"],
-                variant=info["variant"],
+        stages = list[StageJsonOutput]()
+        for name in stage_list:
+            info = cli_helpers.get_stage(name)
+            stages.append(
+                StageJsonOutput(
+                    name=name,
+                    deps=[types.identity_key(dep.identity) for dep in info["deps"].values()],
+                    outs=[types.identity_key(out.identity) for out in info["outs"]],
+                    mutex=info["mutex"],
+                    variant=info["variant"],
+                )
             )
-            for name in stage_list
-        ]
         click.echo(json.dumps(ListJsonOutput(stages=stages), indent=2))
         return
 
@@ -77,8 +82,8 @@ def list_cmd(ctx: click.Context, as_json: bool, show_deps: bool) -> None:
     click.echo(f"Registered stages ({len(stage_list)}):")
     for name in stage_list:
         info = cli_helpers.get_stage(name)
-        deps = info["deps_paths"]
-        outs = info["outs_paths"]
+        deps = [types.identity_key(dep.identity) for dep in info["deps"].values()]
+        outs = [types.identity_key(out.identity) for out in info["outs"]]
         click.echo(f"  {name}")
 
         if show_deps or verbose:

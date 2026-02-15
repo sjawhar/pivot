@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 
@@ -10,6 +10,9 @@ from pivot import exceptions, loaders
 from pivot.engine import graph, types
 from pivot.registry import RegistryStageInfo
 from pivot.types import ArtifactIdentity, ArtifactRef, ArtifactTag
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 def _artifact_ref(identity: ArtifactIdentity) -> ArtifactRef:

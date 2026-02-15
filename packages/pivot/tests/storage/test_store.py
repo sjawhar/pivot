@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import pathlib
 import pickle
+from typing import cast
 
 import pytest
 
@@ -170,15 +171,15 @@ def test_workspace_store_path_resolution(
     key: str | None,
     expected: str,
 ) -> None:
-    fmt: loaders.Writer[object]
+    fmt: loaders.Writer[object] | loaders.Reader[object] | loaders.Loader[object, object]
     if tag == types.ArtifactTag.METRIC:
-        fmt = loaders.JSON[dict[str, object]]()
+        fmt = cast("loaders.Writer[object]", loaders.JSON[dict[str, object]]())
     elif tag == types.ArtifactTag.PLOT:
-        fmt = loaders.MatplotlibFigure()
+        fmt = cast("loaders.Writer[object]", loaders.MatplotlibFigure())
     elif tag == types.ArtifactTag.DIRECTORY:
-        fmt = loaders.PathOnly()
+        fmt = cast("loaders.Reader[object]", loaders.PathOnly())
     else:
-        fmt = loaders.Text()
+        fmt = cast("loaders.Writer[object]", loaders.Text())
 
     workspace_store = store.WorkspaceStore(
         project_root=tmp_path, pipeline_name="pipe", input_bindings={}

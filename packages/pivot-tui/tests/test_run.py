@@ -13,6 +13,7 @@ import pivot_tui.rpc_client_impl
 from helpers import wait_for_socket
 from pivot import loaders, outputs
 from pivot.types import (
+    ArtifactIdentity,
     StageStatus,
     TuiLogMessage,
     TuiMessageType,
@@ -65,7 +66,7 @@ class _Step3Outputs(TypedDict):
 
 
 def _helper_process(
-    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+    input_file: pathlib.Path,
 ) -> _OutputTxtOutputs:
     _ = input_file
     pathlib.Path("output.txt").write_text("done")
@@ -73,7 +74,7 @@ def _helper_process(
 
 
 def _helper_process_print(
-    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+    input_file: pathlib.Path,
 ) -> _OutputTxtOutputs:
     _ = input_file
     print("Processing data")
@@ -82,14 +83,14 @@ def _helper_process_print(
 
 
 def _helper_failing_stage(
-    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+    input_file: pathlib.Path,
 ) -> _OutputTxtOutputs:
     _ = input_file
     raise RuntimeError("Stage failed!")
 
 
 def _helper_step1(
-    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+    input_file: pathlib.Path,
 ) -> _Step1Outputs:
     _ = input_file
     pathlib.Path("step1.txt").write_text("step1")
@@ -97,7 +98,7 @@ def _helper_step1(
 
 
 def _helper_step2(
-    step1_file: Annotated[pathlib.Path, outputs.Dep("step1.txt", loaders.PathOnly())],
+    step1_file: pathlib.Path,
 ) -> _Step2Outputs:
     _ = step1_file
     pathlib.Path("step2.txt").write_text("step2")
@@ -105,7 +106,7 @@ def _helper_step2(
 
 
 def _helper_step3(
-    step2_file: Annotated[pathlib.Path, outputs.Dep("step2.txt", loaders.PathOnly())],
+    step2_file: pathlib.Path,
 ) -> _Step3Outputs:
     _ = step2_file
     pathlib.Path("step3.txt").write_text("step3")
@@ -1227,7 +1228,7 @@ def test_handle_status_stores_output_summary_on_stage_info() -> None:
     snapshot = app._stages["train"].live_output_snapshot
     assert snapshot is not None, "output_summary should be converted and stored"
     assert len(snapshot) == 1
-    assert snapshot[0]["path"] == "output.csv"
+    assert snapshot[0]["path"] == ArtifactIdentity("output.csv", None)
     assert snapshot[0]["change_type"] == "modified"
 
 

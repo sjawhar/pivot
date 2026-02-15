@@ -10,10 +10,11 @@ from __future__ import annotations
 import logging
 import pathlib
 
-from pivot import config, exceptions, parameters, project, registry, run_history
+from pivot import config, exceptions, parameters, project, registry, run_history, types
 from pivot.executor import worker
-from pivot.storage import cache, lock, store as store_mod
+from pivot.storage import lock
 from pivot.storage import state as state_mod
+from pivot.storage import store as store_mod
 from pivot.types import ArtifactTag, DeferredWrites, DepEntry, HashInfo, LockData
 
 logger = logging.getLogger(__name__)
@@ -73,7 +74,7 @@ def commit_stages(
     default_state_dir = config.get_state_dir()
     cache_dir = config.get_cache_dir()
     files_cache_dir = cache_dir / "files"
-    checkout_modes = config.get_checkout_mode_order()
+    config.get_checkout_mode_order()
     project_root = project.get_project_root()
     store_spec = store_mod.StoreSpec(
         kind="workspace",
@@ -131,9 +132,12 @@ def commit_stages(
                 continue
 
             # 4. Compute input_hash
+            dep_hashes_by_identity = {
+                types.identity_from_key(key): info for key, info in dep_hashes.items()
+            }
             stage_outs = stage_info["outs"]
             out_specs = [
-                (worker._artifact_identity_key(out), out.tag is not ArtifactTag.METRIC)
+                (types.identity_key(out.identity), out.tag is not ArtifactTag.METRIC)
                 for out in stage_outs
             ]
             deps_list = [
@@ -146,7 +150,7 @@ def commit_stages(
             )
 
             # Compute normalized output paths once (used for skip check, lock data, and StateDB)
-            out_paths = [worker._artifact_identity_key(out) for out in stage_outs]
+            out_paths = [types.identity_key(out.identity) for out in stage_outs]
             production_lock = lock.StageLock(stage_name, stages_dir)
 
             # 5. If not force and no explicit stages, check lock — skip if unchanged
@@ -160,20 +164,28 @@ def commit_stages(
                         continue
 
             # 6. Hash and cache outputs
-            output_hashes = dict[str, HashInfo]()
+            output_hashes_by_key = dict[str, HashInfo]()
+            output_hashes_by_identity = dict[types.ArtifactIdentity, HashInfo]()
             outputs_missing = False
 
             for out in stage_outs:
-                identity = worker._artifact_identity_key(out)
+                identity_key = types.identity_key(out.identity)
+                identity = types.identity_from_key(identity_key)
                 try:
-                    output_hashes[identity] = store.hash_artifact(out)
+                    hash_info = store.hash_artifact(out)
+                    output_hashes_by_key[identity_key] = hash_info
+                    output_hashes_by_identity[identity] = hash_info
                 except FileNotFoundError:
-                    logger.error("Stage '%s': output missing: %s — skipping", stage_name, identity)
+                    logger.error(
+                        "Stage '%s': output missing: %s — skipping", stage_name, identity_key
+                    )
                     outputs_missing = True
                     break
                 except OSError:
                     logger.error(
-                        "Stage '%s': output unreadable: %s — skipping", stage_name, identity
+                        "Stage '%s': output unreadable: %s — skipping",
+                        stage_name,
+                        identity_key,
                     )
                     outputs_missing = True
                     break
@@ -186,8 +198,8 @@ def commit_stages(
             new_lock_data = LockData(
                 code_manifest=fingerprint,
                 params=current_params,
-                dep_hashes=dict(sorted(dep_hashes.items())),
-                output_hashes=dict(sorted(output_hashes.items())),
+                dep_hashes=dict(sorted(dep_hashes_by_identity.items())),
+                output_hashes=dict(sorted(output_hashes_by_identity.items())),
             )
             production_lock.write(new_lock_data)
 
@@ -198,12 +210,12 @@ def commit_stages(
 
             # Only cached outputs belong in run cache
             cached_paths = {
-                worker._artifact_identity_key(out)
+                types.identity_key(out.identity)
                 for out in stage_outs
                 if out.tag is not ArtifactTag.METRIC
             }
             cached_output_hashes = {
-                path: oh for path, oh in output_hashes.items() if path in cached_paths
+                path: oh for path, oh in output_hashes_by_key.items() if path in cached_paths
             }
 
             output_entries = [

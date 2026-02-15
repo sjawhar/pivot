@@ -1,3 +1,4 @@
+# pyright: reportImplicitRelativeImport=false
 from __future__ import annotations
 
 import html
@@ -5,9 +6,9 @@ import json
 import logging
 import os
 import pathlib
-from typing import TYPE_CHECKING, TypedDict
+from typing import TYPE_CHECKING, TypedDict, cast
 
-from pivot import config, git, outputs, project
+from pivot import config, git, outputs, project, types
 from pivot.show import common
 from pivot.storage import cache, lock
 from pivot.types import ChangeType, OutputFormat
@@ -37,6 +38,43 @@ class PlotDiffEntry(TypedDict):
     change_type: ChangeType
 
 
+def _plot_display_path(
+    out: types.ArtifactRef | outputs.BaseOut,
+    project_root: pathlib.Path,
+) -> str | None:
+    if isinstance(out, types.ArtifactRef):
+        if out.tag is not types.ArtifactTag.PLOT:
+            return None
+        return types.identity_key(out.identity)
+    if isinstance(out, outputs.Plot):
+        expanded = outputs.require_expanded(cast("outputs.BaseOut", out))
+        abs_path = str(project.normalize_path(expanded.path))
+        return project.to_relative_path(abs_path, project_root)
+    return None
+
+
+def _plot_lock_keys(
+    out: types.ArtifactRef | outputs.BaseOut,
+    stage_name: str,
+    project_root: pathlib.Path,
+) -> list[types.ArtifactIdentity]:
+    if isinstance(out, types.ArtifactRef):
+        if out.tag is not types.ArtifactTag.PLOT:
+            return []
+        return [out.identity]
+    if isinstance(out, outputs.Plot):
+        expanded = outputs.require_expanded(cast("outputs.BaseOut", out))
+        abs_path = str(project.normalize_path(expanded.path))
+        rel_path = project.to_relative_path(abs_path, project_root)
+        keys = [abs_path, rel_path]
+        if rel_path:
+            keys.append(f"{stage_name}:{rel_path}")
+        else:
+            keys.append(stage_name)
+        return [types.identity_from_key(key) for key in list(dict.fromkeys(keys)) if key]
+    return []
+
+
 def collect_plots_from_stages() -> list[PlotInfo]:
     """Discover Plot outputs from Pipeline in context."""
     from pivot.cli import helpers as cli_helpers
@@ -44,16 +82,32 @@ def collect_plots_from_stages() -> list[PlotInfo]:
     result = list[PlotInfo]()
     for stage_name in cli_helpers.list_stages():
         info = cli_helpers.get_stage(stage_name)
-        for out in info["outs"]:
-            if isinstance(out, outputs.Plot):
-                # Registry always stores single-file outputs (multi-file are expanded)
+        outs = cast("list[types.ArtifactRef | outputs.BaseOut]", info["outs"])
+        for out in outs:
+            if isinstance(out, types.ArtifactRef):
+                if out.tag is not types.ArtifactTag.PLOT:
+                    continue
                 result.append(
                     PlotInfo(
-                        path=out.path,
+                        path=types.identity_key(out.identity),
                         stage_name=stage_name,
-                        x=out.x,
-                        y=out.y,
-                        template=out.template,
+                        x=None,
+                        y=None,
+                        template=None,
+                    )
+                )
+            elif isinstance(out, outputs.Plot):
+                # Registry always stores single-file outputs (multi-file are expanded)
+                expanded = outputs.require_expanded(cast("outputs.BaseOut", out))
+                abs_path = str(project.normalize_path(expanded.path))
+                rel_path = project.to_relative_path(abs_path, project.get_project_root())
+                result.append(
+                    PlotInfo(
+                        path=rel_path,
+                        stage_name=stage_name,
+                        x=None,
+                        y=None,
+                        template=None,
                     )
                 )
     return result
@@ -78,16 +132,18 @@ def get_plot_hashes_from_lock(
         stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(state_dir))
         lock_data = stage_lock.read()
 
-        for out in info["outs"]:
-            if isinstance(out, outputs.Plot):
-                # Normalize to absolute for lock data lookup, then convert to relative for result
-                abs_path = str(project.normalize_path(out.path))
-                rel_path = project.to_relative_path(abs_path, proj_root)
-                if lock_data and abs_path in lock_data["output_hashes"]:
-                    hash_info = lock_data["output_hashes"][abs_path]
-                    result[rel_path] = hash_info["hash"]
-                else:
-                    result[rel_path] = None
+        outs = cast("list[types.ArtifactRef | outputs.BaseOut]", info["outs"])
+        for out in outs:
+            rel_path = _plot_display_path(out, proj_root)
+            if rel_path is None:
+                continue
+            hash_value: str | None = None
+            if lock_data:
+                for identity in _plot_lock_keys(out, stage_name, proj_root):
+                    if identity in lock_data["output_hashes"]:
+                        hash_value = lock_data["output_hashes"][identity]["hash"]
+                        break
+            result[rel_path] = hash_value
     return result
 
 
@@ -106,12 +162,13 @@ def get_plot_hashes_from_head() -> dict[str, str | None]:
     stage_plot_paths = dict[str, list[str]]()  # stage_name -> [rel_plot_paths]
     for stage_name in cli_helpers.list_stages():
         info = cli_helpers.get_stage(stage_name)
-        for out in info["outs"]:
-            if isinstance(out, outputs.Plot):
-                abs_path = str(project.normalize_path(out.path))
-                rel_path = project.to_relative_path(abs_path, proj_root)
-                stage_plot_paths.setdefault(stage_name, []).append(rel_path)
-                result[rel_path] = None  # Default to None
+        outs = cast("list[types.ArtifactRef | outputs.BaseOut]", info["outs"])
+        for out in outs:
+            rel_path = _plot_display_path(out, proj_root)
+            if rel_path is None:
+                continue
+            stage_plot_paths.setdefault(stage_name, []).append(rel_path)
+            result[rel_path] = None  # Default to None
 
     # Read all lock files from HEAD in one batch
     lock_data_map = common.read_lock_files_from_head(list(stage_plot_paths.keys()))
@@ -290,5 +347,5 @@ def render_plots_html(
 </body>
 </html>"""
 
-    output_path.write_text(html_content)
+    _ = output_path.write_text(html_content)
     return output_path

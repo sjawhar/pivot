@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import pathlib
 from typing import TYPE_CHECKING, TypedDict
 
 import networkx as nx
 
+from pivot import outputs
 from pivot import types as pivot_types
 from pivot.engine.types import NodeType
 
 if TYPE_CHECKING:
     from pivot.registry import RegistryStageInfo
+    from pivot.storage.track import PvtData
 
 __all__ = [
     "artifact_node",
@@ -47,15 +50,20 @@ class GraphView(TypedDict):
     artifact_edges: list[tuple[str, str]]
 
 
-def _format_identity(identity: pivot_types.ArtifactIdentity) -> str:
-    if identity.key is None:
-        return identity.producer
-    return f"{identity.producer}:{identity.key}"
+def _coerce_identity(
+    identity: pivot_types.ArtifactIdentity | pathlib.Path | str,
+) -> pivot_types.ArtifactIdentity:
+    if isinstance(identity, pivot_types.ArtifactIdentity):
+        return identity
+    if isinstance(identity, pathlib.Path):
+        return _path_identity(str(identity))
+    return _path_identity(identity)
 
 
-def artifact_node(identity: pivot_types.ArtifactIdentity) -> str:
+def artifact_node(identity: pivot_types.ArtifactIdentity | pathlib.Path | str) -> str:
     """Create artifact node ID from identity."""
-    return f"artifact:{_format_identity(identity)}"
+    resolved = _coerce_identity(identity)
+    return f"artifact:{pivot_types.identity_key(resolved)}"
 
 
 def stage_node(name: str) -> str:
@@ -79,15 +87,94 @@ def parse_artifact_identity(value: str) -> pivot_types.ArtifactIdentity:
     return pivot_types.ArtifactIdentity(producer, key)
 
 
+def _path_identity(path: str) -> pivot_types.ArtifactIdentity:
+    return pivot_types.ArtifactIdentity(path, None)
+
+
+def _output_identities(
+    out: pivot_types.ArtifactRef | outputs.BaseOut,
+) -> list[pivot_types.ArtifactIdentity]:
+    if isinstance(out, pivot_types.ArtifactRef):
+        return [out.identity]
+    path = out.path
+    if isinstance(path, (list, tuple)):
+        return [_path_identity(str(item)) for item in path]
+    return [_path_identity(str(path))]
+
+
+def _dep_identity(dep: pivot_types.ArtifactRef | str) -> pivot_types.ArtifactIdentity:
+    if isinstance(dep, pivot_types.ArtifactRef):
+        return dep.identity
+    return _path_identity(dep)
+
+
+def _output_identities_in_dir(
+    outputs_map: dict[pivot_types.ArtifactIdentity, str],
+    dep_path: pathlib.Path,
+) -> list[pivot_types.ArtifactIdentity]:
+    matches = list[pivot_types.ArtifactIdentity]()
+    for identity in outputs_map:
+        if identity.key is not None:
+            continue
+        out_path = pathlib.Path(identity.producer)
+        if out_path == dep_path:
+            matches.append(identity)
+            continue
+        if out_path.is_relative_to(dep_path):
+            matches.append(identity)
+    return matches
+
+
+def _resolve_dep_path(identity: pivot_types.ArtifactIdentity) -> pathlib.Path:
+    """Resolve a dependency identity to a filesystem path for existence checking.
+
+    For ArtifactRef-based inputs, the producer is a logical name (e.g.,
+    "input.sql"), not a filesystem path. The Store resolves these using
+    convention paths (data/raw/{name}, data/external/{name}). This function
+    replicates that resolution for DAG validation.
+    """
+    direct = pathlib.Path(identity.producer)
+    if direct.exists():
+        return direct
+    for prefix in ("data/raw", "data/external"):
+        candidate = pathlib.Path(prefix) / identity.producer
+        if candidate.exists():
+            return candidate
+    return direct
+
+
+def _is_tracked_dependency(
+    dep_path: pathlib.Path,
+    tracked_files: dict[str, PvtData],
+) -> bool:
+    dep_str = str(dep_path)
+    if dep_str in tracked_files:
+        return True
+    for tracked_path, data in tracked_files.items():
+        if "manifest" not in data:
+            continue
+        tracked_dir = pathlib.Path(tracked_path)
+        if dep_path == tracked_dir:
+            return True
+        if not dep_path.is_relative_to(tracked_dir):
+            continue
+        relpath = str(dep_path.relative_to(tracked_dir))
+        for entry in data["manifest"]:
+            if entry["relpath"] == relpath:
+                return True
+    return False
+
+
 def _build_outputs_map(
     stages: dict[str, RegistryStageInfo],
 ) -> dict[pivot_types.ArtifactIdentity, str]:
     """Build mapping from output identity to stage name."""
-    return {
-        out.identity: stage_name
-        for stage_name, stage_info in stages.items()
-        for out in stage_info["outs"]
-    }
+    outputs_map = dict[pivot_types.ArtifactIdentity, str]()
+    for stage_name, stage_info in stages.items():
+        for out in stage_info["outs"]:
+            for identity in _output_identities(out):
+                outputs_map[identity] = stage_name
+    return outputs_map
 
 
 def _check_acyclic(g: nx.DiGraph[str]) -> None:
@@ -125,6 +212,7 @@ def _check_acyclic(g: nx.DiGraph[str]) -> None:
 def build_graph(
     stages: dict[str, RegistryStageInfo],
     validate: bool = False,
+    tracked_files: dict[str, PvtData] | None = None,
 ) -> nx.DiGraph[str]:
     """Build bipartite artifact-stage graph from stage definitions.
 
@@ -153,24 +241,43 @@ def build_graph(
 
         # Deps: artifact -> stage
         for dep in info["deps"].values():
-            artifact = artifact_node(dep.identity)
+            dep_identity = _dep_identity(dep)
+            artifact = artifact_node(dep_identity)
             g.add_node(artifact, type=NodeType.ARTIFACT)
             g.add_edge(artifact, stage)
 
-            if validate and dep.identity not in outputs_map:
-                if dep.identity.producer not in stage_names:
+            dep_path = _resolve_dep_path(dep_identity)
+
+            if validate and dep_identity not in outputs_map:
+                if _output_identities_in_dir(outputs_map, dep_path):
+                    continue
+                if dep_identity.producer in stage_names:
+                    raise exceptions.DependencyNotFoundError(
+                        stage=stage_name,
+                        dep=pivot_types.identity_key(dep_identity),
+                        available_outputs=[pivot_types.identity_key(out) for out in outputs_map],
+                    )
+                if dep_path.exists():
+                    continue
+                if tracked_files is not None and _is_tracked_dependency(dep_path, tracked_files):
                     continue
                 raise exceptions.DependencyNotFoundError(
                     stage=stage_name,
-                    dep=_format_identity(dep.identity),
-                    available_outputs=[_format_identity(out) for out in outputs_map],
+                    dep=pivot_types.identity_key(dep_identity),
+                    available_outputs=[pivot_types.identity_key(out) for out in outputs_map],
                 )
+
+            for identity in _output_identities_in_dir(outputs_map, dep_path):
+                artifact = artifact_node(identity)
+                g.add_node(artifact, type=NodeType.ARTIFACT)
+                g.add_edge(artifact, stage)
 
         # Outs: stage -> artifact
         for out in info["outs"]:
-            artifact = artifact_node(out.identity)
-            g.add_node(artifact, type=NodeType.ARTIFACT)
-            g.add_edge(stage, artifact)
+            for identity in _output_identities(out):
+                artifact = artifact_node(identity)
+                g.add_node(artifact, type=NodeType.ARTIFACT)
+                g.add_edge(stage, artifact)
 
     # Always check for cycles - a cyclic graph is never valid
     _check_acyclic(g)

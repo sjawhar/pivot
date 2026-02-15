@@ -263,6 +263,32 @@ class ArtifactIdentity(NamedTuple):
     key: str | None
 
 
+class ArtifactIdentityJson(TypedDict):
+    producer: str
+    key: str | None
+
+
+def identity_to_json(identity: ArtifactIdentity) -> ArtifactIdentityJson:
+    return ArtifactIdentityJson(producer=identity.producer, key=identity.key)
+
+
+def identity_from_json(payload: ArtifactIdentityJson) -> ArtifactIdentity:
+    return ArtifactIdentity(payload["producer"], payload["key"])
+
+
+def identity_key(identity: ArtifactIdentity) -> str:
+    if identity.key is None:
+        return identity.producer
+    return f"{identity.producer}:{identity.key}"
+
+
+def identity_from_key(key: str) -> ArtifactIdentity:
+    if ":" in key:
+        producer, artifact_key = key.split(":", 1)
+        return ArtifactIdentity(producer, artifact_key)
+    return ArtifactIdentity(key, None)
+
+
 class ArtifactTag(enum.StrEnum):
     DATA = "data"
     METRIC = "metric"
@@ -274,9 +300,7 @@ class ArtifactTag(enum.StrEnum):
 class ArtifactRef:
     identity: ArtifactIdentity
     format: (
-        "loaders_module.Reader[Any]"
-        | "loaders_module.Writer[Any]"
-        | "loaders_module.Loader[Any, Any]"
+        loaders_module.Reader[Any] | loaders_module.Writer[Any] | loaders_module.Loader[Any, Any]
     )
     python_type: type
     tag: ArtifactTag
@@ -285,19 +309,28 @@ class ArtifactRef:
 def validate_artifact_identity(identity: ArtifactIdentity) -> None:
     if identity.producer.strip() == "":
         raise ValueError("Artifact producer cannot be empty")
-    if identity.producer in {".", ".."}:
-        raise ValueError(f"Artifact producer cannot be a traversal segment: {identity.producer!r}")
-    if "/" in identity.producer or "\\" in identity.producer:
-        raise ValueError(f"Artifact producer cannot contain path separators: {identity.producer!r}")
+    bad_chars = {"\\", "\0", ":"}
+    if bad_chars & set(identity.producer):
+        raise ValueError(
+            f"Artifact producer cannot contain backslashes, null bytes, or colons: {identity.producer!r}"
+        )
+    for segment in identity.producer.split("/"):
+        if segment in {".", ".."}:
+            raise ValueError(
+                f"Artifact producer cannot contain traversal segments: {identity.producer!r}"
+            )
 
     if identity.key is None:
         return
     if identity.key.strip() == "":
         raise ValueError("Artifact key cannot be empty")
-    if identity.key in {".", ".."}:
-        raise ValueError(f"Artifact key cannot be a traversal segment: {identity.key!r}")
-    if "/" in identity.key or "\\" in identity.key:
-        raise ValueError(f"Artifact key cannot contain path separators: {identity.key!r}")
+    if bad_chars & set(identity.key):
+        raise ValueError(
+            f"Artifact key cannot contain backslashes, null bytes, or colons: {identity.key!r}"
+        )
+    for segment in identity.key.split("/"):
+        if segment in {".", ".."}:
+            raise ValueError(f"Artifact key cannot contain traversal segments: {identity.key!r}")
 
 
 class DepEntry(TypedDict):
@@ -337,12 +370,12 @@ class StorageLockData(TypedDict):
 
 
 class LockData(TypedDict):
-    """Internal representation of stage lock data (dict-based, absolute paths)."""
+    """Internal representation of stage lock data (dict-based, identity-keyed)."""
 
     code_manifest: dict[str, str]
     params: dict[str, Any]
-    dep_hashes: dict[str, HashInfo]
-    output_hashes: dict[str, HashInfo]
+    dep_hashes: dict[ArtifactIdentity, HashInfo]
+    output_hashes: dict[ArtifactIdentity, HashInfo]
     merkle_id: NotRequired[str | None]
 
 
@@ -411,7 +444,7 @@ class ParamChange(TypedDict):
 class DepChange(TypedDict):
     """Change info for an input dependency file."""
 
-    identity: str
+    identity: ArtifactIdentity
     old_hash: str | None
     new_hash: str | None
     change_type: ChangeType
@@ -420,7 +453,7 @@ class DepChange(TypedDict):
 class OutputChange(TypedDict):
     """Change info for an output file."""
 
-    path: str
+    path: ArtifactIdentity
     old_hash: str | None
     new_hash: str | None
     change_type: ChangeType | None  # None means unchanged
@@ -909,8 +942,8 @@ class AgentStageInfo(TypedDict):
     """Stage info returned by stages() RPC method."""
 
     name: str
-    deps: list[str]
-    outs: list[str]
+    deps: list[ArtifactIdentityJson]
+    outs: list[ArtifactIdentityJson]
 
 
 class AgentStagesResult(TypedDict):

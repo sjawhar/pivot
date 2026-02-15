@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING
 import anyio
 import click
 
-from pivot import config
+from pivot import config, project, registry
 from pivot.cli import _run_common, completion
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
@@ -77,6 +77,19 @@ def _configure_watch_sources(
         )
 
 
+def _watch_paths_from_registry(
+    all_stages: dict[str, registry.RegistryStageInfo],
+) -> list[pathlib.Path]:
+    paths = set[pathlib.Path]()
+    for info in all_stages.values():
+        for out in info["outs"]:
+            identity = out.identity
+            path_value = identity.key if identity.key is not None else identity.producer
+            if path_value:
+                paths.add(project.normalize_path(path_value))
+    return sorted(paths)
+
+
 def _configure_oneshot_source(
     eng: engine.Engine,
     stages: list[str] | None,
@@ -111,10 +124,8 @@ def _get_explanations(
 
     Shared by --explain and --dry-run modes.
     """
-    from pivot import project
     from pivot import status as status_mod
     from pivot.engine import graph as engine_graph
-    from pivot.storage import track
 
     # Resolve cross-pipeline dependencies before getting stages
     cli_helpers.resolve_external_dependencies()
@@ -122,11 +133,7 @@ def _get_explanations(
     all_stages = cli_helpers.get_all_stages()
 
     # Build graph with validation when allow_missing is False
-    # When allow_missing=True, tracked files are used for validation
-    tracked_files = track.discover_pvt_files(project.get_project_root()) if allow_missing else None
-    graph = engine_graph.build_graph(
-        all_stages, validate=not allow_missing, tracked_files=tracked_files
-    )
+    graph = engine_graph.build_graph(all_stages, validate=not allow_missing)
 
     return status_mod.get_pipeline_explanations(
         stages_list,
@@ -342,8 +349,8 @@ def _run_watch_mode(  # noqa: PLR0913 - many params needed for different modes
 
     # Build bipartite graph for watch paths
     all_stages = cli_helpers.get_all_stages()
-    bipartite_graph = engine_graph.build_graph(all_stages)
-    watch_paths = engine_graph.get_watch_paths(bipartite_graph)
+    engine_graph.build_graph(all_stages)
+    watch_paths = _watch_paths_from_registry(all_stages)
 
     # Sort for display: group matrix variants together while preserving DAG structure
     display_order = _run_common.sort_for_display(execution_order, graph) if execution_order else []
@@ -484,8 +491,8 @@ def _run_serve_mode(
     async def serve_main() -> None:
         # Build watch paths
         all_stages = cli_helpers.get_all_stages()
-        bipartite_graph = engine_graph.build_graph(all_stages)
-        watch_paths = engine_graph.get_watch_paths(bipartite_graph)
+        engine_graph.build_graph(all_stages)
+        watch_paths = _watch_paths_from_registry(all_stages)
 
         async with engine.Engine(pipeline=pipeline, all_pipelines=use_all_pipelines) as eng:
             # Add filesystem watch source

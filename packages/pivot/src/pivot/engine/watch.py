@@ -64,7 +64,8 @@ class WatchCoordinator:
         PREPARING and COMPLETED (exclusive) — i.e., PREPARING, WAITING_ON_LOCK,
         or RUNNING.
         """
-        producer = engine_graph.get_producer(self._graph, path)
+        identity = engine_graph.parse_artifact_identity(str(path))
+        producer = engine_graph.get_producer(self._graph, identity)
         if producer is None:
             return False
         state = get_stage_state(producer)
@@ -77,7 +78,8 @@ class WatchCoordinator:
         """
         affected = set[str]()
         for path in paths:
-            consumers = engine_graph.get_consumers(self._graph, path)
+            identity = engine_graph.parse_artifact_identity(str(path))
+            consumers = engine_graph.get_consumers(self._graph, identity)
             affected.update(consumers)
             for stage in consumers:
                 downstream = engine_graph.get_downstream_stages(self._graph, stage)
@@ -86,7 +88,8 @@ class WatchCoordinator:
 
     def get_producer(self, path: pathlib.Path) -> str | None:
         """Get the stage that produces a given artifact path."""
-        return engine_graph.get_producer(self._graph, path)
+        identity = engine_graph.parse_artifact_identity(str(path))
+        return engine_graph.get_producer(self._graph, identity)
 
     def should_restart_workers(self, *, parallel: bool) -> bool:
         """Decide whether worker pool should restart after code/config change.

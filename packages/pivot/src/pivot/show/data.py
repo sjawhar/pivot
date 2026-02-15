@@ -13,7 +13,7 @@ import numpy
 import pandas
 import tabulate
 
-from pivot import config, outputs, project
+from pivot import config, outputs, project, types
 from pivot.show import common
 from pivot.storage import cache
 from pivot.types import (
@@ -36,6 +36,24 @@ STATUS_SYMBOLS: dict[ChangeType, str] = {
 }
 
 logger = logging.getLogger(__name__)
+
+
+def _data_rel_path(
+    out: types.ArtifactRef | outputs.BaseOut,
+    project_root: pathlib.Path,
+) -> str | None:
+    if isinstance(out, types.ArtifactRef):
+        if out.tag in {types.ArtifactTag.METRIC, types.ArtifactTag.PLOT}:
+            return None
+        return types.identity_key(out.identity)
+    if isinstance(out, (outputs.Metric, outputs.Plot)):
+        return None
+    path_value = out.path
+    if not isinstance(path_value, str):
+        return None
+    abs_path = str(project.normalize_path(path_value))
+    return project.to_relative_path(abs_path, project_root)
+
 
 _DATA_EXTENSIONS: dict[str, DataFileFormat] = {
     ".csv": DataFileFormat.CSV,
@@ -527,13 +545,12 @@ def get_data_outputs_from_stages() -> dict[str, str]:
         info = cli_helpers.get_stage(stage_name)
         for out in info["outs"]:
             # Only include Out types that are data files (not Metric, Plot, etc.)
-            if not isinstance(out, (outputs.Metric, outputs.Plot)):
-                abs_path = str(project.normalize_path(out.path))
-                rel_path = project.to_relative_path(abs_path, proj_root)
-                # Check if it's a supported data format
-                fmt = detect_format(pathlib.Path(rel_path))
-                if fmt != DataFileFormat.UNKNOWN:
-                    result[stage_name] = rel_path
+            rel_path = _data_rel_path(out, proj_root)
+            if rel_path is None:
+                continue
+            fmt = detect_format(pathlib.Path(rel_path))
+            if fmt != DataFileFormat.UNKNOWN:
+                result[stage_name] = rel_path
 
     return result
 
@@ -553,13 +570,13 @@ def get_data_hashes_from_head() -> dict[str, str | None]:
     for stage_name in cli_helpers.list_stages():
         info = cli_helpers.get_stage(stage_name)
         for out in info["outs"]:
-            if not isinstance(out, (outputs.Metric, outputs.Plot)):
-                abs_path = str(project.normalize_path(out.path))
-                rel_path = project.to_relative_path(abs_path, proj_root)
-                fmt = detect_format(pathlib.Path(rel_path))
-                if fmt != DataFileFormat.UNKNOWN:
-                    stage_data_paths.setdefault(stage_name, []).append(rel_path)
-                    result[rel_path] = None
+            rel_path = _data_rel_path(out, proj_root)
+            if rel_path is None:
+                continue
+            fmt = detect_format(pathlib.Path(rel_path))
+            if fmt != DataFileFormat.UNKNOWN:
+                stage_data_paths.setdefault(stage_name, []).append(rel_path)
+                result[rel_path] = None
 
     # Read all lock files from HEAD in one batch
     lock_data_map = common.read_lock_files_from_head(list(stage_data_paths.keys()))

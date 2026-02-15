@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any, TypedDict, cast
 import flatten_dict
 import yaml
 
-from pivot import config, git, outputs, project, yaml_config
+from pivot import config, git, outputs, project, types, yaml_config
 from pivot.show import common
 from pivot.types import ChangeType, MetricData, MetricValue, OutputFormat
 
@@ -21,6 +21,38 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _METRIC_EXTENSIONS = frozenset({".json", ".yaml", ".yml", ".csv"})
+
+
+def _metric_read_path(
+    out: types.ArtifactRef | outputs.BaseOut,
+    project_root: pathlib.Path,
+) -> tuple[str, pathlib.Path] | None:
+    if isinstance(out, types.ArtifactRef):
+        if out.tag is not types.ArtifactTag.METRIC:
+            return None
+        path_key = types.identity_key(out.identity)
+        path = pathlib.Path(path_key)
+        if not path.is_absolute():
+            path = project_root / path_key
+        return path_key, path
+    if isinstance(out, outputs.Metric):
+        path = pathlib.Path(str(out.path))
+        return str(path), path
+    return None
+
+
+def _metric_lock_key(
+    out: types.ArtifactRef | outputs.BaseOut,
+    project_root: pathlib.Path,
+) -> str | None:
+    if isinstance(out, types.ArtifactRef):
+        if out.tag is not types.ArtifactTag.METRIC:
+            return None
+        return types.identity_key(out.identity)
+    if isinstance(out, outputs.Metric):
+        abs_path = str(project.normalize_path(str(out.path)))
+        return project.to_relative_path(abs_path, project_root)
+    return None
 
 
 class MetricDiff(TypedDict):
@@ -123,19 +155,22 @@ def collect_metrics_from_stages() -> dict[str, dict[str, MetricData]]:
     from pivot.cli import helpers as cli_helpers
 
     result = dict[str, dict[str, MetricData]]()
+    project_root = project.get_project_root()
     for stage_name in cli_helpers.list_stages():
         stage_info = cli_helpers.get_stage(stage_name)
         stage_metrics = dict[str, MetricData]()
         for out in stage_info["outs"]:
-            if isinstance(out, outputs.Metric):
-                path = pathlib.Path(str(out.path))
-                if not path.exists():
-                    logger.warning(f"Metric file not found: {out.path} (stage: {stage_name})")
-                    continue
-                try:
-                    stage_metrics[str(path)] = parse_metric_file(path)
-                except MetricsError as e:
-                    logger.warning(f"Failed to parse metrics from {out.path}: {e}")
+            info = _metric_read_path(out, project_root)
+            if info is None:
+                continue
+            path_key, path = info
+            if not path.exists():
+                logger.warning(f"Metric file not found: {path_key} (stage: {stage_name})")
+                continue
+            try:
+                stage_metrics[path_key] = parse_metric_file(path)
+            except MetricsError as e:
+                logger.warning(f"Failed to parse metrics from {path_key}: {e}")
         if stage_metrics:
             result[stage_name] = stage_metrics
     return result
@@ -297,12 +332,11 @@ def get_metric_info_from_head() -> dict[str, str | None]:
     for stage_name in cli_helpers.list_stages():
         info = cli_helpers.get_stage(stage_name)
         for out in info["outs"]:
-            if isinstance(out, outputs.Metric):
-                # Registry always stores single-file outputs (multi-file are expanded)
-                abs_path = str(project.normalize_path(out.path))
-                rel_path = project.to_relative_path(abs_path, proj_root)
-                stage_metric_paths.setdefault(stage_name, []).append(rel_path)
-                result[rel_path] = None  # Default to None
+            rel_path = _metric_lock_key(out, proj_root)
+            if rel_path is None:
+                continue
+            stage_metric_paths.setdefault(stage_name, []).append(rel_path)
+            result[rel_path] = None
 
     # Read all lock files from HEAD in one batch
     lock_data_map = common.read_lock_files_from_head(list(stage_metric_paths.keys()))

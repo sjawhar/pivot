@@ -19,6 +19,7 @@ import yaml
 from pivot import yaml_config
 from pivot.storage import cache
 from pivot.types import (
+    ArtifactIdentity,
     DepEntry,
     DirHash,
     FileHash,
@@ -26,6 +27,7 @@ from pivot.types import (
     LockData,
     OutEntry,
     StorageLockData,
+    identity_from_key,
     is_dir_hash,
 )
 
@@ -94,23 +96,8 @@ def is_lock_data(data: object) -> TypeGuard[StorageLockData]:
     return True
 
 
-def _split_identity(identity: str) -> tuple[str, str | None]:
-    if ":" in identity:
-        producer, key = identity.split(":", 1)
-        if key == "":
-            return producer, None
-        return producer, key
-    return identity, None
-
-
-def _build_identity(producer: str, key: str | None) -> str:
-    if key is None:
-        return producer
-    return f"{producer}:{key}"
-
-
 def _get_output_tag(hash_info: HashInfo) -> str:
-    raw: dict[str, object] = cast("dict[str, object]", cast(object, hash_info))
+    raw: dict[str, object] = cast("dict[str, object]", cast("object", hash_info))
     value = raw.get("tag")
     if isinstance(value, str):
         return value
@@ -119,10 +106,12 @@ def _get_output_tag(hash_info: HashInfo) -> str:
 
 def _convert_to_storage_format(data: LockData) -> StorageLockData:
     """Convert internal LockData to storage format (list-based, identity keys, sorted)."""
+    normalized_deps = _ensure_identity_keys(data["dep_hashes"])
+    normalized_outs = _ensure_identity_keys(data["output_hashes"])
+
     deps_list = list[DepEntry]()
-    for identity, hash_info in data["dep_hashes"].items():
-        producer, key = _split_identity(identity)
-        entry = DepEntry(producer=producer, key=key, hash=hash_info["hash"])
+    for identity, hash_info in normalized_deps.items():
+        entry = DepEntry(producer=identity.producer, key=identity.key, hash=hash_info["hash"])
         if is_dir_hash(hash_info):
             entry["manifest"] = hash_info["manifest"]
         raw_info = dict(hash_info)  # shallow copy to check extra keys
@@ -134,15 +123,13 @@ def _convert_to_storage_format(data: LockData) -> StorageLockData:
     deps_list.sort(key=lambda e: (e["producer"], e["key"] or ""))
 
     outs_list = list[OutEntry]()
-    for identity, hash_info in data["output_hashes"].items():
-        _producer, key = _split_identity(identity)
-        entry = OutEntry(key=key, hash=hash_info["hash"], tag=_get_output_tag(hash_info))
+    for identity, hash_info in normalized_outs.items():
+        entry = OutEntry(key=identity.key, hash=hash_info["hash"], tag=_get_output_tag(hash_info))
         if is_dir_hash(hash_info):
             entry["manifest"] = hash_info["manifest"]
         outs_list.append(entry)
     outs_list.sort(key=lambda e: e["key"] or "")
 
-    # Sort code_manifest keys for deterministic output across interpreter sessions
     sorted_code_manifest = dict(sorted(data["code_manifest"].items()))
 
     storage = StorageLockData(
@@ -160,15 +147,14 @@ def _convert_to_storage_format(data: LockData) -> StorageLockData:
 
 
 def _convert_from_storage_format(data: StorageLockData, *, stage_name: str) -> LockData:
-    """Convert storage format (list-based, identity keys) to internal LockData."""
-    dep_hashes = dict[str, HashInfo]()
+    """Convert storage format (list-based) to internal LockData (identity-keyed)."""
+    dep_hashes = dict[ArtifactIdentity, HashInfo]()
     for entry in data["deps"]:
-        identity = _build_identity(entry["producer"], entry["key"])
+        identity = ArtifactIdentity(entry["producer"], entry["key"])
         if "manifest" in entry:
             hash_info: HashInfo = DirHash(hash=entry["hash"], manifest=entry["manifest"])
         else:
             hash_info = FileHash(hash=entry["hash"])
-        # Attach accessed_keys/hashes as extra dict entries for per-key skip detection
         if "accessed_keys" in entry or "accessed_hashes" in entry:
             raw = dict[str, object](hash=hash_info["hash"])  # type: ignore[call-overload] - building mutable copy
             if is_dir_hash(hash_info):
@@ -177,19 +163,19 @@ def _convert_from_storage_format(data: StorageLockData, *, stage_name: str) -> L
                 raw["accessed_keys"] = entry["accessed_keys"]
             if "accessed_hashes" in entry:
                 raw["accessed_hashes"] = entry["accessed_hashes"]
-            dep_hashes[identity] = cast("HashInfo", cast(object, raw))
+            dep_hashes[identity] = cast("HashInfo", cast("object", raw))
         else:
             dep_hashes[identity] = hash_info
 
-    output_hashes = dict[str, HashInfo]()
+    output_hashes = dict[ArtifactIdentity, HashInfo]()
     for entry in data["outs"]:
-        identity = _build_identity(stage_name, entry["key"])
+        identity = ArtifactIdentity(stage_name, entry["key"])
         if "manifest" in entry:
             output_hashes[identity] = DirHash(hash=entry["hash"], manifest=entry["manifest"])
         else:
             output_hashes[identity] = FileHash(hash=entry["hash"])
 
-    result = LockData(
+    return LockData(
         code_manifest=data["code_manifest"],
         params=data["params"],
         dep_hashes=dep_hashes,
@@ -197,7 +183,26 @@ def _convert_from_storage_format(data: StorageLockData, *, stage_name: str) -> L
         merkle_id=data.get("merkle_id"),
     )
 
-    return result
+
+def _ensure_identity_keys(
+    hashes: dict[ArtifactIdentity, HashInfo] | dict[str, HashInfo],
+) -> dict[ArtifactIdentity, HashInfo]:
+    if not hashes:
+        return {}
+    first_key = next(iter(hashes))
+    if isinstance(first_key, ArtifactIdentity):
+        return cast("dict[ArtifactIdentity, HashInfo]", hashes)
+    return {identity_from_key(k): v for k, v in cast("dict[str, HashInfo]", hashes).items()}
+
+
+def _ensure_identity_list(
+    paths: list[ArtifactIdentity] | list[str],
+) -> list[ArtifactIdentity]:
+    if not paths:
+        return []
+    if isinstance(paths[0], ArtifactIdentity):
+        return cast("list[ArtifactIdentity]", paths)
+    return [identity_from_key(p) for p in cast("list[str]", paths)]
 
 
 class StageLock:
@@ -256,10 +261,9 @@ class StageLock:
         self,
         current_fingerprint: dict[str, str],
         current_params: dict[str, Any],
-        dep_hashes: dict[str, HashInfo],
-        out_paths: list[str] | None = None,
+        dep_hashes: dict[ArtifactIdentity, HashInfo] | dict[str, HashInfo],
+        out_paths: list[ArtifactIdentity] | list[str] | None = None,
     ) -> tuple[bool, str]:
-        """Check if stage needs re-run (reads lock file)."""
         lock_data = self.read()
         return self.is_changed_with_lock_data(
             lock_data, current_fingerprint, current_params, dep_hashes, out_paths
@@ -270,10 +274,9 @@ class StageLock:
         lock_data: LockData | None,
         current_fingerprint: dict[str, str],
         current_params: dict[str, Any],
-        dep_hashes: dict[str, HashInfo],
-        out_paths: list[str] | None = None,
+        dep_hashes: dict[ArtifactIdentity, HashInfo] | dict[str, HashInfo],
+        out_paths: list[ArtifactIdentity] | list[str] | None = None,
     ) -> tuple[bool, str]:
-        """Check if stage needs re-run (pure comparison, no I/O)."""
         if lock_data is None:
             return True, "No previous run"
 
@@ -281,11 +284,13 @@ class StageLock:
             return True, "Code changed"
         if lock_data["params"] != current_params:
             return True, "Params changed"
-        if lock_data["dep_hashes"] != dep_hashes:
+        normalized_deps = _ensure_identity_keys(dep_hashes)
+        if lock_data["dep_hashes"] != normalized_deps:
             return True, "Input dependencies changed"
         if out_paths is not None:
             locked_out_paths = sorted(lock_data["output_hashes"].keys())
-            if sorted(out_paths) != locked_out_paths:
+            normalized_outs = _ensure_identity_list(out_paths)
+            if sorted(normalized_outs) != locked_out_paths:
                 return True, "Output paths changed"
 
         return False, ""
