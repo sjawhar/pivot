@@ -1196,6 +1196,19 @@ class Engine:
             retention=retention,
         )
 
+        # Materialize presentation symlinks for successful stages
+        from pivot.storage import presentation
+
+        try:
+            presentation.present(
+                project_root=project_root,
+                pipeline_name=pipeline.name,
+                cache_dir=cache_dir / "files",
+                stages=all_stages,
+            )
+        except Exception:
+            _logger.debug("Presentation layer failed", exc_info=True)
+
         return results
 
     def _wait_for_futures_snapshot(
