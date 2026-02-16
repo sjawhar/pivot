@@ -132,7 +132,7 @@ def test_resolve_targets_as_stage(git_repo: GitRepo, monkeypatch: pytest.MonkeyP
     assert len(targets) == 1
     assert targets[0]["target_type"] == "stage"
     assert targets[0]["original_target"] == "train"
-    assert "model.pkl" in targets[0]["paths"]
+    assert "train" in targets[0]["paths"]
 
 
 def test_resolve_targets_as_pvt_file(git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch) -> None:

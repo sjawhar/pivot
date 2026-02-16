@@ -4,12 +4,12 @@ import enum
 import logging
 import os
 import pathlib
-from typing import TYPE_CHECKING, TypedDict, TypeGuard, cast
+from typing import TYPE_CHECKING, TypedDict, TypeGuard
 
 import xxhash
 import yaml
 
-from pivot import exceptions, git, project, yaml_config
+from pivot import exceptions, git, project, types, yaml_config
 from pivot.remote import storage as remote
 from pivot.storage import cache, lock, track
 from pivot.types import DirHash, FileHash
@@ -130,15 +130,14 @@ def _normalize_target_path(target: str, proj_root: pathlib.Path) -> str:
         ) from None
 
 
-def _entry_display(entry: OutEntry) -> str:
-    raw = cast("dict[str, object]", cast("object", entry))
-    path_value = raw.get("path")
-    if isinstance(path_value, str):
-        return path_value
-    display = entry.get("display", entry.get("key", "unknown"))
-    if display is None:
-        return "unknown"
-    return display
+def _entry_display(entry: OutEntry) -> str:  # pyright: ignore[reportUnusedFunction] - used in tests
+    display = entry.get("display")
+    if isinstance(display, str):
+        return display
+    key = entry.get("key")
+    if isinstance(key, str):
+        return key
+    return "unknown"
 
 
 def resolve_targets(
@@ -156,10 +155,13 @@ def resolve_targets(
             lock_data = get_lock_data_from_revision(target, rev, state_dir)
             if lock_data is not None and "outs" in lock_data:
                 outs = lock_data["outs"]
-                paths = [_entry_display(entry) for entry in outs]
-                hashes: dict[str, HashInfo | None] = {
-                    _entry_display(entry): _out_entry_to_output_hash(entry) for entry in outs
-                }
+                paths: list[str] = []
+                hashes: dict[str, HashInfo | None] = {}
+                for entry in outs:
+                    identity = types.ArtifactIdentity(target, entry["key"])
+                    display = types.identity_key(identity)
+                    paths.append(display)
+                    hashes[display] = _out_entry_to_output_hash(entry)
                 results.append(
                     TargetInfo(
                         target_type=TargetType.STAGE,
