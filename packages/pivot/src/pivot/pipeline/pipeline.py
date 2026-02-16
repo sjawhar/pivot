@@ -237,26 +237,22 @@ class Pipeline:
         """Compute/return cached code fingerprint for a stage."""
         return self._registry.ensure_fingerprint(name)
 
-    def build_dag(self, validate: bool = True) -> DiGraph[str]:
+    def build_dag(self) -> DiGraph[str]:
         """Build DAG from registered stages.
 
         Automatically resolves external dependencies before building. For each
         dependency without a local producer, searches for pipelines starting from
         the dependency's directory and traversing up to project root.
 
-        Args:
-            validate: If True, validate that all dependencies exist
-
         Returns:
             NetworkX DiGraph with stages as nodes and dependencies as edges
 
         Raises:
             CyclicGraphError: If graph contains cycles
-            DependencyNotFoundError: If dependency doesn't exist (when validate=True)
         """
         # Auto-resolve external dependencies before building
         self.resolve_external_dependencies()
-        dag = self._registry.build_dag(validate=validate)
+        dag = self._registry.build_dag()
         self._write_output_index()
         return dag
 

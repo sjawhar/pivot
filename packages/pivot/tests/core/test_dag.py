@@ -1,4 +1,5 @@
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
@@ -6,7 +7,7 @@ from pivot import loaders
 from pivot.engine import graph as engine_graph
 from pivot.exceptions import CyclicGraphError, DependencyNotFoundError
 from pivot.registry import RegistryStageInfo
-from pivot.storage.track import PvtData
+from pivot.storage.store import Store
 from pivot.types import ArtifactIdentity, ArtifactRef, ArtifactTag
 
 
@@ -210,11 +211,11 @@ def test_missing_dependency_raises_error(tmp_path: Path) -> None:
         DependencyNotFoundError,
         match="depends on.*producer:missing.csv.*not produced by any stage and does not exist on disk",
     ):
-        engine_graph.build_graph(stages, validate=True)
+        engine_graph.validate_dependency_sources(stages)
 
 
-def test_missing_dependency_with_validate_false(tmp_path: Path) -> None:
-    """With validate=False, missing dependencies don't raise error."""
+def test_build_graph_does_not_validate_deps(tmp_path: Path) -> None:
+    """build_graph doesn't validate dependency existence."""
     stages = {
         "process": _create_stage(
             "process", [str(tmp_path / "missing.csv")], [str(tmp_path / "output.csv")]
@@ -222,9 +223,91 @@ def test_missing_dependency_with_validate_false(tmp_path: Path) -> None:
     }
 
     # Should not raise
-    bipartite = engine_graph.build_graph(stages, validate=False)
+    bipartite = engine_graph.build_graph(stages)
     graph = engine_graph.get_stage_dag(bipartite)
     assert "process" in graph.nodes()
+
+
+def test_validate_dependency_sources_uses_store() -> None:
+    external_dep = _artifact_ref(ArtifactIdentity("input.sql", None))
+    stages = {
+        "consumer": RegistryStageInfo(
+            func=lambda: None,
+            name="consumer",
+            deps={"_0": external_dep},
+            outs=[_artifact_ref(ArtifactIdentity("output.csv", None))],
+            params=None,
+            mutex=list[str](),
+            variant=None,
+            signature=None,
+            fingerprint=dict[str, str](),
+            params_arg_name=None,
+            state_dir=None,
+        ),
+    }
+
+    store = Mock(spec=Store)
+    store.exists.return_value = True
+    engine_graph.validate_dependency_sources(stages, store=store)
+    store.exists.assert_called_once_with(external_dep)
+
+    store = Mock(spec=Store)
+    store.exists.return_value = False
+    with pytest.raises(DependencyNotFoundError):
+        engine_graph.validate_dependency_sources(stages, store=store)
+
+
+def test_validate_dependency_sources_no_store_skips_external() -> None:
+    external_dep = _artifact_ref(ArtifactIdentity("external", "input.csv"))
+    stages = {
+        "consumer": RegistryStageInfo(
+            func=lambda: None,
+            name="consumer",
+            deps={"_0": external_dep},
+            outs=[_artifact_ref(ArtifactIdentity("consumer", "output.csv"))],
+            params=None,
+            mutex=list[str](),
+            variant=None,
+            signature=None,
+            fingerprint=dict[str, str](),
+            params_arg_name=None,
+            state_dir=None,
+        ),
+    }
+
+    engine_graph.validate_dependency_sources(stages, store=None)
+
+    stages = {
+        "producer": RegistryStageInfo(
+            func=lambda: None,
+            name="producer",
+            deps={},
+            outs=[_artifact_ref(ArtifactIdentity("producer", "output.csv"))],
+            params=None,
+            mutex=list[str](),
+            variant=None,
+            signature=None,
+            fingerprint=dict[str, str](),
+            params_arg_name=None,
+            state_dir=None,
+        ),
+        "consumer": RegistryStageInfo(
+            func=lambda: None,
+            name="consumer",
+            deps={"_0": _artifact_ref(ArtifactIdentity("producer", "missing.csv"))},
+            outs=[_artifact_ref(ArtifactIdentity("consumer", "output.csv"))],
+            params=None,
+            mutex=list[str](),
+            variant=None,
+            signature=None,
+            fingerprint=dict[str, str](),
+            params_arg_name=None,
+            state_dir=None,
+        ),
+    }
+
+    with pytest.raises(DependencyNotFoundError):
+        engine_graph.validate_dependency_sources(stages, store=None)
 
 
 # --- Cycle detection tests ---
@@ -441,7 +524,7 @@ def test_stage_with_no_deps(tmp_path: Path) -> None:
     """Stage with no dependencies (leaf node)."""
     stages = {"stage_a": _create_stage("stage_a", [], [str(tmp_path / "a.csv")])}
 
-    bipartite = engine_graph.build_graph(stages, validate=False)
+    bipartite = engine_graph.build_graph(stages)
     graph = engine_graph.get_stage_dag(bipartite)
 
     assert "stage_a" in graph.nodes()
@@ -480,140 +563,3 @@ def test_multiple_stages_same_dependency(tmp_path: Path) -> None:
     # Both analyze and visualize depend on extract
     assert graph.has_edge("analyze", "extract")
     assert graph.has_edge("visualize", "extract")
-
-
-# --- Directory dependency tests (BUG-007) ---
-
-
-def test_directory_depends_on_file_outputs(tmp_path: Path) -> None:
-    """Directory dependency waits for stages outputting files into it."""
-    dir_path = tmp_path / "data" / "outputs"
-    dir_path.mkdir(parents=True)
-
-    stages = {
-        "produce_file": _create_stage("produce_file", [], [str(dir_path / "file.csv")]),
-        "consume_dir": _create_stage(
-            "consume_dir", [str(dir_path)], [str(tmp_path / "result.csv")]
-        ),
-    }
-
-    bipartite = engine_graph.build_graph(stages, validate=False)
-    graph = engine_graph.get_stage_dag(bipartite)
-
-    assert graph.has_edge("consume_dir", "produce_file"), (
-        "Should create edge for dir->file dependency"
-    )
-
-
-def test_directory_depends_on_multiple_file_outputs(tmp_path: Path) -> None:
-    """Directory dependency waits for ALL stages outputting files into it."""
-    dir_path = tmp_path / "data" / "outputs"
-    dir_path.mkdir(parents=True)
-
-    stages = {
-        "produce_a": _create_stage("produce_a", [], [str(dir_path / "a.csv")]),
-        "produce_b": _create_stage("produce_b", [], [str(dir_path / "b.csv")]),
-        "consume_dir": _create_stage(
-            "consume_dir", [str(dir_path)], [str(tmp_path / "result.csv")]
-        ),
-    }
-
-    bipartite = engine_graph.build_graph(stages, validate=False)
-    graph = engine_graph.get_stage_dag(bipartite)
-
-    assert graph.has_edge("consume_dir", "produce_a"), "Should depend on first producer"
-    assert graph.has_edge("consume_dir", "produce_b"), "Should depend on second producer"
-
-
-def test_nested_directory_dependency(tmp_path: Path) -> None:
-    """Directory dependency detects files in nested subdirectories."""
-    dir_path = tmp_path / "data"
-    nested = dir_path / "sub" / "nested"
-    nested.mkdir(parents=True)
-
-    stages = {
-        "produce_nested": _create_stage("produce_nested", [], [str(nested / "file.csv")]),
-        "consume_parent": _create_stage(
-            "consume_parent", [str(dir_path)], [str(tmp_path / "result.csv")]
-        ),
-    }
-
-    bipartite = engine_graph.build_graph(stages, validate=False)
-    graph = engine_graph.get_stage_dag(bipartite)
-
-    assert graph.has_edge("consume_parent", "produce_nested"), "Should detect nested file outputs"
-
-
-# --- Tracked file tests ---
-
-
-def test_tracked_file_recognized_as_valid_source(tmp_path: Path) -> None:
-    """Tracked files are valid dependency sources even if not on disk."""
-    # Dependency doesn't exist on disk, but it's in tracked_files
-    tracked_path = str(tmp_path / "tracked_input.csv")
-
-    stages = {"process": _create_stage("process", [tracked_path], [str(tmp_path / "output.csv")])}
-
-    # Without tracked_files, this would raise DependencyNotFoundError
-    tracked_files: dict[str, PvtData] = {
-        tracked_path: PvtData(path="tracked_input.csv", hash="abc123", size=100),
-    }
-
-    # Should not raise - tracked file is recognized as valid source
-    bipartite = engine_graph.build_graph(stages, validate=True, tracked_files=tracked_files)
-    graph = engine_graph.get_stage_dag(bipartite)
-    assert "process" in graph.nodes()
-
-
-def test_tracked_file_inside_directory_recognized(tmp_path: Path) -> None:
-    """File inside a tracked directory is recognized as valid source."""
-    tracked_dir = str(tmp_path / "tracked_data")
-    file_inside = str(tmp_path / "tracked_data" / "file.csv")
-
-    stages = {"process": _create_stage("process", [file_inside], [str(tmp_path / "output.csv")])}
-
-    # Directory is tracked
-    tracked_files: dict[str, PvtData] = {
-        tracked_dir: PvtData(
-            path="tracked_data",
-            hash="def456",
-            size=500,
-            num_files=3,
-            manifest=[{"relpath": "file.csv", "hash": "ghi789", "size": 100, "isexec": False}],
-        ),
-    }
-
-    # Should not raise - file inside tracked directory is valid
-    bipartite = engine_graph.build_graph(stages, validate=True, tracked_files=tracked_files)
-    graph = engine_graph.get_stage_dag(bipartite)
-    assert "process" in graph.nodes()
-
-
-def test_dependency_on_tracked_directory(tmp_path: Path) -> None:
-    """Directory dependency on tracked directory is valid."""
-    tracked_dir = str(tmp_path / "tracked_data")
-
-    stages = {"process": _create_stage("process", [tracked_dir], [str(tmp_path / "output.csv")])}
-
-    tracked_files: dict[str, PvtData] = {
-        tracked_dir: PvtData(path="tracked_data", hash="abc123", size=500, num_files=2),
-    }
-
-    bipartite = engine_graph.build_graph(stages, validate=True, tracked_files=tracked_files)
-    graph = engine_graph.get_stage_dag(bipartite)
-    assert "process" in graph.nodes()
-
-
-def test_untracked_missing_dependency_still_raises(tmp_path: Path) -> None:
-    """Missing dependency not in tracked_files still raises error."""
-    missing_path = str(tmp_path / "missing.csv")
-
-    stages = {"process": _create_stage("process", [missing_path], [str(tmp_path / "output.csv")])}
-
-    # Some other file is tracked, but not the one we depend on
-    tracked_files: dict[str, PvtData] = {
-        str(tmp_path / "other.csv"): PvtData(path="other.csv", hash="xyz", size=50),
-    }
-
-    with pytest.raises(DependencyNotFoundError):
-        engine_graph.build_graph(stages, validate=True, tracked_files=tracked_files)

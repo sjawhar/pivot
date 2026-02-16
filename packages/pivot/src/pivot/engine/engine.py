@@ -828,6 +828,7 @@ class Engine:
         """Orchestrate parallel stage execution with the async event loop."""
         import datetime
 
+        from pivot import exceptions as pivot_exceptions
         from pivot import run_history
 
         # Record start time for run history
@@ -840,9 +841,18 @@ class Engine:
         project_root = project.get_project_root()
         executor_core.verify_tracked_files(project_root, checkout_missing=checkout_missing)
 
-        # Build bipartite graph (single source of truth) with validation
+        # Build bipartite graph (single source of truth)
         all_stages = self._get_all_stages()
-        graph = engine_graph.build_graph(all_stages, validate=True)
+        graph = engine_graph.build_graph(all_stages)
+        pipeline = self._pipeline
+        if pipeline is None:
+            raise pivot_exceptions.PipelineNotFoundError("No active pipeline registered.")
+        store = store_mod.WorkspaceStore(
+            project_root=project_root,
+            pipeline_name=pipeline.name,
+            input_bindings={},
+        )
+        engine_graph.validate_dependency_sources(all_stages, store=store)
         self._graph = graph
 
         # Extract stage-only DAG for execution order
@@ -852,9 +862,10 @@ class Engine:
             registered = set(stage_dag.nodes())
             unknown = [s for s in stages if s not in registered]
             if unknown:
-                from pivot import exceptions
-
-                raise exceptions.StageNotFoundError(unknown, available_stages=list(registered))
+                raise pivot_exceptions.StageNotFoundError(
+                    unknown,
+                    available_stages=list(registered),
+                )
 
         execution_order = engine_graph.get_execution_order(
             stage_dag, stages, single_stage=single_stage
@@ -869,10 +880,8 @@ class Engine:
                 execution_order, self._get_all_stages()
             )
             if uncached:
-                from pivot import exceptions
-
                 files_list = "\n".join(f"  - {stage}: {path}" for stage, path in uncached)
-                raise exceptions.UncachedIncrementalOutputError(
+                raise pivot_exceptions.UncachedIncrementalOutputError(
                     f"The following IncrementalOut files exist but are not in cache:\n{files_list}\n\n"
                     + "Running the pipeline will DELETE these files and they cannot be restored.\n"
                     + "To proceed anyway, use allow_uncached_incremental=True or back up these files first."
@@ -2057,6 +2066,7 @@ class Engine:
         # Reload bypasses Pipeline.build_dag() so we must resolve explicitly.
         self._require_pipeline().resolve_external_dependencies()
         all_stages = self._get_all_stages()
+        # Hot-reload: skip dependency validation — deps may be temporarily missing while user edits
         self._graph = engine_graph.build_graph(all_stages)
 
         # Update watch paths if we have a FilesystemSource

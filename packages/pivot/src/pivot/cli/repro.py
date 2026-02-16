@@ -133,7 +133,10 @@ def _get_explanations(
     all_stages = cli_helpers.get_all_stages()
 
     # Build graph with validation when allow_missing is False
-    graph = engine_graph.build_graph(all_stages, validate=not allow_missing)
+    graph = engine_graph.build_graph(all_stages)
+    if not allow_missing:
+        ws = cli_helpers.get_workspace_store()
+        engine_graph.validate_dependency_sources(all_stages, store=ws)
 
     return status_mod.get_pipeline_explanations(
         stages_list,
@@ -229,7 +232,7 @@ def _run_pipeline(
         )
 
     # Build DAG and get execution order for TUI display and worker pre-warming
-    graph = cli_helpers.build_dag(validate=True)
+    graph = cli_helpers.build_dag()
     execution_order = engine_graph.get_execution_order(graph, stages_list, single_stage=False)
 
     if not execution_order and not watch:
@@ -349,7 +352,7 @@ def _run_watch_mode(  # noqa: PLR0913 - many params needed for different modes
 
     # Build bipartite graph for watch paths
     all_stages = cli_helpers.get_all_stages()
-    engine_graph.build_graph(all_stages)
+    engine_graph.build_graph(all_stages)  # Cycle check only (graph result unused)
     watch_paths = _watch_paths_from_registry(all_stages)
 
     # Sort for display: group matrix variants together while preserving DAG structure
@@ -491,7 +494,7 @@ def _run_serve_mode(
     async def serve_main() -> None:
         # Build watch paths
         all_stages = cli_helpers.get_all_stages()
-        engine_graph.build_graph(all_stages)
+        engine_graph.build_graph(all_stages)  # Cycle check only (graph result unused)
         watch_paths = _watch_paths_from_registry(all_stages)
 
         async with engine.Engine(pipeline=pipeline, all_pipelines=use_all_pipelines) as eng:
