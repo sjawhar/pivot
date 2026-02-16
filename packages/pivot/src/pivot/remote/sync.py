@@ -1,3 +1,4 @@
+# pyright: reportImplicitRelativeImport=false
 from __future__ import annotations
 
 import asyncio
@@ -109,7 +110,7 @@ def get_stage_dep_hashes(state_dir: pathlib.Path, stage_names: list[str]) -> set
 
 
 def _get_file_hash_from_stages(
-    abs_path: str,
+    target_identity_key: str,
     state_dir: pathlib.Path,
     all_stages: dict[str, RegistryStageInfo] | None = None,
 ) -> HashInfo | None:
@@ -127,10 +128,8 @@ def _get_file_hash_from_stages(
                 if out.tag is types.ArtifactTag.METRIC
             }
             for out_path, out_hash in lock_data["output_hashes"].items():
-                if (
-                    types.identity_key(out_path) == abs_path
-                    and types.identity_key(out_path) not in non_cached_paths
-                ):
+                identity_key = types.identity_key(out_path)
+                if identity_key == target_identity_key and identity_key not in non_cached_paths:
                     return out_hash
         return None
 
@@ -159,10 +158,8 @@ def _get_file_hash_from_stages(
             continue
 
         for out_path, out_hash in lock_data["output_hashes"].items():
-            if (
-                types.identity_key(out_path) == abs_path
-                and types.identity_key(out_path) not in non_cached_paths
-            ):
+            identity_key = types.identity_key(out_path)
+            if identity_key == target_identity_key and identity_key not in non_cached_paths:
                 return out_hash
 
     return None
@@ -223,15 +220,34 @@ def get_target_hashes(
                             hashes |= _extract_file_hashes_from_hash_info(dep_hash)
                     continue
 
+        target_identity = types.identity_from_key(target)
+        is_identity_target = (
+            all_stages is not None
+            and target_identity.producer in all_stages
+            and target not in all_stages
+        )
+        if is_identity_target:
+            out_hash = _get_file_hash_from_stages(
+                types.identity_key(target_identity),
+                state_dir,
+                all_stages,
+            )
+            if out_hash is not None:
+                hashes |= _extract_file_hashes_from_hash_info(out_hash)
+                continue
+
         # Strip .pvt suffix if present (CLI normalizes these, but be defensive)
         target_p = pathlib.Path(target)
         if target_p.suffix == ".pvt":
             target = str(track.get_data_path(target_p))
+            target_identity = types.identity_from_key(target)
 
         abs_path = str(project.normalize_path(target))
         rel_path = project.to_relative_path(abs_path, proj_root)
 
-        out_hash = _get_file_hash_from_stages(abs_path, state_dir, all_stages)
+        out_hash = _get_file_hash_from_stages(
+            types.identity_key(target_identity), state_dir, all_stages
+        )
         if out_hash is not None:
             hashes |= _extract_file_hashes_from_hash_info(out_hash)
             continue
