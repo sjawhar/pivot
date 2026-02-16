@@ -8,11 +8,13 @@ import click
 from tqdm import tqdm
 
 from pivot.types import (
+    ArtifactIdentity,
     DisplayCategory,
     StageDisplayStatus,
     StageExplanation,
     StageStatus,
     categorize_stage_result,
+    identity_key,
 )
 
 # ANSI color codes
@@ -255,6 +257,8 @@ class Console:
 
         for change in changes:
             key = change[key_field]
+            if isinstance(key, ArtifactIdentity):
+                key = identity_key(key)
             change_type = change["change_type"]
             old_val = change[old_field]
             new_val = change[new_field]
@@ -295,7 +299,7 @@ class Console:
             "Param Changes:", explanation["param_changes"], "key", "old_value", "new_value"
         )
         self._print_changes(
-            "Dependency Changes:", explanation["dep_changes"], "path", "old_hash", "new_hash"
+            "Dependency Changes:", explanation["dep_changes"], "identity", "old_hash", "new_hash"
         )
 
     def explain_summary(self, will_run: int, unchanged: int) -> None:
