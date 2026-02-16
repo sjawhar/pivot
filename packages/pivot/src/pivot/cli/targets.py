@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import pathlib
-from typing import TYPE_CHECKING, Any, TypedDict
+from typing import TYPE_CHECKING, Any, Literal, TypedDict
 
 import click
 
@@ -11,9 +11,12 @@ from pivot.cli import helpers as cli_helpers
 from pivot.engine import graph as engine_graph
 
 if TYPE_CHECKING:
+    from collections.abc import Callable, Mapping
+
     import networkx as nx
 
     from pivot.pipeline.pipeline import Pipeline
+    from pivot.registry import RegistryStageInfo
     from pivot.show import plots as plots_mod
 
 logger = logging.getLogger(__name__)
@@ -30,6 +33,89 @@ class ResolvedTarget(TypedDict):
     is_stage: bool
     is_file: bool
     norm_path: str
+
+
+class IdentityTarget(TypedDict):
+    """CLI target resolved to a stage identity."""
+
+    kind: Literal["identity"]
+    identity: types.ArtifactIdentity
+    stage_name: str
+    refs: list[types.ArtifactRef]
+
+
+class PvtTarget(TypedDict):
+    """CLI target resolved to a .pvt-tracked file."""
+
+    kind: Literal["pvt"]
+    path: str
+
+
+def parse_identity_target(target: str) -> types.ArtifactIdentity:
+    """Parse a CLI target string into an ArtifactIdentity.
+
+    Accepts ``"stage_name"`` or ``"stage_name:key"`` format.
+    """
+    return types.identity_from_key(target)
+
+
+def resolve_cli_target(
+    target: str,
+    all_stages: Mapping[str, RegistryStageInfo],
+    pvt_exists: Callable[[str], bool],
+) -> IdentityTarget | PvtTarget:
+    """Resolve a CLI target to an identity or pvt target.
+
+    Resolution order:
+    1. Parse as identity (``"stage"`` or ``"stage:key"``)
+    2. If producer is a registered stage, return IdentityTarget
+    3. If target has a ``.pvt`` sidecar, return PvtTarget
+    4. Otherwise raise TargetValidationError
+
+    Args:
+        target: CLI target string.
+        all_stages: All registered stages by name.
+        pvt_exists: Callable that checks if a path has a .pvt sidecar.
+
+    Returns:
+        IdentityTarget or PvtTarget.
+
+    Raises:
+        TargetValidationError: If target cannot be resolved.
+    """
+    identity = parse_identity_target(target)
+
+    if identity.producer in all_stages:
+        stage_info = all_stages[identity.producer]
+        stage_outs: list[types.ArtifactRef] = stage_info["outs"]
+
+        if identity.key is not None:
+            # Filter to matching key
+            matching = [out for out in stage_outs if out.identity.key == identity.key]
+            if not matching:
+                available_keys = [types.identity_key(out.identity) for out in stage_outs]
+                raise TargetValidationError(
+                    f"Stage '{identity.producer}' has no output key '{identity.key}'. "
+                    f"Available: {', '.join(available_keys) or '(none)'}"
+                )
+            refs = matching
+        else:
+            refs = stage_outs
+
+        return IdentityTarget(
+            kind="identity",
+            identity=identity,
+            stage_name=identity.producer,
+            refs=refs,
+        )
+
+    # Not a stage — check if .pvt tracked
+    if pvt_exists(target):
+        return PvtTarget(kind="pvt", path=target)
+
+    raise TargetValidationError(
+        f"Target '{target}' is neither a registered stage nor a .pvt-tracked file"
+    )
 
 
 def validate_targets(targets: tuple[str, ...]) -> list[str]:

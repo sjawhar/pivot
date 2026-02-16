@@ -246,6 +246,16 @@ class WorkspaceStore:
         file_hash, _ = cache.hash_file(path, None)
         return types.FileHash(hash=file_hash)
 
+    def resolve_display_path(self, ref: types.ArtifactRef) -> pathlib.Path:
+        """Resolve the workspace path for an artifact, for display/CLI use.
+
+        Unlike ``checkout``/``prepare_output``, this does not mutate internal
+        state (collision map, output producers set).  It always treats the ref
+        as an output, which is correct for stage-produced artifacts shown in
+        CLI commands.
+        """
+        return self._resolve_output_path(ref)
+
     def exists(self, ref: types.ArtifactRef) -> bool:
         path = self._resolve_path(ref)
         return path.exists() or path.is_symlink()

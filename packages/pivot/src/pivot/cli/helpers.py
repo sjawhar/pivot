@@ -14,8 +14,9 @@ if TYPE_CHECKING:
     from pivot.cli import CliContext
     from pivot.pipeline.pipeline import Pipeline
     from pivot.registry import RegistryStageInfo, StageRegistry
+    from pivot.storage.store import WorkspaceStore
 
-from pivot import exceptions
+from pivot import exceptions, project
 from pivot.cli import decorators as cli_decorators
 
 
@@ -70,6 +71,20 @@ def get_all_stages() -> dict[str, RegistryStageInfo]:
 def build_dag(validate: bool = True) -> DiGraph[str]:
     """Build DAG from Pipeline in context."""
     return _get_pipeline().build_dag(validate=validate)
+
+
+def get_workspace_store() -> WorkspaceStore | None:
+    """Get a WorkspaceStore for display/path resolution, or None if no pipeline."""
+    from pivot.storage import store as store_mod
+
+    pipeline = cli_decorators.get_pipeline_from_context()
+    if pipeline is None:
+        return None
+    return store_mod.WorkspaceStore(
+        project_root=project.get_project_root(),
+        pipeline_name=pipeline.name,
+        input_bindings={},
+    )
 
 
 def _json_default(obj: Any) -> Any:  # noqa: ANN401 - json.dumps default requires Any
