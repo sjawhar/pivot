@@ -81,7 +81,7 @@ def commit_stages(
         cache_dir=str(files_cache_dir),
         project_root=str(project_root),
         pipeline_name=pipeline.name,
-        input_bindings={},
+        input_bindings=pipeline.input_bindings,
     )
     store = store_mod.store_from_spec(store_spec)
 

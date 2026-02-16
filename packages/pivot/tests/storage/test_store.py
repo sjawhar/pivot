@@ -217,6 +217,25 @@ def test_workspace_store_collision_detection(tmp_path: pathlib.Path) -> None:
         _ = workspace_store.checkout(bar_ref)
 
 
+def test_workspace_store_resolves_external_input(tmp_path: pathlib.Path) -> None:
+    (tmp_path / "data" / "external").mkdir(parents=True)
+    (tmp_path / "data" / "external" / "ext.jsonl").write_text("[]")
+
+    workspace_store = store.WorkspaceStore(
+        project_root=tmp_path,
+        pipeline_name="test",
+        input_bindings={"ext.jsonl": "data/external/ext.jsonl"},
+    )
+    ref = types.ArtifactRef(
+        identity=types.ArtifactIdentity("ext.jsonl", None),
+        format=loaders.DataFrameJSONL(),
+        python_type=list,
+        tag=types.ArtifactTag.DATA,
+    )
+
+    assert workspace_store.exists(ref)
+
+
 def test_store_spec_round_trip(tmp_path: pathlib.Path) -> None:
     spec: store.StoreSpec = {
         "kind": "workspace",

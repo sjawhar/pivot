@@ -83,7 +83,7 @@ def get_workspace_store() -> WorkspaceStore | None:
     return store_mod.WorkspaceStore(
         project_root=project.get_project_root(),
         pipeline_name=pipeline.name,
-        input_bindings={},
+        input_bindings=pipeline.input_bindings,
     )
 
 

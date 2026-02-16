@@ -850,7 +850,7 @@ class Engine:
         store = store_mod.WorkspaceStore(
             project_root=project_root,
             pipeline_name=pipeline.name,
-            input_bindings={},
+            input_bindings=pipeline.input_bindings,
         )
         engine_graph.validate_dependency_sources(all_stages, store=store)
         self._graph = graph
@@ -1364,7 +1364,7 @@ class Engine:
             cache_dir=str(cache_dir / "files"),
             project_root=str(project_root),
             pipeline_name=pipeline.name,
-            input_bindings={},
+            input_bindings=pipeline.input_bindings,
         )
         started = 0
         max_to_start = self._effective_max_workers - len(self._futures)
@@ -1494,7 +1494,7 @@ class Engine:
             cache_dir=str(files_cache_dir),
             project_root=str(project_root),
             pipeline_name=pipeline.name,
-            input_bindings={},
+            input_bindings=pipeline.input_bindings,
         )
         store = store_mod.store_from_spec(store_spec)
 

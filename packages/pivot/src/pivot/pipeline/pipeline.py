@@ -170,6 +170,7 @@ class Pipeline:
     _root: pathlib.Path
     _registry: registry.StageRegistry
     _external_deps_resolved: bool
+    _input_bindings: dict[str, str]
 
     def __init__(
         self,
@@ -188,6 +189,7 @@ class Pipeline:
         self._name = name
         self._registry = registry.StageRegistry()
         self._external_deps_resolved = False
+        self._input_bindings = {}
 
         if root is not None:
             self._root = root.resolve()
@@ -220,6 +222,13 @@ class Pipeline:
     def state_dir(self) -> pathlib.Path:
         """State directory for this pipeline's lock files and state.db."""
         return self._root / ".pivot"
+
+    def set_input_bindings(self, bindings: dict[str, str]) -> None:
+        self._input_bindings = bindings.copy()
+
+    @property
+    def input_bindings(self) -> dict[str, str]:
+        return self._input_bindings.copy()
 
     def list_stages(self) -> list[str]:
         """List all registered stage names."""
@@ -325,6 +334,10 @@ class Pipeline:
         for stage_info in stages_to_add:
             self._registry.add_existing(stage_info)
             existing_names.add(stage_info["name"])
+
+        for name, path in other.input_bindings.items():
+            if name not in self._input_bindings:
+                self._input_bindings[name] = path
 
         if stages_to_add:
             self._reset_resolution_cache()
