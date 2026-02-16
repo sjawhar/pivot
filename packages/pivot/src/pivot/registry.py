@@ -97,27 +97,22 @@ class StageRegistry:
             info["fingerprint"] = _compute_fingerprint(stage_name, info)
         return info["fingerprint"]
 
-    def build_dag(self, validate: bool = True) -> DiGraph[str]:
+    def build_dag(self) -> DiGraph[str]:
         """Build DAG from registered stages.
 
         Returns:
             NetworkX DiGraph with stages as nodes and dependencies as edges
         """
-        if validate and self._cached_dag is not None:
+        if self._cached_dag is not None:
             return self._cached_dag
 
         from pivot.engine import graph as engine_graph
 
-        # Build bipartite graph with validation, extract stage DAG
-        bipartite = engine_graph.build_graph(
-            self._stages,
-            validate=validate,
-        )
+        # Build bipartite graph, extract stage DAG
+        bipartite = engine_graph.build_graph(self._stages)
         graph = engine_graph.get_stage_dag(bipartite)
 
-        if validate:
-            self.validate_outputs()
-            self._cached_dag = graph
+        self._cached_dag = graph
 
         return graph
 
@@ -166,15 +161,6 @@ class StageRegistry:
     def get_all_output_paths(self) -> set[str]:
         """Get all registered output paths (for watch mode filtering)."""
         return set[str]()
-
-    def validate_outputs(self) -> None:
-        """Validate no output path conflicts between stages.
-
-        This is called once after all stages are registered, instead of
-        checking on every register() call. Raises OutputDuplicationError
-        or OverlappingOutputPathsError if conflicts are found.
-        """
-        return
 
 
 def _compute_fingerprint(stage_name: str, info: RegistryStageInfo) -> dict[str, str]:

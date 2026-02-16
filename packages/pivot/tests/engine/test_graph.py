@@ -1,3 +1,4 @@
+# pyright: reportMissingImports=false
 """Tests for the bipartite artifact-stage graph."""
 
 from __future__ import annotations
@@ -426,7 +427,7 @@ def test_build_graph_raises_on_cycle(tmp_path: Path) -> None:
 
 
 def test_build_graph_raises_on_missing_dependency(tmp_path: Path) -> None:
-    """build_graph raises DependencyNotFoundError when validate=True."""
+    """validate_dependency_sources raises DependencyNotFoundError for missing deps."""
     missing_dep = ArtifactIdentity("stage_b", "missing.csv")
 
     stages = {
@@ -437,11 +438,11 @@ def test_build_graph_raises_on_missing_dependency(tmp_path: Path) -> None:
     }
 
     with pytest.raises(exceptions.DependencyNotFoundError):
-        graph.build_graph(stages, validate=True)
+        graph.validate_dependency_sources(stages)
 
 
 def test_build_graph_allows_missing_when_validate_false(tmp_path: Path) -> None:
-    """build_graph allows missing deps when validate=False."""
+    """build_graph does not validate dependency existence."""
     output_identity = ArtifactIdentity("stage_a", "output.csv")
     missing_dep = ArtifactIdentity("external", "missing.csv")
 
@@ -450,7 +451,7 @@ def test_build_graph_allows_missing_when_validate_false(tmp_path: Path) -> None:
     }
 
     # Should not raise
-    g = graph.build_graph(stages, validate=False)
+    g = graph.build_graph(stages)
     assert "stage:stage_a" in g
 
 

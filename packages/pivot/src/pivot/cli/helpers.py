@@ -68,9 +68,9 @@ def get_all_stages() -> dict[str, RegistryStageInfo]:
     return {name: pipeline.get(name) for name in pipeline.list_stages()}
 
 
-def build_dag(validate: bool = True) -> DiGraph[str]:
+def build_dag() -> DiGraph[str]:
     """Build DAG from Pipeline in context."""
-    return _get_pipeline().build_dag(validate=validate)
+    return _get_pipeline().build_dag()
 
 
 def get_workspace_store() -> WorkspaceStore | None:
