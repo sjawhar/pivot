@@ -75,12 +75,16 @@ def extract_output_hashes_from_lock(
     """Extract path -> hash mapping from lock data 'outs' field."""
     result = dict[str, str | None]()
     for out in lock_data["outs"]:
+        key = out["key"]
+        if isinstance(key, str):
+            result[key] = out["hash"]
+            continue
         raw = cast("dict[str, object]", cast("object", out))
         path_value = raw.get("path")
         if isinstance(path_value, str):
             result[path_value] = out["hash"]
             continue
-        display = out.get("display", out.get("key", "unknown"))
+        display = out["display"] if "display" in out else None
         if display is None:
             display = "unknown"
         result[display] = out["hash"]
