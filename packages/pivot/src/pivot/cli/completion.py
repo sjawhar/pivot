@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import pathlib
 import tempfile
-from typing import Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import click
 from click.shell_completion import CompletionItem
@@ -85,8 +85,45 @@ def complete_stages(
         return []
 
 
-# Alias for push/pull targets (currently stages only; expand if file path completion needed)
-complete_targets = complete_stages
+if TYPE_CHECKING:
+    from pivot.pipeline.pipeline import Pipeline
+
+
+def _get_pipeline_for_targets() -> Pipeline | None:
+    from pivot import discovery
+
+    return discovery.discover_pipeline()
+
+
+def complete_targets(
+    _ctx: click.Context,
+    _param: click.Parameter,
+    incomplete: str,
+) -> list[str]:
+    try:
+        stages = _get_stages_fast()
+        if stages is None:
+            stages = _get_stages_full()
+
+        completions = [stage for stage in stages if stage.startswith(incomplete)]
+
+        pipeline = _get_pipeline_for_targets()
+        if pipeline is None:
+            return completions
+
+        for stage in stages:
+            info = pipeline.get(stage)
+            keys = [ref.identity.key for ref in info["outs"] if ref.identity.key is not None]
+            if not keys:
+                continue
+            for key in keys:
+                target = f"{stage}:{key}"
+                if target.startswith(incomplete):
+                    completions.append(target)
+        return completions
+    except Exception:
+        logger.debug("Completion failed", exc_info=True)
+        return []
 
 
 def _detect_config_file(root: pathlib.Path) -> tuple[str, float] | None:

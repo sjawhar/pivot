@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import pathlib
-from typing import TYPE_CHECKING, Any, Literal, TypedDict
+from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast
 
 import click
 
@@ -94,10 +94,12 @@ def resolve_cli_target(
             matching = [out for out in stage_outs if out.identity.key == identity.key]
             if not matching:
                 available_keys = [types.identity_key(out.identity) for out in stage_outs]
-                raise TargetValidationError(
+                available = ", ".join(available_keys) or "(none)"
+                message = (
                     f"Stage '{identity.producer}' has no output key '{identity.key}'. "
-                    f"Available: {', '.join(available_keys) or '(none)'}"
+                    + f"Available: {available}"
                 )
+                raise TargetValidationError(message)
             refs = matching
         else:
             refs = stage_outs
@@ -190,6 +192,10 @@ def resolve_targets_to_stages(
         if target in registered_stages:
             result.add(target)
         else:
+            identity = types.identity_from_key(target)
+            if identity.producer in registered_stages:
+                result.add(identity.producer)
+                continue
             # Treat as artifact path - use absolute path to match graph node format
             # Only find the producer (for upstream-only semantics like stage targets)
             norm_path = project.normalize_path(target)
@@ -246,10 +252,13 @@ def resolve_output_paths(
     resolved = set[str]()
     missing = list[str]()
 
+    store = cli_helpers.get_workspace_store()
+
     for item in _classify_targets(targets, proj_root):
         if item["is_stage"]:
             info = cli_helpers.get_stage(item["target"])
-            for out in info["outs"]:
+            stage_outs = cast("list[object]", info["outs"])
+            for out in stage_outs:
                 if isinstance(out, types.ArtifactRef):
                     if (
                         output_type is outputs.Metric
@@ -257,10 +266,17 @@ def resolve_output_paths(
                         or output_type is outputs.Plot
                         and out.tag is types.ArtifactTag.PLOT
                     ):
-                        resolved.add(types.identity_key(out.identity))
+                        if store is None:
+                            resolved.add(types.identity_key(out.identity))
+                        else:
+                            resolved.add(
+                                project.to_relative_path(store.resolve_display_path(out), proj_root)
+                            )
                 elif isinstance(out, output_type):
                     # Registry always stores single-file outputs (multi-file are expanded)
-                    expanded = outputs.require_expanded(out)
+                    expanded = outputs.require_expanded(
+                        cast("outputs.Metric | outputs.Plot[Any]", out)
+                    )
                     rel_path = project.to_relative_path(
                         project.normalize_path(expanded.path), proj_root
                     )
@@ -286,15 +302,24 @@ def resolve_plot_infos(
     resolved = list[plots.PlotInfo]()
     missing = list[str]()
 
+    store = cli_helpers.get_workspace_store()
+
     for item in _classify_targets(targets, proj_root):
         if item["is_stage"]:
             info = cli_helpers.get_stage(item["target"])
-            for out in info["outs"]:
+            stage_outs = cast("list[object]", info["outs"])
+            for out in stage_outs:
                 if isinstance(out, types.ArtifactRef):
                     if out.tag is types.ArtifactTag.PLOT:
+                        if store is None:
+                            path = types.identity_key(out.identity)
+                        else:
+                            path = project.to_relative_path(
+                                store.resolve_display_path(out), proj_root
+                            )
                         resolved.append(
                             plots.PlotInfo(
-                                path=types.identity_key(out.identity),
+                                path=path,
                                 stage_name=item["target"],
                                 x=None,
                                 y=None,
@@ -303,7 +328,7 @@ def resolve_plot_infos(
                         )
                 elif isinstance(out, outputs.Plot):
                     # Registry always stores single-file outputs (multi-file are expanded)
-                    expanded = outputs.require_expanded(out)
+                    expanded = outputs.require_expanded(cast("outputs.Plot[Any]", out))
                     resolved.append(
                         plots.PlotInfo(
                             path=project.to_relative_path(
