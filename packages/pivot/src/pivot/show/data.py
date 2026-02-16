@@ -13,7 +13,7 @@ import numpy
 import pandas
 import tabulate
 
-from pivot import config, outputs, project, types
+from pivot import config, loaders, outputs, project, types
 from pivot.show import common
 from pivot.storage import cache
 from pivot.types import (
@@ -45,6 +45,12 @@ def _data_rel_path(
     if isinstance(out, types.ArtifactRef):
         if out.tag in {types.ArtifactTag.METRIC, types.ArtifactTag.PLOT}:
             return None
+        from pivot.cli import helpers as cli_helpers
+
+        store = cli_helpers.get_workspace_store()
+        if store is not None:
+            abs_path = store.resolve_display_path(out)
+            return project.to_relative_path(str(abs_path), project_root)
         return types.identity_key(out.identity)
     if isinstance(out, (outputs.Metric, outputs.Plot)):
         return None
@@ -110,6 +116,35 @@ def detect_format(path: pathlib.Path) -> DataFileFormat:
     """Detect data file format from extension."""
     suffix = path.suffix.lower()
     return _DATA_EXTENSIONS.get(suffix, DataFileFormat.UNKNOWN)
+
+
+def _format_from_loader(
+    loader: loaders.Reader[object] | loaders.Writer[object] | loaders.Loader[object, object],
+) -> DataFileFormat | None:
+    if isinstance(loader, loaders.CSV):
+        return DataFileFormat.CSV
+    if isinstance(loader, loaders.JSON):
+        return DataFileFormat.JSON
+    if isinstance(loader, loaders.JSONL):
+        return DataFileFormat.JSONL
+    return None
+
+
+def _detect_output_format(
+    out: types.ArtifactRef | outputs.BaseOut,
+    rel_path: str,
+) -> DataFileFormat:
+    if isinstance(out, types.ArtifactRef):
+        format_from_ref = _format_from_loader(out.format)
+        if format_from_ref is not None:
+            return format_from_ref
+    return detect_format(pathlib.Path(rel_path))
+
+
+def _output_identity_key(out: types.ArtifactRef | outputs.BaseOut, rel_path: str) -> str:
+    if isinstance(out, types.ArtifactRef):
+        return types.identity_key(out.identity)
+    return rel_path
 
 
 def load_dataframe(path: pathlib.Path) -> pandas.DataFrame:
@@ -548,7 +583,7 @@ def get_data_outputs_from_stages() -> dict[str, str]:
             rel_path = _data_rel_path(out, proj_root)
             if rel_path is None:
                 continue
-            fmt = detect_format(pathlib.Path(rel_path))
+            fmt = _detect_output_format(out, rel_path)
             if fmt != DataFileFormat.UNKNOWN:
                 result[stage_name] = rel_path
 
@@ -566,16 +601,17 @@ def get_data_hashes_from_head() -> dict[str, str | None]:
     proj_root = project.get_project_root()
 
     # Collect lock file paths and data paths per stage
-    stage_data_paths = dict[str, list[str]]()
+    stage_data_paths = dict[str, list[tuple[str, str]]]()
     for stage_name in cli_helpers.list_stages():
         info = cli_helpers.get_stage(stage_name)
         for out in info["outs"]:
             rel_path = _data_rel_path(out, proj_root)
             if rel_path is None:
                 continue
-            fmt = detect_format(pathlib.Path(rel_path))
+            fmt = _detect_output_format(out, rel_path)
             if fmt != DataFileFormat.UNKNOWN:
-                stage_data_paths.setdefault(stage_name, []).append(rel_path)
+                identity = _output_identity_key(out, rel_path)
+                stage_data_paths.setdefault(stage_name, []).append((identity, rel_path))
                 result[rel_path] = None
 
     # Read all lock files from HEAD in one batch
@@ -589,9 +625,9 @@ def get_data_hashes_from_head() -> dict[str, str | None]:
 
         path_to_hash = common.extract_output_hashes_from_lock(lock_data)
 
-        for data_rel_path in data_paths:
-            if data_rel_path in path_to_hash:
-                result[data_rel_path] = path_to_hash[data_rel_path]
+        for identity_key, data_rel_path in data_paths:
+            if identity_key in path_to_hash:
+                result[data_rel_path] = path_to_hash[identity_key]
 
     return result
 
