@@ -107,6 +107,10 @@ def complete_targets(
 
         completions = [stage for stage in stages if stage.startswith(incomplete)]
 
+        # Only load full pipeline (expensive) when user is completing a stage:key target
+        if ":" not in incomplete:
+            return completions
+
         pipeline = _get_pipeline_for_targets()
         if pipeline is None:
             return completions

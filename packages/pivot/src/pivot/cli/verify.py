@@ -21,7 +21,6 @@ from pivot.types import HashInfo, PipelineStatus, PipelineStatusInfo, is_dir_has
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
-    from pathlib import Path
 
 
 VerifyStatus = Literal["passed", "failed"]
@@ -110,7 +109,7 @@ def _get_stage_missing_hashes(
     stage_name: str,
     local_hashes: set[str],
     allow_missing: bool,
-    project_root: Path,
+    project_root: pathlib.Path,
 ) -> dict[str, list[str]]:
     """Get hashes missing from local cache for a stage.
 
@@ -162,7 +161,7 @@ def _create_remote_if_needed(allow_missing: bool) -> remote_mod.S3Remote | None:
 
 def _verify_stages(
     pipeline_status: list[PipelineStatusInfo],
-    cache_dir: Path,
+    cache_dir: pathlib.Path,
     allow_missing: bool,
 ) -> tuple[bool, list[StageVerifyInfo]]:
     """Verify all stages and return pass/fail status with details.
