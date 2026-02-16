@@ -48,6 +48,7 @@ class RegistryStageInfo(TypedDict):
     fingerprint: dict[str, str] | None
     params_arg_name: str | None
     state_dir: pathlib.Path | None
+    collection_params: dict[str, str]
 
 
 class ValidationMode(enum.StrEnum):
@@ -171,10 +172,13 @@ def _compute_fingerprint(stage_name: str, info: RegistryStageInfo) -> dict[str, 
             result = _compute_file_fingerprint(info["func"])
         else:
             result = fingerprint.get_stage_fingerprint_cached(stage_name, info["func"])
-        for dep in info["deps"].values():
-            result.update(fingerprint.get_loader_fingerprint(dep.format))
+        for dep_name, dep in info["deps"].items():
+            for key, value in fingerprint.get_loader_fingerprint(dep.format).items():
+                result[f"dep:{dep_name}:{key}"] = value
         for out in info["outs"]:
-            result.update(fingerprint.get_loader_fingerprint(out.format))
+            out_key = types.identity_key(out.identity)
+            for key, value in fingerprint.get_loader_fingerprint(out.format).items():
+                result[f"out:{out_key}:{key}"] = value
         return result
     except Exception as exc:
         raise exceptions.PivotError(f"Stage '{stage_name}': fingerprinting failed: {exc}") from exc

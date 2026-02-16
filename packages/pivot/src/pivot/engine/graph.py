@@ -268,9 +268,11 @@ def get_producer(g: nx.DiGraph[str], identity: pivot_types.ArtifactIdentity) -> 
 
 
 def get_watch_paths(g: nx.DiGraph[str]) -> list[str]:
-    """Return watch paths (identity-based artifacts require Store resolution).
+    """Return watch paths (STUB — watch mode broken for data artifacts).
 
-    TODO: Resolve ArtifactIdentity to filesystem paths via Store (Task 4).
+    Watch mode for data artifact changes is not functional in this release.
+    Code/config file watching still works via inotify on source files.
+    TODO: Resolve ArtifactIdentity to filesystem paths via Store.
     """
     _ = g
     return []

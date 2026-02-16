@@ -24,19 +24,17 @@ SINGLE_OUTPUT_KEY = "_single"
 class StageParams(pydantic.BaseModel):
     """Base class for stage parameters (Pydantic model).
 
-    Use as a simple base class for parameter-only stages:
+    Use as a simple base class for stage configuration:
 
         class TrainParams(StageParams):
             learning_rate: float = 0.01
             batch_size: int = 32
 
-        def train(
-            config: TrainParams,
-            data: Annotated[DataFrame, Dep("input.csv", CSV())],
-        ) -> TrainOutputs:
+        @pivot.stage
+        def train(config: TrainParams, data: DataFrame) -> DataFrame:
             ...
 
-    For testing, just pass the data directly:
+    For testing, call the function directly:
 
         result = train(TrainParams(learning_rate=0.5), test_df)
     """

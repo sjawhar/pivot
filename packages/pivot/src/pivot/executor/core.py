@@ -343,6 +343,7 @@ def prepare_worker_info(
         "params_arg_name": stage_info["params_arg_name"],
         "project_root": project_root,
         "state_dir": state_dir,
+        "collection_params": stage_info["collection_params"],
     }
     return cast("worker.WorkerStageInfo", cast("object", worker_info))
 

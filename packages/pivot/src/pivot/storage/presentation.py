@@ -74,8 +74,13 @@ def _ensure_symlink(display_path: pathlib.Path, ref_path: pathlib.Path) -> None:
     """Create or update a symlink at display_path pointing to ref_path."""
     display_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Remove existing symlink/file if present
+    # Remove existing symlink/file/directory if present
     if display_path.is_symlink() or display_path.exists():
-        display_path.unlink()
+        if display_path.is_dir() and not display_path.is_symlink():
+            import shutil
+
+            shutil.rmtree(display_path)
+        else:
+            display_path.unlink()
 
     display_path.symlink_to(ref_path.resolve())

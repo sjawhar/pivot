@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-__version__ = "0.1.0-dev"
+__version__ = "0.2.0a1"
 
 # Public API - only exports that users need when writing pipelines
 # Internal modules like BaseOut and show.* are accessible via their full paths
