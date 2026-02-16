@@ -58,27 +58,6 @@ __all__ = [
 ]
 
 
-def _artifact_dir_prefix(tag: _MetricTag | _PlotTag | None) -> str:
-    if isinstance(tag, _MetricTag):
-        return "metrics"
-    if isinstance(tag, _PlotTag):
-        return "plots"
-    return "data"
-
-
-def _generate_artifact_path(
-    pipeline_name: str,
-    stage_name: str,
-    output_spec: _OutputSpec,
-    is_single_output: bool,
-) -> str:
-    prefix = _artifact_dir_prefix(output_spec.tag)
-    ext = _format_extension(output_spec.format)
-    if is_single_output:
-        return f"{prefix}/{pipeline_name}/{stage_name}.{ext}"
-    return f"{prefix}/{pipeline_name}/{stage_name}/{output_spec.key}.{ext}"
-
-
 class Pipeline:
     _name: str
     _root: pathlib.Path
@@ -286,7 +265,7 @@ class Pipeline:
                     )
                 if len(source.output_specs) == 1:
                     output_spec = source.output_specs[0]
-                    output_key = None
+                    output_key = None if output_spec.key == SINGLE_OUTPUT_KEY else output_spec.key
                 else:
                     output_spec = next(
                         spec for spec in source.output_specs if spec.key == handle._output_key
@@ -311,9 +290,8 @@ class Pipeline:
 
             outs = list[types.ArtifactRef]()
 
-            is_single_output = len(node.output_specs) == 1
             for output_spec in node.output_specs:
-                output_key = None if is_single_output else output_spec.key
+                output_key = None if output_spec.key == SINGLE_OUTPUT_KEY else output_spec.key
                 if isinstance(output_spec.tag, _MetricTag):
                     out_tag = types.ArtifactTag.METRIC
                 elif isinstance(output_spec.tag, _PlotTag):
@@ -505,6 +483,11 @@ def _parse_output_type(hint: Any, key: str) -> list[_OutputSpec]:
         specs = list[_OutputSpec]()
         field_hints = get_type_hints(hint, include_extras=True)
         for field_name, field_hint in field_hints.items():
+            if field_name == SINGLE_OUTPUT_KEY:
+                raise ValueError(
+                    f"TypedDict field name {SINGLE_OUTPUT_KEY!r} is reserved by Pivot. "
+                    f"Rename the field in {hint.__name__}."
+                )
             specs.extend(_parse_output_type(field_hint, field_name))
         return specs
 
