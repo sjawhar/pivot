@@ -9,7 +9,7 @@ from typing import Annotated, TypedDict
 import pandas as pd
 import pytest
 
-from pivot import loaders, stage_def, types
+from pivot import loaders, outputs, stage_def, types
 from pivot.compose import (
     ArtifactHandle,
     Pipeline,
@@ -430,6 +430,25 @@ def test_pipeline_build_bridge(tmp_path: pathlib.Path) -> None:
     assert stage_b["outs"][0].tag is types.ArtifactTag.DATA
 
 
+def test_external_input_produces_bindings(tmp_path: pathlib.Path) -> None:
+    project_root = tmp_path
+    (project_root / "data" / "external").mkdir(parents=True)
+    (project_root / "data" / "external" / "ext_data.jsonl").write_text("[]")
+
+    with Pipeline("test", root=project_root) as pipeline:
+        ext = pipeline.input("ext_data.jsonl", t=list, external=True)
+
+        @stage
+        def consume(data: list = ext) -> Annotated[list, outputs.Out("out.json", loaders.JSON())]:
+            return data
+
+    legacy = pipeline.build()
+    bindings = legacy.input_bindings
+
+    assert "ext_data.jsonl" in bindings
+    assert bindings["ext_data.jsonl"] == "data/external/ext_data.jsonl"
+
+
 class _HelperTaggedOutputs(TypedDict):
     data: pd.DataFrame
     metrics: Annotated[dict, metric]
@@ -507,9 +526,12 @@ def test_pipeline_variant_basic(tmp_path: pathlib.Path) -> None:
 
 
 def test_pipeline_variant_nested(tmp_path: pathlib.Path) -> None:
-    with Pipeline("test_nested", root=tmp_path) as pipeline, pipeline.variant("base"):
-        with pipeline.variant("gpt4"):
-            _helper_produce(params=stage_def.StageParams())
+    with (
+        Pipeline("test_nested", root=tmp_path) as pipeline,
+        pipeline.variant("base"),
+        pipeline.variant("gpt4"),
+    ):
+        _helper_produce(params=stage_def.StageParams())
 
     assert len(pipeline._stages) == 1
     assert pipeline._stages[0].name == "_helper_produce@base@gpt4"

@@ -258,6 +258,7 @@ class Pipeline:
 
     def build(self) -> pipeline_mod.Pipeline:
         legacy = pipeline_mod.Pipeline(self._name, root=self._root)
+        legacy.set_input_bindings({name: node.path for name, node in self._inputs.items()})
 
         for node in self._stages:
             func = node.original_func
