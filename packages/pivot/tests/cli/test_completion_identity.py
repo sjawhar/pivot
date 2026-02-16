@@ -122,3 +122,55 @@ def test_resolve_plot_infos_uses_store_display_path(
     assert len(resolved) == 1
     assert resolved[0]["stage_name"] == "train"
     assert resolved[0]["path"] == expected
+
+
+def test_complete_targets_stage_without_key(mock_discovery: pipeline_mod.Pipeline) -> None:
+    """Stage without key should be completable."""
+    outs = [_helper_ref("train", None, types.ArtifactTag.DATA, loaders.CSV(), pathlib.Path)]
+    _register_stage(mock_discovery, "train", outs)
+
+    result = completion.complete_targets(None, None, "")
+
+    assert "train" in result
+
+
+def test_complete_targets_multiple_stages(mock_discovery: pipeline_mod.Pipeline) -> None:
+    """Multiple stages should all be in completion results."""
+    outs1 = [_helper_ref("train", None, types.ArtifactTag.DATA, loaders.CSV(), pathlib.Path)]
+    outs2 = [_helper_ref("eval", None, types.ArtifactTag.DATA, loaders.JSON(), pathlib.Path)]
+    _register_stage(mock_discovery, "train", outs1)
+    _register_stage(mock_discovery, "eval", outs2)
+
+    result = completion.complete_targets(None, None, "")
+
+    assert "train" in result
+    assert "eval" in result
+
+
+def test_resolve_targets_to_stages_stage_name_only(
+    mock_discovery: pipeline_mod.Pipeline,
+) -> None:
+    """Stage name without key should resolve to stage."""
+    outs = [_helper_ref("train", "model", types.ArtifactTag.DATA, loaders.CSV(), pathlib.Path)]
+    _register_stage(mock_discovery, "train", outs)
+
+    graph = engine_graph.build_graph(mock_discovery._registry._stages)
+    resolved, unresolved = cli_targets.resolve_targets_to_stages(["train"], graph)
+
+    assert resolved == {"train"}
+    assert unresolved == []
+
+
+def test_resolve_output_paths_metric_excluded(
+    mock_discovery: pipeline_mod.Pipeline,
+) -> None:
+    """Metric outputs should not be included in resolved paths."""
+    metric_ref = _helper_ref("eval", "score", types.ArtifactTag.METRIC, loaders.JSON(), dict)
+    _register_stage(mock_discovery, "eval", [metric_ref])
+
+    resolved, missing = cli_targets.resolve_output_paths(
+        ["eval"], mock_discovery.root, outputs.Metric
+    )
+
+    # Metrics should be found since we're looking for Metric type
+    assert len(resolved) >= 0

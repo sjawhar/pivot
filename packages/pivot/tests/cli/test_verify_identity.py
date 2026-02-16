@@ -4,8 +4,6 @@ from __future__ import annotations
 import pathlib
 from typing import TYPE_CHECKING
 
-import pytest
-
 from pivot import config, loaders, project, types
 from pivot.cli import helpers as cli_helpers
 from pivot.cli import remote as cli_remote
@@ -13,6 +11,8 @@ from pivot.cli import verify as cli_verify
 from pivot.storage import lock
 
 if TYPE_CHECKING:
+    import pytest
+
     from pivot.pipeline.pipeline import Pipeline
     from pivot.registry import RegistryStageInfo
 
@@ -134,3 +134,62 @@ def test_normalize_cli_targets_preserves_identity_targets(
     normalized = cli_remote._normalize_cli_targets(targets, known_stages={"train"})
 
     assert normalized == targets
+
+
+def test_get_stage_lock_hashes_without_workspace_store(
+    mock_discovery: Pipeline,
+) -> None:
+    """When workspace_store is None, falls back to identity_key."""
+    data_ref = _helper_ref("train", "model", types.ArtifactTag.DATA, loaders.CSV())
+    stage_info = _make_stage_info("train", [data_ref])
+    mock_discovery._registry.add_existing(stage_info)  # type: ignore[reportPrivateUsage]
+
+    state_dir = config.get_state_dir()
+    _write_stage_lock(
+        "train",
+        state_dir,
+        output_hashes={
+            types.ArtifactIdentity("train", "model"): types.FileHash(hash="abc123"),
+        },
+    )
+
+    # Mock get_workspace_store to return None
+    import pivot.cli.helpers as cli_helpers_mod
+
+    original_get_store = cli_helpers_mod.get_workspace_store
+    try:
+        cli_helpers_mod.get_workspace_store = lambda: None  # type: ignore[assignment]
+        output_hashes, dep_hashes = cli_verify._get_stage_lock_hashes("train")
+
+        # Should fall back to identity_key
+        assert "train:model" in output_hashes
+        assert output_hashes["train:model"] == "abc123"
+        assert dep_hashes == {}
+    finally:
+        cli_helpers_mod.get_workspace_store = original_get_store
+
+
+def test_get_stage_lock_hashes_filters_metric_outputs(
+    mock_discovery: Pipeline,
+) -> None:
+    """Metric outputs should be excluded from returned hashes."""
+    data_ref = _helper_ref("train", "model", types.ArtifactTag.DATA, loaders.CSV())
+    metric_ref = _helper_ref("train", "loss", types.ArtifactTag.METRIC, loaders.JSON())
+    stage_info = _make_stage_info("train", [data_ref, metric_ref])
+    mock_discovery._registry.add_existing(stage_info)  # type: ignore[reportPrivateUsage]
+
+    state_dir = config.get_state_dir()
+    _write_stage_lock(
+        "train",
+        state_dir,
+        output_hashes={
+            types.ArtifactIdentity("train", "model"): types.FileHash(hash="data123"),
+            types.ArtifactIdentity("train", "loss"): types.FileHash(hash="metric456"),
+        },
+    )
+
+    output_hashes, dep_hashes = cli_verify._get_stage_lock_hashes("train")
+
+    # Only data output, not metric
+    assert len(output_hashes) == 1
+    assert "train:model" in output_hashes or any("model" in k for k in output_hashes.keys())
