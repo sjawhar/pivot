@@ -62,11 +62,13 @@ def test_complete_targets_includes_stage_keys(mock_discovery: pipeline_mod.Pipel
     ]
     _register_stage(mock_discovery, "train", outs)
 
-    result = completion.complete_targets(None, None, "")
+    bare = completion.complete_targets(None, None, "")
+    assert "train" in bare
+    assert "train:model" not in bare, "stage:key completions should only appear after typing ':'"
 
-    assert "train" in result
-    assert "train:model" in result
-    assert "train:score" in result
+    keyed = completion.complete_targets(None, None, "train:")
+    assert "train:model" in keyed
+    assert "train:score" in keyed
 
 
 def test_resolve_targets_to_stages_identity_key(
