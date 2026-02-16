@@ -216,6 +216,10 @@ This document exhaustively catalogs what code changes are and are not detected b
 | Custom loader code change       | ✅        | `test_fingerprint.py::test_custom_loader_code_change_detected`              |
 | Custom loader fingerprinting    | ✅        | `test_fingerprint.py::test_custom_loader_fingerprint`                       |
 | Fingerprint stability           | ✅        | `test_fingerprint.py::test_loader_fingerprint_stable`                       |
+| Config collision between outputs| ✅        | `test_compose.py::test_output_loader_change_detected[same-class-different-config]`     |
+| YAML→CSV with existing CSV out  | ✅        | `test_compose.py::test_output_loader_change_detected[yaml-to-csv-with-existing-csv]`   |
+| @no_fingerprint loader collision| ✅        | `test_compose.py::test_no_fingerprint_output_loader_collision`                          |
+| Dep config collision            | ✅        | `test_compose.py::test_dep_loader_config_collision`                                     |
 
 ---
 

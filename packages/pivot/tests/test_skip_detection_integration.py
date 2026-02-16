@@ -107,6 +107,7 @@ def _make_stage_info(
         "params_arg_name": params_arg_name,
         "project_root": tmp_path,
         "state_dir": tmp_path / ".pivot",
+        "collection_params": {},
     }
 
 

@@ -9,10 +9,11 @@ from typing import Annotated, TypedDict
 import pandas as pd
 import pytest
 
-from pivot import loaders, outputs, stage_def, types
+from pivot import fingerprint, loaders, outputs, stage_def, types
 from pivot.compose import (
     SINGLE_OUTPUT_KEY,
     ArtifactHandle,
+    CollectionKind,
     Pipeline,
     _analyze_return_type,
     _format_extension,
@@ -26,6 +27,8 @@ from pivot.compose import (
     plot,
     stage,
 )
+from pivot.executor.worker import _reconstruct_list_kwargs
+from pivot.registry import RegistryStageInfo, _compute_fingerprint
 
 
 def test_infer_format_dataframe() -> None:
@@ -604,8 +607,8 @@ def test_pipeline_variant_nested(tmp_path: pathlib.Path) -> None:
 
 def test_pipeline_variant_multiple_stages(tmp_path: pathlib.Path) -> None:
     with Pipeline("test_multi", root=tmp_path) as pipeline, pipeline.variant("v1"):
-        _helper_produce(params=stage_def.StageParams())
-        _helper_consume_dict(data={})
+        result = _helper_produce(params=stage_def.StageParams())
+        _helper_consume_dict(data=result)  # pyright: ignore[reportArgumentType] - compose records handles
 
     assert len(pipeline._stages) == 2
     assert pipeline._stages[0].name == "_helper_produce@v1"
@@ -643,9 +646,9 @@ def test_pipeline_variant_with_repeated_calls(tmp_path: pathlib.Path) -> None:
 
 def test_pipeline_variant_mixed_with_non_variant(tmp_path: pathlib.Path) -> None:
     with Pipeline("test_mixed", root=tmp_path) as pipeline:
-        _helper_produce(params=stage_def.StageParams())
+        result = _helper_produce(params=stage_def.StageParams())
         with pipeline.variant("v1"):
-            _helper_consume_dict(data={})
+            _helper_consume_dict(data=result)  # pyright: ignore[reportArgumentType] - compose records handles
         _helper_repeat(params=stage_def.StageParams())
 
     assert pipeline._stages[0].name == "_helper_produce"
@@ -675,3 +678,471 @@ def test_build_rejects_stage_params_in_typing_optional(tmp_path: pathlib.Path) -
 
     with pytest.raises(TypeError, match="StageParams must not be in a union"):
         pipeline.build()
+
+
+# --- Bug 3: list[ArtifactHandle] support ---
+
+
+@stage
+def _helper_consume_list(
+    main_data: pd.DataFrame,
+    extra_data: list[pd.DataFrame],
+) -> pd.DataFrame:
+    return main_data
+
+
+@stage
+def _helper_consume_list_from_stages(
+    data_files: list[pd.DataFrame],
+) -> dict:
+    return {"count": len(data_files)}
+
+
+def test_record_stage_detects_list_artifact_handles(tmp_path: pathlib.Path) -> None:
+    with Pipeline("test", root=tmp_path) as pipeline:
+        inp = pipeline.input("data.csv", path="data/raw/data.csv", t=pd.DataFrame)
+        _helper_consume_list(main_data=inp, extra_data=[inp, inp])
+
+    node = pipeline._stages[0]
+    assert "main_data" in node.input_handles
+    assert "extra_data" in node.list_input_handles
+    assert len(node.list_input_handles["extra_data"]) == 2
+    assert node.collection_params["extra_data"] == CollectionKind.LIST
+
+
+def test_record_stage_detects_tuple_artifact_handles(tmp_path: pathlib.Path) -> None:
+    with Pipeline("test", root=tmp_path) as pipeline:
+        inp = pipeline.input("data.csv", path="data/raw/data.csv", t=pd.DataFrame)
+        _helper_consume_list(main_data=inp, extra_data=(inp, inp))  # pyright: ignore[reportArgumentType] - compose records handles
+
+    node = pipeline._stages[0]
+    assert "extra_data" in node.list_input_handles
+    assert node.collection_params["extra_data"] == CollectionKind.TUPLE
+
+
+def test_record_stage_detects_empty_list(tmp_path: pathlib.Path) -> None:
+    with Pipeline("test", root=tmp_path) as pipeline:
+        inp = pipeline.input("data.csv", path="data/raw/data.csv", t=pd.DataFrame)
+        _helper_consume_list(main_data=inp, extra_data=[])
+
+    node = pipeline._stages[0]
+    assert "extra_data" in node.list_input_handles
+    assert len(node.list_input_handles["extra_data"]) == 0
+    assert node.collection_params["extra_data"] == CollectionKind.LIST
+
+
+def test_build_expands_list_deps(tmp_path: pathlib.Path) -> None:
+    with Pipeline("test_list", root=tmp_path) as pipeline:
+        inp = pipeline.input("data.csv", path="data/raw/data.csv", t=pd.DataFrame)
+        _helper_consume_list(main_data=inp, extra_data=[inp, inp, inp])
+
+    legacy = pipeline.build()
+    stage_info = legacy.get("_helper_consume_list")
+
+    assert "main_data" in stage_info["deps"]
+    assert "extra_data[0]" in stage_info["deps"]
+    assert "extra_data[1]" in stage_info["deps"]
+    assert "extra_data[2]" in stage_info["deps"]
+    assert "extra_data" not in stage_info["deps"]
+
+    for key in ["extra_data[0]", "extra_data[1]", "extra_data[2]"]:
+        ref = stage_info["deps"][key]
+        assert ref.identity.producer == "data.csv"
+
+
+def test_build_list_deps_from_multiple_stages(tmp_path: pathlib.Path) -> None:
+    with Pipeline("test_multi_list", root=tmp_path) as pipeline:
+        a = _helper_produce(params=stage_def.StageParams())
+        b = _helper_produce(params=stage_def.StageParams())
+        _helper_consume_list_from_stages(data_files=[a, b])
+
+    legacy = pipeline.build()
+    consumer = legacy.get("_helper_consume_list_from_stages")
+
+    assert "data_files[0]" in consumer["deps"]
+    assert "data_files[1]" in consumer["deps"]
+    assert consumer["deps"]["data_files[0]"].identity.producer == "_helper_produce"
+    assert consumer["deps"]["data_files[1]"].identity.producer == "_helper_produce@1"
+
+
+def test_build_list_deps_dag_has_correct_edges(tmp_path: pathlib.Path) -> None:
+    with Pipeline("test_dag_list", root=tmp_path) as pipeline:
+        a = _helper_produce(params=stage_def.StageParams())
+        b = _helper_produce(params=stage_def.StageParams())
+        _helper_consume_list_from_stages(data_files=[a, b])
+
+    legacy = pipeline.build()
+
+    from pivot.engine import graph
+
+    bipartite = graph.build_graph(legacy._registry._stages)
+    upstream = graph.get_upstream_stages(bipartite, "_helper_consume_list_from_stages")
+    assert sorted(upstream) == ["_helper_produce", "_helper_produce@1"]
+
+
+# --- _reconstruct_list_kwargs ---
+
+
+def test_reconstruct_list_kwargs_basic() -> None:
+    kwargs = {
+        "params": "some_params",
+        "data_files[0]": "loaded_0",
+        "data_files[1]": "loaded_1",
+        "data_files[2]": "loaded_2",
+    }
+    result = _reconstruct_list_kwargs(kwargs, {"data_files": "list"})
+    assert result == {
+        "params": "some_params",
+        "data_files": ["loaded_0", "loaded_1", "loaded_2"],
+    }
+
+
+def test_reconstruct_list_kwargs_preserves_order() -> None:
+    kwargs = {
+        "data_files[2]": "val_2",
+        "data_files[0]": "val_0",
+        "data_files[1]": "val_1",
+    }
+    result = _reconstruct_list_kwargs(kwargs, {"data_files": "list"})
+    assert result["data_files"] == ["val_0", "val_1", "val_2"]
+
+
+def test_reconstruct_list_kwargs_noop_without_lists() -> None:
+    kwargs = {"x": 1, "y": 2}
+    result = _reconstruct_list_kwargs(kwargs, {})
+    assert result == {"x": 1, "y": 2}
+
+
+def test_reconstruct_list_kwargs_multiple_lists() -> None:
+    kwargs = {
+        "a[0]": "a0",
+        "a[1]": "a1",
+        "b[0]": "b0",
+        "plain": "val",
+    }
+    result = _reconstruct_list_kwargs(kwargs, {"a": "list", "b": "list"})
+    assert result == {"a": ["a0", "a1"], "b": ["b0"], "plain": "val"}
+
+
+def test_reconstruct_list_kwargs_tuple() -> None:
+    kwargs = {"data[0]": "a", "data[1]": "b"}
+    result = _reconstruct_list_kwargs(kwargs, {"data": "tuple"})
+    assert result["data"] == ("a", "b")
+    assert isinstance(result["data"], tuple)
+
+
+def test_reconstruct_list_kwargs_empty_list() -> None:
+    result = _reconstruct_list_kwargs({}, {"data_files": "list"})
+    assert result == {"data_files": []}
+
+
+def test_reconstruct_list_kwargs_empty_tuple() -> None:
+    result = _reconstruct_list_kwargs({}, {"data_files": "tuple"})
+    assert result == {"data_files": ()}
+    assert isinstance(result["data_files"], tuple)
+
+
+def test_build_collection_params_populated(tmp_path: pathlib.Path) -> None:
+    with Pipeline("test", root=tmp_path) as pipeline:
+        inp = pipeline.input("data.csv", path="data/raw/data.csv", t=pd.DataFrame)
+        _helper_consume_list(main_data=inp, extra_data=[inp, inp])
+
+    legacy = pipeline.build()
+    stage_info = legacy.get("_helper_consume_list")
+    assert stage_info["collection_params"] == {"extra_data": "list"}
+
+
+def test_build_empty_list_no_deps_but_collection_params(tmp_path: pathlib.Path) -> None:
+    with Pipeline("test", root=tmp_path) as pipeline:
+        inp = pipeline.input("data.csv", path="data/raw/data.csv", t=pd.DataFrame)
+        _helper_consume_list(main_data=inp, extra_data=[])
+
+    legacy = pipeline.build()
+    stage_info = legacy.get("_helper_consume_list")
+
+    assert "extra_data[0]" not in stage_info["deps"]
+    assert stage_info["collection_params"] == {"extra_data": "list"}
+
+
+def test_build_single_element_list(tmp_path: pathlib.Path) -> None:
+    with Pipeline("test", root=tmp_path) as pipeline:
+        inp = pipeline.input("data.csv", path="data/raw/data.csv", t=pd.DataFrame)
+        _helper_consume_list(main_data=inp, extra_data=[inp])
+
+    legacy = pipeline.build()
+    stage_info = legacy.get("_helper_consume_list")
+    assert "extra_data[0]" in stage_info["deps"]
+    assert "extra_data[1]" not in stage_info["deps"]
+
+
+def test_reconstruct_list_kwargs_single_element() -> None:
+    kwargs = {"data[0]": "val"}
+    result = _reconstruct_list_kwargs(kwargs, {"data": "list"})
+    assert result == {"data": ["val"]}
+
+
+# --- Multi-output dep resolution through build() ---
+
+
+@stage
+def _helper_consume_multi_output_dep(data: pd.DataFrame) -> pd.DataFrame:
+    return data
+
+
+def test_build_multi_output_dep_key(tmp_path: pathlib.Path) -> None:
+    with Pipeline("test", root=tmp_path) as pipeline:
+        tagged = _helper_build_tagged()
+        _helper_consume_multi_output_dep(data=tagged.data)
+
+    legacy = pipeline.build()
+    consumer = legacy.get("_helper_consume_multi_output_dep")
+    ref = consumer["deps"]["data"]
+    assert ref.identity.producer == "_helper_build_tagged"
+    assert ref.identity.key == "data"
+
+
+def test_build_multi_output_sub_handles_in_list(tmp_path: pathlib.Path) -> None:
+    with Pipeline("test", root=tmp_path) as pipeline:
+        tagged = _helper_build_tagged()
+        _helper_consume_list_from_stages(data_files=[tagged.data, tagged.data])
+
+    legacy = pipeline.build()
+    consumer = legacy.get("_helper_consume_list_from_stages")
+    ref_0 = consumer["deps"]["data_files[0]"]
+    assert ref_0.identity.producer == "_helper_build_tagged"
+    assert ref_0.identity.key == "data"
+
+
+def test_build_rejects_unsubscripted_multi_output_handle(tmp_path: pathlib.Path) -> None:
+    with Pipeline("test", root=tmp_path) as pipeline:
+        tagged = _helper_build_tagged()
+        _helper_consume_multi_output_dep(data=tagged)  # pyright: ignore[reportArgumentType] - intentional
+
+    with pytest.raises(TypeError, match="without selecting an output"):
+        pipeline.build()
+
+
+# --- collection_params empty for non-list stages ---
+
+
+def test_build_collection_params_empty_for_non_list_stage(tmp_path: pathlib.Path) -> None:
+    with Pipeline("test", root=tmp_path) as pipeline:
+        a = _helper_produce(params=stage_def.StageParams())
+        _helper_consume(data=a)
+
+    legacy = pipeline.build()
+    assert legacy.get("_helper_consume")["collection_params"] == {}
+
+
+# --- Unrecognized argument detection ---
+
+
+@stage
+def _helper_with_plain_arg(data: pd.DataFrame, verbose: bool = False) -> pd.DataFrame:
+    return data
+
+
+def test_record_stage_rejects_explicit_unsupported_arg(tmp_path: pathlib.Path) -> None:
+    with (
+        pytest.raises(ValueError, match="unsupported type"),
+        Pipeline("test", root=tmp_path) as pipeline,
+    ):
+        inp = pipeline.input("data.csv", path="data/raw/data.csv", t=pd.DataFrame)
+        _helper_with_plain_arg(data=inp, verbose=True)  # pyright: ignore[reportArgumentType]
+
+
+def test_record_stage_ignores_default_unsupported_arg(tmp_path: pathlib.Path) -> None:
+    with Pipeline("test", root=tmp_path) as pipeline:
+        inp = pipeline.input("data.csv", path="data/raw/data.csv", t=pd.DataFrame)
+        _helper_with_plain_arg(data=inp)
+
+    pipeline.build()
+
+
+# --- Output format fingerprint detection ---
+
+
+def test_loader_fingerprint_yaml_vs_csv_differ() -> None:
+    """get_loader_fingerprint must produce different results for YAML vs CSV."""
+    yaml_fp = fingerprint.get_loader_fingerprint(loaders.YAML())
+    csv_fp = fingerprint.get_loader_fingerprint(loaders.CSV())
+    assert yaml_fp != csv_fp, "YAML and CSV loaders should have different fingerprints"
+
+
+def test_loader_fingerprint_csv_config_change_detected() -> None:
+    """Changing CSV config (index_col) should change the fingerprint."""
+    csv_default = fingerprint.get_loader_fingerprint(loaders.CSV())
+    csv_custom = fingerprint.get_loader_fingerprint(loaders.CSV(index_col=[0, 1]))
+    assert csv_default != csv_custom, "CSV() and CSV(index_col=[0, 1]) should differ"
+
+
+def test_analyze_return_type_metric_with_explicit_csv() -> None:
+    """Metric + explicit CSV loader should use CSV, not default YAML."""
+    specs = _analyze_return_type(_helper_metric_with_csv)
+    assert len(specs) == 1
+    assert isinstance(specs[0].tag, _MetricTag), "Should be tagged as metric"
+    assert isinstance(specs[0].format, loaders.CSV), "Should use explicit CSV, not default YAML"
+
+
+def test_analyze_return_type_metric_default_yaml() -> None:
+    """Metric without explicit loader should default to YAML."""
+    specs = _analyze_return_type(_helper_metric_default_yaml)
+    assert len(specs) == 1
+    assert isinstance(specs[0].tag, _MetricTag)
+    assert isinstance(specs[0].format, loaders.YAML), "Metric default should be YAML"
+
+
+def _helper_metric_with_csv() -> Annotated[pd.DataFrame, metric, loaders.CSV(index_col=[0, 1])]:
+    return pd.DataFrame()
+
+
+def _helper_metric_default_yaml() -> Annotated[pd.DataFrame, metric]:
+    return pd.DataFrame()
+
+
+def _make_stage_info(
+    func: typing.Any,
+    name: str = "s",
+    deps: dict[str, types.ArtifactRef] | None = None,
+    outs: list[types.ArtifactRef] | None = None,
+) -> RegistryStageInfo:
+    return RegistryStageInfo(
+        func=func,
+        name=name,
+        deps=deps or {},
+        outs=outs or [],
+        params=None,
+        mutex=[],
+        variant=None,
+        signature=inspect.signature(func),
+        fingerprint=None,
+        params_arg_name=None,
+        state_dir=None,
+        collection_params={},
+    )
+
+
+def _make_out(
+    key: str,
+    fmt: loaders.Writer[typing.Any] | loaders.Loader[typing.Any, typing.Any],
+    producer: str = "s",
+    tag: types.ArtifactTag = types.ArtifactTag.DATA,
+) -> types.ArtifactRef:
+    return types.ArtifactRef(
+        identity=types.ArtifactIdentity(producer=producer, key=key),
+        format=fmt,
+        python_type=pd.DataFrame,
+        tag=tag,
+    )
+
+
+def _make_dep(
+    key: str,
+    fmt: loaders.Reader[typing.Any] | loaders.Loader[typing.Any, typing.Any],
+    producer: str = "upstream",
+) -> types.ArtifactRef:
+    return types.ArtifactRef(
+        identity=types.ArtifactIdentity(producer=producer, key=key),
+        format=fmt,
+        python_type=pd.DataFrame,
+        tag=types.ArtifactTag.DATA,
+    )
+
+
+def _dummy_stage() -> dict:
+    return {}
+
+
+@pytest.mark.parametrize(
+    ("before_outs", "after_outs"),
+    [
+        pytest.param(
+            [
+                _make_out("a", loaders.CSV(index_col=[0, 1])),
+                _make_out("b", loaders.CSV(index_col=0)),
+            ],
+            [_make_out("a", loaders.CSV(index_col=0)), _make_out("b", loaders.CSV(index_col=0))],
+            id="same-class-different-config",
+        ),
+        pytest.param(
+            [
+                _make_out("savings", loaders.YAML(), tag=types.ArtifactTag.METRIC),
+                _make_out("savings_nb", loaders.CSV(index_col=0), tag=types.ArtifactTag.METRIC),
+            ],
+            [
+                _make_out("savings", loaders.CSV(index_col=[0, 1]), tag=types.ArtifactTag.METRIC),
+                _make_out("savings_nb", loaders.CSV(index_col=0), tag=types.ArtifactTag.METRIC),
+            ],
+            id="yaml-to-csv-with-existing-csv",
+        ),
+    ],
+)
+def test_output_loader_change_detected(
+    before_outs: list[types.ArtifactRef],
+    after_outs: list[types.ArtifactRef],
+) -> None:
+    """Changing an output's loader config/class must change the stage fingerprint.
+
+    Regression for key collision: without per-output namespacing, dict.update()
+    merges loader keys by class name only, so two CSV outputs with different
+    configs clobber each other's config hash.
+    """
+    fp_before = _compute_fingerprint("s", _make_stage_info(_dummy_stage, outs=before_outs))
+    fp_after = _compute_fingerprint("s", _make_stage_info(_dummy_stage, outs=after_outs))
+    assert fp_before != fp_after
+
+
+def test_no_fingerprint_output_loader_collision(set_project_root: pathlib.Path) -> None:
+    """@no_fingerprint() file-hash path must also prevent loader config collisions."""
+    from pivot.decorators import no_fingerprint
+
+    @no_fingerprint()
+    def _nofp_stage() -> dict:
+        return {}
+
+    fp_before = _compute_fingerprint(
+        "s",
+        _make_stage_info(
+            _nofp_stage,
+            outs=[
+                _make_out("a", loaders.CSV(index_col=[0, 1])),
+                _make_out("b", loaders.CSV(index_col=0)),
+            ],
+        ),
+    )
+    fp_after = _compute_fingerprint(
+        "s",
+        _make_stage_info(
+            _nofp_stage,
+            outs=[
+                _make_out("a", loaders.CSV(index_col=0)),
+                _make_out("b", loaders.CSV(index_col=0)),
+            ],
+        ),
+    )
+    assert fp_before != fp_after
+
+
+def test_dep_loader_config_collision() -> None:
+    """Two deps with same loader class but different configs must both be fingerprinted."""
+    fp_before = _compute_fingerprint(
+        "s",
+        _make_stage_info(
+            _dummy_stage,
+            deps={
+                "train": _make_dep("train", loaders.CSV(index_col=[0, 1])),
+                "test": _make_dep("test", loaders.CSV(index_col=0)),
+            },
+        ),
+    )
+    fp_after = _compute_fingerprint(
+        "s",
+        _make_stage_info(
+            _dummy_stage,
+            deps={
+                "train": _make_dep("train", loaders.CSV(index_col=0)),
+                "test": _make_dep("test", loaders.CSV(index_col=0)),
+            },
+        ),
+    )
+    assert fp_before != fp_after

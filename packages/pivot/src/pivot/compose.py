@@ -4,6 +4,7 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import dataclasses
+import enum
 import functools
 import importlib
 import inspect
@@ -42,8 +43,15 @@ plot = _PlotTag()
 
 SINGLE_OUTPUT_KEY = "_single"
 
+
+class CollectionKind(enum.StrEnum):
+    LIST = "list"
+    TUPLE = "tuple"
+
+
 __all__ = [
     "ArtifactHandle",
+    "CollectionKind",
     "SINGLE_OUTPUT_KEY",
     "_InputNode",
     "_OutputSpec",
@@ -56,6 +64,57 @@ __all__ = [
     "plot",
     "stage",
 ]
+
+
+def _handle_to_artifact_ref(handle: ArtifactHandle, consumer_name: str) -> types.ArtifactRef:
+    if isinstance(handle._source, _InputNode):
+        identity = types.ArtifactIdentity(producer=handle._source.name, key=None)
+        types.validate_artifact_identity(identity)
+        return types.ArtifactRef(
+            identity=identity,
+            format=handle._source.format,
+            python_type=handle._python_type,
+            tag=types.ArtifactTag.DATA,
+        )
+
+    source = handle._source
+    if not source.output_specs:
+        raise TypeError(
+            f"Stage '{consumer_name}' depends on '{source.name}' which has no outputs "
+            f"(returns None). A stage must produce outputs to be used as a dependency."
+        )
+    if len(source.output_specs) == 1:
+        output_spec = source.output_specs[0]
+        output_key = None if output_spec.key == SINGLE_OUTPUT_KEY else output_spec.key
+    else:
+        matched = next(
+            (spec for spec in source.output_specs if spec.key == handle._output_key), None
+        )
+        if matched is None:
+            available = [spec.key for spec in source.output_specs]
+            raise TypeError(
+                f"Stage '{consumer_name}' received handle from multi-output stage "
+                f"'{source.name}' without selecting an output. "
+                f"Use .field or ['key']. Available: {available}"
+            )
+        output_spec = matched
+        output_key = output_spec.key
+
+    if isinstance(output_spec.tag, _MetricTag):
+        dep_tag = types.ArtifactTag.METRIC
+    elif isinstance(output_spec.tag, _PlotTag):
+        dep_tag = types.ArtifactTag.PLOT
+    else:
+        dep_tag = types.ArtifactTag.DATA
+
+    identity = types.ArtifactIdentity(producer=source.name, key=output_key)
+    types.validate_artifact_identity(identity)
+    return types.ArtifactRef(
+        identity=identity,
+        format=output_spec.format,
+        python_type=handle._python_type,
+        tag=dep_tag,
+    )
 
 
 class Pipeline:
@@ -178,6 +237,7 @@ class Pipeline:
         sig = inspect.signature(original_func)
         try:
             bound = sig.bind(*args, **kwargs)
+            explicit_params = set(bound.arguments.keys())
             bound.apply_defaults()
         except TypeError as exc:
             self._validation_errors.append(f"{stage_name}: {exc}")
@@ -190,12 +250,27 @@ class Pipeline:
             return ArtifactHandle(self, dummy_input, None, object)
 
         input_handles = dict[str, ArtifactHandle]()
+        list_input_handles = dict[str, list[ArtifactHandle]]()
+        collection_params = dict[str, CollectionKind]()
         params: stage_def.StageParams | None = None
         for param_name, value in bound.arguments.items():
             if isinstance(value, ArtifactHandle):
                 input_handles[param_name] = value
+            elif isinstance(value, (list, tuple)) and all(
+                isinstance(v, ArtifactHandle) for v in value
+            ):
+                list_input_handles[param_name] = list(value)
+                collection_params[param_name] = (
+                    CollectionKind.TUPLE if isinstance(value, tuple) else CollectionKind.LIST
+                )
             elif isinstance(value, stage_def.StageParams):
                 params = value
+            elif param_name in explicit_params:
+                self._validation_errors.append(
+                    f"{stage_name}: parameter '{param_name}' has unsupported type "
+                    f"'{type(value).__name__}'. Use ArtifactHandle (dependency), "
+                    f"StageParams (config), or list/tuple of ArtifactHandle."
+                )
 
         variant_str = "@".join(self._variant_stack) if self._variant_stack else None
 
@@ -208,6 +283,8 @@ class Pipeline:
             output_specs=output_specs,
             call_index=count,
             variant=variant_str,
+            list_input_handles=list_input_handles,
+            collection_params=collection_params,
         )
         self._stages.append(node)
 
@@ -246,47 +323,11 @@ class Pipeline:
             deps = dict[str, types.ArtifactRef]()
 
             for param_name, handle in node.input_handles.items():
-                if isinstance(handle._source, _InputNode):
-                    identity = types.ArtifactIdentity(producer=handle._source.name, key=None)
-                    types.validate_artifact_identity(identity)
-                    deps[param_name] = types.ArtifactRef(
-                        identity=identity,
-                        format=handle._source.format,
-                        python_type=handle._python_type,
-                        tag=types.ArtifactTag.DATA,
-                    )
-                    continue
+                deps[param_name] = _handle_to_artifact_ref(handle, node.name)
 
-                source = handle._source
-                if not source.output_specs:
-                    raise TypeError(
-                        f"Stage '{node.name}' depends on '{source.name}' which has no outputs "
-                        f"(returns None). A stage must produce outputs to be used as a dependency."
-                    )
-                if len(source.output_specs) == 1:
-                    output_spec = source.output_specs[0]
-                    output_key = None if output_spec.key == SINGLE_OUTPUT_KEY else output_spec.key
-                else:
-                    output_spec = next(
-                        spec for spec in source.output_specs if spec.key == handle._output_key
-                    )
-                    output_key = output_spec.key
-
-                if isinstance(output_spec.tag, _MetricTag):
-                    dep_tag = types.ArtifactTag.METRIC
-                elif isinstance(output_spec.tag, _PlotTag):
-                    dep_tag = types.ArtifactTag.PLOT
-                else:
-                    dep_tag = types.ArtifactTag.DATA
-
-                identity = types.ArtifactIdentity(producer=source.name, key=output_key)
-                types.validate_artifact_identity(identity)
-                deps[param_name] = types.ArtifactRef(
-                    identity=identity,
-                    format=output_spec.format,
-                    python_type=handle._python_type,
-                    tag=dep_tag,
-                )
+            for param_name, handles in node.list_input_handles.items():
+                for i, handle in enumerate(handles):
+                    deps[f"{param_name}[{i}]"] = _handle_to_artifact_ref(handle, node.name)
 
             outs = list[types.ArtifactRef]()
 
@@ -347,6 +388,7 @@ class Pipeline:
                 fingerprint=None,
                 params_arg_name=params_arg_name,
                 state_dir=self._root / ".pivot",
+                collection_params={k: str(v) for k, v in node.collection_params.items()},
             )
 
             legacy._registry.add_existing(stage_info)
@@ -583,6 +625,8 @@ class _StageNode:
     output_specs: list[_OutputSpec]
     call_index: int
     variant: str | None = None
+    list_input_handles: dict[str, list[ArtifactHandle]] = dataclasses.field(default_factory=dict)
+    collection_params: dict[str, CollectionKind] = dataclasses.field(default_factory=dict)
 
 
 @dataclasses.dataclass

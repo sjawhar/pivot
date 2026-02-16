@@ -154,6 +154,7 @@ class WorkerStageInfo(TypedDict):
     params_arg_name: str | None
     project_root: pathlib.Path
     state_dir: pathlib.Path
+    collection_params: dict[str, str]
 
 
 class TrackedDict(dict[str, Any]):
@@ -447,6 +448,7 @@ def execute_stage(
                         stage_outs,
                         store,
                         stage_info["params_arg_name"],
+                        stage_info["collection_params"],
                     )
                     if no_commit:
                         output_hashes = _hash_output_paths(output_paths)
@@ -1092,6 +1094,34 @@ def _write_output_with_store(
     return output_path
 
 
+def _reconstruct_list_kwargs(
+    kwargs: dict[str, Any],
+    collection_params: dict[str, str],
+) -> dict[str, Any]:
+    # Reverse the ``param[N]`` expansion from compose.Pipeline.build()
+    # back into ``param = [val0, val1, …]``.
+    lists = dict[str, list[tuple[int, Any]]]()
+    result = dict[str, Any]()
+    for name, value in kwargs.items():
+        bracket = name.rfind("[")
+        if bracket != -1 and name.endswith("]"):
+            base_name = name[:bracket]
+            index = int(name[bracket + 1 : -1])
+            if base_name not in lists:
+                lists[base_name] = list[tuple[int, Any]]()
+            lists[base_name].append((index, value))
+        else:
+            result[name] = value
+    for base_name, indexed in lists.items():
+        indexed.sort(key=lambda x: x[0])
+        values = [v for _, v in indexed]
+        result[base_name] = tuple(values) if collection_params.get(base_name) == "tuple" else values
+    for param_name, ctype in collection_params.items():
+        if param_name not in result:
+            result[param_name] = () if ctype == "tuple" else []
+    return result
+
+
 def _run_stage_function_with_store(
     func: Callable[..., Any],
     stage_name: str,
@@ -1102,6 +1132,7 @@ def _run_stage_function_with_store(
     outs: list[types.ArtifactRef],
     store: store_mod.Store,
     params_arg_name: str | None,
+    collection_params: dict[str, str],
 ) -> tuple[dict[types.ArtifactRef, pathlib.Path], dict[str, set[str]]]:
     with (
         _QueueWriter(stage_name, output_queue, is_stderr=False, ring_buffer=ring_buffer),
@@ -1124,6 +1155,8 @@ def _run_stage_function_with_store(
             else:
                 kwargs[name] = loaded
 
+        kwargs = _reconstruct_list_kwargs(kwargs, collection_params)
+
         _set_deterministic_seeds()
 
         result = _execute_with_joblib_protection(func, kwargs)
@@ -1136,6 +1169,10 @@ def _run_stage_function_with_store(
         for name, value in kwargs.items():
             if isinstance(value, TrackedDict):
                 accessed[name] = set(value.accessed_keys)
+            elif isinstance(value, (list, tuple)):
+                for item in value:
+                    if isinstance(item, TrackedDict):
+                        accessed.setdefault(name, set()).update(item.accessed_keys)
 
         return output_paths, accessed
 

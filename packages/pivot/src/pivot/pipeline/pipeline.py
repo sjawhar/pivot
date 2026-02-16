@@ -315,20 +315,34 @@ class Pipeline:
 
         # Collect stages to add with deep copy
         stages_to_add = list[registry.RegistryStageInfo]()
+        rename_map = dict[str, str]()
         for stage_name in other.list_stages():
             stage_info = copy.deepcopy(other.get(stage_name))
             if needs_prefix:
                 prefixed = f"{other.name}/{stage_name}"
-                # If the prefixed name also collides (e.g. two pipelines with the
-                # same name both have a stage with the same name), add a numeric
-                # suffix to guarantee uniqueness.
                 if prefixed in existing_names:
                     counter = 2
                     while f"{prefixed}_{counter}" in existing_names:
                         counter += 1
                     prefixed = f"{prefixed}_{counter}"
+                rename_map[stage_name] = prefixed
                 stage_info["name"] = prefixed
             stages_to_add.append(stage_info)
+
+        if rename_map:
+            for stage_info in stages_to_add:
+                for ref in stage_info["deps"].values():
+                    new_producer = rename_map.get(ref.identity.producer)
+                    if new_producer is not None:
+                        ref.identity = types.ArtifactIdentity(
+                            producer=new_producer, key=ref.identity.key
+                        )
+                for ref in stage_info["outs"]:
+                    new_producer = rename_map.get(ref.identity.producer)
+                    if new_producer is not None:
+                        ref.identity = types.ArtifactIdentity(
+                            producer=new_producer, key=ref.identity.key
+                        )
 
         # Add all stages (and track names to avoid intra-batch collisions)
         for stage_info in stages_to_add:

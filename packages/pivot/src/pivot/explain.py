@@ -194,28 +194,28 @@ def get_stage_explanation(
         str_hashes, missing_deps, unreadable_deps, _ = worker.hash_dependencies(deps)
         dep_hashes = _to_identity_keyed(str_hashes)
 
-    if missing_deps:
-        rel_missing = [project.to_relative_path(p) for p in missing_deps]
+    if missing_deps or unreadable_deps:
+        # fingerprint is pre-computed by the caller; diffing two dicts is cheap
+        code_changes = skip.diff_code_manifests(lock_data["code_manifest"], fingerprint)
+        param_changes = skip.diff_params(lock_data["params"], current_params)
+        reasons = list[str]()
+        if code_changes:
+            reasons.append("Code changed")
+        if param_changes:
+            reasons.append("Params changed")
+        if missing_deps:
+            rel_missing = [project.to_relative_path(p) for p in missing_deps]
+            reasons.append(f"Missing deps: {', '.join(rel_missing)}")
+        if unreadable_deps:
+            rel_unreadable = [project.to_relative_path(p) for p in unreadable_deps]
+            reasons.append(f"Unreadable deps: {', '.join(rel_unreadable)}")
         return StageExplanation(
             stage_name=stage_name,
             will_run=True,
             is_forced=force,
-            reason=f"Missing deps: {', '.join(rel_missing)}",
-            code_changes=[],
-            param_changes=[],
-            dep_changes=[],
-            upstream_stale=[],
-        )
-
-    if unreadable_deps:
-        rel_unreadable = [project.to_relative_path(p) for p in unreadable_deps]
-        return StageExplanation(
-            stage_name=stage_name,
-            will_run=True,
-            is_forced=force,
-            reason=f"Unreadable deps: {', '.join(rel_unreadable)}",
-            code_changes=[],
-            param_changes=[],
+            reason="; ".join(reasons),
+            code_changes=code_changes,
+            param_changes=param_changes,
             dep_changes=[],
             upstream_stale=[],
         )
