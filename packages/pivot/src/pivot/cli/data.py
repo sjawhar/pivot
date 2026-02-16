@@ -78,7 +78,10 @@ def diff(
     for target in targets:
         try:
             resolved = cli_targets.resolve_cli_target(target, all_stages, lambda _: False)
-        except cli_targets.TargetValidationError:
+        except cli_targets.TargetValidationError as exc:
+            identity = types.identity_from_key(target)
+            if identity.producer in all_stages:
+                raise click.ClickException(str(exc)) from exc
             resolved_targets.add(
                 project.to_relative_path(project.normalize_path(target), proj_root)
             )
