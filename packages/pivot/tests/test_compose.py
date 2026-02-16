@@ -11,6 +11,7 @@ import pytest
 
 from pivot import loaders, outputs, stage_def, types
 from pivot.compose import (
+    SINGLE_OUTPUT_KEY,
     ArtifactHandle,
     Pipeline,
     _analyze_return_type,
@@ -181,6 +182,23 @@ class _HelperMultiOutput(TypedDict):
 def _helper_multi_output() -> _HelperMultiOutput: ...
 
 
+class _HelperSingleFieldTypedDict(TypedDict):
+    result: pd.DataFrame
+
+
+@stage
+def _helper_single_field_typeddict() -> _HelperSingleFieldTypedDict:
+    return {"result": pd.DataFrame()}
+
+
+class _HelperSingleMetricTypedDict(TypedDict):
+    accuracy: Annotated[dict, metric]
+
+
+class _HelperReservedKeyTypedDict(TypedDict):
+    _single: str
+
+
 @stage
 def _helper_produce(params: stage_def.StageParams) -> pd.DataFrame:
     return pd.DataFrame()
@@ -270,6 +288,22 @@ def test_analyze_return_type_typeddict() -> None:
     assert specs[0].tag is None
     assert specs[1].key == "weights"
     assert isinstance(specs[1].tag, _MetricTag)
+
+
+def test_analyze_return_type_single_field_typeddict_with_metric() -> None:
+    def _helper() -> _HelperSingleMetricTypedDict: ...
+
+    specs = _analyze_return_type(_helper)
+    assert len(specs) == 1
+    assert specs[0].key == "accuracy"
+    assert isinstance(specs[0].tag, _MetricTag)
+
+
+def test_analyze_return_type_rejects_reserved_key() -> None:
+    def _helper() -> _HelperReservedKeyTypedDict: ...
+
+    with pytest.raises(ValueError, match=f"{SINGLE_OUTPUT_KEY!r} is reserved"):
+        _analyze_return_type(_helper)
 
 
 # --- Extension-based format inference ---
@@ -428,6 +462,36 @@ def test_pipeline_build_bridge(tmp_path: pathlib.Path) -> None:
     assert stage_b["deps"]["data"].tag is types.ArtifactTag.DATA
     assert isinstance(stage_b["outs"][0].format, loaders.YAML)
     assert stage_b["outs"][0].tag is types.ArtifactTag.DATA
+
+
+def test_pipeline_build_single_field_typeddict_preserves_key(tmp_path: pathlib.Path) -> None:
+    """Single-field TypedDict outputs must preserve their field name as the identity key."""
+    with Pipeline("test_single_td", root=tmp_path) as pipeline:
+        _helper_single_field_typeddict()
+
+    legacy = pipeline.build()
+    stage_info = legacy.get("_helper_single_field_typeddict")
+
+    assert len(stage_info["outs"]) == 1
+    out = stage_info["outs"][0]
+    assert out.identity.key == "result", (
+        f"Single-field TypedDict key should be 'result', not {out.identity.key!r}"
+    )
+
+
+def test_pipeline_build_single_field_typeddict_dep_key(tmp_path: pathlib.Path) -> None:
+    """Dep references to single-field TypedDict outputs must use the field key."""
+    with Pipeline("test_single_td_dep", root=tmp_path) as pipeline:
+        data = _helper_single_field_typeddict()
+        _helper_build_stage_b(data)  # pyright: ignore[reportArgumentType] - compose records deps, not real calls
+
+    legacy = pipeline.build()
+    consumer = legacy.get("_helper_build_stage_b")
+
+    dep = consumer["deps"]["data"]
+    assert dep.identity.key == "result", (
+        f"Dep to single-field TypedDict should use key 'result', not {dep.identity.key!r}"
+    )
 
 
 def test_external_input_produces_bindings(tmp_path: pathlib.Path) -> None:

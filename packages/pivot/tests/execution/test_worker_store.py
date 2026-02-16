@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, TypedDict, cast
 
 from pivot import loaders, types
 from pivot.executor import worker
@@ -35,6 +35,14 @@ def _stage_uppercase(data: str) -> str:
 
 def _stage_access_group(group: dict[str, str]) -> str:
     return group["a.txt"]
+
+
+class _HelperSingleFieldOutput(TypedDict):
+    upper: str
+
+
+def _stage_single_field_typeddict(data: str) -> _HelperSingleFieldOutput:
+    return {"upper": data.upper()}
 
 
 def _make_worker_stage_info(
@@ -176,3 +184,57 @@ def test_execute_stage_records_accessed_group_keys(
     assert result["status"] == types.StageStatus.RAN
     assert "accessed_dep_keys" in result
     assert result["accessed_dep_keys"] == {"group": {"a.txt"}}, "Should record accessed group keys"
+
+
+def test_execute_stage_single_field_typeddict(
+    worker_env: pathlib.Path, tmp_path: pathlib.Path, output_queue: mp.Queue[OutputMessage]
+) -> None:
+    """Single-field TypedDict return extracts the field value, not the whole dict."""
+    (tmp_path / "input.txt").write_text("hello")
+
+    deps = {
+        "data": _make_artifact_ref(
+            "input",
+            None,
+            tag=types.ArtifactTag.DATA,
+            loader=loaders.Text(),
+            python_type=str,
+        )
+    }
+    outs = [
+        _make_artifact_ref(
+            "stage",
+            "upper",
+            tag=types.ArtifactTag.DATA,
+            loader=loaders.Text(),
+            python_type=str,
+        )
+    ]
+    store_spec = cast(
+        "store_mod.StoreSpec",
+        cast(
+            "object",
+            {
+                "kind": "workspace",
+                "cache_dir": str(worker_env),
+                "project_root": str(tmp_path),
+                "pipeline_name": "pipe",
+                "input_bindings": {"input": "input.txt"},
+            },
+        ),
+    )
+
+    stage_info = _make_worker_stage_info(
+        _stage_single_field_typeddict,
+        tmp_path,
+        deps=deps,
+        outs=outs,
+        store_spec=store_spec,
+    )
+
+    result = worker.execute_stage("stage", stage_info, worker_env, output_queue)
+
+    output_path = tmp_path / "data" / "pipe" / "stage" / "upper.txt"
+    assert output_path.exists(), "Keyed output should be in subdirectory"
+    assert output_path.read_text() == "HELLO"
+    assert result["status"] == types.StageStatus.RAN
