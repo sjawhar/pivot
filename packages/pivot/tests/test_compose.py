@@ -15,9 +15,9 @@ from pivot.compose import (
     ArtifactHandle,
     CollectionKind,
     Pipeline,
-    _handle_to_artifact_ref,
     _analyze_return_type,
     _format_extension,
+    _handle_to_artifact_ref,
     _infer_format,
     _infer_format_from_extension,
     _InputNode,
@@ -1492,7 +1492,7 @@ def test_pipeline_level_cycle_is_valid_chain(tmp_path: pathlib.Path) -> None:
         a_out = _helper_produce(params=stage_def.StageParams())
 
     with p_b:
-        b_out = _helper_consume(data=a_out)
+        _helper_consume(data=a_out)
 
     # Build p_b which depends on p_a
     legacy = p_b.build()
