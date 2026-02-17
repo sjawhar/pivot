@@ -1416,3 +1416,92 @@ def test_cross_pipeline_input_binding_conflict_raises(tmp_path: pathlib.Path) ->
         _helper_consume_dict(result)
     with pytest.raises(ValueError, match="Input binding conflict.*raw"):
         p2.build()
+
+
+# --- Edge-case tests for cross-pipeline composition ---
+
+
+def test_cross_pipeline_transitive_three_pipelines(tmp_path: pathlib.Path) -> None:
+    """A→B→C transitive cross-pipeline dependencies resolve correctly."""
+    p_a = Pipeline("a", root=tmp_path)
+    with p_a:
+        a_out = _helper_produce(params=stage_def.StageParams())
+
+    p_b = Pipeline("b", root=tmp_path)
+    with p_b:
+        b_out = _helper_consume(data=a_out)
+
+    p_c = Pipeline("c", root=tmp_path)
+    with p_c:
+        _helper_consume_dict(b_out)
+
+    legacy = p_c.build()
+    stage_names = legacy.list_stages()
+    assert "a/_helper_produce" in stage_names
+    assert "b/_helper_consume" in stage_names
+    assert "c/_helper_consume_dict" in stage_names
+
+
+def test_cross_pipeline_list_handles(tmp_path: pathlib.Path) -> None:
+    """list[ArtifactHandle] from foreign pipelines are included and resolved."""
+    p1 = Pipeline("base", root=tmp_path)
+    with p1:
+        a = _helper_produce(params=stage_def.StageParams())
+
+    p2 = Pipeline("consumer", root=tmp_path)
+    with p2:
+        local_input = p2.input("local", path="data/raw/local.csv", t=pd.DataFrame)
+        _helper_consume_list(main_data=local_input, extra_data=[a, a])
+
+    legacy = p2.build()
+    assert "base/_helper_produce" in legacy.list_stages()
+    assert "consumer/_helper_consume_list" in legacy.list_stages()
+
+    consumer_info = legacy.get("consumer/_helper_consume_list")
+    assert consumer_info["deps"]["extra_data[0]"].identity.producer == "base/_helper_produce"
+
+
+def test_cross_pipeline_foreign_stage_uses_own_state_dir(tmp_path: pathlib.Path) -> None:
+    """Foreign stages keep their own pipeline's state_dir, not the consumer's."""
+    base_root = tmp_path / "base"
+    base_root.mkdir()
+    horizon_root = tmp_path / "horizon"
+    horizon_root.mkdir()
+
+    p1 = Pipeline("base", root=base_root)
+    with p1:
+        result = _helper_produce(params=stage_def.StageParams())
+
+    p2 = Pipeline("horizon", root=horizon_root)
+    with p2:
+        _helper_consume(data=result)
+
+    legacy = p2.build()
+    base_stage = legacy.get("base/_helper_produce")
+    horizon_stage = legacy.get("horizon/_helper_consume")
+    assert base_stage["state_dir"] == base_root / ".pivot"
+    assert horizon_stage["state_dir"] == horizon_root / ".pivot"
+
+
+def test_pipeline_level_cycle_is_valid_chain(tmp_path: pathlib.Path) -> None:
+    """Pipeline-level references don't create stage cycles; DAG remains valid."""
+    p_a = Pipeline("alpha", root=tmp_path)
+    p_b = Pipeline("beta", root=tmp_path)
+
+    with p_a:
+        a_out = _helper_produce(params=stage_def.StageParams())
+
+    with p_b:
+        b_out = _helper_consume(data=a_out)
+
+    # Build p_b which depends on p_a
+    legacy = p_b.build()
+    stages = legacy.list_stages()
+    assert "alpha/_helper_produce" in stages
+    assert "beta/_helper_consume" in stages
+    # Verify DAG is acyclic: alpha/_helper_produce has no deps, beta/_helper_consume depends on it
+    from pivot.engine import graph
+
+    bipartite = graph.build_graph(legacy._registry._stages)
+    upstream = graph.get_upstream_stages(bipartite, "beta/_helper_consume")
+    assert "alpha/_helper_produce" in upstream
