@@ -233,6 +233,21 @@ def _helper_consume_dict(data: dict) -> dict:
 
 
 @stage
+def _helper_base_a(params: stage_def.StageParams) -> pd.DataFrame:
+    return pd.DataFrame()
+
+
+@stage
+def _helper_base_b(data: pd.DataFrame) -> dict:
+    return {"rows": len(data)}
+
+
+@stage
+def _helper_base_c_unrelated(params: stage_def.StageParams) -> dict:
+    return {"ok": True}
+
+
+@stage
 def _helper_build_stage_a(
     params: stage_def.StageParams,
     raw: dict,
@@ -1336,3 +1351,26 @@ def test_no_fingerprint_outside_stage_decorator(set_project_root: pathlib.Path) 
     assert any(k.startswith("file:") for k in fp), (
         f"Expected file-hash fingerprint when @no_fingerprint is applied, got keys: {list(fp.keys())}"
     )
+
+
+# --- Cross-pipeline closure collection ---
+
+
+def test_build_includes_only_foreign_closure(tmp_path: pathlib.Path) -> None:
+    """build() includes transitive foreign deps but excludes unrelated foreign stages."""
+    base = Pipeline("base", root=tmp_path)
+    with base:
+        a = _helper_base_a(params=stage_def.StageParams())
+        b = _helper_base_b(a)
+        _helper_base_c_unrelated(params=stage_def.StageParams())
+
+    consumer = Pipeline("consumer", root=tmp_path)
+    with consumer:
+        _helper_consume_dict(b)
+
+    legacy = consumer.build()
+    names = set(legacy.list_stages())
+    assert "consumer/_helper_consume_dict" in names
+    assert "base/_helper_base_b" in names
+    assert "base/_helper_base_a" in names
+    assert "base/_helper_base_c_unrelated" not in names
