@@ -304,22 +304,26 @@ class Pipeline:
         if other is self:
             raise PipelineConfigError(f"Pipeline '{self.name}' cannot include itself")
 
-        stages_to_add = list[registry.RegistryStageInfo]()
+        existing_stages = set(self.list_stages())
+        stages_added = 0
         for stage_name in other.list_stages():
+            if stage_name in existing_stages:
+                logger.debug(
+                    f"Skipping stage '{stage_name}' from '{other.name}' — already in '{self.name}'"
+                )
+                continue
             stage_info = copy.deepcopy(other.get(stage_name))
-            stages_to_add.append(stage_info)
-
-        for stage_info in stages_to_add:
             self._registry.add_existing(stage_info)
+            stages_added += 1
 
         for name, path in other.input_bindings.items():
             if name not in self._input_bindings:
                 self._input_bindings[name] = path
 
-        if stages_to_add:
+        if stages_added:
             self._reset_resolution_cache()
             logger.debug(
-                f"Included {len(stages_to_add)} stages from pipeline '{other.name}' into '{self.name}'"
+                f"Included {stages_added} stages from pipeline '{other.name}' into '{self.name}'"
             )
 
     def resolve_external_dependencies(self) -> None:

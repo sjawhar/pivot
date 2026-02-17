@@ -1502,3 +1502,30 @@ def test_pipeline_level_cycle_is_valid_chain(tmp_path: pathlib.Path) -> None:
     assert "alpha/_helper_produce" in stage_names
     assert "beta/_helper_consume" in stage_names
     assert "alpha/_helper_consume_dict" in stage_names
+
+
+def test_cross_pipeline_all_discovery_deduplicates(tmp_path: pathlib.Path) -> None:
+    """Simulates --all discovery: cross-pipeline closure + independent builds don't collide."""
+    from pivot.pipeline import pipeline as pipeline_mod
+
+    p_difficulty = Pipeline("difficulty", root=tmp_path)
+    with p_difficulty:
+        patched = _helper_produce(params=stage_def.StageParams())
+
+    p_base = Pipeline("base", root=tmp_path)
+    with p_base:
+        _helper_consume(data=patched)
+
+    base_legacy = p_base.build()
+    difficulty_legacy = p_difficulty.build()
+
+    assert "difficulty/_helper_produce" in base_legacy.list_stages()
+    assert "difficulty/_helper_produce" in difficulty_legacy.list_stages()
+
+    combined = pipeline_mod.Pipeline("all", root=tmp_path)
+    combined.include(base_legacy)
+    combined.include(difficulty_legacy)
+
+    assert "difficulty/_helper_produce" in combined.list_stages()
+    assert "base/_helper_consume" in combined.list_stages()
+    assert len([s for s in combined.list_stages() if s == "difficulty/_helper_produce"]) == 1

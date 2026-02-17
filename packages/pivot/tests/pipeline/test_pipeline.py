@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from pivot import exceptions, loaders, registry, types
+from pivot import loaders, registry, types
 from pivot.pipeline import pipeline as pipeline_mod
 
 if TYPE_CHECKING:
@@ -117,7 +117,7 @@ def test_include_dep_identities_need_no_rewriting(tmp_path: pathlib.Path) -> Non
     assert downstream["deps"]["data"].identity.producer == "child/upstream"
 
 
-def test_include_raises_on_exact_name_collision(tmp_path: pathlib.Path) -> None:
+def test_include_skips_duplicate_stage_names(tmp_path: pathlib.Path) -> None:
     a = pipeline_mod.Pipeline("same", root=tmp_path)
     a._registry.add_existing(_make_stage_info("same/train"))
 
@@ -126,6 +126,6 @@ def test_include_raises_on_exact_name_collision(tmp_path: pathlib.Path) -> None:
 
     combined = pipeline_mod.Pipeline("all", root=tmp_path)
     combined.include(a)
+    combined.include(b)
 
-    with pytest.raises(exceptions.ValidationError, match="already registered"):
-        combined.include(b)
+    assert combined.list_stages() == ["same/train"]
