@@ -322,9 +322,7 @@ class Pipeline:
         legacy.set_input_bindings({name: node.path for name, node in self._inputs.items()})
 
         for node in self._stages:
-            node.name = f"{self._name}/{node.name}"
-
-        for node in self._stages:
+            qualified_name = f"{self._name}/{node.name}"
             func = node.original_func
             assert not hasattr(func, "_is_stage")
             if getattr(node.func, "__pivot_no_fingerprint__", False):
@@ -333,11 +331,11 @@ class Pipeline:
             deps = dict[str, types.ArtifactRef]()
 
             for param_name, handle in node.input_handles.items():
-                deps[param_name] = _handle_to_artifact_ref(handle, node.name)
+                deps[param_name] = _handle_to_artifact_ref(handle, qualified_name)
 
             for param_name, handles in node.list_input_handles.items():
                 for i, handle in enumerate(handles):
-                    deps[f"{param_name}[{i}]"] = _handle_to_artifact_ref(handle, node.name)
+                    deps[f"{param_name}[{i}]"] = _handle_to_artifact_ref(handle, qualified_name)
 
             outs = list[types.ArtifactRef]()
 
@@ -350,7 +348,7 @@ class Pipeline:
                 else:
                     out_tag = types.ArtifactTag.DATA
 
-                identity = types.ArtifactIdentity(producer=node.name, key=output_key)
+                identity = types.ArtifactIdentity(producer=qualified_name, key=output_key)
                 types.validate_artifact_identity(identity)
                 outs.append(
                     types.ArtifactRef(
@@ -376,7 +374,7 @@ class Pipeline:
                             union_arg, stage_def.StageParams
                         ):
                             raise TypeError(
-                                f"Stage '{node.name}' parameter '{name}' has type "
+                                f"Stage '{qualified_name}' parameter '{name}' has type "
                                 f"'{base_hint}' — StageParams must not be in a union. "
                                 f"Use 'params: {union_arg.__name__}' directly, with a "
                                 f"default if needed (params: {union_arg.__name__} = "
@@ -388,7 +386,7 @@ class Pipeline:
 
             stage_info = registry.RegistryStageInfo(
                 func=func,
-                name=node.name,
+                name=qualified_name,
                 deps=deps,
                 outs=outs,
                 params=node.params,

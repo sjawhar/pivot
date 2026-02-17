@@ -1226,6 +1226,15 @@ def test_build_prefixes_stage_names_with_pipeline_name(tmp_path: pathlib.Path) -
     assert "_helper_produce" not in legacy.list_stages()
 
 
+def test_build_does_not_mutate_stage_node_names(tmp_path: pathlib.Path) -> None:
+    with Pipeline("my_pipeline", root=tmp_path) as pipeline:
+        _helper_produce(params=stage_def.StageParams())
+
+    assert pipeline._stages[0].name == "_helper_produce"
+    pipeline.build()
+    assert pipeline._stages[0].name == "_helper_produce"
+
+
 def test_build_prefixes_output_identity_producer(tmp_path: pathlib.Path) -> None:
     with Pipeline("my_pipeline", root=tmp_path) as pipeline:
         _helper_produce(params=stage_def.StageParams())
