@@ -429,7 +429,39 @@ class Pipeline:
         )
 
     def _merge_foreign_input_bindings(self, legacy: pipeline_mod.Pipeline) -> None:
-        pass
+        foreign_bindings = dict[str, str]()
+        for _foreign_pipeline, foreign_node in self._upstream_closure():
+            for handle in foreign_node.input_handles.values():
+                if isinstance(handle._source, _InputNode):
+                    inp = handle._source
+                    if inp.name in foreign_bindings and foreign_bindings[inp.name] != inp.path:
+                        raise ValueError(
+                            f"Input binding conflict: input '{inp.name}' is bound to "
+                            f"'{foreign_bindings[inp.name]}' and '{inp.path}' "
+                            f"in different pipelines."
+                        )
+                    foreign_bindings[inp.name] = inp.path
+            for handles in foreign_node.list_input_handles.values():
+                for handle in handles:
+                    if isinstance(handle._source, _InputNode):
+                        inp = handle._source
+                        if inp.name in foreign_bindings and foreign_bindings[inp.name] != inp.path:
+                            raise ValueError(
+                                f"Input binding conflict: input '{inp.name}' is bound to "
+                                f"'{foreign_bindings[inp.name]}' and '{inp.path}' "
+                                f"in different pipelines."
+                            )
+                        foreign_bindings[inp.name] = inp.path
+
+        local_bindings = legacy.input_bindings
+        for name, path in foreign_bindings.items():
+            if name in local_bindings and local_bindings[name] != path:
+                raise ValueError(
+                    f"Input binding conflict: input '{name}' is bound to "
+                    f"'{local_bindings[name]}' locally and '{path}' in a foreign pipeline."
+                )
+            local_bindings[name] = path
+        legacy.set_input_bindings(local_bindings)
 
     def build(self) -> pipeline_mod.Pipeline:
         if self._built:

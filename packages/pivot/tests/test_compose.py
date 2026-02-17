@@ -1374,3 +1374,45 @@ def test_build_includes_only_foreign_closure(tmp_path: pathlib.Path) -> None:
     assert "base/_helper_base_b" in names
     assert "base/_helper_base_a" in names
     assert "base/_helper_base_c_unrelated" not in names
+
+
+# --- Cross-pipeline input-binding merge ---
+
+
+def test_cross_pipeline_input_bindings_propagated(tmp_path: pathlib.Path) -> None:
+    p1 = Pipeline("base", root=tmp_path)
+    with p1:
+        data = p1.input("external_data", path="data/external/scores.csv", t=pd.DataFrame)
+        result = _helper_consume(data=data)
+    p2 = Pipeline("horizon", root=tmp_path)
+    with p2:
+        _helper_consume_dict(result)
+    legacy = p2.build()
+    assert "external_data" in legacy.input_bindings
+    assert legacy.input_bindings["external_data"] == "data/external/scores.csv"
+
+
+def test_cross_pipeline_input_binding_same_path_ok(tmp_path: pathlib.Path) -> None:
+    p1 = Pipeline("base", root=tmp_path)
+    with p1:
+        data1 = p1.input("raw", path="data/raw/shared.csv", t=pd.DataFrame)
+        result = _helper_consume(data=data1)
+    p2 = Pipeline("consumer", root=tmp_path)
+    with p2:
+        _ = p2.input("raw", path="data/raw/shared.csv", t=pd.DataFrame)
+        _helper_consume_dict(result)
+    legacy = p2.build()
+    assert legacy.input_bindings["raw"] == "data/raw/shared.csv"
+
+
+def test_cross_pipeline_input_binding_conflict_raises(tmp_path: pathlib.Path) -> None:
+    p1 = Pipeline("base", root=tmp_path)
+    with p1:
+        data1 = p1.input("raw", path="data/raw/base.csv", t=pd.DataFrame)
+        result = _helper_consume(data=data1)
+    p2 = Pipeline("consumer", root=tmp_path)
+    with p2:
+        _ = p2.input("raw", path="data/raw/consumer.csv", t=pd.DataFrame)
+        _helper_consume_dict(result)
+    with pytest.raises(ValueError, match="Input binding conflict.*raw"):
+        p2.build()
