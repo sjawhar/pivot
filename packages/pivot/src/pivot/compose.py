@@ -118,6 +118,108 @@ def _handle_to_artifact_ref(handle: ArtifactHandle, consumer_name: str) -> types
     )
 
 
+def _iter_stage_handles(node: _StageNode) -> list[ArtifactHandle]:
+    result = list[ArtifactHandle]()
+    for handle in node.input_handles.values():
+        if isinstance(handle._source, _StageNode):
+            result.append(handle)
+    for handles in node.list_input_handles.values():
+        for handle in handles:
+            if isinstance(handle._source, _StageNode):
+                result.append(handle)
+    return result
+
+
+def _iter_all_handles(node: _StageNode) -> list[ArtifactHandle]:
+    result = list[ArtifactHandle]()
+    for handle in node.input_handles.values():
+        result.append(handle)
+    for handles in node.list_input_handles.values():
+        for handle in handles:
+            result.append(handle)
+    return result
+
+
+def _emit_stage_info(
+    node: _StageNode,
+    qualified_name: str,
+    state_dir: pathlib.Path,
+) -> registry.RegistryStageInfo:
+    func = node.original_func
+    assert not hasattr(func, "_is_stage")
+    if getattr(node.func, "__pivot_no_fingerprint__", False):
+        func.__pivot_no_fingerprint__ = True  # pyright: ignore[reportFunctionMemberAccess]
+
+    deps = dict[str, types.ArtifactRef]()
+
+    for param_name, handle in node.input_handles.items():
+        deps[param_name] = _handle_to_artifact_ref(handle, qualified_name)
+
+    for param_name, handles in node.list_input_handles.items():
+        for i, handle in enumerate(handles):
+            deps[f"{param_name}[{i}]"] = _handle_to_artifact_ref(handle, qualified_name)
+
+    outs = list[types.ArtifactRef]()
+
+    for output_spec in node.output_specs:
+        output_key = None if output_spec.key == SINGLE_OUTPUT_KEY else output_spec.key
+        if isinstance(output_spec.tag, _MetricTag):
+            out_tag = types.ArtifactTag.METRIC
+        elif isinstance(output_spec.tag, _PlotTag):
+            out_tag = types.ArtifactTag.PLOT
+        else:
+            out_tag = types.ArtifactTag.DATA
+
+        identity = types.ArtifactIdentity(producer=qualified_name, key=output_key)
+        types.validate_artifact_identity(identity)
+        outs.append(
+            types.ArtifactRef(
+                identity=identity,
+                format=output_spec.format,
+                python_type=output_spec.python_type,
+                tag=out_tag,
+            )
+        )
+
+    params_arg_name: str | None = None
+    hints = get_type_hints(func, include_extras=True)
+    for name, hint in hints.items():
+        if name == "return":
+            continue
+        base_hint = hint
+        if get_origin(base_hint) is Annotated:
+            base_hint = get_args(base_hint)[0]
+        origin = get_origin(base_hint)
+        if origin is _stdlib_types.UnionType or origin is typing.Union:  # pyright: ignore[reportDeprecated] - runtime identity check
+            for union_arg in get_args(base_hint):
+                if isinstance(union_arg, type) and issubclass(union_arg, stage_def.StageParams):
+                    raise TypeError(
+                        f"Stage '{qualified_name}' parameter '{name}' has type "
+                        f"'{base_hint}' — StageParams must not be in a union. "
+                        f"Use 'params: {union_arg.__name__}' directly, with a "
+                        f"default if needed (params: {union_arg.__name__} = "
+                        f"{union_arg.__name__}())."
+                    )
+        if isinstance(base_hint, type) and issubclass(base_hint, stage_def.StageParams):
+            params_arg_name = name
+            break
+
+    return registry.RegistryStageInfo(
+        func=func,
+        name=qualified_name,
+        deps=deps,
+        outs=outs,
+        params=node.params,
+        mutex=[],
+        variant=node.variant,
+        signature=inspect.signature(func),
+        fingerprint=None,
+        params_arg_name=params_arg_name,
+        state_dir=state_dir,
+        collection_params={k: str(v) for k, v in node.collection_params.items()},
+    )
+
+
 class Pipeline:
     _name: str
     _root: pathlib.Path
@@ -322,13 +424,11 @@ class Pipeline:
         stack = list[tuple[Pipeline, _StageNode]]()
 
         for node in self._stages:
-            for handle in node.input_handles.values():
-                if isinstance(handle._source, _StageNode) and handle._pipeline is not self:
-                    stack.append((handle._pipeline, handle._source))
-            for handles in node.list_input_handles.values():
-                for handle in handles:
-                    if isinstance(handle._source, _StageNode) and handle._pipeline is not self:
-                        stack.append((handle._pipeline, handle._source))
+            for handle in _iter_stage_handles(node):
+                if handle._pipeline is not self:
+                    source = handle._source
+                    assert isinstance(source, _StageNode)  # guaranteed by _iter_stage_handles
+                    stack.append((handle._pipeline, source))
 
         while stack:
             foreign_pipeline, stage_node = stack.pop()
@@ -338,100 +438,22 @@ class Pipeline:
             visited.add(node_id)
             result.append((foreign_pipeline, stage_node))
 
-            for handle in stage_node.input_handles.values():
-                if isinstance(handle._source, _StageNode):
-                    stack.append((handle._pipeline, handle._source))
-            for handles in stage_node.list_input_handles.values():
-                for handle in handles:
-                    if isinstance(handle._source, _StageNode):
-                        stack.append((handle._pipeline, handle._source))
+            for handle in _iter_stage_handles(stage_node):
+                if handle._pipeline is not self:
+                    source = handle._source
+                    assert isinstance(source, _StageNode)  # guaranteed by _iter_stage_handles
+                    stack.append((handle._pipeline, source))
 
         return result
 
     @staticmethod
-    def _emit_stage_info(
-        node: _StageNode,
-        qualified_name: str,
-        state_dir: pathlib.Path,
-    ) -> registry.RegistryStageInfo:
-        func = node.original_func
-        assert not hasattr(func, "_is_stage")
-        if getattr(node.func, "__pivot_no_fingerprint__", False):
-            func.__pivot_no_fingerprint__ = True  # pyright: ignore[reportFunctionMemberAccess]
-
-        deps = dict[str, types.ArtifactRef]()
-
-        for param_name, handle in node.input_handles.items():
-            deps[param_name] = _handle_to_artifact_ref(handle, qualified_name)
-
-        for param_name, handles in node.list_input_handles.items():
-            for i, handle in enumerate(handles):
-                deps[f"{param_name}[{i}]"] = _handle_to_artifact_ref(handle, qualified_name)
-
-        outs = list[types.ArtifactRef]()
-
-        for output_spec in node.output_specs:
-            output_key = None if output_spec.key == SINGLE_OUTPUT_KEY else output_spec.key
-            if isinstance(output_spec.tag, _MetricTag):
-                out_tag = types.ArtifactTag.METRIC
-            elif isinstance(output_spec.tag, _PlotTag):
-                out_tag = types.ArtifactTag.PLOT
-            else:
-                out_tag = types.ArtifactTag.DATA
-
-            identity = types.ArtifactIdentity(producer=qualified_name, key=output_key)
-            types.validate_artifact_identity(identity)
-            outs.append(
-                types.ArtifactRef(
-                    identity=identity,
-                    format=output_spec.format,
-                    python_type=output_spec.python_type,
-                    tag=out_tag,
-                )
-            )
-
-        params_arg_name: str | None = None
-        hints = get_type_hints(func, include_extras=True)
-        for name, hint in hints.items():
-            if name == "return":
-                continue
-            base_hint = hint
-            if get_origin(base_hint) is Annotated:
-                base_hint = get_args(base_hint)[0]
-            origin = get_origin(base_hint)
-            if origin is _stdlib_types.UnionType or origin is typing.Union:  # pyright: ignore[reportDeprecated] - runtime identity check
-                for union_arg in get_args(base_hint):
-                    if isinstance(union_arg, type) and issubclass(union_arg, stage_def.StageParams):
-                        raise TypeError(
-                            f"Stage '{qualified_name}' parameter '{name}' has type "
-                            f"'{base_hint}' — StageParams must not be in a union. "
-                            f"Use 'params: {union_arg.__name__}' directly, with a "
-                            f"default if needed (params: {union_arg.__name__} = "
-                            f"{union_arg.__name__}())."
-                        )
-            if isinstance(base_hint, type) and issubclass(base_hint, stage_def.StageParams):
-                params_arg_name = name
-                break
-
-        return registry.RegistryStageInfo(
-            func=func,
-            name=qualified_name,
-            deps=deps,
-            outs=outs,
-            params=node.params,
-            mutex=[],
-            variant=node.variant,
-            signature=inspect.signature(func),
-            fingerprint=None,
-            params_arg_name=params_arg_name,
-            state_dir=state_dir,
-            collection_params={k: str(v) for k, v in node.collection_params.items()},
-        )
-
-    def _merge_foreign_input_bindings(self, legacy: pipeline_mod.Pipeline) -> None:
+    def _merge_foreign_input_bindings(
+        legacy: pipeline_mod.Pipeline,
+        closure: list[tuple[Pipeline, _StageNode]],
+    ) -> None:
         foreign_bindings = dict[str, str]()
-        for _foreign_pipeline, foreign_node in self._upstream_closure():
-            for handle in foreign_node.input_handles.values():
+        for _foreign_pipeline, foreign_node in closure:
+            for handle in _iter_all_handles(foreign_node):
                 if isinstance(handle._source, _InputNode):
                     inp = handle._source
                     if inp.name in foreign_bindings and foreign_bindings[inp.name] != inp.path:
@@ -441,17 +463,6 @@ class Pipeline:
                             f"in different pipelines."
                         )
                     foreign_bindings[inp.name] = inp.path
-            for handles in foreign_node.list_input_handles.values():
-                for handle in handles:
-                    if isinstance(handle._source, _InputNode):
-                        inp = handle._source
-                        if inp.name in foreign_bindings and foreign_bindings[inp.name] != inp.path:
-                            raise ValueError(
-                                f"Input binding conflict: input '{inp.name}' is bound to "
-                                f"'{foreign_bindings[inp.name]}' and '{inp.path}' "
-                                f"in different pipelines."
-                            )
-                        foreign_bindings[inp.name] = inp.path
 
         local_bindings = legacy.input_bindings
         for name, path in foreign_bindings.items():
@@ -470,18 +481,20 @@ class Pipeline:
         legacy = pipeline_mod.Pipeline(self._name, root=self._root)
         legacy.set_input_bindings({name: node.path for name, node in self._inputs.items()})
 
-        for foreign_pipeline, foreign_node in self._upstream_closure():
+        closure = self._upstream_closure()
+
+        for foreign_pipeline, foreign_node in closure:
             qualified_name = f"{foreign_pipeline._name}/{foreign_node.name}"
-            stage_info = self._emit_stage_info(
+            stage_info = _emit_stage_info(
                 foreign_node, qualified_name, foreign_pipeline._root / ".pivot"
             )
             legacy._registry.add_existing(stage_info)
 
-        self._merge_foreign_input_bindings(legacy)
+        self._merge_foreign_input_bindings(legacy, closure)
 
         for node in self._stages:
             qualified_name = f"{self._name}/{node.name}"
-            stage_info = self._emit_stage_info(node, qualified_name, self._root / ".pivot")
+            stage_info = _emit_stage_info(node, qualified_name, self._root / ".pivot")
             legacy._registry.add_existing(stage_info)
 
         self._built = True

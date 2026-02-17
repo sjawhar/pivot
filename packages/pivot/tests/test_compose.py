@@ -1484,7 +1484,7 @@ def test_cross_pipeline_foreign_stage_uses_own_state_dir(tmp_path: pathlib.Path)
 
 
 def test_pipeline_level_cycle_is_valid_chain(tmp_path: pathlib.Path) -> None:
-    """Pipeline-level references don't create stage cycles; DAG remains valid."""
+    """A->B->A at pipeline level is a linear stage chain, not a cycle."""
     p_a = Pipeline("alpha", root=tmp_path)
     p_b = Pipeline("beta", root=tmp_path)
 
@@ -1492,16 +1492,13 @@ def test_pipeline_level_cycle_is_valid_chain(tmp_path: pathlib.Path) -> None:
         a_out = _helper_produce(params=stage_def.StageParams())
 
     with p_b:
-        _helper_consume(data=a_out)
+        b_out = _helper_consume(data=a_out)
 
-    # Build p_b which depends on p_a
-    legacy = p_b.build()
-    stages = legacy.list_stages()
-    assert "alpha/_helper_produce" in stages
-    assert "beta/_helper_consume" in stages
-    # Verify DAG is acyclic: alpha/_helper_produce has no deps, beta/_helper_consume depends on it
-    from pivot.engine import graph
+    with p_a:
+        _helper_consume_dict(b_out)
 
-    bipartite = graph.build_graph(legacy._registry._stages)
-    upstream = graph.get_upstream_stages(bipartite, "beta/_helper_consume")
-    assert "alpha/_helper_produce" in upstream
+    legacy = p_a.build()
+    stage_names = legacy.list_stages()
+    assert "alpha/_helper_produce" in stage_names
+    assert "beta/_helper_consume" in stage_names
+    assert "alpha/_helper_consume_dict" in stage_names
