@@ -1170,17 +1170,18 @@ def test_dep_loader_config_collision() -> None:
 # --- Cross-pipeline handle validation ---
 
 
-def test_cross_pipeline_handle_rejected(tmp_path: pathlib.Path) -> None:
-    """Handles from different Pipeline instances must be rejected during validation."""
+def test_cross_pipeline_handle_accepted(tmp_path: pathlib.Path) -> None:
     p1 = Pipeline("pipe1", root=tmp_path)
     with p1:
         handle = p1.input("data", path="data/raw/data.csv", t=pd.DataFrame)
 
-    with (
-        pytest.raises(ValueError, match="different Pipeline instance"),
-        Pipeline("pipe2", root=tmp_path),
-    ):
+    p2 = Pipeline("pipe2", root=tmp_path)
+    with p2:
         _helper_consume(data=handle)
+
+    assert len(p2._stages) == 1
+    assert "data" in p2._stages[0].input_handles
+    assert p2._stages[0].input_handles["data"]._pipeline is p1
 
 
 # --- build() validation without context manager ---

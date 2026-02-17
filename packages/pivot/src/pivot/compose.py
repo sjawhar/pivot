@@ -257,22 +257,10 @@ class Pipeline:
         params: stage_def.StageParams | None = None
         for param_name, value in bound.arguments.items():
             if isinstance(value, ArtifactHandle):
-                if value._pipeline is not self:
-                    self._validation_errors.append(
-                        f"{stage_name}: parameter '{param_name}' is a handle from a "
-                        f"different Pipeline instance. All handles must come from the same pipeline."
-                    )
                 input_handles[param_name] = value
             elif isinstance(value, (list, tuple)) and all(
                 isinstance(v, ArtifactHandle) for v in value
             ):
-                for v in value:
-                    if isinstance(v, ArtifactHandle) and v._pipeline is not self:
-                        self._validation_errors.append(
-                            f"{stage_name}: parameter '{param_name}' is a handle from a "
-                            f"different Pipeline instance. All handles must come from the same pipeline."
-                        )
-                        break
                 list_input_handles[param_name] = list(value)
                 collection_params[param_name] = (
                     CollectionKind.TUPLE if isinstance(value, tuple) else CollectionKind.LIST
