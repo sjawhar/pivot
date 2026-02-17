@@ -78,9 +78,10 @@ def _handle_to_artifact_ref(handle: ArtifactHandle, consumer_name: str) -> types
         )
 
     source = handle._source
+    qualified_name = f"{handle._pipeline._name}/{source.name}"
     if not source.output_specs:
         raise TypeError(
-            f"Stage '{consumer_name}' depends on '{source.name}' which has no outputs "
+            f"Stage '{consumer_name}' depends on '{qualified_name}' which has no outputs "
             f"(returns None). A stage must produce outputs to be used as a dependency."
         )
     if len(source.output_specs) == 1:
@@ -94,7 +95,7 @@ def _handle_to_artifact_ref(handle: ArtifactHandle, consumer_name: str) -> types
             available = [spec.key for spec in source.output_specs]
             raise TypeError(
                 f"Stage '{consumer_name}' received handle from multi-output stage "
-                f"'{source.name}' without selecting an output. "
+                f"'{qualified_name}' without selecting an output. "
                 f"Use handle.key or handle['key']. Available: {available}"
             )
         output_spec = matched
@@ -107,7 +108,7 @@ def _handle_to_artifact_ref(handle: ArtifactHandle, consumer_name: str) -> types
     else:
         dep_tag = types.ArtifactTag.DATA
 
-    identity = types.ArtifactIdentity(producer=source.name, key=output_key)
+    identity = types.ArtifactIdentity(producer=qualified_name, key=output_key)
     types.validate_artifact_identity(identity)
     return types.ArtifactRef(
         identity=identity,

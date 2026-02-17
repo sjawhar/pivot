@@ -15,6 +15,7 @@ from pivot.compose import (
     ArtifactHandle,
     CollectionKind,
     Pipeline,
+    _handle_to_artifact_ref,
     _analyze_return_type,
     _format_extension,
     _infer_format,
@@ -1245,6 +1246,15 @@ def test_build_prefixes_output_identity_producer(tmp_path: pathlib.Path) -> None
         assert out.identity.producer == "my_pipeline/_helper_produce"
 
 
+def test_handle_to_artifact_ref_qualifies_producer_name(tmp_path: pathlib.Path) -> None:
+    p1 = Pipeline("base", root=tmp_path)
+    with p1:
+        result = _helper_produce(params=stage_def.StageParams())
+
+    ref = _handle_to_artifact_ref(result, "horizon/consumer")
+    assert ref.identity.producer == "base/_helper_produce"
+
+
 def test_build_prefixes_dep_identity_producer(tmp_path: pathlib.Path) -> None:
     with Pipeline("my_pipeline", root=tmp_path) as pipeline:
         result = _helper_produce(params=stage_def.StageParams())
@@ -1256,6 +1266,21 @@ def test_build_prefixes_dep_identity_producer(tmp_path: pathlib.Path) -> None:
     assert dep.identity.producer == "my_pipeline/_helper_produce"
 
 
+def test_cross_pipeline_dep_identity_qualified(tmp_path: pathlib.Path) -> None:
+    p1 = Pipeline("base", root=tmp_path)
+    with p1:
+        result = _helper_produce(params=stage_def.StageParams())
+
+    p2 = Pipeline("horizon", root=tmp_path)
+    with p2:
+        _helper_consume(data=result)
+
+    legacy = p2.build()
+    consumer = legacy.get("horizon/_helper_consume")
+    dep = consumer["deps"]["data"]
+    assert dep.identity.producer == "base/_helper_produce"
+
+
 def test_build_does_not_prefix_input_identity(tmp_path: pathlib.Path) -> None:
     with Pipeline("my_pipeline", root=tmp_path) as pipeline:
         inp = pipeline.input("data.csv", path="data/raw/data.csv", t=pd.DataFrame)
@@ -1265,6 +1290,21 @@ def test_build_does_not_prefix_input_identity(tmp_path: pathlib.Path) -> None:
     consumer = legacy.get("my_pipeline/_helper_consume")
     dep = consumer["deps"]["data"]
     assert dep.identity.producer == "data.csv"  # NOT "my_pipeline/data.csv"
+
+
+def test_cross_pipeline_input_identity_not_qualified(tmp_path: pathlib.Path) -> None:
+    p1 = Pipeline("base", root=tmp_path)
+    with p1:
+        data = p1.input("scores", path="data/raw/scores.csv", t=pd.DataFrame)
+
+    p2 = Pipeline("horizon", root=tmp_path)
+    with p2:
+        _helper_consume(data=data)
+
+    legacy = p2.build()
+    consumer = legacy.get("horizon/_helper_consume")
+    dep = consumer["deps"]["data"]
+    assert dep.identity.producer == "scores"
 
 
 def test_build_double_call_raises(tmp_path: pathlib.Path) -> None:
