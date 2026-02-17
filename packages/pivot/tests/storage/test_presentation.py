@@ -1,14 +1,10 @@
 from __future__ import annotations
 
 import pathlib
-from typing import TYPE_CHECKING
 
-from pivot import compose, loaders, types
+from pivot import loaders, types
 from pivot.registry import RegistryStageInfo
 from pivot.storage.presentation import present
-
-if TYPE_CHECKING:
-    pass
 
 
 def _make_stage(
@@ -55,7 +51,7 @@ def test_presentation_creates_symlinks_for_single_output(tmp_path: pathlib.Path)
         stages=stages,
     )
 
-    display_path = tmp_path / "data" / "default" / "train.csv"
+    display_path = tmp_path / "data" / "train.csv"
     assert display_path.is_symlink()
     assert display_path.resolve() == ref_path.resolve()
 
@@ -78,7 +74,7 @@ def test_presentation_creates_symlinks_for_keyed_output(tmp_path: pathlib.Path) 
         stages=stages,
     )
 
-    display_path = tmp_path / "metrics" / "default" / "eval" / "accuracy.json"
+    display_path = tmp_path / "metrics" / "eval" / "accuracy.json"
     assert display_path.is_symlink()
 
 
@@ -96,5 +92,5 @@ def test_presentation_skips_missing_refs(tmp_path: pathlib.Path) -> None:
         stages=stages,
     )
 
-    display_path = tmp_path / "data" / "default" / "missing.csv"
+    display_path = tmp_path / "data" / "missing.csv"
     assert not display_path.exists()

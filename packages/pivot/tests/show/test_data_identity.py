@@ -2,22 +2,16 @@ from __future__ import annotations
 
 import inspect
 import pathlib
-from typing import TYPE_CHECKING
 
-import click.testing
 import pytest
 
 from pivot import git, loaders, project, types
-from pivot import cli as cli_module
 from pivot.cli import helpers as cli_helpers
 from pivot.registry import RegistryStageInfo
 from pivot.show import common as show_common
 from pivot.show import data as data_module
 from pivot.storage import store as store_mod
 from pivot.types import DataFileFormat, StorageLockData
-
-if TYPE_CHECKING:
-    from pivot.pipeline import pipeline as pipeline_mod
 
 
 def _make_artifact_ref(
@@ -66,7 +60,7 @@ def test_data_rel_path_uses_workspace_store(
 
     rel_path = data_module._data_rel_path(ref, tmp_path)
 
-    assert rel_path == "data/eval/train.csv"
+    assert rel_path == "data/train.csv"
     assert rel_path != "train"
 
 
@@ -108,7 +102,7 @@ def test_get_data_outputs_from_stages_uses_store_paths(
 
     result = data_module.get_data_outputs_from_stages()
 
-    assert result == {"train": "data/eval/train.csv"}
+    assert result == {"train": "data/train.csv"}
 
 
 def test_extract_output_hashes_from_lock_uses_identity_keys() -> None:
@@ -162,4 +156,4 @@ outs:
 
     result = data_module.get_data_hashes_from_head()
 
-    assert result == {"data/eval/train.csv": "deadbeef"}
+    assert result == {"data/train.csv": "deadbeef"}

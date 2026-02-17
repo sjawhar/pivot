@@ -344,3 +344,31 @@ class MatplotlibFigure(Writer["Figure"]):
             )
         finally:
             plt.close(data)
+
+
+def format_extension(fmt: object) -> str:
+    """Map loader type to file extension.
+
+    Args:
+        fmt: A loader instance (CSV, JSON, YAML, etc.)
+
+    Returns:
+        File extension without the dot (e.g., "csv", "json", "pkl")
+    """
+    match fmt:
+        case DataFrameJSONL():
+            return "jsonl"
+        case CSV():
+            return "csv"
+        case YAML():
+            return "yaml"
+        case JSON():
+            return "json"
+        case Text():
+            return "txt"
+        case Pickle():
+            return "pkl"
+        case MatplotlibFigure():
+            return "png"
+        case _:
+            return "dat"

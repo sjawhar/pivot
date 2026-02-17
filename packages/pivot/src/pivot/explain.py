@@ -28,11 +28,6 @@ if TYPE_CHECKING:
 
     from pivot.storage.track import PvtData
 
-# Re-exports for backward compatibility (tests reference these)
-diff_code_manifests = skip.diff_code_manifests
-diff_params = skip.diff_params
-diff_dep_hashes = skip.diff_dep_hashes
-
 
 def _to_identity_keyed(str_hashes: dict[str, HashInfo]) -> dict[ArtifactIdentity, HashInfo]:
     return {identity_from_key(k): v for k, v in str_hashes.items()}
@@ -166,30 +161,19 @@ def get_stage_explanation(
                 )
 
     if allow_missing:
-        deps_to_hash = list[str]()
         fallback_hashes = dict[ArtifactIdentity, HashInfo]()
         missing_deps = list[str]()
 
         for dep in deps:
-            dep_path = pathlib.Path(dep)
-            if dep_path.exists():
-                deps_to_hash.append(dep)
+            dep_id = identity_from_key(dep)
+            hash_info = lock_data["dep_hashes"].get(dep_id)
+            if hash_info:
+                fallback_hashes[dep_id] = hash_info
             else:
-                hash_info = None
-                if tracked_files is not None and tracked_trie is not None:
-                    hash_info = _find_tracked_hash(dep_path, tracked_files, tracked_trie)
-                dep_id = identity_from_key(dep)
-                if hash_info is None:
-                    hash_info = lock_data["dep_hashes"].get(dep_id)
-                if hash_info:
-                    fallback_hashes[dep_id] = hash_info
-                else:
-                    missing_deps.append(dep)
+                missing_deps.append(dep)
 
-        str_hashes, more_missing, unreadable_deps, _ = worker.hash_dependencies(deps_to_hash)
-        dep_hashes = _to_identity_keyed(str_hashes)
-        dep_hashes.update(fallback_hashes)
-        missing_deps.extend(more_missing)
+        dep_hashes = fallback_hashes
+        unreadable_deps = list[str]()
     else:
         str_hashes, missing_deps, unreadable_deps, _ = worker.hash_dependencies(deps)
         dep_hashes = _to_identity_keyed(str_hashes)

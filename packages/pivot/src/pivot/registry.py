@@ -1,7 +1,6 @@
 # pyright: reportImplicitRelativeImport=false, reportMissingModuleSource=false, reportExplicitAny=false, reportAny=false
 from __future__ import annotations
 
-import enum
 import inspect
 import logging
 import pathlib
@@ -51,22 +50,14 @@ class RegistryStageInfo(TypedDict):
     collection_params: dict[str, str]
 
 
-class ValidationMode(enum.StrEnum):
-    """Validation strictness levels."""
-
-    ERROR = "error"  # Raise exception on validation failure
-    WARN = "warn"  # Log warning, allow registration
-
-
 class StageRegistry:
     """Registry for pipeline stages and DAG construction."""
 
     _stages: dict[str, RegistryStageInfo]
 
-    def __init__(self, validation_mode: ValidationMode = ValidationMode.ERROR) -> None:
+    def __init__(self) -> None:
         self._stages = dict[str, RegistryStageInfo]()
         self._cached_dag: DiGraph[str] | None = None
-        self.validation_mode: ValidationMode = validation_mode
 
     def add_existing(self, stage_info: RegistryStageInfo) -> None:
         """Add a pre-validated stage info (for pipeline composition).
@@ -80,6 +71,11 @@ class StageRegistry:
         name = stage_info["name"]
         if name in self._stages:
             raise exceptions.ValidationError(f"Stage '{name}' already registered")
+        for out in stage_info["outs"]:
+            if out.identity.producer != name:
+                raise ValueError(
+                    f"Output producer '{out.identity.producer}' for stage '{name}' must match stage name"
+                )
         self._stages[name] = stage_info
         self._cached_dag = None
 
@@ -167,8 +163,11 @@ class StageRegistry:
 def _compute_fingerprint(stage_name: str, info: RegistryStageInfo) -> dict[str, str]:
     """Compute and return a stage fingerprint, wrapping errors."""
     try:
-        unwrapped = inspect.unwrap(info["func"])
-        if getattr(unwrapped, "__pivot_no_fingerprint__", False):
+        no_fp = getattr(info["func"], "__pivot_no_fingerprint__", False)
+        if not no_fp:
+            unwrapped = inspect.unwrap(info["func"])
+            no_fp = getattr(unwrapped, "__pivot_no_fingerprint__", False)
+        if no_fp:
             result = _compute_file_fingerprint(info["func"])
         else:
             result = fingerprint.get_stage_fingerprint_cached(stage_name, info["func"])

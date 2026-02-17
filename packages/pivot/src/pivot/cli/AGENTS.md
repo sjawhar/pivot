@@ -34,7 +34,7 @@ Set `auto_discover=False` only for commands that don't use the stage registry:
 
 | Command | auto_discover | Reason |
 |---------|---------------|--------|
-| run, export | True (default) | Need registry to find stages |
+| run | True (default) | Need registry to find stages |
 | list, dag | True (default), allow_all=True | Need registry; --all for multi-pipeline |
 | checkout | True (default) | Need registry; handles None pipeline gracefully |
 | track | True (default) | Handles None pipeline gracefully (no overlap check) |

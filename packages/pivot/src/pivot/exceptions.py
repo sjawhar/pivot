@@ -335,8 +335,8 @@ class ProjectNotInitializedError(InitError):
 
 
 class PipelineNotFoundError(PivotError):
-    """Raised when no pipeline is found (no pivot.yaml or pipeline.py)."""
+    """Raised when no pipeline is found (no pipeline.py)."""
 
     @override
     def get_suggestion(self) -> str:
-        return "Create pivot.yaml or pipeline.py to define your pipeline"
+        return "Create pipeline.py to define your pipeline"

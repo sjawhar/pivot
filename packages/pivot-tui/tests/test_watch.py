@@ -114,5 +114,5 @@ def test_tui_watch_mode_accepts_run_command(tui_watch_pipeline: pathlib.Path) ->
     sock_path = tui_watch_pipeline
 
     # Send a force run command for a specific stage
-    response = send_rpc(sock_path, "run", {"stages": ["hello"], "force": True})
+    response = send_rpc(sock_path, "run", {"stages": ["test/hello"], "force": True})
     assert response.get("result") == "accepted", f"Expected 'accepted': {response}"

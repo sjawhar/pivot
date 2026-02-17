@@ -11,10 +11,10 @@ import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING, TypedDict, final
 
+import pivot.types as types
+
 if TYPE_CHECKING:
     import pathlib
-
-    import pivot.types as types
 
 
 class LockMode(enum.IntEnum):
@@ -57,7 +57,7 @@ def expand_lock_requests(
 
 
 def _lock_key(ref: types.ArtifactRef) -> str:
-    return f"{ref.identity.producer}:{ref.identity.key}"
+    return types.identity_key(ref.identity)
 
 
 # ---------------------------------------------------------------------------

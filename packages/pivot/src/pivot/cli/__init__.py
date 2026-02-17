@@ -13,11 +13,8 @@ COMMAND_CATEGORIES = {
     "Inspection": ["dag", "diff", "history", "list", "metrics", "params", "plots", "show"],
     "Other": [
         "init",
-        "export",
-        "import-dvc",
         "config",
         "completion",
-        "schema",
         "check-ignore",
         "doctor",
         "fingerprint",
@@ -31,16 +28,10 @@ _LAZY_COMMANDS: dict[str, tuple[str, str, str]] = {
     "repro": ("pivot.cli.repro", "repro", "Reproduce pipeline with full DAG resolution."),
     "dag": ("pivot.cli.dag", "dag_cmd", "Visualize pipeline DAG."),
     "list": ("pivot.cli.list", "list_cmd", "List registered stages."),
-    "export": ("pivot.cli.export", "export", "Export pipeline to DVC YAML format."),
     "import": (
         "pivot.cli.import_cmd",
         "import_cmd",
         "Import artifact from a remote Pivot repo.",
-    ),
-    "import-dvc": (
-        "pivot.cli.import_dvc",
-        "import_dvc",
-        "Import DVC pipeline and convert to Pivot format.",
     ),
     "track": ("pivot.cli.track", "track", "Track files/directories for caching."),
     "status": ("pivot.cli.status", "status", "Show pipeline, tracked files, and remote status."),
@@ -67,7 +58,6 @@ _LAZY_COMMANDS: dict[str, tuple[str, str, str]] = {
     "config": ("pivot.cli.config", "config_cmd", "View and modify Pivot configuration."),
     "history": ("pivot.cli.history", "history", "List recent pipeline runs."),
     "show": ("pivot.cli.history", "show_cmd", "Show details of a specific run."),
-    "schema": ("pivot.cli.schema", "schema", "Output JSON Schema for pivot.yaml configuration."),
     "commit": ("pivot.cli.commit", "commit_command", "Commit current workspace state for stages."),
     "check-ignore": (
         "pivot.cli.check_ignore",

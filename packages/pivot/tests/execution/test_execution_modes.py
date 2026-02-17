@@ -118,7 +118,7 @@ def test_no_commit_produces_outputs_without_production_lock(
 
     assert result["status"] == StageStatus.RAN
 
-    output_path = tmp_path / "data" / "test" / "test_stage.txt"
+    output_path = tmp_path / "data" / "test_stage.txt"
     assert output_path.exists(), "Output should exist"
 
     # Production lock should NOT exist
@@ -224,7 +224,7 @@ def test_normal_run_after_no_commit_reruns_and_commits(
     # Lock should now exist
     assert production_lock.path.exists(), "Lock should exist after normal run"
 
-    output_path = tmp_path / "data" / "test" / "test_stage.txt"
+    output_path = tmp_path / "data" / "test_stage.txt"
     assert output_path.exists(), "Output should exist after normal run"
 
 
@@ -280,8 +280,8 @@ def test_run_cache_restores_directory_output(
     assert not output_dir.exists()
 
     result2 = worker.execute_stage("test_stage", stage_info, worker_env, output_queue)
-    assert result2["status"] == StageStatus.RAN
-    assert execution_count[0] == 2
+    assert result2["status"] == StageStatus.CACHED
+    assert execution_count[0] == 1
 
     assert output_dir.is_dir(), "Directory should be recreated"
     assert (output_dir / "file1.txt").read_text() == "content1"

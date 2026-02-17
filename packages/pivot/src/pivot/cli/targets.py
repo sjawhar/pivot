@@ -6,9 +6,8 @@ from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast
 
 import click
 
-from pivot import discovery, outputs, project, types
+from pivot import discovery, names, outputs, project, types
 from pivot.cli import helpers as cli_helpers
-from pivot.engine import graph as engine_graph
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
@@ -85,6 +84,11 @@ def resolve_cli_target(
     """
     identity = parse_identity_target(target)
 
+    # Resolve bare name to prefixed form (single-pipeline convenience)
+    resolved_producer = names.resolve_stage_name(identity.producer, all_stages)
+    if resolved_producer != identity.producer:
+        identity = types.ArtifactIdentity(producer=resolved_producer, key=identity.key)
+
     if identity.producer in all_stages:
         stage_info = all_stages[identity.producer]
         stage_outs: list[types.ArtifactRef] = stage_info["outs"]
@@ -137,7 +141,7 @@ def validate_targets(targets: tuple[str, ...]) -> list[str]:
     return valid
 
 
-_PIPELINE_FILENAMES = frozenset((*discovery.PIVOT_YAML_NAMES, discovery.PIPELINE_PY_NAME))
+_PIPELINE_FILENAMES = frozenset((discovery.PIPELINE_PY_NAME,))
 
 
 def resolve_pipeline_file_targets(
@@ -146,8 +150,7 @@ def resolve_pipeline_file_targets(
     """Resolve targets that are paths to pipeline config files.
 
     For each target, checks if it's an existing file whose name matches
-    pipeline.py, pivot.yaml, or pivot.yml. If so, loads the pipeline and
-    extracts all stage names.
+    pipeline.py. If so, loads the pipeline and extracts all stage names.
 
     Returns:
         Tuple of (resolved stage names, remaining unresolved targets, loaded pipelines).
@@ -189,22 +192,18 @@ def resolve_targets_to_stages(
     unresolved = list[str]()
 
     for target in targets:
-        if target in registered_stages:
-            result.add(target)
+        resolved = names.resolve_stage_name(target, dict.fromkeys(registered_stages))
+        if resolved in registered_stages:
+            result.add(resolved)
         else:
             identity = types.identity_from_key(target)
-            if identity.producer in registered_stages:
-                result.add(identity.producer)
+            resolved_producer = names.resolve_stage_name(
+                identity.producer, dict.fromkeys(registered_stages)
+            )
+            if resolved_producer in registered_stages:
+                result.add(resolved_producer)
                 continue
-            # Treat as artifact path - use absolute path to match graph node format
-            # Only find the producer (for upstream-only semantics like stage targets)
-            norm_path = project.normalize_path(target)
-            identity = engine_graph.parse_artifact_identity(str(norm_path))
-            producer = engine_graph.get_producer(bipartite_graph, identity)
-            if producer:
-                result.add(producer)
-            else:
-                unresolved.append(target)
+            unresolved.append(target)
 
     return result, unresolved
 
@@ -218,19 +217,23 @@ def _classify_targets(
     results = list[ResolvedTarget]()
 
     for target in targets:
-        is_stage = target in registered_stages
+        resolved = names.resolve_stage_name(target, dict.fromkeys(registered_stages))
+        is_stage = resolved in registered_stages
         norm_path = project.to_relative_path(project.normalize_path(target), proj_root)
         is_file = (proj_root / norm_path).exists()
+
+        # Use resolved name for stage lookups downstream
+        effective_target = resolved if is_stage else target
 
         if is_stage and is_file:
             logger.warning(
                 f"Target '{target}' matches both a stage name and a file path. "
-                + f"Using stage '{target}'. To use the file, specify a path like './{target}'."
+                + f"Using stage '{effective_target}'. To use the file, specify a path like './{target}'."
             )
 
         results.append(
             ResolvedTarget(
-                target=target,
+                target=effective_target,
                 is_stage=is_stage,
                 is_file=is_file,
                 norm_path=norm_path,
@@ -272,15 +275,6 @@ def resolve_output_paths(
                             resolved.add(
                                 project.to_relative_path(store.resolve_display_path(out), proj_root)
                             )
-                elif isinstance(out, output_type):
-                    # Registry always stores single-file outputs (multi-file are expanded)
-                    expanded = outputs.require_expanded(
-                        cast("outputs.Metric | outputs.Plot[Any]", out)
-                    )
-                    rel_path = project.to_relative_path(
-                        project.normalize_path(expanded.path), proj_root
-                    )
-                    resolved.add(rel_path)
         elif item["is_file"]:
             resolved.add(item["norm_path"])
         else:
@@ -326,20 +320,6 @@ def resolve_plot_infos(
                                 template=None,
                             )
                         )
-                elif isinstance(out, outputs.Plot):
-                    # Registry always stores single-file outputs (multi-file are expanded)
-                    expanded = outputs.require_expanded(cast("outputs.Plot[Any]", out))
-                    resolved.append(
-                        plots.PlotInfo(
-                            path=project.to_relative_path(
-                                project.normalize_path(expanded.path), proj_root
-                            ),
-                            stage_name=item["target"],
-                            x=out.x,
-                            y=out.y,
-                            template=out.template,
-                        )
-                    )
         elif item["is_file"]:
             resolved.append(
                 plots.PlotInfo(

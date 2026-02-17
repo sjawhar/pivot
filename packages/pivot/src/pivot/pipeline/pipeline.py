@@ -27,8 +27,8 @@ def _find_pipeline_dir_for_stage(
     """Find the pipeline directory for a stage, relative to project root.
 
     Walks up from the stage function's source file to find the nearest directory
-    containing a pipeline config (pipeline.py or pivot.yaml). Falls back to
-    state_dir derivation if inspect fails.
+    containing a pipeline config (pipeline.py). Falls back to state_dir derivation
+    if inspect fails.
     """
     # Try to find the pipeline dir from the function's source file
     try:
@@ -200,7 +200,7 @@ class Pipeline:
                 if frame is None or frame.f_back is None:
                     raise RuntimeError("Cannot determine caller frame")
                 caller_file = frame.f_back.f_globals.get("__file__")
-                if caller_file is None:
+                if caller_file is None or not isinstance(caller_file, str):
                     raise RuntimeError(
                         "Cannot determine caller's __file__. Provide an explicit root= argument when creating Pipeline from interactive code, exec(), or similar contexts."
                     )
@@ -291,14 +291,9 @@ class Pipeline:
     def include(self, other: Pipeline) -> None:
         """Include all stages from another pipeline.
 
-        Stages are deep-copied with their original state_dir preserved, enabling
-        composition where sub-pipeline stages maintain independent state tracking.
-        The copy is a point-in-time snapshot; subsequent changes to the source
-        pipeline are not reflected.
-
-        On name collision, all stages from the incoming pipeline are automatically
-        prefixed with ``{other.name}/`` to disambiguate. The first pipeline's
-        stages keep their bare names.
+        Stages are deep-copied to prevent mutation of the source pipeline.
+        Names are already prefixed with their pipeline name (from build()),
+        so no collision detection or renaming is needed.
 
         Args:
             other: Pipeline whose stages to include.
@@ -309,45 +304,13 @@ class Pipeline:
         if other is self:
             raise PipelineConfigError(f"Pipeline '{self.name}' cannot include itself")
 
-        # Check if any names collide — if so, prefix all incoming stages
-        existing_names = set(self._registry.list_stages())
-        needs_prefix = any(name in existing_names for name in other.list_stages())
-
-        # Collect stages to add with deep copy
         stages_to_add = list[registry.RegistryStageInfo]()
-        rename_map = dict[str, str]()
         for stage_name in other.list_stages():
             stage_info = copy.deepcopy(other.get(stage_name))
-            if needs_prefix:
-                prefixed = f"{other.name}/{stage_name}"
-                if prefixed in existing_names:
-                    counter = 2
-                    while f"{prefixed}_{counter}" in existing_names:
-                        counter += 1
-                    prefixed = f"{prefixed}_{counter}"
-                rename_map[stage_name] = prefixed
-                stage_info["name"] = prefixed
             stages_to_add.append(stage_info)
 
-        if rename_map:
-            for stage_info in stages_to_add:
-                for ref in stage_info["deps"].values():
-                    new_producer = rename_map.get(ref.identity.producer)
-                    if new_producer is not None:
-                        ref.identity = types.ArtifactIdentity(
-                            producer=new_producer, key=ref.identity.key
-                        )
-                for ref in stage_info["outs"]:
-                    new_producer = rename_map.get(ref.identity.producer)
-                    if new_producer is not None:
-                        ref.identity = types.ArtifactIdentity(
-                            producer=new_producer, key=ref.identity.key
-                        )
-
-        # Add all stages (and track names to avoid intra-batch collisions)
         for stage_info in stages_to_add:
             self._registry.add_existing(stage_info)
-            existing_names.add(stage_info["name"])
 
         for name, path in other.input_bindings.items():
             if name not in self._input_bindings:
@@ -355,9 +318,8 @@ class Pipeline:
 
         if stages_to_add:
             self._reset_resolution_cache()
-            prefix_note = f" (prefixed with '{other.name}/')" if needs_prefix else ""
             logger.debug(
-                f"Included {len(stages_to_add)} stages from pipeline '{other.name}' into '{self.name}'{prefix_note}"
+                f"Included {len(stages_to_add)} stages from pipeline '{other.name}' into '{self.name}'"
             )
 
     def resolve_external_dependencies(self) -> None:
@@ -424,17 +386,14 @@ class Pipeline:
             if result is None:
                 continue
 
-            producer, source_pipeline_name = result
+            producer, _source_pipeline_name = result
             producer_name = producer["name"]
 
             # Skip if already included (idempotency)
             if producer_name in self._registry.list_stages():
                 continue
 
-            # Include the producer stage, prefixing on name collision
             stage_info = copy.deepcopy(producer)
-            if stage_info["name"] in self._registry.list_stages():
-                stage_info["name"] = f"{source_pipeline_name}/{stage_info['name']}"
             self._registry.add_existing(stage_info)
             local_outputs.update(types.identity_key(out.identity) for out in stage_info["outs"])
 
@@ -456,7 +415,7 @@ class Pipeline:
 
         The pipeline directory is derived from the stage function's source file
         by walking up to find a directory containing a pipeline config file
-        (pipeline.py or pivot.yaml). This is more robust than using state_dir,
+        (pipeline.py). This is more robust than using state_dir,
         which can be shared when sub-pipelines use the same project root.
         """
         try:
@@ -479,7 +438,7 @@ class Pipeline:
                 target = cache_dir / rel_path
                 try:
                     target.parent.mkdir(parents=True, exist_ok=True)
-                    target.write_text(pipeline_dir)
+                    _ = target.write_text(pipeline_dir)
                 except OSError:
                     logger.debug(f"Failed to write output index for {out_path}")
 

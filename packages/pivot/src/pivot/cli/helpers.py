@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+# pyright: reportImportCycles=false
 import enum
+import importlib
 import json
 import sys
 from typing import TYPE_CHECKING, Any, cast, override
@@ -29,7 +31,6 @@ class NoPipelineError(exceptions.PivotError):
             "No pipeline definition found.\n"
             "\n"
             "This command requires a pipeline to be defined in one of:\n"
-            "  - pivot.yaml (or pivot.yml)\n"
             "  - pipeline.py"
         )
 
@@ -75,7 +76,7 @@ def build_dag() -> DiGraph[str]:
 
 def get_workspace_store() -> WorkspaceStore | None:
     """Get a WorkspaceStore for display/path resolution, or None if no pipeline."""
-    from pivot.storage import store as store_mod
+    store_mod = importlib.import_module("pivot.storage.store")
 
     pipeline = cli_decorators.get_pipeline_from_context()
     if pipeline is None:

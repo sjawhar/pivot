@@ -53,7 +53,7 @@ def list_cmd(ctx: click.Context, as_json: bool, show_deps: bool) -> None:
             click.echo(json.dumps(ListJsonOutput(stages=[])))
         elif not quiet:
             click.echo("No stages registered.")
-            click.echo("Create a pipeline.py with stage functions, or a pivot.yaml file.")
+            click.echo("Create a pipeline.py with stage functions.")
         return
 
     if as_json:

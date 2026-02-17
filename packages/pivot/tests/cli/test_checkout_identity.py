@@ -336,4 +336,4 @@ pipeline._registry._stages["evaluate"] = RegistryStageInfo(
 
         assert result.exit_code == 0, result.output
         assert output_path.exists()
-        assert "all" in output_path.parts
+        assert output_path.name == "train.csv"

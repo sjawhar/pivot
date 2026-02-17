@@ -69,6 +69,20 @@ def _get_config_paths() -> list[pathlib.Path]:
     return paths
 
 
+def _add_bare_completions(stages: list[str], completions: list[str], incomplete: str) -> None:
+    """Add bare (unprefixed) stage names when there's a single pipeline prefix."""
+    prefixes = {s.split("/", 1)[0] for s in stages if "/" in s}
+    if len(prefixes) != 1:
+        return
+    prefix = next(iter(prefixes))
+    existing = set(completions)
+    for s in stages:
+        if s.startswith(f"{prefix}/"):
+            bare = s[len(prefix) + 1 :]
+            if bare.startswith(incomplete) and bare not in existing:
+                completions.append(bare)
+
+
 def complete_stages(
     _ctx: click.Context,
     _param: click.Parameter,
@@ -79,7 +93,9 @@ def complete_stages(
         stages = _get_stages_fast()
         if stages is None:
             stages = _get_stages_full()
-        return [s for s in stages if s.startswith(incomplete)]
+        completions = [s for s in stages if s.startswith(incomplete)]
+        _add_bare_completions(stages, completions, incomplete)
+        return completions
     except Exception:
         logger.debug("Completion failed", exc_info=True)
         return []
@@ -106,6 +122,7 @@ def complete_targets(
             stages = _get_stages_full()
 
         completions = [stage for stage in stages if stage.startswith(incomplete)]
+        _add_bare_completions(stages, completions, incomplete)
 
         # Only load full pipeline (expensive) when user is completing a stage:key target
         if ":" not in incomplete:
@@ -114,6 +131,9 @@ def complete_targets(
         pipeline = _get_pipeline_for_targets()
         if pipeline is None:
             return completions
+
+        prefixes = {s.split("/", 1)[0] for s in stages if "/" in s}
+        single_prefix = next(iter(prefixes)) if len(prefixes) == 1 else None
 
         for stage in stages:
             info = pipeline.get(stage)
@@ -124,6 +144,11 @@ def complete_targets(
                 target = f"{stage}:{key}"
                 if target.startswith(incomplete):
                     completions.append(target)
+                # Also offer bare stage:key in single-pipeline mode
+                if single_prefix and stage.startswith(f"{single_prefix}/"):
+                    bare_target = f"{stage[len(single_prefix) + 1 :]}:{key}"
+                    if bare_target.startswith(incomplete) and bare_target not in completions:
+                        completions.append(bare_target)
         return completions
     except Exception:
         logger.debug("Completion failed", exc_info=True)
@@ -137,7 +162,7 @@ def _detect_config_file(root: pathlib.Path) -> tuple[str, float] | None:
     """
     from pivot import discovery
 
-    for name in (*discovery.PIVOT_YAML_NAMES, discovery.PIPELINE_PY_NAME):
+    for name in (discovery.PIPELINE_PY_NAME,):
         path = root / name
         if path.exists():
             return (name, path.stat().st_mtime)
@@ -210,42 +235,12 @@ def _get_stages_fast() -> list[str] | None:
 
     Returns None to trigger fallback when:
     - No project root found
-    - No pivot.yaml exists
-    - Config has 'variants' field (requires Python imports)
-    - YAML parse error
+    - Cache is missing or invalid
     """
     root = _find_project_root_fast()
     if root is None:
         return None
-
-    # Try cache first (works for both YAML and pipeline.py)
-    if (stages := _get_stages_from_cache(root)) is not None:
-        return stages
-
-    yaml_path = next(
-        (p for p in [root / "pivot.yaml", root / "pivot.yml"] if p.exists()),
-        None,
-    )
-    if yaml_path is None:
-        return None
-
-    # Lazy imports to avoid loading pivot package at CLI startup
-    import yaml
-
-    from pivot import matrix
-
-    try:
-        raw: object = yaml.safe_load(yaml_path.read_text())
-    except yaml.YAMLError:
-        logger.debug("YAML parse error in %s", yaml_path)
-        return None
-
-    config = cast("dict[str, Any]", raw) if isinstance(raw, dict) else None
-
-    if matrix.needs_fallback(config):
-        return None
-
-    return matrix.extract_stage_names(config)
+    return _get_stages_from_cache(root)
 
 
 def _get_stages_full() -> list[str]:

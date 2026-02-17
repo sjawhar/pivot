@@ -185,7 +185,7 @@ async def test_rpc_contract_stage_info_and_explain_success(
     tmp_path: Path,
     set_project_root: Path,
 ) -> None:
-    stage_name = "contract_stage"
+    stage_name = "test/contract_stage"
     pipeline = _build_contract_pipeline(set_project_root)
     (set_project_root / "input.txt").write_text("data")
 
@@ -194,7 +194,7 @@ async def test_rpc_contract_stage_info_and_explain_success(
         server.set_stage_info(
             stage_name,
             deps=[{"producer": "input", "key": None}],
-            outs=[{"producer": "contract_stage", "key": None}],
+            outs=[{"producer": "test/contract_stage", "key": None}],
         )
         server.set_explanation(
             stage_name,

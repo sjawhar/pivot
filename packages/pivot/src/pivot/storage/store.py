@@ -129,18 +129,21 @@ class WorkspaceStore:
     _input_bindings: dict[str, str]
     _path_map: dict[str, types.ArtifactIdentity]
     _output_producers: set[str]
+    _cache_dir: pathlib.Path | None
 
     def __init__(
         self,
         project_root: pathlib.Path,
         pipeline_name: str,
         input_bindings: dict[str, str],
+        cache_dir: pathlib.Path | None = None,
     ) -> None:
         self._project_root = project_root.resolve()
         self._pipeline_name = pipeline_name
         self._input_bindings = input_bindings.copy()
         self._path_map = {}
         self._output_producers = set[str]()
+        self._cache_dir = cache_dir.resolve() if cache_dir is not None else None
 
     def _is_input_ref(self, ref: types.ArtifactRef) -> bool:
         if ref.tag != types.ArtifactTag.DATA:
@@ -162,23 +165,7 @@ class WorkspaceStore:
         return self._project_root / "data" / "raw" / name
 
     def _format_extension(self, fmt: object) -> str:
-        match fmt:
-            case loaders.DataFrameJSONL():
-                return "jsonl"
-            case loaders.CSV():
-                return "csv"
-            case loaders.YAML():
-                return "yaml"
-            case loaders.JSON():
-                return "json"
-            case loaders.Text():
-                return "txt"
-            case loaders.Pickle():
-                return "pkl"
-            case loaders.MatplotlibFigure():
-                return "png"
-            case _:
-                return "dat"
+        return loaders.format_extension(fmt)
 
     def _resolve_output_path(self, ref: types.ArtifactRef) -> pathlib.Path:
         stage_name = ref.identity.producer
@@ -191,16 +178,16 @@ class WorkspaceStore:
         key = ref.identity.key
         if ref.tag == types.ArtifactTag.DIRECTORY:
             if key is None:
-                rel = pathlib.Path(prefix) / self._pipeline_name / stage_name
+                rel = pathlib.Path(prefix) / stage_name
             else:
-                rel = pathlib.Path(prefix) / self._pipeline_name / stage_name / key
+                rel = pathlib.Path(prefix) / stage_name / key
             return self._project_root / rel
 
         ext = self._format_extension(ref.format)
         if key is None:
-            rel = pathlib.Path(prefix) / self._pipeline_name / f"{stage_name}.{ext}"
+            rel = pathlib.Path(prefix) / f"{stage_name}.{ext}"
         else:
-            rel = pathlib.Path(prefix) / self._pipeline_name / stage_name / f"{key}.{ext}"
+            rel = pathlib.Path(prefix) / stage_name / f"{key}.{ext}"
         return self._project_root / rel
 
     def _resolve_path(self, ref: types.ArtifactRef) -> pathlib.Path:
@@ -225,9 +212,11 @@ class WorkspaceStore:
         self._output_producers.add(ref.identity.producer)
         path = self._resolve_path(ref)
         if ref.tag == types.ArtifactTag.DIRECTORY:
+            cache.remove_output(path)
             path.mkdir(parents=True, exist_ok=True)
             return path
         path.parent.mkdir(parents=True, exist_ok=True)
+        cache.remove_output(path)
         return path
 
     def commit(self, ref: types.ArtifactRef, path: pathlib.Path) -> str:
@@ -237,6 +226,38 @@ class WorkspaceStore:
             return tree_hash
         file_hash, _ = cache.hash_file(path, None)
         return file_hash
+
+    def backup_to_cache(self, ref: types.ArtifactRef, path: pathlib.Path) -> None:
+        if self._cache_dir is None:
+            return
+        if ref.tag is types.ArtifactTag.METRIC:
+            return
+        _ = cache.save_to_cache(
+            path,
+            self._cache_dir,
+            state_db=None,
+            checkout_mode=config.CheckoutMode.COPY,
+        )
+
+    def restore_from_cache(
+        self,
+        ref: types.ArtifactRef,
+        output_hash: types.HashInfo,
+        *,
+        state_dir: pathlib.Path | None = None,
+    ) -> bool:
+        if self._cache_dir is None:
+            return False
+        if ref.tag is types.ArtifactTag.METRIC:
+            return False
+        output_path = self._resolve_output_path(ref)
+        return cache.restore_from_cache(
+            output_path,
+            output_hash,
+            self._cache_dir,
+            checkout_mode=config.CheckoutMode.COPY,
+            state_dir=state_dir,
+        )
 
     def hash_artifact(self, ref: types.ArtifactRef) -> types.HashInfo:
         path = self._resolve_path(ref)
@@ -258,22 +279,24 @@ class WorkspaceStore:
 
     def exists(self, ref: types.ArtifactRef) -> bool:
         path = self._resolve_path(ref)
-        return path.exists() or path.is_symlink()
+        return path.exists()
 
 
 def store_from_spec(spec: StoreSpec) -> Store:
     kind = spec["kind"]
     if kind == "cache":
         project_root = pathlib.Path(spec["project_root"])
-        state_db_path = project_root / ".pivot"
+        state_db_path = project_root / ".pivot" / "cache-state"
         return CacheStore(
             cache_dir=pathlib.Path(spec["cache_dir"]),
             state_db_path=state_db_path,
         )
     if kind == "workspace":
+        cache_dir_str = spec.get("cache_dir")
         return WorkspaceStore(
             project_root=pathlib.Path(spec["project_root"]),
             pipeline_name=spec["pipeline_name"],
             input_bindings=spec["input_bindings"],
+            cache_dir=pathlib.Path(cache_dir_str) if cache_dir_str else None,
         )
     raise ValueError(f"Unknown store kind: {kind}")

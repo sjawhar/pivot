@@ -52,7 +52,7 @@ from pivot.types import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Generator, Mapping, Sequence
+    from collections.abc import Callable, Generator, Sequence
     from inspect import Signature
     from multiprocessing import Queue
     from types import TracebackType
@@ -208,19 +208,17 @@ def execute_stage(
     """
     # Clear metrics at start - each stage collects its own metrics
     metrics.clear()
+    _ = cache_dir
     ring_buffer = _OutputRingBuffer()
-    files_cache_dir = cache_dir / "files"
     state_db_path = stage_info["state_dir"] / "state.db"
     project_root = stage_info["project_root"]
     store = store_mod.store_from_spec(stage_info["store_spec"])
-    use_store = _uses_artifact_refs(stage_info)
 
     # For store-based stages, mark outputs as produced so _resolve_path returns
     # the correct output path (not input path) during run cache skip checks
-    if use_store and isinstance(store, store_mod.WorkspaceStore):
+    if isinstance(store, store_mod.WorkspaceStore):
         for out in stage_info["outs"]:
-            if isinstance(out, types.ArtifactRef):
-                cast("store_mod.WorkspaceStore", store)._output_producers.add(out.identity.producer)  # pyright: ignore[reportPrivateUsage]
+            store._output_producers.add(out.identity.producer)  # pyright: ignore[reportPrivateUsage]
 
     # Set project root cache explicitly - workers in reusable pool may have
     # stale cache from previous execution in different project/test.
@@ -231,8 +229,6 @@ def execute_stage(
     # _queue_logging captures log messages to the output queue (for TUI display).
     with contextlib.chdir(project_root), _queue_logging(stage_name, output_queue):
         no_commit = stage_info["no_commit"]
-
-        checkout_modes = stage_info["checkout_modes"]
 
         production_lock = lock.StageLock(stage_name, lock.get_stages_dir(stage_info["state_dir"]))
         current_fingerprint = stage_info["fingerprint"]
@@ -254,12 +250,7 @@ def execute_stage(
         # Acquire artifact locks (READ on deps, WRITE on outs)
         deps_info = stage_info["deps"]
         outs_info = stage_info["outs"]
-        if isinstance(deps_info, list):
-            lock_requests = _legacy_lock_requests(
-                deps_info, cast("Sequence[outputs.ExpandedOut]", outs_info)
-            )
-        else:
-            lock_requests = artifact_lock.expand_lock_requests(deps_info, outs_info, project_root)
+        lock_requests = artifact_lock.expand_lock_requests(deps_info, outs_info, project_root)
         lock_service = artifact_lock.LocalFlockLockService(stage_info["state_dir"] / "locks")
 
         def _on_lock_status(_key: str, _mode: artifact_lock.LockMode, _elapsed: float) -> None:
@@ -302,18 +293,12 @@ def execute_stage(
                             input_hash = run_history.compute_input_hash(
                                 current_fingerprint, current_params, deps_list, out_specs
                             )
-                            restored = False
-                            if not use_store:
-                                restored = restore_outputs_from_cache(
-                                    cast("Sequence[outputs.ExpandedOut]", stage_outs),
-                                    lock_data,
-                                    files_cache_dir,
-                                    checkout_modes,
-                                    state_db=state_db,
-                                    state_dir=stage_info["state_dir"],
-                                )
-                            else:
-                                restored = _outputs_exist_with_store(store, stage_outs)
+                            restored = _outputs_exist_with_store(
+                                store,
+                                stage_outs,
+                                lock_data,
+                                stage_info["state_dir"],
+                            )
                             if restored:
                                 return _make_result(
                                     StageStatus.CACHED,
@@ -360,17 +345,12 @@ def execute_stage(
                         run_reason = "forced"
 
                     if skip_reason is not None and lock_data is not None:
-                        restored = False
-                        if not use_store:
-                            restored = restore_outputs_from_cache(
-                                cast("Sequence[outputs.ExpandedOut]", stage_outs),
-                                lock_data,
-                                files_cache_dir,
-                                checkout_modes,
-                                state_db=state_db,
-                            )
-                        else:
-                            restored = _outputs_exist_with_store(store, stage_outs)
+                        restored = _outputs_exist_with_store(
+                            store,
+                            stage_outs,
+                            lock_data,
+                            stage_info["state_dir"],
+                        )
                         if restored:
                             return _make_result(
                                 StageStatus.CACHED,
@@ -382,25 +362,13 @@ def execute_stage(
 
                     # Check run cache for previously executed configuration (skip if forcing)
                     if run_reason and not stage_info["force"]:
-                        run_cache_skip = None
-                        if use_store:
-                            run_cache_skip = _try_skip_via_run_cache_with_store(
-                                stage_name,
-                                input_hash,
-                                cast("list[types.ArtifactRef]", stage_outs),
-                                store,
-                                state_db,
-                            )
-                        else:
-                            run_cache_skip = _try_skip_via_run_cache(
-                                stage_name,
-                                input_hash,
-                                cast("Sequence[outputs.ExpandedOut]", stage_outs),
-                                files_cache_dir,
-                                checkout_modes,
-                                state_db,
-                                state_dir=stage_info["state_dir"],
-                            )
+                        run_cache_skip = _try_skip_via_run_cache_with_store(
+                            stage_name,
+                            input_hash,
+                            stage_outs,
+                            store,
+                            state_db,
+                        )
                         if run_cache_skip is not None:
                             if no_commit:
                                 return _make_result(
@@ -436,60 +404,22 @@ def execute_stage(
                                 deferred_writes=deferred,
                             )
 
-                accessed_dep_keys: dict[str, set[str]] | None = None
-                if use_store:
-                    output_paths, accessed_dep_keys = _run_stage_function_with_store(
-                        stage_info["func"],
-                        stage_name,
-                        output_queue,
-                        ring_buffer,
-                        params_instance,
-                        stage_info["deps"],
-                        stage_outs,
-                        store,
-                        stage_info["params_arg_name"],
-                        stage_info["collection_params"],
-                    )
-                    if no_commit:
-                        output_hashes = _hash_output_paths(output_paths)
-                    else:
-                        output_hashes = _commit_outputs_with_store(output_paths, store)
+                output_paths, accessed_dep_keys = _run_stage_function_with_store(
+                    stage_info["func"],
+                    stage_name,
+                    output_queue,
+                    ring_buffer,
+                    params_instance,
+                    stage_info["deps"],
+                    stage_outs,
+                    store,
+                    stage_info["params_arg_name"],
+                    stage_info["collection_params"],
+                )
+                if no_commit:
+                    output_hashes = _hash_output_paths(output_paths)
                 else:
-                    try:
-                        _prepare_outputs_for_execution(
-                            cast("Sequence[outputs.ExpandedOut]", stage_outs),
-                            lock_data,
-                            files_cache_dir,
-                            state_dir=stage_info["state_dir"],
-                        )
-                    except exceptions.CacheRestoreError as e:
-                        raise exceptions.CacheRestoreError(
-                            f"{e}. Run `pivot pull` to fetch from remote, or delete "
-                            + f"`{production_lock.path}` to start fresh."
-                        ) from e
-
-                    _run_stage_function_with_injection(
-                        stage_info["func"],
-                        stage_name,
-                        output_queue,
-                        ring_buffer,
-                        params_instance,
-                        None,
-                        project_root,
-                        None,
-                        stage_info["params_arg_name"],
-                    )
-
-                    if no_commit:
-                        output_hashes = _hash_outputs_only(
-                            cast("Sequence[outputs.ExpandedOut]", stage_outs)
-                        )
-                    else:
-                        output_hashes = _save_outputs_to_cache(
-                            cast("Sequence[outputs.ExpandedOut]", stage_outs),
-                            files_cache_dir,
-                            checkout_modes,
-                        )
+                    output_hashes = _commit_outputs_with_store(output_paths, store)
 
                 # For --no-commit, skip lock/cache writes entirely
                 if no_commit:
@@ -527,9 +457,8 @@ def execute_stage(
                         output_lines=ring_buffer.snapshot(),
                         metrics=metrics.get_entries(),
                         deferred_writes=deferred,
+                        accessed_dep_keys=accessed_dep_keys,
                     )
-                    if accessed_dep_keys is not None:
-                        result["accessed_dep_keys"] = accessed_dep_keys
                     return result
         except exceptions.OutputMissingError as e:
             return _make_result(StageStatus.FAILED, str(e), ring_buffer, input_hash=input_hash)
@@ -571,29 +500,26 @@ def _to_identity_keyed_hashes(
     return {types.identity_key(identity): info for identity, info in hashes.items()}
 
 
-def _outputs_exist_with_store(store: store_mod.Store, outs: list[types.ArtifactRef]) -> bool:
-    return all(store.exists(ref) for ref in outs)
+def _outputs_exist_with_store(
+    store: store_mod.Store,
+    outs: list[types.ArtifactRef],
+    lock_data: LockData | None = None,
+    state_dir: pathlib.Path | None = None,
+) -> bool:
+    if not isinstance(store, store_mod.WorkspaceStore):
+        return all(store.exists(ref) for ref in outs)
 
-
-def _legacy_lock_requests(
-    deps: list[str],
-    outs: Sequence[outputs.ExpandedOut],
-) -> list[artifact_lock.LockRequest]:
-    key_to_mode = dict[str, artifact_lock.LockMode]()
-    for dep in deps:
-        key_to_mode[dep] = artifact_lock.LockMode.READ
-    for out in outs:
-        key_to_mode[str(out.path)] = artifact_lock.LockMode.WRITE
-    return [{"key": key, "mode": key_to_mode[key]} for key in sorted(key_to_mode)]
-
-
-def _uses_artifact_refs(stage_info: WorkerStageInfo) -> bool:
-    deps = stage_info.get("deps", {})
-    if isinstance(deps, dict) and deps:
-        first = next(iter(deps.values()))
-        return isinstance(first, types.ArtifactRef)
-    outs = stage_info.get("outs", [])
-    return bool(outs) and isinstance(outs[0], types.ArtifactRef)
+    for ref in outs:
+        if store.exists(ref):
+            continue
+        if lock_data is None:
+            return False
+        hash_info = lock_data["output_hashes"].get(ref.identity)
+        if hash_info is None:
+            return False
+        if not store.restore_from_cache(ref, hash_info, state_dir=state_dir):
+            return False
+    return True
 
 
 def _get_normalized_out_paths(stage_info: WorkerStageInfo) -> list[str]:
@@ -613,24 +539,18 @@ def _deps_list_for_input_hash(
     dep_hashes: dict[str, HashInfo],
 ) -> list[DepEntry]:
     deps_info = stage_info["deps"]
-    if isinstance(deps_info, dict):
-        entries = list[DepEntry]()
-        for ref in deps_info.values():
-            dep_key = types.identity_key(ref.identity)
-            hash_info = dep_hashes[dep_key]
-            entries.append(
-                DepEntry(
-                    producer=ref.identity.producer,
-                    key=ref.identity.key,
-                    hash=hash_info["hash"],
-                )
+    entries = list[DepEntry]()
+    for ref in deps_info.values():
+        dep_key = types.identity_key(ref.identity)
+        hash_info = dep_hashes[dep_key]
+        entries.append(
+            DepEntry(
+                producer=ref.identity.producer,
+                key=ref.identity.key,
+                hash=hash_info["hash"],
             )
-        return entries
-
-    return [
-        DepEntry(producer=path, key=None, hash=info["hash"], display=path)
-        for path, info in dep_hashes.items()
-    ]
+        )
+    return entries
 
 
 def _check_skip_or_run(
@@ -814,76 +734,6 @@ def _file_needs_restore(
         return True
 
 
-def _prepare_outputs_for_execution(
-    stage_outs: Sequence[outputs.ExpandedOut],
-    lock_data: LockData | None,
-    files_cache_dir: pathlib.Path,
-    state_dir: pathlib.Path | None = None,
-) -> None:
-    """Prepare outputs before stage execution - delete or restore for incremental."""
-    output_hashes = lock_data["output_hashes"] if lock_data else {}
-
-    for out in stage_outs:
-        path = pathlib.Path(out.path)
-
-        if isinstance(out, outputs.IncrementalOut):
-            # IncrementalOut: restore from cache as writable copy
-            cache.remove_output(path)  # Clear any stale state first
-            out_hash = output_hashes.get(types.identity_from_key(str(out.path)))
-            if out_hash:
-                # COPY mode makes file writable (not symlink to read-only cache)
-                restored = cache.restore_from_cache(
-                    path,
-                    out_hash,
-                    files_cache_dir,
-                    cache.CheckoutMode.COPY,
-                    state_dir=state_dir,
-                )
-                if not restored:
-                    raise exceptions.CacheRestoreError(
-                        f"Cache missing for IncrementalOut '{out.path}'"
-                    )
-        else:
-            # Regular output: delete before run
-            cache.remove_output(path)
-
-
-def _save_outputs_to_cache(
-    stage_outs: Sequence[outputs.ExpandedOut],
-    files_cache_dir: pathlib.Path,
-    checkout_modes: list[cache.CheckoutMode],
-) -> dict[str, HashInfo]:
-    """Save outputs to cache after successful execution."""
-    _t = metrics.start()
-    output_hashes = dict[str, HashInfo]()
-
-    for out in stage_outs:
-        path = pathlib.Path(out.path)
-        if not path.exists():
-            raise exceptions.OutputMissingError(f"Stage did not produce output: {out.path}")
-
-        if out.cache:
-            output_hashes[str(out.path)] = cache.save_to_cache(
-                path, files_cache_dir, checkout_modes=checkout_modes
-            )
-        else:
-            output_hashes[str(out.path)] = hash_output(path)
-
-    metrics.end("worker.save_outputs_to_cache", _t)
-    return output_hashes
-
-
-def _hash_outputs_only(stage_outs: Sequence[outputs.ExpandedOut]) -> dict[str, HashInfo]:
-    """Hash outputs without saving to cache (for --no-commit mode)."""
-    output_hashes = dict[str, HashInfo]()
-    for out in stage_outs:
-        path = pathlib.Path(out.path)
-        if not path.exists():
-            raise exceptions.OutputMissingError(f"Stage did not produce output: {out.path}")
-        output_hashes[str(out.path)] = hash_output(path)
-    return output_hashes
-
-
 def hash_output(path: pathlib.Path, state_db: state.StateDB | None = None) -> HashInfo:
     """Compute output hash without saving to cache."""
     if path.is_dir():
@@ -937,76 +787,6 @@ def _execute_with_joblib_protection(func: Callable[..., Any], kwargs: dict[str, 
     logger.debug("Nested parallelism: threading mode")
     with parallel_config(backend="threading"):
         return func(**kwargs)
-
-
-def _run_stage_function_with_injection(
-    func: Callable[..., Any],
-    stage_name: str,
-    output_queue: Queue[OutputMessage],
-    ring_buffer: _OutputRingBuffer,
-    params: stage_def.StageParams | None = None,
-    dep_specs: dict[str, stage_def.FuncDepSpec] | None = None,
-    project_root: pathlib.Path | None = None,
-    out_specs: Mapping[str, outputs.BaseOut] | None = None,
-    params_arg_name: str | None = None,
-) -> None:
-    """Run stage function with dependency injection and output capture.
-
-    This is the injection-based execution path for stages using Annotated outputs:
-
-        def train(
-            config: TrainParams,
-        ) -> TrainOutputs:
-            ...
-
-    The function:
-    1. Loads deps from disk based on dep_specs
-    2. Builds kwargs dict (params + loaded deps)
-    3. Calls the function with kwargs
-    4. Saves outputs based on out_specs (resolved at registration time)
-
-    Args:
-        out_specs: Output specs resolved at registration time (return key -> Out).
-            For single-output stages, uses "_single" key convention.
-        params_arg_name: Name of the StageParams parameter (pre-computed at registration).
-    """
-    with (
-        _QueueWriter(stage_name, output_queue, is_stderr=False, ring_buffer=ring_buffer),
-        _QueueWriter(stage_name, output_queue, is_stderr=True, ring_buffer=ring_buffer),
-    ):
-        kwargs = dict[str, Any]()
-
-        # Add params if provided (using pre-computed arg name from registration)
-        if params is not None:
-            if params_arg_name is None:
-                raise RuntimeError(
-                    f"Stage '{stage_name}' has params but params_arg_name is None - this indicates a bug in registration"
-                )
-            kwargs[params_arg_name] = params
-
-        # Load and inject deps
-        root = project_root if project_root is not None else project.get_project_root()
-        if dep_specs:
-            loaded_deps = stage_def.load_deps_from_specs(dep_specs, root)
-            kwargs.update(loaded_deps)
-
-        _set_deterministic_seeds()
-
-        # Execute function with joblib threading protection
-        result = _execute_with_joblib_protection(func, kwargs)
-
-        # Save outputs using pre-resolved specs from registration
-        if out_specs:
-            if result is None:
-                raise RuntimeError(f"Stage '{stage_name}' has output annotations but returned None")
-            # For single-output stages, out_specs uses SINGLE_OUTPUT_KEY convention
-            if stage_def.SINGLE_OUTPUT_KEY in out_specs:
-                result = {stage_def.SINGLE_OUTPUT_KEY: result}
-            stage_def.save_return_outputs(result, out_specs, root)
-        elif result is not None:
-            logger.warning(
-                "Stage '%s' returned value but has no Out annotation - discarding", stage_name
-            )
 
 
 def _load_dep_from_store(ref: types.ArtifactRef, store: store_mod.Store) -> Any:
@@ -1205,6 +985,8 @@ def _commit_outputs_with_store(
         if not path.exists():
             raise exceptions.OutputMissingError(f"Stage did not produce output: {path}")
         store.commit(ref, path)
+        if isinstance(store, store_mod.WorkspaceStore):
+            store.backup_to_cache(ref, path)
         output_hashes[types.identity_key(ref.identity)] = store.hash_artifact(ref)
     return output_hashes
 
@@ -1617,69 +1399,6 @@ def _try_skip_via_run_cache_with_store(
             return None
         identity_key = types.identity_key(ref.identity)
         output_hashes[identity_key] = store.hash_artifact(ref)
-
-    return RunCacheSkipResult(
-        output_hashes=output_hashes,
-    )
-
-
-def _try_skip_via_run_cache(
-    stage_name: str,
-    input_hash: str,
-    stage_outs: Sequence[outputs.ExpandedOut],
-    files_cache_dir: pathlib.Path,
-    checkout_modes: list[cache.CheckoutMode],
-    state_db: state.StateDB,
-    state_dir: pathlib.Path | None = None,
-) -> RunCacheSkipResult | None:
-    """Try to skip using run cache. Returns result and output hashes if skipped, None if must run."""
-    # IncrementalOut stages build on previous outputs - run cache doesn't apply
-    if any(isinstance(out, outputs.IncrementalOut) for out in stage_outs):
-        return None
-
-    entry = state_db.lookup_run_cache(stage_name, input_hash)
-    if entry is None:
-        return None
-
-    # Build output hash map preserving manifest for directories
-    output_hash_map: dict[str, FileHash | DirHash] = {
-        oh["path"]: run_history.entry_to_output_hash(oh) for oh in entry["output_hashes"]
-    }
-
-    # Validate cached outputs match expected: run cache entry should only contain
-    # outputs that have cache=True. The input hash includes cache flags, so a mismatch
-    # here indicates corruption or a bug.
-    cached_path_strings = [out.path for out in stage_outs if out.cache]
-    if set(output_hash_map.keys()) != set(cached_path_strings):
-        return None
-
-    # Non-cached outputs (like Metrics) must exist on disk - we can't restore them from cache
-    for out in stage_outs:
-        if not out.cache:
-            path = pathlib.Path(out.path)
-            if not path.exists():
-                return None  # Must re-run to recreate non-cached output
-
-    restored = _restore_outputs(
-        cached_path_strings,
-        output_hash_map,
-        files_cache_dir,
-        checkout_modes,
-        use_normalized_paths=False,
-        state_db=state_db,
-        state_dir=state_dir,
-    )
-    if not restored:
-        return None
-
-    # Build output_hashes for lock file update, including non-cached outputs
-    output_hashes: dict[str, HashInfo] = {}
-    for out in stage_outs:
-        out_path = out.path
-        if out.cache:
-            output_hashes[out_path] = output_hash_map[out_path]
-        else:
-            output_hashes[out_path] = hash_output(pathlib.Path(out_path), state_db)
 
     return RunCacheSkipResult(
         output_hashes=output_hashes,

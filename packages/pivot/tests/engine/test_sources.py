@@ -200,3 +200,9 @@ async def test_async_filesystem_source_restarts_after_set_watch_paths(tmp_path: 
     assert len(events_received) >= 1, "Should receive event for file in new watch path"
     data_events = [e for e in events_received if e["type"] == "data_artifact_changed"]
     assert len(data_events) >= 1, "Should emit data_artifact_changed for .txt file"
+
+
+def test_is_code_or_config_ignores_pivot_yaml() -> None:
+    assert sources._is_code_or_config("pipeline.py") is True
+    assert sources._is_code_or_config("pivot.yaml") is False
+    assert sources._is_code_or_config("pivot.yml") is False

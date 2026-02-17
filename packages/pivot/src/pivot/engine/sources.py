@@ -26,8 +26,6 @@ _DEFAULT_DEBOUNCE_MS = 1600
 # File patterns that trigger code reload (same as watch/engine.py)
 _CODE_FILE_SUFFIXES = (".py",)
 _CONFIG_FILE_NAMES = (
-    "pivot.yaml",
-    "pivot.yml",
     "pipeline.py",
     "params.yaml",
     "params.yml",

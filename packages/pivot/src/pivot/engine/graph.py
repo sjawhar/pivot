@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING, TypedDict, cast
 
 import networkx as nx
 
-from pivot import outputs
 from pivot import types as pivot_types
 from pivot.engine.types import NodeType
 
@@ -94,20 +93,13 @@ def _path_identity(path: str) -> pivot_types.ArtifactIdentity:
 
 
 def _output_identities(
-    out: pivot_types.ArtifactRef | outputs.BaseOut,
+    out: pivot_types.ArtifactRef,
 ) -> list[pivot_types.ArtifactIdentity]:
-    if isinstance(out, pivot_types.ArtifactRef):
-        return [out.identity]
-    path = out.path
-    if isinstance(path, (list, tuple)):
-        return [_path_identity(str(item)) for item in path]
-    return [_path_identity(str(path))]
+    return [out.identity]
 
 
-def _dep_identity(dep: pivot_types.ArtifactRef | str) -> pivot_types.ArtifactIdentity:
-    if isinstance(dep, pivot_types.ArtifactRef):
-        return dep.identity
-    return _path_identity(dep)
+def _dep_identity(dep: pivot_types.ArtifactRef) -> pivot_types.ArtifactIdentity:
+    return dep.identity
 
 
 def _build_outputs_map(

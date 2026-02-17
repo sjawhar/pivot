@@ -232,15 +232,17 @@ def _run_inner(
         pipeline = discovery.discover_pipeline()
         if pipeline is None:
             raise exceptions.PipelineNotFoundError(
-                "No pipeline found. Create pivot.yaml or pipeline.py to define stages."
+                "No pipeline found. Create pipeline.py to define stages."
             )
 
     # Run async execution
     async def execute() -> dict[str, ExecutionSummary]:
+        from pivot.engine import types as engine_types
+
         async with Engine(pipeline=pipeline) as eng:
             # Add ResultCollectorSink to collect results
             result_sink = ResultCollectorSink()
-            eng.add_sink(result_sink)
+            eng.add_sink(cast("engine_types.EventSink", result_sink))
 
             # Create OneShotSource with all orchestration parameters
             source = OneShotSource(

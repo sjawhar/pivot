@@ -829,7 +829,7 @@ def repro(
     STAGES can be stage names or output file paths — file paths are resolved
     to the stage that produces them. Without arguments, runs the entire pipeline.
 
-    Auto-discovers pivot.yaml or pipeline.py if no stages are registered.
+    Auto-discovers pipeline.py if no stages are registered.
     """
     cli_ctx = cli_helpers.get_cli_context(ctx)
     quiet = cli_ctx["quiet"]
@@ -922,7 +922,7 @@ def repro(
     pipeline = cli_decorators.get_pipeline_from_context()
     has_stages = pipeline is not None and bool(pipeline.list_stages())
     if not has_stages and not dry_run and not as_json:
-        raise click.ClickException("No pipeline found (pivot.yaml or pipeline.py)")
+        raise click.ClickException("No pipeline found (pipeline.py)")
 
     # Handle explain mode
     if explain:

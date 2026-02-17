@@ -307,6 +307,7 @@ class AgentRpcHandler:
                         state_dir=registry_mod.get_stage_state_dir(
                             reg_info, config_io.get_state_dir()
                         ),
+                        allow_missing=True,
                     )
 
                 return await anyio.to_thread.run_sync(_get_explanation)  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType, reportUnknownVariableType] - anyio stub issue

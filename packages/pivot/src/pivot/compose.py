@@ -41,7 +41,7 @@ class _PlotTag:
 metric = _MetricTag()
 plot = _PlotTag()
 
-SINGLE_OUTPUT_KEY = "_single"
+SINGLE_OUTPUT_KEY = stage_def.SINGLE_OUTPUT_KEY
 
 
 class CollectionKind(enum.StrEnum):
@@ -95,7 +95,7 @@ def _handle_to_artifact_ref(handle: ArtifactHandle, consumer_name: str) -> types
             raise TypeError(
                 f"Stage '{consumer_name}' received handle from multi-output stage "
                 f"'{source.name}' without selecting an output. "
-                f"Use .field or ['key']. Available: {available}"
+                f"Use handle.key or handle['key']. Available: {available}"
             )
         output_spec = matched
         output_key = output_spec.key
@@ -126,6 +126,7 @@ class Pipeline:
     _validation_errors: list[str]
     _token: contextvars.Token[Pipeline | None] | None
     _variant_stack: list[str]
+    _built: bool
 
     def __init__(self, name: str, *, root: pathlib.Path | None = None) -> None:
         self._name = name
@@ -135,6 +136,7 @@ class Pipeline:
         self._validation_errors = []
         self._token = None
         self._variant_stack = []
+        self._built = False
 
         if root is not None:
             self._root = root.resolve()
@@ -255,10 +257,22 @@ class Pipeline:
         params: stage_def.StageParams | None = None
         for param_name, value in bound.arguments.items():
             if isinstance(value, ArtifactHandle):
+                if value._pipeline is not self:
+                    self._validation_errors.append(
+                        f"{stage_name}: parameter '{param_name}' is a handle from a "
+                        f"different Pipeline instance. All handles must come from the same pipeline."
+                    )
                 input_handles[param_name] = value
             elif isinstance(value, (list, tuple)) and all(
                 isinstance(v, ArtifactHandle) for v in value
             ):
+                for v in value:
+                    if isinstance(v, ArtifactHandle) and v._pipeline is not self:
+                        self._validation_errors.append(
+                            f"{stage_name}: parameter '{param_name}' is a handle from a "
+                            f"different Pipeline instance. All handles must come from the same pipeline."
+                        )
+                        break
                 list_input_handles[param_name] = list(value)
                 collection_params[param_name] = (
                     CollectionKind.TUPLE if isinstance(value, tuple) else CollectionKind.LIST
@@ -313,12 +327,20 @@ class Pipeline:
             raise ValueError(msg)
 
     def build(self) -> pipeline_mod.Pipeline:
+        if self._built:
+            raise RuntimeError("Pipeline already built")
+        self._validate()
         legacy = pipeline_mod.Pipeline(self._name, root=self._root)
         legacy.set_input_bindings({name: node.path for name, node in self._inputs.items()})
 
         for node in self._stages:
+            node.name = f"{self._name}/{node.name}"
+
+        for node in self._stages:
             func = node.original_func
             assert not hasattr(func, "_is_stage")
+            if getattr(node.func, "__pivot_no_fingerprint__", False):
+                func.__pivot_no_fingerprint__ = True  # pyright: ignore[reportFunctionMemberAccess]
 
             deps = dict[str, types.ArtifactRef]()
 
@@ -393,6 +415,7 @@ class Pipeline:
 
             legacy._registry.add_existing(stage_info)
 
+        self._built = True
         return legacy
 
 
@@ -464,23 +487,7 @@ def _format_extension(
     fmt: object,
 ) -> str:
     loaders = _get_loaders()
-    match fmt:
-        case loaders.DataFrameJSONL():
-            return "jsonl"
-        case loaders.CSV():
-            return "csv"
-        case loaders.YAML():
-            return "yaml"
-        case loaders.JSON():
-            return "json"
-        case loaders.Text():
-            return "txt"
-        case loaders.Pickle():
-            return "pkl"
-        case loaders.MatplotlibFigure():
-            return "png"
-        case _:
-            return "dat"
+    return loaders.format_extension(fmt)
 
 
 def _infer_input_format_from_type(t: type) -> loaders_mod.Reader[object] | None:
@@ -520,7 +527,10 @@ def _infer_format_from_extension(path: str) -> loaders_mod.Reader[object]:
 
 def _parse_output_type(hint: Any, key: str) -> list[_OutputSpec]:
     """Parse a type hint into OutputSpec(s)."""
-    # Check for TypedDict (multi-output)
+    origin = get_origin(hint)
+    if origin is typing.Required or origin is typing.NotRequired:
+        hint = get_args(hint)[0]
+
     if isinstance(hint, type) and is_typeddict(hint):
         specs = list[_OutputSpec]()
         field_hints = get_type_hints(hint, include_extras=True)

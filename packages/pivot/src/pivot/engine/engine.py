@@ -1600,7 +1600,7 @@ class Engine:
                 return False
             for out_ref in stage_info["outs"]:
                 out_path = store._resolve_output_path(out_ref)  # pyright: ignore[reportPrivateUsage]
-                if not (out_path.exists() or out_path.is_symlink()):
+                if not out_path.exists():
                     return False
             return True
 
@@ -1708,7 +1708,17 @@ class Engine:
         )
 
         def _restore_outputs() -> bool:
-            return _outputs_exist()
+            if _outputs_exist():
+                return True
+            if not isinstance(store, store_mod.WorkspaceStore):
+                return False
+            for out_ref in stage_info["outs"]:
+                hash_info = lock_data["output_hashes"].get(out_ref.identity)
+                if hash_info is None:
+                    return False
+                if not store.restore_from_cache(out_ref, hash_info, state_dir=stage_state_dir):
+                    return False
+            return True
 
         restored = await anyio.to_thread.run_sync(_restore_outputs)
         if not restored:
@@ -1770,7 +1780,7 @@ class Engine:
 
         input_merkle_ids = {
             types.identity_key(ref.identity): self._merkle_ids[types.identity_key(ref.identity)]
-            for ref in stage_info["outs"]
+            for ref in stage_info["deps"].values()
             if types.identity_key(ref.identity) in self._merkle_ids
         }
         stage_merkle_id = merkle.compute_merkle_id(code_manifest, params, input_merkle_ids)
@@ -1801,6 +1811,7 @@ class Engine:
                 overrides=overrides,
                 state_dir=worker_info["state_dir"],
                 force=force,
+                allow_missing=True,
             )
 
         try:
@@ -2088,7 +2099,7 @@ class Engine:
         watch_paths = [pathlib.Path(p) for p in engine_graph.get_watch_paths(self._graph)]
 
         # In --all mode, also watch pipeline config directories so creating/removing
-        # pipeline.py or pivot.yaml triggers reload.
+        # pipeline.py triggers reload.
         if self._all_pipelines:
             from pivot import discovery
 

@@ -112,6 +112,42 @@ def test_deterministic_sort() -> None:
     assert keys == ["a:a", "b:b"]
 
 
+def test_lock_key_none_matches_identity_key() -> None:
+    """Verify _lock_key matches identity_key for both None and non-None keys."""
+    _lock_key = artifact_lock._lock_key
+
+    identity_none = types.ArtifactIdentity("stage", None)
+    ref_none = types.ArtifactRef(
+        identity=identity_none,
+        format=loaders.JSON(),
+        python_type=dict,
+        tag=types.ArtifactTag.DATA,
+    )
+    lock_key_none = _lock_key(ref_none)
+    identity_key_none = types.identity_key(identity_none)
+
+    assert lock_key_none == identity_key_none, (
+        f"Lock key mismatch for None: {lock_key_none!r} != {identity_key_none!r}"
+    )
+    assert "None" not in lock_key_none, (
+        f"Lock key should not contain 'None' string: {lock_key_none!r}"
+    )
+
+    identity_key = types.ArtifactIdentity("stage", "output")
+    ref_key = types.ArtifactRef(
+        identity=identity_key,
+        format=loaders.JSON(),
+        python_type=dict,
+        tag=types.ArtifactTag.DATA,
+    )
+    lock_key_key = _lock_key(ref_key)
+    identity_key_key = types.identity_key(identity_key)
+
+    assert lock_key_key == identity_key_key, (
+        f"Lock key mismatch for non-None: {lock_key_key!r} != {identity_key_key!r}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Flock-based LocalFlockLockService tests
 # ---------------------------------------------------------------------------

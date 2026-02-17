@@ -1,8 +1,10 @@
 # pyright: reportMissingImports=false, reportUnknownVariableType=false, reportUnknownMemberType=false, reportAttributeAccessIssue=false, reportMissingTypeArgument=false, reportAny=false, reportExplicitAny=false, reportUnknownParameterType=false, reportUnknownArgumentType=false, reportUntypedFunctionDecorator=false, reportUnusedParameter=false, reportUnusedCallResult=false
 from __future__ import annotations
 
+import os
 import pathlib
 import pickle
+import stat
 from typing import cast
 
 import pytest
@@ -117,6 +119,30 @@ def test_workspace_store_prepare_output_commit_pattern(tmp_path: pathlib.Path) -
     assert workspace_store.checkout(ref).read_text() == "content"
 
 
+def test_workspace_store_backup_and_restore(tmp_path: pathlib.Path) -> None:
+    cache_dir = tmp_path / "cache" / "files"
+    workspace_store = store.WorkspaceStore(
+        project_root=tmp_path,
+        pipeline_name="pipe",
+        input_bindings={},
+        cache_dir=cache_dir,
+    )
+    ref = _helper_ref("stage", None, types.ArtifactTag.DATA, loaders.Text())
+    output_path = workspace_store.prepare_output(ref)
+    output_path.write_text("hello cache")
+
+    workspace_store.commit(ref, output_path)
+    output_hash = workspace_store.hash_artifact(ref)
+    workspace_store.backup_to_cache(ref, output_path)
+
+    output_path.unlink()
+    assert not output_path.exists()
+
+    restored = workspace_store.restore_from_cache(ref, output_hash)
+    assert restored is True
+    assert output_path.read_text() == "hello cache"
+
+
 def test_workspace_store_pickle_round_trip(tmp_path: pathlib.Path) -> None:
     workspace_store = store.WorkspaceStore(
         project_root=tmp_path, pipeline_name="pipe", input_bindings={}
@@ -136,31 +162,31 @@ def test_workspace_store_pickle_round_trip(tmp_path: pathlib.Path) -> None:
         pytest.param(
             types.ArtifactTag.DATA,
             None,
-            "data/pipe/stage.txt",
+            "data/stage.txt",
             id="data-single",
         ),
         pytest.param(
             types.ArtifactTag.DATA,
             "out",
-            "data/pipe/stage/out.txt",
+            "data/stage/out.txt",
             id="data-multi",
         ),
         pytest.param(
             types.ArtifactTag.METRIC,
             "score",
-            "metrics/pipe/stage/score.json",
+            "metrics/stage/score.json",
             id="metric",
         ),
         pytest.param(
             types.ArtifactTag.PLOT,
             "loss",
-            "plots/pipe/stage/loss.png",
+            "plots/stage/loss.png",
             id="plot",
         ),
         pytest.param(
             types.ArtifactTag.DIRECTORY,
             "dir",
-            "data/pipe/stage/dir",
+            "data/stage/dir",
             id="directory",
         ),
     ],
@@ -248,6 +274,34 @@ def test_store_spec_round_trip(tmp_path: pathlib.Path) -> None:
     round_trip = pickle.loads(pickle.dumps(spec))
     rebuilt = store.store_from_spec(round_trip)
     assert isinstance(rebuilt, store.WorkspaceStore)
+
+
+def test_prepare_output_unlinks_readonly_cas_hardlink(tmp_path: pathlib.Path) -> None:
+    ws = store.WorkspaceStore(tmp_path, "pipe", {})
+    ref = _helper_ref("pipe/stage", None, types.ArtifactTag.DATA, loaders.YAML())
+
+    output_path = ws._resolve_output_path(ref)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text("old cached data")
+    os.chmod(output_path, stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
+    assert not os.access(output_path, os.W_OK)
+
+    result = ws.prepare_output(ref)
+    assert result == output_path
+    assert not output_path.exists(), "prepare_output should unlink read-only file"
+
+
+def test_resolve_output_path_uses_prefixed_producer(tmp_path: pathlib.Path) -> None:
+    ws = store.WorkspaceStore(tmp_path, "ignored", {})
+    ref = types.ArtifactRef(
+        identity=types.ArtifactIdentity(producer="horizon/train", key="output"),
+        format=loaders.CSV(),
+        python_type=pathlib.Path,
+        tag=types.ArtifactTag.DATA,
+    )
+    path = ws._resolve_output_path(ref)
+    assert path == tmp_path / "data" / "horizon" / "train" / "output.csv"
+    assert "ignored" not in str(path)  # pipeline_name should not appear
 
 
 def test_store_spec_cache_round_trip(tmp_path: pathlib.Path) -> None:

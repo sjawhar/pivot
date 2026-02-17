@@ -135,7 +135,7 @@ def test_execute_stage_uses_store_spec_for_io(
 
     result = worker.execute_stage("stage", stage_info, worker_env, output_queue)
 
-    output_path = tmp_path / "data" / "pipe" / "stage.txt"
+    output_path = tmp_path / "data" / "stage.txt"
     assert output_path.exists(), "Output should be written via Store"
     assert output_path.read_text() == "HELLO"
     assert result["status"] == types.StageStatus.RAN
@@ -144,7 +144,7 @@ def test_execute_stage_uses_store_spec_for_io(
 def test_execute_stage_records_accessed_group_keys(
     worker_env: pathlib.Path, tmp_path: pathlib.Path, output_queue: mp.Queue[OutputMessage]
 ) -> None:
-    group_dir = tmp_path / "data" / "pipe" / "upstream"
+    group_dir = tmp_path / "data" / "upstream"
     group_dir.mkdir(parents=True)
     (group_dir / "a.txt").write_text("alpha")
     (group_dir / "b.txt").write_text("beta")
@@ -235,7 +235,7 @@ def test_execute_stage_single_field_typeddict(
 
     result = worker.execute_stage("stage", stage_info, worker_env, output_queue)
 
-    output_path = tmp_path / "data" / "pipe" / "stage" / "upper.txt"
+    output_path = tmp_path / "data" / "stage" / "upper.txt"
     assert output_path.exists(), "Keyed output should be in subdirectory"
     assert output_path.read_text() == "HELLO"
     assert result["status"] == types.StageStatus.RAN

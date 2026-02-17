@@ -15,7 +15,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Paths that can never be ignored regardless of patterns
-PROTECTED_PATHS = frozenset({"pivot.yaml", "pivot.yml", ".pivot/"})
+PROTECTED_PATHS = frozenset({"pipeline.py", ".pivot/"})
 
 # Default patterns for starter .pivotignore file
 _DEFAULT_PATTERNS = [

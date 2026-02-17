@@ -132,35 +132,35 @@ def test_resolve_cli_target_stage_with_bad_key_raises() -> None:
             types.ArtifactTag.DATA,
             None,
             loaders.CSV(),
-            "data/eval/train.csv",
+            "data/train.csv",
             id="data-single",
         ),
         pytest.param(
             types.ArtifactTag.DATA,
             "model",
             loaders.CSV(),
-            "data/eval/train/model.csv",
+            "data/train/model.csv",
             id="data-multi",
         ),
         pytest.param(
             types.ArtifactTag.METRIC,
             "score",
             cast("loaders.Writer[object]", loaders.JSON[dict[str, object]]()),
-            "metrics/eval/train/score.json",
+            "metrics/train/score.json",
             id="metric",
         ),
         pytest.param(
             types.ArtifactTag.PLOT,
             "loss",
             loaders.MatplotlibFigure(),
-            "plots/eval/train/loss.png",
+            "plots/train/loss.png",
             id="plot",
         ),
         pytest.param(
             types.ArtifactTag.DIRECTORY,
             None,
             loaders.PathOnly(),
-            "data/eval/train",
+            "data/train",
             id="directory",
         ),
     ],
@@ -210,12 +210,11 @@ def test_get_workspace_store_no_pipeline(
 def test_get_workspace_store_pipeline_name(
     mock_discovery: Pipeline,
 ) -> None:
-    """WorkspaceStore uses the pipeline name for path construction."""
+    """WorkspaceStore resolves paths using the producer name, not pipeline_name."""
     ws = cli_helpers.get_workspace_store()
     assert ws is not None
 
-    # Verify the store resolves paths using the pipeline name ("test" from mock_discovery)
     ref = _helper_ref("stage", None, types.ArtifactTag.DATA, loaders.CSV())
     path = ws.resolve_display_path(ref)
-    # mock_discovery pipeline name is "test" (from conftest test_pipeline)
-    assert "test" in path.parts, f"Expected 'test' in path parts: {path}"
+    assert path.name == "stage.csv"
+    assert "data" in path.parts
