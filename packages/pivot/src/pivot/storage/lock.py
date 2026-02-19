@@ -1,3 +1,4 @@
+# pyright: reportImplicitRelativeImport=false
 """Per-stage lock files for tracking pipeline state.
 
 StageLock provides persistent lock files (.lock) for change detection,
@@ -87,12 +88,10 @@ def is_lock_data(data: object) -> TypeGuard[StorageLockData]:
             typed_entry = cast("dict[str, object]", raw_entry)
             if not typed_entry.get("hash"):
                 return False
-            if list_key == "deps":
-                if "producer" not in typed_entry or "key" not in typed_entry:
-                    return False
-            if list_key == "outs":
-                if "key" not in typed_entry or "tag" not in typed_entry:
-                    return False
+            if list_key == "deps" and ("producer" not in typed_entry or "key" not in typed_entry):
+                return False
+            if list_key == "outs" and ("key" not in typed_entry or "tag" not in typed_entry):
+                return False
     return True
 
 
@@ -294,3 +293,33 @@ class StageLock:
                 return True, "Output paths changed"
 
         return False, ""
+
+
+def find_orphaned_locks(
+    stages_dir: Path,
+    registered_stages: set[str],
+) -> list[str]:
+    """Find lock files in stages_dir that don't correspond to any registered stage.
+
+    When a pipeline is restructured (stages renamed/removed), old lock files
+    persist and old output files remain on disk. Detecting orphaned locks helps
+    users identify stale artifacts from previous pipeline configurations.
+
+    Returns:
+        Sorted list of stage names that have lock files but aren't registered.
+    """
+    if not stages_dir.is_dir():
+        return []
+
+    orphaned = list[str]()
+    suffix = ".lock"
+
+    for lock_file in stages_dir.rglob(f"*{suffix}"):
+        # Derive stage name from relative path (e.g., "base/stage_name.lock" -> "base/stage_name")
+        rel = lock_file.relative_to(stages_dir)
+        stage_name = str(rel)[: -len(suffix)]
+        if stage_name not in registered_stages:
+            orphaned.append(stage_name)
+
+    orphaned.sort()
+    return orphaned

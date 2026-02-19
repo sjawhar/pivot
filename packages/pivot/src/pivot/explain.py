@@ -11,9 +11,10 @@ from typing import TYPE_CHECKING
 
 import pydantic
 
-from pivot import parameters, project, skip
+from pivot import parameters, project, skip, types
 from pivot.executor import worker
 from pivot.storage import lock, state
+from pivot.storage import store as store_mod
 from pivot.types import (
     ArtifactIdentity,
     HashInfo,
@@ -95,6 +96,8 @@ def get_stage_explanation(
     allow_missing: bool = False,
     tracked_files: dict[str, PvtData] | None = None,
     tracked_trie: pygtrie.Trie[str] | None = None,
+    deps_refs: dict[str, types.ArtifactRef] | None = None,
+    store: store_mod.Store | None = None,
 ) -> StageExplanation:
     """Compute detailed explanation of why a stage would run.
 
@@ -175,7 +178,12 @@ def get_stage_explanation(
         dep_hashes = fallback_hashes
         unreadable_deps = list[str]()
     else:
-        str_hashes, missing_deps, unreadable_deps, _ = worker.hash_dependencies(deps)
+        if deps_refs is not None and store is not None:
+            str_hashes, missing_deps, unreadable_deps, _ = worker.hash_dependencies(
+                deps_refs, store
+            )
+        else:
+            str_hashes, missing_deps, unreadable_deps, _ = worker.hash_dependencies(deps)
         dep_hashes = _to_identity_keyed(str_hashes)
 
     if missing_deps or unreadable_deps:
