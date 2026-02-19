@@ -872,3 +872,46 @@ def test_lock_roundtrip_dir_hash_with_identity_keys(tmp_path: Path) -> None:
     info = loaded["dep_hashes"][_id("data_dir")]
     assert info["hash"] == "tree_aaa"
     assert "manifest" in info
+
+
+# --- find_orphaned_locks ---
+
+
+def test_find_orphaned_locks_empty_dir(tmp_path: Path) -> None:
+    stages_dir = tmp_path / "stages"
+    stages_dir.mkdir()
+    assert lock.find_orphaned_locks(stages_dir, {"train", "test"}) == []
+
+
+def test_find_orphaned_locks_nonexistent_dir(tmp_path: Path) -> None:
+    assert lock.find_orphaned_locks(tmp_path / "nope", {"train"}) == []
+
+
+def test_find_orphaned_locks_all_registered(tmp_path: Path) -> None:
+    stages_dir = tmp_path / "stages"
+    stages_dir.mkdir()
+    (stages_dir / "train.lock").touch()
+    (stages_dir / "test.lock").touch()
+    assert lock.find_orphaned_locks(stages_dir, {"train", "test"}) == []
+
+
+def test_find_orphaned_locks_detects_orphans(tmp_path: Path) -> None:
+    stages_dir = tmp_path / "stages"
+    stages_dir.mkdir()
+    (stages_dir / "train.lock").touch()
+    (stages_dir / "old_stage.lock").touch()
+    (stages_dir / "renamed@legacy.lock").touch()
+
+    orphans = lock.find_orphaned_locks(stages_dir, {"train"})
+    assert orphans == ["old_stage", "renamed@legacy"]
+
+
+def test_find_orphaned_locks_nested_directories(tmp_path: Path) -> None:
+    stages_dir = tmp_path / "stages"
+    (stages_dir / "base").mkdir(parents=True)
+    (stages_dir / "base" / "base_train.lock").touch()
+    (stages_dir / "base" / "base_test.lock").touch()
+    (stages_dir / "old_root_stage.lock").touch()
+
+    orphans = lock.find_orphaned_locks(stages_dir, {"base/base_train", "base/base_test"})
+    assert orphans == ["old_root_stage"]

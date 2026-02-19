@@ -1,25 +1,28 @@
+# pyright: reportMissingImports=false
 from __future__ import annotations
 
 import inspect
 import pathlib
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
 from pivot import loaders, outputs, project, types
 from pivot.cli import completion
 from pivot.cli import helpers as cli_helpers
 from pivot.cli import targets as cli_targets
 from pivot.engine import graph as engine_graph
-from pivot.registry import RegistryStageInfo
+from pivot.registry import PipelineLike, RegistryStageInfo
 
 if TYPE_CHECKING:
-    from pivot.pipeline import pipeline as pipeline_mod
+    import click
+
+    from pivot.compose import Pipeline
 
 
 def _helper_ref(
     producer: str,
     key: str | None,
     tag: types.ArtifactTag,
-    fmt: loaders.Writer[object] | loaders.Reader[object] | loaders.Loader[object, object],
+    fmt: loaders.Writer[Any] | loaders.Reader[Any] | loaders.Loader[Any, Any],
     python_type: type,
 ) -> types.ArtifactRef:
     return types.ArtifactRef(
@@ -46,38 +49,44 @@ def _make_stage_info(name: str, outs: list[types.ArtifactRef]) -> RegistryStageI
         fingerprint={"_code": "fake_hash"},
         params_arg_name=None,
         state_dir=None,
+        collection_params={},
+        no_fingerprint=False,
     )
 
 
-def _register_stage(
-    test_pipeline: pipeline_mod.Pipeline, name: str, outs: list[types.ArtifactRef]
-) -> None:
-    test_pipeline._registry._stages[name] = _make_stage_info(name, outs)
+def _register_stage(test_pipeline: PipelineLike, name: str, outs: list[types.ArtifactRef]) -> None:
+    pipeline = cast("Pipeline", test_pipeline)
+    pipeline._registry._stages[name] = _make_stage_info(name, outs)
 
 
-def test_complete_targets_includes_stage_keys(mock_discovery: pipeline_mod.Pipeline) -> None:
+_NONE_CTX = cast("click.Context", cast("object", None))
+_NONE_PARAM = cast("click.Parameter", cast("object", None))
+
+
+def test_complete_targets_includes_stage_keys(mock_discovery: PipelineLike) -> None:
     outs = [
         _helper_ref("train", "model", types.ArtifactTag.DATA, loaders.CSV(), pathlib.Path),
         _helper_ref("train", "score", types.ArtifactTag.METRIC, loaders.JSON(), dict),
     ]
     _register_stage(mock_discovery, "train", outs)
 
-    bare = completion.complete_targets(None, None, "")
+    bare = completion.complete_targets(_NONE_CTX, _NONE_PARAM, "")
     assert "train" in bare
     assert "train:model" not in bare, "stage:key completions should only appear after typing ':'"
 
-    keyed = completion.complete_targets(None, None, "train:")
+    keyed = completion.complete_targets(_NONE_CTX, _NONE_PARAM, "train:")
     assert "train:model" in keyed
     assert "train:score" in keyed
 
 
 def test_resolve_targets_to_stages_identity_key(
-    mock_discovery: pipeline_mod.Pipeline,
+    mock_discovery: PipelineLike,
 ) -> None:
     outs = [_helper_ref("train", "model", types.ArtifactTag.DATA, loaders.CSV(), pathlib.Path)]
     _register_stage(mock_discovery, "train", outs)
 
-    graph = engine_graph.build_graph(mock_discovery._registry._stages)
+    pipeline = cast("Pipeline", mock_discovery)
+    graph = engine_graph.build_graph(pipeline._registry._stages)
     resolved, unresolved = cli_targets.resolve_targets_to_stages(["train:model"], graph)
 
     assert resolved == {"train"}
@@ -85,7 +94,7 @@ def test_resolve_targets_to_stages_identity_key(
 
 
 def test_resolve_output_paths_uses_store_display_path(
-    mock_discovery: pipeline_mod.Pipeline,
+    mock_discovery: PipelineLike,
 ) -> None:
     ref = _helper_ref("train", "score", types.ArtifactTag.METRIC, loaders.JSON(), dict)
     _register_stage(mock_discovery, "train", [ref])
@@ -105,7 +114,7 @@ def test_resolve_output_paths_uses_store_display_path(
 
 
 def test_resolve_plot_infos_uses_store_display_path(
-    mock_discovery: pipeline_mod.Pipeline,
+    mock_discovery: PipelineLike,
 ) -> None:
     ref = _helper_ref(
         "train", "loss", types.ArtifactTag.PLOT, loaders.MatplotlibFigure(), pathlib.Path
@@ -126,37 +135,38 @@ def test_resolve_plot_infos_uses_store_display_path(
     assert resolved[0]["path"] == expected
 
 
-def test_complete_targets_stage_without_key(mock_discovery: pipeline_mod.Pipeline) -> None:
+def test_complete_targets_stage_without_key(mock_discovery: PipelineLike) -> None:
     """Stage without key should be completable."""
     outs = [_helper_ref("train", None, types.ArtifactTag.DATA, loaders.CSV(), pathlib.Path)]
     _register_stage(mock_discovery, "train", outs)
 
-    result = completion.complete_targets(None, None, "")
+    result = completion.complete_targets(_NONE_CTX, _NONE_PARAM, "")
 
     assert "train" in result
 
 
-def test_complete_targets_multiple_stages(mock_discovery: pipeline_mod.Pipeline) -> None:
+def test_complete_targets_multiple_stages(mock_discovery: PipelineLike) -> None:
     """Multiple stages should all be in completion results."""
     outs1 = [_helper_ref("train", None, types.ArtifactTag.DATA, loaders.CSV(), pathlib.Path)]
     outs2 = [_helper_ref("eval", None, types.ArtifactTag.DATA, loaders.JSON(), pathlib.Path)]
     _register_stage(mock_discovery, "train", outs1)
     _register_stage(mock_discovery, "eval", outs2)
 
-    result = completion.complete_targets(None, None, "")
+    result = completion.complete_targets(_NONE_CTX, _NONE_PARAM, "")
 
     assert "train" in result
     assert "eval" in result
 
 
 def test_resolve_targets_to_stages_stage_name_only(
-    mock_discovery: pipeline_mod.Pipeline,
+    mock_discovery: PipelineLike,
 ) -> None:
     """Stage name without key should resolve to stage."""
     outs = [_helper_ref("train", "model", types.ArtifactTag.DATA, loaders.CSV(), pathlib.Path)]
     _register_stage(mock_discovery, "train", outs)
 
-    graph = engine_graph.build_graph(mock_discovery._registry._stages)
+    pipeline = cast("Pipeline", mock_discovery)
+    graph = engine_graph.build_graph(pipeline._registry._stages)
     resolved, unresolved = cli_targets.resolve_targets_to_stages(["train"], graph)
 
     assert resolved == {"train"}
@@ -164,7 +174,7 @@ def test_resolve_targets_to_stages_stage_name_only(
 
 
 def test_resolve_output_paths_metric_excluded(
-    mock_discovery: pipeline_mod.Pipeline,
+    mock_discovery: PipelineLike,
 ) -> None:
     """Metric outputs should not be included in resolved paths."""
     metric_ref = _helper_ref("eval", "score", types.ArtifactTag.METRIC, loaders.JSON(), dict)

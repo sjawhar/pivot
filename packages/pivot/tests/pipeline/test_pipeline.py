@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from pivot import loaders, registry, types
-from pivot.pipeline import pipeline as pipeline_mod
+from pivot.compose import Pipeline
 
 if TYPE_CHECKING:
     import pathlib
@@ -43,6 +43,7 @@ def _helper_make_stage_info(
         params_arg_name=None,
         state_dir=None,
         collection_params={},
+        no_fingerprint=False,
     )
 
 
@@ -50,17 +51,18 @@ _make_stage_info = _helper_make_stage_info
 
 
 def test_include_merges_input_bindings(tmp_path: pathlib.Path) -> None:
-    child = pipeline_mod.Pipeline("child", root=tmp_path)
-    child.set_input_bindings({"ext.jsonl": "data/external/ext.jsonl"})
+    child = Pipeline("child", root=tmp_path)
+    with child:
+        child.input("ext.jsonl", path="data/external/ext.jsonl")
 
-    parent = pipeline_mod.Pipeline("parent", root=tmp_path)
+    parent = Pipeline("parent", root=tmp_path)
     parent.include(child)
 
     assert parent.input_bindings["ext.jsonl"] == "data/external/ext.jsonl"
 
 
 def test_add_existing_rejects_mismatched_out_producer(tmp_path: pathlib.Path) -> None:
-    pipeline = pipeline_mod.Pipeline("test", root=tmp_path)
+    pipeline = Pipeline("test", root=tmp_path)
     bad_out = types.ArtifactRef(
         identity=types.ArtifactIdentity(producer="wrong", key="out"),
         format=loaders.YAML(),
@@ -73,10 +75,10 @@ def test_add_existing_rejects_mismatched_out_producer(tmp_path: pathlib.Path) ->
 
 
 def test_include_preserves_prefixed_names(tmp_path: pathlib.Path) -> None:
-    child = pipeline_mod.Pipeline("child", root=tmp_path)
+    child = Pipeline("child", root=tmp_path)
     child._registry.add_existing(_make_stage_info("child/alpha"))
 
-    parent = pipeline_mod.Pipeline("parent", root=tmp_path)
+    parent = Pipeline("parent", root=tmp_path)
     parent._registry.add_existing(_make_stage_info("parent/beta"))
     parent.include(child)
 
@@ -85,13 +87,13 @@ def test_include_preserves_prefixed_names(tmp_path: pathlib.Path) -> None:
 
 
 def test_include_no_collision_with_same_bare_name(tmp_path: pathlib.Path) -> None:
-    a = pipeline_mod.Pipeline("a", root=tmp_path)
+    a = Pipeline("a", root=tmp_path)
     a._registry.add_existing(_make_stage_info("a/train"))
 
-    b = pipeline_mod.Pipeline("b", root=tmp_path)
+    b = Pipeline("b", root=tmp_path)
     b._registry.add_existing(_make_stage_info("b/train"))
 
-    combined = pipeline_mod.Pipeline("all", root=tmp_path)
+    combined = Pipeline("all", root=tmp_path)
     combined.include(a)
     combined.include(b)
 
@@ -100,7 +102,7 @@ def test_include_no_collision_with_same_bare_name(tmp_path: pathlib.Path) -> Non
 
 
 def test_include_dep_identities_need_no_rewriting(tmp_path: pathlib.Path) -> None:
-    child = pipeline_mod.Pipeline("child", root=tmp_path)
+    child = Pipeline("child", root=tmp_path)
     dep_ref = types.ArtifactRef(
         identity=types.ArtifactIdentity(producer="child/upstream", key="out"),
         format=loaders.YAML(),
@@ -110,21 +112,21 @@ def test_include_dep_identities_need_no_rewriting(tmp_path: pathlib.Path) -> Non
     child._registry.add_existing(_make_stage_info("child/upstream"))
     child._registry.add_existing(_make_stage_info("child/downstream", deps={"data": dep_ref}))
 
-    combined = pipeline_mod.Pipeline("all", root=tmp_path)
+    combined = Pipeline("all", root=tmp_path)
     combined.include(child)
 
-    downstream = combined.get("child/downstream")
+    downstream = combined.get_stage("child/downstream")
     assert downstream["deps"]["data"].identity.producer == "child/upstream"
 
 
 def test_include_skips_duplicate_stage_names(tmp_path: pathlib.Path) -> None:
-    a = pipeline_mod.Pipeline("same", root=tmp_path)
+    a = Pipeline("same", root=tmp_path)
     a._registry.add_existing(_make_stage_info("same/train"))
 
-    b = pipeline_mod.Pipeline("same", root=tmp_path)
+    b = Pipeline("same", root=tmp_path)
     b._registry.add_existing(_make_stage_info("same/train"))
 
-    combined = pipeline_mod.Pipeline("all", root=tmp_path)
+    combined = Pipeline("all", root=tmp_path)
     combined.include(a)
     combined.include(b)
 

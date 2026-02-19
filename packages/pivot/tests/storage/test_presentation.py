@@ -1,14 +1,22 @@
+# pyright: reportMissingImports=false
 from __future__ import annotations
 
-import pathlib
+from typing import TYPE_CHECKING, Any
 
 from pivot import loaders, types
 from pivot.registry import RegistryStageInfo
 from pivot.storage.presentation import present
 
+if TYPE_CHECKING:
+    import pathlib
+
 
 def _make_stage(
-    name: str, tag: types.ArtifactTag, fmt: object, *, key: str | None
+    name: str,
+    tag: types.ArtifactTag,
+    fmt: loaders.Reader[Any] | loaders.Writer[Any] | loaders.Loader[Any, Any],
+    *,
+    key: str | None,
 ) -> RegistryStageInfo:
     """Test helper: create a minimal RegistryStageInfo with one output."""
     return RegistryStageInfo(
@@ -30,6 +38,8 @@ def _make_stage(
         fingerprint=dict[str, str](),
         params_arg_name=None,
         state_dir=None,
+        collection_params={},
+        no_fingerprint=False,
     )
 
 

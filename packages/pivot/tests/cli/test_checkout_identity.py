@@ -3,18 +3,19 @@ from __future__ import annotations
 
 import inspect
 import pathlib
+import typing
 from typing import TYPE_CHECKING
 
 from pivot import cli, config, loaders, path_utils, project, types
 from pivot.cli import checkout as checkout_mod
 from pivot.cli import helpers as cli_helpers
-from pivot.registry import RegistryStageInfo
+from pivot.registry import PipelineLike, RegistryStageInfo
 from pivot.storage import cache, lock, store, track
 
 if TYPE_CHECKING:
     import click.testing
 
-    from pivot.pipeline import pipeline as pipeline_mod
+    from pivot.compose import Pipeline
 
 
 def _helper_ref(
@@ -51,17 +52,20 @@ def _helper_stage_info(
         fingerprint=None,
         params_arg_name=None,
         state_dir=state_dir,
+        collection_params={},
+        no_fingerprint=False,
     )
 
 
 def _helper_register_stage(
-    pipeline: pipeline_mod.Pipeline,
+    pipeline: PipelineLike,
     name: str,
     outs: list[types.ArtifactRef],
     state_dir: pathlib.Path | None = None,
 ) -> None:
     stage_info = _helper_stage_info(name, outs, state_dir or pipeline.state_dir)
-    pipeline._registry._stages[name] = stage_info
+    compose_pipeline = typing.cast("Pipeline", pipeline)
+    compose_pipeline._registry._stages[name] = stage_info
 
 
 def _helper_write_lock(
@@ -104,7 +108,7 @@ def _helper_cache_directory(path: pathlib.Path) -> types.HashInfo:
     return output_hash
 
 
-def test_get_stage_output_info_uses_store_paths(mock_discovery: pipeline_mod.Pipeline) -> None:
+def test_get_stage_output_info_uses_store_paths(mock_discovery: PipelineLike) -> None:
     store_instance = cli_helpers.get_workspace_store()
     assert store_instance is not None
 
@@ -124,7 +128,7 @@ def test_get_stage_output_info_uses_store_paths(mock_discovery: pipeline_mod.Pip
 
 
 def test_checkout_identity_target_restores_store_path(
-    mock_discovery: pipeline_mod.Pipeline, runner: click.testing.CliRunner
+    mock_discovery: PipelineLike, runner: click.testing.CliRunner
 ) -> None:
     store_instance = cli_helpers.get_workspace_store()
     assert store_instance is not None
@@ -144,7 +148,7 @@ def test_checkout_identity_target_restores_store_path(
 
 
 def test_checkout_no_targets_restores_all_outputs(
-    mock_discovery: pipeline_mod.Pipeline, runner: click.testing.CliRunner
+    mock_discovery: PipelineLike, runner: click.testing.CliRunner
 ) -> None:
     store_instance = cli_helpers.get_workspace_store()
     assert store_instance is not None
@@ -170,7 +174,7 @@ def test_checkout_no_targets_restores_all_outputs(
 
 
 def test_checkout_pvt_target_restores_file(
-    mock_discovery: pipeline_mod.Pipeline, runner: click.testing.CliRunner
+    mock_discovery: PipelineLike, runner: click.testing.CliRunner
 ) -> None:
     data_dir = project.get_project_root() / "data"
     data_path = data_dir / "raw.csv"
@@ -196,7 +200,7 @@ def test_checkout_pvt_target_restores_file(
 
 
 def test_checkout_unknown_identity_target_raises(
-    mock_discovery: pipeline_mod.Pipeline, runner: click.testing.CliRunner
+    mock_discovery: PipelineLike, runner: click.testing.CliRunner
 ) -> None:
     ref = _helper_ref("train", "model", types.ArtifactTag.DATA, loaders.CSV())
     _helper_register_stage(mock_discovery, "train", [ref])
@@ -208,7 +212,7 @@ def test_checkout_unknown_identity_target_raises(
 
 
 def test_checkout_directory_output_restores_contents(
-    mock_discovery: pipeline_mod.Pipeline, runner: click.testing.CliRunner
+    mock_discovery: PipelineLike, runner: click.testing.CliRunner
 ) -> None:
     store_instance = cli_helpers.get_workspace_store()
     assert store_instance is not None
@@ -249,7 +253,7 @@ import inspect
 import pathlib
 
 from pivot import loaders, types
-from pivot.pipeline.pipeline import Pipeline
+from pivot.compose import Pipeline
 from pivot.registry import RegistryStageInfo
 
 
@@ -257,9 +261,9 @@ def stage_func() -> None:
     return None
 
 
-pipeline = Pipeline("pipe_a")
+pipeline = Pipeline("pipe_a", root=pathlib.Path(__file__).parent)
 
-pipeline._registry._stages["train"] = RegistryStageInfo(
+pipeline._registry.add_existing(RegistryStageInfo(
     func=stage_func,
     name="train",
     deps={},
@@ -278,7 +282,9 @@ pipeline._registry._stages["train"] = RegistryStageInfo(
     fingerprint=None,
     params_arg_name=None,
     state_dir=pipeline.state_dir,
-)
+    collection_params={},
+    no_fingerprint=False,
+))
 """
         (pipeline_a / "pipeline.py").write_text(pipeline_a_code)
 
@@ -289,7 +295,7 @@ import inspect
 import pathlib
 
 from pivot import loaders, types
-from pivot.pipeline.pipeline import Pipeline
+from pivot.compose import Pipeline
 from pivot.registry import RegistryStageInfo
 
 
@@ -297,9 +303,9 @@ def stage_func() -> None:
     return None
 
 
-pipeline = Pipeline("pipe_b")
+pipeline = Pipeline("pipe_b", root=pathlib.Path(__file__).parent)
 
-pipeline._registry._stages["evaluate"] = RegistryStageInfo(
+pipeline._registry.add_existing(RegistryStageInfo(
     func=stage_func,
     name="evaluate",
     deps={},
@@ -318,7 +324,9 @@ pipeline._registry._stages["evaluate"] = RegistryStageInfo(
     fingerprint=None,
     params_arg_name=None,
     state_dir=pipeline.state_dir,
-)
+    collection_params={},
+    no_fingerprint=False,
+))
 """
         (pipeline_b / "pipeline.py").write_text(pipeline_b_code)
 

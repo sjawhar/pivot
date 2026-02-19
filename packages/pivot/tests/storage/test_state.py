@@ -756,7 +756,6 @@ def test_readonly_blocks_save_many(tmp_path: pathlib.Path) -> None:
 def test_readonly_blocks_increment_generation(tmp_path: pathlib.Path) -> None:
     """Readonly mode blocks increment_generation operation."""
     db_path = tmp_path / "state.db"
-    tmp_path / "output.txt"
 
     with state.StateDB(db_path) as db:
         pass  # Just create

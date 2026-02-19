@@ -1,16 +1,18 @@
+# pyright: reportMissingImports=false, reportImplicitRelativeImport=false
 from __future__ import annotations
 
 import inspect
 import json
 import pathlib
 import subprocess
+import typing
 from typing import TYPE_CHECKING
 
 import yaml
 
 from conftest import init_git_repo
 from pivot import loaders, project
-from pivot.registry import RegistryStageInfo
+from pivot.registry import PipelineLike, RegistryStageInfo
 from pivot.show import plots
 from pivot.storage import lock
 from pivot.types import (
@@ -28,7 +30,7 @@ if TYPE_CHECKING:
     from pytest_mock import MockerFixture
 
     from conftest import GitRepo
-    from pivot.pipeline import pipeline as pipeline_mod
+    from pivot.compose import Pipeline
 
 
 # =============================================================================
@@ -37,7 +39,7 @@ if TYPE_CHECKING:
 
 
 def _register_plot_stage(
-    test_pipeline: pipeline_mod.Pipeline,
+    test_pipeline: PipelineLike,
     name: str,
     plot_path: str,
     x: str | None = None,
@@ -58,7 +60,8 @@ def _register_plot_stage(
     if path_obj.is_absolute():
         identity_path = project.to_relative_path(path_obj)
 
-    test_pipeline._registry._stages[name] = RegistryStageInfo(
+    pipeline = typing.cast("Pipeline", test_pipeline)
+    pipeline._registry._stages[name] = RegistryStageInfo(
         func=_stage_func,
         name=name,
         deps={},
@@ -77,11 +80,13 @@ def _register_plot_stage(
         fingerprint={"_code": "fake_hash"},
         params_arg_name=None,
         state_dir=None,
+        collection_params={},
+        no_fingerprint=False,
     )
 
 
 def _register_mixed_output_stage(
-    test_pipeline: pipeline_mod.Pipeline,
+    test_pipeline: PipelineLike,
     name: str,
     out_path: str,
     metric_path: str,
@@ -107,7 +112,8 @@ def _register_mixed_output_stage(
     if plot_obj.is_absolute():
         plot_identity = project.to_relative_path(plot_obj)
 
-    test_pipeline._registry._stages[name] = RegistryStageInfo(
+    pipeline = typing.cast("Pipeline", test_pipeline)
+    pipeline._registry._stages[name] = RegistryStageInfo(
         func=_stage_func,
         name=name,
         deps={},
@@ -138,6 +144,8 @@ def _register_mixed_output_stage(
         fingerprint={"_code": "fake_hash"},
         params_arg_name=None,
         state_dir=None,
+        collection_params={},
+        no_fingerprint=False,
     )
 
 
@@ -146,14 +154,14 @@ def _register_mixed_output_stage(
 # =============================================================================
 
 
-def test_collect_plots_from_stages_empty(mock_discovery: pipeline_mod.Pipeline) -> None:
+def test_collect_plots_from_stages_empty(mock_discovery: PipelineLike) -> None:
     """Empty registry returns empty list."""
     result = plots.collect_plots_from_stages()
 
     assert result == []
 
 
-def test_collect_plots_from_stages_finds_plots(mock_discovery: pipeline_mod.Pipeline) -> None:
+def test_collect_plots_from_stages_finds_plots(mock_discovery: PipelineLike) -> None:
     """Finds Plot outputs from registered stages."""
     plot_path = mock_discovery.root / "plot.png"
     plot_path.write_bytes(b"data")
@@ -168,7 +176,7 @@ def test_collect_plots_from_stages_finds_plots(mock_discovery: pipeline_mod.Pipe
     assert result[0]["y"] is None
 
 
-def test_collect_plots_from_stages_ignores_non_plots(mock_discovery: pipeline_mod.Pipeline) -> None:
+def test_collect_plots_from_stages_ignores_non_plots(mock_discovery: PipelineLike) -> None:
     """Ignores Out and Metric outputs, only returns Plot outputs."""
     out_file = mock_discovery.root / "output.txt"
     metric_file = mock_discovery.root / "metrics.json"
@@ -196,7 +204,7 @@ def test_collect_plots_from_stages_ignores_non_plots(mock_discovery: pipeline_mo
 # =============================================================================
 
 
-def test_get_plot_hashes_from_lock_no_lock_file(mock_discovery: pipeline_mod.Pipeline) -> None:
+def test_get_plot_hashes_from_lock_no_lock_file(mock_discovery: PipelineLike) -> None:
     """Returns None for plots without lock files."""
     plot_file = mock_discovery.root / "plot.png"
     plot_file.write_bytes(b"data")
@@ -210,7 +218,7 @@ def test_get_plot_hashes_from_lock_no_lock_file(mock_discovery: pipeline_mod.Pip
     assert result["plot.png"] is None
 
 
-def test_get_plot_hashes_from_lock_with_hash(mock_discovery: pipeline_mod.Pipeline) -> None:
+def test_get_plot_hashes_from_lock_with_hash(mock_discovery: PipelineLike) -> None:
     """Returns None when lock format doesn't include paths."""
     plot_file = mock_discovery.root / "plot.png"
     plot_file.write_bytes(b"data")
@@ -237,7 +245,7 @@ def test_get_plot_hashes_from_lock_with_hash(mock_discovery: pipeline_mod.Pipeli
     assert result["plot.png"] is None
 
 
-def test_get_plot_hashes_from_lock_with_none_hash(mock_discovery: pipeline_mod.Pipeline) -> None:
+def test_get_plot_hashes_from_lock_with_none_hash(mock_discovery: PipelineLike) -> None:
     """Returns None for plots without path-mapped hashes."""
     plot_file = mock_discovery.root / "plot.png"
     plot_file.write_bytes(b"data")
@@ -269,7 +277,7 @@ def test_get_plot_hashes_from_lock_with_none_hash(mock_discovery: pipeline_mod.P
 # =============================================================================
 
 
-def test_get_plot_hashes_from_head_no_git_repo(mock_discovery: pipeline_mod.Pipeline) -> None:
+def test_get_plot_hashes_from_head_no_git_repo(mock_discovery: PipelineLike) -> None:
     """Returns empty dict when not in a git repo."""
     plot_file = mock_discovery.root / "plot.png"
     plot_file.write_bytes(b"data")
@@ -285,7 +293,7 @@ def test_get_plot_hashes_from_head_no_git_repo(mock_discovery: pipeline_mod.Pipe
 
 def test_get_plot_hashes_from_head_returns_committed_hash(
     git_repo: GitRepo,
-    mock_discovery: pipeline_mod.Pipeline,
+    mock_discovery: PipelineLike,
     mocker: MockerFixture,
 ) -> None:
     """Returns hash from lock file committed to HEAD."""
@@ -325,7 +333,7 @@ def test_get_plot_hashes_from_head_returns_committed_hash(
 
 def test_get_plot_hashes_from_head_ignores_uncommitted_changes(
     git_repo: GitRepo,
-    mock_discovery: pipeline_mod.Pipeline,
+    mock_discovery: PipelineLike,
     mocker: MockerFixture,
 ) -> None:
     """Returns committed hash, not uncommitted changes."""
@@ -367,7 +375,7 @@ def test_get_plot_hashes_from_head_ignores_uncommitted_changes(
 
 def test_get_plot_hashes_from_head_no_lock_in_head(
     git_repo: GitRepo,
-    mock_discovery: pipeline_mod.Pipeline,
+    mock_discovery: PipelineLike,
     mocker: MockerFixture,
 ) -> None:
     """Returns None for plots with no lock file in HEAD."""

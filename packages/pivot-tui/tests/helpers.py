@@ -1,5 +1,7 @@
 """Test helpers for registering stages."""
 
+# pyright: reportMissingImports=false
+
 from __future__ import annotations
 
 import inspect
@@ -14,7 +16,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
 
     from pivot import outputs, stage_def
-    from pivot.pipeline import pipeline as pipeline_mod
+    from pivot.registry import PipelineLike
 
 
 async def wait_for_socket(socket_path: pathlib.Path, timeout: float = 5.0) -> None:
@@ -45,10 +47,10 @@ async def wait_for_socket(socket_path: pathlib.Path, timeout: float = 5.0) -> No
 
 # Module-level test pipeline for tests that don't have explicit Pipeline context.
 # This is reset between tests by the clean_test_pipeline fixture in conftest.py.
-_test_pipeline: pipeline_mod.Pipeline | None = None
+_test_pipeline: PipelineLike | None = None
 
 
-def get_test_pipeline() -> pipeline_mod.Pipeline:
+def get_test_pipeline() -> PipelineLike:
     """Get the current test pipeline.
 
     Raises RuntimeError if no test pipeline is set.
@@ -60,7 +62,7 @@ def get_test_pipeline() -> pipeline_mod.Pipeline:
     return _test_pipeline
 
 
-def set_test_pipeline(pipeline: pipeline_mod.Pipeline | None) -> None:
+def set_test_pipeline(pipeline: PipelineLike | None) -> None:
     """Set the module-level test pipeline."""
     global _test_pipeline
     _test_pipeline = pipeline
@@ -75,7 +77,7 @@ def register_test_stage(
     dep_path_overrides: Mapping[str, outputs.PathType] | None = None,
     out_path_overrides: Mapping[str, outputs.PathType] | None = None,
     *,
-    pipeline: pipeline_mod.Pipeline | None = None,
+    pipeline: PipelineLike | None = None,
 ) -> None:
     """Register a stage for testing.
 
@@ -145,8 +147,7 @@ def register_test_stage(
         _ = out_path_overrides
         stage_func(**kwargs)
 
-    built = pipeline_builder.build()
-    target.include(built)
+    target.include(pipeline_builder)
 
 
 def create_pipeline_py(
@@ -235,7 +236,7 @@ def create_pipeline_py(
             lines.append(f"    {func_name}({call})")
 
     lines.append("")
-    lines.append("pipeline = pipeline_builder.build()")
+    lines.append("pipeline = pipeline_builder")
     lines.append("")  # Final newline
 
     pipeline_path.write_text("\n".join(lines))

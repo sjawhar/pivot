@@ -1,3 +1,4 @@
+# pyright: reportMissingImports=false
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -42,6 +43,8 @@ def _create_stage(name: str, deps: list[str], outs: list[str]) -> RegistryStageI
         fingerprint=dict[str, str](),
         params_arg_name=None,
         state_dir=None,
+        collection_params={},
+        no_fingerprint=False,
     )
 
 
@@ -191,6 +194,8 @@ def test_missing_dependency_raises_error(tmp_path: Path) -> None:
             fingerprint=dict[str, str](),
             params_arg_name=None,
             state_dir=None,
+            collection_params={},
+            no_fingerprint=False,
         ),
         "consumer": RegistryStageInfo(
             func=lambda: None,
@@ -204,6 +209,8 @@ def test_missing_dependency_raises_error(tmp_path: Path) -> None:
             fingerprint=dict[str, str](),
             params_arg_name=None,
             state_dir=None,
+            collection_params={},
+            no_fingerprint=False,
         ),
     }
 
@@ -243,6 +250,8 @@ def test_validate_dependency_sources_uses_store() -> None:
             fingerprint=dict[str, str](),
             params_arg_name=None,
             state_dir=None,
+            collection_params={},
+            no_fingerprint=False,
         ),
     }
 
@@ -272,6 +281,8 @@ def test_validate_dependency_sources_no_store_skips_external() -> None:
             fingerprint=dict[str, str](),
             params_arg_name=None,
             state_dir=None,
+            collection_params={},
+            no_fingerprint=False,
         ),
     }
 
@@ -290,6 +301,8 @@ def test_validate_dependency_sources_no_store_skips_external() -> None:
             fingerprint=dict[str, str](),
             params_arg_name=None,
             state_dir=None,
+            collection_params={},
+            no_fingerprint=False,
         ),
         "consumer": RegistryStageInfo(
             func=lambda: None,
@@ -303,6 +316,8 @@ def test_validate_dependency_sources_no_store_skips_external() -> None:
             fingerprint=dict[str, str](),
             params_arg_name=None,
             state_dir=None,
+            collection_params={},
+            no_fingerprint=False,
         ),
     }
 

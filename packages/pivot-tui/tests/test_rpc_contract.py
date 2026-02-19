@@ -26,7 +26,7 @@ from pivot_tui.testing.fake_server import FakeRpcServer
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
-    from pivot.pipeline import pipeline as pipeline_mod
+    from pivot.registry import PipelineLike
 
 
 @compose.stage
@@ -34,11 +34,11 @@ def contract_stage(data: Path) -> Path:
     return data
 
 
-def _build_contract_pipeline(root: Path) -> pipeline_mod.Pipeline:
+def _build_contract_pipeline(root: Path) -> PipelineLike:
     with compose.Pipeline("test", root=root) as pipeline:
         input_handle = pipeline.input("input", path="input.txt", t=Path)
         contract_stage(input_handle)
-    return pipeline.build()
+    return pipeline
 
 
 def _helper_build_request(

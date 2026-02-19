@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import pathlib
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from pivot import config, loaders, project, types
 from pivot.cli import helpers as cli_helpers
@@ -13,8 +13,8 @@ from pivot.storage import lock
 if TYPE_CHECKING:
     import pytest
 
-    from pivot.pipeline.pipeline import Pipeline
-    from pivot.registry import RegistryStageInfo
+    from pivot.compose import Pipeline
+    from pivot.registry import PipelineLike, RegistryStageInfo
 
 
 def _helper_ref(
@@ -49,6 +49,8 @@ def _make_stage_info(
         "fingerprint": None,
         "params_arg_name": None,
         "state_dir": state_dir,
+        "collection_params": {},
+        "no_fingerprint": False,
     }
     return info
 
@@ -71,12 +73,13 @@ def _write_stage_lock(
 
 
 def test_get_stage_lock_hashes_uses_identity_paths(
-    mock_discovery: Pipeline,
+    mock_discovery: PipelineLike,
 ) -> None:
     data_ref = _helper_ref("train", "model", types.ArtifactTag.DATA, loaders.CSV())
     metric_ref = _helper_ref("train", "metrics", types.ArtifactTag.METRIC, loaders.JSON())
     stage_info = _make_stage_info("train", [data_ref, metric_ref])
-    mock_discovery._registry.add_existing(stage_info)  # type: ignore[reportPrivateUsage]
+    pipeline = cast("Pipeline", mock_discovery)
+    pipeline._registry.add_existing(stage_info)  # type: ignore[reportPrivateUsage]
 
     state_dir = config.get_state_dir()
     _write_stage_lock(
@@ -98,7 +101,7 @@ def test_get_stage_lock_hashes_uses_identity_paths(
 
 
 def test_get_stage_lock_hashes_merged_pipeline_paths(
-    mock_discovery: Pipeline,
+    mock_discovery: PipelineLike,
     tmp_path: pathlib.Path,
 ) -> None:
     stage_name = "alpha/train"
@@ -106,7 +109,8 @@ def test_get_stage_lock_hashes_merged_pipeline_paths(
     state_dir = tmp_path / "alpha" / ".pivot"
     state_dir.mkdir(parents=True)
     stage_info = _make_stage_info(stage_name, [data_ref], state_dir=state_dir)
-    mock_discovery._registry.add_existing(stage_info)  # type: ignore[reportPrivateUsage]
+    pipeline = cast("Pipeline", mock_discovery)
+    pipeline._registry.add_existing(stage_info)  # type: ignore[reportPrivateUsage]
 
     _write_stage_lock(
         stage_name,
@@ -137,12 +141,13 @@ def test_normalize_cli_targets_preserves_identity_targets(
 
 
 def test_get_stage_lock_hashes_without_workspace_store(
-    mock_discovery: Pipeline,
+    mock_discovery: PipelineLike,
 ) -> None:
     """When workspace_store is None, falls back to identity_key."""
     data_ref = _helper_ref("train", "model", types.ArtifactTag.DATA, loaders.CSV())
     stage_info = _make_stage_info("train", [data_ref])
-    mock_discovery._registry.add_existing(stage_info)  # type: ignore[reportPrivateUsage]
+    pipeline = cast("Pipeline", mock_discovery)
+    pipeline._registry.add_existing(stage_info)  # type: ignore[reportPrivateUsage]
 
     state_dir = config.get_state_dir()
     _write_stage_lock(
@@ -170,13 +175,14 @@ def test_get_stage_lock_hashes_without_workspace_store(
 
 
 def test_get_stage_lock_hashes_filters_metric_outputs(
-    mock_discovery: Pipeline,
+    mock_discovery: PipelineLike,
 ) -> None:
     """Metric outputs should be excluded from returned hashes."""
     data_ref = _helper_ref("train", "model", types.ArtifactTag.DATA, loaders.CSV())
     metric_ref = _helper_ref("train", "loss", types.ArtifactTag.METRIC, loaders.JSON())
     stage_info = _make_stage_info("train", [data_ref, metric_ref])
-    mock_discovery._registry.add_existing(stage_info)  # type: ignore[reportPrivateUsage]
+    pipeline = cast("Pipeline", mock_discovery)
+    pipeline._registry.add_existing(stage_info)  # type: ignore[reportPrivateUsage]
 
     state_dir = config.get_state_dir()
     _write_stage_lock(

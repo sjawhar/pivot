@@ -37,7 +37,7 @@ from pivot_tui.widgets import status as tui_status
 if TYPE_CHECKING:
     from pytest_mock import MockerFixture
 
-    from pivot.pipeline.pipeline import Pipeline
+    from pivot.registry import PipelineLike
 
 # =============================================================================
 # Output TypedDicts for annotation-based stages
@@ -317,8 +317,8 @@ def test_confirm_commit_screen_instantiation() -> None:
 
 @pytest.fixture
 def simple_run_app(
-    test_pipeline: Pipeline,
-    mock_discovery: Pipeline,
+    test_pipeline: PipelineLike,
+    mock_discovery: PipelineLike,
 ) -> run_tui.PivotApp:
     """Create a simple PivotApp for testing."""
     return run_tui.PivotApp(
@@ -424,8 +424,8 @@ async def test_run_app_quit_action(simple_run_app: run_tui.PivotApp) -> None:
 
 @pytest.mark.asyncio
 async def test_run_app_stages_shown(
-    test_pipeline: Pipeline,
-    mock_discovery: Pipeline,
+    test_pipeline: PipelineLike,
+    mock_discovery: PipelineLike,
 ) -> None:
     """Stage names appear in the app."""
     stage_names = ["alpha", "beta", "gamma"]
@@ -498,8 +498,8 @@ def test_stage_log_panel_init() -> None:
 @pytest.mark.asyncio
 async def test_tui_app_with_tui_log_writes_to_file(
     tmp_path: pathlib.Path,
-    test_pipeline: Pipeline,
-    mock_discovery: Pipeline,
+    test_pipeline: PipelineLike,
+    mock_discovery: PipelineLike,
 ) -> None:
     """PivotApp writes messages to tui_log file when configured."""
     import json
@@ -552,8 +552,8 @@ async def test_tui_app_with_tui_log_writes_to_file(
 @pytest.mark.asyncio
 async def test_tui_app_without_tui_log_no_file_created(
     tmp_path: pathlib.Path,
-    test_pipeline: Pipeline,
-    mock_discovery: Pipeline,
+    test_pipeline: PipelineLike,
+    mock_discovery: PipelineLike,
 ) -> None:
     """PivotApp does not create log file when tui_log is None."""
     log_path = tmp_path / "tui.jsonl"
@@ -577,8 +577,8 @@ async def test_tui_app_without_tui_log_no_file_created(
 
 @pytest.mark.asyncio
 async def test_watch_tui_app_with_serve_flag(
-    test_pipeline: Pipeline,
-    mock_discovery: Pipeline,
+    test_pipeline: PipelineLike,
+    mock_discovery: PipelineLike,
 ) -> None:
     """PivotApp (watch mode) initializes serve mode correctly."""
     app = run_tui.PivotApp(
@@ -599,8 +599,8 @@ async def test_watch_tui_app_with_serve_flag(
 @pytest.mark.asyncio
 async def test_watch_tui_app_with_tui_log(
     tmp_path: pathlib.Path,
-    test_pipeline: Pipeline,
-    mock_discovery: Pipeline,
+    test_pipeline: PipelineLike,
+    mock_discovery: PipelineLike,
 ) -> None:
     """PivotApp (watch mode) writes to tui_log when configured."""
     log_path = tmp_path / "watch_tui.jsonl"

@@ -37,7 +37,7 @@ def hello() -> None:
 with _cp:
     hello()
 
-pipeline = _cp.build()
+pipeline = _cp
 """
     (tmp_path / "pipeline.py").write_text(pipeline_code)
 

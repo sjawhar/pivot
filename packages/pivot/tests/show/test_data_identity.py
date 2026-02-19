@@ -1,9 +1,9 @@
+# pyright: reportMissingImports=false
 from __future__ import annotations
 
 import inspect
 import pathlib
-
-import pytest
+from typing import TYPE_CHECKING
 
 from pivot import git, loaders, project, types
 from pivot.cli import helpers as cli_helpers
@@ -12,6 +12,9 @@ from pivot.show import common as show_common
 from pivot.show import data as data_module
 from pivot.storage import store as store_mod
 from pivot.types import DataFileFormat, StorageLockData
+
+if TYPE_CHECKING:
+    import pytest
 
 
 def _make_artifact_ref(
@@ -44,6 +47,8 @@ def _make_stage_info(name: str, outs: list[types.ArtifactRef]) -> RegistryStageI
         fingerprint={"_code": "fake_hash"},
         params_arg_name=None,
         state_dir=None,
+        collection_params={},
+        no_fingerprint=False,
     )
 
 

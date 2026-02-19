@@ -1,3 +1,4 @@
+# pyright: reportMissingImports=false
 """Unit tests for DAG render functions (ASCII, Mermaid, DOT)."""
 
 from __future__ import annotations
@@ -47,6 +48,8 @@ def _create_stage(
         fingerprint={},
         params_arg_name=None,
         state_dir=None,
+        collection_params={},
+        no_fingerprint=False,
     )
 
 

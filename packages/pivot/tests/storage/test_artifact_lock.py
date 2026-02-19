@@ -20,6 +20,8 @@ class _LockMode(enum.IntEnum):
 class _ArtifactLockModule(Protocol):
     LockMode: type[_LockMode]
 
+    def _lock_key(self, ref: types.ArtifactRef) -> str: ...
+
     def expand_lock_requests(
         self,
         deps: dict[str, types.ArtifactRef],

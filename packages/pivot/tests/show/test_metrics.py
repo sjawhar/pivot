@@ -1,15 +1,17 @@
+# pyright: reportMissingImports=false
 from __future__ import annotations
 
 import inspect
 import json
 import pathlib
+import typing
 from typing import TYPE_CHECKING
 
 import pytest
 import yaml
 
 from pivot import loaders, project
-from pivot.registry import RegistryStageInfo
+from pivot.registry import PipelineLike, RegistryStageInfo
 from pivot.show import metrics
 from pivot.types import ArtifactIdentity, ArtifactRef, ArtifactTag, ChangeType, OutputFormat
 
@@ -18,13 +20,13 @@ if TYPE_CHECKING:
 
     from pytest_mock import MockerFixture
 
-    from pivot.pipeline import pipeline as pipeline_mod
+    from pivot.compose import Pipeline
     from pivot.types import MetricValue
     from tests.conftest import ValidLockContentFactory
 
 
 def _register_metric_stage(
-    test_pipeline: pipeline_mod.Pipeline,
+    test_pipeline: PipelineLike,
     name: str,
     metric_path: str,
 ) -> None:
@@ -42,7 +44,8 @@ def _register_metric_stage(
     if path_obj.is_absolute():
         identity_path = project.to_relative_path(path_obj)
 
-    test_pipeline._registry._stages[name] = RegistryStageInfo(
+    pipeline = typing.cast("Pipeline", test_pipeline)
+    pipeline._registry._stages[name] = RegistryStageInfo(
         func=_stage_func,
         name=name,
         deps={},
@@ -61,6 +64,8 @@ def _register_metric_stage(
         fingerprint={"_code": "fake_hash"},
         params_arg_name=None,
         state_dir=None,
+        collection_params={},
+        no_fingerprint=False,
     )
 
 
@@ -558,7 +563,7 @@ def test_parse_metric_content_invalid_yaml() -> None:
 
 def test_collect_metrics_from_stages_with_metric_output(
     tmp_path: Path,
-    mock_discovery: pipeline_mod.Pipeline,
+    mock_discovery: PipelineLike,
 ) -> None:
     """Collect metrics from stages with Metric outputs."""
     metric_file = tmp_path / "metrics.json"
@@ -575,7 +580,7 @@ def test_collect_metrics_from_stages_with_metric_output(
 
 def test_collect_metrics_from_stages_missing_file(
     tmp_path: Path,
-    mock_discovery: pipeline_mod.Pipeline,
+    mock_discovery: PipelineLike,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Missing metric file logs warning and skips."""
@@ -589,7 +594,7 @@ def test_collect_metrics_from_stages_missing_file(
 
 def test_collect_metrics_from_stages_parse_error(
     tmp_path: Path,
-    mock_discovery: pipeline_mod.Pipeline,
+    mock_discovery: PipelineLike,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Parse error in metric file logs warning and skips."""
@@ -606,7 +611,7 @@ def test_collect_metrics_from_stages_parse_error(
 
 def test_collect_all_stage_metrics_flat(
     tmp_path: Path,
-    mock_discovery: pipeline_mod.Pipeline,
+    mock_discovery: PipelineLike,
 ) -> None:
     """Collect and flatten metrics from all stages."""
     metric_file = tmp_path / "metrics.json"
@@ -625,7 +630,7 @@ def test_collect_all_stage_metrics_flat(
 # =============================================================================
 
 
-def test_get_metric_info_from_head_no_stages(mock_discovery: pipeline_mod.Pipeline) -> None:
+def test_get_metric_info_from_head_no_stages(mock_discovery: PipelineLike) -> None:
     """No registered stages returns empty dict."""
     result = metrics.get_metric_info_from_head()
     assert result == {}
@@ -633,7 +638,7 @@ def test_get_metric_info_from_head_no_stages(mock_discovery: pipeline_mod.Pipeli
 
 def test_get_metric_info_from_head_with_metric_stage(
     tmp_path: Path,
-    mock_discovery: pipeline_mod.Pipeline,
+    mock_discovery: PipelineLike,
     mocker: MockerFixture,
     make_valid_lock_content: ValidLockContentFactory,
 ) -> None:
@@ -670,7 +675,7 @@ def test_get_metric_info_from_head_with_metric_stage(
 
 def test_get_metric_info_from_head_no_lock_file(
     tmp_path: Path,
-    mock_discovery: pipeline_mod.Pipeline,
+    mock_discovery: PipelineLike,
     mocker: MockerFixture,
 ) -> None:
     """Missing lock file returns None hash."""
@@ -690,7 +695,7 @@ def test_get_metric_info_from_head_no_lock_file(
 
 def test_get_metric_info_from_head_invalid_lock_yaml(
     tmp_path: Path,
-    mock_discovery: pipeline_mod.Pipeline,
+    mock_discovery: PipelineLike,
     mocker: MockerFixture,
 ) -> None:
     """Invalid YAML in lock file returns None hash."""
@@ -714,7 +719,7 @@ def test_get_metric_info_from_head_invalid_lock_yaml(
 
 def test_get_metric_info_from_head_lock_missing_outs(
     tmp_path: Path,
-    mock_discovery: pipeline_mod.Pipeline,
+    mock_discovery: PipelineLike,
     mocker: MockerFixture,
 ) -> None:
     """Lock file without 'outs' key returns None hash."""
@@ -739,7 +744,7 @@ def test_get_metric_info_from_head_lock_missing_outs(
 
 def test_get_metric_info_from_head_outs_not_list(
     tmp_path: Path,
-    mock_discovery: pipeline_mod.Pipeline,
+    mock_discovery: PipelineLike,
     mocker: MockerFixture,
 ) -> None:
     """Lock file with non-list 'outs' returns None hash."""

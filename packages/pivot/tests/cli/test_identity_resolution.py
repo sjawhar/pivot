@@ -13,8 +13,7 @@ from pivot.cli import targets as cli_targets
 from pivot.storage import store
 
 if TYPE_CHECKING:
-    from pivot.pipeline.pipeline import Pipeline
-    from pivot.registry import RegistryStageInfo
+    from pivot.registry import PipelineLike, RegistryStageInfo
 
 
 def _helper_ref(
@@ -64,6 +63,8 @@ def _make_stage_info(outs: list[types.ArtifactRef]) -> RegistryStageInfo:
         "fingerprint": None,
         "params_arg_name": None,
         "state_dir": None,
+        "collection_params": {},
+        "no_fingerprint": False,
     }
     return info
 
@@ -187,7 +188,7 @@ def test_workspace_store_resolve_display_path(
 
 
 def test_get_workspace_store_with_pipeline(
-    mock_discovery: Pipeline,
+    mock_discovery: PipelineLike,
 ) -> None:
     """Returns WorkspaceStore when pipeline is in context."""
     ws = cli_helpers.get_workspace_store()
@@ -208,7 +209,7 @@ def test_get_workspace_store_no_pipeline(
 
 
 def test_get_workspace_store_pipeline_name(
-    mock_discovery: Pipeline,
+    mock_discovery: PipelineLike,
 ) -> None:
     """WorkspaceStore resolves paths using the producer name, not pipeline_name."""
     ws = cli_helpers.get_workspace_store()

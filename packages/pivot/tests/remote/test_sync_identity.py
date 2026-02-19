@@ -44,6 +44,8 @@ def _make_stage_info(
         "fingerprint": None,
         "params_arg_name": None,
         "state_dir": state_dir,
+        "collection_params": {},
+        "no_fingerprint": False,
     }
     return info
 

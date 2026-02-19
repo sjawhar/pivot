@@ -277,7 +277,7 @@ def _helper_optional_params_stage(
 @stage
 def _helper_typing_optional_params_stage(
     data: pd.DataFrame,
-    params: typing.Optional[_HelperOptionalParams] = None,  # noqa: UP045 - intentionally testing typing.Union path
+    params: typing.Optional[_HelperOptionalParams] = None,  # noqa: UP045 # pyright: ignore[reportDeprecated] - intentionally testing typing.Union path
 ) -> pd.DataFrame:
     return data
 
@@ -455,15 +455,15 @@ def test_pipeline_build_bridge(tmp_path: pathlib.Path) -> None:
         data = _helper_build_stage_a(params=stage_def.StageParams(), raw=raw)
         _helper_build_stage_b(data)
 
-    legacy = pipeline.build()
+    legacy = pipeline
 
     assert legacy.list_stages() == [
         "compose_build/_helper_build_stage_a",
         "compose_build/_helper_build_stage_b",
     ]
 
-    stage_a = legacy.get("compose_build/_helper_build_stage_a")
-    stage_b = legacy.get("compose_build/_helper_build_stage_b")
+    stage_a = legacy.get_stage("compose_build/_helper_build_stage_a")
+    stage_b = legacy.get_stage("compose_build/_helper_build_stage_b")
 
     assert stage_a["func"] is inspect.unwrap(_helper_build_stage_a)
     assert not hasattr(stage_a["func"], "_is_stage")
@@ -500,8 +500,8 @@ def test_pipeline_build_single_field_typeddict_preserves_key(tmp_path: pathlib.P
     with Pipeline("test_single_td", root=tmp_path) as pipeline:
         _helper_single_field_typeddict()
 
-    legacy = pipeline.build()
-    stage_info = legacy.get("test_single_td/_helper_single_field_typeddict")
+    legacy = pipeline
+    stage_info = legacy.get_stage("test_single_td/_helper_single_field_typeddict")
 
     assert len(stage_info["outs"]) == 1
     out = stage_info["outs"][0]
@@ -516,8 +516,8 @@ def test_pipeline_build_single_field_typeddict_dep_key(tmp_path: pathlib.Path) -
         data = _helper_single_field_typeddict()
         _helper_build_stage_b(data)  # pyright: ignore[reportArgumentType] - compose records deps, not real calls
 
-    legacy = pipeline.build()
-    consumer = legacy.get("test_single_td_dep/_helper_build_stage_b")
+    legacy = pipeline
+    consumer = legacy.get_stage("test_single_td_dep/_helper_build_stage_b")
 
     dep = consumer["deps"]["data"]
     assert dep.identity.key == "result", (
@@ -537,7 +537,7 @@ def test_external_input_produces_bindings(tmp_path: pathlib.Path) -> None:
         def consume(data: list = ext) -> Annotated[list, outputs.Out("out.json", loaders.JSON())]:
             return data
 
-    legacy = pipeline.build()
+    legacy = pipeline
     bindings = legacy.input_bindings
 
     assert "ext_data.jsonl" in bindings
@@ -563,8 +563,8 @@ def test_pipeline_build_artifact_refs_and_tags(tmp_path: pathlib.Path) -> None:
     with Pipeline("compose_tagged", root=tmp_path) as pipeline:
         _helper_build_tagged()
 
-    legacy = pipeline.build()
-    stage_info = legacy.get("compose_tagged/_helper_build_tagged")
+    legacy = pipeline
+    stage_info = legacy.get_stage("compose_tagged/_helper_build_tagged")
 
     outs = stage_info["outs"]
     assert all(isinstance(out, types.ArtifactRef) for out in outs)
@@ -650,10 +650,10 @@ def test_pipeline_variant_artifact_identity(tmp_path: pathlib.Path) -> None:
         data = _helper_produce(params=stage_def.StageParams())
         _helper_consume(data)
 
-    legacy = pipeline.build()
+    legacy = pipeline
 
-    stage_a = legacy.get("test_artifact_id/_helper_produce@gpt4")
-    stage_b = legacy.get("test_artifact_id/_helper_consume@gpt4")
+    stage_a = legacy.get_stage("test_artifact_id/_helper_produce@gpt4")
+    stage_b = legacy.get_stage("test_artifact_id/_helper_consume@gpt4")
 
     assert stage_a["variant"] == "gpt4"
     assert stage_b["variant"] == "gpt4"
@@ -687,25 +687,49 @@ def test_pipeline_variant_mixed_with_non_variant(tmp_path: pathlib.Path) -> None
     assert pipeline._stages[2].variant is None
 
 
+def test_pipeline_variant_separate_counts_per_variant(tmp_path: pathlib.Path) -> None:
+    with Pipeline("test_separate", root=tmp_path) as pipeline:
+        with pipeline.variant("current"):
+            _helper_repeat(params=stage_def.StageParams())
+        with pipeline.variant("legacy"):
+            _helper_repeat(params=stage_def.StageParams())
+
+    assert pipeline._stages[0].name == "_helper_repeat@current"
+    assert pipeline._stages[1].name == "_helper_repeat@legacy"
+    assert pipeline._stages[0].variant == "current"
+    assert pipeline._stages[1].variant == "legacy"
+
+
+def test_pipeline_variant_counts_still_increment_within_same_variant(
+    tmp_path: pathlib.Path,
+) -> None:
+    with Pipeline("test_within", root=tmp_path) as pipeline:
+        with pipeline.variant("v1"):
+            _helper_repeat(params=stage_def.StageParams())
+            _helper_repeat(params=stage_def.StageParams())
+        with pipeline.variant("v2"):
+            _helper_repeat(params=stage_def.StageParams())
+
+    assert pipeline._stages[0].name == "_helper_repeat@v1"
+    assert pipeline._stages[1].name == "_helper_repeat@1@v1"
+    assert pipeline._stages[2].name == "_helper_repeat@v2"
+
+
 # --- Bug 2: Optional[StageParams] params detection ---
 
 
 def test_build_rejects_stage_params_in_pipe_union(tmp_path: pathlib.Path) -> None:
-    with Pipeline("test", root=tmp_path) as pipeline:
-        raw = pipeline.input("raw", path="data/raw.csv", t=pd.DataFrame)
-        _helper_optional_params_stage(data=raw, params=_HelperOptionalParams(x=2))
-
-    with pytest.raises(TypeError, match="StageParams must not be in a union"):
-        pipeline.build()
+    with pytest.raises(TypeError, match="StageParams must not be in a union"):  # noqa: SIM117
+        with Pipeline("test", root=tmp_path) as pipeline:
+            raw = pipeline.input("raw", path="data/raw.csv", t=pd.DataFrame)
+            _helper_optional_params_stage(data=raw, params=_HelperOptionalParams(x=2))
 
 
 def test_build_rejects_stage_params_in_typing_optional(tmp_path: pathlib.Path) -> None:
-    with Pipeline("test", root=tmp_path) as pipeline:
-        raw = pipeline.input("raw", path="data/raw.csv", t=pd.DataFrame)
-        _helper_typing_optional_params_stage(data=raw, params=_HelperOptionalParams(x=3))
-
-    with pytest.raises(TypeError, match="StageParams must not be in a union"):
-        pipeline.build()
+    with pytest.raises(TypeError, match="StageParams must not be in a union"):  # noqa: SIM117
+        with Pipeline("test", root=tmp_path) as pipeline:
+            raw = pipeline.input("raw", path="data/raw.csv", t=pd.DataFrame)
+            _helper_typing_optional_params_stage(data=raw, params=_HelperOptionalParams(x=3))
 
 
 # --- Bug 3: list[ArtifactHandle] support ---
@@ -764,8 +788,8 @@ def test_build_expands_list_deps(tmp_path: pathlib.Path) -> None:
         inp = pipeline.input("data.csv", path="data/raw/data.csv", t=pd.DataFrame)
         _helper_consume_list(main_data=inp, extra_data=[inp, inp, inp])
 
-    legacy = pipeline.build()
-    stage_info = legacy.get("test_list/_helper_consume_list")
+    legacy = pipeline
+    stage_info = legacy.get_stage("test_list/_helper_consume_list")
 
     assert "main_data" in stage_info["deps"]
     assert "extra_data[0]" in stage_info["deps"]
@@ -784,8 +808,8 @@ def test_build_list_deps_from_multiple_stages(tmp_path: pathlib.Path) -> None:
         b = _helper_produce(params=stage_def.StageParams())
         _helper_consume_list_from_stages(data_files=[a, b])
 
-    legacy = pipeline.build()
-    consumer = legacy.get("test_multi_list/_helper_consume_list_from_stages")
+    legacy = pipeline
+    consumer = legacy.get_stage("test_multi_list/_helper_consume_list_from_stages")
 
     assert "data_files[0]" in consumer["deps"]
     assert "data_files[1]" in consumer["deps"]
@@ -801,10 +825,11 @@ def test_build_list_deps_dag_has_correct_edges(tmp_path: pathlib.Path) -> None:
         b = _helper_produce(params=stage_def.StageParams())
         _helper_consume_list_from_stages(data_files=[a, b])
 
-    legacy = pipeline.build()
+    legacy = pipeline
 
     from pivot.engine import graph
 
+    legacy.list_stages()
     bipartite = graph.build_graph(legacy._registry._stages)
     upstream = graph.get_upstream_stages(
         bipartite, "test_dag_list/_helper_consume_list_from_stages"
@@ -882,8 +907,8 @@ def test_build_collection_params_populated(tmp_path: pathlib.Path) -> None:
         inp = pipeline.input("data.csv", path="data/raw/data.csv", t=pd.DataFrame)
         _helper_consume_list(main_data=inp, extra_data=[inp, inp])
 
-    legacy = pipeline.build()
-    stage_info = legacy.get("test/_helper_consume_list")
+    legacy = pipeline
+    stage_info = legacy.get_stage("test/_helper_consume_list")
     assert stage_info["collection_params"] == {"extra_data": "list"}
 
 
@@ -892,8 +917,8 @@ def test_build_empty_list_no_deps_but_collection_params(tmp_path: pathlib.Path) 
         inp = pipeline.input("data.csv", path="data/raw/data.csv", t=pd.DataFrame)
         _helper_consume_list(main_data=inp, extra_data=[])
 
-    legacy = pipeline.build()
-    stage_info = legacy.get("test/_helper_consume_list")
+    legacy = pipeline
+    stage_info = legacy.get_stage("test/_helper_consume_list")
 
     assert "extra_data[0]" not in stage_info["deps"]
     assert stage_info["collection_params"] == {"extra_data": "list"}
@@ -904,8 +929,8 @@ def test_build_single_element_list(tmp_path: pathlib.Path) -> None:
         inp = pipeline.input("data.csv", path="data/raw/data.csv", t=pd.DataFrame)
         _helper_consume_list(main_data=inp, extra_data=[inp])
 
-    legacy = pipeline.build()
-    stage_info = legacy.get("test/_helper_consume_list")
+    legacy = pipeline
+    stage_info = legacy.get_stage("test/_helper_consume_list")
     assert "extra_data[0]" in stage_info["deps"]
     assert "extra_data[1]" not in stage_info["deps"]
 
@@ -929,8 +954,8 @@ def test_build_multi_output_dep_key(tmp_path: pathlib.Path) -> None:
         tagged = _helper_build_tagged()
         _helper_consume_multi_output_dep(data=tagged.data)
 
-    legacy = pipeline.build()
-    consumer = legacy.get("test/_helper_consume_multi_output_dep")
+    legacy = pipeline
+    consumer = legacy.get_stage("test/_helper_consume_multi_output_dep")
     ref = consumer["deps"]["data"]
     assert ref.identity.producer == "test/_helper_build_tagged"
     assert ref.identity.key == "data"
@@ -941,20 +966,18 @@ def test_build_multi_output_sub_handles_in_list(tmp_path: pathlib.Path) -> None:
         tagged = _helper_build_tagged()
         _helper_consume_list_from_stages(data_files=[tagged.data, tagged.data])
 
-    legacy = pipeline.build()
-    consumer = legacy.get("test/_helper_consume_list_from_stages")
+    legacy = pipeline
+    consumer = legacy.get_stage("test/_helper_consume_list_from_stages")
     ref_0 = consumer["deps"]["data_files[0]"]
     assert ref_0.identity.producer == "test/_helper_build_tagged"
     assert ref_0.identity.key == "data"
 
 
 def test_build_rejects_unsubscripted_multi_output_handle(tmp_path: pathlib.Path) -> None:
-    with Pipeline("test", root=tmp_path) as pipeline:
-        tagged = _helper_build_tagged()
-        _helper_consume_multi_output_dep(data=tagged)  # pyright: ignore[reportArgumentType] - intentional
-
-    with pytest.raises(TypeError, match="without selecting an output"):
-        pipeline.build()
+    with pytest.raises(TypeError, match="without selecting an output"):  # noqa: SIM117
+        with Pipeline("test", root=tmp_path):
+            tagged = _helper_build_tagged()
+            _helper_consume_multi_output_dep(data=tagged)  # pyright: ignore[reportArgumentType] - intentional
 
 
 # --- collection_params empty for non-list stages ---
@@ -965,8 +988,8 @@ def test_build_collection_params_empty_for_non_list_stage(tmp_path: pathlib.Path
         a = _helper_produce(params=stage_def.StageParams())
         _helper_consume(data=a)
 
-    legacy = pipeline.build()
-    assert legacy.get("test/_helper_consume")["collection_params"] == {}
+    legacy = pipeline
+    assert legacy.get_stage("test/_helper_consume")["collection_params"] == {}
 
 
 # --- Unrecognized argument detection ---
@@ -983,7 +1006,7 @@ def test_record_stage_rejects_explicit_unsupported_arg(tmp_path: pathlib.Path) -
         Pipeline("test", root=tmp_path) as pipeline,
     ):
         inp = pipeline.input("data.csv", path="data/raw/data.csv", t=pd.DataFrame)
-        _helper_with_plain_arg(data=inp, verbose=True)  # pyright: ignore[reportArgumentType]
+        _helper_with_plain_arg(data=inp, verbose=True)
 
 
 def test_record_stage_ignores_default_unsupported_arg(tmp_path: pathlib.Path) -> None:
@@ -991,7 +1014,7 @@ def test_record_stage_ignores_default_unsupported_arg(tmp_path: pathlib.Path) ->
         inp = pipeline.input("data.csv", path="data/raw/data.csv", t=pd.DataFrame)
         _helper_with_plain_arg(data=inp)
 
-    pipeline.build()
+    pipeline.list_stages()
 
 
 # --- Output format fingerprint detection ---
@@ -1054,6 +1077,7 @@ def _make_stage_info(
         params_arg_name=None,
         state_dir=None,
         collection_params={},
+        no_fingerprint=False,
     )
 
 
@@ -1200,15 +1224,10 @@ def test_cross_pipeline_handle_accepted(tmp_path: pathlib.Path) -> None:
     assert p2._stages[0].input_handles["data"]._pipeline is p1
 
 
-# --- build() validation without context manager ---
-
-
-def test_build_without_context_manager_validates(tmp_path: pathlib.Path) -> None:
-    """build() runs validation even without context manager."""
+def test_engine_methods_raise_during_construction(tmp_path: pathlib.Path) -> None:
     p = Pipeline("test", root=tmp_path)
-    p._validation_errors.append("test error for validation")
-    with pytest.raises(ValueError, match="test error for validation"):
-        p.build()
+    with p, pytest.raises(RuntimeError, match="still under construction"):
+        p.list_stages()
 
 
 # --- Required/NotRequired unwrapping ---
@@ -1237,7 +1256,7 @@ def test_build_prefixes_stage_names_with_pipeline_name(tmp_path: pathlib.Path) -
     with Pipeline("my_pipeline", root=tmp_path) as pipeline:
         _helper_produce(params=stage_def.StageParams())
 
-    legacy = pipeline.build()
+    legacy = pipeline
     assert "my_pipeline/_helper_produce" in legacy.list_stages()
     assert "_helper_produce" not in legacy.list_stages()
 
@@ -1247,7 +1266,7 @@ def test_build_does_not_mutate_stage_node_names(tmp_path: pathlib.Path) -> None:
         _helper_produce(params=stage_def.StageParams())
 
     assert pipeline._stages[0].name == "_helper_produce"
-    pipeline.build()
+    pipeline.list_stages()
     assert pipeline._stages[0].name == "_helper_produce"
 
 
@@ -1255,8 +1274,8 @@ def test_build_prefixes_output_identity_producer(tmp_path: pathlib.Path) -> None
     with Pipeline("my_pipeline", root=tmp_path) as pipeline:
         _helper_produce(params=stage_def.StageParams())
 
-    legacy = pipeline.build()
-    info = legacy.get("my_pipeline/_helper_produce")
+    legacy = pipeline
+    info = legacy.get_stage("my_pipeline/_helper_produce")
     for out in info["outs"]:
         assert out.identity.producer == "my_pipeline/_helper_produce"
 
@@ -1264,7 +1283,10 @@ def test_build_prefixes_output_identity_producer(tmp_path: pathlib.Path) -> None
 def test_handle_to_artifact_ref_qualifies_producer_name(tmp_path: pathlib.Path) -> None:
     p1 = Pipeline("base", root=tmp_path)
     with p1:
-        result = _helper_produce(params=stage_def.StageParams())
+        result = typing.cast(
+            "ArtifactHandle",
+            typing.cast("object", _helper_produce(params=stage_def.StageParams())),
+        )
 
     ref = _handle_to_artifact_ref(result, "horizon/consumer")
     assert ref.identity.producer == "base/_helper_produce"
@@ -1275,8 +1297,8 @@ def test_build_prefixes_dep_identity_producer(tmp_path: pathlib.Path) -> None:
         result = _helper_produce(params=stage_def.StageParams())
         _helper_consume(data=result)
 
-    legacy = pipeline.build()
-    consumer = legacy.get("my_pipeline/_helper_consume")
+    legacy = pipeline
+    consumer = legacy.get_stage("my_pipeline/_helper_consume")
     dep = consumer["deps"]["data"]
     assert dep.identity.producer == "my_pipeline/_helper_produce"
 
@@ -1290,8 +1312,8 @@ def test_cross_pipeline_dep_identity_qualified(tmp_path: pathlib.Path) -> None:
     with p2:
         _helper_consume(data=result)
 
-    legacy = p2.build()
-    consumer = legacy.get("horizon/_helper_consume")
+    legacy = p2
+    consumer = legacy.get_stage("horizon/_helper_consume")
     dep = consumer["deps"]["data"]
     assert dep.identity.producer == "base/_helper_produce"
 
@@ -1301,8 +1323,8 @@ def test_build_does_not_prefix_input_identity(tmp_path: pathlib.Path) -> None:
         inp = pipeline.input("data.csv", path="data/raw/data.csv", t=pd.DataFrame)
         _helper_consume(data=inp)
 
-    legacy = pipeline.build()
-    consumer = legacy.get("my_pipeline/_helper_consume")
+    legacy = pipeline
+    consumer = legacy.get_stage("my_pipeline/_helper_consume")
     dep = consumer["deps"]["data"]
     assert dep.identity.producer == "data.csv"  # NOT "my_pipeline/data.csv"
 
@@ -1316,19 +1338,10 @@ def test_cross_pipeline_input_identity_not_qualified(tmp_path: pathlib.Path) -> 
     with p2:
         _helper_consume(data=data)
 
-    legacy = p2.build()
-    consumer = legacy.get("horizon/_helper_consume")
+    legacy = p2
+    consumer = legacy.get_stage("horizon/_helper_consume")
     dep = consumer["deps"]["data"]
     assert dep.identity.producer == "scores"
-
-
-def test_build_double_call_raises(tmp_path: pathlib.Path) -> None:
-    with Pipeline("my_pipeline", root=tmp_path) as pipeline:
-        _helper_produce(params=stage_def.StageParams())
-
-    pipeline.build()
-    with pytest.raises(RuntimeError, match="already built"):
-        pipeline.build()
 
 
 # --- @no_fingerprint decorator stacking ---
@@ -1345,9 +1358,9 @@ def test_no_fingerprint_outside_stage_decorator(set_project_root: pathlib.Path) 
     p = Pipeline("test", root=set_project_root)
     with p:
         my_stage()
-    built = p.build()
+    built = p
 
-    fp = built._registry.ensure_fingerprint("test/my_stage")
+    fp = built.ensure_fingerprint("test/my_stage")
     assert any(k.startswith("file:") for k in fp), (
         f"Expected file-hash fingerprint when @no_fingerprint is applied, got keys: {list(fp.keys())}"
     )
@@ -1368,7 +1381,7 @@ def test_build_includes_only_foreign_closure(tmp_path: pathlib.Path) -> None:
     with consumer:
         _helper_consume_dict(b)
 
-    legacy = consumer.build()
+    legacy = consumer
     names = set(legacy.list_stages())
     assert "consumer/_helper_consume_dict" in names
     assert "base/_helper_base_b" in names
@@ -1387,7 +1400,8 @@ def test_cross_pipeline_input_bindings_propagated(tmp_path: pathlib.Path) -> Non
     p2 = Pipeline("horizon", root=tmp_path)
     with p2:
         _helper_consume_dict(result)
-    legacy = p2.build()
+    legacy = p2
+    legacy.list_stages()
     assert "external_data" in legacy.input_bindings
     assert legacy.input_bindings["external_data"] == "data/external/scores.csv"
 
@@ -1401,7 +1415,8 @@ def test_cross_pipeline_input_binding_same_path_ok(tmp_path: pathlib.Path) -> No
     with p2:
         _ = p2.input("raw", path="data/raw/shared.csv", t=pd.DataFrame)
         _helper_consume_dict(result)
-    legacy = p2.build()
+    legacy = p2
+    legacy.list_stages()
     assert legacy.input_bindings["raw"] == "data/raw/shared.csv"
 
 
@@ -1410,12 +1425,10 @@ def test_cross_pipeline_input_binding_conflict_raises(tmp_path: pathlib.Path) ->
     with p1:
         data1 = p1.input("raw", path="data/raw/base.csv", t=pd.DataFrame)
         result = _helper_consume(data=data1)
-    p2 = Pipeline("consumer", root=tmp_path)
-    with p2:
-        _ = p2.input("raw", path="data/raw/consumer.csv", t=pd.DataFrame)
-        _helper_consume_dict(result)
-    with pytest.raises(ValueError, match="Input binding conflict.*raw"):
-        p2.build()
+    with pytest.raises(ValueError, match="Input binding conflict.*raw"):  # noqa: SIM117
+        with Pipeline("consumer", root=tmp_path) as p2:
+            _ = p2.input("raw", path="data/raw/consumer.csv", t=pd.DataFrame)
+            _helper_consume_dict(result)
 
 
 # --- Edge-case tests for cross-pipeline composition ---
@@ -1435,7 +1448,7 @@ def test_cross_pipeline_transitive_three_pipelines(tmp_path: pathlib.Path) -> No
     with p_c:
         _helper_consume_dict(b_out)
 
-    legacy = p_c.build()
+    legacy = p_c
     stage_names = legacy.list_stages()
     assert "a/_helper_produce" in stage_names
     assert "b/_helper_consume" in stage_names
@@ -1453,11 +1466,11 @@ def test_cross_pipeline_list_handles(tmp_path: pathlib.Path) -> None:
         local_input = p2.input("local", path="data/raw/local.csv", t=pd.DataFrame)
         _helper_consume_list(main_data=local_input, extra_data=[a, a])
 
-    legacy = p2.build()
+    legacy = p2
     assert "base/_helper_produce" in legacy.list_stages()
     assert "consumer/_helper_consume_list" in legacy.list_stages()
 
-    consumer_info = legacy.get("consumer/_helper_consume_list")
+    consumer_info = legacy.get_stage("consumer/_helper_consume_list")
     assert consumer_info["deps"]["extra_data[0]"].identity.producer == "base/_helper_produce"
 
 
@@ -1476,9 +1489,9 @@ def test_cross_pipeline_foreign_stage_uses_own_state_dir(tmp_path: pathlib.Path)
     with p2:
         _helper_consume(data=result)
 
-    legacy = p2.build()
-    base_stage = legacy.get("base/_helper_produce")
-    horizon_stage = legacy.get("horizon/_helper_consume")
+    legacy = p2
+    base_stage = legacy.get_stage("base/_helper_produce")
+    horizon_stage = legacy.get_stage("horizon/_helper_consume")
     assert base_stage["state_dir"] == base_root / ".pivot"
     assert horizon_stage["state_dir"] == horizon_root / ".pivot"
 
@@ -1497,7 +1510,7 @@ def test_pipeline_level_cycle_is_valid_chain(tmp_path: pathlib.Path) -> None:
     with p_a:
         _helper_consume_dict(b_out)
 
-    legacy = p_a.build()
+    legacy = p_a
     stage_names = legacy.list_stages()
     assert "alpha/_helper_produce" in stage_names
     assert "beta/_helper_consume" in stage_names
@@ -1506,8 +1519,6 @@ def test_pipeline_level_cycle_is_valid_chain(tmp_path: pathlib.Path) -> None:
 
 def test_cross_pipeline_all_discovery_deduplicates(tmp_path: pathlib.Path) -> None:
     """Simulates --all discovery: cross-pipeline closure + independent builds don't collide."""
-    from pivot.pipeline import pipeline as pipeline_mod
-
     p_difficulty = Pipeline("difficulty", root=tmp_path)
     with p_difficulty:
         patched = _helper_produce(params=stage_def.StageParams())
@@ -1516,13 +1527,13 @@ def test_cross_pipeline_all_discovery_deduplicates(tmp_path: pathlib.Path) -> No
     with p_base:
         _helper_consume(data=patched)
 
-    base_legacy = p_base.build()
-    difficulty_legacy = p_difficulty.build()
+    base_legacy = p_base
+    difficulty_legacy = p_difficulty
 
     assert "difficulty/_helper_produce" in base_legacy.list_stages()
     assert "difficulty/_helper_produce" in difficulty_legacy.list_stages()
 
-    combined = pipeline_mod.Pipeline("all", root=tmp_path)
+    combined = Pipeline("all", root=tmp_path)
     combined.include(base_legacy)
     combined.include(difficulty_legacy)
 

@@ -19,14 +19,22 @@ import pytest
 
 from pivot import project
 from pivot.cli import console
+from pivot.compose import Pipeline
 from pivot.config import io as config_io
 from pivot.executor import core as executor_core
-from pivot.pipeline import pipeline as pipeline_mod
-from pivot.registry import StageRegistry
+from pivot.registry import PipelineLike, StageRegistry
 
 _tests_dir = pathlib.Path(__file__).parent
 if str(_tests_dir) not in sys.path:
     sys.path.insert(0, str(_tests_dir))
+_tests_root = _tests_dir.parent
+if str(_tests_root) not in sys.path:
+    sys.path.insert(0, str(_tests_root))
+pythonpath = os.environ.get("PYTHONPATH")
+if pythonpath:
+    os.environ["PYTHONPATH"] = os.pathsep.join([str(_tests_root), pythonpath])
+else:
+    os.environ["PYTHONPATH"] = str(_tests_root)
 
 
 if TYPE_CHECKING:
@@ -101,7 +109,7 @@ def sample_data_file(tmp_pipeline_dir: pathlib.Path) -> pathlib.Path:
 
 
 @pytest.fixture
-def test_pipeline(tmp_path: pathlib.Path) -> Generator[pipeline_mod.Pipeline]:
+def test_pipeline(tmp_path: pathlib.Path) -> Generator[PipelineLike]:
     """Provide a fresh Pipeline for tests.
 
     Note: This fixture does NOT mock the project root. Tests that register
@@ -109,16 +117,16 @@ def test_pipeline(tmp_path: pathlib.Path) -> Generator[pipeline_mod.Pipeline]:
     1. Use mock_discovery fixture (which mocks project root)
     2. Or explicitly mock project._project_root_cache themselves
     """
-    pipeline = pipeline_mod.Pipeline("test", root=tmp_path)
+    pipeline = Pipeline("test", root=tmp_path)
     yield pipeline
 
 
 @pytest.fixture
 def mock_discovery(
-    test_pipeline: pipeline_mod.Pipeline,
+    test_pipeline: PipelineLike,
     mocker: MockerFixture,
     monkeypatch: pytest.MonkeyPatch,
-) -> pipeline_mod.Pipeline:
+) -> PipelineLike:
     """Mock discover_pipeline to return the test_pipeline.
 
     Use this fixture for CLI tests that need stages to be discovered
@@ -436,7 +444,7 @@ def output_queue() -> Generator[mp.Queue[OutputMessage]]:
 
 
 @pytest.fixture
-async def test_engine(test_pipeline: pipeline_mod.Pipeline) -> AsyncGenerator[Engine]:
+async def test_engine(test_pipeline: PipelineLike) -> AsyncGenerator[Engine]:
     """Provide a context-managed Engine instance.
 
     The engine is properly closed after each test to ensure sinks are cleaned up.
@@ -509,8 +517,8 @@ class AsyncEventCaptureSink:
 
 @pytest.fixture
 def minimal_pipeline(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, test_pipeline: pipeline_mod.Pipeline
-) -> pipeline_mod.Pipeline:
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, test_pipeline: PipelineLike
+) -> PipelineLike:
     """Set up a minimal pipeline for testing."""
     from pivot import config
 
