@@ -334,6 +334,10 @@ class ProjectNotInitializedError(InitError):
         return "Run 'pivot init' in your project root to initialize Pivot"
 
 
+class PipelineConfigError(PivotError):
+    """Raised when pipeline configuration is invalid."""
+
+
 class PipelineNotFoundError(PivotError):
     """Raised when no pipeline is found (no pipeline.py)."""
 

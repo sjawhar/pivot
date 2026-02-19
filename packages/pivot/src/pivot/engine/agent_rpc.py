@@ -1,3 +1,4 @@
+# pyright: reportImportCycles=false, reportMissingImports=false, reportImplicitRelativeImport=false
 from __future__ import annotations
 
 import contextlib
@@ -249,7 +250,7 @@ class AgentRpcHandler:
         if pipeline is None:
             raise ValueError("No pipeline loaded")
         try:
-            reg_info = pipeline.get(stage)
+            reg_info = pipeline.get_stage(stage)
         except KeyError:
             raise ValueError(f"Unknown stage: {stage}") from None
         return stage, reg_info
@@ -288,7 +289,7 @@ class AgentRpcHandler:
                 pipeline = self._engine._pipeline  # pyright: ignore[reportPrivateUsage]
                 if pipeline is None:
                     raise ValueError("No pipeline loaded")
-                fingerprint = pipeline._registry.ensure_fingerprint(stage)  # pyright: ignore[reportPrivateUsage]
+                fingerprint = pipeline.ensure_fingerprint(stage)
 
                 def _get_explanation() -> StageExplanation:
                     try:

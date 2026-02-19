@@ -878,8 +878,6 @@ def _reconstruct_list_kwargs(
     kwargs: dict[str, Any],
     collection_params: dict[str, str],
 ) -> dict[str, Any]:
-    # Reverse the ``param[N]`` expansion from compose.Pipeline.build()
-    # back into ``param = [val0, val1, …]``.
     lists = dict[str, list[tuple[int, Any]]]()
     result = dict[str, Any]()
     for name, value in kwargs.items():

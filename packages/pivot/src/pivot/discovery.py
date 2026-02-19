@@ -1,16 +1,13 @@
+# pyright: reportImplicitRelativeImport=false
 from __future__ import annotations
 
 import logging
 import pathlib
 import runpy
-from typing import TYPE_CHECKING, Final
+from typing import Final, cast
 
 from pivot import fingerprint, metrics, project, types
-
-if TYPE_CHECKING:
-    from collections.abc import Iterator
-
-    from pivot.pipeline.pipeline import Pipeline
+from pivot.registry import PipelineLike
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +34,7 @@ def discover_pipeline(
     project_root: pathlib.Path | None = None,
     *,
     all_pipelines: bool = False,
-) -> Pipeline | None:
+) -> PipelineLike | None:
     """Discover and return Pipeline from pipeline.py.
 
     Looks for pipeline config in this order:
@@ -107,7 +104,7 @@ def discover_pipeline(
         metrics.end("discovery.total", _t)
 
 
-def _load_pipeline_from_module(path: pathlib.Path) -> Pipeline | None:
+def _load_pipeline_from_module(path: pathlib.Path) -> PipelineLike | None:
     """Load Pipeline instance from a pipeline.py file.
 
     Returns None if the file doesn't define a 'pipeline' variable.
@@ -115,23 +112,30 @@ def _load_pipeline_from_module(path: pathlib.Path) -> Pipeline | None:
     - 'pipeline' variable exists but isn't a Pipeline instance
     - A Pipeline instance exists under a different variable name (likely typo)
     """
-    from pivot.pipeline.pipeline import Pipeline
-
-    module_dict = runpy.run_path(str(path), run_name="_pivot_pipeline")
+    module_dict = cast("dict[str, object]", runpy.run_path(str(path), run_name="_pivot_pipeline"))
 
     # Look for 'pipeline' variable
     pipeline_obj = module_dict.get("pipeline")
     if pipeline_obj is not None:
-        if not isinstance(pipeline_obj, Pipeline):
+        if not isinstance(pipeline_obj, PipelineLike):
+            from typing import get_protocol_members
+
+            required = sorted(get_protocol_members(PipelineLike))
+            missing = [attr for attr in required if not hasattr(pipeline_obj, attr)]
+            if missing:
+                raise DiscoveryError(
+                    f"{path} defines 'pipeline' but it's missing required methods: {missing}"
+                )
             raise DiscoveryError(
-                f"{path} defines 'pipeline' but it's not a Pipeline instance (got {type(pipeline_obj).__name__})"
+                f"{path} defines 'pipeline' but it doesn't satisfy the Pipeline interface "
+                f"(got {type(pipeline_obj).__name__})"
             )
         return pipeline_obj
 
     # No 'pipeline' variable - check if there's a Pipeline under a different name
     # This catches cases where user creates a Pipeline but forgets to name it 'pipeline'
     for name, value in module_dict.items():
-        if isinstance(value, Pipeline):
+        if isinstance(value, PipelineLike):
             raise DiscoveryError(
                 f"{path} does not define a 'pipeline' variable. Found Pipeline instance named '{name}' - rename it to 'pipeline'."
             )
@@ -140,18 +144,18 @@ def _load_pipeline_from_module(path: pathlib.Path) -> Pipeline | None:
     return None
 
 
-def _discover_all_pipelines(root: pathlib.Path) -> Pipeline | None:
+def _discover_all_pipelines(root: pathlib.Path) -> PipelineLike | None:
     """Discover all pipelines and combine into one.
 
     Globs all pipeline config files, loads each, and merges via include().
     """
-    from pivot.pipeline.pipeline import Pipeline
+    from pivot.compose import Pipeline
 
     config_paths = glob_all_pipelines(root)
     if not config_paths:
         return None
 
-    pipelines = list[Pipeline]()
+    pipelines = list[PipelineLike]()
     for path in config_paths:
         pipeline = load_pipeline_from_path(path)
         if pipeline is not None:
@@ -171,7 +175,7 @@ def _discover_all_pipelines(root: pathlib.Path) -> Pipeline | None:
         local_outputs = set[str]()
         all_deps = set[str]()
         for stage_name in combined.list_stages():
-            info = combined.get(stage_name)
+            info = combined.get_stage(stage_name)
             local_outputs.update(types.identity_key(out.identity) for out in info["outs"])
             all_deps.update(types.identity_key(dep.identity) for dep in info["deps"].values())
         unresolved = all_deps - local_outputs
@@ -182,87 +186,10 @@ def _discover_all_pipelines(root: pathlib.Path) -> Pipeline | None:
                 f"--all: dependency path(s) not produced by any discovered pipeline: {sample}{suffix}"
             )
 
-    # All pipelines are already merged — no external deps to resolve between them.
-    # Mark resolved to skip the redundant (and expensive) re-discovery in
-    # resolve_external_dependencies(), which would re-load every pipeline.py.
-    combined._external_deps_resolved = True  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
-
     logger.info(
         f"Discovered {len(pipelines)} pipelines with {len(combined.list_stages())} total stages"
     )
     return combined
-
-
-def find_parent_pipeline_paths(
-    start_dir: pathlib.Path,
-    stop_at: pathlib.Path,
-) -> Iterator[pathlib.Path]:
-    """Find pipeline config files in parent directories.
-
-    Traverses up from start_dir (exclusive) to stop_at (inclusive),
-    yielding each pipeline.py found. Closest parents first.
-
-    Args:
-        start_dir: Directory to start from (its config is NOT included).
-        stop_at: Stop traversal at this directory (inclusive).
-
-    Yields:
-        Paths to pipeline.py files.
-    """
-    try:
-        current = start_dir.resolve().parent
-        stop_at_resolved = stop_at.resolve()
-    except OSError as e:
-        raise DiscoveryError(f"Failed to resolve paths: {e}") from e
-
-    while current.is_relative_to(stop_at_resolved):
-        config_path = find_config_in_dir(current)
-        if config_path:
-            yield config_path
-
-        if current == stop_at_resolved or current.parent == current:
-            break
-        current = current.parent
-
-
-def find_pipeline_paths_for_dependency(
-    dep_path: pathlib.Path,
-    stop_at: pathlib.Path,
-) -> Iterator[pathlib.Path]:
-    """Find pipeline config files starting from a dependency's directory.
-
-    Starts from the directory containing the dependency and traverses up to
-    stop_at, yielding each pipeline.py found. Closest directories first. Unlike
-    find_parent_pipeline_paths (which excludes start_dir), this function INCLUDES
-    the dependency's containing directory in the search.
-
-    This enables resolution of sibling pipeline dependencies - if a dependency
-    is in ../sibling_b/data/file.csv, we search sibling_b/ for a pipeline that
-    produces it.
-
-    Args:
-        dep_path: Path to the dependency (file or directory).
-        stop_at: Stop traversal at this directory (inclusive).
-
-    Yields:
-        Paths to pipeline.py files.
-    """
-    try:
-        # Start from dependency's parent directory (the directory containing the dep)
-        current = dep_path.resolve().parent
-        stop_at_resolved = stop_at.resolve()
-    except OSError as e:
-        raise DiscoveryError(f"Failed to resolve paths: {e}") from e
-
-    # Traverse up to project root
-    while current.is_relative_to(stop_at_resolved):
-        config_path = find_config_in_dir(current)
-        if config_path:
-            yield config_path
-
-        if current == stop_at_resolved or current.parent == current:
-            break
-        current = current.parent
 
 
 # Directories excluded from all-pipelines scan
@@ -320,7 +247,7 @@ def glob_all_pipelines(project_root: pathlib.Path) -> list[pathlib.Path]:
     return results
 
 
-def load_pipeline_from_path(path: pathlib.Path) -> Pipeline | None:
+def load_pipeline_from_path(path: pathlib.Path) -> PipelineLike | None:
     """Load a Pipeline from a pipeline.py file.
 
     Args:

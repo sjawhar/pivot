@@ -1,3 +1,4 @@
+# pyright: reportImplicitRelativeImport=false
 from __future__ import annotations
 
 import logging
@@ -102,10 +103,10 @@ def complete_stages(
 
 
 if TYPE_CHECKING:
-    from pivot.pipeline.pipeline import Pipeline
+    from pivot.registry import PipelineLike
 
 
-def _get_pipeline_for_targets() -> Pipeline | None:
+def _get_pipeline_for_targets() -> PipelineLike | None:
     from pivot import discovery
 
     return discovery.discover_pipeline()
@@ -136,7 +137,7 @@ def complete_targets(
         single_prefix = next(iter(prefixes)) if len(prefixes) == 1 else None
 
         for stage in stages:
-            info = pipeline.get(stage)
+            info = pipeline.get_stage(stage)
             keys = [ref.identity.key for ref in info["outs"] if ref.identity.key is not None]
             if not keys:
                 continue

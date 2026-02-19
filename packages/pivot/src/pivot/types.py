@@ -449,7 +449,7 @@ class DepChange(TypedDict):
 class OutputChange(TypedDict):
     """Change info for an output artifact."""
 
-    identity: ArtifactIdentity
+    path: ArtifactIdentity
     old_hash: str | None
     new_hash: str | None
     change_type: ChangeType | None  # None means unchanged

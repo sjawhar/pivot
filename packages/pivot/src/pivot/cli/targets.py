@@ -1,3 +1,4 @@
+# pyright: reportImplicitRelativeImport=false, reportMissingModuleSource=false
 from __future__ import annotations
 
 import logging
@@ -14,8 +15,7 @@ if TYPE_CHECKING:
 
     import networkx as nx
 
-    from pivot.pipeline.pipeline import Pipeline
-    from pivot.registry import RegistryStageInfo
+    from pivot.registry import PipelineLike, RegistryStageInfo
     from pivot.show import plots as plots_mod
 
 logger = logging.getLogger(__name__)
@@ -146,7 +146,7 @@ _PIPELINE_FILENAMES = frozenset((discovery.PIPELINE_PY_NAME,))
 
 def resolve_pipeline_file_targets(
     targets: list[str],
-) -> tuple[set[str], list[str], list[Pipeline]]:
+) -> tuple[set[str], list[str], list[PipelineLike]]:
     """Resolve targets that are paths to pipeline config files.
 
     For each target, checks if it's an existing file whose name matches
@@ -157,7 +157,7 @@ def resolve_pipeline_file_targets(
     """
     resolved = set[str]()
     remaining = list[str]()
-    pipelines: list[Pipeline] = []
+    pipelines: list[PipelineLike] = []
 
     for target in targets:
         path = pathlib.Path(target)
@@ -177,7 +177,7 @@ def resolve_pipeline_file_targets(
 
 def resolve_targets_to_stages(
     targets: list[str],
-    bipartite_graph: nx.DiGraph[str],
+    _bipartite_graph: nx.DiGraph[str],
 ) -> tuple[set[str], list[str]]:
     """Resolve targets to stage names.
 
@@ -262,19 +262,18 @@ def resolve_output_paths(
             info = cli_helpers.get_stage(item["target"])
             stage_outs = cast("list[object]", info["outs"])
             for out in stage_outs:
-                if isinstance(out, types.ArtifactRef):
-                    if (
-                        output_type is outputs.Metric
-                        and out.tag is types.ArtifactTag.METRIC
-                        or output_type is outputs.Plot
-                        and out.tag is types.ArtifactTag.PLOT
-                    ):
-                        if store is None:
-                            resolved.add(types.identity_key(out.identity))
-                        else:
-                            resolved.add(
-                                project.to_relative_path(store.resolve_display_path(out), proj_root)
-                            )
+                if isinstance(out, types.ArtifactRef) and (
+                    output_type is outputs.Metric
+                    and out.tag is types.ArtifactTag.METRIC
+                    or output_type is outputs.Plot
+                    and out.tag is types.ArtifactTag.PLOT
+                ):
+                    if store is None:
+                        resolved.add(types.identity_key(out.identity))
+                    else:
+                        resolved.add(
+                            project.to_relative_path(store.resolve_display_path(out), proj_root)
+                        )
         elif item["is_file"]:
             resolved.add(item["norm_path"])
         else:
@@ -303,23 +302,20 @@ def resolve_plot_infos(
             info = cli_helpers.get_stage(item["target"])
             stage_outs = cast("list[object]", info["outs"])
             for out in stage_outs:
-                if isinstance(out, types.ArtifactRef):
-                    if out.tag is types.ArtifactTag.PLOT:
-                        if store is None:
-                            path = types.identity_key(out.identity)
-                        else:
-                            path = project.to_relative_path(
-                                store.resolve_display_path(out), proj_root
-                            )
-                        resolved.append(
-                            plots.PlotInfo(
-                                path=path,
-                                stage_name=item["target"],
-                                x=None,
-                                y=None,
-                                template=None,
-                            )
+                if isinstance(out, types.ArtifactRef) and out.tag is types.ArtifactTag.PLOT:
+                    if store is None:
+                        path = types.identity_key(out.identity)
+                    else:
+                        path = project.to_relative_path(store.resolve_display_path(out), proj_root)
+                    resolved.append(
+                        plots.PlotInfo(
+                            path=path,
+                            stage_name=item["target"],
+                            x=None,
+                            y=None,
+                            template=None,
                         )
+                    )
         elif item["is_file"]:
             resolved.append(
                 plots.PlotInfo(

@@ -20,13 +20,6 @@ from pivot.types import ArtifactTag, DeferredWrites, DepEntry, HashInfo, LockDat
 logger = logging.getLogger(__name__)
 
 
-def _get_registry() -> registry.StageRegistry:
-    """Get StageRegistry via CLI helpers (lazy import to avoid circular imports)."""
-    from pivot.cli import helpers as cli_helpers
-
-    return cli_helpers.get_registry()
-
-
 def _split_identity(identity: str) -> tuple[str, str | None]:
     if ":" in identity:
         producer, key = identity.split(":", 1)
@@ -57,9 +50,8 @@ def commit_stages(
     """
     from pivot.cli import helpers as cli_helpers
 
-    stage_registry = _get_registry()
-    pipeline = cli_helpers._get_pipeline()
-    all_stage_names = stage_registry.list_stages()
+    pipeline = cli_helpers.get_pipeline()
+    all_stage_names = pipeline.list_stages()
 
     # Resolve target stages
     if stage_names is not None:
@@ -99,13 +91,13 @@ def commit_stages(
 
     try:
         for stage_name in targets:
-            stage_info = stage_registry.get(stage_name)
+            stage_info = pipeline.get_stage(stage_name)
             stage_state_dir = registry.get_stage_state_dir(stage_info, default_state_dir)
             stage_db = _get_state_db(stage_state_dir)
             stages_dir = lock.get_stages_dir(stage_state_dir)
 
             # 1. Get fingerprint
-            fingerprint = stage_registry.ensure_fingerprint(stage_name)
+            fingerprint = pipeline.ensure_fingerprint(stage_name)
 
             # 2. Get effective params
             current_params = parameters.get_effective_params(

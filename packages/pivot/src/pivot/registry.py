@@ -4,7 +4,7 @@ from __future__ import annotations
 import inspect
 import logging
 import pathlib
-from typing import TYPE_CHECKING, Any, TypedDict
+from typing import TYPE_CHECKING, Any, Protocol, TypedDict, runtime_checkable
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -48,6 +48,7 @@ class RegistryStageInfo(TypedDict):
     params_arg_name: str | None
     state_dir: pathlib.Path | None
     collection_params: dict[str, str]
+    no_fingerprint: bool
 
 
 class StageRegistry:
@@ -160,13 +161,41 @@ class StageRegistry:
         return set[str]()
 
 
+@runtime_checkable
+class PipelineLike(Protocol):
+    @property
+    def name(self) -> str: ...
+
+    @property
+    def root(self) -> pathlib.Path: ...
+
+    @property
+    def state_dir(self) -> pathlib.Path: ...
+
+    @property
+    def input_bindings(self) -> dict[str, str]: ...
+
+    def list_stages(self) -> list[str]: ...
+
+    def get_stage(self, name: str) -> RegistryStageInfo: ...
+
+    def ensure_fingerprint(self, name: str) -> dict[str, str]: ...
+
+    def build_dag(self) -> DiGraph[str]: ...
+
+    def invalidate_dag_cache(self) -> None: ...
+
+    def snapshot(self) -> dict[str, RegistryStageInfo]: ...
+
+    def restore(self, snapshot: dict[str, RegistryStageInfo]) -> None: ...
+
+    def include(self, other: PipelineLike) -> None: ...
+
+
 def _compute_fingerprint(stage_name: str, info: RegistryStageInfo) -> dict[str, str]:
     """Compute and return a stage fingerprint, wrapping errors."""
     try:
-        no_fp = getattr(info["func"], "__pivot_no_fingerprint__", False)
-        if not no_fp:
-            unwrapped = inspect.unwrap(info["func"])
-            no_fp = getattr(unwrapped, "__pivot_no_fingerprint__", False)
+        no_fp = info["no_fingerprint"]
         if no_fp:
             result = _compute_file_fingerprint(info["func"])
         else:

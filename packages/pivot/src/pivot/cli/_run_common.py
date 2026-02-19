@@ -1,3 +1,4 @@
+# pyright: reportImplicitRelativeImport=false, reportMissingImports=false, reportMissingModuleSource=false
 """Shared helpers for run and repro CLI commands."""
 
 from __future__ import annotations
@@ -26,7 +27,7 @@ if TYPE_CHECKING:
 
     from pivot.engine.types import OutputEvent, StageCompleted
     from pivot.executor import ExecutionSummary
-    from pivot.pipeline.pipeline import Pipeline
+    from pivot.registry import PipelineLike
 
 
 logger = logging.getLogger(__name__)
@@ -114,7 +115,7 @@ def ensure_stages_registered() -> None:
     if cli_decorators.get_pipeline_from_context() is not None:
         return
     try:
-        pipeline: Pipeline | None = discovery.discover_pipeline()
+        pipeline: PipelineLike | None = discovery.discover_pipeline()
         if pipeline is not None:
             cli_decorators.store_pipeline_in_context(pipeline)
             logger.info(f"Loaded pipeline: {pipeline.name}")

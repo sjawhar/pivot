@@ -20,8 +20,8 @@ from pivot.types import OnError, StageResult, StageStatus
 if TYPE_CHECKING:
     import concurrent.futures
 
+    from pivot.engine import types as engine_types
     from pivot.executor import worker
-    from pivot.pipeline.pipeline import Pipeline
     from pivot.registry import RegistryStageInfo
 
 logger = logging.getLogger(__name__)
@@ -160,7 +160,7 @@ def run(
     force: bool = False,
     no_commit: bool = False,
     checkout_missing: bool = False,
-    pipeline: Pipeline | None = None,
+    pipeline: registry.PipelineLike | None = None,
 ) -> dict[str, ExecutionSummary]:
     """Execute pipeline stages via Engine.
 
@@ -209,7 +209,7 @@ def _run_inner(
     force: bool,
     no_commit: bool,
     checkout_missing: bool,
-    pipeline: Pipeline | None,
+    pipeline: registry.PipelineLike | None,
 ) -> dict[str, ExecutionSummary]:
     """Inner implementation of run(), called with lock already held if needed."""
     # Import here to avoid circular import (engine imports executor_core)
@@ -237,8 +237,6 @@ def _run_inner(
 
     # Run async execution
     async def execute() -> dict[str, ExecutionSummary]:
-        from pivot.engine import types as engine_types
-
         async with Engine(pipeline=pipeline) as eng:
             # Add ResultCollectorSink to collect results
             result_sink = ResultCollectorSink()
@@ -308,7 +306,7 @@ def create_executor(max_workers: int) -> concurrent.futures.Executor:
 
 def prepare_worker_info(
     stage_info: RegistryStageInfo,
-    stage_registry: registry.StageRegistry,
+    pipeline: registry.PipelineLike,
     overrides: parameters.ParamsOverrides,
     checkout_modes: list[cache.CheckoutMode],
     run_id: str,
@@ -330,7 +328,7 @@ def prepare_worker_info(
 
     worker_info: dict[str, object] = {
         "func": stage_info["func"],
-        "fingerprint": stage_registry.ensure_fingerprint(stage_info["name"]),
+        "fingerprint": pipeline.ensure_fingerprint(stage_info["name"]),
         "deps": stage_info["deps"],
         "outs": stage_info["outs"],
         "store_spec": store_spec,

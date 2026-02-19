@@ -1,6 +1,6 @@
+# pyright: reportImplicitRelativeImport=false, reportMissingModuleSource=false, reportImportCycles=false
 from __future__ import annotations
 
-# pyright: reportImportCycles=false
 import enum
 import importlib
 import json
@@ -14,8 +14,7 @@ if TYPE_CHECKING:
     from networkx import DiGraph
 
     from pivot.cli import CliContext
-    from pivot.pipeline.pipeline import Pipeline
-    from pivot.registry import RegistryStageInfo, StageRegistry
+    from pivot.registry import PipelineLike, RegistryStageInfo
     from pivot.storage.store import WorkspaceStore
 
 from pivot import exceptions, project
@@ -35,7 +34,7 @@ class NoPipelineError(exceptions.PivotError):
         )
 
 
-def _get_pipeline() -> Pipeline:
+def get_pipeline() -> PipelineLike:
     """Get Pipeline from context, raising NoPipelineError if not found."""
     pipeline = cli_decorators.get_pipeline_from_context()
     if pipeline is None:
@@ -43,35 +42,25 @@ def _get_pipeline() -> Pipeline:
     return pipeline
 
 
-def get_registry() -> StageRegistry:
-    """Get StageRegistry from Pipeline in context."""
-    return _get_pipeline()._registry  # pyright: ignore[reportPrivateUsage]
-
-
 def list_stages() -> list[str]:
     """List stage names from Pipeline in context."""
-    return _get_pipeline().list_stages()
+    return get_pipeline().list_stages()
 
 
 def get_stage(name: str) -> RegistryStageInfo:
     """Get stage info from Pipeline in context."""
-    return _get_pipeline().get(name)
-
-
-def resolve_external_dependencies() -> None:
-    """Resolve external dependencies on the Pipeline in context."""
-    _get_pipeline().resolve_external_dependencies()
+    return get_pipeline().get_stage(name)
 
 
 def get_all_stages() -> dict[str, RegistryStageInfo]:
     """Get all stages as a dict from Pipeline in context."""
-    pipeline = _get_pipeline()
-    return {name: pipeline.get(name) for name in pipeline.list_stages()}
+    pipeline = get_pipeline()
+    return {name: pipeline.get_stage(name) for name in pipeline.list_stages()}
 
 
 def build_dag() -> DiGraph[str]:
     """Build DAG from Pipeline in context."""
-    return _get_pipeline().build_dag()
+    return get_pipeline().build_dag()
 
 
 def get_workspace_store() -> WorkspaceStore | None:

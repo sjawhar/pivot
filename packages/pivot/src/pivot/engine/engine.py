@@ -83,7 +83,6 @@ if TYPE_CHECKING:
     from anyio.abc import TaskGroup
     from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
 
-    from pivot.pipeline.pipeline import Pipeline
     from pivot.registry import RegistryStageInfo
     from pivot.storage.cache import CheckoutMode
 
@@ -135,7 +134,7 @@ class Engine:
     the channel, so no explicit lock is needed.
     """
 
-    _pipeline: Pipeline | None
+    _pipeline: registry.PipelineLike | None
     _all_pipelines: bool
     _state: EngineState
     _sources: list[EventSource]
@@ -179,7 +178,9 @@ class Engine:
     # Event signaling dispatcher has finished draining
     _dispatch_complete: anyio.Event
 
-    def __init__(self, *, pipeline: Pipeline | None = None, all_pipelines: bool = False) -> None:
+    def __init__(
+        self, *, pipeline: registry.PipelineLike | None = None, all_pipelines: bool = False
+    ) -> None:
         """Initialize the async engine in IDLE state."""
         self._pipeline = pipeline
         self._all_pipelines = all_pipelines
@@ -753,7 +754,7 @@ class Engine:
     # Pipeline Access
     # =========================================================================
 
-    def _require_pipeline(self) -> Pipeline:
+    def _require_pipeline(self) -> registry.PipelineLike:
         """Get the pipeline, raising RuntimeError if not set."""
         if self._pipeline is None:
             raise RuntimeError(
@@ -767,12 +768,12 @@ class Engine:
 
     def _get_stage(self, name: str) -> RegistryStageInfo:
         """Get stage info from pipeline."""
-        return self._require_pipeline().get(name)
+        return self._require_pipeline().get_stage(name)
 
     def _get_all_stages(self) -> dict[str, RegistryStageInfo]:
         """Get all stages as a dict from pipeline."""
         pipeline = self._require_pipeline()
-        return {name: pipeline.get(name) for name in pipeline.list_stages()}
+        return {name: pipeline.get_stage(name) for name in pipeline.list_stages()}
 
     # =========================================================================
     # Stage State Management
@@ -1434,7 +1435,7 @@ class Engine:
                 pool = self._ensure_worker_pool()
                 worker_info = executor_core.prepare_worker_info(
                     stage_info,
-                    pipeline._registry,  # pyright: ignore[reportPrivateUsage]
+                    pipeline,
                     overrides,
                     checkout_modes,
                     run_id,
@@ -1522,8 +1523,7 @@ class Engine:
 
         def _ensure_fingerprint() -> dict[str, str]:
             pipeline = self._require_pipeline()
-            stage_registry = pipeline._registry  # pyright: ignore[reportPrivateUsage]
-            return stage_registry.ensure_fingerprint(stage_name)
+            return pipeline.ensure_fingerprint(stage_name)
 
         current_fingerprint = await anyio.to_thread.run_sync(_ensure_fingerprint)
 
@@ -2080,15 +2080,12 @@ class Engine:
             return
 
         # Emit reload event
-        old_stages, old_registry = reload_result
-        await self._emit_reload_event(old_stages, old_registry)
+        old_stages, old_pipeline_ref = reload_result
+        await self._emit_reload_event(old_stages, old_pipeline_ref)
 
         # Flush manifest cache so cached manifests survive the reload
         fingerprint.flush_manifest_cache()
 
-        # Resolve external deps (e.g. sibling pipelines) before reading stages.
-        # Reload bypasses Pipeline.build_dag() so we must resolve explicitly.
-        self._require_pipeline().resolve_external_dependencies()
         all_stages = self._get_all_stages()
         # Hot-reload: skip dependency validation — deps may be temporarily missing while user edits
         self._graph = engine_graph.build_graph(all_stages)
@@ -2253,15 +2250,15 @@ class Engine:
 
     def _reload_registry(
         self,
-    ) -> tuple[dict[str, RegistryStageInfo], registry.StageRegistry | None] | None:
+    ) -> tuple[dict[str, RegistryStageInfo], registry.PipelineLike | None] | None:
         """Reload the pipeline by re-importing pipeline definition.
 
-        Returns old_stages and old_registry if reload succeeded, None if pipeline is invalid.
+        Returns old_stages and old_pipeline_ref if reload succeeded, None if pipeline is invalid.
         The caller should emit the reload event using the returned old_stages.
         """
         old_pipeline = self._pipeline
         old_stages = old_pipeline.snapshot() if old_pipeline else {}
-        old_registry = old_pipeline._registry if old_pipeline else None  # pyright: ignore[reportPrivateUsage]
+        old_pipeline_ref = old_pipeline if old_pipeline else None
         root = project.get_project_root()
 
         # Clear project modules from sys.modules
@@ -2277,7 +2274,7 @@ class Engine:
                 return None
 
             self._pipeline = new_pipeline
-            return old_stages, old_registry
+            return old_stages, old_pipeline_ref
         except Exception as e:
             _logger.warning(f"Pipeline invalid: {e}")
             # Restore old pipeline on failure
@@ -2307,7 +2304,7 @@ class Engine:
     async def _emit_reload_event(
         self,
         old_stages: dict[str, RegistryStageInfo],
-        old_registry: registry.StageRegistry | None,
+        old_pipeline_ref: registry.PipelineLike | None,
     ) -> None:
         """Emit PipelineReloaded event with diff information."""
         new_stage_names = self._list_stages()
@@ -2320,10 +2317,10 @@ class Engine:
         # Detect modified stages by comparing fingerprints
         modified = list[str]()
         pipeline = self._require_pipeline()
-        new_registry = pipeline._registry  # pyright: ignore[reportPrivateUsage]
+        new_pipeline_ref = pipeline
         for stage_name in sorted(old_stage_names & new_stages_set):
             had_error = False
-            if old_registry is None:
+            if old_pipeline_ref is None:
                 old_fp = None
                 had_error = True
                 _logger.warning(
@@ -2332,7 +2329,7 @@ class Engine:
                 )
             else:
                 try:
-                    old_fp = old_registry.ensure_fingerprint(stage_name)
+                    old_fp = old_pipeline_ref.ensure_fingerprint(stage_name)
                 except exceptions.PivotError as exc:
                     old_fp = None
                     had_error = True
@@ -2343,7 +2340,7 @@ class Engine:
                     )
 
             try:
-                new_fp = new_registry.ensure_fingerprint(stage_name)
+                new_fp = new_pipeline_ref.ensure_fingerprint(stage_name)
             except exceptions.PivotError as exc:
                 new_fp = None
                 had_error = True

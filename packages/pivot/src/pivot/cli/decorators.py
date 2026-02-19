@@ -1,3 +1,4 @@
+# pyright: reportImplicitRelativeImport=false, reportImportCycles=false
 from __future__ import annotations
 
 import functools
@@ -15,7 +16,7 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from pivot.pipeline.pipeline import Pipeline
+    from pivot.registry import PipelineLike
 
 
 # Context key for storing the discovered Pipeline
@@ -142,7 +143,7 @@ def pivot_command(
     return decorator
 
 
-def store_pipeline_in_context(pipeline: Pipeline) -> None:
+def store_pipeline_in_context(pipeline: PipelineLike) -> None:
     """Store a Pipeline in the Click context."""
     ctx = click.get_current_context(silent=True)
     if ctx is None:
@@ -154,12 +155,12 @@ def store_pipeline_in_context(pipeline: Pipeline) -> None:
     ctx.obj[PIPELINE_CONTEXT_KEY] = pipeline  # type: ignore[literal-required]
 
 
-def get_pipeline_from_context() -> Pipeline | None:
+def get_pipeline_from_context() -> PipelineLike | None:
     """Get the discovered Pipeline from Click context, if any.
 
     Returns None if no Pipeline was discovered.
     """
-    from pivot.pipeline.pipeline import Pipeline
+    from pivot.registry import PipelineLike
 
     ctx = click.get_current_context(silent=True)
     if ctx is None:
@@ -169,7 +170,7 @@ def get_pipeline_from_context() -> Pipeline | None:
         return None
     # ctx.obj is typed as Any, so dict.get returns Unknown
     pipeline = cast("Any", obj).get(PIPELINE_CONTEXT_KEY)
-    if pipeline is None or not isinstance(pipeline, Pipeline):
+    if pipeline is None or not isinstance(pipeline, PipelineLike):
         return None
     return pipeline
 
