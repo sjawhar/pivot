@@ -1,4 +1,4 @@
-# pyright: reportPrivateUsage=false, reportUnusedFunction=false, reportAny=false, reportExplicitAny=false, reportUnknownParameterType=false, reportUnknownMemberType=false, reportUnknownArgumentType=false, reportUntypedFunctionDecorator=false, reportUnusedParameter=false, reportUnusedCallResult=false
+# pyright: reportPrivateUsage=false, reportUnusedFunction=false, reportAny=false, reportExplicitAny=false, reportUnknownParameterType=false, reportUnknownMemberType=false, reportUnknownArgumentType=false, reportUntypedFunctionDecorator=false, reportUnusedParameter=false, reportUnusedCallResult=false, reportImportCycles=false, reportImplicitRelativeImport=false
 from __future__ import annotations
 
 import contextlib
@@ -8,6 +8,7 @@ import enum
 import functools
 import importlib
 import inspect
+import logging
 import types as _stdlib_types
 import typing
 from typing import TYPE_CHECKING, Annotated, Any, TypeVar, get_args, get_origin, get_type_hints
@@ -15,11 +16,15 @@ from typing import TYPE_CHECKING, Annotated, Any, TypeVar, get_args, get_origin,
 from typing_extensions import is_typeddict
 
 from . import project, registry, stage_def, types
-from .pipeline import pipeline as pipeline_mod
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    import collections.abc
     import pathlib
     from collections.abc import Callable
+
+    from networkx import DiGraph
 
     from . import loaders as loaders_mod
 
@@ -147,8 +152,9 @@ def _emit_stage_info(
 ) -> registry.RegistryStageInfo:
     func = node.original_func
     assert not hasattr(func, "_is_stage")
-    if getattr(node.func, "__pivot_no_fingerprint__", False):
-        func.__pivot_no_fingerprint__ = True  # pyright: ignore[reportFunctionMemberAccess]
+    no_fp = getattr(node.func, "__pivot_no_fingerprint__", False)
+    if not no_fp:
+        no_fp = getattr(func, "__pivot_no_fingerprint__", False)
 
     deps = dict[str, types.ArtifactRef]()
 
@@ -217,6 +223,7 @@ def _emit_stage_info(
         params_arg_name=params_arg_name,
         state_dir=state_dir,
         collection_params={k: str(v) for k, v in node.collection_params.items()},
+        no_fingerprint=no_fp,
     )
 
 
@@ -225,11 +232,12 @@ class Pipeline:
     _root: pathlib.Path
     _stages: list[_StageNode]
     _inputs: dict[str, _InputNode]
-    _call_counts: dict[str, int]
+    _call_counts: dict[tuple[str, tuple[str, ...]], int]
     _validation_errors: list[str]
     _token: contextvars.Token[Pipeline | None] | None
     _variant_stack: list[str]
-    _built: bool
+    _registry: registry.StageRegistry
+    _constructing: bool
 
     def __init__(self, name: str, *, root: pathlib.Path | None = None) -> None:
         self._name = name
@@ -239,7 +247,8 @@ class Pipeline:
         self._validation_errors = []
         self._token = None
         self._variant_stack = []
-        self._built = False
+        self._registry = registry.StageRegistry()
+        self._constructing = False
 
         if root is not None:
             self._root = root.resolve()
@@ -250,16 +259,124 @@ class Pipeline:
     def name(self) -> str:
         return self._name
 
+    @property
+    def root(self) -> pathlib.Path:
+        return self._root
+
+    @property
+    def state_dir(self) -> pathlib.Path:
+        return self._root / ".pivot"
+
+    @property
+    def input_bindings(self) -> dict[str, str]:
+        return {name: node.path for name, node in self._inputs.items()}
+
+    def _require_materialized(self) -> None:
+        if self._constructing:
+            raise RuntimeError(
+                "Cannot call engine-facing methods on a Pipeline that is still under "
+                "construction (inside a 'with' block). Exit the 'with' block first."
+            )
+
+    def list_stages(self) -> list[str]:
+        self._require_materialized()
+        return self._registry.list_stages()
+
+    def get_stage(self, name: str) -> registry.RegistryStageInfo:
+        self._require_materialized()
+        return self._registry.get(name)
+
+    def ensure_fingerprint(self, name: str) -> dict[str, str]:
+        self._require_materialized()
+        return self._registry.ensure_fingerprint(name)
+
+    def build_dag(self) -> DiGraph[str]:
+        self._require_materialized()
+        return self._registry.build_dag()
+
+    def invalidate_dag_cache(self) -> None:
+        self._registry.invalidate_dag_cache()
+
+    def snapshot(self) -> dict[str, registry.RegistryStageInfo]:
+        self._require_materialized()
+        return self._registry.snapshot()
+
+    def restore(self, snapshot: dict[str, registry.RegistryStageInfo]) -> None:
+        self._require_materialized()
+        self._registry.invalidate_dag_cache()
+        self._registry.restore(snapshot)
+
+    def include(self, other: registry.PipelineLike) -> None:
+        import copy
+
+        if other is self:
+            from pivot.exceptions import PipelineConfigError
+
+            raise PipelineConfigError(f"Pipeline '{self.name}' cannot include itself")
+
+        existing_stages = set(self._registry.list_stages())
+        for stage_name in other.list_stages():
+            if stage_name in existing_stages:
+                logger.debug("include: skipping duplicate stage '%s'", stage_name)
+                continue
+            stage_info = copy.deepcopy(other.get_stage(stage_name))
+            self._registry.add_existing(stage_info)
+
+        for name, path in other.input_bindings.items():
+            if name in self._inputs:
+                existing_path = self._inputs[name].path
+                if existing_path != path:
+                    from pivot.exceptions import PipelineConfigError
+
+                    raise PipelineConfigError(
+                        f"Input binding conflict: input '{name}' is bound to "
+                        f"'{existing_path}' and '{path}' in different pipelines."
+                    )
+            else:
+                self._inputs[name] = _InputNode(
+                    name=name, python_type=None, path=path, format=_get_loaders().PathOnly()
+                )
+        self._registry.invalidate_dag_cache()
+
     def __enter__(self) -> Pipeline:
+        if self._token is not None:
+            raise RuntimeError(
+                f"Pipeline '{self._name}' is already inside a 'with' block. "
+                "Nested 'with' on the same Pipeline is not supported."
+            )
         self._token = _active_pipeline.set(self)
+        self._constructing = True
         return self
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         if self._token is not None:
             _active_pipeline.reset(self._token)
             self._token = None
+        self._constructing = False
         if exc_type is None:
             self._validate()
+            self._materialize_stages()
+
+    def _materialize_stages(self) -> None:
+        new_registry = registry.StageRegistry()
+        closure = self._upstream_closure()
+
+        for foreign_pipeline, foreign_node in closure:
+            qualified_name = f"{foreign_pipeline._name}/{foreign_node.name}"
+            stage_info = _emit_stage_info(
+                foreign_node, qualified_name, foreign_pipeline._root / ".pivot"
+            )
+            new_registry.add_existing(stage_info)
+
+        self._merge_foreign_input_bindings(closure)
+
+        for node in self._stages:
+            qualified_name = f"{self._name}/{node.name}"
+            stage_info = _emit_stage_info(node, qualified_name, self._root / ".pivot")
+            new_registry.add_existing(stage_info)
+
+        # Atomic swap — if any step above raises, self._registry is unchanged
+        self._registry = new_registry
 
     @typing.overload
     def input(
@@ -309,7 +426,7 @@ class Pipeline:
         )
 
     @contextlib.contextmanager
-    def variant(self, name: str) -> typing.Generator[None]:
+    def variant(self, name: str) -> collections.abc.Generator[None]:
         """Context manager for registering stages with a variant suffix.
 
         All stages registered within the block get @{name} appended to their stage name.
@@ -331,8 +448,10 @@ class Pipeline:
     ) -> ArtifactHandle:
         func_name = original_func.__name__
 
-        count = self._call_counts.get(func_name, 0)
-        self._call_counts[func_name] = count + 1
+        variant_key = tuple(self._variant_stack)
+        count_key = (func_name, variant_key)
+        count = self._call_counts.get(count_key, 0)
+        self._call_counts[count_key] = count + 1
         stage_name = func_name if count == 0 else f"{func_name}@{count}"
 
         if self._variant_stack:
@@ -361,13 +480,19 @@ class Pipeline:
         for param_name, value in bound.arguments.items():
             if isinstance(value, ArtifactHandle):
                 input_handles[param_name] = value
-            elif isinstance(value, (list, tuple)) and all(
-                isinstance(v, ArtifactHandle) for v in value
-            ):
-                list_input_handles[param_name] = list(value)
-                collection_params[param_name] = (
-                    CollectionKind.TUPLE if isinstance(value, tuple) else CollectionKind.LIST
-                )
+            elif isinstance(value, (list, tuple)):
+                items = list[Any](value)
+                if all(isinstance(v, ArtifactHandle) for v in items):
+                    list_input_handles[param_name] = items
+                    collection_params[param_name] = (
+                        CollectionKind.TUPLE if isinstance(value, tuple) else CollectionKind.LIST
+                    )
+                elif param_name in explicit_params:
+                    self._validation_errors.append(
+                        f"{stage_name}: parameter '{param_name}' has unsupported type "
+                        f"'{type(value).__name__}'. Use ArtifactHandle (dependency), "
+                        f"StageParams (config), or list/tuple of ArtifactHandle."
+                    )
             elif isinstance(value, stage_def.StageParams):
                 params = value
             elif param_name in explicit_params:
@@ -446,9 +571,8 @@ class Pipeline:
 
         return result
 
-    @staticmethod
     def _merge_foreign_input_bindings(
-        legacy: pipeline_mod.Pipeline,
+        self,
         closure: list[tuple[Pipeline, _StageNode]],
     ) -> None:
         foreign_bindings = dict[str, str]()
@@ -464,41 +588,17 @@ class Pipeline:
                         )
                     foreign_bindings[inp.name] = inp.path
 
-        local_bindings = legacy.input_bindings
+        local_bindings = self.input_bindings
         for name, path in foreign_bindings.items():
             if name in local_bindings and local_bindings[name] != path:
                 raise ValueError(
                     f"Input binding conflict: input '{name}' is bound to "
                     f"'{local_bindings[name]}' locally and '{path}' in a foreign pipeline."
                 )
-            local_bindings[name] = path
-        legacy.set_input_bindings(local_bindings)
-
-    def build(self) -> pipeline_mod.Pipeline:
-        if self._built:
-            raise RuntimeError("Pipeline already built")
-        self._validate()
-        legacy = pipeline_mod.Pipeline(self._name, root=self._root)
-        legacy.set_input_bindings({name: node.path for name, node in self._inputs.items()})
-
-        closure = self._upstream_closure()
-
-        for foreign_pipeline, foreign_node in closure:
-            qualified_name = f"{foreign_pipeline._name}/{foreign_node.name}"
-            stage_info = _emit_stage_info(
-                foreign_node, qualified_name, foreign_pipeline._root / ".pivot"
-            )
-            legacy._registry.add_existing(stage_info)
-
-        self._merge_foreign_input_bindings(legacy, closure)
-
-        for node in self._stages:
-            qualified_name = f"{self._name}/{node.name}"
-            stage_info = _emit_stage_info(node, qualified_name, self._root / ".pivot")
-            legacy._registry.add_existing(stage_info)
-
-        self._built = True
-        return legacy
+            if name not in self._inputs:
+                self._inputs[name] = _InputNode(
+                    name=name, python_type=None, path=path, format=_get_loaders().PathOnly()
+                )
 
 
 _active_pipeline: contextvars.ContextVar[Pipeline | None] = contextvars.ContextVar(
