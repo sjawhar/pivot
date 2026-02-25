@@ -107,15 +107,20 @@ def sort_for_display(execution_order: list[str], graph: nx.DiGraph[str]) -> list
     return sorted(execution_order, key=display_sort_key)
 
 
-def ensure_stages_registered() -> None:
+def ensure_stages_registered(*, all_pipelines: bool = False) -> None:
     """Ensure a Pipeline is discovered and in context.
 
     If no Pipeline is in context, attempts discovery and stores the result.
+
+    Args:
+        all_pipelines: If True, discover all pipelines recursively.
     """
     if cli_decorators.get_pipeline_from_context() is not None:
         return
     try:
-        pipeline: PipelineLike | None = discovery.discover_pipeline()
+        pipeline: PipelineLike | None = discovery.discover_pipeline(
+            all_pipelines=all_pipelines,
+        )
         if pipeline is not None:
             cli_decorators.store_pipeline_in_context(pipeline)
             logger.info(f"Loaded pipeline: {pipeline.name}")

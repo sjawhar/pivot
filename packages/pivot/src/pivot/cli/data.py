@@ -13,7 +13,7 @@ from pivot.storage import cache, restore
 from pivot.types import DataDiffResult, OutputFormat
 
 
-@cli_decorators.pivot_command()
+@cli_decorators.pivot_command(allow_all=True)
 @click.argument("targets", nargs=-1, required=True)
 @click.option("--key", "key_cols", help="Comma-separated key columns for row matching")
 @click.option("--positional", is_flag=True, help="Use positional (row-by-row) matching")

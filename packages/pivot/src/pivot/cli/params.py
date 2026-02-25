@@ -19,6 +19,13 @@ def params() -> None:
 @params.command("show")
 @click.argument("stages", nargs=-1, shell_complete=completion.complete_stages)
 @click.option(
+    "--all",
+    "all_pipelines",
+    is_flag=True,
+    default=False,
+    help="Run across all pipelines in the project.",
+)
+@click.option(
     "--json", "output_format", flag_value=OutputFormat.JSON, default=None, help="Output as JSON"
 )
 @click.option("--md", "output_format", flag_value=OutputFormat.MD, help="Output as Markdown table")
@@ -28,6 +35,7 @@ def params() -> None:
 @cli_decorators.with_error_handling
 def params_show(
     stages: tuple[str, ...],
+    all_pipelines: bool,
     output_format: OutputFormat | None,
     precision: int | None,
 ) -> None:
@@ -36,7 +44,7 @@ def params_show(
     If STAGES are specified, shows params for those stages only.
     Otherwise, shows params from all registered stages.
     """
-    ensure_stages_registered()
+    ensure_stages_registered(all_pipelines=all_pipelines)
     precision = precision if precision is not None else config.get_display_precision()
     stages_list = list(stages) if stages else None
     result = params_mod.collect_params_from_stages(stages_list)
@@ -52,6 +60,13 @@ def params_show(
 @params.command("diff")
 @click.argument("stages", nargs=-1, shell_complete=completion.complete_stages)
 @click.option(
+    "--all",
+    "all_pipelines",
+    is_flag=True,
+    default=False,
+    help="Run across all pipelines in the project.",
+)
+@click.option(
     "--json", "output_format", flag_value=OutputFormat.JSON, default=None, help="Output as JSON"
 )
 @click.option("--md", "output_format", flag_value=OutputFormat.MD, help="Output as Markdown table")
@@ -61,6 +76,7 @@ def params_show(
 @cli_decorators.with_error_handling
 def params_diff(
     stages: tuple[str, ...],
+    all_pipelines: bool,
     output_format: OutputFormat | None,
     precision: int | None,
 ) -> None:
@@ -69,7 +85,7 @@ def params_diff(
     If STAGES are specified, compares those stages only.
     Otherwise, compares all registered stages.
     """
-    ensure_stages_registered()
+    ensure_stages_registered(all_pipelines=all_pipelines)
     precision = precision if precision is not None else config.get_display_precision()
     stages_list = list(stages) if stages else None
 

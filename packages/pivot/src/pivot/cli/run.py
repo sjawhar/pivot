@@ -306,7 +306,7 @@ def _validate_stages_required(stages_list: list[str] | None) -> list[str]:
     return stages_list
 
 
-@cli_decorators.pivot_command()
+@cli_decorators.pivot_command(allow_all=True)
 @click.argument("stages", nargs=-1, shell_complete=completion.complete_stages)
 @click.option(
     "--force",
