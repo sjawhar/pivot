@@ -6,7 +6,7 @@ import pytest
 
 from pivot import loaders
 from pivot.engine import graph as engine_graph
-from pivot.exceptions import CyclicGraphError, DependencyNotFoundError
+from pivot.exceptions import CyclicGraphError
 from pivot.registry import RegistryStageInfo
 from pivot.storage.store import Store
 from pivot.types import ArtifactIdentity, ArtifactRef, ArtifactTag

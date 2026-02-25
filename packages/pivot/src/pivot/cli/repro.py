@@ -87,7 +87,11 @@ def _watch_paths_from_registry(
             identity = out.identity
             path_value = identity.key if identity.key is not None else identity.producer
             if path_value:
-                paths.add(project.normalize_path(path_value))
+                resolved = project.normalize_path(path_value)
+                # Only watch paths that exist on disk — identity-based artifacts
+                # (inter-stage deps) don't have filesystem paths to watch.
+                if resolved.exists():
+                    paths.add(resolved)
     return sorted(paths)
 
 
