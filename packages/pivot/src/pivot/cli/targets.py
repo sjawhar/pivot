@@ -182,7 +182,8 @@ def resolve_targets_to_stages(
     """Resolve targets to stage names.
 
     Stage names are used directly. Artifact paths are resolved to the stages
-    that produce them.
+    that produce them. File paths are resolved by matching against workspace
+    output paths of all registered stages.
 
     Returns:
         Tuple of (resolved stage names, unresolved targets).
@@ -190,6 +191,25 @@ def resolve_targets_to_stages(
     registered_stages = set(cli_helpers.list_stages())
     result = set[str]()
     unresolved = list[str]()
+
+    # Build file path → stage name reverse map (lazy, only if needed)
+    _file_to_stage: dict[str, str] | None = None
+
+    def _get_file_to_stage() -> dict[str, str]:
+        nonlocal _file_to_stage
+        if _file_to_stage is not None:
+            return _file_to_stage
+        store = cli_helpers.get_workspace_store()
+        proj_root = project.get_project_root()
+        _file_to_stage = {}
+        for stage_name in registered_stages:
+            info = cli_helpers.get_stage(stage_name)
+            for out in info["outs"]:
+                if store is not None:
+                    display_path = store.resolve_display_path(out)
+                    rel = project.to_relative_path(str(display_path), proj_root)
+                    _file_to_stage[rel] = stage_name
+        return _file_to_stage
 
     for target in targets:
         resolved = names.resolve_stage_name(target, dict.fromkeys(registered_stages))
@@ -202,6 +222,13 @@ def resolve_targets_to_stages(
             )
             if resolved_producer in registered_stages:
                 result.add(resolved_producer)
+                continue
+            # Try resolving as a workspace file path
+            proj_root = project.get_project_root()
+            norm_path = project.to_relative_path(project.normalize_path(target), proj_root)
+            file_to_stage = _get_file_to_stage()
+            if norm_path in file_to_stage:
+                result.add(file_to_stage[norm_path])
                 continue
             unresolved.append(target)
 

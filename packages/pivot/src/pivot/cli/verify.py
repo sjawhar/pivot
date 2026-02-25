@@ -105,6 +105,22 @@ def _get_stage_lock_hashes(
     )
 
 
+def _get_stage_missing_workspace_files(
+    stage_name: str,
+    project_root: pathlib.Path,
+) -> list[str]:
+    """Get output workspace files that are missing from disk for a non-stale stage.
+
+    Returns list of relative paths for output files that don't exist on disk.
+    Excludes metric outputs (git-tracked, not workspace files).
+    """
+    output_hashes, _ = _get_stage_lock_hashes(stage_name)
+    missing = list[str]()
+    for rel_path in output_hashes:
+        if not (project_root / rel_path).exists():
+            missing.append(rel_path)
+    return missing
+
 def _get_stage_missing_hashes(
     stage_name: str,
     local_hashes: set[str],
@@ -216,6 +232,7 @@ def _verify_stages(
         hash_to_paths = stage_hash_to_paths[stage_name]
 
         # Determine missing files based on mode
+        # Determine missing files based on mode
         if not hash_to_paths:
             missing_files = list[str]()
         elif allow_missing and remote is not None:
@@ -229,6 +246,13 @@ def _verify_stages(
         else:
             # Without allow_missing, all locally missing hashes are failures
             missing_files = [p for paths in hash_to_paths.values() for p in paths]
+        # Check workspace output files exist on disk (even if hash is in cache)
+        # This catches the case where outputs were deleted from the workspace
+        # but the hash is still in the local cache.
+        if not missing_files and not allow_missing:
+            missing_workspace = _get_stage_missing_workspace_files(stage_name, project_root)
+            if missing_workspace:
+                missing_files = missing_workspace
 
         # Create result based on whether any files are missing
         if missing_files:
