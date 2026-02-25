@@ -259,28 +259,18 @@ def resolve_output_paths(
             info = cli_helpers.get_stage(item["target"])
             stage_outs = cast("list[object]", info["outs"])
             for out in stage_outs:
-                if isinstance(out, types.ArtifactRef):
-                    if (
-                        output_type is outputs.Metric
-                        and out.tag is types.ArtifactTag.METRIC
-                        or output_type is outputs.Plot
-                        and out.tag is types.ArtifactTag.PLOT
-                    ):
-                        if store is None:
-                            resolved.add(types.identity_key(out.identity))
-                        else:
-                            resolved.add(
-                                project.to_relative_path(store.resolve_display_path(out), proj_root)
-                            )
-                elif isinstance(out, output_type):
-                    # Registry always stores single-file outputs (multi-file are expanded)
-                    expanded = outputs.require_expanded(
-                        cast("outputs.Metric | outputs.Plot[Any]", out)
-                    )
-                    rel_path = project.to_relative_path(
-                        project.normalize_path(expanded.path), proj_root
-                    )
-                    resolved.add(rel_path)
+                if isinstance(out, types.ArtifactRef) and (
+                    output_type is outputs.Metric
+                    and out.tag is types.ArtifactTag.METRIC
+                    or output_type is outputs.Plot
+                    and out.tag is types.ArtifactTag.PLOT
+                ):
+                    if store is None:
+                        resolved.add(types.identity_key(out.identity))
+                    else:
+                        resolved.add(
+                            project.to_relative_path(store.resolve_display_path(out), proj_root)
+                        )
         elif item["is_file"]:
             resolved.add(item["norm_path"])
         else:
@@ -309,35 +299,18 @@ def resolve_plot_infos(
             info = cli_helpers.get_stage(item["target"])
             stage_outs = cast("list[object]", info["outs"])
             for out in stage_outs:
-                if isinstance(out, types.ArtifactRef):
-                    if out.tag is types.ArtifactTag.PLOT:
-                        if store is None:
-                            path = types.identity_key(out.identity)
-                        else:
-                            path = project.to_relative_path(
-                                store.resolve_display_path(out), proj_root
-                            )
-                        resolved.append(
-                            plots.PlotInfo(
-                                path=path,
-                                stage_name=item["target"],
-                                x=None,
-                                y=None,
-                                template=None,
-                            )
-                        )
-                elif isinstance(out, outputs.Plot):
-                    # Registry always stores single-file outputs (multi-file are expanded)
-                    expanded = outputs.require_expanded(cast("outputs.Plot[Any]", out))
+                if isinstance(out, types.ArtifactRef) and out.tag is types.ArtifactTag.PLOT:
+                    if store is None:
+                        path = types.identity_key(out.identity)
+                    else:
+                        path = project.to_relative_path(store.resolve_display_path(out), proj_root)
                     resolved.append(
                         plots.PlotInfo(
-                            path=project.to_relative_path(
-                                project.normalize_path(expanded.path), proj_root
-                            ),
+                            path=path,
                             stage_name=item["target"],
-                            x=out.x,
-                            y=out.y,
-                            template=out.template,
+                            x=None,
+                            y=None,
+                            template=None,
                         )
                     )
         elif item["is_file"]:

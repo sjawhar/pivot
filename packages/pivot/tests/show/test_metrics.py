@@ -61,6 +61,7 @@ def _register_metric_stage(
         fingerprint={"_code": "fake_hash"},
         params_arg_name=None,
         state_dir=None,
+        collection_params={},
     )
 
 

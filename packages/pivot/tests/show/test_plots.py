@@ -77,6 +77,7 @@ def _register_plot_stage(
         fingerprint={"_code": "fake_hash"},
         params_arg_name=None,
         state_dir=None,
+        collection_params={},
     )
 
 
@@ -138,6 +139,7 @@ def _register_mixed_output_stage(
         fingerprint={"_code": "fake_hash"},
         params_arg_name=None,
         state_dir=None,
+        collection_params={},
     )
 
 

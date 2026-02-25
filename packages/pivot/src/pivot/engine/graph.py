@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import pathlib
-from typing import TYPE_CHECKING, TypedDict, cast
+from typing import TYPE_CHECKING, TypedDict
 
 import networkx as nx
 
@@ -268,9 +268,14 @@ def get_producer(g: nx.DiGraph[str], identity: pivot_types.ArtifactIdentity) -> 
 
 
 def get_watch_paths(g: nx.DiGraph[str]) -> list[str]:
-    """Return watch paths (identity-based artifacts require Store resolution).
+    """Return watch paths for file-change monitoring.
 
-    TODO: Resolve ArtifactIdentity to filesystem paths via Store (Task 4).
+    Known limitation: watch mode is non-functional with the compose API.
+    Identity-based artifacts (stage-to-stage deps) need Store-backed
+    path resolution, which is not yet implemented. Returns empty list,
+    causing ``pivot repro --watch`` to not detect any file changes.
+
+    TODO: Resolve ArtifactIdentity to filesystem paths via Store.
     """
     _ = g
     return []
@@ -542,4 +547,4 @@ def _get_subgraph(graph: nx.DiGraph[str], source_stages: list[str]) -> nx.DiGrap
     nodes = set[str]()
     for stage in source_stages:
         nodes.update(nx.dfs_postorder_nodes(graph, stage))
-    return cast("nx.DiGraph[str]", graph.subgraph(nodes))
+    return graph.subgraph(nodes)

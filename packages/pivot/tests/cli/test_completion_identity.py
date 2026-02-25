@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import inspect
 import pathlib
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from pivot import loaders, outputs, project, types
 from pivot.cli import completion
@@ -12,7 +12,13 @@ from pivot.engine import graph as engine_graph
 from pivot.registry import RegistryStageInfo
 
 if TYPE_CHECKING:
+    import click
+
     from pivot.pipeline import pipeline as pipeline_mod
+
+
+_CTX = cast("click.Context", cast("object", None))
+_PARAM = cast("click.Parameter", cast("object", None))
 
 
 def _helper_ref(
@@ -46,6 +52,7 @@ def _make_stage_info(name: str, outs: list[types.ArtifactRef]) -> RegistryStageI
         fingerprint={"_code": "fake_hash"},
         params_arg_name=None,
         state_dir=None,
+        collection_params={},
     )
 
 
@@ -62,11 +69,11 @@ def test_complete_targets_includes_stage_keys(mock_discovery: pipeline_mod.Pipel
     ]
     _register_stage(mock_discovery, "train", outs)
 
-    bare = completion.complete_targets(None, None, "")
+    bare = completion.complete_targets(_CTX, _PARAM, "")
     assert "train" in bare
     assert "train:model" not in bare, "stage:key completions should only appear after typing ':'"
 
-    keyed = completion.complete_targets(None, None, "train:")
+    keyed = completion.complete_targets(_CTX, _PARAM, "train:")
     assert "train:model" in keyed
     assert "train:score" in keyed
 
@@ -108,7 +115,11 @@ def test_resolve_plot_infos_uses_store_display_path(
     mock_discovery: pipeline_mod.Pipeline,
 ) -> None:
     ref = _helper_ref(
-        "train", "loss", types.ArtifactTag.PLOT, loaders.MatplotlibFigure(), pathlib.Path
+        "train",
+        "loss",
+        types.ArtifactTag.PLOT,
+        cast("loaders.Writer[object]", loaders.MatplotlibFigure()),
+        pathlib.Path,
     )
     _register_stage(mock_discovery, "train", [ref])
 
@@ -131,7 +142,7 @@ def test_complete_targets_stage_without_key(mock_discovery: pipeline_mod.Pipelin
     outs = [_helper_ref("train", None, types.ArtifactTag.DATA, loaders.CSV(), pathlib.Path)]
     _register_stage(mock_discovery, "train", outs)
 
-    result = completion.complete_targets(None, None, "")
+    result = completion.complete_targets(_CTX, _PARAM, "")
 
     assert "train" in result
 
@@ -143,7 +154,7 @@ def test_complete_targets_multiple_stages(mock_discovery: pipeline_mod.Pipeline)
     _register_stage(mock_discovery, "train", outs1)
     _register_stage(mock_discovery, "eval", outs2)
 
-    result = completion.complete_targets(None, None, "")
+    result = completion.complete_targets(_CTX, _PARAM, "")
 
     assert "train" in result
     assert "eval" in result

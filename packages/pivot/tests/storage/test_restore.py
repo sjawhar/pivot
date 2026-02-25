@@ -596,7 +596,7 @@ def test_restore_file_from_remote_caches_with_readonly_permissions(
     # Mock remote.fetch_from_remote to return our content
     monkeypatch.setattr(
         "pivot.storage.restore.remote.fetch_from_remote",
-        lambda h: content,  # pyright: ignore[reportUnknownLambdaType, reportUnknownArgumentType]
+        lambda h: content,
     )
 
     output_path = repo_path / "restored_data.csv"
@@ -652,7 +652,7 @@ def test_restore_file_from_remote_hash_mismatch(
     # Mock remote.fetch_from_remote to return WRONG content (simulating corruption)
     monkeypatch.setattr(
         "pivot.storage.restore.remote.fetch_from_remote",
-        lambda h: actual_content,  # pyright: ignore[reportUnknownLambdaType, reportUnknownArgumentType]
+        lambda h: actual_content,
     )
 
     output_path = repo_path / "restored_data.csv"
@@ -703,7 +703,7 @@ def test_restore_file_from_remote_success(
     monkeypatch.setattr(project, "_project_root_cache", repo_path)
     monkeypatch.setattr(
         "pivot.storage.restore.remote.fetch_from_remote",
-        lambda h: content,  # pyright: ignore[reportUnknownLambdaType, reportUnknownArgumentType]
+        lambda h: content,
     )
 
     # Create output directory as read-only to simulate write failure

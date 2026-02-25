@@ -751,7 +751,7 @@ def test_lock_read_ignores_display_fields(set_project_root: Path) -> None:
 
     stage_lock.path.parent.mkdir(parents=True, exist_ok=True)
     stage_lock.path.write_text(
-        "code_manifest: {self:dir_out_stage: fingerprint}\n"
+        "code_manifest: {self:dir_out_stage: fingerprint}\n"  # noqa: ISC003
         "params: {}\n"
         "schema_version: 2\n"
         "deps:\n"

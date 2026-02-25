@@ -16,7 +16,7 @@ if TYPE_CHECKING:
 def test_entry_display_uses_identity_key() -> None:
     entry = cast(
         "types.OutEntry",
-        {"key": "model", "hash": "abc123", "tag": "data", "path": "legacy/path"},
+        cast("object", {"key": "model", "hash": "abc123", "tag": "data", "path": "legacy/path"}),
     )
 
     assert restore._entry_display(entry) == "model"

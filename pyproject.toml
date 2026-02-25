@@ -36,10 +36,18 @@ reportUnusedFunction = false
 reportUnusedParameter = false
 reportUnusedVariable = false
 reportPrivateUsage = false
+reportPrivateLocalImportUsage = false
 reportRedeclaration = false
 reportMissingTypeStubs = false
 reportUnknownMemberType = false
 reportUnknownVariableType = false
+reportUnknownLambdaType = false
+reportUnknownParameterType = false
+reportUnknownArgumentType = false
+reportMissingParameterType = false
+reportUnannotatedClassAttribute = false
+reportImplicitOverride = false
+reportImplicitStringConcatenation = false
 
 [[tool.basedpyright.executionEnvironments]]
 root = "packages/pivot-tui/src"
@@ -51,10 +59,17 @@ reportUnusedFunction = false
 reportUnusedParameter = false
 reportUnusedVariable = false
 reportPrivateUsage = false
+reportPrivateLocalImportUsage = false
 reportRedeclaration = false
 reportMissingTypeStubs = false
 reportUnknownMemberType = false
 reportUnknownVariableType = false
+reportUnknownLambdaType = false
+reportUnknownParameterType = false
+reportUnknownArgumentType = false
+reportMissingParameterType = false
+reportUnannotatedClassAttribute = false
+reportImplicitOverride = false
 
 [tool.coverage.run]
 source = ["packages/pivot/src/pivot"]

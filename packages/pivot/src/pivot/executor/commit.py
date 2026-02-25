@@ -58,7 +58,7 @@ def commit_stages(
     from pivot.cli import helpers as cli_helpers
 
     stage_registry = _get_registry()
-    pipeline = cli_helpers._get_pipeline()
+    pipeline = cli_helpers._get_pipeline()  # pyright: ignore[reportPrivateUsage] - cross-module integration
     all_stage_names = stage_registry.list_stages()
 
     # Resolve target stages

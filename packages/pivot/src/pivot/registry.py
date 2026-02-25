@@ -1,7 +1,6 @@
 # pyright: reportImplicitRelativeImport=false, reportMissingModuleSource=false, reportExplicitAny=false, reportAny=false
 from __future__ import annotations
 
-import enum
 import inspect
 import logging
 import pathlib
@@ -51,22 +50,14 @@ class RegistryStageInfo(TypedDict):
     collection_params: dict[str, str]
 
 
-class ValidationMode(enum.StrEnum):
-    """Validation strictness levels."""
-
-    ERROR = "error"  # Raise exception on validation failure
-    WARN = "warn"  # Log warning, allow registration
-
-
 class StageRegistry:
     """Registry for pipeline stages and DAG construction."""
 
     _stages: dict[str, RegistryStageInfo]
 
-    def __init__(self, validation_mode: ValidationMode = ValidationMode.ERROR) -> None:
+    def __init__(self) -> None:
         self._stages = dict[str, RegistryStageInfo]()
         self._cached_dag: DiGraph[str] | None = None
-        self.validation_mode: ValidationMode = validation_mode
 
     def add_existing(self, stage_info: RegistryStageInfo) -> None:
         """Add a pre-validated stage info (for pipeline composition).
@@ -160,14 +151,23 @@ class StageRegistry:
         self._cached_dag = None
 
     def get_all_output_paths(self) -> set[str]:
-        """Get all registered output paths (for watch mode filtering)."""
+        """Get all registered output paths (for watch mode filtering).
+
+        Known limitation: returns empty set. Identity-based artifacts from
+        the compose API need Store-backed path resolution.
+        """
         return set[str]()
 
 
 def _compute_fingerprint(stage_name: str, info: RegistryStageInfo) -> dict[str, str]:
     """Compute and return a stage fingerprint, wrapping errors."""
     try:
-        unwrapped = inspect.unwrap(info["func"])
+        # Check every layer in the wrapper chain, not just the innermost function,
+        # so @no_fingerprint() works regardless of decorator stacking order.
+        unwrapped = inspect.unwrap(
+            info["func"],
+            stop=lambda f: getattr(f, "__pivot_no_fingerprint__", False),
+        )
         if getattr(unwrapped, "__pivot_no_fingerprint__", False):
             result = _compute_file_fingerprint(info["func"])
         else:

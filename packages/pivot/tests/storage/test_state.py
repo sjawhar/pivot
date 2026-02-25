@@ -756,7 +756,7 @@ def test_readonly_blocks_save_many(tmp_path: pathlib.Path) -> None:
 def test_readonly_blocks_increment_generation(tmp_path: pathlib.Path) -> None:
     """Readonly mode blocks increment_generation operation."""
     db_path = tmp_path / "state.db"
-    tmp_path / "output.txt"
+    _ = tmp_path / "output.txt"
 
     with state.StateDB(db_path) as db:
         pass  # Just create
@@ -1921,3 +1921,200 @@ def test_apply_deferred_writes_empty_output_paths_with_flag_true(
     with state.StateDB(db_path) as db:
         # Should not raise
         db.apply_deferred_writes("stage", [], deferred)
+
+
+def test_run_manifest_write_read_roundtrip(tmp_path: pathlib.Path) -> None:
+    db_path = tmp_path / "state.db"
+    manifest = run_history.RunManifest(
+        run_id="20260101_000001_a1b2c3d4",
+        started_at="2026-01-01T00:00:01Z",
+        ended_at="2026-01-01T00:00:02Z",
+        targeted_stages=["train"],
+        execution_order=["train"],
+        stages={
+            "train": run_history.StageRunRecord(
+                input_hash="abc123",
+                status=run_history.StageStatus.RAN,
+                reason="ok",
+                duration_ms=10,
+            )
+        },
+    )
+
+    with state.StateDB(db_path) as db:
+        db.write_run(manifest)
+        result = db.read_run(manifest["run_id"])
+
+    assert result == manifest
+
+
+def test_read_run_missing_returns_none(tmp_path: pathlib.Path) -> None:
+    db_path = tmp_path / "state.db"
+
+    with state.StateDB(db_path) as db:
+        result = db.read_run("missing")
+
+    assert result is None
+
+
+def test_list_runs_returns_newest_first_with_limit(tmp_path: pathlib.Path) -> None:
+    db_path = tmp_path / "state.db"
+    runs = [
+        run_history.RunManifest(
+            run_id="20260101_000001_aaaaaaaa",
+            started_at="2026-01-01T00:00:01Z",
+            ended_at="2026-01-01T00:00:02Z",
+            targeted_stages=["a"],
+            execution_order=["a"],
+            stages={
+                "a": run_history.StageRunRecord(
+                    input_hash=None,
+                    status=run_history.StageStatus.CACHED,
+                    reason="cached",
+                    duration_ms=1,
+                )
+            },
+        ),
+        run_history.RunManifest(
+            run_id="20260101_000002_bbbbbbbb",
+            started_at="2026-01-01T00:00:02Z",
+            ended_at="2026-01-01T00:00:03Z",
+            targeted_stages=["b"],
+            execution_order=["b"],
+            stages={
+                "b": run_history.StageRunRecord(
+                    input_hash=None,
+                    status=run_history.StageStatus.RAN,
+                    reason="ran",
+                    duration_ms=2,
+                )
+            },
+        ),
+        run_history.RunManifest(
+            run_id="20260101_000003_cccccccc",
+            started_at="2026-01-01T00:00:03Z",
+            ended_at="2026-01-01T00:00:04Z",
+            targeted_stages=["c"],
+            execution_order=["c"],
+            stages={
+                "c": run_history.StageRunRecord(
+                    input_hash=None,
+                    status=run_history.StageStatus.FAILED,
+                    reason="failed",
+                    duration_ms=3,
+                )
+            },
+        ),
+    ]
+
+    with state.StateDB(db_path) as db:
+        for run in runs:
+            db.write_run(run)
+        latest_two = db.list_runs(limit=2)
+
+    assert [run["run_id"] for run in latest_two] == [
+        "20260101_000003_cccccccc",
+        "20260101_000002_bbbbbbbb",
+    ]
+
+
+def test_prune_runs_removes_old_runs_and_orphan_cache_entries(tmp_path: pathlib.Path) -> None:
+    db_path = tmp_path / "state.db"
+
+    run1 = run_history.RunManifest(
+        run_id="20260101_000001_aaaaaaaa",
+        started_at="2026-01-01T00:00:01Z",
+        ended_at="2026-01-01T00:00:02Z",
+        targeted_stages=["a"],
+        execution_order=["a"],
+        stages={
+            "a": run_history.StageRunRecord(
+                input_hash=None,
+                status=run_history.StageStatus.CACHED,
+                reason="cached",
+                duration_ms=1,
+            )
+        },
+    )
+    run2 = run_history.RunManifest(
+        run_id="20260101_000002_bbbbbbbb",
+        started_at="2026-01-01T00:00:02Z",
+        ended_at="2026-01-01T00:00:03Z",
+        targeted_stages=["b"],
+        execution_order=["b"],
+        stages={
+            "b": run_history.StageRunRecord(
+                input_hash=None,
+                status=run_history.StageStatus.RAN,
+                reason="ran",
+                duration_ms=2,
+            )
+        },
+    )
+
+    with state.StateDB(db_path) as db:
+        db.write_run(run1)
+        db.write_run(run2)
+
+        db.write_run_cache(
+            "stage",
+            "h1",
+            run_history.RunCacheEntry(run_id=run1["run_id"], output_hashes=[]),
+        )
+        db.write_run_cache(
+            "stage",
+            "sentinel",
+            run_history.RunCacheEntry(run_id="__committed__", output_hashes=[]),
+        )
+
+        deleted = db.prune_runs(retention=1)
+        remaining_runs = db.list_runs(limit=10)
+
+        deleted_cache = db.lookup_run_cache("stage", "h1")
+        sentinel_cache = db.lookup_run_cache("stage", "sentinel")
+
+    assert deleted == 1
+    assert [run["run_id"] for run in remaining_runs] == [run2["run_id"]]
+    assert deleted_cache is None
+    assert sentinel_cache is not None
+
+
+def test_list_runs_empty_database_returns_empty_list(tmp_path: pathlib.Path) -> None:
+    db_path = tmp_path / "state.db"
+
+    with state.StateDB(db_path) as db:
+        assert db.list_runs() == []
+
+
+def test_prune_runs_noop_when_within_retention(tmp_path: pathlib.Path) -> None:
+    db_path = tmp_path / "state.db"
+    run = run_history.RunManifest(
+        run_id="20260101_000001_aaaaaaaa",
+        started_at="2026-01-01T00:00:01Z",
+        ended_at="2026-01-01T00:00:02Z",
+        targeted_stages=["a"],
+        execution_order=["a"],
+        stages={
+            "a": run_history.StageRunRecord(
+                input_hash=None,
+                status=run_history.StageStatus.RAN,
+                reason="ran",
+                duration_ms=1,
+            )
+        },
+    )
+
+    with state.StateDB(db_path) as db:
+        db.write_run(run)
+        deleted = db.prune_runs(retention=2)
+
+    assert deleted == 0
+
+
+def test_prune_run_cache_returns_zero_when_nothing_to_delete(tmp_path: pathlib.Path) -> None:
+    db_path = tmp_path / "state.db"
+
+    with state.StateDB(db_path) as db:
+        deleted = db.prune_run_cache({"keep"})
+
+    assert deleted == 0

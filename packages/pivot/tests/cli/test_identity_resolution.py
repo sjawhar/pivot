@@ -64,6 +64,7 @@ def _make_stage_info(outs: list[types.ArtifactRef]) -> RegistryStageInfo:
         "fingerprint": None,
         "params_arg_name": None,
         "state_dir": None,
+        "collection_params": {},
     }
     return info
 

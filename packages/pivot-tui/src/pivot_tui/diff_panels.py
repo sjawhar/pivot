@@ -627,7 +627,7 @@ class OutputDiffPanel(_SelectableExpandablePanel):
             change["old_hash"], change["new_hash"], change["change_type"]
         )
 
-        display = types.identity_key(change["path"])
+        display = types.identity_key(change["identity"])
         return f"{prefix}{indicator} {_escape_padded(display, 25)} {hash_display}{suffix}"
 
     @override
@@ -644,7 +644,7 @@ class OutputDiffPanel(_SelectableExpandablePanel):
         type_label = self._get_type_label(item_type)
 
         lines = [
-            f"[bold]{rich.markup.escape(types.identity_key(change['path']))}[/]",
+            f"[bold]{rich.markup.escape(types.identity_key(change['identity']))}[/]",
             "",
             f"Type: {type_label}",
             f"Status: {self._format_status(change['change_type'])}",
@@ -811,5 +811,5 @@ class OutputDiffPanel(_SelectableExpandablePanel):
         self._stage_name = stage_name
         self._stage_status = status
         self._output_by_path.clear()
-        self._output_by_path.update({types.identity_key(c["path"]): c for c in changes})
+        self._output_by_path.update({types.identity_key(c["identity"]): c for c in changes})
         self._update_display()

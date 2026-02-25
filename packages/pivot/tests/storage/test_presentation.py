@@ -1,14 +1,13 @@
 from __future__ import annotations
 
-import pathlib
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
-from pivot import compose, loaders, types
+from pivot import loaders, types
 from pivot.registry import RegistryStageInfo
 from pivot.storage.presentation import present
 
 if TYPE_CHECKING:
-    pass
+    import pathlib
 
 
 def _make_stage(
@@ -22,7 +21,7 @@ def _make_stage(
         outs=[
             types.ArtifactRef(
                 identity=types.ArtifactIdentity(name, key),
-                format=fmt,
+                format=cast("loaders.Reader[Any]", fmt),
                 python_type=object,
                 tag=tag,
             )
@@ -34,6 +33,7 @@ def _make_stage(
         fingerprint=dict[str, str](),
         params_arg_name=None,
         state_dir=None,
+        collection_params={},
     )
 
 

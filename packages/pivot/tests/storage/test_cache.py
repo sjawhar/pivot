@@ -1971,3 +1971,41 @@ def test_restore_directory_rejects_path_traversal(tmp_path: pathlib.Path) -> Non
         cache._restore_directory_from_cache(
             output_dir, malicious_hash, cache_dir, [cache.CheckoutMode.COPY]
         )
+
+
+def test_checkout_with_fallback_rejects_empty_modes(
+    tmp_path: pathlib.Path,
+) -> None:
+    source = tmp_path / "source.txt"
+    source.write_text("content")
+    cache_dir = tmp_path / "cache"
+    output_hash = cache.save_to_cache(source, cache_dir, checkout_mode=cache.CheckoutMode.COPY)
+    cache_path = cache.get_cache_path(cache_dir, output_hash["hash"])
+    target = tmp_path / "target.txt"
+
+    with pytest.raises(ValueError, match="checkout_modes cannot be empty"):
+        cache._checkout_with_fallback(target, cache_path, [])
+
+
+def test_resolve_checkout_modes_rejects_empty_list() -> None:
+    with pytest.raises(ValueError, match="checkout_modes cannot be empty"):
+        cache._resolve_checkout_modes(None, [])
+
+
+def test_save_file_to_cache_rehashes_when_symlink_target_missing(tmp_path: pathlib.Path) -> None:
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    target = tmp_path / "artifact.txt"
+    target.symlink_to(cache_dir / "ab" / "cdef1234567890")
+
+    real_file = tmp_path / "real.txt"
+    real_file.write_text("actual content")
+
+    result = cache._save_file_to_cache(
+        real_file,
+        cache_dir,
+        state_db=None,
+        checkout_modes=[cache.CheckoutMode.SYMLINK],
+    )
+
+    assert len(result["hash"]) == cache.XXHASH64_HEX_LENGTH

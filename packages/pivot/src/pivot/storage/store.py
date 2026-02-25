@@ -7,7 +7,7 @@ import pathlib
 import tempfile
 from typing import TYPE_CHECKING, Protocol, TypedDict, runtime_checkable
 
-from pivot import compose, config, loaders, types
+from pivot import config, loaders, stage_def, types
 from pivot.storage import cache
 from pivot.storage import state as state_mod
 
@@ -55,7 +55,7 @@ class CacheStore:
             yield db
 
     def _ref_path(self, ref: types.ArtifactRef) -> pathlib.Path:
-        key = ref.identity.key or compose.SINGLE_OUTPUT_KEY
+        key = ref.identity.key or stage_def.SINGLE_OUTPUT_KEY
         return self._ref_dir / ref.identity.producer / key
 
     def checkout(self, ref: types.ArtifactRef) -> pathlib.Path:
@@ -258,7 +258,7 @@ class WorkspaceStore:
 
     def exists(self, ref: types.ArtifactRef) -> bool:
         path = self._resolve_path(ref)
-        return path.exists() or path.is_symlink()
+        return path.exists()
 
 
 def store_from_spec(spec: StoreSpec) -> Store:

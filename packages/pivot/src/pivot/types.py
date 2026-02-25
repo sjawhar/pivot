@@ -244,18 +244,17 @@ class OutputFormat(enum.StrEnum):
 #
 # Two representations exist for different purposes:
 #
-#   StorageLockData   On-disk YAML format. Uses project-relative paths
-#                     (portable across machines) and list-based deps/outs
-#                     (stable YAML output). This is the only place relative
-#                     paths appear in lockfiles — converted at read/write
-#                     boundary in storage/lock.py.
+#   StorageLockData   On-disk YAML format. Uses project-relative paths for
+#                     filesystem deps and identity keys (producer:key) for
+#                     stage-to-stage deps. List-based deps/outs for stable
+#                     YAML output. Converted at read/write boundary in
+#                     storage/lock.py.
 #
-#   LockData          In-memory format. Uses canonical absolute paths
-#                     (matching registry/engine convention, fast comparisons)
-#                     and dict-based deps/outs (O(1) lookups by path).
+#   LockData          In-memory format. Uses ArtifactIdentity-keyed dicts
+#                     for deps/outs (O(1) lookups). Identity keys are
+#                     derived from ArtifactRef objects via identity_key().
 #
 # Conversion happens at read/write time in storage/lock.py.
-#
 
 
 class ArtifactIdentity(NamedTuple):
@@ -453,7 +452,7 @@ class DepChange(TypedDict):
 class OutputChange(TypedDict):
     """Change info for an output file."""
 
-    path: ArtifactIdentity
+    identity: ArtifactIdentity
     old_hash: str | None
     new_hash: str | None
     change_type: ChangeType | None  # None means unchanged

@@ -13,6 +13,7 @@ from typing import (
     IO,
     TYPE_CHECKING,
     ClassVar,
+    Literal,
     Protocol,
     override,
 )
@@ -115,6 +116,20 @@ def _safe_change_type(raw: object) -> ChangeType | None:
         return None
 
 
+def _safe_output_type(raw: object) -> Literal["out", "metric", "plot"]:
+    """Convert raw output_type to the OutputChange literal values."""
+    match raw:
+        case "out":
+            return "out"
+        case "metric":
+            return "metric"
+        case "plot":
+            return "plot"
+        case _:
+            _logger.warning("Unknown output_type %r, defaulting to 'out'", raw)
+            return "out"
+
+
 def _convert_output_summary(
     raw: list[dict[str, object]] | None,
 ) -> list[OutputChange] | None:
@@ -128,11 +143,11 @@ def _convert_output_summary(
         path_key = path_raw if isinstance(path_raw, str) else "unknown"
         result.append(
             OutputChange(
-                path=types.identity_from_key(path_key),
+                identity=types.identity_from_key(path_key),
                 old_hash=str(item["old_hash"]) if item.get("old_hash") is not None else None,
                 new_hash=str(item["new_hash"]) if item.get("new_hash") is not None else None,
                 change_type=_safe_change_type(change_type_raw),
-                output_type=str(item.get("output_type", "out")),  # pyright: ignore[reportArgumentType] - raw JSON str
+                output_type=_safe_output_type(item.get("output_type")),
             )
         )
     return result

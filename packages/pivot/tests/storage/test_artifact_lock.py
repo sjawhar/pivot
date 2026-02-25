@@ -91,6 +91,21 @@ def test_write_dominates_read() -> None:
     assert lock_map["stage:output"] is artifact_lock.LockMode.WRITE
 
 
+def test_expand_lock_requests_uses_producer_for_none_key() -> None:
+    project_root = pathlib.Path("/project")
+    dep_ref = types.ArtifactRef(
+        identity=types.ArtifactIdentity("upstream_stage", None),
+        format=loaders.JSON(),
+        python_type=dict,
+        tag=types.ArtifactTag.DATA,
+    )
+
+    result = artifact_lock.expand_lock_requests({"dep": dep_ref}, [], project_root)
+
+    lock_map = _helper_lock_map(result)
+    assert lock_map["upstream_stage"] is artifact_lock.LockMode.READ
+
+
 def test_deterministic_sort() -> None:
     project_root = pathlib.Path("/project")
     dep_a = types.ArtifactRef(
@@ -225,6 +240,21 @@ def test_flock_lock_files_created(tmp_path: pathlib.Path) -> None:
     with svc.acquire_many(requests):
         lock_files = list(lock_dir.iterdir())
         assert len(lock_files) == 2, f"Expected 2 lock files, got {lock_files}"
+
+
+def test_flock_acquire_many_normalizes_to_strongest_mode(tmp_path: pathlib.Path) -> None:
+    svc = _FlockLockService(tmp_path / "locks")
+    requests = [
+        _helper_make_request("alpha", _FlockLockMode.READ),
+        _helper_make_request("alpha", _FlockLockMode.WRITE),
+        _helper_make_request("alpha", _FlockLockMode.READ),
+    ]
+
+    handle = svc.acquire_many(requests)
+    try:
+        assert len(handle._fds) == 1
+    finally:
+        handle.release()
 
 
 def test_flock_status_callback_invoked(tmp_path: pathlib.Path) -> None:

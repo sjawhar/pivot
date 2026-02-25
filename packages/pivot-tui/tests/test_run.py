@@ -21,6 +21,7 @@ from pivot.types import (
     TuiStatusMessage,
     TuiWatchMessage,
     WatchStatus,
+    identity_key,
 )
 from pivot_tui import run as run_tui
 from pivot_tui.screens import ConfirmCommitScreen
@@ -1228,7 +1229,9 @@ def test_handle_status_stores_output_summary_on_stage_info() -> None:
     snapshot = app._stages["train"].live_output_snapshot
     assert snapshot is not None, "output_summary should be converted and stored"
     assert len(snapshot) == 1
-    assert snapshot[0]["path"] == ArtifactIdentity("output.csv", None)
+    assert identity_key(snapshot[0]["identity"]) == identity_key(
+        ArtifactIdentity("output.csv", None)
+    )
     assert snapshot[0]["change_type"] == "modified"
 
 

@@ -85,3 +85,63 @@ def test_normalize_path_default_base_is_project_root(
     result = project.normalize_path("relative/path.txt")
 
     assert result == tmp_path / "relative" / "path.txt"
+
+
+def test_resolve_path_for_comparison_wraps_permission_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _helper_raise_permission(_: str) -> pathlib.Path:
+        raise PermissionError("no access")
+
+    monkeypatch.setattr(project, "resolve_path", _helper_raise_permission)
+
+    with pytest.raises(PermissionError, match="input 'data.csv'"):
+        project.resolve_path_for_comparison("data.csv", "input")
+
+
+def test_resolve_path_for_comparison_falls_back_for_stage_output_file_missing(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _helper_raise_not_found(_: str) -> pathlib.Path:
+        raise FileNotFoundError()
+
+    monkeypatch.setattr(project, "resolve_path", _helper_raise_not_found)
+
+    result = project.resolve_path_for_comparison("outs/model.pkl", "stage output")
+    assert result == project.normalize_path("outs/model.pkl")
+
+
+def test_resolve_path_for_comparison_reraises_not_found_for_non_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _helper_raise_not_found(_: str) -> pathlib.Path:
+        raise FileNotFoundError()
+
+    monkeypatch.setattr(project, "resolve_path", _helper_raise_not_found)
+
+    with pytest.raises(FileNotFoundError):
+        project.resolve_path_for_comparison("deps/input.csv", "dependency")
+
+
+def test_try_resolve_path_returns_none_on_oserror(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _helper_raise_oserror(_: str) -> pathlib.Path:
+        raise OSError("bad filesystem")
+
+    monkeypatch.setattr(project, "resolve_path", _helper_raise_oserror)
+
+    assert project.try_resolve_path("data.csv") is None
+
+
+def test_to_relative_path_returns_input_for_relative(tmp_path: pathlib.Path) -> None:
+    result = project.to_relative_path("already/relative.txt", base=tmp_path)
+    assert result == "already/relative.txt"
+
+
+def test_to_absolute_path_with_base_and_absolute_passthrough(tmp_path: pathlib.Path) -> None:
+    relative = project.to_absolute_path("data/file.txt", base=tmp_path)
+    absolute_input = tmp_path / "already_abs.txt"
+    absolute = project.to_absolute_path(str(absolute_input), base=tmp_path)
+
+    assert relative == tmp_path / "data" / "file.txt"
+    assert absolute == absolute_input

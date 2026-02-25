@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import os
 import pathlib  # noqa: TCH003 - used at runtime by pytest fixtures (tmp_path)
 import threading
 import time
 import unicodedata
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from pivot import ignore
 
@@ -543,3 +544,68 @@ def test_works_without_user_pivotignore(tmp_path: pathlib.Path) -> None:
 
     # Should not raise, just have no user patterns
     assert not filter_instance.is_ignored("any_file.txt")
+
+
+def test_filter_entries_filters_ignored_and_keeps_protected(tmp_path: pathlib.Path) -> None:
+    pivotignore = tmp_path / ".pivotignore"
+    pivotignore.write_text("*.tmp\n")
+
+    protected = tmp_path / "pivot.yaml"
+    protected.write_text("stages: {}")
+    kept = tmp_path / "keep.txt"
+    kept.write_text("ok")
+    ignored_file = tmp_path / "temp.tmp"
+    ignored_file.write_text("drop")
+
+    filter_instance = ignore.IgnoreFilter(project_root=tmp_path)
+    with os.scandir(tmp_path) as entries:
+        result_names = [entry.name for entry in filter_instance.filter_entries(entries, tmp_path)]
+
+    assert "pivot.yaml" in result_names
+    assert "keep.txt" in result_names
+    assert "temp.tmp" not in result_names
+
+
+def test_filter_entries_keeps_entries_outside_base(tmp_path: pathlib.Path) -> None:
+    pivotignore = tmp_path / ".pivotignore"
+    pivotignore.write_text("*.txt\n")
+
+    other_root = tmp_path.parent / f"{tmp_path.name}_outside"
+    other_root.mkdir()
+    outside_file = other_root / "outside.txt"
+    outside_file.write_text("ok")
+
+    filter_instance = ignore.IgnoreFilter(project_root=tmp_path)
+    with os.scandir(other_root) as entries:
+        result = list(filter_instance.filter_entries(entries, tmp_path))
+
+    assert len(result) == 1
+    assert result[0].name == "outside.txt"
+
+
+def test_reload_spec_falls_back_when_compile_fails(
+    tmp_path: pathlib.Path,
+    mocker: MockerFixture,
+    caplog: LogCaptureFixture,
+) -> None:
+    pivotignore = tmp_path / ".pivotignore"
+    pivotignore.write_text("*.log\n")
+
+    original_from_lines = ignore.pathspec.PathSpec.from_lines
+    call_count = 0
+
+    def _helper_from_lines(kind: str, patterns: object):
+        nonlocal call_count
+        call_count += 1
+        pattern_list = list(cast("list[str]", patterns))
+        if call_count == 2 and pattern_list == ["*.log"]:
+            raise ValueError("compile failed")
+        return original_from_lines(kind, pattern_list)
+
+    mocker.patch.object(ignore.pathspec.PathSpec, "from_lines", side_effect=_helper_from_lines)
+
+    filter_instance = ignore.IgnoreFilter(project_root=tmp_path)
+    with caplog.at_level("WARNING"):
+        assert filter_instance.is_ignored("x.log") is False
+
+    assert "Failed to compile ignore patterns" in caplog.text

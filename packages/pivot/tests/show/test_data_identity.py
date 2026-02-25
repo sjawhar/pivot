@@ -4,11 +4,7 @@ import inspect
 import pathlib
 from typing import TYPE_CHECKING
 
-import click.testing
-import pytest
-
 from pivot import git, loaders, project, types
-from pivot import cli as cli_module
 from pivot.cli import helpers as cli_helpers
 from pivot.registry import RegistryStageInfo
 from pivot.show import common as show_common
@@ -17,7 +13,7 @@ from pivot.storage import store as store_mod
 from pivot.types import DataFileFormat, StorageLockData
 
 if TYPE_CHECKING:
-    from pivot.pipeline import pipeline as pipeline_mod
+    import pytest
 
 
 def _make_artifact_ref(
@@ -50,6 +46,7 @@ def _make_stage_info(name: str, outs: list[types.ArtifactRef]) -> RegistryStageI
         fingerprint={"_code": "fake_hash"},
         params_arg_name=None,
         state_dir=None,
+        collection_params={},
     )
 
 

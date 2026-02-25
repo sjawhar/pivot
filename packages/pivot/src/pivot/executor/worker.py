@@ -166,6 +166,7 @@ class TrackedDict(dict[str, Any]):
         super().__init__(*args, **kwargs)
         self._accessed_keys = set[str]()
 
+    @override
     def __getitem__(self, key: str) -> Any:
         self._accessed_keys.add(key)
         return super().__getitem__(key)
@@ -213,14 +214,13 @@ def execute_stage(
     state_db_path = stage_info["state_dir"] / "state.db"
     project_root = stage_info["project_root"]
     store = store_mod.store_from_spec(stage_info["store_spec"])
-    use_store = _uses_artifact_refs(stage_info)
+    use_store = True
 
     # For store-based stages, mark outputs as produced so _resolve_path returns
     # the correct output path (not input path) during run cache skip checks
     if use_store and isinstance(store, store_mod.WorkspaceStore):
         for out in stage_info["outs"]:
-            if isinstance(out, types.ArtifactRef):
-                cast("store_mod.WorkspaceStore", store)._output_producers.add(out.identity.producer)  # pyright: ignore[reportPrivateUsage]
+            store._output_producers.add(out.identity.producer)  # pyright: ignore[reportPrivateUsage]
 
     # Set project root cache explicitly - workers in reusable pool may have
     # stale cache from previous execution in different project/test.
@@ -254,12 +254,7 @@ def execute_stage(
         # Acquire artifact locks (READ on deps, WRITE on outs)
         deps_info = stage_info["deps"]
         outs_info = stage_info["outs"]
-        if isinstance(deps_info, list):
-            lock_requests = _legacy_lock_requests(
-                deps_info, cast("Sequence[outputs.ExpandedOut]", outs_info)
-            )
-        else:
-            lock_requests = artifact_lock.expand_lock_requests(deps_info, outs_info, project_root)
+        lock_requests = artifact_lock.expand_lock_requests(deps_info, outs_info, project_root)
         lock_service = artifact_lock.LocalFlockLockService(stage_info["state_dir"] / "locks")
 
         def _on_lock_status(_key: str, _mode: artifact_lock.LockMode, _elapsed: float) -> None:
@@ -387,7 +382,7 @@ def execute_stage(
                             run_cache_skip = _try_skip_via_run_cache_with_store(
                                 stage_name,
                                 input_hash,
-                                cast("list[types.ArtifactRef]", stage_outs),
+                                stage_outs,
                                 store,
                                 state_db,
                             )
@@ -474,7 +469,6 @@ def execute_stage(
                         output_queue,
                         ring_buffer,
                         params_instance,
-                        None,
                         project_root,
                         None,
                         stage_info["params_arg_name"],
@@ -575,27 +569,6 @@ def _outputs_exist_with_store(store: store_mod.Store, outs: list[types.ArtifactR
     return all(store.exists(ref) for ref in outs)
 
 
-def _legacy_lock_requests(
-    deps: list[str],
-    outs: Sequence[outputs.ExpandedOut],
-) -> list[artifact_lock.LockRequest]:
-    key_to_mode = dict[str, artifact_lock.LockMode]()
-    for dep in deps:
-        key_to_mode[dep] = artifact_lock.LockMode.READ
-    for out in outs:
-        key_to_mode[str(out.path)] = artifact_lock.LockMode.WRITE
-    return [{"key": key, "mode": key_to_mode[key]} for key in sorted(key_to_mode)]
-
-
-def _uses_artifact_refs(stage_info: WorkerStageInfo) -> bool:
-    deps = stage_info.get("deps", {})
-    if isinstance(deps, dict) and deps:
-        first = next(iter(deps.values()))
-        return isinstance(first, types.ArtifactRef)
-    outs = stage_info.get("outs", [])
-    return bool(outs) and isinstance(outs[0], types.ArtifactRef)
-
-
 def _get_normalized_out_paths(stage_info: WorkerStageInfo) -> list[str]:
     outs = stage_info.get("outs", [])
     return [types.identity_key(out.identity) for out in outs]
@@ -613,24 +586,18 @@ def _deps_list_for_input_hash(
     dep_hashes: dict[str, HashInfo],
 ) -> list[DepEntry]:
     deps_info = stage_info["deps"]
-    if isinstance(deps_info, dict):
-        entries = list[DepEntry]()
-        for ref in deps_info.values():
-            dep_key = types.identity_key(ref.identity)
-            hash_info = dep_hashes[dep_key]
-            entries.append(
-                DepEntry(
-                    producer=ref.identity.producer,
-                    key=ref.identity.key,
-                    hash=hash_info["hash"],
-                )
+    entries = list[DepEntry]()
+    for ref in deps_info.values():
+        dep_key = types.identity_key(ref.identity)
+        hash_info = dep_hashes[dep_key]
+        entries.append(
+            DepEntry(
+                producer=ref.identity.producer,
+                key=ref.identity.key,
+                hash=hash_info["hash"],
             )
-        return entries
-
-    return [
-        DepEntry(producer=path, key=None, hash=info["hash"], display=path)
-        for path, info in dep_hashes.items()
-    ]
+        )
+    return entries
 
 
 def _check_skip_or_run(
@@ -945,7 +912,6 @@ def _run_stage_function_with_injection(
     output_queue: Queue[OutputMessage],
     ring_buffer: _OutputRingBuffer,
     params: stage_def.StageParams | None = None,
-    dep_specs: dict[str, stage_def.FuncDepSpec] | None = None,
     project_root: pathlib.Path | None = None,
     out_specs: Mapping[str, outputs.BaseOut] | None = None,
     params_arg_name: str | None = None,
@@ -960,10 +926,9 @@ def _run_stage_function_with_injection(
             ...
 
     The function:
-    1. Loads deps from disk based on dep_specs
-    2. Builds kwargs dict (params + loaded deps)
-    3. Calls the function with kwargs
-    4. Saves outputs based on out_specs (resolved at registration time)
+    1. Builds kwargs dict from params
+    2. Calls the function with kwargs
+    3. Saves outputs based on out_specs (resolved at registration time)
 
     Args:
         out_specs: Output specs resolved at registration time (return key -> Out).
@@ -984,11 +949,7 @@ def _run_stage_function_with_injection(
                 )
             kwargs[params_arg_name] = params
 
-        # Load and inject deps
         root = project_root if project_root is not None else project.get_project_root()
-        if dep_specs:
-            loaded_deps = stage_def.load_deps_from_specs(dep_specs, root)
-            kwargs.update(loaded_deps)
 
         _set_deterministic_seeds()
 
@@ -1042,6 +1003,7 @@ def _resolve_output_values(
         raise RuntimeError(
             f"Stage '{stage_name}' returned {type(result).__name__} but expected a mapping"
         )
+    typed_result = cast("Mapping[str, Any]", result)
 
     value_map = dict[types.ArtifactRef, Any]()
     missing = list[str]()
@@ -1049,17 +1011,18 @@ def _resolve_output_values(
         key = out.identity.key
         if key is None:
             raise RuntimeError(f"Stage '{stage_name}' has multiple outputs but missing output key")
-        if key not in result:
+        if key not in typed_result:
             missing.append(key)
             continue
-        value_map[out] = result[key]
+        value_map[out] = typed_result[key]
 
     if missing:
         raise KeyError(
-            f"Missing return output keys: {sorted(missing)}. Return value keys: {sorted(result.keys())}"
+            f"Missing return output keys: {sorted(missing)}. Return value keys: {sorted(typed_result.keys())}"
         )
 
-    extra = set(result.keys()) - {out.identity.key for out in outs if out.identity.key is not None}
+    declared_keys: set[str] = {out.identity.key for out in outs if out.identity.key is not None}
+    extra: set[str] = set(typed_result.keys()) - declared_keys
     if extra:
         logger.warning("Extra keys in return value not declared as outputs: %s", sorted(extra))
 
@@ -1076,14 +1039,15 @@ def _write_output_with_store(
             raise RuntimeError(
                 f"Directory output for '{ref.identity.producer}' expects dict, got {type(value).__name__}"
             )
-        if not value:
+        typed_value = cast("dict[str, Any]", value)
+        if not typed_value:
             raise ValueError(f"Directory output '{ref.identity.producer}': dict must be non-empty")
-        for key, item_value in value.items():
-            if not isinstance(key, str):
+        for key, item_value in typed_value.items():
+            if not isinstance(key, str):  # pyright: ignore[reportUnnecessaryIsInstance] - runtime validation of user data
                 raise ValueError(
                     f"Directory output '{ref.identity.producer}': keys must be strings, got {type(key).__name__}"
                 )
-            normalized = stage_def._validate_directory_out_key(key, ref.identity.producer)
+            normalized = stage_def._validate_directory_out_key(key, ref.identity.producer)  # pyright: ignore[reportPrivateUsage] - cross-module integration
             full_path = output_path / normalized
             full_path.parent.mkdir(parents=True, exist_ok=True)
             writer.save(item_value, full_path)
@@ -1170,7 +1134,8 @@ def _run_stage_function_with_store(
             if isinstance(value, TrackedDict):
                 accessed[name] = set(value.accessed_keys)
             elif isinstance(value, (list, tuple)):
-                for item in value:
+                typed_items = cast("list[Any] | tuple[Any, ...]", value)
+                for item in typed_items:
                     if isinstance(item, TrackedDict):
                         accessed.setdefault(name, set()).update(item.accessed_keys)
 
@@ -1442,7 +1407,7 @@ def can_skip_via_generation(
     current_params: dict[str, Any],
     lock_data: LockData,
     state_db: state.StateDB,
-    verify_files: bool = True,
+    verify_files: bool = True,  # pyright: ignore[reportUnusedParameter]
 ) -> bool:
     """Check if stage can skip using O(1) generation tracking.
 
@@ -1456,10 +1421,7 @@ def can_skip_via_generation(
 
     # Compare output identities (outs_paths is already normalized by _get_normalized_out_paths)
     normalized_outs = sorted(outs_paths)
-    locked_out_paths = sorted(
-        types.identity_key(k) if isinstance(k, types.ArtifactIdentity) else k
-        for k in lock_data["output_hashes"]
-    )
+    locked_out_paths = sorted(types.identity_key(k) for k in lock_data["output_hashes"])
     if normalized_outs != locked_out_paths:
         return False
 

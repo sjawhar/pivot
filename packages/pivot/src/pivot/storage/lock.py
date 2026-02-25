@@ -87,12 +87,10 @@ def is_lock_data(data: object) -> TypeGuard[StorageLockData]:
             typed_entry = cast("dict[str, object]", raw_entry)
             if not typed_entry.get("hash"):
                 return False
-            if list_key == "deps":
-                if "producer" not in typed_entry or "key" not in typed_entry:
-                    return False
-            if list_key == "outs":
-                if "key" not in typed_entry or "tag" not in typed_entry:
-                    return False
+            if list_key == "deps" and ("producer" not in typed_entry or "key" not in typed_entry):
+                return False
+            if list_key == "outs" and ("key" not in typed_entry or "tag" not in typed_entry):
+                return False
     return True
 
 

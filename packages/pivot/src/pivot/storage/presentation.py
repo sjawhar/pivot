@@ -10,9 +10,10 @@ from __future__ import annotations
 
 import logging
 import pathlib  # noqa: TCH003 - used at runtime for path operations
+import shutil
 from typing import TYPE_CHECKING
 
-from pivot import compose, types
+from pivot import stage_def, types
 from pivot.storage import store as store_mod
 
 if TYPE_CHECKING:
@@ -66,7 +67,7 @@ def _ref_path(refs_dir: pathlib.Path, ref: types.ArtifactRef) -> pathlib.Path:
 
     Mirrors CacheStore._ref_path: uses SINGLE_OUTPUT_KEY for key=None.
     """
-    key = ref.identity.key or compose.SINGLE_OUTPUT_KEY
+    key = ref.identity.key or stage_def.SINGLE_OUTPUT_KEY
     return refs_dir / ref.identity.producer / key
 
 
@@ -76,6 +77,9 @@ def _ensure_symlink(display_path: pathlib.Path, ref_path: pathlib.Path) -> None:
 
     # Remove existing symlink/file if present
     if display_path.is_symlink() or display_path.exists():
-        display_path.unlink()
+        if display_path.is_dir() and not display_path.is_symlink():
+            shutil.rmtree(display_path)
+        else:
+            display_path.unlink()
 
     display_path.symlink_to(ref_path.resolve())

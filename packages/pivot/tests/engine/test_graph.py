@@ -43,6 +43,7 @@ def _create_stage(
         fingerprint=dict[str, str](),
         params_arg_name=None,
         state_dir=None,
+        collection_params={},
     )
 
 

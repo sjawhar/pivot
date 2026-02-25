@@ -1,7 +1,6 @@
 # pyright: reportImplicitRelativeImport=false, reportMissingImports=false
 from __future__ import annotations
 
-import dataclasses
 import logging
 import pathlib  # noqa: TC003 - used at runtime in _write_output
 import unicodedata
@@ -244,87 +243,3 @@ def save_return_outputs(
     for full_path, value, loader in write_ops:
         full_path.parent.mkdir(parents=True, exist_ok=True)
         loader.save(value, full_path)
-
-
-# ==============================================================================
-# Dependency injection helpers
-# ==============================================================================
-
-
-@dataclasses.dataclass(frozen=True)
-class FuncDepSpec:
-    """Specification for a function argument dependency (from Annotated marker).
-
-    Attributes:
-        path: The file path(s) for this dependency.
-        loader: The loader to use for loading the file(s).
-        creates_dep_edge: If True (default), creates a DAG dependency edge.
-            Set to False for IncrementalOut used as input (self-referential,
-            no DAG edge to avoid circular dependency).
-    """
-
-    path: outputs.PathType
-    loader: loaders.Reader[Any]
-    creates_dep_edge: bool = True
-
-
-def _load_single_dep(
-    name: str,
-    path: str,
-    spec: FuncDepSpec,
-    project_root: pathlib.Path,
-) -> Any:
-    """Load a single dependency file with error context.
-
-    For deps with creates_dep_edge=False (IncrementalOut as input), returns an
-    empty instance from the loader if the file doesn't exist (first run).
-    """
-    from pivot import loaders as loaders_module
-
-    full_path = project_root / path
-    if not spec.creates_dep_edge and not full_path.exists():
-        # IncrementalOut as input: file doesn't exist yet (first run)
-        # IncrementalOut.loader is always a Loader (has empty()), narrow the type
-        if not isinstance(spec.loader, loaders_module.Loader):
-            raise RuntimeError(
-                f"Dependency '{name}' has creates_dep_edge=False but loader is not a Loader"
-            )
-        # Cast to Loader[Any, Any] - isinstance narrows but basedpyright keeps Unknown params
-        loader = cast("loaders_module.Loader[Any, Any]", spec.loader)
-        return loader.empty()
-    try:
-        return spec.loader.load(full_path)
-    except Exception as e:
-        raise RuntimeError(f"Failed to load dependency '{name}' from '{path}': {e}") from e
-
-
-def load_deps_from_specs(
-    specs: dict[str, FuncDepSpec],
-    project_root: pathlib.Path,
-    path_overrides: Mapping[str, outputs.PathType] | None = None,
-) -> dict[str, Any]:
-    """Load dependency files based on specs.
-
-    For single-file deps (path is str), loads and returns the single value.
-    For multi-file deps (path is list/tuple), loads each file and returns as list/tuple.
-
-    Args:
-    specs: Dep specs from pipeline composition
-        project_root: Root directory for relative paths
-        path_overrides: Optional dict of dep name -> custom path(s)
-
-    Returns:
-        Dict of dep name -> loaded data
-    """
-    loaded = dict[str, Any]()
-
-    for name, spec in specs.items():
-        path = path_overrides[name] if path_overrides and name in path_overrides else spec.path
-        if isinstance(path, (list, tuple)):
-            items = [_load_single_dep(name, p, spec, project_root) for p in path]
-            # Preserve tuple type for fixed-length deps
-            loaded[name] = tuple(items) if isinstance(path, tuple) else items
-        else:
-            loaded[name] = _load_single_dep(name, path, spec, project_root)
-
-    return loaded

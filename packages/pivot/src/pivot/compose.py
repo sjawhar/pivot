@@ -18,6 +18,7 @@ from . import project, registry, stage_def, types
 from .pipeline import pipeline as pipeline_mod
 
 if TYPE_CHECKING:
+    import collections.abc
     import pathlib
     from collections.abc import Callable
 
@@ -41,7 +42,7 @@ class _PlotTag:
 metric = _MetricTag()
 plot = _PlotTag()
 
-SINGLE_OUTPUT_KEY = "_single"
+SINGLE_OUTPUT_KEY = stage_def.SINGLE_OUTPUT_KEY
 
 
 class CollectionKind(enum.StrEnum):
@@ -81,7 +82,7 @@ def _handle_to_artifact_ref(handle: ArtifactHandle, consumer_name: str) -> types
     if not source.output_specs:
         raise TypeError(
             f"Stage '{consumer_name}' depends on '{source.name}' which has no outputs "
-            f"(returns None). A stage must produce outputs to be used as a dependency."
+            + "(returns None). A stage must produce outputs to be used as a dependency."
         )
     if len(source.output_specs) == 1:
         output_spec = source.output_specs[0]
@@ -94,8 +95,8 @@ def _handle_to_artifact_ref(handle: ArtifactHandle, consumer_name: str) -> types
             available = [spec.key for spec in source.output_specs]
             raise TypeError(
                 f"Stage '{consumer_name}' received handle from multi-output stage "
-                f"'{source.name}' without selecting an output. "
-                f"Use .field or ['key']. Available: {available}"
+                + f"'{source.name}' without selecting an output. "
+                + f"Use .<key> attribute access or ['key'] subscript. Available: {available}"
             )
         output_spec = matched
         output_key = output_spec.key
@@ -204,7 +205,7 @@ class Pipeline:
         )
 
     @contextlib.contextmanager
-    def variant(self, name: str) -> typing.Generator[None]:
+    def variant(self, name: str) -> collections.abc.Generator[None]:
         """Context manager for registering stages with a variant suffix.
 
         All stages registered within the block get @{name} appended to their stage name.
@@ -255,10 +256,24 @@ class Pipeline:
         params: stage_def.StageParams | None = None
         for param_name, value in bound.arguments.items():
             if isinstance(value, ArtifactHandle):
+                if value._pipeline is not self:
+                    self._validation_errors.append(
+                        f"{stage_name}: parameter '{param_name}' received a handle from "
+                        + "a different Pipeline instance. All dependencies must come from "
+                        + "the same Pipeline."
+                    )
                 input_handles[param_name] = value
             elif isinstance(value, (list, tuple)) and all(
-                isinstance(v, ArtifactHandle) for v in value
+                isinstance(v, ArtifactHandle)
+                for v in value  # pyright: ignore[reportUnknownVariableType]
             ):
+                for v in value:  # pyright: ignore[reportUnknownVariableType]
+                    if isinstance(v, ArtifactHandle) and v._pipeline is not self:
+                        self._validation_errors.append(
+                            f"{stage_name}: parameter '{param_name}' contains a handle "
+                            + "from a different Pipeline instance."
+                        )
+                        break
                 list_input_handles[param_name] = list(value)
                 collection_params[param_name] = (
                     CollectionKind.TUPLE if isinstance(value, tuple) else CollectionKind.LIST
@@ -268,8 +283,8 @@ class Pipeline:
             elif param_name in explicit_params:
                 self._validation_errors.append(
                     f"{stage_name}: parameter '{param_name}' has unsupported type "
-                    f"'{type(value).__name__}'. Use ArtifactHandle (dependency), "
-                    f"StageParams (config), or list/tuple of ArtifactHandle."
+                    + f"'{type(value).__name__}'. Use ArtifactHandle (dependency), "
+                    + "StageParams (config), or list/tuple of ArtifactHandle."
                 )
 
         variant_str = "@".join(self._variant_stack) if self._variant_stack else None
@@ -313,6 +328,7 @@ class Pipeline:
             raise ValueError(msg)
 
     def build(self) -> pipeline_mod.Pipeline:
+        self._validate()
         legacy = pipeline_mod.Pipeline(self._name, root=self._root)
         legacy.set_input_bindings({name: node.path for name, node in self._inputs.items()})
 
@@ -367,10 +383,10 @@ class Pipeline:
                         ):
                             raise TypeError(
                                 f"Stage '{node.name}' parameter '{name}' has type "
-                                f"'{base_hint}' — StageParams must not be in a union. "
-                                f"Use 'params: {union_arg.__name__}' directly, with a "
-                                f"default if needed (params: {union_arg.__name__} = "
-                                f"{union_arg.__name__}())."
+                                + f"'{base_hint}' — StageParams must not be in a union. "
+                                + f"Use 'params: {union_arg.__name__}' directly, with a "
+                                + f"default if needed (params: {union_arg.__name__} = "
+                                + f"{union_arg.__name__}())."
                             )
                 if isinstance(base_hint, type) and issubclass(base_hint, stage_def.StageParams):
                     params_arg_name = name
@@ -528,10 +544,15 @@ def _parse_output_type(hint: Any, key: str) -> list[_OutputSpec]:
             if field_name == SINGLE_OUTPUT_KEY:
                 raise ValueError(
                     f"TypedDict field name {SINGLE_OUTPUT_KEY!r} is reserved by Pivot. "
-                    f"Rename the field in {hint.__name__}."
+                    + f"Rename the field in {hint.__name__}."
                 )
             specs.extend(_parse_output_type(field_hint, field_name))
         return specs
+
+    # Unwrap Required[] / NotRequired[] wrappers from TypedDict fields
+    origin = get_origin(hint)
+    if origin is typing.Required or origin is typing.NotRequired:
+        hint = get_args(hint)[0]
 
     # Check for Annotated
     if get_origin(hint) is Annotated:

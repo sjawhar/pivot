@@ -252,7 +252,7 @@ def _helper_optional_params_stage(
 @stage
 def _helper_typing_optional_params_stage(
     data: pd.DataFrame,
-    params: typing.Optional[_HelperOptionalParams] = None,  # noqa: UP045 - intentionally testing typing.Union path
+    params: typing.Optional[_HelperOptionalParams] = None,  # noqa: UP045 - intentionally testing typing.Union path  # pyright: ignore[reportDeprecated]
 ) -> pd.DataFrame:
     return data
 
@@ -948,7 +948,7 @@ def test_record_stage_rejects_explicit_unsupported_arg(tmp_path: pathlib.Path) -
         Pipeline("test", root=tmp_path) as pipeline,
     ):
         inp = pipeline.input("data.csv", path="data/raw/data.csv", t=pd.DataFrame)
-        _helper_with_plain_arg(data=inp, verbose=True)  # pyright: ignore[reportArgumentType]
+        _helper_with_plain_arg(data=inp, verbose=True)
 
 
 def test_record_stage_ignores_default_unsupported_arg(tmp_path: pathlib.Path) -> None:
@@ -1146,3 +1146,66 @@ def test_dep_loader_config_collision() -> None:
         ),
     )
     assert fp_before != fp_after
+
+
+def test_pipeline_rejects_handle_from_different_pipeline(tmp_path: pathlib.Path) -> None:
+    upstream = Pipeline("upstream", root=tmp_path)
+    foreign_handle = upstream.input("raw", path="data/raw/input.yaml", t=dict)
+
+    with (
+        pytest.raises(ValueError, match="different Pipeline instance"),
+        Pipeline("downstream", root=tmp_path),
+    ):
+        _helper_consume_dict(data=foreign_handle)
+
+
+def test_build_calls_validate(tmp_path: pathlib.Path) -> None:
+    pipeline = Pipeline("validation", root=tmp_path)
+    pipeline._validation_errors.append("validation failed")
+
+    with pytest.raises(ValueError, match="validation failed"):
+        pipeline.build()
+
+
+def test_artifact_handle_getitem_missing_output_raises_key_error() -> None:
+    def _helper_stage() -> None:
+        return None
+
+    pipeline = Pipeline("getitem", root=pathlib.Path("/tmp"))
+    stage_node = _StageNode(
+        func=_helper_stage,
+        original_func=_helper_stage,
+        name="producer",
+        params=None,
+        input_handles={},
+        output_specs=[_OutputSpec(key="known", python_type=dict, format=loaders.JSON())],
+        call_index=0,
+    )
+    handle = ArtifactHandle(
+        pipeline=pipeline,
+        source=stage_node,
+        output_key=None,
+        python_type=dict,
+    )
+
+    with pytest.raises(KeyError, match="no output 'missing'"):
+        _ = handle["missing"]
+
+
+def test_artifact_handle_getitem_on_input_raises_key_error() -> None:
+    pipeline = Pipeline("getitem_input", root=pathlib.Path("/tmp"))
+    input_node = _InputNode(
+        name="source",
+        python_type=str,
+        path="data/input.txt",
+        format=loaders.Text(),
+    )
+    handle = ArtifactHandle(
+        pipeline=pipeline,
+        source=input_node,
+        output_key=None,
+        python_type=str,
+    )
+
+    with pytest.raises(KeyError, match="has no sub-outputs"):
+        _ = handle["anything"]

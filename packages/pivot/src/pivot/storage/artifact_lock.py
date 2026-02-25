@@ -57,7 +57,10 @@ def expand_lock_requests(
 
 
 def _lock_key(ref: types.ArtifactRef) -> str:
-    return f"{ref.identity.producer}:{ref.identity.key}"
+    identity = ref.identity
+    if identity.key is None:
+        return identity.producer
+    return f"{identity.producer}:{identity.key}"
 
 
 # ---------------------------------------------------------------------------
