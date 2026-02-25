@@ -121,6 +121,7 @@ def _get_stage_missing_workspace_files(
             missing.append(rel_path)
     return missing
 
+
 def _get_stage_missing_hashes(
     stage_name: str,
     local_hashes: set[str],

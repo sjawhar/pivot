@@ -585,6 +585,7 @@ def test_collect_metrics_from_stages_with_metric_output(
     assert "metrics.json" in result["my_stage"]
     assert result["my_stage"]["metrics.json"]["accuracy"] == 0.95
 
+
 def test_collect_metrics_from_stages_missing_file(
     tmp_path: Path,
     mock_discovery: PipelineLike,
@@ -622,6 +623,7 @@ def test_collect_metrics_from_stages_parse_error(
 
     assert "my_stage" not in result
     assert "Failed to parse metrics" in caplog.text
+
 
 def test_collect_all_stage_metrics_flat(
     tmp_path: Path,
