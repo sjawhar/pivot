@@ -13,6 +13,7 @@ import pivot_tui.rpc_client_impl
 from helpers import wait_for_socket
 from pivot import loaders, outputs
 from pivot.types import (
+    ArtifactIdentity,
     StageStatus,
     TuiLogMessage,
     TuiMessageType,
@@ -36,7 +37,7 @@ from pivot_tui.widgets import status as tui_status
 if TYPE_CHECKING:
     from pytest_mock import MockerFixture
 
-    from pivot.pipeline.pipeline import Pipeline
+    from pivot.registry import PipelineLike
 
 # =============================================================================
 # Output TypedDicts for annotation-based stages
@@ -65,7 +66,7 @@ class _Step3Outputs(TypedDict):
 
 
 def _helper_process(
-    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+    input_file: pathlib.Path,
 ) -> _OutputTxtOutputs:
     _ = input_file
     pathlib.Path("output.txt").write_text("done")
@@ -73,7 +74,7 @@ def _helper_process(
 
 
 def _helper_process_print(
-    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+    input_file: pathlib.Path,
 ) -> _OutputTxtOutputs:
     _ = input_file
     print("Processing data")
@@ -82,14 +83,14 @@ def _helper_process_print(
 
 
 def _helper_failing_stage(
-    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+    input_file: pathlib.Path,
 ) -> _OutputTxtOutputs:
     _ = input_file
     raise RuntimeError("Stage failed!")
 
 
 def _helper_step1(
-    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+    input_file: pathlib.Path,
 ) -> _Step1Outputs:
     _ = input_file
     pathlib.Path("step1.txt").write_text("step1")
@@ -97,7 +98,7 @@ def _helper_step1(
 
 
 def _helper_step2(
-    step1_file: Annotated[pathlib.Path, outputs.Dep("step1.txt", loaders.PathOnly())],
+    step1_file: pathlib.Path,
 ) -> _Step2Outputs:
     _ = step1_file
     pathlib.Path("step2.txt").write_text("step2")
@@ -105,7 +106,7 @@ def _helper_step2(
 
 
 def _helper_step3(
-    step2_file: Annotated[pathlib.Path, outputs.Dep("step2.txt", loaders.PathOnly())],
+    step2_file: pathlib.Path,
 ) -> _Step3Outputs:
     _ = step2_file
     pathlib.Path("step3.txt").write_text("step3")
@@ -316,8 +317,8 @@ def test_confirm_commit_screen_instantiation() -> None:
 
 @pytest.fixture
 def simple_run_app(
-    test_pipeline: Pipeline,
-    mock_discovery: Pipeline,
+    test_pipeline: PipelineLike,
+    mock_discovery: PipelineLike,
 ) -> run_tui.PivotApp:
     """Create a simple PivotApp for testing."""
     return run_tui.PivotApp(
@@ -423,8 +424,8 @@ async def test_run_app_quit_action(simple_run_app: run_tui.PivotApp) -> None:
 
 @pytest.mark.asyncio
 async def test_run_app_stages_shown(
-    test_pipeline: Pipeline,
-    mock_discovery: Pipeline,
+    test_pipeline: PipelineLike,
+    mock_discovery: PipelineLike,
 ) -> None:
     """Stage names appear in the app."""
     stage_names = ["alpha", "beta", "gamma"]
@@ -497,8 +498,8 @@ def test_stage_log_panel_init() -> None:
 @pytest.mark.asyncio
 async def test_tui_app_with_tui_log_writes_to_file(
     tmp_path: pathlib.Path,
-    test_pipeline: Pipeline,
-    mock_discovery: Pipeline,
+    test_pipeline: PipelineLike,
+    mock_discovery: PipelineLike,
 ) -> None:
     """PivotApp writes messages to tui_log file when configured."""
     import json
@@ -551,8 +552,8 @@ async def test_tui_app_with_tui_log_writes_to_file(
 @pytest.mark.asyncio
 async def test_tui_app_without_tui_log_no_file_created(
     tmp_path: pathlib.Path,
-    test_pipeline: Pipeline,
-    mock_discovery: Pipeline,
+    test_pipeline: PipelineLike,
+    mock_discovery: PipelineLike,
 ) -> None:
     """PivotApp does not create log file when tui_log is None."""
     log_path = tmp_path / "tui.jsonl"
@@ -576,8 +577,8 @@ async def test_tui_app_without_tui_log_no_file_created(
 
 @pytest.mark.asyncio
 async def test_watch_tui_app_with_serve_flag(
-    test_pipeline: Pipeline,
-    mock_discovery: Pipeline,
+    test_pipeline: PipelineLike,
+    mock_discovery: PipelineLike,
 ) -> None:
     """PivotApp (watch mode) initializes serve mode correctly."""
     app = run_tui.PivotApp(
@@ -598,8 +599,8 @@ async def test_watch_tui_app_with_serve_flag(
 @pytest.mark.asyncio
 async def test_watch_tui_app_with_tui_log(
     tmp_path: pathlib.Path,
-    test_pipeline: Pipeline,
-    mock_discovery: Pipeline,
+    test_pipeline: PipelineLike,
+    mock_discovery: PipelineLike,
 ) -> None:
     """PivotApp (watch mode) writes to tui_log when configured."""
     log_path = tmp_path / "watch_tui.jsonl"
@@ -1227,7 +1228,7 @@ def test_handle_status_stores_output_summary_on_stage_info() -> None:
     snapshot = app._stages["train"].live_output_snapshot
     assert snapshot is not None, "output_summary should be converted and stored"
     assert len(snapshot) == 1
-    assert snapshot[0]["path"] == "output.csv"
+    assert snapshot[0]["path"] == ArtifactIdentity("output.csv", None)
     assert snapshot[0]["change_type"] == "modified"
 
 

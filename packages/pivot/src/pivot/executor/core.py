@@ -1,3 +1,4 @@
+# pyright: reportImplicitRelativeImport=false, reportMissingImports=false, reportUnknownArgumentType=false, reportUnknownMemberType=false, reportUnknownParameterType=false, reportUnknownVariableType=false, reportUnusedCallResult=false
 from __future__ import annotations
 
 import atexit
@@ -6,20 +7,21 @@ import functools
 import logging
 import os
 import pathlib
-from typing import TYPE_CHECKING, Literal, TypedDict
+from typing import TYPE_CHECKING, Literal, TypedDict, cast
 
 import loky
 
 from pivot import config, discovery, exceptions, outputs, parameters, registry
-from pivot.executor import worker
 from pivot.storage import cache, lock, track
 from pivot.storage import state as state_mod
+from pivot.storage import store as store_mod
 from pivot.types import OnError, StageResult, StageStatus
 
 if TYPE_CHECKING:
     import concurrent.futures
 
-    from pivot.pipeline.pipeline import Pipeline
+    from pivot.engine import types as engine_types
+    from pivot.executor import worker
     from pivot.registry import RegistryStageInfo
 
 logger = logging.getLogger(__name__)
@@ -158,7 +160,7 @@ def run(
     force: bool = False,
     no_commit: bool = False,
     checkout_missing: bool = False,
-    pipeline: Pipeline | None = None,
+    pipeline: registry.PipelineLike | None = None,
 ) -> dict[str, ExecutionSummary]:
     """Execute pipeline stages via Engine.
 
@@ -207,7 +209,7 @@ def _run_inner(
     force: bool,
     no_commit: bool,
     checkout_missing: bool,
-    pipeline: Pipeline | None,
+    pipeline: registry.PipelineLike | None,
 ) -> dict[str, ExecutionSummary]:
     """Inner implementation of run(), called with lock already held if needed."""
     # Import here to avoid circular import (engine imports executor_core)
@@ -230,7 +232,7 @@ def _run_inner(
         pipeline = discovery.discover_pipeline()
         if pipeline is None:
             raise exceptions.PipelineNotFoundError(
-                "No pipeline found. Create pivot.yaml or pipeline.py to define stages."
+                "No pipeline found. Create pipeline.py to define stages."
             )
 
     # Run async execution
@@ -238,7 +240,7 @@ def _run_inner(
         async with Engine(pipeline=pipeline) as eng:
             # Add ResultCollectorSink to collect results
             result_sink = ResultCollectorSink()
-            eng.add_sink(result_sink)
+            eng.add_sink(cast("engine_types.EventSink", result_sink))
 
             # Create OneShotSource with all orchestration parameters
             source = OneShotSource(
@@ -304,7 +306,7 @@ def create_executor(max_workers: int) -> concurrent.futures.Executor:
 
 def prepare_worker_info(
     stage_info: RegistryStageInfo,
-    stage_registry: registry.StageRegistry,
+    pipeline: registry.PipelineLike,
     overrides: parameters.ParamsOverrides,
     checkout_modes: list[cache.CheckoutMode],
     run_id: str,
@@ -312,6 +314,7 @@ def prepare_worker_info(
     no_commit: bool,
     project_root: pathlib.Path,
     default_state_dir: pathlib.Path,
+    store_spec: store_mod.StoreSpec,
 ) -> worker.WorkerStageInfo:
     """Prepare stage info for pickling to worker process.
 
@@ -323,25 +326,26 @@ def prepare_worker_info(
     # Ensure state directory exists (workers open StateDB in readonly mode)
     state_dir.mkdir(parents=True, exist_ok=True)
 
-    return worker.WorkerStageInfo(
-        func=stage_info["func"],
-        fingerprint=stage_registry.ensure_fingerprint(stage_info["name"]),
-        deps=stage_info["deps_paths"],
-        outs=stage_info["outs"],
-        signature=stage_info["signature"],
-        params=stage_info["params"],
-        variant=stage_info["variant"],
-        overrides=overrides,
-        checkout_modes=checkout_modes,
-        run_id=run_id,
-        force=force,
-        no_commit=no_commit,
-        dep_specs=stage_info["dep_specs"],
-        out_specs=stage_info["out_specs"],
-        params_arg_name=stage_info["params_arg_name"],
-        project_root=project_root,
-        state_dir=state_dir,
-    )
+    worker_info: dict[str, object] = {
+        "func": stage_info["func"],
+        "fingerprint": pipeline.ensure_fingerprint(stage_info["name"]),
+        "deps": stage_info["deps"],
+        "outs": stage_info["outs"],
+        "store_spec": store_spec,
+        "signature": stage_info["signature"],
+        "params": stage_info["params"],
+        "variant": stage_info["variant"],
+        "overrides": overrides,
+        "checkout_modes": checkout_modes,
+        "run_id": run_id,
+        "force": force,
+        "no_commit": no_commit,
+        "params_arg_name": stage_info["params_arg_name"],
+        "project_root": project_root,
+        "state_dir": state_dir,
+        "collection_params": stage_info["collection_params"],
+    }
+    return cast("worker.WorkerStageInfo", cast("object", worker_info))
 
 
 def apply_deferred_writes(

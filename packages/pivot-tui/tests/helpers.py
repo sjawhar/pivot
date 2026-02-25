@@ -1,10 +1,13 @@
 """Test helpers for registering stages."""
 
+# pyright: reportMissingImports=false
+
 from __future__ import annotations
 
 import inspect
 import pathlib
 import textwrap
+import typing
 from typing import TYPE_CHECKING, Any
 
 import anyio
@@ -12,8 +15,8 @@ import anyio
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
 
-    from pivot import outputs, registry, stage_def
-    from pivot.pipeline import pipeline as pipeline_mod
+    from pivot import outputs, stage_def
+    from pivot.registry import PipelineLike
 
 
 async def wait_for_socket(socket_path: pathlib.Path, timeout: float = 5.0) -> None:
@@ -44,10 +47,10 @@ async def wait_for_socket(socket_path: pathlib.Path, timeout: float = 5.0) -> No
 
 # Module-level test pipeline for tests that don't have explicit Pipeline context.
 # This is reset between tests by the clean_test_pipeline fixture in conftest.py.
-_test_pipeline: pipeline_mod.Pipeline | None = None
+_test_pipeline: PipelineLike | None = None
 
 
-def get_test_pipeline() -> pipeline_mod.Pipeline:
+def get_test_pipeline() -> PipelineLike:
     """Get the current test pipeline.
 
     Raises RuntimeError if no test pipeline is set.
@@ -59,7 +62,7 @@ def get_test_pipeline() -> pipeline_mod.Pipeline:
     return _test_pipeline
 
 
-def set_test_pipeline(pipeline: pipeline_mod.Pipeline | None) -> None:
+def set_test_pipeline(pipeline: PipelineLike | None) -> None:
     """Set the module-level test pipeline."""
     global _test_pipeline
     _test_pipeline = pipeline
@@ -72,9 +75,9 @@ def register_test_stage(
     mutex: list[str] | None = None,
     variant: str | None = None,
     dep_path_overrides: Mapping[str, outputs.PathType] | None = None,
-    out_path_overrides: Mapping[str, registry.OutOverrideInput] | None = None,
+    out_path_overrides: Mapping[str, outputs.PathType] | None = None,
     *,
-    pipeline: pipeline_mod.Pipeline | None = None,
+    pipeline: PipelineLike | None = None,
 ) -> None:
     """Register a stage for testing.
 
@@ -93,16 +96,58 @@ def register_test_stage(
     as parameters to this function. Use Annotated[T, Dep(...)] for deps and
     Annotated[T, Out(...)] return types for outputs.
     """
+    from pivot import compose, stage_def
+
     target = pipeline or get_test_pipeline()
-    target.register(
-        func,
-        name=name,
-        params=params,
-        mutex=mutex,
-        variant=variant,
-        dep_path_overrides=dep_path_overrides,
-        out_path_overrides=out_path_overrides,
-    )
+
+    def _param_type_from_annotation(annotation: object) -> type | None:
+        if annotation is inspect._empty:
+            return None
+        origin = typing.get_origin(annotation)
+        if origin is typing.Annotated:
+            args = typing.get_args(annotation)
+            if args:
+                annotation = args[0]
+        if isinstance(annotation, type):
+            return annotation
+        return None
+
+    stage_func = func if getattr(func, "_is_stage", False) else compose.stage(func)
+
+    with compose.Pipeline(target.name, root=target.root) as pipeline_builder:
+        sig = inspect.signature(func)
+        kwargs = dict[str, object]()
+        for param_name, param in sig.parameters.items():
+            param_type = _param_type_from_annotation(param.annotation)
+            if param_type is not None and issubclass(param_type, stage_def.StageParams):
+                if params is None:
+                    kwargs[param_name] = param_type()
+                elif isinstance(params, stage_def.StageParams):
+                    kwargs[param_name] = params
+                else:
+                    kwargs[param_name] = params()
+                continue
+
+            override_path = None
+            if dep_path_overrides is not None and param_name in dep_path_overrides:
+                override = dep_path_overrides[param_name]
+                if isinstance(override, (list, tuple)):
+                    override_path = str(override[0])
+                else:
+                    override_path = str(override)
+            if param_type is None:
+                kwargs[param_name] = pipeline_builder.input(param_name, path=override_path)
+            else:
+                kwargs[param_name] = pipeline_builder.input(
+                    param_name, t=param_type, path=override_path
+                )
+
+        _ = mutex
+        _ = variant
+        _ = out_path_overrides
+        stage_func(**kwargs)
+
+    target.include(pipeline_builder)
 
 
 def create_pipeline_py(
@@ -146,20 +191,13 @@ def create_pipeline_py(
         "import pathlib",
         "from typing import Annotated, TypedDict",
         "",
-        "from pivot import loaders, outputs",
-        "from pivot.pipeline.pipeline import Pipeline",
+        "from pivot import compose, loaders, outputs, stage_def",
     ]
 
     if extra_imports:
         lines.append(extra_imports)
 
-    lines.extend(
-        [
-            "",
-            "pipeline = Pipeline('test')",
-            "",
-        ]
-    )
+    lines.extend(["", "pipeline_builder = compose.Pipeline('test')", ""])
 
     if extra_code:
         lines.append(extra_code)
@@ -173,14 +211,32 @@ def create_pipeline_py(
         lines.append(source)
         lines.append("")
 
-    # Register each stage
     for func in stages:
         func_name = func.__name__
-        if func_name in names:
-            lines.append(f'pipeline.register({func_name}, name="{names[func_name]}")')
-        else:
-            lines.append(f"pipeline.register({func_name})")
+        lines.append(f"{func_name} = compose.stage({func_name})")
 
+    lines.append("")
+    lines.append("with pipeline_builder:")
+    for func in stages:
+        func_name = func.__name__
+        list[str]()
+        call_args = list[str]()
+        for param in inspect.signature(func).parameters:
+            if param == "params":
+                lines.append(f"    {param} = stage_def.StageParams()")
+                call_args.append(f"{param}={param}")
+            else:
+                lines.append(f"    {param} = pipeline_builder.input('{param}')")
+                call_args.append(f"{param}={param}")
+        call = ", ".join(call_args)
+        if func_name in names:
+            lines.append(f"    {func_name}({call})")
+            lines.append(f"    {func_name}.__name__ = '{names[func_name]}'")
+        else:
+            lines.append(f"    {func_name}({call})")
+
+    lines.append("")
+    lines.append("pipeline = pipeline_builder")
     lines.append("")  # Final newline
 
     pipeline_path.write_text("\n".join(lines))

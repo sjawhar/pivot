@@ -67,7 +67,9 @@ class _FakeRpcServer(Protocol):
 
     def set_explanation(self, stage: str, explanation: dict[str, object]) -> None: ...
 
-    def set_stage_info(self, stage: str, deps: list[str], outs: list[str]) -> None: ...
+    def set_stage_info(
+        self, stage: str, deps: list[dict[str, object]], outs: list[dict[str, object]]
+    ) -> None: ...
 
     def set_commit_result(self, committed: list[str], failed: list[str] | None = None) -> None: ...
 
@@ -165,7 +167,11 @@ async def test_fake_rpc_server_stages_method(tmp_path: Path) -> None:
 async def test_fake_rpc_server_stage_info_known_stage(tmp_path: Path) -> None:
     socket_path = tmp_path / "fake.sock"
     server = FakeRpcServer()
-    server.set_stage_info("train", deps=["input.csv"], outs=["output.csv"])
+    server.set_stage_info(
+        "train",
+        deps=[{"producer": "input", "key": None}],
+        outs=[{"producer": "train", "key": None}],
+    )
     await server.start(socket_path)
     try:
         await _wait_for_socket(socket_path)
@@ -175,8 +181,8 @@ async def test_fake_rpc_server_stage_info_known_stage(tmp_path: Path) -> None:
         )
         assert response.get("result") == {
             "name": "train",
-            "deps": ["input.csv"],
-            "outs": ["output.csv"],
+            "deps": [{"producer": "input", "key": None}],
+            "outs": [{"producer": "train", "key": None}],
         }, "stage_info should return configured info"
     finally:
         await server.stop()

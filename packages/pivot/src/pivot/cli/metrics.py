@@ -18,6 +18,13 @@ def metrics() -> None:
 @metrics.command("show")
 @click.argument("targets", nargs=-1)
 @click.option(
+    "--all",
+    "all_pipelines",
+    is_flag=True,
+    default=False,
+    help="Run across all pipelines in the project.",
+)
+@click.option(
     "--json", "output_format", flag_value=OutputFormat.JSON, default=None, help="Output as JSON"
 )
 @click.option("--md", "output_format", flag_value=OutputFormat.MD, help="Output as Markdown table")
@@ -28,6 +35,7 @@ def metrics() -> None:
 @cli_decorators.with_error_handling
 def metrics_show(
     targets: tuple[str, ...],
+    all_pipelines: bool,
     output_format: OutputFormat | None,
     recursive: bool,
     precision: int | None,
@@ -41,7 +49,7 @@ def metrics_show(
     """
     precision = precision if precision is not None else config.get_display_precision()
     proj_root = project.get_project_root()
-    _run_common.ensure_stages_registered()
+    _run_common.ensure_stages_registered(all_pipelines=all_pipelines)
 
     paths = cli_targets.resolve_and_validate(targets, proj_root, outputs.Metric)
     if paths is not None:
@@ -56,6 +64,13 @@ def metrics_show(
 @metrics.command("diff")
 @click.argument("targets", nargs=-1)
 @click.option(
+    "--all",
+    "all_pipelines",
+    is_flag=True,
+    default=False,
+    help="Run across all pipelines in the project.",
+)
+@click.option(
     "--json", "output_format", flag_value=OutputFormat.JSON, default=None, help="Output as JSON"
 )
 @click.option("--md", "output_format", flag_value=OutputFormat.MD, help="Output as Markdown table")
@@ -67,6 +82,7 @@ def metrics_show(
 @cli_decorators.with_error_handling
 def metrics_diff(
     targets: tuple[str, ...],
+    all_pipelines: bool,
     output_format: OutputFormat | None,
     recursive: bool,
     no_path: bool,
@@ -81,7 +97,7 @@ def metrics_diff(
     """
     precision = precision if precision is not None else config.get_display_precision()
     proj_root = project.get_project_root()
-    _run_common.ensure_stages_registered()
+    _run_common.ensure_stages_registered(all_pipelines=all_pipelines)
 
     paths = cli_targets.resolve_and_validate(targets, proj_root, outputs.Metric)
     if paths is not None:

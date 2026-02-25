@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from pivot.types import (
+    ArtifactIdentity,
     ChangeType,
     CodeChange,
     DepChange,
@@ -15,6 +16,7 @@ from pivot.types import (
     ParamChange,
     StageExplanation,
     StageStatus,
+    identity_key,
 )
 from pivot_tui import diff_panels
 
@@ -156,14 +158,15 @@ def test_output_diff_panel_set_stage_none() -> None:
 
 def test_output_change_creation() -> None:
     """OutputChange TypedDict can be created with all fields."""
+    identity = ArtifactIdentity("/path/to/file.csv", None)
     change = OutputChange(
-        path="/path/to/file.csv",
+        path=identity,
         old_hash="abc123",
         new_hash="def456",
         change_type=ChangeType.MODIFIED,
         output_type="out",
     )
-    assert change["path"] == "/path/to/file.csv"
+    assert change["path"] == identity
     assert change["old_hash"] == "abc123"
     assert change["new_hash"] == "def456"
     assert change["change_type"] == ChangeType.MODIFIED
@@ -172,8 +175,9 @@ def test_output_change_creation() -> None:
 
 def test_output_change_with_metric_type() -> None:
     """OutputChange can have metric output_type."""
+    identity = ArtifactIdentity("/metrics.json", None)
     change = OutputChange(
-        path="/metrics.json",
+        path=identity,
         old_hash=None,
         new_hash="xyz789",
         change_type=ChangeType.ADDED,
@@ -184,8 +188,9 @@ def test_output_change_with_metric_type() -> None:
 
 def test_output_change_with_plot_type() -> None:
     """OutputChange can have plot output_type."""
+    identity = ArtifactIdentity("/plot.png", None)
     change = OutputChange(
-        path="/plot.png",
+        path=identity,
         old_hash="old123",
         new_hash=None,
         change_type=ChangeType.REMOVED,
@@ -374,11 +379,12 @@ def test_input_panel_is_changed_code_key() -> None:
 
 def test_input_panel_is_changed_dep_path() -> None:
     """InputDiffPanel._is_changed returns True for dep path in _dep_by_path."""
+    identity = ArtifactIdentity("/path/to/file.csv", None)
     panel = diff_panels.InputDiffPanel()
     panel._code_by_key = {}
     panel._dep_by_path = {
-        "/path/to/file.csv": DepChange(
-            path="/path/to/file.csv",
+        identity_key(identity): DepChange(
+            identity=identity,
             change_type=ChangeType.MODIFIED,
             old_hash="abc",
             new_hash="def",
@@ -386,7 +392,7 @@ def test_input_panel_is_changed_dep_path() -> None:
     }
     panel._param_by_key = {}
 
-    assert panel._is_changed("dep:/path/to/file.csv") is True
+    assert panel._is_changed(f"dep:{identity_key(identity)}") is True
     assert panel._is_changed("dep:/other/file.csv") is False
 
 
@@ -425,10 +431,11 @@ def test_input_panel_is_changed_unknown_type() -> None:
 
 def test_output_panel_is_changed_with_change() -> None:
     """OutputDiffPanel._is_changed returns True for output with change_type."""
+    identity = ArtifactIdentity("/path/to/output.csv", None)
     panel = diff_panels.OutputDiffPanel()
     panel._output_by_path = {
-        "/path/to/output.csv": OutputChange(
-            path="/path/to/output.csv",
+        identity_key(identity): OutputChange(
+            path=identity,
             old_hash="abc",
             new_hash="def",
             change_type=ChangeType.MODIFIED,
@@ -436,15 +443,16 @@ def test_output_panel_is_changed_with_change() -> None:
         )
     }
 
-    assert panel._is_changed("out:/path/to/output.csv") is True
+    assert panel._is_changed(f"out:{identity_key(identity)}") is True
 
 
 def test_output_panel_is_changed_unchanged() -> None:
     """OutputDiffPanel._is_changed returns False for output without change_type."""
+    identity = ArtifactIdentity("/path/to/output.csv", None)
     panel = diff_panels.OutputDiffPanel()
     panel._output_by_path = {
-        "/path/to/output.csv": OutputChange(
-            path="/path/to/output.csv",
+        identity_key(identity): OutputChange(
+            path=identity,
             old_hash="abc",
             new_hash="abc",
             change_type=None,  # Unchanged
@@ -505,9 +513,10 @@ def test_output_panel_set_from_snapshot(mocker: MockerFixture) -> None:
 
     # Mock _update_display to verify it's called
     mock_update = mocker.patch.object(panel, "_update_display", autospec=True)
+    identity = ArtifactIdentity("/path/output.csv", None)
     changes = [
         OutputChange(
-            path="/path/output.csv",
+            path=identity,
             old_hash="old",
             new_hash="new",
             change_type=ChangeType.MODIFIED,
@@ -517,5 +526,5 @@ def test_output_panel_set_from_snapshot(mocker: MockerFixture) -> None:
     panel.set_from_snapshot("test_stage", changes)
 
     assert panel._stage_name == "test_stage"
-    assert "/path/output.csv" in panel._output_by_path
+    assert identity_key(identity) in panel._output_by_path
     mock_update.assert_called_once()

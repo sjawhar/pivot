@@ -1,3 +1,4 @@
+# pyright: reportImplicitRelativeImport=false, reportMissingImports=false, reportMissingModuleSource=false, reportUnknownArgumentType=false, reportUnknownLambdaType=false, reportUnknownMemberType=false, reportUnknownParameterType=false, reportUnknownVariableType=false, reportUnusedCallResult=false, reportExplicitAny=false, reportAny=false
 from __future__ import annotations
 
 import collections
@@ -19,7 +20,16 @@ import anyio
 import anyio.from_thread
 import anyio.to_thread
 
-from pivot import config, exceptions, fingerprint, parameters, project, registry
+from pivot import (
+    config,
+    exceptions,
+    fingerprint,
+    merkle,
+    parameters,
+    project,
+    registry,
+    types,
+)
 from pivot.engine import agent_rpc
 from pivot.engine import graph as engine_graph
 from pivot.engine import scheduler as engine_scheduler
@@ -49,7 +59,9 @@ from pivot.engine.types import (
 from pivot.executor import core as executor_core
 from pivot.executor import worker
 from pivot.storage import state as state_mod
+from pivot.storage import store as store_mod
 from pivot.types import (
+    ArtifactTag,
     CompletionType,
     DepEntry,
     HashInfo,
@@ -71,7 +83,6 @@ if TYPE_CHECKING:
     from anyio.abc import TaskGroup
     from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
 
-    from pivot.pipeline.pipeline import Pipeline
     from pivot.registry import RegistryStageInfo
     from pivot.storage.cache import CheckoutMode
 
@@ -123,7 +134,7 @@ class Engine:
     the channel, so no explicit lock is needed.
     """
 
-    _pipeline: Pipeline | None
+    _pipeline: registry.PipelineLike | None
     _all_pipelines: bool
     _state: EngineState
     _sources: list[EventSource]
@@ -167,7 +178,9 @@ class Engine:
     # Event signaling dispatcher has finished draining
     _dispatch_complete: anyio.Event
 
-    def __init__(self, *, pipeline: Pipeline | None = None, all_pipelines: bool = False) -> None:
+    def __init__(
+        self, *, pipeline: registry.PipelineLike | None = None, all_pipelines: bool = False
+    ) -> None:
         """Initialize the async engine in IDLE state."""
         self._pipeline = pipeline
         self._all_pipelines = all_pipelines
@@ -212,6 +225,8 @@ class Engine:
         self._stored_on_error = OnError.FAIL
         self._stored_parallel = True
         self._stored_max_workers = None
+        self._current_overrides: parameters.ParamsOverrides | None = None
+        self._merkle_ids: dict[str, str] = {}
 
         # Track whether run() has completed to prevent re-use
         self._run_completed = False
@@ -739,7 +754,7 @@ class Engine:
     # Pipeline Access
     # =========================================================================
 
-    def _require_pipeline(self) -> Pipeline:
+    def _require_pipeline(self) -> registry.PipelineLike:
         """Get the pipeline, raising RuntimeError if not set."""
         if self._pipeline is None:
             raise RuntimeError(
@@ -753,12 +768,12 @@ class Engine:
 
     def _get_stage(self, name: str) -> RegistryStageInfo:
         """Get stage info from pipeline."""
-        return self._require_pipeline().get(name)
+        return self._require_pipeline().get_stage(name)
 
     def _get_all_stages(self) -> dict[str, RegistryStageInfo]:
         """Get all stages as a dict from pipeline."""
         pipeline = self._require_pipeline()
-        return {name: pipeline.get(name) for name in pipeline.list_stages()}
+        return {name: pipeline.get_stage(name) for name in pipeline.list_stages()}
 
     # =========================================================================
     # Stage State Management
@@ -814,6 +829,7 @@ class Engine:
         """Orchestrate parallel stage execution with the async event loop."""
         import datetime
 
+        from pivot import exceptions as pivot_exceptions
         from pivot import run_history
 
         # Record start time for run history
@@ -826,25 +842,51 @@ class Engine:
         project_root = project.get_project_root()
         executor_core.verify_tracked_files(project_root, checkout_missing=checkout_missing)
 
-        # Build bipartite graph (single source of truth) with validation
+        # Build bipartite graph (single source of truth)
         all_stages = self._get_all_stages()
-        from pivot.storage import track
-
-        tracked_files = track.discover_pvt_files(project_root)
-        self._graph = engine_graph.build_graph(
-            all_stages, validate=True, tracked_files=tracked_files
+        graph = engine_graph.build_graph(all_stages)
+        pipeline = self._pipeline
+        if pipeline is None:
+            raise pivot_exceptions.PipelineNotFoundError("No active pipeline registered.")
+        store = store_mod.WorkspaceStore(
+            project_root=project_root,
+            pipeline_name=pipeline.name,
+            input_bindings=pipeline.input_bindings,
         )
+        dep_errors = engine_graph.validate_dependency_sources(all_stages, store=store)
+        if dep_errors:
+            if self._all_pipelines and on_error == OnError.KEEP_GOING:
+                # Skip broken stages but continue with healthy pipelines
+                broken_stages = {err.stage for err in dep_errors}
+                for err in dep_errors:
+                    _logger.warning("Skipping: %s", err.format_user_message())
+                # Also skip downstream dependents of broken stages
+                to_remove = set[str]()
+                for broken in broken_stages:
+                    to_remove.add(broken)
+                    to_remove.update(engine_graph.get_downstream_stages(graph, broken))
+                all_stages = {k: v for k, v in all_stages.items() if k not in to_remove}
+                if not all_stages:
+                    raise pivot_exceptions.MultipleDependencyError(dep_errors)
+                # Rebuild graph without broken stages
+                graph = engine_graph.build_graph(all_stages)
+            else:
+                if len(dep_errors) == 1:
+                    raise dep_errors[0]
+                raise pivot_exceptions.MultipleDependencyError(dep_errors)
+        self._graph = graph
 
         # Extract stage-only DAG for execution order
-        stage_dag = engine_graph.get_stage_dag(self._graph)
+        stage_dag = engine_graph.get_stage_dag(graph)
 
         if stages:
             registered = set(stage_dag.nodes())
             unknown = [s for s in stages if s not in registered]
             if unknown:
-                from pivot import exceptions
-
-                raise exceptions.StageNotFoundError(unknown, available_stages=list(registered))
+                raise pivot_exceptions.StageNotFoundError(
+                    unknown,
+                    available_stages=list(registered),
+                )
 
         execution_order = engine_graph.get_execution_order(
             stage_dag, stages, single_stage=single_stage
@@ -859,10 +901,8 @@ class Engine:
                 execution_order, self._get_all_stages()
             )
             if uncached:
-                from pivot import exceptions
-
                 files_list = "\n".join(f"  - {stage}: {path}" for stage, path in uncached)
-                raise exceptions.UncachedIncrementalOutputError(
+                raise pivot_exceptions.UncachedIncrementalOutputError(
                     f"The following IncrementalOut files exist but are not in cache:\n{files_list}\n\n"
                     + "Running the pipeline will DELETE these files and they cannot be restored.\n"
                     + "To proceed anyway, use allow_uncached_incremental=True or back up these files first."
@@ -878,6 +918,8 @@ class Engine:
         # Load config
         overrides = parameters.load_params_yaml()
         checkout_modes = config.get_checkout_mode_order()
+        self._current_overrides = overrides
+        self._merkle_ids = dict[str, str]()
 
         # Get project paths for worker info
         project_root = project.get_project_root()
@@ -976,7 +1018,10 @@ class Engine:
                                         and not no_commit
                                     ):
                                         stage_info = self._get_stage(stage_name)
-                                        output_paths = [str(out.path) for out in stage_info["outs"]]
+                                        output_paths = [
+                                            types.identity_key(out.identity)
+                                            for out in stage_info["outs"]
+                                        ]
                                         stage_state_dir = registry.get_stage_state_dir(
                                             stage_info, default_state_dir
                                         )
@@ -1172,6 +1217,19 @@ class Engine:
             retention=retention,
         )
 
+        # Materialize presentation symlinks for successful stages
+        from pivot.storage import presentation
+
+        try:
+            presentation.present(
+                project_root=project_root,
+                pipeline_name=pipeline.name,
+                cache_dir=cache_dir / "files",
+                stages=all_stages,
+            )
+        except Exception:
+            _logger.debug("Presentation layer failed", exc_info=True)
+
         return results
 
     def _wait_for_futures_snapshot(
@@ -1335,6 +1393,13 @@ class Engine:
             return
 
         pipeline = self._require_pipeline()
+        store_spec = store_mod.StoreSpec(
+            kind="workspace",
+            cache_dir=str(cache_dir / "files"),
+            project_root=str(project_root),
+            pipeline_name=pipeline.name,
+            input_bindings=pipeline.input_bindings,
+        )
         started = 0
         max_to_start = self._effective_max_workers - len(self._futures)
         if max_to_start <= 0:
@@ -1367,7 +1432,6 @@ class Engine:
                         stage_name,
                         stage_info,
                         overrides,
-                        checkout_modes,
                         force,
                         cache_dir,
                         state_dir,
@@ -1391,7 +1455,7 @@ class Engine:
                 pool = self._ensure_worker_pool()
                 worker_info = executor_core.prepare_worker_info(
                     stage_info,
-                    pipeline._registry,  # pyright: ignore[reportPrivateUsage]
+                    pipeline,
                     overrides,
                     checkout_modes,
                     run_id,
@@ -1399,6 +1463,7 @@ class Engine:
                     no_commit,
                     project_root,
                     default_state_dir=state_dir,
+                    store_spec=store_spec,
                 )
 
                 future = pool.submit(
@@ -1442,7 +1507,6 @@ class Engine:
         stage_name: str,
         stage_info: RegistryStageInfo,
         overrides: parameters.ParamsOverrides,
-        checkout_modes: list[CheckoutMode],
         force: bool,
         cache_dir: pathlib.Path,
         state_dir: pathlib.Path,
@@ -1458,6 +1522,15 @@ class Engine:
 
         stage_state_dir = registry.get_stage_state_dir(stage_info, state_dir)
         files_cache_dir = cache_dir / "files"
+        pipeline = self._require_pipeline()
+        store_spec = store_mod.StoreSpec(
+            kind="workspace",
+            cache_dir=str(files_cache_dir),
+            project_root=str(project_root),
+            pipeline_name=pipeline.name,
+            input_bindings=pipeline.input_bindings,
+        )
+        store = store_mod.store_from_spec(store_spec)
 
         def _read_lock() -> LockData | None:
             stages_dir = lock.get_stages_dir(stage_state_dir)
@@ -1470,8 +1543,7 @@ class Engine:
 
         def _ensure_fingerprint() -> dict[str, str]:
             pipeline = self._require_pipeline()
-            stage_registry = pipeline._registry  # pyright: ignore[reportPrivateUsage]
-            return stage_registry.ensure_fingerprint(stage_name)
+            return pipeline.ensure_fingerprint(stage_name)
 
         current_fingerprint = await anyio.to_thread.run_sync(_ensure_fingerprint)
 
@@ -1482,9 +1554,10 @@ class Engine:
         except Exception:
             return False
 
-        out_paths = stage_info["outs_paths"]
+        out_paths = [types.identity_key(ref.identity) for ref in stage_info["outs"]]
         out_specs = [
-            (path, out.cache) for out, path in zip(stage_info["outs"], out_paths, strict=True)
+            (types.identity_key(ref.identity), ref.tag != ArtifactTag.METRIC)
+            for ref in stage_info["outs"]
         ]
 
         # Acquire artifact locks (READ on deps, WRITE on outs) to prevent
@@ -1493,7 +1566,7 @@ class Engine:
 
         def _acquire_artifact_locks() -> artifact_lock.LockHandle:
             lock_requests = artifact_lock.expand_lock_requests(
-                stage_info["deps_paths"], stage_info["outs"], project_root
+                stage_info["deps"], stage_info["outs"], project_root
             )
             lock_service = artifact_lock.LocalFlockLockService(stage_state_dir / "locks")
             return lock_service.acquire_many(lock_requests)
@@ -1510,8 +1583,7 @@ class Engine:
                 current_params,
                 out_paths,
                 out_specs,
-                checkout_modes,
-                files_cache_dir,
+                store,
                 stage_state_dir,
                 state_dir,
                 results,
@@ -1530,8 +1602,7 @@ class Engine:
         current_params: dict[str, Any],
         out_paths: list[str],
         out_specs: list[tuple[str, bool]],
-        checkout_modes: list[CheckoutMode],
-        files_cache_dir: pathlib.Path,
+        store: store_mod.Store,
         stage_state_dir: pathlib.Path,
         state_dir: pathlib.Path,
         results: dict[str, executor_core.ExecutionSummary],
@@ -1541,6 +1612,17 @@ class Engine:
         """Perform skip detection while artifact locks are held."""
         from pivot import run_history
         from pivot import skip as skip_mod
+
+        deps = stage_info["deps"]
+
+        def _outputs_exist() -> bool:
+            if not isinstance(store, store_mod.WorkspaceStore):
+                return False
+            for out_ref in stage_info["outs"]:
+                out_path = store._resolve_output_path(out_ref)  # pyright: ignore[reportPrivateUsage]
+                if not out_path.exists():
+                    return False
+            return True
 
         def _get_skip_state_db() -> state_mod.StateDB:
             state_db_path = stage_state_dir / "state.db"
@@ -1556,7 +1638,7 @@ class Engine:
                 can_skip = worker.can_skip_via_generation(
                     stage_name=stage_name,
                     fingerprint=current_fingerprint,
-                    deps=stage_info["deps_paths"],
+                    deps=deps,
                     outs_paths=out_paths,
                     current_params=current_params,
                     lock_data=lock_data,
@@ -1566,21 +1648,17 @@ class Engine:
                 if not can_skip:
                     return False, None
                 deps_list = [
-                    DepEntry(path=path, hash=info["hash"])
-                    for path, info in lock_data["dep_hashes"].items()
+                    DepEntry(
+                        producer=identity.producer,
+                        key=identity.key,
+                        hash=info["hash"],
+                    )
+                    for identity, info in lock_data["dep_hashes"].items()
                 ]
                 input_hash = run_history.compute_input_hash(
                     current_fingerprint, current_params, deps_list, out_specs
                 )
-                restored = worker.restore_outputs_from_cache(
-                    stage_info["outs"],
-                    lock_data,
-                    files_cache_dir,
-                    checkout_modes,
-                    state_db=state_db,
-                    state_dir=stage_state_dir,
-                )
-                if not restored:
+                if not _outputs_exist():
                     return False, None
                 return True, input_hash
             finally:
@@ -1604,7 +1682,7 @@ class Engine:
         ]:
             state_db = _get_skip_state_db()
             try:
-                return worker.hash_dependencies(stage_info["deps_paths"], state_db)
+                return worker.hash_dependencies(deps, store, state_db)
             finally:
                 if skip_state_dbs is None:
                     state_db.close()
@@ -1612,22 +1690,36 @@ class Engine:
         dep_hashes, missing, unreadable, _file_hash_entries = await anyio.to_thread.run_sync(
             _hash_deps
         )
+        dep_hashes_by_identity = {
+            types.identity_from_key(key): info for key, info in dep_hashes.items()
+        }
+        self._update_merkle_ids_for_stage(
+            stage_info, current_fingerprint, current_params, dep_hashes_by_identity
+        )
         if missing or unreadable:
             return False
 
+        out_identities = [out.identity for out in stage_info["outs"]]
         decision = skip_mod.check_stage(
             lock_data,
             current_fingerprint,
             current_params,
-            dep_hashes,
-            out_paths,
+            dep_hashes_by_identity,
+            out_identities,
             explain=False,
             force=False,
         )
         if decision["changed"]:
             return False
 
-        deps_list = [DepEntry(path=path, hash=info["hash"]) for path, info in dep_hashes.items()]
+        deps_list = [
+            DepEntry(
+                producer=identity.producer,
+                key=identity.key,
+                hash=info["hash"],
+            )
+            for identity, info in dep_hashes_by_identity.items()
+        ]
         input_hash = run_history.compute_input_hash(
             current_fingerprint,
             current_params,
@@ -1636,19 +1728,17 @@ class Engine:
         )
 
         def _restore_outputs() -> bool:
-            state_db = _get_skip_state_db()
-            try:
-                return worker.restore_outputs_from_cache(
-                    stage_info["outs"],
-                    lock_data,
-                    files_cache_dir,
-                    checkout_modes,
-                    state_db=state_db,
-                    state_dir=stage_state_dir,
-                )
-            finally:
-                if skip_state_dbs is None:
-                    state_db.close()
+            if _outputs_exist():
+                return True
+            if not isinstance(store, store_mod.WorkspaceStore):
+                return False
+            for out_ref in stage_info["outs"]:
+                hash_info = lock_data["output_hashes"].get(out_ref.identity)
+                if hash_info is None:
+                    return False
+                if not store.restore_from_cache(out_ref, hash_info, state_dir=stage_state_dir):
+                    return False
+            return True
 
         restored = await anyio.to_thread.run_sync(_restore_outputs)
         if not restored:
@@ -1695,6 +1785,28 @@ class Engine:
             input_hash=result["input_hash"],
         )
 
+    def _update_merkle_ids_for_stage(
+        self,
+        stage_info: RegistryStageInfo,
+        code_manifest: dict[str, str],
+        params: dict[str, Any],
+        dep_hashes: dict[types.ArtifactIdentity, HashInfo],
+    ) -> None:
+        for ref in stage_info["deps"].values():
+            identity_key = types.identity_key(ref.identity)
+            identity = ref.identity
+            if identity in dep_hashes and identity_key not in self._merkle_ids:
+                self._merkle_ids[identity_key] = dep_hashes[identity]["hash"]
+
+        input_merkle_ids = {
+            types.identity_key(ref.identity): self._merkle_ids[types.identity_key(ref.identity)]
+            for ref in stage_info["deps"].values()
+            if types.identity_key(ref.identity) in self._merkle_ids
+        }
+        stage_merkle_id = merkle.compute_merkle_id(code_manifest, params, input_merkle_ids)
+        for out_ref in stage_info["outs"]:
+            self._merkle_ids[types.identity_key(out_ref.identity)] = stage_merkle_id
+
     async def _compute_explanation(
         self,
         stage_name: str,
@@ -1713,12 +1825,13 @@ class Engine:
             return explain_mod.get_stage_explanation(
                 stage_name=stage_name,
                 fingerprint=worker_info["fingerprint"],
-                deps=worker_info["deps"],
-                outs_paths=stage_info["outs_paths"],
+                deps=[types.identity_key(ref.identity) for ref in stage_info["deps"].values()],
+                outs_paths=[types.identity_key(ref.identity) for ref in stage_info["outs"]],
                 params_instance=worker_info["params"],
                 overrides=overrides,
                 state_dir=worker_info["state_dir"],
                 force=force,
+                allow_missing=True,
             )
 
         try:
@@ -1737,7 +1850,6 @@ class Engine:
         Reads the lock file (just written by the worker) to get output hashes.
         Returns None if computation fails (should never block event emission).
         """
-        from pivot import outputs
         from pivot.storage import lock
 
         def _compute() -> list[OutputChangeSummary]:
@@ -1749,22 +1861,23 @@ class Engine:
 
             # Build path -> output_type map from registry
             outs = stage_info["outs"]
-            outs_paths = stage_info["outs_paths"]
+            outs_paths = [types.identity_key(ref.identity) for ref in stage_info["outs"]]
             path_to_type = dict[str, str]()
-            for out, path in zip(outs, outs_paths, strict=True):
-                if isinstance(out, outputs.Metric):
-                    path_to_type[path] = "metric"
-                elif isinstance(out, outputs.Plot):
-                    path_to_type[path] = "plot"
-                else:
-                    path_to_type[path] = "out"
+            for out in outs:
+                match out.tag:
+                    case ArtifactTag.METRIC:
+                        path_to_type[types.identity_key(out.identity)] = "metric"
+                    case ArtifactTag.PLOT:
+                        path_to_type[types.identity_key(out.identity)] = "plot"
+                    case _:
+                        path_to_type[types.identity_key(out.identity)] = "out"
 
             summary = list[OutputChangeSummary]()
             # Get new hashes from lock file
             new_hashes = dict[str, str | None]()
             if lock_data is not None and "output_hashes" in lock_data:
-                for path, hash_info in lock_data["output_hashes"].items():
-                    new_hashes[path] = hash_info["hash"]
+                for identity, hash_info in lock_data["output_hashes"].items():
+                    new_hashes[types.identity_key(identity)] = hash_info["hash"]
 
             for path in outs_paths:
                 new_hash = new_hashes.get(path)
@@ -1953,43 +2066,10 @@ class Engine:
 
     async def _handle_data_artifact_changed(self, event: DataArtifactChanged) -> None:
         """Handle data artifact changes by running affected stages."""
-        paths = [pathlib.Path(p) for p in event["paths"]]
-
-        # Filter out paths that are outputs of executing stages
-        filtered_paths = list[pathlib.Path]()
-        deferred_paths = list[tuple[str, pathlib.Path]]()
-
-        for path in paths:
-            if self._should_filter_path(path):
-                coordinator = self._get_watch_coordinator()
-                producer = coordinator.get_producer(path) if coordinator else None
-                if producer:
-                    deferred_paths.append((producer, path))
-                    continue
-            filtered_paths.append(path)
-
-        # Defer events for filtered paths
-        for producer, path in deferred_paths:
-            self._defer_event_for_stage(
-                producer,
-                DataArtifactChanged(type="data_artifact_changed", paths=[str(path)]),
-            )
-
-        if not filtered_paths:
-            return
-
-        # Get affected stages
-        affected = self._get_affected_stages_for_paths(filtered_paths)
-
-        if not affected:
-            return
-
-        _logger.info(
-            "Data changed: %d file(s) affect %d stage(s)", len(filtered_paths), len(affected)
-        )
-
-        # Execute affected stages
-        await self._execute_affected_stages(affected)
+        _ = event
+        # TODO: Store-based watch resolution will re-enable this handler.
+        _logger.debug("Watch data artifact handling is disabled pending store integration")
+        return
 
     async def _handle_code_or_config_changed(self, event: CodeOrConfigChanged) -> None:
         """Handle code/config changes by reloading registry and re-running.
@@ -2020,25 +2100,23 @@ class Engine:
             return
 
         # Emit reload event
-        old_stages, old_registry = reload_result
-        await self._emit_reload_event(old_stages, old_registry)
+        old_stages, old_pipeline_ref = reload_result
+        await self._emit_reload_event(old_stages, old_pipeline_ref)
 
         # Flush manifest cache so cached manifests survive the reload
         fingerprint.flush_manifest_cache()
 
-        # Resolve external deps (e.g. sibling pipelines) before reading stages.
-        # Reload bypasses Pipeline.build_dag() so we must resolve explicitly.
-        self._require_pipeline().resolve_external_dependencies()
         all_stages = self._get_all_stages()
+        # Hot-reload: skip dependency validation — deps may be temporarily missing while user edits
         self._graph = engine_graph.build_graph(all_stages)
 
         # Update watch paths if we have a FilesystemSource
         from pivot.engine.sources import FilesystemSource
 
-        watch_paths = engine_graph.get_watch_paths(self._graph)
+        watch_paths = [pathlib.Path(p) for p in engine_graph.get_watch_paths(self._graph)]
 
         # In --all mode, also watch pipeline config directories so creating/removing
-        # pipeline.py or pivot.yaml triggers reload.
+        # pipeline.py triggers reload.
         if self._all_pipelines:
             from pivot import discovery
 
@@ -2192,15 +2270,15 @@ class Engine:
 
     def _reload_registry(
         self,
-    ) -> tuple[dict[str, RegistryStageInfo], registry.StageRegistry | None] | None:
+    ) -> tuple[dict[str, RegistryStageInfo], registry.PipelineLike | None] | None:
         """Reload the pipeline by re-importing pipeline definition.
 
-        Returns old_stages and old_registry if reload succeeded, None if pipeline is invalid.
+        Returns old_stages and old_pipeline_ref if reload succeeded, None if pipeline is invalid.
         The caller should emit the reload event using the returned old_stages.
         """
         old_pipeline = self._pipeline
         old_stages = old_pipeline.snapshot() if old_pipeline else {}
-        old_registry = old_pipeline._registry if old_pipeline else None  # pyright: ignore[reportPrivateUsage]
+        old_pipeline_ref = old_pipeline if old_pipeline else None
         root = project.get_project_root()
 
         # Clear project modules from sys.modules
@@ -2216,7 +2294,7 @@ class Engine:
                 return None
 
             self._pipeline = new_pipeline
-            return old_stages, old_registry
+            return old_stages, old_pipeline_ref
         except Exception as e:
             _logger.warning(f"Pipeline invalid: {e}")
             # Restore old pipeline on failure
@@ -2246,7 +2324,7 @@ class Engine:
     async def _emit_reload_event(
         self,
         old_stages: dict[str, RegistryStageInfo],
-        old_registry: registry.StageRegistry | None,
+        old_pipeline_ref: registry.PipelineLike | None,
     ) -> None:
         """Emit PipelineReloaded event with diff information."""
         new_stage_names = self._list_stages()
@@ -2259,10 +2337,10 @@ class Engine:
         # Detect modified stages by comparing fingerprints
         modified = list[str]()
         pipeline = self._require_pipeline()
-        new_registry = pipeline._registry  # pyright: ignore[reportPrivateUsage]
+        new_pipeline_ref = pipeline
         for stage_name in sorted(old_stage_names & new_stages_set):
             had_error = False
-            if old_registry is None:
+            if old_pipeline_ref is None:
                 old_fp = None
                 had_error = True
                 _logger.warning(
@@ -2271,7 +2349,7 @@ class Engine:
                 )
             else:
                 try:
-                    old_fp = old_registry.ensure_fingerprint(stage_name)
+                    old_fp = old_pipeline_ref.ensure_fingerprint(stage_name)
                 except exceptions.PivotError as exc:
                     old_fp = None
                     had_error = True
@@ -2282,7 +2360,7 @@ class Engine:
                     )
 
             try:
-                new_fp = new_registry.ensure_fingerprint(stage_name)
+                new_fp = new_pipeline_ref.ensure_fingerprint(stage_name)
             except exceptions.PivotError as exc:
                 new_fp = None
                 had_error = True

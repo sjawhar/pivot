@@ -306,7 +306,7 @@ def _validate_stages_required(stages_list: list[str] | None) -> list[str]:
     return stages_list
 
 
-@cli_decorators.pivot_command()
+@cli_decorators.pivot_command(allow_all=True)
 @click.argument("stages", nargs=-1, shell_complete=completion.complete_stages)
 @click.option(
     "--force",
@@ -437,3 +437,11 @@ def run(
 
     if not results and show_human_output:
         click.echo("No stages to run")
+        return
+
+    if results:
+        from pivot.executor import core as executor_core
+
+        _, _, _, _, failed = executor_core.count_results(results)
+        if failed > 0:
+            raise SystemExit(1)

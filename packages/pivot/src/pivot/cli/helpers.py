@@ -1,6 +1,8 @@
+# pyright: reportImplicitRelativeImport=false, reportMissingModuleSource=false, reportImportCycles=false
 from __future__ import annotations
 
 import enum
+import importlib
 import json
 import sys
 from typing import TYPE_CHECKING, Any, cast, override
@@ -12,10 +14,10 @@ if TYPE_CHECKING:
     from networkx import DiGraph
 
     from pivot.cli import CliContext
-    from pivot.pipeline.pipeline import Pipeline
-    from pivot.registry import RegistryStageInfo, StageRegistry
+    from pivot.registry import PipelineLike, RegistryStageInfo
+    from pivot.storage.store import WorkspaceStore
 
-from pivot import exceptions
+from pivot import exceptions, project
 from pivot.cli import decorators as cli_decorators
 
 
@@ -28,12 +30,11 @@ class NoPipelineError(exceptions.PivotError):
             "No pipeline definition found.\n"
             "\n"
             "This command requires a pipeline to be defined in one of:\n"
-            "  - pivot.yaml (or pivot.yml)\n"
             "  - pipeline.py"
         )
 
 
-def _get_pipeline() -> Pipeline:
+def get_pipeline() -> PipelineLike:
     """Get Pipeline from context, raising NoPipelineError if not found."""
     pipeline = cli_decorators.get_pipeline_from_context()
     if pipeline is None:
@@ -41,35 +42,39 @@ def _get_pipeline() -> Pipeline:
     return pipeline
 
 
-def get_registry() -> StageRegistry:
-    """Get StageRegistry from Pipeline in context."""
-    return _get_pipeline()._registry  # pyright: ignore[reportPrivateUsage]
-
-
 def list_stages() -> list[str]:
     """List stage names from Pipeline in context."""
-    return _get_pipeline().list_stages()
+    return get_pipeline().list_stages()
 
 
 def get_stage(name: str) -> RegistryStageInfo:
     """Get stage info from Pipeline in context."""
-    return _get_pipeline().get(name)
-
-
-def resolve_external_dependencies() -> None:
-    """Resolve external dependencies on the Pipeline in context."""
-    _get_pipeline().resolve_external_dependencies()
+    return get_pipeline().get_stage(name)
 
 
 def get_all_stages() -> dict[str, RegistryStageInfo]:
     """Get all stages as a dict from Pipeline in context."""
-    pipeline = _get_pipeline()
-    return {name: pipeline.get(name) for name in pipeline.list_stages()}
+    pipeline = get_pipeline()
+    return {name: pipeline.get_stage(name) for name in pipeline.list_stages()}
 
 
-def build_dag(validate: bool = True) -> DiGraph[str]:
+def build_dag() -> DiGraph[str]:
     """Build DAG from Pipeline in context."""
-    return _get_pipeline().build_dag(validate=validate)
+    return get_pipeline().build_dag()
+
+
+def get_workspace_store() -> WorkspaceStore | None:
+    """Get a WorkspaceStore for display/path resolution, or None if no pipeline."""
+    store_mod = importlib.import_module("pivot.storage.store")
+
+    pipeline = cli_decorators.get_pipeline_from_context()
+    if pipeline is None:
+        return None
+    return store_mod.WorkspaceStore(
+        project_root=project.get_project_root(),
+        pipeline_name=pipeline.name,
+        input_bindings=pipeline.input_bindings,
+    )
 
 
 def _json_default(obj: Any) -> Any:  # noqa: ANN401 - json.dumps default requires Any

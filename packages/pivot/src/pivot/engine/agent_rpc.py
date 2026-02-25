@@ -1,3 +1,4 @@
+# pyright: reportImportCycles=false, reportMissingImports=false, reportImplicitRelativeImport=false
 from __future__ import annotations
 
 import contextlib
@@ -13,7 +14,7 @@ from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStre
 from pydantic import BaseModel, ValidationError, field_validator
 
 from pivot import explain as explain_mod
-from pivot import parameters
+from pivot import parameters, types
 from pivot import registry as registry_mod
 from pivot.config import io as config_io
 from pivot.engine.types import CancelRequested, EngineState, OutputEvent, RunRequested
@@ -48,6 +49,10 @@ def _json_default(obj: object) -> object:
     if isinstance(obj, enum.Enum):
         return obj.value
     raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+
+def _identity_json(ref: types.ArtifactRef) -> types.ArtifactIdentityJson:
+    return types.identity_to_json(ref.identity)
 
 
 # JSON-RPC 2.0: id can be string, number, or null (for notifications)
@@ -123,8 +128,8 @@ class QueryStageInfoResult(TypedDict):
     """Result type for stage_info query."""
 
     name: str
-    deps: list[str]
-    outs: list[str]
+    deps: list[types.ArtifactIdentityJson]
+    outs: list[types.ArtifactIdentityJson]
 
 
 class CommitResult(TypedDict):
@@ -245,7 +250,7 @@ class AgentRpcHandler:
         if pipeline is None:
             raise ValueError("No pipeline loaded")
         try:
-            reg_info = pipeline.get(stage)
+            reg_info = pipeline.get_stage(stage)
         except KeyError:
             raise ValueError(f"Unknown stage: {stage}") from None
         return stage, reg_info
@@ -284,7 +289,7 @@ class AgentRpcHandler:
                 pipeline = self._engine._pipeline  # pyright: ignore[reportPrivateUsage]
                 if pipeline is None:
                     raise ValueError("No pipeline loaded")
-                fingerprint = pipeline._registry.ensure_fingerprint(stage)  # pyright: ignore[reportPrivateUsage]
+                fingerprint = pipeline.ensure_fingerprint(stage)
 
                 def _get_explanation() -> StageExplanation:
                     try:
@@ -294,13 +299,16 @@ class AgentRpcHandler:
                     return explain_mod.get_stage_explanation(
                         stage_name=stage,
                         fingerprint=fingerprint,
-                        deps=reg_info["deps_paths"],
-                        outs_paths=reg_info["outs_paths"],
+                        deps=[
+                            types.identity_key(dep.identity) for dep in reg_info["deps"].values()
+                        ],
+                        outs_paths=[types.identity_key(out.identity) for out in reg_info["outs"]],
                         params_instance=reg_info["params"],
                         overrides=overrides,
                         state_dir=registry_mod.get_stage_state_dir(
                             reg_info, config_io.get_state_dir()
                         ),
+                        allow_missing=True,
                     )
 
                 return await anyio.to_thread.run_sync(_get_explanation)  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType, reportUnknownVariableType] - anyio stub issue
@@ -317,8 +325,8 @@ class AgentRpcHandler:
                 stage, reg_info = self._get_stage_info(params)
                 return QueryStageInfoResult(
                     name=stage,
-                    deps=reg_info["deps_paths"],
-                    outs=reg_info["outs_paths"],
+                    deps=[_identity_json(dep) for dep in reg_info["deps"].values()],
+                    outs=[_identity_json(out) for out in reg_info["outs"]],
                 )
             case "diff_output":
                 path = params.get("path")

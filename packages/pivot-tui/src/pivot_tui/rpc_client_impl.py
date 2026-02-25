@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Literal, cast
 
 import anyio
 
+from pivot.types import ArtifactIdentity
 from pivot_tui.client import (
     CommitResult,
     EngineStatus,
@@ -130,8 +131,8 @@ class RpcPivotClient:
             raise RpcProtocolError("str", type(name).__name__)
         return StageInfoResult(
             name=name,
-            deps=_as_str_list(r["deps"]),
-            outs=_as_str_list(r["outs"]),
+            deps=_as_identity_list(r["deps"]),
+            outs=_as_identity_list(r["outs"]),
         )
 
     async def explain(self, stage: str) -> StageExplanation:
@@ -294,4 +295,20 @@ def _as_str_list(value: object) -> list[str]:
         if not isinstance(item, str):
             raise RpcProtocolError("list[str]", type(item).__name__)
         items.append(item)
+    return items
+
+
+def _as_identity_list(value: object) -> list[ArtifactIdentity]:
+    if not isinstance(value, list):
+        raise RpcProtocolError("list", type(value).__name__)
+    items = list[ArtifactIdentity]()
+    for item in value:
+        d = _as_dict(item)
+        producer = d.get("producer")
+        if not isinstance(producer, str):
+            raise RpcProtocolError("str (producer)", type(producer).__name__)
+        key = d.get("key")
+        if key is not None and not isinstance(key, str):
+            raise RpcProtocolError("str | None (key)", type(key).__name__)
+        items.append(ArtifactIdentity(producer, key))
     return items

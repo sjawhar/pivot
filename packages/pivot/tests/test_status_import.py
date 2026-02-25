@@ -1,3 +1,5 @@
+# pyright: reportMissingImports=false, reportImplicitRelativeImport=false
+
 from __future__ import annotations
 
 import pathlib
@@ -158,12 +160,12 @@ def test_status_no_flag_no_api(
     )
 
     with isolated_pivot_dir(runner, tmp_path):
-        pathlib.Path("pipeline.py").write_text("""\
-from __future__ import annotations
-from pivot.pipeline.pipeline import Pipeline
-
-pipeline = Pipeline('test')
-""")
+        pathlib.Path("pipeline.py").write_text(
+            "from __future__ import annotations\n"
+            "from pivot.compose import Pipeline\n"
+            "\n"
+            "pipeline = Pipeline('test')\n"
+        )
         result = runner.invoke(cli.cli, ["status"])
 
     assert result.exit_code == 0

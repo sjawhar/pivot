@@ -1,12 +1,14 @@
+# pyright: reportMissingImports=false
 """Unit tests for DAG render functions (ASCII, Mermaid, DOT)."""
 
 from __future__ import annotations
 
 import pathlib
 
-from pivot import dag, loaders, outputs
+from pivot import dag, loaders
 from pivot.engine import graph as engine_graph
 from pivot.registry import RegistryStageInfo
+from pivot.types import ArtifactIdentity, ArtifactRef, ArtifactTag
 
 # =============================================================================
 # Helper functions for building test stages
@@ -17,31 +19,37 @@ def _noop_stage_func() -> None:
     """No-op function for test stages (must be module-level for fingerprinting)."""
 
 
+def _artifact_ref(identity: ArtifactIdentity) -> ArtifactRef:
+    return ArtifactRef(
+        identity=identity,
+        format=loaders.PathOnly(),
+        python_type=str,
+        tag=ArtifactTag.DATA,
+    )
+
+
 def _create_stage(
     name: str,
     deps: list[str],
     outs: list[str],
 ) -> RegistryStageInfo:
     """Create a stage info dict for testing."""
+    dep_identities = [ArtifactIdentity(dep, None) for dep in deps]
+    out_identities = [ArtifactIdentity(out, None) for out in outs]
     return RegistryStageInfo(
         func=_noop_stage_func,
         name=name,
-        deps={f"_{i}": d for i, d in enumerate(deps)},
-        deps_paths=deps,
-        outs=[
-            outputs.require_expanded(outputs.Out(path=out, loader=loaders.PathOnly()))
-            for out in outs
-        ],
-        outs_paths=outs,
+        deps={f"_{i}": _artifact_ref(dep) for i, dep in enumerate(dep_identities)},
+        outs=[_artifact_ref(out) for out in out_identities],
         params=None,
         mutex=[],
         variant=None,
         signature=None,
         fingerprint={},
-        dep_specs={},
-        out_specs=dict[str, outputs.BaseOut](),
         params_arg_name=None,
         state_dir=None,
+        collection_params={},
+        no_fingerprint=False,
     )
 
 

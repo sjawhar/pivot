@@ -26,14 +26,18 @@ def tui_watch_pipeline(tmp_path: pathlib.Path) -> Generator[pathlib.Path]:
     # Use pipeline.py only (not pivot.yaml) to avoid ambiguity error
     pipeline_code = """\
 import pathlib
-from pivot.pipeline.pipeline import Pipeline
+from pivot.compose import Pipeline as ComposePipeline, stage
 
-pipeline = Pipeline("test", root=pathlib.Path(__file__).parent)
+_cp = ComposePipeline("test", root=pathlib.Path(__file__).parent)
 
+@stage
 def hello() -> None:
     print("Hello!")
 
-pipeline.register(hello, name="hello")
+with _cp:
+    hello()
+
+pipeline = _cp
 """
     (tmp_path / "pipeline.py").write_text(pipeline_code)
 
@@ -110,5 +114,5 @@ def test_tui_watch_mode_accepts_run_command(tui_watch_pipeline: pathlib.Path) ->
     sock_path = tui_watch_pipeline
 
     # Send a force run command for a specific stage
-    response = send_rpc(sock_path, "run", {"stages": ["hello"], "force": True})
+    response = send_rpc(sock_path, "run", {"stages": ["test/hello"], "force": True})
     assert response.get("result") == "accepted", f"Expected 'accepted': {response}"

@@ -1,39 +1,34 @@
+# pyright: reportImportCycles=false, reportImplicitRelativeImport=false
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-__version__ = "0.1.0-dev"
+__version__ = "0.2.0a1"
 
 # Public API - only exports that users need when writing pipelines
 # Internal modules like BaseOut and show.* are accessible via their full paths
 
 if TYPE_CHECKING:
     from pivot import loaders as loaders
+    from pivot import merkle as merkle
     from pivot import stage_def as stage_def
+    from pivot.compose import Pipeline as Pipeline
+    from pivot.compose import metric as metric
+    from pivot.compose import plot as plot
+    from pivot.compose import stage as stage
     from pivot.decorators import no_fingerprint as no_fingerprint
-    from pivot.outputs import Dep as Dep
-    from pivot.outputs import DirectoryOut as DirectoryOut
-    from pivot.outputs import IncrementalOut as IncrementalOut
-    from pivot.outputs import Metric as Metric
-    from pivot.outputs import Out as Out
-    from pivot.outputs import PlaceholderDep as PlaceholderDep
-    from pivot.outputs import Plot as Plot
-    from pivot.pipeline.pipeline import Pipeline as Pipeline
     from pivot.stage_def import StageParams as StageParams
 
 # Lazy import mapping for runtime: (module_path, attr_name or None for module import)
 _LAZY_IMPORTS: dict[str, tuple[str, str | None]] = {
     "no_fingerprint": ("pivot.decorators", "no_fingerprint"),
+    "merkle": ("pivot.merkle", None),
     "loaders": ("pivot.loaders", None),
     "stage_def": ("pivot.stage_def", None),
-    "DirectoryOut": ("pivot.outputs", "DirectoryOut"),
-    "Dep": ("pivot.outputs", "Dep"),
-    "IncrementalOut": ("pivot.outputs", "IncrementalOut"),
-    "Metric": ("pivot.outputs", "Metric"),
-    "Out": ("pivot.outputs", "Out"),
-    "PlaceholderDep": ("pivot.outputs", "PlaceholderDep"),
-    "Plot": ("pivot.outputs", "Plot"),
-    "Pipeline": ("pivot.pipeline.pipeline", "Pipeline"),
+    "Pipeline": ("pivot.compose", "Pipeline"),
+    "stage": ("pivot.compose", "stage"),
+    "metric": ("pivot.compose", "metric"),
+    "plot": ("pivot.compose", "plot"),
     "StageParams": ("pivot.stage_def", "StageParams"),
 }
 

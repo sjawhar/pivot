@@ -5,7 +5,7 @@ from typing import TypedDict
 
 import click
 
-from pivot import config, project
+from pivot import config, project, types
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
 from pivot.storage import cache
@@ -52,7 +52,7 @@ def _get_all_stage_outputs() -> dict[str, pathlib.Path]:
     outputs_normalized = set[str]()
     for stage_name in cli_helpers.list_stages():
         info = cli_helpers.get_stage(stage_name)
-        outputs_normalized.update(info.get("outs_paths", []))
+        outputs_normalized.update(types.identity_key(out.identity) for out in info["outs"])
 
     # Pre-resolve all stage outputs with explicit error handling
     outputs_resolved = dict[str, pathlib.Path]()

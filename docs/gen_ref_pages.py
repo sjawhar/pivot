@@ -1,5 +1,7 @@
 """Generate API reference pages automatically from docstrings."""
 
+# pyright: reportMissingImports=false
+
 import mkdocs_gen_files
 
 nav = mkdocs_gen_files.Nav()
@@ -9,7 +11,7 @@ PUBLIC_MODULES = [
     ("pivot", "Package Exports"),
     ("pivot.registry", "Stage Registration"),
     ("pivot.outputs", "Output Types"),
-    ("pivot.pipeline", "Pipeline Class"),
+    ("pivot.compose", "Pipeline Composition"),
     ("pivot.executor", "Execution"),
     ("pivot.parameters", "Parameters"),
     ("pivot.explain", "Explain Mode"),

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import pytest
 import yaml
@@ -25,17 +25,21 @@ code_manifest:
 params:
   lr: 0.01
 deps:
-  - path: data.csv
+  - producer: source
+    key: data.csv
     hash: def456
 outs:
-  - path: model.pkl
+  - key: null
     hash: ghi789
+    tag: data
+    display: model.pkl
 """
     result = restore._parse_lock_data_from_bytes(content)
 
     assert result is not None
     assert "outs" in result
-    assert result["outs"][0]["path"] == "model.pkl"
+    out_entry = cast("dict[str, object]", cast("object", result["outs"][0]))
+    assert out_entry["display"] == "model.pkl"
 
 
 def test_parse_lock_data_from_bytes_invalid() -> None:
@@ -115,7 +119,7 @@ def test_resolve_targets_as_stage(git_repo: GitRepo, monkeypatch: pytest.MonkeyP
         "code_manifest": {"func:main": "abc123"},
         "params": {},
         "deps": [],
-        "outs": [{"path": "model.pkl", "hash": "def456"}],
+        "outs": [{"key": None, "hash": "def456", "tag": "data", "display": "model.pkl"}],
     }
     (repo_path / ".pivot" / "stages" / "train.lock").write_text(yaml.dump(lock_content))
 
@@ -128,7 +132,7 @@ def test_resolve_targets_as_stage(git_repo: GitRepo, monkeypatch: pytest.MonkeyP
     assert len(targets) == 1
     assert targets[0]["target_type"] == "stage"
     assert targets[0]["original_target"] == "train"
-    assert "model.pkl" in targets[0]["paths"]
+    assert "train" in targets[0]["paths"]
 
 
 def test_resolve_targets_as_pvt_file(git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -365,7 +369,7 @@ def test_restore_targets_from_revision_output_with_stage(
         "code_manifest": {"func:main": "abc123"},
         "params": {},
         "deps": [],
-        "outs": [{"path": "model.pkl", "hash": "def456"}],
+        "outs": [{"key": None, "hash": "def456", "tag": "data", "display": "model.pkl"}],
     }
     (repo_path / ".pivot" / "stages" / "train.lock").write_text(yaml.dump(lock_content))
 
@@ -392,7 +396,12 @@ def test_restore_targets_from_revision_output_with_stage(
 
 def test_out_entry_to_output_hash_with_manifest() -> None:
     """Converts OutEntry with manifest to HashInfo."""
-    entry = {"path": "data/", "hash": "abc123", "manifest": {"a.txt": "def456"}}
+    entry = {
+        "key": None,
+        "hash": "abc123",
+        "tag": "data",
+        "manifest": [{"relpath": "a.txt", "hash": "def456", "size": 1, "isexec": False}],
+    }
     result = restore._out_entry_to_output_hash(entry)  # pyright: ignore[reportArgumentType]
 
     assert result["hash"] == "abc123"
@@ -401,7 +410,7 @@ def test_out_entry_to_output_hash_with_manifest() -> None:
 
 def test_out_entry_to_output_hash_file() -> None:
     """Converts OutEntry without manifest to FileHash."""
-    entry = {"path": "data.csv", "hash": "abc123"}
+    entry = {"key": None, "hash": "abc123", "tag": "data"}
     result = restore._out_entry_to_output_hash(entry)  # pyright: ignore[reportArgumentType]
 
     assert result["hash"] == "abc123"

@@ -5,13 +5,15 @@ import pathlib
 
 import click
 
-from pivot import config, project
+from pivot import config, project, types
 from pivot.cli import decorators as cli_decorators
+from pivot.cli import helpers as cli_helpers
+from pivot.cli import targets as cli_targets
 from pivot.storage import cache, restore
 from pivot.types import DataDiffResult, OutputFormat
 
 
-@cli_decorators.pivot_command()
+@cli_decorators.pivot_command(allow_all=True)
 @click.argument("targets", nargs=-1, required=True)
 @click.option("--key", "key_cols", help="Comma-separated key columns for row matching")
 @click.option("--positional", is_flag=True, help="Use positional (row-by-row) matching")
@@ -69,7 +71,39 @@ def diff(
 
     # Filter to targets
     proj_root = project.get_project_root()
-    target_set = {project.to_relative_path(project.normalize_path(t), proj_root) for t in targets}
+    store = cli_helpers.get_workspace_store()
+    all_stages = cli_helpers.get_all_stages()
+    resolved_targets = set[str]()
+
+    for target in targets:
+        try:
+            resolved = cli_targets.resolve_cli_target(target, all_stages, lambda _: False)
+        except cli_targets.TargetValidationError as exc:
+            identity = types.identity_from_key(target)
+            if identity.producer in all_stages:
+                raise click.ClickException(str(exc)) from exc
+            resolved_targets.add(
+                project.to_relative_path(project.normalize_path(target), proj_root)
+            )
+            continue
+
+        if resolved["kind"] == "identity":
+            if store is None:
+                resolved_targets.add(types.identity_key(resolved["identity"]))
+                continue
+            for ref in resolved["refs"]:
+                if ref.tag in {types.ArtifactTag.METRIC, types.ArtifactTag.PLOT}:
+                    continue
+                abs_path = store.resolve_display_path(ref)
+                rel_path = project.to_relative_path(str(abs_path), proj_root)
+                resolved_targets.add(rel_path)
+            continue
+
+        resolved_targets.add(
+            project.to_relative_path(project.normalize_path(resolved["path"]), proj_root)
+        )
+
+    target_set = resolved_targets
     filtered_head_hashes = {k: v for k, v in head_hashes.items() if k in target_set}
 
     # Get workspace hashes

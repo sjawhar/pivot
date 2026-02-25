@@ -73,17 +73,19 @@ def status(
     tracked_status = list[TrackedFileInfo]()
     remote_status: RemoteSyncInfo | None = None
 
+    orphaned_locks = list[str]()
+
     if show_stages and pipeline is not None:
-        # Build bipartite graph for consistent execution order with Engine
         all_stages = cli_helpers.get_all_stages()
         graph = engine_graph.build_graph(all_stages)
+        orphaned_locks = status_mod.find_orphaned_lock_files(set(all_stages.keys()))
 
         if explain:
             pipeline_explanations = status_mod.get_pipeline_explanations(
                 stages_list,
                 single_stage=False,
                 all_stages=all_stages,
-                stage_registry=cli_helpers.get_registry(),
+                pipeline=cli_helpers.get_pipeline(),
                 graph=graph,
             )
         else:
@@ -91,7 +93,7 @@ def status(
                 stages_list,
                 single_stage=False,
                 all_stages=all_stages,
-                stage_registry=cli_helpers.get_registry(),
+                pipeline=cli_helpers.get_pipeline(),
                 graph=graph,
             )
 
@@ -137,7 +139,6 @@ def status(
         import_statuses = status_mod.get_import_status(project_root)
 
     # Compute counts once for suggestions and output
-    # When explain mode is used, compute from explanations; otherwise from status
     if explain and pipeline_explanations:
         stale_count = sum(1 for e in pipeline_explanations if e["will_run"])
     else:
@@ -145,7 +146,9 @@ def status(
     modified_count = sum(1 for f in tracked_status if f["status"] == TrackedFileStatus.MODIFIED)
     push_count = remote_status["push_count"] if remote_status else 0
     pull_count = remote_status["pull_count"] if remote_status else 0
-    suggestions = status_mod.get_suggestions(stale_count, modified_count, push_count, pull_count)
+    suggestions = status_mod.get_suggestions(
+        stale_count, modified_count, push_count, pull_count, len(orphaned_locks)
+    )
 
     # Quiet mode: no output, exit 1 if there are issues needing attention
     if quiet and not output_json:

@@ -5,9 +5,8 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from pivot import project
 from pivot.storage import lock
-from pivot.types import DirHash, LockData, StorageLockData
+from pivot.types import ArtifactIdentity, DirHash, LockData, StorageLockData
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -15,6 +14,10 @@ if TYPE_CHECKING:
     from pytest_mock import MockerFixture
 
     from pivot.types import HashInfo
+
+
+def _id(producer: str, key: str | None = None) -> ArtifactIdentity:
+    return ArtifactIdentity(producer, key)
 
 
 def test_lock_file_creation(tmp_path: Path) -> None:
@@ -38,9 +41,7 @@ def test_lock_file_read(set_project_root: Path) -> None:
     """Lock file contents can be read back."""
     cache_dir = set_project_root / ".cache"
     stage_lock = lock.StageLock("train", cache_dir)
-    # Use absolute path for dep_hashes (internal format uses absolute paths)
-    abs_data_path = str(set_project_root / "data.csv")
-    dep_hashes: dict[str, HashInfo] = {abs_data_path: {"hash": "xyz123"}}
+    dep_hashes: dict[ArtifactIdentity, HashInfo] = {_id("input"): {"hash": "xyz123"}}
     data = LockData(
         code_manifest={"self:train": "def456", "func:helper": "ghi789"},
         params={"learning_rate": 0.01},
@@ -51,6 +52,8 @@ def test_lock_file_read(set_project_root: Path) -> None:
     stage_lock.write(data)
     result = stage_lock.read()
 
+    if result and "merkle_id" in result:
+        del result["merkle_id"]
     assert result == data
 
 
@@ -117,6 +120,9 @@ def test_parallel_lock_writes(tmp_path: Path) -> None:
     for name in stages:
         stage_lock = lock.StageLock(name, tmp_path)
         result = stage_lock.read()
+        # Remove merkle_id from result for comparison (it's added on read)
+        if result and "merkle_id" in result:
+            del result["merkle_id"]
         assert result == LockData(
             code_manifest={f"self:{name}": f"hash_{name}"},
             params={},
@@ -144,9 +150,7 @@ def test_stage_unchanged_when_identical(tmp_path: Path) -> None:
     stage_lock = lock.StageLock("stable", tmp_path)
     fingerprint = {"self:stable": "abc", "func:helper": "def"}
     params = {"lr": 0.01}
-    # In real usage, dep_hashes keys are normalized by hash_dependencies()
-    normalized_key = str(project.normalize_path("data.csv"))
-    dep_hashes: dict[str, HashInfo] = {normalized_key: {"hash": "xyz"}}
+    dep_hashes: dict[ArtifactIdentity, HashInfo] = {_id("data"): {"hash": "xyz"}}
 
     stage_lock.write(
         LockData(
@@ -232,9 +236,8 @@ def test_stage_changed_params_modified(tmp_path: Path) -> None:
 def test_stage_changed_dep_hash_modified(tmp_path: Path) -> None:
     """Stage is marked changed when input file hash differs."""
     stage_lock = lock.StageLock("consumer", tmp_path)
-    # Use absolute paths for dep_hashes to match production behavior
-    input_path = str(tmp_path / "input.csv")
-    old_dep_hashes: dict[str, HashInfo] = {input_path: {"hash": "old_hash"}}
+    dep_id = _id("input")
+    old_dep_hashes: dict[ArtifactIdentity, HashInfo] = {dep_id: {"hash": "old_hash"}}
     stage_lock.write(
         LockData(
             code_manifest={"self:consumer": "hash"},
@@ -244,7 +247,7 @@ def test_stage_changed_dep_hash_modified(tmp_path: Path) -> None:
         )
     )
 
-    new_dep_hashes: dict[str, HashInfo] = {input_path: {"hash": "new_hash"}}
+    new_dep_hashes: dict[ArtifactIdentity, HashInfo] = {dep_id: {"hash": "new_hash"}}
     changed, reason = stage_lock.is_changed(
         current_fingerprint={"self:consumer": "hash"},
         current_params={},
@@ -258,19 +261,19 @@ def test_stage_changed_dep_hash_modified(tmp_path: Path) -> None:
 def test_stage_changed_dep_added(tmp_path: Path) -> None:
     """Stage is marked changed when new input dependency added."""
     stage_lock = lock.StageLock("consumer", tmp_path)
-    old_dep_hashes: dict[str, HashInfo] = {"a.csv": {"hash": "hash_a"}}
+    old_dep_hashes: dict[ArtifactIdentity, HashInfo] = {_id("a"): {"hash": "hash_a"}}
     stage_lock.write(
-        {
-            "code_manifest": {"self:consumer": "hash"},
-            "params": {},
-            "dep_hashes": old_dep_hashes,
-            "output_hashes": {},
-        }
+        LockData(
+            code_manifest={"self:consumer": "hash"},
+            params={},
+            dep_hashes=old_dep_hashes,
+            output_hashes={},
+        )
     )
 
-    new_dep_hashes: dict[str, HashInfo] = {
-        "a.csv": {"hash": "hash_a"},
-        "b.csv": {"hash": "hash_b"},
+    new_dep_hashes: dict[ArtifactIdentity, HashInfo] = {
+        _id("a"): {"hash": "hash_a"},
+        _id("b"): {"hash": "hash_b"},
     }
     changed, reason = stage_lock.is_changed(
         current_fingerprint={"self:consumer": "hash"},
@@ -284,20 +287,20 @@ def test_stage_changed_dep_added(tmp_path: Path) -> None:
 def test_stage_changed_dep_removed(tmp_path: Path) -> None:
     """Stage is marked changed when input dependency removed."""
     stage_lock = lock.StageLock("consumer", tmp_path)
-    old_dep_hashes: dict[str, HashInfo] = {
-        "a.csv": {"hash": "hash_a"},
-        "b.csv": {"hash": "hash_b"},
+    old_dep_hashes: dict[ArtifactIdentity, HashInfo] = {
+        _id("a"): {"hash": "hash_a"},
+        _id("b"): {"hash": "hash_b"},
     }
     stage_lock.write(
-        {
-            "code_manifest": {"self:consumer": "hash"},
-            "params": {},
-            "dep_hashes": old_dep_hashes,
-            "output_hashes": {},
-        }
+        LockData(
+            code_manifest={"self:consumer": "hash"},
+            params={},
+            dep_hashes=old_dep_hashes,
+            output_hashes={},
+        )
     )
 
-    new_dep_hashes: dict[str, HashInfo] = {"a.csv": {"hash": "hash_a"}}
+    new_dep_hashes: dict[ArtifactIdentity, HashInfo] = {_id("a"): {"hash": "hash_a"}}
     changed, reason = stage_lock.is_changed(
         current_fingerprint={"self:consumer": "hash"},
         current_params={},
@@ -595,7 +598,7 @@ def test_stage_changed_output_path_added(tmp_path: Path) -> None:
             code_manifest={"self:producer": "hash"},
             params={},
             dep_hashes={},
-            output_hashes={"/path/to/output.csv": {"hash": "abc123"}},
+            output_hashes={_id("producer", "output"): {"hash": "abc123"}},
         )
     )
 
@@ -604,7 +607,7 @@ def test_stage_changed_output_path_added(tmp_path: Path) -> None:
         current_fingerprint={"self:producer": "hash"},
         current_params={},
         dep_hashes={},
-        out_paths=["/path/to/output.csv", "/path/to/new_output.csv"],
+        out_paths=[_id("producer", "output"), _id("producer", "new_output")],
     )
 
     assert changed is True
@@ -620,8 +623,8 @@ def test_stage_changed_output_path_removed(tmp_path: Path) -> None:
             params={},
             dep_hashes={},
             output_hashes={
-                "/path/to/output1.csv": {"hash": "abc123"},
-                "/path/to/output2.csv": {"hash": "def456"},
+                _id("producer", "output1"): {"hash": "abc123"},
+                _id("producer", "output2"): {"hash": "def456"},
             },
         )
     )
@@ -631,7 +634,7 @@ def test_stage_changed_output_path_removed(tmp_path: Path) -> None:
         current_fingerprint={"self:producer": "hash"},
         current_params={},
         dep_hashes={},
-        out_paths=["/path/to/output1.csv"],
+        out_paths=[_id("producer", "output1")],
     )
 
     assert changed is True
@@ -646,7 +649,7 @@ def test_stage_changed_output_path_modified(tmp_path: Path) -> None:
             code_manifest={"self:producer": "hash"},
             params={},
             dep_hashes={},
-            output_hashes={"/path/to/output.csv": {"hash": "abc123"}},
+            output_hashes={_id("producer", "output"): {"hash": "abc123"}},
         )
     )
 
@@ -655,7 +658,7 @@ def test_stage_changed_output_path_modified(tmp_path: Path) -> None:
         current_fingerprint={"self:producer": "hash"},
         current_params={},
         dep_hashes={},
-        out_paths=["/path/to/results/output.csv"],  # Different path
+        out_paths=[_id("producer", "results_output")],
     )
 
     assert changed is True
@@ -671,19 +674,18 @@ def test_stage_unchanged_with_same_output_paths(tmp_path: Path) -> None:
             params={},
             dep_hashes={},
             output_hashes={
-                "/path/to/output1.csv": {"hash": "abc123"},
-                "/path/to/output2.csv": {"hash": "def456"},
+                _id("producer", "output1"): {"hash": "abc123"},
+                _id("producer", "output2"): {"hash": "def456"},
             },
         )
     )
 
-    # Provide paths in different order to test order-independence
     changed, reason = stage_lock.is_changed_with_lock_data(
         lock_data=stage_lock.read(),
         current_fingerprint={"self:producer": "hash"},
         current_params={},
         dep_hashes={},
-        out_paths=["/path/to/output2.csv", "/path/to/output1.csv"],
+        out_paths=[_id("producer", "output2"), _id("producer", "output1")],
     )
 
     assert changed is False
@@ -691,18 +693,17 @@ def test_stage_unchanged_with_same_output_paths(tmp_path: Path) -> None:
 
 
 def test_stage_unchanged_when_out_paths_none(tmp_path: Path) -> None:
-    """Backward compat: when out_paths not passed, skip output path check."""
+    """When out_paths not passed, skip output path check."""
     stage_lock = lock.StageLock("producer", tmp_path)
     stage_lock.write(
         LockData(
             code_manifest={"self:producer": "hash"},
             params={},
             dep_hashes={},
-            output_hashes={"/path/to/output.csv": {"hash": "abc123"}},
+            output_hashes={_id("producer", "output"): {"hash": "abc123"}},
         )
     )
 
-    # Call without out_paths parameter (backward compat)
     changed, reason = stage_lock.is_changed_with_lock_data(
         lock_data=stage_lock.read(),
         current_fingerprint={"self:producer": "hash"},
@@ -714,20 +715,19 @@ def test_stage_unchanged_when_out_paths_none(tmp_path: Path) -> None:
     assert reason == ""
 
 
-def test_dep_path_change_invalidates_cache(tmp_path: Path) -> None:
-    """Verify dep path changes correctly invalidate cache (documentation test)."""
+def test_dep_identity_change_invalidates_cache(tmp_path: Path) -> None:
+    """Verify dep identity changes correctly invalidate cache."""
     stage_lock = lock.StageLock("consumer", tmp_path)
     stage_lock.write(
         LockData(
             code_manifest={"self:consumer": "hash"},
             params={},
-            dep_hashes={"/old/path/data.csv": {"hash": "abc123"}},
+            dep_hashes={_id("data", "old"): {"hash": "abc123"}},
             output_hashes={},
         )
     )
 
-    # Same hash, different path - should invalidate
-    new_dep_hashes: dict[str, HashInfo] = {"/new/path/data.csv": {"hash": "abc123"}}
+    new_dep_hashes: dict[ArtifactIdentity, HashInfo] = {_id("data", "new"): {"hash": "abc123"}}
     changed, reason = stage_lock.is_changed_with_lock_data(
         lock_data=stage_lock.read(),
         current_fingerprint={"self:consumer": "hash"},
@@ -744,45 +744,43 @@ def test_dep_path_change_invalidates_cache(tmp_path: Path) -> None:
 # ==============================================================================
 
 
-def test_directory_out_trailing_slash_preserved_through_lockfile_roundtrip(
-    set_project_root: Path,
-) -> None:
-    """DirectoryOut paths preserve trailing slash through write/read cycle.
-
-    This is critical because pathlib.Path strips trailing slashes, which would
-    break key matching between stage_outs and lockfile keys.
-    """
+def test_lock_read_ignores_display_fields(set_project_root: Path) -> None:
+    """Display fields should be ignored on read (write-only schema field)."""
     cache_dir = set_project_root / ".cache"
     stage_lock = lock.StageLock("dir_out_stage", cache_dir)
 
-    # Simulate DirectoryOut with trailing slash
-    dir_out_path = str(set_project_root / "results") + "/"
-    dir_hash = DirHash(
-        hash="abc123",
-        manifest=[
-            {"relpath": "task_a.json", "hash": "hash_a", "size": 100, "isexec": False},
-            {"relpath": "task_b.json", "hash": "hash_b", "size": 200, "isexec": False},
-        ],
+    stage_lock.path.parent.mkdir(parents=True, exist_ok=True)
+    stage_lock.path.write_text(
+        "code_manifest: {self:dir_out_stage: fingerprint}\n"
+        "params: {}\n"
+        "schema_version: 2\n"
+        "deps:\n"
+        "  - producer: input\n"
+        "    key: null\n"
+        "    hash: dep_hash\n"
+        "    display: data/raw/input.csv\n"
+        "outs:\n"
+        "  - key: results\n"
+        "    hash: out_hash\n"
+        "    tag: directory\n"
+        "    display: results/\n"
+        "    manifest:\n"
+        "      - relpath: task_a.json\n"
+        "        hash: hash_a\n"
+        "        size: 100\n"
+        "        isexec: false\n"
     )
 
-    data = LockData(
-        code_manifest={"self:dir_out_stage": "fingerprint"},
-        params={},
-        dep_hashes={},
-        output_hashes={dir_out_path: dir_hash},
-    )
-
-    stage_lock.write(data)
     result = stage_lock.read()
 
     assert result is not None
-    # Verify trailing slash is preserved
-    result_paths = list(result["output_hashes"].keys())
-    assert len(result_paths) == 1
-    assert result_paths[0].endswith("/"), f"Trailing slash lost: {result_paths[0]!r}"
-    assert result_paths[0] == dir_out_path
-    # Verify manifest is preserved
-    assert result["output_hashes"][dir_out_path] == dir_hash
+    assert result["dep_hashes"] == {_id("input"): {"hash": "dep_hash"}}
+    assert result["output_hashes"] == {
+        _id("dir_out_stage", "results"): DirHash(
+            hash="out_hash",
+            manifest=[{"relpath": "task_a.json", "hash": "hash_a", "size": 100, "isexec": False}],
+        )
+    }
 
 
 def test_pipeline_prefixed_stage_name_creates_subdirectory(tmp_path: Path) -> None:
@@ -812,3 +810,108 @@ def test_pipeline_prefixed_stage_name_creates_subdirectory(tmp_path: Path) -> No
     assert result is not None
     assert result["code_manifest"] == data["code_manifest"]
     assert result["params"] == data["params"]
+
+
+# =============================================================================
+# ArtifactIdentity-keyed lock roundtrip tests
+# =============================================================================
+
+
+def test_lock_roundtrip_identity_keys(tmp_path: Path) -> None:
+    """LockData dep_hashes and output_hashes use ArtifactIdentity keys through roundtrip."""
+    dep_hashes: dict[ArtifactIdentity, HashInfo] = {
+        _id("input"): {"hash": "aaa"},
+        _id("features", "embeddings"): {"hash": "bbb"},
+    }
+    output_hashes: dict[ArtifactIdentity, HashInfo] = {
+        _id("train"): {"hash": "ccc"},
+        _id("train", "metrics"): {"hash": "ddd"},
+    }
+    data = LockData(
+        code_manifest={"self:train": "fp1"},
+        params={"lr": 0.01},
+        dep_hashes=dep_hashes,
+        output_hashes=output_hashes,
+    )
+    stage_lock = lock.StageLock("train", tmp_path)
+    stage_lock.write(data)
+    loaded = stage_lock.read()
+
+    assert loaded is not None
+    # Keys must be ArtifactIdentity, not strings
+    assert _id("input") in loaded["dep_hashes"]
+    assert _id("features", "embeddings") in loaded["dep_hashes"]
+    assert loaded["dep_hashes"][_id("input")]["hash"] == "aaa"
+    assert loaded["dep_hashes"][_id("features", "embeddings")]["hash"] == "bbb"
+
+    assert _id("train") in loaded["output_hashes"]
+    assert _id("train", "metrics") in loaded["output_hashes"]
+    assert loaded["output_hashes"][_id("train")]["hash"] == "ccc"
+    assert loaded["output_hashes"][_id("train", "metrics")]["hash"] == "ddd"
+
+
+def test_lock_roundtrip_dir_hash_with_identity_keys(tmp_path: Path) -> None:
+    """DirHash manifests survive roundtrip with ArtifactIdentity keys."""
+    dep_hashes: dict[ArtifactIdentity, HashInfo] = {
+        _id("data_dir"): DirHash(
+            hash="tree_aaa",
+            manifest=[{"relpath": "a.csv", "hash": "h1", "size": 100, "isexec": False}],
+        )
+    }
+    data = LockData(
+        code_manifest={},
+        params={},
+        dep_hashes=dep_hashes,
+        output_hashes={},
+    )
+    stage_lock = lock.StageLock("consume", tmp_path)
+    stage_lock.write(data)
+    loaded = stage_lock.read()
+
+    assert loaded is not None
+    info = loaded["dep_hashes"][_id("data_dir")]
+    assert info["hash"] == "tree_aaa"
+    assert "manifest" in info
+
+
+# --- find_orphaned_locks ---
+
+
+def test_find_orphaned_locks_empty_dir(tmp_path: Path) -> None:
+    stages_dir = tmp_path / "stages"
+    stages_dir.mkdir()
+    assert lock.find_orphaned_locks(stages_dir, {"train", "test"}) == []
+
+
+def test_find_orphaned_locks_nonexistent_dir(tmp_path: Path) -> None:
+    assert lock.find_orphaned_locks(tmp_path / "nope", {"train"}) == []
+
+
+def test_find_orphaned_locks_all_registered(tmp_path: Path) -> None:
+    stages_dir = tmp_path / "stages"
+    stages_dir.mkdir()
+    (stages_dir / "train.lock").touch()
+    (stages_dir / "test.lock").touch()
+    assert lock.find_orphaned_locks(stages_dir, {"train", "test"}) == []
+
+
+def test_find_orphaned_locks_detects_orphans(tmp_path: Path) -> None:
+    stages_dir = tmp_path / "stages"
+    stages_dir.mkdir()
+    (stages_dir / "train.lock").touch()
+    (stages_dir / "old_stage.lock").touch()
+    (stages_dir / "renamed@legacy.lock").touch()
+
+    orphans = lock.find_orphaned_locks(stages_dir, {"train"})
+    assert orphans == ["old_stage", "renamed@legacy"]
+
+
+def test_find_orphaned_locks_nested_directories(tmp_path: Path) -> None:
+    stages_dir = tmp_path / "stages"
+    (stages_dir / "base").mkdir(parents=True)
+    (stages_dir / "base" / "base_train.lock").touch()
+    (stages_dir / "base" / "base_test.lock").touch()
+    (stages_dir / "old_root_stage.lock").touch()
+
+    orphans = lock.find_orphaned_locks(stages_dir, {"base/base_train", "base/base_test"})
+    assert orphans == ["old_root_stage"]

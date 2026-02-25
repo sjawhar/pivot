@@ -86,6 +86,7 @@ addopts = [
   "-v",
   "--strict-markers",
   "--tb=short",
+  "--import-mode=importlib",
 ]
 markers = [
   "slow: marks tests as slow (deselect with '-m \"not slow\"')",

@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Literal, Protocol, TypedDict
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from pivot.types import StageExplanation
+    from pivot.types import ArtifactIdentity, StageExplanation
 
 
 class EngineStatus(TypedDict):
@@ -24,8 +24,8 @@ class CommitResult(TypedDict):
 
 class StageInfoResult(TypedDict):
     name: str
-    deps: list[str]
-    outs: list[str]
+    deps: list[ArtifactIdentity]
+    outs: list[ArtifactIdentity]
 
 
 class VersionedEvent(TypedDict):

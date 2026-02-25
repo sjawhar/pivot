@@ -7,10 +7,10 @@ is handled by callers after this function when changed=True.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
-from pivot import project
 from pivot.types import (
+    ArtifactIdentity,
     ChangeDecision,
     ChangeType,
     CodeChange,
@@ -25,8 +25,8 @@ def check_stage(
     lock_data: LockData | None,
     fingerprint: dict[str, str],
     params: dict[str, Any],
-    dep_hashes: dict[str, HashInfo],
-    out_paths: list[str],
+    dep_hashes: dict[ArtifactIdentity, HashInfo],
+    out_paths: list[ArtifactIdentity],
     *,
     explain: bool = False,
     force: bool = False,
@@ -52,7 +52,7 @@ def check_stage(
             return ChangeDecision(changed=True, reason="Code changed")
         if lock_data["params"] != params:
             return ChangeDecision(changed=True, reason="Params changed")
-        if lock_data["dep_hashes"] != dep_hashes:
+        if not _dep_hashes_match(lock_data["dep_hashes"], dep_hashes):
             return ChangeDecision(changed=True, reason="Input dependencies changed")
         if sorted(lock_data["output_hashes"].keys()) != sorted(out_paths):
             return ChangeDecision(changed=True, reason="Output paths changed")
@@ -157,40 +157,68 @@ def diff_params(old: dict[str, Any], new: dict[str, Any]) -> list[ParamChange]:
     return changes
 
 
-def diff_dep_hashes(old: dict[str, HashInfo], new: dict[str, HashInfo]) -> list[DepChange]:
+def diff_dep_hashes(
+    old: dict[ArtifactIdentity, HashInfo], new: dict[ArtifactIdentity, HashInfo]
+) -> list[DepChange]:
     changes = list[DepChange]()
     all_keys = sorted(set(old.keys()) | set(new.keys()))
     for key in all_keys:
         in_old = key in old
         in_new = key in new
         if not in_old:
-            rel_path = project.to_relative_path(key)
             changes.append(
                 DepChange(
-                    path=rel_path,
+                    identity=key,
                     old_hash=None,
                     new_hash=new[key]["hash"],
                     change_type=ChangeType.ADDED,
                 )
             )
         elif not in_new:
-            rel_path = project.to_relative_path(key)
             changes.append(
                 DepChange(
-                    path=rel_path,
+                    identity=key,
                     old_hash=old[key]["hash"],
                     new_hash=None,
                     change_type=ChangeType.REMOVED,
                 )
             )
-        elif old[key] != new[key]:
-            rel_path = project.to_relative_path(key)
-            changes.append(
-                DepChange(
-                    path=rel_path,
-                    old_hash=old[key]["hash"],
-                    new_hash=new[key]["hash"],
-                    change_type=ChangeType.MODIFIED,
+        else:
+            if _dep_hash_changed(old[key], new[key]):
+                changes.append(
+                    DepChange(
+                        identity=key,
+                        old_hash=old[key]["hash"],
+                        new_hash=new[key]["hash"],
+                        change_type=ChangeType.MODIFIED,
+                    )
                 )
-            )
     return changes
+
+
+def _dep_hashes_match(
+    old: dict[ArtifactIdentity, HashInfo], new: dict[ArtifactIdentity, HashInfo]
+) -> bool:
+    if old.keys() != new.keys():
+        return False
+    return not any(_dep_hash_changed(old[key], new[key]) for key in old)
+
+
+def _dep_hash_changed(old: HashInfo, new: HashInfo) -> bool:
+    old_accessed = _get_accessed_hashes(old)
+    if old_accessed is None:
+        return old != new
+
+    new_accessed = _get_accessed_hashes(new)
+    if new_accessed is None:
+        return True
+    return any(new_accessed.get(dep_key) != dep_hash for dep_key, dep_hash in old_accessed.items())
+
+
+def _get_accessed_hashes(info: HashInfo) -> dict[str, str] | None:
+    raw: dict[str, object] = cast("dict[str, object]", cast("object", info))
+    if "accessed_hashes" in raw:
+        return cast("dict[str, str]", raw["accessed_hashes"])
+    if "manifest" in info:
+        return {entry["relpath"]: entry["hash"] for entry in info["manifest"]}
+    return None

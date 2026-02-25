@@ -1,4 +1,8 @@
-"""Tests for pivot history and show CLI commands."""
+"""Tests for pivot history and show CLI commands.
+
+Verifies both commands read from the same StateDB data source and agree
+on run records. Restored after deletion during pipeline-unification.
+"""
 
 from __future__ import annotations
 
@@ -7,7 +11,8 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from pivot import cli, run_history
+from pivot import cli, project, run_history
+from pivot.config import io as config_io
 from pivot.storage import state
 from pivot.types import StageStatus
 
@@ -18,19 +23,21 @@ if TYPE_CHECKING:
 
 
 @pytest.fixture
-def project_with_runs(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> pathlib.Path:
-    """Create a project directory with some run history."""
-    from pivot import project
-
+def project_with_runs(
+    tmp_path: pathlib.Path,
+    runner: click.testing.CliRunner,
+    monkeypatch: pytest.MonkeyPatch,
+) -> pathlib.Path:
+    """Create a project directory with run history in StateDB."""
     project_dir = tmp_path / "project"
     project_dir.mkdir()
     (project_dir / ".pivot").mkdir()
 
     monkeypatch.chdir(project_dir)
-    # Reset cache so discovery finds this project root
     project._project_root_cache = None
+    config_io.clear_config_cache()
 
-    # Write some test runs
+    # Write test runs to the same StateDB that both commands read from
     state_db_path = project_dir / ".pivot" / "state.db"
     with state.StateDB(state_db_path) as db:
         for i in range(3):
@@ -84,9 +91,10 @@ def test_history_shows_status_summary(
     result = runner.invoke(cli.cli, ["history"])
 
     assert result.exit_code == 0
-    # Most recent run has 1 ran, 1 skipped (train ran, eval ran in run 2)
-    # Actually train=ran (i==2), eval=ran → 2 ran, 0 skipped
-    assert "ran" in result.output.lower()
+    # All 3 runs should appear
+    assert "20250110_143000_abc12340" in result.output
+    assert "20250111_143000_abc12341" in result.output
+    assert "20250112_143000_abc12342" in result.output
 
 
 def test_history_respects_limit(
@@ -121,6 +129,8 @@ def test_history_empty(
     project_dir.mkdir()
     (project_dir / ".pivot").mkdir()
     monkeypatch.chdir(project_dir)
+    project._project_root_cache = None
+    config_io.clear_config_cache()
 
     result = runner.invoke(cli.cli, ["history"])
 
@@ -185,8 +195,48 @@ def test_show_empty_project(
     project_dir.mkdir()
     (project_dir / ".pivot").mkdir()
     monkeypatch.chdir(project_dir)
+    project._project_root_cache = None
+    config_io.clear_config_cache()
 
     result = runner.invoke(cli.cli, ["show"])
 
     assert result.exit_code != 0
     assert "No runs recorded" in result.output
+
+
+# =============================================================================
+# Cross-command consistency: history and show agree
+# =============================================================================
+
+
+def test_show_finds_all_runs_listed_by_history(
+    runner: click.testing.CliRunner, project_with_runs: pathlib.Path
+) -> None:
+    """Every run_id listed by history should be found by show."""
+    history_result = runner.invoke(cli.cli, ["history", "--json"])
+    assert history_result.exit_code == 0
+    runs: list[dict[str, object]] = json.loads(history_result.output)
+
+    for run in runs:
+        run_id = run["run_id"]
+        assert isinstance(run_id, str)
+        show_result = runner.invoke(cli.cli, ["show", run_id])
+        assert show_result.exit_code == 0, f"show failed for run_id {run_id}: {show_result.output}"
+        assert run_id in show_result.output
+
+
+def test_show_latest_matches_history_first(
+    runner: click.testing.CliRunner, project_with_runs: pathlib.Path
+) -> None:
+    """Show (no args) should return the same run as the first entry in history."""
+    history_result = runner.invoke(cli.cli, ["history", "--json"])
+    assert history_result.exit_code == 0
+    runs: list[dict[str, object]] = json.loads(history_result.output)
+    latest_run_id = runs[0]["run_id"]
+
+    show_result = runner.invoke(cli.cli, ["show", "--json"])
+    assert show_result.exit_code == 0
+    show_data: dict[str, object] = json.loads(show_result.output)
+    assert show_data["run_id"] == latest_run_id, (
+        "show (no args) should return the same run as the first entry in history"
+    )

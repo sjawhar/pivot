@@ -1,3 +1,4 @@
+# pyright: reportImplicitRelativeImport=false
 from __future__ import annotations
 
 import asyncio
@@ -7,7 +8,7 @@ from typing import TYPE_CHECKING, Literal, TypedDict
 
 import click
 
-from pivot import config, exceptions, path_utils, project, registry
+from pivot import config, exceptions, project, registry, types
 from pivot import status as status_mod
 from pivot.cli import completion
 from pivot.cli import decorators as cli_decorators
@@ -20,7 +21,6 @@ from pivot.types import HashInfo, PipelineStatus, PipelineStatusInfo, is_dir_has
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
-    from pathlib import Path
 
 
 VerifyStatus = Literal["passed", "failed"]
@@ -79,29 +79,54 @@ def _get_stage_lock_hashes(
         return {}, {}
 
     # Filter non-cached outputs — they're git-tracked, not in cache
-    project_root = project.get_project_root()
-    cached_paths = {
-        path_utils.canonicalize_artifact_path(str(out.path), project_root)
-        for out in stage_info["outs"]
-        if out.cache
+    workspace_store = cli_helpers.get_workspace_store()
+    output_refs = {types.identity_key(out.identity): out for out in stage_info["outs"]}
+    cached_identity_keys = {
+        identity_key
+        for identity_key, out in output_refs.items()
+        if out.tag is not types.ArtifactTag.METRIC
     }
-    cached_output_hashes: dict[str, HashInfo] = {
-        path: h
-        for path, h in lock_data["output_hashes"].items()
-        if path_utils.canonicalize_artifact_path(path, project_root) in cached_paths
-    }
+    cached_output_hashes: dict[str, HashInfo] = {}
+    for identity, hash_info in lock_data["output_hashes"].items():
+        identity_key = types.identity_key(identity)
+        if identity_key in cached_identity_keys:
+            if workspace_store is not None and identity_key in output_refs:
+                display_path = workspace_store.resolve_display_path(output_refs[identity_key])
+                resolved_path = project.to_relative_path(display_path)
+            else:
+                resolved_path = identity_key
+            cached_output_hashes[resolved_path] = hash_info
+
+    dep_hashes = {types.identity_key(k): v for k, v in lock_data["dep_hashes"].items()}
 
     return (
         _extract_file_hashes(cached_output_hashes),
-        _extract_file_hashes(lock_data["dep_hashes"]),
+        _extract_file_hashes(dep_hashes),
     )
+
+
+def _get_stage_missing_workspace_files(
+    stage_name: str,
+    project_root: pathlib.Path,
+) -> list[str]:
+    """Get output workspace files that are missing from disk for a non-stale stage.
+
+    Returns list of relative paths for output files that don't exist on disk.
+    Excludes metric outputs (git-tracked, not workspace files).
+    """
+    output_hashes, _ = _get_stage_lock_hashes(stage_name)
+    missing = list[str]()
+    for rel_path in output_hashes:
+        if not (project_root / rel_path).exists():
+            missing.append(rel_path)
+    return missing
 
 
 def _get_stage_missing_hashes(
     stage_name: str,
     local_hashes: set[str],
     allow_missing: bool,
-    project_root: Path,
+    project_root: pathlib.Path,
 ) -> dict[str, list[str]]:
     """Get hashes missing from local cache for a stage.
 
@@ -153,7 +178,7 @@ def _create_remote_if_needed(allow_missing: bool) -> remote_mod.S3Remote | None:
 
 def _verify_stages(
     pipeline_status: list[PipelineStatusInfo],
-    cache_dir: Path,
+    cache_dir: pathlib.Path,
     allow_missing: bool,
 ) -> tuple[bool, list[StageVerifyInfo]]:
     """Verify all stages and return pass/fail status with details.
@@ -208,6 +233,7 @@ def _verify_stages(
         hash_to_paths = stage_hash_to_paths[stage_name]
 
         # Determine missing files based on mode
+        # Determine missing files based on mode
         if not hash_to_paths:
             missing_files = list[str]()
         elif allow_missing and remote is not None:
@@ -221,6 +247,13 @@ def _verify_stages(
         else:
             # Without allow_missing, all locally missing hashes are failures
             missing_files = [p for paths in hash_to_paths.values() for p in paths]
+        # Check workspace output files exist on disk (even if hash is in cache)
+        # This catches the case where outputs were deleted from the workspace
+        # but the hash is still in the local cache.
+        if not missing_files and not allow_missing:
+            missing_workspace = _get_stage_missing_workspace_files(stage_name, project_root)
+            if missing_workspace:
+                missing_files = missing_workspace
 
         # Create result based on whether any files are missing
         if missing_files:
@@ -305,7 +338,7 @@ def verify(
         stages_list,
         single_stage=False,
         all_stages=all_stages,
-        stage_registry=cli_helpers.get_registry(),
+        pipeline=cli_helpers.get_pipeline(),
         allow_missing=allow_missing,
     )
 

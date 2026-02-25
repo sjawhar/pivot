@@ -1,90 +1,40 @@
+# pyright: reportImplicitRelativeImport=false, reportMissingImports=false
 from __future__ import annotations
 
 import dataclasses
 import logging
 import pathlib  # noqa: TC003 - used at runtime in _write_output
 import unicodedata
-from collections.abc import Callable, Mapping  # noqa: TC003 - used in function signatures
-from typing import (
-    TYPE_CHECKING,
-    Annotated,
-    Any,
-    ClassVar,
-    TypeAliasType,
-    cast,
-    get_args,
-    get_origin,
-    get_type_hints,
-)
+from collections.abc import Mapping  # noqa: TC003 - used in function signatures
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import pydantic
-from typing_extensions import is_typeddict
 
-from pivot import exceptions, outputs
+from pivot import outputs
 
 if TYPE_CHECKING:
     from pivot import loaders
 
 logger = logging.getLogger(__name__)
 
-# Key used in out_specs for single-output stages (non-TypedDict Annotated[T, Out(...)] returns)
+# Key used in out_specs for single-output stages (non-TypedDict returns)
 SINGLE_OUTPUT_KEY = "_single"
-
-
-def _get_type_hints_safe(
-    obj: Callable[..., Any] | type,
-    name: str,
-    *,
-    include_extras: bool = False,
-) -> dict[str, Any] | None:
-    """Get type hints from a function or type, returning None on failure.
-
-    Args:
-        obj: Function or type to get hints from
-        name: Name for error messages
-        include_extras: Whether to preserve Annotated metadata
-
-    Returns:
-        Dict of type hints, or None if hints couldn't be resolved
-    """
-    try:
-        return get_type_hints(obj, include_extras=include_extras)
-    except (NameError, AttributeError) as e:
-        logger.warning("Failed to resolve type hints for %s: %s", name, e)
-        return None
-    except Exception as e:
-        logger.debug("Failed to get type hints for %s: %s", name, e)
-        return None
-
-
-def _unwrap_type_alias(t: Any) -> Any:
-    """Unwrap TypeAliasType (Python 3.12+ 'type' keyword aliases) to their value.
-
-    Handles nested aliases like `type Outer = Inner` where `type Inner = Annotated[...]`.
-    Note: Accessing __value__ is the documented approach - get_origin()/get_args()
-    return None/() for TypeAliasType by design.
-    """
-    while isinstance(t, TypeAliasType):
-        t = t.__value__
-    return t
 
 
 class StageParams(pydantic.BaseModel):
     """Base class for stage parameters (Pydantic model).
 
-    Use as a simple base class for parameter-only stages:
+    Use as a simple base class for stage configuration:
 
         class TrainParams(StageParams):
             learning_rate: float = 0.01
             batch_size: int = 32
 
-        def train(
-            config: TrainParams,
-            data: Annotated[DataFrame, Dep("input.csv", CSV())],
-        ) -> TrainOutputs:
+        @pivot.stage
+        def train(config: TrainParams, data: DataFrame) -> DataFrame:
             ...
 
-    For testing, just pass the data directly:
+    For testing, call the function directly:
 
         result = train(TrainParams(learning_rate=0.5), test_df)
     """
@@ -222,63 +172,6 @@ def _collect_directory_out_ops(
         write_ops.append((full_path, item_value, spec.loader))
 
 
-# ==============================================================================
-# Return output spec extraction
-# ==============================================================================
-
-
-def _extract_typeddict_outputs(
-    return_type: type,
-    stage_name: str,
-) -> dict[str, outputs.BaseOut]:
-    """Extract output specs from TypedDict, erroring if any field lacks Out/DirectoryOut/IncrementalOut."""
-    field_hints = _get_type_hints_safe(return_type, str(return_type), include_extras=True)
-    if field_hints is None:
-        raise exceptions.StageDefinitionError(
-            f"Stage '{stage_name}': Failed to resolve type hints for TypedDict '{return_type.__name__}'"
-        )
-
-    specs = dict[str, outputs.BaseOut]()
-    fields_without_out = list[str]()
-
-    for field_name, field_type in field_hints.items():
-        field_type = _unwrap_type_alias(field_type)
-
-        if get_origin(field_type) is not Annotated:
-            fields_without_out.append(field_name)
-            continue
-
-        args = get_args(field_type)
-        if len(args) < 2:
-            fields_without_out.append(field_name)
-            continue
-
-        out_found = False
-        for metadata in args[1:]:
-            # Check for any output spec type (Out, DirectoryOut, IncrementalOut, and subclasses)
-            if isinstance(metadata, (outputs.Out, outputs.DirectoryOut, outputs.IncrementalOut)):
-                specs[field_name] = metadata
-                out_found = True
-                break
-
-        if not out_found:
-            fields_without_out.append(field_name)
-
-    if fields_without_out:
-        raise exceptions.StageDefinitionError(
-            f"Stage '{stage_name}': TypedDict '{return_type.__name__}' has fields without Out annotations: "
-            + f"{', '.join(sorted(fields_without_out))}. All fields must have Out annotations."
-        )
-
-    if not specs:
-        raise exceptions.StageDefinitionError(
-            f"Stage '{stage_name}': TypedDict '{return_type.__name__}' has no fields. "
-            + "Use None return type for stages with no outputs."
-        )
-
-    return specs
-
-
 def save_return_outputs(
     return_value: Mapping[str, Any],
     specs: Mapping[str, outputs.BaseOut],
@@ -352,7 +245,7 @@ def save_return_outputs(
 
 
 # ==============================================================================
-# Annotation-based dependency injection helpers
+# Dependency injection helpers
 # ==============================================================================
 
 
@@ -371,168 +264,6 @@ class FuncDepSpec:
     path: outputs.PathType
     loader: loaders.Reader[Any]
     creates_dep_edge: bool = True
-
-
-@dataclasses.dataclass(frozen=True)
-class StageDefinition:
-    """Complete parsed definition of a stage function's annotations.
-
-    Produced once by extract_stage_definition() and consumed by Pipeline/Registry.
-    Avoids redundant get_type_hints() calls across registration layers.
-    """
-
-    dep_specs: dict[str, FuncDepSpec]
-    out_specs: dict[str, outputs.BaseOut]
-    single_out_spec: outputs.BaseOut | None
-    placeholder_dep_names: frozenset[str]
-    params_arg_name: str | None
-    params_type: type[StageParams] | None
-    hints_resolved: bool
-
-
-def extract_stage_definition(
-    func: Callable[..., Any],
-    stage_name: str,
-    dep_path_overrides: Mapping[str, outputs.PathType] | None = None,
-    *,
-    strict: bool = True,
-) -> StageDefinition:
-    """Extract complete stage definition from function annotations in a single pass.
-
-    Calls get_type_hints() once and derives all dep/output/params specs from the
-    result. This is the single extraction point -- Pipeline and Registry should
-    call this instead of individual extraction functions.
-
-    Args:
-        func: Stage function to extract from.
-        stage_name: Name for error messages.
-        dep_path_overrides: Override paths for PlaceholderDep and Dep annotations.
-        strict: If True (default), raise StageDefinitionError when type hints
-            can't be resolved. If False, return a definition with hints_resolved=False
-            and empty specs.
-
-    Returns:
-        StageDefinition with all parsed annotation data.
-
-    Raises:
-        StageDefinitionError: If strict=True and type hints can't be resolved.
-        ValueError: If PlaceholderDep override is provided but empty.
-    """
-    import inspect as inspect_module
-
-    hints = _get_type_hints_safe(func, func.__name__, include_extras=True)
-    if hints is None:
-        if strict:
-            raise exceptions.StageDefinitionError(
-                f"Stage '{stage_name}': failed to resolve type hints for '{func.__name__}'. "
-                + "Check that all type annotations are importable."
-            )
-        return StageDefinition(
-            dep_specs={},
-            out_specs={},
-            single_out_spec=None,
-            placeholder_dep_names=frozenset(),
-            params_arg_name=None,
-            params_type=None,
-            hints_resolved=False,
-        )
-
-    sig = inspect_module.signature(func)
-
-    # --- Extract deps, placeholders, and params from parameters ---
-    overrides = dep_path_overrides or {}
-    dep_specs = dict[str, FuncDepSpec]()
-    placeholder_dep_names = set[str]()
-    params_arg_name: str | None = None
-    params_type: type[StageParams] | None = None
-
-    for param_name in sig.parameters:
-        if param_name not in hints:
-            continue
-
-        param_type = _unwrap_type_alias(hints[param_name])
-
-        # Check for StageParams: strip Annotated wrapper to get the base type.
-        # Only match the first StageParams parameter.
-        if params_arg_name is None:
-            base_type = (
-                get_args(param_type)[0] if get_origin(param_type) is Annotated else param_type
-            )
-            if isinstance(base_type, type) and issubclass(base_type, StageParams):
-                params_arg_name = param_name
-                params_type = base_type
-
-        # Check for Annotated deps
-        if get_origin(param_type) is not Annotated:
-            continue
-
-        args = get_args(param_type)
-        if len(args) < 2:
-            continue
-
-        for metadata in args[1:]:
-            if isinstance(metadata, outputs.PlaceholderDep):
-                placeholder_dep_names.add(param_name)
-                if param_name not in overrides:
-                    # Skip resolution -- caller checks placeholder_dep_names
-                    break
-                override_path = overrides[param_name]
-                if isinstance(override_path, (list, tuple)):
-                    if not override_path or any(not p for p in override_path):
-                        raise ValueError(
-                            f"PlaceholderDep '{param_name}' override contains empty path"
-                        )
-                elif not override_path:
-                    raise ValueError(f"PlaceholderDep '{param_name}' override cannot be empty")
-                placeholder = cast("outputs.PlaceholderDep[Any]", metadata)
-                dep_specs[param_name] = FuncDepSpec(
-                    path=override_path,
-                    loader=placeholder.loader,
-                )
-                break
-            elif isinstance(metadata, outputs.Dep):
-                dep = cast("outputs.Dep[Any]", metadata)
-                path = overrides.get(param_name, dep.path)
-                dep_specs[param_name] = FuncDepSpec(path=path, loader=dep.loader)
-                break
-            elif isinstance(metadata, outputs.IncrementalOut):
-                inc = cast("outputs.IncrementalOut[Any, Any]", metadata)
-                dep_specs[param_name] = FuncDepSpec(
-                    path=inc.path,
-                    loader=inc.loader,
-                    creates_dep_edge=False,
-                )
-                break
-
-    # --- Extract output specs from return type ---
-    out_specs = dict[str, outputs.BaseOut]()
-    single_out_spec: outputs.BaseOut | None = None
-
-    return_type = hints.get("return")
-    if return_type is not None and return_type is not type(None):
-        return_type = _unwrap_type_alias(return_type)
-
-        if is_typeddict(return_type):
-            out_specs = _extract_typeddict_outputs(return_type, stage_name)
-        elif get_origin(return_type) is Annotated:
-            rt_args = get_args(return_type)
-            if len(rt_args) >= 2:
-                for metadata in rt_args[1:]:
-                    if isinstance(
-                        metadata, (outputs.Out, outputs.IncrementalOut, outputs.DirectoryOut)
-                    ):
-                        single_out_spec = cast("outputs.BaseOut", metadata)
-                        break
-
-    return StageDefinition(
-        dep_specs=dep_specs,
-        out_specs=out_specs,
-        single_out_spec=single_out_spec,
-        placeholder_dep_names=frozenset(placeholder_dep_names),
-        params_arg_name=params_arg_name,
-        params_type=params_type,
-        hints_resolved=True,
-    )
 
 
 def _load_single_dep(
@@ -576,7 +307,7 @@ def load_deps_from_specs(
     For multi-file deps (path is list/tuple), loads each file and returns as list/tuple.
 
     Args:
-        specs: Dep specs from extract_stage_definition()
+    specs: Dep specs from pipeline composition
         project_root: Root directory for relative paths
         path_overrides: Optional dict of dep name -> custom path(s)
 

@@ -81,7 +81,7 @@ class DataArtifactChanged(TypedDict):
 
 
 class CodeOrConfigChanged(TypedDict):
-    """Python files or pivot.yaml/pipeline.py changed."""
+    """Python files or pipeline.py changed."""
 
     type: Literal["code_or_config_changed"]
     paths: list[str]

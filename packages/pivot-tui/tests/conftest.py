@@ -1,3 +1,5 @@
+# pyright: reportMissingImports=false, reportImplicitRelativeImport=false
+
 from __future__ import annotations
 
 import contextlib
@@ -17,10 +19,10 @@ import pytest
 
 from pivot import project
 from pivot.cli import console
+from pivot.compose import Pipeline
 from pivot.config import io as config_io
 from pivot.executor import core as executor_core
-from pivot.pipeline import pipeline as pipeline_mod
-from pivot.registry import StageRegistry
+from pivot.registry import PipelineLike, StageRegistry
 
 # Add tests directory to sys.path so helpers.py can be imported
 _tests_dir = pathlib.Path(__file__).parent
@@ -51,7 +53,7 @@ def sample_data_file(tmp_pipeline_dir: pathlib.Path) -> pathlib.Path:
 
 
 @pytest.fixture
-def test_pipeline(tmp_path: pathlib.Path) -> Generator[pipeline_mod.Pipeline]:
+def test_pipeline(tmp_path: pathlib.Path) -> Generator[PipelineLike]:
     """Provide a fresh Pipeline for tests.
 
     Also sets up the module-level test pipeline in helpers.py so that
@@ -64,7 +66,7 @@ def test_pipeline(tmp_path: pathlib.Path) -> Generator[pipeline_mod.Pipeline]:
     """
     import helpers
 
-    pipeline = pipeline_mod.Pipeline("test", root=tmp_path)
+    pipeline = Pipeline("test", root=tmp_path)
     helpers.set_test_pipeline(pipeline)
     yield pipeline
     helpers.set_test_pipeline(None)
@@ -72,10 +74,10 @@ def test_pipeline(tmp_path: pathlib.Path) -> Generator[pipeline_mod.Pipeline]:
 
 @pytest.fixture
 def mock_discovery(
-    test_pipeline: pipeline_mod.Pipeline,
+    test_pipeline: PipelineLike,
     mocker: MockerFixture,
     monkeypatch: pytest.MonkeyPatch,
-) -> pipeline_mod.Pipeline:
+) -> PipelineLike:
     """Mock discover_pipeline to return the test_pipeline.
 
     Use this fixture for CLI tests that need stages to be discovered
@@ -392,7 +394,7 @@ def output_queue() -> Generator[mp.Queue[OutputMessage]]:
 
 
 @pytest.fixture
-async def test_engine(test_pipeline: pipeline_mod.Pipeline) -> AsyncGenerator[Engine]:
+async def test_engine(test_pipeline: PipelineLike) -> AsyncGenerator[Engine]:
     """Provide a context-managed Engine instance.
 
     The engine is properly closed after each test to ensure sinks are cleaned up.

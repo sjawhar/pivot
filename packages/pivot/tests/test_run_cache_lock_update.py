@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from pivot import executor, loaders, outputs
+from pivot import executor, loaders
 from pivot.storage import cache, lock, state
+from pivot.storage import store as store_mod
+from pivot.types import ArtifactIdentity, ArtifactRef, ArtifactTag
 
 if TYPE_CHECKING:
     import multiprocessing as mp
@@ -21,9 +23,42 @@ def _apply_deferred_writes(
     """Apply deferred writes from stage result (normally done by coordinator)."""
     if "deferred_writes" not in result:
         return
-    output_paths = [str(out.path) for out in stage_info["outs"]]
+    output_paths = [_identity_key(out) for out in stage_info["outs"]]
     with state.StateDB(state_db_path) as db:
         db.apply_deferred_writes(stage_name, output_paths, result["deferred_writes"])
+
+
+def _identity_key(ref: ArtifactRef) -> str:
+    if ref.identity.key is None:
+        return ref.identity.producer
+    return f"{ref.identity.producer}:{ref.identity.key}"
+
+
+def _input_ref(name: str) -> ArtifactRef:
+    return ArtifactRef(
+        identity=ArtifactIdentity(name, None),
+        format=loaders.Text(),
+        python_type=str,
+        tag=ArtifactTag.DATA,
+    )
+
+
+def _output_ref(stage_name: str) -> ArtifactRef:
+    return ArtifactRef(
+        identity=ArtifactIdentity(stage_name, None),
+        format=loaders.Text(),
+        python_type=str,
+        tag=ArtifactTag.DATA,
+    )
+
+
+def _output_path(ref: ArtifactRef, tmp_path: pathlib.Path) -> pathlib.Path:
+    store = store_mod.WorkspaceStore(
+        project_root=tmp_path,
+        pipeline_name="test",
+        input_bindings={},
+    )
+    return store.prepare_output(ref)
 
 
 def _make_stage_info(
@@ -31,18 +66,28 @@ def _make_stage_info(
     tmp_path: pathlib.Path,
     *,
     fingerprint: dict[str, str] | None = None,
-    deps: list[str] | None = None,
-    outs: list[outputs.BaseOut] | None = None,
+    deps: dict[str, ArtifactRef] | None = None,
+    outs: list[ArtifactRef] | None = None,
     run_id: str = "test_run",
 ) -> WorkerStageInfo:
     """Create a WorkerStageInfo with sensible defaults for testing."""
-    expanded_outs = [outputs.require_expanded(out) for out in outs] if outs else []
+    deps = deps or {}
+    outs = outs or []
     return {
         "func": func,
         "fingerprint": fingerprint or {"self:test": "abc123"},
-        "deps": deps or [],
+        "deps": deps,
         "signature": None,
-        "outs": expanded_outs,
+        "outs": outs,
+        "store_spec": {
+            "kind": "workspace",
+            "cache_dir": str(tmp_path / ".pivot" / "cache"),
+            "project_root": str(tmp_path),
+            "pipeline_name": "test",
+            "input_bindings": {
+                ref.identity.producer: ref.identity.producer for ref in deps.values()
+            },
+        },
         "params": None,
         "variant": None,
         "overrides": {},
@@ -54,11 +99,10 @@ def _make_stage_info(
         "run_id": run_id,
         "force": False,
         "no_commit": False,
-        "dep_specs": {},
-        "out_specs": dict[str, outputs.BaseOut](),
         "params_arg_name": None,
         "project_root": tmp_path,
         "state_dir": tmp_path / ".pivot",
+        "collection_params": {},
     }
 
 
@@ -83,23 +127,24 @@ def test_run_cache_skip_updates_lock_file(
     input_file = tmp_path / "input.txt"
     input_file.write_text("state_A")
 
-    def stage_func() -> None:
+    def stage_func(_0: str) -> str:
         content = (tmp_path / "input.txt").read_text()
-        (tmp_path / "output.txt").write_text(f"processed: {content}")
+        output = f"processed: {content}"
+        (tmp_path / "output.txt").write_text(output)
+        return output
 
-    out = outputs.Out(str(tmp_path / "output.txt"), loader=loaders.PathOnly())
     stage_info = _make_stage_info(
         stage_func,
         tmp_path,
         fingerprint={"self:stage_func": "fp123"},
-        deps=["input.txt"],
-        outs=[out],
+        deps={"_0": _input_ref("input.txt")},
+        outs=[_output_ref("test_stage")],
         run_id="run_1",
     )
 
     state_db_path = tmp_path / ".pivot" / "state.db"
 
-    # Step 1: First run - creates lock file with state A
+    # Step 1: First run - creates lock file with state A, output gen -> 1
     result1 = executor.execute_stage("test_stage", stage_info, worker_env, output_queue)
     assert result1["status"] == "ran"
     assert (tmp_path / "output.txt").read_text() == "processed: state_A"
@@ -119,8 +164,8 @@ def test_run_cache_skip_updates_lock_file(
         stage_func,
         tmp_path,
         fingerprint={"self:stage_func": "fp123"},
-        deps=["input.txt"],
-        outs=[out],
+        deps={"_0": _input_ref("input.txt")},
+        outs=[_output_ref("test_stage")],
         run_id="run_2",
     )
     result2 = executor.execute_stage("test_stage", stage_info_run2, worker_env, output_queue)
@@ -142,8 +187,8 @@ def test_run_cache_skip_updates_lock_file(
         stage_func,
         tmp_path,
         fingerprint={"self:stage_func": "fp123"},
-        deps=["input.txt"],
-        outs=[out],
+        deps={"_0": _input_ref("input.txt")},
+        outs=[_output_ref("test_stage")],
         run_id="run_3",
     )
     result3 = executor.execute_stage("test_stage", stage_info_run3, worker_env, output_queue)
@@ -173,17 +218,18 @@ def test_explain_shows_cached_after_run_cache_skip(
     input_file = tmp_path / "input.txt"
     input_file.write_text("state_A")
 
-    def stage_func() -> None:
+    def stage_func(_0: str) -> str:
         content = (tmp_path / "input.txt").read_text()
-        (tmp_path / "output.txt").write_text(f"processed: {content}")
+        output = f"processed: {content}"
+        (tmp_path / "output.txt").write_text(output)
+        return output
 
-    out = outputs.Out(str(tmp_path / "output.txt"), loader=loaders.PathOnly())
     stage_info = _make_stage_info(
         stage_func,
         tmp_path,
         fingerprint={"self:stage_func": "fp123"},
-        deps=["input.txt"],
-        outs=[out],
+        deps={"_0": _input_ref("input.txt")},
+        outs=[_output_ref("test_stage")],
         run_id="run_1",
     )
 
@@ -202,8 +248,8 @@ def test_explain_shows_cached_after_run_cache_skip(
         stage_func,
         tmp_path,
         fingerprint={"self:stage_func": "fp123"},
-        deps=["input.txt"],
-        outs=[out],
+        deps={"_0": _input_ref("input.txt")},
+        outs=[_output_ref("test_stage")],
         run_id="run_2",
     )
     result2 = executor.execute_stage("test_stage", stage_info_run2, worker_env, output_queue)
@@ -218,8 +264,8 @@ def test_explain_shows_cached_after_run_cache_skip(
         stage_func,
         tmp_path,
         fingerprint={"self:stage_func": "fp123"},
-        deps=["input.txt"],
-        outs=[out],
+        deps={"_0": _input_ref("input.txt")},
+        outs=[_output_ref("test_stage")],
         run_id="run_3",
     )
     result3 = executor.execute_stage("test_stage", stage_info_run3, worker_env, output_queue)
@@ -230,8 +276,8 @@ def test_explain_shows_cached_after_run_cache_skip(
     explanation = explain.get_stage_explanation(
         stage_name="test_stage",
         fingerprint=stage_info["fingerprint"],
-        deps=stage_info["deps"],
-        outs_paths=[str(out.path)],
+        deps=["input.txt"],
+        outs_paths=[_identity_key(_output_ref("test_stage"))],
         params_instance=None,
         overrides=None,
         state_dir=tmp_path / ".pivot",
@@ -251,16 +297,17 @@ def test_regular_execution_still_works(
     input_file = tmp_path / "input.txt"
     input_file.write_text("test data")
 
-    def stage_func() -> None:
-        (tmp_path / "output.txt").write_text("result")
+    def stage_func(_0: str) -> str:
+        result = "result"
+        (tmp_path / "output.txt").write_text(result)
+        return result
 
-    out = outputs.Out(str(tmp_path / "output.txt"), loader=loaders.PathOnly())
     stage_info = _make_stage_info(
         stage_func,
         tmp_path,
         fingerprint={"self:stage_func": "fp123"},
-        deps=["input.txt"],
-        outs=[out],
+        deps={"_0": _input_ref("input.txt")},
+        outs=[_output_ref("test_stage")],
     )
 
     # First run - should execute and create lock file
@@ -298,29 +345,30 @@ def test_run_cache_skip_does_not_increment_output_generations(
     input_file = tmp_path / "input.txt"
     input_file.write_text("state_A")
 
-    def stage_func() -> None:
+    def stage_func(_0: str) -> str:
         content = (tmp_path / "input.txt").read_text()
-        (tmp_path / "output.txt").write_text(f"processed: {content}")
+        output = f"processed: {content}"
+        (tmp_path / "output.txt").write_text(output)
+        return output
 
-    out = outputs.Out(str(tmp_path / "output.txt"), loader=loaders.PathOnly())
     stage_info = _make_stage_info(
         stage_func,
         tmp_path,
         fingerprint={"self:stage_func": "fp123"},
-        deps=["input.txt"],
-        outs=[out],
+        deps={"_0": _input_ref("input.txt")},
+        outs=[_output_ref("test_stage")],
         run_id="run_1",
     )
 
     state_db_path = tmp_path / ".pivot" / "state.db"
 
-    # Step 1: First run - creates lock file with state A, output gen -> 1
+    # Step 1: First run - creates lock file with state A
     result1 = executor.execute_stage("test_stage", stage_info, worker_env, output_queue)
     assert result1["status"] == "ran"
     _apply_deferred_writes("test_stage", stage_info, result1, state_db_path)
 
     with state.StateDB(state_db_path) as db:
-        gen_after_run1 = db.get_generation(tmp_path / "output.txt")
+        gen_after_run1 = db.get_generation(_identity_key(_output_ref("test_stage")))
     assert gen_after_run1 == 1, f"Expected generation 1 after first run, got {gen_after_run1}"
 
     # Step 2: Modify input to state B
@@ -331,8 +379,8 @@ def test_run_cache_skip_does_not_increment_output_generations(
         stage_func,
         tmp_path,
         fingerprint={"self:stage_func": "fp123"},
-        deps=["input.txt"],
-        outs=[out],
+        deps={"_0": _input_ref("input.txt")},
+        outs=[_output_ref("test_stage")],
         run_id="run_2",
     )
     result2 = executor.execute_stage("test_stage", stage_info_run2, worker_env, output_queue)
@@ -340,7 +388,7 @@ def test_run_cache_skip_does_not_increment_output_generations(
     _apply_deferred_writes("test_stage", stage_info_run2, result2, state_db_path)
 
     with state.StateDB(state_db_path) as db:
-        gen_after_run2 = db.get_generation(tmp_path / "output.txt")
+        gen_after_run2 = db.get_generation(_identity_key(_output_ref("test_stage")))
     assert gen_after_run2 == 2, f"Expected generation 2 after second run, got {gen_after_run2}"
 
     # Step 4: Revert input to state A
@@ -351,8 +399,8 @@ def test_run_cache_skip_does_not_increment_output_generations(
         stage_func,
         tmp_path,
         fingerprint={"self:stage_func": "fp123"},
-        deps=["input.txt"],
-        outs=[out],
+        deps={"_0": _input_ref("input.txt")},
+        outs=[_output_ref("test_stage")],
         run_id="run_3",
     )
     result3 = executor.execute_stage("test_stage", stage_info_run3, worker_env, output_queue)
@@ -364,7 +412,7 @@ def test_run_cache_skip_does_not_increment_output_generations(
 
     # CRITICAL: Output generation should NOT have been incremented
     with state.StateDB(state_db_path) as db:
-        gen_after_skip = db.get_generation(tmp_path / "output.txt")
+        gen_after_skip = db.get_generation(_identity_key(_output_ref("test_stage")))
     assert gen_after_skip == 2, (
         f"Output generation should remain at 2 after run cache skip, got {gen_after_skip}. "
         "Run cache skip should not increment output generations since outputs are restored, not rewritten."

@@ -97,7 +97,7 @@ def compute_input_hash(
     data = {
         "code_manifest": code_manifest,
         "params": params,
-        "deps": sorted([(d["path"], d["hash"]) for d in deps]),
+        "deps": sorted([(d["producer"], d["key"], d["hash"]) for d in deps]),
         "out_specs": sorted(out_specs),
     }
     content = json.dumps(data, sort_keys=True, separators=(",", ":"))

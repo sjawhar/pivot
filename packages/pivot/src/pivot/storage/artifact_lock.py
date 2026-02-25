@@ -1,3 +1,4 @@
+# pyright: reportImplicitRelativeImport=false
 """Artifact lock request modeling for concurrent execution."""
 
 from __future__ import annotations
@@ -6,12 +7,14 @@ import enum
 import fcntl
 import hashlib
 import os
-import pathlib
 import time
 from collections.abc import Callable
-from typing import TypedDict, final
+from typing import TYPE_CHECKING, TypedDict, final
 
-from pivot import outputs, path_utils
+import pivot.types as types
+
+if TYPE_CHECKING:
+    import pathlib
 
 
 class LockMode(enum.IntEnum):
@@ -32,52 +35,29 @@ class LockRequest(TypedDict):
 
 
 def expand_lock_requests(
-    deps: list[str],
-    outs: list[outputs.ExpandedOut],
+    deps: dict[str, types.ArtifactRef],
+    outs: list[types.ArtifactRef],
     project_root: pathlib.Path,
 ) -> list[LockRequest]:
-    """Expand deps/outs into lock requests with ancestor directory reads."""
+    """Expand deps/outs into lock requests."""
+    _ = project_root
     key_to_mode = dict[str, LockMode]()
 
-    for dep in deps:
-        key = path_utils.canonicalize_artifact_path(dep, project_root)
-        key = key.rstrip("/")
-        if not key:
-            key = "/"
+    for dep_ref in deps.values():
+        key = _lock_key(dep_ref)
         if key in key_to_mode and key_to_mode[key] is LockMode.WRITE:
             continue
         key_to_mode[key] = LockMode.READ
 
-    for out in outs:
-        key = path_utils.canonicalize_artifact_path(out.path, project_root)
-        key = key.rstrip("/")
-        if not key:
-            key = "/"
+    for out_ref in outs:
+        key = _lock_key(out_ref)
         key_to_mode[key] = LockMode.WRITE
-
-    keys = list(key_to_mode)
-    for key in keys:
-        base = key.rstrip("/")
-        path = pathlib.Path(base)
-        for parent in path.parents:
-            if project_root in parent.parents:
-                _add_read_lock(key_to_mode, parent)
-                continue
-            if parent == project_root:
-                _add_read_lock(key_to_mode, parent)
-                break
-            break
 
     return [LockRequest(key=key, mode=key_to_mode[key]) for key in sorted(key_to_mode)]
 
 
-def _add_read_lock(key_to_mode: dict[str, LockMode], path: pathlib.Path) -> None:
-    key = path.as_posix()
-    if not key.endswith("/"):
-        key += "/"
-    if key in key_to_mode and key_to_mode[key] is LockMode.WRITE:
-        return
-    key_to_mode[key] = LockMode.READ
+def _lock_key(ref: types.ArtifactRef) -> str:
+    return types.identity_key(ref.identity)
 
 
 # ---------------------------------------------------------------------------

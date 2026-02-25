@@ -1,3 +1,4 @@
+# pyright: reportImplicitRelativeImport=false
 """Per-stage lock files for tracking pipeline state.
 
 StageLock provides persistent lock files (.lock) for change detection,
@@ -16,9 +17,10 @@ from typing import TYPE_CHECKING, Any, TypeGuard, cast
 
 import yaml
 
-from pivot import path_utils, project, yaml_config
+from pivot import yaml_config
 from pivot.storage import cache
 from pivot.types import (
+    ArtifactIdentity,
     DepEntry,
     DirHash,
     FileHash,
@@ -26,6 +28,7 @@ from pivot.types import (
     LockData,
     OutEntry,
     StorageLockData,
+    identity_from_key,
     is_dir_hash,
 )
 
@@ -85,74 +88,120 @@ def is_lock_data(data: object) -> TypeGuard[StorageLockData]:
             typed_entry = cast("dict[str, object]", raw_entry)
             if not typed_entry.get("hash"):
                 return False
+            if list_key == "deps" and ("producer" not in typed_entry or "key" not in typed_entry):
+                return False
+            if list_key == "outs" and ("key" not in typed_entry or "tag" not in typed_entry):
+                return False
     return True
 
 
+def _get_output_tag(hash_info: HashInfo) -> str:
+    raw: dict[str, object] = cast("dict[str, object]", cast("object", hash_info))
+    value = raw.get("tag")
+    if isinstance(value, str):
+        return value
+    return "data"
+
+
 def _convert_to_storage_format(data: LockData) -> StorageLockData:
-    """Convert internal LockData to storage format (list-based, relative paths, sorted)."""
-    proj_root = project.get_project_root()
+    """Convert internal LockData to storage format (list-based, identity keys, sorted)."""
+    normalized_deps = _ensure_identity_keys(data["dep_hashes"])
+    normalized_outs = _ensure_identity_keys(data["output_hashes"])
 
     deps_list = list[DepEntry]()
-    for abs_path, hash_info in data["dep_hashes"].items():
-        rel_path = project.to_relative_path(abs_path, proj_root)
-        entry = DepEntry(path=rel_path, hash=hash_info["hash"])
+    for identity, hash_info in normalized_deps.items():
+        entry = DepEntry(producer=identity.producer, key=identity.key, hash=hash_info["hash"])
         if is_dir_hash(hash_info):
             entry["manifest"] = hash_info["manifest"]
+        raw_info = dict(hash_info)  # shallow copy to check extra keys
+        if "accessed_keys" in raw_info:
+            entry["accessed_keys"] = cast("list[str]", raw_info["accessed_keys"])
+        if "accessed_hashes" in raw_info:
+            entry["accessed_hashes"] = cast("dict[str, str]", raw_info["accessed_hashes"])
         deps_list.append(entry)
-    deps_list.sort(key=lambda e: e["path"])
+    deps_list.sort(key=lambda e: (e["producer"], e["key"] or ""))
 
     outs_list = list[OutEntry]()
-    for abs_path, hash_info in data["output_hashes"].items():
-        rel_path = project.to_relative_path(abs_path, proj_root)
-        rel_path = path_utils.preserve_trailing_slash(abs_path, rel_path)
-        entry = OutEntry(path=rel_path, hash=hash_info["hash"])
+    for identity, hash_info in normalized_outs.items():
+        entry = OutEntry(key=identity.key, hash=hash_info["hash"], tag=_get_output_tag(hash_info))
         if is_dir_hash(hash_info):
             entry["manifest"] = hash_info["manifest"]
         outs_list.append(entry)
-    outs_list.sort(key=lambda e: e["path"])
+    outs_list.sort(key=lambda e: e["key"] or "")
 
-    # Sort code_manifest keys for deterministic output across interpreter sessions
     sorted_code_manifest = dict(sorted(data["code_manifest"].items()))
 
-    return StorageLockData(
-        schema_version=1,
+    storage = StorageLockData(
+        schema_version=2,
         code_manifest=sorted_code_manifest,
         params=data["params"],
         deps=deps_list,
         outs=outs_list,
     )
+    if "merkle_id" in data:
+        mid = data["merkle_id"]
+        if mid is not None:
+            storage["merkle_id"] = mid
+    return storage
 
 
-def _convert_from_storage_format(data: StorageLockData) -> LockData:
-    """Convert storage format (list-based, relative paths) to internal LockData."""
-    proj_root = project.get_project_root()
-
-    dep_hashes = dict[str, HashInfo]()
+def _convert_from_storage_format(data: StorageLockData, *, stage_name: str) -> LockData:
+    """Convert storage format (list-based) to internal LockData (identity-keyed)."""
+    dep_hashes = dict[ArtifactIdentity, HashInfo]()
     for entry in data["deps"]:
-        abs_path = str(project.to_absolute_path(entry["path"], proj_root))
+        identity = ArtifactIdentity(entry["producer"], entry["key"])
         if "manifest" in entry:
-            dep_hashes[abs_path] = DirHash(hash=entry["hash"], manifest=entry["manifest"])
+            hash_info: HashInfo = DirHash(hash=entry["hash"], manifest=entry["manifest"])
         else:
-            dep_hashes[abs_path] = FileHash(hash=entry["hash"])
+            hash_info = FileHash(hash=entry["hash"])
+        if "accessed_keys" in entry or "accessed_hashes" in entry:
+            raw = dict[str, object](hash=hash_info["hash"])  # type: ignore[call-overload] - building mutable copy
+            if is_dir_hash(hash_info):
+                raw["manifest"] = hash_info["manifest"]
+            if "accessed_keys" in entry:
+                raw["accessed_keys"] = entry["accessed_keys"]
+            if "accessed_hashes" in entry:
+                raw["accessed_hashes"] = entry["accessed_hashes"]
+            dep_hashes[identity] = cast("HashInfo", cast("object", raw))
+        else:
+            dep_hashes[identity] = hash_info
 
-    output_hashes = dict[str, HashInfo]()
+    output_hashes = dict[ArtifactIdentity, HashInfo]()
     for entry in data["outs"]:
-        rel_path = entry["path"]
-        abs_path = str(project.to_absolute_path(rel_path, proj_root))
-        abs_path = path_utils.preserve_trailing_slash(rel_path, abs_path)
+        identity = ArtifactIdentity(stage_name, entry["key"])
         if "manifest" in entry:
-            output_hashes[abs_path] = DirHash(hash=entry["hash"], manifest=entry["manifest"])
+            output_hashes[identity] = DirHash(hash=entry["hash"], manifest=entry["manifest"])
         else:
-            output_hashes[abs_path] = FileHash(hash=entry["hash"])
+            output_hashes[identity] = FileHash(hash=entry["hash"])
 
-    result = LockData(
+    return LockData(
         code_manifest=data["code_manifest"],
         params=data["params"],
         dep_hashes=dep_hashes,
         output_hashes=output_hashes,
+        merkle_id=data.get("merkle_id"),
     )
 
-    return result
+
+def _ensure_identity_keys(
+    hashes: dict[ArtifactIdentity, HashInfo] | dict[str, HashInfo],
+) -> dict[ArtifactIdentity, HashInfo]:
+    if not hashes:
+        return {}
+    first_key = next(iter(hashes))
+    if isinstance(first_key, ArtifactIdentity):
+        return cast("dict[ArtifactIdentity, HashInfo]", hashes)
+    return {identity_from_key(k): v for k, v in cast("dict[str, HashInfo]", hashes).items()}
+
+
+def _ensure_identity_list(
+    paths: list[ArtifactIdentity] | list[str],
+) -> list[ArtifactIdentity]:
+    if not paths:
+        return []
+    if isinstance(paths[0], ArtifactIdentity):
+        return cast("list[ArtifactIdentity]", paths)
+    return [identity_from_key(p) for p in cast("list[str]", paths)]
 
 
 class StageLock:
@@ -190,7 +239,7 @@ class StageLock:
                         _REQUIRED_LOCK_KEYS,
                     )
                 return None  # Treat corrupted/invalid file as missing
-            return _convert_from_storage_format(data)
+            return _convert_from_storage_format(data, stage_name=self.stage_name)
         except FileNotFoundError:
             return None  # Normal case - lock doesn't exist yet
         except (UnicodeDecodeError, yaml.YAMLError) as e:
@@ -211,10 +260,9 @@ class StageLock:
         self,
         current_fingerprint: dict[str, str],
         current_params: dict[str, Any],
-        dep_hashes: dict[str, HashInfo],
-        out_paths: list[str] | None = None,
+        dep_hashes: dict[ArtifactIdentity, HashInfo] | dict[str, HashInfo],
+        out_paths: list[ArtifactIdentity] | list[str] | None = None,
     ) -> tuple[bool, str]:
-        """Check if stage needs re-run (reads lock file)."""
         lock_data = self.read()
         return self.is_changed_with_lock_data(
             lock_data, current_fingerprint, current_params, dep_hashes, out_paths
@@ -225,10 +273,9 @@ class StageLock:
         lock_data: LockData | None,
         current_fingerprint: dict[str, str],
         current_params: dict[str, Any],
-        dep_hashes: dict[str, HashInfo],
-        out_paths: list[str] | None = None,
+        dep_hashes: dict[ArtifactIdentity, HashInfo] | dict[str, HashInfo],
+        out_paths: list[ArtifactIdentity] | list[str] | None = None,
     ) -> tuple[bool, str]:
-        """Check if stage needs re-run (pure comparison, no I/O)."""
         if lock_data is None:
             return True, "No previous run"
 
@@ -236,11 +283,43 @@ class StageLock:
             return True, "Code changed"
         if lock_data["params"] != current_params:
             return True, "Params changed"
-        if lock_data["dep_hashes"] != dep_hashes:
+        normalized_deps = _ensure_identity_keys(dep_hashes)
+        if lock_data["dep_hashes"] != normalized_deps:
             return True, "Input dependencies changed"
         if out_paths is not None:
             locked_out_paths = sorted(lock_data["output_hashes"].keys())
-            if sorted(out_paths) != locked_out_paths:
+            normalized_outs = _ensure_identity_list(out_paths)
+            if sorted(normalized_outs) != locked_out_paths:
                 return True, "Output paths changed"
 
         return False, ""
+
+
+def find_orphaned_locks(
+    stages_dir: Path,
+    registered_stages: set[str],
+) -> list[str]:
+    """Find lock files in stages_dir that don't correspond to any registered stage.
+
+    When a pipeline is restructured (stages renamed/removed), old lock files
+    persist and old output files remain on disk. Detecting orphaned locks helps
+    users identify stale artifacts from previous pipeline configurations.
+
+    Returns:
+        Sorted list of stage names that have lock files but aren't registered.
+    """
+    if not stages_dir.is_dir():
+        return []
+
+    orphaned = list[str]()
+    suffix = ".lock"
+
+    for lock_file in stages_dir.rglob(f"*{suffix}"):
+        # Derive stage name from relative path (e.g., "base/stage_name.lock" -> "base/stage_name")
+        rel = lock_file.relative_to(stages_dir)
+        stage_name = str(rel)[: -len(suffix)]
+        if stage_name not in registered_stages:
+            orphaned.append(stage_name)
+
+    orphaned.sort()
+    return orphaned

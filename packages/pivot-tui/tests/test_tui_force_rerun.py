@@ -36,19 +36,23 @@ def serve_pipeline(tmp_path: pathlib.Path) -> Generator[pathlib.Path]:
     # Use pipeline.py with a simple stage (no outputs)
     pipeline_code = """\
 import pathlib
-from pivot.pipeline.pipeline import Pipeline
+from pivot.compose import Pipeline as ComposePipeline, stage
 
-pipeline = Pipeline("test", root=pathlib.Path(__file__).parent)
+_cp = ComposePipeline("test", root=pathlib.Path(__file__).parent)
 
+@stage
 def my_stage() -> None:
     print("my_stage executed")
 
-pipeline.register(my_stage, name="my_stage")
-
+@stage
 def other_stage() -> None:
     print("other_stage executed")
 
-pipeline.register(other_stage, name="other_stage")
+with _cp:
+    my_stage()
+    other_stage()
+
+pipeline = _cp
 """
     (tmp_path / "pipeline.py").write_text(pipeline_code)
 
@@ -104,7 +108,7 @@ def test_force_rerun_single_stage_accepted(serve_pipeline: pathlib.Path) -> None
     Verifies that the RPC "run" method with force=True and a specific stage
     returns "accepted", indicating the command was received and queued.
     """
-    response = send_rpc(serve_pipeline, "run", {"stages": ["my_stage"], "force": True})
+    response = send_rpc(serve_pipeline, "run", {"stages": ["test/my_stage"], "force": True})
     assert "result" in response, f"Expected result, got: {response}"
     assert response["result"] == "accepted", f"Expected 'accepted', got: {response['result']}"
 
@@ -126,7 +130,7 @@ def test_force_rerun_multiple_stages_accepted(serve_pipeline: pathlib.Path) -> N
     Verifies that multiple stage names can be passed in the stages list.
     """
     response = send_rpc(
-        serve_pipeline, "run", {"stages": ["my_stage", "other_stage"], "force": True}
+        serve_pipeline, "run", {"stages": ["test/my_stage", "test/other_stage"], "force": True}
     )
     assert "result" in response, f"Expected result, got: {response}"
     assert response["result"] == "accepted"
@@ -137,7 +141,7 @@ def test_force_rerun_without_force_flag(serve_pipeline: pathlib.Path) -> None:
 
     Verifies that the run command works with force=False as well.
     """
-    response = send_rpc(serve_pipeline, "run", {"stages": ["my_stage"], "force": False})
+    response = send_rpc(serve_pipeline, "run", {"stages": ["test/my_stage"], "force": False})
     assert "result" in response, f"Expected result, got: {response}"
     assert response["result"] == "accepted"
 
@@ -167,7 +171,7 @@ def test_force_rerun_triggers_events(serve_pipeline: pathlib.Path) -> None:
     initial_version = initial_result["version"]
 
     # Send force re-run command
-    run_response = send_rpc(serve_pipeline, "run", {"stages": ["my_stage"], "force": True})
+    run_response = send_rpc(serve_pipeline, "run", {"stages": ["test/my_stage"], "force": True})
     assert run_response.get("result") == "accepted"
 
     # Wait a bit for the engine to process

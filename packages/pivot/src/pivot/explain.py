@@ -11,12 +11,15 @@ from typing import TYPE_CHECKING
 
 import pydantic
 
-from pivot import parameters, project, skip
+from pivot import parameters, project, skip, types
 from pivot.executor import worker
 from pivot.storage import lock, state
+from pivot.storage import store as store_mod
 from pivot.types import (
+    ArtifactIdentity,
     HashInfo,
     StageExplanation,
+    identity_from_key,
 )
 
 if TYPE_CHECKING:
@@ -26,10 +29,9 @@ if TYPE_CHECKING:
 
     from pivot.storage.track import PvtData
 
-# Re-exports for backward compatibility (tests reference these)
-diff_code_manifests = skip.diff_code_manifests
-diff_params = skip.diff_params
-diff_dep_hashes = skip.diff_dep_hashes
+
+def _to_identity_keyed(str_hashes: dict[str, HashInfo]) -> dict[ArtifactIdentity, HashInfo]:
+    return {identity_from_key(k): v for k, v in str_hashes.items()}
 
 
 def _find_tracked_ancestor(dep: Path, tracked_trie: pygtrie.Trie[str]) -> Path | None:
@@ -94,6 +96,9 @@ def get_stage_explanation(
     allow_missing: bool = False,
     tracked_files: dict[str, PvtData] | None = None,
     tracked_trie: pygtrie.Trie[str] | None = None,
+    deps_refs: dict[str, types.ArtifactRef] | None = None,
+    store: store_mod.Store | None = None,
+    outs_refs: list[types.ArtifactRef] | None = None,
 ) -> StageExplanation:
     """Compute detailed explanation of why a stage would run.
 
@@ -134,7 +139,6 @@ def get_stage_explanation(
         )
 
     # Check generation tracking first (O(1) skip detection)
-    # Use verify_files=False since status predicts run behavior after restoration
     state_db_path = state_dir / "state.db"
     if state_db_path.exists():
         with state.StateDB(state_db_path, readonly=True) as state_db:
@@ -148,81 +152,83 @@ def get_stage_explanation(
                 state_db=state_db,
                 verify_files=False,
             ):
-                return StageExplanation(
-                    stage_name=stage_name,
-                    will_run=False,
-                    is_forced=False,
-                    reason="",
-                    code_changes=[],
-                    param_changes=[],
-                    dep_changes=[],
-                    upstream_stale=[],
-                )
+                # Also verify output files exist on disk (matches engine behavior)
+                outputs_exist = True
+                if outs_refs is not None and isinstance(store, store_mod.WorkspaceStore):
+                    for out_ref in outs_refs:
+                        out_path = store.resolve_display_path(out_ref)
+                        if not out_path.exists():
+                            outputs_exist = False
+                            break
+                if outputs_exist:
+                    return StageExplanation(
+                        stage_name=stage_name,
+                        will_run=False,
+                        is_forced=False,
+                        reason="",
+                        code_changes=[],
+                        param_changes=[],
+                        dep_changes=[],
+                        upstream_stale=[],
+                    )
 
-    # Hash dependencies - with optional fallback for missing files
     if allow_missing:
-        deps_to_hash = list[str]()
-        fallback_hashes = dict[str, HashInfo]()
+        fallback_hashes = dict[ArtifactIdentity, HashInfo]()
         missing_deps = list[str]()
 
         for dep in deps:
-            dep_path = pathlib.Path(dep)
-            if dep_path.exists():
-                deps_to_hash.append(dep)
+            dep_id = identity_from_key(dep)
+            hash_info = lock_data["dep_hashes"].get(dep_id)
+            if hash_info:
+                fallback_hashes[dep_id] = hash_info
             else:
-                # Try .pvt file first
-                hash_info = None
-                if tracked_files is not None and tracked_trie is not None:
-                    hash_info = _find_tracked_hash(dep_path, tracked_files, tracked_trie)
-                # Fall back to lock file hash (for remote verification)
-                normalized = str(project.normalize_path(dep))
-                if hash_info is None:
-                    hash_info = lock_data["dep_hashes"].get(normalized)
-                if hash_info:
-                    fallback_hashes[normalized] = hash_info
-                else:
-                    missing_deps.append(dep)
+                missing_deps.append(dep)
 
-        file_hashes, more_missing, unreadable_deps, _ = worker.hash_dependencies(deps_to_hash)
-        dep_hashes = {**file_hashes, **fallback_hashes}
-        missing_deps.extend(more_missing)
+        dep_hashes = fallback_hashes
+        unreadable_deps = list[str]()
     else:
-        dep_hashes, missing_deps, unreadable_deps, _ = worker.hash_dependencies(deps)
+        if deps_refs is not None and store is not None:
+            str_hashes, missing_deps, unreadable_deps, _ = worker.hash_dependencies(
+                deps_refs, store
+            )
+        else:
+            str_hashes, missing_deps, unreadable_deps, _ = worker.hash_dependencies(deps)
+        dep_hashes = _to_identity_keyed(str_hashes)
 
-    if missing_deps:
-        # Convert to relative paths for user-facing message
-        rel_missing = [project.to_relative_path(p) for p in missing_deps]
+    if missing_deps or unreadable_deps:
+        # fingerprint is pre-computed by the caller; diffing two dicts is cheap
+        code_changes = skip.diff_code_manifests(lock_data["code_manifest"], fingerprint)
+        param_changes = skip.diff_params(lock_data["params"], current_params)
+        reasons = list[str]()
+        if code_changes:
+            reasons.append("Code changed")
+        if param_changes:
+            reasons.append("Params changed")
+        if missing_deps:
+            rel_missing = [project.to_relative_path(p) for p in missing_deps]
+            reasons.append(f"Missing deps: {', '.join(rel_missing)}")
+        if unreadable_deps:
+            rel_unreadable = [project.to_relative_path(p) for p in unreadable_deps]
+            reasons.append(f"Unreadable deps: {', '.join(rel_unreadable)}")
         return StageExplanation(
             stage_name=stage_name,
             will_run=True,
             is_forced=force,
-            reason=f"Missing deps: {', '.join(rel_missing)}",
-            code_changes=[],
-            param_changes=[],
+            reason="; ".join(reasons),
+            code_changes=code_changes,
+            param_changes=param_changes,
             dep_changes=[],
             upstream_stale=[],
         )
 
-    if unreadable_deps:
-        # Convert to relative paths for user-facing message
-        rel_unreadable = [project.to_relative_path(p) for p in unreadable_deps]
-        return StageExplanation(
-            stage_name=stage_name,
-            will_run=True,
-            is_forced=force,
-            reason=f"Unreadable deps: {', '.join(rel_unreadable)}",
-            code_changes=[],
-            param_changes=[],
-            dep_changes=[],
-            upstream_stale=[],
-        )
+    out_identities = [identity_from_key(p) for p in outs_paths]
 
     decision = skip.check_stage(
         lock_data=lock_data,
         fingerprint=fingerprint,
         params=current_params,
         dep_hashes=dep_hashes,
-        out_paths=outs_paths,
+        out_paths=out_identities,
         explain=True,
         force=force,
     )

@@ -1,3 +1,4 @@
+# pyright: reportImplicitRelativeImport=false, reportMissingImports=false, reportMissingModuleSource=false
 """DAG-aware pipeline execution with full dependency resolution.
 
 The `pivot repro` command runs stages with their dependencies, supporting
@@ -21,7 +22,7 @@ from typing import TYPE_CHECKING
 import anyio
 import click
 
-from pivot import config
+from pivot import config, project, registry
 from pivot.cli import _run_common, completion
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
@@ -77,6 +78,23 @@ def _configure_watch_sources(
         )
 
 
+def _watch_paths_from_registry(
+    all_stages: dict[str, registry.RegistryStageInfo],
+) -> list[pathlib.Path]:
+    paths = set[pathlib.Path]()
+    for info in all_stages.values():
+        for out in info["outs"]:
+            identity = out.identity
+            path_value = identity.key if identity.key is not None else identity.producer
+            if path_value:
+                resolved = project.normalize_path(path_value)
+                # Only watch paths that exist on disk — identity-based artifacts
+                # (inter-stage deps) don't have filesystem paths to watch.
+                if resolved.exists():
+                    paths.add(resolved)
+    return sorted(paths)
+
+
 def _configure_oneshot_source(
     eng: engine.Engine,
     stages: list[str] | None,
@@ -111,28 +129,28 @@ def _get_explanations(
 
     Shared by --explain and --dry-run modes.
     """
-    from pivot import project
     from pivot import status as status_mod
     from pivot.engine import graph as engine_graph
-    from pivot.storage import track
-
-    # Resolve cross-pipeline dependencies before getting stages
-    cli_helpers.resolve_external_dependencies()
 
     all_stages = cli_helpers.get_all_stages()
 
     # Build graph with validation when allow_missing is False
-    # When allow_missing=True, tracked files are used for validation
-    tracked_files = track.discover_pvt_files(project.get_project_root()) if allow_missing else None
-    graph = engine_graph.build_graph(
-        all_stages, validate=not allow_missing, tracked_files=tracked_files
-    )
+    graph = engine_graph.build_graph(all_stages)
+    if not allow_missing:
+        ws = cli_helpers.get_workspace_store()
+        dep_errors = engine_graph.validate_dependency_sources(all_stages, store=ws)
+        if dep_errors:
+            from pivot import exceptions
+
+            if len(dep_errors) == 1:
+                raise dep_errors[0]
+            raise exceptions.MultipleDependencyError(dep_errors)
 
     return status_mod.get_pipeline_explanations(
         stages_list,
         single_stage=False,
         all_stages=all_stages,
-        stage_registry=cli_helpers.get_registry(),
+        pipeline=cli_helpers.get_pipeline(),
         force=force,
         allow_missing=allow_missing,
         graph=graph,
@@ -222,7 +240,7 @@ def _run_pipeline(
         )
 
     # Build DAG and get execution order for TUI display and worker pre-warming
-    graph = cli_helpers.build_dag(validate=True)
+    graph = cli_helpers.build_dag()
     execution_order = engine_graph.get_execution_order(graph, stages_list, single_stage=False)
 
     if not execution_order and not watch:
@@ -342,8 +360,8 @@ def _run_watch_mode(  # noqa: PLR0913 - many params needed for different modes
 
     # Build bipartite graph for watch paths
     all_stages = cli_helpers.get_all_stages()
-    bipartite_graph = engine_graph.build_graph(all_stages)
-    watch_paths = engine_graph.get_watch_paths(bipartite_graph)
+    engine_graph.build_graph(all_stages)  # Cycle check only (graph result unused)
+    watch_paths = _watch_paths_from_registry(all_stages)
 
     # Sort for display: group matrix variants together while preserving DAG structure
     display_order = _run_common.sort_for_display(execution_order, graph) if execution_order else []
@@ -484,8 +502,8 @@ def _run_serve_mode(
     async def serve_main() -> None:
         # Build watch paths
         all_stages = cli_helpers.get_all_stages()
-        bipartite_graph = engine_graph.build_graph(all_stages)
-        watch_paths = engine_graph.get_watch_paths(bipartite_graph)
+        engine_graph.build_graph(all_stages)  # Cycle check only (graph result unused)
+        watch_paths = _watch_paths_from_registry(all_stages)
 
         async with engine.Engine(pipeline=pipeline, all_pipelines=use_all_pipelines) as eng:
             # Add filesystem watch source
@@ -819,7 +837,7 @@ def repro(
     STAGES can be stage names or output file paths — file paths are resolved
     to the stage that produces them. Without arguments, runs the entire pipeline.
 
-    Auto-discovers pivot.yaml or pipeline.py if no stages are registered.
+    Auto-discovers pipeline.py if no stages are registered.
     """
     cli_ctx = cli_helpers.get_cli_context(ctx)
     quiet = cli_ctx["quiet"]
@@ -843,9 +861,9 @@ def repro(
                 for pipeline in loaded_pipelines:
                     context_pipeline.include(pipeline)
             else:
-                from pivot.pipeline import pipeline as pipeline_mod
+                from pivot.compose import Pipeline
 
-                combined = pipeline_mod.Pipeline("cli", root=loaded_pipelines[0].root)
+                combined = Pipeline("cli", root=loaded_pipelines[0].root)
                 for pipeline in loaded_pipelines:
                     combined.include(pipeline)
                 cli_decorators.store_pipeline_in_context(combined)
@@ -912,7 +930,7 @@ def repro(
     pipeline = cli_decorators.get_pipeline_from_context()
     has_stages = pipeline is not None and bool(pipeline.list_stages())
     if not has_stages and not dry_run and not as_json:
-        raise click.ClickException("No pipeline found (pivot.yaml or pipeline.py)")
+        raise click.ClickException("No pipeline found (pipeline.py)")
 
     # Handle explain mode
     if explain:
@@ -956,3 +974,11 @@ def repro(
 
     if not results and show_human_output and not tui_flag:
         click.echo("No stages to run")
+        return
+
+    if results:
+        from pivot.executor import core as executor_core
+
+        _, _, _, _, failed = executor_core.count_results(results)
+        if failed > 0:
+            raise SystemExit(1)

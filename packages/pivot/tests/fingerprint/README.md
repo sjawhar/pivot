@@ -4,14 +4,11 @@ This directory contains all tests for Pivot's automatic code change detection (f
 
 ## Test Files
 
-- **`test_fingerprint.py`** - Unit tests for fingerprinting functions
-- **`test_integration.py`** - End-to-end tests with real Python files on disk
-- **`test_change_detection.py`** - Comprehensive change detection behavior tests
-- **`test_pydantic_defaults.py`** - Tests for Pydantic default data tracking
-- **`test_functools.py`** - Tests for `functools.partial` and `functools.wraps` handling
-- **`test_callback_vulnerabilities.py`** - Tests documenting callback detection edge cases
-- **`test_determinism.py`** - Cross-process fingerprint stability tests (builtins, default_factory)
-- **`test_safe_fingerprinting.py`** - Tests for safe fingerprinting error guards (data class methods, dynamic name access)
+> **Status:** Test files were removed during the compositional API rewrite.
+> Tests need to be rebuilt. The change detection matrix below documents the
+> expected behaviors that tests should cover.
+
+See `tests/test_compose.py` for loader fingerprint collision tests.
 
 ---
 
@@ -216,6 +213,10 @@ This document exhaustively catalogs what code changes are and are not detected b
 | Custom loader code change       | ✅        | `test_fingerprint.py::test_custom_loader_code_change_detected`              |
 | Custom loader fingerprinting    | ✅        | `test_fingerprint.py::test_custom_loader_fingerprint`                       |
 | Fingerprint stability           | ✅        | `test_fingerprint.py::test_loader_fingerprint_stable`                       |
+| Config collision between outputs| ✅        | `test_compose.py::test_output_loader_change_detected[same-class-different-config]`     |
+| YAML→CSV with existing CSV out  | ✅        | `test_compose.py::test_output_loader_change_detected[yaml-to-csv-with-existing-csv]`   |
+| @no_fingerprint loader collision| ✅        | `test_compose.py::test_no_fingerprint_output_loader_collision`                          |
+| Dep config collision            | ✅        | `test_compose.py::test_dep_loader_config_collision`                                     |
 
 ---
 

@@ -1,10 +1,23 @@
+# pyright: reportImplicitRelativeImport=false, reportExplicitAny=false
 from __future__ import annotations
 
+import dataclasses
 import enum
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, Literal, NotRequired, Required, TypedDict, TypeGuard, cast
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Literal,
+    NamedTuple,
+    NotRequired,
+    Required,
+    TypedDict,
+    TypeGuard,
+    cast,
+)
 
 if TYPE_CHECKING:
+    from pivot import loaders as loaders_module
     from pivot.run_history import RunCacheEntry
 
 # =============================================================================
@@ -162,6 +175,7 @@ class StageResult(TypedDict):
     output_lines: list[tuple[str, bool]]
     metrics: NotRequired[list[tuple[str, float]]]  # (name, duration_ms) for cross-process
     deferred_writes: NotRequired[DeferredWrites]
+    accessed_dep_keys: NotRequired[dict[str, set[str]]]
 
 
 # =============================================================================
@@ -230,25 +244,100 @@ class OutputFormat(enum.StrEnum):
 #
 # Two representations exist for different purposes:
 #
-#   StorageLockData   On-disk YAML format. Uses project-relative paths
-#                     (portable across machines) and list-based deps/outs
-#                     (stable YAML output). This is the only place relative
-#                     paths appear in lockfiles — converted at read/write
-#                     boundary in storage/lock.py.
+#   StorageLockData   On-disk YAML format. Uses project-relative identity keys
+#                     and list-based deps/outs (stable YAML output).
 #
-#   LockData          In-memory format. Uses canonical absolute paths
-#                     (matching registry/engine convention, fast comparisons)
-#                     and dict-based deps/outs (O(1) lookups by path).
+#   LockData          In-memory format. Uses ArtifactIdentity keys
+#                     and dict-based deps/outs (O(1) lookups by identity).
 #
 # Conversion happens at read/write time in storage/lock.py.
 #
 
 
+class ArtifactIdentity(NamedTuple):
+    producer: str
+    key: str | None
+
+
+class ArtifactIdentityJson(TypedDict):
+    producer: str
+    key: str | None
+
+
+def identity_to_json(identity: ArtifactIdentity) -> ArtifactIdentityJson:
+    return ArtifactIdentityJson(producer=identity.producer, key=identity.key)
+
+
+def identity_from_json(payload: ArtifactIdentityJson) -> ArtifactIdentity:
+    return ArtifactIdentity(payload["producer"], payload["key"])
+
+
+def identity_key(identity: ArtifactIdentity) -> str:
+    if identity.key is None:
+        return identity.producer
+    return f"{identity.producer}:{identity.key}"
+
+
+def identity_from_key(key: str) -> ArtifactIdentity:
+    if ":" in key:
+        producer, artifact_key = key.split(":", 1)
+        return ArtifactIdentity(producer, artifact_key)
+    return ArtifactIdentity(key, None)
+
+
+class ArtifactTag(enum.StrEnum):
+    DATA = "data"
+    METRIC = "metric"
+    PLOT = "plot"
+    DIRECTORY = "directory"
+
+
+@dataclasses.dataclass(eq=False)
+class ArtifactRef:
+    identity: ArtifactIdentity
+    format: (
+        loaders_module.Reader[Any] | loaders_module.Writer[Any] | loaders_module.Loader[Any, Any]
+    )
+    python_type: type
+    tag: ArtifactTag
+
+
+def validate_artifact_identity(identity: ArtifactIdentity) -> None:
+    if identity.producer.strip() == "":
+        raise ValueError("Artifact producer cannot be empty")
+    bad_chars = {"\\", "\0", ":"}
+    if bad_chars & set(identity.producer):
+        raise ValueError(
+            f"Artifact producer cannot contain backslashes, null bytes, or colons: {identity.producer!r}"
+        )
+    for segment in identity.producer.split("/"):
+        if segment in {".", ".."}:
+            raise ValueError(
+                f"Artifact producer cannot contain traversal segments: {identity.producer!r}"
+            )
+
+    if identity.key is None:
+        return
+    if identity.key.strip() == "":
+        raise ValueError("Artifact key cannot be empty")
+    if bad_chars & set(identity.key):
+        raise ValueError(
+            f"Artifact key cannot contain backslashes, null bytes, or colons: {identity.key!r}"
+        )
+    for segment in identity.key.split("/"):
+        if segment in {".", ".."}:
+            raise ValueError(f"Artifact key cannot contain traversal segments: {identity.key!r}")
+
+
 class DepEntry(TypedDict):
     """Entry in deps list for lock file storage."""
 
-    path: str
+    producer: str
+    key: str | None
     hash: str
+    display: NotRequired[str]
+    accessed_keys: NotRequired[list[str]]
+    accessed_hashes: NotRequired[dict[str, str]]
     size: NotRequired[int]
     manifest: NotRequired[list[DirManifestEntry]]
 
@@ -256,8 +345,10 @@ class DepEntry(TypedDict):
 class OutEntry(TypedDict):
     """Entry in outs list for lock file storage."""
 
-    path: str
+    key: str | None
     hash: str
+    tag: str
+    display: NotRequired[str]
     size: NotRequired[int]
     manifest: NotRequired[list[DirManifestEntry]]
 
@@ -271,15 +362,17 @@ class StorageLockData(TypedDict):
     params: dict[str, Any]
     deps: list[DepEntry]
     outs: list[OutEntry]
+    merkle_id: NotRequired[str]
 
 
 class LockData(TypedDict):
-    """Internal representation of stage lock data (dict-based, absolute paths)."""
+    """Internal representation of stage lock data (dict-based, identity-keyed)."""
 
     code_manifest: dict[str, str]
     params: dict[str, Any]
-    dep_hashes: dict[str, HashInfo]
-    output_hashes: dict[str, HashInfo]
+    dep_hashes: dict[ArtifactIdentity, HashInfo]
+    output_hashes: dict[ArtifactIdentity, HashInfo]
+    merkle_id: NotRequired[str | None]
 
 
 class OutputMessageKind(enum.StrEnum):
@@ -347,16 +440,16 @@ class ParamChange(TypedDict):
 class DepChange(TypedDict):
     """Change info for an input dependency file."""
 
-    path: str
+    identity: ArtifactIdentity
     old_hash: str | None
     new_hash: str | None
     change_type: ChangeType
 
 
 class OutputChange(TypedDict):
-    """Change info for an output file."""
+    """Change info for an output artifact."""
 
-    path: str
+    path: ArtifactIdentity
     old_hash: str | None
     new_hash: str | None
     change_type: ChangeType | None  # None means unchanged
@@ -845,8 +938,8 @@ class AgentStageInfo(TypedDict):
     """Stage info returned by stages() RPC method."""
 
     name: str
-    deps: list[str]
-    outs: list[str]
+    deps: list[ArtifactIdentityJson]
+    outs: list[ArtifactIdentityJson]
 
 
 class AgentStagesResult(TypedDict):
@@ -883,9 +976,7 @@ class AgentStagesResult(TypedDict):
 #   4. Any other type
 #      No tracked outputs. Return value is ignored by the framework.
 #
-# Note: The constraint "TypedDict where all fields have Out annotations" cannot
-# be expressed in Python's type system. Validation is performed at registration
-# time in stage_def.extract_stage_definition().
+
 #
 
 # Return type for stage functions. The actual constraint is validated at

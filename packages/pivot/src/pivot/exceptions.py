@@ -86,6 +86,10 @@ class DependencyNotFoundError(DAGError):
             f"Stage '{stage}' depends on '{dep}' which is not produced by any stage and does not exist on disk"
         )
 
+    @property
+    def stage(self) -> str:
+        return self._stage
+
     @override
     def format_user_message(self) -> str:
         msg = str(self)
@@ -100,6 +104,35 @@ class DependencyNotFoundError(DAGError):
     @override
     def __reduce__(self) -> tuple[type, tuple[str, str, list[str]]]:
         return (self.__class__, (self._stage, self._dep, self._available))
+
+
+class MultipleDependencyError(DAGError):
+    """Raised when multiple dependencies are missing."""
+
+    _errors: list[DependencyNotFoundError]
+
+    def __init__(self, errors: list[DependencyNotFoundError]) -> None:
+        self._errors = errors
+        super().__init__(f"{len(errors)} missing dependency error(s)")
+
+    @property
+    def errors(self) -> list[DependencyNotFoundError]:
+        return self._errors
+
+    @override
+    def format_user_message(self) -> str:
+        lines = [f"{len(self._errors)} missing dependency error(s):"]
+        for err in self._errors:
+            lines.append(f"  - {err.format_user_message()}")
+        return "\n".join(lines)
+
+    @override
+    def get_suggestion(self) -> str:
+        return "Ensure all dependency files exist or are produced by other stages"
+
+    @override
+    def __reduce__(self) -> tuple[type, tuple[list[DependencyNotFoundError]]]:
+        return (self.__class__, (self._errors,))
 
 
 class StageNotFoundError(DAGError):
@@ -334,9 +367,13 @@ class ProjectNotInitializedError(InitError):
         return "Run 'pivot init' in your project root to initialize Pivot"
 
 
+class PipelineConfigError(PivotError):
+    """Raised when pipeline configuration is invalid."""
+
+
 class PipelineNotFoundError(PivotError):
-    """Raised when no pipeline is found (no pivot.yaml or pipeline.py)."""
+    """Raised when no pipeline is found (no pipeline.py)."""
 
     @override
     def get_suggestion(self) -> str:
-        return "Create pivot.yaml or pipeline.py to define your pipeline"
+        return "Create pipeline.py to define your pipeline"

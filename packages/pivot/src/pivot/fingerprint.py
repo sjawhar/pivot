@@ -765,7 +765,7 @@ def _check_mutable_capture(var_name: str, value: Any, stage_name: str) -> None:
         + f"(type: {type(value).__name__}).\n"
         + "Pivot cannot track changes to mutable runtime state, which may cause silent wrong "
         + "outputs.\n"
-        + "Fix: pass this data via StageParams or declare it as a Dep(...) input.\n"
+        + "Fix: pass this data via StageParams or as a function parameter.\n"
         + "To suppress: set core.unsafe_fingerprinting=true or PIVOT_UNSAFE_FINGERPRINTING=1"
     )
     if _is_unsafe_fingerprinting_enabled():

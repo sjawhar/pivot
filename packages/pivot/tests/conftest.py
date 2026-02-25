@@ -11,7 +11,6 @@ import pathlib
 import subprocess
 import sys
 import tempfile
-import uuid
 from collections.abc import AsyncGenerator, Callable, Generator
 from typing import TYPE_CHECKING
 
@@ -20,19 +19,26 @@ import pytest
 
 from pivot import project
 from pivot.cli import console
+from pivot.compose import Pipeline
 from pivot.config import io as config_io
 from pivot.executor import core as executor_core
-from pivot.pipeline import pipeline as pipeline_mod
-from pivot.registry import StageRegistry
+from pivot.registry import PipelineLike, StageRegistry
 
-# Add tests directory to sys.path so helpers.py can be imported
 _tests_dir = pathlib.Path(__file__).parent
 if str(_tests_dir) not in sys.path:
     sys.path.insert(0, str(_tests_dir))
+_tests_root = _tests_dir.parent
+if str(_tests_root) not in sys.path:
+    sys.path.insert(0, str(_tests_root))
+pythonpath = os.environ.get("PYTHONPATH")
+if pythonpath:
+    os.environ["PYTHONPATH"] = os.pathsep.join([str(_tests_root), pythonpath])
+else:
+    os.environ["PYTHONPATH"] = str(_tests_root)
+
 
 if TYPE_CHECKING:
     from pytest_mock import MockerFixture
-    from types_aiobotocore_s3 import S3Client
 
     from pivot.engine.engine import Engine
     from pivot.engine.types import OutputEvent
@@ -96,24 +102,6 @@ def tmp_pipeline_dir() -> Generator[pathlib.Path]:
 
 
 @pytest.fixture
-async def moto_s3_bucket(
-    moto_patch_session: object, aioboto3_s3_client: S3Client
-) -> AsyncGenerator[str]:
-    """Create a test bucket in moto with unique name for xdist support.
-
-    Uses pytest-aioboto3's moto_patch_session to mock S3 and aioboto3_s3_client
-    to create the bucket. Bucket name includes a unique suffix to prevent
-    conflicts when running tests in parallel with pytest-xdist.
-
-    Yields:
-        str: The bucket name (e.g., "test-bucket-a1b2c3d4").
-    """
-    bucket_name = f"test-bucket-{uuid.uuid4().hex[:8]}"
-    await aioboto3_s3_client.create_bucket(Bucket=bucket_name)
-    yield bucket_name
-
-
-@pytest.fixture
 def sample_data_file(tmp_pipeline_dir: pathlib.Path) -> pathlib.Path:
     data_file = tmp_pipeline_dir / "data.csv"
     data_file.write_text("id,value\n1,10\n2,20\n3,30\n")
@@ -121,31 +109,24 @@ def sample_data_file(tmp_pipeline_dir: pathlib.Path) -> pathlib.Path:
 
 
 @pytest.fixture
-def test_pipeline(tmp_path: pathlib.Path) -> Generator[pipeline_mod.Pipeline]:
+def test_pipeline(tmp_path: pathlib.Path) -> Generator[PipelineLike]:
     """Provide a fresh Pipeline for tests.
-
-    Also sets up the module-level test pipeline in helpers.py so that
-    register_test_stage() works without explicit pipeline parameter.
 
     Note: This fixture does NOT mock the project root. Tests that register
     stages with path annotations should either:
     1. Use mock_discovery fixture (which mocks project root)
     2. Or explicitly mock project._project_root_cache themselves
     """
-    import helpers
-
-    pipeline = pipeline_mod.Pipeline("test", root=tmp_path)
-    helpers.set_test_pipeline(pipeline)
+    pipeline = Pipeline("test", root=tmp_path)
     yield pipeline
-    helpers.set_test_pipeline(None)
 
 
 @pytest.fixture
 def mock_discovery(
-    test_pipeline: pipeline_mod.Pipeline,
+    test_pipeline: PipelineLike,
     mocker: MockerFixture,
     monkeypatch: pytest.MonkeyPatch,
-) -> pipeline_mod.Pipeline:
+) -> PipelineLike:
     """Mock discover_pipeline to return the test_pipeline.
 
     Use this fixture for CLI tests that need stages to be discovered
@@ -161,8 +142,7 @@ def mock_discovery(
     Tests using this fixture should NOT use isolated_filesystem() since
     this fixture already sets up the environment correctly.
 
-    Note: The test_pipeline fixture is automatically used, so stages
-    can be registered via register_test_stage().
+    Note: The test_pipeline fixture is automatically used.
     """
     from pivot import discovery
     from pivot.cli import decorators as cli_decorators
@@ -464,7 +444,7 @@ def output_queue() -> Generator[mp.Queue[OutputMessage]]:
 
 
 @pytest.fixture
-async def test_engine(test_pipeline: pipeline_mod.Pipeline) -> AsyncGenerator[Engine]:
+async def test_engine(test_pipeline: PipelineLike) -> AsyncGenerator[Engine]:
     """Provide a context-managed Engine instance.
 
     The engine is properly closed after each test to ensure sinks are cleaned up.
@@ -537,8 +517,8 @@ class AsyncEventCaptureSink:
 
 @pytest.fixture
 def minimal_pipeline(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, test_pipeline: pipeline_mod.Pipeline
-) -> pipeline_mod.Pipeline:
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, test_pipeline: PipelineLike
+) -> PipelineLike:
     """Set up a minimal pipeline for testing."""
     from pivot import config
 
