@@ -964,3 +964,11 @@ def repro(
 
     if not results and show_human_output and not tui_flag:
         click.echo("No stages to run")
+        return
+
+    if results:
+        from pivot.executor import core as executor_core
+
+        _, _, _, _, failed = executor_core.count_results(results)
+        if failed > 0:
+            raise SystemExit(1)

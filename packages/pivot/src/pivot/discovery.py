@@ -186,7 +186,7 @@ def _discover_all_pipelines(root: pathlib.Path) -> PipelineLike | None:
                 f"--all: dependency path(s) not produced by any discovered pipeline: {sample}{suffix}"
             )
 
-    logger.info(
+    logger.debug(
         f"Discovered {len(pipelines)} pipelines with {len(combined.list_stages())} total stages"
     )
     return combined
