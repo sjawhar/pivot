@@ -564,10 +564,18 @@ def test_parse_metric_content_invalid_yaml() -> None:
 def test_collect_metrics_from_stages_with_metric_output(
     tmp_path: Path,
     mock_discovery: PipelineLike,
+    mocker: MockerFixture,
 ) -> None:
     """Collect metrics from stages with Metric outputs."""
     metric_file = tmp_path / "metrics.json"
     metric_file.write_text(json.dumps({"accuracy": 0.95}))
+
+    # Patch get_workspace_store to return None so _metric_read_path uses
+    # the fallback path (project_root / path_key) which is tmp_path / "metrics.json"
+    mocker.patch(
+        "pivot.cli.helpers.get_workspace_store",
+        return_value=None,
+    )
 
     _register_metric_stage(mock_discovery, "my_stage", str(metric_file))
 
@@ -576,7 +584,6 @@ def test_collect_metrics_from_stages_with_metric_output(
     assert "my_stage" in result
     assert "metrics.json" in result["my_stage"]
     assert result["my_stage"]["metrics.json"]["accuracy"] == 0.95
-
 
 def test_collect_metrics_from_stages_missing_file(
     tmp_path: Path,
@@ -595,11 +602,19 @@ def test_collect_metrics_from_stages_missing_file(
 def test_collect_metrics_from_stages_parse_error(
     tmp_path: Path,
     mock_discovery: PipelineLike,
+    mocker: MockerFixture,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Parse error in metric file logs warning and skips."""
     metric_file = tmp_path / "metrics.json"
     metric_file.write_text("{invalid json}")
+
+    # Patch get_workspace_store to return None so _metric_read_path uses
+    # the fallback path (project_root / path_key) which is tmp_path / "metrics.json"
+    mocker.patch(
+        "pivot.cli.helpers.get_workspace_store",
+        return_value=None,
+    )
 
     _register_metric_stage(mock_discovery, "my_stage", str(metric_file))
 
@@ -608,14 +623,21 @@ def test_collect_metrics_from_stages_parse_error(
     assert "my_stage" not in result
     assert "Failed to parse metrics" in caplog.text
 
-
 def test_collect_all_stage_metrics_flat(
     tmp_path: Path,
     mock_discovery: PipelineLike,
+    mocker: MockerFixture,
 ) -> None:
     """Collect and flatten metrics from all stages."""
     metric_file = tmp_path / "metrics.json"
     metric_file.write_text(json.dumps({"accuracy": 0.95}))
+
+    # Patch get_workspace_store to return None so _metric_read_path uses
+    # the fallback path (project_root / path_key) which is tmp_path / "metrics.json"
+    mocker.patch(
+        "pivot.cli.helpers.get_workspace_store",
+        return_value=None,
+    )
 
     _register_metric_stage(mock_discovery, "my_stage", str(metric_file))
 

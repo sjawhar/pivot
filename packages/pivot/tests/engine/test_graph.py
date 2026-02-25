@@ -439,8 +439,8 @@ def test_build_graph_raises_on_missing_dependency(tmp_path: Path) -> None:
         "stage_b": _create_stage("stage_b", [], [ArtifactIdentity("stage_b", "other.csv")]),
     }
 
-    with pytest.raises(exceptions.DependencyNotFoundError):
-        graph.validate_dependency_sources(stages)
+    errors = graph.validate_dependency_sources(stages)
+    assert len(errors) == 1
 
 
 def test_build_graph_allows_missing_when_validate_false(tmp_path: Path) -> None:

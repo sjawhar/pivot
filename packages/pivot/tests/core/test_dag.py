@@ -214,11 +214,10 @@ def test_missing_dependency_raises_error(tmp_path: Path) -> None:
         ),
     }
 
-    with pytest.raises(
-        DependencyNotFoundError,
-        match="depends on.*producer:missing.csv.*not produced by any stage and does not exist on disk",
-    ):
-        engine_graph.validate_dependency_sources(stages)
+    errors = engine_graph.validate_dependency_sources(stages)
+    assert len(errors) == 1
+    assert "producer:missing.csv" in str(errors[0])
+    assert "not produced by any stage and does not exist on disk" in str(errors[0])
 
 
 def test_build_graph_does_not_validate_deps(tmp_path: Path) -> None:
@@ -257,13 +256,14 @@ def test_validate_dependency_sources_uses_store() -> None:
 
     store = Mock(spec=Store)
     store.exists.return_value = True
-    engine_graph.validate_dependency_sources(stages, store=store)
+    errors = engine_graph.validate_dependency_sources(stages, store=store)
+    assert not errors
     store.exists.assert_called_once_with(external_dep)
 
     store = Mock(spec=Store)
     store.exists.return_value = False
-    with pytest.raises(DependencyNotFoundError):
-        engine_graph.validate_dependency_sources(stages, store=store)
+    errors = engine_graph.validate_dependency_sources(stages, store=store)
+    assert len(errors) == 1
 
 
 def test_validate_dependency_sources_no_store_skips_external() -> None:
@@ -286,7 +286,7 @@ def test_validate_dependency_sources_no_store_skips_external() -> None:
         ),
     }
 
-    engine_graph.validate_dependency_sources(stages, store=None)
+    assert not engine_graph.validate_dependency_sources(stages, store=None)
 
     stages = {
         "producer": RegistryStageInfo(
@@ -321,8 +321,8 @@ def test_validate_dependency_sources_no_store_skips_external() -> None:
         ),
     }
 
-    with pytest.raises(DependencyNotFoundError):
-        engine_graph.validate_dependency_sources(stages, store=None)
+    errors = engine_graph.validate_dependency_sources(stages, store=None)
+    assert len(errors) == 1
 
 
 # --- Cycle detection tests ---

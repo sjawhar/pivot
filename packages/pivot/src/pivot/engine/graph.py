@@ -12,6 +12,7 @@ from pivot import types as pivot_types
 from pivot.engine.types import NodeType
 
 if TYPE_CHECKING:
+    from pivot.exceptions import DependencyNotFoundError
     from pivot.registry import RegistryStageInfo
     from pivot.storage.store import Store
 
@@ -149,17 +150,20 @@ def _check_acyclic(g: nx.DiGraph[str]) -> None:
 def validate_dependency_sources(
     stages: dict[str, RegistryStageInfo],
     store: Store | None = None,
-) -> None:
+) -> list[DependencyNotFoundError]:
     """Check that every dependency is either produced by a stage or exists on disk.
 
-    Raises :class:`~pivot.exceptions.DependencyNotFoundError` when a dep is
-    unresolvable.  With *store=None*, only structural checks run (wrong output
-    key on a known stage); external-dep existence is silently skipped.
+    Collects ALL errors instead of failing on the first.
+
+    Returns a list of :class:`~pivot.exceptions.DependencyNotFoundError` for
+    unresolvable deps.  With *store=None*, only structural checks run (wrong
+    output key on a known stage); external-dep existence is silently skipped.
     """
     from pivot import exceptions
 
     outputs_map = _build_outputs_map(stages)
     stage_names = set(stages.keys())
+    errors = list[exceptions.DependencyNotFoundError]()
 
     for stage_name, info in stages.items():
         for dep in info["deps"].values():
@@ -167,20 +171,27 @@ def validate_dependency_sources(
             if dep_identity in outputs_map:
                 continue
             if dep_identity.producer in stage_names:
-                raise exceptions.DependencyNotFoundError(
-                    stage=stage_name,
-                    dep=pivot_types.identity_key(dep_identity),
-                    available_outputs=[pivot_types.identity_key(out) for out in outputs_map],
+                errors.append(
+                    exceptions.DependencyNotFoundError(
+                        stage=stage_name,
+                        dep=pivot_types.identity_key(dep_identity),
+                        available_outputs=[pivot_types.identity_key(out) for out in outputs_map],
+                    )
                 )
+                continue
             if store is None:
                 continue
             if store.exists(dep):
                 continue
-            raise exceptions.DependencyNotFoundError(
-                stage=stage_name,
-                dep=pivot_types.identity_key(dep_identity),
-                available_outputs=[pivot_types.identity_key(out) for out in outputs_map],
+            errors.append(
+                exceptions.DependencyNotFoundError(
+                    stage=stage_name,
+                    dep=pivot_types.identity_key(dep_identity),
+                    available_outputs=[pivot_types.identity_key(out) for out in outputs_map],
+                )
             )
+
+    return errors
 
 
 def build_graph(

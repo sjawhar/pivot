@@ -134,7 +134,13 @@ def _get_explanations(
     graph = engine_graph.build_graph(all_stages)
     if not allow_missing:
         ws = cli_helpers.get_workspace_store()
-        engine_graph.validate_dependency_sources(all_stages, store=ws)
+        dep_errors = engine_graph.validate_dependency_sources(all_stages, store=ws)
+        if dep_errors:
+            from pivot import exceptions
+
+            if len(dep_errors) == 1:
+                raise dep_errors[0]
+            raise exceptions.MultipleDependencyError(dep_errors)
 
     return status_mod.get_pipeline_explanations(
         stages_list,
