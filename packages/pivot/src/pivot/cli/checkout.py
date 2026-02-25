@@ -243,8 +243,10 @@ def _validate_and_build_files(
     store = cli_helpers.get_workspace_store()
     identity_outputs: dict[types.ArtifactIdentity, tuple[str, HashInfo]] = {}
     stage_output_groups: dict[str, list[tuple[str, HashInfo]]] = {}
+    stage_names: set[str] = set()
     if store is not None:
-        for stage_name in cli_helpers.list_stages():
+        stage_names = set(cli_helpers.list_stages())
+        for stage_name in stage_names:
             stage_info = cli_helpers.get_stage(stage_name)
             for ref in stage_info["outs"]:
                 if ref.tag is types.ArtifactTag.METRIC:
@@ -268,6 +270,13 @@ def _validate_and_build_files(
             for resolved_path, output_hash in stage_output_groups[identity.producer]:
                 files[resolved_path] = output_hash
             continue
+
+        # Stage identity key with no cached outputs — give a helpful error
+        if identity.producer in stage_names:
+            raise click.ClickException(
+                f"Stage '{identity.producer}' has no cached outputs. "
+                + f"Run 'pivot repro {identity.producer}' first."
+            )
 
         # Use normalized path (preserve symlinks) to match keys in tracked_files/stage_outputs
         abs_path = project.normalize_path(target)

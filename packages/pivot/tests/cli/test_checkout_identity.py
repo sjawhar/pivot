@@ -208,7 +208,8 @@ def test_checkout_unknown_identity_target_raises(
     result = runner.invoke(cli.cli, ["checkout", "train:nope"])
 
     assert result.exit_code != 0
-    assert "not a tracked file or stage output" in result.output
+    assert "has no cached outputs" in result.output
+    assert "pivot repro train" in result.output
 
 
 def test_checkout_directory_output_restores_contents(
@@ -345,3 +346,39 @@ pipeline._registry.add_existing(RegistryStageInfo(
         assert result.exit_code == 0, result.output
         assert output_path.exists()
         assert output_path.name == "train.csv"
+
+
+def test_checkout_stage_identity_no_lock_data_gives_helpful_error(
+    mock_discovery: PipelineLike, runner: click.testing.CliRunner
+) -> None:
+    """Stage identity key with no lock file data gives a helpful error."""
+    ref = _helper_ref("train", None, types.ArtifactTag.DATA, loaders.CSV())
+    _helper_register_stage(mock_discovery, "train", [ref])
+    # Do NOT write lock data -- simulate stage that hasn't been run
+
+    result = runner.invoke(cli.cli, ["checkout", "train"])
+
+    assert result.exit_code != 0
+    assert "has no cached outputs" in result.output
+    assert "pivot repro train" in result.output
+
+
+def test_checkout_stage_identity_with_lock_data_restores(
+    mock_discovery: PipelineLike, runner: click.testing.CliRunner
+) -> None:
+    """Stage identity key with lock file data restores outputs successfully."""
+    store_instance = cli_helpers.get_workspace_store()
+    assert store_instance is not None
+
+    ref = _helper_ref("train", None, types.ArtifactTag.DATA, loaders.CSV())
+    _helper_register_stage(mock_discovery, "train", [ref])
+
+    output_path = store_instance.resolve_display_path(ref)
+    output_hash = _helper_cache_file(output_path, "id,value\n1,2\n")
+    _helper_write_lock("train", mock_discovery.state_dir, {ref.identity: output_hash})
+
+    result = runner.invoke(cli.cli, ["checkout", "train"])
+
+    assert result.exit_code == 0, result.output
+    assert output_path.exists()
+    assert output_path.read_text() == "id,value\n1,2\n"
