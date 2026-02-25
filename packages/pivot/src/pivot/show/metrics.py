@@ -31,9 +31,15 @@ def _metric_read_path(
         if out.tag is not types.ArtifactTag.METRIC:
             return None
         path_key = types.identity_key(out.identity)
-        path = pathlib.Path(path_key)
-        if not path.is_absolute():
-            path = project_root / path_key
+        # Resolve identity to actual workspace path via WorkspaceStore
+        from pivot.cli import helpers as cli_helpers
+
+        store = cli_helpers.get_workspace_store()
+        if store is not None:
+            path = store.resolve_display_path(out)
+            return path_key, path
+        # Fallback: use project_root / path_key (may not exist)
+        path = project_root / path_key
         return path_key, path
     if isinstance(out, outputs.Metric):
         path = pathlib.Path(str(out.path))

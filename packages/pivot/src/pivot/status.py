@@ -140,6 +140,7 @@ def _get_explanations_in_parallel(
                 tracked_trie=tracked_trie,
                 deps_refs=stage_info["deps"],
                 store=store,
+                outs_refs=list(stage_info["outs"]),
             )
             futures[future] = stage_name
 

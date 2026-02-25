@@ -98,6 +98,7 @@ def get_stage_explanation(
     tracked_trie: pygtrie.Trie[str] | None = None,
     deps_refs: dict[str, types.ArtifactRef] | None = None,
     store: store_mod.Store | None = None,
+    outs_refs: list[types.ArtifactRef] | None = None,
 ) -> StageExplanation:
     """Compute detailed explanation of why a stage would run.
 
@@ -138,7 +139,6 @@ def get_stage_explanation(
         )
 
     # Check generation tracking first (O(1) skip detection)
-    # Use verify_files=False since status predicts run behavior after restoration
     state_db_path = state_dir / "state.db"
     if state_db_path.exists():
         with state.StateDB(state_db_path, readonly=True) as state_db:
@@ -152,16 +152,25 @@ def get_stage_explanation(
                 state_db=state_db,
                 verify_files=False,
             ):
-                return StageExplanation(
-                    stage_name=stage_name,
-                    will_run=False,
-                    is_forced=False,
-                    reason="",
-                    code_changes=[],
-                    param_changes=[],
-                    dep_changes=[],
-                    upstream_stale=[],
-                )
+                # Also verify output files exist on disk (matches engine behavior)
+                outputs_exist = True
+                if outs_refs is not None and isinstance(store, store_mod.WorkspaceStore):
+                    for out_ref in outs_refs:
+                        out_path = store.resolve_display_path(out_ref)
+                        if not out_path.exists():
+                            outputs_exist = False
+                            break
+                if outputs_exist:
+                    return StageExplanation(
+                        stage_name=stage_name,
+                        will_run=False,
+                        is_forced=False,
+                        reason="",
+                        code_changes=[],
+                        param_changes=[],
+                        dep_changes=[],
+                        upstream_stale=[],
+                    )
 
     if allow_missing:
         fallback_hashes = dict[ArtifactIdentity, HashInfo]()
