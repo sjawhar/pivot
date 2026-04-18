@@ -154,15 +154,7 @@ class ExecutionError(PivotError):
     """Raised when pipeline execution fails."""
 
 
-class DVCCompatError(PivotError):
-    """Base class for DVC compatibility errors."""
-
-
-class ExportError(DVCCompatError):
-    """Raised when stage export to DVC format fails."""
-
-
-class DVCImportError(DVCCompatError):
+class DVCImportError(PivotError):
     """Raised when dvc.yaml import fails."""
 
 

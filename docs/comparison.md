@@ -94,16 +94,3 @@ pivot repro --watch  # Monitors files, re-runs on change
 
 Edit code, save, see results immediately.
 
-## Migration from DVC
-
-Pivot can export to DVC format for gradual adoption:
-
-```bash
-# Generate dvc.yaml from Pivot stages
-pivot export > dvc.yaml
-
-# Team members without Pivot can still use DVC
-dvc repro
-```
-
-See [Migrating from DVC](migrating-from-dvc.md) for details.

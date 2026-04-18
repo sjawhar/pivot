@@ -251,22 +251,6 @@ pivot show [RUN_ID] [OPTIONS]
 
 ---
 
-### `pivot export`
-
-Export pipeline to DVC YAML format.
-
-```bash
-pivot export [STAGES...] [OPTIONS]
-```
-
-**Options:**
-
-| Option | Description |
-|--------|-------------|
-| `--output` / `-o PATH` | Output path (default: `dvc.yaml`) |
-
----
-
 ### `pivot dag`
 
 Visualize the pipeline DAG.

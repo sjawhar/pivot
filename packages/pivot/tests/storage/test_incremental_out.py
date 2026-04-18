@@ -349,29 +349,6 @@ async def test_integration_missing_cache_error_includes_recovery_suggestion(
 
 
 # =============================================================================
-# IncrementalOut DVC Export Tests
-# =============================================================================
-
-
-def test_dvc_export_incremental_out_always_persist() -> None:
-    """IncrementalOut should always export with persist: true."""
-    from pivot import dvc_compat
-
-    inc = outputs.IncrementalOut(path="database.csv", loader=loaders.PathOnly())
-    result = dvc_compat._build_out_entry(inc, "database.csv")
-    assert result == {"database.csv": {"persist": True}}
-
-
-def test_dvc_export_incremental_out_with_cache_false() -> None:
-    """IncrementalOut with cache=False should export both options."""
-    from pivot import dvc_compat
-
-    inc = outputs.IncrementalOut(path="database.csv", loader=loaders.PathOnly(), cache=False)
-    result = dvc_compat._build_out_entry(inc, "database.csv")
-    assert result == {"database.csv": {"cache": False, "persist": True}}
-
-
-# =============================================================================
 # IncrementalOut Integration Tests
 # =============================================================================
 

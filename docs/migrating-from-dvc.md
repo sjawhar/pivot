@@ -273,60 +273,6 @@ pivot repro
 diff data/processed.csv data/processed.csv.dvc_backup
 ```
 
-### Step 6: Export for Validation (Optional)
-
-Pivot can export back to DVC format for validation:
-
-```bash
-pivot export
-
-# Should show nothing needs to run
-dvc repro --dry
-```
-
-## Running Side-by-Side
-
-During migration, you can run both tools:
-
-```bash
-# Run with Pivot
-pivot repro
-
-# Validate outputs match DVC
-pivot export
-dvc repro --dry  # Should show nothing to run
-```
-
-## Export Command
-
-Export Pivot pipeline to DVC format:
-
-```bash
-# Generate dvc.yaml
-pivot export
-
-# Custom output path
-pivot export --output my-pipeline.yaml
-
-# Export specific stages
-pivot export preprocess train
-```
-
-## Limitations of Export
-
-The export captures:
-
-- Stage commands (as Python function calls)
-- Dependencies
-- Outputs (with cache/persist settings)
-- Metrics and plots
-
-Not exported:
-
-- Automatic code fingerprinting (DVC doesn't support this)
-- Mutex groups
-- Pydantic parameter types (exported as plain values)
-
 ## FAQs
 
 ### Do I need to migrate all at once?

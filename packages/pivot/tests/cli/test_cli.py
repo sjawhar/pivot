@@ -985,29 +985,6 @@ pipeline = Pipeline('test')
         assert result.output.strip() == "", "Quiet mode should suppress output"
 
 
-def test_cli_export_quiet_produces_no_output(runner: CliRunner, tmp_path: pathlib.Path) -> None:
-    """pivot --quiet export produces no output."""
-    with isolated_pivot_dir(runner, tmp_path):
-        pathlib.Path("pipeline.py").write_text("""\
-from __future__ import annotations
-from pivot.pipeline.pipeline import Pipeline
-
-pipeline = Pipeline('test')
-
-def test_stage() -> None:
-    pass
-
-pipeline.register(test_stage)
-""")
-
-        result = runner.invoke(cli.cli, ["--quiet", "export"])
-
-        assert result.exit_code == 0, f"Export failed: {result.output}"
-        assert result.output.strip() == "", "Quiet mode should suppress output"
-        # Verify file was created
-        assert pathlib.Path("dvc.yaml").exists()
-
-
 def test_cli_doctor_quiet_produces_no_output(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """pivot --quiet doctor produces no output."""
     with isolated_pivot_dir(runner, tmp_path):

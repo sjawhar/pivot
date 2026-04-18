@@ -13,7 +13,6 @@ COMMAND_CATEGORIES = {
     "Inspection": ["dag", "diff", "history", "list", "metrics", "params", "plots", "show"],
     "Other": [
         "init",
-        "export",
         "import-dvc",
         "config",
         "completion",
@@ -31,7 +30,6 @@ _LAZY_COMMANDS: dict[str, tuple[str, str, str]] = {
     "repro": ("pivot.cli.repro", "repro", "Reproduce pipeline with full DAG resolution."),
     "dag": ("pivot.cli.dag", "dag_cmd", "Visualize pipeline DAG."),
     "list": ("pivot.cli.list", "list_cmd", "List registered stages."),
-    "export": ("pivot.cli.export", "export", "Export pipeline to DVC YAML format."),
     "import": (
         "pivot.cli.import_cmd",
         "import_cmd",

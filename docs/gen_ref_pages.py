@@ -15,7 +15,6 @@ PUBLIC_MODULES = [
     ("pivot.explain", "Explain Mode"),
     ("pivot.types", "Type Definitions"),
     ("pivot.storage", "Storage & Cache"),
-    ("pivot.dvc_compat", "DVC Compatibility"),
 ]
 
 for module_path, display_name in PUBLIC_MODULES:

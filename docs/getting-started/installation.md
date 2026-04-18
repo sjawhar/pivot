@@ -21,20 +21,6 @@ For pushing/pulling cached outputs to S3:
 uv add "pivot[s3]"
 ```
 
-### DVC Integration
-
-For `pivot export` to generate DVC-compatible YAML:
-
-```bash
-uv add "pivot[dvc]"
-```
-
-### All Optional Dependencies
-
-```bash
-uv add "pivot[s3,dvc]"
-```
-
 ## Development Installation
 
 For contributing to Pivot:
