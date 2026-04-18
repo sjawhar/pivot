@@ -506,9 +506,14 @@ def test_is_lock_data_accepts_missing_dep_generations() -> None:
     assert lock.is_lock_data(data)
 
 
-def test_read_lock_with_dep_generations_ignored(tmp_path: Path) -> None:
-    """Legacy lock files with dep_generations are still readable."""
-    stage_lock = lock.StageLock("legacy", tmp_path)
+def test_read_lock_with_dep_generations_rejected(tmp_path: Path) -> None:
+    """Lock files containing the removed dep_generations field are rejected.
+
+    After the SQLite→LMDB migration, dep_generations lives only in StateDB.
+    Stale lock files that still have this field are rejected so callers
+    treat them as 'no previous run' and regenerate cleanly.
+    """
+    stage_lock = lock.StageLock("stale", tmp_path)
     stage_lock.path.parent.mkdir(parents=True, exist_ok=True)
     stage_lock.path.write_text(
         "code_manifest: {}\nparams: {}\ndeps: []\nouts: []\ndep_generations: {}\n"
@@ -516,8 +521,7 @@ def test_read_lock_with_dep_generations_ignored(tmp_path: Path) -> None:
 
     result = stage_lock.read()
 
-    assert result is not None
-    assert "dep_generations" not in result
+    assert result is None, "stale lock files with dep_generations must be rejected"
 
 
 @pytest.mark.parametrize(

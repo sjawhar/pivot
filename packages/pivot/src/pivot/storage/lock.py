@@ -68,6 +68,10 @@ def is_lock_data(data: object) -> TypeGuard[StorageLockData]:
     # Require all required keys (allow extra keys for forward compatibility)
     if not _REQUIRED_LOCK_KEYS.issubset(typed_data.keys()):
         return False
+    # Reject the removed dep_generations field. Pre-alpha: lock files from the
+    # SQLite-era schema must regenerate rather than be silently partially-read.
+    if "dep_generations" in typed_data:
+        return False
     # Reject null values for required keys (corrupted data)
     if not all(typed_data[key] is not None for key in _REQUIRED_LOCK_KEYS):
         return False
