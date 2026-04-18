@@ -37,7 +37,6 @@ class TabbedDetailPanel(textual.containers.Vertical):
         *,
         id: str | None = None,
         classes: str | None = None,
-        stage_data_provider: object = None,  # Deprecated: accepted but ignored
     ) -> None:
         super().__init__(id=id, classes=classes)
         self._stage = None
