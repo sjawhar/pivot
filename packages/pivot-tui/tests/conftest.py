@@ -115,17 +115,6 @@ def test_registry() -> StageRegistry:
     return StageRegistry()
 
 
-@pytest.fixture
-def clean_registry() -> None:
-    """No-op fixture for backwards compatibility.
-
-    Previously cleared the global REGISTRY between tests.
-    Now that REGISTRY is removed, this is kept for tests that still use
-    @pytest.mark.usefixtures("clean_registry") - they can be gradually updated.
-    """
-    pass
-
-
 _PIVOT_LOGGERS = ("pivot", "pivot.project", "pivot.executor", "pivot.registry", "")
 
 
