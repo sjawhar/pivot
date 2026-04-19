@@ -16,13 +16,13 @@ if TYPE_CHECKING:
 
 
 def _apply_deferred_writes(
-    stage_name: str, stage_info: WorkerStageInfo, result: StageResult, state_db_path: pathlib.Path
+    stage_name: str, stage_info: WorkerStageInfo, result: StageResult, state_dir: pathlib.Path
 ) -> None:
     """Apply deferred writes from stage result (normally done by coordinator)."""
     if "deferred_writes" not in result:
         return
     output_paths = [str(out.path) for out in stage_info["outs"]]
-    with state.StateDB(state_db_path) as db:
+    with state.StateDB(state_dir) as db:
         db.apply_deferred_writes(stage_name, output_paths, result["deferred_writes"])
 
 
@@ -97,13 +97,13 @@ def test_run_cache_skip_updates_lock_file(
         run_id="run_1",
     )
 
-    state_db_path = tmp_path / ".pivot"
+    state_dir = tmp_path / ".pivot"
 
     # Step 1: First run - creates lock file with state A
     result1 = executor.execute_stage("test_stage", stage_info, worker_env, output_queue)
     assert result1["status"] == "ran"
     assert (tmp_path / "output.txt").read_text() == "processed: state_A"
-    _apply_deferred_writes("test_stage", stage_info, result1, state_db_path)
+    _apply_deferred_writes("test_stage", stage_info, result1, state_dir)
 
     # Read lock file to get hash of state A
     stage_lock = lock.StageLock("test_stage", lock.get_stages_dir(tmp_path / ".pivot"))
@@ -126,7 +126,7 @@ def test_run_cache_skip_updates_lock_file(
     result2 = executor.execute_stage("test_stage", stage_info_run2, worker_env, output_queue)
     assert result2["status"] == "ran"
     assert (tmp_path / "output.txt").read_text() == "processed: state_B"
-    _apply_deferred_writes("test_stage", stage_info_run2, result2, state_db_path)
+    _apply_deferred_writes("test_stage", stage_info_run2, result2, state_dir)
 
     # Read lock file to confirm state B
     lock_data_b = stage_lock.read()
@@ -187,12 +187,12 @@ def test_explain_shows_cached_after_run_cache_skip(
         run_id="run_1",
     )
 
-    state_db_path = tmp_path / ".pivot"
+    state_dir = tmp_path / ".pivot"
 
     # Step 1: First run - creates lock file with state A
     result1 = executor.execute_stage("test_stage", stage_info, worker_env, output_queue)
     assert result1["status"] == "ran"
-    _apply_deferred_writes("test_stage", stage_info, result1, state_db_path)
+    _apply_deferred_writes("test_stage", stage_info, result1, state_dir)
 
     # Step 2: Modify input to state B
     input_file.write_text("state_B")
@@ -208,7 +208,7 @@ def test_explain_shows_cached_after_run_cache_skip(
     )
     result2 = executor.execute_stage("test_stage", stage_info_run2, worker_env, output_queue)
     assert result2["status"] == "ran"
-    _apply_deferred_writes("test_stage", stage_info_run2, result2, state_db_path)
+    _apply_deferred_writes("test_stage", stage_info_run2, result2, state_dir)
 
     # Step 4: Revert input to state A
     input_file.write_text("state_A")
@@ -312,14 +312,14 @@ def test_run_cache_skip_does_not_increment_output_generations(
         run_id="run_1",
     )
 
-    state_db_path = tmp_path / ".pivot"
+    state_dir = tmp_path / ".pivot"
 
     # Step 1: First run - creates lock file with state A, output gen -> 1
     result1 = executor.execute_stage("test_stage", stage_info, worker_env, output_queue)
     assert result1["status"] == "ran"
-    _apply_deferred_writes("test_stage", stage_info, result1, state_db_path)
+    _apply_deferred_writes("test_stage", stage_info, result1, state_dir)
 
-    with state.StateDB(state_db_path) as db:
+    with state.StateDB(state_dir) as db:
         gen_after_run1 = db.get_generation(tmp_path / "output.txt")
     assert gen_after_run1 == 1, f"Expected generation 1 after first run, got {gen_after_run1}"
 
@@ -337,9 +337,9 @@ def test_run_cache_skip_does_not_increment_output_generations(
     )
     result2 = executor.execute_stage("test_stage", stage_info_run2, worker_env, output_queue)
     assert result2["status"] == "ran"
-    _apply_deferred_writes("test_stage", stage_info_run2, result2, state_db_path)
+    _apply_deferred_writes("test_stage", stage_info_run2, result2, state_dir)
 
-    with state.StateDB(state_db_path) as db:
+    with state.StateDB(state_dir) as db:
         gen_after_run2 = db.get_generation(tmp_path / "output.txt")
     assert gen_after_run2 == 2, f"Expected generation 2 after second run, got {gen_after_run2}"
 
@@ -360,10 +360,10 @@ def test_run_cache_skip_does_not_increment_output_generations(
     assert "run cache" in result3["reason"], f"Expected run cache skip, got: {result3['reason']}"
 
     # Apply deferred writes from the SKIPPED result
-    _apply_deferred_writes("test_stage", stage_info_run3, result3, state_db_path)
+    _apply_deferred_writes("test_stage", stage_info_run3, result3, state_dir)
 
     # CRITICAL: Output generation should NOT have been incremented
-    with state.StateDB(state_db_path) as db:
+    with state.StateDB(state_dir) as db:
         gen_after_skip = db.get_generation(tmp_path / "output.txt")
     assert gen_after_skip == 2, (
         f"Output generation should remain at 2 after run cache skip, got {gen_after_skip}. "

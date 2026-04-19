@@ -209,9 +209,9 @@ def test_run_cache_restores_directory_output(
 
     # Apply deferred writes (simulating what coordinator does)
     assert "deferred_writes" in result1, "Should have deferred writes for directory output"
-    state_db_path = worker_env.parent
+    state_dir = worker_env.parent
     output_paths = [str(out.path) for out in stage_info["outs"]]
-    with state.StateDB(state_db_path) as db:
+    with state.StateDB(state_dir) as db:
         db.apply_deferred_writes("test_stage", output_paths, result1["deferred_writes"])
 
     # Verify directory output exists
@@ -282,9 +282,9 @@ def test_run_cache_reruns_when_noncached_output_missing(
     # Apply deferred writes (simulating what coordinator does)
     # With a cached output, deferred_writes MUST contain a run cache entry
     assert "deferred_writes" in result1, "Should have deferred writes with cached output"
-    state_db_path = worker_env.parent
+    state_dir = worker_env.parent
     output_paths: list[str] = [str(out.path) for out in stage_info["outs"]]
-    with state.StateDB(state_db_path) as db:
+    with state.StateDB(state_dir) as db:
         db.apply_deferred_writes("test_stage", output_paths, result1["deferred_writes"])
 
     # Verify both files exist
