@@ -72,7 +72,6 @@ def test_parse_node_handles_colons_in_path() -> None:
 # --- Graph building tests ---
 
 
-@pytest.mark.usefixtures("clean_registry")
 def test_build_graph_simple_chain(tmp_path: Path) -> None:
     """Build bipartite graph for simple chain: input -> A -> intermediate -> B -> output."""
     input_file = tmp_path / "input.csv"
@@ -102,7 +101,6 @@ def test_build_graph_simple_chain(tmp_path: Path) -> None:
     assert g.has_edge(graph.stage_node("stage_b"), graph.artifact_node(output_file))
 
 
-@pytest.mark.usefixtures("clean_registry")
 def test_build_graph_diamond(tmp_path: Path) -> None:
     """Build bipartite graph for diamond pattern.
 
@@ -133,7 +131,6 @@ def test_build_graph_diamond(tmp_path: Path) -> None:
     assert g.has_edge(graph.artifact_node(feats), graph.stage_node("train"))
 
 
-@pytest.mark.usefixtures("clean_registry")
 def test_build_graph_empty() -> None:
     """Build graph with no stages returns empty graph."""
     g = graph.build_graph({})
@@ -144,7 +141,6 @@ def test_build_graph_empty() -> None:
 # --- Query function tests ---
 
 
-@pytest.mark.usefixtures("clean_registry")
 def test_get_consumers_returns_dependent_stages(tmp_path: Path) -> None:
     """get_consumers returns stages that depend on an artifact."""
     input_file = tmp_path / "input.csv"
@@ -163,7 +159,6 @@ def test_get_consumers_returns_dependent_stages(tmp_path: Path) -> None:
     assert set(consumers) == {"stage_a", "stage_b"}
 
 
-@pytest.mark.usefixtures("clean_registry")
 def test_get_consumers_returns_empty_for_unknown_path(tmp_path: Path) -> None:
     """get_consumers returns empty list for unknown path."""
     g = graph.build_graph({})
@@ -171,7 +166,6 @@ def test_get_consumers_returns_empty_for_unknown_path(tmp_path: Path) -> None:
     assert consumers == []
 
 
-@pytest.mark.usefixtures("clean_registry")
 def test_get_producer_returns_producing_stage(tmp_path: Path) -> None:
     """get_producer returns the stage that produces an artifact."""
     input_file = tmp_path / "input.csv"
@@ -188,7 +182,6 @@ def test_get_producer_returns_producing_stage(tmp_path: Path) -> None:
     assert producer == "stage_a"
 
 
-@pytest.mark.usefixtures("clean_registry")
 def test_get_producer_returns_none_for_input_artifact(tmp_path: Path) -> None:
     """get_producer returns None for artifacts that are inputs (not produced by any stage)."""
     input_file = tmp_path / "input.csv"
@@ -205,7 +198,6 @@ def test_get_producer_returns_none_for_input_artifact(tmp_path: Path) -> None:
     assert producer is None
 
 
-@pytest.mark.usefixtures("clean_registry")
 def test_get_watch_paths_returns_all_artifacts(tmp_path: Path) -> None:
     """get_watch_paths returns all artifact paths."""
     input_file = tmp_path / "input.csv"
@@ -224,7 +216,6 @@ def test_get_watch_paths_returns_all_artifacts(tmp_path: Path) -> None:
     assert set(paths) == {input_file, intermediate, output_file}
 
 
-@pytest.mark.usefixtures("clean_registry")
 def test_get_downstream_stages(tmp_path: Path) -> None:
     """get_downstream_stages returns all transitively downstream stages."""
     input_file = tmp_path / "input.csv"
@@ -243,7 +234,6 @@ def test_get_downstream_stages(tmp_path: Path) -> None:
     assert set(downstream) == {"stage_b"}
 
 
-@pytest.mark.usefixtures("clean_registry")
 def test_get_downstream_stages_empty_for_leaf(tmp_path: Path) -> None:
     """get_downstream_stages returns empty for leaf stage."""
     input_file = tmp_path / "input.csv"
@@ -263,7 +253,6 @@ def test_get_downstream_stages_empty_for_leaf(tmp_path: Path) -> None:
 # --- Incremental update tests ---
 
 
-@pytest.mark.usefixtures("clean_registry")
 def test_update_stage_adds_new_dep(tmp_path: Path) -> None:
     """update_stage adds new dependency edges."""
     input_a = tmp_path / "a.csv"
@@ -289,7 +278,6 @@ def test_update_stage_adds_new_dep(tmp_path: Path) -> None:
     assert set(graph.get_consumers(g, input_b)) == {"stage_a"}
 
 
-@pytest.mark.usefixtures("clean_registry")
 def test_update_stage_removes_old_dep(tmp_path: Path) -> None:
     """update_stage removes old dependency edges and orphaned artifacts."""
     input_a = tmp_path / "a.csv"
@@ -315,7 +303,6 @@ def test_update_stage_removes_old_dep(tmp_path: Path) -> None:
     assert graph.artifact_node(input_b) not in g
 
 
-@pytest.mark.usefixtures("clean_registry")
 def test_update_stage_preserves_shared_artifacts(tmp_path: Path) -> None:
     """update_stage doesn't remove artifacts used by other stages."""
     shared_input = tmp_path / "shared.csv"
@@ -342,7 +329,6 @@ def test_update_stage_preserves_shared_artifacts(tmp_path: Path) -> None:
 # --- get_stage_dag tests ---
 
 
-@pytest.mark.usefixtures("clean_registry")
 def test_get_stage_dag_extracts_stage_only_graph(tmp_path: Path) -> None:
     """get_stage_dag returns stage-only DAG from bipartite graph."""
     input_file = tmp_path / "input.csv"
@@ -376,7 +362,6 @@ def test_get_stage_dag_extracts_stage_only_graph(tmp_path: Path) -> None:
 # --- get_artifact_consumers tests ---
 
 
-@pytest.mark.usefixtures("clean_registry")
 def test_get_artifact_consumers_returns_direct_and_downstream(tmp_path: Path) -> None:
     """get_artifact_consumers returns stages that depend on artifact."""
     # Build graph: input.csv -> preprocess -> cleaned.csv -> train -> model.pkl
@@ -404,7 +389,6 @@ def test_get_artifact_consumers_returns_direct_and_downstream(tmp_path: Path) ->
     assert "train" not in direct
 
 
-@pytest.mark.usefixtures("clean_registry")
 def test_get_artifact_consumers_returns_empty_for_unknown_path(tmp_path: Path) -> None:
     """get_artifact_consumers returns empty list for unknown artifact."""
     g = graph.build_graph({})
@@ -495,7 +479,6 @@ def test_build_graph_directory_dependency(tmp_path: Path) -> None:
 # --- get_upstream_stages tests ---
 
 
-@pytest.mark.usefixtures("clean_registry")
 def test_get_upstream_stages_returns_producing_stages(tmp_path: Path) -> None:
     """get_upstream_stages returns stages that produce inputs for a stage."""
     input_file = tmp_path / "input.csv"
@@ -517,7 +500,6 @@ def test_get_upstream_stages_returns_producing_stages(tmp_path: Path) -> None:
     assert set(upstream) == {"preprocess", "extract"}
 
 
-@pytest.mark.usefixtures("clean_registry")
 def test_get_upstream_stages_empty_for_root_stage(tmp_path: Path) -> None:
     """get_upstream_stages returns empty list for stage with no upstream dependencies."""
     input_file = tmp_path / "input.csv"
@@ -535,7 +517,6 @@ def test_get_upstream_stages_empty_for_root_stage(tmp_path: Path) -> None:
     assert upstream == []
 
 
-@pytest.mark.usefixtures("clean_registry")
 def test_get_upstream_stages_empty_for_unknown_stage(tmp_path: Path) -> None:
     """get_upstream_stages returns empty list for unknown stage."""
     g = graph.build_graph({})
@@ -546,7 +527,6 @@ def test_get_upstream_stages_empty_for_unknown_stage(tmp_path: Path) -> None:
 # --- get_execution_order with single_stage tests ---
 
 
-@pytest.mark.usefixtures("clean_registry")
 def test_get_execution_order_single_stage_mode(tmp_path: Path) -> None:
     """get_execution_order with single_stage=True returns only requested stages."""
     input_file = tmp_path / "input.csv"
@@ -569,7 +549,6 @@ def test_get_execution_order_single_stage_mode(tmp_path: Path) -> None:
     assert "stage_a" not in order
 
 
-@pytest.mark.usefixtures("clean_registry")
 def test_get_execution_order_single_stage_preserves_order(tmp_path: Path) -> None:
     """get_execution_order with single_stage=True preserves input order."""
     input_file = tmp_path / "input.csv"
@@ -594,7 +573,6 @@ def test_get_execution_order_single_stage_preserves_order(tmp_path: Path) -> Non
 # --- Additional edge case tests ---
 
 
-@pytest.mark.usefixtures("clean_registry")
 def test_get_producer_returns_none_for_unknown_path(tmp_path: Path) -> None:
     """get_producer returns None for completely unknown artifact path."""
     input_file = tmp_path / "input.csv"
@@ -611,7 +589,6 @@ def test_get_producer_returns_none_for_unknown_path(tmp_path: Path) -> None:
     assert producer is None
 
 
-@pytest.mark.usefixtures("clean_registry")
 def test_get_downstream_stages_empty_for_unknown_stage(tmp_path: Path) -> None:
     """get_downstream_stages returns empty list for unknown stage."""
     input_file = tmp_path / "input.csv"
@@ -628,7 +605,6 @@ def test_get_downstream_stages_empty_for_unknown_stage(tmp_path: Path) -> None:
     assert downstream == []
 
 
-@pytest.mark.usefixtures("clean_registry")
 def test_update_stage_adds_new_out(tmp_path: Path) -> None:
     """update_stage adds new output edges."""
     input_file = tmp_path / "input.csv"
@@ -653,7 +629,6 @@ def test_update_stage_adds_new_out(tmp_path: Path) -> None:
     assert graph.get_producer(g, out_b) == "stage_a"
 
 
-@pytest.mark.usefixtures("clean_registry")
 def test_update_stage_removes_old_out(tmp_path: Path) -> None:
     """update_stage removes old output edges and orphaned artifacts."""
     input_file = tmp_path / "input.csv"
@@ -678,14 +653,12 @@ def test_update_stage_removes_old_out(tmp_path: Path) -> None:
     assert graph.artifact_node(out_b) not in g
 
 
-@pytest.mark.usefixtures("clean_registry")
 def test_build_tracked_trie_empty() -> None:
     """build_tracked_trie handles empty tracked files dict."""
     trie = graph.build_tracked_trie({})
     assert len(trie) == 0
 
 
-@pytest.mark.usefixtures("clean_registry")
 def test_build_tracked_trie_single_file(tmp_path: Path) -> None:
     """build_tracked_trie creates trie from single file."""
     tracked_path = str(tmp_path / "file.csv")
@@ -700,7 +673,6 @@ def test_build_tracked_trie_single_file(tmp_path: Path) -> None:
     assert trie[path_key] == tracked_path
 
 
-@pytest.mark.usefixtures("clean_registry")
 def test_build_tracked_trie_nested_files(tmp_path: Path) -> None:
     """build_tracked_trie creates trie from nested file structure."""
     file1 = str(tmp_path / "data" / "a.csv")
@@ -720,7 +692,6 @@ def test_build_tracked_trie_nested_files(tmp_path: Path) -> None:
 # --- Edge cases for directory dependency resolution ---
 
 
-@pytest.mark.usefixtures("clean_registry")
 def test_directory_dependency_parent_is_output(tmp_path: Path) -> None:
     """File depends on parent directory that is produced by a stage."""
     data_dir = tmp_path / "data"
@@ -743,7 +714,6 @@ def test_directory_dependency_parent_is_output(tmp_path: Path) -> None:
     assert stage_dag.has_edge("consume_file", "produce_dir")
 
 
-@pytest.mark.usefixtures("clean_registry")
 def test_directory_dependency_with_seen_stages_dedupe(tmp_path: Path) -> None:
     """Directory dependency correctly deduplicates stages producing multiple files."""
     output_dir = tmp_path / "outputs"
@@ -771,7 +741,6 @@ def test_directory_dependency_with_seen_stages_dedupe(tmp_path: Path) -> None:
 # --- Error path tests ---
 
 
-@pytest.mark.usefixtures("clean_registry")
 def test_cycle_detection_error_message_format(tmp_path: Path) -> None:
     """Cycle error message contains affected stage names."""
     stages = {
@@ -879,7 +848,6 @@ def test_tracked_file_inside_directory_validates(tmp_path: Path) -> None:
 # --- extract_graph_view tests ---
 
 
-@pytest.mark.usefixtures("clean_registry")
 def test_extract_graph_view_empty() -> None:
     """extract_graph_view on empty graph returns empty lists."""
     g = graph.build_graph({})
@@ -891,7 +859,6 @@ def test_extract_graph_view_empty() -> None:
     assert view["artifact_edges"] == []
 
 
-@pytest.mark.usefixtures("clean_registry")
 def test_extract_graph_view_single_stage(tmp_path: Path) -> None:
     """extract_graph_view extracts stage and artifact from single-stage graph."""
     input_file = tmp_path / "input.csv"
@@ -912,7 +879,6 @@ def test_extract_graph_view_single_stage(tmp_path: Path) -> None:
     assert (str(input_file), str(output_file)) in view["artifact_edges"]
 
 
-@pytest.mark.usefixtures("clean_registry")
 def test_extract_graph_view_linear_chain(tmp_path: Path) -> None:
     """extract_graph_view extracts correct edges for a linear chain."""
     input_file = tmp_path / "input.csv"
@@ -936,7 +902,6 @@ def test_extract_graph_view_linear_chain(tmp_path: Path) -> None:
     assert (str(intermediate), str(output_file)) in view["artifact_edges"]
 
 
-@pytest.mark.usefixtures("clean_registry")
 def test_extract_graph_view_diamond(tmp_path: Path) -> None:
     """extract_graph_view handles diamond DAG correctly."""
     input_file = tmp_path / "input.csv"
@@ -959,7 +924,6 @@ def test_extract_graph_view_diamond(tmp_path: Path) -> None:
     assert ("features", "train") in view["stage_edges"]
 
 
-@pytest.mark.usefixtures("clean_registry")
 def test_extract_graph_view_stage_with_multiple_outputs(tmp_path: Path) -> None:
     """extract_graph_view deduplicates stage edges when multiple artifacts connect stages.
 
@@ -997,7 +961,6 @@ def test_extract_graph_view_stage_with_multiple_outputs(tmp_path: Path) -> None:
     assert len(artifact_edges) == 4
 
 
-@pytest.mark.usefixtures("clean_registry")
 def test_extract_graph_view_external_input_artifacts(tmp_path: Path) -> None:
     """extract_graph_view handles external inputs (no producer) correctly.
 
@@ -1024,7 +987,6 @@ def test_extract_graph_view_external_input_artifacts(tmp_path: Path) -> None:
     assert (str(input_file), str(output_file)) in artifact_edges
 
 
-@pytest.mark.usefixtures("clean_registry")
 def test_extract_graph_view_no_spurious_edges(tmp_path: Path) -> None:
     """extract_graph_view should not create edges between unconnected stages."""
     input_a = tmp_path / "input_a.csv"
@@ -1057,7 +1019,6 @@ def test_extract_graph_view_no_spurious_edges(tmp_path: Path) -> None:
     assert len(artifact_edges) == 2
 
 
-@pytest.mark.usefixtures("clean_registry")
 def test_extract_graph_view_complex_diamond_with_edge_verification(tmp_path: Path) -> None:
     """extract_graph_view with strict edge verification for complex diamond.
 
