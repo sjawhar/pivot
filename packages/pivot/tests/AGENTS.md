@@ -55,7 +55,7 @@ def test_it():
 
 ### Global State (autouse)
 
-`conftest.py` has autouse fixtures that reset state between tests: `clean_registry`, `reset_pivot_state`.
+`conftest.py` has an autouse fixture that resets state between tests: `reset_pivot_state`.
 
 **Never** manually reset these in individual tests or create duplicate fixtures.
 

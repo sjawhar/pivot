@@ -12,7 +12,7 @@ Three-tier algorithm for deciding whether to skip stage execution:
 
 ## dep_generations: StateDB Only
 
-Dependency generations (`{dep_path: generation}`) live **only in StateDB**, not in lock files. Workers compute them via `compute_dep_generation_map()` and return them in `DeferredWrites`. The coordinator applies them via `apply_deferred_writes()`. Old lock files that may have contained `dep_generations` are handled gracefully (field ignored on read).
+Dependency generations (`{dep_path: generation}`) live **only in StateDB**, not in lock files. Workers compute them via `compute_dep_generation_map()` and return them in `DeferredWrites`. The coordinator applies them via `apply_deferred_writes()`. Lock files that contain a `dep_generations` field are rejected at parse time (treated as "no previous run") so stale state regenerates cleanly.
 
 ## File-Hash Write-Back (DeferredWrites)
 
