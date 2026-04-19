@@ -14,7 +14,7 @@ import pydantic
 import pytest
 
 from helpers import register_test_stage
-from pivot import executor, explain, loaders, outputs, status
+from pivot import executor, explain, loaders, outputs, skip, status
 from pivot.storage import lock
 from pivot.types import (
     ChangeType,
@@ -109,7 +109,7 @@ def test_diff_code_change(
     expected_type: ChangeType,
 ) -> None:
     """diff_code_manifests detects added/modified/removed code components."""
-    changes = explain.diff_code_manifests(old, new)
+    changes = skip.diff_code_manifests(old, new)
     assert len(changes) == 1
     assert changes[0] == CodeChange(
         key=expected_key,
@@ -124,7 +124,7 @@ def test_diff_code_multiple_changes() -> None:
     old = {"func:a": "hash_a", "func:b": "hash_b"}
     new = {"func:a": "hash_a_new", "func:c": "hash_c"}
 
-    changes = explain.diff_code_manifests(old, new)
+    changes = skip.diff_code_manifests(old, new)
 
     keys: dict[str, CodeChange] = {c["key"]: c for c in changes}
     assert len(keys) == 3
@@ -137,7 +137,7 @@ def test_diff_code_unchanged() -> None:
     """Returns empty list when code unchanged."""
     manifest = {"func:helper": "abc123", "self:stage": "def456"}
 
-    changes = explain.diff_code_manifests(manifest, manifest)
+    changes = skip.diff_code_manifests(manifest, manifest)
 
     assert changes == []
 
@@ -172,7 +172,7 @@ def test_diff_params_change(
     expected_type: ChangeType,
 ) -> None:
     """diff_params detects added/modified/removed params."""
-    changes = explain.diff_params(old, new)
+    changes = skip.diff_params(old, new)
     assert len(changes) == 1
     assert changes[0] == ParamChange(
         key=expected_key,
@@ -187,7 +187,7 @@ def test_diff_params_nested_changed() -> None:
     old = {"model": {"hidden_size": 256}}
     new = {"model": {"hidden_size": 512}}
 
-    changes = explain.diff_params(old, new)
+    changes = skip.diff_params(old, new)
 
     assert len(changes) == 1
     assert changes[0]["key"] == "model"
@@ -198,7 +198,7 @@ def test_diff_params_unchanged() -> None:
     """Returns empty list when params unchanged."""
     params = {"learning_rate": 0.01, "epochs": 10}
 
-    changes = explain.diff_params(params, params)
+    changes = skip.diff_params(params, params)
 
     assert changes == []
 
@@ -249,7 +249,7 @@ def test_diff_deps_change(
     expected_type: ChangeType,
 ) -> None:
     """diff_dep_hashes detects added/modified/removed dependencies."""
-    changes = explain.diff_dep_hashes(old, new)
+    changes = skip.diff_dep_hashes(old, new)
     assert len(changes) == 1
     assert changes[0] == DepChange(
         path=expected_path,
@@ -274,7 +274,7 @@ def test_diff_deps_directory_with_manifest() -> None:
         }
     }
 
-    changes = explain.diff_dep_hashes(old, new)
+    changes = skip.diff_dep_hashes(old, new)
 
     assert len(changes) == 1
     assert changes[0]["path"] == "data_dir"
@@ -286,7 +286,7 @@ def test_diff_deps_unchanged() -> None:
     """Returns empty list when deps unchanged."""
     dep_hashes: dict[str, HashInfo] = {"data.csv": {"hash": "abc123"}}
 
-    changes = explain.diff_dep_hashes(dep_hashes, dep_hashes)
+    changes = skip.diff_dep_hashes(dep_hashes, dep_hashes)
 
     assert changes == []
 

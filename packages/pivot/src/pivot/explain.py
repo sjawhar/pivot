@@ -26,11 +26,6 @@ if TYPE_CHECKING:
 
     from pivot.storage.track import PvtData
 
-# Re-exports for backward compatibility (tests reference these)
-diff_code_manifests = skip.diff_code_manifests
-diff_params = skip.diff_params
-diff_dep_hashes = skip.diff_dep_hashes
-
 
 def _find_tracked_ancestor(dep: Path, tracked_trie: pygtrie.Trie[str]) -> Path | None:
     """Find the tracked path that contains dep (exact match or ancestor)."""
