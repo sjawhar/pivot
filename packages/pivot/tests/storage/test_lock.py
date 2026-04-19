@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import threading
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
@@ -15,6 +15,28 @@ if TYPE_CHECKING:
     from pytest_mock import MockerFixture
 
     from pivot.types import HashInfo
+
+
+def _is_changed(
+    stage_lock: lock.StageLock,
+    current_fingerprint: dict[str, str],
+    current_params: dict[str, Any],
+    dep_hashes: dict[str, HashInfo],
+    out_paths: list[str] | None = None,
+) -> tuple[bool, str]:
+    """Test helper: read lock file then compare (mirrors the old StageLock.is_changed).
+
+    Production code calls is_changed_with_lock_data directly with lock_data it
+    already has; only tests want the read-then-compare convenience.
+    """
+    lock_data = stage_lock.read()
+    return stage_lock.is_changed_with_lock_data(
+        lock_data,
+        current_fingerprint,
+        current_params,
+        dep_hashes,
+        out_paths if out_paths is not None else [],
+    )
 
 
 def test_lock_file_creation(tmp_path: Path) -> None:
@@ -129,7 +151,8 @@ def test_stage_changed_no_previous_run(tmp_path: Path) -> None:
     """Stage is marked changed when no lock file exists."""
     stage_lock = lock.StageLock("new_stage", tmp_path)
 
-    changed, reason = stage_lock.is_changed(
+    changed, reason = _is_changed(
+        stage_lock,
         current_fingerprint={"self:new_stage": "abc"},
         current_params={},
         dep_hashes={},
@@ -157,7 +180,7 @@ def test_stage_unchanged_when_identical(tmp_path: Path) -> None:
         )
     )
 
-    changed, reason = stage_lock.is_changed(fingerprint, params, dep_hashes)
+    changed, reason = _is_changed(stage_lock, fingerprint, params, dep_hashes)
 
     assert changed is False
     assert reason == ""
@@ -175,7 +198,8 @@ def test_stage_changed_code_modified(tmp_path: Path) -> None:
         )
     )
 
-    changed, reason = stage_lock.is_changed(
+    changed, reason = _is_changed(
+        stage_lock,
         current_fingerprint={"self:modified": "new_hash"},
         current_params={},
         dep_hashes={},
@@ -197,7 +221,8 @@ def test_stage_changed_new_dependency(tmp_path: Path) -> None:
         )
     )
 
-    changed, reason = stage_lock.is_changed(
+    changed, reason = _is_changed(
+        stage_lock,
         current_fingerprint={"self:extended": "hash1", "func:new_helper": "hash2"},
         current_params={},
         dep_hashes={},
@@ -219,7 +244,8 @@ def test_stage_changed_params_modified(tmp_path: Path) -> None:
         )
     )
 
-    changed, reason = stage_lock.is_changed(
+    changed, reason = _is_changed(
+        stage_lock,
         current_fingerprint={"self:tuned": "hash"},
         current_params={"learning_rate": 0.001},
         dep_hashes={},
@@ -245,7 +271,8 @@ def test_stage_changed_dep_hash_modified(tmp_path: Path) -> None:
     )
 
     new_dep_hashes: dict[str, HashInfo] = {input_path: {"hash": "new_hash"}}
-    changed, reason = stage_lock.is_changed(
+    changed, reason = _is_changed(
+        stage_lock,
         current_fingerprint={"self:consumer": "hash"},
         current_params={},
         dep_hashes=new_dep_hashes,
@@ -272,7 +299,8 @@ def test_stage_changed_dep_added(tmp_path: Path) -> None:
         "a.csv": {"hash": "hash_a"},
         "b.csv": {"hash": "hash_b"},
     }
-    changed, reason = stage_lock.is_changed(
+    changed, reason = _is_changed(
+        stage_lock,
         current_fingerprint={"self:consumer": "hash"},
         current_params={},
         dep_hashes=new_dep_hashes,
@@ -298,7 +326,8 @@ def test_stage_changed_dep_removed(tmp_path: Path) -> None:
     )
 
     new_dep_hashes: dict[str, HashInfo] = {"a.csv": {"hash": "hash_a"}}
-    changed, reason = stage_lock.is_changed(
+    changed, reason = _is_changed(
+        stage_lock,
         current_fingerprint={"self:consumer": "hash"},
         current_params={},
         dep_hashes=new_dep_hashes,
@@ -541,7 +570,8 @@ def test_is_changed_with_missing_required_key_triggers_rerun(
     stage_lock.path.parent.mkdir(parents=True, exist_ok=True)
     stage_lock.path.write_text(lock_content)
 
-    changed, reason = stage_lock.is_changed(
+    changed, reason = _is_changed(
+        stage_lock,
         current_fingerprint={},
         current_params={},
         dep_hashes={},
@@ -559,7 +589,8 @@ def test_is_changed_with_null_values_triggers_rerun(tmp_path: Path) -> None:
     # All required keys present but with null values
     stage_lock.path.write_text("code_manifest: null\nparams: null\ndeps: null\nouts: null\n")
 
-    changed, reason = stage_lock.is_changed(
+    changed, reason = _is_changed(
+        stage_lock,
         current_fingerprint={},
         current_params={},
         dep_hashes={},
@@ -694,30 +725,6 @@ def test_stage_unchanged_with_same_output_paths(tmp_path: Path) -> None:
     assert reason == ""
 
 
-def test_stage_unchanged_when_out_paths_none(tmp_path: Path) -> None:
-    """Backward compat: when out_paths not passed, skip output path check."""
-    stage_lock = lock.StageLock("producer", tmp_path)
-    stage_lock.write(
-        LockData(
-            code_manifest={"self:producer": "hash"},
-            params={},
-            dep_hashes={},
-            output_hashes={"/path/to/output.csv": {"hash": "abc123"}},
-        )
-    )
-
-    # Call without out_paths parameter (backward compat)
-    changed, reason = stage_lock.is_changed_with_lock_data(
-        lock_data=stage_lock.read(),
-        current_fingerprint={"self:producer": "hash"},
-        current_params={},
-        dep_hashes={},
-    )
-
-    assert changed is False
-    assert reason == ""
-
-
 def test_dep_path_change_invalidates_cache(tmp_path: Path) -> None:
     """Verify dep path changes correctly invalidate cache (documentation test)."""
     stage_lock = lock.StageLock("consumer", tmp_path)
@@ -737,6 +744,7 @@ def test_dep_path_change_invalidates_cache(tmp_path: Path) -> None:
         current_fingerprint={"self:consumer": "hash"},
         current_params={},
         dep_hashes=new_dep_hashes,
+        out_paths=[],
     )
 
     assert changed is True

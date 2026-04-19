@@ -211,26 +211,13 @@ class StageLock:
 
         cache.atomic_write_file(self.path, write_yaml)
 
-    def is_changed(
-        self,
-        current_fingerprint: dict[str, str],
-        current_params: dict[str, Any],
-        dep_hashes: dict[str, HashInfo],
-        out_paths: list[str] | None = None,
-    ) -> tuple[bool, str]:
-        """Check if stage needs re-run (reads lock file)."""
-        lock_data = self.read()
-        return self.is_changed_with_lock_data(
-            lock_data, current_fingerprint, current_params, dep_hashes, out_paths
-        )
-
     def is_changed_with_lock_data(
         self,
         lock_data: LockData | None,
         current_fingerprint: dict[str, str],
         current_params: dict[str, Any],
         dep_hashes: dict[str, HashInfo],
-        out_paths: list[str] | None = None,
+        out_paths: list[str],
     ) -> tuple[bool, str]:
         """Check if stage needs re-run (pure comparison, no I/O)."""
         if lock_data is None:
@@ -242,9 +229,8 @@ class StageLock:
             return True, "Params changed"
         if lock_data["dep_hashes"] != dep_hashes:
             return True, "Input dependencies changed"
-        if out_paths is not None:
-            locked_out_paths = sorted(lock_data["output_hashes"].keys())
-            if sorted(out_paths) != locked_out_paths:
-                return True, "Output paths changed"
+        locked_out_paths = sorted(lock_data["output_hashes"].keys())
+        if sorted(out_paths) != locked_out_paths:
+            return True, "Output paths changed"
 
         return False, ""
