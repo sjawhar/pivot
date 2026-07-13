@@ -3,10 +3,25 @@ name = "pivot-tui"
 version = "0.1.0"
 description = "Textual-based TUI for the Pivot pipeline framework"
 requires-python = ">=3.13,<3.14"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Sami Jawhar", email = "sami@metr.org" }]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Operating System :: POSIX",
+  "Programming Language :: Python :: 3.13",
+]
 dependencies = [
     "pivot",
     "textual>=7.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/sjawhar/pivot"
+Documentation = "https://sjawhar.github.io/pivot/"
+Repository = "https://github.com/sjawhar/pivot"
+Issues = "https://github.com/sjawhar/pivot/issues"
 
 [build-system]
 requires = ["uv_build>=0.9.18,<0.10.0"]

@@ -293,3 +293,6 @@ $RECYCLE.BIN/
 # Sisyphus session state (plans, notepads, drafts)
 .sisyphus/*
 !.sisyphus/rules/
+
+# OhMyOpenCode session state
+.omo/

@@ -34,6 +34,9 @@ jobs:
 
       - name: Configure git for semantic-release
         run: |
+          # actions/checkout leaves HEAD detached at head_sha; semantic-release
+          # requires being on a release branch (main) to match a release group.
+          git checkout -B main
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
@@ -64,7 +67,6 @@ jobs:
       - name: Publish to PyPI
         if: steps.release.outputs.released == 'true'
         run: |
-          # Publish workspace packages in dependency order.
-          # pivot-tui depends on pivot, so pivot must be published first.
-          # uv publish publishes all distributions in dist/ directory.
+          # Publishes all distributions in dist/ (pivot and pivot-tui sdists + wheels)
+          # via PyPI trusted publishing (OIDC).
           uv publish
