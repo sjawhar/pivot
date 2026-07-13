@@ -7,11 +7,11 @@ from typing import TYPE_CHECKING, Literal
 
 import click
 
-from pivot import config, path_utils, project, registry
+from pivot import config, project
 from pivot.cli import completion
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
-from pivot.storage import cache, lock, track
+from pivot.storage import cache, track
 from pivot.types import HashInfo, is_dir_hash
 
 if TYPE_CHECKING:
@@ -27,37 +27,6 @@ class CheckoutBehavior(enum.StrEnum):
     ERROR = "error"  # Error if file already exists (default)
     SKIP_EXISTING = "skip_existing"  # Skip files that already exist (--only-missing)
     FORCE = "force"  # Overwrite existing files (--force)
-
-
-def _get_stage_output_info() -> dict[str, HashInfo]:
-    """Get output hash info from lock files for cached stage outputs only.
-
-    Non-cached outputs (e.g. Metric with cache=False) are excluded —
-    they are git-tracked and not Pivot's responsibility to restore.
-
-    Uses per-stage state_dir from the registry for lock file lookup.
-    """
-    result = dict[str, HashInfo]()
-
-    for stage_name in cli_helpers.list_stages():
-        stage_info = cli_helpers.get_stage(stage_name)
-        project_root = project.get_project_root()
-        cached_paths = {
-            path_utils.canonicalize_artifact_path(str(out.path), project_root)
-            for out in stage_info["outs"]
-            if out.cache
-        }
-
-        stage_state_dir = registry.get_stage_state_dir(stage_info, config.get_state_dir())
-        stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(stage_state_dir))
-        lock_data = stage_lock.read()
-        if lock_data:
-            for out_path, out_hash in lock_data["output_hashes"].items():
-                norm_path = path_utils.canonicalize_artifact_path(out_path, project_root)
-                if norm_path in cached_paths:
-                    result[norm_path] = out_hash
-
-    return result
 
 
 def _on_disk_matches_expected(path: pathlib.Path, expected_hash: HashInfo) -> bool:
@@ -400,7 +369,7 @@ def checkout(
 
     # Get stage output info from lock files (cached outputs only)
     pipeline = cli_decorators.get_pipeline_from_context()
-    stage_outputs = {} if pipeline is None else _get_stage_output_info()
+    stage_outputs = {} if pipeline is None else cli_helpers.get_stage_output_info()
 
     state_dir = config.get_state_dir()
 

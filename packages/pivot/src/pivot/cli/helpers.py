@@ -15,8 +15,10 @@ if TYPE_CHECKING:
     from pivot.pipeline.pipeline import Pipeline
     from pivot.registry import RegistryStageInfo, StageRegistry
 
-from pivot import exceptions
+from pivot import config, exceptions, path_utils, project, registry
 from pivot.cli import decorators as cli_decorators
+from pivot.storage import lock, track
+from pivot.types import HashInfo
 
 
 class NoPipelineError(exceptions.PivotError):
@@ -153,6 +155,47 @@ class TransferProgress:
             )
         self._bar.desc = f"{self._action} {filename}"
         self._bar.update(completed - self._bar.n)
+
+
+def get_stage_output_info() -> dict[str, HashInfo]:
+    """Get output hash info from lock files for cached stage outputs only.
+
+    Non-cached outputs (e.g. Metric with cache=False) are excluded —
+    they are git-tracked and not Pivot's responsibility to restore.
+    """
+    result = dict[str, HashInfo]()
+    proj_root = project.get_project_root()
+    state_dir = config.get_state_dir()
+
+    for stage_name in list_stages():
+        stage_info = get_stage(stage_name)
+        cached_paths = {
+            path_utils.canonicalize_artifact_path(str(out.path), proj_root)
+            for out in stage_info["outs"]
+            if out.cache
+        }
+        stage_state_dir = registry.get_stage_state_dir(stage_info, state_dir)
+        stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(stage_state_dir))
+        lock_data = stage_lock.read()
+        if lock_data:
+            for out_path, out_hash in lock_data["output_hashes"].items():
+                norm_path = path_utils.canonicalize_artifact_path(out_path, proj_root)
+                if norm_path in cached_paths:
+                    result[norm_path] = out_hash
+
+    return result
+
+
+def get_locally_tracked_targets() -> list[str]:
+    """Return paths of all files tracked locally via .pvt files and stage lockfiles."""
+    proj_root = project.get_project_root()
+    targets = list(track.discover_pvt_files(proj_root))
+
+    pipeline = cli_decorators.get_pipeline_from_context()
+    if pipeline is not None:
+        targets.extend(get_stage_output_info())
+
+    return targets
 
 
 def print_transfer_errors(errors: list[str], max_shown: int = 5) -> None:

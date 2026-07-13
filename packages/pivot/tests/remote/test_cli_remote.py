@@ -254,26 +254,29 @@ def test_fetch_dry_run_all(
     monkeypatch: pytest.MonkeyPatch,
     mocker: MockerFixture,
 ) -> None:
-    """Fetch dry run without stages lists all remote files."""
+    """Fetch dry run without targets scopes to locally tracked files."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".pivot").mkdir()
         pathlib.Path(".git").mkdir()
         monkeypatch.setattr(project, "_project_root_cache", None)
 
-        mock_remote = mocker.MagicMock()
-
-        async def mock_list_hashes() -> set[str]:
-            return {"remote1", "remote2", "remote3"}
-
-        mock_remote.list_hashes = mock_list_hashes
-
         mocker.patch.object(config_mod, "get_cache_dir", return_value=tmp_path / ".pivot/cache")
         mocker.patch.object(
             transfer,
             "create_remote_from_name",
-            return_value=(mock_remote, "origin"),
+            return_value=(mocker.MagicMock(), "origin"),
         )
-        mocker.patch.object(transfer, "get_local_cache_hashes", return_value={"remote1"})
+        mocker.patch.object(transfer, "get_local_cache_hashes", return_value={"hash1"})
+        mocker.patch.object(
+            cli_helpers,
+            "get_locally_tracked_targets",
+            return_value=["data/file1.csv", "data/file2.csv"],
+        )
+        mocker.patch.object(
+            transfer,
+            "get_target_hashes",
+            return_value={"hash1", "hash2", "hash3"},
+        )
 
         result = runner.invoke(cli.cli, ["fetch", "--dry-run"])
 
@@ -302,6 +305,9 @@ def test_fetch_success(
             return_value=(mocker.MagicMock(), "origin"),
         )
 
+        mocker.patch.object(
+            cli_helpers, "get_locally_tracked_targets", return_value=["data/file1.csv"]
+        )
         mock_pull = mocker.patch.object(
             transfer,
             "pull",
@@ -337,6 +343,9 @@ def test_fetch_with_errors(
             transfer,
             "create_remote_from_name",
             return_value=(mocker.MagicMock(), "origin"),
+        )
+        mocker.patch.object(
+            cli_helpers, "get_locally_tracked_targets", return_value=["data/file1.csv"]
         )
         mocker.patch.object(
             transfer,
@@ -429,29 +438,32 @@ def test_pull_dry_run_all(
     monkeypatch: pytest.MonkeyPatch,
     mocker: MockerFixture,
 ) -> None:
-    """Pull dry run without stages lists all remote files."""
+    """Pull dry run without targets scopes to locally tracked files."""
 
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".pivot").mkdir()
         pathlib.Path(".git").mkdir()
         monkeypatch.setattr(project, "_project_root_cache", None)
 
-        mock_remote = mocker.MagicMock()
-
-        async def mock_list_hashes() -> set[str]:
-            return {"remote1", "remote2", "remote3"}
-
-        mock_remote.list_hashes = mock_list_hashes
-
         mocker.patch.object(config_mod, "get_cache_dir", return_value=tmp_path / ".pivot/cache")
         mocker.patch.object(
             transfer,
             "create_remote_from_name",
-            return_value=(mock_remote, "origin"),
+            return_value=(mocker.MagicMock(), "origin"),
         )
-        mocker.patch.object(transfer, "get_local_cache_hashes", return_value={"remote1"})
+        mocker.patch.object(transfer, "get_local_cache_hashes", return_value={"hash1"})
+        mocker.patch.object(
+            cli_helpers,
+            "get_locally_tracked_targets",
+            return_value=["data/file1.csv", "data/file2.csv"],
+        )
+        mocker.patch.object(
+            transfer,
+            "get_target_hashes",
+            return_value={"hash1", "hash2", "hash3"},
+        )
 
-        result = runner.invoke(cli.cli, ["pull", "--dry-run", "--all"])
+        result = runner.invoke(cli.cli, ["pull", "--dry-run"])
 
         assert result.exit_code == 0
         assert "Would pull 2 file(s) from 'origin'" in result.output
@@ -799,43 +811,94 @@ def test_fetch_quiet_mode_no_output(
 # =============================================================================
 
 
-def test_pull_no_pipeline_no_targets_fails_early(
+def test_pull_no_pipeline_no_targets_uses_locally_tracked(
     runner: click.testing.CliRunner,
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
     mocker: MockerFixture,
 ) -> None:
-    """Pull fails early when no pipeline and no targets (and not using --all).
-
-    Without a pipeline, targets, or --all flag, pull should fail immediately
-    with a clear error message suggesting --all or targets.
-    """
+    """Pull with no pipeline and no targets scopes to locally tracked files."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".pivot").mkdir()
         pathlib.Path(".git").mkdir()
         monkeypatch.setattr(project, "_project_root_cache", None)
 
-        # Mock remote and transfer functions
         mocker.patch.object(
             transfer,
             "create_remote_from_name",
             return_value=(mocker.MagicMock(), "origin"),
         )
-        # Mock pull to ensure it's not called (early failure should prevent it)
+        mocker.patch.object(config_mod, "get_cache_dir", return_value=tmp_path / ".pivot/cache")
+        mocker.patch.object(
+            cli_helpers,
+            "get_locally_tracked_targets",
+            return_value=["data/file1.csv"],
+        )
         mock_pull = mocker.patch.object(
             transfer,
             "pull",
-            return_value=TransferSummary(transferred=0, skipped=0, failed=0, errors=[]),
+            return_value=TransferSummary(transferred=1, skipped=0, failed=0, errors=[]),
         )
+        mock_state_db = mocker.MagicMock()
+        mocker.patch.object(state, "StateDB", return_value=mock_state_db)
 
-        # Run pull with no pipeline, no targets, no --all
         result = runner.invoke(cli.cli, ["pull"])
 
-        # Should fail early
-        assert result.exit_code != 0, f"Expected failure, got: {result.output}"
-        # Error message should suggest --all or targets
-        assert "--all" in result.output or "target" in result.output.lower()
-        # Should not have called pull (early failure prevents fetch)
+        assert result.exit_code == 0
+        mock_pull.assert_called_once()
+
+
+def test_fetch_no_locally_tracked_targets_exits_early(
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mocker: MockerFixture,
+) -> None:
+    """Fetch exits early with 0 transferred when no locally tracked targets."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".pivot").mkdir()
+        pathlib.Path(".git").mkdir()
+        monkeypatch.setattr(project, "_project_root_cache", None)
+
+        mocker.patch.object(
+            transfer,
+            "create_remote_from_name",
+            return_value=(mocker.MagicMock(), "origin"),
+        )
+        mocker.patch.object(cli_helpers, "get_locally_tracked_targets", return_value=[])
+        mock_pull = mocker.patch.object(transfer, "pull")
+
+        result = runner.invoke(cli.cli, ["fetch"])
+
+        assert result.exit_code == 0
+        assert "0 transferred" in result.output
+        mock_pull.assert_not_called()
+
+
+def test_pull_no_locally_tracked_targets_exits_early(
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mocker: MockerFixture,
+) -> None:
+    """Pull exits early with 0 transferred when no locally tracked targets."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".pivot").mkdir()
+        pathlib.Path(".git").mkdir()
+        monkeypatch.setattr(project, "_project_root_cache", None)
+
+        mocker.patch.object(
+            transfer,
+            "create_remote_from_name",
+            return_value=(mocker.MagicMock(), "origin"),
+        )
+        mocker.patch.object(cli_helpers, "get_locally_tracked_targets", return_value=[])
+        mock_pull = mocker.patch.object(transfer, "pull")
+
+        result = runner.invoke(cli.cli, ["pull"])
+
+        assert result.exit_code == 0
+        assert "0 transferred" in result.output
         mock_pull.assert_not_called()
 
 

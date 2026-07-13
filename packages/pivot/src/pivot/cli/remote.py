@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import pathlib
 
 import click
@@ -175,8 +174,8 @@ def fetch(
     """Fetch cached outputs from remote storage to local cache.
 
     TARGETS can be stage names or file paths. If specified, fetches those
-    outputs (and dependencies for stages). Otherwise, fetches all available
-    files from remote.
+    outputs (and dependencies for stages). Otherwise, fetches files referenced
+    by local tracking files (.pvt and stage lockfiles).
 
     This command only downloads to the local cache. Use 'pivot pull' to also
     restore files to your workspace, or 'pivot checkout' to restore from cache.
@@ -195,16 +194,17 @@ def fetch(
 
     stage_names = set(all_stages) if all_stages is not None else None
     normalized = _normalize_cli_targets(targets, known_stages=stage_names)
-    targets_list = _get_targets_list(normalized)
+    targets_list = _get_targets_list(normalized) or cli_helpers.get_locally_tracked_targets()
+
+    if not targets_list:
+        if not quiet:
+            click.echo(f"Fetched from '{resolved_name}': 0 transferred, 0 skipped, 0 failed")
+        return
 
     if dry_run:
-        if targets_list:
-            needed = transfer.get_target_hashes(
-                targets_list, state_dir, include_deps=True, all_stages=all_stages
-            )
-        else:
-            needed = asyncio.run(s3_remote.list_hashes())
-
+        needed = transfer.get_target_hashes(
+            targets_list, state_dir, include_deps=True, all_stages=all_stages
+        )
         local = transfer.get_local_cache_hashes(cache_dir)
         missing = needed - local
         if not quiet:
@@ -276,7 +276,8 @@ def pull(
     This matches the behavior of 'git pull' and 'dvc pull'.
 
     TARGETS can be stage names or file paths. If specified, pulls those
-    outputs (and dependencies for stages). Otherwise, pulls all available files.
+    outputs (and dependencies for stages). Otherwise, pulls files referenced
+    by local tracking files (.pvt and stage lockfiles).
     """
     if force and only_missing:
         raise click.ClickException("--force and --only-missing are mutually exclusive")
@@ -295,24 +296,18 @@ def pull(
 
     stage_names = set(all_stages) if all_stages is not None else None
     normalized = _normalize_cli_targets(targets, known_stages=stage_names)
-    targets_list = _get_targets_list(normalized)
+    targets_list = _get_targets_list(normalized) or cli_helpers.get_locally_tracked_targets()
 
-    # Fail early if no pipeline and no targets specified (unless --all was used)
-    use_all = cli_decorators.get_all_pipelines_from_context()
-    if pipeline is None and not targets_list and not use_all:
-        raise click.UsageError(
-            "No pipeline found. Use --all to pull from all pipelines, or specify file targets."
-        )
+    if not targets_list:
+        if not quiet:
+            click.echo(f"Fetched from '{resolved_name}': 0 transferred, 0 skipped, 0 failed")
+        return
 
     # Dry-run: show what would be fetched, don't proceed to checkout
     if dry_run:
-        if targets_list:
-            needed = transfer.get_target_hashes(
-                targets_list, state_dir, include_deps=True, all_stages=all_stages
-            )
-        else:
-            needed = asyncio.run(s3_remote.list_hashes())
-
+        needed = transfer.get_target_hashes(
+            targets_list, state_dir, include_deps=True, all_stages=all_stages
+        )
         local = transfer.get_local_cache_hashes(cache_dir)
         missing = needed - local
         if not quiet:
