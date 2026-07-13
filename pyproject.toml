@@ -164,3 +164,9 @@ build_command = "uv lock --upgrade-package pivot --upgrade-package pivot-tui && 
 commit_message = "chore(release): {version}"
 major_on_zero = false
 allow_zero_version = true
+
+[tool.semantic_release.remote]
+# Push the release commit/tag via the checkout's SSH remote (DEPLOY_KEY) instead
+# of an HTTPS token URL. The deploy key bypasses the main branch ruleset; the
+# GITHUB_TOKEN actor does not. GH_TOKEN is still used for the GitHub release.
+ignore_token_for_push = true
