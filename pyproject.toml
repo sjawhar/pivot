@@ -155,5 +155,12 @@ pivot = { workspace = true }
 pivot-tui = { workspace = true }
 
 [tool.semantic_release]
-version_toml = ["pyproject.toml:project.version"]
-build_command = "uv lock --upgrade-package pivot && git add uv.lock && uv build"
+version_toml = [
+  "pyproject.toml:project.version",
+  "packages/pivot/pyproject.toml:project.version",
+  "packages/pivot-tui/pyproject.toml:project.version",
+]
+build_command = "uv lock --upgrade-package pivot --upgrade-package pivot-tui && git add uv.lock && uv build --all-packages"
+commit_message = "chore(release): {version}"
+major_on_zero = false
+allow_zero_version = true

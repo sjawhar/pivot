@@ -3,8 +3,15 @@ name = "pivot"
 version = "0.1.0"
 description = "High-performance Python pipeline tool with automatic code change detection"
 requires-python = ">=3.13,<3.14"
-license = { text = "TBD" }
-authors = [{ name = "Internal Team" }]
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Sami Jawhar", email = "sami@metr.org" }]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Operating System :: POSIX",
+  "Programming Language :: Python :: 3.13",
+]
 dependencies = [
   "aiohttp>=3.9",
   "anyio>=4.0",
@@ -69,6 +76,12 @@ dev = [
 
 [project.scripts]
 pivot = "pivot.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/sjawhar/pivot"
+Documentation = "https://sjawhar.github.io/pivot/"
+Repository = "https://github.com/sjawhar/pivot"
+Issues = "https://github.com/sjawhar/pivot/issues"
 
 [build-system]
 requires = ["uv_build>=0.9.18,<0.10.0"]
