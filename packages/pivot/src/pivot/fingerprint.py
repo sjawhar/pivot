@@ -29,7 +29,7 @@ if TYPE_CHECKING:
 _logger = logging.getLogger(__name__)
 
 _PYTHON_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}"
-_CACHE_SCHEMA_VERSION = 2
+_CACHE_SCHEMA_VERSION = 4
 _REPR_SIZE_LIMIT = 10_000
 
 _SITE_PACKAGE_PATHS = ("site-packages", "dist-packages")
@@ -1116,29 +1116,31 @@ def _discover_pydantic_field_types(
 
 def _serialize_value_for_hash(value: Any) -> str:
     """Serialize a value to a stable string for hashing."""
+    return json.dumps(_canonicalize_value_for_hash(value))
+
+
+def _canonicalize_value_for_hash(value: Any) -> Any:
     if hasattr(value, "model_dump"):
-        return json.dumps(value.model_dump(), sort_keys=True, default=str)
-
-    if isinstance(value, (list, tuple)):
-        items: list[Any] = []
-        for item in cast("list[Any]", value):
-            if hasattr(item, "model_dump"):
-                items.append(item.model_dump())
-            else:
-                items.append(item)
-        return json.dumps(items, sort_keys=True, default=str)
-
-    if isinstance(value, (set, frozenset)):
-        # Sort for deterministic ordering
-        items_to_sort = cast("set[Any] | frozenset[Any]", value)
-        return json.dumps(
-            sorted(items_to_sort, key=lambda x: (type(x).__name__, str(x))), default=str
-        )
+        return _canonicalize_value_for_hash(value.model_dump())
 
     if isinstance(value, dict):
-        return json.dumps(value, sort_keys=True, default=str)
+        entries = [
+            (_canonicalize_value_for_hash(key), _canonicalize_value_for_hash(item))
+            for key, item in cast("dict[Any, Any]", value).items()
+        ]
+        return "dict", sorted(entries, key=lambda entry: json.dumps(entry[0]))
 
-    return repr(value)
+    if isinstance(value, (list, tuple, set, frozenset)):
+        collection = cast("list[Any] | tuple[Any, ...] | set[Any] | frozenset[Any]", value)
+        items = [_canonicalize_value_for_hash(item) for item in collection]
+        if isinstance(collection, (set, frozenset)):
+            items.sort(key=json.dumps)
+        return type(collection).__name__, items
+
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+
+    return type(value).__name__, repr(value)
 
 
 def _process_collection_dependency(

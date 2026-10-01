@@ -332,7 +332,12 @@ When a stage uses `@pivot.no_fingerprint()`, AST fingerprinting is bypassed enti
 
 19. **Module attribute primitive collections ARE tracked**: Module-level collections (dict, list, tuple, set, frozenset) containing only primitive values (bool, int, float, str, bytes, None) are fingerprinted via JSON serialization. Collections containing non-primitives (custom objects, class instances, numpy arrays) raise a `TypeError` to prevent non-deterministic `repr()` output. The primitive check is recursive, so nested structures like `{"key": [1, 2, {"inner": "value"}]}` are supported.
 
-    Tests: `test_integration.py::test_primitive_collection_module_attr_fingerprinting`, `test_integration.py::test_unsupported_module_attr_type_raises_error`
+    Collections use recursively tagged JSON nodes, with deterministic ordering for dicts,
+    sets, and frozensets across Python hash seeds. Collection tags remain distinct from
+    user strings and containers that resemble tags, so changing between them invalidates
+    the fingerprint.
+
+    Tests: `test_integration.py::test_primitive_collection_module_attr_fingerprinting`, `test_integration.py::test_unsupported_module_attr_type_raises_error`, `test_determinism.py::test_nested_sets_deterministic_across_processes`, `test_fingerprint.py::test_serialize_value_for_hash`
 
 20. **Manifest cache invalidation is path-scoped**: Watch-mode reloads invalidate only the cached manifests whose source maps include changed paths, leaving unaffected stage manifests intact. Affected stages are recomputed on next fingerprint access and re-cached.
 

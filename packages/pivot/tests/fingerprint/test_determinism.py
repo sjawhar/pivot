@@ -6,6 +6,7 @@ invocations. This is critical because stages may be fingerprinted in different
 processes (main process vs worker) and must produce identical results.
 """
 
+import os
 import pathlib
 import subprocess
 import sys
@@ -86,6 +87,42 @@ if mod_keys:
 
 
 # --- Cross-process determinism tests ---
+
+
+@pytest.mark.parametrize(
+    "input",
+    [
+        pytest.param('(("all", frozenset({"tasks", "runs", "models"})),)', id="tuple"),
+        pytest.param('{"items": [{"tasks", "runs", "models"}]}', id="dict-list"),
+        pytest.param(
+            'frozenset({frozenset({"tasks", "runs"}), frozenset({"models", "tasks"})})',
+            id="frozenset",
+        ),
+    ],
+)
+def test_nested_sets_deterministic_across_processes(tmp_path: pathlib.Path, input: str) -> None:
+    (tmp_path / ".pivot").mkdir()
+    (tmp_path / "sources.py").write_text(f"VALUE = {input}\n")
+    script = tmp_path / "stage.py"
+    script.write_text("""
+import sources
+from pivot import fingerprint
+def stage():
+    return sources.VALUE
+print(fingerprint.get_stage_fingerprint(stage)["mod:sources.VALUE"])
+""")
+    results = [
+        subprocess.run(
+            [sys.executable, str(script)],
+            cwd=tmp_path,
+            env={**os.environ, "PYTHONHASHSEED": str(seed)},
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        for seed in range(3)
+    ]
+    assert len(set(results)) == 1, f"Hashes differ across processes: {results}"
 
 
 @pytest.mark.slow
