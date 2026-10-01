@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import subprocess
+import sys
 import time
 from typing import TYPE_CHECKING
 
@@ -734,6 +736,116 @@ def test_readonly_allows_reads(tmp_path: pathlib.Path) -> None:
         assert db.get_generation(test_file) == 1
         assert db.get_dep_generations("stage") == {"/dep.csv": 1}
         assert db.remote_hash_exists("origin", "remote_hash")
+
+
+def test_concurrent_instances_on_same_path(tmp_path: pathlib.Path) -> None:
+    """Multiple StateDBs on one path can be open at once in a process (#465)."""
+    db_path = tmp_path
+    test_file = tmp_path / "file.txt"
+    test_file.write_text("content")
+    file_stat = test_file.stat()
+
+    with state.StateDB(db_path, readonly=True) as reader:
+        with state.StateDB(db_path) as writer:
+            writer.save(test_file, file_stat, "hash123")
+            with state.StateDB(db_path, readonly=True) as second_reader:
+                assert second_reader.get(test_file, file_stat) == "hash123"
+        assert reader.get(test_file, file_stat) == "hash123"
+
+
+@pytest.mark.parametrize(
+    ("input", "expected_output"),
+    [
+        pytest.param(
+            ("state._shared_envs_lock.acquire()", "pass"), "value\n", id="locked-registry"
+        ),
+        pytest.param(
+            ("pass", "inherited.close(); inherited.close()"), "value\n", id="close-before-open"
+        ),
+        pytest.param(
+            (
+                "pass",
+                """with state.StateDB(path) as child:
+    inherited.close()
+    inherited.close()
+    child.put_raw(b'key', b'value')
+    assert child.get_raw(b'key') == b'value'""",
+            ),
+            "value\n",
+            id="close-after-open",
+        ),
+        pytest.param(
+            (
+                "pass",
+                """with pytest.raises(RuntimeError, match='inherited.*fork'):
+    inherited.get_raw(b'key')""",
+            ),
+            "value\n",
+            id="inherited-read",
+        ),
+        pytest.param(
+            (
+                "pass",
+                """with pytest.raises(RuntimeError, match='inherited.*fork'):
+    inherited.put_raw(b'key', b'changed')""",
+            ),
+            "value\n",
+            id="inherited-write",
+        ),
+        pytest.param(
+            (
+                "pass",
+                "with pytest.raises(RuntimeError, match='inherited.*fork'), inherited:\n    pass",
+            ),
+            "value\n",
+            id="inherited-context-manager",
+        ),
+    ],
+)
+def test_state_db_after_fork(
+    tmp_path: pathlib.Path, input: tuple[str, str], expected_output: str
+) -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import os
+import pathlib
+import signal
+import sys
+import pytest
+from pivot.storage import state
+
+path = pathlib.Path(sys.argv[1])
+inherited = state.StateDB(path)
+inherited.put_raw(b"key", b"value")
+exec(sys.argv[2])
+pid = os.fork()
+if pid:
+    if state._shared_envs_lock.locked():
+        state._shared_envs_lock.release()
+    _, status = os.waitpid(pid, 0)
+    print(inherited.get_raw(b"key").decode())
+    inherited.close()
+    sys.exit(os.waitstatus_to_exitcode(status))
+
+signal.alarm(5)
+exec(sys.argv[3])
+with state.StateDB(path) as child:
+    child.put_raw(b"key", b"value")
+    assert child.get_raw(b"key") == b"value"
+sys.exit(0)
+""",
+            str(tmp_path),
+            *input,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == expected_output
 
 
 def test_readonly_blocks_save(tmp_path: pathlib.Path) -> None:
